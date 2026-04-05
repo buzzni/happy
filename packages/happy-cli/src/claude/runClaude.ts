@@ -6,7 +6,7 @@ import { logger } from '@/ui/logger';
 import { loop } from '@/claude/loop';
 import { AgentState, Metadata } from '@/api/types';
 import packageJson from '../../package.json';
-import { Credentials, readSettings } from '@/persistence';
+import { Credentials, readSettings, SandboxConfigSchema } from '@/persistence';
 import { EnhancedMode, PermissionMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
@@ -73,7 +73,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Get machine ID from settings (should already be set up)
     const settings = await readSettings();
     let machineId = settings?.machineId
-    const sandboxConfig = options.noSandbox ? undefined : settings?.sandboxConfig;
+    const projectSandboxEnv = process.env.HAPPY_PROJECT_SANDBOX_CONFIG;
+    const sandboxConfig = options.noSandbox
+        ? undefined
+        : projectSandboxEnv
+            ? SandboxConfigSchema.parse(JSON.parse(projectSandboxEnv))
+            : settings?.sandboxConfig;
     const sandboxEnabled = Boolean(sandboxConfig?.enabled);
     const initialPermissionMode = applySandboxPermissionPolicy(
         resolveInitialClaudePermissionMode(options.permissionMode, options.claudeArgs),
