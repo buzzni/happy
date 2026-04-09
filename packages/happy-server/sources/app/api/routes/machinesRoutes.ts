@@ -134,6 +134,42 @@ export function machinesRoutes(app: Fastify) {
         }));
     });
 
+    // DELETE /v1/machines/:id - Delete a machine and its access keys
+    app.delete('/v1/machines/:id', {
+        preHandler: app.authenticate,
+        schema: {
+            params: z.object({
+                id: z.string()
+            })
+        }
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { id } = request.params;
+
+        const machine = await db.machine.findFirst({
+            where: {
+                accountId: userId,
+                id: id
+            }
+        });
+
+        if (!machine) {
+            return reply.code(404).send({ error: 'Machine not found' });
+        }
+
+        // Delete access keys first, then the machine
+        await db.accessKey.deleteMany({
+            where: { machineId: id }
+        });
+        await db.machine.delete({
+            where: { id }
+        });
+
+        log({ module: 'machines', machineId: id, userId }, 'Machine deleted');
+
+        return reply.send({ success: true });
+    });
+
     // GET /v1/machines/:id - Get single machine by ID
     app.get('/v1/machines/:id', {
         preHandler: app.authenticate,
