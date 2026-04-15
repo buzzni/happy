@@ -281,6 +281,29 @@ export class ApiClient {
     return new ApiMachineClient(this.credential.token, machine);
   }
 
+  /**
+   * Post a session event to the durable event log on the server.
+   * Used by daemon recovery to emit session-end for dead sessions.
+   */
+  async postSessionEvent(sessionId: string, eventType: string, content: string): Promise<void> {
+    try {
+      await axios.post(
+        `${configuration.serverUrl}/v3/sessions/${sessionId}/events`,
+        { eventType, content },
+        {
+          headers: {
+            'Authorization': `Bearer ${this.credential.token}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 10000
+        }
+      );
+      logger.debug(`[API] Session event posted: ${eventType} for session ${sessionId}`);
+    } catch (error) {
+      logger.debug(`[API] Failed to post session event: ${error}`);
+    }
+  }
+
   push(): PushNotificationClient {
     return this.pushClient;
   }

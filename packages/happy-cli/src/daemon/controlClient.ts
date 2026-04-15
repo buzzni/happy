@@ -4,7 +4,7 @@
  */
 
 import { logger } from '@/ui/logger';
-import { clearDaemonState, readDaemonState } from '@/persistence';
+import { clearDaemonState, readDaemonState, writeDaemonState } from '@/persistence';
 import { Metadata } from '@/api/types';
 import { projectPath } from '@/projectPath';
 import { readFileSync } from 'fs';
@@ -126,8 +126,8 @@ export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolea
     process.kill(state.pid, 0);
     return true;
   } catch {
-    logger.debug('[DAEMON RUN] Daemon PID not running, cleaning up state');
-    await cleanupDaemonState();
+    logger.debug('[DAEMON RUN] Daemon PID not running, marking state as crashed');
+    writeDaemonState({ ...state, state: 'crashed', stateReason: 'Daemon PID not running' });
     return false;
   }
 }

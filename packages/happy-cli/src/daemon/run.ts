@@ -13,7 +13,7 @@ import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
-import { writeDaemonState, DaemonLocallyPersistedState, readDaemonState, acquireDaemonLock, releaseDaemonLock } from '@/persistence';
+import { writeDaemonState, writeDaemonStateDebounced, flushDaemonState, DaemonLocallyPersistedState, PersistedTrackedSession, readDaemonState, acquireDaemonLock, releaseDaemonLock, isPidAlive } from '@/persistence';
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { startDaemonControlServer } from './controlServer';
@@ -145,12 +145,45 @@ export async function startDaemon(): Promise<void> {
 
     // Setup state - key by PID
     const pidToTrackedSession = new Map<number, TrackedSession>();
+    const deadSessionsToCleanup: PersistedTrackedSession[] = [];
+
+    // Recover sessions from previous daemon run
+    const previousState = await readDaemonState();
+    if (previousState?.trackedSessions?.length) {
+      logger.debug(`[DAEMON RUN] Found ${previousState.trackedSessions.length} sessions from previous daemon (state: ${previousState.state || 'unknown'})`);
+      for (const persisted of previousState.trackedSessions) {
+        if (isPidAlive(persisted.pid)) {
+          const recovered: TrackedSession = {
+            startedBy: persisted.startedBy,
+            pid: persisted.pid,
+            happySessionId: persisted.happySessionId,
+            tmuxSessionId: persisted.tmuxSessionId,
+          };
+          pidToTrackedSession.set(persisted.pid, recovered);
+          logger.debug(`[DAEMON RUN] Recovered alive session PID ${persisted.pid}, sessionId: ${persisted.happySessionId || 'pending'}`);
+        } else {
+          deadSessionsToCleanup.push(persisted);
+          logger.debug(`[DAEMON RUN] Previous session PID ${persisted.pid} is dead (sessionId: ${persisted.happySessionId || 'pending'})`);
+        }
+      }
+    }
 
     // Session spawning awaiter system
     const pidToAwaiter = new Map<number, (session: TrackedSession) => void>();
 
     // Helper functions
     const getCurrentChildren = () => Array.from(pidToTrackedSession.values());
+
+    // Serialize tracked sessions for disk persistence
+    const serializeTrackedSessions = (): PersistedTrackedSession[] => {
+      return Array.from(pidToTrackedSession.values()).map(s => ({
+        pid: s.pid,
+        happySessionId: s.happySessionId,
+        startedBy: s.startedBy,
+        tmuxSessionId: s.tmuxSessionId,
+        startedAt: Date.now(),
+      }));
+    };
 
     // Handle webhook from happy session reporting itself
     const onHappySessionWebhook = (sessionId: string, sessionMetadata: Metadata) => {
@@ -181,6 +214,8 @@ export async function startDaemon(): Promise<void> {
           awaiter(existingSession);
           logger.debug(`[DAEMON RUN] Resolved session awaiter for PID ${pid}`);
         }
+
+        persistTrackedSessions();
       } else if (!existingSession) {
         // New session started externally
         const trackedSession: TrackedSession = {
@@ -191,6 +226,7 @@ export async function startDaemon(): Promise<void> {
         };
         pidToTrackedSession.set(pid, trackedSession);
         logger.debug(`[DAEMON RUN] Registered externally-started session ${sessionId}`);
+        persistTrackedSessions();
       }
     };
 
@@ -517,6 +553,7 @@ export async function startDaemon(): Promise<void> {
       };
 
       pidToTrackedSession.set(happyProcess.pid, trackedSession);
+      persistTrackedSessions();
 
       happyProcess.on('exit', (code, signal) => {
         logger.debug(`[DAEMON RUN] Child PID ${happyProcess.pid} exited with code ${code}, signal ${signal}`);
@@ -607,6 +644,7 @@ export async function startDaemon(): Promise<void> {
           }
 
           pidToTrackedSession.delete(pid);
+          persistTrackedSessions();
           logger.debug(`[DAEMON RUN] Removed session ${sessionId} from tracking`);
           return true;
         }
@@ -620,6 +658,7 @@ export async function startDaemon(): Promise<void> {
     const onChildExited = (pid: number) => {
       logger.debug(`[DAEMON RUN] Removing exited process PID ${pid} from tracking`);
       pidToTrackedSession.delete(pid);
+      persistTrackedSessions();
     };
 
     // Start control server
@@ -637,10 +676,22 @@ export async function startDaemon(): Promise<void> {
       httpPort: controlPort,
       startTime: new Date().toLocaleString(),
       startedWithCliVersion: packageJson.version,
-      daemonLogPath: logger.logFilePath
+      daemonLogPath: logger.logFilePath,
+      state: 'running',
+      trackedSessions: serializeTrackedSessions(),
     };
     writeDaemonState(fileState);
     logger.debug('[DAEMON RUN] Daemon state written');
+
+    // Persist tracked sessions to disk on every mutation (debounced)
+    const persistTrackedSessions = () => {
+      writeDaemonStateDebounced({
+        ...fileState,
+        state: 'running',
+        lastHeartbeat: new Date().toLocaleString(),
+        trackedSessions: serializeTrackedSessions(),
+      });
+    };
 
     // Prepare initial daemon state
     const initialDaemonState: DaemonState = {
@@ -675,6 +726,18 @@ export async function startDaemon(): Promise<void> {
     // Connect to server
     apiMachine.connect();
 
+    // Emit session-end events for dead sessions from previous daemon run
+    if (deadSessionsToCleanup.length > 0) {
+      logger.debug(`[DAEMON RUN] Cleaning up ${deadSessionsToCleanup.length} dead sessions from previous run`);
+      for (const dead of deadSessionsToCleanup) {
+        if (dead.happySessionId) {
+          api.postSessionEvent(dead.happySessionId, 'session-end', '').catch((error) => {
+            logger.debug(`[DAEMON RUN] Failed to emit session-end for dead session ${dead.happySessionId}: ${error}`);
+          });
+        }
+      }
+    }
+
     // Every 60 seconds:
     // 1. Prune stale sessions
     // 2. Check if daemon needs update
@@ -693,15 +756,16 @@ export async function startDaemon(): Promise<void> {
       }
 
       // Prune stale sessions
+      let sessionsPruned = false;
       for (const [pid, _] of pidToTrackedSession.entries()) {
-        try {
-          // Check if process is still alive (signal 0 doesn't kill, just checks)
-          process.kill(pid, 0);
-        } catch (error) {
-          // Process is dead, remove from tracking
+        if (!isPidAlive(pid)) {
           logger.debug(`[DAEMON RUN] Removing stale session with PID ${pid} (process no longer exists)`);
           pidToTrackedSession.delete(pid);
+          sessionsPruned = true;
         }
+      }
+      if (sessionsPruned) {
+        persistTrackedSessions();
       }
 
       // Check if daemon needs update
@@ -754,7 +818,9 @@ export async function startDaemon(): Promise<void> {
           startTime: fileState.startTime,
           startedWithCliVersion: packageJson.version,
           lastHeartbeat: new Date().toLocaleString(),
-          daemonLogPath: fileState.daemonLogPath
+          daemonLogPath: fileState.daemonLogPath,
+          state: 'running',
+          trackedSessions: serializeTrackedSessions(),
         };
         writeDaemonState(updatedState);
         if (process.env.DEBUG) {
@@ -790,7 +856,17 @@ export async function startDaemon(): Promise<void> {
 
       apiMachine.shutdown();
       await stopControlServer();
-      await cleanupDaemonState();
+
+      // Preserve state file with stopped status and final session list
+      flushDaemonState();
+      writeDaemonState({
+        ...fileState,
+        state: 'stopped',
+        stateReason: `Shutdown by ${source}${errorMessage ? ': ' + errorMessage : ''}`,
+        lastHeartbeat: new Date().toLocaleString(),
+        trackedSessions: serializeTrackedSessions(),
+      });
+
       await stopCaffeinate();
       await releaseDaemonLock(daemonLockHandle);
 

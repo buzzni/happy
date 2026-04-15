@@ -1,6 +1,12 @@
+import { persistSessionEvent } from "@/app/events/persistSessionEvent";
 import { db } from "@/storage/db";
 import { z } from "zod";
 import { type Fastify } from "../types";
+
+const sendEventBodySchema = z.object({
+    eventType: z.string().min(1),
+    content: z.string(),
+});
 
 const getEventsQuerySchema = z.object({
     after_seq: z.coerce.number().int().min(0).default(0),
@@ -86,6 +92,46 @@ export function v3SessionEventRoutes(app: Fastify) {
         return reply.send({
             events: page.map(toResponseEvent),
             hasMore,
+        });
+    });
+
+    app.post('/v3/sessions/:sessionId/events', {
+        preHandler: app.authenticate,
+        schema: {
+            params: z.object({
+                sessionId: z.string(),
+            }),
+            body: sendEventBodySchema,
+        },
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { sessionId } = request.params;
+        const { eventType, content } = request.body;
+
+        const session = await db.session.findFirst({
+            where: {
+                id: sessionId,
+                accountId: userId,
+            },
+            select: { id: true },
+        });
+
+        if (!session) {
+            return reply.code(404).send({ error: 'Session not found' });
+        }
+
+        const event = await persistSessionEvent({
+            sessionId,
+            eventType: eventType as any,
+            content,
+        });
+
+        return reply.send({
+            event: {
+                id: event.id,
+                seq: event.seq,
+                createdAt: event.createdAt.getTime(),
+            },
         });
     });
 }

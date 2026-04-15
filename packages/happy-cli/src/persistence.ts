@@ -64,8 +64,20 @@ function migrateSettings(raw: any, fromVersion: number): any {
 }
 
 /**
+ * Serializable subset of TrackedSession for disk persistence
+ */
+export interface PersistedTrackedSession {
+  pid: number;
+  happySessionId?: string;
+  startedBy: string;
+  tmuxSessionId?: string;
+  startedAt: number;
+}
+
+/**
  * Daemon state persisted locally (different from API DaemonState)
- * This is written to disk by the daemon to track its local process state
+ * This is written to disk by the daemon to track its local process state.
+ * File is preserved on shutdown (state='stopped') for session recovery.
  */
 export interface DaemonLocallyPersistedState {
   pid: number;
@@ -74,6 +86,9 @@ export interface DaemonLocallyPersistedState {
   startedWithCliVersion: string;
   lastHeartbeat?: string;
   daemonLogPath?: string;
+  state?: 'running' | 'stopped' | 'crashed';
+  stateReason?: string;
+  trackedSessions?: PersistedTrackedSession[];
 }
 
 export async function readSettings(): Promise<Settings> {
@@ -313,14 +328,69 @@ export function writeDaemonState(state: DaemonLocallyPersistedState): void {
   writeFileSync(configuration.daemonStateFile, JSON.stringify(state, null, 2), 'utf-8');
 }
 
+let pendingDaemonState: DaemonLocallyPersistedState | null = null;
+let daemonStateDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+const DAEMON_STATE_DEBOUNCE_MS = 500;
+
 /**
- * Clean up daemon state file and lock file
+ * Debounced write for daemon state — avoids excessive I/O during rapid session mutations.
+ * Call flushDaemonState() before shutdown to ensure final state is written.
+ */
+export function writeDaemonStateDebounced(state: DaemonLocallyPersistedState): void {
+  pendingDaemonState = state;
+  if (daemonStateDebounceTimer) {
+    clearTimeout(daemonStateDebounceTimer);
+  }
+  daemonStateDebounceTimer = setTimeout(() => {
+    if (pendingDaemonState) {
+      writeDaemonState(pendingDaemonState);
+    }
+    pendingDaemonState = null;
+    daemonStateDebounceTimer = null;
+  }, DAEMON_STATE_DEBOUNCE_MS);
+}
+
+/**
+ * Flush any pending debounced daemon state write immediately
+ */
+export function flushDaemonState(): void {
+  if (daemonStateDebounceTimer) {
+    clearTimeout(daemonStateDebounceTimer);
+    daemonStateDebounceTimer = null;
+  }
+  if (pendingDaemonState) {
+    writeDaemonState(pendingDaemonState);
+    pendingDaemonState = null;
+  }
+}
+
+/**
+ * Check if a process with the given PID is alive
+ */
+export function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Mark daemon state as stopped (preserves file for session recovery).
+ * Only cleans up lock file, not the state file itself.
  */
 export async function clearDaemonState(): Promise<void> {
   if (existsSync(configuration.daemonStateFile)) {
-    await unlink(configuration.daemonStateFile);
+    try {
+      const content = readFileSync(configuration.daemonStateFile, 'utf-8');
+      const current = JSON.parse(content) as DaemonLocallyPersistedState;
+      writeDaemonState({ ...current, state: 'stopped' });
+    } catch {
+      // State corrupted, just remove it
+      await unlink(configuration.daemonStateFile);
+    }
   }
-  // Also clean up lock file if it exists (for stale cleanup)
   if (existsSync(configuration.daemonLockFile)) {
     try {
       await unlink(configuration.daemonLockFile);
