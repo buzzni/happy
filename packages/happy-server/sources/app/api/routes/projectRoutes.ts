@@ -113,6 +113,7 @@ function formatProject(project: {
     description: string;
     color: string;
     config: unknown;
+    giteaRepo?: string | null;
     isDefault: boolean;
     createdAt: Date;
     updatedAt: Date;
@@ -124,6 +125,7 @@ function formatProject(project: {
         description: project.description,
         color: project.color,
         config: project.config,
+        giteaRepo: project.giteaRepo ?? null,
         isDefault: project.isDefault,
         createdAt: project.createdAt.getTime(),
         updatedAt: project.updatedAt.getTime()

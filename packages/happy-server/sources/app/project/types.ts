@@ -42,7 +42,9 @@ export type ProjectError =
     | 'already-member'
     | 'not-pending'
     | 'member-not-found'
-    | 'cannot-delete-default';
+    | 'cannot-delete-default'
+    | 'workspace-not-found'
+    | 'branch-exists';
 
 export type Result<T> =
     | { ok: true; value: T }
