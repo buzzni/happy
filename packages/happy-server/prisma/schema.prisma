@@ -52,6 +52,9 @@ model Account {
     AccessKey           AccessKey[]
     UserFeedItem        UserFeedItem[]
     UserKVStore         UserKVStore[]
+    Project             Project[]
+    ProjectMember       ProjectMember[]
+    ProjectMemberInviter ProjectMember[]  @relation("ProjectMemberInviter")
 }
 
 model TerminalAuthRequest {
@@ -377,4 +380,43 @@ model UserKVStore {
 
     @@unique([accountId, key])
     @@index([accountId])
+}
+
+//
+// Projects
+//
+
+model Project {
+    id                   String              @id @default(cuid())
+    accountId            String
+    account              Account             @relation(fields: [accountId], references: [id])
+    name                 String
+    description          String              @default("")
+    color                String              @default("#6366f1")
+    /// [ProjectConfig]
+    config               Json?
+    isDefault            Boolean             @default(false)
+    createdAt            DateTime            @default(now())
+    updatedAt            DateTime            @updatedAt
+    members              ProjectMember[]
+
+    @@index([accountId])
+}
+
+model ProjectMember {
+    id          String            @id @default(cuid())
+    projectId   String
+    project     Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+    accountId   String
+    account     Account           @relation(fields: [accountId], references: [id])
+    role        String            @default("editor")
+    status      String            @default("pending")
+    invitedBy   String
+    inviter     Account           @relation("ProjectMemberInviter", fields: [invitedBy], references: [id])
+    createdAt   DateTime          @default(now())
+    updatedAt   DateTime          @updatedAt
+
+    @@unique([projectId, accountId])
+    @@index([accountId])
+    @@index([projectId])
 }
