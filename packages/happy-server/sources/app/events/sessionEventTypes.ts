@@ -8,6 +8,8 @@ export const SESSION_EVENT_TYPES = {
     ERROR: 'error',
     CHECKPOINT_SNAPSHOT: 'checkpoint-snapshot',
     CHECKPOINT_REWIND: 'checkpoint-rewind',
+    MESSAGE_HIDDEN: 'message-hidden',
+    MESSAGE_UNHIDDEN: 'message-unhidden',
 } as const;
 
 export type SessionEventType = typeof SESSION_EVENT_TYPES[keyof typeof SESSION_EVENT_TYPES];
