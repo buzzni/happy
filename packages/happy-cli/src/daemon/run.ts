@@ -18,7 +18,7 @@ import { writeDaemonState, writeDaemonStateDebounced, flushDaemonState, DaemonLo
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { startDaemonControlServer } from './controlServer';
 import { createPortRegistry } from './portRegistry';
-import { stageUserCredentials } from './stageUserCredentials';
+import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { projectPath } from '@/projectPath';
@@ -161,6 +161,7 @@ export async function startDaemon(): Promise<void> {
             pid: persisted.pid,
             happySessionId: persisted.happySessionId,
             tmuxSessionId: persisted.tmuxSessionId,
+            userHomeDir: persisted.userHomeDir,
           };
           pidToTrackedSession.set(persisted.pid, recovered);
           logger.debug(`[DAEMON RUN] Recovered alive session PID ${persisted.pid}, sessionId: ${persisted.happySessionId || 'pending'}`);
@@ -169,6 +170,22 @@ export async function startDaemon(): Promise<void> {
           logger.debug(`[DAEMON RUN] Previous session PID ${persisted.pid} is dead (sessionId: ${persisted.happySessionId || 'pending'})`);
         }
       }
+    }
+
+    // Sweep stale /tmp/happy-session-* directories from previous runs. Any
+    // directory we don't claim through a live tracked session is removed so
+    // credentials and logs don't accumulate across crashes or ungraceful
+    // restarts.
+    try {
+      const liveHomeDirs = Array.from(pidToTrackedSession.values())
+        .map((s) => s.userHomeDir)
+        .filter((d): d is string => typeof d === 'string');
+      const removed = await sweepOrphanUserHomeDirs(liveHomeDirs);
+      if (removed.length > 0) {
+        logger.debug(`[DAEMON RUN] Swept ${removed.length} orphan user home dir(s) from /tmp`);
+      }
+    } catch (e) {
+      logger.debug(`[DAEMON RUN] Orphan sweep failed: ${e instanceof Error ? e.message : String(e)}`);
     }
 
     // Session spawning awaiter system
@@ -189,6 +206,7 @@ export async function startDaemon(): Promise<void> {
         startedBy: s.startedBy,
         tmuxSessionId: s.tmuxSessionId,
         startedAt: sessionStartTimes.get(s.pid) ?? Date.now(),
+        userHomeDir: s.userHomeDir,
       }));
     };
 
@@ -317,9 +335,11 @@ export async function startDaemon(): Promise<void> {
         // to a per-spawn access.key so the child CLI registers its session under
         // the user's account rather than inheriting the daemon's credentials
         // from ~/.happy-dev/access.key.
+        let stagedUserHomeDir: string | undefined;
         if (options.happyToken && options.happySecret) {
           const { homeDir } = await stageUserCredentials(options.happyToken, options.happySecret);
           authEnv.HAPPY_HOME_DIR = homeDir;
+          stagedUserHomeDir = homeDir;
           logger.debug(`[DAEMON RUN] User credentials staged at ${homeDir}/access.key`);
         }
 
@@ -431,6 +451,7 @@ export async function startDaemon(): Promise<void> {
               pid: tmuxResult.pid, // Real PID from tmux -P flag
               tmuxSessionId: tmuxResult.sessionId,
               directoryCreated,
+              userHomeDir: stagedUserHomeDir,
               message: directoryCreated
                 ? `The path '${directory}' did not exist. We created a new folder and spawned a new session in tmux session '${tmuxSessionName}'. Use 'tmux attach -t ${tmuxSessionName}' to view the session.`
                 : `Spawned new session in tmux session '${tmuxSessionName}'. Use 'tmux attach -t ${tmuxSessionName}' to view the session.`
@@ -513,6 +534,7 @@ export async function startDaemon(): Promise<void> {
             },
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
+            userHomeDir: stagedUserHomeDir,
           });
         }
 
@@ -537,12 +559,14 @@ export async function startDaemon(): Promise<void> {
       env,
       directoryCreated = false,
       message,
+      userHomeDir,
     }: {
       args: string[];
       cwd: string;
       env: NodeJS.ProcessEnv;
       directoryCreated?: boolean;
       message?: string;
+      userHomeDir?: string;
     }): Promise<SpawnSessionResult> => {
       const happyProcess = spawnHappyCLI(args, {
         cwd,
@@ -567,6 +591,7 @@ export async function startDaemon(): Promise<void> {
         childProcess: happyProcess,
         directoryCreated,
         message,
+        userHomeDir,
       };
 
       pidToTrackedSession.set(happyProcess.pid, trackedSession);
@@ -675,8 +700,18 @@ export async function startDaemon(): Promise<void> {
     // Handle child process exit
     const onChildExited = (pid: number) => {
       logger.debug(`[DAEMON RUN] Removing exited process PID ${pid} from tracking`);
+      const tracked = pidToTrackedSession.get(pid);
       pidToTrackedSession.delete(pid);
       persistTrackedSessions();
+      if (tracked?.userHomeDir) {
+        const homeDir = tracked.userHomeDir;
+        // Small delay lets the child flush any final writes before we unlink.
+        setTimeout(() => {
+          unstageUserCredentials(homeDir).catch((err) => {
+            logger.debug(`[DAEMON RUN] Failed to unstage ${homeDir}: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        }, 100);
+      }
     };
 
     // Per-project port registry (30000-40000), persisted at configuration.portRegistryFile
