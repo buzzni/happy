@@ -1,7 +1,9 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { promises as fs } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { stageUserCredentials } from './stageUserCredentials'
+import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials'
 
 describe('stageUserCredentials', () => {
   it('writes an access.key file containing the user token and secret', async () => {
@@ -48,5 +50,74 @@ describe('stageUserCredentials', () => {
     } finally {
       await fs.rm(homeDir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('unstageUserCredentials', () => {
+  it('removes a previously staged directory', async () => {
+    const { homeDir } = await stageUserCredentials('t', 's')
+    await fs.access(homeDir)
+
+    await unstageUserCredentials(homeDir)
+
+    await expect(fs.access(homeDir)).rejects.toThrow()
+  })
+
+  it('is idempotent — removing a non-existent directory does not throw', async () => {
+    const { homeDir } = await stageUserCredentials('t', 's')
+    await unstageUserCredentials(homeDir)
+    await expect(unstageUserCredentials(homeDir)).resolves.toBeUndefined()
+  })
+
+  it('refuses to delete paths outside the happy-session tmp prefix', async () => {
+    const outsideDir = mkdtempSync(join(tmpdir(), 'not-happy-session-'))
+    try {
+      await expect(unstageUserCredentials(outsideDir)).rejects.toThrow(/refusing/i)
+      await fs.access(outsideDir)
+    } finally {
+      await fs.rm(outsideDir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses to delete an obviously dangerous path', async () => {
+    await expect(unstageUserCredentials('/')).rejects.toThrow(/refusing/i)
+    await expect(unstageUserCredentials('/home/aiden')).rejects.toThrow(/refusing/i)
+  })
+})
+
+describe('sweepOrphanUserHomeDirs', () => {
+  let scratchTmp: string
+  let liveDir: string
+  let orphanDir: string
+  let unrelatedDir: string
+
+  beforeEach(() => {
+    scratchTmp = mkdtempSync(join(tmpdir(), 'sweep-parent-'))
+    liveDir = mkdtempSync(join(scratchTmp, 'happy-session-'))
+    orphanDir = mkdtempSync(join(scratchTmp, 'happy-session-'))
+    unrelatedDir = mkdtempSync(join(scratchTmp, 'not-ours-'))
+  })
+
+  afterEach(() => {
+    rmSync(scratchTmp, { recursive: true, force: true })
+  })
+
+  it('removes happy-session-* directories that no live session claims', async () => {
+    const removed = await sweepOrphanUserHomeDirs([liveDir], scratchTmp)
+    expect(removed).toEqual([orphanDir])
+    await fs.access(liveDir)
+    await expect(fs.access(orphanDir)).rejects.toThrow()
+    await fs.access(unrelatedDir)
+  })
+
+  it('leaves directories whose prefix does not match alone', async () => {
+    await sweepOrphanUserHomeDirs([], scratchTmp)
+    await fs.access(unrelatedDir)
+  })
+
+  it('returns empty when parent dir does not exist', async () => {
+    const missing = join(tmpdir(), 'definitely-not-there-' + Date.now())
+    const removed = await sweepOrphanUserHomeDirs([], missing)
+    expect(removed).toEqual([])
   })
 })
