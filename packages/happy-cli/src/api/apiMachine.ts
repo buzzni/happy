@@ -13,6 +13,7 @@ import { backoff } from '@/utils/time';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { detectCLIAvailability, CLIAvailability } from '@/utils/detectCLI';
 import { detectResumeSupport, type ResumeSupport } from '@/resume/localHappyAgentAuth';
+import type { PortRegistry } from '@/daemon/portRegistry';
 
 interface ServerToDaemonEvents {
     update: (data: Update) => void;
@@ -76,6 +77,7 @@ type MachineRpcHandlers = {
     resumeSession?: (sessionId: string) => Promise<SpawnSessionResult>;
     stopSession: (sessionId: string) => boolean;
     requestShutdown: () => void;
+    portRegistry: PortRegistry;
 }
 
 export class ApiMachineClient {
@@ -105,7 +107,8 @@ export class ApiMachineClient {
         spawnSession,
         resumeSession,
         stopSession,
-        requestShutdown
+        requestShutdown,
+        portRegistry
     }: MachineRpcHandlers) {
         this.resumeSessionHandler = resumeSession ?? null;
 
@@ -164,6 +167,28 @@ export class ApiMachineClient {
             }, 100);
 
             return { message: 'Daemon stop request acknowledged, starting shutdown sequence...' };
+        });
+
+        // Register port allocation handler (sticky per-project port in 30000-40000)
+        this.rpcHandlerManager.registerHandler('allocate-port', async (params: any) => {
+            const { projectId } = params || {};
+            if (!projectId || typeof projectId !== 'string') {
+                throw new Error('projectId is required');
+            }
+            const result = await portRegistry.allocate(projectId);
+            logger.debug(`[API MACHINE] allocate-port ${projectId} -> ${result.port} (reused=${result.reused})`);
+            return result;
+        });
+
+        // Register port release handler (e.g., on project deletion)
+        this.rpcHandlerManager.registerHandler('release-port', async (params: any) => {
+            const { projectId } = params || {};
+            if (!projectId || typeof projectId !== 'string') {
+                throw new Error('projectId is required');
+            }
+            const released = await portRegistry.release(projectId);
+            logger.debug(`[API MACHINE] release-port ${projectId} -> released=${released}`);
+            return { released };
         });
     }
 

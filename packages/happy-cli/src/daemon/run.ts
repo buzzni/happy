@@ -731,7 +731,8 @@ export async function startDaemon(): Promise<void> {
       spawnSession,
       resumeSession,
       stopSession,
-      requestShutdown: () => requestShutdown('happy-app')
+      requestShutdown: () => requestShutdown('happy-app'),
+      portRegistry
     });
 
     // Connect to server
