@@ -53,5 +53,7 @@ COPY --from=builder /repo/packages/happy-server /repo/packages/happy-server
 # Expose the port the app will run on
 EXPOSE 3000
 
-# Command to run the application
-CMD ["yarn", "--cwd", "packages/happy-server", "start"]
+# Command to run the application.
+# Runs pending migrations first, then starts the server. Without this step
+# a fresh DB will be missing every table and Prisma queries 500 with P2021.
+CMD ["sh", "-c", "npx prisma migrate deploy --schema=/repo/packages/happy-server/prisma/schema.prisma && exec yarn --cwd packages/happy-server start"]
