@@ -19,6 +19,16 @@ import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
 interface ServerToDaemonEvents {
     update: (data: Update) => void;
     'rpc-request': (data: { method: string, params: string }, callback: (response: string) => void) => void;
+    'proxy-http-request': (
+        params: {
+            port: number;
+            method: string;
+            path: string;
+            headers: Record<string, string>;
+            bodyB64: string | null;
+        },
+        ack: (response: unknown) => void,
+    ) => void;
     'rpc-registered': (data: { method: string }) => void;
     'rpc-unregistered': (data: { method: string }) => void;
     'rpc-error': (data: { type: string, error: string }) => void;
@@ -192,26 +202,14 @@ export class ApiMachineClient {
             return { released };
         });
 
-        // Register HTTP proxy handler (relay browser request → local dev server)
-        this.rpcHandlerManager.registerHandler('proxy-http', async (params: any) => {
-            try {
-                const result = await proxyHttp({
-                    port: params?.port,
-                    method: params?.method,
-                    path: params?.path,
-                    headers: params?.headers ?? {},
-                    bodyB64: params?.bodyB64 ?? null,
-                });
-                logger.debug(`[API MACHINE] proxy-http ${params?.method} ${params?.path} -> ${result.status}${result.truncated ? ' (truncated)' : ''}`);
-                return { type: 'success', ...result };
-            } catch (e) {
-                if (e instanceof PreviewProxyError) {
-                    logger.debug(`[API MACHINE] proxy-http failed: ${e.code} ${e.message}`);
-                    return { type: 'error', code: e.code, message: e.message };
-                }
-                throw e;
-            }
-        });
+        // NOTE: proxy-http is intentionally wired as a plain socket event
+        // (see connect() — 'proxy-http-request') instead of an encrypted
+        // RpcHandlerManager handler. happy-server's preview relay route
+        // terminates iframe requests and needs to forward plaintext bodies
+        // — it has no access to the machine encryption key, so the E2EE
+        // RPC envelope can't be used. The preview payload is inherently
+        // non-sensitive (it's the HTTP request flowing from the iframe,
+        // and happy-server already sees it to rewrite HTML).
     }
 
     private syncResumeSessionRpcRegistration(rpcAvailable: boolean): void {
@@ -358,6 +356,39 @@ export class ApiMachineClient {
             logger.debugLargeJson(`[API MACHINE] Received RPC request:`, data);
             callback(await this.rpcHandlerManager.handleRequest(data));
         });
+
+        // Plain-text preview proxy channel — happy-server relays iframe HTTP
+        // requests here without encryption because it needs to inspect/rewrite
+        // response bodies (HTML path rewriting) and has no access to the
+        // machine encryption key anyway. Independent of the rpc-request
+        // pipeline above.
+        this.socket.on(
+            'proxy-http-request',
+            async (params: any, ack: (response: any) => void) => {
+                try {
+                    const result = await proxyHttp({
+                        port: params?.port,
+                        method: params?.method,
+                        path: params?.path,
+                        headers: params?.headers ?? {},
+                        bodyB64: params?.bodyB64 ?? null,
+                    });
+                    logger.debug(
+                        `[API MACHINE] proxy-http-request ${params?.method} ${params?.path} -> ${result.status}${result.truncated ? ' (truncated)' : ''}`,
+                    );
+                    ack({ type: 'success', ...result });
+                } catch (e) {
+                    if (e instanceof PreviewProxyError) {
+                        logger.debug(`[API MACHINE] proxy-http-request failed: ${e.code} ${e.message}`);
+                        ack({ type: 'error', code: e.code, message: e.message });
+                        return;
+                    }
+                    const message = e instanceof Error ? e.message : String(e);
+                    logger.debug(`[API MACHINE] proxy-http-request internal error: ${message}`);
+                    ack({ type: 'error', code: 'INTERNAL', message });
+                }
+            },
+        );
 
         // Handle update events from server
         this.socket.on('update', (data: Update) => {

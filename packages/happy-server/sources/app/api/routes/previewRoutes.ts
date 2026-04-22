@@ -181,25 +181,29 @@ export function previewRoutes(app: Fastify) {
 
                 const forwardHeaders = filterForwardedHeaders(request.headers);
 
-                // Relay via RPC.
+                // Relay via the daemon's plain `proxy-http-request` socket event
+                // — deliberately outside the encrypted rpc-request pipeline
+                // because happy-server has no access to the machine key and
+                // needs to read response bodies to rewrite HTML anyway.
                 let rpcResponse: ProxyRpcResponse;
                 try {
                     const raw = await machineSocket
                         .timeout(RPC_TIMEOUT_MS)
-                        .emitWithAck('rpc-request', {
-                            method: `${params.machineId}:proxy-http`,
-                            params: {
-                                port: portNum,
-                                method: request.method,
-                                path: upstreamPath,
-                                headers: forwardHeaders,
-                                bodyB64,
-                            },
+                        .emitWithAck('proxy-http-request', {
+                            port: portNum,
+                            method: request.method,
+                            path: upstreamPath,
+                            headers: forwardHeaders,
+                            bodyB64,
                         });
                     rpcResponse = raw as ProxyRpcResponse;
                 } catch (err) {
-                    log({ module: 'preview', level: 'error' }, `RPC call failed: ${(err as Error).message}`);
+                    log({ module: 'preview', level: 'error' }, `proxy-http-request relay failed: ${(err as Error).message}`);
                     return reply.code(504).send({ error: 'Upstream relay timeout' });
+                }
+                if (!rpcResponse || typeof rpcResponse !== 'object') {
+                    log({ module: 'preview', level: 'error' }, `proxy-http-request returned malformed response: ${JSON.stringify(rpcResponse)}`);
+                    return reply.code(502).send({ error: 'Bad response from daemon' });
                 }
 
                 if (rpcResponse.type === 'error') {
