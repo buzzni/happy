@@ -28,7 +28,13 @@ export function startSocket(app: Fastify) {
         allowUpgrades: true,
         upgradeTimeout: 10000,
         connectTimeout: 20000,
-        serveClient: false // Don't serve the client files
+        serveClient: false, // Don't serve the client files
+        // 100 MiB — matches the preview relay's 50 MiB body cap plus
+        // base64 overhead (~33%) + envelope + headroom. Socket.IO's
+        // default is 1 MiB which would cut off any non-trivial dev
+        // bundle in proxy-http-request acks. See specs/remote-preview-relay/
+        // Phase 4.
+        maxHttpBufferSize: 100 * 1024 * 1024,
     });
 
     let rpcListeners = new Map<string, Map<string, Socket>>();

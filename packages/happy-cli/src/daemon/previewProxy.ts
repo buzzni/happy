@@ -36,7 +36,12 @@ export interface ProxyOptions {
 }
 
 export const DEFAULT_TIMEOUT_MS = 30_000
-export const DEFAULT_MAX_BODY_BYTES = 1_048_576 // 1 MiB
+// 50 MiB — covers typical dev JS bundles, source maps, and unoptimized
+// images without needing a streaming protocol. Bumped from 1 MiB after
+// live remote-preview testing showed real React / Vite / Next.js dev
+// builds routinely ship 5–15 MiB of transient assets. See
+// specs/remote-preview-relay/ Phase 4.
+export const DEFAULT_MAX_BODY_BYTES = 50 * 1024 * 1024
 export const DEFAULT_PORT_MIN = 1024
 export const DEFAULT_PORT_MAX = 65535
 
