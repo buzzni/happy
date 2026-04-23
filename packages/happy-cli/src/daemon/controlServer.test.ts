@@ -115,6 +115,35 @@ describe('controlServer port allocation endpoints', () => {
     })
     expect(res.status).toBe(400)
   })
+
+  const getPort = async (query: string) => {
+    const res = await fetch(`${baseUrl}/get-port${query}`)
+    const body = (await res.json()) as { port?: number | null; error?: string }
+    return { status: res.status, body }
+  }
+
+  it('GET /get-port returns the registered port for an allocated projectId', async () => {
+    const alloc = await allocate('proj-a')
+    const { status, body } = await getPort('?projectId=proj-a')
+    expect(status).toBe(200)
+    expect(body.port).toBe(alloc.body.port)
+  })
+
+  it('GET /get-port returns port=null for an unknown projectId', async () => {
+    const { status, body } = await getPort('?projectId=ghost')
+    expect(status).toBe(200)
+    expect(body.port).toBeNull()
+  })
+
+  it('GET /get-port rejects missing projectId', async () => {
+    const { status } = await getPort('')
+    expect(status).toBe(400)
+  })
+
+  it('GET /get-port rejects empty projectId', async () => {
+    const { status } = await getPort('?projectId=')
+    expect(status).toBe(400)
+  })
 })
 
 describe('controlServer port allocation — range exhaustion', () => {

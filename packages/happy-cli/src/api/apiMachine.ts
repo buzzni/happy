@@ -193,6 +193,22 @@ export class ApiMachineClient {
             return result;
         });
 
+        // Register read-only port lookup handler. Used by web-ui preflight
+        // (specs/preview-server-lifecycle/ Phase 1) to check whether a project
+        // already has a sticky port assigned before deciding to start a new
+        // server. Does not mutate the registry and does not probe the port.
+        this.rpcHandlerManager.registerHandler('get-port', async (params: any) => {
+            const { projectId } = params || {};
+            if (!projectId || typeof projectId !== 'string') {
+                throw new Error('projectId is required');
+            }
+            const data = await portRegistry.readAll();
+            const entry = data[projectId];
+            const port = entry ? entry.port : null;
+            logger.debug(`[API MACHINE] get-port ${projectId} -> ${port}`);
+            return { port };
+        });
+
         // Register port release handler (e.g., on project deletion)
         this.rpcHandlerManager.registerHandler('release-port', async (params: any) => {
             const { projectId } = params || {};

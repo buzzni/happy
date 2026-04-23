@@ -227,6 +227,28 @@ export function startDaemonControlServer({
       return { released };
     });
 
+    // Look up the registered port for a single project without allocating
+    // one. Used by web-ui preflight (specs/preview-server-lifecycle/ Phase 1)
+    // to decide whether an existing server is reusable before firing a new
+    // `startServerDirect` call.
+    typed.get('/get-port', {
+      schema: {
+        querystring: z.object({
+          projectId: z.string().min(1)
+        }),
+        response: {
+          200: z.object({
+            port: z.number().nullable()
+          })
+        }
+      }
+    }, async (request) => {
+      const { projectId } = request.query
+      const data = await portRegistry.readAll()
+      const entry = data[projectId]
+      return { port: entry ? entry.port : null }
+    });
+
     // Read full port registry (debugging / inspection)
     typed.get('/port-registry', {
       schema: {
