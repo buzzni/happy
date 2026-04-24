@@ -8,8 +8,13 @@ import { run as runRipgrep } from '@/modules/ripgrep/index';
 import { run as runDifftastic } from '@/modules/difftastic/index';
 import { RpcHandlerManager } from '../../api/rpc/RpcHandlerManager';
 import { validatePath } from './pathSecurity';
+import { createIgnoreMatcher } from './ignorePresets';
 
 const execAsync = promisify(exec);
+
+// Shared across getDirectoryTree / listDirectory calls — the preset set
+// is immutable at runtime, so one matcher is plenty.
+const directoryIgnoreMatcher = createIgnoreMatcher();
 
 interface BashRequest {
     command: string;
@@ -403,11 +408,19 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                     const children: TreeNode[] = [];
 
                     // Process entries in parallel, filtering out symlinks
+                    // and ignore-preset paths (.git, node_modules, *.pyc, ...).
+                    // Filtering at the daemon avoids shipping huge
+                    // vendored trees across the wire; the browser used
+                    // to re-filter anyway.
                     await Promise.all(
                         entries.map(async (entry) => {
                             // Skip symbolic links completely
                             if (entry.isSymbolicLink()) {
                                 logger.debug(`Skipping symlink: ${join(path, entry.name)}`);
+                                return;
+                            }
+
+                            if (directoryIgnoreMatcher.shouldIgnore(entry.name)) {
                                 return;
                             }
 
