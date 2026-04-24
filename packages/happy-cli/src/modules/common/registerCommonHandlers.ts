@@ -9,12 +9,19 @@ import { run as runDifftastic } from '@/modules/difftastic/index';
 import { RpcHandlerManager } from '../../api/rpc/RpcHandlerManager';
 import { validatePath } from './pathSecurity';
 import { createIgnoreMatcher } from './ignorePresets';
+import {
+    createGitignoreContext,
+    enterDirectory,
+    type GitignoreContext,
+} from './gitignoreWalker';
 
 const execAsync = promisify(exec);
 
-// Shared across getDirectoryTree / listDirectory calls — the preset set
-// is immutable at runtime, so one matcher is plenty.
+// Preset matcher is immutable at runtime — one instance covers every
+// getDirectoryTree call. Gitignore rules cascade per-request from this
+// baseline context.
 const directoryIgnoreMatcher = createIgnoreMatcher();
+const baseDirectoryIgnoreContext = createGitignoreContext(directoryIgnoreMatcher);
 
 interface BashRequest {
     command: string;
@@ -388,8 +395,17 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             return { success: false, error: validation.error };
         }
 
-        // Helper function to build tree recursively
-        async function buildTree(path: string, name: string, currentDepth: number): Promise<TreeNode | null> {
+        // Helper function to build tree recursively. parentIgnore carries
+        // the preset baseline plus any .gitignore layers accumulated from
+        // ancestor directories; relPath is the path relative to the walk
+        // root — needed so scoped gitignore rules can match correctly.
+        async function buildTree(
+            path: string,
+            name: string,
+            currentDepth: number,
+            parentIgnore: GitignoreContext,
+            relPath: string,
+        ): Promise<TreeNode | null> {
             try {
                 const stats = await stat(path);
 
@@ -404,14 +420,14 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
 
                 // If it's a directory and we haven't reached max depth, get children
                 if (stats.isDirectory() && currentDepth < data.maxDepth) {
+                    // Layer this directory's .gitignore (if any) on top of the
+                    // parent context before scanning children. enterDirectory
+                    // returns the same context when there is no .gitignore,
+                    // so the common case allocates nothing.
+                    const localIgnore = await enterDirectory(parentIgnore, path, relPath);
                     const entries = await readdir(path, { withFileTypes: true });
                     const children: TreeNode[] = [];
 
-                    // Process entries in parallel, filtering out symlinks
-                    // and ignore-preset paths (.git, node_modules, *.pyc, ...).
-                    // Filtering at the daemon avoids shipping huge
-                    // vendored trees across the wire; the browser used
-                    // to re-filter anyway.
                     await Promise.all(
                         entries.map(async (entry) => {
                             // Skip symbolic links completely
@@ -420,12 +436,21 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                                 return;
                             }
 
-                            if (directoryIgnoreMatcher.shouldIgnore(entry.name)) {
+                            const childRel = relPath
+                                ? `${relPath}/${entry.name}`
+                                : entry.name;
+                            if (localIgnore.ignores(childRel, entry.isDirectory())) {
                                 return;
                             }
 
                             const childPath = join(path, entry.name);
-                            const childNode = await buildTree(childPath, entry.name, currentDepth + 1);
+                            const childNode = await buildTree(
+                                childPath,
+                                entry.name,
+                                currentDepth + 1,
+                                localIgnore,
+                                childRel,
+                            );
                             if (childNode) {
                                 children.push(childNode);
                             }
@@ -459,7 +484,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             // Get the base name for the root node
             const rootPath = validation.resolvedPath!;
             const baseName = rootPath === '/' ? '/' : rootPath.split('/').pop() || rootPath;
-            const tree = await buildTree(rootPath, baseName, 0);
+            const tree = await buildTree(rootPath, baseName, 0, baseDirectoryIgnoreContext, '');
 
             if (!tree) {
                 return { success: false, error: 'Failed to access the specified path' };
