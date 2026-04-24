@@ -4,56 +4,51 @@
  * Upstream dev servers emit absolute paths (e.g. `src="/main.js"`) that would
  * resolve to happy-server's own origin when served through the preview route.
  * This module rewrites those paths to include the per-request prefix
- * (`/v1/preview/{machineId}/{port}`) AND the per-session `ptoken` query param
- * (otherwise every subresource request would fail auth with 401 — see
- * specs/remote-preview-relay Phase 8 H1), and injects a small browser-side
- * shim that:
+ * (`/v1/preview/{machineId}/{port}`) and injects a small browser-side shim
+ * that:
  *
  * - rewrites `fetch(...)` / `XMLHttpRequest.open(...)` to go through the
- *   prefix + ptoken so app-level API calls end up at the same dev server
+ *   prefix so app-level API calls end up at the same dev server
  * - strips the prefix from `window.location.pathname` so SPA routers see
  *   clean paths
  * - stubs `WebSocket` for known HMR protocols (Vite / Next.js / Webpack)
  *
- * Ported from `packages/web-ui/vite.config.ts` `/preview-proxy` middleware —
- * kept in sync with the `preview-api-proxy` spec (R5 / R7).
+ * Auth is delivered via a per-preview HttpOnly cookie set by the relay on
+ * the first response (see previewCookie.ts, Phase 9). The rewriter no
+ * longer touches the auth secret — URLs stay clean so they don't leak into
+ * browser history / referrer / DevTools / CDN cache keys.
+ *
+ * Kept in sync with the `preview-api-proxy` spec (R5 / R7).
  */
 
-// Each regex captures three groups: (prefix/keyword, path, closing-delimiter).
-// Capturing the full path lets us prefix AND tack on ?ptoken in a single pass.
+// Each regex captures three groups: (prefix/keyword, path, closing-delimiter)
+// so the replacement can check `path.startsWith(prefix)` and avoid doubling
+// an already-prefixed URL without a separate post-pass.
 const ABS_PATH_ATTRS = /((?:src|href|action)\s*=\s*["'])(\/(?!\/)[^"']*?)(["'])/g;
 const ABS_PATH_IMPORT = /((?:from|import)\s*\(?\s*["'])(\/(?!\/)[^"']*?)(["'])/g;
 const ABS_PATH_CSS_URL = /(url\(\s*["']?)(\/(?!\/)[^"')\s]*)(["']?\s*\))/g;
 
-function appendPtoken(url: string, ptoken: string): string {
-    // Idempotent: never stack ptoken twice on the same URL. Matches at start
-    // or after ? / & to be safe.
-    if (/(?:^|[?&])ptoken=/.test(url)) return url;
-    const sep = url.indexOf('?') >= 0 ? '&' : '?';
-    return `${url}${sep}ptoken=${encodeURIComponent(ptoken)}`;
-}
-
-function makeReplacer(prefix: string, ptoken: string) {
+function makeReplacer(prefix: string) {
     return (_match: string, pre: string, path: string, tail: string): string => {
         const prefixed = path.startsWith(prefix) ? path : `${prefix}${path}`;
-        return `${pre}${appendPtoken(prefixed, ptoken)}${tail}`;
+        return `${pre}${prefixed}${tail}`;
     };
 }
 
-export function rewriteJsCss(text: string, prefix: string, ptoken: string): string {
-    const rep = makeReplacer(prefix, ptoken);
+export function rewriteJsCss(text: string, prefix: string): string {
+    const rep = makeReplacer(prefix);
     return text
         .replace(ABS_PATH_IMPORT, rep)
         .replace(ABS_PATH_CSS_URL, rep);
 }
 
-export function rewriteHtml(html: string, prefix: string, ptoken: string): string {
-    const rep = makeReplacer(prefix, ptoken);
+export function rewriteHtml(html: string, prefix: string): string {
+    const rep = makeReplacer(prefix);
     let out = html
         .replace(ABS_PATH_ATTRS, rep)
         .replace(ABS_PATH_IMPORT, rep);
 
-    const interceptor = buildInterceptorScript(prefix, ptoken);
+    const interceptor = buildInterceptorScript(prefix);
     if (out.includes('<head>')) {
         out = out.replace('<head>', `<head>${interceptor}`);
     } else if (out.includes('<html>')) {
@@ -64,20 +59,17 @@ export function rewriteHtml(html: string, prefix: string, ptoken: string): strin
     return out;
 }
 
-function buildInterceptorScript(prefix: string, ptoken: string): string {
+function buildInterceptorScript(prefix: string): string {
     // Kept as a single string so the rewriter doesn't accidentally patch its
-    // own path literals. Escape single quotes inside prefix/ptoken so the
-    // embedded `var P='…'`/`var T='…'` stay syntactically valid.
+    // own path literals. Escape single quotes in prefix so the embedded
+    // `var P='…'` stays syntactically valid.
     const p = prefix.replace(/'/g, "\\'");
-    const t = ptoken.replace(/'/g, "\\'");
     return (
         `<script>(function(){` +
-        `var P='${p}';var T='${t}';` +
+        `var P='${p}';` +
         `function rw(u){` +
         `if(typeof u!=='string'||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;` +
-        `var x=u.indexOf(P)===0?u:P+u;` +
-        `if(/(?:^|[?&])ptoken=/.test(x))return x;` +
-        `return x+(x.indexOf('?')>=0?'&':'?')+'ptoken='+encodeURIComponent(T)` +
+        `return u.indexOf(P)===0?u:P+u` +
         `}` +
         `var loc=window.location.pathname;` +
         `if(loc.indexOf(P)===0){history.replaceState(null,'',loc.slice(P.length)||'/')}` +

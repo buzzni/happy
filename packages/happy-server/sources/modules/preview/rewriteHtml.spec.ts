@@ -2,136 +2,141 @@ import { describe, it, expect } from 'vitest';
 import { rewriteHtml, rewriteJsCss } from '@/modules/preview/rewriteHtml';
 
 const PREFIX = '/v1/preview/m1/3000';
-const PTOKEN = 'tkn-abc123';
-// Every subresource the iframe pulls through the relay needs its own ptoken
-// — the browser only carries the query string of the initial iframe src,
-// so rewritten URLs must bake the token in. See plan.md Phase 8 H1.
-const T = `ptoken=${encodeURIComponent(PTOKEN)}`;
+
+// Phase 9: the auth secret no longer travels via URL — the relay sets a
+// path-scoped HttpOnly cookie on the first response, and every subsequent
+// subresource request picks it up automatically. The rewriter must stop
+// appending ?ptoken= to rewritten URLs. See plan.md Phase 9 step 3.
 
 describe('rewriteHtml — absolute path rewriting', () => {
-    it('rewrites src="/..." to prefix + ptoken', () => {
-        const out = rewriteHtml('<img src="/logo.png">', PREFIX, PTOKEN);
-        expect(out).toContain(`src="${PREFIX}/logo.png?${T}"`);
+    it('rewrites src="/..." to prefix', () => {
+        const out = rewriteHtml('<img src="/logo.png">', PREFIX);
+        expect(out).toContain(`src="${PREFIX}/logo.png"`);
     });
 
-    it('rewrites href="/..." to prefix + ptoken', () => {
-        const out = rewriteHtml('<link href="/main.css">', PREFIX, PTOKEN);
-        expect(out).toContain(`href="${PREFIX}/main.css?${T}"`);
+    it('rewrites href="/..." to prefix', () => {
+        const out = rewriteHtml('<link href="/main.css">', PREFIX);
+        expect(out).toContain(`href="${PREFIX}/main.css"`);
     });
 
-    it('rewrites action="/..." to prefix + ptoken', () => {
-        const out = rewriteHtml('<form action="/submit">', PREFIX, PTOKEN);
-        expect(out).toContain(`action="${PREFIX}/submit?${T}"`);
+    it('rewrites action="/..." to prefix', () => {
+        const out = rewriteHtml('<form action="/submit">', PREFIX);
+        expect(out).toContain(`action="${PREFIX}/submit"`);
     });
 
-    it('uses & separator when the path already has a query string', () => {
-        const out = rewriteHtml('<script src="/a.js?v=1"></script>', PREFIX, PTOKEN);
-        expect(out).toContain(`src="${PREFIX}/a.js?v=1&${T}"`);
+    it('preserves the original query string on rewritten paths', () => {
+        const out = rewriteHtml('<script src="/a.js?v=1"></script>', PREFIX);
+        expect(out).toContain(`src="${PREFIX}/a.js?v=1"`);
     });
 
-    it('does not append ptoken a second time when it is already present', () => {
-        const already = `<img src="/logo.png?${T}">`;
-        const out = rewriteHtml(already, PREFIX, PTOKEN);
-        expect(out).toContain(`src="${PREFIX}/logo.png?${T}"`);
-        // The src attribute must carry exactly one ptoken — scope the count
-        // to the attribute so the interceptor script's literals don't leak
-        // into the assertion.
-        const srcAttr = out.match(/src="[^"]+"/)?.[0] ?? '';
-        expect(srcAttr.match(/ptoken=/g) ?? []).toHaveLength(1);
-    });
-
-    it('leaves protocol-relative paths (//cdn/...) untouched — no prefix, no ptoken', () => {
-        const out = rewriteHtml('<script src="//cdn.example.com/lib.js"></script>', PREFIX, PTOKEN);
+    it('leaves protocol-relative paths (//cdn/...) untouched', () => {
+        const out = rewriteHtml('<script src="//cdn.example.com/lib.js"></script>', PREFIX);
         expect(out).toContain('src="//cdn.example.com/lib.js"');
         expect(out).not.toContain(`${PREFIX}//cdn`);
-        expect(out).not.toContain(`cdn.example.com/lib.js?${T}`);
     });
 
-    it('does not double-rewrite already-prefixed paths but DOES add ptoken', () => {
+    it('does not double-rewrite already-prefixed paths', () => {
         const already = `<img src="${PREFIX}/logo.png">`;
-        const out = rewriteHtml(already, PREFIX, PTOKEN);
-        expect(out).toContain(`src="${PREFIX}/logo.png?${T}"`);
+        const out = rewriteHtml(already, PREFIX);
+        expect(out).toContain(`src="${PREFIX}/logo.png"`);
         expect(out).not.toContain(`${PREFIX}${PREFIX}`);
     });
 
     it('rewrites ES module imports starting with /', () => {
-        const out = rewriteHtml(`<script type="module">import foo from '/src/foo.js'</script>`, PREFIX, PTOKEN);
-        expect(out).toContain(`'${PREFIX}/src/foo.js?${T}'`);
+        const out = rewriteHtml(`<script type="module">import foo from '/src/foo.js'</script>`, PREFIX);
+        expect(out).toContain(`'${PREFIX}/src/foo.js'`);
     });
 
     it('rewrites from "/..." in dynamic imports', () => {
-        const out = rewriteHtml(`<script>import('/x.js')</script>`, PREFIX, PTOKEN);
-        expect(out).toContain(`'${PREFIX}/x.js?${T}'`);
+        const out = rewriteHtml(`<script>import('/x.js')</script>`, PREFIX);
+        expect(out).toContain(`'${PREFIX}/x.js'`);
     });
 
-    it('leaves external absolute URLs untouched — no ptoken', () => {
-        const out = rewriteHtml('<a href="https://example.com/x">ok</a>', PREFIX, PTOKEN);
+    it('leaves external absolute URLs untouched', () => {
+        const out = rewriteHtml('<a href="https://example.com/x">ok</a>', PREFIX);
         expect(out).toContain('href="https://example.com/x"');
-        expect(out).not.toContain(`example.com/x?${T}`);
+    });
+
+    it('does not append ?ptoken= to any rewritten src/href/action attribute', () => {
+        // Phase 9: URLs must stay clean — cookie-based auth replaces it.
+        const input = '<img src="/a.png"><link href="/b.css"><form action="/c"></form>';
+        const out = rewriteHtml(input, PREFIX);
+        // Scope the assertion to the attribute values so the interceptor
+        // script's internal literals (there are none for ptoken in Phase 9,
+        // but keep the check explicit) can't cross-contaminate.
+        const attrValues = (out.match(/(?:src|href|action)="[^"]+"/g) ?? []).join('\n');
+        expect(attrValues).not.toContain('ptoken=');
     });
 });
 
 describe('rewriteHtml — interceptor injection', () => {
     it('injects the interceptor script after <head>', () => {
-        const out = rewriteHtml('<html><head></head><body></body></html>', PREFIX, PTOKEN);
+        const out = rewriteHtml('<html><head></head><body></body></html>', PREFIX);
         expect(out).toMatch(/<head><script>/);
     });
 
     it('injects after <html> when <head> is absent', () => {
-        const out = rewriteHtml('<html><body></body></html>', PREFIX, PTOKEN);
+        const out = rewriteHtml('<html><body></body></html>', PREFIX);
         expect(out).toMatch(/<html><script>/);
     });
 
     it('prepends interceptor when neither <head> nor <html> is present', () => {
-        const out = rewriteHtml('<div>naked fragment</div>', PREFIX, PTOKEN);
+        const out = rewriteHtml('<div>naked fragment</div>', PREFIX);
         expect(out.startsWith('<script>')).toBe(true);
         expect(out).toContain('<div>naked fragment</div>');
     });
 
     it('interceptor embeds the configured prefix', () => {
-        const out = rewriteHtml('<html><head></head><body></body></html>', PREFIX, PTOKEN);
+        const out = rewriteHtml('<html><head></head><body></body></html>', PREFIX);
         expect(out).toContain(`var P='${PREFIX}'`);
     });
 
-    it('interceptor embeds the configured ptoken', () => {
-        const out = rewriteHtml('<html><head></head><body></body></html>', PREFIX, PTOKEN);
-        expect(out).toContain(`var T='${PTOKEN}'`);
+    it('interceptor no longer embeds a ptoken constant (cookie replaces it)', () => {
+        const out = rewriteHtml('<html><head></head><body></body></html>', PREFIX);
+        expect(out).not.toContain(`var T=`);
+        expect(out).not.toContain('ptoken=');
     });
 
     it('interceptor patches fetch and XMLHttpRequest', () => {
-        const out = rewriteHtml('<html><head></head></html>', PREFIX, PTOKEN);
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
         expect(out).toContain('window.fetch');
         expect(out).toContain('XMLHttpRequest.prototype.open');
     });
 
     it('interceptor stubs WebSocket for HMR protocols', () => {
-        const out = rewriteHtml('<html><head></head></html>', PREFIX, PTOKEN);
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
         expect(out).toContain('NoopWS');
         expect(out).toContain('vite-hmr');
     });
 });
 
 describe('rewriteJsCss', () => {
-    it('rewrites ES import paths with ptoken', () => {
-        const out = rewriteJsCss(`import x from '/lib/x.js'`, PREFIX, PTOKEN);
-        expect(out).toContain(`'${PREFIX}/lib/x.js?${T}'`);
+    it('rewrites ES import paths', () => {
+        const out = rewriteJsCss(`import x from '/lib/x.js'`, PREFIX);
+        expect(out).toContain(`'${PREFIX}/lib/x.js'`);
     });
 
-    it('rewrites CSS url() references with ptoken', () => {
-        const out = rewriteJsCss(`.bg{background:url("/img/bg.png")}`, PREFIX, PTOKEN);
-        expect(out).toContain(`url("${PREFIX}/img/bg.png?${T}")`);
+    it('rewrites CSS url() references', () => {
+        const out = rewriteJsCss(`.bg{background:url("/img/bg.png")}`, PREFIX);
+        expect(out).toContain(`url("${PREFIX}/img/bg.png")`);
     });
 
-    it('leaves protocol-relative paths untouched; already-prefixed paths get ptoken only', () => {
+    it('leaves protocol-relative paths untouched and does not double-prefix', () => {
         const input = `import a from '//cdn/lib.js'; import b from '${PREFIX}/local.js';`;
-        const out = rewriteJsCss(input, PREFIX, PTOKEN);
+        const out = rewriteJsCss(input, PREFIX);
         expect(out).toContain("'//cdn/lib.js'");
-        expect(out).toContain(`'${PREFIX}/local.js?${T}'`);
+        expect(out).toContain(`'${PREFIX}/local.js'`);
         expect(out).not.toContain(`${PREFIX}${PREFIX}`);
     });
 
-    it('preserves existing query strings and appends ptoken with &', () => {
-        const out = rewriteJsCss(`@import url("/theme.css?v=2")`, PREFIX, PTOKEN);
-        expect(out).toContain(`url("${PREFIX}/theme.css?v=2&${T}")`);
+    it('preserves existing query strings on rewritten paths', () => {
+        const out = rewriteJsCss(`@import url("/theme.css?v=2")`, PREFIX);
+        expect(out).toContain(`url("${PREFIX}/theme.css?v=2")`);
+    });
+
+    it('does not append ?ptoken= to rewritten URLs', () => {
+        const input = `import x from '/a.js'; .bg{background:url("/img/b.png")}`;
+        const out = rewriteJsCss(input, PREFIX);
+        expect(out).not.toContain('ptoken=');
     });
 });

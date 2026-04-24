@@ -229,13 +229,13 @@ export function previewRoutes(app: Fastify) {
                 let responseBody: Buffer = Buffer.from(rpcResponse.bodyB64, 'base64');
 
                 if (contentType.includes('text/html')) {
-                    responseBody = Buffer.from(rewriteHtml(responseBody.toString('utf-8'), prefix, token), 'utf-8');
+                    responseBody = Buffer.from(rewriteHtml(responseBody.toString('utf-8'), prefix), 'utf-8');
                 } else if (
                     contentType.includes('javascript') ||
                     contentType.includes('typescript') ||
                     contentType.includes('text/css')
                 ) {
-                    responseBody = Buffer.from(rewriteJsCss(responseBody.toString('utf-8'), prefix, token), 'utf-8');
+                    responseBody = Buffer.from(rewriteJsCss(responseBody.toString('utf-8'), prefix), 'utf-8');
                 }
 
                 const outHeaders = stripResponseHeaders(rpcResponse.headers);
