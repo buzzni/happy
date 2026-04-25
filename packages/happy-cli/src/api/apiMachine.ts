@@ -183,41 +183,55 @@ export class ApiMachineClient {
             return { message: 'Daemon stop request acknowledged, starting shutdown sequence...' };
         });
 
-        // Register port allocation handler (sticky per-project port in 30000-40000)
+        // Register port allocation handler — sticky per (user, project)
+        // composite key in 30000-40000 since specs/preview-cross-user-
+        // isolation/ Phase 4. Both userId and projectId are required.
         this.rpcHandlerManager.registerHandler('allocate-port', async (params: any) => {
-            const { projectId } = params || {};
+            const { userId, projectId } = params || {};
+            if (!userId || typeof userId !== 'string') {
+                throw new Error('userId is required');
+            }
             if (!projectId || typeof projectId !== 'string') {
                 throw new Error('projectId is required');
             }
-            const result = await portRegistry.allocate(projectId);
-            logger.debug(`[API MACHINE] allocate-port ${projectId} -> ${result.port} (reused=${result.reused})`);
+            const result = await portRegistry.allocate(userId, projectId);
+            logger.debug(`[API MACHINE] allocate-port ${userId}:${projectId} -> ${result.port} (reused=${result.reused})`);
             return result;
         });
 
         // Register read-only port lookup handler. Used by web-ui preflight
-        // (specs/preview-server-lifecycle/ Phase 1) to check whether a project
-        // already has a sticky port assigned before deciding to start a new
-        // server. Does not mutate the registry and does not probe the port.
+        // (specs/preview-server-lifecycle/ Phase 1) to check whether a (user,
+        // project) already has a sticky port assigned before deciding to
+        // start a new server. Falls back to the legacy bare-projectId entry
+        // so daemons that have not yet seen the new composite key still
+        // resolve the right port for the original owner.
         this.rpcHandlerManager.registerHandler('get-port', async (params: any) => {
-            const { projectId } = params || {};
+            const { userId, projectId } = params || {};
+            if (!userId || typeof userId !== 'string') {
+                throw new Error('userId is required');
+            }
             if (!projectId || typeof projectId !== 'string') {
                 throw new Error('projectId is required');
             }
             const data = await portRegistry.readAll();
-            const entry = data[projectId];
+            const entry = data[`${userId}:${projectId}`] ?? data[projectId];
             const port = entry ? entry.port : null;
-            logger.debug(`[API MACHINE] get-port ${projectId} -> ${port}`);
+            logger.debug(`[API MACHINE] get-port ${userId}:${projectId} -> ${port}`);
             return { port };
         });
 
-        // Register port release handler (e.g., on project deletion)
+        // Register port release handler (e.g., on project deletion). userId
+        // is required to scope the release to the correct (user, project).
         this.rpcHandlerManager.registerHandler('release-port', async (params: any) => {
-            const { projectId } = params || {};
+            const { userId, projectId } = params || {};
+            if (!userId || typeof userId !== 'string') {
+                throw new Error('userId is required');
+            }
             if (!projectId || typeof projectId !== 'string') {
                 throw new Error('projectId is required');
             }
-            const released = await portRegistry.release(projectId);
-            logger.debug(`[API MACHINE] release-port ${projectId} -> released=${released}`);
+            const released = await portRegistry.release(userId, projectId);
+            logger.debug(`[API MACHINE] release-port ${userId}:${projectId} -> released=${released}`);
             return { released };
         });
 

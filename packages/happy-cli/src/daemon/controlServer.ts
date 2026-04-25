@@ -179,10 +179,14 @@ export function startDaemonControlServer({
       }
     });
 
-    // Allocate a port for a project (returns existing sticky port or a fresh one)
+    // Allocate a port for a (user, project) — composite-keyed since
+    // specs/preview-cross-user-isolation/ Phase 4. userId is required so
+    // two users on the same machine cannot collide on a shared projectId
+    // string.
     typed.post('/allocate-port', {
       schema: {
         body: z.object({
+          userId: z.string().min(1),
           projectId: z.string().min(1)
         }),
         response: {
@@ -196,23 +200,24 @@ export function startDaemonControlServer({
         }
       }
     }, async (request, reply) => {
-      const { projectId } = request.body;
+      const { userId, projectId } = request.body;
       try {
-        const result = await portRegistry.allocate(projectId);
-        logger.debug(`[CONTROL SERVER] Allocated port ${result.port} for project ${projectId} (reused=${result.reused})`);
+        const result = await portRegistry.allocate(userId, projectId);
+        logger.debug(`[CONTROL SERVER] Allocated port ${result.port} for ${userId}:${projectId} (reused=${result.reused})`);
         return result;
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
-        logger.debug(`[CONTROL SERVER] Port allocation failed for ${projectId}: ${message}`);
+        logger.debug(`[CONTROL SERVER] Port allocation failed for ${userId}:${projectId}: ${message}`);
         reply.code(503);
         return { error: message };
       }
     });
 
-    // Release a project's port binding (e.g., on project deletion)
+    // Release a (user, project) port binding (e.g., on project deletion)
     typed.post('/release-port', {
       schema: {
         body: z.object({
+          userId: z.string().min(1),
           projectId: z.string().min(1)
         }),
         response: {
@@ -222,19 +227,23 @@ export function startDaemonControlServer({
         }
       }
     }, async (request) => {
-      const { projectId } = request.body;
-      const released = await portRegistry.release(projectId);
-      logger.debug(`[CONTROL SERVER] Release port for ${projectId}: released=${released}`);
+      const { userId, projectId } = request.body;
+      const released = await portRegistry.release(userId, projectId);
+      logger.debug(`[CONTROL SERVER] Release port for ${userId}:${projectId}: released=${released}`);
       return { released };
     });
 
-    // Look up the registered port for a single project without allocating
-    // one. Used by web-ui preflight (specs/preview-server-lifecycle/ Phase 1)
-    // to decide whether an existing server is reusable before firing a new
-    // `startServerDirect` call.
+    // Look up the registered port for a single (user, project) without
+    // allocating one. Used by web-ui preflight (specs/preview-server-
+    // lifecycle/ Phase 1) to decide whether an existing server is
+    // reusable before firing a new `startServerDirect` call. userId is
+    // required (Phase 4) — the legacy bare-projectId entry is also
+    // returned as a fallback so a daemon that has not yet seen the new
+    // composite key still serves the right port for the original owner.
     typed.get('/get-port', {
       schema: {
         querystring: z.object({
+          userId: z.string().min(1),
           projectId: z.string().min(1)
         }),
         response: {
@@ -244,9 +253,9 @@ export function startDaemonControlServer({
         }
       }
     }, async (request) => {
-      const { projectId } = request.query
+      const { userId, projectId } = request.query
       const data = await portRegistry.readAll()
-      const entry = data[projectId]
+      const entry = data[`${userId}:${projectId}`] ?? data[projectId]
       return { port: entry ? entry.port : null }
     });
 

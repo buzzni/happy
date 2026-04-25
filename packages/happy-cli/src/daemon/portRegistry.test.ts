@@ -22,40 +22,40 @@ describe('portRegistry', () => {
   const neverBindable = async () => false
   const bindableExcept = (blocked: Set<number>) => async (port: number) => !blocked.has(port)
 
-  it('allocates the lowest port in range for a new projectId', async () => {
+  it('allocates the lowest port in range for a new (user, project)', async () => {
     const reg = createPortRegistry({
       filePath: file,
       portMin: 30000,
       portMax: 30010,
       isPortBindable: alwaysBindable,
     })
-    const result = await reg.allocate('proj-a')
+    const result = await reg.allocate('user-A', 'proj-a')
     expect(result).toEqual({ port: 30000, reused: false })
   })
 
-  it('returns the same port when the same projectId allocates twice (reused: true)', async () => {
+  it('returns the same port when the same (user, project) allocates twice (reused: true)', async () => {
     const reg = createPortRegistry({
       filePath: file,
       portMin: 30000,
       portMax: 30010,
       isPortBindable: alwaysBindable,
     })
-    const first = await reg.allocate('proj-a')
-    const second = await reg.allocate('proj-a')
+    const first = await reg.allocate('user-A', 'proj-a')
+    const second = await reg.allocate('user-A', 'proj-a')
     expect(second.port).toBe(first.port)
     expect(second.reused).toBe(true)
   })
 
-  it('allocates distinct ports to different projectIds', async () => {
+  it('allocates distinct ports to different projectIds for the same user', async () => {
     const reg = createPortRegistry({
       filePath: file,
       portMin: 30000,
       portMax: 30010,
       isPortBindable: alwaysBindable,
     })
-    const a = await reg.allocate('proj-a')
-    const b = await reg.allocate('proj-b')
-    const c = await reg.allocate('proj-c')
+    const a = await reg.allocate('user-A', 'proj-a')
+    const b = await reg.allocate('user-A', 'proj-b')
+    const c = await reg.allocate('user-A', 'proj-c')
     expect(new Set([a.port, b.port, c.port]).size).toBe(3)
   })
 
@@ -66,8 +66,8 @@ describe('portRegistry', () => {
       portMax: 30010,
       isPortBindable: alwaysBindable,
     })
-    await reg.allocate('proj-a')
-    const b = await reg.allocate('proj-b')
+    await reg.allocate('user-A', 'proj-a')
+    const b = await reg.allocate('user-A', 'proj-b')
     expect(b.port).toBe(30001)
   })
 
@@ -78,7 +78,7 @@ describe('portRegistry', () => {
       portMax: 30010,
       isPortBindable: bindableExcept(new Set([30000, 30001])),
     })
-    const result = await reg.allocate('proj-a')
+    const result = await reg.allocate('user-A', 'proj-a')
     expect(result.port).toBe(30002)
   })
 
@@ -89,7 +89,7 @@ describe('portRegistry', () => {
       portMax: 30010,
       isPortBindable: alwaysBindable,
     })
-    const initial = await firstReg.allocate('proj-a')
+    const initial = await firstReg.allocate('user-A', 'proj-a')
     expect(initial.port).toBe(30000)
 
     const secondReg = createPortRegistry({
@@ -98,7 +98,7 @@ describe('portRegistry', () => {
       portMax: 30010,
       isPortBindable: bindableExcept(new Set([30000])),
     })
-    const reallocated = await secondReg.allocate('proj-a')
+    const reallocated = await secondReg.allocate('user-A', 'proj-a')
     expect(reallocated.port).not.toBe(30000)
     expect(reallocated.reused).toBe(false)
   })
@@ -110,9 +110,9 @@ describe('portRegistry', () => {
       portMax: 30001,
       isPortBindable: alwaysBindable,
     })
-    await reg.allocate('proj-a')
-    await reg.allocate('proj-b')
-    await expect(reg.allocate('proj-c')).rejects.toThrow(/No available port/)
+    await reg.allocate('user-A', 'proj-a')
+    await reg.allocate('user-A', 'proj-b')
+    await expect(reg.allocate('user-A', 'proj-c')).rejects.toThrow(/No available port/)
   })
 
   it('throws when no port in the range is bindable', async () => {
@@ -122,7 +122,7 @@ describe('portRegistry', () => {
       portMax: 30002,
       isPortBindable: neverBindable,
     })
-    await expect(reg.allocate('proj-a')).rejects.toThrow(/No available port/)
+    await expect(reg.allocate('user-A', 'proj-a')).rejects.toThrow(/No available port/)
   })
 
   it('persists allocations to disk across registry instances', async () => {
@@ -132,7 +132,7 @@ describe('portRegistry', () => {
       portMax: 30010,
       isPortBindable: alwaysBindable,
     })
-    await first.allocate('proj-a')
+    await first.allocate('user-A', 'proj-a')
 
     const second = createPortRegistry({
       filePath: file,
@@ -140,7 +140,7 @@ describe('portRegistry', () => {
       portMax: 30010,
       isPortBindable: alwaysBindable,
     })
-    const reused = await second.allocate('proj-a')
+    const reused = await second.allocate('user-A', 'proj-a')
     expect(reused.port).toBe(30000)
     expect(reused.reused).toBe(true)
   })
@@ -152,21 +152,21 @@ describe('portRegistry', () => {
       portMax: 30010,
       isPortBindable: alwaysBindable,
     })
-    await reg.allocate('proj-a')
-    const released = await reg.release('proj-a')
+    await reg.allocate('user-A', 'proj-a')
+    const released = await reg.release('user-A', 'proj-a')
     expect(released).toBe(true)
     const all = await reg.readAll()
-    expect(all['proj-a']).toBeUndefined()
+    expect(all['user-A:proj-a']).toBeUndefined()
   })
 
-  it('release returns false for an unknown projectId', async () => {
+  it('release returns false for an unknown (user, project)', async () => {
     const reg = createPortRegistry({
       filePath: file,
       portMin: 30000,
       portMax: 30010,
       isPortBindable: alwaysBindable,
     })
-    const released = await reg.release('missing')
+    const released = await reg.release('user-A', 'missing')
     expect(released).toBe(false)
   })
 
@@ -177,9 +177,9 @@ describe('portRegistry', () => {
       portMax: 30010,
       isPortBindable: alwaysBindable,
     })
-    const a = await reg.allocate('proj-a')
-    await reg.release('proj-a')
-    const b = await reg.allocate('proj-b')
+    const a = await reg.allocate('user-A', 'proj-a')
+    await reg.release('user-A', 'proj-a')
+    const b = await reg.allocate('user-A', 'proj-b')
     expect(b.port).toBe(a.port)
   })
 
@@ -191,10 +191,10 @@ describe('portRegistry', () => {
       isPortBindable: alwaysBindable,
     })
     const results = await Promise.all([
-      reg.allocate('p1'),
-      reg.allocate('p2'),
-      reg.allocate('p3'),
-      reg.allocate('p4'),
+      reg.allocate('user-A', 'p1'),
+      reg.allocate('user-A', 'p2'),
+      reg.allocate('user-A', 'p3'),
+      reg.allocate('user-A', 'p4'),
     ])
     const ports = results.map((r) => r.port)
     expect(new Set(ports).size).toBe(4)
@@ -224,7 +224,7 @@ describe('portRegistry', () => {
       portMax: 30010,
       isPortBindable: alwaysBindable,
     })
-    const result = await reg.allocate('proj-a')
+    const result = await reg.allocate('user-A', 'proj-a')
     expect(result.port).toBe(30000)
   })
 
@@ -236,8 +236,110 @@ describe('portRegistry', () => {
       portMax: 30010,
       isPortBindable: alwaysBindable,
     })
-    await reg.allocate('proj-a')
+    await reg.allocate('user-A', 'proj-a')
     const content = await fs.readFile(nested, 'utf-8')
-    expect(JSON.parse(content)).toHaveProperty('proj-a')
+    expect(JSON.parse(content)).toHaveProperty('user-A:proj-a')
+  })
+
+  // Phase 4 — per-user isolation guarantees.
+  describe('per-user isolation', () => {
+    it('gives different ports to two users that share the same projectId string', async () => {
+      const reg = createPortRegistry({
+        filePath: file,
+        portMin: 30000,
+        portMax: 30010,
+        isPortBindable: alwaysBindable,
+      })
+      const a = await reg.allocate('user-A', 'shared-name')
+      const b = await reg.allocate('user-B', 'shared-name')
+      expect(a.port).not.toBe(b.port)
+    })
+
+    it("user A's release does not affect user B's entry for the same projectId", async () => {
+      const reg = createPortRegistry({
+        filePath: file,
+        portMin: 30000,
+        portMax: 30010,
+        isPortBindable: alwaysBindable,
+      })
+      const a = await reg.allocate('user-A', 'shared-name')
+      const b = await reg.allocate('user-B', 'shared-name')
+      const releasedA = await reg.release('user-A', 'shared-name')
+      expect(releasedA).toBe(true)
+      const all = await reg.readAll()
+      expect(all['user-A:shared-name']).toBeUndefined()
+      expect(all['user-B:shared-name']?.port).toBe(b.port)
+    })
+
+    it('persists userId and projectId on each entry value', async () => {
+      const reg = createPortRegistry({
+        filePath: file,
+        portMin: 30000,
+        portMax: 30010,
+        isPortBindable: alwaysBindable,
+      })
+      await reg.allocate('user-A', 'proj-a')
+      const all = await reg.readAll()
+      expect(all['user-A:proj-a']?.userId).toBe('user-A')
+      expect(all['user-A:proj-a']?.projectId).toBe('proj-a')
+    })
+  })
+
+  // Phase 4 — migration of legacy entries written before composite keys.
+  describe('legacy entry migration', () => {
+    it('upgrades a legacy projectId-keyed entry to userId:projectId on first matching allocate', async () => {
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      await fs.writeFile(
+        file,
+        JSON.stringify({ 'proj-old': { port: 30005, allocatedAt: 100 } }),
+      )
+      const reg = createPortRegistry({
+        filePath: file,
+        portMin: 30000,
+        portMax: 30010,
+        isPortBindable: alwaysBindable,
+      })
+      const result = await reg.allocate('user-A', 'proj-old')
+      expect(result).toEqual({ port: 30005, reused: true })
+      const all = await reg.readAll()
+      expect(all['proj-old']).toBeUndefined()
+      expect(all['user-A:proj-old']?.port).toBe(30005)
+      expect(all['user-A:proj-old']?.userId).toBe('user-A')
+    })
+
+    it('does not reuse a legacy port when its bind test fails', async () => {
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      await fs.writeFile(
+        file,
+        JSON.stringify({ 'proj-old': { port: 30005, allocatedAt: 100 } }),
+      )
+      const reg = createPortRegistry({
+        filePath: file,
+        portMin: 30000,
+        portMax: 30010,
+        isPortBindable: bindableExcept(new Set([30005])),
+      })
+      const result = await reg.allocate('user-A', 'proj-old')
+      expect(result.port).not.toBe(30005)
+      expect(result.reused).toBe(false)
+    })
+
+    it('release accepts a legacy bare-projectId entry and removes it', async () => {
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      await fs.writeFile(
+        file,
+        JSON.stringify({ 'proj-old': { port: 30005, allocatedAt: 100 } }),
+      )
+      const reg = createPortRegistry({
+        filePath: file,
+        portMin: 30000,
+        portMax: 30010,
+        isPortBindable: alwaysBindable,
+      })
+      const released = await reg.release('user-A', 'proj-old')
+      expect(released).toBe(true)
+      const all = await reg.readAll()
+      expect(all['proj-old']).toBeUndefined()
+    })
   })
 })
