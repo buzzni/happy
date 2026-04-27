@@ -7,6 +7,8 @@ import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { allocateUserSeq } from "@/storage/seq";
 import { log } from "@/utils/log";
 import { AccountProfile } from "@/types";
+import { Context } from "@/context";
+import { accountUpdateProfile } from "@/app/account/accountUpdateProfile";
 
 export function accountRoutes(app: Fastify) {
     app.get('/v1/account/profile', {
@@ -32,6 +34,47 @@ export function accountRoutes(app: Fastify) {
             username: user.username,
             avatar: user.avatar ? { ...user.avatar, url: getPublicUrl(user.avatar.path) } : null,
             github: user.githubUser ? user.githubUser.profile : null,
+            connectedServices: Array.from(connectedVendors)
+        });
+    });
+
+    // Update Account Profile (specs/happy-server-identity-sync Phase 1).
+    // Mirrors GET /v1/account/profile's response shape so clients can reuse
+    // the same parsing path. Web-ui invokes this on login and on
+    // company-context switch to keep Account.username/firstName in sync
+    // with users.json / companies.json — see specs/happy-server-identity-sync.
+    app.patch('/v1/account/profile', {
+        preHandler: app.authenticate,
+        schema: {
+            body: z.object({
+                username: z.string().min(1).max(40).optional(),
+                firstName: z.string().max(80).optional(),
+                lastName: z.string().max(80).optional(),
+            })
+        }
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const ctx = Context.create(userId);
+        const result = await accountUpdateProfile(ctx, request.body);
+        if (!result.ok) {
+            const status = result.error === 'username-taken' ? 409 : 400;
+            return reply.code(status).send({ error: result.error });
+        }
+        const githubProfile = result.value.githubUser
+            ? (result.value.githubUser as { profile: unknown }).profile
+            : null;
+        const avatar = result.value.avatar as { path: string } | null;
+        const connectedVendors = new Set(
+            (await db.serviceAccountToken.findMany({ where: { accountId: userId } })).map(t => t.vendor)
+        );
+        return reply.send({
+            id: userId,
+            timestamp: Date.now(),
+            firstName: result.value.firstName,
+            lastName: result.value.lastName,
+            username: result.value.username,
+            avatar: avatar ? { ...avatar, url: getPublicUrl(avatar.path) } : null,
+            github: githubProfile,
             connectedServices: Array.from(connectedVendors)
         });
     });
