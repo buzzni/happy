@@ -1,4 +1,13 @@
 /**
+ * DEPRECATED — DELETE-AFTER: 2026-05-30
+ *
+ * Continuous identity sync now lives in:
+ *   - happy-server: PATCH /v1/account/profile (accountUpdateProfile.ts)
+ *   - web-ui: updateHappyProfile() called from initSync() on every login
+ *     and company-context switch.
+ * See specs/happy-server-identity-sync/. Once 30 days of post-deploy
+ * monitoring confirm new gaps don't appear, remove this script.
+ *
  * One-shot backfill: heal the missing identity sync between web-ui
  * (~/.aplus-dev/) and happy-server's Account table.
  *
