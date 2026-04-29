@@ -27,6 +27,7 @@ interface ChatHeaderViewProps {
     avatarMenuSession?: Session | null;
     onAfterAvatarArchive?: () => void;
     onAfterAvatarDelete?: () => void;
+    onNewSessionPress?: () => void;
 }
 
 export const ChatHeaderView: React.FC<ChatHeaderViewProps> = ({
@@ -42,6 +43,7 @@ export const ChatHeaderView: React.FC<ChatHeaderViewProps> = ({
     avatarMenuSession,
     onAfterAvatarArchive,
     onAfterAvatarDelete,
+    onNewSessionPress,
 }) => {
     const { theme } = useUnistyles();
     const navigation = useNavigation();
@@ -157,6 +159,16 @@ export const ChatHeaderView: React.FC<ChatHeaderViewProps> = ({
                         )}
                     </View>
 
+                    {onNewSessionPress && (
+                        <Pressable
+                            onPress={onNewSessionPress}
+                            hitSlop={15}
+                            style={styles.newSessionButton}
+                        >
+                            <Ionicons name="add-outline" size={28} color={theme.colors.header.tint} />
+                        </Pressable>
+                    )}
+
                     {avatarId && onAvatarPress && (
                         <View collapsable={false} ref={avatarAnchorRef} style={styles.avatarButtonSlot}>
                             {avatarMenuSession ? (
@@ -242,6 +254,12 @@ const styles = StyleSheet.create({
         fontSize: 12,
         fontWeight: '400',
         lineHeight: 14,
+    },
+    newSessionButton: {
+        width: 44,
+        height: 44,
+        alignItems: 'center',
+        justifyContent: 'center',
     },
     avatarButtonSlot: {
         marginRight: Platform.select({ ios: -8, default: -8 }),

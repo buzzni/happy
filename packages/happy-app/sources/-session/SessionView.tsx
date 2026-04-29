@@ -132,6 +132,7 @@ export const SessionView = React.memo((props: { id: string }) => {
                     <ChatHeaderView
                         {...headerProps}
                         onBackPress={() => router.back()}
+                        onNewSessionPress={() => router.navigate('/new')}
                         avatarMenuExpanded={Platform.OS === 'web' && !!sessionActionsAnchor}
                         avatarMenuSession={session}
                         onAfterAvatarArchive={() => {
