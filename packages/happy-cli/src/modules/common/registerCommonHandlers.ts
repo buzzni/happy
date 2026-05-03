@@ -1,9 +1,9 @@
 import { logger } from '@/ui/logger';
 import { exec, ExecOptions } from 'child_process';
 import { promisify } from 'util';
-import { readFile, writeFile, readdir, stat } from 'fs/promises';
+import { readFile, writeFile, readdir, stat, mkdir } from 'fs/promises';
 import { createHash } from 'crypto';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { run as runRipgrep } from '@/modules/ripgrep/index';
 import { run as runDifftastic } from '@/modules/difftastic/index';
 import { RpcHandlerManager } from '../../api/rpc/RpcHandlerManager';
@@ -322,8 +322,13 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                 }
             }
 
-            // Write the file
+            // Write the file. Auto-create the parent directory so the
+            // first writeFile to a freshly-bound project doesn't fail
+            // with ENOENT (specs/project-workspace-auto-create/ Phase 2).
+            // mkdir({ recursive: true }) is idempotent and stays inside
+            // the validated path, so traversal defense is unaffected.
             const buffer = Buffer.from(data.content, 'base64');
+            await mkdir(dirname(validation.resolvedPath!), { recursive: true });
             await writeFile(validation.resolvedPath!, buffer);
 
             // Calculate and return hash of written file
