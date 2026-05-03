@@ -8,6 +8,7 @@ import { run as runRipgrep } from '@/modules/ripgrep/index';
 import { run as runDifftastic } from '@/modules/difftastic/index';
 import { RpcHandlerManager } from '../../api/rpc/RpcHandlerManager';
 import { validatePath } from './pathSecurity';
+import { ensureDirectory } from './ensureDirectory';
 import { createIgnoreMatcher } from './ignorePresets';
 import {
     createGitignoreContext,
@@ -73,6 +74,15 @@ interface DirectoryEntry {
 interface ListDirectoryResponse {
     success: boolean;
     entries?: DirectoryEntry[];
+    error?: string;
+}
+
+interface EnsureDirectoryRequest {
+    path: string;
+}
+
+interface EnsureDirectoryResponse {
+    success: boolean;
     error?: string;
 }
 
@@ -383,6 +393,17 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             logger.debug('Failed to list directory:', error);
             return { success: false, error: error instanceof Error ? error.message : 'Failed to list directory' };
         }
+    });
+
+    // Ensure directory exists — creates the target and any missing
+    // parents inside the allowed working directory. Idempotent.
+    // Used by web-ui to bootstrap a freshly-created project's
+    // workspaceDir before the first terminal/upload (see
+    // specs/project-workspace-auto-create/).
+    rpcHandlerManager.registerHandler<EnsureDirectoryRequest, EnsureDirectoryResponse>('ensureDirectory', async (data) => {
+        logger.debug('Ensure directory request:', data.path);
+        const result = await ensureDirectory(data.path, workingDirectory);
+        return { success: result.success, error: result.error };
     });
 
     // Get directory tree handler - recursive with depth control
