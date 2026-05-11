@@ -517,6 +517,11 @@ export async function runAcp(opts: {
   let sawModes = false;
   let sawModels = false;
 
+  // chat-tool-output-streaming Phase 3 — bash_stream MCP tool runs in this
+  // process and looks up the active session call id via the shared
+  // bashStreamCallRegistry (which AcpSessionManager populates on
+  // tool-call-start). No per-runner wiring needed; the registry is the
+  // single source of truth across runClaude/runAcp/runCodex/runGemini.
   const happyServer = await startHappyServer(session);
   const mcpServers = {
     happy: {
