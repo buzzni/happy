@@ -48,6 +48,21 @@ export interface DecideTerminalCwdInput {
     validate: (path: string, root: string) => { valid: boolean; resolvedPath?: string; error?: string };
 }
 
+/**
+ * Render the one-line dim-ANSI banner the user sees in xterm when the
+ * spawn falls back. Kept pure (no socket / no log) so it can be tested
+ * independently of the daemon's apiMachine wiring.
+ *
+ * Trailing `\r\n` ensures xterm starts the shell prompt on a fresh line.
+ * The dim grey style (ESC[2m) communicates "informational, not an
+ * error" so users don't mistake the fallback for a crash.
+ */
+export function formatCwdFallbackBanner(decision: CwdDecision): string | undefined {
+    if (!decision.fallback) return undefined;
+    const { requested } = decision.fallback;
+    return `\x1b[2m[info] 요청한 작업 디렉토리(${requested})를 사용할 수 없어 ${decision.cwd}에서 시작합니다.\x1b[0m\r\n`;
+}
+
 export function decideTerminalCwd(input: DecideTerminalCwdInput): CwdDecision {
     const { requested, allowedRoot, homedir, fsExists, fsMkdir, validate } = input;
 

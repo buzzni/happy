@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { decideTerminalCwd } from './decideTerminalCwd';
+import { decideTerminalCwd, formatCwdFallbackBanner } from './decideTerminalCwd';
 
 describe('decideTerminalCwd', () => {
     const allowedRoot = '/home/u';
@@ -139,6 +139,32 @@ describe('decideTerminalCwd', () => {
 
         expect(result.cwd).toBe(homedir);
         expect(result.fallback?.error).toBe('kaboom');
+    });
+
+    describe('formatCwdFallbackBanner', () => {
+        it('returns undefined when there is no fallback (no banner needed)', () => {
+            expect(formatCwdFallbackBanner({ cwd: '/home/u' })).toBeUndefined();
+        });
+
+        it('renders a dim-ANSI line that ends with \\r\\n for a clean prompt', () => {
+            const banner = formatCwdFallbackBanner({
+                cwd: '/home/u',
+                fallback: { requested: '/tmp/missing', reason: 'mkdir-failed' },
+            });
+            expect(banner).toBeDefined();
+            expect(banner!.startsWith('\x1b[2m')).toBe(true);
+            expect(banner!.endsWith('\x1b[0m\r\n')).toBe(true);
+            expect(banner).toContain('/tmp/missing');
+            expect(banner).toContain('/home/u');
+        });
+
+        it('includes the requested path verbatim even when validation rejected it', () => {
+            const banner = formatCwdFallbackBanner({
+                cwd: '/home/u',
+                fallback: { requested: '/etc/passwd', reason: 'outside-root' },
+            });
+            expect(banner).toContain('/etc/passwd');
+        });
     });
 
     it('uses validate.resolvedPath when present (normalizes ./ etc.)', () => {
