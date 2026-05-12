@@ -22,6 +22,7 @@ interface PermissionResponse {
     reason?: string;
     mode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan';
     allowTools?: string[];
+    updatedInput?: Record<string, unknown>;
     receivedAt?: number;
 }
 
@@ -102,8 +103,12 @@ export class PermissionHandler {
             }
         } else {
             // Handle default case for all other tools
+            const originalInput = (pending.input as Record<string, unknown>) || {};
+            const updatedInput = response.updatedInput
+                ? { ...originalInput, ...response.updatedInput }
+                : originalInput;
             const result: PermissionResult = response.approved
-                ? { behavior: 'allow', updatedInput: (pending.input as Record<string, unknown>) || {} }
+                ? { behavior: 'allow', updatedInput }
                 : { behavior: 'deny', message: response.reason || `The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.` };
 
             pending.resolve(result);
@@ -114,6 +119,22 @@ export class PermissionHandler {
      * Creates the canCallTool callback for the SDK
      */
     handleToolCall = async (toolName: string, input: unknown, mode: EnhancedMode, options: { signal: AbortSignal }): Promise<PermissionResult> => {
+
+        // AskUserQuestion requires user interaction — never auto-approve, even in bypassPermissions mode.
+        // This mirrors Claude SDK's internal requiresUserInteraction() check.
+        // upstream: slopus/happy 2a44395 (PR #1018 base used options.toolUseID;
+        // this aplus fork still resolves via toolCalls list).
+        if (toolName === 'AskUserQuestion') {
+            let id = this.resolveToolCallId(toolName, input);
+            if (!id) {
+                await delay(1000);
+                id = this.resolveToolCallId(toolName, input);
+                if (!id) {
+                    throw new Error(`Could not resolve tool call ID for ${toolName}`);
+                }
+            }
+            return this.handlePermissionRequest(id, toolName, input, options.signal);
+        }
 
         // Check if tool is explicitly allowed
         if (toolName === 'Bash') {
