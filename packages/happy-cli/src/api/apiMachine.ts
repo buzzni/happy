@@ -20,6 +20,9 @@ import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
+import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
+import { validatePath } from '@/modules/common/pathSecurity';
+import { existsSync, mkdirSync } from 'node:fs';
 import {
     addDaemonTerminalSession,
     getDaemonTerminalSession,
@@ -127,6 +130,10 @@ export class ApiMachineClient {
     private lastKnownResumeSupport: ResumeSupport | null = null;
     private rpcHandlerManager: RpcHandlerManager;
     private resumeSessionHandler: ((sessionId: string) => Promise<SpawnSessionResult>) | null = null;
+    // specs/remote-terminal-cwd-fallback/ — cached so the
+    // terminal-open-fwd handler can run validatePath against the same
+    // root the rest of the RPC surface uses (Files tab / writeFile).
+    private allowedRoot: string;
 
     constructor(
         private token: string,
@@ -154,6 +161,7 @@ export class ApiMachineClient {
             registryWorkspaceRoot: process.env.HAPPY_WORKSPACE_ROOT ?? null,
             homeDir: homedir(),
         });
+        this.allowedRoot = allowedRoot;
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot);
     }
 
@@ -565,13 +573,27 @@ export class ApiMachineClient {
                     }
                 }
                 const auditUserId = typeof opts?.userId === 'string' ? opts.userId : 'remote-client';
+                // specs/remote-terminal-cwd-fallback/ — never let
+                // pty.spawn() chdir into a path that may not exist on
+                // this daemon. decideTerminalCwd validates, auto-mkdirs
+                // when safe, and falls back to homedir otherwise so the
+                // user always gets a working shell instead of node-pty's
+                // raw `chdir(2) failed.: No such file or directory`.
+                const cwdDecision = decideTerminalCwd({
+                    requested: typeof opts?.cwd === 'string' ? opts.cwd : undefined,
+                    allowedRoot: this.allowedRoot,
+                    homedir: homedir(),
+                    fsExists: existsSync,
+                    fsMkdir: (path) => mkdirSync(path, { recursive: true }),
+                    validate: validatePath,
+                });
                 let pty: ReturnType<typeof createPtySession>;
                 try {
                     pty = createPtySession({
                         userId: auditUserId,
                         shell: typeof opts?.shell === 'string' ? opts.shell : undefined,
                         args: Array.isArray(opts?.args) ? opts.args : undefined,
-                        cwd: typeof opts?.cwd === 'string' ? opts.cwd : undefined,
+                        cwd: cwdDecision.cwd,
                         env: opts?.env && typeof opts.env === 'object' ? opts.env : undefined,
                         cols: Number.isInteger(opts?.cols) ? opts.cols : undefined,
                         rows: Number.isInteger(opts?.rows) ? opts.rows : undefined,
@@ -586,6 +608,28 @@ export class ApiMachineClient {
                     userId: auditUserId,
                     machineId,
                 });
+                // Emit the fallback banner BEFORE registering pty.onData
+                // so the dim ANSI notice always lands ahead of the
+                // shell's first prompt chunk in the terminal-frame
+                // stream. Encrypt with the same machine key the regular
+                // frames use; happy-server forwards untouched.
+                if (cwdDecision.fallback) {
+                    const banner = formatCwdFallbackBanner(cwdDecision);
+                    if (banner) {
+                        try {
+                            const data = encodeBase64(encrypt(machineKey, machineVariant, banner));
+                            this.socket.emit('terminal-frame', { sessionId, data });
+                            recordBytesOut(sessionId, banner.length);
+                        } catch (e) {
+                            logger.debug(`[API MACHINE] terminal-open-fwd banner encrypt failed: ${(e as Error).message}`);
+                        }
+                    }
+                    logger.debug(
+                        `[REMOTE-TERMINAL] cwd-fallback session=${sessionId} user=${entry.userId} machine=${entry.machineId ?? '-'} ` +
+                        `requested=${cwdDecision.fallback.requested} fallback=${cwdDecision.cwd} reason=${cwdDecision.fallback.reason}` +
+                        (cwdDecision.fallback.error ? ` error=${JSON.stringify(cwdDecision.fallback.error)}` : ''),
+                    );
+                }
                 pty.onData((chunk) => {
                     recordBytesOut(sessionId, chunk.length);
                     try {
