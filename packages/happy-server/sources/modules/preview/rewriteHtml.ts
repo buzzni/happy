@@ -24,14 +24,46 @@
 // Each regex captures three groups: (prefix/keyword, path, closing-delimiter)
 // so the replacement can check `path.startsWith(prefix)` and avoid doubling
 // an already-prefixed URL without a separate post-pass.
-const ABS_PATH_ATTRS = /((?:src|href|action)\s*=\s*["'])(\/(?!\/)[^"']*?)(["'])/g;
+//
+// Attribute coverage matches the vite preview-proxy middleware in aplus-dev-studio
+// (vite.config.ts ABS_PATH_ATTRS): src/href/action plus poster/data/formaction/
+// background. Missing `poster` / `data` / `background` caused <video poster>,
+// <object data>, and inline `style="background:url(/...)"` outside <style>
+// blocks to leak through with absolute paths. srcset is handled separately
+// below because it carries a comma-list of URL+descriptor pairs.
+const ABS_PATH_ATTRS = /((?:src|href|action|poster|data|formaction|background)\s*=\s*["'])(\/(?!\/)[^"']*?)(["'])/g;
 const ABS_PATH_IMPORT = /((?:from|import)\s*\(?\s*["'])(\/(?!\/)[^"']*?)(["'])/g;
 const ABS_PATH_CSS_URL = /(url\(\s*["']?)(\/(?!\/)[^"')\s]*)(["']?\s*\))/g;
+const SRCSET_ATTR = /(srcset\s*=\s*)(["'])([^"']+)\2/gi;
 
 function makeReplacer(prefix: string) {
     return (_match: string, pre: string, path: string, tail: string): string => {
         const prefixed = path.startsWith(prefix) ? path : `${prefix}${path}`;
         return `${pre}${prefixed}${tail}`;
+    };
+}
+
+/**
+ * Rewrite each comma-separated entry of a `srcset` attribute. Each entry is
+ * `<url> <descriptor>` (descriptor optional, e.g. `2x`, `100w`). Only the
+ * URL part can be a path — descriptors stay untouched.
+ */
+function rewriteSrcset(prefix: string) {
+    return (_match: string, head: string, quote: string, list: string): string => {
+        const rewritten = list
+            .split(',')
+            .map((entry) => {
+                const trimmed = entry.trim();
+                const spaceIdx = trimmed.search(/\s/);
+                const url = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
+                const descriptor = spaceIdx === -1 ? '' : trimmed.slice(spaceIdx);
+                const isAbsolute =
+                    url.startsWith('/') && !url.startsWith('//') && !url.startsWith(prefix);
+                const rewrittenUrl = isAbsolute ? `${prefix}${url}` : url;
+                return `${rewrittenUrl}${descriptor}`;
+            })
+            .join(', ');
+        return `${head}${quote}${rewritten}${quote}`;
     };
 }
 
@@ -46,7 +78,9 @@ export function rewriteHtml(html: string, prefix: string): string {
     const rep = makeReplacer(prefix);
     let out = html
         .replace(ABS_PATH_ATTRS, rep)
-        .replace(ABS_PATH_IMPORT, rep);
+        .replace(SRCSET_ATTR, rewriteSrcset(prefix))
+        .replace(ABS_PATH_IMPORT, rep)
+        .replace(ABS_PATH_CSS_URL, rep);
 
     // <base> pins the document base URL so relative-path resources
     // (`<script src="app.js">`) survive the interceptor's history.replaceState.
