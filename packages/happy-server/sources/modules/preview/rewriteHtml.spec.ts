@@ -211,33 +211,50 @@ describe('rewriteHtml — srcset / imageSrcSet multi-URL rewriting (Phase 3)', (
     });
 });
 
-describe('rewriteHtml — interceptor script src/href setter + getAttribute patches (Phase 2.5)', () => {
-    it('interceptor patches HTMLScriptElement.prototype.src setter for /_next/ paths', () => {
+describe('rewriteHtml — interceptor script src/href/setAttribute patches', () => {
+    it('patches src setter on HTMLScriptElement / HTMLImageElement', () => {
         const out = rewriteHtml('<html><head></head></html>', PREFIX);
         expect(out).toContain(`patchSetter(HTMLScriptElement.prototype,'src')`);
+        expect(out).toContain(`patchSetter(HTMLImageElement.prototype,'src')`);
     });
 
-    it('interceptor patches HTMLLinkElement.prototype.href setter for /_next/ paths', () => {
+    it('patches href setter on HTMLLinkElement', () => {
         const out = rewriteHtml('<html><head></head></html>', PREFIX);
         expect(out).toContain(`patchSetter(HTMLLinkElement.prototype,'href')`);
     });
 
-    it('interceptor overrides HTMLScriptElement.getAttribute(src) to strip the prefix', () => {
+    it('setter delegates to rw() so it covers every absolute / path, not just /_next/', () => {
+        // The rw() helper is already defined for fetch/XHR — reusing it makes
+        // setter behavior symmetric and idempotent. Without this, user code
+        // like `script.src = '/api/widget.js'` would bypass the proxy.
         const out = rewriteHtml('<html><head></head></html>', PREFIX);
-        expect(out).toContain(`HTMLScriptElement.prototype.getAttribute=function`);
-        // The patch should reference the prefix variable P
-        expect(out).toContain(`v.indexOf(P+'/_next/')===0`);
-        expect(out).toContain(`v.slice(P.length)`);
+        expect(out).toContain(`set:function(v){d.set.call(this,rw(v))}`);
     });
 
-    it('interceptor intercepts Element.setAttribute for src/href (Phase 3)', () => {
-        // React's RSC reader uses setAttribute (not the property setter) for
-        // HL[] preload directives — without this patch they target
-        // location.origin (the relay) instead of the proxy path.
+    it('narrows setAttribute patch to HTMLScript / HTMLLink / HTMLImage prototypes (no global Element.prototype patch)', () => {
         const out = rewriteHtml('<html><head></head></html>', PREFIX);
-        expect(out).toContain(`Element.prototype.setAttribute=function`);
-        expect(out).toContain(`(n==='src'||n==='href')`);
-        expect(out).toContain(`v.indexOf('/_next/')===0`);
+        expect(out).toContain(`patchSetAttr(HTMLScriptElement.prototype)`);
+        expect(out).toContain(`patchSetAttr(HTMLLinkElement.prototype)`);
+        expect(out).toContain(`patchSetAttr(HTMLImageElement.prototype)`);
+        // Must NOT install on Element.prototype (would slow every setAttribute call)
+        expect(out).not.toMatch(/Element\.prototype\.setAttribute\s*=/);
+    });
+
+    it('setAttribute patch covers src / href / action and is case-insensitive on attr name', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`(nl==='src'||nl==='href'||nl==='action')`);
+        expect(out).toContain(`n.toLowerCase()`);
+        expect(out).toContain(`v=rw(v)`);
+    });
+
+    it('keeps HTMLScriptElement.getAttribute(src) strip narrow to /_next/ (Turbopack-specific)', () => {
+        // Stripping the prefix back is only needed for Turbopack's
+        // getPathFromScript, which expects the canonical "/_next/" form.
+        // For user-code paths like /api/foo, callers expect what they set.
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`HTMLScriptElement.prototype.getAttribute=function`);
+        expect(out).toContain(`v.indexOf(P+'/_next/')===0`);
+        expect(out).toContain(`v.slice(P.length)`);
     });
 });
 

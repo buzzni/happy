@@ -136,35 +136,47 @@ function buildInterceptorScript(prefix: string): string {
         `window.WebSocket.CONNECTING=0;window.WebSocket.OPEN=1;window.WebSocket.CLOSING=2;window.WebSocket.CLOSED=3;` +
         `var oF=window.fetch;window.fetch=function(i,n){if(typeof i==='string')i=rw(i);return oF.call(this,i,n)};` +
         `var oO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(typeof u==='string')arguments[1]=rw(u);return oO.apply(this,arguments)};` +
-        // Phase 2.5 fix for Next.js / Turbopack: the runtime's getPathFromScript
-        // strips a hardcoded "/_next/" prefix from script.src to derive the
-        // chunk registry key. Our HTML rewrite turns "/_next/foo.js" into
-        // "${P}/_next/foo.js", so the runtime fails to strip → registry key
-        // becomes the full prefixed path, doesn't match the chunkList entry
-        // ("static/chunks/foo.js"), entry chunk never executes, hydration
-        // never starts. We work around by (a) intercepting dynamic
-        // HTMLScriptElement.src / HTMLLinkElement.href setters and adding the
-        // prefix when the runtime tries to load "/_next/..." chunks, and
-        // (b) overriding HTMLScriptElement.prototype.getAttribute so that
-        // reading src returns the unprefixed "/_next/..." form Turbopack
-        // expects. See specs/preview-nextjs-turbopack-hydration/ Phase 2.5.
+        // Phase 2.5 / 3 / refactor for Next.js + general resource loading:
+        //
+        // (a) src/href setter patches on HTMLScriptElement / HTMLLinkElement /
+        //     HTMLImageElement: when JS code does `el.src = '/foo'`, route
+        //     the actual fetch through the proxy. Uses the same rw() helper
+        //     as fetch/XHR so behavior is symmetric and idempotent — covers
+        //     not just /_next/ but every absolute /... path (e.g. user code
+        //     like `script.src = '/api/widget.js'`).
+        //
+        // (b) setAttribute shadow on the SAME three prototypes (not on the
+        //     base Element.prototype). React's RSC reader uses
+        //     `link.setAttribute('href', '/_next/...')` for HL[] preload
+        //     directives — the property setter we patched in (a) doesn't
+        //     fire for setAttribute. Narrowing to specific subclasses
+        //     avoids paying the check cost on every <div>/<svg>/...
+        //     setAttribute call.
+        //
+        // (c) getAttribute('src') strip on HTMLScriptElement only — kept
+        //     narrow to /_next/ because Turbopack's getPathFromScript is
+        //     the only known caller that relies on the canonical form.
+        //     See specs/preview-nextjs-turbopack-hydration/ Phase 2.5.
         `function patchSetter(proto,attr){` +
         `var d=Object.getOwnPropertyDescriptor(proto,attr);if(!d||!d.set)return;` +
         `Object.defineProperty(proto,attr,{configurable:true,` +
         `get:function(){return d.get.call(this)},` +
-        `set:function(v){if(typeof v==='string'&&v.indexOf('/_next/')===0)v=P+v;d.set.call(this,v)}})` +
+        `set:function(v){d.set.call(this,rw(v))}})` +
+        `}` +
+        `function patchSetAttr(proto){` +
+        `var oSA=proto.hasOwnProperty('setAttribute')?proto.setAttribute:Element.prototype.setAttribute;` +
+        `Object.defineProperty(proto,'setAttribute',{configurable:true,writable:true,` +
+        `value:function(n,v){` +
+        `var nl=typeof n==='string'?n.toLowerCase():n;` +
+        `if(nl==='src'||nl==='href'||nl==='action')v=rw(v);` +
+        `return oSA.call(this,n,v)}})` +
         `}` +
         `patchSetter(HTMLScriptElement.prototype,'src');` +
         `patchSetter(HTMLLinkElement.prototype,'href');` +
-        // setAttribute bypasses the property setter — React's RSC reader
-        // uses `link.setAttribute('href', '/_next/...')` for HL[] preload
-        // directives, so we also intercept setAttribute. Without this,
-        // RSC-driven preloads target location.origin (the relay host) and
-        // log "preloaded using link preload but not used" warnings.
-        `var oSA=Element.prototype.setAttribute;` +
-        `Element.prototype.setAttribute=function(n,v){` +
-        `if((n==='src'||n==='href')&&typeof v==='string'&&v.indexOf('/_next/')===0)v=P+v;` +
-        `return oSA.call(this,n,v)};` +
+        `patchSetter(HTMLImageElement.prototype,'src');` +
+        `patchSetAttr(HTMLScriptElement.prototype);` +
+        `patchSetAttr(HTMLLinkElement.prototype);` +
+        `patchSetAttr(HTMLImageElement.prototype);` +
         `var oGA=Element.prototype.getAttribute;` +
         `HTMLScriptElement.prototype.getAttribute=function(n){` +
         `var v=oGA.call(this,n);` +
