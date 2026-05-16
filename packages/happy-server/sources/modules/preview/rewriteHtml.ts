@@ -24,9 +24,18 @@
 // Each regex captures three groups: (prefix/keyword, path, closing-delimiter)
 // so the replacement can check `path.startsWith(prefix)` and avoid doubling
 // an already-prefixed URL without a separate post-pass.
-const ABS_PATH_ATTRS = /((?:src|href|action)\s*=\s*["'])(\/(?!\/)[^"']*?)(["'])/g;
+//
+// Attribute list mirrors the locally-injected web-ui preview-proxy
+// middleware: standard fetchable URL attrs plus the less common ones
+// (`poster` on <video>, `data` on <object>, `formaction` on <button>,
+// `background` on legacy <body>).
+const ABS_PATH_ATTRS = /((?:src|href|action|poster|data|formaction|background)\s*=\s*["'])(\/(?!\/)[^"']*?)(["'])/g;
 const ABS_PATH_IMPORT = /((?:from|import)\s*\(?\s*["'])(\/(?!\/)[^"']*?)(["'])/g;
 const ABS_PATH_CSS_URL = /(url\(\s*["']?)(\/(?!\/)[^"')\s]*)(["']?\s*\))/g;
+// Inline <style>...</style> blocks: rewrite CSS url() references inside.
+// External CSS responses are handled separately by rewriteJsCss(), but
+// inline styles only show up when the rewriter walks the HTML body.
+const INLINE_STYLE_BLOCK = /<style[^>]*>([\s\S]*?)<\/style>/gi;
 
 // `srcset`, `imagesrcset` (HTML), `imageSrcSet` (React JSX camelCase) carry
 // comma-separated URL+descriptor pairs (e.g. `/a.png 1x, /b.png 2x`). They
@@ -86,7 +95,11 @@ export function rewriteHtml(html: string, prefix: string): string {
         .replace(ABS_PATH_IMPORT, rep)
         .replace(MULTI_URL_ATTRS, (_match, head: string, list: string, tail: string) =>
             `${head}${rewriteSrcSetValue(list, prefix)}${tail}`,
-        );
+        )
+        .replace(INLINE_STYLE_BLOCK, (match, css: string) => {
+            const rewritten = css.replace(ABS_PATH_CSS_URL, rep);
+            return rewritten === css ? match : match.replace(css, rewritten);
+        });
 
     // <base> pins the document base URL so relative-path resources
     // (`<script src="app.js">`) survive the interceptor's history.replaceState.

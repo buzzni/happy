@@ -52,6 +52,26 @@ describe('rewriteHtml — absolute path rewriting', () => {
         expect(out).toContain(`'${PREFIX}/x.js'`);
     });
 
+    it('rewrites poster="/..." on <video>', () => {
+        const out = rewriteHtml('<video poster="/thumb.jpg"></video>', PREFIX);
+        expect(out).toContain(`poster="${PREFIX}/thumb.jpg"`);
+    });
+
+    it('rewrites data="/..." on <object>', () => {
+        const out = rewriteHtml('<object data="/app.swf"></object>', PREFIX);
+        expect(out).toContain(`data="${PREFIX}/app.swf"`);
+    });
+
+    it('rewrites formaction="/..." on <button>', () => {
+        const out = rewriteHtml('<button formaction="/api/x">go</button>', PREFIX);
+        expect(out).toContain(`formaction="${PREFIX}/api/x"`);
+    });
+
+    it('rewrites background="/..." on <body>', () => {
+        const out = rewriteHtml('<body background="/bg.png"></body>', PREFIX);
+        expect(out).toContain(`background="${PREFIX}/bg.png"`);
+    });
+
     it('leaves external absolute URLs untouched', () => {
         const out = rewriteHtml('<a href="https://example.com/x">ok</a>', PREFIX);
         expect(out).toContain('href="https://example.com/x"');
@@ -138,6 +158,43 @@ describe('rewriteHtml — interceptor injection', () => {
 // We deliberately do NOT rewrite these paths. Instead, the interceptor's
 // HTMLScriptElement.src setter patch (below) redirects the actual fetch
 // through the proxy while preserving the canonical attribute value.
+describe('rewriteHtml — inline <style> CSS url() rewriting', () => {
+    it('rewrites url("/...") inside an inline <style> block', () => {
+        const out = rewriteHtml('<style>.x{background:url("/img/bg.png")}</style>', PREFIX);
+        expect(out).toContain(`url("${PREFIX}/img/bg.png")`);
+    });
+
+    it('handles multiple url() in one inline <style> block', () => {
+        const out = rewriteHtml(
+            '<style>.a{background:url("/a.png")}.b{background:url("/b.png")}</style>',
+            PREFIX,
+        );
+        expect(out).toContain(`url("${PREFIX}/a.png")`);
+        expect(out).toContain(`url("${PREFIX}/b.png")`);
+    });
+
+    it('leaves external / protocol-relative url() untouched', () => {
+        const out = rewriteHtml(
+            '<style>.a{background:url("https://cdn/x.png")}.b{background:url("//cdn/y.png")}</style>',
+            PREFIX,
+        );
+        expect(out).toContain('url("https://cdn/x.png")');
+        expect(out).toContain('url("//cdn/y.png")');
+    });
+
+    it('handles unquoted url(/...) form', () => {
+        const out = rewriteHtml('<style>.x{background:url(/img/bg.png)}</style>', PREFIX);
+        expect(out).toContain(`url(${PREFIX}/img/bg.png)`);
+    });
+
+    it('does not double-rewrite an already-prefixed url() (idempotent)', () => {
+        const input = `<style>.x{background:url("${PREFIX}/img/bg.png")}</style>`;
+        const out = rewriteHtml(input, PREFIX);
+        expect(out).toContain(`url("${PREFIX}/img/bg.png")`);
+        expect(out).not.toContain(`${PREFIX}${PREFIX}`);
+    });
+});
+
 describe('rewriteHtml — RSC flight stream MUST NOT be rewritten (Phase 2.5)', () => {
     it('leaves \\"/_next/...\\" paths inside __next_f.push JSON unchanged', () => {
         const input = `<script>self.__next_f.push([1,"7:I[\\"/_next/static/chunks/app.js\\"]"])</script>`;
