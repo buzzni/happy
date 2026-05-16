@@ -247,6 +247,18 @@ describe('rewriteHtml — interceptor script src/href/setAttribute patches', () 
         expect(out).toContain(`v=rw(v)`);
     });
 
+    it('installs a forward-compat sentinel that warns if Next.js / Turbopack does not hydrate', () => {
+        // The sentinel exists to surface a clear console warning if a future
+        // Next.js version changes the /_next/ chunk-loader contract that our
+        // patches depend on, instead of silently failing to a black screen.
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`window.next&&window.next.turbopack`);
+        expect(out).toContain(`script[src*="_next/static/chunks"]`);
+        expect(out).toContain(`Next.js / Turbopack hydration did not complete`);
+        // 8s budget — long enough that real hydration finishes first.
+        expect(out).toContain(`8000`);
+    });
+
     it('keeps HTMLScriptElement.getAttribute(src) strip narrow to /_next/ (Turbopack-specific)', () => {
         // Stripping the prefix back is only needed for Turbopack's
         // getPathFromScript, which expects the canonical "/_next/" form.

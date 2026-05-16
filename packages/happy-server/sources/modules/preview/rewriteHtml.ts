@@ -182,6 +182,25 @@ function buildInterceptorScript(prefix: string): string {
         `var v=oGA.call(this,n);` +
         `if(n==='src'&&typeof v==='string'&&v.indexOf(P+'/_next/')===0)return v.slice(P.length);` +
         `return v};` +
+        // Forward-compat sentinel: our setter/getAttribute patches depend on
+        // Turbopack's runtime stripping a hardcoded "/_next/" prefix in
+        // getPathFromScript. If a future Next.js version changes that path
+        // (or the chunk loader internals), our patches silently no-op and
+        // hydration stalls — exactly the failure mode that started this
+        // saga. After page load, check whether a Next.js + Turbopack page
+        // hydrated. If not, surface a warning instead of a silent black
+        // screen. False-positive guards: only fire if the page actually
+        // shipped Turbopack chunk scripts (indicator that it IS a Next.js
+        // app), and only if window.next.turbopack was never set.
+        `setTimeout(function(){` +
+        `try{` +
+        `if(window.next&&window.next.turbopack)return;` +
+        `if(!document.querySelector('script[src*="_next/static/chunks"]'))return;` +
+        `console.warn('[happy-preview] Next.js / Turbopack hydration did not complete within 8s through the preview proxy. ' +` +
+        `'This usually means the runtime\\'s chunk-loader contract changed and our /_next/ patch needs to be revisited. ' +` +
+        `'See specs/preview-nextjs-turbopack-hydration/ for the original diagnosis.')` +
+        `}catch(_){}` +
+        `},8000);` +
         `})()</script>`
     );
 }

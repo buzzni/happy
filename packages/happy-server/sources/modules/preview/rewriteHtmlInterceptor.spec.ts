@@ -39,9 +39,18 @@ function buildSandbox() {
         }
     }
 
-    class FakeScriptElement extends FakeElement {}
-    class FakeLinkElement extends FakeElement {}
-    class FakeImageElement extends FakeElement {}
+    // `declare` keeps the type-only declaration (no field emitted at
+    // runtime) so it doesn't shadow the accessor we install on the
+    // prototype via defineUrlAccessor below.
+    class FakeScriptElement extends FakeElement {
+        declare src: string;
+    }
+    class FakeLinkElement extends FakeElement {
+        declare href: string;
+    }
+    class FakeImageElement extends FakeElement {
+        declare src: string;
+    }
 
     // The real DOM exposes `src` / `href` as accessor properties on the
     // *element prototype* (HTMLScriptElement.prototype.src etc.) that
@@ -240,6 +249,68 @@ describe('rewriteHtml interceptor — runtime behavior in stubbed DOM', () => {
             fresh.sandbox.window.location.pathname = PREFIX;
             runInterceptor(fresh.sandbox);
             expect(fresh.sandbox.window.location.pathname).toBe('/');
+        });
+    });
+
+    describe('forward-compat sentinel — warns if Turbopack hydration silently fails', () => {
+        // Helper: build a sandbox that records setTimeout callbacks instead
+        // of running them, so we can inspect the deferred warning logic.
+        function buildSandboxWithDeferredTimer() {
+            const bag = buildSandbox();
+            const deferred: Array<{ fn: () => void; ms: number }> = [];
+            const sandbox = bag.sandbox as any;
+            // Replace the always-immediate setTimeout with a recorder
+            sandbox.setTimeout = (fn: () => void, ms: number) => {
+                deferred.push({ fn, ms });
+            };
+            sandbox.window.setTimeout = sandbox.setTimeout;
+            // Mock console + document so the sentinel can introspect
+            const warnings: string[] = [];
+            sandbox.console = { warn: (msg: string) => warnings.push(String(msg)) };
+            const scripts: Array<{ src: string }> = [];
+            sandbox.document = {
+                querySelector: (sel: string) => {
+                    // Match `script[src*="_next/static/chunks"]` only
+                    if (sel.includes('_next/static/chunks')) {
+                        return scripts.find((s) => s.src.includes('_next/static/chunks')) || null;
+                    }
+                    return null;
+                },
+            };
+            return { sandbox, deferred, warnings, scripts };
+        }
+
+        it('does NOT warn when window.next.turbopack is set (happy path)', () => {
+            const { sandbox, deferred, warnings, scripts } = buildSandboxWithDeferredTimer();
+            scripts.push({ src: '/v1/preview/m1/3000/_next/static/chunks/foo.js' });
+            runInterceptor(sandbox);
+            // Hydration succeeded
+            sandbox.window.next = { turbopack: true };
+            // Fire the deferred sentinel
+            expect(deferred.length).toBe(1);
+            expect(deferred[0].ms).toBe(8000);
+            deferred[0].fn();
+            expect(warnings).toEqual([]);
+        });
+
+        it('does NOT warn when no Turbopack chunk scripts in the document (non-Next app)', () => {
+            const { sandbox, deferred, warnings, scripts } = buildSandboxWithDeferredTimer();
+            // No /_next/static/chunks scripts → not a Next.js page
+            void scripts;
+            runInterceptor(sandbox);
+            deferred[0].fn();
+            expect(warnings).toEqual([]);
+        });
+
+        it('WARNS when Turbopack chunks are present but window.next.turbopack never sets', () => {
+            const { sandbox, deferred, warnings, scripts } = buildSandboxWithDeferredTimer();
+            scripts.push({ src: '/v1/preview/m1/3000/_next/static/chunks/foo.js' });
+            runInterceptor(sandbox);
+            // Hydration never completed (sentinel-trigger condition)
+            deferred[0].fn();
+            expect(warnings.length).toBe(1);
+            expect(warnings[0]).toContain('hydration did not complete');
+            expect(warnings[0]).toContain('specs/preview-nextjs-turbopack-hydration');
         });
     });
 
