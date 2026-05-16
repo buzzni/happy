@@ -52,6 +52,26 @@ describe('rewriteHtml — absolute path rewriting', () => {
         expect(out).toContain(`'${PREFIX}/x.js'`);
     });
 
+    it('rewrites poster="/..." on <video>', () => {
+        const out = rewriteHtml('<video poster="/thumb.jpg"></video>', PREFIX);
+        expect(out).toContain(`poster="${PREFIX}/thumb.jpg"`);
+    });
+
+    it('rewrites data="/..." on <object>', () => {
+        const out = rewriteHtml('<object data="/app.swf"></object>', PREFIX);
+        expect(out).toContain(`data="${PREFIX}/app.swf"`);
+    });
+
+    it('rewrites formaction="/..." on <button>', () => {
+        const out = rewriteHtml('<button formaction="/api/x">go</button>', PREFIX);
+        expect(out).toContain(`formaction="${PREFIX}/api/x"`);
+    });
+
+    it('rewrites background="/..." on <body>', () => {
+        const out = rewriteHtml('<body background="/bg.png"></body>', PREFIX);
+        expect(out).toContain(`background="${PREFIX}/bg.png"`);
+    });
+
     it('leaves external absolute URLs untouched', () => {
         const out = rewriteHtml('<a href="https://example.com/x">ok</a>', PREFIX);
         expect(out).toContain('href="https://example.com/x"');
@@ -185,6 +205,216 @@ describe('rewriteHtml — interceptor injection', () => {
         const out = rewriteHtml('<html><head></head></html>', PREFIX);
         expect(out).toContain('NoopWS');
         expect(out).toContain('vite-hmr');
+    });
+});
+
+// Phase 2.5 (specs/preview-nextjs-turbopack-hydration/): Next.js App Router /
+// Turbopack uses paths inside __next_f.push as resolver keys that must remain
+// in their canonical "/_next/..." form so BACKEND.registerChunk's `chunkUrl =
+// getChunkRelativeUrl(chunkPath)` matches the resolver created at fetch time.
+// We deliberately do NOT rewrite these paths. Instead, the interceptor's
+// HTMLScriptElement.src setter patch (below) redirects the actual fetch
+// through the proxy while preserving the canonical attribute value.
+describe('rewriteHtml — inline <style> CSS url() rewriting', () => {
+    it('rewrites url("/...") inside an inline <style> block', () => {
+        const out = rewriteHtml('<style>.x{background:url("/img/bg.png")}</style>', PREFIX);
+        expect(out).toContain(`url("${PREFIX}/img/bg.png")`);
+    });
+
+    it('handles multiple url() in one inline <style> block', () => {
+        const out = rewriteHtml(
+            '<style>.a{background:url("/a.png")}.b{background:url("/b.png")}</style>',
+            PREFIX,
+        );
+        expect(out).toContain(`url("${PREFIX}/a.png")`);
+        expect(out).toContain(`url("${PREFIX}/b.png")`);
+    });
+
+    it('leaves external / protocol-relative url() untouched', () => {
+        const out = rewriteHtml(
+            '<style>.a{background:url("https://cdn/x.png")}.b{background:url("//cdn/y.png")}</style>',
+            PREFIX,
+        );
+        expect(out).toContain('url("https://cdn/x.png")');
+        expect(out).toContain('url("//cdn/y.png")');
+    });
+
+    it('handles unquoted url(/...) form', () => {
+        const out = rewriteHtml('<style>.x{background:url(/img/bg.png)}</style>', PREFIX);
+        expect(out).toContain(`url(${PREFIX}/img/bg.png)`);
+    });
+
+    it('does not double-rewrite an already-prefixed url() (idempotent)', () => {
+        const input = `<style>.x{background:url("${PREFIX}/img/bg.png")}</style>`;
+        const out = rewriteHtml(input, PREFIX);
+        expect(out).toContain(`url("${PREFIX}/img/bg.png")`);
+        expect(out).not.toContain(`${PREFIX}${PREFIX}`);
+    });
+});
+
+describe('rewriteHtml — RSC flight stream MUST NOT be rewritten (Phase 2.5)', () => {
+    it('leaves \\"/_next/...\\" paths inside __next_f.push JSON unchanged', () => {
+        const input = `<script>self.__next_f.push([1,"7:I[\\"/_next/static/chunks/app.js\\"]"])</script>`;
+        const out = rewriteHtml(input, PREFIX);
+        // The path inside the JSON-escaped script body must remain "/_next/..."
+        // because Turbopack uses it as a resolver key.
+        expect(out).toContain(`7:I[\\"/_next/static/chunks/app.js\\"]`);
+        expect(out).not.toContain(`${PREFIX}/_next/static/chunks/app.js`);
+    });
+
+    it('leaves real-world Next.js RSC HL+I payload unchanged', () => {
+        const input = `<script>self.__next_f.push([1,":HL[\\"/_next/static/chunks/%5Broot-of-the-server%5D__d56404ae._.css\\",\\"style\\"]\\n7:I[\\"/_next/static/chunks/953a0._.js\\"]"])</script>`;
+        const out = rewriteHtml(input, PREFIX);
+        expect(out).toContain(`HL[\\"/_next/static/chunks/%5Broot-of-the-server%5D__d56404ae._.css\\"`);
+        expect(out).toContain(`I[\\"/_next/static/chunks/953a0._.js\\"]`);
+    });
+
+    it('does still rewrite external <script src="/_next/..."> attributes (ABS_PATH_ATTRS regression)', () => {
+        const input = `<script src="/_next/static/foo.js"></script>`;
+        const out = rewriteHtml(input, PREFIX);
+        expect(out).toContain(`src="${PREFIX}/_next/static/foo.js"`);
+    });
+});
+
+// Phase 3 (specs/preview-nextjs-turbopack-hydration/): multi-URL attributes
+// like `srcset`, `imagesrcset` (lowercase HTML form) and `imageSrcSet`
+// (React/JSX form) are comma-separated URL+descriptor pairs. ABS_PATH_ATTRS
+// can't rewrite them as a single string — each URL token must be
+// rewritten independently while preserving the descriptor (1x, 2x, 300w).
+describe('rewriteHtml — srcset / imageSrcSet multi-URL rewriting (Phase 3)', () => {
+    it('rewrites both URLs in a simple srcset attribute', () => {
+        const out = rewriteHtml('<img srcset="/a.png 1x, /b.png 2x">', PREFIX);
+        expect(out).toContain(`srcset="${PREFIX}/a.png 1x, ${PREFIX}/b.png 2x"`);
+    });
+
+    it('rewrites URLs in imageSrcSet (JSX camelCase form Next.js emits)', () => {
+        const input = `<link rel="preload" as="image" imageSrcSet="/_next/image?url=%2Fx.png&amp;w=96 1x, /_next/image?url=%2Fx.png&amp;w=256 2x"/>`;
+        const out = rewriteHtml(input, PREFIX);
+        expect(out).toContain(`${PREFIX}/_next/image?url=%2Fx.png&amp;w=96 1x`);
+        expect(out).toContain(`${PREFIX}/_next/image?url=%2Fx.png&amp;w=256 2x`);
+    });
+
+    it('rewrites URLs in srcSet (React JSX camelCase form on <img>) — the obid Image bug', () => {
+        // React's renderToString outputs the JSX `srcSet` prop literally as
+        // `srcSet="…"` in SSR HTML. Earlier regex matched lowercase srcset
+        // only, so next/image SSR'd <img srcSet="…"> tags stayed unprefixed
+        // — browser fetched from platform origin, images broke.
+        const input =
+            `<img data-nimg="1" srcSet="/_next/image?url=foo&amp;w=96 1x, /_next/image?url=foo&amp;w=256 2x" src="/x">`;
+        const out = rewriteHtml(input, PREFIX);
+        expect(out).toContain(`${PREFIX}/_next/image?url=foo&amp;w=96 1x`);
+        expect(out).toContain(`${PREFIX}/_next/image?url=foo&amp;w=256 2x`);
+    });
+
+    it('rewrites URLs in imagesrcset (lowercase HTML form)', () => {
+        const out = rewriteHtml(`<link rel="preload" as="image" imagesrcset="/a.png 1x, /b.png 2x">`, PREFIX);
+        expect(out).toContain(`${PREFIX}/a.png 1x`);
+        expect(out).toContain(`${PREFIX}/b.png 2x`);
+    });
+
+    it('leaves external + protocol-relative URLs untouched, rewrites absolute ones', () => {
+        const out = rewriteHtml(
+            `<img srcset="https://cdn.example.com/x.png 1x, //cdn/y.png 2x, /local.png 3x">`,
+            PREFIX,
+        );
+        expect(out).toContain('https://cdn.example.com/x.png 1x');
+        expect(out).toContain('//cdn/y.png 2x');
+        expect(out).toContain(`${PREFIX}/local.png 3x`);
+        // No double-prefix on protocol-relative
+        expect(out).not.toContain(`${PREFIX}//cdn`);
+    });
+
+    it('preserves srcset URLs already prefixed (idempotent)', () => {
+        const input = `<img srcset="${PREFIX}/a.png 1x">`;
+        const out = rewriteHtml(input, PREFIX);
+        expect(out).toContain(`srcset="${PREFIX}/a.png 1x"`);
+        expect(out).not.toContain(`${PREFIX}${PREFIX}`);
+    });
+
+    it('handles a single URL without descriptor in srcset', () => {
+        const out = rewriteHtml(`<img srcset="/only.png">`, PREFIX);
+        expect(out).toContain(`srcset="${PREFIX}/only.png"`);
+    });
+});
+
+describe('rewriteHtml — interceptor script src/href/setAttribute patches', () => {
+    it('patches src setter on HTMLScriptElement / HTMLImageElement', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`patchSetter(HTMLScriptElement.prototype,'src')`);
+        expect(out).toContain(`patchSetter(HTMLImageElement.prototype,'src')`);
+    });
+
+    it('patches href setter on HTMLLinkElement', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`patchSetter(HTMLLinkElement.prototype,'href')`);
+    });
+
+    it('setter delegates to rw() (or supplied transform) — covers every absolute / path', () => {
+        // The rw() helper is already defined for fetch/XHR — reusing it makes
+        // setter behavior symmetric and idempotent. Without this, user code
+        // like `script.src = '/api/widget.js'` would bypass the proxy.
+        // The patchSetter signature accepts an optional transform so srcset
+        // variants can pass rwSet instead.
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`set:function(v){d.set.call(this,fn(v))}`);
+        expect(out).toContain(`var fn=t||rw`);
+    });
+
+    it('narrows setAttribute patch to HTMLScript / HTMLLink / HTMLImage prototypes (no global Element.prototype patch)', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`patchSetAttr(HTMLScriptElement.prototype)`);
+        expect(out).toContain(`patchSetAttr(HTMLLinkElement.prototype)`);
+        expect(out).toContain(`patchSetAttr(HTMLImageElement.prototype)`);
+        // Must NOT install on Element.prototype (would slow every setAttribute call)
+        expect(out).not.toMatch(/Element\.prototype\.setAttribute\s*=/);
+    });
+
+    it('setAttribute patch covers src / href / action and is case-insensitive on attr name', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`(nl==='src'||nl==='href'||nl==='action')`);
+        expect(out).toContain(`n.toLowerCase()`);
+        expect(out).toContain(`v=rw(v)`);
+    });
+
+    it('installs rwSet helper for multi-URL srcset rewriting', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`function rwSet(v)`);
+        // rwSet must use rw() per-URL token + preserve descriptors
+        expect(out).toContain(`return rw(u)+d`);
+    });
+
+    it('patches srcset setter on HTMLImageElement + HTMLSourceElement with rwSet', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`patchSetter(HTMLImageElement.prototype,'srcset',rwSet)`);
+        expect(out).toContain(`patchSetter(HTMLSourceElement.prototype,'srcset',rwSet)`);
+    });
+
+    it('setAttribute patch covers srcset / imagesrcset via rwSet', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`(nl==='srcset'||nl==='imagesrcset')`);
+        expect(out).toContain(`v=rwSet(v)`);
+    });
+
+    it('installs a forward-compat sentinel that warns if Next.js / Turbopack does not hydrate', () => {
+        // The sentinel exists to surface a clear console warning if a future
+        // Next.js version changes the /_next/ chunk-loader contract that our
+        // patches depend on, instead of silently failing to a black screen.
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`window.next&&window.next.turbopack`);
+        expect(out).toContain(`script[src*="_next/static/chunks"]`);
+        expect(out).toContain(`Next.js / Turbopack hydration did not complete`);
+        // 8s budget — long enough that real hydration finishes first.
+        expect(out).toContain(`8000`);
+    });
+
+    it('keeps HTMLScriptElement.getAttribute(src) strip narrow to /_next/ (Turbopack-specific)', () => {
+        // Stripping the prefix back is only needed for Turbopack's
+        // getPathFromScript, which expects the canonical "/_next/" form.
+        // For user-code paths like /api/foo, callers expect what they set.
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`HTMLScriptElement.prototype.getAttribute=function`);
+        expect(out).toContain(`v.indexOf(P+'/_next/')===0`);
+        expect(out).toContain(`v.slice(P.length)`);
     });
 });
 

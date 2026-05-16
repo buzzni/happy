@@ -25,16 +25,67 @@
 // so the replacement can check `path.startsWith(prefix)` and avoid doubling
 // an already-prefixed URL without a separate post-pass.
 //
-// Attribute coverage matches the vite preview-proxy middleware in aplus-dev-studio
-// (vite.config.ts ABS_PATH_ATTRS): src/href/action plus poster/data/formaction/
-// background. Missing `poster` / `data` / `background` caused <video poster>,
-// <object data>, and inline `style="background:url(/...)"` outside <style>
-// blocks to leak through with absolute paths. srcset is handled separately
-// below because it carries a comma-list of URL+descriptor pairs.
+// Attribute list mirrors the locally-injected web-ui preview-proxy
+// middleware (and the vite preview-proxy in aplus-dev-studio): standard
+// fetchable URL attrs (src/href/action) plus the less common ones
+// (`poster` on <video>, `data` on <object>, `formaction` on <button>,
+// `background` on legacy <body>). Missing `poster`/`data`/`background`
+// previously caused <video poster>, <object data>, and inline
+// `style="background:url(/...)"` outside <style> blocks to leak through
+// with absolute paths.
 const ABS_PATH_ATTRS = /((?:src|href|action|poster|data|formaction|background)\s*=\s*["'])(\/(?!\/)[^"']*?)(["'])/g;
 const ABS_PATH_IMPORT = /((?:from|import)\s*\(?\s*["'])(\/(?!\/)[^"']*?)(["'])/g;
 const ABS_PATH_CSS_URL = /(url\(\s*["']?)(\/(?!\/)[^"')\s]*)(["']?\s*\))/g;
-const SRCSET_ATTR = /(srcset\s*=\s*)(["'])([^"']+)\2/gi;
+// Inline <style>...</style> blocks: rewrite CSS url() references inside.
+// External CSS responses are handled separately by rewriteJsCss(), but
+// embedded styles only show up when the rewriter walks the HTML body.
+const INLINE_STYLE_BLOCK = /<style[^>]*>([\s\S]*?)<\/style>/gi;
+// `style="..."` attribute values: same url() rewriting as <style> blocks,
+// scoped to the attribute so we don't accidentally rewrite url("/...")
+// string literals inside <script> tags (notably the RSC flight stream).
+// Common in inline backgrounds (`style="background:url(/img/...)"`) and
+// CSS-in-JS output that escapes to the SSR HTML.
+const INLINE_STYLE_ATTR = /(style\s*=\s*["'])([^"']*)(["'])/gi;
+// `srcset` / `imagesrcset` carry comma-separated URL+descriptor pairs
+// (e.g. `/a.png 1x, /b.png 2x`). They don't fit ABS_PATH_ATTRS's
+// single-URL shape, so we handle them with a dedicated pass that
+// tokenizes each pair, rewrites the URL part if it's an absolute path,
+// and preserves the descriptor verbatim.
+//
+// Case-insensitive on the attribute name: React's renderToString emits
+// the JSX `srcSet` prop as `srcSet="…"` (capital S) in SSR HTML;
+// next/image preload uses `imageSrcSet`. Browsers normalize these to
+// lowercase on the DOM side, but our regex runs on the source string,
+// so we need to match every case variant.
+const MULTI_URL_ATTRS = /((?:srcset|imagesrcset)\s*=\s*["'])([^"']+)(["'])/gi;
+function rewriteSrcSetValue(value: string, prefix: string): string {
+    return value
+        .split(',')
+        .map((part) => {
+            const trimmed = part.trim();
+            if (!trimmed) return part;
+            const spaceIdx = trimmed.search(/\s/);
+            const url = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
+            const descriptor = spaceIdx === -1 ? '' : trimmed.slice(spaceIdx);
+            // Only rewrite absolute paths starting with `/` but not `//`
+            const shouldRewrite =
+                url.startsWith('/') && !url.startsWith('//') && !url.startsWith(prefix);
+            const rewritten = shouldRewrite ? `${prefix}${url}` : url;
+            return `${rewritten}${descriptor}`;
+        })
+        .join(', ');
+}
+// NOTE on RSC flight stream: Next.js App Router emits the React Server
+// Components flight stream as inline <script>self.__next_f.push([1, "<JSON>"])</script>
+// containing absolute /_next/... paths inside `I[...]` import directives.
+// We deliberately do NOT rewrite those paths even though they "look like"
+// absolute URLs — the Turbopack runtime uses them as resolver keys that
+// must match `getChunkRelativeUrl(chunkPath) === "/_next/" + chunkPath`.
+// Rewriting them to `/v1/preview/.../3001/_next/...` causes the resolver
+// to wait on a key that BACKEND.registerChunk never resolves, silently
+// stalling hydration. See specs/preview-nextjs-turbopack-hydration/
+// Phase 2.5 for the diagnosis. The actual fetch is redirected through
+// the proxy via the interceptor's HTMLScriptElement.src setter patch.
 
 function makeReplacer(prefix: string) {
     return (_match: string, pre: string, path: string, tail: string): string => {
@@ -77,11 +128,19 @@ export function rewriteJsCss(text: string, prefix: string): string {
 export function rewriteHtml(html: string, prefix: string): string {
     const rep = makeReplacer(prefix);
     let out = html
-        .replace(ABS_PATH_ATTRS, rep)
-        .replace(SRCSET_ATTR, rewriteSrcset(prefix))
         .replace(ABS_PATH_IMPORT, rep)
-        .replace(ABS_PATH_CSS_URL, rep);
-
+        .replace(MULTI_URL_ATTRS, (_match, head: string, list: string, tail: string) =>
+            `${head}${rewriteSrcSetValue(list, prefix)}${tail}`,
+        )
+        .replace(INLINE_STYLE_BLOCK, (match, css: string) => {
+            const rewritten = css.replace(ABS_PATH_CSS_URL, rep);
+            return rewritten === css ? match : match.replace(css, rewritten);
+        })
+        .replace(INLINE_STYLE_ATTR, (match, head: string, css: string, tail: string) => {
+            const rewritten = css.replace(ABS_PATH_CSS_URL, rep);
+            return rewritten === css ? match : `${head}${rewritten}${tail}`;
+        });
+  
     // <base> pins the document base URL so relative-path resources
     // (`<script src="app.js">`) survive the interceptor's history.replaceState.
     const baseHref = `<base href="${prefix}/">`;
@@ -130,6 +189,94 @@ function buildInterceptorScript(prefix: string): string {
         `window.WebSocket.CONNECTING=0;window.WebSocket.OPEN=1;window.WebSocket.CLOSING=2;window.WebSocket.CLOSED=3;` +
         `var oF=window.fetch;window.fetch=function(i,n){if(typeof i==='string')i=rw(i);return oF.call(this,i,n)};` +
         `var oO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(typeof u==='string')arguments[1]=rw(u);return oO.apply(this,arguments)};` +
+        // rwSet: multi-URL form of rw() for srcset / imagesrcset attribute
+        // values. Each comma-separated entry is "URL descriptor?" (e.g.
+        // "/_next/image?... 1x"); rewrite the URL part only and keep the
+        // descriptor verbatim.
+        `function rwSet(v){` +
+        `if(typeof v!=='string')return v;` +
+        `return v.split(',').map(function(p){` +
+        `var t=p.trim();if(!t)return p;` +
+        `var i=t.search(/\\s/);` +
+        `var u=i===-1?t:t.slice(0,i);` +
+        `var d=i===-1?'':t.slice(i);` +
+        `return rw(u)+d` +
+        `}).join(', ')};` +
+        // Phase 2.5 / 3 / refactor for Next.js + general resource loading:
+        //
+        // (a) src/href setter patches on HTMLScriptElement / HTMLLinkElement /
+        //     HTMLImageElement: when JS code does `el.src = '/foo'`, route
+        //     the actual fetch through the proxy. Uses the same rw() helper
+        //     as fetch/XHR so behavior is symmetric and idempotent — covers
+        //     not just /_next/ but every absolute /... path (e.g. user code
+        //     like `script.src = '/api/widget.js'`).
+        //
+        // (b) setAttribute shadow on the SAME three prototypes (not on the
+        //     base Element.prototype). React's RSC reader uses
+        //     `link.setAttribute('href', '/_next/...')` for HL[] preload
+        //     directives — the property setter we patched in (a) doesn't
+        //     fire for setAttribute. Narrowing to specific subclasses
+        //     avoids paying the check cost on every <div>/<svg>/...
+        //     setAttribute call.
+        //
+        // (c) getAttribute('src') strip on HTMLScriptElement only — kept
+        //     narrow to /_next/ because Turbopack's getPathFromScript is
+        //     the only known caller that relies on the canonical form.
+        //     See specs/preview-nextjs-turbopack-hydration/ Phase 2.5.
+        // patchSetter accepts an optional transform fn — defaults to rw()
+        // (single-URL). srcset variants pass rwSet instead.
+        `function patchSetter(proto,attr,t){` +
+        `var d=Object.getOwnPropertyDescriptor(proto,attr);if(!d||!d.set)return;` +
+        `var fn=t||rw;` +
+        `Object.defineProperty(proto,attr,{configurable:true,` +
+        `get:function(){return d.get.call(this)},` +
+        `set:function(v){d.set.call(this,fn(v))}})` +
+        `}` +
+        `function patchSetAttr(proto){` +
+        `var oSA=proto.hasOwnProperty('setAttribute')?proto.setAttribute:Element.prototype.setAttribute;` +
+        `Object.defineProperty(proto,'setAttribute',{configurable:true,writable:true,` +
+        `value:function(n,v){` +
+        `var nl=typeof n==='string'?n.toLowerCase():n;` +
+        `if(nl==='src'||nl==='href'||nl==='action')v=rw(v);` +
+        `else if(nl==='srcset'||nl==='imagesrcset')v=rwSet(v);` +
+        `return oSA.call(this,n,v)}})` +
+        `}` +
+        `patchSetter(HTMLScriptElement.prototype,'src');` +
+        `patchSetter(HTMLLinkElement.prototype,'href');` +
+        `patchSetter(HTMLImageElement.prototype,'src');` +
+        // srcset setter on Image + Source (the <picture><source srcset>
+        // form). React's next/image re-sets srcset after hydration via
+        // the property; without this, the user sees broken images.
+        `patchSetter(HTMLImageElement.prototype,'srcset',rwSet);` +
+        `if(typeof HTMLSourceElement!=='undefined')patchSetter(HTMLSourceElement.prototype,'srcset',rwSet);` +
+        `patchSetAttr(HTMLScriptElement.prototype);` +
+        `patchSetAttr(HTMLLinkElement.prototype);` +
+        `patchSetAttr(HTMLImageElement.prototype);` +
+        `if(typeof HTMLSourceElement!=='undefined')patchSetAttr(HTMLSourceElement.prototype);` +
+        `var oGA=Element.prototype.getAttribute;` +
+        `HTMLScriptElement.prototype.getAttribute=function(n){` +
+        `var v=oGA.call(this,n);` +
+        `if(n==='src'&&typeof v==='string'&&v.indexOf(P+'/_next/')===0)return v.slice(P.length);` +
+        `return v};` +
+        // Forward-compat sentinel: our setter/getAttribute patches depend on
+        // Turbopack's runtime stripping a hardcoded "/_next/" prefix in
+        // getPathFromScript. If a future Next.js version changes that path
+        // (or the chunk loader internals), our patches silently no-op and
+        // hydration stalls — exactly the failure mode that started this
+        // saga. After page load, check whether a Next.js + Turbopack page
+        // hydrated. If not, surface a warning instead of a silent black
+        // screen. False-positive guards: only fire if the page actually
+        // shipped Turbopack chunk scripts (indicator that it IS a Next.js
+        // app), and only if window.next.turbopack was never set.
+        `setTimeout(function(){` +
+        `try{` +
+        `if(window.next&&window.next.turbopack)return;` +
+        `if(!document.querySelector('script[src*="_next/static/chunks"]'))return;` +
+        `console.warn('[happy-preview] Next.js / Turbopack hydration did not complete within 8s through the preview proxy. ' +` +
+        `'This usually means the runtime\\'s chunk-loader contract changed and our /_next/ patch needs to be revisited. ' +` +
+        `'See specs/preview-nextjs-turbopack-hydration/ for the original diagnosis.')` +
+        `}catch(_){}` +
+        `},8000);` +
         `})()</script>`
     );
 }
