@@ -237,6 +237,18 @@ describe('rewriteHtml — srcset / imageSrcSet multi-URL rewriting (Phase 3)', (
         expect(out).toContain(`${PREFIX}/_next/image?url=%2Fx.png&amp;w=256 2x`);
     });
 
+    it('rewrites URLs in srcSet (React JSX camelCase form on <img>) — the obid Image bug', () => {
+        // React's renderToString outputs the JSX `srcSet` prop literally as
+        // `srcSet="…"` in SSR HTML. Earlier regex matched lowercase srcset
+        // only, so next/image SSR'd <img srcSet="…"> tags stayed unprefixed
+        // — browser fetched from platform origin, images broke.
+        const input =
+            `<img data-nimg="1" srcSet="/_next/image?url=foo&amp;w=96 1x, /_next/image?url=foo&amp;w=256 2x" src="/x">`;
+        const out = rewriteHtml(input, PREFIX);
+        expect(out).toContain(`${PREFIX}/_next/image?url=foo&amp;w=96 1x`);
+        expect(out).toContain(`${PREFIX}/_next/image?url=foo&amp;w=256 2x`);
+    });
+
     it('rewrites URLs in imagesrcset (lowercase HTML form)', () => {
         const out = rewriteHtml(`<link rel="preload" as="image" imagesrcset="/a.png 1x, /b.png 2x">`, PREFIX);
         expect(out).toContain(`${PREFIX}/a.png 1x`);
@@ -280,12 +292,15 @@ describe('rewriteHtml — interceptor script src/href/setAttribute patches', () 
         expect(out).toContain(`patchSetter(HTMLLinkElement.prototype,'href')`);
     });
 
-    it('setter delegates to rw() so it covers every absolute / path, not just /_next/', () => {
+    it('setter delegates to rw() (or supplied transform) — covers every absolute / path', () => {
         // The rw() helper is already defined for fetch/XHR — reusing it makes
         // setter behavior symmetric and idempotent. Without this, user code
         // like `script.src = '/api/widget.js'` would bypass the proxy.
+        // The patchSetter signature accepts an optional transform so srcset
+        // variants can pass rwSet instead.
         const out = rewriteHtml('<html><head></head></html>', PREFIX);
-        expect(out).toContain(`set:function(v){d.set.call(this,rw(v))}`);
+        expect(out).toContain(`set:function(v){d.set.call(this,fn(v))}`);
+        expect(out).toContain(`var fn=t||rw`);
     });
 
     it('narrows setAttribute patch to HTMLScript / HTMLLink / HTMLImage prototypes (no global Element.prototype patch)', () => {
@@ -302,6 +317,25 @@ describe('rewriteHtml — interceptor script src/href/setAttribute patches', () 
         expect(out).toContain(`(nl==='src'||nl==='href'||nl==='action')`);
         expect(out).toContain(`n.toLowerCase()`);
         expect(out).toContain(`v=rw(v)`);
+    });
+
+    it('installs rwSet helper for multi-URL srcset rewriting', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`function rwSet(v)`);
+        // rwSet must use rw() per-URL token + preserve descriptors
+        expect(out).toContain(`return rw(u)+d`);
+    });
+
+    it('patches srcset setter on HTMLImageElement + HTMLSourceElement with rwSet', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`patchSetter(HTMLImageElement.prototype,'srcset',rwSet)`);
+        expect(out).toContain(`patchSetter(HTMLSourceElement.prototype,'srcset',rwSet)`);
+    });
+
+    it('setAttribute patch covers srcset / imagesrcset via rwSet', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`(nl==='srcset'||nl==='imagesrcset')`);
+        expect(out).toContain(`v=rwSet(v)`);
     });
 
     it('installs a forward-compat sentinel that warns if Next.js / Turbopack does not hydrate', () => {

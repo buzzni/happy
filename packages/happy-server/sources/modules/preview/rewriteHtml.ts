@@ -37,12 +37,18 @@ const ABS_PATH_CSS_URL = /(url\(\s*["']?)(\/(?!\/)[^"')\s]*)(["']?\s*\))/g;
 // inline styles only show up when the rewriter walks the HTML body.
 const INLINE_STYLE_BLOCK = /<style[^>]*>([\s\S]*?)<\/style>/gi;
 
-// `srcset`, `imagesrcset` (HTML), `imageSrcSet` (React JSX camelCase) carry
-// comma-separated URL+descriptor pairs (e.g. `/a.png 1x, /b.png 2x`). They
-// don't fit ABS_PATH_ATTRS's single-URL shape, so we handle them with a
-// dedicated pass that tokenizes each pair, rewrites the URL part if it's
-// an absolute path, and preserves the descriptor verbatim.
-const MULTI_URL_ATTRS = /((?:srcset|imagesrcset|imageSrcSet)\s*=\s*["'])([^"']+)(["'])/g;
+// `srcset` / `imagesrcset` carry comma-separated URL+descriptor pairs
+// (e.g. `/a.png 1x, /b.png 2x`). They don't fit ABS_PATH_ATTRS's
+// single-URL shape, so we handle them with a dedicated pass that
+// tokenizes each pair, rewrites the URL part if it's an absolute path,
+// and preserves the descriptor verbatim.
+//
+// Case-insensitive on the attribute name: React's renderToString emits
+// the JSX `srcSet` prop as `srcSet="…"` (capital S) in SSR HTML;
+// next/image preload uses `imageSrcSet`. Browsers normalize these to
+// lowercase on the DOM side, but our regex runs on the source string,
+// so we need to match every case variant.
+const MULTI_URL_ATTRS = /((?:srcset|imagesrcset)\s*=\s*["'])([^"']+)(["'])/gi;
 
 function rewriteSrcSetValue(value: string, prefix: string): string {
     return value
@@ -149,6 +155,19 @@ function buildInterceptorScript(prefix: string): string {
         `window.WebSocket.CONNECTING=0;window.WebSocket.OPEN=1;window.WebSocket.CLOSING=2;window.WebSocket.CLOSED=3;` +
         `var oF=window.fetch;window.fetch=function(i,n){if(typeof i==='string')i=rw(i);return oF.call(this,i,n)};` +
         `var oO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(typeof u==='string')arguments[1]=rw(u);return oO.apply(this,arguments)};` +
+        // rwSet: multi-URL form of rw() for srcset / imagesrcset attribute
+        // values. Each comma-separated entry is "URL descriptor?" (e.g.
+        // "/_next/image?... 1x"); rewrite the URL part only and keep the
+        // descriptor verbatim.
+        `function rwSet(v){` +
+        `if(typeof v!=='string')return v;` +
+        `return v.split(',').map(function(p){` +
+        `var t=p.trim();if(!t)return p;` +
+        `var i=t.search(/\\s/);` +
+        `var u=i===-1?t:t.slice(0,i);` +
+        `var d=i===-1?'':t.slice(i);` +
+        `return rw(u)+d` +
+        `}).join(', ')};` +
         // Phase 2.5 / 3 / refactor for Next.js + general resource loading:
         //
         // (a) src/href setter patches on HTMLScriptElement / HTMLLinkElement /
@@ -170,11 +189,14 @@ function buildInterceptorScript(prefix: string): string {
         //     narrow to /_next/ because Turbopack's getPathFromScript is
         //     the only known caller that relies on the canonical form.
         //     See specs/preview-nextjs-turbopack-hydration/ Phase 2.5.
-        `function patchSetter(proto,attr){` +
+        // patchSetter accepts an optional transform fn — defaults to rw()
+        // (single-URL). srcset variants pass rwSet instead.
+        `function patchSetter(proto,attr,t){` +
         `var d=Object.getOwnPropertyDescriptor(proto,attr);if(!d||!d.set)return;` +
+        `var fn=t||rw;` +
         `Object.defineProperty(proto,attr,{configurable:true,` +
         `get:function(){return d.get.call(this)},` +
-        `set:function(v){d.set.call(this,rw(v))}})` +
+        `set:function(v){d.set.call(this,fn(v))}})` +
         `}` +
         `function patchSetAttr(proto){` +
         `var oSA=proto.hasOwnProperty('setAttribute')?proto.setAttribute:Element.prototype.setAttribute;` +
@@ -182,14 +204,21 @@ function buildInterceptorScript(prefix: string): string {
         `value:function(n,v){` +
         `var nl=typeof n==='string'?n.toLowerCase():n;` +
         `if(nl==='src'||nl==='href'||nl==='action')v=rw(v);` +
+        `else if(nl==='srcset'||nl==='imagesrcset')v=rwSet(v);` +
         `return oSA.call(this,n,v)}})` +
         `}` +
         `patchSetter(HTMLScriptElement.prototype,'src');` +
         `patchSetter(HTMLLinkElement.prototype,'href');` +
         `patchSetter(HTMLImageElement.prototype,'src');` +
+        // srcset setter on Image + Source (the <picture><source srcset>
+        // form). React's next/image re-sets srcset after hydration via
+        // the property; without this, the user sees broken images.
+        `patchSetter(HTMLImageElement.prototype,'srcset',rwSet);` +
+        `if(typeof HTMLSourceElement!=='undefined')patchSetter(HTMLSourceElement.prototype,'srcset',rwSet);` +
         `patchSetAttr(HTMLScriptElement.prototype);` +
         `patchSetAttr(HTMLLinkElement.prototype);` +
         `patchSetAttr(HTMLImageElement.prototype);` +
+        `if(typeof HTMLSourceElement!=='undefined')patchSetAttr(HTMLSourceElement.prototype);` +
         `var oGA=Element.prototype.getAttribute;` +
         `HTMLScriptElement.prototype.getAttribute=function(n){` +
         `var v=oGA.call(this,n);` +

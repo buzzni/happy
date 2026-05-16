@@ -50,6 +50,10 @@ function buildSandbox() {
     }
     class FakeImageElement extends FakeElement {
         declare src: string;
+        declare srcset: string;
+    }
+    class FakeSourceElement extends FakeElement {
+        declare srcset: string;
     }
 
     // The real DOM exposes `src` / `href` as accessor properties on the
@@ -71,6 +75,8 @@ function buildSandbox() {
     defineUrlAccessor(FakeScriptElement.prototype, 'src');
     defineUrlAccessor(FakeLinkElement.prototype, 'href');
     defineUrlAccessor(FakeImageElement.prototype, 'src');
+    defineUrlAccessor(FakeImageElement.prototype, 'srcset');
+    defineUrlAccessor(FakeSourceElement.prototype, 'srcset');
 
     // No-op WebSocket / XMLHttpRequest / fetch so monkey-patches don't blow up.
     class FakeWebSocket {
@@ -102,6 +108,7 @@ function buildSandbox() {
         HTMLScriptElement: FakeScriptElement,
         HTMLLinkElement: FakeLinkElement,
         HTMLImageElement: FakeImageElement,
+        HTMLSourceElement: FakeSourceElement,
         Element: FakeElement,
         history: {
             replaceState: (_state: unknown, _title: string, url: string) => {
@@ -116,7 +123,7 @@ function buildSandbox() {
         Object,
         Promise,
     };
-    return { sandbox, FakeScriptElement, FakeLinkElement, FakeImageElement };
+    return { sandbox, FakeScriptElement, FakeLinkElement, FakeImageElement, FakeSourceElement };
 }
 
 function runInterceptor(sandbox: Record<string, unknown>) {
@@ -193,6 +200,36 @@ describe('rewriteHtml interceptor — runtime behavior in stubbed DOM', () => {
         });
     });
 
+    describe('img.srcset / source.srcset setter — multi-URL rewrite via rwSet', () => {
+        it('prefixes both URLs in img.srcset (next/image responsive variants)', () => {
+            const i = new bag.FakeImageElement();
+            i.srcset = '/_next/image?url=foo&w=96 1x, /_next/image?url=foo&w=256 2x';
+            expect(i.getAttribute('srcset')).toBe(
+                `${PREFIX}/_next/image?url=foo&w=96 1x, ${PREFIX}/_next/image?url=foo&w=256 2x`,
+            );
+        });
+
+        it('prefixes URLs in <source> srcset (<picture> element)', () => {
+            const s = new bag.FakeSourceElement();
+            s.srcset = '/a.webp 1x, /b.webp 2x';
+            expect(s.getAttribute('srcset')).toBe(`${PREFIX}/a.webp 1x, ${PREFIX}/b.webp 2x`);
+        });
+
+        it('leaves external + protocol-relative + already-prefixed URLs untouched', () => {
+            const i = new bag.FakeImageElement();
+            i.srcset = `https://cdn/x.png 1x, //cdn/y.png 2x, ${PREFIX}/already.png 3x, /local.png 4x`;
+            expect(i.getAttribute('srcset')).toBe(
+                `https://cdn/x.png 1x, //cdn/y.png 2x, ${PREFIX}/already.png 3x, ${PREFIX}/local.png 4x`,
+            );
+        });
+
+        it('handles single URL without descriptor', () => {
+            const i = new bag.FakeImageElement();
+            i.srcset = '/only.png';
+            expect(i.getAttribute('srcset')).toBe(`${PREFIX}/only.png`);
+        });
+    });
+
     describe('setAttribute (narrowed to Script / Link / Image)', () => {
         it('script.setAttribute(src, "/_next/...") fires rw', () => {
             const s = new bag.FakeScriptElement();
@@ -223,6 +260,23 @@ describe('rewriteHtml interceptor — runtime behavior in stubbed DOM', () => {
             const s = new bag.FakeScriptElement();
             s.setAttribute('id', '/_next/looks-like-path');
             expect(s.getAttribute('id')).toBe('/_next/looks-like-path');
+        });
+
+        it('img.setAttribute(srcset, multi-URL) — the next/image post-hydration path', () => {
+            // This is the bug the user reported: next/image swaps srcset
+            // attribute via setAttribute after hydration → bypasses the
+            // .srcset property setter, so we also intercept setAttribute.
+            const i = new bag.FakeImageElement();
+            i.setAttribute('srcset', '/_next/image?url=foo&w=96 1x, /_next/image?url=foo&w=256 2x');
+            expect(i.getAttribute('srcset')).toBe(
+                `${PREFIX}/_next/image?url=foo&w=96 1x, ${PREFIX}/_next/image?url=foo&w=256 2x`,
+            );
+        });
+
+        it('img.setAttribute(imagesrcset, ...) — lowercase HTML form', () => {
+            const i = new bag.FakeImageElement();
+            i.setAttribute('imagesrcset', '/a 1x, /b 2x');
+            expect(i.getAttribute('imagesrcset')).toBe(`${PREFIX}/a 1x, ${PREFIX}/b 2x`);
         });
     });
 
