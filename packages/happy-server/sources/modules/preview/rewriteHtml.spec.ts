@@ -162,6 +162,55 @@ describe('rewriteHtml — RSC flight stream MUST NOT be rewritten (Phase 2.5)', 
     });
 });
 
+// Phase 3 (specs/preview-nextjs-turbopack-hydration/): multi-URL attributes
+// like `srcset`, `imagesrcset` (lowercase HTML form) and `imageSrcSet`
+// (React/JSX form) are comma-separated URL+descriptor pairs. ABS_PATH_ATTRS
+// can't rewrite them as a single string — each URL token must be
+// rewritten independently while preserving the descriptor (1x, 2x, 300w).
+describe('rewriteHtml — srcset / imageSrcSet multi-URL rewriting (Phase 3)', () => {
+    it('rewrites both URLs in a simple srcset attribute', () => {
+        const out = rewriteHtml('<img srcset="/a.png 1x, /b.png 2x">', PREFIX);
+        expect(out).toContain(`srcset="${PREFIX}/a.png 1x, ${PREFIX}/b.png 2x"`);
+    });
+
+    it('rewrites URLs in imageSrcSet (JSX camelCase form Next.js emits)', () => {
+        const input = `<link rel="preload" as="image" imageSrcSet="/_next/image?url=%2Fx.png&amp;w=96 1x, /_next/image?url=%2Fx.png&amp;w=256 2x"/>`;
+        const out = rewriteHtml(input, PREFIX);
+        expect(out).toContain(`${PREFIX}/_next/image?url=%2Fx.png&amp;w=96 1x`);
+        expect(out).toContain(`${PREFIX}/_next/image?url=%2Fx.png&amp;w=256 2x`);
+    });
+
+    it('rewrites URLs in imagesrcset (lowercase HTML form)', () => {
+        const out = rewriteHtml(`<link rel="preload" as="image" imagesrcset="/a.png 1x, /b.png 2x">`, PREFIX);
+        expect(out).toContain(`${PREFIX}/a.png 1x`);
+        expect(out).toContain(`${PREFIX}/b.png 2x`);
+    });
+
+    it('leaves external + protocol-relative URLs untouched, rewrites absolute ones', () => {
+        const out = rewriteHtml(
+            `<img srcset="https://cdn.example.com/x.png 1x, //cdn/y.png 2x, /local.png 3x">`,
+            PREFIX,
+        );
+        expect(out).toContain('https://cdn.example.com/x.png 1x');
+        expect(out).toContain('//cdn/y.png 2x');
+        expect(out).toContain(`${PREFIX}/local.png 3x`);
+        // No double-prefix on protocol-relative
+        expect(out).not.toContain(`${PREFIX}//cdn`);
+    });
+
+    it('preserves srcset URLs already prefixed (idempotent)', () => {
+        const input = `<img srcset="${PREFIX}/a.png 1x">`;
+        const out = rewriteHtml(input, PREFIX);
+        expect(out).toContain(`srcset="${PREFIX}/a.png 1x"`);
+        expect(out).not.toContain(`${PREFIX}${PREFIX}`);
+    });
+
+    it('handles a single URL without descriptor in srcset', () => {
+        const out = rewriteHtml(`<img srcset="/only.png">`, PREFIX);
+        expect(out).toContain(`srcset="${PREFIX}/only.png"`);
+    });
+});
+
 describe('rewriteHtml — interceptor script src/href setter + getAttribute patches (Phase 2.5)', () => {
     it('interceptor patches HTMLScriptElement.prototype.src setter for /_next/ paths', () => {
         const out = rewriteHtml('<html><head></head></html>', PREFIX);
@@ -179,6 +228,16 @@ describe('rewriteHtml — interceptor script src/href setter + getAttribute patc
         // The patch should reference the prefix variable P
         expect(out).toContain(`v.indexOf(P+'/_next/')===0`);
         expect(out).toContain(`v.slice(P.length)`);
+    });
+
+    it('interceptor intercepts Element.setAttribute for src/href (Phase 3)', () => {
+        // React's RSC reader uses setAttribute (not the property setter) for
+        // HL[] preload directives — without this patch they target
+        // location.origin (the relay) instead of the proxy path.
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`Element.prototype.setAttribute=function`);
+        expect(out).toContain(`(n==='src'||n==='href')`);
+        expect(out).toContain(`v.indexOf('/_next/')===0`);
     });
 });
 

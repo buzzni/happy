@@ -83,7 +83,7 @@ function filterForwardedHeaders(raw: Record<string, string | string[] | undefine
     return out;
 }
 
-function stripResponseHeaders(headers: Record<string, string>): Record<string, string> {
+export function stripResponseHeaders(headers: Record<string, string>): Record<string, string> {
     const out: Record<string, string> = {};
     for (const [key, value] of Object.entries(headers)) {
         const lower = key.toLowerCase();
@@ -91,6 +91,17 @@ function stripResponseHeaders(headers: Record<string, string>): Record<string, s
         // and frame-ancestor directives that would block iframe embedding.
         if (lower === 'content-length' || lower === 'content-encoding') continue;
         if (lower === 'x-frame-options') continue;
+        // Drop `Link` response headers entirely. Next.js dev emits things like
+        // `</_next/static/...>; rel=preload; as="style"` here, and we cannot
+        // rewrite those URLs the way we do for HTML attributes — the browser
+        // would issue early-hint preloads against the platform origin
+        // (location.origin = the relay host), get the platform's SPA fallback
+        // HTML back, and log noisy "preloaded using link preload but not
+        // used" warnings. The same preloads exist as `<link rel="preload">`
+        // in the HTML body and get prefixed by the rewriter, so dropping the
+        // header only loses the early-hint timing benefit. See
+        // specs/preview-nextjs-turbopack-hydration/ Phase 3.
+        if (lower === 'link') continue;
         out[key] = value;
     }
     return out;

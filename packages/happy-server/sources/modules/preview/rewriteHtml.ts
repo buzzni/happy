@@ -28,6 +28,31 @@ const ABS_PATH_ATTRS = /((?:src|href|action)\s*=\s*["'])(\/(?!\/)[^"']*?)(["'])/
 const ABS_PATH_IMPORT = /((?:from|import)\s*\(?\s*["'])(\/(?!\/)[^"']*?)(["'])/g;
 const ABS_PATH_CSS_URL = /(url\(\s*["']?)(\/(?!\/)[^"')\s]*)(["']?\s*\))/g;
 
+// `srcset`, `imagesrcset` (HTML), `imageSrcSet` (React JSX camelCase) carry
+// comma-separated URL+descriptor pairs (e.g. `/a.png 1x, /b.png 2x`). They
+// don't fit ABS_PATH_ATTRS's single-URL shape, so we handle them with a
+// dedicated pass that tokenizes each pair, rewrites the URL part if it's
+// an absolute path, and preserves the descriptor verbatim.
+const MULTI_URL_ATTRS = /((?:srcset|imagesrcset|imageSrcSet)\s*=\s*["'])([^"']+)(["'])/g;
+
+function rewriteSrcSetValue(value: string, prefix: string): string {
+    return value
+        .split(',')
+        .map((part) => {
+            const trimmed = part.trim();
+            if (!trimmed) return part;
+            const spaceIdx = trimmed.search(/\s/);
+            const url = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
+            const descriptor = spaceIdx === -1 ? '' : trimmed.slice(spaceIdx);
+            // Only rewrite absolute paths starting with `/` but not `//`
+            const shouldRewrite =
+                url.startsWith('/') && !url.startsWith('//') && !url.startsWith(prefix);
+            const rewritten = shouldRewrite ? `${prefix}${url}` : url;
+            return `${rewritten}${descriptor}`;
+        })
+        .join(', ');
+}
+
 // NOTE on RSC flight stream: Next.js App Router emits the React Server
 // Components flight stream as inline <script>self.__next_f.push([1, "<JSON>"])</script>
 // containing absolute /_next/... paths inside `I[...]` import directives.
@@ -58,7 +83,10 @@ export function rewriteHtml(html: string, prefix: string): string {
     const rep = makeReplacer(prefix);
     let out = html
         .replace(ABS_PATH_ATTRS, rep)
-        .replace(ABS_PATH_IMPORT, rep);
+        .replace(ABS_PATH_IMPORT, rep)
+        .replace(MULTI_URL_ATTRS, (_match, head: string, list: string, tail: string) =>
+            `${head}${rewriteSrcSetValue(list, prefix)}${tail}`,
+        );
 
     // <base> pins the document base URL so relative-path resources
     // (`<script src="app.js">`) survive the interceptor's history.replaceState.
@@ -128,6 +156,15 @@ function buildInterceptorScript(prefix: string): string {
         `}` +
         `patchSetter(HTMLScriptElement.prototype,'src');` +
         `patchSetter(HTMLLinkElement.prototype,'href');` +
+        // setAttribute bypasses the property setter — React's RSC reader
+        // uses `link.setAttribute('href', '/_next/...')` for HL[] preload
+        // directives, so we also intercept setAttribute. Without this,
+        // RSC-driven preloads target location.origin (the relay host) and
+        // log "preloaded using link preload but not used" warnings.
+        `var oSA=Element.prototype.setAttribute;` +
+        `Element.prototype.setAttribute=function(n,v){` +
+        `if((n==='src'||n==='href')&&typeof v==='string'&&v.indexOf('/_next/')===0)v=P+v;` +
+        `return oSA.call(this,n,v)};` +
         `var oGA=Element.prototype.getAttribute;` +
         `HTMLScriptElement.prototype.getAttribute=function(n){` +
         `var v=oGA.call(this,n);` +
