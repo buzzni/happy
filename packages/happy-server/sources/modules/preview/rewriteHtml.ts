@@ -94,30 +94,6 @@ function makeReplacer(prefix: string) {
     };
 }
 
-/**
- * Rewrite each comma-separated entry of a `srcset` attribute. Each entry is
- * `<url> <descriptor>` (descriptor optional, e.g. `2x`, `100w`). Only the
- * URL part can be a path — descriptors stay untouched.
- */
-function rewriteSrcset(prefix: string) {
-    return (_match: string, head: string, quote: string, list: string): string => {
-        const rewritten = list
-            .split(',')
-            .map((entry) => {
-                const trimmed = entry.trim();
-                const spaceIdx = trimmed.search(/\s/);
-                const url = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
-                const descriptor = spaceIdx === -1 ? '' : trimmed.slice(spaceIdx);
-                const isAbsolute =
-                    url.startsWith('/') && !url.startsWith('//') && !url.startsWith(prefix);
-                const rewrittenUrl = isAbsolute ? `${prefix}${url}` : url;
-                return `${rewrittenUrl}${descriptor}`;
-            })
-            .join(', ');
-        return `${head}${quote}${rewritten}${quote}`;
-    };
-}
-
 export function rewriteJsCss(text: string, prefix: string): string {
     const rep = makeReplacer(prefix);
     return text
@@ -128,6 +104,7 @@ export function rewriteJsCss(text: string, prefix: string): string {
 export function rewriteHtml(html: string, prefix: string): string {
     const rep = makeReplacer(prefix);
     let out = html
+        .replace(ABS_PATH_ATTRS, rep)
         .replace(ABS_PATH_IMPORT, rep)
         .replace(MULTI_URL_ATTRS, (_match, head: string, list: string, tail: string) =>
             `${head}${rewriteSrcSetValue(list, prefix)}${tail}`,
