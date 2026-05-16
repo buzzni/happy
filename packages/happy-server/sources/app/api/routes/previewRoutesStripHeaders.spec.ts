@@ -24,15 +24,43 @@ describe('stripResponseHeaders', () => {
         expect(out['x-frame-options']).toBeUndefined();
     });
 
-    it('drops Link response header (early-hint preloads against the wrong origin)', () => {
+    it('drops Link response header when no prefix supplied (backwards compat)', () => {
         const linkValue = '</_next/static/chunks/foo.css>; rel=preload; as="style"';
         const out = stripResponseHeaders({ Link: linkValue, 'content-type': 'text/html' });
         expect(out['Link']).toBeUndefined();
         expect(out['link']).toBeUndefined();
     });
 
-    it('drops lowercase `link` header too (case-insensitive match)', () => {
-        const out = stripResponseHeaders({ link: '</a.css>; rel=preload', 'content-type': 'text/html' });
+    it('drops Link header when all entries are rel=preload (with prefix)', () => {
+        const linkValue =
+            '</_next/static/chunks/foo.css>; rel=preload; as="style", ' +
+            '</_next/static/y.woff2>; rel=preload; as="font"';
+        const out = stripResponseHeaders(
+            { Link: linkValue, 'content-type': 'text/html' },
+            '/v1/preview/m1/3000',
+        );
+        expect(out['Link']).toBeUndefined();
+    });
+
+    it('keeps + rewrites non-preload Link entries (rel=manifest, canonical) when prefix supplied', () => {
+        const linkValue =
+            '</_next/static/x.css>; rel=preload; as="style", ' +
+            '</manifest.json>; rel=manifest, ' +
+            '<https://example.com/canonical>; rel=canonical';
+        const out = stripResponseHeaders(
+            { Link: linkValue, 'content-type': 'text/html' },
+            '/v1/preview/m1/3000',
+        );
+        expect(out['Link']).toBe(
+            '</v1/preview/m1/3000/manifest.json>; rel=manifest, <https://example.com/canonical>; rel=canonical',
+        );
+    });
+
+    it('handles lowercase `link` header (case-insensitive match) with prefix', () => {
+        const out = stripResponseHeaders(
+            { link: '</a.css>; rel=preload', 'content-type': 'text/html' },
+            '/v1/preview/m1/3000',
+        );
         expect(out['link']).toBeUndefined();
     });
 

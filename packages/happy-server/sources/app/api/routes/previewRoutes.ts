@@ -25,6 +25,7 @@ import { eventRouter } from "@/app/events/eventRouter";
 import { signPreviewToken, verifyPreviewToken } from "@/modules/preview/previewToken";
 import { readPreviewCookie, buildPreviewCookie } from "@/modules/preview/previewCookie";
 import { rewriteHtml, rewriteJsCss } from "@/modules/preview/rewriteHtml";
+import { rewriteLinkHeader } from "@/modules/preview/rewriteLinkHeader";
 import { type Fastify } from "../types";
 
 interface ProxySuccess {
@@ -83,7 +84,10 @@ function filterForwardedHeaders(raw: Record<string, string | string[] | undefine
     return out;
 }
 
-export function stripResponseHeaders(headers: Record<string, string>): Record<string, string> {
+export function stripResponseHeaders(
+    headers: Record<string, string>,
+    prefix?: string,
+): Record<string, string> {
     const out: Record<string, string> = {};
     for (const [key, value] of Object.entries(headers)) {
         const lower = key.toLowerCase();
@@ -91,17 +95,21 @@ export function stripResponseHeaders(headers: Record<string, string>): Record<st
         // and frame-ancestor directives that would block iframe embedding.
         if (lower === 'content-length' || lower === 'content-encoding') continue;
         if (lower === 'x-frame-options') continue;
-        // Drop `Link` response headers entirely. Next.js dev emits things like
-        // `</_next/static/...>; rel=preload; as="style"` here, and we cannot
-        // rewrite those URLs the way we do for HTML attributes — the browser
-        // would issue early-hint preloads against the platform origin
-        // (location.origin = the relay host), get the platform's SPA fallback
-        // HTML back, and log noisy "preloaded using link preload but not
-        // used" warnings. The same preloads exist as `<link rel="preload">`
-        // in the HTML body and get prefixed by the rewriter, so dropping the
-        // header only loses the early-hint timing benefit. See
-        // specs/preview-nextjs-turbopack-hydration/ Phase 3.
-        if (lower === 'link') continue;
+        // For the `Link` header, parse and selectively rewrite: drop
+        // `rel=preload` entries (they leak as early-hint preloads against
+        // location.origin = the relay host and the HTML body already carries
+        // equivalent <link rel="preload"> tags that get prefixed by the
+        // rewriter), and rewrite absolute-path URLs in surviving entries
+        // (e.g. rel=canonical / rel=manifest) so they route through the
+        // proxy. When no entries survive, drop the header entirely.
+        // See specs/preview-nextjs-turbopack-hydration/ Phase 3.
+        if (lower === 'link') {
+            if (!prefix) continue; // Backwards compat: drop when no prefix supplied.
+            const rewritten = rewriteLinkHeader(value, prefix);
+            if (rewritten === null) continue;
+            out[key] = rewritten;
+            continue;
+        }
         out[key] = value;
     }
     return out;
@@ -256,7 +264,7 @@ export function previewRoutes(app: Fastify) {
                     responseBody = Buffer.from(rewriteJsCss(responseBody.toString('utf-8'), prefix), 'utf-8');
                 }
 
-                const outHeaders = stripResponseHeaders(rpcResponse.headers);
+                const outHeaders = stripResponseHeaders(rpcResponse.headers, prefix);
                 if (rpcResponse.truncated) {
                     outHeaders['X-Preview-Truncated'] = '1';
                 }
