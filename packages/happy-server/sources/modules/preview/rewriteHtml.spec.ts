@@ -131,6 +131,57 @@ describe('rewriteHtml — interceptor injection', () => {
     });
 });
 
+// Phase 2.5 (specs/preview-nextjs-turbopack-hydration/): Next.js App Router /
+// Turbopack uses paths inside __next_f.push as resolver keys that must remain
+// in their canonical "/_next/..." form so BACKEND.registerChunk's `chunkUrl =
+// getChunkRelativeUrl(chunkPath)` matches the resolver created at fetch time.
+// We deliberately do NOT rewrite these paths. Instead, the interceptor's
+// HTMLScriptElement.src setter patch (below) redirects the actual fetch
+// through the proxy while preserving the canonical attribute value.
+describe('rewriteHtml — RSC flight stream MUST NOT be rewritten (Phase 2.5)', () => {
+    it('leaves \\"/_next/...\\" paths inside __next_f.push JSON unchanged', () => {
+        const input = `<script>self.__next_f.push([1,"7:I[\\"/_next/static/chunks/app.js\\"]"])</script>`;
+        const out = rewriteHtml(input, PREFIX);
+        // The path inside the JSON-escaped script body must remain "/_next/..."
+        // because Turbopack uses it as a resolver key.
+        expect(out).toContain(`7:I[\\"/_next/static/chunks/app.js\\"]`);
+        expect(out).not.toContain(`${PREFIX}/_next/static/chunks/app.js`);
+    });
+
+    it('leaves real-world Next.js RSC HL+I payload unchanged', () => {
+        const input = `<script>self.__next_f.push([1,":HL[\\"/_next/static/chunks/%5Broot-of-the-server%5D__d56404ae._.css\\",\\"style\\"]\\n7:I[\\"/_next/static/chunks/953a0._.js\\"]"])</script>`;
+        const out = rewriteHtml(input, PREFIX);
+        expect(out).toContain(`HL[\\"/_next/static/chunks/%5Broot-of-the-server%5D__d56404ae._.css\\"`);
+        expect(out).toContain(`I[\\"/_next/static/chunks/953a0._.js\\"]`);
+    });
+
+    it('does still rewrite external <script src="/_next/..."> attributes (ABS_PATH_ATTRS regression)', () => {
+        const input = `<script src="/_next/static/foo.js"></script>`;
+        const out = rewriteHtml(input, PREFIX);
+        expect(out).toContain(`src="${PREFIX}/_next/static/foo.js"`);
+    });
+});
+
+describe('rewriteHtml — interceptor script src/href setter + getAttribute patches (Phase 2.5)', () => {
+    it('interceptor patches HTMLScriptElement.prototype.src setter for /_next/ paths', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`patchSetter(HTMLScriptElement.prototype,'src')`);
+    });
+
+    it('interceptor patches HTMLLinkElement.prototype.href setter for /_next/ paths', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`patchSetter(HTMLLinkElement.prototype,'href')`);
+    });
+
+    it('interceptor overrides HTMLScriptElement.getAttribute(src) to strip the prefix', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`HTMLScriptElement.prototype.getAttribute=function`);
+        // The patch should reference the prefix variable P
+        expect(out).toContain(`v.indexOf(P+'/_next/')===0`);
+        expect(out).toContain(`v.slice(P.length)`);
+    });
+});
+
 describe('rewriteJsCss', () => {
     it('rewrites ES import paths', () => {
         const out = rewriteJsCss(`import x from '/lib/x.js'`, PREFIX);

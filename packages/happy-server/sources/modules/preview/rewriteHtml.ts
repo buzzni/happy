@@ -28,6 +28,18 @@ const ABS_PATH_ATTRS = /((?:src|href|action)\s*=\s*["'])(\/(?!\/)[^"']*?)(["'])/
 const ABS_PATH_IMPORT = /((?:from|import)\s*\(?\s*["'])(\/(?!\/)[^"']*?)(["'])/g;
 const ABS_PATH_CSS_URL = /(url\(\s*["']?)(\/(?!\/)[^"')\s]*)(["']?\s*\))/g;
 
+// NOTE on RSC flight stream: Next.js App Router emits the React Server
+// Components flight stream as inline <script>self.__next_f.push([1, "<JSON>"])</script>
+// containing absolute /_next/... paths inside `I[...]` import directives.
+// We deliberately do NOT rewrite those paths even though they "look like"
+// absolute URLs — the Turbopack runtime uses them as resolver keys that
+// must match `getChunkRelativeUrl(chunkPath) === "/_next/" + chunkPath`.
+// Rewriting them to `/v1/preview/.../3001/_next/...` causes the resolver
+// to wait on a key that BACKEND.registerChunk never resolves, silently
+// stalling hydration. See specs/preview-nextjs-turbopack-hydration/
+// Phase 2.5 for the diagnosis. The actual fetch is redirected through
+// the proxy via the interceptor's HTMLScriptElement.src setter patch.
+
 function makeReplacer(prefix: string) {
     return (_match: string, pre: string, path: string, tail: string): string => {
         const prefixed = path.startsWith(prefix) ? path : `${prefix}${path}`;
@@ -96,6 +108,31 @@ function buildInterceptorScript(prefix: string): string {
         `window.WebSocket.CONNECTING=0;window.WebSocket.OPEN=1;window.WebSocket.CLOSING=2;window.WebSocket.CLOSED=3;` +
         `var oF=window.fetch;window.fetch=function(i,n){if(typeof i==='string')i=rw(i);return oF.call(this,i,n)};` +
         `var oO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(typeof u==='string')arguments[1]=rw(u);return oO.apply(this,arguments)};` +
+        // Phase 2.5 fix for Next.js / Turbopack: the runtime's getPathFromScript
+        // strips a hardcoded "/_next/" prefix from script.src to derive the
+        // chunk registry key. Our HTML rewrite turns "/_next/foo.js" into
+        // "${P}/_next/foo.js", so the runtime fails to strip → registry key
+        // becomes the full prefixed path, doesn't match the chunkList entry
+        // ("static/chunks/foo.js"), entry chunk never executes, hydration
+        // never starts. We work around by (a) intercepting dynamic
+        // HTMLScriptElement.src / HTMLLinkElement.href setters and adding the
+        // prefix when the runtime tries to load "/_next/..." chunks, and
+        // (b) overriding HTMLScriptElement.prototype.getAttribute so that
+        // reading src returns the unprefixed "/_next/..." form Turbopack
+        // expects. See specs/preview-nextjs-turbopack-hydration/ Phase 2.5.
+        `function patchSetter(proto,attr){` +
+        `var d=Object.getOwnPropertyDescriptor(proto,attr);if(!d||!d.set)return;` +
+        `Object.defineProperty(proto,attr,{configurable:true,` +
+        `get:function(){return d.get.call(this)},` +
+        `set:function(v){if(typeof v==='string'&&v.indexOf('/_next/')===0)v=P+v;d.set.call(this,v)}})` +
+        `}` +
+        `patchSetter(HTMLScriptElement.prototype,'src');` +
+        `patchSetter(HTMLLinkElement.prototype,'href');` +
+        `var oGA=Element.prototype.getAttribute;` +
+        `HTMLScriptElement.prototype.getAttribute=function(n){` +
+        `var v=oGA.call(this,n);` +
+        `if(n==='src'&&typeof v==='string'&&v.indexOf(P+'/_next/')===0)return v.slice(P.length);` +
+        `return v};` +
         `})()</script>`
     );
 }
