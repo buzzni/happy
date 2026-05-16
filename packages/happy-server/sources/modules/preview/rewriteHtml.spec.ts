@@ -89,6 +89,63 @@ describe('rewriteHtml — absolute path rewriting', () => {
     });
 });
 
+describe('rewriteHtml — extended attribute coverage', () => {
+    // Real-world dev servers emit responsive images with srcset and other
+    // resource-bearing attributes (poster / data / formaction / background).
+    // Missing rewrites caused absolute paths to leak through and 404 against
+    // happy-server's own origin — the user-facing symptom is a broken
+    // placeholder where the logo should be.
+    it('rewrites srcset entries (single URL)', () => {
+        const out = rewriteHtml('<img src="/logo.png" srcset="/logo@2x.png 2x">', PREFIX);
+        expect(out).toContain(`src="${PREFIX}/logo.png"`);
+        expect(out).toContain(`srcset="${PREFIX}/logo@2x.png 2x"`);
+    });
+
+    it('rewrites srcset with multiple URL+descriptor pairs', () => {
+        const out = rewriteHtml(
+            '<img srcset="/a.png 1x, /b.png 2x, //cdn/c.png 3x" alt="x">',
+            PREFIX,
+        );
+        expect(out).toContain(`srcset="${PREFIX}/a.png 1x, ${PREFIX}/b.png 2x, //cdn/c.png 3x"`);
+    });
+
+    it('does not double-prefix already-prefixed srcset URLs', () => {
+        const already = `<img srcset="${PREFIX}/a.png 1x, ${PREFIX}/b.png 2x">`;
+        const out = rewriteHtml(already, PREFIX);
+        expect(out).toContain(`srcset="${PREFIX}/a.png 1x, ${PREFIX}/b.png 2x"`);
+        expect(out).not.toContain(`${PREFIX}${PREFIX}`);
+    });
+
+    it('rewrites <video poster="/...">', () => {
+        const out = rewriteHtml('<video poster="/cover.jpg">', PREFIX);
+        expect(out).toContain(`poster="${PREFIX}/cover.jpg"`);
+    });
+
+    it('rewrites <object data="/...">', () => {
+        const out = rewriteHtml('<object data="/doc.pdf"></object>', PREFIX);
+        expect(out).toContain(`data="${PREFIX}/doc.pdf"`);
+    });
+
+    it('rewrites <button formaction="/...">', () => {
+        const out = rewriteHtml('<button formaction="/submit">go</button>', PREFIX);
+        expect(out).toContain(`formaction="${PREFIX}/submit"`);
+    });
+
+    it('rewrites <body background="/...">', () => {
+        const out = rewriteHtml('<body background="/bg.png">', PREFIX);
+        expect(out).toContain(`background="${PREFIX}/bg.png"`);
+    });
+
+    it('rewrites url(/...) inside HTML (inline <style> or style attr)', () => {
+        const out = rewriteHtml(
+            `<div style="background: url(/bg.png)"></div><style>.h{background-image:url('/hero.svg')}</style>`,
+            PREFIX,
+        );
+        expect(out).toContain(`url(${PREFIX}/bg.png)`);
+        expect(out).toContain(`url('${PREFIX}/hero.svg')`);
+    });
+});
+
 describe('rewriteHtml — interceptor injection', () => {
     it('injects <base href> before the interceptor script after <head>', () => {
         const out = rewriteHtml('<html><head></head><body></body></html>', PREFIX);

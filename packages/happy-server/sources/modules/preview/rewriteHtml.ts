@@ -26,17 +26,26 @@
 // an already-prefixed URL without a separate post-pass.
 //
 // Attribute list mirrors the locally-injected web-ui preview-proxy
-// middleware: standard fetchable URL attrs plus the less common ones
+// middleware (and the vite preview-proxy in aplus-dev-studio): standard
+// fetchable URL attrs (src/href/action) plus the less common ones
 // (`poster` on <video>, `data` on <object>, `formaction` on <button>,
-// `background` on legacy <body>).
+// `background` on legacy <body>). Missing `poster`/`data`/`background`
+// previously caused <video poster>, <object data>, and inline
+// `style="background:url(/...)"` outside <style> blocks to leak through
+// with absolute paths.
 const ABS_PATH_ATTRS = /((?:src|href|action|poster|data|formaction|background)\s*=\s*["'])(\/(?!\/)[^"']*?)(["'])/g;
 const ABS_PATH_IMPORT = /((?:from|import)\s*\(?\s*["'])(\/(?!\/)[^"']*?)(["'])/g;
 const ABS_PATH_CSS_URL = /(url\(\s*["']?)(\/(?!\/)[^"')\s]*)(["']?\s*\))/g;
 // Inline <style>...</style> blocks: rewrite CSS url() references inside.
 // External CSS responses are handled separately by rewriteJsCss(), but
-// inline styles only show up when the rewriter walks the HTML body.
+// embedded styles only show up when the rewriter walks the HTML body.
 const INLINE_STYLE_BLOCK = /<style[^>]*>([\s\S]*?)<\/style>/gi;
-
+// `style="..."` attribute values: same url() rewriting as <style> blocks,
+// scoped to the attribute so we don't accidentally rewrite url("/...")
+// string literals inside <script> tags (notably the RSC flight stream).
+// Common in inline backgrounds (`style="background:url(/img/...)"`) and
+// CSS-in-JS output that escapes to the SSR HTML.
+const INLINE_STYLE_ATTR = /(style\s*=\s*["'])([^"']*)(["'])/gi;
 // `srcset` / `imagesrcset` carry comma-separated URL+descriptor pairs
 // (e.g. `/a.png 1x, /b.png 2x`). They don't fit ABS_PATH_ATTRS's
 // single-URL shape, so we handle them with a dedicated pass that
@@ -49,7 +58,6 @@ const INLINE_STYLE_BLOCK = /<style[^>]*>([\s\S]*?)<\/style>/gi;
 // lowercase on the DOM side, but our regex runs on the source string,
 // so we need to match every case variant.
 const MULTI_URL_ATTRS = /((?:srcset|imagesrcset)\s*=\s*["'])([^"']+)(["'])/gi;
-
 function rewriteSrcSetValue(value: string, prefix: string): string {
     return value
         .split(',')
@@ -67,7 +75,6 @@ function rewriteSrcSetValue(value: string, prefix: string): string {
         })
         .join(', ');
 }
-
 // NOTE on RSC flight stream: Next.js App Router emits the React Server
 // Components flight stream as inline <script>self.__next_f.push([1, "<JSON>"])</script>
 // containing absolute /_next/... paths inside `I[...]` import directives.
@@ -87,6 +94,30 @@ function makeReplacer(prefix: string) {
     };
 }
 
+/**
+ * Rewrite each comma-separated entry of a `srcset` attribute. Each entry is
+ * `<url> <descriptor>` (descriptor optional, e.g. `2x`, `100w`). Only the
+ * URL part can be a path — descriptors stay untouched.
+ */
+function rewriteSrcset(prefix: string) {
+    return (_match: string, head: string, quote: string, list: string): string => {
+        const rewritten = list
+            .split(',')
+            .map((entry) => {
+                const trimmed = entry.trim();
+                const spaceIdx = trimmed.search(/\s/);
+                const url = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
+                const descriptor = spaceIdx === -1 ? '' : trimmed.slice(spaceIdx);
+                const isAbsolute =
+                    url.startsWith('/') && !url.startsWith('//') && !url.startsWith(prefix);
+                const rewrittenUrl = isAbsolute ? `${prefix}${url}` : url;
+                return `${rewrittenUrl}${descriptor}`;
+            })
+            .join(', ');
+        return `${head}${quote}${rewritten}${quote}`;
+    };
+}
+
 export function rewriteJsCss(text: string, prefix: string): string {
     const rep = makeReplacer(prefix);
     return text
@@ -97,7 +128,6 @@ export function rewriteJsCss(text: string, prefix: string): string {
 export function rewriteHtml(html: string, prefix: string): string {
     const rep = makeReplacer(prefix);
     let out = html
-        .replace(ABS_PATH_ATTRS, rep)
         .replace(ABS_PATH_IMPORT, rep)
         .replace(MULTI_URL_ATTRS, (_match, head: string, list: string, tail: string) =>
             `${head}${rewriteSrcSetValue(list, prefix)}${tail}`,
@@ -105,8 +135,12 @@ export function rewriteHtml(html: string, prefix: string): string {
         .replace(INLINE_STYLE_BLOCK, (match, css: string) => {
             const rewritten = css.replace(ABS_PATH_CSS_URL, rep);
             return rewritten === css ? match : match.replace(css, rewritten);
+        })
+        .replace(INLINE_STYLE_ATTR, (match, head: string, css: string, tail: string) => {
+            const rewritten = css.replace(ABS_PATH_CSS_URL, rep);
+            return rewritten === css ? match : `${head}${rewritten}${tail}`;
         });
-
+  
     // <base> pins the document base URL so relative-path resources
     // (`<script src="app.js">`) survive the interceptor's history.replaceState.
     const baseHref = `<base href="${prefix}/">`;
