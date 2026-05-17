@@ -26,6 +26,7 @@ import { signPreviewToken, verifyPreviewToken } from "@/modules/preview/previewT
 import { readPreviewCookie, buildPreviewCookie } from "@/modules/preview/previewCookie";
 import { rewriteHtml, rewriteJsCss } from "@/modules/preview/rewriteHtml";
 import { rewriteLinkHeader } from "@/modules/preview/rewriteLinkHeader";
+import { renderExpiredPtokenHtml, shouldServeExpiredHtml } from "@/modules/preview/expiredPtokenHtml";
 import { type Fastify } from "../types";
 
 interface ProxySuccess {
@@ -183,12 +184,40 @@ export function previewRoutes(app: Fastify) {
                     params.machineId,
                     portNum,
                 );
+                // specs/remote-preview-relay Phase 10c — when a browser top-
+                // level navigation lands on an expired/missing-ptoken URL,
+                // respond with a small HTML page whose inline JS re-mints
+                // via /api/preview-mint-remote (Phase 10b) and reloads.
+                // Non-HTML callers (JSON clients, curl, image subresources)
+                // keep getting the existing JSON 401.
+                const acceptHeader = request.headers.accept as string | undefined;
+                const wantsHtmlFallback = shouldServeExpiredHtml(acceptHeader);
                 const token = query.ptoken ?? cookieToken;
                 if (!token) {
+                    if (wantsHtmlFallback) {
+                        return reply
+                            .code(401)
+                            .header('Content-Type', 'text/html; charset=utf-8')
+                            .send(renderExpiredPtokenHtml({
+                                machineId: params.machineId,
+                                port: portNum,
+                                reason: 'missing',
+                            }));
+                    }
                     return reply.code(401).send({ error: 'Missing ptoken' });
                 }
                 const claims = verifyPreviewToken(token);
                 if (!claims) {
+                    if (wantsHtmlFallback) {
+                        return reply
+                            .code(401)
+                            .header('Content-Type', 'text/html; charset=utf-8')
+                            .send(renderExpiredPtokenHtml({
+                                machineId: params.machineId,
+                                port: portNum,
+                                reason: 'expired-or-invalid',
+                            }));
+                    }
                     return reply.code(401).send({ error: 'Invalid or expired ptoken' });
                 }
                 if (claims.machineId !== params.machineId || claims.port !== portNum) {
