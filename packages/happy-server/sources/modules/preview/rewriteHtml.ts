@@ -188,13 +188,20 @@ function buildInterceptorScript(prefix: string): string {
     // own path literals. Escape single quotes in prefix so the embedded
     // `var P='…'` stays syntactically valid.
     const p = prefix.replace(/'/g, "\\'");
+    // Phase 11B: inject the same rwPath / rwInput pure helpers used by the
+    // unit tests. `Function.prototype.toString()` returns the compiled JS
+    // source so the runtime helpers and the tested helpers stay in lockstep
+    // (no parallel implementations to drift).
+    const rwPathSource = rwPath.toString();
+    const rwInputSource = rwInput.toString();
     return (
         `<script>(function(){` +
         `var P='${p}';` +
-        `function rw(u){` +
-        `if(typeof u!=='string'||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;` +
-        `return u.indexOf(P)===0?u:P+u` +
-        `}` +
+        `var ORIGIN=window.location.origin;` +
+        `${rwPathSource};` +
+        `${rwInputSource};` +
+        `function rw(u){return rwPath(u,P,ORIGIN)}` +
+        `function rwIn(i){return rwInput(i,P,ORIGIN)}` +
         `var loc=window.location.pathname;` +
         `if(loc.indexOf(P)===0){history.replaceState(null,'',loc.slice(P.length)||'/')}` +
         `var _WS=window.WebSocket;` +
@@ -215,8 +222,14 @@ function buildInterceptorScript(prefix: string): string {
         `return p?new _WS(u,p):new _WS(u)};` +
         `window.WebSocket.prototype=_WS.prototype;` +
         `window.WebSocket.CONNECTING=0;window.WebSocket.OPEN=1;window.WebSocket.CLOSING=2;window.WebSocket.CLOSED=3;` +
-        `var oF=window.fetch;window.fetch=function(i,n){if(typeof i==='string')i=rw(i);return oF.call(this,i,n)};` +
-        `var oO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(typeof u==='string')arguments[1]=rw(u);return oO.apply(this,arguments)};` +
+        // Phase 11B: rwIn handles string / URL / Request — covers fetch
+        // callers that don't pass plain string paths (e.g. apps using
+        // `fetch(\`\${origin}/api/x\`)`, `fetch(new URL(...))`, or
+        // `fetch(new Request(...))`). Without this, those calls bypass
+        // the prefix and hit web-ui's /api/* root with no matching
+        // middleware → 404.
+        `var oF=window.fetch;window.fetch=function(i,n){return oF.call(this,rwIn(i),n)};` +
+        `var oO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){arguments[1]=rwIn(u);return oO.apply(this,arguments)};` +
         // rwSet: multi-URL form of rw() for srcset / imagesrcset attribute
         // values. Each comma-separated entry is "URL descriptor?" (e.g.
         // "/_next/image?... 1x"); rewrite the URL part only and keep the
