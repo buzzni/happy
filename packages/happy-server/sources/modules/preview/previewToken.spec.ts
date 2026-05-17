@@ -73,6 +73,18 @@ describe('previewToken', () => {
         expect(verifyPreviewToken(truncated, { secret: SECRET })).toBeNull();
     });
 
+    it('default TTL is 60 minutes (specs/remote-preview-relay Phase 10a)', () => {
+        const before = Date.now();
+        const signed = signPreviewToken(
+            { userId: 'u1', machineId: 'm1', port: 3000 },
+            { secret: SECRET },
+        );
+        const after = Date.now();
+        const sixtyMinMs = 60 * 60 * 1000;
+        expect(signed.expiresAt).toBeGreaterThanOrEqual(before + sixtyMinMs);
+        expect(signed.expiresAt).toBeLessThanOrEqual(after + sixtyMinMs);
+    });
+
     it('binds token to the exact (userId, machineId, port) triple', () => {
         const forUser1 = signPreviewToken(
             { userId: 'u1', machineId: 'm1', port: 3000 },

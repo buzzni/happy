@@ -36,7 +36,13 @@ export interface PreviewTokenOptions {
     ttlMs?: number;
 }
 
-const DEFAULT_TTL_MS = 10 * 60 * 1000;
+// 60 minutes — bumped from 10m in specs/remote-preview-relay Phase 10a.
+// Web-ui's in-iframe refresh only fires while PreviewPanel is mounted, so
+// users who copied the preview URL via 'URL 복사' (PreviewPanel.handleCopyUrl)
+// and opened it in a fresh tab had no recovery path before the token expired.
+// Longer TTL widens the recovery window; Phase 10c adds an HTML fallback
+// that lets the page re-mint client-side when this TTL still elapses.
+const DEFAULT_TTL_MS = 60 * 60 * 1000;
 
 interface EncodedPayload extends PreviewTokenPayload {
     exp: number;
