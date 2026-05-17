@@ -94,6 +94,57 @@ function makeReplacer(prefix: string) {
     };
 }
 
+// ============================================================================
+// Phase 11B — interceptor input coverage
+//
+// The runtime interceptor injected into rewritten HTML uses these two pure
+// functions to decide how to rewrite a URL/input given the per-preview
+// `prefix` and the page's `origin`. They are exported (and tested directly)
+// so the dual-implementation drift problem from earlier specs can't recur:
+// `buildInterceptorScript` embeds them verbatim via `.toString()`.
+//
+// Constraints these functions operate under:
+//   - Browser runtime (no Node-only APIs)
+//   - Must handle: string path / absolute URL (same origin) / `URL` / `Request`
+//   - Idempotent: a value that already carries the prefix is returned as-is
+//   - Body-preserving for Request (wraps via `new Request(rewrittenUrl, original)`)
+// ============================================================================
+
+export function rwPath(u: string, P: string, ORIGIN: string): string {
+    if (typeof u !== 'string') return u as unknown as string;
+    if (u.charAt(0) === '/') {
+        if (u.charAt(1) === '/') return u;          // protocol-relative
+        return u.indexOf(P) === 0 ? u : P + u;
+    }
+    try {
+        const parsed = new URL(u);
+        if (parsed.origin !== ORIGIN) return u;
+        const path = parsed.pathname + parsed.search + parsed.hash;
+        if (path.indexOf(P) === 0) return u;
+        return parsed.origin + P + path;
+    } catch {
+        return u;
+    }
+}
+
+export function rwInput(i: unknown, P: string, ORIGIN: string): unknown {
+    if (typeof i === 'string') return rwPath(i, P, ORIGIN);
+    try {
+        if (typeof Request !== 'undefined' && i instanceof Request) {
+            const ru = rwPath(i.url, P, ORIGIN);
+            return ru === i.url ? i : new Request(ru, i);
+        }
+        if (typeof URL !== 'undefined' && i instanceof URL) {
+            const s = i.toString();
+            const ru = rwPath(s, P, ORIGIN);
+            return ru === s ? i : new URL(ru);
+        }
+    } catch {
+        // Fall through — non-matching exotic input.
+    }
+    return i;
+}
+
 export function rewriteJsCss(text: string, prefix: string): string {
     const rep = makeReplacer(prefix);
     return text
