@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { rewriteHtml, rewriteJsCss } from '@/modules/preview/rewriteHtml';
+import { rewriteHtml, rewriteJsCss, rwPath, rwInput } from '@/modules/preview/rewriteHtml';
 
 const PREFIX = '/v1/preview/m1/3000';
 
@@ -446,5 +446,103 @@ describe('rewriteJsCss', () => {
         const input = `import x from '/a.js'; .bg{background:url("/img/b.png")}`;
         const out = rewriteJsCss(input, PREFIX);
         expect(out).not.toContain('ptoken=');
+    });
+});
+
+// ============================================================================
+// Phase 11B — rwPath / rwInput pure helpers
+//
+// Coverage gap discovered in Phase 11: the original `rw()` inside the inline
+// interceptor required `typeof === 'string' && charAt(0) === '/'`. Apps using
+// absolute-origin URLs, URL objects, or Request objects bypass the prefix
+// rewrite and hit web-ui's `/api/*` directly → 404.
+// ============================================================================
+
+const P = '/v1/preview/m1/3000';
+const ORIGIN = 'http://172.16.10.204:5174';
+
+describe('rwPath — string path/URL rewriting', () => {
+    it('prefixes a plain absolute path', () => {
+        expect(rwPath('/api/x', P, ORIGIN)).toBe(`${P}/api/x`);
+    });
+
+    it('preserves query string when prefixing', () => {
+        expect(rwPath('/api/x?y=1&z=2', P, ORIGIN)).toBe(`${P}/api/x?y=1&z=2`);
+    });
+
+    it('is idempotent — path already prefixed is returned as-is', () => {
+        expect(rwPath(`${P}/api/x`, P, ORIGIN)).toBe(`${P}/api/x`);
+    });
+
+    it('leaves protocol-relative paths untouched', () => {
+        expect(rwPath('//cdn.example.com/a.js', P, ORIGIN)).toBe('//cdn.example.com/a.js');
+    });
+
+    it('rewrites an absolute URL whose origin matches the page', () => {
+        expect(rwPath(`${ORIGIN}/api/x`, P, ORIGIN)).toBe(`${ORIGIN}${P}/api/x`);
+    });
+
+    it('preserves query + hash on absolute-URL rewrite', () => {
+        expect(rwPath(`${ORIGIN}/api/x?y=1#frag`, P, ORIGIN)).toBe(`${ORIGIN}${P}/api/x?y=1#frag`);
+    });
+
+    it('leaves cross-origin absolute URLs untouched', () => {
+        expect(rwPath('https://other.com/api/x', P, ORIGIN)).toBe('https://other.com/api/x');
+    });
+
+    it('is idempotent on already-prefixed absolute URLs', () => {
+        const url = `${ORIGIN}${P}/api/x`;
+        expect(rwPath(url, P, ORIGIN)).toBe(url);
+    });
+
+    it('returns input on malformed URLs (e.g. relative without leading /)', () => {
+        // `<base>` covers these in the browser; no rewrite at the interceptor.
+        expect(rwPath('api/x', P, ORIGIN)).toBe('api/x');
+    });
+
+    it('returns input when typeof is not string (defensive)', () => {
+        // Cast through unknown to test runtime guard.
+        expect(rwPath(123 as unknown as string, P, ORIGIN)).toBe(123 as unknown as string);
+    });
+});
+
+describe('rwInput — URL/Request object support', () => {
+    it('rewrites a string input via rwPath', () => {
+        expect(rwInput('/api/x', P, ORIGIN)).toBe(`${P}/api/x`);
+    });
+
+    it('rewrites a URL object (same origin) to a new URL', () => {
+        const u = new URL(`${ORIGIN}/api/x`);
+        const out = rwInput(u, P, ORIGIN);
+        expect(out).toBeInstanceOf(URL);
+        expect((out as URL).toString()).toBe(`${ORIGIN}${P}/api/x`);
+    });
+
+    it('returns the same URL object when already prefixed (no clone)', () => {
+        const u = new URL(`${ORIGIN}${P}/api/x`);
+        expect(rwInput(u, P, ORIGIN)).toBe(u);
+    });
+
+    it('returns cross-origin URL objects unchanged', () => {
+        const u = new URL('https://other.com/api/x');
+        expect(rwInput(u, P, ORIGIN)).toBe(u);
+    });
+
+    it('rewrites a Request object — wraps with new Request (URL replaced)', () => {
+        const r = new Request(`${ORIGIN}/api/x`, { method: 'POST' });
+        const out = rwInput(r, P, ORIGIN);
+        expect(out).toBeInstanceOf(Request);
+        expect((out as Request).url).toBe(`${ORIGIN}${P}/api/x`);
+        expect((out as Request).method).toBe('POST');
+    });
+
+    it('returns the same Request when already prefixed', () => {
+        const r = new Request(`${ORIGIN}${P}/api/x`);
+        expect(rwInput(r, P, ORIGIN)).toBe(r);
+    });
+
+    it('passes through exotic non-string/URL/Request inputs', () => {
+        const input = { foo: 'bar' };
+        expect(rwInput(input, P, ORIGIN)).toBe(input);
     });
 });

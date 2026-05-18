@@ -158,7 +158,29 @@ describe('createIgnoreMatcher — selective presets', () => {
 
     it('PRESET_NAMES exposes all known presets', () => {
         expect(PRESET_NAMES).toEqual(
-            expect.arrayContaining(['common', 'node', 'python', 'rust', 'jvm', 'go', 'mobile', 'editor', 'agent']),
+            expect.arrayContaining(['common', 'node', 'python', 'rust', 'jvm', 'go', 'mobile', 'editor', 'agent', 'workspace-self']),
         )
+    })
+})
+
+// aplus-dev-studio's specs/workspace-cross-project-pollution/ Phase 2 —
+// mirror of the web-ui `workspace-self preset (Phase 2)` describe block.
+describe('createIgnoreMatcher — workspace-self preset (Phase 2)', () => {
+    it('default matcher ignores the home/coder/workspace/ daemon-mirror prefix', () => {
+        const matcher = createIgnoreMatcher()
+        expect(matcher.shouldIgnore('home/coder/workspace/aplus-dev-studio/aaaaaaaaaaaa/bbbbbbbbbbbb/x.html')).toBe(true)
+        expect(matcher.shouldIgnore('home/coder/workspace')).toBe(true)
+    })
+
+    it('does NOT match partial prefix or unrelated home/ paths', () => {
+        const matcher = createIgnoreMatcher()
+        expect(matcher.shouldIgnore('home/coder/workspaces/x.html')).toBe(false)
+        expect(matcher.shouldIgnore('home/dashboard/page.tsx')).toBe(false)
+        expect(matcher.shouldIgnore('src/home/coder/workspace/foo.ts')).toBe(false)
+    })
+
+    it('opting out re-exposes the path class', () => {
+        const matcher = createIgnoreMatcher({ presets: ['common'] })
+        expect(matcher.shouldIgnore('home/coder/workspace/aplus-dev-studio/a/b/x.html')).toBe(false)
     })
 })

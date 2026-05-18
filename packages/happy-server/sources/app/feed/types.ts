@@ -44,6 +44,53 @@ export const FeedBodySchema = z.discriminatedUnion('kind', [
         projectId: z.string(),
         projectName: z.string(),
         creatorUsername: z.string().nullable()
+    }),
+    // specs/collab-lifecycle-notifications Phase 1 (G1) — collab-request
+    // lifecycle 5 kinds. Emitted by web-ui server through the internal
+    // /v1/internal/collab-feed-post route (see internalFeedRoutes.ts).
+    // expired carries no toast on the client (D2-2 silent decision) — store
+    // updates only; the other four drive both a toast and a store update.
+    z.object({
+        kind: z.literal('collab_request_created'),
+        requestId: z.string(),
+        projectId: z.string(),
+        projectName: z.string(),
+        requesterUsername: z.string().nullable(),
+        message: z.string().nullable(),
+        createdAt: z.number()
+    }),
+    z.object({
+        kind: z.literal('collab_request_accepted'),
+        requestId: z.string(),
+        projectId: z.string(),
+        projectName: z.string(),
+        ownerUsername: z.string().nullable(),
+        respondedAt: z.number()
+    }),
+    z.object({
+        kind: z.literal('collab_request_rejected'),
+        requestId: z.string(),
+        projectId: z.string(),
+        projectName: z.string(),
+        ownerUsername: z.string().nullable(),
+        rejectReason: z.string().nullable(),
+        respondedAt: z.number()
+    }),
+    z.object({
+        kind: z.literal('collab_request_cancelled'),
+        requestId: z.string(),
+        projectId: z.string(),
+        projectName: z.string(),
+        requesterUsername: z.string().nullable(),
+        respondedAt: z.number()
+    }),
+    z.object({
+        kind: z.literal('collab_request_expired'),
+        requestId: z.string(),
+        projectId: z.string(),
+        projectName: z.string(),
+        requesterUsername: z.string().nullable(),
+        expiredAt: z.number()
     })
 ]);
 

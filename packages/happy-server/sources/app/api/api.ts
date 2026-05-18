@@ -20,6 +20,7 @@ import { enableErrorHandlers } from "./utils/enableErrorHandlers";
 import { enableAuthentication } from "./utils/enableAuthentication";
 import { userRoutes } from "./routes/userRoutes";
 import { feedRoutes } from "./routes/feedRoutes";
+import { internalFeedRoutes } from "./routes/internalFeedRoutes";
 import { kvRoutes } from "./routes/kvRoutes";
 import { v3SessionRoutes } from "./routes/v3SessionRoutes";
 import { v3SessionEventRoutes } from "./routes/v3SessionEventRoutes";
@@ -94,6 +95,7 @@ export async function startApi() {
     voiceRoutes(typed);
     userRoutes(typed);
     feedRoutes(typed);
+    internalFeedRoutes(typed);
     kvRoutes(typed);
     v3SessionRoutes(typed);
     v3SessionEventRoutes(typed);

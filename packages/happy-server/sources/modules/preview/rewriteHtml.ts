@@ -94,6 +94,57 @@ function makeReplacer(prefix: string) {
     };
 }
 
+// ============================================================================
+// Phase 11B — interceptor input coverage
+//
+// The runtime interceptor injected into rewritten HTML uses these two pure
+// functions to decide how to rewrite a URL/input given the per-preview
+// `prefix` and the page's `origin`. They are exported (and tested directly)
+// so the dual-implementation drift problem from earlier specs can't recur:
+// `buildInterceptorScript` embeds them verbatim via `.toString()`.
+//
+// Constraints these functions operate under:
+//   - Browser runtime (no Node-only APIs)
+//   - Must handle: string path / absolute URL (same origin) / `URL` / `Request`
+//   - Idempotent: a value that already carries the prefix is returned as-is
+//   - Body-preserving for Request (wraps via `new Request(rewrittenUrl, original)`)
+// ============================================================================
+
+export function rwPath(u: string, P: string, ORIGIN: string): string {
+    if (typeof u !== 'string') return u as unknown as string;
+    if (u.charAt(0) === '/') {
+        if (u.charAt(1) === '/') return u;          // protocol-relative
+        return u.indexOf(P) === 0 ? u : P + u;
+    }
+    try {
+        const parsed = new URL(u);
+        if (parsed.origin !== ORIGIN) return u;
+        const path = parsed.pathname + parsed.search + parsed.hash;
+        if (path.indexOf(P) === 0) return u;
+        return parsed.origin + P + path;
+    } catch {
+        return u;
+    }
+}
+
+export function rwInput(i: unknown, P: string, ORIGIN: string): unknown {
+    if (typeof i === 'string') return rwPath(i, P, ORIGIN);
+    try {
+        if (typeof Request !== 'undefined' && i instanceof Request) {
+            const ru = rwPath(i.url, P, ORIGIN);
+            return ru === i.url ? i : new Request(ru, i);
+        }
+        if (typeof URL !== 'undefined' && i instanceof URL) {
+            const s = i.toString();
+            const ru = rwPath(s, P, ORIGIN);
+            return ru === s ? i : new URL(ru);
+        }
+    } catch {
+        // Fall through — non-matching exotic input.
+    }
+    return i;
+}
+
 export function rewriteJsCss(text: string, prefix: string): string {
     const rep = makeReplacer(prefix);
     return text
@@ -137,13 +188,20 @@ function buildInterceptorScript(prefix: string): string {
     // own path literals. Escape single quotes in prefix so the embedded
     // `var P='…'` stays syntactically valid.
     const p = prefix.replace(/'/g, "\\'");
+    // Phase 11B: inject the same rwPath / rwInput pure helpers used by the
+    // unit tests. `Function.prototype.toString()` returns the compiled JS
+    // source so the runtime helpers and the tested helpers stay in lockstep
+    // (no parallel implementations to drift).
+    const rwPathSource = rwPath.toString();
+    const rwInputSource = rwInput.toString();
     return (
         `<script>(function(){` +
         `var P='${p}';` +
-        `function rw(u){` +
-        `if(typeof u!=='string'||u.charAt(0)!=='/'||u.charAt(1)==='/')return u;` +
-        `return u.indexOf(P)===0?u:P+u` +
-        `}` +
+        `var ORIGIN=window.location.origin;` +
+        `${rwPathSource};` +
+        `${rwInputSource};` +
+        `function rw(u){return rwPath(u,P,ORIGIN)}` +
+        `function rwIn(i){return rwInput(i,P,ORIGIN)}` +
         `var loc=window.location.pathname;` +
         `if(loc.indexOf(P)===0){history.replaceState(null,'',loc.slice(P.length)||'/')}` +
         `var _WS=window.WebSocket;` +
@@ -164,8 +222,14 @@ function buildInterceptorScript(prefix: string): string {
         `return p?new _WS(u,p):new _WS(u)};` +
         `window.WebSocket.prototype=_WS.prototype;` +
         `window.WebSocket.CONNECTING=0;window.WebSocket.OPEN=1;window.WebSocket.CLOSING=2;window.WebSocket.CLOSED=3;` +
-        `var oF=window.fetch;window.fetch=function(i,n){if(typeof i==='string')i=rw(i);return oF.call(this,i,n)};` +
-        `var oO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(typeof u==='string')arguments[1]=rw(u);return oO.apply(this,arguments)};` +
+        // Phase 11B: rwIn handles string / URL / Request — covers fetch
+        // callers that don't pass plain string paths (e.g. apps using
+        // `fetch(\`\${origin}/api/x\`)`, `fetch(new URL(...))`, or
+        // `fetch(new Request(...))`). Without this, those calls bypass
+        // the prefix and hit web-ui's /api/* root with no matching
+        // middleware → 404.
+        `var oF=window.fetch;window.fetch=function(i,n){return oF.call(this,rwIn(i),n)};` +
+        `var oO=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){arguments[1]=rwIn(u);return oO.apply(this,arguments)};` +
         // rwSet: multi-URL form of rw() for srcset / imagesrcset attribute
         // values. Each comma-separated entry is "URL descriptor?" (e.g.
         // "/_next/image?... 1x"); rewrite the URL part only and keep the
