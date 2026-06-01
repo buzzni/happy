@@ -213,16 +213,18 @@ class ActivityCache {
         // Batch update machines
         if (machineUpdates.length > 0) {
             try {
+                // specs/machine-keepalive-bump — same rationale as the
+                // session branch above. Bypass Prisma's @updatedAt so
+                // keepalive cannot inflate Machine.updatedAt. No consumer
+                // currently sorts by updatedAt, but matching the session
+                // fix keeps the two branches semantically aligned and
+                // prevents a future regression.
                 await Promise.all(machineUpdates.map(update =>
-                    db.machine.update({
-                        where: {
-                            accountId_id: {
-                                accountId: update.userId,
-                                id: update.id
-                            }
-                        },
-                        data: { lastActiveAt: new Date(update.timestamp) }
-                    })
+                    db.$executeRaw`
+                        UPDATE "Machine"
+                        SET "lastActiveAt" = ${new Date(update.timestamp)}
+                        WHERE "accountId" = ${update.userId} AND "id" = ${update.id}
+                    `
                 ));
                 for (const update of machineUpdates) {
                     update.entry.lastUpdateSent = update.timestamp;

@@ -51,6 +51,16 @@ function primeCacheEntry(sessionId: string, userId: string, validUntilOffset = 6
     });
 }
 
+function primeMachineCacheEntry(machineId: string, userId: string, validUntilOffset = 60_000) {
+    const cache = (activityCache as any).machineCache as Map<string, any>;
+    cache.set(machineId, {
+        validUntil: Date.now() + validUntilOffset,
+        lastUpdateSent: 0,
+        pendingUpdate: null,
+        userId,
+    });
+}
+
 async function flushNow(): Promise<void> {
     await (activityCache as any).flushPendingUpdates();
 }
@@ -60,8 +70,10 @@ beforeEach(() => {
     machineUpdateMock = vi.fn();
     executeRawCalls = [];
     // Clear any leftover state between tests.
-    const cache = (activityCache as any).sessionCache as Map<string, any>;
-    cache.clear();
+    const sCache = (activityCache as any).sessionCache as Map<string, any>;
+    sCache.clear();
+    const mCache = (activityCache as any).machineCache as Map<string, any>;
+    mCache.clear();
 });
 
 afterEach(() => {
@@ -110,14 +122,64 @@ describe("sessionCache.flushPendingUpdates — keepalive must not bump Session.u
         expect(sessionUpdateMock).not.toHaveBeenCalled();
     });
 
-    it("machine keepalive path is intentionally untouched in this spec (out of scope)", async () => {
-        // Sanity check the symmetric branch — we left machine.update alone
-        // because Machine list ordering uses lastActiveAt and no user-visible
-        // regression has been reported. Future spec can extend coverage.
+    it("session + machine flushed in same tick → both use $executeRaw", async () => {
         primeCacheEntry("sess-Z", "user-1");
+        primeMachineCacheEntry("mach-Z", "user-1");
         activityCache.queueSessionUpdate("sess-Z", Date.now());
+        activityCache.queueMachineUpdate("mach-Z", Date.now());
         await flushNow();
-        // sessions used raw SQL; machine.update remains the Prisma path.
+        // Both branches must now use raw SQL — symmetric semantics, neither
+        // should call the Prisma model accessor that triggers @updatedAt.
+        expect(executeRawCalls.length).toBe(2);
+        expect(sessionUpdateMock).not.toHaveBeenCalled();
+        expect(machineUpdateMock).not.toHaveBeenCalled();
+    });
+});
+
+describe("sessionCache.flushPendingUpdates — Machine keepalive must not bump Machine.updatedAt", () => {
+    it("queueMachineUpdate + flush uses $executeRaw (NOT db.machine.update)", async () => {
+        primeMachineCacheEntry("mach-A", "user-1");
+        const queued = activityCache.queueMachineUpdate("mach-A", Date.now());
+        expect(queued).toBe(true);
+
+        await flushNow();
+
+        // Critical invariant: prisma's machine.update must NOT be called.
+        // That path triggers @updatedAt and is the source of the symmetric
+        // bug. See specs/machine-keepalive-bump.
+        expect(machineUpdateMock).not.toHaveBeenCalled();
         expect(executeRawCalls.length).toBe(1);
+    });
+
+    it("raw SQL UPDATE only references lastActiveAt + accountId + id (NOT updatedAt)", async () => {
+        primeMachineCacheEntry("mach-B", "user-1");
+        activityCache.queueMachineUpdate("mach-B", Date.now());
+        await flushNow();
+
+        expect(executeRawCalls.length).toBe(1);
+        const sql = executeRawCalls[0].strings.join("?");
+        expect(sql).toMatch(/UPDATE\s+"Machine"/);
+        expect(sql).toMatch(/"lastActiveAt"/);
+        expect(sql).toMatch(/"accountId"/);
+        expect(sql).toMatch(/"id"/);
+        // Same regression guard as the session branch — adding "updatedAt"
+        // to the SET list would defeat the whole fix.
+        expect(sql).not.toMatch(/SET[^W]*"updatedAt"/);
+        // active is NOT touched in the machine branch — keepalive flush
+        // preserves the original behavior (only lastActiveAt is bumped here;
+        // active toggling lives in presence/timeout.ts).
+        expect(sql).not.toMatch(/SET[^W]*"active"/);
+    });
+
+    it("flushes multiple queued machines in parallel via $executeRaw", async () => {
+        primeMachineCacheEntry("mach-X", "user-1");
+        primeMachineCacheEntry("mach-Y", "user-2");
+        activityCache.queueMachineUpdate("mach-X", Date.now());
+        activityCache.queueMachineUpdate("mach-Y", Date.now());
+
+        await flushNow();
+
+        expect(executeRawCalls.length).toBe(2);
+        expect(machineUpdateMock).not.toHaveBeenCalled();
     });
 });
