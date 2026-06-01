@@ -158,47 +158,58 @@ class ActivityCache {
     }
 
     private async flushPendingUpdates(): Promise<void> {
-        const sessionUpdates: { id: string, timestamp: number }[] = [];
-        const machineUpdates: { id: string, timestamp: number, userId: string }[] = [];
-        
-        // Collect session updates
+        type SessionPending = { id: string; timestamp: number; entry: SessionCacheEntry };
+        type MachinePending = { id: string; timestamp: number; userId: string; entry: MachineCacheEntry };
+
+        const sessionUpdates: SessionPending[] = [];
+        const machineUpdates: MachinePending[] = [];
+
+        // Collect updates and clear pendingUpdate provisionally.
+        // lastUpdateSent is NOT advanced here — only after DB confirms success.
+        // On DB failure, pendingUpdate is restored so the next flush retries.
         for (const [sessionId, entry] of this.sessionCache.entries()) {
             if (entry.pendingUpdate) {
-                sessionUpdates.push({ id: sessionId, timestamp: entry.pendingUpdate });
-                entry.lastUpdateSent = entry.pendingUpdate;
+                sessionUpdates.push({ id: sessionId, timestamp: entry.pendingUpdate, entry });
                 entry.pendingUpdate = null;
             }
         }
-        
-        // Collect machine updates
+
         for (const [machineId, entry] of this.machineCache.entries()) {
             if (entry.pendingUpdate) {
-                machineUpdates.push({ 
-                    id: machineId, 
-                    timestamp: entry.pendingUpdate, 
-                    userId: entry.userId 
-                });
-                entry.lastUpdateSent = entry.pendingUpdate;
+                machineUpdates.push({ id: machineId, timestamp: entry.pendingUpdate, userId: entry.userId, entry });
                 entry.pendingUpdate = null;
             }
         }
-        
+
         // Batch update sessions
         if (sessionUpdates.length > 0) {
             try {
+                // specs/session-list-keepalive-bump — bypass Prisma's
+                // @updatedAt decorator. Keepalive flushes must NOT bump
+                // Session.updatedAt, otherwise every active session shows
+                // up as "방금" in consumer session lists (web-ui sidebar,
+                // mobile app). updatedAt is reserved for real modifications
+                // (new SessionMessage, metadata write, etc.).
                 await Promise.all(sessionUpdates.map(update =>
-                    db.session.update({
-                        where: { id: update.id },
-                        data: { lastActiveAt: new Date(update.timestamp), active: true }
-                    })
+                    db.$executeRaw`
+                        UPDATE "Session"
+                        SET "lastActiveAt" = ${new Date(update.timestamp)}, "active" = true
+                        WHERE "id" = ${update.id}
+                    `
                 ));
-                
+                for (const update of sessionUpdates) {
+                    update.entry.lastUpdateSent = update.timestamp;
+                }
                 log({ module: 'session-cache' }, `Flushed ${sessionUpdates.length} session updates`);
             } catch (error) {
+                // Restore so the next flush interval retries the DB write.
+                for (const update of sessionUpdates) {
+                    update.entry.pendingUpdate = update.timestamp;
+                }
                 log({ module: 'session-cache', level: 'error' }, `Error updating sessions: ${error}`);
             }
         }
-        
+
         // Batch update machines
         if (machineUpdates.length > 0) {
             try {
@@ -213,9 +224,15 @@ class ActivityCache {
                         data: { lastActiveAt: new Date(update.timestamp) }
                     })
                 ));
-                
+                for (const update of machineUpdates) {
+                    update.entry.lastUpdateSent = update.timestamp;
+                }
                 log({ module: 'session-cache' }, `Flushed ${machineUpdates.length} machine updates`);
             } catch (error) {
+                // Restore so the next flush interval retries the DB write.
+                for (const update of machineUpdates) {
+                    update.entry.pendingUpdate = update.timestamp;
+                }
                 log({ module: 'session-cache', level: 'error' }, `Error updating machines: ${error}`);
             }
         }
