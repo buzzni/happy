@@ -488,14 +488,16 @@ export async function startDaemon(): Promise<void> {
 
           // Construct command for the CLI
           const cliPath = join(projectPath(), 'dist', 'index.mjs');
-          // Determine agent command - support claude, codex, and gemini
-          const agent = options.agent === 'gemini' ? 'gemini' : (options.agent === 'codex' ? 'codex' : (options.agent === 'openclaw' ? 'openclaw' : 'claude'));
+          // Determine agent command - support claude, codex, gemini, openclaw, opencode
+          const agent = options.agent === 'gemini' ? 'gemini' : (options.agent === 'codex' ? 'codex' : (options.agent === 'openclaw' ? 'openclaw' : (options.agent === 'opencode' ? 'opencode' : 'claude')));
+          // opencode runs over ACP and is launched as `happy acp opencode`.
+          const agentCliCommand = agent === 'opencode' ? 'acp opencode' : agent;
           // Restrict resume to Claude — Codex/Gemini don't honour the
           // happy-pass-through `--resume <id>` argument the same way.
           const resumeFragment = options.resumeClaudeSessionId && agent === 'claude'
             ? ` --resume ${shellescape(options.resumeClaudeSessionId)}`
             : '';
-          const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon --dangerously-skip-permissions${resumeFragment}`;
+          const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agentCliCommand} --happy-starting-mode remote --started-by daemon --dangerously-skip-permissions${resumeFragment}`;
 
           // Spawn in tmux with environment variables
           // IMPORTANT: Pass complete environment (process.env + extraEnv) because:
@@ -572,7 +574,8 @@ export async function startDaemon(): Promise<void> {
         if (!useTmux) {
           logger.debug(`[DAEMON RUN] Using regular process spawning`);
 
-          // Construct arguments for the CLI - support claude, codex, and gemini
+          // Construct arguments for the CLI - support claude, codex, gemini,
+          // openclaw, and opencode (opencode runs over ACP: `happy acp opencode`).
           let agentCommand: string;
           switch (options.agent) {
             case 'claude':
@@ -588,6 +591,9 @@ export async function startDaemon(): Promise<void> {
             case 'openclaw':
               agentCommand = 'openclaw';
               break;
+            case 'opencode':
+              agentCommand = 'acp';
+              break;
             default:
               return {
                 type: 'error',
@@ -596,6 +602,8 @@ export async function startDaemon(): Promise<void> {
           }
           const args = [
             agentCommand,
+            // opencode is launched as the ACP sub-agent: `acp opencode`.
+            ...(options.agent === 'opencode' ? ['opencode'] : []),
             '--happy-starting-mode', 'remote',
             '--started-by', 'daemon',
             '--dangerously-skip-permissions'
