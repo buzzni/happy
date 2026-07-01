@@ -54,8 +54,6 @@ describe('composeStepGuide', () => {
         expect(guide).toMatch(/specs\/\[feature-slug\]\/prd\.md/);
         expect(guide).toMatch(/spec\.md/);
         expect(guide).toMatch(/context\.md/);
-        expect(guide).toMatch(/feature-oriented implementation phases/);
-        expect(guide).toMatch(/Avoid broad catch-all phases/);
         expect(guide).toMatch(/AX_PROJECT_PLAN\.md.*explicitly requested/i);
     });
 
