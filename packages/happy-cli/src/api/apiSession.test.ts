@@ -1207,6 +1207,53 @@ describe('ApiSessionClient v3 messages API migration', () => {
         await client.close();
     });
 
+    it('routes a live socket message even when reconnect catch-up skipped the same seq', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        const onUserMessage = vi.fn();
+        client.onUserMessage(onUserMessage);
+        client.skipExistingMessages();
+
+        const liveUserMessage = {
+            role: 'user',
+            content: { type: 'text', text: 'resume race' }
+        };
+        const encrypted = encryptContent(session, liveUserMessage);
+
+        mockAxiosGet.mockResolvedValueOnce({
+            data: {
+                messages: [
+                    {
+                        id: 'msg-1',
+                        seq: 1,
+                        content: {
+                            t: 'encrypted',
+                            c: encrypted
+                        },
+                        localId: null,
+                        createdAt: 1000,
+                        updatedAt: 1000
+                    }
+                ],
+                hasMore: false
+            }
+        });
+
+        emitSocketEvent('connect');
+        await waitForCheck(() => {
+            expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+        });
+        expect(onUserMessage).not.toHaveBeenCalled();
+        expect((client as any).lastSeq).toBe(1);
+
+        emitSocketEvent('update', createNewMessageUpdate(1, encrypted));
+
+        expect(onUserMessage).toHaveBeenCalledTimes(1);
+        expect(onUserMessage).toHaveBeenCalledWith(liveUserMessage);
+        expect((client as any).lastSeq).toBe(1);
+        expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+        await client.close();
+    });
+
     it('stops send and receive sync loops on close', async () => {
         const client = new ApiSessionClient('fake-token', session);
         await client.close();
