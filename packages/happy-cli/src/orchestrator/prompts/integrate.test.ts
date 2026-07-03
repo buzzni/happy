@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applyAxOrchestration } from './integrate';
@@ -43,16 +43,17 @@ describe('applyAxOrchestration', () => {
         expect(guideIdx).toBeLessThan(ctxIdx);
     });
 
-    it('design-step: references AX_PROJECT_PLAN.md without embedding content in the context block', async () => {
+    it('design-step: references the selected planning prd without embedding content in the context block', async () => {
         await bootstrapWorkspace(workspace, 'design');
-        await writeFile(join(workspace, 'AX_PROJECT_PLAN.md'), '# My Plan\n\nbody-marker\n');
+        await mkdir(join(workspace, 'specs', 'todo'), { recursive: true });
+        await writeFile(join(workspace, 'specs', 'todo', 'prd.md'), '# My Plan\n\nbody-marker\n');
         const result = await applyAxOrchestration({
             workspaceRoot: workspace,
             userText: 'show me designs',
         });
         expect(result!.userText).toBe('show me designs');
         expect(result!.step).toBe('design');
-        expect(result!.appendSystemPrompt).toMatch(/AX_PROJECT_PLAN\.md/);
+        expect(result!.appendSystemPrompt).toMatch(/specs\/\[feature-slug\]\/prd\.md/);
         expect(result!.appendSystemPrompt).not.toMatch(/body-marker/);
     });
 

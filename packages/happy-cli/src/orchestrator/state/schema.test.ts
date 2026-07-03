@@ -31,7 +31,7 @@ describe('createInitialState', () => {
         const state = createInitialState('plan');
         expect(state.version).toBe(1);
         expect(state.step).toBe('plan');
-        expect(state.plan.filePath).toBe('AX_PROJECT_PLAN.md');
+        expect(state.plan.filePath).toBe('specs/[feature-slug]/prd.md');
         expect(state.plan.completedAt).toBeNull();
         expect(state.design.candidates).toEqual([]);
         expect(state.design.candidatesSource).toBe('claude-suggested');
@@ -58,7 +58,7 @@ describe('AxStateSchema', () => {
         const valid = {
             version: 1,
             step: 'design',
-            plan: { filePath: 'AX_PROJECT_PLAN.md', completedAt: '2026-05-19T10:00:00.000Z' },
+            plan: { filePath: 'specs/todo/prd.md', completedAt: '2026-05-19T10:00:00.000Z' },
             design: {
                 candidates: ['bmw-m', 'linear', 'stripe'],
                 candidatesSource: 'claude-suggested',

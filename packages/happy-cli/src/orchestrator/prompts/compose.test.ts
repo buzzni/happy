@@ -44,7 +44,8 @@ describe('composeStepGuide', () => {
         const guide = await composeStepGuide('plan');
         expect(guide).toMatch(/Step: plan/);
         expect(guide).toMatch(/Product Manager/);
-        expect(guide).toMatch(/AX_PROJECT_PLAN\.md/);
+        expect(guide).toMatch(/specs\/\[feature-slug\]\/prd\.md/);
+        expect(guide).toMatch(/Do not write new planning content to `AX_PROJECT_PLAN\.md`/);
     });
 
     it('loads the design step guide', async () => {
@@ -78,28 +79,33 @@ describe('composeDynamicContext', () => {
         expect(ctx).not.toMatch(/AX_STUDIO_DESIGN\.md\n```/);
     });
 
-    it('design step: references AX_PROJECT_PLAN.md when present without embedding content', async () => {
+    it('design step: references the selected planning prd when present without embedding content', async () => {
         const state = createInitialState('design');
-        await writeFile(join(workspace, 'AX_PROJECT_PLAN.md'), '# Test Plan\n\n## 🎯 목표\nbuild it\n');
+        state.plan.filePath = 'specs/todo/prd.md';
+        await mkdir(join(workspace, 'specs', 'todo'), { recursive: true });
+        await writeFile(join(workspace, 'specs', 'todo', 'prd.md'), '# Test Plan\n\n## 🎯 목표\nbuild it\n');
         const ctx = await composeDynamicContext(workspace, state);
         expect(ctx).toMatch(/"step":\s*"design"/);
-        expect(ctx).toMatch(/AX_PROJECT_PLAN\.md/);
+        expect(ctx).toMatch(/specs\/todo\/prd\.md/);
         expect(ctx).not.toMatch(/build it/);
     });
 
-    it('design step: handles missing AX_PROJECT_PLAN.md gracefully', async () => {
+    it('design step: handles a missing selected planning prd gracefully', async () => {
         const state = createInitialState('design');
+        state.plan.filePath = 'specs/missing/prd.md';
         const ctx = await composeDynamicContext(workspace, state);
-        expect(ctx).toMatch(/AX_PROJECT_PLAN\.md/);
+        expect(ctx).toMatch(/specs\/missing\/prd\.md/);
         expect(ctx).toMatch(/not found|missing|not yet created/i);
     });
 
     it('work step: references plan AND design when both present without embedding content', async () => {
         const state = createInitialState('work');
-        await writeFile(join(workspace, 'AX_PROJECT_PLAN.md'), '# Plan\nbody A\n');
+        state.plan.filePath = 'specs/todo/prd.md';
+        await mkdir(join(workspace, 'specs', 'todo'), { recursive: true });
+        await writeFile(join(workspace, 'specs', 'todo', 'prd.md'), '# Plan\nbody A\n');
         await writeFile(join(workspace, 'AX_STUDIO_DESIGN.md'), '# Design\nbody B\n');
         const ctx = await composeDynamicContext(workspace, state);
-        expect(ctx).toMatch(/AX_PROJECT_PLAN\.md/);
+        expect(ctx).toMatch(/specs\/todo\/prd\.md/);
         expect(ctx).toMatch(/AX_STUDIO_DESIGN\.md/);
         expect(ctx).not.toMatch(/body A/);
         expect(ctx).not.toMatch(/body B/);
@@ -107,7 +113,9 @@ describe('composeDynamicContext', () => {
 
     it('work step: notes which attachments are missing', async () => {
         const state = createInitialState('work');
-        await writeFile(join(workspace, 'AX_PROJECT_PLAN.md'), '# Plan\n');
+        state.plan.filePath = 'specs/todo/prd.md';
+        await mkdir(join(workspace, 'specs', 'todo'), { recursive: true });
+        await writeFile(join(workspace, 'specs', 'todo', 'prd.md'), '# Plan\n');
         const ctx = await composeDynamicContext(workspace, state);
         expect(ctx).toMatch(/AX_STUDIO_DESIGN\.md/);
         expect(ctx).toMatch(/not found|missing|not yet created/i);
@@ -115,9 +123,12 @@ describe('composeDynamicContext', () => {
 
     it('free step: references plan + design when present, skips embedding content', async () => {
         const state = createInitialState('free');
-        await writeFile(join(workspace, 'AX_PROJECT_PLAN.md'), '# Plan\nfree-body-plan\n');
+        state.plan.filePath = 'specs/todo/prd.md';
+        await mkdir(join(workspace, 'specs', 'todo'), { recursive: true });
+        await writeFile(join(workspace, 'specs', 'todo', 'prd.md'), '# Plan\nfree-body-plan\n');
         const ctx = await composeDynamicContext(workspace, state);
         expect(ctx).toMatch(/"step":\s*"free"/);
+        expect(ctx).toMatch(/specs\/todo\/prd\.md/);
         expect(ctx).not.toMatch(/free-body-plan/);
         expect(ctx).toMatch(/AX_STUDIO_DESIGN\.md/);
         expect(ctx).toMatch(/not found|missing|not yet created/i);
