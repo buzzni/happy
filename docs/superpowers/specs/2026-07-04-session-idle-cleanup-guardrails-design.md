@@ -6,6 +6,21 @@ Happy sessions are being stopped while users are actively working. In the 2026-0
 
 The root problem is that idle detection today is built on liveness signals instead of user-activity signals, and the daemon executes every stop request unconditionally. This design defines what "active" means, makes the daemon the final authority over policy-driven stops, and adds a grace window so a wrong candidate decision becomes a warning instead of a kill.
 
+## Implementation Status (2026-07-04)
+
+Phase 1 is **implemented in this repo** (`packages/happy-cli`) and is the load-bearing fix:
+
+- Activity signals `pendingUserInput`, `lastUserInteractionAt`, `mode` are collected by the session (`apiSession.ts`), forwarded through `/session-runtime` (`controlServer.ts` / `controlClient.ts`), and stored on the tracked session (`run.ts`).
+- `evaluateIdleStopGuard`, `resolveStopSessionMode`, `isPolicyStopSource`, and `readIdleStopGuardConfig` live in `sessionIdleReaper.ts` with unit tests.
+- The `stop-session` RPC (`apiMachine.ts`) and `stopSession()` (`run.ts`) now take a context, infer `if-idle` for policy sources, run the guard, and return a **structured refusal** instead of killing an active session. The daemon reaper pull path re-validates through the same guard.
+
+Not yet done (follow-up):
+
+- **Two-phase grace + warning event** (candidate → warn → confirm) is designed below but not implemented; the guard alone already prevents the incident, and the warning event needs app work.
+- **Server/vendor side** (`packages/web-ui`, `vendor/happy` — not present/initialized in this repo): candidate selection on real activity, `mode: 'if-idle'` from `project-session-idle-stop`, backoff on refusal, and the `candidate request failed: 401` auth fix.
+
+Related, already landed on `main` and out of scope here: the spawn webhook timeout was reworked (`spawnWebhookWait.ts`, 15s soft / 60s final, delayed webhook resolves as success), which resolves the separate "세션 스폰 실패" false-failure symptom. The per-user-credentials `daemon.state.json` gap (F-03, `No daemon running, no state file found`) had zero occurrences in the incident logs and is tracked separately as a low-priority port-plumbing footnote.
+
 ## Goals
 
 - Never stop a session that has a pending user interaction (AskUserQuestion, permission prompt) or an open tool call, regardless of who requested the stop.
@@ -45,14 +60,16 @@ Known properties:
 - `HAPPY_DAEMON_SESSION_IDLE_REAPER_DISABLED=1` disables the whole path.
 - In the incident environment this path 401s every tick and never returns candidates — it fails safe, but silently.
 
-### Path B: `stop-session` RPC (push)
+### Path B: `stop-session` RPC (push) — the path that actually fired
 
-`packages/happy-cli/src/api/apiMachine.ts` registers a machine-scoped `stop-session` handler. It logs `source`/`reason` if present and then calls `stopSession(sessionId)` **unconditionally**. The same handler serves:
+`packages/happy-cli/src/api/apiMachine.ts` registers a machine-scoped `stop-session` handler. Before this change it logged `source`/`reason` if present and then called `stopSession(sessionId)` **unconditionally**. The same handler serves:
 
 - user-initiated stops from the app (`packages/happy-app/sources/sync/ops.ts` sends only `{ sessionId }`),
-- policy-initiated stops from the internal project orchestrator (`source: 'project-session-idle-stop'`, `reason: 'inactive-project-or-session'`).
+- policy-initiated stops. Per the web-ui maintainers, the actual kill is **sent by the web-ui client, not the server**: a browser timer (`web-ui App.tsx` → `stopSessionViaRpc` → `${machineId}:stop-session`) fires 5 minutes after that browser considers the project/session "left", using only agent-busy signals (`isAgentActiveFromSignals`: sending/streaming/thinking/open-tool-call) to gate it. The server-side reaper (`web-ui server/sessionIdleReaper.ts`, 10-minute + 2-minute project presence) only *computes candidates* and does not kill. This matches the incident source `project-session-idle-stop` / `inactive-project-or-session`.
 
-`stopSession()` in `run.ts` preserves the session for resume, sends SIGTERM (child process for daemon-spawned, raw PID for terminal-spawned), and drops it from tracking. There is no distinction between "the user pressed stop" and "a batch policy decided the project looks inactive" — and terminal-spawned sessions the user has open in a visible terminal are killed by PID just the same.
+The consequence: a **single stale or backgrounded browser tab** can send a kill for a session the user is actively using from another tab, a terminal, or mobile — none of which that tab's presence/activity check can see. `stopSession()` in `run.ts` then preserves the session for resume, sends SIGTERM (child process for daemon-spawned, raw PID for terminal-spawned), and drops it from tracking, with no distinction between "the user pressed stop" and "one browser's timer expired".
+
+Because `packages/web-ui` / `vendor/happy` are not present in this repo, the daemon's `stop-session` handler is the **only enforcement point we can currently fix** — which is why the daemon guard (below) is the load-bearing change rather than a secondary safety net.
 
 ### Path C: dead-PID pruning
 
@@ -156,12 +173,13 @@ The pending map lives in daemon memory only; a daemon restart resets the cycle, 
 
 ### 5. Threshold and default changes
 
-- `DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS`: 5 minutes → **30 minutes**. Five minutes is below routine think-time; with the guard keyed to `lastUserInteractionAt` this threshold now measures real user absence, so it can be meaningfully larger without accumulating zombies.
-- New env knobs, all following the existing `readDaemonSessionIdleReaperConfig` pattern:
-  - `HAPPY_DAEMON_SESSION_IDLE_STOP_GRACE_MS` (default 300000)
-  - `HAPPY_DAEMON_SESSION_IDLE_MIN_AGE_MS` (default 600000)
-  - `HAPPY_DAEMON_SESSION_IDLE_HARD_CAP_MS` (default 7200000)
-  - `HAPPY_DAEMON_SESSION_IDLE_PROTECT_LOCAL` (default true)
+- `DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS` stays **5 minutes** (unchanged) for the server request payload, but the guard now reuses it as the `recent-user-interaction` window. Because that window is keyed to real `lastUserInteractionAt` (not liveness), operators can raise it via env without accumulating zombies; 30 minutes is a reasonable target once the server side also selects candidates on activity.
+- New env knobs implemented in `readIdleStopGuardConfig`, following the existing `readDaemonSessionIdleReaperConfig` pattern:
+  - `HAPPY_DAEMON_SESSION_IDLE_MIN_AGE_MS` (default 600000 — 10 min)
+  - `HAPPY_DAEMON_SESSION_IDLE_HARD_CAP_MS` (default 7200000 — 2 h)
+  - `HAPPY_DAEMON_SESSION_IDLE_PRESENCE_STALE_MS` (default 300000 — 5 min; the guard's stale-runtime window)
+  - `HAPPY_DAEMON_SESSION_IDLE_PROTECT_LOCAL` (default true; set `0`/`false`/`no` to allow reaping local-mode sessions)
+- Planned but not yet implemented: `HAPPY_DAEMON_SESSION_IDLE_STOP_GRACE_MS` (two-phase grace, §4).
 - Existing knobs (`...REAPER_AFTER_MS`, `...REAPER_PRESENCE_STALE_MS`, `...REAPER_DISABLED`) keep their meaning.
 
 ### 6. Server-side contract (not implemented in this repo)

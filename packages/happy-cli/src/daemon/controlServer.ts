@@ -10,6 +10,7 @@ import { logger } from '@/ui/logger';
 import { Metadata } from '@/api/types';
 import { decodeBase64 } from '@/api/encryption';
 import { TrackedSession, SessionEncryptionData, SessionRuntimeState } from './types';
+import type { StopSessionContext, StopSessionResult } from './sessionIdleReaper';
 import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
 import { PortRegistry } from './portRegistry';
 import { proxyHttp, PreviewProxyError } from './previewProxy';
@@ -27,7 +28,7 @@ export function startDaemonControlServer({
   portRegistry
 }: {
   getChildren: () => TrackedSession[];
-  stopSession: (sessionId: string) => boolean;
+  stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
   spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
   requestShutdown: () => void;
   onHappySessionWebhook: (sessionId: string, metadata: Metadata, encryption?: SessionEncryptionData) => void;
@@ -90,7 +91,10 @@ export function startDaemonControlServer({
         body: z.object({
           sessionId: z.string(),
           thinking: z.boolean().optional(),
-          hasOpenToolCall: z.boolean().optional()
+          hasOpenToolCall: z.boolean().optional(),
+          pendingUserInput: z.boolean().optional(),
+          lastUserInteractionAt: z.number().optional(),
+          mode: z.enum(['local', 'remote']).optional()
         }),
         response: {
           200: z.object({
@@ -99,11 +103,14 @@ export function startDaemonControlServer({
         }
       }
     }, async (request) => {
-      const { sessionId, thinking, hasOpenToolCall } = request.body;
+      const { sessionId, thinking, hasOpenToolCall, pendingUserInput, lastUserInteractionAt, mode } = request.body;
 
       onHappySessionRuntime(sessionId, {
         ...(thinking !== undefined ? { thinking } : {}),
         ...(hasOpenToolCall !== undefined ? { hasOpenToolCall } : {}),
+        ...(pendingUserInput !== undefined ? { pendingUserInput } : {}),
+        ...(lastUserInteractionAt !== undefined ? { lastUserInteractionAt } : {}),
+        ...(mode !== undefined ? { mode } : {}),
         updatedAt: Date.now()
       });
 
@@ -155,8 +162,11 @@ export function startDaemonControlServer({
       const { sessionId, source, reason } = request.body;
 
       logger.debug(`[CONTROL SERVER] Stop session request: ${sessionId}`, { source, reason });
-      const success = stopSession(sessionId);
-      return { success };
+      const result = stopSession(sessionId, {
+        ...(source !== undefined ? { source } : {}),
+        ...(reason !== undefined ? { reason } : {})
+      });
+      return { success: result.stopped };
     });
 
     // Spawn new session

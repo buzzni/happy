@@ -255,8 +255,11 @@ export class ApiSessionClient extends EventEmitter {
     private lastDaemonRuntimeReport: {
         thinking: boolean;
         hasOpenToolCall: boolean;
+        pendingUserInput: boolean;
         reportedAt: number;
     } | null = null;
+    private currentMode: 'local' | 'remote' = 'remote';
+    private lastUserInteractionAt: number | undefined;
 
     constructor(token: string, session: Session) {
         super()
@@ -977,6 +980,7 @@ export class ApiSessionClient extends EventEmitter {
             logger.debug(`[API] Sending keep alive message: ${thinking}`);
         }
         this.currentThinking = thinking;
+        this.currentMode = mode;
         this.socket.volatile.emit('session-alive', {
             sid: this.sessionId,
             time: Date.now(),
@@ -988,23 +992,46 @@ export class ApiSessionClient extends EventEmitter {
 
     private reportDaemonRuntime(thinking: boolean, force = false) {
         const hasOpenToolCall = this.openToolCallIds.size > 0;
-        const isWaitingForAskUserQuestion = this.openAskUserQuestionIds.size > 0 && !hasOpenToolCall;
-        const daemonThinking = thinking && !isWaitingForAskUserQuestion;
+        // Blocked on an AskUserQuestion (and nothing else running) means the
+        // session is waiting on a human — report it as not-thinking for the UI,
+        // but surface it separately so the daemon idle guard never reaps it.
+        const pendingUserInput = this.openAskUserQuestionIds.size > 0 && !hasOpenToolCall;
+        const daemonThinking = thinking && !pendingUserInput;
         const now = Date.now();
 
-        if (!force && this.lastDaemonRuntimeReport
-            && this.lastDaemonRuntimeReport.thinking === daemonThinking
-            && this.lastDaemonRuntimeReport.hasOpenToolCall === hasOpenToolCall
-            && now - this.lastDaemonRuntimeReport.reportedAt < DAEMON_RUNTIME_REPORT_MAX_INTERVAL_MS) {
+        const prev = this.lastDaemonRuntimeReport;
+
+        // Stamp a user-interaction timestamp on user-caused transitions: the
+        // agent starting a turn (idle -> thinking) means the user just sent a
+        // prompt, and an AskUserQuestion clearing (pending -> not pending) means
+        // the user just answered. The daemon idle guard uses this to protect
+        // sessions the user touched recently, without conflating it with
+        // keep-alive liveness.
+        if ((daemonThinking && !prev?.thinking) || (prev?.pendingUserInput === true && !pendingUserInput)) {
+            this.lastUserInteractionAt = now;
+        }
+
+        if (!force && prev
+            && prev.thinking === daemonThinking
+            && prev.hasOpenToolCall === hasOpenToolCall
+            && prev.pendingUserInput === pendingUserInput
+            && now - prev.reportedAt < DAEMON_RUNTIME_REPORT_MAX_INTERVAL_MS) {
             return;
         }
 
         this.lastDaemonRuntimeReport = {
             thinking: daemonThinking,
             hasOpenToolCall,
+            pendingUserInput,
             reportedAt: now
         };
-        void notifyDaemonSessionRuntime(this.sessionId, { thinking: daemonThinking, hasOpenToolCall });
+        void notifyDaemonSessionRuntime(this.sessionId, {
+            thinking: daemonThinking,
+            hasOpenToolCall,
+            pendingUserInput,
+            ...(this.lastUserInteractionAt !== undefined ? { lastUserInteractionAt: this.lastUserInteractionAt } : {}),
+            mode: this.currentMode,
+        });
     }
 
     /**

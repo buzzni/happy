@@ -24,7 +24,7 @@ describe('controlServer port allocation endpoints', () => {
     })
     const { port, stop } = await startDaemonControlServer({
       getChildren: () => [],
-      stopSession: () => false,
+      stopSession: () => ({ stopped: false, reason: 'not-found' }),
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused in this test' }),
       requestShutdown: () => {},
       onHappySessionWebhook: () => {},
@@ -165,7 +165,7 @@ describe('controlServer POST /spawn-session', () => {
     })
     const { port, stop } = await startDaemonControlServer({
       getChildren: () => [],
-      stopSession: () => false,
+      stopSession: () => ({ stopped: false, reason: 'not-found' }),
       spawnSession: async (options) => {
         spawnRequests.push(options)
         return { type: 'success', sessionId: 'happy-opencode-session' }
@@ -223,7 +223,7 @@ describe('controlServer POST /session-runtime', () => {
     })
     const { port, stop } = await startDaemonControlServer({
       getChildren: () => [],
-      stopSession: () => false,
+      stopSession: () => ({ stopped: false, reason: 'not-found' }),
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused in this test' }),
       requestShutdown: () => {},
       onHappySessionWebhook: () => {},
@@ -283,7 +283,7 @@ describe('controlServer port allocation — range exhaustion', () => {
     })
     const { port, stop } = await startDaemonControlServer({
       getChildren: () => [],
-      stopSession: () => false,
+      stopSession: () => ({ stopped: false, reason: 'not-found' }),
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
       requestShutdown: () => {},
       onHappySessionWebhook: () => {},
@@ -341,7 +341,7 @@ describe('controlServer POST /proxy-http', () => {
     })
     const { port, stop } = await startDaemonControlServer({
       getChildren: () => [],
-      stopSession: () => false,
+      stopSession: () => ({ stopped: false, reason: 'not-found' }),
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
       requestShutdown: () => {},
       onHappySessionWebhook: () => {},
@@ -445,7 +445,7 @@ describe('controlServer POST /start-server', () => {
     })
     const { port, stop } = await startDaemonControlServer({
       getChildren: () => [],
-      stopSession: () => false,
+      stopSession: () => ({ stopped: false, reason: 'not-found' }),
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
       requestShutdown: () => {},
       onHappySessionWebhook: () => {},
@@ -557,7 +557,7 @@ describe('controlServer POST /stop-server', () => {
     })
     const { port, stop } = await startDaemonControlServer({
       getChildren: () => [],
-      stopSession: () => false,
+      stopSession: () => ({ stopped: false, reason: 'not-found' }),
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
       requestShutdown: () => {},
       onHappySessionWebhook: () => {},

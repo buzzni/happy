@@ -676,7 +676,10 @@ describe('ApiSessionClient v3 messages API migration', () => {
         }));
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalledWith('test-session-id', {
             thinking: true,
-            hasOpenToolCall: false
+            hasOpenToolCall: false,
+            pendingUserInput: false,
+            lastUserInteractionAt: expect.any(Number),
+            mode: 'remote'
         });
     });
 
@@ -708,7 +711,10 @@ describe('ApiSessionClient v3 messages API migration', () => {
 
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', {
             thinking: true,
-            hasOpenToolCall: true
+            hasOpenToolCall: true,
+            pendingUserInput: false,
+            lastUserInteractionAt: expect.any(Number),
+            mode: 'remote'
         });
 
         client.sendSessionProtocolMessage({
@@ -721,7 +727,10 @@ describe('ApiSessionClient v3 messages API migration', () => {
 
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', {
             thinking: true,
-            hasOpenToolCall: false
+            hasOpenToolCall: false,
+            pendingUserInput: false,
+            lastUserInteractionAt: expect.any(Number),
+            mode: 'remote'
         });
     });
 
@@ -761,7 +770,10 @@ describe('ApiSessionClient v3 messages API migration', () => {
 
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalledWith('test-session-id', {
             thinking: false,
-            hasOpenToolCall: false
+            hasOpenToolCall: false,
+            pendingUserInput: true,
+            lastUserInteractionAt: expect.any(Number),
+            mode: 'remote'
         });
     });
 
