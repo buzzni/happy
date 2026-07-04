@@ -17,7 +17,11 @@ Phase 1 is **implemented in this repo** (`packages/happy-cli`) and is the load-b
 Not yet done (follow-up):
 
 - **Two-phase grace + warning event** (candidate → warn → confirm) is designed below but not implemented; the guard alone already prevents the incident, and the warning event needs app work.
-- **Server/vendor side** (`packages/web-ui`, `vendor/happy` — not present/initialized in this repo): candidate selection on real activity, `mode: 'if-idle'` from `project-session-idle-stop`, backoff on refusal, and the `candidate request failed: 401` auth fix.
+
+Done since (2026-07-04, follow-up review pass):
+
+- **This repo**: `pendingUserInput` now also covers pending permission/approval requests (`agentState.requests` — the only signal for Codex approvals, which never open a tool call); the reaper candidate request forwards `pendingUserInput`/`lastUserInteractionAt`/`mode`; the local control-server `/stop-session` accepts `mode` and returns the structured refusal (`stopped`/`reason`/`guard`).
+- **Root repo (`packages/web-ui`, aplus-dev-studio)**: `project-session-idle-stop` sends `mode: 'if-idle'`, parses the structured refusal (no `active:false` on refusal, reschedules instead); candidate selection excludes `pendingUserInput` and computes idleness from `max(lastActiveAt, lastUserInteractionAt)`; the `candidate request failed: 401` is fixed by accepting company happy tokens for shared machines (machine-company binding verified, session→project lookup company-scoped). See `specs/daemon-session-idle-reaper/` there.
 
 Related, already landed on `main` and out of scope here: the spawn webhook timeout was reworked (`spawnWebhookWait.ts`, 15s soft / 60s final, delayed webhook resolves as success), which resolves the separate "세션 스폰 실패" false-failure symptom. The per-user-credentials `daemon.state.json` gap (F-03, `No daemon running, no state file found`) had zero occurrences in the incident logs and is tracked separately as a low-priority port-plumbing footnote.
 

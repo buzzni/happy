@@ -777,6 +777,27 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
     });
 
+    it('reports a pending permission request as pending user input', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        // Claude/Codex permission handlers mirror pending approvals into
+        // agentState.requests — codex approvals never open a tool call, so
+        // this is the only "waiting on user" signal for them.
+        (client as unknown as { agentState: unknown }).agentState = {
+            requests: {
+                'perm-1': { tool: 'CodexBash', arguments: {}, createdAt: 1000 }
+            }
+        };
+
+        client.keepAlive(true, 'remote');
+
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalledWith('test-session-id', {
+            thinking: false,
+            hasOpenToolCall: false,
+            pendingUserInput: true,
+            mode: 'remote'
+        });
+    });
+
     it('persists pending AskUserQuestion as cancelled before shutdown', async () => {
         const client = new ApiSessionClient('fake-token', session);
         mockAxiosPost.mockResolvedValue({

@@ -59,6 +59,7 @@ describe('buildDaemonSessionIdleReaperRequest', () => {
           active: true,
           thinking: false,
           hasOpenToolCall: false,
+          pendingUserInput: false,
           lastActiveAt: 1_000,
         },
         {
@@ -67,6 +68,7 @@ describe('buildDaemonSessionIdleReaperRequest', () => {
           active: true,
           thinking: false,
           hasOpenToolCall: false,
+          pendingUserInput: false,
           lastActiveAt: 10_000,
         },
       ],
@@ -99,6 +101,44 @@ describe('buildDaemonSessionIdleReaperRequest', () => {
         active: true,
         thinking: true,
         hasOpenToolCall: true,
+        pendingUserInput: false,
+        lastActiveAt: 9_000,
+      },
+    ]);
+  });
+
+  it('forwards user-activity signals so the server can select candidates from real activity', () => {
+    const request = buildDaemonSessionIdleReaperRequest({
+      machineId: 'machine-1',
+      now: 10_000,
+      sessionStartTimes: new Map([[100, 1_000]]),
+      trackedSessions: [
+        tracked({
+          pid: 100,
+          happySessionId: 'session-claude',
+          happySessionMetadataFromLocalWebhook: { flavor: 'claude' } as never,
+          runtime: {
+            thinking: false,
+            hasOpenToolCall: false,
+            pendingUserInput: true,
+            lastUserInteractionAt: 8_500,
+            mode: 'local',
+            updatedAt: 9_000,
+          },
+        }),
+      ],
+    });
+
+    expect(request.sessions).toEqual([
+      {
+        sessionId: 'session-claude',
+        agent: 'claude',
+        active: true,
+        thinking: false,
+        hasOpenToolCall: false,
+        pendingUserInput: true,
+        lastUserInteractionAt: 8_500,
+        mode: 'local',
         lastActiveAt: 9_000,
       },
     ]);
@@ -130,6 +170,7 @@ describe('buildDaemonSessionIdleReaperRequest', () => {
         active: true,
         thinking: false,
         hasOpenToolCall: false,
+        pendingUserInput: false,
         lastActiveAt: 9_000,
       },
     ]);

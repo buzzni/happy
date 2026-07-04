@@ -992,10 +992,15 @@ export class ApiSessionClient extends EventEmitter {
 
     private reportDaemonRuntime(thinking: boolean, force = false) {
         const hasOpenToolCall = this.openToolCallIds.size > 0;
-        // Blocked on an AskUserQuestion (and nothing else running) means the
-        // session is waiting on a human — report it as not-thinking for the UI,
-        // but surface it separately so the daemon idle guard never reaps it.
-        const pendingUserInput = this.openAskUserQuestionIds.size > 0 && !hasOpenToolCall;
+        // Blocked waiting on a human: an open AskUserQuestion, or a pending
+        // permission/approval request that the Claude/Codex permission handlers
+        // mirror into agentState.requests. Codex approvals never open a tool
+        // call (exec_approval_request is deliberately not mapped to
+        // tool-call-start), so agentState.requests is the only signal for them.
+        // Reported as not-thinking for the UI, but surfaced separately so the
+        // daemon idle guard never reaps a session waiting on the user.
+        const hasPendingPermissionRequest = Object.keys(this.agentState?.requests ?? {}).length > 0;
+        const pendingUserInput = (this.openAskUserQuestionIds.size > 0 || hasPendingPermissionRequest) && !hasOpenToolCall;
         const daemonThinking = thinking && !pendingUserInput;
         const now = Date.now();
 
@@ -1131,6 +1136,10 @@ export class ApiSessionClient extends EventEmitter {
                     this.agentState = answer.agentState ? decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(answer.agentState)) : null;
                     this.agentStateVersion = answer.version;
                     logger.debug('Agent state updated', this.agentState);
+                    // agentState.requests feeds pendingUserInput for the daemon
+                    // idle guard — re-report promptly instead of waiting for the
+                    // next keep-alive tick (dedupe suppresses no-op reports).
+                    this.reportDaemonRuntime(this.currentThinking);
                 } else if (answer.result === 'version-mismatch') {
                     if (answer.version > this.agentStateVersion) {
                         this.agentStateVersion = answer.version;

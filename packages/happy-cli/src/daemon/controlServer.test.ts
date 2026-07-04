@@ -626,3 +626,86 @@ describe('controlServer POST /stop-server', () => {
     expect(res.status).toBe(400)
   })
 })
+
+describe('controlServer /stop-session v2 contract', () => {
+  let dir: string
+  let baseUrl: string
+  let stopServer: () => Promise<void>
+  let received: Array<{ sessionId: string; context?: { source?: string; reason?: string; mode?: 'force' | 'if-idle' } }>
+
+  beforeEach(async () => {
+    dir = mkdtempSync(path.join(tmpdir(), 'control-server-stop-'))
+    received = []
+    const registry = createPortRegistry({
+      filePath: path.join(dir, 'port-registry.json'),
+      portMin: 30000,
+      portMax: 30010,
+      isPortBindable: async () => true,
+    })
+    const { port, stop } = await startDaemonControlServer({
+      getChildren: () => [],
+      stopSession: (sessionId, context) => {
+        received.push({ sessionId, ...(context !== undefined ? { context } : {}) })
+        if (sessionId === 'session-active') {
+          return {
+            stopped: false,
+            reason: 'active',
+            guard: 'thinking',
+            activity: { thinking: true, hasOpenToolCall: false, pendingUserInput: false },
+          }
+        }
+        if (sessionId === 'session-live') {
+          return { stopped: true }
+        }
+        return { stopped: false, reason: 'not-found' }
+      },
+      spawnSession: async () => ({ type: 'error', errorMessage: 'unused in this test' }),
+      requestShutdown: () => {},
+      onHappySessionWebhook: () => {},
+      portRegistry: registry,
+    })
+    baseUrl = `http://127.0.0.1:${port}`
+    stopServer = stop
+  })
+
+  afterEach(async () => {
+    await stopServer()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const stopSessionPost = async (body: Record<string, unknown>) => {
+    const res = await fetch(`${baseUrl}/stop-session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> }
+  }
+
+  it('passes mode through and returns a structured refusal for an active session', async () => {
+    const { status, body } = await stopSessionPost({
+      sessionId: 'session-active',
+      source: 'project-session-idle-stop',
+      mode: 'if-idle',
+    })
+
+    expect(status).toBe(200)
+    expect(body).toEqual({ success: false, stopped: false, reason: 'active', guard: 'thinking' })
+    expect(received).toEqual([{
+      sessionId: 'session-active',
+      context: { source: 'project-session-idle-stop', mode: 'if-idle' },
+    }])
+  })
+
+  it('returns stopped:true alongside legacy success for a real stop', async () => {
+    const { status, body } = await stopSessionPost({ sessionId: 'session-live' })
+    expect(status).toBe(200)
+    expect(body).toEqual({ success: true, stopped: true })
+  })
+
+  it('marks an untracked session as not-found without a guard', async () => {
+    const { status, body } = await stopSessionPost({ sessionId: 'session-missing' })
+    expect(status).toBe(200)
+    expect(body).toEqual({ success: false, stopped: false, reason: 'not-found' })
+  })
+})

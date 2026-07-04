@@ -13,6 +13,15 @@ type DaemonSessionIdleReaperObservedSession = {
   active: true;
   thinking: boolean;
   hasOpenToolCall: boolean;
+  /** Waiting on the user (AskUserQuestion / permission prompt) — the server
+   *  must treat this as busy, not idle, when selecting stop candidates. */
+  pendingUserInput: boolean;
+  /** Last real user action (prompt sent, question/permission answered) — lets
+   *  the server compute idleness from user activity instead of liveness. */
+  lastUserInteractionAt?: number;
+  /** 'local' = terminal attached. Sent for observability; local protection is
+   *  enforced daemon-side via HAPPY_DAEMON_SESSION_IDLE_PROTECT_LOCAL. */
+  mode?: 'local' | 'remote';
   lastActiveAt: number;
 };
 
@@ -237,6 +246,11 @@ export function buildDaemonSessionIdleReaperRequest(input: {
       active: true,
       thinking: session.runtime?.thinking === true,
       hasOpenToolCall: session.runtime?.hasOpenToolCall === true,
+      pendingUserInput: session.runtime?.pendingUserInput === true,
+      ...(session.runtime?.lastUserInteractionAt !== undefined
+        ? { lastUserInteractionAt: session.runtime.lastUserInteractionAt }
+        : {}),
+      ...(session.runtime?.mode !== undefined ? { mode: session.runtime.mode } : {}),
       lastActiveAt: resolveSessionLastActiveAt(session, input.sessionStartTimes, now),
     });
   }

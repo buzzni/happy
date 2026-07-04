@@ -150,23 +150,40 @@ export function startDaemonControlServer({
         body: z.object({
           sessionId: z.string(),
           source: z.string().optional(),
-          reason: z.string().optional()
+          reason: z.string().optional(),
+          mode: z.enum(['force', 'if-idle']).optional()
         }),
         response: {
+          // Mirrors the machine RPC stop-session contract: `stopped` plus a
+          // structured refusal (`reason`/`guard`) so a policy-driven local
+          // caller can tell "active refusal" from a real failure. `success`
+          // stays for pre-v2 callers that only read that flag.
           200: z.object({
-            success: z.boolean()
+            success: z.boolean(),
+            stopped: z.boolean(),
+            reason: z.enum(['not-found', 'active']).optional(),
+            guard: z.string().optional()
           })
         }
       }
     }, async (request) => {
-      const { sessionId, source, reason } = request.body;
+      const { sessionId, source, reason, mode } = request.body;
 
-      logger.debug(`[CONTROL SERVER] Stop session request: ${sessionId}`, { source, reason });
+      logger.debug(`[CONTROL SERVER] Stop session request: ${sessionId}`, { source, reason, mode });
       const result = stopSession(sessionId, {
         ...(source !== undefined ? { source } : {}),
-        ...(reason !== undefined ? { reason } : {})
+        ...(reason !== undefined ? { reason } : {}),
+        ...(mode !== undefined ? { mode } : {})
       });
-      return { success: result.stopped };
+      if (result.stopped) {
+        return { success: true, stopped: true };
+      }
+      return {
+        success: false,
+        stopped: false,
+        reason: result.reason,
+        ...(result.reason === 'active' ? { guard: result.guard } : {})
+      };
     });
 
     // Spawn new session
