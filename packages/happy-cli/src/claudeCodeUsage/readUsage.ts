@@ -98,7 +98,7 @@ export async function readClaudeCodeUsage(): Promise<ClaudeCodeUsage> {
     }
 
     const auth = await fetchAuthStatus();
-    if (!auth || auth.loggedIn !== true) {
+    if (auth && auth.loggedIn !== true) {
         return {
             refreshedAt,
             installed: true,
@@ -111,13 +111,25 @@ export async function readClaudeCodeUsage(): Promise<ClaudeCodeUsage> {
     }
 
     const usage = await fetchUsageText();
+    if (!auth && !usage.result) {
+        return {
+            refreshedAt,
+            installed: true,
+            authenticated: false,
+            cliVersion: install.version,
+            subscriptionType: null,
+            errorKind: 'not-authenticated',
+            error: 'Claude Code CLI is not logged in.',
+        };
+    }
+
     if (!usage.result) {
         return {
             refreshedAt,
             installed: true,
             authenticated: true,
             cliVersion: install.version,
-            subscriptionType: auth.subscriptionType ?? null,
+            subscriptionType: auth?.subscriptionType ?? null,
             errorKind: 'transport',
             error: 'Could not fetch /usage output from Claude Code CLI.',
         };
@@ -136,7 +148,7 @@ export async function readClaudeCodeUsage(): Promise<ClaudeCodeUsage> {
         installed: true,
         authenticated: true,
         cliVersion: install.version,
-        subscriptionType: auth.subscriptionType ?? null,
+        subscriptionType: auth?.subscriptionType ?? null,
         window5h: parsed.window5h,
         windowWeeklyAllModels: parsed.windowWeeklyAllModels,
         windowWeeklySonnet: parsed.windowWeeklySonnet,
