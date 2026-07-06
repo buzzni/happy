@@ -123,6 +123,56 @@ export function sessionRoutes(app: Fastify) {
         });
     });
 
+    app.post('/v2/sessions/lookup', {
+        preHandler: app.authenticate,
+        schema: {
+            body: z.object({
+                ids: z.array(z.string().min(1)).min(1).max(200)
+            })
+        }
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const uniqueIds = Array.from(new Set(request.body.ids));
+        const sessions = await db.session.findMany({
+            where: {
+                accountId: userId,
+                id: { in: uniqueIds }
+            },
+            select: {
+                id: true,
+                seq: true,
+                createdAt: true,
+                updatedAt: true,
+                metadata: true,
+                metadataVersion: true,
+                agentState: true,
+                agentStateVersion: true,
+                dataEncryptionKey: true,
+                active: true,
+                lastActiveAt: true,
+            }
+        });
+        const order = new Map(uniqueIds.map((id, index) => [id, index]));
+
+        return reply.send({
+            sessions: sessions
+                .sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0))
+                .map((v) => ({
+                    id: v.id,
+                    seq: v.seq,
+                    createdAt: v.createdAt.getTime(),
+                    updatedAt: v.updatedAt.getTime(),
+                    active: v.active,
+                    activeAt: v.lastActiveAt.getTime(),
+                    metadata: v.metadata,
+                    metadataVersion: v.metadataVersion,
+                    agentState: v.agentState,
+                    agentStateVersion: v.agentStateVersion,
+                    dataEncryptionKey: v.dataEncryptionKey ? Buffer.from(v.dataEncryptionKey).toString('base64') : null,
+                }))
+        });
+    });
+
     // V2 Sessions API - Cursor-based pagination with change tracking
     app.get('/v2/sessions', {
         preHandler: app.authenticate,

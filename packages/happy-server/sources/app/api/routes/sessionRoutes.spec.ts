@@ -1,6 +1,6 @@
 import fastify from "fastify";
 import { serializerCompiler, validatorCompiler, ZodTypeProvider } from "fastify-type-provider-zod";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { type Fastify } from "../types";
 
 const {
@@ -42,6 +42,10 @@ vi.mock("@/app/events/eventRouter", async (importOriginal) => {
 
 import { sessionRoutes } from "./sessionRoutes";
 
+beforeEach(() => {
+    vi.clearAllMocks();
+});
+
 async function createApp() {
     const app = fastify();
     app.setValidatorCompiler(validatorCompiler);
@@ -66,6 +70,114 @@ describe("sessionRoutes", () => {
         const app = await createApp();
 
         expect(app.hasRoute({ method: "POST", url: "/v1/sessions/:sessionId/archive" })).toBe(true);
+        expect(app.hasRoute({ method: "POST", url: "/v2/sessions/lookup" })).toBe(true);
+
+        await app.close();
+    });
+
+    it("looks up requested sessions owned by the authenticated account", async () => {
+        dbMock.session.findMany.mockResolvedValue([
+            {
+                id: "session-b",
+                seq: 7,
+                createdAt: new Date("2026-07-03T04:27:00.000Z"),
+                updatedAt: new Date("2026-07-03T06:57:00.000Z"),
+                metadata: "encrypted-metadata-b",
+                metadataVersion: 2,
+                agentState: null,
+                agentStateVersion: 0,
+                dataEncryptionKey: Buffer.from("key-b"),
+                active: false,
+                lastActiveAt: new Date("2026-07-03T06:57:00.000Z"),
+            },
+            {
+                id: "session-a",
+                seq: 3,
+                createdAt: new Date("2026-07-03T03:00:00.000Z"),
+                updatedAt: new Date("2026-07-03T03:30:00.000Z"),
+                metadata: "encrypted-metadata-a",
+                metadataVersion: 1,
+                agentState: "agent-state",
+                agentStateVersion: 4,
+                dataEncryptionKey: null,
+                active: true,
+                lastActiveAt: new Date("2026-07-03T03:30:00.000Z"),
+            },
+        ]);
+        const app = await createApp();
+
+        const response = await app.inject({
+            method: "POST",
+            url: "/v2/sessions/lookup",
+            headers: { "x-user-id": "user-1" },
+            payload: { ids: ["session-a", "session-b", "session-a"] },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(dbMock.session.findMany).toHaveBeenCalledWith({
+            where: {
+                accountId: "user-1",
+                id: { in: ["session-a", "session-b"] },
+            },
+            select: {
+                id: true,
+                seq: true,
+                createdAt: true,
+                updatedAt: true,
+                metadata: true,
+                metadataVersion: true,
+                agentState: true,
+                agentStateVersion: true,
+                dataEncryptionKey: true,
+                active: true,
+                lastActiveAt: true,
+            },
+        });
+        expect(response.json()).toEqual({
+            sessions: [
+                {
+                    id: "session-a",
+                    seq: 3,
+                    createdAt: Date.parse("2026-07-03T03:00:00.000Z"),
+                    updatedAt: Date.parse("2026-07-03T03:30:00.000Z"),
+                    active: true,
+                    activeAt: Date.parse("2026-07-03T03:30:00.000Z"),
+                    metadata: "encrypted-metadata-a",
+                    metadataVersion: 1,
+                    agentState: "agent-state",
+                    agentStateVersion: 4,
+                    dataEncryptionKey: null,
+                },
+                {
+                    id: "session-b",
+                    seq: 7,
+                    createdAt: Date.parse("2026-07-03T04:27:00.000Z"),
+                    updatedAt: Date.parse("2026-07-03T06:57:00.000Z"),
+                    active: false,
+                    activeAt: Date.parse("2026-07-03T06:57:00.000Z"),
+                    metadata: "encrypted-metadata-b",
+                    metadataVersion: 2,
+                    agentState: null,
+                    agentStateVersion: 0,
+                    dataEncryptionKey: Buffer.from("key-b").toString("base64"),
+                },
+            ],
+        });
+
+        await app.close();
+    });
+
+    it("rejects lookup requests without authentication", async () => {
+        const app = await createApp();
+
+        const response = await app.inject({
+            method: "POST",
+            url: "/v2/sessions/lookup",
+            payload: { ids: ["session-a"] },
+        });
+
+        expect(response.statusCode).toBe(401);
+        expect(dbMock.session.findMany).not.toHaveBeenCalled();
 
         await app.close();
     });
