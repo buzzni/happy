@@ -360,7 +360,7 @@ export function connectRoutes(app: Fastify) {
         schema: {
             body: z.object({
                 token: z.string().refine(isLikelyGithubPat, {
-                    message: 'Token does not match a GitHub PAT shape (ghp_/github_pat_/gho_/ghs_ + ≥20 chars)'
+                    message: 'Token does not match a code repository PAT shape (ghp_/github_pat_/gho_/ghs_/glpat- + ≥20 chars)'
                 })
             }),
             response: {

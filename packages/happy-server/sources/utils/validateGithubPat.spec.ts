@@ -18,6 +18,14 @@ describe('isLikelyGithubPat', () => {
         expect(isLikelyGithubPat('ghs_AAAAAAAAAAAAAAAAAAAA')).toBe(true);
     });
 
+    it('accepts GitLab PAT prefix glpat-', () => {
+        expect(isLikelyGithubPat('glpat-AAAAAAAAAAAAAAAAAAAA')).toBe(true);
+    });
+
+    it('accepts GitLab PAT prefix glpat_', () => {
+        expect(isLikelyGithubPat('glpat_AAAAAAAAAAAAAAAAAAAA')).toBe(true);
+    });
+
     it('rejects unknown prefix (e.g. OpenAI sk-)', () => {
         expect(isLikelyGithubPat('sk-AAAAAAAAAAAAAAAAAAAA')).toBe(false);
     });
