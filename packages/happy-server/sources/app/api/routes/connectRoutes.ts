@@ -9,7 +9,7 @@ import { githubDisconnect } from "@/app/github/githubDisconnect";
 import { Context } from "@/context";
 import { db } from "@/storage/db";
 import { INFERENCE_VENDORS } from "@/utils/inferenceVendors";
-import { isLikelyGithubPat } from "@/utils/validateGithubPat";
+import { inferCodeRepositoryPatProvider, isLikelyGithubPat } from "@/utils/validateGithubPat";
 
 export function connectRoutes(app: Fastify) {
 
@@ -384,7 +384,8 @@ export function connectRoutes(app: Fastify) {
             response: {
                 200: z.object({
                     hasPat: z.boolean(),
-                    updatedAt: z.string().nullable()
+                    updatedAt: z.string().nullable(),
+                    provider: z.enum(['github', 'gitlab']).nullable()
                 })
             }
         }
@@ -392,11 +393,15 @@ export function connectRoutes(app: Fastify) {
         const userId = request.userId;
         const row = await db.serviceAccountToken.findUnique({
             where: { accountId_vendor: { accountId: userId, vendor: GITHUB_PAT_VENDOR } },
-            select: { updatedAt: true }
+            select: { updatedAt: true, token: true }
         });
+        const plaintext = row
+            ? decryptString(['user', userId, 'vendors', GITHUB_PAT_VENDOR, 'token'], row.token)
+            : null;
         return reply.send({
             hasPat: !!row,
-            updatedAt: row ? row.updatedAt.toISOString() : null
+            updatedAt: row ? row.updatedAt.toISOString() : null,
+            provider: plaintext ? inferCodeRepositoryPatProvider(plaintext) : null
         });
     });
 

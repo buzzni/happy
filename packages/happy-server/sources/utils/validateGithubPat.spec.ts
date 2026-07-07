@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isLikelyGithubPat } from './validateGithubPat';
+import { inferCodeRepositoryPatProvider, isLikelyGithubPat } from './validateGithubPat';
 
 describe('isLikelyGithubPat', () => {
     it('accepts classic PAT prefix ghp_', () => {
@@ -52,5 +52,21 @@ describe('isLikelyGithubPat', () => {
         // Strict — better to fail loudly than silently accept stray whitespace
         // that breaks downstream HTTP Authorization header building.
         expect(isLikelyGithubPat(' ghp_AAAAAAAAAAAAAAAAAAAA ')).toBe(false);
+    });
+});
+
+describe('inferCodeRepositoryPatProvider', () => {
+    it('classifies GitHub PAT prefixes', () => {
+        expect(inferCodeRepositoryPatProvider('ghp_AAAAAAAAAAAAAAAAAAAA')).toBe('github');
+        expect(inferCodeRepositoryPatProvider('github_pat_AAAAAAAAAAAAAAAAAAAA_BBBBB')).toBe('github');
+    });
+
+    it('classifies GitLab PAT prefixes', () => {
+        expect(inferCodeRepositoryPatProvider('glpat-AAAAAAAAAAAAAAAAAAAA')).toBe('gitlab');
+        expect(inferCodeRepositoryPatProvider('glpat_AAAAAAAAAAAAAAAAAAAA')).toBe('gitlab');
+    });
+
+    it('returns null for unknown token shapes', () => {
+        expect(inferCodeRepositoryPatProvider('sk-AAAAAAAAAAAAAAAAAAAA')).toBeNull();
     });
 });

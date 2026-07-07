@@ -18,11 +18,21 @@
  *   aplus-dev-studio specs/remote-git-clone-per-user-credentials Step 2.2.
  */
 
-const PAT_PREFIX_RE = /^(ghp_|github_pat_|gho_|ghs_|glpat[-_])/;
+const GITHUB_PAT_PREFIX_RE = /^(ghp_|github_pat_|gho_|ghs_)/;
+const GITLAB_PAT_PREFIX_RE = /^glpat[-_]/;
 const PAT_MIN_LENGTH = 20;
+
+export type CodeRepositoryPatProvider = 'github' | 'gitlab';
+
+export function inferCodeRepositoryPatProvider(token: string): CodeRepositoryPatProvider | null {
+    if (typeof token !== 'string') return null;
+    if (GITLAB_PAT_PREFIX_RE.test(token)) return 'gitlab';
+    if (GITHUB_PAT_PREFIX_RE.test(token)) return 'github';
+    return null;
+}
 
 export function isLikelyGithubPat(token: string): boolean {
     if (typeof token !== 'string') return false;
     if (token.length < PAT_MIN_LENGTH) return false;
-    return PAT_PREFIX_RE.test(token);
+    return inferCodeRepositoryPatProvider(token) !== null;
 }
