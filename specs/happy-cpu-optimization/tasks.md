@@ -1,0 +1,29 @@
+# Happy CPU Optimization Tasks
+
+- [x] `slopus/happy` 현재 main과 `buzzni/happy` 로컬 브랜치 비교
+- [x] 현재 머신에서 Happy 관련 장기 실행 프로세스 CPU 확인
+- [x] Kubernetes prod `happy-server` pod CPU/metrics 확인
+- [x] SSH 머신 `main.axstudio-4.ryan.coder` CPU/process snapshot 확인
+- [x] SSH 머신 CPU와 Kubernetes pod CPU 범위 분리
+- [x] `saycode-status`/`npm list` 반복 실행 후보 확인
+- [x] remote preview/status polling command 반복 생성 후보 확인
+- [x] idle CPU와 기능 사용 중 CPU 후보 분리
+- [x] 1차 수정 범위에 `happy-cli` 포함 여부 정리
+- [x] spec/plan/context 문서 작성
+- [x] prod 실측 결과를 문서에 반영
+- [x] SSH 머신 실측 결과를 문서에 반영
+- [ ] 사용자 승인 후 Phase 1 baseline 측정 스크립트/절차 정리
+- [ ] `saycode-status` CLI version 조회 캐싱/대체 테스트 작성
+- [ ] `saycode-status` CLI version 조회 캐싱/대체 구현
+- [ ] A+ remote preview/status polling 공유 cache/in-flight 범위 재검토
+- [ ] spec/resource polling shell RPC 호출 빈도 cache/coalesce 설계
+- [ ] happy-server session-alive fan-out/throttle 테스트 작성
+- [ ] happy-server session-alive fan-out/throttle 구현
+- [ ] `happy-cli` capability detection 캐싱 테스트 작성
+- [ ] `happy-cli` capability detection 캐싱 구현
+- [ ] session receive polling adaptive 전략 테스트 작성
+- [ ] session receive polling adaptive 전략 구현
+- [ ] remote terminal batching/throttle 테스트 작성
+- [ ] remote terminal batching/throttle 구현
+- [ ] happy-server preview/RPC 최적화 범위 재검토
+- [ ] 변경 후 테스트와 CPU 측정 결과 기록
