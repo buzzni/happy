@@ -41,7 +41,18 @@ export function parseMessageAsEvent(msg: NormalizedMessage): AgentEvent | null {
                         } as AgentEvent;
                     }
                 }
-                
+
+                // Newer SDK format has no machine-readable timestamp, only a
+                // human-readable reset time (e.g. "You've hit your session
+                // limit · resets 2:10am (Asia/Seoul)"). Surface it verbatim as
+                // a message event so the reset time stays visible to the user.
+                if (/^You've hit your session limit/.test(content.text)) {
+                    return {
+                        type: 'message',
+                        message: content.text
+                    } as AgentEvent;
+                }
+
             }
             
             // Check for mcp__happy__change_title tool calls

@@ -98,6 +98,29 @@ describe('parseMessageAsEvent', () => {
                 expect(event!.endsAt).toBe(1700000000);
             }
         });
+
+        it('should convert new-format session limit text to a message event preserving the reset time', () => {
+            const msg: NormalizedMessage = {
+                id: 'msg1',
+                localId: null,
+                createdAt: 1000,
+                role: 'agent',
+                isSidechain: false,
+                content: [{
+                    type: 'text',
+                    text: "You've hit your session limit · resets 2:10am (Asia/Seoul)",
+                    uuid: 'uuid1',
+                    parentUUID: null
+                }]
+            };
+            const event = parseMessageAsEvent(msg);
+
+            expect(event).not.toBeNull();
+            expect(event!.type).toBe('message');
+            if (event!.type === 'message') {
+                expect(event!.message).toBe("You've hit your session limit · resets 2:10am (Asia/Seoul)");
+            }
+        });
     });
 
     describe('unrelated messages', () => {
