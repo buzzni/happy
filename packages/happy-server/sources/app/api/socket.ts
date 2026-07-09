@@ -4,7 +4,8 @@ import { buildMachineActivityEphemeral, ClientConnection, eventRouter } from "@/
 import { Server } from "socket.io";
 import { createAdapter } from "@socket.io/redis-streams-adapter";
 import { Redis } from "ioredis";
-import { log } from "@/utils/log";
+import { log, warn } from "@/utils/log";
+import { guardClusterAdapterLocalDelivery } from "@/app/events/adapterLocalDeliveryGuard";
 import { auth } from "@/app/auth/auth";
 import { getMetricsLabelsFromSocket, redisStreamLagMsGauge, websocketConnectionsGauge, websocketEventsCounter } from "../monitoring/metrics2";
 import { usageHandler } from "./socket/usageHandler";
@@ -57,6 +58,17 @@ export function startSocket(app: Fastify) {
     // Multi-process support: attach Redis streams adapter when REDIS_URL is set
     if (process.env.REDIS_URL) {
         const streamClient = new Redis(process.env.REDIS_URL);
+        // Surface redis connection problems instead of relying on ioredis'
+        // default unhandled-error printing; a broken stream client otherwise
+        // fails almost silently while broadcasts die (see guard below).
+        let lastRedisErrorLogAt = 0;
+        streamClient.on('error', (err) => {
+            const now = Date.now();
+            if (now - lastRedisErrorLogAt >= 30_000) {
+                lastRedisErrorLogAt = now;
+                warn({ module: 'websocket' }, `redis stream client error: ${err.message}`);
+            }
+        });
         io.adapter(createAdapter(streamClient, { maxLen: 200000, readCount: 2000 }));
         log({ module: 'websocket' }, 'Redis streams adapter enabled for multi-process support');
 
@@ -69,6 +81,12 @@ export function startSocket(app: Fastify) {
             lastReadOffset = offset;
             return origOnRawMessage(msg, offset);
         };
+        // ClusterAdapter.broadcast awaits the redis publish first and skips
+        // LOCAL delivery entirely when it rejects or hangs (e.g. REDIS_URL
+        // routed to a read-only replica → READONLY on every XADD). The guard
+        // makes the publish always settle so local sockets keep receiving
+        // update/ephemeral events even when redis is unhealthy.
+        guardClusterAdapterLocalDelivery(adapter, (message) => warn({ module: 'websocket' }, message));
         setInterval(async () => {
             try {
                 const info = await streamClient.xinfo("STREAM", "socket.io") as any[];
