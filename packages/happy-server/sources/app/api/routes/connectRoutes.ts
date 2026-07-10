@@ -9,7 +9,7 @@ import { githubDisconnect } from "@/app/github/githubDisconnect";
 import { Context } from "@/context";
 import { db } from "@/storage/db";
 import { INFERENCE_VENDORS } from "@/utils/inferenceVendors";
-import { inferCodeRepositoryPatProvider, isLikelyGithubPat } from "@/utils/validateGithubPat";
+import { isLikelyGithubPat } from "@/utils/validateGithubPat";
 
 export function connectRoutes(app: Fastify) {
 
@@ -360,7 +360,7 @@ export function connectRoutes(app: Fastify) {
         schema: {
             body: z.object({
                 token: z.string().refine(isLikelyGithubPat, {
-                    message: 'Token does not match a code repository PAT shape (ghp_/github_pat_/gho_/ghs_/glpat- + ≥20 chars)'
+                    message: 'Token does not match a GitHub PAT shape (ghp_/github_pat_/gho_/ghs_ + ≥20 chars)'
                 })
             }),
             response: {
@@ -384,8 +384,7 @@ export function connectRoutes(app: Fastify) {
             response: {
                 200: z.object({
                     hasPat: z.boolean(),
-                    updatedAt: z.string().nullable(),
-                    provider: z.enum(['github', 'gitlab']).nullable()
+                    updatedAt: z.string().nullable()
                 })
             }
         }
@@ -393,15 +392,11 @@ export function connectRoutes(app: Fastify) {
         const userId = request.userId;
         const row = await db.serviceAccountToken.findUnique({
             where: { accountId_vendor: { accountId: userId, vendor: GITHUB_PAT_VENDOR } },
-            select: { updatedAt: true, token: true }
+            select: { updatedAt: true }
         });
-        const plaintext = row
-            ? decryptString(['user', userId, 'vendors', GITHUB_PAT_VENDOR, 'token'], row.token)
-            : null;
         return reply.send({
             hasPat: !!row,
-            updatedAt: row ? row.updatedAt.toISOString() : null,
-            provider: plaintext ? inferCodeRepositoryPatProvider(plaintext) : null
+            updatedAt: row ? row.updatedAt.toISOString() : null
         });
     });
 
