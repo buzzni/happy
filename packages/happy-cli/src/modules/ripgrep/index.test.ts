@@ -23,6 +23,12 @@ describe('ripgrep low-level wrapper', () => {
         expect(result.exitCode).toBe(1)
         expect(result.stdout).toBe('')
     })
+
+    it('should not wait for stdin when no search path is provided', async () => {
+        const pattern = ['NoMatch', 'a8f04f9d', 'e12b'].join('-')
+        const result = await run([pattern], { timeoutMs: 1_000 })
+        expect(result.stdout).toBe('')
+    })
     
     it('should handle JSON output', async () => {
         const result = await run(['--json', 'describe', 'src/modules/ripgrep/index.test.ts'])
