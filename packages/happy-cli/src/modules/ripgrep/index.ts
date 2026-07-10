@@ -14,10 +14,7 @@ export interface RipgrepResult {
 
 export interface RipgrepOptions {
     cwd?: string
-    timeoutMs?: number
 }
-
-const DEFAULT_TIMEOUT_MS = 15_000;
 
 /**
  * Run ripgrep with the given arguments
@@ -30,16 +27,10 @@ export function run(args: string[], options?: RipgrepOptions): Promise<RipgrepRe
     return new Promise((resolve, reject) => {
         // Use cross-spawn so `node` resolves to `node.exe` on Windows (issue #1082).
         const child = crossSpawn('node', [RUNNER_PATH, JSON.stringify(args)], {
-            stdio: ['ignore', 'pipe', 'pipe'],
+            stdio: ['pipe', 'pipe', 'pipe'],
             cwd: options?.cwd,
             windowsHide: true,
         });
-        const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-        let timedOut = false;
-        const timeout = setTimeout(() => {
-            timedOut = true;
-            child.kill('SIGKILL');
-        }, timeoutMs);
 
         let stdout = '';
         let stderr = '';
@@ -53,20 +44,14 @@ export function run(args: string[], options?: RipgrepOptions): Promise<RipgrepRe
         });
 
         child.on('close', (code) => {
-            clearTimeout(timeout);
-            if (timedOut) {
-                reject(new Error(`Ripgrep timed out after ${timeoutMs}ms`));
-                return;
-            }
             resolve({
-                exitCode: code ?? 1,
+                exitCode: code || 0,
                 stdout,
                 stderr
             });
         });
 
         child.on('error', (err) => {
-            clearTimeout(timeout);
             reject(err);
         });
     });
