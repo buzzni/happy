@@ -168,6 +168,9 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
   }
 
   let session: ApiSessionClient;
+  // Assigned after handleKillSession is defined; re-attached on session swap
+  // so an offline-started session still exits when archived server-side.
+  let onSessionArchived: (() => void) | undefined;
   const { session: initialSession, reconnectionHandle } = setupOfflineReconnection({
     api,
     sessionTag,
@@ -176,6 +179,9 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
     response,
     onSessionSwap: (newSession) => {
       session = newSession;
+      if (onSessionArchived) {
+        newSession.on('archived', onSessionArchived);
+      }
     },
   });
   session = initialSession;
@@ -312,10 +318,12 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
   // Exit when the session is archived/deleted server-side: the web archive
   // button (ephemeral with reason='archived') or a fatal 404 from the
   // message sync. Without this the syncs stop but the process lingers.
-  session.on('archived', () => {
+  // Also attached to swapped sessions via onSessionSwap (offline start).
+  onSessionArchived = () => {
     log('Session archived server-side, terminating...');
     void handleKillSession();
-  });
+  };
+  session.on('archived', onSessionArchived);
 
   try {
     const started = await backend.startSession();

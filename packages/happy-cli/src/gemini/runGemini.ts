@@ -145,6 +145,9 @@ export async function runGemini(opts: {
   // When a swap is requested during processing, it's queued and applied after the current cycle
   let isProcessingMessage = false;
   let pendingSessionSwap: ApiSessionClient | null = null;
+  // Assigned after handleKillSession is defined; re-attached on session swap
+  // so an offline-started session still exits when archived server-side.
+  let onSessionArchived: ((archiveOpts?: { stampArchive?: boolean }) => void) | undefined;
 
   /**
    * Apply a pending session swap. Called between message processing cycles.
@@ -168,6 +171,11 @@ export async function runGemini(opts: {
     state,
     response,
     onSessionSwap: (newSession) => {
+      // Listener attach is safe immediately, even when the swap itself is
+      // queued below — the new session's socket is already live.
+      if (onSessionArchived) {
+        newSession.on('archived', onSessionArchived);
+      }
       // If we're processing a message, queue the swap for later
       // This prevents race conditions where session changes mid-processing
       if (isProcessingMessage) {
@@ -422,11 +430,13 @@ export async function runGemini(opts: {
   // Exit when the session is archived/deleted server-side: the web archive
   // button (ephemeral with reason='archived') or a fatal 404 from the
   // message sync. Without this the syncs stop but the process lingers.
-  // Mirrors the 'archived' listener in runClaude.
-  session.on('archived', (archiveOpts?: { stampArchive?: boolean }) => {
+  // Mirrors the 'archived' listener in runClaude. Also attached to swapped
+  // sessions via onSessionSwap (offline start → reconnect).
+  onSessionArchived = (archiveOpts?: { stampArchive?: boolean }) => {
     logger.debug('[Gemini] Session archived server-side, terminating...', archiveOpts);
     void handleKillSession(archiveOpts);
-  });
+  };
+  session.on('archived', onSessionArchived);
 
   //
   // Initialize Ink UI

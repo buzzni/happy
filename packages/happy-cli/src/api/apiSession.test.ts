@@ -73,7 +73,11 @@ vi.mock('@/modules/common/registerCommonHandlers', () => ({
 
 vi.mock('@/utils/time', () => ({
     backoff: mockBackoff,
-    delay: mockDelay
+    delay: mockDelay,
+    isSessionGoneError: (e: unknown) => {
+        const status = (e as { response?: { status?: number } })?.response?.status;
+        return status === 404 || status === 410;
+    }
 }));
 
 vi.mock('@/utils/lidState', () => ({
@@ -1466,19 +1470,156 @@ describe('ApiSessionClient v3 messages API migration', () => {
     it('triggers receive catch-up fetch on socket reconnect', async () => {
         new ApiSessionClient('fake-token', session);
 
-        mockAxiosGet.mockResolvedValueOnce({
-            data: {
-                messages: [],
-                hasMore: false
+        // The connect handler also captures the session-end event baseline,
+        // so route the mock by URL instead of counting raw calls.
+        mockAxiosGet.mockImplementation(async (url: unknown) => {
+            if (String(url).includes('/events')) {
+                return { data: { events: [], hasMore: false } };
             }
+            return { data: { messages: [], hasMore: false } };
         });
 
         emitSocketEvent('connect');
 
+        const messagesCalls = () => mockAxiosGet.mock.calls.filter((call) => String(call[0]).includes('/messages'));
         await waitForCheck(() => {
-            expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+            expect(messagesCalls()).toHaveLength(1);
         });
-        expect(mockAxiosGet.mock.calls[0][1].params.after_seq).toBe(0);
+        expect(messagesCalls()[0][1].params.after_seq).toBe(0);
+    });
+
+    describe('archived-while-disconnected recheck', () => {
+        function mockEventsAndMessages(opts: {
+            baselineSeq: number | null;
+            recheckEvents: Array<{ seq: number }>;
+        }) {
+            mockAxiosGet.mockImplementation(async (url: unknown, config?: { params?: { order?: string } }) => {
+                if (String(url).includes('/events')) {
+                    if (config?.params?.order === 'desc') {
+                        // Baseline capture on first connect
+                        if (opts.baselineSeq === null) {
+                            throw new Error('baseline fetch failed');
+                        }
+                        return {
+                            data: {
+                                events: opts.baselineSeq > 0
+                                    ? [{ id: 'e-base', eventType: 'session-end', seq: opts.baselineSeq, content: '', createdAt: 1, updatedAt: 1 }]
+                                    : [],
+                                hasMore: false
+                            }
+                        };
+                    }
+                    // Recheck on reconnect (after_seq cursor)
+                    return {
+                        data: {
+                            events: opts.recheckEvents.map((e, i) => ({
+                                id: `e-${i}`, eventType: 'session-end', seq: e.seq, content: '', createdAt: 2, updatedAt: 2
+                            })),
+                            hasMore: false
+                        }
+                    };
+                }
+                return { data: { messages: [], hasMore: false } };
+            });
+        }
+
+        function mockLookupActive(active: boolean) {
+            mockAxiosPost.mockImplementation(async (url: unknown) => {
+                if (String(url).includes('/lookup')) {
+                    return { data: { sessions: [{ id: 'test-session-id', active }] } };
+                }
+                return { data: { messages: [] } };
+            });
+        }
+
+        it('emits archived when a session-end appeared while disconnected and the session stayed inactive', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            const onArchived = vi.fn();
+            client.on('archived', onArchived);
+            mockEventsAndMessages({ baselineSeq: 5, recheckEvents: [{ seq: 6 }] });
+            mockLookupActive(false);
+
+            emitSocketEvent('connect');
+            await waitForCheck(() => {
+                expect((client as any).sessionEndSeqBaseline).toBe(5);
+            });
+
+            emitSocketEvent('connect'); // reconnect
+            await waitForCheck(() => {
+                expect(onArchived).toHaveBeenCalledTimes(1);
+            });
+            await client.close();
+        });
+
+        it('does not emit when the session was revived (active again) and advances the baseline', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            const onArchived = vi.fn();
+            client.on('archived', onArchived);
+            mockEventsAndMessages({ baselineSeq: 5, recheckEvents: [{ seq: 6 }] });
+            mockLookupActive(true);
+
+            emitSocketEvent('connect');
+            await waitForCheck(() => {
+                expect((client as any).sessionEndSeqBaseline).toBe(5);
+            });
+
+            emitSocketEvent('connect'); // reconnect
+            await waitForCheck(() => {
+                expect((client as any).sessionEndSeqBaseline).toBe(6);
+            });
+            expect(onArchived).not.toHaveBeenCalled();
+            await client.close();
+        });
+
+        it('honors suppressNextArchiveSignal exactly once', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            const onArchived = vi.fn();
+            client.on('archived', onArchived);
+            mockEventsAndMessages({ baselineSeq: 0, recheckEvents: [{ seq: 1 }] });
+            mockLookupActive(false);
+            client.suppressNextArchiveSignal();
+
+            emitSocketEvent('connect');
+            await waitForCheck(() => {
+                expect((client as any).sessionEndSeqBaseline).toBe(0);
+            });
+
+            emitSocketEvent('connect'); // reconnect
+            await waitForCheck(() => {
+                expect((client as any).sessionEndSeqBaseline).toBe(1);
+            });
+            expect(onArchived).not.toHaveBeenCalled();
+            expect((client as any).ignoreArchiveSignal).toBe(false);
+            await client.close();
+        });
+
+        it('disables rechecks when the baseline fetch fails (fail-safe)', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            const onArchived = vi.fn();
+            client.on('archived', onArchived);
+            mockEventsAndMessages({ baselineSeq: null, recheckEvents: [{ seq: 1 }] });
+            mockLookupActive(false);
+
+            emitSocketEvent('connect');
+            emitSocketEvent('connect'); // reconnect — baseline is null, recheck skipped
+            // Give the (skipped) recheck a tick to settle
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            expect(onArchived).not.toHaveBeenCalled();
+            expect((client as any).archiveRecheckPending).toBe(false);
+            await client.close();
+        });
+
+        it('suppresses keepalives while a recheck is pending', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            (client as any).archiveRecheckPending = true;
+            client.keepAlive(false, 'remote');
+            expect(mockSocket.volatile.emit).not.toHaveBeenCalled();
+
+            (client as any).archiveRecheckPending = false;
+            client.keepAlive(false, 'remote');
+            expect(mockSocket.volatile.emit).toHaveBeenCalledWith('session-alive', expect.objectContaining({ sid: 'test-session-id' }));
+            await client.close();
+        });
     });
 
     it('recovers a saved user message when the socket new-message update is missed', async () => {
@@ -1487,49 +1628,55 @@ describe('ApiSessionClient v3 messages API migration', () => {
         const onUserMessage = vi.fn();
         client.onUserMessage(onUserMessage);
 
-        mockAxiosGet.mockResolvedValueOnce({
-            data: {
-                messages: [],
-                hasMore: false
-            }
-        });
-
-        emitSocketEvent('connect');
-        await waitForCheck(() => {
-            expect(mockAxiosGet).toHaveBeenCalledTimes(1);
-        });
-
         const userMessage = {
             role: 'user',
             content: { type: 'text', text: 'missed socket update' }
         };
 
-        mockAxiosGet.mockResolvedValueOnce({
-            data: {
-                messages: [
-                    {
-                        id: 'msg-1',
-                        seq: 1,
-                        content: {
-                            t: 'encrypted',
-                            c: encryptContent(session, userMessage)
-                        },
-                        localId: null,
-                        createdAt: 1000,
-                        updatedAt: 1000
-                    }
-                ],
-                hasMore: false
+        // First messages fetch (connect catch-up) is empty; the poll then
+        // recovers the saved message. Events calls (session-end baseline)
+        // are routed separately so they don't consume messages responses.
+        const messagesResponses = [
+            { data: { messages: [], hasMore: false } },
+            {
+                data: {
+                    messages: [
+                        {
+                            id: 'msg-1',
+                            seq: 1,
+                            content: {
+                                t: 'encrypted',
+                                c: encryptContent(session, userMessage)
+                            },
+                            localId: null,
+                            createdAt: 1000,
+                            updatedAt: 1000
+                        }
+                    ],
+                    hasMore: false
+                }
             }
+        ];
+        mockAxiosGet.mockImplementation(async (url: unknown) => {
+            if (String(url).includes('/events')) {
+                return { data: { events: [], hasMore: false } };
+            }
+            return messagesResponses.shift() ?? { data: { messages: [], hasMore: false } };
+        });
+        const messagesCalls = () => mockAxiosGet.mock.calls.filter((call) => String(call[0]).includes('/messages'));
+
+        emitSocketEvent('connect');
+        await waitForCheck(() => {
+            expect(messagesCalls()).toHaveLength(1);
         });
 
         await vi.advanceTimersByTimeAsync(5000);
 
         await waitForCheck(() => {
-            expect(mockAxiosGet).toHaveBeenCalledTimes(2);
+            expect(messagesCalls()).toHaveLength(2);
             expect(onUserMessage).toHaveBeenCalledWith(userMessage);
         });
-        expect(mockAxiosGet.mock.calls[1][1].params.after_seq).toBe(0);
+        expect(messagesCalls()[1][1].params.after_seq).toBe(0);
         expect((client as any).lastSeq).toBe(1);
         await client.close();
     });

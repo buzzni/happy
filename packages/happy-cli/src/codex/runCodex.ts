@@ -192,6 +192,9 @@ export async function runCodex(opts: {
     let client!: CodexAppServerClient;
     let reasoningProcessor!: ReasoningProcessor;
     let abortInProgress: Promise<void> | null = null;
+    // Assigned after handleKillSession is defined; re-attached on session swap
+    // so an offline-started session still exits when archived server-side.
+    let onSessionArchived: ((archiveOpts?: { stampArchive?: boolean }) => void) | undefined;
     const { session: initialSession, reconnectionHandle } = setupOfflineReconnection({
         api,
         sessionTag,
@@ -203,6 +206,9 @@ export async function runCodex(opts: {
             // Update permission handler with new session to avoid stale reference
             if (permissionHandler) {
                 permissionHandler.updateSession(newSession);
+            }
+            if (onSessionArchived) {
+                newSession.on('archived', onSessionArchived);
             }
         }
     });
@@ -537,11 +543,13 @@ export async function runCodex(opts: {
     // Exit when the session is archived/deleted server-side: the web archive
     // button (ephemeral with reason='archived') or a fatal 404 from the
     // message sync. Without this the syncs stop but the process lingers.
-    // Mirrors the 'archived' listener in runClaude.
-    session.on('archived', (archiveOpts?: { stampArchive?: boolean }) => {
+    // Mirrors the 'archived' listener in runClaude. Also attached to swapped
+    // sessions via onSessionSwap (offline start → reconnect).
+    onSessionArchived = (archiveOpts?: { stampArchive?: boolean }) => {
         logger.debug('[Codex] Session archived server-side, terminating...', archiveOpts);
         void handleKillSession(archiveOpts);
-    });
+    };
+    session.on('archived', onSessionArchived);
 
     //
     // Initialize Ink UI
