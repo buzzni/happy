@@ -10,14 +10,16 @@
  * @module offlineSessionStub
  */
 
+import { EventEmitter } from 'node:events';
 import type { ApiSessionClient } from '@/api/apiSession';
 
 /**
  * Creates a no-op session stub for offline mode.
  *
- * The stub implements the ApiSessionClient interface with no-op methods,
- * allowing the application to continue running while offline. When reconnection
- * succeeds, the real session replaces this stub.
+ * The stub is a real EventEmitter (so `session.on('archived', ...)` and friends
+ * are safe to call before reconnection) with no-op implementations of every
+ * ApiSessionClient method the runners touch before a session swap. When
+ * reconnection succeeds, the real session replaces this stub.
  *
  * @param sessionTag - Unique session tag (used to create offline session ID)
  * @returns A no-op ApiSessionClient stub
@@ -32,11 +34,13 @@ import type { ApiSessionClient } from '@/api/apiSession';
  * ```
  */
 export function createOfflineSessionStub(sessionTag: string): ApiSessionClient {
-    return {
+    const stub = new EventEmitter();
+    return Object.assign(stub, {
         sessionId: `offline-${sessionTag}`,
         sendCodexMessage: () => {},
         sendAgentMessage: () => {},
         sendClaudeSessionMessage: () => {},
+        sendSessionProtocolMessage: () => {},
         keepAlive: () => {},
         sendSessionEvent: () => {},
         sendSessionDeath: () => {},
@@ -46,9 +50,18 @@ export function createOfflineSessionStub(sessionTag: string): ApiSessionClient {
         close: async () => {},
         updateMetadata: () => {},
         updateAgentState: () => {},
+        getMetadata: () => null,
         onUserMessage: () => {},
+        onFileEvent: () => {},
+        skipExistingMessages: () => {},
+        suppressNextArchiveSignal: () => {},
+        trackAttachmentDownload: () => {},
+        drainAttachmentsForUserMessage: async () => [],
+        // Must produce a SessionEnvelope — impossible offline, so throw; the
+        // only caller (codex fork backfill) wraps the call in try/catch.
+        uploadLocalImageAttachmentEnvelope: async () => { throw new Error('Session is offline: attachments unavailable'); },
         rpcHandlerManager: {
             registerHandler: () => {}
         }
-    } as unknown as ApiSessionClient;
+    }) as unknown as ApiSessionClient;
 }
