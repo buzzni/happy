@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { AxiosError, AxiosHeaders } from 'axios';
-import { createBackoff, isNonRetryableError } from './time';
+import { createBackoff, isNonRetryableError, isSessionGoneError } from './time';
 
 function axiosErrorWithStatus(status: number): AxiosError {
     const err = new AxiosError('Request failed with status code ' + status);
@@ -32,6 +32,23 @@ describe('isNonRetryableError', () => {
     it('keeps non-axios errors retryable (network, socket version-mismatch)', () => {
         expect(isNonRetryableError(new Error('Metadata version mismatch'))).toBe(false);
         expect(isNonRetryableError(new Error('ECONNRESET'))).toBe(false);
+    });
+});
+
+describe('isSessionGoneError', () => {
+    it('treats only 404/410 as "session gone"', () => {
+        expect(isSessionGoneError(axiosErrorWithStatus(404))).toBe(true);
+        expect(isSessionGoneError(axiosErrorWithStatus(410))).toBe(true);
+    });
+
+    it('does not treat other non-retryable 4xx as "session gone"', () => {
+        // 401/403/400 are non-retryable but may be environmental (expired
+        // token, proxy) — the session must stay resumable.
+        expect(isSessionGoneError(axiosErrorWithStatus(401))).toBe(false);
+        expect(isSessionGoneError(axiosErrorWithStatus(403))).toBe(false);
+        expect(isSessionGoneError(axiosErrorWithStatus(400))).toBe(false);
+        expect(isSessionGoneError(axiosErrorWithStatus(500))).toBe(false);
+        expect(isSessionGoneError(new Error('ECONNRESET'))).toBe(false);
     });
 });
 

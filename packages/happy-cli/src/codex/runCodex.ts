@@ -192,6 +192,9 @@ export async function runCodex(opts: {
     let client!: CodexAppServerClient;
     let reasoningProcessor!: ReasoningProcessor;
     let abortInProgress: Promise<void> | null = null;
+    // Assigned after handleKillSession is defined; re-attached on session swap
+    // so an offline-started session still exits when archived server-side.
+    let onSessionArchived: ((archiveOpts?: { stampArchive?: boolean }) => void) | undefined;
     const { session: initialSession, reconnectionHandle } = setupOfflineReconnection({
         api,
         sessionTag,
@@ -203,6 +206,9 @@ export async function runCodex(opts: {
             // Update permission handler with new session to avoid stale reference
             if (permissionHandler) {
                 permissionHandler.updateSession(newSession);
+            }
+            if (onSessionArchived) {
+                newSession.on('archived', onSessionArchived);
             }
         }
     });
@@ -484,22 +490,27 @@ export async function runCodex(opts: {
      * Abort stops the current inference but keeps the session alive.
      * Kill terminates the entire process.
      */
-    const handleKillSession = async () => {
+    const handleKillSession = async (killOpts?: { stampArchive?: boolean }) => {
         logger.debug('[Codex] Kill session requested - terminating process');
         await handleAbort();
         logger.debug('[Codex] Abort completed, proceeding with termination');
 
         try {
-            // Update lifecycle state to archived before closing
+            // Update lifecycle state to archived before closing —
+            // unless the caller says the session may still be alive
+            // server-side (sync-fatal 401/403), in which case leave the
+            // metadata alone so the session stays resumable.
             if (session) {
-                session.updateMetadata((currentMetadata) => ({
-                    ...currentMetadata,
-                    lifecycleState: 'archived',
-                    lifecycleStateSince: Date.now(),
-                    archivedBy: 'cli',
-                    archiveReason: 'User terminated'
-                }));
-                
+                if (killOpts?.stampArchive ?? true) {
+                    session.updateMetadata((currentMetadata) => ({
+                        ...currentMetadata,
+                        lifecycleState: 'archived',
+                        lifecycleStateSince: Date.now(),
+                        archivedBy: 'cli',
+                        archiveReason: 'User terminated'
+                    }));
+                }
+
                 // Send session death message
                 session.sendSessionDeath();
                 await session.flush();
@@ -528,6 +539,17 @@ export async function runCodex(opts: {
     session.rpcHandlerManager.registerHandler('abort', handleAbort);
 
     registerKillSessionHandler(session.rpcHandlerManager, handleKillSession);
+
+    // Exit when the session is archived/deleted server-side: the web archive
+    // button (ephemeral with reason='archived') or a fatal 404 from the
+    // message sync. Without this the syncs stop but the process lingers.
+    // Mirrors the 'archived' listener in runClaude. Also attached to swapped
+    // sessions via onSessionSwap (offline start → reconnect).
+    onSessionArchived = (archiveOpts?: { stampArchive?: boolean }) => {
+        logger.debug('[Codex] Session archived server-side, terminating...', archiveOpts);
+        void handleKillSession(archiveOpts);
+    };
+    session.on('archived', onSessionArchived);
 
     //
     // Initialize Ink UI

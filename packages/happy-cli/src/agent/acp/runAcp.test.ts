@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => {
   let killHandler: (() => Promise<void>) | null = null;
 
   const mockSession = {
+    on: vi.fn(),
     onUserMessage: vi.fn((handler: (message: any) => void) => {
       userMessageHandler = handler;
     }),

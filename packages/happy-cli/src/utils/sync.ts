@@ -1,4 +1,5 @@
 import { backoff } from "@/utils/time";
+import { logger } from "@/ui/logger";
 
 export class InvalidateSync {
     private _invalidated = false;
@@ -65,7 +66,10 @@ export class InvalidateSync {
         } catch (e) {
             // backoff only throws for permanently non-retryable errors (e.g. a
             // 404 after the session was archived/deleted). Stop syncing instead
-            // of leaving an unhandled rejection or spinning forever.
+            // of leaving an unhandled rejection or spinning forever. The log
+            // matters for instances constructed without onError — they stop
+            // silently otherwise.
+            logger.debug('[InvalidateSync] permanently stopped on non-retryable error:', e);
             this._notifyPendings();
             this._stopped = true;
             this._onError?.(e);

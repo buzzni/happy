@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events'
 import { io, Socket } from 'socket.io-client'
 import { AgentState, ClientToServerEvents, FileEventMessage, FileEventMessageSchema, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
 import { decodeBase64, decryptBlob, decrypt, encodeBase64, encrypt, encryptBlob } from './encryption';
-import { backoff, delay } from '@/utils/time';
+import { backoff, delay, isSessionGoneError } from '@/utils/time';
 import { configuration } from '@/configuration';
 import { RawJSONLines } from '@/claude/types';
 import { randomUUID } from 'node:crypto';
@@ -64,6 +64,25 @@ type V3SessionMessage = {
 type V3GetSessionMessagesResponse = {
     messages: V3SessionMessage[];
     hasMore: boolean;
+};
+
+type V3GetSessionEventsResponse = {
+    events: Array<{
+        id: string;
+        eventType: string;
+        seq: number;
+        content: unknown;
+        createdAt: number;
+        updatedAt: number;
+    }>;
+    hasMore: boolean;
+};
+
+type V2SessionLookupResponse = {
+    sessions: Array<{
+        id: string;
+        active: boolean;
+    }>;
 };
 
 type V3PostSessionMessagesResponse = {
@@ -230,6 +249,14 @@ export class ApiSessionClient extends EventEmitter {
     private reconnectInterval: NodeJS.Timeout | null = null;
     private ignoreArchiveSignal = false;
     private syncFatalHandled = false;
+    // Durable session-end event log baseline, captured on first connect.
+    // null = baseline unavailable (fetch failed) → reconnect rechecks disabled.
+    private sessionEndSeqBaseline: number | null = null;
+    private hasConnectedOnce = false;
+    // While a reconnect recheck is deciding whether the session was archived
+    // during the disconnect, keepalives are suppressed — they set active=true
+    // server-side and would mask the very state the recheck is reading.
+    private archiveRecheckPending = false;
     private skipInitialMessages = false;
     private skipExistingMessagesThroughSeq: number | null = null;
     private skippedInitialMessageSeqs = new Set<number>();
@@ -315,6 +342,18 @@ export class ApiSessionClient extends EventEmitter {
             this.rpcHandlerManager.onSocketConnect(this.socket);
             this.startReceivePolling();
             this.receiveSync.invalidate();
+            // The 'archived' ephemeral is transient: archived-while-disconnected
+            // is invisible to the handlers below (and archive keeps the session
+            // row, so the message sync never 404s either). The durable
+            // session-end event log covers that gap — baseline it on first
+            // connect, recheck it on every reconnect.
+            if (!this.hasConnectedOnce) {
+                this.hasConnectedOnce = true;
+                void this.initSessionEndBaseline();
+            } else {
+                this.archiveRecheckPending = true;
+                void this.recheckArchivedWhileDisconnected();
+            }
         })
 
         // Set up global RPC request handler
@@ -750,8 +789,103 @@ export class ApiSessionClient extends EventEmitter {
             return;
         }
         this.syncFatalHandled = true;
-        logger.debug(`[SOCKET] ${which} sync stopped on non-retryable error, exiting session:`, error);
-        this.emit('archived');
+        // 404/410 → the session row is gone server-side; stamping archive
+        // metadata is what the user expects (and is a no-op anyway). Other
+        // non-retryable 4xx (401/403/400) may be environmental — an expired
+        // token or a misbehaving proxy — so still tear down (this sync
+        // direction is dead either way) but tell listeners NOT to mark the
+        // session archived, keeping it resumable once the issue clears.
+        const sessionGone = isSessionGoneError(error);
+        logger.debug(`[SOCKET] ${which} sync stopped on non-retryable error (sessionGone=${sessionGone}), exiting session:`, error);
+        this.emit('archived', { stampArchive: sessionGone });
+    }
+
+    /**
+     * Capture the newest durable session-end event seq at startup. Everything
+     * at or below this seq predates this process (previous runs' graceful
+     * deaths, an old archive before a resume) and must not trigger an exit.
+     * Anything above it appeared while THIS process is alive — and since we
+     * only send our own session-end during cleanup, a newer event means an
+     * external archive/kill happened while our socket was down.
+     * (specs/followups/session-archive-ephemeral-miss.md)
+     */
+    private async initSessionEndBaseline() {
+        try {
+            const response = await axios.get<V3GetSessionEventsResponse>(
+                `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/events`,
+                {
+                    params: { type: 'session-end', order: 'desc', limit: 1 },
+                    headers: this.authHeaders(),
+                    timeout: 30000
+                }
+            );
+            const events = Array.isArray(response.data.events) ? response.data.events : [];
+            this.sessionEndSeqBaseline = events.length > 0 ? events[0].seq : 0;
+            logger.debug('[API] session-end baseline captured', { baseline: this.sessionEndSeqBaseline });
+        } catch (error) {
+            // Leave the baseline null — reconnect rechecks stay disabled, which
+            // fails safe (behaves exactly like before this feature existed).
+            logger.debug('[API] Failed to capture session-end baseline, reconnect recheck disabled:', error);
+        }
+    }
+
+    /**
+     * After a reconnect, decide whether the session was archived/killed while
+     * our socket was down (the transient 'archived' ephemeral would have been
+     * missed). A session-end event newer than our baseline says someone ended
+     * the session during our lifetime; `active === false` confirms it stayed
+     * dead (an active session means it was legitimately revived — e.g. control
+     * transfer — and the event is stale). Keepalives are gated via
+     * archiveRecheckPending so our own presence pings can't flip active=true
+     * back on mid-decision.
+     */
+    private async recheckArchivedWhileDisconnected() {
+        try {
+            if (this.sessionEndSeqBaseline === null || this.syncFatalHandled) {
+                return;
+            }
+            const eventsResponse = await axios.get<V3GetSessionEventsResponse>(
+                `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/events`,
+                {
+                    params: { type: 'session-end', after_seq: this.sessionEndSeqBaseline, limit: 100 },
+                    headers: this.authHeaders(),
+                    timeout: 30000
+                }
+            );
+            const events = Array.isArray(eventsResponse.data.events) ? eventsResponse.data.events : [];
+            if (events.length === 0) {
+                return;
+            }
+            // Advance the baseline so a stale (revived) event can't re-trigger
+            // on every later reconnect.
+            this.sessionEndSeqBaseline = events.reduce((max, e) => Math.max(max, e.seq), this.sessionEndSeqBaseline);
+
+            const lookupResponse = await axios.post<V2SessionLookupResponse>(
+                `${configuration.serverUrl}/v2/sessions/lookup`,
+                { ids: [this.sessionId] },
+                { headers: this.authHeaders(), timeout: 30000 }
+            );
+            const record = Array.isArray(lookupResponse.data.sessions)
+                ? lookupResponse.data.sessions.find((s) => s.id === this.sessionId)
+                : undefined;
+            if (record?.active === true) {
+                logger.debug('[API] session-end seen during disconnect but session is active again (revived), ignoring');
+                return;
+            }
+            if (this.ignoreArchiveSignal) {
+                logger.debug('[API] Session archived while disconnected but suppressed for reconnect');
+                this.ignoreArchiveSignal = false;
+                return;
+            }
+            logger.debug('[API] Session was archived/killed while disconnected, exiting...');
+            this.emit('archived');
+        } catch (error) {
+            // Recheck is best-effort: on any failure keep running (same
+            // behavior as before this feature).
+            logger.debug('[API] archived-while-disconnected recheck failed:', error);
+        } finally {
+            this.archiveRecheckPending = false;
+        }
     }
 
     private async flushOutbox() {
@@ -1018,6 +1152,12 @@ export class ApiSessionClient extends EventEmitter {
     keepAlive(thinking: boolean, mode: 'local' | 'remote') {
         if (process.env.DEBUG) { // too verbose for production
             logger.debug(`[API] Sending keep alive message: ${thinking}`);
+        }
+        // A reconnect recheck is reading the server-side `active` flag to
+        // decide if we were archived while disconnected — a keepalive now
+        // would set active=true and mask it. Skip; the next tick resumes.
+        if (this.archiveRecheckPending) {
+            return;
         }
         this.currentThinking = thinking;
         this.currentMode = mode;
