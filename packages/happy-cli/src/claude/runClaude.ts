@@ -613,10 +613,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         });
     });
 
-    // Exit when session is archived from web/mobile
-    session.on('archived', () => {
-        logger.debug('[loop] Session archived from web/mobile, cleaning up...');
-        cleanup();
+    // Exit when the session is archived from web/mobile, or when the message
+    // sync dies on a non-retryable error (onSyncFatal). stampArchive=false
+    // means the session itself may still be alive server-side (e.g. a 401/403
+    // blip) — exit without marking it archived so it stays resumable.
+    session.on('archived', (opts?: { stampArchive?: boolean }) => {
+        logger.debug('[loop] Session archived, cleaning up...', opts);
+        cleanup({ archive: opts?.stampArchive ?? true });
     });
 
     // Handle file events — each download promise resolves to its own decoded

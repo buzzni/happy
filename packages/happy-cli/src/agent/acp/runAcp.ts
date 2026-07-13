@@ -883,11 +883,20 @@ export async function runAcp(opts: {
   }
 
   session.rpcHandlerManager.registerHandler('abort', handleAbort);
-  registerKillSessionHandler(session.rpcHandlerManager, async () => {
+  const handleKillSession = async () => {
     shouldExit = true;
     messageQueue.close();
     clearPendingTurn(new Error('Session terminated'));
     await handleAbort();
+  };
+  registerKillSessionHandler(session.rpcHandlerManager, handleKillSession);
+
+  // Exit when the session is archived/deleted server-side: the web archive
+  // button (ephemeral with reason='archived') or a fatal 404 from the
+  // message sync. Without this the syncs stop but the process lingers.
+  session.on('archived', () => {
+    logger.debug('[ACP] Session archived server-side, terminating...');
+    void handleKillSession();
   });
 
   try {

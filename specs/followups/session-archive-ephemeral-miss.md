@@ -51,3 +51,20 @@ Ship the retry-loop fix first (it fully resolves the observed incident: a single
 dead session producing ~757k 404 retries / ~90MB of logs). Revisit this
 ephemeral-miss edge case as a separate change once production confirms how often
 disconnect-at-archive actually coincides.
+
+## Related smaller gaps (also deferred)
+
+- **Offline-start session swap loses the `archived` listener.** The Codex /
+  Gemini / OpenClaw / ACP runners attach their `session.on('archived', ...)`
+  listener once, to the session in hand at startup. If the runner started
+  offline (stub session via `setupOfflineReconnection`) and later swapped to a
+  real session, the listener is not re-attached to the swapped session. Narrow
+  window (offline start + later server-side archive), and Gemini's queued-swap
+  logic makes threading the listener through `onSessionSwap` non-trivial — do
+  it together with the reconnect-recheck fix above.
+- **`presence/timeout.ts` emits no `reason` and stays user-scoped-only.** The
+  idle-timeout job flips `active=false` without notifying the session-scoped
+  socket. This is fine today: the timeout only fires after ~10 min without
+  keepalives, i.e. when the CLI is dead or disconnected — a session-scoped
+  ephemeral would have no one to reach anyway. Noted so nobody "fixes" it into
+  archiving live sessions.

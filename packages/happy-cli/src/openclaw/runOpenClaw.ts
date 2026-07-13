@@ -301,11 +301,20 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
   session.rpcHandlerManager.registerHandler('openclaw-retry-pairing', async () => {
     backend.retryConnect();
   });
-  registerKillSessionHandler(session.rpcHandlerManager, async () => {
+  const handleKillSession = async () => {
     shouldExit = true;
     messageQueue.close();
     clearPendingTurn(new Error('Session terminated'));
     await handleAbort();
+  };
+  registerKillSessionHandler(session.rpcHandlerManager, handleKillSession);
+
+  // Exit when the session is archived/deleted server-side: the web archive
+  // button (ephemeral with reason='archived') or a fatal 404 from the
+  // message sync. Without this the syncs stop but the process lingers.
+  session.on('archived', () => {
+    log('Session archived server-side, terminating...');
+    void handleKillSession();
   });
 
   try {

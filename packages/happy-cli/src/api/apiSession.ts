@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events'
 import { io, Socket } from 'socket.io-client'
 import { AgentState, ClientToServerEvents, FileEventMessage, FileEventMessageSchema, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
 import { decodeBase64, decryptBlob, decrypt, encodeBase64, encrypt, encryptBlob } from './encryption';
-import { backoff, delay } from '@/utils/time';
+import { backoff, delay, isSessionGoneError } from '@/utils/time';
 import { configuration } from '@/configuration';
 import { RawJSONLines } from '@/claude/types';
 import { randomUUID } from 'node:crypto';
@@ -750,8 +750,15 @@ export class ApiSessionClient extends EventEmitter {
             return;
         }
         this.syncFatalHandled = true;
-        logger.debug(`[SOCKET] ${which} sync stopped on non-retryable error, exiting session:`, error);
-        this.emit('archived');
+        // 404/410 → the session row is gone server-side; stamping archive
+        // metadata is what the user expects (and is a no-op anyway). Other
+        // non-retryable 4xx (401/403/400) may be environmental — an expired
+        // token or a misbehaving proxy — so still tear down (this sync
+        // direction is dead either way) but tell listeners NOT to mark the
+        // session archived, keeping it resumable once the issue clears.
+        const sessionGone = isSessionGoneError(error);
+        logger.debug(`[SOCKET] ${which} sync stopped on non-retryable error (sessionGone=${sessionGone}), exiting session:`, error);
+        this.emit('archived', { stampArchive: sessionGone });
     }
 
     private async flushOutbox() {

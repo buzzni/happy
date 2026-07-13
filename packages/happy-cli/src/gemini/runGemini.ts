@@ -378,20 +378,24 @@ export async function runGemini(opts: {
     }
   }
 
-  const handleKillSession = async () => {
+  const handleKillSession = async (killOpts?: { stampArchive?: boolean }) => {
     logger.debug('[Gemini] Kill session requested - terminating process');
     await handleAbort();
     logger.debug('[Gemini] Abort completed, proceeding with termination');
 
     try {
       if (session) {
-        session.updateMetadata((currentMetadata) => ({
-          ...currentMetadata,
-          lifecycleState: 'archived',
-          lifecycleStateSince: Date.now(),
-          archivedBy: 'cli',
-          archiveReason: 'User terminated'
-        }));
+        // Skip the archive stamp when the session may still be alive
+        // server-side (sync-fatal 401/403) so it stays resumable.
+        if (killOpts?.stampArchive ?? true) {
+          session.updateMetadata((currentMetadata) => ({
+            ...currentMetadata,
+            lifecycleState: 'archived',
+            lifecycleStateSince: Date.now(),
+            archivedBy: 'cli',
+            archiveReason: 'User terminated'
+          }));
+        }
 
         session.sendSessionDeath();
         await session.flush();
@@ -414,6 +418,15 @@ export async function runGemini(opts: {
 
   session.rpcHandlerManager.registerHandler('abort', handleAbort);
   registerKillSessionHandler(session.rpcHandlerManager, handleKillSession);
+
+  // Exit when the session is archived/deleted server-side: the web archive
+  // button (ephemeral with reason='archived') or a fatal 404 from the
+  // message sync. Without this the syncs stop but the process lingers.
+  // Mirrors the 'archived' listener in runClaude.
+  session.on('archived', (archiveOpts?: { stampArchive?: boolean }) => {
+    logger.debug('[Gemini] Session archived server-side, terminating...', archiveOpts);
+    void handleKillSession(archiveOpts);
+  });
 
   //
   // Initialize Ink UI

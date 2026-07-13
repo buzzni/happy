@@ -27,6 +27,22 @@ export function isNonRetryableError(e: unknown): boolean {
     return false;
 }
 
+/**
+ * True when the server says the requested resource no longer exists (404/410)
+ * — e.g. the session row was deleted or the endpoint is gone for good. This is
+ * a stronger claim than {@link isNonRetryableError}: a 401/403/400 is also
+ * non-retryable, but the session itself may still be alive and the failure
+ * environmental (expired token, misbehaving proxy), so callers should not
+ * treat those as "the session is gone".
+ */
+export function isSessionGoneError(e: unknown): boolean {
+    if (axios.isAxiosError(e)) {
+        const status = e.response?.status;
+        return status === 404 || status === 410;
+    }
+    return false;
+}
+
 export function exponentialBackoffDelay(currentFailureCount: number, minDelay: number, maxDelay: number, maxFailureCount: number) {
     let maxDelayRet = minDelay + ((maxDelay - minDelay) / maxFailureCount) * Math.min(currentFailureCount, maxFailureCount);
     return Math.round(Math.random() * maxDelayRet);
