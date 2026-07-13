@@ -169,7 +169,7 @@ export type EphemeralEvent = {
     active: boolean;
     activeAt: number;
     thinking?: boolean;
-    reason?: 'session-socket-disconnected';
+    reason?: 'session-socket-disconnected' | 'archived';
 } | {
     type: 'machine-activity';
     id: string;
@@ -524,7 +524,7 @@ export function buildSessionActivityEphemeral(
     active: boolean,
     activeAt: number,
     thinking?: boolean,
-    reason?: 'session-socket-disconnected',
+    reason?: 'session-socket-disconnected' | 'archived',
 ): EphemeralPayload {
     const payload: EphemeralPayload = {
         type: 'activity',

@@ -229,6 +229,7 @@ export class ApiSessionClient extends EventEmitter {
     private encryptionVariant: 'legacy' | 'dataKey';
     private reconnectInterval: NodeJS.Timeout | null = null;
     private ignoreArchiveSignal = false;
+    private syncFatalHandled = false;
     private skipInitialMessages = false;
     private skipExistingMessagesThroughSeq: number | null = null;
     private skippedInitialMessageSeqs = new Set<number>();
@@ -271,8 +272,8 @@ export class ApiSessionClient extends EventEmitter {
         this.agentStateVersion = session.agentStateVersion;
         this.encryptionKey = session.encryptionKey;
         this.encryptionVariant = session.encryptionVariant;
-        this.sendSync = new InvalidateSync(() => this.flushOutbox());
-        this.receiveSync = new InvalidateSync(() => this.fetchMessages());
+        this.sendSync = new InvalidateSync(() => this.flushOutbox(), (e) => this.onSyncFatal('send', e));
+        this.receiveSync = new InvalidateSync(() => this.fetchMessages(), (e) => this.onSyncFatal('receive', e));
 
         // Initialize RPC handler manager
         this.rpcHandlerManager = new RpcHandlerManager({
@@ -397,6 +398,28 @@ export class ApiSessionClient extends EventEmitter {
                 }
             } catch (error) {
                 logger.debug('[SOCKET] [UPDATE] [ERROR] Error handling update', { error });
+            }
+        });
+
+        // Session archived from web/mobile via the /archive endpoint. That path
+        // flips server-side `active` but does not stamp lifecycleState into the
+        // (E2E-encrypted) metadata, so the metadata-based archive trigger above
+        // never fires for it. The server now sends an activity ephemeral with
+        // reason='archived' to this session's connection — exit on it so we stop
+        // instead of retrying the now-404 message endpoint forever.
+        this.socket.on('ephemeral', (data) => {
+            try {
+                if (data?.type === 'activity' && data.id === this.sessionId && data.reason === 'archived') {
+                    if (this.ignoreArchiveSignal) {
+                        logger.debug('[SOCKET] Session archived (ephemeral) but suppressed for reconnect');
+                        this.ignoreArchiveSignal = false;
+                    } else {
+                        logger.debug('[SOCKET] Session archived (ephemeral), exiting...');
+                        this.emit('archived');
+                    }
+                }
+            } catch (error) {
+                logger.debug('[SOCKET] [EPHEMERAL] [ERROR] Error handling ephemeral', { error });
             }
         });
 
@@ -712,6 +735,23 @@ export class ApiSessionClient extends EventEmitter {
         if (!this.receivePollInterval) return;
         clearInterval(this.receivePollInterval);
         this.receivePollInterval = null;
+    }
+
+    /**
+     * A message sync (send/receive) hit a permanently non-retryable error —
+     * almost always a 404 after the session was deleted/archived server-side.
+     * The InvalidateSync has already stopped itself; tear the whole session down
+     * (same path as the archive signal) rather than leaving the process alive
+     * with one dead sync direction silently dropping messages.
+     */
+    private onSyncFatal(which: 'send' | 'receive', error: unknown) {
+        // Both syncs can fail near-simultaneously; only tear down once.
+        if (this.syncFatalHandled) {
+            return;
+        }
+        this.syncFatalHandled = true;
+        logger.debug(`[SOCKET] ${which} sync stopped on non-retryable error, exiting session:`, error);
+        this.emit('archived');
     }
 
     private async flushOutbox() {

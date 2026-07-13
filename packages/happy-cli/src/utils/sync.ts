@@ -5,10 +5,12 @@ export class InvalidateSync {
     private _invalidatedDouble = false;
     private _stopped = false;
     private _command: () => Promise<void>;
+    private _onError?: (e: unknown) => void;
     private _pendings: (() => void)[] = [];
 
-    constructor(command: () => Promise<void>) {
+    constructor(command: () => Promise<void>, onError?: (e: unknown) => void) {
         this._command = command;
+        this._onError = onError;
     }
 
     invalidate() {
@@ -53,12 +55,22 @@ export class InvalidateSync {
 
 
     private _doSync = async () => {
-        await backoff(async () => {
-            if (this._stopped) {
-                return;
-            }
-            await this._command();
-        });
+        try {
+            await backoff(async () => {
+                if (this._stopped) {
+                    return;
+                }
+                await this._command();
+            });
+        } catch (e) {
+            // backoff only throws for permanently non-retryable errors (e.g. a
+            // 404 after the session was archived/deleted). Stop syncing instead
+            // of leaving an unhandled rejection or spinning forever.
+            this._notifyPendings();
+            this._stopped = true;
+            this._onError?.(e);
+            return;
+        }
         if (this._stopped) {
             this._notifyPendings();
             return;

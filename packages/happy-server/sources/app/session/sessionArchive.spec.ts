@@ -24,12 +24,13 @@ vi.mock("@/storage/inTx", () => ({
 // Mock the event router — factory cannot reference outer variables because
 // vi.mock is hoisted. Access the spy via the imported module after setup.
 vi.mock("@/app/events/eventRouter", () => ({
-    buildSessionActivityEphemeral: vi.fn((sessionId: string, active: boolean, activeAt: number, thinking?: boolean) => ({
+    buildSessionActivityEphemeral: vi.fn((sessionId: string, active: boolean, activeAt: number, thinking?: boolean, reason?: string) => ({
         type: "activity",
         id: sessionId,
         active,
         activeAt,
         thinking,
+        ...(reason ? { reason } : {}),
     })),
     eventRouter: {
         emitEphemeral: vi.fn(),
@@ -114,9 +115,11 @@ describe("sessionArchive", () => {
         expect(call.data.lastActiveAt).toBeInstanceOf(Date);
     });
 
-    it("emits a session-activity(active=false) ephemeral to user-scoped-only after archiving", async () => {
+    it("emits a session-activity(active=false, reason=archived) ephemeral to all-interested-in-session after archiving", async () => {
         // Why: clients need the real-time push to remove the session from their
-        // active list immediately. The recipientFilter must be user-scoped-only
+        // active list immediately, AND a still-running CLI on this session must
+        // receive it (session-scoped room) with reason='archived' so it shuts
+        // down gracefully instead of retrying the now-404 message endpoint.
         // (mirrors the socket session-end handler behaviour documented in spec).
         const session = makeSession({ id: "session-1", accountId: "user-1", active: true });
         const updateMock = vi.fn().mockResolvedValue({ ...session, active: false });
@@ -132,9 +135,10 @@ describe("sessionArchive", () => {
         expect(vi.mocked(eventRouter.emitEphemeral)).toHaveBeenCalledOnce();
         const emitArgs = vi.mocked(eventRouter.emitEphemeral).mock.calls[0][0];
         expect(emitArgs.userId).toBe("user-1");
-        expect(emitArgs.recipientFilter).toEqual({ type: "user-scoped-only" });
+        expect(emitArgs.recipientFilter).toEqual({ type: "all-interested-in-session", sessionId: "session-1" });
         expect(emitArgs.payload.active).toBe(false);
         expect(emitArgs.payload.id).toBe("session-1");
+        expect(emitArgs.payload.reason).toBe("archived");
     });
 
     it("persists a SESSION_END event after archiving an active session", async () => {

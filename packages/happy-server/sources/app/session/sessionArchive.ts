@@ -47,11 +47,15 @@ export async function sessionArchive(ctx: Context, sessionId: string): Promise<b
 
         // After transaction commits, emit ephemeral update and persist session-end event
         afterTx(tx, () => {
-            const sessionActivity = buildSessionActivityEphemeral(sessionId, false, now.getTime(), false);
+            // reason: 'archived' + session-scoped delivery so a still-running CLI on
+            // this session learns it was archived and shuts down gracefully, instead
+            // of hammering the (now 404) message endpoint forever. 'all-interested-in-session'
+            // unions the session room with user-scoped, so the app is still notified too.
+            const sessionActivity = buildSessionActivityEphemeral(sessionId, false, now.getTime(), false, 'archived');
             eventRouter.emitEphemeral({
                 userId: ctx.uid,
                 payload: sessionActivity,
-                recipientFilter: { type: 'user-scoped-only' }
+                recipientFilter: { type: 'all-interested-in-session', sessionId }
             });
 
             persistSessionEvent({
