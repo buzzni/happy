@@ -30,6 +30,12 @@ export function startSocket(app: Fastify) {
         pingInterval: 15000,
         path: '/v1/updates',
         allowUpgrades: true,
+        // engine.io's default behavior is to `socket.end()` any upgrade whose
+        // path is not its own (`/v1/updates`) after `destroyUpgradeTimeout`.
+        // The preview WebSocket relay (previewWebSocketRelay.ts) owns
+        // `/v1/preview/:machineId/:port/*` upgrades on the same HTTP server, so
+        // we opt out of engine.io tearing those foreign upgrades down.
+        destroyUpgrade: false,
         upgradeTimeout: 10000,
         connectTimeout: 20000,
         serveClient: false, // Don't serve the client files

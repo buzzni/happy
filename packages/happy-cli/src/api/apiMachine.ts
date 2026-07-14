@@ -22,6 +22,7 @@ import {
     type StopSessionResult,
 } from '@/daemon/sessionIdleReaper';
 import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
+import { PreviewWsProxy } from '@/daemon/previewWsProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import packageJson from '../../package.json';
 import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
@@ -71,6 +72,15 @@ interface ServerToDaemonEvents {
         },
         ack: (response: unknown) => void,
     ) => void;
+    // Preview WebSocket relay (raw byte tunnel). Counterpart to
+    // proxy-http-request for upgrades (noVNC/websockify, ws, HMR). See
+    // daemon/previewWsProxy.ts.
+    'proxy-ws-open': (
+        params: { tunnelId: string; port: number; dataB64: string },
+        ack: (response: unknown) => void,
+    ) => void;
+    'proxy-ws-data': (payload: { tunnelId: string; dataB64: string }) => void;
+    'proxy-ws-close': (payload: { tunnelId: string }) => void;
     // specs/remote-terminal/ Phase 2 — server forwards terminal control
     // events here. `params` / `data` payloads are E2EE between the
     // daemon and the originating client; happy-server only routes them.
@@ -138,6 +148,9 @@ interface DaemonToServerEvents {
     // to the client without inspection.
     'terminal-frame': (msg: { sessionId: string; data: string }) => void;
     'terminal-closed': (msg: { sessionId: string; code: number; signal: number | null }) => void;
+    // Preview WebSocket relay — upstream→browser bytes and tunnel teardown.
+    'proxy-ws-data': (payload: { tunnelId: string; dataB64: string }) => void;
+    'proxy-ws-close': (payload: { tunnelId: string }) => void;
 }
 
 type MachineRpcHandlers = {
@@ -176,6 +189,8 @@ export class ApiMachineClient {
     // happyCliVersion 을 갱신한다.
     private lastKnownCliVersion: string | null = null;
     private rpcHandlerManager: RpcHandlerManager;
+    // Live raw-TCP tunnels for preview WebSocket upgrades (previewWsProxy.ts).
+    private previewWsProxy: PreviewWsProxy | null = null;
     private resumeSessionHandler: ((sessionId: string, options?: { model?: string; permissionMode?: string }) => Promise<SpawnSessionResult>) | null = null;
     // specs/remote-terminal-cwd-fallback/ — cached so the
     // terminal-open-fwd handler can run validatePath against the same
@@ -762,6 +777,9 @@ export class ApiMachineClient {
             logger.debug(`[API MACHINE] Disconnected from server — reason: ${reason}`);
             this.rpcHandlerManager.onSocketDisconnect();
             this.stopKeepAlive();
+            // Tear down any live preview WebSocket tunnels — the relay path is
+            // dead once the daemon socket drops, so leave no orphan TCP sockets.
+            this.previewWsProxy?.closeAll();
             // specs/remote-terminal/ Phase 2 — relay path is broken once
             // the socket drops, and the server's session map entry now
             // points at a dead socket. Kill local PTYs so no orphans
@@ -814,6 +832,23 @@ export class ApiMachineClient {
                 }
             },
         );
+
+        // Preview WebSocket relay — raw byte tunnel for upgrades (noVNC /
+        // websockify, ws, HMR). Bytes flow verbatim so the upstream performs the
+        // actual WS handshake with the browser end-to-end. See previewWsProxy.ts.
+        this.previewWsProxy = new PreviewWsProxy(
+            { emit: (event: any, payload: any) => this.socket.emit(event, payload) },
+            { logger: { debug: (msg: string) => logger.debug(msg) } },
+        );
+        this.socket.on('proxy-ws-open', async (params, ack) => {
+            ack(await this.previewWsProxy!.open(params));
+        });
+        this.socket.on('proxy-ws-data', (payload) => {
+            this.previewWsProxy?.data(payload);
+        });
+        this.socket.on('proxy-ws-close', (payload) => {
+            this.previewWsProxy?.close(payload?.tunnelId);
+        });
 
         // specs/remote-terminal/ Phase 2 — interactive PTY relay.
         //
