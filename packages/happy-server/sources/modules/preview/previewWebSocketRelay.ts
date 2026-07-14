@@ -134,9 +134,24 @@ function wireMachineSocket(machineSocket: IoSocket): void {
 
 function writeHttpError(socket: NetSocket, status: number, reason: string): void {
     if (socket.writable) {
-        socket.write(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\n\r\n`);
+        // Use socket.end(body) — it flushes the full response before FIN-closing.
+        // The previous write()+destroy() could RST before the bytes left the
+        // socket, and the bodyless response had no Content-Length; a fronting
+        // nginx then turned the auth failure into a generic 502 instead of
+        // relaying the real 401/403. Send a proper Content-Length + body so the
+        // status reaches the client (e.g. noVNC) cleanly.
+        const body = `${status} ${reason}`;
+        socket.end(
+            `HTTP/1.1 ${status} ${reason}\r\n` +
+            `Connection: close\r\n` +
+            `Content-Type: text/plain; charset=utf-8\r\n` +
+            `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+            `\r\n` +
+            body,
+        );
+    } else {
+        socket.destroy();
     }
-    socket.destroy();
 }
 
 /**
