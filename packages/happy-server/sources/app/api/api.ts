@@ -29,6 +29,7 @@ import { projectMemberRoutes } from "./routes/projectMemberRoutes";
 import { workspaceRoutes } from "./routes/workspaceRoutes";
 import { mergeRequestRoutes } from "./routes/mergeRequestRoutes";
 import { previewRoutes } from "./routes/previewRoutes";
+import { previewWebSocketRelay } from "@/modules/preview/previewWebSocketRelay";
 import { parsePreviewHost } from "@/modules/preview/parsePreviewHost";
 import { attachmentRoutes } from "./routes/attachmentRoutes";
 import { isLocalStorage, getLocalFilesDir } from "@/storage/files";
@@ -215,6 +216,11 @@ export async function startApi(opts: StartApiOptions = {}) {
 
     // Start Socket
     startSocket(typed);
+
+    // Preview WebSocket relay — must attach after startSocket so engine.io's
+    // upgrade listener is already in place (they coexist on app.server; see
+    // previewWebSocketRelay.ts). Handles /v1/preview/:machineId/:port/* upgrades.
+    previewWebSocketRelay(typed);
 
     // End
     log(`API ready on http://${host}:${port}`);
