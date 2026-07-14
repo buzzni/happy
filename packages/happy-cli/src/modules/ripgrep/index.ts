@@ -27,7 +27,7 @@ export function run(args: string[], options?: RipgrepOptions): Promise<RipgrepRe
     return new Promise((resolve, reject) => {
         // Use cross-spawn so `node` resolves to `node.exe` on Windows (issue #1082).
         const child = crossSpawn('node', [RUNNER_PATH, JSON.stringify(args)], {
-            stdio: ['pipe', 'pipe', 'pipe'],
+            stdio: ['ignore', 'pipe', 'pipe'],
             cwd: options?.cwd,
             windowsHide: true,
         });
