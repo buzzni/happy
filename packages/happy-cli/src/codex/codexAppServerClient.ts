@@ -300,7 +300,9 @@ export class CodexAppServerClient {
     ): void {
         const aborted = status === 'cancelled' || status === 'canceled' || status === 'aborted' || status === 'interrupted';
 
-        this.tryResolvePendingTurn(aborted, turnId, source);
+        if (!this.tryResolvePendingTurn(aborted, turnId, source)) {
+            return;
+        }
         this._turnId = null;
 
         if (turnId && this.completedTurnIds.has(turnId)) {
@@ -335,14 +337,15 @@ export class CodexAppServerClient {
 
         if (method === 'turn/started') {
             const turnId = this.extractTurnId(params);
-            if (turnId) {
-                this._turnId = turnId;
+            if (this.markPendingTurnStarted(turnId)) {
+                if (turnId) {
+                    this._turnId = turnId;
+                }
+                this.eventHandler?.({
+                    type: 'task_started',
+                    ...(turnId ? { turn_id: turnId } : {}),
+                });
             }
-            this.markPendingTurnStarted(turnId);
-            this.eventHandler?.({
-                type: 'task_started',
-                ...(turnId ? { turn_id: turnId } : {}),
-            });
             return true;
         }
 
@@ -887,29 +890,37 @@ export class CodexAppServerClient {
         this.pendingTurnCompletion = null;
     }
 
-    private markPendingTurnStarted(turnId?: string | null): void {
-        if (!this.pendingTurnCompletion) return;
-        if (turnId) {
-            this.pendingTurnCompletion.turnId = turnId;
-        }
+    private matchesPendingTurn(turnId?: string | null): boolean {
+        const pending = this.pendingTurnCompletion;
+        if (!pending) return true;
+        return !pending.turnId || !turnId || pending.turnId === turnId;
     }
 
-    private tryResolvePendingTurn(aborted: boolean, turnId: string | null, source: string): void {
+    private markPendingTurnStarted(turnId?: string | null): boolean {
+        if (!this.matchesPendingTurn(turnId)) return false;
+        if (turnId && this.pendingTurnCompletion && !this.pendingTurnCompletion.turnId) {
+            this.pendingTurnCompletion.turnId = turnId;
+        }
+        return true;
+    }
+
+    private tryResolvePendingTurn(aborted: boolean, turnId: string | null, source: string): boolean {
         const pending = this.pendingTurnCompletion;
-        if (!pending) return;
+        if (!pending) return true;
 
         // Guard against stale completion notifications from a *different* turn.
         // We use turn ID matching instead of the `started` flag because Codex
         // can skip the turn/started notification entirely for fast turns,
         // which would cause us to discard a valid turn/completed and hang forever.
-        if (pending.turnId && turnId && pending.turnId !== turnId) {
+        if (!this.matchesPendingTurn(turnId)) {
             logger.debug(
                 `[CodexAppServer] Ignoring ${source} for turn ${turnId}; awaiting ${pending.turnId}`,
             );
-            return;
+            return false;
         }
 
         this.resolvePendingTurn(aborted);
+        return true;
     }
 
     private async waitForTurnCompletion(timeoutMs: number): Promise<boolean> {
@@ -1371,28 +1382,32 @@ export class CodexAppServerClient {
             this.notificationProtocol = 'legacy';
             const msg = params?.msg;
             if (msg) {
-                // Extract turn_id from task_started events
-                if (msg.type === 'task_started' && msg.turn_id) {
-                    this._turnId = msg.turn_id;
-                }
+                const turnId = msg.turn_id ?? msg.turnId ?? null;
                 if (msg.type === 'task_started') {
-                    this.markPendingTurnStarted(msg.turn_id ?? msg.turnId ?? null);
+                    if (!this.markPendingTurnStarted(turnId)) return;
+                    if (turnId) {
+                        this._turnId = turnId;
+                    }
+                }
+                if ((msg.type === 'task_complete' || msg.type === 'turn_aborted')
+                    && !this.matchesPendingTurn(turnId)) {
+                    return;
                 }
                 // Fire event handler first (so consumer processes the event)
                 this.eventHandler?.(msg);
                 // Then resolve turn completion promise
                 if (msg.type === 'task_complete' || msg.type === 'turn_aborted') {
-                    const turnId = msg.turn_id ?? msg.turnId ?? null;
                     // Mark as completed so v2 turn/completed doesn't duplicate
                     if (turnId) {
                         this.completedTurnIds.add(turnId);
                     }
-                    this.tryResolvePendingTurn(
+                    if (this.tryResolvePendingTurn(
                         msg.type === 'turn_aborted',
                         turnId,
                         `codex/event/${msg.type}`,
-                    );
-                    this._turnId = null;
+                    )) {
+                        this._turnId = null;
+                    }
                 }
             }
             return;
@@ -1410,10 +1425,9 @@ export class CodexAppServerClient {
             // Mark the turn as started so the completion guard lets it through.
             if (method === 'turn/started') {
                 const turnId = this.extractTurnId(params);
-                if (turnId) {
+                if (this.markPendingTurnStarted(turnId) && turnId) {
                     this._turnId = turnId;
                 }
-                this.markPendingTurnStarted(turnId);
             }
             // turn/completed is a fallback signal — for mid-inference interrupts,
             // Codex may only signal completion here (not via codex/event turn_aborted).

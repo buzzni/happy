@@ -828,6 +828,117 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('keeps waiting for the root turn when nested turn lifecycle events interleave', async () => {
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        const proc = createMockProcess({
+            pid: 3008,
+            onRequest: (msg, stdout) => {
+                appServerStdout = stdout;
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: {
+                                thread: { id: 'thread-root', path: '/tmp/thread-root' },
+                                model: 'gpt-test',
+                                modelProvider: 'openai',
+                                cwd: '/tmp/project',
+                                approvalPolicy: 'never',
+                                sandbox: { type: 'dangerFullAccess' },
+                                reasoningEffort: null,
+                            },
+                        });
+                    }, 0);
+                }
+
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: {
+                                turn: { id: 'turn-root', items: [], status: 'inProgress', error: null },
+                            },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: {
+                                threadId: 'thread-root',
+                                turn: { id: 'turn-root', items: [], status: 'inProgress', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        });
+
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((msg) => {
+            events.push(msg as Record<string, unknown>);
+        });
+
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'never',
+            sandbox: 'danger-full-access',
+        });
+
+        let settled = false;
+        const pending = client.sendTurnAndWait('root request').finally(() => {
+            settled = true;
+        });
+        await waitFor(() => events.some((event) => event.type === 'task_started' && event.turn_id === 'turn-root'));
+        if (!appServerStdout) throw new Error('app-server stdout unavailable');
+
+        pushJsonLine(appServerStdout, {
+            method: 'turn/started',
+            params: {
+                threadId: 'thread-root',
+                turn: { id: 'turn-nested', items: [], status: 'inProgress', error: null },
+            },
+        });
+        pushJsonLine(appServerStdout, {
+            method: 'turn/completed',
+            params: {
+                threadId: 'thread-root',
+                turn: { id: 'turn-nested', items: [], status: 'completed', error: null },
+            },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        expect(settled).toBe(false);
+        expect(events.filter((event) => event.type === 'task_started')).toEqual([
+            expect.objectContaining({ turn_id: 'turn-root' }),
+        ]);
+        expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(0);
+
+        pushJsonLine(appServerStdout, {
+            method: 'item/completed',
+            params: {
+                threadId: 'thread-root',
+                turnId: 'turn-root',
+                item: {
+                    type: 'agentMessage',
+                    id: 'msg-root',
+                    text: 'root done',
+                    phase: 'final_answer',
+                },
+            },
+        });
+
+        await expect(pending).resolves.toEqual({ aborted: false });
+        expect(events.filter((event) => event.type === 'task_complete')).toEqual([
+            expect.objectContaining({ turn_id: 'turn-root' }),
+        ]);
+
+        await client.disconnect();
+    });
+
     it('maps raw goal notifications into legacy goal events', async () => {
         const proc = createMockProcess({
             pid: 3002,
