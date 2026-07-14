@@ -10,6 +10,7 @@ import {
   isPolicyStopSource,
   readDaemonSessionIdleReaperConfig,
   readIdleStopGuardConfig,
+  restoreSessionStartTimes,
   resolveStopSessionMode,
   runDaemonSessionIdleReaperTick,
   type IdleStopGuardConfig,
@@ -102,7 +103,7 @@ describe('buildDaemonSessionIdleReaperRequest', () => {
         thinking: true,
         hasOpenToolCall: true,
         pendingUserInput: false,
-        lastActiveAt: 9_000,
+        lastActiveAt: 1_000,
       },
     ]);
   });
@@ -139,12 +140,12 @@ describe('buildDaemonSessionIdleReaperRequest', () => {
         pendingUserInput: true,
         lastUserInteractionAt: 8_500,
         mode: 'local',
-        lastActiveAt: 9_000,
+        lastActiveAt: 1_000,
       },
     ]);
   });
 
-  it('uses recent runtime activity even after the session is no longer busy', () => {
+  it('does not treat fresh runtime keep-alive as user activity', () => {
     const request = buildDaemonSessionIdleReaperRequest({
       machineId: 'machine-1',
       now: 10_000,
@@ -171,7 +172,7 @@ describe('buildDaemonSessionIdleReaperRequest', () => {
         thinking: false,
         hasOpenToolCall: false,
         pendingUserInput: false,
-        lastActiveAt: 9_000,
+        lastActiveAt: 1_000,
       },
     ]);
   });
@@ -194,8 +195,8 @@ describe('buildDaemonSessionIdleReaperRequest', () => {
 });
 
 describe('readDaemonSessionIdleReaperConfig', () => {
-  it('defaults the idle threshold to 5 minutes for production safety', () => {
-    expect(DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS).toBe(5 * 60 * 1000);
+  it('defaults the daemon idle threshold to 24 hours', () => {
+    expect(DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS).toBe(24 * 60 * 60 * 1000);
     expect(readDaemonSessionIdleReaperConfig({})).toEqual({
       disabled: false,
       idleAfterMs: DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS,
@@ -208,6 +209,19 @@ describe('readDaemonSessionIdleReaperConfig', () => {
     })).toMatchObject({
       idleAfterMs: 2500,
     });
+  });
+});
+
+describe('restoreSessionStartTimes', () => {
+  it('restores persisted start time and uses now only for newly discovered sessions', () => {
+    expect(restoreSessionStartTimes({
+      trackedSessions: [tracked({ pid: 100 }), tracked({ pid: 101 })],
+      persistedSessions: [{ pid: 100, startedAt: 1_000 }],
+      now: 10_000,
+    })).toEqual(new Map([
+      [100, 1_000],
+      [101, 10_000],
+    ]));
   });
 });
 
