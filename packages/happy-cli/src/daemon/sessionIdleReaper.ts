@@ -2,7 +2,7 @@ import axios from 'axios';
 
 import type { SessionRuntimeState, TrackedSession } from './types';
 
-export const DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS = 5 * 60 * 1000;
+export const DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_MIN_SESSION_AGE_MS = 10 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_HARD_CAP_MS = 2 * 60 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_PRESENCE_STALE_MS = 5 * 60 * 1000;
@@ -75,6 +75,18 @@ export type DaemonSessionIdleReaperTickResult = {
 };
 
 export type StopSessionMode = 'force' | 'if-idle';
+
+export function restoreSessionStartTimes(input: {
+  trackedSessions: readonly Pick<TrackedSession, 'pid'>[];
+  persistedSessions: readonly { pid: number; startedAt: number }[];
+  now: number;
+}): Map<number, number> {
+  const persistedByPid = new Map(input.persistedSessions.map((session) => [session.pid, session.startedAt]));
+  return new Map(input.trackedSessions.map((session) => [
+    session.pid,
+    persistedByPid.get(session.pid) ?? input.now,
+  ]));
+}
 
 /**
  * Context carried alongside a stop request. `mode` decides whether the daemon
@@ -346,12 +358,10 @@ function resolveSessionLastActiveAt(
   sessionStartTimes: ReadonlyMap<number, number>,
   now: number,
 ): number {
-  const activityTimes = [
-    sessionStartTimes.get(session.pid),
-    session.runtime?.updatedAt,
-  ].filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
-
-  return activityTimes.length > 0 ? Math.max(...activityTimes) : now;
+  const sessionStartedAt = sessionStartTimes.get(session.pid);
+  return typeof sessionStartedAt === 'number' && Number.isFinite(sessionStartedAt)
+    ? sessionStartedAt
+    : now;
 }
 
 function parseOptionalMs(value: string | undefined): number | undefined {

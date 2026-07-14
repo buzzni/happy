@@ -50,6 +50,7 @@ import {
   readIdleStopGuardConfig,
   evaluateIdleStopGuard,
   resolveStopSessionMode,
+  restoreSessionStartTimes,
   type StopSessionContext,
   type StopSessionResult,
 } from './sessionIdleReaper';
@@ -252,10 +253,11 @@ export async function startDaemon(): Promise<void> {
     const getCurrentChildren = () => Array.from(pidToTrackedSession.values());
 
     // Serialize tracked sessions for disk persistence
-    const sessionStartTimes = new Map<number, number>();
-    for (const s of pidToTrackedSession.values()) {
-      sessionStartTimes.set(s.pid, Date.now());
-    }
+    const sessionStartTimes = restoreSessionStartTimes({
+      trackedSessions: getCurrentChildren(),
+      persistedSessions: previousState?.trackedSessions ?? [],
+      now: Date.now(),
+    });
     const serializeTrackedSessions = (): PersistedTrackedSession[] => {
       return Array.from(pidToTrackedSession.values()).map(s => ({
         pid: s.pid,
