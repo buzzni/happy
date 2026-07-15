@@ -216,7 +216,8 @@ export class CodexAppServerClient {
     } | null = null;
 
     // Turn completion tracking for the currently active sendTurnAndWait call.
-    // A completion event only resolves once we have seen task_started for this turn.
+    // Once known, the root provider turn ID prevents nested lifecycle events
+    // from resolving the caller's completion promise.
     private pendingTurnCompletion: {
         resolve: (aborted: boolean) => void;
         turnId: string | null;
