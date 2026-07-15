@@ -8,14 +8,24 @@ import {
 
 describe('mapCodexMcpMessageToSessionEnvelopes', () => {
     it('starts and ends turns for task lifecycle events', () => {
-        const started = mapCodexMcpMessageToSessionEnvelopes({ type: 'task_started' }, { currentTurnId: null });
+        const started = mapCodexMcpMessageToSessionEnvelopes(
+            { type: 'task_started', turn_id: 'provider-1' },
+            { currentTurnId: null }
+        );
 
         expect(started.envelopes).toHaveLength(1);
         expect(started.envelopes[0].ev.t).toBe('turn-start');
         expect(started.envelopes[0].turn).toBe(started.currentTurnId);
         expect(started.envelopes[0].turn).not.toBe(started.envelopes[0].id);
+        expect(started.currentProviderTurnId).toBe('provider-1');
 
-        const ended = mapCodexMcpMessageToSessionEnvelopes({ type: 'task_complete' }, { currentTurnId: started.currentTurnId });
+        const ended = mapCodexMcpMessageToSessionEnvelopes(
+            { type: 'task_complete', turn_id: 'provider-1' },
+            {
+                currentTurnId: started.currentTurnId,
+                currentProviderTurnId: started.currentProviderTurnId,
+            }
+        );
         expect(ended.envelopes).toHaveLength(1);
         expect(ended.envelopes[0].ev.t).toBe('turn-end');
         if (ended.envelopes[0].ev.t === 'turn-end') {
@@ -23,6 +33,38 @@ describe('mapCodexMcpMessageToSessionEnvelopes', () => {
         }
         expect(ended.envelopes[0].turn).toBe(started.currentTurnId);
         expect(ended.currentTurnId).toBeNull();
+        expect(ended.currentProviderTurnId).toBeNull();
+    });
+
+    it('keeps the active session turn when another task_started event arrives', () => {
+        const activeSubagents = new Set<string>(['subagent-1']);
+        const startedSubagents = new Set<string>(['subagent-1']);
+        const result = mapCodexMcpMessageToSessionEnvelopes(
+            { type: 'task_started', turn_id: 'provider-nested' },
+            {
+                currentTurnId: 'session-root',
+                currentProviderTurnId: 'provider-root',
+                activeSubagents,
+                startedSubagents,
+            }
+        );
+
+        expect(result.currentTurnId).toBe('session-root');
+        expect(result.currentProviderTurnId).toBe('provider-root');
+        expect(result.envelopes).toHaveLength(0);
+        expect(result.activeSubagents).toEqual(activeSubagents);
+        expect(result.startedSubagents).toEqual(startedSubagents);
+    });
+
+    it('ignores completion for a different provider turn', () => {
+        const result = mapCodexMcpMessageToSessionEnvelopes(
+            { type: 'task_complete', turn_id: 'provider-nested' },
+            { currentTurnId: 'session-root', currentProviderTurnId: 'provider-root' }
+        );
+
+        expect(result.currentTurnId).toBe('session-root');
+        expect(result.currentProviderTurnId).toBe('provider-root');
+        expect(result.envelopes).toHaveLength(0);
     });
 
     it('maps abort lifecycle with cancelled turn-end status', () => {

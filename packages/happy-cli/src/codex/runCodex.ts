@@ -373,6 +373,7 @@ export async function runCodex(opts: {
     session.onUserMessage(handleUserMessage);
     let thinking = false;
     let currentTurnId: string | null = null;
+    let currentProviderTurnId: string | null = null;
     let codexStartedSubagents = new Set<string>();
     let codexActiveSubagents = new Set<string>();
     let codexProviderSubagentToSessionSubagent = new Map<string, string>();
@@ -794,11 +795,13 @@ export async function runCodex(opts: {
         if (msg.type !== 'agent_reasoning_delta' && msg.type !== 'agent_reasoning' && msg.type !== 'agent_reasoning_section_break' && msg.type !== 'turn_diff') {
             const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, {
                 currentTurnId,
+                currentProviderTurnId,
                 startedSubagents: codexStartedSubagents,
                 activeSubagents: codexActiveSubagents,
                 providerSubagentToSessionSubagent: codexProviderSubagentToSessionSubagent,
             });
             currentTurnId = mapped.currentTurnId;
+            currentProviderTurnId = mapped.currentProviderTurnId;
             codexStartedSubagents = mapped.startedSubagents;
             codexActiveSubagents = mapped.activeSubagents;
             codexProviderSubagentToSessionSubagent = mapped.providerSubagentToSessionSubagent;
@@ -903,6 +906,7 @@ export async function runCodex(opts: {
                 logger.debug('[Codex] Handling /clear command - resetting Codex thread state');
                 client.clearThreadState();
                 currentTurnId = null;
+                currentProviderTurnId = null;
                 codexStartedSubagents = new Set<string>();
                 codexActiveSubagents = new Set<string>();
                 codexProviderSubagentToSessionSubagent = new Map<string, string>();
