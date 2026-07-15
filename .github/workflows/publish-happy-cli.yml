@@ -72,10 +72,15 @@ jobs:
               run: node packages/happy-cli/scripts/guard-publish-artifact.cjs "${{ steps.pack_publish_artifact.outputs.tarball }}" --install-smoke
 
             - name: Publish to npm
-              working-directory: ${{ runner.temp }}/happy-cli-publish
-              # Publish from inside the prepared directory, not by passing a directory path.
-              # The guard above fails if workspace/file dependencies leak into npm metadata.
-              run: npm publish --access public --tag latest --ignore-scripts
+              # Publish the exact tarball the guard verified. Anything that
+              # re-packs at publish time (directory-path publish, publishing
+              # from inside the directory with a different npm, or pnpm/yarn
+              # publish — which do not implement bundledDependencies at all)
+              # can drop the bundled node_modules while the metadata still
+              # declares them; fresh installs then die with
+              # ERR_MODULE_NOT_FOUND. This shipped as 1.1.10-aplus.36 and
+              # 1.1.10-aplus.44.
+              run: npm publish "${{ steps.pack_publish_artifact.outputs.tarball }}" --access public --tag latest --ignore-scripts
               env:
                   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
                   NPM_CONFIG_PROVENANCE: 'true'
