@@ -16,9 +16,10 @@ afterEach(async () => {
 });
 
 describe('loadBasePrompt', () => {
-    it('returns the AX Studio base prompt text mentioning all 4 modes', async () => {
+    it('returns the Saycode base prompt text mentioning all 4 modes', async () => {
         const text = await loadBasePrompt();
-        expect(text).toMatch(/AX Studio AI assistant/);
+        expect(text).toMatch(/Saycode AI assistant/);
+        expect(text).not.toMatch(/AX Studio AI assistant/);
         expect(text).toMatch(/plan/);
         expect(text).toMatch(/design/);
         expect(text).toMatch(/work/);
