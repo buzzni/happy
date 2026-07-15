@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { setTimeout as sleep } from 'node:timers/promises'
 import {
     addDaemonTerminalSession,
@@ -18,6 +18,7 @@ describe('daemonTerminalSessions', () => {
         _resetDaemonTerminalSessionsForTest()
     })
     afterEach(() => {
+        vi.useRealTimers()
         while (tracked.length) {
             try { tracked.pop()?.kill('SIGKILL') } catch {/* gone */ }
         }
@@ -31,6 +32,21 @@ describe('daemonTerminalSessions', () => {
         })
         tracked.push(s)
         return s
+    }
+
+    function createSignalRecordingPty(signals: NodeJS.Signals[]): PtySession {
+        return {
+            id: 'pty-a',
+            userId: 'u',
+            pid: 1,
+            cols: 80,
+            rows: 24,
+            write() {},
+            resize() {},
+            kill(signal = 'SIGTERM') { signals.push(signal) },
+            onData() { return () => {} },
+            onExit() { return () => {} },
+        }
     }
 
     it('add() returns an entry with userId, machineId, openedAt, zero counters', () => {
@@ -107,6 +123,40 @@ describe('daemonTerminalSessions', () => {
         // SIGHUP terminates the process; code is non-zero or signal set —
         // exact value is platform-specific, just confirm something happened.
         expect(exitInfo).toBeDefined()
+    })
+
+    it('idle termination escalates through SIGHUP, SIGTERM, and SIGKILL before removing the session', async () => {
+        vi.useFakeTimers()
+        const signals: NodeJS.Signals[] = []
+        const pty = createSignalRecordingPty(signals)
+        addDaemonTerminalSession('a', pty, { userId: 'u', idleTimeoutMs: 100 })
+
+        await vi.advanceTimersByTimeAsync(100)
+        expect(signals).toEqual(['SIGHUP'])
+        expect(getDaemonTerminalSession('a')).not.toBeNull()
+
+        recordBytesOut('a', 1)
+        await vi.advanceTimersByTimeAsync(5000)
+        expect(signals).toEqual(['SIGHUP', 'SIGTERM'])
+        expect(getDaemonTerminalSession('a')).not.toBeNull()
+
+        await vi.advanceTimersByTimeAsync(5000)
+        expect(signals).toEqual(['SIGHUP', 'SIGTERM', 'SIGKILL'])
+        expect(getDaemonTerminalSession('a')).toBeNull()
+    })
+
+    it('removing a session during idle termination cancels pending escalation signals', async () => {
+        vi.useFakeTimers()
+        const signals: NodeJS.Signals[] = []
+        const pty = createSignalRecordingPty(signals)
+        addDaemonTerminalSession('a', pty, { userId: 'u', idleTimeoutMs: 100 })
+
+        await vi.advanceTimersByTimeAsync(100)
+        expect(signals).toEqual(['SIGHUP'])
+
+        expect(removeDaemonTerminalSession('a')).toBe(true)
+        await vi.advanceTimersByTimeAsync(10000)
+        expect(signals).toEqual(['SIGHUP'])
     })
 
     it('activity resets the idle timer (no kill while bytes flow)', async () => {

@@ -13,6 +13,7 @@
 import { type PtySession } from './remoteTerminal'
 
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1000
+const TERMINATION_GRACE_MS = 5000
 
 export interface DaemonTerminalEntry {
     readonly id: string
@@ -29,6 +30,8 @@ export interface DaemonTerminalEntry {
 interface InternalEntry extends DaemonTerminalEntry {
     _idleTimeoutMs: number
     _idleTimer: ReturnType<typeof setTimeout> | null
+    _terminationTimer: ReturnType<typeof setTimeout> | null
+    _isTerminating: boolean
 }
 
 export interface AddSessionOptions {
@@ -47,15 +50,47 @@ function clearIdleTimer(entry: InternalEntry): void {
     }
 }
 
+function clearTerminationTimer(entry: InternalEntry): void {
+    if (entry._terminationTimer) {
+        clearTimeout(entry._terminationTimer)
+        entry._terminationTimer = null
+    }
+}
+
+function clearSessionTimers(entry: InternalEntry): void {
+    clearIdleTimer(entry)
+    clearTerminationTimer(entry)
+}
+
+function isCurrentEntry(entry: InternalEntry): boolean {
+    return sessions.get(entry.id) === entry
+}
+
+function beginIdleTermination(entry: InternalEntry): void {
+    entry._idleTimer = null
+    entry._isTerminating = true
+    try { entry.session.kill('SIGHUP') } catch {/* already gone */ }
+    if (!isCurrentEntry(entry)) return
+
+    entry._terminationTimer = setTimeout(() => {
+        entry._terminationTimer = null
+        if (!isCurrentEntry(entry)) return
+        try { entry.session.kill('SIGTERM') } catch {/* already gone */ }
+        if (!isCurrentEntry(entry)) return
+
+        entry._terminationTimer = setTimeout(() => {
+            entry._terminationTimer = null
+            if (!isCurrentEntry(entry)) return
+            try { entry.session.kill('SIGKILL') } catch {/* already gone */ }
+            if (isCurrentEntry(entry)) sessions.delete(entry.id)
+        }, TERMINATION_GRACE_MS)
+    }, TERMINATION_GRACE_MS)
+}
+
 function armIdleTimer(entry: InternalEntry): void {
     clearIdleTimer(entry)
-    if (entry._idleTimeoutMs <= 0) return
-    entry._idleTimer = setTimeout(() => {
-        // Trust pty.onExit to fire and remove the entry from the map; if
-        // the kill races with a manual close, removeDaemonTerminalSession
-        // is idempotent.
-        try { entry.session.kill('SIGHUP') } catch {/* already gone */ }
-    }, entry._idleTimeoutMs)
+    if (entry._idleTimeoutMs <= 0 || entry._isTerminating) return
+    entry._idleTimer = setTimeout(() => beginIdleTermination(entry), entry._idleTimeoutMs)
 }
 
 export function addDaemonTerminalSession(
@@ -75,6 +110,8 @@ export function addDaemonTerminalSession(
         lastActivityAt: now,
         _idleTimeoutMs: opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
         _idleTimer: null,
+        _terminationTimer: null,
+        _isTerminating: false,
     }
     sessions.set(id, entry)
     armIdleTimer(entry)
@@ -89,14 +126,14 @@ export function getDaemonTerminalSession(id: string | undefined | null): DaemonT
 export function removeDaemonTerminalSession(id: string): boolean {
     const entry = sessions.get(id)
     if (!entry) return false
-    clearIdleTimer(entry)
+    clearSessionTimers(entry)
     return sessions.delete(id)
 }
 
 export function killAllDaemonTerminalSessions(signal: NodeJS.Signals = 'SIGTERM'): number {
     let killed = 0
     for (const [id, entry] of sessions) {
-        clearIdleTimer(entry)
+        clearSessionTimers(entry)
         try {
             entry.session.kill(signal)
             killed++
@@ -135,7 +172,7 @@ export function recordBytesOut(id: string, n: number): void {
 
 export function _resetDaemonTerminalSessionsForTest(): void {
     for (const entry of sessions.values()) {
-        clearIdleTimer(entry)
+        clearSessionTimers(entry)
     }
     sessions.clear()
 }
