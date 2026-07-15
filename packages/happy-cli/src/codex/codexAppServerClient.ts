@@ -1082,6 +1082,16 @@ export class CodexAppServerClient {
             timer = setTimeout(() => {
                 if (this.pendingTurnCompletion) {
                     logger.warn(`[CodexAppServer] Turn timed out after ${timeoutMs}ms — treating as abort`);
+                    const turnId = this.pendingTurnCompletion.turnId ?? this._turnId;
+                    if (turnId) {
+                        this.completedTurnIds.add(turnId);
+                    }
+                    this.eventHandler?.({
+                        type: 'turn_aborted',
+                        reason: 'timeout',
+                        ...(turnId ? { turn_id: turnId } : {}),
+                    });
+                    this._turnId = null;
                     this.resolvePendingTurn(true);
                 }
             }, timeoutMs);
@@ -1392,6 +1402,10 @@ export class CodexAppServerClient {
                 }
                 if ((msg.type === 'task_complete' || msg.type === 'turn_aborted')
                     && !this.matchesPendingTurn(turnId)) {
+                    return;
+                }
+                if ((msg.type === 'task_complete' || msg.type === 'turn_aborted')
+                    && turnId && this.completedTurnIds.has(turnId)) {
                     return;
                 }
                 // Fire event handler first (so consumer processes the event)
