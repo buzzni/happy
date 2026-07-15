@@ -36,7 +36,7 @@ describe('applyAxOrchestration', () => {
         expect(result!.appendSystemPrompt).toMatch(/Step: plan/);
         expect(result!.appendSystemPrompt).toMatch(/<ax-dynamic-context>/);
         // Order: base prompt -> step guide -> dynamic context.
-        const baseIdx = result!.appendSystemPrompt.indexOf('AX Studio AI assistant');
+        const baseIdx = result!.appendSystemPrompt.indexOf('Saycode AI assistant');
         const guideIdx = result!.appendSystemPrompt.indexOf('Step: plan');
         const ctxIdx = result!.appendSystemPrompt.indexOf('<ax-dynamic-context>');
         expect(baseIdx).toBeLessThan(guideIdx);
@@ -83,7 +83,7 @@ describe('applyAxOrchestration', () => {
             workspaceRoot: workspace,
             userText: 'hi',
         });
-        expect(result!.appendSystemPrompt).toMatch(/AX Studio AI assistant/);
+        expect(result!.appendSystemPrompt).toMatch(/Saycode AI assistant/);
     });
 
     it('replaces prior AX guide/context instead of accumulating stale prompt blocks', async () => {
@@ -112,7 +112,7 @@ describe('applyAxOrchestration', () => {
             currentAppendSystemPrompt: 'CUSTOM USER PROMPT',
         });
         // Both AX base and user's custom prompt should be present
-        expect(result!.appendSystemPrompt).toMatch(/AX Studio AI assistant/);
+        expect(result!.appendSystemPrompt).toMatch(/Saycode AI assistant/);
         expect(result!.appendSystemPrompt).toMatch(/CUSTOM USER PROMPT/);
     });
 
@@ -127,7 +127,7 @@ describe('applyAxOrchestration', () => {
             userText: 'hi again',
             currentAppendSystemPrompt: first!.appendSystemPrompt,
         });
-        const occurrences = (second!.appendSystemPrompt!.match(/AX Studio AI assistant/g) || []).length;
+        const occurrences = (second!.appendSystemPrompt!.match(/Saycode AI assistant/g) || []).length;
         expect(occurrences).toBe(1);
     });
 
