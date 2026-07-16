@@ -46,7 +46,7 @@ until curl -fsI "$TARBALL_URL" >/dev/null; do
   echo "waiting for npm tarball propagation: $TARBALL_URL"
   sleep 30
 done
-npm install -g "@namsangboy/happy-cli@$VERSION" --ignore-scripts --prefer-online
+npm install -g "@namsangboy/happy-cli@$VERSION" --prefer-online
 HAPPY_HOME_DIR="$(mktemp -d)" happy daemon status
 ```
 
@@ -59,7 +59,7 @@ The final `npm publish` takes the guarded `.tgz` path, so the registry receives 
 
 The command includes `--tag latest` because `*-aplus.*` versions are semver prereleases and npm requires an explicit dist-tag for those publishes.
 
-After publish, always install the exact version from the npm registry and run `happy daemon status`. This verifies that the registry metadata, registry tarball, bundled dependency files, and CLI entrypoint all work outside the monorepo.
+After publish, always install the exact version from the npm registry with lifecycle scripts enabled and run `happy daemon status`. This verifies that the registry metadata, registry tarball, bundled dependency files, native dependencies such as `node-pty`, and the CLI entrypoint all work outside the monorepo. Do not use `--ignore-scripts` for this smoke: Linux installs need `node-pty`'s install script to build its native module because the package does not ship a Linux prebuild.
 
 ## npm Tarball Propagation
 
@@ -76,7 +76,7 @@ until curl -fsI "$TARBALL_URL" >/dev/null; do
   echo "waiting for npm tarball propagation: $TARBALL_URL"
   sleep 30
 done
-npm install -g "@namsangboy/happy-cli@$VERSION" --ignore-scripts --prefer-online
+npm install -g "@namsangboy/happy-cli@$VERSION" --prefer-online
 HAPPY_HOME_DIR="$(mktemp -d)" happy daemon status
 ```
 
@@ -145,6 +145,12 @@ cd "$(npm root -g)/@namsangboy/happy-cli"
 npm install --no-save --no-package-lock '@slopus/happy-wire@<version>' '@paralleldrive/cuid2@^2.2.2' '@noble/hashes@^2.0.1' 'zod@^4.0.0'
 happy daemon stop && happy daemon start
 ```
+
+## Why 1.1.10-aplus.46 Verification Failed
+
+`1.1.10-aplus.46` was published correctly, but the post-publish registry smoke installed it with `--ignore-scripts`. The Linux `node-pty` package does not include a prebuilt native module, so skipping lifecycle scripts prevented its install script from building `pty.node`. The installed CLI then failed while loading `node-pty` before `happy daemon status` could run.
+
+The same registry version installs and runs successfully when lifecycle scripts are enabled. Post-publish verification must match a real user install and must not pass `--ignore-scripts`.
 
 ## Why 1.1.8-aplus.22 Failed
 

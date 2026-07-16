@@ -106,7 +106,7 @@ jobs:
                   CACHE="$(mktemp -d)"
                   HAPPY_HOME="$(mktemp -d)"
                   for attempt in 1 2 3 4 5 6; do
-                      if npm install --prefix "$PREFIX" -g "@namsangboy/happy-cli@$VERSION" --ignore-scripts --prefer-online --cache "$CACHE"; then
+                      if npm install --prefix "$PREFIX" -g "@namsangboy/happy-cli@$VERSION" --prefer-online --cache "$CACHE"; then
                           HAPPY_HOME_DIR="$HAPPY_HOME" node "$PREFIX/lib/node_modules/@namsangboy/happy-cli/bin/happy.mjs" daemon status
                           exit 0
                       fi
