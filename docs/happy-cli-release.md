@@ -39,7 +39,7 @@ mkdir -p "$RUNNER_TEMP/happy-cli-pack"
 npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/happy-cli-pack"
 PUBLISH_TGZ="$(ls "$RUNNER_TEMP"/happy-cli-pack/*.tgz)"
 node "$REPO/packages/happy-cli/scripts/guard-publish-artifact.cjs" "$PUBLISH_TGZ" --install-smoke
-npm publish --access public --tag latest --ignore-scripts
+npm publish "$PUBLISH_TGZ" --access public --tag latest --ignore-scripts
 VERSION="$(node -p 'require("./package.json").version')"
 TARBALL_URL="$(npm view "@namsangboy/happy-cli@$VERSION" dist.tarball)"
 until curl -fsI "$TARBALL_URL" >/dev/null; do
@@ -50,7 +50,14 @@ npm install -g "@namsangboy/happy-cli@$VERSION" --ignore-scripts --prefer-online
 HAPPY_HOME_DIR="$(mktemp -d)" happy daemon status
 ```
 
-The final `npm publish` runs from inside the prepared directory. Do not replace it with `npm publish "$RUNNER_TEMP/happy-cli-publish"`; that form can pack the same files without the bundled dependency set. The command includes `--tag latest` because `*-aplus.*` versions are semver prereleases and npm requires an explicit dist-tag for those publishes.
+The final `npm publish` takes the guarded `.tgz` path, so the registry receives the exact bytes the guard verified. Never publish in any form that re-packs the package:
+
+- `npm publish "$RUNNER_TEMP/happy-cli-publish"` (directory path) re-packed without the bundled dependency set — this shipped `1.1.10-aplus.36` broken.
+- `pnpm publish` (and `yarn publish`) do not implement `bundledDependencies` at all; they silently drop the bundled `node_modules` while the metadata still declares them — this shipped `1.1.10-aplus.44` broken.
+
+`prepublishOnly` in both the source and the prepared package now runs `scripts/assert-publish-tool.cjs`, which rejects non-npm publishers, and the published artifact's `postinstall` runs `scripts/verify-bundled-deps.cjs`, which fails a registry install immediately when the bundled files are missing instead of crashing later with `ERR_MODULE_NOT_FOUND`.
+
+The command includes `--tag latest` because `*-aplus.*` versions are semver prereleases and npm requires an explicit dist-tag for those publishes.
 
 After publish, always install the exact version from the npm registry and run `happy daemon status`. This verifies that the registry metadata, registry tarball, bundled dependency files, and CLI entrypoint all work outside the monorepo.
 
@@ -116,6 +123,28 @@ Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@slopus/happy-wire' imported 
 ```
 
 The fix is to pack from inside the prepared directory, guard the resulting `.tgz`, publish from inside that same prepared directory, and then run a post-publish registry install smoke. The install smoke must also execute the installed `happy` entrypoint so missing runtime imports fail before release completion.
+
+## Why 1.1.10-aplus.44 Failed
+
+`1.1.10-aplus.44` was prepared correctly but published manually outside the tag workflow (the registry entry has no provenance attestation, unlike `1.1.10-aplus.43`). The publish tool re-packed the prepared directory without honoring `bundledDependencies` — the tarball had 64 files instead of ~1100 and contained no `node_modules` — while the metadata still declared the bundled set. Fresh installs failed exactly like `1.1.10-aplus.36`:
+
+```text
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@slopus/happy-wire' imported from .../@namsangboy/happy-cli/dist/index.mjs
+```
+
+This is the failure mode of `pnpm publish` (pnpm does not implement `bundledDependencies`). The per-artifact guard did not help because it packs with `npm pack` internally — the guard's own tarball was fine; the publisher's re-packed tarball was not. Three defenses were added after this incident:
+
+1. The workflow publishes the guarded `.tgz` path itself, so no re-pack can happen between guard and publish.
+2. `scripts/assert-publish-tool.cjs` runs from `prepublishOnly` and rejects pnpm/yarn publishers outright.
+3. `scripts/verify-bundled-deps.cjs` runs from the published artifact's `postinstall` and fails the install with an actionable message when bundled files are missing.
+
+In the field, a machine with the broken version installed can be repaired without waiting for a republish:
+
+```sh
+cd "$(npm root -g)/@namsangboy/happy-cli"
+npm install --no-save --no-package-lock '@slopus/happy-wire@<version>' '@paralleldrive/cuid2@^2.2.2' '@noble/hashes@^2.0.1' 'zod@^4.0.0'
+happy daemon stop && happy daemon start
+```
 
 ## Why 1.1.8-aplus.22 Failed
 

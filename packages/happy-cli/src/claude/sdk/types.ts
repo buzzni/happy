@@ -12,7 +12,10 @@ export type {
     SDKResultMessage,
     PermissionResult,
     CanUseTool,
+    AgentDefinition,
 } from '@anthropic-ai/claude-agent-sdk'
+
+import type { AgentDefinition } from '@anthropic-ai/claude-agent-sdk'
 
 // Re-export AbortError class
 export { AbortError } from '@anthropic-ai/claude-agent-sdk'
@@ -52,6 +55,13 @@ export interface QueryOptions {
      * the SDK silently downgrades it to 'high' on models without it.
      */
     effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+    /**
+     * Programmatically-defined custom subagents, keyed by name, forwarded to the
+     * SDK's `agents` option. Used for per-session orchestrator/worker delegation:
+     * a cheaper `worker` agent the (expensive) main model delegates mechanical
+     * work to. See orchestrator/workerAgents.ts.
+     */
+    agents?: Record<string, AgentDefinition>
 }
 
 /**
