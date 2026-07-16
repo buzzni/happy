@@ -110,7 +110,7 @@ function preparePublishPackage() {
         },
         scripts: {
             ...cliPackage.scripts,
-            prepublishOnly: 'node scripts/guard-publish-artifact.cjs . --install-smoke'
+            prepublishOnly: 'node scripts/assert-publish-tool.cjs && node scripts/guard-publish-artifact.cjs . --install-smoke'
         },
         bundledDependencies: BUNDLED_DEPENDENCIES
     };
