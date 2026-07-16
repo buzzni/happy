@@ -4,6 +4,8 @@ import { EnhancedMode } from "./loop";
 import { logger } from "@/ui/logger";
 import type { JsRuntime } from "./runClaude";
 import type { SandboxConfig } from "@/persistence";
+import type { AplusMcpServersMap } from '@/aplus/fetchAplusMcpServers';
+import type { McpConfigSource } from './mcpConfigSynchronizer';
 
 export class Session {
     readonly path: string;
@@ -13,7 +15,8 @@ export class Session {
     readonly queue: MessageQueue2<EnhancedMode>;
     readonly claudeEnvVars?: Record<string, string>;
     claudeArgs?: string[];  // Made mutable to allow filtering
-    readonly mcpServers: Record<string, any>;
+    mcpServers: Record<string, any>;
+    readonly mcpConfig?: McpConfigSource;
     readonly allowedTools?: string[];
     readonly sandboxConfig?: SandboxConfig;
     readonly _onModeChange: (mode: 'local' | 'remote') => void;
@@ -42,6 +45,7 @@ export class Session {
         claudeEnvVars?: Record<string, string>,
         claudeArgs?: string[],
         mcpServers: Record<string, any>,
+        mcpConfig?: McpConfigSource,
         messageQueue: MessageQueue2<EnhancedMode>,
         onModeChange: (mode: 'local' | 'remote') => void,
         onAbort?: () => void,
@@ -61,6 +65,7 @@ export class Session {
         this.claudeEnvVars = opts.claudeEnvVars;
         this.claudeArgs = opts.claudeArgs;
         this.mcpServers = opts.mcpServers;
+        this.mcpConfig = opts.mcpConfig;
         this.allowedTools = opts.allowedTools;
         this.sandboxConfig = opts.sandboxConfig;
         this._onModeChange = opts.onModeChange;
@@ -73,6 +78,13 @@ export class Session {
         this.keepAliveInterval = setInterval(() => {
             this.client.keepAlive(this.thinking, this.mode);
         }, 2000);
+    }
+
+    updateMcpConfiguration(servers: Record<string, any>, aplusServers: AplusMcpServersMap): void {
+        this.mcpServers = servers;
+        if (this.mcpConfig) {
+            this.mcpConfig.initialAplusServers = aplusServers;
+        }
     }
     
     /**

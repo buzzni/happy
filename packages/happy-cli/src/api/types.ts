@@ -305,7 +305,7 @@ export type Metadata = {
   codexThreadId?: string, // Codex app-server thread ID
   tools?: string[],
   slashCommands?: string[],
-  mcpServers?: Array<{ name: string; status: string }>,
+  mcpServers?: Array<{ name: string; status: string; error?: string; checkedAt?: number }>,
   skills?: string[],
   homeDir: string,
   happyHomeDir: string,

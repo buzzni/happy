@@ -253,13 +253,13 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
                 callback?.({ ok: true, result: response });
             } catch (error) {
                 const errorMsg = error instanceof Error ? error.message : 'RPC call failed';
-                finish(errorMsg === 'RPC target disconnected' ? 'target_disconnected' : 'timeout');
+                finish(/timeout|timed out/i.test(errorMsg) ? 'timeout' : 'failed');
                 callback?.({ ok: false, error: errorMsg });
             } finally {
                 presenceAlive = false;
             }
         } catch (error) {
-            finish('internal_error');
+            finish('failed');
             log({ module: 'websocket', level: 'error' }, `Error in rpc-call: ${error}`);
             callback?.({ ok: false, error: 'Internal error' });
         }

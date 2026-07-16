@@ -35,7 +35,7 @@ import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudePermissionMode, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
 import { applyAxOrchestration } from '@/orchestrator/prompts/integrate';
 import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
-import { fetchAplusMcpServers } from '@/aplus/fetchAplusMcpServers';
+import { fetchAplusMcpServersResult } from '@/aplus/fetchAplusMcpServers';
 import { mergeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { decodeBase64, encodeBase64 } from '@/api/encryption';
 import type { Session as ApiSession } from '@/api/types';
@@ -962,7 +962,14 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     // P6(b): aplus 자동 mcp 등록 — web-ui 의 /api/me/mcp-config 응답을
     // 'happy' MCP 옆에 머지한다. 실패는 silent (graceful degrade).
-    const aplusMcpServers = await fetchAplusMcpServers(credentials.token, machineId);
+    const initialAplusMcpResult = await fetchAplusMcpServersResult(credentials.token, machineId);
+    const aplusMcpServers = initialAplusMcpResult.ok ? initialAplusMcpResult.servers : {};
+    const baseMcpServers = {
+        'happy': {
+            type: 'http' as const,
+            url: happyServer.url,
+        },
+    };
 
     // Create claude loop
     const exitCode = await loop({
@@ -986,12 +993,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             currentSession = sessionInstance;
         },
         onAbort: resetCurrentModeDefaults,
-        mcpServers: mergeAplusMcpServers({
-            'happy': {
-                type: 'http' as const,
-                url: happyServer.url,
-            },
-        }, aplusMcpServers),
+        mcpServers: mergeAplusMcpServers(baseMcpServers, aplusMcpServers),
+        mcpConfig: {
+            baseServers: baseMcpServers,
+            initialAplusServers: aplusMcpServers,
+            fetchAplusServers: () => fetchAplusMcpServersResult(credentials.token, machineId),
+        },
         session,
         claudeEnvVars: options.claudeEnvVars,
         claudeArgs: options.claudeArgs,

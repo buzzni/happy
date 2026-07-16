@@ -20,17 +20,25 @@ type McpHttpServerEntry = {
 
 export type AplusMcpServersMap = Record<string, McpHttpServerEntry>
 
+export type AplusMcpServersFetchResult =
+    | { ok: true; servers: AplusMcpServersMap }
+    | {
+        ok: false
+        reason: 'not-configured' | 'missing-machine-id' | 'http-error' | 'invalid-response' | 'timeout' | 'network-error'
+        error: string
+    }
+
 const TIMEOUT_MS = 3000
 
-export async function fetchAplusMcpServers(token: string, machineId: string): Promise<AplusMcpServersMap> {
+export async function fetchAplusMcpServersResult(token: string, machineId: string): Promise<AplusMcpServersFetchResult> {
     const configUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL
     if (!configUrl) {
         logger.debug('[aplus] HAPPY_APLUS_MCP_CONFIG_URL 미설정 — aplus MCP 자동등록 skip')
-        return {}
+        return { ok: false, reason: 'not-configured', error: 'mcp-config URL is not configured' }
     }
     if (!machineId) {
         logger.debug('[aplus] machineId 없음 — aplus MCP 자동등록 skip')
-        return {}
+        return { ok: false, reason: 'missing-machine-id', error: 'machineId is missing' }
     }
     const ctl = new AbortController()
     const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS)
@@ -45,20 +53,28 @@ export async function fetchAplusMcpServers(token: string, machineId: string): Pr
         })
         if (!res.ok) {
             logger.debug(`[aplus] mcp-config 응답 ${res.status} — skip`)
-            return {}
+            return { ok: false, reason: 'http-error', error: `mcp-config responded with ${res.status}` }
         }
         const body = (await res.json()) as { mcpServers?: AplusMcpServersMap }
         if (!body?.mcpServers || typeof body.mcpServers !== 'object') {
             logger.debug('[aplus] mcp-config 응답에 mcpServers 없음 — skip')
-            return {}
+            return { ok: false, reason: 'invalid-response', error: 'mcp-config response is invalid' }
         }
         const keys = Object.keys(body.mcpServers)
         logger.debug(`[aplus] mcp-config 받음 — 등록: ${keys.join(', ')}`)
-        return body.mcpServers
+        return { ok: true, servers: body.mcpServers }
     } catch (e) {
-        logger.debug(`[aplus] mcp-config fetch 실패 — skip: ${(e as Error).message}`)
-        return {}
+        const timedOut = ctl.signal.aborted
+        logger.debug(`[aplus] mcp-config fetch 실패 — skip: ${timedOut ? 'timeout' : 'network error'}`)
+        return timedOut
+            ? { ok: false, reason: 'timeout', error: 'mcp-config request timed out' }
+            : { ok: false, reason: 'network-error', error: 'mcp-config network request failed' }
     } finally {
         clearTimeout(timer)
     }
+}
+
+export async function fetchAplusMcpServers(token: string, machineId: string): Promise<AplusMcpServersMap> {
+    const result = await fetchAplusMcpServersResult(token, machineId)
+    return result.ok ? result.servers : {}
 }

@@ -17,6 +17,9 @@ import { getToolName } from "./utils/getToolName";
 import { getAskUserQuestionToolCallIds } from "./utils/questionNotification";
 import { cleanupStdinAfterInk } from "@/utils/terminalStdinCleanup";
 import type { MessageParam, ContentBlockParam } from '@anthropic-ai/sdk/resources';
+import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
+import type { McpRuntimeRecovery } from './mcpRuntimeRecovery';
+import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 
 interface PermissionsField {
     date: number;
@@ -101,6 +104,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
     // Create permission handler
     const permissionHandler = new PermissionHandler(session);
+    let mcpController: Pick<McpRuntimeRecovery, 'reconnectServer'> | null = null;
+    registerMcpReconnectHandler(
+        session.client.rpcHandlerManager,
+        session.client.sessionId,
+        () => mcpController,
+    );
 
     // Drop any permission requests left over in agent state from a
     // previous CLI process that died while a tool prompt was open. The
@@ -314,6 +323,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     path: session.path,
                     allowedTools: session.allowedTools ?? [],
                     mcpServers: session.mcpServers,
+                    mcpConfig: session.mcpConfig ? {
+                        ...session.mcpConfig,
+                        onApplied: (servers, aplusServers) => {
+                            session.updateMcpConfiguration(servers, aplusServers);
+                        },
+                    } : undefined,
                     hookSettingsPath: session.hookSettingsPath,
                     jsRuntime: session.jsRuntime,
                     canCallTool: permissionHandler.handleToolCall,
@@ -406,6 +421,18 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             await q.setPermissionMode(mode);
                         });
                     },
+                    onMcpControllerReady: (controller) => {
+                        mcpController = controller;
+                    },
+                    onMcpStatus: (status: McpRuntimeServerStatus) => {
+                        session.client.updateMetadata((currentMetadata) => ({
+                            ...currentMetadata,
+                            mcpServers: [
+                                ...(currentMetadata.mcpServers ?? []).filter((server) => server.name !== status.name),
+                                status,
+                            ],
+                        }));
+                    },
                     onThinkingChange: session.onThinkingChange,
                     claudeEnvVars: session.claudeEnvVars,
                     claudeArgs: session.claudeArgs,
@@ -450,6 +477,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     continue;
                 }
             } finally {
+
+                mcpController = null;
 
                 logger.debug('[remote]: launch finally');
 

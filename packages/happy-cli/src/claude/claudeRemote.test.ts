@@ -58,6 +58,7 @@ describe('claudeRemote', () => {
         const setPermissionMode = vi.fn();
         vi.mocked(query).mockReturnValue({
             setPermissionMode,
+            mcpServerStatus: vi.fn(async () => []),
             async *[Symbol.asyncIterator]() {
                 yield {
                     type: 'assistant',
@@ -104,5 +105,107 @@ describe('claudeRemote', () => {
             type: 'assistant',
             isCompactSummary: true,
         }));
+    });
+
+    it('reconnects a server that changes from connected init metadata to failed SDK runtime status', async () => {
+        const reconnectMcpServer = vi.fn(async () => {});
+        const mcpServerStatus = vi.fn()
+            .mockResolvedValueOnce([{
+                name: 'argos',
+                status: 'failed',
+                error: 'connection refused',
+            }])
+            .mockResolvedValueOnce([{ name: 'argos', status: 'connected' }]);
+        const onMcpStatus = vi.fn();
+        vi.mocked(query).mockReturnValue({
+            setPermissionMode: vi.fn(),
+            mcpServerStatus,
+            reconnectMcpServer,
+            async *[Symbol.asyncIterator]() {
+                yield {
+                    type: 'system',
+                    subtype: 'init',
+                    mcp_servers: [{ name: 'argos', status: 'connected' }],
+                };
+                yield {
+                    type: 'result',
+                    subtype: 'success',
+                };
+            },
+        } as any);
+
+        let messageCount = 0;
+        await claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage: async () => {
+                messageCount += 1;
+                return messageCount === 1 ? { message: 'use argos', mode } : null;
+            },
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+            onMcpStatus,
+        });
+
+        expect(mcpServerStatus).toHaveBeenCalled();
+        expect(reconnectMcpServer).toHaveBeenCalledOnce();
+        expect(reconnectMcpServer).toHaveBeenCalledWith('argos');
+        expect(onMcpStatus.mock.calls.map(([status]) => status.status)).toEqual([
+            'failed',
+            'reconnecting',
+            'connected',
+        ]);
+    });
+
+    it('applies changed MCP config at an idle turn boundary', async () => {
+        const setMcpServers = vi.fn(async () => ({ added: ['argos'], removed: [], errors: {} }));
+        vi.mocked(query).mockReturnValue({
+            setPermissionMode: vi.fn(),
+            setMcpServers,
+            mcpServerStatus: vi.fn(async () => []),
+            async *[Symbol.asyncIterator]() {
+                yield { type: 'result', subtype: 'success' };
+            },
+        } as any);
+        const onApplied = vi.fn();
+        let messageCount = 0;
+
+        await claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage: async () => {
+                messageCount += 1;
+                return messageCount === 1 ? { message: 'hello', mode } : null;
+            },
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+            mcpConfig: {
+                baseServers: { happy: { type: 'http', url: 'http://happy.test/mcp' } },
+                initialAplusServers: {},
+                fetchAplusServers: vi.fn(async () => ({
+                    ok: true as const,
+                    servers: { argos: { type: 'http' as const, url: 'https://argos.test/mcp' } },
+                })),
+                onApplied,
+            },
+        });
+
+        expect(setMcpServers).toHaveBeenCalledWith({
+            happy: { type: 'http', url: 'http://happy.test/mcp' },
+            argos: { type: 'http', url: 'https://argos.test/mcp' },
+        });
+        expect(onApplied).toHaveBeenCalledOnce();
     });
 });

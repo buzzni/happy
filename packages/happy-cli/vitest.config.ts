@@ -29,6 +29,7 @@ export default defineConfig({
                     testTimeout: 60_000,
                     include: [
                         'src/claude/claude.integration.test.ts',
+                        'src/claude/mcpRuntimeRecovery.integration.test.ts',
                         'src/codex/codex.integration.test.ts',
                         'src/sandbox/network.integration.test.ts',
                     ],
