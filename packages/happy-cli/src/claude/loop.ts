@@ -7,6 +7,7 @@ import { claudeRemoteLauncher } from "./claudeRemoteLauncher"
 import { ApiClient } from "@/lib"
 import type { JsRuntime } from "./runClaude"
 import type { SandboxConfig } from "@/persistence"
+import type { McpConfigSource } from './mcpConfigSynchronizer'
 
 // Re-export permission mode type from api/types
 // Single unified type with 7 modes - Codex modes mapped at SDK boundary
@@ -34,6 +35,7 @@ interface LoopOptions {
     startingMode?: 'local' | 'remote'
     onModeChange: (mode: 'local' | 'remote') => void
     mcpServers: Record<string, any>
+    mcpConfig?: McpConfigSource
     session: ApiSessionClient
     api: ApiClient,
     claudeEnvVars?: Record<string, string>
@@ -61,6 +63,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         claudeEnvVars: opts.claudeEnvVars,
         claudeArgs: opts.claudeArgs,
         mcpServers: opts.mcpServers,
+        mcpConfig: opts.mcpConfig,
         logPath: logPath,
         messageQueue: opts.messageQueue,
         allowedTools: opts.allowedTools,

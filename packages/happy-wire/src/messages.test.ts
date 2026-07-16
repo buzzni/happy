@@ -4,6 +4,9 @@ import {
   ApiUpdateNewMessageSchema,
   ApiUpdateSessionStateSchema,
   CoreUpdateContainerSchema,
+  McpReconnectRequestSchema,
+  McpReconnectResultSchema,
+  McpRuntimeServerStatusSchema,
   MessageContentSchema,
   SessionProtocolMessageSchema,
 } from './messages';
@@ -14,6 +17,43 @@ import {
 } from './legacyProtocol';
 
 describe('shared wire message schemas', () => {
+  it('parses MCP runtime status and rejects unsupported states', () => {
+    expect(McpRuntimeServerStatusSchema.safeParse({
+      name: 'aplus-common',
+      status: 'reconnecting',
+      error: 'connection refused',
+      checkedAt: 1_721_111_111_000,
+    }).success).toBe(true);
+
+    expect(McpRuntimeServerStatusSchema.safeParse({
+      name: 'aplus-common',
+      status: 'pending',
+      checkedAt: 1_721_111_111_000,
+    }).success).toBe(false);
+  });
+
+  it('parses MCP reconnect contracts and rejects secret-bearing payload fields', () => {
+    expect(McpReconnectRequestSchema.safeParse({
+      sessionId: 'session-1',
+      serverName: 'argos',
+    }).success).toBe(true);
+    expect(McpReconnectRequestSchema.safeParse({
+      sessionId: 'session-1',
+      serverName: 'argos',
+      authorization: 'Bearer secret-token',
+    }).success).toBe(false);
+
+    expect(McpReconnectResultSchema.safeParse({
+      serverName: 'argos',
+      status: 'timeout',
+      error: 'MCP reconnect timed out',
+    }).success).toBe(true);
+    expect(McpReconnectResultSchema.safeParse({
+      serverName: '',
+      status: 'success',
+    }).success).toBe(false);
+  });
+
   it('parses a new-message update', () => {
     const parsed = ApiUpdateNewMessageSchema.safeParse({
       t: 'new-message',

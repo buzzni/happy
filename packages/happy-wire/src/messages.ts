@@ -47,6 +47,27 @@ export const VersionedNullableEncryptedValueSchema = z.object({
 });
 export type VersionedNullableEncryptedValue = z.infer<typeof VersionedNullableEncryptedValueSchema>;
 
+export const McpRuntimeServerStatusSchema = z.strictObject({
+  name: z.string().min(1),
+  status: z.enum(['connected', 'reconnecting', 'failed', 'needs-auth', 'config-fetch-failed']),
+  error: z.string().optional(),
+  checkedAt: z.number().int().nonnegative(),
+});
+export type McpRuntimeServerStatus = z.infer<typeof McpRuntimeServerStatusSchema>;
+
+export const McpReconnectRequestSchema = z.strictObject({
+  sessionId: z.string().min(1),
+  serverName: z.string().min(1),
+});
+export type McpReconnectRequest = z.infer<typeof McpReconnectRequestSchema>;
+
+export const McpReconnectResultSchema = z.strictObject({
+  serverName: z.string().min(1),
+  status: z.enum(['success', 'not_available', 'timeout', 'failed']),
+  error: z.string().optional(),
+});
+export type McpReconnectResult = z.infer<typeof McpReconnectResultSchema>;
+
 export const UpdateNewMessageBodySchema = z.object({
   t: z.literal('new-message'),
   sid: z.string(),

@@ -13,6 +13,9 @@ import { systemPrompt } from "./utils/systemPrompt";
 import { PermissionResult } from "./sdk/types";
 import type { JsRuntime } from "./runClaude";
 import { ORCHESTRATOR_SYSTEM_PROMPT } from "@/orchestrator/workerMcp";
+import { McpRuntimeRecovery } from './mcpRuntimeRecovery';
+import { McpConfigSynchronizer, type McpConfigSource } from './mcpConfigSynchronizer';
+import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
 import { buildWorkerAgents, readWorkerConfigFromEnv } from "@/orchestrator/workerAgents";
 
 export async function claudeRemote(opts: {
@@ -36,6 +39,7 @@ export async function claudeRemote(opts: {
     orchestratorMode?: boolean,
     /** MCP servers to add for orchestrator worker management */
     orchestratorMcpServers?: Record<string, unknown>,
+    mcpConfig?: McpConfigSource,
 
     // Dynamic parameters
     nextMessage: () => Promise<{ message: MessageParam['content'], mode: EnhancedMode } | null>,
@@ -48,6 +52,8 @@ export async function claudeRemote(opts: {
     onMessage: (message: SDKMessage) => void,
     onCompletionEvent?: (message: string) => void,
     onSessionReset?: () => void,
+    onMcpStatus?: (status: McpRuntimeServerStatus) => void,
+    onMcpControllerReady?: (controller: Pick<McpRuntimeRecovery, 'reconnectServer'> | null) => void,
     onSDKMetadata?: (metadata: { tools?: string[]; slashCommands?: string[]; mcpServers?: { name: string; status: string }[]; skills?: string[] }) => void
 }) {
 
@@ -186,6 +192,10 @@ export async function claudeRemote(opts: {
         prompt: messages,
         options: sdkOptions,
     });
+    const mcpRecovery = new McpRuntimeRecovery(response, { onStatus: opts.onMcpStatus });
+    const mcpConfigSynchronizer = opts.mcpConfig
+        ? new McpConfigSynchronizer(response, { ...opts.mcpConfig, onStatus: opts.onMcpStatus })
+        : null;
 
     // Expose query control methods to permission handler
     if (opts.onQueryReady) {
@@ -255,6 +265,10 @@ export async function claudeRemote(opts: {
             if (message.type === 'result') {
                 updateThinking(false);
                 logger.debug('[claudeRemote] Result received');
+                opts.onMcpControllerReady?.(mcpRecovery);
+
+                await mcpConfigSynchronizer?.sync();
+                await mcpRecovery.recoverFailedServers();
 
                 // Send completion messages
                 if (isCompactCommand) {
@@ -275,6 +289,7 @@ export async function claudeRemote(opts: {
                     if (!next) {
                         messages.end();
                     } else {
+                        opts.onMcpControllerReady?.(null);
                         mode = next.mode;
                         messages.push({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: next.message } });
                     }
@@ -304,6 +319,7 @@ export async function claudeRemote(opts: {
             throw e;
         }
     } finally {
+        opts.onMcpControllerReady?.(null);
         updateThinking(false);
     }
 }

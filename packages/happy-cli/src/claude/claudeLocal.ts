@@ -267,7 +267,12 @@ export async function claudeLocal(opts: {
             }
 
             logger.debug(`[ClaudeLocal] Spawning launcher: ${claudeCliPath}`);
-            logger.debug(`[ClaudeLocal] Args: ${JSON.stringify(args)}`);
+            const loggedArgs = args.map((arg, index) => {
+                if (args[index - 1] === '--mcp-config') return '[REDACTED]';
+                if (arg.startsWith('--mcp-config=')) return '--mcp-config=[REDACTED]';
+                return arg;
+            });
+            logger.debug(`[ClaudeLocal] Args: ${JSON.stringify(loggedArgs)}`);
 
             (async () => {
                 let cleanupSandbox: (() => Promise<void>) | null = null;
