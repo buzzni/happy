@@ -8,12 +8,14 @@ const {
     mockInitializeSandbox,
     mockWrapCommand,
     mockSandboxCleanup,
+    mockLoggerDebug,
 } = vi.hoisted(() => ({
     mockSpawn: vi.fn(),
     mockClaudeFindLastSession: vi.fn(),
     mockInitializeSandbox: vi.fn(),
     mockWrapCommand: vi.fn(),
     mockSandboxCleanup: vi.fn(),
+    mockLoggerDebug: vi.fn(),
 }));
 
 vi.mock('cross-spawn', () => ({
@@ -22,7 +24,7 @@ vi.mock('cross-spawn', () => ({
 
 vi.mock('@/ui/logger', () => ({
     logger: {
-        debug: vi.fn(),
+        debug: mockLoggerDebug,
         info: vi.fn(),
         warn: vi.fn(),
     }
@@ -155,6 +157,30 @@ describe('claudeLocal --continue handling', () => {
         expect(spawnArgs).toContain('--session-id');
         expect(spawnArgs).not.toContain('--continue');
         expect(spawnArgs).not.toContain('--resume');
+    });
+
+    it('should not log MCP authorization values when spawning Claude', async () => {
+        const secret = 'Bearer live-argos-secret';
+
+        await claudeLocal({
+            abort: new AbortController().signal,
+            sessionId: null,
+            path: '/tmp',
+            onSessionFound,
+            claudeArgs: [],
+            mcpServers: {
+                argos: {
+                    type: 'http',
+                    url: 'https://argos.test/mcp',
+                    headers: { Authorization: secret },
+                },
+            },
+        });
+
+        const debugOutput = mockLoggerDebug.mock.calls.flat().join('\n');
+        expect(debugOutput).not.toContain(secret);
+        expect(debugOutput).toContain('--mcp-config');
+        expect(debugOutput).toContain('[REDACTED]');
     });
 
     it('should handle --resume with specific session ID without conflict', async () => {
