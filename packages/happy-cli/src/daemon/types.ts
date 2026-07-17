@@ -30,6 +30,20 @@ export interface SessionRuntimeState {
    * liveness/keep-alive timestamp — it only advances on real user activity.
    */
   lastUserInteractionAt?: number;
+  /**
+   * Last time the agent finished a turn and went fully idle (busy → not
+   * thinking / no open tool call / not waiting on the user). Marks a safe
+   * reclamation point — there is no in-flight work to lose — so the reaper can
+   * clean a done-and-idle conversation well before the multi-day absolute cut.
+   */
+  lastTurnEndAt?: number;
+  /**
+   * True once this conversation has launched a background job (e.g. a Bash tool
+   * call with run_in_background). Such a session may look idle at turn end while
+   * its detached work is still running, so it is exempted from the aggressive
+   * turn-end reap and falls back to the conservative absolute idle cut.
+   */
+  launchedBackgroundJob?: boolean;
   /** 'local' = a terminal is attached to this session; 'remote' = app-driven. */
   mode?: 'local' | 'remote';
   updatedAt: number;

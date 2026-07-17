@@ -142,6 +142,18 @@ function isAskUserQuestionToolName(value: string | undefined | null): boolean {
         || normalized === '사용자에게질문';
 }
 
+/**
+ * True when a tool-call-start launches detached background work (Claude Code's
+ * Bash tool with `run_in_background`). Such a call returns immediately, so the
+ * session reaches turn-end while the job is still running — we use this to
+ * exempt the conversation from the aggressive turn-end reap. Best-effort on the
+ * tool input; the daemon idle knob is the reliable backstop.
+ */
+export function toolCallStartLaunchesBackgroundJob(ev: { name: string; args: Record<string, unknown> }): boolean {
+    const bg = ev.args?.run_in_background ?? ev.args?.runInBackground;
+    return bg === true;
+}
+
 function extractLocalTranscriptImageAttachments(body: RawJSONLines): LocalImageAttachment[] {
     if (body.type !== 'user' || body.isMeta || body.isSidechain) {
         return [];
@@ -293,6 +305,8 @@ export class ApiSessionClient extends EventEmitter {
     } | null = null;
     private currentMode: 'local' | 'remote' = 'remote';
     private lastUserInteractionAt: number | undefined;
+    private lastTurnEndAt: number | undefined;
+    private launchedBackgroundJob = false;
 
     constructor(token: string, session: Session) {
         super()
@@ -1100,6 +1114,16 @@ export class ApiSessionClient extends EventEmitter {
                 }
             } else {
                 this.openToolCallIds.add(envelope.ev.call);
+                // A background job (e.g. Bash run_in_background) returns its
+                // tool call immediately, so the session looks idle at turn end
+                // while the detached work keeps running. Flag the conversation
+                // so the reaper falls back to the conservative absolute cut
+                // instead of the aggressive turn-end reap. Best-effort: the
+                // flag is derived from the tool input, and the daemon idle knob
+                // is the reliable backstop if the field name ever changes.
+                if (!this.launchedBackgroundJob && toolCallStartLaunchesBackgroundJob(envelope.ev)) {
+                    this.launchedBackgroundJob = true;
+                }
             }
         } else if (envelope.ev.t === 'tool-call-end') {
             this.openToolCallIds.delete(envelope.ev.call);
@@ -1225,6 +1249,15 @@ export class ApiSessionClient extends EventEmitter {
             this.lastUserInteractionAt = now;
         }
 
+        // Stamp a turn-end timestamp when the agent goes from busy to fully idle
+        // (finished a turn, now waiting on the user). This marks a safe point to
+        // reclaim a done conversation before the multi-day absolute cut.
+        const prevBusy = !!prev && (prev.thinking || prev.hasOpenToolCall || prev.pendingUserInput);
+        const nowIdle = !daemonThinking && !hasOpenToolCall && !pendingUserInput;
+        if (prevBusy && nowIdle) {
+            this.lastTurnEndAt = now;
+        }
+
         if (!force && prev
             && prev.thinking === daemonThinking
             && prev.hasOpenToolCall === hasOpenToolCall
@@ -1244,6 +1277,8 @@ export class ApiSessionClient extends EventEmitter {
             hasOpenToolCall,
             pendingUserInput,
             ...(this.lastUserInteractionAt !== undefined ? { lastUserInteractionAt: this.lastUserInteractionAt } : {}),
+            ...(this.lastTurnEndAt !== undefined ? { lastTurnEndAt: this.lastTurnEndAt } : {}),
+            ...(this.launchedBackgroundJob ? { launchedBackgroundJob: true } : {}),
             mode: this.currentMode,
         });
     }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiSessionClient } from './apiSession';
+import { ApiSessionClient, toolCallStartLaunchesBackgroundJob } from './apiSession';
 import { decodeBase64, decrypt, decryptBlob, encodeBase64, encrypt } from './encryption';
 import type { Update } from './types';
 import { logger } from '@/ui/logger';
@@ -1824,5 +1824,18 @@ describe('ApiSessionClient fallback title', () => {
         client.sendSessionEvent({ type: 'ready' });
 
         expect(summariesSentBy(spy)).toEqual(['first message']);
+    });
+});
+
+describe('toolCallStartLaunchesBackgroundJob', () => {
+    it('detects a Bash tool call started in the background', () => {
+        expect(toolCallStartLaunchesBackgroundJob({ name: 'Bash', args: { command: 'train.sh', run_in_background: true } })).toBe(true);
+        expect(toolCallStartLaunchesBackgroundJob({ name: 'Bash', args: { command: 'train.sh', runInBackground: true } })).toBe(true);
+    });
+
+    it('does not flag foreground or non-background tool calls', () => {
+        expect(toolCallStartLaunchesBackgroundJob({ name: 'Bash', args: { command: 'ls' } })).toBe(false);
+        expect(toolCallStartLaunchesBackgroundJob({ name: 'Bash', args: { command: 'ls', run_in_background: false } })).toBe(false);
+        expect(toolCallStartLaunchesBackgroundJob({ name: 'Read', args: {} })).toBe(false);
     });
 });

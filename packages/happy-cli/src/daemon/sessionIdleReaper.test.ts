@@ -6,6 +6,7 @@ import {
   DEFAULT_IDLE_STOP_MIN_SESSION_AGE_MS,
   DEFAULT_IDLE_STOP_PRESENCE_STALE_MS,
   DEFAULT_IDLE_STOP_RECENT_INTERACTION_MS,
+  DEFAULT_SESSION_TURN_END_REAPER_MS,
   buildDaemonSessionIdleReaperRequest,
   evaluateIdleStopGuard,
   isPolicyStopSource,
@@ -185,23 +186,56 @@ describe('buildDaemonSessionIdleReaperRequest', () => {
       now: 10_000,
       idleAfterMs: 123,
       presenceStaleMs: 456,
+      turnEndReaperMs: 789,
       sessionStartTimes: new Map(),
       trackedSessions: [],
     })).toEqual({
       machineId: 'machine-1',
       idleAfterMs: 123,
       presenceStaleMs: 456,
+      turnEndReaperMs: 789,
       sessions: [],
     });
+  });
+
+  it('forwards turn-end and background-job signals for the turn-end reap', () => {
+    const request = buildDaemonSessionIdleReaperRequest({
+      machineId: 'machine-1',
+      now: 10_000,
+      sessionStartTimes: new Map([[100, 1_000], [101, 1_000]]),
+      trackedSessions: [
+        tracked({
+          pid: 100,
+          happySessionId: 'done',
+          happySessionMetadataFromLocalWebhook: { flavor: 'claude' } as never,
+          runtime: { thinking: false, hasOpenToolCall: false, lastTurnEndAt: 7_000, updatedAt: 9_000 },
+        }),
+        tracked({
+          pid: 101,
+          happySessionId: 'bg',
+          happySessionMetadataFromLocalWebhook: { flavor: 'claude' } as never,
+          runtime: { thinking: false, hasOpenToolCall: false, lastTurnEndAt: 7_000, launchedBackgroundJob: true, updatedAt: 9_000 },
+        }),
+      ],
+    });
+
+    expect(request.sessions).toEqual([
+      expect.objectContaining({ sessionId: 'done', lastTurnEndAt: 7_000 }),
+      expect.objectContaining({ sessionId: 'bg', lastTurnEndAt: 7_000, launchedBackgroundJob: true }),
+    ]);
+    // The background-job session must NOT carry the flag when absent.
+    expect(request.sessions[0]).not.toHaveProperty('launchedBackgroundJob');
   });
 });
 
 describe('readDaemonSessionIdleReaperConfig', () => {
-  it('defaults the idle cut to 24 hours', () => {
+  it('defaults the idle cut to 24 hours and the turn-end reap to 1 hour', () => {
     expect(DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS).toBe(24 * 60 * 60 * 1000);
+    expect(DEFAULT_SESSION_TURN_END_REAPER_MS).toBe(60 * 60 * 1000);
     expect(readDaemonSessionIdleReaperConfig({})).toEqual({
       disabled: false,
       idleAfterMs: DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS,
+      turnEndReaperMs: DEFAULT_SESSION_TURN_END_REAPER_MS,
     });
   });
 
@@ -211,6 +245,17 @@ describe('readDaemonSessionIdleReaperConfig', () => {
     })).toMatchObject({
       idleAfterMs: 2500,
     });
+  });
+
+  it('overrides the turn-end reap and disables it when set to 0', () => {
+    expect(readDaemonSessionIdleReaperConfig({
+      HAPPY_DAEMON_SESSION_TURN_END_REAPER_MS: '900000',
+    })).toMatchObject({ turnEndReaperMs: 900000 });
+    // 0 disables the turn-end reap — the field is omitted so the absolute cut
+    // is the only cleanup threshold.
+    expect(readDaemonSessionIdleReaperConfig({
+      HAPPY_DAEMON_SESSION_TURN_END_REAPER_MS: '0',
+    })).not.toHaveProperty('turnEndReaperMs');
   });
 });
 

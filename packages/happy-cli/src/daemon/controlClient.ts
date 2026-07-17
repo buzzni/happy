@@ -97,6 +97,8 @@ export async function notifyDaemonSessionRuntime(
     hasOpenToolCall?: boolean;
     pendingUserInput?: boolean;
     lastUserInteractionAt?: number;
+    lastTurnEndAt?: number;
+    launchedBackgroundJob?: boolean;
     mode?: 'local' | 'remote';
   }
 ): Promise<{ error?: string } | any> {
