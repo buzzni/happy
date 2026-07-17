@@ -9,6 +9,7 @@ import { RawJSONLines } from '@/claude/types';
 import { randomUUID } from 'node:crypto';
 import { AsyncLock } from '@/utils/lock';
 import { deriveKey } from '@/utils/deriveKey';
+import { buildFallbackTitle } from '@/utils/fallbackTitle';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { registerCommonHandlers } from '../modules/common/registerCommonHandlers';
 import { calculateCost } from '@/utils/pricing';
@@ -226,6 +227,13 @@ export class ApiSessionClient extends EventEmitter {
     readonly sessionId: string;
     private metadata: Metadata | null;
     private metadataVersion: number;
+    // Set synchronously the moment a summary (title) message passes through this
+    // client, so callers can tell "a title was already chosen this run" without
+    // waiting for the async updateMetadata socket round-trip to reflect it.
+    private summarySent: boolean = false;
+    // Title derived from the first usable user message, applied when a turn ends
+    // without the model having titled the chat itself. See @/utils/fallbackTitle.
+    private fallbackTitleCandidate: string | null = null;
     private agentState: AgentState | null;
     private agentStateVersion: number;
     private socket: Socket<ServerToClientEvents, ClientToServerEvents>;
@@ -654,6 +662,12 @@ export class ApiSessionClient extends EventEmitter {
     private routeIncomingMessage(message: unknown) {
         const userResult = UserMessageSchema.safeParse(message);
         if (userResult.success) {
+            // Remember the first message we could title the chat from. Messages
+            // that make no sense as a title (slash commands, empty text) yield
+            // null and leave the slot open for the next one.
+            if (this.fallbackTitleCandidate === null) {
+                this.fallbackTitleCandidate = buildFallbackTitle(userResult.data.content.text);
+            }
             if (this.pendingMessageCallback) {
                 this.pendingMessageCallback(userResult.data);
             } else {
@@ -945,6 +959,7 @@ export class ApiSessionClient extends EventEmitter {
 
         // Update metadata with summary if this is a summary message
         if (body.type === 'summary' && 'summary' in body && 'leafUuid' in body) {
+            this.summarySent = true;
             this.updateMetadata((metadata) => ({
                 ...metadata,
                 summary: {
@@ -1006,6 +1021,29 @@ export class ApiSessionClient extends EventEmitter {
         const mapped = closeClaudeTurnWithStatus(this.claudeSessionProtocolState, status);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
+        this.applyFallbackTitleIfMissing();
+    }
+
+    /**
+     * Title the chat from its first user message when a turn has ended and the
+     * model still hasn't titled it via the `change_title` tool.
+     *
+     * Hooked into the two points every agent already funnels through — turn
+     * close (Claude) and the `ready` session event (Codex, Gemini, ACP,
+     * OpenClaw) — so no launcher has to opt in, and a new agent gets this for
+     * free. Once a title exists (`hasTitle()`), this never fires again, so a
+     * title the model chose is never clobbered.
+     */
+    private applyFallbackTitleIfMissing() {
+        if (this.hasTitle() || !this.fallbackTitleCandidate) {
+            return;
+        }
+        logger.debug(`[API] No title set by the model; applying fallback: ${this.fallbackTitleCandidate}`);
+        this.sendClaudeSessionMessage({
+            type: 'summary',
+            summary: this.fallbackTitleCandidate,
+            leafUuid: randomUUID()
+        });
     }
 
     closeOpenAskUserQuestionsAsCancelled() {
@@ -1144,6 +1182,9 @@ export class ApiSessionClient extends EventEmitter {
             }
         };
         this.enqueueMessage(content);
+        if (event.type === 'ready') {
+            this.applyFallbackTitleIfMissing();
+        }
     }
 
     /**
@@ -1261,6 +1302,16 @@ export class ApiSessionClient extends EventEmitter {
      */
     getMetadata(): Metadata | null {
         return this.metadata;
+    }
+
+    /**
+     * Whether this session already has a title. True if a summary message was
+     * sent this run (tracked synchronously, so it's reliable even before the
+     * async metadata round-trip lands) or if the loaded metadata already
+     * carries a non-empty summary (e.g. a resumed session titled earlier).
+     */
+    hasTitle(): boolean {
+        return this.summarySent || !!this.metadata?.summary?.text?.trim();
     }
 
     /**

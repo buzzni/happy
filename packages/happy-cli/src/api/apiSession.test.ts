@@ -1710,3 +1710,116 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(mockAxiosPost).not.toHaveBeenCalled();
     });
 });
+
+describe('ApiSessionClient fallback title', () => {
+    let socketHandlers: SocketHandlers;
+    let mockSocket: any;
+    let session: ReturnType<typeof makeSession>;
+
+    const emitSocketEvent = (event: string, ...args: any[]) => {
+        const handlers = socketHandlers[event] || [];
+        handlers.forEach((handler) => handler(...args));
+    };
+
+    // Each update needs a fresh seq — the client drops ones it has already seen.
+    let nextSeq = 1;
+    const sendUserMessage = (client: ApiSessionClient, text: string) => {
+        emitSocketEvent('update', createNewMessageUpdate(nextSeq++, encryptContent(session, {
+            role: 'user',
+            content: { type: 'text', text }
+        })));
+    };
+
+    const summariesSentBy = (spy: ReturnType<typeof vi.spyOn>) => spy.mock.calls
+        .map(([body]) => body as any)
+        .filter((body) => body?.type === 'summary')
+        .map((body) => body.summary as string);
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockShouldReconnect.mockReturnValue(true);
+        socketHandlers = {};
+        nextSeq = 1;
+        session = makeSession();
+        mockSocket = {
+            connected: true,
+            connect: vi.fn(),
+            on: vi.fn((event: string, handler: SocketHandler) => {
+                if (!socketHandlers[event]) {
+                    socketHandlers[event] = [];
+                }
+                socketHandlers[event].push(handler);
+            }),
+            off: vi.fn(),
+            emit: vi.fn(),
+            emitWithAck: vi.fn(async () => ({ result: 'error' })),
+            volatile: { emit: vi.fn() },
+            close: vi.fn()
+        };
+        mockIo.mockReturnValue(mockSocket);
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+        vi.restoreAllMocks();
+    });
+
+    it('titles the chat from the first user message when a turn ends untitled', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
+
+        sendUserMessage(client, '음... 그러니까 로그인 버튼이 안 눌려');
+        client.closeClaudeSessionTurn('completed');
+
+        expect(summariesSentBy(spy)).toEqual(['음... 그러니까 로그인 버튼이 안 눌려']);
+        expect(client.hasTitle()).toBe(true);
+    });
+
+    it('never clobbers a title the model set via change_title', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
+
+        sendUserMessage(client, '음... 그러니까 로그인 버튼이 안 눌려');
+        // What the happy MCP change_title tool does.
+        client.sendClaudeSessionMessage({ type: 'summary', summary: 'Login button fix', leafUuid: 'model-uuid' } as any);
+        client.closeClaudeSessionTurn('completed');
+
+        expect(summariesSentBy(spy)).toEqual(['Login button fix']);
+    });
+
+    it('applies the fallback on the ready event used by codex/gemini/acp', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
+
+        sendUserMessage(client, 'refactor the reaper');
+        client.sendSessionEvent({ type: 'ready' });
+
+        expect(summariesSentBy(spy)).toEqual(['refactor the reaper']);
+    });
+
+    it('does not title from a slash command, and uses the next real message instead', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
+
+        sendUserMessage(client, '/clear');
+        client.closeClaudeSessionTurn('completed');
+        expect(summariesSentBy(spy)).toEqual([]);
+
+        sendUserMessage(client, 'now fix the parser');
+        client.closeClaudeSessionTurn('completed');
+        expect(summariesSentBy(spy)).toEqual(['now fix the parser']);
+    });
+
+    it('applies the fallback only once across later turns', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
+
+        sendUserMessage(client, 'first message');
+        client.closeClaudeSessionTurn('completed');
+        sendUserMessage(client, 'second message');
+        client.closeClaudeSessionTurn('completed');
+        client.sendSessionEvent({ type: 'ready' });
+
+        expect(summariesSentBy(spy)).toEqual(['first message']);
+    });
+});
