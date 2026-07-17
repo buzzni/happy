@@ -662,11 +662,12 @@ export class ApiSessionClient extends EventEmitter {
     private routeIncomingMessage(message: unknown) {
         const userResult = UserMessageSchema.safeParse(message);
         if (userResult.success) {
-            // Remember the first message we could title the chat from. Messages
-            // that make no sense as a title (slash commands, empty text) yield
-            // null and leave the slot open for the next one.
+            // Title the chat from the first message we can, right as it lands.
+            // Messages that make no sense as a title (slash commands, empty
+            // text) yield null and leave the slot open for the next one.
             if (this.fallbackTitleCandidate === null) {
                 this.fallbackTitleCandidate = buildFallbackTitle(userResult.data.content.text);
+                this.applyFallbackTitleIfMissing();
             }
             if (this.pendingMessageCallback) {
                 this.pendingMessageCallback(userResult.data);
@@ -1021,18 +1022,20 @@ export class ApiSessionClient extends EventEmitter {
         const mapped = closeClaudeTurnWithStatus(this.claudeSessionProtocolState, status);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
-        this.applyFallbackTitleIfMissing();
     }
 
     /**
-     * Title the chat from its first user message when a turn has ended and the
-     * model still hasn't titled it via the `change_title` tool.
+     * Title the chat from its first user message, so it is findable straight
+     * away rather than only once the model gets around to `change_title` — an
+     * instruction it often skips entirely.
      *
-     * Hooked into the two points every agent already funnels through — turn
-     * close (Claude) and the `ready` session event (Codex, Gemini, ACP,
-     * OpenClaw) — so no launcher has to opt in, and a new agent gets this for
-     * free. Once a title exists (`hasTitle()`), this never fires again, so a
-     * title the model chose is never clobbered.
+     * Called as the message lands, not at turn end: a first turn routinely runs
+     * for minutes, which is exactly when the user goes looking for the chat.
+     * This sits in the client every agent shares, so no launcher opts in and a
+     * new agent gets it for free.
+     *
+     * `hasTitle()` stops this from firing twice, and `change_title` overwrites
+     * unconditionally, so a title the model chooses later always wins.
      */
     private applyFallbackTitleIfMissing() {
         if (this.hasTitle() || !this.fallbackTitleCandidate) {
@@ -1182,9 +1185,6 @@ export class ApiSessionClient extends EventEmitter {
             }
         };
         this.enqueueMessage(content);
-        if (event.type === 'ready') {
-            this.applyFallbackTitleIfMissing();
-        }
     }
 
     /**
