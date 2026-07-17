@@ -344,6 +344,8 @@ export async function startDaemon(): Promise<void> {
         hasOpenToolCall?: boolean;
         pendingUserInput?: boolean;
         lastUserInteractionAt?: number;
+        lastTurnEndAt?: number;
+        launchedBackgroundJob?: boolean;
         mode?: 'local' | 'remote';
         updatedAt: number;
       },
@@ -356,12 +358,18 @@ export async function startDaemon(): Promise<void> {
 
       const prev = trackedSession.runtime;
       const lastUserInteractionAt = runtime.lastUserInteractionAt ?? prev?.lastUserInteractionAt;
+      const lastTurnEndAt = runtime.lastTurnEndAt ?? prev?.lastTurnEndAt;
+      // Sticky once set: a conversation that ever launched a background job
+      // stays exempt from the turn-end reap for the rest of its life.
+      const launchedBackgroundJob = runtime.launchedBackgroundJob || prev?.launchedBackgroundJob;
       const mode = runtime.mode ?? prev?.mode;
       trackedSession.runtime = {
         thinking: runtime.thinking ?? prev?.thinking ?? false,
         hasOpenToolCall: runtime.hasOpenToolCall ?? prev?.hasOpenToolCall ?? false,
         pendingUserInput: runtime.pendingUserInput ?? prev?.pendingUserInput ?? false,
         ...(lastUserInteractionAt !== undefined ? { lastUserInteractionAt } : {}),
+        ...(lastTurnEndAt !== undefined ? { lastTurnEndAt } : {}),
+        ...(launchedBackgroundJob ? { launchedBackgroundJob } : {}),
         ...(mode !== undefined ? { mode } : {}),
         updatedAt: runtime.updatedAt,
       };
@@ -1097,6 +1105,7 @@ export async function startDaemon(): Promise<void> {
           stopSession,
           ...(idleReaperConfig.idleAfterMs !== undefined ? { idleAfterMs: idleReaperConfig.idleAfterMs } : {}),
           ...(idleReaperConfig.presenceStaleMs !== undefined ? { presenceStaleMs: idleReaperConfig.presenceStaleMs } : {}),
+          ...(idleReaperConfig.turnEndReaperMs !== undefined ? { turnEndReaperMs: idleReaperConfig.turnEndReaperMs } : {}),
           logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
         });
       }

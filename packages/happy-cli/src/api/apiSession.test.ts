@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiSessionClient } from './apiSession';
+import { ApiSessionClient, toolCallStartLaunchesBackgroundJob } from './apiSession';
 import { decodeBase64, decrypt, decryptBlob, encodeBase64, encrypt } from './encryption';
 import type { Update } from './types';
 import { logger } from '@/ui/logger';
@@ -736,6 +736,59 @@ describe('ApiSessionClient v3 messages API migration', () => {
             lastUserInteractionAt: expect.any(Number),
             mode: 'remote'
         });
+    });
+
+    it('stamps and reports lastTurnEndAt when the agent finishes a turn (busy → idle)', () => {
+        const client = new ApiSessionClient('fake-token', session);
+
+        // A fresh idle report (no prior busy state) must NOT stamp a turn-end.
+        client.keepAlive(false, 'remote');
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', {
+            thinking: false,
+            hasOpenToolCall: false,
+            pendingUserInput: false,
+            mode: 'remote'
+        });
+
+        // Agent starts a turn (idle → busy)…
+        client.keepAlive(true, 'remote');
+        mockNotifyDaemonSessionRuntime.mockClear();
+
+        // …then finishes it (busy → idle): this is a turn-end.
+        client.keepAlive(false, 'remote');
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', {
+            thinking: false,
+            hasOpenToolCall: false,
+            pendingUserInput: false,
+            lastUserInteractionAt: expect.any(Number),
+            lastTurnEndAt: expect.any(Number),
+            mode: 'remote'
+        });
+    });
+
+    it('flags launchedBackgroundJob when a Bash tool call runs in the background', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.keepAlive(true, 'remote');
+        mockNotifyDaemonSessionRuntime.mockClear();
+
+        client.sendSessionProtocolMessage({
+            id: 'env-bg-start-1',
+            time: 2001,
+            role: 'agent',
+            turn: 'turn-bg',
+            ev: {
+                t: 'tool-call-start',
+                call: 'bg-1',
+                name: 'Bash',
+                title: 'Bash',
+                description: 'Run training in background',
+                args: { command: 'train.sh', run_in_background: true }
+            }
+        });
+
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', expect.objectContaining({
+            launchedBackgroundJob: true,
+        }));
     });
 
     it('reports AskUserQuestion wait state as idle to the local daemon', () => {
@@ -1824,5 +1877,18 @@ describe('ApiSessionClient fallback title', () => {
         client.sendSessionEvent({ type: 'ready' });
 
         expect(summariesSentBy(spy)).toEqual(['first message']);
+    });
+});
+
+describe('toolCallStartLaunchesBackgroundJob', () => {
+    it('detects a Bash tool call started in the background', () => {
+        expect(toolCallStartLaunchesBackgroundJob({ name: 'Bash', args: { command: 'train.sh', run_in_background: true } })).toBe(true);
+        expect(toolCallStartLaunchesBackgroundJob({ name: 'Bash', args: { command: 'train.sh', runInBackground: true } })).toBe(true);
+    });
+
+    it('does not flag foreground or non-background tool calls', () => {
+        expect(toolCallStartLaunchesBackgroundJob({ name: 'Bash', args: { command: 'ls' } })).toBe(false);
+        expect(toolCallStartLaunchesBackgroundJob({ name: 'Bash', args: { command: 'ls', run_in_background: false } })).toBe(false);
+        expect(toolCallStartLaunchesBackgroundJob({ name: 'Read', args: {} })).toBe(false);
     });
 });

@@ -94,6 +94,8 @@ export function startDaemonControlServer({
           hasOpenToolCall: z.boolean().optional(),
           pendingUserInput: z.boolean().optional(),
           lastUserInteractionAt: z.number().optional(),
+          lastTurnEndAt: z.number().optional(),
+          launchedBackgroundJob: z.boolean().optional(),
           mode: z.enum(['local', 'remote']).optional()
         }),
         response: {
@@ -103,13 +105,15 @@ export function startDaemonControlServer({
         }
       }
     }, async (request) => {
-      const { sessionId, thinking, hasOpenToolCall, pendingUserInput, lastUserInteractionAt, mode } = request.body;
+      const { sessionId, thinking, hasOpenToolCall, pendingUserInput, lastUserInteractionAt, lastTurnEndAt, launchedBackgroundJob, mode } = request.body;
 
       onHappySessionRuntime(sessionId, {
         ...(thinking !== undefined ? { thinking } : {}),
         ...(hasOpenToolCall !== undefined ? { hasOpenToolCall } : {}),
         ...(pendingUserInput !== undefined ? { pendingUserInput } : {}),
         ...(lastUserInteractionAt !== undefined ? { lastUserInteractionAt } : {}),
+        ...(lastTurnEndAt !== undefined ? { lastTurnEndAt } : {}),
+        ...(launchedBackgroundJob !== undefined ? { launchedBackgroundJob } : {}),
         ...(mode !== undefined ? { mode } : {}),
         updatedAt: Date.now()
       });

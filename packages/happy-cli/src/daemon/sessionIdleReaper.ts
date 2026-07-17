@@ -5,6 +5,10 @@ import type { SessionRuntimeState, TrackedSession } from './types';
 /** Idle cut: a session with no real user activity for this long is cleaned up
  *  (SIGTERM — the session stays resumable). */
 export const DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS = 24 * 60 * 60 * 1000;
+/** A conversation that reached a clean turn-end and sat idle this long is
+ *  reclaimed early (SIGTERM — resumable). Conversations that launched a
+ *  background job are exempt and fall back to the absolute idle cut above. */
+export const DEFAULT_SESSION_TURN_END_REAPER_MS = 60 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_MIN_SESSION_AGE_MS = 10 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_HARD_CAP_MS = 2 * 60 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_PRESENCE_STALE_MS = 5 * 60 * 1000;
@@ -24,6 +28,11 @@ type DaemonSessionIdleReaperObservedSession = {
   /** Last real user action (prompt sent, question/permission answered) — lets
    *  the server compute idleness from user activity instead of liveness. */
   lastUserInteractionAt?: number;
+  /** Last time the agent finished a turn and went idle — lets the server reap a
+   *  done conversation early (turnEndReaperMs) instead of at the absolute cut. */
+  lastTurnEndAt?: number;
+  /** Conversation launched a background job → exempt from the turn-end reap. */
+  launchedBackgroundJob?: boolean;
   /** 'local' = terminal attached. Sent for observability; local protection is
    *  enforced daemon-side via HAPPY_DAEMON_SESSION_IDLE_PROTECT_LOCAL. */
   mode?: 'local' | 'remote';
@@ -35,6 +44,8 @@ export type DaemonSessionIdleReaperRequest = {
   sessions: DaemonSessionIdleReaperObservedSession[];
   idleAfterMs?: number;
   presenceStaleMs?: number;
+  /** Reap a turn-ended, non-background conversation after this much idle time. */
+  turnEndReaperMs?: number;
 };
 
 type DaemonSessionIdleReaperCandidate = {
@@ -43,6 +54,9 @@ type DaemonSessionIdleReaperCandidate = {
   machineId: string;
   lastActiveAt: number;
   idleMs: number;
+  /** Why the server selected this session. Absent from servers that predate
+   *  the turn-end reap — treated as the absolute-idle-cut for logging. */
+  reason?: 'absolute-idle-cut' | 'turn-end';
 };
 
 type DaemonSessionIdleReaperResponse = {
@@ -66,6 +80,7 @@ type RunDaemonSessionIdleReaperTickInput = {
   now?: number;
   idleAfterMs?: number;
   presenceStaleMs?: number;
+  turnEndReaperMs?: number;
   postCandidates?: (input: PostCandidatesInput) => Promise<DaemonSessionIdleReaperResponse>;
   logDebug?: (message: string) => void;
 };
@@ -246,15 +261,25 @@ export type DaemonSessionIdleReaperConfig = {
   disabled: boolean;
   idleAfterMs?: number;
   presenceStaleMs?: number;
+  /** undefined when the turn-end reap is disabled (env set to 0). */
+  turnEndReaperMs?: number;
 };
 
 export function readDaemonSessionIdleReaperConfig(env: NodeJS.ProcessEnv = process.env): DaemonSessionIdleReaperConfig {
   const idleAfterMs = parseOptionalMs(env.HAPPY_DAEMON_SESSION_IDLE_REAPER_AFTER_MS);
   const presenceStaleMs = parseOptionalMs(env.HAPPY_DAEMON_SESSION_IDLE_REAPER_PRESENCE_STALE_MS);
+  // Turn-end reap: default 1h; env override; explicit 0 disables it (absolute
+  // cut still applies). A machine that runs long unattended background jobs can
+  // lengthen or disable this knob.
+  const turnEndRaw = parseOptionalMs(env.HAPPY_DAEMON_SESSION_TURN_END_REAPER_MS);
+  const turnEndReaperMs = turnEndRaw === undefined
+    ? DEFAULT_SESSION_TURN_END_REAPER_MS
+    : (turnEndRaw > 0 ? turnEndRaw : undefined);
   return {
     disabled: isTruthy(env.HAPPY_DAEMON_SESSION_IDLE_REAPER_DISABLED),
     idleAfterMs: idleAfterMs ?? DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS,
     ...(presenceStaleMs !== undefined ? { presenceStaleMs } : {}),
+    ...(turnEndReaperMs !== undefined ? { turnEndReaperMs } : {}),
   };
 }
 
@@ -265,6 +290,7 @@ export function buildDaemonSessionIdleReaperRequest(input: {
   now?: number;
   idleAfterMs?: number;
   presenceStaleMs?: number;
+  turnEndReaperMs?: number;
 }): DaemonSessionIdleReaperRequest {
   const now = input.now ?? Date.now();
   const sessions: DaemonSessionIdleReaperObservedSession[] = [];
@@ -285,6 +311,10 @@ export function buildDaemonSessionIdleReaperRequest(input: {
       ...(session.runtime?.lastUserInteractionAt !== undefined
         ? { lastUserInteractionAt: session.runtime.lastUserInteractionAt }
         : {}),
+      ...(session.runtime?.lastTurnEndAt !== undefined
+        ? { lastTurnEndAt: session.runtime.lastTurnEndAt }
+        : {}),
+      ...(session.runtime?.launchedBackgroundJob ? { launchedBackgroundJob: true } : {}),
       ...(session.runtime?.mode !== undefined ? { mode: session.runtime.mode } : {}),
       lastActiveAt: resolveSessionLastActiveAt(session, input.sessionStartTimes, now),
     });
@@ -294,6 +324,7 @@ export function buildDaemonSessionIdleReaperRequest(input: {
     machineId: input.machineId,
     ...(input.idleAfterMs !== undefined ? { idleAfterMs: input.idleAfterMs } : {}),
     ...(input.presenceStaleMs !== undefined ? { presenceStaleMs: input.presenceStaleMs } : {}),
+    ...(input.turnEndReaperMs !== undefined ? { turnEndReaperMs: input.turnEndReaperMs } : {}),
     sessions,
   };
 }
@@ -343,17 +374,20 @@ export async function runDaemonSessionIdleReaperTick(
   }
 
   result.candidateSessions = response.candidates.length;
+  let turnEndStopped = 0;
   for (const candidate of response.candidates) {
+    const reason = candidate.reason ?? 'absolute-idle-cut';
     // Even though the server already excludes busy sessions, the daemon
     // re-validates locally (if-idle) because it is the only component that sees
     // real user activity for the child process it owns.
     const stopResult = input.stopSession(candidate.sessionId, {
       source: 'session-idle-reaper',
-      reason: 'absolute-idle-cut',
+      reason,
       mode: 'if-idle',
     });
     if (stopResult.stopped) {
       result.stoppedSessions += 1;
+      if (reason === 'turn-end') turnEndStopped += 1;
     } else if (stopResult.reason === 'active') {
       result.skippedActiveSessions += 1;
     } else {
@@ -363,7 +397,7 @@ export async function runDaemonSessionIdleReaperTick(
 
   if (result.candidateSessions > 0) {
     input.logDebug?.(
-      `[session-idle-reaper] candidates=${result.candidateSessions} stopped=${result.stoppedSessions} skippedActive=${result.skippedActiveSessions} noop=${result.noopSessions}`,
+      `[session-idle-reaper] candidates=${result.candidateSessions} stopped=${result.stoppedSessions} (turnEnd=${turnEndStopped}) skippedActive=${result.skippedActiveSessions} noop=${result.noopSessions}`,
     );
   }
 
