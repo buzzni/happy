@@ -43,6 +43,7 @@ import { getProjectPath } from './utils/path';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { RawJSONLinesSchema, type RawJSONLines } from './types';
+import { installBroadKillShims } from '@/utils/broadKillShims';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -74,7 +75,11 @@ type PendingClaudeGoalAction = {
 export async function runClaude(credentials: Credentials, options: StartOptions = {}): Promise<void> {
     logger.debug(`[CLAUDE] ===== CLAUDE MODE STARTING =====`);
     logger.debug(`[CLAUDE] This is the Claude agent, NOT Gemini`);
-    
+
+    // Shield killall/pkill against broad kills before anything is spawned —
+    // everything this session launches inherits the shimmed PATH.
+    installBroadKillShims();
+
     const workingDirectory = process.cwd();
     const sessionTag = randomUUID();
 

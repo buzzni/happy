@@ -29,7 +29,17 @@ export function generateHookSettingsFile(port: number): string {
     const forwarderScript = resolve(projectPath(), 'scripts', 'session_hook_forwarder.cjs');
     const hookCommand = `node "${forwarderScript}" ${port}`;
 
+    // Guard against broad kills (`killall node`, `pkill -f node`, ...) that
+    // would take down the happy daemon and every agent session on the machine.
+    const broadKillGuardScript = resolve(projectPath(), 'scripts', 'broad_kill_guard.cjs');
+    const broadKillGuardCommand = `node "${broadKillGuardScript}"`;
+
     const settings = {
+        permissions: {
+            deny: [
+                "Bash(killall:*)"
+            ]
+        },
         hooks: {
             SessionStart: [
                 {
@@ -38,6 +48,17 @@ export function generateHookSettingsFile(port: number): string {
                         {
                             type: "command",
                             command: hookCommand
+                        }
+                    ]
+                }
+            ],
+            PreToolUse: [
+                {
+                    matcher: "Bash",
+                    hooks: [
+                        {
+                            type: "command",
+                            command: broadKillGuardCommand
                         }
                     ]
                 }
