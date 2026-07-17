@@ -55,7 +55,6 @@ import {
   type StopSessionContext,
   type StopSessionResult,
 } from './sessionIdleReaper';
-import { measureSessionRss, readSessionMemoryPressureConfig } from './sessionMemoryPressure';
 import { waitForSessionWebhook } from './spawnWebhookWait';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
@@ -1051,7 +1050,6 @@ export async function startDaemon(): Promise<void> {
       ? heartbeatIntervalMsEnv
       : 60_000;
     const idleReaperConfig = readDaemonSessionIdleReaperConfig(process.env);
-    const memoryPressureConfig = readSessionMemoryPressureConfig(process.env);
     let heartbeatRunning = false
     const restartOnStaleVersionAndHeartbeat = setInterval(async () => {
       if (heartbeatRunning) {
@@ -1078,8 +1076,8 @@ export async function startDaemon(): Promise<void> {
       }
 
       // Reclaim sessions whose runtime stopped reporting entirely (dead process
-      // with a live PID). Independent of the server flow so zombies don't wait
-      // out the multi-day absolute idle cut.
+      // with a live PID). Independent of the server flow so a genuine leak
+      // doesn't wait out the 24h idle cut.
       sweepZombieSessions({
         trackedSessions: getCurrentChildren(),
         sessionStartTimes,
@@ -1090,20 +1088,13 @@ export async function startDaemon(): Promise<void> {
       });
 
       if (!idleReaperConfig.disabled) {
-        // Memory-pressure eviction input: a failed measurement means pressure is
-        // unknown and the tick performs no pressure evictions (fail closed).
-        const trackedForTick = getCurrentChildren();
-        const measurement = memoryPressureConfig.disabled
-          ? null
-          : await measureSessionRss(trackedForTick.map((s) => s.pid));
         await runDaemonSessionIdleReaperTick({
           machineId,
           serverUrl: configuration.serverUrl,
           credentialsToken: credentials.token,
-          trackedSessions: trackedForTick,
+          trackedSessions: getCurrentChildren(),
           sessionStartTimes,
           stopSession,
-          pressure: { measurement, config: memoryPressureConfig },
           ...(idleReaperConfig.idleAfterMs !== undefined ? { idleAfterMs: idleReaperConfig.idleAfterMs } : {}),
           ...(idleReaperConfig.presenceStaleMs !== undefined ? { presenceStaleMs: idleReaperConfig.presenceStaleMs } : {}),
           logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),

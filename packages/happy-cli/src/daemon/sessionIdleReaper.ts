@@ -1,25 +1,16 @@
 import axios from 'axios';
 
 import type { SessionRuntimeState, TrackedSession } from './types';
-import {
-  DEFAULT_SESSION_RSS_FALLBACK_BYTES,
-  type SessionMemoryPressureConfig,
-  type SessionRssMeasurement,
-} from './sessionMemoryPressure';
 
-/** Absolute idle cut: even without memory pressure, a session nobody touched
- *  for this long is cleaned up. Resource reclamation itself is handled by the
- *  pressure-based eviction below, so this is deliberately long. */
-export const DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
-/** Under memory pressure, sessions become eviction-eligible (oldest user
- *  interaction first) once idle for at least this long. */
-export const DEFAULT_SESSION_PRESSURE_MIN_IDLE_MS = 30 * 60 * 1000;
+/** Idle cut: a session with no real user activity for this long is cleaned up
+ *  (SIGTERM — the session stays resumable). */
+export const DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_MIN_SESSION_AGE_MS = 10 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_HARD_CAP_MS = 2 * 60 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_PRESENCE_STALE_MS = 5 * 60 * 1000;
 /** Local guard floor: no policy stop may kill a session the user touched
- *  within this window, matching the pressure-eviction eligibility floor. */
-export const DEFAULT_IDLE_STOP_RECENT_INTERACTION_MS = DEFAULT_SESSION_PRESSURE_MIN_IDLE_MS;
+ *  within this window, regardless of process age. */
+export const DEFAULT_IDLE_STOP_RECENT_INTERACTION_MS = 30 * 60 * 1000;
 
 type DaemonSessionIdleReaperObservedSession = {
   sessionId: string;
@@ -44,11 +35,6 @@ export type DaemonSessionIdleReaperRequest = {
   sessions: DaemonSessionIdleReaperObservedSession[];
   idleAfterMs?: number;
   presenceStaleMs?: number;
-  /** Present only when the daemon is over its memory budget: asks the server
-   *  to also rank sessions idle ≥ minIdleMs (oldest activity first) so the
-   *  daemon can evict until it is back under the low-water mark. Servers that
-   *  predate this field ignore it and return only absolute-cut candidates. */
-  pressure?: { active: boolean; minIdleMs: number };
 };
 
 type DaemonSessionIdleReaperCandidate = {
@@ -80,15 +66,6 @@ type RunDaemonSessionIdleReaperTickInput = {
   now?: number;
   idleAfterMs?: number;
   presenceStaleMs?: number;
-  /** Memory-pressure eviction: when the measured session RSS exceeds the
-   *  budget, candidates below the absolute cut are evicted oldest-activity
-   *  first until the estimate drops under the low-water mark. Omitted (or a
-   *  null measurement) means pressure is unknown — no pressure evictions. */
-  pressure?: {
-    measurement: SessionRssMeasurement | null;
-    config: SessionMemoryPressureConfig;
-    minIdleMs?: number;
-  };
   postCandidates?: (input: PostCandidatesInput) => Promise<DaemonSessionIdleReaperResponse>;
   logDebug?: (message: string) => void;
 };
@@ -97,8 +74,6 @@ export type DaemonSessionIdleReaperTickResult = {
   requestedSessions: number;
   candidateSessions: number;
   stoppedSessions: number;
-  /** Subset of stoppedSessions evicted for memory pressure (below the absolute cut). */
-  pressureStoppedSessions: number;
   /** Candidates the daemon refused to stop because its local guard saw activity. */
   skippedActiveSessions: number;
   noopSessions: number;
@@ -151,9 +126,9 @@ export function resolveStopSessionMode(context?: StopSessionContext): StopSessio
 }
 
 export type IdleStopGuardConfig = {
-  /** Sessions the user touched within this window are never policy-stopped.
-   *  Decoupled from the absolute idle cut: the pressure eviction path needs a
-   *  short floor (default 30m), not the multi-day absolute threshold. */
+  /** Sessions the user touched within this window are never policy-stopped —
+   *  a short safety floor (default 30m) so a race can't kill a session the
+   *  user just interacted with, independent of the 24h idle cut. */
   recentInteractionMs: number;
   minSessionAgeMs: number;
   hardCapMs: number;
@@ -290,7 +265,6 @@ export function buildDaemonSessionIdleReaperRequest(input: {
   now?: number;
   idleAfterMs?: number;
   presenceStaleMs?: number;
-  pressure?: { active: boolean; minIdleMs: number };
 }): DaemonSessionIdleReaperRequest {
   const now = input.now ?? Date.now();
   const sessions: DaemonSessionIdleReaperObservedSession[] = [];
@@ -320,7 +294,6 @@ export function buildDaemonSessionIdleReaperRequest(input: {
     machineId: input.machineId,
     ...(input.idleAfterMs !== undefined ? { idleAfterMs: input.idleAfterMs } : {}),
     ...(input.presenceStaleMs !== undefined ? { presenceStaleMs: input.presenceStaleMs } : {}),
-    ...(input.pressure !== undefined ? { pressure: input.pressure } : {}),
     sessions,
   };
 }
@@ -347,31 +320,11 @@ export async function postDaemonSessionIdleReaperCandidates(input: PostCandidate
 export async function runDaemonSessionIdleReaperTick(
   input: RunDaemonSessionIdleReaperTickInput,
 ): Promise<DaemonSessionIdleReaperTickResult> {
-  const absoluteCutMs = input.idleAfterMs ?? DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS;
-  const pressure = (() => {
-    const config = input.pressure?.config;
-    const measurement = input.pressure?.measurement ?? null;
-    if (!config || config.disabled || measurement === null) return null;
-    if (measurement.totalBytes <= config.budgetBytes) return null;
-    return { config, measurement };
-  })();
-
-  const request = buildDaemonSessionIdleReaperRequest({
-    machineId: input.machineId,
-    trackedSessions: input.trackedSessions,
-    sessionStartTimes: input.sessionStartTimes,
-    ...(input.now !== undefined ? { now: input.now } : {}),
-    ...(input.idleAfterMs !== undefined ? { idleAfterMs: input.idleAfterMs } : {}),
-    ...(input.presenceStaleMs !== undefined ? { presenceStaleMs: input.presenceStaleMs } : {}),
-    ...(pressure
-      ? { pressure: { active: true, minIdleMs: input.pressure?.minIdleMs ?? DEFAULT_SESSION_PRESSURE_MIN_IDLE_MS } }
-      : {}),
-  });
+  const request = buildDaemonSessionIdleReaperRequest(input);
   const result: DaemonSessionIdleReaperTickResult = {
     requestedSessions: request.sessions.length,
     candidateSessions: 0,
     stoppedSessions: 0,
-    pressureStoppedSessions: 0,
     skippedActiveSessions: 0,
     noopSessions: 0,
   };
@@ -390,44 +343,17 @@ export async function runDaemonSessionIdleReaperTick(
   }
 
   result.candidateSessions = response.candidates.length;
-
-  const pidBySessionId = new Map<string, number>();
-  for (const session of input.trackedSessions) {
-    if (session.happySessionId) pidBySessionId.set(session.happySessionId, session.pid);
-  }
-  let estimatedTotalBytes = pressure ? pressure.measurement.totalBytes : 0;
-  let pressureEvictions = 0;
-
-  // Oldest activity first so pressure evictions drain in LRU order.
-  const candidates = [...response.candidates].sort((a, b) => b.idleMs - a.idleMs);
-  for (const candidate of candidates) {
-    const pastAbsoluteCut = candidate.idleMs >= absoluteCutMs;
-    const evictForPressure = !pastAbsoluteCut
-      && pressure !== null
-      && estimatedTotalBytes > pressure.config.lowWaterBytes
-      && pressureEvictions < pressure.config.maxEvictionsPerTick;
-    if (!pastAbsoluteCut && !evictForPressure) continue;
-
+  for (const candidate of response.candidates) {
     // Even though the server already excludes busy sessions, the daemon
     // re-validates locally (if-idle) because it is the only component that sees
     // real user activity for the child process it owns.
     const stopResult = input.stopSession(candidate.sessionId, {
       source: 'session-idle-reaper',
-      reason: pastAbsoluteCut ? 'absolute-idle-cut' : 'memory-pressure',
+      reason: 'absolute-idle-cut',
       mode: 'if-idle',
     });
     if (stopResult.stopped) {
       result.stoppedSessions += 1;
-      if (!pastAbsoluteCut) {
-        pressureEvictions += 1;
-        result.pressureStoppedSessions += 1;
-      }
-      if (pressure) {
-        const pid = pidBySessionId.get(candidate.sessionId);
-        const freedBytes = (pid !== undefined ? pressure.measurement.bytesByRootPid.get(pid) : undefined)
-          ?? DEFAULT_SESSION_RSS_FALLBACK_BYTES;
-        estimatedTotalBytes = Math.max(0, estimatedTotalBytes - freedBytes);
-      }
     } else if (stopResult.reason === 'active') {
       result.skippedActiveSessions += 1;
     } else {
@@ -437,7 +363,7 @@ export async function runDaemonSessionIdleReaperTick(
 
   if (result.candidateSessions > 0) {
     input.logDebug?.(
-      `[session-idle-reaper] candidates=${result.candidateSessions} stopped=${result.stoppedSessions} pressureStopped=${result.pressureStoppedSessions} skippedActive=${result.skippedActiveSessions} noop=${result.noopSessions}${pressure ? ` rssMb=${Math.round(pressure.measurement.totalBytes / (1024 * 1024))} budgetMb=${Math.round(pressure.config.budgetBytes / (1024 * 1024))}` : ''}`,
+      `[session-idle-reaper] candidates=${result.candidateSessions} stopped=${result.stoppedSessions} skippedActive=${result.skippedActiveSessions} noop=${result.noopSessions}`,
     );
   }
 
