@@ -14,6 +14,7 @@ import { join, resolve } from 'node:path';
 
 import { ApiClient } from '@/api/api';
 import { logger } from '@/ui/logger';
+import { installBroadKillShims } from '@/utils/broadKillShims';
 import { Credentials, readSettings } from '@/persistence';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { initialMachineMetadata } from '@/daemon/run';
@@ -62,11 +63,15 @@ export async function runGemini(opts: {
   credentials: Credentials;
   startedBy?: 'daemon' | 'terminal';
 }): Promise<void> {
+  // Shield killall/pkill against broad kills before anything is spawned —
+  // Gemini has no PreToolUse hook system, so the PATH shim is its only guard.
+  installBroadKillShims();
+
   //
   // Define session
   //
 
-  
+
   const sessionTag = randomUUID();
 
   // Set backend for offline warnings (before any API calls)

@@ -9,6 +9,7 @@ import { DiffProcessor } from './utils/diffProcessor';
 import { randomUUID } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { logger } from '@/ui/logger';
+import { installBroadKillShims } from '@/utils/broadKillShims';
 import { Credentials, readSettings } from '@/persistence';
 import { initialMachineMetadata } from '@/daemon/run';
 import { configuration } from '@/configuration';
@@ -86,6 +87,10 @@ export async function runCodex(opts: {
     resumeThreadId?: string;
     permissionMode?: PermissionMode;
 }): Promise<void> {
+    // Shield killall/pkill against broad kills before anything is spawned —
+    // Codex has no PreToolUse hook system, so the PATH shim is its only guard.
+    installBroadKillShims();
+
     // Early check: ensure Codex CLI is installed before proceeding
     try {
         execSync('codex --version', { encoding: 'utf8', stdio: 'pipe', windowsHide: true });
