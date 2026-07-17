@@ -1,11 +1,25 @@
 import axios from 'axios';
 
 import type { SessionRuntimeState, TrackedSession } from './types';
+import {
+  DEFAULT_SESSION_RSS_FALLBACK_BYTES,
+  type SessionMemoryPressureConfig,
+  type SessionRssMeasurement,
+} from './sessionMemoryPressure';
 
-export const DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS = 24 * 60 * 60 * 1000;
+/** Absolute idle cut: even without memory pressure, a session nobody touched
+ *  for this long is cleaned up. Resource reclamation itself is handled by the
+ *  pressure-based eviction below, so this is deliberately long. */
+export const DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+/** Under memory pressure, sessions become eviction-eligible (oldest user
+ *  interaction first) once idle for at least this long. */
+export const DEFAULT_SESSION_PRESSURE_MIN_IDLE_MS = 30 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_MIN_SESSION_AGE_MS = 10 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_HARD_CAP_MS = 2 * 60 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_PRESENCE_STALE_MS = 5 * 60 * 1000;
+/** Local guard floor: no policy stop may kill a session the user touched
+ *  within this window, matching the pressure-eviction eligibility floor. */
+export const DEFAULT_IDLE_STOP_RECENT_INTERACTION_MS = DEFAULT_SESSION_PRESSURE_MIN_IDLE_MS;
 
 type DaemonSessionIdleReaperObservedSession = {
   sessionId: string;
@@ -30,6 +44,11 @@ export type DaemonSessionIdleReaperRequest = {
   sessions: DaemonSessionIdleReaperObservedSession[];
   idleAfterMs?: number;
   presenceStaleMs?: number;
+  /** Present only when the daemon is over its memory budget: asks the server
+   *  to also rank sessions idle ≥ minIdleMs (oldest activity first) so the
+   *  daemon can evict until it is back under the low-water mark. Servers that
+   *  predate this field ignore it and return only absolute-cut candidates. */
+  pressure?: { active: boolean; minIdleMs: number };
 };
 
 type DaemonSessionIdleReaperCandidate = {
@@ -61,6 +80,15 @@ type RunDaemonSessionIdleReaperTickInput = {
   now?: number;
   idleAfterMs?: number;
   presenceStaleMs?: number;
+  /** Memory-pressure eviction: when the measured session RSS exceeds the
+   *  budget, candidates below the absolute cut are evicted oldest-activity
+   *  first until the estimate drops under the low-water mark. Omitted (or a
+   *  null measurement) means pressure is unknown — no pressure evictions. */
+  pressure?: {
+    measurement: SessionRssMeasurement | null;
+    config: SessionMemoryPressureConfig;
+    minIdleMs?: number;
+  };
   postCandidates?: (input: PostCandidatesInput) => Promise<DaemonSessionIdleReaperResponse>;
   logDebug?: (message: string) => void;
 };
@@ -69,6 +97,8 @@ export type DaemonSessionIdleReaperTickResult = {
   requestedSessions: number;
   candidateSessions: number;
   stoppedSessions: number;
+  /** Subset of stoppedSessions evicted for memory pressure (below the absolute cut). */
+  pressureStoppedSessions: number;
   /** Candidates the daemon refused to stop because its local guard saw activity. */
   skippedActiveSessions: number;
   noopSessions: number;
@@ -106,7 +136,7 @@ export type StopSessionResult =
   | { stopped: false; reason: 'not-found' }
   | { stopped: false; reason: 'active'; guard: string; activity: IdleStopGuardActivity };
 
-const POLICY_STOP_SOURCES = new Set(['project-session-idle-stop', 'session-idle-reaper']);
+const POLICY_STOP_SOURCES = new Set(['project-session-idle-stop', 'session-idle-reaper', 'session-zombie-sweep']);
 
 /** True when a stop source is a background cleanup policy rather than a user action. */
 export function isPolicyStopSource(source: unknown): boolean {
@@ -121,7 +151,10 @@ export function resolveStopSessionMode(context?: StopSessionContext): StopSessio
 }
 
 export type IdleStopGuardConfig = {
-  idleAfterMs: number;
+  /** Sessions the user touched within this window are never policy-stopped.
+   *  Decoupled from the absolute idle cut: the pressure eviction path needs a
+   *  short floor (default 30m), not the multi-day absolute threshold. */
+  recentInteractionMs: number;
   minSessionAgeMs: number;
   hardCapMs: number;
   presenceStaleMs: number;
@@ -144,8 +177,8 @@ export type IdleStopGuardDecision =
 
 export function readIdleStopGuardConfig(env: NodeJS.ProcessEnv = process.env): IdleStopGuardConfig {
   return {
-    idleAfterMs: parseOptionalMs(env.HAPPY_DAEMON_SESSION_IDLE_REAPER_AFTER_MS)
-      ?? DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS,
+    recentInteractionMs: parseOptionalMs(env.HAPPY_DAEMON_SESSION_IDLE_RECENT_INTERACTION_MS)
+      ?? DEFAULT_IDLE_STOP_RECENT_INTERACTION_MS,
     minSessionAgeMs: parseOptionalMs(env.HAPPY_DAEMON_SESSION_IDLE_MIN_AGE_MS)
       ?? DEFAULT_IDLE_STOP_MIN_SESSION_AGE_MS,
     hardCapMs: parseOptionalMs(env.HAPPY_DAEMON_SESSION_IDLE_HARD_CAP_MS)
@@ -162,19 +195,29 @@ export function readIdleStopGuardConfig(env: NodeJS.ProcessEnv = process.env): I
  * component that owns the child process and sees cross-surface activity
  * (terminal, mobile, app), so it has the final word over cleanup policies.
  *
- * Hard blocks (thinking / open tool call / pending user input) always deny.
- * Past `hardCapMs` with no such signal, a session is treated as a zombie and
- * allowed so genuine leaks still get cleaned up. Within the hard cap, soft
- * protections (recent user interaction, minimum age, attached local terminal,
- * stale/unknown runtime) deny.
+ * Hard blocks (thinking / open tool call / pending user input) always deny,
+ * and recent user interaction always denies — no cleanup policy may kill a
+ * session the user touched within `recentInteractionMs`, regardless of
+ * process age.
+ *
+ * The zombie escape hatch is measured by runtime-report silence, not process
+ * age: live sessions report on every keepalive (≤30s), so `hardCapMs` without
+ * a report means the runtime is dead even though the PID is alive. A session
+ * that has never reported to this daemon measures silence from the moment this
+ * daemon could first have heard it (the later of session start and daemon
+ * start), which gives recovered sessions a full report window after a daemon
+ * restart instead of being reaped on the first tick.
  */
 export function evaluateIdleStopGuard(input: {
   runtime?: SessionRuntimeState;
   sessionStartedAt?: number;
+  /** When this daemon process started — lower bound for how long a session
+   *  that never reported could have been silent toward this daemon. */
+  daemonStartedAt?: number;
   now: number;
   config: IdleStopGuardConfig;
 }): IdleStopGuardDecision {
-  const { runtime, sessionStartedAt, now, config } = input;
+  const { runtime, sessionStartedAt, daemonStartedAt, now, config } = input;
 
   const activity: IdleStopGuardActivity = {
     thinking: runtime?.thinking === true,
@@ -192,18 +235,23 @@ export function evaluateIdleStopGuard(input: {
   if (activity.hasOpenToolCall) return deny('open-tool-call');
   if (activity.pendingUserInput) return deny('pending-user-input');
 
+  if (activity.lastUserInteractionAt !== undefined
+    && now - activity.lastUserInteractionAt < config.recentInteractionMs) {
+    return deny('recent-user-interaction');
+  }
+
   const { sessionAgeMs } = activity;
 
-  // Zombie escape hatch: past the hard cap with no busy signal, allow cleanup
-  // even when the soft protections below would otherwise apply.
-  if (sessionAgeMs !== undefined && sessionAgeMs >= config.hardCapMs) {
+  // Zombie escape hatch: hardCapMs of runtime-report silence with no busy
+  // signal means the runtime is dead — allow cleanup even when the soft
+  // protections below would otherwise apply. Silence for a session that never
+  // reported starts at the later of session start and daemon start.
+  const silenceSinceAt = runtime?.updatedAt
+    ?? maxDefined(sessionStartedAt, daemonStartedAt);
+  if (silenceSinceAt !== undefined && now - silenceSinceAt >= config.hardCapMs) {
     return { allow: true };
   }
 
-  if (activity.lastUserInteractionAt !== undefined
-    && now - activity.lastUserInteractionAt < config.idleAfterMs) {
-    return deny('recent-user-interaction');
-  }
   if (sessionAgeMs !== undefined && sessionAgeMs < config.minSessionAgeMs) {
     return deny('min-session-age');
   }
@@ -242,6 +290,7 @@ export function buildDaemonSessionIdleReaperRequest(input: {
   now?: number;
   idleAfterMs?: number;
   presenceStaleMs?: number;
+  pressure?: { active: boolean; minIdleMs: number };
 }): DaemonSessionIdleReaperRequest {
   const now = input.now ?? Date.now();
   const sessions: DaemonSessionIdleReaperObservedSession[] = [];
@@ -271,6 +320,7 @@ export function buildDaemonSessionIdleReaperRequest(input: {
     machineId: input.machineId,
     ...(input.idleAfterMs !== undefined ? { idleAfterMs: input.idleAfterMs } : {}),
     ...(input.presenceStaleMs !== undefined ? { presenceStaleMs: input.presenceStaleMs } : {}),
+    ...(input.pressure !== undefined ? { pressure: input.pressure } : {}),
     sessions,
   };
 }
@@ -297,11 +347,31 @@ export async function postDaemonSessionIdleReaperCandidates(input: PostCandidate
 export async function runDaemonSessionIdleReaperTick(
   input: RunDaemonSessionIdleReaperTickInput,
 ): Promise<DaemonSessionIdleReaperTickResult> {
-  const request = buildDaemonSessionIdleReaperRequest(input);
+  const absoluteCutMs = input.idleAfterMs ?? DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS;
+  const pressure = (() => {
+    const config = input.pressure?.config;
+    const measurement = input.pressure?.measurement ?? null;
+    if (!config || config.disabled || measurement === null) return null;
+    if (measurement.totalBytes <= config.budgetBytes) return null;
+    return { config, measurement };
+  })();
+
+  const request = buildDaemonSessionIdleReaperRequest({
+    machineId: input.machineId,
+    trackedSessions: input.trackedSessions,
+    sessionStartTimes: input.sessionStartTimes,
+    ...(input.now !== undefined ? { now: input.now } : {}),
+    ...(input.idleAfterMs !== undefined ? { idleAfterMs: input.idleAfterMs } : {}),
+    ...(input.presenceStaleMs !== undefined ? { presenceStaleMs: input.presenceStaleMs } : {}),
+    ...(pressure
+      ? { pressure: { active: true, minIdleMs: input.pressure?.minIdleMs ?? DEFAULT_SESSION_PRESSURE_MIN_IDLE_MS } }
+      : {}),
+  });
   const result: DaemonSessionIdleReaperTickResult = {
     requestedSessions: request.sessions.length,
     candidateSessions: 0,
     stoppedSessions: 0,
+    pressureStoppedSessions: 0,
     skippedActiveSessions: 0,
     noopSessions: 0,
   };
@@ -320,16 +390,44 @@ export async function runDaemonSessionIdleReaperTick(
   }
 
   result.candidateSessions = response.candidates.length;
-  for (const candidate of response.candidates) {
+
+  const pidBySessionId = new Map<string, number>();
+  for (const session of input.trackedSessions) {
+    if (session.happySessionId) pidBySessionId.set(session.happySessionId, session.pid);
+  }
+  let estimatedTotalBytes = pressure ? pressure.measurement.totalBytes : 0;
+  let pressureEvictions = 0;
+
+  // Oldest activity first so pressure evictions drain in LRU order.
+  const candidates = [...response.candidates].sort((a, b) => b.idleMs - a.idleMs);
+  for (const candidate of candidates) {
+    const pastAbsoluteCut = candidate.idleMs >= absoluteCutMs;
+    const evictForPressure = !pastAbsoluteCut
+      && pressure !== null
+      && estimatedTotalBytes > pressure.config.lowWaterBytes
+      && pressureEvictions < pressure.config.maxEvictionsPerTick;
+    if (!pastAbsoluteCut && !evictForPressure) continue;
+
     // Even though the server already excludes busy sessions, the daemon
     // re-validates locally (if-idle) because it is the only component that sees
     // real user activity for the child process it owns.
     const stopResult = input.stopSession(candidate.sessionId, {
       source: 'session-idle-reaper',
+      reason: pastAbsoluteCut ? 'absolute-idle-cut' : 'memory-pressure',
       mode: 'if-idle',
     });
     if (stopResult.stopped) {
       result.stoppedSessions += 1;
+      if (!pastAbsoluteCut) {
+        pressureEvictions += 1;
+        result.pressureStoppedSessions += 1;
+      }
+      if (pressure) {
+        const pid = pidBySessionId.get(candidate.sessionId);
+        const freedBytes = (pid !== undefined ? pressure.measurement.bytesByRootPid.get(pid) : undefined)
+          ?? DEFAULT_SESSION_RSS_FALLBACK_BYTES;
+        estimatedTotalBytes = Math.max(0, estimatedTotalBytes - freedBytes);
+      }
     } else if (stopResult.reason === 'active') {
       result.skippedActiveSessions += 1;
     } else {
@@ -339,11 +437,55 @@ export async function runDaemonSessionIdleReaperTick(
 
   if (result.candidateSessions > 0) {
     input.logDebug?.(
-      `[session-idle-reaper] candidates=${result.candidateSessions} stopped=${result.stoppedSessions} skippedActive=${result.skippedActiveSessions} noop=${result.noopSessions}`,
+      `[session-idle-reaper] candidates=${result.candidateSessions} stopped=${result.stoppedSessions} pressureStopped=${result.pressureStoppedSessions} skippedActive=${result.skippedActiveSessions} noop=${result.noopSessions}${pressure ? ` rssMb=${Math.round(pressure.measurement.totalBytes / (1024 * 1024))} budgetMb=${Math.round(pressure.config.budgetBytes / (1024 * 1024))}` : ''}`,
     );
   }
 
   return result;
+}
+
+/**
+ * Daemon-local zombie sweep, independent of the server candidate flow: a live
+ * session reports runtime on every keepalive (≤30s), so `silenceMs` (default
+ * the idle-stop hard cap) without any report means the runtime is dead even
+ * though the PID is alive. Sessions that never reported measure silence from
+ * the later of session start and daemon start, giving recovered sessions a
+ * full report window after a daemon restart. Stops are if-idle, so the guard
+ * re-validates each one.
+ */
+export function sweepZombieSessions(input: {
+  trackedSessions: readonly TrackedSession[];
+  sessionStartTimes: ReadonlyMap<number, number>;
+  daemonStartedAt: number;
+  stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
+  now?: number;
+  silenceMs?: number;
+  logDebug?: (message: string) => void;
+}): number {
+  const now = input.now ?? Date.now();
+  const silenceMs = input.silenceMs ?? DEFAULT_IDLE_STOP_HARD_CAP_MS;
+  let stopped = 0;
+
+  for (const session of input.trackedSessions) {
+    if (!session.happySessionId) continue;
+    const lastEvidenceAt = session.runtime?.updatedAt
+      ?? maxDefined(input.sessionStartTimes.get(session.pid), input.daemonStartedAt);
+    if (lastEvidenceAt === undefined || now - lastEvidenceAt < silenceMs) continue;
+
+    const stopResult = input.stopSession(session.happySessionId, {
+      source: 'session-zombie-sweep',
+      reason: 'runtime-silent',
+      mode: 'if-idle',
+    });
+    if (stopResult.stopped) {
+      stopped += 1;
+      input.logDebug?.(
+        `[session-zombie-sweep] stopped ${session.happySessionId} (no runtime report for ${Math.round((now - lastEvidenceAt) / 60_000)}m)`,
+      );
+    }
+  }
+
+  return stopped;
 }
 
 function resolveStoppableAgent(session: TrackedSession): 'claude' | 'codex' | null {
@@ -362,6 +504,11 @@ function resolveSessionLastActiveAt(
   return typeof sessionStartedAt === 'number' && Number.isFinite(sessionStartedAt)
     ? sessionStartedAt
     : now;
+}
+
+function maxDefined(...values: (number | undefined)[]): number | undefined {
+  const defined = values.filter((v): v is number => typeof v === 'number');
+  return defined.length > 0 ? Math.max(...defined) : undefined;
 }
 
 function parseOptionalMs(value: string | undefined): number | undefined {

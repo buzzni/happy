@@ -51,9 +51,11 @@ import {
   evaluateIdleStopGuard,
   resolveStopSessionMode,
   restoreSessionStartTimes,
+  sweepZombieSessions,
   type StopSessionContext,
   type StopSessionResult,
 } from './sessionIdleReaper';
+import { measureSessionRss, readSessionMemoryPressureConfig } from './sessionMemoryPressure';
 import { waitForSessionWebhook } from './spawnWebhookWait';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
@@ -845,6 +847,10 @@ export async function startDaemon(): Promise<void> {
     // Local idle guard config for policy-initiated (if-idle) stops. Read once;
     // env overrides are picked up on daemon restart, same as other knobs.
     const idleStopGuardConfig = readIdleStopGuardConfig(process.env);
+    // Recovered sessions haven't had a chance to report runtime to this daemon
+    // yet — the guard measures their report silence from this moment, not from
+    // their (possibly days-old) session start.
+    const daemonStartedAt = Date.now();
 
     // Stop a session by sessionId or PID fallback.
     //
@@ -869,6 +875,7 @@ export async function startDaemon(): Promise<void> {
             const decision = evaluateIdleStopGuard({
               runtime: session.runtime,
               sessionStartedAt: sessionStartTimes.get(pid),
+              daemonStartedAt,
               now: Date.now(),
               config: idleStopGuardConfig,
             });
@@ -1044,6 +1051,7 @@ export async function startDaemon(): Promise<void> {
       ? heartbeatIntervalMsEnv
       : 60_000;
     const idleReaperConfig = readDaemonSessionIdleReaperConfig(process.env);
+    const memoryPressureConfig = readSessionMemoryPressureConfig(process.env);
     let heartbeatRunning = false
     const restartOnStaleVersionAndHeartbeat = setInterval(async () => {
       if (heartbeatRunning) {
@@ -1069,14 +1077,33 @@ export async function startDaemon(): Promise<void> {
         persistTrackedSessions();
       }
 
+      // Reclaim sessions whose runtime stopped reporting entirely (dead process
+      // with a live PID). Independent of the server flow so zombies don't wait
+      // out the multi-day absolute idle cut.
+      sweepZombieSessions({
+        trackedSessions: getCurrentChildren(),
+        sessionStartTimes,
+        daemonStartedAt,
+        stopSession,
+        silenceMs: idleStopGuardConfig.hardCapMs,
+        logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
+      });
+
       if (!idleReaperConfig.disabled) {
+        // Memory-pressure eviction input: a failed measurement means pressure is
+        // unknown and the tick performs no pressure evictions (fail closed).
+        const trackedForTick = getCurrentChildren();
+        const measurement = memoryPressureConfig.disabled
+          ? null
+          : await measureSessionRss(trackedForTick.map((s) => s.pid));
         await runDaemonSessionIdleReaperTick({
           machineId,
           serverUrl: configuration.serverUrl,
           credentialsToken: credentials.token,
-          trackedSessions: getCurrentChildren(),
+          trackedSessions: trackedForTick,
           sessionStartTimes,
           stopSession,
+          pressure: { measurement, config: memoryPressureConfig },
           ...(idleReaperConfig.idleAfterMs !== undefined ? { idleAfterMs: idleReaperConfig.idleAfterMs } : {}),
           ...(idleReaperConfig.presenceStaleMs !== undefined ? { presenceStaleMs: idleReaperConfig.presenceStaleMs } : {}),
           logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),

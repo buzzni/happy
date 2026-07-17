@@ -5,6 +5,8 @@ import {
   DEFAULT_IDLE_STOP_HARD_CAP_MS,
   DEFAULT_IDLE_STOP_MIN_SESSION_AGE_MS,
   DEFAULT_IDLE_STOP_PRESENCE_STALE_MS,
+  DEFAULT_IDLE_STOP_RECENT_INTERACTION_MS,
+  DEFAULT_SESSION_PRESSURE_MIN_IDLE_MS,
   buildDaemonSessionIdleReaperRequest,
   evaluateIdleStopGuard,
   isPolicyStopSource,
@@ -13,8 +15,10 @@ import {
   restoreSessionStartTimes,
   resolveStopSessionMode,
   runDaemonSessionIdleReaperTick,
+  sweepZombieSessions,
   type IdleStopGuardConfig,
 } from './sessionIdleReaper';
+import type { SessionMemoryPressureConfig } from './sessionMemoryPressure';
 import type { SessionRuntimeState, TrackedSession } from './types';
 
 function tracked(overrides: Partial<TrackedSession>): TrackedSession {
@@ -195,8 +199,8 @@ describe('buildDaemonSessionIdleReaperRequest', () => {
 });
 
 describe('readDaemonSessionIdleReaperConfig', () => {
-  it('defaults the daemon idle threshold to 24 hours', () => {
-    expect(DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS).toBe(24 * 60 * 60 * 1000);
+  it('defaults the absolute idle cut to 7 days', () => {
+    expect(DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS).toBe(7 * 24 * 60 * 60 * 1000);
     expect(readDaemonSessionIdleReaperConfig({})).toEqual({
       disabled: false,
       idleAfterMs: DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS,
@@ -246,6 +250,7 @@ describe('runDaemonSessionIdleReaperTick', () => {
       serverUrl: 'https://aplus.example.com',
       credentialsToken: 'token-1',
       now: 20_000,
+      idleAfterMs: 10_000,
       sessionStartTimes: new Map([[100, 1_000]]),
       trackedSessions: [tracked({
         pid: 100,
@@ -269,11 +274,12 @@ describe('runDaemonSessionIdleReaperTick', () => {
       }),
     }));
     expect(stopSession).toHaveBeenCalledTimes(3);
-    expect(stopSession).toHaveBeenCalledWith('session-1', { source: 'session-idle-reaper', mode: 'if-idle' });
+    expect(stopSession).toHaveBeenCalledWith('session-1', { source: 'session-idle-reaper', reason: 'absolute-idle-cut', mode: 'if-idle' });
     expect(result).toEqual({
       requestedSessions: 1,
       candidateSessions: 3,
       stoppedSessions: 1,
+      pressureStoppedSessions: 0,
       skippedActiveSessions: 0,
       noopSessions: 2,
     });
@@ -295,6 +301,7 @@ describe('runDaemonSessionIdleReaperTick', () => {
       serverUrl: 'https://aplus.example.com',
       credentialsToken: 'token-1',
       now: 20_000,
+      idleAfterMs: 10_000,
       sessionStartTimes: new Map([[100, 1_000]]),
       trackedSessions: [tracked({ pid: 100, happySessionId: 'ok' })],
       stopSession,
@@ -339,9 +346,180 @@ describe('runDaemonSessionIdleReaperTick', () => {
       requestedSessions: 1,
       candidateSessions: 0,
       stoppedSessions: 0,
+      pressureStoppedSessions: 0,
       skippedActiveSessions: 0,
       noopSessions: 0,
     });
+  });
+
+  const pressureConfig = (overrides: Partial<SessionMemoryPressureConfig> = {}): SessionMemoryPressureConfig => ({
+    disabled: false,
+    budgetBytes: 1_000,
+    lowWaterBytes: 800,
+    maxEvictionsPerTick: 5,
+    ...overrides,
+  });
+
+  const candidate = (sessionId: string, idleMs: number) => (
+    { sessionId, projectId: 'p', machineId: 'machine-1', lastActiveAt: 1_000, idleMs }
+  );
+
+  it('skips candidates below the absolute cut when there is no memory pressure', async () => {
+    const stopSession = vi.fn(() => ({ stopped: true as const }));
+    const postCandidates = vi.fn(async () => ({
+      checkedAt: 20_000,
+      candidates: [candidate('young', 5_000), candidate('ancient', 50_000)],
+    }));
+
+    const result = await runDaemonSessionIdleReaperTick({
+      machineId: 'machine-1',
+      serverUrl: 'https://aplus.example.com',
+      credentialsToken: 'token-1',
+      now: 20_000,
+      idleAfterMs: 40_000,
+      sessionStartTimes: new Map(),
+      trackedSessions: [
+        tracked({ pid: 100, happySessionId: 'young' }),
+        tracked({ pid: 101, happySessionId: 'ancient' }),
+      ],
+      stopSession,
+      pressure: { measurement: { totalBytes: 900, bytesByRootPid: new Map() }, config: pressureConfig() },
+      postCandidates,
+    });
+
+    // Under budget: no pressure block in the request, only the absolute cut fires.
+    expect(postCandidates).toHaveBeenCalledWith(expect.objectContaining({
+      request: expect.not.objectContaining({ pressure: expect.anything() }),
+    }));
+    expect(stopSession).toHaveBeenCalledTimes(1);
+    expect(stopSession).toHaveBeenCalledWith('ancient', { source: 'session-idle-reaper', reason: 'absolute-idle-cut', mode: 'if-idle' });
+    expect(result).toMatchObject({ stoppedSessions: 1, pressureStoppedSessions: 0 });
+  });
+
+  it('evicts oldest-first under memory pressure until the low-water mark', async () => {
+    const stopSession = vi.fn(() => ({ stopped: true as const }));
+    const postCandidates = vi.fn(async () => ({
+      checkedAt: 20_000,
+      candidates: [candidate('newer', 5_000), candidate('oldest', 15_000), candidate('older', 10_000)],
+    }));
+
+    const result = await runDaemonSessionIdleReaperTick({
+      machineId: 'machine-1',
+      serverUrl: 'https://aplus.example.com',
+      credentialsToken: 'token-1',
+      now: 20_000,
+      idleAfterMs: 40_000,
+      sessionStartTimes: new Map(),
+      trackedSessions: [
+        tracked({ pid: 100, happySessionId: 'oldest' }),
+        tracked({ pid: 101, happySessionId: 'older' }),
+        tracked({ pid: 102, happySessionId: 'newer' }),
+      ],
+      stopSession,
+      pressure: {
+        measurement: {
+          totalBytes: 1_200,
+          bytesByRootPid: new Map([[100, 300], [101, 300], [102, 300]]),
+        },
+        config: pressureConfig(),
+      },
+      postCandidates,
+    });
+
+    expect(postCandidates).toHaveBeenCalledWith(expect.objectContaining({
+      request: expect.objectContaining({
+        pressure: { active: true, minIdleMs: DEFAULT_SESSION_PRESSURE_MIN_IDLE_MS },
+      }),
+    }));
+    // 1200 → kill oldest (900) → still above 800 → kill older (600) → stop.
+    expect(stopSession).toHaveBeenCalledTimes(2);
+    expect(stopSession).toHaveBeenNthCalledWith(1, 'oldest', { source: 'session-idle-reaper', reason: 'memory-pressure', mode: 'if-idle' });
+    expect(stopSession).toHaveBeenNthCalledWith(2, 'older', { source: 'session-idle-reaper', reason: 'memory-pressure', mode: 'if-idle' });
+    expect(result).toMatchObject({ stoppedSessions: 2, pressureStoppedSessions: 2 });
+  });
+
+  it('caps pressure evictions per tick and skips them when the measurement failed', async () => {
+    const stopSession = vi.fn(() => ({ stopped: true as const }));
+    const capped = await runDaemonSessionIdleReaperTick({
+      machineId: 'machine-1',
+      serverUrl: 'https://aplus.example.com',
+      credentialsToken: 'token-1',
+      now: 20_000,
+      idleAfterMs: 40_000,
+      sessionStartTimes: new Map(),
+      trackedSessions: [
+        tracked({ pid: 100, happySessionId: 'a' }),
+        tracked({ pid: 101, happySessionId: 'b' }),
+      ],
+      stopSession,
+      pressure: {
+        measurement: { totalBytes: 100_000, bytesByRootPid: new Map([[100, 10], [101, 10]]) },
+        config: pressureConfig({ maxEvictionsPerTick: 1 }),
+      },
+      postCandidates: vi.fn(async () => ({
+        checkedAt: 20_000,
+        candidates: [candidate('a', 15_000), candidate('b', 10_000)],
+      })),
+    });
+    expect(capped.pressureStoppedSessions).toBe(1);
+
+    stopSession.mockClear();
+    const unknown = await runDaemonSessionIdleReaperTick({
+      machineId: 'machine-1',
+      serverUrl: 'https://aplus.example.com',
+      credentialsToken: 'token-1',
+      now: 20_000,
+      idleAfterMs: 40_000,
+      sessionStartTimes: new Map(),
+      trackedSessions: [tracked({ pid: 100, happySessionId: 'a' })],
+      stopSession,
+      pressure: { measurement: null, config: pressureConfig() },
+      postCandidates: vi.fn(async () => ({
+        checkedAt: 20_000,
+        candidates: [candidate('a', 15_000)],
+      })),
+    });
+    expect(stopSession).not.toHaveBeenCalled();
+    expect(unknown.pressureStoppedSessions).toBe(0);
+  });
+});
+
+describe('sweepZombieSessions', () => {
+  const now = 10_000_000;
+  const silenceMs = 2 * 60 * 60 * 1000;
+
+  it('stops only sessions whose runtime has been silent past the threshold', () => {
+    const stopSession = vi.fn(() => ({ stopped: true as const }));
+    const stopped = sweepZombieSessions({
+      trackedSessions: [
+        tracked({ pid: 100, happySessionId: 'silent', runtime: { thinking: false, hasOpenToolCall: false, updatedAt: now - silenceMs - 1 } }),
+        tracked({ pid: 101, happySessionId: 'fresh', runtime: { thinking: false, hasOpenToolCall: false, updatedAt: now - 1_000 } }),
+      ],
+      sessionStartTimes: new Map(),
+      daemonStartedAt: now - 10 * silenceMs,
+      stopSession,
+      now,
+      silenceMs,
+    });
+
+    expect(stopped).toBe(1);
+    expect(stopSession).toHaveBeenCalledTimes(1);
+    expect(stopSession).toHaveBeenCalledWith('silent', { source: 'session-zombie-sweep', reason: 'runtime-silent', mode: 'if-idle' });
+  });
+
+  it('measures never-reported sessions from daemon start so restarts get a grace window', () => {
+    const stopSession = vi.fn(() => ({ stopped: true as const }));
+    const stopped = sweepZombieSessions({
+      trackedSessions: [tracked({ pid: 100, happySessionId: 'recovered' })],
+      sessionStartTimes: new Map([[100, now - 100 * silenceMs]]),
+      daemonStartedAt: now - 60_000,
+      stopSession,
+      now,
+      silenceMs,
+    });
+
+    expect(stopped).toBe(0);
+    expect(stopSession).not.toHaveBeenCalled();
   });
 });
 
@@ -370,7 +548,7 @@ describe('isPolicyStopSource / resolveStopSessionMode', () => {
 describe('readIdleStopGuardConfig', () => {
   it('applies conservative defaults and protects local sessions by default', () => {
     expect(readIdleStopGuardConfig({})).toEqual({
-      idleAfterMs: DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS,
+      recentInteractionMs: DEFAULT_IDLE_STOP_RECENT_INTERACTION_MS,
       minSessionAgeMs: DEFAULT_IDLE_STOP_MIN_SESSION_AGE_MS,
       hardCapMs: DEFAULT_IDLE_STOP_HARD_CAP_MS,
       presenceStaleMs: DEFAULT_IDLE_STOP_PRESENCE_STALE_MS,
@@ -380,11 +558,13 @@ describe('readIdleStopGuardConfig', () => {
 
   it('reads overrides and lets local protection be turned off explicitly', () => {
     expect(readIdleStopGuardConfig({
+      HAPPY_DAEMON_SESSION_IDLE_RECENT_INTERACTION_MS: '500',
       HAPPY_DAEMON_SESSION_IDLE_MIN_AGE_MS: '1000',
       HAPPY_DAEMON_SESSION_IDLE_HARD_CAP_MS: '2000',
       HAPPY_DAEMON_SESSION_IDLE_PRESENCE_STALE_MS: '3000',
       HAPPY_DAEMON_SESSION_IDLE_PROTECT_LOCAL: 'false',
     })).toMatchObject({
+      recentInteractionMs: 500,
       minSessionAgeMs: 1000,
       hardCapMs: 2000,
       presenceStaleMs: 3000,
@@ -395,7 +575,7 @@ describe('readIdleStopGuardConfig', () => {
 
 describe('evaluateIdleStopGuard', () => {
   const config: IdleStopGuardConfig = {
-    idleAfterMs: 30 * 60 * 1000,
+    recentInteractionMs: 30 * 60 * 1000,
     minSessionAgeMs: 10 * 60 * 1000,
     hardCapMs: 2 * 60 * 60 * 1000,
     presenceStaleMs: 5 * 60 * 1000,
@@ -474,10 +654,55 @@ describe('evaluateIdleStopGuard', () => {
     })).toMatchObject({ allow: false, guard: 'stale-runtime' });
   });
 
-  it('allows cleanup past the hard cap even when soft protections would apply', () => {
-    // Local + recent interaction + stale runtime, but the session is ancient.
+  it('allows cleanup when the runtime has been silent past the hard cap', () => {
+    // Local + stale runtime, but the runtime stopped reporting hardCapMs ago —
+    // a live session reports every keepalive, so this is a zombie.
     expect(evaluateIdleStopGuard({
-      runtime: runtime({ mode: 'local', lastUserInteractionAt: now, updatedAt: now - config.presenceStaleMs - 1 }),
+      runtime: runtime({ mode: 'local', updatedAt: now - config.hardCapMs - 1 }),
+      sessionStartedAt: now - 3 * config.hardCapMs,
+      now,
+      config,
+    })).toEqual({ allow: true });
+
+    // Never reported at all, and both the session and this daemon have been up
+    // past the hard cap — nothing left to wait for.
+    expect(evaluateIdleStopGuard({
+      runtime: undefined,
+      sessionStartedAt: now - 3 * config.hardCapMs,
+      daemonStartedAt: now - config.hardCapMs - 1,
+      now,
+      config,
+    })).toEqual({ allow: true });
+  });
+
+  it('denies an ancient session the user interacted with recently', () => {
+    // Process age is way past the hard cap, but the user touched it a minute
+    // ago — cleanup must never win over live user activity (2026-07-16 사고:
+    // age-based zombie hatch killed sessions users were actively chatting in).
+    expect(evaluateIdleStopGuard({
+      runtime: runtime({ lastUserInteractionAt: now - 60_000, updatedAt: now - config.presenceStaleMs - 1 }),
+      sessionStartedAt: now - config.hardCapMs - 1,
+      now,
+      config,
+    })).toMatchObject({ allow: false, guard: 'recent-user-interaction' });
+  });
+
+  it('gives recovered sessions a fresh report window after a daemon restart', () => {
+    // Session process is days old but this daemon just started and the session
+    // has not reported yet — silence is measured from daemon start, so the
+    // first reaper tick cannot mass-kill recovered sessions.
+    expect(evaluateIdleStopGuard({
+      runtime: undefined,
+      sessionStartedAt: now - 3 * config.hardCapMs,
+      daemonStartedAt: now - 60_000,
+      now,
+      config,
+    })).toMatchObject({ allow: false, guard: 'stale-runtime' });
+  });
+
+  it('allows a quiet old session that reports fresh runtime and no recent interaction', () => {
+    expect(evaluateIdleStopGuard({
+      runtime: runtime({ lastUserInteractionAt: now - config.recentInteractionMs - 1 }),
       sessionStartedAt: now - config.hardCapMs - 1,
       now,
       config,
