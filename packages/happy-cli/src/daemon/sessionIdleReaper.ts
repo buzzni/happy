@@ -54,6 +54,9 @@ type DaemonSessionIdleReaperCandidate = {
   machineId: string;
   lastActiveAt: number;
   idleMs: number;
+  /** Why the server selected this session. Absent from servers that predate
+   *  the turn-end reap — treated as the absolute-idle-cut for logging. */
+  reason?: 'absolute-idle-cut' | 'turn-end';
 };
 
 type DaemonSessionIdleReaperResponse = {
@@ -371,17 +374,20 @@ export async function runDaemonSessionIdleReaperTick(
   }
 
   result.candidateSessions = response.candidates.length;
+  let turnEndStopped = 0;
   for (const candidate of response.candidates) {
+    const reason = candidate.reason ?? 'absolute-idle-cut';
     // Even though the server already excludes busy sessions, the daemon
     // re-validates locally (if-idle) because it is the only component that sees
     // real user activity for the child process it owns.
     const stopResult = input.stopSession(candidate.sessionId, {
       source: 'session-idle-reaper',
-      reason: 'absolute-idle-cut',
+      reason,
       mode: 'if-idle',
     });
     if (stopResult.stopped) {
       result.stoppedSessions += 1;
+      if (reason === 'turn-end') turnEndStopped += 1;
     } else if (stopResult.reason === 'active') {
       result.skippedActiveSessions += 1;
     } else {
@@ -391,7 +397,7 @@ export async function runDaemonSessionIdleReaperTick(
 
   if (result.candidateSessions > 0) {
     input.logDebug?.(
-      `[session-idle-reaper] candidates=${result.candidateSessions} stopped=${result.stoppedSessions} skippedActive=${result.skippedActiveSessions} noop=${result.noopSessions}`,
+      `[session-idle-reaper] candidates=${result.candidateSessions} stopped=${result.stoppedSessions} (turnEnd=${turnEndStopped}) skippedActive=${result.skippedActiveSessions} noop=${result.noopSessions}`,
     );
   }
 

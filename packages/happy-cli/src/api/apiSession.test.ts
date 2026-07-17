@@ -738,6 +738,59 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
     });
 
+    it('stamps and reports lastTurnEndAt when the agent finishes a turn (busy → idle)', () => {
+        const client = new ApiSessionClient('fake-token', session);
+
+        // A fresh idle report (no prior busy state) must NOT stamp a turn-end.
+        client.keepAlive(false, 'remote');
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', {
+            thinking: false,
+            hasOpenToolCall: false,
+            pendingUserInput: false,
+            mode: 'remote'
+        });
+
+        // Agent starts a turn (idle → busy)…
+        client.keepAlive(true, 'remote');
+        mockNotifyDaemonSessionRuntime.mockClear();
+
+        // …then finishes it (busy → idle): this is a turn-end.
+        client.keepAlive(false, 'remote');
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', {
+            thinking: false,
+            hasOpenToolCall: false,
+            pendingUserInput: false,
+            lastUserInteractionAt: expect.any(Number),
+            lastTurnEndAt: expect.any(Number),
+            mode: 'remote'
+        });
+    });
+
+    it('flags launchedBackgroundJob when a Bash tool call runs in the background', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.keepAlive(true, 'remote');
+        mockNotifyDaemonSessionRuntime.mockClear();
+
+        client.sendSessionProtocolMessage({
+            id: 'env-bg-start-1',
+            time: 2001,
+            role: 'agent',
+            turn: 'turn-bg',
+            ev: {
+                t: 'tool-call-start',
+                call: 'bg-1',
+                name: 'Bash',
+                title: 'Bash',
+                description: 'Run training in background',
+                args: { command: 'train.sh', run_in_background: true }
+            }
+        });
+
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', expect.objectContaining({
+            launchedBackgroundJob: true,
+        }));
+    });
+
     it('reports AskUserQuestion wait state as idle to the local daemon', () => {
         const client = new ApiSessionClient('fake-token', session);
         mockAxiosPost.mockResolvedValue({

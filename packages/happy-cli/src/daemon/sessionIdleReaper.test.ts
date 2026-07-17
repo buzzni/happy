@@ -364,6 +364,34 @@ describe('runDaemonSessionIdleReaperTick', () => {
     });
   });
 
+  it('passes the server-supplied reason through to stopSession for observability', async () => {
+    const stopSession = vi.fn(() => ({ stopped: true as const }));
+    await runDaemonSessionIdleReaperTick({
+      machineId: 'machine-1',
+      serverUrl: 'https://aplus.example.com',
+      credentialsToken: 'token-1',
+      now: 20_000,
+      idleAfterMs: 24 * 60 * 60 * 1000,
+      sessionStartTimes: new Map([[100, 1_000], [101, 1_000]]),
+      trackedSessions: [
+        tracked({ pid: 100, happySessionId: 'te' }),
+        tracked({ pid: 101, happySessionId: 'legacy' }),
+      ],
+      stopSession,
+      postCandidates: vi.fn(async () => ({
+        checkedAt: 20_000,
+        candidates: [
+          { sessionId: 'te', projectId: 'p', machineId: 'machine-1', lastActiveAt: 1_000, idleMs: 5_000, reason: 'turn-end' as const },
+          // A legacy server omits reason → logged as the absolute cut.
+          { sessionId: 'legacy', projectId: 'p', machineId: 'machine-1', lastActiveAt: 1_000, idleMs: 99_000 },
+        ],
+      })),
+    });
+
+    expect(stopSession).toHaveBeenNthCalledWith(1, 'te', { source: 'session-idle-reaper', reason: 'turn-end', mode: 'if-idle' });
+    expect(stopSession).toHaveBeenNthCalledWith(2, 'legacy', { source: 'session-idle-reaper', reason: 'absolute-idle-cut', mode: 'if-idle' });
+  });
+
   it('does not stop sessions when the candidate request fails', async () => {
     const stopSession = vi.fn();
     const logDebug = vi.fn();
