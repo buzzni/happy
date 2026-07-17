@@ -231,9 +231,6 @@ export class ApiSessionClient extends EventEmitter {
     // client, so callers can tell "a title was already chosen this run" without
     // waiting for the async updateMetadata socket round-trip to reflect it.
     private summarySent: boolean = false;
-    // Title derived from the first usable user message, applied when a turn ends
-    // without the model having titled the chat itself. See @/utils/fallbackTitle.
-    private fallbackTitleCandidate: string | null = null;
     private agentState: AgentState | null;
     private agentStateVersion: number;
     private socket: Socket<ServerToClientEvents, ClientToServerEvents>;
@@ -662,16 +659,33 @@ export class ApiSessionClient extends EventEmitter {
     private routeIncomingMessage(message: unknown) {
         const userResult = UserMessageSchema.safeParse(message);
         if (userResult.success) {
-            // Remember the first message we could title the chat from. Messages
-            // that make no sense as a title (slash commands, empty text) yield
-            // null and leave the slot open for the next one.
-            if (this.fallbackTitleCandidate === null) {
-                this.fallbackTitleCandidate = buildFallbackTitle(userResult.data.content.text);
-            }
             if (this.pendingMessageCallback) {
                 this.pendingMessageCallback(userResult.data);
             } else {
                 this.pendingMessages.push(userResult.data);
+            }
+            // Title the chat from the first message we can, as it lands, so it
+            // is findable straight away rather than only once the model gets
+            // around to `change_title` — an instruction it often skips (and
+            // never gets to at all while a long first turn is still running).
+            //
+            // Titling after delivery, not before: this is the path the user's
+            // message travels to the agent, and failing to title must never
+            // cost the message. hasTitle() closes this guard once a title
+            // exists, and `change_title` overwrites unconditionally, so a title
+            // the model chooses later still wins. A message that makes no sense
+            // as a title (slash command, empty) yields null and leaves the
+            // guard open for the next one.
+            if (!this.hasTitle()) {
+                const title = buildFallbackTitle(userResult.data.content.text);
+                if (title) {
+                    logger.debug(`[API] Titling chat from its first message: ${title}`);
+                    this.sendClaudeSessionMessage({
+                        type: 'summary',
+                        summary: title,
+                        leafUuid: randomUUID()
+                    });
+                }
             }
             return;
         }
@@ -1021,29 +1035,6 @@ export class ApiSessionClient extends EventEmitter {
         const mapped = closeClaudeTurnWithStatus(this.claudeSessionProtocolState, status);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
-        this.applyFallbackTitleIfMissing();
-    }
-
-    /**
-     * Title the chat from its first user message when a turn has ended and the
-     * model still hasn't titled it via the `change_title` tool.
-     *
-     * Hooked into the two points every agent already funnels through — turn
-     * close (Claude) and the `ready` session event (Codex, Gemini, ACP,
-     * OpenClaw) — so no launcher has to opt in, and a new agent gets this for
-     * free. Once a title exists (`hasTitle()`), this never fires again, so a
-     * title the model chose is never clobbered.
-     */
-    private applyFallbackTitleIfMissing() {
-        if (this.hasTitle() || !this.fallbackTitleCandidate) {
-            return;
-        }
-        logger.debug(`[API] No title set by the model; applying fallback: ${this.fallbackTitleCandidate}`);
-        this.sendClaudeSessionMessage({
-            type: 'summary',
-            summary: this.fallbackTitleCandidate,
-            leafUuid: randomUUID()
-        });
     }
 
     closeOpenAskUserQuestionsAsCancelled() {
@@ -1182,9 +1173,6 @@ export class ApiSessionClient extends EventEmitter {
             }
         };
         this.enqueueMessage(content);
-        if (event.type === 'ready') {
-            this.applyFallbackTitleIfMissing();
-        }
     }
 
     /**

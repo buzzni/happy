@@ -1764,37 +1764,43 @@ describe('ApiSessionClient fallback title', () => {
         vi.restoreAllMocks();
     });
 
-    it('titles the chat from the first user message when a turn ends untitled', () => {
+    // The title must land as the message arrives, not when the turn ends. A
+    // first turn routinely runs for minutes, and that is exactly the window in
+    // which the user goes looking for the chat by its title.
+    it('titles the chat as soon as the first user message arrives, without waiting for the turn to end', () => {
         const client = new ApiSessionClient('fake-token', session);
         const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
 
         sendUserMessage(client, '음... 그러니까 로그인 버튼이 안 눌려');
-        client.closeClaudeSessionTurn('completed');
 
+        // No closeClaudeSessionTurn / ready event — the turn is still running.
         expect(summariesSentBy(spy)).toEqual(['음... 그러니까 로그인 버튼이 안 눌려']);
         expect(client.hasTitle()).toBe(true);
     });
 
-    it('never clobbers a title the model set via change_title', () => {
+    it('lets a title the model chose win, and never re-titles after it', () => {
         const client = new ApiSessionClient('fake-token', session);
         const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
 
         sendUserMessage(client, '음... 그러니까 로그인 버튼이 안 눌려');
-        // What the happy MCP change_title tool does.
+        // What the happy MCP change_title tool does — an unconditional overwrite.
         client.sendClaudeSessionMessage({ type: 'summary', summary: 'Login button fix', leafUuid: 'model-uuid' } as any);
         client.closeClaudeSessionTurn('completed');
-
-        expect(summariesSentBy(spy)).toEqual(['Login button fix']);
-    });
-
-    it('applies the fallback on the ready event used by codex/gemini/acp', () => {
-        const client = new ApiSessionClient('fake-token', session);
-        const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
-
-        sendUserMessage(client, 'refactor the reaper');
         client.sendSessionEvent({ type: 'ready' });
 
-        expect(summariesSentBy(spy)).toEqual(['refactor the reaper']);
+        // The model's title is last, so it wins, and nothing re-titles after it.
+        expect(summariesSentBy(spy)).toEqual(['음... 그러니까 로그인 버튼이 안 눌려', 'Login button fix']);
+    });
+
+    it('never titles a session that already has one', () => {
+        const titled = makeSession();
+        (titled.metadata as any).summary = { text: 'Existing title', updatedAt: 1 };
+        const client = new ApiSessionClient('fake-token', titled);
+        const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
+
+        sendUserMessage(client, 'a message that must not become the title');
+
+        expect(summariesSentBy(spy)).toEqual([]);
     });
 
     it('does not title from a slash command, and uses the next real message instead', () => {
@@ -1802,20 +1808,17 @@ describe('ApiSessionClient fallback title', () => {
         const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
 
         sendUserMessage(client, '/clear');
-        client.closeClaudeSessionTurn('completed');
         expect(summariesSentBy(spy)).toEqual([]);
 
         sendUserMessage(client, 'now fix the parser');
-        client.closeClaudeSessionTurn('completed');
         expect(summariesSentBy(spy)).toEqual(['now fix the parser']);
     });
 
-    it('applies the fallback only once across later turns', () => {
+    it('titles only once, however many messages arrive', () => {
         const client = new ApiSessionClient('fake-token', session);
         const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
 
         sendUserMessage(client, 'first message');
-        client.closeClaudeSessionTurn('completed');
         sendUserMessage(client, 'second message');
         client.closeClaudeSessionTurn('completed');
         client.sendSessionEvent({ type: 'ready' });
