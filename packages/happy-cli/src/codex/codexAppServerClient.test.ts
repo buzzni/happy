@@ -377,7 +377,7 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
-    it('emits one abort lifecycle when a turn times out and ignores late completion', async () => {
+    it('keeps an active turn alive when provider progress resets the inactivity timeout', async () => {
         let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
         const proc = createMockProcess({
             pid: 2003,
@@ -437,26 +437,130 @@ describe('CodexAppServerClient sandbox integration', () => {
             sandbox: 'danger-full-access',
         });
 
-        await expect(client.sendTurnAndWait('hang', { turnTimeoutMs: 10 })).resolves.toEqual({ aborted: true });
-        expect(events.filter((event) => event.type === 'turn_aborted')).toEqual([
-            expect.objectContaining({ turn_id: 'turn-timeout', reason: 'timeout' }),
-        ]);
+        vi.useFakeTimers();
+        try {
+            const pending = client.sendTurnAndWait('long active turn', { turnTimeoutMs: 200 });
+            await vi.advanceTimersByTimeAsync(0);
+            if (!appServerStdout) throw new Error('app-server stdout unavailable');
+            await vi.advanceTimersByTimeAsync(120);
+            pushJsonLine(appServerStdout, {
+                method: 'item/started',
+                params: {
+                    threadId: 'thread-timeout',
+                    turnId: 'turn-timeout',
+                    item: { id: 'item-progress', type: 'agentMessage', text: '', phase: 'commentary' },
+                },
+            });
+            await vi.advanceTimersByTimeAsync(120);
+            pushJsonLine(appServerStdout, {
+                method: 'turn/completed',
+                params: {
+                    threadId: 'thread-timeout',
+                    turn: { id: 'turn-timeout', items: [], status: 'completed', error: null },
+                },
+            });
 
-        if (!appServerStdout) throw new Error('app-server stdout unavailable');
-        pushJsonLine(appServerStdout, {
-            method: 'turn/completed',
-            params: {
-                threadId: 'thread-timeout',
-                turn: { id: 'turn-timeout', items: [], status: 'completed', error: null },
+            await expect(pending).resolves.toEqual({ aborted: false });
+            expect(events.filter((event) => event.type === 'turn_aborted')).toHaveLength(0);
+            expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(1);
+        } finally {
+            vi.useRealTimers();
+        }
+
+        await client.disconnect();
+    });
+
+    it('ignores stale-turn activity and interrupts the inactive current provider turn', async () => {
+        const requests: MockRpcMessage[] = [];
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        const proc = createMockProcess({
+            pid: 2004,
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                appServerStdout = stdout;
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-inactive', path: '/tmp/thread-inactive' },
+                            model: 'gpt-test',
+                            modelProvider: 'openai',
+                            cwd: '/tmp/project',
+                            approvalPolicy: 'never',
+                            sandbox: { type: 'dangerFullAccess' },
+                            reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { turn: { id: 'turn-inactive', items: [], status: 'inProgress', error: null } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: {
+                                threadId: 'thread-inactive',
+                                turn: { id: 'turn-inactive', items: [], status: 'inProgress', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'turn/interrupt' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: {} });
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: {
+                                threadId: 'thread-inactive',
+                                turn: { id: 'turn-inactive', items: [], status: 'cancelled', error: null },
+                            },
+                        });
+                    }, 0);
+                }
             },
         });
-        pushJsonLine(appServerStdout, {
-            method: 'codex/event',
-            params: { msg: { type: 'task_complete', turn_id: 'turn-timeout' } },
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((msg) => events.push(msg as Record<string, unknown>));
+
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'never',
+            sandbox: 'danger-full-access',
         });
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        expect(events.filter((event) => event.type === 'turn_aborted')).toHaveLength(1);
-        expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(0);
+
+        vi.useFakeTimers();
+        try {
+            const pending = client.sendTurnAndWait('hang', { turnTimeoutMs: 20 });
+            await vi.advanceTimersByTimeAsync(0);
+            if (!appServerStdout) throw new Error('app-server stdout unavailable');
+            await vi.advanceTimersByTimeAsync(15);
+            pushJsonLine(appServerStdout, {
+                method: 'item/started',
+                params: {
+                    threadId: 'thread-inactive',
+                    turnId: 'turn-from-previous-request',
+                    item: { id: 'stale-item', type: 'agentMessage', text: '', phase: 'commentary' },
+                },
+            });
+            await vi.advanceTimersByTimeAsync(6);
+
+            expect(requests.some((request) => request.method === 'turn/interrupt')).toBe(true);
+            await expect(pending).resolves.toEqual({ aborted: true });
+            expect(events.filter((event) => event.type === 'turn_aborted')).toEqual([
+                expect.objectContaining({ turn_id: 'turn-inactive', status: 'cancelled' }),
+            ]);
+        } finally {
+            await vi.runOnlyPendingTimersAsync();
+            vi.useRealTimers();
+        }
 
         await client.disconnect();
     });

@@ -221,6 +221,8 @@ export class CodexAppServerClient {
     private pendingTurnCompletion: {
         resolve: (aborted: boolean) => void;
         turnId: string | null;
+        inactivityTimeoutMs: number;
+        inactivityTimer: ReturnType<typeof setTimeout> | null;
     } | null = null;
 
     // Tracks in-flight interruptTurn() RPCs so sendTurnAndWait can wait for them
@@ -887,8 +889,54 @@ export class CodexAppServerClient {
 
     private resolvePendingTurn(aborted: boolean): void {
         if (!this.pendingTurnCompletion) return;
+        if (this.pendingTurnCompletion.inactivityTimer) {
+            clearTimeout(this.pendingTurnCompletion.inactivityTimer);
+        }
         this.pendingTurnCompletion.resolve(aborted);
         this.pendingTurnCompletion = null;
+    }
+
+    private schedulePendingTurnInactivityTimeout(): void {
+        const pending = this.pendingTurnCompletion;
+        if (!pending) return;
+        if (pending.inactivityTimer) {
+            clearTimeout(pending.inactivityTimer);
+        }
+        pending.inactivityTimer = setTimeout(() => {
+            if (this.pendingTurnCompletion !== pending) return;
+            pending.inactivityTimer = null;
+            logger.warn(
+                `[CodexAppServer] Turn inactive for ${pending.inactivityTimeoutMs}ms — interrupting provider`,
+            );
+            void this.abortTurnWithFallback().catch((error) => {
+                logger.warn('[CodexAppServer] Failed to abort inactive turn', error);
+            });
+        }, pending.inactivityTimeoutMs);
+    }
+
+    private recordPendingTurnActivity(method: string, params: any): void {
+        const pending = this.pendingTurnCompletion;
+        if (!pending) return;
+        const isTurnActivity = method === 'turn/started'
+            || method === 'thread/tokenUsage/updated'
+            || method === 'turn/diff/updated'
+            || method.startsWith('item/')
+            || method === 'codex/event'
+            || method.startsWith('codex/event/');
+        if (!isTurnActivity) return;
+
+        const legacyMessage = method === 'codex/event' || method.startsWith('codex/event/')
+            ? params?.msg
+            : null;
+        const activityTurnId = legacyMessage
+            ? legacyMessage.turn_id ?? legacyMessage.turnId ?? null
+            : this.extractTurnId(params);
+        if (pending.turnId && activityTurnId && pending.turnId !== activityTurnId) return;
+
+        const activityThreadId = params?.threadId ?? legacyMessage?.thread_id ?? legacyMessage?.threadId ?? null;
+        if (this._threadId && activityThreadId && this._threadId !== activityThreadId) return;
+
+        this.schedulePendingTurnInactivityTimeout();
     }
 
     private matchesPendingTurn(turnId?: string | null): boolean {
@@ -1043,7 +1091,7 @@ export class CodexAppServerClient {
         }
     }
 
-    /** Default timeout for waiting on turn completion (ms). 10 minutes. */
+    /** Default maximum inactivity while waiting on turn completion (ms). */
     private static readonly TURN_TIMEOUT_MS = 10 * 60 * 1000;
 
     /**
@@ -1071,42 +1119,24 @@ export class CodexAppServerClient {
         }
 
         const timeoutMs = opts?.turnTimeoutMs ?? CodexAppServerClient.TURN_TIMEOUT_MS;
-        let timer: ReturnType<typeof setTimeout> | null = null;
-
         const completion = new Promise<boolean>((resolve) => {
             this.pendingTurnCompletion = {
                 resolve,
                 turnId: null,
+                inactivityTimeoutMs: timeoutMs,
+                inactivityTimer: null,
             };
-
-            timer = setTimeout(() => {
-                if (this.pendingTurnCompletion) {
-                    logger.warn(`[CodexAppServer] Turn timed out after ${timeoutMs}ms — treating as abort`);
-                    const turnId = this.pendingTurnCompletion.turnId ?? this._turnId;
-                    if (turnId) {
-                        this.completedTurnIds.add(turnId);
-                    }
-                    this.eventHandler?.({
-                        type: 'turn_aborted',
-                        reason: 'timeout',
-                        ...(turnId ? { turn_id: turnId } : {}),
-                    });
-                    this._turnId = null;
-                    this.resolvePendingTurn(true);
-                }
-            }, timeoutMs);
+            this.schedulePendingTurnInactivityTimeout();
         });
 
         try {
             await this.sendTurn(prompt, opts);
         } catch (err) {
-            if (timer) clearTimeout(timer);
-            this.pendingTurnCompletion = null;
+            this.resolvePendingTurn(true);
             throw err;
         }
 
         const aborted = await completion;
-        if (timer) clearTimeout(timer);
         return { aborted };
     }
 
@@ -1122,7 +1152,7 @@ export class CodexAppServerClient {
         };
         const doInterrupt = async () => {
             try {
-                await this.request('turn/interrupt', params);
+                await this.request('turn/interrupt', params, CodexAppServerClient.ABORT_GRACE_MS);
             } catch (err) {
                 // Ignore if no turn is active
                 logger.debug('[CodexAppServer] interruptTurn error (may be expected):', err);
@@ -1388,6 +1418,8 @@ export class CodexAppServerClient {
     }
 
     private handleNotification(method: string, params: any): void {
+        this.recordPendingTurnActivity(method, params);
+
         // codex/event notifications: either `codex/event` or `codex/event/<type>`
         if (method === 'codex/event' || method.startsWith('codex/event/')) {
             this.notificationProtocol = 'legacy';
