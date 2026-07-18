@@ -38,6 +38,8 @@ const mocks = vi.hoisted(() => {
     cancelCalls: [] as string[],
     disposeCalls: 0,
     constructorArgs: null as any,
+    /** When set, sendPrompt emits nothing so the turn looks silent. */
+    silentPrompt: false,
   };
 
   return {
@@ -146,6 +148,9 @@ vi.mock('./AcpBackend', () => ({
 
     async sendPrompt(sessionId: string, prompt: string) {
       mocks.backendState.prompts.push({ sessionId, prompt });
+      if (mocks.backendState.silentPrompt) {
+        return;
+      }
       for (const listener of mocks.backendState.listeners) {
         listener({ type: 'status', status: 'running' });
         listener({ type: 'model-output', textDelta: 'hello' });
@@ -207,6 +212,7 @@ describe('runAcp', () => {
     mocks.backendState.cancelCalls = [];
     mocks.backendState.disposeCalls = 0;
     mocks.backendState.constructorArgs = null;
+    mocks.backendState.silentPrompt = false;
 
     mocks.mockApiCreate.mockResolvedValue({
       getOrCreateMachine: mocks.mockGetOrCreateMachine,
@@ -267,6 +273,96 @@ describe('runAcp', () => {
       'Tool: ReadFile completed (callId=tool-1)',
       'Status: idle',
     ]));
+  });
+
+  it('cancels the backend when a turn goes silent for the inactivity window', async () => {
+    mocks.backendState.silentPrompt = true;
+    const runPromise = runAcp({
+      credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+      agentName: 'opencode',
+      command: 'opencode',
+      args: ['--acp'],
+      turnInactivityTimeoutMs: 20,
+    });
+    // The runner tears itself down once the turn fails; settle it either way.
+    const settled = runPromise.then(() => 'resolved').catch(() => 'rejected');
+
+    await vi.waitFor(() => {
+      expect(mocks.getUserMessageHandler()).toBeTypeOf('function');
+    });
+    mocks.getUserMessageHandler()!({ role: 'user', content: { type: 'text', text: 'hang please' } });
+
+    // The old wall-clock timer rejected the turn while leaving the agent running.
+    await vi.waitFor(() => {
+      expect(mocks.backendState.cancelCalls).toContain('acp-session-1');
+    });
+
+    await settled;
+  });
+
+  it('keeps a slow turn alive while the backend keeps reporting activity', async () => {
+    mocks.backendState.silentPrompt = true;
+    const runPromise = runAcp({
+      credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+      agentName: 'opencode',
+      command: 'opencode',
+      args: ['--acp'],
+      turnInactivityTimeoutMs: 250,
+    });
+
+    await vi.waitFor(() => {
+      expect(mocks.getUserMessageHandler()).toBeTypeOf('function');
+    });
+    mocks.getUserMessageHandler()!({ role: 'user', content: { type: 'text', text: 'long but alive' } });
+    await vi.waitFor(() => {
+      expect(mocks.backendState.prompts).toHaveLength(1);
+    });
+
+    // Total elapsed time exceeds the window, but no single gap does.
+    for (let i = 0; i < 6; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      for (const listener of mocks.backendState.listeners) {
+        listener({ type: 'model-output', textDelta: `chunk-${i}` });
+      }
+    }
+
+    expect(mocks.backendState.cancelCalls).not.toContain('acp-session-1');
+
+    // Killing mid-turn rejects the still-pending turn; that is the shutdown path.
+    await mocks.getKillHandler()!();
+    await runPromise.catch(() => { });
+  });
+
+  it('keeps a turn alive while an approval awaits the user', async () => {
+    mocks.backendState.silentPrompt = true;
+    const runPromise = runAcp({
+      credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+      agentName: 'opencode',
+      command: 'opencode',
+      args: ['--acp'],
+      turnInactivityTimeoutMs: 250,
+    });
+
+    await vi.waitFor(() => {
+      expect(mocks.getUserMessageHandler()).toBeTypeOf('function');
+    });
+    mocks.getUserMessageHandler()!({ role: 'user', content: { type: 'text', text: 'needs approval' } });
+    await vi.waitFor(() => {
+      expect(mocks.backendState.prompts).toHaveLength(1);
+    });
+
+    // ACP resolves approvals inside this call, so it stays pending exactly as
+    // long as the user takes to answer. That wait is not provider inactivity.
+    const decision = mocks.backendState.constructorArgs.permissionHandler
+      .handleToolCall('tool-1', 'Bash', { command: 'ls' });
+    void decision.catch(() => { });
+
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    expect(mocks.backendState.cancelCalls).not.toContain('acp-session-1');
+
+    await mocks.getKillHandler()!();
+    await runPromise.catch(() => { });
   });
 
   it('registers abort handler that cancels the ACP backend session', async () => {

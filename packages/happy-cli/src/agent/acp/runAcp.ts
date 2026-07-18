@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { ApiClient } from '@/api/api';
 import type { ApiSessionClient } from '@/api/apiSession';
-import type { AgentMessage } from '@/agent/core';
+import type { AgentMessage, TurnInactivityWatchdog } from '@/agent/core';
+import { startTurnInactivityWatchdog } from '@/agent/core';
 import { AcpBackend, type AcpPermissionHandler } from './AcpBackend';
 import { DefaultTransport } from '@/agent/transport';
 import { AcpSessionManager } from './AcpSessionManager';
@@ -32,7 +33,8 @@ import {
 } from './sessionConfigMetadata';
 import type { SessionConfigOption, SessionModeState, SessionModelState } from '@agentclientprotocol/sdk';
 
-const TURN_TIMEOUT_MS = 5 * 60 * 1000;
+/** Max time without any backend activity before the turn is cancelled. */
+const TURN_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 const ACP_EVENT_PREVIEW_CHARS = 240;
 const ACP_RAW_PREVIEW_CHARS = 2000;
 const ACP_COLOR_RESET = '\u001b[0m';
@@ -435,7 +437,7 @@ class GenericAcpPermissionHandler extends BasePermissionHandler implements AcpPe
 type PendingTurn = {
   resolve: () => void;
   reject: (err: Error) => void;
-  timeout: NodeJS.Timeout;
+  watchdog: TurnInactivityWatchdog;
 };
 
 function resolveSessionFlavor(agentName: string): 'gemini' | 'opencode' | 'acp' {
@@ -455,8 +457,11 @@ export async function runAcp(opts: {
   args: string[];
   startedBy?: 'daemon' | 'terminal';
   verbose?: boolean;
+  /** Max time without any backend activity before the turn is cancelled. */
+  turnInactivityTimeoutMs?: number;
 }): Promise<void> {
   const verbose = opts.verbose === true;
+  const turnInactivityTimeoutMs = opts.turnInactivityTimeoutMs ?? TURN_INACTIVITY_TIMEOUT_MS;
   const sessionTag = randomUUID();
   connectionState.setBackend(opts.agentName);
 
@@ -554,13 +559,29 @@ export async function runAcp(opts: {
     },
   }, aplusMcpServers);
 
+  // ACP resolves approvals synchronously inside the requestPermission RPC and
+  // never emits a permission-response message, so the handler call itself is the
+  // only place that knows both when the user is asked and when they answer.
+  // Suspending the watchdog around it keeps think-time from counting as a hang.
+  const watchdogAwarePermissionHandler: AcpPermissionHandler = {
+    handleToolCall: async (toolCallId, toolName, input) => {
+      const turn = pendingTurn;
+      turn?.watchdog.holdForApproval();
+      try {
+        return await permissionHandler.handleToolCall(toolCallId, toolName, input);
+      } finally {
+        turn?.watchdog.releaseApproval();
+      }
+    },
+  };
+
   const backend = new AcpBackend({
     agentName: opts.agentName,
     cwd: process.cwd(),
     command: opts.command,
     args: opts.args,
     mcpServers,
-    permissionHandler,
+    permissionHandler: watchdogAwarePermissionHandler,
     transportHandler: new DefaultTransport(opts.agentName),
     verbose,
   });
@@ -575,7 +596,7 @@ export async function runAcp(opts: {
     if (!pendingTurn) {
       return;
     }
-    clearTimeout(pendingTurn.timeout);
+    pendingTurn.watchdog.stop();
     const current = pendingTurn;
     pendingTurn = null;
     if (error) {
@@ -585,12 +606,25 @@ export async function runAcp(opts: {
     current.resolve();
   };
 
+  // Bounds inactivity, not total turn duration: backend progress restarts the
+  // window and approval waits disarm it, so only a silent backend trips this.
+  // Cancel the backend before giving up — rejecting alone would leave the agent
+  // running while the runner reports the turn as failed.
   const waitForTurnEnd = () => new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      pendingTurn = null;
-      reject(new Error(`Timed out waiting for ${opts.agentName} to finish the turn`));
-    }, TURN_TIMEOUT_MS);
-    pendingTurn = { resolve, reject, timeout };
+    const watchdog = startTurnInactivityWatchdog({
+      timeoutMs: turnInactivityTimeoutMs,
+      onInactive: () => {
+        logger.debug(`[${opts.agentName}] No backend activity for ${turnInactivityTimeoutMs}ms; cancelling turn`);
+        const sessionToCancel = acpSessionId;
+        if (sessionToCancel) {
+          void backend.cancel(sessionToCancel).catch((error) => {
+            logger.debug(`[${opts.agentName}] Failed to cancel inactive turn:`, error);
+          });
+        }
+        clearPendingTurn(new Error(`${opts.agentName} produced no activity for ${turnInactivityTimeoutMs}ms`));
+      },
+    });
+    pendingTurn = { resolve, reject, watchdog };
   });
 
   const stopRunnerFromBackendStatus = (status: 'error' | 'stopped', detail?: string) => {
@@ -706,6 +740,9 @@ export async function runAcp(opts: {
     if (verbose) {
       logAcp('muted', `Outgoing raw backend message from ${opts.agentName}: ${formatUnknownForConsole(msg, ACP_RAW_PREVIEW_CHARS)}`);
     }
+
+    // Any backend message is proof the turn is still alive.
+    pendingTurn?.watchdog.recordActivity();
 
     if (msg.type === 'event' && msg.name === 'available_commands') {
       const commands = msg.payload as { name: string; description?: string }[];
