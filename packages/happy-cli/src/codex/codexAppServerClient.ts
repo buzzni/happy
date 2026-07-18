@@ -228,6 +228,10 @@ export class CodexAppServerClient {
     // Tracks in-flight interruptTurn() RPCs so sendTurnAndWait can wait for them
     // before starting a new turn (prevents stale turn/interrupt from aborting the next turn).
     private pendingInterrupt: Promise<void> | null = null;
+    // Server → client requests (approvals, elicitations) awaiting our response.
+    // The turn is legitimately idle while these are outstanding.
+    private outstandingServerRequests = 0;
+
     private notificationProtocol: 'unknown' | 'legacy' | 'raw' = 'unknown';
     private completedTurnIds = new Set<string>();
     private rawFileChangesByItemId = new Map<string, LegacyPatchChanges>();
@@ -642,6 +646,9 @@ export class CodexAppServerClient {
         this._turnId = null;
         this.notificationProtocol = 'unknown';
         this.completedTurnIds.clear();
+        // Approvals belonging to the dead process can never be answered; drop them
+        // so a later turn's watchdog is not left permanently disarmed.
+        this.outstandingServerRequests = 0;
         if (!opts?.preserveThreadState) {
             this._threadId = null;
             this.threadDefaults = null;
@@ -901,7 +908,12 @@ export class CodexAppServerClient {
         if (!pending) return;
         if (pending.inactivityTimer) {
             clearTimeout(pending.inactivityTimer);
+            pending.inactivityTimer = null;
         }
+        // A turn blocked on an approval prompt is waiting on *us*, not hung.
+        // Leave the watchdog disarmed until every outstanding request is answered;
+        // answering re-arms it with a full inactivity window.
+        if (this.outstandingServerRequests > 0) return;
         pending.inactivityTimer = setTimeout(() => {
             if (this.pendingTurnCompletion !== pending) return;
             pending.inactivityTimer = null;
@@ -1097,6 +1109,12 @@ export class CodexAppServerClient {
     /**
      * Send a user turn and wait for it to complete (task_complete or turn_aborted).
      * Returns { aborted: true } if the turn was aborted (user cancel, permission reject, etc.).
+     *
+     * `turnTimeoutMs` bounds *inactivity*, not total turn duration: any turn
+     * progress notification restarts the window, and it stays disarmed while an
+     * approval request is awaiting the user. A turn that keeps making progress
+     * therefore runs without a wall-clock limit; only a silent provider is
+     * interrupted.
      */
     async sendTurnAndWait(prompt: string, opts?: {
         model?: string;
@@ -1105,6 +1123,7 @@ export class CodexAppServerClient {
         sandbox?: SandboxMode;
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
+        /** Max time without any turn activity before interrupting the provider. */
         turnTimeoutMs?: number;
     }): Promise<{ aborted: boolean }> {
         // Wait for any in-flight interruptTurn() to complete before starting a new
@@ -1263,8 +1282,13 @@ export class CodexAppServerClient {
 
         // Server → client request (approvals)
         if (msg.id != null && msg.method) {
+            this.outstandingServerRequests += 1;
+            this.schedulePendingTurnInactivityTimeout();
             this.handleServerRequest(msg.id, msg.method, msg.params).catch((err) => {
                 logger.debug('[CodexAppServer] Error handling server request:', err);
+            }).finally(() => {
+                this.outstandingServerRequests = Math.max(0, this.outstandingServerRequests - 1);
+                this.schedulePendingTurnInactivityTimeout();
             });
             return;
         }

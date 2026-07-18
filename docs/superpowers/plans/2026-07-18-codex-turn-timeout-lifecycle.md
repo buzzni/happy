@@ -20,10 +20,12 @@
 
 ## Verification
 
-- `corepack pnpm -C packages/happy-cli exec vitest run --project unit src/codex/codexAppServerClient.test.ts`: 22 tests passed.
-- `corepack pnpm -C packages/happy-cli test`: build/typecheck passed and 1,122 tests passed. The command remains red because 14 unrelated `src/claude/runClaude.test.ts` cases use a `@/persistence` mock that does not export `SandboxConfigSchema`; the failures occur before the Codex client path under this change.
+- `corepack pnpm -C packages/happy-cli exec vitest run --project unit src/codex/codexAppServerClient.test.ts`: 24 tests passed.
+- `corepack pnpm -C packages/happy-cli test`: build/typecheck passed and 1,124 tests passed. The command remains red because 14 unrelated `src/claude/runClaude.test.ts` cases use a `@/persistence` mock that does not export `SandboxConfigSchema`; the same 14 fail on this branch's parent, so they are not caused by this change.
 
 ## Review Follow-up
 
 - [x] Correlate activity notifications with the pending thread/turn before refreshing the inactivity watchdog, so late events from an older turn cannot keep a dead current turn alive.
 - [x] Replace real-time timeout sleeps with Vitest fake timers while preserving both the activity-extension and stale-turn timeout regressions.
+- [x] Hold the watchdog disarmed while a server → client approval request is outstanding. Approvals arrive as JSON-RPC requests, not notifications, so they never reached `recordPendingTurnActivity`; a turn blocked on a mobile approval prompt was interrupted after the inactivity window even though the provider was waiting on us. Answering the request re-arms the watchdog with a full window, and `disconnectInternal` drops the counter so approvals belonging to a dead process cannot leave a later turn unguarded.
+- [x] Document on `sendTurnAndWait` that `turnTimeoutMs` bounds inactivity rather than total turn duration.
