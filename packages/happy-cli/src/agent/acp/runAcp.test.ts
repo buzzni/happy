@@ -177,6 +177,10 @@ vi.mock('./AcpBackend', () => ({
 
     async cancel(sessionId: string) {
       mocks.backendState.cancelCalls.push(sessionId);
+      // The real AcpBackend awaits the cancel RPC before emitting, so emitting
+      // synchronously here would let 'stopped' pre-empt the caller's own
+      // post-cancel bookkeeping and exercise a path production never takes.
+      await Promise.resolve();
       for (const listener of mocks.backendState.listeners) {
         listener({ type: 'status', status: 'stopped' });
       }
@@ -282,10 +286,10 @@ describe('runAcp', () => {
       agentName: 'opencode',
       command: 'opencode',
       args: ['--acp'],
-      turnInactivityTimeoutMs: 20,
+      turnInactivityTimeoutMs: 250,
     });
-    // The runner tears itself down once the turn fails; settle it either way.
-    const settled = runPromise.then(() => 'resolved').catch(() => 'rejected');
+    // The runner tears itself down once the turn fails; capture why.
+    const settled = runPromise.then(() => null).catch((error: Error) => error);
 
     await vi.waitFor(() => {
       expect(mocks.getUserMessageHandler()).toBeTypeOf('function');
@@ -297,7 +301,8 @@ describe('runAcp', () => {
       expect(mocks.backendState.cancelCalls).toContain('acp-session-1');
     });
 
-    await settled;
+    // The turn must fail *as inactivity*, not as a side effect of the cancel.
+    expect((await settled)?.message).toContain('produced no activity');
   });
 
   it('keeps a slow turn alive while the backend keeps reporting activity', async () => {
@@ -307,7 +312,7 @@ describe('runAcp', () => {
       agentName: 'opencode',
       command: 'opencode',
       args: ['--acp'],
-      turnInactivityTimeoutMs: 250,
+      turnInactivityTimeoutMs: 1000,
     });
 
     await vi.waitFor(() => {
@@ -340,7 +345,7 @@ describe('runAcp', () => {
       agentName: 'opencode',
       command: 'opencode',
       args: ['--acp'],
-      turnInactivityTimeoutMs: 250,
+      turnInactivityTimeoutMs: 300,
     });
 
     await vi.waitFor(() => {
@@ -357,7 +362,7 @@ describe('runAcp', () => {
       .handleToolCall('tool-1', 'Bash', { command: 'ls' });
     void decision.catch(() => { });
 
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await new Promise((resolve) => setTimeout(resolve, 900));
 
     expect(mocks.backendState.cancelCalls).not.toContain('acp-session-1');
 

@@ -232,6 +232,9 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
   // while the runner reports the turn as failed.
   const waitForTurnEnd = () =>
     new Promise<void>((resolve, reject) => {
+      // A previous turn that was abandoned without clearing would otherwise leave
+      // an armed watchdog behind that outlives the turn it belongs to.
+      pendingTurn?.watchdog.stop();
       const watchdog = startTurnInactivityWatchdog({
         timeoutMs: turnInactivityTimeoutMs,
         onInactive: () => {
@@ -371,6 +374,11 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         log(`Turn ended: ${msg}`);
+        // sendPrompt can throw before the turn is ever awaited (e.g. the gateway
+        // dropped). Without this the watchdog stays armed on an abandoned turn and
+        // later cancels whatever run is live by then. Resolve rather than reject:
+        // nobody awaits this promise on the throw path.
+        clearPendingTurn();
         sendEnvelopes(sessionManager.endTurn('failed'));
       }
       inTurn = false;
