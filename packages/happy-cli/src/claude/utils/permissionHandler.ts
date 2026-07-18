@@ -309,6 +309,13 @@ export class PermissionHandler {
         this.allowedBashPrefixes.clear();
         this.permissionMode = 'default';
 
+        // This callback closes over the Query object of the generation being torn
+        // down, and claudeRemote re-registers it for every new query. Dropping it
+        // keeps a dead Query from staying reachable across the restart boundary.
+        // onPermissionRequestCallback is deliberately kept: it is bound to the
+        // launcher-scoped message queue, not to a query, and is registered once.
+        this.setPermissionModeCallback = undefined;
+
         // Cancel all pending requests
         for (const [, pending] of this.pendingRequests.entries()) {
             pending.reject(new Error('Session reset'));
