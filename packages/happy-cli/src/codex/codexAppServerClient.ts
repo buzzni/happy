@@ -221,11 +221,17 @@ export class CodexAppServerClient {
     private pendingTurnCompletion: {
         resolve: (aborted: boolean) => void;
         turnId: string | null;
+        inactivityTimeoutMs: number;
+        inactivityTimer: ReturnType<typeof setTimeout> | null;
     } | null = null;
 
     // Tracks in-flight interruptTurn() RPCs so sendTurnAndWait can wait for them
     // before starting a new turn (prevents stale turn/interrupt from aborting the next turn).
     private pendingInterrupt: Promise<void> | null = null;
+    // Server → client requests (approvals, elicitations) awaiting our response.
+    // The turn is legitimately idle while these are outstanding.
+    private outstandingServerRequests = 0;
+
     private notificationProtocol: 'unknown' | 'legacy' | 'raw' = 'unknown';
     private completedTurnIds = new Set<string>();
     private rawFileChangesByItemId = new Map<string, LegacyPatchChanges>();
@@ -546,6 +552,11 @@ export class CodexAppServerClient {
         logger.debug(`[CodexAppServer] Spawning: ${command} ${args.join(' ')}`);
 
         const epoch = ++this.processEpoch;
+        // Approvals issued by a previous process can never be answered against this
+        // one, and their responses are dropped by the epoch guard rather than
+        // decrementing the count. Clear it here so the invariant holds for every
+        // epoch bump, including a crash that skipped disconnectInternal.
+        this.outstandingServerRequests = 0;
         // Use cross-spawn so npm-installed wrappers (codex.cmd / codex.ps1) resolve on Windows.
         // Native child_process.spawn fails with ENOENT for .cmd shims (issues #980, #1016).
         const proc = crossSpawn(command, args, {
@@ -640,6 +651,9 @@ export class CodexAppServerClient {
         this._turnId = null;
         this.notificationProtocol = 'unknown';
         this.completedTurnIds.clear();
+        // Approvals belonging to the dead process can never be answered; drop them
+        // so a later turn's watchdog is not left permanently disarmed.
+        this.outstandingServerRequests = 0;
         if (!opts?.preserveThreadState) {
             this._threadId = null;
             this.threadDefaults = null;
@@ -887,8 +901,59 @@ export class CodexAppServerClient {
 
     private resolvePendingTurn(aborted: boolean): void {
         if (!this.pendingTurnCompletion) return;
+        if (this.pendingTurnCompletion.inactivityTimer) {
+            clearTimeout(this.pendingTurnCompletion.inactivityTimer);
+        }
         this.pendingTurnCompletion.resolve(aborted);
         this.pendingTurnCompletion = null;
+    }
+
+    private schedulePendingTurnInactivityTimeout(): void {
+        const pending = this.pendingTurnCompletion;
+        if (!pending) return;
+        if (pending.inactivityTimer) {
+            clearTimeout(pending.inactivityTimer);
+            pending.inactivityTimer = null;
+        }
+        // A turn blocked on an approval prompt is waiting on *us*, not hung.
+        // Leave the watchdog disarmed until every outstanding request is answered;
+        // answering re-arms it with a full inactivity window.
+        if (this.outstandingServerRequests > 0) return;
+        pending.inactivityTimer = setTimeout(() => {
+            if (this.pendingTurnCompletion !== pending) return;
+            pending.inactivityTimer = null;
+            logger.warn(
+                `[CodexAppServer] Turn inactive for ${pending.inactivityTimeoutMs}ms — interrupting provider`,
+            );
+            void this.abortTurnWithFallback().catch((error) => {
+                logger.warn('[CodexAppServer] Failed to abort inactive turn', error);
+            });
+        }, pending.inactivityTimeoutMs);
+    }
+
+    private recordPendingTurnActivity(method: string, params: any): void {
+        const pending = this.pendingTurnCompletion;
+        if (!pending) return;
+        const isTurnActivity = method === 'turn/started'
+            || method === 'thread/tokenUsage/updated'
+            || method === 'turn/diff/updated'
+            || method.startsWith('item/')
+            || method === 'codex/event'
+            || method.startsWith('codex/event/');
+        if (!isTurnActivity) return;
+
+        const legacyMessage = method === 'codex/event' || method.startsWith('codex/event/')
+            ? params?.msg
+            : null;
+        const activityTurnId = legacyMessage
+            ? legacyMessage.turn_id ?? legacyMessage.turnId ?? null
+            : this.extractTurnId(params);
+        if (pending.turnId && activityTurnId && pending.turnId !== activityTurnId) return;
+
+        const activityThreadId = params?.threadId ?? legacyMessage?.thread_id ?? legacyMessage?.threadId ?? null;
+        if (this._threadId && activityThreadId && this._threadId !== activityThreadId) return;
+
+        this.schedulePendingTurnInactivityTimeout();
     }
 
     private matchesPendingTurn(turnId?: string | null): boolean {
@@ -1043,12 +1108,18 @@ export class CodexAppServerClient {
         }
     }
 
-    /** Default timeout for waiting on turn completion (ms). 10 minutes. */
+    /** Default maximum inactivity while waiting on turn completion (ms). */
     private static readonly TURN_TIMEOUT_MS = 10 * 60 * 1000;
 
     /**
      * Send a user turn and wait for it to complete (task_complete or turn_aborted).
      * Returns { aborted: true } if the turn was aborted (user cancel, permission reject, etc.).
+     *
+     * `turnTimeoutMs` bounds *inactivity*, not total turn duration: any turn
+     * progress notification restarts the window, and it stays disarmed while an
+     * approval request is awaiting the user. A turn that keeps making progress
+     * therefore runs without a wall-clock limit; only a silent provider is
+     * interrupted.
      */
     async sendTurnAndWait(prompt: string, opts?: {
         model?: string;
@@ -1057,6 +1128,7 @@ export class CodexAppServerClient {
         sandbox?: SandboxMode;
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
+        /** Max time without any turn activity before interrupting the provider. */
         turnTimeoutMs?: number;
     }): Promise<{ aborted: boolean }> {
         // Wait for any in-flight interruptTurn() to complete before starting a new
@@ -1071,42 +1143,24 @@ export class CodexAppServerClient {
         }
 
         const timeoutMs = opts?.turnTimeoutMs ?? CodexAppServerClient.TURN_TIMEOUT_MS;
-        let timer: ReturnType<typeof setTimeout> | null = null;
-
         const completion = new Promise<boolean>((resolve) => {
             this.pendingTurnCompletion = {
                 resolve,
                 turnId: null,
+                inactivityTimeoutMs: timeoutMs,
+                inactivityTimer: null,
             };
-
-            timer = setTimeout(() => {
-                if (this.pendingTurnCompletion) {
-                    logger.warn(`[CodexAppServer] Turn timed out after ${timeoutMs}ms — treating as abort`);
-                    const turnId = this.pendingTurnCompletion.turnId ?? this._turnId;
-                    if (turnId) {
-                        this.completedTurnIds.add(turnId);
-                    }
-                    this.eventHandler?.({
-                        type: 'turn_aborted',
-                        reason: 'timeout',
-                        ...(turnId ? { turn_id: turnId } : {}),
-                    });
-                    this._turnId = null;
-                    this.resolvePendingTurn(true);
-                }
-            }, timeoutMs);
+            this.schedulePendingTurnInactivityTimeout();
         });
 
         try {
             await this.sendTurn(prompt, opts);
         } catch (err) {
-            if (timer) clearTimeout(timer);
-            this.pendingTurnCompletion = null;
+            this.resolvePendingTurn(true);
             throw err;
         }
 
         const aborted = await completion;
-        if (timer) clearTimeout(timer);
         return { aborted };
     }
 
@@ -1122,7 +1176,7 @@ export class CodexAppServerClient {
         };
         const doInterrupt = async () => {
             try {
-                await this.request('turn/interrupt', params);
+                await this.request('turn/interrupt', params, CodexAppServerClient.ABORT_GRACE_MS);
             } catch (err) {
                 // Ignore if no turn is active
                 logger.debug('[CodexAppServer] interruptTurn error (may be expected):', err);
@@ -1192,7 +1246,11 @@ export class CodexAppServerClient {
         logger.debug(`[CodexAppServer] → ${method} (notification)`);
     }
 
-    private respond(id: number, result: unknown): void {
+    private respond(id: number, result: unknown, sourceEpoch: number): void {
+        if (sourceEpoch !== this.processEpoch) {
+            logger.debug(`[CodexAppServer] Ignoring response from stale epoch for id=${id}`);
+            return;
+        }
         if (!this.process?.stdin?.writable) return;
         const msg: JsonRpcResponse = { jsonrpc: '2.0', id, result };
         this.process.stdin.write(JSON.stringify(msg) + '\n');
@@ -1233,8 +1291,14 @@ export class CodexAppServerClient {
 
         // Server → client request (approvals)
         if (msg.id != null && msg.method) {
-            this.handleServerRequest(msg.id, msg.method, msg.params).catch((err) => {
+            this.outstandingServerRequests += 1;
+            this.schedulePendingTurnInactivityTimeout();
+            this.handleServerRequest(msg.id, msg.method, msg.params, sourceEpoch).catch((err) => {
                 logger.debug('[CodexAppServer] Error handling server request:', err);
+            }).finally(() => {
+                if (sourceEpoch !== this.processEpoch) return;
+                this.outstandingServerRequests = Math.max(0, this.outstandingServerRequests - 1);
+                this.schedulePendingTurnInactivityTimeout();
             });
             return;
         }
@@ -1324,7 +1388,7 @@ export class CodexAppServerClient {
         };
     }
 
-    private async handleServerRequest(id: number, method: string, params: any): Promise<void> {
+    private async handleServerRequest(id: number, method: string, params: any, sourceEpoch: number): Promise<void> {
         if (method === 'mcpServer/elicitation/request') {
             const toolName = this.parseToolNameFromElicitationMessage(params?.message) ?? params?.serverName ?? 'McpTool';
             const decision = await this.handleApproval({
@@ -1335,7 +1399,7 @@ export class CodexAppServerClient {
                 serverName: params?.serverName,
                 message: params?.message,
             });
-            this.respond(id, this.mapDecisionToMcpElicitationResponse(decision, params));
+            this.respond(id, this.mapDecisionToMcpElicitationResponse(decision, params), sourceEpoch);
             return;
         }
 
@@ -1350,7 +1414,7 @@ export class CodexAppServerClient {
                 cwd: params.cwd,
                 reason: params.reason,
             });
-            this.respond(id, { decision: this.mapDecisionToWire(decision, legacy) });
+            this.respond(id, { decision: this.mapDecisionToWire(decision, legacy) }, sourceEpoch);
             return;
         }
 
@@ -1366,13 +1430,13 @@ export class CodexAppServerClient {
                     : undefined),
                 reason: params.reason,
             });
-            this.respond(id, { decision: this.mapDecisionToWire(decision, legacy) });
+            this.respond(id, { decision: this.mapDecisionToWire(decision, legacy) }, sourceEpoch);
             return;
         }
 
         // Unknown server request — respond so server doesn't hang
         logger.debug(`[CodexAppServer] Unknown server request: ${method}`);
-        this.respond(id, {});
+        this.respond(id, {}, sourceEpoch);
     }
 
     private async handleApproval(params: Parameters<ApprovalHandler>[0]): Promise<ReviewDecision> {
@@ -1388,6 +1452,8 @@ export class CodexAppServerClient {
     }
 
     private handleNotification(method: string, params: any): void {
+        this.recordPendingTurnActivity(method, params);
+
         // codex/event notifications: either `codex/event` or `codex/event/<type>`
         if (method === 'codex/event' || method.startsWith('codex/event/')) {
             this.notificationProtocol = 'legacy';
