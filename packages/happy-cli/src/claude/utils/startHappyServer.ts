@@ -30,6 +30,32 @@ export interface HappyServerHandlers {
     client: ApiSessionClient;
 }
 
+// The very first title a session gets — whether from the fallback-title
+// mechanism in apiSession.ts or from an earlier change_title call — is the
+// one users rely on to find the chat again. Letting later change_title calls
+// keep overwriting it (the system prompt nudges the model to call it on
+// almost every turn) makes the title churn instead of staying findable, so
+// once a title exists this becomes a no-op.
+export function createChangeTitleHandler(client: ApiSessionClient) {
+    return async (title: string): Promise<{ success: boolean; error?: string }> => {
+        if (client.hasTitle()) {
+            logger.debug('[happyMCP] Title already set; ignoring change_title call');
+            return { success: false, error: 'Title already set for this session and is now locked' };
+        }
+        logger.debug('[happyMCP] Changing title to:', title);
+        try {
+            client.sendClaudeSessionMessage({
+                type: 'summary',
+                summary: title,
+                leafUuid: randomUUID()
+            });
+            return { success: true };
+        } catch (error) {
+            return { success: false, error: String(error) };
+        }
+    };
+}
+
 function createMcpServer(handlers: HappyServerHandlers): McpServer {
     const mcp = new McpServer({
         name: "Happy MCP",
@@ -149,19 +175,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
 export async function startHappyServer(client: ApiSessionClient) {
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
 
-    const changeTitle = async (title: string) => {
-        logger.debug('[happyMCP] Changing title to:', title);
-        try {
-            client.sendClaudeSessionMessage({
-                type: 'summary',
-                summary: title,
-                leafUuid: randomUUID()
-            });
-            return { success: true };
-        } catch (error) {
-            return { success: false, error: String(error) };
-        }
-    };
+    const changeTitle = createChangeTitleHandler(client);
 
     const server = createServer(async (req, res) => {
         const mcp = createMcpServer({ changeTitle, client });
