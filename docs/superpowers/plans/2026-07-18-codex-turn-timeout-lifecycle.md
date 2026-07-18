@@ -20,8 +20,8 @@
 
 ## Verification
 
-- `corepack pnpm -C packages/happy-cli exec vitest run --project unit src/codex/codexAppServerClient.test.ts`: 25 tests passed.
-- `corepack pnpm -C packages/happy-cli test`: build/typecheck passed and 1,125 tests passed. The command remains red because 14 unrelated `src/claude/runClaude.test.ts` cases use a `@/persistence` mock that does not export `SandboxConfigSchema`; the same 14 fail on this branch's parent, so they are not caused by this change.
+- `corepack pnpm -C packages/happy-cli exec vitest run --project unit src/codex/codexAppServerClient.test.ts`: 26 tests passed.
+- `corepack pnpm -C packages/happy-cli test`: build/typecheck passed and 1,126 tests passed. The command remains red because 14 unrelated `src/claude/runClaude.test.ts` cases use a `@/persistence` mock that does not export `SandboxConfigSchema`; the same 14 fail on this branch's parent, so they are not caused by this change.
 
 ## Review Follow-up
 
@@ -29,4 +29,5 @@
 - [x] Replace real-time timeout sleeps with Vitest fake timers while preserving both the activity-extension and stale-turn timeout regressions.
 - [x] Hold the watchdog disarmed while a server → client approval request is outstanding. Approvals arrive as JSON-RPC requests, not notifications, so they never reached `recordPendingTurnActivity`; a turn blocked on a mobile approval prompt was interrupted after the inactivity window even though the provider was waiting on us. Answering the request re-arms the watchdog with a full window, and `disconnectInternal` drops the counter so approvals belonging to a dead process cannot leave a later turn unguarded.
 - [x] Bind asynchronous server-request responses and counter cleanup to the app-server epoch that received the request. An approval resolved after reconnect must neither write its stale JSON-RPC response to the replacement process nor decrement the replacement process's outstanding-request count and re-arm its watchdog.
+- [x] Clear the outstanding-request count at the spawn site where the epoch is bumped, not only in `disconnectInternal`. A crashed app-server leaves `connect()` reachable without an intervening `disconnectInternal`, so a never-answered approval kept the count above zero while the epoch guard refused to decrement it — permanently disarming the watchdog for every later turn. Resetting where the epoch changes makes the invariant epoch-local by construction.
 - [x] Document on `sendTurnAndWait` that `turnTimeoutMs` bounds inactivity rather than total turn duration.

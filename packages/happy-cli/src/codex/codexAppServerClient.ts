@@ -552,6 +552,11 @@ export class CodexAppServerClient {
         logger.debug(`[CodexAppServer] Spawning: ${command} ${args.join(' ')}`);
 
         const epoch = ++this.processEpoch;
+        // Approvals issued by a previous process can never be answered against this
+        // one, and their responses are dropped by the epoch guard rather than
+        // decrementing the count. Clear it here so the invariant holds for every
+        // epoch bump, including a crash that skipped disconnectInternal.
+        this.outstandingServerRequests = 0;
         // Use cross-spawn so npm-installed wrappers (codex.cmd / codex.ps1) resolve on Windows.
         // Native child_process.spawn fails with ENOENT for .cmd shims (issues #980, #1016).
         const proc = crossSpawn(command, args, {

@@ -955,6 +955,121 @@ describe('CodexAppServerClient sandbox integration', () => {
         }
     });
 
+    it('re-arms the watchdog for a turn started after a crash left an approval outstanding', async () => {
+        const secondProcessRequests: MockRpcMessage[] = [];
+        const proc1 = createMockProcess({
+            pid: 2009,
+            onRequest: (msg, stdout) => {
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-crash', path: '/tmp/thread-crash' },
+                            model: 'gpt-test',
+                            modelProvider: 'openai',
+                            cwd: '/tmp/project',
+                            approvalPolicy: 'on-request',
+                            sandbox: { type: 'dangerFullAccess' },
+                            reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { turn: { id: 'turn-crash', items: [], status: 'inProgress', error: null } },
+                        });
+                        pushJsonLine(stdout, {
+                            id: 77,
+                            method: 'item/commandExecution/requestApproval',
+                            params: {
+                                threadId: 'thread-crash',
+                                turnId: 'turn-crash',
+                                itemId: 'crash-approval',
+                                command: 'never answered',
+                                cwd: '/tmp/project',
+                                reason: null,
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        });
+
+        const proc2 = createMockProcess({
+            pid: 2010,
+            onRequest: (msg, stdout) => {
+                secondProcessRequests.push(msg);
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { turn: { id: 'turn-after-crash', items: [], status: 'inProgress', error: null } },
+                    }), 0);
+                }
+                if (msg.method === 'turn/interrupt' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: {} });
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: {
+                                threadId: 'thread-crash',
+                                turn: { id: 'turn-after-crash', items: [], status: 'cancelled', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        });
+        mockSpawn
+            .mockImplementationOnce(() => proc1)
+            .mockImplementationOnce(() => proc2);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        let releaseApproval!: () => void;
+        let markApprovalRequested!: () => void;
+        const approvalDecision = new Promise<void>((resolve) => { releaseApproval = resolve; });
+        const approvalRequested = new Promise<void>((resolve) => { markApprovalRequested = resolve; });
+        client.setApprovalHandler(async () => {
+            markApprovalRequested();
+            await approvalDecision;
+            return 'approved';
+        });
+
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'on-request',
+            sandbox: 'danger-full-access',
+        });
+
+        const crashedTurn = client.sendTurnAndWait('crashes mid-approval', { turnTimeoutMs: 60_000 });
+        await approvalRequested;
+
+        // The app-server dies while the approval is still outstanding, so
+        // disconnectInternal never runs to clear the outstanding-request count.
+        proc1.emit('exit', 1, null);
+        await expect(crashedTurn).resolves.toEqual({ aborted: true });
+        await client.connect();
+
+        vi.useFakeTimers();
+        try {
+            const pending = client.sendTurnAndWait('after crash', { turnTimeoutMs: 20 });
+            await vi.advanceTimersByTimeAsync(0);
+            await vi.advanceTimersByTimeAsync(25);
+
+            expect(secondProcessRequests.some((request) => request.method === 'turn/interrupt')).toBe(true);
+            await expect(pending).resolves.toEqual({ aborted: true });
+        } finally {
+            releaseApproval();
+            await vi.advanceTimersByTimeAsync(0);
+            await client.disconnect();
+            vi.useRealTimers();
+        }
+    });
+
     it('forks, reads, and rolls back Codex threads through app-server RPC', async () => {
         const requests: MockRpcMessage[] = [];
         const proc = createMockProcess({
