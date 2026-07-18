@@ -1241,7 +1241,11 @@ export class CodexAppServerClient {
         logger.debug(`[CodexAppServer] → ${method} (notification)`);
     }
 
-    private respond(id: number, result: unknown): void {
+    private respond(id: number, result: unknown, sourceEpoch: number): void {
+        if (sourceEpoch !== this.processEpoch) {
+            logger.debug(`[CodexAppServer] Ignoring response from stale epoch for id=${id}`);
+            return;
+        }
         if (!this.process?.stdin?.writable) return;
         const msg: JsonRpcResponse = { jsonrpc: '2.0', id, result };
         this.process.stdin.write(JSON.stringify(msg) + '\n');
@@ -1284,9 +1288,10 @@ export class CodexAppServerClient {
         if (msg.id != null && msg.method) {
             this.outstandingServerRequests += 1;
             this.schedulePendingTurnInactivityTimeout();
-            this.handleServerRequest(msg.id, msg.method, msg.params).catch((err) => {
+            this.handleServerRequest(msg.id, msg.method, msg.params, sourceEpoch).catch((err) => {
                 logger.debug('[CodexAppServer] Error handling server request:', err);
             }).finally(() => {
+                if (sourceEpoch !== this.processEpoch) return;
                 this.outstandingServerRequests = Math.max(0, this.outstandingServerRequests - 1);
                 this.schedulePendingTurnInactivityTimeout();
             });
@@ -1378,7 +1383,7 @@ export class CodexAppServerClient {
         };
     }
 
-    private async handleServerRequest(id: number, method: string, params: any): Promise<void> {
+    private async handleServerRequest(id: number, method: string, params: any, sourceEpoch: number): Promise<void> {
         if (method === 'mcpServer/elicitation/request') {
             const toolName = this.parseToolNameFromElicitationMessage(params?.message) ?? params?.serverName ?? 'McpTool';
             const decision = await this.handleApproval({
@@ -1389,7 +1394,7 @@ export class CodexAppServerClient {
                 serverName: params?.serverName,
                 message: params?.message,
             });
-            this.respond(id, this.mapDecisionToMcpElicitationResponse(decision, params));
+            this.respond(id, this.mapDecisionToMcpElicitationResponse(decision, params), sourceEpoch);
             return;
         }
 
@@ -1404,7 +1409,7 @@ export class CodexAppServerClient {
                 cwd: params.cwd,
                 reason: params.reason,
             });
-            this.respond(id, { decision: this.mapDecisionToWire(decision, legacy) });
+            this.respond(id, { decision: this.mapDecisionToWire(decision, legacy) }, sourceEpoch);
             return;
         }
 
@@ -1420,13 +1425,13 @@ export class CodexAppServerClient {
                     : undefined),
                 reason: params.reason,
             });
-            this.respond(id, { decision: this.mapDecisionToWire(decision, legacy) });
+            this.respond(id, { decision: this.mapDecisionToWire(decision, legacy) }, sourceEpoch);
             return;
         }
 
         // Unknown server request — respond so server doesn't hang
         logger.debug(`[CodexAppServer] Unknown server request: ${method}`);
-        this.respond(id, {});
+        this.respond(id, {}, sourceEpoch);
     }
 
     private async handleApproval(params: Parameters<ApprovalHandler>[0]): Promise<ReviewDecision> {

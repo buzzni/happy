@@ -785,6 +785,176 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('ignores an approval completion from a disconnected app-server epoch', async () => {
+        const secondProcessRequests: MockRpcMessage[] = [];
+        let secondStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+
+        const proc1 = createMockProcess({
+            pid: 2007,
+            onRequest: (msg, stdout) => {
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-epoch', path: '/tmp/thread-epoch' },
+                            model: 'gpt-test',
+                            modelProvider: 'openai',
+                            cwd: '/tmp/project',
+                            approvalPolicy: 'on-request',
+                            sandbox: { type: 'dangerFullAccess' },
+                            reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { turn: { id: 'turn-old', items: [], status: 'inProgress', error: null } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: {
+                                threadId: 'thread-epoch',
+                                turn: { id: 'turn-old', items: [], status: 'inProgress', error: null },
+                            },
+                        });
+                        pushJsonLine(stdout, {
+                            id: 77,
+                            method: 'item/commandExecution/requestApproval',
+                            params: {
+                                threadId: 'thread-epoch',
+                                turnId: 'turn-old',
+                                itemId: 'old-approval',
+                                command: 'old command',
+                                cwd: '/tmp/project',
+                                reason: null,
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        });
+
+        const proc2 = createMockProcess({
+            pid: 2008,
+            onRequest: (msg, stdout) => {
+                secondProcessRequests.push(msg);
+                secondStdout = stdout;
+                if (msg.method === 'thread/resume' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-epoch', path: '/tmp/thread-epoch' },
+                            model: 'gpt-test',
+                            modelProvider: 'openai',
+                            cwd: '/tmp/project',
+                            approvalPolicy: 'on-request',
+                            sandbox: { type: 'dangerFullAccess' },
+                            reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { turn: { id: 'turn-new', items: [], status: 'inProgress', error: null } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: {
+                                threadId: 'thread-epoch',
+                                turn: { id: 'turn-new', items: [], status: 'inProgress', error: null },
+                            },
+                        });
+                        pushJsonLine(stdout, {
+                            id: 88,
+                            method: 'item/commandExecution/requestApproval',
+                            params: {
+                                threadId: 'thread-epoch',
+                                turnId: 'turn-new',
+                                itemId: 'new-approval',
+                                command: 'new command',
+                                cwd: '/tmp/project',
+                                reason: null,
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        });
+        mockSpawn
+            .mockImplementationOnce(() => proc1)
+            .mockImplementationOnce(() => proc2);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        let releaseOldApproval!: () => void;
+        let releaseNewApproval!: () => void;
+        let markOldApprovalRequested!: () => void;
+        let markNewApprovalRequested!: () => void;
+        const oldApprovalDecision = new Promise<void>((resolve) => { releaseOldApproval = resolve; });
+        const newApprovalDecision = new Promise<void>((resolve) => { releaseNewApproval = resolve; });
+        const oldApprovalRequested = new Promise<void>((resolve) => { markOldApprovalRequested = resolve; });
+        const newApprovalRequested = new Promise<void>((resolve) => { markNewApprovalRequested = resolve; });
+        client.setApprovalHandler(async ({ callId }) => {
+            if (callId === 'old-approval') {
+                markOldApprovalRequested();
+                await oldApprovalDecision;
+                return 'approved';
+            }
+            markNewApprovalRequested();
+            await newApprovalDecision;
+            return 'approved';
+        });
+
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'on-request',
+            sandbox: 'danger-full-access',
+        });
+
+        const oldPending = client.sendTurnAndWait('old turn', { turnTimeoutMs: 60_000 });
+        await oldApprovalRequested;
+        await expect(client.reconnectAndResumeThread()).resolves.toBe(true);
+        await expect(oldPending).resolves.toEqual({ aborted: true });
+
+        vi.useFakeTimers();
+        try {
+            const newPending = client.sendTurnAndWait('new turn', { turnTimeoutMs: 20 });
+            await vi.advanceTimersByTimeAsync(0);
+            await newApprovalRequested;
+
+            releaseOldApproval();
+            await vi.advanceTimersByTimeAsync(0);
+
+            expect(secondProcessRequests.some((request) => request.id === 77 && request.result !== undefined)).toBe(false);
+            await vi.advanceTimersByTimeAsync(25);
+            expect(secondProcessRequests.some((request) => request.method === 'turn/interrupt')).toBe(false);
+
+            releaseNewApproval();
+            await vi.advanceTimersByTimeAsync(0);
+            if (!secondStdout) throw new Error('second app-server stdout unavailable');
+            pushJsonLine(secondStdout, {
+                method: 'turn/completed',
+                params: {
+                    threadId: 'thread-epoch',
+                    turn: { id: 'turn-new', items: [], status: 'completed', error: null },
+                },
+            });
+            await expect(newPending).resolves.toEqual({ aborted: false });
+        } finally {
+            releaseOldApproval();
+            releaseNewApproval();
+            await vi.advanceTimersByTimeAsync(0);
+            await client.disconnect();
+            vi.useRealTimers();
+        }
+    });
+
     it('forks, reads, and rolls back Codex threads through app-server RPC', async () => {
         const requests: MockRpcMessage[] = [];
         const proc = createMockProcess({
