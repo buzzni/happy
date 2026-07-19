@@ -37,6 +37,8 @@ export interface QueryOptions {
     cwd?: string
     disallowedTools?: string[]
     maxTurns?: number
+    /** Emit Claude's predicted next user prompt after completed turns. */
+    promptSuggestions?: boolean
     mcpServers?: Record<string, unknown>
     permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan'
     continue?: boolean

@@ -20,6 +20,7 @@ import type { MessageParam, ContentBlockParam } from '@anthropic-ai/sdk/resource
 import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
 import type { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
+import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 
 interface PermissionsField {
     date: number;
@@ -415,6 +416,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             mcpServers: metadata.mcpServers,
                             skills: metadata.skills,
                         }));
+                    },
+                    onPromptSuggestionChange: (suggestion) => {
+                        publishClaudePromptSuggestion(
+                            session.client.updateMetadata.bind(session.client),
+                            suggestion,
+                        );
                     },
                     onQueryReady: (q) => {
                         permissionHandler.setPermissionModeUpdater(async (mode) => {

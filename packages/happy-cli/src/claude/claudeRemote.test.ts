@@ -28,6 +28,9 @@ describe('claudeRemote', () => {
         const onReady = vi.fn(() => {
             callbackOrder.push('ready');
         });
+        const onPromptSuggestionChange = vi.fn((suggestion: string | null) => {
+            callbackOrder.push(`suggestion:${suggestion ?? 'clear'}`);
+        });
 
         await claudeRemote({
             sessionId: null,
@@ -44,6 +47,7 @@ describe('claudeRemote', () => {
             onSessionFound: vi.fn(),
             onThinkingChange: vi.fn(),
             onMessage: vi.fn(),
+            onPromptSuggestionChange,
             onCompletionEvent,
             onSessionReset,
         });
@@ -51,7 +55,7 @@ describe('claudeRemote', () => {
         expect(onCompletionEvent).toHaveBeenCalledWith('Context was reset');
         expect(onSessionReset).toHaveBeenCalledOnce();
         expect(onReady).toHaveBeenCalledOnce();
-        expect(callbackOrder).toEqual(['event:Context was reset', 'reset', 'ready']);
+        expect(callbackOrder).toEqual(['suggestion:clear', 'event:Context was reset', 'reset', 'ready']);
     });
 
     it('injects worker agents + delegation prompt when HAPPY_WORKER_MODEL is set', async () => {
@@ -122,6 +126,90 @@ describe('claudeRemote', () => {
         } finally {
             if (prev === undefined) delete process.env.HAPPY_WORKER_MODEL; else process.env.HAPPY_WORKER_MODEL = prev;
         }
+    });
+
+    it('enables prompt suggestions and routes them outside the conversation transcript', async () => {
+        vi.mocked(query).mockReturnValue({
+            setPermissionMode: vi.fn(),
+            mcpServerStatus: vi.fn(async () => []),
+            async *[Symbol.asyncIterator]() {
+                yield { type: 'result', subtype: 'success' };
+                yield {
+                    type: 'prompt_suggestion',
+                    suggestion: '  Run the focused tests  ',
+                    uuid: 'suggestion-1',
+                    session_id: 'session-1',
+                };
+            },
+        } as any);
+
+        const onMessage = vi.fn();
+        const onPromptSuggestionChange = vi.fn();
+        let messageCount = 0;
+
+        await claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage: async () => (messageCount++ === 0 ? { message: 'implement it', mode } : null),
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage,
+            onPromptSuggestionChange,
+        });
+
+        expect(vi.mocked(query).mock.calls[0][0].options?.promptSuggestions).toBe(true);
+        expect(onPromptSuggestionChange.mock.calls.map(([value]) => value)).toEqual([
+            null,
+            'Run the focused tests',
+        ]);
+        expect(onMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'prompt_suggestion' }));
+    });
+
+    it('drops a completed-turn suggestion that arrives after the next user input was accepted', async () => {
+        vi.mocked(query).mockReturnValue({
+            setPermissionMode: vi.fn(),
+            mcpServerStatus: vi.fn(async () => []),
+            async *[Symbol.asyncIterator]() {
+                yield { type: 'result', subtype: 'success' };
+                await Promise.resolve();
+                yield {
+                    type: 'prompt_suggestion',
+                    suggestion: 'Stale previous-turn suggestion',
+                    uuid: 'suggestion-1',
+                    session_id: 'session-1',
+                };
+            },
+        } as any);
+
+        const onPromptSuggestionChange = vi.fn();
+        let messageCount = 0;
+
+        await claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage: async () => {
+                messageCount += 1;
+                if (messageCount === 1) return { message: 'first', mode };
+                if (messageCount === 2) return { message: 'next', mode };
+                return null;
+            },
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+            onPromptSuggestionChange,
+        });
+
+        expect(onPromptSuggestionChange.mock.calls.map(([value]) => value)).toEqual([null, null]);
     });
 
     it('marks assistant messages from /compact as compact summaries', async () => {

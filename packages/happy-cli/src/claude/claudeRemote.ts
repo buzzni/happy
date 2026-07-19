@@ -50,6 +50,7 @@ export async function claudeRemote(opts: {
     onSessionFound: (id: string) => void,
     onThinkingChange?: (thinking: boolean) => void,
     onMessage: (message: SDKMessage) => void,
+    onPromptSuggestionChange?: (suggestion: string | null) => void,
     onCompletionEvent?: (message: string) => void,
     onSessionReset?: () => void,
     onMcpStatus?: (status: McpRuntimeServerStatus) => void,
@@ -101,6 +102,7 @@ export async function claudeRemote(opts: {
     if (!initial) { // No initial message - exit
         return;
     }
+    opts.onPromptSuggestionChange?.(null);
 
     // Handle special commands (extract text for parsing when content is a block array)
     const initialText = typeof initial.message === 'string'
@@ -162,6 +164,7 @@ export async function claudeRemote(opts: {
         canCallTool: (toolName: string, input: unknown, options: { signal: AbortSignal; toolUseID: string }) => opts.canCallTool(toolName, input, mode, options),
         abort: opts.signal,
         settingsPath: opts.hookSettingsPath,
+        promptSuggestions: true,
     }
 
     // Track thinking state
@@ -205,11 +208,23 @@ export async function claudeRemote(opts: {
     }
 
     updateThinking(true);
+    let acceptsPromptSuggestion = false;
     try {
         logger.debug(`[claudeRemote] Starting to iterate over response`);
 
         for await (const message of response) {
             logger.debugLargeJson(`[claudeRemote] Message ${message.type}`, message);
+
+            if (message.type === 'prompt_suggestion') {
+                if (acceptsPromptSuggestion) {
+                    acceptsPromptSuggestion = false;
+                    const suggestion = message.suggestion.trim();
+                    if (suggestion) {
+                        opts.onPromptSuggestionChange?.(suggestion);
+                    }
+                }
+                continue;
+            }
 
             // Handle messages. During /compact, Claude emits the generated
             // summary as a normal assistant text message before the result.
@@ -263,6 +278,7 @@ export async function claudeRemote(opts: {
 
             // Handle result messages
             if (message.type === 'result') {
+                acceptsPromptSuggestion = true;
                 updateThinking(false);
                 logger.debug('[claudeRemote] Result received');
                 opts.onMcpControllerReady?.(mcpRecovery);
@@ -289,6 +305,8 @@ export async function claudeRemote(opts: {
                     if (!next) {
                         messages.end();
                     } else {
+                        acceptsPromptSuggestion = false;
+                        opts.onPromptSuggestionChange?.(null);
                         opts.onMcpControllerReady?.(null);
                         mode = next.mode;
                         messages.push({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: next.message } });

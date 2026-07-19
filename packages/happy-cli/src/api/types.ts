@@ -300,6 +300,11 @@ export type Metadata = {
     text: string,
     updatedAt: number
   },
+  promptSuggestion?: {
+    text: string,
+    provider: string,
+    updatedAt: number
+  } | null,
   machineId?: string,
   claudeSessionId?: string, // Claude Code session ID
   codexThreadId?: string, // Codex app-server thread ID
