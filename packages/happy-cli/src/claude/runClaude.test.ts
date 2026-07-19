@@ -26,7 +26,8 @@ vi.mock('@/api/api', () => ({
     },
 }));
 
-vi.mock('@/persistence', () => ({
+vi.mock('@/persistence', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/persistence')>(),
     readSettings: mockReadSettings,
 }));
 
