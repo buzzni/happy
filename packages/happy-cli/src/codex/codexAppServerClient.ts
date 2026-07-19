@@ -222,6 +222,7 @@ export class CodexAppServerClient {
     private pendingTurnCompletion: {
         resolve: (aborted: boolean) => void;
         turnId: string | null;
+        started: boolean;
         inactivityTimeoutMs: number;
         inactivityTimer: ReturnType<typeof setTimeout> | null;
     } | null = null;
@@ -394,7 +395,10 @@ export class CodexAppServerClient {
 
         if (method === 'thread/status/changed') {
             const statusType = params?.status?.type;
-            if (statusType === 'idle' && this.pendingTurnCompletion) {
+            // A previous turn's idle status can arrive after the next turn/start
+            // response. Only use this ID-less fallback after the pending turn has
+            // announced its own start, so stale idle cannot complete the new turn.
+            if (statusType === 'idle' && this.pendingTurnCompletion?.started) {
                 this.emitRawTurnCompletion(this._turnId, 'completed', null, method);
             }
             return true;
@@ -999,8 +1003,11 @@ export class CodexAppServerClient {
 
     private markPendingTurnStarted(turnId?: string | null): boolean {
         if (!this.matchesPendingTurn(turnId)) return false;
-        if (turnId && this.pendingTurnCompletion && !this.pendingTurnCompletion.turnId) {
-            this.pendingTurnCompletion.turnId = turnId;
+        if (this.pendingTurnCompletion) {
+            this.pendingTurnCompletion.started = true;
+            if (turnId && !this.pendingTurnCompletion.turnId) {
+                this.pendingTurnCompletion.turnId = turnId;
+            }
         }
         return true;
     }
@@ -1199,6 +1206,7 @@ export class CodexAppServerClient {
             this.pendingTurnCompletion = {
                 resolve,
                 turnId: null,
+                started: false,
                 inactivityTimeoutMs: timeoutMs,
                 inactivityTimer: null,
             };
