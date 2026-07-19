@@ -236,6 +236,15 @@ export class CodexAppServerClient {
     private completedTurnIds = new Set<string>();
     private rawFileChangesByItemId = new Map<string, LegacyPatchChanges>();
 
+    // Last known startup status per MCP server (name -> status, e.g. 'ready'/'starting'/'failed').
+    // Used to explain a watchdog-forced abort: a turn can hang building its tool
+    // list while waiting on a server that never became ready.
+    private mcpServerStatuses = new Map<string, string>();
+    // Set when *our* inactivity watchdog forces the current turn to abort, so the
+    // resulting turn_aborted event can be distinguished from a user-initiated cancel.
+    private inactivityTimedOut = false;
+    private inactivityTimeoutMs = 0;
+
     // Handlers set by the consumer (runCodex.ts)
     private eventHandler: ((msg: EventMsg) => void) | null = null;
     private approvalHandler: ApprovalHandler | null = null;
@@ -299,6 +308,32 @@ export class CodexAppServerClient {
         return true;
     }
 
+    /** MCP servers whose last reported startup status is anything other than 'ready'. */
+    private getNotReadyMcpServers(): string[] {
+        const notReady: string[] = [];
+        for (const [name, status] of this.mcpServerStatuses) {
+            if (status !== 'ready') notReady.push(name);
+        }
+        return notReady;
+    }
+
+    /**
+     * If the current abort was triggered by our inactivity watchdog, returns the
+     * diagnostic fields to attach to the turn_aborted event and clears the flag.
+     * Returns an empty object for user-initiated aborts (which stay silent).
+     */
+    private consumeInactivityAbortFields(): Record<string, unknown> {
+        if (!this.inactivityTimedOut) return {};
+        const timeoutMs = this.inactivityTimeoutMs;
+        this.inactivityTimedOut = false;
+        this.inactivityTimeoutMs = 0;
+        return {
+            reason: 'inactivity_timeout',
+            inactivity_timeout_ms: timeoutMs,
+            not_ready_mcp_servers: this.getNotReadyMcpServers(),
+        };
+    }
+
     private emitRawTurnCompletion(
         turnId: string | null,
         status: string | null,
@@ -325,6 +360,7 @@ export class CodexAppServerClient {
                 ...(turnId ? { turn_id: turnId } : {}),
                 ...(status ? { status } : {}),
                 ...(error !== undefined && error !== null ? { error } : {}),
+                ...this.consumeInactivityAbortFields(),
             });
             return;
         }
@@ -922,6 +958,8 @@ export class CodexAppServerClient {
         pending.inactivityTimer = setTimeout(() => {
             if (this.pendingTurnCompletion !== pending) return;
             pending.inactivityTimer = null;
+            this.inactivityTimedOut = true;
+            this.inactivityTimeoutMs = pending.inactivityTimeoutMs;
             logger.warn(
                 `[CodexAppServer] Turn inactive for ${pending.inactivityTimeoutMs}ms — interrupting provider`,
             );
@@ -1036,11 +1074,13 @@ export class CodexAppServerClient {
         logger.warn(`[CodexAppServer] interrupt did not settle turn in ${gracePeriodMs}ms; force-restarting app-server`);
         const pendingTurnId = this.pendingTurnCompletion?.turnId ?? this._turnId;
         if (this.pendingTurnCompletion) {
+            const inactivityFields = this.consumeInactivityAbortFields();
             this.eventHandler?.({
                 type: 'turn_aborted',
                 reason: 'interrupted',
                 ...(pendingTurnId ? { turn_id: pendingTurnId } : {}),
                 forced_restart: true,
+                ...inactivityFields,
             });
         }
         const resumedThread = await this.reconnectAndResumeThread();
@@ -1141,6 +1181,10 @@ export class CodexAppServerClient {
             // (harmlessly, since pendingTurnCompletion is null at this point).
             await new Promise(resolve => setTimeout(resolve, 0));
         }
+
+        // Clear any stale watchdog flag so it can only describe this turn's abort.
+        this.inactivityTimedOut = false;
+        this.inactivityTimeoutMs = 0;
 
         const timeoutMs = opts?.turnTimeoutMs ?? CodexAppServerClient.TURN_TIMEOUT_MS;
         const completion = new Promise<boolean>((resolve) => {
@@ -1528,6 +1572,9 @@ export class CodexAppServerClient {
         // (e.g. happy-mcp bridge failing on Windows due to shebang execution).
         if (method === 'mcpServer/startupStatus/updated') {
             logger.debug(`[CodexAppServer] mcpServer startup status:`, params);
+            if (typeof params?.name === 'string' && typeof params?.status === 'string') {
+                this.mcpServerStatuses.set(params.name, params.status);
+            }
             return;
         }
 

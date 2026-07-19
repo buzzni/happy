@@ -2,6 +2,7 @@ import { render } from "ink";
 import React from "react";
 import { ApiClient } from '@/api/api';
 import { CodexAppServerClient } from './codexAppServerClient';
+import { describeCodexInactivityAbort } from './codexAbortNotice';
 import type { ReasoningEffort } from './codexAppServerTypes';
 import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
@@ -736,8 +737,14 @@ export async function runCodex(opts: {
                 messageBuffer.addMessage('Task completed', 'status');
             }
         } else if (msg.type === 'turn_aborted') {
+            const inactivityNotice = describeCodexInactivityAbort(msg);
             const failure = describeCodexFailure(msg);
-            if (failure) {
+            if (inactivityNotice) {
+                // Our own watchdog force-stopped a hung turn: without this the turn
+                // ends silently and the user never learns why nothing came back.
+                messageBuffer.addMessage(inactivityNotice, 'status');
+                session.sendSessionEvent({ type: 'message', message: inactivityNotice });
+            } else if (failure) {
                 messageBuffer.addMessage(`Turn aborted: ${failure}`, 'status');
                 session.sendSessionEvent({ type: 'message', message: `Codex error: ${failure}` });
             } else {
