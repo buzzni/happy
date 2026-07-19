@@ -714,8 +714,15 @@ export async function runCodex(opts: {
         } else if (msg.type === 'task_complete') {
             // Ready is emitted from the main loop's idle check so pushes only fire once
             // after the queue is actually drained.
+            // Codex may settle a watchdog interrupt with status 'completed', so the
+            // inactivity notice applies here too, not just to turn_aborted.
+            const inactivityNotice = describeCodexInactivityAbort(msg);
             const failure = describeCodexFailure(msg);
-            if (failure) {
+            if (inactivityNotice) {
+                const message = failure ? `${inactivityNotice} Provider error: ${failure}` : inactivityNotice;
+                messageBuffer.addMessage(message, 'status');
+                session.sendSessionEvent({ type: 'message', message });
+            } else if (failure) {
                 messageBuffer.addMessage(`Task failed: ${failure}`, 'status');
                 session.sendSessionEvent({ type: 'message', message: `Codex error: ${failure}` });
             } else {
@@ -727,8 +734,10 @@ export async function runCodex(opts: {
             if (inactivityNotice) {
                 // Our own watchdog force-stopped a hung turn: without this the turn
                 // ends silently and the user never learns why nothing came back.
-                messageBuffer.addMessage(inactivityNotice, 'status');
-                session.sendSessionEvent({ type: 'message', message: inactivityNotice });
+                // Keep the provider error visible when the event carries both.
+                const message = failure ? `${inactivityNotice} Provider error: ${failure}` : inactivityNotice;
+                messageBuffer.addMessage(message, 'status');
+                session.sendSessionEvent({ type: 'message', message });
             } else if (failure) {
                 messageBuffer.addMessage(`Turn aborted: ${failure}`, 'status');
                 session.sendSessionEvent({ type: 'message', message: `Codex error: ${failure}` });
