@@ -1918,6 +1918,20 @@ describe('CodexAppServerClient sandbox integration', () => {
                     turnStartCount += 1;
                     const turnId = turnStartCount === 1 ? 'turn-first' : 'turn-second';
                     setTimeout(() => {
+                        if (turnId === 'turn-second') {
+                            pushJsonLine(stdout, {
+                                method: 'turn/started',
+                                params: {
+                                    threadId: 'thread-queued',
+                                    turn: { id: 'turn-late-nested' },
+                                },
+                            });
+                            pushJsonLine(stdout, {
+                                method: 'thread/status/changed',
+                                params: { threadId: 'thread-queued', status: { type: 'idle' } },
+                            });
+                        }
+
                         pushJsonLine(stdout, {
                             id: msg.id,
                             result: {
