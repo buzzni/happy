@@ -67,3 +67,6 @@ export {
   isPermissionRequestMessage,
   getMessageText,
 } from './AgentMessage';
+
+export type { TurnInactivityWatchdog } from './turnInactivityWatchdog';
+export { startTurnInactivityWatchdog } from './turnInactivityWatchdog';

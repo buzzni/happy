@@ -38,6 +38,14 @@ const mocks = vi.hoisted(() => {
     cancelCalls: [] as string[],
     disposeCalls: 0,
     constructorArgs: null as any,
+    /** When set, sendPrompt emits nothing so the turn looks silent. */
+    silentPrompt: false,
+    /**
+     * When set, sendPrompt stays pending until cancel — matching real ACP,
+     * where the session/prompt RPC only settles once the turn ends.
+     */
+    hangPromptUntilCancel: false,
+    resolveHangingPrompt: null as (() => void) | null,
   };
 
   return {
@@ -146,6 +154,15 @@ vi.mock('./AcpBackend', () => ({
 
     async sendPrompt(sessionId: string, prompt: string) {
       mocks.backendState.prompts.push({ sessionId, prompt });
+      if (mocks.backendState.hangPromptUntilCancel) {
+        await new Promise<void>((resolve) => {
+          mocks.backendState.resolveHangingPrompt = resolve;
+        });
+        return;
+      }
+      if (mocks.backendState.silentPrompt) {
+        return;
+      }
       for (const listener of mocks.backendState.listeners) {
         listener({ type: 'status', status: 'running' });
         listener({ type: 'model-output', textDelta: 'hello' });
@@ -172,6 +189,18 @@ vi.mock('./AcpBackend', () => ({
 
     async cancel(sessionId: string) {
       mocks.backendState.cancelCalls.push(sessionId);
+      // The real AcpBackend awaits the cancel RPC before emitting, so emitting
+      // synchronously here would let 'stopped' pre-empt the caller's own
+      // post-cancel bookkeeping and exercise a path production never takes.
+      await Promise.resolve();
+      if (mocks.backendState.resolveHangingPrompt) {
+        // A real cancel crosses the network, so the hung prompt settles on a
+        // later macrotask — after Node has already checked for unhandled
+        // rejections — not in the same microtask drain as the watchdog firing.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        mocks.backendState.resolveHangingPrompt();
+        mocks.backendState.resolveHangingPrompt = null;
+      }
       for (const listener of mocks.backendState.listeners) {
         listener({ type: 'status', status: 'stopped' });
       }
@@ -207,6 +236,9 @@ describe('runAcp', () => {
     mocks.backendState.cancelCalls = [];
     mocks.backendState.disposeCalls = 0;
     mocks.backendState.constructorArgs = null;
+    mocks.backendState.silentPrompt = false;
+    mocks.backendState.hangPromptUntilCancel = false;
+    mocks.backendState.resolveHangingPrompt = null;
 
     mocks.mockApiCreate.mockResolvedValue({
       getOrCreateMachine: mocks.mockGetOrCreateMachine,
@@ -267,6 +299,131 @@ describe('runAcp', () => {
       'Tool: ReadFile completed (callId=tool-1)',
       'Status: idle',
     ]));
+  });
+
+  it('cancels the backend when a turn goes silent for the inactivity window', async () => {
+    mocks.backendState.silentPrompt = true;
+    const runPromise = runAcp({
+      credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+      agentName: 'opencode',
+      command: 'opencode',
+      args: ['--acp'],
+      turnInactivityTimeoutMs: 250,
+    });
+    // The runner tears itself down once the turn fails; capture why.
+    const settled = runPromise.then(() => null).catch((error: Error) => error);
+
+    await vi.waitFor(() => {
+      expect(mocks.getUserMessageHandler()).toBeTypeOf('function');
+    });
+    mocks.getUserMessageHandler()!({ role: 'user', content: { type: 'text', text: 'hang please' } });
+
+    // The old wall-clock timer rejected the turn while leaving the agent running.
+    await vi.waitFor(() => {
+      expect(mocks.backendState.cancelCalls).toContain('acp-session-1');
+    });
+
+    // The turn must fail *as inactivity*, not as a side effect of the cancel.
+    expect((await settled)?.message).toContain('produced no activity');
+  });
+
+  it('keeps a slow turn alive while the backend keeps reporting activity', async () => {
+    mocks.backendState.silentPrompt = true;
+    const runPromise = runAcp({
+      credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+      agentName: 'opencode',
+      command: 'opencode',
+      args: ['--acp'],
+      turnInactivityTimeoutMs: 1000,
+    });
+
+    await vi.waitFor(() => {
+      expect(mocks.getUserMessageHandler()).toBeTypeOf('function');
+    });
+    mocks.getUserMessageHandler()!({ role: 'user', content: { type: 'text', text: 'long but alive' } });
+    await vi.waitFor(() => {
+      expect(mocks.backendState.prompts).toHaveLength(1);
+    });
+
+    // Total elapsed time exceeds the window, but no single gap does.
+    for (let i = 0; i < 6; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      for (const listener of mocks.backendState.listeners) {
+        listener({ type: 'model-output', textDelta: `chunk-${i}` });
+      }
+    }
+
+    expect(mocks.backendState.cancelCalls).not.toContain('acp-session-1');
+
+    // Killing mid-turn rejects the still-pending turn; that is the shutdown path.
+    await mocks.getKillHandler()!();
+    await runPromise.catch(() => { });
+  });
+
+  // In real ACP the session/prompt RPC spans the whole turn, so when the
+  // watchdog fires the runner is still suspended at `await sendPrompt` and no
+  // handler is attached to the turn promise yet. Rejecting it there used to
+  // surface as an unhandled rejection, which crashes the process (skipping all
+  // finally-cleanup) instead of failing the turn.
+  it('fails the turn without an unhandled rejection when the prompt RPC outlives the watchdog', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      mocks.backendState.hangPromptUntilCancel = true;
+      const runPromise = runAcp({
+        credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+        agentName: 'opencode',
+        command: 'opencode',
+        args: ['--acp'],
+        turnInactivityTimeoutMs: 250,
+      });
+      const settled = runPromise.then(() => null).catch((error: Error) => error);
+
+      await vi.waitFor(() => {
+        expect(mocks.getUserMessageHandler()).toBeTypeOf('function');
+      });
+      mocks.getUserMessageHandler()!({ role: 'user', content: { type: 'text', text: 'hang forever' } });
+
+      expect((await settled)?.message).toContain('produced no activity');
+      // Let Node deliver any pending unhandledRejection events.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandled).toHaveLength(0);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('keeps a turn alive while an approval awaits the user', async () => {
+    mocks.backendState.silentPrompt = true;
+    const runPromise = runAcp({
+      credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+      agentName: 'opencode',
+      command: 'opencode',
+      args: ['--acp'],
+      turnInactivityTimeoutMs: 300,
+    });
+
+    await vi.waitFor(() => {
+      expect(mocks.getUserMessageHandler()).toBeTypeOf('function');
+    });
+    mocks.getUserMessageHandler()!({ role: 'user', content: { type: 'text', text: 'needs approval' } });
+    await vi.waitFor(() => {
+      expect(mocks.backendState.prompts).toHaveLength(1);
+    });
+
+    // ACP resolves approvals inside this call, so it stays pending exactly as
+    // long as the user takes to answer. That wait is not provider inactivity.
+    const decision = mocks.backendState.constructorArgs.permissionHandler
+      .handleToolCall('tool-1', 'Bash', { command: 'ls' });
+    void decision.catch(() => { });
+
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    expect(mocks.backendState.cancelCalls).not.toContain('acp-session-1');
+
+    await mocks.getKillHandler()!();
+    await runPromise.catch(() => { });
   });
 
   it('registers abort handler that cancels the ACP backend session', async () => {

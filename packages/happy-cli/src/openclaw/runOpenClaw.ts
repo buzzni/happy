@@ -29,14 +29,16 @@ import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler'
 import { connectionState } from '@/utils/serverConnectionErrors';
 import { OpenClawBackend } from './OpenClawBackend';
 import type { OpenClawGatewayConfig } from './openclawTypes';
-import type { AgentMessage } from '@/agent/core';
+import type { AgentMessage, TurnInactivityWatchdog } from '@/agent/core';
+import { startTurnInactivityWatchdog } from '@/agent/core';
 
-const TURN_TIMEOUT_MS = 5 * 60 * 1000;
+/** Max time without any backend activity before the turn is cancelled. */
+const TURN_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 
 type PendingTurn = {
   resolve: () => void;
   reject: (err: Error) => void;
-  timeout: NodeJS.Timeout;
+  watchdog: TurnInactivityWatchdog;
 };
 
 export interface RunOpenClawOptions {
@@ -46,6 +48,8 @@ export interface RunOpenClawOptions {
   gatewayToken?: string;
   gatewayPassword?: string;
   verbose?: boolean;
+  /** Max time without any backend activity before the turn is cancelled. */
+  turnInactivityTimeoutMs?: number;
 }
 
 /**
@@ -133,6 +137,7 @@ function resolveGatewayConfig(opts: RunOpenClawOptions): OpenClawGatewayConfig {
 
 export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
   const verbose = opts.verbose === true;
+  const turnInactivityTimeoutMs = opts.turnInactivityTimeoutMs ?? TURN_INACTIVITY_TIMEOUT_MS;
   const sessionTag = randomUUID();
   connectionState.setBackend('openclaw');
 
@@ -207,10 +212,11 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
   let pendingTurn: PendingTurn | null = null;
   let thinking = false;
   let inTurn = false;
+  let backendSessionId: string | null = null;
 
   const clearPendingTurn = (error?: Error) => {
     if (!pendingTurn) return;
-    clearTimeout(pendingTurn.timeout);
+    pendingTurn.watchdog.stop();
     const current = pendingTurn;
     pendingTurn = null;
     if (error) {
@@ -220,14 +226,37 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
     }
   };
 
-  const waitForTurnEnd = () =>
-    new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        pendingTurn = null;
-        reject(new Error('Timed out waiting for OpenClaw to finish the turn'));
-      }, TURN_TIMEOUT_MS);
-      pendingTurn = { resolve, reject, timeout };
+  // Bounds inactivity rather than total turn duration: backend progress restarts
+  // the window, so a long turn that keeps reporting is never cut off. Cancel the
+  // backend before giving up — rejecting alone would leave the agent running
+  // while the runner reports the turn as failed.
+  const waitForTurnEnd = () => {
+    const turnEnded = new Promise<void>((resolve, reject) => {
+      // A previous turn that was abandoned without clearing would otherwise leave
+      // an armed watchdog behind that outlives the turn it belongs to.
+      pendingTurn?.watchdog.stop();
+      const watchdog = startTurnInactivityWatchdog({
+        timeoutMs: turnInactivityTimeoutMs,
+        onInactive: () => {
+          log(`No backend activity for ${turnInactivityTimeoutMs}ms; cancelling turn`);
+          if (backendSessionId) {
+            void backend.cancel(backendSessionId).catch((error) => {
+              logger.debug('[openclaw] Failed to cancel inactive turn:', error);
+            });
+          }
+          clearPendingTurn(new Error(`OpenClaw produced no activity for ${turnInactivityTimeoutMs}ms`));
+        },
+      });
+      pendingTurn = { resolve, reject, watchdog };
     });
+    // When the gateway goes unresponsive, sendPrompt itself hangs and the loop
+    // never reaches `await turnEnded` — so a rejection (watchdog, backend stop,
+    // kill) lands on a promise with no handler attached. Mark it handled so it
+    // fails the turn instead of crashing the process; `await turnEnded` still
+    // observes it.
+    turnEnded.catch(() => { });
+    return turnEnded;
+  };
 
   const sendEnvelopes = (envelopes: SessionEnvelope[]) => {
     for (const envelope of envelopes) {
@@ -245,6 +274,9 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
     if (verbose) {
       log(`Backend message: ${JSON.stringify(msg).slice(0, 200)}`);
     }
+
+    // Any backend message is proof the turn is still alive.
+    pendingTurn?.watchdog.recordActivity();
 
     // Still forward all messages as envelopes so frontend history matches gateway,
     // but don't let stale post-abort events flip the thinking/turn state.
@@ -327,6 +359,7 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
 
   try {
     const started = await backend.startSession();
+    backendSessionId = started.sessionId;
     log(`Connected. Session key: ${started.sessionId}`);
 
     while (!shouldExit) {
@@ -349,6 +382,11 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         log(`Turn ended: ${msg}`);
+        // sendPrompt can throw before the turn is ever awaited (e.g. the gateway
+        // dropped). Without this the watchdog stays armed on an abandoned turn and
+        // later cancels whatever run is live by then. Resolve rather than reject:
+        // nobody awaits this promise on the throw path.
+        clearPendingTurn();
         sendEnvelopes(sessionManager.endTurn('failed'));
       }
       inTurn = false;
