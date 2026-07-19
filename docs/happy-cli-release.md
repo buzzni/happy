@@ -17,7 +17,19 @@ upstream `main` unless that is explicitly requested as separate work.
 1. Update `packages/happy-cli/package.json` to the next `*-aplus.*` version.
 2. Run the normal build and tests from the workspace.
 3. Create a tag that exactly matches the package version: `happy-cli-v<version>`.
-4. Push the tag. The `Publish @namsangboy/happy-cli` workflow verifies that the tag and package version match before publishing.
+4. Push the tag **without running any local publish command**. The `Publish @namsangboy/happy-cli` workflow verifies that the tag and package version match, then is the sole process that publishes.
+
+## Single Publisher Policy (CRITICAL)
+
+GitHub Actions owns the entire registry publication path. Local work ends after the
+version bump, validation, and release-tag push. Do **not** run `npm publish`,
+`pnpm publish`, or `yarn publish` locally, including against a prepared directory or
+tarball.
+
+npm versions are immutable. If a version is published locally and its matching tag is
+then pushed, the workflow correctly attempts the same version a second time and fails
+with E403. Do not re-run that job. Check the published version and publish a new version
+through CI only when a correction is required.
 
 ## Publish Artifact Rule
 
@@ -29,7 +41,9 @@ The source package can use local workspace wiring during development, but the np
 - `@slopus/happy-wire` must be bundled into the CLI artifact until the A+ wire package changes are published independently.
 - The bundled dependency closure currently includes `@slopus/happy-wire`, `@paralleldrive/cuid2`, `@noble/hashes`, and `zod`.
 
-The release workflow therefore does this after build:
+The following commands describe the **GitHub Actions-only** publish section. They are not
+a local release procedure; do not copy the `npm publish` command to a developer machine.
+The workflow therefore does this after build:
 
 ```sh
 REPO="$(pwd)"
