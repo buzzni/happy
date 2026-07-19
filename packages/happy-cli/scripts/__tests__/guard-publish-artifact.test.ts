@@ -36,7 +36,7 @@ function createPublishTarball(packageVersion: string, cliVersion: string): strin
     writeFixtureFile(
         packageRoot,
         'bin/happy.mjs',
-        `if (process.argv.includes('--version')) console.log(${JSON.stringify(cliVersion)});\n`
+        `if (process.argv.includes('--version')) console.log('happy version: ' + ${JSON.stringify(cliVersion)} + '\\nprovider version: test');\n`
     );
     writeFixtureFile(packageRoot, 'node_modules/@slopus/happy-wire/package.json', JSON.stringify({ name: '@slopus/happy-wire', version: '0.0.0-test' }));
     writeFixtureFile(packageRoot, 'node_modules/@slopus/happy-wire/dist/index.mjs', 'export {};\n');
@@ -57,6 +57,16 @@ afterEach(() => {
 });
 
 describe('guard-publish-artifact', () => {
+    it('accepts an installed CLI whose reported Happy version matches package metadata', () => {
+        const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56');
+        const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball, '--install-smoke'], {
+            encoding: 'utf8',
+            timeout: 30_000
+        });
+
+        expect(result.status, result.stderr).toBe(0);
+    }, 40_000);
+
     it('rejects an installed CLI whose runtime version differs from package metadata', () => {
         const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.55');
         const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball, '--install-smoke'], {

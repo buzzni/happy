@@ -211,10 +211,12 @@ function runInstallSmoke(tarball, packageJson) {
             throw new Error(`Smoke install version mismatch: expected ${packageJson.version}, got ${installedPackage.version}`);
         }
 
-        const cliVersion = run(process.execPath, [
+        const cliVersionOutput = run(process.execPath, [
             path.join(installedRoot, 'bin', 'happy.mjs'),
             '--version'
         ]).stdout.trim();
+        const cliVersionMatch = cliVersionOutput.match(/^happy version:\s*(\S+)/m);
+        const cliVersion = cliVersionMatch ? cliVersionMatch[1] : cliVersionOutput;
 
         if (cliVersion !== packageJson.version) {
             throw new Error(`CLI version mismatch: expected ${packageJson.version}, got ${cliVersion}`);
