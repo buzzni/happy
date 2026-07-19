@@ -30,12 +30,9 @@ export interface HappyServerHandlers {
     client: ApiSessionClient;
 }
 
-// The very first title a session gets — whether from the fallback-title
-// mechanism in apiSession.ts or from an earlier change_title call — is the
-// one users rely on to find the chat again. Letting later change_title calls
-// keep overwriting it (the system prompt nudges the model to call it on
-// almost every turn) makes the title churn instead of staying findable, so
-// once a title exists this becomes a no-op.
+// The first title generated through change_title is the one users rely on to
+// find the chat again. Letting later calls overwrite it makes the title churn,
+// so once a title exists this becomes a no-op.
 export function createChangeTitleHandler(client: ApiSessionClient) {
     return async (title: string): Promise<{ success: boolean; error?: string }> => {
         if (client.hasTitle()) {

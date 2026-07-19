@@ -1764,7 +1764,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
     });
 });
 
-describe('ApiSessionClient fallback title', () => {
+describe('ApiSessionClient generated title', () => {
     let socketHandlers: SocketHandlers;
     let mockSocket: any;
     let session: ReturnType<typeof makeSession>;
@@ -1817,66 +1817,25 @@ describe('ApiSessionClient fallback title', () => {
         vi.restoreAllMocks();
     });
 
-    // The title must land as the message arrives, not when the turn ends. A
-    // first turn routinely runs for minutes, and that is exactly the window in
-    // which the user goes looking for the chat by its title.
-    it('titles the chat as soon as the first user message arrives, without waiting for the turn to end', () => {
+    it('does not save the first user message as a fallback title', () => {
         const client = new ApiSessionClient('fake-token', session);
         const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
 
         sendUserMessage(client, '음... 그러니까 로그인 버튼이 안 눌려');
 
-        // No closeClaudeSessionTurn / ready event — the turn is still running.
-        expect(summariesSentBy(spy)).toEqual(['음... 그러니까 로그인 버튼이 안 눌려']);
-        expect(client.hasTitle()).toBe(true);
-    });
-
-    it('lets a title the model chose win, and never re-titles after it', () => {
-        const client = new ApiSessionClient('fake-token', session);
-        const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
-
-        sendUserMessage(client, '음... 그러니까 로그인 버튼이 안 눌려');
-        // What the happy MCP change_title tool does — an unconditional overwrite.
-        client.sendClaudeSessionMessage({ type: 'summary', summary: 'Login button fix', leafUuid: 'model-uuid' } as any);
-        client.closeClaudeSessionTurn('completed');
-        client.sendSessionEvent({ type: 'ready' });
-
-        // The model's title is last, so it wins, and nothing re-titles after it.
-        expect(summariesSentBy(spy)).toEqual(['음... 그러니까 로그인 버튼이 안 눌려', 'Login button fix']);
-    });
-
-    it('never titles a session that already has one', () => {
-        const titled = makeSession();
-        (titled.metadata as any).summary = { text: 'Existing title', updatedAt: 1 };
-        const client = new ApiSessionClient('fake-token', titled);
-        const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
-
-        sendUserMessage(client, 'a message that must not become the title');
-
+        // A generated title must come only from the agent's change_title tool.
         expect(summariesSentBy(spy)).toEqual([]);
+        expect(client.hasTitle()).toBe(false);
     });
 
-    it('does not title from a slash command, and uses the next real message instead', () => {
+    it('preserves a title written by the model after the user message arrives', () => {
         const client = new ApiSessionClient('fake-token', session);
         const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
 
-        sendUserMessage(client, '/clear');
-        expect(summariesSentBy(spy)).toEqual([]);
+        sendUserMessage(client, '로그인 버튼이 안 눌려');
+        client.sendClaudeSessionMessage({ type: 'summary', summary: '로그인 버튼 클릭 오류 수정', leafUuid: 'model-uuid' } as any);
 
-        sendUserMessage(client, 'now fix the parser');
-        expect(summariesSentBy(spy)).toEqual(['now fix the parser']);
-    });
-
-    it('titles only once, however many messages arrive', () => {
-        const client = new ApiSessionClient('fake-token', session);
-        const spy = vi.spyOn(client, 'sendClaudeSessionMessage');
-
-        sendUserMessage(client, 'first message');
-        sendUserMessage(client, 'second message');
-        client.closeClaudeSessionTurn('completed');
-        client.sendSessionEvent({ type: 'ready' });
-
-        expect(summariesSentBy(spy)).toEqual(['first message']);
+        expect(summariesSentBy(spy)).toEqual(['로그인 버튼 클릭 오류 수정']);
     });
 });
 

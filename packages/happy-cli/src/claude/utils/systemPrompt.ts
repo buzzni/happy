@@ -5,7 +5,7 @@ import { shouldIncludeCoAuthoredBy } from "./claudeSettings";
  * Base system prompt shared across all configurations
  */
 const BASE_SYSTEM_PROMPT = (() => trimIdent(`
-    ALWAYS when you start a new chat - you must call a tool "mcp__happy__change_title" once to set a chat title, unless the chat already has one. This title is needed to easily find the chat in the future. Help human. The title locks in after it is first set (whether by you or automatically from the first message) — later calls to change_title are ignored, so do not keep calling it again.
+    ALWAYS when you start a new chat - you must call a tool "mcp__happy__change_title" once to generate a concise title that represents the user's task, unless the chat already has one. This title is needed to easily find the chat in the future. Help human. The title locks after it is first set, so do not call change_title again.
 `))();
 
 /**
