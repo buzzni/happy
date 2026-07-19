@@ -38,6 +38,7 @@ import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import { filterCredentialsFromEnv } from '@/sandbox/config';
+import { scrubSessionLineageEnv, SESSION_LINEAGE_ENV_PREFIXES } from './sessionEnv';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
@@ -79,6 +80,18 @@ export const initialMachineMetadata: MachineMetadata = {
 };
 
 export async function startDaemon(): Promise<void> {
+  // The daemon can be auto-(re)started by any happy CLI child — including a
+  // resumed/forked session that carries HAPPY_RECONNECT_*/HAPPY_FORK* in its
+  // environment. Those variables are per-spawn instructions, not daemon
+  // state; if they survive here they leak into every child we spawn and all
+  // new sessions reconnect to one poisoned session (2026-07-19 incident).
+  for (const key of Object.keys(process.env)) {
+    if (SESSION_LINEAGE_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) {
+      logger.debug(`[DAEMON RUN] Scrubbing inherited session lineage env: ${key}`);
+      delete process.env[key];
+    }
+  }
+
   // We don't have cleanup function at the time of server construction
   // Control flow is:
   // 1. Create promise that will resolve when shutdown is requested
@@ -571,9 +584,9 @@ export async function startDaemon(): Promise<void> {
           // 3. tmux needs explicit environment via -e flags to ensure all variables are available
           const windowName = `happy-${Date.now()}-${agent}`;
           // Filter credentials from daemon env when sandbox is enabled
-          const daemonEnvFiltered = hasSandbox
-            ? filterCredentialsFromEnv(process.env)
-            : Object.fromEntries(Object.entries(process.env).filter(([, v]) => v !== undefined)) as Record<string, string>;
+          const daemonEnvFiltered = scrubSessionLineageEnv(
+            hasSandbox ? filterCredentialsFromEnv(process.env) : process.env,
+          );
           const tmuxEnv: Record<string, string> = { ...daemonEnvFiltered, ...extraEnv };
 
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
@@ -653,8 +666,11 @@ export async function startDaemon(): Promise<void> {
           return spawnTrackedHappyProcess({
             args,
             cwd: directory,
+            // scrub: 상속된 lineage env(HAPPY_RECONNECT_*/HAPPY_FORK*)가 새
+            // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
+            // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
             env: {
-              ...(hasSandbox ? filterCredentialsFromEnv(process.env) : process.env),
+              ...scrubSessionLineageEnv(hasSandbox ? filterCredentialsFromEnv(process.env) : process.env),
               ...extraEnv
             },
             directoryCreated,
@@ -831,8 +847,10 @@ export async function startDaemon(): Promise<void> {
         return spawnTrackedHappyProcess({
           args: launch.args,
           cwd: launch.cwd,
+          // resume 는 이 spawn 하나에 한해 lineage 를 명시적으로 부여한다 —
+          // 상속분은 scrub 하고 이 세션의 값만 아래에서 다시 넣는다.
           env: {
-            ...process.env,
+            ...scrubSessionLineageEnv(process.env),
             HAPPY_RECONNECT_SESSION_ID: happySessionId,
             HAPPY_RECONNECT_ENCRYPTION_KEY: encodeBase64(tracked.encryption.encryptionKey),
             HAPPY_RECONNECT_ENCRYPTION_VARIANT: tracked.encryption.encryptionVariant,
