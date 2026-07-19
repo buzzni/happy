@@ -1890,6 +1890,150 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('ignores a stale idle status from the previous turn while the next turn is starting', async () => {
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        let turnStartCount = 0;
+        const proc = createMockProcess({
+            pid: 3007,
+            onRequest: (msg, stdout) => {
+                appServerStdout = stdout;
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: {
+                                thread: { id: 'thread-queued', path: '/tmp/thread-queued' },
+                                model: 'gpt-test',
+                                modelProvider: 'openai',
+                                cwd: '/tmp/project',
+                                approvalPolicy: 'never',
+                                sandbox: { type: 'dangerFullAccess' },
+                                reasoningEffort: null,
+                            },
+                        });
+                    }, 0);
+                }
+
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    turnStartCount += 1;
+                    const turnId = turnStartCount === 1 ? 'turn-first' : 'turn-second';
+                    setTimeout(() => {
+                        if (turnId === 'turn-second') {
+                            pushJsonLine(stdout, {
+                                method: 'turn/started',
+                                params: {
+                                    threadId: 'thread-queued',
+                                    turn: { id: 'turn-late-nested' },
+                                },
+                            });
+                            pushJsonLine(stdout, {
+                                method: 'thread/status/changed',
+                                params: { threadId: 'thread-queued', status: { type: 'idle' } },
+                            });
+                        }
+
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: {
+                                turn: { id: turnId, items: [], status: 'inProgress', error: null },
+                            },
+                        });
+
+                        if (turnId === 'turn-first') {
+                            pushJsonLine(stdout, {
+                                method: 'turn/started',
+                                params: {
+                                    threadId: 'thread-queued',
+                                    turn: { id: turnId, items: [], status: 'inProgress', error: null },
+                                },
+                            });
+                            pushJsonLine(stdout, {
+                                method: 'item/completed',
+                                params: {
+                                    threadId: 'thread-queued',
+                                    turnId,
+                                    item: {
+                                        type: 'agentMessage',
+                                        id: 'msg-first',
+                                        text: 'first done',
+                                        phase: 'final_answer',
+                                    },
+                                },
+                            });
+                            return;
+                        }
+
+                        // The previous turn's idle notification can arrive after the
+                        // next turn/start response but before its turn/started event.
+                        setTimeout(() => {
+                            pushJsonLine(stdout, {
+                                method: 'thread/status/changed',
+                                params: { threadId: 'thread-queued', status: { type: 'idle' } },
+                            });
+                        }, 0);
+                    }, 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((msg) => {
+            events.push(msg as Record<string, unknown>);
+        });
+
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'never',
+            sandbox: 'danger-full-access',
+        });
+        await expect(client.sendTurnAndWait('first request')).resolves.toEqual({ aborted: false });
+
+        let secondSettled = false;
+        const second = client.sendTurnAndWait('second request').finally(() => {
+            secondSettled = true;
+        });
+        await waitFor(() => turnStartCount === 2);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        expect(secondSettled).toBe(false);
+        expect(events.filter((event) => event.turn_id === 'turn-second')).toHaveLength(0);
+        if (!appServerStdout) throw new Error('app-server stdout unavailable');
+
+        pushJsonLine(appServerStdout, {
+            method: 'turn/started',
+            params: {
+                threadId: 'thread-queued',
+                turn: { id: 'turn-second', items: [], status: 'inProgress', error: null },
+            },
+        });
+        pushJsonLine(appServerStdout, {
+            method: 'item/completed',
+            params: {
+                threadId: 'thread-queued',
+                turnId: 'turn-second',
+                item: {
+                    type: 'agentMessage',
+                    id: 'msg-second',
+                    text: 'second done',
+                    phase: 'final_answer',
+                },
+            },
+        });
+
+        await expect(second).resolves.toEqual({ aborted: false });
+        expect(events.filter((event) => event.turn_id === 'turn-second')).toEqual([
+            expect.objectContaining({ type: 'task_started' }),
+            expect.objectContaining({ type: 'task_complete' }),
+        ]);
+
+        await client.disconnect();
+    });
+
     it('keeps waiting for the root turn when nested turn lifecycle events interleave', async () => {
         let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
         const proc = createMockProcess({

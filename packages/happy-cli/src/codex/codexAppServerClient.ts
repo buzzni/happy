@@ -222,6 +222,8 @@ export class CodexAppServerClient {
     private pendingTurnCompletion: {
         resolve: (aborted: boolean) => void;
         turnId: string | null;
+        startedTurnId: string | null;
+        turnIdConfirmed: boolean;
         inactivityTimeoutMs: number;
         inactivityTimer: ReturnType<typeof setTimeout> | null;
     } | null = null;
@@ -394,8 +396,15 @@ export class CodexAppServerClient {
 
         if (method === 'thread/status/changed') {
             const statusType = params?.status?.type;
-            if (statusType === 'idle' && this.pendingTurnCompletion) {
-                this.emitRawTurnCompletion(this._turnId, 'completed', null, method);
+            // A previous turn's idle status can arrive after the next turn/start
+            // request. Only use this ID-less fallback after the response confirms
+            // the turn ID and that same turn announces its start.
+            const pending = this.pendingTurnCompletion;
+            if (statusType === 'idle'
+                && pending?.turnId
+                && pending.turnIdConfirmed
+                && pending.startedTurnId === pending.turnId) {
+                this.emitRawTurnCompletion(pending.turnId, 'completed', null, method);
             }
             return true;
         }
@@ -999,8 +1008,11 @@ export class CodexAppServerClient {
 
     private markPendingTurnStarted(turnId?: string | null): boolean {
         if (!this.matchesPendingTurn(turnId)) return false;
-        if (turnId && this.pendingTurnCompletion && !this.pendingTurnCompletion.turnId) {
-            this.pendingTurnCompletion.turnId = turnId;
+        if (this.pendingTurnCompletion && turnId) {
+            this.pendingTurnCompletion.startedTurnId = turnId;
+            if (!this.pendingTurnCompletion.turnId) {
+                this.pendingTurnCompletion.turnId = turnId;
+            }
         }
         return true;
     }
@@ -1152,7 +1164,11 @@ export class CodexAppServerClient {
         if (typeof turnId === 'string' && turnId.length > 0) {
             this._turnId = turnId;
             if (this.pendingTurnCompletion) {
+                if (this.pendingTurnCompletion.startedTurnId !== turnId) {
+                    this.pendingTurnCompletion.startedTurnId = null;
+                }
                 this.pendingTurnCompletion.turnId = turnId;
+                this.pendingTurnCompletion.turnIdConfirmed = true;
             }
         }
     }
@@ -1199,6 +1215,8 @@ export class CodexAppServerClient {
             this.pendingTurnCompletion = {
                 resolve,
                 turnId: null,
+                startedTurnId: null,
+                turnIdConfirmed: false,
                 inactivityTimeoutMs: timeoutMs,
                 inactivityTimer: null,
             };
