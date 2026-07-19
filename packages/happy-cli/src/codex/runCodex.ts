@@ -2,6 +2,7 @@ import { render } from "ink";
 import React from "react";
 import { ApiClient } from '@/api/api';
 import { CodexAppServerClient } from './codexAppServerClient';
+import { describeCodexFailure, describeCodexInactivityAbort } from './codexAbortNotice';
 import type { ReasoningEffort } from './codexAppServerTypes';
 import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
@@ -57,21 +58,6 @@ import {
     parseCodexGoalCommand,
     type CodexGoalCommand,
 } from './codexGoalStatus';
-
-/**
- * Extracts a human-readable error from a codex task_complete/turn_aborted event.
- * Returns null if the event represents a successful/clean completion.
- */
-function describeCodexFailure(msg: any): string | null {
-    const hasFailure = msg?.status === 'failed' || (msg?.error !== undefined && msg?.error !== null);
-    if (!hasFailure) return null;
-    const err = msg.error;
-    if (typeof err === 'string' && err.length > 0) return err;
-    if (err && typeof err === 'object' && typeof err.message === 'string' && err.message.length > 0) {
-        return err.message;
-    }
-    return 'Unknown error';
-}
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
@@ -728,16 +714,31 @@ export async function runCodex(opts: {
         } else if (msg.type === 'task_complete') {
             // Ready is emitted from the main loop's idle check so pushes only fire once
             // after the queue is actually drained.
+            // Codex may settle a watchdog interrupt with status 'completed', so the
+            // inactivity notice applies here too, not just to turn_aborted.
+            const inactivityNotice = describeCodexInactivityAbort(msg);
             const failure = describeCodexFailure(msg);
-            if (failure) {
+            if (inactivityNotice) {
+                const message = failure ? `${inactivityNotice} Provider error: ${failure}` : inactivityNotice;
+                messageBuffer.addMessage(message, 'status');
+                session.sendSessionEvent({ type: 'message', message });
+            } else if (failure) {
                 messageBuffer.addMessage(`Task failed: ${failure}`, 'status');
                 session.sendSessionEvent({ type: 'message', message: `Codex error: ${failure}` });
             } else {
                 messageBuffer.addMessage('Task completed', 'status');
             }
         } else if (msg.type === 'turn_aborted') {
+            const inactivityNotice = describeCodexInactivityAbort(msg);
             const failure = describeCodexFailure(msg);
-            if (failure) {
+            if (inactivityNotice) {
+                // Our own watchdog force-stopped a hung turn: without this the turn
+                // ends silently and the user never learns why nothing came back.
+                // Keep the provider error visible when the event carries both.
+                const message = failure ? `${inactivityNotice} Provider error: ${failure}` : inactivityNotice;
+                messageBuffer.addMessage(message, 'status');
+                session.sendSessionEvent({ type: 'message', message });
+            } else if (failure) {
                 messageBuffer.addMessage(`Turn aborted: ${failure}`, 'status');
                 session.sendSessionEvent({ type: 'message', message: `Codex error: ${failure}` });
             } else {

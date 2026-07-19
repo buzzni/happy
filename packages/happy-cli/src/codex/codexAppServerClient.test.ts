@@ -565,6 +565,375 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('tags a watchdog-forced abort with the inactivity reason and the not-ready MCP servers', async () => {
+        const requests: MockRpcMessage[] = [];
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        const proc = createMockProcess({
+            pid: 2014,
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                appServerStdout = stdout;
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-hung', path: '/tmp/thread-hung' },
+                            model: 'gpt-test',
+                            modelProvider: 'openai',
+                            cwd: '/tmp/project',
+                            approvalPolicy: 'never',
+                            sandbox: { type: 'dangerFullAccess' },
+                            reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { turn: { id: 'turn-hung', items: [], status: 'inProgress', error: null } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: {
+                                threadId: 'thread-hung',
+                                turn: { id: 'turn-hung', items: [], status: 'inProgress', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'turn/interrupt' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: {} });
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: {
+                                threadId: 'thread-hung',
+                                turn: { id: 'turn-hung', items: [], status: 'cancelled', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((msg) => events.push(msg as Record<string, unknown>));
+
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'never',
+            sandbox: 'danger-full-access',
+        });
+
+        // One server never finished starting; another is fine. Only the hung one
+        // should be surfaced to the user.
+        if (!appServerStdout) throw new Error('app-server stdout unavailable');
+        pushJsonLine(appServerStdout, {
+            method: 'mcpServer/startupStatus/updated',
+            params: { threadId: 'thread-hung', name: 'aplus-common', status: 'ready' },
+        });
+        pushJsonLine(appServerStdout, {
+            method: 'mcpServer/startupStatus/updated',
+            params: { threadId: 'thread-hung', name: 'dataAnalyticsWidgets', status: 'starting' },
+        });
+
+        vi.useFakeTimers();
+        try {
+            const pending = client.sendTurnAndWait('hang', { turnTimeoutMs: 20 });
+            await vi.advanceTimersByTimeAsync(0);
+            // Provider goes fully silent — the watchdog must fire.
+            await vi.advanceTimersByTimeAsync(25);
+
+            expect(requests.some((request) => request.method === 'turn/interrupt')).toBe(true);
+            await expect(pending).resolves.toEqual({ aborted: true });
+            const abortEvents = events.filter((event) => event.type === 'turn_aborted');
+            expect(abortEvents).toHaveLength(1);
+            expect(abortEvents[0]).toMatchObject({
+                turn_id: 'turn-hung',
+                reason: 'inactivity_timeout',
+                not_ready_mcp_servers: ['dataAnalyticsWidgets'],
+            });
+        } finally {
+            await vi.runOnlyPendingTimersAsync();
+            vi.useRealTimers();
+        }
+
+        await client.disconnect();
+    });
+
+    it('tags the completion with the inactivity reason even when codex settles the interrupted turn as completed', async () => {
+        // Replays the real incident: codex answered the watchdog's turn/interrupt
+        // with turn/completed status 'completed' (not 'cancelled'), so the abort
+        // surfaced as task_complete and the user saw nothing.
+        const requests: MockRpcMessage[] = [];
+        const proc = createMockProcess({
+            pid: 2015,
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-done', path: '/tmp/thread-done' },
+                            model: 'gpt-test',
+                            modelProvider: 'openai',
+                            cwd: '/tmp/project',
+                            approvalPolicy: 'never',
+                            sandbox: { type: 'dangerFullAccess' },
+                            reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { turn: { id: 'turn-done', items: [], status: 'inProgress', error: null } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: {
+                                threadId: 'thread-done',
+                                turn: { id: 'turn-done', items: [], status: 'inProgress', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'turn/interrupt' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: {} });
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: {
+                                threadId: 'thread-done',
+                                turn: { id: 'turn-done', items: [], status: 'completed', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((msg) => events.push(msg as Record<string, unknown>));
+
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'never',
+            sandbox: 'danger-full-access',
+        });
+
+        vi.useFakeTimers();
+        try {
+            const pending = client.sendTurnAndWait('hang', { turnTimeoutMs: 20 });
+            await vi.advanceTimersByTimeAsync(0);
+            await vi.advanceTimersByTimeAsync(25);
+
+            expect(requests.some((request) => request.method === 'turn/interrupt')).toBe(true);
+            await expect(pending).resolves.toEqual({ aborted: false });
+            const terminalEvents = events.filter((event) =>
+                event.type === 'task_complete' || event.type === 'turn_aborted');
+            expect(terminalEvents).toHaveLength(1);
+            expect(terminalEvents[0]).toMatchObject({
+                type: 'task_complete',
+                turn_id: 'turn-done',
+                reason: 'inactivity_timeout',
+            });
+        } finally {
+            await vi.runOnlyPendingTimersAsync();
+            vi.useRealTimers();
+        }
+
+        await client.disconnect();
+    });
+
+    it('does not tag a user-initiated abort as inactivity even when the watchdog deadline passes mid-abort', async () => {
+        const requests: MockRpcMessage[] = [];
+        const proc = createMockProcess({
+            pid: 2016,
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-cancel', path: '/tmp/thread-cancel' },
+                            model: 'gpt-test',
+                            modelProvider: 'openai',
+                            cwd: '/tmp/project',
+                            approvalPolicy: 'never',
+                            sandbox: { type: 'dangerFullAccess' },
+                            reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { turn: { id: 'turn-cancel', items: [], status: 'inProgress', error: null } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: {
+                                threadId: 'thread-cancel',
+                                turn: { id: 'turn-cancel', items: [], status: 'inProgress', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'turn/interrupt' && msg.id != null) {
+                    // The provider takes 30ms to honor the user's interrupt — long
+                    // enough for the 20ms inactivity deadline to pass mid-abort.
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: {} });
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: {
+                                threadId: 'thread-cancel',
+                                turn: { id: 'turn-cancel', items: [], status: 'cancelled', error: null },
+                            },
+                        });
+                    }, 30);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((msg) => events.push(msg as Record<string, unknown>));
+
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'never',
+            sandbox: 'danger-full-access',
+        });
+
+        vi.useFakeTimers();
+        try {
+            const pending = client.sendTurnAndWait('hang', { turnTimeoutMs: 20 });
+            await vi.advanceTimersByTimeAsync(0);
+            await vi.advanceTimersByTimeAsync(10);
+            // User cancels before the watchdog deadline.
+            const abortPromise = client.abortTurnWithFallback({ gracePeriodMs: 100 });
+            await vi.advanceTimersByTimeAsync(40);
+
+            await expect(abortPromise).resolves.toMatchObject({ aborted: true });
+            await expect(pending).resolves.toEqual({ aborted: true });
+            const abortEvents = events.filter((event) => event.type === 'turn_aborted');
+            expect(abortEvents).toHaveLength(1);
+            expect(abortEvents[0]).not.toHaveProperty('reason', 'inactivity_timeout');
+        } finally {
+            await vi.runOnlyPendingTimersAsync();
+            vi.useRealTimers();
+        }
+
+        await client.disconnect();
+    });
+
+    it('tags a watchdog abort delivered via the legacy codex/event protocol', async () => {
+        const requests: MockRpcMessage[] = [];
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        const proc = createMockProcess({
+            pid: 2017,
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                appServerStdout = stdout;
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-legacy', path: '/tmp/thread-legacy' },
+                            model: 'gpt-test',
+                            modelProvider: 'openai',
+                            cwd: '/tmp/project',
+                            approvalPolicy: 'never',
+                            sandbox: { type: 'dangerFullAccess' },
+                            reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { turn: { id: 'turn-legacy', items: [], status: 'inProgress', error: null } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'codex/event',
+                            params: { msg: { type: 'task_started', turn_id: 'turn-legacy' } },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'turn/interrupt' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: {} });
+                        pushJsonLine(stdout, {
+                            method: 'codex/event',
+                            params: { msg: { type: 'turn_aborted', turn_id: 'turn-legacy' } },
+                        });
+                    }, 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((msg) => events.push(msg as Record<string, unknown>));
+
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'never',
+            sandbox: 'danger-full-access',
+        });
+
+        if (!appServerStdout) throw new Error('app-server stdout unavailable');
+        pushJsonLine(appServerStdout, {
+            method: 'mcpServer/startupStatus/updated',
+            params: { threadId: 'thread-legacy', name: 'dataAnalyticsWidgets', status: 'starting' },
+        });
+
+        vi.useFakeTimers();
+        try {
+            const pending = client.sendTurnAndWait('hang', { turnTimeoutMs: 20 });
+            await vi.advanceTimersByTimeAsync(0);
+            await vi.advanceTimersByTimeAsync(25);
+
+            expect(requests.some((request) => request.method === 'turn/interrupt')).toBe(true);
+            await expect(pending).resolves.toEqual({ aborted: true });
+            const abortEvents = events.filter((event) => event.type === 'turn_aborted');
+            expect(abortEvents).toHaveLength(1);
+            expect(abortEvents[0]).toMatchObject({
+                reason: 'inactivity_timeout',
+                not_ready_mcp_servers: ['dataAnalyticsWidgets'],
+            });
+        } finally {
+            await vi.runOnlyPendingTimersAsync();
+            vi.useRealTimers();
+        }
+
+        await client.disconnect();
+    });
+
     it('keeps an active turn alive while an approval request awaits the user', async () => {
         const requests: MockRpcMessage[] = [];
         let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
