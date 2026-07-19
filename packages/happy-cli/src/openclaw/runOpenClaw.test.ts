@@ -29,6 +29,9 @@ const mocks = vi.hoisted(() => {
     disposeCalls: 0,
     /** Prompts whose sendPrompt should reject, simulating a dropped gateway. */
     failPromptsMatching: null as string | null,
+    /** When set, sendPrompt hangs until cancel, simulating an unresponsive gateway. */
+    hangPromptUntilCancel: false,
+    resolveHangingPrompt: null as (() => void) | null,
   };
 
   return {
@@ -112,11 +115,24 @@ vi.mock('./OpenClawBackend', () => ({
       if (failMatch !== null && prompt.includes(failMatch)) {
         throw new Error('Not connected to OpenClaw gateway');
       }
+      if (mocks.backendState.hangPromptUntilCancel) {
+        await new Promise<void>((resolve) => {
+          mocks.backendState.resolveHangingPrompt = resolve;
+        });
+      }
     }
 
     async cancel(sessionId: string) {
       mocks.backendState.cancelCalls.push(sessionId);
       await Promise.resolve();
+      if (mocks.backendState.resolveHangingPrompt) {
+        // A real cancel crosses the network, so the hung prompt settles on a
+        // later macrotask — after Node has already checked for unhandled
+        // rejections — not in the same microtask drain as the watchdog firing.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        mocks.backendState.resolveHangingPrompt();
+        mocks.backendState.resolveHangingPrompt = null;
+      }
       for (const listener of mocks.backendState.listeners) {
         listener({ type: 'status', status: 'stopped' });
       }
@@ -153,6 +169,8 @@ describe('runOpenClaw turn inactivity watchdog', () => {
     mocks.backendState.cancelCalls = [];
     mocks.backendState.disposeCalls = 0;
     mocks.backendState.failPromptsMatching = null;
+    mocks.backendState.hangPromptUntilCancel = false;
+    mocks.backendState.resolveHangingPrompt = null;
 
     mocks.mockApiCreate.mockResolvedValue({
       getOrCreateMachine: mocks.mockGetOrCreateMachine,
@@ -209,6 +227,37 @@ describe('runOpenClaw turn inactivity watchdog', () => {
 
     await mocks.getKillHandler()!();
     await settled;
+  });
+
+  // When the gateway goes unresponsive, sendPrompt itself hangs and the runner
+  // never reaches `await turnEnded` — so the watchdog's rejection lands on a
+  // promise with no handler attached. That used to surface as an unhandled
+  // rejection, which crashes the process instead of failing the turn.
+  it('fails the turn without an unhandled rejection when sendPrompt outlives the watchdog', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      mocks.backendState.hangPromptUntilCancel = true;
+      const runPromise = startRunner(200);
+      const settled = runPromise.then(() => null).catch((error: Error) => error);
+
+      await vi.waitFor(() => {
+        expect(mocks.getUserMessageHandler()).toBeTypeOf('function');
+      });
+      await sendPrompt('gateway went dark');
+
+      await vi.waitFor(() => {
+        expect(mocks.backendState.cancelCalls).toContain('openclaw-session-1');
+      });
+      await settled;
+
+      // Let Node deliver any pending unhandledRejection events.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandled).toHaveLength(0);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
   });
 
   // Regression: sendPrompt can reject before the turn promise is ever awaited.

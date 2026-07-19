@@ -230,8 +230,8 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
   // the window, so a long turn that keeps reporting is never cut off. Cancel the
   // backend before giving up — rejecting alone would leave the agent running
   // while the runner reports the turn as failed.
-  const waitForTurnEnd = () =>
-    new Promise<void>((resolve, reject) => {
+  const waitForTurnEnd = () => {
+    const turnEnded = new Promise<void>((resolve, reject) => {
       // A previous turn that was abandoned without clearing would otherwise leave
       // an armed watchdog behind that outlives the turn it belongs to.
       pendingTurn?.watchdog.stop();
@@ -249,6 +249,14 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
       });
       pendingTurn = { resolve, reject, watchdog };
     });
+    // When the gateway goes unresponsive, sendPrompt itself hangs and the loop
+    // never reaches `await turnEnded` — so a rejection (watchdog, backend stop,
+    // kill) lands on a promise with no handler attached. Mark it handled so it
+    // fails the turn instead of crashing the process; `await turnEnded` still
+    // observes it.
+    turnEnded.catch(() => { });
+    return turnEnded;
+  };
 
   const sendEnvelopes = (envelopes: SessionEnvelope[]) => {
     for (const envelope of envelopes) {

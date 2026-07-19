@@ -610,22 +610,31 @@ export async function runAcp(opts: {
   // window and approval waits disarm it, so only a silent backend trips this.
   // Cancel the backend before giving up — rejecting alone would leave the agent
   // running while the runner reports the turn as failed.
-  const waitForTurnEnd = () => new Promise<void>((resolve, reject) => {
-    const watchdog = startTurnInactivityWatchdog({
-      timeoutMs: turnInactivityTimeoutMs,
-      onInactive: () => {
-        logger.debug(`[${opts.agentName}] No backend activity for ${turnInactivityTimeoutMs}ms; cancelling turn`);
-        const sessionToCancel = acpSessionId;
-        if (sessionToCancel) {
-          void backend.cancel(sessionToCancel).catch((error) => {
-            logger.debug(`[${opts.agentName}] Failed to cancel inactive turn:`, error);
-          });
-        }
-        clearPendingTurn(new Error(`${opts.agentName} produced no activity for ${turnInactivityTimeoutMs}ms`));
-      },
+  const waitForTurnEnd = () => {
+    const turnEnded = new Promise<void>((resolve, reject) => {
+      const watchdog = startTurnInactivityWatchdog({
+        timeoutMs: turnInactivityTimeoutMs,
+        onInactive: () => {
+          logger.debug(`[${opts.agentName}] No backend activity for ${turnInactivityTimeoutMs}ms; cancelling turn`);
+          const sessionToCancel = acpSessionId;
+          if (sessionToCancel) {
+            void backend.cancel(sessionToCancel).catch((error) => {
+              logger.debug(`[${opts.agentName}] Failed to cancel inactive turn:`, error);
+            });
+          }
+          clearPendingTurn(new Error(`${opts.agentName} produced no activity for ${turnInactivityTimeoutMs}ms`));
+        },
+      });
+      pendingTurn = { resolve, reject, watchdog };
     });
-    pendingTurn = { resolve, reject, watchdog };
-  });
+    // The prompt RPC spans the whole turn in ACP, so a rejection (watchdog,
+    // backend stop, kill) can land while the loop is still suspended inside
+    // sendPrompt with no handler attached yet. Mark the rejection handled so it
+    // fails the turn instead of crashing the process; `await turnEnded` still
+    // observes it.
+    turnEnded.catch(() => { });
+    return turnEnded;
+  };
 
   const stopRunnerFromBackendStatus = (status: 'error' | 'stopped', detail?: string) => {
     const reason = detail
