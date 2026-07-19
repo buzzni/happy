@@ -1,4 +1,19 @@
 /**
+ * Extracts a human-readable error from a codex task_complete/turn_aborted event.
+ * Returns null if the event represents a successful/clean completion.
+ */
+export function describeCodexFailure(msg: any): string | null {
+    const hasFailure = msg?.status === 'failed' || (msg?.error !== undefined && msg?.error !== null);
+    if (!hasFailure) return null;
+    const err = msg.error;
+    if (typeof err === 'string' && err.length > 0) return err;
+    if (err && typeof err === 'object' && typeof err.message === 'string' && err.message.length > 0) {
+        return err.message;
+    }
+    return 'Unknown error';
+}
+
+/**
  * Builds a user-facing notice when Codex's inactivity watchdog force-stops a turn.
  *
  * A watchdog-initiated abort looks "clean" to the rest of the pipeline (no error,
