@@ -34,6 +34,9 @@ describe('buildCodexTurnPrompt', () => {
         });
 
         expect(prompt).toBe(`hello\n\n${CHANGE_TITLE_INSTRUCTION}`);
+        expect(CHANGE_TITLE_INSTRUCTION).toContain('generate a concise chat session title');
+        expect(CHANGE_TITLE_INSTRUCTION).toContain('once');
+        expect(CHANGE_TITLE_INSTRUCTION).toContain('do not call this function again');
     });
 
     it('does not inject Happy preamble on normal follow-up turns', () => {

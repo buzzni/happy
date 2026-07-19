@@ -9,7 +9,6 @@ import { RawJSONLines } from '@/claude/types';
 import { randomUUID } from 'node:crypto';
 import { AsyncLock } from '@/utils/lock';
 import { deriveKey } from '@/utils/deriveKey';
-import { buildFallbackTitle } from '@/utils/fallbackTitle';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { registerCommonHandlers } from '../modules/common/registerCommonHandlers';
 import { calculateCost } from '@/utils/pricing';
@@ -677,29 +676,6 @@ export class ApiSessionClient extends EventEmitter {
                 this.pendingMessageCallback(userResult.data);
             } else {
                 this.pendingMessages.push(userResult.data);
-            }
-            // Title the chat from the first message we can, as it lands, so it
-            // is findable straight away rather than only once the model gets
-            // around to `change_title` — an instruction it often skips (and
-            // never gets to at all while a long first turn is still running).
-            //
-            // Titling after delivery, not before: this is the path the user's
-            // message travels to the agent, and failing to title must never
-            // cost the message. hasTitle() closes this guard once a title
-            // exists, and `change_title` overwrites unconditionally, so a title
-            // the model chooses later still wins. A message that makes no sense
-            // as a title (slash command, empty) yields null and leaves the
-            // guard open for the next one.
-            if (!this.hasTitle()) {
-                const title = buildFallbackTitle(userResult.data.content.text);
-                if (title) {
-                    logger.debug(`[API] Titling chat from its first message: ${title}`);
-                    this.sendClaudeSessionMessage({
-                        type: 'summary',
-                        summary: title,
-                        leafUuid: randomUUID()
-                    });
-                }
             }
             return;
         }
