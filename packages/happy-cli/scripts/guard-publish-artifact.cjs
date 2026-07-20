@@ -166,6 +166,13 @@ function collectTarErrors(entries) {
 function runInstallSmoke(tarball, packageJson) {
     const prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'happy-cli-install-'));
     const happyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'happy-cli-smoke-home-'));
+    const isolatedEnv = {
+        ...process.env,
+        HOME: happyHome,
+        USERPROFILE: happyHome,
+        HAPPY_HOME_DIR: happyHome,
+        HAPPY_SERVER_URL: 'http://127.0.0.1:1'
+    };
 
     try {
         run('npm', [
@@ -214,12 +221,14 @@ function runInstallSmoke(tarball, packageJson) {
         const cliVersionOutput = run(process.execPath, [
             path.join(installedRoot, 'bin', 'happy.mjs'),
             '--version'
-        ]).stdout.trim();
-        const cliVersionMatch = cliVersionOutput.match(/^happy version:\s*(\S+)/m);
-        const cliVersion = cliVersionMatch ? cliVersionMatch[1] : cliVersionOutput;
+        ], {
+            env: isolatedEnv,
+            timeout: 30000
+        }).stdout.trim();
+        const expectedVersionOutput = `happy version: ${packageJson.version}`;
 
-        if (cliVersion !== packageJson.version) {
-            throw new Error(`CLI version mismatch: expected ${packageJson.version}, got ${cliVersion}`);
+        if (cliVersionOutput !== expectedVersionOutput) {
+            throw new Error(`CLI version output mismatch: expected ${JSON.stringify(expectedVersionOutput)}, got ${JSON.stringify(cliVersionOutput)}`);
         }
 
         run(process.execPath, [
@@ -227,10 +236,7 @@ function runInstallSmoke(tarball, packageJson) {
             'daemon',
             'status'
         ], {
-            env: {
-                ...process.env,
-                HAPPY_HOME_DIR: happyHome
-            },
+            env: isolatedEnv,
             timeout: 30000
         });
     } finally {
