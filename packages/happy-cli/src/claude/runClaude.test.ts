@@ -248,6 +248,7 @@ describe('runClaude remote JSONL scanner', () => {
         delete process.env.HAPPY_RECONNECT_SEQ;
         delete process.env.HAPPY_RECONNECT_METADATA_VERSION;
         delete process.env.HAPPY_RECONNECT_AGENT_STATE_VERSION;
+        delete process.env.HAPPY_RECONNECT_SNAPSHOT;
         delete process.env.HAPPY_FORKED_FROM_SESSION_ID;
         delete process.env.HAPPY_FORKED_FROM_MESSAGE_ID;
         delete process.env.HAPPY_FORK_CLAUDE_SESSION_ID;
@@ -289,11 +290,34 @@ describe('runClaude remote JSONL scanner', () => {
         process.env.HAPPY_RECONNECT_SEQ = '42';
         process.env.HAPPY_RECONNECT_METADATA_VERSION = '3';
         process.env.HAPPY_RECONNECT_AGENT_STATE_VERSION = '4';
+        const reconnectMetadata = {
+            path: '/tmp/project',
+            host: 'test-host',
+            homeDir: '/tmp',
+            happyHomeDir: '/tmp/.happy',
+            happyLibDir: '/tmp/happy',
+            happyToolsDir: '/tmp/happy/tools',
+            flavor: 'claude',
+            claudeSessionId: 'claude-session-1',
+            summary: { text: 'preserved title', updatedAt: 1 },
+            futureProviderState: { preserved: true },
+        };
+        process.env.HAPPY_RECONNECT_SNAPSHOT = Buffer.from(JSON.stringify({
+            metadata: reconnectMetadata,
+            seq: 42,
+            metadataVersion: 3,
+            agentStateVersion: 4,
+        })).toString('base64');
 
         const harness = await startRemoteRunClaudeHarness();
 
         expect(harness.sessionClient.suppressNextArchiveSignal).toHaveBeenCalledTimes(1);
         expect(harness.sessionClient.skipExistingMessages).toHaveBeenCalledWith(42);
+        expect(harness.api.sessionSyncClient).toHaveBeenCalledWith(expect.objectContaining({
+            metadata: reconnectMetadata,
+            seq: 42,
+            metadataVersion: 3,
+        }));
 
         await harness.finish();
     });
