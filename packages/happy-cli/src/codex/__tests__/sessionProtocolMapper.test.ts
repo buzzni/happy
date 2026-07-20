@@ -81,6 +81,40 @@ describe('mapCodexMcpMessageToSessionEnvelopes', () => {
         expect(result.currentTurnId).toBeNull();
     });
 
+    // runCodex.ts's crash-catch handler synthesizes this exact call (type
+    // 'turn_aborted', status 'failed', no turn_id) when sendTurnAndWait rejects
+    // with a real error (process crash / connection failure) — i.e. no
+    // task_complete/turn_aborted was ever received from codex for the open
+    // turn. Without this close, the durable transcript is left with an
+    // unclosed turn forever, and the dangling currentTurnId would make the
+    // mapper treat the next task_started as a nested continuation (silently
+    // dropping the next turn's turn-start too, per 'keeps the active session
+    // turn when another task_started event arrives' above).
+    it('closes an open turn for a synthetic crash abort (status failed, no turn_id)', () => {
+        const result = mapCodexMcpMessageToSessionEnvelopes(
+            { type: 'turn_aborted', status: 'failed' },
+            { currentTurnId: 'turn-1', currentProviderTurnId: 'provider-1' }
+        );
+
+        expect(result.envelopes).toHaveLength(1);
+        expect(result.envelopes[0].ev).toEqual({
+            t: 'turn-end',
+            status: 'failed',
+        });
+        expect(result.currentTurnId).toBeNull();
+        expect(result.currentProviderTurnId).toBeNull();
+    });
+
+    it('is a harmless no-op for a synthetic crash abort when no turn is open', () => {
+        const result = mapCodexMcpMessageToSessionEnvelopes(
+            { type: 'turn_aborted', status: 'failed' },
+            { currentTurnId: null, currentProviderTurnId: null }
+        );
+
+        expect(result.envelopes).toHaveLength(0);
+        expect(result.currentTurnId).toBeNull();
+    });
+
     it('maps agent text messages with turn context', () => {
         const result = mapCodexMcpMessageToSessionEnvelopes(
             { type: 'agent_message', message: 'hello' },

@@ -1014,9 +1014,37 @@ export async function runCodex(opts: {
                 }
             } catch (error) {
                 // Only actual errors reach here (process crash, connection failure, etc.)
+                // No task_complete/turn_aborted was ever received for this turn, so the
+                // session-protocol mapper's turn state is left open. Without an explicit
+                // close here, the durable transcript keeps an unclosed turn forever (the
+                // 'thinking' ephemeral below still gets set false, but that is live-only
+                // and does not repair what a reload/observer reads from history), and the
+                // dangling currentTurnId would make the mapper treat the NEXT task_started
+                // as a nested continuation (task_started no-ops while currentTurnId is set),
+                // silently dropping turn-start too. Synthesize the same close the mapper
+                // would have produced from a real turn_aborted, reusing its guard logic
+                // (harmless no-op if currentTurnId is already null).
                 logger.warn('Error in codex session:', error);
                 messageBuffer.addMessage('Process exited unexpectedly', 'status');
                 session.sendSessionEvent({ type: 'message', message: 'Process exited unexpectedly' });
+                const closed = mapCodexMcpMessageToSessionEnvelopes(
+                    { type: 'turn_aborted', status: 'failed' },
+                    {
+                        currentTurnId,
+                        currentProviderTurnId,
+                        startedSubagents: codexStartedSubagents,
+                        activeSubagents: codexActiveSubagents,
+                        providerSubagentToSessionSubagent: codexProviderSubagentToSessionSubagent,
+                    },
+                );
+                currentTurnId = closed.currentTurnId;
+                currentProviderTurnId = closed.currentProviderTurnId;
+                codexStartedSubagents = closed.startedSubagents;
+                codexActiveSubagents = closed.activeSubagents;
+                codexProviderSubagentToSessionSubagent = closed.providerSubagentToSessionSubagent;
+                for (const envelope of closed.envelopes) {
+                    session.sendSessionProtocolMessage(envelope);
+                }
             } finally {
                 // Reset permission handler, reasoning processor, and diff processor
                 permissionHandler.reset();
