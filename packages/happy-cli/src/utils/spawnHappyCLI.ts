@@ -172,3 +172,35 @@ export function spawnHappyCLI(args: string[], options: SpawnOptions = {}): Child
     ...(env ? { env } : {}),
   });
 }
+
+export async function preflightInstalledHappyCLI({
+  spawn = spawnHappyCLI,
+  timeoutMs = 30_000,
+}: {
+  spawn?: typeof spawnHappyCLI
+  timeoutMs?: number
+} = {}): Promise<boolean> {
+  let child: ChildProcess
+  try {
+    child = spawn(['daemon', 'preflight'], { stdio: 'ignore' })
+  } catch {
+    return false
+  }
+
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (ready: boolean) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(ready)
+    }
+    const timer = setTimeout(() => {
+      child.kill()
+      finish(false)
+    }, timeoutMs)
+
+    child.once('error', () => finish(false))
+    child.once('exit', (code) => finish(code === 0))
+  })
+}

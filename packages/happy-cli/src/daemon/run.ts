@@ -13,7 +13,7 @@ import { configuration } from '@/configuration';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
-import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
+import { preflightInstalledHappyCLI, spawnHappyCLI } from '@/utils/spawnHappyCLI';
 import {
   writeDaemonState,
   writeDaemonStateDebounced,
@@ -29,7 +29,8 @@ import {
 } from '@/persistence';
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
-import { startDaemonControlServer } from './controlServer';
+import { preflightDaemonControlServer, startDaemonControlServer } from './controlServer';
+import { handoffToReplacedBundle, prepareDaemonStartup } from './handoff';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
 import { statSync } from 'fs';
@@ -159,17 +160,19 @@ export async function startDaemon(): Promise<void> {
   logger.debug('[DAEMON RUN] Starting daemon process...');
   logger.debugLargeJson('[DAEMON RUN] Environment', getEnvironmentInfo());
 
-  // Check if already running
-  // Check if running daemon version matches current CLI version
-  const runningDaemonVersionMatches = await isDaemonRunningCurrentlyInstalledHappyVersion();
-  if (!runningDaemonVersionMatches) {
-    // TODO: This hand-rolled self-restart path is awkward to reason about and awkward to test.
-    // We should probably migrate this daemon to native system service management
-    // (launchd/systemd, similar to OpenClaw's model), so startup/start-at-login and upgrades
-    // are owned by the OS instead of by the daemon trying to replace itself in-process.
-    logger.debug('[DAEMON RUN] Daemon version mismatch detected, restarting daemon with current CLI version');
-    await stopDaemon();
-  } else {
+  const startupDisposition = await prepareDaemonStartup({
+    preflightCandidate: preflightDaemonControlServer,
+    runningVersionMatches: isDaemonRunningCurrentlyInstalledHappyVersion,
+    stopRunningDaemon: async () => {
+      // TODO: This hand-rolled self-restart path is awkward to reason about and awkward to test.
+      // We should probably migrate this daemon to native system service management
+      // (launchd/systemd, similar to OpenClaw's model), so startup/start-at-login and upgrades
+      // are owned by the OS instead of by the daemon trying to replace itself in-process.
+      logger.debug('[DAEMON RUN] Daemon version mismatch detected, restarting daemon with current CLI version');
+      await stopDaemon();
+    },
+  });
+  if (startupDisposition === 'already-running') {
     logger.debug('[DAEMON RUN] Daemon version matches, keeping existing daemon');
     console.log('Daemon already running with matching version');
     process.exit(0);
@@ -1155,30 +1158,36 @@ export async function startDaemon(): Promise<void> {
         // TODO: We probably do not want to keep this in-process self-restart logic long-term.
         // A native service manager would make startup and upgrades much simpler: the CLI would
         // ask the OS to start the latest daemon instead of hand-rolling respawn/kill behavior here.
-        logger.debug('[DAEMON RUN] Daemon bundle replaced on disk, handing off to new daemon');
+        logger.debug('[DAEMON RUN] Daemon bundle replaced on disk, preflighting new daemon before handoff');
 
-        clearInterval(restartOnStaleVersionAndHeartbeat);
+        const handoffResult = await handoffToReplacedBundle({
+          preflightReplacement: () => preflightInstalledHappyCLI(),
+          teardownCurrentDaemon: async () => {
+            clearInterval(restartOnStaleVersionAndHeartbeat);
 
-        // Release ownership BEFORE spawning the new daemon. Otherwise the spawned
-        // `happy daemon start` reads our still-present daemon.state.json, sees
-        // isDaemonRunningCurrentlyInstalledHappyVersion() === true, and exits —
-        // leaving nothing running once we also exit.
-        apiMachine.shutdown();
-        await stopControlServer();
-        await cleanupDaemonState();
-        await releaseDaemonLock(daemonLockHandle);
-        await stopCaffeinate();
+            // Release ownership BEFORE spawning the new daemon. Otherwise the spawned
+            // `happy daemon start` reads our still-present daemon.state.json, sees
+            // isDaemonRunningCurrentlyInstalledHappyVersion() === true, and exits —
+            // leaving nothing running once we also exit.
+            apiMachine.shutdown();
+            await stopControlServer();
+            await cleanupDaemonState();
+            await releaseDaemonLock(daemonLockHandle);
+            await stopCaffeinate();
+          },
+          spawnReplacement: () => {
+            spawnHappyCLI(['daemon', 'start'], {
+              detached: true,
+              stdio: 'ignore'
+            });
+          },
+        });
 
-        try {
-          spawnHappyCLI(['daemon', 'start'], {
-            detached: true,
-            stdio: 'ignore'
-          });
-        } catch (error) {
-          logger.debug('[DAEMON RUN] Failed to spawn new daemon, this is quite likely to happen during integration tests as we are cleaning out dist/ directory', error);
+        if (handoffResult === 'handed-off') {
+          process.exit(0);
         }
 
-        process.exit(0);
+        logger.debug('[DAEMON RUN] New daemon bundle preflight failed; keeping current daemon running');
       }
 
       // Before wrecklessly overriting the daemon state file, we should check if we are the ones who own it

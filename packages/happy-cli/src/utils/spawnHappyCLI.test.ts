@@ -1,6 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
-import { resolveHappyCliSpawnCommand } from './spawnHappyCLI';
+import { EventEmitter } from 'node:events';
+import type { ChildProcess } from 'node:child_process';
+import { preflightInstalledHappyCLI, resolveHappyCliSpawnCommand } from './spawnHappyCLI';
 
 describe('resolveHappyCliSpawnCommand', () => {
   it('uses the source entrypoint when the current CLI is running from source', () => {
@@ -48,3 +50,27 @@ describe('resolveHappyCliSpawnCommand', () => {
     ]);
   });
 });
+
+describe('preflightInstalledHappyCLI', () => {
+  it('reports ready only when the candidate preflight exits successfully', async () => {
+    const child = new EventEmitter() as ChildProcess
+    child.kill = vi.fn()
+    const spawn = vi.fn(() => child)
+    const preflight = preflightInstalledHappyCLI({ spawn, timeoutMs: 1_000 })
+
+    child.emit('exit', 0)
+
+    await expect(preflight).resolves.toBe(true)
+    expect(spawn).toHaveBeenCalledWith(['daemon', 'preflight'], { stdio: 'ignore' })
+  })
+
+  it('reports not ready when the candidate preflight fails', async () => {
+    const child = new EventEmitter() as ChildProcess
+    child.kill = vi.fn()
+    const preflight = preflightInstalledHappyCLI({ spawn: () => child, timeoutMs: 1_000 })
+
+    child.emit('exit', 1)
+
+    await expect(preflight).resolves.toBe(false)
+  })
+})
