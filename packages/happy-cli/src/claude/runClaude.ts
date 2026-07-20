@@ -45,6 +45,7 @@ import { join } from 'node:path';
 import { RawJSONLinesSchema, type RawJSONLines } from './types';
 import { installBroadKillShims } from '@/utils/broadKillShims';
 import { readReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
+import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -137,7 +138,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     const forkedFromSessionId = process.env.HAPPY_FORKED_FROM_SESSION_ID;
     const forkedFromMessageId = process.env.HAPPY_FORKED_FROM_MESSAGE_ID;
 
-    let metadata: Metadata = {
+    const freshMetadata: Metadata = {
         path: workingDirectory,
         host: os.hostname(),
         version: packageJson.version,
@@ -165,13 +166,14 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // otherwise pass CAS while deleting the existing summary/title.
     const reconnectSession = readReconnectSessionEnvironment(process.env);
     const reconnectSessionId = reconnectSession?.id;
-    if (reconnectSession) metadata = reconnectSession.metadata;
+    const metadata = mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata);
 
     let response: ApiSession | null;
     if (reconnectSession) {
         logger.debug(`[START] Reconnecting to existing session ${reconnectSessionId}`);
         response = {
             ...reconnectSession,
+            metadata,
             agentState: state,
         };
     } else {
@@ -287,11 +289,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     if (reconnectSessionId) {
         session.suppressNextArchiveSignal();
         session.skipExistingMessages(response.seq);
-        session.updateMetadata((meta) => ({
-            ...meta,
-            lifecycleState: 'running',
-            archivedBy: undefined,
-        }));
+        session.updateMetadata((meta) => mergeReconnectSessionMetadata(meta, freshMetadata));
     }
 
     // Fork backfill: when this Happy session was just spawned as a fork

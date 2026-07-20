@@ -283,7 +283,7 @@ describe('runClaude remote JSONL scanner', () => {
         originalListeners.clear();
     });
 
-    it('passes reconnect seq as the skip baseline', async () => {
+    it('passes reconnect seq and refreshes runtime metadata without losing server fields', async () => {
         process.env.HAPPY_RECONNECT_SESSION_ID = 'happy-session-1';
         process.env.HAPPY_RECONNECT_ENCRYPTION_KEY = Buffer.from(new Uint8Array(32)).toString('base64');
         process.env.HAPPY_RECONNECT_ENCRYPTION_VARIANT = 'legacy';
@@ -298,6 +298,8 @@ describe('runClaude remote JSONL scanner', () => {
             happyLibDir: '/tmp/happy',
             happyToolsDir: '/tmp/happy/tools',
             flavor: 'claude',
+            hostPid: 77316,
+            version: '1.1.10-aplus.56',
             claudeSessionId: 'claude-session-1',
             summary: { text: 'preserved title', updatedAt: 1 },
             futureProviderState: { preserved: true },
@@ -314,10 +316,23 @@ describe('runClaude remote JSONL scanner', () => {
         expect(harness.sessionClient.suppressNextArchiveSignal).toHaveBeenCalledTimes(1);
         expect(harness.sessionClient.skipExistingMessages).toHaveBeenCalledWith(42);
         expect(harness.api.sessionSyncClient).toHaveBeenCalledWith(expect.objectContaining({
-            metadata: reconnectMetadata,
+            metadata: expect.objectContaining({
+                hostPid: process.pid,
+                summary: { text: 'preserved title', updatedAt: 1 },
+                futureProviderState: { preserved: true },
+            }),
             seq: 42,
             metadataVersion: 3,
         }));
+        expect(mockNotifyDaemonSessionStarted).toHaveBeenCalledWith(
+            'happy-session-1',
+            expect.objectContaining({
+                hostPid: process.pid,
+                summary: { text: 'preserved title', updatedAt: 1 },
+                futureProviderState: { preserved: true },
+            }),
+            expect.any(Object),
+        );
 
         await harness.finish();
     });
