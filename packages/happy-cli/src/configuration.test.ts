@@ -59,4 +59,17 @@ describe('configuration URL fallback', () => {
     expect(configuration.webappUrl).toBe('https://saycode.ai');
     cleanup();
   });
+
+  it('applyRelayOverride points serverUrl and webappUrl at the given url (trailing slash stripped)', async () => {
+    const { configuration, cleanup } = await loadConfiguration({
+      HAPPY_SERVER_URL: undefined,
+      HAPPY_WEBAPP_URL: undefined,
+    });
+
+    configuration.applyRelayOverride('https://abc.share.zrok.io/');
+
+    expect(configuration.serverUrl).toBe('https://abc.share.zrok.io');
+    expect(configuration.webappUrl).toBe('https://abc.share.zrok.io');
+    cleanup();
+  });
 });
