@@ -569,3 +569,20 @@ export function startDaemonControlServer({
     });
   });
 }
+
+export async function preflightDaemonControlServer(): Promise<void> {
+  const portRegistry: PortRegistry = {
+    allocate: async () => ({ port: 30000, reused: false }),
+    release: async () => false,
+    readAll: async () => ({}),
+  }
+  const server = await startDaemonControlServer({
+    getChildren: () => [],
+    stopSession: () => ({ stopped: false, reason: 'not-found' }),
+    spawnSession: async () => ({ type: 'error', errorMessage: 'runtime preflight only' }),
+    requestShutdown: () => {},
+    onHappySessionWebhook: () => {},
+    portRegistry,
+  })
+  await server.stop()
+}

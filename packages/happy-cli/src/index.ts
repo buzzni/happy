@@ -35,6 +35,7 @@ import { handleResumeCommand } from '@/resume/handleResumeCommand'
 import { ensureDaemonRunning } from './daemon/ensureDaemonRunning'
 import { handleCodexCommand } from './commands/codexCommand'
 import { runPreToolUseCli } from './hooks/runPreToolUseCli'
+import { preflightDaemonControlServer } from './daemon/controlServer'
 
 
 (async () => {
@@ -539,6 +540,9 @@ Conversation history is preserved on the server, but in-flight tool calls are in
         process.exit(1);
       }
       process.exit(0);
+    } else if (daemonSubcommand === 'preflight') {
+      await preflightDaemonControlServer()
+      process.exit(0)
     } else if (daemonSubcommand === 'start-sync') {
       await startDaemon()
       process.exit(0)

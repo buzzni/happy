@@ -163,6 +163,59 @@ function collectTarErrors(entries) {
     return errors;
 }
 
+function assertProductionDependencyClosure(prefix) {
+    const result = childProcess.spawnSync('npm', [
+        'ls',
+        '--global',
+        '--prefix',
+        prefix,
+        '--all',
+        '--omit=dev',
+        '--json'
+    ], {
+        encoding: 'utf8',
+        timeout: 30000
+    });
+
+    if (result.status === 0) {
+        return;
+    }
+
+    let problems = [];
+    try {
+        const report = JSON.parse(result.stdout || '{}');
+        problems = Array.isArray(report.problems) ? report.problems : [];
+    } catch {
+        // Fall through to the bounded command output below.
+    }
+
+    const details = problems.length > 0
+        ? formatErrors(problems)
+        : [result.stderr, result.stdout]
+            .filter(Boolean)
+            .join('\n')
+            .split('\n')
+            .slice(0, MAX_PRINTED_ERRORS)
+            .join('\n');
+
+    throw new Error(`Production dependency closure failed:\n- ${details || 'npm ls failed without diagnostic output'}`);
+}
+
+function assertDaemonRuntimePreflight(cliPath, isolatedEnv) {
+    try {
+        run(process.execPath, [cliPath, 'daemon', 'preflight'], {
+            env: isolatedEnv,
+            timeout: 30000
+        });
+    } catch (error) {
+        const details = String(error.message || error)
+            .split('\n')
+            .slice(0, MAX_PRINTED_ERRORS)
+            .join('\n');
+        throw new Error(`Daemon runtime preflight failed:\n${details}`);
+    }
+}
+
 function runInstallSmoke(tarball, packageJson) {
     const prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'happy-cli-install-'));
     const happyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'happy-cli-smoke-home-'));
@@ -218,6 +271,8 @@ function runInstallSmoke(tarball, packageJson) {
             throw new Error(`Smoke install version mismatch: expected ${packageJson.version}, got ${installedPackage.version}`);
         }
 
+        assertProductionDependencyClosure(prefix);
+
         const cliVersionOutput = run(process.execPath, [
             path.join(installedRoot, 'bin', 'happy.mjs'),
             '--version'
@@ -231,8 +286,11 @@ function runInstallSmoke(tarball, packageJson) {
             throw new Error(`CLI version output mismatch: expected ${JSON.stringify(expectedVersionOutput)}, got ${JSON.stringify(cliVersionOutput)}`);
         }
 
+        const cliPath = path.join(installedRoot, 'bin', 'happy.mjs');
+        assertDaemonRuntimePreflight(cliPath, isolatedEnv);
+
         run(process.execPath, [
-            path.join(installedRoot, 'bin', 'happy.mjs'),
+            cliPath,
             'daemon',
             'status'
         ], {
