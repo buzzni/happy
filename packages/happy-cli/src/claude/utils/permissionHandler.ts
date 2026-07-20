@@ -350,7 +350,7 @@ export class PermissionHandler {
      */
     private setupClientHandler(): void {
         this.session.client.rpcHandlerManager.registerHandler<PermissionResponse, void>('permission', async (message) => {
-            logger.debug(`Permission response: ${JSON.stringify(message)}`);
+            logger.debugLargeJson('Permission response:', message);
 
             const id = message.id;
             const pending = this.pendingRequests.get(id);

@@ -67,7 +67,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
         },
     }, async (args) => {
         const response = await handlers.changeTitle(args.title);
-        logger.debug('[happyMCP] Response:', response);
+        logger.debugLargeJson('[happyMCP] Response:', response);
 
         if (response.success) {
             return {

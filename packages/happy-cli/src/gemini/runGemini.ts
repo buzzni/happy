@@ -745,12 +745,13 @@ export async function runGemini(opts: {
         
         if (isError) {
           const errorMsg = (msg.result as any).error || 'Tool call failed';
-          logger.debug(`[gemini] ❌ Tool call error: ${errorMsg.substring(0, 300)}`);
+          logger.debug(`[gemini] ❌ Tool call error length: ${errorMsg.length}`);
+          logger.debugLargeJson('[gemini] Tool call error payload:', { error: errorMsg });
           messageBuffer.addMessage(`Error: ${errorMsg}`, 'status');
         } else {
           // Log summary for large results (like investigation tools)
           if (resultSize > 1000) {
-            logger.debug(`[gemini] ✅ Large tool result (${resultSize} bytes) - first 200 chars: ${truncatedResult}`);
+            logger.debug(`[gemini] ✅ Large tool result (${resultSize} bytes)`);
           }
           messageBuffer.addMessage(`Result: ${truncatedResult}`, 'result');
         }
@@ -1114,8 +1115,8 @@ export async function runGemini(opts: {
           // Don't clear history - keep accumulating for future model changes
         }
         
-        logger.debug(`[gemini] Sending prompt to Gemini (length: ${promptToSend.length}): ${promptToSend.substring(0, 100)}...`);
-        logger.debug(`[gemini] Full prompt: ${promptToSend}`);
+        logger.debug(`[gemini] Sending prompt to Gemini (length: ${promptToSend.length})`);
+        logger.debugLargeJson('[gemini] Prompt payload:', { prompt: promptToSend });
         
         // Retry logic for transient Gemini API errors (empty response, internal errors)
         const MAX_RETRIES = 3;
@@ -1296,7 +1297,7 @@ export async function runGemini(opts: {
             ...(options.length > 0 && { options }),
           };
           
-          logger.debug(`[gemini] Sending complete message to mobile (length: ${finalMessageText.length}): ${finalMessageText.substring(0, 100)}...`);
+          logger.debug(`[gemini] Sending complete message to mobile (length: ${finalMessageText.length})`);
           session.sendAgentMessage('gemini', messagePayload);
           accumulatedResponse = '';
           isResponseInProgress = false;

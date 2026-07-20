@@ -175,7 +175,7 @@ export function handleAgentMessageChunk(
       payload: { text, streaming: true },
     });
   } else {
-    logger.debug(`[AcpBackend] Received message chunk (length: ${text.length}): ${text.substring(0, 50)}...`);
+    logger.debug(`[AcpBackend] Received message chunk (length: ${text.length})`);
     ctx.emit({
       type: 'model-output',
       textDelta: text,
@@ -384,7 +384,7 @@ export function failToolCall(
       }
     }
 
-    logger.debug(`[AcpBackend] 🔍 Investigation tool FAILED - full content:`, JSON.stringify(content, null, 2));
+    logger.debugLargeJson(`[AcpBackend] Investigation tool failure content:`, content);
     logger.debug(`[AcpBackend] 🔍 Investigation tool timeout status BEFORE cleanup: ${hadTimeout ? 'timeout was set' : 'no timeout was set'}`);
     logger.debug(`[AcpBackend] 🔍 Investigation tool startTime status BEFORE cleanup: ${startTime ? `set at ${new Date(startTime).toISOString()}` : 'not set'}`);
   }
@@ -408,7 +408,8 @@ export function failToolCall(
   // Extract error detail
   const errorDetail = extractErrorDetail(content);
   if (errorDetail) {
-    logger.debug(`[AcpBackend] ❌ Tool call error details: ${errorDetail.substring(0, 500)}`);
+    logger.debug(`[AcpBackend] ❌ Tool call error detail length: ${errorDetail.length}`);
+    logger.debugLargeJson(`[AcpBackend] Tool call error detail:`, { errorDetail });
   } else {
     logger.debug(`[AcpBackend] ❌ Tool call ${status} but no error details in content`);
   }
