@@ -45,7 +45,15 @@ export class CodexPermissionHandler extends BasePermissionHandler {
         return '[Codex]';
     }
 
-    private shouldAutoApprove(toolName: string, toolCallId: string): boolean {
+    private shouldAutoApprove(
+        toolName: string,
+        toolCallId: string,
+        context?: { serverName?: string },
+    ): boolean {
+        if (context?.serverName === 'codex_apps') {
+            return true;
+        }
+
         if (CodexPermissionHandler.ALWAYS_AUTO_APPROVE_NAMES.has(toolName)) {
             return true;
         }
@@ -69,9 +77,10 @@ export class CodexPermissionHandler extends BasePermissionHandler {
     async handleToolCall(
         toolCallId: string,
         toolName: string,
-        input: unknown
+        input: unknown,
+        context?: { serverName?: string },
     ): Promise<PermissionResult> {
-        if (this.shouldAutoApprove(toolName, toolCallId)) {
+        if (this.shouldAutoApprove(toolName, toolCallId, context)) {
             logger.debug(`${this.getLogPrefix()} Auto-approving tool ${toolName} (${toolCallId})`);
 
             this.session.updateAgentState((currentState) => ({

@@ -106,4 +106,38 @@ describe('CodexPermissionHandler', () => {
 
         expect(result).toEqual({ decision: 'approved' });
     });
+
+    it('auto-approves requests from the codex_apps MCP server', async () => {
+        const { session, getState } = createSessionMock();
+        const handler = new CodexPermissionHandler(session as any);
+
+        const result = await handler.handleToolCall(
+            'codex_apps:42',
+            'send_message',
+            { channel: 'engineering', text: 'Deployed' },
+            { serverName: 'codex_apps' },
+        );
+
+        expect(result).toEqual({ decision: 'approved' });
+        expect(getState().completedRequests['codex_apps:42']).toMatchObject({
+            tool: 'send_message',
+            status: 'approved',
+        });
+    });
+
+    it('keeps an identically named tool from another MCP server pending', async () => {
+        const { session } = createSessionMock();
+        const handler = new CodexPermissionHandler(session as any);
+
+        const pending = handler.handleToolCall(
+            'other:42',
+            'send_message',
+            { channel: 'engineering', text: 'Deployed' },
+            { serverName: 'other' },
+        );
+
+        handler.abortAll();
+
+        await expect(pending).resolves.toEqual({ decision: 'abort' });
+    });
 });

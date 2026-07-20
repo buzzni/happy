@@ -672,7 +672,9 @@ export async function runCodex(opts: {
                 : (params.input ?? {});
 
         try {
-            const result = await permissionHandler.handleToolCall(params.callId, toolName, input);
+            const result = await permissionHandler.handleToolCall(params.callId, toolName, input, {
+                serverName: params.serverName,
+            });
             logger.debug('[Codex] Permission result:', result.decision);
             return result.decision;
         } catch (error) {
