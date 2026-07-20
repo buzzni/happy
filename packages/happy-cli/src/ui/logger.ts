@@ -7,10 +7,10 @@
 
 import chalk from 'chalk'
 import { appendFileSync } from 'fs'
-import { inspect } from 'node:util'
 import { configuration } from '@/configuration'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { join, basename } from 'node:path'
+import { formatLogLine } from './logSerialization'
 // Note: readDaemonState is imported lazily inside listDaemonLogFiles() to avoid
 // circular dependency: logger.ts ↔ persistence.ts
 
@@ -202,9 +202,7 @@ class Logger {
   }
 
   private logToFile(prefix: string, message: string, ...args: unknown[]): void {
-    const logLine = `${prefix} ${message} ${args.map(arg =>
-      typeof arg === 'string' ? arg : inspect(arg, { depth: 5, breakLength: 120 })
-    ).join(' ')}\n`
+    const logLine = formatLogLine(prefix, message, args)
     
     // Send to remote server if configured
     if (this.dangerouslyUnencryptedServerLoggingUrl) {
