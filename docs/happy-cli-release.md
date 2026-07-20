@@ -1,6 +1,6 @@
 # Happy CLI Release
 
-This document covers the A+ fork release path for `@namsangboy/happy-cli`.
+This document covers the A+ fork release path for `@buzzni/happy-cli`.
 
 ## Fork Scope
 
@@ -17,7 +17,7 @@ upstream `main` unless that is explicitly requested as separate work.
 1. Update `packages/happy-cli/package.json` to the next `*-aplus.*` version.
 2. Run the normal build and tests from the workspace.
 3. Create a tag that exactly matches the package version: `happy-cli-v<version>`.
-4. Push the tag **without running any local publish command**. The `Publish @namsangboy/happy-cli` workflow verifies that the tag and package version match, then is the sole process that publishes.
+4. Push the tag **without running any local publish command**. The `Publish @buzzni/happy-cli` workflow verifies that the tag and package version match, then is the sole process that publishes.
 
 ## Single Publisher Policy (CRITICAL)
 
@@ -73,12 +73,13 @@ PUBLISH_TGZ="$(ls "$RUNNER_TEMP"/happy-cli-pack/*.tgz)"
 node "$REPO/packages/happy-cli/scripts/guard-publish-artifact.cjs" "$PUBLISH_TGZ" --install-smoke
 npm publish "$PUBLISH_TGZ" --access public --tag latest --ignore-scripts
 VERSION="$(node -p 'require("./package.json").version')"
-TARBALL_URL="$(npm view "@namsangboy/happy-cli@$VERSION" dist.tarball)"
+PACKAGE_NAME="$(node -p 'require("./package.json").name')"
+TARBALL_URL="$(npm view "$PACKAGE_NAME@$VERSION" dist.tarball)"
 until curl -fsI "$TARBALL_URL" >/dev/null; do
   echo "waiting for npm tarball propagation: $TARBALL_URL"
   sleep 30
 done
-npm install -g "@namsangboy/happy-cli@$VERSION" --prefer-online
+npm install -g "$PACKAGE_NAME@$VERSION" --prefer-online
 HAPPY_HOME_DIR="$(mktemp -d)" happy daemon status
 ```
 
@@ -101,7 +102,7 @@ After publish, always install the exact version from the npm registry with lifec
 
 ## npm Tarball Propagation
 
-`npm publish` can print `+ @namsangboy/happy-cli@<version>` before every registry edge can serve the tarball blob. During that window, `npm view @namsangboy/happy-cli@<version>` and the `latest` dist-tag can already show the new version, while the package tarball URL still returns HTTP 404.
+`npm publish` can print `+ @buzzni/happy-cli@<version>` before every registry edge can serve the tarball blob. During that window, `npm view @buzzni/happy-cli@<version>` and the `latest` dist-tag can already show the new version, while the package tarball URL still returns HTTP 404.
 
 This is an npm registry/CDN propagation delay between package metadata and the tarball object, not a CLI runtime failure. Do not immediately republish just because the first registry install gets a 404. Treat publish as complete only after the tarball URL returns 200 and the registry install smoke passes.
 
@@ -109,12 +110,13 @@ Use this wait loop after every publish:
 
 ```sh
 VERSION="$(node -p 'require("./package.json").version')"
-TARBALL_URL="$(npm view "@namsangboy/happy-cli@$VERSION" dist.tarball)"
+PACKAGE_NAME="$(node -p 'require("./package.json").name')"
+TARBALL_URL="$(npm view "$PACKAGE_NAME@$VERSION" dist.tarball)"
 until curl -fsI "$TARBALL_URL" >/dev/null; do
   echo "waiting for npm tarball propagation: $TARBALL_URL"
   sleep 30
 done
-npm install -g "@namsangboy/happy-cli@$VERSION" --prefer-online
+npm install -g "$PACKAGE_NAME@$VERSION" --prefer-online
 HAPPY_HOME_DIR="$(mktemp -d)" happy daemon status
 ```
 
@@ -138,7 +140,7 @@ Do not rely on `gh repo view` or the default inferred repository for this fork.
 Every Happy CLI publish is complete only after all of these are true:
 
 1. The release change is merged into `buzzni/happy` `main`.
-2. `@namsangboy/happy-cli@<version>` is published and `latest` points to that version.
+2. `@buzzni/happy-cli@<version>` is published and `latest` points to that version.
 3. The npm tarball URL returns 200.
 4. A fresh registry install runs `happy daemon status` successfully.
 5. `buzzni/aplus-dev-studio` updates `vendor/happy` to the merged `buzzni/happy` `main` commit.

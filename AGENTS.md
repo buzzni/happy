@@ -29,12 +29,12 @@ and verified with `packages/happy-cli/scripts/guard-publish-artifact.cjs --insta
 
 ## Happy CLI Release Publisher (CRITICAL)
 
-GitHub Actions is the **only** publisher for `@namsangboy/happy-cli`.
+GitHub Actions is the **only** publisher for `@buzzni/happy-cli`.
 
 1. Bump `packages/happy-cli/package.json`, validate the release change, and merge it
    to `main`.
 2. Create and push exactly one matching `happy-cli-v<version>` tag.
-3. Let `Publish @namsangboy/happy-cli` build, guard, publish, and verify the package.
+3. Let `Publish @buzzni/happy-cli` build, guard, publish, and verify the package.
 
 Never run `npm publish`, `pnpm publish`, or `yarn publish` locally for this package,
 including from a prepared publish directory. A local publish followed by the release-tag
