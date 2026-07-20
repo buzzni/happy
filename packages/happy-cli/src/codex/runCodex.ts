@@ -52,6 +52,7 @@ import {
 } from './codexPrompt';
 import { discoverCodexSkillCommands } from './codexSkills';
 import { readReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
+import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import {
     codexGoalActionCapabilities,
     mapCodexGoalEventToAgentGoalStatus,
@@ -156,13 +157,14 @@ export async function runCodex(opts: {
     // any provider fields while still satisfying the server CAS version.
     const reconnectSession = readReconnectSessionEnvironment(process.env);
     const reconnectSessionId = reconnectSession?.id;
-    const metadata = reconnectSession?.metadata ?? freshMetadata;
+    const metadata = mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata);
 
     let response: ApiSession | null;
     if (reconnectSession) {
         logger.debug(`[START] Reconnecting to existing session ${reconnectSessionId}`);
         response = {
             ...reconnectSession,
+            metadata,
             agentState: state,
         };
     } else {
@@ -203,11 +205,7 @@ export async function runCodex(opts: {
     if (reconnectSessionId) {
         session.suppressNextArchiveSignal();
         session.skipExistingMessages(response?.seq ?? 0);
-        session.updateMetadata((meta) => ({
-            ...meta,
-            lifecycleState: 'running',
-            archivedBy: undefined,
-        }));
+        session.updateMetadata((meta) => mergeReconnectSessionMetadata(meta, freshMetadata));
     }
 
     // Always report to daemon if it exists (skip if offline)
