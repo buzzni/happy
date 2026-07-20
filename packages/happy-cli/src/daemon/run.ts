@@ -46,6 +46,7 @@ import { encodeBase64, decodeBase64 } from '@/api/encryption';
 import { resolveRegularSpawnAgentArgs, resolveTmuxSpawnAgentCommand } from './spawnAgentCommand';
 import { applyServerSessionSnapshot, parseServerSessionSnapshot, type ServerSessionSnapshot } from './serverSessionSnapshot';
 import { buildReconnectSessionEnvironment } from './reconnectSessionEnv';
+import { startLogHousekeeping } from '@/ui/logHousekeepingRunner';
 import {
   readDaemonSessionIdleReaperConfig,
   runDaemonSessionIdleReaperTick,
@@ -185,6 +186,7 @@ export async function startDaemon(): Promise<void> {
   // 1. Not have a stale daemon state
   // 2. Should not have another daemon process running
 
+  let stopLogHousekeeping: () => void = () => undefined;
   try {
     // Start caffeinate
     const caffeinateStarted = startCaffeinate();
@@ -997,6 +999,11 @@ export async function startDaemon(): Promise<void> {
     };
     writeDaemonState(fileState);
     logger.debug('[DAEMON RUN] Daemon state written');
+    stopLogHousekeeping = startLogHousekeeping({
+      logsDir: configuration.logsDir,
+      currentLogPath: logger.logFilePath,
+      debug: (message, details) => logger.debug(message, details),
+    });
 
     // Now that fileState is available, assign the real implementation
     persistTrackedSessions = () => {
@@ -1214,6 +1221,7 @@ export async function startDaemon(): Promise<void> {
         clearInterval(restartOnStaleVersionAndHeartbeat);
         logger.debug('[DAEMON RUN] Health check interval cleared');
       }
+      stopLogHousekeeping();
 
       // Update daemon state before shutting down
       await apiMachine.updateDaemonState((state: DaemonState | null) => ({
@@ -1252,6 +1260,7 @@ export async function startDaemon(): Promise<void> {
     const shutdownRequest = await resolvesWhenShutdownRequested;
     await cleanupAndShutdown(shutdownRequest.source, shutdownRequest.errorMessage);
   } catch (error) {
+    stopLogHousekeeping();
     logger.debug('[DAEMON RUN][FATAL] Failed somewhere unexpectedly - exiting with code 1', error);
     process.exit(1);
   }

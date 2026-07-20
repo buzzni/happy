@@ -6,11 +6,11 @@
  */
 
 import chalk from 'chalk'
-import { appendFileSync } from 'fs'
 import { configuration } from '@/configuration'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { join, basename } from 'node:path'
 import { formatLogLine, sanitizeLogArgs } from './logSerialization'
+import { readLogRotationPolicy, RotatingLogWriter, type LogRotationPolicy } from './logRotation'
 // Note: readDaemonState is imported lazily inside listDaemonLogFiles() to avoid
 // circular dependency: logger.ts ↔ persistence.ts
 
@@ -49,10 +49,13 @@ function getSessionLogPath(): string {
 export class Logger {
   private dangerouslyUnencryptedServerLoggingUrl: string | undefined
   private readonly largePayloadOmissions = new Map<string, { loggedAt: number; suppressed: number }>()
+  private readonly fileWriter: RotatingLogWriter
 
   constructor(
-    public readonly logFilePath = getSessionLogPath()
+    public readonly logFilePath = getSessionLogPath(),
+    rotationPolicy: LogRotationPolicy = readLogRotationPolicy(process.env),
   ) {
+    this.fileWriter = new RotatingLogWriter(logFilePath, rotationPolicy)
     // Remote logging enabled only when explicitly set with server URL
     if (process.env.DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING 
       && process.env.HAPPY_SERVER_URL) {
@@ -235,7 +238,7 @@ export class Logger {
     
     // Handle async file path
     try {
-      appendFileSync(this.logFilePath, logLine)
+      this.fileWriter.append(logLine)
     } catch (appendError) {
       if (process.env.DEBUG) {
         console.error('[DEV MODE ONLY THROWING] Failed to append to log file:', appendError)
@@ -258,13 +261,21 @@ export type LogFileInfo = {
   modified: Date;
 };
 
+export type ListDaemonLogFileOptions = {
+  logsDir?: string
+  includePersisted?: boolean
+}
+
 /**
  * List daemon log files in descending modification time order.
  * Returns up to `limit` entries; empty array if none.
  */
-export async function listDaemonLogFiles(limit: number = 50): Promise<LogFileInfo[]> {
+export async function listDaemonLogFiles(
+  limit: number = 50,
+  options: ListDaemonLogFileOptions = {},
+): Promise<LogFileInfo[]> {
   try {
-    const logsDir = configuration.logsDir;
+    const logsDir = options.logsDir ?? configuration.logsDir;
     if (!existsSync(logsDir)) {
       return [];
     }
@@ -279,32 +290,34 @@ export async function listDaemonLogFiles(limit: number = 50): Promise<LogFileInf
       .sort((a, b) => b.modified.getTime() - a.modified.getTime());
 
     // Prefer the path persisted by the daemon if present (return 0th element if present)
-    try {
-      // Lazy import to avoid circular dependency: logger.ts ↔ persistence.ts
-      const { readDaemonState } = await import('@/persistence');
-      const state = await readDaemonState();
+    if (options.includePersisted !== false) {
+      try {
+        // Lazy import to avoid circular dependency: logger.ts ↔ persistence.ts
+        const { readDaemonState } = await import('@/persistence');
+        const state = await readDaemonState();
 
-      if (!state) {
-        return logs;
-      }
-
-      if (state.daemonLogPath && existsSync(state.daemonLogPath)) {
-        const stats = statSync(state.daemonLogPath);
-        const persisted: LogFileInfo = {
-          file: basename(state.daemonLogPath),
-          path: state.daemonLogPath,
-          modified: stats.mtime
-        };
-        const idx = logs.findIndex(l => l.path === persisted.path);
-        if (idx >= 0) {
-          const [found] = logs.splice(idx, 1);
-          logs.unshift(found);
-        } else {
-          logs.unshift(persisted);
+        if (!state) {
+          return logs;
         }
+
+        if (state.daemonLogPath && existsSync(state.daemonLogPath)) {
+          const stats = statSync(state.daemonLogPath);
+          const persisted: LogFileInfo = {
+            file: basename(state.daemonLogPath),
+            path: state.daemonLogPath,
+            modified: stats.mtime
+          };
+          const idx = logs.findIndex(l => l.path === persisted.path);
+          if (idx >= 0) {
+            const [found] = logs.splice(idx, 1);
+            logs.unshift(found);
+          } else {
+            logs.unshift(persisted);
+          }
+        }
+      } catch {
+        // Ignore errors reading daemon state; fall back to directory listing
       }
-    } catch {
-      // Ignore errors reading daemon state; fall back to directory listing
     }
 
     return logs.slice(0, Math.max(0, limit));
