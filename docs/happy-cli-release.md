@@ -31,6 +31,24 @@ then pushed, the workflow correctly attempts the same version a second time and 
 with E403. Do not re-run that job. Check the published version and publish a new version
 through CI only when a correction is required.
 
+## Required User Approval Checkpoint
+
+Local implementation, tests, build, package preparation, `npm pack`, and artifact
+guarding may be completed before release approval. Immediately before any
+external release mutation, present the exact candidate version and the proposed
+actions and obtain explicit user approval.
+
+This checkpoint applies separately to:
+
+- pushing a release tag;
+- `npm publish`;
+- adding, moving, or removing an npm dist-tag;
+- adding or changing an npm deprecation message.
+
+Approval of a plan or of the implementation work is not publish approval. If
+the external action list changes after approval, stop and ask again for the
+changed list.
+
 ## Publish Artifact Rule
 
 Do not publish directly from the raw pnpm workspace package.
@@ -72,6 +90,12 @@ The final `npm publish` takes the guarded `.tgz` path, so the registry receives 
 `prepublishOnly` in both the source and the prepared package now runs `scripts/assert-publish-tool.cjs`, which rejects non-npm publishers, and the published artifact's `postinstall` runs `scripts/verify-bundled-deps.cjs`, which fails a registry install immediately when the bundled files are missing instead of crashing later with `ERR_MODULE_NOT_FOUND`.
 
 The command includes `--tag latest` because `*-aplus.*` versions are semver prereleases and npm requires an explicit dist-tag for those publishes.
+
+The install smoke runs every installed CLI command with an isolated
+`HOME`/`HAPPY_HOME_DIR` and a bounded timeout. `happy --version` must print
+exactly one Happy version line and exit before authentication, provider startup,
+or daemon startup. The smoke also requires a complete production dependency
+tree and creates then closes the packaged Fastify control-server runtime.
 
 After publish, always install the exact version from the npm registry with lifecycle scripts enabled and run `happy daemon status`. This verifies that the registry metadata, registry tarball, bundled dependency files, native dependencies such as `node-pty`, and the CLI entrypoint all work outside the monorepo. Do not use `--ignore-scripts` for this smoke: Linux installs need `node-pty`'s install script to build its native module because the package does not ship a Linux prebuild.
 
@@ -190,10 +214,24 @@ This was introduced when upstream pnpm workspace metadata was merged back into t
 - `@slopus/happy-wire` is missing or points to a local-only protocol;
 - the tarball contains pnpm workspace paths such as `node_modules/.pnpm` or `../`;
 - required bundled files are missing;
+- `npm ls --global --all --omit=dev` reports an incomplete production dependency tree;
 - the optional global install smoke test cannot install the tarball;
+- the installed artifact cannot create and close its Fastify control-server runtime;
 - the optional global install smoke test cannot execute the installed `happy daemon status` entrypoint.
 
 Do not remove this guard from the publish workflow.
+
+## Fail-safe Daemon Handoff
+
+Both daemon startup and the bundle-replacement heartbeat must preflight the new
+control-server runtime before stopping the current daemon. A failed candidate
+must leave the current API connection, control socket, state file, lock, and
+sleep-prevention process intact. The heartbeat retries the on-disk candidate on
+the next interval instead of advancing its observed bundle marker.
+
+This protects availability from incomplete or concurrently replaced install
+prefixes. It is not a full blue/green supervisor: failures after a successful
+preflight and teardown still require a separate OS service-manager design.
 
 ## Should We Use pnpm Pack or pnpm Publish?
 

@@ -43,3 +43,9 @@ with E403 and the workflow is correctly marked failed. Do not re-run such a fail
 confirm the registry version, then use a new version only if a corrected release is needed.
 
 `docs/happy-cli-release.md` is the release runbook and source of truth for this policy.
+
+Every external Happy CLI release mutation requires the user's explicit approval
+immediately before it is performed. Planning approval or approval to implement
+release hardening does not authorize tag pushes, `npm publish`, npm dist-tag
+changes, or npm deprecation changes. Present the exact version and external
+commands/actions, wait for approval, and only then perform the approved subset.
