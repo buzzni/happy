@@ -16,6 +16,7 @@ describe('scrubSessionLineageEnv', () => {
             HAPPY_RECONNECT_SEQ: '119',
             HAPPY_RECONNECT_METADATA_VERSION: '3',
             HAPPY_RECONNECT_AGENT_STATE_VERSION: '4',
+            HAPPY_RECONNECT_SNAPSHOT: 'snapshot',
             HAPPY_FORKED_FROM_SESSION_ID: 'cmr-parent',
             HAPPY_FORKED_FROM_MESSAGE_ID: 'msg-1',
             HAPPY_FORK_CLAUDE_SESSION_ID: 'claude-1',

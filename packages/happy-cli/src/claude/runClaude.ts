@@ -37,13 +37,14 @@ import { applyAxOrchestration } from '@/orchestrator/prompts/integrate';
 import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
 import { fetchAplusMcpServersResult } from '@/aplus/fetchAplusMcpServers';
 import { mergeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
-import { decodeBase64, encodeBase64 } from '@/api/encryption';
+import { encodeBase64 } from '@/api/encryption';
 import type { Session as ApiSession } from '@/api/types';
 import { getProjectPath } from './utils/path';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { RawJSONLinesSchema, type RawJSONLines } from './types';
 import { installBroadKillShims } from '@/utils/broadKillShims';
+import { readReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -159,26 +160,19 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         ...(forkedFromMessageId ? { forkedFromMessageId } : {}),
     };
 
-    // Check for session reconnection env vars (set by daemon for resume-in-place)
-    const reconnectSessionId = process.env.HAPPY_RECONNECT_SESSION_ID;
-    const reconnectKeyBase64 = process.env.HAPPY_RECONNECT_ENCRYPTION_KEY;
-    const reconnectVariant = process.env.HAPPY_RECONNECT_ENCRYPTION_VARIANT as 'legacy' | 'dataKey' | undefined;
-    const reconnectSeq = process.env.HAPPY_RECONNECT_SEQ;
-    const reconnectMetadataVersion = process.env.HAPPY_RECONNECT_METADATA_VERSION;
-    const reconnectAgentStateVersion = process.env.HAPPY_RECONNECT_AGENT_STATE_VERSION;
+    // Resume-in-place must use the latest server document as its metadata
+    // base. A fresh local document paired with the latest server version can
+    // otherwise pass CAS while deleting the existing summary/title.
+    const reconnectSession = readReconnectSessionEnvironment(process.env);
+    const reconnectSessionId = reconnectSession?.id;
+    if (reconnectSession) metadata = reconnectSession.metadata;
 
     let response: ApiSession | null;
-    if (reconnectSessionId && reconnectKeyBase64 && reconnectVariant) {
+    if (reconnectSession) {
         logger.debug(`[START] Reconnecting to existing session ${reconnectSessionId}`);
         response = {
-            id: reconnectSessionId,
-            seq: parseInt(reconnectSeq || '0', 10),
-            encryptionKey: decodeBase64(reconnectKeyBase64),
-            encryptionVariant: reconnectVariant,
-            metadata,
-            metadataVersion: parseInt(reconnectMetadataVersion || '0', 10),
+            ...reconnectSession,
             agentState: state,
-            agentStateVersion: parseInt(reconnectAgentStateVersion || '0', 10),
         };
     } else {
         response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });

@@ -45,6 +45,7 @@ import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
 import { encodeBase64, decodeBase64 } from '@/api/encryption';
 import { resolveRegularSpawnAgentArgs, resolveTmuxSpawnAgentCommand } from './spawnAgentCommand';
 import { applyServerSessionSnapshot, parseServerSessionSnapshot, type ServerSessionSnapshot } from './serverSessionSnapshot';
+import { buildReconnectSessionEnvironment } from './reconnectSessionEnv';
 import {
   readDaemonSessionIdleReaperConfig,
   runDaemonSessionIdleReaperTick,
@@ -819,16 +820,24 @@ export async function startDaemon(): Promise<void> {
         // Webhook metadata and seq may be stale after the original child exits.
         // Fetch a fresh server snapshot before resuming so the child skips only
         // messages that already exist and starts listening from the latest seq.
-        let metadata = tracked.happySessionMetadataFromLocalWebhook;
         const serverSnapshot = await fetchServerSessionSnapshot(happySessionId, tracked.encryption);
-        if (serverSnapshot) {
-          const previousSeq = tracked.encryption.seq;
-          metadata = applyServerSessionSnapshot(tracked, serverSnapshot);
-          logger.debug(`[DAEMON RUN] Refreshed session ${happySessionId} snapshot for resume`, {
-            previousSeq,
-            nextSeq: tracked.encryption.seq,
-          });
+        if (!serverSnapshot) {
+          return {
+            type: 'error',
+            errorMessage: `Cannot safely resume session ${happySessionId}: latest server metadata is unavailable. Retry when the server is reachable.`,
+          };
         }
+        const reconnectEnvironment = buildReconnectSessionEnvironment({
+          sessionId: happySessionId,
+          encryption: tracked.encryption,
+          serverSnapshot,
+        });
+        const previousSeq = tracked.encryption.seq;
+        const metadata = applyServerSessionSnapshot(tracked, serverSnapshot);
+        logger.debug(`[DAEMON RUN] Refreshed session ${happySessionId} snapshot for resume`, {
+          previousSeq,
+          nextSeq: tracked.encryption.seq,
+        });
 
         const launch = buildResumeLaunch(
           { id: happySessionId, active: true, metadata },
@@ -851,12 +860,7 @@ export async function startDaemon(): Promise<void> {
           // 상속분은 scrub 하고 이 세션의 값만 아래에서 다시 넣는다.
           env: {
             ...scrubSessionLineageEnv(process.env),
-            HAPPY_RECONNECT_SESSION_ID: happySessionId,
-            HAPPY_RECONNECT_ENCRYPTION_KEY: encodeBase64(tracked.encryption.encryptionKey),
-            HAPPY_RECONNECT_ENCRYPTION_VARIANT: tracked.encryption.encryptionVariant,
-            HAPPY_RECONNECT_SEQ: String(tracked.encryption.seq),
-            HAPPY_RECONNECT_METADATA_VERSION: String(tracked.encryption.metadataVersion),
-            HAPPY_RECONNECT_AGENT_STATE_VERSION: String(tracked.encryption.agentStateVersion),
+            ...reconnectEnvironment,
           },
         });
       } catch (error) {

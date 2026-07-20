@@ -26,7 +26,7 @@ import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { CodexDisplay } from "@/ui/ink/CodexDisplay";
 import { trimIdent } from "@/utils/trimIdent";
 import { notifyDaemonSessionStarted } from "@/daemon/controlClient";
-import { encodeBase64, decodeBase64 } from '@/api/encryption';
+import { encodeBase64 } from '@/api/encryption';
 import type { Session as ApiSession, UserMessage } from '@/api/types';
 import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler";
 import { connectionState } from '@/utils/serverConnectionErrors';
@@ -51,6 +51,7 @@ import {
     type CodexEnhancedMode,
 } from './codexPrompt';
 import { discoverCodexSkillCommands } from './codexSkills';
+import { readReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 import {
     codexGoalActionCapabilities,
     mapCodexGoalEventToAgentGoalStatus,
@@ -134,7 +135,7 @@ export async function runCodex(opts: {
     const forkedFromSessionId = process.env.HAPPY_FORKED_FROM_SESSION_ID;
     const forkedFromMessageId = process.env.HAPPY_FORKED_FROM_MESSAGE_ID;
 
-    const { state, metadata } = createSessionMetadata({
+    const { state, metadata: freshMetadata } = createSessionMetadata({
         flavor: 'codex',
         machineId,
         startedBy: opts.startedBy,
@@ -146,30 +147,23 @@ export async function runCodex(opts: {
 
     const skillCommands = await discoverCodexSkillCommands();
     if (skillCommands.length > 0) {
-        metadata.skills = skillCommands;
-        metadata.slashCommands = Array.from(new Set([...(metadata.slashCommands ?? []), ...skillCommands]));
+        freshMetadata.skills = skillCommands;
+        freshMetadata.slashCommands = Array.from(new Set([...(freshMetadata.slashCommands ?? []), ...skillCommands]));
     }
 
-    // Check for session reconnection env vars (set by daemon for resume-in-place)
-    const reconnectSessionId = process.env.HAPPY_RECONNECT_SESSION_ID;
-    const reconnectKeyBase64 = process.env.HAPPY_RECONNECT_ENCRYPTION_KEY;
-    const reconnectVariant = process.env.HAPPY_RECONNECT_ENCRYPTION_VARIANT as 'legacy' | 'dataKey' | undefined;
-    const reconnectSeq = process.env.HAPPY_RECONNECT_SEQ;
-    const reconnectMetadataVersion = process.env.HAPPY_RECONNECT_METADATA_VERSION;
-    const reconnectAgentStateVersion = process.env.HAPPY_RECONNECT_AGENT_STATE_VERSION;
+    // Resume-in-place must start from the latest server metadata snapshot.
+    // Rebuilding a local document here can overwrite an existing title and
+    // any provider fields while still satisfying the server CAS version.
+    const reconnectSession = readReconnectSessionEnvironment(process.env);
+    const reconnectSessionId = reconnectSession?.id;
+    const metadata = reconnectSession?.metadata ?? freshMetadata;
 
     let response: ApiSession | null;
-    if (reconnectSessionId && reconnectKeyBase64 && reconnectVariant) {
+    if (reconnectSession) {
         logger.debug(`[START] Reconnecting to existing session ${reconnectSessionId}`);
         response = {
-            id: reconnectSessionId,
-            seq: parseInt(reconnectSeq || '0', 10),
-            encryptionKey: decodeBase64(reconnectKeyBase64),
-            encryptionVariant: reconnectVariant,
-            metadata,
-            metadataVersion: parseInt(reconnectMetadataVersion || '0', 10),
+            ...reconnectSession,
             agentState: state,
-            agentStateVersion: parseInt(reconnectAgentStateVersion || '0', 10),
         };
     } else {
         response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiSessionClient, toolCallStartLaunchesBackgroundJob } from './apiSession';
 import { decodeBase64, decrypt, decryptBlob, encodeBase64, encrypt } from './encryption';
-import type { Update } from './types';
+import type { Metadata, Update } from './types';
 import { logger } from '@/ui/logger';
 
 const {
@@ -102,7 +102,7 @@ function makeSession() {
             happyHomeDir: '/home/user/.happy',
             happyLibDir: '/home/user/.happy/lib',
             happyToolsDir: '/home/user/.happy/tools'
-        },
+        } as Metadata,
         metadataVersion: 0,
         agentState: null,
         agentStateVersion: 0,
@@ -201,6 +201,58 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(mockSocket.on).toHaveBeenCalledWith('disconnect', expect.any(Function));
         expect(mockSocket.on).toHaveBeenCalledWith('update', expect.any(Function));
         expect(mockSocket.connect).toHaveBeenCalledTimes(1);
+    });
+
+    it('reapplies a metadata patch to the newest server document after a version mismatch', async () => {
+        session.metadata = {
+            ...session.metadata,
+            summary: { text: 'original title', updatedAt: 1 },
+        };
+        session.metadataVersion = 4;
+        const concurrentMetadata = {
+            ...session.metadata,
+            summary: { text: 'newer title', updatedAt: 2 },
+            promptSuggestion: { text: 'next step', provider: 'codex', updatedAt: 3 },
+            futureProviderState: { preserved: true },
+        };
+        const encryptedConcurrentMetadata = encryptContent(session, concurrentMetadata);
+
+        mockSocket.emitWithAck
+            .mockResolvedValueOnce({
+                result: 'version-mismatch',
+                version: 5,
+                metadata: encryptedConcurrentMetadata,
+            })
+            .mockImplementationOnce(async (_event: string, payload: { metadata: string }) => ({
+                result: 'success',
+                version: 6,
+                metadata: payload.metadata,
+            }));
+
+        const client = new ApiSessionClient('fake-token', session);
+        client.updateMetadata((metadata) => ({
+            ...metadata,
+            lifecycleState: 'running',
+            archivedBy: undefined,
+        }));
+
+        await waitForCheck(() => {
+            expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(2);
+        });
+        expect(mockSocket.emitWithAck.mock.calls[0][1].expectedVersion).toBe(4);
+        expect(mockSocket.emitWithAck.mock.calls[1][1].expectedVersion).toBe(5);
+        expect(decrypt(
+            session.encryptionKey,
+            session.encryptionVariant,
+            decodeBase64(mockSocket.emitWithAck.mock.calls[1][1].metadata),
+        )).toEqual({
+            ...concurrentMetadata,
+            lifecycleState: 'running',
+        });
+        expect(client.getMetadata()).toEqual({
+            ...concurrentMetadata,
+            lifecycleState: 'running',
+        });
     });
 
     it('retries after initial socket connection error', async () => {
