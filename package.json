@@ -2,7 +2,7 @@
     "name": "monorepo",
     "private": true,
     "scripts": {
-        "cli": "pnpm --filter @namsangboy/happy-cli cli",
+        "cli": "pnpm --filter @buzzni/happy-cli cli",
         "release": "node ./scripts/release.cjs",
         "web": "pnpm --filter happy-app web",
         "codium": "pnpm --filter codium dev",

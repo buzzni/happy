@@ -194,15 +194,15 @@ to `execve()` it. Linux uses `forkpty + execvp` and is unaffected.
 postinstall flips the bit on macOS. Just upgrade:
 
 ```bash
-npm i -g @namsangboy/happy-cli@latest
+npm i -g @buzzni/happy-cli@latest
 happy daemon stop && happy daemon start
 ```
 
 **Manual fix (older versions)**:
 
 ```bash
-chmod +x $(npm root -g)/@namsangboy/happy-cli/node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper
-chmod +x $(npm root -g)/@namsangboy/happy-cli/node_modules/node-pty/prebuilds/darwin-x64/spawn-helper
+chmod +x $(npm root -g)/@buzzni/happy-cli/node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper
+chmod +x $(npm root -g)/@buzzni/happy-cli/node_modules/node-pty/prebuilds/darwin-x64/spawn-helper
 happy daemon stop && happy daemon start
 ```
 
@@ -210,7 +210,7 @@ happy daemon stop && happy daemon start
 
 ```bash
 xcode-select --install   # if not already
-npm i -g @namsangboy/happy-cli@latest --build-from-source
+npm i -g @buzzni/happy-cli@latest --build-from-source
 ```
 
 ### Other

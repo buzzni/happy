@@ -10,13 +10,17 @@
 //
 // This script runs from prepublishOnly and rejects non-npm publishers.
 
+const fs = require('fs');
+const path = require('path');
+
+const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf8'));
 const userAgent = process.env.npm_config_user_agent || '';
 const tool = userAgent.split('/')[0];
 
 if (tool && tool !== 'npm') {
     console.error(
         [
-            `Refusing to publish @namsangboy/happy-cli with ${tool}.`,
+            `Refusing to publish ${manifest.name} with ${tool}.`,
             '',
             `${tool} re-packs the package without bundledDependencies, producing`,
             'a tarball whose fresh installs crash with ERR_MODULE_NOT_FOUND',

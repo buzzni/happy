@@ -13,7 +13,7 @@
  *   7. verify by running `happy --version`
  *
  * Reuses ~/.happy/ - no separate dev home dir. Auth and sessions carry over.
- * To undo: `npm uninstall -g @namsangboy/happy-cli && npm i -g @namsangboy/happy-cli@latest`.
+ * To undo: uninstall this manifest's package name and reinstall its latest registry release.
  */
 
 const fs = require('fs');
@@ -22,6 +22,7 @@ const { spawnSync } = require('child_process');
 const path = require('path');
 
 const PACKAGE_DIR = path.resolve(__dirname, '..');
+const PACKAGE_NAME = JSON.parse(fs.readFileSync(path.join(PACKAGE_DIR, 'package.json'), 'utf8')).name;
 const IS_WINDOWS = process.platform === 'win32';
 
 function run(cmd, args, { allowFailure = false } = {}) {
@@ -121,8 +122,7 @@ function verifyBundledDependency() {
     const npmRoot = runOutput('npm', ['root', '-g']).trim();
     const wireEntry = path.join(
         npmRoot,
-        '@namsangboy',
-        'happy-cli',
+        ...PACKAGE_NAME.split('/'),
         'node_modules',
         '@slopus',
         'happy-wire',
@@ -159,4 +159,4 @@ try {
 }
 
 console.log(`\n✓ Installed from ${PACKAGE_DIR}`);
-console.log('  To undo: npm uninstall -g @namsangboy/happy-cli && npm i -g @namsangboy/happy-cli@latest');
+console.log(`  To undo: npm uninstall -g ${PACKAGE_NAME} && npm i -g ${PACKAGE_NAME}@latest`);

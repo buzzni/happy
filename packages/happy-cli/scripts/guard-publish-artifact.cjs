@@ -237,21 +237,13 @@ function runInstallSmoke(tarball, packageJson) {
             '--prefer-online'
         ]);
 
-        const installedPackagePath = path.join(
-            prefix,
-            'lib',
-            'node_modules',
-            '@namsangboy',
-            'happy-cli',
-            'package.json'
-        );
         const installedRoot = path.join(
             prefix,
             'lib',
             'node_modules',
-            '@namsangboy',
-            'happy-cli'
+            ...packageJson.name.split('/')
         );
+        const installedPackagePath = path.join(installedRoot, 'package.json');
 
         if (!fs.existsSync(installedPackagePath)) {
             throw new Error(`Smoke install did not create ${installedPackagePath}`);

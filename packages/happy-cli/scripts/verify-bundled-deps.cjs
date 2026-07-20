@@ -27,7 +27,7 @@ const missing = bundled.filter(
 if (missing.length > 0) {
     console.error(
         [
-            '@namsangboy/happy-cli: this npm artifact is broken — package.json',
+            `${manifest.name}: this npm artifact is broken — package.json`,
             'declares bundledDependencies that the artifact does not contain:',
             '',
             ...missing.map((name) => `  missing node_modules/${name}`),

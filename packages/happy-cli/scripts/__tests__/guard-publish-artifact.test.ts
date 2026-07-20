@@ -28,7 +28,7 @@ function createPublishTarball(
     const packageRoot = join(fixtureRoot, 'package')
 
     writeFixtureFile(packageRoot, 'package.json', JSON.stringify({
-        name: '@namsangboy/happy-cli',
+        name: '@buzzni/happy-cli',
         version: packageVersion,
         bin: { happy: 'bin/happy.mjs' },
         dependencies: {
