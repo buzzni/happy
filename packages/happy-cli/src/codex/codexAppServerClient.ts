@@ -1364,7 +1364,7 @@ export class CodexAppServerClient {
             return;
         }
 
-        logger.debug('[CodexAppServer] Unhandled message:', JSON.stringify(msg).substring(0, 300));
+        logger.debugLargeJson('[CodexAppServer] Unhandled message:', msg);
     }
 
     /**

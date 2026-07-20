@@ -10,7 +10,7 @@ import { appendFileSync } from 'fs'
 import { configuration } from '@/configuration'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { join, basename } from 'node:path'
-import { formatLogLine } from './logSerialization'
+import { formatLogLine, sanitizeLogArgs } from './logSerialization'
 // Note: readDaemonState is imported lazily inside listDaemonLogFiles() to avoid
 // circular dependency: logger.ts ↔ persistence.ts
 
@@ -46,8 +46,9 @@ function getSessionLogPath(): string {
   return join(configuration.logsDir, filename)
 }
 
-class Logger {
+export class Logger {
   private dangerouslyUnencryptedServerLoggingUrl: string | undefined
+  private readonly largePayloadOmissions = new Map<string, { loggedAt: number; suppressed: number }>()
 
   constructor(
     public readonly logFilePath = getSessionLogPath()
@@ -86,7 +87,22 @@ class Logger {
     maxArrayLength: number = 10,
   ): void {
     if (!process.env.DEBUG) {
-      this.debug(`In production, skipping message inspection`)
+      const now = Date.now()
+      const previous = this.largePayloadOmissions.get(message)
+      if (!previous || now - previous.loggedAt >= 60_000) {
+        const suppressed = previous?.suppressed
+          ? `; ${previous.suppressed} similar events suppressed`
+          : ''
+        this.debug(`${message} [large payload omitted in production${suppressed}]`)
+        this.largePayloadOmissions.set(message, { loggedAt: now, suppressed: 0 })
+        if (this.largePayloadOmissions.size > 200) {
+          const oldest = this.largePayloadOmissions.keys().next().value
+          if (oldest) this.largePayloadOmissions.delete(oldest)
+        }
+      } else {
+        previous.suppressed += 1
+      }
+      return
     }
 
     // Some of our messages are huge, but we still want to show them in the logs
@@ -189,7 +205,7 @@ class Logger {
         body: JSON.stringify({
           timestamp: new Date().toISOString(),
           level,
-          message: `${message} ${args.map(a => 
+          message: `${message} ${sanitizeLogArgs(args).map(a =>
             typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)
           ).join(' ')}`,
           source: 'cli',

@@ -599,15 +599,15 @@ export class AcpBackend implements AgentBackend {
           
           const options = extendedParams.options || [];
           
-          // Log permission request for debugging (include full params to understand structure)
-          logger.debug(`[AcpBackend] Permission request: tool=${toolName}, toolCallId=${toolCallId}, input=`, JSON.stringify(input));
-          logger.debug(`[AcpBackend] Permission request params structure:`, JSON.stringify({
+          logger.debug(`[AcpBackend] Permission request: tool=${toolName}, toolCallId=${toolCallId}`);
+          logger.debugLargeJson(`[AcpBackend] Permission request payload:`, input);
+          logger.debugLargeJson(`[AcpBackend] Permission request params structure:`, {
             hasToolCall: !!toolCall,
             toolCallKind: toolCall?.kind,
             toolCallId: toolCall?.id,
             paramsKind: extendedParams.kind,
             paramsKeys: Object.keys(params),
-          }, null, 2));
+          });
           
           // Emit permission request event for UI/mobile handling
           this.emit({
@@ -931,14 +931,14 @@ export class AcpBackend implements AgentBackend {
     const update = notification.update;
 
     if (!update) {
-      logger.debug('[AcpBackend] Received session update without update field:', params);
+      logger.debugLargeJson('[AcpBackend] Received session update without update field:', params);
       return;
     }
 
     const sessionUpdateType = update.sessionUpdate;
     const updateType = sessionUpdateType as string | undefined;
 
-    logger.debug(`[AcpBackend] sessionUpdate: ${sessionUpdateType}`, JSON.stringify(update));
+    logger.debugLargeJson(`[AcpBackend] sessionUpdate: ${sessionUpdateType}`, update);
     if (this.options.verbose) {
       logAcpBackendMuted(
         `Incoming raw session update from ${this.options.agentName}: ${JSON.stringify(update)}`,
@@ -1060,8 +1060,8 @@ export class AcpBackend implements AgentBackend {
     this.waitingForResponse = true;
 
     try {
-      logger.debug(`[AcpBackend] Sending prompt (length: ${prompt.length}): ${prompt.substring(0, 100)}...`);
-      logger.debug(`[AcpBackend] Full prompt: ${prompt}`);
+      logger.debug(`[AcpBackend] Sending prompt (length: ${prompt.length})`);
+      logger.debugLargeJson(`[AcpBackend] Prompt payload:`, { prompt });
       
       const contentBlock: ContentBlock = {
         type: 'text',
@@ -1073,7 +1073,7 @@ export class AcpBackend implements AgentBackend {
         prompt: [contentBlock],
       };
 
-      logger.debug(`[AcpBackend] Prompt request:`, JSON.stringify(promptRequest, null, 2));
+      logger.debugLargeJson(`[AcpBackend] Prompt request:`, promptRequest);
       await this.connection.prompt(promptRequest);
       logger.debug('[AcpBackend] Prompt request sent to ACP connection');
       
