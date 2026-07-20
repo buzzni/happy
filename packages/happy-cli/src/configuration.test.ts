@@ -48,4 +48,15 @@ describe('configuration URL fallback', () => {
     expect(configuration.webappUrl).toBe('https://app.example.com');
     cleanup();
   });
+
+  it('defaults serverUrl and webappUrl to saycode when no env or settings', async () => {
+    const { configuration, cleanup } = await loadConfiguration({
+      HAPPY_SERVER_URL: undefined,
+      HAPPY_WEBAPP_URL: undefined,
+    });
+
+    expect(configuration.serverUrl).toBe('https://saycode.ai');
+    expect(configuration.webappUrl).toBe('https://saycode.ai');
+    cleanup();
+  });
 });

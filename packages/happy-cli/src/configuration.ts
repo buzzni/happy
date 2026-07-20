@@ -58,12 +58,12 @@ class Configuration {
     this.serverUrl =
       process.env.HAPPY_SERVER_URL ||
       readSettingsStringSync(this.settingsFile, 'serverUrl') ||
-      'https://api.cluster-fluster.com'
+      'https://saycode.ai'
     this.webappUrl =
       process.env.HAPPY_WEBAPP_URL ||
       readSettingsStringSync(this.settingsFile, 'webappUrl') ||
       this.serverUrl ||
-      'https://app.happy.engineering'
+      'https://saycode.ai'
 
     this.isExperimentalEnabled = ['true', '1', 'yes'].includes(process.env.HAPPY_EXPERIMENTAL?.toLowerCase() || '');
     this.disableCaffeinate = ['true', '1', 'yes'].includes(process.env.HAPPY_DISABLE_CAFFEINATE?.toLowerCase() || '');
