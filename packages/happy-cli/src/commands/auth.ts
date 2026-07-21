@@ -1,5 +1,5 @@
 import chalk from 'chalk';
-import { readCredentials, clearCredentials, clearMachineId, readSettings } from '@/persistence';
+import { readCredentials, clearCredentials, clearMachineId, readSettings, updateSettings } from '@/persistence';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
 import { configuration } from '@/configuration';
 import { existsSync, rmSync } from 'node:fs';
@@ -38,13 +38,16 @@ function showAuthHelp(): void {
 ${chalk.bold('happy auth')} - Authentication management
 
 ${chalk.bold('Usage:')}
-  happy auth login [--force]    Authenticate with Happy
+  happy auth login [--force] [--server <url>]  Authenticate with Happy
   happy auth logout             Remove authentication and machine data
   happy auth status             Show authentication status
   happy auth help               Show this help message
 
 ${chalk.bold('Options:')}
-  --force    Clear credentials, machine ID, and stop daemon before re-auth
+  --force           Clear credentials, machine ID, and stop daemon before re-auth
+  --server <url>    Pair against a specific relay (e.g. a standalone zrok URL)
+                    instead of the default. Persisted to settings so the daemon
+                    uses it too. Switching relays usually needs --force as well.
 
 ${chalk.gray('PS: Your master secret never leaves your mobile/web device. Each CLI machine')}
 ${chalk.gray('receives only a derived key for per-machine encryption, so backup codes')}
@@ -54,6 +57,24 @@ ${chalk.gray('cannot be displayed from the CLI.')}
 
 async function handleAuthLogin(args: string[]): Promise<void> {
   const forceAuth = args.includes('--force') || args.includes('-f');
+
+  // `--server <url>`: 이번 로그인을 saycode 기본 릴레이가 아닌 임의 릴레이
+  // (예: standalone 의 zrok URL) 로 향하게 한다. 데몬은 별도 프로세스이므로
+  // settings 에도 영속화해 이후 daemon/CLI 가 같은 릴레이로 붙게 한다.
+  const serverIdx = args.findIndex((a) => a === '--server');
+  const serverArg = serverIdx >= 0 ? args[serverIdx + 1] : undefined;
+  if (serverArg && /^https?:\/\//.test(serverArg)) {
+    configuration.applyRelayOverride(serverArg);
+    await updateSettings((s) => ({
+      ...s,
+      serverUrl: configuration.serverUrl,
+      webappUrl: configuration.webappUrl,
+    }));
+    console.log(chalk.gray(`Relay: ${configuration.serverUrl}`));
+  } else if (serverIdx >= 0) {
+    console.error(chalk.red('--server requires an http(s) URL, e.g. --server https://<token>.share.zrok.io'));
+    process.exit(1);
+  }
 
   if (forceAuth) {
     // As per user's request: "--force-auth will clear credentials, clear machine ID, stop daemon"

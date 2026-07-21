@@ -11,8 +11,10 @@ import { join } from 'node:path'
 import packageJson from '../package.json'
 
 class Configuration {
-  public readonly serverUrl: string
-  public readonly webappUrl: string
+  // serverUrl/webappUrl 은 생성 시 env>settings>default 로 정해지지만,
+  // `happy auth login --server <url>` 같은 per-command override 를 위해 readonly 가 아니다.
+  public serverUrl: string
+  public webappUrl: string
   public readonly isDaemonProcess: boolean
 
   // Directories and paths (from persistence)
@@ -58,12 +60,12 @@ class Configuration {
     this.serverUrl =
       process.env.HAPPY_SERVER_URL ||
       readSettingsStringSync(this.settingsFile, 'serverUrl') ||
-      'https://api.cluster-fluster.com'
+      'https://saycode.ai'
     this.webappUrl =
       process.env.HAPPY_WEBAPP_URL ||
       readSettingsStringSync(this.settingsFile, 'webappUrl') ||
       this.serverUrl ||
-      'https://app.happy.engineering'
+      'https://saycode.ai'
 
     this.isExperimentalEnabled = ['true', '1', 'yes'].includes(process.env.HAPPY_EXPERIMENTAL?.toLowerCase() || '');
     this.disableCaffeinate = ['true', '1', 'yes'].includes(process.env.HAPPY_DISABLE_CAFFEINATE?.toLowerCase() || '');
@@ -83,6 +85,18 @@ class Configuration {
     if (!existsSync(this.logsDir)) {
       mkdirSync(this.logsDir, { recursive: true })
     }
+  }
+
+  /**
+   * Per-command relay override, e.g. `happy auth login --server <url>` (standalone
+   * zrok URL). serverUrl 과 webappUrl 을 함께 맞춰 /v1/auth/request 와 승인 URL 이 같은
+   * 릴레이를 가리키게 한다. 빈 문자열은 무시. 후행 슬래시 제거.
+   */
+  applyRelayOverride(url: string): void {
+    const trimmed = url.trim().replace(/\/+$/, '')
+    if (!trimmed) return
+    this.serverUrl = trimmed
+    this.webappUrl = trimmed
   }
 }
 
