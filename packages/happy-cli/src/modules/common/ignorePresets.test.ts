@@ -183,4 +183,12 @@ describe('createIgnoreMatcher — workspace-self preset (Phase 2)', () => {
         const matcher = createIgnoreMatcher({ presets: ['common'] })
         expect(matcher.shouldIgnore('home/coder/workspace/aplus-dev-studio/a/b/x.html')).toBe(false)
     })
+
+    it('ignores managed worktrees only at the workspace root', () => {
+        const matcher = createIgnoreMatcher()
+        expect(matcher.shouldIgnore('.aplus/worktrees')).toBe(true)
+        expect(matcher.shouldIgnore('.aplus/worktrees/proud-panda-lqra/frontend/App.tsx')).toBe(true)
+        expect(matcher.shouldIgnore('.aplus/uploads/chat-image.png')).toBe(false)
+        expect(matcher.shouldIgnore('docs/.aplus/worktrees/example.md')).toBe(false)
+    })
 })

@@ -116,6 +116,16 @@ describe('walkWorkspace', () => {
         expect(files).toContain('src/main.ts')
     })
 
+    it('does not descend into managed worktrees nested under the workspace root', async () => {
+        await write('src/main.ts')
+        await write('.aplus/worktrees/proud-panda-lqra/src/main.ts')
+        await write('.aplus/uploads/chat-image.png')
+        expect(await collectFiles()).toEqual([
+            '.aplus/uploads/chat-image.png',
+            'src/main.ts',
+        ])
+    })
+
     it('skips symbolic links entirely', async () => {
         await write('real/file.txt')
         await symlink(join(root, 'real'), join(root, 'link'))

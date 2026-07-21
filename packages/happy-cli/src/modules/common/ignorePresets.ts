@@ -120,7 +120,7 @@ const PRESETS: Record<PresetName, Preset> = {
         // auto-fix at deploy time. specs/workspace-cross-project-pollution/.
         segments: [],
         globs: [],
-        pathPrefixes: ['home/coder/workspace'],
+        pathPrefixes: ['home/coder/workspace', '.aplus/worktrees'],
     },
 }
 
