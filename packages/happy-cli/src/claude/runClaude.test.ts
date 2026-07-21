@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { CLAUDE_TITLE_INSTRUCTION } from './utils/titlePrompt';
 
 const {
     mockApiClientCreate,
@@ -129,6 +130,7 @@ async function startRemoteRunClaudeHarness(opts: {
             metadata = updater(metadata);
         }),
         sendClaudeSessionMessage: vi.fn(),
+        hasTitle: vi.fn(() => false),
         onUserMessage: vi.fn(),
         onFileEvent: vi.fn(),
         on: vi.fn(),
@@ -347,6 +349,7 @@ describe('runClaude remote JSONL scanner', () => {
             sendClaudeSessionMessage: vi.fn((message: unknown) => {
                 sentMessages.push(message);
             }),
+            hasTitle: vi.fn(() => false),
             onUserMessage: vi.fn(),
             onFileEvent: vi.fn(),
             on: vi.fn(),
@@ -456,6 +459,7 @@ describe('runClaude remote JSONL scanner', () => {
             sendClaudeSessionMessage: vi.fn((message: unknown) => {
                 sentMessages.push(message);
             }),
+            hasTitle: vi.fn(() => false),
             onUserMessage: vi.fn(),
             onFileEvent: vi.fn(),
             on: vi.fn(),
@@ -888,6 +892,40 @@ describe('runClaude remote JSONL scanner', () => {
 
         await expectPromptRejectsFast(handler({ action: 'clear' }), /not ready|thinking/i);
         expect(harness.loopOptions.messageQueue.queue).toEqual([]);
+        await harness.finish();
+    });
+
+    it('appends the change_title instruction to a user message while the chat has no title', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(false);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({ content: { text: '로그인 버튼이 안 눌려' }, meta: {} });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(1);
+        expect(queued[0].message.startsWith('로그인 버튼이 안 눌려')).toBe(true);
+        expect(queued[0].message).toContain(CLAUDE_TITLE_INSTRUCTION);
+        await harness.finish();
+    });
+
+    it('does not append the change_title instruction once the chat already has a title', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({ content: { text: 'fix the parser' }, meta: {} });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(1);
+        expect(queued[0].message).toBe('fix the parser');
+        expect(queued[0].message).not.toContain(CLAUDE_TITLE_INSTRUCTION);
         await harness.finish();
     });
 });
