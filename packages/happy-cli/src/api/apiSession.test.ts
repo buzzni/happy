@@ -1572,6 +1572,47 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect((client as any).pendingOutbox).toHaveLength(0);
     });
 
+    // Regression for the FORK BACKFILL corruption bug: enqueuing an entire
+    // historical transcript (hundreds of messages) synchronously used to post
+    // them newest-first once the backlog exceeded one batch, permanently
+    // assigning the lowest server seq to the newest content. Every consumer
+    // renders by seq, so that silently scrambled replayed history.
+    it('flushes a backlog larger than one batch in enqueue (oldest-first) order', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        (client as any).lastSeq = 0;
+
+        // The first enqueue synchronously kicks off flushOutbox, which awaits
+        // this still-pending POST — mirroring a real axios call still in
+        // flight while a synchronous loop keeps enqueueing behind it.
+        let resolveFirstPost: (value: unknown) => void = () => {};
+        const firstPostPromise = new Promise((resolve) => { resolveFirstPost = resolve; });
+        mockAxiosPost.mockImplementationOnce(() => firstPostPromise);
+
+        client.sendCodexMessage({ index: 0 });
+
+        // Pile up a backlog bigger than MAX_OUTBOX_BATCH_SIZE (50) while the
+        // first POST is still unresolved.
+        for (let i = 1; i <= 60; i += 1) {
+            client.sendCodexMessage({ index: i });
+        }
+        expect((client as any).pendingOutbox.length).toBe(61);
+
+        resolveFirstPost({ data: { messages: [{ id: 'm0', seq: 1, localId: 'l0', createdAt: 0, updatedAt: 0 }] } });
+        mockAxiosPost.mockResolvedValue({
+            data: { messages: [{ id: 'batch', seq: 51, localId: 'lb', createdAt: 0, updatedAt: 0 }] }
+        });
+
+        await waitForCheck(() => {
+            expect(mockAxiosPost.mock.calls.length).toBeGreaterThanOrEqual(2);
+        });
+
+        const secondBatch = mockAxiosPost.mock.calls[1][1].messages as Array<{ content: string }>;
+        const decoded = decrypt(session.encryptionKey, session.encryptionVariant, decodeBase64(secondBatch[0].content)) as {
+            content: { data: { index: number } }
+        };
+        expect(decoded.content.data.index).toBe(1);
+    });
+
     it('triggers receive catch-up fetch on socket reconnect', async () => {
         new ApiSessionClient('fake-token', session);
 

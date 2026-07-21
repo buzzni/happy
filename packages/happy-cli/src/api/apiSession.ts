@@ -907,12 +907,22 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private async flushOutbox() {
-        // Send latest messages first so the user sees recent activity immediately,
-        // then backfill older messages in subsequent batches.
+        // Post in enqueue (oldest-first) order. The server assigns each
+        // message's `seq` at insertion time, and every consumer (desktop,
+        // mobile) renders messages sorted by that seq — it is the only
+        // ordering signal they have. Posting newest-first (as this used to,
+        // to surface "recent activity" sooner) permanently assigns the
+        // *lowest* seq to the *newest* content once a backlog exceeds one
+        // batch, silently corrupting render order for the rest of the
+        // session's life. That backlog isn't hypothetical: FORK BACKFILL
+        // (runClaude.ts) enqueues an entire historical transcript — hundreds
+        // of messages — before the first flush ever runs. "Show recent
+        // activity fast" is already handled correctly on the read side via
+        // latest-first paginated loading (fetchLatestMessagesPage); nothing
+        // needs the write path to reorder.
         while (this.pendingOutbox.length > 0) {
             const batchSize = Math.min(this.pendingOutbox.length, ApiSessionClient.MAX_OUTBOX_BATCH_SIZE);
-            const batchStart = this.pendingOutbox.length - batchSize;
-            const batch = this.pendingOutbox.slice(batchStart);
+            const batch = this.pendingOutbox.slice(0, batchSize);
 
             const response = await axios.post<V3PostSessionMessagesResponse>(
                 `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/messages`,
@@ -930,7 +940,7 @@ export class ApiSessionClient extends EventEmitter {
                 message.seq > acc ? message.seq : acc
             ), this.lastSeq);
             this.lastSeq = maxSeq;
-            this.pendingOutbox.splice(batchStart, batch.length);
+            this.pendingOutbox.splice(0, batch.length);
         }
     }
 
