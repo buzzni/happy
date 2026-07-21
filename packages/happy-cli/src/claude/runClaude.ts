@@ -34,6 +34,7 @@ import {
 import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudePermissionMode, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
 import { applyAxOrchestration } from '@/orchestrator/prompts/integrate';
+import { appendClaudeTitleInstruction } from './utils/titlePrompt';
 import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
 import { fetchAplusMcpServersResult } from '@/aplus/fetchAplusMcpServers';
 import { mergeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
@@ -843,6 +844,25 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             }
         } catch (err) {
             logger.debug(`[ax] orchestration failed, falling through: ${(err as Error).message}`);
+        }
+
+        // Until the chat has a title, nudge the model to call `change_title`
+        // by appending the instruction to the turn it actually reads. The base
+        // system prompt carries the same instruction but the model routinely
+        // skips it while a long first turn runs; a message-level nudge (as the
+        // Codex backend already does) makes titling reliable. hasTitle() closes
+        // this once a title exists — including resumed sessions titled earlier —
+        // and the tool locks after the first set, so we never re-title.
+        //
+        // Only the model's copy changes; the app renders its own user bubble.
+        // recordAppPrompt() de-dupes the modified turn so the remote-mode JSONL
+        // scanner doesn't forward it back to the app as a second message.
+        if (!session.hasTitle()) {
+            const withTitle = appendClaudeTitleInstruction(pushText);
+            if (withTitle !== pushText) {
+                pushText = withTitle;
+                recordAppPrompt(pushText);
+            }
         }
 
         // Push with resolved permission mode, model, system prompts, and tools
