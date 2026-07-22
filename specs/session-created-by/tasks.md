@@ -28,10 +28,11 @@ T11(데스크톱 배선)은 happy-cli 쪽이 먼저 끝나야 검증 가능해�
 
 ## Phase 2: (structural) runClaude.ts → 공용 팩토리 통합
 
-- [ ] T5. (structural) `runClaude.ts:142-163`의 inline `freshMetadata` 구성을
+- [x] T5. (structural) `runClaude.ts:142-163`의 inline `freshMetadata` 구성을
       `createSessionMetadata()`(공용 팩토리) 호출로 교체. `mergeReconnectSessionMetadata` 등
-      나머지 로직은 그대로 유지 → 검증: 리팩토링 전후 `runClaude` 관련 기존 테스트 전부 통과,
-      동작 변경 없음 확인 후 별도 커밋(behavioral 변경과 분리)
+      나머지 로직은 그대로 유지 → 검증: `runClaude.test.ts` 16개 통과, 전체 유닛 스위트
+      137파일/1236개 통과, typecheck 통과. 이제 안 쓰는 `os`/`packageJson`/`projectPath`/
+      `resolve`/`Metadata` import 제거(고아 import — 이 변경으로 인한 것만)
 
 ## Phase 3: (behavioral) createdBy 필드 추가 + 5개 러너 배선
 
