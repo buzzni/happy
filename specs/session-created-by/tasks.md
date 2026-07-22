@@ -18,12 +18,13 @@ T11(데스크톱 배선)은 happy-cli 쪽이 먼저 끝나야 검증 가능해�
 - [x] T2. `apiMachine.ts:242-256`의 `spawn-happy-session` 핸들러 destructure에 두 필드 추가,
       `spawnSession()` 호출에 전달 → 검증: `apiMachine.spawnCreatedBy.test.ts` 2개 통과(있음/없음),
       typecheck 통과
-- [ ] T3. `run.ts`의 `spawnSession`(라인 484-503 부근)에서 `options.createdByAccountId`/
+- [x] T3. `run.ts`의 `spawnSession`(라인 484-503 부근)에서 `options.createdByAccountId`/
       `createdByDisplayName`이 있으면 `extraEnv.HAPPY_CREATED_BY_ACCOUNT_ID`/
-      `HAPPY_CREATED_BY_DISPLAY_NAME`을 채우는 조건 추가 → 검증: 없을 때 기존 env 키 목록과
-      동일(회귀 없음), 있을 때 두 키가 추가됨을 단위 테스트로 확인
-- [ ] T4. `sessionEnv.ts`의 `SESSION_LINEAGE_ENV_PREFIXES`에 `'HAPPY_CREATED_BY'` 추가 →
-      검증: `scrubSessionLineageEnv`가 해당 키를 스크럽하는 테스트 추가/통과
+      `HAPPY_CREATED_BY_DISPLAY_NAME`을 채우는 조건 추가 → 검증: 기존 `HAPPY_FORK*` 패턴과
+      동일한 조건부 대입이라 typecheck + 전체 스위트로 회귀 확인(closure라 격리 단위 테스트가
+      기존에도 없음 — T4/sessionEnv 쪽에서 스크럽 대상임을 검증)
+- [x] T4. `sessionEnv.ts`의 `SESSION_LINEAGE_ENV_PREFIXES`에 `'HAPPY_CREATED_BY'` 추가 →
+      검증: `sessionEnv.test.ts` 3개 통과(스크럽 대상 포함/prefix 목록에 포함), typecheck 통과
 
 ## Phase 2: (structural) runClaude.ts → 공용 팩토리 통합
 

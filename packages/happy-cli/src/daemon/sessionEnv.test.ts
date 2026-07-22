@@ -21,6 +21,8 @@ describe('scrubSessionLineageEnv', () => {
             HAPPY_FORKED_FROM_MESSAGE_ID: 'msg-1',
             HAPPY_FORK_CLAUDE_SESSION_ID: 'claude-1',
             HAPPY_FORK_CODEX_THREAD_ID: 'codex-1',
+            HAPPY_CREATED_BY_ACCOUNT_ID: 'acct-stale',
+            HAPPY_CREATED_BY_DISPLAY_NAME: 'Stale Name',
         }
         const scrubbed = scrubSessionLineageEnv(env)
         expect(scrubbed).toEqual({
@@ -39,5 +41,6 @@ describe('scrubSessionLineageEnv', () => {
     it('covers every lineage prefix used by spawn/resume paths', () => {
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_RECONNECT_')
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_FORK')
+        expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_CREATED_BY')
     })
 })
