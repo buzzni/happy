@@ -55,6 +55,8 @@ import {
   evaluateIdleStopGuard,
   resolveStopSessionMode,
   restoreSessionStartTimes,
+  readEmptySessionReaperMs,
+  sweepEmptySessions,
   sweepZombieSessions,
   type StopSessionContext,
   type StopSessionResult,
@@ -1090,6 +1092,7 @@ export async function startDaemon(): Promise<void> {
       ? heartbeatIntervalMsEnv
       : 60_000;
     const idleReaperConfig = readDaemonSessionIdleReaperConfig(process.env);
+    const emptySessionReaperMs = readEmptySessionReaperMs(process.env);
     let heartbeatRunning = false
     const restartOnStaleVersionAndHeartbeat = setInterval(async () => {
       if (heartbeatRunning) {
@@ -1126,6 +1129,19 @@ export async function startDaemon(): Promise<void> {
         silenceMs: idleStopGuardConfig.hardCapMs,
         logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
       });
+
+      // Reclaim never-used sessions (project opened, no prompt ever sent). These
+      // report a live-but-idle runtime forever, so neither the zombie sweep nor
+      // the turn-end reap catches them; without this they wait out the 24h cut.
+      if (emptySessionReaperMs !== undefined) {
+        sweepEmptySessions({
+          trackedSessions: getCurrentChildren(),
+          sessionStartTimes,
+          stopSession,
+          emptyReaperMs: emptySessionReaperMs,
+          logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
+        });
+      }
 
       if (!idleReaperConfig.disabled) {
         await runDaemonSessionIdleReaperTick({
