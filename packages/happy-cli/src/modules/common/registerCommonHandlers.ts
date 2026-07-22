@@ -170,6 +170,15 @@ export interface SpawnSessionOptions {
     parentSessionId?: string;
     /** Happy message id used as the rewind point (only set for "duplicate"). */
     forkedFromMessageId?: string;
+    /**
+     * Identity of the account that requested this spawn, as known by the
+     * client (e.g. the desktop app). Threaded into the new session's
+     * metadata as `createdBy` so shared-account orgs can approximate "my
+     * conversations" (specs/session-created-by). Not lineage — re-supplied
+     * on every spawn, never inherited from a previous process's env.
+     */
+    createdByAccountId?: string;
+    createdByDisplayName?: string;
 }
 
 export type SpawnSessionResult =

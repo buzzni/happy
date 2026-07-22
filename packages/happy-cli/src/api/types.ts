@@ -330,6 +330,13 @@ export type Metadata = {
   /** Lineage for sessions created via the fork / duplicate flow. */
   parentSessionId?: string
   forkedFromMessageId?: string
+  /**
+   * Identity of the account that requested this session's creation, as
+   * reported by the client (e.g. desktop app). Additive — absent on
+   * sessions created before this field existed and on any spawn that
+   * doesn't supply it (specs/session-created-by).
+   */
+  createdBy?: { accountId: string; displayName?: string }
 };
 
 export type AgentGoalStatus = {

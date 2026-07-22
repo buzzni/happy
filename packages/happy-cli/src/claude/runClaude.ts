@@ -1,11 +1,9 @@
-import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 
 import { ApiClient } from '@/api/api';
 import { logger } from '@/ui/logger';
 import { loop } from '@/claude/loop';
-import { AgentGoalStatus, AgentState, Metadata } from '@/api/types';
-import packageJson from '../../package.json';
+import { AgentGoalStatus, AgentState } from '@/api/types';
 import { Credentials, readSettings, SandboxConfigSchema } from '@/persistence';
 import { EnhancedMode, PermissionMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
@@ -19,8 +17,6 @@ import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { startHookServer } from '@/claude/utils/startHookServer';
 import { generateHookSettingsFile, cleanupHookSettingsFile } from '@/claude/utils/generateHookSettings';
 import { registerKillSessionHandler } from './registerKillSessionHandler';
-import { projectPath } from '../projectPath';
-import { resolve } from 'node:path';
 import { startOfflineReconnection, connectionState } from '@/utils/serverConnectionErrors';
 import { claudeLocal } from '@/claude/claudeLocal';
 import { createSessionScanner } from '@/claude/utils/sessionScanner';
@@ -47,6 +43,7 @@ import { RawJSONLinesSchema, type RawJSONLines } from './types';
 import { installBroadKillShims } from '@/utils/broadKillShims';
 import { readReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
+import { createSessionMetadata } from '@/utils/createSessionMetadata';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -138,29 +135,20 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Lineage from the daemon's spawn RPC (set by app-side fork / duplicate).
     const forkedFromSessionId = process.env.HAPPY_FORKED_FROM_SESSION_ID;
     const forkedFromMessageId = process.env.HAPPY_FORKED_FROM_MESSAGE_ID;
+    // Requester identity from the daemon's spawn RPC (specs/session-created-by).
+    const createdByAccountId = process.env.HAPPY_CREATED_BY_ACCOUNT_ID;
+    const createdByDisplayName = process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
 
-    const freshMetadata: Metadata = {
-        path: workingDirectory,
-        host: os.hostname(),
-        version: packageJson.version,
-        os: os.platform(),
-        machineId: machineId,
-        homeDir: os.homedir(),
-        happyHomeDir: configuration.happyHomeDir,
-        happyLibDir: projectPath(),
-        happyToolsDir: resolve(projectPath(), 'tools', 'unpacked'),
-        startedFromDaemon: options.startedBy === 'daemon',
-        hostPid: process.pid,
-        startedBy: options.startedBy || 'terminal',
-        // Initialize lifecycle state
-        lifecycleState: 'running',
-        lifecycleStateSince: Date.now(),
+    const { metadata: freshMetadata } = createSessionMetadata({
         flavor: 'claude',
-        sandbox: sandboxConfig?.enabled ? sandboxConfig : null,
+        machineId,
+        startedBy: options.startedBy,
+        sandbox: sandboxConfig,
         dangerouslySkipPermissions,
-        ...(forkedFromSessionId ? { parentSessionId: forkedFromSessionId } : {}),
-        ...(forkedFromMessageId ? { forkedFromMessageId } : {}),
-    };
+        parentSessionId: forkedFromSessionId,
+        forkedFromMessageId,
+        createdBy: createdByAccountId ? { accountId: createdByAccountId, displayName: createdByDisplayName } : undefined,
+    });
 
     // Resume-in-place must use the latest server document as its metadata
     // base. A fresh local document paired with the latest server version can

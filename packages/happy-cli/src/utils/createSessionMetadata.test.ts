@@ -83,4 +83,23 @@ describe('createSessionMetadata', () => {
         expect(metadata.parentSessionId).toBe('happy-source');
         expect(metadata.forkedFromMessageId).toBe('message-2');
     });
+
+    it('sets metadata.createdBy when provided', () => {
+        const { metadata } = createSessionMetadata({
+            flavor: 'claude',
+            machineId: 'machine-7',
+            createdBy: { accountId: 'acct-123', displayName: 'Ada' },
+        });
+
+        expect(metadata.createdBy).toEqual({ accountId: 'acct-123', displayName: 'Ada' });
+    });
+
+    it('omits metadata.createdBy when not provided (backward compatible)', () => {
+        const { metadata } = createSessionMetadata({
+            flavor: 'claude',
+            machineId: 'machine-8',
+        });
+
+        expect('createdBy' in metadata).toBe(false);
+    });
 });

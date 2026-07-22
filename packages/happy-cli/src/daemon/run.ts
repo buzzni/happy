@@ -501,6 +501,14 @@ export async function startDaemon(): Promise<void> {
         if (options.resumeCodexThreadId) {
           extraEnv.HAPPY_FORK_CODEX_THREAD_ID = options.resumeCodexThreadId;
         }
+        // Requester identity for the new session's metadata (specs/session-created-by).
+        // Re-supplied on every spawn, not lineage — see SESSION_LINEAGE_ENV_PREFIXES.
+        if (options.createdByAccountId) {
+          extraEnv.HAPPY_CREATED_BY_ACCOUNT_ID = options.createdByAccountId;
+        }
+        if (options.createdByDisplayName) {
+          extraEnv.HAPPY_CREATED_BY_DISPLAY_NAME = options.createdByDisplayName;
+        }
         logger.debug(`[DAEMON RUN] Environment variable keys (before expansion) (${Object.keys(extraEnv).length}): ${Object.keys(extraEnv).join(', ')}`);
 
         // Expand ${VAR} references from daemon's process.env

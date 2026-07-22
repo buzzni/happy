@@ -39,6 +39,8 @@ export interface CreateSessionMetadataOptions {
     parentSessionId?: string;
     /** Happy message id used as the fork rewind point. */
     forkedFromMessageId?: string;
+    /** Account that requested this spawn, if known by the caller. */
+    createdBy?: { accountId: string; displayName?: string };
 }
 
 /**
@@ -96,6 +98,7 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         dangerouslySkipPermissions: opts.dangerouslySkipPermissions ?? null,
         ...(opts.parentSessionId ? { parentSessionId: opts.parentSessionId } : {}),
         ...(opts.forkedFromMessageId ? { forkedFromMessageId: opts.forkedFromMessageId } : {}),
+        ...(opts.createdBy ? { createdBy: opts.createdBy } : {}),
     };
 
     return { state, metadata };
