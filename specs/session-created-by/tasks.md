@@ -36,10 +36,10 @@ T11(데스크톱 배선)은 happy-cli 쪽이 먼저 끝나야 검증 가능해�
 
 ## Phase 3: (behavioral) createdBy 필드 추가 + 5개 러너 배선
 
-- [ ] T6. `createSessionMetadata.ts`의 `CreateSessionMetadataOptions`에
-      `createdBy?: { accountId: string; displayName?: string }` 추가, `metadata` 조건부
-      스프레드(`...(opts.createdBy ? { createdBy: opts.createdBy } : {})`) → 검증:
-      `createSessionMetadata.test.ts`에 "있음/없음" 두 케이스
+- [x] T6. `Metadata` 타입(`api/types.ts`)과 `createSessionMetadata.ts`의
+      `CreateSessionMetadataOptions`에 `createdBy?: { accountId: string; displayName?: string }`
+      추가, `metadata` 조건부 스프레드 → 검증: `createSessionMetadata.test.ts` 8개 통과(신규
+      "있음/없음" 2케이스 포함), typecheck 통과
 - [ ] T7. `runClaude.ts`(T5로 팩토리 통합 완료 후) — `process.env.HAPPY_CREATED_BY_ACCOUNT_ID`/
       `HAPPY_CREATED_BY_DISPLAY_NAME`을 읽어 `createSessionMetadata()` 호출에 `createdBy` 전달 →
       검증: 스모크 테스트(env 있을 때 세션 metadata에 `createdBy` 포함)
