@@ -135,6 +135,9 @@ export async function runCodex(opts: {
     // Lineage from the daemon's spawn RPC (set by app-side fork / duplicate).
     const forkedFromSessionId = process.env.HAPPY_FORKED_FROM_SESSION_ID;
     const forkedFromMessageId = process.env.HAPPY_FORKED_FROM_MESSAGE_ID;
+    // Requester identity from the daemon's spawn RPC (specs/session-created-by).
+    const createdByAccountId = process.env.HAPPY_CREATED_BY_ACCOUNT_ID;
+    const createdByDisplayName = process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
 
     const { state, metadata: freshMetadata } = createSessionMetadata({
         flavor: 'codex',
@@ -144,6 +147,7 @@ export async function runCodex(opts: {
         dangerouslySkipPermissions: initialPermissionMode === 'yolo' || initialPermissionMode === 'bypassPermissions',
         ...(forkedFromSessionId ? { parentSessionId: forkedFromSessionId } : {}),
         ...(forkedFromMessageId ? { forkedFromMessageId } : {}),
+        ...(createdByAccountId ? { createdBy: { accountId: createdByAccountId, displayName: createdByDisplayName } } : {}),
     });
 
     const skillCommands = await discoverCodexSkillCommands();

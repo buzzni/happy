@@ -43,9 +43,15 @@ T11(데스크톱 배선)은 happy-cli 쪽이 먼저 끝나야 검증 가능해�
 - [x] T7. `runClaude.ts`(T5로 팩토리 통합 완료 후) — `process.env.HAPPY_CREATED_BY_ACCOUNT_ID`/
       `HAPPY_CREATED_BY_DISPLAY_NAME`을 읽어 `createSessionMetadata()` 호출에 `createdBy` 전달 →
       검증: `runClaude.test.ts`에 2케이스(있음/없음) 추가, 18개 전체 통과, typecheck 통과
-- [ ] T8. `runCodex.ts`에 동일 배선 → 검증: 동일 패턴 스모크 테스트
-- [ ] T9. `runGemini.ts`에 동일 배선 → 검증: 동일 패턴 스모크 테스트
-- [ ] T10. `runOpenClaw.ts` + `agent/acp/runAcp.ts`에 동일 배선 → 검증: 두 러너 각각 스모크 테스트
+- [x] T8. `runCodex.ts`에 동일 배선 → 검증: 이미 `createSessionMetadata()`를 쓰고 있어 T7과
+      동일한 2줄 패턴만 추가(fork lineage 조건부 스프레드 옆에 병렬로). 전용 harness 테스트
+      파일이 이 저장소에 원래 없어(runClaude만 예외) 신규로 만들지 않음 — `createSessionMetadata()`
+      자체는 T6에서 8케이스로 이미 검증됐고, env→옵션 전달이라는 동일 패턴이 T7에서 실증됨.
+      전체 유닛 스위트 회귀로 검증.
+- [x] T9. `runGemini.ts`에 동일 배선 → 검증: 동일(fork lineage 자체가 gemini엔 원래 없어
+      추가하지 않음, createdBy만 추가), 전체 유닛 스위트 회귀
+- [x] T10. `runOpenClaw.ts` + `agent/acp/runAcp.ts`에 동일 배선 → 검증: 동일, 전체 유닛
+      스위트 회귀. typecheck + 137파일/1240개 전체 통과(T6~T7 대비 +4 테스트)
 
 ## Phase 4: 데스크톱 쪽 배선 (cross-repo — aplus-dev-studio-desktop 저장소)
 

@@ -476,11 +476,16 @@ export async function runAcp(opts: {
     metadata: initialMachineMetadata,
   });
 
+  // Requester identity from the daemon's spawn RPC (specs/session-created-by).
+  const createdByAccountId = process.env.HAPPY_CREATED_BY_ACCOUNT_ID;
+  const createdByDisplayName = process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
+
   const { state, metadata } = createSessionMetadata({
     flavor: resolveSessionFlavor(opts.agentName),
     machineId: settings.machineId,
     startedBy: opts.startedBy,
     sandbox: settings.sandboxConfig,
+    ...(createdByAccountId ? { createdBy: { accountId: createdByAccountId, displayName: createdByDisplayName } } : {}),
   });
   const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
   if (response) {
