@@ -1,5 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SandboxConfig } from '@/persistence';
+import { mapCodexMcpMessageToSessionEnvelopes } from './utils/sessionProtocolMapper';
 
 const {
     mockExecSync,
@@ -1886,6 +1887,141 @@ describe('CodexAppServerClient sandbox integration', () => {
             expect.objectContaining({ type: 'agent_message', message: 'done' }),
         ]));
         expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(1);
+
+        await client.disconnect();
+    });
+
+    it('defers terminal completion until a command started by the turn completes', async () => {
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        const proc = createMockProcess({
+            pid: 3002,
+            onRequest: (msg, stdout) => {
+                appServerStdout = stdout;
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { thread: { id: 'thread-delayed-command', path: '/tmp/thread-delayed-command' } },
+                        });
+                    }, 0);
+                }
+
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-delayed-command' } } });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: { threadId: 'thread-delayed-command', turn: { id: 'turn-delayed-command' } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'item/started',
+                            params: {
+                                threadId: 'thread-delayed-command',
+                                turnId: 'turn-delayed-command',
+                                item: {
+                                    type: 'commandExecution', id: 'call-delayed', command: 'sleep 1', cwd: '/tmp', status: 'inProgress',
+                                },
+                            },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'item/completed',
+                            params: {
+                                threadId: 'thread-delayed-command',
+                                turnId: 'turn-delayed-command',
+                                item: { type: 'agentMessage', id: 'final-delayed', text: 'final answer', phase: 'final_answer' },
+                            },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'thread/status/changed',
+                            params: { threadId: 'thread-delayed-command', status: { type: 'idle' } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: {
+                                threadId: 'thread-delayed-command',
+                                turn: { id: 'turn-delayed-command', status: 'failed', error: 'provider failed' },
+                            },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: {
+                                threadId: 'thread-delayed-command',
+                                turn: { id: 'turn-stale', status: 'completed', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((msg) => events.push(msg as Record<string, unknown>));
+
+        await client.connect();
+        await client.startThread({ model: 'gpt-test', cwd: '/tmp', approvalPolicy: 'never', sandbox: 'danger-full-access' });
+
+        let settled = false;
+        const completion = client.sendTurnAndWait('run delayed command').then((result) => {
+            settled = true;
+            return result;
+        });
+        await waitFor(() => events.some((event) => event.type === 'exec_command_begin'));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        expect(events.some((event) => event.type === 'task_complete')).toBe(false);
+        expect(settled).toBe(false);
+
+        pushJsonLine(appServerStdout!, {
+            method: 'item/completed',
+            params: {
+                threadId: 'thread-delayed-command',
+                turnId: 'turn-delayed-command',
+                item: {
+                    type: 'commandExecution', id: 'call-delayed', command: 'sleep 1', cwd: '/tmp',
+                    aggregatedOutput: '', exitCode: 0, durationMs: 1, status: 'completed',
+                },
+            },
+        });
+
+        await expect(completion).resolves.toEqual({ aborted: false });
+        const commandEndIndex = events.findIndex((event) => event.type === 'exec_command_end');
+        const terminalIndex = events.findIndex((event) => event.type === 'task_complete');
+        expect(commandEndIndex).toBeGreaterThanOrEqual(0);
+        expect(terminalIndex).toBeGreaterThan(commandEndIndex);
+        expect(events[terminalIndex]).toEqual(expect.objectContaining({
+            type: 'task_complete',
+            status: 'failed',
+            error: 'provider failed',
+        }));
+
+        let mapperState = {
+            currentTurnId: null as string | null,
+            currentProviderTurnId: null as string | null,
+        };
+        const sessionEnvelopes = events.flatMap((event) => {
+            const mapped = mapCodexMcpMessageToSessionEnvelopes(event, mapperState);
+            mapperState = mapped;
+            return mapped.envelopes;
+        });
+        const lifecycleEnvelopes = sessionEnvelopes.filter((envelope) => (
+            envelope.ev.t === 'turn-start'
+            || envelope.ev.t === 'tool-call-start'
+            || envelope.ev.t === 'tool-call-end'
+            || envelope.ev.t === 'turn-end'
+        ));
+        expect(lifecycleEnvelopes.map((envelope) => envelope.ev.t)).toEqual([
+            'turn-start',
+            'tool-call-start',
+            'tool-call-end',
+            'turn-end',
+        ]);
+        expect(new Set(lifecycleEnvelopes.map((envelope) => envelope.turn))).toEqual(
+            new Set([lifecycleEnvelopes[0].turn]),
+        );
+        expect(lifecycleEnvelopes[0].turn).toEqual(expect.any(String));
 
         await client.disconnect();
     });
