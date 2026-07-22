@@ -61,6 +61,44 @@ Server extracts CUID from JWT via app.authenticate decorator
 | GitHub | Stored foreign key | Enables profile linking and account recovery via OAuth |
 | AI vendors | Stored encrypted | User-owned keys, need to be retrievable |
 
+## Session `createdBy` (shared-account orgs)
+
+Some orgs share one Happy account/token across multiple humans on one desktop
+client, so a session's row has no per-human author by default — the CUID above
+identifies the *account*, not which person at the keyboard started a given
+session.
+
+`Metadata.createdBy = { accountId, displayName }` closes that gap additively,
+without a new CUID or auth flow:
+
+```
+Desktop app (knows the human via its own login UI)
+  │
+  ├─ spawn-happy-session RPC { ..., createdByAccountId, createdByDisplayName }
+  ▼
+happy-cli daemon (packages/happy-cli/src/daemon/run.ts)
+  │
+  ├─ sets HAPPY_CREATED_BY_ACCOUNT_ID / HAPPY_CREATED_BY_DISPLAY_NAME on the
+  │  spawned process env (same lineage-style passthrough as
+  │  HAPPY_FORKED_FROM_SESSION_ID — re-supplied per spawn, scrubbed from
+  │  SESSION_LINEAGE_ENV_PREFIXES so a daemon restart never leaks a stale
+  │  value into an unrelated session)
+  ▼
+Backend runner (claude/codex/gemini/openclaw/acp)
+  │
+  ├─ createSessionMetadata({ ..., createdBy: { accountId, displayName } })
+  ▼
+metadata.createdBy persisted encrypted, same as any other Metadata field —
+happy-server never inspects it (metadata is an opaque string server-side)
+```
+
+`accountId` here is caller-supplied, not independently verified against the
+CUID above — the daemon trusts whatever the requesting client sends, exactly
+as it already does for `parentSessionId`/`forkedFromMessageId`. Sessions
+created before this field existed, or by a client that doesn't send it, simply
+omit `createdBy` — there is no retroactive backfill (see
+`vendor/happy/specs/session-created-by/spec.md` non-goals).
+
 ## Local Scripting
 
 To derive an ElevenLabs user ID from a Happy CUID locally:

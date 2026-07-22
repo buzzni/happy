@@ -68,6 +68,13 @@ T11(데스크톱 배선)은 happy-cli 쪽이 먼저 끝나야 검증 가능해�
       데스크톱 `tasks.md`/`context.md` 갱신 완료. 단, happy-cli 릴리스+버전 pin이 아직 안 끝나서
       T14를 실제로 완료할 수는 없음 — 그건 별도 승인 필요한 절차
 
+## Phase 5: 문서화
+
+- [x] T13. `docs/user-identity.md`에 "Session `createdBy` (shared-account orgs)" 절 추가 —
+      전체 흐름(데스크톱→RPC→daemon env→러너→metadata), `accountId`가 CUID처럼 서버 검증되는
+      게 아니라 호출자가 보낸 값을 신뢰하는 것뿐이라는 점, 소급 적용 불가(비목표)를 명시 →
+      검증: 문서 리뷰(코드 변경 없음, typecheck/테스트 영향 없음)
+
 ## 승인 대기 중인 추가 작업 (스코프 확장 제안)
 
 - [ ] (제안) happy-cli 릴리스(버전 bump·태그·`npm publish`) — 이 spec의 구현이 끝난 뒤,

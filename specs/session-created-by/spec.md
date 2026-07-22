@@ -72,11 +72,14 @@ additive로 기록한다.
 
 ## 완료 기준 (Definition of Done)
 
-- [ ] R1~R6에 대응하는 테스트 존재 및 통과(`apiMachine`, `run.ts` spawn 경로, 5개 백엔드
-      러너 각각의 metadata 생성 테스트)
-- [ ] `pnpm -C packages/happy-cli typecheck` / lint 통과
-- [ ] `docs/user-identity.md` 또는 `docs/session-protocol.md`에 `createdBy` 필드 반영
-      (어디에 적을지는 plan.md에서 결정)
-- [ ] `specs/desktop-conversation-search/tasks.md`의 T14가 이 spec 완료를 전제로 재개 가능한
-      상태(데스크톱 쪽 `SpawnSessionOptions`/RPC 콜에 필드가 추가되어 있어야 함 — 이 부분은
-      데스크톱 저장소 쪽 작업이므로 이 spec의 tasks.md에도 "cross-repo" 표시로 포함)
+- [x] R1~R6에 대응하는 테스트 존재 및 통과(`apiMachine.spawnCreatedBy.test.ts`,
+      `sessionEnv.test.ts`, `createSessionMetadata.test.ts`, `runClaude.test.ts` — codex/gemini/
+      openclaw/acp 4개는 전용 harness가 원래 없어 전체 유닛 스위트 회귀로 대체 검증, context.md
+      "발견된 문제" 참고)
+- [x] `pnpm -C packages/happy-cli typecheck` / lint 통과 (매 태스크마다 확인, 최종
+      137파일/1240개 전체 유닛 스위트 통과)
+- [x] `docs/user-identity.md`에 `createdBy` 필드 반영("Session `createdBy` (shared-account
+      orgs)" 절, T13)
+- [x] `specs/desktop-conversation-search/tasks.md`의 T14가 이 spec 완료를 전제로 재개 가능한
+      상태(데스크톱 쪽 `SpawnSessionParams`/RPC 콜에 필드 추가 완료, 커밋 3a9c729) — 단
+      happy-cli 릴리스 + 데스크톱 버전 pin이 남아 있어 T14 자체는 아직 미완료(별도 승인 필요)

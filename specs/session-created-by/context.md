@@ -1,6 +1,6 @@
 # 세션 생성자(createdBy) metadata 기록 Context
 
-> 마지막 갱신: 2026-07-22 / 상태: 진행중(Phase 4 완료, Phase 5 진행 여부 확인 대기)
+> 마지막 갱신: 2026-07-22 / 상태: 구현·문서화 완료, 릴리스 승인 대기
 > 목적: 다음 세션의 Claude가 이 파일 하나만 읽고 즉시 이어서 작업할 수 있게 한다.
 
 ## 현재 상태 (3~5문장)
@@ -16,8 +16,11 @@ Phase 1(T1~T4)·Phase 2(T5)에 이어 Phase 3(T6~T10)까지 완료 — happy-cli
 7개 커밋(be89583c, 35685df1, 60a349e9, a94bdad7, fd039726, d27beb50, 4f59d90f). Phase 4(T11~T12,
 cross-repo)도 완료: 데스크톱의 `createDesktopProjectSession`이 `createdByAccountId`/
 `createdByDisplayName`을 spawn RPC에 실어 보내도록 배선(데스크톱 저장소 커밋 3a9c729, 전체
-스위트 194파일/2183개 통과), `specs/desktop-conversation-search`의 T14 상태도 갱신. 남은 건
-Phase 5(문서화)와 — 별도 승인이 필요한 — 실제 happy-cli 릴리스 + 데스크톱 버전 pin.
+스위트 194파일/2183개 통과), `specs/desktop-conversation-search`의 T14 상태도 갱신. Phase 5(T13,
+문서화)도 완료: `docs/user-identity.md`에 "Session `createdBy` (shared-account orgs)" 절 추가
+(커밋 대상, 아래 참고). **이 spec의 구현·문서화는 전부 끝났다.** 남은 건 이 spec 범위 밖인
+실제 happy-cli 릴리스(버전 bump·태그·`npm publish`) + 데스크톱의 happy-cli 버전 pin 갱신 —
+둘 다 사용자의 별도 명시적 승인이 필요.
 
 ## 핵심 결정 로그 (누적, 최신이 위)
 
@@ -60,9 +63,15 @@ Phase 5(문서화)와 — 별도 승인이 필요한 — 실제 happy-cli 릴리
 
 ## 다음 세션 시작점
 
-1. 사용자 승인 확인 후 `tasks.md`의 T1부터 순서대로 진행 (Phase 1: RPC 파라미터 → env 스레딩)
-2. T1은 `packages/happy-cli/src/modules/common/registerCommonHandlers.ts:140`의
-   `SpawnSessionOptions` interface에 두 optional 필드를 추가하는 것부터
+1. 이 spec 자체(T1~T13)는 완료. 다음 단계는 **사용자에게 릴리스 승인을 받는 것**:
+   - happy-cli 버전 bump(`packages/happy-cli/package.json`) → `docs/happy-cli-release.md`
+     런북대로 `happy-cli-v<version>` 태그 push → GitHub Actions가 빌드·가드·publish
+   - 릴리스 완료 후 데스크톱 저장소에서 happy-cli 버전 pin 갱신
+     (`specs/happy-runtime-pin-aplus-56`/`-60` 전례 참고)
+2. 그 다음에야 데스크톱 `specs/desktop-conversation-search`의 T14(파서 `apiSessionToSession`
+   관용 처리 + `conversationSearchScope`의 `createdByAccountId` 연결)를 완료할 수 있다.
+3. 브랜치 `keen-panda-bjgb`는 아직 `main`에 머지/PR되지 않았다 — 릴리스 승인 전에 먼저
+   PR 생성 여부를 사용자에게 확인할 것.
 
 ## 파일 맵
 
