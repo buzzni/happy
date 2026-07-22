@@ -61,6 +61,13 @@ type PendingRequest = {
 
 type LegacyPatchChanges = Record<string, Record<string, unknown>>;
 
+type DeferredRawTurnCompletion = {
+    turnId: string | null;
+    status: string | null;
+    error: unknown;
+    source: string;
+};
+
 export type ApprovalHandler = (params: {
     type: 'exec' | 'patch' | 'mcp';
     callId: string;
@@ -238,6 +245,11 @@ export class CodexAppServerClient {
     private notificationProtocol: 'unknown' | 'legacy' | 'raw' = 'unknown';
     private completedTurnIds = new Set<string>();
     private rawFileChangesByItemId = new Map<string, LegacyPatchChanges>();
+    // Codex can report turn/completed before its commandExecution item has
+    // completed. Keep the terminal event behind that item's end so consumers
+    // receive one well-formed turn: tool start → tool end → turn end.
+    private openCommandExecutionTurns = new Map<string, string | null>();
+    private deferredRawTurnCompletion: DeferredRawTurnCompletion | null = null;
 
     // Last known startup status per MCP server (name -> status, e.g. 'ready'/'starting'/'failed').
     // Used to explain a watchdog-forced abort: a turn can hang building its tool
@@ -365,6 +377,52 @@ export class CodexAppServerClient {
         });
     }
 
+    private hasOpenCommandsForTurn(turnId: string | null): boolean {
+        for (const commandTurnId of this.openCommandExecutionTurns.values()) {
+            if (!turnId || !commandTurnId || commandTurnId === turnId) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private emitOrDeferRawTurnCompletion(
+        turnId: string | null,
+        status: string | null,
+        error: unknown,
+        source: string,
+    ): void {
+        if (!this.matchesPendingTurn(turnId)) {
+            logger.debug(
+                `[CodexAppServer] Ignoring ${source} for turn ${turnId}; terminal event is deferred for another turn`,
+            );
+            return;
+        }
+        if (this.deferredRawTurnCompletion) {
+            // final_answer and idle are fallback completion signals. Preserve
+            // the authoritative turn/completed status when it arrives while a
+            // command is still draining.
+            if (source === 'turn/completed') {
+                this.deferredRawTurnCompletion = { turnId, status, error, source };
+            }
+            return;
+        }
+        if (this.hasOpenCommandsForTurn(turnId)) {
+            this.deferredRawTurnCompletion = { turnId, status, error, source };
+            return;
+        }
+        this.emitRawTurnCompletion(turnId, status, error, source);
+    }
+
+    private flushDeferredRawTurnCompletion(): void {
+        const deferred = this.deferredRawTurnCompletion;
+        if (!deferred || this.hasOpenCommandsForTurn(deferred.turnId)) {
+            return;
+        }
+        this.deferredRawTurnCompletion = null;
+        this.emitRawTurnCompletion(deferred.turnId, deferred.status, deferred.error, deferred.source);
+    }
+
     private handleRawNotification(method: string, params: any): boolean {
         if (!this.shouldHandleRawNotification(method)) {
             return false;
@@ -385,7 +443,7 @@ export class CodexAppServerClient {
         }
 
         if (method === 'turn/completed') {
-            this.emitRawTurnCompletion(
+            this.emitOrDeferRawTurnCompletion(
                 this.extractTurnId(params),
                 this.extractTurnStatus(params),
                 params?.turn?.error ?? params?.error,
@@ -404,7 +462,7 @@ export class CodexAppServerClient {
                 && pending?.turnId
                 && pending.turnIdConfirmed
                 && pending.startedTurnId === pending.turnId) {
-                this.emitRawTurnCompletion(pending.turnId, 'completed', null, method);
+                this.emitOrDeferRawTurnCompletion(pending.turnId, 'completed', null, method);
             }
             return true;
         }
@@ -450,6 +508,9 @@ export class CodexAppServerClient {
 
         if (method === 'item/started' && item.type === 'commandExecution') {
             const callId = typeof item.id === 'string' ? item.id : '';
+            if (callId) {
+                this.openCommandExecutionTurns.set(callId, this.extractTurnId(params));
+            }
             this.eventHandler?.({
                 type: 'exec_command_begin',
                 call_id: callId,
@@ -474,6 +535,10 @@ export class CodexAppServerClient {
                 cwd: item.cwd,
                 command: item.command,
             });
+            if (callId) {
+                this.openCommandExecutionTurns.delete(callId);
+            }
+            this.flushDeferredRawTurnCompletion();
             return true;
         }
 
@@ -522,7 +587,7 @@ export class CodexAppServerClient {
             }
 
             if (item.phase === 'final_answer' && this.pendingTurnCompletion) {
-                this.emitRawTurnCompletion(
+                this.emitOrDeferRawTurnCompletion(
                     this.extractTurnId(params),
                     'completed',
                     null,
@@ -945,6 +1010,8 @@ export class CodexAppServerClient {
         }
         this.pendingTurnCompletion.resolve(aborted);
         this.pendingTurnCompletion = null;
+        this.openCommandExecutionTurns.clear();
+        this.deferredRawTurnCompletion = null;
     }
 
     private schedulePendingTurnInactivityTimeout(): void {
