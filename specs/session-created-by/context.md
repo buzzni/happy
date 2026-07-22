@@ -1,6 +1,6 @@
 # 세션 생성자(createdBy) metadata 기록 Context
 
-> 마지막 갱신: 2026-07-22 / 상태: 구현·문서화 완료, 릴리스 승인 대기
+> 마지막 갱신: 2026-07-22 / 상태: PR #99 오픈(https://github.com/buzzni/happy/pull/99), 리뷰·릴리스 승인 대기
 > 목적: 다음 세션의 Claude가 이 파일 하나만 읽고 즉시 이어서 작업할 수 있게 한다.
 
 ## 현재 상태 (3~5문장)
@@ -41,6 +41,11 @@ cross-repo)도 완료: 데스크톱의 `createDesktopProjectSession`이 `created
 - [2026-07-22] 실제 npm 릴리스는 이 spec의 완료 기준에서 제외 / 이유: `AGENTS.md`의 "Happy CLI
   Release Publisher" 정책상 외부 릴리스 뮤테이션은 항상 직전 별도 승인이 필요함. 구현·테스트
   통과까지만 이 spec 책임, 릴리스는 승인 대기 작업으로 tasks.md에 분리해 둠.
+- [2026-07-22] 원래 작업하던 `keen-panda-bjgb` 브랜치가 아니라 `main` 기준 새 브랜치
+  `session-created-by`에서 9개 커밋을 cherry-pick해 PR #99를 열었다 / 이유: `keen-panda-bjgb`에
+  이미 무관한 PR #98("Fix Codex terminal and tool event ordering")이 열려 있어서, 그대로
+  push하면 이 작업이 그 PR에 섞여 들어갔을 것. `keen-panda-bjgb`는 원래 상태(로컬에 커밋은
+  남아있지만 push 안 함)로 되돌려 PR #98을 건드리지 않음.
 
 ## 시도했으나 실패한 접근 ⚠️
 
@@ -63,15 +68,14 @@ cross-repo)도 완료: 데스크톱의 `createDesktopProjectSession`이 `created
 
 ## 다음 세션 시작점
 
-1. 이 spec 자체(T1~T13)는 완료. 다음 단계는 **사용자에게 릴리스 승인을 받는 것**:
+1. 이 spec 자체(T1~T13)는 완료, **PR #99가 `main`에 오픈된 상태**(리뷰 대기). 다음 단계는
+   PR 리뷰/머지 후 **사용자에게 릴리스 승인을 받는 것**:
    - happy-cli 버전 bump(`packages/happy-cli/package.json`) → `docs/happy-cli-release.md`
      런북대로 `happy-cli-v<version>` 태그 push → GitHub Actions가 빌드·가드·publish
    - 릴리스 완료 후 데스크톱 저장소에서 happy-cli 버전 pin 갱신
      (`specs/happy-runtime-pin-aplus-56`/`-60` 전례 참고)
 2. 그 다음에야 데스크톱 `specs/desktop-conversation-search`의 T14(파서 `apiSessionToSession`
    관용 처리 + `conversationSearchScope`의 `createdByAccountId` 연결)를 완료할 수 있다.
-3. 브랜치 `keen-panda-bjgb`는 아직 `main`에 머지/PR되지 않았다 — 릴리스 승인 전에 먼저
-   PR 생성 여부를 사용자에게 확인할 것.
 
 ## 파일 맵
 
