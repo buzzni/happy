@@ -55,13 +55,18 @@ T11(데스크톱 배선)은 happy-cli 쪽이 먼저 끝나야 검증 가능해�
 
 ## Phase 4: 데스크톱 쪽 배선 (cross-repo — aplus-dev-studio-desktop 저장소)
 
-- [ ] T11. (cross-repo) 데스크톱 `SpawnHappySessionInput`/`SpawnSessionParams`
-      (`src/sync/sessionCreation.ts`, `sessionCreationModel.ts`)에 `createdByAccountId`/
-      `createdByDisplayName` optional 필드 추가, `createSessionForProject`가
-      `extractAccountIdFromHappyJwt(auth.token) ?? auth.userId` / `auth.username`으로 채워
-      RPC 호출에 포함 → 검증: `sessionCreation.test.ts`류에 신규 케이스
-- [ ] T12. (cross-repo) 완료 시 `specs/desktop-conversation-search/tasks.md`의 T14를
-      "차단 해제"로 갱신하고 그 쪽에서 파서(`apiSessionToSession`)·검색 스코프 연결 진행
+- [x] T11. (cross-repo) 데스크톱 `SpawnSessionParams`(`sessionCreationModel.ts`)에
+      `createdByAccountId`/`createdByDisplayName` optional 필드 추가 + `buildSpawnSessionParams`
+      전달, `createDesktopProjectSession`(`sessionCreation.ts`)이
+      `extractAccountIdFromHappyJwt(auth.token) || auth.userId` / `auth.username`으로 채워
+      spawn 호출에 포함(원래 계획한 `createSessionForProject`가 아니라 그 아래 계층인
+      `createDesktopProjectSession`에서 처리 — auth를 이미 갖고 있어 호출부 변경 불필요) →
+      검증: 신규 `sessionCreationModel.test.ts`(2케이스) + `sessionCreation.test.ts`(1케이스),
+      데스크톱 전체 스위트 194파일/2183개 통과, typecheck 통과
+- [x] T12. (cross-repo) 완료 시 `specs/desktop-conversation-search/tasks.md`의 T14를
+      "차단 해제"로 갱신하고 그 쪽에서 파서(`apiSessionToSession`)·검색 스코프 연결 진행 →
+      데스크톱 `tasks.md`/`context.md` 갱신 완료. 단, happy-cli 릴리스+버전 pin이 아직 안 끝나서
+      T14를 실제로 완료할 수는 없음 — 그건 별도 승인 필요한 절차
 
 ## 승인 대기 중인 추가 작업 (스코프 확장 제안)
 

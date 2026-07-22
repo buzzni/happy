@@ -1,6 +1,6 @@
 # 세션 생성자(createdBy) metadata 기록 Context
 
-> 마지막 갱신: 2026-07-22 / 상태: 계획 수립 완료, 구현 착수 전(승인 대기)
+> 마지막 갱신: 2026-07-22 / 상태: 진행중(Phase 4 완료, Phase 5 진행 여부 확인 대기)
 > 목적: 다음 세션의 Claude가 이 파일 하나만 읽고 즉시 이어서 작업할 수 있게 한다.
 
 ## 현재 상태 (3~5문장)
@@ -9,7 +9,15 @@
 T14가 필요로 하는 `createdBy` metadata를 데스크톱 단독으로는 심을 통로가 없다는 게 확인되어
 (REST에 metadata 갱신 엔드포인트 없음, spawn RPC 파라미터 닫힌 스키마, `update-session` 소켓
 이벤트는 서버→클라이언트 단방향), 이 vendor/happy 저장소 쪽에 별도 spec으로 분리했다.
-spec.md/plan.md/tasks.md까지 작성 완료, 아직 코드 작업은 시작 안 함(Phase 1 승인 대기).
+Phase 1(T1~T4)·Phase 2(T5)에 이어 Phase 3(T6~T10)까지 완료 — happy-cli 쪽 구현은 이제 끝났다.
+`Metadata.createdBy`/`createSessionMetadata()`에 필드 추가(T6) → claude/codex/gemini/openclaw/acp
+5개 백엔드 러너 전부가 `HAPPY_CREATED_BY_ACCOUNT_ID`/`_DISPLAY_NAME` env를 읽어 metadata에
+반영(T7~T10). typecheck 통과, 전체 유닛 스위트 137파일/1240개 통과. 브랜치 `keen-panda-bjgb`에
+7개 커밋(be89583c, 35685df1, 60a349e9, a94bdad7, fd039726, d27beb50, 4f59d90f). Phase 4(T11~T12,
+cross-repo)도 완료: 데스크톱의 `createDesktopProjectSession`이 `createdByAccountId`/
+`createdByDisplayName`을 spawn RPC에 실어 보내도록 배선(데스크톱 저장소 커밋 3a9c729, 전체
+스위트 194파일/2183개 통과), `specs/desktop-conversation-search`의 T14 상태도 갱신. 남은 건
+Phase 5(문서화)와 — 별도 승인이 필요한 — 실제 happy-cli 릴리스 + 데스크톱 버전 pin.
 
 ## 핵심 결정 로그 (누적, 최신이 위)
 
@@ -36,6 +44,12 @@ spec.md/plan.md/tasks.md까지 작성 완료, 아직 코드 작업은 시작 안
 (아직 없음 — 구현 미착수)
 
 ## 발견된 문제 / 열린 질문
+
+- T8~T10(codex/gemini/openclaw/acp)은 `runClaude.test.ts`급 전용 harness 테스트가 없다 —
+  이 저장소에 원래 그 4개 러너의 세션-생성 진입점을 도는 단위 테스트 자체가 없었다(runClaude만
+  예외적으로 있었음). 새로 harness를 만드는 대신 `createSessionMetadata()` 자체의 커버리지(T6,
+  8케이스)와 동일 패턴이 실증된 T7로 대체 검증하고 전체 스위트 회귀로 확인했다. 더 강한 보증이
+  필요해지면 각 러너에 `runClaude.test.ts`와 같은 harness를 만드는 걸 별도 작업으로 제안할 것.
 
 - fork된 세션이 "원래 생성자"를 승계해야 하는지, 아니면 "fork를 트리거한 사람"으로 다시
   채워야 하는지는 이번 스코프에서 후자로 결정했지만(R4/비목표), 실제 사용 패턴을 보고
