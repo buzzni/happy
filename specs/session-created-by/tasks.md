@@ -12,11 +12,12 @@ T11(데스크톱 배선)은 happy-cli 쪽이 먼저 끝나야 검증 가능해�
 
 ## Phase 1: RPC 파라미터 → 환경변수 스레딩
 
-- [ ] T1. `SpawnSessionOptions`(`src/modules/common/registerCommonHandlers.ts:140`)에
+- [x] T1. `SpawnSessionOptions`(`src/modules/common/registerCommonHandlers.ts:140`)에
       `createdByAccountId?: string`, `createdByDisplayName?: string` 추가 →
-      검증: 타입 체크 통과
-- [ ] T2. `apiMachine.ts:242-256`의 `spawn-happy-session` 핸들러 destructure에 두 필드 추가,
-      `spawnSession()` 호출에 전달 → 검증: 신규 단위 테스트(핸들러가 필드를 옵션에 실어 넘기는지)
+      검증: 타입 체크 통과 (커밋 be89583c)
+- [x] T2. `apiMachine.ts:242-256`의 `spawn-happy-session` 핸들러 destructure에 두 필드 추가,
+      `spawnSession()` 호출에 전달 → 검증: `apiMachine.spawnCreatedBy.test.ts` 2개 통과(있음/없음),
+      typecheck 통과
 - [ ] T3. `run.ts`의 `spawnSession`(라인 484-503 부근)에서 `options.createdByAccountId`/
       `createdByDisplayName`이 있으면 `extraEnv.HAPPY_CREATED_BY_ACCOUNT_ID`/
       `HAPPY_CREATED_BY_DISPLAY_NAME`을 채우는 조건 추가 → 검증: 없을 때 기존 env 키 목록과

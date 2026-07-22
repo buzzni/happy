@@ -253,6 +253,8 @@ export class ApiMachineClient {
                 resumeCodexThreadId,
                 parentSessionId,
                 forkedFromMessageId,
+                createdByAccountId,
+                createdByDisplayName,
             } = params || {};
             logger.debug(`[API MACHINE] Spawning session: dir=${directory}, hasUserCreds=${!!(happyToken && happySecret)}`);
 
@@ -274,6 +276,8 @@ export class ApiMachineClient {
                 resumeCodexThreadId,
                 parentSessionId,
                 forkedFromMessageId,
+                createdByAccountId,
+                createdByDisplayName,
             });
 
             switch (result.type) {
