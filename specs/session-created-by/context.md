@@ -1,6 +1,7 @@
 # 세션 생성자(createdBy) metadata 기록 Context
 
-> 마지막 갱신: 2026-07-22 / 상태: PR #99 오픈(https://github.com/buzzni/happy/pull/99), 리뷰·릴리스 승인 대기
+> 마지막 갱신: 2026-07-23 / 상태: **완료.** PR #99 머지 + `happy-cli-v1.1.10-aplus.67` 릴리스
+> (npm 배포 확인) + 데스크톱 버전 pin 갱신 + 데스크톱 파서/검색 스코프 소비까지 전부 끝남.
 > 목적: 다음 세션의 Claude가 이 파일 하나만 읽고 즉시 이어서 작업할 수 있게 한다.
 
 ## 현재 상태 (3~5문장)
@@ -68,14 +69,19 @@ cross-repo)도 완료: 데스크톱의 `createDesktopProjectSession`이 `created
 
 ## 다음 세션 시작점
 
-1. 이 spec 자체(T1~T13)는 완료, **PR #99가 `main`에 오픈된 상태**(리뷰 대기). 다음 단계는
-   PR 리뷰/머지 후 **사용자에게 릴리스 승인을 받는 것**:
-   - happy-cli 버전 bump(`packages/happy-cli/package.json`) → `docs/happy-cli-release.md`
-     런북대로 `happy-cli-v<version>` 태그 push → GitHub Actions가 빌드·가드·publish
-   - 릴리스 완료 후 데스크톱 저장소에서 happy-cli 버전 pin 갱신
-     (`specs/happy-runtime-pin-aplus-56`/`-60` 전례 참고)
-2. 그 다음에야 데스크톱 `specs/desktop-conversation-search`의 T14(파서 `apiSessionToSession`
-   관용 처리 + `conversationSearchScope`의 `createdByAccountId` 연결)를 완료할 수 있다.
+**이 spec은 완전히 종료됐다 — 재개할 것 없음.** 진행 기록(추적용):
+
+1. PR #99가 `main`에 머지됨(PR #98 Codex 순서 수정도 함께).
+2. `packages/happy-cli/package.json`을 `1.1.10-aplus.67`로 bump → 로컬 빌드+테스트(137파일/
+   1240개) 통과 확인 → `main`에 직접 커밋+push → `happy-cli-v1.1.10-aplus.67` 태그 push →
+   GitHub Actions `Publish @buzzni/happy-cli`(run 29929973385) 성공 → `npm view
+   @buzzni/happy-cli@1.1.10-aplus.67 version`으로 레지스트리 반영 실측 확인.
+3. 데스크톱 `config/happy-runtime-pin.json`을 `.67`로 갱신, standalone runtime 재staging,
+   전체 회귀(198파일/2238개) 통과 (`specs/happy-runtime-pin-aplus-67` 참고).
+4. 데스크톱 `specs/desktop-conversation-search`의 T14 완료: `apiSessionToSession`
+   (`src/sync/messageParser.ts`)이 `createdBy`를 additive로 파싱, `GlobalSearchPanel`이
+   `filterSessionsToMine`에 실제 `createdBy?.accountId`를 전달하도록 배선(이전엔 하드코딩된
+   `null`이었음). R9(a/b/c) 전부 구현 완료.
 
 ## 파일 맵
 
