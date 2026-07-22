@@ -36,6 +36,7 @@ import { ensureDaemonRunning } from './daemon/ensureDaemonRunning'
 import { handleCodexCommand } from './commands/codexCommand'
 import { runPreToolUseCli } from './hooks/runPreToolUseCli'
 import { preflightDaemonControlServer } from './daemon/controlServer'
+import { resolveMcpConfigPresetUrl } from './aplus/mcpConfigPresets'
 
 
 (async () => {
@@ -515,11 +516,25 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       return
 
     } else if (daemonSubcommand === 'start') {
+      // Optional preset name (e.g. `happy daemon start saycode`) resolves to
+      // HAPPY_APLUS_MCP_CONFIG_URL so it doesn't need to be exported by hand.
+      // An explicitly set env var always wins over the preset.
+      let daemonEnv = process.env
+      const mcpConfigPreset = args[2]
+      if (mcpConfigPreset && !process.env.HAPPY_APLUS_MCP_CONFIG_URL) {
+        const presetUrl = resolveMcpConfigPresetUrl(mcpConfigPreset)
+        if (!presetUrl) {
+          console.error(`Unknown mcp-config preset: ${mcpConfigPreset}`)
+          process.exit(1)
+        }
+        daemonEnv = { ...process.env, HAPPY_APLUS_MCP_CONFIG_URL: presetUrl }
+      }
+
       // Spawn detached daemon process
       const child = spawnHappyCLI(['daemon', 'start-sync'], {
         detached: true,
         stdio: 'ignore',
-        env: process.env
+        env: daemonEnv
       });
       child.unref();
 
@@ -580,10 +595,11 @@ Conversation history is preserved on the server, but in-flight tool calls are in
 ${chalk.bold('happy daemon')} - Daemon management
 
 ${chalk.bold('Usage:')}
-  happy daemon start              Start the daemon (detached)
-  happy daemon stop               Stop the daemon (sessions stay alive)
-  happy daemon status             Show daemon status
-  happy daemon list               List active sessions
+  happy daemon start [preset]     Start the daemon (detached). Optional preset
+                                   (e.g. "saycode") sets HAPPY_APLUS_MCP_CONFIG_URL.
+  happy daemon stop                Stop the daemon (sessions stay alive)
+  happy daemon status              Show daemon status
+  happy daemon list                List active sessions
 
   If you want to kill all happy related processes run 
   ${chalk.cyan('happy doctor clean')}
