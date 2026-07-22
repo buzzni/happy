@@ -40,9 +40,9 @@ T11(데스크톱 배선)은 happy-cli 쪽이 먼저 끝나야 검증 가능해�
       `CreateSessionMetadataOptions`에 `createdBy?: { accountId: string; displayName?: string }`
       추가, `metadata` 조건부 스프레드 → 검증: `createSessionMetadata.test.ts` 8개 통과(신규
       "있음/없음" 2케이스 포함), typecheck 통과
-- [ ] T7. `runClaude.ts`(T5로 팩토리 통합 완료 후) — `process.env.HAPPY_CREATED_BY_ACCOUNT_ID`/
+- [x] T7. `runClaude.ts`(T5로 팩토리 통합 완료 후) — `process.env.HAPPY_CREATED_BY_ACCOUNT_ID`/
       `HAPPY_CREATED_BY_DISPLAY_NAME`을 읽어 `createSessionMetadata()` 호출에 `createdBy` 전달 →
-      검증: 스모크 테스트(env 있을 때 세션 metadata에 `createdBy` 포함)
+      검증: `runClaude.test.ts`에 2케이스(있음/없음) 추가, 18개 전체 통과, typecheck 통과
 - [ ] T8. `runCodex.ts`에 동일 배선 → 검증: 동일 패턴 스모크 테스트
 - [ ] T9. `runGemini.ts`에 동일 배선 → 검증: 동일 패턴 스모크 테스트
 - [ ] T10. `runOpenClaw.ts` + `agent/acp/runAcp.ts`에 동일 배선 → 검증: 두 러너 각각 스모크 테스트

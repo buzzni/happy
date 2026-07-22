@@ -135,6 +135,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Lineage from the daemon's spawn RPC (set by app-side fork / duplicate).
     const forkedFromSessionId = process.env.HAPPY_FORKED_FROM_SESSION_ID;
     const forkedFromMessageId = process.env.HAPPY_FORKED_FROM_MESSAGE_ID;
+    // Requester identity from the daemon's spawn RPC (specs/session-created-by).
+    const createdByAccountId = process.env.HAPPY_CREATED_BY_ACCOUNT_ID;
+    const createdByDisplayName = process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
 
     const { metadata: freshMetadata } = createSessionMetadata({
         flavor: 'claude',
@@ -144,6 +147,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         dangerouslySkipPermissions,
         parentSessionId: forkedFromSessionId,
         forkedFromMessageId,
+        createdBy: createdByAccountId ? { accountId: createdByAccountId, displayName: createdByDisplayName } : undefined,
     });
 
     // Resume-in-place must use the latest server document as its metadata

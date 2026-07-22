@@ -254,6 +254,8 @@ describe('runClaude remote JSONL scanner', () => {
         delete process.env.HAPPY_FORKED_FROM_SESSION_ID;
         delete process.env.HAPPY_FORKED_FROM_MESSAGE_ID;
         delete process.env.HAPPY_FORK_CLAUDE_SESSION_ID;
+        delete process.env.HAPPY_CREATED_BY_ACCOUNT_ID;
+        delete process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
 
         mockReadSettings.mockResolvedValue({
             machineId: 'machine-1',
@@ -335,6 +337,30 @@ describe('runClaude remote JSONL scanner', () => {
             }),
             expect.any(Object),
         );
+
+        await harness.finish();
+    });
+
+    it('includes createdBy in fresh session metadata when the daemon supplies it', async () => {
+        process.env.HAPPY_CREATED_BY_ACCOUNT_ID = 'acct-123';
+        process.env.HAPPY_CREATED_BY_DISPLAY_NAME = 'Ada';
+
+        const harness = await startRemoteRunClaudeHarness();
+
+        expect(harness.api.getOrCreateSession).toHaveBeenCalledWith(expect.objectContaining({
+            metadata: expect.objectContaining({
+                createdBy: { accountId: 'acct-123', displayName: 'Ada' },
+            }),
+        }));
+
+        await harness.finish();
+    });
+
+    it('omits createdBy from fresh session metadata when not supplied (backward compatible)', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+
+        const call = (harness.api.getOrCreateSession as any).mock.calls.at(-1)?.[0];
+        expect(call.metadata.createdBy).toBeUndefined();
 
         await harness.finish();
     });
