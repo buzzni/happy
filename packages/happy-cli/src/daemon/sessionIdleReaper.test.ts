@@ -6,15 +6,18 @@ import {
   DEFAULT_IDLE_STOP_MIN_SESSION_AGE_MS,
   DEFAULT_IDLE_STOP_PRESENCE_STALE_MS,
   DEFAULT_IDLE_STOP_RECENT_INTERACTION_MS,
+  DEFAULT_SESSION_EMPTY_REAPER_MS,
   DEFAULT_SESSION_TURN_END_REAPER_MS,
   buildDaemonSessionIdleReaperRequest,
   evaluateIdleStopGuard,
   isPolicyStopSource,
   readDaemonSessionIdleReaperConfig,
+  readEmptySessionReaperMs,
   readIdleStopGuardConfig,
   restoreSessionStartTimes,
   resolveStopSessionMode,
   runDaemonSessionIdleReaperTick,
+  sweepEmptySessions,
   sweepZombieSessions,
   type IdleStopGuardConfig,
 } from './sessionIdleReaper';
@@ -458,6 +461,116 @@ describe('sweepZombieSessions', () => {
 
     expect(stopped).toBe(0);
     expect(stopSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('sweepEmptySessions', () => {
+  const now = 10_000_000;
+  const emptyReaperMs = 15 * 60 * 1000;
+  const idleRuntime = (updatedAt: number): SessionRuntimeState => ({
+    thinking: false,
+    hasOpenToolCall: false,
+    pendingUserInput: false,
+    mode: 'remote',
+    updatedAt,
+  });
+
+  it('stops a never-used session older than the threshold with if-idle semantics', () => {
+    const stopSession = vi.fn(() => ({ stopped: true as const }));
+    const stopped = sweepEmptySessions({
+      trackedSessions: [tracked({ pid: 100, happySessionId: 'empty', runtime: idleRuntime(now - 1_000) })],
+      sessionStartTimes: new Map([[100, now - emptyReaperMs - 1]]),
+      stopSession,
+      now,
+      emptyReaperMs,
+    });
+
+    expect(stopped).toBe(1);
+    expect(stopSession).toHaveBeenCalledWith('empty', { source: 'session-empty-reaper', reason: 'never-used', mode: 'if-idle' });
+  });
+
+  it('leaves a session younger than the threshold alone', () => {
+    const stopSession = vi.fn(() => ({ stopped: true as const }));
+    const stopped = sweepEmptySessions({
+      trackedSessions: [tracked({ pid: 100, happySessionId: 'young', runtime: idleRuntime(now - 1_000) })],
+      sessionStartTimes: new Map([[100, now - emptyReaperMs + 60_000]]),
+      stopSession,
+      now,
+      emptyReaperMs,
+    });
+
+    expect(stopped).toBe(0);
+    expect(stopSession).not.toHaveBeenCalled();
+  });
+
+  it('never reaps a session that has any usage history', () => {
+    const stopSession = vi.fn(() => ({ stopped: true as const }));
+    const oldStart = new Map([[100, now - emptyReaperMs - 1]]);
+    const cases: SessionRuntimeState[] = [
+      { ...idleRuntime(now - 1_000), lastUserInteractionAt: now - 60_000 },
+      { ...idleRuntime(now - 1_000), lastTurnEndAt: now - 60_000 },
+      { ...idleRuntime(now - 1_000), launchedBackgroundJob: true },
+      { ...idleRuntime(now - 1_000), thinking: true },
+      { ...idleRuntime(now - 1_000), hasOpenToolCall: true },
+      { ...idleRuntime(now - 1_000), pendingUserInput: true },
+    ];
+    for (const runtime of cases) {
+      const stopped = sweepEmptySessions({
+        trackedSessions: [tracked({ pid: 100, happySessionId: 's', runtime })],
+        sessionStartTimes: oldStart,
+        stopSession,
+        now,
+        emptyReaperMs,
+      });
+      expect(stopped).toBe(0);
+    }
+    expect(stopSession).not.toHaveBeenCalled();
+  });
+
+  it('leaves a session with no runtime report to the guard/absolute cut', () => {
+    const stopSession = vi.fn(() => ({ stopped: true as const }));
+    const stopped = sweepEmptySessions({
+      trackedSessions: [tracked({ pid: 100, happySessionId: 'norep' })],
+      sessionStartTimes: new Map([[100, now - emptyReaperMs - 1]]),
+      stopSession,
+      now,
+      emptyReaperMs,
+    });
+
+    expect(stopped).toBe(0);
+    expect(stopSession).not.toHaveBeenCalled();
+  });
+
+  it('does not count a session the guard refuses to stop', () => {
+    const stopSession = vi.fn(() => ({ stopped: false as const, reason: 'active' as const, guard: 'local-session', activity: { thinking: false, hasOpenToolCall: false, pendingUserInput: false } }));
+    const stopped = sweepEmptySessions({
+      trackedSessions: [tracked({ pid: 100, happySessionId: 'guarded', runtime: idleRuntime(now - 1_000) })],
+      sessionStartTimes: new Map([[100, now - emptyReaperMs - 1]]),
+      stopSession,
+      now,
+      emptyReaperMs,
+    });
+
+    expect(stopped).toBe(0);
+    expect(stopSession).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('readEmptySessionReaperMs', () => {
+  it('defaults to 15 minutes', () => {
+    expect(readEmptySessionReaperMs({})).toBe(DEFAULT_SESSION_EMPTY_REAPER_MS);
+  });
+
+  it('honors a positive override', () => {
+    expect(readEmptySessionReaperMs({ HAPPY_DAEMON_SESSION_EMPTY_REAPER_MS: '600000' })).toBe(600_000);
+  });
+
+  it('treats 0 as disabled', () => {
+    expect(readEmptySessionReaperMs({ HAPPY_DAEMON_SESSION_EMPTY_REAPER_MS: '0' })).toBeUndefined();
+  });
+
+  it('falls back to the default on invalid input', () => {
+    expect(readEmptySessionReaperMs({ HAPPY_DAEMON_SESSION_EMPTY_REAPER_MS: 'abc' })).toBe(DEFAULT_SESSION_EMPTY_REAPER_MS);
   });
 });
 

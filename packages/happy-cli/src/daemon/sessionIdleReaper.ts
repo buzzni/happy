@@ -9,6 +9,11 @@ export const DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS = 24 * 60 * 60 * 1000;
  *  reclaimed early (SIGTERM — resumable). Conversations that launched a
  *  background job are exempt and fall back to the absolute idle cut above. */
 export const DEFAULT_SESSION_TURN_END_REAPER_MS = 60 * 60 * 1000;
+/** A session the user opened but never interacted with (no prompt ever started
+ *  a turn, no turn ever completed) is reclaimed after this long. Neither the
+ *  turn-end reap (needs a turn-end) nor the zombie sweep (needs runtime silence)
+ *  catches it, so without this it would sit until the multi-day absolute cut. */
+export const DEFAULT_SESSION_EMPTY_REAPER_MS = 15 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_MIN_SESSION_AGE_MS = 10 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_HARD_CAP_MS = 2 * 60 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_PRESENCE_STALE_MS = 5 * 60 * 1000;
@@ -126,7 +131,7 @@ export type StopSessionResult =
   | { stopped: false; reason: 'not-found' }
   | { stopped: false; reason: 'active'; guard: string; activity: IdleStopGuardActivity };
 
-const POLICY_STOP_SOURCES = new Set(['project-session-idle-stop', 'session-idle-reaper', 'session-zombie-sweep']);
+const POLICY_STOP_SOURCES = new Set(['project-session-idle-stop', 'session-idle-reaper', 'session-zombie-sweep', 'session-empty-reaper']);
 
 /** True when a stop source is a background cleanup policy rather than a user action. */
 export function isPolicyStopSource(source: unknown): boolean {
@@ -441,6 +446,71 @@ export function sweepZombieSessions(input: {
       stopped += 1;
       input.logDebug?.(
         `[session-zombie-sweep] stopped ${session.happySessionId} (no runtime report for ${Math.round((now - lastEvidenceAt) / 60_000)}m)`,
+      );
+    }
+  }
+
+  return stopped;
+}
+
+/**
+ * Read the empty-session reap window from env. Returns the default (15m) when
+ * unset, the override when a positive value is given, and `undefined` (feature
+ * off) when explicitly set to 0.
+ */
+export function readEmptySessionReaperMs(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const raw = parseOptionalMs(env.HAPPY_DAEMON_SESSION_EMPTY_REAPER_MS);
+  if (raw === undefined) return DEFAULT_SESSION_EMPTY_REAPER_MS;
+  return raw > 0 ? raw : undefined;
+}
+
+/**
+ * Daemon-local reap of never-used sessions: a session the user opened (project
+ * spawned) but never interacted with — no prompt ever started a turn
+ * (`lastUserInteractionAt` absent), no turn ever completed (`lastTurnEndAt`
+ * absent), and no background job launched. Such a session reports a live-but-idle
+ * runtime forever, so neither the turn-end reap (needs `lastTurnEndAt`) nor the
+ * zombie sweep (needs runtime silence) reclaims it — without this it sits until
+ * the multi-day absolute idle cut. A missing runtime is left alone (spawn in
+ * flight / recovered) and handled by the guard's stale-runtime protection. Stops
+ * are if-idle, so `evaluateIdleStopGuard` re-validates each one (min session age,
+ * local-mode protection, freshly-busy).
+ */
+export function sweepEmptySessions(input: {
+  trackedSessions: readonly TrackedSession[];
+  sessionStartTimes: ReadonlyMap<number, number>;
+  stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
+  now?: number;
+  emptyReaperMs?: number;
+  logDebug?: (message: string) => void;
+}): number {
+  const now = input.now ?? Date.now();
+  const emptyReaperMs = input.emptyReaperMs ?? DEFAULT_SESSION_EMPTY_REAPER_MS;
+  let stopped = 0;
+
+  for (const session of input.trackedSessions) {
+    if (!session.happySessionId) continue;
+    if (!resolveStoppableAgent(session)) continue;
+
+    const runtime = session.runtime;
+    if (!runtime) continue;
+    if (runtime.thinking || runtime.hasOpenToolCall || runtime.pendingUserInput) continue;
+    if (runtime.lastUserInteractionAt !== undefined) continue;
+    if (runtime.lastTurnEndAt !== undefined) continue;
+    if (runtime.launchedBackgroundJob) continue;
+
+    const startedAt = input.sessionStartTimes.get(session.pid);
+    if (startedAt === undefined || now - startedAt < emptyReaperMs) continue;
+
+    const stopResult = input.stopSession(session.happySessionId, {
+      source: 'session-empty-reaper',
+      reason: 'never-used',
+      mode: 'if-idle',
+    });
+    if (stopResult.stopped) {
+      stopped += 1;
+      input.logDebug?.(
+        `[session-empty-reaper] stopped ${session.happySessionId} (never used, alive ${Math.round((now - startedAt) / 60_000)}m)`,
       );
     }
   }

@@ -103,6 +103,13 @@ being redesigned to stop killing in-use sessions — see
 `docs/superpowers/specs/2026-07-04-session-idle-cleanup-guardrails-design.md`
 for the activity-signal / stop-guard / grace-window design.
 
+Never-used sessions (project opened, no prompt ever sent) report a live-but-idle
+runtime forever, so neither the turn-end reap (needs `lastTurnEndAt`) nor the
+zombie sweep (needs runtime silence) reclaims them — they would otherwise sit
+until the 24h absolute cut. `sweepEmptySessions` (heartbeat-local, if-idle so the
+stop guard re-validates) reaps them after `HAPPY_DAEMON_SESSION_EMPTY_REAPER_MS`
+(default 15m; `0` disables).
+
 ## 3. HTTP Control Server
 
 Local HTTP server (127.0.0.1 only) provides:
