@@ -50,6 +50,17 @@ export function exponentialBackoffDelay(currentFailureCount: number, minDelay: n
 
 export type BackoffFunc = <T>(callback: () => Promise<T>) => Promise<T>;
 
+/**
+ * Total attempts allowed for a 404/410 before the backoff aborts.
+ *
+ * A 404 is NOT proof the session is gone: happy-server returns the same 404
+ * for "row deleted" and "row exists under another account" (2026-07-23
+ * incident: the session was alive, the credentials were mismatched), and a
+ * replica/LB lookup miss can 404 transiently. A short bounded retry rules out
+ * the transient case; the bound keeps the #64 guarantee (no unbounded loop).
+ */
+export const SESSION_GONE_MAX_ATTEMPTS = 3;
+
 export function createBackoff(
     opts?: {
         onError?: (e: any, failuresCount: number) => void,
@@ -61,7 +72,12 @@ export function createBackoff(
          * true the backoff loop aborts and rethrows instead of retrying forever.
          * Defaults to {@link isNonRetryableError} (axios 4xx except 408/429).
          */
-        isNonRetryable?: (e: unknown) => boolean
+        isNonRetryable?: (e: unknown) => boolean,
+        /**
+         * Total attempts allowed for session-gone-class errors (404/410)
+         * before aborting. Defaults to {@link SESSION_GONE_MAX_ATTEMPTS}.
+         */
+        sessionGoneMaxAttempts?: number
     }): BackoffFunc {
     return async <T>(callback: () => Promise<T>): Promise<T> => {
         let currentFailureCount = 0;
@@ -69,6 +85,9 @@ export function createBackoff(
         const maxDelay = opts && opts.maxDelay !== undefined ? opts.maxDelay : 1000;
         const maxFailureCount = opts && opts.maxFailureCount !== undefined ? opts.maxFailureCount : 50;
         const isNonRetryable = opts && opts.isNonRetryable !== undefined ? opts.isNonRetryable : isNonRetryableError;
+        const sessionGoneMaxAttempts = opts && opts.sessionGoneMaxAttempts !== undefined
+            ? opts.sessionGoneMaxAttempts
+            : SESSION_GONE_MAX_ATTEMPTS;
         while (true) {
             try {
                 return await callback();
@@ -79,9 +98,16 @@ export function createBackoff(
                 if (opts && opts.onError) {
                     opts.onError(e, currentFailureCount);
                 }
-                // Permanent failures (e.g. 404 after a session is archived/deleted)
-                // would otherwise be retried indefinitely — abort and let the caller decide.
+                // Permanent failures would otherwise be retried indefinitely —
+                // abort and let the caller decide. Exception: 404/410 get a
+                // short bounded retry first, because the same 404 covers
+                // deleted-row, account-mismatch, and transient lookup miss.
                 if (isNonRetryable(e)) {
+                    if (isSessionGoneError(e) && currentFailureCount < sessionGoneMaxAttempts) {
+                        await delay(exponentialBackoffDelay(currentFailureCount, minDelay, maxDelay, maxFailureCount));
+                        continue;
+                    }
+                    logger.debug(`[BACKOFF] non-retryable error, aborting after ${currentFailureCount} attempt(s):`, (e as Error)?.message || e);
                     throw e;
                 }
                 let waitForRequest = exponentialBackoffDelay(currentFailureCount, minDelay, maxDelay, maxFailureCount);
