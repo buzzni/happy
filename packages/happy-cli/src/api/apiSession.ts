@@ -807,15 +807,18 @@ export class ApiSessionClient extends EventEmitter {
             return;
         }
         this.syncFatalHandled = true;
-        // 404/410 → the session row is gone server-side; stamping archive
-        // metadata is what the user expects (and is a no-op anyway). Other
-        // non-retryable 4xx (401/403/400) may be environmental — an expired
-        // token or a misbehaving proxy — so still tear down (this sync
-        // direction is dead either way) but tell listeners NOT to mark the
-        // session archived, keeping it resumable once the issue clears.
-        const sessionGone = isSessionGoneError(error);
-        logger.debug(`[SOCKET] ${which} sync stopped on non-retryable error (sessionGone=${sessionGone}), exiting session:`, error);
-        this.emit('archived', { stampArchive: sessionGone });
+        // A sync 404/410 is NOT proof the session row is gone: happy-server
+        // returns the identical 404 for "row deleted" and "row exists under
+        // another account" (2026-07-23 incident — the session was alive, the
+        // credentials were mismatched), and the bounded retry in backoff has
+        // already ruled out a transient lookup miss. Tear the session down
+        // either way (this sync direction is dead), but NEVER stamp archive
+        // from a 404 alone — archive is only confirmed by explicit signals
+        // (archive ephemeral, durable session-end recheck). The session stays
+        // resumable once the credential/server issue clears.
+        const sessionUnreachable = isSessionGoneError(error);
+        logger.debug(`[SOCKET] ${which} sync stopped on non-retryable error (sessionUnreachable=${sessionUnreachable}), exiting session without archive stamp:`, error);
+        this.emit('archived', { stampArchive: false });
     }
 
     /**

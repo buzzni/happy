@@ -26,7 +26,9 @@ import {
   isPidAlive,
   readPersistedSessions,
   persistSession,
+  readCredentials,
 } from '@/persistence';
+import { decideResumeCredentials, readStagedTokenFromHomeDir } from './resumeCredentials';
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { preflightDaemonControlServer, startDaemonControlServer } from './controlServer';
@@ -237,7 +239,12 @@ export async function startDaemon(): Promise<void> {
       const liveHomeDirs = Array.from(pidToTrackedSession.values())
         .map((s) => s.userHomeDir)
         .filter((d): d is string => typeof d === 'string');
-      const removed = await sweepOrphanUserHomeDirs(liveHomeDirs);
+      // Resumable sessions keep their staged identity across restarts
+      // (2026-07-23 incident) — their dirs are claimed, not orphans.
+      const resumableHomeDirs = Object.values(readPersistedSessions())
+        .map((s) => s.userHomeDir)
+        .filter((d): d is string => typeof d === 'string');
+      const removed = await sweepOrphanUserHomeDirs([...liveHomeDirs, ...resumableHomeDirs]);
       if (removed.length > 0) {
         logger.debug(`[DAEMON RUN] Swept ${removed.length} orphan user home dir(s) from /tmp`);
       }
@@ -262,6 +269,7 @@ export async function startDaemon(): Promise<void> {
           agentStateVersion: s.agentStateVersion,
         },
         pid: 0,
+        userHomeDir: s.userHomeDir,
       });
     }
     if (Object.keys(persisted).length > 0) {
@@ -796,16 +804,17 @@ export async function startDaemon(): Promise<void> {
           agentStateVersion: session.encryption.agentStateVersion,
           metadata: session.happySessionMetadataFromLocalWebhook,
           savedAt: Date.now(),
+          userHomeDir: session.userHomeDir,
         });
       }
       logger.debug(`[DAEMON RUN] Preserved session ${session.happySessionId} for resume (${reason})`);
       return true;
     };
 
-    const fetchServerSessionSnapshot = async (sessionId: string, encryption: SessionEncryptionData): Promise<ServerSessionSnapshot | null> => {
+    const fetchServerSessionSnapshot = async (sessionId: string, encryption: SessionEncryptionData, token?: string): Promise<ServerSessionSnapshot | null> => {
       try {
         const response = await axios.get(`${configuration.serverUrl}/v1/sessions`, {
-          headers: { Authorization: `Bearer ${credentials.token}` },
+          headers: { Authorization: `Bearer ${token ?? credentials.token}` },
           timeout: 10_000,
         });
         return parseServerSessionSnapshot(
@@ -832,10 +841,30 @@ export async function startDaemon(): Promise<void> {
           return { type: 'error', errorMessage: `Session ${happySessionId} has no stored encryption data. It was likely started before this feature was available. Restart the daemon and start a new session to enable resume.` };
         }
 
+        // 2026-07-23 incident: pin preflight and child to ONE identity.
+        // A child that syncs under a different account than the session owner
+        // gets identical-looking 404s and exits — never spawn that child.
+        const diskCredentials = await readCredentials();
+        const credentialDecision = decideResumeCredentials({
+          trackedUserHomeDir: tracked.userHomeDir,
+          stagedToken: tracked.userHomeDir ? await readStagedTokenFromHomeDir(tracked.userHomeDir) : null,
+          daemonToken: credentials.token,
+          diskToken: diskCredentials?.token ?? null,
+        });
+        if (credentialDecision.kind === 'refuse') {
+          return {
+            type: 'error',
+            errorMessage: `Cannot resume session ${happySessionId}: ${credentialDecision.reason}`,
+          };
+        }
+
         // Webhook metadata and seq may be stale after the original child exits.
         // Fetch a fresh server snapshot before resuming so the child skips only
         // messages that already exist and starts listening from the latest seq.
-        const serverSnapshot = await fetchServerSessionSnapshot(happySessionId, tracked.encryption);
+        // The snapshot is fetched with the token the child will actually use,
+        // so an account mismatch fails here (session not visible) instead of
+        // after spawn.
+        const serverSnapshot = await fetchServerSessionSnapshot(happySessionId, tracked.encryption, credentialDecision.token);
         if (!serverSnapshot) {
           return {
             type: 'error',
@@ -876,7 +905,13 @@ export async function startDaemon(): Promise<void> {
           env: {
             ...scrubSessionLineageEnv(process.env),
             ...reconnectEnvironment,
+            // user-credential 세션은 원래 계정의 스테이징 자격증명으로 복원 —
+            // 없으면 위의 credentialDecision 이 이미 refuse 했다.
+            ...(credentialDecision.kind === 'user-staged'
+              ? { HAPPY_HOME_DIR: credentialDecision.homeDir }
+              : {}),
           },
+          userHomeDir: credentialDecision.kind === 'user-staged' ? credentialDecision.homeDir : undefined,
         });
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : (error && typeof error === 'object' ? JSON.stringify(error) : String(error));
@@ -968,7 +1003,8 @@ export async function startDaemon(): Promise<void> {
     // Handle child process exit — preserve session data for resume
     const onChildExited = (pid: number) => {
       const tracked = pidToTrackedSession.get(pid);
-      if (!tracked || !preserveSessionForResume(tracked, `process-exit:${pid}`)) {
+      const preservedForResume = tracked ? preserveSessionForResume(tracked, `process-exit:${pid}`) : false;
+      if (!preservedForResume) {
         logger.debug(`[DAEMON RUN] Removing exited process PID ${pid} from tracking`);
       }
       pidToTrackedSession.delete(pid);
@@ -976,13 +1012,22 @@ export async function startDaemon(): Promise<void> {
       persistTrackedSessions();
       if (tracked?.userHomeDir) {
         const homeDir = tracked.userHomeDir;
-        // Small delay lets the child flush any final writes before we unlink.
-        setTimeout(() => {
-          unstageUserCredentials(homeDir).then(
-            () => logger.debug(`[DAEMON RUN] Unstaged user home dir ${homeDir}`),
-            (err) => logger.debug(`[DAEMON RUN] Failed to unstage ${homeDir}: ${err instanceof Error ? err.message : String(err)}`),
-          );
-        }, 100);
+        if (preservedForResume) {
+          // 2026-07-23 incident (path a): deleting the staged credentials here
+          // made a later resume spawn the child under the DAEMON's account —
+          // its sync then 404'd against the user-owned session. A resumable
+          // session keeps its staged identity; cleanup happens when the
+          // session is removed from the resumable set or via the startup sweep.
+          logger.debug(`[DAEMON RUN] Keeping staged user home dir ${homeDir} for resumable session ${tracked.happySessionId}`);
+        } else {
+          // Small delay lets the child flush any final writes before we unlink.
+          setTimeout(() => {
+            unstageUserCredentials(homeDir).then(
+              () => logger.debug(`[DAEMON RUN] Unstaged user home dir ${homeDir}`),
+              (err) => logger.debug(`[DAEMON RUN] Failed to unstage ${homeDir}: ${err instanceof Error ? err.message : String(err)}`),
+            );
+          }, 100);
+        }
       }
     };
 

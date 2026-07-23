@@ -53,11 +53,43 @@ describe('isSessionGoneError', () => {
 });
 
 describe('createBackoff', () => {
-    it('aborts immediately on a non-retryable error instead of looping forever', async () => {
+    // 2026-07-23 운영 사고: happy-server 는 "세션 삭제됨"과 "다른 계정
+    // 소유"를 같은 404 로 반환한다. 실제 원인이 계정/토큰 불일치였는데도
+    // 첫 404 에서 즉시 중단해 세션이 끊긴 것처럼 보였다. 404/410 은 짧은
+    // 제한 재시도로 일시적 lookup miss 를 걸러낸 뒤에만 중단한다
+    // (무한 재시도 금지는 #64 그대로 유지).
+    it('retries 404/410 a bounded number of times before aborting', async () => {
         const backoff = createBackoff({ minDelay: 0, maxDelay: 0 });
         const callback = vi.fn(async () => { throw axiosErrorWithStatus(404); });
         await expect(backoff(callback)).rejects.toMatchObject({ response: { status: 404 } });
-        // 404 is permanent — the callback must not be retried.
+        // Default bound: 3 attempts total — enough to rule out a transient
+        // replica/LB miss, nowhere near the old unbounded loop.
+        expect(callback).toHaveBeenCalledTimes(3);
+    });
+
+    it('recovers when a transient 404 clears within the bounded retries', async () => {
+        const backoff = createBackoff({ minDelay: 0, maxDelay: 0 });
+        let attempts = 0;
+        const callback = vi.fn(async () => {
+            attempts++;
+            if (attempts < 3) throw axiosErrorWithStatus(404);
+            return 'ok';
+        });
+        await expect(backoff(callback)).resolves.toBe('ok');
+        expect(callback).toHaveBeenCalledTimes(3);
+    });
+
+    it('honors a custom sessionGoneMaxAttempts bound', async () => {
+        const backoff = createBackoff({ minDelay: 0, maxDelay: 0, sessionGoneMaxAttempts: 1 });
+        const callback = vi.fn(async () => { throw axiosErrorWithStatus(410); });
+        await expect(backoff(callback)).rejects.toMatchObject({ response: { status: 410 } });
+        expect(callback).toHaveBeenCalledTimes(1);
+    });
+
+    it('still aborts immediately on other non-retryable 4xx (401/403/400)', async () => {
+        const backoff = createBackoff({ minDelay: 0, maxDelay: 0 });
+        const callback = vi.fn(async () => { throw axiosErrorWithStatus(401); });
+        await expect(backoff(callback)).rejects.toMatchObject({ response: { status: 401 } });
         expect(callback).toHaveBeenCalledTimes(1);
     });
 

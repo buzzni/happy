@@ -1768,6 +1768,53 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
     });
 
+    // 2026-07-23 운영 사고: 404 의 실제 원인이 세션 삭제가 아니라 계정/토큰
+    // 불일치였음이 DB 로 확정됨. happy-server 는 두 경우를 같은 404 로
+    // 반환하므로, sync 404 만으로는 archive 를 확정(stamp)할 수 없다.
+    // archive 확정은 명시적 신호(archive ephemeral, durable session-end
+    // recheck)에서만 이뤄져야 한다. 세션 종료 자체는 유지하되(죽은 sync 로
+    // 프로세스를 살려두지 않음) 세션은 resumable 로 남긴다.
+    describe('onSyncFatal', () => {
+        function axios404(): Error {
+            const err = new Error('Request failed with status code 404') as Error & {
+                isAxiosError: boolean;
+                response: { status: number };
+            };
+            err.isAxiosError = true;
+            err.response = { status: 404 } as any;
+            return err;
+        }
+
+        it('exits the session WITHOUT stamping archive on a sync 404 (could be account mismatch)', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            const onArchived = vi.fn();
+            client.on('archived', onArchived);
+            (client as any).onSyncFatal('receive', axios404());
+            expect(onArchived).toHaveBeenCalledTimes(1);
+            expect(onArchived).toHaveBeenCalledWith({ stampArchive: false });
+            await client.close();
+        });
+
+        it('exits without stamping archive on other non-retryable errors too (401 등 환경 문제)', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            const onArchived = vi.fn();
+            client.on('archived', onArchived);
+            (client as any).onSyncFatal('send', new Error('Request failed with status code 401'));
+            expect(onArchived).toHaveBeenCalledWith({ stampArchive: false });
+            await client.close();
+        });
+
+        it('tears down only once when both sync directions fail', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            const onArchived = vi.fn();
+            client.on('archived', onArchived);
+            (client as any).onSyncFatal('receive', axios404());
+            (client as any).onSyncFatal('send', axios404());
+            expect(onArchived).toHaveBeenCalledTimes(1);
+            await client.close();
+        });
+    });
+
     it('recovers a saved user message when the socket new-message update is missed', async () => {
         vi.useFakeTimers();
         const client = new ApiSessionClient('fake-token', session);
