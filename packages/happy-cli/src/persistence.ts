@@ -478,6 +478,9 @@ export type PersistedSession = {
   agentStateVersion: number;
   metadata: Metadata;
   savedAt: number;
+  /** Staged per-user HAPPY_HOME_DIR — a resume must restore this identity
+   *  (2026-07-23 incident: resuming under the daemon account 404s). */
+  userHomeDir?: string;
 };
 
 type SessionsFile = {
