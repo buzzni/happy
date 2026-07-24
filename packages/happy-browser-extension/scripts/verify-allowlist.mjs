@@ -54,8 +54,15 @@ function call(method, params = {}) {
     return answered
 }
 
-/** Run a call that is expected to be refused by the allowlist. */
-async function expectDenied(label, method, params) {
+/**
+ * Run a call expected to be refused by the allowlist.
+ *
+ * `targetsTabById` distinguishes the two refusal shapes deliberately: for a tab the
+ * caller named only by id, echoing its URL would undo tabs_list filtering, so
+ * the message must not contain it. For a destination URL the caller supplied
+ * itself (navigate/tabs_open), echoing is expected and useful.
+ */
+async function expectDenied(label, method, params, { targetsTabById = true } = {}) {
     try {
         const result = await call(method, params)
         throw new Error(`${label} — expected SITE_NOT_ALLOWED, but it succeeded with ${JSON.stringify(result)}`)
@@ -66,8 +73,7 @@ async function expectDenied(label, method, params) {
             throw new Error(`${label} — 검증용 탭이 닫혀 있어 확인할 수 없습니다. Phase A 에서 열린 "Denied page" 탭을 닫지 말고 다시 실행해 주세요.`)
         }
         if (!/SITE_NOT_ALLOWED/.test(e.message)) throw new Error(`${label} — expected SITE_NOT_ALLOWED, got: ${e.message}`)
-        // The refusal must not hand back the URL it is hiding.
-        if (e.message.includes(`:${DENIED_PORT}`)) {
+        if (targetsTabById && e.message.includes(`:${DENIED_PORT}`)) {
             throw new Error(`${label} — 거부 메시지가 가려야 할 URL 을 노출했습니다: ${e.message}`)
         }
         console.log(`  ok  ${label}`)
@@ -172,7 +178,7 @@ async function run() {
     await expectDenied('허용되지 않은 탭 screenshot 거부', 'screenshot', { tabId: deniedTab.id })
     await expectDenied('허용되지 않은 탭 click 거부', 'click', { tabId: deniedTab.id, ref: '@e1' })
     await expectDenied('허용되지 않은 탭 close 거부', 'tabs_close', { tabId: deniedTab.id })
-    await expectDenied('허용되지 않은 URL 로 tabs_open 거부', 'tabs_open', { url: deniedUrl })
+    await expectDenied('허용되지 않은 URL 로 tabs_open 거부', 'tabs_open', { url: deniedUrl }, { targetsTabById: false })
 
     console.log('')
     console.log('허용된 경로는 그대로 동작하는지')
@@ -190,7 +196,7 @@ async function run() {
 
     // The bypass that makes an allowlist pointless if missed: move a permitted
     // tab to a forbidden site, then act on it there.
-    await expectDenied('허용된 탭을 금지된 URL 로 navigate 거부', 'navigate', { tabId: allowedTab.id, url: deniedUrl })
+    await expectDenied('허용된 탭을 금지된 URL 로 navigate 거부', 'navigate', { tabId: allowedTab.id, url: deniedUrl }, { targetsTabById: false })
 
     check('ping 은 allowlist 와 무관하게 동작', (await call('ping')) === 'pong', 'ping failed')
 
