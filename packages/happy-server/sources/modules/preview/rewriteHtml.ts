@@ -187,6 +187,39 @@ export function rewriteJsCss(text: string, prefix: string): string {
         .replace(ABS_PATH_CSS_URL, rep);
 }
 
+/**
+ * Vite's HMR client dynamically imports updated modules from its compiled
+ * `base`. Unlike fetch/XHR, native import() cannot be intercepted by the
+ * browser shim, so path-based previews must make that base relay-aware.
+ *
+ * Scope this narrowly to Vite's own client response and require stable Vite
+ * HMR markers. Unknown scripts and dev servers therefore remain untouched.
+ */
+export function rewriteViteClientForPath(
+    text: string,
+    prefix: string,
+    upstreamPath: string,
+): string {
+    if (!prefix || upstreamPath.split('?')[0] !== '/@vite/client') return text;
+    if (!text.includes('"vite-hmr"') && !text.includes("'vite-hmr'")) return text;
+    if (!text.includes('acceptedPathWithoutQuery')) return text;
+
+    const baseDeclaration =
+        /\bconst\s+base\s*=\s*(["'])(\/[^"']*)\1\s*\|\|\s*(["'])\/\3\s*;/;
+    const match = text.match(baseDeclaration);
+    if (!match) return text;
+
+    const viteBase = match[2];
+    if (viteBase === prefix || viteBase.startsWith(`${prefix}/`)) return text;
+
+    const normalizedPrefix = prefix.replace(/\/+$/, '');
+    const prefixedBase = `${normalizedPrefix}${viteBase}`;
+    return text.replace(
+        baseDeclaration,
+        `const base = ${match[1]}${prefixedBase}${match[1]} || ${match[3]}/${match[3]};`,
+    );
+}
+
 export function rewriteHtml(html: string, prefix: string): string {
     const rep = makeReplacer(prefix);
     let out = html

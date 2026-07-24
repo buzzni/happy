@@ -5,6 +5,7 @@ import {
     rwPath,
     rwInput,
     rwWebSocketUrl,
+    rewriteViteClientForPath,
 } from '@/modules/preview/rewriteHtml';
 
 const PREFIX = '/v1/preview/m1/3000';
@@ -647,5 +648,70 @@ describe('rwInput — URL/Request object support', () => {
     it('passes through exotic non-string/URL/Request inputs', () => {
         const input = { foo: 'bar' };
         expect(rwInput(input, P, ORIGIN)).toBe(input);
+    });
+});
+
+describe('rewriteViteClientForPath — HMR dynamic import base', () => {
+    const viteClient = [
+        'const base = "/" || "/";',
+        'const socketProtocol = "wss";',
+        'new WebSocket(url, "vite-hmr");',
+        'const [acceptedPathWithoutQuery] = acceptedPath.split("?");',
+        'const importPromise = import(base + acceptedPathWithoutQuery.slice(1));',
+    ].join('\n');
+
+    it('prefixes the Vite HMR dynamic import base for /@vite/client', () => {
+        const out = rewriteViteClientForPath(viteClient, PREFIX, '/@vite/client');
+
+        expect(out).toContain(`const base = "${PREFIX}/" || "/";`);
+        expect(out).toContain('import(base + acceptedPathWithoutQuery.slice(1))');
+    });
+
+    it('recognizes /@vite/client when the upstream path has a query string', () => {
+        const out = rewriteViteClientForPath(viteClient, PREFIX, '/@vite/client?t=123');
+
+        expect(out).toContain(`const base = "${PREFIX}/" || "/";`);
+    });
+
+    it('prefixes a custom Vite base without dropping it', () => {
+        const customBaseClient = viteClient.replace(
+            'const base = "/" || "/";',
+            'const base = "/app/" || "/";',
+        );
+
+        const out = rewriteViteClientForPath(customBaseClient, PREFIX, '/@vite/client');
+
+        expect(out).toContain(`const base = "${PREFIX}/app/" || "/";`);
+    });
+
+    it('is idempotent when the Vite base already contains the preview prefix', () => {
+        const prefixedClient = viteClient.replace(
+            'const base = "/" || "/";',
+            `const base = "${PREFIX}/" || "/";`,
+        );
+
+        expect(
+            rewriteViteClientForPath(prefixedClient, PREFIX, '/@vite/client'),
+        ).toBe(prefixedClient);
+    });
+
+    it('does not rewrite an arbitrary JavaScript asset', () => {
+        expect(
+            rewriteViteClientForPath(viteClient, PREFIX, '/src/main.tsx'),
+        ).toBe(viteClient);
+    });
+
+    it('does not rewrite a non-Vite script that happens to declare base', () => {
+        const ordinaryScript = 'const base = "/" || "/";\nrender(base);';
+
+        expect(
+            rewriteViteClientForPath(ordinaryScript, PREFIX, '/@vite/client'),
+        ).toBe(ordinaryScript);
+    });
+
+    it('is a no-op for subdomain preview mode with an empty prefix', () => {
+        expect(
+            rewriteViteClientForPath(viteClient, '', '/@vite/client'),
+        ).toBe(viteClient);
     });
 });

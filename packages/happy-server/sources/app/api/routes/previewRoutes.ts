@@ -24,7 +24,11 @@ import { log } from "@/utils/log";
 import { eventRouter } from "@/app/events/eventRouter";
 import { signPreviewToken, verifyPreviewToken } from "@/modules/preview/previewToken";
 import { readPreviewCookie, buildPreviewCookie } from "@/modules/preview/previewCookie";
-import { rewriteHtml, rewriteJsCss } from "@/modules/preview/rewriteHtml";
+import {
+    rewriteHtml,
+    rewriteJsCss,
+    rewriteViteClientForPath,
+} from "@/modules/preview/rewriteHtml";
 import { rewriteLinkHeader } from "@/modules/preview/rewriteLinkHeader";
 import { rewriteLocationHeader } from "@/modules/preview/rewriteLocationHeader";
 import { renderExpiredPtokenHtml, shouldServeExpiredHtml } from "@/modules/preview/expiredPtokenHtml";
@@ -461,7 +465,11 @@ export function previewRoutes(app: Fastify) {
                     contentType.includes('typescript') ||
                     contentType.includes('text/css')
                 ) {
-                    responseBody = Buffer.from(rewriteJsCss(responseBody.toString('utf-8'), prefix), 'utf-8');
+                    const rewritten = rewriteJsCss(responseBody.toString('utf-8'), prefix);
+                    responseBody = Buffer.from(
+                        rewriteViteClientForPath(rewritten, prefix, upstreamPath),
+                        'utf-8',
+                    );
                 }
 
                 const outHeaders = stripResponseHeaders(rpcResponse.headers, prefix || undefined);
