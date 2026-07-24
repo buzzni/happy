@@ -10,7 +10,8 @@
  *   > then type a method name (ping / tabs_list) and press enter
  *
  * BRIDGE_AUTO=1 runs ping + tabs_list automatically on the first connection
- * and exits — for unattended verification.
+ * and exits — for unattended verification. Set it to a comma-separated list
+ * to run different methods, e.g. BRIDGE_AUTO=snapshot,screenshot.
  */
 
 import { WebSocketServer } from 'ws'
@@ -73,9 +74,17 @@ if (process.env.BRIDGE_AUTO) {
         if (extension !== socket) return
         // Let the extension finish its own setup before probing it.
         await new Promise((r) => setTimeout(r, 200))
-        for (const method of ['ping', 'tabs_list']) {
+        const methods = process.env.BRIDGE_AUTO === '1'
+            ? ['ping', 'tabs_list']
+            : process.env.BRIDGE_AUTO.split(',').map((m) => m.trim()).filter(Boolean)
+        for (const method of methods) {
             console.log(`\n--- ${method} ---`)
-            console.log(JSON.stringify(await call(method), null, 2))
+            const answer = await call(method)
+            // A screenshot's base64 payload would drown the output.
+            const shown = answer.result?.dataB64
+                ? { ...answer, result: { ...answer.result, dataB64: `<${answer.result.dataB64.length} base64 chars>` } }
+                : answer
+            console.log(JSON.stringify(shown, null, 2))
         }
         console.log('\nOK — 확장이 실제 Chrome에서 응답했습니다.')
         process.exit(0)
