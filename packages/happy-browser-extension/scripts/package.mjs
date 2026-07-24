@@ -29,6 +29,7 @@ const INCLUDE = [
     'src/snapshot.js',
     'src/actions.js',
     'src/allowlist.js',
+    'src/cdp.js',
     'src/backoff.js',
     'src/options.html',
     'src/options.js',

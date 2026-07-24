@@ -2,9 +2,20 @@ import { describe, it, expect } from 'vitest'
 import { handleCommand } from './protocol.js'
 
 /** Minimal stand-in for the parts of the chrome API the protocol uses. */
-function fakeChrome({ tabs = [], executeScript, captureVisibleTab, update, create, remove, allowlist } = {}) {
+function fakeChrome({ tabs = [], executeScript, captureVisibleTab, update, create, remove, allowlist, debuggerGranted = false, sendCommand } = {}) {
+    const cdpCalls = []
     return {
+        cdpCalls,
         storage: { local: { get: async () => (allowlist === undefined ? {} : { allowlist }) } },
+        permissions: { contains: async () => debuggerGranted },
+        debugger: {
+            attach: async () => { cdpCalls.push(['attach']) },
+            detach: async () => { cdpCalls.push(['detach']) },
+            sendCommand: sendCommand ?? (async (_target, method, params) => {
+                cdpCalls.push([method, params])
+                return method === 'Page.captureScreenshot' ? { data: 'FULLPAGE' } : {}
+            }),
+        },
         tabs: {
             query: async (query) => (query && query.active ? tabs.filter((t) => t.active) : tabs),
             get: async (tabId) => {
@@ -345,6 +356,112 @@ describe('handleCommand', () => {
             const chrome = fakeChrome({ tabs: [], allowlist: 'work.test' })
             const response = await handleCommand({ id: 39, method: 'ping' }, chrome)
             expect(response.result).toBe('pong')
+        })
+    })
+
+    describe('debugger tier (Phase 5)', () => {
+        const TAB = { id: 7, windowId: 1, index: 0, url: 'https://a.com', title: 'A', active: true }
+
+        it('capabilities reports the debugger tier as off by default', async () => {
+            const response = await handleCommand({ id: 40, method: 'capabilities' }, fakeChrome({ tabs: [TAB] }))
+            expect(response.result.debugger).toBe(false)
+        })
+
+        it('capabilities reports it on once the user grants it', async () => {
+            const response = await handleCommand({ id: 41, method: 'capabilities' }, fakeChrome({ tabs: [TAB], debuggerGranted: true }))
+            expect(response.result.debugger).toBe(true)
+        })
+
+        it('capabilities lists the commands so the agent need not guess', async () => {
+            const response = await handleCommand({ id: 42, method: 'capabilities' }, fakeChrome({ tabs: [TAB] }))
+            expect(response.result.commands).toContain('snapshot')
+            expect(response.result.commands).toContain('tabs_close')
+        })
+
+        it('a plain screenshot still uses the permission-free path', async () => {
+            const chrome = fakeChrome({ tabs: [TAB], debuggerGranted: true })
+            const response = await handleCommand({ id: 43, method: 'screenshot' }, chrome)
+            expect(response.result.dataB64).toBe('AAAA')
+            expect(chrome.cdpCalls).toEqual([])
+        })
+
+        it('fullPage screenshot goes through CDP when granted', async () => {
+            const chrome = fakeChrome({ tabs: [TAB], debuggerGranted: true })
+            const response = await handleCommand({ id: 44, method: 'screenshot', params: { fullPage: true } }, chrome)
+            expect(response.result.dataB64).toBe('FULLPAGE')
+            expect(chrome.cdpCalls.some((c) => c[0] === 'Page.captureScreenshot')).toBe(true)
+        })
+
+        it('fullPage without the permission fails loudly instead of quietly returning a viewport shot', async () => {
+            // Silently downgrading would hand back an image that does not
+            // show what was asked for, and nothing would say so.
+            const chrome = fakeChrome({ tabs: [TAB], debuggerGranted: false })
+            const response = await handleCommand({ id: 45, method: 'screenshot', params: { fullPage: true } }, chrome)
+            expect(response.error.code).toBe('DEBUGGER_NOT_AVAILABLE')
+            expect(response.error.message).toMatch(/options/i)
+        })
+
+        it('trusted click dispatches real input events at the ref position', async () => {
+            const chrome = fakeChrome({
+                tabs: [TAB],
+                debuggerGranted: true,
+                executeScript: async () => [{ result: { ok: true, x: 12, y: 34 } }],
+            })
+            const response = await handleCommand({ id: 46, method: 'click', params: { ref: '@e1', trusted: true } }, chrome)
+            expect(response.error).toBeUndefined()
+            const press = chrome.cdpCalls.find((c) => c[0] === 'Input.dispatchMouseEvent')
+            expect(press[1]).toMatchObject({ x: 12, y: 34 })
+        })
+
+        it('trusted click without the permission fails loudly', async () => {
+            const chrome = fakeChrome({ tabs: [TAB], debuggerGranted: false })
+            const response = await handleCommand({ id: 47, method: 'click', params: { ref: '@e1', trusted: true } }, chrome)
+            expect(response.error.code).toBe('DEBUGGER_NOT_AVAILABLE')
+        })
+
+        it('trusted click surfaces a stale ref rather than clicking a stale point', async () => {
+            const chrome = fakeChrome({
+                tabs: [TAB],
+                debuggerGranted: true,
+                executeScript: async () => [{ result: { ok: false, code: 'REF_NOT_FOUND', message: 'No element for @e9' } }],
+            })
+            const response = await handleCommand({ id: 48, method: 'click', params: { ref: '@e9', trusted: true } }, chrome)
+            expect(response.error.code).toBe('REF_NOT_FOUND')
+            expect(chrome.cdpCalls.some((c) => c[0] === 'Input.dispatchMouseEvent')).toBe(false)
+        })
+
+        it('trusted fill focuses the ref then inserts text as real input', async () => {
+            const chrome = fakeChrome({
+                tabs: [TAB],
+                debuggerGranted: true,
+                executeScript: async () => [{ result: { ok: true, x: 5, y: 6 } }],
+            })
+            const response = await handleCommand({ id: 49, method: 'fill', params: { ref: '@e1', value: 'hi', trusted: true } }, chrome)
+            expect(response.error).toBeUndefined()
+            const insert = chrome.cdpCalls.find((c) => c[0] === 'Input.insertText')
+            expect(insert[1]).toEqual({ text: 'hi' })
+        })
+
+        it('untrusted click keeps working with no debugger involvement', async () => {
+            const chrome = fakeChrome({
+                tabs: [TAB],
+                debuggerGranted: true,
+                executeScript: async () => [{ result: { ok: true } }],
+            })
+            const response = await handleCommand({ id: 50, method: 'click', params: { ref: '@e1' } }, chrome)
+            expect(response.result).toEqual({ ok: true })
+            expect(chrome.cdpCalls).toEqual([])
+        })
+
+        it('the debugger tier respects the allowlist like everything else', async () => {
+            const chrome = fakeChrome({
+                tabs: [TAB, { id: 3, url: 'https://bank.example/', title: 'Bank' }],
+                allowlist: 'a.com',
+                debuggerGranted: true,
+            })
+            const response = await handleCommand({ id: 51, method: 'screenshot', params: { tabId: 3, fullPage: true } }, chrome)
+            expect(response.error.code).toBe('SITE_NOT_ALLOWED')
+            expect(chrome.cdpCalls).toEqual([])
         })
     })
 })

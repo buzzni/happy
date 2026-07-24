@@ -39,6 +39,31 @@ export function clickRef(ref) {
     return { ok: true }
 }
 
+/**
+ * Viewport centre of a ref, for CDP input which addresses points, not
+ * elements. Also focuses it, so a following Input.insertText lands in it.
+ *
+ * Self-contained for the same reason as the others — see the file docblock.
+ */
+export function locateRef(ref) {
+    const element = window.__happyRefs && window.__happyRefs.get(ref)
+    if (!element || !element.isConnected) {
+        return { ok: false, code: 'REF_NOT_FOUND', message: `No element for ${ref} — the page may have changed since the last snapshot. Take a new snapshot and use its refs.` }
+    }
+    if (element.disabled === true) {
+        return { ok: false, code: 'ELEMENT_DISABLED', message: `Element ${ref} is disabled` }
+    }
+
+    element.scrollIntoView({ block: 'center', inline: 'center' })
+    const box = element.getBoundingClientRect()
+    if (box.width === 0 && box.height === 0) {
+        return { ok: false, code: 'ELEMENT_NOT_VISIBLE', message: `Element ${ref} has no on-screen box to click` }
+    }
+    if (typeof element.focus === 'function') element.focus()
+
+    return { ok: true, x: box.left + box.width / 2, y: box.top + box.height / 2 }
+}
+
 export function fillRef(ref, value) {
     const element = window.__happyRefs && window.__happyRefs.get(ref)
     if (!element || !element.isConnected) {

@@ -7,8 +7,9 @@
  */
 
 import { collectSnapshot } from './snapshot.js'
-import { clickRef, fillRef } from './actions.js'
+import { clickRef, fillRef, locateRef } from './actions.js'
 import { parseAllowlist, isUrlAllowed } from './allowlist.js'
+import { hasDebuggerPermission, captureFullPage, dispatchTrustedClick, insertTrustedText } from './cdp.js'
 
 export class CommandError extends Error {
     constructor(code, message) {
@@ -122,6 +123,13 @@ const handlers = {
     // allowlist would block every tab, and it reveals nothing about the user.
     ping: async () => 'pong',
 
+    // So the agent can tell whether the debugger tier is available instead of
+    // discovering it by having a command fail.
+    capabilities: async (_params, chrome) => ({
+        commands: Object.keys(handlers),
+        debugger: await hasDebuggerPermission(chrome),
+    }),
+
     tabs_list: async (_params, chrome, allowlist) => {
         const tabs = await chrome.tabs.query({})
         return {
@@ -158,6 +166,11 @@ const handlers = {
 
     screenshot: async (params, chrome, allowlist) => {
         const tab = await resolveTab(params, chrome, allowlist)
+        if (params.fullPage) {
+            // No silent downgrade to a viewport shot: that would return an
+            // image that isn't what was asked for, with nothing saying so.
+            return captureFullPage(chrome, tab.id)
+        }
         const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' })
         const [, dataB64] = dataUrl.split(',')
         return { mimeType: 'image/png', dataB64 }
@@ -165,6 +178,11 @@ const handlers = {
 
     click: async (params, chrome, allowlist) => {
         const ref = requireParam(params, 'ref')
+        if (params.trusted) {
+            const tab = await resolveTab(params, chrome, allowlist)
+            const point = await runPageAction(locateRef, [ref], params, chrome, allowlist)
+            return dispatchTrustedClick(chrome, tab.id, point)
+        }
         return runPageAction(clickRef, [ref], params, chrome, allowlist)
     },
 
@@ -173,6 +191,12 @@ const handlers = {
         // Unlike the other params, an empty string is valid here — it clears a field.
         if (params.value === undefined || params.value === null) {
             throw new CommandError('MISSING_PARAM', 'Missing required param: value')
+        }
+        if (params.trusted) {
+            const tab = await resolveTab(params, chrome, allowlist)
+            // locateRef focuses the element, so the inserted text lands in it.
+            await runPageAction(locateRef, [ref], params, chrome, allowlist)
+            return insertTrustedText(chrome, tab.id, params.value)
         }
         return runPageAction(fillRef, [ref, params.value], params, chrome, allowlist)
     },
@@ -212,7 +236,9 @@ export async function handleCommand(message, chrome) {
         const allowlist = await readAllowlist(chrome)
         return { id: message.id, result: await handler(message.params ?? {}, chrome, allowlist) }
     } catch (e) {
-        const code = e instanceof CommandError ? e.code : 'COMMAND_FAILED'
+        // DebuggerUnavailableError carries its own `code` without being a
+        // CommandError — honour any error that names one.
+        const code = e?.code ?? 'COMMAND_FAILED'
         return { id: message.id, error: { code, message: e instanceof Error ? e.message : String(e) } }
     }
 }
