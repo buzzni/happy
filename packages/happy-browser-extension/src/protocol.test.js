@@ -2,11 +2,14 @@ import { describe, it, expect } from 'vitest'
 import { handleCommand } from './protocol.js'
 
 /** Minimal stand-in for the parts of the chrome API the protocol uses. */
-function fakeChrome({ tabs = [], executeScript, captureVisibleTab } = {}) {
+function fakeChrome({ tabs = [], executeScript, captureVisibleTab, update, create, remove } = {}) {
     return {
         tabs: {
             query: async (query) => (query && query.active ? tabs.filter((t) => t.active) : tabs),
             captureVisibleTab: captureVisibleTab ?? (async () => 'data:image/png;base64,AAAA'),
+            update: update ?? (async (tabId, props) => ({ id: tabId, ...props })),
+            create: create ?? (async (props) => ({ id: 99, windowId: 1, ...props })),
+            remove: remove ?? (async () => {}),
         },
         scripting: {
             executeScript: executeScript ?? (async () => [{ result: { url: 'https://a.com', title: 'A', elements: [], truncated: false } }]),
@@ -137,6 +140,94 @@ describe('handleCommand', () => {
         it('reports NO_ACTIVE_TAB when no tab is focused', async () => {
             const response = await handleCommand({ id: 11, method: 'screenshot' }, fakeChrome({ tabs: [] }))
             expect(response.error.code).toBe('NO_ACTIVE_TAB')
+        })
+    })
+
+    describe('click and fill', () => {
+        it('injects clickRef with the given ref into the target tab', async () => {
+            let injected
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                executeScript: async (options) => {
+                    injected = options
+                    return [{ result: { ok: true } }]
+                },
+            })
+            const response = await handleCommand({ id: 12, method: 'click', params: { ref: '@e1' } }, chrome)
+            expect(injected.target).toEqual({ tabId: 7 })
+            expect(injected.args).toEqual(['@e1'])
+            expect(response.result).toEqual({ ok: true })
+        })
+
+        it('injects fillRef with ref and value', async () => {
+            let injected
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                executeScript: async (options) => {
+                    injected = options
+                    return [{ result: { ok: true } }]
+                },
+            })
+            await handleCommand({ id: 13, method: 'fill', params: { ref: '@e2', value: 'hi' } }, chrome)
+            expect(injected.args).toEqual(['@e2', 'hi'])
+        })
+
+        it('reports ACTION_FAILED when the page-side action throws (e.g. a stale ref)', async () => {
+            // Chrome rejects the whole executeScript() call when the injected
+            // function throws — it does not resolve with a per-result error.
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                executeScript: async () => {
+                    throw new Error('No element for @e9 — the page may have changed since the last snapshot.')
+                },
+            })
+            const response = await handleCommand({ id: 14, method: 'click', params: { ref: '@e9' } }, chrome)
+            expect(response.error.code).toBe('ACTION_FAILED')
+            expect(response.error.message).toContain('@e9')
+        })
+
+        it('reports MISSING_PARAM when click is called without a ref', async () => {
+            const response = await handleCommand({ id: 15, method: 'click', params: {} }, fakeChrome({ tabs: [ACTIVE_TAB] }))
+            expect(response.error.code).toBe('MISSING_PARAM')
+        })
+    })
+
+    describe('navigate', () => {
+        it('updates the target tab to the given url', async () => {
+            let updated
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                update: async (tabId, props) => { updated = { tabId, props }; return { id: tabId } },
+            })
+            const response = await handleCommand({ id: 16, method: 'navigate', params: { url: 'https://b.com' } }, chrome)
+            expect(updated).toEqual({ tabId: 7, props: { url: 'https://b.com' } })
+            expect(response.result).toEqual({ ok: true })
+        })
+
+        it('reports MISSING_PARAM without a url', async () => {
+            const response = await handleCommand({ id: 17, method: 'navigate', params: {} }, fakeChrome({ tabs: [ACTIVE_TAB] }))
+            expect(response.error.code).toBe('MISSING_PARAM')
+        })
+    })
+
+    describe('tabs_open and tabs_close', () => {
+        it('opens a new tab at the given url', async () => {
+            const chrome = fakeChrome({ create: async (props) => ({ id: 55, windowId: 2, ...props }) })
+            const response = await handleCommand({ id: 18, method: 'tabs_open', params: { url: 'https://c.com' } }, chrome)
+            expect(response.result).toEqual({ id: 55, windowId: 2, url: 'https://c.com' })
+        })
+
+        it('closes the given tab', async () => {
+            let removed
+            const chrome = fakeChrome({ remove: async (tabId) => { removed = tabId } })
+            const response = await handleCommand({ id: 19, method: 'tabs_close', params: { tabId: 7 } }, chrome)
+            expect(removed).toBe(7)
+            expect(response.result).toEqual({ ok: true })
+        })
+
+        it('reports MISSING_PARAM when tabs_close has no tabId', async () => {
+            const response = await handleCommand({ id: 20, method: 'tabs_close', params: {} }, fakeChrome())
+            expect(response.error.code).toBe('MISSING_PARAM')
         })
     })
 })

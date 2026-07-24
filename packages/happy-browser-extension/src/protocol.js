@@ -7,6 +7,7 @@
  */
 
 import { collectSnapshot } from './snapshot.js'
+import { clickRef, fillRef } from './actions.js'
 
 export class CommandError extends Error {
     constructor(code, message) {
@@ -23,6 +24,31 @@ async function resolveTab(params, chrome) {
         throw new CommandError('NO_ACTIVE_TAB', 'No active tab to act on')
     }
     return active
+}
+
+function requireParam(params, name) {
+    const value = params[name]
+    if (value === undefined || value === null || value === '') {
+        throw new CommandError('MISSING_PARAM', `Missing required param: ${name}`)
+    }
+    return value
+}
+
+/** Run a ref-targeted action (clickRef/fillRef) in the page. */
+async function runPageAction(func, args, params, chrome) {
+    const tab = await resolveTab(params, chrome)
+    try {
+        const results = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func,
+            args,
+        })
+        return results[0].result
+    } catch (e) {
+        // Chrome rejects the whole call when the injected function throws —
+        // e.g. actions.js's REF_NOT_FOUND for a stale or unknown ref.
+        throw new CommandError('ACTION_FAILED', e instanceof Error ? e.message : String(e))
+    }
 }
 
 const handlers = {
@@ -64,6 +90,38 @@ const handlers = {
         const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' })
         const [, dataB64] = dataUrl.split(',')
         return { mimeType: 'image/png', dataB64 }
+    },
+
+    click: async (params, chrome) => {
+        const ref = requireParam(params, 'ref')
+        return runPageAction(clickRef, [ref], params, chrome)
+    },
+
+    fill: async (params, chrome) => {
+        const ref = requireParam(params, 'ref')
+        // Unlike the other params, an empty string is valid here — it clears a field.
+        if (params.value === undefined || params.value === null) {
+            throw new CommandError('MISSING_PARAM', 'Missing required param: value')
+        }
+        return runPageAction(fillRef, [ref, params.value], params, chrome)
+    },
+
+    navigate: async (params, chrome) => {
+        const url = requireParam(params, 'url')
+        const tab = await resolveTab(params, chrome)
+        await chrome.tabs.update(tab.id, { url })
+        return { ok: true }
+    },
+
+    tabs_open: async (params, chrome) => {
+        const url = requireParam(params, 'url')
+        return chrome.tabs.create({ url })
+    },
+
+    tabs_close: async (params, chrome) => {
+        const tabId = requireParam(params, 'tabId')
+        await chrome.tabs.remove(tabId)
+        return { ok: true }
     },
 }
 
