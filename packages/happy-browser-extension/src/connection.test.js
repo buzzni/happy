@@ -40,11 +40,14 @@ class FakeWebSocket {
     }
 }
 
-function fakeChrome(stored = { token: 'tok', port: 41777, profile: 'default' }) {
+function fakeChrome(stored = { token: 'tok', port: 41777, profile: 'default' }, badges) {
     return {
         storage: { local: { get: async () => stored } },
         tabs: { query: async () => [] },
-        action: { setBadgeText: () => {} },
+        action: {
+            setBadgeText: ({ text }) => { badges?.push(text) },
+            setBadgeBackgroundColor: () => {},
+        },
     }
 }
 
@@ -163,5 +166,53 @@ describe('createConnection', () => {
         ws.fire('message', { data: JSON.stringify({ id: 1, method: 'ping' }) })
         await vi.advanceTimersByTimeAsync(0)
         expect(ws.sent).toEqual([JSON.stringify({ id: 1, result: 'pong' })])
+    })
+
+    describe('badge', () => {
+        // The badge is the user's only in-browser signal that something is
+        // driving their tabs, so it has to distinguish "connected and idle"
+        // from "a command is running right now".
+        it('marks the badge while a command runs and restores it afterwards', async () => {
+            const badges = []
+            const connection = make(fakeChrome(undefined, badges))
+            await connection.connect()
+            const ws = FakeWebSocket.instances[0]
+            ws.open()
+            badges.length = 0
+
+            ws.fire('message', { data: JSON.stringify({ id: 1, method: 'ping' }) })
+            await vi.advanceTimersByTimeAsync(0)
+
+            expect(badges[0]).toBe('▶')
+            expect(badges[badges.length - 1]).toBe('●')
+        })
+
+        it('restores the idle badge even when the command fails', async () => {
+            const badges = []
+            const connection = make(fakeChrome(undefined, badges))
+            await connection.connect()
+            const ws = FakeWebSocket.instances[0]
+            ws.open()
+            badges.length = 0
+
+            ws.fire('message', { data: JSON.stringify({ id: 2, method: 'no_such_method' }) })
+            await vi.advanceTimersByTimeAsync(0)
+
+            expect(badges[badges.length - 1]).toBe('●')
+        })
+
+        it('does not mark the badge for keepalive pongs', async () => {
+            const badges = []
+            const connection = make(fakeChrome(undefined, badges))
+            await connection.connect()
+            const ws = FakeWebSocket.instances[0]
+            ws.open()
+            badges.length = 0
+
+            ws.fire('message', { data: JSON.stringify({ type: 'pong' }) })
+            await vi.advanceTimersByTimeAsync(0)
+
+            expect(badges).toEqual([])
+        })
     })
 })

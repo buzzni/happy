@@ -6,10 +6,12 @@
   <style>
     body { font-family: system-ui, sans-serif; max-width: 30rem; margin: 2rem auto; padding: 0 1rem; }
     label { display: block; margin-top: 1rem; font-weight: 600; }
-    input { width: 100%; padding: .4rem; margin-top: .25rem; font-family: ui-monospace, monospace; }
+    input, textarea { width: 100%; padding: .4rem; margin-top: .25rem; font-family: ui-monospace, monospace; }
+    textarea { min-height: 6rem; resize: vertical; }
     button { margin-top: 1.25rem; padding: .5rem 1rem; }
     .hint { color: #666; font-weight: 400; font-size: .85rem; }
     #status { margin-top: 1rem; }
+    hr { margin: 2rem 0 0; border: 0; border-top: 1px solid #ddd; }
   </style>
 </head>
 <body>
@@ -24,6 +26,20 @@
 
   <label for="profile">프로필 이름 <span class="hint">(여러 Chrome 프로필을 구분할 때)</span></label>
   <input id="profile" type="text" autocomplete="off" spellcheck="false">
+
+  <hr>
+
+  <label for="allowlist">사이트 allowlist <span class="hint">(선택)</span></label>
+  <p class="hint">
+    비워 두면 <strong>모든 사이트</strong>를 제어할 수 있습니다. 한 줄에 하나씩 적으면
+    그 사이트에서만 동작하고, 나머지 탭은 조작은 물론 목록에도 보이지 않습니다.
+    은행·개인 메일처럼 에이전트가 건드리면 안 되는 탭이 있다면 지정하세요.
+  </p>
+  <p class="hint">
+    예: <code>example.com</code> · <code>*.example.com</code>(서브도메인 포함) ·
+    <code>https://example.com</code>(https 만) · <code>localhost:3000</code>
+  </p>
+  <textarea id="allowlist" autocomplete="off" spellcheck="false" placeholder="비워 두면 제한 없음"></textarea>
 
   <button id="save">저장하고 연결</button>
   <p id="status"></p>

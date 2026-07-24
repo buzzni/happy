@@ -11,6 +11,12 @@ import { reconnectDelayMs } from './backoff.js'
 export const DEFAULT_PORT = 41777
 export const KEEPALIVE_INTERVAL_MS = 20_000
 
+/** Connected and idle. */
+const BADGE_IDLE = { text: '●', color: '#4a9d5f' }
+/** A command from the agent is running against this profile right now. */
+const BADGE_BUSY = { text: '▶', color: '#c2701c' }
+const BADGE_OFF = { text: '', color: '#4a9d5f' }
+
 export function createConnection({
     chrome,
     WebSocketImpl,
@@ -27,6 +33,11 @@ export function createConnection({
     async function readConfig() {
         const { port, token, profile } = await chrome.storage.local.get(['port', 'token', 'profile'])
         return { port: port || defaultPort, token: token || '', profile: profile || 'default' }
+    }
+
+    function setBadge({ text, color }) {
+        chrome.action?.setBadgeText?.({ text })
+        chrome.action?.setBadgeBackgroundColor?.({ color })
     }
 
     function scheduleReconnect() {
@@ -64,7 +75,7 @@ export function createConnection({
 
         ws.addEventListener('open', () => {
             consecutiveFailures = 0
-            chrome.action?.setBadgeText?.({ text: '●' })
+            setBadge(BADGE_IDLE)
             keepaliveTimer = setInterval(() => {
                 if (ws.readyState === WebSocketImpl.OPEN) ws.send(JSON.stringify({ type: 'ping' }))
             }, keepaliveIntervalMs)
@@ -77,10 +88,20 @@ export function createConnection({
             } catch {
                 return
             }
-            // The daemon's reply to our keepalive; nothing to answer.
+            // The daemon's reply to our keepalive; nothing to answer, and
+            // not something to flag to the user as activity.
             if (message.type === 'pong') return
 
-            const response = await handleCommand(message, chrome)
+            // The badge is the user's only in-browser signal that an agent is
+            // driving their tabs — mark it for the whole command, and restore
+            // it in `finally` so a failure can't leave it stuck.
+            setBadge(BADGE_BUSY)
+            let response
+            try {
+                response = await handleCommand(message, chrome)
+            } finally {
+                if (socket === ws) setBadge(BADGE_IDLE)
+            }
             if (ws.readyState === WebSocketImpl.OPEN) ws.send(JSON.stringify(response))
         })
 
@@ -93,7 +114,7 @@ export function createConnection({
             // one losing the daemon warrants a badge reset and a reconnect.
             if (socket !== ws) return
             socket = null
-            chrome.action?.setBadgeText?.({ text: '' })
+            setBadge(BADGE_OFF)
             scheduleReconnect()
         }
         ws.addEventListener('close', onGone)
