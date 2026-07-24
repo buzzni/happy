@@ -50,14 +50,22 @@ node packages/happy-browser-extension/scripts/dev-bridge.mjs
 출력된 토큰을 확장 옵션에 입력하면 연결됩니다(`✓ extension connected`).
 이후 프롬프트에 `ping` 또는 `tabs_list` 를 입력하면 응답이 그대로 출력됩니다.
 
-## 현재 지원 명령 (Phase 1)
+## 현재 지원 명령
 
-| method | 결과 |
-|--------|------|
-| `ping` | `"pong"` |
-| `tabs_list` | 열린 탭 목록 (id, url, title, active 등) |
+| method | params | 결과 |
+|--------|--------|------|
+| `ping` | — | `"pong"` |
+| `tabs_list` | — | 열린 탭 목록 (id, url, title, active 등) |
+| `snapshot` | `tabId?` | 인터랙티브 요소 + `@eN` ref, url/title, truncated |
+| `screenshot` | `tabId?` | `{ mimeType, dataB64 }` (보이는 영역 PNG) |
 
-내비게이션·클릭·입력·스냅샷은 Phase 2–3에서 추가됩니다.
+`tabId` 를 생략하면 활성 탭을 대상으로 합니다.
+
+세션 쪽에서는 `mcp__happy__browser_tabs` / `browser_snapshot` / `browser_screenshot`
+도구로 노출됩니다.
+
+내비게이션·클릭·입력은 Phase 3에서 추가됩니다. 스냅샷의 ref 는 페이지가
+바뀌면 무효가 되므로 그때는 다시 스냅샷을 떠야 합니다.
 
 ## 테스트
 
