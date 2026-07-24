@@ -8,6 +8,9 @@
  *   node scripts/dev-bridge.mjs
  *   > paste the printed token into the extension options page
  *   > then type a method name (ping / tabs_list) and press enter
+ *
+ * BRIDGE_AUTO=1 runs ping + tabs_list automatically on the first connection
+ * and exits — for unattended verification.
  */
 
 import { WebSocketServer } from 'ws'
@@ -58,18 +61,36 @@ wss.on('connection', (socket, request) => {
     })
 })
 
-const rl = createInterface({ input: process.stdin, output: process.stdout, prompt: 'method> ' })
-rl.prompt()
-rl.on('line', async (line) => {
-    const method = line.trim()
-    if (!method) return rl.prompt()
-    if (!extension) {
-        console.log('아직 확장이 연결되지 않았습니다.')
-        return rl.prompt()
-    }
+function call(method) {
     const id = nextId++
     const answered = new Promise((resolve) => pending.set(id, resolve))
     extension.send(JSON.stringify({ id, method, params: {} }))
-    console.log(JSON.stringify(await answered, null, 2))
+    return answered
+}
+
+if (process.env.BRIDGE_AUTO) {
+    wss.on('connection', async (socket) => {
+        if (extension !== socket) return
+        // Let the extension finish its own setup before probing it.
+        await new Promise((r) => setTimeout(r, 200))
+        for (const method of ['ping', 'tabs_list']) {
+            console.log(`\n--- ${method} ---`)
+            console.log(JSON.stringify(await call(method), null, 2))
+        }
+        console.log('\nOK — 확장이 실제 Chrome에서 응답했습니다.')
+        process.exit(0)
+    })
+} else {
+    const rl = createInterface({ input: process.stdin, output: process.stdout, prompt: 'method> ' })
     rl.prompt()
-})
+    rl.on('line', async (line) => {
+        const method = line.trim()
+        if (!method) return rl.prompt()
+        if (!extension) {
+            console.log('아직 확장이 연결되지 않았습니다.')
+            return rl.prompt()
+        }
+        console.log(JSON.stringify(await call(method), null, 2))
+        rl.prompt()
+    })
+}
