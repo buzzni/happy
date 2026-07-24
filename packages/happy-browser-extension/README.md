@@ -38,6 +38,18 @@ curl -s localhost:$PORT/browser/status
 curl -s localhost:$PORT/browser/request -H 'Content-Type: application/json' -d '{"method":"tabs_list"}'
 ```
 
+## 데몬 없이 확인하기 (dev-bridge)
+
+프로덕션 데몬이 세션을 물고 있어 재시작할 수 없을 때 사용합니다.
+데몬과 같은 프로토콜을 말하는 독립 브리지라 확장은 실제와 동일하게 붙습니다.
+
+```bash
+node packages/happy-browser-extension/scripts/dev-bridge.mjs
+```
+
+출력된 토큰을 확장 옵션에 입력하면 연결됩니다(`✓ extension connected`).
+이후 프롬프트에 `ping` 또는 `tabs_list` 를 입력하면 응답이 그대로 출력됩니다.
+
 ## 현재 지원 명령 (Phase 1)
 
 | method | 결과 |
