@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { relayProxyHttpRequest } from '@/app/api/routes/previewRoutes';
+import {
+    buildPreviewUpstreamPath,
+    relayProxyHttpRequest,
+} from '@/app/api/routes/previewRoutes';
 
 function socket(id: string, response: unknown) {
     const emitWithAck = vi.fn(async () => {
@@ -59,5 +62,42 @@ describe('relayProxyHttpRequest', () => {
         await expect(relayProxyHttpRequest([a as never, b as never], payload, 10))
             .rejects
             .toThrow();
+    });
+});
+
+describe('buildPreviewUpstreamPath', () => {
+    it('preserves Vite valueless query flags byte-for-byte', () => {
+        expect(buildPreviewUpstreamPath(
+            'src/routes/+page.svelte',
+            '/v1/preview/machine-1/30024/src/routes/+page.svelte?svelte&type=style&lang.css',
+        )).toBe('/src/routes/+page.svelte?svelte&type=style&lang.css');
+    });
+
+    it('removes only ptoken while preserving order, duplicates, and encoding', () => {
+        expect(buildPreviewUpstreamPath(
+            'src/routes/+page.svelte',
+            '/v1/preview/machine-1/30024/src/routes/+page.svelte?svelte&ptoken=secret&type=style&lang.css&x=a%2Bb&x=2',
+        )).toBe('/src/routes/+page.svelte?svelte&type=style&lang.css&x=a%2Bb&x=2');
+    });
+
+    it('removes an encoded ptoken key without normalizing sibling parameters', () => {
+        expect(buildPreviewUpstreamPath(
+            'asset.js',
+            '/v1/preview/machine-1/30024/asset.js?before&p%74oken=secret%2Bvalue&after=',
+        )).toBe('/asset.js?before&after=');
+    });
+
+    it('preserves empty query pairs while removing ptoken', () => {
+        expect(buildPreviewUpstreamPath(
+            'asset.js',
+            '/v1/preview/machine-1/30024/asset.js?before&&ptoken=secret&after=&',
+        )).toBe('/asset.js?before&&after=&');
+    });
+
+    it('keeps paths without a query unchanged', () => {
+        expect(buildPreviewUpstreamPath(
+            'src/app.css',
+            '/v1/preview/machine-1/30024/src/app.css',
+        )).toBe('/src/app.css');
     });
 });

@@ -123,6 +123,28 @@ function filterForwardedHeaders(raw: Record<string, string | string[] | undefine
     return out;
 }
 
+function isPreviewTokenQueryPair(pair: string): boolean {
+    const separatorIndex = pair.indexOf('=');
+    const rawKey = separatorIndex === -1 ? pair : pair.slice(0, separatorIndex);
+    try {
+        return decodeURIComponent(rawKey.replace(/\+/g, ' ')) === 'ptoken';
+    } catch {
+        return rawKey === 'ptoken';
+    }
+}
+
+export function buildPreviewUpstreamPath(subPath: string, rawUrl: string): string {
+    const queryIndex = rawUrl.indexOf('?');
+    if (queryIndex === -1) return `/${subPath}`;
+
+    const query = rawUrl.slice(queryIndex + 1);
+    const forwardedQuery = query
+        .split('&')
+        .filter((pair) => !isPreviewTokenQueryPair(pair))
+        .join('&');
+    return `/${subPath}${forwardedQuery ? `?${forwardedQuery}` : ''}`;
+}
+
 export function stripResponseHeaders(
     headers: Record<string, string>,
     prefix?: string,
@@ -408,16 +430,16 @@ export function previewRoutes(app: Fastify) {
                     log({ module: 'preview', level: 'warn' }, `multiple machine sockets for preview relay: user=${claims.userId} machine=${params.machineId} count=${machineSockets.length}`);
                 }
 
-                // Build the upstream path (everything after `:port/`) + query string
-                // excluding the ptoken we added.
+                // Build the upstream path (everything after `:port/`) while
+                // preserving raw query syntax. Vite virtual modules use
+                // valueless flags such as `?svelte&type=style&lang.css`;
+                // URLSearchParams would normalize them to `svelte=` and break
+                // plugin matching. Strip only the relay auth token.
                 const subPath = params['*'] ?? '';
-                const upstreamQuery = new URLSearchParams();
-                for (const [k, v] of Object.entries(request.query as Record<string, string>)) {
-                    if (k === 'ptoken') continue;
-                    upstreamQuery.append(k, v);
-                }
-                const qs = upstreamQuery.toString();
-                const upstreamPath = `/${subPath}${qs ? `?${qs}` : ''}`;
+                const upstreamPath = buildPreviewUpstreamPath(
+                    subPath,
+                    request.raw.url ?? request.url,
+                );
 
                 const bodyBuf: Buffer | undefined = request.body as Buffer | undefined;
                 const bodyB64 = bodyBuf && bodyBuf.length > 0 ? bodyBuf.toString('base64') : null;
