@@ -58,14 +58,20 @@ node packages/happy-browser-extension/scripts/dev-bridge.mjs
 | `tabs_list` | — | 열린 탭 목록 (id, url, title, active 등) |
 | `snapshot` | `tabId?` | 인터랙티브 요소 + `@eN` ref, url/title, truncated |
 | `screenshot` | `tabId?` | `{ mimeType, dataB64 }` (보이는 영역 PNG) |
+| `click` | `ref`, `tabId?` | `{ ok: true }` |
+| `fill` | `ref`, `value`, `tabId?` | `{ ok: true }` (`value: ""` 로 필드 지우기) |
+| `navigate` | `url`, `tabId?` | `{ ok: true }` |
+| `tabs_open` | `url` | 새 탭 정보 (id, windowId, url) |
+| `tabs_close` | `tabId` | `{ ok: true }` |
 
-`tabId` 를 생략하면 활성 탭을 대상으로 합니다.
+`tabId` 를 생략하면 활성 탭을 대상으로 합니다. `ref` 는 가장 최근 `snapshot` 이
+돌려준 `@eN` 값입니다 — 페이지가 바뀌면(내비게이션 포함) 무효화되므로 그때는
+다시 스냅샷을 떠야 합니다. 무효한 ref 로 click/fill 을 호출하면 재스냅샷을
+안내하는 메시지와 함께 실패합니다.
 
-세션 쪽에서는 `mcp__happy__browser_tabs` / `browser_snapshot` / `browser_screenshot`
-도구로 노출됩니다.
-
-내비게이션·클릭·입력은 Phase 3에서 추가됩니다. 스냅샷의 ref 는 페이지가
-바뀌면 무효가 되므로 그때는 다시 스냅샷을 떠야 합니다.
+세션 쪽에서는 `mcp__happy__browser_tabs` / `browser_snapshot` /
+`browser_screenshot` / `browser_click` / `browser_fill` / `browser_navigate` /
+`browser_open_tab` / `browser_close_tab` 도구로 노출됩니다.
 
 ## 테스트
 
