@@ -276,6 +276,24 @@ describe('handleCommand', () => {
             const chrome = fakeChrome({ tabs: [WORK_TAB, BANK_TAB], allowlist: 'work.test' })
             const response = await handleCommand({ id: 31, method: 'snapshot', params: { tabId: 3 } }, chrome)
             expect(response.error.code).toBe('SITE_NOT_ALLOWED')
+        })
+
+        it('does not echo a blocked tab\'s url back in the refusal', async () => {
+            // Otherwise tabs_list filtering is pointless: the agent walks tab
+            // ids and reads the URLs it is not allowed to see straight out of
+            // the error messages.
+            const chrome = fakeChrome({ tabs: [WORK_TAB, BANK_TAB], allowlist: 'work.test' })
+            for (const method of ['snapshot', 'screenshot', 'click', 'tabs_close']) {
+                const response = await handleCommand({ id: 31, method, params: { tabId: 3, ref: '@e1' } }, chrome)
+                expect(response.error.code).toBe('SITE_NOT_ALLOWED')
+                expect(response.error.message).not.toContain('bank.example')
+                expect(response.error.message).not.toContain('/accounts')
+            }
+        })
+
+        it('does echo a caller-supplied destination url, which the caller already knows', async () => {
+            const chrome = fakeChrome({ tabs: [WORK_TAB], allowlist: 'work.test' })
+            const response = await handleCommand({ id: 31, method: 'tabs_open', params: { url: 'https://bank.example/' } }, chrome)
             expect(response.error.message).toContain('bank.example')
         })
 

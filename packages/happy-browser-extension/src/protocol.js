@@ -22,9 +22,26 @@ async function readAllowlist(chrome) {
     return parseAllowlist(allowlist)
 }
 
-function assertUrlAllowed(url, allowlist) {
+const ALLOWLIST_HINT = 'the site allowlist configured in the Happy Browser Bridge extension'
+
+/**
+ * For a URL the caller supplied (a navigate/tabs_open destination). Echoing
+ * it back tells them nothing they didn't already know.
+ */
+function assertDestinationAllowed(url, allowlist) {
     if (!isUrlAllowed(url, allowlist)) {
-        throw new CommandError('SITE_NOT_ALLOWED', `${url ?? 'this tab'} is outside the site allowlist configured in the Happy Browser Bridge extension`)
+        throw new CommandError('SITE_NOT_ALLOWED', `${url} is outside ${ALLOWLIST_HINT}`)
+    }
+}
+
+/**
+ * For a tab the caller only named by id. The URL must NOT appear in the
+ * refusal: an agent could otherwise walk tab ids and read back the URLs of
+ * exactly the tabs tabs_list filtering exists to hide.
+ */
+function assertTabAllowed(url, allowlist) {
+    if (!isUrlAllowed(url, allowlist)) {
+        throw new CommandError('SITE_NOT_ALLOWED', `That tab is outside ${ALLOWLIST_HINT}`)
     }
 }
 
@@ -50,7 +67,7 @@ async function resolveTab(params, chrome, allowlist) {
     if (!tab || tab.id === undefined) {
         throw new CommandError('NO_ACTIVE_TAB', 'No active tab to act on')
     }
-    assertUrlAllowed(tab.url, allowlist)
+    assertTabAllowed(tab.url, allowlist)
     return tab
 }
 
@@ -165,14 +182,14 @@ const handlers = {
         const tab = await resolveTab(params, chrome, allowlist)
         // Both ends are checked: without the destination check the allowlist
         // is trivially bypassed by navigating a permitted tab elsewhere.
-        assertUrlAllowed(url, allowlist)
+        assertDestinationAllowed(url, allowlist)
         await chrome.tabs.update(tab.id, { url })
         return { ok: true }
     },
 
     tabs_open: async (params, chrome, allowlist) => {
         const url = requireParam(params, 'url')
-        assertUrlAllowed(url, allowlist)
+        assertDestinationAllowed(url, allowlist)
         return chrome.tabs.create({ url })
     },
 
