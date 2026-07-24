@@ -7,7 +7,16 @@
 
 import { BrowserClientError } from '@/daemon/browserClient'
 
-export const BROWSER_TOOL_NAMES = ['browser_tabs', 'browser_snapshot', 'browser_screenshot'] as const
+export const BROWSER_TOOL_NAMES = [
+    'browser_tabs',
+    'browser_snapshot',
+    'browser_screenshot',
+    'browser_click',
+    'browser_fill',
+    'browser_navigate',
+    'browser_open_tab',
+    'browser_close_tab',
+] as const
 
 type ToolContent =
     | { type: 'text'; text: string }
@@ -60,10 +69,31 @@ function renderSnapshot(result: any): string {
     return `${header}\n\n${body}${note}`
 }
 
+export type BrowserBridgeMethod =
+    | 'tabs_list' | 'snapshot' | 'screenshot'
+    | 'click' | 'fill' | 'navigate' | 'tabs_open' | 'tabs_close'
+
+function renderSuccess(method: BrowserBridgeMethod, params: any, result: any): string {
+    switch (method) {
+        case 'click':
+            return `Clicked ${params.ref}.`
+        case 'fill':
+            return `Filled ${params.ref} with ${JSON.stringify(params.value)}.`
+        case 'navigate':
+            return `Navigated to ${params.url}.`
+        case 'tabs_open':
+            return `Opened tab ${result.id} at ${result.url}.`
+        case 'tabs_close':
+            return `Closed tab ${params.tabId}.`
+        default:
+            return 'Done.'
+    }
+}
+
 export async function runBrowserTool({ request, method, params }: {
     request: BridgeRequest
-    method: 'tabs_list' | 'snapshot' | 'screenshot'
-    params: unknown
+    method: BrowserBridgeMethod
+    params: any
 }): Promise<BrowserToolResult> {
     let result: any
     try {
@@ -81,6 +111,10 @@ export async function runBrowserTool({ request, method, params }: {
             isError: false,
         }
     }
-    const text = method === 'tabs_list' ? renderTabs(result) : renderSnapshot(result)
+    let text: string
+    if (method === 'tabs_list') text = renderTabs(result)
+    else if (method === 'snapshot') text = renderSnapshot(result)
+    else text = renderSuccess(method, params, result)
+
     return { content: [{ type: 'text', text }], isError: false }
 }

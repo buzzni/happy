@@ -211,6 +211,52 @@ function registerBrowserTools(mcp: McpServer): void {
             tabId: z.number().optional().describe('Tab to capture (defaults to the active tab)'),
         },
     }, async (args) => runBrowserTool({ request: bridge, method: 'screenshot', params: { tabId: args.tabId } }));
+
+    mcp.registerTool('browser_click', {
+        description:
+            'Click an element in the user\'s Chrome by its @eN ref from the most recent browser_snapshot. If the ref is stale (the page navigated or changed) this fails and tells you to re-snapshot.',
+        title: 'Click an element',
+        inputSchema: {
+            ref: z.string().describe('Element ref from browser_snapshot, e.g. "@e3"'),
+            tabId: z.number().optional().describe('Tab the ref belongs to (defaults to the active tab)'),
+        },
+    }, async (args) => runBrowserTool({ request: bridge, method: 'click', params: { ref: args.ref, tabId: args.tabId } }));
+
+    mcp.registerTool('browser_fill', {
+        description:
+            'Set the value of a text input, textarea or editable element in the user\'s Chrome by its @eN ref from the most recent browser_snapshot.',
+        title: 'Fill an element',
+        inputSchema: {
+            ref: z.string().describe('Element ref from browser_snapshot, e.g. "@e3"'),
+            value: z.string().describe('Text to enter. An empty string clears the field.'),
+            tabId: z.number().optional().describe('Tab the ref belongs to (defaults to the active tab)'),
+        },
+    }, async (args) => runBrowserTool({ request: bridge, method: 'fill', params: { ref: args.ref, value: args.value, tabId: args.tabId } }));
+
+    mcp.registerTool('browser_navigate', {
+        description: "Navigate a tab in the user's Chrome to a URL. This invalidates any refs from an earlier browser_snapshot of that tab — re-snapshot after navigating.",
+        title: 'Navigate a tab',
+        inputSchema: {
+            url: z.string().describe('URL to navigate to'),
+            tabId: z.number().optional().describe('Tab to navigate (defaults to the active tab)'),
+        },
+    }, async (args) => runBrowserTool({ request: bridge, method: 'navigate', params: { url: args.url, tabId: args.tabId } }));
+
+    mcp.registerTool('browser_open_tab', {
+        description: "Open a new tab in the user's Chrome at a URL.",
+        title: 'Open a new tab',
+        inputSchema: {
+            url: z.string().describe('URL to open'),
+        },
+    }, async (args) => runBrowserTool({ request: bridge, method: 'tabs_open', params: { url: args.url } }));
+
+    mcp.registerTool('browser_close_tab', {
+        description: "Close a tab in the user's Chrome. Use browser_tabs first to find the tabId.",
+        title: 'Close a tab',
+        inputSchema: {
+            tabId: z.number().describe('Tab id from browser_tabs'),
+        },
+    }, async (args) => runBrowserTool({ request: bridge, method: 'tabs_close', params: { tabId: args.tabId } }));
 }
 
 export async function startHappyServer(client: ApiSessionClient) {

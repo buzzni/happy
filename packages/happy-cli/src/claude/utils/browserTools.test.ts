@@ -14,8 +14,17 @@ const fails = (code: string, message: string) => async () => {
 }
 
 describe('BROWSER_TOOL_NAMES', () => {
-    it('exposes the read-only browser tools', () => {
-        expect(BROWSER_TOOL_NAMES).toEqual(['browser_tabs', 'browser_snapshot', 'browser_screenshot'])
+    it('exposes the read and interaction browser tools', () => {
+        expect(BROWSER_TOOL_NAMES).toEqual([
+            'browser_tabs',
+            'browser_snapshot',
+            'browser_screenshot',
+            'browser_click',
+            'browser_fill',
+            'browser_navigate',
+            'browser_open_tab',
+            'browser_close_tab',
+        ])
     })
 })
 
@@ -121,5 +130,44 @@ describe('runBrowserTool', () => {
             params: { tabId: 42 },
         })
         expect(seen).toEqual({ method: 'snapshot', params: { tabId: 42 } })
+    })
+
+    describe('interaction commands', () => {
+        it('confirms a click in plain text', async () => {
+            const result = await runBrowserTool({ request: ok({ ok: true }), method: 'click', params: { ref: '@e1' } })
+            expect(result.isError).toBe(false)
+            expect(textOf(result)).toContain('@e1')
+        })
+
+        it('confirms a fill in plain text', async () => {
+            const result = await runBrowserTool({ request: ok({ ok: true }), method: 'fill', params: { ref: '@e2', value: 'hi' } })
+            expect(result.isError).toBe(false)
+            expect(textOf(result)).toContain('@e2')
+        })
+
+        it('confirms navigation with the destination url', async () => {
+            const result = await runBrowserTool({ request: ok({ ok: true }), method: 'navigate', params: { url: 'https://b.com' } })
+            expect(textOf(result)).toContain('https://b.com')
+        })
+
+        it('reports the new tab id after tabs_open', async () => {
+            const result = await runBrowserTool({ request: ok({ id: 55, windowId: 2, url: 'https://c.com' }), method: 'tabs_open', params: { url: 'https://c.com' } })
+            expect(textOf(result)).toContain('55')
+        })
+
+        it('confirms tabs_close', async () => {
+            const result = await runBrowserTool({ request: ok({ ok: true }), method: 'tabs_close', params: { tabId: 7 } })
+            expect(result.isError).toBe(false)
+        })
+
+        it('surfaces a stale-ref failure with its re-snapshot guidance intact', async () => {
+            const result = await runBrowserTool({
+                request: fails('ACTION_FAILED', 'No element for @e9 — the page may have changed since the last snapshot. Take a new snapshot and use its refs.'),
+                method: 'click',
+                params: { ref: '@e9' },
+            })
+            expect(result.isError).toBe(true)
+            expect(textOf(result)).toContain('Take a new snapshot')
+        })
     })
 })
