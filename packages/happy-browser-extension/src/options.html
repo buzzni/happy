@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>Happy Browser Bridge 설정</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 30rem; margin: 2rem auto; padding: 0 1rem; }
+    label { display: block; margin-top: 1rem; font-weight: 600; }
+    input { width: 100%; padding: .4rem; margin-top: .25rem; font-family: ui-monospace, monospace; }
+    button { margin-top: 1.25rem; padding: .5rem 1rem; }
+    .hint { color: #666; font-weight: 400; font-size: .85rem; }
+    #status { margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Happy Browser Bridge</h1>
+  <p class="hint">happy 데몬이 이 Chrome 프로필을 제어할 수 있게 연결합니다. 토큰은 데몬이 실행 중인 머신의 <code>~/.happy/browser-bridge.token</code> 에 있습니다.</p>
+
+  <label for="port">포트 <span class="hint">(기본 41777)</span></label>
+  <input id="port" type="number" min="1" max="65535">
+
+  <label for="token">Pairing 토큰</label>
+  <input id="token" type="password" autocomplete="off" spellcheck="false">
+
+  <label for="profile">프로필 이름 <span class="hint">(여러 Chrome 프로필을 구분할 때)</span></label>
+  <input id="profile" type="text" autocomplete="off" spellcheck="false">
+
+  <button id="save">저장하고 연결</button>
+  <p id="status"></p>
+
+  <script type="module" src="options.js"></script>
+</body>
+</html>
