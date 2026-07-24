@@ -9,7 +9,7 @@
 import { collectSnapshot } from './snapshot.js'
 import { clickRef, fillRef, locateRef } from './actions.js'
 import { parseAllowlist, isUrlAllowed } from './allowlist.js'
-import { hasDebuggerPermission, captureFullPage, dispatchTrustedClick, insertTrustedText } from './cdp.js'
+import { isDebuggerTierEnabled, captureFullPage, dispatchTrustedClick, insertTrustedText } from './cdp.js'
 
 export class CommandError extends Error {
     constructor(code, message) {
@@ -127,7 +127,7 @@ const handlers = {
     // discovering it by having a command fail.
     capabilities: async (_params, chrome) => ({
         commands: Object.keys(handlers),
-        debugger: await hasDebuggerPermission(chrome),
+        debugger: await isDebuggerTierEnabled(chrome),
     }),
 
     tabs_list: async (_params, chrome, allowlist) => {

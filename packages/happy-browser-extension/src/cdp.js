@@ -1,43 +1,57 @@
 /**
  * Chrome DevTools Protocol tier (Phase 5).
  *
- * `debugger` is an *optional* permission, and deliberately so: attaching puts
- * a "Chrome is being debugged" banner on the tab and grants far more power
- * than the tabs/scripting tier. Only the user can turn it on (from the
- * options page — chrome.permissions.request needs a user gesture), which is
- * the same property the allowlist relies on: the agent cannot widen its own
- * authority.
+ * Attaching puts a "Chrome is being debugged" banner on the tab and grants
+ * far more power than the tabs/scripting tier, so it stays off until the
+ * user turns it on.
+ *
+ * That gate is a stored setting rather than an optional Chrome permission,
+ * because Chrome does not allow one: `debugger` is on the documented list of
+ * permissions that cannot appear in `optional_permissions` (alongside
+ * `proxy`, `devtools`, ...). Declaring it there is silently ignored, and the
+ * runtime request then fails with "Only permissions specified in the
+ * manifest may be requested" — which is how this was found. So `debugger` is
+ * a required permission and we enforce the opt-in ourselves.
+ *
+ * The security property that matters is preserved: the agent has no protocol
+ * command that writes extension storage, so it cannot switch this on for
+ * itself — the same reasoning as the allowlist. What is weaker than a real
+ * optional permission: Chrome grants the capability at install time, so the
+ * install prompt warns about it and the guard is our code rather than the
+ * browser's. Per-use visibility still comes from Chrome's own banner.
  *
  * Scope is limited to what genuinely needs CDP:
  *   - trusted input (isTrusted events; synthetic ones are refused by some
  *     editors and by anything guarding against scripted clicks)
  *   - full-page screenshots (captureBeyondViewport)
  * iframe/shadow-DOM traversal is deliberately NOT here — executeScript's
- * `allFrames` and `element.shadowRoot` cover it without this permission.
+ * `allFrames` and `element.shadowRoot` cover it without any of this.
  */
 
 const PROTOCOL_VERSION = '1.3'
 
 export class DebuggerUnavailableError extends Error {
     constructor() {
-        super('The debugger permission is not granted. Ask the user to enable "정밀 제어(디버거)" in the Happy Browser Bridge options page — only they can grant it.')
+        super('The debugger tier is turned off. Ask the user to enable "정밀 제어(디버거)" in the Happy Browser Bridge options page — only they can turn it on.')
         this.code = 'DEBUGGER_NOT_AVAILABLE'
     }
 }
 
-export async function hasDebuggerPermission(chrome) {
+export async function isDebuggerTierEnabled(chrome) {
     try {
-        return await chrome.permissions.contains({ permissions: ['debugger'] })
+        const { debuggerTier } = await chrome.storage.local.get(['debuggerTier'])
+        return debuggerTier === true
     } catch {
-        // Older Chrome, or a stripped-down test double: treat as unavailable
-        // rather than letting the whole command fail.
+        // A stripped-down test double, or storage unavailable: treat as off
+        // rather than letting the whole command fail — and off is the safe
+        // direction for a capability this broad.
         return false
     }
 }
 
 /** Attach for the duration of `body`, and always detach afterwards. */
 export async function withDebugger(chrome, tabId, body) {
-    if (!(await hasDebuggerPermission(chrome))) throw new DebuggerUnavailableError()
+    if (!(await isDebuggerTierEnabled(chrome))) throw new DebuggerUnavailableError()
 
     const target = { tabId }
     await chrome.debugger.attach(target, PROTOCOL_VERSION)

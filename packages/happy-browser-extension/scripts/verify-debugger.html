@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Happy Bridge Debugger Verify Page</title></head>
+<body>
+  <h1>Debugger tier verify page</h1>
+
+  <input id="trusted-marker" aria-label="Marker" readonly value="not-clicked">
+  <button id="trusted-btn">Trusted-only button</button>
+
+  <input id="text-target" aria-label="Text target" placeholder="type here">
+
+  <div style="height: 2500px"></div>
+  <div id="bottom" style="background:#c00; color:#fff; padding: 2rem;">BOTTOM OF PAGE — only visible in a full-page capture</div>
+
+  <script>
+    // Only reacts to a real (isTrusted) click — a scripted click.click() must
+    // NOT flip this, which is exactly what distinguishes the debugger tier's
+    // trusted input from the plain tabs/scripting one.
+    document.getElementById('trusted-btn').addEventListener('click', function (e) {
+      document.getElementById('trusted-marker').value = e.isTrusted ? 'trusted-clicked' : 'untrusted-clicked'
+    })
+  </script>
+</body>
+</html>

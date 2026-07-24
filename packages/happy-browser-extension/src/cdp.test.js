@@ -1,11 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { hasDebuggerPermission, withDebugger, captureFullPage, dispatchTrustedClick, insertTrustedText, DebuggerUnavailableError } from './cdp.js'
+import { isDebuggerTierEnabled, withDebugger, captureFullPage, dispatchTrustedClick, insertTrustedText, DebuggerUnavailableError } from './cdp.js'
 
 function fakeChrome({ granted = true, sendCommand, attach, detach } = {}) {
     const calls = []
     return {
         calls,
-        permissions: { contains: async () => granted },
+        storage: { local: { get: async () => ({ debuggerTier: granted }) } },
         debugger: {
             attach: attach ?? (async (target, version) => { calls.push(['attach', target, version]) }),
             detach: detach ?? (async (target) => { calls.push(['detach', target]) }),
@@ -17,17 +17,21 @@ function fakeChrome({ granted = true, sendCommand, attach, detach } = {}) {
     }
 }
 
-describe('hasDebuggerPermission', () => {
-    it('is true when the optional permission has been granted', async () => {
-        expect(await hasDebuggerPermission(fakeChrome({ granted: true }))).toBe(true)
+describe('isDebuggerTierEnabled', () => {
+    it('is true once the user has turned the tier on', async () => {
+        expect(await isDebuggerTierEnabled(fakeChrome({ granted: true }))).toBe(true)
     })
 
-    it('is false when it has not', async () => {
-        expect(await hasDebuggerPermission(fakeChrome({ granted: false }))).toBe(false)
+    it('is false while it is off', async () => {
+        expect(await isDebuggerTierEnabled(fakeChrome({ granted: false }))).toBe(false)
     })
 
-    it('is false rather than throwing when the API is missing entirely', async () => {
-        expect(await hasDebuggerPermission({})).toBe(false)
+    it('is false rather than throwing when storage is unavailable', async () => {
+        expect(await isDebuggerTierEnabled({})).toBe(false)
+    })
+
+    it('defaults to off when the setting was never written', async () => {
+        expect(await isDebuggerTierEnabled({ storage: { local: { get: async () => ({}) } } })).toBe(false)
     })
 })
 
@@ -55,13 +59,13 @@ describe('withDebugger', () => {
         await expect(withDebugger(chrome, 7, async () => 'done')).resolves.toBe('done')
     })
 
-    it('refuses up front when the permission is not granted', async () => {
+    it('refuses up front when the tier is off', async () => {
         const chrome = fakeChrome({ granted: false })
         await expect(withDebugger(chrome, 7, async () => 'done')).rejects.toBeInstanceOf(DebuggerUnavailableError)
         expect(chrome.calls).toEqual([])
     })
 
-    it('explains how to turn the permission on', async () => {
+    it('explains how to turn the tier on', async () => {
         const chrome = fakeChrome({ granted: false })
         await expect(withDebugger(chrome, 7, async () => 'x')).rejects.toThrow(/options/i)
     })

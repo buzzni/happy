@@ -36,37 +36,32 @@ document.getElementById('save').addEventListener('click', async () => {
         : `저장했습니다. ${patterns.length}개 패턴만 허용됩니다: ${patterns.join(', ')}`
 })
 
-// The debugger tier. chrome.permissions.request only works from a user
-// gesture on an extension page, which is exactly why the agent cannot grant
-// itself this — same property the allowlist depends on.
-//
-// It must be called synchronously inside the click handler, with no `await`
-// before it: any await lets a microtask/event-loop turn pass first, which
-// can drop Chrome's transient user-activation flag and make the call reject
-// with a "must be called during a user gesture" error — silently, if nothing
-// catches it, which looked to the user like the button doing nothing.
-// `debuggerGranted` is kept in memory so the handler doesn't need to await
-// `permissions.contains()` first to decide request vs remove.
-const DEBUGGER_PERMISSION = { permissions: ['debugger'] }
+// The debugger tier is gated by a stored setting, not an optional Chrome
+// permission: Chrome does not allow `debugger` in optional_permissions (it is
+// on the documented exclusion list), so requesting it at runtime fails with
+// "Only permissions specified in the manifest may be requested". See cdp.js
+// for the full reasoning. The agent has no command that writes extension
+// storage, so it still cannot switch this on for itself.
 const debuggerButton = document.getElementById('toggle-debugger')
 const debuggerStatus = document.getElementById('debugger-status')
-let debuggerGranted = false
+let debuggerEnabled = false
 
-function renderDebuggerState(granted) {
-    debuggerGranted = granted
-    debuggerButton.textContent = granted ? '정밀 제어 끄기' : '정밀 제어 켜기'
-    debuggerStatus.textContent = granted
+function renderDebuggerState(enabled) {
+    debuggerEnabled = enabled
+    debuggerButton.textContent = enabled ? '정밀 제어 끄기' : '정밀 제어 켜기'
+    debuggerStatus.textContent = enabled
         ? '켜짐 — trusted 입력과 전체 페이지 스크린샷을 쓸 수 있습니다.'
         : '꺼짐 — 나머지 기능은 그대로 동작합니다.'
 }
 
-debuggerButton.addEventListener('click', () => {
-    const action = debuggerGranted
-        ? chrome.permissions.remove(DEBUGGER_PERMISSION)
-        : chrome.permissions.request(DEBUGGER_PERMISSION)
-    action
-        .then((result) => renderDebuggerState(debuggerGranted ? false : result))
-        .catch((e) => { debuggerStatus.textContent = `오류: ${e.message}` })
+debuggerButton.addEventListener('click', async () => {
+    try {
+        const next = !debuggerEnabled
+        await chrome.storage.local.set({ debuggerTier: next })
+        renderDebuggerState(next)
+    } catch (e) {
+        debuggerStatus.textContent = `오류: ${e.message}`
+    }
 })
 
-renderDebuggerState(await chrome.permissions.contains(DEBUGGER_PERMISSION))
+renderDebuggerState((await chrome.storage.local.get(['debuggerTier'])).debuggerTier === true)

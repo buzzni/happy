@@ -6,8 +6,7 @@ function fakeChrome({ tabs = [], executeScript, captureVisibleTab, update, creat
     const cdpCalls = []
     return {
         cdpCalls,
-        storage: { local: { get: async () => (allowlist === undefined ? {} : { allowlist }) } },
-        permissions: { contains: async () => debuggerGranted },
+        storage: { local: { get: async () => ({ ...(allowlist === undefined ? {} : { allowlist }), debuggerTier: debuggerGranted }) } },
         debugger: {
             attach: async () => { cdpCalls.push(['attach']) },
             detach: async () => { cdpCalls.push(['detach']) },
