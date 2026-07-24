@@ -10,6 +10,7 @@ import { collectSnapshot } from './snapshot.js'
 import { clickRef, fillRef, locateRef } from './actions.js'
 import { parseAllowlist, isUrlAllowed } from './allowlist.js'
 import { isDebuggerTierEnabled, captureFullPage, dispatchTrustedClick, insertTrustedText } from './cdp.js'
+import { decodeRef, mergeFrameSnapshots } from './frameRefs.js'
 
 export class CommandError extends Error {
     constructor(code, message) {
@@ -89,12 +90,15 @@ function requireParam(params, name) {
  * the caller as the action having worked. So failure is a normal return
  * value (`{ok: false, code, message}`), checked here explicitly.
  */
-async function runPageAction(func, args, params, chrome, allowlist) {
+async function runPageAction(func, args, params, chrome, allowlist, frameId = 0) {
     const tab = await resolveTab(params, chrome, allowlist)
     let results
     try {
         results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            // Target one frame explicitly. Without frameIds Chrome runs the
+            // action in the main frame only, and with allFrames it would run
+            // in every frame against whatever @eN means there.
+            target: { tabId: tab.id, frameIds: [frameId] },
             func,
             args,
         })
@@ -154,14 +158,16 @@ const handlers = {
         let results
         try {
             results = await chrome.scripting.executeScript({
-                target: { tabId: tab.id },
+                // Every frame: an embedded editor or payment form lives in an
+                // iframe and is otherwise invisible to the agent.
+                target: { tabId: tab.id, allFrames: true },
                 func: collectSnapshot,
             })
         } catch (e) {
             // chrome:// pages, the Web Store, and PDF viewers refuse injection.
             throw new CommandError('INJECTION_FAILED', e instanceof Error ? e.message : String(e))
         }
-        return results[0].result
+        return mergeFrameSnapshots(results)
     },
 
     screenshot: async (params, chrome, allowlist) => {
@@ -177,17 +183,19 @@ const handlers = {
     },
 
     click: async (params, chrome, allowlist) => {
-        const ref = requireParam(params, 'ref')
+        // The agent holds a possibly frame-qualified ref; the injected
+        // function only understands the frame-local one.
+        const { frameId, innerRef } = decodeRef(requireParam(params, 'ref'))
         if (params.trusted) {
             const tab = await resolveTab(params, chrome, allowlist)
-            const point = await runPageAction(locateRef, [ref], params, chrome, allowlist)
+            const point = await runPageAction(locateRef, [innerRef], params, chrome, allowlist, frameId)
             return dispatchTrustedClick(chrome, tab.id, point)
         }
-        return runPageAction(clickRef, [ref], params, chrome, allowlist)
+        return runPageAction(clickRef, [innerRef], params, chrome, allowlist, frameId)
     },
 
     fill: async (params, chrome, allowlist) => {
-        const ref = requireParam(params, 'ref')
+        const { frameId, innerRef } = decodeRef(requireParam(params, 'ref'))
         // Unlike the other params, an empty string is valid here — it clears a field.
         if (params.value === undefined || params.value === null) {
             throw new CommandError('MISSING_PARAM', 'Missing required param: value')
@@ -195,10 +203,10 @@ const handlers = {
         if (params.trusted) {
             const tab = await resolveTab(params, chrome, allowlist)
             // locateRef focuses the element, so the inserted text lands in it.
-            await runPageAction(locateRef, [ref], params, chrome, allowlist)
+            await runPageAction(locateRef, [innerRef], params, chrome, allowlist, frameId)
             return insertTrustedText(chrome, tab.id, params.value)
         }
-        return runPageAction(fillRef, [ref, params.value], params, chrome, allowlist)
+        return runPageAction(fillRef, [innerRef, params.value], params, chrome, allowlist, frameId)
     },
 
     navigate: async (params, chrome, allowlist) => {

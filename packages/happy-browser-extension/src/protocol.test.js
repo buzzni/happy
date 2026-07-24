@@ -107,7 +107,7 @@ describe('handleCommand', () => {
                 },
             })
             const response = await handleCommand({ id: 6, method: 'snapshot' }, chrome)
-            expect(injectedTarget).toEqual({ tabId: 7 })
+            expect(injectedTarget).toEqual({ tabId: 7, allFrames: true })
             expect(response.result.elements).toEqual([{ ref: '@e1' }])
         })
 
@@ -121,7 +121,7 @@ describe('handleCommand', () => {
                 },
             })
             await handleCommand({ id: 7, method: 'snapshot', params: { tabId: 42 } }, chrome)
-            expect(injectedTarget).toEqual({ tabId: 42 })
+            expect(injectedTarget).toEqual({ tabId: 42, allFrames: true })
         })
 
         it('reports NO_ACTIVE_TAB when there is nothing to snapshot', async () => {
@@ -160,6 +160,86 @@ describe('handleCommand', () => {
         })
     })
 
+    describe('frames', () => {
+        const TAB = { id: 7, windowId: 1, index: 0, url: 'https://a.com', title: 'A', active: true }
+
+        it('snapshots every frame and merges them under non-colliding refs', async () => {
+            let injectOptions
+            const chrome = fakeChrome({
+                tabs: [TAB],
+                executeScript: async (options) => {
+                    injectOptions = options
+                    return [
+                        { frameId: 0, result: { url: 'https://a.com/', title: 'A', elements: [{ ref: '@e1', name: 'Main' }], truncated: false } },
+                        { frameId: 7, result: { url: 'https://embed.example/', title: 'E', elements: [{ ref: '@e1', name: 'Embedded' }], truncated: false } },
+                    ]
+                },
+            })
+            const response = await handleCommand({ id: 60, method: 'snapshot' }, chrome)
+            expect(injectOptions.target).toMatchObject({ tabId: 7, allFrames: true })
+            expect(response.result.elements.map((e) => e.ref)).toEqual(['@e1', '@f7:e1'])
+            expect(response.result.url).toBe('https://a.com/')
+        })
+
+        it('sends a click for a frame-qualified ref to that frame only', async () => {
+            let injectOptions
+            const chrome = fakeChrome({
+                tabs: [TAB],
+                executeScript: async (options) => {
+                    injectOptions = options
+                    return [{ frameId: 7, result: { ok: true } }]
+                },
+            })
+            const response = await handleCommand({ id: 61, method: 'click', params: { ref: '@f7:e1' } }, chrome)
+            expect(response.error).toBeUndefined()
+            // The frame-local ref is what the injected function understands.
+            expect(injectOptions.args).toEqual(['@e1'])
+            expect(injectOptions.target).toMatchObject({ tabId: 7, frameIds: [7] })
+        })
+
+        it('sends a main-frame click to the main frame, not every frame', async () => {
+            // Broadcasting to allFrames would run the action in each one and
+            // hit whatever @e1 happens to mean there.
+            let injectOptions
+            const chrome = fakeChrome({
+                tabs: [TAB],
+                executeScript: async (options) => {
+                    injectOptions = options
+                    return [{ frameId: 0, result: { ok: true } }]
+                },
+            })
+            await handleCommand({ id: 62, method: 'click', params: { ref: '@e1' } }, chrome)
+            expect(injectOptions.args).toEqual(['@e1'])
+            expect(injectOptions.target).toMatchObject({ tabId: 7, frameIds: [0] })
+        })
+
+        it('fills a frame-qualified ref in its own frame', async () => {
+            let injectOptions
+            const chrome = fakeChrome({
+                tabs: [TAB],
+                executeScript: async (options) => {
+                    injectOptions = options
+                    return [{ frameId: 3, result: { ok: true, value: 'hi' } }]
+                },
+            })
+            await handleCommand({ id: 63, method: 'fill', params: { ref: '@f3:e2', value: 'hi' } }, chrome)
+            expect(injectOptions.args).toEqual(['@e2', 'hi'])
+            expect(injectOptions.target).toMatchObject({ frameIds: [3] })
+        })
+
+        it('ignores frames that returned nothing rather than failing the snapshot', async () => {
+            const chrome = fakeChrome({
+                tabs: [TAB],
+                executeScript: async () => [
+                    { frameId: 0, result: { url: 'https://a.com/', title: 'A', elements: [{ ref: '@e1', name: 'Main' }], truncated: false } },
+                    { frameId: 4, result: null },
+                ],
+            })
+            const response = await handleCommand({ id: 64, method: 'snapshot' }, chrome)
+            expect(response.result.elements.map((e) => e.ref)).toEqual(['@e1'])
+        })
+    })
+
     describe('click and fill', () => {
         it('injects clickRef with the given ref into the target tab', async () => {
             let injected
@@ -171,7 +251,7 @@ describe('handleCommand', () => {
                 },
             })
             const response = await handleCommand({ id: 12, method: 'click', params: { ref: '@e1' } }, chrome)
-            expect(injected.target).toEqual({ tabId: 7 })
+            expect(injected.target).toEqual({ tabId: 7, frameIds: [0] })
             expect(injected.args).toEqual(['@e1'])
             expect(response.result).toEqual({ ok: true })
         })

@@ -124,6 +124,15 @@ node packages/happy-browser-extension/scripts/dev-bridge.mjs
 다시 스냅샷을 떠야 합니다. 무효한 ref 로 click/fill 을 호출하면 재스냅샷을
 안내하는 메시지와 함께 실패합니다.
 
+### 스냅샷 범위: shadow DOM 과 iframe
+
+- **open shadow root** 내부까지 수집합니다. 웹 컴포넌트의 컨트롤도 보입니다.
+  `closed` shadow root 은 브라우저가 `shadowRoot` 자체를 노출하지 않아 접근 불가입니다.
+- **모든 iframe** 을 수집합니다(임베드된 에디터·결제 폼 등). 프레임마다 자기
+  요소를 `@e1` 부터 번호 매기므로, 메인 프레임 밖 요소는 `@f7:e1` 처럼 프레임
+  id 로 한정된 ref 를 받고 `frameUrl` 이 함께 표시됩니다. click/fill 은 그 ref 가
+  가리키는 프레임에서만 실행됩니다.
+
 세션 쪽에서는 `mcp__happy__browser_tabs` / `browser_snapshot` /
 `browser_screenshot` / `browser_click` / `browser_fill` / `browser_navigate` /
 `browser_open_tab` / `browser_close_tab` / `browser_capabilities` 도구로 노출됩니다.

@@ -30,6 +30,7 @@ const INCLUDE = [
     'src/actions.js',
     'src/allowlist.js',
     'src/cdp.js',
+    'src/frameRefs.js',
     'src/backoff.js',
     'src/options.html',
     'src/options.js',
