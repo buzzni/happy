@@ -113,4 +113,56 @@ describe('collectSnapshot', () => {
         render('<button>Save</button>')
         expect(collectSnapshot().truncated).toBe(false)
     })
+
+    describe('shadow DOM', () => {
+        function attachShadow(hostId, html, mode = 'open') {
+            const root = document.getElementById(hostId).attachShadow({ mode })
+            root.innerHTML = html
+            return root
+        }
+
+        it('finds interactive elements inside an open shadow root', () => {
+            // querySelectorAll does not pierce shadow roots, so a web
+            // component's controls are invisible to a naive snapshot.
+            render('<div id="host"></div>')
+            attachShadow('host', '<button>In shadow</button>')
+            const { elements } = collectSnapshot()
+            expect(elements.map((e) => e.name)).toEqual(['In shadow'])
+        })
+
+        it('finds elements in both the light DOM and a shadow root', () => {
+            render('<button>Light</button><div id="host"></div>')
+            attachShadow('host', '<button>Shadow</button>')
+            expect(collectSnapshot().elements.map((e) => e.name)).toEqual(['Light', 'Shadow'])
+        })
+
+        it('descends into nested shadow roots', () => {
+            render('<div id="host"></div>')
+            const outer = attachShadow('host', '<div id="inner"></div>')
+            const innerRoot = outer.getElementById('inner').attachShadow({ mode: 'open' })
+            innerRoot.innerHTML = '<button>Deep</button>'
+            expect(collectSnapshot().elements.map((e) => e.name)).toEqual(['Deep'])
+        })
+
+        it('gives shadow elements refs that resolve like any other', () => {
+            render('<div id="host"></div>')
+            const root = attachShadow('host', '<button>In shadow</button>')
+            const { elements } = collectSnapshot()
+            expect(window.__happyRefs.get(elements[0].ref)).toBe(root.querySelector('button'))
+        })
+
+        it('cannot see into a closed shadow root, and that is a browser limit not a bug', () => {
+            render('<button>Light</button><div id="host"></div>')
+            attachShadow('host', '<button>Hidden</button>', 'closed')
+            expect(collectSnapshot().elements.map((e) => e.name)).toEqual(['Light'])
+        })
+
+        it('still honours the element cap across shadow boundaries', () => {
+            render('<div id="host"></div>')
+            attachShadow('host', Array.from({ length: 250 }, (_, i) => `<button>b${i}</button>`).join(''))
+            const snapshot = collectSnapshot()
+            expect(snapshot.elements).toHaveLength(200)
+            expect(snapshot.truncated).toBe(true)
+        })
+    })
 })

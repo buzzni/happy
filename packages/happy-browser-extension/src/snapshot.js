@@ -81,12 +81,7 @@ export function collectSnapshot() {
     const elements = []
     let truncated = false
 
-    for (const element of document.querySelectorAll(INTERACTIVE_SELECTOR)) {
-        if (!isVisible(element)) continue
-        if (elements.length >= MAX_ELEMENTS) {
-            truncated = true
-            break
-        }
+    const record = (element) => {
         const ref = `@e${elements.length + 1}`
         refs.set(ref, element)
         const entry = {
@@ -99,6 +94,28 @@ export function collectSnapshot() {
         if (element.disabled === true) entry.disabled = true
         elements.push(entry)
     }
+
+    // Walks every element under `root`, stepping into open shadow roots as it
+    // meets them. querySelectorAll does not pierce shadow boundaries, so a
+    // web component's controls are invisible without this. Recursing at the
+    // host keeps a component's internals next to it in the listing.
+    // Closed shadow roots expose no `shadowRoot` at all — that content is
+    // unreachable by design, not an oversight here.
+    const walk = (root) => {
+        for (const element of root.querySelectorAll('*')) {
+            if (elements.length >= MAX_ELEMENTS) {
+                truncated = true
+                return
+            }
+            if (element.matches(INTERACTIVE_SELECTOR) && isVisible(element)) record(element)
+            if (element.shadowRoot) {
+                walk(element.shadowRoot)
+                if (truncated) return
+            }
+        }
+    }
+
+    walk(document)
 
     // Replaced wholesale so refs always match the snapshot just handed out.
     window.__happyRefs = refs
