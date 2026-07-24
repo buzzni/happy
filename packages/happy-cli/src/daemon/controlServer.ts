@@ -16,6 +16,7 @@ import { PortRegistry } from './portRegistry';
 import { proxyHttp, PreviewProxyError } from './previewProxy';
 import { startServerProcess, StartServerError } from './startServer';
 import { stopServerProcess, StopServerError } from './stopServer';
+import { BrowserBridge, BridgeRequestError } from './browserBridge';
 import type { ChildProcess } from 'node:child_process';
 
 export function startDaemonControlServer({
@@ -25,7 +26,8 @@ export function startDaemonControlServer({
   requestShutdown,
   onHappySessionWebhook,
   onHappySessionRuntime = () => {},
-  portRegistry
+  portRegistry,
+  browserBridge
 }: {
   getChildren: () => TrackedSession[];
   stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
@@ -34,6 +36,7 @@ export function startDaemonControlServer({
   onHappySessionWebhook: (sessionId: string, metadata: Metadata, encryption?: SessionEncryptionData) => void;
   onHappySessionRuntime?: (sessionId: string, runtime: Partial<SessionRuntimeState> & { updatedAt: number }) => void;
   portRegistry: PortRegistry;
+  browserBridge?: BrowserBridge;
 }): Promise<{ port: number; stop: () => Promise<void> }> {
   return new Promise((resolve) => {
     const app = fastify({
@@ -527,6 +530,73 @@ export function startDaemonControlServer({
         throw e;
       }
     });
+
+    // Chrome extension bridge (specs/chrome-extension-bridge/). Sessions
+    // reach the user's logged-in Chrome through these routes; the extension
+    // itself connects to the dedicated WS listener (browserBridgeServer.ts)
+    // which shares the same BrowserBridge instance.
+    if (browserBridge) {
+      typed.get('/browser/status', {
+        schema: {
+          response: {
+            200: z.object({
+              connections: z.array(z.object({ profile: z.string() }))
+            })
+          }
+        }
+      }, async () => {
+        return { connections: browserBridge.connections() };
+      });
+
+      typed.post('/browser/request', {
+        schema: {
+          body: z.object({
+            method: z.string().min(1),
+            params: z.unknown().optional(),
+            timeoutMs: z.number().int().positive().optional(),
+            profile: z.string().optional()
+          }),
+          response: {
+            200: z.object({
+              result: z.unknown()
+            }),
+            502: z.object({
+              code: z.string(),
+              error: z.string()
+            }),
+            503: z.object({
+              code: z.string(),
+              error: z.string()
+            }),
+            504: z.object({
+              code: z.string(),
+              error: z.string()
+            })
+          }
+        }
+      }, async (request, reply) => {
+        const { method, params, timeoutMs, profile } = request.body;
+        try {
+          const result = await browserBridge.request(method, params ?? {}, {
+            ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+            ...(profile !== undefined ? { profile } : {})
+          });
+          logger.debug(`[CONTROL SERVER] browser/request ${method} -> ok`);
+          return { result };
+        } catch (e) {
+          if (e instanceof BridgeRequestError) {
+            logger.debug(`[CONTROL SERVER] browser/request ${method} failed: ${e.code} ${e.message}`);
+            reply.code(
+              e.code === 'NO_EXTENSION_CONNECTED' ? 503 :
+              e.code === 'TIMEOUT' ? 504 :
+              502
+            );
+            return { code: e.code, error: e.message };
+          }
+          throw e;
+        }
+      });
+    }
 
     // Stop daemon
     typed.post('/stop', {
