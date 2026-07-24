@@ -172,18 +172,42 @@ describe('handleCommand', () => {
             expect(injected.args).toEqual(['@e2', 'hi'])
         })
 
-        it('reports ACTION_FAILED when the page-side action throws (e.g. a stale ref)', async () => {
-            // Chrome rejects the whole executeScript() call when the injected
-            // function throws — it does not resolve with a per-result error.
+        it('reports the code/message an action returns for a stale ref (e.g. REF_NOT_FOUND)', async () => {
+            // clickRef/fillRef never throw — a thrown error crossing
+            // chrome.scripting.executeScript's boundary was observed in real
+            // Chrome to resolve as silent success instead of rejecting, so
+            // failure travels as a normal `{ok:false,...}` return value.
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                executeScript: async () => [{ result: { ok: false, code: 'REF_NOT_FOUND', message: 'No element for @e9 — the page may have changed since the last snapshot.' } }],
+            })
+            const response = await handleCommand({ id: 14, method: 'click', params: { ref: '@e9' } }, chrome)
+            expect(response.error.code).toBe('REF_NOT_FOUND')
+            expect(response.error.message).toContain('@e9')
+        })
+
+        it('reports INJECTION_FAILED when Chrome refuses to run the script at all', async () => {
             const chrome = fakeChrome({
                 tabs: [ACTIVE_TAB],
                 executeScript: async () => {
-                    throw new Error('No element for @e9 — the page may have changed since the last snapshot.')
+                    throw new Error('Cannot access a chrome:// URL')
                 },
             })
-            const response = await handleCommand({ id: 14, method: 'click', params: { ref: '@e9' } }, chrome)
-            expect(response.error.code).toBe('ACTION_FAILED')
-            expect(response.error.message).toContain('@e9')
+            const response = await handleCommand({ id: 14, method: 'click', params: { ref: '@e1' } }, chrome)
+            expect(response.error.code).toBe('INJECTION_FAILED')
+        })
+
+        it('reports NO_RESULT instead of treating a missing result as success', async () => {
+            // Observed for real against Chrome: some execution paths resolve
+            // executeScript with an injectionResult that has no `.result` at
+            // all. Silently returning that as success would tell the agent
+            // the click/fill worked when we genuinely don't know.
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                executeScript: async () => [{}],
+            })
+            const response = await handleCommand({ id: 14, method: 'click', params: { ref: '@e1' } }, chrome)
+            expect(response.error.code).toBe('NO_RESULT')
         })
 
         it('reports MISSING_PARAM when click is called without a ref', async () => {
