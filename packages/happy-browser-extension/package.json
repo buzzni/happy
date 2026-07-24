@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Chrome extension bridging happy CLI sessions to the user's logged-in browser",
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "package": "node scripts/package.mjs"
   },
   "devDependencies": {
     "jsdom": "^29.1.1",

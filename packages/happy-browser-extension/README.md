@@ -18,15 +18,43 @@ WS는 루프백 전용이며, pairing 토큰이 없는 연결은 데몬이 거�
 
 ## 설치
 
-1. 데몬이 한 번 실행되면 `~/.happy/browser-bridge.token` 이 생성됩니다. 값을 복사합니다.
-   ```
-   cat ~/.happy/browser-bridge.token
-   ```
+```bash
+happy browser
+```
+
+토큰, 연결 상태, 설치 절차를 한 번에 보여줍니다. 토큰만 필요하면 `happy browser token`.
+
+1. 위 명령이 출력한 **pairing 토큰**을 복사합니다
+   (파일 경로는 `~/.happy/browser-bridge.token`).
 2. Chrome에서 `chrome://extensions` → **개발자 모드** 켜기 → **압축해제된 확장 프로그램을 로드** →
    이 디렉터리(`packages/happy-browser-extension`)를 선택합니다.
 3. 확장의 **옵션** 페이지에서 토큰을 붙여넣고 저장합니다. 포트는 기본 41777.
    Chrome 프로필이 여러 개면 프로필마다 다른 이름을 지정하세요.
-4. 연결되면 확장 아이콘에 ● 배지가 표시됩니다.
+4. 연결되면 확장 아이콘에 ● 배지(초록)가 표시됩니다.
+   에이전트가 명령을 실행하는 동안에는 ▶ (주황)으로 바뀝니다.
+
+### 사이트 allowlist (선택)
+
+옵션 페이지의 allowlist를 비워 두면 **모든 탭**을 제어할 수 있습니다.
+한 줄에 하나씩 사이트를 적으면 그 사이트에서만 동작하고, 나머지 탭은
+조작은 물론 `tabs_list` 목록에도 나타나지 않습니다.
+
+| 패턴 | 의미 |
+|------|------|
+| `example.com` | 그 호스트만 (서브도메인 제외) |
+| `*.example.com` | 서브도메인 + bare 도메인 |
+| `https://example.com` | https 로만 |
+| `localhost:3000` | 그 포트만 |
+
+허용되지 않은 탭에 대한 명령은 `SITE_NOT_ALLOWED` 로 거부됩니다.
+
+## 배포용 패키징
+
+```bash
+pnpm --filter happy-browser-extension package
+```
+
+Chrome이 로드하는 파일만 담은 zip을 `dist/` 에 만듭니다 (테스트·dev 스크립트 제외).
 
 ## 확인
 
