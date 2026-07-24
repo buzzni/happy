@@ -11,7 +11,7 @@
  *   prefix so app-level API calls end up at the same dev server
  * - strips the prefix from `window.location.pathname` so SPA routers see
  *   clean paths
- * - stubs `WebSocket` for known HMR protocols (Vite / Next.js / Webpack)
+ * - relays Vite HMR WebSockets and stubs unsupported Next.js / Webpack HMR
  *
  * Auth is delivered via a per-preview HttpOnly cookie set by the relay on
  * the first response (see previewCookie.ts, Phase 9). The rewriter no
@@ -145,6 +145,23 @@ export function rwPath(u: string, P: string, ORIGIN: string): string {
     }
 }
 
+export function rwWebSocketUrl(u: string, P: string, ORIGIN: string): string {
+    if (typeof u !== 'string') return u as unknown as string;
+    if (u.charAt(0) === '/') return rwPath(u, P, ORIGIN);
+    try {
+        const parsed = new URL(u);
+        const page = new URL(ORIGIN);
+        const pageWebSocketProtocol =
+            page.protocol === 'https:' ? 'wss:' : page.protocol === 'http:' ? 'ws:' : '';
+        if (parsed.protocol !== pageWebSocketProtocol || parsed.host !== page.host) return u;
+        if (parsed.pathname === P || parsed.pathname.indexOf(P + '/') === 0) return u;
+        parsed.pathname = P + parsed.pathname;
+        return parsed.toString();
+    } catch {
+        return u;
+    }
+}
+
 export function rwInput(i: unknown, P: string, ORIGIN: string): unknown {
     if (typeof i === 'string') return rwPath(i, P, ORIGIN);
     try {
@@ -168,6 +185,39 @@ export function rewriteJsCss(text: string, prefix: string): string {
     return text
         .replace(ABS_PATH_IMPORT, rep)
         .replace(ABS_PATH_CSS_URL, rep);
+}
+
+/**
+ * Vite's HMR client dynamically imports updated modules from its compiled
+ * `base`. Unlike fetch/XHR, native import() cannot be intercepted by the
+ * browser shim, so path-based previews must make that base relay-aware.
+ *
+ * Scope this narrowly to Vite's own client response and require stable Vite
+ * HMR markers. Unknown scripts and dev servers therefore remain untouched.
+ */
+export function rewriteViteClientForPath(
+    text: string,
+    prefix: string,
+    upstreamPath: string,
+): string {
+    if (!prefix || upstreamPath.split('?')[0] !== '/@vite/client') return text;
+    if (!text.includes('"vite-hmr"') && !text.includes("'vite-hmr'")) return text;
+    if (!text.includes('acceptedPathWithoutQuery')) return text;
+
+    const baseDeclaration =
+        /\bconst\s+base\s*=\s*(["'])(\/[^"']*)\1\s*\|\|\s*(["'])\/\3\s*;/;
+    const match = text.match(baseDeclaration);
+    if (!match) return text;
+
+    const viteBase = match[2];
+    if (viteBase === prefix || viteBase.startsWith(`${prefix}/`)) return text;
+
+    const normalizedPrefix = prefix.replace(/\/+$/, '');
+    const prefixedBase = `${normalizedPrefix}${viteBase}`;
+    return text.replace(
+        baseDeclaration,
+        `const base = ${match[1]}${prefixedBase}${match[1]} || ${match[3]}/${match[3]};`,
+    );
 }
 
 export function rewriteHtml(html: string, prefix: string): string {
@@ -230,14 +280,17 @@ function buildInterceptorScript(prefix: string): string {
     // source so the runtime helpers and the tested helpers stay in lockstep
     // (no parallel implementations to drift).
     const rwPathSource = rwPath.toString();
+    const rwWebSocketUrlSource = rwWebSocketUrl.toString();
     const rwInputSource = rwInput.toString();
     return (
         `<script>(function(){` +
         `var P='${p}';` +
         `var ORIGIN=window.location.origin;` +
         `${rwPathSource};` +
+        `${rwWebSocketUrlSource};` +
         `${rwInputSource};` +
         `function rw(u){return rwPath(u,P,ORIGIN)}` +
+        `function rwWs(u){return rwWebSocketUrl(u,P,ORIGIN)}` +
         `function rwIn(i){return rwInput(i,P,ORIGIN)}` +
         `var loc=window.location.pathname;` +
         `if(loc.indexOf(P)===0){history.replaceState(null,'',loc.slice(P.length)||'/')}` +
@@ -254,9 +307,9 @@ function buildInterceptorScript(prefix: string): string {
         `}` +
         `NoopWS.CONNECTING=0;NoopWS.OPEN=1;NoopWS.CLOSING=2;NoopWS.CLOSED=3;` +
         `window.WebSocket=function(u,p){` +
-        `if(p==='vite-hmr'||p==='vite-ping'||` +
-        `(u&&(u.indexOf('__vite')!==-1||u.indexOf('/_next/webpack')!==-1||u.indexOf('hot-update')!==-1)))return new NoopWS();` +
-        `u=rw(u);return p?new _WS(u,p):new _WS(u)};` +
+        `var isVite=p==='vite-hmr'||p==='vite-ping'||(u&&u.indexOf('__vite')!==-1);` +
+        `if(!isVite&&u&&(u.indexOf('/_next/webpack')!==-1||u.indexOf('hot-update')!==-1))return new NoopWS();` +
+        `u=isVite?rwWs(u):rw(u);return p?new _WS(u,p):new _WS(u)};` +
         `window.WebSocket.prototype=_WS.prototype;` +
         `window.WebSocket.CONNECTING=0;window.WebSocket.OPEN=1;window.WebSocket.CLOSING=2;window.WebSocket.CLOSED=3;` +
         // Phase 11B: rwIn handles string / URL / Request — covers fetch

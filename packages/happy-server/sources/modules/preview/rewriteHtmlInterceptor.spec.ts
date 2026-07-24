@@ -84,6 +84,15 @@ function buildSandbox() {
         static OPEN = 1;
         static CLOSING = 2;
         static CLOSED = 3;
+
+        readonly url: string;
+        readonly protocol: string | string[] | undefined;
+        readonly readyState = FakeWebSocket.CONNECTING;
+
+        constructor(url: string, protocol?: string | string[]) {
+            this.url = url;
+            this.protocol = protocol;
+        }
     }
     class FakeXHR {
         open(_method: string, _url: string) {}
@@ -98,7 +107,7 @@ function buildSandbox() {
         WebSocket: FakeWebSocket,
         fetch: fakeFetch,
         XMLHttpRequest: FakeXHR,
-        location: { pathname: '/' },
+        location: { origin: 'https://studio.example', pathname: '/' },
         setTimeout: (fn: () => void) => fn(),
     };
     fakeWindow.window = fakeWindow;
@@ -122,6 +131,7 @@ function buildSandbox() {
         // not via window.Object).
         Object,
         Promise,
+        URL,
     };
     return { sandbox, FakeScriptElement, FakeLinkElement, FakeImageElement, FakeSourceElement };
 }
@@ -368,32 +378,35 @@ describe('rewriteHtml interceptor — runtime behavior in stubbed DOM', () => {
         });
     });
 
-    describe('WebSocket shim — Vite/Next HMR protocols swap in NoopWS', () => {
-        it('vite-hmr protocol returns a NoopWS instance', () => {
-            const w = new bag.sandbox.window.WebSocket('ws://anything', 'vite-hmr');
-            expect(w.readyState).toBe(1);
-            // NoopWS has a no-op send
-            expect(typeof w.send).toBe('function');
-            w.send('test'); // must not throw
+    describe('WebSocket shim — Vite HMR relay and Next/Webpack suppression', () => {
+        it('routes a same-origin vite-hmr socket through the preview prefix', () => {
+            const w = new bag.sandbox.window.WebSocket(
+                'wss://studio.example/?token=hmr',
+                'vite-hmr',
+            );
+            expect(w).toBeInstanceOf(bag.sandbox.WebSocket);
+            expect(w.url).toBe(`wss://studio.example${PREFIX}/?token=hmr`);
+            expect(w.protocol).toBe('vite-hmr');
         });
 
-        it('vite-ping protocol returns NoopWS', () => {
-            const w = new bag.sandbox.window.WebSocket('ws://anything', 'vite-ping');
-            expect(w.readyState).toBe(1);
+        it('routes an already-prefixed vite-ping socket without double-prefixing', () => {
+            const url = `wss://studio.example${PREFIX}/`;
+            const w = new bag.sandbox.window.WebSocket(url, 'vite-ping');
+            expect(w).toBeInstanceOf(bag.sandbox.WebSocket);
+            expect(w.url).toBe(url);
+            expect(w.protocol).toBe('vite-ping');
         });
 
-        it('URL containing /_next/webpack returns NoopWS', () => {
+        it('continues suppressing a URL containing /_next/webpack', () => {
             const w = new bag.sandbox.window.WebSocket('ws://host/_next/webpack-hmr', '');
             expect(w.readyState).toBe(1);
+            expect(typeof w.send).toBe('function');
         });
 
         it('arbitrary WebSocket URL falls through to native (here: our stub)', () => {
-            // Our stub FakeWebSocket has no constructor args/instance state.
-            // The shim path: `return p?new _WS(u,p):new _WS(u)` — calls the
-            // saved native ctor. With FakeWebSocket it returns an instance
-            // without our NoopWS shape, but with the static constants.
             const w = new bag.sandbox.window.WebSocket('ws://host/something-else', '');
             expect(w).toBeInstanceOf(bag.sandbox.WebSocket);
+            expect(w.url).toBe('ws://host/something-else');
         });
     });
 });
