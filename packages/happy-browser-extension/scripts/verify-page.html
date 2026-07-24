@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Happy Bridge Verify Page</title></head>
+<body>
+  <h1>Happy Bridge Verify Page</h1>
+  <input id="name-input" placeholder="Your name">
+  <button id="submit-btn">Submit</button>
+  <input id="result" aria-label="Result" readonly>
+  <div contenteditable="true" id="editable-area">edit me</div>
+  <script>
+    document.getElementById('submit-btn').addEventListener('click', function () {
+      document.getElementById('result').value = 'Hello, ' + document.getElementById('name-input').value + '!'
+    })
+  </script>
+</body>
+</html>
