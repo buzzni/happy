@@ -8,6 +8,7 @@
 
 import { collectSnapshot } from './snapshot.js'
 import { clickRef, fillRef } from './actions.js'
+import { parseAllowlist, isUrlAllowed } from './allowlist.js'
 
 export class CommandError extends Error {
     constructor(code, message) {
@@ -16,14 +17,41 @@ export class CommandError extends Error {
     }
 }
 
-/** The tab a command acts on: an explicit tabId, else the focused tab. */
-async function resolveTab(params, chrome) {
-    if (params.tabId !== undefined) return { id: params.tabId }
-    const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
-    if (!active || active.id === undefined) {
+async function readAllowlist(chrome) {
+    const { allowlist } = await chrome.storage.local.get(['allowlist'])
+    return parseAllowlist(allowlist)
+}
+
+function assertUrlAllowed(url, allowlist) {
+    if (!isUrlAllowed(url, allowlist)) {
+        throw new CommandError('SITE_NOT_ALLOWED', `${url ?? 'this tab'} is outside the site allowlist configured in the Happy Browser Bridge extension`)
+    }
+}
+
+/**
+ * The tab a command acts on: an explicit tabId, else the focused tab.
+ *
+ * Always resolves the full tab (not just its id) because the allowlist check
+ * needs the real URL — trusting a caller-supplied one would let the agent
+ * name any tab and claim it was allowed.
+ */
+async function resolveTab(params, chrome, allowlist) {
+    let tab
+    if (params.tabId !== undefined) {
+        try {
+            tab = await chrome.tabs.get(params.tabId)
+        } catch (e) {
+            throw new CommandError('TAB_NOT_FOUND', e instanceof Error ? e.message : String(e))
+        }
+    } else {
+        const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+        tab = active
+    }
+    if (!tab || tab.id === undefined) {
         throw new CommandError('NO_ACTIVE_TAB', 'No active tab to act on')
     }
-    return active
+    assertUrlAllowed(tab.url, allowlist)
+    return tab
 }
 
 function requireParam(params, name) {
@@ -43,8 +71,8 @@ function requireParam(params, name) {
  * the caller as the action having worked. So failure is a normal return
  * value (`{ok: false, code, message}`), checked here explicitly.
  */
-async function runPageAction(func, args, params, chrome) {
-    const tab = await resolveTab(params, chrome)
+async function runPageAction(func, args, params, chrome, allowlist) {
+    const tab = await resolveTab(params, chrome, allowlist)
     let results
     try {
         results = await chrome.scripting.executeScript({
@@ -73,13 +101,18 @@ async function runPageAction(func, args, params, chrome) {
 }
 
 const handlers = {
+    // Deliberately unrestricted: pairing has to be verifiable even when the
+    // allowlist would block every tab, and it reveals nothing about the user.
     ping: async () => 'pong',
 
-    tabs_list: async (_params, chrome) => {
+    tabs_list: async (_params, chrome, allowlist) => {
         const tabs = await chrome.tabs.query({})
         return {
             tabs: tabs
                 .filter((tab) => tab.id !== undefined)
+                // Filtered, not just blocked-on-use: the URL list itself is
+                // what the user is keeping private.
+                .filter((tab) => isUrlAllowed(tab.url, allowlist))
                 .map((tab) => ({
                     id: tab.id,
                     windowId: tab.windowId,
@@ -91,8 +124,8 @@ const handlers = {
         }
     },
 
-    snapshot: async (params, chrome) => {
-        const tab = await resolveTab(params, chrome)
+    snapshot: async (params, chrome, allowlist) => {
+        const tab = await resolveTab(params, chrome, allowlist)
         let results
         try {
             results = await chrome.scripting.executeScript({
@@ -106,41 +139,46 @@ const handlers = {
         return results[0].result
     },
 
-    screenshot: async (params, chrome) => {
-        const tab = await resolveTab(params, chrome)
+    screenshot: async (params, chrome, allowlist) => {
+        const tab = await resolveTab(params, chrome, allowlist)
         const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' })
         const [, dataB64] = dataUrl.split(',')
         return { mimeType: 'image/png', dataB64 }
     },
 
-    click: async (params, chrome) => {
+    click: async (params, chrome, allowlist) => {
         const ref = requireParam(params, 'ref')
-        return runPageAction(clickRef, [ref], params, chrome)
+        return runPageAction(clickRef, [ref], params, chrome, allowlist)
     },
 
-    fill: async (params, chrome) => {
+    fill: async (params, chrome, allowlist) => {
         const ref = requireParam(params, 'ref')
         // Unlike the other params, an empty string is valid here — it clears a field.
         if (params.value === undefined || params.value === null) {
             throw new CommandError('MISSING_PARAM', 'Missing required param: value')
         }
-        return runPageAction(fillRef, [ref, params.value], params, chrome)
+        return runPageAction(fillRef, [ref, params.value], params, chrome, allowlist)
     },
 
-    navigate: async (params, chrome) => {
+    navigate: async (params, chrome, allowlist) => {
         const url = requireParam(params, 'url')
-        const tab = await resolveTab(params, chrome)
+        const tab = await resolveTab(params, chrome, allowlist)
+        // Both ends are checked: without the destination check the allowlist
+        // is trivially bypassed by navigating a permitted tab elsewhere.
+        assertUrlAllowed(url, allowlist)
         await chrome.tabs.update(tab.id, { url })
         return { ok: true }
     },
 
-    tabs_open: async (params, chrome) => {
+    tabs_open: async (params, chrome, allowlist) => {
         const url = requireParam(params, 'url')
+        assertUrlAllowed(url, allowlist)
         return chrome.tabs.create({ url })
     },
 
-    tabs_close: async (params, chrome) => {
+    tabs_close: async (params, chrome, allowlist) => {
         const tabId = requireParam(params, 'tabId')
+        await resolveTab({ tabId }, chrome, allowlist)
         await chrome.tabs.remove(tabId)
         return { ok: true }
     },
@@ -152,7 +190,10 @@ export async function handleCommand(message, chrome) {
         return { id: message.id, error: { code: 'UNKNOWN_METHOD', message: `Unsupported method: ${message.method}` } }
     }
     try {
-        return { id: message.id, result: await handler(message.params ?? {}, chrome) }
+        // Read per command rather than caching: the user can edit the
+        // allowlist mid-session and expects the next command to respect it.
+        const allowlist = await readAllowlist(chrome)
+        return { id: message.id, result: await handler(message.params ?? {}, chrome, allowlist) }
     } catch (e) {
         const code = e instanceof CommandError ? e.code : 'COMMAND_FAILED'
         return { id: message.id, error: { code, message: e instanceof Error ? e.message : String(e) } }

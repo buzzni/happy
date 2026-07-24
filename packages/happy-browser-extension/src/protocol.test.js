@@ -2,10 +2,16 @@ import { describe, it, expect } from 'vitest'
 import { handleCommand } from './protocol.js'
 
 /** Minimal stand-in for the parts of the chrome API the protocol uses. */
-function fakeChrome({ tabs = [], executeScript, captureVisibleTab, update, create, remove } = {}) {
+function fakeChrome({ tabs = [], executeScript, captureVisibleTab, update, create, remove, allowlist } = {}) {
     return {
+        storage: { local: { get: async () => (allowlist === undefined ? {} : { allowlist }) } },
         tabs: {
             query: async (query) => (query && query.active ? tabs.filter((t) => t.active) : tabs),
+            get: async (tabId) => {
+                const found = tabs.find((t) => t.id === tabId)
+                if (!found) throw new Error(`No tab with id: ${tabId}`)
+                return found
+            },
             captureVisibleTab: captureVisibleTab ?? (async () => 'data:image/png;base64,AAAA'),
             update: update ?? (async (tabId, props) => ({ id: tabId, ...props })),
             create: create ?? (async (props) => ({ id: 99, windowId: 1, ...props })),
@@ -66,6 +72,7 @@ describe('handleCommand', () => {
 
     it('turns a thrown chrome API error into an error response, not a crash', async () => {
         const chrome = {
+            storage: { local: { get: async () => ({}) } },
             tabs: {
                 query: async () => {
                     throw new Error('Tabs API unavailable')
@@ -243,7 +250,7 @@ describe('handleCommand', () => {
 
         it('closes the given tab', async () => {
             let removed
-            const chrome = fakeChrome({ remove: async (tabId) => { removed = tabId } })
+            const chrome = fakeChrome({ tabs: [ACTIVE_TAB], remove: async (tabId) => { removed = tabId } })
             const response = await handleCommand({ id: 19, method: 'tabs_close', params: { tabId: 7 } }, chrome)
             expect(removed).toBe(7)
             expect(response.result).toEqual({ ok: true })
@@ -252,6 +259,74 @@ describe('handleCommand', () => {
         it('reports MISSING_PARAM when tabs_close has no tabId', async () => {
             const response = await handleCommand({ id: 20, method: 'tabs_close', params: {} }, fakeChrome())
             expect(response.error.code).toBe('MISSING_PARAM')
+        })
+    })
+
+    describe('allowlist enforcement', () => {
+        const BANK_TAB = { id: 3, windowId: 1, index: 1, url: 'https://bank.example/accounts', title: 'Bank', active: false }
+        const WORK_TAB = { id: 7, windowId: 1, index: 0, url: 'https://work.test/board', title: 'Work', active: true }
+
+        it('acts normally when no allowlist is configured', async () => {
+            const chrome = fakeChrome({ tabs: [WORK_TAB] })
+            const response = await handleCommand({ id: 30, method: 'snapshot' }, chrome)
+            expect(response.error).toBeUndefined()
+        })
+
+        it('refuses to snapshot a tab outside the allowlist', async () => {
+            const chrome = fakeChrome({ tabs: [WORK_TAB, BANK_TAB], allowlist: 'work.test' })
+            const response = await handleCommand({ id: 31, method: 'snapshot', params: { tabId: 3 } }, chrome)
+            expect(response.error.code).toBe('SITE_NOT_ALLOWED')
+            expect(response.error.message).toContain('bank.example')
+        })
+
+        it('refuses to click in a tab outside the allowlist', async () => {
+            const chrome = fakeChrome({ tabs: [WORK_TAB, BANK_TAB], allowlist: 'work.test' })
+            const response = await handleCommand({ id: 32, method: 'click', params: { tabId: 3, ref: '@e1' } }, chrome)
+            expect(response.error.code).toBe('SITE_NOT_ALLOWED')
+        })
+
+        it('refuses to screenshot a tab outside the allowlist', async () => {
+            const chrome = fakeChrome({ tabs: [WORK_TAB, BANK_TAB], allowlist: 'work.test' })
+            const response = await handleCommand({ id: 33, method: 'screenshot', params: { tabId: 3 } }, chrome)
+            expect(response.error.code).toBe('SITE_NOT_ALLOWED')
+        })
+
+        it('still allows a tab inside the allowlist', async () => {
+            const chrome = fakeChrome({ tabs: [WORK_TAB, BANK_TAB], allowlist: 'work.test' })
+            const response = await handleCommand({ id: 34, method: 'snapshot', params: { tabId: 7 } }, chrome)
+            expect(response.error).toBeUndefined()
+        })
+
+        it('refuses to navigate an allowed tab to a disallowed destination', async () => {
+            // Otherwise the allowlist is trivially bypassed: navigate a
+            // permitted tab to the bank, then act on it.
+            const chrome = fakeChrome({ tabs: [WORK_TAB], allowlist: 'work.test' })
+            const response = await handleCommand({ id: 35, method: 'navigate', params: { tabId: 7, url: 'https://bank.example/' } }, chrome)
+            expect(response.error.code).toBe('SITE_NOT_ALLOWED')
+        })
+
+        it('refuses to open a new tab at a disallowed url', async () => {
+            const chrome = fakeChrome({ tabs: [WORK_TAB], allowlist: 'work.test' })
+            const response = await handleCommand({ id: 36, method: 'tabs_open', params: { url: 'https://bank.example/' } }, chrome)
+            expect(response.error.code).toBe('SITE_NOT_ALLOWED')
+        })
+
+        it('hides disallowed tabs from tabs_list so their urls never leak', async () => {
+            const chrome = fakeChrome({ tabs: [WORK_TAB, BANK_TAB], allowlist: 'work.test' })
+            const response = await handleCommand({ id: 37, method: 'tabs_list' }, chrome)
+            expect(response.result.tabs.map((t) => t.id)).toEqual([7])
+        })
+
+        it('refuses to close a tab outside the allowlist', async () => {
+            const chrome = fakeChrome({ tabs: [WORK_TAB, BANK_TAB], allowlist: 'work.test' })
+            const response = await handleCommand({ id: 38, method: 'tabs_close', params: { tabId: 3 } }, chrome)
+            expect(response.error.code).toBe('SITE_NOT_ALLOWED')
+        })
+
+        it('leaves ping unrestricted so pairing can always be verified', async () => {
+            const chrome = fakeChrome({ tabs: [], allowlist: 'work.test' })
+            const response = await handleCommand({ id: 39, method: 'ping' }, chrome)
+            expect(response.result).toBe('pong')
         })
     })
 })
