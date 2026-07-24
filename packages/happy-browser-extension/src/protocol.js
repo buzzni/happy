@@ -6,6 +6,25 @@
  * happy-cli/src/daemon/browserBridge.ts.
  */
 
+import { collectSnapshot } from './snapshot.js'
+
+export class CommandError extends Error {
+    constructor(code, message) {
+        super(message)
+        this.code = code
+    }
+}
+
+/** The tab a command acts on: an explicit tabId, else the focused tab. */
+async function resolveTab(params, chrome) {
+    if (params.tabId !== undefined) return { id: params.tabId }
+    const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+    if (!active || active.id === undefined) {
+        throw new CommandError('NO_ACTIVE_TAB', 'No active tab to act on')
+    }
+    return active
+}
+
 const handlers = {
     ping: async () => 'pong',
 
@@ -24,6 +43,28 @@ const handlers = {
                 })),
         }
     },
+
+    snapshot: async (params, chrome) => {
+        const tab = await resolveTab(params, chrome)
+        let results
+        try {
+            results = await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                func: collectSnapshot,
+            })
+        } catch (e) {
+            // chrome:// pages, the Web Store, and PDF viewers refuse injection.
+            throw new CommandError('INJECTION_FAILED', e instanceof Error ? e.message : String(e))
+        }
+        return results[0].result
+    },
+
+    screenshot: async (params, chrome) => {
+        const tab = await resolveTab(params, chrome)
+        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' })
+        const [, dataB64] = dataUrl.split(',')
+        return { mimeType: 'image/png', dataB64 }
+    },
 }
 
 export async function handleCommand(message, chrome) {
@@ -34,6 +75,7 @@ export async function handleCommand(message, chrome) {
     try {
         return { id: message.id, result: await handler(message.params ?? {}, chrome) }
     } catch (e) {
-        return { id: message.id, error: { code: 'COMMAND_FAILED', message: e instanceof Error ? e.message : String(e) } }
+        const code = e instanceof CommandError ? e.code : 'COMMAND_FAILED'
+        return { id: message.id, error: { code, message: e instanceof Error ? e.message : String(e) } }
     }
 }
