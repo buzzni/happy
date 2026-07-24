@@ -18,20 +18,15 @@ export function createConnection({
     defaultPort = DEFAULT_PORT,
 }) {
     let socket = null
-    let keepaliveTimer = null
+    // Set synchronously so two overlapping connect() calls cannot both get past
+    // the guard while the first is awaiting the stored config.
+    let connecting = false
     let reconnectTimer = null
     let consecutiveFailures = 0
 
     async function readConfig() {
         const { port, token, profile } = await chrome.storage.local.get(['port', 'token', 'profile'])
         return { port: port || defaultPort, token: token || '', profile: profile || 'default' }
-    }
-
-    function stopKeepalive() {
-        if (keepaliveTimer !== null) {
-            clearInterval(keepaliveTimer)
-            keepaliveTimer = null
-        }
     }
 
     function scheduleReconnect() {
@@ -45,9 +40,16 @@ export function createConnection({
     }
 
     async function connect() {
-        if (socket) return
+        if (socket || connecting) return
+        connecting = true
 
-        const { port, token, profile } = await readConfig()
+        let config
+        try {
+            config = await readConfig()
+        } finally {
+            connecting = false
+        }
+        const { port, token, profile } = config
         if (!token) {
             // Not paired yet — the options page starts the connection once saved.
             return
@@ -56,6 +58,9 @@ export function createConnection({
         const url = `ws://127.0.0.1:${port}/?token=${encodeURIComponent(token)}&profile=${encodeURIComponent(profile)}`
         const ws = new WebSocketImpl(url)
         socket = ws
+        // Per-socket so a late close from a replaced socket cannot stop the
+        // live one's keepalive — that let the service worker go idle and die.
+        let keepaliveTimer = null
 
         ws.addEventListener('open', () => {
             consecutiveFailures = 0
@@ -80,8 +85,14 @@ export function createConnection({
         })
 
         const onGone = () => {
-            if (socket === ws) socket = null
-            stopKeepalive()
+            if (keepaliveTimer !== null) {
+                clearInterval(keepaliveTimer)
+                keepaliveTimer = null
+            }
+            // A socket we already replaced is expected to close; only the live
+            // one losing the daemon warrants a badge reset and a reconnect.
+            if (socket !== ws) return
+            socket = null
             chrome.action?.setBadgeText?.({ text: '' })
             scheduleReconnect()
         }
