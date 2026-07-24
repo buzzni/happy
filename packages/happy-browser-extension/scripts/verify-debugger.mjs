@@ -64,6 +64,21 @@ function check(label, condition, detail) {
     console.log(`  ok  ${label}`)
 }
 
+/**
+ * Pixel dimensions from a PNG's IHDR chunk.
+ *
+ * Byte size is NOT a usable proxy for "did it capture more of the page": a
+ * full-page shot of a mostly-blank page compresses far better than a dense
+ * viewport shot, and captureVisibleTab renders at the device pixel ratio
+ * (2x on this display) while CDP's Page.captureScreenshot uses CSS pixels.
+ * The first version of this check compared byte counts and failed on a
+ * capture that was perfectly correct.
+ */
+function pngSize(dataB64) {
+    const header = Buffer.from(dataB64.slice(0, 64), 'base64')
+    return { width: header.readUInt32BE(16), height: header.readUInt32BE(20) }
+}
+
 let started = false
 
 wss.on('connection', (socket, request) => {
@@ -171,15 +186,26 @@ async function run() {
     check('trusted fill 값이 실제로 들어갔다', textValue === 'typed by CDP', `got: ${JSON.stringify(textValue)}`)
 
     console.log('')
-    console.log('fullPage screenshot 이 뷰포트 캡처보다 더 많은 내용을 담는지 (바이트 크기로 추정)')
+    console.log('fullPage screenshot 이 화면 밖까지 담는지 (PNG 실제 픽셀 높이로 판정)')
     const viewportShot = await call('screenshot', { tabId: tab.id })
     const fullShot = await call('screenshot', { tabId: tab.id, fullPage: true })
     check('둘 다 PNG 데이터를 반환한다', viewportShot.dataB64.length > 100 && fullShot.dataB64.length > 100, 'missing data')
-    console.log(`      viewport: ${viewportShot.dataB64.length} chars, fullPage: ${fullShot.dataB64.length} chars`)
+
+    const viewportSize = pngSize(viewportShot.dataB64)
+    const fullSize = pngSize(fullShot.dataB64)
+    console.log(`      viewport: ${viewportSize.width}x${viewportSize.height}, fullPage: ${fullSize.width}x${fullSize.height}`)
+
+    // The page has a 2500px spacer, so a genuine full-page capture cannot be
+    // shorter than that — whatever the scale factor.
     check(
-        'fullPage 캡처가 뷰포트 캡처보다 뚜렷이 크다 (페이지 하단의 빨간 마커까지 담겼다는 신호)',
-        fullShot.dataB64.length > viewportShot.dataB64.length * 1.3,
-        `viewport=${viewportShot.dataB64.length} fullPage=${fullShot.dataB64.length}`,
+        'fullPage 캡처 높이가 페이지 전체(2500px 여백 포함)를 담는다',
+        fullSize.height >= 2000,
+        `fullPage height=${fullSize.height} — 화면 안쪽만 담긴 것으로 보입니다`,
+    )
+    check(
+        'fullPage 캡처가 뷰포트 캡처보다 높다',
+        fullSize.height > viewportSize.height,
+        `viewport=${viewportSize.height} fullPage=${fullSize.height}`,
     )
 
     console.log('')
