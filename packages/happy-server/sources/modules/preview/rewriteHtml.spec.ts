@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { rewriteHtml, rewriteJsCss, rwPath, rwInput } from '@/modules/preview/rewriteHtml';
+import {
+    rewriteHtml,
+    rewriteJsCss,
+    rwPath,
+    rwInput,
+    rwWebSocketUrl,
+} from '@/modules/preview/rewriteHtml';
 
 const PREFIX = '/v1/preview/m1/3000';
 
@@ -576,6 +582,30 @@ describe('rwPath — string path/URL rewriting', () => {
     it('returns input when typeof is not string (defensive)', () => {
         // Cast through unknown to test runtime guard.
         expect(rwPath(123 as unknown as string, P, ORIGIN)).toBe(123 as unknown as string);
+    });
+});
+
+describe('rwWebSocketUrl — same-origin WebSocket relay rewriting', () => {
+    it('prefixes a secure WebSocket URL matching an HTTPS page origin', () => {
+        expect(
+            rwWebSocketUrl('wss://studio.example/?token=hmr', P, 'https://studio.example'),
+        ).toBe(`wss://studio.example${P}/?token=hmr`);
+    });
+
+    it('prefixes an insecure WebSocket URL matching an HTTP page origin', () => {
+        expect(
+            rwWebSocketUrl('ws://localhost:5174/hmr?x=1', P, 'http://localhost:5174'),
+        ).toBe(`ws://localhost:5174${P}/hmr?x=1`);
+    });
+
+    it('is idempotent for an already-prefixed WebSocket URL', () => {
+        const url = `wss://studio.example${P}/`;
+        expect(rwWebSocketUrl(url, P, 'https://studio.example')).toBe(url);
+    });
+
+    it('leaves cross-origin WebSocket URLs untouched', () => {
+        const url = 'wss://other.example/hmr';
+        expect(rwWebSocketUrl(url, P, 'https://studio.example')).toBe(url);
     });
 });
 
