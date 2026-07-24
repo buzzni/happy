@@ -141,8 +141,32 @@ async function waitForDebuggerPermission() {
     throw new Error('정밀 제어가 5분 안에 켜지지 않았습니다')
 }
 
+/**
+ * Phase A needs the tier off. Rather than failing when it happens to be on —
+ * which it is right after a previous run — ask for it to be turned off and
+ * wait, the same way we wait for it to be turned on later.
+ */
+async function waitForDebuggerOff() {
+    if ((await call('capabilities')).debugger === false) return
+
+    console.log('')
+    console.log('──────────────────────────────────────────────────────────────')
+    console.log('  정밀 제어가 켜져 있습니다. Phase A 는 꺼진 상태를 확인하는')
+    console.log('  단계라, 옵션 페이지에서 "정밀 제어 끄기" 를 눌러 주세요.')
+    console.log('  (끄면 자동으로 이어지고, 나중에 다시 켜달라고 안내합니다.)')
+    console.log('──────────────────────────────────────────────────────────────\n')
+
+    const deadline = Date.now() + 5 * 60_000
+    while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2000))
+        if ((await call('capabilities')).debugger === false) return
+    }
+    throw new Error('정밀 제어가 5분 안에 꺼지지 않았습니다')
+}
+
 async function run() {
     console.log('Phase A — 정밀 제어 꺼진 상태')
+    await waitForDebuggerOff()
     const caps1 = await call('capabilities')
     check('capabilities 가 debugger:false 를 보고한다', caps1.debugger === false, JSON.stringify(caps1))
     check('capabilities 가 명령 목록을 제공한다', caps1.commands.includes('snapshot'), JSON.stringify(caps1))
