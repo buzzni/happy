@@ -73,6 +73,7 @@ describe('startHappyServer tool registration', () => {
                 'browser_navigate',
                 'browser_open_tab',
                 'browser_close_tab',
+                'browser_capabilities',
             ]));
             expect(names).toEqual(expect.arrayContaining(server.toolNames));
         } finally {

@@ -24,7 +24,40 @@ describe('BROWSER_TOOL_NAMES', () => {
             'browser_navigate',
             'browser_open_tab',
             'browser_close_tab',
+            'browser_capabilities',
         ])
+    })
+})
+
+describe('debugger tier reporting', () => {
+    it('says plainly when the debugger tier is off and that it still works without it', async () => {
+        const result = await runBrowserTool({
+            request: ok({ debugger: false, commands: ['snapshot', 'click'] }),
+            method: 'capabilities',
+            params: {},
+        })
+        expect(textOf(result)).toMatch(/OFF/)
+        expect(textOf(result)).toContain('snapshot')
+    })
+
+    it('says when it is on', async () => {
+        const result = await runBrowserTool({
+            request: ok({ debugger: true, commands: [] }),
+            method: 'capabilities',
+            params: {},
+        })
+        expect(textOf(result)).toMatch(/ON/)
+    })
+
+    it('turns a missing debugger permission into advice, including the fallback', async () => {
+        const result = await runBrowserTool({
+            request: fails('DEBUGGER_NOT_AVAILABLE', 'The debugger permission is not granted. Ask the user to enable it in the options page.'),
+            method: 'screenshot',
+            params: { fullPage: true },
+        })
+        expect(result.isError).toBe(true)
+        expect(textOf(result)).toContain('options page')
+        expect(textOf(result)).toMatch(/normal screenshot|untrusted/)
     })
 })
 

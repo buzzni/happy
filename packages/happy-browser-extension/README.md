@@ -48,6 +48,26 @@ happy browser
 
 허용되지 않은 탭에 대한 명령은 `SITE_NOT_ALLOWED` 로 거부됩니다.
 
+### 정밀 제어 — 디버거 티어 (선택)
+
+옵션 페이지에서 켤 수 있는 **선택 권한**입니다. 켜면 두 가지가 가능해집니다:
+
+- **trusted 입력** — 실제 사용자 입력과 동일한 `isTrusted` 이벤트.
+  스크립트 클릭을 무시하는 사이트나 리치 텍스트 에디터에 필요합니다.
+- **전체 페이지 스크린샷** — 화면 밖까지 포함한 캡처.
+
+대가로 조작 대상 탭에 Chrome의 **"디버깅 중" 알림 바**가 뜹니다. 끄면 나머지
+기능은 전부 그대로 동작합니다.
+
+이 권한은 **사용자만** 켤 수 있습니다 (`chrome.permissions.request`가 사용자
+제스처를 요구) — 에이전트는 자기 권한을 넓힐 수 없습니다. allowlist와 같은 성질입니다.
+
+권한 없이 `fullPage`/`trusted`를 요청하면 **조용히 대체하지 않고**
+`DEBUGGER_NOT_AVAILABLE`로 실패합니다. 뷰포트 스크린샷을 전체 페이지인 척
+돌려주면 아무도 그 차이를 모르기 때문입니다.
+
+에이전트는 `browser_capabilities`로 현재 가용 여부를 미리 확인할 수 있습니다.
+
 ## 배포용 패키징
 
 ```bash
@@ -85,9 +105,10 @@ node packages/happy-browser-extension/scripts/dev-bridge.mjs
 | `ping` | — | `"pong"` |
 | `tabs_list` | — | 열린 탭 목록 (id, url, title, active 등) |
 | `snapshot` | `tabId?` | 인터랙티브 요소 + `@eN` ref, url/title, truncated |
-| `screenshot` | `tabId?` | `{ mimeType, dataB64 }` (보이는 영역 PNG) |
-| `click` | `ref`, `tabId?` | `{ ok: true }` |
-| `fill` | `ref`, `value`, `tabId?` | `{ ok: true }` (`value: ""` 로 필드 지우기) |
+| `screenshot` | `tabId?`, `fullPage?` | `{ mimeType, dataB64 }` (기본은 보이는 영역 PNG) |
+| `click` | `ref`, `tabId?`, `trusted?` | `{ ok: true }` |
+| `fill` | `ref`, `value`, `tabId?`, `trusted?` | `{ ok: true }` (`value: ""` 로 필드 지우기) |
+| `capabilities` | — | `{ debugger, commands }` |
 | `navigate` | `url`, `tabId?` | `{ ok: true }` |
 | `tabs_open` | `url` | 새 탭 정보 (id, windowId, url) |
 | `tabs_close` | `tabId` | `{ ok: true }` |
@@ -99,7 +120,7 @@ node packages/happy-browser-extension/scripts/dev-bridge.mjs
 
 세션 쪽에서는 `mcp__happy__browser_tabs` / `browser_snapshot` /
 `browser_screenshot` / `browser_click` / `browser_fill` / `browser_navigate` /
-`browser_open_tab` / `browser_close_tab` 도구로 노출됩니다.
+`browser_open_tab` / `browser_close_tab` / `browser_capabilities` 도구로 노출됩니다.
 
 ## 테스트
 

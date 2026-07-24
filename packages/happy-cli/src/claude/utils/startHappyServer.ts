@@ -209,8 +209,9 @@ function registerBrowserTools(mcp: McpServer): void {
         title: 'Screenshot a tab',
         inputSchema: {
             tabId: z.number().optional().describe('Tab to capture (defaults to the active tab)'),
+            fullPage: z.boolean().optional().describe('Capture the whole scrollable page instead of just the visible area. Needs the optional debugger permission, which only the user can enable.'),
         },
-    }, async (args) => runBrowserTool({ request: bridge, method: 'screenshot', params: { tabId: args.tabId } }));
+    }, async (args) => runBrowserTool({ request: bridge, method: 'screenshot', params: { tabId: args.tabId, fullPage: args.fullPage } }));
 
     mcp.registerTool('browser_click', {
         description:
@@ -219,8 +220,9 @@ function registerBrowserTools(mcp: McpServer): void {
         inputSchema: {
             ref: z.string().describe('Element ref from browser_snapshot, e.g. "@e3"'),
             tabId: z.number().optional().describe('Tab the ref belongs to (defaults to the active tab)'),
+            trusted: z.boolean().optional().describe('Dispatch a real (isTrusted) mouse event instead of a scripted click. Only needed when a page ignores scripted clicks. Requires the optional debugger permission, which only the user can enable.'),
         },
-    }, async (args) => runBrowserTool({ request: bridge, method: 'click', params: { ref: args.ref, tabId: args.tabId } }));
+    }, async (args) => runBrowserTool({ request: bridge, method: 'click', params: { ref: args.ref, tabId: args.tabId, trusted: args.trusted } }));
 
     mcp.registerTool('browser_fill', {
         description:
@@ -230,8 +232,9 @@ function registerBrowserTools(mcp: McpServer): void {
             ref: z.string().describe('Element ref from browser_snapshot, e.g. "@e3"'),
             value: z.string().describe('Text to enter. An empty string clears the field.'),
             tabId: z.number().optional().describe('Tab the ref belongs to (defaults to the active tab)'),
+            trusted: z.boolean().optional().describe('Type as real (isTrusted) input instead of setting the value directly. Needed for editors that ignore scripted input. Requires the optional debugger permission, which only the user can enable.'),
         },
-    }, async (args) => runBrowserTool({ request: bridge, method: 'fill', params: { ref: args.ref, value: args.value, tabId: args.tabId } }));
+    }, async (args) => runBrowserTool({ request: bridge, method: 'fill', params: { ref: args.ref, value: args.value, tabId: args.tabId, trusted: args.trusted } }));
 
     mcp.registerTool('browser_navigate', {
         description: "Navigate a tab in the user's Chrome to a URL. This invalidates any refs from an earlier browser_snapshot of that tab — re-snapshot after navigating.",
@@ -249,6 +252,13 @@ function registerBrowserTools(mcp: McpServer): void {
             url: z.string().describe('URL to open'),
         },
     }, async (args) => runBrowserTool({ request: bridge, method: 'tabs_open', params: { url: args.url } }));
+
+    mcp.registerTool('browser_capabilities', {
+        description:
+            "Check what the browser bridge can do right now — in particular whether the optional debugger tier (fullPage screenshots, trusted click/fill) is enabled. Check this before relying on those rather than discovering it from a failed call.",
+        title: 'Browser capabilities',
+        inputSchema: {},
+    }, async () => runBrowserTool({ request: bridge, method: 'capabilities', params: {} }));
 
     mcp.registerTool('browser_close_tab', {
         description: "Close a tab in the user's Chrome. Use browser_tabs first to find the tabId.",

@@ -16,6 +16,7 @@ export const BROWSER_TOOL_NAMES = [
     'browser_navigate',
     'browser_open_tab',
     'browser_close_tab',
+    'browser_capabilities',
 ] as const
 
 type ToolContent =
@@ -42,6 +43,10 @@ function describeError(error: BrowserClientError): string {
         case 'BRIDGE_UNAVAILABLE':
         case 'DAEMON_UNREACHABLE':
             return `${error.message} (the daemon may need a restart on a build that includes browser support)`
+        case 'DEBUGGER_NOT_AVAILABLE':
+            // Actionable, and clear that it is the user's call — the agent
+            // cannot grant this to itself, by design.
+            return `${error.message} Without it, use a normal screenshot or an untrusted click/fill, which work for most pages.`
         default:
             return `${error.code}: ${error.message}`
     }
@@ -72,6 +77,16 @@ function renderSnapshot(result: any): string {
 export type BrowserBridgeMethod =
     | 'tabs_list' | 'snapshot' | 'screenshot'
     | 'click' | 'fill' | 'navigate' | 'tabs_open' | 'tabs_close'
+    | 'capabilities'
+
+function renderCapabilities(result: any): string {
+    return [
+        result?.debugger
+            ? 'Debugger tier: ON — fullPage screenshots and trusted click/fill are available.'
+            : 'Debugger tier: OFF — fullPage screenshots and trusted click/fill will fail. Only the user can enable it, in the extension options page; everything else works without it.',
+        `Commands: ${(result?.commands ?? []).join(', ')}`,
+    ].join('\n')
+}
 
 function renderSuccess(method: BrowserBridgeMethod, params: any, result: any): string {
     switch (method) {
@@ -114,6 +129,7 @@ export async function runBrowserTool({ request, method, params }: {
     let text: string
     if (method === 'tabs_list') text = renderTabs(result)
     else if (method === 'snapshot') text = renderSnapshot(result)
+    else if (method === 'capabilities') text = renderCapabilities(result)
     else text = renderSuccess(method, params, result)
 
     return { content: [{ type: 'text', text }], isError: false }
