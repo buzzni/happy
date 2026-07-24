@@ -18,6 +18,8 @@ import { createId } from "@paralleldrive/cuid2";
 import type { SessionEnvelope } from "@slopus/happy-wire";
 import { runBashStream } from "./bashStream";
 import { getActiveBashStreamCall } from "./bashStreamCallRegistry";
+import { requestBrowser, readDaemonControlPort, BrowserClientError } from "@/daemon/browserClient";
+import { runBrowserTool, BROWSER_TOOL_NAMES, type BridgeRequest } from "./browserTools";
 
 // chat-tool-output-streaming Phase 3 — bash_stream emits its agent-side
 // tool name via this constant so per-runner mappers (sessionProtocolMapper
@@ -166,7 +168,49 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
         }
     });
 
+    registerBrowserTools(mcp);
+
     return mcp;
+}
+
+/**
+ * chrome-extension-bridge Phase 2 — read-only control of the user's real,
+ * logged-in Chrome. The session reaches the browser through the daemon
+ * (`/browser/request`), which relays to the extension over a loopback socket.
+ */
+function registerBrowserTools(mcp: McpServer): void {
+    const bridge: BridgeRequest = async (method, params) => {
+        const port = await readDaemonControlPort();
+        if (port === null) {
+            throw new BrowserClientError('DAEMON_UNREACHABLE', 'No happy daemon is running on this machine');
+        }
+        return requestBrowser({ port, method, params });
+    };
+
+    mcp.registerTool('browser_tabs', {
+        description:
+            "List the tabs open in the user's real Chrome on this machine (their logged-in profile, not a fresh headless browser). Use this to find the tab to work with; the returned ids can be passed as tabId to the other browser tools.",
+        title: 'List browser tabs',
+        inputSchema: {},
+    }, async () => runBrowserTool({ request: bridge, method: 'tabs_list', params: {} }));
+
+    mcp.registerTool('browser_snapshot', {
+        description:
+            "Snapshot the interactive elements of a tab in the user's Chrome — links, buttons, inputs — each with a @eN ref. Prefer this over a screenshot when you need to understand or act on the page: it is text, cheap, and the refs are how you will target elements. Refs are invalidated by navigation, so re-snapshot after the page changes.",
+        title: 'Snapshot page elements',
+        inputSchema: {
+            tabId: z.number().optional().describe('Tab to snapshot (defaults to the active tab)'),
+        },
+    }, async (args) => runBrowserTool({ request: bridge, method: 'snapshot', params: { tabId: args.tabId } }));
+
+    mcp.registerTool('browser_screenshot', {
+        description:
+            "Capture what a tab in the user's Chrome currently looks like. Use it for visual questions (layout, rendering, a chart); for reading or acting on page content prefer browser_snapshot.",
+        title: 'Screenshot a tab',
+        inputSchema: {
+            tabId: z.number().optional().describe('Tab to capture (defaults to the active tab)'),
+        },
+    }, async (args) => runBrowserTool({ request: bridge, method: 'screenshot', params: { tabId: args.tabId } }));
 }
 
 export async function startHappyServer(client: ApiSessionClient) {
@@ -206,7 +250,7 @@ export async function startHappyServer(client: ApiSessionClient) {
 
     return {
         url: baseUrl.toString(),
-        toolNames: ['change_title', 'bash_stream'],
+        toolNames: ['change_title', 'bash_stream', ...BROWSER_TOOL_NAMES],
         stop: () => {
             logger.debug(`[happyMCP] server:stop sessionId=${client.sessionId}`);
             server.close();
