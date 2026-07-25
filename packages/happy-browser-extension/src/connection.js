@@ -16,6 +16,9 @@ const BADGE_IDLE = { text: '●', color: '#4a9d5f' }
 /** A command from the agent is running against this profile right now. */
 const BADGE_BUSY = { text: '▶', color: '#c2701c' }
 const BADGE_OFF = { text: '', color: '#4a9d5f' }
+/** The daemon rejected our stored token (4401) — retrying won't help until
+ *  the user re-pairs; a bare BADGE_OFF looks identical to a normal drop. */
+const BADGE_AUTH_ERROR = { text: '!', color: '#c0392b' }
 
 export function createConnection({
     chrome,
@@ -105,7 +108,7 @@ export function createConnection({
             if (ws.readyState === WebSocketImpl.OPEN) ws.send(JSON.stringify(response))
         })
 
-        const onGone = () => {
+        const onGone = (event) => {
             if (keepaliveTimer !== null) {
                 clearInterval(keepaliveTimer)
                 keepaliveTimer = null
@@ -114,7 +117,7 @@ export function createConnection({
             // one losing the daemon warrants a badge reset and a reconnect.
             if (socket !== ws) return
             socket = null
-            setBadge(BADGE_OFF)
+            setBadge(event?.code === 4401 ? BADGE_AUTH_ERROR : BADGE_OFF)
             scheduleReconnect()
         }
         ws.addEventListener('close', onGone)

@@ -73,6 +73,34 @@ describe('BrowserBridge', () => {
         })
     })
 
+    describe('hasRecentAuthFailure', () => {
+        // Ground truth for this: an already-paired extension kept a token that
+        // predates the daemon's token file being regenerated. It retried
+        // forever, rejected every time, and nothing surfaced that to the user
+        // — connections() only reports successes, so `/browser/status` looked
+        // identical to "nothing has ever tried to connect".
+        it('is false when nothing has failed to authenticate', () => {
+            expect(bridge.hasRecentAuthFailure()).toBe(false)
+        })
+
+        it('is true right after a rejected token', () => {
+            bridge.handleConnection(new FakeSocket(), { token: 'wrong', profile: 'default' })
+            expect(bridge.hasRecentAuthFailure()).toBe(true)
+        })
+
+        it('stays false once a connection with that profile succeeds', () => {
+            bridge.handleConnection(new FakeSocket(), { token: 'wrong', profile: 'default' })
+            connect('default')
+            expect(bridge.hasRecentAuthFailure()).toBe(false)
+        })
+
+        it('expires after the recent-failure window passes', () => {
+            bridge.handleConnection(new FakeSocket(), { token: 'wrong', profile: 'default' })
+            vi.advanceTimersByTime(60_001)
+            expect(bridge.hasRecentAuthFailure()).toBe(false)
+        })
+    })
+
     describe('request/response correlation', () => {
         it('resolves a request with the result matching its id', async () => {
             const socket = connect()

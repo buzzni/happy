@@ -11,6 +11,7 @@
  */
 
 import { createConnection } from './connection.js'
+import { generateDefaultProfileName } from './profileId.js'
 
 const connection = createConnection({ chrome, WebSocketImpl: WebSocket })
 
@@ -22,5 +23,17 @@ chrome.storage.onChanged.addListener((changes, area) => {
 })
 
 chrome.runtime.onStartup.addListener(() => connection.connect())
-chrome.runtime.onInstalled.addListener(() => connection.connect())
+chrome.runtime.onInstalled.addListener(async (details) => {
+    // A fresh install's options page has never saved a profile name yet — the
+    // options page itself falls back to displaying "default", which two
+    // never-configured Chrome profiles would both persist verbatim. Pin a
+    // unique one now so that only happens if the user explicitly clears it.
+    if (details.reason === 'install') {
+        const { profile } = await chrome.storage.local.get(['profile'])
+        if (!profile) {
+            await chrome.storage.local.set({ profile: generateDefaultProfileName() })
+        }
+    }
+    connection.connect()
+})
 connection.connect()

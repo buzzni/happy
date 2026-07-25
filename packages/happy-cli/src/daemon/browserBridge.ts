@@ -47,12 +47,14 @@ interface Connection {
 
 const DEFAULT_PROFILE = 'default'
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+const AUTH_FAILURE_WINDOW_MS = 60_000
 
 export class BrowserBridge {
     private readonly authToken: string
     private readonly requestTimeoutMs: number
     private readonly byProfile = new Map<string, Connection>()
     private nextRequestId = 1
+    private lastAuthFailureAt: number | null = null
 
     constructor(opts: { authToken: string; requestTimeoutMs?: number }) {
         this.authToken = opts.authToken
@@ -67,9 +69,11 @@ export class BrowserBridge {
      */
     handleConnection(socket: BridgeSocket, params: BridgeConnectionParams): boolean {
         if (!params.token || params.token !== this.authToken) {
+            this.lastAuthFailureAt = Date.now()
             socket.close(4401, 'invalid token')
             return false
         }
+        this.lastAuthFailureAt = null
         const profile = params.profile || DEFAULT_PROFILE
 
         const stale = this.byProfile.get(profile)
@@ -95,6 +99,17 @@ export class BrowserBridge {
     /** Connected extensions (introspection / status endpoint). */
     connections(): Array<{ profile: string }> {
         return Array.from(this.byProfile.keys()).map(profile => ({ profile }))
+    }
+
+    /**
+     * True when a connection attempt was rejected for a bad token recently.
+     * A stale token (the daemon's token file was regenerated after an
+     * extension paired) retries forever and fails silently otherwise —
+     * connections() only reports successes, so nothing else distinguishes
+     * this from "no extension has ever tried to connect".
+     */
+    hasRecentAuthFailure(): boolean {
+        return this.lastAuthFailureAt !== null && Date.now() - this.lastAuthFailureAt < AUTH_FAILURE_WINDOW_MS
     }
 
     /**

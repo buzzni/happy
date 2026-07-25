@@ -108,12 +108,12 @@ describe('controlServer /browser routes', () => {
 
     it('GET /browser/status reports connected profiles', async () => {
         const before = await fetch(`${baseUrl}/browser/status`)
-        expect(await before.json()).toEqual({ connections: [] })
+        expect(await before.json()).toEqual({ connections: [], hasRecentAuthFailure: false })
 
         const { ws } = await connectExtension(bridgePort, `token=${TOKEN}&profile=work`)
         await expect.poll(() => bridge.connections().length).toBe(1)
         const after = await fetch(`${baseUrl}/browser/status`)
-        expect(await after.json()).toEqual({ connections: [{ profile: 'work' }] })
+        expect(await after.json()).toEqual({ connections: [{ profile: 'work' }], hasRecentAuthFailure: false })
         ws.close()
     })
 

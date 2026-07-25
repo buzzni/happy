@@ -24,10 +24,10 @@ class FakeWebSocket {
         this.sent.push(data)
     }
 
-    close() {
+    close(code) {
         this.closed = true
         this.readyState = FakeWebSocket.CLOSED
-        this.fire('close')
+        this.fire('close', { code })
     }
 
     fire(event, payload) {
@@ -199,6 +199,23 @@ describe('createConnection', () => {
             await vi.advanceTimersByTimeAsync(0)
 
             expect(badges[badges.length - 1]).toBe('●')
+        })
+
+        it('shows a distinct badge when the daemon rejects the stored token', async () => {
+            // A stale token (daemon's token file rotated after pairing) closes
+            // with 4401 and the extension retries forever with the same stale
+            // token — without a distinct badge that looks identical to a normal
+            // transient disconnect, which is what made this silent to debug.
+            const badges = []
+            const connection = make(fakeChrome(undefined, badges))
+            await connection.connect()
+            const ws = FakeWebSocket.instances[0]
+            ws.open()
+            badges.length = 0
+
+            ws.close(4401)
+
+            expect(badges[badges.length - 1]).toBe('!')
         })
 
         it('does not mark the badge for keepalive pongs', async () => {

@@ -11,5 +11,6 @@
     "src/backoff.js",
     "src/options.html",
     "src/options.js",
-    "src/autoConnect.js"
+    "src/autoConnect.js",
+    "src/profileId.js"
 ]

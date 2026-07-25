@@ -51,9 +51,22 @@ export interface BrowserStatusInput {
     bridgePort: number
     daemonRunning: boolean
     connections: Array<{ profile: string }>
+    /**
+     * A connection attempt was rejected recently for a bad token — typically
+     * an already-paired extension whose stored token predates the daemon's
+     * token file being regenerated. It retries forever and fails silently,
+     * so this needs its own message: connections() alone can't tell "never
+     * tried" apart from "tried and keeps getting rejected", and a healthy
+     * second profile shouldn't hide a broken first one.
+     */
+    hasRecentAuthFailure: boolean
 }
 
-export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePort, daemonRunning, connections }: BrowserStatusInput): string {
+function autoConnectLink(extensionId: string, token: string, bridgePort: number): string {
+    return `chrome-extension://${extensionId}/src/options.html?token=${token}&port=${bridgePort}`
+}
+
+export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePort, daemonRunning, connections, hasRecentAuthFailure }: BrowserStatusInput): string {
     const lines: string[] = ['', chalk.bold('Happy Browser Bridge'), '']
 
     if (!daemonRunning) {
@@ -75,10 +88,18 @@ export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePo
             lines.push(`  • ${connection.profile}`)
         }
         lines.push('')
+        if (hasRecentAuthFailure) {
+            lines.push(chalk.yellow('다른 확장이 예전 토큰으로 재연결을 시도하다 거부되고 있습니다.'))
+            lines.push('아래 링크를 열어 재연결하세요:')
+            lines.push(`  ${chalk.cyan(autoConnectLink(extensionId, token, bridgePort))}`)
+            lines.push('')
+        }
         return lines.join('\n')
     }
 
-    lines.push(chalk.yellow('연결된 확장이 없습니다.'))
+    lines.push(hasRecentAuthFailure
+        ? chalk.yellow('확장이 연결을 시도했지만 예전 토큰이라 거부됐습니다. 재연결이 필요합니다.')
+        : chalk.yellow('연결된 확장이 없습니다.'))
     lines.push('')
     lines.push(chalk.bold('설치 방법'))
     lines.push(`  1. Chrome에서 ${chalk.cyan('chrome://extensions')} 열기 → 개발자 모드 켜기`)
@@ -88,7 +109,7 @@ export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePo
     lines.push(`     (포트는 ${bridgePort}, 기본값 그대로면 수정 불필요)`)
     lines.push('')
     lines.push(chalk.dim('  1번 이후에는 아래 링크를 열면 2, 3번이 자동으로 끝납니다:'))
-    lines.push(`  ${chalk.cyan(`chrome-extension://${extensionId}/src/options.html?token=${token}&port=${bridgePort}`)}`)
+    lines.push(`  ${chalk.cyan(autoConnectLink(extensionId, token, bridgePort))}`)
     lines.push('')
     lines.push(chalk.dim('  선택: 옵션의 allowlist에 사이트를 적으면 그 사이트에서만 동작합니다.'))
     lines.push(chalk.dim('  비워 두면 모든 탭을 제어할 수 있습니다.'))
@@ -97,16 +118,16 @@ export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePo
     return lines.join('\n')
 }
 
-async function fetchConnections(httpPort: number): Promise<Array<{ profile: string }>> {
+async function fetchBridgeStatus(httpPort: number): Promise<{ connections: Array<{ profile: string }>; hasRecentAuthFailure: boolean }> {
     try {
         const response = await fetch(`http://127.0.0.1:${httpPort}/browser/status`, {
             signal: AbortSignal.timeout(2000),
         })
-        if (!response.ok) return []
-        const body = await response.json() as { connections?: Array<{ profile: string }> }
-        return body.connections ?? []
+        if (!response.ok) return { connections: [], hasRecentAuthFailure: false }
+        const body = await response.json() as { connections?: Array<{ profile: string }>; hasRecentAuthFailure?: boolean }
+        return { connections: body.connections ?? [], hasRecentAuthFailure: body.hasRecentAuthFailure ?? false }
     } catch {
-        return []
+        return { connections: [], hasRecentAuthFailure: false }
     }
 }
 
@@ -130,7 +151,9 @@ export async function handleBrowserCommand(args: string[]): Promise<void> {
 
     const state = await readDaemonState()
     const daemonRunning = Boolean(state?.httpPort)
-    const connections = daemonRunning ? await fetchConnections(state!.httpPort!) : []
+    const { connections, hasRecentAuthFailure } = daemonRunning
+        ? await fetchBridgeStatus(state!.httpPort!)
+        : { connections: [], hasRecentAuthFailure: false }
 
     const extensionDir = resolveExtensionDir()
 
@@ -141,5 +164,6 @@ export async function handleBrowserCommand(args: string[]): Promise<void> {
         bridgePort: DEFAULT_BROWSER_BRIDGE_PORT,
         daemonRunning,
         connections,
+        hasRecentAuthFailure,
     }))
 }

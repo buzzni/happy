@@ -540,12 +540,13 @@ export function startDaemonControlServer({
         schema: {
           response: {
             200: z.object({
-              connections: z.array(z.object({ profile: z.string() }))
+              connections: z.array(z.object({ profile: z.string() })),
+              hasRecentAuthFailure: z.boolean()
             })
           }
         }
       }, async () => {
-        return { connections: browserBridge.connections() };
+        return { connections: browserBridge.connections(), hasRecentAuthFailure: browserBridge.hasRecentAuthFailure() };
       });
 
       typed.post('/browser/request', {

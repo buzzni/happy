@@ -9,6 +9,7 @@ const base = {
     extensionDir: '/repo/packages/happy-browser-extension',
     bridgePort: 41777,
     extensionId: 'emaponnolfbhnoaabgiebjmbdlmoifke',
+    hasRecentAuthFailure: false,
 }
 
 describe('formatBrowserStatus', () => {
@@ -46,6 +47,33 @@ describe('formatBrowserStatus', () => {
     it('drops the auto-connect link once an extension is connected', () => {
         const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [{ profile: 'default' }] })
         expect(out).not.toContain('chrome-extension://')
+    })
+
+    it('warns about a stale token even when another profile is connected fine', () => {
+        // Ground truth: an already-paired extension whose stored token
+        // predates the daemon's token file being regenerated retries forever
+        // and fails silently — the "확장 연결됨" branch used to return before
+        // ever looking at this, so a healthy second profile hid the problem.
+        const out = formatBrowserStatus({
+            ...base,
+            daemonRunning: true,
+            connections: [{ profile: 'default' }],
+            hasRecentAuthFailure: true,
+        })
+        expect(out).toContain('확장 연결됨')
+        expect(out).toMatch(/토큰|재연결/)
+        expect(out).toContain(`chrome-extension://${base.extensionId}/src/options.html?token=${base.token}&port=${base.bridgePort}`)
+    })
+
+    it('distinguishes "never connected" from "rejected for a bad token" when nothing is connected', () => {
+        const out = formatBrowserStatus({
+            ...base,
+            daemonRunning: true,
+            connections: [],
+            hasRecentAuthFailure: true,
+        })
+        expect(out).not.toContain('연결된 확장이 없습니다')
+        expect(out).toMatch(/토큰|재연결/)
     })
 
     it('leads with the daemon being down, since nothing else can work then', () => {
