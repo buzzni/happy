@@ -65,6 +65,7 @@ function createPublishTarball(
     writeFixtureFile(packageRoot, 'node_modules/zod/package.json', JSON.stringify({ name: 'zod', version: '0.0.0-test' }))
     writeFixtureFile(packageRoot, 'node_modules/@paralleldrive/cuid2/package.json', JSON.stringify({ name: '@paralleldrive/cuid2', version: '0.0.0-test' }))
     writeFixtureFile(packageRoot, 'node_modules/@paralleldrive/cuid2/node_modules/@noble/hashes/package.json', JSON.stringify({ name: '@noble/hashes', version: '0.0.0-test' }))
+    writeFixtureFile(packageRoot, 'browser-extension/manifest.json', '{}')
     writeFixtureFile(packageRoot, 'node_modules/fastify/package.json', JSON.stringify({
         name: 'fastify',
         version: '0.0.0-test',

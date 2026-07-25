@@ -27,7 +27,11 @@ happy browser
 1. 위 명령이 출력한 **pairing 토큰**을 복사합니다
    (파일 경로는 `~/.happy/browser-bridge.token`).
 2. Chrome에서 `chrome://extensions` → **개발자 모드** 켜기 → **압축해제된 확장 프로그램을 로드** →
-   이 디렉터리(`packages/happy-browser-extension`)를 선택합니다.
+   `happy browser` 가 알려준 폴더를 선택합니다.
+   (모노레포에서 개발 중이면 이 디렉터리, `npm i -g @buzzni/happy-cli` 로 설치했다면
+   설치된 `browser-extension/` — `happy browser` 가 실제 상황에 맞는 경로를 출력합니다.
+   `shipped-files.json` 이 packed 될 파일 목록의 유일한 출처이고,
+   `happy-cli/scripts/copy-browser-extension.cjs` 가 그걸 읽어 CLI 패키지에 번들합니다.)
 3. 확장의 **옵션** 페이지에서 토큰을 붙여넣고 저장합니다. 포트는 기본 41777.
    Chrome 프로필이 여러 개면 프로필마다 다른 이름을 지정하세요.
 4. 연결되면 확장 아이콘에 ● 배지(초록)가 표시됩니다.

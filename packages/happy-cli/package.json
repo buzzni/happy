@@ -59,6 +59,7 @@
     "dist",
     "bin",
     "scripts",
+    "browser-extension",
     "tools/archives",
     "tools/licenses",
     "package.json"
@@ -70,7 +71,7 @@
     "bundle:server": "node scripts/bundle-server.cjs",
     "bundle:server:all": "node scripts/bundle-server.cjs --all-platforms",
     "bundle:webapp": "node scripts/bundle-webapp.cjs",
-    "build": "shx rm -rf dist && tsc --noEmit && pkgroll",
+    "build": "shx rm -rf dist && tsc --noEmit && pkgroll && node scripts/copy-browser-extension.cjs",
     "test": "pnpm run build && vitest run --project unit",
     "test:integration": "pnpm run build && vitest run --project integration-empty --project integration-plan-mode --project integration-authenticated",
     "cli:install": "node scripts/install-local.cjs",

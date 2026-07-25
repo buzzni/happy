@@ -9,11 +9,28 @@
 
 import chalk from 'chalk'
 import path from 'node:path'
+import { existsSync } from 'node:fs'
 import { configuration } from '@/configuration'
 import { readDaemonState } from '@/persistence'
 import { projectPath } from '@/projectPath'
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken'
 import { DEFAULT_BROWSER_BRIDGE_PORT } from '@/daemon/browserBridgeServer'
+
+/**
+ * Where to point the user at the extension's source.
+ *
+ * An installed happy-cli has the extension bundled alongside it (built by
+ * scripts/copy-browser-extension.cjs, shipped via package.json "files") —
+ * that's the common case and takes priority. Running from the monorepo
+ * source tree (no build step run) has no bundled copy, so fall back to the
+ * sibling package. Without this fallback, dev checkouts print a path that
+ * doesn't exist — which is exactly the bug that prompted this function.
+ */
+export function resolveExtensionDir(): string {
+    const bundled = path.join(projectPath(), 'browser-extension')
+    if (existsSync(path.join(bundled, 'manifest.json'))) return bundled
+    return path.join(projectPath(), '..', 'happy-browser-extension')
+}
 
 export interface BrowserStatusInput {
     token: string
@@ -101,7 +118,7 @@ export async function handleBrowserCommand(args: string[]): Promise<void> {
 
     console.log(formatBrowserStatus({
         token,
-        extensionDir: path.join(projectPath(), '..', 'happy-browser-extension'),
+        extensionDir: resolveExtensionDir(),
         bridgePort: DEFAULT_BROWSER_BRIDGE_PORT,
         daemonRunning,
         connections,

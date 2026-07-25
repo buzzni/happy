@@ -263,6 +263,14 @@ function runInstallSmoke(tarball, packageJson) {
             throw new Error(`Smoke install version mismatch: expected ${packageJson.version}, got ${installedPackage.version}`);
         }
 
+        // `happy browser`'s install instructions point here; if it's missing
+        // from a real install, the printed path is a dead end. This is what
+        // broke before scripts/copy-browser-extension.cjs existed.
+        const bundledExtensionManifest = path.join(installedRoot, 'browser-extension', 'manifest.json');
+        if (!fs.existsSync(bundledExtensionManifest)) {
+            throw new Error(`Smoke install is missing the bundled browser extension at ${bundledExtensionManifest}`);
+        }
+
         assertProductionDependencyClosure(prefix);
 
         const cliVersionOutput = run(process.execPath, [

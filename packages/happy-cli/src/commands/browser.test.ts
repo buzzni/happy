@@ -1,5 +1,8 @@
-import { describe, it, expect } from 'vitest'
-import { formatBrowserStatus } from './browser'
+import { describe, it, expect, afterEach } from 'vitest'
+import { existsSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
+import { formatBrowserStatus, resolveExtensionDir } from './browser'
+import { projectPath } from '@/projectPath'
 
 const base = {
     token: 'a'.repeat(64),
@@ -51,5 +54,36 @@ describe('formatBrowserStatus', () => {
         })
         expect(out).toContain('work')
         expect(out).toContain('personal')
+    })
+})
+
+describe('resolveExtensionDir', () => {
+    // An installed happy-cli has no sibling packages/ directory at all — the
+    // sibling fallback existing is what the pre-fix bug relied on without
+    // that being true outside this monorepo. These tests exercise the real
+    // filesystem (not a fake) because the bug was entirely about a real path
+    // not existing; a mock would not have caught it.
+    const bundledDir = path.join(projectPath(), 'browser-extension')
+
+    afterEach(() => {
+        rmSync(bundledDir, { recursive: true, force: true })
+    })
+
+    it('prefers the bundled copy (what a real install has) when present', () => {
+        mkdirSync(bundledDir, { recursive: true })
+        writeFileSync(path.join(bundledDir, 'manifest.json'), '{}')
+
+        expect(resolveExtensionDir()).toBe(bundledDir)
+    })
+
+    it('falls back to the monorepo sibling package when there is no bundled copy', () => {
+        expect(existsSync(bundledDir)).toBe(false)
+
+        const result = resolveExtensionDir()
+
+        expect(result).not.toBe(bundledDir)
+        // The fallback must point somewhere real, in this checkout — the bug
+        // this guards against is exactly "the printed path doesn't exist".
+        expect(existsSync(path.join(result, 'manifest.json'))).toBe(true)
     })
 })

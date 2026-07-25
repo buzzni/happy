@@ -20,21 +20,10 @@ const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8
 const zipName = `happy-browser-bridge-${manifest.version}.zip`
 const zipPath = path.join(outDir, zipName)
 
-// Everything Chrome needs, and nothing else.
-const INCLUDE = [
-    'manifest.json',
-    'src/background.js',
-    'src/connection.js',
-    'src/protocol.js',
-    'src/snapshot.js',
-    'src/actions.js',
-    'src/allowlist.js',
-    'src/cdp.js',
-    'src/frameRefs.js',
-    'src/backoff.js',
-    'src/options.html',
-    'src/options.js',
-]
+// Everything Chrome needs, and nothing else. Shared with happy-cli's
+// scripts/copy-browser-extension.cjs (which bundles the same files into the
+// published happy-cli package) so there is one list to keep in sync, not two.
+const INCLUDE = JSON.parse(readFileSync(path.join(root, 'shipped-files.json'), 'utf8'))
 
 const missing = INCLUDE.filter((file) => !existsSync(path.join(root, file)))
 if (missing.length > 0) {

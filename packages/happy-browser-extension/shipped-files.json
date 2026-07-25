@@ -1,0 +1,14 @@
+[
+    "manifest.json",
+    "src/background.js",
+    "src/connection.js",
+    "src/protocol.js",
+    "src/snapshot.js",
+    "src/actions.js",
+    "src/allowlist.js",
+    "src/cdp.js",
+    "src/frameRefs.js",
+    "src/backoff.js",
+    "src/options.html",
+    "src/options.js"
+]
