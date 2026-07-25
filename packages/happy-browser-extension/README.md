@@ -34,6 +34,10 @@ happy browser
    `happy-cli/scripts/copy-browser-extension.cjs` 가 그걸 읽어 CLI 패키지에 번들합니다.)
 3. 확장의 **옵션** 페이지에서 토큰을 붙여넣고 저장합니다. 포트는 기본 41777.
    Chrome 프로필이 여러 개면 프로필마다 다른 이름을 지정하세요.
+   (`happy browser` 가 2번 이후 열 수 있는 **설정 링크**도 함께 출력합니다 —
+   `chrome-extension://<고정ID>/src/options.html?token=...&port=...` 를 열면
+   토큰 붙여넣기·저장이 자동으로 끝납니다. 확장 ID는 `manifest.json` 의 `key` 로
+   고정되어 있어 CLI가 미리 계산할 수 있습니다.)
 4. 연결되면 확장 아이콘에 ● 배지(초록)가 표시됩니다.
    에이전트가 명령을 실행하는 동안에는 ▶ (주황)으로 바뀝니다.
 

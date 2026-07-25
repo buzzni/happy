@@ -1,13 +1,14 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import { existsSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { formatBrowserStatus, resolveExtensionDir } from './browser'
+import { formatBrowserStatus, resolveExtensionDir, resolveExtensionId } from './browser'
 import { projectPath } from '@/projectPath'
 
 const base = {
     token: 'a'.repeat(64),
     extensionDir: '/repo/packages/happy-browser-extension',
     bridgePort: 41777,
+    extensionId: 'emaponnolfbhnoaabgiebjmbdlmoifke',
 }
 
 describe('formatBrowserStatus', () => {
@@ -33,6 +34,18 @@ describe('formatBrowserStatus', () => {
         // buries the part they came for (the status).
         const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [{ profile: 'default' }] })
         expect(out).not.toContain('chrome://extensions')
+    })
+
+    it('offers an auto-connect link that fills the token in for the user', () => {
+        // The extension id is fixed (manifest.json "key"), so the CLI can
+        // build this link without the extension ever having reported its id.
+        const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [] })
+        expect(out).toContain(`chrome-extension://${base.extensionId}/src/options.html?token=${base.token}&port=${base.bridgePort}`)
+    })
+
+    it('drops the auto-connect link once an extension is connected', () => {
+        const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [{ profile: 'default' }] })
+        expect(out).not.toContain('chrome-extension://')
     })
 
     it('leads with the daemon being down, since nothing else can work then', () => {
@@ -85,5 +98,14 @@ describe('resolveExtensionDir', () => {
         // The fallback must point somewhere real, in this checkout — the bug
         // this guards against is exactly "the printed path doesn't exist".
         expect(existsSync(path.join(result, 'manifest.json'))).toBe(true)
+    })
+})
+
+describe('resolveExtensionId', () => {
+    it('derives the id from the real monorepo manifest\'s pinned key', () => {
+        // Ground truth for this id: real Chrome load, see
+        // browserExtensionId.test.ts.
+        const extensionDir = path.join(projectPath(), '..', 'happy-browser-extension')
+        expect(resolveExtensionId(extensionDir)).toBe('emaponnolfbhnoaabgiebjmbdlmoifke')
     })
 })

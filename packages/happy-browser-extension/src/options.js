@@ -1,4 +1,5 @@
 import { parseAllowlist } from './allowlist.js'
+import { parseAutoConnectParams } from './autoConnect.js'
 
 const portInput = document.getElementById('port')
 const tokenInput = document.getElementById('token')
@@ -12,7 +13,7 @@ tokenInput.value = stored.token || ''
 profileInput.value = stored.profile || 'default'
 allowlistInput.value = stored.allowlist || ''
 
-document.getElementById('save').addEventListener('click', async () => {
+async function save() {
     const token = tokenInput.value.trim()
     if (!token) {
         status.textContent = '토큰을 입력해 주세요.'
@@ -34,7 +35,24 @@ document.getElementById('save').addEventListener('click', async () => {
     status.textContent = patterns.length === 0
         ? '저장했습니다. allowlist가 비어 있어 모든 사이트를 제어할 수 있습니다.'
         : `저장했습니다. ${patterns.length}개 패턴만 허용됩니다: ${patterns.join(', ')}`
-})
+}
+
+document.getElementById('save').addEventListener('click', save)
+
+// `happy browser` prints a chrome-extension://<id>/src/options.html?token=...
+// link so first-time setup is "open link" instead of "copy token, switch to
+// this tab, paste, save". The token still came from a link the user chose to
+// open, so auto-saving it is no riskier than them pasting it themselves.
+const autoConnect = parseAutoConnectParams(location.search)
+if (autoConnect) {
+    tokenInput.value = autoConnect.token
+    portInput.value = autoConnect.port
+    // Scrub the token from the visible URL / this navigation's history entry
+    // right away — nothing downstream needs it to stay there.
+    history.replaceState(null, '', location.pathname)
+    await save()
+    status.textContent = `링크로 자동 연결되었습니다. ${status.textContent}`
+}
 
 // The debugger tier is gated by a stored setting, not an optional Chrome
 // permission: Chrome does not allow `debugger` in optional_permissions (it is

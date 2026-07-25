@@ -10,5 +10,6 @@
     "src/frameRefs.js",
     "src/backoff.js",
     "src/options.html",
-    "src/options.js"
+    "src/options.js",
+    "src/autoConnect.js"
 ]

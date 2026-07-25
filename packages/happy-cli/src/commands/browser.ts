@@ -9,12 +9,13 @@
 
 import chalk from 'chalk'
 import path from 'node:path'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { configuration } from '@/configuration'
 import { readDaemonState } from '@/persistence'
 import { projectPath } from '@/projectPath'
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken'
 import { DEFAULT_BROWSER_BRIDGE_PORT } from '@/daemon/browserBridgeServer'
+import { computeChromeExtensionId } from './browserExtensionId'
 
 /**
  * Where to point the user at the extension's source.
@@ -32,15 +33,27 @@ export function resolveExtensionDir(): string {
     return path.join(projectPath(), '..', 'happy-browser-extension')
 }
 
+/**
+ * manifest.json pins a "key", which fixes the extension's id regardless of
+ * which path it was loaded from — that's what lets us build a working
+ * chrome-extension://<id>/... link before the extension has ever reported
+ * anything back to the daemon.
+ */
+export function resolveExtensionId(extensionDir: string): string {
+    const manifest = JSON.parse(readFileSync(path.join(extensionDir, 'manifest.json'), 'utf8')) as { key: string }
+    return computeChromeExtensionId(manifest.key)
+}
+
 export interface BrowserStatusInput {
     token: string
     extensionDir: string
+    extensionId: string
     bridgePort: number
     daemonRunning: boolean
     connections: Array<{ profile: string }>
 }
 
-export function formatBrowserStatus({ token, extensionDir, bridgePort, daemonRunning, connections }: BrowserStatusInput): string {
+export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePort, daemonRunning, connections }: BrowserStatusInput): string {
     const lines: string[] = ['', chalk.bold('Happy Browser Bridge'), '']
 
     if (!daemonRunning) {
@@ -73,6 +86,9 @@ export function formatBrowserStatus({ token, extensionDir, bridgePort, daemonRun
     lines.push(`     ${extensionDir}`)
     lines.push('  3. 확장 옵션 페이지에서 위 토큰을 붙여넣고 저장')
     lines.push(`     (포트는 ${bridgePort}, 기본값 그대로면 수정 불필요)`)
+    lines.push('')
+    lines.push(chalk.dim('  1번 이후에는 아래 링크를 열면 2, 3번이 자동으로 끝납니다:'))
+    lines.push(`  ${chalk.cyan(`chrome-extension://${extensionId}/src/options.html?token=${token}&port=${bridgePort}`)}`)
     lines.push('')
     lines.push(chalk.dim('  선택: 옵션의 allowlist에 사이트를 적으면 그 사이트에서만 동작합니다.'))
     lines.push(chalk.dim('  비워 두면 모든 탭을 제어할 수 있습니다.'))
@@ -116,9 +132,12 @@ export async function handleBrowserCommand(args: string[]): Promise<void> {
     const daemonRunning = Boolean(state?.httpPort)
     const connections = daemonRunning ? await fetchConnections(state!.httpPort!) : []
 
+    const extensionDir = resolveExtensionDir()
+
     console.log(formatBrowserStatus({
         token,
-        extensionDir: resolveExtensionDir(),
+        extensionDir,
+        extensionId: resolveExtensionId(extensionDir),
         bridgePort: DEFAULT_BROWSER_BRIDGE_PORT,
         daemonRunning,
         connections,
