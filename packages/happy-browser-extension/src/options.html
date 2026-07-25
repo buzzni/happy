@@ -4,62 +4,231 @@
   <meta charset="utf-8">
   <title>Happy Browser Bridge 설정</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 30rem; margin: 2rem auto; padding: 0 1rem; }
-    label { display: block; margin-top: 1rem; font-weight: 600; }
-    input, textarea { width: 100%; padding: .4rem; margin-top: .25rem; font-family: ui-monospace, monospace; }
+    :root {
+      --bg: #ffffff;
+      --surface: #F5F5F5;
+      --divider: #eaeaea;
+      --text: #1c1b1f;
+      --text-muted: #68666e;
+      --primary: #5e52a7;
+      --primary-container: #e5deff;
+      --on-primary: #ffffff;
+      --success: #248a3d;
+      --success-bg: #e7f7ec;
+      --error: #d5251f;
+      --error-bg: #fdecec;
+      --radius-md: 8px;
+      --radius-lg: 10px;
+      --radius-xl: 12px;
+      --space-xs: 4px;
+      --space-sm: 8px;
+      --space-md: 12px;
+      --space-lg: 16px;
+      --space-xl: 20px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1c1b1f;
+        --surface: #212121;
+        --divider: #333238;
+        --text: #f0eef4;
+        --text-muted: #a3a1a8;
+        --primary: #c8bfff;
+        --primary-container: #443c73;
+        --on-primary: #1c1b1f;
+        --success: #32D74B;
+        --success-bg: #1c2e20;
+        --error: #FF453A;
+        --error-bg: #33201f;
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      max-width: 32rem;
+      margin: 0 auto;
+      padding: var(--space-xl) var(--space-lg) 3rem;
+      line-height: 1.5;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: var(--space-md);
+      margin-bottom: var(--space-xl);
+    }
+
+    .logo-dot {
+      width: 2rem;
+      height: 2rem;
+      border-radius: 50%;
+      background: var(--primary);
+      flex-shrink: 0;
+    }
+
+    h1 {
+      font-size: 1.15rem;
+      margin: 0;
+    }
+
+    header p {
+      margin: 2px 0 0;
+      color: var(--text-muted);
+      font-size: .85rem;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--divider);
+      border-radius: var(--radius-xl);
+      padding: var(--space-lg);
+      margin-bottom: var(--space-lg);
+    }
+
+    label {
+      display: block;
+      font-weight: 600;
+      font-size: .9rem;
+      margin-bottom: var(--space-xs);
+    }
+
+    label:not(:first-child) {
+      margin-top: var(--space-lg);
+    }
+
+    .hint {
+      color: var(--text-muted);
+      font-weight: 400;
+      font-size: .8rem;
+    }
+
+    input, textarea {
+      width: 100%;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--divider);
+      border-radius: var(--radius-lg);
+      padding: .5rem .6rem;
+      margin-top: var(--space-xs);
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: .85rem;
+    }
+
+    input:focus, textarea:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px var(--primary-container);
+    }
+
     textarea { min-height: 6rem; resize: vertical; }
-    button { margin-top: 1.25rem; padding: .5rem 1rem; }
-    .hint { color: #666; font-weight: 400; font-size: .85rem; }
-    #status { margin-top: 1rem; }
-    hr { margin: 2rem 0 0; border: 0; border-top: 1px solid #ddd; }
+
+    button {
+      font-family: inherit;
+      font-size: .9rem;
+      font-weight: 600;
+      border-radius: var(--radius-md);
+      border: none;
+      padding: .55rem 1.1rem;
+      margin-top: var(--space-lg);
+      cursor: pointer;
+    }
+
+    button#save {
+      background: var(--primary);
+      color: var(--on-primary);
+    }
+
+    button#save:hover { filter: brightness(1.08); }
+
+    button#toggle-debugger {
+      background: transparent;
+      color: var(--primary);
+      border: 1px solid var(--primary);
+    }
+
+    button#toggle-debugger:hover { background: var(--primary-container); }
+
+    #status, #debugger-status {
+      margin: var(--space-sm) 0 0;
+      font-size: .85rem;
+      color: var(--text-muted);
+    }
+
+    #status:not(:empty) {
+      background: var(--success-bg);
+      color: var(--success);
+      border-radius: var(--radius-md);
+      padding: var(--space-sm) var(--space-md);
+    }
+
+    code {
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      background: var(--primary-container);
+      color: var(--text);
+      border-radius: 4px;
+      padding: .1rem .3rem;
+      font-size: .82em;
+    }
   </style>
 </head>
 <body>
-  <h1>Happy Browser Bridge</h1>
-  <p class="hint">happy 데몬이 이 Chrome 프로필을 제어할 수 있게 연결합니다. 토큰은 데몬이 실행 중인 머신의 <code>~/.happy/browser-bridge.token</code> 에 있습니다.</p>
+  <header>
+    <div class="logo-dot" aria-hidden="true"></div>
+    <div>
+      <h1>Happy Browser Bridge</h1>
+      <p>happy 데몬이 이 Chrome 프로필을 제어할 수 있게 연결합니다. 토큰은 데몬이 실행 중인 머신의 <code>~/.happy/browser-bridge.token</code> 에 있습니다.</p>
+    </div>
+  </header>
 
-  <label for="port">포트 <span class="hint">(기본 41777)</span></label>
-  <input id="port" type="number" min="1" max="65535">
+  <div class="card">
+    <label for="port">포트 <span class="hint">(기본 41777)</span></label>
+    <input id="port" type="number" min="1" max="65535">
 
-  <label for="token">Pairing 토큰</label>
-  <input id="token" type="password" autocomplete="off" spellcheck="false">
+    <label for="token">Pairing 토큰</label>
+    <input id="token" type="password" autocomplete="off" spellcheck="false">
 
-  <label for="profile">프로필 이름 <span class="hint">(여러 Chrome 프로필을 구분할 때)</span></label>
-  <input id="profile" type="text" autocomplete="off" spellcheck="false">
+    <label for="profile">프로필 이름 <span class="hint">(여러 Chrome 프로필을 구분할 때)</span></label>
+    <input id="profile" type="text" autocomplete="off" spellcheck="false">
 
-  <hr>
+    <button id="save">저장하고 연결</button>
+    <p id="status"></p>
+  </div>
 
-  <label for="allowlist">사이트 allowlist <span class="hint">(선택)</span></label>
-  <p class="hint">
-    비워 두면 <strong>모든 사이트</strong>를 제어할 수 있습니다. 한 줄에 하나씩 적으면
-    그 사이트에서만 동작하고, 나머지 탭은 조작은 물론 목록에도 보이지 않습니다.
-    은행·개인 메일처럼 에이전트가 건드리면 안 되는 탭이 있다면 지정하세요.
-  </p>
-  <p class="hint">
-    예: <code>example.com</code> · <code>*.example.com</code>(서브도메인 포함) ·
-    <code>https://example.com</code>(https 만) · <code>localhost:3000</code>
-  </p>
-  <textarea id="allowlist" autocomplete="off" spellcheck="false" placeholder="비워 두면 제한 없음"></textarea>
+  <div class="card">
+    <label for="allowlist">사이트 allowlist <span class="hint">(선택)</span></label>
+    <p class="hint">
+      비워 두면 <strong>모든 사이트</strong>를 제어할 수 있습니다. 한 줄에 하나씩 적으면
+      그 사이트에서만 동작하고, 나머지 탭은 조작은 물론 목록에도 보이지 않습니다.
+      은행·개인 메일처럼 에이전트가 건드리면 안 되는 탭이 있다면 지정하세요.
+    </p>
+    <p class="hint">
+      예: <code>example.com</code> · <code>*.example.com</code>(서브도메인 포함) ·
+      <code>https://example.com</code>(https 만) · <code>localhost:3000</code>
+    </p>
+    <textarea id="allowlist" autocomplete="off" spellcheck="false" placeholder="비워 두면 제한 없음"></textarea>
+  </div>
 
-  <button id="save">저장하고 연결</button>
-  <p id="status"></p>
-
-  <hr>
-
-  <label>정밀 제어 (디버거) <span class="hint">(선택)</span></label>
-  <p class="hint">
-    켜면 <strong>실제 입력 이벤트</strong>(사이트가 스크립트 클릭을 거부하는 경우에
-    필요)와 <strong>전체 페이지 스크린샷</strong>을 쓸 수 있습니다.
-    켜져 있는 동안 조작 대상 탭에 Chrome의 “디버깅 중” 알림 바가 뜹니다.
-    끄면 나머지 기능은 그대로 동작합니다.
-  </p>
-  <p class="hint">
-    이 설정은 <strong>사용자만</strong> 켤 수 있습니다 — 에이전트에겐 확장 설정을 바꾸는
-    명령이 없습니다. (Chrome 이 <code>debugger</code> 를 선택 권한으로 허용하지 않아
-    설치 시 권한 자체는 함께 부여되며, 실제 사용 여부를 이 설정이 통제합니다.)
-  </p>
-  <button id="toggle-debugger">확인 중…</button>
-  <p id="debugger-status"></p>
+  <div class="card">
+    <label>정밀 제어 (디버거) <span class="hint">(선택)</span></label>
+    <p class="hint">
+      켜면 <strong>실제 입력 이벤트</strong>(사이트가 스크립트 클릭을 거부하는 경우에
+      필요)와 <strong>전체 페이지 스크린샷</strong>을 쓸 수 있습니다.
+      켜져 있는 동안 조작 대상 탭에 Chrome의 “디버깅 중” 알림 바가 뜹니다.
+      끄면 나머지 기능은 그대로 동작합니다.
+    </p>
+    <p class="hint">
+      이 설정은 <strong>사용자만</strong> 켤 수 있습니다 — 에이전트에겐 확장 설정을 바꾸는
+      명령이 없습니다. (Chrome 이 <code>debugger</code> 를 선택 권한으로 허용하지 않아
+      설치 시 권한 자체는 함께 부여되며, 실제 사용 여부를 이 설정이 통제합니다.)
+    </p>
+    <button id="toggle-debugger">확인 중…</button>
+    <p id="debugger-status"></p>
+  </div>
 
   <script type="module" src="options.js"></script>
 </body>
