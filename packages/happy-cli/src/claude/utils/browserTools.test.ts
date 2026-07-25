@@ -188,6 +188,13 @@ describe('runBrowserTool', () => {
             expect(textOf(result)).toContain('55')
         })
 
+        it('falls back to the requested url when the new tab has not loaded yet', async () => {
+            // chrome.tabs.create resolves with an empty url before load; the
+            // confirmation should still say where the tab is headed.
+            const result = await runBrowserTool({ request: ok({ id: 55, windowId: 2, url: '' }), method: 'tabs_open', params: { url: 'https://c.com' } })
+            expect(textOf(result)).toContain('https://c.com')
+        })
+
         it('confirms tabs_close', async () => {
             const result = await runBrowserTool({ request: ok({ ok: true }), method: 'tabs_close', params: { tabId: 7 } })
             expect(result.isError).toBe(false)

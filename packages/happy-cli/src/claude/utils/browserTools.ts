@@ -97,7 +97,10 @@ function renderSuccess(method: BrowserBridgeMethod, params: any, result: any): s
         case 'navigate':
             return `Navigated to ${params.url}.`
         case 'tabs_open':
-            return `Opened tab ${result.id} at ${result.url}.`
+            // chrome.tabs.create resolves before the tab finishes loading, so
+            // result.url is often empty at this point — fall back to what the
+            // caller asked to open.
+            return `Opened tab ${result.id} at ${result.url || params.url}.`
         case 'tabs_close':
             return `Closed tab ${params.tabId}.`
         default:
