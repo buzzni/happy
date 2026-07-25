@@ -238,6 +238,36 @@ describe('handleCommand', () => {
             const response = await handleCommand({ id: 64, method: 'snapshot' }, chrome)
             expect(response.result.elements.map((e) => e.ref)).toEqual(['@e1'])
         })
+
+        it('refuses a trusted click on a frame-qualified ref instead of clicking the wrong point', async () => {
+            // CDP mouse events use top-level viewport coordinates, but
+            // locateRef measures inside the frame — so a trusted click on an
+            // iframe element would land at the wrong place. Refuse rather than
+            // mis-click; the untrusted path (element.click) is coordinate-free
+            // and works in frames.
+            const chrome = fakeChrome({ tabs: [TAB], debuggerGranted: true })
+            const response = await handleCommand({ id: 65, method: 'click', params: { ref: '@f7:e1', trusted: true } }, chrome)
+            expect(response.error.code).toBe('TRUSTED_FRAME_UNSUPPORTED')
+            expect(response.error.message).toMatch(/without trusted|trusted:\s*false|일반/i)
+            expect(chrome.cdpCalls).toEqual([])
+        })
+
+        it('refuses a trusted fill on a frame-qualified ref for the same reason', async () => {
+            const chrome = fakeChrome({ tabs: [TAB], debuggerGranted: true })
+            const response = await handleCommand({ id: 66, method: 'fill', params: { ref: '@f7:e1', value: 'x', trusted: true } }, chrome)
+            expect(response.error.code).toBe('TRUSTED_FRAME_UNSUPPORTED')
+            expect(chrome.cdpCalls).toEqual([])
+        })
+
+        it('still allows a trusted click on a main-frame ref', async () => {
+            const chrome = fakeChrome({
+                tabs: [TAB],
+                debuggerGranted: true,
+                executeScript: async () => [{ frameId: 0, result: { ok: true, x: 5, y: 6 } }],
+            })
+            const response = await handleCommand({ id: 67, method: 'click', params: { ref: '@e1', trusted: true } }, chrome)
+            expect(response.error).toBeUndefined()
+        })
     })
 
     describe('click and fill', () => {

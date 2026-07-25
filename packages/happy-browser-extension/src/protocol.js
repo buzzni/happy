@@ -82,6 +82,22 @@ function requireParam(params, name) {
 }
 
 /**
+ * Trusted (CDP) input addresses top-level viewport coordinates, but a ref
+ * inside an iframe is measured relative to that frame — the two coordinate
+ * systems don't line up, so a trusted action on a frame element would hit the
+ * wrong spot. Refuse rather than mis-click; untrusted click/fill work in
+ * frames because they act on the element, not a point.
+ */
+function assertTrustedFrameSupported(frameId) {
+    if (frameId !== 0) {
+        throw new CommandError(
+            'TRUSTED_FRAME_UNSUPPORTED',
+            'trusted input is not supported on elements inside an iframe (CDP addresses page coordinates, which do not match frame-local ones). Retry without trusted: true — the normal click/fill works inside frames.',
+        )
+    }
+}
+
+/**
  * Run a ref-targeted action (clickRef/fillRef) in the page.
  *
  * clickRef/fillRef never throw — confirmed against real Chrome that a
@@ -187,6 +203,7 @@ const handlers = {
         // function only understands the frame-local one.
         const { frameId, innerRef } = decodeRef(requireParam(params, 'ref'))
         if (params.trusted) {
+            assertTrustedFrameSupported(frameId)
             const tab = await resolveTab(params, chrome, allowlist)
             const point = await runPageAction(locateRef, [innerRef], params, chrome, allowlist, frameId)
             return dispatchTrustedClick(chrome, tab.id, point)
@@ -201,6 +218,7 @@ const handlers = {
             throw new CommandError('MISSING_PARAM', 'Missing required param: value')
         }
         if (params.trusted) {
+            assertTrustedFrameSupported(frameId)
             const tab = await resolveTab(params, chrome, allowlist)
             // locateRef focuses the element, so the inserted text lands in it.
             await runPageAction(locateRef, [innerRef], params, chrome, allowlist, frameId)

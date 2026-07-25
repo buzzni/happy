@@ -132,6 +132,9 @@ node packages/happy-browser-extension/scripts/dev-bridge.mjs
   요소를 `@e1` 부터 번호 매기므로, 메인 프레임 밖 요소는 `@f7:e1` 처럼 프레임
   id 로 한정된 ref 를 받고 `frameUrl` 이 함께 표시됩니다. click/fill 은 그 ref 가
   가리키는 프레임에서만 실행됩니다.
+  - 단, iframe 안 요소에는 **`trusted` 입력을 쓸 수 없습니다**. CDP 입력은
+    페이지 최상위 좌표를 쓰는데 프레임 내부 좌표와 어긋나기 때문입니다.
+    프레임 안에서는 일반 click/fill 을 쓰세요 (`TRUSTED_FRAME_UNSUPPORTED`).
 
 세션 쪽에서는 `mcp__happy__browser_tabs` / `browser_snapshot` /
 `browser_screenshot` / `browser_click` / `browser_fill` / `browser_navigate` /

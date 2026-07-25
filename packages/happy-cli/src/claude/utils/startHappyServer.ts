@@ -220,7 +220,7 @@ function registerBrowserTools(mcp: McpServer): void {
         inputSchema: {
             ref: z.string().describe('Element ref from browser_snapshot, e.g. "@e3"'),
             tabId: z.number().optional().describe('Tab the ref belongs to (defaults to the active tab)'),
-            trusted: z.boolean().optional().describe('Dispatch a real (isTrusted) mouse event instead of a scripted click. Only needed when a page ignores scripted clicks. Requires the optional debugger permission, which only the user can enable.'),
+            trusted: z.boolean().optional().describe('Dispatch a real (isTrusted) mouse event instead of a scripted click. Only needed when a page ignores scripted clicks. Requires the optional debugger permission, which only the user can enable. Not supported for elements inside an iframe (a @fN:eM ref) — use a normal click there.'),
         },
     }, async (args) => runBrowserTool({ request: bridge, method: 'click', params: { ref: args.ref, tabId: args.tabId, trusted: args.trusted } }));
 
@@ -232,7 +232,7 @@ function registerBrowserTools(mcp: McpServer): void {
             ref: z.string().describe('Element ref from browser_snapshot, e.g. "@e3"'),
             value: z.string().describe('Text to enter. An empty string clears the field.'),
             tabId: z.number().optional().describe('Tab the ref belongs to (defaults to the active tab)'),
-            trusted: z.boolean().optional().describe('Type as real (isTrusted) input instead of setting the value directly. Needed for editors that ignore scripted input. Requires the optional debugger permission, which only the user can enable.'),
+            trusted: z.boolean().optional().describe('Type as real (isTrusted) input instead of setting the value directly. Needed for editors that ignore scripted input. Requires the optional debugger permission, which only the user can enable. Not supported for elements inside an iframe (a @fN:eM ref) — use a normal fill there.'),
         },
     }, async (args) => runBrowserTool({ request: bridge, method: 'fill', params: { ref: args.ref, value: args.value, tabId: args.tabId, trusted: args.trusted } }));
 
