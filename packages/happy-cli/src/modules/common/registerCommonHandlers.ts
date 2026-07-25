@@ -1,9 +1,9 @@
 import { logger } from '@/ui/logger';
 import { exec, ExecOptions } from 'child_process';
 import { promisify } from 'util';
-import { readFile, writeFile, readdir, stat, mkdir } from 'fs/promises';
+import { readFile, writeFile, readdir, stat, mkdir, rename, rm, cp } from 'fs/promises';
 import { createHash } from 'crypto';
-import { dirname, join } from 'path';
+import { dirname, join, basename, extname, resolve } from 'path';
 import { run as runRipgrep } from '@/modules/ripgrep/index';
 import { run as runDifftastic } from '@/modules/difftastic/index';
 import { RpcHandlerManager } from '../../api/rpc/RpcHandlerManager';
@@ -129,6 +129,38 @@ interface DifftasticResponse {
     exitCode?: number;
     stdout?: string;
     stderr?: string;
+    error?: string;
+}
+
+interface RenameFileRequest {
+    path: string;
+    newName: string;
+}
+
+interface RenameFileResponse {
+    success: boolean;
+    path?: string;
+    error?: string;
+}
+
+interface DeleteFileRequest {
+    path: string;
+}
+
+interface DeleteFileResponse {
+    success: boolean;
+    error?: string;
+}
+
+interface CopyFileRequest {
+    path: string;
+    newName?: string;
+}
+
+interface CopyFileResponse {
+    success: boolean;
+    path?: string;
+    name?: string;
     error?: string;
 }
 
@@ -424,6 +456,187 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         } catch (error) {
             logger.debug('Failed to list directory:', error);
             return { success: false, error: error instanceof Error ? error.message : 'Failed to list directory' };
+        }
+    });
+
+    // Rename file or directory handler
+    rpcHandlerManager.registerHandler<RenameFileRequest, RenameFileResponse>('renameFile', async (data) => {
+        logger.debug('Rename file request:', data.path, 'newName:', data.newName);
+
+        // Validate original path is within working directory
+        const validation = validatePath(data.path, workingDirectory);
+        if (!validation.valid) {
+            return { success: false, error: validation.error };
+        }
+
+        // Validate newName
+        const trimmedName = data.newName.trim();
+        if (!trimmedName) {
+            return { success: false, error: 'Invalid name' };
+        }
+        if (trimmedName.includes('/') || trimmedName.includes('\\')) {
+            return { success: false, error: 'Invalid name' };
+        }
+        if (trimmedName === '.' || trimmedName === '..') {
+            return { success: false, error: 'Invalid name' };
+        }
+
+        try {
+            // Construct new path
+            const newPath = join(dirname(validation.resolvedPath!), trimmedName);
+
+            // Validate new path is within working directory
+            const newValidation = validatePath(newPath, workingDirectory);
+            if (!newValidation.valid) {
+                return { success: false, error: newValidation.error };
+            }
+
+            // Check if target with new name already exists
+            try {
+                await stat(newValidation.resolvedPath!);
+                return { success: false, error: 'A file or folder with that name already exists' };
+            } catch (error) {
+                const nodeError = error as NodeJS.ErrnoException;
+                if (nodeError.code !== 'ENOENT') {
+                    throw error;
+                }
+                // File doesn't exist - this is expected
+            }
+
+            // Perform rename
+            await rename(validation.resolvedPath!, newValidation.resolvedPath!);
+            return { success: true, path: newValidation.resolvedPath };
+        } catch (error) {
+            logger.debug('Failed to rename:', error);
+            return { success: false, error: error instanceof Error ? error.message : 'Failed to rename' };
+        }
+    });
+
+    // Delete file or directory handler
+    rpcHandlerManager.registerHandler<DeleteFileRequest, DeleteFileResponse>('deleteFile', async (data) => {
+        logger.debug('Delete file request:', data.path);
+
+        // Validate path is within working directory
+        const validation = validatePath(data.path, workingDirectory);
+        if (!validation.valid) {
+            return { success: false, error: validation.error };
+        }
+
+        try {
+            // Prevent deletion of the project root directory
+            const resolvedWorkingDir = resolve(workingDirectory);
+            if (validation.resolvedPath === resolvedWorkingDir) {
+                return { success: false, error: 'Cannot delete the project root directory' };
+            }
+
+            // Perform deletion
+            await rm(validation.resolvedPath!, { recursive: true, force: false });
+            return { success: true };
+        } catch (error) {
+            logger.debug('Failed to delete:', error);
+            return { success: false, error: error instanceof Error ? error.message : 'Failed to delete' };
+        }
+    });
+
+    // Copy file or directory handler
+    rpcHandlerManager.registerHandler<CopyFileRequest, CopyFileResponse>('copyFile', async (data) => {
+        logger.debug('Copy file request:', data.path, 'newName:', data.newName);
+
+        // Validate source path is within working directory
+        const validation = validatePath(data.path, workingDirectory);
+        if (!validation.valid) {
+            return { success: false, error: validation.error };
+        }
+
+        try {
+            let targetPath: string;
+            let targetName: string;
+
+            if (data.newName) {
+                // Use provided name
+                const trimmedName = data.newName.trim();
+                if (!trimmedName) {
+                    return { success: false, error: 'Invalid name' };
+                }
+                if (trimmedName.includes('/') || trimmedName.includes('\\')) {
+                    return { success: false, error: 'Invalid name' };
+                }
+                if (trimmedName === '.' || trimmedName === '..') {
+                    return { success: false, error: 'Invalid name' };
+                }
+
+                targetName = trimmedName;
+                targetPath = join(dirname(validation.resolvedPath!), trimmedName);
+
+                // Validate new path is within working directory
+                const newValidation = validatePath(targetPath, workingDirectory);
+                if (!newValidation.valid) {
+                    return { success: false, error: newValidation.error };
+                }
+                targetPath = newValidation.resolvedPath!;
+
+                // Check if target already exists
+                try {
+                    await stat(targetPath);
+                    return { success: false, error: 'A file or folder with that name already exists' };
+                } catch (error) {
+                    const nodeError = error as NodeJS.ErrnoException;
+                    if (nodeError.code !== 'ENOENT') {
+                        throw error;
+                    }
+                }
+            } else {
+                // Auto-generate name
+                const sourceBaseName = basename(validation.resolvedPath!);
+                const ext = extname(sourceBaseName);
+                const nameWithoutExt = ext ? sourceBaseName.slice(0, -ext.length) : sourceBaseName;
+                const sourceDir = dirname(validation.resolvedPath!);
+
+                let candidateName = `${nameWithoutExt} copy${ext}`;
+                let counter = 2;
+                let candidatePath = join(sourceDir, candidateName);
+
+                // Find the first non-existing name
+                while (counter <= 100) {
+                    try {
+                        await stat(candidatePath);
+                        // File exists, try next candidate
+                        candidateName = ext
+                            ? `${nameWithoutExt} copy ${counter}${ext}`
+                            : `${nameWithoutExt} copy ${counter}`;
+                        candidatePath = join(sourceDir, candidateName);
+                        counter++;
+                    } catch (error) {
+                        const nodeError = error as NodeJS.ErrnoException;
+                        if (nodeError.code === 'ENOENT') {
+                            // File doesn't exist - use this name
+                            break;
+                        }
+                        throw error;
+                    }
+                }
+
+                if (counter > 100) {
+                    return { success: false, error: 'Failed to find a valid name for the copy' };
+                }
+
+                targetName = candidateName;
+                targetPath = candidatePath;
+
+                // Validate new path is within working directory
+                const newValidation = validatePath(targetPath, workingDirectory);
+                if (!newValidation.valid) {
+                    return { success: false, error: newValidation.error };
+                }
+                targetPath = newValidation.resolvedPath!;
+            }
+
+            // Perform copy
+            await cp(validation.resolvedPath!, targetPath, { recursive: true, errorOnExist: true });
+            return { success: true, path: targetPath, name: targetName };
+        } catch (error) {
+            logger.debug('Failed to copy:', error);
+            return { success: false, error: error instanceof Error ? error.message : 'Failed to copy' };
         }
     });
 
