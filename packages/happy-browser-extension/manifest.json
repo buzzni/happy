@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Happy Browser Bridge",
+  "version": "0.1.0",
+  "description": "Lets a happy CLI session control this logged-in Chrome profile through the local daemon bridge.",
+  "permissions": ["tabs", "storage", "scripting", "debugger"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_title": "Happy Browser Bridge"
+  },
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "options_page": "src/options.html"
+}

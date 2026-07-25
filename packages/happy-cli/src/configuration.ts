@@ -25,6 +25,7 @@ class Configuration {
   public readonly daemonStateFile: string
   public readonly daemonLockFile: string
   public readonly portRegistryFile: string
+  public readonly browserBridgeTokenFile: string
   public readonly sessionsFile: string
   public readonly currentCliVersion: string
 
@@ -51,6 +52,7 @@ class Configuration {
     this.daemonStateFile = join(this.happyHomeDir, 'daemon.state.json')
     this.daemonLockFile = join(this.happyHomeDir, 'daemon.state.json.lock')
     this.portRegistryFile = join(this.happyHomeDir, 'port-registry.json')
+    this.browserBridgeTokenFile = join(this.happyHomeDir, 'browser-bridge.token')
     this.sessionsFile = join(this.happyHomeDir, 'sessions.json')
 
     // URL precedence (both): HAPPY_*_URL env > settings.<key> > default.

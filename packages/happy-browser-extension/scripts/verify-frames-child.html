@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Child frame</title></head>
+<body>
+  <h2>Inside the iframe</h2>
+  <button id="frame-btn">Frame button</button>
+  <input id="frame-result" aria-label="Frame result" readonly value="untouched">
+  <input id="frame-text" aria-label="Frame text" placeholder="type in frame">
+  <script>
+    document.getElementById('frame-btn').addEventListener('click', function () {
+      document.getElementById('frame-result').value = 'frame-clicked'
+    })
+  </script>
+</body>
+</html>

@@ -32,6 +32,9 @@ import { decideResumeCredentials, readStagedTokenFromHomeDir } from './resumeCre
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { preflightDaemonControlServer, startDaemonControlServer } from './controlServer';
+import { BrowserBridge } from './browserBridge';
+import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT } from './browserBridgeServer';
+import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { handoffToReplacedBundle, prepareDaemonStartup } from './handoff';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
@@ -1034,6 +1037,24 @@ export async function startDaemon(): Promise<void> {
     // Per-project port registry (30000-40000), persisted at configuration.portRegistryFile
     const portRegistry = createPortRegistry({ filePath: configuration.portRegistryFile });
 
+    // Chrome extension bridge (specs/chrome-extension-bridge/). Listens on a
+    // fixed loopback port because the extension cannot read daemon.state.json
+    // to discover an ephemeral one. A bind failure (port taken) must not take
+    // the daemon down — browser control is simply unavailable until restart.
+    const browserBridge = new BrowserBridge({
+      authToken: await readOrCreateBrowserBridgeToken(configuration.browserBridgeTokenFile)
+    });
+    let stopBrowserBridge: () => Promise<void> = async () => {};
+    try {
+      const bridgeServer = await startBrowserBridgeServer({
+        bridge: browserBridge,
+        port: DEFAULT_BROWSER_BRIDGE_PORT
+      });
+      stopBrowserBridge = bridgeServer.stop;
+    } catch (err) {
+      logger.debug(`[DAEMON RUN] Browser bridge failed to start on ${DEFAULT_BROWSER_BRIDGE_PORT}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
     // Start control server
     const { port: controlPort, stop: stopControlServer } = await startDaemonControlServer({
       getChildren: getCurrentChildren,
@@ -1042,7 +1063,8 @@ export async function startDaemon(): Promise<void> {
       requestShutdown: () => requestShutdown('happy-cli'),
       onHappySessionWebhook,
       onHappySessionRuntime,
-      portRegistry
+      portRegistry,
+      browserBridge
     });
 
     // Write initial daemon state (no lock needed for state file)
@@ -1240,6 +1262,7 @@ export async function startDaemon(): Promise<void> {
             // leaving nothing running once we also exit.
             apiMachine.shutdown();
             await stopControlServer();
+            await stopBrowserBridge();
             await cleanupDaemonState();
             await releaseDaemonLock(daemonLockHandle);
             await stopCaffeinate();
@@ -1314,6 +1337,7 @@ export async function startDaemon(): Promise<void> {
 
       apiMachine.shutdown();
       await stopControlServer();
+      await stopBrowserBridge();
 
       // Preserve state file with stopped status and final session list
       flushDaemonState();

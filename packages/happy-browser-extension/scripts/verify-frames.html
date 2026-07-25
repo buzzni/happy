@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Frames and shadow DOM verify page</title></head>
+<body>
+  <h1>Frames + shadow DOM verify page</h1>
+
+  <button id="light-btn">Light DOM button</button>
+  <input id="light-result" aria-label="Light result" readonly value="untouched">
+
+  <div id="shadow-host"></div>
+
+  <iframe id="child" src="/frame" style="width: 400px; height: 200px"></iframe>
+
+  <script>
+    document.getElementById('light-btn').addEventListener('click', function () {
+      document.getElementById('light-result').value = 'light-clicked'
+    })
+
+    const root = document.getElementById('shadow-host').attachShadow({ mode: 'open' })
+    root.innerHTML = '<button id="sb">Shadow button</button><input id="sr" aria-label="Shadow result" readonly value="untouched">'
+    root.getElementById('sb').addEventListener('click', function () {
+      root.getElementById('sr').value = 'shadow-clicked'
+    })
+  </script>
+</body>
+</html>

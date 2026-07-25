@@ -1,0 +1,16 @@
+{
+  "name": "happy-browser-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome extension bridging happy CLI sessions to the user's logged-in browser",
+  "scripts": {
+    "test": "vitest run",
+    "package": "node scripts/package.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1",
+    "vitest": "^3.2.4",
+    "ws": "^8.19.0"
+  }
+}
