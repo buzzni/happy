@@ -631,8 +631,11 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                 targetPath = newValidation.resolvedPath!;
             }
 
-            // Perform copy
-            await cp(validation.resolvedPath!, targetPath, { recursive: true, errorOnExist: true });
+            // Perform copy. `errorOnExist` only takes effect when `force` is
+            // false (force defaults to true and would silently overwrite), so
+            // both are needed to close the gap between the stat check above
+            // and the copy itself.
+            await cp(validation.resolvedPath!, targetPath, { recursive: true, force: false, errorOnExist: true });
             return { success: true, path: targetPath, name: targetName };
         } catch (error) {
             logger.debug('Failed to copy:', error);
