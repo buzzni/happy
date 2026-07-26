@@ -23,7 +23,8 @@ export interface ProxyRequest {
 
 export interface ProxyResponse {
   status: number
-  headers: Record<string, string>
+  /** `set-cookie` is carried as a list; every other header is a joined string. */
+  headers: Record<string, string | string[]>
   bodyB64: string
   truncated: boolean
 }
@@ -84,12 +85,19 @@ function stripHopByHop(headers: Record<string, string>): Record<string, string> 
   return out
 }
 
-function flattenResponseHeaders(raw: http.IncomingHttpHeaders): Record<string, string> {
-  const out: Record<string, string> = {}
+function flattenResponseHeaders(raw: http.IncomingHttpHeaders): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {}
   for (const [key, value] of Object.entries(raw)) {
     if (value === undefined) continue
     const lower = key.toLowerCase()
     if (HOP_BY_HOP_HEADERS.has(lower)) continue
+    // `set-cookie` is the one header where joining is lossy: a cookie's
+    // `Expires=Wed, 21 Oct 2015 …` already contains a comma, so a joined
+    // value cannot be split back apart unambiguously. Keep it as a list.
+    if (lower === 'set-cookie') {
+      out[lower] = Array.isArray(value) ? value.map(String) : [String(value)]
+      continue
+    }
     out[lower] = Array.isArray(value) ? value.join(', ') : String(value)
   }
   return out

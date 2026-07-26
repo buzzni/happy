@@ -25,6 +25,11 @@ import { eventRouter } from "@/app/events/eventRouter";
 import { signPreviewToken, verifyPreviewToken } from "@/modules/preview/previewToken";
 import { readPreviewCookie, buildPreviewCookie } from "@/modules/preview/previewCookie";
 import {
+    filterUpstreamCookieHeader,
+    rewriteSetCookieForPreview,
+    splitSetCookieValues,
+} from "@/modules/preview/previewCredentials";
+import {
     rewriteHtml,
     rewriteJsCss,
     rewriteViteClientForPath,
@@ -38,7 +43,9 @@ import { type Fastify } from "../types";
 interface ProxySuccess {
     type: 'success';
     status: number;
-    headers: Record<string, string>;
+    // `set-cookie` arrives as an array from current daemons and as a
+    // comma-joined string from older ones — see splitSetCookieValues.
+    headers: Record<string, string | string[]>;
     bodyB64: string;
     truncated: boolean;
 }
@@ -99,12 +106,25 @@ export async function relayProxyHttpRequest(
     return Promise.any(attempts);
 }
 
-function filterForwardedHeaders(raw: Record<string, string | string[] | undefined>): Record<string, string> {
+/**
+ * Build the header set forwarded to the previewed dev server.
+ *
+ * Only hop-by-hop headers (RFC 7230 §6.1) and `Host` are dropped — the relay
+ * is otherwise transparent. In particular `Authorization` and `Cookie` are
+ * forwarded: they are the previewed app's own credentials, and stripping them
+ * made every authenticated request in the preview fail (the dev server
+ * answered 401/redirect, then served its SPA history fallback, so the app's
+ * `res.json()` got `index.html`).
+ *
+ * The one thing that must not cross: the relay's own `happy_preview_*`
+ * cookies, which carry the signed ptoken. `filterUpstreamCookieHeader` removes
+ * exactly those and leaves the app's cookies alone.
+ */
+export function filterForwardedHeaders(raw: Record<string, string | string[] | undefined>): Record<string, string> {
     const out: Record<string, string> = {};
     for (const [key, value] of Object.entries(raw)) {
         if (value === undefined) continue;
         const lower = key.toLowerCase();
-        // Strip hop-by-hop + things only meaningful to happy-server itself.
         if (
             lower === 'host' ||
             lower === 'connection' ||
@@ -114,10 +134,15 @@ function filterForwardedHeaders(raw: Record<string, string | string[] | undefine
             lower === 'proxy-authorization' ||
             lower === 'te' ||
             lower === 'trailer' ||
-            lower === 'transfer-encoding' ||
-            lower === 'authorization' ||
-            lower === 'cookie'
+            lower === 'transfer-encoding'
         ) continue;
+        if (lower === 'cookie') {
+            const forwarded = filterUpstreamCookieHeader(
+                Array.isArray(value) ? value.join('; ') : value,
+            );
+            if (forwarded) out[key] = forwarded;
+            continue;
+        }
         out[key] = Array.isArray(value) ? value.join(', ') : value;
     }
     return out;
@@ -146,12 +171,23 @@ export function buildPreviewUpstreamPath(subPath: string, rawUrl: string): strin
 }
 
 export function stripResponseHeaders(
-    headers: Record<string, string>,
+    headers: Record<string, string | string[]>,
     prefix?: string,
-): Record<string, string> {
-    const out: Record<string, string> = {};
+): Record<string, string | string[]> {
+    const out: Record<string, string | string[]> = {};
     for (const [key, value] of Object.entries(headers)) {
         const lower = key.toLowerCase();
+        // `set-cookie` is the only header the daemon keeps as a list. Pass it
+        // through untouched; the route rewrites the entries and merges them
+        // with the relay's own cookie once the prefix/secure flags are known.
+        if (lower === 'set-cookie') {
+            out[key] = value;
+            continue;
+        }
+        // Everything else is single-valued by the time it reaches us, but join
+        // defensively so an array-shaped value can't slip past the drop and
+        // rewrite rules below.
+        const single = Array.isArray(value) ? value.join(', ') : value;
         // Drop headers that don't survive rewriting (Content-Length changes)
         // and frame-ancestor directives that would block iframe embedding.
         if (lower === 'content-length' || lower === 'content-encoding') continue;
@@ -166,7 +202,7 @@ export function stripResponseHeaders(
         // See specs/preview-nextjs-turbopack-hydration/ Phase 3.
         if (lower === 'link') {
             if (!prefix) continue; // Backwards compat: drop when no prefix supplied.
-            const rewritten = rewriteLinkHeader(value, prefix);
+            const rewritten = rewriteLinkHeader(single, prefix);
             if (rewritten === null) continue;
             out[key] = rewritten;
             continue;
@@ -177,28 +213,30 @@ export function stripResponseHeaders(
         // Prefix the path so the redirect stays inside the preview mount.
         // See specs/preview-relay-escape-plug/ Phase A.
         if (lower === 'location') {
-            out[key] = rewriteLocationHeader(value, prefix ?? '');
+            out[key] = rewriteLocationHeader(single, prefix ?? '');
             continue;
         }
-        out[key] = value;
+        out[key] = single;
     }
     return out;
 }
 
-function deleteHeaderCaseInsensitive(headers: Record<string, string>, name: string): void {
+function deleteHeaderCaseInsensitive(headers: Record<string, string | string[]>, name: string): void {
     const target = name.toLowerCase();
     for (const key of Object.keys(headers)) {
         if (key.toLowerCase() === target) delete headers[key];
     }
 }
 
-function appendVaryOrigin(headers: Record<string, string>): void {
+function appendVaryOrigin(headers: Record<string, string | string[]>): void {
     const existingKey = Object.keys(headers).find((key) => key.toLowerCase() === 'vary');
     if (!existingKey) {
         headers['Vary'] = 'Origin';
         return;
     }
-    const existing = headers[existingKey];
+    const existing = Array.isArray(headers[existingKey])
+        ? (headers[existingKey] as string[]).join(', ')
+        : (headers[existingKey] as string);
     const parts = existing.split(',').map((part) => part.trim().toLowerCase());
     if (!parts.includes('origin')) {
         headers[existingKey] = `${existing}, Origin`;
@@ -206,11 +244,11 @@ function appendVaryOrigin(headers: Record<string, string>): void {
 }
 
 export function applySubdomainPreviewCorsHeaders(
-    headers: Record<string, string>,
+    headers: Record<string, string | string[]>,
     requestOrigin: string | undefined,
     requestHost: string | undefined,
     requestedHeaders?: string,
-): Record<string, string> {
+): Record<string, string | string[]> {
     if (!requestOrigin) return headers;
     let originHost: string;
     try {
@@ -477,7 +515,8 @@ export function previewRoutes(app: Fastify) {
                 const prefix = previewMode === 'subdomain'
                     ? ''
                     : `/v1/preview/${params.machineId}/${portNum}`;
-                const contentType = (rpcResponse.headers['content-type'] ?? '').toLowerCase();
+                const contentTypeValue = rpcResponse.headers['content-type'] ?? '';
+                const contentType = (Array.isArray(contentTypeValue) ? contentTypeValue[0] : contentTypeValue).toLowerCase();
                 let responseBody: Buffer = Buffer.from(rpcResponse.bodyB64, 'base64');
 
                 if (contentType.includes('text/html')) {
@@ -519,7 +558,7 @@ export function previewRoutes(app: Fastify) {
                 // subresource requests on HTTPS.
                 const maxAgeSeconds = Math.floor(Math.max(0, claims.exp - Date.now()) / 1000);
                 const isHttps = (request.headers['x-forwarded-proto'] === 'https') || (request.protocol === 'https');
-                outHeaders['Set-Cookie'] = buildPreviewCookie(
+                const previewCookie = buildPreviewCookie(
                     params.machineId,
                     portNum,
                     token,
@@ -528,6 +567,25 @@ export function previewRoutes(app: Fastify) {
                         ? { mode: 'subdomain', sameSite: isHttps ? 'None' : 'Lax', secure: isHttps }
                         : {},
                 );
+                // The previewed app's own `Set-Cookie` (a login session, say)
+                // has to survive alongside the relay cookie. A plain
+                // `outHeaders['Set-Cookie'] = …` used to clobber it, because
+                // writeHead lower-cases keys and the upstream value lives
+                // under `set-cookie` — so cookie-based login could never
+                // round-trip. Collect, rewrite for the relay origin, and emit
+                // both as a multi-value header.
+                const upstreamSetCookies: string[] = [];
+                for (const key of Object.keys(outHeaders)) {
+                    if (key.toLowerCase() !== 'set-cookie') continue;
+                    upstreamSetCookies.push(...splitSetCookieValues(outHeaders[key]));
+                    delete outHeaders[key];
+                }
+                outHeaders['Set-Cookie'] = [
+                    ...upstreamSetCookies.map((cookie) =>
+                        rewriteSetCookieForPreview(cookie, { prefix, secure: isHttps }),
+                    ),
+                    previewCookie,
+                ];
 
                 reply.raw.writeHead(rpcResponse.status, outHeaders);
                 reply.raw.end(responseBody);
