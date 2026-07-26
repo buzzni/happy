@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
     applySubdomainPreviewCorsHeaders,
     stripResponseHeaders,
+    filterForwardedHeaders,
 } from '@/app/api/routes/previewRoutes';
 
 const MID = '12345678-1234-1234-1234-123456789abc';
@@ -158,5 +159,101 @@ describe('applySubdomainPreviewCorsHeaders', () => {
         );
 
         expect(out['Access-Control-Allow-Origin']).toBeUndefined();
+    });
+});
+
+describe('filterForwardedHeaders', () => {
+    it('forwards authorization header (regression: was incorrectly dropped, breaking every Bearer-authed API call)', () => {
+        const out = filterForwardedHeaders({ authorization: 'Bearer token123' });
+        expect(out['authorization']).toBe('Bearer token123');
+    });
+
+    it('forwards cookie with happy_preview_* cookies removed', () => {
+        const out = filterForwardedHeaders({
+            cookie: 'sessionId=abc123; happy_preview_m1_3000=token; userId=xyz',
+        });
+        expect(out['cookie']).toBe('sessionId=abc123; userId=xyz');
+    });
+
+    it('omits cookie header entirely when only preview cookies were present', () => {
+        const out = filterForwardedHeaders({
+            cookie: 'happy_preview_m1_3000=token1; happy_preview_m2_4000=token2',
+        });
+        expect(out['cookie']).toBeUndefined();
+    });
+
+    it('drops hop-by-hop headers (connection, keep-alive, proxy-authenticate, etc)', () => {
+        const out = filterForwardedHeaders({
+            connection: 'keep-alive',
+            'keep-alive': 'timeout=5',
+            'proxy-authenticate': 'Basic',
+            'proxy-authorization': 'Basic abc',
+            te: 'trailers',
+            trailer: 'X-Trailer',
+            'transfer-encoding': 'chunked',
+            upgrade: 'websocket',
+        });
+        expect(out['connection']).toBeUndefined();
+        expect(out['keep-alive']).toBeUndefined();
+        expect(out['proxy-authenticate']).toBeUndefined();
+        expect(out['proxy-authorization']).toBeUndefined();
+        expect(out['te']).toBeUndefined();
+        expect(out['trailer']).toBeUndefined();
+        expect(out['transfer-encoding']).toBeUndefined();
+        expect(out['upgrade']).toBeUndefined();
+    });
+
+    it('drops host header', () => {
+        const out = filterForwardedHeaders({ host: 'example.com' });
+        expect(out['host']).toBeUndefined();
+    });
+
+    it('forwards other headers unchanged (content-type, origin, accept, etc)', () => {
+        const out = filterForwardedHeaders({
+            'content-type': 'application/json',
+            origin: 'https://example.com',
+            accept: 'application/json',
+            'x-custom-header': 'value',
+        });
+        expect(out['content-type']).toBe('application/json');
+        expect(out['origin']).toBe('https://example.com');
+        expect(out['accept']).toBe('application/json');
+        expect(out['x-custom-header']).toBe('value');
+    });
+
+    it('joins array-valued headers with comma separator', () => {
+        const out = filterForwardedHeaders({
+            'accept-encoding': ['gzip', 'deflate', 'br'],
+            'content-type': 'application/json',
+        });
+        expect(out['accept-encoding']).toBe('gzip, deflate, br');
+        expect(out['content-type']).toBe('application/json');
+    });
+
+    it('filters out undefined header values', () => {
+        const out = filterForwardedHeaders({
+            'content-type': 'application/json',
+            'x-undefined': undefined,
+        });
+        expect(out['content-type']).toBe('application/json');
+        expect(out['x-undefined']).toBeUndefined();
+    });
+
+    it('handles cookie as array by joining and filtering', () => {
+        const out = filterForwardedHeaders({
+            cookie: ['sessionId=abc', 'happy_preview_m1_3000=token', 'userId=xyz'],
+        });
+        expect(out['cookie']).toBe('sessionId=abc; userId=xyz');
+    });
+});
+
+describe('stripResponseHeaders with multi-value headers', () => {
+    it('passes array-valued set-cookie through untouched', () => {
+        const setCookies = ['sessionId=abc; Path=/', 'trackingId=xyz; Path=/'];
+        const out = stripResponseHeaders({
+            'set-cookie': setCookies,
+            'content-type': 'text/html',
+        });
+        expect(out['set-cookie']).toEqual(setCookies);
     });
 });

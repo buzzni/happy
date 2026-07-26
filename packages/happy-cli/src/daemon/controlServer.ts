@@ -492,7 +492,7 @@ export function startDaemonControlServer({
         response: {
           200: z.object({
             status: z.number(),
-            headers: z.record(z.string(), z.string()),
+            headers: z.record(z.string(), z.union([z.string(), z.array(z.string())])),
             bodyB64: z.string(),
             truncated: z.boolean()
           }),
