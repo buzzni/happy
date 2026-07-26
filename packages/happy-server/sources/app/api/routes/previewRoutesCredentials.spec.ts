@@ -444,6 +444,124 @@ describe('preview relay route credentials integration', () => {
         await app.close();
     });
 
+    // 프로덕션 ingress 는 TLS 를 더 앞단(CDN/ALB)에서 종료하고 뒤로는 평문으로
+    // 넘기며 `x-forwarded-proto: http` 를 붙인다(실측). 그 헤더를 그대로 믿으면
+    // preview 쿠키가 SameSite=Lax 로 발급되는데, 프리뷰는 **항상** 데스크탑
+    // 안의 cross-site iframe 이라 Chromium 이 Lax 쿠키를 보내지 않는다. 그러면
+    // 최초 `?ptoken=` 로드 이후 모든 요청이 401 이 되고, Accept: text/html 인
+    // 요청에는 relay 가 "프리뷰 토큰 재발급" HTML 을 돌려줘서 앱이 그 HTML
+    // 원문을 화면에 덤프한다 — 프리뷰가 안 뜨던 실제 증상.
+    //
+    // subdomain origin(`<uuid>-<port>.preview.<zone>`)은 프로덕션 wildcard TLS
+    // 뒤에서만 존재하므로 브라우저 쪽 연결은 언제나 HTTPS 다.
+    it('subdomain 모드는 x-forwarded-proto 가 http 여도 SameSite=None; Secure 로 굽는다', async () => {
+        const app = await buildApp();
+        const capturedPayload = { current: null as any };
+
+        const connections = new Set([
+            { connectionType: 'machine-scoped', machineId: MID, socket: createFakeMachineSocket(capturedPayload) as any },
+        ]);
+        vi.mocked(eventRouter.getConnections).mockReturnValue(connections as any);
+
+        const signed = signPreviewToken({ userId: USER_ID, machineId: MID, port: PORT });
+
+        const res = await app.inject({
+            method: 'GET',
+            url: `/v1/preview/${MID}/${PORT}/?ptoken=${signed.token}`,
+            headers: {
+                host: `${MID}-${PORT}.preview.saycode.ai`,
+                'x-forwarded-proto': 'http',
+            },
+        });
+
+        expect(res.statusCode).toBe(200);
+        const setCookie = res.headers['set-cookie'];
+        const cookies = Array.isArray(setCookie) ? setCookie : [setCookie as string];
+        const relayCookie = cookies.find((c) => c?.includes(`${cookieName(MID, PORT)}=`));
+        expect(relayCookie).toBeDefined();
+        expect(relayCookie).toContain('SameSite=None');
+        expect(relayCookie).toContain('Secure');
+        expect(relayCookie).not.toContain('SameSite=Lax');
+        await app.close();
+    });
+
+    it('subdomain 모드에서는 앱 쿠키도 x-forwarded-proto 와 무관하게 SameSite=None; Secure', async () => {
+        const app = await buildApp();
+        const capturedPayload = { current: null as any };
+
+        const fakeMachineSocket = {
+            id: 'socket-123',
+            connected: true,
+            timeout: vi.fn().mockReturnValue({
+                emitWithAck: vi.fn().mockImplementation(async (event, payload) => {
+                    capturedPayload.current = payload;
+                    return {
+                        type: 'success',
+                        status: 200,
+                        headers: {
+                            'content-type': 'text/html',
+                            'set-cookie': ['sid=abc; Path=/; HttpOnly'],
+                        },
+                        bodyB64: Buffer.from('<html>OK</html>', 'utf-8').toString('base64'),
+                        truncated: false,
+                    };
+                }),
+            }),
+        };
+
+        const connections = new Set([
+            { connectionType: 'machine-scoped', machineId: MID, socket: fakeMachineSocket as any },
+        ]);
+        vi.mocked(eventRouter.getConnections).mockReturnValue(connections as any);
+
+        const signed = signPreviewToken({ userId: USER_ID, machineId: MID, port: PORT });
+
+        const res = await app.inject({
+            method: 'GET',
+            url: `/v1/preview/${MID}/${PORT}/api/login?ptoken=${signed.token}`,
+            headers: {
+                host: `${MID}-${PORT}.preview.saycode.ai`,
+                'x-forwarded-proto': 'http',
+            },
+        });
+
+        expect(res.statusCode).toBe(200);
+        const setCookie = res.headers['set-cookie'];
+        const cookies = Array.isArray(setCookie) ? setCookie : [setCookie as string];
+        const appCookie = cookies.find((c) => c?.includes('sid=abc'));
+        expect(appCookie).toBeDefined();
+        expect(appCookie).toContain('SameSite=None');
+        expect(appCookie).toContain('Secure');
+    });
+
+    // path-prefix 모드는 로컬 standalone(http://127.0.0.1:3005/v1/preview/...)
+    // 에서도 쓰인다. 거기까지 Secure 를 강제하면 브라우저가 쿠키를 버리므로
+    // 기존 x-forwarded-proto 판정을 유지해야 한다.
+    it('path-prefix 모드는 평문 http 판정을 유지한다 (로컬 standalone 회귀 방지)', async () => {
+        const app = await buildApp();
+        const capturedPayload = { current: null as any };
+
+        const connections = new Set([
+            { connectionType: 'machine-scoped', machineId: MID, socket: createFakeMachineSocket(capturedPayload) as any },
+        ]);
+        vi.mocked(eventRouter.getConnections).mockReturnValue(connections as any);
+
+        const signed = signPreviewToken({ userId: USER_ID, machineId: MID, port: PORT });
+
+        const res = await app.inject({
+            method: 'GET',
+            url: `/v1/preview/${MID}/${PORT}/?ptoken=${signed.token}`,
+            headers: { host: '127.0.0.1:3005', 'x-forwarded-proto': 'http' },
+        });
+
+        expect(res.statusCode).toBe(200);
+        const setCookie = res.headers['set-cookie'];
+        const cookies = Array.isArray(setCookie) ? setCookie : [setCookie as string];
+        const relayCookie = cookies.find((c) => c?.includes(`${cookieName(MID, PORT)}=`));
+        expect(relayCookie).toBeDefined();
+        expect(relayCookie).not.toContain('Secure');
+    });
+
     it('adds Secure and SameSite=None to upstream cookies when x-forwarded-proto is https', async () => {
         const app = await buildApp();
         const capturedPayload = { current: null as any };
