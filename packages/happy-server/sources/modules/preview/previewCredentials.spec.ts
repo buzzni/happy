@@ -75,6 +75,16 @@ describe('splitSetCookieValues', () => {
         expect(splitSetCookieValues(undefined)).toEqual([]);
     });
 
+    it('never re-splits array elements, even when a value contains ",name="', () => {
+        // The array form is unambiguous (one element per upstream Set-Cookie).
+        // A non-RFC value like `theme=dark,lang=ko` must survive verbatim —
+        // only the legacy comma-joined *string* form goes through the
+        // heuristic splitter.
+        expect(splitSetCookieValues(['prefs=theme=dark,lang=ko; Path=/'])).toEqual([
+            'prefs=theme=dark,lang=ko; Path=/',
+        ]);
+    });
+
     it('passes through array input, trimmed, empties removed', () => {
         const input = ['  cookie1=value1', 'cookie2=value2  ', '', '  '];
         const result = splitSetCookieValues(input);

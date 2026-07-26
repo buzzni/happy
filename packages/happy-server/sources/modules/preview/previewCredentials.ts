@@ -60,17 +60,21 @@ const SET_COOKIE_SEPARATOR = /,\s*(?=[A-Za-z0-9!#$%&'*+\-.^_`|~]+=)/;
 /**
  * Normalize the daemon's `set-cookie` value into one entry per cookie.
  *
- * Current daemons send an array (one element per upstream `Set-Cookie`).
+ * Current daemons send an array (one element per upstream `Set-Cookie`) —
+ * that form is already unambiguous, so each element passes through verbatim.
  * Older daemons flattened the array with `', '`, which is ambiguous with the
- * comma inside an `Expires` date — hence the token-aware split for that case.
- * Both shapes must keep working: the daemon runs on the user's machine and
- * updates independently of the server.
+ * comma inside an `Expires` date — only that legacy string form goes through
+ * the token-aware split. Never re-split array elements: a cookie value that
+ * happens to contain `,name=` (non-RFC but seen in the wild) would be torn
+ * into two broken cookies. Both shapes must keep working: the daemon runs on
+ * the user's machine and updates independently of the server.
  */
 export function splitSetCookieValues(value: string | string[] | undefined): string[] {
     if (value === undefined) return [];
-    const raw = Array.isArray(value) ? value : [value];
+    const raw = Array.isArray(value)
+        ? value.map(String)
+        : String(value).split(SET_COOKIE_SEPARATOR);
     return raw
-        .flatMap((entry) => String(entry).split(SET_COOKIE_SEPARATOR))
         .map((entry) => entry.trim())
         .filter((entry) => entry.length > 0);
 }
