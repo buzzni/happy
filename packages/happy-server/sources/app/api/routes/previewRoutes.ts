@@ -557,7 +557,23 @@ export function previewRoutes(app: Fastify) {
                 // SameSite=None + Secure required for cross-origin iframe
                 // subresource requests on HTTPS.
                 const maxAgeSeconds = Math.floor(Math.max(0, claims.exp - Date.now()) / 1000);
-                const isHttps = (request.headers['x-forwarded-proto'] === 'https') || (request.protocol === 'https');
+                // 프로덕션 ingress 는 TLS 를 더 앞단(CDN/ALB)에서 종료하고 뒤로는
+                // 평문으로 넘기며 `x-forwarded-proto: http` 를 붙인다(실측). 그
+                // 헤더만 믿으면 preview 쿠키가 `SameSite=Lax` 로 발급되는데,
+                // 프리뷰는 **항상** 데스크탑/스튜디오 안의 cross-site iframe 이라
+                // Chromium 이 Lax 쿠키를 보내지 않는다. 그러면 최초 `?ptoken=`
+                // 로드 이후의 모든 요청이 401 이 되고, Accept: text/html 인 요청에는
+                // relay 가 "프리뷰 토큰 재발급" HTML 을 돌려줘 앱이 그 HTML 원문을
+                // 화면에 덤프한다 — 프리뷰가 아예 안 뜨던 실제 증상.
+                //
+                // subdomain origin(`<uuid>-<port>.preview.<zone>`)은 프로덕션
+                // wildcard DNS/TLS 뒤에서만 존재하므로 브라우저 쪽 연결은 언제나
+                // HTTPS 다. 반대로 path-prefix 모드는 로컬 standalone
+                // (`http://127.0.0.1:3005/v1/preview/...`)에서도 쓰이므로 거기서
+                // Secure 를 강제하면 브라우저가 쿠키를 버린다 — 기존 판정 유지.
+                const isHttps = previewMode === 'subdomain'
+                    || (request.headers['x-forwarded-proto'] === 'https')
+                    || (request.protocol === 'https');
                 const previewCookie = buildPreviewCookie(
                     params.machineId,
                     portNum,
