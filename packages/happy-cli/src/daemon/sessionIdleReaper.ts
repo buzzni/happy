@@ -453,6 +453,11 @@ export async function runDaemonSessionIdleReaperTick(
  * the later of session start and daemon start, giving recovered sessions a
  * full report window after a daemon restart. Stops are if-idle, so the guard
  * re-validates each one.
+ *
+ * Deliberately has no per-sweep batch cap, unlike the idle and empty reapers:
+ * every session it stops has already been silent for the hard cap, so it is
+ * reclaiming dead runtimes rather than live conversations. There is no live
+ * session to surprise by stopping many at once.
  */
 export function sweepZombieSessions(input: {
   trackedSessions: readonly TrackedSession[];
@@ -518,11 +523,16 @@ export function sweepEmptySessions(input: {
   stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
   now?: number;
   emptyReaperMs?: number;
+  /** Max sessions to stop per sweep; the rest are picked up on the next tick.
+   *  Shares the idle reaper's cap so a tick cannot exceed it on either path. */
+  batchMax?: number;
   logDebug?: (message: string) => void;
 }): number {
   const now = input.now ?? Date.now();
   const emptyReaperMs = input.emptyReaperMs ?? DEFAULT_SESSION_EMPTY_REAPER_MS;
+  const batchMax = input.batchMax ?? DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX;
   let stopped = 0;
+  let deferred = 0;
 
   for (const session of input.trackedSessions) {
     if (!session.happySessionId) continue;
@@ -538,6 +548,16 @@ export function sweepEmptySessions(input: {
     const startedAt = input.sessionStartTimes.get(session.pid);
     if (startedAt === undefined || now - startedAt < emptyReaperMs) continue;
 
+    // Cap actual stops per sweep, for the same reason the idle reaper does:
+    // this sweep runs on every tick (and before the idle reaper), so a backlog
+    // of never-used sessions — exactly what the local-session guard used to
+    // protect — would otherwise be SIGTERM'd all at once on the first tick
+    // after that guard is fixed.
+    if (stopped >= batchMax) {
+      deferred += 1;
+      continue;
+    }
+
     const stopResult = input.stopSession(session.happySessionId, {
       source: 'session-empty-reaper',
       reason: 'never-used',
@@ -549,6 +569,10 @@ export function sweepEmptySessions(input: {
         `[session-empty-reaper] stopped ${session.happySessionId} (never used, alive ${Math.round((now - startedAt) / 60_000)}m)`,
       );
     }
+  }
+
+  if (deferred > 0) {
+    input.logDebug?.(`[session-empty-reaper] deferred=${deferred} (batchMax=${batchMax})`);
   }
 
   return stopped;

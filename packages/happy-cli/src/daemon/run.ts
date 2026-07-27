@@ -1223,6 +1223,7 @@ export async function startDaemon(): Promise<void> {
           sessionStartTimes,
           stopSession,
           emptyReaperMs: emptySessionReaperMs,
+          batchMax: idleReaperConfig.batchMax,
           logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
         });
       }

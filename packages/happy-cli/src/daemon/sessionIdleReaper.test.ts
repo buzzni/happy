@@ -597,6 +597,27 @@ describe('sweepEmptySessions', () => {
     expect(stopSession).toHaveBeenCalledWith('empty', { source: 'session-empty-reaper', reason: 'never-used', mode: 'if-idle' });
   });
 
+  it('caps how many never-used sessions it stops per sweep', () => {
+    // The empty reaper runs on the same tick as (and before) the idle reaper,
+    // and daemon-spawned sessions that were never used are exactly what the
+    // local-session guard used to protect. Without its own cap, the first tick
+    // after that guard is fixed SIGTERMs the whole backlog at once, bypassing
+    // the idle reaper's batch cap entirely.
+    const stopSession = vi.fn(() => ({ stopped: true as const }));
+    const ids = ['e1', 'e2', 'e3', 'e4', 'e5'];
+    const stopped = sweepEmptySessions({
+      trackedSessions: ids.map((id, i) => tracked({ pid: 100 + i, happySessionId: id, runtime: idleRuntime(now - 1_000) })),
+      sessionStartTimes: new Map(ids.map((_, i) => [100 + i, now - emptyReaperMs - 1])),
+      stopSession,
+      now,
+      emptyReaperMs,
+      batchMax: 2,
+    });
+
+    expect(stopped).toBe(2);
+    expect(stopSession).toHaveBeenCalledTimes(2);
+  });
+
   it('leaves a session younger than the threshold alone', () => {
     const stopSession = vi.fn(() => ({ stopped: true as const }));
     const stopped = sweepEmptySessions({
