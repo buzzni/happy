@@ -115,6 +115,35 @@ preview-relay-origin-normalization`로 만든 격리된 worktree에서 했다. *
 - **호출부 확인.** `proxyHttp`는 `controlServer.ts:538`, `apiMachine.ts:820` 두 곳에서
   호출되며 둘 다 `req.port`를 그대로 넘기므로 loopback origin 계산이 항상 일관된다.
 
+### 2차 리뷰에서 추가로 찾은 것
+
+- **배포 스큐 — 두 수정의 릴리스 경로가 다르다 (운영상 가장 중요).**
+  HTTP 경로 수정은 `packages/happy-cli`(사용자 머신의 daemon), WS 경로 수정은
+  `packages/happy-server`(서버 배포)에 있다. 프로토콜 호환성은 서로 독립이라 깨지지
+  않지만(spec.md 제약 참고), **사용자에게 보이는 효과는 각각 따로 도착한다**:
+  | 조합 | 결과 |
+  |---|---|
+  | 신 server + 구 daemon | WS(HMR)만 고쳐짐. **Expo 번들 500/흰 화면은 그대로** |
+  | 구 server + 신 daemon | HTTP(흰 화면) 고쳐짐, WS는 그대로 |
+  | 둘 다 신규 | 완전 해결 |
+  즉 **이 PR 머지만으로는 흰 화면이 안 고쳐진다** — 흰 화면을 고치는 건 daemon 쪽이고,
+  그건 `AGENTS.md`의 "Happy CLI Release Publisher" 절차(버전 bump → 태그 → CI publish,
+  사용자 명시 승인 필요)를 거쳐 각 머신의 daemon 이 갱신돼야 반영된다. 따라서
+  `aplus-dev-studio-app` 의 `app.config.js` 워크어라운드는 **happy-cli 릴리스가 실제로
+  배포되고 대상 머신의 daemon 이 갱신될 때까지** 반드시 유지해야 한다.
+- **live WS 테스트의 "faithful mirror" 가 실제로 드리프트해 있었다(수정함).**
+  `previewWsRelay.live.test.ts` 는 cross-package import 가 안 돼서
+  `serializeUpgradeRequest` 의 헤더 직렬화를 인라인으로 복제하는데, 이번 변경 이후
+  그 복제본은 `Host` 만 재작성하고 `Origin` 은 안 하고 있었다. 테스트의 목적 자체는
+  전송 계층(socket.io `destroyUpgrade:false` + 바이트 파이핑)이라 기능적 결함은
+  아니지만, "faithful mirror" 라는 주석 때문에 **Origin 재작성이 end-to-end 로 검증된다는
+  착시**를 준다. 복제본도 Origin 을 재작성하도록 맞추고, 실제 구현과 동기화를 유지해야
+  한다는 경고를 주석에 명시했다.
+- **`filterForwardedHeaders` 의 문서가 부정확해졌다(수정함).** "the relay is otherwise
+  transparent" 라고 적혀 있었는데 `Origin` 은 더 이상 투명하지 않다(daemon 에서 재작성).
+  그 함수만 읽는 사람이 알 수 없으므로, 어디서 재작성되는지와 이 계층에서 원본을
+  남겨두는 이유(응답 CORS 가 브라우저의 실제 origin 을 필요로 함)를 doc 에 추가했다.
+
 ### 검토했으나 손대지 않은 것
 
 - **`Referer` 헤더는 재작성하지 않았다.** 여전히 프리뷰 도메인을 가리킨다. Expo/Vite/

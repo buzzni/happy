@@ -119,6 +119,12 @@ export async function relayProxyHttpRequest(
  * The one thing that must not cross: the relay's own `happy_preview_*`
  * cookies, which carry the signed ptoken. `filterUpstreamCookieHeader` removes
  * exactly those and leaves the app's cookies alone.
+ *
+ * `Origin` is passed through here but is NOT transparent end-to-end: the daemon
+ * rewrites it to the loopback target before hitting the dev server
+ * (previewProxy.ts `buildUpstreamHeaders`, specs/preview-relay-origin-normalization).
+ * It is left intact at this layer because the response path still needs the
+ * browser's real origin — see `applySubdomainPreviewCorsHeaders`.
  */
 export function filterForwardedHeaders(raw: Record<string, string | string[] | undefined>): Record<string, string> {
     const out: Record<string, string> = {};
