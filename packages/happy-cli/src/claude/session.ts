@@ -27,7 +27,9 @@ export class Session {
     readonly jsRuntime: JsRuntime;
 
     sessionId: string | null;
-    mode: 'local' | 'remote' = 'local';
+    /** Always assigned from opts.startingMode in the constructor — the single
+     *  place the default lives — before the first keepalive is sent. */
+    mode: 'local' | 'remote';
     thinking: boolean = false;
     
     /** Callbacks to be notified when session ID is found/changed */
