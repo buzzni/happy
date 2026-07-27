@@ -966,6 +966,7 @@ export async function startDaemon(): Promise<void> {
               runtime: session.runtime,
               sessionStartedAt: sessionStartTimes.get(pid),
               daemonStartedAt,
+              startedBy: session.startedBy,
               now: Date.now(),
               config: idleStopGuardConfig,
             });

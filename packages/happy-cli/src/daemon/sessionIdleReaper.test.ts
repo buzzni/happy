@@ -689,6 +689,22 @@ describe('evaluateIdleStopGuard', () => {
     expect(decision).toMatchObject({ allow: false, guard: 'local-session' });
   });
 
+  it('does not apply local protection to a daemon-spawned session reporting mode=local', () => {
+    // Daemon-spawned sessions are always started with --happy-starting-mode
+    // remote (runClaude.ts refuses daemon+local at spawn time), so a
+    // daemon-spawned session can never have a real attached terminal. A
+    // 'local' report from one is a client-side reporting bug, not a real
+    // terminal — the local-session guard must not treat it as one.
+    const decision = evaluateIdleStopGuard({
+      runtime: runtime({ mode: 'local' }),
+      sessionStartedAt: withinCap,
+      startedBy: 'daemon',
+      now,
+      config,
+    });
+    expect(decision).toEqual({ allow: true });
+  });
+
   it('denies when the runtime report is missing or stale within the hard cap', () => {
     expect(evaluateIdleStopGuard({
       runtime: undefined,

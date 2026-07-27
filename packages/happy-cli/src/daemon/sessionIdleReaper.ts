@@ -209,10 +209,16 @@ export function evaluateIdleStopGuard(input: {
   /** When this daemon process started — lower bound for how long a session
    *  that never reported could have been silent toward this daemon. */
   daemonStartedAt?: number;
+  /** Who spawned this session. Daemon-spawned sessions are always launched
+   *  with --happy-starting-mode remote (runClaude.ts refuses daemon+local at
+   *  spawn time), so they can never have a real attached terminal — a
+   *  'local' runtime report from one reflects a client-side reporting bug,
+   *  not a terminal, and must not trigger the local-session guard. */
+  startedBy?: TrackedSession['startedBy'];
   now: number;
   config: IdleStopGuardConfig;
 }): IdleStopGuardDecision {
-  const { runtime, sessionStartedAt, daemonStartedAt, now, config } = input;
+  const { runtime, sessionStartedAt, daemonStartedAt, startedBy, now, config } = input;
 
   const activity: IdleStopGuardActivity = {
     thinking: runtime?.thinking === true,
@@ -250,7 +256,7 @@ export function evaluateIdleStopGuard(input: {
   if (sessionAgeMs !== undefined && sessionAgeMs < config.minSessionAgeMs) {
     return deny('min-session-age');
   }
-  if (config.protectLocalSessions && activity.mode === 'local') {
+  if (config.protectLocalSessions && activity.mode === 'local' && startedBy !== 'daemon') {
     return deny('local-session');
   }
   // Unknown or stale runtime within the hard cap is treated as not-idle: absence
