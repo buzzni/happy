@@ -1,7 +1,7 @@
 # Preview relay Origin 정규화 Context
 
-> 마지막 갱신: 2026-07-28 / 상태: **구현 완료(T1~T5, T7). T6(실기기 daemon 교체 검증)만
-> 의도적으로 스킵 — 아래 참고. PR/릴리스는 아직.**
+> 마지막 갱신: 2026-07-28 / 상태: **구현 + 셀프 리뷰 2회 완료. PR #109 open.**
+> T6(실기기 daemon 교체 검증)은 의도적으로 스킵, happy-cli 릴리스는 미승인 — 아래 참고.
 > 목적: 다음 세션의 Claude가 이 파일 하나만 읽고 즉시 이어서 작업할 수 있게 한다.
 
 ## 현재 상태 (3~5문장)
@@ -14,17 +14,18 @@ relay는 dev 서버로 요청을 전달할 때 `Host`는 이미 항상 `127.0.0.
 거부한다. `specs/preview-relay-credential-passthrough/context.md`의 "남은 이슈"에 이미
 발견돼 있던 갭이었다. HTTP 경로(`previewProxy.ts`, T1~T2)와 WS 업그레이드 경로
 (`previewWebSocketRelay.ts`, T3~T4)에 각각 대칭적인 Origin 재작성을 TDD로 구현했고,
-happy-cli(typecheck+test 145/147 파일, 실패 2개는 무관한 기존 flake)와 happy-server
-(typecheck+test 39/39 파일 478/478 전부 통과)로 회귀를 확인했다(T5). 브랜치
-`preview-relay-origin-normalization`에 커밋 2개(14ab6b6d, 7ff62423). PR 생성 및
-happy-cli 릴리스는 아직 하지 않음 — 둘 다 사용자 승인 필요.
+happy-server(typecheck + 39파일/479개 전부 통과)와 happy-cli(typecheck 통과, 유닛
+스위트는 부하 의존 flake를 제외하면 통과 — 아래 "발견된 문제" 참고)로 회귀를 확인했다.
+이후 셀프 코드 리뷰를 2회 돌려 발견한 6건을 반영했다(아래 "셀프 코드 리뷰 결과").
+PR #109(https://github.com/buzzni/happy/pull/109) open 상태. happy-cli 릴리스는
+아직 승인받지 않았다.
 
 ## 다음 세션 시작점
 
-구현은 끝났다. 다음 단계는 (a) 이 브랜치를 push하고 PR을 만들지, (b) T6(실기기 검증)를
-언제·어떻게 안전하게 할지, (c) happy-cli 릴리스(버전 bump+태그+`npm publish`, `AGENTS.md`
-정책상 별도 승인 필요)까지 진행할지를 사용자와 정하는 것. 셋 다 이 세션에서는 승인받지
-않았다.
+구현·리뷰는 끝났다. 남은 결정은 (a) PR #109 리뷰 반영/머지, (b) T6(실기기 검증)를
+언제·어떻게 안전하게 할지, (c) happy-cli 릴리스(버전 bump+태그+`npm publish`,
+`AGENTS.md` 정책상 별도 승인 필요)까지 진행할지. **(c)가 끝나야 실제로 흰 화면이
+고쳐진다** — 아래 "배포 스큐" 항목이 이유.
 
 ## 작업 환경 — 격리된 worktree 사용 (중요)
 
@@ -62,24 +63,6 @@ preview-relay-origin-normalization`로 만든 격리된 worktree에서 했다. *
   단위 테스트(T1~T4)가 정확히 실제 버그의 재현 조건(`aplus-dev-studio-app`에서 실측한
   `curl -H "Origin: <preview-url>" <bundle-url>` 200/500 분기)을 assert하도록 작성해
   간접 검증으로 대체했다.
-
-## 결정 로그
-
-- **재작성 지점을 `previewRoutes.ts`(happy-server, 브라우저↔relay 경계)가 아니라
-  `previewProxy.ts`/`previewWebSocketRelay.ts`(relay↔dev서버 경계, 즉 이미 `Host`를
-  재작성하는 바로 그 지점)로 잡았다.** 이유: `previewRoutes.ts`는
-  `request.headers.origin`을 응답 CORS 헤더(`applySubdomainPreviewCorsHeaders`)에도
-  쓰고 있어서, 거기서 재작성하면 "브라우저가 보낸 원본 Origin"과 "upstream에 보낼
-  재작성된 Origin" 두 값을 구분해서 daemon에 넘겨야 해 프로토콜(payload 스키마)이
-  늘어난다. `previewProxy.ts`는 `port`만 있으면 `Origin`을 계산할 수 있는 지점이라
-  기존 시그니처를 안 건드리고 끝난다. → 재검토 조건: 만약 나중에 relay가 `kind`
-  (frontend/backend)별로 다르게 처리해야 하는 요구가 생기면, 그때는 daemon↔server
-  프로토콜에 `kind`를 얹는 별도 spec이 필요하고 이 결정도 같이 재검토.
-- **재작성을 `kind` 무관하게 전부 적용하기로 했다(비목표에 명시).** `Host`가 이미
-  오늘도 무조건 재작성되고 있어서, `Origin`만 예외적으로 유지하는 게 오히려 더
-  일관성이 없다고 판단. 이론적으로 어떤 프로젝트의 백엔드가 이 relay 뒤에서 Origin
-  기반 CSRF 방어를 하고 있었다면 이 변경으로 그 방어의 "실제 브라우저 Origin을
-  본다"는 전제가 깨질 수 있음 — 발견되면 재검토(spec.md 비목표 참고).
 
 ## 셀프 코드 리뷰 결과 (사이드 이펙트 분석)
 
@@ -169,12 +152,19 @@ preview-relay-origin-normalization`로 만든 격리된 worktree에서 했다. *
 - `aplus-dev-studio-app`의 `app.config.js`+`.env`(`EXPO_PREVIEW_ORIGIN`) 워크어라운드는
   이 spec이 릴리스되어 실제로 그 프로젝트에 반영되기 전까지 계속 필요 — 되돌리는 건
   별도 승인 필요한 다른 저장소 작업이라 이번 스코프에 포함 안 함.
-- **happy-cli 유닛 스위트에 타임아웃 마진이 부족한 테스트가 있다.**
-  `scripts/__tests__/cli-version.test.ts`의 "initializes and closes the packaged
-  control-server runtime"은 격리 실행에서도 4797ms/5000ms로 여유가 200ms뿐이라,
-  전체 스위트를 동시 실행하면 CPU 경합으로 간헐 실패한다. `runAcp.test.ts`의 몇몇
-  케이스도 같은 성질. 이 spec과 무관하지만 CI 신뢰도를 갉아먹으므로 별도로
-  `testTimeout` 상향 또는 해당 테스트의 격리 실행 분리를 검토할 가치가 있다.
+- **happy-cli 유닛 스위트가 부하에 따라 간헐 실패한다 — main 에서도 재현되는 기존 문제.**
+  **검증 방법**: `origin/main`(이 spec 의 변경이 전혀 없는 상태)을 별도 worktree 로
+  체크아웃해 full suite 를 돌린 결과 **3개 파일 실패**
+  (`broadKillShims.test.ts`, `difftastic/index.test.ts`, `ripgrep/index.test.ts`).
+  같은 시점 이 브랜치는 1개 실패였다 — 즉 이 spec 이 flake 를 늘리지 않았고,
+  오히려 main 이 이미 더 불안정하다.
+  실행마다 실패 파일이 바뀌고(`runAcp` → `cli-version` → `sessionScanner` →
+  main 에선 또 다른 3개), 각각 격리 실행하면 전부 통과한다. 원인은 타임아웃 마진
+  부족으로 보인다 — `cli-version.test.ts` 의 "initializes and closes the packaged
+  control-server runtime" 은 **격리 실행에서도 4797ms / 5000ms** 로 여유가 200ms뿐이라
+  전체 스위트 동시 실행의 CPU 경합에서 바로 넘어간다.
+  이 spec 과 무관하지만 CI 신뢰도를 갉아먹으므로 별도 안건으로 `testTimeout` 상향
+  또는 무거운 테스트의 격리 실행 분리를 검토할 가치가 있다.
 
 ## 바뀐 파일
 
@@ -185,16 +175,14 @@ preview-relay-origin-normalization`로 만든 격리된 worktree에서 했다. *
 | `packages/happy-server/sources/modules/preview/previewWebSocketRelay.ts` | `serializeUpgradeRequest`가 `Host`와 대칭으로 `Origin` 재작성 |
 | `packages/happy-server/sources/modules/preview/previewWebSocketRelay.spec.ts` | Origin 재작성 케이스 2개(있음/없음) |
 | `packages/happy-server/sources/app/api/routes/previewRoutesStripHeaders.spec.ts` | upstream loopback ACAO를 실제 프리뷰 origin으로 교체하는 안전 속성 회귀 테스트 |
+| `packages/happy-server/sources/app/api/routes/previewRoutes.ts` | `filterForwardedHeaders` doc에 Origin이 downstream에서 재작성된다는 사실 명시(코드 변경 아님) |
+| `packages/happy-cli/src/daemon/previewWsRelay.live.test.ts` | 드리프트한 mirror를 실제 구현에 맞춤 + 동기화 경고 주석 |
 | `specs/preview-relay-credential-passthrough/context.md` | "남은 이슈"의 Origin 항목에 이 spec으로의 각주 링크 |
 
-검증: happy-server typecheck 통과 + 전체 39파일/479개 통과. happy-cli typecheck 통과 +
-146/147 파일, 1343/1344개 통과.
-
-**happy-cli의 1개 실패는 무관한 기존 flake다.** 실행마다 실패 파일이 바뀌며
-(`runAcp.test.ts` → `scripts/__tests__/cli-version.test.ts`), 후자는 격리 실행 시
-**4797ms / 5000ms 타임아웃**으로 여유가 200ms뿐이라 전체 스위트 동시 실행의 CPU
-경합에서 초과한다. 이 spec의 변경은 순수 헤더 조립 함수라 daemon 초기화 시간에
-영향을 줄 수 없다. → 별도 이슈로 다룰 가치가 있음(아래 "발견된 문제" 참고).
+검증: happy-server typecheck 통과 + 전체 39파일/479개 통과. happy-cli typecheck 통과.
+happy-cli 유닛 스위트의 간헐 실패는 main 에서도 재현되는 기존 flake로 확인
+(아래 "발견된 문제" 참고).
 
 커밋: 14ab6b6d(T1-T2), 7ff62423(T3-T4), da7db079(T7 문서),
-06a2deab(테스트 보강), 9603012b(구조적 개명), + ACAO 회귀 테스트.
+06a2deab(테스트 보강), 9603012b(구조적 개명), 12cbf8bd(ACAO 회귀 테스트 + 1차 리뷰),
+cd4ab34b(2차 리뷰: mirror 드리프트 + 문서).
