@@ -75,18 +75,24 @@ const HOP_BY_HOP_HEADERS = new Set([
   'host',
 ])
 
-// specs/preview-relay-origin-normalization — Host is always rewritten to the
-// loopback target below (the caller-supplied Host is hop-by-hop; Node fills
-// it in from the connection target). Origin must match, or dev-server CORS
-// middlewares that compare Origin against Host (Expo's CorsMiddleware, Vite,
-// webpack-dev-server) see a cross-origin request from the preview domain and
-// reject it. Rewrite in place rather than adding a step so callers can't
-// forget it.
-function stripHopByHop(headers: Record<string, string>, loopbackOrigin: string): Record<string, string> {
+/**
+ * Build the header set sent to the local dev server: drop hop-by-hop headers
+ * and point `Origin` at the loopback target.
+ *
+ * `Host` is always the loopback target already — it is dropped as hop-by-hop
+ * here and Node regenerates it from the connection target. `Origin` has to
+ * agree with it (specs/preview-relay-origin-normalization): left as the
+ * preview domain, any dev-server middleware that compares the two (Expo's
+ * CorsMiddleware, Vite, webpack-dev-server) reads a cross-origin request and
+ * rejects it. An absent Origin stays absent — "no Origin" and "same-origin"
+ * are distinct signals downstream.
+ */
+function buildUpstreamHeaders(headers: Record<string, string>, loopbackOrigin: string): Record<string, string> {
   const out: Record<string, string> = {}
   for (const [key, value] of Object.entries(headers)) {
-    if (HOP_BY_HOP_HEADERS.has(key.toLowerCase())) continue
-    out[key] = key.toLowerCase() === 'origin' ? loopbackOrigin : value
+    const lower = key.toLowerCase()
+    if (HOP_BY_HOP_HEADERS.has(lower)) continue
+    out[key] = lower === 'origin' ? loopbackOrigin : value
   }
   return out
 }
@@ -125,7 +131,7 @@ export function proxyHttp(req: ProxyRequest, opts: ProxyOptions = {}): Promise<P
   }
 
   const bodyBuf = req.bodyB64 ? Buffer.from(req.bodyB64, 'base64') : null
-  const requestHeaders = stripHopByHop(req.headers, `http://127.0.0.1:${req.port}`)
+  const requestHeaders = buildUpstreamHeaders(req.headers, `http://127.0.0.1:${req.port}`)
   // Force the upstream to skip compression. The browser's default
   // `Accept-Encoding: gzip, deflate, br` would otherwise have the dev
   // server gzip its response, and the happy-server preview route strips
