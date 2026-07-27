@@ -255,6 +255,8 @@ export class ApiMachineClient {
                 forkedFromMessageId,
                 createdByAccountId,
                 createdByDisplayName,
+                axStep,
+                bootstrapFiles,
             } = params || {};
             logger.debug(`[API MACHINE] Spawning session: dir=${directory}, hasUserCreds=${!!(happyToken && happySecret)}`);
 
@@ -278,6 +280,8 @@ export class ApiMachineClient {
                 forkedFromMessageId,
                 createdByAccountId,
                 createdByDisplayName,
+                axStep,
+                bootstrapFiles,
             });
 
             switch (result.type) {

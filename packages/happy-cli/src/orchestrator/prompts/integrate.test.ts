@@ -24,6 +24,51 @@ describe('applyAxOrchestration', () => {
         expect(result).toBeNull();
     });
 
+    it('uses an explicit step directly when state.json is missing', async () => {
+        const result = await applyAxOrchestration({
+            workspaceRoot: workspace,
+            userText: 'plan this product',
+            explicitStep: 'plan',
+        });
+
+        expect(result?.step).toBe('plan');
+        expect(result?.appendSystemPrompt).toMatch(/Step: plan/);
+    });
+
+    it('uses an explicit step instead of a stale file step without mutating the file', async () => {
+        await bootstrapWorkspace(workspace, 'free');
+
+        const result = await applyAxOrchestration({
+            workspaceRoot: workspace,
+            userText: 'plan this product',
+            explicitStep: 'plan',
+        });
+
+        expect(result?.step).toBe('plan');
+        expect(result?.appendSystemPrompt).toMatch(/Step: plan/);
+        const persisted = JSON.parse(
+            await (await import('node:fs/promises')).readFile(
+                join(workspace, '.ax', 'state.json'),
+                'utf8',
+            ),
+        );
+        expect(persisted.step).toBe('free');
+    });
+
+    it('uses an explicit step even when state.json is corrupt', async () => {
+        await mkdir(join(workspace, '.ax'), { recursive: true });
+        await writeFile(join(workspace, '.ax', 'state.json'), '{ garbage');
+
+        const result = await applyAxOrchestration({
+            workspaceRoot: workspace,
+            userText: 'continue in work mode',
+            explicitStep: 'free',
+        });
+
+        expect(result?.step).toBe('free');
+        expect(result?.appendSystemPrompt).toMatch(/Step: free/);
+    });
+
     it('plan-step: keeps user text visible-clean and injects guide/context into appendSystemPrompt', async () => {
         await bootstrapWorkspace(workspace, 'plan');
         const result = await applyAxOrchestration({

@@ -211,6 +211,8 @@ export interface SpawnSessionOptions {
      */
     createdByAccountId?: string;
     createdByDisplayName?: string;
+    axStep?: 'plan' | 'design' | 'free';
+    bootstrapFiles?: Array<{ relativePath: string; content: string }>;
 }
 
 export type SpawnSessionResult =

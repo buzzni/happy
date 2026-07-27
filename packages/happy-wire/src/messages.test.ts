@@ -162,7 +162,7 @@ describe('shared wire message schemas', () => {
   });
 
   it('parses legacy decrypted user message payload', () => {
-    const parsed = UserMessageSchema.safeParse({
+    const parsed = UserMessageSchema.parse({
       role: 'user',
       content: {
         type: 'text',
@@ -170,10 +170,11 @@ describe('shared wire message schemas', () => {
       },
       meta: {
         sentFrom: 'mobile',
+        axStep: 'plan',
       },
     });
 
-    expect(parsed.success).toBe(true);
+    expect(parsed.meta?.axStep).toBe('plan');
   });
 
   it('parses legacy decrypted agent message payload', () => {

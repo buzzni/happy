@@ -67,6 +67,8 @@ import {
   type StopSessionResult,
 } from './sessionIdleReaper';
 import { waitForSessionWebhook } from './spawnWebhookWait';
+import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
+import { materializeSpawnBootstrapFiles } from './materializeSpawnBootstrapFiles';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -458,6 +460,12 @@ export async function startDaemon(): Promise<void> {
       }
 
       try {
+        if (options.bootstrapFiles) {
+          await materializeSpawnBootstrapFiles(directory, options.bootstrapFiles);
+        }
+        if (options.axStep) {
+          await persistExplicitStep(directory, options.axStep);
+        }
 
         // Build environment variables for session spawning
         // Authentication tokens are resolved here

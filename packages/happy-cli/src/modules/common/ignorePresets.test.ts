@@ -60,6 +60,8 @@ describe('createIgnoreMatcher — default (all presets on)', () => {
     })
 
     it('ignores AI coding agent state directories', () => {
+        expect(matcher.shouldIgnore('.ax')).toBe(true)
+        expect(matcher.shouldIgnore('.ax/state.json')).toBe(true)
         expect(matcher.shouldIgnore('.claude')).toBe(true)
         expect(matcher.shouldIgnore('.omc')).toBe(true)
         expect(matcher.shouldIgnore('.happy')).toBe(true)
@@ -75,6 +77,7 @@ describe('createIgnoreMatcher — default (all presets on)', () => {
     })
 
     it('does NOT match partial segment for agent names', () => {
+        expect(matcher.shouldIgnore('.axis/config.json')).toBe(false)
         expect(matcher.shouldIgnore('my-.claude-backup')).toBe(false)
         expect(matcher.shouldIgnore('cursor-app/file')).toBe(false)
         expect(matcher.shouldIgnore('src/claude/helper.ts')).toBe(false)
@@ -170,6 +173,13 @@ describe('createIgnoreMatcher — workspace-self preset (Phase 2)', () => {
         const matcher = createIgnoreMatcher()
         expect(matcher.shouldIgnore('home/coder/workspace/aplus-dev-studio/aaaaaaaaaaaa/bbbbbbbbbbbb/x.html')).toBe(true)
         expect(matcher.shouldIgnore('home/coder/workspace')).toBe(true)
+    })
+
+    it('ignores managed worktrees without hiding other .aplus files', () => {
+        const matcher = createIgnoreMatcher()
+        expect(matcher.shouldIgnore('.aplus/worktrees/task/src/App.tsx')).toBe(true)
+        expect(matcher.shouldIgnore('.aplus/agent/project-template.md')).toBe(false)
+        expect(matcher.shouldIgnore('.aplus/uploads/chat-image.png')).toBe(false)
     })
 
     it('does NOT match partial prefix or unrelated home/ paths', () => {
