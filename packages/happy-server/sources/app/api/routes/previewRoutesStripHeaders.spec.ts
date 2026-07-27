@@ -160,6 +160,30 @@ describe('applySubdomainPreviewCorsHeaders', () => {
 
         expect(out['Access-Control-Allow-Origin']).toBeUndefined();
     });
+
+    // specs/preview-relay-origin-normalization — the relay now rewrites the
+    // outgoing request Origin to http://127.0.0.1:{port}, so a dev server that
+    // reflects the origin back answers with a loopback ACAO. That value is
+    // meaningless to the browser, whose origin is the preview subdomain. This
+    // pins the property that makes the request-side rewrite safe: whatever
+    // ACAO upstream produced is replaced, not merged, with the real origin.
+    it('replaces an upstream loopback ACAO with the real preview origin', () => {
+        const out = applySubdomainPreviewCorsHeaders(
+            {
+                'access-control-allow-origin': 'http://127.0.0.1:41009',
+                'access-control-allow-credentials': 'false',
+            },
+            `https://${MID}-31010.preview.saycode.ai`,
+            `${MID}-41009.preview.saycode.ai`,
+        );
+
+        expect(out['Access-Control-Allow-Origin']).toBe(`https://${MID}-31010.preview.saycode.ai`);
+        expect(out['Access-Control-Allow-Credentials']).toBe('true');
+        // The lower-cased upstream keys must be gone, not merely shadowed —
+        // writeHead lower-cases outgoing keys, so a survivor would win.
+        expect(out['access-control-allow-origin']).toBeUndefined();
+        expect(out['access-control-allow-credentials']).toBeUndefined();
+    });
 });
 
 describe('filterForwardedHeaders', () => {

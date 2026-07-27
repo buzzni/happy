@@ -81,6 +81,50 @@ preview-relay-origin-normalization`로 만든 격리된 worktree에서 했다. *
   기반 CSRF 방어를 하고 있었다면 이 변경으로 그 방어의 "실제 브라우저 Origin을
   본다"는 전제가 깨질 수 있음 — 발견되면 재검토(spec.md 비목표 참고).
 
+## 셀프 코드 리뷰 결과 (사이드 이펙트 분석)
+
+구현 후 자체 리뷰에서 확인한 것들. **결론: 회귀 없음.** 근거를 남긴다.
+
+- **응답 CORS는 영향받지 않는다 (가장 중요).** 상위 spec이 "CORS preflight 응답에
+  영향이 있어 단순 치환은 위험"이라고 우려했던 부분을 실제로 추적했다:
+  1. **preflight는 upstream에 도달조차 하지 않는다.** `previewRoutes.ts:446`이
+     `OPTIONS` + `access-control-request-method`를 relay에서 단락 처리하고 204를
+     직접 응답한다. 요청 Origin 재작성은 preflight 경로와 무관.
+  2. **실제 요청의 응답 ACAO는 relay가 덮어쓴다.** `applySubdomainPreviewCorsHeaders`가
+     **원본** `request.headers.origin`(재작성 전 값)으로 ACAO를 다시 세팅한다.
+     upstream이 loopback ACAO를 반사해도 지워지고 실제 프리뷰 origin으로 교체된다.
+     → 이 안전 속성을 `previewRoutesStripHeaders.spec.ts`에 회귀 테스트로 고정했다
+     ("replaces an upstream loopback ACAO with the real preview origin").
+  즉 outbound(relay→dev서버) 방향만 재작성한 설계가 정확히 이 이유로 안전하다.
+- **잔여 위험(낮음): path-prefix 모드.** 이 모드에선 `parsePreviewHost(host)`가 null이라
+  `applySubdomainPreviewCorsHeaders`가 헤더를 그대로 통과시키므로, upstream의 loopback
+  ACAO가 브라우저까지 샐 수 있다. 다만 path-prefix 모드는 iframe이 relay 호스트에서
+  서빙되어 프리뷰 요청이 **same-origin**이고, 브라우저는 same-origin 응답의 ACAO를
+  무시하므로 실사용 영향이 없다고 판단. → 재검토 조건: path-prefix 모드에서 진짜
+  cross-origin 요청을 하는 구성이 생기면 다시 볼 것.
+- **`Origin: null`(sandboxed iframe의 opaque origin)도 loopback으로 정규화된다.**
+  의도한 동작 — opaque origin은 어떤 same-origin 검사도 통과하지 못하므로 오히려
+  개선이다. 테스트로 고정.
+- **테스트가 프로덕션 형태를 놓치고 있었다(수정함).** happy-server는 Fastify의
+  `request.headers`(소문자화됨)로 전달 헤더를 만들기 때문에 daemon에 실제로 도착하는
+  건 소문자 `origin`인데, 최초 테스트는 대문자 `Origin`만 검증하고 있었다. 소문자
+  케이스를 추가했다. (WS 경로는 `req.rawHeaders`라 와이어 원본 대소문자 `Origin`이
+  맞으므로 기존 테스트가 이미 현실적.)
+- **함수 이름이 동작을 감추고 있었다(수정함).** `stripHopByHop`이 이제 재작성도
+  하므로 `buildUpstreamHeaders`로 개명(구조적 커밋 분리).
+- **호출부 확인.** `proxyHttp`는 `controlServer.ts:538`, `apiMachine.ts:820` 두 곳에서
+  호출되며 둘 다 `req.port`를 그대로 넘기므로 loopback origin 계산이 항상 일관된다.
+
+### 검토했으나 손대지 않은 것
+
+- **`Referer` 헤더는 재작성하지 않았다.** 여전히 프리뷰 도메인을 가리킨다. Expo/Vite/
+  webpack/Next dev 서버 중 `Referer`로 origin 검사를 하는 사례를 찾지 못했고, 추측성
+  변경은 하지 않는다는 원칙(Simplicity First)에 따라 보류. → 재검토 조건: `Referer`
+  기반으로 요청을 거부하는 dev 서버가 보고되면.
+- **`Sec-Fetch-Site: cross-site`는 그대로 남는다.** 재작성한 Origin(same-origin 의미)과
+  형식상 불일치하지만, 이걸 맞추려면 브라우저 fetch metadata 전반을 위조해야 해서
+  범위를 넘는다. 이걸로 차단하는 dev 서버가 나오면 별도 안건.
+
 ## 시도했으나 기각한 접근
 
 - happy-server의 `previewRoutes.ts` 응답 CORS 로직 쪽에서 재작성 — 위 결정 로그 참고,
@@ -96,17 +140,32 @@ preview-relay-origin-normalization`로 만든 격리된 worktree에서 했다. *
 - `aplus-dev-studio-app`의 `app.config.js`+`.env`(`EXPO_PREVIEW_ORIGIN`) 워크어라운드는
   이 spec이 릴리스되어 실제로 그 프로젝트에 반영되기 전까지 계속 필요 — 되돌리는 건
   별도 승인 필요한 다른 저장소 작업이라 이번 스코프에 포함 안 함.
+- **happy-cli 유닛 스위트에 타임아웃 마진이 부족한 테스트가 있다.**
+  `scripts/__tests__/cli-version.test.ts`의 "initializes and closes the packaged
+  control-server runtime"은 격리 실행에서도 4797ms/5000ms로 여유가 200ms뿐이라,
+  전체 스위트를 동시 실행하면 CPU 경합으로 간헐 실패한다. `runAcp.test.ts`의 몇몇
+  케이스도 같은 성질. 이 spec과 무관하지만 CI 신뢰도를 갉아먹으므로 별도로
+  `testTimeout` 상향 또는 해당 테스트의 격리 실행 분리를 검토할 가치가 있다.
 
 ## 바뀐 파일
 
 | 파일 | 내용 |
 |---|---|
-| `packages/happy-cli/src/daemon/previewProxy.ts` | `stripHopByHop`이 `Origin`을 `http://127.0.0.1:{port}`로 재작성(loopback 인자 추가) |
-| `packages/happy-cli/src/daemon/previewProxy.test.ts` | Origin 재작성 케이스 2개(있음/없음) |
+| `packages/happy-cli/src/daemon/previewProxy.ts` | `buildUpstreamHeaders`(구 `stripHopByHop`)가 `Origin`을 `http://127.0.0.1:{port}`로 재작성 |
+| `packages/happy-cli/src/daemon/previewProxy.test.ts` | Origin 재작성 케이스 5개(소문자/대문자/`null`/없음 등) |
 | `packages/happy-server/sources/modules/preview/previewWebSocketRelay.ts` | `serializeUpgradeRequest`가 `Host`와 대칭으로 `Origin` 재작성 |
 | `packages/happy-server/sources/modules/preview/previewWebSocketRelay.spec.ts` | Origin 재작성 케이스 2개(있음/없음) |
+| `packages/happy-server/sources/app/api/routes/previewRoutesStripHeaders.spec.ts` | upstream loopback ACAO를 실제 프리뷰 origin으로 교체하는 안전 속성 회귀 테스트 |
 | `specs/preview-relay-credential-passthrough/context.md` | "남은 이슈"의 Origin 항목에 이 spec으로의 각주 링크 |
 
-검증: happy-server 전체 스위트 39파일/478개 통과, happy-cli typecheck 통과 +
-145/147 파일(무관한 기존 flake 2케이스 제외) 통과. 커밋: 14ab6b6d(T1-T2),
-7ff62423(T3-T4).
+검증: happy-server typecheck 통과 + 전체 39파일/479개 통과. happy-cli typecheck 통과 +
+146/147 파일, 1343/1344개 통과.
+
+**happy-cli의 1개 실패는 무관한 기존 flake다.** 실행마다 실패 파일이 바뀌며
+(`runAcp.test.ts` → `scripts/__tests__/cli-version.test.ts`), 후자는 격리 실행 시
+**4797ms / 5000ms 타임아웃**으로 여유가 200ms뿐이라 전체 스위트 동시 실행의 CPU
+경합에서 초과한다. 이 spec의 변경은 순수 헤더 조립 함수라 daemon 초기화 시간에
+영향을 줄 수 없다. → 별도 이슈로 다룰 가치가 있음(아래 "발견된 문제" 참고).
+
+커밋: 14ab6b6d(T1-T2), 7ff62423(T3-T4), da7db079(T7 문서),
+06a2deab(테스트 보강), 9603012b(구조적 개명), + ACAO 회귀 테스트.
