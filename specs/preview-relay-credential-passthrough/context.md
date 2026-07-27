@@ -81,6 +81,11 @@ relay(`/v1/preview/:machineId/:port/*`)는 dev server 앞의 투명한 reverse p
   same-origin이어도 `Origin: https://<mid>-<port>.preview.…`를 붙인다. 백엔드가
   엄격한 CSRF origin 검사를 하면 403이 날 수 있다. relay가 upstream origin으로
   다시 쓸지는 결정 필요 — CORS preflight 응답에 영향이 있어 단순 치환은 위험.
+  → `specs/preview-relay-origin-normalization/`에서 해결. dev 서버(loopback) 쪽으로
+  나가는 `Origin`만 `http://127.0.0.1:{port}`로 재작성(이미 무조건 재작성되던 `Host`와
+  대칭), 브라우저로 돌아오는 응답 CORS 헤더 로직은 그대로 둠 — 여기서 우려한
+  "CORS preflight 응답 영향"은 없음. backend CSRF와의 상호작용은 그 spec의 비목표에
+  트레이드오프로 기록.
 - **third-party cookie phase-out.** 현재 Electron/Chromium 기본값에선
   `SameSite=None; Secure`면 통과한다. 차단이 기본이 되면 CHIPS(`Partitioned`)가
   필요해지는데, 그러면 top-level site별로 파티션되므로 별도 검토가 필요하다.

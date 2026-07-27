@@ -98,17 +98,17 @@
 
 ## 완료 기준 (Definition of Done)
 
-- [ ] R1~R3에 대응하는 테스트 존재 및 통과
+- [x] R1~R3에 대응하는 테스트 존재 및 통과
       (`previewProxy.test.ts`에 Origin 재작성 케이스 추가,
       `previewWebSocketRelay.spec.ts`의 `serializeUpgradeRequest` describe에
       Origin 케이스 추가)
-- [ ] R4 회귀 확인 — 기존 `previewRoutesCredentials.spec.ts` /
+- [x] R4 회귀 확인 — 기존 `previewRoutesCredentials.spec.ts` /
       `previewRoutesStripHeaders.spec.ts` / `previewRoutesRelay.spec.ts` 등
       `previewRoutes.ts` 관련 스위트가 그대로 통과(이 spec이 그 파일을 건드리지
-      않는다는 것 자체가 증거)
-- [ ] `pnpm -C packages/happy-cli typecheck` && `pnpm -C packages/happy-cli test`
-      통과
-- [ ] `pnpm -C packages/happy-server typecheck` && `pnpm -C packages/happy-server test`
-      통과
+      않는다는 것 자체가 증거) — happy-server 39파일/478개 전체 통과로 확인
+- [x] `pnpm -C packages/happy-cli typecheck` && `pnpm -C packages/happy-cli test`
+      통과 (typecheck 통과, test 145/147 파일 — 실패 2개는 무관한 기존 flake, context.md 참고)
+- [x] `pnpm -C packages/happy-server typecheck` && `pnpm -C packages/happy-server test`
+      통과 (39/39 파일, 478/478 테스트)
 - [ ] `context.md`에 완료 요약 + (재현 가능하면) `aplus-dev-studio-app`에서
       `app.config.js` 워크어라운드 없이도 프리뷰가 뜨는지 수동 확인 기록

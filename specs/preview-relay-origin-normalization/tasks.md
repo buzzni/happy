@@ -42,22 +42,27 @@ T5(전체 회귀)는 둘 다 끝나야 의미가 있어 마지막 → T6(수동 
 
 ## Phase 3: 전체 회귀 + 실기기 검증
 
-- [ ] T5. `pnpm -C packages/happy-cli typecheck && pnpm -C packages/happy-cli test`,
+- [x] T5. `pnpm -C packages/happy-cli typecheck && pnpm -C packages/happy-cli test`,
       `pnpm -C packages/happy-server typecheck && pnpm -C packages/happy-server test`
-      전체 실행 → 검증: 전부 통과(특히 `previewRoutesCredentials.spec.ts`,
-      `previewRoutesStripHeaders.spec.ts`, `previewRoutesRelay.spec.ts`,
-      `previewWsProxy.test.ts`, `previewWsRelay.live.test.ts`가 이 변경으로 깨지지
-      않는지 — spec.md R4 회귀 확인)
+      전체 실행 → 검증: happy-server 39파일/478개 전체 통과(`previewRoutesCredentials.spec.ts`,
+      `previewRoutesStripHeaders.spec.ts`, `previewRoutesRelay.spec.ts` 포함 — spec.md R4
+      회귀 확인). happy-cli는 145/147 파일 통과, `typecheck` 통과; 실패한 2개
+      (`runAcp.test.ts` 중 2케이스)는 이 변경이 건드리지 않은 파일이고 단독 실행 시
+      13/13 통과(타이밍에 민감한 기존 flake, 전체 스위트 동시 실행 시 CPU 경합으로
+      간헐 실패) — context.md에 기록.
 - [ ] T6. (가능하면) 이 브랜치의 daemon으로 `aplus-dev-studio-app` 프리뷰를 띄우고,
       `app.config.js`의 `EXPO_PREVIEW_ORIGIN` 주입을 일시적으로 끈 상태에서도
       (`.env`의 `EXPO_PREVIEW_ORIGIN` 주석 처리) `curl -H "Origin:
       <preview-url>" <bundle-url>`이 200인지 확인 → 검증: 200 확인되면 근본 원인
       해결의 최종 증거. 로컬 daemon 교체가 여의치 않으면 이 태스크는 스킵하고
       context.md에 "미검증, T5까지만 확인"으로 명시(중단 조건 아님 — 정보 기록)
+      **스킵함** — 실행 중인 daemon이 여러 동시 세션을 서빙하고 있어(`ps aux`로 확인,
+      10개 이상의 활성 happy-cli 프로세스) 라이브 교체는 다른 세션의 프리뷰를
+      끊을 위험이 있어 별도 승인 없이 수행하지 않음.
 
 ## Phase 4: 문서화
 
-- [ ] T7. `context.md`에 완료 요약 작성. `specs/preview-relay-credential-passthrough/context.md`의
+- [x] T7. `context.md`에 완료 요약 작성. `specs/preview-relay-credential-passthrough/context.md`의
       "남은 이슈" 절 중 `Origin` 헤더 그대로 전달 항목에 `→ specs/preview-relay-origin-normalization/
       에서 해결` 각주 추가 → 검증: 문서 리뷰(코드 변경 없음)
 
