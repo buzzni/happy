@@ -20,6 +20,12 @@ export const DEFAULT_IDLE_STOP_PRESENCE_STALE_MS = 5 * 60 * 1000;
 /** Local guard floor: no policy stop may kill a session the user touched
  *  within this window, regardless of process age. */
 export const DEFAULT_IDLE_STOP_RECENT_INTERACTION_MS = 30 * 60 * 1000;
+/** Max sessions SIGTERM'd by a single reaper tick. A fixed batch of stopped
+ *  sessions is always resumable, but stopping hundreds at once (e.g. after a
+ *  guard bug is fixed and a large backlog is suddenly eligible) is a surprise
+ *  worth spreading across ticks instead. Remaining candidates are picked up
+ *  again on the next tick. */
+export const DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX = 10;
 
 type DaemonSessionIdleReaperObservedSession = {
   sessionId: string;
@@ -86,6 +92,9 @@ type RunDaemonSessionIdleReaperTickInput = {
   idleAfterMs?: number;
   presenceStaleMs?: number;
   turnEndReaperMs?: number;
+  /** Max sessions to stop this tick; extra candidates are deferred to the next
+   *  tick. Defaults to DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX. */
+  batchMax?: number;
   postCandidates?: (input: PostCandidatesInput) => Promise<DaemonSessionIdleReaperResponse>;
   logDebug?: (message: string) => void;
 };
@@ -97,6 +106,8 @@ export type DaemonSessionIdleReaperTickResult = {
   /** Candidates the daemon refused to stop because its local guard saw activity. */
   skippedActiveSessions: number;
   noopSessions: number;
+  /** Candidates left unprocessed this tick because batchMax was reached. */
+  deferredSessions: number;
 };
 
 export type StopSessionMode = 'force' | 'if-idle';
@@ -274,6 +285,7 @@ export type DaemonSessionIdleReaperConfig = {
   presenceStaleMs?: number;
   /** undefined when the turn-end reap is disabled (env set to 0). */
   turnEndReaperMs?: number;
+  batchMax: number;
 };
 
 export function readDaemonSessionIdleReaperConfig(env: NodeJS.ProcessEnv = process.env): DaemonSessionIdleReaperConfig {
@@ -286,11 +298,13 @@ export function readDaemonSessionIdleReaperConfig(env: NodeJS.ProcessEnv = proce
   const turnEndReaperMs = turnEndRaw === undefined
     ? DEFAULT_SESSION_TURN_END_REAPER_MS
     : (turnEndRaw > 0 ? turnEndRaw : undefined);
+  const batchMax = parseOptionalMs(env.HAPPY_DAEMON_SESSION_IDLE_REAPER_BATCH_MAX);
   return {
     disabled: isTruthy(env.HAPPY_DAEMON_SESSION_IDLE_REAPER_DISABLED),
     idleAfterMs: idleAfterMs ?? DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS,
     ...(presenceStaleMs !== undefined ? { presenceStaleMs } : {}),
     ...(turnEndReaperMs !== undefined ? { turnEndReaperMs } : {}),
+    batchMax: batchMax ?? DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX,
   };
 }
 
@@ -369,6 +383,7 @@ export async function runDaemonSessionIdleReaperTick(
     stoppedSessions: 0,
     skippedActiveSessions: 0,
     noopSessions: 0,
+    deferredSessions: 0,
   };
   if (request.sessions.length === 0) return result;
 
@@ -385,8 +400,11 @@ export async function runDaemonSessionIdleReaperTick(
   }
 
   result.candidateSessions = response.candidates.length;
+  const batchMax = input.batchMax ?? DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX;
+  const batch = response.candidates.slice(0, batchMax);
+  result.deferredSessions = response.candidates.length - batch.length;
   let turnEndStopped = 0;
-  for (const candidate of response.candidates) {
+  for (const candidate of batch) {
     const reason = candidate.reason ?? 'absolute-idle-cut';
     // Even though the server already excludes busy sessions, the daemon
     // re-validates locally (if-idle) because it is the only component that sees
@@ -408,7 +426,7 @@ export async function runDaemonSessionIdleReaperTick(
 
   if (result.candidateSessions > 0) {
     input.logDebug?.(
-      `[session-idle-reaper] candidates=${result.candidateSessions} stopped=${result.stoppedSessions} (turnEnd=${turnEndStopped}) skippedActive=${result.skippedActiveSessions} noop=${result.noopSessions}`,
+      `[session-idle-reaper] candidates=${result.candidateSessions} stopped=${result.stoppedSessions} (turnEnd=${turnEndStopped}) skippedActive=${result.skippedActiveSessions} noop=${result.noopSessions} deferred=${result.deferredSessions}`,
     );
   }
 

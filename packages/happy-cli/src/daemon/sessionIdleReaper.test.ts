@@ -7,6 +7,7 @@ import {
   DEFAULT_IDLE_STOP_PRESENCE_STALE_MS,
   DEFAULT_IDLE_STOP_RECENT_INTERACTION_MS,
   DEFAULT_SESSION_EMPTY_REAPER_MS,
+  DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX,
   DEFAULT_SESSION_TURN_END_REAPER_MS,
   buildDaemonSessionIdleReaperRequest,
   evaluateIdleStopGuard,
@@ -239,6 +240,15 @@ describe('readDaemonSessionIdleReaperConfig', () => {
       disabled: false,
       idleAfterMs: DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS,
       turnEndReaperMs: DEFAULT_SESSION_TURN_END_REAPER_MS,
+      batchMax: DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX,
+    });
+  });
+
+  it('allows env to override the per-tick stop batch cap', () => {
+    expect(readDaemonSessionIdleReaperConfig({
+      HAPPY_DAEMON_SESSION_IDLE_REAPER_BATCH_MAX: '25',
+    })).toMatchObject({
+      batchMax: 25,
     });
   });
 
@@ -327,6 +337,7 @@ describe('runDaemonSessionIdleReaperTick', () => {
       stoppedSessions: 1,
       skippedActiveSessions: 0,
       noopSessions: 2,
+      deferredSessions: 0,
     });
   });
 
@@ -395,6 +406,49 @@ describe('runDaemonSessionIdleReaperTick', () => {
     expect(stopSession).toHaveBeenNthCalledWith(2, 'legacy', { source: 'session-idle-reaper', reason: 'absolute-idle-cut', mode: 'if-idle' });
   });
 
+  it('caps the number of sessions stopped per tick, deferring the rest to the next tick', async () => {
+    const stopSession = vi.fn(() => ({ stopped: true as const }));
+    const logDebug = vi.fn();
+
+    const result = await runDaemonSessionIdleReaperTick({
+      machineId: 'machine-1',
+      serverUrl: 'https://aplus.example.com',
+      credentialsToken: 'token-1',
+      now: 20_000,
+      idleAfterMs: 10_000,
+      batchMax: 2,
+      sessionStartTimes: new Map([[100, 1_000], [101, 1_000], [102, 1_000]]),
+      trackedSessions: [
+        tracked({ pid: 100, happySessionId: 'a' }),
+        tracked({ pid: 101, happySessionId: 'b' }),
+        tracked({ pid: 102, happySessionId: 'c' }),
+      ],
+      stopSession,
+      logDebug,
+      postCandidates: vi.fn(async () => ({
+        checkedAt: 20_000,
+        candidates: [
+          { sessionId: 'a', projectId: 'p', machineId: 'machine-1', lastActiveAt: 1_000, idleMs: 19_000 },
+          { sessionId: 'b', projectId: 'p', machineId: 'machine-1', lastActiveAt: 1_000, idleMs: 19_000 },
+          { sessionId: 'c', projectId: 'p', machineId: 'machine-1', lastActiveAt: 1_000, idleMs: 19_000 },
+        ],
+      })),
+    });
+
+    expect(stopSession).toHaveBeenCalledTimes(2);
+    expect(stopSession).toHaveBeenCalledWith('a', expect.anything());
+    expect(stopSession).toHaveBeenCalledWith('b', expect.anything());
+    expect(result).toEqual({
+      requestedSessions: 3,
+      candidateSessions: 3,
+      stoppedSessions: 2,
+      skippedActiveSessions: 0,
+      noopSessions: 0,
+      deferredSessions: 1,
+    });
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('deferred=1'));
+  });
+
   it('does not stop sessions when the candidate request fails', async () => {
     const stopSession = vi.fn();
     const logDebug = vi.fn();
@@ -421,6 +475,7 @@ describe('runDaemonSessionIdleReaperTick', () => {
       stoppedSessions: 0,
       skippedActiveSessions: 0,
       noopSessions: 0,
+      deferredSessions: 0,
     });
   });
 });
