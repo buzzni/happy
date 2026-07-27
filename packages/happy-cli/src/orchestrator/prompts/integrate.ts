@@ -17,7 +17,7 @@
 
 import { readState } from '../state/io';
 import { composeStepGuide, composeDynamicContext, loadBasePrompt } from './compose';
-import type { AxStep } from '../state/schema';
+import { createInitialState, type AxStep } from '../state/schema';
 
 const BASE_SENTINEL = '<!-- ax:base-prompt -->';
 const TURN_CONTEXT_SENTINEL = '<!-- ax:turn-context -->';
@@ -26,6 +26,7 @@ export interface ApplyAxOrchestrationInput {
     workspaceRoot: string;
     userText: string;
     currentAppendSystemPrompt?: string;
+    explicitStep?: AxStep;
 }
 
 export interface ApplyAxOrchestrationResult {
@@ -41,8 +42,15 @@ export async function applyAxOrchestration(
     try {
         state = await readState(input.workspaceRoot);
     } catch {
-        // No state, corrupt state, or read error — opt out gracefully.
-        return null;
+        if (!input.explicitStep) {
+            // No state, corrupt state, or read error — opt out gracefully.
+            return null;
+        }
+        state = createInitialState(input.explicitStep);
+    }
+
+    if (input.explicitStep && state.step !== input.explicitStep) {
+        state = { ...state, step: input.explicitStep };
     }
 
     const [guide, context, base] = await Promise.all([

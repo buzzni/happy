@@ -107,7 +107,7 @@ const PRESETS: Record<PresetName, Preset> = {
     },
     agent: {
         // AI coding tool state dirs that leak agent memory/sessions if deployed.
-        segments: ['.claude', '.omc', '.happy', '.codex', '.cursor', '.aider'],
+        segments: ['.ax', '.claude', '.omc', '.happy', '.codex', '.cursor', '.aider'],
         globs: [],
     },
     'workspace-self': {
@@ -120,7 +120,7 @@ const PRESETS: Record<PresetName, Preset> = {
         // auto-fix at deploy time. specs/workspace-cross-project-pollution/.
         segments: [],
         globs: [],
-        pathPrefixes: ['home/coder/workspace'],
+        pathPrefixes: ['home/coder/workspace', '.aplus/worktrees'],
     },
 }
 

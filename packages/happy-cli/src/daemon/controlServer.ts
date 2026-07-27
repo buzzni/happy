@@ -203,6 +203,11 @@ export function startDaemonControlServer({
           environmentVariables: z.record(z.string(), z.string()).optional(),
           happyToken: z.string().optional(),
           happySecret: z.string().optional(),
+          axStep: z.enum(['plan', 'design', 'free']).optional(),
+          bootstrapFiles: z.array(z.object({
+            relativePath: z.string(),
+            content: z.string(),
+          })).optional(),
         }),
         response: {
           200: z.object({
@@ -223,10 +228,28 @@ export function startDaemonControlServer({
         }
       }
     }, async (request, reply) => {
-      const { directory, sessionId, agent, environmentVariables, happyToken, happySecret } = request.body;
+      const {
+        directory,
+        sessionId,
+        agent,
+        environmentVariables,
+        happyToken,
+        happySecret,
+        axStep,
+        bootstrapFiles,
+      } = request.body;
 
       logger.debug(`[CONTROL SERVER] Spawn session request: dir=${directory}, sessionId=${sessionId || 'new'}, agent=${agent || 'default'}, hasUserCreds=${!!(happyToken && happySecret)}`);
-      const result = await spawnSession({ directory, sessionId, agent, environmentVariables, happyToken, happySecret });
+      const result = await spawnSession({
+        directory,
+        sessionId,
+        agent,
+        environmentVariables,
+        happyToken,
+        happySecret,
+        axStep,
+        bootstrapFiles,
+      });
 
       switch (result.type) {
         case 'success':

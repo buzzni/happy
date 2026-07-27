@@ -30,6 +30,7 @@ import {
 import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudePermissionMode, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
 import { applyAxOrchestration } from '@/orchestrator/prompts/integrate';
+import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
 import { appendClaudeTitleInstruction } from './utils/titlePrompt';
 import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
 import { fetchAplusMcpServersResult } from '@/aplus/fetchAplusMcpServers';
@@ -814,11 +815,18 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         // inject the step guide + dynamic context into appendSystemPrompt.
         // Returns null for non-AX workspaces — fall through to default flow.
         let pushText = message.content.text;
+        const explicitAxStep = message.meta?.axStep;
+        if (explicitAxStep) {
+            await persistExplicitStep(workingDirectory, explicitAxStep).catch((err) => {
+                logger.debug(`[ax] explicit step persistence failed: ${(err as Error).message}`);
+            });
+        }
         try {
             const ax = await applyAxOrchestration({
                 workspaceRoot: workingDirectory,
                 userText: pushText,
                 currentAppendSystemPrompt: messageAppendSystemPrompt,
+                explicitStep: explicitAxStep,
             });
             if (ax) {
                 pushText = ax.userText;

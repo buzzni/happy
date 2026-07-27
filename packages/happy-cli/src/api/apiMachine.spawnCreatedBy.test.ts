@@ -75,4 +75,32 @@ describe('ApiMachineClient spawn-happy-session createdBy passthrough', () => {
         expect(calls[0].createdByAccountId).toBeUndefined();
         expect(calls[0].createdByDisplayName).toBeUndefined();
     });
+
+    it('forwards axStep and bootstrapFiles to spawnSession', async () => {
+        const calls: any[] = [];
+        const spawnSession = (options: any) => {
+            calls.push(options);
+            return Promise.resolve({ type: 'success', sessionId: 'happy-1' });
+        };
+        const bootstrapFiles = [{
+            relativePath: '.aplus/agent/project-template.md',
+            content: '# Project',
+        }];
+
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ spawnSession }));
+
+        await handlersFrom(client).get('machine-1:spawn-happy-session')?.({
+            directory: '/tmp/project',
+            agent: 'claude',
+            axStep: 'plan',
+            bootstrapFiles,
+        });
+
+        expect(calls[0]).toEqual(expect.objectContaining({
+            axStep: 'plan',
+            bootstrapFiles,
+        }));
+    });
 });

@@ -201,6 +201,31 @@ describe('controlServer POST /spawn-session', () => {
       expect.objectContaining({ directory: dir, agent: 'opencode' }),
     ])
   })
+
+  it('forwards axStep and bootstrapFiles to spawnSession', async () => {
+    const bootstrapFiles = [{
+      relativePath: '.aplus/agent/project-template.md',
+      content: '# Project',
+    }]
+    const res = await fetch(`${baseUrl}/spawn-session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        directory: dir,
+        agent: 'claude',
+        axStep: 'design',
+        bootstrapFiles,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(spawnRequests).toEqual([
+      expect.objectContaining({
+        axStep: 'design',
+        bootstrapFiles,
+      }),
+    ])
+  })
 })
 
 describe('controlServer POST /session-runtime', () => {
