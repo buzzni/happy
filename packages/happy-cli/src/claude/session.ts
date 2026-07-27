@@ -55,6 +55,10 @@ export class Session {
         hookSettingsPath: string,
         /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
         jsRuntime?: JsRuntime,
+        /** Mode the run loop is starting in — the single source of truth for
+         *  this.mode, so the first keepalive reports it correctly instead of
+         *  the 'local' field initializer. */
+        startingMode?: 'local' | 'remote',
     }) {
         this.path = opts.path;
         this.api = opts.api;
@@ -72,6 +76,7 @@ export class Session {
         this._onAbort = opts.onAbort;
         this.hookSettingsPath = opts.hookSettingsPath;
         this.jsRuntime = opts.jsRuntime ?? 'node';
+        this.mode = opts.startingMode ?? 'local';
 
         // Start keep alive
         this.client.keepAlive(this.thinking, this.mode);
