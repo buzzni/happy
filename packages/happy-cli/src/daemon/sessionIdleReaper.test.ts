@@ -252,6 +252,21 @@ describe('readDaemonSessionIdleReaperConfig', () => {
     });
   });
 
+  it('ignores a batch cap that would stop nothing, rather than silently disabling cleanup', () => {
+    // A cap of 0 (or negative/garbage) would make every tick a no-op — a
+    // silent, total disabling of the reaper. Use the dedicated
+    // HAPPY_DAEMON_SESSION_IDLE_REAPER_DISABLED knob for that instead.
+    for (const value of ['0', '-1', 'abc', '']) {
+      expect(readDaemonSessionIdleReaperConfig({
+        HAPPY_DAEMON_SESSION_IDLE_REAPER_BATCH_MAX: value,
+      })).toMatchObject({ batchMax: DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX });
+    }
+    // Fractional counts round down to a whole number of sessions.
+    expect(readDaemonSessionIdleReaperConfig({
+      HAPPY_DAEMON_SESSION_IDLE_REAPER_BATCH_MAX: '2.7',
+    })).toMatchObject({ batchMax: 2 });
+  });
+
   it('allows env to override the idle threshold', () => {
     expect(readDaemonSessionIdleReaperConfig({
       HAPPY_DAEMON_SESSION_IDLE_REAPER_AFTER_MS: '2500',
@@ -447,6 +462,44 @@ describe('runDaemonSessionIdleReaperTick', () => {
       deferredSessions: 1,
     });
     expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('deferred=1'));
+  });
+
+  it('does not let guard-refused candidates consume the stop budget', async () => {
+    // The server cannot see local guard denials, so it keeps returning the
+    // same refused candidates every tick. If the cap counted attempts rather
+    // than actual stops, a block of permanently-refused candidates at the head
+    // of the list would starve every reapable session behind them forever.
+    const stopSession = vi.fn((sessionId: string) =>
+      sessionId.startsWith('busy')
+        ? { stopped: false as const, reason: 'active' as const, guard: 'recent-user-interaction', activity: { thinking: false, hasOpenToolCall: false, pendingUserInput: false } }
+        : { stopped: true as const });
+
+    const candidateIds = ['busy-1', 'busy-2', 'busy-3', 'reapable-1', 'reapable-2'];
+    const result = await runDaemonSessionIdleReaperTick({
+      machineId: 'machine-1',
+      serverUrl: 'https://aplus.example.com',
+      credentialsToken: 'token-1',
+      now: 20_000,
+      idleAfterMs: 10_000,
+      batchMax: 2,
+      sessionStartTimes: new Map(candidateIds.map((_, i) => [100 + i, 1_000])),
+      trackedSessions: candidateIds.map((id, i) => tracked({ pid: 100 + i, happySessionId: id })),
+      stopSession,
+      postCandidates: vi.fn(async () => ({
+        checkedAt: 20_000,
+        candidates: candidateIds.map((sessionId) => ({
+          sessionId, projectId: 'p', machineId: 'machine-1', lastActiveAt: 1_000, idleMs: 19_000,
+        })),
+      })),
+    });
+
+    expect(stopSession).toHaveBeenCalledWith('reapable-1', expect.anything());
+    expect(stopSession).toHaveBeenCalledWith('reapable-2', expect.anything());
+    expect(result).toMatchObject({
+      stoppedSessions: 2,
+      skippedActiveSessions: 3,
+      deferredSessions: 0,
+    });
   });
 
   it('does not stop sessions when the candidate request fails', async () => {

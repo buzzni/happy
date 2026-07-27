@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { Session } from './session';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import type { ApiSessionClient } from '@/api/apiSession';
@@ -24,10 +24,6 @@ function createSession(overrides: { startingMode?: 'local' | 'remote' } = {}) {
 }
 
 describe('Session mode', () => {
-    afterEach(() => {
-        vi.useRealTimers();
-    });
-
     it('reports the given startingMode on the very first keepalive', () => {
         const { session, keepAlive } = createSession({ startingMode: 'remote' });
         expect(session.mode).toBe('remote');

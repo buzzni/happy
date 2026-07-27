@@ -222,9 +222,15 @@ export function evaluateIdleStopGuard(input: {
   daemonStartedAt?: number;
   /** Who spawned this session. Daemon-spawned sessions are always launched
    *  with --happy-starting-mode remote (runClaude.ts refuses daemon+local at
-   *  spawn time), so they can never have a real attached terminal — a
-   *  'local' runtime report from one reflects a client-side reporting bug,
-   *  not a terminal, and must not trigger the local-session guard. */
+   *  spawn time), so a 'local' report from one is overwhelmingly a client-side
+   *  reporting bug rather than a terminal the user is sitting at, and must not
+   *  trigger the local-session guard.
+   *
+   *  Tradeoff: a user CAN reach a genuine local mode on a daemon-spawned
+   *  (e.g. tmux) session by triggering the 'switch' RPC, and that case loses
+   *  local protection here. It is still covered by the hard blocks above
+   *  (thinking / open tool call / pending user input) and by the
+   *  recent-user-interaction floor, and any stop is a resumable SIGTERM. */
   startedBy?: TrackedSession['startedBy'];
   now: number;
   config: IdleStopGuardConfig;
@@ -298,7 +304,7 @@ export function readDaemonSessionIdleReaperConfig(env: NodeJS.ProcessEnv = proce
   const turnEndReaperMs = turnEndRaw === undefined
     ? DEFAULT_SESSION_TURN_END_REAPER_MS
     : (turnEndRaw > 0 ? turnEndRaw : undefined);
-  const batchMax = parseOptionalMs(env.HAPPY_DAEMON_SESSION_IDLE_REAPER_BATCH_MAX);
+  const batchMax = parseOptionalCount(env.HAPPY_DAEMON_SESSION_IDLE_REAPER_BATCH_MAX);
   return {
     disabled: isTruthy(env.HAPPY_DAEMON_SESSION_IDLE_REAPER_DISABLED),
     idleAfterMs: idleAfterMs ?? DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS,
@@ -401,10 +407,15 @@ export async function runDaemonSessionIdleReaperTick(
 
   result.candidateSessions = response.candidates.length;
   const batchMax = input.batchMax ?? DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX;
-  const batch = response.candidates.slice(0, batchMax);
-  result.deferredSessions = response.candidates.length - batch.length;
   let turnEndStopped = 0;
-  for (const candidate of batch) {
+  let processed = 0;
+  for (const candidate of response.candidates) {
+    // The cap counts actual stops, not attempts: the server cannot see local
+    // guard denials, so it returns the same refused candidates every tick.
+    // Counting attempts would let a block of permanently-refused candidates
+    // starve every reapable session behind them.
+    if (result.stoppedSessions >= batchMax) break;
+    processed += 1;
     const reason = candidate.reason ?? 'absolute-idle-cut';
     // Even though the server already excludes busy sessions, the daemon
     // re-validates locally (if-idle) because it is the only component that sees
@@ -423,6 +434,7 @@ export async function runDaemonSessionIdleReaperTick(
       result.noopSessions += 1;
     }
   }
+  result.deferredSessions = response.candidates.length - processed;
 
   if (result.candidateSessions > 0) {
     input.logDebug?.(
@@ -569,6 +581,16 @@ function parseOptionalMs(value: string | undefined): number | undefined {
   if (value === undefined || value.trim() === '') return undefined;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+/** Parse a positive whole count. Zero/negative/garbage return undefined so the
+ *  caller falls back to its default — a cap of 0 would silently turn the whole
+ *  policy into a no-op, which is what the *_DISABLED knobs are for. */
+function parseOptionalCount(value: string | undefined): number | undefined {
+  const parsed = parseOptionalMs(value);
+  if (parsed === undefined) return undefined;
+  const count = Math.floor(parsed);
+  return count >= 1 ? count : undefined;
 }
 
 function isTruthy(value: string | undefined): boolean {
