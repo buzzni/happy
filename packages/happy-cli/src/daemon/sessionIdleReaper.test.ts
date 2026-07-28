@@ -774,6 +774,7 @@ describe('evaluateIdleStopGuard', () => {
     expect(evaluateIdleStopGuard({
       runtime: runtime({}),
       sessionStartedAt: withinCap,
+      startedBy: 'daemon',
       now,
       config,
     })).toEqual({ allow: true });
@@ -784,7 +785,7 @@ describe('evaluateIdleStopGuard', () => {
     ['open-tool-call', runtime({ hasOpenToolCall: true })],
     ['pending-user-input', runtime({ pendingUserInput: true })],
   ] as const)('denies when %s (hard block, even for an old session)', (guard, rt) => {
-    expect(evaluateIdleStopGuard({ runtime: rt, sessionStartedAt: old, now, config }))
+    expect(evaluateIdleStopGuard({ runtime: rt, sessionStartedAt: old, startedBy: 'daemon', now, config }))
       .toEqual({ allow: false, guard, activity: expect.any(Object) });
   });
 
@@ -792,6 +793,7 @@ describe('evaluateIdleStopGuard', () => {
     const decision = evaluateIdleStopGuard({
       runtime: runtime({ lastUserInteractionAt: now - 60_000 }),
       sessionStartedAt: withinCap,
+      startedBy: 'daemon',
       now,
       config,
     });
@@ -802,6 +804,7 @@ describe('evaluateIdleStopGuard', () => {
     const decision = evaluateIdleStopGuard({
       runtime: runtime({}),
       sessionStartedAt: now - 60_000,
+      startedBy: 'daemon',
       now,
       config,
     });
@@ -812,6 +815,10 @@ describe('evaluateIdleStopGuard', () => {
     const decision = evaluateIdleStopGuard({
       runtime: runtime({ mode: 'local' }),
       sessionStartedAt: withinCap,
+      // Not daemon-spawned — e.g. a plain `happy` run in a terminal — so the
+      // local-session guard's exemption for daemon-spawned sessions must not
+      // apply here.
+      startedBy: 'terminal',
       now,
       config,
     });
@@ -838,6 +845,7 @@ describe('evaluateIdleStopGuard', () => {
     expect(evaluateIdleStopGuard({
       runtime: undefined,
       sessionStartedAt: now - 20 * 60 * 1000,
+      startedBy: 'daemon',
       now,
       config,
     })).toMatchObject({ allow: false, guard: 'stale-runtime' });
@@ -845,6 +853,7 @@ describe('evaluateIdleStopGuard', () => {
     expect(evaluateIdleStopGuard({
       runtime: runtime({ updatedAt: now - config.presenceStaleMs - 1 }),
       sessionStartedAt: now - 20 * 60 * 1000,
+      startedBy: 'daemon',
       now,
       config,
     })).toMatchObject({ allow: false, guard: 'stale-runtime' });
@@ -856,6 +865,7 @@ describe('evaluateIdleStopGuard', () => {
     expect(evaluateIdleStopGuard({
       runtime: runtime({ mode: 'local', updatedAt: now - config.hardCapMs - 1 }),
       sessionStartedAt: now - 3 * config.hardCapMs,
+      startedBy: 'daemon',
       now,
       config,
     })).toEqual({ allow: true });
@@ -866,6 +876,7 @@ describe('evaluateIdleStopGuard', () => {
       runtime: undefined,
       sessionStartedAt: now - 3 * config.hardCapMs,
       daemonStartedAt: now - config.hardCapMs - 1,
+      startedBy: 'daemon',
       now,
       config,
     })).toEqual({ allow: true });
@@ -878,6 +889,7 @@ describe('evaluateIdleStopGuard', () => {
     expect(evaluateIdleStopGuard({
       runtime: runtime({ lastUserInteractionAt: now - 60_000, updatedAt: now - config.presenceStaleMs - 1 }),
       sessionStartedAt: now - config.hardCapMs - 1,
+      startedBy: 'daemon',
       now,
       config,
     })).toMatchObject({ allow: false, guard: 'recent-user-interaction' });
@@ -891,6 +903,7 @@ describe('evaluateIdleStopGuard', () => {
       runtime: undefined,
       sessionStartedAt: now - 3 * config.hardCapMs,
       daemonStartedAt: now - 60_000,
+      startedBy: 'daemon',
       now,
       config,
     })).toMatchObject({ allow: false, guard: 'stale-runtime' });
@@ -900,6 +913,7 @@ describe('evaluateIdleStopGuard', () => {
     expect(evaluateIdleStopGuard({
       runtime: runtime({ lastUserInteractionAt: now - config.recentInteractionMs - 1 }),
       sessionStartedAt: now - config.hardCapMs - 1,
+      startedBy: 'daemon',
       now,
       config,
     })).toEqual({ allow: true });
@@ -909,6 +923,7 @@ describe('evaluateIdleStopGuard', () => {
     expect(evaluateIdleStopGuard({
       runtime: runtime({ hasOpenToolCall: true }),
       sessionStartedAt: now - config.hardCapMs - 1,
+      startedBy: 'daemon',
       now,
       config,
     })).toMatchObject({ allow: false, guard: 'open-tool-call' });

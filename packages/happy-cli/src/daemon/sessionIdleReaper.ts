@@ -230,8 +230,12 @@ export function evaluateIdleStopGuard(input: {
    *  (e.g. tmux) session by triggering the 'switch' RPC, and that case loses
    *  local protection here. It is still covered by the hard blocks above
    *  (thinking / open tool call / pending user input) and by the
-   *  recent-user-interaction floor, and any stop is a resumable SIGTERM. */
-  startedBy?: TrackedSession['startedBy'];
+   *  recent-user-interaction floor, and any stop is a resumable SIGTERM.
+   *
+   *  Required (not optional) so a future edit that drops the argument at the
+   *  call site fails to compile, instead of silently reverting to treating
+   *  every daemon-spawned session as protectable local state. */
+  startedBy: TrackedSession['startedBy'];
   now: number;
   config: IdleStopGuardConfig;
 }): IdleStopGuardDecision {
