@@ -966,6 +966,7 @@ export async function startDaemon(): Promise<void> {
               runtime: session.runtime,
               sessionStartedAt: sessionStartTimes.get(pid),
               daemonStartedAt,
+              startedBy: session.startedBy,
               now: Date.now(),
               config: idleStopGuardConfig,
             });
@@ -1222,6 +1223,7 @@ export async function startDaemon(): Promise<void> {
           sessionStartTimes,
           stopSession,
           emptyReaperMs: emptySessionReaperMs,
+          batchMax: idleReaperConfig.batchMax,
           logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
         });
       }
@@ -1237,6 +1239,7 @@ export async function startDaemon(): Promise<void> {
           ...(idleReaperConfig.idleAfterMs !== undefined ? { idleAfterMs: idleReaperConfig.idleAfterMs } : {}),
           ...(idleReaperConfig.presenceStaleMs !== undefined ? { presenceStaleMs: idleReaperConfig.presenceStaleMs } : {}),
           ...(idleReaperConfig.turnEndReaperMs !== undefined ? { turnEndReaperMs: idleReaperConfig.turnEndReaperMs } : {}),
+          batchMax: idleReaperConfig.batchMax,
           logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
         });
       }

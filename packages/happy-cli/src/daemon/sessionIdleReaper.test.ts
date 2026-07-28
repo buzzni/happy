@@ -7,6 +7,7 @@ import {
   DEFAULT_IDLE_STOP_PRESENCE_STALE_MS,
   DEFAULT_IDLE_STOP_RECENT_INTERACTION_MS,
   DEFAULT_SESSION_EMPTY_REAPER_MS,
+  DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX,
   DEFAULT_SESSION_TURN_END_REAPER_MS,
   buildDaemonSessionIdleReaperRequest,
   evaluateIdleStopGuard,
@@ -239,7 +240,31 @@ describe('readDaemonSessionIdleReaperConfig', () => {
       disabled: false,
       idleAfterMs: DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS,
       turnEndReaperMs: DEFAULT_SESSION_TURN_END_REAPER_MS,
+      batchMax: DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX,
     });
+  });
+
+  it('allows env to override the per-tick stop batch cap', () => {
+    expect(readDaemonSessionIdleReaperConfig({
+      HAPPY_DAEMON_SESSION_IDLE_REAPER_BATCH_MAX: '25',
+    })).toMatchObject({
+      batchMax: 25,
+    });
+  });
+
+  it('ignores a batch cap that would stop nothing, rather than silently disabling cleanup', () => {
+    // A cap of 0 (or negative/garbage) would make every tick a no-op — a
+    // silent, total disabling of the reaper. Use the dedicated
+    // HAPPY_DAEMON_SESSION_IDLE_REAPER_DISABLED knob for that instead.
+    for (const value of ['0', '-1', 'abc', '']) {
+      expect(readDaemonSessionIdleReaperConfig({
+        HAPPY_DAEMON_SESSION_IDLE_REAPER_BATCH_MAX: value,
+      })).toMatchObject({ batchMax: DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX });
+    }
+    // Fractional counts round down to a whole number of sessions.
+    expect(readDaemonSessionIdleReaperConfig({
+      HAPPY_DAEMON_SESSION_IDLE_REAPER_BATCH_MAX: '2.7',
+    })).toMatchObject({ batchMax: 2 });
   });
 
   it('allows env to override the idle threshold', () => {
@@ -327,6 +352,7 @@ describe('runDaemonSessionIdleReaperTick', () => {
       stoppedSessions: 1,
       skippedActiveSessions: 0,
       noopSessions: 2,
+      deferredSessions: 0,
     });
   });
 
@@ -395,6 +421,87 @@ describe('runDaemonSessionIdleReaperTick', () => {
     expect(stopSession).toHaveBeenNthCalledWith(2, 'legacy', { source: 'session-idle-reaper', reason: 'absolute-idle-cut', mode: 'if-idle' });
   });
 
+  it('caps the number of sessions stopped per tick, deferring the rest to the next tick', async () => {
+    const stopSession = vi.fn(() => ({ stopped: true as const }));
+    const logDebug = vi.fn();
+
+    const result = await runDaemonSessionIdleReaperTick({
+      machineId: 'machine-1',
+      serverUrl: 'https://aplus.example.com',
+      credentialsToken: 'token-1',
+      now: 20_000,
+      idleAfterMs: 10_000,
+      batchMax: 2,
+      sessionStartTimes: new Map([[100, 1_000], [101, 1_000], [102, 1_000]]),
+      trackedSessions: [
+        tracked({ pid: 100, happySessionId: 'a' }),
+        tracked({ pid: 101, happySessionId: 'b' }),
+        tracked({ pid: 102, happySessionId: 'c' }),
+      ],
+      stopSession,
+      logDebug,
+      postCandidates: vi.fn(async () => ({
+        checkedAt: 20_000,
+        candidates: [
+          { sessionId: 'a', projectId: 'p', machineId: 'machine-1', lastActiveAt: 1_000, idleMs: 19_000 },
+          { sessionId: 'b', projectId: 'p', machineId: 'machine-1', lastActiveAt: 1_000, idleMs: 19_000 },
+          { sessionId: 'c', projectId: 'p', machineId: 'machine-1', lastActiveAt: 1_000, idleMs: 19_000 },
+        ],
+      })),
+    });
+
+    expect(stopSession).toHaveBeenCalledTimes(2);
+    expect(stopSession).toHaveBeenCalledWith('a', expect.anything());
+    expect(stopSession).toHaveBeenCalledWith('b', expect.anything());
+    expect(result).toEqual({
+      requestedSessions: 3,
+      candidateSessions: 3,
+      stoppedSessions: 2,
+      skippedActiveSessions: 0,
+      noopSessions: 0,
+      deferredSessions: 1,
+    });
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('deferred=1'));
+  });
+
+  it('does not let guard-refused candidates consume the stop budget', async () => {
+    // The server cannot see local guard denials, so it keeps returning the
+    // same refused candidates every tick. If the cap counted attempts rather
+    // than actual stops, a block of permanently-refused candidates at the head
+    // of the list would starve every reapable session behind them forever.
+    const stopSession = vi.fn((sessionId: string) =>
+      sessionId.startsWith('busy')
+        ? { stopped: false as const, reason: 'active' as const, guard: 'recent-user-interaction', activity: { thinking: false, hasOpenToolCall: false, pendingUserInput: false } }
+        : { stopped: true as const });
+
+    const candidateIds = ['busy-1', 'busy-2', 'busy-3', 'reapable-1', 'reapable-2'];
+    const result = await runDaemonSessionIdleReaperTick({
+      machineId: 'machine-1',
+      serverUrl: 'https://aplus.example.com',
+      credentialsToken: 'token-1',
+      now: 20_000,
+      idleAfterMs: 10_000,
+      batchMax: 2,
+      sessionStartTimes: new Map(candidateIds.map((_, i) => [100 + i, 1_000])),
+      trackedSessions: candidateIds.map((id, i) => tracked({ pid: 100 + i, happySessionId: id })),
+      stopSession,
+      postCandidates: vi.fn(async () => ({
+        checkedAt: 20_000,
+        candidates: candidateIds.map((sessionId) => ({
+          sessionId, projectId: 'p', machineId: 'machine-1', lastActiveAt: 1_000, idleMs: 19_000,
+        })),
+      })),
+    });
+
+    expect(stopSession).toHaveBeenCalledWith('reapable-1', expect.anything());
+    expect(stopSession).toHaveBeenCalledWith('reapable-2', expect.anything());
+    expect(result).toMatchObject({
+      stoppedSessions: 2,
+      skippedActiveSessions: 3,
+      deferredSessions: 0,
+    });
+  });
+
   it('does not stop sessions when the candidate request fails', async () => {
     const stopSession = vi.fn();
     const logDebug = vi.fn();
@@ -421,6 +528,7 @@ describe('runDaemonSessionIdleReaperTick', () => {
       stoppedSessions: 0,
       skippedActiveSessions: 0,
       noopSessions: 0,
+      deferredSessions: 0,
     });
   });
 });
@@ -487,6 +595,27 @@ describe('sweepEmptySessions', () => {
 
     expect(stopped).toBe(1);
     expect(stopSession).toHaveBeenCalledWith('empty', { source: 'session-empty-reaper', reason: 'never-used', mode: 'if-idle' });
+  });
+
+  it('caps how many never-used sessions it stops per sweep', () => {
+    // The empty reaper runs on the same tick as (and before) the idle reaper,
+    // and daemon-spawned sessions that were never used are exactly what the
+    // local-session guard used to protect. Without its own cap, the first tick
+    // after that guard is fixed SIGTERMs the whole backlog at once, bypassing
+    // the idle reaper's batch cap entirely.
+    const stopSession = vi.fn(() => ({ stopped: true as const }));
+    const ids = ['e1', 'e2', 'e3', 'e4', 'e5'];
+    const stopped = sweepEmptySessions({
+      trackedSessions: ids.map((id, i) => tracked({ pid: 100 + i, happySessionId: id, runtime: idleRuntime(now - 1_000) })),
+      sessionStartTimes: new Map(ids.map((_, i) => [100 + i, now - emptyReaperMs - 1])),
+      stopSession,
+      now,
+      emptyReaperMs,
+      batchMax: 2,
+    });
+
+    expect(stopped).toBe(2);
+    expect(stopSession).toHaveBeenCalledTimes(2);
   });
 
   it('leaves a session younger than the threshold alone', () => {
@@ -645,6 +774,7 @@ describe('evaluateIdleStopGuard', () => {
     expect(evaluateIdleStopGuard({
       runtime: runtime({}),
       sessionStartedAt: withinCap,
+      startedBy: 'daemon',
       now,
       config,
     })).toEqual({ allow: true });
@@ -655,7 +785,7 @@ describe('evaluateIdleStopGuard', () => {
     ['open-tool-call', runtime({ hasOpenToolCall: true })],
     ['pending-user-input', runtime({ pendingUserInput: true })],
   ] as const)('denies when %s (hard block, even for an old session)', (guard, rt) => {
-    expect(evaluateIdleStopGuard({ runtime: rt, sessionStartedAt: old, now, config }))
+    expect(evaluateIdleStopGuard({ runtime: rt, sessionStartedAt: old, startedBy: 'daemon', now, config }))
       .toEqual({ allow: false, guard, activity: expect.any(Object) });
   });
 
@@ -663,6 +793,7 @@ describe('evaluateIdleStopGuard', () => {
     const decision = evaluateIdleStopGuard({
       runtime: runtime({ lastUserInteractionAt: now - 60_000 }),
       sessionStartedAt: withinCap,
+      startedBy: 'daemon',
       now,
       config,
     });
@@ -673,6 +804,7 @@ describe('evaluateIdleStopGuard', () => {
     const decision = evaluateIdleStopGuard({
       runtime: runtime({}),
       sessionStartedAt: now - 60_000,
+      startedBy: 'daemon',
       now,
       config,
     });
@@ -683,16 +815,37 @@ describe('evaluateIdleStopGuard', () => {
     const decision = evaluateIdleStopGuard({
       runtime: runtime({ mode: 'local' }),
       sessionStartedAt: withinCap,
+      // Not daemon-spawned — e.g. a plain `happy` run in a terminal — so the
+      // local-session guard's exemption for daemon-spawned sessions must not
+      // apply here.
+      startedBy: 'terminal',
       now,
       config,
     });
     expect(decision).toMatchObject({ allow: false, guard: 'local-session' });
   });
 
+  it('does not apply local protection to a daemon-spawned session reporting mode=local', () => {
+    // Daemon-spawned sessions are always started with --happy-starting-mode
+    // remote (runClaude.ts refuses daemon+local at spawn time), so a
+    // daemon-spawned session can never have a real attached terminal. A
+    // 'local' report from one is a client-side reporting bug, not a real
+    // terminal — the local-session guard must not treat it as one.
+    const decision = evaluateIdleStopGuard({
+      runtime: runtime({ mode: 'local' }),
+      sessionStartedAt: withinCap,
+      startedBy: 'daemon',
+      now,
+      config,
+    });
+    expect(decision).toEqual({ allow: true });
+  });
+
   it('denies when the runtime report is missing or stale within the hard cap', () => {
     expect(evaluateIdleStopGuard({
       runtime: undefined,
       sessionStartedAt: now - 20 * 60 * 1000,
+      startedBy: 'daemon',
       now,
       config,
     })).toMatchObject({ allow: false, guard: 'stale-runtime' });
@@ -700,6 +853,7 @@ describe('evaluateIdleStopGuard', () => {
     expect(evaluateIdleStopGuard({
       runtime: runtime({ updatedAt: now - config.presenceStaleMs - 1 }),
       sessionStartedAt: now - 20 * 60 * 1000,
+      startedBy: 'daemon',
       now,
       config,
     })).toMatchObject({ allow: false, guard: 'stale-runtime' });
@@ -711,6 +865,7 @@ describe('evaluateIdleStopGuard', () => {
     expect(evaluateIdleStopGuard({
       runtime: runtime({ mode: 'local', updatedAt: now - config.hardCapMs - 1 }),
       sessionStartedAt: now - 3 * config.hardCapMs,
+      startedBy: 'daemon',
       now,
       config,
     })).toEqual({ allow: true });
@@ -721,6 +876,7 @@ describe('evaluateIdleStopGuard', () => {
       runtime: undefined,
       sessionStartedAt: now - 3 * config.hardCapMs,
       daemonStartedAt: now - config.hardCapMs - 1,
+      startedBy: 'daemon',
       now,
       config,
     })).toEqual({ allow: true });
@@ -733,6 +889,7 @@ describe('evaluateIdleStopGuard', () => {
     expect(evaluateIdleStopGuard({
       runtime: runtime({ lastUserInteractionAt: now - 60_000, updatedAt: now - config.presenceStaleMs - 1 }),
       sessionStartedAt: now - config.hardCapMs - 1,
+      startedBy: 'daemon',
       now,
       config,
     })).toMatchObject({ allow: false, guard: 'recent-user-interaction' });
@@ -746,6 +903,7 @@ describe('evaluateIdleStopGuard', () => {
       runtime: undefined,
       sessionStartedAt: now - 3 * config.hardCapMs,
       daemonStartedAt: now - 60_000,
+      startedBy: 'daemon',
       now,
       config,
     })).toMatchObject({ allow: false, guard: 'stale-runtime' });
@@ -755,6 +913,7 @@ describe('evaluateIdleStopGuard', () => {
     expect(evaluateIdleStopGuard({
       runtime: runtime({ lastUserInteractionAt: now - config.recentInteractionMs - 1 }),
       sessionStartedAt: now - config.hardCapMs - 1,
+      startedBy: 'daemon',
       now,
       config,
     })).toEqual({ allow: true });
@@ -764,6 +923,7 @@ describe('evaluateIdleStopGuard', () => {
     expect(evaluateIdleStopGuard({
       runtime: runtime({ hasOpenToolCall: true }),
       sessionStartedAt: now - config.hardCapMs - 1,
+      startedBy: 'daemon',
       now,
       config,
     })).toMatchObject({ allow: false, guard: 'open-tool-call' });

@@ -71,7 +71,8 @@ export async function loop(opts: LoopOptions): Promise<number> {
         onModeChange: opts.onModeChange,
         onAbort: opts.onAbort,
         hookSettingsPath: opts.hookSettingsPath,
-        jsRuntime: opts.jsRuntime
+        jsRuntime: opts.jsRuntime,
+        startingMode: opts.startingMode
     });
 
     opts.onSessionReady?.(session)
@@ -86,7 +87,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
                 switch (result.type ) {
                     case 'switch':
                         mode = 'remote';
-                        opts.onModeChange?.(mode);
+                        session.onModeChange(mode);
                         break;
                     case 'exit':
                         return result.code;
@@ -103,7 +104,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
                         return 0;
                     case 'switch':
                         mode = 'local';
-                        opts.onModeChange?.(mode);
+                        session.onModeChange(mode);
                         break;
                     default:
                         const _: never = reason satisfies never;

@@ -27,7 +27,9 @@ export class Session {
     readonly jsRuntime: JsRuntime;
 
     sessionId: string | null;
-    mode: 'local' | 'remote' = 'local';
+    /** Always assigned from opts.startingMode in the constructor — the single
+     *  place the default lives — before the first keepalive is sent. */
+    mode: 'local' | 'remote';
     thinking: boolean = false;
     
     /** Callbacks to be notified when session ID is found/changed */
@@ -55,6 +57,10 @@ export class Session {
         hookSettingsPath: string,
         /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
         jsRuntime?: JsRuntime,
+        /** Mode the run loop is starting in. Sets this.mode before the first
+         *  keepalive, so a remote session is never reported as 'local'.
+         *  Defaults to 'local' (a plain interactive terminal run). */
+        startingMode?: 'local' | 'remote',
     }) {
         this.path = opts.path;
         this.api = opts.api;
@@ -72,6 +78,7 @@ export class Session {
         this._onAbort = opts.onAbort;
         this.hookSettingsPath = opts.hookSettingsPath;
         this.jsRuntime = opts.jsRuntime ?? 'node';
+        this.mode = opts.startingMode ?? 'local';
 
         // Start keep alive
         this.client.keepAlive(this.thinking, this.mode);
