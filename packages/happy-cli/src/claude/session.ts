@@ -57,9 +57,9 @@ export class Session {
         hookSettingsPath: string,
         /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
         jsRuntime?: JsRuntime,
-        /** Mode the run loop is starting in — the single source of truth for
-         *  this.mode, so the first keepalive reports it correctly instead of
-         *  the 'local' field initializer. */
+        /** Mode the run loop is starting in. Sets this.mode before the first
+         *  keepalive, so a remote session is never reported as 'local'.
+         *  Defaults to 'local' (a plain interactive terminal run). */
         startingMode?: 'local' | 'remote',
     }) {
         this.path = opts.path;
