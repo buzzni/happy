@@ -72,6 +72,11 @@ describe('preview WS relay (live)', () => {
         // Minimal faithful mirror of previewWebSocketRelay.handleUpgrade: parse,
         // serialize, proxy-ws-open, then pipe. (Auth is covered by unit tests;
         // here we focus on the live transport + handshake.)
+        //
+        // This duplicates serializeUpgradeRequest because that lives in
+        // happy-server and cannot be imported across packages. Keep the header
+        // rewrites below in step with it — a silent divergence would leave this
+        // test green while the real relay is broken.
         const browserByTunnel = new Map<string, net.Socket>()
         const wiredSockets = new WeakSet<any>()
         function wire(ms: any) {
@@ -94,7 +99,11 @@ describe('preview WS relay (live)', () => {
             let reqBytes = `${req.method} ${subPath} HTTP/1.1\r\n`
             for (let i = 0; i + 1 < req.rawHeaders.length; i += 2) {
                 const k = req.rawHeaders[i]
-                const v = k.toLowerCase() === 'host' ? `127.0.0.1:${port}` : req.rawHeaders[i + 1]
+                const lower = k.toLowerCase()
+                const v =
+                    lower === 'host' ? `127.0.0.1:${port}` :
+                    lower === 'origin' ? `http://127.0.0.1:${port}` :
+                    req.rawHeaders[i + 1]
                 reqBytes += `${k}: ${v}\r\n`
             }
             reqBytes += '\r\n'

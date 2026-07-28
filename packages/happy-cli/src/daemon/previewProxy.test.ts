@@ -362,4 +362,96 @@ describe('proxyHttp', () => {
     // Upstream didn't compress, so no content-encoding header to forward.
     expect(result.headers['content-encoding']).toBeUndefined()
   })
+
+  // specs/preview-relay-origin-normalization — Host is already always rewritten
+  // to 127.0.0.1:{port} (the caller-supplied Host is hop-by-hop and Node fills
+  // it in from the connection target). Origin must match that same target, or
+  // dev-server CORS middlewares that compare Origin against Host (Expo's
+  // CorsMiddleware, Vite, webpack-dev-server) see a cross-origin request from
+  // the preview domain and reject it.
+  // Lowercase `origin` is the shape that actually reaches the daemon in
+  // production: happy-server builds the forwarded set from Fastify's
+  // `request.headers`, which are already lowercased.
+  it('rewrites a lowercase origin header to the loopback target', async () => {
+    let seenOrigin: string | undefined
+    const srv = await startTestServer((req, res) => {
+      seenOrigin = req.headers['origin']
+      res.writeHead(200)
+      res.end('ok')
+    })
+    stopServer = srv.stop
+
+    await proxyHttp({
+      port: srv.port,
+      method: 'GET',
+      path: '/',
+      headers: { origin: 'https://3c78fd5e-c77f-4d1e-9783-62b6df5d12ef-30003.preview.saycode.ai' },
+      bodyB64: null,
+    })
+
+    expect(seenOrigin).toBe(`http://127.0.0.1:${srv.port}`)
+  })
+
+  it('rewrites a capitalized Origin header to the loopback target', async () => {
+    let seenOrigin: string | undefined
+    const srv = await startTestServer((req, res) => {
+      seenOrigin = req.headers['origin']
+      res.writeHead(200)
+      res.end('ok')
+    })
+    stopServer = srv.stop
+
+    await proxyHttp({
+      port: srv.port,
+      method: 'GET',
+      path: '/',
+      headers: { Origin: 'https://3c78fd5e-c77f-4d1e-9783-62b6df5d12ef-30003.preview.saycode.ai' },
+      bodyB64: null,
+    })
+
+    expect(seenOrigin).toBe(`http://127.0.0.1:${srv.port}`)
+  })
+
+  // Sandboxed iframes and some redirect chains send the literal string `null`
+  // as an opaque origin. Rewriting it to loopback is the desired outcome:
+  // an opaque origin would otherwise fail every same-origin check downstream.
+  it('rewrites an opaque "null" origin to the loopback target', async () => {
+    let seenOrigin: string | undefined
+    const srv = await startTestServer((req, res) => {
+      seenOrigin = req.headers['origin']
+      res.writeHead(200)
+      res.end('ok')
+    })
+    stopServer = srv.stop
+
+    await proxyHttp({
+      port: srv.port,
+      method: 'GET',
+      path: '/',
+      headers: { origin: 'null' },
+      bodyB64: null,
+    })
+
+    expect(seenOrigin).toBe(`http://127.0.0.1:${srv.port}`)
+  })
+
+  it('does not add an Origin header when the caller sent none', async () => {
+    let sawOriginKey = false
+    const srv = await startTestServer((req, res) => {
+      sawOriginKey = Object.prototype.hasOwnProperty.call(req.headers, 'origin')
+      res.writeHead(200)
+      res.end('ok')
+    })
+    stopServer = srv.stop
+
+    await proxyHttp({
+      port: srv.port,
+      method: 'GET',
+      path: '/',
+      headers: {},
+      bodyB64: null,
+    })
+
+    expect(sawOriginKey).toBe(false)
+  })
 })

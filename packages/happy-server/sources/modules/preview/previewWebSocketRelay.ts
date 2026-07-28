@@ -158,7 +158,11 @@ function writeHttpError(socket: NetSocket, status: number, reason: string): void
  * Serialize an upgrade request back into raw HTTP/1.1 bytes for the daemon to
  * replay against the local upstream. Preserves original header order/case via
  * `rawHeaders`, but rewrites `Host` to the loopback target so name-based vhosts
- * on the dev server resolve correctly.
+ * on the dev server resolve correctly. `Origin` is rewritten the same way
+ * (specs/preview-relay-origin-normalization) — otherwise it stays the preview
+ * domain while `Host` becomes loopback, and any dev-server WS handler that
+ * compares the two (Vite/webpack HMR, Expo Metro) rejects the handshake as
+ * cross-origin.
  */
 export function serializeUpgradeRequest(
     method: string,
@@ -167,10 +171,15 @@ export function serializeUpgradeRequest(
     rawHeaders: string[],
     head: Buffer,
 ): Buffer {
+    const loopback = `127.0.0.1:${port}`;
     let lines = `${method} ${upstreamPath} HTTP/1.1\r\n`;
     for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
         const key = rawHeaders[i];
-        const value = key.toLowerCase() === 'host' ? `127.0.0.1:${port}` : rawHeaders[i + 1];
+        const lower = key.toLowerCase();
+        const value =
+            lower === 'host' ? loopback :
+            lower === 'origin' ? `http://${loopback}` :
+            rawHeaders[i + 1];
         lines += `${key}: ${value}\r\n`;
     }
     lines += '\r\n';

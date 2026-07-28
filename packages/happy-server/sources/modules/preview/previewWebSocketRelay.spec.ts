@@ -108,4 +108,29 @@ describe('serializeUpgradeRequest', () => {
         const text = bytes.toString('utf-8');
         expect(text).toContain('\r\n\r\nEARLYBYTES');
     });
+
+    // specs/preview-relay-origin-normalization — symmetric with the Host
+    // rewrite above. Host is already always rewritten to the loopback target;
+    // Origin must match it or dev-server WS upgrade handlers that compare the
+    // two (Vite/webpack HMR, Expo Metro) reject the handshake as cross-origin.
+    it('rewrites Origin to the loopback target alongside Host', () => {
+        const rawHeaders = [
+            'Host', 'preview.example.com',
+            'Origin', 'https://3c78fd5e-c77f-4d1e-9783-62b6df5d12ef-30003.preview.saycode.ai',
+            'Upgrade', 'websocket',
+            'Connection', 'Upgrade',
+        ];
+        const bytes = serializeUpgradeRequest('GET', '/ws', 30003, rawHeaders, Buffer.alloc(0));
+        const text = bytes.toString('utf-8');
+
+        expect(text).toContain('Host: 127.0.0.1:30003\r\n');
+        expect(text).toContain('Origin: http://127.0.0.1:30003\r\n');
+    });
+
+    it('does not add an Origin header when the caller sent none', () => {
+        const bytes = serializeUpgradeRequest('GET', '/ws', 3000, ['Host', 'x'], Buffer.alloc(0));
+        const text = bytes.toString('utf-8');
+
+        expect(text).not.toContain('Origin:');
+    });
 });
