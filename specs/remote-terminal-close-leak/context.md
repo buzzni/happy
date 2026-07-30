@@ -1,21 +1,21 @@
 # 원격 터미널 종료 시 PTY 프로세스 누수 수정 Context
 
-> 최종 갱신: 2026-07-30 / 상태: 구현 완료 (릴리스 미승인)
+> 최종 갱신: 2026-07-30 / 상태: 완료 — `1.1.10-aplus.79`로 릴리스됨
 > 관련 문서: [spec.md](./spec.md) / [plan.md](./plan.md) / [tasks.md](./tasks.md)
 
 ## 지금 상태
 
-Phase 1~3 완료. 브랜치 `fix/remote-terminal-pty-leak`.
+완료. PR #111 → main 병합(sync to main), 사용자 승인 후 `happy-cli-v1.1.10-aplus.79`
+태그 푸시 → CI publish 성공, npm 반영 확인.
 
-- `pnpm -C packages/happy-cli typecheck` 통과
-- 유닛 스위트 전체 통과: 149 파일 / 1363 테스트
-- 릴리스(태그 푸시 / npm publish)는 수행하지 않았다 — `AGENTS.md`의 "Happy CLI Release
-  Publisher" 정책상 사용자의 릴리스 직전 명시 승인이 필요.
+- `pnpm -C packages/happy-cli typecheck` / 유닛 149 파일 / 1363 테스트 통과
 
 ## 다음 세션 시작점
 
-이 수정이 실제 사용자 환경에 닿으려면 happy-cli 릴리스 + 데스크톱의 런타임 pin 갱신이
-필요하다. 둘 다 별도 승인 사항이므로 사용자 확인부터 할 것.
+남은 것은 **데스크톱(aplus-dev-studio-desktop) 쪽 후속**뿐:
+1. 데스크톱 런타임 pin을 `1.1.10-aplus.79`로 갱신 + DMG 릴리스 (별도 승인 절차)
+2. 사용자 머신의 실행 중 데몬 업데이트·재시작 — 재시작하면 기존 좀비도 커널 SIGHUP으로
+   전부 회수된다 (아래 "이미 쌓인 좀비 회수" 참고)
 
 ## 왜 이 버그가 존재했는가 (핵심 판단)
 
