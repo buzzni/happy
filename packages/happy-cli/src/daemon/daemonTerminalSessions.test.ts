@@ -154,7 +154,7 @@ describe('daemonTerminalSessions', () => {
             new Promise<void>((res) => b.onExit(() => res())),
         ])
 
-        const killed = killAllDaemonTerminalSessions('SIGTERM')
+        const killed = killAllDaemonTerminalSessions()
         expect(killed).toBe(2)
         expect(getDaemonTerminalSession('a')).toBeNull()
         expect(getDaemonTerminalSession('b')).toBeNull()
@@ -163,5 +163,62 @@ describe('daemonTerminalSessions', () => {
             exitsP,
             sleep(3000).then(() => { throw new Error('PTYs did not exit within 3s of killAll') }),
         ])
+    })
+
+    /**
+     * specs/remote-terminal-close-leak/ — the `node -e` fixture above dies on
+     * any signal, so it can never catch the bug that actually shipped: an
+     * interactive shell ignores SIGTERM and every teardown path here used to
+     * send exactly that. These cases use a real `/bin/bash -l`.
+     */
+    describe('interactive shell teardown', () => {
+        const shells: PtySession[] = []
+
+        afterEach(() => {
+            while (shells.length) {
+                try { shells.pop()?.kill('SIGKILL') } catch {/* gone */ }
+            }
+        })
+
+        function spawnLoginShell(): PtySession {
+            const s = createPtySession({ userId: 'u1', shell: '/bin/bash', args: ['-l'] })
+            shells.push(s)
+            return s
+        }
+
+        async function waitUntilDead(s: PtySession, ms: number): Promise<void> {
+            const end = Date.now() + ms
+            while (Date.now() < end && s.isAlive()) await sleep(25)
+        }
+
+        it.skipIf(process.platform === 'win32')(
+            'killAll actually reaps interactive login shells',
+            async () => {
+                const a = spawnLoginShell()
+                const b = spawnLoginShell()
+                addDaemonTerminalSession('a', a, { userId: 'u', idleTimeoutMs: 0 })
+                addDaemonTerminalSession('b', b, { userId: 'u', idleTimeoutMs: 0 })
+                await sleep(300) // let bash install its signal dispositions
+
+                expect(killAllDaemonTerminalSessions()).toBe(2)
+
+                await waitUntilDead(a, 1800)
+                await waitUntilDead(b, 1800)
+                expect(a.isAlive()).toBe(false)
+                expect(b.isAlive()).toBe(false)
+            },
+        )
+
+        it.skipIf(process.platform === 'win32')(
+            'idle timeout actually reaps an interactive login shell',
+            async () => {
+                const s = spawnLoginShell()
+                addDaemonTerminalSession('a', s, { userId: 'u', idleTimeoutMs: 300 })
+                await sleep(300)
+
+                await waitUntilDead(s, 2500)
+                expect(s.isAlive()).toBe(false)
+            },
+        )
     })
 })

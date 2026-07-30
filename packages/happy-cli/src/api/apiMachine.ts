@@ -795,7 +795,7 @@ export class ApiMachineClient {
             // is deferred to a future remote-terminal-detach-attach spec
             // since it requires server+daemon coordinated state for any
             // real reattach value (Phase 5 review).
-            const killed = killAllDaemonTerminalSessions('SIGTERM');
+            const killed = killAllDaemonTerminalSessions();
             if (killed > 0) {
                 logger.debug(`[API MACHINE] Killed ${killed} terminal session(s) on disconnect`);
             }
@@ -1006,9 +1006,15 @@ export class ApiMachineClient {
             const { sessionId } = msg || {};
             const entry = getDaemonTerminalSession(sessionId);
             if (!entry) return;
-            entry.session.kill('SIGTERM');
+            // terminate(), not kill('SIGTERM'): an interactive shell ignores
+            // SIGTERM, so the old close path left a live `/bin/bash -l` and its
+            // pty descriptors behind on every single terminal close
+            // (specs/remote-terminal-close-leak/). terminate() escalates to
+            // SIGKILL and holds its own reference to the child, so removing the
+            // entry below cannot cancel the teardown.
+            void entry.session.terminate();
             // onExit handler clears the entry; remove explicitly in case
-            // the kill races with reconnect.
+            // the teardown races with reconnect.
             removeDaemonTerminalSession(sessionId);
         });
 

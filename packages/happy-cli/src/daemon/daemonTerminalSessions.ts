@@ -14,6 +14,13 @@ import { type PtySession } from './remoteTerminal'
 
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1000
 
+/**
+ * Shorter graceful window for bulk teardown: the relay path is already dead at
+ * that point, so nothing the shell prints can reach anyone and there is no
+ * reason to wait out the full per-session grace.
+ */
+const DISCONNECT_GRACE_MS = 500
+
 export interface DaemonTerminalEntry {
     readonly id: string
     readonly session: PtySession
@@ -34,7 +41,7 @@ interface InternalEntry extends DaemonTerminalEntry {
 export interface AddSessionOptions {
     userId: string
     machineId?: string | null
-    /** ms with no in/out activity before SIGHUP. Defaults to 15 min. Pass 0 to disable. */
+    /** ms with no in/out activity before teardown. Defaults to 15 min. Pass 0 to disable. */
     idleTimeoutMs?: number
 }
 
@@ -52,9 +59,9 @@ function armIdleTimer(entry: InternalEntry): void {
     if (entry._idleTimeoutMs <= 0) return
     entry._idleTimer = setTimeout(() => {
         // Trust pty.onExit to fire and remove the entry from the map; if
-        // the kill races with a manual close, removeDaemonTerminalSession
-        // is idempotent.
-        try { entry.session.kill('SIGHUP') } catch {/* already gone */ }
+        // the teardown races with a manual close, removeDaemonTerminalSession
+        // and terminate() are both idempotent.
+        void entry.session.terminate()
     }, entry._idleTimeoutMs)
 }
 
@@ -93,16 +100,21 @@ export function removeDaemonTerminalSession(id: string): boolean {
     return sessions.delete(id)
 }
 
-export function killAllDaemonTerminalSessions(signal: NodeJS.Signals = 'SIGTERM'): number {
+/**
+ * Tear down every registered session. Returns how many were signalled.
+ *
+ * Deliberately takes no signal argument: callers used to pass 'SIGTERM', which
+ * interactive shells ignore outright, so this "kill all" quietly killed nothing
+ * and leaked a shell per session (specs/remote-terminal-close-leak/).
+ * `terminate()` owns the SIGHUP → SIGKILL escalation and holds its own
+ * reference to the child, so dropping the map entry here cannot cancel it.
+ */
+export function killAllDaemonTerminalSessions(): number {
     let killed = 0
     for (const [id, entry] of sessions) {
         clearIdleTimer(entry)
-        try {
-            entry.session.kill(signal)
-            killed++
-        } catch {
-            /* already dead */
-        }
+        void entry.session.terminate({ graceMs: DISCONNECT_GRACE_MS })
+        killed++
         sessions.delete(id)
     }
     return killed
