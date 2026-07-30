@@ -130,3 +130,115 @@ describe('createPtySession', () => {
         expect(Number.isInteger(s.pid)).toBe(true)
     })
 })
+
+/**
+ * specs/remote-terminal-close-leak/ — the reported leak was that closing a
+ * remote terminal left `/bin/bash -l` alive forever: every close path sent
+ * SIGTERM, and an *interactive* bash ignores SIGTERM (bash(1): "When Bash is
+ * interactive, in the absence of any traps, it ignores SIGTERM").
+ *
+ * Note the fixtures below: an interactive login shell (`-l`, no `-c`), not the
+ * `bash -c` / `node -e` children the tests above use. Non-interactive children
+ * die on SIGTERM like good citizens, which is precisely why the whole existing
+ * suite stayed green while production leaked one shell per terminal close.
+ */
+const describeUnix = process.platform === 'win32' ? describe.skip : describe
+
+describeUnix('createPtySession termination', () => {
+    const sessions: PtySession[] = []
+
+    afterEach(() => {
+        while (sessions.length) {
+            try { sessions.pop()?.kill('SIGKILL') } catch {/* gone */ }
+        }
+    })
+
+    function track<T extends PtySession>(s: T): T {
+        sessions.push(s)
+        return s
+    }
+
+    /** Interactive login shell — the exact shape the remote terminal spawns. */
+    function spawnLoginShell(): PtySession {
+        return track(createPtySession({ userId: 'u1', shell: '/bin/bash', args: ['-l'] }))
+    }
+
+    /** Traps SIGHUP too, so only SIGKILL can reap it. */
+    function spawnSignalProofShell(): PtySession {
+        return track(createPtySession({
+            userId: 'u1',
+            shell: '/bin/bash',
+            args: ['--noprofile', '--norc', '-c', "trap '' HUP TERM INT; while :; do sleep 0.05; done"],
+        }))
+    }
+
+    /** Let the shell install its signal dispositions before we signal it. */
+    async function settle(): Promise<void> {
+        await sleep(300)
+    }
+
+    async function waitUntilDead(s: PtySession, ms: number): Promise<void> {
+        const end = Date.now() + ms
+        while (Date.now() < end && s.isAlive()) await sleep(20)
+    }
+
+    it('isAlive() is true right after spawn', async () => {
+        const s = spawnLoginShell()
+        await settle()
+        expect(s.isAlive()).toBe(true)
+    })
+
+    it('an interactive login shell survives SIGTERM (the leak this spec fixes)', async () => {
+        const s = spawnLoginShell()
+        await settle()
+
+        s.kill('SIGTERM')
+        await sleep(400)
+
+        expect(s.isAlive()).toBe(true)
+    })
+
+    it('terminate() reaps an interactive login shell that ignored SIGTERM', async () => {
+        const s = spawnLoginShell()
+        await settle()
+
+        s.kill('SIGTERM') // ignored, exactly as in production
+        await sleep(200)
+        expect(s.isAlive()).toBe(true)
+
+        await s.terminate({ graceMs: 500 })
+
+        expect(s.isAlive()).toBe(false)
+    })
+
+    it('terminate() escalates to SIGKILL when SIGHUP is trapped', async () => {
+        const s = spawnSignalProofShell()
+        await settle()
+
+        await s.terminate({ graceMs: 300, killGraceMs: 2000 })
+
+        expect(s.isAlive()).toBe(false)
+    })
+
+    it('terminate() is idempotent and never rejects on an already-dead session', async () => {
+        const s = spawnLoginShell()
+        await settle()
+
+        await s.terminate({ graceMs: 500 })
+        expect(s.isAlive()).toBe(false)
+
+        // Close paths can fire twice (explicit close racing a socket disconnect).
+        await expect(s.terminate({ graceMs: 500 })).resolves.toBeUndefined()
+        expect(s.isAlive()).toBe(false)
+    })
+
+    it('kill() defaults to SIGHUP, not the ignored-by-shells SIGTERM', async () => {
+        const s = spawnLoginShell()
+        await settle()
+
+        s.kill()
+        await waitUntilDead(s, 2000)
+
+        expect(s.isAlive()).toBe(false)
+    })
+})
