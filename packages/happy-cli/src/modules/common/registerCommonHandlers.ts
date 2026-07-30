@@ -1,7 +1,7 @@
 import { logger } from '@/ui/logger';
 import { exec, ExecOptions } from 'child_process';
 import { promisify } from 'util';
-import { readFile, writeFile, readdir, stat, mkdir, rename, rm, cp } from 'fs/promises';
+import { open, readFile, writeFile, readdir, stat, mkdir, rename, rm, cp } from 'fs/promises';
 import { createHash } from 'crypto';
 import { dirname, join, basename, extname, resolve } from 'path';
 import { run as runRipgrep } from '@/modules/ripgrep/index';
@@ -17,6 +17,7 @@ import {
 } from './gitignoreWalker';
 
 const execAsync = promisify(exec);
+const READ_FILE_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
 
 // Preset matcher is immutable at runtime — one instance covers every
 // getDirectoryTree call. Gitignore rules cascade per-request from this
@@ -45,6 +46,23 @@ interface ReadFileRequest {
 interface ReadFileResponse {
     success: boolean;
     content?: string; // base64 encoded
+    error?: string;
+}
+
+interface ReadFileChunkRequest {
+    path: string;
+    offset: number;
+    length: number;
+}
+
+interface ReadFileChunkResponse {
+    success: boolean;
+    content?: string; // base64 encoded
+    offset?: number;
+    bytesRead?: number;
+    totalBytes?: number;
+    modified?: number;
+    eof?: boolean;
     error?: string;
 }
 
@@ -328,6 +346,48 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         } catch (error) {
             logger.debug('Failed to read file:', error);
             return { success: false, error: error instanceof Error ? error.message : 'Failed to read file' };
+        }
+    });
+
+    rpcHandlerManager.registerHandler<ReadFileChunkRequest, ReadFileChunkResponse>('readFileChunk', async (data) => {
+        const validation = validatePath(data.path, workingDirectory);
+        if (!validation.valid) {
+            return { success: false, error: validation.error };
+        }
+        if (!Number.isSafeInteger(data.offset) || data.offset < 0) {
+            return { success: false, error: 'Chunk offset must be a non-negative integer' };
+        }
+        if (!Number.isSafeInteger(data.length) || data.length < 1 || data.length > READ_FILE_CHUNK_MAX_BYTES) {
+            return {
+                success: false,
+                error: `Chunk length must be an integer between 1 and ${READ_FILE_CHUNK_MAX_BYTES} bytes`,
+            };
+        }
+
+        try {
+            const file = await open(validation.resolvedPath!, 'r');
+            try {
+                const stats = await file.stat();
+                const length = Math.min(data.length, Math.max(0, stats.size - data.offset));
+                const buffer = Buffer.alloc(length);
+                const { bytesRead } = length > 0
+                    ? await file.read(buffer, 0, length, data.offset)
+                    : { bytesRead: 0 };
+                return {
+                    success: true,
+                    content: buffer.subarray(0, bytesRead).toString('base64'),
+                    offset: data.offset,
+                    bytesRead,
+                    totalBytes: stats.size,
+                    modified: stats.mtimeMs,
+                    eof: data.offset + bytesRead >= stats.size,
+                };
+            } finally {
+                await file.close();
+            }
+        } catch (error) {
+            logger.debug('Failed to read file chunk:', error);
+            return { success: false, error: error instanceof Error ? error.message : 'Failed to read file chunk' };
         }
     });
 
