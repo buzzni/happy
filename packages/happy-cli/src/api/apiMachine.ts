@@ -1012,7 +1012,17 @@ export class ApiMachineClient {
             // (specs/remote-terminal-close-leak/). terminate() escalates to
             // SIGKILL and holds its own reference to the child, so removing the
             // entry below cannot cancel the teardown.
-            void entry.session.terminate();
+            //
+            // A graceful exit is already audited by the pty.onExit handler
+            // above; only log the abnormal outcomes, so a future recurrence of
+            // "close did nothing" is visible in the daemon log instead of
+            // silently accumulating shells again.
+            void entry.session.terminate().then((outcome) => {
+                if (outcome === 'exited' || outcome === 'already-gone') return;
+                logger.debug(
+                    `[REMOTE-TERMINAL] terminate session=${sessionId} pid=${entry.session.pid} outcome=${outcome}`,
+                );
+            });
             // onExit handler clears the entry; remove explicitly in case
             // the teardown races with reconnect.
             removeDaemonTerminalSession(sessionId);

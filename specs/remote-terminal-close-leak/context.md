@@ -76,6 +76,28 @@ spawned /bin/bash pid 27447
   최대 15분 좀비를 허용하는 설계다. 종료 요청의 보장을 다른 기능(잊은 세션 정리)의
   부작용에 의존시키면 안 된다.
 
+## 자체 리뷰에서 잡은 것 (구현 후)
+
+- **`process.kill(-0)` = 자기 프로세스 그룹**: `signalGroup`은 `-pid`로 신호를 보내는데
+  `-0 === 0`이고 `process.kill(0, sig)`는 **호출자 자신의 프로세스 그룹**을 대상으로 한다.
+  기존에는 최악이 SIGTERM이라 데몬이 무시했지만, 이 수정으로 SIGKILL을 보내게 되면서
+  잘못된 pid 하나가 데몬 전체를 죽일 수 있게 됐다. node-pty는 pid 0을 돌려주지 않고
+  throw하므로 실제 발생 가능성은 낮지만, blast radius가 커졌으므로
+  `Number.isInteger(pid) && pid > 0` 가드를 넣었다.
+- **`terminate(): Promise<void>`는 정직하지 않은 계약이었다**: "종료를 보장한다"면서 보장이
+  깨진 경우를 호출자가 알 방법이 없었다. 이 버그가 몇 달간 안 보인 이유가 정확히 그
+  침묵이었는데, 같은 구조를 새 API에 재생산한 셈. `TerminateOutcome`
+  (`already-gone`/`exited`/`killed`/`escaped`)을 반환하도록 바꾸고, 사용자가 직접 누른
+  close 경로에서 비정상 outcome(`killed`/`escaped`)만 데몬 로그에 남긴다. 정상 종료는
+  기존 `pty.onExit` 감사 라인이 이미 커버하므로 중복 로깅하지 않는다.
+- **일관성 판단**: idle/disconnect 경로는 outcome을 로깅하지 않는다.
+  `daemonTerminalSessions.ts`는 logger-free 모듈이라는 기존 계약을 유지하는 편이,
+  세 경로 로깅을 위해 콜백을 배선하는 것보다 낫다고 판단. 성공 종료는 모든 경로에서
+  `pty.onExit` 감사 라인으로 보인다.
+- node-pty가 **다중 `onExit` 리스너를 등록 순서대로** 호출하는지 실측 확인
+  (`order: internal,consumer`). 내부 `reaped` 플래그가 소비자 핸들러보다 먼저 세팅되므로,
+  `apiMachine`의 onExit 안에서 `isAlive()`를 호출해도 올바르게 false다.
+
 ## 함정 / 비자명한 사실
 
 - **좀비 구간**: 자식이 exit했지만 아직 reap 전이면 `process.kill(pid, 0)`이 성공한다.

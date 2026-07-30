@@ -23,6 +23,22 @@ export interface TerminateOpts {
     killGraceMs?: number
 }
 
+/**
+ * What `terminate()` actually had to do. Reported rather than swallowed: a
+ * teardown API that claims a guarantee must let the caller see when the
+ * guarantee did not hold — silence is what let the original leak run for
+ * months (specs/remote-terminal-close-leak/).
+ */
+export type TerminateOutcome =
+    /** Process was already gone before we signalled anything. */
+    | 'already-gone'
+    /** Exited on SIGHUP within the graceful window. The normal case. */
+    | 'exited'
+    /** Ignored/trapped SIGHUP; reaped by the SIGKILL escalation. */
+    | 'killed'
+    /** Still alive after SIGKILL — must never happen, must never be silent. */
+    | 'escaped'
+
 /** Default graceful window. Long enough for a shell to run its EXIT traps. */
 const DEFAULT_GRACE_MS = 2000
 const DEFAULT_KILL_GRACE_MS = 1000
@@ -68,7 +84,7 @@ export interface PtySession {
      * registry, so dropping the session from a bookkeeping map cannot cancel
      * the guarantee — which is exactly how the original leak became permanent.
      */
-    terminate(opts?: TerminateOpts): Promise<void>
+    terminate(opts?: TerminateOpts): Promise<TerminateOutcome>
     onData(cb: (chunk: string) => void): () => void
     onExit(cb: (code: number, signal: number | null) => void): () => void
 }
@@ -105,11 +121,18 @@ export function createPtySession(opts: PtySessionOpts): PtySession {
         // from `gh auth login`, npm subshells, etc.) are reaped along
         // with the shell. Falls back to single-process kill if the PG
         // is already gone (e.g. natural exit followed by explicit kill).
-        try {
-            process.kill(-pid, signal)
-        } catch {
-            try { child.kill(signal) } catch {/* already dead */ }
+        //
+        // The pid guard matters because `-0 === 0`, and process.kill(0, sig)
+        // signals *our own* process group. node-pty throws rather than handing
+        // back a zero pid, but now that this path can send SIGKILL, a bad pid
+        // would take the whole daemon down instead of being a no-op.
+        if (Number.isInteger(pid) && pid > 0) {
+            try {
+                process.kill(-pid, signal)
+                return
+            } catch {/* PG gone — fall through to the single-process kill */ }
         }
+        try { child.kill(signal) } catch {/* already dead */ }
     }
 
     const isAlive = () => {
@@ -153,15 +176,17 @@ export function createPtySession(opts: PtySessionOpts): PtySession {
             signalGroup(signal)
         },
         isAlive,
-        async terminate(terminateOpts?: TerminateOpts) {
-            if (!isAlive()) return
+        async terminate(terminateOpts?: TerminateOpts): Promise<TerminateOutcome> {
+            if (!isAlive()) return 'already-gone'
             signalGroup('SIGHUP')
-            if (await waitGone(terminateOpts?.graceMs ?? DEFAULT_GRACE_MS)) return
+            if (await waitGone(terminateOpts?.graceMs ?? DEFAULT_GRACE_MS)) return 'exited'
             // Still there: something trapped or ignored SIGHUP. SIGKILL cannot
             // be trapped, so this is the point where termination stops being a
             // request and becomes a guarantee.
             signalGroup('SIGKILL')
-            await waitGone(terminateOpts?.killGraceMs ?? DEFAULT_KILL_GRACE_MS)
+            return await waitGone(terminateOpts?.killGraceMs ?? DEFAULT_KILL_GRACE_MS)
+                ? 'killed'
+                : 'escaped'
         },
         onData(cb) {
             const sub = child.onData(cb)

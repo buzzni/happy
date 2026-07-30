@@ -108,6 +108,11 @@ export function removeDaemonTerminalSession(id: string): boolean {
  * and leaked a shell per session (specs/remote-terminal-close-leak/).
  * `terminate()` owns the SIGHUP → SIGKILL escalation and holds its own
  * reference to the child, so dropping the map entry here cannot cancel it.
+ *
+ * Outcomes are intentionally not awaited or logged here: this module stays
+ * logger-free (see the file header), and every successful teardown is already
+ * audited by the `pty.onExit` handler in apiMachine.ts. The user-initiated
+ * close path logs abnormal outcomes explicitly.
  */
 export function killAllDaemonTerminalSessions(): number {
     let killed = 0

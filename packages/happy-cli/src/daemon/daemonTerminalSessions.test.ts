@@ -171,7 +171,7 @@ describe('daemonTerminalSessions', () => {
      * interactive shell ignores SIGTERM and every teardown path here used to
      * send exactly that. These cases use a real `/bin/bash -l`.
      */
-    describe('interactive shell teardown', () => {
+    describe.skipIf(process.platform === 'win32')('interactive shell teardown', () => {
         const shells: PtySession[] = []
 
         afterEach(() => {
@@ -191,34 +191,28 @@ describe('daemonTerminalSessions', () => {
             while (Date.now() < end && s.isAlive()) await sleep(25)
         }
 
-        it.skipIf(process.platform === 'win32')(
-            'killAll actually reaps interactive login shells',
-            async () => {
-                const a = spawnLoginShell()
-                const b = spawnLoginShell()
-                addDaemonTerminalSession('a', a, { userId: 'u', idleTimeoutMs: 0 })
-                addDaemonTerminalSession('b', b, { userId: 'u', idleTimeoutMs: 0 })
-                await sleep(300) // let bash install its signal dispositions
+        it('killAll actually reaps interactive login shells', async () => {
+            const a = spawnLoginShell()
+            const b = spawnLoginShell()
+            addDaemonTerminalSession('a', a, { userId: 'u', idleTimeoutMs: 0 })
+            addDaemonTerminalSession('b', b, { userId: 'u', idleTimeoutMs: 0 })
+            await sleep(300) // let bash install its signal dispositions
 
-                expect(killAllDaemonTerminalSessions()).toBe(2)
+            expect(killAllDaemonTerminalSessions()).toBe(2)
 
-                await waitUntilDead(a, 1800)
-                await waitUntilDead(b, 1800)
-                expect(a.isAlive()).toBe(false)
-                expect(b.isAlive()).toBe(false)
-            },
-        )
+            await waitUntilDead(a, 1800)
+            await waitUntilDead(b, 1800)
+            expect(a.isAlive()).toBe(false)
+            expect(b.isAlive()).toBe(false)
+        })
 
-        it.skipIf(process.platform === 'win32')(
-            'idle timeout actually reaps an interactive login shell',
-            async () => {
-                const s = spawnLoginShell()
-                addDaemonTerminalSession('a', s, { userId: 'u', idleTimeoutMs: 300 })
-                await sleep(300)
+        it('idle timeout actually reaps an interactive login shell', async () => {
+            const s = spawnLoginShell()
+            addDaemonTerminalSession('a', s, { userId: 'u', idleTimeoutMs: 300 })
+            await sleep(300)
 
-                await waitUntilDead(s, 2500)
-                expect(s.isAlive()).toBe(false)
-            },
-        )
+            await waitUntilDead(s, 2500)
+            expect(s.isAlive()).toBe(false)
+        })
     })
 })

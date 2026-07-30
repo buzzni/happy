@@ -206,7 +206,8 @@ describeUnix('createPtySession termination', () => {
         await sleep(200)
         expect(s.isAlive()).toBe(true)
 
-        await s.terminate({ graceMs: 500 })
+        // SIGHUP is enough for a plain shell, so no SIGKILL escalation needed.
+        await expect(s.terminate({ graceMs: 500 })).resolves.toBe('exited')
 
         expect(s.isAlive()).toBe(false)
     })
@@ -215,7 +216,9 @@ describeUnix('createPtySession termination', () => {
         const s = spawnSignalProofShell()
         await settle()
 
-        await s.terminate({ graceMs: 300, killGraceMs: 2000 })
+        // The reported outcome must distinguish this from a graceful exit — a
+        // hard kill means a running job was destroyed and should be visible.
+        await expect(s.terminate({ graceMs: 300, killGraceMs: 2000 })).resolves.toBe('killed')
 
         expect(s.isAlive()).toBe(false)
     })
@@ -228,7 +231,7 @@ describeUnix('createPtySession termination', () => {
         expect(s.isAlive()).toBe(false)
 
         // Close paths can fire twice (explicit close racing a socket disconnect).
-        await expect(s.terminate({ graceMs: 500 })).resolves.toBeUndefined()
+        await expect(s.terminate({ graceMs: 500 })).resolves.toBe('already-gone')
         expect(s.isAlive()).toBe(false)
     })
 
