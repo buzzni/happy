@@ -112,9 +112,16 @@ export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePo
         return lines.join('\n')
     }
 
-    lines.push(hasRecentAuthFailure
-        ? chalk.yellow('확장이 연결을 시도했지만 예전 토큰이라 거부됐습니다. 재연결이 필요합니다.')
-        : chalk.yellow('연결된 확장이 없습니다.'))
+    // `connections` comes from *this* install's daemon. If another install
+    // owns the bridge we never got to ask anyone, so an empty list is "we
+    // don't know", not "nothing is connected".
+    if (!daemonRunning && bridgePortInUse) {
+        lines.push(chalk.yellow('연결 상태는 이 설치에서 확인할 수 없습니다 (브리지를 잡고 있는 데몬의 제어 포트를 모릅니다).'))
+    } else {
+        lines.push(hasRecentAuthFailure
+            ? chalk.yellow('확장이 연결을 시도했지만 예전 토큰이라 거부됐습니다. 재연결이 필요합니다.')
+            : chalk.yellow('연결된 확장이 없습니다.'))
+    }
     lines.push('')
     lines.push(chalk.bold('설치 방법'))
     lines.push(`  1. Chrome에서 ${chalk.cyan('chrome://extensions')} 열기 → 개발자 모드 켜기`)

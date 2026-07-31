@@ -12,6 +12,8 @@
 - [x] T4. `src/commands/browser.test.ts` — 데몬 미실행 + `bridgePortInUse: true`면 "다른 데몬이
       브리지를 잡고 있음" 안내가 출력에 포함 (R2)
 - [x] T5. `commands/browser.ts` 구현 — `formatBrowserStatus` 입력 확장 + 41777 TCP 프로브
+- [x] T16. 같은 파일 — 다른 설치가 브리지를 잡고 있으면 연결 상태를 "없음"이 아니라
+      "확인 불가"로 보고 (실측 출력에서 발견한 거짓 단정)
 
 ## Phase 2 — 프로필 선택 (R3, R4)
 

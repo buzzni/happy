@@ -99,6 +99,21 @@ describe('formatBrowserStatus', () => {
         expect(out).not.toMatch(/데몬이 실행 중이 아닙니다/)
     })
 
+    it('does not claim nothing is connected when it could not ask', () => {
+        // Connections are read from this install's daemon. When another
+        // install owns the bridge we never reached anyone to ask, so "연결된
+        // 확장이 없습니다" would be an unverified claim — and a misleading one,
+        // since an extension may well be connected to that other daemon.
+        const out = formatBrowserStatus({
+            ...base,
+            daemonRunning: false,
+            bridgePortInUse: true,
+            connections: [],
+        })
+        expect(out).not.toContain('연결된 확장이 없습니다')
+        expect(out).toMatch(/확인할 수 없|알 수 없/)
+    })
+
     it('still tells the user to start the daemon when nothing holds the bridge', () => {
         const out = formatBrowserStatus({
             ...base,
