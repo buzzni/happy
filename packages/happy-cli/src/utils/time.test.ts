@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { AxiosError, AxiosHeaders } from 'axios';
-import { createBackoff, isNonRetryableError, isSessionGoneError } from './time';
+import { createBackoff, isNonRetryableError, isSessionGoneError, SESSION_GONE_MIN_DELAY_MS, SESSION_GONE_MAX_DELAY_MS } from './time';
 
 function axiosErrorWithStatus(status: number): AxiosError {
     const err = new AxiosError('Request failed with status code ' + status);
@@ -59,7 +59,7 @@ describe('createBackoff', () => {
     // 제한 재시도로 일시적 lookup miss 를 걸러낸 뒤에만 중단한다
     // (무한 재시도 금지는 #64 그대로 유지).
     it('retries 404/410 a bounded number of times before aborting', async () => {
-        const backoff = createBackoff({ minDelay: 0, maxDelay: 0 });
+        const backoff = createBackoff({ minDelay: 0, maxDelay: 0, sessionGoneMinDelay: 0, sessionGoneMaxDelay: 0 });
         const callback = vi.fn(async () => { throw axiosErrorWithStatus(404); });
         await expect(backoff(callback)).rejects.toMatchObject({ response: { status: 404 } });
         // Default bound: 3 attempts total — enough to rule out a transient
@@ -68,7 +68,7 @@ describe('createBackoff', () => {
     });
 
     it('recovers when a transient 404 clears within the bounded retries', async () => {
-        const backoff = createBackoff({ minDelay: 0, maxDelay: 0 });
+        const backoff = createBackoff({ minDelay: 0, maxDelay: 0, sessionGoneMinDelay: 0, sessionGoneMaxDelay: 0 });
         let attempts = 0;
         const callback = vi.fn(async () => {
             attempts++;
@@ -80,10 +80,47 @@ describe('createBackoff', () => {
     });
 
     it('honors a custom sessionGoneMaxAttempts bound', async () => {
-        const backoff = createBackoff({ minDelay: 0, maxDelay: 0, sessionGoneMaxAttempts: 1 });
+        const backoff = createBackoff({ minDelay: 0, maxDelay: 0, sessionGoneMinDelay: 0, sessionGoneMaxDelay: 0, sessionGoneMaxAttempts: 1 });
         const callback = vi.fn(async () => { throw axiosErrorWithStatus(410); });
         await expect(backoff(callback)).rejects.toMatchObject({ response: { status: 410 } });
         expect(callback).toHaveBeenCalledTimes(1);
+    });
+
+    // 2026-07-31 운영 사고: 실측 재시도 창이 265ms 에 불과해(minDelay/maxDelay
+    // 를 세션-소실용으로 별도 분리하지 않고 재사용) 서버가 한순간 준 404 에도
+    // 살아있는 세션이 죽었다. 죽은 세션 3개를 직후 같은 토큰으로 재조회하면
+    // 전부 200(active=true) — 삭제가 아니라 순간적인 흔들림이었다. 세션-소실
+    // 재시도는 일반 전송 재시도(빠른 네트워크 히컵용)와 분리된, 훨씬 더 긴
+    // 기본 지연 창을 써야 한다.
+    it('exposes session-gone default delays that are far longer than the old ~265ms window', () => {
+        expect(SESSION_GONE_MIN_DELAY_MS).toBeGreaterThanOrEqual(2000);
+        expect(SESSION_GONE_MAX_DELAY_MS).toBeGreaterThan(SESSION_GONE_MIN_DELAY_MS);
+    });
+
+    it('uses the session-gone delay window (not the fast generic window) by default when retrying 404s', async () => {
+        vi.useFakeTimers();
+        // exponentialBackoffDelay draws uniformly from [0, maxDelayRet] — pin
+        // Math.random so the test isn't flaky against the low end of that range.
+        const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.9);
+        try {
+            // No overrides at all — this is exactly what apiSession.ts's shared
+            // `backoff` singleton uses in production.
+            const backoff = createBackoff({});
+            const callback = vi.fn(async () => { throw axiosErrorWithStatus(404); });
+            const result = backoff(callback).catch((e) => e);
+
+            // The old bug: all 3 attempts fit inside ~265ms. Advancing past that
+            // old window must NOT be enough to exhaust the retries now.
+            await vi.advanceTimersByTimeAsync(500);
+            expect(callback).toHaveBeenCalledTimes(1);
+
+            await vi.advanceTimersByTimeAsync(30000);
+            await expect(result).resolves.toMatchObject({ response: { status: 404 } });
+            expect(callback).toHaveBeenCalledTimes(3);
+        } finally {
+            randomSpy.mockRestore();
+            vi.useRealTimers();
+        }
     });
 
     it('still aborts immediately on other non-retryable 4xx (401/403/400)', async () => {
