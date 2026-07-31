@@ -95,6 +95,22 @@ node packages/happy-cli/bin/happy.mjs daemon start-sync &   # 재기동 → 로�
 | 나이는 실제값 유지 + 2분 유예 | 나이를 리셋하면 데몬 재시작마다 정책이 초기화돼 장수 고아가 불멸이 된다. 대신 유예로 복구 첫 틱의 무더기 SIGTERM을 막는다 | 유예 중 리핑 지연이 문제되면 `HAPPY_DAEMON_ADOPTION_GRACE_MS`로 조정 |
 | 유예를 리퍼 3곳이 아니라 가드 1곳에 | 세 리퍼가 전부 `if-idle` → `evaluateIdleStopGuard`를 통과한다. 한 곳이면 누락이 없다 | 리퍼가 가드를 우회하는 경로가 생기면 |
 
+## 셀프 리뷰에서 잡은 것 (2026-08-01, 커밋 `9c834946`)
+
+- **입양이 resume을 깨뜨림 (가장 큰 건)**: `findTrackedSessionById`는 추적 맵을
+  `sessionIdToFinishedSession`보다 **먼저** 본다. 기동 입양 경로가 `encryption`을 옮기지
+  않아서, 입양된 세션이 resume 가능한 레코드를 **가려버리고** `no stored encryption data`로
+  실패했다 — 입양하지 않느니만 못한 상태. 실측 대조군(이관 로직을 임시로 끄고 재현)으로
+  확정한 뒤, `trackAdoptedSession` 공용 헬퍼로 두 경로가 같은 장부를 쓰게 고쳤다.
+  **교훈: 추적 맵에 넣는 것은 단순 추가가 아니라 조회 우선순위를 바꾸는 행위다.**
+- **PID 충돌로 남의 세션을 조용히 추적 해제**: 추적 맵이 PID 키라, 이미 다른 세션이 쓰는
+  PID로 입양하면 덮어쓴다. `trackedPidOwner` 가드(`reason: 'pid-conflict'`) 추가,
+  기동 경로도 같은 PID 중복 claim 방지.
+- **기동 지연**: `isPidAlive`(값싼 검사)가 `getProcessStartedAt`(블로킹 `ps` spawn)보다
+  뒤에 있어, 14일치 죽은 PID마다 서브프로세스를 띄웠다. 순서 교체.
+- **`ps -o lstart=` 로케일 의존**: 비영어 `LC_TIME`에서 `Date.parse`가 NaN → "확인 불가"로
+  읽혀 기동 입양이 조용히 멈출 수 있었다. `LC_ALL=C` 고정.
+
 ## 함정 / 시도했으나 실패한 접근
 
 - **가드 유예를 하드캡 뒤에 두면 무력화된다.** 하드캡은 `return {allow:true}`인 allow-분기라,
