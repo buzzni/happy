@@ -1051,7 +1051,9 @@ export async function startDaemon(): Promise<void> {
     // to discover an ephemeral one. A bind failure (port taken) must not take
     // the daemon down — browser control is simply unavailable until restart.
     const browserBridge = new BrowserBridge({
-      authToken: await readOrCreateBrowserBridgeToken(configuration.browserBridgeTokenFile)
+      authToken: await readOrCreateBrowserBridgeToken(configuration.browserBridgeTokenFile, {
+        migrateFrom: configuration.legacyBrowserBridgeTokenFile
+      })
     });
     let stopBrowserBridge: () => Promise<void> = async () => {};
     try {

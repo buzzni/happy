@@ -82,6 +82,65 @@ describe('formatBrowserStatus', () => {
         expect(out).toContain('happy daemon start')
     })
 
+    it('says another install holds the bridge instead of "start the daemon"', () => {
+        // Ground truth: a daemon started with HAPPY_HOME_DIR set owns port
+        // 41777, so this install's state file says "not running" while the
+        // bridge is very much up. Telling the user to start a daemon here is
+        // useless — the second one cannot bind the port.
+        const out = formatBrowserStatus({
+            ...base,
+            daemonRunning: false,
+            bridgePortInUse: true,
+            connections: [],
+        })
+        expect(out).toContain('41777')
+        expect(out).toMatch(/다른 happy|다른 데몬/)
+        expect(out).toContain('happy daemon stop')
+        expect(out).not.toMatch(/데몬이 실행 중이 아닙니다/)
+    })
+
+    it('does not claim nothing is connected when it could not ask', () => {
+        // Connections are read from this install's daemon. When another
+        // install owns the bridge we never reached anyone to ask, so "연결된
+        // 확장이 없습니다" would be an unverified claim — and a misleading one,
+        // since an extension may well be connected to that other daemon.
+        const out = formatBrowserStatus({
+            ...base,
+            daemonRunning: false,
+            bridgePortInUse: true,
+            connections: [],
+        })
+        expect(out).not.toContain('연결된 확장이 없습니다')
+        expect(out).toMatch(/확인할 수 없|알 수 없/)
+    })
+
+    it('flags a running daemon that never got the bridge port', () => {
+        // run.ts logs a bind failure to debug only and comes up without a
+        // bridge. From the user's side that is indistinguishable from "the
+        // extension is not set up" — the port being free while our daemon
+        // runs is the one observable signal that this happened.
+        const out = formatBrowserStatus({
+            ...base,
+            daemonRunning: true,
+            bridgePortInUse: false,
+            connections: [],
+        })
+        expect(out).toMatch(/잡지 못했/)
+        expect(out).toContain('41777')
+        expect(out).toContain('happy daemon stop')
+    })
+
+    it('still tells the user to start the daemon when nothing holds the bridge', () => {
+        const out = formatBrowserStatus({
+            ...base,
+            daemonRunning: false,
+            bridgePortInUse: false,
+            connections: [],
+        })
+        expect(out).toMatch(/데몬이 실행 중이 아닙니다/)
+        expect(out).toContain('happy daemon start')
+    })
+
     it('mentions the port the extension must be pointed at', () => {
         const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [] })
         expect(out).toContain('41777')
