@@ -193,6 +193,32 @@ describe('BrowserBridge', () => {
                 .rejects.toMatchObject({ code: 'NO_EXTENSION_CONNECTED' })
         })
 
+        it('refuses to pick for the caller when more than one profile is connected', async () => {
+            // Ground truth for why this is an error and not a default: a Chrome
+            // profile with no open windows answered `capabilities` fine but
+            // returned zero tabs, and the arbitrary first-inserted pick meant
+            // the profile the user was actually looking at could never win.
+            connect('work')
+            connect('home')
+            await expect(bridge.request('tabs_list', {})).rejects.toMatchObject({ code: 'AMBIGUOUS_PROFILE' })
+        })
+
+        it('names the connected profiles so the caller can retry with one', async () => {
+            connect('work')
+            connect('home')
+            const error = await bridge.request('tabs_list', {}).catch((e: Error) => e)
+            expect((error as Error).message).toContain('work')
+            expect((error as Error).message).toContain('home')
+        })
+
+        it('still routes without a profile while only one is connected', async () => {
+            const only = connect('work')
+            const promise = bridge.request('tabs_list', {})
+            const sent = only.lastSent()
+            only.receive({ id: sent.id, result: 'work-tabs' })
+            await expect(promise).resolves.toBe('work-tabs')
+        })
+
         it('a reconnecting profile replaces the previous connection', () => {
             const stale = connect('work')
             connect('work')

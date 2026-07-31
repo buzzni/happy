@@ -15,12 +15,12 @@
 
 ## Phase 2 — 프로필 선택 (R3, R4)
 
-- [ ] T6. `src/daemon/browserBridge.test.ts` — 연결 2개 + profile 미지정 → `AMBIGUOUS_PROFILE`,
+- [x] T6. `src/daemon/browserBridge.test.ts` — 연결 2개 + profile 미지정 → `AMBIGUOUS_PROFILE`,
       에러 메시지에 두 프로필 이름 포함 / 연결 1개일 때는 기존대로 동작 (R3)
-- [ ] T7. `browserBridge.ts` 구현
-- [ ] T8. `src/claude/utils/browserTools.test.ts` — `profile`이 params가 아니라 라우팅 인자로
+- [x] T7. `browserBridge.ts` 구현
+- [x] T8. `src/claude/utils/browserTools.test.ts` — `profile`이 params가 아니라 라우팅 인자로
       전달되고, `AMBIGUOUS_PROFILE` 에러가 재시도 방법을 안내 (R3, R4)
-- [ ] T9. `browserTools.ts` / `startHappyServer.ts` 구현 — 모든 툴에 `profile` 인자
+- [x] T9. `browserTools.ts` / `startHappyServer.ts` 구현 — 모든 툴에 `profile` 인자
 
 ## Phase 3 — 관측 가능성 (R5, R6)
 

@@ -31,7 +31,7 @@ export interface BrowserToolResult {
     isError: boolean
 }
 
-export type BridgeRequest = (method: string, params: unknown) => Promise<unknown>
+export type BridgeRequest = (method: string, params: unknown, opts?: { profile?: string }) => Promise<unknown>
 
 const PAIRING_HINT =
     'No Chrome extension is connected to this machine\'s browser bridge. Ask the user to load the Happy Browser Bridge extension in Chrome and paste the token from ~/.happy/browser-bridge.token into its options page.'
@@ -47,6 +47,11 @@ function describeError(error: BrowserClientError): string {
             // Actionable, and clear that it is the user's call — the agent
             // cannot grant this to itself, by design.
             return `${error.message} Without it, use a normal screenshot or an untrusted click/fill, which work for most pages.`
+        case 'AMBIGUOUS_PROFILE':
+            // Naming the profiles is not enough: which one holds the user's
+            // tabs is unknowable from here (a profile with no open windows
+            // answers every command, just with nothing in it).
+            return `${error.message}. Retry with profile set to one of them — browser_tabs on each shows which Chrome profile has the tabs you want.`
         default:
             return `${error.code}: ${error.message}`
     }
@@ -113,9 +118,12 @@ export async function runBrowserTool({ request, method, params }: {
     method: BrowserBridgeMethod
     params: any
 }): Promise<BrowserToolResult> {
+    // `profile` selects which connected Chrome answers; it is not a command
+    // param, and forwarding it to the extension would be meaningless there.
+    const { profile, ...commandParams } = (params ?? {}) as Record<string, unknown>
     let result: any
     try {
-        result = await request(method, params)
+        result = await request(method, commandParams, profile === undefined ? {} : { profile: profile as string })
     } catch (error) {
         const text = error instanceof BrowserClientError
             ? describeError(error)

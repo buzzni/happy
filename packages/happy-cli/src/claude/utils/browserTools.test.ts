@@ -165,6 +165,35 @@ describe('runBrowserTool', () => {
         expect(seen).toEqual({ method: 'snapshot', params: { tabId: 42 } })
     })
 
+    it('sends profile as routing, not as a command param the extension would see', async () => {
+        // The extension has no idea what a "profile" is — it is how the daemon
+        // picks which connected Chrome to talk to.
+        let seen: unknown
+        await runBrowserTool({
+            request: async (method, params, opts) => {
+                seen = { method, params, opts }
+                return { tabs: [] }
+            },
+            method: 'snapshot',
+            params: { tabId: 42, profile: 'work' },
+        })
+        expect(seen).toEqual({ method: 'snapshot', params: { tabId: 42 }, opts: { profile: 'work' } })
+    })
+
+    it('tells the agent how to disambiguate when several profiles are connected', async () => {
+        const result = await runBrowserTool({
+            request: fails('AMBIGUOUS_PROFILE', '2 Chrome profiles are connected (work, home) — pass profile to choose one'),
+            method: 'tabs_list',
+            params: {},
+        })
+        expect(result.isError).toBe(true)
+        expect(textOf(result)).toContain('work, home')
+        // Naming the profiles is not enough — the agent has no way to know
+        // which one has the user's tabs unless it is told to go look.
+        expect(textOf(result)).toMatch(/retry/i)
+        expect(textOf(result)).toContain('browser_tabs')
+    })
+
     describe('interaction commands', () => {
         it('confirms a click in plain text', async () => {
             const result = await runBrowserTool({ request: ok({ ok: true }), method: 'click', params: { ref: '@e1' } })

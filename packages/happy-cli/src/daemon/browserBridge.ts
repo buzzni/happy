@@ -115,8 +115,21 @@ export class BrowserBridge {
     /**
      * Send a command to the extension and await its response. Targets the
      * given profile, or the only connected one when unspecified.
+     *
+     * Deliberately refuses to choose when several profiles are connected. The
+     * previous behaviour (first-inserted wins) sent every command to whichever
+     * Chrome profile happened to pair first — including one with no open
+     * windows, which answers `capabilities` happily and then reports zero tabs
+     * forever. A named error the caller can act on beats a silent wrong target.
      */
     request(method: string, params: unknown, opts: { timeoutMs?: number; profile?: string } = {}): Promise<unknown> {
+        if (!opts.profile && this.byProfile.size > 1) {
+            const names = Array.from(this.byProfile.keys()).join(', ')
+            return Promise.reject(new BridgeRequestError(
+                'AMBIGUOUS_PROFILE',
+                `${this.byProfile.size} Chrome profiles are connected (${names}) — pass profile to choose one`
+            ))
+        }
         const connection = opts.profile
             ? this.byProfile.get(opts.profile)
             : this.byProfile.values().next().value
