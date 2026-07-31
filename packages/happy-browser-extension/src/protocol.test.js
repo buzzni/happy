@@ -2,11 +2,20 @@ import { describe, it, expect } from 'vitest'
 import { handleCommand } from './protocol.js'
 
 /** Minimal stand-in for the parts of the chrome API the protocol uses. */
-function fakeChrome({ tabs = [], executeScript, captureVisibleTab, update, create, remove, allowlist, debuggerGranted = false, sendCommand } = {}) {
+function fakeChrome({ tabs = [], executeScript, captureVisibleTab, update, create, remove, allowlist, debuggerGranted = false, sendCommand, windows, profile } = {}) {
     const cdpCalls = []
     return {
         cdpCalls,
-        storage: { local: { get: async () => ({ ...(allowlist === undefined ? {} : { allowlist }), debuggerTier: debuggerGranted }) } },
+        storage: {
+            local: {
+                get: async () => ({
+                    ...(allowlist === undefined ? {} : { allowlist }),
+                    ...(profile === undefined ? {} : { profile }),
+                    debuggerTier: debuggerGranted,
+                }),
+            },
+        },
+        ...(windows === undefined ? {} : { windows: { getAll: async () => windows } }),
         debugger: {
             attach: async () => { cdpCalls.push(['attach']) },
             detach: async () => { cdpCalls.push(['detach']) },
@@ -56,6 +65,9 @@ describe('handleCommand', () => {
                     { id: 7, windowId: 1, index: 0, url: 'https://a.com', title: 'A', active: true },
                     { id: 8, windowId: 1, index: 1, url: 'https://b.com', title: 'B', active: false },
                 ],
+                profile: null,
+                windowCount: null,
+                totalTabs: 2,
             },
         })
     })
@@ -70,6 +82,55 @@ describe('handleCommand', () => {
         const response = await handleCommand({ id: 3, method: 'tabs_list' }, chrome)
         expect(response.result.tabs).toHaveLength(1)
         expect(response.result.tabs[0].id).toBe(9)
+    })
+
+    /**
+     * A Chrome profile with no open windows answers every command happily and
+     * returns an empty tab list — indistinguishable, from the agent's side,
+     * from "the user closed everything". Reporting who answered and how many
+     * windows they have is what makes that diagnosable.
+     */
+    describe('tabs_list diagnostics', () => {
+        it('names the profile that answered and how many windows it has', async () => {
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                windows: [{ id: 1 }, { id: 2 }],
+                profile: 'work',
+            })
+            const response = await handleCommand({ id: 20, method: 'tabs_list' }, chrome)
+            expect(response.result.profile).toBe('work')
+            expect(response.result.windowCount).toBe(2)
+        })
+
+        it('reports zero windows rather than looking like an empty browser', async () => {
+            const chrome = fakeChrome({ tabs: [], windows: [], profile: 'ghost' })
+            const response = await handleCommand({ id: 21, method: 'tabs_list' }, chrome)
+            expect(response.result.tabs).toEqual([])
+            expect(response.result.windowCount).toBe(0)
+        })
+
+        it('separates "no tabs" from "every tab hidden by the allowlist"', async () => {
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB, { id: 8, windowId: 1, index: 1, url: 'https://b.com', title: 'B', active: false }],
+                allowlist: 'nowhere.example',
+                windows: [{ id: 1 }],
+            })
+            const response = await handleCommand({ id: 22, method: 'tabs_list' }, chrome)
+            expect(response.result.tabs).toEqual([])
+            expect(response.result.totalTabs).toBe(2)
+        })
+
+        it('still answers when the chrome build exposes no windows API', async () => {
+            const response = await handleCommand({ id: 23, method: 'tabs_list' }, fakeChrome({ tabs: [ACTIVE_TAB] }))
+            expect(response.error).toBeUndefined()
+            expect(response.result.windowCount).toBeNull()
+            expect(response.result.profile).toBeNull()
+        })
+
+        it('capabilities names the answering profile too', async () => {
+            const response = await handleCommand({ id: 24, method: 'capabilities' }, fakeChrome({ profile: 'work' }))
+            expect(response.result.profile).toBe('work')
+        })
     })
 
     it('reports UNKNOWN_METHOD for a command it does not implement', async () => {

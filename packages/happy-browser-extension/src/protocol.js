@@ -138,6 +138,33 @@ async function runPageAction(func, args, params, chrome, allowlist, frameId = 0)
     return result
 }
 
+/**
+ * Which Chrome profile is answering, as the user named it in the options page.
+ *
+ * An extension only ever sees its own profile, so an empty tab list is
+ * ambiguous: it could be an empty browser, or the bridge talking to a profile
+ * the user has no windows open in. Reporting this is what lets the agent tell
+ * the two apart instead of insisting the browser is empty.
+ */
+async function readProfileName(chrome) {
+    try {
+        const { profile } = await chrome.storage.local.get(['profile'])
+        return profile ?? null
+    } catch {
+        return null
+    }
+}
+
+/** Null (not 0) when the API is unavailable — "unknown" is not "none". */
+async function countWindows(chrome) {
+    try {
+        const windows = await chrome.windows.getAll()
+        return windows.length
+    } catch {
+        return null
+    }
+}
+
 const handlers = {
     // Deliberately unrestricted: pairing has to be verifiable even when the
     // allowlist would block every tab, and it reveals nothing about the user.
@@ -148,6 +175,7 @@ const handlers = {
     capabilities: async (_params, chrome) => ({
         commands: Object.keys(handlers),
         debugger: await isDebuggerTierEnabled(chrome),
+        profile: await readProfileName(chrome),
     }),
 
     tabs_list: async (_params, chrome, allowlist) => {
@@ -166,6 +194,11 @@ const handlers = {
                     title: tab.title,
                     active: tab.active,
                 })),
+            profile: await readProfileName(chrome),
+            windowCount: await countWindows(chrome),
+            // Pre-allowlist count. Without it "0 tabs" reads as an empty
+            // browser even when the allowlist is hiding every one of them.
+            totalTabs: tabs.length,
         }
     },
 

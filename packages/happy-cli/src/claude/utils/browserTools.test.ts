@@ -165,6 +165,87 @@ describe('runBrowserTool', () => {
         expect(seen).toEqual({ method: 'snapshot', params: { tabId: 42 } })
     })
 
+    describe('empty tab list', () => {
+        // The whole class of bug this guards: `No open tabs.` was returned for
+        // a Chrome profile with zero windows, so the agent concluded the user's
+        // browser was empty while ten tabs sat in another profile.
+        it('says the answering profile has no windows instead of "no tabs"', async () => {
+            const result = await runBrowserTool({
+                request: ok({ tabs: [], profile: 'ghost', windowCount: 0, totalTabs: 0 }),
+                method: 'tabs_list',
+                params: {},
+            })
+            expect(textOf(result)).toContain('ghost')
+            expect(textOf(result)).toMatch(/no open windows/i)
+            expect(textOf(result)).toMatch(/different .*profile|another profile/i)
+        })
+
+        it('says so when the allowlist is what hid every tab', async () => {
+            const result = await runBrowserTool({
+                request: ok({ tabs: [], profile: 'work', windowCount: 2, totalTabs: 9 }),
+                method: 'tabs_list',
+                params: {},
+            })
+            expect(textOf(result)).toMatch(/allowlist/i)
+            expect(textOf(result)).toContain('9')
+        })
+
+        it('flags an extension being rejected for a stale token', async () => {
+            const result = await runBrowserTool({
+                request: ok({ tabs: [], profile: 'ghost', windowCount: 0, totalTabs: 0 }),
+                method: 'tabs_list',
+                params: {},
+                status: async () => ({ connections: [{ profile: 'ghost' }], hasRecentAuthFailure: true }),
+            })
+            expect(textOf(result)).toMatch(/stale|re-pair|rejected/i)
+            expect(textOf(result)).toContain('happy browser')
+        })
+
+        it('does not pay for a status lookup when tabs came back', async () => {
+            let asked = 0
+            await runBrowserTool({
+                request: ok({ tabs: [{ id: 1, url: 'https://a.com', title: 'A' }], profile: 'work', windowCount: 1, totalTabs: 1 }),
+                method: 'tabs_list',
+                params: {},
+                status: async () => {
+                    asked += 1
+                    return { connections: [], hasRecentAuthFailure: false }
+                },
+            })
+            expect(asked).toBe(0)
+        })
+
+        it('names the profile and window count alongside a normal listing', async () => {
+            const result = await runBrowserTool({
+                request: ok({ tabs: [{ id: 7, url: 'https://a.com', title: 'A', active: true }], profile: 'work', windowCount: 2, totalTabs: 1 }),
+                method: 'tabs_list',
+                params: {},
+            })
+            expect(textOf(result)).toContain('work')
+            expect(textOf(result)).toContain('https://a.com')
+        })
+    })
+
+    it('adds the stale-token diagnosis when nothing is connected at all', async () => {
+        const result = await runBrowserTool({
+            request: fails('NO_EXTENSION_CONNECTED', 'no Chrome extension is connected to the bridge'),
+            method: 'tabs_list',
+            params: {},
+            status: async () => ({ connections: [], hasRecentAuthFailure: true }),
+        })
+        expect(result.isError).toBe(true)
+        expect(textOf(result)).toMatch(/stale|rejected/i)
+    })
+
+    it('reports the answering profile in capabilities', async () => {
+        const result = await runBrowserTool({
+            request: ok({ debugger: false, commands: ['snapshot'], profile: 'work' }),
+            method: 'capabilities',
+            params: {},
+        })
+        expect(textOf(result)).toContain('work')
+    })
+
     it('sends profile as routing, not as a command param the extension would see', async () => {
         // The extension has no idea what a "profile" is — it is how the daemon
         // picks which connected Chrome to talk to.

@@ -18,7 +18,7 @@ import { createId } from "@paralleldrive/cuid2";
 import type { SessionEnvelope } from "@slopus/happy-wire";
 import { runBashStream } from "./bashStream";
 import { getActiveBashStreamCall } from "./bashStreamCallRegistry";
-import { requestBrowser, readDaemonControlPort, BrowserClientError } from "@/daemon/browserClient";
+import { requestBrowser, readDaemonControlPort, fetchBrowserStatus, BrowserClientError } from "@/daemon/browserClient";
 import { runBrowserTool, BROWSER_TOOL_NAMES, type BridgeRequest } from "./browserTools";
 
 // chat-tool-output-streaming Phase 3 — bash_stream emits its agent-side
@@ -187,6 +187,12 @@ function registerBrowserTools(mcp: McpServer): void {
         return requestBrowser({ port, method, params, ...(opts?.profile !== undefined ? { profile: opts.profile } : {}) });
     };
 
+    // Only consulted when a command comes back looking wrong (see runBrowserTool).
+    const status = async () => {
+        const port = await readDaemonControlPort();
+        return port === null ? null : fetchBrowserStatus(port);
+    };
+
     mcp.registerTool('browser_tabs', {
         description:
             "List the tabs open in the user's real Chrome on this machine (their logged-in profile, not a fresh headless browser). Use this to find the tab to work with; the returned ids can be passed as tabId to the other browser tools.",
@@ -194,7 +200,7 @@ function registerBrowserTools(mcp: McpServer): void {
         inputSchema: {
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runBrowserTool({ request: bridge, method: 'tabs_list', params: { profile: args.profile } }));
+    }, async (args) => runBrowserTool({ request: bridge, status, method: 'tabs_list', params: { profile: args.profile } }));
 
     mcp.registerTool('browser_snapshot', {
         description:
@@ -204,7 +210,7 @@ function registerBrowserTools(mcp: McpServer): void {
             tabId: z.number().optional().describe('Tab to snapshot (defaults to the active tab)'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runBrowserTool({ request: bridge, method: 'snapshot', params: { profile: args.profile, tabId: args.tabId } }));
+    }, async (args) => runBrowserTool({ request: bridge, status, method: 'snapshot', params: { profile: args.profile, tabId: args.tabId } }));
 
     mcp.registerTool('browser_screenshot', {
         description:
@@ -215,7 +221,7 @@ function registerBrowserTools(mcp: McpServer): void {
             fullPage: z.boolean().optional().describe('Capture the whole scrollable page instead of just the visible area. Needs the optional debugger permission, which only the user can enable.'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runBrowserTool({ request: bridge, method: 'screenshot', params: { profile: args.profile, tabId: args.tabId, fullPage: args.fullPage } }));
+    }, async (args) => runBrowserTool({ request: bridge, status, method: 'screenshot', params: { profile: args.profile, tabId: args.tabId, fullPage: args.fullPage } }));
 
     mcp.registerTool('browser_click', {
         description:
@@ -227,7 +233,7 @@ function registerBrowserTools(mcp: McpServer): void {
             trusted: z.boolean().optional().describe('Dispatch a real (isTrusted) mouse event instead of a scripted click. Only needed when a page ignores scripted clicks. Requires the optional debugger permission, which only the user can enable. Not supported for elements inside an iframe (a @fN:eM ref) — use a normal click there.'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runBrowserTool({ request: bridge, method: 'click', params: { profile: args.profile, ref: args.ref, tabId: args.tabId, trusted: args.trusted } }));
+    }, async (args) => runBrowserTool({ request: bridge, status, method: 'click', params: { profile: args.profile, ref: args.ref, tabId: args.tabId, trusted: args.trusted } }));
 
     mcp.registerTool('browser_fill', {
         description:
@@ -240,7 +246,7 @@ function registerBrowserTools(mcp: McpServer): void {
             trusted: z.boolean().optional().describe('Type as real (isTrusted) input instead of setting the value directly. Needed for editors that ignore scripted input. Requires the optional debugger permission, which only the user can enable. Not supported for elements inside an iframe (a @fN:eM ref) — use a normal fill there.'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runBrowserTool({ request: bridge, method: 'fill', params: { profile: args.profile, ref: args.ref, value: args.value, tabId: args.tabId, trusted: args.trusted } }));
+    }, async (args) => runBrowserTool({ request: bridge, status, method: 'fill', params: { profile: args.profile, ref: args.ref, value: args.value, tabId: args.tabId, trusted: args.trusted } }));
 
     mcp.registerTool('browser_navigate', {
         description: "Navigate a tab in the user's Chrome to a URL. This invalidates any refs from an earlier browser_snapshot of that tab — re-snapshot after navigating.",
@@ -250,7 +256,7 @@ function registerBrowserTools(mcp: McpServer): void {
             tabId: z.number().optional().describe('Tab to navigate (defaults to the active tab)'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runBrowserTool({ request: bridge, method: 'navigate', params: { profile: args.profile, url: args.url, tabId: args.tabId } }));
+    }, async (args) => runBrowserTool({ request: bridge, status, method: 'navigate', params: { profile: args.profile, url: args.url, tabId: args.tabId } }));
 
     mcp.registerTool('browser_open_tab', {
         description: "Open a new tab in the user's Chrome at a URL.",
@@ -259,7 +265,7 @@ function registerBrowserTools(mcp: McpServer): void {
             url: z.string().describe('URL to open'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runBrowserTool({ request: bridge, method: 'tabs_open', params: { profile: args.profile, url: args.url } }));
+    }, async (args) => runBrowserTool({ request: bridge, status, method: 'tabs_open', params: { profile: args.profile, url: args.url } }));
 
     mcp.registerTool('browser_capabilities', {
         description:
@@ -268,7 +274,7 @@ function registerBrowserTools(mcp: McpServer): void {
         inputSchema: {
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runBrowserTool({ request: bridge, method: 'capabilities', params: { profile: args.profile } }));
+    }, async (args) => runBrowserTool({ request: bridge, status, method: 'capabilities', params: { profile: args.profile } }));
 
     mcp.registerTool('browser_close_tab', {
         description: "Close a tab in the user's Chrome. Use browser_tabs first to find the tabId.",
@@ -277,7 +283,7 @@ function registerBrowserTools(mcp: McpServer): void {
             tabId: z.number().describe('Tab id from browser_tabs'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         },
-    }, async (args) => runBrowserTool({ request: bridge, method: 'tabs_close', params: { profile: args.profile, tabId: args.tabId } }));
+    }, async (args) => runBrowserTool({ request: bridge, status, method: 'tabs_close', params: { profile: args.profile, tabId: args.tabId } }));
 }
 
 export async function startHappyServer(client: ApiSessionClient) {

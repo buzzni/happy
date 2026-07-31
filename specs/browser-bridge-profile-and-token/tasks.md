@@ -24,10 +24,10 @@
 
 ## Phase 3 — 관측 가능성 (R5, R6)
 
-- [ ] T10. `packages/happy-browser-extension/src/protocol.test.js` — `tabs_list`가
+- [x] T10. `packages/happy-browser-extension/src/protocol.test.js` — `tabs_list`가
       `profile`/`windowCount`/`totalTabs`를 함께 반환, `chrome.windows` 없는 환경에서도 실패하지 않음 (R5)
-- [ ] T11. `protocol.js` 구현 (`tabs_list`, `capabilities`)
-- [ ] T12. `browserTools.test.ts` — 탭 0건일 때 창 0개 / allowlist 전량 차단을 구분해 안내 (R5)
-- [ ] T13. `browserTools.test.ts` — `hasRecentAuthFailure`면 재페어링 안내가 붙음 (R6)
-- [ ] T14. `browserTools.ts` / `browserClient.ts` / `startHappyServer.ts` 구현 — 상태 조회 주입
-- [ ] T15. 전체 유닛 테스트 + `typecheck` 통과, `context.md` 갱신
+- [x] T11. `protocol.js` 구현 (`tabs_list`, `capabilities`)
+- [x] T12. `browserTools.test.ts` — 탭 0건일 때 창 0개 / allowlist 전량 차단을 구분해 안내 (R5)
+- [x] T13. `browserTools.test.ts` — `hasRecentAuthFailure`면 재페어링 안내가 붙음 (R6)
+- [x] T14. `browserTools.ts` / `browserClient.ts` / `startHappyServer.ts` 구현 — 상태 조회 주입
+- [x] T15. 전체 유닛 테스트 + `typecheck` 통과, `context.md` 갱신
