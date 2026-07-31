@@ -1,27 +1,88 @@
 # 데몬 고아 세션 입양 Context
 
-> 마지막 갱신: 2026-07-31 / 상태: 구현 완료, 검증 일부 미실시
+> 마지막 갱신: 2026-08-01 / 상태: 구현 완료, 실측 검증 완료 (머지 대기)
 
 ## 지금 상태
 
 Phase 1~4 구현 완료. 유닛 스위트 1404개 전부 통과, typecheck clean.
+**로컬 격리 환경(pglite + 자체 서버, 프로덕션 미접촉)에서 실측 검증도 완료** — 아래
+"실측 검증 결과" 참조.
 
-커밋: 브랜치 `feat/daemon-orphan-adoption-clean` (워크트리 `/tmp/happy-orphan-adoption`)의
-`684260ec` 하나. main에서 갈라져 나왔고 다른 작업이 섞여 있지 않아 단독 머지 가능하다.
+커밋: 브랜치 `feat/daemon-orphan-adoption-clean`의 `684260ec`, `d9eae617`. main에서
+갈라져 나왔고 다른 작업이 섞여 있지 않아 단독 머지 가능하다.
 (중간에 `feat/daemon-orphan-adoption` 브랜치가 있으나 다른 세션의 브라우저 브릿지 작업을
 조상으로 물고 있어 폐기 대상이다 — 아래 "사고" 참조.)
 
 ## 다음 세션 시작점
 
-1. `feat/daemon-orphan-adoption`을 main에 머지 (또는 PR)
-2. **미실시 검증**: 데몬 재시작 후 실제 입양이 일어나는지 확인
-   - `daemon.integration.test.ts`에 시나리오 추가 → `integration-authenticated` 프로젝트는
-     로컬 서버 + 시드 계정을 부팅하는 환경 매니저를 요구한다. 무거워서 이번에 돌리지 않았다
-   - 대안(더 빠름): 세션 하나를 띄운 채 데몬을 SIGKILL → 재기동 → 30초 안에
-     `Adopted orphan session` 로그와 `happy doctor` / `/list`에 그 세션이 나타나는지 확인
-3. Phase 0 확증이 아직 안 왔다면 사고 호스트에서:
+1. `feat/daemon-orphan-adoption-clean`을 main에 머지 (또는 PR)
+2. Phase 0 확증이 아직 안 왔다면 사고 호스트에서:
    `grep -c "Ignoring runtime report for untracked session" ~/.happy/logs/*daemon.log`
    — 이 줄이 있으면 리포트 기반 입양(Phase 1)이 그 사고를 직접 해결했음을 확증한다
+3. (선택) `daemon.integration.test.ts`에 이번에 수동으로 확인한 시나리오를 자동화된
+   테스트로 추가 — 아래 "실측 검증 방법"이 그대로 스크립트화 가능하다
+
+## 실측 검증 결과 (2026-08-01)
+
+로컬 전용 격리 환경(`environments/environments.ts`의 `createEnvironment` +
+`startEnvironmentServices` + `seedEnvironment` — pglite 내장 DB, 랜덤 포트, 프로덕션 서버
+미접촉)에서 워크트리(`feat/daemon-orphan-adoption-clean` 체크아웃) 빌드로 데몬을 직접 띄워
+세 가지 시나리오를 확인했다.
+
+**Phase 2 (기동 시 침묵 고아 입양)** — 세션을 daemon control server에 등록(`/session-started`,
+externally-started로) → 데몬 SIGKILL → 상태파일까지 삭제(완전 유실 시나리오, SIGKILL 단독보다
+가혹한 조건) → 신 데몬 기동. 로그:
+```
+[DAEMON RUN] No previous daemon state found; any sessions left by a previous daemon must be adopted
+[DAEMON RUN] Adopted orphan session verify-orphan-startup at startup (pid 34095, startedBy happy directly - likely by user from terminal)
+[DAEMON RUN] Adopted 1 orphan session(s) left by a previous daemon
+```
+`daemon.state.json`의 `trackedSessions`에도 즉시 반영됨.
+
+**Phase 4 (T8 상태 유실 경고)** — 위 로그의 첫 줄이 정확히 이것. 이전에는 이 상황이
+완전히 침묵했다.
+
+**Phase 1 (리포트 기반 입양)** — 신 데몬에게 **persisted 기록이 전혀 없는** 새 세션ID로
+`/session-runtime`을 한 번 POST (살아있는 더미 PID를 `hostPid`로 자기신고). 로그:
+```
+[DAEMON RUN] Adopted orphan session verify-orphan-report (pid 35477, startedBy happy directly - likely by user from terminal, age 0m)
+```
+`trackedSessions`에도 즉시 반영. 리포트 하나만으로 persisted 기록 없이도 입양됨을 확인 —
+R2의 "persisted 없으면 보수적으로 external로 분류" 경로가 실동작함을 실측으로 확정.
+
+**검증하지 않은 것**: adoption-grace 유예(가드가 입양 후 2분간 정지를 막는지)는 실제
+heartbeat tick(기본 60초)을 기다려야 해서 이번엔 건너뛰었다 — 유닛 테스트
+(`sessionIdleReaper.test.ts`)로만 커버됨. Phase 3(버전 전환 스냅샷 복원)도 구 버전 데몬
+바이너리가 필요해 이번 실측에서 제외 — `handoff.test.ts`의 유닛 테스트로만 커버됨.
+
+### 실측 검증 방법 (재현 절차)
+
+```bash
+git worktree add /tmp/happy-verify feat/daemon-orphan-adoption-clean
+cd /tmp/happy-verify
+ln -s <메인체크아웃>/node_modules node_modules
+ln -s <메인체크아웃>/packages/happy-cli/node_modules packages/happy-cli/node_modules
+ln -s <메인체크아웃>/packages/happy-server/node_modules packages/happy-server/node_modules
+ln -s <메인체크아웃>/packages/happy-app/node_modules packages/happy-app/node_modules
+ln -s <메인체크아웃>/packages/happy-cli/tools/unpacked packages/happy-cli/tools/unpacked
+cd packages/happy-cli && npm run build   # dist/index.mjs 생성, bin/happy.mjs가 이걸 씀
+
+# 로컬 격리 환경 생성 (pglite, 랜덤 포트, 프로덕션 미접촉)
+cd /tmp/happy-verify
+export PATH="$PWD/packages/happy-server/node_modules/.bin:$PATH"   # tsx
+./packages/happy-cli/node_modules/.bin/tsx <<'TS' 스크립트로 createEnvironment/startEnvironmentServices/seedEnvironment 호출
+# seedEnvironment가 이 워크트리의 bin/happy.mjs로 데몬을 이미 하나 띄워준다
+
+# 세션 등록 (더미 프로세스를 PID로 사용)
+sleep 3600 & DUMMY_PID=$!
+curl -X POST http://127.0.0.1:<daemon httpPort>/session-started \
+  -d '{"sessionId":"x","metadata":{"path":"/tmp","host":"h","hostPid":'$DUMMY_PID'},"encryption":{...더미...}}'
+
+kill -9 <daemon pid>; rm daemon.state.json   # 완전 유실 시나리오
+source environments/data/envs/<name>/env.sh
+node packages/happy-cli/bin/happy.mjs daemon start-sync &   # 재기동 → 로그 확인
+```
+정리: 더미 프로세스 kill, `stopEnvironment`+`removeEnvironment` 호출, `git worktree remove`.
 
 ## 결정과 이유
 
