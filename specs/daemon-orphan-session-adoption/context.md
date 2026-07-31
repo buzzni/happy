@@ -6,11 +6,10 @@
 
 Phase 1~4 구현 완료. 유닛 스위트 1404개 전부 통과, typecheck clean.
 
-**커밋은 두 곳에 나뉘어 있다** (아래 "사고" 참조):
-- `main`의 `7531ff37`, `899826a1` — spec/plan/tasks 3개 문서 + T1(프로토콜 hostPid) +
-  T2(`orphanAdoption.ts` + 테스트). 다른 세션의 커밋에 섞여 들어갔다.
-- 브랜치 `feat/daemon-orphan-adoption` (워크트리 `/tmp/happy-orphan-adoption`) —
-  `4b019569`(T3-T4), `3c675b1c`(T5-T6), `f68a8815`(T7-T8).
+커밋: 브랜치 `feat/daemon-orphan-adoption-clean` (워크트리 `/tmp/happy-orphan-adoption`)의
+`684260ec` 하나. main에서 갈라져 나왔고 다른 작업이 섞여 있지 않아 단독 머지 가능하다.
+(중간에 `feat/daemon-orphan-adoption` 브랜치가 있으나 다른 세션의 브라우저 브릿지 작업을
+조상으로 물고 있어 폐기 대상이다 — 아래 "사고" 참조.)
 
 ## 다음 세션 시작점
 
