@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import packageJson from '../package.json'
+import { resolveBrowserBridgeTokenFile } from './daemon/browserBridgeToken'
 
 class Configuration {
   // serverUrl/webappUrl 은 생성 시 env>settings>default 로 정해지지만,
@@ -26,6 +27,8 @@ class Configuration {
   public readonly daemonLockFile: string
   public readonly portRegistryFile: string
   public readonly browserBridgeTokenFile: string
+  /** Pre-machine-wide location of the same token; adopted once, then unused. */
+  public readonly legacyBrowserBridgeTokenFile: string | null
   public readonly sessionsFile: string
   public readonly currentCliVersion: string
 
@@ -52,7 +55,11 @@ class Configuration {
     this.daemonStateFile = join(this.happyHomeDir, 'daemon.state.json')
     this.daemonLockFile = join(this.happyHomeDir, 'daemon.state.json.lock')
     this.portRegistryFile = join(this.happyHomeDir, 'port-registry.json')
-    this.browserBridgeTokenFile = join(this.happyHomeDir, 'browser-bridge.token')
+    // Machine-wide, not HAPPY_HOME_DIR-scoped: the bridge it authenticates
+    // binds one fixed port per machine (browserBridgeToken.ts).
+    const bridgeToken = resolveBrowserBridgeTokenFile({ homeDir: homedir(), happyHomeDir: this.happyHomeDir })
+    this.browserBridgeTokenFile = bridgeToken.tokenFile
+    this.legacyBrowserBridgeTokenFile = bridgeToken.migrateFrom
     this.sessionsFile = join(this.happyHomeDir, 'sessions.json')
 
     // URL precedence (both): HAPPY_*_URL env > settings.<key> > default.
