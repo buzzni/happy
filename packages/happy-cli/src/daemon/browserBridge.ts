@@ -134,7 +134,14 @@ export class BrowserBridge {
             ? this.byProfile.get(opts.profile)
             : this.byProfile.values().next().value
         if (!connection) {
-            return Promise.reject(new BridgeRequestError('NO_EXTENSION_CONNECTED', 'no Chrome extension is connected to the bridge'))
+            // Naming what *is* connected turns "nothing is connected" (false,
+            // and unactionable, when the caller simply named the wrong
+            // profile) into something the caller can correct on its own.
+            const connected = Array.from(this.byProfile.keys())
+            const detail = opts.profile && connected.length > 0
+                ? `no Chrome extension is connected for profile "${opts.profile}" (connected: ${connected.join(', ')})`
+                : 'no Chrome extension is connected to the bridge'
+            return Promise.reject(new BridgeRequestError('NO_EXTENSION_CONNECTED', detail))
         }
 
         const id = this.nextRequestId++

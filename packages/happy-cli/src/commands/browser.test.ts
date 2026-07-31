@@ -114,6 +114,22 @@ describe('formatBrowserStatus', () => {
         expect(out).toMatch(/확인할 수 없|알 수 없/)
     })
 
+    it('flags a running daemon that never got the bridge port', () => {
+        // run.ts logs a bind failure to debug only and comes up without a
+        // bridge. From the user's side that is indistinguishable from "the
+        // extension is not set up" — the port being free while our daemon
+        // runs is the one observable signal that this happened.
+        const out = formatBrowserStatus({
+            ...base,
+            daemonRunning: true,
+            bridgePortInUse: false,
+            connections: [],
+        })
+        expect(out).toMatch(/잡지 못했/)
+        expect(out).toContain('41777')
+        expect(out).toContain('happy daemon stop')
+    })
+
     it('still tells the user to start the daemon when nothing holds the bridge', () => {
         const out = formatBrowserStatus({
             ...base,

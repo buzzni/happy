@@ -33,3 +33,14 @@
 - [x] T13. `browserTools.test.ts` — `hasRecentAuthFailure`면 재페어링 안내가 붙음 (R6)
 - [x] T14. `browserTools.ts` / `browserClient.ts` / `startHappyServer.ts` 구현 — 상태 조회 주입
 - [x] T15. 전체 유닛 테스트 + `typecheck` 통과, `context.md` 갱신
+
+## Phase 4 — 셀프 리뷰에서 나온 수정
+
+- [x] T17. `browserBridge.ts` — 지정한 프로필이 없을 때 "연결된 확장 없음" 대신
+      실제 연결된 프로필 이름을 알려줌 (거짓 진술 제거)
+- [x] T18. `commands/browser.ts` — 데몬은 떠 있는데 브리지 포트를 못 잡은 경우를 보고
+      (run.ts가 bind 실패를 debug 로그로만 남기는 침묵 실패)
+- [x] T19. `commands/browser.ts` — `bridgePortInUse`를 3-state(참/거짓/미조사)로 바꿔
+      조사하지 않은 것을 "포트 사용 중"으로 단정하지 않도록
+- [x] T20. `commands/browser.ts` — 중복된 `fetchBridgeStatus` 제거,
+      `browserClient.fetchBrowserStatus` 재사용

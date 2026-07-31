@@ -193,6 +193,16 @@ describe('BrowserBridge', () => {
                 .rejects.toMatchObject({ code: 'NO_EXTENSION_CONNECTED' })
         })
 
+        it('names what is connected when the requested profile is not', async () => {
+            // "no extension is connected" is false and unactionable when one
+            // is — the caller just named the wrong profile and needs to see
+            // the real names to fix its own call.
+            connect('work')
+            const error = await bridge.request('tabs_list', {}, { profile: 'home' }).catch((e: Error) => e)
+            expect((error as Error).message).toContain('home')
+            expect((error as Error).message).toContain('work')
+        })
+
         it('refuses to pick for the caller when more than one profile is connected', async () => {
             // Ground truth for why this is an error and not a default: a Chrome
             // profile with no open windows answered `capabilities` fine but

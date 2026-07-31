@@ -15,6 +15,7 @@ import { configuration } from '@/configuration'
 import { readDaemonState } from '@/persistence'
 import { projectPath } from '@/projectPath'
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken'
+import { fetchBrowserStatus } from '@/daemon/browserClient'
 import { DEFAULT_BROWSER_BRIDGE_PORT } from '@/daemon/browserBridgeServer'
 import { computeChromeExtensionId } from './browserExtensionId'
 
@@ -62,11 +63,12 @@ export interface BrowserStatusInput {
      */
     hasRecentAuthFailure: boolean
     /**
-     * Something is listening on the bridge port even though this install's
-     * daemon state says nothing is running — i.e. a daemon started under a
-     * different HAPPY_HOME_DIR owns the bridge. "Start the daemon" is the
-     * wrong advice then: the second daemon cannot bind the port, so it would
-     * come up with no bridge at all.
+     * Whether anything is listening on the bridge port, or undefined when it
+     * was not probed. Combined with `daemonRunning` it separates two silent
+     * failures: another install's daemon owning the bridge (port in use while
+     * ours is down — "start the daemon" would be useless, the second one
+     * cannot bind), and our daemon having failed to bind it (port free while
+     * ours is up — no extension can ever reach it).
      */
     bridgePortInUse?: boolean
 }
@@ -75,13 +77,21 @@ function autoConnectLink(extensionId: string, token: string, bridgePort: number)
     return `chrome-extension://${extensionId}/src/options.html?token=${token}&port=${bridgePort}`
 }
 
-export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePort, daemonRunning, connections, hasRecentAuthFailure, bridgePortInUse = false }: BrowserStatusInput): string {
+export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePort, daemonRunning, connections, hasRecentAuthFailure, bridgePortInUse }: BrowserStatusInput): string {
     const lines: string[] = ['', chalk.bold('Happy Browser Bridge'), '']
 
-    if (!daemonRunning && bridgePortInUse) {
+    if (!daemonRunning && bridgePortInUse === true) {
         lines.push(chalk.yellow(`이 설치의 데몬은 떠 있지 않지만, 다른 happy 설치의 데몬이 브리지 포트 ${bridgePort}을 잡고 있습니다.`))
         lines.push(chalk.dim('  토큰은 머신 공용이라 아래 값이 맞습니다. 다만 그 데몬이 예전 빌드라면 옛 토큰을 검증할 수 있습니다.'))
         lines.push(chalk.dim('  연결이 계속 거부되면 그 데몬을 재시작하세요:'))
+        lines.push(`  ${chalk.cyan('happy daemon stop && happy daemon start')}`)
+        lines.push('')
+    } else if (daemonRunning && bridgePortInUse === false) {
+        // The daemon comes up even when the bridge fails to bind (run.ts logs
+        // it to debug and moves on), so nothing else tells the user that no
+        // extension can ever connect to this daemon.
+        lines.push(chalk.yellow(`데몬은 실행 중이지만 브리지 포트 ${bridgePort}를 잡지 못했습니다. 확장은 이 데몬에 연결할 수 없습니다.`))
+        lines.push(chalk.dim('  다른 데몬이 먼저 포트를 잡았다가 종료된 경우입니다. 재시작하면 잡습니다:'))
         lines.push(`  ${chalk.cyan('happy daemon stop && happy daemon start')}`)
         lines.push('')
     } else if (!daemonRunning) {
@@ -115,7 +125,7 @@ export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePo
     // `connections` comes from *this* install's daemon. If another install
     // owns the bridge we never got to ask anyone, so an empty list is "we
     // don't know", not "nothing is connected".
-    if (!daemonRunning && bridgePortInUse) {
+    if (!daemonRunning && bridgePortInUse === true) {
         lines.push(chalk.yellow('연결 상태는 이 설치에서 확인할 수 없습니다 (브리지를 잡고 있는 데몬의 제어 포트를 모릅니다).'))
     } else {
         lines.push(hasRecentAuthFailure
@@ -138,19 +148,6 @@ export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePo
     lines.push('')
 
     return lines.join('\n')
-}
-
-async function fetchBridgeStatus(httpPort: number): Promise<{ connections: Array<{ profile: string }>; hasRecentAuthFailure: boolean }> {
-    try {
-        const response = await fetch(`http://127.0.0.1:${httpPort}/browser/status`, {
-            signal: AbortSignal.timeout(2000),
-        })
-        if (!response.ok) return { connections: [], hasRecentAuthFailure: false }
-        const body = await response.json() as { connections?: Array<{ profile: string }>; hasRecentAuthFailure?: boolean }
-        return { connections: body.connections ?? [], hasRecentAuthFailure: body.hasRecentAuthFailure ?? false }
-    } catch {
-        return { connections: [], hasRecentAuthFailure: false }
-    }
 }
 
 /**
@@ -194,9 +191,9 @@ export async function handleBrowserCommand(args: string[]): Promise<void> {
 
     const state = await readDaemonState()
     const daemonRunning = Boolean(state?.httpPort)
-    const { connections, hasRecentAuthFailure } = daemonRunning
-        ? await fetchBridgeStatus(state!.httpPort!)
-        : { connections: [], hasRecentAuthFailure: false }
+    const { connections, hasRecentAuthFailure } = (daemonRunning
+        ? await fetchBrowserStatus(state!.httpPort!)
+        : null) ?? { connections: [], hasRecentAuthFailure: false }
 
     const extensionDir = resolveExtensionDir()
 
@@ -208,6 +205,6 @@ export async function handleBrowserCommand(args: string[]): Promise<void> {
         daemonRunning,
         connections,
         hasRecentAuthFailure,
-        bridgePortInUse: daemonRunning ? true : await isBridgePortInUse(DEFAULT_BROWSER_BRIDGE_PORT),
+        bridgePortInUse: await isBridgePortInUse(DEFAULT_BROWSER_BRIDGE_PORT),
     }))
 }

@@ -73,7 +73,7 @@ GET /browser/status → {"connections":[{"profile":"profile2"}],"hasRecentAuthFa
 
 ## 발견된 문제 (이번 범위 밖)
 
-- `packages/happy-cli/src/daemon/run.ts`는 브리지 bind 실패를 debug 로그로만 남긴다. 두 번째
-  데몬은 브리지 없이 조용히 뜬다 — 사용자에게 보이는 신호가 없다.
+- ~~`run.ts`의 브리지 bind 실패가 침묵한다~~ → T18에서 `happy browser`가 "데몬은 떠 있는데
+  포트를 못 잡음"을 보고하도록 처리. 데몬 자체의 로그/상태 노출은 여전히 debug 로그뿐이다.
 - 확장 옵션의 기본 프로필 이름이 과거 설치에서는 리터럴 `default`로 저장돼 있다(랜덤 접미사
   도입 이전). 서로 다른 두 프로필이 같은 이름이면 지금도 소켓을 번갈아 뺏는다.
