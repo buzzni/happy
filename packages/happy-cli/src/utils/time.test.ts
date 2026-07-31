@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { AxiosError, AxiosHeaders } from 'axios';
-import { createBackoff, isNonRetryableError, isSessionGoneError, SESSION_GONE_MIN_DELAY_MS, SESSION_GONE_MAX_DELAY_MS } from './time';
+import { backoff, createBackoff, isNonRetryableError, isSessionGoneError, SESSION_GONE_MIN_DELAY_MS, SESSION_GONE_MAX_DELAY_MS } from './time';
 
 function axiosErrorWithStatus(status: number): AxiosError {
     const err = new AxiosError('Request failed with status code ' + status);
@@ -103,9 +103,9 @@ describe('createBackoff', () => {
         // Math.random so the test isn't flaky against the low end of that range.
         const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.9);
         try {
-            // No overrides at all — this is exactly what apiSession.ts's shared
-            // `backoff` singleton uses in production.
-            const backoff = createBackoff({});
+            // Exercise the actual exported singleton apiSession.ts/InvalidateSync
+            // use in production (only `onError` overridden), not a fresh
+            // createBackoff({}) that could silently drift from it.
             const callback = vi.fn(async () => { throw axiosErrorWithStatus(404); });
             const result = backoff(callback).catch((e) => e);
 
