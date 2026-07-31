@@ -61,6 +61,20 @@ export type BackoffFunc = <T>(callback: () => Promise<T>) => Promise<T>;
  */
 export const SESSION_GONE_MAX_ATTEMPTS = 3;
 
+/**
+ * Default delay window for session-gone-class (404/410) retries, kept
+ * separate from the generic transient-retry window (minDelay 250 /
+ * maxDelay 1000, tuned for fast network hiccups).
+ *
+ * 2026-07-31 incident: with the generic window reused for 404/410, all 3
+ * bounded attempts fit inside ~265ms of wall-clock time. Three sessions were
+ * killed by a 404 that, re-queried moments later with the same token, came
+ * back 200 (active=true) — the "session gone" signal was a momentary blip,
+ * not a deletion, and 265ms wasn't enough time for it to clear.
+ */
+export const SESSION_GONE_MIN_DELAY_MS = 2000;
+export const SESSION_GONE_MAX_DELAY_MS = 8000;
+
 export function createBackoff(
     opts?: {
         onError?: (e: any, failuresCount: number) => void,
@@ -77,7 +91,16 @@ export function createBackoff(
          * Total attempts allowed for session-gone-class errors (404/410)
          * before aborting. Defaults to {@link SESSION_GONE_MAX_ATTEMPTS}.
          */
-        sessionGoneMaxAttempts?: number
+        sessionGoneMaxAttempts?: number,
+        /**
+         * Delay window used between session-gone-class (404/410) retries.
+         * Defaults to {@link SESSION_GONE_MIN_DELAY_MS} / {@link SESSION_GONE_MAX_DELAY_MS}
+         * — deliberately much longer than minDelay/maxDelay, which are tuned
+         * for fast transient network retries, not for waiting out a
+         * replica/LB blip on a resource-gone signal.
+         */
+        sessionGoneMinDelay?: number,
+        sessionGoneMaxDelay?: number
     }): BackoffFunc {
     return async <T>(callback: () => Promise<T>): Promise<T> => {
         let currentFailureCount = 0;
@@ -88,6 +111,12 @@ export function createBackoff(
         const sessionGoneMaxAttempts = opts && opts.sessionGoneMaxAttempts !== undefined
             ? opts.sessionGoneMaxAttempts
             : SESSION_GONE_MAX_ATTEMPTS;
+        const sessionGoneMinDelay = opts && opts.sessionGoneMinDelay !== undefined
+            ? opts.sessionGoneMinDelay
+            : SESSION_GONE_MIN_DELAY_MS;
+        const sessionGoneMaxDelay = opts && opts.sessionGoneMaxDelay !== undefined
+            ? opts.sessionGoneMaxDelay
+            : SESSION_GONE_MAX_DELAY_MS;
         while (true) {
             try {
                 return await callback();
@@ -104,7 +133,7 @@ export function createBackoff(
                 // deleted-row, account-mismatch, and transient lookup miss.
                 if (isNonRetryable(e)) {
                     if (isSessionGoneError(e) && currentFailureCount < sessionGoneMaxAttempts) {
-                        await delay(exponentialBackoffDelay(currentFailureCount, minDelay, maxDelay, maxFailureCount));
+                        await delay(exponentialBackoffDelay(currentFailureCount, sessionGoneMinDelay, sessionGoneMaxDelay, sessionGoneMaxAttempts));
                         continue;
                     }
                     logger.debug(`[BACKOFF] non-retryable error, aborting after ${currentFailureCount} attempt(s):`, (e as Error)?.message || e);
