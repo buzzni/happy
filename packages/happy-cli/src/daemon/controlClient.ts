@@ -102,7 +102,13 @@ export async function notifyDaemonSessionRuntime(
     mode?: 'local' | 'remote';
   }
 ): Promise<{ error?: string } | any> {
-  return daemonPost('/session-runtime', { sessionId, ...runtime });
+  // Announce our own PID on every report. `daemonPost` re-reads daemon.state.json
+  // each call, so this report reaches whichever daemon is current — including one
+  // that replaced the daemon that spawned us and therefore has no record of this
+  // session. hostPid is what lets that daemon adopt us instead of dropping the
+  // report; taking the PID from a persisted record instead would risk acting on a
+  // recycled PID.
+  return daemonPost('/session-runtime', { sessionId, ...runtime, hostPid: process.pid });
 }
 
 export async function listDaemonSessions(): Promise<any[]> {

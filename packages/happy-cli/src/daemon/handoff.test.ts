@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { handoffToReplacedBundle, prepareDaemonStartup } from './handoff'
+import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff'
 
 describe('prepareDaemonStartup', () => {
   it('does not inspect or stop the running daemon when candidate preflight fails', async () => {
@@ -38,6 +38,42 @@ describe('prepareDaemonStartup', () => {
 
     expect(result).toBe('start')
     expect(events).toEqual(['preflight', 'version-check', 'stop'])
+  })
+})
+
+describe('resolveStatePreservation', () => {
+  const withSessions = {
+    pid: 1094,
+    httpPort: 42001,
+    startTime: 'x',
+    startedWithCliVersion: '1.1.9',
+    state: 'running' as const,
+    trackedSessions: [{ pid: 117331, startedBy: 'daemon', startedAt: 1 }],
+  }
+
+  // Daemons at or below 1.1.9 unlink the state file when told to stop, taking
+  // their live children's only record with them. That code runs inside the OLD
+  // process, so the replacement can't fix it there — it has to restore the
+  // snapshot it took before asking the old daemon to die.
+  it('restores the pre-stop snapshot when the old daemon deleted the state file', () => {
+    expect(resolveStatePreservation({ before: withSessions, after: null }))
+      .toEqual({ ...withSessions, state: 'stopped' })
+  })
+
+  it('leaves a state file the old daemon preserved alone', () => {
+    const after = { ...withSessions, state: 'stopped' as const }
+    expect(resolveStatePreservation({ before: withSessions, after })).toBeNull()
+  })
+
+  it('has nothing to restore when the old daemon tracked no sessions', () => {
+    expect(resolveStatePreservation({
+      before: { ...withSessions, trackedSessions: [] },
+      after: null,
+    })).toBeNull()
+  })
+
+  it('has nothing to restore when there was no daemon to begin with', () => {
+    expect(resolveStatePreservation({ before: null, after: null })).toBeNull()
   })
 })
 

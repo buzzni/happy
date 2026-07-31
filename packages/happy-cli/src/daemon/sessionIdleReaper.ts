@@ -17,6 +17,12 @@ export const DEFAULT_SESSION_EMPTY_REAPER_MS = 15 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_MIN_SESSION_AGE_MS = 10 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_HARD_CAP_MS = 2 * 60 * 60 * 1000;
 export const DEFAULT_IDLE_STOP_PRESENCE_STALE_MS = 5 * 60 * 1000;
+/** How long a freshly adopted session is shielded from policy stops. An adopted
+ *  orphan keeps its real age, so it can qualify for the empty/idle reaps on the
+ *  first tick after adoption; one report cycle (≤30s) plus margin lets it prove
+ *  what it is first. Long enough to cover a heartbeat tick (60s), short enough
+ *  that a genuine leak isn't held for long. */
+export const DEFAULT_ADOPTION_GRACE_MS = 2 * 60 * 1000;
 /** Local guard floor: no policy stop may kill a session the user touched
  *  within this window, regardless of process age. */
 export const DEFAULT_IDLE_STOP_RECENT_INTERACTION_MS = 30 * 60 * 1000;
@@ -165,6 +171,8 @@ export type IdleStopGuardConfig = {
   hardCapMs: number;
   presenceStaleMs: number;
   protectLocalSessions: boolean;
+  /** Shield window applied after a session is adopted from a previous daemon. */
+  adoptionGraceMs: number;
 };
 
 export type IdleStopGuardActivity = {
@@ -192,6 +200,8 @@ export function readIdleStopGuardConfig(env: NodeJS.ProcessEnv = process.env): I
     presenceStaleMs: parseOptionalMs(env.HAPPY_DAEMON_SESSION_IDLE_PRESENCE_STALE_MS)
       ?? DEFAULT_IDLE_STOP_PRESENCE_STALE_MS,
     protectLocalSessions: !isExplicitlyFalse(env.HAPPY_DAEMON_SESSION_IDLE_PROTECT_LOCAL),
+    adoptionGraceMs: parseOptionalMs(env.HAPPY_DAEMON_ADOPTION_GRACE_MS)
+      ?? DEFAULT_ADOPTION_GRACE_MS,
   };
 }
 
@@ -236,10 +246,12 @@ export function evaluateIdleStopGuard(input: {
    *  call site fails to compile, instead of silently reverting to treating
    *  every daemon-spawned session as protectable local state. */
   startedBy: TrackedSession['startedBy'];
+  /** When this daemon adopted the session from a previous daemon, if it did. */
+  adoptedAt?: number;
   now: number;
   config: IdleStopGuardConfig;
 }): IdleStopGuardDecision {
-  const { runtime, sessionStartedAt, daemonStartedAt, startedBy, now, config } = input;
+  const { runtime, sessionStartedAt, daemonStartedAt, startedBy, adoptedAt, now, config } = input;
 
   const activity: IdleStopGuardActivity = {
     thinking: runtime?.thinking === true,
@@ -260,6 +272,14 @@ export function evaluateIdleStopGuard(input: {
   if (activity.lastUserInteractionAt !== undefined
     && now - activity.lastUserInteractionAt < config.recentInteractionMs) {
     return deny('recent-user-interaction');
+  }
+
+  // Must sit ahead of the hard-cap allow below: an adopted orphan carries its
+  // real age and its pre-adoption silence, so without this a session recovered
+  // from a dead daemon would be reclaimed on the tick right after adoption —
+  // the recovery would look identical to the leak it was meant to fix.
+  if (adoptedAt !== undefined && now - adoptedAt < config.adoptionGraceMs) {
+    return deny('adoption-grace');
   }
 
   const { sessionAgeMs } = activity;

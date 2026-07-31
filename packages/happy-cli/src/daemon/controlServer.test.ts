@@ -235,6 +235,7 @@ describe('controlServer POST /session-runtime', () => {
   let runtimeReports: Array<{
     sessionId: string
     runtime: { thinking?: boolean; hasOpenToolCall?: boolean; updatedAt: number }
+    reporter?: { hostPid?: number }
   }>
 
   beforeEach(async () => {
@@ -252,8 +253,8 @@ describe('controlServer POST /session-runtime', () => {
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused in this test' }),
       requestShutdown: () => {},
       onHappySessionWebhook: () => {},
-      onHappySessionRuntime: (sessionId, runtime) => {
-        runtimeReports.push({ sessionId, runtime })
+      onHappySessionRuntime: (sessionId, runtime, reporter) => {
+        runtimeReports.push({ sessionId, runtime, ...(reporter ? { reporter } : {}) })
       },
       portRegistry: registry,
     })
@@ -289,6 +290,36 @@ describe('controlServer POST /session-runtime', () => {
       },
     })
     expect(runtimeReports[0].runtime.updatedAt).toBeGreaterThan(0)
+  })
+
+  // The reporting process announces its own PID so the daemon can adopt a
+  // session it isn't tracking (orphaned by a daemon restart) without guessing
+  // the PID from a 14-day-old persisted record, which PID reuse can poison.
+  it('forwards the reporting process PID when the session sends one', async () => {
+    const res = await fetch(`${baseUrl}/session-runtime`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: 'session-1',
+        thinking: false,
+        hostPid: 4242,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(runtimeReports[0].reporter).toEqual({ hostPid: 4242 })
+  })
+
+  // Sessions from an older CLI don't send hostPid; the endpoint must still work.
+  it('accepts reports without a hostPid', async () => {
+    const res = await fetch(`${baseUrl}/session-runtime`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'session-1', thinking: false }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(runtimeReports[0].reporter).toBeUndefined()
   })
 })
 

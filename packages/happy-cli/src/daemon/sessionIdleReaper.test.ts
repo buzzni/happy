@@ -5,6 +5,7 @@ import {
   DEFAULT_IDLE_STOP_HARD_CAP_MS,
   DEFAULT_IDLE_STOP_MIN_SESSION_AGE_MS,
   DEFAULT_IDLE_STOP_PRESENCE_STALE_MS,
+  DEFAULT_ADOPTION_GRACE_MS,
   DEFAULT_IDLE_STOP_RECENT_INTERACTION_MS,
   DEFAULT_SESSION_EMPTY_REAPER_MS,
   DEFAULT_SESSION_IDLE_REAPER_BATCH_MAX,
@@ -733,6 +734,7 @@ describe('readIdleStopGuardConfig', () => {
       hardCapMs: DEFAULT_IDLE_STOP_HARD_CAP_MS,
       presenceStaleMs: DEFAULT_IDLE_STOP_PRESENCE_STALE_MS,
       protectLocalSessions: true,
+      adoptionGraceMs: DEFAULT_ADOPTION_GRACE_MS,
     });
   });
 
@@ -743,12 +745,14 @@ describe('readIdleStopGuardConfig', () => {
       HAPPY_DAEMON_SESSION_IDLE_HARD_CAP_MS: '2000',
       HAPPY_DAEMON_SESSION_IDLE_PRESENCE_STALE_MS: '3000',
       HAPPY_DAEMON_SESSION_IDLE_PROTECT_LOCAL: 'false',
+      HAPPY_DAEMON_ADOPTION_GRACE_MS: '4000',
     })).toMatchObject({
       recentInteractionMs: 500,
       minSessionAgeMs: 1000,
       hardCapMs: 2000,
       presenceStaleMs: 3000,
       protectLocalSessions: false,
+      adoptionGraceMs: 4000,
     });
   });
 });
@@ -760,6 +764,7 @@ describe('evaluateIdleStopGuard', () => {
     hardCapMs: 2 * 60 * 60 * 1000,
     presenceStaleMs: 5 * 60 * 1000,
     protectLocalSessions: true,
+    adoptionGraceMs: 2 * 60 * 1000,
   };
 
   const now = 10_000_000;
@@ -907,6 +912,54 @@ describe('evaluateIdleStopGuard', () => {
       now,
       config,
     })).toMatchObject({ allow: false, guard: 'stale-runtime' });
+  });
+
+  // An adopted orphan keeps its real age (hours or days), so it can qualify for
+  // the empty/idle reaps on the very first tick after adoption. The grace window
+  // gives it one report cycle to prove what it is before anything reclaims it.
+  it('denies a stop inside the adoption grace window', () => {
+    expect(evaluateIdleStopGuard({
+      runtime: runtime({ lastUserInteractionAt: now - config.recentInteractionMs - 1 }),
+      sessionStartedAt: now - config.hardCapMs - 1,
+      adoptedAt: now - 30_000,
+      startedBy: 'daemon',
+      now,
+      config,
+    })).toMatchObject({ allow: false, guard: 'adoption-grace' });
+  });
+
+  it('denies a stop inside the grace window even past the zombie hard cap', () => {
+    // The hard cap is an allow-branch, so the grace check has to sit in front of
+    // it — otherwise a long-silent orphan is reclaimed the instant it is adopted.
+    expect(evaluateIdleStopGuard({
+      runtime: runtime({ updatedAt: now - config.hardCapMs - 1 }),
+      sessionStartedAt: now - 3 * config.hardCapMs,
+      adoptedAt: now - 30_000,
+      startedBy: 'daemon',
+      now,
+      config,
+    })).toMatchObject({ allow: false, guard: 'adoption-grace' });
+  });
+
+  it('allows a stop once the adoption grace window has passed', () => {
+    expect(evaluateIdleStopGuard({
+      runtime: runtime({ lastUserInteractionAt: now - config.recentInteractionMs - 1 }),
+      sessionStartedAt: now - config.hardCapMs - 1,
+      adoptedAt: now - config.adoptionGraceMs - 1,
+      startedBy: 'daemon',
+      now,
+      config,
+    })).toEqual({ allow: true });
+  });
+
+  it('leaves sessions that were never adopted unaffected', () => {
+    expect(evaluateIdleStopGuard({
+      runtime: runtime({ lastUserInteractionAt: now - config.recentInteractionMs - 1 }),
+      sessionStartedAt: now - config.hardCapMs - 1,
+      startedBy: 'daemon',
+      now,
+      config,
+    })).toEqual({ allow: true });
   });
 
   it('allows a quiet old session that reports fresh runtime and no recent interaction', () => {

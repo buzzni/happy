@@ -35,7 +35,7 @@ import { preflightDaemonControlServer, startDaemonControlServer } from './contro
 import { BrowserBridge } from './browserBridge';
 import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
-import { handoffToReplacedBundle, prepareDaemonStartup } from './handoff';
+import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
 import { statSync } from 'fs';
@@ -66,6 +66,8 @@ import {
   type StopSessionContext,
   type StopSessionResult,
 } from './sessionIdleReaper';
+import { resolveOrphanAdoption, collectStartupOrphans } from './orphanAdoption';
+import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
 import { materializeSpawnBootstrapFiles } from './materializeSpawnBootstrapFiles';
@@ -178,7 +180,18 @@ export async function startDaemon(): Promise<void> {
       // (launchd/systemd, similar to OpenClaw's model), so startup/start-at-login and upgrades
       // are owned by the OS instead of by the daemon trying to replace itself in-process.
       logger.debug('[DAEMON RUN] Daemon version mismatch detected, restarting daemon with current CLI version');
+      // Snapshot before the stop: the daemon we're about to stop runs its own
+      // shutdown code, and older ones delete the state file outright — with it
+      // goes the only record of the live sessions we're inheriting.
+      const before = await readDaemonState();
       await stopDaemon();
+      const restored = resolveStatePreservation({ before, after: await readDaemonState() });
+      if (restored) {
+        writeDaemonState(restored);
+        logger.debug(
+          `[DAEMON RUN] Previous daemon removed its state file on stop; restored ${restored.trackedSessions?.length ?? 0} session record(s) for recovery`,
+        );
+      }
     },
   });
   if (startupDisposition === 'already-running') {
@@ -212,6 +225,10 @@ export async function startDaemon(): Promise<void> {
 
     // Setup state - key by PID
     const pidToTrackedSession = new Map<number, TrackedSession>();
+    // When a session was adopted from a previous daemon, keyed by PID. Feeds the
+    // idle guard's grace window — an adopted session keeps its real age, so it
+    // can be reap-eligible the instant it is adopted.
+    const pidToAdoptedAt = new Map<number, number>();
     const deadSessionsToCleanup: PersistedTrackedSession[] = [];
 
     // Recover sessions from previous daemon run
@@ -234,6 +251,12 @@ export async function startDaemon(): Promise<void> {
           logger.debug(`[DAEMON RUN] Previous session PID ${persisted.pid} is dead (sessionId: ${persisted.happySessionId || 'pending'})`);
         }
       }
+    } else if (!previousState) {
+      // Silence here used to hide the whole failure: a lost state file looks
+      // exactly like a first-ever start, so sessions orphaned by the previous
+      // daemon left no trace in the log. Adoption below still recovers them —
+      // this line is what makes the recovery visible when it happens.
+      logger.debug('[DAEMON RUN] No previous daemon state found; any sessions left by a previous daemon must be adopted');
     }
 
     // Sweep stale /tmp/happy-session-* directories from previous runs. Any
@@ -293,6 +316,35 @@ export async function startDaemon(): Promise<void> {
       persistedSessions: previousState?.trackedSessions ?? [],
       now: Date.now(),
     });
+    // Adopt live sessions the persisted store knows about but we don't. The
+    // report-driven path (onHappySessionRuntime) only catches sessions that
+    // still talk; a session whose runtime is wedged is silent forever, and
+    // nothing else would ever put it in front of the zombie sweep. Runs on
+    // every startup, not just when the previous state was lost — a partially
+    // written state file leaves the same gap.
+    try {
+      const startupOrphans = collectStartupOrphans({
+        persistedSessions: persisted,
+        trackedPids: new Set(pidToTrackedSession.keys()),
+        isPidAlive,
+        getProcessStartedAt,
+        now: Date.now(),
+      });
+      for (const orphan of startupOrphans) {
+        pidToTrackedSession.set(orphan.session.pid, orphan.session);
+        sessionStartTimes.set(orphan.session.pid, orphan.startedAt);
+        pidToAdoptedAt.set(orphan.session.pid, Date.now());
+        logger.debug(
+          `[DAEMON RUN] Adopted orphan session ${orphan.sessionId} at startup (pid ${orphan.session.pid}, startedBy ${orphan.session.startedBy})`,
+        );
+      }
+      if (startupOrphans.length > 0) {
+        logger.debug(`[DAEMON RUN] Adopted ${startupOrphans.length} orphan session(s) left by a previous daemon`);
+      }
+    } catch (e) {
+      logger.debug(`[DAEMON RUN] Startup orphan adoption failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
     const serializeTrackedSessions = (): PersistedTrackedSession[] => {
       return Array.from(pidToTrackedSession.values()).map(s => ({
         pid: s.pid,
@@ -371,6 +423,46 @@ export async function startDaemon(): Promise<void> {
       }
     };
 
+    /**
+     * Take over a live session this daemon isn't tracking. Returns the adopted
+     * session, or undefined when it can't be identified (logged, not thrown).
+     */
+    const adoptOrphanSession = (sessionId: string, hostPid?: number): TrackedSession | undefined => {
+      // Read from disk rather than the startup snapshot: the previous daemon may
+      // have written this session's record moments before it died.
+      const adoption = resolveOrphanAdoption({
+        sessionId,
+        ...(hostPid !== undefined ? { hostPid } : {}),
+        persistedSessions: readPersistedSessions(),
+        isPidAlive,
+        now: Date.now(),
+      });
+
+      if (!adoption.adopted) {
+        logger.debug(`[DAEMON RUN] Cannot adopt untracked session ${sessionId}: ${adoption.reason}`);
+        return undefined;
+      }
+
+      const { session, startedAt } = adoption;
+      // Carry over the encryption material we loaded from disk at startup so the
+      // adopted session stays resumable — without it a resume RPC fails with
+      // "not tracked by this daemon".
+      const finished = sessionIdToFinishedSession.get(sessionId);
+      if (finished?.encryption) {
+        session.encryption = finished.encryption;
+      }
+
+      const now = Date.now();
+      pidToTrackedSession.set(session.pid, session);
+      sessionStartTimes.set(session.pid, startedAt);
+      pidToAdoptedAt.set(session.pid, now);
+      persistTrackedSessions();
+      logger.debug(
+        `[DAEMON RUN] Adopted orphan session ${sessionId} (pid ${session.pid}, startedBy ${session.startedBy}, age ${Math.round((now - startedAt) / 60_000)}m)`,
+      );
+      return session;
+    };
+
     const onHappySessionRuntime = (
       sessionId: string,
       runtime: {
@@ -383,11 +475,19 @@ export async function startDaemon(): Promise<void> {
         mode?: 'local' | 'remote';
         updatedAt: number;
       },
+      reporter?: { hostPid?: number },
     ) => {
-      const trackedSession = getCurrentChildren().find(session => session.happySessionId === sessionId);
+      let trackedSession = getCurrentChildren().find(session => session.happySessionId === sessionId);
       if (!trackedSession) {
-        logger.debug(`[DAEMON RUN] Ignoring runtime report for untracked session ${sessionId}`);
-        return;
+        // A session we don't know about is reporting to us: it outlived the
+        // daemon that spawned it (version upgrade, crash, lost state file) and
+        // found us by re-reading daemon.state.json. Dropping the report leaves
+        // it untracked forever — no reaper iterates anything but this map, so
+        // not even the absolute idle cut would ever reach it.
+        trackedSession = adoptOrphanSession(sessionId, reporter?.hostPid);
+        if (!trackedSession) {
+          return;
+        }
       }
 
       const prev = trackedSession.runtime;
@@ -967,6 +1067,7 @@ export async function startDaemon(): Promise<void> {
               sessionStartedAt: sessionStartTimes.get(pid),
               daemonStartedAt,
               startedBy: session.startedBy,
+              ...(pidToAdoptedAt.has(pid) ? { adoptedAt: pidToAdoptedAt.get(pid)! } : {}),
               now: Date.now(),
               config: idleStopGuardConfig,
             });
@@ -1002,6 +1103,8 @@ export async function startDaemon(): Promise<void> {
 
           pidToTrackedSession.delete(pid);
           sessionStartTimes.delete(pid);
+
+          pidToAdoptedAt.delete(pid);
           persistTrackedSessions();
           logger.debug(`[DAEMON RUN] Removed session ${sessionId} from tracking`);
           return { stopped: true };
@@ -1021,6 +1124,7 @@ export async function startDaemon(): Promise<void> {
       }
       pidToTrackedSession.delete(pid);
       sessionStartTimes.delete(pid);
+      pidToAdoptedAt.delete(pid);
       persistTrackedSessions();
       if (tracked?.userHomeDir) {
         const homeDir = tracked.userHomeDir;
@@ -1195,6 +1299,7 @@ export async function startDaemon(): Promise<void> {
           logger.debug(`[DAEMON RUN] Removing stale session with PID ${pid} (process no longer exists)`);
           pidToTrackedSession.delete(pid);
           sessionStartTimes.delete(pid);
+          pidToAdoptedAt.delete(pid);
           sessionsPruned = true;
         }
       }
