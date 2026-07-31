@@ -23,7 +23,7 @@ export const EXTERNAL_SESSION_STARTED_BY = 'happy directly - likely by user from
 
 export type OrphanAdoptionResult =
   | { adopted: true; session: TrackedSession; startedAt: number }
-  | { adopted: false; reason: 'no-pid' | 'pid-dead' };
+  | { adopted: false; reason: 'no-pid' | 'pid-dead' | 'pid-conflict' };
 
 /**
  * Decide whether a runtime report from an untracked session should be adopted.
@@ -34,9 +34,12 @@ export function resolveOrphanAdoption(input: {
   hostPid?: number;
   persistedSessions: Record<string, PersistedSession>;
   isPidAlive: (pid: number) => boolean;
+  /** Session currently tracked under a PID, if any. The daemon's tracked map is
+   *  keyed by PID, so adopting over a claimed one would evict its owner. */
+  trackedPidOwner?: (pid: number) => string | undefined;
   now: number;
 }): OrphanAdoptionResult {
-  const { sessionId, hostPid, persistedSessions, isPidAlive, now } = input;
+  const { sessionId, hostPid, persistedSessions, isPidAlive, trackedPidOwner, now } = input;
   const persisted = persistedSessions[sessionId];
 
   // Prefer the self-announced PID: a process reporting its own pid cannot be a
@@ -47,6 +50,13 @@ export function resolveOrphanAdoption(input: {
   }
   if (!isPidAlive(pid)) {
     return { adopted: false, reason: 'pid-dead' };
+  }
+  // Adopting over another session's PID would silently drop that session from
+  // tracking — the exact leak this module exists to close. A stale persisted
+  // hostPid is the likely way to get here, so refuse rather than guess.
+  const owner = trackedPidOwner?.(pid);
+  if (owner !== undefined && owner !== sessionId) {
+    return { adopted: false, reason: 'pid-conflict' };
   }
 
   const session: TrackedSession = {
@@ -100,10 +110,17 @@ export function collectStartupOrphans(input: {
 }): StartupOrphan[] {
   const { persistedSessions, trackedPids, isPidAlive, getProcessStartedAt, now } = input;
   const orphans: StartupOrphan[] = [];
+  const claimedPids = new Set(trackedPids);
 
   for (const [sessionId, persisted] of Object.entries(persistedSessions)) {
     const pid = persisted.metadata?.hostPid;
-    if (pid === undefined || trackedPids.has(pid)) continue;
+    // claimedPids grows as we adopt: two records can name the same PID (a
+    // session re-registered under a new id in one process), and the tracked map
+    // is PID-keyed, so the second would evict the first.
+    if (pid === undefined || claimedPids.has(pid)) continue;
+    // Cheap liveness first: the store keeps records for 14 days, so most PIDs
+    // here are long dead and getProcessStartedAt blocks on a `ps` subprocess.
+    if (!isPidAlive(pid)) continue;
 
     const startedAt = getProcessStartedAt(pid);
     // A process that started after the session record was written is a
@@ -120,6 +137,7 @@ export function collectStartupOrphans(input: {
     });
     if (!adoption.adopted) continue;
 
+    claimedPids.add(pid);
     orphans.push({ sessionId, session: adoption.session, startedAt: adoption.startedAt });
   }
 

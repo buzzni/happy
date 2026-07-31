@@ -229,3 +229,71 @@ describe('collectStartupOrphans', () => {
     })).toEqual([])
   })
 })
+
+describe('resolveOrphanAdoption — PID already claimed', () => {
+  // pidToTrackedSession is keyed by PID, so adopting a session under a PID that
+  // already belongs to a different session silently evicts that session from
+  // tracking — turning the fix into the very leak it exists to prevent.
+  it('refuses a PID already tracked by a different session', () => {
+    const result = resolveOrphanAdoption({
+      sessionId: 'sess-new',
+      hostPid: 4242,
+      persistedSessions: {},
+      isPidAlive: () => true,
+      trackedPidOwner: (pid) => (pid === 4242 ? 'sess-other' : undefined),
+      now: NOW,
+    })
+
+    expect(result).toEqual({ adopted: false, reason: 'pid-conflict' })
+  })
+
+  it('allows re-adopting the same session under the same PID', () => {
+    const result = resolveOrphanAdoption({
+      sessionId: 'sess-1',
+      hostPid: 4242,
+      persistedSessions: {},
+      isPidAlive: () => true,
+      trackedPidOwner: (pid) => (pid === 4242 ? 'sess-1' : undefined),
+      now: NOW,
+    })
+
+    expect(result.adopted).toBe(true)
+  })
+})
+
+describe('collectStartupOrphans — cost and collisions', () => {
+  // Persisted records live 14 days, so most PIDs in the store are long dead.
+  // getProcessStartedAt shells out to `ps` synchronously, so probing a dead PID
+  // costs a blocking subprocess spawn during daemon startup for nothing.
+  it('does not probe process start time for a dead PID', () => {
+    const probed: number[] = []
+    collectStartupOrphans({
+      persistedSessions: { 'sess-1': persisted({ hostPid: 4242 }) },
+      trackedPids: new Set<number>(),
+      isPidAlive: () => false,
+      getProcessStartedAt: (pid) => { probed.push(pid); return NOW - 120_000 },
+      now: NOW,
+    })
+
+    expect(probed).toEqual([])
+  })
+
+  // Two records can name the same PID (e.g. a session re-registered under a new
+  // id in the same process). Adopting both would make the second overwrite the
+  // first in the PID-keyed tracked map.
+  it('claims each PID at most once', () => {
+    const savedAt = NOW - 60_000
+    const orphans = collectStartupOrphans({
+      persistedSessions: {
+        'sess-1': persisted({ hostPid: 4242, savedAt }),
+        'sess-2': persisted({ hostPid: 4242, savedAt }),
+      },
+      trackedPids: new Set<number>(),
+      isPidAlive: () => true,
+      getProcessStartedAt: () => savedAt - 1_000,
+      now: NOW,
+    })
+
+    expect(orphans).toHaveLength(1)
+  })
+})

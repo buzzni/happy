@@ -10,6 +10,8 @@ import { execFileSync } from 'node:child_process';
  *
  * `ps -o lstart=` is available on macOS and Linux and reports whole seconds,
  * which is fine here: the comparison it feeds has seconds of slack by design.
+ * It is also a blocking subprocess, so callers should filter to PIDs worth
+ * asking about (e.g. live ones) before calling it in a loop.
  */
 export function getProcessStartedAt(pid: number): number | undefined {
   try {
@@ -17,6 +19,10 @@ export function getProcessStartedAt(pid: number): number | undefined {
       encoding: 'utf-8',
       timeout: 2_000,
       stdio: ['ignore', 'pipe', 'ignore'],
+      // `lstart` prints month/day names, and Date.parse only understands the C
+      // locale's. Without this a non-English LC_TIME yields NaN, which we would
+      // read as "cannot verify" and silently stop adopting anything.
+      env: { ...process.env, LC_ALL: 'C' },
     }).trim();
     if (!output) return undefined;
 

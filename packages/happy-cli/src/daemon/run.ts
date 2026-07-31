@@ -316,6 +316,24 @@ export async function startDaemon(): Promise<void> {
       persistedSessions: previousState?.trackedSessions ?? [],
       now: Date.now(),
     });
+    /**
+     * Put an adopted session into tracking. Shared by the startup sweep and the
+     * report-driven path so both get identical bookkeeping.
+     */
+    const trackAdoptedSession = (sessionId: string, session: TrackedSession, startedAt: number) => {
+      // Carry over the encryption material loaded from disk. findTrackedSessionById
+      // prefers the tracked map over the resumable-session map, so an adopted
+      // session without it would shadow the resumable record and make resume fail
+      // with "no stored encryption data" — worse than not adopting at all.
+      const resumable = sessionIdToFinishedSession.get(sessionId);
+      if (resumable?.encryption) {
+        session.encryption = resumable.encryption;
+      }
+      pidToTrackedSession.set(session.pid, session);
+      sessionStartTimes.set(session.pid, startedAt);
+      pidToAdoptedAt.set(session.pid, Date.now());
+    };
+
     // Adopt live sessions the persisted store knows about but we don't. The
     // report-driven path (onHappySessionRuntime) only catches sessions that
     // still talk; a session whose runtime is wedged is silent forever, and
@@ -331,9 +349,7 @@ export async function startDaemon(): Promise<void> {
         now: Date.now(),
       });
       for (const orphan of startupOrphans) {
-        pidToTrackedSession.set(orphan.session.pid, orphan.session);
-        sessionStartTimes.set(orphan.session.pid, orphan.startedAt);
-        pidToAdoptedAt.set(orphan.session.pid, Date.now());
+        trackAdoptedSession(orphan.sessionId, orphan.session, orphan.startedAt);
         logger.debug(
           `[DAEMON RUN] Adopted orphan session ${orphan.sessionId} at startup (pid ${orphan.session.pid}, startedBy ${orphan.session.startedBy})`,
         );
@@ -435,6 +451,7 @@ export async function startDaemon(): Promise<void> {
         ...(hostPid !== undefined ? { hostPid } : {}),
         persistedSessions: readPersistedSessions(),
         isPidAlive,
+        trackedPidOwner: (pid) => pidToTrackedSession.get(pid)?.happySessionId,
         now: Date.now(),
       });
 
@@ -444,21 +461,10 @@ export async function startDaemon(): Promise<void> {
       }
 
       const { session, startedAt } = adoption;
-      // Carry over the encryption material we loaded from disk at startup so the
-      // adopted session stays resumable — without it a resume RPC fails with
-      // "not tracked by this daemon".
-      const finished = sessionIdToFinishedSession.get(sessionId);
-      if (finished?.encryption) {
-        session.encryption = finished.encryption;
-      }
-
-      const now = Date.now();
-      pidToTrackedSession.set(session.pid, session);
-      sessionStartTimes.set(session.pid, startedAt);
-      pidToAdoptedAt.set(session.pid, now);
+      trackAdoptedSession(sessionId, session, startedAt);
       persistTrackedSessions();
       logger.debug(
-        `[DAEMON RUN] Adopted orphan session ${sessionId} (pid ${session.pid}, startedBy ${session.startedBy}, age ${Math.round((now - startedAt) / 60_000)}m)`,
+        `[DAEMON RUN] Adopted orphan session ${sessionId} (pid ${session.pid}, startedBy ${session.startedBy}, age ${Math.round((Date.now() - startedAt) / 60_000)}m)`,
       );
       return session;
     };
@@ -1067,7 +1073,7 @@ export async function startDaemon(): Promise<void> {
               sessionStartedAt: sessionStartTimes.get(pid),
               daemonStartedAt,
               startedBy: session.startedBy,
-              ...(pidToAdoptedAt.has(pid) ? { adoptedAt: pidToAdoptedAt.get(pid)! } : {}),
+              adoptedAt: pidToAdoptedAt.get(pid),
               now: Date.now(),
               config: idleStopGuardConfig,
             });
@@ -1103,7 +1109,6 @@ export async function startDaemon(): Promise<void> {
 
           pidToTrackedSession.delete(pid);
           sessionStartTimes.delete(pid);
-
           pidToAdoptedAt.delete(pid);
           persistTrackedSessions();
           logger.debug(`[DAEMON RUN] Removed session ${sessionId} from tracking`);
