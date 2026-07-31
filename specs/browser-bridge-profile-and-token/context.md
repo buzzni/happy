@@ -1,14 +1,26 @@
 # 브라우저 브리지 — 토큰 드리프트와 프로필 오선택 수정 Context
 
-> 마지막 갱신: 2026-07-31 / 상태: 구현 완료 (배포 전)
+> 마지막 갱신: 2026-07-31 / 상태: 구현 완료 + 로컬 배포·실측 검증 완료
 > 근거 문서: [spec.md](./spec.md) / [plan.md](./plan.md) / [tasks.md](./tasks.md)
 
 ## 지금 상태
 
 Phase 1~3 구현 완료. `packages/happy-cli` 유닛 1395개, `packages/happy-browser-extension` 159개 통과,
-`tsc --noEmit` 클린. 브랜치 `fix/browser-bridge-token-and-profile`.
+`tsc --noEmit` 클린. 브랜치 `fix/browser-bridge-token-and-profile` (미푸시).
 
-**아직 배포되지 않았다.** 사용자의 실제 장애는 이 코드가 담긴 데몬이 뜰 때까지 그대로다.
+2026-07-31 로컬 전역 설치(`npm i -g` 로컬 tarball) 후 데몬 재시작으로 **실측 검증 완료**:
+`/browser/status` → `{"connections":[{"profile":"justin"}],"hasRecentAuthFailure":false}`,
+`browser_tabs`가 Gmail 포함 실제 탭 목록 반환. 재시작 시 데몬 env(HAPPY_HOME_DIR 등 8개)는
+`ps eww`로 스냅샷해 그대로 복원했다.
+
+**D4. 배포 시 공용 토큰 파일에 확장이 이미 들고 있던 값을 수동 승계.**
+`~/.happy/browser-bridge.token`에 아무도 검증하지 않는 낡은 값(`bf12…`)이 남아 있어 자동
+마이그레이션이 발동하지 않았고(=파일이 비어 있지 않음), 확장은 `~/.happy_remote`의 `7c1b…`를
+들고 있었다. 사용자가 Chrome을 만지지 않아도 되도록 공용 파일에 `7c1b…`를 써 넣고 재시작했다
+(이전 값은 `.bak-20260731`). 마이그레이션 규칙 자체는 그대로 두는 게 맞다 — "비어 있을 때만
+승계"가 아니면 유효한 토큰을 덮어쓸 수 있다.
+*재검토 조건:* 같은 상황(양쪽 파일이 모두 비어 있지 않고 서로 다름)이 다른 사용자에게서도
+보고되면, `happy browser`에 두 파일의 불일치를 감지해 알려주는 진단을 추가한다.
 
 ## 이 기능이 존재하는 이유 (실측 진단)
 
@@ -51,10 +63,13 @@ GET /browser/status → {"connections":[{"profile":"profile2"}],"hasRecentAuthFa
 
 ## 다음 세션 시작점
 
-1. `packages/happy-cli` 빌드/배포 후 데몬 재시작 → `happy browser`로 토큰 확인
-   (이제 `~/.happy`의 값이 실제 검증 토큰이어야 한다)
-2. 사용자 Chrome `Default` 프로필의 확장을 끊고, `Profile 1`에서 auto-connect 링크로 재페어링
-3. `browser_tabs`가 프로필명·창 수 헤더와 함께 탭을 반환하는지 실측 확인
+1. **확장 재로드 대기 중**: Chrome `Profile 1`은 확장을 이 저장소 경로
+   (`packages/happy-browser-extension`)에서 unpacked로 로드하고 있다. Phase 3의
+   `profile`/`windowCount`/`totalTabs` 필드는 사용자가 `chrome://extensions`에서 새로고침하거나
+   Chrome을 재시작해야 실제로 실린다. 그 전까지 툴 출력에 프로필 헤더가 안 보이는 것은 정상.
+2. 세션의 MCP 서버는 세션 시작 시점의 CLI 빌드를 쓴다 — 새 렌더링(프로필 헤더, 빈 목록 진단)은
+   **새 세션**에서 확인할 것.
+3. 브랜치 푸시 / PR은 아직 하지 않았다.
 
 ## 발견된 문제 (이번 범위 밖)
 
