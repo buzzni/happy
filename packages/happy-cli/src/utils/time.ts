@@ -17,7 +17,34 @@ export async function delay(ms: number) {
  * 408 (Request Timeout) and 429 (Too Many Requests) are 4xx but transient, so
  * they remain retryable.
  */
+/**
+ * The aplus web-ui proxy short-circuits repeated session-message 404s: once
+ * open it answers locally, byte-identical to happy-server's real
+ * `{"error":"Session not found"}`, without asking upstream at all. The only
+ * thing that tells the two apart is this header.
+ *
+ * Such a 404 carries no information about the session — it is the proxy's own
+ * state. 2026-08-01 incident: a session that returned 200 to a direct query
+ * with the same token had its CLI killed 6 times over 27 minutes, because the
+ * synthetic 404 was read as "session gone".
+ */
+const PROXY_CIRCUIT_BREAKER_HEADER = 'x-aplus-circuit-breaker';
+
+export function isProxyCircuitBreakerError(e: unknown): boolean {
+    if (!axios.isAxiosError(e)) {
+        return false;
+    }
+    const headers = e.response?.headers as Record<string, unknown> | undefined;
+    return typeof headers?.[PROXY_CIRCUIT_BREAKER_HEADER] === 'string';
+}
+
 export function isNonRetryableError(e: unknown): boolean {
+    // The proxy's block is time-bounded (minutes) and never reaches upstream,
+    // so retrying is both correct and cheap — far cheaper than tearing the
+    // session down and having the app respawn it into the same wall.
+    if (isProxyCircuitBreakerError(e)) {
+        return false;
+    }
     if (axios.isAxiosError(e)) {
         const status = e.response?.status;
         if (typeof status === 'number' && status >= 400 && status < 500) {
@@ -36,6 +63,11 @@ export function isNonRetryableError(e: unknown): boolean {
  * treat those as "the session is gone".
  */
 export function isSessionGoneError(e: unknown): boolean {
+    // A proxy-synthesized 404 never reached the session store — it must not
+    // feed the sessionUnreachable verdict either.
+    if (isProxyCircuitBreakerError(e)) {
+        return false;
+    }
     if (axios.isAxiosError(e)) {
         const status = e.response?.status;
         return status === 404 || status === 410;
