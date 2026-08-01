@@ -313,6 +313,7 @@ export type Metadata = {
   slashCommands?: string[],
   mcpServers?: Array<{ name: string; status: string; error?: string; checkedAt?: number }>,
   skills?: string[],
+  plugins?: Array<{ name: string; path: string }>,
   homeDir: string,
   happyHomeDir: string,
   happyLibDir: string,

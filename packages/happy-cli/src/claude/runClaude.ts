@@ -9,6 +9,7 @@ import { EnhancedMode, PermissionMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
+import { specialCommandResponse } from '@/claude/specialCommandResponse';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { configuration } from '@/configuration';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
@@ -768,30 +769,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             return;
         }
 
-        if (specialCommand.type === 'mcp' || specialCommand.type === 'skills') {
+        if (specialCommand.type === 'mcp' || specialCommand.type === 'skills' || specialCommand.type === 'plugins') {
             // In local mode, let Claude Code handle these commands natively
             if (currentRunMode === 'local') {
                 logger.debug(`[start] /${specialCommand.type} in local mode — passing through to Claude Code`);
             } else {
                 logger.debug(`[start] Detected /${specialCommand.type} command in remote mode`);
-                const metadata = session.getMetadata();
-                let responseText: string;
-
-                if (specialCommand.type === 'mcp') {
-                    const servers = metadata?.mcpServers;
-                    if (servers && servers.length > 0) {
-                        responseText = '**MCP Servers**\n\n' + servers.map(s => `- **${s.name}** — ${s.status}`).join('\n');
-                    } else {
-                        responseText = 'No MCP servers configured. Session may still be initializing — try again after sending a message.';
-                    }
-                } else {
-                    const skills = metadata?.skills ?? metadata?.slashCommands;
-                    if (skills && skills.length > 0) {
-                        responseText = '**Available Skills**\n\n' + skills.map(s => `- /${s}`).join('\n');
-                    } else {
-                        responseText = 'No skills available. Session may still be initializing — try again after sending a message.';
-                    }
-                }
+                const responseText = specialCommandResponse(specialCommand.type, session.getMetadata());
 
                 session.sendClaudeSessionMessage({
                     type: 'assistant',

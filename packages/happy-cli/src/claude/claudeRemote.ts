@@ -55,7 +55,7 @@ export async function claudeRemote(opts: {
     onSessionReset?: () => void,
     onMcpStatus?: (status: McpRuntimeServerStatus) => void,
     onMcpControllerReady?: (controller: Pick<McpRuntimeRecovery, 'reconnectServer'> | null) => void,
-    onSDKMetadata?: (metadata: { tools?: string[]; slashCommands?: string[]; mcpServers?: { name: string; status: string }[]; skills?: string[] }) => void
+    onSDKMetadata?: (metadata: { tools?: string[]; slashCommands?: string[]; mcpServers?: { name: string; status: string }[]; skills?: string[]; plugins?: { name: string; path: string }[] }) => void
 }) {
 
     // Check if session is valid
@@ -251,6 +251,7 @@ export async function claudeRemote(opts: {
                         slashCommands: systemInit.slash_commands,
                         mcpServers: systemInit.mcp_servers?.map(s => ({ name: s.name, status: s.status })),
                         skills: systemInit.skills,
+                        plugins: systemInit.plugins?.map(p => ({ name: p.name, path: p.path })),
                     });
                 }
 

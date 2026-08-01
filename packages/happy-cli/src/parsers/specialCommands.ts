@@ -12,7 +12,7 @@ export interface ClearCommandResult {
 }
 
 export interface SpecialCommandResult {
-    type: 'compact' | 'clear' | 'mcp' | 'skills' | null;
+    type: 'compact' | 'clear' | 'mcp' | 'skills' | 'plugins' | null;
     originalMessage?: string;
 }
 
@@ -81,6 +81,11 @@ export function parseSpecialCommand(message: string): SpecialCommandResult {
     }
     if (trimmed === '/skills') {
         return { type: 'skills' };
+    }
+    // `/plugins` is the name Claude Code documents; `/plugin` is the common
+    // slip and would otherwise reach the SDK as an unknown command.
+    if (trimmed === '/plugins' || trimmed === '/plugin') {
+        return { type: 'plugins' };
     }
 
     return {

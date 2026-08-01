@@ -68,6 +68,17 @@ describe('parseSpecialCommand', () => {
         expect(result.originalMessage).toBeUndefined();
     });
 
+    it('should detect the capability listing commands', () => {
+        expect(parseSpecialCommand('/mcp').type).toBe('mcp');
+        expect(parseSpecialCommand('/skills').type).toBe('skills');
+        expect(parseSpecialCommand('/plugins').type).toBe('plugins');
+    });
+
+    it('should accept /plugin as an alias for /plugins', () => {
+        expect(parseSpecialCommand('/plugin').type).toBe('plugins');
+        expect(parseSpecialCommand('  /PLUGIN  ').type).toBe('plugins');
+    });
+
     it('should handle edge cases correctly', () => {
         // Test with extra whitespace
         expect(parseSpecialCommand('  /compact test  ').type).toBe('compact');
@@ -77,5 +88,7 @@ describe('parseSpecialCommand', () => {
         expect(parseSpecialCommand('some /compact text').type).toBeNull();
         expect(parseSpecialCommand('/compactor').type).toBeNull();
         expect(parseSpecialCommand('/clearing').type).toBeNull();
+        expect(parseSpecialCommand('/plugins install foo').type).toBeNull();
+        expect(parseSpecialCommand('/pluginss').type).toBeNull();
     });
 });
