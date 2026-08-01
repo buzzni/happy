@@ -34,7 +34,13 @@ export function startDaemonControlServer({
   spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
   requestShutdown: () => void;
   onHappySessionWebhook: (sessionId: string, metadata: Metadata, encryption?: SessionEncryptionData) => void;
-  onHappySessionRuntime?: (sessionId: string, runtime: Partial<SessionRuntimeState> & { updatedAt: number }) => void;
+  /** `reporter` carries facts about the process that sent the report (not about
+   *  the conversation) — the daemon uses it to adopt sessions it isn't tracking. */
+  onHappySessionRuntime?: (
+    sessionId: string,
+    runtime: Partial<SessionRuntimeState> & { updatedAt: number },
+    reporter?: { hostPid?: number },
+  ) => void;
   portRegistry: PortRegistry;
   browserBridge?: BrowserBridge;
 }): Promise<{ port: number; stop: () => Promise<void> }> {
@@ -99,7 +105,9 @@ export function startDaemonControlServer({
           lastUserInteractionAt: z.number().optional(),
           lastTurnEndAt: z.number().optional(),
           launchedBackgroundJob: z.boolean().optional(),
-          mode: z.enum(['local', 'remote']).optional()
+          mode: z.enum(['local', 'remote']).optional(),
+          /** PID of the reporting session process. Absent on older CLIs. */
+          hostPid: z.number().optional()
         }),
         response: {
           200: z.object({
@@ -108,7 +116,7 @@ export function startDaemonControlServer({
         }
       }
     }, async (request) => {
-      const { sessionId, thinking, hasOpenToolCall, pendingUserInput, lastUserInteractionAt, lastTurnEndAt, launchedBackgroundJob, mode } = request.body;
+      const { sessionId, thinking, hasOpenToolCall, pendingUserInput, lastUserInteractionAt, lastTurnEndAt, launchedBackgroundJob, mode, hostPid } = request.body;
 
       onHappySessionRuntime(sessionId, {
         ...(thinking !== undefined ? { thinking } : {}),
@@ -119,7 +127,7 @@ export function startDaemonControlServer({
         ...(launchedBackgroundJob !== undefined ? { launchedBackgroundJob } : {}),
         ...(mode !== undefined ? { mode } : {}),
         updatedAt: Date.now()
-      });
+      }, hostPid !== undefined ? { hostPid } : undefined);
 
       return { status: 'ok' as const };
     });
