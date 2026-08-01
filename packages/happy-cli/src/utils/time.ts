@@ -1,4 +1,4 @@
-import axios from 'axios';
+import axios, { AxiosHeaders } from 'axios';
 import { logger } from '@/ui/logger';
 
 export async function delay(ms: number) {
@@ -29,13 +29,17 @@ export async function delay(ms: number) {
  * synthetic 404 was read as "session gone".
  */
 const PROXY_CIRCUIT_BREAKER_HEADER = 'x-aplus-circuit-breaker';
+const SESSION_MESSAGES_404_CIRCUIT = 'session-messages-404';
 
 export function isProxyCircuitBreakerError(e: unknown): boolean {
-    if (!axios.isAxiosError(e)) {
+    if (!axios.isAxiosError(e) || e.response?.status !== 404) {
         return false;
     }
-    const headers = e.response?.headers as Record<string, unknown> | undefined;
-    return typeof headers?.[PROXY_CIRCUIT_BREAKER_HEADER] === 'string';
+    const headers = e.response.headers;
+    const circuit = headers instanceof AxiosHeaders
+        ? headers.get(PROXY_CIRCUIT_BREAKER_HEADER)
+        : Object.entries(headers).find(([name]) => name.toLowerCase() === PROXY_CIRCUIT_BREAKER_HEADER)?.[1];
+    return circuit === SESSION_MESSAGES_404_CIRCUIT;
 }
 
 export function isNonRetryableError(e: unknown): boolean {

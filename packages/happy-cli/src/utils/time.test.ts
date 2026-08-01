@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { AxiosError, AxiosHeaders } from 'axios';
-import { backoff, createBackoff, isNonRetryableError, isSessionGoneError, SESSION_GONE_MIN_DELAY_MS, SESSION_GONE_MAX_DELAY_MS } from './time';
+import { backoff, createBackoff, isNonRetryableError, isProxyCircuitBreakerError, isSessionGoneError, SESSION_GONE_MIN_DELAY_MS, SESSION_GONE_MAX_DELAY_MS } from './time';
 
 function axiosErrorWithStatus(status: number): AxiosError {
     const err = new AxiosError('Request failed with status code ' + status);
@@ -18,14 +18,32 @@ function axiosErrorWithStatus(status: number): AxiosError {
  * aplus web-ui proxy 가 세션 메시지 404 서킷을 열었을 때 돌려주는 합성 응답.
  * 본문은 happy-server 의 진짜 404 와 글자까지 동일하고, 헤더만 다르다.
  */
-function axiosErrorFromCircuitBreaker(status = 404): AxiosError {
+function axiosErrorFromCircuitBreaker(status = 404, circuit = 'session-messages-404'): AxiosError {
     const err = axiosErrorWithStatus(status);
     err.response!.data = { error: 'Session not found' };
     err.response!.headers = {
-        'x-aplus-circuit-breaker': 'session-messages-404',
+        'x-aplus-circuit-breaker': circuit,
     } as NonNullable<AxiosError['response']>['headers'];
     return err;
 }
+
+describe('isProxyCircuitBreakerError', () => {
+    it('matches only the exact session-messages synthetic 404 contract', () => {
+        expect(isProxyCircuitBreakerError(axiosErrorFromCircuitBreaker())).toBe(true);
+        expect(isProxyCircuitBreakerError(axiosErrorFromCircuitBreaker(401))).toBe(false);
+        expect(isProxyCircuitBreakerError(axiosErrorFromCircuitBreaker(410))).toBe(false);
+        expect(isProxyCircuitBreakerError(axiosErrorFromCircuitBreaker(404, 'future-circuit'))).toBe(false);
+    });
+
+    it('reads the header case-insensitively from AxiosHeaders', () => {
+        const err = axiosErrorWithStatus(404);
+        err.response!.headers = new AxiosHeaders({
+            'X-Aplus-Circuit-Breaker': 'session-messages-404',
+        });
+
+        expect(isProxyCircuitBreakerError(err)).toBe(true);
+    });
+});
 
 describe('isNonRetryableError', () => {
     it('treats 4xx (except 408/429) as non-retryable', () => {
@@ -55,6 +73,11 @@ describe('isNonRetryableError', () => {
     it('keeps a proxy circuit-breaker 404 retryable', () => {
         expect(isNonRetryableError(axiosErrorFromCircuitBreaker())).toBe(false);
     });
+
+    it('keeps unrelated permanent 4xx non-retryable when a circuit header is present', () => {
+        expect(isNonRetryableError(axiosErrorFromCircuitBreaker(401))).toBe(true);
+        expect(isNonRetryableError(axiosErrorFromCircuitBreaker(404, 'future-circuit'))).toBe(true);
+    });
 });
 
 describe('isSessionGoneError', () => {
@@ -77,7 +100,8 @@ describe('isSessionGoneError', () => {
         // 프록시가 upstream 에 묻지도 않고 만든 404 — 세션 상태에 대한
         // 증거가 전혀 아니다. sessionUnreachable 판정이 오염되면 안 된다.
         expect(isSessionGoneError(axiosErrorFromCircuitBreaker())).toBe(false);
-        expect(isSessionGoneError(axiosErrorFromCircuitBreaker(410))).toBe(false);
+        expect(isSessionGoneError(axiosErrorFromCircuitBreaker(410))).toBe(true);
+        expect(isSessionGoneError(axiosErrorFromCircuitBreaker(404, 'future-circuit'))).toBe(true);
     });
 });
 
