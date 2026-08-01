@@ -24,3 +24,14 @@ backoff 기본 분류기에 사용되므로, 401 같은 영구 오류나 향후 
 - `pnpm run build` — 통과
 - `vitest run --project unit src/utils/time.test.ts` — 18 passed
 - 전체 unit — 151 files / 1426 tests passed
+
+## 2026-08-01 — 리뷰 보강 2: headers 없는 오류에서 fail closed
+
+`axios.isAxiosError` 는 `isAxiosError` 플래그만 확인하므로 손으로 만든
+AxiosError 에는 `response.headers` 가 없을 수 있다. 이때
+`Object.entries(undefined)` 가 throw 해 backoff 의 catch 안에서 원래 오류가
+TypeError 로 바뀌어 삼켜졌다. headers 가 nullish 면 false 를 반환하도록
+가드하고 (fail closed — 기존 4xx 분류 유지), 회귀 테스트를 추가했다.
+
+검증: `vitest run --project unit src/utils/time.test.ts` 19 passed,
+`pnpm run build` 통과.

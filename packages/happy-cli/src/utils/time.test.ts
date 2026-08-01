@@ -43,6 +43,18 @@ describe('isProxyCircuitBreakerError', () => {
 
         expect(isProxyCircuitBreakerError(err)).toBe(true);
     });
+
+    it('fails closed on a crafted 404 without response headers instead of throwing', () => {
+        // isAxiosError 는 e.isAxiosError === true 만 본다 — 손으로 만든 에러는
+        // headers 없이도 여기까지 온다. 분류기는 backoff 의 catch 안에서 돌므로
+        // 여기서 throw 하면 원래 오류가 TypeError 로 바뀌어 삼켜진다.
+        const err = axiosErrorWithStatus(404);
+        err.response!.headers = undefined as unknown as NonNullable<AxiosError['response']>['headers'];
+
+        expect(isProxyCircuitBreakerError(err)).toBe(false);
+        expect(isNonRetryableError(err)).toBe(true);
+        expect(isSessionGoneError(err)).toBe(true);
+    });
 });
 
 describe('isNonRetryableError', () => {

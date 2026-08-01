@@ -35,7 +35,13 @@ export function isProxyCircuitBreakerError(e: unknown): boolean {
     if (!axios.isAxiosError(e) || e.response?.status !== 404) {
         return false;
     }
+    // isAxiosError 는 e.isAxiosError 플래그만 본다 — 손으로 만든 에러에는
+    // headers 가 없을 수 있고, 이 분류기는 backoff 의 catch 안에서 돌므로
+    // 여기서 throw 하면 원래 오류가 TypeError 로 바뀌어 삼켜진다. fail closed.
     const headers = e.response.headers;
+    if (!headers) {
+        return false;
+    }
     const circuit = headers instanceof AxiosHeaders
         ? headers.get(PROXY_CIRCUIT_BREAKER_HEADER)
         : Object.entries(headers).find(([name]) => name.toLowerCase() === PROXY_CIRCUIT_BREAKER_HEADER)?.[1];
