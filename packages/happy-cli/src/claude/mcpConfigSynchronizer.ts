@@ -31,7 +31,13 @@ export class McpConfigSynchronizer {
     }
 
     async sync(): Promise<void> {
-        const result = await this.options.fetchAplusServers();
+        let result: AplusMcpServersFetchResult;
+        try {
+            result = await this.options.fetchAplusServers();
+        } catch (error) {
+            this.emitConfigFailure(sanitizeMcpError(error));
+            return;
+        }
         if (!result.ok) {
             if (result.reason === 'not-configured' || result.reason === 'missing-machine-id') {
                 return;

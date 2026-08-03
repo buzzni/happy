@@ -284,7 +284,6 @@ export async function claudeRemote(opts: {
                 logger.debug('[claudeRemote] Result received');
                 opts.onMcpControllerReady?.(mcpRecovery);
 
-                await mcpConfigSynchronizer?.sync();
                 await mcpRecovery.recoverFailedServers();
 
                 // Send completion messages
@@ -302,10 +301,11 @@ export async function claudeRemote(opts: {
                 // Wait for next user message without blocking the message loop.
                 // Background task messages (task_started, task_progress, task_notification)
                 // continue flowing through while we wait for user input.
-                opts.nextMessage().then((next) => {
+                opts.nextMessage().then(async (next) => {
                     if (!next) {
                         messages.end();
                     } else {
+                        await mcpConfigSynchronizer?.sync();
                         acceptsPromptSuggestion = false;
                         opts.onPromptSuggestionChange?.(null);
                         opts.onMcpControllerReady?.(null);
