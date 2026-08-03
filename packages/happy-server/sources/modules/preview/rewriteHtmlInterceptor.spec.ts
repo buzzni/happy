@@ -378,23 +378,27 @@ describe('rewriteHtml interceptor — runtime behavior in stubbed DOM', () => {
         });
     });
 
-    describe('WebSocket shim — Vite HMR relay and Next/Webpack suppression', () => {
-        it('routes a same-origin vite-hmr socket through the preview prefix', () => {
+    describe('WebSocket shim — HMR suppression', () => {
+        it('suppresses a vite-hmr socket so file saves do not reload the preview', () => {
             const w = new bag.sandbox.window.WebSocket(
                 'wss://studio.example/?token=hmr',
                 'vite-hmr',
             );
-            expect(w).toBeInstanceOf(bag.sandbox.WebSocket);
-            expect(w.url).toBe(`wss://studio.example${PREFIX}/?token=hmr`);
-            expect(w.protocol).toBe('vite-hmr');
+            expect(w).not.toBeInstanceOf(bag.sandbox.WebSocket);
+            expect(w.readyState).toBe(1);
+            expect(typeof w.send).toBe('function');
         });
 
-        it('routes an already-prefixed vite-ping socket without double-prefixing', () => {
-            const url = `wss://studio.example${PREFIX}/`;
-            const w = new bag.sandbox.window.WebSocket(url, 'vite-ping');
-            expect(w).toBeInstanceOf(bag.sandbox.WebSocket);
-            expect(w.url).toBe(url);
-            expect(w.protocol).toBe('vite-ping');
+        it('suppresses a vite-ping socket', () => {
+            const w = new bag.sandbox.window.WebSocket(`wss://studio.example${PREFIX}/`, 'vite-ping');
+            expect(w).not.toBeInstanceOf(bag.sandbox.WebSocket);
+            expect(w.readyState).toBe(1);
+        });
+
+        it('suppresses a socket whose URL contains __vite regardless of protocol', () => {
+            const w = new bag.sandbox.window.WebSocket('wss://studio.example/__vite_hmr', '');
+            expect(w).not.toBeInstanceOf(bag.sandbox.WebSocket);
+            expect(w.readyState).toBe(1);
         });
 
         it('continues suppressing a URL containing /_next/webpack', () => {
