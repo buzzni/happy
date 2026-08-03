@@ -54,6 +54,27 @@ describe('McpConfigSynchronizer', () => {
         }));
     });
 
+    it('keeps last-known-good servers when config fetch throws', async () => {
+        const setMcpServers = vi.fn();
+        const onStatus = vi.fn();
+        const synchronizer = new McpConfigSynchronizer({ setMcpServers } as any, {
+            baseServers,
+            initialAplusServers,
+            fetchAplusServers: vi.fn(async () => {
+                throw new Error('network exploded');
+            }),
+            onStatus,
+        });
+
+        await synchronizer.sync();
+
+        expect(setMcpServers).not.toHaveBeenCalled();
+        expect(onStatus).toHaveBeenCalledWith(expect.objectContaining({
+            name: 'aplus-config',
+            status: 'config-fetch-failed',
+        }));
+    });
+
     it('does not apply a semantically identical config', async () => {
         const setMcpServers = vi.fn();
         const synchronizer = new McpConfigSynchronizer({ setMcpServers } as any, {

@@ -20,8 +20,8 @@ import { projectPath } from '@/projectPath';
 import { join } from 'node:path';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
-import { fetchAplusMcpServers } from '@/aplus/fetchAplusMcpServers';
-import { bridgeAplusMcpServers, mergeMcpServers } from '@/aplus/mergeAplusMcpServers';
+import { fetchAplusMcpServersResult } from '@/aplus/fetchAplusMcpServers';
+import { bridgeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { CodexDisplay } from "@/ui/ink/CodexDisplay";
 import { trimIdent } from "@/utils/trimIdent";
@@ -39,6 +39,7 @@ import {
     mapCodexProcessorMessageToSessionEnvelopes,
 } from './utils/sessionProtocolMapper';
 import { resumeExistingThread } from './resumeExistingThread';
+import { CodexMcpConfigSynchronizer } from './codexMcpConfigSynchronizer';
 import { emitReadyIfIdle } from './emitReadyIfIdle';
 import { enqueueCodexUserText, isCodexClearText } from './codexClearCommand';
 import { downloadCodexFileEventAttachment } from './utils/attachmentEvents';
@@ -822,16 +823,21 @@ export async function runCodex(opts: {
     // codex would otherwise fail to start the MCP server, the change_title tool would
     // not be visible to the model, and the model would improvise with shell echoes.
     const bridgeEntrypoint = join(projectPath(), 'bin', 'happy-mcp.mjs');
-    const aplusMcpServers = bridgeAplusMcpServers(
-        await fetchAplusMcpServers(opts.credentials.token, machineId),
-        { bridgeCommand: bridgeEntrypoint, nodeExecPath: process.execPath },
-    );
-    const mcpServers = mergeMcpServers({
+    const initialAplusMcpResult = await fetchAplusMcpServersResult(opts.credentials.token, machineId);
+    const initialAplusMcpServers = initialAplusMcpResult.ok ? initialAplusMcpResult.servers : {};
+    const baseMcpServers = {
         happy: {
             command: process.execPath,
             args: ['--no-warnings', '--no-deprecation', bridgeEntrypoint, '--url', happyServer.url]
         }
-    }, aplusMcpServers);
+    };
+    const bridgeOptions = { bridgeCommand: bridgeEntrypoint, nodeExecPath: process.execPath };
+    const mcpConfigSynchronizer = new CodexMcpConfigSynchronizer({
+        baseServers: baseMcpServers,
+        initialAplusServers: initialAplusMcpServers,
+        fetchAplusServers: () => fetchAplusMcpServersResult(opts.credentials.token, machineId),
+        bridgeAplusServers: (servers) => bridgeAplusMcpServers(servers, bridgeOptions),
+    });
     let first = true;
     let appendSystemPromptInjected = false;
 
@@ -847,7 +853,7 @@ export async function runCodex(opts: {
                 messageBuffer,
                 threadId: opts.resumeThreadId,
                 cwd: process.cwd(),
-                mcpServers,
+                mcpServers: mcpConfigSynchronizer.mcpServers,
             });
             first = false;
             appendSystemPromptInjected = true;
@@ -950,6 +956,13 @@ export async function runCodex(opts: {
                     sandboxManagedByHappy,
                 );
 
+                const mcpSync = await mcpConfigSynchronizer.sync({
+                    threadId: client.threadId,
+                    resumeThread: client.threadId
+                        ? ({ threadId, mcpServers }) => client.resumeThread({ threadId, mcpServers })
+                        : undefined,
+                });
+
                 // Start thread on first turn (thread persists across mode changes)
                 let activeThreadId = client.threadId;
                 if (!client.hasActiveThread() || !activeThreadId) {
@@ -958,7 +971,7 @@ export async function runCodex(opts: {
                         cwd: process.cwd(),
                         approvalPolicy: executionPolicy.approvalPolicy,
                         sandbox: executionPolicy.sandbox,
-                        mcpServers,
+                        mcpServers: mcpSync.mcpServers,
                     });
                     activeThreadId = startedThread.threadId;
                     session.updateMetadata((currentMetadata) => ({

@@ -321,7 +321,7 @@ describe('claudeRemote', () => {
         ]);
     });
 
-    it('applies changed MCP config at an idle turn boundary', async () => {
+    it('refreshes MCP config after idle input arrives and before the next turn starts', async () => {
         const setMcpServers = vi.fn(async () => ({ added: ['argos'], removed: [], errors: {} }));
         vi.mocked(query).mockReturnValue({
             setPermissionMode: vi.fn(),
@@ -332,6 +332,7 @@ describe('claudeRemote', () => {
             },
         } as any);
         const onApplied = vi.fn();
+        const boundaryOrder: string[] = [];
         let messageCount = 0;
 
         await claudeRemote({
@@ -340,8 +341,9 @@ describe('claudeRemote', () => {
             allowedTools: [],
             hookSettingsPath: '/tmp/happy-test-settings.json',
             nextMessage: async () => {
+                boundaryOrder.push('next-message');
                 messageCount += 1;
-                return messageCount === 1 ? { message: 'hello', mode } : null;
+                return messageCount <= 2 ? { message: `hello-${messageCount}`, mode } : null;
             },
             onReady: vi.fn(),
             canCallTool: async () => ({ behavior: 'allow' }) as any,
@@ -352,18 +354,24 @@ describe('claudeRemote', () => {
             mcpConfig: {
                 baseServers: { happy: { type: 'http', url: 'http://happy.test/mcp' } },
                 initialAplusServers: {},
-                fetchAplusServers: vi.fn(async () => ({
-                    ok: true as const,
-                    servers: { argos: { type: 'http' as const, url: 'https://argos.test/mcp' } },
-                })),
+                fetchAplusServers: vi.fn(async () => {
+                    boundaryOrder.push('mcp-sync');
+                    return {
+                        ok: true as const,
+                        servers: { argos: { type: 'http' as const, url: 'https://argos.test/mcp' } },
+                    };
+                }),
                 onApplied,
             },
         });
 
-        expect(setMcpServers).toHaveBeenCalledWith({
-            happy: { type: 'http', url: 'http://happy.test/mcp' },
-            argos: { type: 'http', url: 'https://argos.test/mcp' },
+        expect(boundaryOrder.slice(0, 3)).toEqual(['next-message', 'next-message', 'mcp-sync']);
+        await vi.waitFor(() => {
+            expect(setMcpServers).toHaveBeenCalledWith({
+                happy: { type: 'http', url: 'http://happy.test/mcp' },
+                argos: { type: 'http', url: 'https://argos.test/mcp' },
+            });
+            expect(onApplied).toHaveBeenCalledOnce();
         });
-        expect(onApplied).toHaveBeenCalledOnce();
     });
 });
