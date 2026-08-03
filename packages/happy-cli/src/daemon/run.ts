@@ -71,6 +71,11 @@ import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
 import { materializeSpawnBootstrapFiles } from './materializeSpawnBootstrapFiles';
+import tweetnacl from 'tweetnacl';
+import {
+  injectMcpCallerGrant,
+  McpCallerGrantEnvelopeConsumer,
+} from './mcpCallerGrantEnvelope';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -222,6 +227,11 @@ export async function startDaemon(): Promise<void> {
     // Ensure auth and machine registration BEFORE anything else
     const { credentials, machineId } = await authAndSetupMachineIfNeeded();
     logger.debug('[DAEMON RUN] Auth and machine setup complete');
+    const mcpCallerGrantKeyPair = tweetnacl.box.keyPair();
+    const mcpCallerGrantConsumer = new McpCallerGrantEnvelopeConsumer({
+      machineId,
+      secretKey: mcpCallerGrantKeyPair.secretKey,
+    });
 
     // Setup state - key by PID
     const pidToTrackedSession = new Map<number, TrackedSession>();
@@ -517,7 +527,14 @@ export async function startDaemon(): Promise<void> {
 
     // Spawn a new session (sessionId reserved for future --resume functionality)
     const spawnSession = async (options: SpawnSessionOptions): Promise<SpawnSessionResult> => {
-      logger.debugLargeJson('[DAEMON RUN] Spawning session', options);
+      // Spawn options can contain the encrypted one-use envelope as well as
+      // unrelated project secrets. Log only routing metadata so neither the
+      // envelope nor a client-supplied plaintext grant becomes replayable log
+      // material while DEBUG is enabled.
+      logger.debug(
+        `[DAEMON RUN] Spawning session agent=${options.agent} directory=${options.directory}`
+        + ` callerGrantEnvelope=${options.mcpCallerGrantEnvelope ? 'present' : 'absent'}`,
+      );
 
       const { directory, sessionId, machineId, approvedNewDirectoryCreation = true } = options;
       let directoryCreated = false;
@@ -566,6 +583,21 @@ export async function startDaemon(): Promise<void> {
       }
 
       try {
+        let mcpCallerGrant: string | undefined;
+        const mcpConfigProjectId = options.mcpConfigProjectId?.trim() || null;
+        if (options.mcpCallerGrantEnvelope) {
+          const consumed = mcpCallerGrantConsumer.consume(
+            options.mcpCallerGrantEnvelope,
+            { projectId: mcpConfigProjectId },
+          );
+          if (!consumed.ok) {
+            return {
+              type: 'error',
+              errorMessage: `MCP caller grant rejected (${consumed.reason})`,
+            };
+          }
+          mcpCallerGrant = consumed.grant;
+        }
         if (options.bootstrapFiles) {
           await materializeSpawnBootstrapFiles(directory, options.bootstrapFiles);
         }
@@ -606,10 +638,10 @@ export async function startDaemon(): Promise<void> {
           logger.debug(`[DAEMON RUN] User credentials staged at ${homeDir}/access.key`);
         }
 
-        let extraEnv: Record<string, string> = {
+        let extraEnv: Record<string, string> = injectMcpCallerGrant({
           ...authEnv,
           ...(options.environmentVariables ?? {}),
-        };
+        }, mcpCallerGrant, process.env.HAPPY_APLUS_MCP_CONFIG_URL, mcpConfigProjectId);
         if (options.parentSessionId) {
           extraEnv.HAPPY_FORKED_FROM_SESSION_ID = options.parentSessionId;
         }
@@ -1236,7 +1268,8 @@ export async function startDaemon(): Promise<void> {
       status: 'offline',
       pid: process.pid,
       httpPort: controlPort,
-      startedAt: Date.now()
+      startedAt: Date.now(),
+      mcpCallerGrantPublicKey: encodeBase64(mcpCallerGrantKeyPair.publicKey),
     };
 
     // Create API client

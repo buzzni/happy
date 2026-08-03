@@ -168,7 +168,9 @@ export const DaemonStateSchema = z.object({
     z.union([
       z.enum(['mobile-app', 'cli', 'os-signal', 'unknown']),
       z.string() // Forward compatibility
-    ]).optional()
+    ]).optional(),
+  /** Process-local X25519 public key used only for MCP caller grant envelopes. */
+  mcpCallerGrantPublicKey: z.string().optional()
 })
 
 export type DaemonState = z.infer<typeof DaemonStateSchema>

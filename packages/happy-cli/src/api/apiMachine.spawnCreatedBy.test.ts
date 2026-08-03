@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 function machineClient() {
     return {
@@ -29,6 +29,28 @@ function rpcHandlers(overrides: Record<string, unknown> = {}) {
 }
 
 describe('ApiMachineClient spawn-happy-session createdBy passthrough', () => {
+    it('forwards only the encrypted MCP caller grant envelope to spawnSession', async () => {
+        const spawnSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-1' });
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ spawnSession }));
+
+        await handlersFrom(client).get('machine-1:spawn-happy-session')?.({
+            directory: '/tmp/project',
+            agent: 'claude',
+            mcpCallerGrantEnvelope: 'ENCRYPTED-ONLY',
+            mcpConfigProjectId: 'P-1',
+        });
+
+        expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
+            mcpCallerGrantEnvelope: 'ENCRYPTED-ONLY',
+            mcpConfigProjectId: 'P-1',
+        }));
+        expect(spawnSession).not.toHaveBeenCalledWith(expect.objectContaining({
+            mcpCallerGrant: expect.anything(),
+        }));
+    });
+
     it('forwards createdByAccountId/createdByDisplayName to spawnSession', async () => {
         const calls: any[] = [];
         const spawnSession = (options: any) => {

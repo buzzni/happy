@@ -42,12 +42,14 @@ export async function fetchAplusMcpServersResult(token: string, machineId: strin
     }
     const ctl = new AbortController()
     const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS)
+    const callerGrant = process.env.HAPPY_APLUS_MCP_CALLER_GRANT
     try {
         const res = await fetch(configUrl, {
             method: 'GET',
             headers: {
                 'Authorization': `Bearer ${token}`,
                 'X-Aplus-Machine-Id': machineId,
+                ...(callerGrant ? { 'X-Aplus-Caller-Grant': callerGrant } : {}),
             },
             signal: ctl.signal,
         })
