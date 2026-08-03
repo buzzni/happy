@@ -27,8 +27,8 @@ vi.mock('@/ui/logger', () => ({
 vi.mock('./encryption', () => ({
     decodeBase64: vi.fn((data: string) => data),
     encodeBase64: vi.fn((data: any) => data),
-    decrypt: vi.fn((data: any) => data),
-    encrypt: vi.fn((data: any) => data)
+    decrypt: vi.fn((_key: any, _variant: any, data: any) => data),
+    encrypt: vi.fn((_key: any, _variant: any, data: any) => data)
 }));
 
 // Mock configuration
@@ -238,6 +238,44 @@ describe('Api server error handling', () => {
     });
 
     describe('getOrCreateMachine', () => {
+        it('should retain the current daemon startup state when the server returns an existing machine', async () => {
+            mockPost.mockResolvedValue({
+                data: {
+                    machine: {
+                        id: 'test-machine',
+                        metadata: testMachineMetadata,
+                        metadataVersion: 4,
+                        daemonState: {
+                            status: 'shutting-down',
+                            shutdownSource: 'cli',
+                            mcpCallerGrantPublicKey: 'stale-process-key'
+                        },
+                        daemonStateVersion: 9
+                    }
+                }
+            });
+
+            const result = await api.getOrCreateMachine({
+                machineId: 'test-machine',
+                metadata: testMachineMetadata,
+                daemonState: {
+                    status: 'offline',
+                    pid: 5678,
+                    httpPort: 4321,
+                    mcpCallerGrantPublicKey: 'current-process-key'
+                }
+            });
+
+            expect(result.daemonState).toEqual({
+                status: 'offline',
+                shutdownSource: 'cli',
+                pid: 5678,
+                httpPort: 4321,
+                mcpCallerGrantPublicKey: 'current-process-key'
+            });
+            expect(result.daemonStateVersion).toBe(9);
+        });
+
         it('should return minimal machine object when server is unreachable (ECONNREFUSED)', async () => {
             connectionState.reset();
             const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
