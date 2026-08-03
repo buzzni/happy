@@ -199,6 +199,9 @@ export class ApiClient {
 
       const raw = response.data.machine;
       logger.debug(`[API] Machine ${opts.machineId} registered/updated with server`);
+      const serverDaemonState = raw.daemonState
+        ? decrypt(encryptionKey, encryptionVariant, decodeBase64(raw.daemonState))
+        : null;
 
       // Return decrypted machine like we do for sessions
       const machine: Machine = {
@@ -207,7 +210,12 @@ export class ApiClient {
         encryptionVariant: encryptionVariant,
         metadata: raw.metadata ? decrypt(encryptionKey, encryptionVariant, decodeBase64(raw.metadata)) : null,
         metadataVersion: raw.metadataVersion || 0,
-        daemonState: raw.daemonState ? decrypt(encryptionKey, encryptionVariant, decodeBase64(raw.daemonState)) : null,
+        // Existing machines return the previously persisted state. Keep its
+        // forward-compatible fields, but seed this process's startup state so
+        // ApiMachine.connect() publishes the new ephemeral capabilities.
+        daemonState: opts.daemonState
+          ? { ...serverDaemonState, ...opts.daemonState }
+          : serverDaemonState,
         daemonStateVersion: raw.daemonStateVersion || 0,
       };
       return machine;
