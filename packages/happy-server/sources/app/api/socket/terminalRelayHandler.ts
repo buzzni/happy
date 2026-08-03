@@ -41,16 +41,29 @@ import {
 
 const TERMINAL_OPEN_TIMEOUT_MS = 10_000;
 
-// TODO(post-Phase-2): factor out — duplicated from previewRoutes.ts.
+// Returns the *newest still-connected* machine socket. A daemon that
+// reconnects after a network flap (sleep/wake, Wi-Fi switch, restart)
+// registers a fresh socket within seconds, but happy-server keeps the dead
+// one in eventRouter until engine.io gives up — pingInterval (15s) +
+// pingTimeout (45s) later. Returning the first match sent
+// `terminal-open-fwd` into that dead socket for up to a minute, surfacing
+// only as "Daemon did not acknowledge terminal-open in time". Set iteration
+// is insertion-ordered, so the last match is the most recent connection.
+//
+// previewRoutes.ts hits the same race but answers it differently: it fans
+// out to every live socket and takes the first response (Promise.any).
+// That is safe for an idempotent HTTP proxy hop; terminal-open spawns a
+// PTY, so fanning out would leak duplicate shells. Pick one socket here.
 function findMachineSocket(userId: string, machineId: string): Socket | null {
     const connections = eventRouter.getConnections(userId);
     if (!connections) return null;
+    let newest: Socket | null = null;
     for (const c of connections) {
-        if (c.connectionType === 'machine-scoped' && c.machineId === machineId) {
-            return c.socket;
-        }
+        if (c.connectionType !== 'machine-scoped' || c.machineId !== machineId) continue;
+        if (!c.socket.connected) continue;
+        newest = c.socket;
     }
-    return null;
+    return newest;
 }
 
 export function terminalRelayHandler(userId: string, socket: Socket): void {
