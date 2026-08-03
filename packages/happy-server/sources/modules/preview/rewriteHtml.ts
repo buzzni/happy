@@ -11,7 +11,7 @@
  *   prefix so app-level API calls end up at the same dev server
  * - strips the prefix from `window.location.pathname` so SPA routers see
  *   clean paths
- * - relays Vite HMR WebSockets and stubs unsupported Next.js / Webpack HMR
+ * - stubs `WebSocket` for known HMR protocols (Vite / Next.js / Webpack)
  *
  * Auth is delivered via a per-preview HttpOnly cookie set by the relay on
  * the first response (see previewCookie.ts, Phase 9). The rewriter no
@@ -145,23 +145,6 @@ export function rwPath(u: string, P: string, ORIGIN: string): string {
     }
 }
 
-export function rwWebSocketUrl(u: string, P: string, ORIGIN: string): string {
-    if (typeof u !== 'string') return u as unknown as string;
-    if (u.charAt(0) === '/') return rwPath(u, P, ORIGIN);
-    try {
-        const parsed = new URL(u);
-        const page = new URL(ORIGIN);
-        const pageWebSocketProtocol =
-            page.protocol === 'https:' ? 'wss:' : page.protocol === 'http:' ? 'ws:' : '';
-        if (parsed.protocol !== pageWebSocketProtocol || parsed.host !== page.host) return u;
-        if (parsed.pathname === P || parsed.pathname.indexOf(P + '/') === 0) return u;
-        parsed.pathname = P + parsed.pathname;
-        return parsed.toString();
-    } catch {
-        return u;
-    }
-}
-
 export function rwInput(i: unknown, P: string, ORIGIN: string): unknown {
     if (typeof i === 'string') return rwPath(i, P, ORIGIN);
     try {
@@ -280,17 +263,14 @@ function buildInterceptorScript(prefix: string): string {
     // source so the runtime helpers and the tested helpers stay in lockstep
     // (no parallel implementations to drift).
     const rwPathSource = rwPath.toString();
-    const rwWebSocketUrlSource = rwWebSocketUrl.toString();
     const rwInputSource = rwInput.toString();
     return (
         `<script>(function(){` +
         `var P='${p}';` +
         `var ORIGIN=window.location.origin;` +
         `${rwPathSource};` +
-        `${rwWebSocketUrlSource};` +
         `${rwInputSource};` +
         `function rw(u){return rwPath(u,P,ORIGIN)}` +
-        `function rwWs(u){return rwWebSocketUrl(u,P,ORIGIN)}` +
         `function rwIn(i){return rwInput(i,P,ORIGIN)}` +
         `var loc=window.location.pathname;` +
         `if(loc.indexOf(P)===0){history.replaceState(null,'',loc.slice(P.length)||'/')}` +
@@ -307,9 +287,9 @@ function buildInterceptorScript(prefix: string): string {
         `}` +
         `NoopWS.CONNECTING=0;NoopWS.OPEN=1;NoopWS.CLOSING=2;NoopWS.CLOSED=3;` +
         `window.WebSocket=function(u,p){` +
-        `var isVite=p==='vite-hmr'||p==='vite-ping'||(u&&u.indexOf('__vite')!==-1);` +
-        `if(!isVite&&u&&(u.indexOf('/_next/webpack')!==-1||u.indexOf('hot-update')!==-1))return new NoopWS();` +
-        `u=isVite?rwWs(u):rw(u);return p?new _WS(u,p):new _WS(u)};` +
+        `if(p==='vite-hmr'||p==='vite-ping'||` +
+        `(u&&(u.indexOf('__vite')!==-1||u.indexOf('/_next/webpack')!==-1||u.indexOf('hot-update')!==-1)))return new NoopWS();` +
+        `u=rw(u);return p?new _WS(u,p):new _WS(u)};` +
         `window.WebSocket.prototype=_WS.prototype;` +
         `window.WebSocket.CONNECTING=0;window.WebSocket.OPEN=1;window.WebSocket.CLOSING=2;window.WebSocket.CLOSED=3;` +
         // Phase 11B: rwIn handles string / URL / Request — covers fetch
