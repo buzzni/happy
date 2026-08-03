@@ -249,6 +249,8 @@ export class ApiMachineClient {
                 token,
                 happyToken,
                 happySecret,
+                mcpCallerGrantEnvelope,
+                mcpConfigProjectId,
                 resumeClaudeSessionId,
                 resumeCodexThreadId,
                 parentSessionId,
@@ -263,6 +265,15 @@ export class ApiMachineClient {
             if (!directory) {
                 throw new Error('Directory is required');
             }
+            if (mcpCallerGrantEnvelope !== undefined && typeof mcpCallerGrantEnvelope !== 'string') {
+                throw new Error('MCP caller grant envelope must be a string');
+            }
+            if (
+                mcpConfigProjectId !== undefined
+                && (typeof mcpConfigProjectId !== 'string' || !mcpConfigProjectId.trim())
+            ) {
+                throw new Error('MCP config project id must be a non-empty string');
+            }
 
             const result = await spawnSession({
                 directory,
@@ -274,6 +285,8 @@ export class ApiMachineClient {
                 token,
                 happyToken,
                 happySecret,
+                mcpCallerGrantEnvelope,
+                mcpConfigProjectId,
                 resumeClaudeSessionId,
                 resumeCodexThreadId,
                 parentSessionId,

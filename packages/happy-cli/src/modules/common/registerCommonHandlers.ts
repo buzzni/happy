@@ -204,6 +204,14 @@ export interface SpawnSessionOptions {
     happyToken?: string;
     happySecret?: string;
     /**
+     * Opaque caller grant encrypted to this daemon process's ephemeral public
+     * key. The shared RPC layer may expose the envelope to company members, so
+     * plaintext grants and personal Happy credentials must never replace it.
+     */
+    mcpCallerGrantEnvelope?: string;
+    /** Project scope appended only to the daemon-owned MCP config URL. */
+    mcpConfigProjectId?: string;
+    /**
      * If set, the daemon spawns the agent with `--resume <id>` so the new
      * Happy session continues from an existing Claude conversation file.
      * Used by the session fork / duplicate flow: the fork RPC produces a
