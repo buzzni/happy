@@ -159,11 +159,20 @@ export const REBASE_GRACE_MS = 60_000
  * 지금 기준으로만 다시 계산한다. 이후 데몬이 켜져 있는 동안의 지연 틱은 rebase를
  * 거치지 않으므로 정상적으로 1회 발화한다(claimDueAutomation).
  */
-export function rebaseAutomationsOnLaunch(automations: readonly ScheduledAutomation[], now: number): ScheduledAutomation[] {
-  return automations.map((automation) => {
+export function rebaseAutomationsOnLaunch(
+  automations: readonly ScheduledAutomation[],
+  now: number,
+): readonly ScheduledAutomation[] {
+  let changed = false
+  const rebased = automations.map((automation) => {
     if (automation.nextRunAt !== null && automation.nextRunAt > now - REBASE_GRACE_MS) return automation
+    changed = true
     return { ...automation, nextRunAt: computeNextRunAt(automation.schedule, now) }
   })
+  // 바뀐 게 없으면 입력을 그대로 돌려준다 — 호출자가 참조 비교로 불필요한 파일
+  // 쓰기를 건너뛸 수 있게. 기동마다 쓰면 자동화가 없는 사용자에게도 파일이 생기고,
+  // 손상된 파일(파싱 결과 빈 목록)이 조사할 새도 없이 덮여 사라진다.
+  return changed ? rebased : automations
 }
 
 export function isAutomationDue(automation: ScheduledAutomation, now: number): boolean {

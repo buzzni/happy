@@ -173,6 +173,14 @@ describe('launch rebase and due judgment (R8, R2)', () => {
     expect(isAutomationDue(rebased[0]!, now)).toBe(true)
   })
 
+  // 호출자(run.ts)는 참조 비교로 불필요한 파일 쓰기를 건너뛴다 — 기동마다 쓰면
+  // 자동화가 없는 사용자에게도 파일이 생기고, 손상 파일이 조사 전에 덮인다.
+  it('returns the input array itself when nothing needs rebasing', () => {
+    const automations = [makeAutomation({ nextRunAt: now + 60_000 })]
+    expect(rebaseAutomationsOnLaunch(automations, now)).toBe(automations)
+    expect(rebaseAutomationsOnLaunch([], now)).toHaveLength(0)
+  })
+
   it('treats paused automations as never due', () => {
     const paused = makeAutomation({ paused: true, nextRunAt: now - 1 })
     expect(isAutomationDue(paused, now)).toBe(false)

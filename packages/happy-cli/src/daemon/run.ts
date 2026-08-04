@@ -1249,7 +1249,13 @@ export async function startDaemon(): Promise<void> {
     // 동안 지나간 예정 시각의 소급 실행을 막는다(R8) — replaceAll로 즉시 반영.
     // 실행 틱은 아래 하트비트 루프에 얹힌다(별도 타이머 없음).
     const automationStore = createAutomationStore({ filePath: configuration.automationsFile });
-    automationStore.replaceAll(rebaseAutomationsOnLaunch(automationStore.list(), Date.now()));
+    const storedAutomations = automationStore.list();
+    const rebasedAutomations = rebaseAutomationsOnLaunch(storedAutomations, Date.now());
+    // 참조가 그대로면 rebase 대상이 없었다는 뜻 — 쓰지 않는다. 자동화를 쓰지 않는
+    // 사용자에게 빈 파일을 만들지 않고, 손상된 파일을 조사 전에 덮지도 않는다.
+    if (rebasedAutomations !== storedAutomations) {
+      automationStore.replaceAll(rebasedAutomations);
+    }
     // 스크립트 cwd 검증 루트 — apiMachine의 머신 RPC 표면과 같은 규칙.
     const automationAllowedRoot = resolveAllowedRoot({
       registryWorkspaceRoot: process.env.HAPPY_WORKSPACE_ROOT ?? null,
