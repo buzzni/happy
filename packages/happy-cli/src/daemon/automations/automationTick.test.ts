@@ -65,6 +65,7 @@ describe('runAutomationTick', () => {
     expect(input.spawnSession).toHaveBeenCalledWith({
       directory: '/repo/project-1',
       initialPrompt: '어제 로그를 점검해줘',
+      createdByAccountId: null,
     })
     const [saved] = store.list()
     expect(saved!.runHistory[0]).toEqual({ at: NOW, outcome: 'woke', sessionId: 'session-new' })

@@ -1269,13 +1269,16 @@ export async function startDaemon(): Promise<void> {
       return false;
     };
     const spawnAutomationSession = async (
-      input: { directory: string; initialPrompt: string },
+      input: { directory: string; initialPrompt: string; createdByAccountId: string | null },
     ): Promise<{ ok: true; sessionId: string } | { ok: false; error: string }> => {
       const result = await spawnSession({
         machineId,
         directory: input.directory,
         agent: 'claude',
         initialPrompt: input.initialPrompt,
+        // 세션 자체는 데몬 소유자 자격증명으로 등록된다(자동화에 사용자 토큰을
+        // 저장하지 않는다 — credentials-at-rest 금지). 귀속 표시만 넘긴다.
+        createdByAccountId: input.createdByAccountId ?? undefined,
       });
       if (result.type === 'success') {
         return { ok: true, sessionId: result.sessionId };

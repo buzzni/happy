@@ -34,6 +34,14 @@ export interface ScheduledAutomation {
   createdAt: number
   nextRunAt: number | null
   runHistory: AutomationRunRecord[]
+  /**
+   * 등록한 계정 id. 한 머신 데몬에는 여러 계정이 붙을 수 있지만(cross-identity
+   * machine socket) 자동화 세션은 항상 데몬 소유자 자격증명으로 spawn된다 —
+   * 이 필드는 spawn의 createdByAccountId(→ HAPPY_CREATED_BY_ACCOUNT_ID)로 흘러
+   * 세션 귀속을 표시하고, 클라이언트가 목록을 등록자별로 스코프하는 근거가 된다.
+   * RPC에는 인증된 호출자 정보가 없어 이 값은 자기신고다 — 강제가 아니라 표시용.
+   */
+  createdByAccountId?: string | null
 }
 
 export const MIN_INTERVAL_MINUTES = 15
@@ -110,6 +118,7 @@ export function parseScheduledAutomation(value: unknown): ScheduledAutomation | 
     createdAt: finiteNumber(row.createdAt) ?? 0,
     nextRunAt: finiteNumber(row.nextRunAt),
     runHistory: parseRunHistory(row.runHistory),
+    createdByAccountId: stringValue(row.createdByAccountId),
   }
 }
 

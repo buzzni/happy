@@ -20,6 +20,7 @@ export function makeAutomation(patch: Partial<ScheduledAutomation> = {}): Schedu
     createdAt: 1_000,
     nextRunAt: null,
     runHistory: [],
+    createdByAccountId: null,
     ...patch,
   }
 }
