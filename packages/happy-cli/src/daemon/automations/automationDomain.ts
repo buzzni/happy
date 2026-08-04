@@ -48,6 +48,31 @@ export const MIN_INTERVAL_MINUTES = 15
 export const MAX_RUN_HISTORY = 20
 export const MAX_AUTOMATIONS = 100
 
+/**
+ * RPC 경계(automation-upsert)의 필드 상한. 파서에는 두지 않는다 — 이미 저장된
+ * 파일은 관대하게 계속 읽혀야 하고, 상한은 새로 들어오는 언트러스트 입력에만
+ * 건다. 근거: 저장 파일은 틱마다 재파싱되고 프롬프트는 spawn env로 전달되므로
+ * 무제한이면 공유 머신의 다른 계정이 파일·env를 무한정 불릴 수 있다.
+ */
+export const UPSERT_FIELD_LIMITS = {
+  id: 200,
+  projectId: 200,
+  name: 200,
+  directory: 1_000,
+  prompt: 64_000,
+  scriptCommand: 8_000,
+  createdByAccountId: 200,
+} as const
+
+/** 상한 위반 필드명을 돌려준다(없으면 null) — RPC 핸들러가 에러 메시지에 쓴다. */
+export function findOversizedUpsertField(automation: ScheduledAutomation): string | null {
+  for (const [field, limit] of Object.entries(UPSERT_FIELD_LIMITS)) {
+    const value = (automation as unknown as Record<string, unknown>)[field]
+    if (typeof value === 'string' && value.length > limit) return field
+  }
+  return null
+}
+
 const RUN_OUTCOMES = new Set<AutomationRunOutcome>(['woke', 'skipped-gate', 'skipped-overlap', 'silent', 'error'])
 
 function stringValue(value: unknown): string | null {

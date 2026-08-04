@@ -11,6 +11,7 @@ import { validatePath } from '@/modules/common/pathSecurity'
 
 import {
   computeNextRunAt,
+  findOversizedUpsertField,
   parseScheduledAutomation,
   type ScheduledAutomation,
 } from './automationDomain'
@@ -39,6 +40,10 @@ export function createAutomationRpcHandlers(deps: AutomationRpcDeps): Automation
       const parsed = parseScheduledAutomation(row)
       if (!parsed) {
         throw new Error('automation is missing required fields (id/projectId/name/prompt/directory/schedule)')
+      }
+      const oversized = findOversizedUpsertField(parsed)
+      if (oversized) {
+        throw new Error(`automation field too large: ${oversized}`)
       }
 
       const validation = validatePath(parsed.directory, deps.allowedRoot)

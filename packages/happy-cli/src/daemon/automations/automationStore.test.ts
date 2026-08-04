@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -18,6 +18,17 @@ describe('automationStore', () => {
 
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('writes the store owner-only (0600) — prompts and script commands are sensitive', () => {
+    if (process.platform === 'win32') return
+    const store = createAutomationStore({ filePath: file })
+    store.upsert(makeAutomation())
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+    // 기존 0644 파일도 다음 쓰기(tmp+rename)에서 0600으로 교체된다.
+    chmodSync(file, 0o644)
+    store.upsert(makeAutomation({ id: 'auto-2' }))
+    expect(statSync(file).mode & 0o777).toBe(0o600)
   })
 
   it('lists an empty array when the file is missing', () => {

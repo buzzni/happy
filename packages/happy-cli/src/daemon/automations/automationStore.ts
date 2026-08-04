@@ -46,7 +46,10 @@ export function createAutomationStore(opts: AutomationStoreOptions): AutomationS
   const write = (automations: readonly ScheduledAutomation[]): void => {
     mkdirSync(path.dirname(opts.filePath), { recursive: true })
     const tmp = `${opts.filePath}.${process.pid}.${Date.now()}.tmp`
-    writeFileSync(tmp, serializeScheduledAutomations(automations), 'utf-8')
+    // 0600: happyHomeDir는 0755 관례라 프롬프트·스크립트 커맨드(토큰이 섞일 수
+    // 있는 사용자 콘텐츠)가 다른 OS 사용자에게 읽힌다 — browser-bridge.token과
+    // 같은 명시적 소유자 전용 모드. rename이 tmp의 모드를 그대로 가져간다.
+    writeFileSync(tmp, serializeScheduledAutomations(automations), { encoding: 'utf-8', mode: 0o600 })
     renameSync(tmp, opts.filePath)
   }
 

@@ -32,6 +32,19 @@ describe('automation-upsert', () => {
     await expect(handlers().upsert(undefined)).rejects.toThrow('missing required fields')
   })
 
+  // 공유 머신의 다른 계정이 파일·spawn env를 무한정 불리지 못하게 하는 상한 —
+  // 저장 파일 파싱에는 걸리지 않고 RPC 경계에서만 거부된다.
+  it('shouldRejectOversizedFields', async () => {
+    const longPrompt = makeAutomation({ prompt: 'p'.repeat(64_001) })
+    await expect(handlers().upsert({ automation: longPrompt })).rejects.toThrow('field too large: prompt')
+    const longScript = makeAutomation({ scriptCommand: 'x'.repeat(8_001) })
+    await expect(handlers().upsert({ automation: longScript })).rejects.toThrow('field too large: scriptCommand')
+    expect(store.list()).toHaveLength(0)
+    // 상한 이내는 통과한다.
+    await handlers().upsert({ automation: makeAutomation({ prompt: 'p'.repeat(64_000) }) })
+    expect(store.list()).toHaveLength(1)
+  })
+
   it('shouldRejectDirectoryOutsideAllowedRoot', async () => {
     const automation = makeAutomation({ directory: '/etc' })
     await expect(handlers('/repo').upsert({ automation })).rejects.toThrow('outside the working directory')
