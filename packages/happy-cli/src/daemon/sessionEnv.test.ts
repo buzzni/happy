@@ -23,6 +23,7 @@ describe('scrubSessionLineageEnv', () => {
             HAPPY_FORK_CODEX_THREAD_ID: 'codex-1',
             HAPPY_CREATED_BY_ACCOUNT_ID: 'acct-stale',
             HAPPY_CREATED_BY_DISPLAY_NAME: 'Stale Name',
+            HAPPY_INITIAL_PROMPT: 'stale automation prompt',
         }
         const scrubbed = scrubSessionLineageEnv(env)
         expect(scrubbed).toEqual({
@@ -42,5 +43,6 @@ describe('scrubSessionLineageEnv', () => {
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_RECONNECT_')
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_FORK')
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_CREATED_BY')
+        expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_INITIAL_PROMPT')
     })
 })

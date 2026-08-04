@@ -81,7 +81,11 @@ function parseRunHistory(value: unknown): AutomationRunRecord[] {
   return records
 }
 
-function parseAutomation(value: unknown): ScheduledAutomation | null {
+/**
+ * 단건 파서 — RPC(automation-upsert)의 언트러스트 입력 검증용.
+ * 배열 파서(parseScheduledAutomations)와 같은 관대함/보존 규칙을 공유한다.
+ */
+export function parseScheduledAutomation(value: unknown): ScheduledAutomation | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const row = value as Record<string, unknown>
   const id = stringValue(row.id)
@@ -117,7 +121,7 @@ export function parseScheduledAutomations(raw: string | null | undefined): Sched
     const seen = new Set<string>()
     const automations: ScheduledAutomation[] = []
     for (const row of value) {
-      const automation = parseAutomation(row)
+      const automation = parseScheduledAutomation(row)
       if (!automation || seen.has(automation.id)) continue
       seen.add(automation.id)
       automations.push(automation)

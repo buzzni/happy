@@ -7,6 +7,7 @@ import {
   isAutomationDue,
   isSilentAutomationResponse,
   MIN_INTERVAL_MINUTES,
+  parseScheduledAutomation,
   parseScheduledAutomations,
   rebaseAutomationsOnLaunch,
   SCRIPT_STDOUT_CAP_CHARS,
@@ -113,6 +114,20 @@ describe('scheduled automations persistence', () => {
     const parsed = parseScheduledAutomations(raw)
     expect(parsed[0]!.runHistory).toHaveLength(20)
     expect(parsed[0]!.runHistory.every((record) => typeof record.at === 'number')).toBe(true)
+  })
+})
+
+describe('single automation parsing (RPC input)', () => {
+  it('parses a valid row with the same rules as the array parser', () => {
+    const automation = makeAutomation({ nextRunAt: 5_000 })
+    expect(parseScheduledAutomation(JSON.parse(JSON.stringify(automation)))).toEqual(automation)
+  })
+
+  it('rejects rows missing required fields', () => {
+    expect(parseScheduledAutomation(null)).toBeNull()
+    expect(parseScheduledAutomation('str')).toBeNull()
+    expect(parseScheduledAutomation({ ...makeAutomation(), directory: undefined })).toBeNull()
+    expect(parseScheduledAutomation({ ...makeAutomation(), schedule: { kind: 'weird' } })).toBeNull()
   })
 })
 

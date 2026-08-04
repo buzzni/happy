@@ -217,6 +217,10 @@ export const MachineMetadataSchema = z.object({
         happyAgentAuthenticated: z.boolean(),
         detectedAt: z.number(),
     }).optional(),
+    // Scheduled automations RPC (automation-upsert/remove/list) support.
+    automationSupport: z.object({
+        rpcAvailable: z.boolean(),
+    }).optional(),
 });
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>;

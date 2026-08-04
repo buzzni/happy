@@ -68,6 +68,12 @@ import {
   type StopSessionResult,
 } from './sessionIdleReaper';
 import { resolveOrphanAdoption, collectStartupOrphans } from './orphanAdoption';
+import { createAutomationStore } from './automations/automationStore';
+import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
+import { runAutomationTick } from './automations/automationTick';
+import { createAutomationTickRunner } from './automations/automationTickRunner';
+import { runAutomationScript } from './automations/runAutomationScript';
+import { resolveAllowedRoot } from '@/modules/common/resolveAllowedRoot';
 import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
@@ -97,6 +103,7 @@ export const initialMachineMetadata: MachineMetadata = {
   happyLibDir: projectPath(),
   cliAvailability: detectCLIAvailability(),
   resumeSupport: { ...detectResumeSupport(), rpcAvailable: true },
+  automationSupport: { rpcAvailable: true },
 };
 
 export async function startDaemon(): Promise<void> {
@@ -725,6 +732,14 @@ export async function startDaemon(): Promise<void> {
           };
         }
 
+        // Initial prompt (scheduled automations 등): 불투명한 사용자 텍스트라
+        // 위의 ${VAR} 확장·검증을 통과시키면 안 된다 — 프롬프트 속 "${FOO}"는
+        // 참조가 아니라 내용이다. 그래서 확장/검증 이후에 주입한다. tmux 경로와
+        // 일반 경로 모두 extraEnv를 그대로 사용하므로 이 한 곳이면 충분하다.
+        if (options.initialPrompt) {
+          extraEnv.HAPPY_INITIAL_PROMPT = options.initialPrompt;
+        }
+
         // Check if sandbox is enabled (for credential filtering)
         const hasSandbox = extraEnv.HAPPY_PROJECT_SANDBOX_CONFIG !== undefined;
 
@@ -1230,6 +1245,54 @@ export async function startDaemon(): Promise<void> {
     // Per-project port registry (30000-40000), persisted at configuration.portRegistryFile
     const portRegistry = createPortRegistry({ filePath: configuration.portRegistryFile });
 
+    // Scheduled automations (daemon/automations/). 기동 시 rebase는 다운타임
+    // 동안 지나간 예정 시각의 소급 실행을 막는다(R8) — replaceAll로 즉시 반영.
+    // 실행 틱은 아래 하트비트 루프에 얹힌다(별도 타이머 없음).
+    const automationStore = createAutomationStore({ filePath: configuration.automationsFile });
+    automationStore.replaceAll(rebaseAutomationsOnLaunch(automationStore.list(), Date.now()));
+    // 스크립트 cwd 검증 루트 — apiMachine의 머신 RPC 표면과 같은 규칙.
+    const automationAllowedRoot = resolveAllowedRoot({
+      registryWorkspaceRoot: process.env.HAPPY_WORKSPACE_ROOT ?? null,
+      homeDir: os.homedir(),
+    });
+    // 겹침 가드(R5)용: 데몬이 추적 중인 자식 세션의 프로세스 생존 여부.
+    const isAutomationSessionRunning = (sessionId: string): boolean => {
+      for (const [pid, session] of pidToTrackedSession.entries()) {
+        if (session.happySessionId === sessionId) return isPidAlive(pid);
+      }
+      return false;
+    };
+    const spawnAutomationSession = async (
+      input: { directory: string; initialPrompt: string },
+    ): Promise<{ ok: true; sessionId: string } | { ok: false; error: string }> => {
+      const result = await spawnSession({
+        machineId,
+        directory: input.directory,
+        agent: 'claude',
+        initialPrompt: input.initialPrompt,
+      });
+      if (result.type === 'success') {
+        return { ok: true, sessionId: result.sessionId };
+      }
+      return {
+        ok: false,
+        error: result.type === 'error' ? result.errorMessage : `unexpected spawn result: ${result.type}`,
+      };
+    };
+    // detach 실행 + 자체 리엔트런시 가드(heartbeatRunning과 별개) — spawn의
+    // webhook 대기(최대 60초×due 수)가 하트비트의 나머지 임무를 막지 않게.
+    const automationTickRunner = createAutomationTickRunner({
+      runTick: () => runAutomationTick({
+        store: automationStore,
+        now: Date.now(),
+        runScript: (input) => runAutomationScript({ ...input, allowedRoot: automationAllowedRoot }),
+        spawnSession: spawnAutomationSession,
+        isSessionRunning: isAutomationSessionRunning,
+        logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
+      }),
+      logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
+    });
+
     // Chrome extension bridge (specs/chrome-extension-bridge/). Listens on a
     // fixed loopback port because the extension cannot read daemon.state.json
     // to discover an ephemeral one. A bind failure (port taken) must not take
@@ -1335,7 +1398,8 @@ export async function startDaemon(): Promise<void> {
       resumeSession,
       stopSession,
       requestShutdown: () => requestShutdown('happy-app'),
-      portRegistry
+      portRegistry,
+      automationStore
     });
 
     // Connect to server
@@ -1431,6 +1495,13 @@ export async function startDaemon(): Promise<void> {
           logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
         });
       }
+
+      // Scheduled automations tick — 하트비트 케이던스로 기동하되 await하지
+      // 않는다(detach). spawn webhook 대기가 하트비트의 나머지 임무(자가
+      // 업그레이드 감지·상태 기록)를 막거나 heartbeatRunning 가드로 다음 틱을
+      // 스킵시키지 않게 하기 위함이다. 중복 기동은 러너의 자체 가드가 막고,
+      // 스킵된 due는 claim이 실행 직전에만 반영되므로 다음 tick이 집어간다.
+      automationTickRunner.trigger();
 
       // Check if daemon needs update by detecting whether `dist/index.mjs` was
       // replaced on disk since the daemon started (npm install rewrites the file).
