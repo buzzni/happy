@@ -186,10 +186,29 @@ describe('reconnect session environment snapshot', () => {
 describe('resolveResumeBaselineSeq', () => {
     it('uses the reported processed seq so dead-period messages are delivered on resume', () => {
         expect(resolveResumeBaselineSeq({
-            lastProcessedSeq: 621,
+            reportedSeq: 621,
             webhookSeq: 600,
             serverSeq: 678,
         })).toBe(621);
+    });
+
+    // A daemon restart loses the live runtime report but keeps the persisted
+    // one; the resume must still baseline at the delivered seq.
+    it('falls back to the persisted seq when the live runtime report is gone', () => {
+        expect(resolveResumeBaselineSeq({
+            persistedSeq: 621,
+            webhookSeq: 600,
+            serverSeq: 678,
+        })).toBe(621);
+    });
+
+    it('prefers the live runtime report over the persisted one', () => {
+        expect(resolveResumeBaselineSeq({
+            reportedSeq: 640,
+            persistedSeq: 621,
+            webhookSeq: 600,
+            serverSeq: 678,
+        })).toBe(640);
     });
 
     // The tracked webhook seq is NOT an "already processed" marker: a previous
@@ -198,7 +217,7 @@ describe('resolveResumeBaselineSeq', () => {
     // exists to deliver, so a real report always wins outright.
     it('trusts the reported seq over a webhook seq poisoned by an earlier resume', () => {
         expect(resolveResumeBaselineSeq({
-            lastProcessedSeq: 621,
+            reportedSeq: 621,
             webhookSeq: 678,
             serverSeq: 678,
         })).toBe(621);

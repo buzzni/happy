@@ -90,8 +90,12 @@ export function decodeReconnectSessionSnapshot(encoded: string): ReconnectSessio
  * the previous child actually delivered to its agent loop — not the server
  * head, which silently swallows that dead-period input.
  *
- * A reported seq wins outright, with no floor from the tracked webhook seq:
- * that value is not an "already processed" marker, and `applyServerSessionSnapshot`
+ * Precedence: the live runtime report (`reportedSeq`) first, then the value
+ * persisted for this session (`persistedSeq`), which is all that survives a
+ * daemon restart.
+ *
+ * A known seq wins outright, with no floor from the tracked webhook seq: that
+ * value is not an "already processed" marker, and `applyServerSessionSnapshot`
  * rewrites it to the server head on every resume attempt, so flooring against it
  * would re-swallow the messages this baseline exists to deliver.
  *
@@ -99,12 +103,14 @@ export function decodeReconnectSessionSnapshot(encoded: string): ReconnectSessio
  * CLI, lost record), where replaying already-processed turns is the greater risk.
  */
 export function resolveResumeBaselineSeq(input: {
-    lastProcessedSeq?: number;
+    reportedSeq?: number;
+    persistedSeq?: number;
     webhookSeq: number;
     serverSeq?: number;
 }): number {
-    if (input.lastProcessedSeq !== undefined) {
-        return input.lastProcessedSeq;
+    const knownSeq = input.reportedSeq ?? input.persistedSeq;
+    if (knownSeq !== undefined) {
+        return knownSeq;
     }
     return Math.max(input.webhookSeq, input.serverSeq ?? 0);
 }

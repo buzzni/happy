@@ -1049,7 +1049,8 @@ export async function startDaemon(): Promise<void> {
         // session had no process exist on the server but were never processed,
         // and a head baseline silently swallows them (2026-08-05 incident).
         const baselineSeq = resolveResumeBaselineSeq({
-          lastProcessedSeq: tracked.runtime?.lastProcessedSeq ?? tracked.persistedLastProcessedSeq,
+          reportedSeq: tracked.runtime?.lastProcessedSeq,
+          persistedSeq: tracked.persistedLastProcessedSeq,
           webhookSeq: tracked.encryption.seq,
           serverSeq: serverSnapshot.seq,
         });
