@@ -735,8 +735,22 @@ describe('ApiSessionClient v3 messages API migration', () => {
             hasOpenToolCall: false,
             pendingUserInput: false,
             lastUserInteractionAt: expect.any(Number),
+            lastProcessedSeq: expect.any(Number),
             mode: 'remote'
         });
+    });
+
+    // The daemon uses this as the resume skip-baseline: report the seq actually
+    // delivered to the agent loop, or dead-period messages get swallowed.
+    it('reports the delivered message seq as the resume skip-baseline', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.skipExistingMessages(621);
+
+        client.keepAlive(true, 'remote');
+
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalledWith('test-session-id', expect.objectContaining({
+            lastProcessedSeq: 621,
+        }));
     });
 
     it('reports open tool-call state to the local daemon', async () => {
@@ -770,6 +784,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             hasOpenToolCall: true,
             pendingUserInput: false,
             lastUserInteractionAt: expect.any(Number),
+            lastProcessedSeq: expect.any(Number),
             mode: 'remote'
         });
 
@@ -786,6 +801,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             hasOpenToolCall: false,
             pendingUserInput: false,
             lastUserInteractionAt: expect.any(Number),
+            lastProcessedSeq: expect.any(Number),
             mode: 'remote'
         });
     });
@@ -799,6 +815,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             thinking: false,
             hasOpenToolCall: false,
             pendingUserInput: false,
+            lastProcessedSeq: expect.any(Number),
             mode: 'remote'
         });
 
@@ -814,6 +831,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             pendingUserInput: false,
             lastUserInteractionAt: expect.any(Number),
             lastTurnEndAt: expect.any(Number),
+            lastProcessedSeq: expect.any(Number),
             mode: 'remote'
         });
     });
@@ -882,6 +900,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             hasOpenToolCall: false,
             pendingUserInput: true,
             lastUserInteractionAt: expect.any(Number),
+            lastProcessedSeq: expect.any(Number),
             mode: 'remote'
         });
     });
@@ -903,6 +922,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             thinking: false,
             hasOpenToolCall: false,
             pendingUserInput: true,
+            lastProcessedSeq: expect.any(Number),
             mode: 'remote'
         });
     });

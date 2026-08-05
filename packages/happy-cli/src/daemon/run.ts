@@ -51,7 +51,8 @@ import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
 import { encodeBase64, decodeBase64 } from '@/api/encryption';
 import { resolveRegularSpawnAgentArgs, resolveTmuxSpawnAgentCommand } from './spawnAgentCommand';
 import { applyServerSessionSnapshot, parseServerSessionSnapshot, type ServerSessionSnapshot } from './serverSessionSnapshot';
-import { buildReconnectSessionEnvironment } from './reconnectSessionEnv';
+import { buildReconnectSessionEnvironment, resolveResumeBaselineSeq } from './reconnectSessionEnv';
+import { hasLiveDaemonChild, shareInFlight } from './resumeGuards';
 import { startLogHousekeeping } from '@/ui/logHousekeepingRunner';
 import {
   readDaemonSessionIdleReaperConfig,
@@ -308,6 +309,7 @@ export async function startDaemon(): Promise<void> {
         },
         pid: 0,
         userHomeDir: s.userHomeDir,
+        persistedLastProcessedSeq: s.lastProcessedSeq,
       });
     }
     if (Object.keys(persisted).length > 0) {
@@ -398,6 +400,14 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[DAEMON RUN] Session webhook: ${sessionId}, PID: ${pid}, started by: ${sessionMetadata.startedBy || 'unknown'}, hasEncryption: ${!!encryption}`);
       logger.debug(`[DAEMON RUN] Current tracked sessions before webhook: ${Array.from(pidToTrackedSession.keys()).join(', ')}`);
 
+      // A resumed child re-persists this record at startup, before it has
+      // reported any runtime. Carry the preserved skip-baseline forward or the
+      // rewrite drops it, and a child that dies inside that window would resume
+      // from the server head again — swallowing the very messages it was
+      // resumed to deliver (2026-08-05 incident).
+      const preserved = sessionIdToFinishedSession.get(sessionId);
+      const inheritedLastProcessedSeq = preserved?.runtime?.lastProcessedSeq ?? preserved?.persistedLastProcessedSeq;
+
       // Persist encryption data to disk so it survives daemon restarts
       if (encryption) {
         persistSession(sessionId, {
@@ -408,6 +418,7 @@ export async function startDaemon(): Promise<void> {
           agentStateVersion: encryption.agentStateVersion,
           metadata: sessionMetadata,
           savedAt: Date.now(),
+          lastProcessedSeq: inheritedLastProcessedSeq,
         });
       }
 
@@ -419,6 +430,7 @@ export async function startDaemon(): Promise<void> {
         existingSession.happySessionId = sessionId;
         existingSession.happySessionMetadataFromLocalWebhook = sessionMetadata;
         existingSession.encryption = encryption;
+        existingSession.persistedLastProcessedSeq = inheritedLastProcessedSeq;
         if (!sessionStartTimes.has(pid)) {
           sessionStartTimes.set(pid, Date.now());
         }
@@ -440,7 +452,8 @@ export async function startDaemon(): Promise<void> {
           happySessionId: sessionId,
           happySessionMetadataFromLocalWebhook: sessionMetadata,
           encryption,
-          pid
+          pid,
+          persistedLastProcessedSeq: inheritedLastProcessedSeq,
         };
         pidToTrackedSession.set(pid, trackedSession);
         sessionStartTimes.set(pid, Date.now());
@@ -488,6 +501,7 @@ export async function startDaemon(): Promise<void> {
         lastUserInteractionAt?: number;
         lastTurnEndAt?: number;
         launchedBackgroundJob?: boolean;
+        lastProcessedSeq?: number;
         mode?: 'local' | 'remote';
         updatedAt: number;
       },
@@ -512,6 +526,11 @@ export async function startDaemon(): Promise<void> {
       // Sticky once set: a conversation that ever launched a background job
       // stays exempt from the turn-end reap for the rest of its life.
       const launchedBackgroundJob = runtime.launchedBackgroundJob || prev?.launchedBackgroundJob;
+      // Monotonic: a delayed or older-CLI report must never move the resume
+      // skip baseline backwards.
+      const lastProcessedSeq = runtime.lastProcessedSeq !== undefined || prev?.lastProcessedSeq !== undefined
+        ? Math.max(runtime.lastProcessedSeq ?? 0, prev?.lastProcessedSeq ?? 0)
+        : undefined;
       const mode = runtime.mode ?? prev?.mode;
       trackedSession.runtime = {
         thinking: runtime.thinking ?? prev?.thinking ?? false,
@@ -520,6 +539,7 @@ export async function startDaemon(): Promise<void> {
         ...(lastUserInteractionAt !== undefined ? { lastUserInteractionAt } : {}),
         ...(lastTurnEndAt !== undefined ? { lastTurnEndAt } : {}),
         ...(launchedBackgroundJob ? { launchedBackgroundJob } : {}),
+        ...(lastProcessedSeq !== undefined ? { lastProcessedSeq } : {}),
         ...(mode !== undefined ? { mode } : {}),
         updatedAt: runtime.updatedAt,
       };
@@ -954,6 +974,7 @@ export async function startDaemon(): Promise<void> {
           metadata: session.happySessionMetadataFromLocalWebhook,
           savedAt: Date.now(),
           userHomeDir: session.userHomeDir,
+          lastProcessedSeq: session.runtime?.lastProcessedSeq ?? session.persistedLastProcessedSeq,
         });
       }
       logger.debug(`[DAEMON RUN] Preserved session ${session.happySessionId} for resume (${reason})`);
@@ -977,8 +998,13 @@ export async function startDaemon(): Promise<void> {
       }
     };
 
-    const resumeSession = async (happySessionId: string, options?: { model?: string; permissionMode?: string }): Promise<SpawnSessionResult> => {
+    const spawnResumedSession = async (happySessionId: string, options?: { model?: string; permissionMode?: string }): Promise<SpawnSessionResult> => {
       try {
+        if (hasLiveDaemonChild(happySessionId, pidToTrackedSession.values(), isPidAlive)) {
+          logger.debug(`[DAEMON RUN] Resume requested for ${happySessionId} but a live child is already attached — reusing it`);
+          return { type: 'success', sessionId: happySessionId };
+        }
+
         const tracked = findTrackedSessionById(happySessionId);
         if (!tracked) {
           return { type: 'error', errorMessage: `Session ${happySessionId} is not tracked by this daemon. It may have been started before the daemon or on another machine.` };
@@ -1007,12 +1033,10 @@ export async function startDaemon(): Promise<void> {
           };
         }
 
-        // Webhook metadata and seq may be stale after the original child exits.
-        // Fetch a fresh server snapshot before resuming so the child skips only
-        // messages that already exist and starts listening from the latest seq.
-        // The snapshot is fetched with the token the child will actually use,
-        // so an account mismatch fails here (session not visible) instead of
-        // after spawn.
+        // Webhook metadata may be stale after the original child exits. Fetch a
+        // fresh server snapshot before resuming. The snapshot is fetched with
+        // the token the child will actually use, so an account mismatch fails
+        // here (session not visible) instead of after spawn.
         const serverSnapshot = await fetchServerSessionSnapshot(happySessionId, tracked.encryption, credentialDecision.token);
         if (!serverSnapshot) {
           return {
@@ -1020,16 +1044,28 @@ export async function startDaemon(): Promise<void> {
             errorMessage: `Cannot safely resume session ${happySessionId}: latest server metadata is unavailable. Retry when the server is reachable.`,
           };
         }
+        // The skip baseline is the last seq the previous child delivered to its
+        // agent loop — NOT the server head: messages that arrived while the
+        // session had no process exist on the server but were never processed,
+        // and a head baseline silently swallows them (2026-08-05 incident).
+        const baselineSeq = resolveResumeBaselineSeq({
+          reportedSeq: tracked.runtime?.lastProcessedSeq,
+          persistedSeq: tracked.persistedLastProcessedSeq,
+          webhookSeq: tracked.encryption.seq,
+          serverSeq: serverSnapshot.seq,
+        });
         const reconnectEnvironment = buildReconnectSessionEnvironment({
           sessionId: happySessionId,
           encryption: tracked.encryption,
           serverSnapshot,
+          baselineSeq,
         });
         const previousSeq = tracked.encryption.seq;
         const metadata = applyServerSessionSnapshot(tracked, serverSnapshot);
         logger.debug(`[DAEMON RUN] Refreshed session ${happySessionId} snapshot for resume`, {
           previousSeq,
           nextSeq: tracked.encryption.seq,
+          baselineSeq,
         });
 
         const launch = buildResumeLaunch(
@@ -1071,6 +1107,13 @@ export async function startDaemon(): Promise<void> {
         };
       }
     };
+
+    // Concurrent resume RPCs for the same session share one spawn (2026-08-05:
+    // two RPCs 6.7s apart double-spawned a session; both children were later
+    // empty-reaped together).
+    const resumeInFlight = new Map<string, Promise<SpawnSessionResult>>();
+    const resumeSession = (happySessionId: string, options?: { model?: string; permissionMode?: string }): Promise<SpawnSessionResult> =>
+      shareInFlight(resumeInFlight, happySessionId, () => spawnResumedSession(happySessionId, options));
 
     // Local idle guard config for policy-initiated (if-idle) stops. Read once;
     // env overrides are picked up on daemon restart, same as other knobs.

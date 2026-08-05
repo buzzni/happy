@@ -310,6 +310,23 @@ describe('controlServer POST /session-runtime', () => {
     expect(runtimeReports[0].reporter).toEqual({ hostPid: 4242 })
   })
 
+  // The resume skip-baseline is derived from this report: without it the daemon
+  // falls back to the server-head seq and swallows dead-period messages.
+  it('forwards lastProcessedSeq so resume can baseline at the delivered seq', async () => {
+    const res = await fetch(`${baseUrl}/session-runtime`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: 'session-1',
+        thinking: false,
+        lastProcessedSeq: 621,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect((runtimeReports[0].runtime as { lastProcessedSeq?: number }).lastProcessedSeq).toBe(621)
+  })
+
   // Sessions from an older CLI don't send hostPid; the endpoint must still work.
   it('accepts reports without a hostPid', async () => {
     const res = await fetch(`${baseUrl}/session-runtime`, {

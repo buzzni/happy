@@ -1268,6 +1268,10 @@ export class ApiSessionClient extends EventEmitter {
             ...(this.lastUserInteractionAt !== undefined ? { lastUserInteractionAt: this.lastUserInteractionAt } : {}),
             ...(this.lastTurnEndAt !== undefined ? { lastTurnEndAt: this.lastTurnEndAt } : {}),
             ...(this.launchedBackgroundJob ? { launchedBackgroundJob: true } : {}),
+            // Resume skip-baseline: the last seq delivered to the agent loop.
+            // Without it the daemon falls back to the server-head seq, which
+            // swallows messages that arrive while the session has no process.
+            lastProcessedSeq: this.lastSeq,
             mode: this.currentMode,
         });
     }

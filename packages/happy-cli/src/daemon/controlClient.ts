@@ -99,6 +99,7 @@ export async function notifyDaemonSessionRuntime(
     lastUserInteractionAt?: number;
     lastTurnEndAt?: number;
     launchedBackgroundJob?: boolean;
+    lastProcessedSeq?: number;
     mode?: 'local' | 'remote';
   }
 ): Promise<{ error?: string } | any> {
