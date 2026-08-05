@@ -481,6 +481,11 @@ export type PersistedSession = {
   /** Staged per-user HAPPY_HOME_DIR — a resume must restore this identity
    *  (2026-07-23 incident: resuming under the daemon account 404s). */
   userHomeDir?: string;
+  /** Last message seq the session's child delivered to its agent loop — the
+   *  resume skip-baseline. Without it a resume falls back to the server-head
+   *  seq and swallows messages that arrived while the session had no process
+   *  (2026-08-05 incident). */
+  lastProcessedSeq?: number;
 };
 
 type SessionsFile = {

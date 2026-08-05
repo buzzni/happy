@@ -44,6 +44,13 @@ export interface SessionRuntimeState {
    * turn-end reap and falls back to the conservative absolute idle cut.
    */
   launchedBackgroundJob?: boolean;
+  /**
+   * Last message seq the session process delivered to its agent loop. A resume
+   * uses this as the skip baseline so messages that arrived while the session
+   * had no process are replayed instead of being swallowed by the server-head
+   * baseline. Absent for sessions running an older CLI.
+   */
+  lastProcessedSeq?: number;
   /** 'local' = a terminal is attached to this session; 'remote' = app-driven. */
   mode?: 'local' | 'remote';
   updatedAt: number;
@@ -63,6 +70,14 @@ export interface TrackedSession {
   error?: string;
   directoryCreated?: boolean;
   message?: string;
+  /**
+   * Resume skip-baseline restored from disk after a daemon restart. While the
+   * session's own child is alive, `runtime.lastProcessedSeq` is the
+   * authoritative value; this field only carries it across daemon restarts for
+   * sessions preserved on disk (runtime is deliberately not fabricated for
+   * those — the idle guard's stale-runtime protection depends on its absence).
+   */
+  persistedLastProcessedSeq?: number;
   /** tmux session identifier (format: session:window) */
   tmuxSessionId?: string;
   /**

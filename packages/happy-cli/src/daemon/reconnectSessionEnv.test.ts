@@ -6,6 +6,7 @@ import {
     decodeReconnectSessionSnapshot,
     encodeReconnectSessionSnapshot,
     readReconnectSessionEnvironment,
+    resolveResumeBaselineSeq,
 } from './reconnectSessionEnv';
 
 function makeMetadata(overrides: Partial<Metadata> = {}): Metadata {
@@ -106,6 +107,28 @@ describe('reconnect session environment snapshot', () => {
         });
     });
 
+    it('prefers an explicit baselineSeq over the server head so unprocessed messages replay', () => {
+        const env = buildReconnectSessionEnvironment({
+            sessionId: 'happy-session-1',
+            encryption: {
+                encryptionKey: new Uint8Array(32),
+                encryptionVariant: 'legacy',
+                seq: 600,
+                metadataVersion: 3,
+                agentStateVersion: 8,
+            },
+            serverSnapshot: {
+                metadata: makeMetadata(),
+                seq: 678,
+                metadataVersion: 4,
+                agentStateVersion: 7,
+            },
+            baselineSeq: 621,
+        });
+
+        expect(decodeReconnectSessionSnapshot(env.HAPPY_RECONNECT_SNAPSHOT).seq).toBe(621);
+    });
+
     it('fails closed when the daemon cannot fetch the latest server snapshot', () => {
         expect(() => buildReconnectSessionEnvironment({
             sessionId: 'happy-session-1',
@@ -151,5 +174,42 @@ describe('reconnect session environment snapshot', () => {
             HAPPY_RECONNECT_ENCRYPTION_KEY: Buffer.from(new Uint8Array(32)).toString('base64'),
             HAPPY_RECONNECT_ENCRYPTION_VARIANT: 'legacy',
         })).toThrow(/incomplete reconnect environment/i);
+    });
+});
+
+// 2026-08-05 incident: resuming with the server-head seq as the skip baseline
+// silently discarded messages that arrived while the session had no process
+// (user input included), so the resumed child sat idle until the empty-reaper
+// killed it. The baseline must be the last seq the previous child actually
+// delivered to the agent loop, falling back to the old head-based behavior
+// only when no such report exists (older CLI / lost record).
+describe('resolveResumeBaselineSeq', () => {
+    it('uses the reported processed seq so dead-period messages are delivered on resume', () => {
+        expect(resolveResumeBaselineSeq({
+            lastProcessedSeq: 621,
+            webhookSeq: 600,
+            serverSeq: 678,
+        })).toBe(621);
+    });
+
+    it('never goes below the webhook seq even if the report is stale-low', () => {
+        expect(resolveResumeBaselineSeq({
+            lastProcessedSeq: 5,
+            webhookSeq: 600,
+            serverSeq: 678,
+        })).toBe(600);
+    });
+
+    it('falls back to the server head when no processed seq was ever reported', () => {
+        expect(resolveResumeBaselineSeq({
+            webhookSeq: 600,
+            serverSeq: 678,
+        })).toBe(678);
+    });
+
+    it('falls back to the webhook seq when the server snapshot has no seq', () => {
+        expect(resolveResumeBaselineSeq({
+            webhookSeq: 600,
+        })).toBe(600);
     });
 });

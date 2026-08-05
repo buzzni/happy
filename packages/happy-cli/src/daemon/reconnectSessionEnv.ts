@@ -83,10 +83,33 @@ export function decodeReconnectSessionSnapshot(encoded: string): ReconnectSessio
     }
 }
 
+/**
+ * Skip baseline for a resumed child: messages with seq ≤ baseline are never
+ * delivered. Messages that arrived while the session had no process exist on
+ * the server but were never processed, so the baseline must be the last seq
+ * the previous child actually delivered to its agent loop — not the server
+ * head, which silently swallows that dead-period input. The webhook seq is a
+ * floor against a stale-low report; the server head remains the fallback for
+ * sessions that never reported (older CLI, lost record) where replaying
+ * already-processed turns is the greater risk.
+ */
+export function resolveResumeBaselineSeq(input: {
+    lastProcessedSeq?: number;
+    webhookSeq: number;
+    serverSeq?: number;
+}): number {
+    if (input.lastProcessedSeq !== undefined) {
+        return Math.max(input.lastProcessedSeq, input.webhookSeq);
+    }
+    return Math.max(input.webhookSeq, input.serverSeq ?? 0);
+}
+
 export function buildReconnectSessionEnvironment(input: {
     sessionId: string;
     encryption: SessionEncryptionData;
     serverSnapshot: ServerSessionSnapshot | null;
+    /** Overrides the default head-based skip baseline (see resolveResumeBaselineSeq). */
+    baselineSeq?: number;
 }): ReconnectSessionEnvironment {
     if (!input.serverSnapshot) {
         throw new Error('Cannot safely resume without the latest server session snapshot');
@@ -98,7 +121,7 @@ export function buildReconnectSessionEnvironment(input: {
         HAPPY_RECONNECT_ENCRYPTION_VARIANT: input.encryption.encryptionVariant,
         HAPPY_RECONNECT_SNAPSHOT: encodeReconnectSessionSnapshot({
             metadata: input.serverSnapshot.metadata,
-            seq: Math.max(input.encryption.seq, input.serverSnapshot.seq ?? 0),
+            seq: input.baselineSeq ?? Math.max(input.encryption.seq, input.serverSnapshot.seq ?? 0),
             metadataVersion: Math.max(
                 input.encryption.metadataVersion,
                 input.serverSnapshot.metadataVersion ?? 0,

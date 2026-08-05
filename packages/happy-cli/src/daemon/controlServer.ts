@@ -105,6 +105,8 @@ export function startDaemonControlServer({
           lastUserInteractionAt: z.number().optional(),
           lastTurnEndAt: z.number().optional(),
           launchedBackgroundJob: z.boolean().optional(),
+          /** Last message seq delivered to the agent loop. Absent on older CLIs. */
+          lastProcessedSeq: z.number().optional(),
           mode: z.enum(['local', 'remote']).optional(),
           /** PID of the reporting session process. Absent on older CLIs. */
           hostPid: z.number().optional()
@@ -116,7 +118,7 @@ export function startDaemonControlServer({
         }
       }
     }, async (request) => {
-      const { sessionId, thinking, hasOpenToolCall, pendingUserInput, lastUserInteractionAt, lastTurnEndAt, launchedBackgroundJob, mode, hostPid } = request.body;
+      const { sessionId, thinking, hasOpenToolCall, pendingUserInput, lastUserInteractionAt, lastTurnEndAt, launchedBackgroundJob, lastProcessedSeq, mode, hostPid } = request.body;
 
       onHappySessionRuntime(sessionId, {
         ...(thinking !== undefined ? { thinking } : {}),
@@ -125,6 +127,7 @@ export function startDaemonControlServer({
         ...(lastUserInteractionAt !== undefined ? { lastUserInteractionAt } : {}),
         ...(lastTurnEndAt !== undefined ? { lastTurnEndAt } : {}),
         ...(launchedBackgroundJob !== undefined ? { launchedBackgroundJob } : {}),
+        ...(lastProcessedSeq !== undefined ? { lastProcessedSeq } : {}),
         ...(mode !== undefined ? { mode } : {}),
         updatedAt: Date.now()
       }, hostPid !== undefined ? { hostPid } : undefined);
