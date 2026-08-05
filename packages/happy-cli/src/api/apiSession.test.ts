@@ -1393,6 +1393,50 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(mockAxiosGet).not.toHaveBeenCalled();
     });
 
+    it('routes a message once when polling and the socket deliver the same seq concurrently', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        const onUserMessage = vi.fn();
+        client.onUserMessage(onUserMessage);
+
+        const userMessage = {
+            role: 'user',
+            content: { type: 'text', text: 'one durable message' }
+        };
+        let resolveFetch!: (value: unknown) => void;
+        mockAxiosGet.mockImplementationOnce(() => new Promise((resolve) => {
+            resolveFetch = resolve;
+        }));
+
+        const fetchPromise = (client as any).fetchMessages();
+        await waitForCheck(() => {
+            expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+        });
+
+        emitSocketEvent('update', createNewMessageUpdate(1, encryptContent(session, userMessage)));
+        expect(onUserMessage).toHaveBeenCalledTimes(1);
+
+        resolveFetch({
+            data: {
+                messages: [
+                    {
+                        id: 'msg-1',
+                        seq: 1,
+                        content: { t: 'encrypted', c: encryptContent(session, userMessage) },
+                        localId: null,
+                        createdAt: 1000,
+                        updatedAt: 1000
+                    }
+                ],
+                hasMore: false
+            }
+        });
+        await fetchPromise;
+
+        expect(onUserMessage).toHaveBeenCalledTimes(1);
+        expect(onUserMessage).toHaveBeenCalledWith(userMessage);
+        expect((client as any).lastSeq).toBe(1);
+    });
+
     it('invalidates receive sync and fetches on seq gap', async () => {
         const client = new ApiSessionClient('fake-token', session);
         (client as any).lastSeq = 1;

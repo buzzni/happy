@@ -250,6 +250,7 @@ export class CodexAppServerClient {
     // receive one well-formed turn: tool start → tool end → turn end.
     private openCommandExecutionTurns = new Map<string, string | null>();
     private deferredRawTurnCompletion: DeferredRawTurnCompletion | null = null;
+    private rawTurnCompletionFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
     // Last known startup status per MCP server (name -> status, e.g. 'ready'/'starting'/'failed').
     // Used to explain a watchdog-forced abort: a turn can hang building its tool
@@ -398,6 +399,7 @@ export class CodexAppServerClient {
             );
             return;
         }
+        this.clearRawTurnCompletionFallback();
         if (this.deferredRawTurnCompletion) {
             // final_answer and idle are fallback completion signals. Preserve
             // the authoritative turn/completed status when it arrives while a
@@ -412,6 +414,31 @@ export class CodexAppServerClient {
             return;
         }
         this.emitRawTurnCompletion(turnId, status, error, source);
+    }
+
+    private clearRawTurnCompletionFallback(): void {
+        if (!this.rawTurnCompletionFallbackTimer) return;
+        clearTimeout(this.rawTurnCompletionFallbackTimer);
+        this.rawTurnCompletionFallbackTimer = null;
+    }
+
+    private scheduleRawTurnCompletionFallback(
+        turnId: string | null,
+        status: string | null,
+        error: unknown,
+        source: string,
+    ): void {
+        if (!this.matchesPendingTurn(turnId)) {
+            logger.debug(
+                `[CodexAppServer] Ignoring ${source} for turn ${turnId}; terminal event is deferred for another turn`,
+            );
+            return;
+        }
+        this.clearRawTurnCompletionFallback();
+        this.rawTurnCompletionFallbackTimer = setTimeout(() => {
+            this.rawTurnCompletionFallbackTimer = null;
+            this.emitOrDeferRawTurnCompletion(turnId, status, error, source);
+        }, CodexAppServerClient.RAW_TURN_COMPLETION_FALLBACK_GRACE_MS);
     }
 
     private flushDeferredRawTurnCompletion(): void {
@@ -587,7 +614,7 @@ export class CodexAppServerClient {
             }
 
             if (item.phase === 'final_answer' && this.pendingTurnCompletion) {
-                this.emitOrDeferRawTurnCompletion(
+                this.scheduleRawTurnCompletionFallback(
                     this.extractTurnId(params),
                     'completed',
                     null,
@@ -719,7 +746,10 @@ export class CodexAppServerClient {
         logger.debug('[CodexAppServer] Connected and initialized');
     }
 
-    private async disconnectInternal(opts?: { preserveThreadState?: boolean }): Promise<void> {
+    private async disconnectInternal(opts?: {
+        preserveThreadState?: boolean;
+        preservePendingTurnCompletion?: boolean;
+    }): Promise<void> {
         if (!this.connected && !this.process) return;
 
         const proc = this.process;
@@ -770,8 +800,12 @@ export class CodexAppServerClient {
             this.pending.delete(id);
         }
 
-        // Resolve pending turn completion (treat as abort)
-        this.resolvePendingTurn(true);
+        // A forced restart keeps the current caller pending until the replacement
+        // process has initialized and resumed the thread. This prevents the queue
+        // loop from dispatching its next turn against an unresumed app-server.
+        if (!opts?.preservePendingTurnCompletion) {
+            this.resolvePendingTurn(true);
+        }
 
         if (this.sandboxCleanup) {
             try { await this.sandboxCleanup(); } catch { /* ignore */ }
@@ -974,9 +1008,12 @@ export class CodexAppServerClient {
         return await this.request('thread/goal/clear', params) as ThreadGoalClearResponse;
     }
 
-    async reconnectAndResumeThread(): Promise<boolean> {
+    async reconnectAndResumeThread(opts?: { preservePendingTurnCompletion?: boolean }): Promise<boolean> {
         const threadId = this._threadId;
-        await this.disconnectInternal({ preserveThreadState: !!threadId });
+        await this.disconnectInternal({
+            preserveThreadState: !!threadId,
+            preservePendingTurnCompletion: opts?.preservePendingTurnCompletion,
+        });
         await this.connect();
 
         if (!threadId) {
@@ -998,6 +1035,8 @@ export class CodexAppServerClient {
 
     /** Default grace period after interrupt before forcing a restart (ms). */
     private static readonly ABORT_GRACE_MS = 3_000;
+    /** Allow the authoritative terminal notification to follow the final answer. */
+    private static readonly RAW_TURN_COMPLETION_FALLBACK_GRACE_MS = 250;
 
     private hasPendingTurnCompletion(): boolean {
         return this.pendingTurnCompletion !== null;
@@ -1008,6 +1047,7 @@ export class CodexAppServerClient {
         if (this.pendingTurnCompletion.inactivityTimer) {
             clearTimeout(this.pendingTurnCompletion.inactivityTimer);
         }
+        this.clearRawTurnCompletionFallback();
         this.pendingTurnCompletion.resolve(aborted);
         this.pendingTurnCompletion = null;
         this.openCommandExecutionTurns.clear();
@@ -1171,7 +1211,16 @@ export class CodexAppServerClient {
                 } : {}),
             });
         }
-        const resumedThread = await this.reconnectAndResumeThread();
+        let resumedThread = false;
+        try {
+            resumedThread = await this.reconnectAndResumeThread({ preservePendingTurnCompletion: true });
+        } finally {
+            if (!resumedThread) {
+                this._threadId = null;
+                this.threadDefaults = null;
+            }
+            this.resolvePendingTurn(true);
+        }
         return { hadActiveTurn: true, aborted: true, forcedRestart: true, resumedThread };
     }
 

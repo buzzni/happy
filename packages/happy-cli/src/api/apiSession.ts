@@ -734,6 +734,13 @@ export class ApiSessionClient extends EventEmitter {
                     maxSeq = message.seq;
                 }
 
+                // A polling request can begin before a live socket update advances
+                // lastSeq, then return the same durable message afterward. Re-check
+                // the shared cursor at apply time so the message is routed once.
+                if (message.seq <= this.lastSeq) {
+                    continue;
+                }
+
                 const shouldSkipExistingMessage = skipRouting
                     && (skipThroughSeq === null || message.seq <= skipThroughSeq);
                 if (shouldSkipExistingMessage) {

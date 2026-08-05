@@ -378,6 +378,197 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('keeps a queued turn behind thread resume during a forced restart', async () => {
+        const firstProcessRequests: MockRpcMessage[] = [];
+        const secondProcessRequests: MockRpcMessage[] = [];
+        let resumeCompleted = false;
+
+        const proc1 = createMockProcess({
+            pid: 2011,
+            onRequest: (msg, stdout) => {
+                firstProcessRequests.push(msg);
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { thread: { id: 'thread-restart-order', path: '/tmp/thread-restart-order' } },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { turn: { id: 'turn-before-restart' } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: {
+                                threadId: 'thread-restart-order',
+                                turn: { id: 'turn-before-restart', status: 'inProgress' },
+                            },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'turn/interrupt' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, { id: msg.id, result: {} }), 0);
+                }
+            },
+        });
+
+        const proc2 = createMockProcess({
+            pid: 2012,
+            initializeDelayMs: 30,
+            onRequest: (msg, stdout) => {
+                secondProcessRequests.push(msg);
+                if (msg.method === 'thread/resume' && msg.id != null) {
+                    setTimeout(() => {
+                        resumeCompleted = true;
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { thread: { id: 'thread-restart-order', path: '/tmp/thread-restart-order' } },
+                        });
+                    }, 30);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { turn: { id: 'turn-after-resume' } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: {
+                                threadId: 'thread-restart-order',
+                                turn: { id: 'turn-after-resume', status: 'inProgress' },
+                            },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: {
+                                threadId: 'thread-restart-order',
+                                turn: { id: 'turn-after-resume', status: 'completed', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        });
+
+        mockSpawn
+            .mockImplementationOnce(() => proc1)
+            .mockImplementationOnce(() => proc2);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'never',
+            sandbox: 'danger-full-access',
+        });
+
+        const interruptedTurn = client.sendTurnAndWait('hang before restart', { turnTimeoutMs: 60_000 });
+        const queuedTurn = interruptedTurn.then(() => client.sendTurnAndWait('queued during restart'));
+        await waitFor(() => firstProcessRequests.some((msg) => msg.method === 'turn/start'));
+
+        const restart = client.abortTurnWithFallback({
+            gracePeriodMs: 1,
+            forceRestartOnTimeout: true,
+        });
+        await waitFor(() => secondProcessRequests.some((msg) => msg.method === 'turn/start'));
+
+        expect(resumeCompleted).toBe(true);
+        expect(secondProcessRequests.findIndex((msg) => msg.method === 'thread/resume')).toBeLessThan(
+            secondProcessRequests.findIndex((msg) => msg.method === 'turn/start'),
+        );
+        await expect(restart).resolves.toEqual(expect.objectContaining({
+            forcedRestart: true,
+            resumedThread: true,
+        }));
+        await expect(interruptedTurn).resolves.toEqual({ aborted: true });
+        await expect(queuedTurn).resolves.toEqual({ aborted: false });
+
+        await client.disconnect();
+    });
+
+    it('does not dispatch a queued turn when forced restart cannot resume the thread', async () => {
+        const firstProcessRequests: MockRpcMessage[] = [];
+        const secondProcessRequests: MockRpcMessage[] = [];
+        const proc1 = createMockProcess({
+            pid: 2013,
+            onRequest: (msg, stdout) => {
+                firstProcessRequests.push(msg);
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { thread: { id: 'thread-resume-failure', path: '/tmp/thread-resume-failure' } },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { turn: { id: 'turn-resume-failure' } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: {
+                                threadId: 'thread-resume-failure',
+                                turn: { id: 'turn-resume-failure', status: 'inProgress' },
+                            },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'turn/interrupt' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, { id: msg.id, result: {} }), 0);
+                }
+            },
+        });
+        const proc2 = createMockProcess({
+            pid: 2014,
+            initializeDelayMs: 20,
+            onRequest: (msg, stdout) => {
+                secondProcessRequests.push(msg);
+                if (msg.method === 'thread/resume' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        error: { code: -32600, message: 'thread not found' },
+                    }), 20);
+                }
+            },
+        });
+        mockSpawn
+            .mockImplementationOnce(() => proc1)
+            .mockImplementationOnce(() => proc2);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'never',
+            sandbox: 'danger-full-access',
+        });
+
+        const interruptedTurn = client.sendTurnAndWait('hang before failed resume', { turnTimeoutMs: 60_000 });
+        const queuedTurn = interruptedTurn.then(() => client.sendTurnAndWait('must not dispatch'));
+        await waitFor(() => firstProcessRequests.some((msg) => msg.method === 'turn/start'));
+
+        await expect(client.abortTurnWithFallback({
+            gracePeriodMs: 1,
+            forceRestartOnTimeout: true,
+        })).resolves.toEqual(expect.objectContaining({
+            forcedRestart: true,
+            resumedThread: false,
+        }));
+        await expect(interruptedTurn).resolves.toEqual({ aborted: true });
+        await expect(queuedTurn).rejects.toThrow('No active thread');
+        expect(secondProcessRequests.some((msg) => msg.method === 'turn/start')).toBe(false);
+
+        await client.disconnect();
+    });
+
     it('keeps an active turn alive when provider progress resets the inactivity timeout', async () => {
         let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
         const proc = createMockProcess({
@@ -2166,6 +2357,102 @@ describe('CodexAppServerClient sandbox integration', () => {
             expect.objectContaining({ type: 'task_started' }),
             expect.objectContaining({ type: 'task_complete' }),
         ]);
+
+        await client.disconnect();
+    });
+
+    it('does not start a queued turn before the prior turn authoritative completion', async () => {
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        let turnStartCount = 0;
+        const proc = createMockProcess({
+            pid: 3010,
+            onRequest: (msg, stdout) => {
+                appServerStdout = stdout;
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: {
+                                thread: { id: 'thread-authoritative', path: '/tmp/thread-authoritative' },
+                                model: 'gpt-test',
+                            },
+                        });
+                    }, 0);
+                }
+
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    turnStartCount += 1;
+                    const turnId = turnStartCount === 1 ? 'turn-first' : 'turn-second';
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: turnId } } });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: {
+                                threadId: 'thread-authoritative',
+                                turn: { id: turnId, status: 'inProgress' },
+                            },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'item/completed',
+                            params: {
+                                threadId: 'thread-authoritative',
+                                turnId,
+                                item: {
+                                    type: 'agentMessage',
+                                    id: `msg-${turnId}`,
+                                    text: `${turnId} done`,
+                                    phase: 'final_answer',
+                                },
+                            },
+                        });
+                        if (turnId === 'turn-second') {
+                            pushJsonLine(stdout, {
+                                method: 'turn/completed',
+                                params: {
+                                    threadId: 'thread-authoritative',
+                                    turn: { id: turnId, status: 'completed', error: null },
+                                },
+                            });
+                        }
+                    }, 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((msg) => events.push(msg as Record<string, unknown>));
+
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'never',
+            sandbox: 'danger-full-access',
+        });
+
+        const first = client.sendTurnAndWait('first request');
+        const second = first.then(() => client.sendTurnAndWait('second request'));
+        await waitFor(() => events.some((event) => (
+            event.type === 'agent_message' && event.message === 'turn-first done'
+        )));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        expect(turnStartCount).toBe(1);
+        if (!appServerStdout) throw new Error('app-server stdout unavailable');
+        pushJsonLine(appServerStdout, {
+            method: 'turn/completed',
+            params: {
+                threadId: 'thread-authoritative',
+                turn: { id: 'turn-first', status: 'completed', error: null },
+            },
+        });
+
+        await expect(first).resolves.toEqual({ aborted: false });
+        await expect(second).resolves.toEqual({ aborted: false });
+        expect(turnStartCount).toBe(2);
 
         await client.disconnect();
     });
