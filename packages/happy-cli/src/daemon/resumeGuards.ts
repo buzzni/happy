@@ -8,13 +8,22 @@
  * in-flight spawn.
  */
 
-/** True when a live daemon child is already attached to the happy session. */
+/**
+ * True when a daemon child with a running process is already attached to the
+ * happy session.
+ *
+ * The tracked-session map alone is not proof of liveness: adopted/external
+ * sessions carry no childProcess handle, so no exit event evicts them and only
+ * the periodic health check prunes their PID. Answering "already running" for a
+ * dead entry would turn a resume into a no-op, so the PID is verified here.
+ */
 export function hasLiveDaemonChild(
     happySessionId: string,
-    liveSessions: Iterable<{ happySessionId?: string }>,
+    trackedSessions: Iterable<{ happySessionId?: string; pid: number }>,
+    isPidAlive: (pid: number) => boolean,
 ): boolean {
-    for (const session of liveSessions) {
-        if (session.happySessionId === happySessionId) return true;
+    for (const session of trackedSessions) {
+        if (session.happySessionId === happySessionId && isPidAlive(session.pid)) return true;
     }
     return false;
 }

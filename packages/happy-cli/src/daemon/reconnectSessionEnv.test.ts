@@ -192,12 +192,16 @@ describe('resolveResumeBaselineSeq', () => {
         })).toBe(621);
     });
 
-    it('never goes below the webhook seq even if the report is stale-low', () => {
+    // The tracked webhook seq is NOT an "already processed" marker: a previous
+    // resume attempt rewrites it to the server head via applyServerSessionSnapshot.
+    // Treating it as a floor would re-swallow exactly the messages this baseline
+    // exists to deliver, so a real report always wins outright.
+    it('trusts the reported seq over a webhook seq poisoned by an earlier resume', () => {
         expect(resolveResumeBaselineSeq({
-            lastProcessedSeq: 5,
-            webhookSeq: 600,
+            lastProcessedSeq: 621,
+            webhookSeq: 678,
             serverSeq: 678,
-        })).toBe(600);
+        })).toBe(621);
     });
 
     it('falls back to the server head when no processed seq was ever reported', () => {

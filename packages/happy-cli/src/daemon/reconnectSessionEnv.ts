@@ -88,10 +88,15 @@ export function decodeReconnectSessionSnapshot(encoded: string): ReconnectSessio
  * delivered. Messages that arrived while the session had no process exist on
  * the server but were never processed, so the baseline must be the last seq
  * the previous child actually delivered to its agent loop — not the server
- * head, which silently swallows that dead-period input. The webhook seq is a
- * floor against a stale-low report; the server head remains the fallback for
- * sessions that never reported (older CLI, lost record) where replaying
- * already-processed turns is the greater risk.
+ * head, which silently swallows that dead-period input.
+ *
+ * A reported seq wins outright, with no floor from the tracked webhook seq:
+ * that value is not an "already processed" marker, and `applyServerSessionSnapshot`
+ * rewrites it to the server head on every resume attempt, so flooring against it
+ * would re-swallow the messages this baseline exists to deliver.
+ *
+ * The server head remains the fallback for sessions that never reported (older
+ * CLI, lost record), where replaying already-processed turns is the greater risk.
  */
 export function resolveResumeBaselineSeq(input: {
     lastProcessedSeq?: number;
@@ -99,7 +104,7 @@ export function resolveResumeBaselineSeq(input: {
     serverSeq?: number;
 }): number {
     if (input.lastProcessedSeq !== undefined) {
-        return Math.max(input.lastProcessedSeq, input.webhookSeq);
+        return input.lastProcessedSeq;
     }
     return Math.max(input.webhookSeq, input.serverSeq ?? 0);
 }

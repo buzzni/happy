@@ -7,18 +7,37 @@ import { hasLiveDaemonChild, shareInFlight } from './resumeGuards';
 // empty-reaped 15 minutes later. A resume must reuse a live child and share an
 // in-flight spawn instead of double-spawning.
 describe('hasLiveDaemonChild', () => {
+    const alive = () => true;
+
     it('detects a live child already attached to the session', () => {
         expect(hasLiveDaemonChild('session-1', [
-            { happySessionId: 'session-other' },
-            { happySessionId: 'session-1' },
-        ])).toBe(true);
+            { happySessionId: 'session-other', pid: 10 },
+            { happySessionId: 'session-1', pid: 11 },
+        ], alive)).toBe(true);
     });
 
     it('reports no live child when only other sessions are running', () => {
         expect(hasLiveDaemonChild('session-1', [
-            { happySessionId: 'session-other' },
-            { happySessionId: undefined },
-        ])).toBe(false);
+            { happySessionId: 'session-other', pid: 10 },
+            { happySessionId: undefined, pid: 11 },
+        ], alive)).toBe(false);
+    });
+
+    // Adopted/external sessions have no childProcess handle, so no exit event
+    // removes them — only the periodic health check prunes dead PIDs. Trusting
+    // the map alone would answer "already running" for a session whose process
+    // died seconds ago, and the resume would spawn nothing at all.
+    it('ignores a tracked entry whose process is already dead', () => {
+        expect(hasLiveDaemonChild('session-1', [
+            { happySessionId: 'session-1', pid: 99 },
+        ], (pid) => pid !== 99)).toBe(false);
+    });
+
+    it('still finds a live entry when a dead duplicate is listed first', () => {
+        expect(hasLiveDaemonChild('session-1', [
+            { happySessionId: 'session-1', pid: 99 },
+            { happySessionId: 'session-1', pid: 100 },
+        ], (pid) => pid !== 99)).toBe(true);
     });
 });
 

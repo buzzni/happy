@@ -400,6 +400,14 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[DAEMON RUN] Session webhook: ${sessionId}, PID: ${pid}, started by: ${sessionMetadata.startedBy || 'unknown'}, hasEncryption: ${!!encryption}`);
       logger.debug(`[DAEMON RUN] Current tracked sessions before webhook: ${Array.from(pidToTrackedSession.keys()).join(', ')}`);
 
+      // A resumed child re-persists this record at startup, before it has
+      // reported any runtime. Carry the preserved skip-baseline forward or the
+      // rewrite drops it, and a child that dies inside that window would resume
+      // from the server head again — swallowing the very messages it was
+      // resumed to deliver (2026-08-05 incident).
+      const preserved = sessionIdToFinishedSession.get(sessionId);
+      const inheritedLastProcessedSeq = preserved?.runtime?.lastProcessedSeq ?? preserved?.persistedLastProcessedSeq;
+
       // Persist encryption data to disk so it survives daemon restarts
       if (encryption) {
         persistSession(sessionId, {
@@ -410,6 +418,7 @@ export async function startDaemon(): Promise<void> {
           agentStateVersion: encryption.agentStateVersion,
           metadata: sessionMetadata,
           savedAt: Date.now(),
+          lastProcessedSeq: inheritedLastProcessedSeq,
         });
       }
 
@@ -421,6 +430,7 @@ export async function startDaemon(): Promise<void> {
         existingSession.happySessionId = sessionId;
         existingSession.happySessionMetadataFromLocalWebhook = sessionMetadata;
         existingSession.encryption = encryption;
+        existingSession.persistedLastProcessedSeq = inheritedLastProcessedSeq;
         if (!sessionStartTimes.has(pid)) {
           sessionStartTimes.set(pid, Date.now());
         }
@@ -442,7 +452,8 @@ export async function startDaemon(): Promise<void> {
           happySessionId: sessionId,
           happySessionMetadataFromLocalWebhook: sessionMetadata,
           encryption,
-          pid
+          pid,
+          persistedLastProcessedSeq: inheritedLastProcessedSeq,
         };
         pidToTrackedSession.set(pid, trackedSession);
         sessionStartTimes.set(pid, Date.now());
@@ -987,16 +998,9 @@ export async function startDaemon(): Promise<void> {
       }
     };
 
-    // Concurrent resume RPCs for the same session share one spawn (2026-08-05:
-    // two RPCs 6.7s apart double-spawned a session; both children were later
-    // empty-reaped together).
-    const resumeInFlight = new Map<string, Promise<SpawnSessionResult>>();
-    const resumeSession = (happySessionId: string, options?: { model?: string; permissionMode?: string }): Promise<SpawnSessionResult> =>
-      shareInFlight(resumeInFlight, happySessionId, () => resumeSessionInner(happySessionId, options));
-
-    const resumeSessionInner = async (happySessionId: string, options?: { model?: string; permissionMode?: string }): Promise<SpawnSessionResult> => {
+    const spawnResumedSession = async (happySessionId: string, options?: { model?: string; permissionMode?: string }): Promise<SpawnSessionResult> => {
       try {
-        if (hasLiveDaemonChild(happySessionId, pidToTrackedSession.values())) {
+        if (hasLiveDaemonChild(happySessionId, pidToTrackedSession.values(), isPidAlive)) {
           logger.debug(`[DAEMON RUN] Resume requested for ${happySessionId} but a live child is already attached — reusing it`);
           return { type: 'success', sessionId: happySessionId };
         }
@@ -1102,6 +1106,13 @@ export async function startDaemon(): Promise<void> {
         };
       }
     };
+
+    // Concurrent resume RPCs for the same session share one spawn (2026-08-05:
+    // two RPCs 6.7s apart double-spawned a session; both children were later
+    // empty-reaped together).
+    const resumeInFlight = new Map<string, Promise<SpawnSessionResult>>();
+    const resumeSession = (happySessionId: string, options?: { model?: string; permissionMode?: string }): Promise<SpawnSessionResult> =>
+      shareInFlight(resumeInFlight, happySessionId, () => spawnResumedSession(happySessionId, options));
 
     // Local idle guard config for policy-initiated (if-idle) stops. Read once;
     // env overrides are picked up on daemon restart, same as other knobs.
