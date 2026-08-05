@@ -3,16 +3,20 @@ import { Fastify } from "../types";
 import { httpRequestsCounter, httpRequestDurationHistogram, getMetricsLabelsFromRequest } from "@/app/monitoring/metrics2";
 import { log } from "@/utils/log";
 
-async function sendReadiness(reply: { code: (statusCode: number) => { send: (payload: unknown) => void }; send: (payload: unknown) => void }) {
+function sendProcessStatus(reply: { send: (payload: unknown) => void }) {
+    reply.send({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        service: 'happy-server'
+    });
+}
+
+async function sendHealth(reply: { code: (statusCode: number) => { send: (payload: unknown) => void }; send: (payload: unknown) => void }) {
     try {
-        // Keep readiness dependency checks intentionally small. This is a
-        // single connection liveness probe, not a DB health audit.
+        // Keep the dependency check intentionally small. This is a single
+        // connection liveness probe, not a DB health audit.
         await db.$queryRaw`SELECT 1`;
-        reply.send({
-            status: 'ok',
-            timestamp: new Date().toISOString(),
-            service: 'happy-server'
-        });
+        sendProcessStatus(reply);
     } catch (error) {
         log({ module: 'health', level: 'error' }, `Health check failed: ${error}`);
         reply.code(503).send({
@@ -46,18 +50,19 @@ export function enableMonitoring(app: Fastify) {
     });
 
     app.get('/live', async (_request, reply) => {
-        reply.send({
-            status: 'ok',
-            timestamp: new Date().toISOString(),
-            service: 'happy-server'
-        });
+        sendProcessStatus(reply);
     });
 
+    // specs/readiness-probe-decoupling — readiness MUST NOT depend on the
+    // database. It shares Prisma's pool with the app, so a stalled DB used to
+    // fail this probe, drop the pod from the Service endpoints and turn a
+    // partial degradation into a full outage (2026-08-05). Deep dependency
+    // checks live on /health, which alerting consumes instead.
     app.get('/ready', async (_request, reply) => {
-        await sendReadiness(reply);
+        sendProcessStatus(reply);
     });
 
     app.get('/health', async (_request, reply) => {
-        await sendReadiness(reply);
+        await sendHealth(reply);
     });
 }
