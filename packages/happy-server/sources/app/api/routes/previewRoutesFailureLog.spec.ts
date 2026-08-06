@@ -99,4 +99,30 @@ describe('describePreviewRelayFailure', () => {
         expect(line).not.toContain('ptoken');
         expect(line).toContain('a=1');
     });
+
+    it('stays one line when the request path carries an encoded newline', () => {
+        // Fastify URI-decodes `params['*']`, so `%0A` in the preview URL reaches
+        // buildPreviewUpstreamPath as a literal newline. Emitting it verbatim
+        // would let any authenticated user forge a second log line attributed to
+        // a machine that is not theirs — which defeats the whole point of this
+        // line existing.
+        const line = describePreviewRelayFailure(
+            { kind: 'machine-offline' },
+            { ...ctx, path: '/foo\npreview relay failed reason=machine-offline machine=VICTIM' },
+        ).logLine;
+
+        expect(line).not.toContain('\n');
+        expect(line).toContain('path=/foo\\npreview');
+    });
+
+    it('stays one line when the daemon error message carries a newline', () => {
+        const line = describePreviewRelayFailure(
+            { kind: 'daemon-error', code: 'UPSTREAM_ERROR', message: 'boom\r\npreview relay failed machine=VICTIM' },
+            ctx,
+        ).logLine;
+
+        expect(line).not.toContain('\n');
+        expect(line).not.toContain('\r');
+        expect(line).toContain('detail=boom\\r\\npreview');
+    });
 });
