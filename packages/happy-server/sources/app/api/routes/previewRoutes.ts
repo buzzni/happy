@@ -462,6 +462,21 @@ export function previewRoutes(app: Fastify) {
                     return reply.code(204).headers(outHeaders).send();
                 }
 
+                // Build the upstream path (everything after `:port/`) while
+                // preserving raw query syntax. Vite virtual modules use
+                // valueless flags such as `?svelte&type=style&lang.css`;
+                // URLSearchParams would normalize them to `svelte=` and break
+                // plugin matching. Strip only the relay auth token.
+                //
+                // Computed before the socket lookup because the failure logs
+                // below must report a ptoken-free path — see
+                // specs/preview-relay-502-observability.
+                const subPath = params['*'] ?? '';
+                const upstreamPath = buildPreviewUpstreamPath(
+                    subPath,
+                    request.raw.url ?? request.url,
+                );
+
                 // Find machine sockets. A daemon reconnect can briefly leave
                 // stale machine-scoped connections around; try all live
                 // candidates so one stale socket cannot pin preview to a 35s
@@ -473,17 +488,6 @@ export function previewRoutes(app: Fastify) {
                 if (machineSockets.length > 1) {
                     log({ module: 'preview', level: 'warn' }, `multiple machine sockets for preview relay: user=${claims.userId} machine=${params.machineId} count=${machineSockets.length}`);
                 }
-
-                // Build the upstream path (everything after `:port/`) while
-                // preserving raw query syntax. Vite virtual modules use
-                // valueless flags such as `?svelte&type=style&lang.css`;
-                // URLSearchParams would normalize them to `svelte=` and break
-                // plugin matching. Strip only the relay auth token.
-                const subPath = params['*'] ?? '';
-                const upstreamPath = buildPreviewUpstreamPath(
-                    subPath,
-                    request.raw.url ?? request.url,
-                );
 
                 const bodyBuf: Buffer | undefined = request.body as Buffer | undefined;
                 const bodyB64 = bodyBuf && bodyBuf.length > 0 ? bodyBuf.toString('base64') : null;
