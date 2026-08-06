@@ -176,6 +176,67 @@ export function buildPreviewUpstreamPath(subPath: string, rawUrl: string): strin
     return `/${subPath}${forwardedQuery ? `?${forwardedQuery}` : ''}`;
 }
 
+/**
+ * specs/preview-relay-502-observability — the relay's two failure branches
+ * both answer 502, and the access log (enableMonitoring.ts) records only the
+ * route template and duration. That made "the daemon is gone" (abnormal) and
+ * "the dev server has not opened its port yet" (normal while booting, and
+ * polled for on purpose by web-ui's checkPortReachable) indistinguishable
+ * after the fact. This turns each failure into one greppable line.
+ *
+ * Status mapping is unchanged — 502/504 is a contract with checkPortReachable.
+ */
+export type PreviewRelayOutcome =
+    | { kind: 'machine-offline' }
+    | { kind: 'daemon-error'; code: string; message: string };
+
+export interface PreviewRelayFailureContext {
+    method: string;
+    machineId: string;
+    port: number;
+    userId: string;
+    /** Upstream path, i.e. `buildPreviewUpstreamPath` output — never the raw URL. */
+    path: string;
+    candidates: number;
+}
+
+export interface PreviewRelayFailure {
+    status: number;
+    reason: string;
+    logLine: string;
+}
+
+export function describePreviewRelayFailure(
+    outcome: PreviewRelayOutcome,
+    ctx: PreviewRelayFailureContext,
+): PreviewRelayFailure {
+    const status = outcome.kind === 'machine-offline'
+        ? 502
+        : outcome.code === 'INVALID_PORT' || outcome.code === 'INVALID_PATH' ? 400
+            : outcome.code === 'TIMEOUT' ? 504
+                : 502;
+    const reason = outcome.kind === 'machine-offline'
+        ? 'machine-offline'
+        : `daemon:${outcome.code}`;
+
+    // Backstop for specs/happy-server-log-volume Requirement 4 (never log the
+    // signed ptoken). Callers already pass a stripped path; re-running the same
+    // filter here keeps one source of truth for what "stripped" means.
+    const safePath = buildPreviewUpstreamPath(
+        ctx.path.replace(/^\//, '').split('?')[0],
+        ctx.path,
+    );
+
+    const detail = outcome.kind === 'machine-offline' ? '' : ` detail=${outcome.message}`;
+    return {
+        status,
+        reason,
+        logLine: `preview relay failed reason=${reason} status=${status} `
+            + `method=${ctx.method} machine=${ctx.machineId} port=${ctx.port} `
+            + `user=${ctx.userId} path=${safePath} candidates=${ctx.candidates}${detail}`,
+    };
+}
+
 export function stripResponseHeaders(
     headers: Record<string, string | string[]>,
     prefix?: string,
@@ -482,8 +543,18 @@ export function previewRoutes(app: Fastify) {
                 // candidates so one stale socket cannot pin preview to a 35s
                 // relay timeout while a fresh daemon socket is already ready.
                 const machineSockets = findMachineSockets(claims.userId, params.machineId);
+                const failureContext = {
+                    method: request.method,
+                    machineId: params.machineId,
+                    port: portNum,
+                    userId: claims.userId,
+                    path: upstreamPath,
+                    candidates: machineSockets.length,
+                };
                 if (machineSockets.length === 0) {
-                    return reply.code(502).send({ error: 'Machine offline' });
+                    const failure = describePreviewRelayFailure({ kind: 'machine-offline' }, failureContext);
+                    log({ module: 'preview', level: 'warn' }, failure.logLine);
+                    return reply.code(failure.status).send({ error: 'Machine offline' });
                 }
                 if (machineSockets.length > 1) {
                     log({ module: 'preview', level: 'warn' }, `multiple machine sockets for preview relay: user=${claims.userId} machine=${params.machineId} count=${machineSockets.length}`);
@@ -513,10 +584,12 @@ export function previewRoutes(app: Fastify) {
                 }
 
                 if (rpcResponse.type === 'error') {
-                    const status =
-                        rpcResponse.code === 'INVALID_PORT' || rpcResponse.code === 'INVALID_PATH' ? 400 :
-                        rpcResponse.code === 'TIMEOUT' ? 504 : 502;
-                    return reply.code(status).send({ code: rpcResponse.code, error: rpcResponse.message });
+                    const failure = describePreviewRelayFailure(
+                        { kind: 'daemon-error', code: rpcResponse.code, message: rpcResponse.message },
+                        failureContext,
+                    );
+                    log({ module: 'preview', level: 'warn' }, failure.logLine);
+                    return reply.code(failure.status).send({ code: rpcResponse.code, error: rpcResponse.message });
                 }
 
                 // Successful proxy response — rewrite HTML/JS/CSS if applicable.
