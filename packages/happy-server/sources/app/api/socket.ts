@@ -19,6 +19,7 @@ import { terminalRelayHandler } from "./socket/terminalRelayHandler";
 import { setTerminalSessionBackend, type TerminalSessionBackend } from "./socket/terminalSessions";
 import { previewWsMachineHandler, registerPreviewWsClusterListeners } from "@/modules/preview/previewWebSocketRelay";
 import { db } from "@/storage/db";
+import { markMachineOffline, markMachineOnline } from "@/app/presence/machinePresence";
 
 export function startSocket(app: Fastify) {
     const io = new Server(app.server, {
@@ -223,13 +224,21 @@ export function startSocket(app: Fastify) {
 
         // Broadcast daemon online status
         if (connection.connectionType === 'machine-scoped') {
+            const connectedAt = Date.now();
             // Broadcast daemon online
-            const machineActivity = buildMachineActivityEphemeral(machineId!, true, Date.now());
+            const machineActivity = buildMachineActivityEphemeral(machineId!, true, connectedAt);
             eventRouter.emitEphemeral({
                 userId,
                 payload: machineActivity,
                 recipientFilter: { type: 'user-scoped-only' }
             });
+
+            // specs/machine-active-recovery — 브로드캐스트만으로는 DB 의
+            // Machine.active 가 false 인 채로 남는다. 끊김 경로가
+            // active=false 를 영속화하므로 연결 경로도 대칭이어야 한다.
+            // fire-and-forget: 이 쓰기가 실패해도 소켓은 살아 있어야 하고,
+            // heartbeat flush 가 최대 35초 안에 같은 상태를 다시 기록한다.
+            void markMachineOnline(userId, connection.machineId, connectedAt);
         }
 
         // Track app focus state for push notification routing.
@@ -267,10 +276,7 @@ export function startSocket(app: Fastify) {
                 try {
                     const hasReplacementConnection = await eventRouter.hasMachineSocket(userId, connection.machineId);
                     if (!hasReplacementConnection) {
-                        await db.machine.updateMany({
-                            where: { id: connection.machineId, accountId: userId, active: true },
-                            data: { active: false, lastActiveAt: new Date(disconnectedAt) },
-                        });
+                        await markMachineOffline(userId, connection.machineId, disconnectedAt);
                     }
                 } catch (error) {
                     log({ module: 'websocket', level: 'error' }, `Failed to mark machine offline on disconnect: ${error}`);
