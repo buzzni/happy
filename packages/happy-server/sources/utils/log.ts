@@ -2,6 +2,7 @@ import pino from 'pino';
 import pretty from 'pino-pretty';
 import { mkdirSync } from 'fs';
 import { join } from 'path';
+import { resolveLogLevel } from './logLevel';
 
 // Single log file name created once at startup
 let consolidatedLogFile: string | undefined;
@@ -46,18 +47,22 @@ function formatLocalTime(timestamp?: number) {
 // composed with pino.multistream) need no worker and no on-disk resolution, so
 // they work identically whether bundled or run from source.
 const prettyStream = pretty({
-    colorize: true,
+    // specs/happy-server-log-volume — k8s 로 나가는 stdout 에서 ANSI 코드는
+    // 바이트 낭비이고 grep 을 방해한다 (`[32mINFO[39m`). 터미널에서만 색을 쓴다.
+    colorize: process.stdout.isTTY === true,
     translateTime: 'HH:MM:ss.l',
     ignore: 'pid,hostname',
     messageFormat: '{levelLabel} {msg} | [{time}]',
     errorLikeObjectKeys: ['err', 'error'],
 });
 
-const loggerStreams: pino.StreamEntry[] = [{ level: 'debug', stream: prettyStream }];
+const logLevel = resolveLogLevel(process.env.LOG_LEVEL);
+
+const loggerStreams: pino.StreamEntry[] = [{ level: logLevel, stream: prettyStream }];
 
 if (process.env.DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING && consolidatedLogFile) {
     loggerStreams.push({
-        level: 'debug',
+        level: logLevel,
         stream: pino.destination({ dest: consolidatedLogFile, mkdir: true }),
     });
 }
@@ -65,7 +70,7 @@ if (process.env.DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING && consolidatedL
 // Shared core options: both loggers add localTime to every entry and emit the
 // same timestamp shape. Stream selection (pretty/file) is layered on top.
 const baseOptions = {
-    level: 'debug',
+    level: logLevel,
     formatters: {
         log: (object: any) => {
             // Add localTime to every log entry
@@ -81,9 +86,15 @@ const baseOptions = {
 // Main server logger with local time formatting
 export const logger = pino(baseOptions, pino.multistream(loggerStreams));
 
-// Optional file-only logger for remote logs from CLI/mobile
+// Optional file-only logger for remote logs from CLI/mobile.
+//
+// specs/happy-server-log-volume — 이 로거는 LOG_LEVEL 을 따르지 않고 항상
+// 'debug' 다. DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING 가 켜졌다는 것
+// 자체가 명시적 디버깅 모드라는 뜻이고, CLI/모바일이 보내온 debug 레벨 원격
+// 로그(devRoutes.ts 의 fileConsolidatedLogger.debug)를 여기서 떨구면 기능이
+// 무의미해진다. stdout 볼륨과는 무관한 파일 전용 스트림이다.
 export const fileConsolidatedLogger = process.env.DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING && consolidatedLogFile ?
-    pino(baseOptions, pino.destination({ dest: consolidatedLogFile, mkdir: true })) : undefined;
+    pino({ ...baseOptions, level: 'debug' }, pino.destination({ dest: consolidatedLogFile, mkdir: true })) : undefined;
 
 export function log(src: any, ...args: any[]) {
     logger.info(src, ...args);
