@@ -28,6 +28,28 @@ afterEach(async () => {
     )));
 });
 
+describe('registerCommonHandlers bash scheduling', () => {
+    it('keeps legacy requests foreground-compatible and accepts background classification', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const handler = handlers.get('bash');
+
+        await expect(handler?.({ command: 'printf legacy', cwd: workingDirectory })).resolves.toMatchObject({
+            success: true,
+            stdout: 'legacy',
+            exitCode: 0,
+        });
+        await expect(handler?.({
+            command: 'printf background',
+            cwd: workingDirectory,
+            executionClass: 'background',
+        })).resolves.toMatchObject({
+            success: true,
+            stdout: 'background',
+            exitCode: 0,
+        });
+    });
+});
+
 describe('registerCommonHandlers readFileChunk', () => {
     it('returns the requested bytes with stable file metadata and EOF state', async () => {
         const { handlers, workingDirectory } = await createHandlers();

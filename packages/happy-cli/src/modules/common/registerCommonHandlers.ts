@@ -15,6 +15,11 @@ import {
     enterDirectory,
     type GitignoreContext,
 } from './gitignoreWalker';
+import {
+    BashRpcBusyError,
+    createBashRpcScheduler,
+    type BashRpcExecutionClass,
+} from './bashRpcScheduler';
 
 const execAsync = promisify(exec);
 const READ_FILE_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
@@ -29,6 +34,7 @@ interface BashRequest {
     command: string;
     cwd?: string;
     timeout?: number; // timeout in milliseconds
+    executionClass?: BashRpcExecutionClass;
 }
 
 interface BashResponse {
@@ -37,6 +43,8 @@ interface BashResponse {
     stderr?: string;
     exitCode?: number;
     error?: string;
+    errorCode?: 'DAEMON_BUSY';
+    retryAfterMs?: number;
 }
 
 interface ReadFileRequest {
@@ -258,6 +266,7 @@ export type SpawnSessionResult =
  * Register all RPC handlers with the session
  */
 export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string) {
+    const bashScheduler = createBashRpcScheduler();
 
     // Shell command handler - executes commands in the default shell
     rpcHandlerManager.registerHandler<BashRequest, BashResponse>('bash', async (data) => {
@@ -274,74 +283,98 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             data.cwd = validation.resolvedPath;
         }
 
+        const executionClass = data.executionClass === 'background' ? 'background' : 'foreground';
+        const schedulerState = bashScheduler.snapshot();
+        if (schedulerState.queued > 0 || schedulerState.running >= 8) {
+            logger.debug('Shell command queued', { executionClass, ...schedulerState });
+        }
         try {
-            // Build options with shell enabled by default
-            // Note: ExecOptions doesn't support boolean for shell, but exec() uses the default shell when shell is undefined
-            // If cwd is "/", use undefined to let shell use its default (respects user's PATH)
-            const options: ExecOptions = {
-                cwd: data.cwd === '/' ? undefined : data.cwd,
-                timeout: data.timeout || 30000, // Default 30 seconds timeout
-                windowsHide: true, // Prevent cmd.exe popup on Windows for every RPC bash call
-            };
+            return await bashScheduler.run(executionClass, async () => {
+                try {
+                    // Build options with shell enabled by default
+                    // Note: ExecOptions doesn't support boolean for shell, but exec() uses the default shell when shell is undefined
+                    // If cwd is "/", use undefined to let shell use its default (respects user's PATH)
+                    const options: ExecOptions = {
+                        cwd: data.cwd === '/' ? undefined : data.cwd,
+                        timeout: data.timeout || 30000, // Default 30 seconds timeout
+                        windowsHide: true, // Prevent cmd.exe popup on Windows for every RPC bash call
+                    };
 
-            logger.debug('Shell command executing...', { cwd: options.cwd, timeout: options.timeout });
-            const { stdout, stderr } = await execAsync(data.command, options);
-            logger.debug('Shell command executed, processing result...');
+                    logger.debug('Shell command executing...', { cwd: options.cwd, timeout: options.timeout });
+                    const { stdout, stderr } = await execAsync(data.command, options);
+                    logger.debug('Shell command executed, processing result...');
 
-            const result = {
-                success: true,
-                stdout: stdout ? stdout.toString() : '',
-                stderr: stderr ? stderr.toString() : '',
-                exitCode: 0
-            };
-            logger.debug('Shell command result:', {
-                success: true,
-                exitCode: 0,
-                stdoutLen: result.stdout.length,
-                stderrLen: result.stderr.length
+                    const result = {
+                        success: true,
+                        stdout: stdout ? stdout.toString() : '',
+                        stderr: stderr ? stderr.toString() : '',
+                        exitCode: 0
+                    };
+                    logger.debug('Shell command result:', {
+                        success: true,
+                        exitCode: 0,
+                        stdoutLen: result.stdout.length,
+                        stderrLen: result.stderr.length
+                    });
+                    return result;
+                } catch (error) {
+                    const execError = error as NodeJS.ErrnoException & {
+                        stdout?: string;
+                        stderr?: string;
+                        code?: number | string;
+                        killed?: boolean;
+                    };
+
+                    // Check if the error was due to timeout
+                    if (execError.code === 'ETIMEDOUT' || execError.killed) {
+                        const result = {
+                            success: false,
+                            stdout: execError.stdout || '',
+                            stderr: execError.stderr || '',
+                            exitCode: typeof execError.code === 'number' ? execError.code : -1,
+                            error: 'Command timed out'
+                        };
+                        logger.debug('Shell command timed out:', {
+                            success: false,
+                            exitCode: result.exitCode,
+                            error: 'Command timed out'
+                        });
+                        return result;
+                    }
+
+                    // If exec fails, it includes stdout/stderr in the error
+                    const result = {
+                        success: false,
+                        stdout: execError.stdout ? execError.stdout.toString() : '',
+                        stderr: execError.stderr ? execError.stderr.toString() : execError.message || 'Command failed',
+                        exitCode: typeof execError.code === 'number' ? execError.code : 1,
+                        error: execError.message || 'Command failed'
+                    };
+                    logger.debug('Shell command failed:', {
+                        success: false,
+                        exitCode: result.exitCode,
+                        error: result.error,
+                        stdoutLen: result.stdout.length,
+                        stderrLen: result.stderr.length
+                    });
+                    return result;
+                }
             });
-            return result;
         } catch (error) {
-            const execError = error as NodeJS.ErrnoException & {
-                stdout?: string;
-                stderr?: string;
-                code?: number | string;
-                killed?: boolean;
-            };
-
-            // Check if the error was due to timeout
-            if (execError.code === 'ETIMEDOUT' || execError.killed) {
-                const result = {
+            if (error instanceof BashRpcBusyError) {
+                const state = bashScheduler.snapshot();
+                logger.debug('Shell command rejected: daemon busy', { executionClass, ...state });
+                return {
                     success: false,
-                    stdout: execError.stdout || '',
-                    stderr: execError.stderr || '',
-                    exitCode: typeof execError.code === 'number' ? execError.code : -1,
-                    error: 'Command timed out'
+                    stdout: '',
+                    stderr: '',
+                    exitCode: -1,
+                    error: error.message,
+                    errorCode: error.errorCode,
+                    retryAfterMs: error.retryAfterMs,
                 };
-                logger.debug('Shell command timed out:', {
-                    success: false,
-                    exitCode: result.exitCode,
-                    error: 'Command timed out'
-                });
-                return result;
             }
-
-            // If exec fails, it includes stdout/stderr in the error
-            const result = {
-                success: false,
-                stdout: execError.stdout ? execError.stdout.toString() : '',
-                stderr: execError.stderr ? execError.stderr.toString() : execError.message || 'Command failed',
-                exitCode: typeof execError.code === 'number' ? execError.code : 1,
-                error: execError.message || 'Command failed'
-            };
-            logger.debug('Shell command failed:', {
-                success: false,
-                exitCode: result.exitCode,
-                error: result.error,
-                stdoutLen: result.stdout.length,
-                stderrLen: result.stderr.length
-            });
-            return result;
+            throw error;
         }
     });
 
