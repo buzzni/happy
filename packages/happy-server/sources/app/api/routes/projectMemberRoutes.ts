@@ -69,12 +69,18 @@ export function projectMemberRoutes(app: Fastify) {
      * 224개 × 3쿼리 ≈ 672쿼리가 동시에 Prisma pool 을 잡아 P2024 로
      * 넘어간다 — 2026-08-06 장애의 1차 경로.
      *
+     * 경로가 `/v1/projects/...` 가 아니라 `/v1/project-members/...` 인 것은
+     * 의도적이다. 전자에 두면 `/v1/projects/:projectId/members` 와 같은
+     * 네임스페이스를 공유해 "members" 라는 projectId 와 형태가 겹친다.
+     * 프로젝트에 종속되지 않는 멤버 조회는 이미 `/v1/project-members/pending`
+     * 이 쓰는 이 네임스페이스가 맞다.
+     *
      * GET 이 아니라 POST 인 이유는 id 배열이 URL 길이 제한에 걸리기
      * 때문이다. 상태를 바꾸지 않는 조회다.
      *
      * specs/project-members-batch-lookup
      */
-    app.post('/v1/projects/members/batch', {
+    app.post('/v1/project-members/batch', {
         preHandler: app.authenticate,
         schema: {
             body: z.object({ ids: z.array(z.string()) })

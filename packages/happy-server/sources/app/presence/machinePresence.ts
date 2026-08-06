@@ -49,7 +49,15 @@ export async function markMachineOnline(
     await writePresence(userId, machineId, { id: machineId, accountId: userId }, true, at);
 }
 
-/** 끊김 시 offline 로 기록한다. 이미 꺼져 있으면 아무것도 하지 않는다. */
+/**
+ * 끊김 시 offline 로 기록한다. 이미 꺼져 있으면 아무것도 하지 않는다.
+ *
+ * `lastActiveAt <= at` 가드가 재연결 레이스를 막는다. 호출부는 쓰기 전에
+ * `hasMachineSocket` 으로 대체 연결을 확인하지만, 그 확인과 실제 UPDATE
+ * 사이에 새 소켓이 붙어 `markMachineOnline` 이 먼저 커밋될 수 있다. 가드가
+ * 없으면 그 뒤에 도착한 낡은 offline 쓰기가 살아 있는 머신을 꺼버린다
+ * (heartbeat flush 가 최대 35초 뒤 되살리지만, 그동안 터미널·프리뷰가 막힌다).
+ */
 export async function markMachineOffline(
     userId: string,
     machineId: string,
@@ -58,7 +66,12 @@ export async function markMachineOffline(
     await writePresence(
         userId,
         machineId,
-        { id: machineId, accountId: userId, active: true },
+        {
+            id: machineId,
+            accountId: userId,
+            active: true,
+            lastActiveAt: { lte: new Date(at) },
+        },
         false,
         at,
     );

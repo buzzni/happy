@@ -10,13 +10,18 @@ export interface EnableErrorHandlersOptions {
 /**
  * 같은 종류의 5xx 가 쏟아질 때 창당 한 줄로 묶기 위한 키.
  *
- * 코드(또는 이름)만 쓴다 — 2026-08-06 처럼 pool 이 고갈되면 **모든**
- * 라우트가 동시에 P2024 를 내므로, 라우트를 키에 넣으면 라우트 수만큼
- * 곱해져 rate-limit 이 무력해진다. 대신 첫 발생 로그가 그 시점의
- * method/url 을 그대로 담고 있어 진단은 가능하다.
+ * 라우트는 키에 넣지 않는다 — 2026-08-06 처럼 pool 이 고갈되면 **모든**
+ * 라우트가 동시에 P2024 를 내므로, 라우트를 넣으면 라우트 수만큼 곱해져
+ * rate-limit 이 무력해진다. 대신 첫 발생 로그가 그 시점의 method/url 과
+ * 스택을 그대로 담고 있어 진단은 가능하다.
+ *
+ * code 와 name 을 **함께** 쓴다. code 만 쓰면 `code` 가 없는 서로 다른
+ * 예외들이 전부 한 통(`unknown`)에 묶여, 평상시 드물게 나는 별개 버그가
+ * 서로를 가린다. 폭주하는 에러는 보통 code 를 갖고 있어 묶임 효과는
+ * 그대로다.
  */
 function throttleKey(error: FastifyError): string {
-    return error.code || error.name || 'unknown';
+    return `${error.code ?? ''}:${error.name ?? ''}` || 'unknown';
 }
 
 /**
