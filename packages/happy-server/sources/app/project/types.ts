@@ -48,7 +48,9 @@ export type ProjectError =
     | 'merge-request-not-found'
     | 'merge-request-not-open'
     | 'merge-conflict'
-    | 'id-taken';
+    | 'id-taken'
+    // specs/project-members-batch-lookup — 배치 조회 id 상한 초과.
+    | 'too-many-ids';
 
 export type Result<T> =
     | { ok: true; value: T }
