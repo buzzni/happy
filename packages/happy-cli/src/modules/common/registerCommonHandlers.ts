@@ -239,6 +239,14 @@ export interface SpawnSessionOptions {
     createdByDisplayName?: string;
     axStep?: 'plan' | 'design' | 'free';
     bootstrapFiles?: Array<{ relativePath: string; content: string }>;
+    /**
+     * First user prompt for the spawned session. Delivered via
+     * HAPPY_INITIAL_PROMPT (a per-spawn lineage env, scrubbed like
+     * HAPPY_FORK*) and consumed exactly once by the claude remote path so
+     * the agent starts its first turn without waiting for app input.
+     * Non-claude agents ignore it. Used by scheduled automations.
+     */
+    initialPrompt?: string;
 }
 
 export type SpawnSessionResult =

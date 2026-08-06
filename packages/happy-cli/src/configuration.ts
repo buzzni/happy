@@ -30,6 +30,7 @@ class Configuration {
   /** Pre-machine-wide location of the same token; adopted once, then unused. */
   public readonly legacyBrowserBridgeTokenFile: string | null
   public readonly sessionsFile: string
+  public readonly automationsFile: string
   public readonly currentCliVersion: string
 
   public readonly isExperimentalEnabled: boolean
@@ -61,6 +62,7 @@ class Configuration {
     this.browserBridgeTokenFile = bridgeToken.tokenFile
     this.legacyBrowserBridgeTokenFile = bridgeToken.migrateFrom
     this.sessionsFile = join(this.happyHomeDir, 'sessions.json')
+    this.automationsFile = join(this.happyHomeDir, 'automations.json')
 
     // URL precedence (both): HAPPY_*_URL env > settings.<key> > default.
     // Settings are read sync here (avoid circular import with persistence.ts).

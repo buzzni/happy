@@ -16,6 +16,8 @@ import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { detectCLIAvailability, CLIAvailability } from '@/utils/detectCLI';
 import { detectResumeSupport, type ResumeSupport } from '@/resume/localHappyAgentAuth';
 import type { PortRegistry } from '@/daemon/portRegistry';
+import type { AutomationStore } from '@/daemon/automations/automationStore';
+import { createAutomationRpcHandlers } from '@/daemon/automations/automationRpcHandlers';
 import {
     resolveStopSessionMode,
     type StopSessionContext,
@@ -159,6 +161,8 @@ type MachineRpcHandlers = {
     stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
     requestShutdown: () => void;
     portRegistry: PortRegistry;
+    /** When present, registers the scheduled-automation RPCs and advertises automationSupport. */
+    automationStore?: AutomationStore;
 }
 
 function requireNonEmptyString(value: unknown, name: string): string {
@@ -188,6 +192,10 @@ export class ApiMachineClient {
     // 이므로 첫 keep-alive 가 무조건 publish 하여 stale 한 server-side
     // happyCliVersion 을 갱신한다.
     private lastKnownCliVersion: string | null = null;
+    // Whether the automation RPCs were registered (setRPCHandlers with an
+    // automationStore). Advertised as metadata.automationSupport.rpcAvailable.
+    private automationRpcAvailable = false;
+    private lastKnownAutomationRpcAvailable: boolean | null = null;
     private rpcHandlerManager: RpcHandlerManager;
     // Live raw-TCP tunnels for preview WebSocket upgrades (previewWsProxy.ts).
     private previewWsProxy: PreviewWsProxy | null = null;
@@ -233,9 +241,25 @@ export class ApiMachineClient {
         resumeSession,
         stopSession,
         requestShutdown,
-        portRegistry
+        portRegistry,
+        automationStore
     }: MachineRpcHandlers) {
         this.resumeSessionHandler = resumeSession ?? null;
+
+        // Scheduled automations CRUD (specs: daemon-scheduled-automations).
+        // Handlers live in automationRpcHandlers.ts so they unit-test without
+        // an RpcHandlerManager; directory validation reuses this.allowedRoot,
+        // the same root the spawn/file RPC surface enforces.
+        if (automationStore) {
+            const automationHandlers = createAutomationRpcHandlers({
+                store: automationStore,
+                allowedRoot: this.allowedRoot,
+            });
+            this.rpcHandlerManager.registerHandler('automation-upsert', automationHandlers.upsert);
+            this.rpcHandlerManager.registerHandler('automation-remove', automationHandlers.remove);
+            this.rpcHandlerManager.registerHandler('automation-list', automationHandlers.list);
+            this.automationRpcAvailable = true;
+        }
 
         // Register spawn session handler
         this.rpcHandlerManager.registerHandler('spawn-happy-session', async (params: any) => {
@@ -1098,17 +1122,20 @@ export class ApiMachineClient {
                 || prevResume.rpcAvailable !== newResumeSupport.rpcAvailable
                 || prevResume.happyAgentAuthenticated !== newResumeSupport.happyAgentAuthenticated;
             const cliVersionChanged = prevCliVersion !== newCliVersion;
+            const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable;
 
             this.syncResumeSessionRpcRegistration();
 
-            if (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged) {
+            if (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
+                this.lastKnownAutomationRpcAvailable = this.automationRpcAvailable;
                 this.updateMachineMetadata((metadata) => ({
                     ...(metadata || {} as any),
                     cliAvailability: newAvailability,
                     resumeSupport: { ...newResumeSupport, rpcAvailable: !!this.resumeSessionHandler },
+                    automationSupport: { rpcAvailable: this.automationRpcAvailable },
                     happyCliVersion: newCliVersion,
                 })).catch((err) => {
                     logger.debug('[API MACHINE] Failed to update machine capabilities:', err);

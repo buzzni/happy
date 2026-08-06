@@ -44,6 +44,7 @@ import { join } from 'node:path';
 import { RawJSONLinesSchema, type RawJSONLines } from './types';
 import { installBroadKillShims } from '@/utils/broadKillShims';
 import { readReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
+import { consumePendingInitialPrompt, deliverInitialPrompt } from './initialPrompt';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 
@@ -849,6 +850,26 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         messageQueue.push(pushText, currentEnhancedMode(), attachmentsForThisMessage);
         logger.debugLargeJson('User message pushed to queue:', message)
     });
+
+    // Daemon-spawned initial prompt (HAPPY_INITIAL_PROMPT, e.g. scheduled
+    // automations). Consume-then-deliver exactly once: queue the first turn
+    // and write the user record to server history ourselves — the daemon has
+    // no session content key, and the remote scanner marks session-start JSONL
+    // contents as already-processed so it cannot be relied on to forward this
+    // prompt. See initialPrompt.ts for the full rationale. Always consumed
+    // (so children never inherit the env), delivered only for fresh sessions —
+    // a reconnect resumes an existing conversation.
+    const pendingInitialPrompt = consumePendingInitialPrompt(process.env);
+    if (pendingInitialPrompt && !reconnectSessionId) {
+        deliverInitialPrompt(pendingInitialPrompt, {
+            sessionId: session.sessionId,
+            hasTitle: () => session.hasTitle(),
+            sendClaudeSessionMessage: (record) => session.sendClaudeSessionMessage(record),
+            recordAppPrompt,
+            pushPrompt: (text) => messageQueue.push(text, currentEnhancedMode()),
+        });
+        logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
+    }
 
     // Setup signal handlers for graceful shutdown
     //
