@@ -26,17 +26,26 @@
  * machine; deletes nothing, restarts nothing.
  *
  * USAGE
- *   SMOKE_TOKEN=<happy access token> \
- *   SMOKE_PORT=<a port the daemon can reach on its host> \
+ *   SMOKE_TOKEN=$(python3 -c "import json;print(json.load(open('$HOME/.happy/access.key'))['token'])") \
  *   node smoke-cross-placement.mjs [namespace]
  *
  *   SMOKE_MACHINE=<machineId>   pin the machine (default: first online machine)
+ *   SMOKE_PORT=<port>           port to probe (default 59999 — see below)
  *   SMOKE_ALLOW_SKIP=1          exit 0 even when checks were skipped
  *   SMOKE_KEEP_PF=1             leave port-forwards running (debugging)
  *
- * The token is the same bearer the web app uses. Get it from the browser
- * devtools (Authorization header on any /v1 request) or from
- * `~/.happy/settings.json` on a machine running the daemon.
+ * TOKEN: the bearer the CLI and web app use. `~/.happy/access.key` is JSON
+ * with a `token` field (persistence.ts readCredentials). Browser devtools —
+ * the Authorization header on any /v1 request — works too.
+ *
+ * PORT: does NOT need anything listening. The relay answers 502 in two
+ * distinguishable ways, and only one of them means routing failed:
+ *   { error: "Machine offline" }              → never reached the daemon  ✗
+ *   { code: "CONNECTION_REFUSED", ... }       → daemon answered; port shut ✓
+ * A refused connection still proves the request crossed to the daemon and
+ * came back, which is exactly what AC1 asks. So the default probes a port
+ * that is almost certainly closed and treats a daemon-sourced error as a
+ * pass. Pass SMOKE_PORT only if you want a real 200 through a live server.
  */
 
 import { spawn } from 'node:child_process';
@@ -65,7 +74,9 @@ const ioClient = loadSocketIoClient();
 
 const NS = process.argv[2] ?? 'aplus-dev-studio-dev-shared';
 const TOKEN = process.env.SMOKE_TOKEN ?? '';
-const PORT = Number(process.env.SMOKE_PORT ?? 0);
+// Closed on purpose by default — a daemon-sourced CONNECTION_REFUSED proves
+// the round trip just as well as a 200, without needing a live dev server.
+const PORT = Number(process.env.SMOKE_PORT ?? 59999);
 const PIN_MACHINE = process.env.SMOKE_MACHINE ?? '';
 const ALLOW_SKIP = process.env.SMOKE_ALLOW_SKIP === '1';
 const KEEP_PF = process.env.SMOKE_KEEP_PF === '1';
@@ -216,10 +227,8 @@ async function main() {
     info(`machine-scoped 소켓 총합: ${daemonSockets} (전체 머신 기준)`);
     pass(`대상 머신 확보`);
 
-    section('3. AC1 — 프리뷰 HTTP 가 모든 replica 에서 통하는가');
-    if (!PORT) {
-        skip('SMOKE_PORT 가 없다 — 프리뷰 왕복을 확인할 수 없다');
-    } else {
+    section(`3. AC1 — 프리뷰 HTTP 가 모든 replica 에서 데몬까지 도달하는가 (port=${PORT})`);
+    {
         const mint = await api(ctrl, '/v1/preview-token', {
             method: 'POST', body: { machineId, port: PORT },
         });
@@ -234,19 +243,35 @@ async function main() {
                     `http://127.0.0.1:${ap}/v1/preview/${machineId}/${PORT}/?ptoken=${encodeURIComponent(ptoken)}`,
                     { redirect: 'manual' },
                 );
-                results.push({ pod, status: res.status });
-                info(`${pod} → ${res.status}`);
+                let body = {};
+                try { body = await res.json(); } catch { /* html/binary body = a real 200 */ }
+                // The whole point: a 502 carrying a daemon `code` means the
+                // request reached the daemon and came back. Only a 502 without
+                // one ("Machine offline" / lookup-degraded) is a routing miss.
+                //
+                // Anything else (401/403/404 from a bad ptoken or machine id) is
+                // a broken fixture, NOT evidence about routing — counting it as
+                // "reached" would make the smoke pass for the wrong reason.
+                const daemonAnswered = res.status === 502 && typeof body?.code === 'string';
+                const served = res.status < 400;
+                const verdict = daemonAnswered ? 'daemon-reached'
+                    : served ? 'served'
+                        : res.status === 502 ? 'routing-miss'
+                            : 'setup-error';
+                results.push({ pod, status: res.status, code: body?.code, verdict });
+                info(`${pod} → ${res.status}${body?.code ? ` code=${body.code}` : ''} (${verdict})`);
             }
-            // 502 는 "machine-offline" 또는 "lookup-degraded" 다. 데몬은 한
-            // replica 에만 있으므로, 프로세스 로컬 조회였다면 정확히 하나만
-            // 성공하고 나머지는 502 가 된다.
-            const offline = results.filter((r) => r.status === 502);
-            if (offline.length === 0) {
-                pass(`모든 replica 가 프리뷰를 서빙했다 — 최소 ${pods.length - 1}개는 replica 를 건넜다`);
-            } else if (offline.length === results.length) {
-                fail('모든 replica 가 502 — 데몬이 그 포트를 못 열었거나 머신이 오프라인이다 (라우팅 문제와 구별 불가)');
+            const setupErrors = results.filter((r) => r.verdict === 'setup-error');
+            const missed = results.filter((r) => r.verdict === 'routing-miss');
+            if (setupErrors.length > 0) {
+                // Not a routing verdict either way — say so instead of guessing.
+                fail(`픽스처 오류: ${setupErrors.map((r) => `${r.pod}=${r.status}`).join(', ')} — ptoken/머신 불일치로 보인다. 라우팅에 대해서는 아무것도 증명하지 못했다.`);
+            } else if (missed.length === 0) {
+                pass(`모든 replica 가 데몬에 도달했다 — 최소 ${pods.length - 1}개는 replica 를 건넜다`);
+            } else if (missed.length === results.length) {
+                fail('모든 replica 가 데몬에 도달하지 못했다 — 머신이 오프라인일 수 있다 (라우팅 문제와 구별 불가)');
             } else {
-                fail(`${offline.length}/${results.length} replica 가 502 — 조회가 여전히 프로세스 로컬이다: ${offline.map((r) => r.pod).join(', ')}`);
+                fail(`${missed.length}/${results.length} replica 가 도달 실패 — 조회가 여전히 프로세스 로컬이다: ${missed.map((r) => r.pod).join(', ')}`);
             }
         }
     }
