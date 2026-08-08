@@ -3,10 +3,11 @@ import { Fastify } from "./types";
 import { buildMachineActivityEphemeral, ClientConnection, eventRouter } from "@/app/events/eventRouter";
 import { Server } from "socket.io";
 import { createAdapter } from "@socket.io/redis-streams-adapter";
-import { Redis } from "ioredis";
+import { createRedisClient, isRedisConfigured } from "@/storage/createRedisClient";
 import { log } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
-import { getMetricsLabelsFromSocket, redisStreamLagMsGauge, websocketConnectionsGauge, websocketEventsCounter } from "../monitoring/metrics2";
+import { getMetricsLabelsFromSocket, redisStreamInfoFailuresCounter, redisStreamLagMsGauge, redisStreamWriteFailuresCounter, socketioClusterPeersGauge, websocketConnectionsGauge, websocketEventsCounter } from "../monitoring/metrics2";
+import { createLogThrottle, instrumentStreamWrites, readClusterPeerCount } from "../monitoring/redisHealth";
 import { usageHandler } from "./socket/usageHandler";
 import { rpcHandler } from "./socket/rpcHandler";
 import { pingHandler } from "./socket/pingHandler";
@@ -60,9 +61,22 @@ export function startSocket(app: Fastify) {
         // },
     });
 
-    // Multi-process support: attach Redis streams adapter when REDIS_URL is set
-    if (process.env.REDIS_URL) {
-        const streamClient = new Redis(process.env.REDIS_URL);
+    // Multi-process support: attach Redis streams adapter when Redis is configured
+    if (isRedisConfigured(process.env)) {
+        const streamClient = createRedisClient();
+
+        // A failed bus write is otherwise invisible: socket.io-adapter's
+        // publish() catches the XADD rejection into a debug() log. Count it
+        // here so a pinned-to-replica client (-READONLY) is observable.
+        const shouldLogWriteFailure = createLogThrottle(60_000);
+        instrumentStreamWrites(streamClient, (code, error) => {
+            redisStreamWriteFailuresCounter.inc({ code });
+            if (shouldLogWriteFailure(code)) {
+                log({ module: 'websocket', level: 'error' },
+                    `cluster bus write failed (${code}, throttled to 1/min) — cross-replica routing is degraded: ${error}`);
+            }
+        });
+
         io.adapter(createAdapter(streamClient, { maxLen: 200000, readCount: 2000 }));
         log({ module: 'websocket' }, 'Redis streams adapter enabled for multi-process support');
 
@@ -75,14 +89,29 @@ export function startSocket(app: Fastify) {
             lastReadOffset = offset;
             return origOnRawMessage(msg, offset);
         };
+        const shouldLogInfoFailure = createLogThrottle(60_000);
         setInterval(async () => {
+            // Peers on the bus. This is the decisive signal: with replicas >= 2
+            // a sustained 0 means fetchSockets() is silently answering
+            // local-only, so half of every daemon lookup fails as
+            // "RPC method not available".
+            socketioClusterPeersGauge.set(await readClusterPeerCount(adapter));
             try {
                 const info = await streamClient.xinfo("STREAM", "socket.io") as any[];
                 const headId = String(info[info.indexOf("last-generated-id") + 1]);
                 const headMs = parseInt(headId.split("-")[0]);
                 const readMs = parseInt(lastReadOffset.split("-")[0]);
                 redisStreamLagMsGauge.set(headMs - readMs);
-            } catch { /* stream may not exist yet */ }
+            } catch (error) {
+                // Was a bare `catch {}`. Swallowing it left the lag gauge
+                // frozen at its last value, so a dead bus kept reporting a
+                // plausible number for hours. Count + log instead.
+                redisStreamInfoFailuresCounter.inc();
+                if (shouldLogInfoFailure('xinfo')) {
+                    log({ module: 'websocket', level: 'error' },
+                        `cluster stream XINFO failed (throttled to 1/min) — redis_stream_lag_ms is now stale: ${error}`);
+                }
+            }
         }, 5000);
     }
 

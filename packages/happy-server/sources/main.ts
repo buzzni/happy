@@ -11,6 +11,7 @@ import { initEncrypt } from "./modules/encrypt";
 import { initGithub } from "./modules/github";
 import { loadFiles } from "./storage/files";
 import { startPreviewIdleSweeper } from "./modules/preview/previewIdleSweeper";
+import { createRedisClient, isRedisConfigured } from "./storage/createRedisClient";
 
 async function main() {
 
@@ -22,9 +23,8 @@ async function main() {
     onShutdown('activity-cache', async () => {
         activityCache.shutdown();
     });
-    if (process.env.REDIS_URL) {
-        const { Redis } = await import('ioredis');
-        const redis = new Redis(process.env.REDIS_URL);
+    if (isRedisConfigured(process.env)) {
+        const redis = createRedisClient();
         await redis.ping();
     }
 

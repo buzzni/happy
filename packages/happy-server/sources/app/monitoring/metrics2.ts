@@ -165,5 +165,37 @@ export const redisStreamLagMsGauge = new Gauge({
     registers: [register]
 });
 
+// Cluster-bus health. See app/monitoring/redisHealth.ts for why these exist:
+// the bus can die completely while liveness/readiness/CPU/DB all stay green.
+
+// Peers this replica sees on the Socket.IO cluster bus (serverCount - self);
+// -1 means "could not determine". With replicas >= 2 a sustained 0 means
+// cross-replica lookups are silently answering local-only.
+export const socketioClusterPeersGauge = new Gauge({
+    name: 'socketio_cluster_peers',
+    help: 'Peer replicas visible on the Socket.IO cluster bus (-1 = unknown)',
+    registers: [register]
+});
+
+export const redisStreamWriteFailuresCounter = new Counter({
+    name: 'redis_stream_write_failures_total',
+    help: 'Failed XADD writes to the Socket.IO cluster stream, by error code',
+    labelNames: ['code'] as const,
+    registers: [register]
+});
+
+export const redisStreamInfoFailuresCounter = new Counter({
+    name: 'redis_stream_info_failures_total',
+    help: 'Failed XINFO reads of the Socket.IO cluster stream (lag gauge goes stale while this climbs)',
+    registers: [register]
+});
+
+export const redisClientErrorsCounter = new Counter({
+    name: 'redis_client_errors_total',
+    help: 'Connection-level ioredis client errors, by error code',
+    labelNames: ['code'] as const,
+    registers: [register]
+});
+
 // Export the register for combining metrics
 export { register };
