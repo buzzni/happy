@@ -48,19 +48,19 @@ export function startSocket(app: Fastify) {
         // bundle in proxy-http-request acks. See specs/remote-preview-relay/
         // Phase 4.
         maxHttpBufferSize: 100 * 1024 * 1024,
-        // Brief-disconnect event replay. Currently OFF to preserve parity with
-        // pre-multi-process prod behavior — clients fall through to the full
-        // REST re-fetch path on every reconnect (apiSocket.ts onReconnected
-        // listener). Enabling this lets socket.io replay missed events from
-        // the streams adapter (which implements restoreSession via the Redis
-        // stream) so the client can skip the heavy refetch when
-        // socket.recovered === true. Verified working cross-replica via
-        // deploy/integration-tests/missed-events.mjs (event #2 fired during a
-        // forced engine.close() arrived after auto-reconnect, recovered=true).
-        // Ship parity first; turn this on as a follow-up.
-        // connectionStateRecovery: {
-        //     maxDisconnectionDuration: 2 * 60 * 1000,
-        // },
+        // Brief-disconnect event replay. Lets socket.io replay missed events
+        // from the streams adapter (restoreSession via the Redis stream) so
+        // the client can skip the heavy REST re-fetch when
+        // socket.recovered === true — web-ui narrows loadSessions() to skip
+        // its merge/decrypt pass on a recovered reconnect (specs/
+        // websocket-connection-state-recovery D1). Verified cross-replica via
+        // deploy/integration-tests/missed-events.mjs and
+        // specs/connection-state-recovery/smoke-recovery.mjs (100-round
+        // XRANGE cap under sustained write load during recovery not hit at
+        // the tested load — see spec for the caveat).
+        connectionStateRecovery: {
+            maxDisconnectionDuration: 2 * 60 * 1000,
+        },
     });
 
     // Multi-process support: attach Redis streams adapter when Redis is configured
