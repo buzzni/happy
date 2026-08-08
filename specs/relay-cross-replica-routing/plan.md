@@ -76,7 +76,27 @@
 - 테스트: `terminalRelayHandler.spec.ts`, `terminalSessions.spec.ts` 회귀 +
   cross-replica 케이스.
 
-## Phase 3 — 프리뷰 WS (T4·T5, 가장 어려움)
+## Phase 3 — 프리뷰 WS (T4·T5) — **완료 (2026-08-08)**
+
+- [x] `previewWsTunnels.ts` 신설 — 터널 레지스트리 + replica 간 hand-off.
+      `deliverDaemonData/Close` 는 **로컬이면 바로 쓰고, 아니면 broadcast**
+      한다. 같은 replica 인 흔한 경우에 fan-out 을 내지 않는 게 핵심이다.
+- [x] `wireMachineSocket()`(터널 open 시점에 데몬 Socket 에 리스너 부착)를
+      **`previewWsMachineHandler()`(커넥션 시점, 데몬의 replica 에서 등록)**
+      로 대체. T4 때문에 RemoteSocket 에는 리스너를 못 붙인다.
+- [x] `registerPreviewWsClusterListeners(io)` — peer 가 넘긴 프레임 수신.
+- [x] 터널 엔트리가 `owner: IoSocket` → `ownerSocketId: string`.
+      브라우저→데몬 emit 은 `io.to(daemonSocketId)`.
+- [x] 데몬 disconnect 시 로컬 정리 + `preview-ws-daemon-gone` 브로드캐스트 —
+      브라우저 소켓은 어느 replica 에나 있을 수 있다.
+- [x] 조회 실패(`degraded`)를 "머신 없음" 과 구분해 로깅.
+- 검증: typecheck 클린, vitest **558 passed** (신규 11건).
+  **dev 실제 Redis 로 `serverSideEmit` 자체를 검증** — 양방향 전달 확인,
+  그리고 발신 노드에는 되돌아오지 않음(로컬 중복 쓰기 없음)까지 확인.
+  D1 가정이 실제로 성립하는지가 Phase 3 전체의 전제였다.
+- 미검증: AC2(실제 크로스 배치 HMR 왕복)는 Phase 4.
+
+### 원래 계획 (참고)
 
 - [ ] D1 결정에 따른 replica 간 바이트 전달 경로 구현.
 - [ ] `findMachineSockets()` → room 기반 (T1).

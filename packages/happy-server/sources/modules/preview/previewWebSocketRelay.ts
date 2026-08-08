@@ -30,8 +30,17 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { Socket as NetSocket } from "node:net";
-import { Socket as IoSocket } from "socket.io";
+import { Socket as IoSocket, type Server as IoServer } from "socket.io";
 import { eventRouter } from "@/app/events/eventRouter";
+import { findMachineSockets as findMachineSocketsCrossReplica } from "@/app/events/findMachineSockets";
+import {
+    addTunnel, setTunnelOwner, deleteTunnel, hasTunnel,
+    deliverDaemonData, deliverDaemonClose, dropTunnelsOwnedBy,
+    applyRemoteData, applyRemoteClose,
+    PREVIEW_WS_DATA, PREVIEW_WS_CLOSE, PREVIEW_WS_DAEMON_GONE,
+    type BroadcastToReplicas,
+    type PreviewWsDataMessage, type PreviewWsCloseMessage, type PreviewWsDaemonGoneMessage,
+} from "@/modules/preview/previewWsTunnels";
 import { verifyPreviewToken } from "@/modules/preview/previewToken";
 import { cookieName, readPreviewCookie } from "@/modules/preview/previewCookie";
 import { parsePreviewHost } from "@/modules/preview/parsePreviewHost";
@@ -43,20 +52,9 @@ import type { Fastify } from "@/app/api/types";
 // framebuffer stream (VNC) can legitimately sit idle between screen updates.
 const WS_OPEN_TIMEOUT_MS = 15_000;
 
-// tunnelId → { browser raw socket, owning daemon socket }. Global map;
-// tunnelIds are UUIDs so daemon→server frames dispatch unambiguously. `owner`
-// is recorded once the tunnel opens so a machine-socket disconnect can tear
-// down exactly its tunnels (see wireMachineSocket).
-interface PreviewTunnel {
-    socket: NetSocket;
-    owner: IoSocket | null;
-}
-const browserByTunnel = new Map<string, PreviewTunnel>();
-
-// Machine sockets are long-lived and shared across many tunnels; wire the
-// daemon→server dispatch listeners exactly once per socket to avoid leaking a
-// listener per WebSocket.
-const wiredMachineSockets = new WeakSet<IoSocket>();
+// Tunnel bookkeeping lives in previewWsTunnels.ts because the browser end is a
+// raw TCP socket pinned to this replica while the daemon end may be on another
+// one — see that module for the hand-off.
 
 interface WsFramePayload {
     tunnelId: string;
@@ -90,45 +88,50 @@ export async function openPreviewWsTunnel<T extends PreviewWsMachineSocket>(
     throw lastError ?? new Error('No live daemon accepted the preview tunnel');
 }
 
-function findMachineSockets(userId: string, machineId: string): IoSocket[] {
-    const connections = eventRouter.getConnections(userId);
-    if (!connections) return [];
-    const sockets: IoSocket[] = [];
-    for (const c of connections) {
-        if (c.connectionType === 'machine-scoped' && c.machineId === machineId && c.socket.connected) {
-            sockets.push(c.socket);
-        }
-    }
-    return sockets;
+/** Cross-replica: the daemon may be attached to a different pod than this upgrade. */
+function findMachineSockets(userId: string, machineId: string) {
+    return findMachineSocketsCrossReplica(eventRouter.server, userId, machineId);
 }
 
-function wireMachineSocket(machineSocket: IoSocket): void {
-    if (wiredMachineSockets.has(machineSocket)) return;
-    wiredMachineSockets.add(machineSocket);
+/**
+ * Daemon-side dispatch, registered on every machine-scoped socket at connection
+ * time (socket.ts). It has to live on the daemon's own replica: `proxy-ws-*`
+ * events fire only there, and a RemoteSocket cannot take listeners at all.
+ * The tunnel it refers to may be owned by a peer replica, so delivery goes
+ * through previewWsTunnels' local-or-broadcast hand-off.
+ */
+export function previewWsMachineHandler(machineSocket: IoSocket): void {
+    const broadcast: BroadcastToReplicas = (event, payload) => {
+        eventRouter.server.serverSideEmit(event as any, payload as any);
+    };
 
     machineSocket.on('proxy-ws-data', (payload: WsFramePayload) => {
-        const entry = browserByTunnel.get(payload?.tunnelId);
-        if (entry && entry.socket.writable) {
-            entry.socket.write(Buffer.from(payload.dataB64, 'base64'));
-        }
+        deliverDaemonData(payload?.tunnelId, payload?.dataB64, broadcast);
     });
 
     machineSocket.on('proxy-ws-close', (payload: { tunnelId: string }) => {
-        const entry = browserByTunnel.get(payload?.tunnelId);
-        if (entry) entry.socket.end();
-        browserByTunnel.delete(payload?.tunnelId);
+        deliverDaemonClose(payload?.tunnelId, broadcast);
     });
 
     // When a daemon drops (reconnect, network blip) its live tunnels are dead:
     // the daemon's closeAll() emits land on a disconnected socket, so without
     // this the server would leak the orphaned browser sockets + map entries.
+    // Peers must sweep too — the browser socket can be on any replica.
     machineSocket.on('disconnect', () => {
-        for (const [tunnelId, entry] of browserByTunnel) {
-            if (entry.owner === machineSocket) {
-                entry.socket.destroy();
-                browserByTunnel.delete(tunnelId);
-            }
-        }
+        dropTunnelsOwnedBy(machineSocket.id);
+        broadcast(PREVIEW_WS_DAEMON_GONE, { daemonSocketId: machineSocket.id });
+    });
+}
+
+/**
+ * Peer-replica listeners. Registered once per process (socket.ts) so frames
+ * handed over by another replica reach the browser socket we own.
+ */
+export function registerPreviewWsClusterListeners(io: IoServer): void {
+    io.on(PREVIEW_WS_DATA as any, (message: PreviewWsDataMessage) => applyRemoteData(message));
+    io.on(PREVIEW_WS_CLOSE as any, (message: PreviewWsCloseMessage) => applyRemoteClose(message));
+    io.on(PREVIEW_WS_DAEMON_GONE as any, (message: PreviewWsDaemonGoneMessage) => {
+        dropTunnelsOwnedBy(message?.daemonSocketId);
     });
 }
 
@@ -277,12 +280,17 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
         return;
     }
 
-    const machineSockets = findMachineSockets(claims.userId, machineId);
+    const { sockets: machineSockets, degraded } = await findMachineSockets(claims.userId, machineId);
     if (machineSockets.length === 0) {
+        // `degraded` = the cross-replica lookup failed, so we do not know
+        // whether the daemon is there. Same 502, distinct log line.
+        if (degraded) {
+            log({ module: 'preview', level: 'error' },
+                `preview ws lookup degraded machine=${machineId} port=${port} — cluster bus did not answer`);
+        }
         writeHttpError(socket, 502, 'Machine Offline');
         return;
     }
-    for (const candidate of machineSockets) wireMachineSocket(candidate);
 
     // Rebuild the upstream path without our ptoken query param.
     query.delete('ptoken');
@@ -301,40 +309,46 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
     // an upgrade with no 'data' listener) until the tunnel is open, so no client
     // bytes are lost if anything ever attaches a transient 'data' listener.
     socket.pause();
-    browserByTunnel.set(tunnelId, { socket, owner: null });
+    addTunnel(tunnelId, socket);
 
-    let machineSocket: IoSocket;
+    let daemonSocketId: string;
     try {
-        machineSocket = await openPreviewWsTunnel(machineSockets, {
+        const chosen = await openPreviewWsTunnel(machineSockets, {
             tunnelId,
             port,
             dataB64: requestBytes.toString('base64'),
         });
+        daemonSocketId = chosen.id;
     } catch (err) {
-        browserByTunnel.delete(tunnelId);
+        deleteTunnel(tunnelId);
         log({ module: 'preview', level: 'error' }, `proxy-ws-open failed for ${machineId}:${port}: ${(err as Error).message}`);
         writeHttpError(socket, 502, 'Bad Gateway');
         return;
     }
 
+    // Browser → daemon. Addressed by socket id so it lands on whichever replica
+    // owns the daemon (Socket.IO auto-joins every socket to a room named after
+    // its id).
+    const toDaemon = (event: string, payload: unknown) =>
+        eventRouter.server.to(daemonSocketId).emit(event as any, payload as any);
+
     // The browser may have closed while we were opening the tunnel; if so, tell
     // the daemon to drop the just-opened upstream and stop.
-    const entry = browserByTunnel.get(tunnelId);
-    if (!entry) {
-        machineSocket.emit('proxy-ws-close', { tunnelId });
+    if (!hasTunnel(tunnelId)) {
+        toDaemon('proxy-ws-close', { tunnelId });
         return;
     }
-    entry.owner = machineSocket;
+    setTunnelOwner(tunnelId, daemonSocketId);
 
-    // Browser → daemon. Resume the paused socket after wiring the listener so
-    // any bytes the client buffered replay here in order.
+    // Resume the paused socket after wiring the listener so any bytes the
+    // client buffered replay here in order.
     socket.on('data', (chunk: Buffer) => {
-        machineSocket.emit('proxy-ws-data', { tunnelId, dataB64: chunk.toString('base64') });
+        toDaemon('proxy-ws-data', { tunnelId, dataB64: chunk.toString('base64') });
     });
     socket.resume();
     const teardown = () => {
-        if (browserByTunnel.delete(tunnelId)) {
-            machineSocket.emit('proxy-ws-close', { tunnelId });
+        if (deleteTunnel(tunnelId)) {
+            toDaemon('proxy-ws-close', { tunnelId });
         }
     };
     socket.on('close', teardown);
