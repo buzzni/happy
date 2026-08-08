@@ -62,6 +62,39 @@ export async function findMachineSocketsIn<T extends { id: string; data?: any }>
     return { sockets, degraded: false };
 }
 
+/**
+ * Picks the newest live socket of a daemon.
+ *
+ * A daemon that reconnects after a network flap (sleep/wake, Wi-Fi switch)
+ * registers a fresh socket within seconds while happy-server still holds the
+ * dead one until engine.io gives up — pingInterval (15s) + pingTimeout (45s).
+ * Sending `terminal-open` into the stale socket surfaces only as "Daemon did
+ * not acknowledge in time", so the choice matters.
+ *
+ * The old code took the last entry of an insertion-ordered Set. That signal
+ * does not survive `fetchSockets()`, which merges per-replica answers in no
+ * defined order — hence the explicit `data.connectedAt` stamp set in
+ * socket.ts. Sockets that predate the stamp fall back to the old
+ * last-entry-wins behaviour.
+ *
+ * Caveat: `connectedAt` is each replica's wall clock, so comparing sockets
+ * across replicas assumes NTP-level skew (ms). The gap between a stale and a
+ * fresh daemon socket is seconds, so this holds.
+ */
+export function newestMachineSocket<T extends { id: string; data?: any }>(sockets: T[]): T | null {
+    let best: T | null = null;
+    let bestAt = -Infinity;
+    for (const socket of sockets) {
+        const at = typeof socket.data?.connectedAt === 'number' ? socket.data.connectedAt : -Infinity;
+        // `>=` keeps last-entry-wins among equally-ranked (incl. unstamped) sockets.
+        if (at >= bestAt) {
+            best = socket;
+            bestAt = at;
+        }
+    }
+    return best;
+}
+
 export function findMachineSockets(
     io: Server,
     userId: string,

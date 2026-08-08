@@ -33,7 +33,30 @@
 - 검증: `pnpm typecheck` 클린, vitest **529 passed**. 단일 replica 경로 불변(AC4).
 - 미검증: AC1(실제 크로스 배치 스모크)은 Phase 4 에서 확인한다.
 
-## Phase 2 — 터미널 (T3 활용)
+## Phase 2 — 터미널 (T3 활용) — **완료 (2026-08-08)**
+
+- [x] **구조적 커밋 선행** — `TerminalSession` 이 소켓 객체 대신
+      `clientSocketId`/`daemonSocketId` 를 들고, 모든 emit 이
+      `io.to(socketId)` 로. replicas=1 에서 no-op.
+      프레임 전달 경로에 테스트가 없었어서 6건 추가 (양방향 프레임,
+      resize 방향 제한, 세션 밖 소켓 차단, 양쪽 disconnect).
+- [x] 머신 소켓 조회를 Phase 1 공용 모듈로 교체 + `degraded` 로깅.
+- [x] **`newestMachineSocket()` 신설.** 기존 "가장 최근 소켓" 규칙은 Set
+      삽입 순서에 의존했는데 cross-replica `fetchSockets()` 는 순서를
+      보장하지 않는다. `socket.data.connectedAt` 스탬프(socket.ts 미들웨어)로
+      결정적 정렬. 스탬프 없는 구 소켓은 기존 last-wins 로 폴백.
+- [x] Redis 공유 저장소 + 로컬 write-through 캐시 (D2-a).
+      역방향 인덱스 `terminal:socket:{id}` 도 둔다 — 데몬이 세션을 한 번도
+      캐시하지 않은 replica 에서 끊겨도 클라이언트에 알릴 수 있어야 한다.
+      Redis 실패는 로컬 상태로 degrade (throw 금지).
+- [x] `countActiveSessionsForUser` 를 `SCARD` 로 전역화 — 기존 로컬 카운트는
+      replicas=2 에서 사용자당 상한을 사실상 2배로 만들었다.
+- 검증: typecheck 클린, vitest **547 passed** (신규 18건).
+  dev 실제 Redis 대상 스모크로 cold-cache 조회·전역 카운트·역방향 인덱스·
+  전역 삭제·TTL 을 확인 (테스트 키 정리 완료).
+- 미검증: AC3(실제 크로스 배치 터미널 왕복)은 Phase 4.
+
+### 원래 계획 (참고)
 
 - [ ] `terminalSessions.ts` 의 `TerminalSession` 에서 `clientSocket`/
       `daemonSocket`(Socket 객체) → `clientSocketId`/`machineId`/`daemonSocketId`

@@ -11,10 +11,31 @@ const roomEmits: Array<{ room: string; event: string; payload: any }> = [];
 
 vi.mock('@/app/events/eventRouter', () => ({
     eventRouter: {
-        getConnections: () => connections,
         server: {
             to: (room: string) => ({
                 emit: (event: string, payload: any) => { roomEmits.push({ room, event, payload }); },
+            }),
+            // The daemon is resolved through the machine room so the lookup
+            // crosses replicas. Sockets that engine.io has already torn down
+            // are gone from the room, so the fixture mirrors that by dropping
+            // `connected === false` entries here rather than in the handler.
+            in: (room: string) => ({
+                timeout: () => ({
+                    fetchSockets: async () => {
+                        const machineId = room.split(':machine:')[1];
+                        return [...connections]
+                            .filter((c) => c.connectionType === 'machine-scoped'
+                                && c.machineId === machineId
+                                && c.socket.connected)
+                            .map((c) => Object.assign(c.socket, {
+                                data: {
+                                    clientType: 'machine-scoped',
+                                    machineId: c.machineId,
+                                    connectedAt: c.connectedAt,
+                                },
+                            }));
+                    },
+                }),
             }),
         },
     },
@@ -56,8 +77,20 @@ class FakeSocket {
     }
 }
 
+/**
+ * `connectedAt` is the recency signal the handler ranks on — a monotonically
+ * increasing counter here so "registered later" means "newer", matching the
+ * insertion-order intent of the original fixture.
+ */
+let nextConnectedAt = 1;
 function registerMachineSocket(machineId: string, socket: FakeSocket) {
-    connections.add({ connectionType: 'machine-scoped', machineId, userId: 'u1', socket });
+    connections.add({
+        connectionType: 'machine-scoped',
+        machineId,
+        userId: 'u1',
+        socket,
+        connectedAt: nextConnectedAt++,
+    });
 }
 
 describe('terminalRelayHandler machine socket selection', () => {
