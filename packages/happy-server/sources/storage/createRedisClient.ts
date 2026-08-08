@@ -1,4 +1,7 @@
 import { Redis, type RedisOptions } from 'ioredis';
+import { createLogThrottle, redisErrorCode } from '@/app/monitoring/redisHealth';
+import { redisClientErrorsCounter } from '@/app/monitoring/metrics2';
+import { log } from '@/utils/log';
 
 export interface RedisClientEnv {
     REDIS_URL?: string;
@@ -49,5 +52,21 @@ export function resolveRedisClientOptions(env: RedisClientEnv): RedisOptions | s
 
 export function createRedisClient(env: RedisClientEnv = process.env): Redis {
     const options = resolveRedisClientOptions(env);
-    return typeof options === 'string' ? new Redis(options) : new Redis(options);
+    const client = typeof options === 'string' ? new Redis(options) : new Redis(options);
+
+    // ioredis emits `error` for connection-level failures. Without a listener
+    // these were entirely invisible — the server logged one Redis line in 10
+    // hours while the bus was down. Command-level failures (-READONLY) do NOT
+    // arrive here; those are instrumented at the call site (see
+    // app/monitoring/redisHealth.ts instrumentStreamWrites).
+    const shouldLog = createLogThrottle(60_000);
+    client.on('error', (error: unknown) => {
+        const code = redisErrorCode(error);
+        redisClientErrorsCounter.inc({ code });
+        if (shouldLog(code)) {
+            log({ module: 'redis', level: 'error' }, `redis client error (${code}, throttled to 1/min): ${error}`);
+        }
+    });
+
+    return client;
 }
