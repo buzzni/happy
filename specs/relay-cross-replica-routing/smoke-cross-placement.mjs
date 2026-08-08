@@ -204,11 +204,22 @@ async function main() {
         fail(`GET /v1/machines → ${machinesRes.status} (토큰이 유효한가?)`);
         return;
     }
-    const machines = (await machinesRes.json())?.machines ?? [];
-    const online = machines.filter((m) => m.active !== false);
+    // GET /v1/machines answers with a bare array, not { machines: [...] }.
+    const raw = await machinesRes.json();
+    const machines = Array.isArray(raw) ? raw : (raw?.machines ?? []);
+    const online = machines.filter((m) => m.active === true);
+    info(`머신 ${machines.length}개 중 온라인 ${online.length}개`);
     const machineId = PIN_MACHINE || online[0]?.id;
     if (!machineId) {
-        fail('온라인 머신이 없다 — 데몬이 붙어 있어야 크로스 배치를 만들 수 있다');
+        // `active:false` means no daemon socket. Authenticating creates the
+        // machine row; the daemon still has to be running (`happy daemon start`).
+        fail(`온라인 머신이 없다 — 인증만으로는 부족하고 데몬이 실행 중이어야 한다`
+            + (machines.length ? ` (등록된 머신: ${machines.map((m) => `${m.id}:active=${m.active}`).join(', ')})` : ''));
+        return;
+    }
+    if (PIN_MACHINE && !online.some((m) => m.id === PIN_MACHINE)) {
+        // Otherwise every downstream failure looks like a routing bug.
+        fail(`SMOKE_MACHINE=${PIN_MACHINE} 은 온라인 목록에 없다 — 서버가 아는 머신: ${machines.map((m) => m.id).join(', ') || '없음'}`);
         return;
     }
     info(`machineId=${machineId}`);
