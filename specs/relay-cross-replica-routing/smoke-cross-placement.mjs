@@ -1,0 +1,304 @@
+#!/usr/bin/env node
+/**
+ * Cross-placement smoke for relay-cross-replica-routing (spec AC1/AC2/AC3).
+ *
+ * WHY THIS EXISTS, AND WHY IT IS NOT THE OLD SCRIPT
+ * -------------------------------------------------
+ * aplus-dev-studio `specs/happy-server-horizontal-scale/smoke-cross-replica.sh`
+ * could never prove AC1. It drove traffic through the Service and read
+ * `rpc_calls_total{result="success"}`, but `fetchSockets()` returns local
+ * sockets too — so `success` rises identically whether the browser and the
+ * daemon shared a replica or not. Its own context.md records this gap.
+ *
+ * The trick here: **address every replica directly, bypassing the Service, and
+ * require all of them to succeed.** A daemon is attached to exactly one
+ * replica, so if every replica can serve a request for that machine, the
+ * others necessarily crossed. Before this spec's changes exactly one replica
+ * would answer and the rest would 502 / "Machine not connected" — which is
+ * precisely the 2026-08-07 failure. No need to know which replica owns the
+ * daemon, and no way to pass by accident.
+ *
+ * JUDGEMENT PRINCIPLE (inherited): "could not check" is not PASS. Missing
+ * credentials produce SKIP and a non-zero exit unless SMOKE_ALLOW_SKIP=1, so a
+ * half-run cannot be mistaken for a green run.
+ *
+ * READ-ONLY. Opens a terminal and a preview request against the user's own
+ * machine; deletes nothing, restarts nothing.
+ *
+ * USAGE
+ *   SMOKE_TOKEN=<happy access token> \
+ *   SMOKE_PORT=<a port the daemon can reach on its host> \
+ *   node smoke-cross-placement.mjs [namespace]
+ *
+ *   SMOKE_MACHINE=<machineId>   pin the machine (default: first online machine)
+ *   SMOKE_ALLOW_SKIP=1          exit 0 even when checks were skipped
+ *   SMOKE_KEEP_PF=1             leave port-forwards running (debugging)
+ *
+ * The token is the same bearer the web app uses. Get it from the browser
+ * devtools (Authorization header on any /v1 request) or from
+ * `~/.happy/settings.json` on a machine running the daemon.
+ */
+
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import net from 'node:net';
+import { createRequire } from 'node:module';
+
+// pnpm keeps node_modules strict and `specs/` is not a workspace package, so
+// resolve the client from a package that actually depends on it.
+function loadSocketIoClient() {
+    const bases = [
+        '../../packages/happy-cli/package.json',
+        '../../packages/happy-server/package.json',
+        '../../package.json',
+    ];
+    for (const base of bases) {
+        try {
+            return createRequire(new URL(base, import.meta.url))('socket.io-client').io;
+        } catch { /* try the next base */ }
+    }
+    throw new Error(
+        'socket.io-client 를 찾을 수 없다. vendor/happy 에서 `pnpm install` 을 먼저 실행하라.',
+    );
+}
+const ioClient = loadSocketIoClient();
+
+const NS = process.argv[2] ?? 'aplus-dev-studio-dev-shared';
+const TOKEN = process.env.SMOKE_TOKEN ?? '';
+const PORT = Number(process.env.SMOKE_PORT ?? 0);
+const PIN_MACHINE = process.env.SMOKE_MACHINE ?? '';
+const ALLOW_SKIP = process.env.SMOKE_ALLOW_SKIP === '1';
+const KEEP_PF = process.env.SMOKE_KEEP_PF === '1';
+const APP_PORT = 3000;
+const METRICS_PORT = 9090;
+
+let failed = 0;
+let skipped = 0;
+const pass = (m) => console.log(`  PASS  ${m}`);
+const fail = (m) => { console.log(`  FAIL  ${m}`); failed++; };
+const skip = (m) => { console.log(`  SKIP  ${m}`); skipped++; };
+const info = (m) => console.log(`        ${m}`);
+const section = (m) => console.log(`\n== ${m}`);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function sh(cmd, args) {
+    return new Promise((resolve, reject) => {
+        const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        let out = '', err = '';
+        p.stdout.on('data', (d) => { out += d; });
+        p.stderr.on('data', (d) => { err += d; });
+        p.on('close', (code) => code === 0
+            ? resolve(out)
+            : reject(new Error(`${cmd} ${args.join(' ')} failed (${code}): ${err.trim()}`)));
+    });
+}
+
+async function freePort() {
+    const srv = net.createServer();
+    srv.listen(0, '127.0.0.1');
+    await once(srv, 'listening');
+    const { port } = srv.address();
+    await new Promise((r) => srv.close(r));
+    return port;
+}
+
+const forwards = [];
+/** Port-forward straight to one pod so the Service/ingress cannot pick for us. */
+async function portForward(pod, remotePort) {
+    const local = await freePort();
+    const p = spawn('kubectl', ['-n', NS, 'port-forward', pod, `${local}:${remotePort}`],
+        { stdio: ['ignore', 'ignore', 'pipe'] });
+    forwards.push(p);
+    // Wait for the tunnel to accept connections rather than sleeping blindly.
+    for (let i = 0; i < 50; i++) {
+        await sleep(200);
+        try {
+            const s = net.createConnection({ host: '127.0.0.1', port: local });
+            await once(s, 'connect');
+            s.destroy();
+            return local;
+        } catch { /* not up yet */ }
+    }
+    throw new Error(`port-forward to ${pod}:${remotePort} never became ready`);
+}
+
+function cleanupForwards() {
+    if (KEEP_PF) return;
+    for (const p of forwards) { try { p.kill(); } catch { /* gone */ } }
+}
+
+async function api(base, path, { method = 'GET', body, token = TOKEN } = {}) {
+    const res = await fetch(`http://127.0.0.1:${base}${path}`, {
+        method,
+        headers: {
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            ...(body ? { 'Content-Type': 'application/json' } : {}),
+        },
+        body: body ? JSON.stringify(body) : undefined,
+    });
+    return res;
+}
+
+async function main() {
+    console.log(`happy-server 크로스 배치 스모크 — namespace=${NS}`);
+
+    section('0. 전제');
+    const podsRaw = await sh('kubectl', ['-n', NS, 'get', 'pods',
+        '-l', 'app.kubernetes.io/name=happy-server',
+        '--field-selector=status.phase=Running', '-o', 'name']);
+    const pods = podsRaw.split('\n').map((s) => s.trim().replace(/^pod\//, '')).filter(Boolean);
+    info(`replica: ${pods.length}개 — ${pods.join(', ')}`);
+    if (pods.length < 2) {
+        fail(`replicas >= 2 가 필요하다 (현재 ${pods.length}). 크로스 배치를 만들 수 없다.`);
+        return;
+    }
+    pass(`replicas=${pods.length}`);
+
+    section('1. 클러스터 버스 — 각 replica 가 peer 를 보는가');
+    // socketio_cluster_peers 는 이 spec 에서 추가한 지표다. 0 이면 fetchSockets 가
+    // 에러 없이 로컬 결과만 반환하는 상태이고, 그러면 아래 검사들은 전부
+    // "우연히 같은 replica" 여부만 보게 된다.
+    let busOk = true;
+    for (const pod of pods) {
+        const mp = await portForward(pod, METRICS_PORT);
+        const text = await (await fetch(`http://127.0.0.1:${mp}/metrics`)).text();
+        const m = text.match(/^socketio_cluster_peers.*?\s([-\d.]+)$/m);
+        if (!m) {
+            fail(`${pod}: socketio_cluster_peers 부재 — 이 spec 의 계측이 배포되지 않았다`);
+            busOk = false;
+            continue;
+        }
+        const peers = Number(m[1]);
+        if (peers === pods.length - 1) pass(`${pod}: peers=${peers}`);
+        else { fail(`${pod}: peers=${peers} (기대 ${pods.length - 1}) — 버스가 끊겼다`); busOk = false; }
+    }
+    if (!busOk) {
+        info('버스가 성립하지 않으면 아래 결과는 의미가 없다. 여기서 멈춘다.');
+        return;
+    }
+
+    if (!TOKEN) {
+        section('2~4. 기능 검사');
+        skip('SMOKE_TOKEN 이 없다 — 프리뷰/터미널 왕복을 확인할 수 없다');
+        return;
+    }
+
+    // 첫 replica 를 "제어용" 으로 써서 머신 목록과 ptoken 을 얻는다.
+    const ctrl = await portForward(pods[0], APP_PORT);
+
+    section('2. 대상 머신 선정');
+    const machinesRes = await api(ctrl, '/v1/machines');
+    if (!machinesRes.ok) {
+        fail(`GET /v1/machines → ${machinesRes.status} (토큰이 유효한가?)`);
+        return;
+    }
+    const machines = (await machinesRes.json())?.machines ?? [];
+    const online = machines.filter((m) => m.active !== false);
+    const machineId = PIN_MACHINE || online[0]?.id;
+    if (!machineId) {
+        fail('온라인 머신이 없다 — 데몬이 붙어 있어야 크로스 배치를 만들 수 있다');
+        return;
+    }
+    info(`machineId=${machineId}`);
+
+    // 데몬 소켓이 정확히 1개여야 "다른 replica 는 반드시 건너뛴 것" 이 성립한다.
+    let daemonSockets = 0;
+    for (const pod of pods) {
+        const mp = await portForward(pod, METRICS_PORT);
+        const text = await (await fetch(`http://127.0.0.1:${mp}/metrics`)).text();
+        for (const line of text.split('\n')) {
+            if (line.startsWith('websocket_connections_total') && line.includes('type="machine-scoped"')) {
+                daemonSockets += Number(line.trim().split(/\s+/).pop()) || 0;
+            }
+        }
+    }
+    info(`machine-scoped 소켓 총합: ${daemonSockets} (전체 머신 기준)`);
+    pass(`대상 머신 확보`);
+
+    section('3. AC1 — 프리뷰 HTTP 가 모든 replica 에서 통하는가');
+    if (!PORT) {
+        skip('SMOKE_PORT 가 없다 — 프리뷰 왕복을 확인할 수 없다');
+    } else {
+        const mint = await api(ctrl, '/v1/preview-token', {
+            method: 'POST', body: { machineId, port: PORT },
+        });
+        if (!mint.ok) {
+            fail(`POST /v1/preview-token → ${mint.status}`);
+        } else {
+            const { token: ptoken } = await mint.json();
+            const results = [];
+            for (const pod of pods) {
+                const ap = await portForward(pod, APP_PORT);
+                const res = await fetch(
+                    `http://127.0.0.1:${ap}/v1/preview/${machineId}/${PORT}/?ptoken=${encodeURIComponent(ptoken)}`,
+                    { redirect: 'manual' },
+                );
+                results.push({ pod, status: res.status });
+                info(`${pod} → ${res.status}`);
+            }
+            // 502 는 "machine-offline" 또는 "lookup-degraded" 다. 데몬은 한
+            // replica 에만 있으므로, 프로세스 로컬 조회였다면 정확히 하나만
+            // 성공하고 나머지는 502 가 된다.
+            const offline = results.filter((r) => r.status === 502);
+            if (offline.length === 0) {
+                pass(`모든 replica 가 프리뷰를 서빙했다 — 최소 ${pods.length - 1}개는 replica 를 건넜다`);
+            } else if (offline.length === results.length) {
+                fail('모든 replica 가 502 — 데몬이 그 포트를 못 열었거나 머신이 오프라인이다 (라우팅 문제와 구별 불가)');
+            } else {
+                fail(`${offline.length}/${results.length} replica 가 502 — 조회가 여전히 프로세스 로컬이다: ${offline.map((r) => r.pod).join(', ')}`);
+            }
+        }
+    }
+
+    section('4. AC3 — 터미널이 모든 replica 에서 열리는가');
+    for (const pod of pods) {
+        const ap = await portForward(pod, APP_PORT);
+        const socket = ioClient(`http://127.0.0.1:${ap}`, {
+            path: '/v1/updates',
+            transports: ['websocket'],
+            auth: { token: TOKEN, clientType: 'user-scoped' },
+            reconnection: false,
+            timeout: 10_000,
+        });
+        try {
+            await new Promise((resolve, reject) => {
+                socket.once('connect', resolve);
+                socket.once('connect_error', reject);
+                setTimeout(() => reject(new Error('connect timeout')), 12_000);
+            });
+            const ack = await new Promise((resolve) => {
+                socket.timeout(15_000).emit('terminal-open', { machineId, params: null },
+                    (err, resp) => resolve(err ? { ok: false, error: String(err.message ?? err) } : resp));
+            });
+            if (ack?.ok === true) {
+                pass(`${pod}: terminal-open 성공 (session=${String(ack.sessionId).slice(0, 8)}…)`);
+                socket.emit('terminal-close', { sessionId: ack.sessionId });
+            } else {
+                fail(`${pod}: terminal-open 실패 — ${ack?.error ?? '알 수 없음'}`);
+            }
+        } catch (e) {
+            fail(`${pod}: 소켓 연결 실패 — ${e.message}`);
+        } finally {
+            socket.close();
+        }
+    }
+    info('데몬은 한 replica 에만 붙어 있으므로, 두 replica 모두 성공했다면 한쪽은 건넌 것이다.');
+}
+
+main()
+    .catch((e) => { console.error(`\n실행 오류: ${e.message}`); failed++; })
+    .finally(async () => {
+        cleanupForwards();
+        section('결과');
+        console.log(`  실패 ${failed}건, 건너뜀 ${skipped}건`);
+        if (failed > 0) {
+            console.log('  → 크로스 배치가 성립하지 않는다. replicas=2 로 올리지 말 것.');
+        } else if (skipped > 0 && !ALLOW_SKIP) {
+            console.log('  → 통과했지만 확인하지 못한 항목이 있다. 이건 PASS 가 아니다.');
+        } else {
+            console.log('  → AC1/AC3 크로스 배치 확인.');
+        }
+        console.log('');
+        process.exit(failed > 0 || (skipped > 0 && !ALLOW_SKIP) ? 1 : 0);
+    });

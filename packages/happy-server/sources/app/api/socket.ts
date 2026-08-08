@@ -17,6 +17,7 @@ import { artifactUpdateHandler } from "./socket/artifactUpdateHandler";
 import { accessKeyHandler } from "./socket/accessKeyHandler";
 import { terminalRelayHandler } from "./socket/terminalRelayHandler";
 import { setTerminalSessionBackend, type TerminalSessionBackend } from "./socket/terminalSessions";
+import { previewWsMachineHandler, registerPreviewWsClusterListeners } from "@/modules/preview/previewWebSocketRelay";
 import { db } from "@/storage/db";
 
 export function startSocket(app: Fastify) {
@@ -123,6 +124,10 @@ export function startSocket(app: Fastify) {
 
     // Initialize event router with Socket.IO server instance
     eventRouter.init(io);
+
+    // Preview WS frames whose browser socket is owned by a peer replica arrive
+    // here via serverSideEmit. Registered once per process.
+    registerPreviewWsClusterListeners(io);
 
     // Auth runs in middleware so it completes BEFORE the client's `connect`
     // event fires. Without this, the async verifyToken in the connection
@@ -282,6 +287,12 @@ export function startSocket(app: Fastify) {
         artifactUpdateHandler(userId, socket);
         accessKeyHandler(userId, socket);
         terminalRelayHandler(userId, socket);
+        if (connection.connectionType === 'machine-scoped') {
+            // proxy-ws-* only ever fires on the replica the daemon is attached
+            // to, so the dispatch has to be wired here rather than lazily at
+            // tunnel-open time on whichever replica took the browser upgrade.
+            previewWsMachineHandler(socket);
+        }
 
         // Ready
         log({ module: 'websocket' }, `User connected: ${userId}`);
