@@ -3,7 +3,7 @@ import { Fastify } from "./types";
 import { buildMachineActivityEphemeral, ClientConnection, eventRouter } from "@/app/events/eventRouter";
 import { Server } from "socket.io";
 import { createAdapter } from "@socket.io/redis-streams-adapter";
-import { Redis } from "ioredis";
+import { createRedisClient, isRedisConfigured } from "@/storage/createRedisClient";
 import { log } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
 import { getMetricsLabelsFromSocket, redisStreamLagMsGauge, websocketConnectionsGauge, websocketEventsCounter } from "../monitoring/metrics2";
@@ -60,9 +60,9 @@ export function startSocket(app: Fastify) {
         // },
     });
 
-    // Multi-process support: attach Redis streams adapter when REDIS_URL is set
-    if (process.env.REDIS_URL) {
-        const streamClient = new Redis(process.env.REDIS_URL);
+    // Multi-process support: attach Redis streams adapter when Redis is configured
+    if (isRedisConfigured(process.env)) {
+        const streamClient = createRedisClient();
         io.adapter(createAdapter(streamClient, { maxLen: 200000, readCount: 2000 }));
         log({ module: 'websocket' }, 'Redis streams adapter enabled for multi-process support');
 
