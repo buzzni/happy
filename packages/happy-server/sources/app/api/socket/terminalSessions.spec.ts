@@ -1,17 +1,22 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { Socket } from 'socket.io';
 import {
     addTerminalSession,
     getTerminalSession,
     removeTerminalSession,
-    findTerminalSessionsBySocket,
+    findTerminalSessionsBySocketId,
     countActiveSessionsForUser,
     _resetTerminalSessionsForTest,
 } from './terminalSessions';
 
-function fakeSocket(): Socket {
-    return {} as unknown as Socket;
-}
+const session = (over: Partial<Parameters<typeof addTerminalSession>[0]> = {}) => ({
+    id: 's1',
+    userId: 'u1',
+    machineId: 'm1',
+    clientSocketId: 'client-1',
+    daemonSocketId: 'daemon-1',
+    createdAt: 1,
+    ...over,
+});
 
 describe('terminalSessions', () => {
     beforeEach(() => {
@@ -19,22 +24,15 @@ describe('terminalSessions', () => {
     });
 
     it('add/get round-trips a session by id', () => {
-        const client = fakeSocket();
-        const daemon = fakeSocket();
-        addTerminalSession({
-            id: 's1',
-            userId: 'u1',
-            machineId: 'm1',
-            clientSocket: client,
-            daemonSocket: daemon,
-            createdAt: 1000,
-        });
+        addTerminalSession(session({ createdAt: 1000 }));
         const got = getTerminalSession('s1');
         expect(got).not.toBeNull();
         expect(got!.userId).toBe('u1');
         expect(got!.machineId).toBe('m1');
-        expect(got!.clientSocket).toBe(client);
-        expect(got!.daemonSocket).toBe(daemon);
+        // Socket ids, not Socket objects — a session opened on one replica has
+        // to be resolvable on the replica the daemon is attached to.
+        expect(got!.clientSocketId).toBe('client-1');
+        expect(got!.daemonSocketId).toBe('daemon-1');
     });
 
     it('getTerminalSession returns null for unknown / missing id', () => {
@@ -45,55 +43,26 @@ describe('terminalSessions', () => {
     });
 
     it('removeTerminalSession reports whether the entry existed', () => {
-        addTerminalSession({
-            id: 's1', userId: 'u1', machineId: 'm1',
-            clientSocket: fakeSocket(), daemonSocket: fakeSocket(), createdAt: 1,
-        });
+        addTerminalSession(session());
         expect(removeTerminalSession('s1')).toBe(true);
         expect(removeTerminalSession('s1')).toBe(false);
         expect(getTerminalSession('s1')).toBeNull();
     });
 
-    it('findTerminalSessionsBySocket matches both client and daemon side', () => {
-        const client = fakeSocket();
-        const daemon = fakeSocket();
-        const otherDaemon = fakeSocket();
-        addTerminalSession({
-            id: 's1', userId: 'u1', machineId: 'm1',
-            clientSocket: client, daemonSocket: daemon, createdAt: 1,
-        });
-        addTerminalSession({
-            id: 's2', userId: 'u1', machineId: 'm2',
-            clientSocket: client, daemonSocket: otherDaemon, createdAt: 2,
-        });
-        addTerminalSession({
-            id: 's3', userId: 'u2', machineId: 'm3',
-            clientSocket: fakeSocket(), daemonSocket: fakeSocket(), createdAt: 3,
-        });
+    it('findTerminalSessionsBySocketId matches both client and daemon side', () => {
+        addTerminalSession(session({ id: 's1', clientSocketId: 'client', daemonSocketId: 'daemon' }));
+        addTerminalSession(session({ id: 's2', machineId: 'm2', clientSocketId: 'client', daemonSocketId: 'other-daemon', createdAt: 2 }));
+        addTerminalSession(session({ id: 's3', userId: 'u2', machineId: 'm3', clientSocketId: 'x', daemonSocketId: 'y', createdAt: 3 }));
 
-        const fromClient = findTerminalSessionsBySocket(client);
-        expect(fromClient.map(s => s.id).sort()).toEqual(['s1', 's2']);
-
-        const fromDaemon = findTerminalSessionsBySocket(daemon);
-        expect(fromDaemon.map(s => s.id)).toEqual(['s1']);
-
-        const fromUnrelated = findTerminalSessionsBySocket(fakeSocket());
-        expect(fromUnrelated).toEqual([]);
+        expect(findTerminalSessionsBySocketId('client').map(s => s.id).sort()).toEqual(['s1', 's2']);
+        expect(findTerminalSessionsBySocketId('daemon').map(s => s.id)).toEqual(['s1']);
+        expect(findTerminalSessionsBySocketId('unrelated')).toEqual([]);
     });
 
     it('countActiveSessionsForUser counts only that user', () => {
-        addTerminalSession({
-            id: 's1', userId: 'u1', machineId: 'm1',
-            clientSocket: fakeSocket(), daemonSocket: fakeSocket(), createdAt: 1,
-        });
-        addTerminalSession({
-            id: 's2', userId: 'u1', machineId: 'm2',
-            clientSocket: fakeSocket(), daemonSocket: fakeSocket(), createdAt: 2,
-        });
-        addTerminalSession({
-            id: 's3', userId: 'u2', machineId: 'm3',
-            clientSocket: fakeSocket(), daemonSocket: fakeSocket(), createdAt: 3,
-        });
+        addTerminalSession(session({ id: 's1' }));
+        addTerminalSession(session({ id: 's2', machineId: 'm2', createdAt: 2 }));
+        addTerminalSession(session({ id: 's3', userId: 'u2', machineId: 'm3', createdAt: 3 }));
 
         expect(countActiveSessionsForUser('u1')).toBe(2);
         expect(countActiveSessionsForUser('u2')).toBe(1);

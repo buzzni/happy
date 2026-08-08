@@ -1,16 +1,16 @@
 /**
- * In-memory registry of active terminal relay sessions on this happy-server
- * process. Server-side state for specs/remote-terminal/ Phase 2 — the
- * server is a thin routing layer between the client (web-ui xterm panel)
- * and the daemon (PTY on the user's machine). Payloads are E2EE between
- * the endpoints; this module only tracks the socket pair routing.
+ * Registry of active terminal relay sessions. Server-side state for
+ * specs/remote-terminal/ Phase 2 — the server is a thin routing layer between
+ * the client (web-ui xterm panel) and the daemon (PTY on the user's machine).
+ * Payloads are E2EE between the endpoints; this module only tracks routing.
  *
- * Pure data structure module — no socket.io coupling beyond the Socket
- * type. terminalRelayHandler.ts uses these helpers to resolve sessionId
- * to its socket pair and to enforce per-user concurrency caps.
+ * Sessions hold **socket ids, not Socket objects**. A Socket instance only
+ * exists on the replica that owns the connection, so with replicas >= 2 the
+ * daemon's frames arrive on a replica that has no object for the client side.
+ * Ids are routable from anywhere: Socket.IO auto-joins every socket to a room
+ * named after its id, so `io.to(socketId).emit()` crosses replicas via the
+ * cluster adapter. See specs/relay-cross-replica-routing.
  */
-
-import { Socket } from 'socket.io';
 
 export const MAX_TERMINALS_PER_USER = 5;
 
@@ -18,8 +18,8 @@ export interface TerminalSession {
     id: string;
     userId: string;
     machineId: string;
-    clientSocket: Socket;
-    daemonSocket: Socket;
+    clientSocketId: string;
+    daemonSocketId: string;
     createdAt: number;
 }
 
@@ -38,10 +38,10 @@ export function removeTerminalSession(id: string): boolean {
     return sessions.delete(id);
 }
 
-export function findTerminalSessionsBySocket(socket: Socket): TerminalSession[] {
+export function findTerminalSessionsBySocketId(socketId: string): TerminalSession[] {
     const out: TerminalSession[] = [];
     for (const s of sessions.values()) {
-        if (s.clientSocket === socket || s.daemonSocket === socket) {
+        if (s.clientSocketId === socketId || s.daemonSocketId === socketId) {
             out.push(s);
         }
     }

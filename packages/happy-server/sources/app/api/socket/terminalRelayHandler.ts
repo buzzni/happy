@@ -34,12 +34,22 @@ import {
     addTerminalSession,
     getTerminalSession,
     removeTerminalSession,
-    findTerminalSessionsBySocket,
+    findTerminalSessionsBySocketId,
     countActiveSessionsForUser,
     MAX_TERMINALS_PER_USER,
 } from './terminalSessions';
 
 const TERMINAL_OPEN_TIMEOUT_MS = 10_000;
+
+/**
+ * Every socket is auto-joined to a room named after its own id, so addressing
+ * a room by socket id reaches that socket on whichever replica owns it
+ * (specs/relay-cross-replica-routing). Replaces holding a Socket object,
+ * which only works when both endpoints are on the same process.
+ */
+function emitToSocket(socketId: string, event: string, payload: unknown): void {
+    eventRouter.server.to(socketId).emit(event, payload);
+}
 
 // Returns the *newest still-connected* machine socket. A daemon that
 // reconnects after a network flap (sleep/wake, Wi-Fi switch, restart)
@@ -112,8 +122,8 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
                 id: sessionId,
                 userId,
                 machineId,
-                clientSocket: socket,
-                daemonSocket,
+                clientSocketId: socket.id,
+                daemonSocketId: daemonSocket.id,
                 createdAt: Date.now(),
             });
             log({ module: 'terminal-relay' }, `[REMOTE-TERMINAL] open user=${userId} machine=${machineId} session=${sessionId}`);
@@ -130,13 +140,13 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
         // Direction is inferred from the source socket. Drop frames whose
         // source is not part of the session pair — defends against a
         // confused-deputy where a third socket guesses a sessionId.
-        if (socket === session.clientSocket) {
-            session.daemonSocket.emit('terminal-frame-fwd', {
+        if (socket.id === session.clientSocketId) {
+            emitToSocket(session.daemonSocketId, 'terminal-frame-fwd', {
                 sessionId: session.id,
                 data: data?.data,
             });
-        } else if (socket === session.daemonSocket) {
-            session.clientSocket.emit('terminal-frame', {
+        } else if (socket.id === session.daemonSocketId) {
+            emitToSocket(session.clientSocketId, 'terminal-frame', {
                 sessionId: session.id,
                 data: data?.data,
             });
@@ -145,11 +155,11 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
 
     socket.on('terminal-resize', (data: any) => {
         const session = getTerminalSession(data?.sessionId);
-        if (!session || socket !== session.clientSocket) return;
+        if (!session || socket.id !== session.clientSocketId) return;
         const cols = Number(data?.cols);
         const rows = Number(data?.rows);
         if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) return;
-        session.daemonSocket.emit('terminal-resize-fwd', {
+        emitToSocket(session.daemonSocketId, 'terminal-resize-fwd', {
             sessionId: session.id,
             cols,
             rows,
@@ -159,9 +169,9 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
     socket.on('terminal-close', (data: any) => {
         const session = getTerminalSession(data?.sessionId);
         if (!session) return;
-        if (socket !== session.clientSocket && socket !== session.daemonSocket) return;
-        if (socket === session.clientSocket) {
-            session.daemonSocket.emit('terminal-close-fwd', { sessionId: session.id });
+        if (socket.id !== session.clientSocketId && socket.id !== session.daemonSocketId) return;
+        if (socket.id === session.clientSocketId) {
+            emitToSocket(session.daemonSocketId, 'terminal-close-fwd', { sessionId: session.id });
         }
         removeTerminalSession(session.id);
         log({ module: 'terminal-relay' }, `[REMOTE-TERMINAL] close session=${session.id} (explicit)`);
@@ -170,8 +180,8 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
     socket.on('terminal-closed', (data: any) => {
         // Daemon-originated close (PTY exited).
         const session = getTerminalSession(data?.sessionId);
-        if (!session || socket !== session.daemonSocket) return;
-        session.clientSocket.emit('terminal-closed', {
+        if (!session || socket.id !== session.daemonSocketId) return;
+        emitToSocket(session.clientSocketId, 'terminal-closed', {
             sessionId: session.id,
             code: data?.code,
             signal: data?.signal,
@@ -181,14 +191,14 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
     });
 
     socket.on('disconnect', () => {
-        const sessions = findTerminalSessionsBySocket(socket);
+        const sessions = findTerminalSessionsBySocketId(socket.id);
         if (sessions.length === 0) return;
         for (const session of sessions) {
             try {
-                if (socket === session.clientSocket) {
-                    session.daemonSocket.emit('terminal-close-fwd', { sessionId: session.id });
-                } else if (socket === session.daemonSocket) {
-                    session.clientSocket.emit('terminal-closed', {
+                if (socket.id === session.clientSocketId) {
+                    emitToSocket(session.daemonSocketId, 'terminal-close-fwd', { sessionId: session.id });
+                } else if (socket.id === session.daemonSocketId) {
+                    emitToSocket(session.clientSocketId, 'terminal-closed', {
                         sessionId: session.id,
                         code: -1,
                         signal: null,

@@ -2,9 +2,21 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const connections = new Set<any>();
 
+/**
+ * Frames are routed with `io.to(socketId).emit(...)` rather than by holding a
+ * Socket object, so they reach the endpoint on whichever replica owns it
+ * (specs/relay-cross-replica-routing). Record every such emit.
+ */
+const roomEmits: Array<{ room: string; event: string; payload: any }> = [];
+
 vi.mock('@/app/events/eventRouter', () => ({
     eventRouter: {
         getConnections: () => connections,
+        server: {
+            to: (room: string) => ({
+                emit: (event: string, payload: any) => { roomEmits.push({ room, event, payload }); },
+            }),
+        },
     },
 }));
 
@@ -51,6 +63,7 @@ function registerMachineSocket(machineId: string, socket: FakeSocket) {
 describe('terminalRelayHandler machine socket selection', () => {
     beforeEach(() => {
         connections.clear();
+        roomEmits.length = 0;
         _resetTerminalSessionsForTest();
     });
 
@@ -107,5 +120,96 @@ describe('terminalRelayHandler machine socket selection', () => {
 
         expect(disconnected.forwards).toHaveLength(0);
         expect(ack).toHaveBeenCalledWith({ ok: false, error: 'Machine not connected for this user' });
+    });
+});
+
+describe('terminalRelayHandler frame routing', () => {
+    beforeEach(() => {
+        connections.clear();
+        roomEmits.length = 0;
+        _resetTerminalSessionsForTest();
+    });
+
+    /** Opens a session and returns the pieces needed to drive both directions. */
+    async function openSession() {
+        const daemon = new FakeSocket('daemon-1');
+        registerMachineSocket('m1', daemon);
+        const client = new FakeSocket('client-1');
+        terminalRelayHandler('u1', client as any);
+        // The daemon side registers its own handlers on its own socket — on a
+        // second replica this is a different process, which is exactly why
+        // routing must go through io.to(socketId) and not a Socket object.
+        terminalRelayHandler('u1', daemon as any);
+
+        const ack = vi.fn();
+        await client.trigger('terminal-open', { machineId: 'm1', params: 'enc' }, ack);
+        const sessionId = ack.mock.calls[0][0].sessionId;
+        roomEmits.length = 0;
+        return { client, daemon, sessionId };
+    }
+
+    it('shouldRouteClientFramesToTheDaemonSocketIdRoom', async () => {
+        const { client, sessionId } = await openSession();
+        await client.trigger('terminal-frame', { sessionId, data: 'cipher-in' });
+
+        expect(roomEmits).toEqual([
+            { room: 'daemon-1', event: 'terminal-frame-fwd', payload: { sessionId, data: 'cipher-in' } },
+        ]);
+    });
+
+    it('shouldRouteDaemonFramesBackToTheClientSocketIdRoom', async () => {
+        // This is the direction that was broken cross-replica: the daemon's
+        // frame lands on the daemon's replica, which held no Socket object for
+        // the client. Addressing the client's own id-room fixes it.
+        const { daemon, sessionId } = await openSession();
+        await daemon.trigger('terminal-frame', { sessionId, data: 'cipher-out' });
+
+        expect(roomEmits).toEqual([
+            { room: 'client-1', event: 'terminal-frame', payload: { sessionId, data: 'cipher-out' } },
+        ]);
+    });
+
+    it('shouldDropFramesFromASocketOutsideTheSessionPair', async () => {
+        const { sessionId } = await openSession();
+        const stranger = new FakeSocket('stranger');
+        terminalRelayHandler('u1', stranger as any);
+
+        await stranger.trigger('terminal-frame', { sessionId, data: 'guessed' });
+
+        expect(roomEmits).toEqual([]);
+    });
+
+    it('shouldForwardResizeOnlyFromTheClient', async () => {
+        const { client, daemon, sessionId } = await openSession();
+
+        await daemon.trigger('terminal-resize', { sessionId, cols: 10, rows: 5 });
+        expect(roomEmits).toEqual([]);
+
+        await client.trigger('terminal-resize', { sessionId, cols: 120, rows: 40 });
+        expect(roomEmits).toEqual([
+            { room: 'daemon-1', event: 'terminal-resize-fwd', payload: { sessionId, cols: 120, rows: 40 } },
+        ]);
+    });
+
+    it('shouldTellTheClientWhenTheDaemonSocketDisconnects', async () => {
+        const { daemon, sessionId } = await openSession();
+        await daemon.trigger('disconnect');
+
+        expect(roomEmits).toEqual([
+            {
+                room: 'client-1',
+                event: 'terminal-closed',
+                payload: { sessionId, code: -1, signal: null, reason: 'daemon-disconnected' },
+            },
+        ]);
+    });
+
+    it('shouldTellTheDaemonWhenTheClientSocketDisconnects', async () => {
+        const { client, sessionId } = await openSession();
+        await client.trigger('disconnect');
+
+        expect(roomEmits).toEqual([
+            { room: 'daemon-1', event: 'terminal-close-fwd', payload: { sessionId } },
+        ]);
     });
 });
