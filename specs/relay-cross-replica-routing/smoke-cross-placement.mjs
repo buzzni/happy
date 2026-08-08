@@ -151,6 +151,46 @@ async function api(base, path, { method = 'GET', body, token = TOKEN } = {}) {
     return res;
 }
 
+/**
+ * Sends a raw WebSocket upgrade to the preview relay and returns the status
+ * line. Raw `net` rather than a ws client on purpose: the upstream port is
+ * closed, so no handshake will ever complete — what we want is the relay's own
+ * HTTP error, and those two errors are exactly what tells routing apart:
+ *   "502 Machine Offline" → never reached the daemon  (previewWebSocketRelay:291)
+ *   "502 Bad Gateway"     → daemon answered, port shut (previewWebSocketRelay:325)
+ */
+function probeWsUpgrade(localPort, machineId, port, ptoken) {
+    return new Promise((resolve) => {
+        const socket = net.createConnection({ host: '127.0.0.1', port: localPort });
+        let buf = '';
+        const done = (statusLine) => {
+            socket.destroy();
+            resolve(statusLine);
+        };
+        const timer = setTimeout(() => done('TIMEOUT'), 20_000);
+        socket.on('connect', () => {
+            const key = Buffer.from(Array.from({ length: 16 }, (_, i) => (i * 37) % 256)).toString('base64');
+            socket.write(
+                `GET /v1/preview/${machineId}/${port}/?ptoken=${encodeURIComponent(ptoken)} HTTP/1.1\r\n` +
+                `Host: 127.0.0.1:${localPort}\r\n` +
+                'Upgrade: websocket\r\n' +
+                'Connection: Upgrade\r\n' +
+                `Sec-WebSocket-Key: ${key}\r\n` +
+                'Sec-WebSocket-Version: 13\r\n\r\n',
+            );
+        });
+        socket.on('data', (chunk) => {
+            buf += chunk.toString('latin1');
+            if (buf.includes('\r\n')) {
+                clearTimeout(timer);
+                done(buf.split('\r\n')[0]);
+            }
+        });
+        socket.on('error', (e) => { clearTimeout(timer); done(`ERROR ${e.code ?? e.message}`); });
+        socket.on('close', () => { clearTimeout(timer); done(buf.split('\r\n')[0] || 'CLOSED'); });
+    });
+}
+
 async function main() {
     console.log(`happy-server 크로스 배치 스모크 — namespace=${NS}`);
 
@@ -320,6 +360,44 @@ async function main() {
         }
     }
     info('데몬은 한 replica 에만 붙어 있으므로, 두 replica 모두 성공했다면 한쪽은 건넌 것이다.');
+
+    section(`5. AC2 — 프리뷰 WS 업그레이드가 모든 replica 에서 데몬까지 도달하는가 (port=${PORT})`);
+    {
+        const mint = await api(ctrl, '/v1/preview-token', {
+            method: 'POST', body: { machineId, port: PORT },
+        });
+        if (!mint.ok) {
+            fail(`POST /v1/preview-token → ${mint.status}`);
+        } else {
+            const { token: ptoken } = await mint.json();
+            const results = [];
+            for (const pod of pods) {
+                const ap = await portForward(pod, APP_PORT);
+                const status = await probeWsUpgrade(ap, machineId, PORT, ptoken);
+                // 101 would mean the upstream actually accepted (live port).
+                const served = status.includes(' 101 ');
+                const daemonAnswered = status.includes('502 Bad Gateway');
+                const routingMiss = status.includes('502 Machine Offline');
+                const verdict = served ? 'served'
+                    : daemonAnswered ? 'daemon-reached'
+                        : routingMiss ? 'routing-miss'
+                            : 'setup-error';
+                results.push({ pod, status, verdict });
+                info(`${pod} → ${status} (${verdict})`);
+            }
+            const setupErrors = results.filter((r) => r.verdict === 'setup-error');
+            const missed = results.filter((r) => r.verdict === 'routing-miss');
+            if (setupErrors.length > 0) {
+                fail(`픽스처 오류: ${setupErrors.map((r) => `${r.pod}="${r.status}"`).join(', ')} — 라우팅에 대해서는 아무것도 증명하지 못했다.`);
+            } else if (missed.length === 0) {
+                pass(`모든 replica 의 WS 업그레이드가 데몬에 도달했다 — 최소 ${pods.length - 1}개는 replica 를 건넜다`);
+            } else if (missed.length === results.length) {
+                fail('모든 replica 가 Machine Offline — 머신이 오프라인일 수 있다 (라우팅 문제와 구별 불가)');
+            } else {
+                fail(`${missed.length}/${results.length} replica 가 Machine Offline — WS 조회가 여전히 프로세스 로컬이다: ${missed.map((r) => r.pod).join(', ')}`);
+            }
+        }
+    }
 }
 
 main()
@@ -333,7 +411,7 @@ main()
         } else if (skipped > 0 && !ALLOW_SKIP) {
             console.log('  → 통과했지만 확인하지 못한 항목이 있다. 이건 PASS 가 아니다.');
         } else {
-            console.log('  → AC1/AC3 크로스 배치 확인.');
+            console.log('  → AC1/AC2/AC3 크로스 배치 확인.');
         }
         console.log('');
         process.exit(failed > 0 || (skipped > 0 && !ALLOW_SKIP) ? 1 : 0);
