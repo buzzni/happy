@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { findMachineSocketsIn, machineRoom } from './findMachineSockets';
+import { findMachineSocketsIn, machineRoom, newestMachineSocket } from './findMachineSockets';
 
 /**
  * Builds a fake `io` whose `in(room)` records the room and resolves
@@ -92,5 +92,40 @@ describe('findMachineSocketsIn', () => {
         const { io, seen } = fakeIo({ sockets: [] });
         await findMachineSocketsIn(io, 'u1', 'm1', 1234);
         expect(seen.timeoutMs).toBe(1234);
+    });
+});
+
+describe('newestMachineSocket', () => {
+    const at = (id: string, connectedAt?: number) => ({ id, data: { connectedAt } });
+
+    it('shouldPickTheMostRecentlyConnectedSocket', () => {
+        // A daemon that reconnects after a network flap leaves the dead socket
+        // registered until engine.io gives up (pingInterval + pingTimeout).
+        // Sending terminal-open into the stale one surfaces as "Daemon did not
+        // acknowledge in time".
+        const chosen = newestMachineSocket([at('stale', 1_000), at('live', 5_000)]);
+        expect(chosen?.id).toBe('live');
+    });
+
+    it('shouldNotDependOnArrayOrderBecauseFetchSocketsIsUnorderedAcrossReplicas', () => {
+        const chosen = newestMachineSocket([at('live', 5_000), at('stale', 1_000)]);
+        expect(chosen?.id).toBe('live');
+    });
+
+    it('shouldFallBackToTheLastEntryWhenNoSocketCarriesATimestamp', () => {
+        // Sockets connected before this field shipped have no connectedAt.
+        // Preserve the previous heuristic (insertion order, last = newest)
+        // instead of picking arbitrarily.
+        const chosen = newestMachineSocket([at('older'), at('newer')]);
+        expect(chosen?.id).toBe('newer');
+    });
+
+    it('shouldPreferATimestampedSocketOverAnUntimestampedOne', () => {
+        const chosen = newestMachineSocket([at('legacy'), at('fresh', 42)]);
+        expect(chosen?.id).toBe('fresh');
+    });
+
+    it('shouldReturnNullWhenThereAreNoCandidates', () => {
+        expect(newestMachineSocket([])).toBeNull();
     });
 });

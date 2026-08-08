@@ -16,6 +16,7 @@ import { machineUpdateHandler } from "./socket/machineUpdateHandler";
 import { artifactUpdateHandler } from "./socket/artifactUpdateHandler";
 import { accessKeyHandler } from "./socket/accessKeyHandler";
 import { terminalRelayHandler } from "./socket/terminalRelayHandler";
+import { setTerminalSessionBackend, type TerminalSessionBackend } from "./socket/terminalSessions";
 import { db } from "@/storage/db";
 
 export function startSocket(app: Fastify) {
@@ -79,6 +80,11 @@ export function startSocket(app: Fastify) {
 
         io.adapter(createAdapter(streamClient, { maxLen: 200000, readCount: 2000 }));
         log({ module: 'websocket' }, 'Redis streams adapter enabled for multi-process support');
+
+        // Terminal sessions must be resolvable from the replica the daemon is
+        // attached to, which is not necessarily the one that opened them.
+        // Uses its own client: the adapter's is parked in a blocking XREAD.
+        setTerminalSessionBackend(createRedisClient() as unknown as TerminalSessionBackend);
 
         // Track stream reader lag: wrap onRawMessage to capture last-read offset,
         // then periodically compare against stream HEAD.
@@ -157,6 +163,13 @@ export function startSocket(app: Fastify) {
         socket.data.clientType = clientType;
         socket.data.sessionId = sessionId;
         socket.data.machineId = machineId;
+        // Recency signal for picking between two live sockets of the same
+        // daemon (a reconnect after a network flap leaves the dead one around
+        // until engine.io gives up). The old code relied on Set insertion
+        // order, which does not survive a cross-replica fetchSockets() —
+        // `data` does, because the adapter ships it with the socket details.
+        // See specs/relay-cross-replica-routing.
+        socket.data.connectedAt = Date.now();
         socket.data.happyClient = socket.handshake.auth.happyClient as string
             || socket.handshake.headers['x-happy-client'] as string
             || undefined;
