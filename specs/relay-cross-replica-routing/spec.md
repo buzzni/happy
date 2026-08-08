@@ -86,7 +86,15 @@ replicas>=2 에서 프리뷰 HTTP·프리뷰 WS·터미널이 브라우저와 �
 - AC6: 프레임당 Redis 왕복을 추가하지 않는다 (터미널 키 입력·HMR 스트림이
   Redis RTT 에 묶이면 안 된다).
 
-## 7. 승인 필요 결정 (Decisions)
+## 7. 결정 (2026-08-08 승인 완료)
+
+- **D1 → (a) `io.serverSideEmit()`.** replicas 2~3 규모에서 낭비를 감수하고
+  코드를 작게 간다. 낭비가 지표로 보이면 (b) Redis pub/sub 으로 옮긴다.
+- **D2 → (a) Redis + replica 로컬 캐시.** 프레임당 왕복 없음(AC6).
+- **D3 → 그렇게 한다.** Phase 1(프리뷰 HTTP)을 먼저 머지·배포하고,
+  replicas=2 는 Phase 3 까지 끝난 뒤에 올린다.
+
+### 원문 (검토 시 선택지)
 
 - **D1: 프리뷰 WS 의 replica 간 바이트 전달 경로.**
   - (a) `io.serverSideEmit()` — 어댑터 내장, 코드 최소. 단 **모든** replica 로

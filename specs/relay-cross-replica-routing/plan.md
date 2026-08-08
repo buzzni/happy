@@ -1,23 +1,37 @@
 # 계획 (relay-cross-replica-routing)
 
-> 상태: **Phase 0 — 승인 대기. 코드 미착수.**
-> D1·D2 (spec.md §7) 확정 후 Phase 1 부터 진행한다.
+> 상태: **Phase 1 진행 중** (2026-08-08 승인).
+> D1=serverSideEmit, D2=Redis+로컬 캐시, D3=단계 분할 배포로 확정 (spec.md §7).
 
-## Phase 1 — 프리뷰 HTTP 릴레이 (무상태, 저위험)
+## Phase 1 — 프리뷰 HTTP 릴레이 (무상태, 저위험) — **완료 (2026-08-08)**
 
-`previewRoutes.ts` 만 건드린다.
+- [x] 공용 조회 모듈 `app/events/findMachineSockets.ts` 신설 —
+      `io.in('user:{u}:machine:{m}').timeout(2s).fetchSockets()` +
+      `clientType`/`machineId` 방어 필터. Phase 2·3 도 이걸 쓴다.
+      반환은 `{ sockets, degraded }` — `degraded` 는 어댑터 조회 자체가
+      실패했다는 뜻이라 "머신 없음" 과 구분된다 (AC5).
+- [x] `eventRouter` 에 `get server()` 추가 (io 접근자).
+- [x] `previewRoutes.findMachineSockets()` → 공용 모듈 위임, 호출부 `await`.
+- [x] `PreviewRelayOutcome` 에 `lookup-degraded` 추가. 상태코드는 502 그대로
+      (checkPortReachable 계약 불변), reason 토큰만 분리 (AC5).
+- [x] 조회 실패 시 502 를 `reason=lookup-degraded` 로 로깅.
 
-- [ ] `findMachineSockets()` 를 `io.in('user:{u}:machine:{m}').fetchSockets()`
-      기반 async 함수로 교체. `data.clientType === 'machine-scoped'` 로 필터
-      (room 에는 machine-scoped 만 들어가지만 방어적으로 확인).
-- [ ] `relayProxyHttpRequest()` 의 파라미터 타입은 이미
-      `Array<Pick<Socket,'id'|'timeout'>>` 이라 `RemoteSocket` 이 그대로 맞는다
-      (T2). 시그니처 변경 없음.
-- [ ] 조회 실패(어댑터 타임아웃)와 "머신 없음" 을 구분해 로깅 — AC5.
-      `rpcHandler.fetchRoomSockets` 의 timeout 래핑 패턴을 재사용.
-- 테스트: 기존 `previewRoutesRelay.spec.ts` 회귀 + fetchSockets 를 스텁한
-  cross-replica 조회 케이스 추가.
-- 검증: `pnpm typecheck` + 전체 vitest. 단일 replica 동작 불변(AC4).
+### 계획과 달랐던 점
+
+`relayProxyHttpRequest()` 시그니처가 "변경 없음" 일 거라 적었는데 **틀렸다.**
+파라미터 타입 `Array<Pick<Socket,'id'|'timeout'>>` 은 `RemoteSocket` 을
+구조적으로 받지 못한다 — `Socket.timeout()` 은 `Socket` 을,
+`RemoteSocket.timeout()` 은 `BroadcastOperator` 를 반환한다. 런타임은 둘 다
+`emitWithAck` 를 갖지만 타입이 안 맞는다. `PreviewRelayMachineSocket`
+구조적 인터페이스로 좁혀 해결했다 (previewWebSocketRelay 의
+`PreviewWsMachineSocket` 과 같은 패턴).
+
+- 테스트: `findMachineSockets.spec.ts` 8건 신규,
+  `previewRoutesFailureLog.spec.ts` 에 lookup-degraded 분리 1건 추가.
+  `previewRoutesCredentials.spec.ts` 의 `getConnections` 스텁을 room 조회
+  shim 으로 교체 (같은 픽스처에 production 과 동일한 필터 적용).
+- 검증: `pnpm typecheck` 클린, vitest **529 passed**. 단일 replica 경로 불변(AC4).
+- 미검증: AC1(실제 크로스 배치 스모크)은 Phase 4 에서 확인한다.
 
 ## Phase 2 — 터미널 (T3 활용)
 

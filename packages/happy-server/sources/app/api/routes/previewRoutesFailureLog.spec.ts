@@ -44,6 +44,25 @@ describe('describePreviewRelayFailure', () => {
         expect(status('SOMETHING_NEW')).toBe(502);
     });
 
+    it('separates a failed cross-replica lookup from a genuinely offline machine', () => {
+        // Both answer 502 (checkPortReachable contract), but conflating them in
+        // the log is what made the 2026-08-07 cluster-bus outage read as mass
+        // daemon disconnects. The reason token has to differ.
+        const degraded = describePreviewRelayFailure(
+            { kind: 'lookup-degraded' },
+            { ...ctx, candidates: 0 },
+        );
+        const offline = describePreviewRelayFailure(
+            { kind: 'machine-offline' },
+            { ...ctx, candidates: 0 },
+        );
+
+        expect(degraded.status).toBe(502);
+        expect(degraded.reason).toBe('lookup-degraded');
+        expect(degraded.reason).not.toBe(offline.reason);
+        expect(degraded.logLine).toContain('reason=lookup-degraded');
+    });
+
     it('carries every field an operator needs to tell the two causes apart', () => {
         const line = describePreviewRelayFailure(
             { kind: 'daemon-error', code: 'CONNECTION_REFUSED', message: 'connect ECONNREFUSED 127.0.0.1:30023' },
