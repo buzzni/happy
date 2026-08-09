@@ -15,7 +15,7 @@
 - Verification: 159 extension tests passed; packaged archive contains all four
   icon files at their declared 16, 32, 48, and 128 pixel dimensions.
 
-## Phase 3 — Deliver the isolated pull request (In progress)
+## Phase 3 — Deliver the isolated pull request (Done)
 
 - Create a branch from current `origin/main`, commit only the icon, manifest,
   shipped-files, `.gitignore`, and this spec bundle.

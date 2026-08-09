@@ -2,7 +2,7 @@
 
 ## Status
 
-Implementation validated; branch and pull request delivery in progress.
+Implementation delivered in PR #142.
 
 ## Observed starting state
 
@@ -19,3 +19,4 @@ Implementation validated; branch and pull request delivery in progress.
 - `pnpm --filter happy-browser-extension test`: 159 tests passed.
 - `pnpm --filter happy-browser-extension package`: generated the extension ZIP.
 - The ZIP contains all four declared icon assets at the expected dimensions.
+- PR: https://github.com/buzzni/happy/pull/142
