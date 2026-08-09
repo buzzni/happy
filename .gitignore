@@ -76,3 +76,7 @@ happy-workspaces/
 
 # third party tools
 .supervibe/
+
+# claude-memory-layer markdown mirror (conversation logs)
+memory/
+memory.bak-*/
