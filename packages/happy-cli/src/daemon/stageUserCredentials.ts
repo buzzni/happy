@@ -20,6 +20,11 @@ const STAGED_DIR_PREFIX = 'happy-session-'
 export async function stageUserCredentials(
   happyToken: string,
   happySecret: string,
+  /**
+   * The live daemon's own `daemon.state.json`. Copied into the staged dir —
+   * see below for why this is not optional in practice.
+   */
+  daemonStateFile?: string,
 ): Promise<StagedUserCredentials> {
   const userHomeDir = tmp.dirSync({ prefix: STAGED_DIR_PREFIX })
   await fs.mkdir(join(userHomeDir.name, 'logs'), { recursive: true })
@@ -28,6 +33,29 @@ export async function stageUserCredentials(
     JSON.stringify({ token: happyToken, secret: happySecret }, null, 2),
     { mode: 0o600 },
   )
+
+  // Staging works by pointing the child at this dir via HAPPY_HOME_DIR, but
+  // that env var moves *every* happy path at once (configuration.ts), not just
+  // access.key — including `daemon.state.json`. The child reports its startup
+  // webhook through `daemonPost`, which reads that file to find the daemon's
+  // HTTP port; with the file absent it fails with "No daemon running, no state
+  // file found" and the spawn dies as "Session webhook timeout for PID ...".
+  //
+  // So copy the daemon's current state in. A snapshot is correct here: the
+  // child only needs it to reach the daemon that spawned it, and `daemonPost`
+  // re-reads the file per call, so a daemon that restarts on a new port is
+  // handled by the caller re-staging rather than by this copy going stale.
+  if (daemonStateFile) {
+    try {
+      const state = await fs.readFile(daemonStateFile, 'utf-8')
+      await fs.writeFile(join(userHomeDir.name, 'daemon.state.json'), state, { mode: 0o600 })
+    } catch {
+      // Best-effort: a missing/unreadable daemon state file means the child
+      // falls back to the same "no state file" path it had before this copy
+      // existed. Failing the whole spawn here would be worse.
+    }
+  }
+
   return { homeDir: userHomeDir.name }
 }
 
