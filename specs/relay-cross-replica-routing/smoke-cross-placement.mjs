@@ -23,7 +23,10 @@
  * half-run cannot be mistaken for a green run.
  *
  * READ-ONLY. Opens a terminal and a preview request against the user's own
- * machine; deletes nothing, restarts nothing.
+ * machine; deletes nothing, restarts nothing. The session-spawn RPC check
+ * (§6) calls `spawn-happy-session` with an unencrypted empty `params` — the
+ * daemon can't decrypt it, so it never reaches `spawnSession()`; see the
+ * comment at that section for why the round trip still proves routing.
  *
  * USAGE
  *   SMOKE_TOKEN=$(python3 -c "import json;print(json.load(open('$HOME/.happy/access.key'))['token'])") \
@@ -398,6 +401,63 @@ async function main() {
             }
         }
     }
+
+    section('6. AC1 — 세션 spawn RPC 가 모든 replica 에서 데몬까지 도달하는가');
+    // aplus-dev-studio specs/happy-server-horizontal-scale Phase 2 기록:
+    // "V2 는 임의 daemon RPC 를 관측했을 뿐 세션 spawn 을 특정하지 않았다."
+    // rpc-call 전송 자체는 'bash' 등 다른 method 로 이미 실측됐지만(rpcHandler.ts
+    // 가 method 이름과 무관하게 같은 room+fetchSockets 경로를 타므로 구조적으로는
+    // 같다), spawn-happy-session 을 직접 겨냥한 적은 없었다. 여기서 닫는다.
+    //
+    // web-ui 의 실제 호출(index.ts:5925)은 params 를 machine 의 secretKey 로
+    // 암호화해 보낸다. 이 스모크는 그 키가 없으므로 **일부러 빈 문자열**을
+    // 보낸다 — daemon 쪽 RpcHandlerManager.handleRequest() 는
+    // `decrypt(key, variant, decodeBase64(request.params))` 를 메서드 핸들러
+    // 호출 **이전에** 실행하고, 전체를 try/catch 로 감싼다
+    // (packages/happy-cli/src/api/rpc/RpcHandlerManager.ts). decode 가 실패하면
+    // catch 가 암호화된 에러 블롭을 만들어 정상 반환하므로 — spawnSession()
+    // 근처에도 못 가고 세션은 만들어지지 않는다. 이 요청이 daemon 까지 갔다
+    // 왔다는 것 자체가 왕복 증거이고, 페이로드 내용(우리는 복호화 못 함)은
+    // 무관하다 — 프리뷰 릴레이의 "닫힌 포트에 CONNECTION_REFUSED" 와 같은 원리.
+    //
+    // 판정 기준은 브라우저가 보는 rpc-call 응답의 최상위 `ok` 뿐이다
+    // (rpcHandler.ts): `ok:true` 는 daemon 이 요청을 받고 **뭔가** 응답했다는
+    // 뜻(내용이 암호화된 에러여도 무방), `ok:false` + "not available" 은 room 이
+    // 비어 있었다는 뜻(라우팅 실패) — 나머지는 방화벽 픽스처 오류.
+    for (const pod of pods) {
+        const ap = await portForward(pod, APP_PORT);
+        const socket = ioClient(`http://127.0.0.1:${ap}`, {
+            path: '/v1/updates',
+            transports: ['websocket'],
+            auth: { token: TOKEN, clientType: 'user-scoped' },
+            reconnection: false,
+            timeout: 10_000,
+        });
+        try {
+            await new Promise((resolve, reject) => {
+                socket.once('connect', resolve);
+                socket.once('connect_error', reject);
+                setTimeout(() => reject(new Error('connect timeout')), 12_000);
+            });
+            const ack = await new Promise((resolve) => {
+                socket.timeout(15_000).emit('rpc-call', { method: `${machineId}:spawn-happy-session`, params: '' },
+                    (err, resp) => resolve(err ? { ok: false, error: String(err.message ?? err) } : resp));
+            });
+            const routingMiss = ack?.ok === false && /not available/i.test(String(ack?.error ?? ''));
+            if (ack?.ok === true) {
+                pass(`${pod}: daemon 도달 (응답 수신 — 암호화된 에러 블롭이라 내용은 검사하지 않는다)`);
+            } else if (routingMiss) {
+                fail(`${pod}: RPC method not available — 라우팅 실패로 보인다(데몬이 이 replica 에서 안 보인다)`);
+            } else {
+                fail(`${pod}: 예상 밖 응답 — ${JSON.stringify(ack)}`);
+            }
+        } catch (e) {
+            fail(`${pod}: 소켓 연결 실패 — ${e.message}`);
+        } finally {
+            socket.close();
+        }
+    }
+    info('데몬은 한 replica 에만 붙어 있으므로, 두 replica 모두 daemon 도달이면 한쪽은 건넌 것이다.');
 }
 
 main()

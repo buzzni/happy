@@ -1,8 +1,8 @@
 # 계획 (relay-cross-replica-routing)
 
-> 상태: **Phase 1·2·3 완료, Phase 4 dev 검증 통과 (2026-08-09).**
-> 남은 것은 prod 카나리 + baseline 재채집, 그리고 aplus-dev-studio
-> `specs/happy-server-horizontal-scale` 갱신뿐이다.
+> 상태: **Phase 1·2·3 완료. dev 크로스 배치 스모크 통과, prod 재전환
+> 완료(둘 다 2026-08-09).** 남은 것: prod 에 스모크 실행, §6(세션 spawn
+> RPC) 실행 — 둘 다 실제 사용자 토큰이 필요해 아직 못 했다.
 > D1=serverSideEmit, D2=Redis+로컬 캐시, D3=단계 분할 배포로 확정 (spec.md §7).
 
 ## Phase 1 — 프리뷰 HTTP 릴레이 (무상태, 저위험) — **완료 (2026-08-08)**
@@ -116,9 +116,14 @@
 - [x] dev replicas=2 에서 **브라우저·데몬 강제 크로스 배치** 스모크
       (AC1·AC2·AC3) — **통과 (2026-08-09).** `smoke-cross-placement.mjs`
       실패 0건·건너뜀 0건. 아래 "Phase 4 스모크 결과" 참조.
-- [ ] prod 카나리 + baseline 재채집 (이전 baseline 은 Prometheus retention
-      에서 소실).
-- [ ] aplus-dev-studio `specs/happy-server-horizontal-scale` 갱신.
+- [x] prod 카나리 재전환 — k8s-manifests#1480(2026-08-09). replicas 1→2,
+      PDB 복원, 두 replica 모두 `socketio_cluster_peers=1` 확인. baseline 은
+      aplus-dev-studio#1746 로 전환 **전** replicas=1 상태에서 채집 완료
+      (이전엔 baseline 없이 전환해 판정 불가였던 것을 고쳤다).
+- [ ] prod 에 대해 `smoke-cross-placement.mjs` 실행 — 아직 dev 만 돌렸다.
+      실제 사용자 토큰 + online daemon 필요.
+- [x] aplus-dev-studio `specs/happy-server-horizontal-scale` 갱신 —
+      #1742/#1743/#1746 로 완료.
 
 ### Phase 4 스모크 결과 (2026-08-09, dev `aplus-dev-studio-dev-shared`)
 
@@ -146,6 +151,27 @@ port-forward 했기 때문에 "우연히 같은 replica 로 라우팅됐다" 로
 **이 스모크가 다루지 않은 것**: `happy-server-horizontal-scale` AC1 본문에
 함께 적힌 **메시지 송수신과 세션 spawn RPC** 는 확인하지 않았다. 확인한
 것은 프리뷰 HTTP·프리뷰 WS·터미널 세 릴레이 경로다 (이 spec 의 범위).
+
+### 2026-08-09 (2차) — 메시지 송수신 / 세션 spawn RPC
+
+**메시지 송수신**: 별도 스모크가 필요 없다고 판단한다. 메시지는 RPC(단일
+소켓 지목)가 아니라 room 브로드캐스트(`eventRouter.emitUpdate` →
+`user:{u}:session:{s}` / `user:{u}:user-scoped`)로 전달되고, 이건 애초에
+V1 이 이미 증명한 Redis streams adapter 의 기본 기능이다 — "어느 replica 에
+붙어 있든" 이 애초에 room 멤버십의 문제일 뿐 "올바른 replica 를 찾아야
+하는" 문제가 아니다(RPC/릴레이 세 경로처럼 process-local Map 을 조회하는
+코드가 없다). `socketio_cluster_peers=1`(양쪽 dev/prod 확인됨)이 이 경로가
+살아있다는 증거다.
+
+**세션 spawn RPC**: `smoke-cross-placement.mjs` §6 신설 —
+`${machineId}:spawn-happy-session` 를 암호화 없이(빈 `params`) 호출한다.
+daemon 의 `RpcHandlerManager.handleRequest()` 는 핸들러 실행 전에
+decrypt(decodeBase64(params)) 를 하고 전체를 try/catch 로 감싸므로, decode
+실패는 암호화된 에러 블롭으로 안전하게 반환된다 — `spawnSession()` 에는
+닿지 않아 실제 세션이 만들어지지 않는다. 판정은 `rpc-call` 최상위 `ok` 만
+본다: `true` 는 daemon 도달, `false`+"not available" 은 라우팅 실패.
+**아직 실행하지 않았다** — 실제 사용자 토큰 + online daemon 이 필요해
+사용자가 돌려야 한다.
 
 ## 리스크
 
