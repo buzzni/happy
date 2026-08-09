@@ -1,8 +1,9 @@
 # 계획 (relay-cross-replica-routing)
 
-> 상태: **Phase 1·2·3 완료. dev 크로스 배치 스모크 통과, prod 재전환
-> 완료(둘 다 2026-08-09).** 남은 것: prod 에 스모크 실행, §6(세션 spawn
-> RPC) 실행 — 둘 다 실제 사용자 토큰이 필요해 아직 못 했다.
+> 상태: **Phase 1~4 완료 (2026-08-09).** dev·prod 양쪽에서 크로스 배치
+> 스모크 통과(실패 0건), prod replicas=2 재전환 완료. §6(세션 spawn RPC)
+> 까지 실행돼 `happy-server-horizontal-scale` AC1 의 마지막 미확인 항목이
+> 닫혔다. 남은 것은 그 spec 쪽 AC3(1주 관측)·AC2(클라이언트 재연결 실측).
 > D1=serverSideEmit, D2=Redis+로컬 캐시, D3=단계 분할 배포로 확정 (spec.md §7).
 
 ## Phase 1 — 프리뷰 HTTP 릴레이 (무상태, 저위험) — **완료 (2026-08-08)**
@@ -120,8 +121,9 @@
       PDB 복원, 두 replica 모두 `socketio_cluster_peers=1` 확인. baseline 은
       aplus-dev-studio#1746 로 전환 **전** replicas=1 상태에서 채집 완료
       (이전엔 baseline 없이 전환해 판정 불가였던 것을 고쳤다).
-- [ ] prod 에 대해 `smoke-cross-placement.mjs` 실행 — 아직 dev 만 돌렸다.
-      실제 사용자 토큰 + online daemon 필요.
+- [x] prod 에 대해 `smoke-cross-placement.mjs` 실행 — **통과 (2026-08-09),
+      실패 0건·건너뜀 0건.** §6(세션 spawn RPC) 포함 6개 섹션 전부. 아래
+      "prod 스모크 결과" 참조.
 - [x] aplus-dev-studio `specs/happy-server-horizontal-scale` 갱신 —
       #1742/#1743/#1746 로 완료.
 
@@ -170,8 +172,39 @@ decrypt(decodeBase64(params)) 를 하고 전체를 try/catch 로 감싸므로, d
 실패는 암호화된 에러 블롭으로 안전하게 반환된다 — `spawnSession()` 에는
 닿지 않아 실제 세션이 만들어지지 않는다. 판정은 `rpc-call` 최상위 `ok` 만
 본다: `true` 는 daemon 도달, `false`+"not available" 은 라우팅 실패.
-**아직 실행하지 않았다** — 실제 사용자 토큰 + online daemon 이 필요해
-사용자가 돌려야 한다.
+
+### prod 스모크 결과 (2026-08-09, `aplus-dev-studio-prod-shared`)
+
+k8s-manifests#1480 재전환 직후 실행. **실패 0건·건너뜀 0건 — 6개 섹션 전부
+통과.** replica 2개(`happy-server-6cb886c4b8-6tbv8`, `-nxq7w`), 머신 11개 중
+온라인 5개, 대상 `8d7d1dde-41d2-4e39-bcb8-b7e0e7153ae0`.
+
+| 섹션 | 결과 |
+|---|---|
+| 1. 클러스터 버스 | 두 replica 모두 `socketio_cluster_peers=1` |
+| 3. AC1 프리뷰 HTTP | 두 replica 모두 `502 CONNECTION_REFUSED`(데몬 도달) |
+| 4. AC3 터미널 | 두 replica 모두 `terminal-open` 성공 |
+| 5. AC2 프리뷰 WS | 두 replica 모두 `502 Bad Gateway`(데몬 도달) |
+| **6. AC1 세션 spawn RPC** | **두 replica 모두 daemon 도달** |
+
+§6 이 통과하면서 `happy-server-horizontal-scale` AC1 의 마지막 미확인
+항목이 닫혔다. dev(온라인 머신 1개)와 달리 prod 는 온라인 머신 5개·실사용
+트래픽이 있는 환경이라 신호가 더 강하다.
+
+**단, "최소 한 쪽은 replica 를 건넜다" 추론의 강도는 dev 보다 약하다.**
+스크립트가 찍은 `machine-scoped 소켓 총합: 33` 은 `websocket_connections_total`
+값인데, 이름과 달리 Counter 가 아니라 **Gauge**(`metrics2.ts` —
+"Number of active WebSocket connections") 다. 즉 온라인 머신 5개에 활성
+machine-scoped 소켓이 33개, 머신당 평균 6~7개다. 대상 머신이 두 replica
+**양쪽에** 소켓을 갖고 있었다면 각 replica 가 로컬 소켓만으로 응답했을
+수 있고, 그러면 "건넜다" 는 증명되지 않는다. 스크립트는 대상 머신의
+소켓이 어느 replica 에 있는지 확인하지 않는다(메트릭에 machineId 라벨이
+없어 분해 불가).
+→ 그래도 **검사가 타는 코드 경로는 동일**하다(`findMachineSockets` 는
+어느 경우든 `io.in(room).timeout().fetchSockets()` 클러스터 어댑터 경로를
+탄다). 그리고 "모든 replica 가 이 머신의 요청을 처리해낸다" 는 사용자
+관점의 명제 자체는 그대로 성립한다. 엄밀한 크로스 배치 증명은 소켓이
+1개뿐이었던 dev 실행(2026-08-09, 위)이 담당한다.
 
 ## 리스크
 
