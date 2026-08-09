@@ -1,6 +1,8 @@
 # 계획 (relay-cross-replica-routing)
 
-> 상태: **Phase 1 진행 중** (2026-08-08 승인).
+> 상태: **Phase 1·2·3 완료, Phase 4 dev 검증 통과 (2026-08-09).**
+> 남은 것은 prod 카나리 + baseline 재채집, 그리고 aplus-dev-studio
+> `specs/happy-server-horizontal-scale` 갱신뿐이다.
 > D1=serverSideEmit, D2=Redis+로컬 캐시, D3=단계 분할 배포로 확정 (spec.md §7).
 
 ## Phase 1 — 프리뷰 HTTP 릴레이 (무상태, 저위험) — **완료 (2026-08-08)**
@@ -111,12 +113,39 @@
 
 ## Phase 4 — 통합 검증 후 replicas=2 재전환
 
-- [ ] dev replicas=2 에서 **브라우저·데몬 강제 크로스 배치** 스모크
-      (AC1·AC2·AC3). `happy-server-horizontal-scale` 의 미해결 항목
-      "AC1 크로스 배치 확인" 을 여기서 닫는다.
+- [x] dev replicas=2 에서 **브라우저·데몬 강제 크로스 배치** 스모크
+      (AC1·AC2·AC3) — **통과 (2026-08-09).** `smoke-cross-placement.mjs`
+      실패 0건·건너뜀 0건. 아래 "Phase 4 스모크 결과" 참조.
 - [ ] prod 카나리 + baseline 재채집 (이전 baseline 은 Prometheus retention
       에서 소실).
 - [ ] aplus-dev-studio `specs/happy-server-horizontal-scale` 갱신.
+
+### Phase 4 스모크 결과 (2026-08-09, dev `aplus-dev-studio-dev-shared`)
+
+배포 이미지: `happy-server:5b16a45` (= 이 spec 의 Phase 1·2·3 전부 포함,
+`vendor/happy` 포인터 `42ba7259`). replica 2개
+(`happy-server-6d49494469-f5vq6`, `-tmdqw`), 온라인 머신 1개
+(`83049a09-161d-4b64-8e85-0303b5f17576`), machine-scoped 소켓 총 3개.
+
+- **클러스터 버스**: 두 replica 모두 `socketio_cluster_peers=1` — 서로를
+  본다. 이 값이 0 이면 `fetchSockets` 가 조용히 로컬 결과만 반환해 아래
+  검사가 전부 무의미해지므로, 선행 관문으로 확인했다.
+- **AC1 프리뷰 HTTP**: 두 replica 모두 `502 code=CONNECTION_REFUSED`
+  (= 데몬이 답한 에러). `{ error: "Machine offline" }` 이 아니라는 게 핵심 —
+  전자는 요청이 데몬까지 갔다 왔다는 증거고, 후자가 라우팅 실패다.
+- **AC3 터미널**: 두 replica 모두 `terminal-open` 성공 (세션 발급됨).
+- **AC2 프리뷰 WS**: 두 replica 모두 `502 Bad Gateway` (데몬 도달).
+  `502 Machine Offline` 이었으면 실패다.
+
+**왜 이게 크로스 배치의 증명인가**: 데몬은 정확히 한 replica 에만 붙어
+있는데 **모든** replica 가 그 머신의 요청을 처리해냈다. 따라서 최소 한
+쪽은 replica 를 건넜다. Service 를 거치지 않고 각 파드에 직접
+port-forward 했기 때문에 "우연히 같은 replica 로 라우팅됐다" 로 통과할
+길이 없다 — 구 `smoke-cross-replica.sh` 가 닫지 못했던 바로 그 구멍이다.
+
+**이 스모크가 다루지 않은 것**: `happy-server-horizontal-scale` AC1 본문에
+함께 적힌 **메시지 송수신과 세션 spawn RPC** 는 확인하지 않았다. 확인한
+것은 프리뷰 HTTP·프리뷰 WS·터미널 세 릴레이 경로다 (이 spec 의 범위).
 
 ## 리스크
 
