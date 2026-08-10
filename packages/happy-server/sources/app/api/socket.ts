@@ -19,6 +19,8 @@ import { terminalRelayHandler } from "./socket/terminalRelayHandler";
 import { setTerminalSessionBackend, type TerminalSessionBackend } from "./socket/terminalSessions";
 import { previewWsMachineHandler, registerPreviewWsClusterListeners } from "@/modules/preview/previewWebSocketRelay";
 import { db } from "@/storage/db";
+import { machineSocketIdentityExists } from "./socket/machineSocketAuth";
+import { automationSocketHandler } from "./socket/automationSocketHandler";
 import { markMachineOffline, markMachineOnline } from "@/app/presence/machinePresence";
 
 export function startSocket(app: Fastify) {
@@ -165,6 +167,13 @@ export function startSocket(app: Fastify) {
             return;
         }
 
+        if (clientType === 'machine-scoped'
+            && !await machineSocketIdentityExists(db, verified.userId, machineId!)) {
+            log({ module: 'websocket' }, `Machine-scoped identity does not match a registered machine`);
+            next(new Error('Invalid machine identity'));
+            return;
+        }
+
         socket.data.userId = verified.userId;
         socket.data.clientType = clientType;
         socket.data.sessionId = sessionId;
@@ -299,6 +308,7 @@ export function startSocket(app: Fastify) {
         accessKeyHandler(userId, socket);
         terminalRelayHandler(userId, socket);
         if (connection.connectionType === 'machine-scoped') {
+            automationSocketHandler(userId, connection.machineId, socket);
             // proxy-ws-* only ever fires on the replica the daemon is attached
             // to, so the dispatch has to be wired here rather than lazily at
             // tunnel-open time on whichever replica took the browser upgrade.

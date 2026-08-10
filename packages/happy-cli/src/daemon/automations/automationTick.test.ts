@@ -55,7 +55,7 @@ describe('runAutomationTick', () => {
   })
 
   it('wakes a due automation without a script and records the session', async () => {
-    store.replaceAll([makeDueAutomation()])
+    store.replaceAll([makeDueAutomation({ agent: 'codex' })])
     const input = makeInput()
 
     const outcomes = await runAutomationTick(input)
@@ -66,11 +66,22 @@ describe('runAutomationTick', () => {
       directory: '/repo/project-1',
       initialPrompt: '어제 로그를 점검해줘',
       createdByAccountId: null,
+      agent: 'codex',
     })
     const [saved] = store.list()
     expect(saved!.runHistory[0]).toEqual({ at: NOW, outcome: 'woke', sessionId: 'session-new' })
     // claim이 nextRunAt을 now 기준으로 전진시킨다.
     expect(saved!.nextRunAt).toBe(NOW + 30 * 60_000)
+  })
+
+  it('uses claude for a legacy automation with no agent field', async () => {
+    const { agent: _agent, ...legacy } = makeDueAutomation()
+    store.replaceAll([legacy])
+    const input = makeInput()
+
+    await runAutomationTick(input)
+
+    expect(input.spawnSession).toHaveBeenCalledWith(expect.objectContaining({ agent: 'claude' }))
   })
 
   it('runs the script in the automation directory with the standard timeout', async () => {

@@ -14,6 +14,8 @@ export type AutomationSchedule =
 
 export type AutomationRunOutcome = 'woke' | 'skipped-gate' | 'skipped-overlap' | 'silent' | 'error'
 
+export type AutomationAgent = 'claude' | 'codex' | 'gemini' | 'openclaw' | 'opencode'
+
 export interface AutomationRunRecord {
   at: number
   outcome: AutomationRunOutcome
@@ -34,6 +36,8 @@ export interface ScheduledAutomation {
   createdAt: number
   nextRunAt: number | null
   runHistory: AutomationRunRecord[]
+  /** 자동화가 깨울 세션의 agent. 이전 레코드의 부재는 claude로 해석한다. */
+  agent?: AutomationAgent | null
   /**
    * 등록한 계정 id. 한 머신 데몬에는 여러 계정이 붙을 수 있지만(cross-identity
    * machine socket) 자동화 세션은 항상 데몬 소유자 자격증명으로 spawn된다 —
@@ -81,6 +85,19 @@ function stringValue(value: unknown): string | null {
 
 function finiteNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function parseAutomationAgent(value: unknown): AutomationAgent | null {
+  switch (value) {
+    case 'claude':
+    case 'codex':
+    case 'gemini':
+    case 'openclaw':
+    case 'opencode':
+      return value
+    default:
+      return null
+  }
 }
 
 function parseSchedule(value: unknown): AutomationSchedule | null {
@@ -143,6 +160,7 @@ export function parseScheduledAutomation(value: unknown): ScheduledAutomation | 
     createdAt: finiteNumber(row.createdAt) ?? 0,
     nextRunAt: finiteNumber(row.nextRunAt),
     runHistory: parseRunHistory(row.runHistory),
+    agent: parseAutomationAgent(row.agent),
     createdByAccountId: stringValue(row.createdByAccountId),
   }
 }

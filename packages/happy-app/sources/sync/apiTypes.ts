@@ -138,6 +138,16 @@ export const ApiKvBatchUpdateSchema = z.object({
     }))
 });
 
+export const ApiAutomationUpdatedSchema = z.object({
+    t: z.literal('automation-updated'),
+    projectId: z.string().nullable(),
+    automationId: z.string().optional(),
+    runId: z.string().optional(),
+    revision: z.number().int().positive().optional(),
+    generation: z.number().int().positive().optional(),
+    reason: z.enum(['viewer-key', 'machine-key', 'upsert', 'delete', 'sync', 'run']),
+});
+
 // Use a plain union here to avoid runtime discriminator extraction issues
 // when some schemas come from shared package exports.
 export const ApiUpdateSchema = z.union([
@@ -154,7 +164,8 @@ export const ApiUpdateSchema = z.union([
     ApiDeleteArtifactSchema,
     ApiRelationshipUpdatedSchema,
     ApiNewFeedPostSchema,
-    ApiKvBatchUpdateSchema
+    ApiKvBatchUpdateSchema,
+    ApiAutomationUpdatedSchema,
 ]);
 
 export type ApiUpdateNewMessage = z.infer<typeof ApiUpdateNewMessageSchema>;

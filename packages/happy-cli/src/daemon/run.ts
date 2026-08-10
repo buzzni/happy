@@ -73,6 +73,16 @@ import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
 import { createAutomationTickRunner } from './automations/automationTickRunner';
 import { runAutomationScript } from './automations/runAutomationScript';
+import {
+  loadOrCreateMachineAutomationKey,
+  updateMachineAutomationKeyRegistration,
+} from './automations/machineAutomationKey';
+import {
+  createServerAutomationCache,
+  decryptServerAutomationPayload,
+} from './automations/serverAutomationCache';
+import { createServerAutomationRuntimeStore } from './automations/serverAutomationRuntimeStore';
+import { runServerAutomationTick } from './automations/serverAutomationExecutor';
 import { resolveAllowedRoot } from '@/modules/common/resolveAllowedRoot';
 import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
@@ -235,6 +245,7 @@ export async function startDaemon(): Promise<void> {
     // Ensure auth and machine registration BEFORE anything else
     const { credentials, machineId } = await authAndSetupMachineIfNeeded();
     logger.debug('[DAEMON RUN] Auth and machine setup complete');
+    let machineAutomationKey = loadOrCreateMachineAutomationKey(configuration.automationKeyFile);
     const mcpCallerGrantKeyPair = tweetnacl.box.keyPair();
     const mcpCallerGrantConsumer = new McpCallerGrantEnvelopeConsumer({
       machineId,
@@ -1256,6 +1267,12 @@ export async function startDaemon(): Promise<void> {
     // 동안 지나간 예정 시각의 소급 실행을 막는다(R8) — replaceAll로 즉시 반영.
     // 실행 틱은 아래 하트비트 루프에 얹힌다(별도 타이머 없음).
     const automationStore = createAutomationStore({ filePath: configuration.automationsFile });
+    const serverAutomationCache = createServerAutomationCache({
+      filePath: configuration.serverAutomationsCacheFile,
+    });
+    const serverAutomationRuntimeStore = createServerAutomationRuntimeStore({
+      filePath: configuration.serverAutomationsRuntimeFile,
+    });
     const storedAutomations = automationStore.list();
     const rebasedAutomations = rebaseAutomationsOnLaunch(storedAutomations, Date.now());
     // 참조가 그대로면 rebase 대상이 없었다는 뜻 — 쓰지 않는다. 자동화를 쓰지 않는
@@ -1276,12 +1293,12 @@ export async function startDaemon(): Promise<void> {
       return false;
     };
     const spawnAutomationSession = async (
-      input: { directory: string; initialPrompt: string; createdByAccountId: string | null },
+      input: { directory: string; initialPrompt: string; createdByAccountId: string | null; agent: 'claude' | 'codex' | 'gemini' | 'openclaw' | 'opencode' },
     ): Promise<{ ok: true; sessionId: string } | { ok: false; error: string }> => {
       const result = await spawnSession({
         machineId,
         directory: input.directory,
-        agent: 'claude',
+        agent: input.agent,
         initialPrompt: input.initialPrompt,
         // 세션 자체는 데몬 소유자 자격증명으로 등록된다(자동화에 사용자 토큰을
         // 저장하지 않는다 — credentials-at-rest 금지). 귀속 표시만 넘긴다.
@@ -1407,6 +1424,29 @@ export async function startDaemon(): Promise<void> {
 
     // Create realtime machine session
     const apiMachine = api.machineSyncClient(machine);
+    apiMachine.setAutomationKey(machineAutomationKey, (keyVersion) => {
+      machineAutomationKey = updateMachineAutomationKeyRegistration(
+        configuration.automationKeyFile,
+        machineAutomationKey,
+        keyVersion,
+      );
+    });
+    apiMachine.setServerAutomationCache(serverAutomationCache);
+    const serverAutomationTickRunner = createAutomationTickRunner({
+      runTick: () => runServerAutomationTick({
+        cache: serverAutomationCache,
+        runtimeStore: serverAutomationRuntimeStore,
+        machineSecretKey: machineAutomationKey.secretKey,
+        now: Date.now(),
+        transport: apiMachine.serverAutomationTransport(),
+        decryptPayload: decryptServerAutomationPayload,
+        runScript: (input) => runAutomationScript({ ...input, allowedRoot: automationAllowedRoot }),
+        spawnSession: spawnAutomationSession,
+        isSessionRunning: isAutomationSessionRunning,
+        logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
+      }),
+      logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
+    });
 
     // Set RPC handlers
     apiMachine.setRPCHandlers({
@@ -1518,6 +1558,7 @@ export async function startDaemon(): Promise<void> {
       // 스킵시키지 않게 하기 위함이다. 중복 기동은 러너의 자체 가드가 막고,
       // 스킵된 due는 claim이 실행 직전에만 반영되므로 다음 tick이 집어간다.
       automationTickRunner.trigger();
+      serverAutomationTickRunner.trigger();
 
       // Check if daemon needs update by detecting whether `dist/index.mjs` was
       // replaced on disk since the daemon started (npm install rewrites the file).

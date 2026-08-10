@@ -32,6 +32,7 @@ import { previewRoutes } from "./routes/previewRoutes";
 import { previewWebSocketRelay } from "@/modules/preview/previewWebSocketRelay";
 import { parsePreviewHost } from "@/modules/preview/parsePreviewHost";
 import { attachmentRoutes } from "./routes/attachmentRoutes";
+import { automationRoutes } from "./routes/automationRoutes";
 import { isLocalStorage, getLocalFilesDir } from "@/storage/files";
 import * as path from "path";
 import * as fs from "fs";
@@ -153,6 +154,7 @@ export async function startApi(opts: StartApiOptions = {}) {
     mergeRequestRoutes(typed);
     previewRoutes(typed);
     attachmentRoutes(typed);
+    automationRoutes(typed);
 
     // Static webapp (self-host mode)
     if (opts.staticDir) {
