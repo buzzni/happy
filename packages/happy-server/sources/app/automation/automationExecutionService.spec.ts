@@ -175,6 +175,17 @@ describe('automationExecutionService', () => {
         expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
     });
 
+    it.each(['WOKE', 'SILENT'] as const)('rejects a %s report without a session link', async (outcome) => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+
+        await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
+            outcome, sessionId: null, detailCiphertext: null,
+        }, now)).resolves.toEqual({ ok: false, error: 'report-conflict' });
+        expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
+    });
+
     it('maps a cross-run report id uniqueness conflict to report-conflict', async () => {
         const tx = makeTx();
         tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
@@ -195,10 +206,11 @@ describe('automationExecutionService', () => {
             id: 'run-1', status: 'RUNNING', reportId: null,
             runLeaseExpiresAt: new Date(now.getTime() - 1),
         });
+        tx.session.findFirst.mockResolvedValue({ id: 'session-1' } as never);
 
         await reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
-            outcome: 'WOKE', sessionId: null, detailCiphertext: null,
+            outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,
         }, now);
         expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
             data: expect.objectContaining({ lateReport: true }),

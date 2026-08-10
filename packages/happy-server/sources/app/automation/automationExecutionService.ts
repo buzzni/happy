@@ -284,6 +284,9 @@ export async function reportAutomationRun(
     if ((input.status === 'FAILED') !== (input.outcome === 'ERROR')) {
         return { ok: false, error: 'report-conflict' };
     }
+    if ((input.outcome === 'WOKE' || input.outcome === 'SILENT') && !input.sessionId) {
+        return { ok: false, error: 'report-conflict' };
+    }
     if (input.sessionId) {
         const session = await tx.session.findFirst({
             where: { id: input.sessionId, accountId },

@@ -120,6 +120,21 @@ export function pushRoutes(app: Fastify) {
             return reply.code(404).send({ error: 'Session not found' });
         }
 
+        if (kind === 'done') {
+            const silentAutomationRun = await db.automationRun.findFirst({
+                where: {
+                    sessionId,
+                    machineAccountId: userId,
+                    status: 'COMPLETED',
+                    outcome: 'SILENT'
+                },
+                select: { id: true }
+            });
+            if (silentAutomationRun) {
+                return reply.send({ success: true });
+            }
+        }
+
         // Fan out the event to user's connected clients (web tabs use this to
         // bump tab-title unread counter for "user attention needed" moments only,
         // instead of pinging on every encrypted message).
