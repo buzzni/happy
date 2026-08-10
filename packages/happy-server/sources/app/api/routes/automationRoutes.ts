@@ -2,12 +2,16 @@ import type { Automation, AutomationRun } from '@prisma/client';
 import type { FastifyReply } from 'fastify';
 import { z } from 'zod';
 import {
+    automationActivateAdoptionRequestSchema as activateAdoptionSchema,
+    automationAdoptRequestSchema as adoptSchema,
     automationCreateRequestSchema as createSchema,
     automationDeleteRequestSchema as deleteSchema,
     automationUpdateRequestSchema as updateSchema,
     automationViewerKeyRequestSchema as viewerKeySchema,
 } from '@slopus/happy-wire';
 import {
+    activateAutomationAdoption,
+    adoptAutomation,
     createAutomation,
     deleteAutomation,
     getAutomationTarget,
@@ -171,6 +175,56 @@ export function automationRoutes(app: Fastify) {
             viewerKeyEnvelope: decode(request.body.viewerKeyEnvelope),
             machineKeyEnvelope: decode(request.body.machineKeyEnvelope),
         }));
+        if (!result.ok) return sendError(reply, result);
+        await emitAutomationUpdate(request.userId, {
+            projectId: request.params.projectId,
+            automationId: result.value.id,
+            revision: result.value.revision,
+            generation: result.value.generation,
+            reason: 'upsert',
+        });
+        return reply.send({ automation: serializeAutomation(result.value) });
+    });
+
+    app.post('/v1/projects/:projectId/automation-adoptions', {
+        preHandler: app.authenticate,
+        schema: { params: paramsSchema, body: adoptSchema },
+    }, async (request, reply) => {
+        if (rejectWhenDisabled(request.userId, reply)) return;
+        const body = request.body;
+        const result = await inTx((tx) => adoptAutomation(tx, request.userId, request.params.projectId, {
+            ...body,
+            payloadCiphertext: decode(body.payloadCiphertext),
+            viewerKeyEnvelope: decode(body.viewerKeyEnvelope),
+            machineKeyEnvelope: decode(body.machineKeyEnvelope),
+        }));
+        if (!result.ok) return sendError(reply, result);
+        await emitAutomationUpdate(request.userId, {
+            projectId: request.params.projectId,
+            automationId: result.value.id,
+            revision: result.value.revision,
+            generation: result.value.generation,
+            reason: 'upsert',
+        });
+        return reply.send({
+            automation: serializeAutomation(result.value),
+            migrationPending: result.value.legacyMigrationPending,
+            desiredPaused: result.value.legacyDesiredPaused,
+        });
+    });
+
+    app.post('/v1/projects/:projectId/automation-adoptions/:automationId/activate', {
+        preHandler: app.authenticate,
+        schema: { params: automationParamsSchema, body: activateAdoptionSchema },
+    }, async (request, reply) => {
+        if (rejectWhenDisabled(request.userId, reply)) return;
+        const result = await inTx((tx) => activateAutomationAdoption(
+            tx,
+            request.userId,
+            request.params.projectId,
+            request.params.automationId,
+            request.body.expectedRevision,
+        ));
         if (!result.ok) return sendError(reply, result);
         await emitAutomationUpdate(request.userId, {
             projectId: request.params.projectId,

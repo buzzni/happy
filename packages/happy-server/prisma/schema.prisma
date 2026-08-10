@@ -500,6 +500,8 @@ model Automation {
     appliedAt          DateTime?
     legacyMachineId    String?
     legacyAutomationId String?
+    legacyMigrationPending Boolean   @default(false)
+    legacyDesiredPaused     Boolean?
     createdAt          DateTime  @default(now())
     updatedAt          DateTime  @updatedAt
     runs               AutomationRun[]

@@ -15,6 +15,7 @@ function automation(patch: Record<string, unknown> = {}) {
     return {
         id: 'automation-1', projectId: 'project-1', machineAccountId: 'account-1', machineId: 'machine-1',
         revision: 2, generation: 3, paused: false, deletedAt: null, enabledAt: new Date(0),
+        legacyMigrationPending: false,
         payloadVersion: 1, payloadCiphertext: new Uint8Array([1]), machineKeyVersion: 4,
         machineKeyEnvelope: new Uint8Array([2]), viewerKeyVersion: 5,
         project: { automationViewerKeyVersion: 5 },
@@ -85,6 +86,7 @@ describe('automationExecutionService', () => {
             changes: [expect.objectContaining({ kind: 'UPSERT', payloadCiphertext: new Uint8Array([1]) })],
         }) });
         expect((result as any).value.changes[0].viewerKeyEnvelope).toBeUndefined();
+        expect((result as any).value.changes[0].migrationPending).toBe(false);
     });
 
     it('claims only the current generation inside the due window and stores only a token hash', async () => {
@@ -100,6 +102,16 @@ describe('automationExecutionService', () => {
         await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
             automationId: 'automation-1', generation: 2, scheduledFor: now,
         }, now)).resolves.toEqual({ ok: false, error: 'claim-denied' });
+    });
+
+    it('denies claims while legacy ownership is still staged', async () => {
+        const tx = makeTx();
+        tx.automation.findFirst.mockResolvedValue(automation({ legacyMigrationPending: true }));
+
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
+            automationId: 'automation-1', generation: 3, scheduledFor: now,
+        }, now)).resolves.toEqual({ ok: false, error: 'claim-denied' });
+        expect(tx.automationRun.create).not.toHaveBeenCalled();
     });
 
     it('maps the database uniqueness fence to an already-claimed result', async () => {

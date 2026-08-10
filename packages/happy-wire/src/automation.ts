@@ -124,6 +124,19 @@ export type AutomationEncryptedFields = z.infer<typeof automationEncryptedFields
 export const automationCreateRequestSchema = automationEncryptedFieldsSchema.extend({ paused: z.boolean().default(false) });
 export type AutomationCreateRequest = z.input<typeof automationCreateRequestSchema>;
 
+export const automationAdoptRequestSchema = automationEncryptedFieldsSchema.extend({
+  legacyMachineId: z.string().trim().min(1).max(200),
+  legacyAutomationId: z.string().trim().min(1).max(200),
+  ownershipConfirmed: z.literal(true),
+  desiredPaused: z.boolean(),
+});
+export type AutomationAdoptRequest = z.input<typeof automationAdoptRequestSchema>;
+export interface AutomationAdoption {
+  automation: AutomationPublic;
+  migrationPending: boolean;
+  desiredPaused: boolean;
+}
+
 export const automationUpdateRequestSchema = z.object({
   expectedRevision: positiveInteger,
   paused: z.boolean().optional(),
@@ -150,6 +163,7 @@ export const automationUpdateRequestSchema = z.object({
 export type AutomationUpdateRequest = z.infer<typeof automationUpdateRequestSchema>;
 
 export const automationDeleteRequestSchema = z.object({ expectedRevision: positiveInteger });
+export const automationActivateAdoptionRequestSchema = z.object({ expectedRevision: positiveInteger });
 export const automationViewerKeyRequestSchema = z.object({
   expectedKeyVersion: z.number().int().min(0),
   publicKey: publicKeySchema,
@@ -255,6 +269,8 @@ export interface AutomationApiClient {
   setViewerKey(projectId: string, input: z.infer<typeof automationViewerKeyRequestSchema>): Promise<{ keyVersion: number }>;
   listAutomations(projectId: string): Promise<AutomationPublic[]>;
   createAutomation(projectId: string, input: AutomationCreateRequest): Promise<AutomationPublic>;
+  adoptAutomation(projectId: string, input: AutomationAdoptRequest): Promise<AutomationAdoption>;
+  activateAutomationAdoption(projectId: string, automationId: string, expectedRevision: number): Promise<AutomationPublic>;
   updateAutomation(projectId: string, automationId: string, input: AutomationUpdateRequest): Promise<AutomationPublic>;
   deleteAutomation(projectId: string, automationId: string, expectedRevision: number): Promise<AutomationPublic>;
   listRuns(projectId: string, input?: { automationId?: string; limit?: number }): Promise<AutomationRun[]>;
@@ -319,6 +335,27 @@ export function createAutomationApiClient(options: {
         z.object({ automation: automationPublicSchema }),
         'POST',
         automationCreateRequestSchema.parse(input),
+      );
+      return value.automation;
+    },
+    async adoptAutomation(projectId, input) {
+      return request(
+        `/v1/projects/${pathId(projectId)}/automation-adoptions`,
+        z.object({
+          automation: automationPublicSchema,
+          migrationPending: z.boolean(),
+          desiredPaused: z.boolean(),
+        }),
+        'POST',
+        automationAdoptRequestSchema.parse(input),
+      );
+    },
+    async activateAutomationAdoption(projectId, automationId, expectedRevision) {
+      const value = await request(
+        `/v1/projects/${pathId(projectId)}/automation-adoptions/${pathId(automationId)}/activate`,
+        z.object({ automation: automationPublicSchema }),
+        'POST',
+        automationActivateAdoptionRequestSchema.parse({ expectedRevision }),
       );
       return value.automation;
     },

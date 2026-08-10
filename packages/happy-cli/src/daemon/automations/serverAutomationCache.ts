@@ -16,6 +16,7 @@ export interface EncryptedServerAutomation {
   machineKeyVersion: number
   machineKeyEnvelope: string
   paused: boolean
+  migrationPending?: boolean
   enabledAt: number
 }
 
@@ -86,6 +87,7 @@ function parseUpsert(row: Record<string, unknown>): EncryptedServerAutomation {
     machineKeyVersion: positiveInteger(row.machineKeyVersion),
     machineKeyEnvelope,
     paused: row.paused,
+    migrationPending: row.migrationPending === true,
     enabledAt: timestamp(row.enabledAt),
   }
 }

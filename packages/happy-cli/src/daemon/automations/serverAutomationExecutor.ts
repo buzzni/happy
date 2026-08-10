@@ -154,7 +154,7 @@ export async function runServerAutomationTick(
 
   const outcomes: Array<{ automationId: string; outcome: ServerAutomationReportOutcome }> = []
   for (const automation of cache.automations) {
-    if (automation.paused) continue
+    if (automation.paused || automation.migrationPending === true) continue
     const schedule = input.runtimeStore.read().schedules.find((item) => item.automationId === automation.automationId)
     if (!schedule || schedule.generation !== automation.generation || schedule.nextRunAt > now) continue
     const payload = payloads.get(automation.automationId)!

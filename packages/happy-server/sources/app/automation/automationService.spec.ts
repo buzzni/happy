@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+    activateAutomationAdoption,
+    adoptAutomation,
     createAutomation,
     deleteAutomation,
     getAutomationTarget,
@@ -35,6 +37,8 @@ function automationRecord(patch: Record<string, unknown> = {}) {
         appliedAt: null,
         legacyMachineId: null,
         legacyAutomationId: null,
+        legacyMigrationPending: false,
+        legacyDesiredPaused: null,
         createdAt: new Date(0),
         updatedAt: new Date(0),
         ...patch,
@@ -85,6 +89,7 @@ function makeTx(options: {
                 current && (!where.projectId || current.projectId === where.projectId) ? current : null
             )),
             create: vi.fn(async () => created),
+            createMany: vi.fn(async () => ({ count: 1 })),
             updateMany: vi.fn(async () => ({ count: 1 })),
             findUnique: vi.fn()
                 .mockResolvedValueOnce(updated)
@@ -152,6 +157,83 @@ describe('automationService', () => {
             automationId: 'automation-1',
             kind: 'UPSERT',
         }) });
+    });
+
+    it('stages one idempotent legacy adoption under the target machine owner', async () => {
+        const { tx } = makeTx({ actorId: 'owner-1' });
+        const staged = automationRecord({
+            ownerAccountId: 'owner-1', paused: true, legacyMachineId: 'machine-1',
+            legacyAutomationId: 'legacy-1', legacyMigrationPending: true, legacyDesiredPaused: false,
+            appliedRevision: 1,
+        });
+        tx.automation.createMany = vi.fn()
+            .mockResolvedValueOnce({ count: 1 })
+            .mockResolvedValueOnce({ count: 0 });
+        tx.automation.findUnique = vi.fn(async () => staged);
+        const input = {
+            ...createInput,
+            legacyMachineId: 'machine-1', legacyAutomationId: 'legacy-1',
+            ownershipConfirmed: true as const, desiredPaused: false,
+        };
+
+        await expect(adoptAutomation(tx as never, 'owner-1', 'project-1', input))
+            .resolves.toEqual({ ok: true, value: staged });
+        await expect(adoptAutomation(tx as never, 'owner-1', 'project-1', input))
+            .resolves.toEqual({ ok: true, value: staged });
+        expect(tx.automation.createMany).toHaveBeenNthCalledWith(1, {
+            data: [expect.objectContaining({
+                ownerAccountId: 'owner-1', machineId: 'machine-1', paused: true,
+                legacyMachineId: 'machine-1', legacyAutomationId: 'legacy-1',
+                legacyMigrationPending: true, legacyDesiredPaused: false,
+            })],
+            skipDuplicates: true,
+        });
+        expect(tx.automationChange.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects adoption by a member who does not own the target machine', async () => {
+        const { tx } = makeTx();
+        await expect(adoptAutomation(tx as never, 'editor-1', 'project-1', {
+            ...createInput,
+            legacyMachineId: 'machine-1', legacyAutomationId: 'legacy-1',
+            ownershipConfirmed: true, desiredPaused: false,
+        })).resolves.toEqual({ ok: false, error: 'forbidden' });
+        expect(tx.automation.create).not.toHaveBeenCalled();
+    });
+
+    it('activates a staged adoption with the persisted desired pause state', async () => {
+        const staged = automationRecord({
+            ownerAccountId: 'owner-1', paused: true, legacyMachineId: 'machine-1',
+            legacyAutomationId: 'legacy-1', legacyMigrationPending: true, legacyDesiredPaused: false,
+            appliedRevision: 1,
+        });
+        const active = automationRecord({ ...staged, revision: 2, generation: 2, paused: false, legacyMigrationPending: false });
+        const { tx } = makeTx({ actorId: 'owner-1', automation: staged });
+        tx.automation.findUnique = vi.fn(async () => active);
+
+        await expect(activateAutomationAdoption(tx as never, 'owner-1', 'project-1', 'automation-1', 1))
+            .resolves.toEqual({ ok: true, value: active });
+        expect(tx.automation.updateMany).toHaveBeenCalledWith({
+            where: { id: 'automation-1', projectId: 'project-1', revision: 1, legacyMigrationPending: true, deletedAt: null },
+            data: expect.objectContaining({
+                revision: { increment: 1 }, generation: { increment: 1 },
+                paused: false, legacyMigrationPending: false,
+            }),
+        });
+        expect(tx.automationChange.create).toHaveBeenCalledWith({ data: expect.objectContaining({ kind: 'UPSERT' }) });
+    });
+
+    it('does not activate before the daemon acknowledges the staged revision', async () => {
+        const staged = automationRecord({
+            ownerAccountId: 'owner-1', paused: true, legacyMachineId: 'machine-1',
+            legacyAutomationId: 'legacy-1', legacyMigrationPending: true, legacyDesiredPaused: false,
+            appliedRevision: 0,
+        });
+        const { tx } = makeTx({ actorId: 'owner-1', automation: staged });
+
+        await expect(activateAutomationAdoption(tx as never, 'owner-1', 'project-1', 'automation-1', 1))
+            .resolves.toEqual({ ok: false, error: 'migration-not-applied' });
+        expect(tx.automation.updateMany).not.toHaveBeenCalled();
     });
 
     it('rejects a project configured with another account\'s machine id', async () => {

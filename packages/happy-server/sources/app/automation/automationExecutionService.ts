@@ -85,6 +85,7 @@ export async function syncAutomations(
             machineKeyVersion: automation.machineKeyVersion,
             machineKeyEnvelope: automation.machineKeyEnvelope,
             paused: automation.paused,
+            migrationPending: automation.legacyMigrationPending,
             enabledAt: automation.enabledAt,
         });
     }
@@ -128,6 +129,7 @@ function executable(automation: any, accountId: string, machineId: string, gener
         && automation.machineId === machineId
         && automation.generation === generation
         && !automation.paused
+        && !automation.legacyMigrationPending
         && !automation.deletedAt
         && automation.machineKeyVersion === automation.targetMachine?.automationKeyVersion
         && automation.viewerKeyVersion === automation.project?.automationViewerKeyVersion;

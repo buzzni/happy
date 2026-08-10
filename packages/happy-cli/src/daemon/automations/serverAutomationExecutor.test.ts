@@ -3,11 +3,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { runServerAutomationTick } from './serverAutomationExecutor'
 import type { ServerAutomationRuntimeState } from './serverAutomationRuntimeStore'
 
-function cacheRecord(generation = 2) {
+function cacheRecord(generation = 2, migrationPending = false) {
   return {
     automationId: 'automation-1', revision: 2, generation, payloadVersion: 1 as const,
     payloadCiphertext: 'encrypted-payload', machineKeyVersion: 1,
-    machineKeyEnvelope: 'encrypted-envelope', paused: false, enabledAt: 1,
+    machineKeyEnvelope: 'encrypted-envelope', paused: false, migrationPending, enabledAt: 1,
   }
 }
 
@@ -20,7 +20,7 @@ function runtime(initial: ServerAutomationRuntimeState) {
   }
 }
 
-function setup(options: { generation?: number; claim?: { ok: boolean; value?: any; error?: string } } = {}) {
+function setup(options: { generation?: number; migrationPending?: boolean; claim?: { ok: boolean; value?: any; error?: string } } = {}) {
   const now = 1_000_000
   const store = runtime({
     schedules: [{ automationId: 'automation-1', generation: 2, nextRunAt: now, lastSessionId: null }],
@@ -37,7 +37,7 @@ function setup(options: { generation?: number; claim?: { ok: boolean; value?: an
   const input = {
     cache: { read: () => ({
       cursor: 1n, serverTime: now, syncedAt: now, pendingAcknowledgements: [],
-      automations: [cacheRecord(options.generation)],
+      automations: [cacheRecord(options.generation, options.migrationPending)],
     }) },
     runtimeStore: store,
     machineSecretKey: new Uint8Array(32),
@@ -66,6 +66,15 @@ describe('runServerAutomationTick', () => {
     expect(runScript).not.toHaveBeenCalled()
     expect(spawnSession).not.toHaveBeenCalled()
     expect(store.state().schedules[0]!.nextRunAt).toBe(now)
+  })
+
+  it('does not claim while legacy scheduler ownership is still staged', async () => {
+    const { input, transport, runScript, spawnSession } = setup({ migrationPending: true })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(runScript).not.toHaveBeenCalled()
+    expect(spawnSession).not.toHaveBeenCalled()
   })
 
   it('runs only after claim and start, then durably retries the same completion report', async () => {

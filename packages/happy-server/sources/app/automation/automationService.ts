@@ -9,6 +9,10 @@ export type AutomationServiceError =
     | 'viewer-key-unavailable'
     | 'viewer-key-version-conflict'
     | 'machine-key-version-conflict'
+    | 'legacy-adoption-conflict'
+    | 'legacy-target-mismatch'
+    | 'migration-pending'
+    | 'migration-not-applied'
     | 'invalid-payload-update'
     | 'revision-conflict';
 
@@ -30,6 +34,13 @@ interface AutomationPayloadInput {
 
 export interface AutomationCreateInput extends AutomationPayloadInput {
     paused: boolean;
+}
+
+export interface AutomationAdoptInput extends AutomationPayloadInput {
+    legacyMachineId: string;
+    legacyAutomationId: string;
+    ownershipConfirmed: true;
+    desiredPaused: boolean;
 }
 
 export interface AutomationUpdateInput {
@@ -254,6 +265,102 @@ export async function createAutomation(
     return { ok: true, value: row };
 }
 
+export async function adoptAutomation(
+    tx: Tx,
+    actorId: string,
+    projectId: string,
+    input: AutomationAdoptInput,
+): Promise<AutomationServiceResult<Automation>> {
+    const access = await projectAccess(tx, actorId, projectId);
+    if (!access) return { ok: false, error: 'not-found' };
+    if (!access.canEdit || access.project.accountId !== actorId) return { ok: false, error: 'forbidden' };
+    const target = await targetForProject(tx, access.project);
+    if (!target) return { ok: false, error: 'automation-target-unavailable' };
+    if (input.legacyMachineId !== target.machineId) return { ok: false, error: 'legacy-target-mismatch' };
+    const keyError = validateKeyVersions(access.project, target, input);
+    if (keyError) return { ok: false, error: keyError };
+
+    const data: Prisma.AutomationCreateManyInput = {
+        projectId,
+        ownerAccountId: actorId,
+        machineAccountId: target.machineAccountId,
+        machineId: target.machineId,
+        payloadVersion: input.payloadVersion,
+        payloadCiphertext: input.payloadCiphertext,
+        viewerKeyId: input.viewerKeyId,
+        viewerKeyVersion: input.viewerKeyVersion,
+        viewerKeyEnvelope: input.viewerKeyEnvelope,
+        machineKeyVersion: input.machineKeyVersion,
+        machineKeyEnvelope: input.machineKeyEnvelope,
+        paused: true,
+        legacyMachineId: input.legacyMachineId,
+        legacyAutomationId: input.legacyAutomationId,
+        legacyMigrationPending: true,
+        legacyDesiredPaused: input.desiredPaused,
+    };
+    const created = await tx.automation.createMany({ data: [data], skipDuplicates: true });
+    const row = await tx.automation.findUnique({
+        where: {
+            legacyMachineId_legacyAutomationId: {
+                legacyMachineId: input.legacyMachineId,
+                legacyAutomationId: input.legacyAutomationId,
+            },
+        },
+    });
+    if (!row || row.projectId !== projectId || row.ownerAccountId !== actorId
+        || row.machineAccountId !== target.machineAccountId || row.machineId !== target.machineId
+        || row.deletedAt !== null || row.legacyDesiredPaused !== input.desiredPaused) {
+        return { ok: false, error: 'legacy-adoption-conflict' };
+    }
+    if (created.count === 1) await appendChange(tx, row, target, 'UPSERT');
+    return { ok: true, value: row };
+}
+
+export async function activateAutomationAdoption(
+    tx: Tx,
+    actorId: string,
+    projectId: string,
+    automationId: string,
+    expectedRevision: number,
+    now: Date = new Date(),
+): Promise<AutomationServiceResult<Automation>> {
+    const access = await projectAccess(tx, actorId, projectId);
+    if (!access) return { ok: false, error: 'not-found' };
+    if (!access.canEdit || access.project.accountId !== actorId) return { ok: false, error: 'forbidden' };
+    const current = await tx.automation.findFirst({ where: { id: automationId, projectId, deletedAt: null } });
+    if (!current || current.ownerAccountId !== actorId || !current.legacyMachineId) {
+        return { ok: false, error: 'not-found' };
+    }
+    if (!current.legacyMigrationPending) return { ok: true, value: current };
+    if (current.legacyDesiredPaused === null) return { ok: false, error: 'legacy-adoption-conflict' };
+    if (current.appliedRevision < current.revision) return { ok: false, error: 'migration-not-applied' };
+    const changed = await tx.automation.updateMany({
+        where: { id: automationId, projectId, revision: expectedRevision, legacyMigrationPending: true, deletedAt: null },
+        data: {
+            revision: { increment: 1 },
+            generation: { increment: 1 },
+            paused: current.legacyDesiredPaused,
+            enabledAt: now,
+            legacyMigrationPending: false,
+        },
+    });
+    if (changed.count === 0) {
+        const latest = await tx.automation.findFirst({ where: { id: automationId, projectId, deletedAt: null } });
+        return latest && !latest.legacyMigrationPending
+            ? { ok: true, value: latest }
+            : latest
+                ? { ok: false, error: 'revision-conflict', latest }
+                : { ok: false, error: 'not-found' };
+    }
+    const updated = await tx.automation.findUnique({ where: { id: automationId } });
+    if (!updated?.machineAccountId || !updated.machineId) return { ok: false, error: 'not-found' };
+    await appendChange(tx, updated, {
+        machineAccountId: updated.machineAccountId,
+        machineId: updated.machineId,
+    }, 'UPSERT');
+    return { ok: true, value: updated };
+}
+
 function hasPayloadUpdate(input: AutomationUpdateInput): boolean {
     return input.payloadVersion !== undefined
         || input.payloadCiphertext !== undefined
@@ -286,6 +393,7 @@ export async function updateAutomation(
     if (!access.canEdit) return { ok: false, error: 'forbidden' };
     const current = await tx.automation.findFirst({ where: { id: automationId, projectId, deletedAt: null } });
     if (!current) return { ok: false, error: 'not-found' };
+    if (current.legacyMigrationPending) return { ok: false, error: 'migration-pending' };
 
     const payloadUpdate = hasPayloadUpdate(input);
     if (!payloadUpdate && input.paused === undefined) {

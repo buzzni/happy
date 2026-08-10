@@ -72,6 +72,8 @@ describe('server automation repository', () => {
                 stored = row({ projectId, ...input, viewerKeyVersion: 1 });
                 return stored;
             }),
+            adoptAutomation: vi.fn(),
+            activateAutomationAdoption: vi.fn(),
             updateAutomation: vi.fn(async (_projectId, _automationId, input) => {
                 stored = row({ ...stored!, ...input, revision: 2, generation: 2 });
                 return stored;

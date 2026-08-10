@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Fastify } from '../types';
 
 const mocks = vi.hoisted(() => ({
+    activateAutomationAdoption: vi.fn(),
+    adoptAutomation: vi.fn(),
     createAutomation: vi.fn(),
     deleteAutomation: vi.fn(),
     getAutomationTarget: vi.fn(),
@@ -43,6 +45,8 @@ function record() {
         appliedAt: null,
         legacyMachineId: null,
         legacyAutomationId: null,
+        legacyMigrationPending: false,
+        legacyDesiredPaused: null,
         createdAt: new Date(20),
         updatedAt: new Date(30),
     };
@@ -112,6 +116,44 @@ describe('automationRoutes', () => {
             projectId: 'project-1', automationId: 'automation-1', revision: 1,
             generation: 1, reason: 'upsert',
         });
+    });
+
+    it('stages and activates an explicitly confirmed legacy adoption', async () => {
+        const staged = {
+            ...record(), paused: true, legacyMachineId: 'machine-1', legacyAutomationId: 'legacy-1',
+            legacyMigrationPending: true, legacyDesiredPaused: false,
+        };
+        mocks.adoptAutomation.mockResolvedValue({ ok: true, value: staged });
+        mocks.activateAutomationAdoption.mockResolvedValue({ ok: true, value: { ...staged, revision: 2, legacyMigrationPending: false } });
+        const app = await makeApp();
+        const encrypted = {
+            payloadVersion: 1,
+            payloadCiphertext: Buffer.from(payloadCiphertext).toString('base64'),
+            viewerKeyId: 'viewer-key', viewerKeyVersion: 1,
+            viewerKeyEnvelope: Buffer.from(keyEnvelope).toString('base64'),
+            machineKeyVersion: 1, machineKeyEnvelope: Buffer.from(keyEnvelope).toString('base64'),
+        };
+
+        const adopted = await app.inject({
+            method: 'POST', url: '/v1/projects/project-1/automation-adoptions',
+            headers: { authorization: 'Bearer test' },
+            payload: {
+                ...encrypted, legacyMachineId: 'machine-1', legacyAutomationId: 'legacy-1',
+                ownershipConfirmed: true, desiredPaused: false,
+            },
+        });
+        expect(adopted.statusCode).toBe(200);
+        expect(adopted.json()).toMatchObject({ migrationPending: true, desiredPaused: false });
+        expect(mocks.adoptAutomation).toHaveBeenCalledWith({}, 'user-1', 'project-1', expect.objectContaining({
+            legacyMachineId: 'machine-1', legacyAutomationId: 'legacy-1', payloadCiphertext,
+        }));
+
+        const activated = await app.inject({
+            method: 'POST', url: '/v1/projects/project-1/automation-adoptions/automation-1/activate',
+            headers: { authorization: 'Bearer test' }, payload: { expectedRevision: 1 },
+        });
+        expect(activated.statusCode).toBe(200);
+        expect(mocks.activateAutomationAdoption).toHaveBeenCalledWith({}, 'user-1', 'project-1', 'automation-1', 1);
     });
 
     it('returns 409 with the latest public row for a CAS conflict', async () => {

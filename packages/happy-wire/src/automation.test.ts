@@ -159,4 +159,55 @@ describe('createAutomationApiClient', () => {
     expect(error).toBeInstanceOf(AutomationApiError);
     expect(error).toMatchObject({ status: 409, code: 'revision-conflict', latest: automation });
   });
+
+  it('uses an explicit confirmed adoption endpoint for a legacy identity', async () => {
+    const fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ automation, migrationPending: true, desiredPaused: false }),
+    }));
+    const client = createAutomationApiClient({ baseUrl: 'https://happy.test', token: 'token', fetch });
+    const encrypted = await encryptAutomationPayload({
+      payload,
+      viewer: { publicKey: bytes(32, 11), keyVersion: 2 },
+      machine: { publicKey: bytes(32, 13), keyVersion: 4 },
+      crypto: fakeCrypto(),
+    });
+
+    await expect(client.adoptAutomation('project-1', {
+      ...encrypted,
+      legacyMachineId: 'machine-1',
+      legacyAutomationId: 'legacy-1',
+      ownershipConfirmed: true,
+      desiredPaused: false,
+    })).resolves.toEqual({ automation, migrationPending: true, desiredPaused: false });
+    expect(fetch).toHaveBeenCalledWith(
+      'https://happy.test/v1/projects/project-1/automation-adoptions',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    await expect(client.adoptAutomation('project-1', {
+      ...encrypted,
+      legacyMachineId: 'machine-1',
+      legacyAutomationId: 'legacy-2',
+      ownershipConfirmed: false,
+      desiredPaused: false,
+    } as never)).rejects.toThrow();
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('activates a staged adoption by revision', async () => {
+    const activated = { ...automation, revision: 2, generation: 4, paused: false };
+    const fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ automation: activated }),
+    }));
+    const client = createAutomationApiClient({ baseUrl: 'https://happy.test', token: 'token', fetch });
+
+    await expect(client.activateAutomationAdoption('project-1', 'automation-1', 1)).resolves.toEqual(activated);
+    expect(fetch).toHaveBeenCalledWith(
+      'https://happy.test/v1/projects/project-1/automation-adoptions/automation-1/activate',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ expectedRevision: 1 }) }),
+    );
+  });
 });
