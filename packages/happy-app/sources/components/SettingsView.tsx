@@ -29,7 +29,7 @@ import { useProfile } from '@/sync/storage';
 import { getDisplayName, getAvatarUrl, getBio } from '@/sync/profile';
 import { Avatar } from '@/components/Avatar';
 import { t } from '@/text';
-import { automationPreviewConfirmation } from '@/components/automationPreview';
+import { openAutomationPreview } from '@/components/automationPreview';
 
 type BuildConfig = {
     buildCommitSha?: unknown;
@@ -168,12 +168,10 @@ export const SettingsView = React.memo(function SettingsView() {
     });
 
     const handleScheduledAutomations = async () => {
-        const confirmed = await Modal.confirm(
-            automationPreviewConfirmation.title,
-            automationPreviewConfirmation.message,
-            { confirmText: automationPreviewConfirmation.confirmText, cancelText: automationPreviewConfirmation.cancelText },
-        );
-        if (confirmed) router.push('/settings/automations' as any);
+        await openAutomationPreview({
+            confirm: (title, message, options) => Modal.confirm(title, message, options),
+            onConfirm: () => router.push('/settings/automations' as any),
+        });
     };
 
     // Anthropic disconnection

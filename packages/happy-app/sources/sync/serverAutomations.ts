@@ -36,9 +36,14 @@ export interface ServerAutomationItem {
     runs: AutomationRun[];
 }
 
+export interface ServerAutomationListReadModel {
+    items: ServerAutomationItem[];
+    failedRowCount: number;
+}
+
 export interface ServerAutomationRepository {
     listProjects(): Promise<AutomationProject[]>;
-    listProject(projectId: string): Promise<ServerAutomationItem[]>;
+    listProject(projectId: string): Promise<ServerAutomationListReadModel>;
     create(projectId: string, payload: AutomationPayload): Promise<ServerAutomationItem>;
     update(item: ServerAutomationItem, payload: AutomationPayload): Promise<ServerAutomationItem>;
     setPaused(item: ServerAutomationItem, paused: boolean): Promise<ServerAutomationItem>;
@@ -128,7 +133,11 @@ export function createServerAutomationRepository(input: {
                 input.api.listAutomations(projectId),
                 input.api.listRuns(projectId, { limit: 100 }),
             ]);
-            return Promise.all(rows.map((row) => itemFromRow(row, runs, keyPair)));
+            const settled = await Promise.allSettled(rows.map((row) => itemFromRow(row, runs, keyPair)));
+            return {
+                items: settled.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []),
+                failedRowCount: settled.filter((result) => result.status === 'rejected').length,
+            };
         },
         async create(projectId, payload) {
             const row = await input.api.createAutomation(projectId, {

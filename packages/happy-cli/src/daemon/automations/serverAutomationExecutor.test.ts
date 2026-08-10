@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { runServerAutomationTick } from './serverAutomationExecutor'
+import { runServerAutomationTick, type ServerAutomationExecutorInput } from './serverAutomationExecutor'
+import type { EncryptedServerAutomation } from './serverAutomationCache'
 import type { ServerAutomationRuntimeState } from './serverAutomationRuntimeStore'
 
 function cacheRecord(generation = 2, migrationPending = false) {
@@ -34,7 +35,12 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
   }
   const runScript = vi.fn(async () => ({ ok: true, stdout: '' }))
   const spawnSession = vi.fn(async () => ({ ok: true as const, sessionId: 'session-1' }))
-  const input = {
+  const decryptPayload = vi.fn((_automation: EncryptedServerAutomation, _machineSecretKey: Uint8Array) => ({
+    name: 'name', schedule: { kind: 'interval' as const, minutes: 15 }, prompt: 'prompt',
+    directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+  }))
+  const logDebug = vi.fn()
+  const input: ServerAutomationExecutorInput = {
     cache: { read: () => ({
       cursor: 1n, serverTime: now, syncedAt: now, pendingAcknowledgements: [],
       automations: [cacheRecord(options.generation, options.migrationPending)],
@@ -43,16 +49,14 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     machineSecretKey: new Uint8Array(32),
     now,
     transport,
-    decryptPayload: () => ({
-      name: 'name', schedule: { kind: 'interval' as const, minutes: 15 }, prompt: 'prompt',
-      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
-    }),
+    decryptPayload,
     runScript,
     spawnSession,
     isSessionRunning: vi.fn(() => false),
     randomId: () => 'report-1',
+    logDebug,
   }
-  return { input, store, transport, runScript, spawnSession, now }
+  return { input, store, transport, decryptPayload, logDebug, runScript, spawnSession, now }
 }
 
 describe('runServerAutomationTick', () => {
@@ -66,6 +70,25 @@ describe('runServerAutomationTick', () => {
     expect(runScript).not.toHaveBeenCalled()
     expect(spawnSession).not.toHaveBeenCalled()
     expect(store.state().schedules[0]!.nextRunAt).toBe(now)
+  })
+
+  it('isolates a corrupt encrypted row so other automations still tick', async () => {
+    const { input, decryptPayload, logDebug, transport, now } = setup()
+    const corrupt = { ...cacheRecord(), automationId: 'automation-corrupt' }
+    input.cache = { read: () => ({
+      cursor: 1n, serverTime: now, syncedAt: now, pendingAcknowledgements: [],
+      automations: [corrupt, cacheRecord()],
+    }) }
+    decryptPayload.mockImplementation((automation) => {
+      if (automation.automationId === corrupt.automationId) throw new Error('automation-decrypt-failed')
+      return {
+        name: 'name', schedule: { kind: 'interval' as const, minutes: 15 }, prompt: 'prompt',
+        directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      }
+    })
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+    expect(transport.claim).toHaveBeenCalledWith(expect.objectContaining({ automationId: 'automation-1' }))
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('automation-corrupt'))
   })
 
   it('does not claim while legacy scheduler ownership is still staged', async () => {

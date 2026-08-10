@@ -5,6 +5,7 @@ import { AutomationApiError, type AutomationPayload, type AutomationSchedule } f
 import { useUnistyles } from 'react-native-unistyles';
 
 import { useAuth } from '@/auth/AuthContext';
+import { automationPreviewNotice } from '@/components/automationPreview';
 import { Item } from '@/components/Item';
 import { ItemGroup } from '@/components/ItemGroup';
 import { ItemList } from '@/components/ItemList';
@@ -62,6 +63,7 @@ export function AutomationsSettingsView() {
     );
     const [projects, setProjects] = React.useState<AutomationProject[]>([]);
     const [itemsByProject, setItemsByProject] = React.useState<Record<string, ServerAutomationItem[]>>({});
+    const [decryptFailuresByProject, setDecryptFailuresByProject] = React.useState<Record<string, number>>({});
     const [errorsByProject, setErrorsByProject] = React.useState<Record<string, string | null>>({});
     const [loadError, setLoadError] = React.useState<string | null>(null);
     const [loading, setLoading] = React.useState(true);
@@ -72,8 +74,9 @@ export function AutomationsSettingsView() {
     const reloadProject = React.useCallback(async (projectId: string) => {
         if (!repository) return;
         try {
-            const items = await repository.listProject(projectId);
-            setItemsByProject((current) => ({ ...current, [projectId]: items }));
+            const result = await repository.listProject(projectId);
+            setItemsByProject((current) => ({ ...current, [projectId]: result.items }));
+            setDecryptFailuresByProject((current) => ({ ...current, [projectId]: result.failedRowCount }));
             setErrorsByProject((current) => ({ ...current, [projectId]: null }));
         } catch (error) {
             setErrorsByProject((current) => ({ ...current, [projectId]: errorMessage(error) }));
@@ -149,7 +152,7 @@ export function AutomationsSettingsView() {
 
     return (
         <ItemList style={{ paddingTop: 0 }}>
-            <ItemGroup footer={loadError ?? 'Internal preview: administrator-only test feature. Public release is planned later.'}>
+            <ItemGroup footer={loadError ?? automationPreviewNotice}>
                 <Item
                     title="Scheduled Automations"
                     subtitle="Shared with Desktop through Happy Server"
@@ -163,11 +166,15 @@ export function AutomationsSettingsView() {
             {projects.map((project) => {
                 const items = itemsByProject[project.id] ?? [];
                 const editable = project.membership !== 'viewer';
+                const decryptFailures = decryptFailuresByProject[project.id] ?? 0;
                 return (
                     <ItemGroup
                         key={project.id}
                         title={project.name}
-                        footer={errorsByProject[project.id] ?? (editable ? 'Changes run after the target daemon syncs.' : 'Viewer access is read-only.')}
+                        footer={errorsByProject[project.id]
+                            ?? (decryptFailures > 0
+                                ? `${decryptFailures} automation${decryptFailures === 1 ? '' : 's'} could not be decrypted.`
+                                : editable ? 'Changes run after the target daemon syncs.' : 'Viewer access is read-only.')}
                     >
                         {items.map((item) => (
                             <Item
