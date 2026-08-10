@@ -25,8 +25,9 @@
  * READ-ONLY. Opens a terminal and a preview request against the user's own
  * machine; deletes nothing, restarts nothing. The session-spawn RPC check
  * (§6) calls `spawn-happy-session` with an unencrypted empty `params` — the
- * daemon can't decrypt it, so it never reaches `spawnSession()`; see the
- * comment at that section for why the round trip still proves routing.
+ * legacy decrypt path throws before handler dispatch; the dataKey path returns
+ * null and the handler's first parameter guard rejects it. Neither path reaches
+ * `spawnSession()`; see §6 for why the round trip still proves routing.
  *
  * USAGE
  *   SMOKE_TOKEN=$(python3 -c "import json;print(json.load(open('$HOME/.happy/access.key'))['token'])") \
@@ -413,11 +414,14 @@ async function main() {
     // 암호화해 보낸다. 이 스모크는 그 키가 없으므로 **일부러 빈 문자열**을
     // 보낸다 — daemon 쪽 RpcHandlerManager.handleRequest() 는
     // `decrypt(key, variant, decodeBase64(request.params))` 를 메서드 핸들러
-    // 호출 **이전에** 실행하고, 전체를 try/catch 로 감싼다
-    // (packages/happy-cli/src/api/rpc/RpcHandlerManager.ts). decode 가 실패하면
-    // catch 가 암호화된 에러 블롭을 만들어 정상 반환하므로 — spawnSession()
-    // 근처에도 못 가고 세션은 만들어지지 않는다. 이 요청이 daemon 까지 갔다
-    // 왔다는 것 자체가 왕복 증거이고, 페이로드 내용(우리는 복호화 못 함)은
+    // 호출 전에 실행하고, 전체를 try/catch 로 감싼다
+    // (packages/happy-cli/src/api/rpc/RpcHandlerManager.ts). legacy variant 는
+    // 빈 bundle 복호화가 throw 하므로 핸들러 전에 catch 된다. dataKey variant 는
+    // throw 대신 null 을 반환해 핸들러에 진입하지만, spawn-happy-session 핸들러의
+    // 첫 parameter guard 가 로깅·destructuring·spawnSession() 전에 거부한다
+    // (packages/happy-cli/src/api/apiMachine.ts). 두 경로 모두 catch 가 암호화된
+    // 에러 블롭을 정상 반환하며 세션은 만들어지지 않는다. 요청이 daemon 까지
+    // 갔다 왔다는 것 자체가 왕복 증거이고, 페이로드 내용(우리는 복호화 못 함)은
     // 무관하다 — 프리뷰 릴레이의 "닫힌 포트에 CONNECTION_REFUSED" 와 같은 원리.
     //
     // 판정 기준은 브라우저가 보는 rpc-call 응답의 최상위 `ok` 뿐이다

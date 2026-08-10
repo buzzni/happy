@@ -168,10 +168,13 @@ V1 이 이미 증명한 Redis streams adapter 의 기본 기능이다 — "어�
 **세션 spawn RPC**: `smoke-cross-placement.mjs` §6 신설 —
 `${machineId}:spawn-happy-session` 를 암호화 없이(빈 `params`) 호출한다.
 daemon 의 `RpcHandlerManager.handleRequest()` 는 핸들러 실행 전에
-decrypt(decodeBase64(params)) 를 하고 전체를 try/catch 로 감싸므로, decode
-실패는 암호화된 에러 블롭으로 안전하게 반환된다 — `spawnSession()` 에는
-닿지 않아 실제 세션이 만들어지지 않는다. 판정은 `rpc-call` 최상위 `ok` 만
-본다: `true` 는 daemon 도달, `false`+"not available" 은 라우팅 실패.
+decrypt(decodeBase64(params)) 를 하고 전체를 try/catch 로 감싼다. legacy
+variant 는 빈 bundle 복호화가 throw 되어 핸들러 전에 catch 된다. dataKey
+variant 는 null 을 반환해 핸들러에 진입하므로, `spawn-happy-session` 핸들러
+첫 줄의 null/비객체 parameter guard 가 로깅·destructuring·`spawnSession()` 전에
+거부하도록 계약을 명시했다. 두 경우 모두 암호화된 에러 블롭으로 안전하게
+반환되고 실제 세션은 만들어지지 않는다. 판정은 `rpc-call` 최상위 `ok` 만 본다:
+`true` 는 daemon 도달, `false`+"not available" 은 라우팅 실패.
 
 ### prod 스모크 결과 (2026-08-09, `aplus-dev-studio-prod-shared`)
 
