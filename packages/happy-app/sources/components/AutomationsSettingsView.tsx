@@ -5,6 +5,7 @@ import { AutomationApiError, type AutomationPayload, type AutomationSchedule } f
 import { useUnistyles } from 'react-native-unistyles';
 
 import { useAuth } from '@/auth/AuthContext';
+import { automationPreviewNotice } from '@/components/automationPreview';
 import { Item } from '@/components/Item';
 import { ItemGroup } from '@/components/ItemGroup';
 import { ItemList } from '@/components/ItemList';
@@ -72,9 +73,14 @@ export function AutomationsSettingsView() {
     const reloadProject = React.useCallback(async (projectId: string) => {
         if (!repository) return;
         try {
-            const items = await repository.listProject(projectId);
-            setItemsByProject((current) => ({ ...current, [projectId]: items }));
-            setErrorsByProject((current) => ({ ...current, [projectId]: null }));
+            const result = await repository.listProject(projectId);
+            setItemsByProject((current) => ({ ...current, [projectId]: result.items }));
+            setErrorsByProject((current) => ({
+                ...current,
+                [projectId]: result.failedRowCount > 0
+                    ? `${result.failedRowCount} automation${result.failedRowCount === 1 ? '' : 's'} could not be decrypted.`
+                    : null,
+            }));
         } catch (error) {
             setErrorsByProject((current) => ({ ...current, [projectId]: errorMessage(error) }));
             throw error;
@@ -149,7 +155,7 @@ export function AutomationsSettingsView() {
 
     return (
         <ItemList style={{ paddingTop: 0 }}>
-            <ItemGroup footer={loadError ?? 'Internal preview: administrator-only test feature. Public release is planned later.'}>
+            <ItemGroup footer={loadError ?? automationPreviewNotice}>
                 <Item
                     title="Scheduled Automations"
                     subtitle="Shared with Desktop through Happy Server"

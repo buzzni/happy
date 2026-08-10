@@ -101,7 +101,8 @@ describe('server automation repository', () => {
             machineKeyVersion: 2, viewerKeyVersion: 1,
         }));
         const listed = await repository.listProject('project-1');
-        expect(listed[0]?.payload).toEqual(payload);
+        expect(listed.items[0]?.payload).toEqual(payload);
+        expect(listed.failedRowCount).toBe(0);
         const updated = await repository.update(created, { ...payload, name: 'Updated' });
         expect(updated.payload.name).toBe('Updated');
         expect(api.updateAutomation).toHaveBeenCalledWith('project-1', 'automation-1', expect.objectContaining({ expectedRevision: 1 }));
@@ -140,5 +141,39 @@ describe('server automation repository', () => {
         expect(paused.runs).toEqual([run]);
         expect(paused.row.paused).toBe(true);
         expect(api.updateAutomation).toHaveBeenCalledWith('project-1', 'automation-1', { expectedRevision: 1, paused: true });
+    });
+
+    it('keeps decryptable rows when another row is corrupt', async () => {
+        const secret = crossClientSecret;
+        const viewer = await deriveAutomationViewerKeyPair(secret);
+        const machine = sodiumNode.crypto_box_keypair();
+        const valid = row({
+            payloadCiphertext: desktopFixture.payloadCiphertext,
+            viewerKeyEnvelope: desktopFixture.viewerKeyEnvelope,
+            viewerKeyId: 'viewer-key',
+        });
+        const corrupt = row({
+            id: 'automation-corrupt',
+            payloadCiphertext: desktopFixture.payloadCiphertext,
+            viewerKeyEnvelope: 'corrupt',
+        });
+        const api = {
+            getTarget: vi.fn(async () => ({
+                machineAccountId: 'account-1', machineId: 'machine-1', machinePublicKey: encodeBase64(machine.publicKey),
+                machineKeyVersion: 1, viewerPublicKey: encodeBase64(viewer.publicKey), viewerKeyVersion: 1,
+            })),
+            setViewerKey: vi.fn(),
+            listAutomations: vi.fn(async () => [valid, corrupt]),
+            listRuns: vi.fn(async () => []),
+        } as unknown as AutomationApiClient;
+        const repository = createServerAutomationRepository({
+            api, secret, listProjects: vi.fn(async () => []),
+        });
+
+        const result = await repository.listProject('project-1');
+
+        expect(result.items).toHaveLength(1);
+        expect(result.items[0]?.row.id).toBe('automation-1');
+        expect(result.failedRowCount).toBe(1);
     });
 });
