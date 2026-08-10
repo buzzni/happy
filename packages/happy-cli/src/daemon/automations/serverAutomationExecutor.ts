@@ -144,16 +144,22 @@ export async function runServerAutomationTick(
   if (cache.cursor === 0n) return []
   const now = serverNow(cache, input.now)
   const payloads = new Map<string, ServerAutomationPayload>()
+  const decryptableAutomations: EncryptedServerAutomation[] = []
   for (const automation of cache.automations) {
-    payloads.set(automation.automationId, input.decryptPayload(automation, input.machineSecretKey))
+    try {
+      payloads.set(automation.automationId, input.decryptPayload(automation, input.machineSecretKey))
+      decryptableAutomations.push(automation)
+    } catch (error) {
+      input.logDebug?.(`[server-automation] ${automation.automationId} decrypt failed: ${error}`)
+    }
   }
 
   const before = input.runtimeStore.read()
-  const reconciled = reconcileSchedules(cache, before, payloads, now)
+  const reconciled = reconcileSchedules({ ...cache, automations: decryptableAutomations }, before, payloads, now)
   if (JSON.stringify(reconciled.schedules) !== JSON.stringify(before.schedules)) input.runtimeStore.write(reconciled)
 
   const outcomes: Array<{ automationId: string; outcome: ServerAutomationReportOutcome }> = []
-  for (const automation of cache.automations) {
+  for (const automation of decryptableAutomations) {
     if (automation.paused || automation.migrationPending === true) continue
     const schedule = input.runtimeStore.read().schedules.find((item) => item.automationId === automation.automationId)
     if (!schedule || schedule.generation !== automation.generation || schedule.nextRunAt > now) continue
