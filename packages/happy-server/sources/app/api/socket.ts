@@ -16,6 +16,8 @@ import { artifactUpdateHandler } from "./socket/artifactUpdateHandler";
 import { accessKeyHandler } from "./socket/accessKeyHandler";
 import { terminalRelayHandler } from "./socket/terminalRelayHandler";
 import { db } from "@/storage/db";
+import { machineSocketIdentityExists } from "./socket/machineSocketAuth";
+import { automationSocketHandler } from "./socket/automationSocketHandler";
 
 export function startSocket(app: Fastify) {
     const io = new Server(app.server, {
@@ -121,6 +123,13 @@ export function startSocket(app: Fastify) {
         if (!verified) {
             log({ module: 'websocket' }, `Invalid token provided`);
             next(new Error('Invalid authentication token'));
+            return;
+        }
+
+        if (clientType === 'machine-scoped'
+            && !await machineSocketIdentityExists(db, verified.userId, machineId!)) {
+            log({ module: 'websocket' }, `Machine-scoped identity does not match a registered machine`);
+            next(new Error('Invalid machine identity'));
             return;
         }
 
@@ -240,6 +249,9 @@ export function startSocket(app: Fastify) {
         artifactUpdateHandler(userId, socket);
         accessKeyHandler(userId, socket);
         terminalRelayHandler(userId, socket);
+        if (connection.connectionType === 'machine-scoped') {
+            automationSocketHandler(userId, connection.machineId, socket);
+        }
 
         // Ready
         log({ module: 'websocket' }, `User connected: ${userId}`);

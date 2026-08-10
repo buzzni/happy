@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
     createAutomation: vi.fn(),
     deleteAutomation: vi.fn(),
     getAutomationTarget: vi.fn(),
+    listAutomationRuns: vi.fn(),
     listAutomations: vi.fn(),
     setAutomationViewerKey: vi.fn(),
     updateAutomation: vi.fn(),

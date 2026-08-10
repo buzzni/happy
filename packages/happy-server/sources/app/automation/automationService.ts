@@ -1,4 +1,4 @@
-import type { Automation, Prisma } from '@prisma/client';
+import type { Automation, AutomationRun, Prisma } from '@prisma/client';
 
 type Tx = Prisma.TransactionClient;
 
@@ -205,6 +205,25 @@ export async function listAutomations(
     const rows = await tx.automation.findMany({
         where: { projectId, deletedAt: null },
         orderBy: { createdAt: 'desc' },
+    });
+    return { ok: true, value: rows };
+}
+
+export async function listAutomationRuns(
+    tx: Tx,
+    actorId: string,
+    projectId: string,
+    input: { automationId?: string; limit: number },
+): Promise<AutomationServiceResult<AutomationRun[]>> {
+    const access = await projectAccess(tx, actorId, projectId);
+    if (!access) return { ok: false, error: 'not-found' };
+    const rows = await tx.automationRun.findMany({
+        where: {
+            automation: { projectId },
+            ...(input.automationId ? { automationId: input.automationId } : {}),
+        },
+        orderBy: { claimedAt: 'desc' },
+        take: input.limit,
     });
     return { ok: true, value: rows };
 }

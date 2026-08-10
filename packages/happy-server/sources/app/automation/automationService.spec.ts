@@ -3,6 +3,7 @@ import {
     createAutomation,
     deleteAutomation,
     getAutomationTarget,
+    listAutomationRuns,
     listAutomations,
     setAutomationViewerKey,
     updateAutomation,
@@ -91,6 +92,9 @@ function makeTx(options: {
         automationChange: {
             create: vi.fn(async () => ({})),
         },
+        automationRun: {
+            findMany: vi.fn(async () => [{ id: 'run-1', automationId: 'automation-1' }]),
+        },
     };
     return { tx, project, created, updated };
 }
@@ -117,6 +121,18 @@ describe('automationService', () => {
             .resolves.toEqual({ ok: true, value: [automationRecord()] });
         await expect(listAutomations(pending.tx as never, 'editor-1', 'project-1'))
             .resolves.toEqual({ ok: false, error: 'not-found' });
+    });
+
+    it('lists shared run history through the same project access boundary', async () => {
+        const { tx } = makeTx({ actorRole: 'viewer' });
+        await expect(listAutomationRuns(tx as never, 'editor-1', 'project-1', {
+            automationId: 'automation-1', limit: 20,
+        })).resolves.toEqual({ ok: true, value: [{ id: 'run-1', automationId: 'automation-1' }] });
+        expect(tx.automationRun.findMany).toHaveBeenCalledWith({
+            where: { automation: { projectId: 'project-1' }, automationId: 'automation-1' },
+            orderBy: { claimedAt: 'desc' },
+            take: 20,
+        });
     });
 
     it('derives owner and target machine instead of trusting client identity', async () => {

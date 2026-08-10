@@ -1,10 +1,11 @@
-import type { Automation } from '@prisma/client';
+import type { Automation, AutomationRun } from '@prisma/client';
 import type { FastifyReply } from 'fastify';
 import { z } from 'zod';
 import {
     createAutomation,
     deleteAutomation,
     getAutomationTarget,
+    listAutomationRuns,
     listAutomations,
     setAutomationViewerKey,
     updateAutomation,
@@ -84,6 +85,24 @@ function serializeAutomation(row: Automation) {
     };
 }
 
+function serializeRun(row: AutomationRun) {
+    return {
+        id: row.id,
+        automationId: row.automationId,
+        generation: row.generation,
+        scheduledFor: row.scheduledFor.getTime(),
+        machineId: row.machineId,
+        status: row.status,
+        sessionId: row.sessionId,
+        outcome: row.outcome,
+        detailCiphertext: row.detailCiphertext ? Buffer.from(row.detailCiphertext).toString('base64') : null,
+        claimedAt: row.claimedAt.getTime(),
+        startedAt: row.startedAt?.getTime() ?? null,
+        completedAt: row.completedAt?.getTime() ?? null,
+        lateReport: row.lateReport,
+    };
+}
+
 function errorStatus(error: AutomationServiceError): number {
     if (error === 'not-found') return 404;
     if (error === 'forbidden') return 403;
@@ -141,6 +160,21 @@ export function automationRoutes(app: Fastify) {
         const result = await inTx((tx) => listAutomations(tx, request.userId, request.params.projectId));
         if (!result.ok) return sendError(reply, result);
         return reply.send({ automations: result.value.map(serializeAutomation) });
+    });
+
+    app.get('/v1/projects/:projectId/automation-runs', {
+        preHandler: app.authenticate,
+        schema: {
+            params: paramsSchema,
+            querystring: z.object({
+                automationId: z.string().min(1).optional(),
+                limit: z.coerce.number().int().min(1).max(100).default(20),
+            }),
+        },
+    }, async (request, reply) => {
+        const result = await inTx((tx) => listAutomationRuns(tx, request.userId, request.params.projectId, request.query));
+        if (!result.ok) return sendError(reply, result);
+        return reply.send({ runs: result.value.map(serializeRun) });
     });
 
     app.post('/v1/projects/:projectId/automations', {
