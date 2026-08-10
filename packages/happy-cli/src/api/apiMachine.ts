@@ -61,6 +61,8 @@ import {
 import type { MachineAutomationKey } from '@/daemon/automations/machineAutomationKey';
 import type { ServerAutomationCache } from '@/daemon/automations/serverAutomationCache';
 import { syncServerAutomationDeltas } from '@/daemon/automations/serverAutomationSync';
+import type { ServerAutomationTransport } from '@/daemon/automations/serverAutomationExecutor';
+import type { PendingAutomationReport } from '@/daemon/automations/serverAutomationRuntimeStore';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -120,6 +122,24 @@ interface DaemonToServerEvents {
     'automation-sync-ack': (data: {
         items: Array<{ automationId: string; revision: number }>;
     }, cb: (answer: {
+        ok: boolean;
+        value?: unknown;
+        error?: string;
+    }) => void) => void;
+    'automation-claim': (data: {
+        automationId: string;
+        generation: number;
+        scheduledFor: number;
+    }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
+    'automation-run-start': (data: {
+        runId: string;
+        claimToken: string;
+    }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
+    'automation-run-heartbeat': (data: {
+        runId: string;
+        claimToken: string;
+    }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
+    'automation-run-report': (data: PendingAutomationReport, cb: (answer: {
         ok: boolean;
         value?: unknown;
         error?: string;
@@ -724,6 +744,15 @@ export class ApiMachineClient {
 
     setServerAutomationCache(cache: ServerAutomationCache): void {
         this.serverAutomationCache = cache;
+    }
+
+    serverAutomationTransport(): ServerAutomationTransport {
+        return {
+            claim: (input) => this.socket.emitWithAck('automation-claim', input),
+            start: (input) => this.socket.emitWithAck('automation-run-start', input),
+            heartbeat: (input) => this.socket.emitWithAck('automation-run-heartbeat', input),
+            report: (input) => this.socket.emitWithAck('automation-run-report', input),
+        };
     }
 
     private requestServerAutomationSync(): void {

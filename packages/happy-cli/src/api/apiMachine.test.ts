@@ -191,6 +191,7 @@ describe('ApiMachineClient socket reconnection', () => {
                 serverTime: 10, nextSeq: '1', changes: [{ seq: '1' }],
             } };
             if (event === 'automation-sync-ack') return { ok: true, value: { acknowledged: 1 } };
+            if (event === 'automation-claim') return { ok: true, value: { runId: 'run-1', claimToken: 'token' } };
             if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
             return { result: 'success' };
         });
@@ -210,6 +211,12 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(cache.applySync.mock.invocationCallOrder[0]).toBeLessThan(cache.markAcknowledged.mock.invocationCallOrder[0]!);
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-sync-ack', {
             items: [{ automationId: 'automation-1', revision: 1 }],
+        });
+        await expect((client as any).serverAutomationTransport().claim({
+            automationId: 'automation-1', generation: 2, scheduledFor: 10,
+        })).resolves.toEqual({ ok: true, value: { runId: 'run-1', claimToken: 'token' } });
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-claim', {
+            automationId: 'automation-1', generation: 2, scheduledFor: 10,
         });
         client.shutdown();
     });

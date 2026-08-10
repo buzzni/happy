@@ -28,6 +28,7 @@ export interface EncryptedServerAutomation {
 export interface ServerAutomationCacheState {
   cursor: bigint
   serverTime: number
+  syncedAt: number
   automations: EncryptedServerAutomation[]
   pendingAcknowledgements: Array<{ automationId: string; revision: number }>
 }
@@ -109,7 +110,7 @@ function readState(filePath: string): ServerAutomationCacheState {
     raw = readFileSync(filePath, 'utf8')
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { cursor: 0n, serverTime: 0, automations: [], pendingAcknowledgements: [] }
+      return { cursor: 0n, serverTime: 0, syncedAt: 0, automations: [], pendingAcknowledgements: [] }
     }
     throw error
   }
@@ -119,6 +120,7 @@ function readState(filePath: string): ServerAutomationCacheState {
     const state = {
       cursor: sequence(disk.cursor),
       serverTime: timestamp(disk.serverTime),
+      syncedAt: timestamp(disk.syncedAt),
       automations: disk.automations.map((entry) => parseUpsert({ ...object(entry), kind: 'UPSERT' })),
       pendingAcknowledgements: disk.pendingAcknowledgements.map((entry) => {
         const row = object(entry)
@@ -139,6 +141,7 @@ function persist(filePath: string, state: ServerAutomationCacheState): void {
     version: 1,
     cursor: state.cursor.toString(),
     serverTime: state.serverTime,
+    syncedAt: state.syncedAt,
     automations: state.automations,
     pendingAcknowledgements: state.pendingAcknowledgements,
   }), { encoding: 'utf8', mode: 0o600 })
@@ -146,7 +149,7 @@ function persist(filePath: string, state: ServerAutomationCacheState): void {
   chmodSync(filePath, 0o600)
 }
 
-export function createServerAutomationCache(options: { filePath: string }): ServerAutomationCache {
+export function createServerAutomationCache(options: { filePath: string; now?: () => number }): ServerAutomationCache {
   return {
     read: () => readState(options.filePath),
     applySync(value) {
@@ -183,6 +186,7 @@ export function createServerAutomationCache(options: { filePath: string }): Serv
       persist(options.filePath, {
         cursor: nextSeq,
         serverTime,
+        syncedAt: (options.now ?? Date.now)(),
         automations: [...byId.values()],
         pendingAcknowledgements,
       })
