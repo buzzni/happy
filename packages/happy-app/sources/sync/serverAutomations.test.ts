@@ -3,17 +3,30 @@ import sodiumNode from 'libsodium-wrappers';
 import type { AutomationApiClient, AutomationPublic, AutomationRun, AutomationTarget } from '@slopus/happy-wire';
 
 vi.mock('expo-crypto', () => ({
-    CryptoDigestAlgorithm: { SHA256: 'SHA-256' },
+    CryptoDigestAlgorithm: { SHA256: 'SHA-256', SHA512: 'SHA-512' },
     getRandomBytes: (length: number) => new Uint8Array(require('node:crypto').randomBytes(length)),
-    digest: async (_algorithm: string, value: Uint8Array) => (
-        new Uint8Array(require('node:crypto').createHash('sha256').update(value).digest())
+    digest: async (algorithm: string, value: Uint8Array) => (
+        new Uint8Array(require('node:crypto').createHash(algorithm.toLowerCase().replace('-', '')).update(value).digest())
     ),
 }));
 vi.mock('@/encryption/libsodium.lib', () => ({ default: require('libsodium-wrappers') }));
 vi.mock('@/sync/apiSocket', () => ({ apiSocket: { request: vi.fn() } }));
 
 import { encodeBase64 } from '@/encryption/base64';
-import { createServerAutomationRepository } from './serverAutomations';
+import { automationCrypto } from './automationCrypto';
+import { createServerAutomationRepository, deriveAutomationViewerKeyPair } from './serverAutomations';
+import { decryptAutomationPayload } from '@slopus/happy-wire';
+
+const crossClientSecret = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8';
+const desktopFixture = {
+    payload: {
+        name: 'Desktop fixture', schedule: { kind: 'daily' as const, hour: 9, minute: 20 },
+        prompt: 'Created by Desktop', directory: '/workspace/project', scriptCommand: null,
+        suppressSilent: true, agent: 'codex' as const,
+    },
+    payloadCiphertext: 'AdLyO6qORnC4v/oUIwXuA2w3FG3/v2Y0N8+ojICNfsdlUIJEWE/fix4qFkDBm7WSHg3dX3ccSNbM/CVSavCq8v1AiU1e8vgdOKUTcpScwCGLFxceU0a0+rqvqRExMZj07i3eKS/g3ot82aGiD3ZyZvN9uhPc1zeWGiYnbPPBm0BxLGm/kWT0V73wSRie3Bmq2XBNx4RvEg6+7S0Xy74+B2SBXaLuZAPX+4KMqf3WRT5kV3E2qAvj9HbbVSWNjnqe4dKm+gNbnilW8YSs4pQ1/fV3dQ+k5uNNU0uDaovAAI4OnTdMF253OWOE5JH8Bw==',
+    viewerKeyEnvelope: 'ASDGNuOuNrLOP1WhySO+DO5KRavB+KnrBbSTT6tvPddHOuAOt1F2XsV/Fwj7efctp9+ofad5oKWENJWLcTGAJGJyXptLXo2dhLRiZuoeFs/ZPTgKFytu3U4YcdBnzw0EyDFocTxhWl5j',
+};
 
 function row(patch: Partial<AutomationPublic> = {}): AutomationPublic {
     return {
@@ -28,6 +41,19 @@ function row(patch: Partial<AutomationPublic> = {}): AutomationPublic {
 
 describe('server automation repository', () => {
     beforeAll(async () => sodiumNode.ready);
+
+    it('derives the Desktop viewer identity and decrypts a Desktop-produced fixture', async () => {
+        const keyPair = await deriveAutomationViewerKeyPair(crossClientSecret);
+
+        expect(encodeBase64(keyPair.publicKey)).toBe('JBr5eUFa1tvJnZOvjCur8ojPlghK1uj+cHLtTiKdRFs=');
+        await expect(decryptAutomationPayload({
+            payloadVersion: 1,
+            payloadCiphertext: desktopFixture.payloadCiphertext,
+            keyEnvelope: desktopFixture.viewerKeyEnvelope,
+            recipientSecretKey: keyPair.privateKey,
+            crypto: automationCrypto,
+        })).resolves.toEqual(desktopFixture.payload);
+    });
 
     it('registers the stable viewer key and round-trips CRUD without a local mutation queue', async () => {
         const machine = sodiumNode.crypto_box_keypair();

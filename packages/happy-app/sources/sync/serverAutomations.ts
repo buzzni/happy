@@ -47,7 +47,7 @@ export interface ServerAutomationRepository {
 
 type ViewerKeyPair = { publicKey: Uint8Array; privateKey: Uint8Array };
 
-async function viewerKeyPair(secret: string): Promise<ViewerKeyPair> {
+export async function deriveAutomationViewerKeyPair(secret: string): Promise<ViewerKeyPair> {
     const master = decodeBase64(secret, 'base64url');
     if (master.length !== 32) throw new Error('automation-viewer-key-invalid');
     const seed = await deriveKey(master, 'Happy EnCoder', ['content']);
@@ -106,7 +106,7 @@ export function createServerAutomationRepository(input: {
     secret: string;
     listProjects: () => Promise<AutomationProject[]>;
 }): ServerAutomationRepository {
-    const keyPairPromise = viewerKeyPair(input.secret);
+    const keyPairPromise = deriveAutomationViewerKeyPair(input.secret);
 
     async function encrypt(projectId: string, payload: AutomationPayload) {
         const keyPair = await keyPairPromise;
