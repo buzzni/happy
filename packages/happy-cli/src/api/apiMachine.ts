@@ -312,6 +312,9 @@ export class ApiMachineClient {
 
         // Register spawn session handler
         this.rpcHandlerManager.registerHandler('spawn-happy-session', async (params: any) => {
+            if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+                throw new Error('Spawn parameters must be an object');
+            }
             const {
                 directory,
                 sessionId,

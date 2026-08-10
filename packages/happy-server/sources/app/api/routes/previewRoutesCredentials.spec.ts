@@ -19,12 +19,40 @@ import { signPreviewToken } from '@/modules/preview/previewToken';
 import { cookieName } from '@/modules/preview/previewCookie';
 import { type Fastify as FastifyType } from '../types';
 
-// Mock the daemon connection lookup, logging, and db
-vi.mock('@/app/events/eventRouter', () => ({
-    eventRouter: {
-        getConnections: vi.fn(),
-    },
-}));
+// Mock the daemon connection lookup, logging, and db.
+//
+// previewRoutes resolves the daemon through the Socket.IO room
+// (`eventRouter.server.in(room).timeout().fetchSockets()`) so the lookup works
+// across replicas — see specs/relay-cross-replica-routing. The tests below
+// still express their fixture as a set of ClientConnection records via
+// `getConnections`, so `server` is shimmed on top of that same fixture and
+// applies the same room + clientType/machineId filtering production does.
+vi.mock('@/app/events/eventRouter', () => {
+    const getConnections = vi.fn();
+    return {
+        eventRouter: {
+            getConnections,
+            server: {
+                in(room: string) {
+                    return {
+                        timeout() {
+                            return {
+                                async fetchSockets() {
+                                    const machineId = room.split(':machine:')[1];
+                                    const connections = (getConnections() ?? []) as Iterable<any>;
+                                    return [...connections]
+                                        .filter((c) => c.connectionType === 'machine-scoped' && c.machineId === machineId)
+                                        // RemoteSocket carries routing info on `data`.
+                                        .map((c) => ({ ...c.socket, data: { clientType: 'machine-scoped', machineId: c.machineId } }));
+                                },
+                            };
+                        },
+                    };
+                },
+            },
+        },
+    };
+});
 
 vi.mock('@/storage/db', () => ({
     db: {},

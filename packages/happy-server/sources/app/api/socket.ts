@@ -3,10 +3,11 @@ import { Fastify } from "./types";
 import { buildMachineActivityEphemeral, ClientConnection, eventRouter } from "@/app/events/eventRouter";
 import { Server } from "socket.io";
 import { createAdapter } from "@socket.io/redis-streams-adapter";
-import { Redis } from "ioredis";
+import { createRedisClient, isRedisConfigured } from "@/storage/createRedisClient";
 import { log } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
-import { getMetricsLabelsFromSocket, redisStreamLagMsGauge, websocketConnectionsGauge, websocketEventsCounter } from "../monitoring/metrics2";
+import { getMetricsLabelsFromSocket, redisStreamInfoFailuresCounter, redisStreamLagMsGauge, redisStreamWriteFailuresCounter, socketioClusterPeersGauge, websocketConnectionsGauge, websocketEventsCounter } from "../monitoring/metrics2";
+import { createLogThrottle, instrumentStreamWrites, readClusterPeerCount } from "../monitoring/redisHealth";
 import { usageHandler } from "./socket/usageHandler";
 import { rpcHandler } from "./socket/rpcHandler";
 import { pingHandler } from "./socket/pingHandler";
@@ -15,9 +16,12 @@ import { machineUpdateHandler } from "./socket/machineUpdateHandler";
 import { artifactUpdateHandler } from "./socket/artifactUpdateHandler";
 import { accessKeyHandler } from "./socket/accessKeyHandler";
 import { terminalRelayHandler } from "./socket/terminalRelayHandler";
+import { setTerminalSessionBackend, type TerminalSessionBackend } from "./socket/terminalSessions";
+import { previewWsMachineHandler, registerPreviewWsClusterListeners } from "@/modules/preview/previewWebSocketRelay";
 import { db } from "@/storage/db";
 import { machineSocketIdentityExists } from "./socket/machineSocketAuth";
 import { automationSocketHandler } from "./socket/automationSocketHandler";
+import { markMachineOffline, markMachineOnline } from "@/app/presence/machinePresence";
 
 export function startSocket(app: Fastify) {
     const io = new Server(app.server, {
@@ -47,26 +51,44 @@ export function startSocket(app: Fastify) {
         // bundle in proxy-http-request acks. See specs/remote-preview-relay/
         // Phase 4.
         maxHttpBufferSize: 100 * 1024 * 1024,
-        // Brief-disconnect event replay. Currently OFF to preserve parity with
-        // pre-multi-process prod behavior — clients fall through to the full
-        // REST re-fetch path on every reconnect (apiSocket.ts onReconnected
-        // listener). Enabling this lets socket.io replay missed events from
-        // the streams adapter (which implements restoreSession via the Redis
-        // stream) so the client can skip the heavy refetch when
-        // socket.recovered === true. Verified working cross-replica via
-        // deploy/integration-tests/missed-events.mjs (event #2 fired during a
-        // forced engine.close() arrived after auto-reconnect, recovered=true).
-        // Ship parity first; turn this on as a follow-up.
-        // connectionStateRecovery: {
-        //     maxDisconnectionDuration: 2 * 60 * 1000,
-        // },
+        // Brief-disconnect event replay. Lets socket.io replay missed events
+        // from the streams adapter (restoreSession via the Redis stream) so
+        // the client can skip the heavy REST re-fetch when
+        // socket.recovered === true — web-ui narrows loadSessions() to skip
+        // its merge/decrypt pass on a recovered reconnect (specs/
+        // websocket-connection-state-recovery D1). Verified cross-replica via
+        // deploy/integration-tests/missed-events.mjs and
+        // specs/connection-state-recovery/smoke-recovery.mjs (100-round
+        // XRANGE cap under sustained write load during recovery not hit at
+        // the tested load — see spec for the caveat).
+        connectionStateRecovery: {
+            maxDisconnectionDuration: 2 * 60 * 1000,
+        },
     });
 
-    // Multi-process support: attach Redis streams adapter when REDIS_URL is set
-    if (process.env.REDIS_URL) {
-        const streamClient = new Redis(process.env.REDIS_URL);
+    // Multi-process support: attach Redis streams adapter when Redis is configured
+    if (isRedisConfigured(process.env)) {
+        const streamClient = createRedisClient();
+
+        // A failed bus write is otherwise invisible: socket.io-adapter's
+        // publish() catches the XADD rejection into a debug() log. Count it
+        // here so a pinned-to-replica client (-READONLY) is observable.
+        const shouldLogWriteFailure = createLogThrottle(60_000);
+        instrumentStreamWrites(streamClient, (code, error) => {
+            redisStreamWriteFailuresCounter.inc({ code });
+            if (shouldLogWriteFailure(code)) {
+                log({ module: 'websocket', level: 'error' },
+                    `cluster bus write failed (${code}, throttled to 1/min) — cross-replica routing is degraded: ${error}`);
+            }
+        });
+
         io.adapter(createAdapter(streamClient, { maxLen: 200000, readCount: 2000 }));
         log({ module: 'websocket' }, 'Redis streams adapter enabled for multi-process support');
+
+        // Terminal sessions must be resolvable from the replica the daemon is
+        // attached to, which is not necessarily the one that opened them.
+        // Uses its own client: the adapter's is parked in a blocking XREAD.
+        setTerminalSessionBackend(createRedisClient() as unknown as TerminalSessionBackend);
 
         // Track stream reader lag: wrap onRawMessage to capture last-read offset,
         // then periodically compare against stream HEAD.
@@ -77,19 +99,38 @@ export function startSocket(app: Fastify) {
             lastReadOffset = offset;
             return origOnRawMessage(msg, offset);
         };
+        const shouldLogInfoFailure = createLogThrottle(60_000);
         setInterval(async () => {
+            // Peers on the bus. This is the decisive signal: with replicas >= 2
+            // a sustained 0 means fetchSockets() is silently answering
+            // local-only, so half of every daemon lookup fails as
+            // "RPC method not available".
+            socketioClusterPeersGauge.set(await readClusterPeerCount(adapter));
             try {
                 const info = await streamClient.xinfo("STREAM", "socket.io") as any[];
                 const headId = String(info[info.indexOf("last-generated-id") + 1]);
                 const headMs = parseInt(headId.split("-")[0]);
                 const readMs = parseInt(lastReadOffset.split("-")[0]);
                 redisStreamLagMsGauge.set(headMs - readMs);
-            } catch { /* stream may not exist yet */ }
+            } catch (error) {
+                // Was a bare `catch {}`. Swallowing it left the lag gauge
+                // frozen at its last value, so a dead bus kept reporting a
+                // plausible number for hours. Count + log instead.
+                redisStreamInfoFailuresCounter.inc();
+                if (shouldLogInfoFailure('xinfo')) {
+                    log({ module: 'websocket', level: 'error' },
+                        `cluster stream XINFO failed (throttled to 1/min) — redis_stream_lag_ms is now stale: ${error}`);
+                }
+            }
         }, 5000);
     }
 
     // Initialize event router with Socket.IO server instance
     eventRouter.init(io);
+
+    // Preview WS frames whose browser socket is owned by a peer replica arrive
+    // here via serverSideEmit. Registered once per process.
+    registerPreviewWsClusterListeners(io);
 
     // Auth runs in middleware so it completes BEFORE the client's `connect`
     // event fires. Without this, the async verifyToken in the connection
@@ -137,6 +178,13 @@ export function startSocket(app: Fastify) {
         socket.data.clientType = clientType;
         socket.data.sessionId = sessionId;
         socket.data.machineId = machineId;
+        // Recency signal for picking between two live sockets of the same
+        // daemon (a reconnect after a network flap leaves the dead one around
+        // until engine.io gives up). The old code relied on Set insertion
+        // order, which does not survive a cross-replica fetchSockets() —
+        // `data` does, because the adapter ships it with the socket details.
+        // See specs/relay-cross-replica-routing.
+        socket.data.connectedAt = Date.now();
         socket.data.happyClient = socket.handshake.auth.happyClient as string
             || socket.handshake.headers['x-happy-client'] as string
             || undefined;
@@ -185,13 +233,21 @@ export function startSocket(app: Fastify) {
 
         // Broadcast daemon online status
         if (connection.connectionType === 'machine-scoped') {
+            const connectedAt = Date.now();
             // Broadcast daemon online
-            const machineActivity = buildMachineActivityEphemeral(machineId!, true, Date.now());
+            const machineActivity = buildMachineActivityEphemeral(machineId!, true, connectedAt);
             eventRouter.emitEphemeral({
                 userId,
                 payload: machineActivity,
                 recipientFilter: { type: 'user-scoped-only' }
             });
+
+            // specs/machine-active-recovery — 브로드캐스트만으로는 DB 의
+            // Machine.active 가 false 인 채로 남는다. 끊김 경로가
+            // active=false 를 영속화하므로 연결 경로도 대칭이어야 한다.
+            // fire-and-forget: 이 쓰기가 실패해도 소켓은 살아 있어야 하고,
+            // heartbeat flush 가 최대 35초 안에 같은 상태를 다시 기록한다.
+            void markMachineOnline(userId, connection.machineId, connectedAt);
         }
 
         // Track app focus state for push notification routing.
@@ -229,13 +285,15 @@ export function startSocket(app: Fastify) {
                 try {
                     const hasReplacementConnection = await eventRouter.hasMachineSocket(userId, connection.machineId);
                     if (!hasReplacementConnection) {
-                        await db.machine.updateMany({
-                            where: { id: connection.machineId, accountId: userId, active: true },
-                            data: { active: false, lastActiveAt: new Date(disconnectedAt) },
-                        });
+                        await markMachineOffline(userId, connection.machineId, disconnectedAt);
                     }
                 } catch (error) {
-                    log({ module: 'websocket', level: 'error' }, `Failed to mark machine offline on disconnect: ${error}`);
+                    // markMachineOffline 은 내부에서 DB 실패를 삼키므로,
+                    // 여기 걸리는 건 사실상 hasMachineSocket (Redis 어댑터
+                    // 조회) 실패다. 대체 연결 여부를 모르면 끄지 않는다 —
+                    // 살아 있는 머신을 끄는 쪽이 더 나쁘고, 진짜로 죽었다면
+                    // timeout.ts 의 10분 스윕이 정리한다.
+                    log({ module: 'websocket', level: 'error' }, `Failed to resolve replacement machine socket on disconnect: ${error}`);
                 }
             }
         });
@@ -251,6 +309,10 @@ export function startSocket(app: Fastify) {
         terminalRelayHandler(userId, socket);
         if (connection.connectionType === 'machine-scoped') {
             automationSocketHandler(userId, connection.machineId, socket);
+            // proxy-ws-* only ever fires on the replica the daemon is attached
+            // to, so the dispatch has to be wired here rather than lazily at
+            // tunnel-open time on whichever replica took the browser upgrade.
+            previewWsMachineHandler(socket);
         }
 
         // Ready

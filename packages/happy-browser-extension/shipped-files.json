@@ -12,5 +12,9 @@
     "src/options.html",
     "src/options.js",
     "src/autoConnect.js",
-    "src/profileId.js"
+    "src/profileId.js",
+    "src/icons/icon-16.png",
+    "src/icons/icon-32.png",
+    "src/icons/icon-48.png",
+    "src/icons/icon-128.png"
 ]

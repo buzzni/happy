@@ -19,6 +19,37 @@ describe('stageUserCredentials', () => {
     }
   })
 
+  it('copies the daemon state file so the child can still reach the daemon', async () => {
+    // Regression: HAPPY_HOME_DIR relocates daemon.state.json too, so a staged
+    // home without it made the child's startup webhook fail with "No daemon
+    // running, no state file found" → "Session webhook timeout for PID ...".
+    const scratch = mkdtempSync(join(tmpdir(), 'daemon-state-'))
+    const daemonStateFile = join(scratch, 'daemon.state.json')
+    const state = JSON.stringify({ pid: 4242, httpPort: 43937 })
+    await fs.writeFile(daemonStateFile, state)
+
+    const { homeDir } = await stageUserCredentials('t', 's', daemonStateFile)
+    try {
+      const staged = await fs.readFile(join(homeDir, 'daemon.state.json'), 'utf-8')
+      expect(JSON.parse(staged)).toEqual({ pid: 4242, httpPort: 43937 })
+    } finally {
+      await fs.rm(homeDir, { recursive: true, force: true })
+      rmSync(scratch, { recursive: true, force: true })
+    }
+  })
+
+  it('still stages credentials when the daemon state file is missing', async () => {
+    // Best-effort copy: an unreadable daemon state must not fail the spawn.
+    const { homeDir } = await stageUserCredentials('t', 's', join(tmpdir(), 'does-not-exist-daemon.state.json'))
+    try {
+      const accessKey = await fs.readFile(join(homeDir, 'access.key'), 'utf-8')
+      expect(JSON.parse(accessKey).token).toBe('t')
+      await expect(fs.stat(join(homeDir, 'daemon.state.json'))).rejects.toThrow()
+    } finally {
+      await fs.rm(homeDir, { recursive: true, force: true })
+    }
+  })
+
   it('creates a logs subdirectory so the child CLI can write logs', async () => {
     const { homeDir } = await stageUserCredentials('t', 's')
     try {

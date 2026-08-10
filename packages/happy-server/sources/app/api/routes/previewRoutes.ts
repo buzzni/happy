@@ -17,11 +17,11 @@
  *   an Authorization header).
  */
 
-import { Socket } from "socket.io";
 import { z } from "zod";
 import { db } from "@/storage/db";
 import { log } from "@/utils/log";
 import { eventRouter } from "@/app/events/eventRouter";
+import { findMachineSockets as findMachineSocketsCrossReplica } from "@/app/events/findMachineSockets";
 import { signPreviewToken, verifyPreviewToken } from "@/modules/preview/previewToken";
 import { readPreviewCookie, buildPreviewCookie } from "@/modules/preview/previewCookie";
 import {
@@ -77,20 +77,30 @@ function isProxyRpcResponse(raw: unknown): raw is ProxyRpcResponse {
     return candidate.type === 'success' || candidate.type === 'error';
 }
 
-function findMachineSockets(userId: string, machineId: string): Socket[] {
-    const connections = eventRouter.getConnections(userId);
-    if (!connections) return [];
-    const sockets: Socket[] = [];
-    for (const c of connections) {
-        if (c.connectionType === 'machine-scoped' && c.machineId === machineId) {
-            if (c.socket.connected) sockets.push(c.socket);
-        }
-    }
-    return sockets;
+/**
+ * Cross-replica: resolves the daemon socket through the Socket.IO room rather
+ * than this process's connection map, so a browser request served by a replica
+ * the daemon is not connected to still finds it (specs/relay-cross-replica-routing).
+ */
+function findMachineSockets(userId: string, machineId: string) {
+    return findMachineSocketsCrossReplica(eventRouter.server, userId, machineId);
+}
+
+/**
+ * Minimal shape the relay needs from a daemon socket. Structural on purpose so
+ * it accepts both a local `Socket` and a `RemoteSocket` from a cross-replica
+ * `fetchSockets()` — their `timeout()` return types differ (`Socket` vs
+ * `BroadcastOperator`) but both expose `emitWithAck`, and `RemoteSocket` is
+ * built with `expectSingleResponse: true` so the ack shape is identical.
+ * Mirrors `PreviewWsMachineSocket` in previewWebSocketRelay.ts.
+ */
+export interface PreviewRelayMachineSocket {
+    id: string;
+    timeout(ms: number): { emitWithAck(event: string, payload: unknown): Promise<unknown> };
 }
 
 export async function relayProxyHttpRequest(
-    machineSockets: Array<Pick<Socket, 'id' | 'timeout'>>,
+    machineSockets: PreviewRelayMachineSocket[],
     payload: ProxyHttpRequestPayload,
     timeoutMs = RPC_TIMEOUT_MS,
 ): Promise<ProxyRpcResponse> {
@@ -174,6 +184,92 @@ export function buildPreviewUpstreamPath(subPath: string, rawUrl: string): strin
         .filter((pair) => !isPreviewTokenQueryPair(pair))
         .join('&');
     return `/${subPath}${forwardedQuery ? `?${forwardedQuery}` : ''}`;
+}
+
+/**
+ * specs/preview-relay-502-observability — the relay's two failure branches
+ * both answer 502, and the access log (enableMonitoring.ts) records only the
+ * route template and duration. That made "the daemon is gone" (abnormal) and
+ * "the dev server has not opened its port yet" (normal while booting, and
+ * polled for on purpose by web-ui's checkPortReachable) indistinguishable
+ * after the fact. This turns each failure into one greppable line.
+ *
+ * Status mapping is unchanged — 502/504 is a contract with checkPortReachable.
+ */
+export type PreviewRelayOutcome =
+    | { kind: 'machine-offline' }
+    /**
+     * The cross-replica socket lookup itself failed (peer replica did not
+     * answer), so we do not know whether the daemon is there. Same 502 as
+     * machine-offline — the checkPortReachable contract is unchanged — but a
+     * distinct reason token. Conflating the two is what made the 2026-08-07
+     * cluster-bus outage read as mass daemon disconnects.
+     * See specs/relay-cross-replica-routing.
+     */
+    | { kind: 'lookup-degraded' }
+    | { kind: 'daemon-error'; code: string; message: string };
+
+export interface PreviewRelayFailureContext {
+    method: string;
+    machineId: string;
+    port: number;
+    userId: string;
+    /** Upstream path, i.e. `buildPreviewUpstreamPath` output — never the raw URL. */
+    path: string;
+    candidates: number;
+}
+
+export interface PreviewRelayFailure {
+    status: number;
+    reason: string;
+    logLine: string;
+}
+
+/**
+ * Keep an untrusted value inside the single log line it belongs to. Fastify
+ * URI-decodes `params['*']`, so `%0A` in a preview URL arrives as a literal
+ * newline; the daemon's error message is likewise arbitrary text. Emitting
+ * either verbatim would let a caller forge a second `preview relay failed`
+ * line attributed to a machine that is not theirs — the exact forensic signal
+ * this line exists to provide.
+ */
+function escapeLogValue(value: string): string {
+    return value.replace(/[\r\n]/g, (ch) => (ch === '\r' ? '\\r' : '\\n'));
+}
+
+export function describePreviewRelayFailure(
+    outcome: PreviewRelayOutcome,
+    ctx: PreviewRelayFailureContext,
+): PreviewRelayFailure {
+    const status = outcome.kind === 'machine-offline' || outcome.kind === 'lookup-degraded'
+        ? 502
+        : outcome.code === 'INVALID_PORT' || outcome.code === 'INVALID_PATH' ? 400
+            : outcome.code === 'TIMEOUT' ? 504
+                : 502;
+    const reason = outcome.kind === 'machine-offline'
+        ? 'machine-offline'
+        : outcome.kind === 'lookup-degraded'
+            ? 'lookup-degraded'
+            : `daemon:${outcome.code}`;
+
+    // Backstop for specs/happy-server-log-volume Requirement 4 (never log the
+    // signed ptoken). Callers already pass a stripped path; re-running the same
+    // filter here keeps one source of truth for what "stripped" means.
+    const safePath = escapeLogValue(buildPreviewUpstreamPath(
+        ctx.path.replace(/^\//, '').split('?')[0],
+        ctx.path,
+    ));
+
+    const detail = outcome.kind === 'daemon-error'
+        ? ` detail=${escapeLogValue(outcome.message)}`
+        : '';
+    return {
+        status,
+        reason,
+        logLine: `preview relay failed reason=${reason} status=${status} `
+            + `method=${ctx.method} machine=${ctx.machineId} port=${ctx.port} `
+            + `user=${ctx.userId} path=${safePath} candidates=${ctx.candidates}${detail}`,
+    };
 }
 
 export function stripResponseHeaders(
@@ -462,28 +558,48 @@ export function previewRoutes(app: Fastify) {
                     return reply.code(204).headers(outHeaders).send();
                 }
 
-                // Find machine sockets. A daemon reconnect can briefly leave
-                // stale machine-scoped connections around; try all live
-                // candidates so one stale socket cannot pin preview to a 35s
-                // relay timeout while a fresh daemon socket is already ready.
-                const machineSockets = findMachineSockets(claims.userId, params.machineId);
-                if (machineSockets.length === 0) {
-                    return reply.code(502).send({ error: 'Machine offline' });
-                }
-                if (machineSockets.length > 1) {
-                    log({ module: 'preview', level: 'warn' }, `multiple machine sockets for preview relay: user=${claims.userId} machine=${params.machineId} count=${machineSockets.length}`);
-                }
-
                 // Build the upstream path (everything after `:port/`) while
                 // preserving raw query syntax. Vite virtual modules use
                 // valueless flags such as `?svelte&type=style&lang.css`;
                 // URLSearchParams would normalize them to `svelte=` and break
                 // plugin matching. Strip only the relay auth token.
+                //
+                // Computed before the socket lookup because the failure logs
+                // below must report a ptoken-free path — see
+                // specs/preview-relay-502-observability.
                 const subPath = params['*'] ?? '';
                 const upstreamPath = buildPreviewUpstreamPath(
                     subPath,
                     request.raw.url ?? request.url,
                 );
+
+                // Find machine sockets. A daemon reconnect can briefly leave
+                // stale machine-scoped connections around; try all live
+                // candidates so one stale socket cannot pin preview to a 35s
+                // relay timeout while a fresh daemon socket is already ready.
+                const { sockets: machineSockets, degraded } = await findMachineSockets(claims.userId, params.machineId);
+                const failureContext = {
+                    method: request.method,
+                    machineId: params.machineId,
+                    port: portNum,
+                    userId: claims.userId,
+                    path: upstreamPath,
+                    candidates: machineSockets.length,
+                };
+                if (machineSockets.length === 0) {
+                    // `degraded` means the cross-replica lookup failed, so we do
+                    // not know whether the daemon exists. Same 502 either way,
+                    // different reason token so the log stays diagnosable.
+                    const failure = describePreviewRelayFailure(
+                        { kind: degraded ? 'lookup-degraded' : 'machine-offline' },
+                        failureContext,
+                    );
+                    log({ module: 'preview', level: 'warn' }, failure.logLine);
+                    return reply.code(failure.status).send({ error: 'Machine offline' });
+                }
+                if (machineSockets.length > 1) {
+                    log({ module: 'preview', level: 'warn' }, `multiple machine sockets for preview relay: user=${claims.userId} machine=${params.machineId} count=${machineSockets.length}`);
+                }
 
                 const bodyBuf: Buffer | undefined = request.body as Buffer | undefined;
                 const bodyB64 = bodyBuf && bodyBuf.length > 0 ? bodyBuf.toString('base64') : null;
@@ -509,10 +625,12 @@ export function previewRoutes(app: Fastify) {
                 }
 
                 if (rpcResponse.type === 'error') {
-                    const status =
-                        rpcResponse.code === 'INVALID_PORT' || rpcResponse.code === 'INVALID_PATH' ? 400 :
-                        rpcResponse.code === 'TIMEOUT' ? 504 : 502;
-                    return reply.code(status).send({ code: rpcResponse.code, error: rpcResponse.message });
+                    const failure = describePreviewRelayFailure(
+                        { kind: 'daemon-error', code: rpcResponse.code, message: rpcResponse.message },
+                        failureContext,
+                    );
+                    log({ module: 'preview', level: 'warn' }, failure.logLine);
+                    return reply.code(failure.status).send({ code: rpcResponse.code, error: rpcResponse.message });
                 }
 
                 // Successful proxy response — rewrite HTML/JS/CSS if applicable.

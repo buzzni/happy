@@ -1,15 +1,26 @@
 import fastify from "fastify";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { enableMonitoring } from "./enableMonitoring";
 
-const { dbMock } = vi.hoisted(() => ({
+const { dbMock, logMock, warnMock, errorMock, debugMock } = vi.hoisted(() => ({
     dbMock: {
         $queryRaw: vi.fn()
-    }
+    },
+    logMock: vi.fn(),
+    warnMock: vi.fn(),
+    errorMock: vi.fn(),
+    debugMock: vi.fn()
 }));
 
 vi.mock("@/storage/db", () => ({
     db: dbMock
+}));
+
+vi.mock("@/utils/log", () => ({
+    log: logMock,
+    warn: warnMock,
+    error: errorMock,
+    debug: debugMock
 }));
 
 describe("enableMonitoring health endpoints", () => {
@@ -88,5 +99,75 @@ describe("enableMonitoring health endpoints", () => {
             service: "happy-server",
             error: "Database connectivity failed"
         });
+    });
+});
+
+describe("enableMonitoring access logging", () => {
+    // specs/happy-server-log-volume — Fastify 기본 요청 로그(incoming request +
+    // request completed)는 요청당 16줄이었고 전체 로그의 73% 였다. 정상 요청은
+    // 침묵하고, 조사할 가치가 있는 요청만 단일 라인으로 남긴다. method/route/
+    // status/duration 전량 집계는 같은 훅의 Prometheus 메트릭이 계속 담당한다.
+    const SLOW_MS = 2000;
+    let now = 1_700_000_000_000;
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        now = 1_700_000_000_000;
+        vi.spyOn(Date, "now").mockImplementation(() => now);
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    async function buildApp() {
+        const app = fastify({ disableRequestLogging: true });
+        enableMonitoring(app as never);
+        app.get("/fast", async () => ({ ok: true }));
+        app.get("/slow", async () => {
+            now += SLOW_MS;
+            return { ok: true };
+        });
+        app.get("/boom", async (_request, reply) => {
+            reply.code(500);
+            return { error: "nope" };
+        });
+        await app.ready();
+        return app;
+    }
+
+    it("stays silent for a fast successful request", async () => {
+        const app = await buildApp();
+
+        const response = await app.inject({ method: "GET", url: "/fast" });
+
+        expect(response.statusCode).toBe(200);
+        expect(logMock).not.toHaveBeenCalled();
+        expect(warnMock).not.toHaveBeenCalled();
+        expect(errorMock).not.toHaveBeenCalled();
+    });
+
+    it("logs one line for a server error", async () => {
+        const app = await buildApp();
+
+        const response = await app.inject({ method: "GET", url: "/boom" });
+
+        expect(response.statusCode).toBe(500);
+        expect(errorMock).toHaveBeenCalledTimes(1);
+        const message = String(errorMock.mock.calls[0]?.[1]);
+        expect(message).toContain("/boom");
+        expect(message).toContain("500");
+    });
+
+    it("logs one line for a slow request", async () => {
+        const app = await buildApp();
+
+        const response = await app.inject({ method: "GET", url: "/slow" });
+
+        expect(response.statusCode).toBe(200);
+        expect(warnMock).toHaveBeenCalledTimes(1);
+        const message = String(warnMock.mock.calls[0]?.[1]);
+        expect(message).toContain("/slow");
+        expect(message).toContain("2000ms");
     });
 });

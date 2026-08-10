@@ -670,7 +670,14 @@ export async function startDaemon(): Promise<void> {
         // from ~/.happy-dev/access.key.
         let stagedUserHomeDir: string | undefined;
         if (options.happyToken && options.happySecret) {
-          const { homeDir } = await stageUserCredentials(options.happyToken, options.happySecret);
+          // Pass our own daemon.state.json so the staged home still lets the
+          // child find this daemon's HTTP port for its startup webhook —
+          // HAPPY_HOME_DIR relocates that lookup too, not just access.key.
+          const { homeDir } = await stageUserCredentials(
+            options.happyToken,
+            options.happySecret,
+            configuration.daemonStateFile,
+          );
           authEnv.HAPPY_HOME_DIR = homeDir;
           stagedUserHomeDir = homeDir;
           logger.debug(`[DAEMON RUN] User credentials staged at ${homeDir}/access.key`);

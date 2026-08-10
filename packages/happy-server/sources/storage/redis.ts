@@ -1,3 +1,3 @@
-import { Redis } from 'ioredis';
+import { createRedisClient } from './createRedisClient';
 
-export const redis = new Redis(process.env.REDIS_URL!);
+export const redis = createRedisClient();

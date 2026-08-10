@@ -272,6 +272,17 @@ class EventRouter {
         return this.userConnections.get(userId);
     }
 
+    /**
+     * The Socket.IO server, for cross-replica room queries.
+     *
+     * Prefer this over `getConnections()` when resolving another endpoint's
+     * socket: `userConnections` is process-local, so with replicas >= 2 it only
+     * sees clients attached to *this* pod (specs/relay-cross-replica-routing).
+     */
+    get server(): Server {
+        return this.io;
+    }
+
     // === EVENT EMISSION METHODS ===
 
     emitUpdate(params: {

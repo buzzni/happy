@@ -52,6 +52,13 @@ export async function startApi(opts: StartApiOptions = {}) {
     // Start API
     const app = fastify({
         loggerInstance: logger,
+        // specs/happy-server-log-volume — Fastify 기본 요청 로그는 요청당 16줄
+        // (incoming request + request completed)을 남겨 전체 로그의 73% 를
+        // 차지했다. pino-pretty 가 동기 in-process 스트림이라 그 비용이 요청
+        // 처리와 같은 이벤트 루프에 얹힌다. 대체재는 enableMonitoring 의
+        // onResponse 훅 — Prometheus 로 전량 집계하고, 5xx/느린 요청만 한 줄
+        // 남긴다.
+        disableRequestLogging: true,
         bodyLimit: 1024 * 1024 * 100, // 100MB,
         // specs/preview-iframe-origin-isolation-subdomain Phase 3 fix —
         // Fastify lifecycle runs routing BEFORE onRequest hooks, so a hook
