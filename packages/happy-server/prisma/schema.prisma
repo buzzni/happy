@@ -59,6 +59,7 @@ model Account {
     MergeRequest        MergeRequest[]
     MergeRequestComment MergeRequestComment[]
     VoiceConversation   VoiceConversation[]
+    AutomationOwner     Automation[]         @relation("AutomationOwner")
 }
 
 model TerminalAuthRequest {
@@ -240,6 +241,9 @@ model Machine {
     createdAt          DateTime    @default(now())
     updatedAt          DateTime    @updatedAt
     accessKeys         AccessKey[]
+    automationPublicKey Bytes?
+    automationKeyVersion Int       @default(0)
+    automations        Automation[] @relation("AutomationTargetMachine")
 
     @@unique([accountId, id])
     @@index([accountId])
@@ -402,9 +406,12 @@ model Project {
     createdAt            DateTime            @default(now())
     updatedAt            DateTime            @updatedAt
     giteaRepo            String?
+    automationViewerPublicKey Bytes?
+    automationViewerKeyVersion Int @default(0)
     members              ProjectMember[]
     workspaces           Workspace[]
     mergeRequests        MergeRequest[]
+    automations          Automation[]
 
     @@index([accountId])
 }
@@ -444,6 +451,109 @@ model Workspace {
     @@unique([projectId, branchName])
     @@index([projectId])
     @@index([accountId])
+}
+
+enum AutomationChangeKind {
+    UPSERT
+    TOMBSTONE
+}
+
+enum AutomationRunStatus {
+    CLAIMED
+    RUNNING
+    COMPLETED
+    FAILED
+    CANCELLED
+    EXPIRED
+    ABANDONED
+}
+
+enum AutomationRunOutcome {
+    WOKE
+    SILENT
+    SKIPPED_GATE
+    ERROR
+}
+
+model Automation {
+    id                 String    @id @default(cuid())
+    projectId          String
+    project            Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+    ownerAccountId     String
+    ownerAccount       Account   @relation("AutomationOwner", fields: [ownerAccountId], references: [id])
+    machineAccountId   String?
+    machineId          String?
+    targetMachine      Machine?  @relation("AutomationTargetMachine", fields: [machineAccountId, machineId], references: [accountId, id], onDelete: SetNull)
+    revision           Int       @default(1)
+    generation         Int       @default(1)
+    payloadVersion     Int       @default(1)
+    payloadCiphertext  Bytes
+    viewerKeyId        String
+    viewerKeyVersion   Int
+    viewerKeyEnvelope  Bytes
+    machineKeyVersion  Int
+    machineKeyEnvelope Bytes
+    paused             Boolean   @default(false)
+    enabledAt          DateTime  @default(now())
+    deletedAt          DateTime?
+    appliedRevision    Int       @default(0)
+    appliedAt          DateTime?
+    legacyMachineId    String?
+    legacyAutomationId String?
+    createdAt          DateTime  @default(now())
+    updatedAt          DateTime  @updatedAt
+    runs               AutomationRun[]
+
+    @@unique([legacyMachineId, legacyAutomationId])
+    @@index([projectId, deletedAt])
+    @@index([ownerAccountId])
+    @@index([machineAccountId, machineId, deletedAt])
+}
+
+// Deliberately has no FK to Automation: project hard-delete must leave a
+// target-specific tombstone for daemons that were offline during deletion.
+model AutomationChange {
+    seq              BigInt               @id @default(autoincrement())
+    automationId     String
+    machineAccountId String
+    machineId        String
+    revision         Int
+    generation       Int
+    kind             AutomationChangeKind
+    createdAt        DateTime             @default(now())
+
+    @@unique([automationId, revision, machineAccountId, machineId, kind])
+    @@index([machineAccountId, machineId, seq])
+    @@index([automationId])
+}
+
+// A run row is both the atomic execution claim and the shared run history.
+model AutomationRun {
+    id                String                @id @default(cuid())
+    automationId      String
+    automation        Automation            @relation(fields: [automationId], references: [id], onDelete: Cascade)
+    generation        Int
+    scheduledFor      DateTime
+    machineAccountId  String
+    machineId         String
+    status            AutomationRunStatus
+    claimTokenHash    Bytes                 @unique
+    claimExpiresAt    DateTime
+    runLeaseExpiresAt DateTime?
+    reportId          String?               @unique
+    sessionId         String?
+    outcome           AutomationRunOutcome?
+    detailCiphertext  Bytes?
+    claimedAt         DateTime              @default(now())
+    startedAt         DateTime?
+    completedAt       DateTime?
+    lateReport        Boolean               @default(false)
+    createdAt         DateTime              @default(now())
+    updatedAt         DateTime              @updatedAt
+
+    @@unique([automationId, generation, scheduledFor])
+    @@index([automationId, status])
+    @@index([machineAccountId, machineId, status])
 }
 
 model MergeRequest {
