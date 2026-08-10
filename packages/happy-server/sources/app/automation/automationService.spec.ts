@@ -17,7 +17,7 @@ function automationRecord(patch: Record<string, unknown> = {}) {
         id: 'automation-1',
         projectId: 'project-1',
         ownerAccountId: 'editor-1',
-        machineAccountId: 'machine-owner',
+        machineAccountId: 'owner-1',
         machineId: 'machine-1',
         revision: 1,
         generation: 1,
@@ -46,6 +46,7 @@ function makeTx(options: {
     actorRole?: string;
     actorStatus?: string;
     automation?: ReturnType<typeof automationRecord> | null;
+    machineAccountId?: string;
 } = {}) {
     const actorId = options.actorId ?? 'editor-1';
     const project = {
@@ -71,9 +72,9 @@ function makeTx(options: {
             }),
         },
         machine: {
-            findUnique: vi.fn(async () => ({
+            findUnique: vi.fn(async () => options.machineAccountId === 'foreign-owner' ? null : ({
                 id: 'machine-1',
-                accountId: 'machine-owner',
+                accountId: 'owner-1',
                 automationPublicKey: new Uint8Array(32),
                 automationKeyVersion: 3,
             })),
@@ -144,13 +145,24 @@ describe('automationService', () => {
         expect(tx.automation.create).toHaveBeenCalledWith({ data: expect.objectContaining({
             projectId: 'project-1',
             ownerAccountId: 'editor-1',
-            machineAccountId: 'machine-owner',
+            machineAccountId: 'owner-1',
             machineId: 'machine-1',
         }) });
         expect(tx.automationChange.create).toHaveBeenCalledWith({ data: expect.objectContaining({
             automationId: 'automation-1',
             kind: 'UPSERT',
         }) });
+    });
+
+    it('rejects a project configured with another account\'s machine id', async () => {
+        const { tx } = makeTx({ machineAccountId: 'foreign-owner' });
+
+        await expect(getAutomationTarget(tx as never, 'editor-1', 'project-1'))
+            .resolves.toEqual({ ok: false, error: 'automation-target-unavailable' });
+        expect(tx.machine.findUnique).toHaveBeenCalledWith({
+            where: { accountId_id: { accountId: 'owner-1', id: 'machine-1' } },
+            select: expect.any(Object),
+        });
     });
 
     it('returns public target keys to viewers but lets only the project owner rotate the viewer key', async () => {

@@ -97,7 +97,7 @@ async function targetForProject(tx: Tx, project: ProjectAccess['project']): Prom
     if (!machineId) return null;
 
     const machine = await tx.machine.findUnique({
-        where: { id: machineId },
+        where: { accountId_id: { accountId: project.accountId, id: machineId } },
         select: { id: true, accountId: true, automationPublicKey: true, automationKeyVersion: true },
     });
     if (!machine?.automationPublicKey || machine.automationKeyVersion < 1) return null;

@@ -54,4 +54,60 @@ describe('server-backed automation migration', () => {
             await pg.close();
         }
     });
+
+    it('enforces one active run and one claim per scheduled generation in PostgreSQL', async () => {
+        const pg = new PGlite();
+        try {
+            await pg.exec(`
+                CREATE TABLE "Account" ("id" TEXT PRIMARY KEY);
+                CREATE TABLE "Project" ("id" TEXT PRIMARY KEY);
+                CREATE TABLE "Machine" ("id" TEXT PRIMARY KEY, "accountId" TEXT NOT NULL);
+                CREATE UNIQUE INDEX "Machine_accountId_id_key" ON "Machine"("accountId", "id");
+            `);
+            await pg.exec(readSql('migration.sql'));
+            await pg.exec(`
+                INSERT INTO "Account" ("id") VALUES ('account-1');
+                INSERT INTO "Project" ("id") VALUES ('project-1');
+                INSERT INTO "Machine" ("id", "accountId") VALUES ('machine-1', 'account-1');
+                INSERT INTO "Automation" (
+                    "id", "projectId", "ownerAccountId", "machineAccountId", "machineId",
+                    "payloadCiphertext", "viewerKeyId", "viewerKeyVersion", "viewerKeyEnvelope",
+                    "machineKeyVersion", "machineKeyEnvelope", "updatedAt"
+                ) VALUES (
+                    'automation-1', 'project-1', 'account-1', 'account-1', 'machine-1',
+                    '\\x01', 'viewer-key', 1, '\\x02', 1, '\\x03', CURRENT_TIMESTAMP
+                );
+                INSERT INTO "AutomationRun" (
+                    "id", "automationId", "generation", "scheduledFor", "machineAccountId", "machineId",
+                    "status", "claimTokenHash", "claimExpiresAt", "updatedAt"
+                ) VALUES (
+                    'run-1', 'automation-1', 1, '2026-08-10T08:00:00Z', 'account-1', 'machine-1',
+                    'CLAIMED', '\\x11', '2026-08-10T08:02:00Z', CURRENT_TIMESTAMP
+                );
+            `);
+
+            await expect(pg.exec(`
+                INSERT INTO "AutomationRun" (
+                    "id", "automationId", "generation", "scheduledFor", "machineAccountId", "machineId",
+                    "status", "claimTokenHash", "claimExpiresAt", "updatedAt"
+                ) VALUES (
+                    'run-2', 'automation-1', 1, '2026-08-10T08:01:00Z', 'account-1', 'machine-1',
+                    'RUNNING', '\\x12', '2026-08-10T08:03:00Z', CURRENT_TIMESTAMP
+                );
+            `)).rejects.toThrow(/AutomationRun_one_active_run_per_automation/);
+
+            await pg.exec(`UPDATE "AutomationRun" SET "status" = 'COMPLETED' WHERE "id" = 'run-1'`);
+            await expect(pg.exec(`
+                INSERT INTO "AutomationRun" (
+                    "id", "automationId", "generation", "scheduledFor", "machineAccountId", "machineId",
+                    "status", "claimTokenHash", "claimExpiresAt", "updatedAt"
+                ) VALUES (
+                    'run-3', 'automation-1', 1, '2026-08-10T08:00:00Z', 'account-1', 'machine-1',
+                    'CLAIMED', '\\x13', '2026-08-10T08:02:00Z', CURRENT_TIMESTAMP
+                );
+            `)).rejects.toThrow(/AutomationRun_automationId_generation_scheduledFor_key/);
+        } finally {
+            await pg.close();
+        }
+    });
 });

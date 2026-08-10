@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
+import { Prisma } from '@prisma/client';
 import {
     claimAutomationRun,
+    heartbeatAutomationRun,
     registerAutomationMachineKey,
     reportAutomationRun,
     startAutomationRun,
@@ -85,6 +87,18 @@ describe('automationExecutionService', () => {
         }, now)).resolves.toEqual({ ok: false, error: 'claim-denied' });
     });
 
+    it('maps the database uniqueness fence to an already-claimed result', async () => {
+        const tx = makeTx();
+        tx.automationRun.create.mockRejectedValue(new Prisma.PrismaClientKnownRequestError('duplicate run', {
+            code: 'P2002',
+            clientVersion: 'test',
+        }));
+
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
+            automationId: 'automation-1', generation: 3, scheduledFor: now,
+        }, now)).resolves.toEqual({ ok: false, error: 'already-claimed' });
+    });
+
     it('cancels a claimed run when pause wins before start', async () => {
         const tx = makeTx();
         tx.automationRun.findFirst.mockResolvedValue({
@@ -95,6 +109,18 @@ describe('automationExecutionService', () => {
             runId: 'run-1', claimToken: 'token',
         }, now)).resolves.toEqual({ ok: false, error: 'claim-cancelled' });
         expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'CANCELLED', completedAt: now } }));
+    });
+
+    it('does not resurrect a run after its heartbeat lease expires', async () => {
+        const tx = makeTx();
+        tx.automationRun.updateMany.mockResolvedValue({ count: 0 });
+
+        await expect(heartbeatAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token',
+        }, now)).resolves.toEqual({ ok: false, error: 'run-not-running' });
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            where: expect.objectContaining({ runLeaseExpiresAt: { gte: now } }),
+        }));
     });
 
     it('returns an existing terminal result for the same report id', async () => {
@@ -120,6 +146,36 @@ describe('automationExecutionService', () => {
             where: { id: 'foreign-session', accountId: 'account-1' }, select: { id: true },
         });
         expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('maps a cross-run report id uniqueness conflict to report-conflict', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+        tx.automationRun.updateMany.mockRejectedValue(new Prisma.PrismaClientKnownRequestError('duplicate report', {
+            code: 'P2002',
+            clientVersion: 'test',
+        }));
+
+        await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-used-by-another-run', status: 'COMPLETED',
+            outcome: 'WOKE', sessionId: null, detailCiphertext: null,
+        }, now)).resolves.toEqual({ ok: false, error: 'report-conflict' });
+    });
+
+    it('marks a report after the run lease deadline as late', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({
+            id: 'run-1', status: 'RUNNING', reportId: null,
+            runLeaseExpiresAt: new Date(now.getTime() - 1),
+        });
+
+        await reportAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
+            outcome: 'WOKE', sessionId: null, detailCiphertext: null,
+        }, now);
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ lateReport: true }),
+        }));
     });
 
     it.each([

@@ -231,7 +231,14 @@ export async function heartbeatAutomationRun(
 ): Promise<Result<{ runLeaseExpiresAt: Date }>> {
     const runLeaseExpiresAt = new Date(now.getTime() + 5 * 60_000);
     const changed = await tx.automationRun.updateMany({
-        where: { id: input.runId, machineAccountId: accountId, machineId, claimTokenHash: tokenHash(input.claimToken), status: 'RUNNING' },
+        where: {
+            id: input.runId,
+            machineAccountId: accountId,
+            machineId,
+            claimTokenHash: tokenHash(input.claimToken),
+            status: 'RUNNING',
+            runLeaseExpiresAt: { gte: now },
+        },
         data: { runLeaseExpiresAt },
     });
     return changed.count === 1
@@ -274,18 +281,27 @@ export async function reportAutomationRun(
         });
         if (!session) return { ok: false, error: 'report-conflict' };
     }
-    const changed = await tx.automationRun.updateMany({
-        where: { id: run.id, reportId: null, status: { in: ['RUNNING', 'ABANDONED'] } },
-        data: {
-            reportId: input.reportId,
-            status: input.status,
-            outcome: input.outcome,
-            sessionId: input.sessionId,
-            detailCiphertext: input.detailCiphertext,
-            completedAt: now,
-            lateReport: run.status === 'ABANDONED',
-        },
-    });
+    let changed;
+    try {
+        changed = await tx.automationRun.updateMany({
+            where: { id: run.id, reportId: null, status: { in: ['RUNNING', 'ABANDONED'] } },
+            data: {
+                reportId: input.reportId,
+                status: input.status,
+                outcome: input.outcome,
+                sessionId: input.sessionId,
+                detailCiphertext: input.detailCiphertext,
+                completedAt: now,
+                lateReport: run.status === 'ABANDONED'
+                    || (run.runLeaseExpiresAt !== null && run.runLeaseExpiresAt < now),
+            },
+        });
+    } catch (error) {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+            return { ok: false, error: 'report-conflict' };
+        }
+        throw error;
+    }
     return changed.count === 1
         ? { ok: true, value: { idempotent: false, status: input.status, outcome: input.outcome } }
         : { ok: false, error: 'report-conflict' };
