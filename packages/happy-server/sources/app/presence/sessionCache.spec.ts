@@ -151,7 +151,7 @@ describe("sessionCache.flushPendingUpdates — Machine keepalive must not bump M
         expect(executeRawCalls.length).toBe(1);
     });
 
-    it("raw SQL UPDATE only references lastActiveAt + accountId + id (NOT updatedAt)", async () => {
+    it("raw SQL UPDATE references lastActiveAt + active + accountId + id (NOT updatedAt)", async () => {
         primeMachineCacheEntry("mach-B", "user-1");
         activityCache.queueMachineUpdate("mach-B", Date.now());
         await flushNow();
@@ -165,10 +165,23 @@ describe("sessionCache.flushPendingUpdates — Machine keepalive must not bump M
         // Same regression guard as the session branch — adding "updatedAt"
         // to the SET list would defeat the whole fix.
         expect(sql).not.toMatch(/SET[^W]*"updatedAt"/);
-        // active is NOT touched in the machine branch — keepalive flush
-        // preserves the original behavior (only lastActiveAt is bumped here;
-        // active toggling lives in presence/timeout.ts).
-        expect(sql).not.toMatch(/SET[^W]*"active"/);
+        // specs/machine-active-recovery AC1 — 이 단언은 원래 정반대였다
+        // (`not.toMatch`). 근거는 "active toggling lives in
+        // presence/timeout.ts" 였는데, timeout.ts 는 **끄기만** 하고 켜는
+        // 주기적 경로가 어디에도 없었다. 그래서 데몬이 재연결해도 DB 의
+        // active 가 false 로 남아 머신이 계속 offline 로 보였다. 세션
+        // 브랜치는 이미 `"active" = true` 를 세팅하고 있어 비대칭이기도
+        // 했다. 의도적으로 뒤집는다.
+        expect(sql).toMatch(/SET[^W]*"active"/);
+    });
+
+    it("machine keepalive flush 가 active 를 true 로 되살린다", async () => {
+        primeMachineCacheEntry("mach-C", "user-1");
+        activityCache.queueMachineUpdate("mach-C", Date.now());
+        await flushNow();
+
+        const sql = executeRawCalls[0].strings.join("?");
+        expect(sql).toMatch(/"active"\s*=\s*true/);
     });
 
     it("flushes multiple queued machines in parallel via $executeRaw", async () => {

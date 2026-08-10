@@ -219,10 +219,19 @@ class ActivityCache {
                 // currently sorts by updatedAt, but matching the session
                 // fix keeps the two branches semantically aligned and
                 // prevents a future regression.
+                //
+                // specs/machine-active-recovery — `"active" = true` 는
+                // 나중에 추가됐다. heartbeat 도착 = 데몬 생존인데, 이
+                // UPDATE 가 lastActiveAt 만 건드리던 시절에는 재연결한
+                // 머신의 active 를 되살리는 주기적 경로가 없어 계속
+                // offline 로 남았다. 연결 시점 단발 쓰기
+                // (markMachineOnline) 만으로는 부족하다 — DB pool 이
+                // 고갈된 순간에는 그 쓰기가 통째로 유실되므로, 5초마다
+                // 도는 이 flush 가 자가 치유 경로가 된다.
                 await Promise.all(machineUpdates.map(update =>
                     db.$executeRaw`
                         UPDATE "Machine"
-                        SET "lastActiveAt" = ${new Date(update.timestamp)}
+                        SET "lastActiveAt" = ${new Date(update.timestamp)}, "active" = true
                         WHERE "accountId" = ${update.userId} AND "id" = ${update.id}
                     `
                 ));
