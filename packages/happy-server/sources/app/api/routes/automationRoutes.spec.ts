@@ -1,6 +1,6 @@
 import fastify from 'fastify';
 import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-type-provider-zod';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Fastify } from '../types';
 
 const mocks = vi.hoisted(() => ({
@@ -11,10 +11,12 @@ const mocks = vi.hoisted(() => ({
     listAutomations: vi.fn(),
     setAutomationViewerKey: vi.fn(),
     updateAutomation: vi.fn(),
+    emitAutomationUpdate: vi.fn(),
 }));
 
 vi.mock('@/storage/inTx', () => ({ inTx: (callback: (tx: unknown) => unknown) => callback({}) }));
 vi.mock('@/app/automation/automationService', () => mocks);
+vi.mock('@/app/automation/automationUpdate', () => ({ emitAutomationUpdate: mocks.emitAutomationUpdate }));
 
 import { automationRoutes } from './automationRoutes';
 
@@ -56,7 +58,25 @@ async function makeApp() {
 }
 
 describe('automationRoutes', () => {
-    beforeEach(() => vi.clearAllMocks());
+    beforeEach(() => {
+        vi.clearAllMocks();
+        process.env.HAPPY_SERVER_BACKED_AUTOMATION_ACCOUNTS = '*';
+    });
+    afterEach(() => delete process.env.HAPPY_SERVER_BACKED_AUTOMATION_ACCOUNTS);
+
+    it('keeps the API unavailable unless the authenticated account is allowlisted', async () => {
+        process.env.HAPPY_SERVER_BACKED_AUTOMATION_ACCOUNTS = 'user-2';
+        const app = await makeApp();
+        const response = await app.inject({
+            method: 'GET',
+            url: '/v1/projects/project-1/automations',
+            headers: { authorization: 'Bearer test' },
+        });
+
+        expect(response.statusCode).toBe(404);
+        expect(response.json()).toEqual({ error: 'feature-disabled' });
+        expect(mocks.listAutomations).not.toHaveBeenCalled();
+    });
 
     it('decodes encrypted create fields and derives actor/project outside the body', async () => {
         mocks.createAutomation.mockResolvedValue({ ok: true, value: record() });
@@ -85,6 +105,10 @@ describe('automationRoutes', () => {
             machineKeyEnvelope: new Uint8Array([6, 7]),
         }));
         expect(response.json().automation.payloadCiphertext).toBe('AQID');
+        expect(mocks.emitAutomationUpdate).toHaveBeenCalledWith('user-1', {
+            projectId: 'project-1', automationId: 'automation-1', revision: 1,
+            generation: 1, reason: 'upsert',
+        });
     });
 
     it('returns 409 with the latest public row for a CAS conflict', async () => {

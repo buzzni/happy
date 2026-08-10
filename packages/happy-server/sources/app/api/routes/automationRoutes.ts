@@ -13,6 +13,8 @@ import {
     type AutomationServiceError,
 } from '@/app/automation/automationService';
 import { inTx } from '@/storage/inTx';
+import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
+import { emitAutomationUpdate } from '@/app/automation/automationUpdate';
 import type { Fastify } from '../types';
 
 const paramsSchema = z.object({ projectId: z.string().min(1) });
@@ -120,11 +122,18 @@ function sendError(reply: FastifyReply, result: {
     });
 }
 
+function rejectWhenDisabled(accountId: string, reply: FastifyReply): boolean {
+    if (isServerBackedAutomationEnabled(accountId)) return false;
+    void reply.code(404).send({ error: 'feature-disabled' });
+    return true;
+}
+
 export function automationRoutes(app: Fastify) {
     app.get('/v1/projects/:projectId/automation-target', {
         preHandler: app.authenticate,
         schema: { params: paramsSchema },
     }, async (request, reply) => {
+        if (rejectWhenDisabled(request.userId, reply)) return;
         const result = await inTx((tx) => getAutomationTarget(tx, request.userId, request.params.projectId));
         if (!result.ok) return sendError(reply, result);
         return reply.send({
@@ -145,11 +154,16 @@ export function automationRoutes(app: Fastify) {
             body: z.object({ expectedKeyVersion: z.number().int().min(0), publicKey: publicKeySchema }),
         },
     }, async (request, reply) => {
+        if (rejectWhenDisabled(request.userId, reply)) return;
         const result = await inTx((tx) => setAutomationViewerKey(tx, request.userId, request.params.projectId, {
             expectedKeyVersion: request.body.expectedKeyVersion,
             publicKey: decode(request.body.publicKey),
         }));
         if (!result.ok) return sendError(reply, result);
+        await emitAutomationUpdate(request.userId, {
+            projectId: request.params.projectId,
+            reason: 'viewer-key',
+        });
         return reply.send(result.value);
     });
 
@@ -157,6 +171,7 @@ export function automationRoutes(app: Fastify) {
         preHandler: app.authenticate,
         schema: { params: paramsSchema },
     }, async (request, reply) => {
+        if (rejectWhenDisabled(request.userId, reply)) return;
         const result = await inTx((tx) => listAutomations(tx, request.userId, request.params.projectId));
         if (!result.ok) return sendError(reply, result);
         return reply.send({ automations: result.value.map(serializeAutomation) });
@@ -172,6 +187,7 @@ export function automationRoutes(app: Fastify) {
             }),
         },
     }, async (request, reply) => {
+        if (rejectWhenDisabled(request.userId, reply)) return;
         const result = await inTx((tx) => listAutomationRuns(tx, request.userId, request.params.projectId, request.query));
         if (!result.ok) return sendError(reply, result);
         return reply.send({ runs: result.value.map(serializeRun) });
@@ -181,6 +197,7 @@ export function automationRoutes(app: Fastify) {
         preHandler: app.authenticate,
         schema: { params: paramsSchema, body: createSchema },
     }, async (request, reply) => {
+        if (rejectWhenDisabled(request.userId, reply)) return;
         const result = await inTx((tx) => createAutomation(tx, request.userId, request.params.projectId, {
             ...request.body,
             payloadCiphertext: decode(request.body.payloadCiphertext),
@@ -188,6 +205,13 @@ export function automationRoutes(app: Fastify) {
             machineKeyEnvelope: decode(request.body.machineKeyEnvelope),
         }));
         if (!result.ok) return sendError(reply, result);
+        await emitAutomationUpdate(request.userId, {
+            projectId: request.params.projectId,
+            automationId: result.value.id,
+            revision: result.value.revision,
+            generation: result.value.generation,
+            reason: 'upsert',
+        });
         return reply.send({ automation: serializeAutomation(result.value) });
     });
 
@@ -195,6 +219,7 @@ export function automationRoutes(app: Fastify) {
         preHandler: app.authenticate,
         schema: { params: automationParamsSchema, body: updateSchema },
     }, async (request, reply) => {
+        if (rejectWhenDisabled(request.userId, reply)) return;
         const body = request.body;
         const input: AutomationUpdateInput = {
             expectedRevision: body.expectedRevision,
@@ -217,6 +242,13 @@ export function automationRoutes(app: Fastify) {
             input,
         ));
         if (!result.ok) return sendError(reply, result);
+        await emitAutomationUpdate(request.userId, {
+            projectId: request.params.projectId,
+            automationId: result.value.id,
+            revision: result.value.revision,
+            generation: result.value.generation,
+            reason: 'upsert',
+        });
         return reply.send({ automation: serializeAutomation(result.value) });
     });
 
@@ -227,6 +259,7 @@ export function automationRoutes(app: Fastify) {
             body: z.object({ expectedRevision: z.number().int().min(1) }),
         },
     }, async (request, reply) => {
+        if (rejectWhenDisabled(request.userId, reply)) return;
         const result = await inTx((tx) => deleteAutomation(
             tx,
             request.userId,
@@ -235,6 +268,13 @@ export function automationRoutes(app: Fastify) {
             request.body.expectedRevision,
         ));
         if (!result.ok) return sendError(reply, result);
+        await emitAutomationUpdate(request.userId, {
+            projectId: request.params.projectId,
+            automationId: result.value.id,
+            revision: result.value.revision,
+            generation: result.value.generation,
+            reason: 'delete',
+        });
         return reply.send({ automation: serializeAutomation(result.value) });
     });
 }

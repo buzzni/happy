@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const services = vi.hoisted(() => ({
     ackAutomationSync: vi.fn(),
@@ -8,14 +8,32 @@ const services = vi.hoisted(() => ({
     reportAutomationRun: vi.fn(),
     startAutomationRun: vi.fn(),
     syncAutomations: vi.fn(),
+    emitAutomationUpdate: vi.fn(),
 }));
 vi.mock('@/app/automation/automationExecutionService', () => services);
+vi.mock('@/app/automation/automationUpdate', () => ({ emitAutomationUpdate: services.emitAutomationUpdate }));
 vi.mock('@/storage/inTx', () => ({ inTx: (callback: (tx: unknown) => unknown) => callback({}) }));
 
 import { automationSocketHandler } from './automationSocketHandler';
 
 describe('automationSocketHandler', () => {
-    beforeEach(() => vi.clearAllMocks());
+    beforeEach(() => {
+        vi.clearAllMocks();
+        process.env.HAPPY_SERVER_BACKED_AUTOMATION_ACCOUNTS = '*';
+    });
+    afterEach(() => delete process.env.HAPPY_SERVER_BACKED_AUTOMATION_ACCOUNTS);
+
+    it('fails closed for a machine account outside the rollout allowlist', async () => {
+        process.env.HAPPY_SERVER_BACKED_AUTOMATION_ACCOUNTS = 'account-2';
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+
+        const callback = vi.fn();
+        await handlers.get('automation-sync')!({ afterSeq: '0', limit: 100 }, callback);
+        expect(callback).toHaveBeenCalledWith({ ok: false, error: 'feature-disabled' });
+        expect(services.syncAutomations).not.toHaveBeenCalled();
+    });
 
     it('registers the machine-only surface and ignores body identity fields', async () => {
         const handlers = new Map<string, Function>();

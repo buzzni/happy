@@ -159,6 +159,14 @@ export type UpdateEvent = {
         value: string | null; // null indicates deletion
         version: number; // -1 for deleted keys
     }>;
+} | {
+    type: 'automation-updated';
+    projectId: string | null;
+    automationId?: string;
+    runId?: string;
+    revision?: number;
+    generation?: number;
+    reason: 'viewer-key' | 'machine-key' | 'upsert' | 'delete' | 'sync' | 'run';
 };
 
 // === EPHEMERAL EVENT TYPES (Transient) ===
@@ -693,5 +701,25 @@ export function buildKVBatchUpdateUpdate(
             changes
         },
         createdAt: Date.now()
+    };
+}
+
+export function buildAutomationUpdate(
+    data: {
+        projectId: string | null;
+        automationId?: string;
+        runId?: string;
+        revision?: number;
+        generation?: number;
+        reason: 'viewer-key' | 'machine-key' | 'upsert' | 'delete' | 'sync' | 'run';
+    },
+    updateSeq: number,
+    updateId: string,
+): UpdatePayload {
+    return {
+        id: updateId,
+        seq: updateSeq,
+        body: { t: 'automation-updated', ...data },
+        createdAt: Date.now(),
     };
 }

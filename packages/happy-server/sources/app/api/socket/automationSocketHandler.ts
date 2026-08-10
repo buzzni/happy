@@ -9,6 +9,8 @@ import {
     syncAutomations,
 } from '@/app/automation/automationExecutionService';
 import { inTx } from '@/storage/inTx';
+import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
+import { emitAutomationUpdate } from '@/app/automation/automationUpdate';
 
 type Callback = (response: { ok: boolean; value?: unknown; error?: string }) => void;
 
@@ -39,9 +41,14 @@ function wire(value: unknown): unknown {
     return value;
 }
 
-async function answer(callback: Callback, operation: () => Promise<{ ok: boolean; value?: unknown; error?: string }>) {
+async function answer(
+    callback: Callback,
+    operation: () => Promise<{ ok: boolean; value?: unknown; error?: string }>,
+    onSuccess?: (value: unknown) => Promise<void>,
+) {
     try {
         const result = await operation();
+        if (result.ok && onSuccess) await onSuccess(result.value);
         callback(result.ok ? { ok: true, value: wire(result.value) } : { ok: false, error: result.error });
     } catch {
         callback({ ok: false, error: 'invalid-input' });
@@ -49,12 +56,21 @@ async function answer(callback: Callback, operation: () => Promise<{ ok: boolean
 }
 
 export function automationSocketHandler(accountId: string, machineId: string, socket: Socket): void {
-    const on = (event: string, handler: (data: any, callback: Callback) => Promise<void>) => (socket as any).on(event, handler);
+    const on = (event: string, handler: (data: any, callback: Callback) => Promise<void>) => (socket as any).on(
+        event,
+        async (data: any, callback: Callback) => {
+            if (!isServerBackedAutomationEnabled(accountId)) {
+                callback({ ok: false, error: 'feature-disabled' });
+                return;
+            }
+            await handler(data, callback);
+        },
+    );
 
     on('automation-key-register', async (data, callback) => answer(callback, () => inTx((tx) => registerAutomationMachineKey(tx, accountId, machineId, {
         expectedKeyVersion: integer(data?.expectedKeyVersion, 0, Number.MAX_SAFE_INTEGER),
         publicKey: bytes(data?.publicKey, 32, 32),
-    }))));
+    })), () => emitAutomationUpdate(accountId, { projectId: null, reason: 'machine-key' })));
 
     on('automation-sync', async (data, callback) => answer(callback, () => {
         const afterSeq = BigInt(requiredString(data?.afterSeq));
@@ -72,17 +88,25 @@ export function automationSocketHandler(accountId: string, machineId: string, so
             revision: integer(item?.revision, 1, Number.MAX_SAFE_INTEGER),
         }));
         return inTx((tx) => ackAutomationSync(tx, accountId, machineId, items));
-    }));
+    }, () => emitAutomationUpdate(accountId, { projectId: null, reason: 'sync' })));
 
     on('automation-claim', async (data, callback) => answer(callback, () => inTx((tx) => claimAutomationRun(tx, accountId, machineId, {
         automationId: requiredString(data?.automationId),
         generation: integer(data?.generation, 1, Number.MAX_SAFE_INTEGER),
         scheduledFor: new Date(integer(data?.scheduledFor, 0, Number.MAX_SAFE_INTEGER)),
-    }))));
+    })), () => emitAutomationUpdate(accountId, {
+        projectId: null,
+        automationId: requiredString(data?.automationId),
+        reason: 'run',
+    })));
 
     on('automation-run-start', async (data, callback) => answer(callback, () => inTx((tx) => startAutomationRun(tx, accountId, machineId, {
         runId: requiredString(data?.runId), claimToken: requiredString(data?.claimToken),
-    }))));
+    })), () => emitAutomationUpdate(accountId, {
+        projectId: null,
+        runId: requiredString(data?.runId),
+        reason: 'run',
+    })));
 
     on('automation-run-heartbeat', async (data, callback) => answer(callback, () => inTx((tx) => heartbeatAutomationRun(tx, accountId, machineId, {
         runId: requiredString(data?.runId), claimToken: requiredString(data?.claimToken),
@@ -102,5 +126,9 @@ export function automationSocketHandler(accountId: string, machineId: string, so
             sessionId: data?.sessionId === null ? null : requiredString(data?.sessionId),
             detailCiphertext: data?.detailCiphertext === null ? null : bytes(data?.detailCiphertext, 128 * 1024),
         }));
-    }));
+    }, () => emitAutomationUpdate(accountId, {
+            projectId: null,
+            runId: requiredString(data?.runId),
+            reason: 'run',
+        })));
 }
