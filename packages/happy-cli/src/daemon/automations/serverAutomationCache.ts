@@ -1,13 +1,7 @@
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import tweetnacl from 'tweetnacl'
-
-import {
-  findOversizedUpsertField,
-  parseScheduledAutomation,
-  type AutomationAgent,
-  type AutomationSchedule,
-} from './automationDomain'
+import { automationPayloadSchema, type AutomationPayload } from '@slopus/happy-wire'
 
 const PAYLOAD_MAX_BYTES = 128 * 1024
 const ENVELOPE_BYTES = 1 + tweetnacl.box.publicKeyLength + tweetnacl.box.nonceLength
@@ -33,15 +27,7 @@ export interface ServerAutomationCacheState {
   pendingAcknowledgements: Array<{ automationId: string; revision: number }>
 }
 
-export interface ServerAutomationPayload {
-  name: string
-  schedule: AutomationSchedule
-  prompt: string
-  directory: string
-  scriptCommand: string | null
-  suppressSilent: boolean
-  agent: AutomationAgent | null
-}
+export type ServerAutomationPayload = AutomationPayload
 
 export interface ServerAutomationCache {
   read(): ServerAutomationCacheState
@@ -228,26 +214,7 @@ export function decryptServerAutomationPayload(
   const plaintext = tweetnacl.secretbox.open(ciphertext, nonce, dek)
   if (!plaintext) throw new Error('automation-decrypt-failed')
   try {
-    const value = JSON.parse(new TextDecoder().decode(plaintext)) as Record<string, unknown>
-    const parsed = parseScheduledAutomation({
-      ...value,
-      id: automation.automationId,
-      projectId: 'server',
-      paused: automation.paused,
-      createdAt: automation.enabledAt,
-      nextRunAt: null,
-      runHistory: [],
-    })
-    if (!parsed || findOversizedUpsertField(parsed)) throw new Error()
-    return {
-      name: parsed.name,
-      schedule: parsed.schedule,
-      prompt: parsed.prompt,
-      directory: parsed.directory,
-      scriptCommand: parsed.scriptCommand,
-      suppressSilent: parsed.suppressSilent,
-      agent: parsed.agent ?? null,
-    }
+    return automationPayloadSchema.parse(JSON.parse(new TextDecoder().decode(plaintext)))
   } catch {
     throw new Error('automation-decrypt-failed')
   }

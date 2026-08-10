@@ -58,6 +58,9 @@ async function makeApp() {
 }
 
 describe('automationRoutes', () => {
+    const payloadCiphertext = new Uint8Array([1, ...new Uint8Array(40).fill(2)]);
+    const keyEnvelope = new Uint8Array([1, ...new Uint8Array(104).fill(3)]);
+
     beforeEach(() => {
         vi.clearAllMocks();
         process.env.HAPPY_SERVER_BACKED_AUTOMATION_ACCOUNTS = '*';
@@ -88,21 +91,21 @@ describe('automationRoutes', () => {
             headers: { authorization: 'Bearer test' },
             payload: {
                 payloadVersion: 1,
-                payloadCiphertext: Buffer.from([1, 2, 3]).toString('base64'),
+                payloadCiphertext: Buffer.from(payloadCiphertext).toString('base64'),
                 viewerKeyId: 'viewer-key',
                 viewerKeyVersion: 1,
-                viewerKeyEnvelope: Buffer.from([4, 5]).toString('base64'),
+                viewerKeyEnvelope: Buffer.from(keyEnvelope).toString('base64'),
                 machineKeyVersion: 1,
-                machineKeyEnvelope: Buffer.from([6, 7]).toString('base64'),
+                machineKeyEnvelope: Buffer.from(keyEnvelope).toString('base64'),
                 paused: false,
             },
         });
 
         expect(response.statusCode).toBe(200);
         expect(mocks.createAutomation).toHaveBeenCalledWith({}, 'user-1', 'project-1', expect.objectContaining({
-            payloadCiphertext: new Uint8Array([1, 2, 3]),
-            viewerKeyEnvelope: new Uint8Array([4, 5]),
-            machineKeyEnvelope: new Uint8Array([6, 7]),
+            payloadCiphertext,
+            viewerKeyEnvelope: keyEnvelope,
+            machineKeyEnvelope: keyEnvelope,
         }));
         expect(response.json().automation.payloadCiphertext).toBe('AQID');
         expect(mocks.emitAutomationUpdate).toHaveBeenCalledWith('user-1', {

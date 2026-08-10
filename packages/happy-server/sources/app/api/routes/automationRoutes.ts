@@ -2,6 +2,12 @@ import type { Automation, AutomationRun } from '@prisma/client';
 import type { FastifyReply } from 'fastify';
 import { z } from 'zod';
 import {
+    automationCreateRequestSchema as createSchema,
+    automationDeleteRequestSchema as deleteSchema,
+    automationUpdateRequestSchema as updateSchema,
+    automationViewerKeyRequestSchema as viewerKeySchema,
+} from '@slopus/happy-wire';
+import {
     createAutomation,
     deleteAutomation,
     getAutomationTarget,
@@ -19,45 +25,6 @@ import type { Fastify } from '../types';
 
 const paramsSchema = z.object({ projectId: z.string().min(1) });
 const automationParamsSchema = paramsSchema.extend({ automationId: z.string().min(1) });
-
-function base64Bytes(maxBytes: number) {
-    return z.string().min(1).max(Math.ceil(maxBytes / 3) * 4 + 4)
-        .regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/)
-        .refine((value) => Buffer.from(value, 'base64').byteLength <= maxBytes, 'decoded value is too large');
-}
-
-const publicKeySchema = base64Bytes(32).refine((value) => Buffer.from(value, 'base64').byteLength === 32);
-const payloadCiphertextSchema = base64Bytes(128 * 1024);
-const envelopeSchema = base64Bytes(512);
-const encryptedFields = {
-    payloadVersion: z.literal(1),
-    payloadCiphertext: payloadCiphertextSchema,
-    viewerKeyId: z.string().min(1).max(128),
-    viewerKeyVersion: z.number().int().min(1),
-    viewerKeyEnvelope: envelopeSchema,
-    machineKeyVersion: z.number().int().min(1),
-    machineKeyEnvelope: envelopeSchema,
-};
-const createSchema = z.object({ ...encryptedFields, paused: z.boolean().default(false) });
-const updateSchema = z.object({
-    expectedRevision: z.number().int().min(1),
-    paused: z.boolean().optional(),
-    payloadVersion: encryptedFields.payloadVersion.optional(),
-    payloadCiphertext: encryptedFields.payloadCiphertext.optional(),
-    viewerKeyId: encryptedFields.viewerKeyId.optional(),
-    viewerKeyVersion: encryptedFields.viewerKeyVersion.optional(),
-    viewerKeyEnvelope: encryptedFields.viewerKeyEnvelope.optional(),
-    machineKeyVersion: encryptedFields.machineKeyVersion.optional(),
-    machineKeyEnvelope: encryptedFields.machineKeyEnvelope.optional(),
-}).superRefine((value, ctx) => {
-    const present = Object.keys(encryptedFields).filter((key) => value[key as keyof typeof value] !== undefined).length;
-    if (present === 0 && value.paused === undefined) {
-        ctx.addIssue({ code: 'custom', message: 'patch must change paused or encrypted payload' });
-    }
-    if (present !== 0 && present !== Object.keys(encryptedFields).length) {
-        ctx.addIssue({ code: 'custom', message: 'encrypted payload fields must be replaced together' });
-    }
-});
 
 function decode(value: string): Uint8Array<ArrayBuffer> {
     return new Uint8Array(Buffer.from(value, 'base64'));
@@ -151,7 +118,7 @@ export function automationRoutes(app: Fastify) {
         preHandler: app.authenticate,
         schema: {
             params: paramsSchema,
-            body: z.object({ expectedKeyVersion: z.number().int().min(0), publicKey: publicKeySchema }),
+            body: viewerKeySchema,
         },
     }, async (request, reply) => {
         if (rejectWhenDisabled(request.userId, reply)) return;
@@ -256,7 +223,7 @@ export function automationRoutes(app: Fastify) {
         preHandler: app.authenticate,
         schema: {
             params: automationParamsSchema,
-            body: z.object({ expectedRevision: z.number().int().min(1) }),
+            body: deleteSchema,
         },
     }, async (request, reply) => {
         if (rejectWhenDisabled(request.userId, reply)) return;
