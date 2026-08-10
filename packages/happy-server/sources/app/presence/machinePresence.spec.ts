@@ -57,6 +57,16 @@ describe("machinePresence", () => {
         expect(arg.data.lastActiveAt).toEqual(new Date(2500));
     });
 
+    // 재연결 레이스: hasMachineSocket 확인과 UPDATE 사이에 새 소켓이 붙어
+    // markMachineOnline 이 먼저 커밋되면, 뒤늦게 도착한 offline 쓰기가
+    // 살아 있는 머신을 꺼버린다. lastActiveAt 가드가 그걸 막는다.
+    it("끊김 쓰기는 더 최신 활동을 덮어쓰지 않는다", async () => {
+        await markMachineOffline("user-1", "mach-1", 2500);
+
+        const where = updateManyMock.mock.calls[0][0].where;
+        expect(where.lastActiveAt).toEqual({ lte: new Date(2500) });
+    });
+
     // AC4 — DB 가 흔들려도 소켓 수명주기를 깨면 안 된다. 2026-08-06 처럼
     // pool 이 고갈된 순간에 연결까지 끊기면 장애가 증폭된다.
     it("DB 실패가 호출자에게 전파되지 않고 로그만 남는다", async () => {

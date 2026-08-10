@@ -279,7 +279,12 @@ export function startSocket(app: Fastify) {
                         await markMachineOffline(userId, connection.machineId, disconnectedAt);
                     }
                 } catch (error) {
-                    log({ module: 'websocket', level: 'error' }, `Failed to mark machine offline on disconnect: ${error}`);
+                    // markMachineOffline 은 내부에서 DB 실패를 삼키므로,
+                    // 여기 걸리는 건 사실상 hasMachineSocket (Redis 어댑터
+                    // 조회) 실패다. 대체 연결 여부를 모르면 끄지 않는다 —
+                    // 살아 있는 머신을 끄는 쪽이 더 나쁘고, 진짜로 죽었다면
+                    // timeout.ts 의 10분 스윕이 정리한다.
+                    log({ module: 'websocket', level: 'error' }, `Failed to resolve replacement machine socket on disconnect: ${error}`);
                 }
             }
         });
