@@ -62,6 +62,7 @@ import { encryptBlob } from '@/encryption/blob';
 import { readFileBytes } from '@/utils/readFileBytes';
 import { Modal } from '@/modal';
 import { t } from '@/text';
+import { emitAutomationUpdate } from './automationUpdates';
 
 type V3GetSessionMessagesResponse = {
     messages: ApiMessage[];
@@ -2140,7 +2141,9 @@ class Sync {
         const updateData = validatedUpdate.data;
         console.log(`🔄 Sync: Validated update type: ${updateData.body.t}`);
 
-        if (updateData.body.t === 'new-message') {
+        if (updateData.body.t === 'automation-updated') {
+            emitAutomationUpdate(updateData.body);
+        } else if (updateData.body.t === 'new-message') {
 
             // Get encryption — may not be ready if sessions are still syncing
             let encryption = this.encryption.getSessionEncryption(updateData.body.sid);

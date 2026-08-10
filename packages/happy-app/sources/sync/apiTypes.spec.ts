@@ -68,5 +68,20 @@ describe('ApiUpdateSchema', () => {
         });
         expect(parsed.success).toBe(true);
     });
-});
 
+    it('accepts server automation invalidation events', () => {
+        expect(ApiUpdateContainerSchema.safeParse({
+            id: 'update-automation-1',
+            seq: 43,
+            createdAt: 1700000000000,
+            body: {
+                t: 'automation-updated',
+                projectId: 'project-1',
+                automationId: 'automation-1',
+                revision: 2,
+                generation: 3,
+                reason: 'upsert',
+            },
+        }).success).toBe(true);
+    });
+});
