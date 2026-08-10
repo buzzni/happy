@@ -19,6 +19,7 @@ import {
   isAutomationDue,
   SCRIPT_TIMEOUT_MS,
   shouldWakeFromScriptOutput,
+  type AutomationAgent,
   type AutomationRunOutcome,
   type ScheduledAutomation,
 } from './automationDomain'
@@ -28,7 +29,7 @@ export interface AutomationTickInput {
   store: AutomationStore
   now: number
   runScript: (input: { command: string; cwd: string; timeout: number }) => Promise<{ ok: boolean; stdout: string; error?: string }>
-  spawnSession: (input: { directory: string; initialPrompt: string; createdByAccountId: string | null }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
+  spawnSession: (input: { directory: string; initialPrompt: string; createdByAccountId: string | null; agent: AutomationAgent }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
   isSessionRunning: (sessionId: string) => boolean
   logDebug?: (message: string) => void
 }
@@ -107,6 +108,7 @@ async function runClaimedAutomation(
     initialPrompt: buildAutomationPrompt(automation.prompt, scriptOutput),
     // 세션은 데몬 소유자 자격증명으로 뜨지만 귀속(누가 등록했나)은 남긴다.
     createdByAccountId: automation.createdByAccountId ?? null,
+    agent: automation.agent ?? 'claude',
   })
   if (!spawned.ok) {
     input.logDebug?.(`[automation-tick] ${automation.id} spawn failed: ${spawned.error}`)

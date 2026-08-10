@@ -45,6 +45,16 @@ describe('scheduled automations persistence', () => {
     expect(legacy!.createdByAccountId).toBeNull()
   })
 
+  it('preserves a supported agent and normalizes a missing or unknown agent to null', () => {
+    const [codex] = parseScheduledAutomations(JSON.stringify([makeAutomation({ agent: 'codex' })]))
+    expect(codex!.agent).toBe('codex')
+
+    const { agent: _agent, ...legacyRow } = makeAutomation({ id: 'legacy' })
+    const [legacy] = parseScheduledAutomations(JSON.stringify([legacyRow, { ...makeAutomation({ id: 'unknown' }), agent: 'other' }]))
+    expect(legacy!.agent).toBeNull()
+    expect(parseScheduledAutomations(JSON.stringify([{ ...makeAutomation({ id: 'unknown' }), agent: 'other' }]))[0]!.agent).toBeNull()
+  })
+
   it('returns empty for null, invalid JSON, and non-array payloads', () => {
     expect(parseScheduledAutomations(null)).toEqual([])
     expect(parseScheduledAutomations(undefined)).toEqual([])
