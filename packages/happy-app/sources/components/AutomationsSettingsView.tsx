@@ -63,6 +63,7 @@ export function AutomationsSettingsView() {
     );
     const [projects, setProjects] = React.useState<AutomationProject[]>([]);
     const [itemsByProject, setItemsByProject] = React.useState<Record<string, ServerAutomationItem[]>>({});
+    const [decryptFailuresByProject, setDecryptFailuresByProject] = React.useState<Record<string, number>>({});
     const [errorsByProject, setErrorsByProject] = React.useState<Record<string, string | null>>({});
     const [loadError, setLoadError] = React.useState<string | null>(null);
     const [loading, setLoading] = React.useState(true);
@@ -75,12 +76,8 @@ export function AutomationsSettingsView() {
         try {
             const result = await repository.listProject(projectId);
             setItemsByProject((current) => ({ ...current, [projectId]: result.items }));
-            setErrorsByProject((current) => ({
-                ...current,
-                [projectId]: result.failedRowCount > 0
-                    ? `${result.failedRowCount} automation${result.failedRowCount === 1 ? '' : 's'} could not be decrypted.`
-                    : null,
-            }));
+            setDecryptFailuresByProject((current) => ({ ...current, [projectId]: result.failedRowCount }));
+            setErrorsByProject((current) => ({ ...current, [projectId]: null }));
         } catch (error) {
             setErrorsByProject((current) => ({ ...current, [projectId]: errorMessage(error) }));
             throw error;
@@ -169,11 +166,15 @@ export function AutomationsSettingsView() {
             {projects.map((project) => {
                 const items = itemsByProject[project.id] ?? [];
                 const editable = project.membership !== 'viewer';
+                const decryptFailures = decryptFailuresByProject[project.id] ?? 0;
                 return (
                     <ItemGroup
                         key={project.id}
                         title={project.name}
-                        footer={errorsByProject[project.id] ?? (editable ? 'Changes run after the target daemon syncs.' : 'Viewer access is read-only.')}
+                        footer={errorsByProject[project.id]
+                            ?? (decryptFailures > 0
+                                ? `${decryptFailures} automation${decryptFailures === 1 ? '' : 's'} could not be decrypted.`
+                                : editable ? 'Changes run after the target daemon syncs.' : 'Viewer access is read-only.')}
                     >
                         {items.map((item) => (
                             <Item
