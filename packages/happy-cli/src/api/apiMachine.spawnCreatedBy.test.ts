@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
-function machineClient() {
+function machineClient(encryptionVariant: 'legacy' | 'dataKey' = 'legacy') {
     return {
         id: 'machine-1',
         encryptionKey: new Uint8Array(32),
-        encryptionVariant: 'legacy',
+        encryptionVariant,
     } as any;
 }
 
@@ -29,6 +29,44 @@ function rpcHandlers(overrides: Record<string, unknown> = {}) {
 }
 
 describe('ApiMachineClient spawn-happy-session createdBy passthrough', () => {
+    it.each([
+        { label: 'null', params: null },
+        { label: 'string', params: 'invalid' },
+        { label: 'array', params: [] },
+    ])(
+        'rejects $label spawn params before invoking spawnSession',
+        async ({ params }) => {
+            const spawnSession = vi.fn();
+            const { ApiMachineClient } = await import('./apiMachine');
+            const client = new ApiMachineClient('token', machineClient());
+            client.setRPCHandlers(rpcHandlers({ spawnSession }));
+
+            await expect(
+                handlersFrom(client).get('machine-1:spawn-happy-session')?.(params)
+            ).rejects.toThrow('Spawn parameters must be an object');
+            expect(spawnSession).not.toHaveBeenCalled();
+        }
+    );
+
+    it('rejects empty dataKey params after decrypt returns null without spawning a session', async () => {
+        const spawnSession = vi.fn();
+        const { ApiMachineClient } = await import('./apiMachine');
+        const { decodeBase64, decrypt } = await import('./encryption');
+        const machine = machineClient('dataKey');
+        const client = new ApiMachineClient('token', machine);
+        client.setRPCHandlers(rpcHandlers({ spawnSession }));
+
+        const encryptedResponse = await (client as any).rpcHandlerManager.handleRequest({
+            method: 'machine-1:spawn-happy-session',
+            params: '',
+        });
+
+        expect(decrypt(machine.encryptionKey, 'dataKey', decodeBase64(encryptedResponse))).toEqual({
+            error: 'Spawn parameters must be an object',
+        });
+        expect(spawnSession).not.toHaveBeenCalled();
+    });
+
     it('forwards only the encrypted MCP caller grant envelope to spawnSession', async () => {
         const spawnSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-1' });
         const { ApiMachineClient } = await import('./apiMachine');
