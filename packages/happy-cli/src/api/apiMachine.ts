@@ -59,6 +59,8 @@ import {
     listCodexRewindPoints,
 } from '@/codex/codexThreadFork';
 import type { MachineAutomationKey } from '@/daemon/automations/machineAutomationKey';
+import type { ServerAutomationCache } from '@/daemon/automations/serverAutomationCache';
+import { syncServerAutomationDeltas } from '@/daemon/automations/serverAutomationSync';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -108,6 +110,18 @@ interface DaemonToServerEvents {
     }, cb: (answer: {
         ok: boolean;
         value?: { keyVersion: number };
+        error?: string;
+    }) => void) => void;
+    'automation-sync': (data: { afterSeq: string; limit: number }, cb: (answer: {
+        ok: boolean;
+        value?: unknown;
+        error?: string;
+    }) => void) => void;
+    'automation-sync-ack': (data: {
+        items: Array<{ automationId: string; revision: number }>;
+    }, cb: (answer: {
+        ok: boolean;
+        value?: unknown;
         error?: string;
     }) => void) => void;
     'machine-alive': (data: {
@@ -209,6 +223,8 @@ export class ApiMachineClient {
     private persistAutomationKeyVersion: ((version: number) => void) | null = null;
     private automationServerKeyVersion: number | null = null;
     private lastKnownAutomationServerKeyVersion: number | null = null;
+    private serverAutomationCache: ServerAutomationCache | null = null;
+    private serverAutomationSyncInFlight: Promise<void> | null = null;
     private rpcHandlerManager: RpcHandlerManager;
     // Live raw-TCP tunnels for preview WebSocket upgrades (previewWsProxy.ts).
     private previewWsProxy: PreviewWsProxy | null = null;
@@ -706,6 +722,26 @@ export class ApiMachineClient {
         this.persistAutomationKeyVersion = persistVersion;
     }
 
+    setServerAutomationCache(cache: ServerAutomationCache): void {
+        this.serverAutomationCache = cache;
+    }
+
+    private requestServerAutomationSync(): void {
+        if (!this.serverAutomationCache || this.serverAutomationSyncInFlight) return;
+        const sync = syncServerAutomationDeltas({
+            cache: this.serverAutomationCache,
+            sync: (request) => this.socket.emitWithAck('automation-sync', request),
+            ack: (request) => this.socket.emitWithAck('automation-sync-ack', request),
+        }).then((result) => {
+            if (result.changed > 0) logger.debug(`[API MACHINE] Applied ${result.changed} automation delta(s)`);
+        }).catch((error) => {
+            logger.debug(`[API MACHINE] Automation sync failed: ${error}`);
+        }).finally(() => {
+            this.serverAutomationSyncInFlight = null;
+        });
+        this.serverAutomationSyncInFlight = sync;
+    }
+
     private async registerAutomationKey(): Promise<void> {
         const key = this.automationKey;
         if (!key) return;
@@ -723,6 +759,7 @@ export class ApiMachineClient {
             this.automationKey = { ...key, registeredKeyVersion: keyVersion };
         }
         this.automationServerKeyVersion = keyVersion;
+        this.requestServerAutomationSync();
         await this.updateMachineMetadata((metadata) => ({
             ...(metadata || {} as any),
             automationSupport: {
@@ -1157,6 +1194,7 @@ export class ApiMachineClient {
                 logger.debugLargeJson(`[API MACHINE] Emitting machine-alive`, payload);
             }
             this.socket.emit('machine-alive', payload);
+            if (this.automationServerKeyVersion !== null) this.requestServerAutomationSync();
 
             // Re-detect CLI availability and push metadata update if changed
             const newAvailability = detectCLIAvailability();

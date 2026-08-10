@@ -32,6 +32,7 @@ class Configuration {
   public readonly sessionsFile: string
   public readonly automationsFile: string
   public readonly automationKeyFile: string
+  public readonly serverAutomationsCacheFile: string
   public readonly currentCliVersion: string
 
   public readonly isExperimentalEnabled: boolean
@@ -65,6 +66,7 @@ class Configuration {
     this.sessionsFile = join(this.happyHomeDir, 'sessions.json')
     this.automationsFile = join(this.happyHomeDir, 'automations.json')
     this.automationKeyFile = join(this.happyHomeDir, 'automation-key.v1.json')
+    this.serverAutomationsCacheFile = join(this.happyHomeDir, 'server-automations.v1.json')
 
     // URL precedence (both): HAPPY_*_URL env > settings.<key> > default.
     // Settings are read sync here (avoid circular import with persistence.ts).

@@ -174,4 +174,43 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('machine-update-metadata', expect.any(Object));
         client.shutdown();
     });
+
+    it('syncs encrypted automation deltas after key registration and acknowledges only after cache apply', async () => {
+        let cursor = 0n;
+        const cache = {
+            read: vi.fn(() => ({ cursor, serverTime: 0, automations: [], pendingAcknowledgements: [] })),
+            applySync: vi.fn(() => {
+                cursor = 1n;
+                return { nextSeq: 1n, acknowledgements: [{ automationId: 'automation-1', revision: 1 }] };
+            }),
+            markAcknowledged: vi.fn(),
+        };
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 1 } };
+            if (event === 'automation-sync') return { ok: true, value: {
+                serverTime: 10, nextSeq: '1', changes: [{ seq: '1' }],
+            } };
+            if (event === 'automation-sync-ack') return { ok: true, value: { acknowledged: 1 } };
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            return { result: 'success' };
+        });
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        (client as any).setAutomationKey({
+            version: 1,
+            publicKey: new Uint8Array(32).fill(7),
+            secretKey: new Uint8Array(32).fill(8),
+            registeredKeyVersion: 1,
+        }, vi.fn());
+        (client as any).setServerAutomationCache(cache);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(cache.markAcknowledged).toHaveBeenCalled());
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-sync', { afterSeq: '0', limit: 500 });
+        expect(cache.applySync.mock.invocationCallOrder[0]).toBeLessThan(cache.markAcknowledged.mock.invocationCallOrder[0]!);
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-sync-ack', {
+            items: [{ automationId: 'automation-1', revision: 1 }],
+        });
+        client.shutdown();
+    });
 });
