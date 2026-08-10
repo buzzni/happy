@@ -29,6 +29,7 @@ import { useProfile } from '@/sync/storage';
 import { getDisplayName, getAvatarUrl, getBio } from '@/sync/profile';
 import { Avatar } from '@/components/Avatar';
 import { t } from '@/text';
+import { automationPreviewConfirmation } from '@/components/automationPreview';
 
 type BuildConfig = {
     buildCommitSha?: unknown;
@@ -165,6 +166,15 @@ export const SettingsView = React.memo(function SettingsView() {
     const [connectingAnthropic, connectAnthropic] = useHappyAction(async () => {
         router.push('/settings/connect/claude');
     });
+
+    const handleScheduledAutomations = async () => {
+        const confirmed = await Modal.confirm(
+            automationPreviewConfirmation.title,
+            automationPreviewConfirmation.message,
+            { confirmText: automationPreviewConfirmation.confirmText, cancelText: automationPreviewConfirmation.cancelText },
+        );
+        if (confirmed) router.push('/settings/automations' as any);
+    };
 
     // Anthropic disconnection
     const [disconnectingAnthropic, handleDisconnectAnthropic] = useHappyAction(async () => {
@@ -389,10 +399,10 @@ export const SettingsView = React.memo(function SettingsView() {
                     onPress={() => router.push('/settings/agents' as any)}
                 />
                 <Item
-                    title="Scheduled Automations"
-                    subtitle="Manage shared project schedules and run history"
+                    title="Scheduled Automations · Internal Preview"
+                    subtitle="Administrator-only test feature. Public release is planned later."
                     icon={<Ionicons name="time-outline" size={29} color="#AF52DE" />}
-                    onPress={() => router.push('/settings/automations' as any)}
+                    onPress={handleScheduledAutomations}
                 />
                 <Item
                     title={t('settings.featuresTitle')}

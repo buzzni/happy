@@ -149,7 +149,7 @@ export function AutomationsSettingsView() {
 
     return (
         <ItemList style={{ paddingTop: 0 }}>
-            <ItemGroup footer={loadError ?? 'Automations are encrypted end to end. Server failures never create a local mutation queue.'}>
+            <ItemGroup footer={loadError ?? 'Internal preview: administrator-only test feature. Public release is planned later.'}>
                 <Item
                     title="Scheduled Automations"
                     subtitle="Shared with Desktop through Happy Server"
