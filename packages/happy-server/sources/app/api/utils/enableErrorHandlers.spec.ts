@@ -90,6 +90,23 @@ describe("enableErrorHandlers — 에러 로그 폭주 방지", () => {
         expect(errorLogCount()).toBe(2);
     });
 
+    // code 가 없는 예외들이 한 통에 묶이면, 평상시 드물게 나는 별개 버그가
+    // 서로를 가린다. name 까지 키에 넣어 구분한다.
+    it("code 가 없는 서로 다른 예외는 서로를 가리지 않는다", async () => {
+        const { app, captured } = fakeApp();
+        enableErrorHandlers(app, { skipNotFoundHandler: true });
+
+        const typeError = new TypeError("x is not a function") as FastifyError;
+        typeError.statusCode = 500;
+        const rangeError = new RangeError("out of range") as FastifyError;
+        rangeError.statusCode = 500;
+
+        await captured.errorHandler!(typeError, req, reply);
+        await captured.errorHandler!(rangeError, req, reply);
+
+        expect(errorLogCount()).toBe(2);
+    });
+
     // AC5
     it("4xx 는 억제하지 않는다", async () => {
         const { app, captured } = fakeApp();
