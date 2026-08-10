@@ -1,0 +1,364 @@
+import type { Automation, Prisma } from '@prisma/client';
+
+type Tx = Prisma.TransactionClient;
+
+export type AutomationServiceError =
+    | 'not-found'
+    | 'forbidden'
+    | 'automation-target-unavailable'
+    | 'viewer-key-unavailable'
+    | 'viewer-key-version-conflict'
+    | 'machine-key-version-conflict'
+    | 'invalid-payload-update'
+    | 'revision-conflict';
+
+export type AutomationServiceResult<T> =
+    | { ok: true; value: T }
+    | { ok: false; error: AutomationServiceError; latest?: Automation };
+
+type Binary = Uint8Array<ArrayBuffer>;
+
+interface AutomationPayloadInput {
+    payloadVersion: number;
+    payloadCiphertext: Binary;
+    viewerKeyId: string;
+    viewerKeyVersion: number;
+    viewerKeyEnvelope: Binary;
+    machineKeyVersion: number;
+    machineKeyEnvelope: Binary;
+}
+
+export interface AutomationCreateInput extends AutomationPayloadInput {
+    paused: boolean;
+}
+
+export interface AutomationUpdateInput {
+    expectedRevision: number;
+    paused?: boolean;
+    payloadVersion?: number;
+    payloadCiphertext?: Binary;
+    viewerKeyId?: string;
+    viewerKeyVersion?: number;
+    viewerKeyEnvelope?: Binary;
+    machineKeyVersion?: number;
+    machineKeyEnvelope?: Binary;
+}
+
+interface ProjectAccess {
+    project: {
+        id: string;
+        accountId: string;
+        config: unknown;
+        automationViewerPublicKey: Binary | null;
+        automationViewerKeyVersion: number;
+    };
+    canEdit: boolean;
+    canManageKeys: boolean;
+}
+
+interface AutomationTarget {
+    machineAccountId: string;
+    machineId: string;
+    machinePublicKey: Binary;
+    machineKeyVersion: number;
+}
+
+async function projectAccess(tx: Tx, actorId: string, projectId: string): Promise<ProjectAccess | null> {
+    const project = await tx.project.findUnique({
+        where: { id: projectId },
+        select: {
+            id: true,
+            accountId: true,
+            config: true,
+            automationViewerPublicKey: true,
+            automationViewerKeyVersion: true,
+        },
+    });
+    if (!project) return null;
+    if (project.accountId === actorId) return { project, canEdit: true, canManageKeys: true };
+
+    const member = await tx.projectMember.findUnique({
+        where: { projectId_accountId: { projectId, accountId: actorId } },
+        select: { role: true, status: true },
+    });
+    if (!member || member.status !== 'accepted') return null;
+    return {
+        project,
+        canEdit: member.role === 'owner' || member.role === 'editor',
+        canManageKeys: member.role === 'owner',
+    };
+}
+
+async function targetForProject(tx: Tx, project: ProjectAccess['project']): Promise<AutomationTarget | null> {
+    const machineId = typeof project.config === 'object' && project.config !== null
+        && typeof (project.config as { machineId?: unknown }).machineId === 'string'
+        ? (project.config as { machineId: string }).machineId
+        : null;
+    if (!machineId) return null;
+
+    const machine = await tx.machine.findUnique({
+        where: { id: machineId },
+        select: { id: true, accountId: true, automationPublicKey: true, automationKeyVersion: true },
+    });
+    if (!machine?.automationPublicKey || machine.automationKeyVersion < 1) return null;
+    return {
+        machineAccountId: machine.accountId,
+        machineId: machine.id,
+        machinePublicKey: machine.automationPublicKey,
+        machineKeyVersion: machine.automationKeyVersion,
+    };
+}
+
+export interface AutomationTargetView {
+    machineAccountId: string;
+    machineId: string;
+    machinePublicKey: Binary;
+    machineKeyVersion: number;
+    viewerPublicKey: Binary | null;
+    viewerKeyVersion: number;
+}
+
+export async function getAutomationTarget(
+    tx: Tx,
+    actorId: string,
+    projectId: string,
+): Promise<AutomationServiceResult<AutomationTargetView>> {
+    const access = await projectAccess(tx, actorId, projectId);
+    if (!access) return { ok: false, error: 'not-found' };
+    const target = await targetForProject(tx, access.project);
+    if (!target) return { ok: false, error: 'automation-target-unavailable' };
+    return {
+        ok: true,
+        value: {
+            machineAccountId: target.machineAccountId,
+            machineId: target.machineId,
+            machinePublicKey: target.machinePublicKey,
+            machineKeyVersion: target.machineKeyVersion,
+            viewerPublicKey: access.project.automationViewerPublicKey,
+            viewerKeyVersion: access.project.automationViewerKeyVersion,
+        },
+    };
+}
+
+export async function setAutomationViewerKey(
+    tx: Tx,
+    actorId: string,
+    projectId: string,
+    input: { expectedKeyVersion: number; publicKey: Binary },
+): Promise<AutomationServiceResult<{ keyVersion: number }>> {
+    const access = await projectAccess(tx, actorId, projectId);
+    if (!access) return { ok: false, error: 'not-found' };
+    if (!access.canManageKeys) return { ok: false, error: 'forbidden' };
+    const changed = await tx.project.updateMany({
+        where: { id: projectId, automationViewerKeyVersion: input.expectedKeyVersion },
+        data: {
+            automationViewerPublicKey: input.publicKey,
+            automationViewerKeyVersion: { increment: 1 },
+        },
+    });
+    if (changed.count === 0) return { ok: false, error: 'viewer-key-version-conflict' };
+    return { ok: true, value: { keyVersion: input.expectedKeyVersion + 1 } };
+}
+
+function validateKeyVersions(
+    project: ProjectAccess['project'],
+    target: AutomationTarget,
+    input: Pick<AutomationPayloadInput, 'viewerKeyVersion' | 'machineKeyVersion'>,
+): AutomationServiceError | null {
+    if (!project.automationViewerPublicKey || project.automationViewerKeyVersion < 1) {
+        return 'viewer-key-unavailable';
+    }
+    if (input.viewerKeyVersion !== project.automationViewerKeyVersion) {
+        return 'viewer-key-version-conflict';
+    }
+    if (input.machineKeyVersion !== target.machineKeyVersion) {
+        return 'machine-key-version-conflict';
+    }
+    return null;
+}
+
+async function appendChange(
+    tx: Tx,
+    automation: Pick<Automation, 'id' | 'revision' | 'generation'>,
+    target: { machineAccountId: string; machineId: string },
+    kind: 'UPSERT' | 'TOMBSTONE',
+): Promise<void> {
+    await tx.automationChange.create({
+        data: {
+            automationId: automation.id,
+            machineAccountId: target.machineAccountId,
+            machineId: target.machineId,
+            revision: automation.revision,
+            generation: automation.generation,
+            kind,
+        },
+    });
+}
+
+export async function listAutomations(
+    tx: Tx,
+    actorId: string,
+    projectId: string,
+): Promise<AutomationServiceResult<Automation[]>> {
+    const access = await projectAccess(tx, actorId, projectId);
+    if (!access) return { ok: false, error: 'not-found' };
+    const rows = await tx.automation.findMany({
+        where: { projectId, deletedAt: null },
+        orderBy: { createdAt: 'desc' },
+    });
+    return { ok: true, value: rows };
+}
+
+export async function createAutomation(
+    tx: Tx,
+    actorId: string,
+    projectId: string,
+    input: AutomationCreateInput,
+): Promise<AutomationServiceResult<Automation>> {
+    const access = await projectAccess(tx, actorId, projectId);
+    if (!access) return { ok: false, error: 'not-found' };
+    if (!access.canEdit) return { ok: false, error: 'forbidden' };
+    const target = await targetForProject(tx, access.project);
+    if (!target) return { ok: false, error: 'automation-target-unavailable' };
+    const keyError = validateKeyVersions(access.project, target, input);
+    if (keyError) return { ok: false, error: keyError };
+
+    const data: Prisma.AutomationUncheckedCreateInput = {
+        projectId,
+        ownerAccountId: actorId,
+        machineAccountId: target.machineAccountId,
+        machineId: target.machineId,
+        ...input,
+    };
+    const row = await tx.automation.create({ data });
+    await appendChange(tx, row, target, 'UPSERT');
+    return { ok: true, value: row };
+}
+
+function hasPayloadUpdate(input: AutomationUpdateInput): boolean {
+    return input.payloadVersion !== undefined
+        || input.payloadCiphertext !== undefined
+        || input.viewerKeyId !== undefined
+        || input.viewerKeyVersion !== undefined
+        || input.viewerKeyEnvelope !== undefined
+        || input.machineKeyVersion !== undefined
+        || input.machineKeyEnvelope !== undefined;
+}
+
+function completePayloadUpdate(input: AutomationUpdateInput): input is AutomationUpdateInput & AutomationPayloadInput {
+    return input.payloadVersion !== undefined
+        && input.payloadCiphertext !== undefined
+        && input.viewerKeyId !== undefined
+        && input.viewerKeyVersion !== undefined
+        && input.viewerKeyEnvelope !== undefined
+        && input.machineKeyVersion !== undefined
+        && input.machineKeyEnvelope !== undefined;
+}
+
+export async function updateAutomation(
+    tx: Tx,
+    actorId: string,
+    projectId: string,
+    automationId: string,
+    input: AutomationUpdateInput,
+): Promise<AutomationServiceResult<Automation>> {
+    const access = await projectAccess(tx, actorId, projectId);
+    if (!access) return { ok: false, error: 'not-found' };
+    if (!access.canEdit) return { ok: false, error: 'forbidden' };
+    const current = await tx.automation.findFirst({ where: { id: automationId, projectId, deletedAt: null } });
+    if (!current) return { ok: false, error: 'not-found' };
+
+    const payloadUpdate = hasPayloadUpdate(input);
+    if (!payloadUpdate && input.paused === undefined) {
+        return { ok: false, error: 'invalid-payload-update' };
+    }
+    let target: AutomationTarget | null = null;
+    if (payloadUpdate) {
+        if (!completePayloadUpdate(input)) return { ok: false, error: 'invalid-payload-update' };
+        target = await targetForProject(tx, access.project);
+        if (!target) return { ok: false, error: 'automation-target-unavailable' };
+        const keyError = validateKeyVersions(access.project, target, input);
+        if (keyError) return { ok: false, error: keyError };
+    }
+
+    const data: Prisma.AutomationUncheckedUpdateManyInput = {
+        revision: { increment: 1 },
+        generation: { increment: 1 },
+        ...(input.paused !== undefined ? { paused: input.paused } : {}),
+        ...(target && completePayloadUpdate(input) ? {
+            machineAccountId: target.machineAccountId,
+            machineId: target.machineId,
+            payloadVersion: input.payloadVersion,
+            payloadCiphertext: input.payloadCiphertext,
+            viewerKeyId: input.viewerKeyId,
+            viewerKeyVersion: input.viewerKeyVersion,
+            viewerKeyEnvelope: input.viewerKeyEnvelope,
+            machineKeyVersion: input.machineKeyVersion,
+            machineKeyEnvelope: input.machineKeyEnvelope,
+        } : {}),
+    };
+    const updatedCount = await tx.automation.updateMany({
+        where: { id: automationId, projectId, revision: input.expectedRevision, deletedAt: null },
+        data,
+    });
+    if (updatedCount.count === 0) {
+        const latest = await tx.automation.findFirst({ where: { id: automationId, projectId, deletedAt: null } });
+        return latest
+            ? { ok: false, error: 'revision-conflict', latest }
+            : { ok: false, error: 'not-found' };
+    }
+
+    const updated = await tx.automation.findUnique({ where: { id: automationId } });
+    if (!updated) return { ok: false, error: 'not-found' };
+    const previousTarget = current.machineAccountId && current.machineId
+        ? { machineAccountId: current.machineAccountId, machineId: current.machineId }
+        : null;
+    const nextTarget = updated.machineAccountId && updated.machineId
+        ? { machineAccountId: updated.machineAccountId, machineId: updated.machineId }
+        : null;
+    if (previousTarget && nextTarget
+        && (previousTarget.machineAccountId !== nextTarget.machineAccountId || previousTarget.machineId !== nextTarget.machineId)) {
+        await appendChange(tx, updated, previousTarget, 'TOMBSTONE');
+    }
+    if (nextTarget) await appendChange(tx, updated, nextTarget, 'UPSERT');
+    return { ok: true, value: updated };
+}
+
+export async function deleteAutomation(
+    tx: Tx,
+    actorId: string,
+    projectId: string,
+    automationId: string,
+    expectedRevision: number,
+): Promise<AutomationServiceResult<Automation>> {
+    const access = await projectAccess(tx, actorId, projectId);
+    if (!access) return { ok: false, error: 'not-found' };
+    if (!access.canEdit) return { ok: false, error: 'forbidden' };
+    const current = await tx.automation.findFirst({ where: { id: automationId, projectId, deletedAt: null } });
+    if (!current) return { ok: false, error: 'not-found' };
+
+    const changed = await tx.automation.updateMany({
+        where: { id: automationId, projectId, revision: expectedRevision, deletedAt: null },
+        data: {
+            revision: { increment: 1 },
+            generation: { increment: 1 },
+            deletedAt: new Date(),
+        },
+    });
+    if (changed.count === 0) {
+        const latest = await tx.automation.findFirst({ where: { id: automationId, projectId, deletedAt: null } });
+        return latest
+            ? { ok: false, error: 'revision-conflict', latest }
+            : { ok: false, error: 'not-found' };
+    }
+
+    const updated = await tx.automation.findUnique({ where: { id: automationId } });
+    if (!updated) return { ok: false, error: 'not-found' };
+    if (current.machineAccountId && current.machineId) {
+        await appendChange(tx, updated, {
+            machineAccountId: current.machineAccountId,
+            machineId: current.machineId,
+        }, 'TOMBSTONE');
+    }
+    return { ok: true, value: updated };
+}
