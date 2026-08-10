@@ -27,6 +27,14 @@ export async function registerAutomationMachineKey(
     machineId: string,
     input: { expectedKeyVersion: number; publicKey: Binary },
 ): Promise<Result<{ keyVersion: number }>> {
+    const current = await tx.machine.findFirst({
+        where: { id: machineId, accountId },
+        select: { automationPublicKey: true, automationKeyVersion: true },
+    });
+    if (current?.automationPublicKey
+        && Buffer.from(current.automationPublicKey).equals(Buffer.from(input.publicKey))) {
+        return { ok: true, value: { keyVersion: current.automationKeyVersion } };
+    }
     const changed = await tx.machine.updateMany({
         where: { id: machineId, accountId, automationKeyVersion: input.expectedKeyVersion },
         data: { automationPublicKey: input.publicKey, automationKeyVersion: { increment: 1 } },

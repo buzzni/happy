@@ -39,6 +39,7 @@ vi.mock('@/api/rpc/RpcHandlerManager', () => ({
         handleRequest = vi.fn(async () => '');
         registerHandler = vi.fn();
         unregisterHandler = vi.fn();
+        hasHandler = vi.fn(() => false);
     }
 }));
 
@@ -143,6 +144,34 @@ describe('ApiMachineClient socket reconnection', () => {
         await vi.advanceTimersByTimeAsync(3000);
         expect(mockSocket.connect).toHaveBeenCalledTimes(2);
 
+        client.shutdown();
+    });
+
+    it('registers the persistent automation public key on connect and persists the acknowledged version', async () => {
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 4 } };
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            return { result: 'success' };
+        });
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const persistVersion = vi.fn();
+        (client as any).setAutomationKey({
+            version: 1,
+            publicKey: new Uint8Array(32).fill(7),
+            secretKey: new Uint8Array(32).fill(8),
+            registeredKeyVersion: 3,
+        }, persistVersion);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(persistVersion).toHaveBeenCalledWith(4));
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-key-register', {
+            expectedKeyVersion: 3,
+            publicKey: Buffer.from(new Uint8Array(32).fill(7)).toString('base64'),
+        });
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('machine-update-metadata', expect.any(Object));
         client.shutdown();
     });
 });

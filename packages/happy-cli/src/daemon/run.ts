@@ -73,6 +73,10 @@ import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
 import { createAutomationTickRunner } from './automations/automationTickRunner';
 import { runAutomationScript } from './automations/runAutomationScript';
+import {
+  loadOrCreateMachineAutomationKey,
+  updateMachineAutomationKeyRegistration,
+} from './automations/machineAutomationKey';
 import { resolveAllowedRoot } from '@/modules/common/resolveAllowedRoot';
 import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
@@ -235,6 +239,7 @@ export async function startDaemon(): Promise<void> {
     // Ensure auth and machine registration BEFORE anything else
     const { credentials, machineId } = await authAndSetupMachineIfNeeded();
     logger.debug('[DAEMON RUN] Auth and machine setup complete');
+    let machineAutomationKey = loadOrCreateMachineAutomationKey(configuration.automationKeyFile);
     const mcpCallerGrantKeyPair = tweetnacl.box.keyPair();
     const mcpCallerGrantConsumer = new McpCallerGrantEnvelopeConsumer({
       machineId,
@@ -1400,6 +1405,13 @@ export async function startDaemon(): Promise<void> {
 
     // Create realtime machine session
     const apiMachine = api.machineSyncClient(machine);
+    apiMachine.setAutomationKey(machineAutomationKey, (keyVersion) => {
+      machineAutomationKey = updateMachineAutomationKeyRegistration(
+        configuration.automationKeyFile,
+        machineAutomationKey,
+        keyVersion,
+      );
+    });
 
     // Set RPC handlers
     apiMachine.setRPCHandlers({

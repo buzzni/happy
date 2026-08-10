@@ -26,7 +26,10 @@ function automation(patch: Record<string, unknown> = {}) {
 function makeTx() {
     const row = automation();
     return {
-        machine: { updateMany: vi.fn(async () => ({ count: 1 })) },
+        machine: {
+            updateMany: vi.fn(async () => ({ count: 1 })),
+            findFirst: vi.fn(),
+        },
         automationChange: { findMany: vi.fn(async () => [{
             seq: 9n, automationId: 'automation-1', revision: 2, generation: 3, kind: 'UPSERT',
             machineAccountId: 'account-1', machineId: 'machine-1', createdAt: now,
@@ -57,6 +60,18 @@ describe('automationExecutionService', () => {
             where: { id: 'machine-1', accountId: 'account-1', automationKeyVersion: 3 },
             data: { automationPublicKey: new Uint8Array(32), automationKeyVersion: { increment: 1 } },
         });
+    });
+
+    it('recovers idempotently when the server committed the same key before the daemon saved its version', async () => {
+        const tx = makeTx();
+        const publicKey = new Uint8Array(32);
+        tx.machine.updateMany.mockResolvedValue({ count: 0 });
+        tx.machine.findFirst.mockResolvedValue({ automationPublicKey: publicKey, automationKeyVersion: 4 });
+
+        await expect(registerAutomationMachineKey(tx as never, 'account-1', 'machine-1', {
+            expectedKeyVersion: 3,
+            publicKey,
+        })).resolves.toEqual({ ok: true, value: { keyVersion: 4 } });
     });
 
     it('returns only machine-targeted deltas without the viewer envelope', async () => {

@@ -151,6 +151,8 @@ export const MachineMetadataSchema = z.object({
   /** Scheduled automations RPC(automation-upsert/remove/list) 지원 여부 광고. */
   automationSupport: z.object({
     rpcAvailable: z.boolean(),
+    serverBacked: z.boolean().optional(),
+    keyVersion: z.number().int().min(1).optional(),
   }).optional(),
 })
 

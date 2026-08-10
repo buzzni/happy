@@ -58,6 +58,7 @@ import {
     forkCodexThread,
     listCodexRewindPoints,
 } from '@/codex/codexThreadFork';
+import type { MachineAutomationKey } from '@/daemon/automations/machineAutomationKey';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -101,6 +102,14 @@ interface ServerToDaemonEvents {
 }
 
 interface DaemonToServerEvents {
+    'automation-key-register': (data: {
+        expectedKeyVersion: number;
+        publicKey: string;
+    }, cb: (answer: {
+        ok: boolean;
+        value?: { keyVersion: number };
+        error?: string;
+    }) => void) => void;
     'machine-alive': (data: {
         machineId: string;
         time: number;
@@ -196,6 +205,10 @@ export class ApiMachineClient {
     // automationStore). Advertised as metadata.automationSupport.rpcAvailable.
     private automationRpcAvailable = false;
     private lastKnownAutomationRpcAvailable: boolean | null = null;
+    private automationKey: MachineAutomationKey | null = null;
+    private persistAutomationKeyVersion: ((version: number) => void) | null = null;
+    private automationServerKeyVersion: number | null = null;
+    private lastKnownAutomationServerKeyVersion: number | null = null;
     private rpcHandlerManager: RpcHandlerManager;
     // Live raw-TCP tunnels for preview WebSocket upgrades (previewWsProxy.ts).
     private previewWsProxy: PreviewWsProxy | null = null;
@@ -688,6 +701,38 @@ export class ApiMachineClient {
         // and happy-server already sees it to rewrite HTML).
     }
 
+    setAutomationKey(key: MachineAutomationKey, persistVersion: (version: number) => void): void {
+        this.automationKey = key;
+        this.persistAutomationKeyVersion = persistVersion;
+    }
+
+    private async registerAutomationKey(): Promise<void> {
+        const key = this.automationKey;
+        if (!key) return;
+        const answer = await this.socket.emitWithAck('automation-key-register', {
+            expectedKeyVersion: key.registeredKeyVersion,
+            publicKey: Buffer.from(key.publicKey).toString('base64'),
+        });
+        if (!answer.ok || !answer.value || !Number.isSafeInteger(answer.value.keyVersion)) {
+            logger.debug(`[API MACHINE] Automation key registration unavailable: ${answer.error ?? 'invalid-response'}`);
+            return;
+        }
+        const keyVersion = answer.value.keyVersion;
+        if (keyVersion !== key.registeredKeyVersion) {
+            this.persistAutomationKeyVersion?.(keyVersion);
+            this.automationKey = { ...key, registeredKeyVersion: keyVersion };
+        }
+        this.automationServerKeyVersion = keyVersion;
+        await this.updateMachineMetadata((metadata) => ({
+            ...(metadata || {} as any),
+            automationSupport: {
+                rpcAvailable: this.automationRpcAvailable,
+                serverBacked: true,
+                keyVersion,
+            },
+        }));
+    }
+
     private syncResumeSessionRpcRegistration(): void {
         const method = 'resume-happy-session';
 
@@ -812,6 +857,9 @@ export class ApiMachineClient {
                 httpPort: this.machine.daemonState?.httpPort,
                 startedAt: Date.now()
             }));
+            void this.registerAutomationKey().catch((error) => {
+                logger.debug(`[API MACHINE] Failed to register automation key: ${error}`);
+            });
 
             this.rpcHandlerManager.onSocketConnect(this.socket);
             this.syncResumeSessionRpcRegistration();
@@ -1123,19 +1171,25 @@ export class ApiMachineClient {
                 || prevResume.happyAgentAuthenticated !== newResumeSupport.happyAgentAuthenticated;
             const cliVersionChanged = prevCliVersion !== newCliVersion;
             const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable;
+            const automationServerKeyChanged = this.lastKnownAutomationServerKeyVersion !== this.automationServerKeyVersion;
 
             this.syncResumeSessionRpcRegistration();
 
-            if (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged) {
+            if (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || automationServerKeyChanged) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
                 this.lastKnownAutomationRpcAvailable = this.automationRpcAvailable;
+                this.lastKnownAutomationServerKeyVersion = this.automationServerKeyVersion;
                 this.updateMachineMetadata((metadata) => ({
                     ...(metadata || {} as any),
                     cliAvailability: newAvailability,
                     resumeSupport: { ...newResumeSupport, rpcAvailable: !!this.resumeSessionHandler },
-                    automationSupport: { rpcAvailable: this.automationRpcAvailable },
+                    automationSupport: {
+                        rpcAvailable: this.automationRpcAvailable,
+                        serverBacked: this.automationServerKeyVersion !== null,
+                        ...(this.automationServerKeyVersion !== null ? { keyVersion: this.automationServerKeyVersion } : {}),
+                    },
                     happyCliVersion: newCliVersion,
                 })).catch((err) => {
                     logger.debug('[API MACHINE] Failed to update machine capabilities:', err);
