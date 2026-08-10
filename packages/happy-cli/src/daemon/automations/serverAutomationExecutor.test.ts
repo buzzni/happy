@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { runServerAutomationTick } from './serverAutomationExecutor'
 import type { ServerAutomationRuntimeState } from './serverAutomationRuntimeStore'
@@ -56,6 +56,8 @@ function setup(options: { generation?: number; claim?: { ok: boolean; value?: an
 }
 
 describe('runServerAutomationTick', () => {
+  afterEach(() => vi.useRealTimers())
+
   it('fails closed without running user code when the server claim fails', async () => {
     const { input, store, transport, runScript, spawnSession, now } = setup()
 
@@ -96,5 +98,53 @@ describe('runServerAutomationTick', () => {
     expect(store.state().schedules).toEqual([expect.objectContaining({
       automationId: 'automation-1', generation: 3, nextRunAt: now + 15 * 60_000,
     })])
+  })
+
+  it.each(['claim-denied', 'already-claimed'])('advances without catch-up or user code after %s', async (error) => {
+    const { input, store, transport, runScript, spawnSession, now } = setup({ claim: { ok: false, error } })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+    expect(store.state().schedules[0]!.nextRunAt).toBe(now + 15 * 60_000)
+    expect(transport.start).not.toHaveBeenCalled()
+    expect(runScript).not.toHaveBeenCalled()
+    expect(spawnSession).not.toHaveBeenCalled()
+  })
+
+  it('keeps the due for a later retry when the server is unreachable', async () => {
+    const { input, store, transport, spawnSession, now } = setup()
+    transport.claim.mockRejectedValue(new Error('socket disconnected'))
+
+    await expect(runServerAutomationTick(input)).rejects.toThrow('socket disconnected')
+    expect(store.state().schedules[0]!.nextRunAt).toBe(now)
+    expect(spawnSession).not.toHaveBeenCalled()
+  })
+
+  it('does not run user code when pause or generation wins between claim and start', async () => {
+    const { input, store, transport, runScript, spawnSession, now } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'token' } },
+    })
+    transport.start.mockResolvedValue({ ok: false, error: 'claim-cancelled' })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+    expect(store.state().schedules[0]!.nextRunAt).toBe(now + 15 * 60_000)
+    expect(runScript).not.toHaveBeenCalled()
+    expect(spawnSession).not.toHaveBeenCalled()
+  })
+
+  it('heartbeats a long-running started execution before reporting it', async () => {
+    vi.useFakeTimers()
+    const { input, transport, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'token' } },
+    })
+    spawnSession.mockImplementation(() => new Promise((resolve) => {
+      setTimeout(() => resolve({ ok: true, sessionId: 'session-1' }), 61_000)
+    }))
+
+    const running = runServerAutomationTick(input)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(transport.heartbeat).toHaveBeenCalledWith({ runId: 'run-1', claimToken: 'token' })
+    await vi.advanceTimersByTimeAsync(1_000)
+    await running
+    expect(transport.report).toHaveBeenCalled()
   })
 })

@@ -25,7 +25,8 @@ describe('serverAutomationRuntimeStore', () => {
       }],
     })
 
-    expect(store.read()).toEqual({
+    const restarted = createServerAutomationRuntimeStore({ filePath: file })
+    expect(restarted.read()).toEqual({
       schedules: [{ automationId: 'automation-1', generation: 2, nextRunAt: 100, lastSessionId: null }],
       pendingReports: [{
         runId: 'run-1', claimToken: 'claim-token', reportId: 'report-1', status: 'COMPLETED',

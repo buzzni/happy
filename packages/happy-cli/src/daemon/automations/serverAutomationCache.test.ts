@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import tweetnacl from 'tweetnacl'
@@ -104,5 +104,15 @@ describe('serverAutomationCache', () => {
     expect(() => cache.applySync({ serverTime: 2, nextSeq: '1', changes: [] })).toThrow('automation-sync-invalid')
     expect(() => cache.applySync({ serverTime: 2, nextSeq: '3', changes: [{ kind: 'UPSERT' }] })).toThrow('automation-sync-invalid')
     expect(readFileSync(file, 'utf8')).toBe(before)
+  })
+
+  it('fails closed on a corrupt cache instead of silently resetting its cursor', () => {
+    writeFileSync(file, '{ corrupt')
+    const cache = createServerAutomationCache({ filePath: file })
+
+    expect(() => cache.read()).toThrow('automation-cache-invalid')
+    expect(() => cache.applySync({ serverTime: 1, nextSeq: '1', changes: [] }))
+      .toThrow('automation-cache-invalid')
+    expect(readFileSync(file, 'utf8')).toBe('{ corrupt')
   })
 })
