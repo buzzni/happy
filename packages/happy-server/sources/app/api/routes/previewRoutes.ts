@@ -225,6 +225,18 @@ export interface PreviewRelayFailure {
     logLine: string;
 }
 
+/**
+ * Keep an untrusted value inside the single log line it belongs to. Fastify
+ * URI-decodes `params['*']`, so `%0A` in a preview URL arrives as a literal
+ * newline; the daemon's error message is likewise arbitrary text. Emitting
+ * either verbatim would let a caller forge a second `preview relay failed`
+ * line attributed to a machine that is not theirs — the exact forensic signal
+ * this line exists to provide.
+ */
+function escapeLogValue(value: string): string {
+    return value.replace(/[\r\n]/g, (ch) => (ch === '\r' ? '\\r' : '\\n'));
+}
+
 export function describePreviewRelayFailure(
     outcome: PreviewRelayOutcome,
     ctx: PreviewRelayFailureContext,
@@ -243,12 +255,14 @@ export function describePreviewRelayFailure(
     // Backstop for specs/happy-server-log-volume Requirement 4 (never log the
     // signed ptoken). Callers already pass a stripped path; re-running the same
     // filter here keeps one source of truth for what "stripped" means.
-    const safePath = buildPreviewUpstreamPath(
+    const safePath = escapeLogValue(buildPreviewUpstreamPath(
         ctx.path.replace(/^\//, '').split('?')[0],
         ctx.path,
-    );
+    ));
 
-    const detail = outcome.kind === 'daemon-error' ? ` detail=${outcome.message}` : '';
+    const detail = outcome.kind === 'daemon-error'
+        ? ` detail=${escapeLogValue(outcome.message)}`
+        : '';
     return {
         status,
         reason,
