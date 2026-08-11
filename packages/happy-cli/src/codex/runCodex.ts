@@ -62,6 +62,7 @@ import {
     type CodexGoalCommand,
 } from './codexGoalStatus';
 import { prepareCodexSessionStart } from './initialPrompt';
+import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
@@ -80,6 +81,7 @@ export async function runCodex(opts: {
     // Shield killall/pkill against broad kills before anything is spawned —
     // Codex has no PreToolUse hook system, so the PATH shim is its only guard.
     installBroadKillShims();
+    const exitAfterFirstTurn = consumeAutomationRunOnce(process.env);
 
     // Early check: ensure Codex CLI is installed before proceeding
     try {
@@ -1088,6 +1090,10 @@ export async function runCodex(opts: {
                     shouldExit,
                     sendReady,
                 });
+                if (exitAfterFirstTurn) {
+                    logger.debug('[codex]: Automation turn completed, exiting run-once session');
+                    shouldExit = true;
+                }
                 logActiveHandles('after-turn');
             }
         }

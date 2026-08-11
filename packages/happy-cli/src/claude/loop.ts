@@ -49,6 +49,7 @@ interface LoopOptions {
     hookSettingsPath: string
     /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
     jsRuntime?: JsRuntime
+    exitAfterFirstTurn?: boolean
 }
 
 export async function loop(opts: LoopOptions): Promise<number> {
@@ -72,7 +73,8 @@ export async function loop(opts: LoopOptions): Promise<number> {
         onAbort: opts.onAbort,
         hookSettingsPath: opts.hookSettingsPath,
         jsRuntime: opts.jsRuntime,
-        startingMode: opts.startingMode
+        startingMode: opts.startingMode,
+        exitAfterFirstTurn: opts.exitAfterFirstTurn,
     });
 
     opts.onSessionReady?.(session)

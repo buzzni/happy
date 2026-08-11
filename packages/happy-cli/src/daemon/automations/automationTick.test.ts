@@ -56,7 +56,8 @@ describe('runAutomationTick', () => {
 
   it('wakes a due automation without a script and records the session', async () => {
     store.replaceAll([makeDueAutomation({ agent: 'codex' })])
-    const input = makeInput()
+    const logDebug = vi.fn()
+    const input = makeInput({ logDebug })
 
     const outcomes = await runAutomationTick(input)
 
@@ -70,6 +71,7 @@ describe('runAutomationTick', () => {
     })
     const [saved] = store.list()
     expect(saved!.runHistory[0]).toEqual({ at: NOW, outcome: 'woke', sessionId: 'session-new' })
+    expect(logDebug).toHaveBeenCalledWith('[automation-tick] auto-1 outcome=woke sessionId=session-new')
     // claim이 nextRunAt을 now 기준으로 전진시킨다.
     expect(saved!.nextRunAt).toBe(NOW + 30 * 60_000)
   })

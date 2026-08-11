@@ -255,6 +255,8 @@ export interface SpawnSessionOptions {
      * Used by scheduled automations.
      */
     initialPrompt?: string;
+    /** Exit cleanly after the spawned agent completes its first turn. */
+    exitAfterFirstTurn?: boolean;
 }
 
 export type SpawnSessionResult =
