@@ -15,35 +15,17 @@
  *     포워딩하지 않게 한다(앱발 프롬프트와 동일한 dedupe 규약).
  */
 
-import { randomUUID } from 'node:crypto'
-
 import { appendClaudeTitleInstruction } from './utils/titlePrompt'
 import type { RawJSONLines } from './types'
+import {
+  buildInitialPromptUserRecord,
+  consumePendingInitialPrompt,
+} from '@/utils/initialPrompt'
 
-/**
- * 환경변수에서 초기 프롬프트를 읽고 즉시 삭제한다 — 이 프로세스가 띄우는
- * 자식(Claude SDK 등)에게 상속되지 않게. 공백뿐이면 null.
- */
-export function consumePendingInitialPrompt(env: NodeJS.ProcessEnv): string | null {
-  const raw = env.HAPPY_INITIAL_PROMPT
-  delete env.HAPPY_INITIAL_PROMPT
-  if (typeof raw !== 'string') return null
-  const text = raw.trim()
-  return text.length > 0 ? text : null
-}
-
-/** 서버 히스토리에 남길 합성 user 레코드 (스캐너 포워딩 레코드와 같은 모양). */
-export function buildInitialPromptUserRecord(text: string, happySessionId: string | null): RawJSONLines {
-  return {
-    type: 'user',
-    uuid: randomUUID(),
-    parentUuid: null,
-    isSidechain: false,
-    sessionId: happySessionId ?? 'unknown',
-    timestamp: new Date().toISOString(),
-    message: { role: 'user', content: text },
-  } as RawJSONLines
-}
+export {
+  buildInitialPromptUserRecord,
+  consumePendingInitialPrompt,
+} from '@/utils/initialPrompt'
 
 export interface InitialPromptSink {
   sessionId: string | null

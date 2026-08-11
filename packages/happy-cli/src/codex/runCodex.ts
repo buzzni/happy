@@ -61,6 +61,7 @@ import {
     parseCodexGoalCommand,
     type CodexGoalCommand,
 } from './codexGoalStatus';
+import { deliverCodexInitialPrompt } from './initialPrompt';
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
@@ -359,6 +360,20 @@ export async function runCodex(opts: {
         });
     });
     session.onUserMessage(handleUserMessage);
+    const deliveredInitialPrompt = deliverCodexInitialPrompt({
+        env: process.env,
+        reconnectSessionId,
+        sendSessionMessage: (envelope) => session.sendSessionProtocolMessage(envelope),
+        pushPrompt: (prompt) => messageQueue.push(prompt, {
+            permissionMode: currentPermissionMode ?? 'default',
+            model: currentModel,
+            appendSystemPrompt: currentAppendSystemPrompt,
+            effort: currentEffort,
+        }),
+    });
+    if (deliveredInitialPrompt) {
+        logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
+    }
     let thinking = false;
     let currentTurnId: string | null = null;
     let currentProviderTurnId: string | null = null;
