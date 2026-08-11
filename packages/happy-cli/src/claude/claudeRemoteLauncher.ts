@@ -468,7 +468,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         }
                     },
                     signal: abortController.signal,
+                    exitAfterFirstTurn: session.exitAfterFirstTurn,
                 });
+
+                if (remoteResult === 'turn-complete') {
+                    logger.debug('[remote]: Automation turn completed, exiting run-once session');
+                    exitReason = 'exit';
+                }
                 
                 // Consume one-time Claude flags after spawn
                 session.consumeOneTimeFlags();

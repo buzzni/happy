@@ -758,6 +758,9 @@ export async function startDaemon(): Promise<void> {
         if (options.initialPrompt) {
           extraEnv.HAPPY_INITIAL_PROMPT = options.initialPrompt;
         }
+        if (options.exitAfterFirstTurn) {
+          extraEnv.HAPPY_AUTOMATION_RUN_ONCE = '1';
+        }
 
         // Check if sandbox is enabled (for credential filtering)
         const hasSandbox = extraEnv.HAPPY_PROJECT_SANDBOX_CONFIG !== undefined;
@@ -1321,6 +1324,7 @@ export async function startDaemon(): Promise<void> {
         directory: input.directory,
         agent: input.agent,
         initialPrompt: input.initialPrompt,
+        exitAfterFirstTurn: input.agent === 'claude' || input.agent === 'codex',
         // 세션 자체는 데몬 소유자 자격증명으로 등록된다(자동화에 사용자 토큰을
         // 저장하지 않는다 — credentials-at-rest 금지). 귀속 표시만 넘긴다.
         createdByAccountId: input.createdByAccountId ?? undefined,

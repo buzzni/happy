@@ -47,6 +47,7 @@ import { readReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 import { consumePendingInitialPrompt, deliverInitialPrompt } from './initialPrompt';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
+import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -82,6 +83,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Shield killall/pkill against broad kills before anything is spawned —
     // everything this session launches inherits the shimmed PATH.
     installBroadKillShims();
+    const exitAfterFirstTurn = consumeAutomationRunOnce(process.env);
 
     const workingDirectory = process.cwd();
     const sessionTag = randomUUID();
@@ -1022,7 +1024,8 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         claudeArgs: options.claudeArgs,
         sandboxConfig,
         hookSettingsPath,
-        jsRuntime: options.jsRuntime
+        jsRuntime: options.jsRuntime,
+        exitAfterFirstTurn,
     });
 
     // Cleanup session resources (intervals, callbacks) - prevents memory leak

@@ -55,7 +55,8 @@ export async function claudeRemote(opts: {
     onSessionReset?: () => void,
     onMcpStatus?: (status: McpRuntimeServerStatus) => void,
     onMcpControllerReady?: (controller: Pick<McpRuntimeRecovery, 'reconnectServer'> | null) => void,
-    onSDKMetadata?: (metadata: { tools?: string[]; slashCommands?: string[]; mcpServers?: { name: string; status: string }[]; skills?: string[]; plugins?: { name: string; path: string }[] }) => void
+    onSDKMetadata?: (metadata: { tools?: string[]; slashCommands?: string[]; mcpServers?: { name: string; status: string }[]; skills?: string[]; plugins?: { name: string; path: string }[] }) => void,
+    exitAfterFirstTurn?: boolean,
 }) {
 
     // Check if session is valid
@@ -298,6 +299,10 @@ export async function claudeRemote(opts: {
                 // Send ready event
                 opts.onReady();
 
+                if (opts.exitAfterFirstTurn) {
+                    return 'turn-complete' as const;
+                }
+
                 // Wait for next user message without blocking the message loop.
                 // Background task messages (task_started, task_progress, task_notification)
                 // continue flowing through while we wait for user input.
@@ -341,4 +346,5 @@ export async function claudeRemote(opts: {
         opts.onMcpControllerReady?.(null);
         updateThinking(false);
     }
+    return undefined;
 }

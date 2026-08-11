@@ -15,3 +15,15 @@ export function deliverCodexInitialPrompt(input: {
   input.pushPrompt(prompt)
   return true
 }
+
+export async function prepareCodexSessionStart(input: {
+  env: NodeJS.ProcessEnv
+  reconnectSessionId?: string
+  sendSessionMessage: (envelope: SessionEnvelope) => void
+  pushPrompt: (prompt: string) => void
+  reportStarted?: () => Promise<void>
+}): Promise<boolean> {
+  const delivered = deliverCodexInitialPrompt(input)
+  await input.reportStarted?.()
+  return delivered
+}

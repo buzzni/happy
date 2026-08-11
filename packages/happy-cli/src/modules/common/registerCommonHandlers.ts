@@ -250,11 +250,13 @@ export interface SpawnSessionOptions {
     /**
      * First user prompt for the spawned session. Delivered via
      * HAPPY_INITIAL_PROMPT (a per-spawn lineage env, scrubbed like
-     * HAPPY_FORK*) and consumed exactly once by the claude remote path so
-     * the agent starts its first turn without waiting for app input.
-     * Non-claude agents ignore it. Used by scheduled automations.
+     * HAPPY_FORK*) and consumed exactly once by supported agent startup
+     * paths so the agent starts its first turn without waiting for app input.
+     * Used by scheduled automations.
      */
     initialPrompt?: string;
+    /** Exit cleanly after the spawned agent completes its first turn. */
+    exitAfterFirstTurn?: boolean;
 }
 
 export type SpawnSessionResult =

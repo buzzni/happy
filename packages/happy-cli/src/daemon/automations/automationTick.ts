@@ -56,6 +56,7 @@ export async function runAutomationTick(input: AutomationTickInput): Promise<Aut
 
       const result = await runClaimedAutomation(claim.claimed, input)
       recordOutcome(input, id, result)
+      input.logDebug?.(`[automation-tick] ${id} outcome=${result.outcome} sessionId=${result.sessionId ?? 'none'}`)
       outcomes.push({ id, outcome: result.outcome })
     } catch (error) {
       input.logDebug?.(`[automation-tick] ${id} threw: ${failureMessage(error)}`)

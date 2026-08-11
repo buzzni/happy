@@ -25,6 +25,7 @@ export class Session {
     readonly hookSettingsPath: string;
     /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
     readonly jsRuntime: JsRuntime;
+    readonly exitAfterFirstTurn: boolean;
 
     sessionId: string | null;
     /** Always assigned from opts.startingMode in the constructor — the single
@@ -61,6 +62,7 @@ export class Session {
          *  keepalive, so a remote session is never reported as 'local'.
          *  Defaults to 'local' (a plain interactive terminal run). */
         startingMode?: 'local' | 'remote',
+        exitAfterFirstTurn?: boolean,
     }) {
         this.path = opts.path;
         this.api = opts.api;
@@ -79,6 +81,7 @@ export class Session {
         this.hookSettingsPath = opts.hookSettingsPath;
         this.jsRuntime = opts.jsRuntime ?? 'node';
         this.mode = opts.startingMode ?? 'local';
+        this.exitAfterFirstTurn = opts.exitAfterFirstTurn === true;
 
         // Start keep alive
         this.client.keepAlive(this.thinking, this.mode);

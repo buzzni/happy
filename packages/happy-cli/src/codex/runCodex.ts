@@ -61,7 +61,8 @@ import {
     parseCodexGoalCommand,
     type CodexGoalCommand,
 } from './codexGoalStatus';
-import { deliverCodexInitialPrompt } from './initialPrompt';
+import { prepareCodexSessionStart } from './initialPrompt';
+import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
@@ -80,6 +81,7 @@ export async function runCodex(opts: {
     // Shield killall/pkill against broad kills before anything is spawned —
     // Codex has no PreToolUse hook system, so the PATH shim is its only guard.
     installBroadKillShims();
+    const exitAfterFirstTurn = consumeAutomationRunOnce(process.env);
 
     // Early check: ensure Codex CLI is installed before proceeding
     try {
@@ -214,27 +216,6 @@ export async function runCodex(opts: {
         session.updateMetadata((meta) => mergeReconnectSessionMetadata(meta, freshMetadata));
     }
 
-    // Always report to daemon if it exists (skip if offline)
-    if (response) {
-        try {
-            logger.debug(`[START] Reporting session ${response.id} to daemon`);
-            const result = await notifyDaemonSessionStarted(response.id, metadata, {
-                encryptionKey: encodeBase64(response.encryptionKey),
-                encryptionVariant: response.encryptionVariant,
-                seq: response.seq,
-                metadataVersion: response.metadataVersion,
-                agentStateVersion: response.agentStateVersion,
-            });
-            if (result.error) {
-                logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
-            } else {
-                logger.debug(`[START] Reported session ${response.id} to daemon`);
-            }
-        } catch (error) {
-            logger.debug('[START] Failed to report to daemon (may not be running):', error);
-        }
-    }
-
     const messageQueue = new MessageQueue2<EnhancedMode>(hashCodexEnhancedMode);
 
     session.onFileEvent((fileEvent) => {
@@ -360,20 +341,39 @@ export async function runCodex(opts: {
         });
     });
     session.onUserMessage(handleUserMessage);
-    const deliveredInitialPrompt = deliverCodexInitialPrompt({
+    await prepareCodexSessionStart({
         env: process.env,
         reconnectSessionId,
         sendSessionMessage: (envelope) => session.sendSessionProtocolMessage(envelope),
-        pushPrompt: (prompt) => messageQueue.push(prompt, {
-            permissionMode: currentPermissionMode ?? 'default',
-            model: currentModel,
-            appendSystemPrompt: currentAppendSystemPrompt,
-            effort: currentEffort,
-        }),
+        pushPrompt: (prompt) => {
+            messageQueue.push(prompt, {
+                permissionMode: currentPermissionMode ?? 'default',
+                model: currentModel,
+                appendSystemPrompt: currentAppendSystemPrompt,
+                effort: currentEffort,
+            });
+            logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
+        },
+        reportStarted: response ? async () => {
+            try {
+                logger.debug(`[START] Reporting session ${response.id} to daemon`);
+                const result = await notifyDaemonSessionStarted(response.id, metadata, {
+                    encryptionKey: encodeBase64(response.encryptionKey),
+                    encryptionVariant: response.encryptionVariant,
+                    seq: response.seq,
+                    metadataVersion: response.metadataVersion,
+                    agentStateVersion: response.agentStateVersion,
+                });
+                if (result.error) {
+                    logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
+                } else {
+                    logger.debug(`[START] Reported session ${response.id} to daemon`);
+                }
+            } catch (error) {
+                logger.debug('[START] Failed to report to daemon (may not be running):', error);
+            }
+        } : undefined,
     });
-    if (deliveredInitialPrompt) {
-        logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
-    }
     let thinking = false;
     let currentTurnId: string | null = null;
     let currentProviderTurnId: string | null = null;
@@ -1090,6 +1090,10 @@ export async function runCodex(opts: {
                     shouldExit,
                     sendReady,
                 });
+                if (exitAfterFirstTurn) {
+                    logger.debug('[codex]: Automation turn completed, exiting run-once session');
+                    shouldExit = true;
+                }
                 logActiveHandles('after-turn');
             }
         }

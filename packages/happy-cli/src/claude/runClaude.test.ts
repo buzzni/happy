@@ -256,6 +256,7 @@ describe('runClaude remote JSONL scanner', () => {
         delete process.env.HAPPY_FORK_CLAUDE_SESSION_ID;
         delete process.env.HAPPY_CREATED_BY_ACCOUNT_ID;
         delete process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
+        delete process.env.HAPPY_AUTOMATION_RUN_ONCE;
 
         mockReadSettings.mockResolvedValue({
             machineId: 'machine-1',
@@ -361,6 +362,17 @@ describe('runClaude remote JSONL scanner', () => {
 
         const call = (harness.api.getOrCreateSession as any).mock.calls.at(-1)?.[0];
         expect(call.metadata.createdBy).toBeUndefined();
+
+        await harness.finish();
+    });
+
+    it('consumes the automation run-once marker and passes it to the Claude loop', async () => {
+        process.env.HAPPY_AUTOMATION_RUN_ONCE = '1';
+
+        const harness = await startRemoteRunClaudeHarness();
+
+        expect(harness.loopOptions.exitAfterFirstTurn).toBe(true);
+        expect(process.env.HAPPY_AUTOMATION_RUN_ONCE).toBeUndefined();
 
         await harness.finish();
     });
