@@ -47,7 +47,7 @@ export interface ServerAutomationExecutorInput {
     | {
       ok: true
       pullRequests: GithubPullRequestSnapshot[]
-      githubEnvironment?: { GH_TOKEN: string }
+      githubEnvironment?: { GH_TOKEN: string; GH_REPO: string }
     }
     | { ok: false; error: string }
   >

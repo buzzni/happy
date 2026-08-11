@@ -292,7 +292,7 @@ describe('runServerAutomationTick', () => {
     })
     queryGithubPullRequests.mockResolvedValue({
       ok: true,
-      githubEnvironment: { GH_TOKEN: 'run-scoped-token' },
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
       pullRequests: [{
         number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10', author: { login: 'alice' },
         baseRefName: 'main', headRefName: 'feature/search', isDraft: false, state: 'OPEN', mergedAt: null,
@@ -311,7 +311,7 @@ describe('runServerAutomationTick', () => {
         /^\[주의\].*외부 사용자가 임의로 작성할 수 있는 데이터.*\n\nReview 10: Add search$/,
       ),
       agent: 'codex',
-      environmentVariables: { GH_TOKEN: 'run-scoped-token' },
+      environmentVariables: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
     }))
     expect(store.state().githubTriggers?.[0]?.state.processed).toContain('10:opened')
   })

@@ -74,7 +74,14 @@ function derivesEvent(input: {
 }): boolean {
   const { event, current, previous, previousHighest } = input;
   if (event === 'opened') return previous === undefined && current.number > previousHighest;
-  if (!previous) return false;
+  if (!previous) {
+    // A long-lived PR can leave the top-100 window and re-enter only after it
+    // becomes terminal. Treat that terminal state as the transition; otherwise
+    // the next snapshot records it as already merged/closed and loses the event.
+    if (event === 'merged') return current.state === 'MERGED' || current.mergedAt !== null;
+    if (event === 'closed') return current.state === 'CLOSED' && current.mergedAt === null;
+    return false;
+  }
   if (event === 'ready_for_review') return previous.isDraft && !current.isDraft && current.state === 'OPEN';
   if (event === 'merged') return previous.state !== 'MERGED' && (current.state === 'MERGED' || current.mergedAt !== null);
   return previous.state === 'OPEN' && current.state === 'CLOSED' && current.mergedAt === null;

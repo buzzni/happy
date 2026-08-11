@@ -73,6 +73,24 @@ describe('planGithubTrigger', () => {
     const baseline = planGithubTrigger({ trigger: eventTrigger, current: [before], previous: null }).state
     expect(planGithubTrigger({ trigger: eventTrigger, current: [after], previous: baseline }).event?.id).toBe(`10:${event}`)
   })
+
+  it.each([
+    ['merged', pr({ state: 'MERGED', mergedAt: '2026-08-11T00:00:00Z' })],
+    ['closed', pr({ state: 'CLOSED', mergedAt: null })],
+  ] as const)('fires %s when an old terminal PR re-enters the top-100 window', (event, terminalPr) => {
+    const eventTrigger = { ...trigger, event, filter: { ...trigger.filter, paths: [] } }
+    const baseline = planGithubTrigger({
+      trigger: eventTrigger,
+      current: [pr({ number: 20 })],
+      previous: null,
+    }).state
+
+    expect(planGithubTrigger({
+      trigger: eventTrigger,
+      current: [pr({ number: 20 }), terminalPr],
+      previous: baseline,
+    }).event?.id).toBe(`10:${event}`)
+  })
 })
 
 describe('renderGithubTriggerPrompt', () => {
