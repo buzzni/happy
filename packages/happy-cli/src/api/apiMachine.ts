@@ -200,7 +200,12 @@ interface DaemonToServerEvents {
 
 type MachineRpcHandlers = {
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
-    resumeSession?: (sessionId: string, options?: { model?: string; permissionMode?: string }) => Promise<SpawnSessionResult>;
+    resumeSession?: (sessionId: string, options?: {
+        model?: string;
+        permissionMode?: string;
+        mcpCallerGrantEnvelope?: string;
+        mcpConfigProjectId?: string;
+    }) => Promise<SpawnSessionResult>;
     stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
     requestShutdown: () => void;
     portRegistry: PortRegistry;
@@ -248,7 +253,12 @@ export class ApiMachineClient {
     private rpcHandlerManager: RpcHandlerManager;
     // Live raw-TCP tunnels for preview WebSocket upgrades (previewWsProxy.ts).
     private previewWsProxy: PreviewWsProxy | null = null;
-    private resumeSessionHandler: ((sessionId: string, options?: { model?: string; permissionMode?: string }) => Promise<SpawnSessionResult>) | null = null;
+    private resumeSessionHandler: ((sessionId: string, options?: {
+        model?: string;
+        permissionMode?: string;
+        mcpCallerGrantEnvelope?: string;
+        mcpConfigProjectId?: string;
+    }) => Promise<SpawnSessionResult>) | null = null;
     // specs/remote-terminal-cwd-fallback/ — cached so the
     // terminal-open-fwd handler can run validatePath against the same
     // root the rest of the RPC surface uses (Files tab / writeFile).
@@ -808,10 +818,22 @@ export class ApiMachineClient {
         if (this.resumeSessionHandler) {
             if (!this.rpcHandlerManager.hasHandler(method)) {
                 this.rpcHandlerManager.registerHandler(method, async (params: any) => {
-                    const { sessionId, model, permissionMode } = params || {};
+                    const {
+                        sessionId,
+                        model,
+                        permissionMode,
+                        mcpCallerGrantEnvelope,
+                        mcpConfigProjectId,
+                    } = params || {};
 
                     if (!sessionId || typeof sessionId !== 'string') {
                         throw new Error('Session ID is required');
+                    }
+                    if (mcpCallerGrantEnvelope !== undefined && typeof mcpCallerGrantEnvelope !== 'string') {
+                        throw new Error('MCP caller grant envelope must be a string');
+                    }
+                    if (mcpConfigProjectId !== undefined && typeof mcpConfigProjectId !== 'string') {
+                        throw new Error('MCP config project ID must be a string');
                     }
 
                     const handler = this.resumeSessionHandler;
@@ -819,7 +841,12 @@ export class ApiMachineClient {
                         throw new Error('Resume session handler not available');
                     }
 
-                    const result = await handler(sessionId, { model, permissionMode });
+                    const result = await handler(sessionId, {
+                        model,
+                        permissionMode,
+                        mcpCallerGrantEnvelope,
+                        mcpConfigProjectId,
+                    });
                     switch (result.type) {
                         case 'success':
                             return { type: 'success', sessionId: result.sessionId };
