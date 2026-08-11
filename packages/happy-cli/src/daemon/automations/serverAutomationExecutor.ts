@@ -13,6 +13,7 @@ import type {
   ServerAutomationRuntimeState,
   ServerAutomationRuntimeStore,
 } from './serverAutomationRuntimeStore'
+import type { AutomationMcpCallerGrantResult, AutomationMcpSpawnContext } from './automationMcpCallerGrant'
 
 type TransportResult = { ok: boolean; value?: any; error?: string }
 
@@ -31,11 +32,21 @@ export interface ServerAutomationExecutorInput {
   transport: ServerAutomationTransport
   decryptPayload: (automation: EncryptedServerAutomation, machineSecretKey: Uint8Array) => ServerAutomationPayload
   runScript: (input: { command: string; cwd: string; timeout: number }) => Promise<{ ok: boolean; stdout: string; error?: string }>
+  resolveMcpSpawnContext: (input: {
+    runId: string
+    claimToken: string
+  }) => Promise<AutomationMcpCallerGrantResult>
+  linkSession: (input: {
+    runId: string
+    claimToken: string
+    sessionId: string
+  }) => Promise<{ ok: boolean; error?: string }>
   spawnSession: (input: {
     directory: string
     initialPrompt: string
     createdByAccountId: null
     agent: AutomationAgent
+    mcpSpawnContext?: AutomationMcpSpawnContext
   }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
   isSessionRunning: (sessionId: string) => boolean
   randomId?: () => string
@@ -60,6 +71,17 @@ async function flushPendingReports(input: ServerAutomationExecutorInput): Promis
   for (const report of pending) {
     const result = await input.transport.report(report)
     if (!result.ok) return
+    if (report.sessionId) {
+      const linked = await input.linkSession({
+        runId: report.runId,
+        claimToken: report.claimToken,
+        sessionId: report.sessionId,
+      })
+      if (!linked.ok) {
+        input.logDebug?.(`[server-automation] session project link failed: ${linked.error ?? 'unknown error'}`)
+        return
+      }
+    }
     writeWithoutReport(input.runtimeStore, report.reportId)
   }
 }
@@ -109,11 +131,8 @@ async function executeStartedRun(
   input: ServerAutomationExecutorInput,
   automation: EncryptedServerAutomation,
   payload: ServerAutomationPayload,
-  lastSessionId: string | null,
+  run: { runId: string; claimToken: string },
 ): Promise<{ outcome: ServerAutomationReportOutcome; sessionId: string | null }> {
-  if (lastSessionId && input.isSessionRunning(lastSessionId)) {
-    return { outcome: 'SKIPPED_GATE', sessionId: lastSessionId }
-  }
   let scriptOutput: string | null = null
   if (payload.scriptCommand) {
     const script = await input.runScript({
@@ -125,11 +144,17 @@ async function executeStartedRun(
     if (!shouldWakeFromScriptOutput(script.stdout)) return { outcome: 'SKIPPED_GATE', sessionId: null }
     scriptOutput = script.stdout
   }
+  const mcpContext = await input.resolveMcpSpawnContext(run)
+  if (!mcpContext.ok) {
+    input.logDebug?.(`[server-automation] ${automation.automationId} MCP caller grant failed: ${mcpContext.error}`)
+    return { outcome: 'ERROR', sessionId: null }
+  }
   const spawned = await input.spawnSession({
     directory: payload.directory,
     initialPrompt: buildAutomationPrompt(payload.prompt, scriptOutput),
     createdByAccountId: null,
     agent: payload.agent ?? 'claude',
+    ...(mcpContext.value ? { mcpSpawnContext: mcpContext.value } : {}),
   })
   return spawned.ok
     ? { outcome: 'WOKE', sessionId: spawned.sessionId }
@@ -189,7 +214,11 @@ export async function runServerAutomationTick(
     }, HEARTBEAT_MS)
     let result: { outcome: ServerAutomationReportOutcome; sessionId: string | null }
     try {
-      result = await executeStartedRun(input, automation, payload, schedule.lastSessionId)
+      if (schedule.lastSessionId && input.isSessionRunning(schedule.lastSessionId)) {
+        result = { outcome: 'SKIPPED_GATE', sessionId: schedule.lastSessionId }
+      } else {
+        result = await executeStartedRun(input, automation, payload, { runId, claimToken })
+      }
     } catch (error) {
       input.logDebug?.(`[server-automation] ${automation.automationId} failed: ${error}`)
       result = { outcome: 'ERROR', sessionId: null }
@@ -210,7 +239,16 @@ export async function runServerAutomationTick(
     const state = input.runtimeStore.read()
     input.runtimeStore.write({ ...state, pendingReports: [...state.pendingReports, report] })
     const reported = await input.transport.report(report)
-    if (reported.ok) writeWithoutReport(input.runtimeStore, report.reportId)
+    if (reported.ok) {
+      const linked = report.sessionId
+        ? await input.linkSession({ runId, claimToken, sessionId: report.sessionId })
+        : { ok: true }
+      if (linked.ok) {
+        writeWithoutReport(input.runtimeStore, report.reportId)
+      } else {
+        input.logDebug?.(`[server-automation] session project link failed: ${linked.error ?? 'unknown error'}`)
+      }
+    }
     outcomes.push({ automationId: automation.automationId, outcome: result.outcome })
   }
   return outcomes

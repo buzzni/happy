@@ -232,6 +232,51 @@ export async function startAutomationRun(
         : { ok: false, error: 'claim-cancelled' };
 }
 
+export async function resolveAutomationRunMcpContext(
+    tx: Tx,
+    accountId: string,
+    machineId: string,
+    input: { runId: string; claimToken: string; sessionId?: string },
+    now: Date = new Date(),
+): Promise<Result<{
+    automationId: string;
+    ownerAccountId: string;
+    projectId: string;
+    machineId: string;
+    runLeaseExpiresAt: number | null;
+}>> {
+    const run = await claimedRun(tx, accountId, machineId, input.runId, input.claimToken);
+    if (!run) return { ok: false, error: 'claim-not-found' };
+    const activelyRunning = run.status === 'RUNNING'
+        && run.runLeaseExpiresAt !== null
+        && run.runLeaseExpiresAt >= now;
+    if (input.sessionId) {
+        const terminalSessionMatch = run.status === 'COMPLETED'
+            && run.reportId !== null
+            && run.sessionId === input.sessionId;
+        if (!terminalSessionMatch) {
+            return { ok: false, error: 'run-not-running' };
+        }
+        const session = await tx.session.findFirst({
+            where: { id: input.sessionId, accountId },
+            select: { id: true },
+        });
+        if (!session) return { ok: false, error: 'claim-not-found' };
+    } else if (!activelyRunning) {
+        return { ok: false, error: 'run-not-running' };
+    }
+    return {
+        ok: true,
+        value: {
+            automationId: run.automationId,
+            ownerAccountId: run.automation.ownerAccountId,
+            projectId: run.automation.projectId,
+            machineId: run.machineId,
+            runLeaseExpiresAt: activelyRunning ? run.runLeaseExpiresAt!.getTime() : null,
+        },
+    };
+}
+
 export async function heartbeatAutomationRun(
     tx: Tx,
     accountId: string,

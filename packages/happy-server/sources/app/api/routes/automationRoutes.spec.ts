@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
     getAutomationTarget: vi.fn(),
     listAutomationRuns: vi.fn(),
     listAutomations: vi.fn(),
+    resolveAutomationRunMcpContext: vi.fn(),
     setAutomationViewerKey: vi.fn(),
     updateAutomation: vi.fn(),
     emitAutomationUpdate: vi.fn(),
@@ -18,6 +19,9 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('@/storage/inTx', () => ({ inTx: (callback: (tx: unknown) => unknown) => callback({}) }));
 vi.mock('@/app/automation/automationService', () => mocks);
+vi.mock('@/app/automation/automationExecutionService', () => ({
+    resolveAutomationRunMcpContext: mocks.resolveAutomationRunMcpContext,
+}));
 vi.mock('@/app/automation/automationUpdate', () => ({ emitAutomationUpdate: mocks.emitAutomationUpdate }));
 
 import { automationRoutes } from './automationRoutes';
@@ -115,6 +119,75 @@ describe('automationRoutes', () => {
         expect(mocks.emitAutomationUpdate).toHaveBeenCalledWith('user-1', {
             projectId: 'project-1', automationId: 'automation-1', revision: 1,
             generation: 1, reason: 'upsert',
+        });
+    });
+
+    it('returns a running automation owner context only from the authenticated machine claim', async () => {
+        mocks.resolveAutomationRunMcpContext.mockResolvedValue({
+            ok: true,
+            value: {
+                automationId: 'automation-1',
+                ownerAccountId: 'automation-owner',
+                projectId: 'project-1',
+                machineId: 'machine-1',
+                runLeaseExpiresAt: 1_000_060_000,
+            },
+        });
+        const app = await makeApp();
+
+        const response = await app.inject({
+            method: 'POST',
+            url: '/v1/automation-runs/run-1/mcp-context',
+            headers: { authorization: 'Bearer test' },
+            payload: { machineId: 'machine-1', claimToken: 'claim-token' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(mocks.resolveAutomationRunMcpContext).toHaveBeenCalledWith({}, 'user-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'claim-token',
+        });
+        expect(response.json()).toEqual({
+            automationId: 'automation-1',
+            ownerAccountId: 'automation-owner',
+            projectId: 'project-1',
+            machineId: 'machine-1',
+            runLeaseExpiresAt: 1_000_060_000,
+        });
+    });
+
+    it('rejects an automation MCP context request without machine claim proof', async () => {
+        const app = await makeApp();
+        const response = await app.inject({
+            method: 'POST',
+            url: '/v1/automation-runs/run-1/mcp-context',
+            headers: { authorization: 'Bearer test' },
+            payload: { machineId: 'machine-1' },
+        });
+
+        expect(response.statusCode).toBe(400);
+        expect(mocks.resolveAutomationRunMcpContext).not.toHaveBeenCalled();
+    });
+
+    it('forwards a spawned session id for machine ownership verification', async () => {
+        mocks.resolveAutomationRunMcpContext.mockResolvedValue({
+            ok: true,
+            value: {
+                automationId: 'automation-1', ownerAccountId: 'automation-owner',
+                projectId: 'project-1', machineId: 'machine-1', runLeaseExpiresAt: null,
+            },
+        });
+        const app = await makeApp();
+
+        const response = await app.inject({
+            method: 'POST',
+            url: '/v1/automation-runs/run-1/mcp-context',
+            headers: { authorization: 'Bearer test' },
+            payload: { machineId: 'machine-1', claimToken: 'claim-token', sessionId: 'session-1' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(mocks.resolveAutomationRunMcpContext).toHaveBeenCalledWith({}, 'user-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'claim-token', sessionId: 'session-1',
         });
     });
 

@@ -22,6 +22,7 @@ import {
     type AutomationUpdateInput,
     type AutomationServiceError,
 } from '@/app/automation/automationService';
+import { resolveAutomationRunMcpContext } from '@/app/automation/automationExecutionService';
 import { inTx } from '@/storage/inTx';
 import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
 import { emitAutomationUpdate } from '@/app/automation/automationUpdate';
@@ -29,6 +30,12 @@ import type { Fastify } from '../types';
 
 const paramsSchema = z.object({ projectId: z.string().min(1) });
 const automationParamsSchema = paramsSchema.extend({ automationId: z.string().min(1) });
+const runParamsSchema = z.object({ runId: z.string().min(1) });
+const mcpContextSchema = z.object({
+    machineId: z.string().min(1),
+    claimToken: z.string().min(1).max(256),
+    sessionId: z.string().min(1).optional(),
+});
 
 function decode(value: string): Uint8Array<ArrayBuffer> {
     return new Uint8Array(Buffer.from(value, 'base64'));
@@ -100,6 +107,27 @@ function rejectWhenDisabled(accountId: string, reply: FastifyReply): boolean {
 }
 
 export function automationRoutes(app: Fastify) {
+    app.post('/v1/automation-runs/:runId/mcp-context', {
+        preHandler: app.authenticate,
+        schema: { params: runParamsSchema, body: mcpContextSchema },
+    }, async (request, reply) => {
+        if (rejectWhenDisabled(request.userId, reply)) return;
+        const result = await inTx((tx) => resolveAutomationRunMcpContext(
+            tx,
+            request.userId,
+            request.body.machineId,
+            {
+                runId: request.params.runId,
+                claimToken: request.body.claimToken,
+                ...(request.body.sessionId ? { sessionId: request.body.sessionId } : {}),
+            },
+        ));
+        if (!result.ok) {
+            return reply.code(result.error === 'claim-not-found' ? 404 : 409).send({ error: result.error });
+        }
+        return reply.send(result.value);
+    });
+
     app.get('/v1/projects/:projectId/automation-target', {
         preHandler: app.authenticate,
         schema: { params: paramsSchema },
