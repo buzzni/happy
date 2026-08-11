@@ -92,6 +92,7 @@ import tweetnacl from 'tweetnacl';
 import {
   injectMcpCallerGrant,
   McpCallerGrantEnvelopeConsumer,
+  prepareMcpChildEnvironment,
 } from './mcpCallerGrantEnvelope';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
@@ -1031,7 +1032,14 @@ export async function startDaemon(): Promise<void> {
       }
     };
 
-    const spawnResumedSession = async (happySessionId: string, options?: { model?: string; permissionMode?: string }): Promise<SpawnSessionResult> => {
+    type ResumeSessionOptions = {
+      model?: string;
+      permissionMode?: string;
+      mcpCallerGrantEnvelope?: string;
+      mcpConfigProjectId?: string;
+    };
+
+    const spawnResumedSession = async (happySessionId: string, options?: ResumeSessionOptions): Promise<SpawnSessionResult> => {
       try {
         if (hasLiveDaemonChild(happySessionId, pidToTrackedSession.values(), isPidAlive)) {
           logger.debug(`[DAEMON RUN] Resume requested for ${happySessionId} but a live child is already attached — reusing it`);
@@ -1115,12 +1123,8 @@ export async function startDaemon(): Promise<void> {
 
         await fs.access(launch.cwd);
 
-        return spawnTrackedHappyProcess({
-          args: launch.args,
-          cwd: launch.cwd,
-          // resume 는 이 spawn 하나에 한해 lineage 를 명시적으로 부여한다 —
-          // 상속분은 scrub 하고 이 세션의 값만 아래에서 다시 넣는다.
-          env: {
+        const mcpEnvironment = prepareMcpChildEnvironment({
+          environmentVariables: {
             ...scrubSessionLineageEnv(process.env),
             ...reconnectEnvironment,
             // user-credential 세션은 원래 계정의 스테이징 자격증명으로 복원 —
@@ -1129,6 +1133,23 @@ export async function startDaemon(): Promise<void> {
               ? { HAPPY_HOME_DIR: credentialDecision.homeDir }
               : {}),
           },
+          mcpCallerGrantEnvelope: options?.mcpCallerGrantEnvelope,
+          mcpConfigProjectId: options?.mcpConfigProjectId,
+          trustedConfigUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+        }, mcpCallerGrantConsumer);
+        if (!mcpEnvironment.ok) {
+          return {
+            type: 'error',
+            errorMessage: `MCP caller grant rejected (${mcpEnvironment.reason})`,
+          };
+        }
+
+        return spawnTrackedHappyProcess({
+          args: launch.args,
+          cwd: launch.cwd,
+          // resume 는 이 spawn 하나에 한해 lineage 를 명시적으로 부여한다 —
+          // 상속분은 scrub 하고 이 세션의 값만 아래에서 다시 넣는다.
+          env: mcpEnvironment.environmentVariables,
           userHomeDir: credentialDecision.kind === 'user-staged' ? credentialDecision.homeDir : undefined,
         });
       } catch (error) {
@@ -1145,7 +1166,7 @@ export async function startDaemon(): Promise<void> {
     // two RPCs 6.7s apart double-spawned a session; both children were later
     // empty-reaped together).
     const resumeInFlight = new Map<string, Promise<SpawnSessionResult>>();
-    const resumeSession = (happySessionId: string, options?: { model?: string; permissionMode?: string }): Promise<SpawnSessionResult> =>
+    const resumeSession = (happySessionId: string, options?: ResumeSessionOptions): Promise<SpawnSessionResult> =>
       shareInFlight(resumeInFlight, happySessionId, () => spawnResumedSession(happySessionId, options));
 
     // Local idle guard config for policy-initiated (if-idle) stops. Read once;

@@ -172,3 +172,31 @@ export class McpCallerGrantEnvelopeConsumer {
         return { ok: true, grant };
     }
 }
+
+export function prepareMcpChildEnvironment(
+    input: {
+        environmentVariables: Record<string, string>;
+        mcpCallerGrantEnvelope?: string;
+        mcpConfigProjectId?: string;
+        trustedConfigUrl?: string;
+    },
+    consumer: Pick<McpCallerGrantEnvelopeConsumer, 'consume'>,
+): { ok: true; environmentVariables: Record<string, string> }
+    | { ok: false; reason: ConsumeFailureReason } {
+    const projectId = input.mcpConfigProjectId?.trim() || null;
+    let grant: string | undefined;
+    if (input.mcpCallerGrantEnvelope) {
+        const consumed = consumer.consume(input.mcpCallerGrantEnvelope, { projectId });
+        if (!consumed.ok) return consumed;
+        grant = consumed.grant;
+    }
+    return {
+        ok: true,
+        environmentVariables: injectMcpCallerGrant(
+            input.environmentVariables,
+            grant,
+            input.trustedConfigUrl,
+            projectId,
+        ),
+    };
+}

@@ -3,6 +3,7 @@ import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
 import type { AplusMcpServersFetchResult, AplusMcpServersMap } from '@/aplus/fetchAplusMcpServers';
 import { deepEqual } from '@/utils/deterministicJson';
 import { sanitizeMcpError } from './mcpRuntimeRecovery';
+import { logger } from '@/ui/logger';
 
 type McpConfigControl = Pick<Query, 'setMcpServers'>;
 
@@ -54,6 +55,9 @@ export class McpConfigSynchronizer {
             const applied = await this.query.setMcpServers(servers);
             this.currentAplusServers = result.servers;
             this.options.onApplied?.(servers, result.servers);
+            const added = [...applied.added].sort().join(',') || '(none)';
+            const removed = [...applied.removed].sort().join(',') || '(none)';
+            logger.debug(`[MCP CONFIG] Applied server changes added=${added} removed=${removed}`);
             for (const [name, error] of Object.entries(applied.errors)) {
                 this.options.onStatus?.({
                     name,

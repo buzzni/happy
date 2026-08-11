@@ -4,6 +4,7 @@ import { encodeBase64, libsodiumEncryptForPublicKey } from '@/api/encryption';
 import {
     injectMcpCallerGrant,
     McpCallerGrantEnvelopeConsumer,
+    prepareMcpChildEnvironment,
 } from './mcpCallerGrantEnvelope';
 
 const PROJECT_CONTEXT = { projectId: 'P-1' };
@@ -33,6 +34,46 @@ function envelope(token: string, publicKey: Uint8Array): string {
 }
 
 describe('McpCallerGrantEnvelopeConsumer', () => {
+    it('resume child용 envelope를 검증하고 project-aware MCP env를 만든다', () => {
+        const keyPair = tweetnacl.box.keyPair();
+        const consumer = new McpCallerGrantEnvelopeConsumer({
+            machineId: 'M-1', secretKey: keyPair.secretKey, now: () => 2_000,
+        });
+
+        const result = prepareMcpChildEnvironment({
+            environmentVariables: {
+                SAFE: 'value',
+                HAPPY_APLUS_MCP_CALLER_GRANT: 'stale-grant',
+            },
+            mcpCallerGrantEnvelope: envelope(grant(), keyPair.publicKey),
+            mcpConfigProjectId: 'P-1',
+            trustedConfigUrl: 'https://saycode.ai/api/me/mcp-config',
+        }, consumer);
+
+        expect(result).toEqual({
+            ok: true,
+            environmentVariables: {
+                SAFE: 'value',
+                HAPPY_APLUS_MCP_CALLER_GRANT: grant(),
+                HAPPY_APLUS_MCP_CONFIG_URL: 'https://saycode.ai/api/me/mcp-config?project_id=P-1',
+            },
+        });
+    });
+
+    it('resume child용 envelope가 잘못되면 축소 권한 env를 만들지 않는다', () => {
+        const keyPair = tweetnacl.box.keyPair();
+        const consumer = new McpCallerGrantEnvelopeConsumer({
+            machineId: 'M-1', secretKey: keyPair.secretKey, now: () => 2_000,
+        });
+
+        expect(prepareMcpChildEnvironment({
+            environmentVariables: { SAFE: 'value' },
+            mcpCallerGrantEnvelope: envelope(grant({ projectId: 'P-2' }), keyPair.publicKey),
+            mcpConfigProjectId: 'P-1',
+            trustedConfigUrl: 'https://saycode.ai/api/me/mcp-config',
+        }, consumer)).toEqual({ ok: false, reason: 'wrong-project' });
+    });
+
     it('caller의 HAPPY_APLUS env를 제거하고 daemon URL과 복호화 grant만 주입한다', () => {
         expect(injectMcpCallerGrant({
             SAFE: 'value',

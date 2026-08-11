@@ -28,7 +28,7 @@ function rpcHandlers(overrides: Record<string, unknown> = {}) {
     } as any;
 }
 
-describe('ApiMachineClient spawn-happy-session createdBy passthrough', () => {
+describe('ApiMachineClient spawn/resume RPC passthrough', () => {
     it.each([
         { label: 'null', params: null },
         { label: 'string', params: 'invalid' },
@@ -161,6 +161,26 @@ describe('ApiMachineClient spawn-happy-session createdBy passthrough', () => {
         expect(calls[0]).toEqual(expect.objectContaining({
             axStep: 'plan',
             bootstrapFiles,
+        }));
+    });
+
+    it('forwards encrypted MCP grant fields to resumeSession', async () => {
+        const resumeSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-1' });
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ resumeSession }));
+
+        await handlersFrom(client).get('machine-1:resume-happy-session')?.({
+            sessionId: 'happy-1',
+            permissionMode: 'bypassPermissions',
+            mcpCallerGrantEnvelope: 'ENCRYPTED-RESUME-GRANT',
+            mcpConfigProjectId: 'P-1',
+        });
+
+        expect(resumeSession).toHaveBeenCalledWith('happy-1', expect.objectContaining({
+            permissionMode: 'bypassPermissions',
+            mcpCallerGrantEnvelope: 'ENCRYPTED-RESUME-GRANT',
+            mcpConfigProjectId: 'P-1',
         }));
     });
 });

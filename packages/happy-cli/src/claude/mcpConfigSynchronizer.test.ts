@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { McpConfigSynchronizer } from './mcpConfigSynchronizer';
 
+const { loggerDebug } = vi.hoisted(() => ({ loggerDebug: vi.fn() }));
+
+vi.mock('@/ui/logger', () => ({
+    logger: { debug: loggerDebug },
+}));
+
 const baseServers = {
     happy: { type: 'http', url: 'http://127.0.0.1:4000/mcp' },
 };
@@ -123,5 +129,35 @@ describe('McpConfigSynchronizer', () => {
         expect(setMcpServers).toHaveBeenCalledWith({ ...baseServers, ...changed });
         expect(onApplied).toHaveBeenCalledWith({ ...baseServers, ...changed }, changed);
         expect(JSON.stringify(onStatus.mock.calls)).not.toContain('new-secret');
+    });
+
+    it('logs only added and removed server names when applying config', async () => {
+        loggerDebug.mockClear();
+        const setMcpServers = vi.fn(async () => ({
+            added: ['slack'],
+            removed: ['argos'],
+            errors: {},
+        }));
+        const synchronizer = new McpConfigSynchronizer({ setMcpServers } as any, {
+            baseServers,
+            initialAplusServers,
+            fetchAplusServers: vi.fn(async () => ({
+                ok: true as const,
+                servers: {
+                    slack: {
+                        type: 'http' as const,
+                        url: 'https://slack.test/mcp',
+                        headers: { Authorization: 'Bearer must-not-leak' },
+                    },
+                },
+            })),
+        });
+
+        await synchronizer.sync();
+
+        expect(loggerDebug).toHaveBeenCalledWith(
+            '[MCP CONFIG] Applied server changes added=slack removed=argos',
+        );
+        expect(JSON.stringify(loggerDebug.mock.calls)).not.toContain('must-not-leak');
     });
 });
