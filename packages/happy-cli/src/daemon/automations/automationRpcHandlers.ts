@@ -29,6 +29,15 @@ export interface AutomationRpcHandlers {
   list: (params: unknown) => Promise<{ automations: ScheduledAutomation[] }>
 }
 
+function schedulesEqual(left: ScheduledAutomation['schedule'], right: ScheduledAutomation['schedule']): boolean {
+  if (left.kind !== right.kind) return false
+  if (left.kind === 'interval' && right.kind === 'interval') return left.minutes === right.minutes
+  if (left.kind === 'daily' && right.kind === 'daily') {
+    return left.hour === right.hour && left.minute === right.minute
+  }
+  return false
+}
+
 export function createAutomationRpcHandlers(deps: AutomationRpcDeps): AutomationRpcHandlers {
   const now = deps.now ?? Date.now
 
@@ -52,13 +61,22 @@ export function createAutomationRpcHandlers(deps: AutomationRpcDeps): Automation
       }
 
       const currentNow = now()
+      const existing = deps.store.list().find((automation) => automation.id === parsed.id)
+      const clientOwnsNextRunAt = !existing
+        || !schedulesEqual(existing.schedule, parsed.schedule)
+        || (existing.paused && !parsed.paused)
+      const requestedNextRunAt = clientOwnsNextRunAt ? parsed.nextRunAt : existing.nextRunAt
       const automation: ScheduledAutomation = {
         ...parsed,
         directory: validation.resolvedPath!,
+        // 실행 이력과 동일 스케줄의 다음 예정은 daemon tick이 소유한다. Desktop이 오래된
+        // automation-list 결과로 pause/edit해도 방금 기록된 실행 상태를 되돌리지 않는다.
+        // 새 행·스케줄 변경·일시정지 해제만 클라이언트가 계산한 다음 예정을 수용한다.
+        runHistory: existing?.runHistory ?? parsed.runHistory,
         // 과거/미지정 nextRunAt으로 저장하면 다음 틱이 즉시 발화한다 —
         // upsert는 항상 "지금 이후의 다음 예정"으로 정규화한다.
-        nextRunAt: parsed.nextRunAt !== null && parsed.nextRunAt > currentNow
-          ? parsed.nextRunAt
+        nextRunAt: requestedNextRunAt !== null && requestedNextRunAt > currentNow
+          ? requestedNextRunAt
           : computeNextRunAt(parsed.schedule, currentNow),
       }
       deps.store.upsert(automation)

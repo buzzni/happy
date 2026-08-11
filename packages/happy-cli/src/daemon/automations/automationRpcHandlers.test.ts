@@ -89,6 +89,50 @@ describe('automation-upsert', () => {
     expect(stored).toHaveLength(1)
     expect(stored[0].name).toBe('after')
   })
+
+  it('shouldPreserveDaemonOwnedRuntimeStateWhenAStaleClientUpserts', async () => {
+    const history = [{ at: NOW - 1, outcome: 'woke' as const, sessionId: 'session-1' }]
+    const daemonNextRunAt = NOW + 120_000
+    store.upsert(makeAutomation({
+      name: 'before',
+      nextRunAt: daemonNextRunAt,
+      runHistory: history,
+    }))
+
+    const result = await handlers().upsert({
+      automation: makeAutomation({
+        name: 'after',
+        paused: true,
+        nextRunAt: NOW + 60_000,
+        runHistory: [],
+      }),
+    })
+
+    expect(result.automation).toMatchObject({
+      name: 'after',
+      paused: true,
+      nextRunAt: daemonNextRunAt,
+      runHistory: history,
+    })
+    expect(store.list()[0]?.runHistory).toEqual(history)
+  })
+
+  it('shouldAcceptAClientNextRunAtWhenResumingOrChangingSchedule', async () => {
+    store.upsert(makeAutomation({ paused: true, nextRunAt: NOW + 120_000 }))
+
+    const resumed = await handlers().upsert({
+      automation: makeAutomation({ paused: false, nextRunAt: NOW + 60_000 }),
+    })
+    expect(resumed.automation.nextRunAt).toBe(NOW + 60_000)
+
+    const changedSchedule = await handlers().upsert({
+      automation: makeAutomation({
+        schedule: { kind: 'interval', minutes: 60 },
+        nextRunAt: NOW + 3_600_000,
+      }),
+    })
+    expect(changedSchedule.automation.nextRunAt).toBe(NOW + 3_600_000)
+  })
 })
 
 describe('automation-remove', () => {
