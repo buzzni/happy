@@ -73,6 +73,7 @@ import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
 import { createAutomationTickRunner } from './automations/automationTickRunner';
 import { runAutomationScript } from './automations/runAutomationScript';
+import { queryGithubPullRequests } from './automations/queryGithubPullRequests';
 import {
   loadOrCreateMachineAutomationKey,
   updateMachineAutomationKeyRegistration,
@@ -1339,6 +1340,7 @@ export async function startDaemon(): Promise<void> {
         createdByAccountId: string | null;
         agent: 'claude' | 'codex' | 'gemini' | 'openclaw' | 'opencode';
         mcpSpawnContext?: AutomationMcpSpawnContext;
+        environmentVariables?: Record<string, string>;
       },
     ): Promise<{ ok: true; sessionId: string } | { ok: false; error: string }> => {
       const result = await spawnSession({
@@ -1350,6 +1352,7 @@ export async function startDaemon(): Promise<void> {
         // 세션 자체는 데몬 소유자 자격증명으로 등록된다(자동화에 사용자 토큰을
         // 저장하지 않는다 — credentials-at-rest 금지). 귀속 표시만 넘긴다.
         createdByAccountId: input.createdByAccountId ?? undefined,
+        environmentVariables: input.environmentVariables,
       }, input.mcpSpawnContext);
       if (result.type === 'success') {
         return { ok: true, sessionId: result.sessionId };
@@ -1488,6 +1491,16 @@ export async function startDaemon(): Promise<void> {
         transport: apiMachine.serverAutomationTransport(),
         decryptPayload: decryptServerAutomationPayload,
         runScript: (input) => runAutomationScript({ ...input, allowedRoot: automationAllowedRoot }),
+        queryGithubPullRequests: (input) => queryGithubPullRequests({
+          ...input,
+          configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+          machineToken: credentials.token,
+          machineId,
+          allowedRoot: automationAllowedRoot,
+        }),
+        notifyGithubTrigger: ({ title, body, url }) => {
+          api.push().sendToAllDevices(title, body, { kind: 'github-trigger', url });
+        },
         resolveMcpSpawnContext: ({ runId, claimToken }) => exchangeAutomationMcpCallerGrant({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
           machineToken: credentials.token,

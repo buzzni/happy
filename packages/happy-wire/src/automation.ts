@@ -37,6 +37,9 @@ export type AutomationAgent = z.infer<typeof automationAgentSchema>;
 
 export const automationScheduleSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('interval'), minutes: z.number().int().min(15) }),
+  // A distinct discriminator makes older daemons reject GitHub triggers instead
+  // of stripping githubTrigger and running them as ordinary scheduled prompts.
+  z.object({ kind: z.literal('github'), minutes: z.literal(15) }),
   z.object({
     kind: z.literal('daily'),
     hour: z.number().int().min(0).max(23),
@@ -44,6 +47,23 @@ export const automationScheduleSchema = z.discriminatedUnion('kind', [
   }),
 ]);
 export type AutomationSchedule = z.infer<typeof automationScheduleSchema>;
+
+export const githubTriggerEventSchema = z.enum(['opened', 'ready_for_review', 'merged', 'closed']);
+export type GithubTriggerEvent = z.infer<typeof githubTriggerEventSchema>;
+
+export const githubTriggerSchema = z.object({
+  event: githubTriggerEventSchema,
+  filter: z.object({
+    baseBranch: z.string().trim().min(1).max(255).nullable(),
+    label: z.string().trim().min(1).max(100).nullable(),
+    excludeDraft: z.boolean(),
+    authors: z.array(z.string().trim().min(1).max(100)).max(100),
+    paths: z.array(z.string().trim().min(1).max(1_000)).max(100),
+  }),
+  action: z.enum(['notify', 'start-session']),
+  githubCredentialId: z.string().trim().min(1).max(200).nullable(),
+});
+export type GithubTrigger = z.infer<typeof githubTriggerSchema>;
 
 export const automationPayloadSchema = z.object({
   name: z.string().trim().min(1).max(200),
@@ -53,6 +73,16 @@ export const automationPayloadSchema = z.object({
   scriptCommand: z.string().trim().min(1).max(8_000).nullable(),
   suppressSilent: z.boolean(),
   agent: automationAgentSchema.nullable(),
+  githubTrigger: githubTriggerSchema.optional(),
+}).superRefine((payload, context) => {
+  const isGithubSchedule = payload.schedule.kind === 'github';
+  if (isGithubSchedule !== (payload.githubTrigger !== undefined)) {
+    context.addIssue({
+      code: 'custom',
+      path: ['schedule'],
+      message: 'github schedule and githubTrigger must be used together',
+    });
+  }
 });
 export type AutomationPayload = z.infer<typeof automationPayloadSchema>;
 

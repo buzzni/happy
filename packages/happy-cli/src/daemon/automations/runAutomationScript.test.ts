@@ -61,4 +61,15 @@ describe('runAutomationScript', () => {
     expect(result.ok).toBe(false)
     expect(result.error).toBe('Command timed out')
   })
+
+  it('injects explicit environment variables without putting them in the command', async () => {
+    const result = await runAutomationScript({
+      command: 'node -e "process.stdout.write(process.env.APLUS_AUTOMATION_TEST_TOKEN || \'\')"',
+      cwd: root,
+      timeout: 5_000,
+      allowedRoot: root,
+      environmentVariables: { APLUS_AUTOMATION_TEST_TOKEN: 'in-memory-token' },
+    })
+    expect(result).toEqual({ ok: true, stdout: 'in-memory-token' })
+  })
 })

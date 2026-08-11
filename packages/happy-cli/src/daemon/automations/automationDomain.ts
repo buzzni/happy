@@ -10,6 +10,7 @@
 
 export type AutomationSchedule =
   | { kind: 'interval'; minutes: number }
+  | { kind: 'github'; minutes: 15 }
   | { kind: 'daily'; hour: number; minute: number }
 
 export type AutomationRunOutcome = 'woke' | 'skipped-gate' | 'skipped-overlap' | 'silent' | 'error'
@@ -190,7 +191,7 @@ export function serializeScheduledAutomations(automations: readonly ScheduledAut
 }
 
 export function computeNextRunAt(schedule: AutomationSchedule, from: number): number {
-  if (schedule.kind === 'interval') return from + schedule.minutes * 60_000
+  if (schedule.kind === 'interval' || schedule.kind === 'github') return from + schedule.minutes * 60_000
   const base = new Date(from)
   const candidate = new Date(base.getFullYear(), base.getMonth(), base.getDate(), schedule.hour, schedule.minute, 0, 0)
   // 정확히 그 시각(=from)이면 오늘은 이미 소진 — 같은 시각 재발화를 막는다.

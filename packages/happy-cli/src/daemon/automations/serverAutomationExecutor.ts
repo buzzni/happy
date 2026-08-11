@@ -14,6 +14,12 @@ import type {
   ServerAutomationRuntimeStore,
 } from './serverAutomationRuntimeStore'
 import type { AutomationMcpCallerGrantResult, AutomationMcpSpawnContext } from './automationMcpCallerGrant'
+import {
+  GITHUB_TRIGGER_PROMPT_PREAMBLE,
+  planGithubTrigger,
+  renderGithubTriggerPrompt,
+  type GithubPullRequestSnapshot,
+} from './githubTriggerDomain'
 
 type TransportResult = { ok: boolean; value?: any; error?: string }
 
@@ -32,6 +38,20 @@ export interface ServerAutomationExecutorInput {
   transport: ServerAutomationTransport
   decryptPayload: (automation: EncryptedServerAutomation, machineSecretKey: Uint8Array) => ServerAutomationPayload
   runScript: (input: { command: string; cwd: string; timeout: number }) => Promise<{ ok: boolean; stdout: string; error?: string }>
+  queryGithubPullRequests: (input: {
+    cwd: string
+    githubCredentialId: string | null
+    runId: string
+    claimToken: string
+  }) => Promise<
+    | {
+      ok: true
+      pullRequests: GithubPullRequestSnapshot[]
+      githubEnvironment?: { GH_TOKEN: string }
+    }
+    | { ok: false; error: string }
+  >
+  notifyGithubTrigger: (input: { title: string; body: string; url: string }) => void
   resolveMcpSpawnContext: (input: {
     runId: string
     claimToken: string
@@ -47,6 +67,7 @@ export interface ServerAutomationExecutorInput {
     createdByAccountId: null
     agent: AutomationAgent
     mcpSpawnContext?: AutomationMcpSpawnContext
+    environmentVariables?: Record<string, string>
   }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
   isSessionRunning: (sessionId: string) => boolean
   randomId?: () => string
@@ -55,6 +76,7 @@ export interface ServerAutomationExecutorInput {
 
 const SCRIPT_TIMEOUT_MS = 60_000
 const HEARTBEAT_MS = 60_000
+const MAX_GITHUB_SESSION_STARTS_PER_TICK = 3
 
 function serverNow(cache: ServerAutomationCacheState, localNow: number): number {
   if (cache.syncedAt === 0) return localNow
@@ -106,7 +128,15 @@ function reconcileSchedules(
       lastSessionId: null,
     })
   }
-  return { ...state, schedules: [...byId.values()] }
+  const activeGenerations = new Map(cache.automations.map((automation) => [
+    automation.automationId,
+    automation.generation,
+  ]))
+  const githubTriggers = (state.githubTriggers ?? []).filter((entry) => (
+    activeGenerations.get(entry.automationId) === entry.generation
+      && payloads.get(entry.automationId)?.githubTrigger !== undefined
+  ))
+  return { ...state, schedules: [...byId.values()], githubTriggers }
 }
 
 function advanceSchedule(
@@ -133,6 +163,49 @@ async function executeStartedRun(
   payload: ServerAutomationPayload,
   run: { runId: string; claimToken: string },
 ): Promise<{ outcome: ServerAutomationReportOutcome; sessionId: string | null }> {
+  let prompt = payload.prompt
+  let environmentVariables: Record<string, string> | undefined
+  if (payload.githubTrigger) {
+    const query = await input.queryGithubPullRequests({
+      cwd: payload.directory,
+      githubCredentialId: payload.githubTrigger.githubCredentialId,
+      runId: run.runId,
+      claimToken: run.claimToken,
+    })
+    if (!query.ok) {
+      input.logDebug?.(`[server-automation] ${automation.automationId} GitHub query failed: ${query.error}`)
+      return { outcome: 'ERROR', sessionId: null }
+    }
+    const runtime = input.runtimeStore.read()
+    const previous = (runtime.githubTriggers ?? []).find((entry) => (
+      entry.automationId === automation.automationId && entry.generation === automation.generation
+    ))?.state ?? null
+    const planned = planGithubTrigger({
+      trigger: payload.githubTrigger,
+      current: query.pullRequests,
+      previous,
+    })
+    input.runtimeStore.write({
+      ...runtime,
+      githubTriggers: [
+        ...(runtime.githubTriggers ?? []).filter((entry) => entry.automationId !== automation.automationId),
+        { automationId: automation.automationId, generation: automation.generation, state: planned.state },
+      ],
+    })
+    if (!planned.event) return { outcome: 'SKIPPED_GATE', sessionId: null }
+    const rendered = renderGithubTriggerPrompt(payload.prompt, planned.event.pr, planned.event.event)
+    if (payload.githubTrigger.action === 'notify') {
+      input.notifyGithubTrigger({
+        title: payload.name,
+        body: rendered.slice(0, 1_000),
+        url: planned.event.pr.url,
+      })
+      return { outcome: 'WOKE', sessionId: null }
+    }
+    prompt = `${GITHUB_TRIGGER_PROMPT_PREAMBLE}\n\n${rendered}`
+    environmentVariables = query.githubEnvironment
+  }
+
   let scriptOutput: string | null = null
   if (payload.scriptCommand) {
     const script = await input.runScript({
@@ -151,9 +224,10 @@ async function executeStartedRun(
   }
   const spawned = await input.spawnSession({
     directory: payload.directory,
-    initialPrompt: buildAutomationPrompt(payload.prompt, scriptOutput),
+    initialPrompt: buildAutomationPrompt(prompt, scriptOutput),
     createdByAccountId: null,
     agent: payload.agent ?? 'claude',
+    ...(environmentVariables ? { environmentVariables } : {}),
     ...(mcpContext.value ? { mcpSpawnContext: mcpContext.value } : {}),
   })
   return spawned.ok
@@ -181,9 +255,13 @@ export async function runServerAutomationTick(
 
   const before = input.runtimeStore.read()
   const reconciled = reconcileSchedules({ ...cache, automations: decryptableAutomations }, before, payloads, now)
-  if (JSON.stringify(reconciled.schedules) !== JSON.stringify(before.schedules)) input.runtimeStore.write(reconciled)
+  if (JSON.stringify(reconciled.schedules) !== JSON.stringify(before.schedules)
+    || JSON.stringify(reconciled.githubTriggers) !== JSON.stringify(before.githubTriggers ?? [])) {
+    input.runtimeStore.write(reconciled)
+  }
 
   const outcomes: Array<{ automationId: string; outcome: ServerAutomationReportOutcome }> = []
+  let githubSessionStarts = 0
   for (const automation of decryptableAutomations) {
     if (automation.paused || automation.migrationPending === true) continue
     const schedule = input.runtimeStore.read().schedules.find((item) => item.automationId === automation.automationId)
@@ -214,8 +292,13 @@ export async function runServerAutomationTick(
     }, HEARTBEAT_MS)
     let result: { outcome: ServerAutomationReportOutcome; sessionId: string | null }
     try {
-      if (schedule.lastSessionId && input.isSessionRunning(schedule.lastSessionId)) {
+      if (payload.githubTrigger?.action !== 'notify'
+        && schedule.lastSessionId
+        && input.isSessionRunning(schedule.lastSessionId)) {
         result = { outcome: 'SKIPPED_GATE', sessionId: schedule.lastSessionId }
+      } else if (payload.githubTrigger?.action === 'start-session'
+        && githubSessionStarts >= MAX_GITHUB_SESSION_STARTS_PER_TICK) {
+        result = { outcome: 'SKIPPED_GATE', sessionId: null }
       } else {
         result = await executeStartedRun(input, automation, payload, { runId, claimToken })
       }
@@ -225,6 +308,9 @@ export async function runServerAutomationTick(
     } finally {
       clearInterval(heartbeat)
     }
+    if (payload.githubTrigger?.action === 'start-session'
+      && result.outcome === 'WOKE'
+      && result.sessionId) githubSessionStarts += 1
 
     if (result.sessionId) advanceSchedule(input, automation.automationId, payload, now, result.sessionId)
     const report: PendingAutomationReport = {
