@@ -83,6 +83,11 @@ import {
 } from './automations/serverAutomationCache';
 import { createServerAutomationRuntimeStore } from './automations/serverAutomationRuntimeStore';
 import { runServerAutomationTick } from './automations/serverAutomationExecutor';
+import {
+  exchangeAutomationMcpCallerGrant,
+  linkAutomationProjectSession,
+  type AutomationMcpSpawnContext,
+} from './automations/automationMcpCallerGrant';
 import { resolveAllowedRoot } from '@/modules/common/resolveAllowedRoot';
 import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
@@ -565,14 +570,17 @@ export async function startDaemon(): Promise<void> {
     };
 
     // Spawn a new session (sessionId reserved for future --resume functionality)
-    const spawnSession = async (options: SpawnSessionOptions): Promise<SpawnSessionResult> => {
+    const spawnSession = async (
+      options: SpawnSessionOptions,
+      trustedMcpContext?: AutomationMcpSpawnContext,
+    ): Promise<SpawnSessionResult> => {
       // Spawn options can contain the encrypted one-use envelope as well as
       // unrelated project secrets. Log only routing metadata so neither the
       // envelope nor a client-supplied plaintext grant becomes replayable log
       // material while DEBUG is enabled.
       logger.debug(
         `[DAEMON RUN] Spawning session agent=${options.agent} directory=${options.directory}`
-        + ` callerGrantEnvelope=${options.mcpCallerGrantEnvelope ? 'present' : 'absent'}`,
+        + ` callerGrant=${trustedMcpContext ? 'automation' : options.mcpCallerGrantEnvelope ? 'envelope' : 'absent'}`,
       );
 
       const { directory, sessionId, machineId, approvedNewDirectoryCreation = true } = options;
@@ -622,8 +630,16 @@ export async function startDaemon(): Promise<void> {
       }
 
       try {
-        let mcpCallerGrant: string | undefined;
-        const mcpConfigProjectId = options.mcpConfigProjectId?.trim() || null;
+        if (trustedMcpContext && options.mcpCallerGrantEnvelope) {
+          return {
+            type: 'error',
+            errorMessage: 'MCP caller grant has conflicting trusted and envelope sources',
+          };
+        }
+        let mcpCallerGrant: string | undefined = trustedMcpContext?.mcpCallerGrant;
+        const mcpConfigProjectId = trustedMcpContext?.mcpConfigProjectId
+          ?? options.mcpConfigProjectId?.trim()
+          ?? null;
         if (options.mcpCallerGrantEnvelope) {
           const consumed = mcpCallerGrantConsumer.consume(
             options.mcpCallerGrantEnvelope,
@@ -1317,7 +1333,13 @@ export async function startDaemon(): Promise<void> {
       return false;
     };
     const spawnAutomationSession = async (
-      input: { directory: string; initialPrompt: string; createdByAccountId: string | null; agent: 'claude' | 'codex' | 'gemini' | 'openclaw' | 'opencode' },
+      input: {
+        directory: string;
+        initialPrompt: string;
+        createdByAccountId: string | null;
+        agent: 'claude' | 'codex' | 'gemini' | 'openclaw' | 'opencode';
+        mcpSpawnContext?: AutomationMcpSpawnContext;
+      },
     ): Promise<{ ok: true; sessionId: string } | { ok: false; error: string }> => {
       const result = await spawnSession({
         machineId,
@@ -1328,7 +1350,7 @@ export async function startDaemon(): Promise<void> {
         // 세션 자체는 데몬 소유자 자격증명으로 등록된다(자동화에 사용자 토큰을
         // 저장하지 않는다 — credentials-at-rest 금지). 귀속 표시만 넘긴다.
         createdByAccountId: input.createdByAccountId ?? undefined,
-      });
+      }, input.mcpSpawnContext);
       if (result.type === 'success') {
         return { ok: true, sessionId: result.sessionId };
       }
@@ -1466,6 +1488,21 @@ export async function startDaemon(): Promise<void> {
         transport: apiMachine.serverAutomationTransport(),
         decryptPayload: decryptServerAutomationPayload,
         runScript: (input) => runAutomationScript({ ...input, allowedRoot: automationAllowedRoot }),
+        resolveMcpSpawnContext: ({ runId, claimToken }) => exchangeAutomationMcpCallerGrant({
+          configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+          machineToken: credentials.token,
+          machineId,
+          runId,
+          claimToken,
+        }),
+        linkSession: ({ runId, claimToken, sessionId }) => linkAutomationProjectSession({
+          configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+          machineToken: credentials.token,
+          machineId,
+          runId,
+          claimToken,
+          sessionId,
+        }),
         spawnSession: spawnAutomationSession,
         isSessionRunning: isAutomationSessionRunning,
         logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),

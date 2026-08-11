@@ -5,6 +5,7 @@ import {
     heartbeatAutomationRun,
     registerAutomationMachineKey,
     reportAutomationRun,
+    resolveAutomationRunMcpContext,
     startAutomationRun,
     syncAutomations,
 } from './automationExecutionService';
@@ -13,7 +14,7 @@ const now = new Date('2026-08-10T08:00:00.000Z');
 
 function automation(patch: Record<string, unknown> = {}) {
     return {
-        id: 'automation-1', projectId: 'project-1', machineAccountId: 'account-1', machineId: 'machine-1',
+        id: 'automation-1', projectId: 'project-1', ownerAccountId: 'owner-1', machineAccountId: 'account-1', machineId: 'machine-1',
         revision: 2, generation: 3, paused: false, deletedAt: null, enabledAt: new Date(0),
         legacyMigrationPending: false,
         payloadVersion: 1, payloadCiphertext: new Uint8Array([1]), machineKeyVersion: 4,
@@ -46,7 +47,7 @@ function makeTx() {
             findFirst: vi.fn(),
             findUnique: vi.fn(),
         },
-        session: { findFirst: vi.fn(async () => null) },
+        session: { findFirst: vi.fn(async (): Promise<{ id: string } | null> => null) },
     };
 }
 
@@ -148,6 +149,99 @@ describe('automationExecutionService', () => {
         expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
             where: expect.objectContaining({ runLeaseExpiresAt: { gte: now } }),
         }));
+    });
+
+    it('resolves MCP context from the running claim without treating the machine account as the owner', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({
+            id: 'run-1',
+            automationId: 'automation-1',
+            machineId: 'machine-1',
+            status: 'RUNNING',
+            runLeaseExpiresAt: new Date(now.getTime() + 60_000),
+            automation: automation({ ownerAccountId: 'owner-2' }),
+        });
+
+        await expect(resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token',
+        }, now)).resolves.toEqual({
+            ok: true,
+            value: {
+                automationId: 'automation-1',
+                ownerAccountId: 'owner-2',
+                projectId: 'project-1',
+                machineId: 'machine-1',
+                runLeaseExpiresAt: now.getTime() + 60_000,
+            },
+        });
+    });
+
+    it('rejects a session link before that exact session is recorded by the terminal run report', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({
+            id: 'run-1', automationId: 'automation-1', machineId: 'machine-1',
+            status: 'RUNNING', runLeaseExpiresAt: new Date(now.getTime() + 60_000),
+            sessionId: null, automation: automation({ ownerAccountId: 'owner-2' }),
+        });
+        await expect(resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', sessionId: 'session-1',
+        }, now)).resolves.toEqual({ ok: false, error: 'run-not-running' });
+        expect(tx.session.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('allows a durable project link retry after the matching run report is terminal', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({
+            id: 'run-1', automationId: 'automation-1', machineId: 'machine-1',
+            status: 'COMPLETED', runLeaseExpiresAt: new Date(now.getTime() - 1),
+            reportId: 'report-1', sessionId: 'session-1',
+            automation: automation({ ownerAccountId: 'owner-2' }),
+        });
+        tx.session.findFirst.mockResolvedValue({ id: 'session-1' });
+
+        await expect(resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', sessionId: 'session-1',
+        }, now)).resolves.toEqual({
+            ok: true,
+            value: expect.objectContaining({ projectId: 'project-1', runLeaseExpiresAt: null }),
+        });
+    });
+
+    it('rejects project link context for a foreign or mismatched session', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({
+            id: 'run-1', automationId: 'automation-1', machineId: 'machine-1',
+            status: 'COMPLETED', reportId: 'report-1', sessionId: 'session-1',
+            runLeaseExpiresAt: new Date(now.getTime() - 1), automation: automation(),
+        });
+
+        await expect(resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', sessionId: 'other-session',
+        }, now)).resolves.toEqual({ ok: false, error: 'run-not-running' });
+        expect(tx.session.findFirst).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        { status: 'CLAIMED', runLeaseExpiresAt: null },
+        { status: 'RUNNING', runLeaseExpiresAt: new Date(now.getTime() - 1) },
+    ])('rejects MCP context when the claim is not an actively leased run', async (run) => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({
+            id: 'run-1', automationId: 'automation-1', automation: automation(), ...run,
+        });
+
+        await expect(resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token',
+        }, now)).resolves.toEqual({ ok: false, error: 'run-not-running' });
+    });
+
+    it('rejects MCP context when account, machine, run, or claim token does not match', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue(null);
+
+        await expect(resolveAutomationRunMcpContext(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'forged-token',
+        }, now)).resolves.toEqual({ ok: false, error: 'claim-not-found' });
     });
 
     it('returns an existing terminal result for the same report id', async () => {
