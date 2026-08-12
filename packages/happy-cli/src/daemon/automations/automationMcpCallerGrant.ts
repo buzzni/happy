@@ -24,8 +24,12 @@ export async function exchangeAutomationMcpCallerGrant(input: {
   machineId: string
   runId: string
   claimToken: string
+  logDebug?: (message: string) => void
 }): Promise<AutomationMcpCallerGrantResult> {
-  if (!input.configUrl) return { ok: true, value: null }
+  if (!input.configUrl) {
+    input.logDebug?.('MCP caller grant skipped: HAPPY_APLUS_MCP_CONFIG_URL is not set on this daemon')
+    return { ok: true, value: null }
+  }
 
   let exchangeUrl: string
   try {
@@ -76,8 +80,12 @@ export async function linkAutomationProjectSession(input: {
   runId: string
   claimToken: string
   sessionId: string
+  logDebug?: (message: string) => void
 }): Promise<{ ok: boolean; error?: string }> {
-  if (!input.configUrl) return { ok: true }
+  if (!input.configUrl) {
+    input.logDebug?.('Automation project-session link skipped: HAPPY_APLUS_MCP_CONFIG_URL is not set on this daemon')
+    return { ok: true }
+  }
 
   let linkUrl: string
   try {

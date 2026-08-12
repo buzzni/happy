@@ -1548,6 +1548,7 @@ export async function startDaemon(): Promise<void> {
           machineId,
           runId,
           claimToken,
+          logDebug: (message) => logger.debug(`[DAEMON RUN] [server-automation] ${message}`),
         }),
         linkSession: ({ runId, claimToken, sessionId }) => linkAutomationProjectSession({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
@@ -1555,6 +1556,7 @@ export async function startDaemon(): Promise<void> {
           machineId,
           runId,
           claimToken,
+          logDebug: (message) => logger.debug(`[DAEMON RUN] [server-automation] ${message}`),
           sessionId,
         }),
         spawnSession: spawnAutomationSession,

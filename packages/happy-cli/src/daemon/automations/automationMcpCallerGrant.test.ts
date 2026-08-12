@@ -8,14 +8,17 @@ import {
 describe('exchangeAutomationMcpCallerGrant', () => {
   afterEach(() => vi.unstubAllGlobals())
 
-  it('returns no context when the daemon has no trusted Aplus MCP URL', async () => {
+  it('returns no context when the daemon has no trusted Aplus MCP URL, and says why', async () => {
+    const logDebug = vi.fn()
     await expect(exchangeAutomationMcpCallerGrant({
       configUrl: undefined,
       machineToken: 'machine-token',
       machineId: 'M-1',
       runId: 'R-1',
       claimToken: 'claim-token',
+      logDebug,
     })).resolves.toEqual({ ok: true, value: null })
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('HAPPY_APLUS_MCP_CONFIG_URL'))
   })
 
   it('exchanges the run claim without exposing it in the config URL', async () => {
@@ -88,6 +91,20 @@ describe('exchangeAutomationMcpCallerGrant', () => {
         }),
       }),
     )
+  })
+
+  it('skips project linking when the daemon has no trusted Aplus MCP URL, and says why', async () => {
+    const logDebug = vi.fn()
+    await expect(linkAutomationProjectSession({
+      configUrl: undefined,
+      machineToken: 'machine-token',
+      machineId: 'M-1',
+      runId: 'R-1',
+      claimToken: 'claim-token',
+      sessionId: 'S-1',
+      logDebug,
+    })).resolves.toEqual({ ok: true })
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('HAPPY_APLUS_MCP_CONFIG_URL'))
   })
 
   it('keeps project linking retryable when the Aplus endpoint is unavailable', async () => {
