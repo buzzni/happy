@@ -81,10 +81,10 @@ export async function linkAutomationProjectSession(input: {
   claimToken: string
   sessionId: string
   logDebug?: (message: string) => void
-}): Promise<{ ok: boolean; error?: string }> {
+}): Promise<{ ok: boolean; error?: string; skipped?: boolean }> {
   if (!input.configUrl) {
     input.logDebug?.('Automation project-session link skipped: HAPPY_APLUS_MCP_CONFIG_URL is not set on this daemon')
-    return { ok: true }
+    return { ok: true, skipped: true }
   }
 
   let linkUrl: string

@@ -53,7 +53,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     ok: true as const,
     value: { mcpCallerGrant: 'SIGNED-GRANT', mcpConfigProjectId: 'P-1' },
   }))
-  const linkSession = vi.fn(async (): Promise<{ ok: boolean; error?: string }> => ({ ok: true }))
+  const linkSession = vi.fn(async (): Promise<{ ok: boolean; error?: string; skipped?: boolean }> => ({ ok: true }))
   const decryptPayload = vi.fn((_automation: EncryptedServerAutomation, _machineSecretKey: Uint8Array) => ({
     name: 'name', schedule: { kind: 'interval' as const, minutes: 15 }, prompt: 'prompt',
     directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
@@ -181,6 +181,50 @@ describe('runServerAutomationTick', () => {
     expect(linkSession).toHaveBeenCalledTimes(2)
     expect(store.state().pendingReports).toEqual([])
     expect(transport.claim).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps retrying the project link while the daemon has no Aplus config, within the 24h window', async () => {
+    const { input, store, transport, linkSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    transport.report.mockResolvedValue({ ok: true, value: { idempotent: false } })
+    linkSession.mockResolvedValue({ ok: true, skipped: true })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'WOKE' },
+    ])
+    expect(store.state().pendingReports).toEqual([expect.objectContaining({
+      runId: 'run-1', sessionId: 'session-1',
+    })])
+
+    // A due interval schedule would otherwise reclaim and start a second run on
+    // this tick too — reject that claim to isolate the pending-report flush.
+    transport.claim.mockResolvedValueOnce({ ok: false, error: 'not due yet' })
+    input.now += 60 * 60 * 1000 // +1h, well inside the 24h giveup window
+    await runServerAutomationTick(input)
+    expect(linkSession).toHaveBeenCalledTimes(2)
+    expect(store.state().pendingReports).toEqual([expect.objectContaining({
+      runId: 'run-1', sessionId: 'session-1',
+    })])
+  })
+
+  it('gives up linking after the 24h retry window and stops carrying the report', async () => {
+    const { input, store, transport, linkSession, logDebug } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    transport.report.mockResolvedValue({ ok: true, value: { idempotent: false } })
+    linkSession.mockResolvedValue({ ok: true, skipped: true })
+
+    await runServerAutomationTick(input)
+    expect(store.state().pendingReports).toHaveLength(1)
+
+    // Isolate the flush (see comment above): reject the reclaim so this tick
+    // only exercises the give-up path for the already-pending report.
+    transport.claim.mockResolvedValueOnce({ ok: false, error: 'not due yet' })
+    input.now += 25 * 60 * 60 * 1000 // past the 24h giveup window
+    await runServerAutomationTick(input)
+    expect(store.state().pendingReports).toEqual([])
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('gave up'))
   })
 
   it('reports a clear failure without running user code when caller grant exchange fails', async () => {

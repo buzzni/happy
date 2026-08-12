@@ -103,7 +103,7 @@ describe('exchangeAutomationMcpCallerGrant', () => {
       claimToken: 'claim-token',
       sessionId: 'S-1',
       logDebug,
-    })).resolves.toEqual({ ok: true })
+    })).resolves.toEqual({ ok: true, skipped: true })
     expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('HAPPY_APLUS_MCP_CONFIG_URL'))
   })
 
