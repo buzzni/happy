@@ -43,6 +43,25 @@ describe('github trigger automation payload', () => {
       schedule: { kind: 'interval', minutes: 15 },
     })).toEqual({ ...legacyPayload, schedule: { kind: 'interval', minutes: 15 } });
   });
+
+  it('accepts AgentTask review only with an explicit GitHub credential', () => {
+    const githubTrigger = {
+      event: 'opened' as const,
+      filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+      action: 'agent-task-review' as const,
+      githubCredentialId: 'credential-1',
+    };
+    expect(automationPayloadSchema.safeParse({
+      ...payload,
+      schedule: { kind: 'github', minutes: 15 },
+      githubTrigger,
+    }).success).toBe(true);
+    expect(automationPayloadSchema.safeParse({
+      ...payload,
+      schedule: { kind: 'github', minutes: 15 },
+      githubTrigger: { ...githubTrigger, githubCredentialId: null },
+    }).success).toBe(false);
+  });
 });
 
 function bytes(length: number, value: number): Uint8Array {

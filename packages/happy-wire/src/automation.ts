@@ -60,8 +60,16 @@ export const githubTriggerSchema = z.object({
     authors: z.array(z.string().trim().min(1).max(100)).max(100),
     paths: z.array(z.string().trim().min(1).max(1_000)).max(100),
   }),
-  action: z.enum(['notify', 'start-session']),
+  action: z.enum(['notify', 'start-session', 'agent-task-review']),
   githubCredentialId: z.string().trim().min(1).max(200).nullable(),
+}).superRefine((trigger, context) => {
+  if (trigger.action === 'agent-task-review' && trigger.githubCredentialId === null) {
+    context.addIssue({
+      code: 'custom',
+      path: ['githubCredentialId'],
+      message: 'AgentTask review requires an explicit GitHub credential',
+    });
+  }
 });
 export type GithubTrigger = z.infer<typeof githubTriggerSchema>;
 

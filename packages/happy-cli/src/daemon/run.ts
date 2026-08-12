@@ -75,6 +75,10 @@ import { createAutomationTickRunner } from './automations/automationTickRunner';
 import { runAutomationScript } from './automations/runAutomationScript';
 import { queryGithubPullRequests } from './automations/queryGithubPullRequests';
 import {
+  dispatchAutomationAgentTask,
+  maintainAutomationAgentTaskLease,
+} from './automations/automationAgentTaskBridge';
+import {
   loadOrCreateMachineAutomationKey,
   updateMachineAutomationKeyRegistration,
 } from './automations/machineAutomationKey';
@@ -1500,6 +1504,15 @@ export async function startDaemon(): Promise<void> {
         }),
         notifyGithubTrigger: ({ title, body, url }) => {
           api.push().sendToAllDevices(title, body, { kind: 'github-trigger', url });
+        },
+        dispatchAgentTask: (input) => dispatchAutomationAgentTask({
+          ...input,
+          configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+          machineToken: credentials.token,
+          machineId,
+        }),
+        maintainAgentTaskLease: (dispatch) => {
+          maintainAutomationAgentTaskLease({ dispatch });
         },
         resolveMcpSpawnContext: ({ runId, claimToken }) => exchangeAutomationMcpCallerGrant({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,

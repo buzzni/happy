@@ -40,6 +40,11 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     pullRequests: [],
   }))
   const notifyGithubTrigger = vi.fn<ServerAutomationExecutorInput['notifyGithubTrigger']>()
+  const dispatchAgentTask = vi.fn<ServerAutomationExecutorInput['dispatchAgentTask']>(async () => ({
+    ok: true,
+    dispatch: null,
+  }))
+  const maintainAgentTaskLease = vi.fn<ServerAutomationExecutorInput['maintainAgentTaskLease']>()
   const spawnSession = vi.fn(async () => ({ ok: true as const, sessionId: 'session-1' }))
   const resolveMcpSpawnContext = vi.fn(async (): Promise<AutomationMcpCallerGrantResult> => ({
     ok: true as const,
@@ -64,6 +69,8 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     runScript,
     queryGithubPullRequests,
     notifyGithubTrigger,
+    dispatchAgentTask,
+    maintainAgentTaskLease,
     resolveMcpSpawnContext,
     linkSession,
     spawnSession,
@@ -73,7 +80,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
   }
   return {
     input, store, transport, decryptPayload, logDebug, runScript, queryGithubPullRequests,
-    notifyGithubTrigger,
+    notifyGithubTrigger, dispatchAgentTask, maintainAgentTaskLease,
     resolveMcpSpawnContext, linkSession, spawnSession, now,
   }
 }
@@ -314,6 +321,64 @@ describe('runServerAutomationTick', () => {
       environmentVariables: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
     }))
     expect(store.state().githubTriggers?.[0]?.state.processed).toContain('10:opened')
+  })
+
+  it('dispatches AgentTask continuations on a poll without putting capabilities in the prompt', async () => {
+    const {
+      input, store, queryGithubPullRequests, dispatchAgentTask, maintainAgentTaskLease, spawnSession,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Follow project review rules', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'apply-1', type: 'review_apply.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { reviewedHeadSha: 'a'.repeat(40) }, context: [{ kind: 'review', body: { findings: [] } }],
+      },
+    })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'WOKE' },
+    ])
+    expect(dispatchAgentTask).toHaveBeenCalledWith({
+      runId: 'run-1', claimToken: 'claim-token', credentialId: 'credential-1', event: null,
+    })
+    const spawned = spawnSession.mock.calls[0]![0]
+    expect(spawned.initialPrompt).toContain('Task ID: apply-1')
+    expect(spawned.initialPrompt).not.toContain('claim-secret')
+    expect(spawned.initialPrompt).not.toContain('complete-secret')
+    expect(spawned.environmentVariables).toMatchObject({
+      APLUS_AGENT_TASK_ID: 'apply-1',
+      APLUS_AGENT_TASK_CLAIM_TOKEN: 'claim-secret',
+      APLUS_AGENT_TASK_COMPLETE_TOKEN: 'complete-secret',
+      GH_TOKEN: 'github-secret',
+    })
+    expect(maintainAgentTaskLease).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'apply-1' }))
   })
 
   it('records notify-only GitHub events without issuing an MCP grant or starting an LLM session', async () => {
