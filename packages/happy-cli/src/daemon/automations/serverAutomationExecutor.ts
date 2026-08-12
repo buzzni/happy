@@ -357,8 +357,9 @@ async function executeStartedRun(
     ? { ok: true as const, value: null }
     : await input.resolveMcpSpawnContext(run)
   if (!mcpContext.ok) {
-    input.logDebug?.(`[server-automation] ${automation.automationId} MCP caller grant failed: ${mcpContext.error}`)
-    return { outcome: 'ERROR', sessionId: null }
+    // specs/automation-company-owner-identity R1 — grant 실패는 개인 커넥터에만
+    // fail closed 하고 자동화 실행 자체는 계속한다 (grant 미주입 = 커넥터 없음).
+    input.logDebug?.(`[server-automation] ${automation.automationId} MCP caller grant failed: ${mcpContext.error}; spawning without personal connectors`)
   }
   const spawned = await input.spawnSession({
     directory: payload.directory,
@@ -367,7 +368,7 @@ async function executeStartedRun(
     agent: payload.agent ?? 'claude',
     ...(agentTaskDispatch?.type === 'pr_review.v1' ? { permissionMode: 'read-only' as const } : {}),
     ...(environmentVariables ? { environmentVariables } : {}),
-    ...(mcpContext.value ? { mcpSpawnContext: mcpContext.value } : {}),
+    ...(mcpContext.ok && mcpContext.value ? { mcpSpawnContext: mcpContext.value } : {}),
   })
   if (spawned.ok && agentTaskDispatch) input.maintainAgentTaskLease(agentTaskDispatch)
   if (spawned.ok) persistGithubTriggerState?.()

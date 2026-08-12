@@ -227,21 +227,42 @@ describe('runServerAutomationTick', () => {
     expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('gave up'))
   })
 
-  it('reports a clear failure without running user code when caller grant exchange fails', async () => {
-    const { input, transport, runScript, resolveMcpSpawnContext, spawnSession, logDebug } = setup({
+  // specs/automation-company-owner-identity R1 — grant 교환 실패는 개인
+  // 커넥터에만 fail closed 하고, 자동화 실행 자체는 죽이지 않는다.
+  it('spawns without personal connectors and reports WOKE when caller grant exchange fails', async () => {
+    const { input, transport, resolveMcpSpawnContext, spawnSession, logDebug } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
     })
-    resolveMcpSpawnContext.mockResolvedValue({ ok: false, error: 'exchange unavailable' })
+    resolveMcpSpawnContext.mockResolvedValue({ ok: false, error: 'caller grant exchange returned 404' })
 
     await expect(runServerAutomationTick(input)).resolves.toEqual([
-      { automationId: 'automation-1', outcome: 'ERROR' },
+      { automationId: 'automation-1', outcome: 'WOKE' },
     ])
 
-    expect(runScript).not.toHaveBeenCalled()
-    expect(spawnSession).not.toHaveBeenCalled()
-    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('exchange unavailable'))
+    expect(spawnSession).toHaveBeenCalledTimes(1)
+    expect(spawnSession.mock.calls[0]![0]).not.toHaveProperty('mcpSpawnContext')
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('caller grant exchange returned 404'))
     expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({
-      runId: 'run-1', status: 'FAILED', outcome: 'ERROR', sessionId: null,
+      runId: 'run-1', status: 'COMPLETED', outcome: 'WOKE', sessionId: 'session-1',
+    }))
+  })
+
+  // specs/automation-company-owner-identity R2 — 회사 소유 자동화의 명시적
+  // no-grant 응답은 오류가 아니라 "커넥터 없이 정상 진행" 이다.
+  it('spawns without personal connectors when the server explicitly returns no grant', async () => {
+    const { input, transport, resolveMcpSpawnContext, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    resolveMcpSpawnContext.mockResolvedValue({ ok: true, value: null })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'WOKE' },
+    ])
+
+    expect(spawnSession).toHaveBeenCalledTimes(1)
+    expect(spawnSession.mock.calls[0]![0]).not.toHaveProperty('mcpSpawnContext')
+    expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run-1', status: 'COMPLETED', outcome: 'WOKE', sessionId: 'session-1',
     }))
   })
 

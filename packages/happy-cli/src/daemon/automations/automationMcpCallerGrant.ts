@@ -9,13 +9,16 @@ export type AutomationMcpCallerGrantResult =
 
 const EXCHANGE_TIMEOUT_MS = 3_000
 
-function parseExchangeResponse(value: unknown): AutomationMcpSpawnContext | null {
+// specs/automation-company-owner-identity R2 — `grant: null` 은 회사 happy
+// 계정 소유 자동화의 명시적 no-grant 응답이다: 개인 커넥터 없이 정상 진행.
+function parseExchangeResponse(value: unknown): { context: AutomationMcpSpawnContext | null } | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const row = value as Record<string, unknown>
-  if (typeof row.grant !== 'string' || !row.grant) return null
   if (typeof row.projectId !== 'string' || !row.projectId) return null
+  if (row.grant === null) return { context: null }
+  if (typeof row.grant !== 'string' || !row.grant) return null
   if (typeof row.expiresAt !== 'number' || !Number.isFinite(row.expiresAt) || row.expiresAt <= Date.now()) return null
-  return { mcpCallerGrant: row.grant, mcpConfigProjectId: row.projectId }
+  return { context: { mcpCallerGrant: row.grant, mcpConfigProjectId: row.projectId } }
 }
 
 export async function exchangeAutomationMcpCallerGrant(input: {
@@ -57,10 +60,14 @@ export async function exchangeAutomationMcpCallerGrant(input: {
     if (!response.ok) {
       return { ok: false, error: `caller grant exchange returned ${response.status}` }
     }
-    const context = parseExchangeResponse(await response.json())
-    return context
-      ? { ok: true, value: context }
-      : { ok: false, error: 'caller grant exchange returned an invalid response' }
+    const parsed = parseExchangeResponse(await response.json())
+    if (!parsed) {
+      return { ok: false, error: 'caller grant exchange returned an invalid response' }
+    }
+    if (!parsed.context) {
+      input.logDebug?.('MCP caller grant: server returned no personal grant for this run (company-owned automation)')
+    }
+    return { ok: true, value: parsed.context }
   } catch {
     return {
       ok: false,
