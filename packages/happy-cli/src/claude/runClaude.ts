@@ -29,7 +29,7 @@ import {
     type ClaudeGoalStatusTranscriptEvent,
 } from '@/claude/claudeGoalStatus';
 import { Session } from './session';
-import { applySandboxPermissionPolicy, resolveInitialClaudePermissionMode, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
+import { applySandboxPermissionPolicy, resolveInitialClaudeDisallowedTools, resolveInitialClaudePermissionMode, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
 import { applyAxOrchestration } from '@/orchestrator/prompts/integrate';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
 import { appendClaudeTitleInstruction } from './utils/titlePrompt';
@@ -116,10 +116,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             ? SandboxConfigSchema.parse(JSON.parse(projectSandboxEnv))
             : settings?.sandboxConfig;
     const sandboxEnabled = Boolean(sandboxConfig?.enabled);
-    const initialPermissionMode = applySandboxPermissionPolicy(
-        resolveInitialClaudePermissionMode(options.permissionMode ?? DEFAULT_CLAUDE_PERMISSION_MODE, options.claudeArgs),
-        sandboxEnabled,
+    const requestedPermissionMode = resolveInitialClaudePermissionMode(
+        options.permissionMode ?? DEFAULT_CLAUDE_PERMISSION_MODE,
+        options.claudeArgs,
     );
+    const initialPermissionMode = applySandboxPermissionPolicy(requestedPermissionMode, sandboxEnabled);
+    const initialDisallowedTools = resolveInitialClaudeDisallowedTools(requestedPermissionMode);
     const dangerouslySkipPermissions =
         initialPermissionMode === 'bypassPermissions' ||
         initialPermissionMode === 'yolo' ||
@@ -515,7 +517,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     let currentCustomSystemPrompt: string | undefined = undefined; // Track current custom system prompt
     let currentAppendSystemPrompt: string | undefined = undefined; // Track current append system prompt
     let currentAllowedTools: string[] | undefined = undefined; // Track current allowed tools
-    let currentDisallowedTools: string[] | undefined = undefined; // Track current disallowed tools
+    let currentDisallowedTools: string[] | undefined = initialDisallowedTools; // Track current disallowed tools
     let currentEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined = DEFAULT_CLAUDE_EFFORT; // Track current Claude effort (thinking depth)
 
     const resetCurrentModeDefaults = () => {
@@ -525,7 +527,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         currentCustomSystemPrompt = undefined;
         currentAppendSystemPrompt = undefined;
         currentAllowedTools = undefined;
-        currentDisallowedTools = undefined;
+        currentDisallowedTools = initialDisallowedTools;
         currentEffort = DEFAULT_CLAUDE_EFFORT;
         logger.debug('[loop] Reset current mode defaults after abort');
     };

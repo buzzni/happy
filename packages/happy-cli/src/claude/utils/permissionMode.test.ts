@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { applySandboxPermissionPolicy, extractPermissionModeFromClaudeArgs, mapToClaudeMode, resolveInitialClaudePermissionMode, resolveRemoteClaudePermissionMode } from './permissionMode';
+import { applySandboxPermissionPolicy, extractPermissionModeFromClaudeArgs, mapToClaudeMode, resolveInitialClaudeDisallowedTools, resolveInitialClaudePermissionMode, resolveRemoteClaudePermissionMode } from './permissionMode';
 import type { PermissionMode } from '@/api/types';
 
 describe('mapToClaudeMode', () => {
@@ -92,6 +92,22 @@ describe('applySandboxPermissionPolicy', () => {
 
     it('returns original mode when sandbox is disabled', () => {
         expect(applySandboxPermissionPolicy('acceptEdits', false)).toBe('acceptEdits');
+    });
+});
+
+describe('resolveInitialClaudeDisallowedTools', () => {
+    it('blocks write tools and the unsandboxed streamed shell for read-only sessions', () => {
+        expect(resolveInitialClaudeDisallowedTools('read-only')).toEqual([
+            'Edit',
+            'MultiEdit',
+            'Write',
+            'NotebookEdit',
+            'mcp__happy__bash_stream',
+        ]);
+    });
+
+    it('does not restrict ordinary interactive sessions', () => {
+        expect(resolveInitialClaudeDisallowedTools('default')).toBeUndefined();
     });
 });
 

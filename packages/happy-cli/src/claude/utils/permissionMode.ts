@@ -101,6 +101,19 @@ export function applySandboxPermissionPolicy(
     return 'bypassPermissions';
 }
 
+/**
+ * Claude's managed sandbox constrains built-in tools, but Happy's streamed Bash
+ * MCP tool executes in the wrapper process. Keep it, and direct edit tools,
+ * unavailable for an unattended read-only session. Built-in Bash stays enabled
+ * so the task can POST lifecycle callbacks through the sandbox's network policy.
+ */
+export function resolveInitialClaudeDisallowedTools(
+    mode: PermissionMode | undefined,
+): string[] | undefined {
+    if (mode !== 'read-only') return undefined;
+    return ['Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'mcp__happy__bash_stream'];
+}
+
 function isClaudeBypassEquivalent(mode: PermissionMode | undefined): boolean {
     return mode === 'bypassPermissions' || mode === 'yolo';
 }

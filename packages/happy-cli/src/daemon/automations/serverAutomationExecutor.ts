@@ -92,6 +92,18 @@ export interface ServerAutomationExecutorInput {
 const SCRIPT_TIMEOUT_MS = 60_000
 const HEARTBEAT_MS = 60_000
 const MAX_GITHUB_SESSION_STARTS_PER_TICK = 3
+const PR_REVIEW_SANDBOX_CONFIG = JSON.stringify({
+  enabled: true,
+  sessionIsolation: 'custom',
+  customWritePaths: [],
+  denyReadPaths: ['~/.ssh', '~/.aws', '~/.gnupg'],
+  extraWritePaths: ['/tmp'],
+  denyWritePaths: ['.env'],
+  networkMode: 'allowed',
+  allowedDomains: [],
+  deniedDomains: [],
+  allowLocalBinding: false,
+})
 
 const AGENT_TASK_RESULT_CONTRACTS: Record<AutomationAgentTaskDispatch['type'], string> = {
   'pr_review.v1': '{"reviewedHeadSha":"40-64 hex","verdict":"approve|changes_requested","findings":[{"id":"stable-id","severity":"high|medium|low","file":"path","line":1,"title":"...","evidence":"...","suggestedFix":"...","confidence":0.0}],"checks":[{"name":"...","status":"passed|failed|not_run","details":"..."}]}',
@@ -211,6 +223,7 @@ async function executeStartedRun(
   let prompt = payload.prompt
   let environmentVariables: Record<string, string> | undefined
   let agentTaskDispatch: AutomationAgentTaskDispatch | null = null
+  let persistGithubTriggerState: (() => void) | null = null
   if (payload.githubTrigger) {
     const query = await input.queryGithubPullRequests({
       cwd: payload.directory,
@@ -231,13 +244,16 @@ async function executeStartedRun(
       current: query.pullRequests,
       previous,
     })
-    input.runtimeStore.write({
-      ...runtime,
-      githubTriggers: [
-        ...(runtime.githubTriggers ?? []).filter((entry) => entry.automationId !== automation.automationId),
-        { automationId: automation.automationId, generation: automation.generation, state: planned.state },
-      ],
-    })
+    persistGithubTriggerState = () => {
+      const latest = input.runtimeStore.read()
+      input.runtimeStore.write({
+        ...latest,
+        githubTriggers: [
+          ...(latest.githubTriggers ?? []).filter((entry) => entry.automationId !== automation.automationId),
+          { automationId: automation.automationId, generation: automation.generation, state: planned.state },
+        ],
+      })
+    }
     if (payload.githubTrigger.action === 'agent-task-review') {
       const credentialId = payload.githubTrigger.githubCredentialId
       if (!credentialId) return { outcome: 'ERROR', sessionId: null }
@@ -255,11 +271,18 @@ async function executeStartedRun(
         input.logDebug?.(`[server-automation] ${automation.automationId} AgentTask bridge failed: ${bridged.error}`)
         return { outcome: 'ERROR', sessionId: null }
       }
+      // The server has durably scheduled/claimed any event at this point. A
+      // later local spawn failure must not enqueue the same root task again.
+      persistGithubTriggerState()
+      persistGithubTriggerState = null
       if (!bridged.dispatch) return { outcome: 'SKIPPED_GATE', sessionId: null }
       agentTaskDispatch = bridged.dispatch
       prompt = buildAgentTaskPrompt(bridged.dispatch, payload.prompt)
       environmentVariables = {
         ...(bridged.dispatch.type === 'review_apply.v1' ? query.githubEnvironment ?? {} : {}),
+        ...(bridged.dispatch.type === 'pr_review.v1'
+          ? { HAPPY_PROJECT_SANDBOX_CONFIG: PR_REVIEW_SANDBOX_CONFIG }
+          : {}),
         APLUS_AGENT_TASK_URL: bridged.dispatch.controlUrl,
         APLUS_AGENT_TASK_ID: bridged.dispatch.taskId,
         APLUS_AGENT_TASK_RUN_ID: bridged.dispatch.agentRunId,
@@ -267,7 +290,10 @@ async function executeStartedRun(
         APLUS_AGENT_TASK_COMPLETE_TOKEN: bridged.dispatch.completeToken,
       }
     } else {
-      if (!planned.event) return { outcome: 'SKIPPED_GATE', sessionId: null }
+      if (!planned.event) {
+        persistGithubTriggerState()
+        return { outcome: 'SKIPPED_GATE', sessionId: null }
+      }
       const rendered = renderGithubTriggerPrompt(payload.prompt, planned.event.pr, planned.event.event)
       if (payload.githubTrigger.action === 'notify') {
         input.notifyGithubTrigger({
@@ -275,6 +301,7 @@ async function executeStartedRun(
           body: rendered.slice(0, 1_000),
           url: planned.event.pr.url,
         })
+        persistGithubTriggerState()
         return { outcome: 'WOKE', sessionId: null }
       }
       prompt = `${GITHUB_TRIGGER_PROMPT_PREAMBLE}\n\n${rendered}`
@@ -290,7 +317,10 @@ async function executeStartedRun(
       timeout: SCRIPT_TIMEOUT_MS,
     })
     if (!script.ok) return { outcome: 'ERROR', sessionId: null }
-    if (!shouldWakeFromScriptOutput(script.stdout)) return { outcome: 'SKIPPED_GATE', sessionId: null }
+    if (!shouldWakeFromScriptOutput(script.stdout)) {
+      persistGithubTriggerState?.()
+      return { outcome: 'SKIPPED_GATE', sessionId: null }
+    }
     scriptOutput = script.stdout
   }
   const mcpContext = agentTaskDispatch
@@ -310,6 +340,7 @@ async function executeStartedRun(
     ...(mcpContext.value ? { mcpSpawnContext: mcpContext.value } : {}),
   })
   if (spawned.ok && agentTaskDispatch) input.maintainAgentTaskLease(agentTaskDispatch)
+  if (spawned.ok) persistGithubTriggerState?.()
   return spawned.ok
     ? { outcome: 'WOKE', sessionId: spawned.sessionId }
     : { outcome: 'ERROR', sessionId: null }

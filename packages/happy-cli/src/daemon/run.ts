@@ -794,7 +794,7 @@ export async function startDaemon(): Promise<void> {
           sandboxEnabled: hasSandbox,
           permissionMode: options.permissionMode,
         });
-        const readOnlyAgentAuthEnv = !hasSandbox && options.permissionMode === 'read-only'
+        const readOnlyAgentAuthEnv = options.permissionMode === 'read-only'
           ? resolveReadOnlyAgentAuthEnvironment(options.agent, process.env)
           : {};
 

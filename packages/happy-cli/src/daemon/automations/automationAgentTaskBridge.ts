@@ -122,7 +122,7 @@ export function maintainAutomationAgentTaskLease(input: {
         stop()
       }
     }).catch(() => {
-      if (heartbeatSucceeded || ++failures >= maxPreStartFailures) stop()
+      if (++failures >= maxPreStartFailures) stop()
     }).finally(() => {
       requestRunning = false
     })
