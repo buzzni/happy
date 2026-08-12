@@ -8,6 +8,7 @@ import type { QueryOptions, QueryPrompt, SDKMessage } from './types'
 import type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 import { ensureLocalProxyBypass } from '../utils/proxyBypass'
 import { resolveHappyEntrypoint } from './happyEntrypoint'
+import { resolveClaudeCodeExecutable } from './claudeExecutable'
 
 /**
  * Wraps the official SDK query() with our QueryOptions adapter
@@ -46,6 +47,7 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         sessionId: undefined,
         effort: opts?.effort,
         agents: opts?.agents,
+        pathToClaudeCodeExecutable: resolveClaudeCodeExecutable(),
     }
 
     // Map abort signal -> AbortController

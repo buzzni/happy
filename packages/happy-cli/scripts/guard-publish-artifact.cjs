@@ -13,6 +13,9 @@ const DEPENDENCY_FIELDS = [
 ];
 
 const EXPECTED_BUNDLED_FILES = [
+    'package/scripts/verify-bundled-deps.cjs',
+    'package/scripts/unpack-tools.cjs',
+    'package/scripts/fix-node-pty-perms.cjs',
     'package/node_modules/@slopus/happy-wire/package.json',
     'package/node_modules/@slopus/happy-wire/dist/index.mjs',
     'package/node_modules/zod/package.json',
@@ -20,11 +23,19 @@ const EXPECTED_BUNDLED_FILES = [
     'package/node_modules/@paralleldrive/cuid2/node_modules/@noble/hashes/package.json'
 ];
 const EXPECTED_INSTALLED_FILES = [
+    'scripts/verify-bundled-deps.cjs',
+    'scripts/unpack-tools.cjs',
+    'scripts/fix-node-pty-perms.cjs',
     'node_modules/@slopus/happy-wire/package.json',
     'node_modules/@slopus/happy-wire/dist/index.mjs',
     'node_modules/zod/package.json',
     'node_modules/@paralleldrive/cuid2/package.json',
     'node_modules/@paralleldrive/cuid2/node_modules/@noble/hashes/package.json'
+];
+const REQUIRED_INSTALL_PREPARATION = [
+    'scripts/verify-bundled-deps.cjs',
+    'scripts/unpack-tools.cjs',
+    'scripts/fix-node-pty-perms.cjs'
 ];
 const MAX_PRINTED_ERRORS = 30;
 
@@ -141,6 +152,13 @@ function collectMetadataErrors(packageJson) {
         errors.push(`dependencies.@slopus/happy-wire must be a registry version, got ${wireSpec}`);
     }
 
+    const postinstall = packageJson.scripts && packageJson.scripts.postinstall;
+    for (const script of REQUIRED_INSTALL_PREPARATION) {
+        if (typeof postinstall !== 'string' || !postinstall.includes(script)) {
+            errors.push(`scripts.postinstall must run ${script}`);
+        }
+    }
+
     return errors;
 }
 
@@ -216,6 +234,16 @@ function assertDaemonRuntimePreflight(cliPath, isolatedEnv) {
     }
 }
 
+function runInstallPreparation(installedRoot, isolatedEnv) {
+    for (const script of REQUIRED_INSTALL_PREPARATION) {
+        run(process.execPath, [path.join(installedRoot, script)], {
+            cwd: installedRoot,
+            env: isolatedEnv,
+            timeout: 30000
+        });
+    }
+}
+
 function runInstallSmoke(tarball, packageJson) {
     const prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'happy-cli-install-'));
     const happyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'happy-cli-smoke-home-'));
@@ -262,6 +290,12 @@ function runInstallSmoke(tarball, packageJson) {
         if (installedPackage.version !== packageJson.version) {
             throw new Error(`Smoke install version mismatch: expected ${packageJson.version}, got ${installedPackage.version}`);
         }
+
+        // Some npm environments defer dependency lifecycle scripts until they
+        // are explicitly approved. Exercise Happy's required preparation
+        // directly so a successful smoke install proves runtime readiness,
+        // rather than merely proving that npm extracted the package.
+        runInstallPreparation(installedRoot, isolatedEnv);
 
         // `happy browser`'s install instructions point here; if it's missing
         // from a real install, the printed path is a dead end. This is what

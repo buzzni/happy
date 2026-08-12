@@ -21,6 +21,7 @@ function createPublishTarball(
         writeHomeSentinel?: boolean
         removeFastifyTransitiveAfterInstall?: boolean
         brokenFastifyRuntime?: boolean
+        omitInstallPreparation?: boolean
     } = {}
 ): string {
     const fixtureRoot = mkdtempSync(join(tmpdir(), 'happy-cli-guard-test-'))
@@ -43,9 +44,11 @@ function createPublishTarball(
             '@paralleldrive/cuid2',
             'fastify'
         ],
-        ...(options.removeFastifyTransitiveAfterInstall
-            ? { scripts: { postinstall: 'node scripts/remove-fastify-transitive.mjs' } }
-            : {})
+        scripts: {
+            postinstall: options.removeFastifyTransitiveAfterInstall
+                ? 'node scripts/verify-bundled-deps.cjs && node scripts/unpack-tools.cjs && node scripts/fix-node-pty-perms.cjs && node scripts/remove-fastify-transitive.mjs'
+                : 'node scripts/verify-bundled-deps.cjs && node scripts/unpack-tools.cjs && node scripts/fix-node-pty-perms.cjs'
+        }
     }))
     writeFixtureFile(
         packageRoot,
@@ -66,6 +69,11 @@ function createPublishTarball(
     writeFixtureFile(packageRoot, 'node_modules/@paralleldrive/cuid2/package.json', JSON.stringify({ name: '@paralleldrive/cuid2', version: '0.0.0-test' }))
     writeFixtureFile(packageRoot, 'node_modules/@paralleldrive/cuid2/node_modules/@noble/hashes/package.json', JSON.stringify({ name: '@noble/hashes', version: '0.0.0-test' }))
     writeFixtureFile(packageRoot, 'browser-extension/manifest.json', '{}')
+    writeFixtureFile(packageRoot, 'scripts/verify-bundled-deps.cjs', '')
+    writeFixtureFile(packageRoot, 'scripts/unpack-tools.cjs', '')
+    if (!options.omitInstallPreparation) {
+        writeFixtureFile(packageRoot, 'scripts/fix-node-pty-perms.cjs', '')
+    }
     writeFixtureFile(packageRoot, 'node_modules/fastify/package.json', JSON.stringify({
         name: 'fastify',
         version: '0.0.0-test',
@@ -104,6 +112,19 @@ afterEach(() => {
 })
 
 describe('guard-publish-artifact', () => {
+    it('rejects an artifact missing required runtime preparation', () => {
+        const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', {
+            omitInstallPreparation: true
+        })
+        const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball], {
+            encoding: 'utf8',
+            timeout: 30_000
+        })
+
+        expect(result.status).toBe(1)
+        expect(result.stderr).toContain('scripts/fix-node-pty-perms.cjs')
+    }, 40_000)
+
     it('accepts an installed CLI whose reported Happy version matches package metadata', () => {
         const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56')
         const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball, '--install-smoke'], {
