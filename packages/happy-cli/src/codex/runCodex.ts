@@ -61,7 +61,11 @@ import {
     parseCodexGoalCommand,
     type CodexGoalCommand,
 } from './codexGoalStatus';
-import { prepareCodexSessionStart } from './initialPrompt';
+import {
+    assertCodexAutomationServerAvailable,
+    prepareCodexInitialPrompt,
+    prepareCodexSessionStart,
+} from './initialPrompt';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
@@ -81,7 +85,14 @@ export async function runCodex(opts: {
     // Shield killall/pkill against broad kills before anything is spawned —
     // Codex has no PreToolUse hook system, so the PATH shim is its only guard.
     installBroadKillShims();
-    const exitAfterFirstTurn = consumeAutomationRunOnce(process.env);
+    const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
+    const reconnectSession = readReconnectSessionEnvironment(process.env);
+    const reconnectSessionId = reconnectSession?.id;
+    const preparedInitialPrompt = prepareCodexInitialPrompt({
+        env: process.env,
+        reconnectSessionId,
+        automationRunOnceRequested,
+    });
 
     // Early check: ensure Codex CLI is installed before proceeding
     try {
@@ -163,8 +174,6 @@ export async function runCodex(opts: {
     // Resume-in-place must start from the latest server metadata snapshot.
     // Rebuilding a local document here can overwrite an existing title and
     // any provider fields while still satisfying the server CAS version.
-    const reconnectSession = readReconnectSessionEnvironment(process.env);
-    const reconnectSessionId = reconnectSession?.id;
     const metadata = mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata);
 
     let response: ApiSession | null;
@@ -178,6 +187,10 @@ export async function runCodex(opts: {
     } else {
         response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
     }
+    assertCodexAutomationServerAvailable({
+        automationRunOnceRequested,
+        serverAvailable: response !== null,
+    });
 
     // Handle server unreachable case - create offline stub with hot reconnection
     let session: ApiSessionClient;
@@ -341,9 +354,8 @@ export async function runCodex(opts: {
         });
     });
     session.onUserMessage(handleUserMessage);
-    await prepareCodexSessionStart({
-        env: process.env,
-        reconnectSessionId,
+    const initialPromptDelivered = await prepareCodexSessionStart({
+        prepared: preparedInitialPrompt,
         sendSessionMessage: (envelope) => session.sendSessionProtocolMessage(envelope),
         pushPrompt: (prompt) => {
             messageQueue.push(prompt, {
@@ -374,6 +386,10 @@ export async function runCodex(opts: {
             }
         } : undefined,
     });
+    // A run-once marker is only valid together with the fresh prompt supplied by
+    // the automation daemon. This prevents an incomplete or accidentally resumed
+    // startup from treating a later interactive message as the automation turn.
+    const exitAfterFirstTurn = preparedInitialPrompt.exitAfterFirstTurn && initialPromptDelivered;
     let thinking = false;
     let currentTurnId: string | null = null;
     let currentProviderTurnId: string | null = null;

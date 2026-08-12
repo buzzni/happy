@@ -24,6 +24,9 @@ const path = require('path');
 const PACKAGE_DIR = path.resolve(__dirname, '..');
 const PACKAGE_NAME = JSON.parse(fs.readFileSync(path.join(PACKAGE_DIR, 'package.json'), 'utf8')).name;
 const IS_WINDOWS = process.platform === 'win32';
+const CHILD_ENV = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => !/^npm_config_(?:global_|local_)?prefix$/i.test(key))
+);
 
 function run(cmd, args, { allowFailure = false } = {}) {
     const label = [cmd, ...args].join(' ');
@@ -31,6 +34,7 @@ function run(cmd, args, { allowFailure = false } = {}) {
     const result = spawnSync(cmd, args, {
         cwd: PACKAGE_DIR,
         stdio: 'inherit',
+        env: CHILD_ENV,
         // shell: true resolves `.cmd` shims on Windows so `pnpm` / `npm` / `happy` are found.
         shell: IS_WINDOWS,
     });
@@ -53,6 +57,7 @@ function runOutput(cmd, args) {
     const result = spawnSync(cmd, args, {
         cwd: PACKAGE_DIR,
         encoding: 'utf8',
+        env: CHILD_ENV,
         shell: IS_WINDOWS,
     });
 
@@ -72,6 +77,14 @@ function runOutput(cmd, args) {
     return result.stdout;
 }
 
+function runPnpm(args) {
+    const npmExecPath = process.env.npm_execpath;
+    if (npmExecPath && /(?:^|[\\/])pnpm(?:\.c?js)?$/i.test(npmExecPath)) {
+        return run(process.execPath, [npmExecPath, ...args]);
+    }
+    return run('pnpm', args);
+}
+
 function packPreparedPackage(preparedDir, outputDir) {
     const result = spawnSync('npm', [
         'pack',
@@ -82,6 +95,7 @@ function packPreparedPackage(preparedDir, outputDir) {
     ], {
         cwd: preparedDir,
         encoding: 'utf8',
+        env: CHILD_ENV,
         shell: IS_WINDOWS,
     });
 
@@ -118,8 +132,30 @@ function packPreparedPackage(preparedDir, outputDir) {
     return path.join(outputDir, filename);
 }
 
-function verifyBundledDependency() {
-    const npmRoot = runOutput('npm', ['root', '-g']).trim();
+function globalBinPath(globalPrefix, command) {
+    return IS_WINDOWS
+        ? path.join(globalPrefix, `${command}.cmd`)
+        : path.join(globalPrefix, 'bin', command);
+}
+
+function globalNodeModulesPath(globalPrefix) {
+    return IS_WINDOWS
+        ? path.join(globalPrefix, 'node_modules')
+        : path.join(globalPrefix, 'lib', 'node_modules');
+}
+
+function waitForDaemonHandoff(milliseconds) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function isDaemonRunning(happyExecutable) {
+    const output = runOutput(happyExecutable, ['daemon', 'status']);
+    process.stdout.write(output);
+    return output.includes('Daemon is running');
+}
+
+function verifyBundledDependency(globalPrefix) {
+    const npmRoot = globalNodeModulesPath(globalPrefix);
     const wireEntry = path.join(
         npmRoot,
         ...PACKAGE_NAME.split('/'),
@@ -142,18 +178,34 @@ const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'happy-cli-local-install-'
 const preparedDir = path.join(tempDir, 'package');
 
 try {
-    run('pnpm', ['--filter', '@slopus/happy-wire', 'run', 'build']);
-    run('pnpm', ['run', 'build']);
+    // Pin the destination before pnpm runs nested lifecycle commands. Otherwise an inherited
+    // npm prefix can redirect `npm install -g` into the workspace and shadow the real CLI.
+    const globalPrefix = runOutput('npm', ['prefix', '-g']).trim();
+    const globalHappy = globalBinPath(globalPrefix, 'happy');
+
+    runPnpm(['--filter', '@slopus/happy-wire', 'run', 'build']);
+    runPnpm(['run', 'build']);
     run('node', ['scripts/prepare-publish-package.cjs', '--out', preparedDir]);
     run('node', ['scripts/guard-publish-artifact.cjs', preparedDir, '--install-smoke']);
 
     const tarball = packPreparedPackage(preparedDir, tempDir);
 
-    run('happy', ['daemon', 'stop'], { allowFailure: true });
-    run('npm', ['install', '-g', tarball]);
-    verifyBundledDependency();
-    run('happy', ['daemon', 'start']);
-    run('happy', ['--version']);
+    const happyForStop = fs.existsSync(globalHappy) ? globalHappy : 'happy';
+    run(happyForStop, ['daemon', 'stop'], { allowFailure: true });
+    run('npm', ['install', '-g', '--prefix', globalPrefix, tarball]);
+    verifyBundledDependency(globalPrefix);
+    // A running daemon watches its bundle and may already be handing itself over to the
+    // newly installed copy. Let that handoff settle before issuing a start command.
+    waitForDaemonHandoff(2000);
+    const startStatus = run(globalHappy, ['daemon', 'start'], { allowFailure: true });
+    if (startStatus !== 0) {
+        console.log('\nDaemon start raced with the previous daemon shutdown; checking the handoff result.');
+        waitForDaemonHandoff(2000);
+        if (!isDaemonRunning(globalHappy)) {
+            run(globalHappy, ['daemon', 'start']);
+        }
+    }
+    run(globalHappy, ['--version']);
 } finally {
     fs.rmSync(tempDir, { force: true, recursive: true });
 }

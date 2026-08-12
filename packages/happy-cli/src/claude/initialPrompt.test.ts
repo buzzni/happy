@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest'
 import {
   buildInitialPromptUserRecord,
   consumePendingInitialPrompt,
+  deliverPreparedClaudeSessionStart,
   deliverInitialPrompt,
+  prepareClaudeInitialPrompt,
   type InitialPromptSink,
 } from './initialPrompt'
 import { CLAUDE_TITLE_INSTRUCTION } from './utils/titlePrompt'
@@ -19,6 +21,50 @@ describe('consumePendingInitialPrompt', () => {
   it('shouldReturnNullForMissingOrBlankPrompt', () => {
     expect(consumePendingInitialPrompt({})).toBeNull()
     expect(consumePendingInitialPrompt({ HAPPY_INITIAL_PROMPT: '   ' })).toBeNull()
+  })
+})
+
+describe('prepareClaudeInitialPrompt', () => {
+  it('requiresAndActivatesRunOnceOnlyForAFreshAutomationPrompt', () => {
+    const env = { HAPPY_INITIAL_PROMPT: '  업무 브리핑  ' }
+
+    expect(prepareClaudeInitialPrompt({
+      env,
+      automationRunOnceRequested: true,
+    })).toEqual({
+      prompt: '업무 브리핑',
+      exitAfterFirstTurn: true,
+    })
+    expect(env.HAPPY_INITIAL_PROMPT).toBeUndefined()
+  })
+
+  it('rejectsRunOnceAutomationWhenItsInitialPromptIsMissing', () => {
+    expect(() => prepareClaudeInitialPrompt({
+      env: {},
+      automationRunOnceRequested: true,
+    })).toThrow('Claude automation cannot start without a fresh initial prompt')
+  })
+
+  it('rejectsRunOnceAutomationInsteadOfReplayingItsPromptOnReconnect', () => {
+    const env = { HAPPY_INITIAL_PROMPT: 'stale prompt' }
+
+    expect(() => prepareClaudeInitialPrompt({
+      env,
+      reconnectSessionId: 'existing-session',
+      automationRunOnceRequested: true,
+    })).toThrow('Claude automation cannot start without a fresh initial prompt')
+    expect(env.HAPPY_INITIAL_PROMPT).toBeUndefined()
+  })
+
+  it('consumesAStaleInteractiveReconnectPromptWithoutActivatingRunOnce', () => {
+    const env = { HAPPY_INITIAL_PROMPT: 'stale prompt' }
+
+    expect(prepareClaudeInitialPrompt({
+      env,
+      reconnectSessionId: 'existing-session',
+      automationRunOnceRequested: false,
+    })).toEqual({ prompt: null, exitAfterFirstTurn: false })
+    expect(env.HAPPY_INITIAL_PROMPT).toBeUndefined()
   })
 })
 
@@ -75,5 +121,30 @@ describe('deliverInitialPrompt', () => {
     deliverInitialPrompt('prompt', sink)
     expect(pushed).toEqual(['prompt'])
     expect(recorded).toEqual(['prompt'])
+  })
+})
+
+describe('deliverPreparedClaudeSessionStart', () => {
+  it('reportsDaemonStartOnlyAfterThePromptIsRecordedAndQueued', async () => {
+    const events: string[] = []
+    const prepared = { prompt: '업무 브리핑', exitAfterFirstTurn: true }
+    const { sink } = makeSink({
+      sendClaudeSessionMessage: () => { events.push('record-prompt') },
+      recordAppPrompt: () => {},
+      pushPrompt: () => { events.push('queue-prompt') },
+    })
+
+    await expect(deliverPreparedClaudeSessionStart({
+      prepared,
+      sink,
+      reportStarted: async () => { events.push('report-started') },
+    })).resolves.toBe(true)
+
+    expect(events).toEqual(['record-prompt', 'queue-prompt', 'report-started'])
+    await expect(deliverPreparedClaudeSessionStart({
+      prepared,
+      sink,
+    })).resolves.toBe(false)
+    expect(events).toEqual(['record-prompt', 'queue-prompt', 'report-started'])
   })
 })
