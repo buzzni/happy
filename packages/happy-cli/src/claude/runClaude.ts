@@ -44,7 +44,7 @@ import { join } from 'node:path';
 import { RawJSONLinesSchema, type RawJSONLines } from './types';
 import { installBroadKillShims } from '@/utils/broadKillShims';
 import { readReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
-import { consumePendingInitialPrompt, deliverInitialPrompt } from './initialPrompt';
+import { deliverPreparedClaudeSessionStart, prepareClaudeInitialPrompt } from './initialPrompt';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
@@ -83,7 +83,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Shield killall/pkill against broad kills before anything is spawned —
     // everything this session launches inherits the shimmed PATH.
     installBroadKillShims();
-    const exitAfterFirstTurn = consumeAutomationRunOnce(process.env);
+    const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
 
     const workingDirectory = process.cwd();
     const sessionTag = randomUUID();
@@ -161,6 +161,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     const reconnectSession = readReconnectSessionEnvironment(process.env);
     const reconnectSessionId = reconnectSession?.id;
     const metadata = mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata);
+    const preparedInitialPrompt = prepareClaudeInitialPrompt({
+        env: process.env,
+        reconnectSessionId,
+        automationRunOnceRequested,
+    });
+    const exitAfterFirstTurn = preparedInitialPrompt.exitAfterFirstTurn;
 
     let response: ApiSession | null;
     if (reconnectSession) {
@@ -177,6 +183,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Handle server unreachable case - run Claude locally with hot reconnection
     // Note: connectionState.notifyOffline() was already called by api.ts with error details
     if (!response) {
+        if (automationRunOnceRequested) {
+            throw new Error('Claude automation cannot start while the Happy server is unavailable');
+        }
         let offlineSessionId: string | null = null;
 
         const reconnection = startOfflineReconnection({
@@ -253,25 +262,6 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     }
 
     logger.debug(`Session created: ${response.id}`);
-
-    // Always report to daemon if it exists
-    try {
-        logger.debug(`[START] Reporting session ${response.id} to daemon`);
-        const result = await notifyDaemonSessionStarted(response.id, metadata, {
-            encryptionKey: encodeBase64(response.encryptionKey),
-            encryptionVariant: response.encryptionVariant,
-            seq: response.seq,
-            metadataVersion: response.metadataVersion,
-            agentStateVersion: response.agentStateVersion,
-        });
-        if (result.error) {
-            logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
-        } else {
-            logger.debug(`[START] Reported session ${response.id} to daemon`);
-        }
-    } catch (error) {
-        logger.debug('[START] Failed to report to daemon (may not be running):', error);
-    }
 
     // SDK metadata (tools, slash commands) is now extracted from the
     // system.init message in claudeRemote.ts via onSDKMetadata callback
@@ -861,18 +851,38 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // prompt. See initialPrompt.ts for the full rationale. Always consumed
     // (so children never inherit the env), delivered only for fresh sessions —
     // a reconnect resumes an existing conversation.
-    const pendingInitialPrompt = consumePendingInitialPrompt(process.env);
-    if (pendingInitialPrompt && !reconnectSessionId) {
-        deliverInitialPrompt(pendingInitialPrompt, {
+    await deliverPreparedClaudeSessionStart({
+        prepared: preparedInitialPrompt,
+        sink: {
             sessionId: session.sessionId,
             hasTitle: () => session.hasTitle(),
             sendClaudeSessionMessage: (record) => session.sendClaudeSessionMessage(record),
             recordAppPrompt,
-            pushPrompt: (text) => messageQueue.push(text, currentEnhancedMode()),
-        });
-        logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
-    }
-
+            pushPrompt: (text) => {
+                messageQueue.push(text, currentEnhancedMode());
+                logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
+            },
+        },
+        reportStarted: async () => {
+            try {
+                logger.debug(`[START] Reporting session ${response.id} to daemon`);
+                const result = await notifyDaemonSessionStarted(response.id, metadata, {
+                    encryptionKey: encodeBase64(response.encryptionKey),
+                    encryptionVariant: response.encryptionVariant,
+                    seq: response.seq,
+                    metadataVersion: response.metadataVersion,
+                    agentStateVersion: response.agentStateVersion,
+                });
+                if (result.error) {
+                    logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
+                } else {
+                    logger.debug(`[START] Reported session ${response.id} to daemon`);
+                }
+            } catch (error) {
+                logger.debug('[START] Failed to report to daemon (may not be running):', error);
+            }
+        },
+    });
     // Setup signal handlers for graceful shutdown
     //
     // `archive`: whether to stamp lifecycleState='archived' on the way

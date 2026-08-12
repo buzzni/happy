@@ -256,6 +256,7 @@ describe('runClaude remote JSONL scanner', () => {
         delete process.env.HAPPY_FORK_CLAUDE_SESSION_ID;
         delete process.env.HAPPY_CREATED_BY_ACCOUNT_ID;
         delete process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
+        delete process.env.HAPPY_INITIAL_PROMPT;
         delete process.env.HAPPY_AUTOMATION_RUN_ONCE;
 
         mockReadSettings.mockResolvedValue({
@@ -368,6 +369,7 @@ describe('runClaude remote JSONL scanner', () => {
 
     it('consumes the automation run-once marker and passes it to the Claude loop', async () => {
         process.env.HAPPY_AUTOMATION_RUN_ONCE = '1';
+        process.env.HAPPY_INITIAL_PROMPT = '업무 브리핑';
 
         const harness = await startRemoteRunClaudeHarness();
 
@@ -375,6 +377,27 @@ describe('runClaude remote JSONL scanner', () => {
         expect(process.env.HAPPY_AUTOMATION_RUN_ONCE).toBeUndefined();
 
         await harness.finish();
+    });
+
+    it('fails closed instead of starting an offline interactive Claude for automation', async () => {
+        process.env.HAPPY_AUTOMATION_RUN_ONCE = '1';
+        process.env.HAPPY_INITIAL_PROMPT = '업무 브리핑';
+        const api = {
+            getOrCreateMachine: vi.fn(async () => ({})),
+            getOrCreateSession: vi.fn(async () => null),
+        };
+        mockApiClientCreate.mockResolvedValue(api);
+
+        await expect(runClaude({
+            token: 'token',
+            encryption: { type: 'legacy', secret: new Uint8Array(32) },
+        } as any, {
+            startingMode: 'remote',
+            shouldStartDaemon: false,
+        })).rejects.toThrow('Claude automation cannot start while the Happy server is unavailable');
+
+        expect(mockLoop).not.toHaveBeenCalled();
+        expect(mockNotifyDaemonSessionStarted).not.toHaveBeenCalled();
     });
 
     it('does not forward terminal JSONL messages while local mode owns the transcript', async () => {

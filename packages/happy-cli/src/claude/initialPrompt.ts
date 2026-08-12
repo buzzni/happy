@@ -35,6 +35,43 @@ export interface InitialPromptSink {
   pushPrompt(text: string): void
 }
 
+export type PreparedClaudeInitialPrompt = {
+  prompt: string | null
+  exitAfterFirstTurn: boolean
+}
+
+export function prepareClaudeInitialPrompt(input: {
+  env: NodeJS.ProcessEnv
+  reconnectSessionId?: string
+  automationRunOnceRequested: boolean
+}): PreparedClaudeInitialPrompt {
+  const consumedPrompt = consumePendingInitialPrompt(input.env)
+  const prompt = consumedPrompt && !input.reconnectSessionId ? consumedPrompt : null
+
+  if (input.automationRunOnceRequested && !prompt) {
+    throw new Error('Claude automation cannot start without a fresh initial prompt')
+  }
+
+  return {
+    prompt,
+    exitAfterFirstTurn: input.automationRunOnceRequested && prompt !== null,
+  }
+}
+
+export async function deliverPreparedClaudeSessionStart(input: {
+  prepared: PreparedClaudeInitialPrompt
+  sink: InitialPromptSink
+  reportStarted?: () => Promise<void>
+}): Promise<boolean> {
+  const prompt = input.prepared.prompt
+  input.prepared.prompt = null
+  if (prompt) {
+    deliverInitialPrompt(prompt, input.sink)
+  }
+  await input.reportStarted?.()
+  return prompt !== null
+}
+
 export function deliverInitialPrompt(prompt: string, sink: InitialPromptSink): void {
   // (b) 서버 히스토리: 원문 그대로 — 앱은 이 레코드로 사용자 말풍선을 그린다.
   sink.sendClaudeSessionMessage(buildInitialPromptUserRecord(prompt, sink.sessionId))
