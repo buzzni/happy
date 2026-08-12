@@ -51,4 +51,27 @@ describe('automation AgentTask bridge client', () => {
     stop()
     vi.useRealTimers()
   })
+
+  it('retries a transient heartbeat failure after the lease was established', async () => {
+    vi.useFakeTimers()
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response('{}', { status: 200 }))
+      .mockResolvedValueOnce(new Response('{}', { status: 500 }))
+      .mockResolvedValueOnce(new Response('{}', { status: 200 }))
+    const stop = maintainAutomationAgentTaskLease({
+      dispatch: {
+        taskId: 'task-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret', input: {}, context: [],
+        controlUrl: 'https://studio.test/api/agent-tasks',
+      },
+      intervalMs: 30_000,
+      fetchImpl: fetchImpl as never,
+    })
+
+    await vi.advanceTimersByTimeAsync(90_000)
+
+    expect(fetchImpl).toHaveBeenCalledTimes(3)
+    stop()
+    vi.useRealTimers()
+  })
 })

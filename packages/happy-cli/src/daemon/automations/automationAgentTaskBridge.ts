@@ -117,7 +117,8 @@ export function maintainAutomationAgentTaskLease(input: {
       if (response.ok) {
         heartbeatSucceeded = true
         failures = 0
-      } else if (heartbeatSucceeded || ++failures >= maxPreStartFailures) {
+      } else if ((response.status >= 400 && response.status < 500 && heartbeatSucceeded)
+          || ++failures >= maxPreStartFailures) {
         stop()
       }
     }).catch(() => {
