@@ -1,7 +1,7 @@
 import { homedir } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { buildSandboxRuntimeConfig } from './config';
+import { buildSandboxRuntimeConfig, filterCredentialsFromEnv } from './config';
 import type { SandboxConfig } from '@/persistence';
 
 const sessionPath = '/tmp/happy-session';
@@ -181,5 +181,19 @@ describe('buildSandboxRuntimeConfig', () => {
                 process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir;
             }
         }
+    });
+});
+
+describe('filterCredentialsFromEnv', () => {
+    it('removes inherited GitHub and cloud credentials while preserving runtime variables', () => {
+        expect(filterCredentialsFromEnv({
+            GH_TOKEN: 'github-secret',
+            AWS_ACCESS_KEY_ID: 'aws-secret',
+            PATH: '/usr/bin',
+            APLUS_AGENT_TASK_ID: 'task-1',
+        })).toEqual({
+            PATH: '/usr/bin',
+            APLUS_AGENT_TASK_ID: 'task-1',
+        });
     });
 });

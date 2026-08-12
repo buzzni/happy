@@ -49,7 +49,12 @@ import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
 import { encodeBase64, decodeBase64 } from '@/api/encryption';
-import { resolveRegularSpawnAgentArgs, resolveTmuxSpawnAgentCommand } from './spawnAgentCommand';
+import {
+  resolveRegularSpawnAgentArgs,
+  resolveReadOnlyAgentAuthEnvironment,
+  resolveTmuxSpawnAgentCommand,
+  shouldFilterSpawnCredentials,
+} from './spawnAgentCommand';
 import { applyServerSessionSnapshot, parseServerSessionSnapshot, type ServerSessionSnapshot } from './serverSessionSnapshot';
 import { buildReconnectSessionEnvironment, resolveResumeBaselineSeq } from './reconnectSessionEnv';
 import { hasLiveDaemonChild, shareInFlight } from './resumeGuards';
@@ -783,8 +788,15 @@ export async function startDaemon(): Promise<void> {
           extraEnv.HAPPY_AUTOMATION_RUN_ONCE = '1';
         }
 
-        // Check if sandbox is enabled (for credential filtering)
+        // Isolated sessions must not inherit unrelated daemon credentials.
         const hasSandbox = extraEnv.HAPPY_PROJECT_SANDBOX_CONFIG !== undefined;
+        const filterInheritedCredentials = shouldFilterSpawnCredentials({
+          sandboxEnabled: hasSandbox,
+          permissionMode: options.permissionMode,
+        });
+        const readOnlyAgentAuthEnv = !hasSandbox && options.permissionMode === 'read-only'
+          ? resolveReadOnlyAgentAuthEnvironment(options.agent, process.env)
+          : {};
 
         // Check if tmux is available and should be used
         const tmuxAvailable = await isTmuxAvailable();
@@ -837,11 +849,16 @@ export async function startDaemon(): Promise<void> {
           // 2. Regular spawn uses env: { ...process.env, ...extraEnv }
           // 3. tmux needs explicit environment via -e flags to ensure all variables are available
           const windowName = `happy-${Date.now()}-${agent}`;
-          // Filter credentials from daemon env when sandbox is enabled
+          // Explicit agent auth and task callbacks are overlaid after inherited
+          // credentials are filtered, so the reviewer keeps only what it needs.
           const daemonEnvFiltered = scrubSessionLineageEnv(
-            hasSandbox ? filterCredentialsFromEnv(process.env) : process.env,
+            filterInheritedCredentials ? filterCredentialsFromEnv(process.env) : process.env,
           );
-          const tmuxEnv: Record<string, string> = { ...daemonEnvFiltered, ...extraEnv };
+          const tmuxEnv: Record<string, string> = {
+            ...daemonEnvFiltered,
+            ...readOnlyAgentAuthEnv,
+            ...extraEnv,
+          };
 
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
             sessionName: tmuxSessionName,
@@ -926,7 +943,8 @@ export async function startDaemon(): Promise<void> {
             // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
             // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
             env: {
-              ...scrubSessionLineageEnv(hasSandbox ? filterCredentialsFromEnv(process.env) : process.env),
+              ...scrubSessionLineageEnv(filterInheritedCredentials ? filterCredentialsFromEnv(process.env) : process.env),
+              ...readOnlyAgentAuthEnv,
               ...extraEnv
             },
             directoryCreated,
