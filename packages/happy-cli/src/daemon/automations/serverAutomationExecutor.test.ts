@@ -325,7 +325,8 @@ describe('runServerAutomationTick', () => {
 
   it('dispatches AgentTask continuations on a poll without putting capabilities in the prompt', async () => {
     const {
-      input, store, queryGithubPullRequests, dispatchAgentTask, maintainAgentTaskLease, spawnSession,
+      input, store, queryGithubPullRequests, dispatchAgentTask, maintainAgentTaskLease,
+      resolveMcpSpawnContext, spawnSession,
     } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
     })
@@ -370,8 +371,11 @@ describe('runServerAutomationTick', () => {
     })
     const spawned = spawnSession.mock.calls[0]![0]
     expect(spawned.initialPrompt).toContain('Task ID: apply-1')
+    expect(spawned.initialPrompt).toContain('Retry network failures and 5xx responses')
     expect(spawned.initialPrompt).not.toContain('claim-secret')
     expect(spawned.initialPrompt).not.toContain('complete-secret')
+    expect(resolveMcpSpawnContext).not.toHaveBeenCalled()
+    expect(spawned).not.toHaveProperty('mcpSpawnContext')
     expect(spawned.environmentVariables).toMatchObject({
       APLUS_AGENT_TASK_ID: 'apply-1',
       APLUS_AGENT_TASK_CLAIM_TOKEN: 'claim-secret',
@@ -380,6 +384,59 @@ describe('runServerAutomationTick', () => {
     })
     expect(maintainAgentTaskLease).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'apply-1' }))
   })
+
+  it.each(['pr_review.v1', 'testing.v1'] as const)(
+    'does not grant the repository credential to a %s session',
+    async (taskType) => {
+      const { input, store, queryGithubPullRequests, dispatchAgentTask, spawnSession } = setup({
+        claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+      })
+      input.decryptPayload = vi.fn(() => ({
+        name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+        prompt: 'Review safely', directory: '/repo', scriptCommand: null,
+        suppressSilent: false, agent: 'codex' as const,
+        githubTrigger: {
+          event: 'opened' as const,
+          filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+          action: 'agent-task-review' as const,
+          githubCredentialId: 'credential-1',
+        },
+      }))
+      store.write({
+        ...store.read(),
+        githubTriggers: [{
+          automationId: 'automation-1', generation: 2,
+          state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+        }],
+      })
+      queryGithubPullRequests.mockResolvedValue({
+        ok: true,
+        githubEnvironment: { GH_TOKEN: 'must-not-reach-reviewer', GH_REPO: 'acme/app' },
+        pullRequests: [],
+      })
+      dispatchAgentTask.mockResolvedValue({
+        ok: true,
+        dispatch: {
+          taskId: 'read-only-1', type: taskType, agentRunId: 'automation:run-1',
+          claimToken: 'claim-secret', completeToken: 'complete-secret',
+          controlUrl: 'https://studio.test/api/agent-tasks',
+          input: { headSha: 'a'.repeat(40) }, context: [],
+        },
+      })
+
+      await runServerAutomationTick(input)
+      expect(spawnSession.mock.calls[0]![0].environmentVariables).toEqual(expect.objectContaining({
+        APLUS_AGENT_TASK_ID: 'read-only-1',
+      }))
+      expect(spawnSession.mock.calls[0]![0].environmentVariables).not.toHaveProperty('GH_TOKEN')
+      expect(spawnSession.mock.calls[0]![0].environmentVariables).not.toHaveProperty('GH_REPO')
+      if (taskType === 'pr_review.v1') {
+        expect(spawnSession.mock.calls[0]![0]).toMatchObject({ permissionMode: 'read-only' })
+      } else {
+        expect(spawnSession.mock.calls[0]![0]).not.toHaveProperty('permissionMode')
+      }
+    },
+  )
 
   it('records notify-only GitHub events without issuing an MCP grant or starting an LLM session', async () => {
     const {

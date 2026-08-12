@@ -80,6 +80,7 @@ export interface ServerAutomationExecutorInput {
     initialPrompt: string
     createdByAccountId: null
     agent: AutomationAgent
+    permissionMode?: 'read-only'
     mcpSpawnContext?: AutomationMcpSpawnContext
     environmentVariables?: Record<string, string>
   }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
@@ -117,6 +118,7 @@ function buildAgentTaskPrompt(
     '3. Perform only the task. PR review is read-only. Before review_apply, verify the PR is open and current HEAD equals reviewedHeadSha; otherwise return stale/failed without mutating. review_apply may then edit, test, commit, and push; testing runs checks only.',
     `4. Complete with exactly this result shape: ${AGENT_TASK_RESULT_CONTRACTS[dispatch.type]}`,
     '5. POST /complete with version=1, token=$APLUS_AGENT_TASK_COMPLETE_TOKEN, agentRunId, a stable idempotencyKey, and result.',
+    'Retry network failures and 5xx responses with the same idempotencyKey; do not retry 4xx responses.',
     'If the work cannot complete, POST /fail with the complete token and a concise reason. Do not put capabilities in output, commits, or PR text.',
   ].join('\n')
 }
@@ -257,7 +259,7 @@ async function executeStartedRun(
       agentTaskDispatch = bridged.dispatch
       prompt = buildAgentTaskPrompt(bridged.dispatch, payload.prompt)
       environmentVariables = {
-        ...(query.githubEnvironment ?? {}),
+        ...(bridged.dispatch.type === 'review_apply.v1' ? query.githubEnvironment ?? {} : {}),
         APLUS_AGENT_TASK_URL: bridged.dispatch.controlUrl,
         APLUS_AGENT_TASK_ID: bridged.dispatch.taskId,
         APLUS_AGENT_TASK_RUN_ID: bridged.dispatch.agentRunId,
@@ -291,7 +293,9 @@ async function executeStartedRun(
     if (!shouldWakeFromScriptOutput(script.stdout)) return { outcome: 'SKIPPED_GATE', sessionId: null }
     scriptOutput = script.stdout
   }
-  const mcpContext = await input.resolveMcpSpawnContext(run)
+  const mcpContext = agentTaskDispatch
+    ? { ok: true as const, value: null }
+    : await input.resolveMcpSpawnContext(run)
   if (!mcpContext.ok) {
     input.logDebug?.(`[server-automation] ${automation.automationId} MCP caller grant failed: ${mcpContext.error}`)
     return { outcome: 'ERROR', sessionId: null }
@@ -301,6 +305,7 @@ async function executeStartedRun(
     initialPrompt: buildAutomationPrompt(prompt, scriptOutput),
     createdByAccountId: null,
     agent: payload.agent ?? 'claude',
+    ...(agentTaskDispatch?.type === 'pr_review.v1' ? { permissionMode: 'read-only' as const } : {}),
     ...(environmentVariables ? { environmentVariables } : {}),
     ...(mcpContext.value ? { mcpSpawnContext: mcpContext.value } : {}),
   })

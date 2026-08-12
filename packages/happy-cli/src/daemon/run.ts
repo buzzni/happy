@@ -826,7 +826,10 @@ export async function startDaemon(): Promise<void> {
           const resumeFragment = resumeId
             ? ` --resume ${shellescape(resumeId)}`
             : '';
-          const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon --dangerously-skip-permissions${resumeFragment}`;
+          const permissionFragment = options.permissionMode
+            ? ` --permission-mode ${shellescape(options.permissionMode)}`
+            : ' --dangerously-skip-permissions';
+          const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon${permissionFragment}${resumeFragment}`;
 
           // Spawn in tmux with environment variables
           // IMPORTANT: Pass complete environment (process.env + extraEnv) because:
@@ -900,7 +903,9 @@ export async function startDaemon(): Promise<void> {
             ...agentArgs,
             '--happy-starting-mode', 'remote',
             '--started-by', 'daemon',
-            '--dangerously-skip-permissions'
+            ...(options.permissionMode
+              ? ['--permission-mode', options.permissionMode]
+              : ['--dangerously-skip-permissions']),
           ];
 
           // Resume ids attach the new Happy session to a pre-existing provider
@@ -1343,6 +1348,7 @@ export async function startDaemon(): Promise<void> {
         initialPrompt: string;
         createdByAccountId: string | null;
         agent: 'claude' | 'codex' | 'gemini' | 'openclaw' | 'opencode';
+        permissionMode?: 'read-only';
         mcpSpawnContext?: AutomationMcpSpawnContext;
         environmentVariables?: Record<string, string>;
       },
@@ -1353,6 +1359,7 @@ export async function startDaemon(): Promise<void> {
         agent: input.agent,
         initialPrompt: input.initialPrompt,
         exitAfterFirstTurn: input.agent === 'claude' || input.agent === 'codex',
+        ...(input.permissionMode ? { permissionMode: input.permissionMode } : {}),
         // 세션 자체는 데몬 소유자 자격증명으로 등록된다(자동화에 사용자 토큰을
         // 저장하지 않는다 — credentials-at-rest 금지). 귀속 표시만 넘긴다.
         createdByAccountId: input.createdByAccountId ?? undefined,
