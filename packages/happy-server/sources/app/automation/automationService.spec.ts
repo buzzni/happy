@@ -7,6 +7,7 @@ import {
     getAutomationTarget,
     listAutomationRuns,
     listAutomations,
+    replaceAutomationViewerKeyIfUnused,
     setAutomationViewerKey,
     updateAutomation,
 } from './automationService';
@@ -51,6 +52,7 @@ function makeTx(options: {
     actorStatus?: string;
     automation?: ReturnType<typeof automationRecord> | null;
     machineAccountId?: string;
+    activeAutomationCount?: number;
 } = {}) {
     const actorId = options.actorId ?? 'editor-1';
     const project = {
@@ -84,6 +86,7 @@ function makeTx(options: {
             })),
         },
         automation: {
+            count: vi.fn(async () => options.activeAutomationCount ?? (current ? 1 : 0)),
             findMany: vi.fn(async () => current ? [current] : []),
             findFirst: vi.fn(async ({ where }: { where: { projectId?: string } }) => (
                 current && (!where.projectId || current.projectId === where.projectId) ? current : null
@@ -265,6 +268,30 @@ describe('automationService', () => {
             expectedKeyVersion: 2,
             publicKey: new Uint8Array(32),
         })).resolves.toEqual({ ok: true, value: { keyVersion: 3 } });
+    });
+
+    it('replaces a mismatched viewer key only when the project has no active DB automations', async () => {
+        const empty = makeTx({ actorId: 'owner-1', automation: null });
+        const inUse = makeTx({ actorId: 'owner-1', activeAutomationCount: 1 });
+        const publicKey = new Uint8Array(32).fill(7);
+
+        await expect(replaceAutomationViewerKeyIfUnused(empty.tx as never, 'owner-1', 'project-1', {
+            expectedKeyVersion: 2,
+            publicKey,
+        })).resolves.toEqual({ ok: true, value: { keyVersion: 3 } });
+        expect(empty.tx.automation.count).toHaveBeenCalledWith({
+            where: { projectId: 'project-1', deletedAt: null },
+        });
+        expect(empty.tx.project.updateMany).toHaveBeenCalledWith({
+            where: { id: 'project-1', automationViewerKeyVersion: 2 },
+            data: { automationViewerPublicKey: publicKey, automationViewerKeyVersion: { increment: 1 } },
+        });
+
+        await expect(replaceAutomationViewerKeyIfUnused(inUse.tx as never, 'owner-1', 'project-1', {
+            expectedKeyVersion: 2,
+            publicKey,
+        })).resolves.toEqual({ ok: false, error: 'viewer-key-in-use' });
+        expect(inUse.tx.project.updateMany).not.toHaveBeenCalled();
     });
 
     it('rejects a viewer mutation and a stale machine envelope', async () => {

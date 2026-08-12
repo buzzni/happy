@@ -7,6 +7,7 @@ export type AutomationServiceError =
     | 'forbidden'
     | 'automation-target-unavailable'
     | 'viewer-key-unavailable'
+    | 'viewer-key-in-use'
     | 'viewer-key-version-conflict'
     | 'machine-key-version-conflict'
     | 'legacy-adoption-conflict'
@@ -169,6 +170,22 @@ export async function setAutomationViewerKey(
     });
     if (changed.count === 0) return { ok: false, error: 'viewer-key-version-conflict' };
     return { ok: true, value: { keyVersion: input.expectedKeyVersion + 1 } };
+}
+
+export async function replaceAutomationViewerKeyIfUnused(
+    tx: Tx,
+    actorId: string,
+    projectId: string,
+    input: { expectedKeyVersion: number; publicKey: Binary },
+): Promise<AutomationServiceResult<{ keyVersion: number }>> {
+    const access = await projectAccess(tx, actorId, projectId);
+    if (!access) return { ok: false, error: 'not-found' };
+    if (!access.canManageKeys) return { ok: false, error: 'forbidden' };
+    const activeAutomationCount = await tx.automation.count({
+        where: { projectId, deletedAt: null },
+    });
+    if (activeAutomationCount > 0) return { ok: false, error: 'viewer-key-in-use' };
+    return setAutomationViewerKey(tx, actorId, projectId, input);
 }
 
 function validateKeyVersions(

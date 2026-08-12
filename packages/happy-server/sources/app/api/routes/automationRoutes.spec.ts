@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
     getAutomationTarget: vi.fn(),
     listAutomationRuns: vi.fn(),
     listAutomations: vi.fn(),
+    replaceAutomationViewerKeyIfUnused: vi.fn(),
     resolveAutomationRunMcpContext: vi.fn(),
     setAutomationViewerKey: vi.fn(),
     updateAutomation: vi.fn(),
@@ -120,6 +121,44 @@ describe('automationRoutes', () => {
             projectId: 'project-1', automationId: 'automation-1', revision: 1,
             generation: 1, reason: 'upsert',
         });
+    });
+
+    it('exposes the guarded viewer-key replacement contract', async () => {
+        mocks.replaceAutomationViewerKeyIfUnused.mockResolvedValue({ ok: true, value: { keyVersion: 3 } });
+        const app = await makeApp();
+        const publicKey = Buffer.from(new Uint8Array(32).fill(7)).toString('base64');
+
+        const response = await app.inject({
+            method: 'PUT',
+            url: '/v1/projects/project-1/automation-viewer-key/replace-if-unused',
+            headers: { authorization: 'Bearer test' },
+            payload: { expectedKeyVersion: 2, publicKey },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toEqual({ keyVersion: 3 });
+        expect(mocks.replaceAutomationViewerKeyIfUnused).toHaveBeenCalledWith({}, 'user-1', 'project-1', {
+            expectedKeyVersion: 2,
+            publicKey: new Uint8Array(32).fill(7),
+        });
+    });
+
+    it('returns a distinct conflict when DB automations still use the viewer key', async () => {
+        mocks.replaceAutomationViewerKeyIfUnused.mockResolvedValue({ ok: false, error: 'viewer-key-in-use' });
+        const app = await makeApp();
+
+        const response = await app.inject({
+            method: 'PUT',
+            url: '/v1/projects/project-1/automation-viewer-key/replace-if-unused',
+            headers: { authorization: 'Bearer test' },
+            payload: {
+                expectedKeyVersion: 2,
+                publicKey: Buffer.from(new Uint8Array(32).fill(7)).toString('base64'),
+            },
+        });
+
+        expect(response.statusCode).toBe(409);
+        expect(response.json()).toEqual({ error: 'viewer-key-in-use' });
     });
 
     it('returns a running automation owner context only from the authenticated machine claim', async () => {

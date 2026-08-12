@@ -305,6 +305,7 @@ export type AutomationFetch = (url: string, init: {
 export interface AutomationApiClient {
   getTarget(projectId: string): Promise<AutomationTarget>;
   setViewerKey(projectId: string, input: z.infer<typeof automationViewerKeyRequestSchema>): Promise<{ keyVersion: number }>;
+  replaceViewerKeyIfUnused(projectId: string, input: z.infer<typeof automationViewerKeyRequestSchema>): Promise<{ keyVersion: number }>;
   listAutomations(projectId: string): Promise<AutomationPublic[]>;
   createAutomation(projectId: string, input: AutomationCreateRequest): Promise<AutomationPublic>;
   adoptAutomation(projectId: string, input: AutomationAdoptRequest): Promise<AutomationAdoption>;
@@ -358,6 +359,14 @@ export function createAutomationApiClient(options: {
     async setViewerKey(projectId, input) {
       return request(
         `/v1/projects/${pathId(projectId)}/automation-viewer-key`,
+        z.object({ keyVersion: positiveInteger }),
+        'PUT',
+        automationViewerKeyRequestSchema.parse(input),
+      );
+    },
+    async replaceViewerKeyIfUnused(projectId, input) {
+      return request(
+        `/v1/projects/${pathId(projectId)}/automation-viewer-key/replace-if-unused`,
         z.object({ keyVersion: positiveInteger }),
         'PUT',
         automationViewerKeyRequestSchema.parse(input),

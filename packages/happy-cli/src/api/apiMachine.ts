@@ -247,6 +247,9 @@ export class ApiMachineClient {
     private automationKey: MachineAutomationKey | null = null;
     private persistAutomationKeyVersion: ((version: number) => void) | null = null;
     private automationServerKeyVersion: number | null = null;
+    // Fail closed while server-backed ownership is unresolved. Legacy file ticks
+    // are enabled only after the server explicitly reports rollout disabled.
+    private automationLegacyFallbackEnabled = false;
     private lastKnownAutomationServerKeyVersion: number | null = null;
     private serverAutomationCache: ServerAutomationCache | null = null;
     private serverAutomationSyncInFlight: Promise<void> | null = null;
@@ -779,6 +782,10 @@ export class ApiMachineClient {
         this.serverAutomationCache = cache;
     }
 
+    shouldRunLegacyAutomationScheduler(): boolean {
+        return this.automationLegacyFallbackEnabled;
+    }
+
     serverAutomationTransport(): ServerAutomationTransport {
         return {
             claim: (input) => this.socket.emitWithAck('automation-claim', input),
@@ -805,6 +812,7 @@ export class ApiMachineClient {
     }
 
     private async registerAutomationKey(): Promise<void> {
+        this.automationLegacyFallbackEnabled = false;
         const key = this.automationKey;
         if (!key) return;
         const answer = await this.socket.emitWithAck('automation-key-register', {
@@ -812,6 +820,10 @@ export class ApiMachineClient {
             publicKey: Buffer.from(key.publicKey).toString('base64'),
         });
         if (!answer.ok || !answer.value || !Number.isSafeInteger(answer.value.keyVersion)) {
+            if (answer.error === 'feature-disabled') {
+                this.automationServerKeyVersion = null;
+                this.automationLegacyFallbackEnabled = true;
+            }
             logger.debug(`[API MACHINE] Automation key registration unavailable: ${answer.error ?? 'invalid-response'}`);
             return;
         }

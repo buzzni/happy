@@ -7,7 +7,7 @@ export interface AutomationDraft {
     name: string;
     prompt: string;
     directory: string;
-    scheduleKind: AutomationSchedule['kind'];
+    scheduleKind: Exclude<AutomationSchedule['kind'], 'github'>;
     intervalMinutes: string;
     dailyTime: string;
     scriptCommand: string;
@@ -17,6 +17,9 @@ export interface AutomationDraft {
 
 export function automationDraftFor(project: AutomationProject, item: ServerAutomationItem | null): AutomationDraft {
     const payload = item?.payload;
+    if (payload?.schedule.kind === 'github') {
+        throw new Error('GitHub trigger automations must be edited in Desktop.');
+    }
     return {
         projectId: project.id,
         item,

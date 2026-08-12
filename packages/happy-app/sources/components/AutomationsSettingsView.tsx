@@ -16,6 +16,7 @@ import {
     type AutomationProject,
     type ServerAutomationItem,
 } from '@/sync/serverAutomations';
+import { automationErrorMessage } from '@/sync/automationError';
 import { subscribeAutomationUpdates } from '@/sync/automationUpdates';
 import {
     automationDraftFor,
@@ -34,9 +35,9 @@ const AUTOMATION_AGENTS: Array<{ value: AutomationPayload['agent']; label: strin
 ];
 
 function scheduleLabel(schedule: AutomationSchedule): string {
-    return schedule.kind === 'interval'
-        ? `Every ${schedule.minutes} minutes`
-        : `Daily at ${String(schedule.hour).padStart(2, '0')}:${String(schedule.minute).padStart(2, '0')}`;
+    if (schedule.kind === 'interval') return `Every ${schedule.minutes} minutes`;
+    if (schedule.kind === 'github') return 'GitHub event trigger';
+    return `Daily at ${String(schedule.hour).padStart(2, '0')}:${String(schedule.minute).padStart(2, '0')}`;
 }
 
 function runLabel(item: ServerAutomationItem): string {
@@ -46,12 +47,6 @@ function runLabel(item: ServerAutomationItem): string {
         const session = run.sessionId ? ` · session ${run.sessionId}` : '';
         return `${new Date(run.completedAt ?? run.claimedAt).toLocaleString()} · ${result}${session}`;
     }).join('\n');
-}
-
-function errorMessage(error: unknown): string {
-    if (error instanceof AutomationApiError && error.status === 409) return 'This automation changed elsewhere. The latest version was reloaded.';
-    if (error instanceof AutomationApiError && error.status === 404) return 'Server-backed automations are not enabled for this account.';
-    return error instanceof Error ? error.message : String(error);
 }
 
 export function AutomationsSettingsView() {
@@ -79,7 +74,7 @@ export function AutomationsSettingsView() {
             setDecryptFailuresByProject((current) => ({ ...current, [projectId]: result.failedRowCount }));
             setErrorsByProject((current) => ({ ...current, [projectId]: null }));
         } catch (error) {
-            setErrorsByProject((current) => ({ ...current, [projectId]: errorMessage(error) }));
+            setErrorsByProject((current) => ({ ...current, [projectId]: automationErrorMessage(error) }));
             throw error;
         }
     }, [repository]);
@@ -93,7 +88,7 @@ export function AutomationsSettingsView() {
             setLoadError(null);
             await Promise.allSettled(nextProjects.map((project) => reloadProject(project.id)));
         } catch (error) {
-            setLoadError(errorMessage(error));
+            setLoadError(automationErrorMessage(error));
         } finally {
             setLoading(false);
         }
@@ -117,7 +112,7 @@ export function AutomationsSettingsView() {
             if (error instanceof AutomationApiError && error.status === 409) {
                 await reloadProject(projectId).catch(() => undefined);
             }
-            setErrorsByProject((current) => ({ ...current, [projectId]: errorMessage(error) }));
+            setErrorsByProject((current) => ({ ...current, [projectId]: automationErrorMessage(error) }));
             throw error;
         } finally {
             setBusyProjectId(null);
@@ -144,7 +139,7 @@ export function AutomationsSettingsView() {
             });
         } catch (error) {
             if (error instanceof AutomationApiError && error.status === 409) setDraft(null);
-            setDraftError(errorMessage(error));
+            setDraftError(automationErrorMessage(error));
         }
     }, [draft, mutate, repository]);
 
@@ -180,9 +175,11 @@ export function AutomationsSettingsView() {
                             <Item
                                 key={item.row.id}
                                 title={item.payload.name}
-                                subtitle={`${scheduleLabel(item.payload.schedule)} · ${item.row.paused ? 'Paused' : item.row.appliedRevision >= item.row.revision ? 'Synced' : 'Pending daemon sync'}\n${runLabel(item)}`}
+                                subtitle={`${scheduleLabel(item.payload.schedule)} · ${item.row.paused ? 'Paused' : item.row.appliedRevision >= item.row.revision ? 'Synced' : 'Pending daemon sync'}${item.payload.schedule.kind === 'github' ? ' · Manage in Desktop' : ''}\n${runLabel(item)}`}
                                 subtitleLines={8}
-                                onPress={editable ? () => { setDraft(automationDraftFor(project, item)); setDraftError(null); } : undefined}
+                                onPress={editable && item.payload.schedule.kind !== 'github'
+                                    ? () => { setDraft(automationDraftFor(project, item)); setDraftError(null); }
+                                    : undefined}
                                 rightElement={editable ? (
                                     <View style={{ flexDirection: 'row', gap: 8 }}>
                                         <Pressable

@@ -24,4 +24,13 @@ describe('automation draft', () => {
             suppressSilent: true, agent: 'codex',
         });
     });
+
+    it('does not silently convert GitHub triggers into daily schedules', () => {
+        const project = { id: 'project-1', name: 'Project', membership: 'owner' as const, config: null };
+        expect(() => automationDraftFor(project, {
+            row: {} as never,
+            payload: { schedule: { kind: 'github', minutes: 15 } } as never,
+            runs: [],
+        })).toThrow('must be edited in Desktop');
+    });
 });
