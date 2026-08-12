@@ -24,6 +24,8 @@ export interface PendingAutomationReport {
   outcome: ServerAutomationReportOutcome
   sessionId: string | null
   detailCiphertext: string | null
+  /** When this report was first queued. Absent on entries persisted before this field existed. */
+  createdAt?: number
 }
 
 export interface ServerAutomationRuntimeState {

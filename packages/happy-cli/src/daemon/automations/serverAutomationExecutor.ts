@@ -74,7 +74,7 @@ export interface ServerAutomationExecutorInput {
     runId: string
     claimToken: string
     sessionId: string
-  }) => Promise<{ ok: boolean; error?: string }>
+  }) => Promise<{ ok: boolean; error?: string; skipped?: boolean }>
   spawnSession: (input: {
     directory: string
     initialPrompt: string
@@ -145,6 +145,37 @@ function writeWithoutReport(runtimeStore: ServerAutomationRuntimeStore, reportId
   runtimeStore.write({ ...state, pendingReports: state.pendingReports.filter((report) => report.reportId !== reportId) })
 }
 
+// A daemon with no HAPPY_APLUS_MCP_CONFIG_URL wired up "skips" the link forever
+// (this is the normal, permanent state for plain OSS happy-cli users), so a
+// skipped link can't be retried indefinitely — that would leave one journal
+// entry per automation run stuck in the queue forever. Give a real Aplus
+// deployment a day to fix its daemon config before we stop trying.
+const LINK_RETRY_GIVEUP_MS = 24 * 60 * 60 * 1000
+
+function isLinkStillRetryable(
+  linked: { ok: boolean; error?: string; skipped?: boolean },
+  report: PendingAutomationReport,
+  now: number,
+): boolean {
+  if (!linked.ok) return true
+  if (!linked.skipped) return false
+  return now - (report.createdAt ?? now) < LINK_RETRY_GIVEUP_MS
+}
+
+function logLinkOutcome(
+  input: ServerAutomationExecutorInput,
+  linked: { ok: boolean; error?: string; skipped?: boolean },
+  stillRetrying: boolean,
+): void {
+  if (stillRetrying) {
+    input.logDebug?.(linked.skipped
+      ? '[server-automation] session project link still pending: HAPPY_APLUS_MCP_CONFIG_URL not set on this daemon yet'
+      : `[server-automation] session project link failed: ${linked.error ?? 'unknown error'}`)
+  } else if (linked.skipped) {
+    input.logDebug?.('[server-automation] session project link gave up after 24h: Aplus config still missing on this daemon')
+  }
+}
+
 async function flushPendingReports(input: ServerAutomationExecutorInput): Promise<void> {
   const pending = input.runtimeStore.read().pendingReports
   for (const report of pending) {
@@ -156,10 +187,9 @@ async function flushPendingReports(input: ServerAutomationExecutorInput): Promis
         claimToken: report.claimToken,
         sessionId: report.sessionId,
       })
-      if (!linked.ok) {
-        input.logDebug?.(`[server-automation] session project link failed: ${linked.error ?? 'unknown error'}`)
-        return
-      }
+      const stillRetrying = isLinkStillRetryable(linked, report, input.now)
+      logLinkOutcome(input, linked, stillRetrying)
+      if (stillRetrying) return
     }
     writeWithoutReport(input.runtimeStore, report.reportId)
   }
@@ -432,6 +462,7 @@ export async function runServerAutomationTick(
       outcome: result.outcome,
       sessionId: result.sessionId,
       detailCiphertext: null,
+      createdAt: input.now,
     }
     const state = input.runtimeStore.read()
     input.runtimeStore.write({ ...state, pendingReports: [...state.pendingReports, report] })
@@ -440,11 +471,9 @@ export async function runServerAutomationTick(
       const linked = report.sessionId
         ? await input.linkSession({ runId, claimToken, sessionId: report.sessionId })
         : { ok: true }
-      if (linked.ok) {
-        writeWithoutReport(input.runtimeStore, report.reportId)
-      } else {
-        input.logDebug?.(`[server-automation] session project link failed: ${linked.error ?? 'unknown error'}`)
-      }
+      const stillRetrying = isLinkStillRetryable(linked, report, input.now)
+      logLinkOutcome(input, linked, stillRetrying)
+      if (!stillRetrying) writeWithoutReport(input.runtimeStore, report.reportId)
     }
     outcomes.push({ automationId: automation.automationId, outcome: result.outcome })
   }
