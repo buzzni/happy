@@ -17,6 +17,8 @@ import { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { McpConfigSynchronizer, type McpConfigSource } from './mcpConfigSynchronizer';
 import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
 import { buildWorkerAgents, readWorkerConfigFromEnv } from "@/orchestrator/workerAgents";
+import { readExpectedConnectors } from '@/aplus/fetchAplusMcpServers';
+import { buildConnectorToolGuidance } from '@/aplus/connectorToolGuidance';
 
 export async function claudeRemote(opts: {
 
@@ -143,6 +145,8 @@ export async function claudeRemote(opts: {
     // work to it. No-op when unset, so single-model sessions are unchanged.
     const workerAgents = buildWorkerAgents(readWorkerConfigFromEnv(process.env));
     const workerDelegationSuffix = workerAgents.delegationPrompt ? '\n\n' + workerAgents.delegationPrompt : '';
+    const connectorGuidance = buildConnectorToolGuidance(readExpectedConnectors());
+    const connectorGuidanceSuffix = connectorGuidance ? '\n\n' + connectorGuidance : '';
 
     const mergedMcpServers = {
         ...opts.mcpServers,
@@ -157,7 +161,7 @@ export async function claudeRemote(opts: {
         model: initial.mode.model,
         fallbackModel: initial.mode.fallbackModel,
         customSystemPrompt: initial.mode.customSystemPrompt ? initial.mode.customSystemPrompt + '\n\n' + systemPrompt : undefined,
-        appendSystemPrompt: (initial.mode.appendSystemPrompt ? initial.mode.appendSystemPrompt + '\n\n' + systemPrompt : systemPrompt) + orchestratorPromptSuffix + workerDelegationSuffix,
+        appendSystemPrompt: (initial.mode.appendSystemPrompt ? initial.mode.appendSystemPrompt + '\n\n' + systemPrompt : systemPrompt) + orchestratorPromptSuffix + workerDelegationSuffix + connectorGuidanceSuffix,
         allowedTools: initial.mode.allowedTools ? initial.mode.allowedTools.concat(opts.allowedTools) : opts.allowedTools,
         disallowedTools: initial.mode.disallowedTools,
         effort: initial.mode.effort,

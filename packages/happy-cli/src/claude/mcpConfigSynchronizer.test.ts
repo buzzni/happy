@@ -60,6 +60,30 @@ describe('McpConfigSynchronizer', () => {
         }));
     });
 
+    it('reports a persistent expected connector mismatch distinctly', async () => {
+        const onStatus = vi.fn();
+        const synchronizer = new McpConfigSynchronizer({ setMcpServers: vi.fn() } as any, {
+            baseServers,
+            initialAplusServers,
+            fetchAplusServers: vi.fn(async () => ({
+                ok: false as const,
+                reason: 'connector-config-missing' as const,
+                error: 'Expected connector configuration is missing: knoi',
+                expected: ['gmail', 'knoi'],
+                configured: ['gmail'],
+                missing: ['knoi'],
+            })),
+            onStatus,
+        });
+
+        await synchronizer.sync();
+
+        expect(onStatus).toHaveBeenCalledWith(expect.objectContaining({
+            name: 'knoi',
+            status: 'connector-config-missing',
+        }));
+    });
+
     it('keeps last-known-good servers when config fetch throws', async () => {
         const setMcpServers = vi.fn();
         const onStatus = vi.fn();

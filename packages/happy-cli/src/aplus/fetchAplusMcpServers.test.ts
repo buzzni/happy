@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fetchAplusMcpServers, fetchAplusMcpServersResult } from './fetchAplusMcpServers';
+import {
+    fetchAplusMcpServers,
+    fetchAplusMcpServersResult,
+    mcpConfigFailureStatuses,
+} from './fetchAplusMcpServers';
 
 describe('fetchAplusMcpServersResult', () => {
     beforeEach(() => {
@@ -10,6 +14,8 @@ describe('fetchAplusMcpServersResult', () => {
         vi.unstubAllGlobals();
         delete process.env.HAPPY_APLUS_MCP_CONFIG_URL;
         delete process.env.HAPPY_APLUS_MCP_CALLER_GRANT;
+        delete process.env.HAPPY_APLUS_EXPECTED_CONNECTORS;
+        delete process.env.HAPPY_APLUS_MCP_INITIAL_LIFECYCLE;
     });
 
     it('returns a successful server map', async () => {
@@ -62,5 +68,95 @@ describe('fetchAplusMcpServersResult', () => {
         vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network down'); }));
 
         await expect(fetchAplusMcpServers('happy-token', 'machine-1')).resolves.toEqual({});
+    });
+
+    it('re-fetches config once when an expected connector is missing', async () => {
+        process.env.HAPPY_APLUS_EXPECTED_CONNECTORS = '["gmail","knoi"]';
+        process.env.HAPPY_APLUS_MCP_INITIAL_LIFECYCLE = 'spawn';
+        const fetchMock = vi.fn<typeof fetch>()
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                mcpServers: { gmail: { type: 'http', url: 'https://saycode.test/mcp/connector/gmail' } },
+            }), { status: 200 }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                mcpServers: {
+                    gmail: { type: 'http', url: 'https://saycode.test/mcp/connector/gmail' },
+                    knoi: { type: 'http', url: 'https://saycode.test/mcp/connector/knoi' },
+                },
+            }), { status: 200 }));
+        vi.stubGlobal('fetch', fetchMock);
+
+        await expect(fetchAplusMcpServersResult(
+            'happy-token',
+            'machine-1',
+            { sessionId: 'session-1', lifecycle: 'spawn' },
+        )).resolves.toMatchObject({ ok: true, servers: { gmail: expect.anything(), knoi: expect.anything() } });
+
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({
+            'X-Aplus-Expected-Connectors': 'gmail,knoi',
+            'X-Aplus-Session-Id': 'session-1',
+            'X-Aplus-Mcp-Lifecycle': 'spawn',
+        });
+    });
+
+    it('returns connector-config-missing after one retry without exposing credentials', async () => {
+        process.env.HAPPY_APLUS_EXPECTED_CONNECTORS = '["gmail","knoi"]';
+        const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+            mcpServers: {
+                gmail: {
+                    type: 'http',
+                    url: 'https://saycode.test/mcp/connector/gmail',
+                    headers: { Authorization: 'Bearer connector-secret' },
+                },
+            },
+        }), { status: 200 }));
+        vi.stubGlobal('fetch', fetchMock);
+
+        const result = await fetchAplusMcpServersResult(
+            'happy-secret-token',
+            'machine-1',
+            { sessionId: 'session-1', lifecycle: 'resume' },
+        );
+
+        expect(result).toEqual({
+            ok: false,
+            reason: 'connector-config-missing',
+            error: 'Expected connector configuration is missing: knoi',
+            expected: ['gmail', 'knoi'],
+            configured: ['gmail'],
+            missing: ['knoi'],
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(JSON.stringify(result)).not.toContain('connector-secret');
+        expect(JSON.stringify(result)).not.toContain('happy-secret-token');
+        expect(mcpConfigFailureStatuses(result, 123)).toEqual([{
+            name: 'knoi',
+            status: 'connector-config-missing',
+            error: 'Expected connector configuration is missing: knoi',
+            checkedAt: 123,
+        }]);
+    });
+
+    it('adopts authoritative expected connectors after disconnect or needsReauth', async () => {
+        process.env.HAPPY_APLUS_EXPECTED_CONNECTORS = '["gmail","knoi"]';
+        const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+            mcpServers: {
+                gmail: { type: 'http', url: 'https://saycode.test/mcp/connector/gmail' },
+            },
+            connectorReadiness: {
+                status: 'ready',
+                expected: ['gmail'],
+                configured: ['gmail'],
+                missing: [],
+            },
+        }), { status: 200 }));
+        vi.stubGlobal('fetch', fetchMock);
+
+        await expect(fetchAplusMcpServersResult('happy-token', 'machine-1', {
+            sessionId: 'session-1', lifecycle: 'turn',
+        })).resolves.toMatchObject({ ok: true, servers: { gmail: expect.anything() } });
+
+        expect(fetchMock).toHaveBeenCalledOnce();
+        expect(process.env.HAPPY_APLUS_EXPECTED_CONNECTORS).toBe('["gmail"]');
     });
 });

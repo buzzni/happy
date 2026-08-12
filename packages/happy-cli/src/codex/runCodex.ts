@@ -20,7 +20,12 @@ import { projectPath } from '@/projectPath';
 import { join } from 'node:path';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
-import { fetchAplusMcpServersResult } from '@/aplus/fetchAplusMcpServers';
+import {
+    fetchAplusMcpServersResult,
+    mcpConfigFailureStatuses,
+    readExpectedConnectors,
+} from '@/aplus/fetchAplusMcpServers';
+import { buildConnectorToolGuidance } from '@/aplus/connectorToolGuidance';
 import { bridgeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { CodexDisplay } from "@/ui/ink/CodexDisplay";
@@ -854,7 +859,20 @@ export async function runCodex(opts: {
     // codex would otherwise fail to start the MCP server, the change_title tool would
     // not be visible to the model, and the model would improvise with shell echoes.
     const bridgeEntrypoint = join(projectPath(), 'bin', 'happy-mcp.mjs');
-    const initialAplusMcpResult = await fetchAplusMcpServersResult(opts.credentials.token, machineId);
+    const initialAplusMcpResult = await fetchAplusMcpServersResult(
+        opts.credentials.token,
+        machineId,
+        { sessionId: session.sessionId },
+    );
+    for (const status of mcpConfigFailureStatuses(initialAplusMcpResult)) {
+        session.updateMetadata((currentMetadata) => ({
+            ...currentMetadata,
+            mcpServers: [
+                ...(currentMetadata.mcpServers ?? []).filter((server) => server.name !== status.name),
+                status,
+            ],
+        }));
+    }
     const initialAplusMcpServers = initialAplusMcpResult.ok ? initialAplusMcpResult.servers : {};
     const baseMcpServers = {
         happy: {
@@ -866,9 +884,24 @@ export async function runCodex(opts: {
     const mcpConfigSynchronizer = new CodexMcpConfigSynchronizer({
         baseServers: baseMcpServers,
         initialAplusServers: initialAplusMcpServers,
-        fetchAplusServers: () => fetchAplusMcpServersResult(opts.credentials.token, machineId),
+        fetchAplusServers: () => fetchAplusMcpServersResult(
+            opts.credentials.token,
+            machineId,
+            { sessionId: session.sessionId, lifecycle: 'turn' },
+        ),
         bridgeAplusServers: (servers) => bridgeAplusMcpServers(servers, bridgeOptions),
+        onStatus: (status) => {
+            session.updateMetadata((currentMetadata) => ({
+                ...currentMetadata,
+                mcpServers: [
+                    ...(currentMetadata.mcpServers ?? []).filter((server) => server.name !== status.name),
+                    status,
+                ],
+            }));
+        },
     });
+    const connectorGuidance = buildConnectorToolGuidance(readExpectedConnectors());
+    let connectorGuidanceInjected = false;
     let first = true;
     let appendSystemPromptInjected = false;
 
@@ -955,6 +988,7 @@ export async function runCodex(opts: {
                 reasoningProcessor.abort();
                 diffProcessor.reset();
                 appendSystemPromptInjected = false;
+                connectorGuidanceInjected = false;
                 thinking = false;
                 session.keepAlive(thinking, 'remote');
                 messageBuffer.addMessage('Context was reset', 'status');
@@ -1041,6 +1075,8 @@ export async function runCodex(opts: {
                     mode: message.mode,
                     includeAppendSystemPrompt,
                     includeTitleInstruction: first,
+                    connectorGuidance,
+                    includeConnectorGuidance: Boolean(connectorGuidance && !connectorGuidanceInjected),
                 });
 
                 const result = await client.sendTurnAndWait(turnPrompt, {
@@ -1054,6 +1090,7 @@ export async function runCodex(opts: {
                 if (includeAppendSystemPrompt) {
                     appendSystemPromptInjected = true;
                 }
+                if (connectorGuidance) connectorGuidanceInjected = true;
 
                 if (result.aborted) {
                     // Turn was aborted (user abort or permission cancel).

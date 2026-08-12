@@ -110,6 +110,31 @@ describe('CodexMcpConfigSynchronizer', () => {
         });
     });
 
+    it('reports a persistent expected connector mismatch distinctly', async () => {
+        const onStatus = vi.fn();
+        const synchronizer = new CodexMcpConfigSynchronizer({
+            baseServers,
+            initialAplusServers,
+            fetchAplusServers: async () => ({
+                ok: false,
+                reason: 'connector-config-missing' as const,
+                error: 'Expected connector configuration is missing: knoi',
+                expected: ['gmail', 'knoi'],
+                configured: ['gmail'],
+                missing: ['knoi'],
+            }),
+            bridgeAplusServers: bridge,
+            onStatus,
+        });
+
+        const result = await synchronizer.sync({ threadId: 'thread-1' });
+
+        expect(result.threadId).toBe('thread-1');
+        expect(onStatus).toHaveBeenCalledWith(expect.objectContaining({
+            name: 'knoi', status: 'connector-config-missing',
+        }));
+    });
+
     it('keeps the active thread and current servers when config fetch throws', async () => {
         const resumeThread = vi.fn(async () => ({ threadId: 'thread-1', model: 'gpt-test' }));
         const synchronizer = new CodexMcpConfigSynchronizer({

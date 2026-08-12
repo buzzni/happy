@@ -157,6 +157,38 @@ describe('claudeRemote', () => {
         }
     });
 
+    it('instructs the agent to discover expected connector tools before browser fallback', async () => {
+        process.env.HAPPY_APLUS_EXPECTED_CONNECTORS = '["gmail","knoi"]';
+        try {
+            vi.mocked(query).mockReturnValue({
+                setPermissionMode: vi.fn(),
+                mcpServerStatus: vi.fn(async () => []),
+                async *[Symbol.asyncIterator]() { yield { type: 'result', subtype: 'success' }; },
+            } as any);
+            let count = 0;
+
+            await claudeRemote({
+                sessionId: null,
+                path: process.cwd(),
+                allowedTools: [],
+                hookSettingsPath: '/tmp/happy-test-settings.json',
+                nextMessage: async () => (count++ === 0 ? { message: 'check gmail', mode } : null),
+                onReady: vi.fn(),
+                canCallTool: async () => ({ behavior: 'allow' }) as any,
+                isAborted: () => false,
+                onSessionFound: vi.fn(),
+                onThinkingChange: vi.fn(),
+                onMessage: vi.fn(),
+            });
+
+            expect(vi.mocked(query).mock.calls[0][0].options?.appendSystemPrompt).toContain(
+                'deferred MCP tool discovery',
+            );
+        } finally {
+            delete process.env.HAPPY_APLUS_EXPECTED_CONNECTORS;
+        }
+    });
+
     it('enables prompt suggestions and routes them outside the conversation transcript', async () => {
         vi.mocked(query).mockReturnValue({
             setPermissionMode: vi.fn(),

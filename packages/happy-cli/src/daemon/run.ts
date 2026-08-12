@@ -713,7 +713,7 @@ export async function startDaemon(): Promise<void> {
         let extraEnv: Record<string, string> = injectMcpCallerGrant({
           ...authEnv,
           ...(options.environmentVariables ?? {}),
-        }, mcpCallerGrant, process.env.HAPPY_APLUS_MCP_CONFIG_URL, mcpConfigProjectId);
+        }, mcpCallerGrant, process.env.HAPPY_APLUS_MCP_CONFIG_URL, mcpConfigProjectId, options.expectedConnectors, 'spawn');
         if (options.parentSessionId) {
           extraEnv.HAPPY_FORKED_FROM_SESSION_ID = options.parentSessionId;
         }
@@ -1084,6 +1084,7 @@ export async function startDaemon(): Promise<void> {
       permissionMode?: string;
       mcpCallerGrantEnvelope?: string;
       mcpConfigProjectId?: string;
+      expectedConnectors?: string[];
     };
 
     const spawnResumedSession = async (happySessionId: string, options?: ResumeSessionOptions): Promise<SpawnSessionResult> => {
@@ -1182,6 +1183,8 @@ export async function startDaemon(): Promise<void> {
           },
           mcpCallerGrantEnvelope: options?.mcpCallerGrantEnvelope,
           mcpConfigProjectId: options?.mcpConfigProjectId,
+          expectedConnectors: options?.expectedConnectors,
+          lifecycle: 'resume',
           trustedConfigUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
         }, mcpCallerGrantConsumer);
         if (!mcpEnvironment.ok) {

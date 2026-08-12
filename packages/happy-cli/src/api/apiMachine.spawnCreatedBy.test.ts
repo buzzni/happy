@@ -89,6 +89,29 @@ describe('ApiMachineClient spawn/resume RPC passthrough', () => {
         }));
     });
 
+    it('forwards expected connector provider names to spawn and rejects account-shaped values', async () => {
+        const spawnSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-1' });
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ spawnSession }));
+        const handler = handlersFrom(client).get('machine-1:spawn-happy-session');
+
+        await handler?.({
+            directory: '/tmp/project',
+            agent: 'codex',
+            expectedConnectors: ['gmail', 'knoi'],
+        });
+
+        expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
+            expectedConnectors: ['gmail', 'knoi'],
+        }));
+        await expect(handler?.({
+            directory: '/tmp/project',
+            agent: 'codex',
+            expectedConnectors: ['private@example.com'],
+        })).rejects.toThrow('Expected connectors must contain provider names only');
+    });
+
     it('forwards createdByAccountId/createdByDisplayName to spawnSession', async () => {
         const calls: any[] = [];
         const spawnSession = (options: any) => {
@@ -214,12 +237,14 @@ describe('ApiMachineClient spawn/resume RPC passthrough', () => {
             permissionMode: 'bypassPermissions',
             mcpCallerGrantEnvelope: 'ENCRYPTED-RESUME-GRANT',
             mcpConfigProjectId: 'P-1',
+            expectedConnectors: ['gmail', 'knoi'],
         });
 
         expect(resumeSession).toHaveBeenCalledWith('happy-1', expect.objectContaining({
             permissionMode: 'bypassPermissions',
             mcpCallerGrantEnvelope: 'ENCRYPTED-RESUME-GRANT',
             mcpConfigProjectId: 'P-1',
+            expectedConnectors: ['gmail', 'knoi'],
         }));
     });
 });

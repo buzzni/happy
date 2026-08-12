@@ -1,5 +1,6 @@
 import type { McpReconnectResult, McpRuntimeServerStatus } from '@slopus/happy-wire';
 import type { McpServerStatus, Query } from '@anthropic-ai/claude-agent-sdk';
+import { readExpectedConnectors } from '@/aplus/fetchAplusMcpServers';
 
 type McpQueryControl = Pick<Query, 'mcpServerStatus' | 'reconnectMcpServer'>;
 
@@ -10,6 +11,7 @@ type McpRuntimeRecoveryOptions = {
     now?: () => number;
     sleep?: (ms: number) => Promise<void>;
     onStatus?: (status: McpRuntimeServerStatus) => void;
+    connectorNames?: string[];
 };
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -29,6 +31,7 @@ export class McpRuntimeRecovery {
     private readonly now: () => number;
     private readonly sleep: (ms: number) => Promise<void>;
     private readonly onStatus?: (status: McpRuntimeServerStatus) => void;
+    private readonly connectorNames: Set<string>;
     private readonly inFlight = new Map<string, Promise<McpReconnectResult>>();
     private readonly cooldownUntil = new Map<string, number>();
 
@@ -42,6 +45,7 @@ export class McpRuntimeRecovery {
         this.now = options.now ?? Date.now;
         this.sleep = options.sleep ?? defaultSleep;
         this.onStatus = options.onStatus;
+        this.connectorNames = new Set(options.connectorNames ?? readExpectedConnectors());
     }
 
     async recoverFailedServers(): Promise<void> {
@@ -140,11 +144,15 @@ export class McpRuntimeRecovery {
     }
 
     private emit(status: Pick<McpServerStatus, 'name' | 'status' | 'error'>): void {
-        const mappedStatus: McpRuntimeServerStatus['status'] = status.status === 'pending'
+        let mappedStatus: McpRuntimeServerStatus['status'] = status.status === 'pending'
             ? 'reconnecting'
             : status.status === 'disabled'
                 ? 'failed'
                 : status.status;
+        if (this.connectorNames.has(status.name)) {
+            if (mappedStatus === 'failed') mappedStatus = 'connector-runtime-failed';
+            if (mappedStatus === 'needs-auth') mappedStatus = 'connector-needs-auth';
+        }
         this.onStatus?.({
             name: status.name,
             status: mappedStatus,

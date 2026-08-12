@@ -47,6 +47,8 @@ describe('McpCallerGrantEnvelopeConsumer', () => {
             },
             mcpCallerGrantEnvelope: envelope(grant(), keyPair.publicKey),
             mcpConfigProjectId: 'P-1',
+            expectedConnectors: ['gmail', 'knoi'],
+            lifecycle: 'resume',
             trustedConfigUrl: 'https://saycode.ai/api/me/mcp-config',
         }, consumer);
 
@@ -56,6 +58,8 @@ describe('McpCallerGrantEnvelopeConsumer', () => {
                 SAFE: 'value',
                 HAPPY_APLUS_MCP_CALLER_GRANT: grant(),
                 HAPPY_APLUS_MCP_CONFIG_URL: 'https://saycode.ai/api/me/mcp-config?project_id=P-1',
+                HAPPY_APLUS_EXPECTED_CONNECTORS: '["gmail","knoi"]',
+                HAPPY_APLUS_MCP_INITIAL_LIFECYCLE: 'resume',
             },
         });
     });
@@ -79,10 +83,13 @@ describe('McpCallerGrantEnvelopeConsumer', () => {
             SAFE: 'value',
             HAPPY_APLUS_MCP_CALLER_GRANT: 'client-supplied-grant',
             HAPPY_APLUS_MCP_CONFIG_URL: 'https://attacker.test/collect',
+            HAPPY_APLUS_EXPECTED_CONNECTORS: '["attacker"]',
             HAPPY_APLUS_OTHER: 'caller-controlled',
-        }, undefined, 'https://saycode.ai/api/me/mcp-config', 'P-1')).toEqual({
+        }, undefined, 'https://saycode.ai/api/me/mcp-config', 'P-1', ['gmail'], 'spawn')).toEqual({
             SAFE: 'value',
             HAPPY_APLUS_MCP_CONFIG_URL: 'https://saycode.ai/api/me/mcp-config?project_id=P-1',
+            HAPPY_APLUS_EXPECTED_CONNECTORS: '["gmail"]',
+            HAPPY_APLUS_MCP_INITIAL_LIFECYCLE: 'spawn',
         });
         expect(injectMcpCallerGrant({
             SAFE: 'value',
