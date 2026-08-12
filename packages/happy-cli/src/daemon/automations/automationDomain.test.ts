@@ -155,6 +155,7 @@ describe('schedule computation', () => {
   it('advances interval schedules by their period', () => {
     const from = new Date(2026, 0, 15, 8, 30).getTime()
     expect(computeNextRunAt({ kind: 'interval', minutes: 30 }, from)).toBe(from + 30 * 60_000)
+    expect(computeNextRunAt({ kind: 'github', minutes: 15 }, from)).toBe(from + 15 * 60_000)
   })
 
   it('picks today for a daily schedule still ahead, tomorrow otherwise', () => {

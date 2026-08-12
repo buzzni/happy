@@ -10,6 +10,60 @@ import {
   type AutomationPublic,
 } from './automation';
 
+describe('github trigger automation payload', () => {
+  it('accepts a server-backed PR trigger without changing legacy scheduled payloads', () => {
+    const payload = {
+      name: 'PR review',
+      schedule: { kind: 'github' as const, minutes: 15 },
+      prompt: 'Review {pr.number}: {pr.title}',
+      directory: '/repo',
+      scriptCommand: null,
+      suppressSilent: false,
+      agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: {
+          baseBranch: 'main', label: null, excludeDraft: true,
+          authors: ['octocat'], paths: ['apps/web'],
+        },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    };
+
+    expect(automationPayloadSchema.parse(payload)).toEqual(payload);
+    const { githubTrigger: _githubTrigger, ...legacyPayload } = payload;
+    expect(automationPayloadSchema.safeParse(legacyPayload).success).toBe(false);
+    expect(automationPayloadSchema.safeParse({
+      ...payload,
+      schedule: { kind: 'interval', minutes: 15 },
+    }).success).toBe(false);
+    expect(automationPayloadSchema.parse({
+      ...legacyPayload,
+      schedule: { kind: 'interval', minutes: 15 },
+    })).toEqual({ ...legacyPayload, schedule: { kind: 'interval', minutes: 15 } });
+  });
+
+  it('accepts AgentTask review only with an explicit GitHub credential', () => {
+    const githubTrigger = {
+      event: 'opened' as const,
+      filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+      action: 'agent-task-review' as const,
+      githubCredentialId: 'credential-1',
+    };
+    expect(automationPayloadSchema.safeParse({
+      ...payload,
+      schedule: { kind: 'github', minutes: 15 },
+      githubTrigger,
+    }).success).toBe(true);
+    expect(automationPayloadSchema.safeParse({
+      ...payload,
+      schedule: { kind: 'github', minutes: 15 },
+      githubTrigger: { ...githubTrigger, githubCredentialId: null },
+    }).success).toBe(false);
+  });
+});
+
 function bytes(length: number, value: number): Uint8Array {
   return new Uint8Array(length).fill(value);
 }

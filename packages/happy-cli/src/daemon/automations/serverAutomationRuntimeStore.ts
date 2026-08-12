@@ -1,6 +1,12 @@
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 
+import type {
+  GithubPullRequestSnapshot,
+  GithubTriggerEventMatch,
+  GithubTriggerRuntimeState,
+} from './githubTriggerDomain'
+
 export type ServerAutomationReportOutcome = 'WOKE' | 'SILENT' | 'SKIPPED_GATE' | 'ERROR'
 
 export interface ServerAutomationScheduleState {
@@ -22,6 +28,11 @@ export interface PendingAutomationReport {
 
 export interface ServerAutomationRuntimeState {
   schedules: ServerAutomationScheduleState[]
+  githubTriggers?: Array<{
+    automationId: string
+    generation: number
+    state: GithubTriggerRuntimeState
+  }>
   pendingReports: PendingAutomationReport[]
 }
 
@@ -53,6 +64,47 @@ function nullableText(value: unknown): string | null {
   return value === null ? null : text(value)
 }
 
+function parsePullRequest(value: unknown): GithubPullRequestSnapshot {
+  const row = record(value)
+  const author = row.author === null ? null : record(row.author)
+  if (!Array.isArray(row.labels) || !Array.isArray(row.files) || typeof row.isDraft !== 'boolean') invalid()
+  return {
+    number: integer(row.number, 1),
+    title: text(row.title, 10_000),
+    url: text(row.url, 2_000),
+    author: author === null ? null : { login: text(author.login, 200) },
+    baseRefName: text(row.baseRefName, 512),
+    headRefName: text(row.headRefName, 512),
+    isDraft: row.isDraft,
+    state: text(row.state, 32),
+    mergedAt: nullableText(row.mergedAt),
+    labels: row.labels.map((value) => ({ name: text(record(value).name, 200) })),
+    changedFiles: integer(row.changedFiles),
+    files: row.files.map((value) => ({ path: text(record(value).path, 2_000) })),
+  }
+}
+
+function parseGithubEvent(value: unknown): GithubTriggerEventMatch {
+  const row = record(value)
+  if (!['opened', 'ready_for_review', 'merged', 'closed'].includes(row.event as string)) invalid()
+  return {
+    id: text(row.id, 256),
+    event: row.event as GithubTriggerEventMatch['event'],
+    pr: parsePullRequest(row.pr),
+  }
+}
+
+function parseGithubState(value: unknown): GithubTriggerRuntimeState {
+  const row = record(value)
+  if (!Array.isArray(row.snapshot) || !Array.isArray(row.processed) || !Array.isArray(row.pending)) invalid()
+  return {
+    snapshot: row.snapshot.map(parsePullRequest),
+    highestPrNumber: integer(row.highestPrNumber),
+    processed: row.processed.map((value) => text(value, 256)),
+    pending: row.pending.map(parseGithubEvent),
+  }
+}
+
 function parse(raw: string): ServerAutomationRuntimeState {
   try {
     const disk = record(JSON.parse(raw))
@@ -81,7 +133,17 @@ function parse(raw: string): ServerAutomationRuntimeState {
         detailCiphertext: nullableText(row.detailCiphertext),
       }
     })
-    return { schedules, pendingReports }
+    const githubRows = disk.githubTriggers === undefined ? [] : disk.githubTriggers
+    if (!Array.isArray(githubRows)) invalid()
+    const githubTriggers = githubRows.map((value) => {
+      const row = record(value)
+      return {
+        automationId: text(row.automationId, 200),
+        generation: integer(row.generation, 1),
+        state: parseGithubState(row.state),
+      }
+    })
+    return { schedules, githubTriggers, pendingReports }
   } catch (error) {
     if (error instanceof Error && error.message === 'automation-runtime-invalid') throw error
     invalid()
@@ -96,7 +158,9 @@ export function createServerAutomationRuntimeStore(options: { filePath: string }
         chmodSync(options.filePath, 0o600)
         return state
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { schedules: [], pendingReports: [] }
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          return { schedules: [], githubTriggers: [], pendingReports: [] }
+        }
         throw error
       }
     },

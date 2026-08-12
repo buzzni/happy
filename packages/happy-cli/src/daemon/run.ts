@@ -49,7 +49,12 @@ import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
 import { encodeBase64, decodeBase64 } from '@/api/encryption';
-import { resolveRegularSpawnAgentArgs, resolveTmuxSpawnAgentCommand } from './spawnAgentCommand';
+import {
+  resolveRegularSpawnAgentArgs,
+  resolveReadOnlyAgentAuthEnvironment,
+  resolveTmuxSpawnAgentCommand,
+  shouldFilterSpawnCredentials,
+} from './spawnAgentCommand';
 import { applyServerSessionSnapshot, parseServerSessionSnapshot, type ServerSessionSnapshot } from './serverSessionSnapshot';
 import { buildReconnectSessionEnvironment, resolveResumeBaselineSeq } from './reconnectSessionEnv';
 import { hasLiveDaemonChild, shareInFlight } from './resumeGuards';
@@ -73,6 +78,11 @@ import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
 import { createAutomationTickRunner } from './automations/automationTickRunner';
 import { runAutomationScript } from './automations/runAutomationScript';
+import { queryGithubPullRequests } from './automations/queryGithubPullRequests';
+import {
+  dispatchAutomationAgentTask,
+  maintainAutomationAgentTaskLease,
+} from './automations/automationAgentTaskBridge';
 import {
   loadOrCreateMachineAutomationKey,
   updateMachineAutomationKeyRegistration,
@@ -778,8 +788,15 @@ export async function startDaemon(): Promise<void> {
           extraEnv.HAPPY_AUTOMATION_RUN_ONCE = '1';
         }
 
-        // Check if sandbox is enabled (for credential filtering)
+        // Isolated sessions must not inherit unrelated daemon credentials.
         const hasSandbox = extraEnv.HAPPY_PROJECT_SANDBOX_CONFIG !== undefined;
+        const filterInheritedCredentials = shouldFilterSpawnCredentials({
+          sandboxEnabled: hasSandbox,
+          permissionMode: options.permissionMode,
+        });
+        const readOnlyAgentAuthEnv = options.permissionMode === 'read-only'
+          ? resolveReadOnlyAgentAuthEnvironment(options.agent, process.env)
+          : {};
 
         // Check if tmux is available and should be used
         const tmuxAvailable = await isTmuxAvailable();
@@ -821,7 +838,10 @@ export async function startDaemon(): Promise<void> {
           const resumeFragment = resumeId
             ? ` --resume ${shellescape(resumeId)}`
             : '';
-          const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon --dangerously-skip-permissions${resumeFragment}`;
+          const permissionFragment = options.permissionMode
+            ? ` --permission-mode ${shellescape(options.permissionMode)}`
+            : ' --dangerously-skip-permissions';
+          const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon${permissionFragment}${resumeFragment}`;
 
           // Spawn in tmux with environment variables
           // IMPORTANT: Pass complete environment (process.env + extraEnv) because:
@@ -829,11 +849,16 @@ export async function startDaemon(): Promise<void> {
           // 2. Regular spawn uses env: { ...process.env, ...extraEnv }
           // 3. tmux needs explicit environment via -e flags to ensure all variables are available
           const windowName = `happy-${Date.now()}-${agent}`;
-          // Filter credentials from daemon env when sandbox is enabled
+          // Explicit agent auth and task callbacks are overlaid after inherited
+          // credentials are filtered, so the reviewer keeps only what it needs.
           const daemonEnvFiltered = scrubSessionLineageEnv(
-            hasSandbox ? filterCredentialsFromEnv(process.env) : process.env,
+            filterInheritedCredentials ? filterCredentialsFromEnv(process.env) : process.env,
           );
-          const tmuxEnv: Record<string, string> = { ...daemonEnvFiltered, ...extraEnv };
+          const tmuxEnv: Record<string, string> = {
+            ...daemonEnvFiltered,
+            ...readOnlyAgentAuthEnv,
+            ...extraEnv,
+          };
 
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
             sessionName: tmuxSessionName,
@@ -895,7 +920,9 @@ export async function startDaemon(): Promise<void> {
             ...agentArgs,
             '--happy-starting-mode', 'remote',
             '--started-by', 'daemon',
-            '--dangerously-skip-permissions'
+            ...(options.permissionMode
+              ? ['--permission-mode', options.permissionMode]
+              : ['--dangerously-skip-permissions']),
           ];
 
           // Resume ids attach the new Happy session to a pre-existing provider
@@ -916,7 +943,8 @@ export async function startDaemon(): Promise<void> {
             // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
             // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
             env: {
-              ...scrubSessionLineageEnv(hasSandbox ? filterCredentialsFromEnv(process.env) : process.env),
+              ...scrubSessionLineageEnv(filterInheritedCredentials ? filterCredentialsFromEnv(process.env) : process.env),
+              ...readOnlyAgentAuthEnv,
               ...extraEnv
             },
             directoryCreated,
@@ -1338,7 +1366,9 @@ export async function startDaemon(): Promise<void> {
         initialPrompt: string;
         createdByAccountId: string | null;
         agent: 'claude' | 'codex' | 'gemini' | 'openclaw' | 'opencode';
+        permissionMode?: 'read-only';
         mcpSpawnContext?: AutomationMcpSpawnContext;
+        environmentVariables?: Record<string, string>;
       },
     ): Promise<{ ok: true; sessionId: string } | { ok: false; error: string }> => {
       const result = await spawnSession({
@@ -1347,9 +1377,11 @@ export async function startDaemon(): Promise<void> {
         agent: input.agent,
         initialPrompt: input.initialPrompt,
         exitAfterFirstTurn: input.agent === 'claude' || input.agent === 'codex',
+        ...(input.permissionMode ? { permissionMode: input.permissionMode } : {}),
         // 세션 자체는 데몬 소유자 자격증명으로 등록된다(자동화에 사용자 토큰을
         // 저장하지 않는다 — credentials-at-rest 금지). 귀속 표시만 넘긴다.
         createdByAccountId: input.createdByAccountId ?? undefined,
+        environmentVariables: input.environmentVariables,
       }, input.mcpSpawnContext);
       if (result.type === 'success') {
         return { ok: true, sessionId: result.sessionId };
@@ -1488,6 +1520,25 @@ export async function startDaemon(): Promise<void> {
         transport: apiMachine.serverAutomationTransport(),
         decryptPayload: decryptServerAutomationPayload,
         runScript: (input) => runAutomationScript({ ...input, allowedRoot: automationAllowedRoot }),
+        queryGithubPullRequests: (input) => queryGithubPullRequests({
+          ...input,
+          configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+          machineToken: credentials.token,
+          machineId,
+          allowedRoot: automationAllowedRoot,
+        }),
+        notifyGithubTrigger: ({ title, body, url }) => {
+          api.push().sendToAllDevices(title, body, { kind: 'github-trigger', url });
+        },
+        dispatchAgentTask: (input) => dispatchAutomationAgentTask({
+          ...input,
+          configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+          machineToken: credentials.token,
+          machineId,
+        }),
+        maintainAgentTaskLease: (dispatch) => {
+          maintainAutomationAgentTaskLease({ dispatch });
+        },
         resolveMcpSpawnContext: ({ runId, claimToken }) => exchangeAutomationMcpCallerGrant({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
           machineToken: credentials.token,

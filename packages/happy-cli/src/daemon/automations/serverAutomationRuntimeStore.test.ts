@@ -19,6 +19,20 @@ describe('serverAutomationRuntimeStore', () => {
     const store = createServerAutomationRuntimeStore({ filePath: file })
     store.write({
       schedules: [{ automationId: 'automation-1', generation: 2, nextRunAt: 100, lastSessionId: null }],
+      githubTriggers: [{
+        automationId: 'automation-2',
+        generation: 3,
+        state: {
+          snapshot: [{
+            number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10', author: { login: 'alice' },
+            baseRefName: 'main', headRefName: 'feature/search', isDraft: false, state: 'OPEN', mergedAt: null,
+            labels: [{ name: 'ready' }], changedFiles: 1, files: [{ path: 'apps/web/page.tsx' }],
+          }],
+          highestPrNumber: 10,
+          processed: ['9:opened'],
+          pending: [],
+        },
+      }],
       pendingReports: [{
         runId: 'run-1', claimToken: 'claim-token', reportId: 'report-1', status: 'COMPLETED',
         outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,
@@ -28,6 +42,20 @@ describe('serverAutomationRuntimeStore', () => {
     const restarted = createServerAutomationRuntimeStore({ filePath: file })
     expect(restarted.read()).toEqual({
       schedules: [{ automationId: 'automation-1', generation: 2, nextRunAt: 100, lastSessionId: null }],
+      githubTriggers: [{
+        automationId: 'automation-2',
+        generation: 3,
+        state: {
+          snapshot: [{
+            number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10', author: { login: 'alice' },
+            baseRefName: 'main', headRefName: 'feature/search', isDraft: false, state: 'OPEN', mergedAt: null,
+            labels: [{ name: 'ready' }], changedFiles: 1, files: [{ path: 'apps/web/page.tsx' }],
+          }],
+          highestPrNumber: 10,
+          processed: ['9:opened'],
+          pending: [],
+        },
+      }],
       pendingReports: [{
         runId: 'run-1', claimToken: 'claim-token', reportId: 'report-1', status: 'COMPLETED',
         outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,

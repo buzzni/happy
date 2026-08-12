@@ -257,6 +257,8 @@ export interface SpawnSessionOptions {
     initialPrompt?: string;
     /** Exit cleanly after the spawned agent completes its first turn. */
     exitAfterFirstTurn?: boolean;
+    /** Restrict an unattended automation session to repository reads. */
+    permissionMode?: 'read-only';
 }
 
 export type SpawnSessionResult =

@@ -24,6 +24,7 @@ export interface RunAutomationScriptInput {
   timeout: number
   /** validatePath의 허용 루트 — apiMachine의 RPC 표면과 같은 root를 주입한다. */
   allowedRoot: string
+  environmentVariables?: Record<string, string>
 }
 
 export interface RunAutomationScriptResult {
@@ -43,6 +44,9 @@ export async function runAutomationScript(input: RunAutomationScriptInput): Prom
     timeout: input.timeout,
     maxBuffer: SCRIPT_MAX_BUFFER_BYTES,
     windowsHide: true,
+    env: input.environmentVariables
+      ? { ...process.env, ...input.environmentVariables }
+      : process.env,
   }
 
   try {
