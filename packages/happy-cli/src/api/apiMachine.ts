@@ -345,6 +345,8 @@ export class ApiMachineClient {
                 createdByDisplayName,
                 axStep,
                 bootstrapFiles,
+                initialPrompt,
+                exitAfterFirstTurn,
             } = params || {};
             logger.debug(`[API MACHINE] Spawning session: dir=${directory}, hasUserCreds=${!!(happyToken && happySecret)}`);
 
@@ -359,6 +361,22 @@ export class ApiMachineClient {
                 && (typeof mcpConfigProjectId !== 'string' || !mcpConfigProjectId.trim())
             ) {
                 throw new Error('MCP config project id must be a non-empty string');
+            }
+            if (
+                initialPrompt !== undefined
+                && (typeof initialPrompt !== 'string' || !initialPrompt.trim())
+            ) {
+                throw new Error('Initial prompt must be a non-empty string');
+            }
+            if (exitAfterFirstTurn !== undefined && typeof exitAfterFirstTurn !== 'boolean') {
+                throw new Error('Exit-after-first-turn must be a boolean');
+            }
+            if (exitAfterFirstTurn && initialPrompt === undefined) {
+                throw new Error('Run-once session requires a non-empty initial prompt');
+            }
+            const runOnceAgent = agent ?? 'claude';
+            if (exitAfterFirstTurn && runOnceAgent !== 'claude' && runOnceAgent !== 'codex') {
+                throw new Error('Run-once session is only supported for Claude and Codex');
             }
 
             const result = await spawnSession({
@@ -381,6 +399,8 @@ export class ApiMachineClient {
                 createdByDisplayName,
                 axStep,
                 bootstrapFiles,
+                initialPrompt,
+                exitAfterFirstTurn,
             });
 
             switch (result.type) {

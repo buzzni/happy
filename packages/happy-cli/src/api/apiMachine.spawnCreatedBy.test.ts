@@ -164,6 +164,45 @@ describe('ApiMachineClient spawn/resume RPC passthrough', () => {
         }));
     });
 
+    it.each(['claude', 'codex'])('forwards an atomic run-once prompt for %s', async (agent) => {
+        const spawnSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-1' });
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ spawnSession }));
+
+        await handlersFrom(client).get('machine-1:spawn-happy-session')?.({
+            directory: '/tmp/project',
+            agent,
+            initialPrompt: 'PR #42를 리뷰해줘',
+            exitAfterFirstTurn: true,
+        });
+
+        expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
+            agent,
+            initialPrompt: 'PR #42를 리뷰해줘',
+            exitAfterFirstTurn: true,
+        }));
+    });
+
+    it.each([
+        { params: { exitAfterFirstTurn: true }, message: 'Run-once session requires a non-empty initial prompt' },
+        { params: { initialPrompt: 42 }, message: 'Initial prompt must be a non-empty string' },
+        { params: { initialPrompt: 'review', exitAfterFirstTurn: 'true' }, message: 'Exit-after-first-turn must be a boolean' },
+        { params: { agent: 'opencode', initialPrompt: 'review', exitAfterFirstTurn: true }, message: 'Run-once session is only supported for Claude and Codex' },
+    ])('rejects invalid run-once spawn params: $message', async ({ params, message }) => {
+        const spawnSession = vi.fn();
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ spawnSession }));
+
+        await expect(handlersFrom(client).get('machine-1:spawn-happy-session')?.({
+            directory: '/tmp/project',
+            agent: 'claude',
+            ...params,
+        })).rejects.toThrow(message);
+        expect(spawnSession).not.toHaveBeenCalled();
+    });
+
     it('forwards encrypted MCP grant fields to resumeSession', async () => {
         const resumeSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-1' });
         const { ApiMachineClient } = await import('./apiMachine');
