@@ -59,7 +59,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
     const on = (event: string, handler: (data: any, callback: Callback) => Promise<void>) => (socket as any).on(
         event,
         async (data: any, callback: Callback) => {
-            if (!isServerBackedAutomationEnabled(accountId)) {
+            if (!isServerBackedAutomationEnabled()) {
                 callback({ ok: false, error: 'feature-disabled' });
                 return;
             }

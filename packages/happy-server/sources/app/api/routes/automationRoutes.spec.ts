@@ -71,12 +71,12 @@ describe('automationRoutes', () => {
 
     beforeEach(() => {
         vi.clearAllMocks();
-        process.env.HAPPY_SERVER_BACKED_AUTOMATION_ACCOUNTS = '*';
+        process.env.SAYCODE_AUTOMATION_ENABLED = 'true';
     });
-    afterEach(() => delete process.env.HAPPY_SERVER_BACKED_AUTOMATION_ACCOUNTS);
+    afterEach(() => delete process.env.SAYCODE_AUTOMATION_ENABLED);
 
-    it('keeps the API unavailable unless the authenticated account is allowlisted', async () => {
-        process.env.HAPPY_SERVER_BACKED_AUTOMATION_ACCOUNTS = 'user-2';
+    it('keeps the API unavailable when the global rollout flag is disabled', async () => {
+        process.env.SAYCODE_AUTOMATION_ENABLED = 'false';
         const app = await makeApp();
         const response = await app.inject({
             method: 'GET',

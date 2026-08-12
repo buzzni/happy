@@ -100,8 +100,8 @@ function sendError(reply: FastifyReply, result: {
     });
 }
 
-function rejectWhenDisabled(accountId: string, reply: FastifyReply): boolean {
-    if (isServerBackedAutomationEnabled(accountId)) return false;
+function rejectWhenDisabled(reply: FastifyReply): boolean {
+    if (isServerBackedAutomationEnabled()) return false;
     void reply.code(404).send({ error: 'feature-disabled' });
     return true;
 }
@@ -111,7 +111,7 @@ export function automationRoutes(app: Fastify) {
         preHandler: app.authenticate,
         schema: { params: runParamsSchema, body: mcpContextSchema },
     }, async (request, reply) => {
-        if (rejectWhenDisabled(request.userId, reply)) return;
+        if (rejectWhenDisabled(reply)) return;
         const result = await inTx((tx) => resolveAutomationRunMcpContext(
             tx,
             request.userId,
@@ -132,7 +132,7 @@ export function automationRoutes(app: Fastify) {
         preHandler: app.authenticate,
         schema: { params: paramsSchema },
     }, async (request, reply) => {
-        if (rejectWhenDisabled(request.userId, reply)) return;
+        if (rejectWhenDisabled(reply)) return;
         const result = await inTx((tx) => getAutomationTarget(tx, request.userId, request.params.projectId));
         if (!result.ok) return sendError(reply, result);
         return reply.send({
@@ -153,7 +153,7 @@ export function automationRoutes(app: Fastify) {
             body: viewerKeySchema,
         },
     }, async (request, reply) => {
-        if (rejectWhenDisabled(request.userId, reply)) return;
+        if (rejectWhenDisabled(reply)) return;
         const result = await inTx((tx) => setAutomationViewerKey(tx, request.userId, request.params.projectId, {
             expectedKeyVersion: request.body.expectedKeyVersion,
             publicKey: decode(request.body.publicKey),
@@ -170,7 +170,7 @@ export function automationRoutes(app: Fastify) {
         preHandler: app.authenticate,
         schema: { params: paramsSchema },
     }, async (request, reply) => {
-        if (rejectWhenDisabled(request.userId, reply)) return;
+        if (rejectWhenDisabled(reply)) return;
         const result = await inTx((tx) => listAutomations(tx, request.userId, request.params.projectId));
         if (!result.ok) return sendError(reply, result);
         return reply.send({ automations: result.value.map(serializeAutomation) });
@@ -186,7 +186,7 @@ export function automationRoutes(app: Fastify) {
             }),
         },
     }, async (request, reply) => {
-        if (rejectWhenDisabled(request.userId, reply)) return;
+        if (rejectWhenDisabled(reply)) return;
         const result = await inTx((tx) => listAutomationRuns(tx, request.userId, request.params.projectId, request.query));
         if (!result.ok) return sendError(reply, result);
         return reply.send({ runs: result.value.map(serializeRun) });
@@ -196,7 +196,7 @@ export function automationRoutes(app: Fastify) {
         preHandler: app.authenticate,
         schema: { params: paramsSchema, body: createSchema },
     }, async (request, reply) => {
-        if (rejectWhenDisabled(request.userId, reply)) return;
+        if (rejectWhenDisabled(reply)) return;
         const result = await inTx((tx) => createAutomation(tx, request.userId, request.params.projectId, {
             ...request.body,
             payloadCiphertext: decode(request.body.payloadCiphertext),
@@ -218,7 +218,7 @@ export function automationRoutes(app: Fastify) {
         preHandler: app.authenticate,
         schema: { params: paramsSchema, body: adoptSchema },
     }, async (request, reply) => {
-        if (rejectWhenDisabled(request.userId, reply)) return;
+        if (rejectWhenDisabled(reply)) return;
         const body = request.body;
         const result = await inTx((tx) => adoptAutomation(tx, request.userId, request.params.projectId, {
             ...body,
@@ -245,7 +245,7 @@ export function automationRoutes(app: Fastify) {
         preHandler: app.authenticate,
         schema: { params: automationParamsSchema, body: activateAdoptionSchema },
     }, async (request, reply) => {
-        if (rejectWhenDisabled(request.userId, reply)) return;
+        if (rejectWhenDisabled(reply)) return;
         const result = await inTx((tx) => activateAutomationAdoption(
             tx,
             request.userId,
@@ -268,7 +268,7 @@ export function automationRoutes(app: Fastify) {
         preHandler: app.authenticate,
         schema: { params: automationParamsSchema, body: updateSchema },
     }, async (request, reply) => {
-        if (rejectWhenDisabled(request.userId, reply)) return;
+        if (rejectWhenDisabled(reply)) return;
         const body = request.body;
         const input: AutomationUpdateInput = {
             expectedRevision: body.expectedRevision,
@@ -308,7 +308,7 @@ export function automationRoutes(app: Fastify) {
             body: deleteSchema,
         },
     }, async (request, reply) => {
-        if (rejectWhenDisabled(request.userId, reply)) return;
+        if (rejectWhenDisabled(reply)) return;
         const result = await inTx((tx) => deleteAutomation(
             tx,
             request.userId,

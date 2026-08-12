@@ -1,10 +1,7 @@
-const ENV_NAME = 'HAPPY_SERVER_BACKED_AUTOMATION_ACCOUNTS';
+const ENV_NAME = 'SAYCODE_AUTOMATION_ENABLED';
 
 export function isServerBackedAutomationEnabled(
-    accountId: string,
-    configuredAccounts: string | undefined = process.env[ENV_NAME],
+    configuredValue: string | undefined = process.env[ENV_NAME],
 ): boolean {
-    if (!configuredAccounts) return false;
-    const accounts = configuredAccounts.split(',').map((value) => value.trim()).filter(Boolean);
-    return accounts.includes('*') || accounts.includes(accountId);
+    return configuredValue === 'true';
 }
