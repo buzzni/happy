@@ -27,11 +27,16 @@ export function buildCodexTurnPrompt(opts: {
     mode: Pick<CodexEnhancedMode, 'appendSystemPrompt'>;
     includeAppendSystemPrompt: boolean;
     includeTitleInstruction: boolean;
+    connectorGuidance?: string;
+    includeConnectorGuidance?: boolean;
 }): string {
     const parts: string[] = [];
 
     if (opts.includeAppendSystemPrompt && opts.mode.appendSystemPrompt) {
         parts.push(opts.mode.appendSystemPrompt);
+    }
+    if (opts.includeConnectorGuidance && opts.connectorGuidance) {
+        parts.push(opts.connectorGuidance);
     }
 
     parts.push(opts.message);

@@ -36,6 +36,34 @@ describe('McpRuntimeRecovery', () => {
         expect(reconnectMcpServer).not.toHaveBeenCalled();
     });
 
+    it('classifies expected connector runtime and authentication failures distinctly', async () => {
+        const onStatus = vi.fn();
+        const recovery = new McpRuntimeRecovery({
+            mcpServerStatus: vi.fn(async () => [
+                { name: 'gmail', status: 'failed' as const, error: 'connection refused' },
+                { name: 'knoi', status: 'needs-auth' as const },
+                { name: 'argos', status: 'failed' as const, error: 'offline' },
+            ]),
+            reconnectMcpServer: vi.fn(async () => {}),
+        }, {
+            connectorNames: ['gmail', 'knoi'],
+            maxAttempts: 0,
+            onStatus,
+        });
+
+        await recovery.recoverFailedServers();
+
+        expect(onStatus).toHaveBeenCalledWith(expect.objectContaining({
+            name: 'gmail', status: 'connector-runtime-failed',
+        }));
+        expect(onStatus).toHaveBeenCalledWith(expect.objectContaining({
+            name: 'knoi', status: 'connector-needs-auth',
+        }));
+        expect(onStatus).toHaveBeenCalledWith(expect.objectContaining({
+            name: 'argos', status: 'failed',
+        }));
+    });
+
     it('deduplicates concurrent recovery for the same server', async () => {
         let releaseReconnect!: () => void;
         const reconnectBlocked = new Promise<void>((resolve) => { releaseReconnect = resolve; });

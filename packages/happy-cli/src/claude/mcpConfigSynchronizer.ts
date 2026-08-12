@@ -43,6 +43,17 @@ export class McpConfigSynchronizer {
             if (result.reason === 'not-configured' || result.reason === 'missing-machine-id') {
                 return;
             }
+            if (result.reason === 'connector-config-missing') {
+                for (const provider of result.missing) {
+                    this.options.onStatus?.({
+                        name: provider,
+                        status: 'connector-config-missing',
+                        error: sanitizeMcpError(result.error),
+                        checkedAt: this.now(),
+                    });
+                }
+                return;
+            }
             this.emitConfigFailure(result.error);
             return;
         }

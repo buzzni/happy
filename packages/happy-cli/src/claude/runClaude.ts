@@ -34,7 +34,10 @@ import { applyAxOrchestration } from '@/orchestrator/prompts/integrate';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
 import { appendClaudeTitleInstruction } from './utils/titlePrompt';
 import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
-import { fetchAplusMcpServersResult } from '@/aplus/fetchAplusMcpServers';
+import {
+    fetchAplusMcpServersResult,
+    mcpConfigFailureStatuses,
+} from '@/aplus/fetchAplusMcpServers';
 import { mergeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { encodeBase64 } from '@/api/encryption';
 import type { Session as ApiSession } from '@/api/types';
@@ -994,7 +997,20 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     // P6(b): aplus 자동 mcp 등록 — web-ui 의 /api/me/mcp-config 응답을
     // 'happy' MCP 옆에 머지한다. 실패는 silent (graceful degrade).
-    const initialAplusMcpResult = await fetchAplusMcpServersResult(credentials.token, machineId);
+    const initialAplusMcpResult = await fetchAplusMcpServersResult(
+        credentials.token,
+        machineId,
+        { sessionId: session.sessionId },
+    );
+    for (const status of mcpConfigFailureStatuses(initialAplusMcpResult)) {
+        session.updateMetadata((currentMetadata) => ({
+            ...currentMetadata,
+            mcpServers: [
+                ...(currentMetadata.mcpServers ?? []).filter((server) => server.name !== status.name),
+                status,
+            ],
+        }));
+    }
     const aplusMcpServers = initialAplusMcpResult.ok ? initialAplusMcpResult.servers : {};
     const baseMcpServers = {
         'happy': {
@@ -1029,7 +1045,11 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         mcpConfig: {
             baseServers: baseMcpServers,
             initialAplusServers: aplusMcpServers,
-            fetchAplusServers: () => fetchAplusMcpServersResult(credentials.token, machineId),
+            fetchAplusServers: () => fetchAplusMcpServersResult(
+                credentials.token,
+                machineId,
+                { sessionId: session.sessionId, lifecycle: 'turn' },
+            ),
         },
         session,
         claudeEnvVars: options.claudeEnvVars,

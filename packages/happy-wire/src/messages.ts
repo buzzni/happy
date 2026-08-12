@@ -49,7 +49,16 @@ export type VersionedNullableEncryptedValue = z.infer<typeof VersionedNullableEn
 
 export const McpRuntimeServerStatusSchema = z.strictObject({
   name: z.string().min(1),
-  status: z.enum(['connected', 'reconnecting', 'failed', 'needs-auth', 'config-fetch-failed']),
+  status: z.enum([
+    'connected',
+    'reconnecting',
+    'failed',
+    'needs-auth',
+    'config-fetch-failed',
+    'connector-config-missing',
+    'connector-runtime-failed',
+    'connector-needs-auth',
+  ]),
   error: z.string().optional(),
   checkedAt: z.number().int().nonnegative(),
 });

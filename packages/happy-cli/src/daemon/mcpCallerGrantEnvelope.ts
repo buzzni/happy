@@ -38,6 +38,8 @@ export function injectMcpCallerGrant(
     decryptedGrant: string | undefined,
     trustedConfigUrl?: string,
     projectId: string | null = null,
+    expectedConnectors: string[] = [],
+    lifecycle?: 'spawn' | 'resume',
 ): Record<string, string> {
     const sanitized = Object.fromEntries(
         Object.entries(environmentVariables)
@@ -55,6 +57,10 @@ export function injectMcpCallerGrant(
         }
     }
     if (decryptedGrant) sanitized[CALLER_GRANT_ENV_KEY] = decryptedGrant;
+    if (expectedConnectors.length > 0) {
+        sanitized.HAPPY_APLUS_EXPECTED_CONNECTORS = JSON.stringify(expectedConnectors);
+    }
+    if (lifecycle) sanitized.HAPPY_APLUS_MCP_INITIAL_LIFECYCLE = lifecycle;
     return sanitized;
 }
 
@@ -178,6 +184,8 @@ export function prepareMcpChildEnvironment(
         environmentVariables: Record<string, string>;
         mcpCallerGrantEnvelope?: string;
         mcpConfigProjectId?: string;
+        expectedConnectors?: string[];
+        lifecycle?: 'spawn' | 'resume';
         trustedConfigUrl?: string;
     },
     consumer: Pick<McpCallerGrantEnvelopeConsumer, 'consume'>,
@@ -197,6 +205,8 @@ export function prepareMcpChildEnvironment(
             grant,
             input.trustedConfigUrl,
             projectId,
+            input.expectedConnectors,
+            input.lifecycle,
         ),
     };
 }

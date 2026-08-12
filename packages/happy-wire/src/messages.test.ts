@@ -25,6 +25,18 @@ describe('shared wire message schemas', () => {
       checkedAt: 1_721_111_111_000,
     }).success).toBe(true);
 
+    for (const status of [
+      'connector-config-missing',
+      'connector-runtime-failed',
+      'connector-needs-auth',
+    ]) {
+      expect(McpRuntimeServerStatusSchema.safeParse({
+        name: 'gmail',
+        status,
+        checkedAt: 1_721_111_111_000,
+      }).success).toBe(true);
+    }
+
     expect(McpRuntimeServerStatusSchema.safeParse({
       name: 'aplus-common',
       status: 'pending',

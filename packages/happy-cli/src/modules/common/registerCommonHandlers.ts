@@ -219,6 +219,8 @@ export interface SpawnSessionOptions {
     mcpCallerGrantEnvelope?: string;
     /** Project scope appended only to the daemon-owned MCP config URL. */
     mcpConfigProjectId?: string;
+    /** Connected provider names expected in the child MCP topology. */
+    expectedConnectors?: string[];
     /**
      * If set, the daemon spawns the agent with `--resume <id>` so the new
      * Happy session continues from an existing Claude conversation file.

@@ -205,6 +205,7 @@ type MachineRpcHandlers = {
         permissionMode?: string;
         mcpCallerGrantEnvelope?: string;
         mcpConfigProjectId?: string;
+        expectedConnectors?: string[];
     }) => Promise<SpawnSessionResult>;
     stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
     requestShutdown: () => void;
@@ -218,6 +219,19 @@ function requireNonEmptyString(value: unknown, name: string): string {
         throw new Error(`${name} is required`);
     }
     return value;
+}
+
+function readExpectedConnectors(value: unknown): string[] | undefined {
+    if (value === undefined) return undefined;
+    if (
+        !Array.isArray(value)
+        || value.length > 32
+        || value.some((provider) => typeof provider !== 'string' || !/^[a-z0-9-]{1,64}$/.test(provider))
+    ) {
+        throw new Error('Expected connectors must contain provider names only');
+    }
+    const providers = [...new Set(value)].sort();
+    return providers.length > 0 ? providers : undefined;
 }
 
 async function withCodexAppServerClient<T>(handler: (client: CodexAppServerClient) => Promise<T>): Promise<T> {
@@ -261,6 +275,7 @@ export class ApiMachineClient {
         permissionMode?: string;
         mcpCallerGrantEnvelope?: string;
         mcpConfigProjectId?: string;
+        expectedConnectors?: string[];
     }) => Promise<SpawnSessionResult>) | null = null;
     // specs/remote-terminal-cwd-fallback/ — cached so the
     // terminal-open-fwd handler can run validatePath against the same
@@ -340,6 +355,7 @@ export class ApiMachineClient {
                 happySecret,
                 mcpCallerGrantEnvelope,
                 mcpConfigProjectId,
+                expectedConnectors,
                 resumeClaudeSessionId,
                 resumeCodexThreadId,
                 parentSessionId,
@@ -365,6 +381,7 @@ export class ApiMachineClient {
             ) {
                 throw new Error('MCP config project id must be a non-empty string');
             }
+            const validExpectedConnectors = readExpectedConnectors(expectedConnectors);
             if (
                 initialPrompt !== undefined
                 && (typeof initialPrompt !== 'string' || !initialPrompt.trim())
@@ -394,6 +411,7 @@ export class ApiMachineClient {
                 happySecret,
                 mcpCallerGrantEnvelope,
                 mcpConfigProjectId,
+                expectedConnectors: validExpectedConnectors,
                 resumeClaudeSessionId,
                 resumeCodexThreadId,
                 parentSessionId,
@@ -856,6 +874,7 @@ export class ApiMachineClient {
                         permissionMode,
                         mcpCallerGrantEnvelope,
                         mcpConfigProjectId,
+                        expectedConnectors,
                     } = params || {};
 
                     if (!sessionId || typeof sessionId !== 'string') {
@@ -867,6 +886,7 @@ export class ApiMachineClient {
                     if (mcpConfigProjectId !== undefined && typeof mcpConfigProjectId !== 'string') {
                         throw new Error('MCP config project ID must be a string');
                     }
+                    const validExpectedConnectors = readExpectedConnectors(expectedConnectors);
 
                     const handler = this.resumeSessionHandler;
                     if (!handler) {
@@ -878,6 +898,7 @@ export class ApiMachineClient {
                         permissionMode,
                         mcpCallerGrantEnvelope,
                         mcpConfigProjectId,
+                        expectedConnectors: validExpectedConnectors,
                     });
                     switch (result.type) {
                         case 'success':

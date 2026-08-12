@@ -67,6 +67,28 @@ describe('buildCodexTurnPrompt', () => {
             'start fresh',
         );
     });
+
+    it('injects connector guidance once even when resuming an existing thread', () => {
+        const first = buildCodexTurnPrompt({
+            message: 'check KNOI',
+            mode: {},
+            includeAppendSystemPrompt: false,
+            includeTitleInstruction: false,
+            connectorGuidance: 'discover deferred MCP tools before browser fallback',
+            includeConnectorGuidance: true,
+        });
+        const followUp = buildCodexTurnPrompt({
+            message: 'continue',
+            mode: {},
+            includeAppendSystemPrompt: false,
+            includeTitleInstruction: false,
+            connectorGuidance: 'discover deferred MCP tools before browser fallback',
+            includeConnectorGuidance: false,
+        });
+
+        expect(first).toBe('discover deferred MCP tools before browser fallback\n\ncheck KNOI');
+        expect(followUp).toBe('continue');
+    });
 });
 
 describe('hashCodexEnhancedMode', () => {

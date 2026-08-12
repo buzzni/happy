@@ -14,6 +14,7 @@ import type {
 import type { McpServersMap } from '@/aplus/mergeAplusMcpServers';
 import { sanitizeMcpError } from '@/claude/mcpRuntimeRecovery';
 import { logger } from '@/ui/logger';
+import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
 
 const DEFAULT_CREDENTIAL_REFRESH_MS = 12 * 60 * 60 * 1_000;
 
@@ -29,6 +30,7 @@ type CodexMcpConfigSynchronizerOptions = {
     bridgeAplusServers: (servers: AplusMcpServersMap) => McpServersMap;
     credentialRefreshMs?: number;
     now?: () => number;
+    onStatus?: (status: McpRuntimeServerStatus) => void;
 };
 
 export type CodexMcpSyncResult = {
@@ -74,6 +76,23 @@ export class CodexMcpConfigSynchronizer {
         }
         if (!result.ok) {
             logger.debug(`[codex] MCP config refresh skipped: ${result.error}`);
+            if (result.reason === 'connector-config-missing') {
+                for (const provider of result.missing) {
+                    this.options.onStatus?.({
+                        name: provider,
+                        status: 'connector-config-missing',
+                        error: sanitizeMcpError(result.error),
+                        checkedAt: this.now(),
+                    });
+                }
+            } else if (result.reason !== 'not-configured' && result.reason !== 'missing-machine-id') {
+                this.options.onStatus?.({
+                    name: 'aplus-config',
+                    status: 'config-fetch-failed',
+                    error: sanitizeMcpError(result.error),
+                    checkedAt: this.now(),
+                });
+            }
             return { threadId: input.threadId ?? null, mcpServers: this.currentMcpServers };
         }
 
