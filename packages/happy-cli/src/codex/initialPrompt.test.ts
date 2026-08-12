@@ -1,11 +1,20 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { deliverCodexInitialPrompt, prepareCodexSessionStart } from './initialPrompt'
+import {
+  assertCodexAutomationServerAvailable,
+  deliverCodexInitialPrompt,
+  prepareCodexInitialPrompt,
+  prepareCodexSessionStart,
+} from './initialPrompt'
 
 function makeInput(env: NodeJS.ProcessEnv, reconnectSessionId: string | undefined = undefined) {
-  return {
+  const prepared = prepareCodexInitialPrompt({
     env,
     reconnectSessionId,
+    automationRunOnceRequested: false,
+  })
+  return {
+    prepared,
     sendSessionMessage: vi.fn(),
     pushPrompt: vi.fn(),
   }
@@ -16,7 +25,6 @@ describe('deliverCodexInitialPrompt', () => {
     const input = makeInput({ HAPPY_INITIAL_PROMPT: '  오늘 오류를 확인해줘  ' })
 
     expect(deliverCodexInitialPrompt(input)).toBe(true)
-    expect(input.env.HAPPY_INITIAL_PROMPT).toBeUndefined()
     expect(input.sendSessionMessage).toHaveBeenCalledTimes(1)
     expect(input.sendSessionMessage.mock.calls[0]?.[0]).toMatchObject({
       role: 'user',
@@ -33,7 +41,6 @@ describe('deliverCodexInitialPrompt', () => {
     const input = makeInput({ HAPPY_INITIAL_PROMPT: 'stale prompt' }, 'existing-session')
 
     expect(deliverCodexInitialPrompt(input)).toBe(false)
-    expect(input.env.HAPPY_INITIAL_PROMPT).toBeUndefined()
     expect(input.sendSessionMessage).not.toHaveBeenCalled()
     expect(input.pushPrompt).not.toHaveBeenCalled()
   })
@@ -51,10 +58,13 @@ describe('deliverCodexInitialPrompt', () => {
 describe('prepareCodexSessionStart', () => {
   it('shouldReportDaemonStartOnlyAfterTheAutomationPromptIsQueued', async () => {
     const events: string[] = []
-    const env = { HAPPY_INITIAL_PROMPT: '오늘 오류를 확인해줘' }
+    const prepared = prepareCodexInitialPrompt({
+      env: { HAPPY_INITIAL_PROMPT: '오늘 오류를 확인해줘' },
+      automationRunOnceRequested: true,
+    })
 
     const delivered = await prepareCodexSessionStart({
-      env,
+      prepared,
       sendSessionMessage: () => events.push('record-prompt'),
       pushPrompt: () => events.push('queue-prompt'),
       reportStarted: async () => {
@@ -70,7 +80,7 @@ describe('prepareCodexSessionStart', () => {
     const reportStarted = vi.fn()
 
     const delivered = await prepareCodexSessionStart({
-      env: {},
+      prepared: { prompt: null, exitAfterFirstTurn: false },
       sendSessionMessage: vi.fn(),
       pushPrompt: vi.fn(),
       reportStarted,
@@ -84,7 +94,7 @@ describe('prepareCodexSessionStart', () => {
     const reportStarted = vi.fn()
 
     await expect(prepareCodexSessionStart({
-      env: { HAPPY_INITIAL_PROMPT: '오늘 오류를 확인해줘' },
+      prepared: { prompt: '오늘 오류를 확인해줘', exitAfterFirstTurn: true },
       sendSessionMessage: vi.fn(),
       pushPrompt: () => {
         throw new Error('queue failed')
@@ -93,5 +103,52 @@ describe('prepareCodexSessionStart', () => {
     })).rejects.toThrow('queue failed')
 
     expect(reportStarted).not.toHaveBeenCalled()
+  })
+})
+
+describe('prepareCodexInitialPrompt', () => {
+  it('requiresAndActivatesRunOnceOnlyForAFreshAutomationPrompt', () => {
+    const env = { HAPPY_INITIAL_PROMPT: '  업무 브리핑  ' }
+
+    expect(prepareCodexInitialPrompt({
+      env,
+      automationRunOnceRequested: true,
+    })).toEqual({ prompt: '업무 브리핑', exitAfterFirstTurn: true })
+    expect(env.HAPPY_INITIAL_PROMPT).toBeUndefined()
+  })
+
+  it('rejectsRunOnceAutomationWhenItsInitialPromptIsMissing', () => {
+    expect(() => prepareCodexInitialPrompt({
+      env: {},
+      automationRunOnceRequested: true,
+    })).toThrow('Codex automation cannot start without a fresh initial prompt')
+  })
+
+  it('rejectsRunOnceAutomationInsteadOfReplayingItsPromptOnReconnect', () => {
+    const env = { HAPPY_INITIAL_PROMPT: 'stale prompt' }
+
+    expect(() => prepareCodexInitialPrompt({
+      env,
+      reconnectSessionId: 'existing-session',
+      automationRunOnceRequested: true,
+    })).toThrow('Codex automation cannot start without a fresh initial prompt')
+
+    expect(env.HAPPY_INITIAL_PROMPT).toBeUndefined()
+  })
+})
+
+describe('assertCodexAutomationServerAvailable', () => {
+  it('failsClosedForOfflineRunOnceAutomation', () => {
+    expect(() => assertCodexAutomationServerAvailable({
+      automationRunOnceRequested: true,
+      serverAvailable: false,
+    })).toThrow('Codex automation cannot start while the Happy server is unavailable')
+  })
+
+  it('allowsInteractiveOfflineMode', () => {
+    expect(() => assertCodexAutomationServerAvailable({
+      automationRunOnceRequested: false,
+      serverAvailable: false,
+    })).not.toThrow()
   })
 })

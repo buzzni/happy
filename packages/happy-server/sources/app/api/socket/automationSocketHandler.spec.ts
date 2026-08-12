@@ -19,12 +19,12 @@ import { automationSocketHandler } from './automationSocketHandler';
 describe('automationSocketHandler', () => {
     beforeEach(() => {
         vi.clearAllMocks();
-        process.env.HAPPY_SERVER_BACKED_AUTOMATION_ACCOUNTS = '*';
+        process.env.SAYCODE_AUTOMATION_ENABLED = 'true';
     });
-    afterEach(() => delete process.env.HAPPY_SERVER_BACKED_AUTOMATION_ACCOUNTS);
+    afterEach(() => delete process.env.SAYCODE_AUTOMATION_ENABLED);
 
-    it('fails closed for a machine account outside the rollout allowlist', async () => {
-        process.env.HAPPY_SERVER_BACKED_AUTOMATION_ACCOUNTS = 'account-2';
+    it('fails closed when the global rollout flag is disabled', async () => {
+        process.env.SAYCODE_AUTOMATION_ENABLED = 'false';
         const handlers = new Map<string, Function>();
         const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
         automationSocketHandler('account-1', 'machine-1', socket as never);
