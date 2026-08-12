@@ -17,6 +17,7 @@ import {
     getAutomationTarget,
     listAutomationRuns,
     listAutomations,
+    replaceAutomationViewerKeyIfUnused,
     setAutomationViewerKey,
     updateAutomation,
     type AutomationUpdateInput,
@@ -158,6 +159,31 @@ export function automationRoutes(app: Fastify) {
             expectedKeyVersion: request.body.expectedKeyVersion,
             publicKey: decode(request.body.publicKey),
         }));
+        if (!result.ok) return sendError(reply, result);
+        await emitAutomationUpdate(request.userId, {
+            projectId: request.params.projectId,
+            reason: 'viewer-key',
+        });
+        return reply.send(result.value);
+    });
+
+    app.put('/v1/projects/:projectId/automation-viewer-key/replace-if-unused', {
+        preHandler: app.authenticate,
+        schema: {
+            params: paramsSchema,
+            body: viewerKeySchema,
+        },
+    }, async (request, reply) => {
+        if (rejectWhenDisabled(reply)) return;
+        const result = await inTx((tx) => replaceAutomationViewerKeyIfUnused(
+            tx,
+            request.userId,
+            request.params.projectId,
+            {
+                expectedKeyVersion: request.body.expectedKeyVersion,
+                publicKey: decode(request.body.publicKey),
+            },
+        ));
         if (!result.ok) return sendError(reply, result);
         await emitAutomationUpdate(request.userId, {
             projectId: request.params.projectId,

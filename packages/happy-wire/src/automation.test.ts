@@ -214,6 +214,28 @@ describe('createAutomationApiClient', () => {
     expect(error).toMatchObject({ status: 409, code: 'revision-conflict', latest: automation });
   });
 
+  it('replaces a viewer key through the guarded unused-project endpoint', async () => {
+    const fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ keyVersion: 3 }),
+    }));
+    const client = createAutomationApiClient({ baseUrl: 'https://happy.test', token: 'token', fetch });
+    const publicKey = Buffer.from(bytes(32, 7)).toString('base64');
+
+    await expect(client.replaceViewerKeyIfUnused('project-1', {
+      expectedKeyVersion: 2,
+      publicKey,
+    })).resolves.toEqual({ keyVersion: 3 });
+    expect(fetch).toHaveBeenCalledWith(
+      'https://happy.test/v1/projects/project-1/automation-viewer-key/replace-if-unused',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify({ expectedKeyVersion: 2, publicKey }),
+      }),
+    );
+  });
+
   it('uses an explicit confirmed adoption endpoint for a legacy identity', async () => {
     const fetch = vi.fn(async () => ({
       ok: true,

@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import sodiumNode from 'libsodium-wrappers';
-import type { AutomationApiClient, AutomationPublic, AutomationRun, AutomationTarget } from '@slopus/happy-wire';
+import { AutomationApiError, type AutomationApiClient, type AutomationPublic, type AutomationRun, type AutomationTarget } from '@slopus/happy-wire';
 
 vi.mock('expo-crypto', () => ({
     CryptoDigestAlgorithm: { SHA256: 'SHA-256', SHA512: 'SHA-512' },
@@ -66,6 +66,7 @@ describe('server automation repository', () => {
         const api: AutomationApiClient = {
             getTarget: vi.fn(async () => target),
             setViewerKey: vi.fn(async () => ({ keyVersion: 1 })),
+            replaceViewerKeyIfUnused: vi.fn(),
             listAutomations: vi.fn(async () => stored ? [stored] : []),
             listRuns: vi.fn(async () => []),
             createAutomation: vi.fn(async (projectId, input) => {
@@ -106,6 +107,60 @@ describe('server automation repository', () => {
         const updated = await repository.update(created, { ...payload, name: 'Updated' });
         expect(updated.payload.name).toBe('Updated');
         expect(api.updateAutomation).toHaveBeenCalledWith('project-1', 'automation-1', expect.objectContaining({ expectedRevision: 1 }));
+    });
+
+    it('replaces a mismatched viewer key only through the server unused-project guard', async () => {
+        const machine = sodiumNode.crypto_box_keypair();
+        const otherViewer = sodiumNode.crypto_box_keypair();
+        const secret = encodeBase64(new Uint8Array(32).fill(7), 'base64url');
+        const expectedViewer = await deriveAutomationViewerKeyPair(secret);
+        const replaceViewerKeyIfUnused = vi.fn(async () => ({ keyVersion: 3 }));
+        const api = {
+            getTarget: vi.fn(async () => ({
+                machineAccountId: 'account-1', machineId: 'machine-1',
+                machinePublicKey: encodeBase64(machine.publicKey), machineKeyVersion: 2,
+                viewerPublicKey: encodeBase64(otherViewer.publicKey), viewerKeyVersion: 2,
+            })),
+            replaceViewerKeyIfUnused,
+            listAutomations: vi.fn(async () => []),
+            listRuns: vi.fn(async () => []),
+        } as unknown as AutomationApiClient;
+        const repository = createServerAutomationRepository({ api, secret, listProjects: vi.fn(async () => []) });
+
+        await expect(repository.listProject('project-1')).resolves.toEqual({ items: [], failedRowCount: 0 });
+        expect(replaceViewerKeyIfUnused).toHaveBeenCalledWith('project-1', {
+            expectedKeyVersion: 2,
+            publicKey: encodeBase64(expectedViewer.publicKey),
+        });
+    });
+
+    it('converges when another client wins the viewer-key replacement CAS', async () => {
+        const machine = sodiumNode.crypto_box_keypair();
+        const secret = encodeBase64(new Uint8Array(32).fill(7), 'base64url');
+        const viewer = await deriveAutomationViewerKeyPair(secret);
+        const getTarget = vi.fn()
+            .mockResolvedValueOnce({
+                machineAccountId: 'account-1', machineId: 'machine-1',
+                machinePublicKey: encodeBase64(machine.publicKey), machineKeyVersion: 2,
+                viewerPublicKey: encodeBase64(sodiumNode.crypto_box_keypair().publicKey), viewerKeyVersion: 2,
+            })
+            .mockResolvedValueOnce({
+                machineAccountId: 'account-1', machineId: 'machine-1',
+                machinePublicKey: encodeBase64(machine.publicKey), machineKeyVersion: 2,
+                viewerPublicKey: encodeBase64(viewer.publicKey), viewerKeyVersion: 3,
+            });
+        const api = {
+            getTarget,
+            replaceViewerKeyIfUnused: vi.fn(async () => {
+                throw new AutomationApiError(409, 'viewer-key-version-conflict');
+            }),
+            listAutomations: vi.fn(async () => []),
+            listRuns: vi.fn(async () => []),
+        } as unknown as AutomationApiClient;
+        const repository = createServerAutomationRepository({ api, secret, listProjects: vi.fn(async () => []) });
+
+        await expect(repository.listProject('project-1')).resolves.toEqual({ items: [], failedRowCount: 0 });
+        expect(getTarget).toHaveBeenCalledTimes(2);
     });
 
     it('maps run history and preserves payload when pause succeeds', async () => {

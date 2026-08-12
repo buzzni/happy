@@ -86,7 +86,21 @@ async function ensureViewerTarget(
         }
     }
     if (!sameBytes(decodeBase64(target.viewerPublicKey ?? ''), keyPair.publicKey)) {
-        throw new Error('automation-viewer-key-mismatch');
+        try {
+            const registered = await api.replaceViewerKeyIfUnused(projectId, {
+                expectedKeyVersion: target.viewerKeyVersion,
+                publicKey: encodeBase64(keyPair.publicKey),
+            });
+            target = {
+                ...target,
+                viewerPublicKey: encodeBase64(keyPair.publicKey),
+                viewerKeyVersion: registered.keyVersion,
+            };
+        } catch (error) {
+            if (!(error instanceof AutomationApiError) || error.status !== 409 || error.code !== 'viewer-key-version-conflict') throw error;
+            target = await api.getTarget(projectId);
+            if (!sameBytes(decodeBase64(target.viewerPublicKey ?? ''), keyPair.publicKey)) throw error;
+        }
     }
     return target;
 }

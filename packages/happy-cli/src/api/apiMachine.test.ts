@@ -156,6 +156,7 @@ describe('ApiMachineClient socket reconnection', () => {
             return { result: 'success' };
         });
         const client = new ApiMachineClient('fake-token', makeMachine());
+        expect(client.shouldRunLegacyAutomationScheduler()).toBe(false);
         const persistVersion = vi.fn();
         (client as any).setAutomationKey({
             version: 1,
@@ -167,11 +168,52 @@ describe('ApiMachineClient socket reconnection', () => {
 
         socketHandlers.connect![0]!();
         await vi.waitFor(() => expect(persistVersion).toHaveBeenCalledWith(4));
+        expect(client.shouldRunLegacyAutomationScheduler()).toBe(false);
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-key-register', {
             expectedKeyVersion: 3,
             publicKey: Buffer.from(new Uint8Array(32).fill(7)).toString('base64'),
         });
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('machine-update-metadata', expect.any(Object));
+        client.shutdown();
+    });
+
+    it('opens the legacy scheduler only after an explicit feature-disabled response', async () => {
+        mockSocket.emitWithAck.mockImplementation(async (event: string) => {
+            if (event === 'automation-key-register') return { ok: false, error: 'feature-disabled' };
+            return { result: 'success' };
+        });
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        (client as any).setAutomationKey({
+            version: 1,
+            publicKey: new Uint8Array(32).fill(7),
+            secretKey: new Uint8Array(32).fill(8),
+            registeredKeyVersion: 0,
+        }, vi.fn());
+        expect(client.shouldRunLegacyAutomationScheduler()).toBe(false);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(client.shouldRunLegacyAutomationScheduler()).toBe(true));
+        client.shutdown();
+    });
+
+    it('keeps legacy automation fail-closed for transient registration failures', async () => {
+        mockSocket.emitWithAck.mockImplementation(async (event: string) => {
+            if (event === 'automation-key-register') return { ok: false, error: 'temporary-unavailable' };
+            return { result: 'success' };
+        });
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        (client as any).setAutomationKey({
+            version: 1,
+            publicKey: new Uint8Array(32).fill(7),
+            secretKey: new Uint8Array(32).fill(8),
+            registeredKeyVersion: 0,
+        }, vi.fn());
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-key-register', expect.any(Object)));
+        expect(client.shouldRunLegacyAutomationScheduler()).toBe(false);
         client.shutdown();
     });
 

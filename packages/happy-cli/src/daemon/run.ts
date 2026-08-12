@@ -1670,7 +1670,7 @@ export async function startDaemon(): Promise<void> {
       // 업그레이드 감지·상태 기록)를 막거나 heartbeatRunning 가드로 다음 틱을
       // 스킵시키지 않게 하기 위함이다. 중복 기동은 러너의 자체 가드가 막고,
       // 스킵된 due는 claim이 실행 직전에만 반영되므로 다음 tick이 집어간다.
-      automationTickRunner.trigger();
+      if (apiMachine.shouldRunLegacyAutomationScheduler()) automationTickRunner.trigger();
       serverAutomationTickRunner.trigger();
 
       // Check if daemon needs update by detecting whether `dist/index.mjs` was
