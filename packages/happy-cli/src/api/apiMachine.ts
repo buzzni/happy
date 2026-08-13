@@ -44,6 +44,7 @@ import {
     isCdpReachable,
     launchChrome,
     planChromeInstall,
+    resolveChromeDisplay,
     resolveProfileUserDataDir,
 } from '@/daemon/browserSetup';
 import {
@@ -743,10 +744,23 @@ export class ApiMachineClient {
             if (cdpPort === null) {
                 throw new Error('사용 가능한 CDP 포트를 찾지 못했습니다.');
             }
-            // Headless unless the machine actually has a display: on a
-            // terminal-only box headful Chrome exits immediately.
-            const headless = !process.env.DISPLAY;
-            let { pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless });
+
+            const wantsViewer = params?.viewer === true;
+            // Ensures the viewer stack before deciding headless/display —
+            // "launch under the viewer" must be the Chrome the user actually
+            // sees, not a second headless instance running blind.
+            const viewerState = wantsViewer ? await this.startViewerStack() : null;
+            const chosen = resolveChromeDisplay({
+                wantsViewer,
+                viewerDisplay: viewerState?.display ?? null,
+                daemonDisplayEnv: process.env.DISPLAY,
+            });
+            if (chosen.headless === null) {
+                throw new Error('원격 화면이 아직 준비되지 않았습니다.');
+            }
+            const headless = chosen.headless;
+            const env = chosen.display ? { DISPLAY: chosen.display } : undefined;
+            let { pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless }, env);
             let ready = await waitForCdp(cdpPort, 15_000);
             let sandbox = true;
             if (!ready) {
@@ -755,10 +769,10 @@ export class ApiMachineClient {
                 // "running". Retry once without the sandbox and report the
                 // downgrade rather than leaving a browser that never answers.
                 sandbox = false;
-                ({ pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless, noSandbox: true }));
+                ({ pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless, noSandbox: true }, env));
                 ready = await waitForCdp(cdpPort, 15_000);
             }
-            return { profile, cdpPort, userDataDir, pid, headless, ready, sandbox };
+            return { profile, cdpPort, userDataDir, pid, headless, ready, sandbox, viewer: viewerState };
         });
 
         this.rpcHandlerManager.registerHandler('browser-setup:pair', async (params: any) => {
@@ -818,28 +832,7 @@ export class ApiMachineClient {
         });
 
         this.rpcHandlerManager.registerHandler('browser-viewer:start', async () => {
-            const missing = await detectMissingViewerTools();
-            if (missing.length > 0) {
-                throw new Error(`원격 화면에 필요한 프로그램이 없습니다: ${missing.join(', ')}`);
-            }
-            if (this.viewer) return { ...this.viewer, reused: true };
-
-            const display = ':99';
-            const vncPort = await pickFreePort([5900, 5901, 5902]);
-            const webPort = await pickFreePort([6080, 6081, 6082]);
-            if (vncPort === null || webPort === null) {
-                throw new Error('원격 화면에 쓸 포트를 찾지 못했습니다.');
-            }
-            spawnDetached('Xvfb', buildXvfbArgs({ display, width: 1920, height: 1080 }));
-            await delay(1500);
-            spawnDetached('x11vnc', buildX11vncArgs({ display, vncPort }));
-            await delay(800);
-            spawnDetached('websockify', buildWebsockifyArgs({
-                webPort, vncPort, webRoot: resolveNovncWebRoot(),
-            }));
-            const ready = await waitForPort(webPort, 15_000);
-            this.viewer = { display, vncPort, webPort };
-            return { display, vncPort, webPort, ready, reused: false };
+            return this.startViewerStack();
         });
 
         // Register stop daemon handler
@@ -1007,6 +1000,37 @@ export class ApiMachineClient {
             heartbeat: (input) => this.socket.emitWithAck('automation-run-heartbeat', input),
             report: (input) => this.socket.emitWithAck('automation-run-report', input),
         };
+    }
+
+    /**
+     * Idempotent: returns the running stack if one is already up. Shared by
+     * the `browser-viewer:start` RPC and `browser-setup:launch`'s `viewer`
+     * option, so "launch Chrome under the viewer" never spins up a second,
+     * disconnected Xvfb (specs/browser-remote-login/).
+     */
+    private async startViewerStack(): Promise<{ display: string; vncPort: number; webPort: number; ready: boolean; reused: boolean }> {
+        const missing = await detectMissingViewerTools();
+        if (missing.length > 0) {
+            throw new Error(`원격 화면에 필요한 프로그램이 없습니다: ${missing.join(', ')}`);
+        }
+        if (this.viewer) return { ...this.viewer, ready: true, reused: true };
+
+        const display = ':99';
+        const vncPort = await pickFreePort([5900, 5901, 5902]);
+        const webPort = await pickFreePort([6080, 6081, 6082]);
+        if (vncPort === null || webPort === null) {
+            throw new Error('원격 화면에 쓸 포트를 찾지 못했습니다.');
+        }
+        spawnDetached('Xvfb', buildXvfbArgs({ display, width: 1920, height: 1080 }));
+        await delay(1500);
+        spawnDetached('x11vnc', buildX11vncArgs({ display, vncPort }));
+        await delay(800);
+        spawnDetached('websockify', buildWebsockifyArgs({
+            webPort, vncPort, webRoot: resolveNovncWebRoot(),
+        }));
+        const ready = await waitForPort(webPort, 15_000);
+        this.viewer = { display, vncPort, webPort };
+        return { display, vncPort, webPort, ready, reused: false };
     }
 
     private requestServerAutomationSync(): void {

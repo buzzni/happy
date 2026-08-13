@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildChromeLaunchArgs, planChromeInstall, resolveProfileUserDataDir } from './browserSetup'
+import { buildChromeLaunchArgs, planChromeInstall, resolveChromeDisplay, resolveProfileUserDataDir } from './browserSetup'
 
 describe('buildChromeLaunchArgs', () => {
     it('includes --enable-unsafe-extension-debugging', () => {
@@ -112,5 +112,32 @@ describe('planChromeInstall', () => {
         expect(plan.action).toBe('manual')
         expect(plan.command).toContain('sudo')
         expect(plan.reason).toBeTruthy()
+    })
+})
+
+describe('resolveChromeDisplay', () => {
+    it('runs headful on the viewer display when the caller asks for the viewer', () => {
+        // specs/browser-remote-login/ — the whole point of pairing "launch"
+        // with the noVNC viewer is that the same Chrome the user logs into
+        // is the one that gets paired. It must be headful on the viewer's
+        // Xvfb display, not off on its own headless instance.
+        const result = resolveChromeDisplay({ wantsViewer: true, viewerDisplay: ':99', daemonDisplayEnv: undefined })
+
+        expect(result).toEqual({ headless: false, display: ':99' })
+    })
+
+    it('refuses when the viewer was requested but is not running', () => {
+        // Launching headless anyway would silently give the user a browser
+        // they cannot see or log into — worse than an error.
+        const result = resolveChromeDisplay({ wantsViewer: true, viewerDisplay: null, daemonDisplayEnv: undefined })
+
+        expect(result).toEqual({ headless: null, display: null })
+    })
+
+    it('falls back to the pre-existing headless-unless-DISPLAY rule when no viewer is requested', () => {
+        expect(resolveChromeDisplay({ wantsViewer: false, viewerDisplay: ':99', daemonDisplayEnv: undefined }))
+            .toEqual({ headless: true, display: undefined })
+        expect(resolveChromeDisplay({ wantsViewer: false, viewerDisplay: null, daemonDisplayEnv: ':0' }))
+            .toEqual({ headless: false, display: ':0' })
     })
 })
