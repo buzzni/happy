@@ -33,7 +33,7 @@ import { decideResumeCredentials, readStagedTokenFromHomeDir } from './resumeCre
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { preflightDaemonControlServer, startDaemonControlServer } from './controlServer';
 import { BrowserBridge } from './browserBridge';
-import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT } from './browserBridgeServer';
+import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
 import { createPortRegistry } from './portRegistry';
@@ -1419,11 +1419,16 @@ export async function startDaemon(): Promise<void> {
     });
     let stopBrowserBridge: () => Promise<void> = async () => {};
     try {
+      const bridgeHost = resolveBrowserBridgeHost(process.env);
       const bridgeServer = await startBrowserBridgeServer({
         bridge: browserBridge,
-        port: DEFAULT_BROWSER_BRIDGE_PORT
+        port: DEFAULT_BROWSER_BRIDGE_PORT,
+        host: bridgeHost
       });
       stopBrowserBridge = bridgeServer.stop;
+      if (bridgeHost !== '127.0.0.1') {
+        logger.debug(`[DAEMON RUN] Browser bridge bound to ${bridgeHost} (HAPPY_BROWSER_BRIDGE_HOST) — not loopback-only`);
+      }
     } catch (err) {
       logger.debug(`[DAEMON RUN] Browser bridge failed to start on ${DEFAULT_BROWSER_BRIDGE_PORT}: ${err instanceof Error ? err.message : String(err)}`);
     }
