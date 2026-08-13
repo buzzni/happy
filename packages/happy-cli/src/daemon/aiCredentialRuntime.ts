@@ -15,7 +15,7 @@ export type AiCredentialCommandResult = {
 }
 
 export type AiCredentialRotationStatus = {
-  state: 'stopped' | 'starting' | 'running' | 'blocked'
+  state: 'stopped' | 'starting' | 'running' | 'needs-reauth' | 'blocked'
   lastErrorKind: string | null
   lastSwitchAt?: string
   activeAccount?: string
@@ -178,14 +178,29 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       await deps.chmod(authPath, 0o600)
       await deps.execFile('codex', ['login', 'status'])
     } catch (error) {
-      try { await deps.rm(tempPath, { force: true }) } catch { /* continue restoring the backup */ }
-      try { await deps.rm(authPath, { force: true }) } catch { /* rename may still replace it */ }
+      let tempCleanupFailed = false
+      try {
+        await deps.rm(tempPath, { force: true })
+      } catch {
+        tempCleanupFailed = true
+      }
+      let authRemovalFailed = false
+      try {
+        await deps.rm(authPath, { force: true })
+      } catch {
+        authRemovalFailed = true
+      }
       if (hadExisting) {
         try {
           await deps.rename(backupPath, authPath)
         } catch {
           throw new AiCredentialRuntimeError('CODEX_BACKUP_RESTORE_FAILED')
         }
+      } else if (authRemovalFailed) {
+        throw new AiCredentialRuntimeError('CODEX_APPLY_ROLLBACK_FAILED')
+      }
+      if (tempCleanupFailed) {
+        throw new AiCredentialRuntimeError('CODEX_APPLY_ROLLBACK_FAILED')
       }
       if (error instanceof AiCredentialRuntimeError) throw error
       throw new AiCredentialRuntimeError('CODEX_APPLY_FAILED')

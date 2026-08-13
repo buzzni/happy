@@ -333,7 +333,7 @@ describe('AI credential machine runtime', () => {
     expect(events).toEqual(['verify', 'enable', 'stop'])
   })
 
-  it('restores Codex auth even when temporary-file cleanup fails', async () => {
+  it('restores Codex auth and reports rollback failure when temporary cleanup fails', async () => {
     let files!: Map<string, string>
     const configured = setup({
       execFile: vi.fn(async (command: string) => {
@@ -350,8 +350,28 @@ describe('AI credential machine runtime', () => {
 
     await expect(configured.runtime.apply({
       provider: 'codex', payload: '{"OPENAI_API_KEY":"new"}',
-    })).rejects.toMatchObject({ kind: 'CODEX_APPLY_FAILED' })
+    })).rejects.toMatchObject({ kind: 'CODEX_APPLY_ROLLBACK_FAILED' })
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"old"}')
+  })
+
+  it('reports rollback failure when a rejected Codex auth cannot be removed', async () => {
+    let files!: Map<string, string>
+    const configured = setup({
+      execFile: vi.fn(async (command: string) => {
+        if (command === 'codex') throw new Error('not authenticated')
+        return { stdout: '', stderr: '' }
+      }),
+      rm: vi.fn(async (path: string) => {
+        if (path.endsWith('/auth.json')) throw new Error('permission denied')
+        files.delete(path)
+      }),
+    })
+    files = configured.files
+
+    await expect(configured.runtime.apply({
+      provider: 'codex', payload: '{"OPENAI_API_KEY":"rejected"}',
+    })).rejects.toMatchObject({ kind: 'CODEX_APPLY_ROLLBACK_FAILED' })
+    expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"rejected"}')
   })
 
   it('preserves a concrete Codex command error after restoring the previous auth', async () => {

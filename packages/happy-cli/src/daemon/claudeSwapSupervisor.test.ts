@@ -119,6 +119,52 @@ describe('Claude swap supervisor', () => {
     expect(supervisor.status()).toEqual({ state: 'running', lastErrorKind: null })
   })
 
+  it('reports quarantined credentials as needing reauthentication until recovery', async () => {
+    const { supervisor, children } = setup()
+    await supervisor.enable()
+
+    children[0].stdout.emit('data', Buffer.from(
+      '{"schemaVersion":1,"event":"account-quarantined","number":"2","email":"dead@example.com","reason":"invalid-grant"}\n',
+    ))
+    expect(supervisor.status()).toEqual({
+      state: 'needs-reauth',
+      lastErrorKind: 'ACCOUNT_NEEDS_REAUTH',
+    })
+    expect(JSON.stringify(supervisor.status())).not.toContain('dead@example.com')
+
+    children[0].stdout.emit('data', Buffer.from(
+      '{"schemaVersion":1,"event":"no-switch","reason":"below-threshold"}\n',
+    ))
+    expect(supervisor.status()).toEqual({
+      state: 'needs-reauth',
+      lastErrorKind: 'ACCOUNT_NEEDS_REAUTH',
+    })
+
+    children[0].stdout.emit('data', Buffer.from(
+      '{"schemaVersion":1,"event":"account-unquarantined","number":"2","email":"dead@example.com","reason":"credentials-replaced"}\n',
+    ))
+    expect(supervisor.status()).toEqual({ state: 'running', lastErrorKind: null })
+  })
+
+  it.each([
+    'no-candidates',
+    'no-comparison',
+    'no-qualifying-candidate',
+    'no-viable-target',
+  ])('reports the cswap blocked outcome %s instead of running', async (reason) => {
+    const { supervisor, children } = setup()
+    await supervisor.enable()
+
+    children[0].stdout.emit('data', Buffer.from(
+      `${JSON.stringify({ schemaVersion: 1, event: 'no-switch', reason })}\n`,
+    ))
+
+    expect(supervisor.status()).toEqual({
+      state: 'blocked',
+      lastErrorKind: 'NO_VIABLE_ACCOUNT',
+    })
+  })
+
   it('resets restart backoff after receiving a healthy poll', async () => {
     const { supervisor, children, scheduled } = setup(true)
     await supervisor.restore()

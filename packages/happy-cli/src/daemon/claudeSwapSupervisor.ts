@@ -28,6 +28,7 @@ export class ClaudeSwapSupervisor {
   private restartHandle: unknown = null
   private restartAttempts = 0
   private stdoutBuffer = ''
+  private quarantinedAccounts = new Set<string>()
   private currentStatus: AiCredentialRotationStatus = {
     state: 'stopped',
     lastErrorKind: null,
@@ -86,7 +87,7 @@ export class ClaudeSwapSupervisor {
     this.currentStatus = { ...this.currentStatus, state: 'starting', lastErrorKind: null }
     const child = this.deps.spawn('cswap', ['auto', '--strategy', 'consume-first', '--json'])
     this.child = child
-    this.currentStatus = { ...this.currentStatus, state: 'running', lastErrorKind: null }
+    this.currentStatus = { ...this.currentStatus, ...this.healthyStatus() }
 
     // Drain both streams without logging their contents. Future claude-swap
     // versions may add account or credential fields to JSON events.
@@ -137,12 +138,35 @@ export class ClaudeSwapSupervisor {
             state: 'blocked',
             lastErrorKind: 'ROTATION_ERROR',
           }
+        } else if (event.event === 'account-quarantined'
+          && typeof event.number === 'string'
+          && event.number.length > 0) {
+          this.quarantinedAccounts.add(event.number)
+          this.currentStatus = {
+            ...this.currentStatus,
+            state: 'needs-reauth',
+            lastErrorKind: 'ACCOUNT_NEEDS_REAUTH',
+          }
+        } else if (event.event === 'account-unquarantined'
+          && typeof event.number === 'string') {
+          this.quarantinedAccounts.delete(event.number)
+          if (this.currentStatus.state === 'needs-reauth') {
+            this.currentStatus = { ...this.currentStatus, ...this.healthyStatus() }
+          }
         } else if (event.event === 'poll' && isObject(event.active)) {
           this.restartAttempts = 0
         } else if (event.event === 'no-switch'
           && typeof event.reason === 'string'
           && HEALTHY_NO_SWITCH_REASONS.has(event.reason)) {
-          this.currentStatus = { ...this.currentStatus, state: 'running', lastErrorKind: null }
+          this.currentStatus = { ...this.currentStatus, ...this.healthyStatus() }
+        } else if (event.event === 'no-switch'
+          && typeof event.reason === 'string'
+          && BLOCKED_NO_SWITCH_REASONS.has(event.reason)) {
+          this.currentStatus = {
+            ...this.currentStatus,
+            state: 'blocked',
+            lastErrorKind: 'NO_VIABLE_ACCOUNT',
+          }
         } else if (event.event === 'switch'
           && event.dryRun !== true
           && typeof event.ts === 'string'
@@ -152,8 +176,7 @@ export class ClaudeSwapSupervisor {
           this.restartAttempts = 0
           this.currentStatus = {
             ...this.currentStatus,
-            state: 'running',
-            lastErrorKind: null,
+            ...this.healthyStatus(),
             lastSwitchAt: event.ts,
             activeAccount: maskEmail(event.to.email),
           }
@@ -163,6 +186,12 @@ export class ClaudeSwapSupervisor {
       }
     }
   }
+
+  private healthyStatus(): Pick<AiCredentialRotationStatus, 'state' | 'lastErrorKind'> {
+    return this.quarantinedAccounts.size > 0
+      ? { state: 'needs-reauth', lastErrorKind: 'ACCOUNT_NEEDS_REAUTH' }
+      : { state: 'running', lastErrorKind: null }
+  }
 }
 
 const HEALTHY_NO_SWITCH_REASONS = new Set([
@@ -171,6 +200,13 @@ const HEALTHY_NO_SWITCH_REASONS = new Set([
   'below-threshold',
   'cooldown',
   'reset-unknown',
+])
+
+const BLOCKED_NO_SWITCH_REASONS = new Set([
+  'no-candidates',
+  'no-comparison',
+  'no-qualifying-candidate',
+  'no-viable-target',
 ])
 
 function isObject(value: unknown): value is Record<string, unknown> {
