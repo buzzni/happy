@@ -130,7 +130,7 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
                 text: [
                     chalk.yellow(`연결은 됐지만 정밀 제어가 요청한 상태(${debuggerTierRequested ? '켬' : '끔'})로 바뀌지 않았습니다.`),
                     chalk.dim(debuggerTierActual === undefined
-                        ? '  확장이 상태를 응답하지 않았습니다. 잠시 후 다시 실행해 보세요.'
+                        ? '  상태를 확인하지 못했습니다 — 확장이 응답하지 않았거나, 프로필이 여럿 연결되어 어느 쪽에 적용됐는지 특정할 수 없습니다.'
                         : `  현재 상태: ${debuggerTierActual ? '켬' : '끔'}. 옵션 페이지가 아직 로드 중일 수 있습니다.`),
                     `  ${chalk.cyan('happy browser pair --debugger')} 를 다시 실행하세요.`,
                 ].join('\n'),
@@ -220,6 +220,25 @@ async function waitForConnection(controlPort: number, timeoutMs: number): Promis
 }
 
 /**
+ * Which connected profile the tier probe should ask.
+ *
+ * The daemon refuses a profile-less request when several profiles are
+ * connected (AMBIGUOUS_PROFILE, browserBridge.ts), so the probe must name
+ * one. The profile that appeared after we opened the page is the one whose
+ * storage the page wrote; on a re-pair nothing new appears, but a single
+ * connection can only be the target. With several connections and no new
+ * arrival there is no way to tell which one the page belongs to — return
+ * undefined so the caller skips the probe instead of asking a wrong profile.
+ */
+export function pickTierProbeProfile(profilesBefore: string[], connections: Array<{ profile: string }>): string | undefined {
+    const before = new Set(profilesBefore)
+    const fresh = connections.filter((connection) => !before.has(connection.profile))
+    if (fresh.length === 1) return fresh[0].profile
+    if (connections.length === 1) return connections[0].profile
+    return undefined
+}
+
+/**
  * Read back what the extension actually stored, via the `capabilities`
  * command it already answers.
  *
@@ -227,12 +246,12 @@ async function waitForConnection(controlPort: number, timeoutMs: number): Promis
  * has loaded — an already-paired profile is connected the whole time — so
  * "connected" is not evidence that `--debugger` took effect.
  */
-async function waitForDebuggerTier(controlPort: number, expected: boolean): Promise<boolean | undefined> {
+async function waitForDebuggerTier(controlPort: number, expected: boolean, profile: string): Promise<boolean | undefined> {
     const deadline = Date.now() + 5_000
     let actual: boolean | undefined
     while (Date.now() < deadline) {
         try {
-            const capabilities = await requestBrowser({ port: controlPort, method: 'capabilities', timeoutMs: 3_000 }) as { debugger?: boolean }
+            const capabilities = await requestBrowser({ port: controlPort, method: 'capabilities', timeoutMs: 3_000, profile }) as { debugger?: boolean }
             actual = capabilities?.debugger
             if (actual === expected) return actual
         } catch {
@@ -266,6 +285,9 @@ export async function handlePairCommand(args: string[]): Promise<void> {
     let connections: Array<{ profile: string }> = []
     let debuggerTierActual: boolean | undefined
     if (controlPort && cdpReachable) {
+        // Snapshotted before the page opens so the probe can tell a
+        // newly-arrived profile apart from ones that were already there.
+        const profilesBefore = ((await fetchBrowserStatus(controlPort))?.connections ?? []).map((connection) => connection.profile)
         pageOpened = await openTab(options.cdpPort, buildPairUrl({
             extensionId,
             token,
@@ -275,7 +297,10 @@ export async function handlePairCommand(args: string[]): Promise<void> {
         if (pageOpened) {
             connections = await waitForConnection(controlPort, 10_000)
             if (connections.length > 0 && options.debuggerTier !== undefined) {
-                debuggerTierActual = await waitForDebuggerTier(controlPort, options.debuggerTier)
+                const target = pickTierProbeProfile(profilesBefore, connections)
+                if (target !== undefined) {
+                    debuggerTierActual = await waitForDebuggerTier(controlPort, options.debuggerTier, target)
+                }
             }
         }
     }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { parsePairArgs, buildPairUrl, formatPairOutcome, DEFAULT_CDP_PORT } from './browserPair'
+import { parsePairArgs, buildPairUrl, formatPairOutcome, pickTierProbeProfile, DEFAULT_CDP_PORT } from './browserPair'
 
 describe('parsePairArgs', () => {
     it('defaults to Chrome\'s conventional debugging port and leaves the debugger tier alone', () => {
@@ -121,5 +121,28 @@ describe('formatPairOutcome', () => {
         const outcome = formatPairOutcome(base)
         expect(outcome.ok).toBe(true)
         expect(outcome.text).not.toContain('정밀 제어')
+    })
+})
+
+// The daemon refuses a profile-less request outright when several profiles
+// are connected (AMBIGUOUS_PROFILE), so the tier probe must name its target —
+// and skip the probe honestly when the target cannot be determined, instead
+// of polling into guaranteed rejections and then blaming the extension.
+describe('pickTierProbeProfile', () => {
+    it('picks the profile that appeared after the page was opened', () => {
+        expect(pickTierProbeProfile(['desktop'], [{ profile: 'desktop' }, { profile: 'headless-1' }]))
+            .toBe('headless-1')
+    })
+
+    it('picks the only connection on a re-pair, where nothing new appears', () => {
+        expect(pickTierProbeProfile(['headless-1'], [{ profile: 'headless-1' }])).toBe('headless-1')
+    })
+
+    it('gives up when several profiles are connected and none is new', () => {
+        expect(pickTierProbeProfile(['a', 'b'], [{ profile: 'a' }, { profile: 'b' }])).toBeUndefined()
+    })
+
+    it('gives up when several new profiles appeared at once', () => {
+        expect(pickTierProbeProfile([], [{ profile: 'a' }, { profile: 'b' }])).toBeUndefined()
     })
 })
