@@ -77,6 +77,22 @@ describe('Claude swap supervisor', () => {
     expect(supervisor.status()).toEqual({ state: 'stopped', lastErrorKind: null })
   })
 
+  it('records only masked switch metadata from fragmented JSON events', async () => {
+    const { supervisor, children } = setup()
+    await supervisor.enable()
+    children[0].stdout.emit('data', Buffer.from('{"schemaVersion":1,"event":"switch","ts":"2026-08-13T'))
+    children[0].stdout.emit('data', Buffer.from('09:00:00Z","to":{"number":2,"email":"next@example.com"},"accessToken":"secret"}\n'))
+
+    expect(supervisor.status()).toEqual({
+      state: 'running',
+      lastErrorKind: null,
+      lastSwitchAt: '2026-08-13T09:00:00Z',
+      activeAccount: 'n***@example.com',
+    })
+    expect(JSON.stringify(supervisor.status())).not.toContain('secret')
+    expect(JSON.stringify(supervisor.status())).not.toContain('next@example.com')
+  })
+
   it('shuts down the child without disabling restart persistence', async () => {
     const { supervisor, children, writeEnabled } = setup(true)
     await supervisor.restore()

@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import type { AiCredentialRotationStatus } from './aiCredentialRuntime'
@@ -25,6 +26,7 @@ export class ClaudeSwapSupervisor {
   private child: ClaudeSwapChild | null = null
   private restartHandle: unknown = null
   private restartAttempts = 0
+  private stdoutBuffer = ''
   private currentStatus: AiCredentialRotationStatus = {
     state: 'stopped',
     lastErrorKind: null,
@@ -58,6 +60,7 @@ export class ClaudeSwapSupervisor {
     this.child = null
     if (running) running.kill('SIGTERM')
     this.restartAttempts = 0
+    this.stdoutBuffer = ''
     this.currentStatus = { state: 'stopped', lastErrorKind: null }
   }
 
@@ -67,20 +70,22 @@ export class ClaudeSwapSupervisor {
 
   private start(): void {
     if (!this.enabled || this.child) return
-    this.currentStatus = { state: 'starting', lastErrorKind: null }
+    this.currentStatus = { ...this.currentStatus, state: 'starting', lastErrorKind: null }
     const child = this.deps.spawn('cswap', ['auto', '--strategy', 'consume-first', '--json'])
     this.child = child
-    this.currentStatus = { state: 'running', lastErrorKind: null }
+    this.currentStatus = { ...this.currentStatus, state: 'running', lastErrorKind: null }
 
     // Drain both streams without logging their contents. Future claude-swap
     // versions may add account or credential fields to JSON events.
-    child.stdout?.on('data', () => undefined)
+    this.stdoutBuffer = ''
+    child.stdout?.on('data', (data) => this.consumeStdout(data))
     child.stderr?.on('data', () => undefined)
     const scheduleRestart = (lastErrorKind: string) => {
       if (this.child !== child) return
       this.child = null
       if (!this.enabled) return
       this.currentStatus = {
+        ...this.currentStatus,
         state: 'blocked',
         lastErrorKind,
       }
@@ -94,6 +99,45 @@ export class ClaudeSwapSupervisor {
     child.on('error', () => scheduleRestart('PROCESS_START_FAILED'))
     child.on('exit', (code) => scheduleRestart(code === 0 ? 'PROCESS_STOPPED' : 'PROCESS_EXITED'))
   }
+
+  private consumeStdout(data: Buffer): void {
+    this.stdoutBuffer += data.toString('utf8')
+    if (this.stdoutBuffer.length > 64 * 1024) {
+      this.stdoutBuffer = ''
+      return
+    }
+    const lines = this.stdoutBuffer.split('\n')
+    this.stdoutBuffer = lines.pop() ?? ''
+    for (const line of lines) {
+      try {
+        const event = JSON.parse(line) as unknown
+        if (!isObject(event)
+          || event.schemaVersion !== 1
+          || event.event !== 'switch'
+          || typeof event.ts !== 'string'
+          || !Number.isFinite(Date.parse(event.ts))
+          || !isObject(event.to)
+          || typeof event.to.email !== 'string') continue
+        this.currentStatus = {
+          ...this.currentStatus,
+          lastSwitchAt: event.ts,
+          activeAccount: maskEmail(event.to.email),
+        }
+      } catch {
+        // Ignore non-JSON diagnostic lines without retaining or logging them.
+      }
+    }
+  }
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function maskEmail(email: string): string {
+  const at = email.indexOf('@')
+  if (at < 1) return '***'
+  return `${email[0]}***${email.slice(at)}`
 }
 
 export function createClaudeSwapSupervisor(stateFile: string): ClaudeSwapSupervisor {
@@ -108,7 +152,7 @@ export function createClaudeSwapSupervisor(stateFile: string): ClaudeSwapSupervi
     },
     writeEnabled: async (enabled) => {
       await mkdir(dirname(stateFile), { recursive: true, mode: 0o700 })
-      const temp = `${stateFile}.${process.pid}.tmp`
+      const temp = `${stateFile}.${process.pid}.${randomUUID()}.tmp`
       await writeFile(temp, `${JSON.stringify({ enabled })}\n`, { mode: 0o600 })
       await rename(temp, stateFile)
     },

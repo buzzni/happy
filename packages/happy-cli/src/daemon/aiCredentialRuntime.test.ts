@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   createAiCredentialRuntime,
+  runAiCredentialCommand,
   type AiCredentialCommandResult,
   type AiCredentialRuntimeDependencies,
 } from './aiCredentialRuntime'
@@ -22,7 +23,11 @@ function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
     }
     if (command === 'cswap' && args[0] === 'list') {
       return {
-        stdout: JSON.stringify({ activeAccount: { email: 'owner@example.com', accessToken: 'secret' } }),
+        stdout: JSON.stringify({
+          schemaVersion: 1,
+          activeAccountNumber: 1,
+          accounts: [{ number: 1, email: 'owner@example.com', active: true, accessToken: 'secret' }],
+        }),
         stderr: '',
       }
     }
@@ -121,7 +126,7 @@ describe('AI credential machine runtime', () => {
         return { stdout: 'claude-swap 0.24.0', stderr: '' }
       }
       if (command === 'cswap' && args[0] === 'list') {
-        return { stdout: '{}', stderr: '' }
+        return { stdout: '{"schemaVersion":1,"activeAccountNumber":null,"accounts":[]}', stderr: '' }
       }
       return { stdout: '', stderr: '' }
     })
@@ -131,7 +136,26 @@ describe('AI credential machine runtime', () => {
 
     expect(execFile).toHaveBeenCalledWith('uv', [
       'tool', 'install', 'claude-swap==0.25.0', '--python', '>=3.12', '--force',
-    ])
+    ], expect.anything())
+  })
+
+  it('does not accept a version string that merely contains the managed version', async () => {
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'cswap' && args[0] === '--version') {
+        return { stdout: 'claude-swap 0.25.0-beta.1', stderr: '' }
+      }
+      if (command === 'cswap' && args[0] === 'list') {
+        return { stdout: '{"schemaVersion":1,"activeAccountNumber":null,"accounts":[]}', stderr: '' }
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime } = setup({ execFile })
+
+    await runtime.apply({ provider: 'claude', payload: '{}' })
+
+    expect(execFile).toHaveBeenCalledWith('uv', [
+      'tool', 'install', 'claude-swap==0.25.0', '--python', '>=3.12', '--force',
+    ], expect.anything())
   })
 
   it('atomically applies Codex auth with mode 0600 and reports only login status', async () => {
@@ -163,6 +187,46 @@ describe('AI credential machine runtime', () => {
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"old"}')
   })
 
+  it('restores the existing Codex auth when backup permission tightening fails', async () => {
+    const chmod = vi.fn(async (path: string) => {
+      if (path.endsWith('auth.json.happy-backup')) throw new Error('permission denied')
+    })
+    const { runtime, files } = setup({ chmod })
+    files.set('/home/operator/.codex/auth.json', '{"OPENAI_API_KEY":"old"}')
+
+    await expect(runtime.apply({
+      provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
+    })).rejects.toMatchObject({ kind: 'CODEX_BACKUP_FAILED' })
+    expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"old"}')
+    expect(files.has('/home/operator/.codex/auth.json.happy-backup')).toBe(false)
+  })
+
+  it('serializes concurrent applies so credential file replacements cannot overlap', async () => {
+    let releaseFirst!: () => void
+    const firstStatusBlocked = new Promise<void>((resolve) => { releaseFirst = resolve })
+    let statusCalls = 0
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'codex' && args[0] === 'login') {
+        statusCalls += 1
+        if (statusCalls === 1) await firstStatusBlocked
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime, files } = setup({ execFile })
+    files.set('/home/operator/.codex/auth.json', '{"OPENAI_API_KEY":"old"}')
+
+    const first = runtime.apply({ provider: 'codex', payload: '{"OPENAI_API_KEY":"one"}' })
+    await vi.waitFor(() => expect(statusCalls).toBe(1))
+    const second = runtime.apply({ provider: 'codex', payload: '{"OPENAI_API_KEY":"two"}' })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(statusCalls).toBe(1)
+
+    releaseFirst()
+    await Promise.all([first, second])
+    expect(statusCalls).toBe(2)
+    expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"two"}')
+  })
+
   it('redacts Claude account status instead of returning command output', async () => {
     const { runtime } = setup()
 
@@ -172,5 +236,23 @@ describe('AI credential machine runtime', () => {
       activeAccount: 'o***@example.com',
       rotation: { state: 'running', lastErrorKind: null },
     })
+  })
+
+  it('rejects malformed Claude list output instead of reporting configured', async () => {
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({ stdout: '{"schemaVersion":1,"error":{"message":"secret"}}', stderr: '' })),
+    })
+
+    await expect(runtime.status({ provider: 'claude' })).rejects.toMatchObject({
+      kind: 'CLAUDE_STATUS_INVALID',
+    })
+  })
+
+  it('terminates commands that exceed their timeout without returning process output', async () => {
+    await expect(runAiCredentialCommand(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1000)'],
+      { timeoutMs: 20 },
+    )).rejects.toMatchObject({ kind: 'COMMAND_TIMED_OUT' })
   })
 })

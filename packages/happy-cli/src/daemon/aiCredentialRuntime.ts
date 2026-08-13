@@ -16,11 +16,14 @@ export type AiCredentialCommandResult = {
 export type AiCredentialRotationStatus = {
   state: 'stopped' | 'starting' | 'running' | 'blocked'
   lastErrorKind: string | null
+  lastSwitchAt?: string
+  activeAccount?: string
 }
 
 type CommandOptions = {
   input?: string
   maxOutputBytes?: number
+  timeoutMs?: number
 }
 
 type Supervisor = {
@@ -50,6 +53,8 @@ export class AiCredentialRuntimeError extends Error {
 }
 
 export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies) {
+  let applyTail: Promise<void> = Promise.resolve()
+
   function provider(value: unknown): AiCredentialProvider {
     if (value !== 'claude' && value !== 'codex') {
       throw new AiCredentialRuntimeError('UNSUPPORTED_PROVIDER')
@@ -91,7 +96,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     let installed = false
     try {
       const version = await deps.execFile('cswap', ['--version'])
-      installed = version.stdout.includes(CLAUDE_SWAP_VERSION)
+      installed = /^(?:cswap|claude-swap) 0\.25\.0\s*$/.test(version.stdout)
     } catch {
       installed = false
     }
@@ -99,7 +104,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       await deps.execFile('uv', [
         'tool', 'install', `claude-swap==${CLAUDE_SWAP_VERSION}`,
         '--python', '>=3.12', '--force',
-      ])
+      ], { timeoutMs: 300_000 })
     }
     await deps.execFile('cswap', ['config', 'set', 'autoswitch.threshold', '95'])
     await deps.execFile('cswap', ['config', 'set', 'autoswitch.strategy', 'consume-first'])
@@ -116,7 +121,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     } finally {
       await deps.rm(tempDir, { recursive: true, force: true })
     }
-    await deps.execFile('cswap', ['list', '--json'])
+    const status = await deps.execFile('cswap', ['list', '--json'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
+    parseClaudeList(status.stdout)
     await deps.supervisor.enable()
     return {
       provider: 'claude' as const,
@@ -134,10 +140,21 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     let hadExisting = false
     try {
       await deps.rename(authPath, backupPath)
-      await deps.chmod(backupPath, 0o600)
       hadExisting = true
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new AiCredentialRuntimeError('CODEX_BACKUP_FAILED')
+      }
+    }
+    if (hadExisting) {
+      try {
+        await deps.chmod(backupPath, 0o600)
+      } catch {
+        try {
+          await deps.rename(backupPath, authPath)
+        } catch {
+          throw new AiCredentialRuntimeError('CODEX_BACKUP_RESTORE_FAILED')
+        }
         throw new AiCredentialRuntimeError('CODEX_BACKUP_FAILED')
       }
     }
@@ -162,7 +179,12 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       throw new AiCredentialRuntimeError('INVALID_PAYLOAD')
     }
     assertPayloadSize(input.payload)
-    return selected === 'claude' ? applyClaude(input.payload) : applyCodex(input.payload)
+    const operation = applyTail.then(async () => {
+      if (selected === 'claude') return applyClaude(input.payload)
+      return applyCodex(input.payload)
+    })
+    applyTail = operation.then(() => undefined, () => undefined)
+    return operation
   }
 
   async function status(input: { provider: AiCredentialProvider }) {
@@ -172,15 +194,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       return { provider: selected, configured: true, status: 'authenticated' as const }
     }
     const result = await deps.execFile('cswap', ['list', '--json'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
-    let activeAccount: string | null = null
-    try {
-      const parsed = JSON.parse(result.stdout) as { activeAccount?: { email?: unknown } }
-      if (typeof parsed.activeAccount?.email === 'string') {
-        activeAccount = maskEmail(parsed.activeAccount.email)
-      }
-    } catch {
-      throw new AiCredentialRuntimeError('CLAUDE_STATUS_INVALID')
-    }
+    const activeAccount = parseClaudeList(result.stdout)
     return {
       provider: selected,
       configured: true,
@@ -199,6 +213,40 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   return { capture, apply, status, rotation }
 }
 
+function parseClaudeList(stdout: string): string | null {
+  try {
+    const parsed = JSON.parse(stdout) as unknown
+    if (!isObject(parsed)
+      || parsed.schemaVersion !== 1
+      || !Array.isArray(parsed.accounts)
+      || (parsed.activeAccountNumber !== null
+        && !Number.isInteger(parsed.activeAccountNumber))) {
+      throw new Error('invalid status')
+    }
+    for (const account of parsed.accounts) {
+      if (!isObject(account)
+        || !Number.isInteger(account.number)
+        || typeof account.email !== 'string') {
+        throw new Error('invalid account')
+      }
+    }
+    if (parsed.activeAccountNumber === null) return null
+    const active = parsed.accounts.find((account) => (
+      isObject(account) && account.number === parsed.activeAccountNumber
+    ))
+    if (!isObject(active) || typeof active.email !== 'string') {
+      throw new Error('active account missing')
+    }
+    return maskEmail(active.email)
+  } catch {
+    throw new AiCredentialRuntimeError('CLAUDE_STATUS_INVALID')
+  }
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
 function maskEmail(email: string): string {
   const at = email.indexOf('@')
   if (at < 1) return '***'
@@ -213,7 +261,7 @@ export function createNodeAiCredentialRuntime(
   return createAiCredentialRuntime({
     homeDir,
     env,
-    execFile: runCommand,
+    execFile: runAiCredentialCommand,
     readFile: (path) => readFile(path, 'utf8'),
     writeFile: async (path, content, options) => { await writeFile(path, content, options) },
     mkdir,
@@ -225,7 +273,7 @@ export function createNodeAiCredentialRuntime(
   })
 }
 
-function runCommand(
+export function runAiCredentialCommand(
   command: string,
   args: string[],
   options: CommandOptions = {},
@@ -239,9 +287,11 @@ function runCommand(
     const stderr: Buffer[] = []
     let outputBytes = 0
     let settled = false
+    let timeout: NodeJS.Timeout | undefined
     const fail = (kind: string) => {
       if (settled) return
       settled = true
+      if (timeout) clearTimeout(timeout)
       child.kill('SIGKILL')
       reject(new AiCredentialRuntimeError(kind))
     }
@@ -259,6 +309,7 @@ function runCommand(
     child.on('exit', (code) => {
       if (settled) return
       settled = true
+      if (timeout) clearTimeout(timeout)
       if (code !== 0) {
         reject(new AiCredentialRuntimeError('COMMAND_FAILED'))
         return
@@ -268,6 +319,7 @@ function runCommand(
         stderr: Buffer.concat(stderr).toString('utf8'),
       })
     })
+    timeout = setTimeout(() => fail('COMMAND_TIMED_OUT'), options.timeoutMs ?? 30_000)
     if (options.input === undefined) child.stdin.end()
     else child.stdin.end(options.input)
   })
