@@ -113,6 +113,28 @@ describe('formatPairOutcome', () => {
         expect(outcome.text).toContain('happy browser')
     })
 
+    // The daemon already knows which of the two it was — it reports
+    // hasRecentAuthFailure. Guessing "token or port" while holding the answer
+    // is exactly the ambiguity this command exists to remove.
+    it('names a rejected token outright when the daemon saw the rejection', () => {
+        const outcome = formatPairOutcome({ ...base, connections: [], authRejected: true })
+        expect(outcome.ok).toBe(false)
+        expect(outcome.text).toMatch(/거부/)
+        // A rejection proves the extension reached the bridge, so the address
+        // is right and suggesting otherwise sends the user the wrong way.
+        expect(outcome.text).not.toMatch(/포트가 어긋|주소/)
+    })
+
+    it('says the extension never reached the bridge when no rejection was seen', () => {
+        const outcome = formatPairOutcome({ ...base, connections: [], authRejected: false })
+        expect(outcome.ok).toBe(false)
+        expect(outcome.text).toMatch(/닿지 못했/)
+        // Points at the address/port, not at the token — the opposite remedy
+        // from the rejected-token branch.
+        expect(outcome.text).toMatch(/주소|포트/)
+        expect(outcome.text).not.toMatch(/토큰이 거부/)
+    })
+
     // Chrome answered on /json/list but refused /json/new. Without its own
     // branch this fell through to a message that claims the page WAS opened,
     // pointing the user at a token mismatch that is not the problem.

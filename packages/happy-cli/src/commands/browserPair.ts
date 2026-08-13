@@ -95,9 +95,16 @@ export interface PairOutcomeInput {
     debuggerTierRequested?: boolean
     /** What the extension reports now. Absent when it could not be read. */
     debuggerTierActual?: boolean
+    /**
+     * The daemon rejected a connection for a bad token recently. Separates
+     * "the extension reached the bridge and was turned away" from "it never
+     * arrived at all" — two failures with different remedies that would
+     * otherwise both be reported as a guess.
+     */
+    authRejected?: boolean
 }
 
-export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpReachable, extensionLoaded, pageOpened, connections, freshProfiles, debuggerTierRequested, debuggerTierActual }: PairOutcomeInput): { ok: boolean; text: string } {
+export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpReachable, extensionLoaded, pageOpened, connections, freshProfiles, debuggerTierRequested, debuggerTierActual, authRejected }: PairOutcomeInput): { ok: boolean; text: string } {
     // Ordered by what has to be true first: a later check failing while an
     // earlier prerequisite is missing would point at the wrong thing.
     if (!daemonRunning) {
@@ -193,12 +200,27 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
         }
     }
 
+    // The daemon reports whether it turned a connection away, so this does
+    // not have to guess between the two remaining causes.
+    if (authRejected) {
+        return {
+            ok: false,
+            text: [
+                chalk.yellow('확장이 브리지에 닿았지만 토큰이 거부됐습니다.'),
+                chalk.dim('  방금 저장한 토큰과 데몬이 검증하는 토큰이 다릅니다 — 보통 다른 happy'),
+                chalk.dim('  설치(HAPPY_HOME_DIR이 다른 데몬)가 이 포트를 잡고 있는 경우입니다.'),
+                `  ${chalk.cyan('happy browser')} 로 어느 데몬이 브리지를 쥐고 있는지 확인하세요.`,
+            ].join('\n'),
+        }
+    }
+
     return {
         ok: false,
         text: [
-            chalk.yellow('옵션 페이지는 열었지만 확장이 데몬에 연결되지 않았습니다.'),
-            chalk.dim('  확장은 붙어 있으므로 토큰이나 브리지 포트가 어긋난 경우입니다.'),
-            `  ${chalk.cyan('happy browser')} 로 데몬이 검증 중인 토큰을 확인하세요.`,
+            chalk.yellow('옵션 페이지는 열었지만 확장이 브리지에 닿지 못했습니다.'),
+            chalk.dim('  거부된 시도가 없으므로 확장이 아예 도달하지 못한 것입니다 — 저장된'),
+            chalk.dim('  데몬 주소/포트가 이 데몬과 다르거나, 옵션 페이지가 저장에 실패했습니다.'),
+            `  ${chalk.cyan('happy browser')} 로 브리지 포트와 상태를 확인하세요.`,
         ].join('\n'),
     }
 }
@@ -248,15 +270,21 @@ function hasExtensionTarget(targets: Array<{ url?: string }> | null, extensionId
  * accepted, since answering early would make the bystander case a false
  * success and this is a one-shot diagnostic command.
  */
-async function waitForConnection(controlPort: number, timeoutMs: number, profilesBefore: string[]): Promise<Array<{ profile: string }>> {
+async function waitForConnection(controlPort: number, timeoutMs: number, profilesBefore: string[]): Promise<{ connections: Array<{ profile: string }>; authRejected: boolean }> {
     const deadline = Date.now() + timeoutMs
     let connections: Array<{ profile: string }> = []
+    // Sticky: the daemon's flag expires on its own window, and a rejection
+    // seen at any point during the wait is the explanation for the failure
+    // even if a later poll no longer reports it.
+    let authRejected = false
     while (Date.now() < deadline) {
-        connections = (await fetchBrowserStatus(controlPort))?.connections ?? []
-        if (connections.some((connection) => !profilesBefore.includes(connection.profile))) return connections
+        const status = await fetchBrowserStatus(controlPort)
+        connections = status?.connections ?? []
+        authRejected ||= status?.hasRecentAuthFailure === true
+        if (connections.some((connection) => !profilesBefore.includes(connection.profile))) break
         await new Promise((resolve) => setTimeout(resolve, 500))
     }
-    return connections
+    return { connections, authRejected }
 }
 
 /**
@@ -325,6 +353,7 @@ export async function handlePairCommand(args: string[]): Promise<void> {
     let connections: Array<{ profile: string }> = []
     let debuggerTierActual: boolean | undefined
     let freshProfiles: string[] = []
+    let authRejected = false
     if (controlPort && cdpReachable) {
         // Snapshotted before the page opens so a newly-arrived profile can be
         // told apart from ones that were already there — both the success
@@ -341,7 +370,9 @@ export async function handlePairCommand(args: string[]): Promise<void> {
             bridgeHost: resolveBrowserBridgeHost(process.env),
         }))
         if (pageOpened) {
-            connections = await waitForConnection(controlPort, 10_000, profilesBefore)
+            const waited = await waitForConnection(controlPort, 10_000, profilesBefore)
+            connections = waited.connections
+            authRejected = waited.authRejected
             freshProfiles = connections
                 .map((connection) => connection.profile)
                 .filter((profile) => !profilesBefore.includes(profile))
@@ -365,6 +396,7 @@ export async function handlePairCommand(args: string[]): Promise<void> {
         freshProfiles,
         debuggerTierRequested: options.debuggerTier,
         debuggerTierActual,
+        authRejected,
     })
     console.log('')
     console.log(outcome.text)
