@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import { existsSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { formatBrowserStatus, resolveExtensionDir, resolveExtensionId } from './browser'
+import { formatBrowserStatus, resolveExtensionDir, resolveExtensionId, bridgeProbeHost } from './browser'
 import { projectPath } from '@/projectPath'
 
 const base = {
@@ -156,6 +156,49 @@ describe('formatBrowserStatus', () => {
             const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [], bridgeHost: '0.0.0.0' })
             expect(out).toMatch(/평문|암호화되지 않|토큰.*유일/)
             expect(out).not.toContain('host=')
+        })
+
+        // The liveness probe used to be hardcoded to loopback. A daemon bound
+        // to one specific interface is then unreachable at 127.0.0.1, so the
+        // probe came back false and formatBrowserStatus printed "브리지 포트를
+        // 잡지 못했습니다" plus a restart that changes nothing — for a bridge
+        // that was working fine.
+        it('probes the interface the bridge is actually bound to', () => {
+            expect(bridgeProbeHost('192.168.1.5')).toBe('192.168.1.5')
+            expect(bridgeProbeHost('::1')).toBe('::1')
+        })
+
+        it('probes loopback for a wildcard bind, which a wildcard always covers', () => {
+            expect(bridgeProbeHost('0.0.0.0')).toBe('127.0.0.1')
+            expect(bridgeProbeHost('::')).toBe('127.0.0.1')
+            expect(bridgeProbeHost('127.0.0.1')).toBe('127.0.0.1')
+        })
+
+        // On a public bind any internet scanner touching 41777 trips
+        // hasRecentAuthFailure, so the loopback-era wording ("your other
+        // extension is retrying with an old token") becomes a guess that
+        // sends the user re-pairing something that was never broken.
+        it('does not blame a stale extension for a rejected attempt when anyone can reach the port', () => {
+            const out = formatBrowserStatus({
+                ...base,
+                daemonRunning: true,
+                connections: [],
+                hasRecentAuthFailure: true,
+                bridgeHost: '0.0.0.0',
+            })
+            expect(out).toMatch(/외부|스캔|확장이 아닐/)
+        })
+
+        it('still names the stale-token cause plainly when only loopback can reach the port', () => {
+            const out = formatBrowserStatus({
+                ...base,
+                daemonRunning: true,
+                connections: [],
+                hasRecentAuthFailure: true,
+                bridgeHost: '127.0.0.1',
+            })
+            expect(out).not.toMatch(/외부|스캔/)
+            expect(out).toMatch(/토큰/)
         })
 
         it('adds &host= to the auto-connect link when a public host is given', () => {

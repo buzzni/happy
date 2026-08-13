@@ -93,6 +93,11 @@ function autoConnectLink(extensionId: string, token: string, bridgePort: number,
 
 export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePort, daemonRunning, connections, hasRecentAuthFailure, bridgePortInUse, bridgeHost, publicHost }: BrowserStatusInput): string {
     const lines: string[] = ['', chalk.bold('Happy Browser Bridge'), '']
+    // A rejected connection is strong evidence of a stale-token extension
+    // only while loopback is the sole way in. Once anyone can reach the port,
+    // a passing scanner trips the same flag — and the confident wording would
+    // send the user re-pairing something that was never broken.
+    const portIsPublic = bridgeHost !== undefined && bridgeHost !== '127.0.0.1'
 
     if (bridgeHost !== undefined && bridgeHost !== '127.0.0.1') {
         lines.push(chalk.yellow(`브리지가 ${bridgeHost}에 바인드되어 있습니다 — 이 컴퓨터 밖에서도 닿을 수 있습니다.`))
@@ -134,7 +139,9 @@ export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePo
         }
         lines.push('')
         if (hasRecentAuthFailure) {
-            lines.push(chalk.yellow('다른 확장이 예전 토큰으로 재연결을 시도하다 거부되고 있습니다.'))
+            lines.push(chalk.yellow(portIsPublic
+                ? '잘못된 토큰으로 연결 시도가 거부됐습니다. 포트가 외부에 열려 있어 당신의 확장이 아닐 수도 있습니다(스캔 등).'
+                : '다른 확장이 예전 토큰으로 재연결을 시도하다 거부되고 있습니다.'))
             lines.push('아래 링크를 열어 재연결하세요:')
             lines.push(`  ${chalk.cyan(autoConnectLink(extensionId, token, bridgePort, publicHost))}`)
             lines.push('')
@@ -148,9 +155,13 @@ export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePo
     if (!daemonRunning && bridgePortInUse === true) {
         lines.push(chalk.yellow('연결 상태는 이 설치에서 확인할 수 없습니다 (브리지를 잡고 있는 데몬의 제어 포트를 모릅니다).'))
     } else {
-        lines.push(hasRecentAuthFailure
-            ? chalk.yellow('확장이 연결을 시도했지만 예전 토큰이라 거부됐습니다. 재연결이 필요합니다.')
-            : chalk.yellow('연결된 확장이 없습니다.'))
+        if (!hasRecentAuthFailure) {
+            lines.push(chalk.yellow('연결된 확장이 없습니다.'))
+        } else {
+            lines.push(chalk.yellow(portIsPublic
+                ? '연결된 확장이 없고, 잘못된 토큰으로 거부된 시도가 있었습니다. 포트가 외부에 열려 있어 당신의 확장이 아닐 수도 있습니다(스캔 등).'
+                : '확장이 연결을 시도했지만 예전 토큰이라 거부됐습니다. 재연결이 필요합니다.'))
+        }
     }
     lines.push('')
     lines.push(chalk.bold('설치 방법'))
@@ -178,9 +189,22 @@ export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePo
  * but the bridge is" case (a daemon under a different HAPPY_HOME_DIR), which
  * the state file alone cannot see.
  */
-function isBridgePortInUse(port: number): Promise<boolean> {
+/**
+ * Where to knock to see whether the bridge is up.
+ *
+ * A wildcard bind covers loopback, so 127.0.0.1 is both valid and the safest
+ * destination (connecting *to* 0.0.0.0 is platform-dependent). Anything else
+ * is a specific interface that loopback does not reach — probing 127.0.0.1
+ * there reports "no bridge" for a bridge that is running fine, which
+ * formatBrowserStatus then turns into a restart instruction that cannot help.
+ */
+export function bridgeProbeHost(bridgeHost: string): string {
+    return bridgeHost === '0.0.0.0' || bridgeHost === '::' ? '127.0.0.1' : bridgeHost
+}
+
+function isBridgePortInUse(port: number, host: string): Promise<boolean> {
     return new Promise((resolve) => {
-        const socket = net.connect({ host: '127.0.0.1', port })
+        const socket = net.connect({ host, port })
         const finish = (inUse: boolean) => {
             socket.destroy()
             resolve(inUse)
@@ -242,6 +266,10 @@ export async function handleBrowserCommand(args: string[]): Promise<void> {
         : null) ?? { connections: [], hasRecentAuthFailure: false }
 
     const extensionDir = resolveExtensionDir()
+    // Best-effort: reflects this process's own env, which is only the live
+    // daemon's actual bind host when nothing has changed it since `happy
+    // daemon start` ran. Good enough to warn — not authoritative.
+    const bridgeHost = resolveBrowserBridgeHost(process.env)
 
     console.log(formatBrowserStatus({
         token,
@@ -251,11 +279,8 @@ export async function handleBrowserCommand(args: string[]): Promise<void> {
         daemonRunning,
         connections,
         hasRecentAuthFailure,
-        bridgePortInUse: await isBridgePortInUse(DEFAULT_BROWSER_BRIDGE_PORT),
-        // Best-effort: reflects this process's own env, which is only the
-        // live daemon's actual bind host when nothing has changed it since
-        // `happy daemon start` ran. Good enough to warn — not authoritative.
-        bridgeHost: resolveBrowserBridgeHost(process.env),
+        bridgePortInUse: await isBridgePortInUse(DEFAULT_BROWSER_BRIDGE_PORT, bridgeProbeHost(bridgeHost)),
+        bridgeHost,
         publicHost: process.env.HAPPY_BROWSER_BRIDGE_PUBLIC_HOST?.trim() || undefined,
     }))
 }
