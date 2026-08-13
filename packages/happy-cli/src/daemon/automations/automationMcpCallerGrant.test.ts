@@ -47,9 +47,32 @@ describe('exchangeAutomationMcpCallerGrant', () => {
     )
   })
 
+  // specs/automation-company-owner-identity R2 — 회사 happy 계정 소유
+  // 자동화는 개인 커넥터 대상 사용자가 없어 서버가 no-grant 로 응답한다.
+  // 이는 "grant 없이 정상 진행" 신호이지 오류가 아니다.
+  it('accepts an explicit no-grant response for a company-owned automation', async () => {
+    const logDebug = vi.fn()
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      grant: null, projectId: 'P-1',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(exchangeAutomationMcpCallerGrant({
+      configUrl: 'https://saycode.ai/api/me/mcp-config',
+      machineToken: 'machine-token',
+      machineId: 'M-1',
+      runId: 'R-1',
+      claimToken: 'claim-token',
+      logDebug,
+    })).resolves.toEqual({ ok: true, value: null })
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('no personal grant'))
+  })
+
   it.each([
     new Response('{}', { status: 403 }),
     new Response(JSON.stringify({ grant: '', projectId: 'P-1' }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }),
+    new Response(JSON.stringify({ grant: null, projectId: '' }), {
       status: 200, headers: { 'Content-Type': 'application/json' },
     }),
   ])('fails closed when the exchange rejects the run or returns an invalid grant', async (response) => {
