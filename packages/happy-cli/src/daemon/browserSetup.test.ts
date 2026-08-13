@@ -68,10 +68,20 @@ describe('planChromeInstall', () => {
     })
 
     it('installs directly when passwordless sudo is available', () => {
-        const plan = planChromeInstall({ chromePath: null, canSudo: true })
+        const plan = planChromeInstall({ chromePath: null, canSudo: true, platform: 'linux' })
 
         expect(plan.action).toBe('run')
         expect(plan.command).toContain('google-chrome')
+    })
+
+    it('does not offer an apt command on a non-Linux machine', () => {
+        // The machine screen is shown for every machine, including the
+        // user's own Mac, where Chrome lives in /Applications and is absent
+        // from PATH. Offering `apt-get install` there sends the user to run
+        // a command their OS does not have.
+        const plan = planChromeInstall({ chromePath: null, canSudo: false, platform: 'darwin' })
+
+        expect(plan.command ?? '').not.toContain('apt-get')
     })
 
     it('reports a manual command instead of claiming success without sudo', () => {
@@ -79,7 +89,7 @@ describe('planChromeInstall', () => {
         // cannot be installed without root, so there is no honest unattended
         // path here. Returning "manual" keeps the button from reporting a
         // success the machine never had.
-        const plan = planChromeInstall({ chromePath: null, canSudo: false })
+        const plan = planChromeInstall({ chromePath: null, canSudo: false, platform: 'linux' })
 
         expect(plan.action).toBe('manual')
         expect(plan.command).toContain('sudo')

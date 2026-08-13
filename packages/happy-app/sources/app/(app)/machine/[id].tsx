@@ -9,6 +9,13 @@ import { useSessions, useAllMachines, useMachine } from '@/sync/storage';
 import { Ionicons, Octicons } from '@expo/vector-icons';
 import type { Session } from '@/sync/storageTypes';
 import { machineStopDaemon, machineUpdateMetadata, machineDelete } from '@/sync/ops';
+import {
+    machineBrowserSetupStatus,
+    machineBrowserInstallChrome,
+    machineBrowserLaunch,
+    machineBrowserPair,
+    type BrowserSetupStatus,
+} from '@/sync/ops';
 import { Modal } from '@/modal';
 import { formatPathRelativeToHome, getSessionName, getSessionSubtitle } from '@/utils/sessionUtils';
 import { isMachineOnline } from '@/utils/machineUtils';
@@ -79,6 +86,12 @@ export default function MachineDetailScreen() {
     const [showAllPaths, setShowAllPaths] = useState(false);
     // Variant D only
 
+    // Browser bridge setup (specs/browser-setup-gui/)
+    const [browserStatus, setBrowserStatus] = useState<BrowserSetupStatus | null>(null);
+    const [browserBusy, setBrowserBusy] = useState<'status' | 'install' | 'launch' | 'pair' | null>(null);
+    const [browserProfile] = useState('default');
+    const [launchedCdpPort, setLaunchedCdpPort] = useState<number | null>(null);
+
     const machineSessions = useMemo(() => {
         if (!sessions || !machineId) return [];
 
@@ -123,6 +136,77 @@ export default function MachineDetailScreen() {
         // Use machine online status as proxy for daemon status
         return isMachineOnline(machine) ? 'likely alive' : 'stopped';
     }, [machine]);
+
+    const handleBrowserRefresh = async () => {
+        setBrowserBusy('status');
+        try {
+            setBrowserStatus(await machineBrowserSetupStatus(machineId!));
+        } catch (error) {
+            Modal.alert(t('common.error'), '브라우저 상태를 확인하지 못했습니다. 데몬이 실행 중인지 확인하세요.');
+        } finally {
+            setBrowserBusy(null);
+        }
+    };
+
+    const handleInstallChrome = async () => {
+        setBrowserBusy('install');
+        try {
+            const result = await machineBrowserInstallChrome(machineId!);
+            if (result.action === 'manual') {
+                // Nothing was installed — either no root, or this is not a
+                // Linux machine at all. Show the reason rather than a success
+                // the machine never had. `command` is empty in the latter
+                // case, so it must not be pasted into the message blindly.
+                Modal.alert(
+                    'Chrome 설치 — 직접 실행 필요',
+                    [result.reason, result.command].filter(Boolean).join('\n\n')
+                );
+            } else if (result.action === 'already-installed') {
+                Modal.alert('Chrome', '이미 설치되어 있습니다.');
+            } else if (result.ok) {
+                Modal.alert('Chrome 설치됨', result.chromePath ?? '설치가 완료되었습니다.');
+            } else {
+                Modal.alert(t('common.error'), `설치에 실패했습니다.\n\n${result.stderr ?? ''}`);
+            }
+            setBrowserStatus(await machineBrowserSetupStatus(machineId!));
+        } catch (error) {
+            Modal.alert(t('common.error'), 'Chrome 설치를 실행하지 못했습니다.');
+        } finally {
+            setBrowserBusy(null);
+        }
+    };
+
+    const handleLaunchBrowser = async () => {
+        setBrowserBusy('launch');
+        try {
+            const result = await machineBrowserLaunch(machineId!, browserProfile);
+            setLaunchedCdpPort(result.cdpPort);
+            Modal.alert(
+                result.ready ? '브라우저 실행됨' : '브라우저를 띄웠지만 응답이 없습니다',
+                result.ready
+                    ? `프로필 ${result.profile} · CDP 포트 ${result.cdpPort}\n이제 페어링을 실행하세요.`
+                    : `CDP 포트 ${result.cdpPort}가 아직 응답하지 않습니다. 잠시 후 페어링을 시도하세요.`
+            );
+        } catch (error) {
+            Modal.alert(t('common.error'), error instanceof Error ? error.message : '브라우저를 띄우지 못했습니다.');
+        } finally {
+            setBrowserBusy(null);
+        }
+    };
+
+    const handlePairBrowser = async () => {
+        if (launchedCdpPort === null) return;
+        setBrowserBusy('pair');
+        try {
+            const result = await machineBrowserPair(machineId!, launchedCdpPort);
+            Modal.alert(result.ok ? '페어링 완료' : '페어링 실패', result.message);
+            setBrowserStatus(await machineBrowserSetupStatus(machineId!));
+        } catch (error) {
+            Modal.alert(t('common.error'), error instanceof Error ? error.message : '페어링에 실패했습니다.');
+        } finally {
+            setBrowserBusy(null);
+        }
+    };
 
     const handleStopDaemon = async () => {
         // Show confirmation modal using alert with buttons
@@ -513,6 +597,83 @@ export default function MachineDetailScreen() {
                             title={t('machine.daemonStateVersion')}
                             subtitle={String(machine.daemonStateVersion)}
                         />
+                </ItemGroup>
+
+                {/* Browser bridge — replaces the SSH walkthrough in
+                    docs/browser-bridge-headless.md. See specs/browser-setup-gui/. */}
+                <ItemGroup title="브라우저 브리지">
+                    <Item
+                        title="Chrome"
+                        detail={
+                            browserStatus === null
+                                ? '확인 전'
+                                : browserStatus.chromeInstalled
+                                    ? (browserStatus.chromeVersion ?? '설치됨')
+                                    : '설치 안 됨'
+                        }
+                        detailStyle={{
+                            color: browserStatus?.chromeInstalled ? '#34C759' : '#FF9500'
+                        }}
+                        showChevron={false}
+                        onPress={handleBrowserRefresh}
+                        rightElement={browserBusy === 'status'
+                            ? <ActivityIndicator size="small" color={theme.colors.textSecondary} />
+                            : undefined}
+                    />
+                    {browserStatus && !browserStatus.chromeInstalled && (
+                        <Item
+                            title="Chrome 설치"
+                            subtitle={browserStatus.canSudo
+                                ? '이 머신에 설치합니다'
+                                : 'sudo 권한이 없어 명령을 안내만 합니다'}
+                            titleStyle={{ color: '#007AFF' }}
+                            onPress={handleInstallChrome}
+                            disabled={browserBusy !== null}
+                            rightElement={browserBusy === 'install'
+                                ? <ActivityIndicator size="small" color={theme.colors.textSecondary} />
+                                : undefined}
+                        />
+                    )}
+                    {browserStatus?.chromeInstalled && (
+                        <Item
+                            title="브라우저 띄우기"
+                            subtitle={`프로필: ${browserProfile || 'default'}`}
+                            titleStyle={{ color: '#007AFF' }}
+                            onPress={handleLaunchBrowser}
+                            disabled={browserBusy !== null}
+                            rightElement={browserBusy === 'launch'
+                                ? <ActivityIndicator size="small" color={theme.colors.textSecondary} />
+                                : undefined}
+                        />
+                    )}
+                    {launchedCdpPort !== null && (
+                        <Item
+                            title="페어링"
+                            subtitle={`CDP 포트 ${launchedCdpPort} · 정밀 제어 켜짐`}
+                            titleStyle={{ color: '#007AFF' }}
+                            onPress={handlePairBrowser}
+                            disabled={browserBusy !== null}
+                            rightElement={browserBusy === 'pair'
+                                ? <ActivityIndicator size="small" color={theme.colors.textSecondary} />
+                                : undefined}
+                        />
+                    )}
+                    {browserStatus?.connections.map((connection) => (
+                        <Item
+                            key={connection.profile}
+                            title={connection.profile}
+                            detail="연결됨"
+                            detailStyle={{ color: '#34C759' }}
+                            showChevron={false}
+                        />
+                    ))}
+                    {browserStatus?.connections.length === 0 && (
+                        <Item
+                            title="연결된 프로필 없음"
+                            titleStyle={{ color: theme.colors.textSecondary }}
+                            showChevron={false}
+                        />
+                    )}
                 </ItemGroup>
 
                 {/* CLI Availability */}

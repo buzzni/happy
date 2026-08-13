@@ -74,9 +74,23 @@ const INSTALL_COMMAND = [
  * So when sudo is unavailable this returns the exact command to paste rather
  * than pretending the install happened.
  */
-export function planChromeInstall({ chromePath, canSudo }: { chromePath: string | null; canSudo: boolean }): ChromeInstallPlan {
+export function planChromeInstall({ chromePath, canSudo, platform = process.platform }: {
+    chromePath: string | null
+    canSudo: boolean
+    platform?: NodeJS.Platform
+}): ChromeInstallPlan {
     if (chromePath) {
         return { action: 'already-installed' }
+    }
+    if (platform !== 'linux') {
+        // This flow exists for terminal-only Linux boxes. On a desktop OS
+        // Chrome is installed the normal way and simply is not on PATH, so
+        // an apt command here would be actively wrong.
+        return {
+            action: 'manual',
+            command: '',
+            reason: '이 기능은 터미널 전용 Linux 머신을 위한 것입니다. 데스크톱에서는 Chrome을 평소처럼 설치하고 `happy browser`가 안내하는 링크를 여세요.',
+        }
     }
     if (canSudo) {
         return { action: 'run', command: INSTALL_COMMAND }

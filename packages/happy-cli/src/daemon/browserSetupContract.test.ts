@@ -11,14 +11,14 @@ describe('install button contract', () => {
         // The app renders plan.action verbatim. If a no-sudo machine got
         // 'run' here the UI would claim Chrome was installed while nothing
         // was placed, and the user would chase a missing binary.
-        const plan = planChromeInstall({ chromePath: null, canSudo: false })
+        const plan = planChromeInstall({ chromePath: null, canSudo: false, platform: 'linux' })
 
         expect(plan.action).not.toBe('run')
         expect(plan.action).toBe('manual')
     })
 
     it('hands back a command the user can paste verbatim', () => {
-        const plan = planChromeInstall({ chromePath: null, canSudo: false })
+        const plan = planChromeInstall({ chromePath: null, canSudo: false, platform: 'linux' })
 
         expect(plan.command).toContain('wget')
         expect(plan.command).toContain('apt-get install')
