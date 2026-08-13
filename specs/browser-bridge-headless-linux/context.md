@@ -10,13 +10,24 @@
 | 2 | R2 포커스 없는 활성 탭 폴백 | `66d35ae9` |
 | 3 | R3 스크린샷 CDP 폴백 | `353847e1` |
 | 4 | R4 `happy browser pair` | `4019ca37` |
-| 5 | R5 문서 | (이 커밋) |
+| 5 | R5 문서 | `5605b058` |
+| 리뷰 | pair 오보고 2건 수정 | `a21a9842` |
+
+## 리뷰에서 잡은 결함
+
+1. `openTab` 반환값을 버려서, `/json/new` 거부를 "확장 미로드"로 오진했다.
+2. `--debugger` 반영 여부를 확인하지 않아, 이미 연결된 프로필이 있으면
+   설정이 안 걸렸는데도 "페어링 완료"를 찍었다. `capabilities`로 되읽어
+   대조하도록 고쳤다.
 
 ## 검증 결과
 
 - `happy-browser-extension`: 166 passed (기준선 159 → +7)
-- `happy-cli` unit `src/commands/`: 44 passed (신규 13)
+- `happy-cli` unit `src/commands/` + `src/daemon/`: 529 passed (신규 17)
 - `happy-cli` `tsc --noEmit`: exit 0
+- `happy-cli` unit 전체: 1694 passed / 1 failed
+  - 실패 1건 `fetchAplusMcpServersResult`는 `origin/main`을 별도 워크트리에
+    체크아웃해 확인한 결과 동일하게 실패하는 **기존 실패**다.
 
 ## 미검증 — 실제 Ubuntu 머신에서 확인 필요
 
