@@ -9,7 +9,7 @@
 import { collectSnapshot } from './snapshot.js'
 import { clickRef, fillRef, locateRef } from './actions.js'
 import { parseAllowlist, isUrlAllowed } from './allowlist.js'
-import { isDebuggerTierEnabled, captureFullPage, dispatchTrustedClick, insertTrustedText } from './cdp.js'
+import { isDebuggerTierEnabled, captureFullPage, captureViewport, dispatchTrustedClick, insertTrustedText } from './cdp.js'
 import { decodeRef, mergeFrameSnapshots } from './frameRefs.js'
 
 export class CommandError extends Error {
@@ -63,8 +63,13 @@ async function resolveTab(params, chrome, allowlist) {
             throw new CommandError('TAB_NOT_FOUND', e instanceof Error ? e.message : String(e))
         }
     } else {
-        const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
-        tab = active
+        const [focused] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+        // A Chrome under Xvfb (or `--headless=new`) has no window manager, so
+        // nothing is ever "last focused" and the query above comes back empty
+        // even though a perfectly good active tab exists. Falling back to the
+        // active tab of any window is not an arbitrary pick — it is the only
+        // information left once focus is meaningless.
+        tab = focused ?? (await chrome.tabs.query({ active: true }))[0]
     }
     if (!tab || tab.id === undefined) {
         throw new CommandError('NO_ACTIVE_TAB', 'No active tab to act on')
@@ -226,7 +231,18 @@ const handlers = {
             // image that isn't what was asked for, with nothing saying so.
             return captureFullPage(chrome, tab.id)
         }
-        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' })
+        let dataUrl
+        try {
+            dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' })
+        } catch (e) {
+            // A headless Chrome has no composited window surface, so this call
+            // is the one thing that cannot work there. CDP can still take the
+            // shot — but only if the user granted that tier, and if they did
+            // not, the honest answer is the original failure rather than a
+            // DEBUGGER_NOT_AVAILABLE that hides what actually broke.
+            if (!(await isDebuggerTierEnabled(chrome))) throw e
+            return captureViewport(chrome, tab.id)
+        }
         const [, dataB64] = dataUrl.split(',')
         return { mimeType: 'image/png', dataB64 }
     },

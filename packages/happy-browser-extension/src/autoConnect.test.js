@@ -24,4 +24,38 @@ describe('parseAutoConnectParams', () => {
     it('returns null for a blank token', () => {
         expect(parseAutoConnectParams('?token=%20%20')).toBeNull()
     })
+
+    it('reads an explicit debugger tier opt-in', () => {
+        expect(parseAutoConnectParams('?token=abc123&debugger=1')).toEqual({
+            token: 'abc123',
+            port: 41777,
+            debuggerTier: true,
+        })
+    })
+
+    it('reads an explicit debugger tier opt-out', () => {
+        expect(parseAutoConnectParams('?token=abc123&debugger=0')).toEqual({
+            token: 'abc123',
+            port: 41777,
+            debuggerTier: false,
+        })
+    })
+
+    it('omits debuggerTier entirely when the link does not mention it, so an existing setting is left alone', () => {
+        const parsed = parseAutoConnectParams('?token=abc123')
+        expect('debuggerTier' in parsed).toBe(false)
+    })
+
+    // Pointing this machine's Chrome at a remote happy session's bridge.
+    it('reads an explicit host for a remote daemon', () => {
+        expect(parseAutoConnectParams('?token=abc123&host=happy.example.com').host).toBe('happy.example.com')
+    })
+
+    // Same contract as debuggerTier, and for the same reason: a user paired
+    // against a remote daemon who re-pairs from a link that says nothing
+    // about the host must not be silently dropped back to loopback.
+    it('omits host entirely when the link does not mention it, so an existing setting is left alone', () => {
+        const parsed = parseAutoConnectParams('?token=abc123')
+        expect('host' in parsed).toBe(false)
+    })
 })

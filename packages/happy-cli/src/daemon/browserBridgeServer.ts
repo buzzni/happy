@@ -15,6 +15,17 @@ import { logger } from '@/ui/logger'
 
 export const DEFAULT_BROWSER_BRIDGE_PORT = 41777
 
+/**
+ * Bind address for the bridge, from `HAPPY_BROWSER_BRIDGE_HOST`.
+ *
+ * Loopback by default — a user's own PC pointing its Chrome at a remote
+ * happy session has to opt in explicitly, since anything else turns the
+ * pairing token into the sole defense on a public interface.
+ */
+export function resolveBrowserBridgeHost(env: NodeJS.ProcessEnv): string {
+    return env.HAPPY_BROWSER_BRIDGE_HOST?.trim() || '127.0.0.1'
+}
+
 export function startBrowserBridgeServer({ bridge, port, host = '127.0.0.1' }: {
     bridge: BrowserBridge
     port: number
@@ -41,7 +52,13 @@ export function startBrowserBridgeServer({ bridge, port, host = '127.0.0.1' }: {
         })
 
         wss.on('connection', (socket, request) => {
-            const url = new URL(request.url ?? '/', `http://${host}`)
+            // The base only anchors relative-URL parsing; its host part is
+            // never read. It must NOT be built from the bind host: a bare
+            // IPv6 host ('::1', '::') is invalid in a URL authority, and the
+            // resulting throw inside this handler killed the process on every
+            // incoming connection once HAPPY_BROWSER_BRIDGE_HOST allowed IPv6
+            // binds.
+            const url = new URL(request.url ?? '/', 'http://bridge.invalid')
             bridge.handleConnection(socket, {
                 token: url.searchParams.get('token') ?? undefined,
                 profile: url.searchParams.get('profile') ?? undefined,
