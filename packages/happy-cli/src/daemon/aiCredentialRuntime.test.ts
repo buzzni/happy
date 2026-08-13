@@ -209,7 +209,7 @@ describe('AI credential machine runtime', () => {
     })).resolves.toEqual({ provider: 'codex', configured: true, status: 'authenticated' })
 
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"new-secret"}')
-    expect(files.get('/home/operator/.codex/auth.json.happy-backup')).toBe('{"OPENAI_API_KEY":"old"}')
+    expect(files.has('/home/operator/.codex/auth.json.happy-backup')).toBe(false)
     expect(chmod).toHaveBeenCalledWith('/home/operator/.codex/auth.json', 0o600)
     expect(calls.at(-1)).toEqual({ command: 'codex', args: ['login', 'status'] })
     expect(JSON.stringify(calls)).not.toContain('new-secret')
@@ -226,6 +226,53 @@ describe('AI credential machine runtime', () => {
       provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
     })).rejects.toMatchObject({ kind: 'CODEX_BACKUP_FAILED' })
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"old"}')
+  })
+
+  it('restores the existing Codex auth when successful-apply backup cleanup fails', async () => {
+    let files!: Map<string, string>
+    const configured = setup({
+      rm: vi.fn(async (path: string) => {
+        if (path.endsWith('auth.json.happy-backup')) throw new Error('permission denied')
+        files.delete(path)
+      }),
+    })
+    files = configured.files
+    files.set('/home/operator/.codex/auth.json', '{"OPENAI_API_KEY":"old"}')
+
+    await expect(configured.runtime.apply({
+      provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
+    })).rejects.toMatchObject({ kind: 'CODEX_BACKUP_CLEANUP_FAILED' })
+    expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"old"}')
+    expect(files.has('/home/operator/.codex/auth.json.happy-backup')).toBe(false)
+  })
+
+  it('removes a stale Codex backup after applying without a current auth file', async () => {
+    const { runtime, files } = setup()
+    files.set('/home/operator/.codex/auth.json.happy-backup', '{"OPENAI_API_KEY":"stale"}')
+
+    await expect(runtime.apply({
+      provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
+    })).resolves.toEqual({ provider: 'codex', configured: true, status: 'authenticated' })
+    expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"new-secret"}')
+    expect(files.has('/home/operator/.codex/auth.json.happy-backup')).toBe(false)
+  })
+
+  it('restores a stale Codex backup when its cleanup fails', async () => {
+    let files!: Map<string, string>
+    const configured = setup({
+      rm: vi.fn(async (path: string) => {
+        if (path.endsWith('auth.json.happy-backup')) throw new Error('permission denied')
+        files.delete(path)
+      }),
+    })
+    files = configured.files
+    files.set('/home/operator/.codex/auth.json.happy-backup', '{"OPENAI_API_KEY":"stale"}')
+
+    await expect(configured.runtime.apply({
+      provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
+    })).rejects.toMatchObject({ kind: 'CODEX_BACKUP_CLEANUP_FAILED' })
+    expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"stale"}')
+    expect(files.has('/home/operator/.codex/auth.json.happy-backup')).toBe(false)
   })
 
   it('restores the existing Codex auth when backup permission tightening fails', async () => {

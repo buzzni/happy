@@ -177,6 +177,11 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       await deps.rename(tempPath, authPath)
       await deps.chmod(authPath, 0o600)
       await deps.execFile('codex', ['login', 'status'])
+      try {
+        await deps.rm(backupPath, { force: true })
+      } catch {
+        throw new AiCredentialRuntimeError('CODEX_BACKUP_CLEANUP_FAILED')
+      }
     } catch (error) {
       let tempCleanupFailed = false
       try {
@@ -198,6 +203,15 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         }
       } else if (authRemovalFailed) {
         throw new AiCredentialRuntimeError('CODEX_APPLY_ROLLBACK_FAILED')
+      } else {
+        try {
+          await deps.rename(backupPath, authPath)
+          await deps.chmod(authPath, 0o600)
+        } catch (restoreError) {
+          if ((restoreError as NodeJS.ErrnoException).code !== 'ENOENT') {
+            throw new AiCredentialRuntimeError('CODEX_BACKUP_RESTORE_FAILED')
+          }
+        }
       }
       if (tempCleanupFailed) {
         throw new AiCredentialRuntimeError('CODEX_APPLY_ROLLBACK_FAILED')
