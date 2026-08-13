@@ -1093,10 +1093,16 @@ export async function runCodex(opts: {
                 });
                 if (runtimeRecovery.status !== 'ready') {
                     const connectorNames = new Set(readExpectedConnectors());
-                    for (const name of runtimeRecovery.affectedServers) {
-                        const status = runtimeRecovery.status === 'recovered'
+                    const serverStatuses = runtimeRecovery.serverStatuses
+                        ?? runtimeRecovery.affectedServers.map((name) => ({
+                            name,
+                            status: runtimeRecovery.status,
+                        }));
+                    for (const serverRecovery of serverStatuses) {
+                        const { name } = serverRecovery;
+                        const status = serverRecovery.status === 'recovered'
                             ? 'connected' as const
-                            : runtimeRecovery.status === 'needs-auth'
+                            : serverRecovery.status === 'needs-auth'
                                 ? (connectorNames.has(name) ? 'connector-needs-auth' as const : 'needs-auth' as const)
                                 : (connectorNames.has(name) ? 'connector-runtime-failed' as const : 'failed' as const);
                         session.updateMetadata((currentMetadata) => ({
@@ -1106,9 +1112,9 @@ export async function runCodex(opts: {
                                 {
                                     name,
                                     status,
-                                    ...(runtimeRecovery.status === 'needs-auth'
+                                    ...(serverRecovery.status === 'needs-auth'
                                         ? { error: 'MCP authentication is required' }
-                                        : runtimeRecovery.status === 'failed'
+                                        : serverRecovery.status === 'failed'
                                             ? { error: 'MCP runtime initialization failed' }
                                             : {}),
                                     checkedAt: Date.now(),

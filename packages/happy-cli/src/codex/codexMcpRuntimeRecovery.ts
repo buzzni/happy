@@ -28,6 +28,10 @@ type CodexMcpRuntimeClient = {
 export type CodexMcpRecoveryResult = {
     status: 'ready' | 'recovered' | 'needs-auth' | 'failed';
     affectedServers: string[];
+    serverStatuses?: Array<{
+        name: string;
+        status: 'recovered' | 'needs-auth' | 'failed';
+    }>;
 };
 
 type RecoveryOptions = {
@@ -48,6 +52,8 @@ type RecoveryInput = {
 type RuntimeInspection = {
     status: 'ready' | 'needs-auth' | 'failed';
     affectedServers: string[];
+    needsAuthServers: string[];
+    failedServers: string[];
 };
 
 const DEFAULT_MAX_ATTEMPTS = 2;
@@ -62,6 +68,7 @@ export class CodexMcpRuntimeRecovery {
     private readonly sleep: (ms: number) => Promise<void>;
     private readonly inFlight = new Map<string, Promise<CodexMcpRecoveryResult>>();
     private readonly cooldownUntil = new Map<string, number>();
+    private readonly unhealthyServers = new Map<string, string[]>();
 
     constructor(
         private readonly client: CodexMcpRuntimeClient,
@@ -89,13 +96,22 @@ export class CodexMcpRuntimeRecovery {
         const initial = await this.inspect(input);
         if (initial.status === 'ready') {
             this.cooldownUntil.delete(input.threadId);
+            const expected = new Set(input.expectedServerNames);
+            const recovered = (this.unhealthyServers.get(input.threadId) ?? [])
+                .filter((name) => expected.has(name));
+            this.unhealthyServers.delete(input.threadId);
+            if (recovered.length > 0) {
+                return { status: 'recovered', affectedServers: recovered };
+            }
             return { status: 'ready', affectedServers: [] };
         }
-        if (initial.status === 'needs-auth') {
-            return initial;
+        if (initial.failedServers.length === 0) {
+            this.unhealthyServers.set(input.threadId, initial.affectedServers);
+            return this.toResult(initial);
         }
         if ((this.cooldownUntil.get(input.threadId) ?? 0) > this.now()) {
-            return initial;
+            this.unhealthyServers.set(input.threadId, initial.affectedServers);
+            return this.toResult(initial);
         }
 
         const initiallyAffected = initial.affectedServers;
@@ -119,20 +135,63 @@ export class CodexMcpRuntimeRecovery {
             latest = await this.inspect(input);
             if (latest.status === 'ready') {
                 this.cooldownUntil.delete(input.threadId);
+                this.unhealthyServers.delete(input.threadId);
                 return { status: 'recovered', affectedServers: initiallyAffected };
             }
-            if (latest.status === 'needs-auth') {
-                return latest;
+            if (latest.failedServers.length === 0) {
+                const stillUnhealthy = new Set(latest.affectedServers);
+                const recovered = initiallyAffected.filter((name) => !stillUnhealthy.has(name));
+                this.cooldownUntil.delete(input.threadId);
+                this.unhealthyServers.set(input.threadId, latest.affectedServers);
+                return this.toResult(latest, recovered);
             }
         }
 
         this.cooldownUntil.set(input.threadId, this.now() + this.cooldownMs);
-        return latest;
+        this.unhealthyServers.set(input.threadId, latest.affectedServers);
+        const stillUnhealthy = new Set(latest.affectedServers);
+        const recovered = initiallyAffected.filter((name) => !stillUnhealthy.has(name));
+        return this.toResult(latest, recovered);
+    }
+
+    private toResult(
+        inspection: RuntimeInspection,
+        recoveredServers: string[] = [],
+    ): CodexMcpRecoveryResult {
+        const serverStatuses = [
+            ...recoveredServers.map((name) => ({ name, status: 'recovered' as const })),
+            ...inspection.failedServers.map((name) => ({ name, status: 'failed' as const })),
+            ...inspection.needsAuthServers.map((name) => ({ name, status: 'needs-auth' as const })),
+        ].sort((a, b) => a.name.localeCompare(b.name));
+        if (serverStatuses.length === 0) {
+            return { status: 'ready', affectedServers: [] };
+        }
+
+        const status = inspection.failedServers.length > 0
+            ? 'failed' as const
+            : inspection.needsAuthServers.length > 0
+                ? 'needs-auth' as const
+                : 'recovered' as const;
+        const result: CodexMcpRecoveryResult = {
+            status,
+            affectedServers: serverStatuses.map((entry) => entry.name),
+        };
+        if (new Set(serverStatuses.map((entry) => entry.status)).size > 1) {
+            result.serverStatuses = serverStatuses;
+        }
+        return result;
     }
 
     private async inspect(input: RecoveryInput): Promise<RuntimeInspection> {
         const expected = [...new Set(input.expectedServerNames)].sort();
-        if (expected.length === 0) return { status: 'ready', affectedServers: [] };
+        if (expected.length === 0) {
+            return {
+                status: 'ready',
+                affectedServers: [],
+                needsAuthServers: [],
+                failedServers: [],
+            };
+        }
 
         const startupByName = new Map(
             this.client.getMcpStartupStatuses()
@@ -153,19 +212,22 @@ export class CodexMcpRuntimeRecovery {
             return startup?.failureReason === 'reauthenticationRequired'
                 || inventory?.authStatus === 'notLoggedIn';
         });
-        if (needsAuth.length > 0) {
-            return { status: 'needs-auth', affectedServers: needsAuth };
-        }
+        const needsAuthNames = new Set(needsAuth);
 
         const failed = expected.filter((name) => {
+            if (needsAuthNames.has(name)) return false;
             const startup = startupByName.get(name);
             if (startup?.status === 'failed' || startup?.status === 'cancelled') return true;
             if (startup?.status === 'starting') return false;
             if (inventoryByName && !inventoryByName.has(name)) return true;
             return false;
         });
-        return failed.length > 0
-            ? { status: 'failed', affectedServers: failed }
-            : { status: 'ready', affectedServers: [] };
+        const affectedServers = [...failed, ...needsAuth].sort();
+        return {
+            status: failed.length > 0 ? 'failed' : needsAuth.length > 0 ? 'needs-auth' : 'ready',
+            affectedServers,
+            needsAuthServers: needsAuth,
+            failedServers: failed,
+        };
     }
 }
