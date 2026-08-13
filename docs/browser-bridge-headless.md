@@ -56,8 +56,10 @@ google-chrome \
   `--headless=new`를 쓰거나 방법 B를 택하세요.
 - `--user-data-dir`은 고정하세요. 로그인 세션·쿠키가 여기 저장되고,
   경로가 바뀌면 로그인이 통째로 사라집니다.
-- headless에서는 `chrome.tabs.captureVisibleTab`이 실패할 수 있습니다.
-  4단계에서 `--debugger`를 켜면 CDP 경로로 자동 폴백합니다.
+- 환경에 따라 `chrome.tabs.captureVisibleTab`이 실패할 수 있습니다(실측:
+  Chrome 151 + Xvfb·`--headless=new` 모두 성공, 다만 버전/커널/샌드박스
+  설정에 따라 달라질 수 있음). 실패하면 4단계에서 켠 `--debugger`가 CDP
+  경로로 자동 폴백합니다.
 - CDP로 넣은 확장은 **그 CDP 세션이 끊겨도 살아 있습니다**(실측 확인).
   `happy browser pair`가 일회성 명령이어도 되는 이유입니다.
 
