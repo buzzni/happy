@@ -17,6 +17,7 @@ import { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { McpConfigSynchronizer, type McpConfigSource } from './mcpConfigSynchronizer';
 import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
 import { buildWorkerAgents, readWorkerConfigFromEnv } from "@/orchestrator/workerAgents";
+import { buildSkillGovernanceOptions, readSkillGovernanceConfigFromEnv } from "@/orchestrator/skillGovernance";
 import { readExpectedConnectors, readExpectedMcpServices } from '@/aplus/fetchAplusMcpServers';
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
 
@@ -145,6 +146,14 @@ export async function claudeRemote(opts: {
     // work to it. No-op when unset, so single-model sessions are unchanged.
     const workerAgents = buildWorkerAgents(readWorkerConfigFromEnv(process.env));
     const workerDelegationSuffix = workerAgents.delegationPrompt ? '\n\n' + workerAgents.delegationPrompt : '';
+
+    // Per-machine/session skill governance: when HAPPY_SETTING_SOURCES and/or
+    // HAPPY_SKILL_ALLOWLIST are set (e.g. on a Saycode-managed machine), scope
+    // down which filesystem settings and skills this session loads so that
+    // user-installed workflow skills (which redefine planning/TDD/review the
+    // same way Saycode's own orchestration does) don't leak into managed
+    // sessions. No-op when unset, so existing sessions are unchanged.
+    const skillGovernance = buildSkillGovernanceOptions(readSkillGovernanceConfigFromEnv(process.env));
     const mergedMcpServers = {
         ...opts.mcpServers,
         ...(opts.orchestratorMode ? opts.orchestratorMcpServers : {}),
@@ -170,6 +179,8 @@ export async function claudeRemote(opts: {
         disallowedTools: initial.mode.disallowedTools,
         effort: initial.mode.effort,
         agents: workerAgents.agents,
+        settingSources: skillGovernance.settingSources,
+        skills: skillGovernance.skills,
         canCallTool: (toolName: string, input: unknown, options: { signal: AbortSignal; toolUseID: string }) => opts.canCallTool(toolName, input, mode, options),
         abort: opts.signal,
         settingsPath: opts.hookSettingsPath,

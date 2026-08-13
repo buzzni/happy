@@ -46,6 +46,8 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         sessionId: undefined,
         effort: opts?.effort,
         agents: opts?.agents,
+        settingSources: opts?.settingSources,
+        skills: opts?.skills,
     }
 
     // Map abort signal -> AbortController
