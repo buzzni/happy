@@ -19,6 +19,19 @@ const BADGE_OFF = { text: '', color: '#4a9d5f' }
 /** The daemon rejected our stored token (4401) — retrying won't help until
  *  the user re-pairs; a bare BADGE_OFF looks identical to a normal drop. */
 const BADGE_AUTH_ERROR = { text: '!', color: '#c0392b' }
+/** The saved host/port cannot form a URL at all. Same "go fix the options
+ *  page" meaning as BADGE_AUTH_ERROR, so it shares its look. */
+const BADGE_CONFIG_ERROR = { text: '!', color: '#c0392b' }
+
+/**
+ * An IPv6 literal has to be bracketed in a URL authority, or the colons read
+ * as the port separator and the whole URL is invalid. Hosts the user already
+ * bracketed, and ordinary names/IPv4, pass through untouched.
+ */
+function formatHost(host) {
+    if (host.includes(':') && !host.startsWith('[')) return `[${host}]`
+    return host
+}
 
 export function createConnection({
     chrome,
@@ -77,8 +90,21 @@ export function createConnection({
             return
         }
 
-        const url = `ws://${host}:${port}/?token=${encodeURIComponent(token)}&profile=${encodeURIComponent(profile)}`
-        const ws = new WebSocketImpl(url)
+        const url = `ws://${formatHost(host)}:${port}/?token=${encodeURIComponent(token)}&profile=${encodeURIComponent(profile)}`
+        let ws
+        try {
+            ws = new WebSocketImpl(url)
+        } catch {
+            // `host` is free-form user input (the remote-daemon setting), so a
+            // typo like "http://1.2.3.4" reaches here as a constructor throw.
+            // Letting it escape connect() left an unhandled rejection with no
+            // badge and no reconnect — a service worker that looks alive but
+            // never will be. No reconnect is scheduled on purpose: retrying
+            // the same bad URL cannot succeed, and the only thing that can fix
+            // it (saving new settings) already calls restart().
+            setBadge(BADGE_CONFIG_ERROR)
+            return
+        }
         socket = ws
         // Per-socket so a late close from a replaced socket cannot stop the
         // live one's keepalive — that let the service worker go idle and die.

@@ -62,7 +62,11 @@ export function buildPairUrl({ extensionId, token, bridgePort, debuggerTier }: {
     bridgePort: number
     debuggerTier?: boolean
 }): string {
-    const params = new URLSearchParams({ token, port: String(bridgePort) })
+    // host is pinned, not left to whatever the profile already had: pair
+    // drives a Chrome on this machine against this machine's daemon, so a
+    // remote host left over from an earlier pairing would send the extension
+    // somewhere else and make this run fail with no visible cause.
+    const params = new URLSearchParams({ token, port: String(bridgePort), host: '127.0.0.1' })
     if (debuggerTier !== undefined) params.set('debugger', debuggerTier ? '1' : '0')
     return `chrome-extension://${extensionId}/src/options.html?${params.toString()}`
 }

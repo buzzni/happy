@@ -6,7 +6,6 @@ describe('parseAutoConnectParams', () => {
         expect(parseAutoConnectParams('?token=abc123&port=41777')).toEqual({
             token: 'abc123',
             port: 41777,
-            host: '127.0.0.1',
         })
     })
 
@@ -14,7 +13,6 @@ describe('parseAutoConnectParams', () => {
         expect(parseAutoConnectParams('?token=abc123')).toEqual({
             token: 'abc123',
             port: 41777,
-            host: '127.0.0.1',
         })
     })
 
@@ -31,7 +29,6 @@ describe('parseAutoConnectParams', () => {
         expect(parseAutoConnectParams('?token=abc123&debugger=1')).toEqual({
             token: 'abc123',
             port: 41777,
-            host: '127.0.0.1',
             debuggerTier: true,
         })
     })
@@ -40,7 +37,6 @@ describe('parseAutoConnectParams', () => {
         expect(parseAutoConnectParams('?token=abc123&debugger=0')).toEqual({
             token: 'abc123',
             port: 41777,
-            host: '127.0.0.1',
             debuggerTier: false,
         })
     })
@@ -55,7 +51,11 @@ describe('parseAutoConnectParams', () => {
         expect(parseAutoConnectParams('?token=abc123&host=happy.example.com').host).toBe('happy.example.com')
     })
 
-    it('defaults host to loopback when the link omits it', () => {
-        expect(parseAutoConnectParams('?token=abc123').host).toBe('127.0.0.1')
+    // Same contract as debuggerTier, and for the same reason: a user paired
+    // against a remote daemon who re-pairs from a link that says nothing
+    // about the host must not be silently dropped back to loopback.
+    it('omits host entirely when the link does not mention it, so an existing setting is left alone', () => {
+        const parsed = parseAutoConnectParams('?token=abc123')
+        expect('host' in parsed).toBe(false)
     })
 })

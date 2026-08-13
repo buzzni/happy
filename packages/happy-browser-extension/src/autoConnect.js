@@ -13,8 +13,13 @@ export function parseAutoConnectParams(search) {
     const result = {
         token,
         port: Number.isFinite(port) && port > 0 ? port : 41777,
-        host: (params.get('host') ?? '').trim() || '127.0.0.1',
     }
+
+    // Absent must stay absent, exactly as for debuggerTier below: a profile
+    // paired against a remote daemon would otherwise be silently dropped back
+    // to loopback by any link that happens not to mention a host.
+    const host = (params.get('host') ?? '').trim()
+    if (host) result.host = host
 
     // Absent must stay absent rather than becoming `false`: a machine that
     // re-pairs (new token, same profile) would otherwise silently switch the

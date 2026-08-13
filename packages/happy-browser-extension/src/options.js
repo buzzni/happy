@@ -58,7 +58,9 @@ const autoConnect = parseAutoConnectParams(location.search)
 if (autoConnect) {
     tokenInput.value = autoConnect.token
     portInput.value = autoConnect.port
-    hostInput.value = autoConnect.host
+    // Only when the link was explicit — otherwise the field keeps the stored
+    // value loaded above, and save() below preserves it.
+    if (autoConnect.host !== undefined) hostInput.value = autoConnect.host
     // Scrub the token from the visible URL / this navigation's history entry
     // right away — nothing downstream needs it to stay there.
     history.replaceState(null, '', location.pathname)

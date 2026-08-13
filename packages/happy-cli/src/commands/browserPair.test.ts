@@ -31,12 +31,20 @@ describe('buildPairUrl', () => {
 
     it('points at the extension options page with the token and port', () => {
         expect(buildPairUrl(base)).toBe(
-            'chrome-extension://abcdef/src/options.html?token=tok%2Ben%2F1&port=41777',
+            'chrome-extension://abcdef/src/options.html?token=tok%2Ben%2F1&port=41777&host=127.0.0.1',
         )
     })
 
     it('omits the debugger parameter when it was not asked for, so an existing setting survives', () => {
         expect(buildPairUrl(base)).not.toContain('debugger')
+    })
+
+    // Unlike the debugger tier, host is pinned rather than left alone: pair
+    // drives a Chrome on this machine against this machine's daemon, so a
+    // remote host left over from an earlier pairing would make the extension
+    // dial somewhere else and this run fail for no visible reason.
+    it('pins the host to loopback, since pair is a same-machine operation', () => {
+        expect(buildPairUrl(base)).toContain('host=127.0.0.1')
     })
 
     it('carries an explicit debugger decision', () => {
