@@ -13,9 +13,10 @@ export type {
     PermissionResult,
     CanUseTool,
     AgentDefinition,
+    SettingSource,
 } from '@anthropic-ai/claude-agent-sdk'
 
-import type { AgentDefinition } from '@anthropic-ai/claude-agent-sdk'
+import type { AgentDefinition, SettingSource } from '@anthropic-ai/claude-agent-sdk'
 
 // Re-export AbortError class
 export { AbortError } from '@anthropic-ai/claude-agent-sdk'
@@ -64,6 +65,18 @@ export interface QueryOptions {
      * work to. See orchestrator/workerAgents.ts.
      */
     agents?: Record<string, AgentDefinition>
+    /**
+     * Which filesystem settings sources to load ('user' | 'project' | 'local').
+     * Omit to keep the SDK default (all sources). See orchestrator/skillGovernance.ts
+     * for the env-driven per-session/machine control that populates this.
+     */
+    settingSources?: SettingSource[]
+    /**
+     * Explicit skill allowlist for the main session ('all' or a name list).
+     * Omit to keep the SDK default (CLI's own defaults, i.e. not restricted).
+     * See orchestrator/skillGovernance.ts.
+     */
+    skills?: string[] | 'all'
 }
 
 /**
