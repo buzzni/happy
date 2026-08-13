@@ -54,6 +54,7 @@ describe('formatPairOutcome', () => {
         extensionLoaded: true,
         pageOpened: true,
         connections: [{ profile: 'headless-1' }],
+        freshProfiles: ['headless-1'],
     }
 
     it('succeeds and names the connected profile', () => {
@@ -121,6 +122,40 @@ describe('formatPairOutcome', () => {
         const outcome = formatPairOutcome(base)
         expect(outcome.ok).toBe(true)
         expect(outcome.text).not.toContain('정밀 제어')
+    })
+
+    // A profile that was already connected before pair started proves nothing
+    // about the Chrome we just drove. When the CDP Chrome demonstrably has no
+    // extension, a bystander connection must not turn into "pairing done".
+    it('reports the unloaded extension instead of success when only a bystander is connected', () => {
+        const outcome = formatPairOutcome({
+            ...base,
+            extensionLoaded: false,
+            connections: [{ profile: 'desktop' }],
+            freshProfiles: [],
+        })
+        expect(outcome.ok).toBe(false)
+        expect(outcome.text).toContain('--load-extension')
+    })
+
+    // A re-pair of an already-working profile produces no new connection —
+    // that is a fine outcome, but it must be described as what it is, not as
+    // a fresh pairing that this run performed.
+    it('describes an unchanged existing connection as such, not as a fresh pairing', () => {
+        const outcome = formatPairOutcome({ ...base, freshProfiles: [] })
+        expect(outcome.ok).toBe(true)
+        expect(outcome.text).not.toContain('페어링 완료')
+        expect(outcome.text).toContain('headless-1')
+    })
+
+    it('leads the success message with the profile this run actually connected', () => {
+        const outcome = formatPairOutcome({
+            ...base,
+            connections: [{ profile: 'desktop' }, { profile: 'headless-1' }],
+            freshProfiles: ['headless-1'],
+        })
+        expect(outcome.ok).toBe(true)
+        expect(outcome.text).toContain('headless-1')
     })
 })
 

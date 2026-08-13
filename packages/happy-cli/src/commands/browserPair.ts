@@ -78,13 +78,15 @@ export interface PairOutcomeInput {
     /** Chrome accepted /json/new for the pairing URL. */
     pageOpened: boolean
     connections: Array<{ profile: string }>
+    /** Profiles among `connections` that were NOT connected before the page opened. */
+    freshProfiles: string[]
     /** What --debugger/--no-debugger asked for; absent when neither was given. */
     debuggerTierRequested?: boolean
     /** What the extension reports now. Absent when it could not be read. */
     debuggerTierActual?: boolean
 }
 
-export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpReachable, extensionLoaded, pageOpened, connections, debuggerTierRequested, debuggerTierActual }: PairOutcomeInput): { ok: boolean; text: string } {
+export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpReachable, extensionLoaded, pageOpened, connections, freshProfiles, debuggerTierRequested, debuggerTierActual }: PairOutcomeInput): { ok: boolean; text: string } {
     // Ordered by what has to be true first: a later check failing while an
     // earlier prerequisite is missing would point at the wrong thing.
     if (!daemonRunning) {
@@ -120,10 +122,13 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
         }
     }
 
-    if (connections.length > 0) {
-        // The connection poll returns immediately when a profile was already
-        // paired, which is before the options page could have loaded — so a
-        // requested tier change has to be confirmed, not assumed.
+    // A connection alone is not success: a profile that was already paired
+    // before this run proves nothing about the Chrome we just drove. It only
+    // counts when something new connected, or when the CDP Chrome at least
+    // has the extension (then an unchanged connection reads as a re-pair).
+    if (connections.length > 0 && (freshProfiles.length > 0 || extensionLoaded)) {
+        // The connection poll can complete before the options page has loaded
+        // — so a requested tier change has to be confirmed, not assumed.
         if (debuggerTierRequested !== undefined && debuggerTierActual !== debuggerTierRequested) {
             return {
                 ok: false,
@@ -136,14 +141,31 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
                 ].join('\n'),
             }
         }
+        const tierLine = debuggerTierRequested === undefined
+            ? []
+            : [chalk.dim(`  정밀 제어: ${debuggerTierRequested ? '켬' : '끔'}`)]
+        if (freshProfiles.length > 0) {
+            const bystanders = connections.filter((connection) => !freshProfiles.includes(connection.profile))
+            return {
+                ok: true,
+                text: [
+                    chalk.green(`페어링 완료 — 새로 연결된 프로필: ${freshProfiles.join(', ')}`),
+                    ...(bystanders.length > 0
+                        ? [chalk.dim(`  기존 연결 유지: ${bystanders.map((connection) => connection.profile).join(', ')}`)]
+                        : []),
+                    ...tierLine,
+                ].join('\n'),
+            }
+        }
+        // Nothing new arrived, but the CDP Chrome does have the extension:
+        // the honest description is "already connected", not a pairing this
+        // run performed.
         return {
             ok: true,
             text: [
-                chalk.green(`페어링 완료 — 프로필 ${connections.length}개 연결됨`),
+                chalk.green(`이미 연결되어 있습니다 — 이번 실행으로 새로 연결된 프로필은 없습니다.`),
                 ...connections.map((connection) => `  • ${connection.profile}`),
-                ...(debuggerTierRequested === undefined
-                    ? []
-                    : [chalk.dim(`  정밀 제어: ${debuggerTierRequested ? '켬' : '끔'}`)]),
+                ...tierLine,
             ].join('\n'),
         }
     }
@@ -207,13 +229,20 @@ function hasExtensionTarget(targets: Array<{ url?: string }> | null, extensionId
 /**
  * The extension reconnects on a storage change, so the socket lands shortly
  * after the page saves — poll rather than answering before it could have.
+ *
+ * Waits for a profile that was not connected before the page opened, not
+ * merely for a nonempty list: a bystander profile paired long ago satisfies
+ * the latter instantly, before the target Chrome could possibly have saved
+ * the token. A re-pair produces no new profile and so runs out the clock —
+ * accepted, since answering early would make the bystander case a false
+ * success and this is a one-shot diagnostic command.
  */
-async function waitForConnection(controlPort: number, timeoutMs: number): Promise<Array<{ profile: string }>> {
+async function waitForConnection(controlPort: number, timeoutMs: number, profilesBefore: string[]): Promise<Array<{ profile: string }>> {
     const deadline = Date.now() + timeoutMs
     let connections: Array<{ profile: string }> = []
     while (Date.now() < deadline) {
         connections = (await fetchBrowserStatus(controlPort))?.connections ?? []
-        if (connections.length > 0) return connections
+        if (connections.some((connection) => !profilesBefore.includes(connection.profile))) return connections
         await new Promise((resolve) => setTimeout(resolve, 500))
     }
     return connections
@@ -284,9 +313,11 @@ export async function handlePairCommand(args: string[]): Promise<void> {
     let pageOpened = false
     let connections: Array<{ profile: string }> = []
     let debuggerTierActual: boolean | undefined
+    let freshProfiles: string[] = []
     if (controlPort && cdpReachable) {
-        // Snapshotted before the page opens so the probe can tell a
-        // newly-arrived profile apart from ones that were already there.
+        // Snapshotted before the page opens so a newly-arrived profile can be
+        // told apart from ones that were already there — both the success
+        // verdict and the tier probe depend on that distinction.
         const profilesBefore = ((await fetchBrowserStatus(controlPort))?.connections ?? []).map((connection) => connection.profile)
         pageOpened = await openTab(options.cdpPort, buildPairUrl({
             extensionId,
@@ -295,7 +326,10 @@ export async function handlePairCommand(args: string[]): Promise<void> {
             debuggerTier: options.debuggerTier,
         }))
         if (pageOpened) {
-            connections = await waitForConnection(controlPort, 10_000)
+            connections = await waitForConnection(controlPort, 10_000, profilesBefore)
+            freshProfiles = connections
+                .map((connection) => connection.profile)
+                .filter((profile) => !profilesBefore.includes(profile))
             if (connections.length > 0 && options.debuggerTier !== undefined) {
                 const target = pickTierProbeProfile(profilesBefore, connections)
                 if (target !== undefined) {
@@ -313,6 +347,7 @@ export async function handlePairCommand(args: string[]): Promise<void> {
         extensionLoaded,
         pageOpened,
         connections,
+        freshProfiles,
         debuggerTierRequested: options.debuggerTier,
         debuggerTierActual,
     })
