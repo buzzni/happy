@@ -63,6 +63,7 @@ import type { ServerAutomationCache } from '@/daemon/automations/serverAutomatio
 import { syncServerAutomationDeltas } from '@/daemon/automations/serverAutomationSync';
 import type { ServerAutomationTransport } from '@/daemon/automations/serverAutomationExecutor';
 import type { PendingAutomationReport } from '@/daemon/automations/serverAutomationRuntimeStore';
+import type { AiCredentialRuntime } from '@/daemon/aiCredentialRuntime';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -212,6 +213,7 @@ type MachineRpcHandlers = {
     portRegistry: PortRegistry;
     /** When present, registers the scheduled-automation RPCs and advertises automationSupport. */
     automationStore?: AutomationStore;
+    aiCredentialRuntime: AiCredentialRuntime;
 }
 
 function requireNonEmptyString(value: unknown, name: string): string {
@@ -319,7 +321,8 @@ export class ApiMachineClient {
         stopSession,
         requestShutdown,
         portRegistry,
-        automationStore
+        automationStore,
+        aiCredentialRuntime,
     }: MachineRpcHandlers) {
         this.resumeSessionHandler = resumeSession ?? null;
 
@@ -337,6 +340,19 @@ export class ApiMachineClient {
             this.rpcHandlerManager.registerHandler('automation-list', automationHandlers.list);
             this.automationRpcAvailable = true;
         }
+
+        this.rpcHandlerManager.registerHandler('ai-credential:export', (params) => (
+            aiCredentialRuntime.capture(params)
+        ));
+        this.rpcHandlerManager.registerHandler('ai-credential:apply', (params) => (
+            aiCredentialRuntime.apply(params)
+        ));
+        this.rpcHandlerManager.registerHandler('ai-credential:status', (params) => (
+            aiCredentialRuntime.status(params)
+        ));
+        this.rpcHandlerManager.registerHandler('ai-credential:rotation', (params) => (
+            aiCredentialRuntime.rotation(params)
+        ));
 
         // Register spawn session handler
         this.rpcHandlerManager.registerHandler('spawn-happy-session', async (params: any) => {

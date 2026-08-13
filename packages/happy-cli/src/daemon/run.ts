@@ -109,6 +109,8 @@ import {
   McpCallerGrantEnvelopeConsumer,
   prepareMcpChildEnvironment,
 } from './mcpCallerGrantEnvelope';
+import { createClaudeSwapSupervisor } from './claudeSwapSupervisor';
+import { createNodeAiCredentialRuntime } from './aiCredentialRuntime';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -251,6 +253,7 @@ export async function startDaemon(): Promise<void> {
   // 2. Should not have another daemon process running
 
   let stopLogHousekeeping: () => void = () => undefined;
+  let stopClaudeSwapSupervisor: () => void = () => undefined;
   try {
     // Start caffeinate
     const caffeinateStarted = startCaffeinate();
@@ -1511,6 +1514,12 @@ export async function startDaemon(): Promise<void> {
 
     // Create realtime machine session
     const apiMachine = api.machineSyncClient(machine);
+    const claudeSwapSupervisor = createClaudeSwapSupervisor(
+      join(configuration.happyHomeDir, 'claude-swap-supervisor.json'),
+    );
+    stopClaudeSwapSupervisor = () => claudeSwapSupervisor.shutdown();
+    await claudeSwapSupervisor.restore();
+    const aiCredentialRuntime = createNodeAiCredentialRuntime(claudeSwapSupervisor);
     apiMachine.setAutomationKey(machineAutomationKey, (keyVersion) => {
       machineAutomationKey = updateMachineAutomationKeyRegistration(
         configuration.automationKeyFile,
@@ -1578,7 +1587,8 @@ export async function startDaemon(): Promise<void> {
       stopSession,
       requestShutdown: () => requestShutdown('happy-app'),
       portRegistry,
-      automationStore
+      automationStore,
+      aiCredentialRuntime,
     });
 
     // Connect to server
@@ -1710,6 +1720,7 @@ export async function startDaemon(): Promise<void> {
             // `happy daemon start` reads our still-present daemon.state.json, sees
             // isDaemonRunningCurrentlyInstalledHappyVersion() === true, and exits —
             // leaving nothing running once we also exit.
+            claudeSwapSupervisor.shutdown();
             apiMachine.shutdown();
             await stopControlServer();
             await stopBrowserBridge();
@@ -1773,6 +1784,7 @@ export async function startDaemon(): Promise<void> {
         logger.debug('[DAEMON RUN] Health check interval cleared');
       }
       stopLogHousekeeping();
+      claudeSwapSupervisor.shutdown();
 
       // Update daemon state before shutting down
       await apiMachine.updateDaemonState((state: DaemonState | null) => ({
@@ -1813,6 +1825,7 @@ export async function startDaemon(): Promise<void> {
     await cleanupAndShutdown(shutdownRequest.source, shutdownRequest.errorMessage);
   } catch (error) {
     stopLogHousekeeping();
+    stopClaudeSwapSupervisor();
     logger.debug('[DAEMON RUN][FATAL] Failed somewhere unexpectedly - exiting with code 1', error);
     process.exit(1);
   }
