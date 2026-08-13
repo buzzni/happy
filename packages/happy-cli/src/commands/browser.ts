@@ -97,9 +97,9 @@ export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePo
     // only while loopback is the sole way in. Once anyone can reach the port,
     // a passing scanner trips the same flag — and the confident wording would
     // send the user re-pairing something that was never broken.
-    const portIsPublic = bridgeHost !== undefined && bridgeHost !== '127.0.0.1'
+    const portIsPublic = bridgeHost !== undefined && !['127.0.0.1', '::1', 'localhost'].includes(bridgeHost)
 
-    if (bridgeHost !== undefined && bridgeHost !== '127.0.0.1') {
+    if (portIsPublic) {
         lines.push(chalk.yellow(`브리지가 ${bridgeHost}에 바인드되어 있습니다 — 이 컴퓨터 밖에서도 닿을 수 있습니다.`))
         lines.push(chalk.dim('  연결은 평문 WebSocket이고 pairing 토큰이 유일한 방어선입니다. 신뢰하는 네트워크에서만 여세요.'))
         lines.push('')

@@ -65,6 +65,32 @@ describe('browserBridgeServer', () => {
         ws.close()
     })
 
+    // `new URL(path, 'http://' + host)` throws for a bare IPv6 host ('::1',
+    // '::') — brackets are required in a URL authority. The connection
+    // handler built its base URL from the bind host, so an IPv6 bind crashed
+    // the handler on every incoming connection. Reachable since
+    // HAPPY_BROWSER_BRIDGE_HOST made the bind host configurable.
+    it('accepts connections when bound to an IPv6 loopback', async () => {
+        const v6bridge = new BrowserBridge({ authToken: TOKEN })
+        let server
+        try {
+            server = await startBrowserBridgeServer({ bridge: v6bridge, port: 0, host: '::1' })
+        } catch {
+            return // machine without IPv6 loopback — nothing to verify here
+        }
+        try {
+            const { ws } = await new Promise<{ ws: WebSocket }>((resolve, reject) => {
+                const ws = new WebSocket(`ws://[::1]:${server.port}/?token=${TOKEN}&profile=v6`)
+                ws.on('open', () => resolve({ ws }))
+                ws.on('error', reject)
+            })
+            await expect.poll(() => v6bridge.connections()).toEqual([{ profile: 'v6' }])
+            ws.close()
+        } finally {
+            await server.stop()
+        }
+    })
+
     it('answers extension pings with pong', async () => {
         const { ws } = await connectExtension(port, `token=${TOKEN}`)
         const pong = new Promise<any>((resolve) => {

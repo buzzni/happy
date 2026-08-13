@@ -58,6 +58,19 @@ R4를 R3보다 먼저 한 이유: R2로 non-loopback 바인드가 가능해진 �
    올리므로, 멀쩡한 확장을 재페어링하게 만드는 오진이 된다. 포트가 외부에
    열린 경우에만 문구를 완화한다.
 
+6차 — IPv6 바인드 조합:
+
+6. **IPv6 바인드가 연결마다 데몬 핸들러를 크래시시켰다.**
+   `browserBridgeServer.ts`의 connection 핸들러가 base URL을 바인드
+   host로 조립했는데(`http://${host}`), 브래킷 없는 IPv6(`::1`, `::`)는
+   URL authority로 무효라 `new URL()`이 throw했다. base는 상대 URL
+   해석용일 뿐 host 값은 읽히지 않으므로 고정 문자열로 바꿨다.
+   실증: `node -e "new URL('/', 'http://::1')"` → Invalid URL.
+   실서버 `::1` 바인드 테스트는 수정 전 hang(uncaught throw), 수정 후 통과.
+7. `portIsPublic`이 `::1`(IPv6 loopback)을 외부 노출로 오판해 불필요한
+   경고와 스캐너 문구 완화를 적용했다. loopback 목록('127.0.0.1',
+   '::1', 'localhost')으로 판정을 통일했다.
+
 ## 남은 리스크 / 미검증
 
 - 실제 원격 네트워크(다른 LAN, NAT 뒤)에서의 왕복은 미검증 — 단위 테스트는

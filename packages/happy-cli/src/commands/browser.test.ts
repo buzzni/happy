@@ -174,6 +174,14 @@ describe('formatBrowserStatus', () => {
             expect(bridgeProbeHost('127.0.0.1')).toBe('127.0.0.1')
         })
 
+        // '::1' is as loopback-only as 127.0.0.1 — warning that the machine
+        // is reachable from outside, and softening the auth-failure wording
+        // to "maybe a scanner", would both be wrong there.
+        it('treats the IPv6 loopback like 127.0.0.1: no exposure warning', () => {
+            const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [], bridgeHost: '::1' })
+            expect(out).not.toMatch(/평문|밖에서도/)
+        })
+
         // On a public bind any internet scanner touching 41777 trips
         // hasRecentAuthFailure, so the loopback-era wording ("your other
         // extension is retrying with an old token") becomes a guess that
