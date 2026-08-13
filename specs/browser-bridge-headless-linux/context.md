@@ -70,6 +70,27 @@ CDP `Extensions.loadUnpacked` 를 호출하면 정상 로드된다(확장 id 정
 
 → `pair` 가 `loadUnpackedExtension` 으로 직접 넣도록 변경, 문서 3단계 교체.
 
+## pair 종단 실기 검증 (2026-08-13, 격리 브리지 + 실제 Chrome)
+
+이 머신의 41777 데몬이 justin/ryan 두 사용자의 세션 35개(이 세션 포함)가
+묶여 쓰는 공유 자원임을 확인했다. `pair`의 브리지 포트(41777)는
+`HAPPY_HOME_DIR`과 무관한 하드코딩 상수라 순수 env 격리로는 공유 데몬을
+피할 수 없어, `vi.mock`으로 `DEFAULT_BROWSER_BRIDGE_PORT`·`configuration`·
+`readDaemonState`만 사설 값으로 바꾸고 나머지는 실제 `handlePairCommand`를
+그대로 실행하는 방식으로 검증했다. 공유 포트 41777·실제 토큰 파일
+(`~/.happy/browser-bridge.token`, mtime 불변 확인)에는 어떤 패킷도
+파일 변경도 가지 않는다.
+
+| 시나리오 | 결과 |
+|---|---|
+| 정상 페어링(확장 CDP 로드 → 연결 → tier 확인) | ✅ 실제 출력: `페어링 완료 — 새로 연결된 프로필: default-2d13 / 정밀 제어: 켬` |
+| CDP 미도달(`--cdp-port 19999`) | ✅ 정확한 안내 문구 출력, `process.exitCode === 1` |
+
+`handlePairCommand`의 전체 오케스트레이션(데몬 상태 확인 → CDP 확인 →
+연결 스냅샷 → `loadUnpackedExtension` → `openTab` → `waitForConnection` →
+`waitForDebuggerTier` → `formatPairOutcome`)이 실제 Chrome 151 위에서
+설계대로 동작함을 실측했다.
+
 ## 미검증 — 실제 Ubuntu 머신에서 확인 필요
 
 단위 테스트는 fake chrome/CDP 위에서 돌았다. 실물에서만 확인 가능한 것:
