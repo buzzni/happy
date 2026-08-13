@@ -103,6 +103,15 @@ export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePo
         lines.push(chalk.yellow(`브리지가 ${bridgeHost}에 바인드되어 있습니다 — 이 컴퓨터 밖에서도 닿을 수 있습니다.`))
         lines.push(chalk.dim('  연결은 평문 WebSocket이고 pairing 토큰이 유일한 방어선입니다. 신뢰하는 네트워크에서만 여세요.'))
         lines.push('')
+    } else if (publicHost) {
+        // The link below will point a remote extension at this machine, but
+        // nothing answers beyond loopback — the extension dials into silence
+        // and neither side ever shows a cause. This is the one place that can
+        // see both halves of the mismatch.
+        lines.push(chalk.yellow(`HAPPY_BROWSER_BRIDGE_PUBLIC_HOST(${publicHost})가 설정됐지만 브리지는 loopback만 듣고 있습니다.`))
+        lines.push(chalk.dim('  원격 확장은 아래 링크로 접속해도 닿을 수 없습니다. 데몬을 이렇게 다시 시작하세요:'))
+        lines.push(`  ${chalk.cyan('HAPPY_BROWSER_BRIDGE_HOST=0.0.0.0 happy daemon start')}`)
+        lines.push('')
     }
 
     if (!daemonRunning && bridgePortInUse === true) {

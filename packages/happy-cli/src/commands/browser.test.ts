@@ -213,6 +213,21 @@ describe('formatBrowserStatus', () => {
             const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [], bridgeHost: '0.0.0.0', publicHost: 'happy.example.com' })
             expect(out).toContain(`chrome-extension://${base.extensionId}/src/options.html?token=${base.token}&port=${base.bridgePort}&host=happy.example.com`)
         })
+
+        // PUBLIC_HOST without BRIDGE_HOST hands out a link pointing at this
+        // machine while the daemon still listens on loopback only. The remote
+        // extension then dials a port nothing answers on, and neither side
+        // shows a cause — this status output is the one place that can see
+        // both halves of the mismatch.
+        it('flags a public link handed out while the bridge only listens on loopback', () => {
+            const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [], bridgeHost: '127.0.0.1', publicHost: 'happy.example.com' })
+            expect(out).toMatch(/HAPPY_BROWSER_BRIDGE_HOST/)
+        })
+
+        it('does not flag the pairing link when the bridge actually listens beyond loopback', () => {
+            const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [], bridgeHost: '0.0.0.0', publicHost: 'happy.example.com' })
+            expect(out).not.toMatch(/HAPPY_BROWSER_BRIDGE_HOST/)
+        })
     })
 
     it('mentions the port the extension must be pointed at', () => {
