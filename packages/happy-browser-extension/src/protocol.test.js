@@ -245,6 +245,32 @@ describe('handleCommand', () => {
             const response = await handleCommand({ id: 11, method: 'screenshot' }, fakeChrome({ tabs: [] }))
             expect(response.error.code).toBe('NO_ACTIVE_TAB')
         })
+
+        // captureVisibleTab needs a real composited surface. A headless Chrome
+        // has none, so on that box it is the CDP path or nothing.
+        it('falls back to CDP when captureVisibleTab fails and the debugger tier is on', async () => {
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                debuggerGranted: true,
+                captureVisibleTab: async () => { throw new Error('Failed to capture tab') },
+                sendCommand: async (_target, method, params) => {
+                    expect(method).toBe('Page.captureScreenshot')
+                    expect(params.captureBeyondViewport).toBe(false)
+                    return { data: 'VIEWPORT' }
+                },
+            })
+            const response = await handleCommand({ id: 12, method: 'screenshot' }, chrome)
+            expect(response.result).toEqual({ mimeType: 'image/png', dataB64: 'VIEWPORT' })
+        })
+
+        it('surfaces the original capture failure when the debugger tier is off', async () => {
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                captureVisibleTab: async () => { throw new Error('Failed to capture tab') },
+            })
+            const response = await handleCommand({ id: 13, method: 'screenshot' }, chrome)
+            expect(response.error.message).toContain('Failed to capture tab')
+        })
     })
 
     describe('frames', () => {

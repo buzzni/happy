@@ -79,6 +79,24 @@ export async function captureFullPage(chrome, tabId) {
     })
 }
 
+/**
+ * The same shot `chrome.tabs.captureVisibleTab` gives, taken through CDP.
+ *
+ * Only used as its fallback: captureVisibleTab needs a composited, visible
+ * window surface, which a headless Chrome does not have. Deliberately NOT
+ * captureBeyondViewport — this must stay the viewport shot the caller asked
+ * for, not a quiet upgrade to a full-page one.
+ */
+export async function captureViewport(chrome, tabId) {
+    return withDebugger(chrome, tabId, async ({ send }) => {
+        const { data } = await send('Page.captureScreenshot', {
+            format: 'png',
+            captureBeyondViewport: false,
+        })
+        return { mimeType: 'image/png', dataB64: data }
+    })
+}
+
 export async function dispatchTrustedClick(chrome, tabId, { x, y }) {
     return withDebugger(chrome, tabId, async ({ send }) => {
         const common = { x, y, button: 'left', clickCount: 1 }
