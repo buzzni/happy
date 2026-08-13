@@ -459,6 +459,24 @@ describe('AI credential machine runtime', () => {
     await expect(result).resolves.toEqual({ stdout: '{"complete":true}', stderr: '' })
   })
 
+  it('caps stdout and stderr independently so diagnostics do not consume the payload budget', async () => {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      kill: vi.fn(),
+    })
+    const spawnCommand = vi.fn(() => child) as unknown as typeof spawn
+
+    const result = runAiCredentialCommand('cswap', ['export', '-'], {
+      maxOutputBytes: 4,
+    }, spawnCommand)
+    child.stdout.emit('data', Buffer.from('1234'))
+    child.stderr.emit('data', Buffer.from('note'))
+    child.emit('close', 0)
+
+    await expect(result).resolves.toEqual({ stdout: '1234', stderr: 'note' })
+  })
+
   it('does not let the uv tool bin shadow non-cswap commands', async () => {
     const previousPath = process.env.PATH
     const previousToolBin = process.env.UV_TOOL_BIN_DIR

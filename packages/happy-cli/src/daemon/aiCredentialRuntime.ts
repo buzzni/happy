@@ -331,7 +331,6 @@ export function runAiCredentialCommand(
     })
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
-    let outputBytes = 0
     let settled = false
     let timeout: NodeJS.Timeout | undefined
     const fail = (kind: string) => {
@@ -341,14 +340,17 @@ export function runAiCredentialCommand(
       child.kill('SIGKILL')
       reject(new AiCredentialRuntimeError(kind))
     }
-    const collect = (target: Buffer[]) => (chunk: Buffer) => {
-      if (settled) return
-      outputBytes += chunk.length
-      if (outputBytes > (options.maxOutputBytes ?? MAX_PAYLOAD_BYTES)) {
-        fail('COMMAND_OUTPUT_TOO_LARGE')
-        return
+    const collect = (target: Buffer[]) => {
+      let outputBytes = 0
+      return (chunk: Buffer) => {
+        if (settled) return
+        outputBytes += chunk.length
+        if (outputBytes > (options.maxOutputBytes ?? MAX_PAYLOAD_BYTES)) {
+          fail('COMMAND_OUTPUT_TOO_LARGE')
+          return
+        }
+        target.push(chunk)
       }
-      target.push(chunk)
     }
     child.stdout.on('data', collect(stdout))
     child.stderr.on('data', collect(stderr))
