@@ -143,6 +143,9 @@ export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePo
     lines.push(chalk.dim('  1번 이후에는 아래 링크를 열면 2, 3번이 자동으로 끝납니다:'))
     lines.push(`  ${chalk.cyan(autoConnectLink(extensionId, token, bridgePort))}`)
     lines.push('')
+    lines.push(chalk.dim('  GUI가 없는 머신(SSH 전용 Linux)이라면 링크를 열 방법이 없습니다. 대신:'))
+    lines.push(`  ${chalk.cyan('happy browser pair')}  ${chalk.dim('— docs/browser-bridge-headless.md')}`)
+    lines.push('')
     lines.push(chalk.dim('  선택: 옵션의 allowlist에 사이트를 적으면 그 사이트에서만 동작합니다.'))
     lines.push(chalk.dim('  비워 두면 모든 탭을 제어할 수 있습니다.'))
     lines.push('')
@@ -174,7 +177,30 @@ export async function handleBrowserCommand(args: string[]): Promise<void> {
         console.log('')
         console.log('  happy browser          브라우저 브리지 상태와 pairing 토큰 표시')
         console.log('  happy browser token    토큰만 출력 (스크립트용)')
+        console.log('  happy browser pair     GUI 없이 페어링 (터미널 전용 머신)')
         console.log('')
+        console.log('  pair 옵션:')
+        console.log('    --cdp-port <n>       Chrome --remote-debugging-port (기본 9222)')
+        console.log('    --debugger           정밀 제어(디버거)도 함께 켬')
+        console.log('    --no-debugger        정밀 제어를 끔')
+        console.log('')
+        return
+    }
+
+    // Pairing without a GUI is a different job to reporting status, so it
+    // lives in its own module. Imported dynamically because browserPair.ts
+    // reuses resolveExtensionDir/resolveExtensionId from this file — a static
+    // import both ways is a cycle.
+    if (args[0] === 'pair') {
+        const { handlePairCommand } = await import('./browserPair')
+        try {
+            await handlePairCommand(args.slice(1))
+        } catch (e) {
+            console.log('')
+            console.log(chalk.red(e instanceof Error ? e.message : String(e)))
+            console.log('')
+            process.exitCode = 1
+        }
         return
     }
 
