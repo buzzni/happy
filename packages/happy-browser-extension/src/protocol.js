@@ -63,8 +63,13 @@ async function resolveTab(params, chrome, allowlist) {
             throw new CommandError('TAB_NOT_FOUND', e instanceof Error ? e.message : String(e))
         }
     } else {
-        const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
-        tab = active
+        const [focused] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+        // A Chrome under Xvfb (or `--headless=new`) has no window manager, so
+        // nothing is ever "last focused" and the query above comes back empty
+        // even though a perfectly good active tab exists. Falling back to the
+        // active tab of any window is not an arbitrary pick — it is the only
+        // information left once focus is meaningless.
+        tab = focused ?? (await chrome.tabs.query({ active: true }))[0]
     }
     if (!tab || tab.id === undefined) {
         throw new CommandError('NO_ACTIVE_TAB', 'No active tab to act on')
