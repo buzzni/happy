@@ -9,7 +9,12 @@
  * See specs/browser-setup-gui/.
  */
 
+import { spawn } from 'node:child_process'
+import { mkdirSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
+
+/** Binaries that ship Chrome's CDP + extension support, most preferred first. */
+export const CHROME_BINARIES = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser']
 
 export interface ChromeLaunchOptions {
     userDataDir: string
@@ -80,5 +85,62 @@ export function planChromeInstall({ chromePath, canSudo }: { chromePath: string 
         action: 'manual',
         command: INSTALL_COMMAND,
         reason: 'Chrome은 시스템 공유 라이브러리를 필요로 해서 root 없이 설치할 수 없습니다. 이 명령을 서버에서 한 번 실행해 주세요.',
+    }
+}
+
+function run(command: string, args: string[]): Promise<{ code: number; stdout: string }> {
+    return new Promise((resolvePromise) => {
+        const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'ignore'] })
+        let stdout = ''
+        child.stdout?.on('data', (chunk) => { stdout += String(chunk) })
+        child.on('error', () => resolvePromise({ code: 1, stdout: '' }))
+        child.on('close', (code) => resolvePromise({ code: code ?? 1, stdout: stdout.trim() }))
+    })
+}
+
+/** First Chrome-family binary on PATH, or null when none is installed. */
+export async function detectChrome(): Promise<{ path: string; version: string } | null> {
+    for (const binary of CHROME_BINARIES) {
+        const found = await run('which', [binary])
+        if (found.code !== 0 || !found.stdout) continue
+        const version = await run(found.stdout, ['--version'])
+        return { path: found.stdout, version: version.stdout || 'unknown' }
+    }
+    return null
+}
+
+/**
+ * Whether `sudo` can run without prompting. `-n` makes sudo fail rather than
+ * block on a password prompt — a blocked prompt would hang the RPC forever
+ * with no way for the user to answer it.
+ */
+export async function canSudoWithoutPassword(): Promise<boolean> {
+    const result = await run('sudo', ['-n', 'true'])
+    return result.code === 0
+}
+
+/**
+ * Starts Chrome detached so it outlives the daemon that spawned it — the
+ * whole point is a browser that stays logged in across restarts.
+ */
+export function launchChrome(chromePath: string, options: ChromeLaunchOptions): { pid: number | undefined } {
+    mkdirSync(options.userDataDir, { recursive: true })
+    const child = spawn(chromePath, buildChromeLaunchArgs(options), {
+        detached: true,
+        stdio: 'ignore',
+    })
+    child.unref()
+    return { pid: child.pid }
+}
+
+/** Whether something answers CDP on that port — i.e. Chrome is already up. */
+export async function isCdpReachable(cdpPort: number): Promise<boolean> {
+    try {
+        const response = await fetch(`http://127.0.0.1:${cdpPort}/json/version`, {
+            signal: AbortSignal.timeout(1500),
+        })
+        return response.ok
+    } catch {
+        return false
     }
 }
