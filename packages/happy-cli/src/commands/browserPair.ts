@@ -18,8 +18,8 @@ import { configuration } from '@/configuration'
 import { readDaemonState } from '@/persistence'
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken'
 import { fetchBrowserStatus, requestBrowser } from '@/daemon/browserClient'
-import { DEFAULT_BROWSER_BRIDGE_PORT } from '@/daemon/browserBridgeServer'
-import { resolveExtensionDir, resolveExtensionId } from './browser'
+import { DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from '@/daemon/browserBridgeServer'
+import { resolveExtensionDir, resolveExtensionId, bridgeProbeHost } from './browser'
 
 /** Chrome's conventional `--remote-debugging-port`. */
 export const DEFAULT_CDP_PORT = 9222
@@ -56,17 +56,24 @@ export function parsePairArgs(args: string[]): PairOptions {
     return options
 }
 
-export function buildPairUrl({ extensionId, token, bridgePort, debuggerTier }: {
+export function buildPairUrl({ extensionId, token, bridgePort, debuggerTier, bridgeHost = '127.0.0.1' }: {
     extensionId: string
     token: string
     bridgePort: number
     debuggerTier?: boolean
+    /** What the daemon's bridge is bound to (resolveBrowserBridgeHost). */
+    bridgeHost?: string
 }): string {
     // host is pinned, not left to whatever the profile already had: pair
     // drives a Chrome on this machine against this machine's daemon, so a
     // remote host left over from an earlier pairing would send the extension
     // somewhere else and make this run fail with no visible cause.
-    const params = new URLSearchParams({ token, port: String(bridgePort), host: '127.0.0.1' })
+    //
+    // Pinned to where the daemon actually answers, though — loopback for a
+    // loopback or wildcard bind, but the interface's own address for a
+    // single-interface bind, where nothing listens on 127.0.0.1 and the
+    // failure used to get blamed on the token.
+    const params = new URLSearchParams({ token, port: String(bridgePort), host: bridgeProbeHost(bridgeHost) })
     if (debuggerTier !== undefined) params.set('debugger', debuggerTier ? '1' : '0')
     return `chrome-extension://${extensionId}/src/options.html?${params.toString()}`
 }
@@ -328,6 +335,10 @@ export async function handlePairCommand(args: string[]): Promise<void> {
             token,
             bridgePort: DEFAULT_BROWSER_BRIDGE_PORT,
             debuggerTier: options.debuggerTier,
+            // Best-effort like `happy browser`: this process's env, which
+            // matches the daemon's bind only if nothing changed it since the
+            // daemon started.
+            bridgeHost: resolveBrowserBridgeHost(process.env),
         }))
         if (pageOpened) {
             connections = await waitForConnection(controlPort, 10_000, profilesBefore)

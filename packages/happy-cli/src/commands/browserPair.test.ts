@@ -47,6 +47,19 @@ describe('buildPairUrl', () => {
         expect(buildPairUrl(base)).toContain('host=127.0.0.1')
     })
 
+    // Pinning loopback is only right while the daemon actually listens there.
+    // Bound to one specific interface (HAPPY_BROWSER_BRIDGE_HOST=192.168.1.5),
+    // nothing answers on 127.0.0.1 — the extension saved a dead address and
+    // the failure got blamed on the token. The interface's own address is
+    // reachable from this machine, so pin that instead.
+    it('pins the bind address when the daemon listens on one specific interface', () => {
+        expect(buildPairUrl({ ...base, bridgeHost: '192.168.1.5' })).toContain('host=192.168.1.5')
+    })
+
+    it('still pins loopback for a wildcard bind, which loopback always reaches', () => {
+        expect(buildPairUrl({ ...base, bridgeHost: '0.0.0.0' })).toContain('host=127.0.0.1')
+    })
+
     it('carries an explicit debugger decision', () => {
         expect(buildPairUrl({ ...base, debuggerTier: true })).toContain('&debugger=1')
         expect(buildPairUrl({ ...base, debuggerTier: false })).toContain('&debugger=0')
