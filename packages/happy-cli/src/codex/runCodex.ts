@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import {
+    fetchAplusMcpConfigSnapshot,
     fetchAplusMcpServersResult,
     mcpConfigFailureStatuses,
     readExpectedConnectors,
@@ -861,11 +862,12 @@ export async function runCodex(opts: {
     // codex would otherwise fail to start the MCP server, the change_title tool would
     // not be visible to the model, and the model would improvise with shell echoes.
     const bridgeEntrypoint = join(projectPath(), 'bin', 'happy-mcp.mjs');
-    const initialAplusMcpResult = await fetchAplusMcpServersResult(
+    const initialAplusMcpSnapshot = await fetchAplusMcpConfigSnapshot(
         opts.credentials.token,
         machineId,
         { sessionId: session.sessionId },
     );
+    const initialAplusMcpResult = initialAplusMcpSnapshot.result;
     for (const status of mcpConfigFailureStatuses(initialAplusMcpResult)) {
         session.updateMetadata((currentMetadata) => ({
             ...currentMetadata,
@@ -875,7 +877,7 @@ export async function runCodex(opts: {
             ],
         }));
     }
-    const initialAplusMcpServers = initialAplusMcpResult.ok ? initialAplusMcpResult.servers : {};
+    const initialAplusMcpServers = initialAplusMcpSnapshot.servers;
     const baseMcpServers = {
         happy: {
             command: process.execPath,

@@ -209,6 +209,26 @@ describe('fetchAplusMcpServersResult', () => {
         }]);
     });
 
+    it('keeps healthy MCP servers available when another expected service is missing', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+            mcpServers: {
+                'aplus-common': { type: 'http', url: 'https://saycode.test/mcp/common' },
+                gmail: { type: 'http', url: 'https://saycode.test/mcp/connector/gmail' },
+            },
+            mcpReadiness: {
+                status: 'mcp-config-missing',
+                expected: ['argos', 'gmail'],
+                configured: ['gmail'],
+                missing: [{ name: 'argos', reason: 'missing-headers' }],
+            },
+        }), { status: 200 })));
+
+        await expect(fetchAplusMcpServers('happy-token', 'machine-1')).resolves.toEqual({
+            'aplus-common': { type: 'http', url: 'https://saycode.test/mcp/common' },
+            gmail: { type: 'http', url: 'https://saycode.test/mcp/connector/gmail' },
+        });
+    });
+
     it('preserves connector-specific status inside unified MCP readiness', () => {
         expect(mcpConfigFailureStatuses({
             ok: false,
