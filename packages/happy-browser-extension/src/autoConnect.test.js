@@ -6,6 +6,7 @@ describe('parseAutoConnectParams', () => {
         expect(parseAutoConnectParams('?token=abc123&port=41777')).toEqual({
             token: 'abc123',
             port: 41777,
+            host: '127.0.0.1',
         })
     })
 
@@ -13,6 +14,7 @@ describe('parseAutoConnectParams', () => {
         expect(parseAutoConnectParams('?token=abc123')).toEqual({
             token: 'abc123',
             port: 41777,
+            host: '127.0.0.1',
         })
     })
 
@@ -29,6 +31,7 @@ describe('parseAutoConnectParams', () => {
         expect(parseAutoConnectParams('?token=abc123&debugger=1')).toEqual({
             token: 'abc123',
             port: 41777,
+            host: '127.0.0.1',
             debuggerTier: true,
         })
     })
@@ -37,6 +40,7 @@ describe('parseAutoConnectParams', () => {
         expect(parseAutoConnectParams('?token=abc123&debugger=0')).toEqual({
             token: 'abc123',
             port: 41777,
+            host: '127.0.0.1',
             debuggerTier: false,
         })
     })
@@ -44,5 +48,14 @@ describe('parseAutoConnectParams', () => {
     it('omits debuggerTier entirely when the link does not mention it, so an existing setting is left alone', () => {
         const parsed = parseAutoConnectParams('?token=abc123')
         expect('debuggerTier' in parsed).toBe(false)
+    })
+
+    // Pointing this machine's Chrome at a remote happy session's bridge.
+    it('reads an explicit host for a remote daemon', () => {
+        expect(parseAutoConnectParams('?token=abc123&host=happy.example.com').host).toBe('happy.example.com')
+    })
+
+    it('defaults host to loopback when the link omits it', () => {
+        expect(parseAutoConnectParams('?token=abc123').host).toBe('127.0.0.1')
     })
 })

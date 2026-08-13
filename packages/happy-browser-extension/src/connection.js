@@ -34,8 +34,16 @@ export function createConnection({
     let consecutiveFailures = 0
 
     async function readConfig() {
-        const { port, token, profile } = await chrome.storage.local.get(['port', 'token', 'profile'])
-        return { port: port || defaultPort, token: token || '', profile: profile || 'default' }
+        const { port, token, profile, host } = await chrome.storage.local.get(['port', 'token', 'profile', 'host'])
+        return {
+            port: port || defaultPort,
+            token: token || '',
+            profile: profile || 'default',
+            // The daemon is usually on this machine, but not always — a user
+            // can point their own, already-running Chrome at a remote happy
+            // session's bridge instead.
+            host: host || '127.0.0.1',
+        }
     }
 
     function setBadge({ text, color }) {
@@ -63,13 +71,13 @@ export function createConnection({
         } finally {
             connecting = false
         }
-        const { port, token, profile } = config
+        const { port, token, profile, host } = config
         if (!token) {
             // Not paired yet — the options page starts the connection once saved.
             return
         }
 
-        const url = `ws://127.0.0.1:${port}/?token=${encodeURIComponent(token)}&profile=${encodeURIComponent(profile)}`
+        const url = `ws://${host}:${port}/?token=${encodeURIComponent(token)}&profile=${encodeURIComponent(profile)}`
         const ws = new WebSocketImpl(url)
         socket = ws
         // Per-socket so a late close from a replaced socket cannot stop the

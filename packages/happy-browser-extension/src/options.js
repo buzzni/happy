@@ -1,13 +1,15 @@
 import { parseAllowlist } from './allowlist.js'
 import { parseAutoConnectParams } from './autoConnect.js'
 
+const hostInput = document.getElementById('host')
 const portInput = document.getElementById('port')
 const tokenInput = document.getElementById('token')
 const profileInput = document.getElementById('profile')
 const allowlistInput = document.getElementById('allowlist')
 const status = document.getElementById('status')
 
-const stored = await chrome.storage.local.get(['port', 'token', 'profile', 'allowlist'])
+const stored = await chrome.storage.local.get(['host', 'port', 'token', 'profile', 'allowlist'])
+hostInput.value = stored.host || '127.0.0.1'
 portInput.value = stored.port || 41777
 tokenInput.value = stored.token || ''
 profileInput.value = stored.profile || 'default'
@@ -22,6 +24,7 @@ async function save({ debuggerTier } = {}) {
     const allowlist = allowlistInput.value
     // The service worker watches storage and reconnects on change.
     await chrome.storage.local.set({
+        host: hostInput.value.trim() || '127.0.0.1',
         port: Number(portInput.value) || 41777,
         token,
         profile: profileInput.value.trim() || 'default',
@@ -55,6 +58,7 @@ const autoConnect = parseAutoConnectParams(location.search)
 if (autoConnect) {
     tokenInput.value = autoConnect.token
     portInput.value = autoConnect.port
+    hostInput.value = autoConnect.host
     // Scrub the token from the visible URL / this navigation's history entry
     // right away — nothing downstream needs it to stay there.
     history.replaceState(null, '', location.pathname)

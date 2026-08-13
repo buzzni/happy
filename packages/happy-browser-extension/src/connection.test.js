@@ -71,6 +71,15 @@ describe('createConnection', () => {
         expect(FakeWebSocket.instances[0].url).toBe('ws://127.0.0.1:41777/?token=tok&profile=default')
     })
 
+    // The daemon is not always on this machine — a user pointing their own,
+    // already-logged-in Chrome at a remote happy session needs the extension
+    // to dial out somewhere other than its own loopback.
+    it('dials a configured remote host instead of loopback', async () => {
+        const connection = make(fakeChrome({ token: 'tok', port: 41777, profile: 'default', host: 'happy.example.com' }))
+        await connection.connect()
+        expect(FakeWebSocket.instances[0].url).toBe('ws://happy.example.com:41777/?token=tok&profile=default')
+    })
+
     it('does not connect before a pairing token is saved', async () => {
         const connection = make(fakeChrome({ token: '', port: 41777, profile: 'default' }))
         await connection.connect()

@@ -13,6 +13,7 @@ export function parseAutoConnectParams(search) {
     const result = {
         token,
         port: Number.isFinite(port) && port > 0 ? port : 41777,
+        host: (params.get('host') ?? '').trim() || '127.0.0.1',
     }
 
     // Absent must stay absent rather than becoming `false`: a machine that
