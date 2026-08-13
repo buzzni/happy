@@ -14,6 +14,7 @@
  */
 
 import chalk from 'chalk'
+import { WebSocket } from 'ws'
 import { configuration } from '@/configuration'
 import { readDaemonState } from '@/persistence'
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken'
@@ -84,8 +85,13 @@ export interface PairOutcomeInput {
     daemonRunning: boolean
     /** Chrome answered on the debugging port. */
     cdpReachable: boolean
-    /** A target belonging to our extension id was visible before we opened the page. */
+    /**
+     * The extension is believed present — either its target was already
+     * visible, or this run loaded it over CDP.
+     */
     extensionLoaded: boolean
+    /** The CDP load attempt was made and Chrome refused it. */
+    loadUnpackedFailed?: boolean
     /** Chrome accepted /json/new for the pairing URL. */
     pageOpened: boolean
     connections: Array<{ profile: string }>
@@ -104,7 +110,7 @@ export interface PairOutcomeInput {
     authRejected?: boolean
 }
 
-export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpReachable, extensionLoaded, pageOpened, connections, freshProfiles, debuggerTierRequested, debuggerTierActual, authRejected }: PairOutcomeInput): { ok: boolean; text: string } {
+export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpReachable, extensionLoaded, loadUnpackedFailed, pageOpened, connections, freshProfiles, debuggerTierRequested, debuggerTierActual, authRejected }: PairOutcomeInput): { ok: boolean; text: string } {
     // Ordered by what has to be true first: a later check failing while an
     // earlier prerequisite is missing would point at the wrong thing.
     if (!daemonRunning) {
@@ -122,9 +128,9 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
             ok: false,
             text: [
                 chalk.yellow(`Chrome이 디버깅 포트 ${cdpPort}에서 응답하지 않습니다.`),
-                chalk.dim('  Chrome을 아래처럼 띄운 뒤 다시 실행하세요:'),
-                `  ${chalk.cyan(`google-chrome --remote-debugging-port=${cdpPort} --user-data-dir=~/.happy-chrome \\`)}`,
-                `  ${chalk.cyan(`    --disable-extensions-except=${extensionDir} --load-extension=${extensionDir}`)}`,
+                chalk.dim('  Chrome을 아래처럼 띄운 뒤 다시 실행하세요 (확장은 이 명령이 직접 넣습니다):'),
+                `  ${chalk.cyan(`google-chrome --headless=new --remote-debugging-port=${cdpPort} \\`)}`,
+                `  ${chalk.cyan('    --user-data-dir=~/.happy-chrome --enable-unsafe-extension-debugging')}`,
             ].join('\n'),
         }
     }
@@ -192,9 +198,11 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
         return {
             ok: false,
             text: [
-                chalk.yellow('Chrome은 응답하지만 확장이 로드되어 있지 않습니다.'),
-                chalk.dim('  두 플래그는 짝으로 써야 합니다 — --load-extension만으로는 무시됩니다:'),
-                `  ${chalk.cyan(`--disable-extensions-except=${extensionDir} --load-extension=${extensionDir}`)}`,
+                chalk.yellow('확장을 Chrome에 넣지 못했습니다.'),
+                chalk.dim('  Chrome 137부터 --load-extension은 무시되므로 이 명령은 CDP로 확장을 넣습니다.'),
+                chalk.dim('  그 호출은 아래 플래그로 띄운 Chrome에서만 허용됩니다:'),
+                `  ${chalk.cyan('--enable-unsafe-extension-debugging')}`,
+                chalk.dim(`  확장 경로: ${extensionDir}`),
                 chalk.dim('  구형 --headless는 확장을 지원하지 않습니다. --headless=new 또는 Xvfb를 쓰세요.'),
             ].join('\n'),
         }
@@ -257,6 +265,56 @@ async function openTab(cdpPort: number, url: string): Promise<boolean> {
 /** The extension's own targets (service worker, options page) carry its id. */
 function hasExtensionTarget(targets: Array<{ url?: string }> | null, extensionId: string): boolean {
     return (targets ?? []).some((target) => target.url?.startsWith(`chrome-extension://${extensionId}/`) === true)
+}
+
+/**
+ * Install the extension into the running Chrome over CDP.
+ *
+ * Chrome 137 stopped honouring `--load-extension` (verified on Chrome 151:
+ * even a minimal probe extension does not load, and neither
+ * `--enable-unsafe-extension-debugging` nor
+ * `--disable-features=DisableLoadExtensionCommandLineSwitch` revives it), so
+ * a terminal-only machine has no command line that gets the extension in.
+ * `Extensions.loadUnpacked` does, and Chrome allows it only when started with
+ * `--enable-unsafe-extension-debugging`.
+ *
+ * Verified that the extension outlives this CDP session — it stays loaded and
+ * connected after the socket closes, which is what makes loading it from a
+ * one-shot command worth doing at all.
+ */
+async function loadUnpackedExtension(cdpPort: number, extensionDir: string): Promise<boolean> {
+    let browserSocketUrl: string
+    try {
+        const response = await fetch(`http://127.0.0.1:${cdpPort}/json/version`, { signal: AbortSignal.timeout(2_000) })
+        const body = await response.json() as { webSocketDebuggerUrl?: string }
+        if (!body.webSocketDebuggerUrl) return false
+        browserSocketUrl = body.webSocketDebuggerUrl
+    } catch {
+        return false
+    }
+
+    return new Promise<boolean>((resolve) => {
+        const socket = new WebSocket(browserSocketUrl)
+        const finish = (loaded: boolean) => {
+            clearTimeout(timer)
+            socket.close()
+            resolve(loaded)
+        }
+        const timer = setTimeout(() => finish(false), 10_000)
+        socket.on('open', () => {
+            socket.send(JSON.stringify({ id: 1, method: 'Extensions.loadUnpacked', params: { path: extensionDir } }))
+        })
+        socket.on('message', (raw) => {
+            try {
+                const message = JSON.parse(raw.toString()) as { id?: number; result?: { id?: string }; error?: unknown }
+                if (message.id === 1) finish(typeof message.result?.id === 'string')
+            } catch {
+                // Not our reply; keep waiting for one that parses.
+            }
+        })
+        socket.on('error', () => finish(false))
+        socket.on('close', () => finish(false))
+    })
 }
 
 /**
@@ -347,7 +405,16 @@ export async function handlePairCommand(args: string[]): Promise<void> {
     // becomes unanswerable from the target list.
     const targetsBefore = await fetchCdpTargets(options.cdpPort)
     const cdpReachable = targetsBefore !== null
-    const extensionLoaded = hasExtensionTarget(targetsBefore, extensionId)
+    let extensionLoaded = hasExtensionTarget(targetsBefore, extensionId)
+
+    // A dormant MV3 service worker shows no target, so "not seen" does not
+    // prove "not installed" — loading again is harmless (Chrome reloads it)
+    // and is the only way in on a machine with no GUI.
+    let loadUnpackedFailed = false
+    if (cdpReachable && !extensionLoaded) {
+        extensionLoaded = await loadUnpackedExtension(options.cdpPort, extensionDir)
+        loadUnpackedFailed = !extensionLoaded
+    }
 
     let pageOpened = false
     let connections: Array<{ profile: string }> = []
@@ -391,6 +458,7 @@ export async function handlePairCommand(args: string[]): Promise<void> {
         daemonRunning: Boolean(controlPort),
         cdpReachable,
         extensionLoaded,
+        loadUnpackedFailed,
         pageOpened,
         connections,
         freshProfiles,

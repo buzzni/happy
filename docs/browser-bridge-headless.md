@@ -21,9 +21,23 @@ happy browser        # "압축해제된 확장 프로그램을 로드" 항목에
 
 ## 3. Chrome 기동
 
-두 가지 방법이 있고, **Xvfb 쪽이 확실합니다.**
+**확장은 명령줄로 넣지 않습니다.** Chrome 137부터 `--load-extension`이
+무시되기 때문입니다(Chrome 151에서 실측: 최소 확장조차 로드되지 않고,
+`--enable-unsafe-extension-debugging`이나
+`--disable-features=DisableLoadExtensionCommandLineSwitch`를 붙여도 그대로).
+대신 4단계의 `happy browser pair`가 CDP로 직접 넣습니다. 그 호출을 Chrome이
+허용하려면 **`--enable-unsafe-extension-debugging`**으로 띄워야 합니다.
 
-### 방법 A — Xvfb + 일반(headful) Chrome (권장)
+### 방법 A — `--headless=new` (간단)
+
+```bash
+google-chrome --headless=new \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/.happy-chrome" \
+  --enable-unsafe-extension-debugging &
+```
+
+### 방법 B — Xvfb + 일반(headful) Chrome
 
 ```bash
 sudo apt install -y xvfb
@@ -33,30 +47,19 @@ export DISPLAY=:99
 google-chrome \
   --remote-debugging-port=9222 \
   --user-data-dir="$HOME/.happy-chrome" \
-  --disable-extensions-except="$EXT" \
-  --load-extension="$EXT" &
-```
-
-### 방법 B — `--headless=new`
-
-```bash
-google-chrome --headless=new \
-  --remote-debugging-port=9222 \
-  --user-data-dir="$HOME/.happy-chrome" \
-  --disable-extensions-except="$EXT" \
-  --load-extension="$EXT" &
+  --enable-unsafe-extension-debugging &
 ```
 
 주의할 점:
 
-- **구형 `--headless`(= `--headless=old`)는 확장을 아예 로드하지 않습니다.**
-  반드시 `--headless=new`를 쓰거나 방법 A를 택하세요.
-- `--load-extension`은 `--disable-extensions-except`와 **짝으로** 써야
-  합니다. 하나만 주면 Chrome이 조용히 무시합니다.
+- **구형 `--headless`(= `--headless=old`)는 확장을 아예 지원하지 않습니다.**
+  `--headless=new`를 쓰거나 방법 B를 택하세요.
 - `--user-data-dir`은 고정하세요. 로그인 세션·쿠키가 여기 저장되고,
   경로가 바뀌면 로그인이 통째로 사라집니다.
 - headless에서는 `chrome.tabs.captureVisibleTab`이 실패할 수 있습니다.
   4단계에서 `--debugger`를 켜면 CDP 경로로 자동 폴백합니다.
+- CDP로 넣은 확장은 **그 CDP 세션이 끊겨도 살아 있습니다**(실측 확인).
+  `happy browser pair`가 일회성 명령이어도 되는 이유입니다.
 
 ## 4. 페어링
 
@@ -64,6 +67,9 @@ google-chrome --headless=new \
 happy daemon start
 happy browser pair --debugger
 ```
+
+이 명령이 **확장 설치와 페어링을 모두** 처리합니다 — 확장이 아직 없으면
+CDP로 넣고, 이어서 옵션 페이지를 열어 토큰을 저장시킵니다.
 
 `--debugger`는 정밀 제어(디버거 tier)를 함께 켭니다. 옵션 페이지의 토글을
 누를 사람이 없는 환경이므로, 이 플래그가 headless에서 trusted 입력과
@@ -78,8 +84,9 @@ Chrome을 다른 포트로 띄웠다면 `--cdp-port 9333`처럼 맞춰 줍니다
 | 데몬이 실행 중이 아닙니다 | `happy daemon start` 먼저 |
 | Chrome이 디버깅 포트에서 응답하지 않습니다 | Chrome 미기동 또는 포트 불일치 |
 | 페어링 페이지를 열지 못했습니다 (/json/new 거부) | 다른 도구가 CDP를 점유 중이거나 바인드 주소 불일치 |
-| 확장이 로드되어 있지 않습니다 | 3단계의 두 플래그 확인, `--headless=old` 여부 확인 |
-| 옵션 페이지는 열었지만 연결되지 않았습니다 | 토큰/브리지 포트 불일치 — `happy browser`로 대조 |
+| 확장을 Chrome에 넣지 못했습니다 | `--enable-unsafe-extension-debugging` 누락, 또는 `--headless=old` |
+| 확장이 브리지에 닿았지만 토큰이 거부됐습니다 | 다른 데몬(`HAPPY_HOME_DIR` 상이)이 포트를 쥔 경우 |
+| 옵션 페이지는 열었지만 확장이 브리지에 닿지 못했습니다 | 저장된 데몬 주소/포트 불일치 — `happy browser`로 대조 |
 | 정밀 제어가 요청한 상태로 바뀌지 않았습니다 | 옵션 페이지 로드가 늦은 경우 — 다시 실행 |
 
 ## 5. 계정 로그인 (최초 1회)

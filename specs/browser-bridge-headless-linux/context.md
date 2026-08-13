@@ -42,6 +42,34 @@
   - 실패 1건 `fetchAplusMcpServersResult`는 `origin/main`을 별도 워크트리에
     체크아웃해 확인한 결과 동일하게 실패하는 **기존 실패**다.
 
+## 실기 검증 결과 (2026-08-13, macOS + Chrome 151, headless=new)
+
+브리지를 기본 포트가 아닌 임시 포트에 띄우고(사용자 데몬 무간섭) 실제
+Chrome을 일회용 프로필로 구동해 검증했다.
+
+| 항목 | 결과 |
+|---|---|
+| auto-connect `&host=`/`&debugger=1` → storage 저장 | ✅ `host`,`port`,`debuggerTier` 실제 기록 |
+| 확장이 비기본 포트(41991/41993)로 연결 | ✅ |
+| **비-loopback 원격 연결** (LAN IP `172.16.9.1`, 브리지 `0.0.0.0`) | ✅ |
+| `capabilities.debugger` 실제 반영 | ✅ true |
+| `timingSafeEqual` — 동일길이/다른길이 오답, 정답 | ✅ 4401 / 4401 / open |
+
+### 발견: `--load-extension` 이 죽었다 (Chrome 137+)
+
+최소 확장으로 대조 실험해 **우리 확장 문제가 아님**을 확정했다.
+`--enable-unsafe-extension-debugging` 이나
+`--disable-features=DisableLoadExtensionCommandLineSwitch` 를 붙여도 무시된다.
+문서와 pair 안내가 이 플래그를 전제하고 있었으므로 **따라 해도 실패하는
+절차**였다.
+
+대체 경로: `--enable-unsafe-extension-debugging` 으로 띄운 Chrome 에
+CDP `Extensions.loadUnpacked` 를 호출하면 정상 로드된다(확장 id 정확히 반환,
+옵션 페이지·SW 동작). **CDP 세션을 끊어도 확장이 유지됨**을 15초 후 연결
+생존으로 확인했고, 이것이 일회성 `pair` 명령이 확장을 넣어도 되는 근거다.
+
+→ `pair` 가 `loadUnpackedExtension` 으로 직접 넣도록 변경, 문서 3단계 교체.
+
 ## 미검증 — 실제 Ubuntu 머신에서 확인 필요
 
 단위 테스트는 fake chrome/CDP 위에서 돌았다. 실물에서만 확인 가능한 것:

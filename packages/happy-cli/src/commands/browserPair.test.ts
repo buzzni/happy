@@ -96,11 +96,27 @@ describe('formatPairOutcome', () => {
         expect(outcome.text).toContain('--remote-debugging-port=9222')
     })
 
-    it('names the extension directory when Chrome is up but the extension was never loaded', () => {
-        const outcome = formatPairOutcome({ ...base, extensionLoaded: false, connections: [] })
+    // Verified against Chrome 151: --load-extension is ignored outright
+    // (a minimal probe extension does not load either), and neither
+    // --enable-unsafe-extension-debugging nor
+    // --disable-features=DisableLoadExtensionCommandLineSwitch revives it.
+    // Printing that flag sends the user down a path that cannot work.
+    it('does not tell the user to use --load-extension, which modern Chrome ignores', () => {
+        const outcome = formatPairOutcome({ ...base, extensionLoaded: false, loadUnpackedFailed: true, connections: [] })
+        // Naming it as the thing that stopped working is fine; handing it to
+        // the user as the fix is not.
+        expect(outcome.text).not.toContain(`--load-extension=${base.extensionDir}`)
+        expect(outcome.text).toMatch(/--load-extension은 무시/)
+    })
+
+    // pair loads the extension itself over CDP now, so the only way it can
+    // still be missing is Chrome refusing that call — which it does unless
+    // started with --enable-unsafe-extension-debugging.
+    it('names the flag CDP loading needs when it could not load the extension', () => {
+        const outcome = formatPairOutcome({ ...base, extensionLoaded: false, loadUnpackedFailed: true, connections: [] })
         expect(outcome.ok).toBe(false)
-        expect(outcome.text).toContain('--load-extension=/opt/happy/browser-extension')
-        expect(outcome.text).toContain('--disable-extensions-except')
+        expect(outcome.text).toContain('--enable-unsafe-extension-debugging')
+        expect(outcome.text).toContain('/opt/happy/browser-extension')
     })
 
     // Reached the page and the extension is there, but no socket arrived: a
@@ -109,7 +125,7 @@ describe('formatPairOutcome', () => {
     it('distinguishes "opened the page but nothing connected" from the extension being absent', () => {
         const outcome = formatPairOutcome({ ...base, connections: [] })
         expect(outcome.ok).toBe(false)
-        expect(outcome.text).not.toContain('--load-extension')
+        expect(outcome.text).not.toContain('--enable-unsafe-extension-debugging')
         expect(outcome.text).toContain('happy browser')
     })
 
@@ -174,11 +190,12 @@ describe('formatPairOutcome', () => {
         const outcome = formatPairOutcome({
             ...base,
             extensionLoaded: false,
+            loadUnpackedFailed: true,
             connections: [{ profile: 'desktop' }],
             freshProfiles: [],
         })
         expect(outcome.ok).toBe(false)
-        expect(outcome.text).toContain('--load-extension')
+        expect(outcome.text).toContain('--enable-unsafe-extension-debugging')
     })
 
     // A re-pair of an already-working profile produces no new connection —
