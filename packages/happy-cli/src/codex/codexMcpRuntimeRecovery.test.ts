@@ -70,6 +70,36 @@ describe('CodexMcpRuntimeRecovery', () => {
         expect(client.resumeThread).not.toHaveBeenCalled();
     });
 
+    it('retries a stale authentication failure when current inventory is logged in', async () => {
+        let startupStatus: 'failed' | 'ready' = 'failed';
+        const client = {
+            getMcpStartupStatuses: vi.fn(() => [{
+                name: 'notion',
+                status: startupStatus,
+                failureReason: startupStatus === 'failed' ? 'reauthenticationRequired' : null,
+            }]),
+            listMcpServerStatus: vi.fn(async () => ({
+                data: [{ name: 'notion', authStatus: 'oAuth', tools: { search: {} } }],
+                nextCursor: null,
+            })),
+            resumeThread: vi.fn(async () => {
+                startupStatus = 'ready';
+                return { threadId: 'thread-1', model: 'gpt-5.4' };
+            }),
+        };
+        const recovery = new CodexMcpRuntimeRecovery(client, { backoffMs: 0 });
+
+        await expect(recovery.recoverBeforeTurn({
+            threadId: 'thread-1',
+            mcpServers: { notion: { url: 'https://notion.test/mcp' } },
+            expectedServerNames: ['notion'],
+        })).resolves.toEqual({
+            status: 'recovered',
+            affectedServers: ['notion'],
+        });
+        expect(client.resumeThread).toHaveBeenCalledOnce();
+    });
+
     it('recovers a failed server even when another server needs authentication', async () => {
         const client = {
             getMcpStartupStatuses: vi.fn(() => [
@@ -250,5 +280,54 @@ describe('CodexMcpRuntimeRecovery', () => {
             affectedServers: ['argos'],
         });
         expect(client.resumeThread).not.toHaveBeenCalled();
+    });
+
+    it('reports a previous recovery when a different server fails on the next turn', async () => {
+        let startupStatuses = [
+            { name: 'argos', status: 'failed' },
+            { name: 'notion', status: 'ready' },
+        ];
+        const client = {
+            getMcpStartupStatuses: vi.fn(() => startupStatuses),
+            listMcpServerStatus: vi.fn(async () => ({
+                data: [
+                    { name: 'argos', authStatus: 'unsupported', tools: { search: {} } },
+                    { name: 'notion', authStatus: 'unsupported', tools: { search: {} } },
+                ],
+                nextCursor: null,
+            })),
+            resumeThread: vi.fn(async () => ({ threadId: 'thread-1', model: 'gpt-5.4' })),
+        };
+        const recovery = new CodexMcpRuntimeRecovery(client, {
+            maxAttempts: 0,
+            backoffMs: 0,
+            cooldownMs: 0,
+        });
+        const input = {
+            threadId: 'thread-1',
+            mcpServers: {
+                argos: { url: 'https://argos.test/mcp' },
+                notion: { url: 'https://notion.test/mcp' },
+            },
+            expectedServerNames: ['argos', 'notion'],
+        };
+
+        await expect(recovery.recoverBeforeTurn(input)).resolves.toEqual({
+            status: 'failed',
+            affectedServers: ['argos'],
+        });
+        startupStatuses = [
+            { name: 'argos', status: 'ready' },
+            { name: 'notion', status: 'failed' },
+        ];
+
+        await expect(recovery.recoverBeforeTurn(input)).resolves.toEqual({
+            status: 'failed',
+            affectedServers: ['argos', 'notion'],
+            serverStatuses: [
+                { name: 'argos', status: 'recovered' },
+                { name: 'notion', status: 'failed' },
+            ],
+        });
     });
 });

@@ -94,27 +94,35 @@ export class CodexMcpRuntimeRecovery {
 
     private async recover(input: RecoveryInput): Promise<CodexMcpRecoveryResult> {
         const initial = await this.inspect(input);
+        const expected = new Set(input.expectedServerNames);
+        const initiallyUnhealthy = new Set(initial.affectedServers);
+        const previouslyRecovered = (this.unhealthyServers.get(input.threadId) ?? [])
+            .filter((name) => expected.has(name) && !initiallyUnhealthy.has(name));
         if (initial.status === 'ready') {
             this.cooldownUntil.delete(input.threadId);
-            const expected = new Set(input.expectedServerNames);
-            const recovered = (this.unhealthyServers.get(input.threadId) ?? [])
-                .filter((name) => expected.has(name));
             this.unhealthyServers.delete(input.threadId);
-            if (recovered.length > 0) {
-                return { status: 'recovered', affectedServers: recovered };
+            if (previouslyRecovered.length > 0) {
+                return { status: 'recovered', affectedServers: previouslyRecovered };
             }
             return { status: 'ready', affectedServers: [] };
         }
         if (initial.failedServers.length === 0) {
             this.unhealthyServers.set(input.threadId, initial.affectedServers);
-            return this.toResult(initial);
+            return this.toResult(initial, previouslyRecovered);
         }
         if ((this.cooldownUntil.get(input.threadId) ?? 0) > this.now()) {
             this.unhealthyServers.set(input.threadId, initial.affectedServers);
-            return this.toResult(initial);
+            return this.toResult(initial, previouslyRecovered);
         }
 
         const initiallyAffected = initial.affectedServers;
+        const recoveredSinceInitial = (stillAffected: string[]): string[] => {
+            const stillUnhealthy = new Set(stillAffected);
+            return [
+                ...previouslyRecovered,
+                ...initiallyAffected.filter((name) => !stillUnhealthy.has(name)),
+            ].sort();
+        };
         let latest = initial;
         for (let attempt = 0; attempt < this.maxAttempts; attempt++) {
             let resumed = false;
@@ -136,22 +144,21 @@ export class CodexMcpRuntimeRecovery {
             if (latest.status === 'ready') {
                 this.cooldownUntil.delete(input.threadId);
                 this.unhealthyServers.delete(input.threadId);
-                return { status: 'recovered', affectedServers: initiallyAffected };
+                return {
+                    status: 'recovered',
+                    affectedServers: recoveredSinceInitial([]),
+                };
             }
             if (latest.failedServers.length === 0) {
-                const stillUnhealthy = new Set(latest.affectedServers);
-                const recovered = initiallyAffected.filter((name) => !stillUnhealthy.has(name));
                 this.cooldownUntil.delete(input.threadId);
                 this.unhealthyServers.set(input.threadId, latest.affectedServers);
-                return this.toResult(latest, recovered);
+                return this.toResult(latest, recoveredSinceInitial(latest.affectedServers));
             }
         }
 
         this.cooldownUntil.set(input.threadId, this.now() + this.cooldownMs);
         this.unhealthyServers.set(input.threadId, latest.affectedServers);
-        const stillUnhealthy = new Set(latest.affectedServers);
-        const recovered = initiallyAffected.filter((name) => !stillUnhealthy.has(name));
-        return this.toResult(latest, recovered);
+        return this.toResult(latest, recoveredSinceInitial(latest.affectedServers));
     }
 
     private toResult(
@@ -209,8 +216,9 @@ export class CodexMcpRuntimeRecovery {
         const needsAuth = expected.filter((name) => {
             const startup = startupByName.get(name);
             const inventory = inventoryByName?.get(name);
-            return startup?.failureReason === 'reauthenticationRequired'
-                || inventory?.authStatus === 'notLoggedIn';
+            if (inventory?.authStatus === 'notLoggedIn') return true;
+            if (inventory && inventory.authStatus !== 'unknown') return false;
+            return startup?.failureReason === 'reauthenticationRequired';
         });
         const needsAuthNames = new Set(needsAuth);
 
