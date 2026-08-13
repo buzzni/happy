@@ -7,16 +7,17 @@
  * (parseAutoConnectParams), so opening the page IS the pairing.
  *
  * Deliberately does not launch or install Chrome — that stays the operator's
- * job (docs/browser-bridge-headless.md). This command's only value is turning
- * three failure modes that all look like "it just doesn't connect" into three
- * different messages.
+ * job (docs/browser-bridge-headless.md). This command's only value is telling
+ * apart the failures that all present as "it just doesn't connect": no daemon,
+ * no CDP, CDP but no /json/new, extension never loaded, loaded but no socket,
+ * and connected but the requested tier never applied.
  */
 
 import chalk from 'chalk'
 import { configuration } from '@/configuration'
 import { readDaemonState } from '@/persistence'
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken'
-import { fetchBrowserStatus } from '@/daemon/browserClient'
+import { fetchBrowserStatus, requestBrowser } from '@/daemon/browserClient'
 import { DEFAULT_BROWSER_BRIDGE_PORT } from '@/daemon/browserBridgeServer'
 import { resolveExtensionDir, resolveExtensionId } from './browser'
 
@@ -74,10 +75,16 @@ export interface PairOutcomeInput {
     cdpReachable: boolean
     /** A target belonging to our extension id was visible before we opened the page. */
     extensionLoaded: boolean
+    /** Chrome accepted /json/new for the pairing URL. */
+    pageOpened: boolean
     connections: Array<{ profile: string }>
+    /** What --debugger/--no-debugger asked for; absent when neither was given. */
+    debuggerTierRequested?: boolean
+    /** What the extension reports now. Absent when it could not be read. */
+    debuggerTierActual?: boolean
 }
 
-export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpReachable, extensionLoaded, connections }: PairOutcomeInput): { ok: boolean; text: string } {
+export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpReachable, extensionLoaded, pageOpened, connections, debuggerTierRequested, debuggerTierActual }: PairOutcomeInput): { ok: boolean; text: string } {
     // Ordered by what has to be true first: a later check failing while an
     // earlier prerequisite is missing would point at the wrong thing.
     if (!daemonRunning) {
@@ -102,12 +109,41 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
         }
     }
 
+    if (!pageOpened) {
+        return {
+            ok: false,
+            text: [
+                chalk.yellow(`Chrome은 응답하지만 페어링 페이지를 열지 못했습니다 (/json/new 거부).`),
+                chalk.dim('  --remote-debugging-address가 127.0.0.1이 아니거나, 다른 도구가'),
+                chalk.dim('  같은 포트의 CDP 세션을 독점하고 있는 경우입니다.'),
+            ].join('\n'),
+        }
+    }
+
     if (connections.length > 0) {
+        // The connection poll returns immediately when a profile was already
+        // paired, which is before the options page could have loaded — so a
+        // requested tier change has to be confirmed, not assumed.
+        if (debuggerTierRequested !== undefined && debuggerTierActual !== debuggerTierRequested) {
+            return {
+                ok: false,
+                text: [
+                    chalk.yellow(`연결은 됐지만 정밀 제어가 요청한 상태(${debuggerTierRequested ? '켬' : '끔'})로 바뀌지 않았습니다.`),
+                    chalk.dim(debuggerTierActual === undefined
+                        ? '  확장이 상태를 응답하지 않았습니다. 잠시 후 다시 실행해 보세요.'
+                        : `  현재 상태: ${debuggerTierActual ? '켬' : '끔'}. 옵션 페이지가 아직 로드 중일 수 있습니다.`),
+                    `  ${chalk.cyan('happy browser pair --debugger')} 를 다시 실행하세요.`,
+                ].join('\n'),
+            }
+        }
         return {
             ok: true,
             text: [
                 chalk.green(`페어링 완료 — 프로필 ${connections.length}개 연결됨`),
                 ...connections.map((connection) => `  • ${connection.profile}`),
+                ...(debuggerTierRequested === undefined
+                    ? []
+                    : [chalk.dim(`  정밀 제어: ${debuggerTierRequested ? '켬' : '끔'}`)]),
             ].join('\n'),
         }
     }
@@ -183,6 +219,31 @@ async function waitForConnection(controlPort: number, timeoutMs: number): Promis
     return connections
 }
 
+/**
+ * Read back what the extension actually stored, via the `capabilities`
+ * command it already answers.
+ *
+ * Necessary because the connection poll can return before the options page
+ * has loaded — an already-paired profile is connected the whole time — so
+ * "connected" is not evidence that `--debugger` took effect.
+ */
+async function waitForDebuggerTier(controlPort: number, expected: boolean): Promise<boolean | undefined> {
+    const deadline = Date.now() + 5_000
+    let actual: boolean | undefined
+    while (Date.now() < deadline) {
+        try {
+            const capabilities = await requestBrowser({ port: controlPort, method: 'capabilities', timeoutMs: 3_000 }) as { debugger?: boolean }
+            actual = capabilities?.debugger
+            if (actual === expected) return actual
+        } catch {
+            // Mid-reconnect the daemon has no socket to relay to. Keep the
+            // last reading and retry until the deadline.
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+    return actual
+}
+
 export async function handlePairCommand(args: string[]): Promise<void> {
     const options = parsePairArgs(args)
 
@@ -201,15 +262,22 @@ export async function handlePairCommand(args: string[]): Promise<void> {
     const cdpReachable = targetsBefore !== null
     const extensionLoaded = hasExtensionTarget(targetsBefore, extensionId)
 
+    let pageOpened = false
     let connections: Array<{ profile: string }> = []
+    let debuggerTierActual: boolean | undefined
     if (controlPort && cdpReachable) {
-        await openTab(options.cdpPort, buildPairUrl({
+        pageOpened = await openTab(options.cdpPort, buildPairUrl({
             extensionId,
             token,
             bridgePort: DEFAULT_BROWSER_BRIDGE_PORT,
             debuggerTier: options.debuggerTier,
         }))
-        connections = await waitForConnection(controlPort, 10_000)
+        if (pageOpened) {
+            connections = await waitForConnection(controlPort, 10_000)
+            if (connections.length > 0 && options.debuggerTier !== undefined) {
+                debuggerTierActual = await waitForDebuggerTier(controlPort, options.debuggerTier)
+            }
+        }
     }
 
     const outcome = formatPairOutcome({
@@ -218,7 +286,10 @@ export async function handlePairCommand(args: string[]): Promise<void> {
         daemonRunning: Boolean(controlPort),
         cdpReachable,
         extensionLoaded,
+        pageOpened,
         connections,
+        debuggerTierRequested: options.debuggerTier,
+        debuggerTierActual,
     })
     console.log('')
     console.log(outcome.text)

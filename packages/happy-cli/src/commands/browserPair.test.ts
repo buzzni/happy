@@ -52,6 +52,7 @@ describe('formatPairOutcome', () => {
         daemonRunning: true,
         cdpReachable: true,
         extensionLoaded: true,
+        pageOpened: true,
         connections: [{ profile: 'headless-1' }],
     }
 
@@ -88,5 +89,37 @@ describe('formatPairOutcome', () => {
         expect(outcome.ok).toBe(false)
         expect(outcome.text).not.toContain('--load-extension')
         expect(outcome.text).toContain('happy browser')
+    })
+
+    // Chrome answered on /json/list but refused /json/new. Without its own
+    // branch this fell through to a message that claims the page WAS opened,
+    // pointing the user at a token mismatch that is not the problem.
+    it('reports that the page could not be opened at all', () => {
+        const outcome = formatPairOutcome({ ...base, pageOpened: false, connections: [] })
+        expect(outcome.ok).toBe(false)
+        expect(outcome.text).toContain('/json/new')
+        expect(outcome.text).not.toContain('happy browser')
+    })
+
+    // The whole point of --debugger is that the user cannot check the toggle
+    // themselves on a headless box, so reporting success without verifying it
+    // is the one lie this command must not tell. An already-connected profile
+    // makes the connection poll return before the page has even loaded.
+    it('refuses to call it done when the requested debugger tier did not take', () => {
+        const outcome = formatPairOutcome({ ...base, debuggerTierRequested: true, debuggerTierActual: false })
+        expect(outcome.ok).toBe(false)
+        expect(outcome.text).toContain('정밀 제어')
+    })
+
+    it('confirms the debugger tier when it did take', () => {
+        const outcome = formatPairOutcome({ ...base, debuggerTierRequested: true, debuggerTierActual: true })
+        expect(outcome.ok).toBe(true)
+        expect(outcome.text).toContain('정밀 제어')
+    })
+
+    it('says nothing about the debugger tier when it was not asked for', () => {
+        const outcome = formatPairOutcome(base)
+        expect(outcome.ok).toBe(true)
+        expect(outcome.text).not.toContain('정밀 제어')
     })
 })
