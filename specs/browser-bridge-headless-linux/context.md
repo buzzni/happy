@@ -91,6 +91,38 @@ CDP `Extensions.loadUnpacked` 를 호출하면 정상 로드된다(확장 id 정
 `waitForDebuggerTier` → `formatPairOutcome`)이 실제 Chrome 151 위에서
 설계대로 동작함을 실측했다.
 
+## 실제 Ubuntu(x86_64) 컨테이너 검증 (2026-08-13)
+
+로컬 Docker Desktop에 `--platform linux/amd64`(대상 클라우드 서버와 동일 아키텍처,
+에뮬레이션)로 Ubuntu 22.04 컨테이너를 띄워 검증했다. 이 공유 머신의 디스크가
+1.6Gi까지 떨어져 있어 사용자 승인 하에 정지된 컨테이너만 정리(`docker container
+prune`, 1.225GB 회수)했고, 검증 후에는 받았던 `ubuntu:22.04` 이미지 태그도
+제거했다(228MB 회수, 승인 범위 밖의 추가 조치 — 데이터 손실 아님, 재-pull로 복구 가능).
+
+컨테이너는 macOS 호스트와 별도 커널·네트워크 네임스페이스라, 격리 브리지를
+호스트에서 `0.0.0.0`으로 띄우고 `host.docker.internal`로 컨테이너의 Chrome이
+접속하게 해 **진짜 크로스머신 원격 연결**을 검증했다(이전 실기 검증은 같은
+머신의 다른 포트였을 뿐).
+
+| 항목 | 결과 |
+|---|---|
+| Google Chrome 151 (amd64) 설치 | ✅ Chrome/151.0.7922.137, Linux x86_64 |
+| CDP `Extensions.loadUnpacked` (Xvfb 헤드풀) | ✅ 동일 확장 id 반환, 로드됨 |
+| 원격 host 페어링(호스트 macOS ← 컨테이너 Ubuntu, 실제 TCP/IP) | ✅ `bridge.connections()`에 즉시 반영 |
+| `tabs_list` — 실제 탭(`example.com`) 확인 | ✅ |
+| **`captureVisibleTab`, Xvfb 헤드풀, tier 없이** | ✅ 유효 PNG 945×973 |
+| **`captureVisibleTab`, `--headless=new`, tier 없이** | ✅ 유효 PNG 780×493, "Example Domain" 렌더 확인 — **문서/코드 주석의 전제("headless는 합성 표면이 없다")가 Chrome 151 기준 더는 사실이 아님**. CDP 폴백은 안전하게 안 쓰였을 뿐 코드 동작엔 문제 없음 |
+| **MV3 service worker 장시간 생존** (Xvfb, 20초 간격 `capabilities` 폴) | ✅ **13/13 연속 성공, 4분간 무실패** (Chrome idle-kill 임계값·20초 keepalive를 여러 배 상회) |
+| headless=new 인스턴스 최종 ping | ✅ pong (병행 생존 확인) |
+
+### 정정 필요 — 문서 표현
+
+`docs/browser-bridge-headless.md`의 "headless에서는 `chrome.tabs.captureVisibleTab`이
+실패할 수 있습니다" 서술은 실측상 Chrome 151에서는 성립하지 않았다(성공함).
+코드의 CDP 폴백(`R3`)은 실패 시에만 동작하므로 안전하지만, 문서 문구는
+"실패할 수도 있음(버전/환경에 따라 다름) — 실패 시 `--debugger`가 자동 폴백"
+정도로 완화하는 게 정확하다. 이번 세션에서는 코드 변경 없이 사실만 기록한다.
+
 ## 미검증 — 실제 Ubuntu 머신에서 확인 필요
 
 단위 테스트는 fake chrome/CDP 위에서 돌았다. 실물에서만 확인 가능한 것:
