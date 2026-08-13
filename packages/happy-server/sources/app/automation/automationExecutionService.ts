@@ -313,6 +313,7 @@ export async function reportAutomationRun(
         outcome: AutomationRunOutcome;
         sessionId: string | null;
         detailCiphertext: Binary | null;
+        failureCode: string | null;
     },
     now: Date = new Date(),
 ): Promise<Result<{ idempotent: boolean; status: string; outcome: AutomationRunOutcome | null }>> {
@@ -327,6 +328,9 @@ export async function reportAutomationRun(
         return { ok: false, error: 'run-not-running' };
     }
     if ((input.status === 'FAILED') !== (input.outcome === 'ERROR')) {
+        return { ok: false, error: 'report-conflict' };
+    }
+    if (input.outcome !== 'ERROR' && input.failureCode !== null) {
         return { ok: false, error: 'report-conflict' };
     }
     if ((input.outcome === 'WOKE' || input.outcome === 'SILENT') && !input.sessionId) {
@@ -349,6 +353,7 @@ export async function reportAutomationRun(
                 outcome: input.outcome,
                 sessionId: input.sessionId,
                 detailCiphertext: input.detailCiphertext,
+                failureCode: input.failureCode,
                 completedAt: now,
                 lateReport: run.status === 'ABANDONED'
                     || (run.runLeaseExpiresAt !== null && run.runLeaseExpiresAt < now),

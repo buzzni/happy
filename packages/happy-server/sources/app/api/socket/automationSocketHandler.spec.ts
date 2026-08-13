@@ -58,4 +58,31 @@ describe('automationSocketHandler', () => {
             changes: [expect.objectContaining({ payloadCiphertext: 'AQ==', machineKeyEnvelope: 'Ag==' })],
         }) });
     });
+
+    it('accepts a safe automation failure code and rejects unstructured values', async () => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        services.reportAutomationRun.mockResolvedValue({ ok: true, value: { idempotent: false } });
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+
+        const accepted = vi.fn();
+        await handlers.get('automation-run-report')!({
+            runId: 'run-1', claimToken: 'claim', reportId: 'report-1', status: 'FAILED',
+            outcome: 'ERROR', sessionId: null, detailCiphertext: null,
+            failureCode: 'CONNECTOR_RUNTIME_UNAVAILABLE',
+        }, accepted);
+        expect(services.reportAutomationRun).toHaveBeenCalledWith(
+            {}, 'account-1', 'machine-1', expect.objectContaining({
+                failureCode: 'CONNECTOR_RUNTIME_UNAVAILABLE',
+            }),
+        );
+
+        const rejected = vi.fn();
+        await handlers.get('automation-run-report')!({
+            runId: 'run-2', claimToken: 'claim', reportId: 'report-2', status: 'FAILED',
+            outcome: 'ERROR', sessionId: null, detailCiphertext: null,
+            failureCode: 'secret: do not log',
+        }, rejected);
+        expect(rejected).toHaveBeenCalledWith({ ok: false, error: 'invalid-input' });
+    });
 });

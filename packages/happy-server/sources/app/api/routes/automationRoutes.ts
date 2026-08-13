@@ -77,6 +77,7 @@ function serializeRun(row: AutomationRun) {
         sessionId: row.sessionId,
         outcome: row.outcome,
         detailCiphertext: row.detailCiphertext ? Buffer.from(row.detailCiphertext).toString('base64') : null,
+        failureCode: row.failureCode,
         claimedAt: row.claimedAt.getTime(),
         startedAt: row.startedAt?.getTime() ?? null,
         completedAt: row.completedAt?.getTime() ?? null,

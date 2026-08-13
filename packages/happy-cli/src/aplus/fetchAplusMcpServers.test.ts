@@ -54,6 +54,33 @@ describe('fetchAplusMcpServersResult', () => {
         }
     });
 
+    it('uses an explicit automation context without copying credentials into process env', async () => {
+        const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+            mcpServers: { gmail: { type: 'http', url: 'https://saycode.test/mcp/connector/gmail' } },
+        }), { status: 200 }));
+        vi.stubGlobal('fetch', fetchMock);
+
+        await expect(fetchAplusMcpServersResult('company-token', 'machine-1', {
+            configUrl: 'https://saycode.test/api/me/mcp-config',
+            projectId: 'project-1',
+            callerGrant: 'automation-grant',
+            expectedConnectors: ['gmail'],
+            sessionId: 'session-1',
+            lifecycle: 'spawn',
+        })).resolves.toMatchObject({ ok: true, servers: { gmail: expect.anything() } });
+
+        expect(fetchMock).toHaveBeenCalledWith(
+            'https://saycode.test/api/me/mcp-config?project_id=project-1',
+            expect.objectContaining({
+                headers: expect.objectContaining({
+                    'X-Aplus-Caller-Grant': 'automation-grant',
+                    'X-Aplus-Expected-Connectors': 'gmail',
+                }),
+            }),
+        );
+        expect(process.env.HAPPY_APLUS_MCP_CALLER_GRANT).toBeUndefined();
+    });
+
     it('distinguishes an HTTP failure without exposing the bearer token', async () => {
         vi.stubGlobal('fetch', vi.fn(async () => new Response('unavailable', { status: 503 })));
 

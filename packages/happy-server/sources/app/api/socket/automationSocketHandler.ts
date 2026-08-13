@@ -117,6 +117,11 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         const outcomes = ['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR'] as const;
         const outcome = outcomes.find((candidate) => candidate === data?.outcome);
         if (!status || !outcome) throw new Error('invalid-input');
+        const failureCode = data?.failureCode === null || data?.failureCode === undefined
+            ? null
+            : typeof data?.failureCode === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(data.failureCode)
+                ? data.failureCode
+                : (() => { throw new Error('invalid-input'); })();
         return inTx((tx) => reportAutomationRun(tx, accountId, machineId, {
             runId: requiredString(data?.runId),
             claimToken: requiredString(data?.claimToken),
@@ -125,6 +130,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
             outcome,
             sessionId: data?.sessionId === null ? null : requiredString(data?.sessionId),
             detailCiphertext: data?.detailCiphertext === null ? null : bytes(data?.detailCiphertext, 128 * 1024),
+            failureCode,
         }));
     }, () => emitAutomationUpdate(accountId, {
             projectId: null,

@@ -110,6 +110,7 @@ import {
   linkAutomationProjectSession,
   type AutomationMcpSpawnContext,
 } from './automations/automationMcpCallerGrant';
+import { preflightAutomationConnectors } from './automations/automationConnectorPreflight';
 import { resolveAllowedRoot } from '@/modules/common/resolveAllowedRoot';
 import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
@@ -1487,6 +1488,7 @@ export async function startDaemon(): Promise<void> {
         agent: 'claude' | 'codex' | 'gemini' | 'openclaw' | 'opencode';
         permissionMode?: 'read-only';
         mcpSpawnContext?: AutomationMcpSpawnContext;
+        expectedConnectors?: string[];
         environmentVariables?: Record<string, string>;
       },
     ): Promise<{ ok: true; sessionId: string } | { ok: false; error: string }> => {
@@ -1501,6 +1503,7 @@ export async function startDaemon(): Promise<void> {
         // 저장하지 않는다 — credentials-at-rest 금지). 귀속 표시만 넘긴다.
         createdByAccountId: input.createdByAccountId ?? undefined,
         environmentVariables: input.environmentVariables,
+        expectedConnectors: input.expectedConnectors,
       }, input.mcpSpawnContext);
       if (result.type === 'success') {
         return { ok: true, sessionId: result.sessionId };
@@ -1676,6 +1679,13 @@ export async function startDaemon(): Promise<void> {
           runId,
           claimToken,
           logDebug: (message) => logger.debug(`[DAEMON RUN] [server-automation] ${message}`),
+        }),
+        preflightMcpConnectors: ({ runId, context }) => preflightAutomationConnectors({
+          configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+          machineToken: credentials.token,
+          machineId,
+          runId,
+          context,
         }),
         linkSession: ({ runId, claimToken, sessionId }) => linkAutomationProjectSession({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,

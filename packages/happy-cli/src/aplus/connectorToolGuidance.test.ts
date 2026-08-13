@@ -7,6 +7,8 @@ describe('buildConnectorToolGuidance', () => {
 
         expect(guidance).toContain('gmail, knoi');
         expect(guidance).toContain('deferred MCP tool discovery');
+        expect(guidance).toContain('same-named claude.ai connector is a different integration');
+        expect(guidance).toContain('Do not recommend claude.ai connector reauthorization');
         expect(guidance).toContain('Do not claim that the integration is unsupported');
         expect(guidance).toContain('browser fallback');
         expect(guidance).not.toContain('account');
