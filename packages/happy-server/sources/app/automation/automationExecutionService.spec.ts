@@ -251,7 +251,7 @@ describe('automationExecutionService', () => {
         });
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
-            outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,
+            outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null, failureCode: null,
         }, now)).resolves.toEqual({ ok: true, value: expect.objectContaining({ idempotent: true }) });
         expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
     });
@@ -261,7 +261,7 @@ describe('automationExecutionService', () => {
         tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
-            outcome: 'WOKE', sessionId: 'foreign-session', detailCiphertext: null,
+            outcome: 'WOKE', sessionId: 'foreign-session', detailCiphertext: null, failureCode: null,
         }, now)).resolves.toEqual({ ok: false, error: 'report-conflict' });
         expect(tx.session.findFirst).toHaveBeenCalledWith({
             where: { id: 'foreign-session', accountId: 'account-1' }, select: { id: true },
@@ -275,7 +275,7 @@ describe('automationExecutionService', () => {
 
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
-            outcome, sessionId: null, detailCiphertext: null,
+            outcome, sessionId: null, detailCiphertext: null, failureCode: null,
         }, now)).resolves.toEqual({ ok: false, error: 'report-conflict' });
         expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
     });
@@ -290,7 +290,7 @@ describe('automationExecutionService', () => {
 
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-used-by-another-run', status: 'COMPLETED',
-            outcome: 'WOKE', sessionId: null, detailCiphertext: null,
+            outcome: 'WOKE', sessionId: null, detailCiphertext: null, failureCode: null,
         }, now)).resolves.toEqual({ ok: false, error: 'report-conflict' });
     });
 
@@ -304,10 +304,27 @@ describe('automationExecutionService', () => {
 
         await reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
-            outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,
+            outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null, failureCode: null,
         }, now);
         expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
             data: expect.objectContaining({ lateReport: true }),
+        }));
+    });
+
+    it('persists a safe precondition failure code with a failed run', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({
+            id: 'run-1', status: 'RUNNING', reportId: null, runLeaseExpiresAt: new Date(now.getTime() + 1_000),
+        });
+
+        await reportAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'FAILED',
+            outcome: 'ERROR', sessionId: null, detailCiphertext: null,
+            failureCode: 'TOOL_INVENTORY_EMPTY',
+        }, now);
+
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ failureCode: 'TOOL_INVENTORY_EMPTY' }),
         }));
     });
 
@@ -319,7 +336,7 @@ describe('automationExecutionService', () => {
         tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status,
-            outcome, sessionId: null, detailCiphertext: null,
+            outcome, sessionId: null, detailCiphertext: null, failureCode: null,
         }, now)).resolves.toEqual({ ok: false, error: 'report-conflict' });
         expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
     });

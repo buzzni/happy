@@ -85,9 +85,13 @@ export function mcpConfigFailureStatuses(
 
 const TIMEOUT_MS = 3000
 
-type McpFetchContext = {
+export type McpFetchContext = {
     sessionId?: string
     lifecycle?: 'spawn' | 'resume' | 'turn'
+    configUrl?: string
+    projectId?: string
+    callerGrant?: string
+    expectedConnectors?: string[]
 }
 
 function readExpectedNames(envName: string): string[] {
@@ -159,8 +163,8 @@ export async function fetchAplusMcpConfigSnapshot(
     machineId: string,
     context: McpFetchContext = {},
 ): Promise<AplusMcpConfigSnapshot> {
-    const configUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL
-    if (!configUrl) {
+    const configuredUrl = context.configUrl ?? process.env.HAPPY_APLUS_MCP_CONFIG_URL
+    if (!configuredUrl) {
         logger.debug('[aplus] HAPPY_APLUS_MCP_CONFIG_URL 미설정 — aplus MCP 자동등록 skip')
         return snapshot({ ok: false, reason: 'not-configured', error: 'mcp-config URL is not configured' })
     }
@@ -168,8 +172,16 @@ export async function fetchAplusMcpConfigSnapshot(
         logger.debug('[aplus] machineId 없음 — aplus MCP 자동등록 skip')
         return snapshot({ ok: false, reason: 'missing-machine-id', error: 'machineId is missing' })
     }
-    const callerGrant = process.env.HAPPY_APLUS_MCP_CALLER_GRANT
-    const expected = readExpectedConnectors()
+    let configUrl: string
+    try {
+        const parsed = new URL(configuredUrl)
+        if (context.projectId) parsed.searchParams.set('project_id', context.projectId)
+        configUrl = parsed.toString()
+    } catch {
+        return snapshot({ ok: false, reason: 'not-configured', error: 'mcp-config URL is invalid' })
+    }
+    const callerGrant = context.callerGrant ?? process.env.HAPPY_APLUS_MCP_CALLER_GRANT
+    const expected = context.expectedConnectors ?? readExpectedConnectors()
     const sessionId = correlationValue(context.sessionId)
     const lifecycle = context.lifecycle
         ?? (process.env.HAPPY_APLUS_MCP_INITIAL_LIFECYCLE === 'resume' ? 'resume' : undefined)

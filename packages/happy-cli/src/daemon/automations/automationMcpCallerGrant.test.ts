@@ -8,7 +8,7 @@ import {
 describe('exchangeAutomationMcpCallerGrant', () => {
   afterEach(() => vi.unstubAllGlobals())
 
-  it('returns no context when the daemon has no trusted Aplus MCP URL, and says why', async () => {
+  it('fails preflight when the daemon has no trusted Aplus MCP URL, and says why', async () => {
     const logDebug = vi.fn()
     await expect(exchangeAutomationMcpCallerGrant({
       configUrl: undefined,
@@ -17,13 +17,14 @@ describe('exchangeAutomationMcpCallerGrant', () => {
       runId: 'R-1',
       claimToken: 'claim-token',
       logDebug,
-    })).resolves.toEqual({ ok: true, value: null })
+    })).resolves.toEqual({ ok: false, error: 'Aplus MCP config URL is not configured' })
     expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('HAPPY_APLUS_MCP_CONFIG_URL'))
   })
 
   it('exchanges the run claim without exposing it in the config URL', async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({
       grant: 'SIGNED-GRANT', projectId: 'P-1', expiresAt: Date.now() + 60_000,
+      bindingStatus: 'BOUND', connectorPolicy: 'required', requiredConnectors: ['gmail'],
     }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
     vi.stubGlobal('fetch', fetchMock)
 
@@ -35,7 +36,10 @@ describe('exchangeAutomationMcpCallerGrant', () => {
       claimToken: 'claim-token',
     })).resolves.toEqual({
       ok: true,
-      value: { mcpCallerGrant: 'SIGNED-GRANT', mcpConfigProjectId: 'P-1' },
+      value: {
+        mcpCallerGrant: 'SIGNED-GRANT', mcpConfigProjectId: 'P-1',
+        bindingStatus: 'BOUND', connectorPolicy: 'required', requiredConnectors: ['gmail'],
+      },
     })
     expect(fetchMock).toHaveBeenCalledWith(
       'https://saycode.ai/api/automation/mcp-caller-grant',
@@ -49,11 +53,12 @@ describe('exchangeAutomationMcpCallerGrant', () => {
 
   // specs/automation-company-owner-identity R2 — 회사 happy 계정 소유
   // 자동화는 개인 커넥터 대상 사용자가 없어 서버가 no-grant 로 응답한다.
-  // 이는 "grant 없이 정상 진행" 신호이지 오류가 아니다.
-  it('accepts an explicit no-grant response for a company-owned automation', async () => {
-    const logDebug = vi.fn()
+  // 후속 R12~R14에서는 no-grant도 정책과 함께 전달되어 executor가 fail-closed
+  // 여부를 결정한다.
+  it('preserves explicit no-grant policy metadata for executor preflight', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
-      grant: null, projectId: 'P-1',
+      grant: null, projectId: 'P-1', bindingStatus: 'BOUND',
+      connectorPolicy: 'optional', requiredConnectors: ['gmail'],
     }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
 
     await expect(exchangeAutomationMcpCallerGrant({
@@ -62,9 +67,13 @@ describe('exchangeAutomationMcpCallerGrant', () => {
       machineId: 'M-1',
       runId: 'R-1',
       claimToken: 'claim-token',
-      logDebug,
-    })).resolves.toEqual({ ok: true, value: null })
-    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('no personal grant'))
+    })).resolves.toEqual({
+      ok: true,
+      value: {
+        mcpConfigProjectId: 'P-1', bindingStatus: 'BOUND',
+        connectorPolicy: 'optional', requiredConnectors: ['gmail'],
+      },
+    })
   })
 
   it.each([
@@ -87,6 +96,30 @@ describe('exchangeAutomationMcpCallerGrant', () => {
     })
 
     expect(result.ok).toBe(false)
+  })
+
+  it.each([
+    [409, 'AUTOMATION_EXECUTION_UNBOUND', 'EXECUTION_PRINCIPAL_UNBOUND'],
+    [403, 'EXECUTION_PRINCIPAL_ACCESS_REVOKED', 'EXECUTION_PRINCIPAL_ACCESS_REVOKED'],
+  ])('preserves safe principal precondition code from an exchange %s', async (
+    status, responseCode, expectedCode,
+  ) => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: responseCode }), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(exchangeAutomationMcpCallerGrant({
+      configUrl: 'https://saycode.ai/api/me/mcp-config',
+      machineToken: 'machine-token',
+      machineId: 'M-1',
+      runId: 'R-1',
+      claimToken: 'claim-token',
+    })).resolves.toEqual({
+      ok: false,
+      error: `caller grant exchange returned ${status}`,
+      code: expectedCode,
+    })
   })
 
   it('links the spawned session with the same run claim proof', async () => {

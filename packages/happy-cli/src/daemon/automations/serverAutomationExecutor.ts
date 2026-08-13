@@ -14,6 +14,7 @@ import type {
   ServerAutomationRuntimeStore,
 } from './serverAutomationRuntimeStore'
 import type { AutomationMcpCallerGrantResult, AutomationMcpSpawnContext } from './automationMcpCallerGrant'
+import type { AutomationConnectorPreflightResult } from './automationConnectorPreflight'
 import type {
   AutomationAgentTaskDispatch,
   AutomationAgentTaskEvent,
@@ -70,6 +71,10 @@ export interface ServerAutomationExecutorInput {
     runId: string
     claimToken: string
   }) => Promise<AutomationMcpCallerGrantResult>
+  preflightMcpConnectors: (input: {
+    runId: string
+    context: AutomationMcpSpawnContext
+  }) => Promise<AutomationConnectorPreflightResult>
   linkSession: (input: {
     runId: string
     claimToken: string
@@ -92,6 +97,7 @@ export interface ServerAutomationExecutorInput {
     agent: AutomationAgent
     permissionMode?: 'read-only'
     mcpSpawnContext?: AutomationMcpSpawnContext
+    expectedConnectors?: string[]
     environmentVariables?: Record<string, string>
   }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
   isSessionRunning: (sessionId: string) => boolean
@@ -259,7 +265,11 @@ async function executeStartedRun(
   automation: EncryptedServerAutomation,
   payload: ServerAutomationPayload,
   run: { runId: string; claimToken: string },
-): Promise<{ outcome: ServerAutomationReportOutcome; sessionId: string | null }> {
+): Promise<{
+  outcome: ServerAutomationReportOutcome
+  sessionId: string | null
+  failureCode?: string
+}> {
   let prompt = payload.prompt
   let environmentVariables: Record<string, string> | undefined
   let agentTaskDispatch: AutomationAgentTaskDispatch | null = null
@@ -367,9 +377,45 @@ async function executeStartedRun(
     ? { ok: true as const, value: null }
     : await input.resolveMcpSpawnContext(run)
   if (!mcpContext.ok) {
-    // specs/automation-company-owner-identity R1 — grant 실패는 개인 커넥터에만
-    // fail closed 하고 자동화 실행 자체는 계속한다 (grant 미주입 = 커넥터 없음).
-    input.logDebug?.(`[server-automation] ${automation.automationId} MCP caller grant failed: ${mcpContext.error}; spawning without personal connectors`)
+    input.logDebug?.(
+      `[server-automation] run=${run.runId} automation=${automation.automationId}`
+      + ` precondition=${mcpContext.code ?? 'GRANT_EXCHANGE_FAILED'} detail=${mcpContext.error}`,
+    )
+    return {
+      outcome: 'ERROR',
+      sessionId: null,
+      failureCode: mcpContext.code ?? 'GRANT_EXCHANGE_FAILED',
+    }
+  }
+  let spawnMcpContext: AutomationMcpSpawnContext | undefined
+  let expectedConnectors: string[] | undefined
+  if (!agentTaskDispatch) {
+    const context = mcpContext.value
+    if (!context || context.connectorPolicy === 'unspecified') {
+      input.logDebug?.(`[server-automation] run=${run.runId} automation=${automation.automationId} precondition=POLICY_UNSPECIFIED`)
+      return { outcome: 'ERROR', sessionId: null, failureCode: 'POLICY_UNSPECIFIED' }
+    }
+    expectedConnectors = context.requiredConnectors
+    if (context.connectorPolicy !== 'none') {
+      const preflight = await input.preflightMcpConnectors({ runId: run.runId, context })
+      if (!preflight.ok) {
+        input.logDebug?.(
+          `[server-automation] run=${run.runId} automation=${automation.automationId} precondition=${preflight.code}`
+          + ` providers=${preflight.unavailableConnectors.join(',') || '(none)'}`,
+        )
+        if (context.connectorPolicy === 'required') {
+          return { outcome: 'ERROR', sessionId: null, failureCode: preflight.code }
+        }
+      } else {
+        input.logDebug?.(
+          `[server-automation] run=${run.runId} automation=${automation.automationId}`
+          + ` binding=${context.bindingStatus} policy=${context.connectorPolicy}`
+          + ` required=${context.requiredConnectors.join(',') || '(none)'}`
+          + ` inventory=${preflight.availableConnectors.join(',') || '(none)'} preflight=ready`,
+        )
+        spawnMcpContext = context
+      }
+    }
   }
   const initialPrompt = buildAutomationPrompt(prompt, scriptOutput)
   const spawnInput = {
@@ -379,7 +425,8 @@ async function executeStartedRun(
     agent: payload.agent ?? 'claude',
     ...(agentTaskDispatch?.type === 'pr_review.v1' ? { permissionMode: 'read-only' as const } : {}),
     ...(environmentVariables ? { environmentVariables } : {}),
-    ...(mcpContext.ok && mcpContext.value ? { mcpSpawnContext: mcpContext.value } : {}),
+    ...(spawnMcpContext ? { mcpSpawnContext: spawnMcpContext } : {}),
+    ...(expectedConnectors && expectedConnectors.length > 0 ? { expectedConnectors } : {}),
   }
   let spawned: { ok: true; sessionId: string } | { ok: false; error: string }
   let associateSpawnedSession = true
@@ -479,7 +526,11 @@ export async function runServerAutomationTick(
         input.logDebug?.(`[server-automation] heartbeat failed: ${error}`)
       })
     }, HEARTBEAT_MS)
-    let result: { outcome: ServerAutomationReportOutcome; sessionId: string | null }
+    let result: {
+      outcome: ServerAutomationReportOutcome
+      sessionId: string | null
+      failureCode?: string
+    }
     try {
       if (payload.githubTrigger?.action !== 'notify'
         && schedule.lastSessionId
@@ -493,7 +544,7 @@ export async function runServerAutomationTick(
       }
     } catch (error) {
       input.logDebug?.(`[server-automation] ${automation.automationId} failed: ${error}`)
-      result = { outcome: 'ERROR', sessionId: null }
+      result = { outcome: 'ERROR', sessionId: null, failureCode: 'AUTOMATION_EXECUTION_FAILED' }
     } finally {
       clearInterval(heartbeat)
     }
@@ -510,6 +561,7 @@ export async function runServerAutomationTick(
       outcome: result.outcome,
       sessionId: result.sessionId,
       detailCiphertext: null,
+      failureCode: result.failureCode ?? null,
       createdAt: input.now,
     }
     const state = input.runtimeStore.read()

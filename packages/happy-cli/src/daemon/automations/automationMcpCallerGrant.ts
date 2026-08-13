@@ -1,11 +1,18 @@
 export type AutomationMcpSpawnContext = {
-  mcpCallerGrant: string
+  mcpCallerGrant?: string
   mcpConfigProjectId: string
+  bindingStatus: 'BOUND' | 'DIRECT_OWNER'
+  connectorPolicy: 'required' | 'optional' | 'none' | 'unspecified'
+  requiredConnectors: string[]
 }
 
 export type AutomationMcpCallerGrantResult =
   | { ok: true; value: AutomationMcpSpawnContext | null }
-  | { ok: false; error: string }
+  | {
+    ok: false
+    error: string
+    code?: 'EXECUTION_PRINCIPAL_UNBOUND' | 'EXECUTION_PRINCIPAL_ACCESS_REVOKED'
+  }
 
 const EXCHANGE_TIMEOUT_MS = 3_000
 
@@ -15,10 +22,31 @@ function parseExchangeResponse(value: unknown): { context: AutomationMcpSpawnCon
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const row = value as Record<string, unknown>
   if (typeof row.projectId !== 'string' || !row.projectId) return null
-  if (row.grant === null) return { context: null }
-  if (typeof row.grant !== 'string' || !row.grant) return null
-  if (typeof row.expiresAt !== 'number' || !Number.isFinite(row.expiresAt) || row.expiresAt <= Date.now()) return null
-  return { context: { mcpCallerGrant: row.grant, mcpConfigProjectId: row.projectId } }
+  const bindingStatus = row.bindingStatus === 'BOUND' || row.bindingStatus === 'DIRECT_OWNER'
+    ? row.bindingStatus
+    : 'DIRECT_OWNER'
+  const connectorPolicy = row.connectorPolicy === 'required'
+    || row.connectorPolicy === 'optional' || row.connectorPolicy === 'none'
+    ? row.connectorPolicy
+    : 'unspecified'
+  const requiredConnectors = Array.isArray(row.requiredConnectors)
+    && row.requiredConnectors.every((entry) =>
+      typeof entry === 'string' && /^[a-z0-9-]{1,64}$/.test(entry))
+    ? [...new Set(row.requiredConnectors as string[])].sort()
+    : []
+  if (row.grant !== null && (typeof row.grant !== 'string' || !row.grant)) return null
+  if (typeof row.grant === 'string'
+    && (typeof row.expiresAt !== 'number' || !Number.isFinite(row.expiresAt)
+      || row.expiresAt <= Date.now())) return null
+  return {
+    context: {
+      ...(typeof row.grant === 'string' ? { mcpCallerGrant: row.grant } : {}),
+      mcpConfigProjectId: row.projectId,
+      bindingStatus,
+      connectorPolicy,
+      requiredConnectors,
+    },
+  }
 }
 
 export async function exchangeAutomationMcpCallerGrant(input: {
@@ -31,7 +59,7 @@ export async function exchangeAutomationMcpCallerGrant(input: {
 }): Promise<AutomationMcpCallerGrantResult> {
   if (!input.configUrl) {
     input.logDebug?.('MCP caller grant skipped: HAPPY_APLUS_MCP_CONFIG_URL is not set on this daemon')
-    return { ok: true, value: null }
+    return { ok: false, error: 'Aplus MCP config URL is not configured' }
   }
 
   let exchangeUrl: string
@@ -58,14 +86,21 @@ export async function exchangeAutomationMcpCallerGrant(input: {
       signal: controller.signal,
     })
     if (!response.ok) {
-      return { ok: false, error: `caller grant exchange returned ${response.status}` }
+      const body = await response.json().catch(() => null) as { error?: unknown } | null
+      const code = response.status === 409 && body?.error === 'AUTOMATION_EXECUTION_UNBOUND'
+        ? 'EXECUTION_PRINCIPAL_UNBOUND' as const
+        : response.status === 403 && body?.error === 'EXECUTION_PRINCIPAL_ACCESS_REVOKED'
+          ? 'EXECUTION_PRINCIPAL_ACCESS_REVOKED' as const
+          : undefined
+      return {
+        ok: false,
+        error: `caller grant exchange returned ${response.status}`,
+        ...(code ? { code } : {}),
+      }
     }
     const parsed = parseExchangeResponse(await response.json())
     if (!parsed) {
       return { ok: false, error: 'caller grant exchange returned an invalid response' }
-    }
-    if (!parsed.context) {
-      input.logDebug?.('MCP caller grant: server returned no personal grant for this run (company-owned automation)')
     }
     return { ok: true, value: parsed.context }
   } catch {

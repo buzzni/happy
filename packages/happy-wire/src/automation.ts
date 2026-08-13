@@ -141,6 +141,7 @@ export const automationRunSchema = z.object({
   sessionId: z.string().min(1).nullable(),
   outcome: automationRunOutcomeSchema.nullable(),
   detailCiphertext: base64Schema(PAYLOAD_MAX_BYTES).nullable(),
+  failureCode: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/).nullable().optional(),
   claimedAt: timestamp,
   startedAt: timestamp.nullable(),
   completedAt: timestamp.nullable(),

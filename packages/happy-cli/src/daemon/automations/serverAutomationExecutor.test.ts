@@ -56,7 +56,13 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
   }))
   const resolveMcpSpawnContext = vi.fn(async (): Promise<AutomationMcpCallerGrantResult> => ({
     ok: true as const,
-    value: { mcpCallerGrant: 'SIGNED-GRANT', mcpConfigProjectId: 'P-1' },
+    value: {
+      mcpCallerGrant: 'SIGNED-GRANT', mcpConfigProjectId: 'P-1', bindingStatus: 'BOUND',
+      connectorPolicy: 'required', requiredConnectors: ['gmail'],
+    },
+  }))
+  const preflightMcpConnectors = vi.fn<ServerAutomationExecutorInput['preflightMcpConnectors']>(async () => ({
+    ok: true as const, availableConnectors: ['gmail'],
   }))
   const linkSession = vi.fn(async (): Promise<{ ok: boolean; error?: string; skipped?: boolean }> => ({ ok: true }))
   const decryptPayload = vi.fn((_automation: EncryptedServerAutomation, _machineSecretKey: Uint8Array) => ({
@@ -80,6 +86,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     dispatchAgentTask,
     maintainAgentTaskLease,
     resolveMcpSpawnContext,
+    preflightMcpConnectors,
     linkSession,
     resumeSession,
     spawnSession,
@@ -90,7 +97,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
   return {
     input, store, transport, decryptPayload, logDebug, runScript, queryGithubPullRequests,
     notifyGithubTrigger, dispatchAgentTask, maintainAgentTaskLease,
-    resolveMcpSpawnContext, linkSession, resumeSession, spawnSession, now,
+    resolveMcpSpawnContext, preflightMcpConnectors, linkSession, resumeSession, spawnSession, now,
   }
 }
 
@@ -136,7 +143,7 @@ describe('runServerAutomationTick', () => {
   })
 
   it('runs only after claim and start, then durably retries the same completion report', async () => {
-    const { input, store, transport, resolveMcpSpawnContext, linkSession, spawnSession } = setup({
+    const { input, store, transport, resolveMcpSpawnContext, linkSession, spawnSession, logDebug } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token', claimExpiresAt: 1_100_000, serverTime: 1_000_000 } },
     })
     transport.report
@@ -148,7 +155,11 @@ describe('runServerAutomationTick', () => {
     expect(transport.start.mock.invocationCallOrder[0]).toBeLessThan(spawnSession.mock.invocationCallOrder[0]!)
     expect(resolveMcpSpawnContext).toHaveBeenCalledWith({ runId: 'run-1', claimToken: 'claim-token' })
     expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
-      mcpSpawnContext: { mcpCallerGrant: 'SIGNED-GRANT', mcpConfigProjectId: 'P-1' },
+      mcpSpawnContext: expect.objectContaining({
+        mcpCallerGrant: 'SIGNED-GRANT', mcpConfigProjectId: 'P-1',
+        connectorPolicy: 'required', requiredConnectors: ['gmail'],
+      }),
+      expectedConnectors: ['gmail'],
     }))
     expect(store.state().pendingReports).toEqual([expect.objectContaining({
       runId: 'run-1', claimToken: 'claim-token', reportId: 'report-1', outcome: 'WOKE',
@@ -162,6 +173,7 @@ describe('runServerAutomationTick', () => {
     })
     expect(store.state().pendingReports).toEqual([])
     expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(logDebug.mock.calls)).not.toContain('SIGNED-GRANT')
   })
 
   it('keeps a successful report durable until the spawned session is linked to its project', async () => {
@@ -233,13 +245,44 @@ describe('runServerAutomationTick', () => {
     expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('gave up'))
   })
 
-  // specs/automation-company-owner-identity R1 — grant 교환 실패는 개인
-  // 커넥터에만 fail closed 하고, 자동화 실행 자체는 죽이지 않는다.
-  it('spawns without personal connectors and reports WOKE when caller grant exchange fails', async () => {
+  it('fails before spawn when the execution policy cannot be resolved', async () => {
     const { input, transport, resolveMcpSpawnContext, spawnSession, logDebug } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
     })
-    resolveMcpSpawnContext.mockResolvedValue({ ok: false, error: 'caller grant exchange returned 404' })
+    resolveMcpSpawnContext.mockResolvedValue({
+      ok: false,
+      error: 'caller grant exchange returned 409',
+      code: 'EXECUTION_PRINCIPAL_UNBOUND',
+    })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'ERROR' },
+    ])
+
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('caller grant exchange returned 409'))
+    expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run-1', status: 'FAILED', outcome: 'ERROR', sessionId: null,
+      failureCode: 'EXECUTION_PRINCIPAL_UNBOUND',
+    }))
+  })
+
+  it('allows degraded spawn only for an optional connector policy', async () => {
+    const {
+      input, transport, resolveMcpSpawnContext, preflightMcpConnectors, spawnSession,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    resolveMcpSpawnContext.mockResolvedValue({
+      ok: true,
+      value: {
+        mcpConfigProjectId: 'P-1', bindingStatus: 'BOUND', connectorPolicy: 'optional',
+        requiredConnectors: ['gmail'],
+      },
+    })
+    preflightMcpConnectors.mockResolvedValue({
+      ok: false, code: 'GRANT_MISSING', unavailableConnectors: ['gmail'],
+    })
 
     await expect(runServerAutomationTick(input)).resolves.toEqual([
       { automationId: 'automation-1', outcome: 'WOKE' },
@@ -247,28 +290,27 @@ describe('runServerAutomationTick', () => {
 
     expect(spawnSession).toHaveBeenCalledTimes(1)
     expect(spawnSession.mock.calls[0]![0]).not.toHaveProperty('mcpSpawnContext')
-    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('caller grant exchange returned 404'))
+    expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({ expectedConnectors: ['gmail'] }))
     expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({
       runId: 'run-1', status: 'COMPLETED', outcome: 'WOKE', sessionId: 'session-1',
     }))
   })
 
-  // specs/automation-company-owner-identity R2 — 회사 소유 자동화의 명시적
-  // no-grant 응답은 오류가 아니라 "커넥터 없이 정상 진행" 이다.
-  it('spawns without personal connectors when the server explicitly returns no grant', async () => {
-    const { input, transport, resolveMcpSpawnContext, spawnSession } = setup({
+  it('blocks a required connector automation when tool inventory is unavailable', async () => {
+    const { input, preflightMcpConnectors, spawnSession, transport } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
     })
-    resolveMcpSpawnContext.mockResolvedValue({ ok: true, value: null })
+    preflightMcpConnectors.mockResolvedValue({
+      ok: false, code: 'TOOL_INVENTORY_EMPTY', unavailableConnectors: ['gmail'],
+    })
 
     await expect(runServerAutomationTick(input)).resolves.toEqual([
-      { automationId: 'automation-1', outcome: 'WOKE' },
+      { automationId: 'automation-1', outcome: 'ERROR' },
     ])
-
-    expect(spawnSession).toHaveBeenCalledTimes(1)
-    expect(spawnSession.mock.calls[0]![0]).not.toHaveProperty('mcpSpawnContext')
+    expect(spawnSession).not.toHaveBeenCalled()
     expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({
-      runId: 'run-1', status: 'COMPLETED', outcome: 'WOKE', sessionId: 'session-1',
+      status: 'FAILED', outcome: 'ERROR', sessionId: null,
+      failureCode: 'TOOL_INVENTORY_EMPTY',
     }))
   })
 

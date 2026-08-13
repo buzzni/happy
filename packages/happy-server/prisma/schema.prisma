@@ -563,6 +563,7 @@ model AutomationRun {
     sessionId         String?
     outcome           AutomationRunOutcome?
     detailCiphertext  Bytes?
+    failureCode       String?
     claimedAt         DateTime              @default(now())
     startedAt         DateTime?
     completedAt       DateTime?
