@@ -21,6 +21,11 @@ type McpHttpServerEntry = {
 
 export type AplusMcpServersMap = Record<string, McpHttpServerEntry>
 
+type MissingMcpService = {
+    name: string
+    reason: string
+}
+
 export type AplusMcpServersFetchResult =
     | { ok: true; servers: AplusMcpServersMap }
     | {
@@ -36,6 +41,14 @@ export type AplusMcpServersFetchResult =
         configured: string[]
         missing: string[]
     }
+    | {
+        ok: false
+        reason: 'mcp-config-missing'
+        error: string
+        expected: string[]
+        configured: string[]
+        missing: MissingMcpService[]
+    }
 
 export function mcpConfigFailureStatuses(
     result: AplusMcpServersFetchResult,
@@ -48,6 +61,16 @@ export function mcpConfigFailureStatuses(
         return result.missing.map((provider) => ({
             name: provider,
             status: 'connector-config-missing',
+            error: result.error,
+            checkedAt,
+        }))
+    }
+    if (result.reason === 'mcp-config-missing') {
+        return result.missing.map(({ name, reason }) => ({
+            name,
+            status: reason === 'connector-config-missing'
+                ? 'connector-config-missing'
+                : 'mcp-config-missing',
             error: result.error,
             checkedAt,
         }))
@@ -67,9 +90,9 @@ type McpFetchContext = {
     lifecycle?: 'spawn' | 'resume' | 'turn'
 }
 
-export function readExpectedConnectors(): string[] {
+function readExpectedNames(envName: string): string[] {
     try {
-        const parsed = JSON.parse(process.env.HAPPY_APLUS_EXPECTED_CONNECTORS ?? '[]') as unknown
+        const parsed = JSON.parse(process.env[envName] ?? '[]') as unknown
         if (!Array.isArray(parsed)) return []
         return [...new Set(parsed.filter(
             (provider): provider is string => typeof provider === 'string' && /^[a-z0-9-]{1,64}$/.test(provider),
@@ -77,6 +100,14 @@ export function readExpectedConnectors(): string[] {
     } catch {
         return []
     }
+}
+
+export function readExpectedConnectors(): string[] {
+    return readExpectedNames('HAPPY_APLUS_EXPECTED_CONNECTORS')
+}
+
+export function readExpectedMcpServices(): string[] {
+    return readExpectedNames('HAPPY_APLUS_EXPECTED_MCP_SERVICES')
 }
 
 function correlationValue(value: string | undefined): string | undefined {
@@ -92,19 +123,50 @@ function connectorNames(value: unknown): string[] | null {
     return [...new Set(value)].sort()
 }
 
-export async function fetchAplusMcpServersResult(
+function missingMcpServices(value: unknown): MissingMcpService[] | null {
+    if (!Array.isArray(value)) return null
+    const missing: MissingMcpService[] = []
+    for (const entry of value) {
+        if (!entry || typeof entry !== 'object') return null
+        const { name, reason } = entry as { name?: unknown; reason?: unknown }
+        if (
+            typeof name !== 'string'
+            || !/^[a-z0-9-]{1,64}$/.test(name)
+            || typeof reason !== 'string'
+            || !/^[a-z0-9-]{1,64}$/.test(reason)
+        ) {
+            return null
+        }
+        missing.push({ name, reason })
+    }
+    return missing
+}
+
+export type AplusMcpConfigSnapshot = {
+    result: AplusMcpServersFetchResult
+    servers: AplusMcpServersMap
+}
+
+function snapshot(
+    result: AplusMcpServersFetchResult,
+    servers: AplusMcpServersMap = {},
+): AplusMcpConfigSnapshot {
+    return { result, servers }
+}
+
+export async function fetchAplusMcpConfigSnapshot(
     token: string,
     machineId: string,
     context: McpFetchContext = {},
-): Promise<AplusMcpServersFetchResult> {
+): Promise<AplusMcpConfigSnapshot> {
     const configUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL
     if (!configUrl) {
         logger.debug('[aplus] HAPPY_APLUS_MCP_CONFIG_URL 미설정 — aplus MCP 자동등록 skip')
-        return { ok: false, reason: 'not-configured', error: 'mcp-config URL is not configured' }
+        return snapshot({ ok: false, reason: 'not-configured', error: 'mcp-config URL is not configured' })
     }
     if (!machineId) {
         logger.debug('[aplus] machineId 없음 — aplus MCP 자동등록 skip')
-        return { ok: false, reason: 'missing-machine-id', error: 'machineId is missing' }
+        return snapshot({ ok: false, reason: 'missing-machine-id', error: 'machineId is missing' })
     }
     const callerGrant = process.env.HAPPY_APLUS_MCP_CALLER_GRANT
     const expected = readExpectedConnectors()
@@ -113,7 +175,7 @@ export async function fetchAplusMcpServersResult(
         ?? (process.env.HAPPY_APLUS_MCP_INITIAL_LIFECYCLE === 'resume' ? 'resume' : undefined)
         ?? (process.env.HAPPY_APLUS_MCP_INITIAL_LIFECYCLE === 'spawn' ? 'spawn' : undefined)
 
-    for (let attempt = 0; attempt < (expected.length > 0 ? 2 : 1); attempt++) {
+    for (let attempt = 0; attempt < 2; attempt++) {
         const ctl = new AbortController()
         const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS)
         try {
@@ -131,22 +193,51 @@ export async function fetchAplusMcpServersResult(
             })
             if (!res.ok) {
                 logger.debug(`[aplus] mcp-config 응답 ${res.status} — skip`)
-                return { ok: false, reason: 'http-error', error: `mcp-config responded with ${res.status}` }
+                return snapshot({ ok: false, reason: 'http-error', error: `mcp-config responded with ${res.status}` })
             }
             const body = (await res.json()) as {
                 mcpServers?: AplusMcpServersMap
                 connectorReadiness?: { expected?: unknown }
+                mcpReadiness?: { expected?: unknown; configured?: unknown; missing?: unknown }
             }
             if (!body?.mcpServers || typeof body.mcpServers !== 'object') {
                 logger.debug('[aplus] mcp-config 응답에 mcpServers 없음 — skip')
-                return { ok: false, reason: 'invalid-response', error: 'mcp-config response is invalid' }
+                return snapshot({ ok: false, reason: 'invalid-response', error: 'mcp-config response is invalid' })
             }
             const keys = Object.keys(body.mcpServers)
             const authoritativeExpected = connectorNames(body.connectorReadiness?.expected)
-            const currentExpected = authoritativeExpected ?? expected
             if (authoritativeExpected) {
                 process.env.HAPPY_APLUS_EXPECTED_CONNECTORS = JSON.stringify(authoritativeExpected)
             }
+            const authoritativeMcpExpected = connectorNames(body.mcpReadiness?.expected)
+            const authoritativeMcpConfigured = connectorNames(body.mcpReadiness?.configured)
+            const authoritativeMcpMissing = missingMcpServices(body.mcpReadiness?.missing)
+            if (authoritativeMcpExpected) {
+                process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES = JSON.stringify(authoritativeMcpExpected)
+            }
+            if (
+                authoritativeMcpExpected
+                && authoritativeMcpConfigured
+                && authoritativeMcpMissing
+                && authoritativeMcpMissing.length > 0
+            ) {
+                const missingNames = authoritativeMcpMissing.map(({ name }) => name)
+                logger.debug(
+                    `[aplus] MCP topology mismatch expected=${authoritativeMcpExpected.join(',')}`
+                    + ` configured=${authoritativeMcpConfigured.join(',') || '(none)'}`
+                    + ` missing=${missingNames.join(',')} attempt=${attempt + 1}`,
+                )
+                if (attempt === 0) continue
+                return snapshot({
+                    ok: false,
+                    reason: 'mcp-config-missing',
+                    error: `Expected MCP service configuration is missing: ${missingNames.join(', ')}`,
+                    expected: authoritativeMcpExpected,
+                    configured: authoritativeMcpConfigured,
+                    missing: authoritativeMcpMissing,
+                }, body.mcpServers)
+            }
+            const currentExpected = authoritativeExpected ?? expected
             const configured = currentExpected.filter((provider) => keys.includes(provider))
             const missing = currentExpected.filter((provider) => !configured.includes(provider))
             if (missing.length > 0) {
@@ -156,31 +247,38 @@ export async function fetchAplusMcpServersResult(
                     + ` missing=${missing.join(',')} attempt=${attempt + 1}`,
                 )
                 if (attempt === 0) continue
-                return {
+                return snapshot({
                     ok: false,
                     reason: 'connector-config-missing',
                     error: `Expected connector configuration is missing: ${missing.join(', ')}`,
                     expected: currentExpected,
                     configured,
                     missing,
-                }
+                }, body.mcpServers)
             }
             logger.debug(`[aplus] mcp-config 받음 — 등록: ${keys.join(', ')}`)
-            return { ok: true, servers: body.mcpServers }
+            return snapshot({ ok: true, servers: body.mcpServers }, body.mcpServers)
         } catch {
             const timedOut = ctl.signal.aborted
             logger.debug(`[aplus] mcp-config fetch 실패 — skip: ${timedOut ? 'timeout' : 'network error'}`)
-            return timedOut
+            return snapshot(timedOut
                 ? { ok: false, reason: 'timeout', error: 'mcp-config request timed out' }
-                : { ok: false, reason: 'network-error', error: 'mcp-config network request failed' }
+                : { ok: false, reason: 'network-error', error: 'mcp-config network request failed' })
         } finally {
             clearTimeout(timer)
         }
     }
-    return { ok: false, reason: 'invalid-response', error: 'mcp-config response is invalid' }
+    return snapshot({ ok: false, reason: 'invalid-response', error: 'mcp-config response is invalid' })
+}
+
+export async function fetchAplusMcpServersResult(
+    token: string,
+    machineId: string,
+    context: McpFetchContext = {},
+): Promise<AplusMcpServersFetchResult> {
+    return (await fetchAplusMcpConfigSnapshot(token, machineId, context)).result
 }
 
 export async function fetchAplusMcpServers(token: string, machineId: string): Promise<AplusMcpServersMap> {
-    const result = await fetchAplusMcpServersResult(token, machineId)
-    return result.ok ? result.servers : {}
+    return (await fetchAplusMcpConfigSnapshot(token, machineId)).servers
 }

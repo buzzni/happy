@@ -1,19 +1,21 @@
 import { parseAllowlist } from './allowlist.js'
 import { parseAutoConnectParams } from './autoConnect.js'
 
+const hostInput = document.getElementById('host')
 const portInput = document.getElementById('port')
 const tokenInput = document.getElementById('token')
 const profileInput = document.getElementById('profile')
 const allowlistInput = document.getElementById('allowlist')
 const status = document.getElementById('status')
 
-const stored = await chrome.storage.local.get(['port', 'token', 'profile', 'allowlist'])
+const stored = await chrome.storage.local.get(['host', 'port', 'token', 'profile', 'allowlist'])
+hostInput.value = stored.host || '127.0.0.1'
 portInput.value = stored.port || 41777
 tokenInput.value = stored.token || ''
 profileInput.value = stored.profile || 'default'
 allowlistInput.value = stored.allowlist || ''
 
-async function save() {
+async function save({ debuggerTier } = {}) {
     const token = tokenInput.value.trim()
     if (!token) {
         status.textContent = '토큰을 입력해 주세요.'
@@ -22,10 +24,13 @@ async function save() {
     const allowlist = allowlistInput.value
     // The service worker watches storage and reconnects on change.
     await chrome.storage.local.set({
+        host: hostInput.value.trim() || '127.0.0.1',
         port: Number(portInput.value) || 41777,
         token,
         profile: profileInput.value.trim() || 'default',
         allowlist,
+        // Only when the caller was explicit — see parseAutoConnectParams.
+        ...(debuggerTier === undefined ? {} : { debuggerTier }),
     })
 
     // Say plainly which of the two very different modes is now in force —
@@ -43,15 +48,29 @@ document.getElementById('save').addEventListener('click', save)
 // link so first-time setup is "open link" instead of "copy token, switch to
 // this tab, paste, save". The token still came from a link the user chose to
 // open, so auto-saving it is no riskier than them pasting it themselves.
+//
+// The same reasoning extends `debugger=1` to the debugger tier: on a headless
+// Linux box nobody can press the toggle below, and the link is something the
+// user ran `happy browser pair --debugger` to produce. The property cdp.js
+// cares about still holds — no protocol command writes extension storage, so
+// the agent cannot grant this to itself.
 const autoConnect = parseAutoConnectParams(location.search)
 if (autoConnect) {
     tokenInput.value = autoConnect.token
     portInput.value = autoConnect.port
+    // Only when the link was explicit — otherwise the field keeps the stored
+    // value loaded above, and save() below preserves it.
+    if (autoConnect.host !== undefined) hostInput.value = autoConnect.host
     // Scrub the token from the visible URL / this navigation's history entry
     // right away — nothing downstream needs it to stay there.
     history.replaceState(null, '', location.pathname)
-    await save()
+    await save({ debuggerTier: autoConnect.debuggerTier })
     status.textContent = `링크로 자동 연결되었습니다. ${status.textContent}`
+    if (autoConnect.debuggerTier !== undefined) {
+        status.textContent += autoConnect.debuggerTier
+            ? ' 정밀 제어도 켰습니다.'
+            : ' 정밀 제어는 껐습니다.'
+    }
 }
 
 // The debugger tier is gated by a stored setting, not an optional Chrome

@@ -18,8 +18,8 @@ import { McpConfigSynchronizer, type McpConfigSource } from './mcpConfigSynchron
 import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
 import { buildWorkerAgents, readWorkerConfigFromEnv } from "@/orchestrator/workerAgents";
 import { buildSkillGovernanceOptions, readSkillGovernanceConfigFromEnv } from "@/orchestrator/skillGovernance";
-import { readExpectedConnectors } from '@/aplus/fetchAplusMcpServers';
-import { buildConnectorToolGuidance } from '@/aplus/connectorToolGuidance';
+import { readExpectedConnectors, readExpectedMcpServices } from '@/aplus/fetchAplusMcpServers';
+import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
 
 export async function claudeRemote(opts: {
 
@@ -154,13 +154,17 @@ export async function claudeRemote(opts: {
     // same way Saycode's own orchestration does) don't leak into managed
     // sessions. No-op when unset, so existing sessions are unchanged.
     const skillGovernance = buildSkillGovernanceOptions(readSkillGovernanceConfigFromEnv(process.env));
-    const connectorGuidance = buildConnectorToolGuidance(readExpectedConnectors());
-    const connectorGuidanceSuffix = connectorGuidance ? '\n\n' + connectorGuidance : '';
-
     const mergedMcpServers = {
         ...opts.mcpServers,
         ...(opts.orchestratorMode ? opts.orchestratorMcpServers : {}),
     };
+    const connectorGuidance = buildConnectorToolGuidance(listExpectedMcpServices({
+        expectedConnectors: readExpectedConnectors(),
+        expectedMcpServices: readExpectedMcpServices(),
+        configuredServerNames: Object.keys(mergedMcpServers),
+    }));
+    const connectorGuidanceSuffix = connectorGuidance ? '\n\n' + connectorGuidance : '';
+
     const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
     const sdkOptions: QueryOptions = {
         cwd: opts.path,

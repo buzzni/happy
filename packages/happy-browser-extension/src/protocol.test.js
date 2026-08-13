@@ -190,6 +190,32 @@ describe('handleCommand', () => {
             expect(response.error.code).toBe('NO_ACTIVE_TAB')
         })
 
+        // A headless Linux Chrome under Xvfb has no window manager, so no
+        // window is ever "last focused" — the tab is active, but the focused
+        // lookup comes back empty and every ref-less command used to fail.
+        it('falls back to the active tab of any window when no window is focused', async () => {
+            const chrome = fakeChrome({ tabs: [ACTIVE_TAB] })
+            const queries = []
+            chrome.tabs.query = async (query) => {
+                queries.push(query)
+                if (query.lastFocusedWindow) return []
+                return query.active ? [ACTIVE_TAB] : [ACTIVE_TAB]
+            }
+            const response = await handleCommand({ id: 9, method: 'snapshot' }, chrome)
+            expect(response.error).toBeUndefined()
+            expect(queries).toEqual([
+                { active: true, lastFocusedWindow: true },
+                { active: true },
+            ])
+        })
+
+        it('still reports NO_ACTIVE_TAB when the fallback finds nothing either', async () => {
+            const chrome = fakeChrome({ tabs: [] })
+            chrome.tabs.query = async () => []
+            const response = await handleCommand({ id: 10, method: 'snapshot' }, chrome)
+            expect(response.error.code).toBe('NO_ACTIVE_TAB')
+        })
+
         it('reports INJECTION_FAILED when Chrome refuses to inject', async () => {
             const chrome = fakeChrome({
                 tabs: [ACTIVE_TAB],
@@ -218,6 +244,32 @@ describe('handleCommand', () => {
         it('reports NO_ACTIVE_TAB when no tab is focused', async () => {
             const response = await handleCommand({ id: 11, method: 'screenshot' }, fakeChrome({ tabs: [] }))
             expect(response.error.code).toBe('NO_ACTIVE_TAB')
+        })
+
+        // captureVisibleTab needs a real composited surface. A headless Chrome
+        // has none, so on that box it is the CDP path or nothing.
+        it('falls back to CDP when captureVisibleTab fails and the debugger tier is on', async () => {
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                debuggerGranted: true,
+                captureVisibleTab: async () => { throw new Error('Failed to capture tab') },
+                sendCommand: async (_target, method, params) => {
+                    expect(method).toBe('Page.captureScreenshot')
+                    expect(params.captureBeyondViewport).toBe(false)
+                    return { data: 'VIEWPORT' }
+                },
+            })
+            const response = await handleCommand({ id: 12, method: 'screenshot' }, chrome)
+            expect(response.result).toEqual({ mimeType: 'image/png', dataB64: 'VIEWPORT' })
+        })
+
+        it('surfaces the original capture failure when the debugger tier is off', async () => {
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                captureVisibleTab: async () => { throw new Error('Failed to capture tab') },
+            })
+            const response = await handleCommand({ id: 13, method: 'screenshot' }, chrome)
+            expect(response.error.message).toContain('Failed to capture tab')
         })
     })
 

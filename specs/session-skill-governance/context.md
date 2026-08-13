@@ -17,3 +17,9 @@ SDK 조사 결과 "user-scope 스킬 디렉터리만 제외"하는 단일 플래
 - `strictPluginOnlyCustomization`(managed): user와 project 스킬 디렉터리를 함께 막아 이 저장소의 `packages/*/.claude/skills` 관례를 깬다 — 채택 안 함.
 
 따라서 이번 변경은 "완전 자동 차단"이 아니라 **소비자(Saycode 등)가 세션/머신 단위로 켤 수 있는 스위치**를 노출하는 것까지가 SDK 계약 안에서 가능한 근본 해결의 한계다. Saycode 쪽에서 이 스위치를 실제로 켜는 배포 설정은 별도 작업(happy-cli 릴리스 필요, `[[happy-cli-release-process]]`).
+
+## 2026-08-13 PR #171 conflict resolution
+
+- `origin/main`을 병합했다. `claudeRemote.ts`는 skill-governance SDK 옵션을 유지하면서, 병합된 MCP 서버 이름·expected connector·expected MCP service를 함께 `listExpectedMcpServices`로 전달해 guidance를 생성한다.
+- 회귀 테스트는 `HAPPY_SETTING_SOURCES`, `HAPPY_SKILL_ALLOWLIST`, expected connector/service가 함께 설정된 세션에서 SDK 옵션과 `argos, gmail` guidance가 모두 남는지 검증한다.
+- 검증: `claudeRemote.test.ts` 11개, `skillGovernance.test.ts`·`connectorToolGuidance.test.ts`·`fetchAplusMcpServers.test.ts` 23개, `pnpm --filter @buzzni/happy-cli run typecheck` 통과.

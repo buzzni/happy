@@ -33,6 +33,7 @@ import { previewWebSocketRelay } from "@/modules/preview/previewWebSocketRelay";
 import { parsePreviewHost } from "@/modules/preview/parsePreviewHost";
 import { attachmentRoutes } from "./routes/attachmentRoutes";
 import { automationRoutes } from "./routes/automationRoutes";
+import { agentProfileRoutes } from "./routes/agentProfileRoutes";
 import { isLocalStorage, getLocalFilesDir } from "@/storage/files";
 import * as path from "path";
 import * as fs from "fs";
@@ -135,6 +136,7 @@ export async function startApi(opts: StartApiOptions = {}) {
     pushRoutes(typed);
     sessionRoutes(typed);
     accountRoutes(typed);
+    agentProfileRoutes(typed);
     connectRoutes(typed);
     machinesRoutes(typed);
     artifactsRoutes(typed);

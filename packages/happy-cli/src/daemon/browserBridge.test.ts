@@ -67,6 +67,25 @@ describe('BrowserBridge', () => {
             expect(socket.closed?.code).toBe(4401)
         })
 
+        // Once the bridge can bind a non-loopback interface (browserBridgeServer's
+        // HAPPY_BROWSER_BRIDGE_HOST), the token is the sole defense on a network
+        // an attacker can reach — a length-dependent compare timing side-channel
+        // is worth closing even though it was harmless on loopback.
+        it('rejects a same-length wrong token without throwing', () => {
+            const socket = new FakeSocket()
+            const wrongSameLength = TOKEN.slice(0, -1) + (TOKEN.endsWith('x') ? 'y' : 'x')
+            const accepted = bridge.handleConnection(socket, { token: wrongSameLength, profile: 'default' })
+            expect(accepted).toBe(false)
+            expect(socket.closed?.code).toBe(4401)
+        })
+
+        it('rejects a token of different length without throwing', () => {
+            const socket = new FakeSocket()
+            const accepted = bridge.handleConnection(socket, { token: TOKEN + 'x', profile: 'default' })
+            expect(accepted).toBe(false)
+            expect(socket.closed?.code).toBe(4401)
+        })
+
         it('accepts a connection with the right token and registers its profile', () => {
             connect('work')
             expect(bridge.connections()).toEqual([{ profile: 'work' }])

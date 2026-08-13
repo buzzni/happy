@@ -2,8 +2,9 @@
  * Bridge between happy sessions and the Chrome extension controlling the
  * user's logged-in browser (specs/chrome-extension-bridge/).
  *
- * The extension's MV3 service worker connects over a loopback WebSocket and
- * answers JSON-RPC-style requests:
+ * The extension's MV3 service worker connects over a WebSocket — loopback by
+ * default, or a remote host when HAPPY_BROWSER_BRIDGE_HOST opts in
+ * (browserBridgeServer.ts) — and answers JSON-RPC-style requests:
  *
  *   daemon → extension  { id, method, params }
  *   extension → daemon  { id, result } | { id, error: { code, message } }
@@ -13,6 +14,8 @@
  * Pure of any specific socket library — the caller hands in a socket with
  * send/close/on, so this stays unit-testable (same pattern as PreviewWsProxy).
  */
+
+import { timingSafeEqual } from 'node:crypto'
 
 export interface BridgeSocket {
     send(data: string): void
@@ -49,6 +52,32 @@ const DEFAULT_PROFILE = 'default'
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 const AUTH_FAILURE_WINDOW_MS = 60_000
 
+/**
+ * Constant-time token comparison.
+ *
+ * A plain `!==` was fine while the bridge only ever heard from loopback, but
+ * HAPPY_BROWSER_BRIDGE_HOST (browserBridgeServer.ts) can now put it on a
+ * network an attacker reaches — at which point the token is the only thing
+ * standing between them and the user's browser, and a length/prefix-dependent
+ * compare timing is a real (if slow) way to recover it.
+ *
+ * timingSafeEqual throws on a length mismatch rather than returning false, so
+ * that has to be handled first — comparing against the expected token's own
+ * length keeps that branch's timing independent of the *offered* token's
+ * length too.
+ */
+function tokensMatch(offered: string, expected: string): boolean {
+    const offeredBuf = Buffer.from(offered)
+    const expectedBuf = Buffer.from(expected)
+    if (offeredBuf.length !== expectedBuf.length) {
+        // No real timing signal to protect here: this only tells an attacker
+        // the token's length, which readOrCreateBrowserBridgeToken fixes at
+        // 64 hex chars for every install anyway.
+        return false
+    }
+    return timingSafeEqual(offeredBuf, expectedBuf)
+}
+
 export class BrowserBridge {
     private readonly authToken: string
     private readonly requestTimeoutMs: number
@@ -68,7 +97,7 @@ export class BrowserBridge {
      * "the live service worker".
      */
     handleConnection(socket: BridgeSocket, params: BridgeConnectionParams): boolean {
-        if (!params.token || params.token !== this.authToken) {
+        if (!params.token || !tokensMatch(params.token, this.authToken)) {
             this.lastAuthFailureAt = Date.now()
             socket.close(4401, 'invalid token')
             return false

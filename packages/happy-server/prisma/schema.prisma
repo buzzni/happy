@@ -60,6 +60,23 @@ model Account {
     MergeRequestComment MergeRequestComment[]
     VoiceConversation   VoiceConversation[]
     AutomationOwner     Automation[]         @relation("AutomationOwner")
+    AgentLaunchProfile  AgentLaunchProfile[]
+}
+
+model AgentLaunchProfile {
+    id              String   @id @default(cuid())
+    accountId       String
+    account         Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+    name            String
+    agent           String
+    model           String?
+    worktreeEnabled Boolean  @default(false)
+    active          Boolean  @default(false)
+    createdAt       DateTime @default(now())
+    updatedAt       DateTime @updatedAt
+
+    @@unique([accountId, name])
+    @@index([accountId, active])
 }
 
 model TerminalAuthRequest {

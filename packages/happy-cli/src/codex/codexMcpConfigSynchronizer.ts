@@ -85,6 +85,17 @@ export class CodexMcpConfigSynchronizer {
                         checkedAt: this.now(),
                     });
                 }
+            } else if (result.reason === 'mcp-config-missing') {
+                for (const { name, reason } of result.missing) {
+                    this.options.onStatus?.({
+                        name,
+                        status: reason === 'connector-config-missing'
+                            ? 'connector-config-missing'
+                            : 'mcp-config-missing',
+                        error: sanitizeMcpError(result.error),
+                        checkedAt: this.now(),
+                    });
+                }
             } else if (result.reason !== 'not-configured' && result.reason !== 'missing-machine-id') {
                 this.options.onStatus?.({
                     name: 'aplus-config',

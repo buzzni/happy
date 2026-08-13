@@ -157,8 +157,56 @@ describe('claudeRemote', () => {
         }
     });
 
-    it('instructs the agent to discover expected connector tools before browser fallback', async () => {
-        process.env.HAPPY_APLUS_EXPECTED_CONNECTORS = '["gmail","knoi"]';
+    it('instructs the agent to discover connector and runtime MCP tools before browser fallback', async () => {
+        process.env.HAPPY_APLUS_EXPECTED_CONNECTORS = '["gmail"]';
+        process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES = '["argos","gmail"]';
+        try {
+            vi.mocked(query).mockReturnValue({
+                setPermissionMode: vi.fn(),
+                mcpServerStatus: vi.fn(async () => []),
+                async *[Symbol.asyncIterator]() { yield { type: 'result', subtype: 'success' }; },
+            } as any);
+            let count = 0;
+
+            await claudeRemote({
+                sessionId: null,
+                path: process.cwd(),
+                mcpServers: {
+                    happy: { type: 'http', url: 'http://happy.test/mcp' },
+                    argos: { type: 'http', url: 'https://argos.test/mcp' },
+                },
+                allowedTools: [],
+                hookSettingsPath: '/tmp/happy-test-settings.json',
+                nextMessage: async () => (count++ === 0 ? { message: 'check gmail', mode } : null),
+                onReady: vi.fn(),
+                canCallTool: async () => ({ behavior: 'allow' }) as any,
+                isAborted: () => false,
+                onSessionFound: vi.fn(),
+                onThinkingChange: vi.fn(),
+                onMessage: vi.fn(),
+            });
+
+            const prompt = vi.mocked(query).mock.calls[0][0].options?.appendSystemPrompt;
+            expect(prompt).toContain('argos, gmail');
+            expect(prompt).toContain('deferred MCP tool discovery');
+            expect(prompt).not.toContain('aplus-common');
+        } finally {
+            delete process.env.HAPPY_APLUS_EXPECTED_CONNECTORS;
+            delete process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES;
+        }
+    });
+
+    it('keeps skill governance and expected MCP service guidance together', async () => {
+        const previous = {
+            settingSources: process.env.HAPPY_SETTING_SOURCES,
+            skillAllowlist: process.env.HAPPY_SKILL_ALLOWLIST,
+            connectors: process.env.HAPPY_APLUS_EXPECTED_CONNECTORS,
+            mcpServices: process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES,
+        };
+        process.env.HAPPY_SETTING_SOURCES = 'project,local';
+        process.env.HAPPY_SKILL_ALLOWLIST = 'pdf';
+        process.env.HAPPY_APLUS_EXPECTED_CONNECTORS = '["gmail"]';
+        process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES = '["argos","gmail"]';
         try {
             vi.mocked(query).mockReturnValue({
                 setPermissionMode: vi.fn(),
@@ -172,7 +220,7 @@ describe('claudeRemote', () => {
                 path: process.cwd(),
                 allowedTools: [],
                 hookSettingsPath: '/tmp/happy-test-settings.json',
-                nextMessage: async () => (count++ === 0 ? { message: 'check gmail', mode } : null),
+                nextMessage: async () => (count++ === 0 ? { message: 'check services', mode } : null),
                 onReady: vi.fn(),
                 canCallTool: async () => ({ behavior: 'allow' }) as any,
                 isAborted: () => false,
@@ -181,11 +229,18 @@ describe('claudeRemote', () => {
                 onMessage: vi.fn(),
             });
 
-            expect(vi.mocked(query).mock.calls[0][0].options?.appendSystemPrompt).toContain(
-                'deferred MCP tool discovery',
-            );
+            const options = vi.mocked(query).mock.calls[0][0].options!;
+            expect(options.settingSources).toEqual(['project', 'local']);
+            expect(options.skills).toEqual(['pdf']);
+            expect(options.appendSystemPrompt).toContain('argos, gmail');
         } finally {
-            delete process.env.HAPPY_APLUS_EXPECTED_CONNECTORS;
+            for (const [key, value] of Object.entries(previous)) {
+                const envKey = key === 'settingSources' ? 'HAPPY_SETTING_SOURCES'
+                    : key === 'skillAllowlist' ? 'HAPPY_SKILL_ALLOWLIST'
+                    : key === 'connectors' ? 'HAPPY_APLUS_EXPECTED_CONNECTORS'
+                    : 'HAPPY_APLUS_EXPECTED_MCP_SERVICES';
+                if (value === undefined) delete process.env[envKey]; else process.env[envKey] = value;
+            }
         }
     });
 

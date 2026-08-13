@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import { existsSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { formatBrowserStatus, resolveExtensionDir, resolveExtensionId } from './browser'
+import { formatBrowserStatus, resolveExtensionDir, resolveExtensionId, bridgeProbeHost } from './browser'
 import { projectPath } from '@/projectPath'
 
 const base = {
@@ -139,6 +139,95 @@ describe('formatBrowserStatus', () => {
         })
         expect(out).toMatch(/데몬이 실행 중이 아닙니다/)
         expect(out).toContain('happy daemon start')
+    })
+
+    describe('remote host', () => {
+        it('says nothing about a remote host when the bridge is loopback-only', () => {
+            const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [], bridgeHost: '127.0.0.1' })
+            expect(out).not.toContain('host=')
+            expect(out).not.toMatch(/평문|공인/)
+        })
+
+        // The bridge can bind 0.0.0.0 without the user ever setting a public
+        // host to hand their own PC's Chrome — those are two separate env
+        // vars on purpose (NAT/port-forwarding means the bind address and the
+        // address a remote client dials are often different).
+        it('warns about the exposure once the bridge is bound off loopback, even with no public host to print a link for', () => {
+            const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [], bridgeHost: '0.0.0.0' })
+            expect(out).toMatch(/평문|암호화되지 않|토큰.*유일/)
+            expect(out).not.toContain('host=')
+        })
+
+        // The liveness probe used to be hardcoded to loopback. A daemon bound
+        // to one specific interface is then unreachable at 127.0.0.1, so the
+        // probe came back false and formatBrowserStatus printed "브리지 포트를
+        // 잡지 못했습니다" plus a restart that changes nothing — for a bridge
+        // that was working fine.
+        it('probes the interface the bridge is actually bound to', () => {
+            expect(bridgeProbeHost('192.168.1.5')).toBe('192.168.1.5')
+            expect(bridgeProbeHost('::1')).toBe('::1')
+        })
+
+        it('probes loopback for a wildcard bind, which a wildcard always covers', () => {
+            expect(bridgeProbeHost('0.0.0.0')).toBe('127.0.0.1')
+            expect(bridgeProbeHost('::')).toBe('127.0.0.1')
+            expect(bridgeProbeHost('127.0.0.1')).toBe('127.0.0.1')
+        })
+
+        // '::1' is as loopback-only as 127.0.0.1 — warning that the machine
+        // is reachable from outside, and softening the auth-failure wording
+        // to "maybe a scanner", would both be wrong there.
+        it('treats the IPv6 loopback like 127.0.0.1: no exposure warning', () => {
+            const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [], bridgeHost: '::1' })
+            expect(out).not.toMatch(/평문|밖에서도/)
+        })
+
+        // On a public bind any internet scanner touching 41777 trips
+        // hasRecentAuthFailure, so the loopback-era wording ("your other
+        // extension is retrying with an old token") becomes a guess that
+        // sends the user re-pairing something that was never broken.
+        it('does not blame a stale extension for a rejected attempt when anyone can reach the port', () => {
+            const out = formatBrowserStatus({
+                ...base,
+                daemonRunning: true,
+                connections: [],
+                hasRecentAuthFailure: true,
+                bridgeHost: '0.0.0.0',
+            })
+            expect(out).toMatch(/외부|스캔|확장이 아닐/)
+        })
+
+        it('still names the stale-token cause plainly when only loopback can reach the port', () => {
+            const out = formatBrowserStatus({
+                ...base,
+                daemonRunning: true,
+                connections: [],
+                hasRecentAuthFailure: true,
+                bridgeHost: '127.0.0.1',
+            })
+            expect(out).not.toMatch(/외부|스캔/)
+            expect(out).toMatch(/토큰/)
+        })
+
+        it('adds &host= to the auto-connect link when a public host is given', () => {
+            const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [], bridgeHost: '0.0.0.0', publicHost: 'happy.example.com' })
+            expect(out).toContain(`chrome-extension://${base.extensionId}/src/options.html?token=${base.token}&port=${base.bridgePort}&host=happy.example.com`)
+        })
+
+        // PUBLIC_HOST without BRIDGE_HOST hands out a link pointing at this
+        // machine while the daemon still listens on loopback only. The remote
+        // extension then dials a port nothing answers on, and neither side
+        // shows a cause — this status output is the one place that can see
+        // both halves of the mismatch.
+        it('flags a public link handed out while the bridge only listens on loopback', () => {
+            const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [], bridgeHost: '127.0.0.1', publicHost: 'happy.example.com' })
+            expect(out).toMatch(/HAPPY_BROWSER_BRIDGE_HOST/)
+        })
+
+        it('does not flag the pairing link when the bridge actually listens beyond loopback', () => {
+            const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [], bridgeHost: '0.0.0.0', publicHost: 'happy.example.com' })
+            expect(out).not.toMatch(/HAPPY_BROWSER_BRIDGE_HOST/)
+        })
     })
 
     it('mentions the port the extension must be pointed at', () => {

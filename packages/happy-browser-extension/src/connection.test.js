@@ -71,6 +71,61 @@ describe('createConnection', () => {
         expect(FakeWebSocket.instances[0].url).toBe('ws://127.0.0.1:41777/?token=tok&profile=default')
     })
 
+    // The daemon is not always on this machine — a user pointing their own,
+    // already-logged-in Chrome at a remote happy session needs the extension
+    // to dial out somewhere other than its own loopback.
+    it('dials a configured remote host instead of loopback', async () => {
+        const connection = make(fakeChrome({ token: 'tok', port: 41777, profile: 'default', host: 'happy.example.com' }))
+        await connection.connect()
+        expect(FakeWebSocket.instances[0].url).toBe('ws://happy.example.com:41777/?token=tok&profile=default')
+    })
+
+    it('brackets an IPv6 literal so the URL stays well-formed', async () => {
+        const connection = make(fakeChrome({ token: 'tok', port: 41777, profile: 'default', host: '::1' }))
+        await connection.connect()
+        expect(FakeWebSocket.instances[0].url).toBe('ws://[::1]:41777/?token=tok&profile=default')
+    })
+
+    it('does not double-bracket a host the user already bracketed', async () => {
+        const connection = make(fakeChrome({ token: 'tok', port: 41777, profile: 'default', host: '[::1]' }))
+        await connection.connect()
+        expect(FakeWebSocket.instances[0].url).toBe('ws://[::1]:41777/?token=tok&profile=default')
+    })
+
+    // host became free-form user input with the remote-daemon feature. A typo
+    // ("http://1.2.3.4") makes the WebSocket constructor throw, which used to
+    // escape connect() as an unhandled rejection: no badge, no reconnect, and
+    // a service worker that looks alive but will never connect.
+    it('shows the error badge instead of dying when the configured host makes an invalid URL', async () => {
+        const badges = []
+        const chrome = fakeChrome({ token: 'tok', port: 41777, profile: 'default', host: 'http://1.2.3.4' }, badges)
+        function ThrowingWebSocket() { throw new SyntaxError("The URL 'ws://http://1.2.3.4:41777/' is invalid.") }
+        ThrowingWebSocket.OPEN = 1
+        const connection = createConnection({ chrome, WebSocketImpl: ThrowingWebSocket })
+
+        await expect(connection.connect()).resolves.toBeUndefined()
+        expect(badges).toContain('!')
+    })
+
+    it('can still connect after a bad host is corrected', async () => {
+        const stored = { token: 'tok', port: 41777, profile: 'default', host: 'http://1.2.3.4' }
+        const chrome = fakeChrome(stored)
+        let failNext = true
+        function MaybeThrowingWebSocket(url) {
+            if (failNext) throw new SyntaxError('invalid')
+            return new FakeWebSocket(url)
+        }
+        MaybeThrowingWebSocket.OPEN = 1
+        const connection = createConnection({ chrome, WebSocketImpl: MaybeThrowingWebSocket })
+
+        await connection.connect()
+        failNext = false
+        stored.host = '127.0.0.1'
+        connection.restart()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(FakeWebSocket.instances).toHaveLength(1)
+    })
+
     it('does not connect before a pairing token is saved', async () => {
         const connection = make(fakeChrome({ token: '', port: 41777, profile: 'default' }))
         await connection.connect()
