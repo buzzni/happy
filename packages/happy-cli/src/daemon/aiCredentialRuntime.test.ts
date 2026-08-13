@@ -229,6 +229,92 @@ describe('AI credential machine runtime', () => {
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"two"}')
   })
 
+  it('serializes capture behind an in-progress credential replacement', async () => {
+    let releaseWrite!: () => void
+    const writeBlocked = new Promise<void>((resolve) => { releaseWrite = resolve })
+    let tempWriteStarted = false
+    let files!: Map<string, string>
+    const configured = setup({
+      writeFile: vi.fn(async (path: string, content: string) => {
+        if (path.endsWith('.auth.json.happy-tmp')) {
+          tempWriteStarted = true
+          await writeBlocked
+        }
+        files.set(path, content)
+      }),
+    })
+    files = configured.files
+    files.set('/home/operator/.codex/auth.json', '{"OPENAI_API_KEY":"old"}')
+
+    const apply = configured.runtime.apply({ provider: 'codex', payload: '{"OPENAI_API_KEY":"new"}' })
+    await vi.waitFor(() => expect(tempWriteStarted).toBe(true))
+    let captureSettled = false
+    const capture = configured.runtime.capture({ provider: 'codex' })
+      .finally(() => { captureSettled = true })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(captureSettled).toBe(false)
+
+    releaseWrite()
+    await apply
+    await expect(capture).resolves.toEqual({
+      provider: 'codex', payload: '{"OPENAI_API_KEY":"new"}',
+    })
+  })
+
+  it('orders rotation changes after an in-progress Claude apply', async () => {
+    let releaseList!: () => void
+    const listBlocked = new Promise<void>((resolve) => { releaseList = resolve })
+    const events: string[] = []
+    const supervisor = {
+      enable: vi.fn(async () => { events.push('enable') }),
+      stop: vi.fn(async () => { events.push('stop') }),
+      status: vi.fn(() => ({ state: 'running' as const, lastErrorKind: null })),
+    }
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'cswap' && args[0] === '--version') {
+        return { stdout: 'claude-swap 0.25.0', stderr: '' }
+      }
+      if (command === 'cswap' && args[0] === 'list') {
+        events.push('verify')
+        await listBlocked
+        return { stdout: configuredClaudeList, stderr: '' }
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime } = setup({ execFile, supervisor })
+
+    const apply = runtime.apply({ provider: 'claude', payload: '{}' })
+    await vi.waitFor(() => expect(events).toEqual(['verify']))
+    const stop = runtime.rotation({ action: 'stop' })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(events).toEqual(['verify'])
+
+    releaseList()
+    await Promise.all([apply, stop])
+    expect(events).toEqual(['verify', 'enable', 'stop'])
+  })
+
+  it('restores Codex auth even when temporary-file cleanup fails', async () => {
+    let files!: Map<string, string>
+    const configured = setup({
+      execFile: vi.fn(async (command: string) => {
+        if (command === 'codex') throw new Error('not authenticated')
+        return { stdout: '', stderr: '' }
+      }),
+      rm: vi.fn(async (path: string) => {
+        if (path.endsWith('.auth.json.happy-tmp')) throw new Error('cleanup failed')
+        files.delete(path)
+      }),
+    })
+    files = configured.files
+    files.set('/home/operator/.codex/auth.json', '{"OPENAI_API_KEY":"old"}')
+
+    await expect(configured.runtime.apply({
+      provider: 'codex', payload: '{"OPENAI_API_KEY":"new"}',
+    })).rejects.toMatchObject({ kind: 'CODEX_APPLY_FAILED' })
+    expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"old"}')
+  })
+
   it('redacts Claude account status instead of returning command output', async () => {
     const { runtime } = setup()
 

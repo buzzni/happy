@@ -93,7 +93,7 @@ describe('Claude swap supervisor', () => {
     expect(JSON.stringify(supervisor.status())).not.toContain('next@example.com')
   })
 
-  it('reports account exhaustion as blocked and clears it on a healthy poll', async () => {
+  it('keeps account exhaustion blocked through the next poll and clears on a healthy decision', async () => {
     const { supervisor, children } = setup()
     await supervisor.enable()
 
@@ -107,6 +107,14 @@ describe('Claude swap supervisor', () => {
 
     children[0].stdout.emit('data', Buffer.from(
       '{"schemaVersion":1,"event":"poll","ts":"2026-08-13T09:01:00Z","active":{"number":1}}\n',
+    ))
+    expect(supervisor.status()).toEqual({
+      state: 'blocked',
+      lastErrorKind: 'ALL_ACCOUNTS_EXHAUSTED',
+    })
+
+    children[0].stdout.emit('data', Buffer.from(
+      '{"schemaVersion":1,"event":"no-switch","ts":"2026-08-13T09:01:01Z","reason":"below-threshold"}\n',
     ))
     expect(supervisor.status()).toEqual({ state: 'running', lastErrorKind: null })
   })

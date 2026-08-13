@@ -138,6 +138,9 @@ export class ClaudeSwapSupervisor {
           }
         } else if (event.event === 'poll' && isObject(event.active)) {
           this.restartAttempts = 0
+        } else if (event.event === 'no-switch'
+          && typeof event.reason === 'string'
+          && HEALTHY_NO_SWITCH_REASONS.has(event.reason)) {
           this.currentStatus = { ...this.currentStatus, state: 'running', lastErrorKind: null }
         } else if (event.event === 'switch'
           && event.dryRun !== true
@@ -160,6 +163,14 @@ export class ClaudeSwapSupervisor {
     }
   }
 }
+
+const HEALTHY_NO_SWITCH_REASONS = new Set([
+  'active-api-key',
+  'already-consuming-soonest',
+  'below-threshold',
+  'cooldown',
+  'reset-unknown',
+])
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)

@@ -5,6 +5,7 @@ import { join } from 'node:path'
 
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 const CLAUDE_SWAP_VERSION = '0.25.0'
+const CLAUDE_STATUS_TIMEOUT_MS = 120_000
 
 export type AiCredentialProvider = 'claude' | 'codex'
 
@@ -53,7 +54,13 @@ export class AiCredentialRuntimeError extends Error {
 }
 
 export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies) {
-  let applyTail: Promise<void> = Promise.resolve()
+  let operationTail: Promise<void> = Promise.resolve()
+
+  function serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const result = operationTail.then(operation)
+    operationTail = result.then(() => undefined, () => undefined)
+    return result
+  }
 
   function provider(value: unknown): AiCredentialProvider {
     if (value !== 'claude' && value !== 'codex') {
@@ -75,7 +82,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
 
   async function capture(input: { provider: AiCredentialProvider }) {
     const selected = provider(input?.provider)
-    return withSafeErrors(`${selected.toUpperCase()}_CAPTURE_FAILED`, async () => {
+    return serialize(() => withSafeErrors(`${selected.toUpperCase()}_CAPTURE_FAILED`, async () => {
       let payload: string
       if (selected === 'claude') {
         const result = await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
@@ -89,7 +96,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       }
       assertPayloadSize(payload)
       return { provider: selected, payload }
-    })
+    }))
   }
 
   async function ensureClaudeSwap(): Promise<void> {
@@ -123,7 +130,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     } finally {
       await deps.rm(tempDir, { recursive: true, force: true })
     }
-    const status = await deps.execFile('cswap', ['list', '--json'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
+    const status = await deps.execFile('cswap', ['list', '--json'], {
+      maxOutputBytes: MAX_PAYLOAD_BYTES,
+      timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+    })
     if (!parseClaudeList(status.stdout).configured) {
       throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
     }
@@ -169,9 +179,15 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       await deps.chmod(authPath, 0o600)
       await deps.execFile('codex', ['login', 'status'])
     } catch {
-      await deps.rm(tempPath, { force: true })
-      await deps.rm(authPath, { force: true })
-      if (hadExisting) await deps.rename(backupPath, authPath)
+      try { await deps.rm(tempPath, { force: true }) } catch { /* continue restoring the backup */ }
+      try { await deps.rm(authPath, { force: true }) } catch { /* rename may still replace it */ }
+      if (hadExisting) {
+        try {
+          await deps.rename(backupPath, authPath)
+        } catch {
+          throw new AiCredentialRuntimeError('CODEX_BACKUP_RESTORE_FAILED')
+        }
+      }
       throw new AiCredentialRuntimeError('CODEX_APPLY_FAILED')
     }
     return { provider: 'codex' as const, configured: true, status: 'authenticated' as const }
@@ -183,39 +199,40 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       throw new AiCredentialRuntimeError('INVALID_PAYLOAD')
     }
     assertPayloadSize(input.payload)
-    const operation = applyTail.then(() => withSafeErrors(
+    return serialize(() => withSafeErrors(
       `${selected.toUpperCase()}_APPLY_FAILED`,
       async () => {
         if (selected === 'claude') return applyClaude(input.payload)
         return applyCodex(input.payload)
       },
     ))
-    applyTail = operation.then(() => undefined, () => undefined)
-    return operation
   }
 
   async function status(input: { provider: AiCredentialProvider }) {
     const selected = provider(input?.provider)
-    return withSafeErrors(`${selected.toUpperCase()}_STATUS_FAILED`, async () => {
+    return serialize(() => withSafeErrors(`${selected.toUpperCase()}_STATUS_FAILED`, async () => {
       if (selected === 'codex') {
         await deps.execFile('codex', ['login', 'status'])
         return { provider: selected, configured: true, status: 'authenticated' as const }
       }
-      const result = await deps.execFile('cswap', ['list', '--json'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
+      const result = await deps.execFile('cswap', ['list', '--json'], {
+        maxOutputBytes: MAX_PAYLOAD_BYTES,
+        timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+      })
       const claudeStatus = parseClaudeList(result.stdout)
       return {
         provider: selected,
         ...claudeStatus,
         rotation: deps.supervisor.status(),
       }
-    })
+    }))
   }
 
   async function rotation(input: { action: 'start' | 'stop' }) {
     if (input?.action !== 'start' && input?.action !== 'stop') {
       throw new AiCredentialRuntimeError('UNSUPPORTED_ROTATION_ACTION')
     }
-    return withSafeErrors('ROTATION_UPDATE_FAILED', async () => {
+    return serialize(() => withSafeErrors('ROTATION_UPDATE_FAILED', async () => {
       if (input.action === 'start') {
         await ensureClaudeSwap()
         await deps.supervisor.enable()
@@ -223,7 +240,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         await deps.supervisor.stop()
       }
       return { provider: 'claude' as const, rotation: deps.supervisor.status() }
-    })
+    }))
   }
 
   return { capture, apply, status, rotation }
