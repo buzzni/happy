@@ -77,10 +77,21 @@ TDD → 얇은 부수효과 층 → RPC.
 - [x] 실제 headful Chrome 이 그 화면에 뜨는지 확인:
       `xwininfo` 에 `"Example Domain - Google Chrome" 945x1060` 창 관측
 
-## Phase 4 — 앱 UI + 릴레이 연결 (남음)
+## Phase 4 — 앱 UI + 릴레이 연결 ✅ 완료
 
-- [ ] `browser-setup:launch` 에 `display` 옵션 (뷰어 사용 시 headful 기동)
-- [ ] 릴레이 URL 조립 + CDP 와 구분되는 토큰 종류 (AC3)
-- [ ] 머신 화면 "브라우저 화면 열기" 버튼 + 위험도 명시 (AC4)
+- [x] `browser-setup:launch` 에 `viewer` 옵션 — 뷰어 스택(없으면 자동
+      기동)의 Xvfb 디스플레이에 headful 로 합류 (컨테이너 E2E 5/5)
+- [x] 릴레이 URL 조립 + CDP 와 구분되는 토큰 종류 (AC3) —
+      `aplus-dev-studio` `mintBrowserViewerToken` (machine 소유권 기반,
+      project 포트 소유권 로직과 완전 분리)
+- [x] 머신 화면 "원격 브라우저 화면 열기" 버튼 + 위험도 명시 (AC4) —
+      `aplus-dev-studio` `MachineDashboard.tsx`
+
+Phase 4b(릴레이+UI)는 web-ui 쪽이라 `aplus-dev-studio` 저장소에서
+구현했다: `mintBrowserViewerToken.ts`, `browserViewerRelayResponse.ts`,
+`useOpenBrowserViewer.ts`, `POST /api/machines/:id/browser-viewer/{install,open}`.
+
+2026-08-13 사용자 결정: 회사 공유 머신에서 소유자가 아닌 회사 멤버도
+원격 화면을 열 수 있다(preview-token-trusted 와 같은 패턴).
 
 
