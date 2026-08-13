@@ -31,6 +31,8 @@ import type {
     RollbackConversationResponse,
     InjectItemsParams,
     InjectItemsResponse,
+    CompactConversationParams,
+    CompactConversationResponse,
     ThreadGoalSetParams,
     ThreadGoalSetResponse,
     ThreadGoalClearParams,
@@ -46,6 +48,9 @@ import type {
     InputItem,
     ReasoningEffort,
     McpServerElicitationRequestResponse,
+    McpServerStartupStatus,
+    ListMcpServerStatusParams,
+    ListMcpServerStatusResponse,
 } from './codexAppServerTypes';
 import type { SandboxConfig } from '@/persistence';
 import { CODEX_INACTIVITY_ABORT_REASON, type CodexInactivityAbortFields } from './codexAbortNotice';
@@ -221,6 +226,7 @@ export class CodexAppServerClient {
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
         mcpServers?: Record<string, unknown>;
+        developerInstructions?: string;
     } | null = null;
 
     // Turn completion tracking for the currently active sendTurnAndWait call.
@@ -252,10 +258,10 @@ export class CodexAppServerClient {
     private deferredRawTurnCompletion: DeferredRawTurnCompletion | null = null;
     private rawTurnCompletionFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
-    // Last known startup status per MCP server (name -> status, e.g. 'ready'/'starting'/'failed').
+    // Last known startup status per MCP server.
     // Used to explain a watchdog-forced abort: a turn can hang building its tool
     // list while waiting on a server that never became ready.
-    private mcpServerStatuses = new Map<string, string>();
+    private mcpServerStatuses = new Map<string, McpServerStartupStatus>();
     // Snapshot taken the moment *our* inactivity watchdog fires, so the turn's
     // terminal event can be distinguished from a user-initiated cancel. Captured
     // at fire time (not at emission) because MCP servers may become ready during
@@ -280,6 +286,12 @@ export class CodexAppServerClient {
 
     supportsGoalActions(): boolean {
         return isGoalActionsAvailable();
+    }
+
+    getMcpStartupStatuses(): McpServerStartupStatus[] {
+        return [...this.mcpServerStatuses.values()]
+            .map((status) => ({ ...status }))
+            .sort((left, right) => left.name.localeCompare(right.name));
     }
 
     setEventHandler(handler: (msg: EventMsg) => void): void {
@@ -329,7 +341,7 @@ export class CodexAppServerClient {
     private getNotReadyMcpServers(): string[] {
         const notReady: string[] = [];
         for (const [name, status] of this.mcpServerStatuses) {
-            if (status !== 'ready') notReady.push(name);
+            if (status.status !== 'ready') notReady.push(name);
         }
         return notReady;
     }
@@ -830,6 +842,7 @@ export class CodexAppServerClient {
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
         mcpServers?: Record<string, unknown>;
+        developerInstructions?: string;
     }): void {
         this.threadDefaults = {
             model: opts.model,
@@ -837,6 +850,7 @@ export class CodexAppServerClient {
             approvalPolicy: opts.approvalPolicy,
             sandbox: opts.sandbox,
             mcpServers: opts.mcpServers,
+            developerInstructions: opts.developerInstructions,
         };
     }
 
@@ -848,6 +862,7 @@ export class CodexAppServerClient {
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
         mcpServers?: Record<string, unknown>;
+        developerInstructions?: string;
     }): Promise<{ threadId: string; model: string }> {
         const params: NewConversationParams = {
             model: opts.model ?? null,
@@ -858,7 +873,7 @@ export class CodexAppServerClient {
             sandbox: opts.sandbox ?? null,
             config: this.buildThreadConfig(opts.mcpServers),
             baseInstructions: null,
-            developerInstructions: null,
+            developerInstructions: opts.developerInstructions ?? null,
             compactPrompt: null,
             includeApplyPatchTool: null,
             experimentalRawEvents: false,
@@ -880,6 +895,7 @@ export class CodexAppServerClient {
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
         mcpServers?: Record<string, unknown>;
+        developerInstructions?: string;
     }): Promise<{ threadId: string; model: string }> {
         const threadId = opts?.threadId ?? this._threadId;
         if (!threadId) {
@@ -896,7 +912,7 @@ export class CodexAppServerClient {
             sandbox: opts?.sandbox ?? defaults.sandbox ?? null,
             config: this.buildThreadConfig(opts?.mcpServers ?? defaults.mcpServers),
             baseInstructions: null,
-            developerInstructions: null,
+            developerInstructions: opts?.developerInstructions ?? defaults.developerInstructions ?? null,
             persistExtendedHistory: true,
         };
 
@@ -909,6 +925,7 @@ export class CodexAppServerClient {
             approvalPolicy: opts?.approvalPolicy ?? defaults.approvalPolicy,
             sandbox: opts?.sandbox ?? defaults.sandbox,
             mcpServers: opts?.mcpServers ?? defaults.mcpServers,
+            developerInstructions: opts?.developerInstructions ?? defaults.developerInstructions,
         });
         logger.debug('[CodexAppServer] Thread resumed:', this._threadId);
         return { threadId: result.thread.id, model: result.model };
@@ -921,6 +938,7 @@ export class CodexAppServerClient {
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
         mcpServers?: Record<string, unknown>;
+        developerInstructions?: string;
     }): Promise<{ threadId: string; model: string; thread: Thread }> {
         const defaults = this.threadDefaults ?? {};
         const params: ForkConversationParams = {
@@ -932,7 +950,7 @@ export class CodexAppServerClient {
             sandbox: opts.sandbox ?? defaults.sandbox ?? null,
             config: this.buildThreadConfig(opts.mcpServers ?? defaults.mcpServers),
             baseInstructions: null,
-            developerInstructions: null,
+            developerInstructions: opts.developerInstructions ?? defaults.developerInstructions ?? null,
             ephemeral: false,
             threadSource: null,
         };
@@ -946,6 +964,7 @@ export class CodexAppServerClient {
             approvalPolicy: opts.approvalPolicy ?? defaults.approvalPolicy,
             sandbox: opts.sandbox ?? defaults.sandbox,
             mcpServers: opts.mcpServers ?? defaults.mcpServers,
+            developerInstructions: opts.developerInstructions ?? defaults.developerInstructions,
         });
         logger.debug('[CodexAppServer] Thread forked:', opts.threadId, '->', this._threadId);
         return { threadId: result.thread.id, model: result.model, thread: result.thread };
@@ -960,6 +979,33 @@ export class CodexAppServerClient {
             includeTurns: opts.includeTurns ?? true,
         };
         return await this.request('thread/read', params) as ReadConversationResponse;
+    }
+
+    async listMcpServerStatus(opts: { threadId: string }): Promise<ListMcpServerStatusResponse> {
+        const data: ListMcpServerStatusResponse['data'] = [];
+        let cursor: string | null = null;
+        const seenCursors = new Set<string>();
+        do {
+            const params: ListMcpServerStatusParams = {
+                threadId: opts.threadId,
+                cursor,
+                limit: 100,
+                detail: 'toolsAndAuthOnly',
+            };
+            const result = await this.request('mcpServerStatus/list', params) as ListMcpServerStatusResponse;
+            data.push(...result.data);
+            cursor = result.nextCursor;
+            if (cursor && seenCursors.has(cursor)) {
+                throw new Error('Codex MCP status pagination returned a repeated cursor');
+            }
+            if (cursor) seenCursors.add(cursor);
+        } while (cursor);
+        return { data, nextCursor: null };
+    }
+
+    async compactThread(opts: { threadId: string }): Promise<CompactConversationResponse> {
+        const params: CompactConversationParams = { threadId: opts.threadId };
+        return await this.request('thread/compact/start', params) as CompactConversationResponse;
     }
 
     async rollbackThread(opts: {
@@ -1725,7 +1771,15 @@ export class CodexAppServerClient {
         if (method === 'mcpServer/startupStatus/updated') {
             logger.debug(`[CodexAppServer] mcpServer startup status:`, params);
             if (typeof params?.name === 'string' && typeof params?.status === 'string') {
-                this.mcpServerStatuses.set(params.name, params.status);
+                this.mcpServerStatuses.set(params.name, {
+                    ...(typeof params.threadId === 'string' ? { threadId: params.threadId } : {}),
+                    name: params.name,
+                    status: params.status,
+                    ...(typeof params.error === 'string' ? { error: params.error } : {}),
+                    ...(params.failureReason === 'reauthenticationRequired'
+                        ? { failureReason: params.failureReason }
+                        : {}),
+                });
             }
             return;
         }

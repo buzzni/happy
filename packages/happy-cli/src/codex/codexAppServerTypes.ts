@@ -181,6 +181,43 @@ export type InjectItemsParams = {
 
 export type InjectItemsResponse = Record<string, never>;
 
+export type CompactConversationParams = {
+    threadId: ThreadId;
+};
+
+export type CompactConversationResponse = Record<string, never>;
+
+// --- MCP runtime status ---
+
+export type McpServerStartupStatus = {
+    threadId?: string | null;
+    name: string;
+    status: 'starting' | 'ready' | 'failed' | 'cancelled' | string;
+    error?: string | null;
+    failureReason?: 'reauthenticationRequired' | null;
+};
+
+export type ListMcpServerStatusParams = {
+    cursor?: string | null;
+    limit?: number | null;
+    detail?: 'full' | 'toolsAndAuthOnly' | null;
+    threadId?: string | null;
+};
+
+export type McpServerStatus = {
+    name: string;
+    authStatus: 'unknown' | 'unsupported' | 'notLoggedIn' | 'bearerToken' | 'oAuth' | string;
+    tools: Record<string, unknown>;
+    serverInfo?: unknown | null;
+    resources?: unknown[];
+    resourceTemplates?: unknown[];
+};
+
+export type ListMcpServerStatusResponse = {
+    data: McpServerStatus[];
+    nextCursor: string | null;
+};
+
 // --- Turn lifecycle ---
 
 export type SendUserTurnParams = {

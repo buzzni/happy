@@ -135,6 +135,35 @@ describe('CodexMcpConfigSynchronizer', () => {
         }));
     });
 
+    it('reports a missing runtime MCP service distinctly from a fetch failure', async () => {
+        const onStatus = vi.fn();
+        const synchronizer = new CodexMcpConfigSynchronizer({
+            baseServers,
+            initialAplusServers,
+            fetchAplusServers: async () => ({
+                ok: false,
+                reason: 'mcp-config-missing' as const,
+                error: 'Expected MCP service configuration is missing: argos',
+                expected: ['argos'],
+                configured: [],
+                missing: [{ name: 'argos', reason: 'missing-headers' }],
+            }),
+            bridgeAplusServers: bridge,
+            onStatus,
+        });
+
+        await synchronizer.sync({ threadId: 'thread-1' });
+
+        expect(onStatus).toHaveBeenCalledWith(expect.objectContaining({
+            name: 'argos',
+            status: 'mcp-config-missing',
+            error: 'Expected MCP service configuration is missing: argos',
+        }));
+        expect(onStatus).not.toHaveBeenCalledWith(expect.objectContaining({
+            name: 'aplus-config',
+        }));
+    });
+
     it('keeps the active thread and current servers when config fetch throws', async () => {
         const resumeThread = vi.fn(async () => ({ threadId: 'thread-1', model: 'gpt-test' }));
         const synchronizer = new CodexMcpConfigSynchronizer({

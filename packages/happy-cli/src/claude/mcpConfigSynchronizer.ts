@@ -54,6 +54,17 @@ export class McpConfigSynchronizer {
                 }
                 return;
             }
+            if (result.reason === 'mcp-config-missing') {
+                for (const { name } of result.missing) {
+                    this.options.onStatus?.({
+                        name,
+                        status: 'mcp-config-missing',
+                        error: sanitizeMcpError(result.error),
+                        checkedAt: this.now(),
+                    });
+                }
+                return;
+            }
             this.emitConfigFailure(result.error);
             return;
         }

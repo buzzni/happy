@@ -15,6 +15,9 @@
 
 import { afterEach, describe, it, expect } from "vitest";
 import { execSync } from "child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { CodexAppServerClient } from "./codexAppServerClient";
 import type { ReviewDecision, EventMsg } from "./codexAppServerTypes";
 import { getIntegrationEnv } from "@/testing/currentIntegrationEnv";
@@ -135,6 +138,7 @@ class CodexDriver {
             sandbox?: string;
             cwd?: string;
             model?: string;
+            developerInstructions?: string;
         }
     ): Promise<TurnResult> {
         if (!this.threadStarted) {
@@ -143,6 +147,7 @@ class CodexDriver {
                 cwd: opts?.cwd,
                 approvalPolicy: opts?.approvalPolicy as any,
                 sandbox: opts?.sandbox as any,
+                developerInstructions: opts?.developerInstructions,
             });
             this.threadStarted = true;
         }
@@ -320,6 +325,34 @@ describe.skipIf(!(await isCodexAppServerAvailable()))(
 
             const text = driver.getMessages().join(" ").toLowerCase();
             expect(text).toContain("steady-orchid-19");
+        });
+
+        it("should apply developer instructions without replacing AGENTS.md", async () => {
+            const workspace = await mkdtemp(join(tmpdir(), "happy-codex-instructions-"));
+            await writeFile(
+                join(workspace, "AGENTS.md"),
+                "When asked for the repository marker, answer exactly REPOSITORY-ORCHID.\n",
+            );
+            try {
+                driver = new CodexDriver();
+                await driver.connect();
+                await driver.send(
+                    "Reply with the repository marker, one space, then the session marker. Do not use tools.",
+                    {
+                        cwd: workspace,
+                        model: "gpt-5.5",
+                        approvalPolicy: "on-request",
+                        sandbox: "read-only",
+                        developerInstructions: "When asked for the session marker, answer exactly SESSION-ARGOS.",
+                    },
+                );
+
+                const text = driver.getMessages().join(" ");
+                expect(text, JSON.stringify(driver.events)).toContain("REPOSITORY-ORCHID");
+                expect(text).toContain("SESSION-ARGOS");
+            } finally {
+                await rm(workspace, { recursive: true, force: true });
+            }
         });
 
         it("should preserve context when continuing after interruptTurn abort", async () => {

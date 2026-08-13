@@ -26,6 +26,7 @@ describe('shared wire message schemas', () => {
     }).success).toBe(true);
 
     for (const status of [
+      'mcp-config-missing',
       'connector-config-missing',
       'connector-runtime-failed',
       'connector-needs-auth',

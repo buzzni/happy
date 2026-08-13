@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildConnectorToolGuidance } from './connectorToolGuidance';
+import { buildConnectorToolGuidance, listExpectedMcpServices } from './connectorToolGuidance';
 
 describe('buildConnectorToolGuidance', () => {
     it('requires connector discovery before unsupported or browser fallback claims', () => {
@@ -14,5 +14,13 @@ describe('buildConnectorToolGuidance', () => {
 
     it('omits guidance when no personal connector is expected', () => {
         expect(buildConnectorToolGuidance([])).toBe('');
+    });
+
+    it('combines personal connectors and runtime MCP services while excluding internal servers', () => {
+        expect(listExpectedMcpServices({
+            expectedConnectors: ['gmail'],
+            expectedMcpServices: ['argos'],
+            configuredServerNames: ['happy', 'aplus-common', 'aplus-company', 'gmail', 'argos'],
+        })).toEqual(['argos', 'gmail']);
     });
 });

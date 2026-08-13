@@ -84,6 +84,31 @@ describe('McpConfigSynchronizer', () => {
         }));
     });
 
+    it('reports a missing runtime MCP service distinctly from a fetch failure', async () => {
+        const onStatus = vi.fn();
+        const synchronizer = new McpConfigSynchronizer({ setMcpServers: vi.fn() } as any, {
+            baseServers,
+            initialAplusServers,
+            fetchAplusServers: vi.fn(async () => ({
+                ok: false as const,
+                reason: 'mcp-config-missing' as const,
+                error: 'Expected MCP service configuration is missing: argos',
+                expected: ['argos'],
+                configured: [],
+                missing: [{ name: 'argos', reason: 'missing-headers' }],
+            })),
+            onStatus,
+        });
+
+        await synchronizer.sync();
+
+        expect(onStatus).toHaveBeenCalledWith(expect.objectContaining({
+            name: 'argos',
+            status: 'mcp-config-missing',
+        }));
+        expect(onStatus).not.toHaveBeenCalledWith(expect.objectContaining({ name: 'aplus-config' }));
+    });
+
     it('keeps last-known-good servers when config fetch throws', async () => {
         const setMcpServers = vi.fn();
         const onStatus = vi.fn();

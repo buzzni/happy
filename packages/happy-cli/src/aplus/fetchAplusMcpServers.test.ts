@@ -7,6 +7,8 @@ import {
 
 describe('fetchAplusMcpServersResult', () => {
     beforeEach(() => {
+        delete process.env.HAPPY_APLUS_EXPECTED_CONNECTORS;
+        delete process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES;
         process.env.HAPPY_APLUS_MCP_CONFIG_URL = 'http://aplus.test/api/me/mcp-config';
     });
 
@@ -15,6 +17,7 @@ describe('fetchAplusMcpServersResult', () => {
         delete process.env.HAPPY_APLUS_MCP_CONFIG_URL;
         delete process.env.HAPPY_APLUS_MCP_CALLER_GRANT;
         delete process.env.HAPPY_APLUS_EXPECTED_CONNECTORS;
+        delete process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES;
         delete process.env.HAPPY_APLUS_MCP_INITIAL_LIFECYCLE;
     });
 
@@ -158,5 +161,43 @@ describe('fetchAplusMcpServersResult', () => {
 
         expect(fetchMock).toHaveBeenCalledOnce();
         expect(process.env.HAPPY_APLUS_EXPECTED_CONNECTORS).toBe('["gmail"]');
+    });
+
+    it('treats an effectively connected Argos missing from config as mcp-config-missing', async () => {
+        const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+            mcpServers: {
+                'aplus-common': { type: 'http', url: 'https://saycode.test/mcp/common' },
+            },
+            mcpReadiness: {
+                status: 'mcp-config-missing',
+                expected: ['argos'],
+                configured: [],
+                missing: [{ name: 'argos', reason: 'missing-headers' }],
+            },
+        }), { status: 200 }));
+        vi.stubGlobal('fetch', fetchMock);
+
+        const result = await fetchAplusMcpServersResult(
+            'happy-secret-token',
+            'machine-1',
+            { sessionId: 'session-1', lifecycle: 'turn' },
+        );
+
+        expect(result).toEqual({
+            ok: false,
+            reason: 'mcp-config-missing',
+            error: 'Expected MCP service configuration is missing: argos',
+            expected: ['argos'],
+            configured: [],
+            missing: [{ name: 'argos', reason: 'missing-headers' }],
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES).toBe('["argos"]');
+        expect(mcpConfigFailureStatuses(result, 123)).toEqual([{
+            name: 'argos',
+            status: 'mcp-config-missing',
+            error: 'Expected MCP service configuration is missing: argos',
+            checkedAt: 123,
+        }]);
     });
 });
