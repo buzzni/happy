@@ -484,6 +484,8 @@ export interface BrowserLaunchResult {
     pid?: number;
     headless: boolean;
     ready: boolean;
+    /** false when the kernel forced a --no-sandbox retry (degraded). */
+    sandbox?: boolean;
 }
 
 export async function machineBrowserLaunch(machineId: string, profile: string): Promise<BrowserLaunchResult> {

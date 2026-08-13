@@ -720,9 +720,19 @@ export class ApiMachineClient {
             // Headless unless the machine actually has a display: on a
             // terminal-only box headful Chrome exits immediately.
             const headless = !process.env.DISPLAY;
-            const { pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless });
-            const ready = await waitForCdp(cdpPort, 15_000);
-            return { profile, cdpPort, userDataDir, pid, headless, ready };
+            let { pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless });
+            let ready = await waitForCdp(cdpPort, 15_000);
+            let sandbox = true;
+            if (!ready) {
+                // Kernels that block unprivileged user namespaces kill Chrome's
+                // zygote before it opens the CDP port, so "launched" is not
+                // "running". Retry once without the sandbox and report the
+                // downgrade rather than leaving a browser that never answers.
+                sandbox = false;
+                ({ pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless, noSandbox: true }));
+                ready = await waitForCdp(cdpPort, 15_000);
+            }
+            return { profile, cdpPort, userDataDir, pid, headless, ready, sandbox };
         });
 
         this.rpcHandlerManager.registerHandler('browser-setup:pair', async (params: any) => {

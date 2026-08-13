@@ -24,9 +24,31 @@ apt 명령 대신 데스크톱 안내를 돌려주도록 고쳤다(테스트로 
 - 변이 테스트로 `--enable-unsafe-extension-debugging` 과 `--headless=new`
   회귀 테스트가 실제로 잡아내는지 확인
 
+## RPC 계층 E2E (2026-08-13, Ubuntu 22.04 amd64 컨테이너)
+
+esbuild 로 harness 를 단일 번들로 묶어 컨테이너에 넣고, **실제로 등록된
+핸들러**(`ApiMachineClient.rpcHandlerManager.handlers`)를 호출했다 — 핸들러를
+재구현한 게 아니다. 실제 bridge + control server + Chrome 151 을 띄우고
+비-root 사용자로 실행해 sudo 없는 실제 서버 조건을 재현했다.
+
+7/7 통과: 핸들러 등록, Chrome 탐지, 설치 no-op, 기동(CDP 응답),
+두 번째 프로필의 포트·디렉터리 분리(9222/9223), 페어링 성공
+(debuggerTier=true), 상태에 프로필 반영.
+
+### E2E 가 잡은 결함 — 샌드박스
+
+첫 실행은 3/7 실패였다. Chrome 이 뜨긴 하는데 CDP 가 끝내 응답하지 않았다.
+원인은 `Failed to move to new namespace` — 커널이 비특권 user namespace 를
+막으면 Chrome zygote 가 시작 직후 죽는다. **컨테이너만의 문제가 아니다**:
+Ubuntu 23.10+ 는 이 설정이 기본이라 실제 서버에서도 같은 증상이 난다.
+
+`--no-sandbox` 를 무조건 붙이는 건 보안 강등이라(이 프로필이 사용자의
+로그인 세션을 들고 있다) 기본은 샌드박스 유지, CDP 가 응답하지 않을 때만
+1회 재시도하고 `sandbox: false` 로 강등 사실을 UI 까지 올린다.
+
 ## 남은 것
 
-- **실기 E2E 미검증**: 실제 Linux 머신에서 버튼 4개를 눌러 본 적은 없다.
-  순수 로직과 타입은 검증했지만, RPC 왕복과 UI 렌더는 미확인.
+- **UI 렌더는 여전히 미검증** — 앱 화면은 컨테이너로 못 돌린다. RPC
+  계층까지만 실기 확인했다.
 - 로그인 GUI 패널은 범위 밖(spec.md 참고).
 - 프로필 이름은 UI 에서 'default' 고정 — 입력란은 아직 없다.

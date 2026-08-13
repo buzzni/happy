@@ -33,6 +33,24 @@ describe('buildChromeLaunchArgs', () => {
         expect(args).not.toContain('--headless')
     })
 
+    it('keeps the sandbox on by default', () => {
+        // This browser holds the user's logged-in sessions, so the renderer
+        // sandbox stays on unless the kernel refuses to allow it.
+        const args = buildChromeLaunchArgs({ userDataDir: '/p/a', cdpPort: 9222 })
+
+        expect(args).not.toContain('--no-sandbox')
+    })
+
+    it('can drop the sandbox when the kernel blocks user namespaces', () => {
+        // Ubuntu 23.10+ restricts unprivileged user namespaces by default and
+        // containers often do the same; Chrome then dies at startup with
+        // "Failed to move to new namespace" and never opens its CDP port.
+        // Verified in an Ubuntu 22.04 container on 2026-08-13.
+        const args = buildChromeLaunchArgs({ userDataDir: '/p/a', cdpPort: 9222, noSandbox: true })
+
+        expect(args).toContain('--no-sandbox')
+    })
+
     it('omits headless entirely when running under a display', () => {
         const args = buildChromeLaunchArgs({ userDataDir: '/p/a', cdpPort: 9222, headless: false })
 

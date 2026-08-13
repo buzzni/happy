@@ -183,9 +183,17 @@ export default function MachineDetailScreen() {
             setLaunchedCdpPort(result.cdpPort);
             Modal.alert(
                 result.ready ? '브라우저 실행됨' : '브라우저를 띄웠지만 응답이 없습니다',
-                result.ready
-                    ? `프로필 ${result.profile} · CDP 포트 ${result.cdpPort}\n이제 페어링을 실행하세요.`
-                    : `CDP 포트 ${result.cdpPort}가 아직 응답하지 않습니다. 잠시 후 페어링을 시도하세요.`
+                [
+                    result.ready
+                        ? `프로필 ${result.profile} · CDP 포트 ${result.cdpPort}\n이제 페어링을 실행하세요.`
+                        : `CDP 포트 ${result.cdpPort}가 아직 응답하지 않습니다. 잠시 후 페어링을 시도하세요.`,
+                    // Surfaced because it is a real security downgrade, not a
+                    // detail: the kernel refused Chrome's sandbox and this
+                    // profile holds the user's logged-in sessions.
+                    result.sandbox === false
+                        ? '\n주의: 커널이 샌드박스를 막아 --no-sandbox 로 실행했습니다.'
+                        : null,
+                ].filter(Boolean).join('')
             );
         } catch (error) {
             Modal.alert(t('common.error'), error instanceof Error ? error.message : '브라우저를 띄우지 못했습니다.');

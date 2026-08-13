@@ -21,9 +21,17 @@ export interface ChromeLaunchOptions {
     cdpPort: number
     /** Omitted means headful — the caller decides based on DISPLAY. */
     headless?: boolean
+    /**
+     * Last-resort fallback for kernels that block unprivileged user
+     * namespaces (Ubuntu 23.10+ by default, most containers). Chrome's zygote
+     * dies at startup there — "Failed to move to new namespace" — and never
+     * opens its CDP port, so the browser looks launched but is not.
+     * Off by default: this profile holds the user's logged-in sessions.
+     */
+    noSandbox?: boolean
 }
 
-export function buildChromeLaunchArgs({ userDataDir, cdpPort, headless }: ChromeLaunchOptions): string[] {
+export function buildChromeLaunchArgs({ userDataDir, cdpPort, headless, noSandbox }: ChromeLaunchOptions): string[] {
     const args = [
         `--remote-debugging-port=${cdpPort}`,
         `--user-data-dir=${userDataDir}`,
@@ -38,6 +46,9 @@ export function buildChromeLaunchArgs({ userDataDir, cdpPort, headless }: Chrome
         // `--headless=new` specifically: bare --headless is --headless=old,
         // which supports no extensions at all.
         args.push('--headless=new')
+    }
+    if (noSandbox) {
+        args.push('--no-sandbox')
     }
     return args
 }
