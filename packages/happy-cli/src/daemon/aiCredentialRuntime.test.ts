@@ -1,10 +1,12 @@
 import type { spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { delimiter, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import {
   AiCredentialRuntimeError,
   createAiCredentialRuntime,
   runAiCredentialCommand,
+  withUvToolBinOnPath,
   type AiCredentialCommandResult,
   type AiCredentialRuntimeDependencies,
 } from './aiCredentialRuntime'
@@ -72,6 +74,31 @@ function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
 }
 
 describe('AI credential machine runtime', () => {
+  it('prepends the managed uv tool bin without mutating the daemon environment', () => {
+    const environment = { PATH: '/usr/bin', UV_TOOL_BIN_DIR: '/managed/bin' }
+
+    expect(withUvToolBinOnPath(environment, '/home/operator')).toEqual({
+      PATH: ['/managed/bin', '/usr/bin'].join(delimiter),
+      UV_TOOL_BIN_DIR: '/managed/bin',
+    })
+    expect(environment.PATH).toBe('/usr/bin')
+
+    expect(withUvToolBinOnPath({ PATH: '/usr/bin' }, '/home/operator').PATH)
+      .toBe([join('/home/operator', '.local', 'bin'), '/usr/bin'].join(delimiter))
+    expect(withUvToolBinOnPath({
+      PATH: '/usr/bin',
+      XDG_BIN_HOME: '/xdg/bin',
+      XDG_DATA_HOME: '/ignored/data',
+    }, '/home/operator').PATH).toBe(['/xdg/bin', '/usr/bin'].join(delimiter))
+    expect(withUvToolBinOnPath({
+      PATH: '/usr/bin',
+      XDG_DATA_HOME: '/xdg/data',
+    }, '/home/operator').PATH).toBe([
+      join('/xdg/data', '..', 'bin'),
+      '/usr/bin',
+    ].join(delimiter))
+  })
+
   it('exports Claude credentials with fixed argv and a payload size cap', async () => {
     const { runtime, calls } = setup()
 
@@ -412,6 +439,7 @@ describe('AI credential machine runtime', () => {
 
     const result = runAiCredentialCommand('cswap', ['export', '-'], {}, spawnCommand)
     expect(spawnCommand).toHaveBeenCalledWith('cswap', ['export', '-'], {
+      env: expect.any(Object),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     })
@@ -420,5 +448,38 @@ describe('AI credential machine runtime', () => {
     child.emit('close', 0)
 
     await expect(result).resolves.toEqual({ stdout: '{"complete":true}', stderr: '' })
+  })
+
+  it('does not let the uv tool bin shadow non-cswap commands', async () => {
+    const previousPath = process.env.PATH
+    const previousToolBin = process.env.UV_TOOL_BIN_DIR
+    let spawnedEnvironment: NodeJS.ProcessEnv | undefined
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      kill: vi.fn(),
+    })
+    const spawnCommand = vi.fn((
+      _command: string,
+      _args: readonly string[],
+      options: { env?: NodeJS.ProcessEnv },
+    ) => {
+      spawnedEnvironment = options.env
+      return child
+    }) as unknown as typeof spawn
+
+    try {
+      process.env.PATH = '/usr/bin'
+      process.env.UV_TOOL_BIN_DIR = '/managed/bin'
+      const result = runAiCredentialCommand('codex', ['login', 'status'], {}, spawnCommand)
+      expect(spawnedEnvironment?.PATH).toBe('/usr/bin')
+      child.emit('close', 0)
+      await expect(result).resolves.toEqual({ stdout: '', stderr: '' })
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH
+      else process.env.PATH = previousPath
+      if (previousToolBin === undefined) delete process.env.UV_TOOL_BIN_DIR
+      else process.env.UV_TOOL_BIN_DIR = previousToolBin
+    }
   })
 })

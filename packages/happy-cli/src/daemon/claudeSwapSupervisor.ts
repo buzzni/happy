@@ -1,8 +1,9 @@
 import { spawn as nodeSpawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { dirname } from 'node:path'
-import type { AiCredentialRotationStatus } from './aiCredentialRuntime'
+import { withUvToolBinOnPath, type AiCredentialRotationStatus } from './aiCredentialRuntime'
 
 export type ClaudeSwapChild = {
   pid?: number
@@ -199,6 +200,7 @@ export function createClaudeSwapSupervisor(stateFile: string): ClaudeSwapSupervi
       await rename(temp, stateFile)
     },
     spawn: (command, args) => nodeSpawn(command, args, {
+      env: withUvToolBinOnPath(process.env, homedir()),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     }),

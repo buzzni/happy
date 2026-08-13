@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 const CLAUDE_SWAP_VERSION = '0.25.0'
@@ -325,6 +325,7 @@ export function runAiCredentialCommand(
 ): Promise<AiCredentialCommandResult> {
   return new Promise((resolve, reject) => {
     const child = spawnCommand(command, args, {
+      env: command === 'cswap' ? withUvToolBinOnPath() : process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     })
@@ -367,6 +368,24 @@ export function runAiCredentialCommand(
     })
     timeout = setTimeout(() => fail('COMMAND_TIMED_OUT'), options.timeoutMs ?? 30_000)
   })
+}
+
+export function withUvToolBinOnPath(
+  environment: NodeJS.ProcessEnv = process.env,
+  homeDir: string = homedir(),
+): NodeJS.ProcessEnv {
+  const toolBin = environment.UV_TOOL_BIN_DIR
+    || environment.XDG_BIN_HOME
+    || (environment.XDG_DATA_HOME
+      ? join(environment.XDG_DATA_HOME, '..', 'bin')
+      : join(homeDir, '.local', 'bin'))
+  const pathKey = Object.keys(environment).find((key) => key.toUpperCase() === 'PATH') ?? 'PATH'
+  const currentPath = environment[pathKey] ?? ''
+  if (currentPath.split(delimiter).includes(toolBin)) return environment
+  return {
+    ...environment,
+    [pathKey]: currentPath ? `${toolBin}${delimiter}${currentPath}` : toolBin,
+  }
 }
 
 export type AiCredentialRuntime = ReturnType<typeof createAiCredentialRuntime>
