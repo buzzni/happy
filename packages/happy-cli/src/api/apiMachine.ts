@@ -32,6 +32,20 @@ import { createPtySession } from '@/daemon/remoteTerminal';
 import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
 import { validatePath } from '@/modules/common/pathSecurity';
 import { existsSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { createServer } from 'node:net';
+import { exec } from 'node:child_process';
+import { readDaemonState } from '@/persistence';
+import { fetchBrowserStatus } from '@/daemon/browserClient';
+import { runPairing, formatPairOutcome } from '@/commands/browserPair';
+import {
+    canSudoWithoutPassword,
+    detectChrome,
+    isCdpReachable,
+    launchChrome,
+    planChromeInstall,
+    resolveProfileUserDataDir,
+} from '@/daemon/browserSetup';
 import { readFile } from 'node:fs/promises';
 import {
     addDaemonTerminalSession,
@@ -660,6 +674,99 @@ export class ApiMachineClient {
                 }
                 throw error;
             }
+        });
+
+        // Browser bridge setup, driven by buttons on the machine screen so a
+        // terminal-only Linux box needs no SSH session. See
+        // specs/browser-setup-gui/.
+        this.rpcHandlerManager.registerHandler('browser-setup:status', async () => {
+            const chrome = await detectChrome();
+            const state = await readDaemonState();
+            const controlPort = state?.httpPort;
+            const status = controlPort ? await fetchBrowserStatus(controlPort) : null;
+            return {
+                chromeInstalled: Boolean(chrome),
+                chromePath: chrome?.path ?? null,
+                chromeVersion: chrome?.version ?? null,
+                canSudo: chrome ? false : await canSudoWithoutPassword(),
+                connections: status?.connections ?? [],
+                daemonRunning: Boolean(controlPort),
+            };
+        });
+
+        this.rpcHandlerManager.registerHandler('browser-setup:install-chrome', async () => {
+            const chrome = await detectChrome();
+            const plan = planChromeInstall({
+                chromePath: chrome?.path ?? null,
+                canSudo: chrome ? true : await canSudoWithoutPassword(),
+            });
+            if (plan.action !== 'run') {
+                // 'manual' deliberately reaches the UI as a non-success: no
+                // root means no install, and saying otherwise would leave the
+                // user hunting for a Chrome that was never placed.
+                return plan;
+            }
+            const result = await runShell(plan.command);
+            const installed = await detectChrome();
+            return {
+                action: 'run',
+                command: plan.command,
+                ok: Boolean(installed),
+                chromePath: installed?.path ?? null,
+                stderr: result.ok ? undefined : result.output,
+            };
+        });
+
+        this.rpcHandlerManager.registerHandler('browser-setup:launch', async (params: any) => {
+            const profile = typeof params?.profile === 'string' && params.profile.trim()
+                ? params.profile.trim()
+                : 'default';
+            const chrome = await detectChrome();
+            if (!chrome) {
+                throw new Error('Chrome이 설치되어 있지 않습니다. 먼저 설치를 실행하세요.');
+            }
+            const userDataDir = resolveProfileUserDataDir(
+                join(configuration.happyHomeDir, 'chrome-profiles'),
+                profile,
+            );
+            const cdpPort = await pickFreeCdpPort();
+            if (cdpPort === null) {
+                throw new Error('사용 가능한 CDP 포트를 찾지 못했습니다.');
+            }
+            // Headless unless the machine actually has a display: on a
+            // terminal-only box headful Chrome exits immediately.
+            const headless = !process.env.DISPLAY;
+            let { pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless });
+            let ready = await waitForCdp(cdpPort, 15_000);
+            let sandbox = true;
+            if (!ready) {
+                // Kernels that block unprivileged user namespaces kill Chrome's
+                // zygote before it opens the CDP port, so "launched" is not
+                // "running". Retry once without the sandbox and report the
+                // downgrade rather than leaving a browser that never answers.
+                sandbox = false;
+                ({ pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless, noSandbox: true }));
+                ready = await waitForCdp(cdpPort, 15_000);
+            }
+            return { profile, cdpPort, userDataDir, pid, headless, ready, sandbox };
+        });
+
+        this.rpcHandlerManager.registerHandler('browser-setup:pair', async (params: any) => {
+            const cdpPort = Number(params?.cdpPort);
+            if (!Number.isInteger(cdpPort) || cdpPort <= 0) {
+                throw new Error('cdpPort is required');
+            }
+            // Same sequence the CLI runs — reused, not reimplemented, so the
+            // two paths cannot drift (specs/browser-setup-gui/ AC6).
+            const facts = await runPairing({ cdpPort, debuggerTier: params?.debuggerTier !== false });
+            const outcome = formatPairOutcome(facts);
+            return {
+                ok: outcome.ok,
+                message: stripAnsi(outcome.text),
+                connections: facts.connections,
+                freshProfiles: facts.freshProfiles,
+                debuggerTier: facts.debuggerTierActual ?? null,
+            };
         });
 
         // Register stop daemon handler
@@ -1408,4 +1515,51 @@ export class ApiMachineClient {
             logger.debug('[API MACHINE] Socket closed');
         }
     }
+}
+
+/** Chrome's conventional CDP port, then a small range for extra profiles. */
+const CDP_PORT_RANGE = [9222, 9223, 9224, 9225, 9226, 9227, 9228] as const;
+
+function isPortFree(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+        const server = createServer();
+        server.once('error', () => resolve(false));
+        server.once('listening', () => server.close(() => resolve(true)));
+        server.listen(port, '127.0.0.1');
+    });
+}
+
+/**
+ * A distinct CDP port per profile. Reusing one port makes the second Chrome
+ * fail to expose CDP at all, which surfaces later as an unexplainable
+ * pairing timeout (specs/browser-setup-gui/ AC5).
+ */
+async function pickFreeCdpPort(): Promise<number | null> {
+    for (const port of CDP_PORT_RANGE) {
+        if (await isPortFree(port)) return port;
+    }
+    return null;
+}
+
+/** Chrome needs a moment before its CDP endpoint answers. */
+async function waitForCdp(cdpPort: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (await isCdpReachable(cdpPort)) return true;
+        await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    return false;
+}
+
+function runShell(command: string): Promise<{ ok: boolean; output: string }> {
+    return new Promise((resolve) => {
+        exec(command, { timeout: 300_000 }, (error, stdout, stderr) => {
+            resolve({ ok: !error, output: `${stdout}${stderr}`.trim() });
+        });
+    });
+}
+
+/** The CLI formatter colours its output; the app renders plain text. */
+function stripAnsi(text: string): string {
+    return text.replace(/\u001b\[[0-9;]*m/g, '');
 }

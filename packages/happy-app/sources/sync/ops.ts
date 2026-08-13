@@ -443,6 +443,76 @@ export async function machineDelete(machineId: string): Promise<{ success: boole
 }
 
 /**
+ * Browser bridge setup on a machine — the buttons that replace the SSH
+ * session documented in docs/browser-bridge-headless.md.
+ * See specs/browser-setup-gui/.
+ */
+export interface BrowserSetupStatus {
+    chromeInstalled: boolean;
+    chromePath: string | null;
+    chromeVersion: string | null;
+    canSudo: boolean;
+    connections: Array<{ profile: string }>;
+    daemonRunning: boolean;
+}
+
+export async function machineBrowserSetupStatus(machineId: string): Promise<BrowserSetupStatus> {
+    return apiSocket.machineRPC<BrowserSetupStatus, {}>(machineId, 'browser-setup:status', {});
+}
+
+/**
+ * `action: 'manual'` means the machine has no root and therefore no way to
+ * install Chrome — the caller must show `command` rather than report success.
+ */
+export interface BrowserInstallResult {
+    action: 'already-installed' | 'run' | 'manual';
+    command?: string;
+    reason?: string;
+    ok?: boolean;
+    chromePath?: string | null;
+    stderr?: string;
+}
+
+export async function machineBrowserInstallChrome(machineId: string): Promise<BrowserInstallResult> {
+    return apiSocket.machineRPC<BrowserInstallResult, {}>(machineId, 'browser-setup:install-chrome', {});
+}
+
+export interface BrowserLaunchResult {
+    profile: string;
+    cdpPort: number;
+    userDataDir: string;
+    pid?: number;
+    headless: boolean;
+    ready: boolean;
+    /** false when the kernel forced a --no-sandbox retry (degraded). */
+    sandbox?: boolean;
+}
+
+export async function machineBrowserLaunch(machineId: string, profile: string): Promise<BrowserLaunchResult> {
+    return apiSocket.machineRPC<BrowserLaunchResult, { profile: string }>(
+        machineId,
+        'browser-setup:launch',
+        { profile }
+    );
+}
+
+export interface BrowserPairResult {
+    ok: boolean;
+    message: string;
+    connections: Array<{ profile: string }>;
+    freshProfiles: string[];
+    debuggerTier: boolean | null;
+}
+
+export async function machineBrowserPair(machineId: string, cdpPort: number): Promise<BrowserPairResult> {
+    return apiSocket.machineRPC<BrowserPairResult, { cdpPort: number; debuggerTier: boolean }>(
+        machineId,
+        'browser-setup:pair',
+        { cdpPort, debuggerTier: true }
+    );
+}
+
+/**
  * Stop the daemon on a specific machine
  */
 export async function machineStopDaemon(machineId: string): Promise<{ message: string }> {
