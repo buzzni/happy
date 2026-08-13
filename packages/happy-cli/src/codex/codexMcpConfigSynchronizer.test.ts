@@ -164,6 +164,31 @@ describe('CodexMcpConfigSynchronizer', () => {
         }));
     });
 
+    it('preserves connector-specific status from unified MCP readiness', async () => {
+        const onStatus = vi.fn();
+        const synchronizer = new CodexMcpConfigSynchronizer({
+            baseServers,
+            initialAplusServers,
+            fetchAplusServers: async () => ({
+                ok: false,
+                reason: 'mcp-config-missing' as const,
+                error: 'Expected MCP service configuration is missing: gmail',
+                expected: ['gmail'],
+                configured: [],
+                missing: [{ name: 'gmail', reason: 'connector-config-missing' }],
+            }),
+            bridgeAplusServers: bridge,
+            onStatus,
+        });
+
+        await synchronizer.sync({ threadId: 'thread-1' });
+
+        expect(onStatus).toHaveBeenCalledWith(expect.objectContaining({
+            name: 'gmail',
+            status: 'connector-config-missing',
+        }));
+    });
+
     it('keeps the active thread and current servers when config fetch throws', async () => {
         const resumeThread = vi.fn(async () => ({ threadId: 'thread-1', model: 'gpt-test' }));
         const synchronizer = new CodexMcpConfigSynchronizer({

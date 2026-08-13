@@ -209,6 +209,33 @@ describe('fetchAplusMcpServersResult', () => {
         }]);
     });
 
+    it('preserves connector-specific status inside unified MCP readiness', () => {
+        expect(mcpConfigFailureStatuses({
+            ok: false,
+            reason: 'mcp-config-missing',
+            error: 'Expected MCP service configuration is missing: argos, gmail',
+            expected: ['argos', 'gmail'],
+            configured: [],
+            missing: [
+                { name: 'argos', reason: 'missing-headers' },
+                { name: 'gmail', reason: 'connector-config-missing' },
+            ],
+        }, 123)).toEqual([
+            {
+                name: 'argos',
+                status: 'mcp-config-missing',
+                error: 'Expected MCP service configuration is missing: argos, gmail',
+                checkedAt: 123,
+            },
+            {
+                name: 'gmail',
+                status: 'connector-config-missing',
+                error: 'Expected MCP service configuration is missing: argos, gmail',
+                checkedAt: 123,
+            },
+        ]);
+    });
+
     it('clears stale expected MCP services from authoritative empty readiness', async () => {
         process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES = '["argos"]';
         vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({

@@ -66,9 +66,11 @@ export function mcpConfigFailureStatuses(
         }))
     }
     if (result.reason === 'mcp-config-missing') {
-        return result.missing.map(({ name }) => ({
+        return result.missing.map(({ name, reason }) => ({
             name,
-            status: 'mcp-config-missing',
+            status: reason === 'connector-config-missing'
+                ? 'connector-config-missing'
+                : 'mcp-config-missing',
             error: result.error,
             checkedAt,
         }))
