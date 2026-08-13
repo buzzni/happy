@@ -1,0 +1,176 @@
+import { describe, expect, it, vi } from 'vitest'
+import {
+  createAiCredentialRuntime,
+  type AiCredentialCommandResult,
+  type AiCredentialRuntimeDependencies,
+} from './aiCredentialRuntime'
+
+function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
+  const calls: Array<{ command: string; args: string[]; input?: string }> = []
+  const files = new Map<string, string>()
+  const execFile = vi.fn(async (
+    command: string,
+    args: string[],
+    options?: { input?: string },
+  ): Promise<AiCredentialCommandResult> => {
+    calls.push({ command, args, input: options?.input })
+    if (command === 'cswap' && args[0] === 'export') {
+      return { stdout: '{"version":1,"encrypted":false,"accounts":[{}]}', stderr: '' }
+    }
+    if (command === 'cswap' && args[0] === '--version') {
+      return { stdout: 'claude-swap 0.25.0', stderr: '' }
+    }
+    if (command === 'cswap' && args[0] === 'list') {
+      return {
+        stdout: JSON.stringify({ activeAccount: { email: 'owner@example.com', accessToken: 'secret' } }),
+        stderr: '',
+      }
+    }
+    return { stdout: '', stderr: '' }
+  })
+  const supervisor = {
+    enable: vi.fn(async () => undefined),
+    stop: vi.fn(async () => undefined),
+    status: vi.fn(() => ({ state: 'running' as const, lastErrorKind: null })),
+  }
+  const runtime = createAiCredentialRuntime({
+    homeDir: '/home/operator',
+    env: {},
+    execFile,
+    readFile: vi.fn(async (path: string) => files.get(path) ?? Promise.reject(Object.assign(new Error('missing'), { code: 'ENOENT' }))),
+    writeFile: vi.fn(async (path: string, content: string) => { files.set(path, content) }),
+    mkdir: vi.fn(async () => undefined),
+    rename: vi.fn(async (from: string, to: string) => {
+      const value = files.get(from)
+      if (value === undefined) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+      files.set(to, value)
+      files.delete(from)
+    }),
+    chmod: vi.fn(async () => undefined),
+    rm: vi.fn(async (path: string, options?: { recursive?: boolean }) => {
+      for (const filePath of files.keys()) {
+        if (filePath === path || (options?.recursive && filePath.startsWith(`${path}/`))) {
+          files.delete(filePath)
+        }
+      }
+    }),
+    makeTempDir: vi.fn(async () => '/tmp/happy-ai-credential-fixed'),
+    supervisor,
+    ...overrides,
+  })
+  return { runtime, calls, files, supervisor }
+}
+
+describe('AI credential machine runtime', () => {
+  it('exports Claude credentials with fixed argv and a payload size cap', async () => {
+    const { runtime, calls } = setup()
+
+    await expect(runtime.capture({ provider: 'claude' })).resolves.toEqual({
+      provider: 'claude',
+      payload: '{"version":1,"encrypted":false,"accounts":[{}]}',
+    })
+    expect(calls).toEqual([{ command: 'cswap', args: ['export', '-'], input: undefined }])
+
+    const oversized = 'x'.repeat(1024 * 1024 + 1)
+    const { runtime: capped } = setup({
+      execFile: vi.fn(async () => ({ stdout: oversized, stderr: '' })),
+    })
+    await expect(capped.capture({ provider: 'claude' })).rejects.toMatchObject({
+      kind: 'PAYLOAD_TOO_LARGE',
+    })
+  })
+
+  it('reads Codex credentials from CODEX_HOME only and rejects unsupported providers', async () => {
+    const { runtime, files } = setup({ env: { CODEX_HOME: '/fixed/codex' } })
+    files.set('/fixed/codex/auth.json', '{"OPENAI_API_KEY":"secret"}')
+
+    await expect(runtime.capture({ provider: 'codex' })).resolves.toEqual({
+      provider: 'codex',
+      payload: '{"OPENAI_API_KEY":"secret"}',
+    })
+    await expect(runtime.capture({ provider: '../etc/passwd' as never })).rejects.toThrow(/provider/i)
+  })
+
+  it('installs, configures, and imports Claude credentials without putting the secret in argv', async () => {
+    const { runtime, calls, files, supervisor } = setup()
+    const payload = '{"token":"never-in-argv"}'
+
+    await expect(runtime.apply({ provider: 'claude', payload })).resolves.toMatchObject({
+      provider: 'claude',
+      configured: true,
+      rotation: { state: 'running' },
+    })
+
+    expect(calls.map(({ command, args }) => [command, args])).toEqual([
+      ['uv', ['--version']],
+      ['uv', ['python', 'find', '>=3.12']],
+      ['cswap', ['--version']],
+      ['cswap', ['config', 'set', 'autoswitch.threshold', '95']],
+      ['cswap', ['config', 'set', 'autoswitch.strategy', 'consume-first']],
+      ['cswap', ['import', '/tmp/happy-ai-credential-fixed/claude-swap.json', '--force']],
+      ['cswap', ['list', '--json']],
+    ])
+    expect(JSON.stringify(calls.map(({ command, args }) => ({ command, args })))).not.toContain('never-in-argv')
+    expect(files.has('/tmp/happy-ai-credential-fixed/claude-swap.json')).toBe(false)
+    expect(supervisor.enable).toHaveBeenCalledOnce()
+  })
+
+  it('installs the managed claude-swap version when the current version differs', async () => {
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'cswap' && args[0] === '--version') {
+        return { stdout: 'claude-swap 0.24.0', stderr: '' }
+      }
+      if (command === 'cswap' && args[0] === 'list') {
+        return { stdout: '{}', stderr: '' }
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime } = setup({ execFile })
+
+    await runtime.apply({ provider: 'claude', payload: '{}' })
+
+    expect(execFile).toHaveBeenCalledWith('uv', [
+      'tool', 'install', 'claude-swap==0.25.0', '--python', '>=3.12', '--force',
+    ])
+  })
+
+  it('atomically applies Codex auth with mode 0600 and reports only login status', async () => {
+    const chmod = vi.fn(async () => undefined)
+    const { runtime, files, calls } = setup({ chmod })
+    files.set('/home/operator/.codex/auth.json', '{"OPENAI_API_KEY":"old"}')
+
+    await expect(runtime.apply({
+      provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
+    })).resolves.toEqual({ provider: 'codex', configured: true, status: 'authenticated' })
+
+    expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"new-secret"}')
+    expect(files.get('/home/operator/.codex/auth.json.happy-backup')).toBe('{"OPENAI_API_KEY":"old"}')
+    expect(chmod).toHaveBeenCalledWith('/home/operator/.codex/auth.json', 0o600)
+    expect(calls.at(-1)).toEqual({ command: 'codex', args: ['login', 'status'], input: undefined })
+    expect(JSON.stringify(calls)).not.toContain('new-secret')
+  })
+
+  it('preserves the existing Codex auth when the backup cannot be created', async () => {
+    const rename = vi.fn(async () => {
+      throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
+    })
+    const { runtime, files } = setup({ rename })
+    files.set('/home/operator/.codex/auth.json', '{"OPENAI_API_KEY":"old"}')
+
+    await expect(runtime.apply({
+      provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
+    })).rejects.toMatchObject({ kind: 'CODEX_BACKUP_FAILED' })
+    expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"old"}')
+  })
+
+  it('redacts Claude account status instead of returning command output', async () => {
+    const { runtime } = setup()
+
+    await expect(runtime.status({ provider: 'claude' })).resolves.toEqual({
+      provider: 'claude',
+      configured: true,
+      activeAccount: 'o***@example.com',
+      rotation: { state: 'running', lastErrorKind: null },
+    })
+  })
+})
