@@ -11,11 +11,15 @@ export function prepareCodexInitialPrompt(input: {
   env: NodeJS.ProcessEnv
   reconnectSessionId?: string
   automationRunOnceRequested: boolean
+  allowAutomationReconnectPrompt?: boolean
 }): PreparedCodexInitialPrompt {
   const consumedPrompt = consumePendingInitialPrompt(input.env)
-  const prompt = consumedPrompt && !input.reconnectSessionId ? consumedPrompt : null
+  const prompt = consumedPrompt
+    && (!input.reconnectSessionId || input.allowAutomationReconnectPrompt)
+    ? consumedPrompt
+    : null
 
-  if (input.automationRunOnceRequested && !prompt) {
+  if ((input.automationRunOnceRequested || input.allowAutomationReconnectPrompt) && !prompt) {
     throw new Error('Codex automation cannot start without a fresh initial prompt')
   }
 

@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { hasLiveDaemonChild, shareInFlight } from './resumeGuards';
+import {
+    decideAutomationResumePreflight,
+    hasLiveDaemonChild,
+    resolveAutomationDirectoryMatch,
+    shareInFlight,
+} from './resumeGuards';
 
 // 2026-08-05 incident: two resume-happy-session RPCs 6.7s apart spawned two CLI
 // processes for the same happy session. Both attached, both idle, both were
@@ -38,6 +43,62 @@ describe('hasLiveDaemonChild', () => {
             { happySessionId: 'session-1', pid: 99 },
             { happySessionId: 'session-1', pid: 100 },
         ], (pid) => pid !== 99)).toBe(true);
+    });
+});
+
+describe('decideAutomationResumePreflight', () => {
+    it('falls back immediately when a live target belongs to another directory', () => {
+        expect(decideAutomationResumePreflight({
+            resumeInFlight: false,
+            live: true,
+            sameDirectory: false,
+        })).toBe('fallback');
+    });
+
+    it('keeps a same-directory or unresolved live target busy to protect the writer', () => {
+        expect(decideAutomationResumePreflight({
+            resumeInFlight: false,
+            live: true,
+            sameDirectory: true,
+        })).toBe('busy');
+        expect(decideAutomationResumePreflight({
+            resumeInFlight: false,
+            live: true,
+            sameDirectory: null,
+        })).toBe('busy');
+    });
+
+    it('keeps an in-flight resume busy and otherwise proceeds', () => {
+        expect(decideAutomationResumePreflight({
+            resumeInFlight: true,
+            live: false,
+            sameDirectory: false,
+        })).toBe('busy');
+        expect(decideAutomationResumePreflight({
+            resumeInFlight: false,
+            live: false,
+            sameDirectory: false,
+        })).toBe('resume');
+    });
+});
+
+describe('resolveAutomationDirectoryMatch', () => {
+    it('recognizes symlink and canonical paths that resolve to the same directory', async () => {
+        const realpath = async (path: string) => path === '/repo-link' ? '/actual/repo' : path;
+
+        await expect(resolveAutomationDirectoryMatch(
+            '/repo-link',
+            '/actual/repo',
+            realpath,
+        )).resolves.toBe(true);
+    });
+
+    it('returns unknown when either directory cannot be resolved safely', async () => {
+        await expect(resolveAutomationDirectoryMatch(
+            '/missing',
+            '/repo',
+            async () => { throw new Error('missing'); },
+        )).resolves.toBeNull();
     });
 });
 

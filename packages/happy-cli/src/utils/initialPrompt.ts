@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
 import type { RawJSONLines } from '@/claude/types'
+import type { PermissionMode } from '@/api/types'
 
 /** Read a daemon-provided initial prompt exactly once without leaking it to children. */
 export function consumePendingInitialPrompt(env: NodeJS.ProcessEnv): string | null {
@@ -9,6 +10,13 @@ export function consumePendingInitialPrompt(env: NodeJS.ProcessEnv): string | nu
   if (typeof raw !== 'string') return null
   const text = raw.trim()
   return text.length > 0 ? text : null
+}
+
+export function resolveInitialPromptPermissionMode(
+  currentMode: PermissionMode,
+  automationResume: boolean,
+): PermissionMode {
+  return automationResume ? 'bypassPermissions' : currentMode
 }
 
 /** Build the synthetic user record used to make a daemon prompt visible in history. */

@@ -75,6 +75,7 @@ import {
     prepareCodexSessionStart,
 } from './initialPrompt';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
+import { resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
@@ -96,10 +97,13 @@ export async function runCodex(opts: {
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
     const reconnectSession = readReconnectSessionEnvironment(process.env);
     const reconnectSessionId = reconnectSession?.id;
+    const allowAutomationReconnectPrompt = process.env.HAPPY_AUTOMATION_RESUME_PROMPT === '1';
+    delete process.env.HAPPY_AUTOMATION_RESUME_PROMPT;
     const preparedInitialPrompt = prepareCodexInitialPrompt({
         env: process.env,
         reconnectSessionId,
         automationRunOnceRequested,
+        allowAutomationReconnectPrompt,
     });
 
     // Early check: ensure Codex CLI is installed before proceeding
@@ -234,6 +238,9 @@ export async function runCodex(opts: {
     if (reconnectSessionId) {
         session.suppressNextArchiveSignal();
         session.skipExistingMessages(response?.seq ?? 0);
+        if (allowAutomationReconnectPrompt) {
+            session.capRuntimeProcessedSeq(response?.seq ?? 0);
+        }
         session.updateMetadata((meta) => mergeReconnectSessionMetadata(meta, freshMetadata));
     }
 
@@ -366,8 +373,11 @@ export async function runCodex(opts: {
         prepared: preparedInitialPrompt,
         sendSessionMessage: (envelope) => session.sendSessionProtocolMessage(envelope),
         pushPrompt: (prompt) => {
-            messageQueue.push(prompt, {
-                permissionMode: currentPermissionMode ?? 'default',
+            messageQueue.unshiftIsolated(prompt, {
+                permissionMode: resolveInitialPromptPermissionMode(
+                    currentPermissionMode ?? 'default',
+                    allowAutomationReconnectPrompt,
+                ),
                 model: currentModel,
                 appendSystemPrompt: currentAppendSystemPrompt,
                 effort: currentEffort,

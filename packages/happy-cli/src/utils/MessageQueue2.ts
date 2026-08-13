@@ -186,6 +186,28 @@ export class MessageQueue2<T> {
     }
 
     /**
+     * Put a message at the front without allowing it to batch with messages
+     * that were already queued. Used for an automation turn that wakes an
+     * existing session while preserving subsequent user input.
+     */
+    unshiftIsolated(message: string, mode: T): void {
+        if (this.closed) {
+            throw new Error('Cannot unshift to closed queue');
+        }
+
+        const modeHash = this.modeHasher(mode);
+        this.queue.unshift({ message, mode, modeHash, isolate: true });
+        if (this.onMessageHandler) {
+            this.onMessageHandler(message, mode);
+        }
+        if (this.waiter) {
+            const waiter = this.waiter;
+            this.waiter = null;
+            waiter(true);
+        }
+    }
+
+    /**
      * Push a message to the beginning of the queue with a mode.
      */
     unshift(message: string, mode: T): void {

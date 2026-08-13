@@ -49,6 +49,11 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     ok: true as const,
     sessionId: 'session-1',
   }))
+  const resumeSession = vi.fn<ServerAutomationExecutorInput['resumeSession']>(async () => ({
+    ok: false as const,
+    error: 'target session unavailable',
+    shouldFallback: true,
+  }))
   const resolveMcpSpawnContext = vi.fn(async (): Promise<AutomationMcpCallerGrantResult> => ({
     ok: true as const,
     value: { mcpCallerGrant: 'SIGNED-GRANT', mcpConfigProjectId: 'P-1' },
@@ -76,6 +81,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     maintainAgentTaskLease,
     resolveMcpSpawnContext,
     linkSession,
+    resumeSession,
     spawnSession,
     isSessionRunning: vi.fn(() => false),
     randomId: () => 'report-1',
@@ -84,7 +90,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
   return {
     input, store, transport, decryptPayload, logDebug, runScript, queryGithubPullRequests,
     notifyGithubTrigger, dispatchAgentTask, maintainAgentTaskLease,
-    resolveMcpSpawnContext, linkSession, spawnSession, now,
+    resolveMcpSpawnContext, linkSession, resumeSession, spawnSession, now,
   }
 }
 
@@ -451,6 +457,167 @@ describe('runServerAutomationTick', () => {
       GH_TOKEN: 'github-secret',
     })
     expect(maintainAgentTaskLease).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'apply-1' }))
+  })
+
+  it('resumes the original creator session for review_apply before spawning a new worker', async () => {
+    const {
+      input, store, queryGithubPullRequests, dispatchAgentTask, maintainAgentTaskLease,
+      resumeSession, spawnSession, linkSession, logDebug,
+    } = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } } })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Apply verified findings', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      schedules: store.read().schedules.map((schedule) => ({
+        ...schedule,
+        lastSessionId: 'previous-worker-session',
+      })),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'apply-1', type: 'review_apply.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        targetSessionId: 'creator-session', controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { reviewedHeadSha: 'a'.repeat(40) },
+        context: [{ kind: 'review', body: { findings: [] } }],
+      },
+    })
+    resumeSession.mockResolvedValue({ ok: true, sessionId: 'creator-session' })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'WOKE' },
+    ])
+
+    expect(resumeSession).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'creator-session', directory: '/repo', exitAfterFirstTurn: true,
+      initialPrompt: expect.stringContaining('Task ID: apply-1'),
+      environmentVariables: expect.objectContaining({
+        APLUS_AGENT_TASK_ID: 'apply-1',
+        APLUS_AGENT_TASK_CLAIM_TOKEN: 'claim-secret',
+        GH_TOKEN: 'github-secret',
+      }),
+    }))
+    const resumeInput = resumeSession.mock.calls[0]![0]
+    expect(resumeInput.initialPrompt).not.toContain('claim-secret')
+    expect(resumeInput.initialPrompt).not.toContain('complete-secret')
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(maintainAgentTaskLease).toHaveBeenCalledOnce()
+    expect(linkSession).not.toHaveBeenCalled()
+    expect(store.read().schedules[0]?.lastSessionId).toBeNull()
+    expect(logDebug).toHaveBeenCalledWith(
+      '[server-automation] resumed original requester session creator-session for review_apply task apply-1',
+    )
+  })
+
+  it('falls back to one new apply worker when the original creator session cannot resume', async () => {
+    const { input, store, queryGithubPullRequests, dispatchAgentTask, resumeSession, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Apply verified findings', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({ ok: true, pullRequests: [] })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'apply-1', type: 'review_apply.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        targetSessionId: 'creator-session', controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { reviewedHeadSha: 'a'.repeat(40) }, context: [],
+      },
+    })
+    resumeSession.mockResolvedValue({
+      ok: false,
+      error: 'target session is still running',
+      shouldFallback: true,
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(resumeSession).toHaveBeenCalledOnce()
+    expect(spawnSession).toHaveBeenCalledOnce()
+  })
+
+  it('leaves review_apply pending instead of spawning a competing worker while the creator session is busy', async () => {
+    const {
+      input, store, queryGithubPullRequests, dispatchAgentTask,
+      maintainAgentTaskLease, resumeSession, spawnSession,
+    } = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } } })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Apply verified findings', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({ ok: true, pullRequests: [] })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'apply-1', type: 'review_apply.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        targetSessionId: 'creator-session', controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { reviewedHeadSha: 'a'.repeat(40) }, context: [],
+      },
+    })
+    resumeSession.mockResolvedValue({
+      ok: false,
+      error: 'target session is still running',
+      shouldFallback: false,
+    })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'ERROR' },
+    ])
+
+    expect(resumeSession).toHaveBeenCalledOnce()
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(maintainAgentTaskLease).not.toHaveBeenCalled()
   })
 
   it('leaves a GitHub event pending when the AgentTask bridge fails', async () => {

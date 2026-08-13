@@ -23,6 +23,21 @@ describe('MessageQueue2', () => {
         expect(queue.size()).toBe(0);
     });
 
+    it('should put an isolated automation prompt before pending user messages', async () => {
+        const queue = new MessageQueue2<string>(mode => mode);
+        queue.push('pending user message', 'remote');
+        queue.unshiftIsolated('automation prompt', 'remote');
+
+        expect(await queue.waitForMessagesAndGetAsString()).toEqual(expect.objectContaining({
+            message: 'automation prompt',
+            isolate: true,
+        }));
+        expect(await queue.waitForMessagesAndGetAsString()).toEqual(expect.objectContaining({
+            message: 'pending user message',
+            isolate: false,
+        }));
+    });
+
     it('should return only messages with same mode and keep others', async () => {
         const queue = new MessageQueue2<string>(mode => mode);
         

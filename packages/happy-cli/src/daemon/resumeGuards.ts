@@ -8,6 +8,8 @@
  * in-flight spawn.
  */
 
+import { realpath } from 'node:fs/promises';
+
 /**
  * True when a daemon child with a running process is already attached to the
  * happy session.
@@ -26,6 +28,33 @@ export function hasLiveDaemonChild(
         if (session.happySessionId === happySessionId && isPidAlive(session.pid)) return true;
     }
     return false;
+}
+
+export function decideAutomationResumePreflight(input: {
+    resumeInFlight: boolean;
+    live: boolean;
+    sameDirectory: boolean | null;
+}): 'resume' | 'busy' | 'fallback' {
+    if (input.resumeInFlight) return 'busy';
+    if (input.live && input.sameDirectory === false) return 'fallback';
+    if (input.live) return 'busy';
+    return 'resume';
+}
+
+export async function resolveAutomationDirectoryMatch(
+    firstDirectory: string,
+    secondDirectory: string,
+    resolveRealpath: (path: string) => Promise<string> = realpath,
+): Promise<boolean | null> {
+    try {
+        const [first, second] = await Promise.all([
+            resolveRealpath(firstDirectory),
+            resolveRealpath(secondDirectory),
+        ]);
+        return first === second;
+    } catch {
+        return null;
+    }
 }
 
 /**

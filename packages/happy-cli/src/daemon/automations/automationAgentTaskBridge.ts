@@ -8,6 +8,7 @@ const dispatchSchema = z.object({
   agentRunId: z.string().min(1),
   claimToken: z.string().min(1),
   completeToken: z.string().min(1),
+  targetSessionId: z.string().trim().min(1).max(200).nullable().optional(),
   input: z.unknown(),
   context: z.array(z.object({ kind: z.string(), body: z.unknown() })),
 })

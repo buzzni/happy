@@ -30,6 +30,14 @@ export function extractTokenSubject(token: string | null | undefined): string | 
     }
 }
 
+export function tokensShareIdentity(firstToken: string, secondToken: string): boolean {
+    const firstSubject = extractTokenSubject(firstToken);
+    const secondSubject = extractTokenSubject(secondToken);
+    return firstSubject !== null && secondSubject !== null
+        ? firstSubject === secondSubject
+        : firstToken === secondToken;
+}
+
 export type ResumeCredentialDecision =
     | { kind: 'user-staged'; homeDir: string; token: string }
     | { kind: 'daemon'; token: string }
@@ -59,12 +67,7 @@ export function decideResumeCredentials(input: {
             reason: 'daemon credentials are unreadable. Run `happy auth login` and restart the daemon.',
         };
     }
-    const daemonSubject = extractTokenSubject(input.daemonToken);
-    const diskSubject = extractTokenSubject(input.diskToken);
-    const sameIdentity = daemonSubject !== null && diskSubject !== null
-        ? daemonSubject === diskSubject
-        : input.daemonToken === input.diskToken;
-    if (!sameIdentity) {
+    if (!tokensShareIdentity(input.daemonToken, input.diskToken)) {
         return {
             kind: 'refuse',
             reason: 'the credentials on disk now belong to a different account than when this session started. Restart the daemon or start a new session.',

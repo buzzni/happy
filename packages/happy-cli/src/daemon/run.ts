@@ -28,7 +28,7 @@ import {
   persistSession,
   readCredentials,
 } from '@/persistence';
-import { decideResumeCredentials, readStagedTokenFromHomeDir } from './resumeCredentials';
+import { decideResumeCredentials, readStagedTokenFromHomeDir, tokensShareIdentity } from './resumeCredentials';
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { preflightDaemonControlServer, startDaemonControlServer } from './controlServer';
@@ -56,8 +56,17 @@ import {
   shouldFilterSpawnCredentials,
 } from './spawnAgentCommand';
 import { applyServerSessionSnapshot, parseServerSessionSnapshot, type ServerSessionSnapshot } from './serverSessionSnapshot';
-import { buildReconnectSessionEnvironment, resolveResumeBaselineSeq } from './reconnectSessionEnv';
-import { hasLiveDaemonChild, shareInFlight } from './resumeGuards';
+import {
+  buildReconnectSessionEnvironment,
+  hasReliableResumeBaseline,
+  resolveResumeBaselineSeq,
+} from './reconnectSessionEnv';
+import {
+  decideAutomationResumePreflight,
+  hasLiveDaemonChild,
+  resolveAutomationDirectoryMatch,
+  shareInFlight,
+} from './resumeGuards';
 import { startLogHousekeeping } from '@/ui/logHousekeepingRunner';
 import {
   readDaemonSessionIdleReaperConfig,
@@ -92,7 +101,10 @@ import {
   decryptServerAutomationPayload,
 } from './automations/serverAutomationCache';
 import { createServerAutomationRuntimeStore } from './automations/serverAutomationRuntimeStore';
-import { runServerAutomationTick } from './automations/serverAutomationExecutor';
+import {
+  runServerAutomationTick,
+  type ServerAutomationExecutorInput,
+} from './automations/serverAutomationExecutor';
 import {
   exchangeAutomationMcpCallerGrant,
   linkAutomationProjectSession,
@@ -1088,11 +1100,23 @@ export async function startDaemon(): Promise<void> {
       mcpCallerGrantEnvelope?: string;
       mcpConfigProjectId?: string;
       expectedConnectors?: string[];
+      automation?: {
+        directory: string;
+        initialPrompt: string;
+        environmentVariables: Record<string, string>;
+        exitAfterFirstTurn: true;
+      };
     };
 
     const spawnResumedSession = async (happySessionId: string, options?: ResumeSessionOptions): Promise<SpawnSessionResult> => {
       try {
         if (hasLiveDaemonChild(happySessionId, pidToTrackedSession.values(), isPidAlive)) {
+          if (options?.automation) {
+            return {
+              type: 'error',
+              errorMessage: `Session ${happySessionId} is still running and cannot accept automation environment changes.`,
+            };
+          }
           logger.debug(`[DAEMON RUN] Resume requested for ${happySessionId} but a live child is already attached — reusing it`);
           return { type: 'success', sessionId: happySessionId };
         }
@@ -1122,6 +1146,22 @@ export async function startDaemon(): Promise<void> {
           return {
             type: 'error',
             errorMessage: `Cannot resume session ${happySessionId}: ${credentialDecision.reason}`,
+          };
+        }
+        if (options?.automation
+            && !tokensShareIdentity(credentialDecision.token, credentials.token)) {
+          return {
+            type: 'error',
+            errorMessage: `Cannot safely resume session ${happySessionId}: it belongs to a different Happy account.`,
+          };
+        }
+        if (options?.automation && !hasReliableResumeBaseline({
+          reportedSeq: tracked.runtime?.lastProcessedSeq,
+          persistedSeq: tracked.persistedLastProcessedSeq,
+        })) {
+          return {
+            type: 'error',
+            errorMessage: `Cannot safely resume session ${happySessionId} for automation: no processed-message cursor is available.`,
           };
         }
 
@@ -1162,7 +1202,10 @@ export async function startDaemon(): Promise<void> {
 
         const launch = buildResumeLaunch(
           { id: happySessionId, active: true, metadata },
-          { startedBy: 'daemon', claudeStartingMode: 'remote' },
+          {
+            startedBy: 'daemon',
+            claudeStartingMode: 'remote',
+          },
         );
 
         if (options?.model) {
@@ -1170,6 +1213,21 @@ export async function startDaemon(): Promise<void> {
         }
         if (options?.permissionMode) {
           launch.args.push('--permission-mode', options.permissionMode);
+        } else if (options?.automation) {
+          // The isolated automation prompt elevates only its own queue item.
+          // Keep the process default gated until run-once exits after it.
+          launch.args.push('--permission-mode', 'default');
+        }
+
+        if (options?.automation
+            && await resolveAutomationDirectoryMatch(
+              launch.cwd,
+              options.automation.directory,
+            ) !== true) {
+          return {
+            type: 'error',
+            errorMessage: `Session ${happySessionId} belongs to a different directory.`,
+          };
         }
 
         await fs.access(launch.cwd);
@@ -1177,12 +1235,18 @@ export async function startDaemon(): Promise<void> {
         const mcpEnvironment = prepareMcpChildEnvironment({
           environmentVariables: {
             ...scrubSessionLineageEnv(process.env),
+            ...(options?.automation?.environmentVariables ?? {}),
             ...reconnectEnvironment,
             // user-credential 세션은 원래 계정의 스테이징 자격증명으로 복원 —
             // 없으면 위의 credentialDecision 이 이미 refuse 했다.
             ...(credentialDecision.kind === 'user-staged'
               ? { HAPPY_HOME_DIR: credentialDecision.homeDir }
               : {}),
+            ...(options?.automation ? {
+              HAPPY_INITIAL_PROMPT: options.automation.initialPrompt,
+              HAPPY_AUTOMATION_RESUME_PROMPT: '1',
+              HAPPY_AUTOMATION_RUN_ONCE: '1',
+            } : {}),
           },
           mcpCallerGrantEnvelope: options?.mcpCallerGrantEnvelope,
           mcpConfigProjectId: options?.mcpConfigProjectId,
@@ -1221,6 +1285,55 @@ export async function startDaemon(): Promise<void> {
     const resumeInFlight = new Map<string, Promise<SpawnSessionResult>>();
     const resumeSession = (happySessionId: string, options?: ResumeSessionOptions): Promise<SpawnSessionResult> =>
       shareInFlight(resumeInFlight, happySessionId, () => spawnResumedSession(happySessionId, options));
+
+    const resumeAutomationSession: ServerAutomationExecutorInput['resumeSession'] = async (input) => {
+      const trackedTarget = findTrackedSessionById(input.sessionId);
+      const trackedDirectory = trackedTarget?.happySessionMetadataFromLocalWebhook?.path;
+      const sameDirectory = trackedDirectory
+        ? await resolveAutomationDirectoryMatch(trackedDirectory, input.directory)
+        : null;
+      const preflight = decideAutomationResumePreflight({
+        resumeInFlight: resumeInFlight.has(input.sessionId),
+        live: hasLiveDaemonChild(input.sessionId, pidToTrackedSession.values(), isPidAlive),
+        sameDirectory,
+      });
+      if (preflight === 'fallback') {
+        return {
+          ok: false,
+          error: 'target session belongs to a different directory',
+          shouldFallback: true,
+        };
+      }
+      if (preflight === 'busy') {
+        return {
+          ok: false,
+          error: 'target session is already running or resuming',
+          shouldFallback: false,
+        };
+      }
+      const result = await shareInFlight(resumeInFlight, input.sessionId, () => spawnResumedSession(
+        input.sessionId,
+        {
+          automation: {
+            directory: input.directory,
+            initialPrompt: input.initialPrompt,
+            environmentVariables: input.environmentVariables,
+            exitAfterFirstTurn: input.exitAfterFirstTurn,
+          },
+        },
+      ));
+      return result.type === 'success'
+        ? { ok: true, sessionId: result.sessionId }
+        : {
+          ok: false,
+          error: result.type === 'error' ? result.errorMessage : `unexpected resume result: ${result.type}`,
+          shouldFallback: !hasLiveDaemonChild(
+            input.sessionId,
+            pidToTrackedSession.values(),
+            isPidAlive,
+          ),
+        };
+    };
 
     // Local idle guard config for policy-initiated (if-idle) stops. Read once;
     // env overrides are picked up on daemon restart, same as other knobs.
@@ -1573,6 +1686,7 @@ export async function startDaemon(): Promise<void> {
           logDebug: (message) => logger.debug(`[DAEMON RUN] [server-automation] ${message}`),
           sessionId,
         }),
+        resumeSession: resumeAutomationSession,
         spawnSession: spawnAutomationSession,
         isSessionRunning: isAutomationSessionRunning,
         logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),

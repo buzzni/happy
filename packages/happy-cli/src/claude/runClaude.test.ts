@@ -126,6 +126,7 @@ async function startRemoteRunClaudeHarness(opts: {
         sessionId: 'happy-session-1',
         suppressNextArchiveSignal: vi.fn(),
         skipExistingMessages: vi.fn(),
+        capRuntimeProcessedSeq: vi.fn(),
         updateMetadata: vi.fn((updater: (current: Record<string, unknown>) => Record<string, unknown>) => {
             metadata = updater(metadata);
         }),
@@ -258,6 +259,7 @@ describe('runClaude remote JSONL scanner', () => {
         delete process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
         delete process.env.HAPPY_INITIAL_PROMPT;
         delete process.env.HAPPY_AUTOMATION_RUN_ONCE;
+        delete process.env.HAPPY_AUTOMATION_RESUME_PROMPT;
 
         mockReadSettings.mockResolvedValue({
             machineId: 'machine-1',
@@ -343,6 +345,31 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it('caps the runtime cursor and exits after one explicit automation resume turn', async () => {
+        process.env.HAPPY_RECONNECT_SESSION_ID = 'happy-session-1';
+        process.env.HAPPY_RECONNECT_ENCRYPTION_KEY = Buffer.from(new Uint8Array(32)).toString('base64');
+        process.env.HAPPY_RECONNECT_ENCRYPTION_VARIANT = 'legacy';
+        process.env.HAPPY_RECONNECT_SNAPSHOT = Buffer.from(JSON.stringify({
+            metadata: {
+                path: '/tmp/project', flavor: 'claude', claudeSessionId: 'claude-session-1',
+            },
+            seq: 42,
+            metadataVersion: 3,
+            agentStateVersion: 4,
+        })).toString('base64');
+        process.env.HAPPY_INITIAL_PROMPT = 'apply reviewed findings';
+        process.env.HAPPY_AUTOMATION_RESUME_PROMPT = '1';
+        process.env.HAPPY_AUTOMATION_RUN_ONCE = '1';
+
+        const harness = await startRemoteRunClaudeHarness();
+
+        expect(harness.sessionClient.capRuntimeProcessedSeq).toHaveBeenCalledWith(42);
+        expect(harness.loopOptions.exitAfterFirstTurn).toBe(true);
+        expect(process.env.HAPPY_AUTOMATION_RESUME_PROMPT).toBeUndefined();
+
+        await harness.finish();
+    });
+
     it('includes createdBy in fresh session metadata when the daemon supplies it', async () => {
         process.env.HAPPY_CREATED_BY_ACCOUNT_ID = 'acct-123';
         process.env.HAPPY_CREATED_BY_DISPLAY_NAME = 'Ada';
@@ -406,6 +433,7 @@ describe('runClaude remote JSONL scanner', () => {
             sessionId: 'happy-session-1',
             suppressNextArchiveSignal: vi.fn(),
             skipExistingMessages: vi.fn(),
+            capRuntimeProcessedSeq: vi.fn(),
             updateMetadata: vi.fn(),
             sendClaudeSessionMessage: vi.fn((message: unknown) => {
                 sentMessages.push(message);
@@ -514,6 +542,7 @@ describe('runClaude remote JSONL scanner', () => {
             sessionId: 'happy-session-1',
             suppressNextArchiveSignal: vi.fn(),
             skipExistingMessages: vi.fn(),
+            capRuntimeProcessedSeq: vi.fn(),
             updateMetadata: vi.fn((updater: (current: typeof metadata) => typeof metadata) => {
                 metadata = updater(metadata);
             }),
