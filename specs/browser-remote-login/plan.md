@@ -52,26 +52,35 @@ noVNC 는 화면이 있어야 하므로 Chrome 을 **Xvfb 위 headful** 로 띄�
 `browser-setup:launch` 는 `DISPLAY` 가 없으면 `--headless=new` 를 쓰므로,
 뷰어를 쓸 때는 Xvfb 를 먼저 띄우고 그 `DISPLAY` 로 Chrome 을 기동해야 한다.
 
-## Phase 2 — 머신 측 구현
+## Phase 2 — 머신 측 구현 ✅ 완료
 
 `specs/browser-setup-gui/` 에서 검증된 패턴을 그대로 따른다: 순수 함수 +
 TDD → 얇은 부수효과 층 → RPC.
 
-- [ ] `daemon/remoteViewer.ts`
+- [x] `daemon/remoteViewer.ts`
   - `planViewerInstall({ missing, canSudo, platform })` — 정직한 설치 판정
   - `buildXvfbArgs`, `buildX11vncArgs`, `buildWebsockifyArgs` — 인자 구성
   - `detectViewerTools()` — 무엇이 설치돼 있나
-- [ ] RPC: `browser-viewer:status` / `:install` / `:start`
-- [ ] `browser-setup:launch` 가 Xvfb `DISPLAY` 를 받아 headful 로 뜨게
+- [x] RPC: `browser-viewer:status` / `:install` / `:start`
+- [ ] `browser-setup:launch` 가 Xvfb `DISPLAY` 를 받아 headful 로 뜨게 (Phase 4 로 이월)
 
-## Phase 3 — 검증
+## Phase 3 — 검증 ✅ 완료
 
-- [ ] `remoteViewer` 순수 함수 유닛 테스트 (변이로 이 확인)
-- [ ] Ubuntu 컨테이너 E2E: 실제 등록된 핸들러 호출 → Xvfb+x11vnc+websockify
-      기동 → noVNC HTTP 응답 + WS 업그레이드 확인
-- [ ] 인증 없는 접근이 거부되는지 (AC2)
+- [x] `remoteViewer` 순수 함수 유닛 12개 (변이로 이 확인: `-localhost`,
+      `-forever`, websockify loopback 바인드 3건이 정확히 잡힘)
+- [x] Ubuntu 컨테이너 E2E **8/8 통과** — 도구가 하나도 없는 상태에서 시작해
+      실제 등록된 핸들러로:
+      status(3개 누락 보고) → install(실제 apt 설치 성공) → status(설치됨) →
+      start(Xvfb+x11vnc+websockify 기동, webPort 응답) →
+      `/vnc.html` **200** (웹 루트가 맞다는 증거) →
+      **off-loopback 도달 불가** (AC2 의 실질) → 재호출 시 기존 스택 재사용
+- [x] 실제 headful Chrome 이 그 화면에 뜨는지 확인:
+      `xwininfo` 에 `"Example Domain - Google Chrome" 945x1060` 창 관측
 
-## Phase 4 — 앱 UI (별도)
+## Phase 4 — 앱 UI + 릴레이 연결 (남음)
 
-머신 화면에 "브라우저 화면 열기" + 위험도 명시(AC4). 릴레이 URL 조립.
-Phase 2~3 이 통과한 뒤 착수한다.
+- [ ] `browser-setup:launch` 에 `display` 옵션 (뷰어 사용 시 headful 기동)
+- [ ] 릴레이 URL 조립 + CDP 와 구분되는 토큰 종류 (AC3)
+- [ ] 머신 화면 "브라우저 화면 열기" 버튼 + 위험도 명시 (AC4)
+
+
