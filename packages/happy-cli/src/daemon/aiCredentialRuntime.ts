@@ -22,7 +22,6 @@ export type AiCredentialRotationStatus = {
 }
 
 type CommandOptions = {
-  input?: string
   maxOutputBytes?: number
   timeoutMs?: number
 }
@@ -178,7 +177,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       await deps.rename(tempPath, authPath)
       await deps.chmod(authPath, 0o600)
       await deps.execFile('codex', ['login', 'status'])
-    } catch {
+    } catch (error) {
       try { await deps.rm(tempPath, { force: true }) } catch { /* continue restoring the backup */ }
       try { await deps.rm(authPath, { force: true }) } catch { /* rename may still replace it */ }
       if (hadExisting) {
@@ -188,6 +187,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           throw new AiCredentialRuntimeError('CODEX_BACKUP_RESTORE_FAILED')
         }
       }
+      if (error instanceof AiCredentialRuntimeError) throw error
       throw new AiCredentialRuntimeError('CODEX_APPLY_FAILED')
     }
     return { provider: 'codex' as const, configured: true, status: 'authenticated' as const }
@@ -321,10 +321,11 @@ export function runAiCredentialCommand(
   command: string,
   args: string[],
   options: CommandOptions = {},
+  spawnCommand: typeof spawn = spawn,
 ): Promise<AiCredentialCommandResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
+    const child = spawnCommand(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     })
     const stdout: Buffer[] = []
@@ -340,6 +341,7 @@ export function runAiCredentialCommand(
       reject(new AiCredentialRuntimeError(kind))
     }
     const collect = (target: Buffer[]) => (chunk: Buffer) => {
+      if (settled) return
       outputBytes += chunk.length
       if (outputBytes > (options.maxOutputBytes ?? MAX_PAYLOAD_BYTES)) {
         fail('COMMAND_OUTPUT_TOO_LARGE')
@@ -350,7 +352,7 @@ export function runAiCredentialCommand(
     child.stdout.on('data', collect(stdout))
     child.stderr.on('data', collect(stderr))
     child.on('error', () => fail('COMMAND_NOT_AVAILABLE'))
-    child.on('exit', (code) => {
+    child.on('close', (code) => {
       if (settled) return
       settled = true
       if (timeout) clearTimeout(timeout)
@@ -364,8 +366,6 @@ export function runAiCredentialCommand(
       })
     })
     timeout = setTimeout(() => fail('COMMAND_TIMED_OUT'), options.timeoutMs ?? 30_000)
-    if (options.input === undefined) child.stdin.end()
-    else child.stdin.end(options.input)
   })
 }
 

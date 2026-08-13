@@ -1,5 +1,8 @@
+import type { spawn } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi } from 'vitest'
 import {
+  AiCredentialRuntimeError,
   createAiCredentialRuntime,
   runAiCredentialCommand,
   type AiCredentialCommandResult,
@@ -13,14 +16,14 @@ const configuredClaudeList = JSON.stringify({
 })
 
 function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
-  const calls: Array<{ command: string; args: string[]; input?: string }> = []
+  const calls: Array<{ command: string; args: string[] }> = []
   const files = new Map<string, string>()
   const execFile = vi.fn(async (
     command: string,
     args: string[],
-    options?: { input?: string },
+    _options?: { maxOutputBytes?: number; timeoutMs?: number },
   ): Promise<AiCredentialCommandResult> => {
-    calls.push({ command, args, input: options?.input })
+    calls.push({ command, args })
     if (command === 'cswap' && args[0] === 'export') {
       return { stdout: '{"version":1,"encrypted":false,"accounts":[{}]}', stderr: '' }
     }
@@ -76,7 +79,7 @@ describe('AI credential machine runtime', () => {
       provider: 'claude',
       payload: '{"version":1,"encrypted":false,"accounts":[{}]}',
     })
-    expect(calls).toEqual([{ command: 'cswap', args: ['export', '-'], input: undefined }])
+    expect(calls).toEqual([{ command: 'cswap', args: ['export', '-'] }])
 
     const oversized = 'x'.repeat(1024 * 1024 + 1)
     const { runtime: capped } = setup({
@@ -172,7 +175,7 @@ describe('AI credential machine runtime', () => {
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"new-secret"}')
     expect(files.get('/home/operator/.codex/auth.json.happy-backup')).toBe('{"OPENAI_API_KEY":"old"}')
     expect(chmod).toHaveBeenCalledWith('/home/operator/.codex/auth.json', 0o600)
-    expect(calls.at(-1)).toEqual({ command: 'codex', args: ['login', 'status'], input: undefined })
+    expect(calls.at(-1)).toEqual({ command: 'codex', args: ['login', 'status'] })
     expect(JSON.stringify(calls)).not.toContain('new-secret')
   })
 
@@ -315,6 +318,21 @@ describe('AI credential machine runtime', () => {
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"old"}')
   })
 
+  it('preserves a concrete Codex command error after restoring the previous auth', async () => {
+    const { runtime, files } = setup({
+      execFile: vi.fn(async (command: string) => {
+        if (command === 'codex') throw new AiCredentialRuntimeError('COMMAND_NOT_AVAILABLE')
+        return { stdout: '', stderr: '' }
+      }),
+    })
+    files.set('/home/operator/.codex/auth.json', '{"OPENAI_API_KEY":"old"}')
+
+    await expect(runtime.apply({
+      provider: 'codex', payload: '{"OPENAI_API_KEY":"new"}',
+    })).rejects.toMatchObject({ kind: 'COMMAND_NOT_AVAILABLE' })
+    expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"old"}')
+  })
+
   it('redacts Claude account status instead of returning command output', async () => {
     const { runtime } = setup()
 
@@ -382,5 +400,25 @@ describe('AI credential machine runtime', () => {
       ['-e', 'setInterval(() => {}, 1000)'],
       { timeoutMs: 20 },
     )).rejects.toMatchObject({ kind: 'COMMAND_TIMED_OUT' })
+  })
+
+  it('waits for command stdio to close before returning captured output', async () => {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      kill: vi.fn(),
+    })
+    const spawnCommand = vi.fn(() => child) as unknown as typeof spawn
+
+    const result = runAiCredentialCommand('cswap', ['export', '-'], {}, spawnCommand)
+    expect(spawnCommand).toHaveBeenCalledWith('cswap', ['export', '-'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    child.emit('exit', 0)
+    child.stdout.emit('data', Buffer.from('{"complete":true}'))
+    child.emit('close', 0)
+
+    await expect(result).resolves.toEqual({ stdout: '{"complete":true}', stderr: '' })
   })
 })
