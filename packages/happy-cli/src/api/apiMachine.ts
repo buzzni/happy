@@ -44,8 +44,17 @@ import {
     isCdpReachable,
     launchChrome,
     planChromeInstall,
+    resolveChromeDisplay,
     resolveProfileUserDataDir,
 } from '@/daemon/browserSetup';
+import {
+    buildWebsockifyArgs,
+    buildX11vncArgs,
+    buildXvfbArgs,
+    detectMissingViewerTools,
+    planViewerInstall,
+    spawnDetached,
+} from '@/daemon/remoteViewer';
 import { readFile } from 'node:fs/promises';
 import {
     addDaemonTerminalSession,
@@ -286,6 +295,8 @@ export class ApiMachineClient {
     private rpcHandlerManager: RpcHandlerManager;
     // Live raw-TCP tunnels for preview WebSocket upgrades (previewWsProxy.ts).
     private previewWsProxy: PreviewWsProxy | null = null;
+    // Running noVNC stack for the remote browser screen, if started.
+    private viewer: { display: string; vncPort: number; webPort: number } | null = null;
     private resumeSessionHandler: ((sessionId: string, options?: {
         model?: string;
         permissionMode?: string;
@@ -733,10 +744,23 @@ export class ApiMachineClient {
             if (cdpPort === null) {
                 throw new Error('사용 가능한 CDP 포트를 찾지 못했습니다.');
             }
-            // Headless unless the machine actually has a display: on a
-            // terminal-only box headful Chrome exits immediately.
-            const headless = !process.env.DISPLAY;
-            let { pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless });
+
+            const wantsViewer = params?.viewer === true;
+            // Ensures the viewer stack before deciding headless/display —
+            // "launch under the viewer" must be the Chrome the user actually
+            // sees, not a second headless instance running blind.
+            const viewerState = wantsViewer ? await this.startViewerStack() : null;
+            const chosen = resolveChromeDisplay({
+                wantsViewer,
+                viewerDisplay: viewerState?.display ?? null,
+                daemonDisplayEnv: process.env.DISPLAY,
+            });
+            if (chosen.headless === null) {
+                throw new Error('원격 화면이 아직 준비되지 않았습니다.');
+            }
+            const headless = chosen.headless;
+            const env = chosen.display ? { DISPLAY: chosen.display } : undefined;
+            let { pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless }, env);
             let ready = await waitForCdp(cdpPort, 15_000);
             let sandbox = true;
             if (!ready) {
@@ -745,10 +769,10 @@ export class ApiMachineClient {
                 // "running". Retry once without the sandbox and report the
                 // downgrade rather than leaving a browser that never answers.
                 sandbox = false;
-                ({ pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless, noSandbox: true }));
+                ({ pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless, noSandbox: true }, env));
                 ready = await waitForCdp(cdpPort, 15_000);
             }
-            return { profile, cdpPort, userDataDir, pid, headless, ready, sandbox };
+            return { profile, cdpPort, userDataDir, pid, headless, ready, sandbox, viewer: viewerState };
         });
 
         this.rpcHandlerManager.registerHandler('browser-setup:pair', async (params: any) => {
@@ -767,6 +791,48 @@ export class ApiMachineClient {
                 freshProfiles: facts.freshProfiles,
                 debuggerTier: facts.debuggerTierActual ?? null,
             };
+        });
+
+        // Remote browser screen (noVNC) — lets the user open any site and log
+        // in by hand, 2FA and captcha included, with no SSH tunnel. The
+        // bridge's own click/fill are ref-based and cannot drive a captcha,
+        // which is why this exists. See specs/browser-remote-login/.
+        this.rpcHandlerManager.registerHandler('browser-viewer:status', async () => {
+            const missing = await detectMissingViewerTools();
+            return {
+                installed: missing.length === 0,
+                missing,
+                canSudo: missing.length === 0 ? false : await canSudoWithoutPassword(),
+                running: this.viewer !== null,
+                webPort: this.viewer?.webPort ?? null,
+                display: this.viewer?.display ?? null,
+            };
+        });
+
+        this.rpcHandlerManager.registerHandler('browser-viewer:install', async () => {
+            const missing = await detectMissingViewerTools();
+            const plan = planViewerInstall({
+                missing,
+                canSudo: missing.length === 0 ? true : await canSudoWithoutPassword(),
+            });
+            if (plan.action !== 'run') {
+                // 'manual' reaches the UI as a non-success on purpose: these
+                // are system packages, so without root nothing was installed.
+                return plan;
+            }
+            const result = await runShell(plan.command);
+            const stillMissing = await detectMissingViewerTools();
+            return {
+                action: 'run',
+                command: plan.command,
+                ok: stillMissing.length === 0,
+                missing: stillMissing,
+                stderr: result.ok ? undefined : result.output,
+            };
+        });
+
+        this.rpcHandlerManager.registerHandler('browser-viewer:start', async () => {
+            return this.startViewerStack();
         });
 
         // Register stop daemon handler
@@ -934,6 +1000,37 @@ export class ApiMachineClient {
             heartbeat: (input) => this.socket.emitWithAck('automation-run-heartbeat', input),
             report: (input) => this.socket.emitWithAck('automation-run-report', input),
         };
+    }
+
+    /**
+     * Idempotent: returns the running stack if one is already up. Shared by
+     * the `browser-viewer:start` RPC and `browser-setup:launch`'s `viewer`
+     * option, so "launch Chrome under the viewer" never spins up a second,
+     * disconnected Xvfb (specs/browser-remote-login/).
+     */
+    private async startViewerStack(): Promise<{ display: string; vncPort: number; webPort: number; ready: boolean; reused: boolean }> {
+        const missing = await detectMissingViewerTools();
+        if (missing.length > 0) {
+            throw new Error(`원격 화면에 필요한 프로그램이 없습니다: ${missing.join(', ')}`);
+        }
+        if (this.viewer) return { ...this.viewer, ready: true, reused: true };
+
+        const display = ':99';
+        const vncPort = await pickFreePort([5900, 5901, 5902]);
+        const webPort = await pickFreePort([6080, 6081, 6082]);
+        if (vncPort === null || webPort === null) {
+            throw new Error('원격 화면에 쓸 포트를 찾지 못했습니다.');
+        }
+        spawnDetached('Xvfb', buildXvfbArgs({ display, width: 1920, height: 1080 }));
+        await delay(1500);
+        spawnDetached('x11vnc', buildX11vncArgs({ display, vncPort }));
+        await delay(800);
+        spawnDetached('websockify', buildWebsockifyArgs({
+            webPort, vncPort, webRoot: resolveNovncWebRoot(),
+        }));
+        const ready = await waitForPort(webPort, 15_000);
+        this.viewer = { display, vncPort, webPort };
+        return { display, vncPort, webPort, ready, reused: false };
     }
 
     private requestServerAutomationSync(): void {
@@ -1562,4 +1659,37 @@ function runShell(command: string): Promise<{ ok: boolean; output: string }> {
 /** The CLI formatter colours its output; the app renders plain text. */
 function stripAnsi(text: string): string {
     return text.replace(/\u001b\[[0-9;]*m/g, '');
+}
+
+function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** First free port from the candidate list, or null when all are taken. */
+async function pickFreePort(candidates: number[]): Promise<number | null> {
+    for (const port of candidates) {
+        if (await isPortFree(port)) return port;
+    }
+    return null;
+}
+
+/** Whether something is listening yet — websockify takes a moment to bind. */
+async function waitForPort(port: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (!(await isPortFree(port))) return true;
+        await delay(300);
+    }
+    return false;
+}
+
+/**
+ * Where the distro put noVNC's client assets. Debian/Ubuntu's `novnc`
+ * package uses /usr/share/novnc; the tarball install commonly lands in
+ * /usr/share/webapps/novnc. Falling back to the first existing path keeps
+ * websockify from serving a 404 page that looks like a broken relay.
+ */
+function resolveNovncWebRoot(): string {
+    const candidates = ['/usr/share/novnc', '/usr/share/webapps/novnc', '/usr/local/share/novnc'];
+    return candidates.find((path) => existsSync(path)) ?? candidates[0];
 }

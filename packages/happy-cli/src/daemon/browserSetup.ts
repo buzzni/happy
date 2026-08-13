@@ -148,14 +148,45 @@ export async function canSudoWithoutPassword(): Promise<boolean> {
  * Starts Chrome detached so it outlives the daemon that spawned it — the
  * whole point is a browser that stays logged in across restarts.
  */
-export function launchChrome(chromePath: string, options: ChromeLaunchOptions): { pid: number | undefined } {
+export function launchChrome(
+    chromePath: string,
+    options: ChromeLaunchOptions,
+    // Explicit override, not implicit inheritance: the daemon's own DISPLAY
+    // (usually unset on a terminal-only box) must not decide this — the
+    // caller resolves it via resolveChromeDisplay and passes the viewer's.
+    env?: NodeJS.ProcessEnv,
+): { pid: number | undefined } {
     mkdirSync(options.userDataDir, { recursive: true })
     const child = spawn(chromePath, buildChromeLaunchArgs(options), {
         detached: true,
         stdio: 'ignore',
+        env: env ? { ...process.env, ...env } : process.env,
     })
     child.unref()
     return { pid: child.pid }
+}
+
+/**
+ * Decides headless/display for `browser-setup:launch`.
+ *
+ * When the caller wants the noVNC viewer, the same Chrome the user is about
+ * to log into must be the one that gets paired — so it has to run headful on
+ * the viewer's own Xvfb display, not spin up a second headless instance the
+ * user can never see. Returning `{ headless: null, display: null }` signals
+ * "the viewer was requested but isn't running" — silently falling back to
+ * headless there would hand back a browser nobody can log into and look
+ * like success.
+ */
+export function resolveChromeDisplay({ wantsViewer, viewerDisplay, daemonDisplayEnv }: {
+    wantsViewer: boolean
+    viewerDisplay: string | null
+    daemonDisplayEnv: string | undefined
+}): { headless: boolean | null; display: string | null | undefined } {
+    if (wantsViewer) {
+        if (!viewerDisplay) return { headless: null, display: null }
+        return { headless: false, display: viewerDisplay }
+    }
+    return { headless: !daemonDisplayEnv, display: daemonDisplayEnv }
 }
 
 /** Whether something answers CDP on that port — i.e. Chrome is already up. */
