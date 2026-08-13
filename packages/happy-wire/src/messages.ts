@@ -55,6 +55,7 @@ export const McpRuntimeServerStatusSchema = z.strictObject({
     'failed',
     'needs-auth',
     'config-fetch-failed',
+    'mcp-config-missing',
     'connector-config-missing',
     'connector-runtime-failed',
     'connector-needs-auth',

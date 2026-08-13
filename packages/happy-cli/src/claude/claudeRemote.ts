@@ -17,8 +17,8 @@ import { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { McpConfigSynchronizer, type McpConfigSource } from './mcpConfigSynchronizer';
 import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
 import { buildWorkerAgents, readWorkerConfigFromEnv } from "@/orchestrator/workerAgents";
-import { readExpectedConnectors } from '@/aplus/fetchAplusMcpServers';
-import { buildConnectorToolGuidance } from '@/aplus/connectorToolGuidance';
+import { readExpectedConnectors, readExpectedMcpServices } from '@/aplus/fetchAplusMcpServers';
+import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
 
 export async function claudeRemote(opts: {
 
@@ -145,13 +145,17 @@ export async function claudeRemote(opts: {
     // work to it. No-op when unset, so single-model sessions are unchanged.
     const workerAgents = buildWorkerAgents(readWorkerConfigFromEnv(process.env));
     const workerDelegationSuffix = workerAgents.delegationPrompt ? '\n\n' + workerAgents.delegationPrompt : '';
-    const connectorGuidance = buildConnectorToolGuidance(readExpectedConnectors());
-    const connectorGuidanceSuffix = connectorGuidance ? '\n\n' + connectorGuidance : '';
-
     const mergedMcpServers = {
         ...opts.mcpServers,
         ...(opts.orchestratorMode ? opts.orchestratorMcpServers : {}),
     };
+    const connectorGuidance = buildConnectorToolGuidance(listExpectedMcpServices({
+        expectedConnectors: readExpectedConnectors(),
+        expectedMcpServices: readExpectedMcpServices(),
+        configuredServerNames: Object.keys(mergedMcpServers),
+    }));
+    const connectorGuidanceSuffix = connectorGuidance ? '\n\n' + connectorGuidance : '';
+
     const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
     const sdkOptions: QueryOptions = {
         cwd: opts.path,

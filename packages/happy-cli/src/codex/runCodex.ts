@@ -21,11 +21,13 @@ import { join } from 'node:path';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import {
+    fetchAplusMcpConfigSnapshot,
     fetchAplusMcpServersResult,
     mcpConfigFailureStatuses,
     readExpectedConnectors,
+    readExpectedMcpServices,
 } from '@/aplus/fetchAplusMcpServers';
-import { buildConnectorToolGuidance } from '@/aplus/connectorToolGuidance';
+import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
 import { bridgeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { CodexDisplay } from "@/ui/ink/CodexDisplay";
@@ -45,6 +47,7 @@ import {
 } from './utils/sessionProtocolMapper';
 import { resumeExistingThread } from './resumeExistingThread';
 import { CodexMcpConfigSynchronizer } from './codexMcpConfigSynchronizer';
+import { CodexMcpRuntimeRecovery } from './codexMcpRuntimeRecovery';
 import { emitReadyIfIdle } from './emitReadyIfIdle';
 import { enqueueCodexUserText, isCodexClearText } from './codexClearCommand';
 import { downloadCodexFileEventAttachment } from './utils/attachmentEvents';
@@ -859,11 +862,12 @@ export async function runCodex(opts: {
     // codex would otherwise fail to start the MCP server, the change_title tool would
     // not be visible to the model, and the model would improvise with shell echoes.
     const bridgeEntrypoint = join(projectPath(), 'bin', 'happy-mcp.mjs');
-    const initialAplusMcpResult = await fetchAplusMcpServersResult(
+    const initialAplusMcpSnapshot = await fetchAplusMcpConfigSnapshot(
         opts.credentials.token,
         machineId,
         { sessionId: session.sessionId },
     );
+    const initialAplusMcpResult = initialAplusMcpSnapshot.result;
     for (const status of mcpConfigFailureStatuses(initialAplusMcpResult)) {
         session.updateMetadata((currentMetadata) => ({
             ...currentMetadata,
@@ -873,7 +877,7 @@ export async function runCodex(opts: {
             ],
         }));
     }
-    const initialAplusMcpServers = initialAplusMcpResult.ok ? initialAplusMcpResult.servers : {};
+    const initialAplusMcpServers = initialAplusMcpSnapshot.servers;
     const baseMcpServers = {
         happy: {
             command: process.execPath,
@@ -881,6 +885,20 @@ export async function runCodex(opts: {
         }
     };
     const bridgeOptions = { bridgeCommand: bridgeEntrypoint, nodeExecPath: process.execPath };
+    const listExternalServices = (mcpServers: Record<string, unknown>) => listExpectedMcpServices({
+        expectedConnectors: readExpectedConnectors(),
+        expectedMcpServices: readExpectedMcpServices(),
+        configuredServerNames: Object.keys(mcpServers),
+    });
+    const listConfiguredExternalServices = (mcpServers: Record<string, unknown>) => listExpectedMcpServices({
+        expectedConnectors: [],
+        expectedMcpServices: [],
+        configuredServerNames: Object.keys(mcpServers),
+    });
+    let currentDeveloperInstructions = buildConnectorToolGuidance(listExternalServices({
+        ...baseMcpServers,
+        ...initialAplusMcpServers,
+    }));
     const mcpConfigSynchronizer = new CodexMcpConfigSynchronizer({
         baseServers: baseMcpServers,
         initialAplusServers: initialAplusMcpServers,
@@ -900,8 +918,7 @@ export async function runCodex(opts: {
             }));
         },
     });
-    const connectorGuidance = buildConnectorToolGuidance(readExpectedConnectors());
-    let connectorGuidanceInjected = false;
+    const mcpRuntimeRecovery = new CodexMcpRuntimeRecovery(client);
     let first = true;
     let appendSystemPromptInjected = false;
 
@@ -918,6 +935,7 @@ export async function runCodex(opts: {
                 threadId: opts.resumeThreadId,
                 cwd: process.cwd(),
                 mcpServers: mcpConfigSynchronizer.mcpServers,
+                developerInstructions: currentDeveloperInstructions,
             });
             first = false;
             appendSystemPromptInjected = true;
@@ -988,7 +1006,6 @@ export async function runCodex(opts: {
                 reasoningProcessor.abort();
                 diffProcessor.reset();
                 appendSystemPromptInjected = false;
-                connectorGuidanceInjected = false;
                 thinking = false;
                 session.keepAlive(thinking, 'remote');
                 messageBuffer.addMessage('Context was reset', 'status');
@@ -1024,9 +1041,32 @@ export async function runCodex(opts: {
                 const mcpSync = await mcpConfigSynchronizer.sync({
                     threadId: client.threadId,
                     resumeThread: client.threadId
-                        ? ({ threadId, mcpServers }) => client.resumeThread({ threadId, mcpServers })
+                        ? async ({ threadId, mcpServers }) => {
+                            const nextDeveloperInstructions = buildConnectorToolGuidance(
+                                listExternalServices(mcpServers),
+                            );
+                            const resumed = await client.resumeThread({
+                                threadId,
+                                mcpServers,
+                                developerInstructions: nextDeveloperInstructions,
+                            });
+                            currentDeveloperInstructions = nextDeveloperInstructions;
+                            return resumed;
+                        }
                         : undefined,
                 });
+
+                const nextDeveloperInstructions = buildConnectorToolGuidance(
+                    listExternalServices(mcpSync.mcpServers),
+                );
+                if (client.threadId && nextDeveloperInstructions !== currentDeveloperInstructions) {
+                    await client.resumeThread({
+                        threadId: client.threadId,
+                        mcpServers: mcpSync.mcpServers,
+                        developerInstructions: nextDeveloperInstructions,
+                    });
+                    currentDeveloperInstructions = nextDeveloperInstructions;
+                }
 
                 // Start thread on first turn (thread persists across mode changes)
                 let activeThreadId = client.threadId;
@@ -1037,12 +1077,53 @@ export async function runCodex(opts: {
                         approvalPolicy: executionPolicy.approvalPolicy,
                         sandbox: executionPolicy.sandbox,
                         mcpServers: mcpSync.mcpServers,
+                        developerInstructions: nextDeveloperInstructions,
                     });
                     activeThreadId = startedThread.threadId;
+                    currentDeveloperInstructions = nextDeveloperInstructions;
                     session.updateMetadata((currentMetadata) => ({
                         ...currentMetadata,
                         codexThreadId: startedThread.threadId,
                     }));
+                }
+
+                const runtimeRecovery = await mcpRuntimeRecovery.recoverBeforeTurn({
+                    threadId: activeThreadId,
+                    mcpServers: mcpSync.mcpServers,
+                    expectedServerNames: listConfiguredExternalServices(mcpSync.mcpServers),
+                    developerInstructions: currentDeveloperInstructions,
+                });
+                if (runtimeRecovery.status !== 'ready') {
+                    const connectorNames = new Set(readExpectedConnectors());
+                    const serverStatuses = runtimeRecovery.serverStatuses
+                        ?? runtimeRecovery.affectedServers.map((name) => ({
+                            name,
+                            status: runtimeRecovery.status,
+                        }));
+                    for (const serverRecovery of serverStatuses) {
+                        const { name } = serverRecovery;
+                        const status = serverRecovery.status === 'recovered'
+                            ? 'connected' as const
+                            : serverRecovery.status === 'needs-auth'
+                                ? (connectorNames.has(name) ? 'connector-needs-auth' as const : 'needs-auth' as const)
+                                : (connectorNames.has(name) ? 'connector-runtime-failed' as const : 'failed' as const);
+                        session.updateMetadata((currentMetadata) => ({
+                            ...currentMetadata,
+                            mcpServers: [
+                                ...(currentMetadata.mcpServers ?? []).filter((server) => server.name !== name),
+                                {
+                                    name,
+                                    status,
+                                    ...(serverRecovery.status === 'needs-auth'
+                                        ? { error: 'MCP authentication is required' }
+                                        : serverRecovery.status === 'failed'
+                                            ? { error: 'MCP runtime initialization failed' }
+                                            : {}),
+                                    checkedAt: Date.now(),
+                                },
+                            ],
+                        }));
+                    }
                 }
 
                 const goalCommand = parseCodexGoalCommand(message.message);
@@ -1075,8 +1156,6 @@ export async function runCodex(opts: {
                     mode: message.mode,
                     includeAppendSystemPrompt,
                     includeTitleInstruction: first,
-                    connectorGuidance,
-                    includeConnectorGuidance: Boolean(connectorGuidance && !connectorGuidanceInjected),
                 });
 
                 const result = await client.sendTurnAndWait(turnPrompt, {
@@ -1090,7 +1169,6 @@ export async function runCodex(opts: {
                 if (includeAppendSystemPrompt) {
                     appendSystemPromptInjected = true;
                 }
-                if (connectorGuidance) connectorGuidanceInjected = true;
 
                 if (result.aborted) {
                     // Turn was aborted (user abort or permission cancel).

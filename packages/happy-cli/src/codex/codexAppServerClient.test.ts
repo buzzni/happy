@@ -139,6 +139,131 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(new CodexAppServerClient().supportsGoalActions()).toBe(false);
     });
 
+    it('adapts MCP startup notifications and paginated tool/auth inventory', async () => {
+        const requests: MockRpcMessage[] = [];
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                appServerStdout = stdout;
+                if (msg.method !== 'mcpServerStatus/list' || msg.id == null) return;
+                requests.push(msg);
+                const secondPage = msg.params?.cursor === 'page-2';
+                setTimeout(() => pushJsonLine(stdout, {
+                    id: msg.id,
+                    result: secondPage
+                        ? {
+                            data: [{ name: 'notion', authStatus: 'notLoggedIn', tools: {} }],
+                            nextCursor: null,
+                        }
+                        : {
+                            data: [{ name: 'argos', authStatus: 'unsupported', tools: { search: {} } }],
+                            nextCursor: 'page-2',
+                        },
+                }), 0);
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+        if (!appServerStdout) throw new Error('app-server stdout unavailable');
+
+        pushJsonLine(appServerStdout, {
+            method: 'mcpServer/startupStatus/updated',
+            params: {
+                threadId: 'thread-1',
+                name: 'notion',
+                status: 'failed',
+                error: 'OAuth login required',
+                failureReason: 'reauthenticationRequired',
+            },
+        });
+        await waitFor(() => client.getMcpStartupStatuses().length === 1);
+
+        expect(client.getMcpStartupStatuses()).toEqual([{
+            threadId: 'thread-1',
+            name: 'notion',
+            status: 'failed',
+            error: 'OAuth login required',
+            failureReason: 'reauthenticationRequired',
+        }]);
+        await expect(client.listMcpServerStatus({ threadId: 'thread-1' })).resolves.toEqual({
+            data: [
+                { name: 'argos', authStatus: 'unsupported', tools: { search: {} } },
+                { name: 'notion', authStatus: 'notLoggedIn', tools: {} },
+            ],
+            nextCursor: null,
+        });
+        expect(requests.map(({ params }) => params)).toEqual([
+            { threadId: 'thread-1', cursor: null, limit: 100, detail: 'toolsAndAuthOnly' },
+            { threadId: 'thread-1', cursor: 'page-2', limit: 100, detail: 'toolsAndAuthOnly' },
+        ]);
+
+        client.clearThreadState();
+        expect(client.getMcpStartupStatuses()).toEqual([]);
+
+        await client.disconnect();
+    });
+
+    it('persists developer instructions across start, topology-update resume, and fork', async () => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                if (msg.method === 'thread/compact/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, { id: msg.id, result: {} }), 0);
+                    return;
+                }
+                if (!['thread/start', 'thread/resume', 'thread/fork'].includes(msg.method ?? '') || msg.id == null) {
+                    return;
+                }
+                const threadId = msg.method === 'thread/fork' ? 'thread-forked' : 'thread-1';
+                setTimeout(() => pushJsonLine(stdout, {
+                    id: msg.id,
+                    result: {
+                        thread: { id: threadId, path: `/tmp/${threadId}` },
+                        model: 'gpt-test',
+                        modelProvider: 'openai',
+                        cwd: '/tmp/project',
+                        approvalPolicy: 'on-request',
+                        sandbox: { type: 'workspaceWrite' },
+                        reasoningEffort: null,
+                    },
+                }), 0);
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+
+        await client.startThread({
+            cwd: '/tmp/project',
+            developerInstructions: 'Discover Gmail tools before browser fallback.',
+        });
+        await client.resumeThread({
+            threadId: 'thread-1',
+            developerInstructions: 'Discover Gmail and Argos tools before browser fallback.',
+        });
+        await client.compactThread({ threadId: 'thread-1' });
+        await client.resumeThread({ threadId: 'thread-1' });
+        await client.forkThread({ threadId: 'thread-1' });
+
+        expect(requests.find(({ method }) => method === 'thread/start')?.params.developerInstructions)
+            .toBe('Discover Gmail tools before browser fallback.');
+        expect(requests.filter(({ method }) => method === 'thread/resume').map(({ params }) => (
+            params.developerInstructions
+        ))).toEqual([
+            'Discover Gmail and Argos tools before browser fallback.',
+            'Discover Gmail and Argos tools before browser fallback.',
+        ]);
+        expect(requests.find(({ method }) => method === 'thread/compact/start')?.params).toEqual({
+            threadId: 'thread-1',
+        });
+        expect(requests.find(({ method }) => method === 'thread/fork')?.params.developerInstructions)
+            .toBe('Discover Gmail and Argos tools before browser fallback.');
+
+        await client.disconnect();
+    });
+
     it('wraps transport when sandbox is enabled', async () => {
         // Dynamic import to ensure mocks are applied
         const { CodexAppServerClient } = await import('./codexAppServerClient');

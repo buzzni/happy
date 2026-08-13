@@ -35,6 +35,7 @@ import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
 import { appendClaudeTitleInstruction } from './utils/titlePrompt';
 import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
 import {
+    fetchAplusMcpConfigSnapshot,
     fetchAplusMcpServersResult,
     mcpConfigFailureStatuses,
 } from '@/aplus/fetchAplusMcpServers';
@@ -997,11 +998,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     // P6(b): aplus 자동 mcp 등록 — web-ui 의 /api/me/mcp-config 응답을
     // 'happy' MCP 옆에 머지한다. 실패는 silent (graceful degrade).
-    const initialAplusMcpResult = await fetchAplusMcpServersResult(
+    const initialAplusMcpSnapshot = await fetchAplusMcpConfigSnapshot(
         credentials.token,
         machineId,
         { sessionId: session.sessionId },
     );
+    const initialAplusMcpResult = initialAplusMcpSnapshot.result;
     for (const status of mcpConfigFailureStatuses(initialAplusMcpResult)) {
         session.updateMetadata((currentMetadata) => ({
             ...currentMetadata,
@@ -1011,7 +1013,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             ],
         }));
     }
-    const aplusMcpServers = initialAplusMcpResult.ok ? initialAplusMcpResult.servers : {};
+    const aplusMcpServers = initialAplusMcpSnapshot.servers;
     const baseMcpServers = {
         'happy': {
             type: 'http' as const,

@@ -157,8 +157,9 @@ describe('claudeRemote', () => {
         }
     });
 
-    it('instructs the agent to discover expected connector tools before browser fallback', async () => {
-        process.env.HAPPY_APLUS_EXPECTED_CONNECTORS = '["gmail","knoi"]';
+    it('instructs the agent to discover connector and runtime MCP tools before browser fallback', async () => {
+        process.env.HAPPY_APLUS_EXPECTED_CONNECTORS = '["gmail"]';
+        process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES = '["argos","gmail"]';
         try {
             vi.mocked(query).mockReturnValue({
                 setPermissionMode: vi.fn(),
@@ -170,6 +171,10 @@ describe('claudeRemote', () => {
             await claudeRemote({
                 sessionId: null,
                 path: process.cwd(),
+                mcpServers: {
+                    happy: { type: 'http', url: 'http://happy.test/mcp' },
+                    argos: { type: 'http', url: 'https://argos.test/mcp' },
+                },
                 allowedTools: [],
                 hookSettingsPath: '/tmp/happy-test-settings.json',
                 nextMessage: async () => (count++ === 0 ? { message: 'check gmail', mode } : null),
@@ -181,11 +186,13 @@ describe('claudeRemote', () => {
                 onMessage: vi.fn(),
             });
 
-            expect(vi.mocked(query).mock.calls[0][0].options?.appendSystemPrompt).toContain(
-                'deferred MCP tool discovery',
-            );
+            const prompt = vi.mocked(query).mock.calls[0][0].options?.appendSystemPrompt;
+            expect(prompt).toContain('argos, gmail');
+            expect(prompt).toContain('deferred MCP tool discovery');
+            expect(prompt).not.toContain('aplus-common');
         } finally {
             delete process.env.HAPPY_APLUS_EXPECTED_CONNECTORS;
+            delete process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES;
         }
     });
 

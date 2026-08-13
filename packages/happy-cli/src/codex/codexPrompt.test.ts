@@ -68,25 +68,21 @@ describe('buildCodexTurnPrompt', () => {
         );
     });
 
-    it('injects connector guidance once even when resuming an existing thread', () => {
+    it('keeps external-service guidance out of user messages on first and follow-up turns', () => {
         const first = buildCodexTurnPrompt({
             message: 'check KNOI',
             mode: {},
             includeAppendSystemPrompt: false,
             includeTitleInstruction: false,
-            connectorGuidance: 'discover deferred MCP tools before browser fallback',
-            includeConnectorGuidance: true,
         });
         const followUp = buildCodexTurnPrompt({
             message: 'continue',
             mode: {},
             includeAppendSystemPrompt: false,
             includeTitleInstruction: false,
-            connectorGuidance: 'discover deferred MCP tools before browser fallback',
-            includeConnectorGuidance: false,
         });
 
-        expect(first).toBe('discover deferred MCP tools before browser fallback\n\ncheck KNOI');
+        expect(first).toBe('check KNOI');
         expect(followUp).toBe('continue');
     });
 });
