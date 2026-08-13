@@ -381,10 +381,12 @@ export function withUvToolBinOnPath(
       : join(homeDir, '.local', 'bin'))
   const pathKey = Object.keys(environment).find((key) => key.toUpperCase() === 'PATH') ?? 'PATH'
   const currentPath = environment[pathKey] ?? ''
-  if (currentPath.split(delimiter).includes(toolBin)) return environment
+  const remainingPath = currentPath
+    .split(delimiter)
+    .filter((entry) => entry && entry !== toolBin)
   return {
     ...environment,
-    [pathKey]: currentPath ? `${toolBin}${delimiter}${currentPath}` : toolBin,
+    [pathKey]: [toolBin, ...remainingPath].join(delimiter),
   }
 }
 

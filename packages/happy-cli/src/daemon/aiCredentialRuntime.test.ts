@@ -97,6 +97,15 @@ describe('AI credential machine runtime', () => {
       join('/xdg/data', '..', 'bin'),
       '/usr/bin',
     ].join(delimiter))
+
+    expect(withUvToolBinOnPath({
+      PATH: ['/usr/local/bin', '/managed/bin', '/usr/bin', '/managed/bin'].join(delimiter),
+      UV_TOOL_BIN_DIR: '/managed/bin',
+    }, '/home/operator').PATH).toBe([
+      '/managed/bin',
+      '/usr/local/bin',
+      '/usr/bin',
+    ].join(delimiter))
   })
 
   it('exports Claude credentials with fixed argv and a payload size cap', async () => {
