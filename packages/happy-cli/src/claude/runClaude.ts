@@ -52,6 +52,7 @@ import { deliverPreparedClaudeSessionStart, prepareClaudeInitialPrompt } from '.
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
+import { resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -167,10 +168,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     const reconnectSession = readReconnectSessionEnvironment(process.env);
     const reconnectSessionId = reconnectSession?.id;
     const metadata = mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata);
+    const allowAutomationReconnectPrompt = process.env.HAPPY_AUTOMATION_RESUME_PROMPT === '1';
+    delete process.env.HAPPY_AUTOMATION_RESUME_PROMPT;
     const preparedInitialPrompt = prepareClaudeInitialPrompt({
         env: process.env,
         reconnectSessionId,
         automationRunOnceRequested,
+        allowAutomationReconnectPrompt,
     });
     const exitAfterFirstTurn = preparedInitialPrompt.exitAfterFirstTurn;
 
@@ -279,6 +283,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     if (reconnectSessionId) {
         session.suppressNextArchiveSignal();
         session.skipExistingMessages(response.seq);
+        if (allowAutomationReconnectPrompt) {
+            session.capRuntimeProcessedSeq(response.seq);
+        }
         session.updateMetadata((meta) => mergeReconnectSessionMetadata(meta, freshMetadata));
     }
 
@@ -865,7 +872,14 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             sendClaudeSessionMessage: (record) => session.sendClaudeSessionMessage(record),
             recordAppPrompt,
             pushPrompt: (text) => {
-                messageQueue.push(text, currentEnhancedMode());
+                const mode = currentEnhancedMode();
+                messageQueue.unshiftIsolated(text, {
+                    ...mode,
+                    permissionMode: resolveInitialPromptPermissionMode(
+                        mode.permissionMode,
+                        allowAutomationReconnectPrompt,
+                    ),
+                });
                 logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
             },
         },

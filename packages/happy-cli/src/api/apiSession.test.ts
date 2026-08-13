@@ -753,6 +753,19 @@ describe('ApiSessionClient v3 messages API migration', () => {
         }));
     });
 
+    it('keeps an automation resume cursor at its reconnect baseline', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.skipExistingMessages(41);
+        client.capRuntimeProcessedSeq(41);
+        (client as any).lastSeq = 52;
+
+        client.keepAlive(true, 'remote');
+
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalledWith('test-session-id', expect.objectContaining({
+            lastProcessedSeq: 41,
+        }));
+    });
+
     it('reports open tool-call state to the local daemon', async () => {
         const client = new ApiSessionClient('fake-token', session);
         mockAxiosPost.mockResolvedValue({

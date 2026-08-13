@@ -9,6 +9,7 @@ import {
   type InitialPromptSink,
 } from './initialPrompt'
 import { CLAUDE_TITLE_INSTRUCTION } from './utils/titlePrompt'
+import { resolveInitialPromptPermissionMode } from '@/utils/initialPrompt'
 
 describe('consumePendingInitialPrompt', () => {
   it('shouldReturnPromptOnceAndDeleteEnvVar', () => {
@@ -21,6 +22,13 @@ describe('consumePendingInitialPrompt', () => {
   it('shouldReturnNullForMissingOrBlankPrompt', () => {
     expect(consumePendingInitialPrompt({})).toBeNull()
     expect(consumePendingInitialPrompt({ HAPPY_INITIAL_PROMPT: '   ' })).toBeNull()
+  })
+})
+
+describe('resolveInitialPromptPermissionMode', () => {
+  it('elevates only the explicit automation resume prompt', () => {
+    expect(resolveInitialPromptPermissionMode('default', true)).toBe('bypassPermissions')
+    expect(resolveInitialPromptPermissionMode('default', false)).toBe('default')
   })
 })
 
@@ -54,6 +62,27 @@ describe('prepareClaudeInitialPrompt', () => {
       automationRunOnceRequested: true,
     })).toThrow('Claude automation cannot start without a fresh initial prompt')
     expect(env.HAPPY_INITIAL_PROMPT).toBeUndefined()
+  })
+
+  it('allowsAFreshRunOncePromptForAnExplicitAutomationResume', () => {
+    const env = { HAPPY_INITIAL_PROMPT: 'apply reviewed findings' }
+
+    expect(prepareClaudeInitialPrompt({
+      env,
+      reconnectSessionId: 'existing-session',
+      automationRunOnceRequested: true,
+      allowAutomationReconnectPrompt: true,
+    })).toEqual({ prompt: 'apply reviewed findings', exitAfterFirstTurn: true })
+    expect(env.HAPPY_INITIAL_PROMPT).toBeUndefined()
+  })
+
+  it('rejectsAnExplicitAutomationResumeWithoutItsPrompt', () => {
+    expect(() => prepareClaudeInitialPrompt({
+      env: {},
+      reconnectSessionId: 'existing-session',
+      automationRunOnceRequested: false,
+      allowAutomationReconnectPrompt: true,
+    })).toThrow('Claude automation cannot start without a fresh initial prompt')
   })
 
   it('consumesAStaleInteractiveReconnectPromptWithoutActivatingRunOnce', () => {

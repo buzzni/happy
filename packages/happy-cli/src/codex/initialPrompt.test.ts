@@ -135,6 +135,27 @@ describe('prepareCodexInitialPrompt', () => {
 
     expect(env.HAPPY_INITIAL_PROMPT).toBeUndefined()
   })
+
+  it('allowsAFreshRunOncePromptForAnExplicitAutomationResume', () => {
+    const env = { HAPPY_INITIAL_PROMPT: 'apply reviewed findings' }
+
+    expect(prepareCodexInitialPrompt({
+      env,
+      reconnectSessionId: 'existing-session',
+      automationRunOnceRequested: true,
+      allowAutomationReconnectPrompt: true,
+    })).toEqual({ prompt: 'apply reviewed findings', exitAfterFirstTurn: true })
+    expect(env.HAPPY_INITIAL_PROMPT).toBeUndefined()
+  })
+
+  it('rejectsAnExplicitAutomationResumeWithoutItsPrompt', () => {
+    expect(() => prepareCodexInitialPrompt({
+      env: {},
+      reconnectSessionId: 'existing-session',
+      automationRunOnceRequested: false,
+      allowAutomationReconnectPrompt: true,
+    })).toThrow('Codex automation cannot start without a fresh initial prompt')
+  })
 })
 
 describe('assertCodexAutomationServerAvailable', () => {

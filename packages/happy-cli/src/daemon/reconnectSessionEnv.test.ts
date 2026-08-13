@@ -5,6 +5,7 @@ import {
     buildReconnectSessionEnvironment,
     decodeReconnectSessionSnapshot,
     encodeReconnectSessionSnapshot,
+    hasReliableResumeBaseline,
     readReconnectSessionEnvironment,
     resolveResumeBaselineSeq,
 } from './reconnectSessionEnv';
@@ -234,5 +235,22 @@ describe('resolveResumeBaselineSeq', () => {
         expect(resolveResumeBaselineSeq({
             webhookSeq: 600,
         })).toBe(600);
+    });
+});
+
+describe('hasReliableResumeBaseline', () => {
+    it('requires a runtime or persisted processed seq for an automation resume', () => {
+        expect(hasReliableResumeBaseline({
+            reportedSeq: undefined,
+            persistedSeq: undefined,
+        })).toBe(false);
+        expect(hasReliableResumeBaseline({
+            reportedSeq: 0,
+            persistedSeq: undefined,
+        })).toBe(true);
+        expect(hasReliableResumeBaseline({
+            reportedSeq: undefined,
+            persistedSeq: 621,
+        })).toBe(true);
     });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { decideResumeCredentials, extractTokenSubject } from './resumeCredentials';
+import { decideResumeCredentials, extractTokenSubject, tokensShareIdentity } from './resumeCredentials';
 
 // 2026-07-23 운영 사고: resume 된 child 가 preflight 와 다른 계정의
 // 자격증명을 읽어 세션 sync 가 404 로 종료됨. 두 가지 경로가 있었다:
@@ -30,6 +30,24 @@ describe('extractTokenSubject', () => {
         expect(extractTokenSubject('a.not-base64-json!!.c')).toBeNull();
         expect(extractTokenSubject(null)).toBeNull();
         expect(extractTokenSubject(undefined)).toBeNull();
+    });
+});
+
+describe('tokensShareIdentity', () => {
+    it('accepts refreshed JWTs for the same account and rejects another account', () => {
+        expect(tokensShareIdentity(
+            fakeJwt({ sub: 'account-a', iat: 1 }),
+            fakeJwt({ sub: 'account-a', iat: 2 }),
+        )).toBe(true);
+        expect(tokensShareIdentity(
+            fakeJwt({ sub: 'account-a' }),
+            fakeJwt({ sub: 'account-b' }),
+        )).toBe(false);
+    });
+
+    it('requires exact equality for opaque tokens', () => {
+        expect(tokensShareIdentity('opaque-1', 'opaque-1')).toBe(true);
+        expect(tokensShareIdentity('opaque-1', 'opaque-2')).toBe(false);
     });
 });
 

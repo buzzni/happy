@@ -288,6 +288,7 @@ export class ApiSessionClient extends EventEmitter {
         activeSubagents: new Set<string>(),
     };
     private lastSeq = 0;
+    private runtimeProcessedSeqCap: number | null = null;
     private pendingOutbox: Array<{ content: string; localId: string }> = [];
     private readonly sendSync: InvalidateSync;
     private readonly receiveSync: InvalidateSync;
@@ -1278,7 +1279,7 @@ export class ApiSessionClient extends EventEmitter {
             // Resume skip-baseline: the last seq delivered to the agent loop.
             // Without it the daemon falls back to the server-head seq, which
             // swallows messages that arrive while the session has no process.
-            lastProcessedSeq: this.lastSeq,
+            lastProcessedSeq: this.runtimeProcessedSeqCap ?? this.lastSeq,
             mode: this.currentMode,
         });
     }
@@ -1353,6 +1354,16 @@ export class ApiSessionClient extends EventEmitter {
         } else {
             this.skipExistingMessagesThroughSeq = null;
         }
+    }
+
+    /**
+     * Keep a one-turn automation resume from acknowledging user input that
+     * arrived while its privileged turn was running. The next normal resume
+     * replays everything after this baseline once the automation process and
+     * its scoped credentials have exited.
+     */
+    capRuntimeProcessedSeq(throughSeq: number) {
+        this.runtimeProcessedSeqCap = Math.max(0, throughSeq);
     }
 
     updateMetadata(handler: (metadata: Metadata) => Metadata) {

@@ -54,6 +54,7 @@ export function createOfflineSessionStub(sessionTag: string): ApiSessionClient {
         onUserMessage: () => {},
         onFileEvent: () => {},
         skipExistingMessages: () => {},
+        capRuntimeProcessedSeq: () => {},
         suppressNextArchiveSignal: () => {},
         trackAttachmentDownload: () => {},
         drainAttachmentsForUserMessage: async () => [],

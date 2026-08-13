@@ -115,6 +115,19 @@ export function resolveResumeBaselineSeq(input: {
     return Math.max(input.webhookSeq, input.serverSeq ?? 0);
 }
 
+/**
+ * Automated resumes must not guess at the processed-message boundary. Falling
+ * back to the server head is acceptable for an explicit user resume where
+ * replay is the competing risk, but a one-turn automation could otherwise
+ * acknowledge unseen user input before the user regains control of the session.
+ */
+export function hasReliableResumeBaseline(input: {
+    reportedSeq?: number;
+    persistedSeq?: number;
+}): boolean {
+    return input.reportedSeq !== undefined || input.persistedSeq !== undefined;
+}
+
 export function buildReconnectSessionEnvironment(input: {
     sessionId: string;
     encryption: SessionEncryptionData;

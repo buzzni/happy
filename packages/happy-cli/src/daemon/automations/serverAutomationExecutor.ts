@@ -75,6 +75,16 @@ export interface ServerAutomationExecutorInput {
     claimToken: string
     sessionId: string
   }) => Promise<{ ok: boolean; error?: string; skipped?: boolean }>
+  resumeSession: (input: {
+    sessionId: string
+    directory: string
+    initialPrompt: string
+    environmentVariables: Record<string, string>
+    exitAfterFirstTurn: true
+  }) => Promise<
+    { ok: true; sessionId: string }
+    | { ok: false; error: string; shouldFallback: boolean }
+  >
   spawnSession: (input: {
     directory: string
     initialPrompt: string
@@ -361,19 +371,56 @@ async function executeStartedRun(
     // fail closed 하고 자동화 실행 자체는 계속한다 (grant 미주입 = 커넥터 없음).
     input.logDebug?.(`[server-automation] ${automation.automationId} MCP caller grant failed: ${mcpContext.error}; spawning without personal connectors`)
   }
-  const spawned = await input.spawnSession({
+  const initialPrompt = buildAutomationPrompt(prompt, scriptOutput)
+  const spawnInput = {
     directory: payload.directory,
-    initialPrompt: buildAutomationPrompt(prompt, scriptOutput),
+    initialPrompt,
     createdByAccountId: null,
     agent: payload.agent ?? 'claude',
     ...(agentTaskDispatch?.type === 'pr_review.v1' ? { permissionMode: 'read-only' as const } : {}),
     ...(environmentVariables ? { environmentVariables } : {}),
     ...(mcpContext.ok && mcpContext.value ? { mcpSpawnContext: mcpContext.value } : {}),
-  })
+  }
+  let spawned: { ok: true; sessionId: string } | { ok: false; error: string }
+  let associateSpawnedSession = true
+  if (agentTaskDispatch?.type === 'review_apply.v1'
+      && agentTaskDispatch.targetSessionId
+      && environmentVariables) {
+    const resumed = await input.resumeSession({
+      sessionId: agentTaskDispatch.targetSessionId,
+      directory: payload.directory,
+      initialPrompt,
+      environmentVariables,
+      exitAfterFirstTurn: true,
+    })
+    if (resumed.ok) {
+      input.logDebug?.(
+        `[server-automation] resumed original requester session ${resumed.sessionId} for review_apply task ${agentTaskDispatch.taskId}`,
+      )
+      spawned = resumed
+      // This is the user's existing session, not a child owned by this
+      // automation run. Do not relink it, and clear any stale worker id so a
+      // later GitHub poll cannot be gated by unrelated session liveness.
+      associateSpawnedSession = false
+      advanceSchedule(input, automation.automationId, payload, input.now, null)
+    } else if (resumed.shouldFallback) {
+      input.logDebug?.(
+        `[server-automation] original requester session unavailable; using a new apply worker: ${resumed.error}`,
+      )
+      spawned = await input.spawnSession(spawnInput)
+    } else {
+      input.logDebug?.(
+        `[server-automation] original requester session is busy; leaving apply pending: ${resumed.error}`,
+      )
+      spawned = resumed
+    }
+  } else {
+    spawned = await input.spawnSession(spawnInput)
+  }
   if (spawned.ok && agentTaskDispatch) input.maintainAgentTaskLease(agentTaskDispatch)
   if (spawned.ok) persistGithubTriggerState?.()
   return spawned.ok
-    ? { outcome: 'WOKE', sessionId: spawned.sessionId }
+    ? { outcome: 'WOKE', sessionId: associateSpawnedSession ? spawned.sessionId : null }
     : { outcome: 'ERROR', sessionId: null }
 }
 

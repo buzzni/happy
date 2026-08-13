@@ -10,7 +10,8 @@ describe('automation AgentTask bridge client', () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
       dispatch: {
         taskId: 'task-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
-        claimToken: 'claim-secret', completeToken: 'complete-secret', input: { prNumber: 17 }, context: [],
+        claimToken: 'claim-secret', completeToken: 'complete-secret', targetSessionId: null,
+        input: { prNumber: 17 }, context: [],
       },
     }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
     await expect(dispatchAutomationAgentTask({
@@ -21,6 +22,25 @@ describe('automation AgentTask bridge client', () => {
     const [, init] = fetchImpl.mock.calls[0]! as unknown as [string, RequestInit]
     expect(String(init?.body)).toContain('run-1')
     expect(String(init?.body)).not.toContain('machine-secret')
+  })
+
+  it('parses a review_apply requester session target without exposing it in the request', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      dispatch: {
+        taskId: 'apply-1', type: 'review_apply.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        targetSessionId: 'creator-session', input: {}, context: [],
+      },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+
+    await expect(dispatchAutomationAgentTask({
+      configUrl: 'https://studio.example', machineToken: 'machine-secret', machineId: 'machine-1',
+      runId: 'run-1', claimToken: 'run-secret', credentialId: 'credential-1', event: null,
+      fetchImpl: fetchImpl as never,
+    })).resolves.toMatchObject({
+      ok: true,
+      dispatch: { taskId: 'apply-1', targetSessionId: 'creator-session' },
+    })
   })
 
   it('returns a redacted failure for non-success responses', async () => {
