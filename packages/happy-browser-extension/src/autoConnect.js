@@ -10,8 +10,17 @@ export function parseAutoConnectParams(search) {
     if (!token) return null
 
     const port = Number(params.get('port'))
-    return {
+    const result = {
         token,
         port: Number.isFinite(port) && port > 0 ? port : 41777,
     }
+
+    // Absent must stay absent rather than becoming `false`: a machine that
+    // re-pairs (new token, same profile) would otherwise silently switch the
+    // debugger tier back off for a user who had turned it on.
+    const debuggerParam = params.get('debugger')
+    if (debuggerParam !== null) {
+        result.debuggerTier = debuggerParam === '1' || debuggerParam === 'true'
+    }
+    return result
 }

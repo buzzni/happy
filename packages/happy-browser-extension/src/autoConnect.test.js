@@ -24,4 +24,25 @@ describe('parseAutoConnectParams', () => {
     it('returns null for a blank token', () => {
         expect(parseAutoConnectParams('?token=%20%20')).toBeNull()
     })
+
+    it('reads an explicit debugger tier opt-in', () => {
+        expect(parseAutoConnectParams('?token=abc123&debugger=1')).toEqual({
+            token: 'abc123',
+            port: 41777,
+            debuggerTier: true,
+        })
+    })
+
+    it('reads an explicit debugger tier opt-out', () => {
+        expect(parseAutoConnectParams('?token=abc123&debugger=0')).toEqual({
+            token: 'abc123',
+            port: 41777,
+            debuggerTier: false,
+        })
+    })
+
+    it('omits debuggerTier entirely when the link does not mention it, so an existing setting is left alone', () => {
+        const parsed = parseAutoConnectParams('?token=abc123')
+        expect('debuggerTier' in parsed).toBe(false)
+    })
 })
