@@ -198,6 +198,9 @@ describe('CodexAppServerClient sandbox integration', () => {
             { threadId: 'thread-1', cursor: 'page-2', limit: 100, detail: 'toolsAndAuthOnly' },
         ]);
 
+        client.clearThreadState();
+        expect(client.getMcpStartupStatuses()).toEqual([]);
+
         await client.disconnect();
     });
 

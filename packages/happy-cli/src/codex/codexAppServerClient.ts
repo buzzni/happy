@@ -1439,6 +1439,7 @@ export class CodexAppServerClient {
         this.threadDefaults = null;
         this.completedTurnIds.clear();
         this.rawFileChangesByItemId.clear();
+        this.mcpServerStatuses.clear();
     }
 
     // ─── JSON-RPC transport ─────────────────────────────────────
