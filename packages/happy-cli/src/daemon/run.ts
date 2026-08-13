@@ -253,6 +253,7 @@ export async function startDaemon(): Promise<void> {
   // 2. Should not have another daemon process running
 
   let stopLogHousekeeping: () => void = () => undefined;
+  let stopClaudeSwapSupervisor: () => void = () => undefined;
   try {
     // Start caffeinate
     const caffeinateStarted = startCaffeinate();
@@ -1516,6 +1517,7 @@ export async function startDaemon(): Promise<void> {
     const claudeSwapSupervisor = createClaudeSwapSupervisor(
       join(configuration.happyHomeDir, 'claude-swap-supervisor.json'),
     );
+    stopClaudeSwapSupervisor = () => claudeSwapSupervisor.shutdown();
     await claudeSwapSupervisor.restore();
     const aiCredentialRuntime = createNodeAiCredentialRuntime(claudeSwapSupervisor);
     apiMachine.setAutomationKey(machineAutomationKey, (keyVersion) => {
@@ -1823,6 +1825,7 @@ export async function startDaemon(): Promise<void> {
     await cleanupAndShutdown(shutdownRequest.source, shutdownRequest.errorMessage);
   } catch (error) {
     stopLogHousekeeping();
+    stopClaudeSwapSupervisor();
     logger.debug('[DAEMON RUN][FATAL] Failed somewhere unexpectedly - exiting with code 1', error);
     process.exit(1);
   }
