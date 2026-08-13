@@ -164,9 +164,16 @@ describe('fetchAplusMcpServersResult', () => {
     });
 
     it('treats an effectively connected Argos missing from config as mcp-config-missing', async () => {
+        process.env.HAPPY_APLUS_EXPECTED_CONNECTORS = '["gmail","knoi"]';
         const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
             mcpServers: {
                 'aplus-common': { type: 'http', url: 'https://saycode.test/mcp/common' },
+            },
+            connectorReadiness: {
+                status: 'ready',
+                expected: ['gmail'],
+                configured: ['gmail'],
+                missing: [],
             },
             mcpReadiness: {
                 status: 'mcp-config-missing',
@@ -193,11 +200,35 @@ describe('fetchAplusMcpServersResult', () => {
         });
         expect(fetchMock).toHaveBeenCalledTimes(2);
         expect(process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES).toBe('["argos"]');
+        expect(process.env.HAPPY_APLUS_EXPECTED_CONNECTORS).toBe('["gmail"]');
         expect(mcpConfigFailureStatuses(result, 123)).toEqual([{
             name: 'argos',
             status: 'mcp-config-missing',
             error: 'Expected MCP service configuration is missing: argos',
             checkedAt: 123,
         }]);
+    });
+
+    it('clears stale expected MCP services from authoritative empty readiness', async () => {
+        process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES = '["argos"]';
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+            mcpServers: {
+                'aplus-common': { type: 'http', url: 'https://saycode.test/mcp/common' },
+            },
+            mcpReadiness: {
+                status: 'ready',
+                expected: [],
+                configured: [],
+                missing: [],
+            },
+        }), { status: 200 })));
+
+        await expect(fetchAplusMcpServersResult(
+            'happy-token',
+            'machine-1',
+            { sessionId: 'session-1', lifecycle: 'turn' },
+        )).resolves.toMatchObject({ ok: true });
+
+        expect(process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES).toBe('[]');
     });
 });

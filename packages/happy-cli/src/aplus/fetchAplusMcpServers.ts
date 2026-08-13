@@ -191,6 +191,10 @@ export async function fetchAplusMcpServersResult(
                 return { ok: false, reason: 'invalid-response', error: 'mcp-config response is invalid' }
             }
             const keys = Object.keys(body.mcpServers)
+            const authoritativeExpected = connectorNames(body.connectorReadiness?.expected)
+            if (authoritativeExpected) {
+                process.env.HAPPY_APLUS_EXPECTED_CONNECTORS = JSON.stringify(authoritativeExpected)
+            }
             const authoritativeMcpExpected = connectorNames(body.mcpReadiness?.expected)
             const authoritativeMcpConfigured = connectorNames(body.mcpReadiness?.configured)
             const authoritativeMcpMissing = missingMcpServices(body.mcpReadiness?.missing)
@@ -219,11 +223,7 @@ export async function fetchAplusMcpServersResult(
                     missing: authoritativeMcpMissing,
                 }
             }
-            const authoritativeExpected = connectorNames(body.connectorReadiness?.expected)
             const currentExpected = authoritativeExpected ?? expected
-            if (authoritativeExpected) {
-                process.env.HAPPY_APLUS_EXPECTED_CONNECTORS = JSON.stringify(authoritativeExpected)
-            }
             const configured = currentExpected.filter((provider) => keys.includes(provider))
             const missing = currentExpected.filter((provider) => !configured.includes(provider))
             if (missing.length > 0) {
