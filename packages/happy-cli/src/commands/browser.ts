@@ -16,7 +16,7 @@ import { readDaemonState } from '@/persistence'
 import { projectPath } from '@/projectPath'
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken'
 import { fetchBrowserStatus } from '@/daemon/browserClient'
-import { DEFAULT_BROWSER_BRIDGE_PORT } from '@/daemon/browserBridgeServer'
+import { DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from '@/daemon/browserBridgeServer'
 import { computeChromeExtensionId } from './browserExtensionId'
 
 /**
@@ -71,14 +71,34 @@ export interface BrowserStatusInput {
      * ours is up — no extension can ever reach it).
      */
     bridgePortInUse?: boolean
+    /**
+     * What the bridge is actually bound to (resolveBrowserBridgeHost). Absent
+     * means "not probed" and is treated as loopback — the safe assumption.
+     */
+    bridgeHost?: string
+    /**
+     * The address a remote user's own Chrome should dial — HAPPY_BROWSER_
+     * BRIDGE_PUBLIC_HOST. Deliberately separate from bridgeHost: a bind
+     * address of 0.0.0.0 says nothing about what a NAT/port-forwarding setup
+     * makes reachable from outside, so this has to be given explicitly rather
+     * than inferred.
+     */
+    publicHost?: string
 }
 
-function autoConnectLink(extensionId: string, token: string, bridgePort: number): string {
-    return `chrome-extension://${extensionId}/src/options.html?token=${token}&port=${bridgePort}`
+function autoConnectLink(extensionId: string, token: string, bridgePort: number, publicHost?: string): string {
+    const host = publicHost ? `&host=${encodeURIComponent(publicHost)}` : ''
+    return `chrome-extension://${extensionId}/src/options.html?token=${token}&port=${bridgePort}${host}`
 }
 
-export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePort, daemonRunning, connections, hasRecentAuthFailure, bridgePortInUse }: BrowserStatusInput): string {
+export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePort, daemonRunning, connections, hasRecentAuthFailure, bridgePortInUse, bridgeHost, publicHost }: BrowserStatusInput): string {
     const lines: string[] = ['', chalk.bold('Happy Browser Bridge'), '']
+
+    if (bridgeHost !== undefined && bridgeHost !== '127.0.0.1') {
+        lines.push(chalk.yellow(`브리지가 ${bridgeHost}에 바인드되어 있습니다 — 이 컴퓨터 밖에서도 닿을 수 있습니다.`))
+        lines.push(chalk.dim('  연결은 평문 WebSocket이고 pairing 토큰이 유일한 방어선입니다. 신뢰하는 네트워크에서만 여세요.'))
+        lines.push('')
+    }
 
     if (!daemonRunning && bridgePortInUse === true) {
         lines.push(chalk.yellow(`이 설치의 데몬은 떠 있지 않지만, 다른 happy 설치의 데몬이 브리지 포트 ${bridgePort}을 잡고 있습니다.`))
@@ -116,7 +136,7 @@ export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePo
         if (hasRecentAuthFailure) {
             lines.push(chalk.yellow('다른 확장이 예전 토큰으로 재연결을 시도하다 거부되고 있습니다.'))
             lines.push('아래 링크를 열어 재연결하세요:')
-            lines.push(`  ${chalk.cyan(autoConnectLink(extensionId, token, bridgePort))}`)
+            lines.push(`  ${chalk.cyan(autoConnectLink(extensionId, token, bridgePort, publicHost))}`)
             lines.push('')
         }
         return lines.join('\n')
@@ -141,7 +161,7 @@ export function formatBrowserStatus({ token, extensionDir, extensionId, bridgePo
     lines.push(`     (포트는 ${bridgePort}, 기본값 그대로면 수정 불필요)`)
     lines.push('')
     lines.push(chalk.dim('  1번 이후에는 아래 링크를 열면 2, 3번이 자동으로 끝납니다:'))
-    lines.push(`  ${chalk.cyan(autoConnectLink(extensionId, token, bridgePort))}`)
+    lines.push(`  ${chalk.cyan(autoConnectLink(extensionId, token, bridgePort, publicHost))}`)
     lines.push('')
     lines.push(chalk.dim('  GUI가 없는 머신(SSH 전용 Linux)이라면 링크를 열 방법이 없습니다. 대신:'))
     lines.push(`  ${chalk.cyan('happy browser pair')}  ${chalk.dim('— docs/browser-bridge-headless.md')}`)
@@ -232,5 +252,10 @@ export async function handleBrowserCommand(args: string[]): Promise<void> {
         connections,
         hasRecentAuthFailure,
         bridgePortInUse: await isBridgePortInUse(DEFAULT_BROWSER_BRIDGE_PORT),
+        // Best-effort: reflects this process's own env, which is only the
+        // live daemon's actual bind host when nothing has changed it since
+        // `happy daemon start` ran. Good enough to warn — not authoritative.
+        bridgeHost: resolveBrowserBridgeHost(process.env),
+        publicHost: process.env.HAPPY_BROWSER_BRIDGE_PUBLIC_HOST?.trim() || undefined,
     }))
 }

@@ -141,6 +141,29 @@ describe('formatBrowserStatus', () => {
         expect(out).toContain('happy daemon start')
     })
 
+    describe('remote host', () => {
+        it('says nothing about a remote host when the bridge is loopback-only', () => {
+            const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [], bridgeHost: '127.0.0.1' })
+            expect(out).not.toContain('host=')
+            expect(out).not.toMatch(/평문|공인/)
+        })
+
+        // The bridge can bind 0.0.0.0 without the user ever setting a public
+        // host to hand their own PC's Chrome — those are two separate env
+        // vars on purpose (NAT/port-forwarding means the bind address and the
+        // address a remote client dials are often different).
+        it('warns about the exposure once the bridge is bound off loopback, even with no public host to print a link for', () => {
+            const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [], bridgeHost: '0.0.0.0' })
+            expect(out).toMatch(/평문|암호화되지 않|토큰.*유일/)
+            expect(out).not.toContain('host=')
+        })
+
+        it('adds &host= to the auto-connect link when a public host is given', () => {
+            const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [], bridgeHost: '0.0.0.0', publicHost: 'happy.example.com' })
+            expect(out).toContain(`chrome-extension://${base.extensionId}/src/options.html?token=${base.token}&port=${base.bridgePort}&host=happy.example.com`)
+        })
+    })
+
     it('mentions the port the extension must be pointed at', () => {
         const out = formatBrowserStatus({ ...base, daemonRunning: true, connections: [] })
         expect(out).toContain('41777')
