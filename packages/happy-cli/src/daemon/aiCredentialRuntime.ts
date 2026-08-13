@@ -75,19 +75,21 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
 
   async function capture(input: { provider: AiCredentialProvider }) {
     const selected = provider(input?.provider)
-    let payload: string
-    if (selected === 'claude') {
-      const result = await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
-      payload = result.stdout
-    } else {
-      try {
-        payload = await deps.readFile(join(codexHome(), 'auth.json'))
-      } catch {
-        throw new AiCredentialRuntimeError('CODEX_FILE_STORE_REQUIRED')
+    return withSafeErrors(`${selected.toUpperCase()}_CAPTURE_FAILED`, async () => {
+      let payload: string
+      if (selected === 'claude') {
+        const result = await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
+        payload = result.stdout
+      } else {
+        try {
+          payload = await deps.readFile(join(codexHome(), 'auth.json'))
+        } catch {
+          throw new AiCredentialRuntimeError('CODEX_FILE_STORE_REQUIRED')
+        }
       }
-    }
-    assertPayloadSize(payload)
-    return { provider: selected, payload }
+      assertPayloadSize(payload)
+      return { provider: selected, payload }
+    })
   }
 
   async function ensureClaudeSwap(): Promise<void> {
@@ -122,7 +124,9 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       await deps.rm(tempDir, { recursive: true, force: true })
     }
     const status = await deps.execFile('cswap', ['list', '--json'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
-    parseClaudeList(status.stdout)
+    if (!parseClaudeList(status.stdout).configured) {
+      throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+    }
     await deps.supervisor.enable()
     return {
       provider: 'claude' as const,
@@ -179,41 +183,53 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       throw new AiCredentialRuntimeError('INVALID_PAYLOAD')
     }
     assertPayloadSize(input.payload)
-    const operation = applyTail.then(async () => {
-      if (selected === 'claude') return applyClaude(input.payload)
-      return applyCodex(input.payload)
-    })
+    const operation = applyTail.then(() => withSafeErrors(
+      `${selected.toUpperCase()}_APPLY_FAILED`,
+      async () => {
+        if (selected === 'claude') return applyClaude(input.payload)
+        return applyCodex(input.payload)
+      },
+    ))
     applyTail = operation.then(() => undefined, () => undefined)
     return operation
   }
 
   async function status(input: { provider: AiCredentialProvider }) {
     const selected = provider(input?.provider)
-    if (selected === 'codex') {
-      await deps.execFile('codex', ['login', 'status'])
-      return { provider: selected, configured: true, status: 'authenticated' as const }
-    }
-    const result = await deps.execFile('cswap', ['list', '--json'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
-    const activeAccount = parseClaudeList(result.stdout)
-    return {
-      provider: selected,
-      configured: true,
-      activeAccount,
-      rotation: deps.supervisor.status(),
-    }
+    return withSafeErrors(`${selected.toUpperCase()}_STATUS_FAILED`, async () => {
+      if (selected === 'codex') {
+        await deps.execFile('codex', ['login', 'status'])
+        return { provider: selected, configured: true, status: 'authenticated' as const }
+      }
+      const result = await deps.execFile('cswap', ['list', '--json'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
+      const claudeStatus = parseClaudeList(result.stdout)
+      return {
+        provider: selected,
+        ...claudeStatus,
+        rotation: deps.supervisor.status(),
+      }
+    })
   }
 
   async function rotation(input: { action: 'start' | 'stop' }) {
-    if (input?.action === 'start') await deps.supervisor.enable()
-    else if (input?.action === 'stop') await deps.supervisor.stop()
-    else throw new AiCredentialRuntimeError('UNSUPPORTED_ROTATION_ACTION')
-    return { provider: 'claude' as const, rotation: deps.supervisor.status() }
+    if (input?.action !== 'start' && input?.action !== 'stop') {
+      throw new AiCredentialRuntimeError('UNSUPPORTED_ROTATION_ACTION')
+    }
+    return withSafeErrors('ROTATION_UPDATE_FAILED', async () => {
+      if (input.action === 'start') {
+        await ensureClaudeSwap()
+        await deps.supervisor.enable()
+      } else {
+        await deps.supervisor.stop()
+      }
+      return { provider: 'claude' as const, rotation: deps.supervisor.status() }
+    })
   }
 
   return { capture, apply, status, rotation }
 }
 
-function parseClaudeList(stdout: string): string | null {
+function parseClaudeList(stdout: string): { configured: boolean; activeAccount: string | null } {
   try {
     const parsed = JSON.parse(stdout) as unknown
     if (!isObject(parsed)
@@ -230,16 +246,27 @@ function parseClaudeList(stdout: string): string | null {
         throw new Error('invalid account')
       }
     }
-    if (parsed.activeAccountNumber === null) return null
+    if (parsed.activeAccountNumber === null) {
+      return { configured: parsed.accounts.length > 0, activeAccount: null }
+    }
     const active = parsed.accounts.find((account) => (
       isObject(account) && account.number === parsed.activeAccountNumber
     ))
     if (!isObject(active) || typeof active.email !== 'string') {
       throw new Error('active account missing')
     }
-    return maskEmail(active.email)
+    return { configured: true, activeAccount: maskEmail(active.email) }
   } catch {
     throw new AiCredentialRuntimeError('CLAUDE_STATUS_INVALID')
+  }
+}
+
+async function withSafeErrors<T>(kind: string, operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation()
+  } catch (error) {
+    if (error instanceof AiCredentialRuntimeError) throw error
+    throw new AiCredentialRuntimeError(kind)
   }
 }
 

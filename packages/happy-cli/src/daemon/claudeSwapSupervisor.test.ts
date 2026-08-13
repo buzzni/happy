@@ -93,6 +93,38 @@ describe('Claude swap supervisor', () => {
     expect(JSON.stringify(supervisor.status())).not.toContain('next@example.com')
   })
 
+  it('reports account exhaustion as blocked and clears it on a healthy poll', async () => {
+    const { supervisor, children } = setup()
+    await supervisor.enable()
+
+    children[0].stdout.emit('data', Buffer.from(
+      '{"schemaVersion":1,"event":"all-exhausted","ts":"2026-08-13T09:00:00Z","earliestResetAt":null}\n',
+    ))
+    expect(supervisor.status()).toEqual({
+      state: 'blocked',
+      lastErrorKind: 'ALL_ACCOUNTS_EXHAUSTED',
+    })
+
+    children[0].stdout.emit('data', Buffer.from(
+      '{"schemaVersion":1,"event":"poll","ts":"2026-08-13T09:01:00Z","active":{"number":1}}\n',
+    ))
+    expect(supervisor.status()).toEqual({ state: 'running', lastErrorKind: null })
+  })
+
+  it('resets restart backoff after receiving a healthy poll', async () => {
+    const { supervisor, children, scheduled } = setup(true)
+    await supervisor.restore()
+    children[0].emit('exit', 1, null)
+    scheduled[0].callback()
+
+    children[1].stdout.emit('data', Buffer.from(
+      '{"schemaVersion":1,"event":"poll","ts":"2026-08-13T09:01:00Z","active":{"number":1}}\n',
+    ))
+    children[1].emit('exit', 1, null)
+
+    expect(scheduled[1].delay).toBe(1_000)
+  })
+
   it('shuts down the child without disabling restart persistence', async () => {
     const { supervisor, children, writeEnabled } = setup(true)
     await supervisor.restore()
@@ -102,5 +134,17 @@ describe('Claude swap supervisor', () => {
     expect(children[0].kill).toHaveBeenCalledWith('SIGTERM')
     expect(writeEnabled).not.toHaveBeenCalled()
     expect(supervisor.status()).toEqual({ state: 'stopped', lastErrorKind: null })
+  })
+
+  it('keeps restart enabled when persisting stop fails', async () => {
+    const { supervisor, children, scheduled, writeEnabled } = setup()
+    await supervisor.enable()
+    writeEnabled.mockRejectedValueOnce(new Error('disk full'))
+
+    await expect(supervisor.stop()).rejects.toThrow('disk full')
+    children[0].emit('exit', 1, null)
+
+    expect(scheduled).toHaveLength(1)
+    expect(supervisor.status()).toEqual({ state: 'blocked', lastErrorKind: 'PROCESS_EXITED' })
   })
 })

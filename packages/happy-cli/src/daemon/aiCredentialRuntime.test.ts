@@ -6,6 +6,12 @@ import {
   type AiCredentialRuntimeDependencies,
 } from './aiCredentialRuntime'
 
+const configuredClaudeList = JSON.stringify({
+  schemaVersion: 1,
+  activeAccountNumber: 1,
+  accounts: [{ number: 1, email: 'owner@example.com', active: true }],
+})
+
 function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
   const calls: Array<{ command: string; args: string[]; input?: string }> = []
   const files = new Map<string, string>()
@@ -23,11 +29,7 @@ function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
     }
     if (command === 'cswap' && args[0] === 'list') {
       return {
-        stdout: JSON.stringify({
-          schemaVersion: 1,
-          activeAccountNumber: 1,
-          accounts: [{ number: 1, email: 'owner@example.com', active: true, accessToken: 'secret' }],
-        }),
+        stdout: configuredClaudeList,
         stderr: '',
       }
     }
@@ -126,7 +128,7 @@ describe('AI credential machine runtime', () => {
         return { stdout: 'claude-swap 0.24.0', stderr: '' }
       }
       if (command === 'cswap' && args[0] === 'list') {
-        return { stdout: '{"schemaVersion":1,"activeAccountNumber":null,"accounts":[]}', stderr: '' }
+        return { stdout: configuredClaudeList, stderr: '' }
       }
       return { stdout: '', stderr: '' }
     })
@@ -145,7 +147,7 @@ describe('AI credential machine runtime', () => {
         return { stdout: 'claude-swap 0.25.0-beta.1', stderr: '' }
       }
       if (command === 'cswap' && args[0] === 'list') {
-        return { stdout: '{"schemaVersion":1,"activeAccountNumber":null,"accounts":[]}', stderr: '' }
+        return { stdout: configuredClaudeList, stderr: '' }
       }
       return { stdout: '', stderr: '' }
     })
@@ -236,6 +238,46 @@ describe('AI credential machine runtime', () => {
       activeAccount: 'o***@example.com',
       rotation: { state: 'running', lastErrorKind: null },
     })
+  })
+
+  it('reports an empty Claude account list as not configured', async () => {
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: '{"schemaVersion":1,"activeAccountNumber":null,"accounts":[]}',
+        stderr: '',
+      })),
+    })
+
+    await expect(runtime.status({ provider: 'claude' })).resolves.toMatchObject({
+      provider: 'claude',
+      configured: false,
+      activeAccount: null,
+    })
+  })
+
+  it('bootstraps claude-swap before starting rotation directly', async () => {
+    const { runtime, calls, supervisor } = setup()
+
+    await runtime.rotation({ action: 'start' })
+
+    expect(calls.map(({ command, args }) => [command, args])).toEqual([
+      ['uv', ['--version']],
+      ['uv', ['python', 'find', '>=3.12']],
+      ['cswap', ['--version']],
+      ['cswap', ['config', 'set', 'autoswitch.threshold', '95']],
+      ['cswap', ['config', 'set', 'autoswitch.strategy', 'consume-first']],
+    ])
+    expect(supervisor.enable).toHaveBeenCalledOnce()
+  })
+
+  it('redacts unexpected dependency errors at the RPC boundary', async () => {
+    const { runtime } = setup({
+      makeTempDir: vi.fn(async () => { throw new Error('token=secret-value') }),
+    })
+
+    const error = await runtime.apply({ provider: 'claude', payload: '{}' }).catch((caught) => caught)
+    expect(error).toMatchObject({ kind: 'CLAUDE_APPLY_FAILED' })
+    expect(String(error)).not.toContain('secret-value')
   })
 
   it('rejects malformed Claude list output instead of reporting configured', async () => {

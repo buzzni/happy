@@ -40,14 +40,26 @@ export class ClaudeSwapSupervisor {
   }
 
   async enable(): Promise<void> {
+    const wasEnabled = this.enabled
     this.enabled = true
-    await this.deps.writeEnabled(true)
+    try {
+      await this.deps.writeEnabled(true)
+    } catch (error) {
+      this.enabled = wasEnabled
+      throw error
+    }
     this.start()
   }
 
   async stop(): Promise<void> {
+    const wasEnabled = this.enabled
     this.enabled = false
-    await this.deps.writeEnabled(false)
+    try {
+      await this.deps.writeEnabled(false)
+    } catch (error) {
+      this.enabled = wasEnabled
+      throw error
+    }
     this.shutdown()
   }
 
@@ -111,17 +123,36 @@ export class ClaudeSwapSupervisor {
     for (const line of lines) {
       try {
         const event = JSON.parse(line) as unknown
-        if (!isObject(event)
-          || event.schemaVersion !== 1
-          || event.event !== 'switch'
-          || typeof event.ts !== 'string'
-          || !Number.isFinite(Date.parse(event.ts))
-          || !isObject(event.to)
-          || typeof event.to.email !== 'string') continue
-        this.currentStatus = {
-          ...this.currentStatus,
-          lastSwitchAt: event.ts,
-          activeAccount: maskEmail(event.to.email),
+        if (!isObject(event) || event.schemaVersion !== 1) continue
+        if (event.event === 'all-exhausted') {
+          this.currentStatus = {
+            ...this.currentStatus,
+            state: 'blocked',
+            lastErrorKind: 'ALL_ACCOUNTS_EXHAUSTED',
+          }
+        } else if (event.event === 'error') {
+          this.currentStatus = {
+            ...this.currentStatus,
+            state: 'blocked',
+            lastErrorKind: 'ROTATION_ERROR',
+          }
+        } else if (event.event === 'poll' && isObject(event.active)) {
+          this.restartAttempts = 0
+          this.currentStatus = { ...this.currentStatus, state: 'running', lastErrorKind: null }
+        } else if (event.event === 'switch'
+          && event.dryRun !== true
+          && typeof event.ts === 'string'
+          && Number.isFinite(Date.parse(event.ts))
+          && isObject(event.to)
+          && typeof event.to.email === 'string') {
+          this.restartAttempts = 0
+          this.currentStatus = {
+            ...this.currentStatus,
+            state: 'running',
+            lastErrorKind: null,
+            lastSwitchAt: event.ts,
+            activeAccount: maskEmail(event.to.email),
+          }
         }
       } catch {
         // Ignore non-JSON diagnostic lines without retaining or logging them.
