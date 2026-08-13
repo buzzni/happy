@@ -389,9 +389,14 @@ async function waitForDebuggerTier(controlPort: number, expected: boolean, profi
     return actual
 }
 
-export async function handlePairCommand(args: string[]): Promise<void> {
-    const options = parsePairArgs(args)
-
+/**
+ * Everything `happy browser pair` does except deciding how to say it.
+ *
+ * Extracted so callers that are not a terminal — the app's pairing button,
+ * which needs the facts as data rather than as text on stdout — reuse this
+ * exact sequence instead of reimplementing it. See specs/browser-setup-gui/.
+ */
+export async function runPairing(options: PairOptions): Promise<PairOutcomeInput> {
     const token = await readOrCreateBrowserBridgeToken(configuration.browserBridgeTokenFile, {
         migrateFrom: configuration.legacyBrowserBridgeTokenFile,
     })
@@ -452,7 +457,7 @@ export async function handlePairCommand(args: string[]): Promise<void> {
         }
     }
 
-    const outcome = formatPairOutcome({
+    return {
         cdpPort: options.cdpPort,
         extensionDir,
         daemonRunning: Boolean(controlPort),
@@ -465,7 +470,11 @@ export async function handlePairCommand(args: string[]): Promise<void> {
         debuggerTierRequested: options.debuggerTier,
         debuggerTierActual,
         authRejected,
-    })
+    }
+}
+
+export async function handlePairCommand(args: string[]): Promise<void> {
+    const outcome = formatPairOutcome(await runPairing(parsePairArgs(args)))
     console.log('')
     console.log(outcome.text)
     console.log('')
