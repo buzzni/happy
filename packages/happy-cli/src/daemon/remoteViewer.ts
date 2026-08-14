@@ -99,6 +99,42 @@ export function planViewerInstall({ missing, canSudo, platform = process.platfor
     }
 }
 
+export type ViewerStackDecision =
+    | { action: 'reuse'; webPort: number }
+    | { action: 'adopt'; webPort: number }
+    | { action: 'start'; webPort?: undefined }
+
+/**
+ * What `browser-viewer:start` should do, given what is actually alive.
+ *
+ * Two failures this replaces, both from trusting the in-memory cache:
+ *
+ * - The cache was assign-only and never probed, so a crashed stack kept
+ *   reporting `ready: true` and every retry handed back the same dead port.
+ *   Nothing short of a daemon restart recovered it.
+ * - The stack is spawned detached, so it outlives the daemon. After a restart
+ *   the cache is empty but the processes are still holding their ports, and
+ *   starting again leaks a second full stack. A few restarts exhaust the
+ *   candidate ports and the feature fails with "포트를 찾지 못했습니다".
+ *
+ * `adoptable` must come from a probe that the port really serves noVNC, not
+ * merely that something is listening — otherwise an unrelated service on
+ * 6080 would be handed to the user as their browser screen.
+ */
+export function decideViewerStackAction(input: {
+    cached: { webPort: number } | null
+    cachedAlive: boolean
+    adoptable: { webPort: number } | null
+}): ViewerStackDecision {
+    if (input.cached && input.cachedAlive) {
+        return { action: 'reuse', webPort: input.cached.webPort }
+    }
+    if (input.adoptable) {
+        return { action: 'adopt', webPort: input.adoptable.webPort }
+    }
+    return { action: 'start' }
+}
+
 function which(binary: string): Promise<string | null> {
     return new Promise((resolve) => {
         const child = spawn('which', [binary], { stdio: ['ignore', 'pipe', 'ignore'] })
@@ -116,6 +152,24 @@ export async function detectMissingViewerTools(): Promise<string[]> {
         if (!(await which(tool))) missing.push(tool)
     }
     return missing
+}
+
+/**
+ * Whether that port is actually serving noVNC's client page.
+ *
+ * Deliberately stricter than "something is listening": the result decides
+ * whether we hand this port to the user as their browser screen, and an
+ * unrelated service that happens to hold 6080 must not qualify.
+ */
+export async function isViewerServing(webPort: number): Promise<boolean> {
+    try {
+        const response = await fetch(`http://127.0.0.1:${webPort}/vnc.html`, {
+            signal: AbortSignal.timeout(1500),
+        })
+        return response.ok
+    } catch {
+        return false
+    }
 }
 
 /** Spawns a long-lived viewer process detached so it outlives the daemon. */
