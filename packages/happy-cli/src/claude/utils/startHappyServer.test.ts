@@ -166,7 +166,17 @@ describe('startHappyServer tool registration', () => {
                 }),
             });
             expect(response.status).toBe(200);
+
+            // Assert the slug the caller sent is the one that gets stored — a bare
+            // "updateMetadata was called" check still passes if the tool wires the
+            // wrong argument (e.g. the title) into the handler's slug parameter.
+            const raw = await response.text();
+            const payload = JSON.parse(raw.startsWith('event:') ? raw.slice(raw.indexOf('data: ') + 6) : raw);
+            expect(payload.result.isError).toBe(false);
+
             expect(updateMetadata).toHaveBeenCalledTimes(1);
+            const updater = updateMetadata.mock.calls[0][0];
+            expect(updater({}).summary.branchSlug).toBe('fix-login-bug');
         } finally {
             server.stop();
         }
