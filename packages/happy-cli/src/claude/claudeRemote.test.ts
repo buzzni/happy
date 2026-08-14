@@ -17,6 +17,25 @@ describe('claudeRemote', () => {
         vi.mocked(query).mockReset();
     });
 
+    it('reports that the provider never started when mode switching aborts before the first message', async () => {
+        const result = await claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage: async () => null,
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+        });
+
+        expect(result).toBe('not-started');
+        expect(query).not.toHaveBeenCalled();
+    });
+
     it('returns after the first completed turn without waiting for more automation input', async () => {
         vi.mocked(query).mockReturnValue({
             setPermissionMode: vi.fn(),

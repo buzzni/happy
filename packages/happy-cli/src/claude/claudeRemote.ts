@@ -107,7 +107,7 @@ export async function claudeRemote(opts: {
     // Get initial message
     const initial = await opts.nextMessage();
     if (!initial) { // No initial message - exit
-        return;
+        return 'not-started' as const;
     }
     opts.onPromptSuggestionChange?.(null);
 

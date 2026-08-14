@@ -491,8 +491,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     exitReason = 'exit';
                 }
                 
-                // Consume one-time Claude flags after spawn
-                session.consumeOneTimeFlags();
+                // Consume one-time Claude flags only after a command or provider
+                // turn actually started. A remote→local switch can abort while
+                // nextMessage() is still waiting; local mode must retain the
+                // original --resume/--continue flags in that case.
+                if (remoteResult !== 'not-started') {
+                    session.consumeOneTimeFlags();
+                }
                 
                 if (!exitReason && abortController.signal.aborted) {
                     session.client.closeClaudeSessionTurn('cancelled');
