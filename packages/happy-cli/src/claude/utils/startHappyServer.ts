@@ -54,10 +54,19 @@ export function createChangeTitleHandler(client: ApiSessionClient) {
                 summary: title,
                 leafUuid: randomUUID()
             });
-            if (branchSlug) {
+            const slug = branchSlug?.trim();
+            if (slug) {
+                // The summary above is written by a separate, fire-and-forget
+                // updateMetadata call that silently gives up on a hard error, so
+                // metadata.summary may still be missing here. Fill text/updatedAt
+                // from the title we just sent rather than writing a partial summary.
                 client.updateMetadata((metadata) => ({
                     ...metadata,
-                    summary: { ...metadata.summary, branchSlug } as NonNullable<typeof metadata.summary>
+                    summary: {
+                        text: metadata.summary?.text ?? title,
+                        updatedAt: metadata.summary?.updatedAt ?? Date.now(),
+                        branchSlug: slug
+                    }
                 }));
             }
             return { success: true };

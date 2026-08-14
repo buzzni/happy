@@ -62,6 +62,43 @@ describe('createChangeTitleHandler', () => {
 
         expect(client.updateMetadata).not.toHaveBeenCalled();
     });
+
+    it('ignores a blank branchSlug rather than storing whitespace', async () => {
+        const client = makeFakeClient(false);
+        const changeTitle = createChangeTitleHandler(client);
+
+        await changeTitle('Fix login bug', '   ');
+
+        expect(client.updateMetadata).not.toHaveBeenCalled();
+    });
+
+    it('trims the branchSlug before storing it', async () => {
+        const client = makeFakeClient(false);
+        const changeTitle = createChangeTitleHandler(client);
+
+        await changeTitle('Fix login bug', '  fix-login-bug\n');
+        const updater = (client.updateMetadata as any).mock.calls[0][0];
+
+        expect(updater({ summary: { text: 'Fix login bug', updatedAt: 1 } }).summary.branchSlug)
+            .toBe('fix-login-bug');
+    });
+
+    // The summary write is a separate, fire-and-forget updateMetadata call that
+    // silently gives up on a hard error, so branchSlug can land on metadata that
+    // has no summary yet. Writing only { branchSlug } there would leave a summary
+    // object missing its required text/updatedAt.
+    it('writes a complete summary when metadata has no summary yet', async () => {
+        const client = makeFakeClient(false);
+        const changeTitle = createChangeTitleHandler(client);
+
+        await changeTitle('Fix login bug', 'fix-login-bug');
+        const updater = (client.updateMetadata as any).mock.calls[0][0];
+        const summary = updater({}).summary;
+
+        expect(summary.text).toBe('Fix login bug');
+        expect(typeof summary.updatedAt).toBe('number');
+        expect(summary.branchSlug).toBe('fix-login-bug');
+    });
 });
 
 describe('startHappyServer tool registration', () => {

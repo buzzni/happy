@@ -21,6 +21,22 @@ describe('MetadataSchema', () => {
         expect(metadata.archivedBy).toBe('cli');
         expect(metadata.archiveReason).toBe('User terminated');
     });
+
+    // The app writes the parsed metadata back on any update, so a summary field
+    // the schema does not declare is stripped here and then erased on the server.
+    it('preserves the CLI-supplied branchSlug through a parse round-trip', () => {
+        const metadata = MetadataSchema.parse({
+            path: '/tmp/project',
+            host: 'local-machine',
+            summary: { text: 'Fix login bug', updatedAt: 123, branchSlug: 'fix-login-bug' },
+        });
+
+        expect(metadata.summary).toEqual({
+            text: 'Fix login bug',
+            updatedAt: 123,
+            branchSlug: 'fix-login-bug',
+        });
+    });
 });
 
 describe('AgentGoalStatusSchema', () => {
