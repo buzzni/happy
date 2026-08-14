@@ -45,6 +45,17 @@ describe('preflightAutomationConnectors', () => {
     expect(d.fetchSnapshot).not.toHaveBeenCalled()
   })
 
+  it('fails before config fetch when a required policy has no connector names', async () => {
+    const d = deps()
+    await expect(preflightAutomationConnectors({
+      configUrl: 'https://saycode.test', machineToken: 'TOKEN', machineId: 'M-1', runId: 'R-1',
+      context: context({ requiredConnectors: [] }),
+    }, d)).resolves.toEqual({
+      ok: false, code: 'CONNECTOR_CONFIG_MISSING', unavailableConnectors: [],
+    })
+    expect(d.fetchSnapshot).not.toHaveBeenCalled()
+  })
+
   it('distinguishes missing configuration, runtime failure, and empty tool inventory', async () => {
     const missingConfig = deps({
       fetchSnapshot: vi.fn(async () => ({

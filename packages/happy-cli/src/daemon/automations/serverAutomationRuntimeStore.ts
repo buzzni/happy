@@ -25,6 +25,7 @@ export interface PendingAutomationReport {
   sessionId: string | null
   detailCiphertext: string | null
   failureCode?: string | null
+  degradedCode?: string | null
   /** When this report was first queued. Absent on entries persisted before this field existed. */
   createdAt?: number
 }
@@ -135,6 +136,7 @@ function parse(raw: string): ServerAutomationRuntimeState {
         sessionId: nullableText(row.sessionId),
         detailCiphertext: nullableText(row.detailCiphertext),
         ...(row.failureCode !== undefined ? { failureCode: nullableText(row.failureCode) } : {}),
+        ...(row.degradedCode !== undefined ? { degradedCode: nullableText(row.degradedCode) } : {}),
       }
     })
     const githubRows = disk.githubTriggers === undefined ? [] : disk.githubTriggers

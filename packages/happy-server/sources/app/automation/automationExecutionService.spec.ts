@@ -328,6 +328,36 @@ describe('automationExecutionService', () => {
         }));
     });
 
+    it('persists a safe degraded code only for a completed WOKE run', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({
+            id: 'run-1', status: 'RUNNING', reportId: null, runLeaseExpiresAt: new Date(now.getTime() + 1_000),
+        });
+        tx.session.findFirst.mockResolvedValue({ id: 'session-1' } as never);
+
+        await reportAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
+            outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null, failureCode: null,
+            degradedCode: 'GRANT_MISSING',
+        }, now);
+
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ degradedCode: 'GRANT_MISSING' }),
+        }));
+    });
+
+    it('rejects a degraded code on a non-WOKE run', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+
+        await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'FAILED',
+            outcome: 'ERROR', sessionId: null, detailCiphertext: null, failureCode: 'GRANT_MISSING',
+            degradedCode: 'GRANT_MISSING',
+        }, now)).resolves.toEqual({ ok: false, error: 'report-conflict' });
+        expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
+    });
+
     it.each([
         { status: 'COMPLETED', outcome: 'ERROR' },
         { status: 'FAILED', outcome: 'WOKE' },

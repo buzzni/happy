@@ -70,11 +70,23 @@ describe('automationSocketHandler', () => {
             runId: 'run-1', claimToken: 'claim', reportId: 'report-1', status: 'FAILED',
             outcome: 'ERROR', sessionId: null, detailCiphertext: null,
             failureCode: 'CONNECTOR_RUNTIME_UNAVAILABLE',
+            degradedCode: null,
         }, accepted);
         expect(services.reportAutomationRun).toHaveBeenCalledWith(
             {}, 'account-1', 'machine-1', expect.objectContaining({
                 failureCode: 'CONNECTOR_RUNTIME_UNAVAILABLE',
+                degradedCode: null,
             }),
+        );
+
+        const degraded = vi.fn();
+        await handlers.get('automation-run-report')!({
+            runId: 'run-2', claimToken: 'claim', reportId: 'report-2', status: 'COMPLETED',
+            outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null, failureCode: null,
+            degradedCode: 'GRANT_MISSING',
+        }, degraded);
+        expect(services.reportAutomationRun).toHaveBeenLastCalledWith(
+            {}, 'account-1', 'machine-1', expect.objectContaining({ degradedCode: 'GRANT_MISSING' }),
         );
 
         const rejected = vi.fn();

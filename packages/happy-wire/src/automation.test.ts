@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   AutomationApiError,
   automationPayloadSchema,
+  automationRunSchema,
   createAutomationApiClient,
   decryptAutomationPayload,
   encryptAutomationPayload,
@@ -129,6 +130,17 @@ const automation: AutomationPublic = {
 };
 
 describe('automation wire contract', () => {
+  it('preserves a safe degraded connector code on a completed run', () => {
+    const run = {
+      id: 'run-1', automationId: 'automation-1', generation: 1, scheduledFor: 1,
+      machineId: 'machine-1', status: 'COMPLETED', sessionId: 'session-1', outcome: 'WOKE',
+      detailCiphertext: null, failureCode: null, degradedCode: 'GRANT_MISSING',
+      claimedAt: 1, startedAt: 2, completedAt: 3, lateReport: false,
+    };
+    expect(automationRunSchema.parse(run)).toEqual(run);
+    expect(automationRunSchema.safeParse({ ...run, degradedCode: 'secret: do not expose' }).success).toBe(false);
+  });
+
   it('rejects payloads that the daemon cannot execute safely', () => {
     expect(automationPayloadSchema.safeParse({ ...payload, schedule: { kind: 'interval', minutes: 14 } }).success).toBe(false);
     expect(automationPayloadSchema.safeParse({ ...payload, directory: '' }).success).toBe(false);
