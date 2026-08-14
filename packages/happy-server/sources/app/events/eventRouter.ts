@@ -4,7 +4,7 @@ import { GitHubProfile } from "@/app/api/types";
 import { AccountProfile } from "@/types";
 import { getPublicUrl } from "@/storage/files";
 import type { SessionMessageContent } from "@slopus/happy-wire";
-import { hasActiveUserScopedSocket } from "./hasActiveUserScopedSocket";
+import { hasActiveUserScopedSocketIn, userScopedRoom } from "@/app/events/hasActiveUserScopedSocket";
 
 // === CONNECTION TYPES ===
 
@@ -247,7 +247,7 @@ class EventRouter {
 
         switch (connection.connectionType) {
             case 'user-scoped':
-                socket.join(`user:${userId}:user-scoped`);
+                socket.join(userScopedRoom(userId));
                 break;
             case 'session-scoped':
                 socket.join(`user:${userId}:session:${connection.sessionId}`);
@@ -320,12 +320,12 @@ class EventRouter {
 
     /**
      * Returns true if the user has a human-facing client (web-ui, mobile,
-     * desktop) connected and not backgrounded. See hasActiveUserScopedSocket
-     * for why session-scoped (CLI/agent) and machine-scoped (daemon)
-     * sockets don't count.
+     * desktop) connected and not backgrounded. See
+     * hasActiveUserScopedSocketIn for why session-scoped (CLI/agent) and
+     * machine-scoped (daemon) sockets don't count.
      */
     async hasActiveUserScopedSocket(userId: string): Promise<boolean> {
-        return hasActiveUserScopedSocket(this.io, userId);
+        return hasActiveUserScopedSocketIn(this.io, userId);
     }
 
     async hasMachineSocket(userId: string, machineId: string): Promise<boolean> {
@@ -340,13 +340,13 @@ class EventRouter {
             case 'all-user-authenticated-connections':
                 return [`user:${userId}`];
             case 'user-scoped-only':
-                return [`user:${userId}:user-scoped`];
+                return [userScopedRoom(userId)];
             case 'all-interested-in-session':
                 // Union: session watchers + user-scoped (Socket.IO deduplicates)
-                return [`user:${userId}:session:${filter.sessionId}`, `user:${userId}:user-scoped`];
+                return [`user:${userId}:session:${filter.sessionId}`, userScopedRoom(userId)];
             case 'machine-scoped-only':
                 // Union: specific machine + user-scoped
-                return [`user:${userId}:machine:${filter.machineId}`, `user:${userId}:user-scoped`];
+                return [`user:${userId}:machine:${filter.machineId}`, userScopedRoom(userId)];
         }
     }
 

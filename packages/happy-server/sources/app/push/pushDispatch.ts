@@ -14,7 +14,7 @@
  * active (connected + not backgrounded), suppress the push — they can see
  * in-app indicators (unread dots, tab title counter) instead. The CLI/agent's
  * own session-scoped socket for the very session that's dispatching this
- * push never counts as human presence — see hasActiveUserScopedSocket.
+ * push never counts as human presence — see hasActiveUserScopedSocketIn.
  *
  * "Active" is determined by socket.data.appState:
  *   - Clients send `app-state: { state: 'active' | 'background' }` via socket.
