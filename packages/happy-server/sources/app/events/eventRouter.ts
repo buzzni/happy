@@ -4,6 +4,7 @@ import { GitHubProfile } from "@/app/api/types";
 import { AccountProfile } from "@/types";
 import { getPublicUrl } from "@/storage/files";
 import type { SessionMessageContent } from "@slopus/happy-wire";
+import { hasActiveUserScopedSocket } from "./hasActiveUserScopedSocket";
 
 // === CONNECTION TYPES ===
 
@@ -318,20 +319,13 @@ class EventRouter {
     // === PRESENCE QUERIES ===
 
     /**
-     * Returns true if the user has any non-machine socket that hasn't
-     * reported `app-state: background`.  Old clients that never send
-     * `app-state` are treated as active (connected = present).
-     *
-     * Uses fetchSockets() which works cross-replica via Redis streams adapter.
+     * Returns true if the user has a human-facing client (web-ui, mobile,
+     * desktop) connected and not backgrounded. See hasActiveUserScopedSocket
+     * for why session-scoped (CLI/agent) and machine-scoped (daemon)
+     * sockets don't count.
      */
-    async hasActiveNonMachineSocket(userId: string): Promise<boolean> {
-        const sockets = await this.io.in(`user:${userId}`).fetchSockets();
-        return sockets.some(s => {
-            if (s.data.clientType === 'machine-scoped') return false;
-            // No app-state yet → old client or just connected; assume active
-            const appState = s.data.appState as string | undefined;
-            return appState !== 'background';
-        });
+    async hasActiveUserScopedSocket(userId: string): Promise<boolean> {
+        return hasActiveUserScopedSocket(this.io, userId);
     }
 
     async hasMachineSocket(userId: string, machineId: string): Promise<boolean> {

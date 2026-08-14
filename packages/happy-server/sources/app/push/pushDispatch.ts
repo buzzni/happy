@@ -10,9 +10,11 @@
  * Connected clients still receive the realtime message update over socket;
  * only the Expo push for "new message" went away.
  *
- * Suppression: if the user has ANY non-machine client that is active
- * (connected + not backgrounded), suppress the push — they can see in-app
- * indicators (unread dots, tab title counter) instead.
+ * Suppression: if the user has a human-facing (user-scoped) client that is
+ * active (connected + not backgrounded), suppress the push — they can see
+ * in-app indicators (unread dots, tab title counter) instead. The CLI/agent's
+ * own session-scoped socket for the very session that's dispatching this
+ * push never counts as human presence — see hasActiveUserScopedSocket.
  *
  * "Active" is determined by socket.data.appState:
  *   - Clients send `app-state: { state: 'active' | 'background' }` via socket.
