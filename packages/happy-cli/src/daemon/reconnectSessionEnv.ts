@@ -116,10 +116,10 @@ export function resolveResumeBaselineSeq(input: {
 }
 
 /**
- * Automated resumes must not guess at the processed-message boundary. Falling
- * back to the server head is acceptable for an explicit user resume where
- * replay is the competing risk, but a one-turn automation could otherwise
- * acknowledge unseen user input before the user regains control of the session.
+ * Same-session reconnects must not guess at the processed-message boundary.
+ * Falling back to the server head can acknowledge unseen user input that
+ * arrived while no child process was attached. Callers without a durable
+ * cursor must continue the native provider conversation in a new Happy session.
  */
 export function hasReliableResumeBaseline(input: {
     reportedSeq?: number;

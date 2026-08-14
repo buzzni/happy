@@ -547,6 +547,28 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
     });
 
+    it('preserves the Studio optimistic id on a Claude initial prompt', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        mockAxiosPost.mockResolvedValueOnce({
+            data: {
+                messages: [{ id: 'msg-1', seq: 1, localId: 'studio-local-claude', createdAt: 1, updatedAt: 1 }]
+            }
+        });
+
+        client.sendClaudeSessionMessage({
+            type: 'user',
+            message: { content: 'recover Claude' },
+            isSidechain: false,
+            isMeta: false
+        } as any, 'studio-local-claude');
+
+        await waitForCheck(() => {
+            expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+        });
+
+        expect(mockAxiosPost.mock.calls[0][1].messages[0].localId).toBe('studio-local-claude');
+    });
+
     it('uploads local Codex image files with codex item ids', async () => {
         const client = new ApiSessionClient('fake-token', session);
         const pngBytes = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
@@ -677,6 +699,28 @@ describe('ApiSessionClient v3 messages API migration', () => {
                 ev: { t: 'text', text: 'shadow this' }
             }
         });
+    });
+
+    it('preserves the Studio optimistic id on a Codex initial prompt', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        mockAxiosPost.mockResolvedValueOnce({
+            data: {
+                messages: [{ id: 'msg-1', seq: 1, localId: 'studio-local-codex', createdAt: 1, updatedAt: 1 }]
+            }
+        });
+
+        client.sendSessionProtocolMessage({
+            id: 'env-user-recovery',
+            time: 1002,
+            role: 'user',
+            ev: { t: 'text', text: 'recover Codex' }
+        }, 'studio-local-codex');
+
+        await waitForCheck(() => {
+            expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+        });
+
+        expect(mockAxiosPost.mock.calls[0][1].messages[0].localId).toBe('studio-local-codex');
     });
 
     it('sends modern session envelope for user text', async () => {

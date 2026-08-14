@@ -7,7 +7,14 @@ import { io, Socket } from 'socket.io-client';
 import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
 import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody } from './types';
-import { registerCommonHandlers, SpawnSessionOptions, SpawnSessionResult } from '../modules/common/registerCommonHandlers';
+import {
+    registerCommonHandlers,
+    type RecoverSessionOptions,
+    type RecoverSessionResult,
+    type ResumeSessionResult,
+    type SpawnSessionOptions,
+    type SpawnSessionResult,
+} from '../modules/common/registerCommonHandlers';
 import { resolveAllowedRoot } from '../modules/common/resolveAllowedRoot';
 import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt } from './encryption';
@@ -230,7 +237,8 @@ type MachineRpcHandlers = {
         mcpCallerGrantEnvelope?: string;
         mcpConfigProjectId?: string;
         expectedConnectors?: string[];
-    }) => Promise<SpawnSessionResult>;
+    }) => Promise<ResumeSessionResult>;
+    recoverSession?: (sessionId: string, options: RecoverSessionOptions) => Promise<RecoverSessionResult>;
     stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
     requestShutdown: () => void;
     portRegistry: PortRegistry;
@@ -303,7 +311,8 @@ export class ApiMachineClient {
         mcpCallerGrantEnvelope?: string;
         mcpConfigProjectId?: string;
         expectedConnectors?: string[];
-    }) => Promise<SpawnSessionResult>) | null = null;
+    }) => Promise<ResumeSessionResult>) | null = null;
+    private recoverSessionHandler: ((sessionId: string, options: RecoverSessionOptions) => Promise<RecoverSessionResult>) | null = null;
     // specs/remote-terminal-cwd-fallback/ — cached so the
     // terminal-open-fwd handler can run validatePath against the same
     // root the rest of the RPC surface uses (Files tab / writeFile).
@@ -343,6 +352,7 @@ export class ApiMachineClient {
     setRPCHandlers({
         spawnSession,
         resumeSession,
+        recoverSession,
         stopSession,
         requestShutdown,
         portRegistry,
@@ -350,6 +360,7 @@ export class ApiMachineClient {
         aiCredentialRuntime,
     }: MachineRpcHandlers) {
         this.resumeSessionHandler = resumeSession ?? null;
+        this.recoverSessionHandler = recoverSession ?? null;
 
         // Scheduled automations CRUD (specs: daemon-scheduled-automations).
         // Handlers live in automationRpcHandlers.ts so they unit-test without
@@ -480,6 +491,7 @@ export class ApiMachineClient {
         });
 
         this.syncResumeSessionRpcRegistration();
+        this.syncRecoverSessionRpcRegistration();
 
         // Register stop session handler
         this.rpcHandlerManager.registerHandler('stop-session', (params: any) => {
@@ -1126,8 +1138,83 @@ export class ApiMachineClient {
                         case 'requestToApproveDirectoryCreation':
                             return result;
                         case 'error':
-                            throw new Error(result.errorMessage);
+                            return result;
                     }
+                });
+            }
+            return;
+        }
+
+        if (this.rpcHandlerManager.hasHandler(method)) {
+            this.rpcHandlerManager.unregisterHandler(method);
+        }
+    }
+
+    private syncRecoverSessionRpcRegistration(): void {
+        const method = 'recover-happy-session';
+
+        if (this.recoverSessionHandler) {
+            if (!this.rpcHandlerManager.hasHandler(method)) {
+                this.rpcHandlerManager.registerHandler(method, async (params: any) => {
+                    const {
+                        sessionId,
+                        initialPrompt,
+                        initialPromptLocalId,
+                        environmentVariables,
+                        model,
+                        permissionMode,
+                        mcpCallerGrantEnvelope,
+                        mcpConfigProjectId,
+                        expectedConnectors,
+                    } = params || {};
+
+                    if (typeof sessionId !== 'string' || !sessionId.trim()) {
+                        throw new Error('Session ID is required');
+                    }
+                    if (typeof initialPrompt !== 'string' || !initialPrompt.trim()) {
+                        throw new Error('Initial prompt must be a non-empty string');
+                    }
+                    if (
+                        initialPromptLocalId !== undefined
+                        && (typeof initialPromptLocalId !== 'string' || !initialPromptLocalId.trim())
+                    ) {
+                        throw new Error('Initial prompt local ID must be a non-empty string');
+                    }
+                    if (
+                        environmentVariables !== undefined
+                        && (
+                            environmentVariables === null
+                            || typeof environmentVariables !== 'object'
+                            || Array.isArray(environmentVariables)
+                            || Object.values(environmentVariables).some((value) => typeof value !== 'string')
+                        )
+                    ) {
+                        throw new Error('Environment variables must contain string values only');
+                    }
+                    if (mcpCallerGrantEnvelope !== undefined && typeof mcpCallerGrantEnvelope !== 'string') {
+                        throw new Error('MCP caller grant envelope must be a string');
+                    }
+                    if (
+                        mcpConfigProjectId !== undefined
+                        && (typeof mcpConfigProjectId !== 'string' || !mcpConfigProjectId.trim())
+                    ) {
+                        throw new Error('MCP config project id must be a non-empty string');
+                    }
+
+                    const handler = this.recoverSessionHandler;
+                    if (!handler) {
+                        throw new Error('Recover session handler not available');
+                    }
+                    return handler(sessionId, {
+                        initialPrompt,
+                        initialPromptLocalId,
+                        environmentVariables,
+                        model,
+                        permissionMode,
+                        mcpCallerGrantEnvelope,
+                        mcpConfigProjectId,
+                        expectedConnectors: readExpectedConnectors(expectedConnectors),
+                    });
                 });
             }
             return;

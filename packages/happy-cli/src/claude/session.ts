@@ -21,6 +21,7 @@ export class Session {
     readonly sandboxConfig?: SandboxConfig;
     readonly _onModeChange: (mode: 'local' | 'remote') => void;
     readonly _onAbort?: () => void;
+    readonly onActiveUserInputAccepted?: (text: string) => void;
     /** Path to temporary settings file with SessionStart hook (required for session tracking) */
     readonly hookSettingsPath: string;
     /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
@@ -52,6 +53,7 @@ export class Session {
         messageQueue: MessageQueue2<EnhancedMode>,
         onModeChange: (mode: 'local' | 'remote') => void,
         onAbort?: () => void,
+        onActiveUserInputAccepted?: (text: string) => void,
         allowedTools?: string[],
         sandboxConfig?: SandboxConfig,
         /** Path to temporary settings file with SessionStart hook (required for session tracking) */
@@ -78,6 +80,7 @@ export class Session {
         this.sandboxConfig = opts.sandboxConfig;
         this._onModeChange = opts.onModeChange;
         this._onAbort = opts.onAbort;
+        this.onActiveUserInputAccepted = opts.onActiveUserInputAccepted;
         this.hookSettingsPath = opts.hookSettingsPath;
         this.jsRuntime = opts.jsRuntime ?? 'node';
         this.mode = opts.startingMode ?? 'local';

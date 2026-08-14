@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   buildInitialPromptUserRecord,
@@ -154,6 +154,25 @@ describe('deliverInitialPrompt', () => {
 })
 
 describe('deliverPreparedClaudeSessionStart', () => {
+  it('forwards the web optimistic local id to the persisted user message', async () => {
+    const sendClaudeSessionMessage = vi.fn()
+    const { sink } = makeSink({ sendClaudeSessionMessage })
+
+    await deliverPreparedClaudeSessionStart({
+      prepared: {
+        prompt: '복구 후 이어서 작업해줘',
+        localId: 'web-local-1',
+        exitAfterFirstTurn: false,
+      },
+      sink,
+    })
+
+    expect(sendClaudeSessionMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'user' }),
+      'web-local-1',
+    )
+  })
+
   it('reportsDaemonStartOnlyAfterThePromptIsRecordedAndQueued', async () => {
     const events: string[] = []
     const prepared = { prompt: '업무 브리핑', exitAfterFirstTurn: true }

@@ -20,6 +20,7 @@ import {
     createBashRpcScheduler,
     type BashRpcExecutionClass,
 } from './bashRpcScheduler';
+import type { PermissionMode } from '@/api/types';
 
 const execAsync = promisify(exec);
 const READ_FILE_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
@@ -257,16 +258,59 @@ export interface SpawnSessionOptions {
      * Used by scheduled automations.
      */
     initialPrompt?: string;
+    /** Web optimistic message id preserved on the initial prompt server row. */
+    initialPromptLocalId?: string;
     /** Exit cleanly after the spawned agent completes its first turn. */
     exitAfterFirstTurn?: boolean;
     /** Restrict an unattended automation session to repository reads. */
-    permissionMode?: 'read-only';
+    permissionMode?: PermissionMode;
 }
 
 export type SpawnSessionResult =
     | { type: 'success'; sessionId: string }
     | { type: 'requestToApproveDirectoryCreation'; directory: string }
     | { type: 'error'; errorMessage: string };
+
+export type ResumeSessionErrorCode =
+    | 'SESSION_LIVE'
+    | 'SESSION_NOT_TRACKED'
+    | 'SESSION_METADATA_MISSING'
+    | 'SESSION_ENCRYPTION_MISSING'
+    | 'SESSION_IDENTITY_MISMATCH'
+    | 'SESSION_CURSOR_MISSING'
+    | 'SESSION_SERVER_UNAVAILABLE'
+    | 'SESSION_ALIVE_ELSEWHERE'
+    | 'SESSION_DIRECTORY_MISMATCH'
+    | 'SESSION_DIRECTORY_MISSING'
+    | 'SESSION_NATIVE_SESSION_MISSING'
+    | 'MCP_CALLER_GRANT_REJECTED'
+    | 'SESSION_RESUME_FAILED';
+
+export type ResumeSessionResult =
+    | { type: 'success'; sessionId: string }
+    | { type: 'requestToApproveDirectoryCreation'; directory: string }
+    | { type: 'error'; code: ResumeSessionErrorCode; errorMessage: string };
+
+export type RecoverSessionOptions = {
+    initialPrompt: string;
+    initialPromptLocalId?: string;
+    environmentVariables?: Record<string, string>;
+    model?: string;
+    permissionMode?: PermissionMode;
+    mcpCallerGrantEnvelope?: string;
+    mcpConfigProjectId?: string;
+    expectedConnectors?: string[];
+};
+
+export type RecoverSessionResult =
+    | {
+        type: 'success';
+        sessionId: string;
+        previousSessionId: string;
+        recovery: 'same-session' | 'new-session';
+        initialPromptDelivered: boolean;
+    }
+    | { type: 'error'; code: ResumeSessionErrorCode; errorMessage: string };
 
 /**
  * Register all RPC handlers with the session

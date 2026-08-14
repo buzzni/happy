@@ -39,6 +39,7 @@ import type {
     ThreadGoalClearResponse,
     Thread,
     InterruptConversationParams,
+    SteerConversationParams,
     ReviewDecision,
     EventMsg,
     JsonRpcRequest,
@@ -237,6 +238,7 @@ export class CodexAppServerClient {
         turnId: string | null;
         startedTurnId: string | null;
         turnIdConfirmed: boolean;
+        hasSteeredInput: boolean;
         inactivityTimeoutMs: number;
         inactivityTimer: ReturnType<typeof setTimeout> | null;
     } | null = null;
@@ -625,7 +627,9 @@ export class CodexAppServerClient {
                 });
             }
 
-            if (item.phase === 'final_answer' && this.pendingTurnCompletion) {
+            if (item.phase === 'final_answer'
+                && this.pendingTurnCompletion
+                && !this.pendingTurnCompletion.hasSteeredInput) {
                 this.scheduleRawTurnCompletionFallback(
                     this.extractTurnId(params),
                     'completed',
@@ -1379,6 +1383,7 @@ export class CodexAppServerClient {
                 turnId: null,
                 startedTurnId: null,
                 turnIdConfirmed: false,
+                hasSteeredInput: false,
                 inactivityTimeoutMs: timeoutMs,
                 inactivityTimer: null,
             };
@@ -1394,6 +1399,29 @@ export class CodexAppServerClient {
 
         const aborted = await completion;
         return { aborted };
+    }
+
+    async steerTurn(prompt: string): Promise<void> {
+        if (!this._threadId || !this._turnId) {
+            throw new Error('No active Codex turn');
+        }
+        if (!prompt.trim()) {
+            throw new Error('Cannot steer an empty prompt');
+        }
+
+        const expectedTurnId = this._turnId;
+        const params: SteerConversationParams = {
+            threadId: this._threadId,
+            input: [{ type: 'text', text: prompt }],
+            expectedTurnId,
+        };
+        await this.request('turn/steer', params);
+
+        const pending = this.pendingTurnCompletion;
+        if (pending && (!pending.turnId || pending.turnId === expectedTurnId)) {
+            pending.hasSteeredInput = true;
+            this.clearRawTurnCompletionFallback();
+        }
     }
 
     async interruptTurn(): Promise<void> {

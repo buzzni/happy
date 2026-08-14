@@ -18,8 +18,9 @@
 import { appendClaudeTitleInstruction } from './utils/titlePrompt'
 import type { RawJSONLines } from './types'
 import {
-  buildInitialPromptUserRecord,
-  consumePendingInitialPrompt,
+    buildInitialPromptUserRecord,
+    consumePendingInitialPrompt,
+    consumePendingInitialPromptLocalId,
 } from '@/utils/initialPrompt'
 
 export {
@@ -30,13 +31,14 @@ export {
 export interface InitialPromptSink {
   sessionId: string | null
   hasTitle(): boolean
-  sendClaudeSessionMessage(record: RawJSONLines): void
+  sendClaudeSessionMessage(record: RawJSONLines, localId?: string): void
   recordAppPrompt(text: string): void
   pushPrompt(text: string): void
 }
 
 export type PreparedClaudeInitialPrompt = {
   prompt: string | null
+  localId?: string
   exitAfterFirstTurn: boolean
 }
 
@@ -47,6 +49,7 @@ export function prepareClaudeInitialPrompt(input: {
   allowAutomationReconnectPrompt?: boolean
 }): PreparedClaudeInitialPrompt {
   const consumedPrompt = consumePendingInitialPrompt(input.env)
+  const localId = consumePendingInitialPromptLocalId(input.env)
   const prompt = consumedPrompt
     && (!input.reconnectSessionId || input.allowAutomationReconnectPrompt)
     ? consumedPrompt
@@ -58,6 +61,7 @@ export function prepareClaudeInitialPrompt(input: {
 
   return {
     prompt,
+    ...(prompt && localId ? { localId } : {}),
     exitAfterFirstTurn: input.automationRunOnceRequested && prompt !== null,
   }
 }
@@ -68,17 +72,18 @@ export async function deliverPreparedClaudeSessionStart(input: {
   reportStarted?: () => Promise<void>
 }): Promise<boolean> {
   const prompt = input.prepared.prompt
+  const localId = input.prepared.localId
   input.prepared.prompt = null
   if (prompt) {
-    deliverInitialPrompt(prompt, input.sink)
+    deliverInitialPrompt(prompt, input.sink, localId)
   }
   await input.reportStarted?.()
   return prompt !== null
 }
 
-export function deliverInitialPrompt(prompt: string, sink: InitialPromptSink): void {
+export function deliverInitialPrompt(prompt: string, sink: InitialPromptSink, localId?: string): void {
   // (b) 서버 히스토리: 원문 그대로 — 앱은 이 레코드로 사용자 말풍선을 그린다.
-  sink.sendClaudeSessionMessage(buildInitialPromptUserRecord(prompt, sink.sessionId))
+  sink.sendClaudeSessionMessage(buildInitialPromptUserRecord(prompt, sink.sessionId), localId)
   // SDK가 곧 같은 텍스트를 JSONL에 쓴다 — 스캐너 이중 포워딩 방지 스탬프.
   sink.recordAppPrompt(prompt)
 

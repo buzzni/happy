@@ -247,4 +247,64 @@ describe('ApiMachineClient spawn/resume RPC passthrough', () => {
             expectedConnectors: ['gmail', 'knoi'],
         }));
     });
+
+    it('returns a structured untracked error without throwing away its code', async () => {
+        const resumeSession = vi.fn().mockResolvedValue({
+            type: 'error',
+            code: 'SESSION_NOT_TRACKED',
+            errorMessage: 'Session happy-1 is not tracked by this daemon.',
+        });
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ resumeSession }));
+
+        await expect(handlersFrom(client).get('machine-1:resume-happy-session')?.({
+            sessionId: 'happy-1',
+        })).resolves.toEqual({
+            type: 'error',
+            code: 'SESSION_NOT_TRACKED',
+            errorMessage: 'Session happy-1 is not tracked by this daemon.',
+        });
+    });
+
+    it('forwards an atomic first prompt and recovery context to recoverSession', async () => {
+        const recoverSession = vi.fn().mockResolvedValue({
+            type: 'success',
+            sessionId: 'happy-new',
+            previousSessionId: 'happy-old',
+            recovery: 'new-session',
+            initialPromptDelivered: true,
+        });
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ recoverSession }));
+
+        await expect(handlersFrom(client).get('machine-1:recover-happy-session')?.({
+            sessionId: 'happy-old',
+            initialPrompt: '이어서 작업해줘',
+            initialPromptLocalId: 'web-local-1',
+            environmentVariables: { PROJECT_TOKEN: '${PROJECT_TOKEN}' },
+            model: 'opus',
+            permissionMode: 'bypassPermissions',
+            mcpCallerGrantEnvelope: 'ENCRYPTED-RECOVERY-GRANT',
+            mcpConfigProjectId: 'P-1',
+            expectedConnectors: ['gmail', 'knoi'],
+        })).resolves.toEqual({
+            type: 'success',
+            sessionId: 'happy-new',
+            previousSessionId: 'happy-old',
+            recovery: 'new-session',
+            initialPromptDelivered: true,
+        });
+        expect(recoverSession).toHaveBeenCalledWith('happy-old', {
+            initialPrompt: '이어서 작업해줘',
+            initialPromptLocalId: 'web-local-1',
+            environmentVariables: { PROJECT_TOKEN: '${PROJECT_TOKEN}' },
+            model: 'opus',
+            permissionMode: 'bypassPermissions',
+            mcpCallerGrantEnvelope: 'ENCRYPTED-RECOVERY-GRANT',
+            mcpConfigProjectId: 'P-1',
+            expectedConnectors: ['gmail', 'knoi'],
+        });
+    });
 });

@@ -76,6 +76,7 @@ import {
 } from './initialPrompt';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
+import { registerCodexSteerHandler } from './codexSteerHandler';
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
@@ -371,7 +372,7 @@ export async function runCodex(opts: {
     session.onUserMessage(handleUserMessage);
     const initialPromptDelivered = await prepareCodexSessionStart({
         prepared: preparedInitialPrompt,
-        sendSessionMessage: (envelope) => session.sendSessionProtocolMessage(envelope),
+        sendSessionMessage: (envelope, localId) => session.sendSessionProtocolMessage(envelope, localId),
         pushPrompt: (prompt) => {
             messageQueue.unshiftIsolated(prompt, {
                 permissionMode: resolveInitialPromptPermissionMode(
@@ -627,6 +628,14 @@ export async function runCodex(opts: {
     //
 
     client = new CodexAppServerClient(sandboxConfig);
+
+    registerCodexSteerHandler({
+        client,
+        session,
+        onFailure: (message) => {
+            logger.debug(`[Codex] Active-turn steer failed: ${message}`);
+        },
+    });
 
     permissionHandler = new CodexPermissionHandler(session);
     // Drop any permission requests left in agent state from a previous CLI

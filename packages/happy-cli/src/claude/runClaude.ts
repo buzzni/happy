@@ -53,6 +53,7 @@ import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata'
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
+import { createEnvelope } from '@slopus/happy-wire';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -869,7 +870,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         sink: {
             sessionId: session.sessionId,
             hasTitle: () => session.hasTitle(),
-            sendClaudeSessionMessage: (record) => session.sendClaudeSessionMessage(record),
+            sendClaudeSessionMessage: (record, localId) => session.sendClaudeSessionMessage(record, localId),
             recordAppPrompt,
             pushPrompt: (text) => {
                 const mode = currentEnhancedMode();
@@ -1057,6 +1058,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             currentSession = sessionInstance;
         },
         onAbort: resetCurrentModeDefaults,
+        onActiveUserInputAccepted: (text) => {
+            recordAppPrompt(text);
+            session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }));
+        },
         mcpServers: mergeAplusMcpServers(baseMcpServers, aplusMcpServers),
         mcpConfig: {
             baseServers: baseMcpServers,

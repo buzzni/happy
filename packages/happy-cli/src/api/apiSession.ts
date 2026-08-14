@@ -955,20 +955,30 @@ export class ApiSessionClient extends EventEmitter {
         }
     }
 
-    private enqueueMessage(content: unknown, invalidate: boolean = true) {
+    private enqueueMessage(content: unknown, invalidate: boolean = true, localId?: string) {
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
         this.pendingOutbox.push({
             content: encrypted,
-            localId: randomUUID()
+            localId: localId ?? randomUUID()
         });
         if (invalidate) {
             this.sendSync.invalidate();
         }
     }
 
-    private enqueueSessionProtocolEnvelopes(envelopes: SessionEnvelope[], invalidate: boolean = true) {
+    private enqueueSessionProtocolEnvelopes(
+        envelopes: SessionEnvelope[],
+        invalidate: boolean = true,
+        localId?: string,
+    ) {
+        let pendingLocalId = localId;
         for (let i = 0; i < envelopes.length; i += 1) {
-            this.enqueueSessionProtocolEnvelope(envelopes[i], invalidate && i === envelopes.length - 1);
+            const envelope = envelopes[i];
+            const envelopeLocalId = pendingLocalId && envelope.role === 'user' && envelope.ev.t === 'text'
+                ? pendingLocalId
+                : undefined;
+            this.enqueueSessionProtocolEnvelope(envelope, invalidate && i === envelopes.length - 1, envelopeLocalId);
+            if (envelopeLocalId) pendingLocalId = undefined;
         }
     }
 
@@ -999,10 +1009,10 @@ export class ApiSessionClient extends EventEmitter {
      * Send message to session
      * @param body - Message body (can be MessageContent or raw content for agent messages)
      */
-    sendClaudeSessionMessage(body: RawJSONLines) {
+    sendClaudeSessionMessage(body: RawJSONLines, localId?: string) {
         const mapped = mapClaudeLogMessageToSessionEnvelopes(body, this.claudeSessionProtocolState);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
-        this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
+        this.enqueueSessionProtocolEnvelopes(mapped.envelopes, true, localId);
         this.applyClaudeSessionMessageSideEffects(body);
     }
 
@@ -1085,7 +1095,7 @@ export class ApiSessionClient extends EventEmitter {
         this.enqueueMessage(content);
     }
 
-    private enqueueSessionProtocolEnvelope(envelope: SessionEnvelope, invalidate: boolean = true) {
+    private enqueueSessionProtocolEnvelope(envelope: SessionEnvelope, invalidate: boolean = true, localId?: string) {
         this.applySessionProtocolRuntimeSideEffects(envelope);
 
         const content = {
@@ -1096,7 +1106,7 @@ export class ApiSessionClient extends EventEmitter {
             }
         };
 
-        this.enqueueMessage(content, invalidate);
+        this.enqueueMessage(content, invalidate, localId);
     }
 
     private applySessionProtocolRuntimeSideEffects(envelope: SessionEnvelope) {
@@ -1137,18 +1147,18 @@ export class ApiSessionClient extends EventEmitter {
         }
     }
 
-    sendSessionProtocolMessage(envelope: SessionEnvelope) {
+    sendSessionProtocolMessage(envelope: SessionEnvelope, localId?: string) {
         if (envelope.role !== 'user') {
-            this.enqueueSessionProtocolEnvelope(envelope);
+            this.enqueueSessionProtocolEnvelope(envelope, true, localId);
             return;
         }
 
         if (envelope.ev.t !== 'text') {
-            this.enqueueSessionProtocolEnvelope(envelope);
+            this.enqueueSessionProtocolEnvelope(envelope, true, localId);
             return;
         }
 
-        this.enqueueSessionProtocolEnvelope(envelope);
+        this.enqueueSessionProtocolEnvelope(envelope, true, localId);
     }
 
     /**

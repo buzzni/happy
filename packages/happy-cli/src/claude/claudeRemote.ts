@@ -21,6 +21,8 @@ import { buildSkillGovernanceOptions, readSkillGovernanceConfigFromEnv } from "@
 import { readExpectedConnectors, readExpectedMcpServices } from '@/aplus/fetchAplusMcpServers';
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
 
+export type ClaudeActiveInputSender = (text: string) => boolean;
+
 export async function claudeRemote(opts: {
 
     // Fixed parameters
@@ -58,6 +60,7 @@ export async function claudeRemote(opts: {
     onSessionReset?: () => void,
     onMcpStatus?: (status: McpRuntimeServerStatus) => void,
     onMcpControllerReady?: (controller: Pick<McpRuntimeRecovery, 'reconnectServer'> | null) => void,
+    onActiveInputReady?: (sender: ClaudeActiveInputSender | null) => void,
     onSDKMetadata?: (metadata: { tools?: string[]; slashCommands?: string[]; mcpServers?: { name: string; status: string }[]; skills?: string[]; plugins?: { name: string; path: string }[] }) => void,
     exitAfterFirstTurn?: boolean,
 }) {
@@ -104,7 +107,7 @@ export async function claudeRemote(opts: {
     // Get initial message
     const initial = await opts.nextMessage();
     if (!initial) { // No initial message - exit
-        return;
+        return 'not-started' as const;
     }
     opts.onPromptSuggestionChange?.(null);
 
@@ -228,6 +231,19 @@ export async function claudeRemote(opts: {
     }
 
     updateThinking(true);
+    let acceptsActiveInput = true;
+    const sendActiveInput: ClaudeActiveInputSender = (text) => {
+        if (!acceptsActiveInput || messages.done || !text.trim()) {
+            return false;
+        }
+        messages.push({
+            type: 'user',
+            parent_tool_use_id: null,
+            message: { role: 'user', content: text },
+        });
+        return true;
+    };
+    opts.onActiveInputReady?.(sendActiveInput);
     let acceptsPromptSuggestion = false;
     try {
         logger.debug(`[claudeRemote] Starting to iterate over response`);
@@ -300,6 +316,8 @@ export async function claudeRemote(opts: {
             // Handle result messages
             if (message.type === 'result') {
                 acceptsPromptSuggestion = true;
+                acceptsActiveInput = false;
+                opts.onActiveInputReady?.(null);
                 updateThinking(false);
                 logger.debug('[claudeRemote] Result received');
                 opts.onMcpControllerReady?.(mcpRecovery);
@@ -334,6 +352,8 @@ export async function claudeRemote(opts: {
                         opts.onPromptSuggestionChange?.(null);
                         opts.onMcpControllerReady?.(null);
                         mode = next.mode;
+                        acceptsActiveInput = true;
+                        opts.onActiveInputReady?.(sendActiveInput);
                         messages.push({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: next.message } });
                     }
                 }).catch(() => {
@@ -362,6 +382,8 @@ export async function claudeRemote(opts: {
             throw e;
         }
     } finally {
+        acceptsActiveInput = false;
+        opts.onActiveInputReady?.(null);
         opts.onMcpControllerReady?.(null);
         updateThinking(false);
     }

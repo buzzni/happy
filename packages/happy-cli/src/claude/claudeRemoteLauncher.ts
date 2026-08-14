@@ -3,7 +3,7 @@ import { Session } from "./session";
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";
 import React from "react";
-import { claudeRemote } from "./claudeRemote";
+import { claudeRemote, type ClaudeActiveInputSender } from "./claudeRemote";
 import { PermissionHandler } from "./utils/permissionHandler";
 import { Future } from "@/utils/future";
 import { SDKAssistantMessage, SDKMessage, SDKUserMessage } from "./sdk";
@@ -76,6 +76,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let exitReason: 'switch' | 'exit' | null = null;
     let abortController: AbortController | null = null;
     let abortFuture: Future<void> | null = null;
+    let activeInputSender: ClaudeActiveInputSender | null = null;
 
     async function abort() {
         if (abortController && !abortController.signal.aborted) {
@@ -101,6 +102,17 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     // When to abort
     session.client.rpcHandlerManager.registerHandler('abort', doAbort); // When abort clicked
     session.client.rpcHandlerManager.registerHandler('switch', doSwitch); // When switch clicked
+    session.client.rpcHandlerManager.registerHandler('steer', async (params: Record<string, unknown>) => {
+        const text = typeof params?.text === 'string' ? params.text : '';
+        if (!text.trim()) {
+            return { success: false, error: 'Steer text is required' };
+        }
+        if (!activeInputSender?.(text)) {
+            return { success: false, error: 'No active Claude turn' };
+        }
+        session.onActiveUserInputAccepted?.(text);
+        return { success: true };
+    });
     // Removed catch-all stdin handler - now handled by RemoteModeDisplay keyboard handlers
 
     // Create permission handler
@@ -432,6 +444,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     onMcpControllerReady: (controller) => {
                         mcpController = controller;
                     },
+                    onActiveInputReady: (sender) => {
+                        activeInputSender = sender;
+                    },
                     onMcpStatus: (status: McpRuntimeServerStatus) => {
                         session.client.updateMetadata((currentMetadata) => ({
                             ...currentMetadata,
@@ -476,8 +491,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     exitReason = 'exit';
                 }
                 
-                // Consume one-time Claude flags after spawn
-                session.consumeOneTimeFlags();
+                // Consume one-time Claude flags only after a command or provider
+                // turn actually started. A remote→local switch can abort while
+                // nextMessage() is still waiting; local mode must retain the
+                // original --resume/--continue flags in that case.
+                if (remoteResult !== 'not-started') {
+                    session.consumeOneTimeFlags();
+                }
                 
                 if (!exitReason && abortController.signal.aborted) {
                     session.client.closeClaudeSessionTurn('cancelled');
@@ -523,6 +543,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             }
         }
     } finally {
+
+        activeInputSender = null;
 
         // Clean up permission handler
         permissionHandler.reset();
