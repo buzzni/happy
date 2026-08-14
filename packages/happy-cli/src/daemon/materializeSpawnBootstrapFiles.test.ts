@@ -22,6 +22,10 @@ describe('materializeSpawnBootstrapFiles', () => {
                 relativePath: '.aplus/agent/project-template.md',
                 content: '# A+ Project Template\n',
             },
+            {
+                relativePath: '.aplus/agent/common-base.md',
+                content: '# A+ Common Base Fallback\n',
+            },
         ]);
 
         expect(await readFile(join(workspace, 'AGENTS.md'), 'utf8'))
@@ -30,6 +34,10 @@ describe('materializeSpawnBootstrapFiles', () => {
             join(workspace, '.aplus', 'agent', 'project-template.md'),
             'utf8',
         )).toBe('# A+ Project Template\n');
+        expect(await readFile(
+            join(workspace, '.aplus', 'agent', 'common-base.md'),
+            'utf8',
+        )).toBe('# A+ Common Base Fallback\n');
     });
 
     it('preserves user-authored root instruction files', async () => {
