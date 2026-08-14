@@ -16,7 +16,10 @@ function fakeIo(sockets: any[]) {
 }
 
 describe('userScopedRoom', () => {
-    it('shouldMatchTheRoomEventRouterJoinsUserScopedSocketsTo', () => {
+    it('shouldKeepTheRoomNameStableBecauseItIsAWireFormat', () => {
+        // During a rolling deploy old and new replicas share this room
+        // through the Redis adapter. Renaming it partitions live clients:
+        // events fan out to one name while half the fleet joined the other.
         expect(userScopedRoom('u1')).toBe('user:u1:user-scoped');
     });
 });

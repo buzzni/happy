@@ -3,9 +3,15 @@ import type { Server } from 'socket.io';
 /**
  * The room eventRouter.addConnection joins user-scoped sockets to.
  *
- * Single source of truth: both the join (addConnection) and the presence
- * query below derive the name from here, so they cannot drift apart. A
- * drift would make the query silently answer "nobody is watching" forever.
+ * Single source of truth for its three consumers — the join
+ * (addConnection), event fan-out (getRoomsForFilter) and the presence
+ * query below — so they cannot drift apart. A drift would either split
+ * event routing or make the query silently answer "nobody is watching"
+ * forever.
+ *
+ * The returned string is also a wire format: during a rolling deploy old
+ * and new replicas share one room via the Redis adapter, so changing it
+ * partitions live clients. The spec pins the literal for that reason.
  */
 export function userScopedRoom(userId: string): string {
     return `user:${userId}:user-scoped`;
