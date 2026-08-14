@@ -492,22 +492,12 @@ type SessionsFile = {
   sessions: Record<string, PersistedSession>;
 };
 
-const SESSION_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
-
 export function readPersistedSessions(): Record<string, PersistedSession> {
   try {
     if (!existsSync(configuration.sessionsFile)) return {};
     const data = JSON.parse(readFileSync(configuration.sessionsFile, 'utf-8')) as SessionsFile;
     if (!data?.sessions || typeof data.sessions !== 'object') return {};
-
-    const now = Date.now();
-    const sessions: Record<string, PersistedSession> = {};
-    for (const [id, session] of Object.entries(data.sessions)) {
-      if (now - session.savedAt < SESSION_MAX_AGE_MS) {
-        sessions[id] = session;
-      }
-    }
-    return sessions;
+    return data.sessions;
   } catch {
     return {};
   }
@@ -524,4 +514,3 @@ export function persistSession(sessionId: string, session: PersistedSession): vo
     logger.debug(`[PERSISTENCE] Failed to persist session ${sessionId}:`, error);
   }
 }
-
