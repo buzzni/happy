@@ -12,6 +12,14 @@ export function consumePendingInitialPrompt(env: NodeJS.ProcessEnv): string | nu
   return text.length > 0 ? text : null
 }
 
+export function consumePendingInitialPromptLocalId(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = env.HAPPY_INITIAL_PROMPT_LOCAL_ID
+  delete env.HAPPY_INITIAL_PROMPT_LOCAL_ID
+  if (typeof raw !== 'string') return undefined
+  const localId = raw.trim()
+  return localId.length > 0 ? localId : undefined
+}
+
 export function resolveInitialPromptPermissionMode(
   currentMode: PermissionMode,
   automationResume: boolean,

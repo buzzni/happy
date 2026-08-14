@@ -870,7 +870,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         sink: {
             sessionId: session.sessionId,
             hasTitle: () => session.hasTitle(),
-            sendClaudeSessionMessage: (record) => session.sendClaudeSessionMessage(record),
+            sendClaudeSessionMessage: (record, localId) => session.sendClaudeSessionMessage(record, localId),
             recordAppPrompt,
             pushPrompt: (text) => {
                 const mode = currentEnhancedMode();

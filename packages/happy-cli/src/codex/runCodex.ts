@@ -372,7 +372,7 @@ export async function runCodex(opts: {
     session.onUserMessage(handleUserMessage);
     const initialPromptDelivered = await prepareCodexSessionStart({
         prepared: preparedInitialPrompt,
-        sendSessionMessage: (envelope) => session.sendSessionProtocolMessage(envelope),
+        sendSessionMessage: (envelope, localId) => session.sendSessionProtocolMessage(envelope, localId),
         pushPrompt: (prompt) => {
             messageQueue.unshiftIsolated(prompt, {
                 permissionMode: resolveInitialPromptPermissionMode(

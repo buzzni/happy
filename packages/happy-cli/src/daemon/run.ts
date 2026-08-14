@@ -6,7 +6,13 @@ import axios from 'axios';
 import { ApiClient } from '@/api/api';
 import { TrackedSession, SessionEncryptionData } from './types';
 import { MachineMetadata, DaemonState, Metadata } from '@/api/types';
-import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
+import {
+  type RecoverSessionOptions,
+  type RecoverSessionResult,
+  type ResumeSessionResult,
+  type SpawnSessionOptions,
+  type SpawnSessionResult,
+} from '@/modules/common/registerCommonHandlers';
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
 import { configuration } from '@/configuration';
@@ -124,6 +130,13 @@ import {
 } from './mcpCallerGrantEnvelope';
 import { createClaudeSwapSupervisor } from './claudeSwapSupervisor';
 import { createNodeAiCredentialRuntime } from './aiCredentialRuntime';
+import { resolveReconnectableSession, type ReconnectableHappySession } from '@/resume/resolveHappySession';
+import { claudeCheckSession } from '@/claude/utils/claudeCheckSession';
+import { CodexAppServerClient } from '@/codex/codexAppServerClient';
+import {
+  classifyRecoveryLookupError,
+  decideUntrackedSessionRecovery,
+} from './sessionRecovery';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -799,6 +812,9 @@ export async function startDaemon(): Promise<void> {
         // 일반 경로 모두 extraEnv를 그대로 사용하므로 이 한 곳이면 충분하다.
         if (options.initialPrompt) {
           extraEnv.HAPPY_INITIAL_PROMPT = options.initialPrompt;
+          if (options.initialPromptLocalId) {
+            extraEnv.HAPPY_INITIAL_PROMPT_LOCAL_ID = options.initialPromptLocalId;
+          }
         }
         if (options.exitAfterFirstTurn) {
           extraEnv.HAPPY_AUTOMATION_RUN_ONCE = '1';
@@ -1109,12 +1125,13 @@ export async function startDaemon(): Promise<void> {
       };
     };
 
-    const spawnResumedSession = async (happySessionId: string, options?: ResumeSessionOptions): Promise<SpawnSessionResult> => {
+    const spawnResumedSession = async (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> => {
       try {
         if (hasLiveDaemonChild(happySessionId, pidToTrackedSession.values(), isPidAlive)) {
           if (options?.automation) {
             return {
               type: 'error',
+              code: 'SESSION_LIVE',
               errorMessage: `Session ${happySessionId} is still running and cannot accept automation environment changes.`,
             };
           }
@@ -1124,13 +1141,25 @@ export async function startDaemon(): Promise<void> {
 
         const tracked = findTrackedSessionById(happySessionId);
         if (!tracked) {
-          return { type: 'error', errorMessage: `Session ${happySessionId} is not tracked by this daemon. It may have been started before the daemon or on another machine.` };
+          return {
+            type: 'error',
+            code: 'SESSION_NOT_TRACKED',
+            errorMessage: `Session ${happySessionId} is not tracked by this daemon. It may have been started before the daemon or on another machine.`,
+          };
         }
         if (!tracked.happySessionMetadataFromLocalWebhook) {
-          return { type: 'error', errorMessage: `Session ${happySessionId} has no metadata. Cannot resume.` };
+          return {
+            type: 'error',
+            code: 'SESSION_METADATA_MISSING',
+            errorMessage: `Session ${happySessionId} has no metadata. Cannot resume.`,
+          };
         }
         if (!tracked.encryption) {
-          return { type: 'error', errorMessage: `Session ${happySessionId} has no stored encryption data. It was likely started before this feature was available. Restart the daemon and start a new session to enable resume.` };
+          return {
+            type: 'error',
+            code: 'SESSION_ENCRYPTION_MISSING',
+            errorMessage: `Session ${happySessionId} has no stored encryption data. It was likely started before this feature was available. Restart the daemon and start a new session to enable resume.`,
+          };
         }
 
         // 2026-07-23 incident: pin preflight and child to ONE identity.
@@ -1146,6 +1175,7 @@ export async function startDaemon(): Promise<void> {
         if (credentialDecision.kind === 'refuse') {
           return {
             type: 'error',
+            code: 'SESSION_IDENTITY_MISMATCH',
             errorMessage: `Cannot resume session ${happySessionId}: ${credentialDecision.reason}`,
           };
         }
@@ -1153,16 +1183,18 @@ export async function startDaemon(): Promise<void> {
             && !tokensShareIdentity(credentialDecision.token, credentials.token)) {
           return {
             type: 'error',
+            code: 'SESSION_IDENTITY_MISMATCH',
             errorMessage: `Cannot safely resume session ${happySessionId}: it belongs to a different Happy account.`,
           };
         }
-        if (options?.automation && !hasReliableResumeBaseline({
+        if (!hasReliableResumeBaseline({
           reportedSeq: tracked.runtime?.lastProcessedSeq,
           persistedSeq: tracked.persistedLastProcessedSeq,
         })) {
           return {
             type: 'error',
-            errorMessage: `Cannot safely resume session ${happySessionId} for automation: no processed-message cursor is available.`,
+            code: 'SESSION_CURSOR_MISSING',
+            errorMessage: `Cannot safely resume session ${happySessionId}: no processed-message cursor is available.`,
           };
         }
 
@@ -1174,6 +1206,7 @@ export async function startDaemon(): Promise<void> {
         if (!serverSnapshot) {
           return {
             type: 'error',
+            code: 'SESSION_SERVER_UNAVAILABLE',
             errorMessage: `Cannot safely resume session ${happySessionId}: latest server metadata is unavailable. Retry when the server is reachable.`,
           };
         }
@@ -1227,6 +1260,7 @@ export async function startDaemon(): Promise<void> {
             ) !== true) {
           return {
             type: 'error',
+            code: 'SESSION_DIRECTORY_MISMATCH',
             errorMessage: `Session ${happySessionId} belongs to a different directory.`,
           };
         }
@@ -1258,11 +1292,12 @@ export async function startDaemon(): Promise<void> {
         if (!mcpEnvironment.ok) {
           return {
             type: 'error',
+            code: 'MCP_CALLER_GRANT_REJECTED',
             errorMessage: `MCP caller grant rejected (${mcpEnvironment.reason})`,
           };
         }
 
-        return spawnTrackedHappyProcess({
+        const result = await spawnTrackedHappyProcess({
           args: launch.args,
           cwd: launch.cwd,
           // resume 는 이 spawn 하나에 한해 lineage 를 명시적으로 부여한다 —
@@ -1270,11 +1305,15 @@ export async function startDaemon(): Promise<void> {
           env: mcpEnvironment.environmentVariables,
           userHomeDir: credentialDecision.kind === 'user-staged' ? credentialDecision.homeDir : undefined,
         });
+        return result.type === 'error'
+          ? { ...result, code: 'SESSION_RESUME_FAILED' }
+          : result;
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : (error && typeof error === 'object' ? JSON.stringify(error) : String(error));
         logger.debug(`[DAEMON RUN] Failed to resume session: ${errorMessage}`, error instanceof Error ? error.stack : undefined);
         return {
           type: 'error',
+          code: 'SESSION_RESUME_FAILED',
           errorMessage: `Failed to resume session: ${errorMessage}`,
         };
       }
@@ -1283,9 +1322,160 @@ export async function startDaemon(): Promise<void> {
     // Concurrent resume RPCs for the same session share one spawn (2026-08-05:
     // two RPCs 6.7s apart double-spawned a session; both children were later
     // empty-reaped together).
-    const resumeInFlight = new Map<string, Promise<SpawnSessionResult>>();
-    const resumeSession = (happySessionId: string, options?: ResumeSessionOptions): Promise<SpawnSessionResult> =>
+    const resumeInFlight = new Map<string, Promise<ResumeSessionResult>>();
+    const resumeSession = (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> =>
       shareInFlight(resumeInFlight, happySessionId, () => spawnResumedSession(happySessionId, options));
+
+    const verifyRecoveryNativeSession = async (session: ReconnectableHappySession): Promise<boolean> => {
+      const metadata = session.metadata;
+      if ((metadata.flavor === 'codex' || metadata.codexThreadId) && metadata.codexThreadId) {
+        const client = new CodexAppServerClient();
+        try {
+          await client.connect();
+          await client.readThread({ threadId: metadata.codexThreadId, includeTurns: false });
+          return true;
+        } catch (error) {
+          logger.debug(`[DAEMON RUN] Codex recovery preflight failed for ${session.id}: ${error instanceof Error ? error.message : String(error)}`);
+          return false;
+        } finally {
+          await client.disconnect().catch(() => {});
+        }
+      }
+
+      if ((metadata.flavor === 'claude' || metadata.claudeSessionId) && metadata.claudeSessionId) {
+        return claudeCheckSession(metadata.claudeSessionId, metadata.path);
+      }
+      return false;
+    };
+
+    const spawnRecoveredSession = async (
+      previousSessionId: string,
+      options: RecoverSessionOptions,
+    ): Promise<RecoverSessionResult> => {
+      let serverSession: ReconnectableHappySession;
+      try {
+        serverSession = await resolveReconnectableSession(previousSessionId);
+      } catch (error) {
+        return { type: 'error', ...classifyRecoveryLookupError(error) };
+      }
+
+      const pathExists = await fs.access(serverSession.metadata.path).then(() => true).catch(() => false);
+      const nativeSessionExists = pathExists
+        ? await verifyRecoveryNativeSession(serverSession)
+        : false;
+      const persistedSession = readPersistedSessions()[serverSession.id];
+      const decision = decideUntrackedSessionRecovery({
+        serverSession,
+        persistedSession,
+        pathExists,
+        nativeSessionExists,
+      });
+
+      if (decision.kind === 'refuse') {
+        return {
+          type: 'error',
+          code: decision.code,
+          errorMessage: decision.reason,
+        };
+      }
+
+      if (decision.kind === 'same-session') {
+        const recovered: TrackedSession = {
+          startedBy: 'recovered from persisted session',
+          happySessionId: serverSession.id,
+          happySessionMetadataFromLocalWebhook: serverSession.metadata,
+          encryption: {
+            encryptionKey: serverSession.encryptionKey,
+            encryptionVariant: serverSession.encryptionVariant,
+            seq: serverSession.seq,
+            metadataVersion: serverSession.metadataVersion,
+            agentStateVersion: serverSession.agentStateVersion,
+          },
+          pid: 0,
+          userHomeDir: persistedSession?.userHomeDir,
+          persistedLastProcessedSeq: decision.baselineSeq,
+        };
+        sessionIdToFinishedSession.set(serverSession.id, recovered);
+        persistSession(serverSession.id, {
+          encryptionKey: encodeBase64(serverSession.encryptionKey),
+          encryptionVariant: serverSession.encryptionVariant,
+          seq: serverSession.seq,
+          metadataVersion: serverSession.metadataVersion,
+          agentStateVersion: serverSession.agentStateVersion,
+          metadata: serverSession.metadata,
+          savedAt: Date.now(),
+          userHomeDir: persistedSession?.userHomeDir,
+          lastProcessedSeq: decision.baselineSeq,
+        });
+
+        const result = await spawnResumedSession(serverSession.id, {
+          model: options.model,
+          permissionMode: options.permissionMode,
+          mcpCallerGrantEnvelope: options.mcpCallerGrantEnvelope,
+          mcpConfigProjectId: options.mcpConfigProjectId,
+          expectedConnectors: options.expectedConnectors,
+        });
+        if (result.type !== 'success') {
+          return result.type === 'error'
+            ? result
+            : {
+              type: 'error',
+              code: 'SESSION_RESUME_FAILED',
+              errorMessage: `Unexpected recovery result: ${result.type}`,
+            };
+        }
+        return {
+          type: 'success',
+          sessionId: result.sessionId,
+          previousSessionId: serverSession.id,
+          recovery: 'same-session',
+          initialPromptDelivered: false,
+        };
+      }
+
+      const spawned = await spawnSession({
+        directory: decision.directory,
+        agent: decision.agent,
+        environmentVariables: options.environmentVariables,
+        permissionMode: options.permissionMode,
+        mcpCallerGrantEnvelope: options.mcpCallerGrantEnvelope,
+        mcpConfigProjectId: options.mcpConfigProjectId,
+        expectedConnectors: options.expectedConnectors,
+        ...(decision.agent === 'claude'
+          ? { resumeClaudeSessionId: decision.resumeClaudeSessionId }
+          : { resumeCodexThreadId: decision.resumeCodexThreadId }),
+        parentSessionId: serverSession.id,
+        createdByAccountId: serverSession.metadata.createdBy?.accountId,
+        createdByDisplayName: serverSession.metadata.createdBy?.displayName,
+        initialPrompt: options.initialPrompt,
+        initialPromptLocalId: options.initialPromptLocalId,
+      });
+      if (spawned.type !== 'success') {
+        return {
+          type: 'error',
+          code: 'SESSION_RESUME_FAILED',
+          errorMessage: spawned.type === 'error'
+            ? spawned.errorMessage
+            : `Unexpected recovery result: ${spawned.type}`,
+        };
+      }
+      return {
+        type: 'success',
+        sessionId: spawned.sessionId,
+        previousSessionId: serverSession.id,
+        recovery: 'new-session',
+        initialPromptDelivered: true,
+      };
+    };
+    const recoveryInFlight = new Map<string, Promise<RecoverSessionResult>>();
+    const recoverSession = (
+      happySessionId: string,
+      options: RecoverSessionOptions,
+    ): Promise<RecoverSessionResult> => shareInFlight(
+      recoveryInFlight,
+      happySessionId,
+      () => spawnRecoveredSession(happySessionId, options),
+    );
 
     const resumeAutomationSession: ServerAutomationExecutorInput['resumeSession'] = async (input) => {
       const trackedTarget = findTrackedSessionById(input.sessionId);
@@ -1708,6 +1898,7 @@ export async function startDaemon(): Promise<void> {
     apiMachine.setRPCHandlers({
       spawnSession,
       resumeSession,
+      recoverSession,
       stopSession,
       requestShutdown: () => requestShutdown('happy-app'),
       portRegistry,

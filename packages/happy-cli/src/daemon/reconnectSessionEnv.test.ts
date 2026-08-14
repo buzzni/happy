@@ -239,7 +239,7 @@ describe('resolveResumeBaselineSeq', () => {
 });
 
 describe('hasReliableResumeBaseline', () => {
-    it('requires a runtime or persisted processed seq for an automation resume', () => {
+    it('requires a runtime or persisted processed seq for every same-session reconnect', () => {
         expect(hasReliableResumeBaseline({
             reportedSeq: undefined,
             persistedSeq: undefined,

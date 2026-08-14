@@ -107,6 +107,30 @@ describe('prepareCodexSessionStart', () => {
 })
 
 describe('prepareCodexInitialPrompt', () => {
+  it('forwards the web optimistic local id to the persisted user envelope', () => {
+    const sendSessionMessage = vi.fn()
+    const env = {
+      HAPPY_INITIAL_PROMPT: '복구 후 이어서 작업해줘',
+      HAPPY_INITIAL_PROMPT_LOCAL_ID: 'web-local-1',
+    }
+    const prepared = prepareCodexInitialPrompt({
+      env,
+      automationRunOnceRequested: false,
+    })
+
+    deliverCodexInitialPrompt({
+      prepared,
+      sendSessionMessage,
+      pushPrompt: vi.fn(),
+    })
+
+    expect(sendSessionMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ role: 'user' }),
+      'web-local-1',
+    )
+    expect(env.HAPPY_INITIAL_PROMPT_LOCAL_ID).toBeUndefined()
+  })
+
   it('requiresAndActivatesRunOnceOnlyForAFreshAutomationPrompt', () => {
     const env = { HAPPY_INITIAL_PROMPT: '  업무 브리핑  ' }
 
