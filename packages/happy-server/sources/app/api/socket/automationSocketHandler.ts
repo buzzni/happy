@@ -122,6 +122,11 @@ export function automationSocketHandler(accountId: string, machineId: string, so
             : typeof data?.failureCode === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(data.failureCode)
                 ? data.failureCode
                 : (() => { throw new Error('invalid-input'); })();
+        const degradedCode = data?.degradedCode === null || data?.degradedCode === undefined
+            ? null
+            : typeof data?.degradedCode === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(data.degradedCode)
+                ? data.degradedCode
+                : (() => { throw new Error('invalid-input'); })();
         return inTx((tx) => reportAutomationRun(tx, accountId, machineId, {
             runId: requiredString(data?.runId),
             claimToken: requiredString(data?.claimToken),
@@ -131,6 +136,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
             sessionId: data?.sessionId === null ? null : requiredString(data?.sessionId),
             detailCiphertext: data?.detailCiphertext === null ? null : bytes(data?.detailCiphertext, 128 * 1024),
             failureCode,
+            degradedCode,
         }));
     }, () => emitAutomationUpdate(accountId, {
             projectId: null,

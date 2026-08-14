@@ -269,6 +269,7 @@ async function executeStartedRun(
   outcome: ServerAutomationReportOutcome
   sessionId: string | null
   failureCode?: string
+  degradedCode?: string
 }> {
   let prompt = payload.prompt
   let environmentVariables: Record<string, string> | undefined
@@ -389,6 +390,7 @@ async function executeStartedRun(
   }
   let spawnMcpContext: AutomationMcpSpawnContext | undefined
   let expectedConnectors: string[] | undefined
+  let degradedCode: string | undefined
   if (!agentTaskDispatch) {
     const context = mcpContext.value
     if (!context || context.connectorPolicy === 'unspecified') {
@@ -406,6 +408,7 @@ async function executeStartedRun(
         if (context.connectorPolicy === 'required') {
           return { outcome: 'ERROR', sessionId: null, failureCode: preflight.code }
         }
+        degradedCode = preflight.code
       } else {
         input.logDebug?.(
           `[server-automation] run=${run.runId} automation=${automation.automationId}`
@@ -467,7 +470,11 @@ async function executeStartedRun(
   if (spawned.ok && agentTaskDispatch) input.maintainAgentTaskLease(agentTaskDispatch)
   if (spawned.ok) persistGithubTriggerState?.()
   return spawned.ok
-    ? { outcome: 'WOKE', sessionId: associateSpawnedSession ? spawned.sessionId : null }
+    ? {
+        outcome: 'WOKE',
+        sessionId: associateSpawnedSession ? spawned.sessionId : null,
+        ...(degradedCode ? { degradedCode } : {}),
+      }
     : { outcome: 'ERROR', sessionId: null }
 }
 
@@ -530,6 +537,7 @@ export async function runServerAutomationTick(
       outcome: ServerAutomationReportOutcome
       sessionId: string | null
       failureCode?: string
+      degradedCode?: string
     }
     try {
       if (payload.githubTrigger?.action !== 'notify'
@@ -562,6 +570,7 @@ export async function runServerAutomationTick(
       sessionId: result.sessionId,
       detailCiphertext: null,
       failureCode: result.failureCode ?? null,
+      degradedCode: result.degradedCode ?? null,
       createdAt: input.now,
     }
     const state = input.runtimeStore.read()

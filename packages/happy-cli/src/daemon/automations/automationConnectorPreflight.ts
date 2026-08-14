@@ -65,6 +65,9 @@ export async function preflightAutomationConnectors(
   if (input.context.connectorPolicy === 'unspecified') {
     return { ok: false, code: 'POLICY_UNSPECIFIED', unavailableConnectors: required }
   }
+  if (input.context.connectorPolicy === 'required' && required.length === 0) {
+    return { ok: false, code: 'CONNECTOR_CONFIG_MISSING', unavailableConnectors: [] }
+  }
   if (!input.context.mcpCallerGrant) {
     return { ok: false, code: 'GRANT_MISSING', unavailableConnectors: required }
   }

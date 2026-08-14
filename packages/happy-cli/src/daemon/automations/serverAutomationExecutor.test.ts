@@ -293,6 +293,7 @@ describe('runServerAutomationTick', () => {
     expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({ expectedConnectors: ['gmail'] }))
     expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({
       runId: 'run-1', status: 'COMPLETED', outcome: 'WOKE', sessionId: 'session-1',
+      degradedCode: 'GRANT_MISSING',
     }))
   })
 

@@ -29,11 +29,12 @@ function parseExchangeResponse(value: unknown): { context: AutomationMcpSpawnCon
     || row.connectorPolicy === 'optional' || row.connectorPolicy === 'none'
     ? row.connectorPolicy
     : 'unspecified'
-  const requiredConnectors = Array.isArray(row.requiredConnectors)
-    && row.requiredConnectors.every((entry) =>
-      typeof entry === 'string' && /^[a-z0-9-]{1,64}$/.test(entry))
-    ? [...new Set(row.requiredConnectors as string[])].sort()
-    : []
+  if (!Array.isArray(row.requiredConnectors)
+    || !row.requiredConnectors.every((entry) =>
+      typeof entry === 'string' && /^[a-z0-9-]{1,64}$/.test(entry))) return null
+  const requiredConnectors = [...new Set(row.requiredConnectors as string[])].sort()
+  if (connectorPolicy === 'required' && requiredConnectors.length === 0) return null
+  if (connectorPolicy === 'none' && requiredConnectors.length > 0) return null
   if (row.grant !== null && (typeof row.grant !== 'string' || !row.grant)) return null
   if (typeof row.grant === 'string'
     && (typeof row.expiresAt !== 'number' || !Number.isFinite(row.expiresAt)

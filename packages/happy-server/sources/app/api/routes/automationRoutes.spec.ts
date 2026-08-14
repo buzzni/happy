@@ -90,6 +90,28 @@ describe('automationRoutes', () => {
         expect(mocks.listAutomations).not.toHaveBeenCalled();
     });
 
+    it('serializes a degraded connector code in automation run history', async () => {
+        mocks.listAutomationRuns.mockResolvedValue({
+            ok: true,
+            value: [{
+                id: 'run-1', automationId: 'automation-1', generation: 1,
+                scheduledFor: new Date(1), machineId: 'machine-1', status: 'COMPLETED',
+                sessionId: 'session-1', outcome: 'WOKE', detailCiphertext: null,
+                failureCode: null, degradedCode: 'GRANT_MISSING', claimedAt: new Date(2),
+                startedAt: new Date(3), completedAt: new Date(4), lateReport: false,
+            }],
+        });
+        const app = await makeApp();
+        const response = await app.inject({
+            method: 'GET',
+            url: '/v1/projects/project-1/automation-runs',
+            headers: { authorization: 'Bearer test' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json().runs[0]).toMatchObject({ degradedCode: 'GRANT_MISSING' });
+    });
+
     it('decodes encrypted create fields and derives actor/project outside the body', async () => {
         mocks.createAutomation.mockResolvedValue({ ok: true, value: record() });
         const app = await makeApp();

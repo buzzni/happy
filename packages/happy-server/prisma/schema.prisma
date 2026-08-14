@@ -564,6 +564,7 @@ model AutomationRun {
     outcome           AutomationRunOutcome?
     detailCiphertext  Bytes?
     failureCode       String?
+    degradedCode      String?
     claimedAt         DateTime              @default(now())
     startedAt         DateTime?
     completedAt       DateTime?

@@ -84,6 +84,13 @@ describe('exchangeAutomationMcpCallerGrant', () => {
     new Response(JSON.stringify({ grant: null, projectId: '' }), {
       status: 200, headers: { 'Content-Type': 'application/json' },
     }),
+    new Response(JSON.stringify({
+      grant: null, projectId: 'P-1', connectorPolicy: 'required',
+      requiredConnectors: ['gmail!'],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    new Response(JSON.stringify({
+      grant: null, projectId: 'P-1', connectorPolicy: 'required', requiredConnectors: [],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
   ])('fails closed when the exchange rejects the run or returns an invalid grant', async (response) => {
     vi.stubGlobal('fetch', vi.fn(async () => response))
 

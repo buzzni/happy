@@ -36,6 +36,7 @@ describe('serverAutomationRuntimeStore', () => {
       pendingReports: [{
         runId: 'run-1', claimToken: 'claim-token', reportId: 'report-1', status: 'COMPLETED',
         outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,
+        degradedCode: 'GRANT_MISSING',
       }],
     })
 
@@ -59,6 +60,7 @@ describe('serverAutomationRuntimeStore', () => {
       pendingReports: [{
         runId: 'run-1', claimToken: 'claim-token', reportId: 'report-1', status: 'COMPLETED',
         outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,
+        degradedCode: 'GRANT_MISSING',
       }],
     })
     expect(readdirSync(dir)).toEqual(['server-automation-runtime.v1.json'])
