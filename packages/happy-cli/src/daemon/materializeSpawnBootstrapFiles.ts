@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 const MANAGED_BOOTSTRAP_PATHS = new Set([
     '.aplus/agent/project-template.md',
     '.aplus/agent/mcp-catalog.md',
+    '.aplus/agent/common-base.md',
     'AGENTS.md',
     'CLAUDE.md',
 ]);
