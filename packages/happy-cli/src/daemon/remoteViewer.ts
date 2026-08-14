@@ -99,6 +99,18 @@ export function planViewerInstall({ missing, canSudo, platform = process.platfor
     }
 }
 
+/**
+ * The viewer web ports we bind, in the order the start path tries them.
+ *
+ * Shared so the adoption scan and pickFreePort cannot drift: a port added to
+ * only one of them would never be adopted, and a duplicate stack would be
+ * spawned next to the one already serving it.
+ */
+export const VIEWER_WEB_PORTS = [6080, 6081, 6082] as const
+
+/** VNC ports paired with VIEWER_WEB_PORTS, same ordering. */
+export const VIEWER_VNC_PORTS = [5900, 5901, 5902] as const
+
 export type ViewerStackDecision =
     | { action: 'reuse'; webPort: number }
     | { action: 'adopt'; webPort: number }

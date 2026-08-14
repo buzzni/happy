@@ -58,6 +58,8 @@ import {
     buildWebsockifyArgs,
     buildX11vncArgs,
     buildXvfbArgs,
+    VIEWER_VNC_PORTS,
+    VIEWER_WEB_PORTS,
     decideViewerStackAction,
     detectMissingViewerTools,
     isViewerServing,
@@ -1033,10 +1035,14 @@ export class ApiMachineClient {
         }
         // The cache is not evidence: the stack is spawned detached, so it both
         // outlives the daemon and can die under it. Probe before trusting it.
+        const cachedAlive = this.viewer ? await isViewerServing(this.viewer.webPort) : false;
         const decision = decideViewerStackAction({
             cached: this.viewer,
-            cachedAlive: this.viewer ? await isViewerServing(this.viewer.webPort) : false,
-            adoptable: this.viewer ? null : await findRunningViewer(),
+            cachedAlive,
+            // Scanned whenever the cache is not alive, not just when it is
+            // absent — a stale entry must not stop us adopting a stack that
+            // is genuinely serving, or we spawn a duplicate beside it.
+            adoptable: cachedAlive ? null : await findRunningViewer(),
         });
         if (decision.action === 'reuse' && this.viewer) {
             return { ...this.viewer, ready: true, reused: true };
@@ -1051,8 +1057,8 @@ export class ApiMachineClient {
         this.viewer = null;
 
         const display = ':99';
-        const vncPort = await pickFreePort([5900, 5901, 5902]);
-        const webPort = await pickFreePort([6080, 6081, 6082]);
+        const vncPort = await pickFreePort([...VIEWER_VNC_PORTS]);
+        const webPort = await pickFreePort([...VIEWER_WEB_PORTS]);
         if (vncPort === null || webPort === null) {
             throw new Error('원격 화면에 쓸 포트를 찾지 못했습니다.');
         }
@@ -1782,9 +1788,6 @@ async function pickFreePort(candidates: number[]): Promise<number | null> {
     }
     return null;
 }
-
-/** The viewer web ports we ever bind, in the order startViewerStack tries them. */
-const VIEWER_WEB_PORTS = [6080, 6081, 6082];
 
 /**
  * A viewer stack left running by a previous daemon, if any.

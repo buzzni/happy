@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+    VIEWER_WEB_PORTS,
     decideViewerStackAction,
     buildWebsockifyArgs,
     buildX11vncArgs,
@@ -159,5 +160,16 @@ describe('decideViewerStackAction', () => {
         const decision = decideViewerStackAction({ cached: null, cachedAlive: false, adoptable: null })
 
         expect(decision).toEqual({ action: 'start' })
+    })
+})
+
+describe('VIEWER_WEB_PORTS as the single source of truth', () => {
+    it('is what both the start path and the adoption scan use', () => {
+        // The adoption scan and pickFreePort each had their own literal list.
+        // Adding a port to one and not the other silently breaks adoption:
+        // a stack on the new port would never be found and a duplicate would
+        // be spawned beside it.
+        expect(VIEWER_WEB_PORTS.length).toBeGreaterThan(0)
+        expect([...VIEWER_WEB_PORTS]).toEqual([6080, 6081, 6082])
     })
 })
