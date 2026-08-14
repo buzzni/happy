@@ -6,6 +6,9 @@ export type AcpAgentConfig = {
 export const KNOWN_ACP_AGENTS: Record<string, AcpAgentConfig> = {
   gemini: { command: 'gemini', args: ['--experimental-acp'] },
   opencode: { command: 'opencode', args: ['acp'] },
+  // `grok agent stdio` speaks ACP protocolVersion 1 over JSON-RPC, which is the
+  // version AcpBackend negotiates. The interactive TUI (plain `grok`) does not.
+  grok: { command: 'grok', args: ['agent', 'stdio'] },
 };
 
 export type ResolvedAcpAgentConfig = {

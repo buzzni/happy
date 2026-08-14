@@ -2,10 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { KNOWN_ACP_AGENTS, resolveAcpAgentConfig } from './acpAgentConfig';
 
 describe('KNOWN_ACP_AGENTS', () => {
-  it('defines built-in Gemini and OpenCode command mappings', () => {
+  it('defines built-in Gemini, OpenCode and Grok command mappings', () => {
     expect(KNOWN_ACP_AGENTS).toEqual({
       gemini: { command: 'gemini', args: ['--experimental-acp'] },
       opencode: { command: 'opencode', args: ['acp'] },
+      grok: { command: 'grok', args: ['agent', 'stdio'] },
     });
   });
 });
@@ -16,6 +17,30 @@ describe('resolveAcpAgentConfig', () => {
       agentName: 'gemini',
       command: 'gemini',
       args: ['--experimental-acp'],
+    });
+  });
+
+  it('resolves grok to its ACP stdio subcommand', () => {
+    expect(resolveAcpAgentConfig(['grok'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', 'stdio'],
+    });
+  });
+
+  it('keeps grok ACP subcommand ahead of passthrough args', () => {
+    expect(resolveAcpAgentConfig(['grok', '-m', 'grok-4.6'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', 'stdio', '-m', 'grok-4.6'],
+    });
+  });
+
+  it('strips happy-internal flags before forwarding to grok', () => {
+    expect(resolveAcpAgentConfig(['grok', '--happy-starting-mode', 'remote', '-m', 'grok-4.6'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', 'stdio', '-m', 'grok-4.6'],
     });
   });
 
