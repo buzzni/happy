@@ -76,6 +76,7 @@ import {
 } from './initialPrompt';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
+import { registerCodexSteerHandler } from './codexSteerHandler';
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
@@ -628,20 +629,12 @@ export async function runCodex(opts: {
 
     client = new CodexAppServerClient(sandboxConfig);
 
-    session.rpcHandlerManager.registerHandler('steer', async (params: Record<string, unknown>) => {
-        const text = typeof params?.text === 'string' ? params.text : '';
-        if (!text.trim()) {
-            return { success: false, error: 'Steer text is required' };
-        }
-
-        try {
-            await client.steerTurn(text);
-            return { success: true };
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
+    registerCodexSteerHandler({
+        client,
+        session,
+        onFailure: (message) => {
             logger.debug(`[Codex] Active-turn steer failed: ${message}`);
-            return { success: false, error: message };
-        }
+        },
     });
 
     permissionHandler = new CodexPermissionHandler(session);
