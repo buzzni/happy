@@ -8,6 +8,7 @@ describe('appendClaudeTitleInstruction', () => {
         expect(out.startsWith('로그인 버튼이 안 눌려')).toBe(true);
         expect(out.endsWith(CLAUDE_TITLE_INSTRUCTION)).toBe(true);
         expect(out).toContain('mcp__happy__change_title');
+        expect(out).toContain('branchSlug');
     });
 
     it('separates the user text and the instruction with a blank line', () => {

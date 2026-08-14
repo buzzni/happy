@@ -1,3 +1,4 @@
+import { BRANCH_SLUG_SPEC } from "@/utils/branchSlugSpec";
 import { trimIdent } from "@/utils/trimIdent";
 
 /**
@@ -14,7 +15,7 @@ import { trimIdent } from "@/utils/trimIdent";
  * turn is de-duped by recording it with the JSONL scanner.
  */
 export const CLAUDE_TITLE_INSTRUCTION = trimIdent(`
-    Before you do anything else for this message, call the "mcp__happy__change_title" tool exactly once to set a concise title for this chat — a short noun phrase naming the task, in the user's language. Do it now even if the task itself takes a while. The title locks after it is first set, so do not call it again.
+    Before you do anything else for this message, call the "mcp__happy__change_title" tool exactly once to set a concise title for this chat — a short noun phrase naming the task, in the user's language — and a branchSlug: ${BRANCH_SLUG_SPEC} Do it now even if the task itself takes a while. The title locks after it is first set, so do not call it again.
 `);
 
 /**

@@ -12,7 +12,8 @@ vi.mock('@/ui/logger', () => ({
 function makeFakeClient(hasTitle: boolean) {
     return {
         hasTitle: vi.fn(() => hasTitle),
-        sendClaudeSessionMessage: vi.fn()
+        sendClaudeSessionMessage: vi.fn(),
+        updateMetadata: vi.fn()
     } as unknown as ApiSessionClient;
 }
 
@@ -37,6 +38,66 @@ describe('createChangeTitleHandler', () => {
 
         expect(result.success).toBe(false);
         expect(client.sendClaudeSessionMessage).not.toHaveBeenCalled();
+    });
+
+    it('stores the branchSlug in session metadata alongside the title', async () => {
+        const client = makeFakeClient(false);
+        const changeTitle = createChangeTitleHandler(client);
+
+        const result = await changeTitle('Fix login bug', 'fix-login-bug');
+
+        expect(result).toEqual({ success: true });
+        expect(client.updateMetadata).toHaveBeenCalledTimes(1);
+        const updater = (client.updateMetadata as any).mock.calls[0][0];
+        expect(updater({ summary: { text: 'Fix login bug', updatedAt: 1 } })).toEqual({
+            summary: { text: 'Fix login bug', updatedAt: 1, branchSlug: 'fix-login-bug' }
+        });
+    });
+
+    it('does not touch metadata when no branchSlug is supplied', async () => {
+        const client = makeFakeClient(false);
+        const changeTitle = createChangeTitleHandler(client);
+
+        await changeTitle('Fix login bug');
+
+        expect(client.updateMetadata).not.toHaveBeenCalled();
+    });
+
+    it('ignores a blank branchSlug rather than storing whitespace', async () => {
+        const client = makeFakeClient(false);
+        const changeTitle = createChangeTitleHandler(client);
+
+        await changeTitle('Fix login bug', '   ');
+
+        expect(client.updateMetadata).not.toHaveBeenCalled();
+    });
+
+    it('trims the branchSlug before storing it', async () => {
+        const client = makeFakeClient(false);
+        const changeTitle = createChangeTitleHandler(client);
+
+        await changeTitle('Fix login bug', '  fix-login-bug\n');
+        const updater = (client.updateMetadata as any).mock.calls[0][0];
+
+        expect(updater({ summary: { text: 'Fix login bug', updatedAt: 1 } }).summary.branchSlug)
+            .toBe('fix-login-bug');
+    });
+
+    // The summary write is a separate, fire-and-forget updateMetadata call that
+    // silently gives up on a hard error, so branchSlug can land on metadata that
+    // has no summary yet. Writing only { branchSlug } there would leave a summary
+    // object missing its required text/updatedAt.
+    it('writes a complete summary when metadata has no summary yet', async () => {
+        const client = makeFakeClient(false);
+        const changeTitle = createChangeTitleHandler(client);
+
+        await changeTitle('Fix login bug', 'fix-login-bug');
+        const updater = (client.updateMetadata as any).mock.calls[0][0];
+        const summary = updater({}).summary;
+
+        expect(summary.text).toBe('Fix login bug');
+        expect(typeof summary.updatedAt).toBe('number');
+        expect(summary.branchSlug).toBe('fix-login-bug');
     });
 });
 
@@ -76,6 +137,46 @@ describe('startHappyServer tool registration', () => {
                 'browser_capabilities',
             ]));
             expect(names).toEqual(expect.arrayContaining(server.toolNames));
+        } finally {
+            server.stop();
+        }
+    });
+
+    it('forwards branchSlug from a real tools/call through to the handler', async () => {
+        const updateMetadata = vi.fn();
+        const client = {
+            hasTitle: () => false,
+            sendClaudeSessionMessage: vi.fn(),
+            updateMetadata,
+            sessionId: 'test'
+        } as unknown as ApiSessionClient;
+        const server = await startHappyServer(client);
+        try {
+            const response = await fetch(server.url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Accept: 'application/json, text/event-stream',
+                },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    method: 'tools/call',
+                    params: { name: 'change_title', arguments: { title: 'Fix login bug', branchSlug: 'fix-login-bug' } },
+                }),
+            });
+            expect(response.status).toBe(200);
+
+            // Assert the slug the caller sent is the one that gets stored — a bare
+            // "updateMetadata was called" check still passes if the tool wires the
+            // wrong argument (e.g. the title) into the handler's slug parameter.
+            const raw = await response.text();
+            const payload = JSON.parse(raw.startsWith('event:') ? raw.slice(raw.indexOf('data: ') + 6) : raw);
+            expect(payload.result.isError).toBe(false);
+
+            expect(updateMetadata).toHaveBeenCalledTimes(1);
+            const updater = updateMetadata.mock.calls[0][0];
+            expect(updater({}).summary.branchSlug).toBe('fix-login-bug');
         } finally {
             server.stop();
         }

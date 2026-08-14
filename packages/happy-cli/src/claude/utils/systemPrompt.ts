@@ -1,3 +1,4 @@
+import { BRANCH_SLUG_SPEC } from "@/utils/branchSlugSpec";
 import { trimIdent } from "@/utils/trimIdent";
 import { shouldIncludeCoAuthoredBy } from "./claudeSettings";
 
@@ -5,7 +6,7 @@ import { shouldIncludeCoAuthoredBy } from "./claudeSettings";
  * Base system prompt shared across all configurations
  */
 const BASE_SYSTEM_PROMPT = (() => trimIdent(`
-    ALWAYS when you start a new chat - you must call a tool "mcp__happy__change_title" once to generate a concise title that represents the user's task, unless the chat already has one. This title is needed to easily find the chat in the future. Help human. The title locks after it is first set, so do not call change_title again.
+    ALWAYS when you start a new chat - you must call a tool "mcp__happy__change_title" once to generate a concise title that represents the user's task, unless the chat already has one. This title is needed to easily find the chat in the future. Help human. Pass a branchSlug too: ${BRANCH_SLUG_SPEC} The title locks after it is first set, so do not call change_title again.
 `))();
 
 /**

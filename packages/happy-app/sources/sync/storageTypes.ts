@@ -30,7 +30,11 @@ export const MetadataSchema = z.object({
     os: z.string().optional(),
     summary: z.object({
         text: z.string(),
-        updatedAt: z.number()
+        updatedAt: z.number(),
+        // Set by the CLI alongside the title. Declared here so it survives the
+        // decrypt/parse round-trip — zod strips unknown keys, and the app writes
+        // the parsed object back on any metadata update, which would erase it.
+        branchSlug: z.string().optional()
     }).optional(),
     machineId: z.string().optional(),
     claudeSessionId: z.string().optional(), // Claude Code session ID
