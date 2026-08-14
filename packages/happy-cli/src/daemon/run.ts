@@ -49,15 +49,14 @@ import { join } from 'path';
 import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
-import { filterCredentialsFromEnv } from '@/sandbox/config';
 import { scrubSessionLineageEnv, SESSION_LINEAGE_ENV_PREFIXES } from './sessionEnv';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
 import { encodeBase64, decodeBase64 } from '@/api/encryption';
 import {
+  resolveInheritedSpawnEnvironment,
   resolveRegularSpawnAgentArgs,
-  resolveReadOnlyAgentAuthEnvironment,
   resolveTmuxSpawnAgentCommand,
   shouldFilterSpawnCredentials,
 } from './spawnAgentCommand';
@@ -825,10 +824,13 @@ export async function startDaemon(): Promise<void> {
         const filterInheritedCredentials = shouldFilterSpawnCredentials({
           sandboxEnabled: hasSandbox,
           permissionMode: options.permissionMode,
+          isolatedAutomation: options.filterInheritedCredentials,
         });
-        const readOnlyAgentAuthEnv = options.permissionMode === 'read-only'
-          ? resolveReadOnlyAgentAuthEnvironment(options.agent, process.env)
-          : {};
+        const inheritedSpawnEnvironment = resolveInheritedSpawnEnvironment({
+          agent: options.agent,
+          env: process.env,
+          filterCredentials: filterInheritedCredentials,
+        });
 
         // Check if tmux is available and should be used
         const tmuxAvailable = await isTmuxAvailable();
@@ -882,13 +884,12 @@ export async function startDaemon(): Promise<void> {
           // 3. tmux needs explicit environment via -e flags to ensure all variables are available
           const windowName = `happy-${Date.now()}-${agent}`;
           // Explicit agent auth and task callbacks are overlaid after inherited
-          // credentials are filtered, so the reviewer keeps only what it needs.
+          // credentials are filtered, so isolated tasks keep only what they need.
           const daemonEnvFiltered = scrubSessionLineageEnv(
-            filterInheritedCredentials ? filterCredentialsFromEnv(process.env) : process.env,
+            inheritedSpawnEnvironment,
           );
           const tmuxEnv: Record<string, string> = {
             ...daemonEnvFiltered,
-            ...readOnlyAgentAuthEnv,
             ...extraEnv,
           };
 
@@ -975,8 +976,7 @@ export async function startDaemon(): Promise<void> {
             // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
             // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
             env: {
-              ...scrubSessionLineageEnv(filterInheritedCredentials ? filterCredentialsFromEnv(process.env) : process.env),
-              ...readOnlyAgentAuthEnv,
+              ...scrubSessionLineageEnv(inheritedSpawnEnvironment),
               ...extraEnv
             },
             directoryCreated,
@@ -1267,9 +1267,14 @@ export async function startDaemon(): Promise<void> {
 
         await fs.access(launch.cwd);
 
+        const inheritedResumeEnvironment = resolveInheritedSpawnEnvironment({
+          agent: launch.args[0] === 'codex' ? 'codex' : 'claude',
+          env: process.env,
+          filterCredentials: options?.automation !== undefined,
+        });
         const mcpEnvironment = prepareMcpChildEnvironment({
           environmentVariables: {
-            ...scrubSessionLineageEnv(process.env),
+            ...scrubSessionLineageEnv(inheritedResumeEnvironment),
             ...(options?.automation?.environmentVariables ?? {}),
             ...reconnectEnvironment,
             // user-credential 세션은 원래 계정의 스테이징 자격증명으로 복원 —
@@ -1679,6 +1684,7 @@ export async function startDaemon(): Promise<void> {
         permissionMode?: 'read-only';
         mcpSpawnContext?: AutomationMcpSpawnContext;
         expectedConnectors?: string[];
+        filterInheritedCredentials?: boolean;
         environmentVariables?: Record<string, string>;
       },
     ): Promise<{ ok: true; sessionId: string } | { ok: false; error: string }> => {
@@ -1692,6 +1698,7 @@ export async function startDaemon(): Promise<void> {
         // 세션 자체는 데몬 소유자 자격증명으로 등록된다(자동화에 사용자 토큰을
         // 저장하지 않는다 — credentials-at-rest 금지). 귀속 표시만 넘긴다.
         createdByAccountId: input.createdByAccountId ?? undefined,
+        filterInheritedCredentials: input.filterInheritedCredentials,
         environmentVariables: input.environmentVariables,
         expectedConnectors: input.expectedConnectors,
       }, input.mcpSpawnContext);

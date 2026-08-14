@@ -98,6 +98,7 @@ export interface ServerAutomationExecutorInput {
     permissionMode?: 'read-only'
     mcpSpawnContext?: AutomationMcpSpawnContext
     expectedConnectors?: string[]
+    filterInheritedCredentials?: boolean
     environmentVariables?: Record<string, string>
   }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
   isSessionRunning: (sessionId: string) => boolean
@@ -426,6 +427,7 @@ async function executeStartedRun(
     initialPrompt,
     createdByAccountId: null,
     agent: payload.agent ?? 'claude',
+    ...(agentTaskDispatch ? { filterInheritedCredentials: true } : {}),
     ...(agentTaskDispatch?.type === 'pr_review.v1' ? { permissionMode: 'read-only' as const } : {}),
     ...(environmentVariables ? { environmentVariables } : {}),
     ...(spawnMcpContext ? { mcpSpawnContext: spawnMcpContext } : {}),

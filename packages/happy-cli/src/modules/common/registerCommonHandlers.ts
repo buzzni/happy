@@ -262,6 +262,8 @@ export interface SpawnSessionOptions {
     initialPromptLocalId?: string;
     /** Exit cleanly after the spawned agent completes its first turn. */
     exitAfterFirstTurn?: boolean;
+    /** Remove inherited daemon credentials before applying the explicit spawn environment. */
+    filterInheritedCredentials?: boolean;
     /** Restrict an unattended automation session to repository reads. */
     permissionMode?: PermissionMode;
 }
