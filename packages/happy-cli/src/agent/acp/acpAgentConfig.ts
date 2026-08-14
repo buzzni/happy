@@ -1,6 +1,15 @@
 export type AcpAgentConfig = {
   command: string;
   args: string[];
+  /**
+   * Args that must stay at the very end, after any user passthrough flags.
+   *
+   * Needed by CLIs whose ACP entry point is a leaf subcommand while the flags
+   * that matter (model, effort, approval) belong to its parent — `grok agent
+   * -m <model> stdio`. Appending the subcommand first would make those flags
+   * land on the leaf, which rejects them.
+   */
+  trailingArgs?: string[];
 };
 
 export const KNOWN_ACP_AGENTS: Record<string, AcpAgentConfig> = {
@@ -8,7 +17,7 @@ export const KNOWN_ACP_AGENTS: Record<string, AcpAgentConfig> = {
   opencode: { command: 'opencode', args: ['acp'] },
   // `grok agent stdio` speaks ACP protocolVersion 1 over JSON-RPC, which is the
   // version AcpBackend negotiates. The interactive TUI (plain `grok`) does not.
-  grok: { command: 'grok', args: ['agent', 'stdio'] },
+  grok: { command: 'grok', args: ['agent'], trailingArgs: ['stdio'] },
 };
 
 export type ResolvedAcpAgentConfig = {
@@ -125,7 +134,7 @@ export function resolveAcpAgentConfig(cliArgs: string[]): ResolvedAcpAgentConfig
     return {
       agentName,
       command: known.command,
-      args: [...known.args, ...passthroughArgs],
+      args: [...known.args, ...passthroughArgs, ...(known.trailingArgs ?? [])],
     };
   }
 

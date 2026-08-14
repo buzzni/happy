@@ -40,7 +40,7 @@ describe('KNOWN_ACP_AGENTS', () => {
     expect(KNOWN_ACP_AGENTS).toEqual({
       gemini: { command: 'gemini', args: ['--experimental-acp'] },
       opencode: { command: 'opencode', args: ['acp'] },
-      grok: { command: 'grok', args: ['agent', 'stdio'] },
+      grok: { command: 'grok', args: ['agent'], trailingArgs: ['stdio'] },
     });
   });
 });
@@ -62,11 +62,22 @@ describe('resolveAcpAgentConfig', () => {
     });
   });
 
-  it('keeps grok ACP subcommand ahead of passthrough args', () => {
+  it('keeps trailing args last for agents that take flags before their subcommand', () => {
+    expect(resolveAcpAgentConfig(['grok', '--reasoning-effort', 'high', '--always-approve'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', '--reasoning-effort', 'high', '--always-approve', 'stdio'],
+    });
+  });
+
+  // `-m`, `--reasoning-effort` and `--always-approve` belong to `grok agent`,
+  // not to its `stdio` leaf. Appending them after `stdio` makes the Grok CLI
+  // exit with "unexpected argument" before the ACP handshake starts.
+  it('places grok passthrough flags before the stdio subcommand', () => {
     expect(resolveAcpAgentConfig(['grok', '-m', 'grok-4.6'])).toEqual({
       agentName: 'grok',
       command: 'grok',
-      args: ['agent', 'stdio', '-m', 'grok-4.6'],
+      args: ['agent', '-m', 'grok-4.6', 'stdio'],
     });
   });
 
@@ -74,7 +85,7 @@ describe('resolveAcpAgentConfig', () => {
     expect(resolveAcpAgentConfig(['grok', '--happy-starting-mode', 'remote', '-m', 'grok-4.6'])).toEqual({
       agentName: 'grok',
       command: 'grok',
-      args: ['agent', 'stdio', '-m', 'grok-4.6'],
+      args: ['agent', '-m', 'grok-4.6', 'stdio'],
     });
   });
 
