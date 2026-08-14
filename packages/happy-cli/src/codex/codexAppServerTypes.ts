@@ -237,6 +237,12 @@ export type InterruptConversationParams = {
     turnId: string;
 };
 
+export type SteerConversationParams = {
+    threadId: ThreadId;
+    input: InputItem[];
+    expectedTurnId: string;
+};
+
 export type InterruptConversationResponse = {
     abortReason: TurnAbortReason;
 };

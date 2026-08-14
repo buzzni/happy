@@ -131,6 +131,7 @@ async function startRemoteRunClaudeHarness(opts: {
             metadata = updater(metadata);
         }),
         sendClaudeSessionMessage: vi.fn(),
+        sendSessionProtocolMessage: vi.fn(),
         hasTitle: vi.fn(() => false),
         onUserMessage: vi.fn(),
         onFileEvent: vi.fn(),
@@ -289,6 +290,27 @@ describe('runClaude remote JSONL scanner', () => {
             }
         }
         originalListeners.clear();
+    });
+
+    it('persists an accepted active-turn prompt once and deduplicates the JSONL scanner copy', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+
+        harness.loopOptions.onActiveUserInputAccepted('apply this now');
+
+        expect(harness.sessionClient.sendSessionProtocolMessage).toHaveBeenCalledWith(
+            expect.objectContaining({
+                role: 'user',
+                ev: { t: 'text', text: 'apply this now' },
+            }),
+        );
+
+        harness.scannerOptions.onMessage({
+            type: 'user',
+            message: { content: 'apply this now' },
+        });
+        expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
+
+        await harness.finish();
     });
 
     it('passes reconnect seq and refreshes runtime metadata without losing server fields', async () => {

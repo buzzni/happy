@@ -45,6 +45,7 @@ interface LoopOptions {
     sandboxConfig?: SandboxConfig
     onSessionReady?: (session: Session) => void
     onAbort?: () => void
+    onActiveUserInputAccepted?: (text: string) => void
     /** Path to temporary settings file with SessionStart hook (required for session tracking) */
     hookSettingsPath: string
     /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
@@ -71,6 +72,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         sandboxConfig: opts.sandboxConfig,
         onModeChange: opts.onModeChange,
         onAbort: opts.onAbort,
+        onActiveUserInputAccepted: opts.onActiveUserInputAccepted,
         hookSettingsPath: opts.hookSettingsPath,
         jsRuntime: opts.jsRuntime,
         startingMode: opts.startingMode,

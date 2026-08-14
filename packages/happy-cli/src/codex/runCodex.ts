@@ -628,6 +628,22 @@ export async function runCodex(opts: {
 
     client = new CodexAppServerClient(sandboxConfig);
 
+    session.rpcHandlerManager.registerHandler('steer', async (params: Record<string, unknown>) => {
+        const text = typeof params?.text === 'string' ? params.text : '';
+        if (!text.trim()) {
+            return { success: false, error: 'Steer text is required' };
+        }
+
+        try {
+            await client.steerTurn(text);
+            return { success: true };
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            logger.debug(`[Codex] Active-turn steer failed: ${message}`);
+            return { success: false, error: message };
+        }
+    });
+
     permissionHandler = new CodexPermissionHandler(session);
     // Drop any permission requests left in agent state from a previous CLI
     // process that died while a tool prompt was open — see the matching

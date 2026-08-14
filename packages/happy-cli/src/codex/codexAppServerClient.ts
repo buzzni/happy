@@ -39,6 +39,7 @@ import type {
     ThreadGoalClearResponse,
     Thread,
     InterruptConversationParams,
+    SteerConversationParams,
     ReviewDecision,
     EventMsg,
     JsonRpcRequest,
@@ -1394,6 +1395,22 @@ export class CodexAppServerClient {
 
         const aborted = await completion;
         return { aborted };
+    }
+
+    async steerTurn(prompt: string): Promise<void> {
+        if (!this._threadId || !this._turnId) {
+            throw new Error('No active Codex turn');
+        }
+        if (!prompt.trim()) {
+            throw new Error('Cannot steer an empty prompt');
+        }
+
+        const params: SteerConversationParams = {
+            threadId: this._threadId,
+            input: [{ type: 'text', text: prompt }],
+            expectedTurnId: this._turnId,
+        };
+        await this.request('turn/steer', params);
     }
 
     async interruptTurn(): Promise<void> {

@@ -46,6 +46,65 @@ describe('claudeRemote', () => {
         expect(nextMessage).toHaveBeenCalledOnce();
     });
 
+    it('pushes active-turn input into the running SDK prompt stream', async () => {
+        let releaseResult!: () => void;
+        const resultGate = new Promise<void>((resolve) => {
+            releaseResult = resolve;
+        });
+        let prompt!: AsyncIterator<unknown>;
+        vi.mocked(query).mockImplementation((request) => {
+            prompt = (request.prompt as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+            return {
+                setPermissionMode: vi.fn(),
+                mcpServerStatus: vi.fn(async () => []),
+                async *[Symbol.asyncIterator]() {
+                    await resultGate;
+                    yield { type: 'result', subtype: 'success' };
+                },
+            } as any;
+        });
+        let activeInputSender: ((text: string) => boolean) | null = null;
+        let resolveActiveInputSender!: (sender: (text: string) => boolean) => void;
+        const activeInputSenderReady = new Promise<(text: string) => boolean>((resolve) => {
+            resolveActiveInputSender = resolve;
+        });
+        let messageCount = 0;
+
+        const running = claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage: async () => (
+                messageCount++ === 0 ? { message: 'initial request', mode } : null
+            ),
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+            onActiveInputReady: (sender) => {
+                activeInputSender = sender;
+                if (sender) resolveActiveInputSender(sender);
+            },
+        });
+
+        const sendActiveInput = await activeInputSenderReady;
+        expect(await prompt.next()).toMatchObject({
+            value: { message: { content: 'initial request' } },
+        });
+        expect(sendActiveInput('apply this now')).toBe(true);
+        expect(await prompt.next()).toMatchObject({
+            value: { message: { content: 'apply this now' } },
+        });
+
+        releaseResult();
+        await running;
+        expect(activeInputSender).toBeNull();
+        expect(sendActiveInput('too late')).toBe(false);
+    });
+
     it('marks /clear as a completed reset turn', async () => {
         const callbackOrder: string[] = [];
         const onCompletionEvent = vi.fn((message: string) => {
