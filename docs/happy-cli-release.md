@@ -19,6 +19,39 @@ upstream `main` unless that is explicitly requested as separate work.
 3. Create a tag that exactly matches the package version: `happy-cli-v<version>`.
 4. Push the tag **without running any local publish command**. The `Publish @buzzni/happy-cli` workflow verifies that the tag and package version match, then is the sole process that publishes.
 
+## Cross-Repository Spawn Bootstrap Compatibility (CRITICAL)
+
+The `bootstrapFiles[].relativePath` values sent by A+ Dev Studio are a wire
+contract with Happy CLI's `MANAGED_BOOTSTRAP_PATHS` allowlist. Adding a file on
+the web producer side before the installed daemon accepts that path prevents
+the entire session from spawning; it is not a best-effort file-sync failure.
+
+On 2026-08-14, the web began sending `.aplus/agent/common-base.md` while the
+production daemon was still `1.1.10-aplus.106`. The daemon rejected the request
+with `Unsupported spawn bootstrap path: .aplus/agent/common-base.md`, which
+blocked new conversation creation.
+
+For every new spawn bootstrap path, use this rollout order:
+
+1. Add the path to `materializeSpawnBootstrapFiles.ts` and add a test that
+   materializes the exact path while unrelated paths remain rejected.
+2. Bump and release Happy CLI through the tag workflow, then complete the
+   registry install smoke described in this runbook.
+3. In A+ Dev Studio, gate the new path using the target machine's
+   `happyCliVersion`. Installed versions below the supporting release, missing
+   versions, and malformed versions must omit only the new path.
+4. Add an API-level compatibility test for the real
+   `createNewSession -> spawn-happy-session` payload: production version `N`
+   omits the path and supporting version `N+1` includes it.
+5. Deploy the gated web producer. Do not remove the compatibility gate merely
+   because `latest` points at the supporting CLI; existing daemons may still be
+   running an older installed version.
+
+If this contract breaks in production, the fastest safe recovery is a web
+hotfix that filters only the unsupported path for old/unknown daemon versions.
+Do not disable all bootstrap files, relax the daemon to arbitrary paths, or
+wait for fleet-wide CLI upgrades before restoring session creation.
+
 ## Single Publisher Policy (CRITICAL)
 
 GitHub Actions owns the entire registry publication path. Local work ends after the
