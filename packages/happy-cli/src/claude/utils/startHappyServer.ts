@@ -28,15 +28,21 @@ import { runBrowserTool, BROWSER_TOOL_NAMES, type BridgeRequest } from "./browse
 export const BASH_STREAM_AGENT_TOOL_NAME = 'mcp__happy__bash_stream';
 
 export interface HappyServerHandlers {
-    changeTitle: (title: string) => Promise<{ success: boolean; error?: string }>;
+    changeTitle: (title: string, branchSlug?: string) => Promise<{ success: boolean; error?: string }>;
     client: ApiSessionClient;
 }
 
 // The first title generated through change_title is the one users rely on to
 // find the chat again. Letting later calls overwrite it makes the title churn,
 // so once a title exists this becomes a no-op.
+//
+// branchSlug rides along in the same call so the model can supply it for free
+// off the title-generation pass, without a second LLM round-trip. It is stored
+// separately in metadata.summary.branchSlug rather than folded into the
+// synthetic `summary` RawJSONLines event, since that event's shape mirrors
+// Claude's own JSONL log format and isn't the place to grow custom fields.
 export function createChangeTitleHandler(client: ApiSessionClient) {
-    return async (title: string): Promise<{ success: boolean; error?: string }> => {
+    return async (title: string, branchSlug?: string): Promise<{ success: boolean; error?: string }> => {
         if (client.hasTitle()) {
             logger.debug('[happyMCP] Title already set; ignoring change_title call');
             return { success: false, error: 'Title already set for this session and is now locked' };
@@ -48,6 +54,12 @@ export function createChangeTitleHandler(client: ApiSessionClient) {
                 summary: title,
                 leafUuid: randomUUID()
             });
+            if (branchSlug) {
+                client.updateMetadata((metadata) => ({
+                    ...metadata,
+                    summary: { ...metadata.summary, branchSlug } as NonNullable<typeof metadata.summary>
+                }));
+            }
             return { success: true };
         } catch (error) {
             return { success: false, error: String(error) };
@@ -66,9 +78,12 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
         title: 'Change Chat Title',
         inputSchema: {
             title: z.string().describe('The new title for the chat session'),
+            branchSlug: z.string().optional().describe(
+                'A short English kebab-case slug (2-4 words) summarizing the same task, for use as a git branch name.'
+            ),
         },
     }, async (args) => {
-        const response = await handlers.changeTitle(args.title);
+        const response = await handlers.changeTitle(args.title, args.branchSlug);
         logger.debugLargeJson('[happyMCP] Response:', response);
 
         if (response.success) {

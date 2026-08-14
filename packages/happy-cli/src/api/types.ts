@@ -307,7 +307,9 @@ export type Metadata = {
   os?: string,
   summary?: {
     text: string,
-    updatedAt: number
+    updatedAt: number,
+    /** English kebab-case slug for the task, supplied alongside the title for use as a git branch name. */
+    branchSlug?: string,
   },
   promptSuggestion?: {
     text: string,
