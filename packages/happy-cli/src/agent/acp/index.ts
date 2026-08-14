@@ -36,7 +36,7 @@ export {
 export { createAcpBackend, type CreateAcpBackendOptions } from './createAcpBackend';
 export { AcpSessionManager } from './AcpSessionManager';
 export { runAcp } from './runAcp';
-export { KNOWN_ACP_AGENTS, resolveAcpAgentConfig, type AcpAgentConfig, type ResolvedAcpAgentConfig } from './acpAgentConfig';
+export { KNOWN_ACP_AGENTS, resolveAcpAgentConfig, parseAcpSubcommandArgs, type AcpAgentConfig, type ResolvedAcpAgentConfig, type ParsedAcpSubcommandArgs } from './acpAgentConfig';
 
 // Legacy aliases for backwards compatibility
 export { AcpBackend as AcpSdkBackend } from './AcpBackend';

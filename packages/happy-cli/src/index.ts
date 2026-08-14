@@ -385,26 +385,9 @@ Conversation history is preserved on the server, but in-flight tool calls are in
     return;
   } else if (subcommand === 'acp') {
     try {
-      const { runAcp, resolveAcpAgentConfig } = await import('@/agent/acp');
+      const { runAcp, resolveAcpAgentConfig, parseAcpSubcommandArgs } = await import('@/agent/acp');
 
-      let startedBy: 'daemon' | 'terminal' | undefined = undefined;
-      let verbose = false;
-      const acpArgs: string[] = [];
-      let customCommandMode = false;
-      for (let i = 1; i < args.length; i++) {
-        if (!customCommandMode && args[i] === '--started-by') {
-          startedBy = args[++i] as 'daemon' | 'terminal';
-          continue;
-        }
-        if (!customCommandMode && args[i] === '--verbose') {
-          verbose = true;
-          continue;
-        }
-        if (args[i] === '--') {
-          customCommandMode = true;
-        }
-        acpArgs.push(args[i]);
-      }
+      const { startedBy, verbose, acpArgs } = parseAcpSubcommandArgs(args.slice(1));
 
       const resolved = resolveAcpAgentConfig(acpArgs);
       const { credentials } = await authAndSetupMachineIfNeeded();

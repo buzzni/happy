@@ -1,5 +1,39 @@
 import { describe, expect, it } from 'vitest';
-import { KNOWN_ACP_AGENTS, resolveAcpAgentConfig } from './acpAgentConfig';
+import { KNOWN_ACP_AGENTS, parseAcpSubcommandArgs, resolveAcpAgentConfig } from './acpAgentConfig';
+
+describe('parseAcpSubcommandArgs', () => {
+  it('extracts happy-owned flags and leaves the agent argv intact', () => {
+    expect(parseAcpSubcommandArgs(['--started-by', 'daemon', '--verbose', 'gemini'])).toEqual({
+      startedBy: 'daemon',
+      verbose: true,
+      acpArgs: ['gemini'],
+    });
+  });
+
+  it('defaults to terminal-unset and non-verbose', () => {
+    expect(parseAcpSubcommandArgs(['gemini'])).toEqual({
+      startedBy: undefined,
+      verbose: false,
+      acpArgs: ['gemini'],
+    });
+  });
+
+  it('stops claiming flags once the -- separator hands argv to the agent', () => {
+    expect(parseAcpSubcommandArgs(['--', 'custom-agent', '--verbose', '--started-by', 'daemon'])).toEqual({
+      startedBy: undefined,
+      verbose: false,
+      acpArgs: ['--', 'custom-agent', '--verbose', '--started-by', 'daemon'],
+    });
+  });
+
+  it('keeps happy flags that precede the -- separator', () => {
+    expect(parseAcpSubcommandArgs(['--verbose', '--', 'custom-agent', '--verbose'])).toEqual({
+      startedBy: undefined,
+      verbose: true,
+      acpArgs: ['--', 'custom-agent', '--verbose'],
+    });
+  });
+});
 
 describe('KNOWN_ACP_AGENTS', () => {
   it('defines built-in Gemini, OpenCode and Grok command mappings', () => {

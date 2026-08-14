@@ -59,6 +59,42 @@ function filterHappyInternalFlags(args: string[]): string[] {
   return out;
 }
 
+export type ParsedAcpSubcommandArgs = {
+  startedBy?: 'daemon' | 'terminal';
+  verbose: boolean;
+  /** Remaining argv to hand to `resolveAcpAgentConfig`. */
+  acpArgs: string[];
+};
+
+/**
+ * Split happy's own `acp` subcommand flags off the front of the argv.
+ *
+ * After a `--` separator the user owns the rest of the argv, so `--verbose`
+ * and `--started-by` past that point belong to the underlying agent and are
+ * forwarded verbatim.
+ */
+export function parseAcpSubcommandArgs(rest: string[]): ParsedAcpSubcommandArgs {
+  let startedBy: 'daemon' | 'terminal' | undefined = undefined;
+  let verbose = false;
+  const acpArgs: string[] = [];
+  let customCommandMode = false;
+  for (let i = 0; i < rest.length; i++) {
+    if (!customCommandMode && rest[i] === '--started-by') {
+      startedBy = rest[++i] as 'daemon' | 'terminal';
+      continue;
+    }
+    if (!customCommandMode && rest[i] === '--verbose') {
+      verbose = true;
+      continue;
+    }
+    if (rest[i] === '--') {
+      customCommandMode = true;
+    }
+    acpArgs.push(rest[i]);
+  }
+  return { startedBy, verbose, acpArgs };
+}
+
 export function resolveAcpAgentConfig(cliArgs: string[]): ResolvedAcpAgentConfig {
   if (cliArgs.length === 0) {
     throw new Error('Usage: happy acp <agent-name> or happy acp -- <command> [args]');
