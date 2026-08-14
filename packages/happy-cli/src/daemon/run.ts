@@ -1485,7 +1485,7 @@ export async function startDaemon(): Promise<void> {
         directory: string;
         initialPrompt: string;
         createdByAccountId: string | null;
-        agent: 'claude' | 'codex' | 'gemini' | 'openclaw' | 'opencode';
+        agent: 'claude' | 'codex' | 'gemini' | 'grok' | 'openclaw' | 'opencode';
         permissionMode?: 'read-only';
         mcpSpawnContext?: AutomationMcpSpawnContext;
         expectedConnectors?: string[];
