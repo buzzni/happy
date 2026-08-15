@@ -146,6 +146,28 @@ describe('resolveOrphanAdoption', () => {
     expect(result.session.happySessionMetadataFromLocalWebhook).toBeUndefined()
   })
 
+  // An adopted session without encryption can never be preserved for resume:
+  // preserveSessionForResume bails on it, so the reaper kills it before its
+  // cursor reaches disk and every later resume refuses with
+  // SESSION_CURSOR_MISSING (2026-08-15 incident).
+  it('shouldRestoreEncryptionAndResumeCursorSoTheSessionStaysResumable', () => {
+    const result = resolveOrphanAdoption({
+      sessionId: 'sess-1',
+      hostPid: 4242,
+      persistedSessions: {
+        'sess-1': { ...persisted({ startedBy: 'daemon' }), lastProcessedSeq: 77, userHomeDir: '/tmp/happy-session-9' },
+      },
+      isPidAlive: alive,
+      now: NOW,
+    })
+
+    expect(result.adopted).toBe(true)
+    if (!result.adopted) return
+    expect(result.session.encryption?.encryptionVariant).toBe('dataKey')
+    expect(result.session.persistedLastProcessedSeq).toBe(77)
+    expect(result.session.userHomeDir).toBe('/tmp/happy-session-9')
+  })
+
   // The reporting process's own PID is ground truth; a 14-day-old persisted
   // record can point at a recycled PID.
   it('prefers the reported PID over the persisted one', () => {

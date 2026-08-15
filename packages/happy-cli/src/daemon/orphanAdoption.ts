@@ -14,6 +14,7 @@
  */
 
 import type { PersistedSession } from '@/persistence';
+import { hydrateTrackedSessionFromPersisted } from './persistedSessionHydration';
 import type { TrackedSession } from './types';
 
 /** Label used for sessions the daemon didn't spawn. Matches the string the
@@ -87,14 +88,16 @@ export function resolveOrphanAdoption(input: {
   }
 
   const session: TrackedSession = {
+    // Encryption and the resume cursor come with it: an adopted session that
+    // lacks them can never be preserved for resume, so the reaper would kill it
+    // before its cursor reached disk (2026-08-15 incident).
+    ...hydrateTrackedSessionFromPersisted(persisted),
     // Restore the original provenance. Anything else here (e.g. an 'adopted'
     // label) would make evaluateIdleStopGuard treat a daemon-spawned session as
     // a user's terminal and protect it forever.
     startedBy: persisted?.metadata?.startedBy === 'daemon' ? 'daemon' : EXTERNAL_SESSION_STARTED_BY,
     happySessionId: sessionId,
     pid,
-    ...(persisted?.metadata ? { happySessionMetadataFromLocalWebhook: persisted.metadata } : {}),
-    ...(persisted?.userHomeDir ? { userHomeDir: persisted.userHomeDir } : {}),
   };
 
   return {

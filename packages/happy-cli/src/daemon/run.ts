@@ -317,11 +317,21 @@ export async function startDaemon(): Promise<void> {
       for (const persisted of previousState.trackedSessions) {
         if (isPidAlive(persisted.pid)) {
           const recovered: TrackedSession = {
+            // The state file records who and where, but not the session's
+            // encryption or resume cursor. Without them preserveSessionForResume
+            // bails, so the reaper would later kill this session without ever
+            // writing its cursor to disk and resume would refuse for good
+            // (2026-08-15 incident). sessions.json has both.
+            ...(persisted.happySessionId
+              ? hydrateTrackedSessionFromPersisted(persistedSessions[persisted.happySessionId])
+              : {}),
             startedBy: persisted.startedBy,
             pid: persisted.pid,
             happySessionId: persisted.happySessionId,
             tmuxSessionId: persisted.tmuxSessionId,
-            userHomeDir: persisted.userHomeDir,
+            // The state file's staged home dir is the more current one; fall
+            // back to the persisted record rather than clobbering it.
+            ...(persisted.userHomeDir ? { userHomeDir: persisted.userHomeDir } : {}),
           };
           pidToTrackedSession.set(persisted.pid, recovered);
           logger.debug(`[DAEMON RUN] Recovered alive session PID ${persisted.pid}, sessionId: ${persisted.happySessionId || 'pending'}`);
@@ -412,7 +422,7 @@ export async function startDaemon(): Promise<void> {
     // written state file leaves the same gap.
     try {
       const startupOrphans = collectStartupOrphans({
-        persistedSessions: persisted,
+        persistedSessions,
         trackedPids: new Set(pidToTrackedSession.keys()),
         isPidAlive,
         getProcessStartedAt,
@@ -1070,7 +1080,16 @@ export async function startDaemon(): Promise<void> {
     };
 
     const preserveSessionForResume = (session: TrackedSession, reason: string): boolean => {
-      if (!session.happySessionId || !session.encryption) return false;
+      // Silence here hid the whole 2026-08-15 failure: the reaper logged a clean
+      // stop while this bailed, so nothing recorded that the session had just
+      // been killed in a state no resume could recover from.
+      if (!session.happySessionId || !session.encryption) {
+        logger.debug(
+          `[DAEMON RUN] Cannot preserve session ${session.happySessionId ?? `pid ${session.pid}`} for resume (${reason}):`
+          + ` ${!session.happySessionId ? 'no session id' : 'no encryption data'}`,
+        );
+        return false;
+      }
 
       sessionIdToFinishedSession.set(session.happySessionId, session);
       if (session.happySessionMetadataFromLocalWebhook) {

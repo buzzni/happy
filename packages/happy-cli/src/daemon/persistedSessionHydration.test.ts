@@ -60,6 +60,6 @@ describe('hydrateTrackedSessionFromPersisted', () => {
   // one that has reported since this daemon started; its stale-runtime
   // protection depends on runtime being absent until a real report arrives.
   it('shouldNotFabricateRuntimeState', () => {
-    expect(hydrateTrackedSessionFromPersisted(persisted({ lastProcessedSeq: 41 })).runtime).toBeUndefined();
+    expect('runtime' in hydrateTrackedSessionFromPersisted(persisted({ lastProcessedSeq: 41 }))).toBe(false);
   });
 });
