@@ -3,6 +3,7 @@ import {
     VIEWER_WEB_PORTS,
     decideViewerBrowserAction,
     decideViewerStackAction,
+    summariseViewerBrowser,
     buildWebsockifyArgs,
     buildX11vncArgs,
     buildXvfbArgs,
@@ -191,5 +192,28 @@ describe('decideViewerBrowserAction', () => {
         const decision = decideViewerBrowserAction({ liveCdpPort: 9222 })
 
         expect(decision).toEqual({ action: 'reuse', cdpPort: 9222 })
+    })
+})
+
+describe('summariseViewerBrowser', () => {
+    it('reports that the screen will be blank when Chrome is missing', () => {
+        // 실측(2026-08-15, dev): 뷰어 스택은 다 떠 있는데 Chrome 이 설치돼
+        // 있지 않아 화면이 검게 나왔다. ensureViewerBrowser 가 조용히
+        // return 하는 바람에 사용자는 원인을 알 방법이 없었다.
+        const summary = summariseViewerBrowser({ chromeInstalled: false, cdpPort: null })
+
+        expect(summary).toEqual({ browserReady: false, reason: 'chrome-not-installed' })
+    })
+
+    it('reports not-ready when Chrome exists but never came up', () => {
+        const summary = summariseViewerBrowser({ chromeInstalled: true, cdpPort: null })
+
+        expect(summary).toEqual({ browserReady: false, reason: 'browser-failed' })
+    })
+
+    it('reports ready with the port once a browser is on the display', () => {
+        const summary = summariseViewerBrowser({ chromeInstalled: true, cdpPort: 9222 })
+
+        expect(summary).toEqual({ browserReady: true, cdpPort: 9222 })
     })
 })

@@ -171,6 +171,28 @@ export function decideViewerBrowserAction(input: {
     return { action: 'launch' }
 }
 
+export type ViewerBrowserSummary =
+    | { browserReady: true; cdpPort: number; reason?: undefined }
+    | { browserReady: false; reason: 'chrome-not-installed' | 'browser-failed'; cdpPort?: undefined }
+
+/**
+ * What `browser-viewer:start` should tell the caller about the screen.
+ *
+ * The viewer stack coming up is not the same as the screen being usable: a
+ * machine with Xvfb/x11vnc/websockify but no Chrome serves a perfectly
+ * healthy connection to an empty display, which the user sees as a black
+ * screen with nothing explaining it (observed on a dev machine 2026-08-15).
+ * So the reason travels up instead of being swallowed.
+ */
+export function summariseViewerBrowser(input: {
+    chromeInstalled: boolean
+    cdpPort: number | null
+}): ViewerBrowserSummary {
+    if (!input.chromeInstalled) return { browserReady: false, reason: 'chrome-not-installed' }
+    if (input.cdpPort === null) return { browserReady: false, reason: 'browser-failed' }
+    return { browserReady: true, cdpPort: input.cdpPort }
+}
+
 function which(binary: string): Promise<string | null> {
     return new Promise((resolve) => {
         const child = spawn('which', [binary], { stdio: ['ignore', 'pipe', 'ignore'] })
