@@ -29,7 +29,7 @@ import {
     type ClaudeGoalStatusTranscriptEvent,
 } from '@/claude/claudeGoalStatus';
 import { Session } from './session';
-import { applySandboxPermissionPolicy, resolveInitialClaudeDisallowedTools, resolveInitialClaudePermissionMode, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
+import { applySandboxPermissionPolicy, resolveInitialClaudeDisallowedTools, resolveInitialClaudePermissionMode, resolveRemoteClaudeDisallowedTools, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
 import { applyAxOrchestration } from '@/orchestrator/prompts/integrate';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
 import { appendClaudeTitleInstruction } from './utils/titlePrompt';
@@ -730,7 +730,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         // Resolve disallowed tools - use message.meta.disallowedTools if provided, otherwise use current
         let messageDisallowedTools = currentDisallowedTools;
         if (message.meta?.hasOwnProperty('disallowedTools')) {
-            messageDisallowedTools = message.meta.disallowedTools || undefined; // null becomes undefined
+            messageDisallowedTools = resolveRemoteClaudeDisallowedTools(
+                message.meta.disallowedTools || undefined,
+                initialDisallowedTools,
+            );
             currentDisallowedTools = messageDisallowedTools;
             logger.debug(`[loop] Disallowed tools updated from user message: ${messageDisallowedTools ? messageDisallowedTools.join(', ') : 'reset to none'}`);
         } else {

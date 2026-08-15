@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { applySandboxPermissionPolicy, extractPermissionModeFromClaudeArgs, mapToClaudeMode, resolveInitialClaudeDisallowedTools, resolveInitialClaudePermissionMode, resolveRemoteClaudePermissionMode } from './permissionMode';
+import { applySandboxPermissionPolicy, extractPermissionModeFromClaudeArgs, mapToClaudeMode, resolveInitialClaudeDisallowedTools, resolveInitialClaudePermissionMode, resolveRemoteClaudeDisallowedTools, resolveRemoteClaudePermissionMode } from './permissionMode';
 import type { PermissionMode } from '@/api/types';
 
 describe('mapToClaudeMode', () => {
@@ -108,6 +108,32 @@ describe('resolveInitialClaudeDisallowedTools', () => {
 
     it('does not restrict ordinary interactive sessions', () => {
         expect(resolveInitialClaudeDisallowedTools('default')).toBeUndefined();
+    });
+});
+
+describe('resolveRemoteClaudeDisallowedTools', () => {
+    const requiredReadOnlyTools = resolveInitialClaudeDisallowedTools('read-only');
+
+    it('preserves mandatory read-only restrictions when the app resets disallowed tools', () => {
+        expect(resolveRemoteClaudeDisallowedTools(undefined, requiredReadOnlyTools)).toEqual(requiredReadOnlyTools);
+    });
+
+    it('merges app restrictions without duplicating mandatory read-only restrictions', () => {
+        expect(resolveRemoteClaudeDisallowedTools(
+            ['WebFetch', 'Edit'],
+            requiredReadOnlyTools,
+        )).toEqual([
+            'WebFetch',
+            'Edit',
+            'MultiEdit',
+            'Write',
+            'NotebookEdit',
+            'mcp__happy__bash_stream',
+        ]);
+    });
+
+    it('allows ordinary interactive sessions to reset disallowed tools', () => {
+        expect(resolveRemoteClaudeDisallowedTools(undefined, undefined)).toBeUndefined();
     });
 });
 
