@@ -313,7 +313,6 @@ export const zhHans: TranslationStructure = {
         forkClaudeOnly: '目前仅支持 Claude 会话的分叉。',
         directoryApprovalRequired: '无法恢复此会话，因为它需要目录批准。请从其原始位置手动启动。',
         failedToDeliverInitialPrompt: '会话恢复已启动，但无法传递您的消息。请重试。',
-        sendFailedNoRunningAgent: '该会话没有正在运行的智能体，因此您的消息未送达。',
         sessionRecoveredInNewConversation: '会话已在新对话中恢复。您的消息已传递。',
     },
 

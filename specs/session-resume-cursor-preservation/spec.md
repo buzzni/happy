@@ -54,13 +54,22 @@ reaper 가 세션을 종료하기 전에 최신 `lastProcessedSeq` 가 디스크
 값으로 덮어쓰지 않는다.
 
 ### AC5 — 모바일 앱이 무응답을 방치하지 않는다
-모바일 앱에서 살아있는 CLI 가 없는 세션에 메시지를 보낼 때:
+모바일 앱에서 연결이 끊긴 세션에 메시지를 보낼 때, **복구를 시도할 수 있는
+조건이면**(실험 플래그 on + 머신 온라인 + resumable backend id 존재):
 - resume 을 시도하고, 실패 코드가 복구 가능(`SESSION_NOT_TRACKED`,
   `SESSION_METADATA_MISSING`, `SESSION_ENCRYPTION_MISSING`,
   `SESSION_CURSOR_MISSING`)이면 `recover-happy-session` 으로 이어간다.
 - recover 가 새 세션을 만들었으면 그 세션으로 이동한다. 메시지는 이미
   initialPrompt 로 전달되었으므로 다시 보내지 않는다.
-- 모든 경로가 실패하면 사용자에게 명시적으로 알린다. **조용히 삼키지 않는다.**
+- 시도한 복구가 실패하면 사용자에게 명시적으로 알리고 composer 의 텍스트를
+  보존한다. **조용히 삼키지 않는다.**
+
+복구를 시도할 수 없는 조건(실험 플래그 off, 머신 오프라인, backend id 없음)
+에서는 **기존처럼 그대로 전송해 서버에 큐잉한다.** presence offline 은
+"프로세스 죽음"뿐 아니라 "살아있는 CLI 의 일시적 연결 끊김"(노트북 lid 닫힘)
+도 포함하며, 후자에서 큐잉→재접속 시 수신은 정상 동작하는 기존 플로우다.
+세션 헤더가 이미 연결 상태를 표시하고, AC1~AC2 덕에 죽은 세션으로 큐잉된
+메시지도 다음 성공적인 resume 에서 replay 된다.
 
 ## 범위 밖
 

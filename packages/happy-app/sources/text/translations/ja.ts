@@ -313,7 +313,6 @@ export const ja: TranslationStructure = {
         forkClaudeOnly: 'フォークは現在 Claude セッションのみ対応しています。',
         directoryApprovalRequired: 'このセッションはディレクトリ承認が必要なため、再開できません。元の場所から手動で起動してください。',
         failedToDeliverInitialPrompt: 'セッション復旧が開始されましたが、メッセージを配信できませんでした。もう一度お試しください。',
-        sendFailedNoRunningAgent: 'このセッションには実行中のエージェントがないため、メッセージは配信されませんでした。',
         sessionRecoveredInNewConversation: '新しい会話でセッションが復旧されました。メッセージが配信されました。',
     },
 

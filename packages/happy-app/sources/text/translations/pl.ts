@@ -329,7 +329,6 @@ export const pl: TranslationStructure = {
         forkClaudeOnly: 'Rozwidlenie jest obecnie obsługiwane tylko dla sesji Claude.',
         directoryApprovalRequired: 'Ta sesja nie może być wznowiona, ponieważ wymaga zatwierdzenia katalogu. Uruchom ją ręcznie z jej oryginalnej lokalizacji.',
         failedToDeliverInitialPrompt: 'Odzyskiwanie sesji zostało uruchomione, ale nie udało się dostarczyć wiadomości. Spróbuj ponownie.',
-        sendFailedNoRunningAgent: 'Dla tej sesji nie działa żaden agent, więc wiadomość nie została dostarczona.',
         sessionRecoveredInNewConversation: 'Sesja odzyskana w nowej rozmowie. Wiadomość została dostarczona.',
     },
 

@@ -4,8 +4,17 @@
  * The send path used to be fire-and-forget: a message for a session with no
  * attached process was accepted by the server and answered by nobody, with no
  * error and no hint that anything had gone wrong (2026-08-15 incident — the
- * user waited on a reply that could never come). This hook makes that state
- * visible and, where the daemon allows it, recoverable.
+ * user waited on a reply that could never come). When the session's machine is
+ * reachable, this hook revives the session before sending and surfaces every
+ * failed revival instead of letting the message vanish into a dead session.
+ *
+ * When a revival cannot even be attempted — experiment off, machine offline,
+ * no resumable backend id — the message is sent normally, NOT blocked. An
+ * offline presence also covers a live CLI that is merely disconnected (laptop
+ * lid closed); queueing on the server is the long-standing working flow for
+ * that, the session header already shows the disconnected state, and since the
+ * daemon now preserves the resume cursor, a queued message to a truly dead
+ * session is replayed by the next successful resume rather than swallowed.
  */
 
 import * as React from 'react';
@@ -41,7 +50,11 @@ export function useSessionSend(session: Session) {
     const recoveryInFlightRef = React.useRef(false);
 
     return React.useCallback(async (text: string, options?: SendMessageOptions): Promise<boolean> => {
-        if (isConnected) {
+        const attemptRecovery = !isConnected
+            && expResumeSession
+            && getResumeAvailability(session, machine, isConnected).canResume;
+
+        if (!attemptRecovery) {
             sync.sendMessage(sessionId, text, options);
             return true;
         }
@@ -51,20 +64,6 @@ export function useSessionSend(session: Session) {
         }
         recoveryInFlightRef.current = true;
         try {
-            const availability = getResumeAvailability(session, machine, isConnected);
-
-            // Whether or not this build can revive the session, the user must
-            // learn that nothing is listening. Staying silent is the bug being
-            // fixed.
-            if (!expResumeSession) {
-                Modal.alert(t('common.error'), t('session.sendFailedNoRunningAgent'));
-                return false;
-            }
-            if (!availability.canResume) {
-                Modal.alert(t('common.error'), availability.message || t('session.sendFailedNoRunningAgent'));
-                return false;
-            }
-
             const modeMeta = resolveMessageModeMeta(session, storage.getState().settings);
             const outcome = await prepareSessionForSend({
                 machineId,
@@ -91,6 +90,9 @@ export function useSessionSend(session: Session) {
                     return true;
 
                 case 'failed':
+                    // The daemon was reachable and confirmed it cannot revive
+                    // this session right now — queueing would recreate the
+                    // silent no-response this hook exists to fix.
                     Modal.alert(t('common.error'), failureMessage(outcome));
                     return false;
             }
