@@ -2,10 +2,16 @@ import { spawn } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
+import {
+  getCodexMultiAuthProxyStatus,
+  isManagedCodexRotationSettings,
+} from '../codex/codexMultiAuthProxy'
 
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 const CLAUDE_SWAP_VERSION = '0.25.0'
 const CLAUDE_STATUS_TIMEOUT_MS = 120_000
+const CODEX_MULTI_AUTH_VERSION = '2.8.5'
+const CODEX_MULTI_AUTH_THRESHOLD = 5
 
 export type AiCredentialProvider = 'claude' | 'codex'
 
@@ -15,10 +21,13 @@ export type AiCredentialCommandResult = {
 }
 
 export type AiCredentialRotationStatus = {
-  state: 'stopped' | 'starting' | 'running' | 'needs-reauth' | 'blocked'
+  state: 'stopped' | 'starting' | 'running' | 'needs-reauth' | 'blocked' | 'quota-unknown' | 'not-routed'
   lastErrorKind: string | null
   lastSwitchAt?: string
   activeAccount?: string
+  strategy?: 'sequential'
+  threshold5h?: number
+  threshold7d?: number
 }
 
 type CommandOptions = {
@@ -44,12 +53,69 @@ export type AiCredentialRuntimeDependencies = {
   rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>
   makeTempDir(): Promise<string>
   supervisor: Supervisor
+  codexProxyStatus?: () => { activeRoutes: number }
 }
 
 export class AiCredentialRuntimeError extends Error {
   constructor(public readonly kind: string) {
     super(`AI credential operation failed (${kind})`)
   }
+}
+
+type CodexQuotaWindow = { usedPercent?: unknown }
+type CodexQuotaEntry = { primary?: CodexQuotaWindow; secondary?: CodexQuotaWindow }
+type CodexQuotaCache = {
+  byAccountId?: Record<string, CodexQuotaEntry>
+  byEmail?: Record<string, CodexQuotaEntry>
+}
+type CodexAccountIdentity = { accountId?: unknown; email?: unknown; enabled?: unknown }
+
+export function selectLeastRemainingCodexAccounts(
+  accounts: CodexAccountIdentity[],
+  quotaCache: CodexQuotaCache,
+  threshold: number,
+): { orderedIndexes: number[]; activeIndex: number; quotaKnown: boolean; hasReadyAccount: boolean } {
+  const identities = accounts.map((account) => {
+    const accountId = typeof account.accountId === 'string' ? nonEmptyTrimmed(account.accountId) : null
+    const email = typeof account.email === 'string'
+      ? nonEmptyTrimmed(account.email)?.toLowerCase() ?? null
+      : null
+    return { accountId, email }
+  })
+  const accountIdCounts = countNonNull(identities.map(({ accountId }) => accountId))
+  const emailCounts = countNonNull(identities.map(({ email }) => email))
+  const candidates = accounts.map((account, index) => {
+    const { accountId, email } = identities[index]!
+    const quota = (accountId && accountIdCounts.get(accountId) === 1
+      ? quotaCache.byAccountId?.[accountId]
+      : undefined)
+      ?? (email && emailCounts.get(email) === 1 ? quotaCache.byEmail?.[email] : undefined)
+    const remaining = quota ? restrictiveRemainingPercent(quota) : null
+    return { index, enabled: account.enabled !== false, remaining }
+  })
+  const ready = candidates
+    .filter((candidate) => candidate.enabled
+      && candidate.remaining !== null
+      && candidate.remaining > threshold)
+    .sort((left, right) => left.remaining! - right.remaining! || left.index - right.index)
+  const unknown = candidates.filter((candidate) => candidate.enabled && candidate.remaining === null)
+  const unavailable = candidates.filter((candidate) => !candidate.enabled
+    || (candidate.remaining !== null && candidate.remaining <= threshold))
+  const orderedIndexes = [...ready, ...unknown, ...unavailable].map(({ index }) => index)
+  return {
+    orderedIndexes,
+    activeIndex: 0,
+    quotaKnown: unknown.length === 0,
+    hasReadyAccount: ready.length > 0,
+  }
+}
+
+function restrictiveRemainingPercent(entry: CodexQuotaEntry): number | null {
+  const used = [entry.primary?.usedPercent, entry.secondary?.usedPercent]
+  if (!used.every((value): value is number => typeof value === 'number' && Number.isFinite(value))) {
+    return null
+  }
+  return Math.min(...used.map((value) => Math.max(0, Math.min(100, 100 - value))))
 }
 
 export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies) {
@@ -79,6 +145,11 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return configured && configured.length > 0 ? configured : join(deps.homeDir, '.codex')
   }
 
+  function codexMultiAuthDir(): string {
+    const configured = deps.env.CODEX_MULTI_AUTH_DIR
+    return configured && configured.length > 0 ? configured : join(codexHome(), 'multi-auth')
+  }
+
   async function capture(input: { provider: AiCredentialProvider }) {
     const selected = provider(input?.provider)
     return serialize(() => withSafeErrors(`${selected.toUpperCase()}_CAPTURE_FAILED`, async () => {
@@ -87,8 +158,17 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         const result = await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
         payload = result.stdout
       } else {
+        await assertPinnedCodexMultiAuthInstalled()
         try {
-          payload = await deps.readFile(join(codexHome(), 'auth.json'))
+          const accounts = JSON.parse(await deps.readFile(join(codexMultiAuthDir(), 'openai-codex-accounts.json')))
+          const settings = JSON.parse(await deps.readFile(join(codexMultiAuthDir(), 'settings.json')))
+          payload = JSON.stringify({
+            version: 1,
+            kind: 'codex-multi-auth',
+            packageVersion: CODEX_MULTI_AUTH_VERSION,
+            accounts,
+            settings,
+          })
         } catch {
           throw new AiCredentialRuntimeError('CODEX_FILE_STORE_REQUIRED')
         }
@@ -145,6 +225,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   async function applyCodex(payload: string) {
+    const bundle = parseCodexMultiAuthBundle(payload)
+    if (bundle) return applyCodexMultiAuth(bundle)
     const home = codexHome()
     const authPath = join(home, 'auth.json')
     const backupPath = join(home, 'auth.json.happy-backup')
@@ -222,6 +304,107 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return { provider: 'codex' as const, configured: true, status: 'authenticated' as const }
   }
 
+  async function ensureCodexMultiAuth(): Promise<void> {
+    const installed = await hasPinnedCodexMultiAuthInstalled()
+    if (!installed) {
+      await deps.execFile('npm', [
+        'install', '--global', `codex-multi-auth@${CODEX_MULTI_AUTH_VERSION}`,
+      ], { timeoutMs: 300_000 })
+      if (!await hasPinnedCodexMultiAuthInstalled()) {
+        throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_VERSION_MISMATCH')
+      }
+    }
+    await deps.execFile('codex', ['--version'])
+  }
+
+  async function assertPinnedCodexMultiAuthInstalled(): Promise<void> {
+    if (!await hasPinnedCodexMultiAuthInstalled()) {
+      throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_VERSION_MISMATCH')
+    }
+  }
+
+  async function hasPinnedCodexMultiAuthInstalled(): Promise<boolean> {
+    try {
+      const version = await deps.execFile('codex-multi-auth', ['--version'])
+      return version.stdout.trim() === CODEX_MULTI_AUTH_VERSION
+        && await hasPinnedGlobalCodexMultiAuthPackage()
+    } catch {
+      return false
+    }
+  }
+
+  async function hasPinnedGlobalCodexMultiAuthPackage(): Promise<boolean> {
+    try {
+      const root = nonEmptyTrimmed((await deps.execFile('npm', ['root', '--global'])).stdout)
+      if (!root) return false
+      const packageJson = JSON.parse(await deps.readFile(join(
+        root,
+        'codex-multi-auth',
+        'package.json',
+      ))) as unknown
+      return isObject(packageJson) && packageJson.version === CODEX_MULTI_AUTH_VERSION
+    } catch {
+      return false
+    }
+  }
+
+  async function applyCodexMultiAuth(bundle: CodexMultiAuthBundle) {
+    await ensureCodexMultiAuth()
+    const root = codexMultiAuthDir()
+    await deps.mkdir(root, { recursive: true, mode: 0o700 })
+    await deps.chmod(root, 0o700)
+    const settings = enforceCodexRotationSettings(bundle.settings)
+    const accountsPath = join(root, 'openai-codex-accounts.json')
+    const settingsPath = join(root, 'settings.json')
+    const applied = await replaceCodexMultiAuthFiles(deps, [
+      { path: accountsPath, content: JSON.stringify(bundle.accounts) },
+      { path: settingsPath, content: JSON.stringify(settings) },
+    ], async () => {
+      await deps.execFile('codex-multi-auth', ['forecast', '--live', '--json'], {
+        maxOutputBytes: MAX_PAYLOAD_BYTES,
+        timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+      })
+      const currentBundle = parseCodexMultiAuthBundle(JSON.stringify({
+        ...bundle,
+        accounts: JSON.parse(await deps.readFile(accountsPath)),
+      }))
+      if (!currentBundle
+        || currentBundle.accounts.accounts.length !== bundle.accounts.accounts.length) {
+        throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
+      }
+      const quotaCache = await readCodexQuotaCache(deps, root)
+      const selection = selectLeastRemainingCodexAccounts(
+        currentBundle.accounts.accounts,
+        quotaCache,
+        CODEX_MULTI_AUTH_THRESHOLD,
+      )
+      const orderedAccounts = selection.orderedIndexes
+        .map((index) => currentBundle.accounts.accounts[index]!)
+      const sorted = {
+        ...currentBundle.accounts,
+        accounts: orderedAccounts,
+        activeIndex: selection.activeIndex,
+        activeIndexByFamily: resetActiveIndexes(currentBundle.accounts.activeIndexByFamily),
+        pinnedAccountIndex: undefined,
+      }
+      await writeAtomicFile(deps, accountsPath, JSON.stringify(sorted))
+      await deps.execFile('codex-multi-auth', ['check'], {
+        maxOutputBytes: MAX_PAYLOAD_BYTES,
+        timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+      })
+      return { selection, accountCount: currentBundle.accounts.accounts.length }
+    })
+    return {
+      provider: 'codex' as const,
+      configured: true,
+      accountCount: applied.accountCount,
+      rotation: codexRotationStatus(
+        applied.selection.quotaKnown,
+        applied.selection.hasReadyAccount,
+      ),
+    }
+  }
+
   async function apply(input: { provider: AiCredentialProvider; payload: string }) {
     const selected = provider(input?.provider)
     if (typeof input?.payload !== 'string') {
@@ -241,8 +424,50 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     const selected = provider(input?.provider)
     return serialize(() => withSafeErrors(`${selected.toUpperCase()}_STATUS_FAILED`, async () => {
       if (selected === 'codex') {
-        await deps.execFile('codex', ['login', 'status'])
-        return { provider: selected, configured: true, status: 'authenticated' as const }
+        const root = codexMultiAuthDir()
+        const bundle = parseCodexMultiAuthBundle(JSON.stringify({
+          version: 1,
+          kind: 'codex-multi-auth',
+          packageVersion: CODEX_MULTI_AUTH_VERSION,
+          accounts: JSON.parse(await deps.readFile(join(root, 'openai-codex-accounts.json'))),
+          settings: JSON.parse(await deps.readFile(join(root, 'settings.json'))),
+        }))
+        if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
+        await assertPinnedCodexMultiAuthInstalled()
+        await deps.execFile('codex-multi-auth', ['check'], {
+          maxOutputBytes: MAX_PAYLOAD_BYTES,
+          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+        })
+        const quotaCache = await readCodexQuotaCache(deps, root)
+        const selection = selectLeastRemainingCodexAccounts(
+          bundle.accounts.accounts,
+          quotaCache,
+          CODEX_MULTI_AUTH_THRESHOLD,
+        )
+        const activeAccount = bundle.accounts.accounts[bundle.accounts.activeIndex]
+        const activeRoutes = (deps.codexProxyStatus ?? getCodexMultiAuthProxyStatus)().activeRoutes
+        const settingsValid = isManagedCodexRotationSettings(bundle.settings)
+        const state = !settingsValid
+          ? 'blocked' as const
+          : !selection.quotaKnown
+            ? 'quota-unknown' as const
+            : !selection.hasReadyAccount
+              ? 'blocked' as const
+              : activeRoutes > 0
+                ? 'running' as const
+                : 'not-routed' as const
+        return {
+          provider: selected,
+          configured: true,
+          accountCount: bundle.accounts.accounts.length,
+          ...(typeof activeAccount?.email === 'string'
+            ? { activeAccount: maskEmail(activeAccount.email) }
+            : {}),
+          rotation: {
+            ...codexRotationStatus(selection.quotaKnown, selection.hasReadyAccount),
+            state,
+          },
+        }
       }
       const result = await deps.execFile('cswap', ['list', '--json'], {
         maxOutputBytes: MAX_PAYLOAD_BYTES,
@@ -307,6 +532,201 @@ function parseClaudeList(stdout: string): { configured: boolean; activeAccount: 
   }
 }
 
+type CodexMultiAuthAccount = CodexAccountIdentity & {
+  refreshToken: string
+  addedAt: number
+  lastUsed: number
+  [key: string]: unknown
+}
+
+type CodexMultiAuthBundle = {
+  version: 1
+  kind: 'codex-multi-auth'
+  packageVersion: typeof CODEX_MULTI_AUTH_VERSION
+  accounts: {
+    version: 3
+    accounts: CodexMultiAuthAccount[]
+    activeIndex: number
+    activeIndexByFamily?: Record<string, number | undefined>
+    pinnedAccountIndex?: number
+    [key: string]: unknown
+  }
+  settings: {
+    version: 1
+    pluginConfig: Record<string, unknown>
+    [key: string]: unknown
+  }
+}
+
+function parseCodexMultiAuthBundle(payload: string): CodexMultiAuthBundle | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(payload)
+  } catch {
+    return null
+  }
+  if (!isObject(parsed) || parsed.kind !== 'codex-multi-auth') return null
+  if (parsed.version !== 1
+    || parsed.packageVersion !== CODEX_MULTI_AUTH_VERSION
+    || !isObject(parsed.accounts)
+    || parsed.accounts.version !== 3
+    || !Array.isArray(parsed.accounts.accounts)
+    || parsed.accounts.accounts.length === 0
+    || !Number.isInteger(parsed.accounts.activeIndex)
+    || Number(parsed.accounts.activeIndex) < 0
+    || Number(parsed.accounts.activeIndex) >= parsed.accounts.accounts.length
+    || !isObject(parsed.settings)
+    || parsed.settings.version !== 1
+    || !isObject(parsed.settings.pluginConfig)) {
+    throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
+  }
+  const identities = new Set<string>()
+  for (const account of parsed.accounts.accounts) {
+    if (!isObject(account)
+      || typeof account.refreshToken !== 'string'
+      || !nonEmptyTrimmed(account.refreshToken)
+      || typeof account.addedAt !== 'number'
+      || !Number.isFinite(account.addedAt)
+      || typeof account.lastUsed !== 'number'
+      || !Number.isFinite(account.lastUsed)) {
+      throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
+    }
+    const accountId = typeof account.accountId === 'string'
+      ? nonEmptyTrimmed(account.accountId)
+      : null
+    const email = typeof account.email === 'string'
+      ? nonEmptyTrimmed(account.email)?.toLowerCase() ?? null
+      : null
+    const identity = accountId
+      ? `id:${accountId}`
+      : email
+        ? `email:${email}`
+        : `refresh:${account.refreshToken.trim()}`
+    if (identities.has(identity)) {
+      throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
+    }
+    identities.add(identity)
+  }
+  return parsed as CodexMultiAuthBundle
+}
+
+function enforceCodexRotationSettings(
+  settings: CodexMultiAuthBundle['settings'],
+): CodexMultiAuthBundle['settings'] {
+  return {
+    ...settings,
+    pluginConfig: {
+      ...settings.pluginConfig,
+      codexRuntimeRotationProxy: true,
+      schedulingStrategy: 'sequential',
+      preemptiveQuotaEnabled: true,
+      preemptiveQuotaRemainingPercent5h: CODEX_MULTI_AUTH_THRESHOLD,
+      preemptiveQuotaRemainingPercent7d: CODEX_MULTI_AUTH_THRESHOLD,
+      routingMutex: 'enabled',
+      sessionAffinity: false,
+      pidOffsetEnabled: false,
+    },
+  }
+}
+
+function resetActiveIndexes(
+  indexes: Record<string, number | undefined> | undefined,
+): Record<string, number> | undefined {
+  if (!indexes) return undefined
+  return Object.fromEntries(Object.keys(indexes).map((family) => [family, 0]))
+}
+
+function codexRotationStatus(quotaKnown: boolean, hasReadyAccount: boolean) {
+  return {
+    state: !quotaKnown
+      ? 'quota-unknown' as const
+      : hasReadyAccount
+        ? 'running' as const
+        : 'blocked' as const,
+    lastErrorKind: null,
+    strategy: 'sequential' as const,
+    threshold5h: CODEX_MULTI_AUTH_THRESHOLD,
+    threshold7d: CODEX_MULTI_AUTH_THRESHOLD,
+  }
+}
+
+async function readCodexQuotaCache(
+  deps: AiCredentialRuntimeDependencies,
+  root: string,
+): Promise<CodexQuotaCache> {
+  try {
+    const parsed = JSON.parse(await deps.readFile(join(root, 'quota-cache.json'))) as unknown
+    return isObject(parsed) && parsed.version === 1 ? parsed as CodexQuotaCache : {}
+  } catch {
+    return {}
+  }
+}
+
+type ManagedCodexFile = { path: string; content: string }
+
+async function replaceCodexMultiAuthFiles<T>(
+  deps: AiCredentialRuntimeDependencies,
+  files: ManagedCodexFile[],
+  verify: () => Promise<T>,
+): Promise<T> {
+  const backups = new Set<string>()
+  const installed = new Set<string>()
+  let verified = false
+  try {
+    for (const file of files) {
+      const backup = `${file.path}.happy-backup`
+      try {
+        await deps.rename(file.path, backup)
+        backups.add(file.path)
+        await deps.chmod(backup, 0o600)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+    }
+    for (const file of files) {
+      installed.add(file.path)
+      await writeAtomicFile(deps, file.path, file.content)
+    }
+    const result = await verify()
+    verified = true
+    for (const path of backups) await deps.rm(`${path}.happy-backup`, { force: true })
+    return result
+  } catch (error) {
+    if (verified) {
+      throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_BACKUP_CLEANUP_FAILED')
+    }
+    for (const file of files) {
+      await deps.rm(`${file.path}.happy-tmp`, { force: true }).catch(() => undefined)
+      await deps.rm(`${file.path}.happy-sort-tmp`, { force: true }).catch(() => undefined)
+      if (installed.has(file.path)) {
+        await deps.rm(file.path, { force: true }).catch(() => undefined)
+      }
+    }
+    for (const path of backups) {
+      try {
+        await deps.rename(`${path}.happy-backup`, path)
+        await deps.chmod(path, 0o600)
+      } catch {
+        throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_ROLLBACK_FAILED')
+      }
+    }
+    if (error instanceof AiCredentialRuntimeError) throw error
+    throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_APPLY_FAILED')
+  }
+}
+
+async function writeAtomicFile(
+  deps: AiCredentialRuntimeDependencies,
+  path: string,
+  content: string,
+): Promise<void> {
+  const tempPath = `${path}.happy-tmp`
+  await deps.writeFile(tempPath, content, { mode: 0o600 })
+  await deps.chmod(tempPath, 0o600)
+  await deps.rename(tempPath, path)
+  await deps.chmod(path, 0o600)
+}
+
 async function withSafeErrors<T>(kind: string, operation: () => Promise<T>): Promise<T> {
   try {
     return await operation()
@@ -318,6 +738,19 @@ async function withSafeErrors<T>(kind: string, operation: () => Promise<T>): Pro
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function nonEmptyTrimmed(value: string): string | null {
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+function countNonNull(values: Array<string | null>): Map<string, number> {
+  const counts = new Map<string, number>()
+  for (const value of values) {
+    if (value) counts.set(value, (counts.get(value) ?? 0) + 1)
+  }
+  return counts
 }
 
 function maskEmail(email: string): string {

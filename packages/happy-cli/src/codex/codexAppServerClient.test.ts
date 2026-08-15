@@ -8,12 +8,16 @@ const {
     mockWrapForMcpTransport,
     mockSandboxCleanup,
     mockSpawn,
+    mockPrepareCodexMultiAuthProxy,
+    mockProxyCleanup,
 } = vi.hoisted(() => ({
     mockExecSync: vi.fn(),
     mockInitializeSandbox: vi.fn(),
     mockWrapForMcpTransport: vi.fn(),
     mockSandboxCleanup: vi.fn(),
     mockSpawn: vi.fn(),
+    mockPrepareCodexMultiAuthProxy: vi.fn(),
+    mockProxyCleanup: vi.fn(),
 }));
 
 vi.mock('node:child_process', () => ({
@@ -36,6 +40,10 @@ vi.mock('@/ui/logger', () => ({
         info: vi.fn(),
         warn: vi.fn(),
     },
+}));
+
+vi.mock('./codexMultiAuthProxy', () => ({
+    prepareCodexMultiAuthProxy: mockPrepareCodexMultiAuthProxy,
 }));
 
 vi.mock('../package.json', () => ({
@@ -122,6 +130,8 @@ describe('CodexAppServerClient sandbox integration', () => {
         mockExecSync.mockReturnValue('codex-cli 0.107.0');
         mockInitializeSandbox.mockResolvedValue(mockSandboxCleanup);
         mockWrapForMcpTransport.mockResolvedValue({ command: 'sh', args: ['-c', 'wrapped codex app-server'] });
+        mockPrepareCodexMultiAuthProxy.mockResolvedValue(null);
+        mockProxyCleanup.mockResolvedValue(undefined);
         mockSpawn.mockImplementation(() => createMockProcess());
     });
 
@@ -308,6 +318,63 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(client.sandboxEnabled).toBe(false);
 
         await client.disconnect();
+    });
+
+    it('routes managed Codex sessions through multi-auth and closes the proxy on disconnect', async () => {
+        mockPrepareCodexMultiAuthProxy.mockResolvedValue({
+            args: ['-c', 'model_provider="codex-multi-auth-runtime-proxy"'],
+            env: { PATH: '/usr/bin', OPENAI_API_KEY: 'local-client-key' },
+            cleanup: mockProxyCleanup,
+        });
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+
+        await client.connect();
+
+        expect(mockSpawn).toHaveBeenCalledWith(
+            'codex',
+            ['app-server', '--listen', 'stdio://', '-c', 'model_provider="codex-multi-auth-runtime-proxy"'],
+            expect.objectContaining({
+                env: expect.objectContaining({ OPENAI_API_KEY: 'local-client-key' }),
+            }),
+        );
+        await client.disconnect();
+        expect(mockProxyCleanup).toHaveBeenCalledOnce();
+    });
+
+    it('closes the multi-auth proxy when the Codex process exits unexpectedly', async () => {
+        const proc = createMockProcess();
+        mockSpawn.mockImplementation(() => proc);
+        mockPrepareCodexMultiAuthProxy.mockResolvedValue({
+            args: [],
+            env: { PATH: '/usr/bin', OPENAI_API_KEY: 'local-client-key' },
+            cleanup: mockProxyCleanup,
+        });
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+
+        await client.connect();
+        proc.emit('exit', 1, null);
+
+        await waitFor(() => mockProxyCleanup.mock.calls.length === 1);
+        await client.disconnect();
+        expect(mockProxyCleanup).toHaveBeenCalledOnce();
+    });
+
+    it('closes the multi-auth proxy when spawning Codex throws synchronously', async () => {
+        mockSpawn.mockImplementation(() => {
+            throw new Error('spawn failed');
+        });
+        mockPrepareCodexMultiAuthProxy.mockResolvedValue({
+            args: [],
+            env: { PATH: '/usr/bin', OPENAI_API_KEY: 'local-client-key' },
+            cleanup: mockProxyCleanup,
+        });
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+
+        await expect(client.connect()).rejects.toThrow('spawn failed');
+        expect(mockProxyCleanup).toHaveBeenCalledOnce();
     });
 
     it('resets sandbox on disconnect', async () => {
