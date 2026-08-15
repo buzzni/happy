@@ -62,6 +62,8 @@ import {
     VIEWER_WEB_PORTS,
     decideViewerBrowserAction,
     decideViewerStackAction,
+    summariseViewerBrowser,
+    type ViewerBrowserSummary,
     detectMissingViewerTools,
     isViewerServing,
     planViewerInstall,
@@ -1029,7 +1031,7 @@ export class ApiMachineClient {
      * option, so "launch Chrome under the viewer" never spins up a second,
      * disconnected Xvfb (specs/browser-remote-login/).
      */
-    private async startViewerStack(): Promise<{ display: string; vncPort: number | null; webPort: number; ready: boolean; reused: boolean }> {
+    private async startViewerStack(): Promise<{ display: string; vncPort: number | null; webPort: number; ready: boolean; reused: boolean } & ViewerBrowserSummary> {
         const missing = await detectMissingViewerTools();
         if (missing.length > 0) {
             throw new Error(`원격 화면에 필요한 프로그램이 없습니다: ${missing.join(', ')}`);
@@ -1046,16 +1048,16 @@ export class ApiMachineClient {
             adoptable: cachedAlive ? null : await findRunningViewer(),
         });
         if (decision.action === 'reuse' && this.viewer) {
-            await this.ensureViewerBrowser(this.viewer.display);
-            return { ...this.viewer, ready: true, reused: true };
+            const browser = await this.ensureViewerBrowser(this.viewer.display);
+            return { ...this.viewer, ready: true, reused: true, ...browser };
         }
         if (decision.action === 'adopt') {
             // Left behind by a previous daemon. Re-registering it beats
             // spawning a duplicate that leaks ports until none are left.
             const adopted = { display: ':99', vncPort: null, webPort: decision.webPort };
             this.viewer = adopted;
-            await this.ensureViewerBrowser(adopted.display);
-            return { ...adopted, ready: true, reused: true };
+            const browser = await this.ensureViewerBrowser(adopted.display);
+            return { ...adopted, ready: true, reused: true, ...browser };
         }
         this.viewer = null;
 
@@ -1074,8 +1076,8 @@ export class ApiMachineClient {
         }));
         const ready = await waitForPort(webPort, 15_000);
         this.viewer = { display, vncPort, webPort };
-        await this.ensureViewerBrowser(display);
-        return { display, vncPort, webPort, ready, reused: false };
+        const browser = await this.ensureViewerBrowser(display);
+        return { display, vncPort, webPort, ready, reused: false, ...browser };
     }
 
     /**
@@ -1087,28 +1089,37 @@ export class ApiMachineClient {
      * daemon is adopted instead of a second Chrome being stacked onto the
      * same display, one per click.
      */
-    private async ensureViewerBrowser(display: string): Promise<void> {
+    private async ensureViewerBrowser(display: string): Promise<ViewerBrowserSummary> {
         const chrome = await detectChrome();
-        if (!chrome) return; // Chrome 미설치는 별도 버튼이 안내한다.
+        // Reported, never swallowed: a viewer with no Chrome serves a healthy
+        // connection to an empty display, which reads as an unexplained black
+        // screen (dev, 2026-08-15).
+        if (!chrome) return summariseViewerBrowser({ chromeInstalled: false, cdpPort: null });
+
         let liveCdpPort: number | null = null;
         for (const port of CDP_PORT_RANGE) {
             if (await isCdpReachable(port)) { liveCdpPort = port; break; }
         }
-        if (decideViewerBrowserAction({ liveCdpPort }).action === 'reuse') return;
+        const decision = decideViewerBrowserAction({ liveCdpPort });
+        if (decision.action === 'reuse') {
+            return summariseViewerBrowser({ chromeInstalled: true, cdpPort: decision.cdpPort });
+        }
 
         const cdpPort = await pickFreeCdpPort();
-        if (cdpPort === null) return;
+        if (cdpPort === null) return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
         const userDataDir = resolveProfileUserDataDir(
             join(configuration.happyHomeDir, 'chrome-profiles'),
             'default',
         );
         const env = { DISPLAY: display };
         launchChrome(chrome.path, { userDataDir, cdpPort, headless: false }, env);
-        if (!(await waitForCdp(cdpPort, 15_000))) {
+        let up = await waitForCdp(cdpPort, 15_000);
+        if (!up) {
             // Same kernel/namespace fallback the launch RPC uses.
             launchChrome(chrome.path, { userDataDir, cdpPort, headless: false, noSandbox: true }, env);
-            await waitForCdp(cdpPort, 15_000);
+            up = await waitForCdp(cdpPort, 15_000);
         }
+        return summariseViewerBrowser({ chromeInstalled: true, cdpPort: up ? cdpPort : null });
     }
 
     private requestServerAutomationSync(): void {
