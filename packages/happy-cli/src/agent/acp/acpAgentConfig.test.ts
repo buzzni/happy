@@ -40,12 +40,7 @@ describe('KNOWN_ACP_AGENTS', () => {
     expect(KNOWN_ACP_AGENTS).toEqual({
       gemini: { command: 'gemini', args: ['--experimental-acp'] },
       opencode: { command: 'opencode', args: ['acp'] },
-      grok: {
-        command: 'grok',
-        args: ['agent'],
-        trailingArgs: ['stdio'],
-        bypassPermissionsArgs: ['--always-approve'],
-      },
+      grok: { command: 'grok', args: ['agent'], trailingArgs: ['stdio'] },
     });
   });
 });
@@ -86,25 +81,23 @@ describe('resolveAcpAgentConfig', () => {
     });
   });
 
-  // Happy strips its own `--dangerously-skip-permissions`, so without a mapping
-  // the user asks for bypass and grok silently keeps prompting for every tool.
-  it('translates happy permission bypass into the grok auto-approve flag', () => {
+  // The daemon appends `--dangerously-skip-permissions` to EVERY remote spawn
+  // that has no explicit permission mode, so translating it into grok's
+  // `--always-approve` would auto-approve every app-started session and bypass
+  // happy's own ACP approval prompt. ACP agents approve in the app instead.
+  it('never turns happy permission flags into grok auto-approve', () => {
     expect(resolveAcpAgentConfig(['grok', '--dangerously-skip-permissions'])).toEqual({
       agentName: 'grok',
       command: 'grok',
-      args: ['agent', '--always-approve', 'stdio'],
+      args: ['agent', 'stdio'],
     });
   });
 
-  it('does not auto-approve grok when bypass was not requested', () => {
-    expect(resolveAcpAgentConfig(['grok']).args).not.toContain('--always-approve');
-  });
-
-  it('leaves agents without a bypass mapping untouched', () => {
-    expect(resolveAcpAgentConfig(['gemini', '--dangerously-skip-permissions'])).toEqual({
-      agentName: 'gemini',
-      command: 'gemini',
-      args: ['--experimental-acp'],
+  it('still forwards an explicit grok auto-approve flag', () => {
+    expect(resolveAcpAgentConfig(['grok', '--always-approve'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', '--always-approve', 'stdio'],
     });
   });
 
