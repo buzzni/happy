@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
+  resolveInheritedSpawnEnvironment,
   resolveRegularSpawnAgentArgs,
-  resolveReadOnlyAgentAuthEnvironment,
+  resolveAgentAuthEnvironment,
   resolveTmuxSpawnAgentCommand,
   shouldFilterSpawnCredentials,
 } from './spawnAgentCommand'
@@ -21,7 +22,7 @@ describe('spawnAgentCommand', () => {
   })
 
   it('carries the xAI api key when grok runs read-only', () => {
-    expect(resolveReadOnlyAgentAuthEnvironment('grok', { XAI_API_KEY: 'xai', OPENAI_API_KEY: 'codex' }))
+    expect(resolveAgentAuthEnvironment('grok', { XAI_API_KEY: 'xai', OPENAI_API_KEY: 'codex' }))
       .toEqual({ XAI_API_KEY: 'xai' })
   })
 
@@ -40,6 +41,7 @@ describe('spawnAgentCommand', () => {
   it.each([
     [{ sandboxEnabled: true }, true],
     [{ sandboxEnabled: false, permissionMode: 'read-only' as const }, true],
+    [{ sandboxEnabled: false, isolatedAutomation: true }, true],
     [{ sandboxEnabled: false }, false],
   ])('filters inherited credentials when spawn isolation requires it', (input, expected) => {
     expect(shouldFilterSpawnCredentials(input)).toBe(expected)
@@ -49,7 +51,24 @@ describe('spawnAgentCommand', () => {
     ['claude' as const, { ANTHROPIC_API_KEY: 'claude', OPENAI_API_KEY: 'codex' }, { ANTHROPIC_API_KEY: 'claude' }],
     ['codex' as const, { OPENAI_API_KEY: 'codex', GH_TOKEN: 'github' }, { OPENAI_API_KEY: 'codex' }],
     ['gemini' as const, { GEMINI_API_KEY: 'gemini', AWS_ACCESS_KEY_ID: 'aws' }, { GEMINI_API_KEY: 'gemini' }],
-  ])('retains only the selected read-only agent authentication', (agent, env, expected) => {
-    expect(resolveReadOnlyAgentAuthEnvironment(agent, env)).toEqual(expected)
+  ])('retains only the selected agent authentication', (agent, env, expected) => {
+    expect(resolveAgentAuthEnvironment(agent, env)).toEqual(expected)
+  })
+
+  it('filters daemon credentials while restoring only the selected agent authentication', () => {
+    expect(resolveInheritedSpawnEnvironment({
+      agent: 'claude',
+      filterCredentials: true,
+      env: {
+        PATH: '/bin',
+        ANTHROPIC_API_KEY: 'claude-auth',
+        OPENAI_API_KEY: 'other-agent-auth',
+        GH_TOKEN: 'unscoped-github-token',
+        DATABASE_URL: 'production-database',
+      },
+    })).toEqual({
+      PATH: '/bin',
+      ANTHROPIC_API_KEY: 'claude-auth',
+    })
   })
 })

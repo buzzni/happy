@@ -115,6 +115,7 @@ async function startRemoteRunClaudeHarness(opts: {
     metadata?: Record<string, unknown>;
     updateAgentState?: ReturnType<typeof vi.fn>;
     registerHandler?: ReturnType<typeof vi.fn>;
+    runOptions?: Partial<Parameters<typeof runClaude>[1]>;
 } = {}) {
     let metadata = opts.metadata ?? {
         claudeSessionId: 'claude-session-1',
@@ -175,6 +176,7 @@ async function startRemoteRunClaudeHarness(opts: {
     } as any, {
         startingMode: 'remote',
         shouldStartDaemon: false,
+        ...opts.runOptions,
     });
 
     await vi.waitFor(() => {
@@ -261,6 +263,7 @@ describe('runClaude remote JSONL scanner', () => {
         delete process.env.HAPPY_INITIAL_PROMPT;
         delete process.env.HAPPY_AUTOMATION_RUN_ONCE;
         delete process.env.HAPPY_AUTOMATION_RESUME_PROMPT;
+        delete process.env.HAPPY_PROJECT_SANDBOX_CONFIG;
 
         mockReadSettings.mockResolvedValue({
             machineId: 'machine-1',
@@ -425,6 +428,36 @@ describe('runClaude remote JSONL scanner', () => {
         expect(harness.loopOptions.exitAfterFirstTurn).toBe(true);
         expect(process.env.HAPPY_AUTOMATION_RUN_ONCE).toBeUndefined();
 
+        await harness.finish();
+    });
+
+    it('keeps read-only tool restrictions when a remote message resets disallowed tools', async () => {
+        process.env.HAPPY_PROJECT_SANDBOX_CONFIG = JSON.stringify({
+            enabled: true,
+            sessionIsolation: 'custom',
+            customWritePaths: [],
+            allowLocalBinding: false,
+        });
+        const harness = await startRemoteRunClaudeHarness({
+            runOptions: { permissionMode: 'read-only' },
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'review the change' },
+            meta: { disallowedTools: null },
+        });
+
+        expect(harness.loopOptions.messageQueue.queue[0].mode).toMatchObject({
+            permissionMode: 'bypassPermissions',
+            disallowedTools: [
+                'Edit',
+                'MultiEdit',
+                'Write',
+                'NotebookEdit',
+                'mcp__happy__bash_stream',
+            ],
+        });
         await harness.finish();
     });
 

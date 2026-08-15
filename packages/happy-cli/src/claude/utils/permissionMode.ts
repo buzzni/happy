@@ -114,6 +114,19 @@ export function resolveInitialClaudeDisallowedTools(
     return ['Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'mcp__happy__bash_stream'];
 }
 
+/**
+ * Remote clients may reset or replace disallowed tools on each message. Keep
+ * daemon-enforced restrictions in the effective list so an unattended
+ * read-only session cannot reopen wrapper tools that run outside the sandbox.
+ */
+export function resolveRemoteClaudeDisallowedTools(
+    incoming: string[] | undefined,
+    required: string[] | undefined,
+): string[] | undefined {
+    if (!required?.length) return incoming;
+    return [...new Set([...(incoming ?? []), ...required])];
+}
+
 function isClaudeBypassEquivalent(mode: PermissionMode | undefined): boolean {
     return mode === 'bypassPermissions' || mode === 'yolo';
 }

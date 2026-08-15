@@ -1,15 +1,17 @@
 import type { SpawnSessionOptions } from '@/modules/common/registerCommonHandlers'
+import { filterCredentialsFromEnv } from '@/sandbox/config'
 
 type SpawnAgent = SpawnSessionOptions['agent']
 
 export function shouldFilterSpawnCredentials(input: {
   sandboxEnabled: boolean
   permissionMode?: SpawnSessionOptions['permissionMode']
+  isolatedAutomation?: boolean
 }): boolean {
-  return input.sandboxEnabled || input.permissionMode === 'read-only'
+  return input.sandboxEnabled || input.permissionMode === 'read-only' || input.isolatedAutomation === true
 }
 
-export function resolveReadOnlyAgentAuthEnvironment(
+export function resolveAgentAuthEnvironment(
   agent: SpawnAgent,
   env: NodeJS.ProcessEnv,
 ): Record<string, string> {
@@ -32,6 +34,22 @@ export function resolveReadOnlyAgentAuthEnvironment(
   return Object.fromEntries(
     keys.flatMap((key) => env[key] === undefined ? [] : [[key, env[key]]]),
   ) as Record<string, string>
+}
+
+export function resolveInheritedSpawnEnvironment(input: {
+  agent: SpawnAgent
+  env: NodeJS.ProcessEnv
+  filterCredentials: boolean
+}): Record<string, string> {
+  if (!input.filterCredentials) {
+    return Object.fromEntries(
+      Object.entries(input.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+    )
+  }
+  return {
+    ...filterCredentialsFromEnv(input.env),
+    ...resolveAgentAuthEnvironment(input.agent, input.env),
+  }
 }
 
 export function resolveTmuxSpawnAgentCommand(agent: SpawnAgent): string | undefined {

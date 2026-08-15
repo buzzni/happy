@@ -491,6 +491,7 @@ describe('runServerAutomationTick', () => {
     expect(spawned.initialPrompt).toContain('Retry network failures and 5xx responses')
     expect(spawned.initialPrompt).not.toContain('claim-secret')
     expect(spawned.initialPrompt).not.toContain('complete-secret')
+    expect(spawned.filterInheritedCredentials).toBe(true)
     expect(resolveMcpSpawnContext).not.toHaveBeenCalled()
     expect(spawned).not.toHaveProperty('mcpSpawnContext')
     expect(spawned.environmentVariables).toMatchObject({
@@ -745,6 +746,7 @@ describe('runServerAutomationTick', () => {
       await runServerAutomationTick(input)
       const spawned = spawnSession.mock.calls[0]![0]
       const spawnedEnvironment = spawned.environmentVariables!
+      expect(spawned.filterInheritedCredentials).toBe(true)
       expect(spawnedEnvironment).toEqual(expect.objectContaining({
         APLUS_AGENT_TASK_ID: 'read-only-1',
       }))
