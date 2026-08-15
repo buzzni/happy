@@ -51,3 +51,20 @@
   resume 불가이며, 앱은 이제 recover 로 새 대화를 이어가거나 실패를 알린다.
 - daemon 배포 전까지는 같은 증상이 재발할 수 있다. `vendor/happy` pointer 갱신은
   CLAUDE.md 1.8 의 릴리스 절차(tag → CI publish)를 따를 것.
+
+## 2026-08-15 — 셀프 리뷰 후 수정 (2차)
+
+- **[버그] 실패 시 메시지 유실**: handleSend 가 composer 를 먼저 비우고
+  performSend 를 불러서, resume/recover 실패 시 사용자가 입력한 텍스트가
+  통째로 사라졌다 (composer 에 setMessage 복원 API 없음). useSessionSend 가
+  consumed boolean 을 반환하고 SessionView 는 성공 시에만 clear 하도록 수정.
+- **[누락] 전송 연타 가드**: composer 가 ladder 진행 중(수 초) 유지되므로
+  연타 시 동일 텍스트로 ladder 가 중복 실행될 수 있었다. in-flight ref 추가.
+- **[관행] sendFailedNoRunningAgent 번역**: 다른 신규 키들은 전 로케일 번역이
+  있는데 이 키만 영어였다. 9개 로케일 번역 채움.
+- 확인만 하고 수정 불필요: daemon.state.json 은 필드를 명시적으로 골라
+  저장하므로 하이드레이션된 encryption 이 새지 않는다. 훅 자체의 renderHook
+  테스트는 이 저장소 관행(훅 파일의 exported 순수 함수만 테스트)에 없어
+  추가하지 않았다.
+- 알려진 한계(주석으로 명시): recover 는 텍스트만 전달하므로 prompt-delivered
+  경로에서 attachments 는 새 세션으로 전달되지 않는다.

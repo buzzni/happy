@@ -311,7 +311,7 @@ export const pt: TranslationStructure = {
         forkClaudeOnly: 'A bifurcação atualmente só é suportada para sessões Claude.',
         directoryApprovalRequired: 'Esta sessão não pode ser retomada porque requer aprovação de diretório. Inicie-a manualmente de seu local original.',
         failedToDeliverInitialPrompt: 'A recuperação da sessão foi iniciada, mas não foi possível entregar sua mensagem. Tente novamente.',
-        sendFailedNoRunningAgent: 'No agent is running for this session, so your message was not delivered.',
+        sendFailedNoRunningAgent: 'Nenhum agente está em execução para esta sessão, então sua mensagem não foi entregue.',
         sessionRecoveredInNewConversation: 'Sessão recuperada em uma nova conversa. Sua mensagem foi entregue.',
     },
 

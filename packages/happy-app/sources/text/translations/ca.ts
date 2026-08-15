@@ -312,7 +312,7 @@ export const ca: TranslationStructure = {
         forkClaudeOnly: 'La bifurcació només està disponible per a sessions de Claude.',
         directoryApprovalRequired: 'No es pot reprendre aquesta sessió perquè requereix aprovació de directori. Inicia-la manualment des de la seva ubicació original.',
         failedToDeliverInitialPrompt: 'La recuperació de la sessió s\'ha iniciat però no s\'ha pogut entregar el teu missatge. Prova de nou.',
-        sendFailedNoRunningAgent: 'No agent is running for this session, so your message was not delivered.',
+        sendFailedNoRunningAgent: 'Cap agent no s\'està executant per a aquesta sessió, així que el teu missatge no s\'ha entregat.',
         sessionRecoveredInNewConversation: 'Sessió recuperada en una nova conversa. El teu missatge s\'ha entregat.',
     },
 

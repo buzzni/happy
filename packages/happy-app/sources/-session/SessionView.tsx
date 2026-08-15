@@ -548,11 +548,18 @@ function SessionViewLoaded({ sessionId, session }: { sessionId: string, session:
         const liveMessage = composerHandleRef.current?.getMessage() ?? '';
         if (liveMessage.trim() || (expImageUpload && selectedImages.length > 0)) {
             const attachments = expImageUpload ? selectedImages : undefined;
-            composerHandleRef.current?.clearMessage();
-            if (expImageUpload) clearImages();
-            void performSend(liveMessage, { source: 'chat', attachments });
+            // The composer only clears once the message is actually consumed —
+            // sent, or handed to a recovered session. Clearing up front would
+            // destroy the user's text on every recovery failure, since the
+            // composer has no way to restore it.
+            void performSend(liveMessage, { source: 'chat', attachments }).then((consumed) => {
+                if (consumed) {
+                    composerHandleRef.current?.clearMessage();
+                    if (expImageUpload) clearImages();
+                }
+            });
         }
-    }, [sessionId, expImageUpload, selectedImages, clearImages, performSend]);
+    }, [expImageUpload, selectedImages, clearImages, performSend]);
 
     const handleAbort = React.useCallback(() => {
         storage.getState().resetSessionAgentOverrides(sessionId);

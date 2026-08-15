@@ -19,7 +19,7 @@ export const RECOVERABLE_RESUME_CODES = [
  */
 export function isRecoverableResumeFailure(code: string | undefined): boolean {
     if (!code) return false;
-    return RECOVERABLE_RESUME_CODES.includes(code as any);
+    return (RECOVERABLE_RESUME_CODES as readonly string[]).includes(code);
 }
 
 export type PrepareSendOutcome =

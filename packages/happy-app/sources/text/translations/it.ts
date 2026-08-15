@@ -310,7 +310,7 @@ export const it: TranslationStructure = {
         forkClaudeOnly: 'La biforcazione è attualmente supportata solo per le sessioni Claude.',
         directoryApprovalRequired: 'Questa sessione non può essere ripresa perché richiede l\'approvazione della directory. Avviala manualmente dalla sua posizione originale.',
         failedToDeliverInitialPrompt: 'Il recupero della sessione è stato avviato ma non è stato possibile consegnare il tuo messaggio. Per favore riprova.',
-        sendFailedNoRunningAgent: 'No agent is running for this session, so your message was not delivered.',
+        sendFailedNoRunningAgent: 'Nessun agente è in esecuzione per questa sessione, quindi il tuo messaggio non è stato consegnato.',
         sessionRecoveredInNewConversation: 'Sessione recuperata in una nuova conversazione. Il tuo messaggio è stato consegnato.',
     },
 

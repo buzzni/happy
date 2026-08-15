@@ -312,7 +312,7 @@ export const zhHant: TranslationStructure = {
         forkClaudeOnly: '目前僅支援 Claude 會話的分叉。',
         directoryApprovalRequired: '無法恢復此工作階段，因為它需要目錄批准。請從其原始位置手動啟動。',
         failedToDeliverInitialPrompt: '工作階段恢復已啟動，但無法傳送您的訊息。請重試。',
-        sendFailedNoRunningAgent: 'No agent is running for this session, so your message was not delivered.',
+        sendFailedNoRunningAgent: '此工作階段沒有執行中的代理程式，因此您的訊息未送達。',
         sessionRecoveredInNewConversation: '工作階段已在新對話中恢復。您的訊息已傳送。',
     },
 

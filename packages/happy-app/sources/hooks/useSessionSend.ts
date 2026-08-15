@@ -21,6 +21,12 @@ import { sync, type SendMessageOptions } from '@/sync/sync';
 import { t } from '@/text';
 import { useSessionStatus } from '@/utils/sessionUtils';
 
+/**
+ * Returns an async send function. Its result tells the caller whether the
+ * message was consumed (sent, or already delivered to a recovered session) —
+ * on `false` the caller must keep the composer text, because the composer has
+ * no restore API and this is the user's only copy.
+ */
 export function useSessionSend(session: Session) {
     const sessionId = session.id;
     const machineId = session.metadata?.machineId ?? '';
@@ -29,52 +35,67 @@ export function useSessionSend(session: Session) {
     const expResumeSession = useSetting('expResumeSession');
     const navigateToSession = useNavigateToSession();
     const isConnected = sessionStatus.isConnected;
+    // The recovery ladder takes seconds and the composer stays populated while
+    // it runs, so a second tap would start a concurrent ladder for the same
+    // text. Ignore sends until the first one settles.
+    const recoveryInFlightRef = React.useRef(false);
 
-    return React.useCallback(async (text: string, options?: SendMessageOptions) => {
+    return React.useCallback(async (text: string, options?: SendMessageOptions): Promise<boolean> => {
         if (isConnected) {
             sync.sendMessage(sessionId, text, options);
-            return;
+            return true;
         }
 
-        const availability = getResumeAvailability(session, machine, isConnected);
-
-        // Whether or not this build can revive the session, the user must learn
-        // that nothing is listening. Staying silent is the bug being fixed.
-        if (!expResumeSession) {
-            Modal.alert(t('common.error'), t('session.sendFailedNoRunningAgent'));
-            return;
+        if (recoveryInFlightRef.current) {
+            return false;
         }
-        if (!availability.canResume) {
-            Modal.alert(t('common.error'), availability.message || t('session.sendFailedNoRunningAgent'));
-            return;
-        }
+        recoveryInFlightRef.current = true;
+        try {
+            const availability = getResumeAvailability(session, machine, isConnected);
 
-        const modeMeta = resolveMessageModeMeta(session, storage.getState().settings);
-        const outcome = await prepareSessionForSend({
-            machineId,
-            sessionId,
-            text,
-            model: modeMeta.model ?? undefined,
-            permissionMode: modeMeta.permissionMode,
-            resume: machineResumeSession,
-            recover: (o) => machineRecoverSession({ ...o, machineId }),
-        });
+            // Whether or not this build can revive the session, the user must
+            // learn that nothing is listening. Staying silent is the bug being
+            // fixed.
+            if (!expResumeSession) {
+                Modal.alert(t('common.error'), t('session.sendFailedNoRunningAgent'));
+                return false;
+            }
+            if (!availability.canResume) {
+                Modal.alert(t('common.error'), availability.message || t('session.sendFailedNoRunningAgent'));
+                return false;
+            }
 
-        switch (outcome.kind) {
-            case 'send-normally':
-                sync.sendMessage(sessionId, text, options);
-                return;
+            const modeMeta = resolveMessageModeMeta(session, storage.getState().settings);
+            const outcome = await prepareSessionForSend({
+                machineId,
+                sessionId,
+                text,
+                model: modeMeta.model ?? undefined,
+                permissionMode: modeMeta.permissionMode,
+                resume: machineResumeSession,
+                recover: (o) => machineRecoverSession({ ...o, machineId }),
+            });
 
-            case 'prompt-delivered':
-                // The daemon already handed this text to the new session, so
-                // re-sending it here would duplicate the user's message.
-                Modal.alert(t('common.success'), t('session.sessionRecoveredInNewConversation'));
-                navigateToSession(outcome.sessionId);
-                return;
+            switch (outcome.kind) {
+                case 'send-normally':
+                    sync.sendMessage(sessionId, text, options);
+                    return true;
 
-            case 'failed':
-                Modal.alert(t('common.error'), failureMessage(outcome));
-                return;
+                case 'prompt-delivered':
+                    // The daemon already handed this text to the new session, so
+                    // re-sending it here would duplicate the user's message.
+                    // Known limitation: recover carries text only — attachments
+                    // queued alongside it are not forwarded to the new session.
+                    Modal.alert(t('common.success'), t('session.sessionRecoveredInNewConversation'));
+                    navigateToSession(outcome.sessionId);
+                    return true;
+
+                case 'failed':
+                    Modal.alert(t('common.error'), failureMessage(outcome));
+                    return false;
+            }
+        } finally {
+            recoveryInFlightRef.current = false;
         }
     }, [sessionId, session, machine, isConnected, expResumeSession, machineId, navigateToSession]);
 }
