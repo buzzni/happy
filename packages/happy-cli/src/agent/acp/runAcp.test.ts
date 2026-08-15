@@ -426,6 +426,27 @@ describe('runAcp', () => {
     await runPromise.catch(() => { });
   });
 
+  it('records grok sessions under their own flavor rather than generic acp', async () => {
+    const runPromise = runAcp({
+      credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', 'stdio'],
+    });
+
+    await vi.waitFor(() => {
+      expect(mocks.mockGetOrCreateSession).toHaveBeenCalled();
+    });
+
+    // The mock is declared without a parameter signature, so its recorded call
+    // args widen to an empty tuple; read them through the real payload shape.
+    const [payload] = mocks.mockGetOrCreateSession.mock.calls[0] as unknown as [{ metadata: { flavor: string } }];
+    expect(payload.metadata.flavor).toBe('grok');
+
+    await mocks.getKillHandler()!();
+    await runPromise;
+  });
+
   it('registers abort handler that cancels the ACP backend session', async () => {
     const runPromise = runAcp({
       credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },

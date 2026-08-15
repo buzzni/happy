@@ -15,7 +15,7 @@ export type AutomationSchedule =
 
 export type AutomationRunOutcome = 'woke' | 'skipped-gate' | 'skipped-overlap' | 'silent' | 'error'
 
-export type AutomationAgent = 'claude' | 'codex' | 'gemini' | 'openclaw' | 'opencode'
+export type AutomationAgent = 'claude' | 'codex' | 'gemini' | 'grok' | 'openclaw' | 'opencode'
 
 export interface AutomationRunRecord {
   at: number
@@ -93,6 +93,7 @@ function parseAutomationAgent(value: unknown): AutomationAgent | null {
     case 'claude':
     case 'codex':
     case 'gemini':
+    case 'grok':
     case 'openclaw':
     case 'opencode':
       return value

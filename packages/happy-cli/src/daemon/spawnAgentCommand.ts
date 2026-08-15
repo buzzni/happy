@@ -24,6 +24,8 @@ export function resolveAgentAuthEnvironment(
         return ['OPENAI_API_KEY']
       case 'gemini':
         return ['GEMINI_API_KEY', 'GOOGLE_API_KEY']
+      case 'grok':
+        return ['XAI_API_KEY']
       case 'openclaw':
       case 'opencode':
         return []
@@ -59,6 +61,8 @@ export function resolveTmuxSpawnAgentCommand(agent: SpawnAgent): string | undefi
       return 'codex'
     case 'gemini':
       return 'gemini'
+    case 'grok':
+      return 'grok'
     case 'openclaw':
       return 'openclaw'
     case 'opencode':
@@ -75,6 +79,8 @@ export function resolveRegularSpawnAgentArgs(agent: SpawnAgent): string[] | unde
       return ['codex']
     case 'gemini':
       return ['gemini']
+    case 'grok':
+      return ['grok']
     case 'openclaw':
       return ['openclaw']
     case 'opencode':
