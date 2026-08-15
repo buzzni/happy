@@ -135,3 +135,15 @@ dev 에서 릴레이 URL 을 열면 noVNC 는 뜨는데 **화면이 검게** 나
 
 검증: 유닛 71개. 컨테이너 E2E 4/4 — 스택 기동 후 `xwininfo` 에 Chrome
 창이 실제로 존재하고, 재호출해도 Chrome 프로세스 수가 늘지 않는다.
+
+## 후속 수정 — profile launch 소유권 (2026-08-15)
+
+검은 화면 수정 뒤 `browser-setup:launch({ viewer: true })`도 viewer stack을 준비하는
+과정에서 기본 profile Chrome을 먼저 실행했다. 호출자가 이미 선택 profile을 실행할
+예정인데 viewer가 같은 free CDP port를 선점해, 비기본 profile 요청이 기본 profile에
+연결된 것처럼 성공할 수 있었다.
+
+viewer를 직접 여는 경로는 계속 기본 browser를 보장하되, profile launch 호출자는
+`callerWillLaunchBrowser` ownership을 전달해 선행 browser 실행을 생략한다. 순수 결정
+test가 defer/launch/reuse 세 경우를 고정하며 browser setup/viewer 유닛 38개와 CLI
+typecheck/package build가 통과했다.

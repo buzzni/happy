@@ -177,11 +177,20 @@ describe('VIEWER_WEB_PORTS as the single source of truth', () => {
 })
 
 describe('decideViewerBrowserAction', () => {
+    it('defers to the profile launch caller instead of occupying its CDP port', () => {
+        const decision = decideViewerBrowserAction({
+            liveCdpPort: null,
+            callerWillLaunchBrowser: true,
+        })
+
+        expect(decision).toEqual({ action: 'defer' })
+    })
+
     it('launches a browser when the display has none', () => {
         // A viewer with no browser on it is a black screen — exactly what the
         // "원격 브라우저 화면 열기" button produced: the open flow started
         // Xvfb/x11vnc/websockify and never put anything on the display.
-        const decision = decideViewerBrowserAction({ liveCdpPort: null })
+        const decision = decideViewerBrowserAction({ liveCdpPort: null, callerWillLaunchBrowser: false })
 
         expect(decision).toEqual({ action: 'launch' })
     })
@@ -189,7 +198,7 @@ describe('decideViewerBrowserAction', () => {
     it('reuses the browser already on the display instead of stacking another', () => {
         // Every click would otherwise pile one more Chrome onto the same
         // Xvfb, each grabbing the next CDP port.
-        const decision = decideViewerBrowserAction({ liveCdpPort: 9222 })
+        const decision = decideViewerBrowserAction({ liveCdpPort: 9222, callerWillLaunchBrowser: false })
 
         expect(decision).toEqual({ action: 'reuse', cdpPort: 9222 })
     })

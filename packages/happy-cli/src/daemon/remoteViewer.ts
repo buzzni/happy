@@ -150,6 +150,7 @@ export function decideViewerStackAction(input: {
 export type ViewerBrowserDecision =
     | { action: 'reuse'; cdpPort: number }
     | { action: 'launch'; cdpPort?: undefined }
+    | { action: 'defer'; cdpPort?: undefined }
 
 /**
  * Whether the viewer display still needs a browser put on it.
@@ -164,7 +165,11 @@ export type ViewerBrowserDecision =
  */
 export function decideViewerBrowserAction(input: {
     liveCdpPort: number | null
+    callerWillLaunchBrowser: boolean
 }): ViewerBrowserDecision {
+    if (input.callerWillLaunchBrowser) {
+        return { action: 'defer' }
+    }
     if (input.liveCdpPort !== null) {
         return { action: 'reuse', cdpPort: input.liveCdpPort }
     }
