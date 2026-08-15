@@ -50,8 +50,13 @@ export function useSessionSend(session: Session) {
     const recoveryInFlightRef = React.useRef(false);
 
     return React.useCallback(async (text: string, options?: SendMessageOptions): Promise<boolean> => {
+        // An attachments-only send (empty text, images experiment) must not
+        // enter the ladder: recover can only carry text, so the daemon rejects
+        // an empty initialPrompt and the user would see a bare RPC error.
+        // Queueing keeps the file events replayable like any other message.
         const attemptRecovery = !isConnected
             && expResumeSession
+            && text.trim().length > 0
             && getResumeAvailability(session, machine, isConnected).canResume;
 
         if (!attemptRecovery) {

@@ -93,3 +93,17 @@ composer 보존. daemon 이 커서를 보존하므로(AC1~AC2) 죽은 세션으�
 케이스의 자동 복구가 동작하지 않는다. 실험 원칙(off=기존 동작) 준수가
 우선이고, daemon 수정 덕에 메시지는 유실되지 않고 다음 resume 에서
 replay 된다.
+
+## 2026-08-15 — 셀프 리뷰 (4차)
+
+- **[버그] 첨부-only 전송이 ladder 진입**: 텍스트가 빈 채(이미지 실험 on)
+  ladder 를 타면 recover 단계에서 daemon 의 "Initial prompt must be a
+  non-empty string" 검증에 걸려 의미불명 RPC 에러가 알림으로 떴다. recover
+  는 텍스트만 전달하므로 첨부-only 는 복구로 이어갈 수 없다 — 빈 텍스트는
+  ladder 를 스킵하고 큐잉하도록 게이트 추가.
+- 점검 후 이상 없음: daemon 의 하이드레이션된 TrackedSession 을 소비하는
+  `restoreSessionStartTimes` / `sweepZombieSessions` 는 시각·runtime 만 쓴다.
+- 스코프 밖으로 판정(기록): 다른 sendMessage 호출부 3곳 — 새 세션 initial
+  prompt(방금 spawn 된 세션), 음성(realtimeClientTools, 활성 세션 전제),
+  옵션 버튼 탭(MessageView, 재타이핑 부담 없음 + 큐잉이 resume 시 replay 됨)
+  — 은 fire-and-forget 을 유지한다. 원 사고의 경로는 handleSend 다.
