@@ -53,7 +53,7 @@ import { scrubSessionLineageEnv, SESSION_LINEAGE_ENV_PREFIXES } from './sessionE
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
-import { encodeBase64, decodeBase64 } from '@/api/encryption';
+import { encodeBase64 } from '@/api/encryption';
 import {
   resolveInheritedSpawnEnvironment,
   resolveRegularSpawnAgentArgs,
@@ -87,6 +87,7 @@ import {
   type StopSessionResult,
 } from './sessionIdleReaper';
 import { resolveOrphanAdoption, collectStartupOrphans, resolveTrackedPidOwner } from './orphanAdoption';
+import { hydrateTrackedSessionFromPersisted } from './persistedSessionHydration';
 import { createAutomationStore } from './automations/automationStore';
 import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
@@ -304,6 +305,11 @@ export async function startDaemon(): Promise<void> {
     const pidToAdoptedAt = new Map<number, number>();
     const deadSessionsToCleanup: PersistedTrackedSession[] = [];
 
+    // Read once and share: session recovery, the orphan home-dir sweep and the
+    // finished-session map all need the same snapshot, and nothing writes
+    // sessions.json in between.
+    const persistedSessions = readPersistedSessions();
+
     // Recover sessions from previous daemon run
     const previousState = await readDaemonState();
     if (previousState?.trackedSessions?.length) {
@@ -342,7 +348,7 @@ export async function startDaemon(): Promise<void> {
         .filter((d): d is string => typeof d === 'string');
       // Resumable sessions keep their staged identity across restarts
       // (2026-07-23 incident) — their dirs are claimed, not orphans.
-      const resumableHomeDirs = Object.values(readPersistedSessions())
+      const resumableHomeDirs = Object.values(persistedSessions)
         .map((s) => s.userHomeDir)
         .filter((d): d is string => typeof d === 'string');
       const removed = await sweepOrphanUserHomeDirs([...liveHomeDirs, ...resumableHomeDirs]);
@@ -356,26 +362,16 @@ export async function startDaemon(): Promise<void> {
     // Retain session data after process exits so resume can still find it.
     // Pre-populate from disk so sessions survive daemon restarts.
     const sessionIdToFinishedSession = new Map<string, TrackedSession>();
-    const persisted = readPersistedSessions();
-    for (const [id, s] of Object.entries(persisted)) {
+    for (const [id, s] of Object.entries(persistedSessions)) {
       sessionIdToFinishedSession.set(id, {
+        ...hydrateTrackedSessionFromPersisted(s),
         startedBy: 'persisted',
         happySessionId: id,
-        happySessionMetadataFromLocalWebhook: s.metadata,
-        encryption: {
-          encryptionKey: decodeBase64(s.encryptionKey),
-          encryptionVariant: s.encryptionVariant,
-          seq: s.seq,
-          metadataVersion: s.metadataVersion,
-          agentStateVersion: s.agentStateVersion,
-        },
         pid: 0,
-        userHomeDir: s.userHomeDir,
-        persistedLastProcessedSeq: s.lastProcessedSeq,
       });
     }
-    if (Object.keys(persisted).length > 0) {
-      logger.debug(`[DAEMON RUN] Loaded ${Object.keys(persisted).length} persisted sessions from disk`);
+    if (Object.keys(persistedSessions).length > 0) {
+      logger.debug(`[DAEMON RUN] Loaded ${Object.keys(persistedSessions).length} persisted sessions from disk`);
     }
 
     // Session spawning awaiter system
