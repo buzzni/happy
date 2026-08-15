@@ -6,6 +6,7 @@ import {
   AiCredentialRuntimeError,
   createAiCredentialRuntime,
   runAiCredentialCommand,
+  selectLeastRemainingCodexAccounts,
   withUvToolBinOnPath,
   type AiCredentialCommandResult,
   type AiCredentialRuntimeDependencies,
@@ -17,9 +18,28 @@ const configuredClaudeList = JSON.stringify({
   accounts: [{ number: 1, email: 'owner@example.com', active: true }],
 })
 
+function codexMultiAuthBundle() {
+  return {
+    version: 1,
+    kind: 'codex-multi-auth',
+    packageVersion: '2.8.5',
+    accounts: {
+      version: 3,
+      activeIndex: 0,
+      accounts: [
+        { accountId: 'account-a', email: 'alpha@example.com', refreshToken: 'refresh-a', accessToken: 'access-a', addedAt: 1, lastUsed: 1 },
+        { accountId: 'account-b', email: 'beta@example.com', refreshToken: 'refresh-b', accessToken: 'access-b', addedAt: 2, lastUsed: 2 },
+        { accountId: 'account-c', email: 'gamma@example.com', refreshToken: 'refresh-c', accessToken: 'access-c', addedAt: 3, lastUsed: 3 },
+      ],
+    },
+    settings: { version: 1, pluginConfig: {} },
+  }
+}
+
 function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
   const calls: Array<{ command: string; args: string[] }> = []
   const files = new Map<string, string>()
+  files.set('/global/node_modules/codex-multi-auth/package.json', JSON.stringify({ version: '2.8.5' }))
   const execFile = vi.fn(async (
     command: string,
     args: string[],
@@ -37,6 +57,12 @@ function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
         stdout: configuredClaudeList,
         stderr: '',
       }
+    }
+    if (command === 'codex-multi-auth' && args[0] === '--version') {
+      return { stdout: '2.8.5\n', stderr: '' }
+    }
+    if (command === 'npm' && args[0] === 'root') {
+      return { stdout: '/global/node_modules\n', stderr: '' }
     }
     return { stdout: '', stderr: '' }
   })
@@ -74,6 +100,84 @@ function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
 }
 
 describe('AI credential machine runtime', () => {
+  it('orders ready Codex accounts by the least remaining quota instead of storage order', () => {
+    const accounts = [
+      { accountId: 'account-a', enabled: true },
+      { accountId: 'account-b', enabled: true },
+      { accountId: 'account-c', enabled: true },
+    ]
+    const quotaCache = {
+      version: 1,
+      byAccountId: {
+        'account-a': { updatedAt: 3, status: 200, model: 'gpt-5.5', primary: { usedPercent: 40 }, secondary: { usedPercent: 20 } },
+        'account-b': { updatedAt: 3, status: 200, model: 'gpt-5.5', primary: { usedPercent: 90 }, secondary: { usedPercent: 70 } },
+        'account-c': { updatedAt: 3, status: 200, model: 'gpt-5.5', primary: { usedPercent: 60 }, secondary: { usedPercent: 30 } },
+      },
+      byEmail: {},
+    }
+
+    expect(selectLeastRemainingCodexAccounts(accounts, quotaCache, 5)).toEqual({
+      orderedIndexes: [1, 2, 0],
+      activeIndex: 0,
+      quotaKnown: true,
+      hasReadyAccount: true,
+    })
+  })
+
+  it('distinguishes known exhausted Codex quota from unknown quota', () => {
+    expect(selectLeastRemainingCodexAccounts([
+      { accountId: 'account-a', enabled: true },
+      { accountId: 'account-b', enabled: true },
+    ], {
+      byAccountId: {
+        'account-a': { primary: { usedPercent: 95 }, secondary: { usedPercent: 50 } },
+        'account-b': { primary: { usedPercent: 100 }, secondary: { usedPercent: 100 } },
+      },
+    }, 5)).toMatchObject({
+      quotaKnown: true,
+      hasReadyAccount: false,
+    })
+  })
+
+  it('treats a missing quota window as unknown and normalizes email cache keys', () => {
+    const accounts = [
+      { email: ' First@Example.com ', enabled: true },
+      { email: 'second@example.com', enabled: true },
+    ]
+
+    expect(selectLeastRemainingCodexAccounts(accounts, {
+      byEmail: {
+        'first@example.com': {
+          primary: { usedPercent: 80 },
+          secondary: { usedPercent: 40 },
+        },
+        'second@example.com': { primary: { usedPercent: 90 } },
+      },
+    }, 5)).toMatchObject({
+      orderedIndexes: [0, 1],
+      quotaKnown: false,
+      hasReadyAccount: true,
+    })
+  })
+
+  it('does not use an ambiguous email quota cache entry', () => {
+    expect(selectLeastRemainingCodexAccounts([
+      { accountId: 'account-a', email: 'shared@example.com' },
+      { email: 'shared@example.com' },
+    ], {
+      byAccountId: {
+        'account-a': { primary: { usedPercent: 50 }, secondary: { usedPercent: 40 } },
+      },
+      byEmail: {
+        'shared@example.com': { primary: { usedPercent: 90 }, secondary: { usedPercent: 80 } },
+      },
+    }, 5)).toMatchObject({
+      orderedIndexes: [0, 1],
+      quotaKnown: false,
+      hasReadyAccount: true,
+    })
+  })
+
   it('prepends the managed uv tool bin without mutating the daemon environment', () => {
     const environment = { PATH: '/usr/bin', UV_TOOL_BIN_DIR: '/managed/bin' }
 
@@ -126,15 +230,222 @@ describe('AI credential machine runtime', () => {
     })
   })
 
-  it('reads Codex credentials from CODEX_HOME only and rejects unsupported providers', async () => {
+  it('does not fall back to legacy Codex auth outside the managed multi-auth pool', async () => {
     const { runtime, files } = setup({ env: { CODEX_HOME: '/fixed/codex' } })
     files.set('/fixed/codex/auth.json', '{"OPENAI_API_KEY":"secret"}')
 
-    await expect(runtime.capture({ provider: 'codex' })).resolves.toEqual({
-      provider: 'codex',
-      payload: '{"OPENAI_API_KEY":"secret"}',
+    await expect(runtime.capture({ provider: 'codex' })).rejects.toMatchObject({
+      kind: 'CODEX_FILE_STORE_REQUIRED',
     })
     await expect(runtime.capture({ provider: '../etc/passwd' as never })).rejects.toThrow(/provider/i)
+  })
+
+  it('captures the fixed Codex multi-auth account pool and settings as one versioned bundle', async () => {
+    const { runtime, files } = setup({ env: { CODEX_HOME: '/fixed/codex' } })
+    const bundle = codexMultiAuthBundle()
+    files.set('/fixed/codex/multi-auth/openai-codex-accounts.json', JSON.stringify(bundle.accounts))
+    files.set('/fixed/codex/multi-auth/settings.json', JSON.stringify(bundle.settings))
+
+    const captured = await runtime.capture({ provider: 'codex' })
+
+    expect(captured.provider).toBe('codex')
+    expect(JSON.parse(captured.payload)).toEqual(bundle)
+  })
+
+  it('rejects Codex capture when the installed multi-auth package is not the pinned version', async () => {
+    const { runtime, files } = setup({
+      execFile: vi.fn(async (command: string, args: string[]) => {
+        if (command === 'codex-multi-auth' && args[0] === '--version') {
+          return { stdout: '2.8.4\n', stderr: '' }
+        }
+        return { stdout: '', stderr: '' }
+      }),
+    })
+    const bundle = codexMultiAuthBundle()
+    files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(bundle.accounts))
+    files.set('/home/operator/.codex/multi-auth/settings.json', JSON.stringify(bundle.settings))
+
+    await expect(runtime.capture({ provider: 'codex' })).rejects.toMatchObject({
+      kind: 'CODEX_MULTI_AUTH_VERSION_MISMATCH',
+    })
+  })
+
+  it('pins Codex multi-auth 2.8.5 and applies least-remaining 5% rotation settings', async () => {
+    let files!: Map<string, string>
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'codex-multi-auth' && args[0] === '--version') {
+        return { stdout: '2.8.5\n', stderr: '' }
+      }
+      if (command === 'npm' && args[0] === 'root') {
+        return { stdout: '/global/node_modules\n', stderr: '' }
+      }
+      if (command === 'codex-multi-auth' && args[0] === 'forecast') {
+        files.set('/home/operator/.codex/multi-auth/quota-cache.json', JSON.stringify({
+          version: 1,
+          byAccountId: {
+            'account-a': { updatedAt: 3, status: 200, model: 'gpt-5.5', primary: { usedPercent: 40 }, secondary: { usedPercent: 20 } },
+            'account-b': { updatedAt: 3, status: 200, model: 'gpt-5.5', primary: { usedPercent: 90 }, secondary: { usedPercent: 70 } },
+            'account-c': { updatedAt: 3, status: 200, model: 'gpt-5.5', primary: { usedPercent: 60 }, secondary: { usedPercent: 30 } },
+          },
+          byEmail: {},
+        }))
+        return { stdout: '{"command":"forecast"}', stderr: '' }
+      }
+      if (command === 'codex-multi-auth' && args[0] === 'check') {
+        return { stdout: '', stderr: '' }
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const configured = setup({ execFile })
+    files = configured.files
+
+    await expect(configured.runtime.apply({
+      provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()),
+    })).resolves.toMatchObject({
+      provider: 'codex',
+      configured: true,
+      accountCount: 3,
+      rotation: {
+        state: 'running',
+        strategy: 'sequential',
+        threshold5h: 5,
+        threshold7d: 5,
+      },
+    })
+
+    const storedAccounts = JSON.parse(files.get('/home/operator/.codex/multi-auth/openai-codex-accounts.json')!)
+    expect(storedAccounts.accounts.map((account: { accountId: string }) => account.accountId))
+      .toEqual(['account-b', 'account-c', 'account-a'])
+    expect(storedAccounts.activeIndex).toBe(0)
+    const storedSettings = JSON.parse(files.get('/home/operator/.codex/multi-auth/settings.json')!)
+    expect(storedSettings.pluginConfig).toMatchObject({
+      codexRuntimeRotationProxy: true,
+      schedulingStrategy: 'sequential',
+      preemptiveQuotaEnabled: true,
+      preemptiveQuotaRemainingPercent5h: 5,
+      preemptiveQuotaRemainingPercent7d: 5,
+      routingMutex: 'enabled',
+    })
+    expect(execFile).toHaveBeenCalledWith('codex-multi-auth', ['forecast', '--live', '--json'], expect.anything())
+    expect(JSON.stringify(execFile.mock.calls)).not.toContain('refresh-a')
+  })
+
+  it('preserves OAuth tokens refreshed by the live quota forecast when sorting accounts', async () => {
+    let files!: Map<string, string>
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'codex-multi-auth' && args[0] === '--version') {
+        return { stdout: '2.8.5\n', stderr: '' }
+      }
+      if (command === 'npm' && args[0] === 'root') {
+        return { stdout: '/global/node_modules\n', stderr: '' }
+      }
+      if (command === 'codex-multi-auth' && args[0] === 'forecast') {
+        const path = '/home/operator/.codex/multi-auth/openai-codex-accounts.json'
+        const accounts = JSON.parse(files.get(path)!)
+        accounts.accounts[0] = {
+          ...accounts.accounts[0],
+          refreshToken: 'rotated-refresh-a',
+          accessToken: 'rotated-access-a',
+        }
+        files.set(path, JSON.stringify(accounts))
+        files.set('/home/operator/.codex/multi-auth/quota-cache.json', JSON.stringify({
+          version: 1,
+          byAccountId: {
+            'account-a': { updatedAt: 3, status: 200, model: 'gpt-5.5', primary: { usedPercent: 90 }, secondary: { usedPercent: 80 } },
+            'account-b': { updatedAt: 3, status: 200, model: 'gpt-5.5', primary: { usedPercent: 50 }, secondary: { usedPercent: 40 } },
+            'account-c': { updatedAt: 3, status: 200, model: 'gpt-5.5', primary: { usedPercent: 30 }, secondary: { usedPercent: 20 } },
+          },
+          byEmail: {},
+        }))
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const configured = setup({ execFile })
+    files = configured.files
+
+    await configured.runtime.apply({
+      provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()),
+    })
+
+    const stored = JSON.parse(files.get('/home/operator/.codex/multi-auth/openai-codex-accounts.json')!)
+    expect(stored.accounts[0]).toMatchObject({
+      accountId: 'account-a',
+      refreshToken: 'rotated-refresh-a',
+      accessToken: 'rotated-access-a',
+    })
+  })
+
+  it('fails closed when the pinned Codex multi-auth version is still unavailable after install', async () => {
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'codex-multi-auth' && args[0] === '--version') {
+        return { stdout: '2.8.4\n', stderr: '' }
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime } = setup({ execFile })
+
+    await expect(runtime.apply({
+      provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()),
+    })).rejects.toMatchObject({ kind: 'CODEX_MULTI_AUTH_VERSION_MISMATCH' })
+    expect(execFile).toHaveBeenCalledWith('npm', [
+      'install', '--global', 'codex-multi-auth@2.8.5',
+    ], expect.anything())
+  })
+
+  it('installs the pinned npm-global package when PATH exposes an unrelated exact-version CLI', async () => {
+    let files!: Map<string, string>
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'codex-multi-auth' && args[0] === '--version') {
+        return { stdout: '2.8.5\n', stderr: '' }
+      }
+      if (command === 'npm' && args[0] === 'root') {
+        return { stdout: '/alternate/global/node_modules\n', stderr: '' }
+      }
+      if (command === 'npm' && args[0] === 'install') {
+        files.set('/alternate/global/node_modules/codex-multi-auth/package.json', JSON.stringify({
+          version: '2.8.5',
+        }))
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const configured = setup({ execFile })
+    files = configured.files
+
+    await configured.runtime.apply({
+      provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()),
+    })
+
+    expect(execFile).toHaveBeenCalledWith('npm', [
+      'install', '--global', 'codex-multi-auth@2.8.5',
+    ], expect.anything())
+  })
+
+  it('preserves untouched Codex multi-auth files when a later backup fails', async () => {
+    let files!: Map<string, string>
+    let failedSettingsBackup = false
+    const configured = setup({
+      rename: vi.fn(async (from: string, to: string) => {
+        if (to.endsWith('settings.json.happy-backup') && !failedSettingsBackup) {
+          failedSettingsBackup = true
+          throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
+        }
+        const value = files.get(from)
+        if (value === undefined) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+        files.set(to, value)
+        files.delete(from)
+      }),
+    })
+    files = configured.files
+    const oldAccounts = JSON.stringify(codexMultiAuthBundle().accounts)
+    const oldSettings = JSON.stringify({ version: 1, pluginConfig: { schedulingStrategy: 'round-robin' } })
+    files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', oldAccounts)
+    files.set('/home/operator/.codex/multi-auth/settings.json', oldSettings)
+
+    await expect(configured.runtime.apply({
+      provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()),
+    })).rejects.toMatchObject({ kind: 'CODEX_MULTI_AUTH_APPLY_FAILED' })
+    expect(files.get('/home/operator/.codex/multi-auth/openai-codex-accounts.json')).toBe(oldAccounts)
+    expect(files.get('/home/operator/.codex/multi-auth/settings.json')).toBe(oldSettings)
   })
 
   it('installs, configures, and imports Claude credentials without putting the secret in argv', async () => {
@@ -322,7 +633,7 @@ describe('AI credential machine runtime', () => {
     let files!: Map<string, string>
     const configured = setup({
       writeFile: vi.fn(async (path: string, content: string) => {
-        if (path.endsWith('.auth.json.happy-tmp')) {
+        if (path.endsWith('openai-codex-accounts.json.happy-tmp')) {
           tempWriteStarted = true
           await writeBlocked
         }
@@ -330,9 +641,10 @@ describe('AI credential machine runtime', () => {
       }),
     })
     files = configured.files
-    files.set('/home/operator/.codex/auth.json', '{"OPENAI_API_KEY":"old"}')
 
-    const apply = configured.runtime.apply({ provider: 'codex', payload: '{"OPENAI_API_KEY":"new"}' })
+    const apply = configured.runtime.apply({
+      provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()),
+    })
     await vi.waitFor(() => expect(tempWriteStarted).toBe(true))
     let captureSettled = false
     const capture = configured.runtime.capture({ provider: 'codex' })
@@ -342,8 +654,13 @@ describe('AI credential machine runtime', () => {
 
     releaseWrite()
     await apply
-    await expect(capture).resolves.toEqual({
-      provider: 'codex', payload: '{"OPENAI_API_KEY":"new"}',
+    const captured = await capture
+    expect(captured.provider).toBe('codex')
+    expect(JSON.parse(captured.payload)).toMatchObject({
+      kind: 'codex-multi-auth',
+      packageVersion: '2.8.5',
+      accounts: { version: 3 },
+      settings: { pluginConfig: { schedulingStrategy: 'sequential' } },
     })
   })
 
@@ -444,6 +761,129 @@ describe('AI credential machine runtime', () => {
       configured: true,
       activeAccount: 'o***@example.com',
       rotation: { state: 'running', lastErrorKind: null },
+    })
+  })
+
+  it('reports managed Codex routing with the least-remaining active account masked', async () => {
+    const { runtime, files } = setup({
+      codexProxyStatus: vi.fn(() => ({ activeRoutes: 1 })),
+      execFile: vi.fn(async (command: string, args: string[]) => {
+        if (command === 'codex-multi-auth' && args[0] === '--version') {
+          return { stdout: '2.8.5\n', stderr: '' }
+        }
+        if (command === 'npm' && args[0] === 'root') {
+          return { stdout: '/global/node_modules\n', stderr: '' }
+        }
+        return { stdout: '', stderr: '' }
+      }),
+    })
+    const bundle = codexMultiAuthBundle()
+    bundle.accounts.accounts = [
+      bundle.accounts.accounts[1]!,
+      bundle.accounts.accounts[2]!,
+      bundle.accounts.accounts[0]!,
+    ]
+    files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(bundle.accounts))
+    files.set('/home/operator/.codex/multi-auth/settings.json', JSON.stringify({
+      version: 1,
+      pluginConfig: {
+        codexRuntimeRotationProxy: true,
+        schedulingStrategy: 'sequential',
+        preemptiveQuotaEnabled: true,
+        preemptiveQuotaRemainingPercent5h: 5,
+        preemptiveQuotaRemainingPercent7d: 5,
+        routingMutex: 'enabled',
+        sessionAffinity: false,
+        pidOffsetEnabled: false,
+      },
+    }))
+    files.set('/home/operator/.codex/multi-auth/quota-cache.json', JSON.stringify({
+      version: 1,
+      byAccountId: {
+        'account-a': { primary: { usedPercent: 40 }, secondary: { usedPercent: 20 } },
+        'account-b': { primary: { usedPercent: 90 }, secondary: { usedPercent: 70 } },
+        'account-c': { primary: { usedPercent: 60 }, secondary: { usedPercent: 30 } },
+      },
+    }))
+
+    await expect(runtime.status({ provider: 'codex' })).resolves.toEqual({
+      provider: 'codex',
+      configured: true,
+      accountCount: 3,
+      activeAccount: 'b***@example.com',
+      rotation: {
+        state: 'running',
+        lastErrorKind: null,
+        strategy: 'sequential',
+        threshold5h: 5,
+        threshold7d: 5,
+      },
+    })
+  })
+
+  it('does not report direct Codex execution as routed rotation', async () => {
+    const configured = setup({ codexProxyStatus: vi.fn(() => ({ activeRoutes: 0 })) })
+    const bundle = codexMultiAuthBundle()
+    configured.files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(bundle.accounts))
+    configured.files.set('/home/operator/.codex/multi-auth/settings.json', JSON.stringify({
+      version: 1,
+      pluginConfig: {
+        codexRuntimeRotationProxy: true,
+        schedulingStrategy: 'sequential',
+        preemptiveQuotaEnabled: true,
+        preemptiveQuotaRemainingPercent5h: 5,
+        preemptiveQuotaRemainingPercent7d: 5,
+        routingMutex: 'enabled',
+        sessionAffinity: false,
+        pidOffsetEnabled: false,
+      },
+    }))
+    configured.files.set('/home/operator/.codex/multi-auth/quota-cache.json', JSON.stringify({
+      version: 1,
+      byAccountId: Object.fromEntries(bundle.accounts.accounts.map((account) => [
+        account.accountId,
+        { primary: { usedPercent: 50 }, secondary: { usedPercent: 40 } },
+      ])),
+    }))
+
+    await expect(configured.runtime.status({ provider: 'codex' })).resolves.toMatchObject({
+      rotation: { state: 'not-routed' },
+    })
+  })
+
+  it('reports unknown Codex quota without guessing a rotation account', async () => {
+    const configured = setup({ codexProxyStatus: vi.fn(() => ({ activeRoutes: 1 })) })
+    const bundle = codexMultiAuthBundle()
+    configured.files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(bundle.accounts))
+    configured.files.set('/home/operator/.codex/multi-auth/settings.json', JSON.stringify({
+      version: 1,
+      pluginConfig: {
+        codexRuntimeRotationProxy: true,
+        schedulingStrategy: 'sequential',
+        preemptiveQuotaEnabled: true,
+        preemptiveQuotaRemainingPercent5h: 5,
+        preemptiveQuotaRemainingPercent7d: 5,
+        routingMutex: 'enabled',
+        sessionAffinity: false,
+        pidOffsetEnabled: false,
+      },
+    }))
+
+    await expect(configured.runtime.status({ provider: 'codex' })).resolves.toMatchObject({
+      accountCount: 3,
+      rotation: { state: 'quota-unknown' },
+    })
+  })
+
+  it('rejects Codex status when the npm-global runtime package is missing', async () => {
+    const configured = setup()
+    configured.files.delete('/global/node_modules/codex-multi-auth/package.json')
+    const bundle = codexMultiAuthBundle()
+    configured.files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(bundle.accounts))
+    configured.files.set('/home/operator/.codex/multi-auth/settings.json', JSON.stringify(bundle.settings))
+
+    await expect(configured.runtime.status({ provider: 'codex' })).rejects.toMatchObject({
+      kind: 'CODEX_MULTI_AUTH_VERSION_MISMATCH',
     })
   })
 

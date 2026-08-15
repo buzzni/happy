@@ -55,6 +55,7 @@ import type {
 } from './codexAppServerTypes';
 import type { SandboxConfig } from '@/persistence';
 import { CODEX_INACTIVITY_ABORT_REASON, type CodexInactivityAbortFields } from './codexAbortNotice';
+import { prepareCodexMultiAuthProxy, type PreparedCodexMultiAuthProxy } from './codexMultiAuthProxy';
 import { initializeSandbox, wrapForMcpTransport } from '@/sandbox/manager';
 import packageJson from '../../package.json';
 
@@ -216,6 +217,8 @@ export class CodexAppServerClient {
     private connected = false;
     private sandboxConfig?: SandboxConfig;
     private sandboxCleanup: (() => Promise<void>) | null = null;
+    private multiAuthProxy: PreparedCodexMultiAuthProxy | null = null;
+    private multiAuthProxyCleanup: Promise<void> | null = null;
     public sandboxEnabled = false;
 
     // Session state
@@ -648,6 +651,10 @@ export class CodexAppServerClient {
     async connect(): Promise<void> {
         if (this.connected) return;
 
+        if (this.multiAuthProxy || this.multiAuthProxyCleanup) {
+            await this.cleanupMultiAuthProxy();
+        }
+
         if (!isAppServerAvailable()) {
             throw new Error(
                 'Codex CLI is not installed\n\n' +
@@ -658,14 +665,29 @@ export class CodexAppServerClient {
             );
         }
 
+        // Build env — same filtering as the old MCP client
+        let env: Record<string, string> = {};
+        for (const [key, value] of Object.entries(process.env)) {
+            if (typeof value === 'string') env[key] = value;
+        }
+        this.multiAuthProxy = await prepareCodexMultiAuthProxy(env);
+        if (this.multiAuthProxy) {
+            env = this.multiAuthProxy.env;
+        }
+
         let command = 'codex';
-        let args = ['app-server', '--listen', 'stdio://'];
+        let args = [
+            'app-server',
+            '--listen',
+            'stdio://',
+            ...(this.multiAuthProxy?.args ?? []),
+        ];
         this.sandboxEnabled = false;
 
         if (this.sandboxConfig?.enabled && process.platform !== 'win32') {
             try {
                 this.sandboxCleanup = await initializeSandbox(this.sandboxConfig, process.cwd());
-                const wrapped = await wrapForMcpTransport('codex', ['app-server', '--listen', 'stdio://']);
+                const wrapped = await wrapForMcpTransport('codex', args);
                 command = wrapped.command;
                 args = wrapped.args;
                 this.sandboxEnabled = true;
@@ -676,11 +698,6 @@ export class CodexAppServerClient {
             }
         }
 
-        // Build env — same filtering as the old MCP client
-        const env: Record<string, string> = {};
-        for (const [key, value] of Object.entries(process.env)) {
-            if (typeof value === 'string') env[key] = value;
-        }
         // Mute noisy rollout list logging
         const filter = 'codex_core::rollout::list=off';
         if (!env.RUST_LOG) {
@@ -702,11 +719,17 @@ export class CodexAppServerClient {
         this.outstandingServerRequests = 0;
         // Use cross-spawn so npm-installed wrappers (codex.cmd / codex.ps1) resolve on Windows.
         // Native child_process.spawn fails with ENOENT for .cmd shims (issues #980, #1016).
-        const proc = crossSpawn(command, args, {
-            stdio: ['pipe', 'pipe', 'pipe'],
-            env,
-            windowsHide: true,
-        });
+        let proc: ReturnType<typeof crossSpawn>;
+        try {
+            proc = crossSpawn(command, args, {
+                stdio: ['pipe', 'pipe', 'pipe'],
+                env,
+                windowsHide: true,
+            });
+        } catch (error) {
+            await this.disconnectInternal();
+            throw error;
+        }
         this.process = proc;
 
         proc.on('error', (err) => {
@@ -721,6 +744,7 @@ export class CodexAppServerClient {
                 return;
             }
             this.connected = false;
+            void this.cleanupMultiAuthProxy();
             // Reject all pending requests
             for (const [id, req] of this.pending) {
                 if (req.epoch !== epoch) continue;
@@ -756,17 +780,26 @@ export class CodexAppServerClient {
                 experimentalApi: true,
             },
         };
-        await this.request('initialize', initParams);
-        this.notify('initialized');
-        this.connected = true;
-        logger.debug('[CodexAppServer] Connected and initialized');
+        try {
+            await this.request('initialize', initParams);
+            this.notify('initialized');
+            this.connected = true;
+            logger.debug('[CodexAppServer] Connected and initialized');
+        } catch (error) {
+            await this.disconnectInternal();
+            throw error;
+        }
     }
 
     private async disconnectInternal(opts?: {
         preserveThreadState?: boolean;
         preservePendingTurnCompletion?: boolean;
     }): Promise<void> {
-        if (!this.connected && !this.process) return;
+        if (!this.connected
+            && !this.process
+            && !this.sandboxCleanup
+            && !this.multiAuthProxy
+            && !this.multiAuthProxyCleanup) return;
 
         const proc = this.process;
         const pid = proc?.pid;
@@ -829,11 +862,33 @@ export class CodexAppServerClient {
         }
         this.sandboxEnabled = false;
 
+        if (this.multiAuthProxy || this.multiAuthProxyCleanup) {
+            await this.cleanupMultiAuthProxy();
+        }
+
         logger.debug('[CodexAppServer] Disconnected');
     }
 
     async disconnect(): Promise<void> {
         await this.disconnectInternal();
+    }
+
+    private cleanupMultiAuthProxy(): Promise<void> {
+        if (this.multiAuthProxyCleanup) return this.multiAuthProxyCleanup;
+        const proxy = this.multiAuthProxy;
+        this.multiAuthProxy = null;
+        if (!proxy) return Promise.resolve();
+
+        const cleanup = Promise.resolve()
+            .then(() => proxy.cleanup())
+            .catch(() => undefined)
+            .finally(() => {
+                if (this.multiAuthProxyCleanup === cleanup) {
+                    this.multiAuthProxyCleanup = null;
+                }
+            });
+        this.multiAuthProxyCleanup = cleanup;
+        return cleanup;
     }
 
     private buildThreadConfig(mcpServers?: Record<string, unknown>): Record<string, unknown> | null {
