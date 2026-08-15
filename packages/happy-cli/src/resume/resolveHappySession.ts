@@ -82,7 +82,7 @@ function readAgentCredentials() {
     const credentials = readLocalHappyAgentCredentials();
     if (!credentials) {
         throw new Error(
-            `Cannot resume historical Happy sessions without ${credentialPath}. Run \`happy-agent auth login\` in this environment first.`,
+            `Cannot resume historical Happy sessions without ${credentialPath} or an authenticated Happy home directory. Run \`happy-agent auth login\` in this environment first.`,
         );
     }
     return credentials;
