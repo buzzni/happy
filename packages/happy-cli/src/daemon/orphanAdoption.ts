@@ -25,6 +25,33 @@ export type OrphanAdoptionResult =
   | { adopted: true; session: TrackedSession; startedAt: number }
   | { adopted: false; reason: 'no-pid' | 'pid-dead' | 'pid-conflict' };
 
+/** trackedPidOwner sentinel for a pid the daemon just spawned but whose
+ *  session-started webhook hasn't arrived yet (happySessionId still unset).
+ *  Never equals a real Happy session id, so resolveOrphanAdoption always
+ *  treats it as a conflict. */
+export const PENDING_SPAWN_OWNER = '<pending-daemon-spawn>';
+
+/**
+ * trackedPidOwner for resolveOrphanAdoption: identifies whether a pid is
+ * already claimed by this daemon, even before its happySessionId is known.
+ *
+ * spawnTrackedHappyProcess registers the pid synchronously at spawn time
+ * (startedBy: 'daemon'), but happySessionId is only filled in once the
+ * session-started webhook arrives. A runtime report that reaches the daemon
+ * in that window carries a *different* identity (the real session id) than
+ * the pending entry's undefined happySessionId, so a naive `tracked
+ * ?.happySessionId` lookup reports the pid as unclaimed. resolveOrphanAdoption
+ * then "adopts" the pending pid as an external session and overwrites its
+ * startedBy — the webhook's `existingSession.startedBy === 'daemon'` check
+ * then fails to match, its awaiter never resolves, and the RPC caller sees a
+ * 60s timeout even though the session spawned and is running fine (2026-08-15
+ * incident: session recovery routinely timed out this way).
+ */
+export function resolveTrackedPidOwner(tracked: { happySessionId?: string } | undefined): string | undefined {
+  if (!tracked) return undefined;
+  return tracked.happySessionId ?? PENDING_SPAWN_OWNER;
+}
+
 /**
  * Decide whether a runtime report from an untracked session should be adopted.
  */
