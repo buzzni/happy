@@ -10,6 +10,7 @@ import {
     clearActiveBashStreamCall,
 } from './bashStreamCallRegistry';
 import { BASH_STREAM_AGENT_TOOL_NAME } from './startHappyServer';
+import { recordToolUse, getToolNameById, shouldRedact } from '@/redact/redactGate';
 
 export type ClaudeSessionProtocolState = {
     currentTurnId: string | null;
@@ -27,6 +28,34 @@ type ClaudeMapperResult = {
     currentTurnId: string | null;
     envelopes: SessionEnvelope[];
 };
+
+type ToolResultImage = { mediaType: string; data: string };
+
+/**
+ * Pull base64 image blocks out of a tool_result body (e.g. Read on a .png).
+ * Mirrors the web's `extractToolResultImages` (parseAgentContent.ts) — kept
+ * separate since the two sides don't share a package, but must stay in sync:
+ * only base64-sourced image blocks survive, anything else (plain string
+ * body, text blocks, url-sourced images) yields undefined.
+ * specs/20260815-chat-tool-result-image-render.
+ */
+function extractToolResultImages(content: unknown): ToolResultImage[] | undefined {
+    if (!Array.isArray(content)) return undefined;
+    const images: ToolResultImage[] = [];
+    for (const block of content) {
+        if (!block || typeof block !== 'object') continue;
+        const { type, source } = block as { type?: string; source?: unknown };
+        if (type !== 'image' || !source || typeof source !== 'object') continue;
+        const { type: sourceType, media_type: mediaType, data } = source as {
+            type?: string;
+            media_type?: string;
+            data?: string;
+        };
+        if (sourceType !== 'base64' || !mediaType || !data) continue;
+        images.push({ mediaType, data });
+    }
+    return images.length > 0 ? images : undefined;
+}
 
 function isSubagentTool(name: string): boolean {
     return name === 'Task' || name === 'Agent';
@@ -504,6 +533,10 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
             if (block.type === 'tool_use') {
                 const call = typeof block.id === 'string' && block.id.length > 0 ? block.id : createId();
                 const name = typeof block.name === 'string' && block.name.length > 0 ? block.name : 'unknown';
+                // (id -> name) so the matching tool_result can apply the same
+                // redact policy to its images that redactGate already applies
+                // to text (specs/20260815-chat-tool-result-image-render).
+                recordToolUse(call, name);
                 const baseArgs = toToolArgs(block.input);
                 const title = toolTitle(name, block.input);
                 const sessionSubagentForCall = ensureSessionSubagentIdForProviderSubagent(state, call);
@@ -629,9 +662,13 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                         maybeEmitSubagentStop(state, turnId, sessionSubagentForToolResult, envelopes);
                     }
                 }
+                const images = shouldRedact(getToolNameById(block.tool_use_id))
+                    ? undefined
+                    : extractToolResultImages((block as { content?: unknown }).content);
                 envelopes.push(createEnvelope('agent', {
                     t: 'tool-call-end',
                     call: block.tool_use_id,
+                    ...(images ? { images } : {}),
                 }, { turn: turnId, subagent }));
                 clearActiveBashStreamCall(block.tool_use_id);
                 continue;
