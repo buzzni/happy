@@ -699,6 +699,13 @@ ${chalk.bold('To clean up runaway processes:')} Use ${chalk.cyan('happy doctor c
     }
 
     // Show help
+    //
+    // Contract with aplus-dev-studio web-ui: it greps this output for the
+    // literal "happy grok" to decide whether a machine can spawn Grok at all
+    // (packages/web-ui/src/lib/sync/agentLoginProbe.ts). Daemons predating
+    // Grok support reject the agent with "Unsupported agent type", so the
+    // picker hides Grok when the substring is missing. Reflowing or renaming
+    // that line silently removes Grok from the session picker.
     if (showHelp) {
       console.log(`
 ${chalk.bold('happy')} - Claude Code On the Go
