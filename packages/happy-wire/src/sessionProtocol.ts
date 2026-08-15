@@ -38,9 +38,17 @@ export const sessionToolCallStartEventSchema = z.object({
   args: z.record(z.string(), z.unknown()),
 });
 
+// specs/20260815-chat-tool-result-image-render — a tool_result (e.g. Read on
+// an image file) carries base64 image blocks in its content. They ride
+// inline on the same tool-call-end event that already reports the call
+// finished, rather than a separate attachment-blob upload: this envelope
+// stream is already the transport the client decrypts and renders text
+// through, so no new upload/download/decrypt path is needed. Optional —
+// existing consumers that only read `.call` are unaffected.
 export const sessionToolCallEndEventSchema = z.object({
   t: z.literal('tool-call-end'),
   call: z.string(),
+  images: z.array(z.object({ mediaType: z.string(), data: z.string() })).optional(),
 });
 
 // chat-tool-output-streaming Phase 3 — daemon-emitted incremental

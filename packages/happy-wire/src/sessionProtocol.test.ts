@@ -22,6 +22,14 @@ describe('session protocol schemas', () => {
         args: { command: 'ls -la' },
       },
       { t: 'tool-call-end', call: 'call-1' },
+      // specs/20260815-chat-tool-result-image-render — a tool_result (e.g.
+      // Read on a .png) carries base64 image blocks; they ride inline on the
+      // same tool-call-end event that already reports the call finished.
+      {
+        t: 'tool-call-end',
+        call: 'call-2',
+        images: [{ mediaType: 'image/png', data: 'AAA' }],
+      },
       // chat-tool-output-streaming Phase 3 — daemon streams stdout/stderr
       // chunks while a long-running Bash MCP call is in flight.
       { t: 'tool-call-progress', call: 'call-1', stream: 'stdout', lines: ['build started', '...'] },

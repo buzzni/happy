@@ -110,6 +110,129 @@ describe('mapClaudeLogMessageToSessionEnvelopes', () => {
         );
     });
 
+    it('carries base64 image blocks from a tool_result inline on tool-call-end', () => {
+        // specs/20260815-chat-tool-result-image-render — Read on an image
+        // returns a tool_result whose content holds a base64 image block.
+        mapClaudeLogMessageToSessionEnvelopes({
+            type: 'assistant',
+            uuid: 'a-img-1',
+            message: {
+                role: 'assistant',
+                content: [
+                    { type: 'tool_use', id: 'tool-img-1', name: 'Read', input: { file_path: '/tmp/a.png' } },
+                ],
+            },
+        } as any, { currentTurnId: null });
+
+        const started = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'assistant',
+            uuid: 'a-img-1',
+            message: {
+                role: 'assistant',
+                content: [
+                    { type: 'tool_use', id: 'tool-img-1', name: 'Read', input: { file_path: '/tmp/a.png' } },
+                ],
+            },
+        } as any, { currentTurnId: null });
+
+        const ended = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'user',
+            uuid: 'u-img-1',
+            message: {
+                role: 'user',
+                content: [
+                    {
+                        type: 'tool_result',
+                        tool_use_id: 'tool-img-1',
+                        content: [
+                            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAA' } },
+                        ],
+                    },
+                ],
+            },
+        } as any, { currentTurnId: started.currentTurnId });
+
+        expect(ended.envelopes).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({
+                    ev: {
+                        t: 'tool-call-end',
+                        call: 'tool-img-1',
+                        images: [{ mediaType: 'image/png', data: 'AAA' }],
+                    },
+                }),
+            ]),
+        );
+    });
+
+    it('omits images when the tool_result content has none', () => {
+        const started = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'assistant',
+            uuid: 'a-noimg-1',
+            message: {
+                role: 'assistant',
+                content: [
+                    { type: 'tool_use', id: 'tool-noimg-1', name: 'Bash', input: { command: 'ls' } },
+                ],
+            },
+        } as any, { currentTurnId: null });
+
+        const ended = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'user',
+            uuid: 'u-noimg-1',
+            message: {
+                role: 'user',
+                content: [
+                    { type: 'tool_result', tool_use_id: 'tool-noimg-1', content: 'ok' },
+                ],
+            },
+        } as any, { currentTurnId: started.currentTurnId });
+
+        expect(ended.envelopes).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({ ev: { t: 'tool-call-end', call: 'tool-noimg-1' } }),
+            ]),
+        );
+    });
+
+    it('drops images from a tool whose name matches the redact policy', () => {
+        // The MCP prefix policy already redacts text for these tools
+        // (redactGate.ts); images from the same tools must not leak either.
+        const started = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'assistant',
+            uuid: 'a-redact-1',
+            message: {
+                role: 'assistant',
+                content: [
+                    { type: 'tool_use', id: 'tool-redact-1', name: 'mcp__aplus-common__inspect_org_repository', input: {} },
+                ],
+            },
+        } as any, { currentTurnId: null });
+
+        const ended = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'user',
+            uuid: 'u-redact-1',
+            message: {
+                role: 'user',
+                content: [
+                    {
+                        type: 'tool_result',
+                        tool_use_id: 'tool-redact-1',
+                        content: [
+                            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAA' } },
+                        ],
+                    },
+                ],
+            },
+        } as any, { currentTurnId: started.currentTurnId });
+
+        expect(ended.envelopes).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({ ev: { t: 'tool-call-end', call: 'tool-redact-1' } }),
+            ]),
+        );
+    });
+
     it('exposes the generated session subagent id on Agent tool calls', () => {
         const started = mapClaudeLogMessageToSessionEnvelopes({
             type: 'assistant',
