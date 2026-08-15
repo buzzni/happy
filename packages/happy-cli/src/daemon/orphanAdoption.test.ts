@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { resolveOrphanAdoption, collectStartupOrphans, EXTERNAL_SESSION_STARTED_BY } from './orphanAdoption'
+import {
+  resolveOrphanAdoption,
+  collectStartupOrphans,
+  resolveTrackedPidOwner,
+  EXTERNAL_SESSION_STARTED_BY,
+  PENDING_SPAWN_OWNER,
+} from './orphanAdoption'
 import type { PersistedSession } from '@/persistence'
 import type { Metadata } from '@/api/types'
 
@@ -258,6 +264,38 @@ describe('resolveOrphanAdoption — PID already claimed', () => {
     })
 
     expect(result.adopted).toBe(true)
+  })
+})
+
+describe('resolveTrackedPidOwner', () => {
+  it('reports no owner for an untracked pid', () => {
+    expect(resolveTrackedPidOwner(undefined)).toBeUndefined()
+  })
+
+  it('reports the happySessionId for a fully tracked pid', () => {
+    expect(resolveTrackedPidOwner({ happySessionId: 'sess-1' })).toBe('sess-1')
+  })
+
+  // The 2026-08-15 recovery-timeout incident: a daemon-spawned entry is
+  // registered before its session-started webhook arrives, so happySessionId
+  // is still unset. Reporting undefined here lets a racing runtime report
+  // fall through resolveOrphanAdoption's owner check and adopt the pid out
+  // from under the pending spawn.
+  it('reports a pending-spawn sentinel for a tracked pid with no happySessionId yet', () => {
+    expect(resolveTrackedPidOwner({})).toBe(PENDING_SPAWN_OWNER)
+  })
+
+  it('the pending-spawn sentinel makes resolveOrphanAdoption refuse the pid', () => {
+    const result = resolveOrphanAdoption({
+      sessionId: 'sess-racing-report',
+      hostPid: 4242,
+      persistedSessions: {},
+      isPidAlive: () => true,
+      trackedPidOwner: (pid) => (pid === 4242 ? resolveTrackedPidOwner({}) : undefined),
+      now: NOW,
+    })
+
+    expect(result).toEqual({ adopted: false, reason: 'pid-conflict' })
   })
 })
 

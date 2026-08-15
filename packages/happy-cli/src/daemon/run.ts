@@ -86,7 +86,7 @@ import {
   type StopSessionContext,
   type StopSessionResult,
 } from './sessionIdleReaper';
-import { resolveOrphanAdoption, collectStartupOrphans } from './orphanAdoption';
+import { resolveOrphanAdoption, collectStartupOrphans, resolveTrackedPidOwner } from './orphanAdoption';
 import { createAutomationStore } from './automations/automationStore';
 import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
@@ -536,7 +536,7 @@ export async function startDaemon(): Promise<void> {
         ...(hostPid !== undefined ? { hostPid } : {}),
         persistedSessions: readPersistedSessions(),
         isPidAlive,
-        trackedPidOwner: (pid) => pidToTrackedSession.get(pid)?.happySessionId,
+        trackedPidOwner: (pid) => resolveTrackedPidOwner(pidToTrackedSession.get(pid)),
         now: Date.now(),
       });
 
