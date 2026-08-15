@@ -1,11 +1,29 @@
 export type AcpAgentConfig = {
   command: string;
   args: string[];
+  /**
+   * Args that must stay at the very end, after any user passthrough flags.
+   *
+   * Needed by CLIs whose ACP entry point is a leaf subcommand while the flags
+   * that matter (model, effort, approval) belong to its parent — `grok agent
+   * -m <model> stdio`. Appending the subcommand first would make those flags
+   * land on the leaf, which rejects them.
+   */
+  trailingArgs?: string[];
 };
 
 export const KNOWN_ACP_AGENTS: Record<string, AcpAgentConfig> = {
   gemini: { command: 'gemini', args: ['--experimental-acp'] },
   opencode: { command: 'opencode', args: ['acp'] },
+  // `grok agent stdio` speaks ACP protocolVersion 1 over JSON-RPC, which is the
+  // version AcpBackend negotiates. The interactive TUI (plain `grok`) does not.
+  // Tool approvals go through happy's own ACP prompt, like every other ACP
+  // agent. Happy's `--dangerously-skip-permissions` is deliberately NOT mapped
+  // to grok's `--always-approve`: the daemon appends that flag to every remote
+  // spawn without an explicit permission mode, so mapping it would silently
+  // auto-approve every app-started session. Users who want it pass
+  // `--always-approve` (or `--yolo`, which grok accepts) themselves.
+  grok: { command: 'grok', args: ['agent'], trailingArgs: ['stdio'] },
 };
 
 export type ResolvedAcpAgentConfig = {
@@ -56,6 +74,42 @@ function filterHappyInternalFlags(args: string[]): string[] {
   return out;
 }
 
+export type ParsedAcpSubcommandArgs = {
+  startedBy?: 'daemon' | 'terminal';
+  verbose: boolean;
+  /** Remaining argv to hand to `resolveAcpAgentConfig`. */
+  acpArgs: string[];
+};
+
+/**
+ * Split happy's own `acp` subcommand flags off the front of the argv.
+ *
+ * After a `--` separator the user owns the rest of the argv, so `--verbose`
+ * and `--started-by` past that point belong to the underlying agent and are
+ * forwarded verbatim.
+ */
+export function parseAcpSubcommandArgs(rest: string[]): ParsedAcpSubcommandArgs {
+  let startedBy: 'daemon' | 'terminal' | undefined = undefined;
+  let verbose = false;
+  const acpArgs: string[] = [];
+  let customCommandMode = false;
+  for (let i = 0; i < rest.length; i++) {
+    if (!customCommandMode && rest[i] === '--started-by') {
+      startedBy = rest[++i] as 'daemon' | 'terminal';
+      continue;
+    }
+    if (!customCommandMode && rest[i] === '--verbose') {
+      verbose = true;
+      continue;
+    }
+    if (rest[i] === '--') {
+      customCommandMode = true;
+    }
+    acpArgs.push(rest[i]);
+  }
+  return { startedBy, verbose, acpArgs };
+}
+
 export function resolveAcpAgentConfig(cliArgs: string[]): ResolvedAcpAgentConfig {
   if (cliArgs.length === 0) {
     throw new Error('Usage: happy acp <agent-name> or happy acp -- <command> [args]');
@@ -86,7 +140,7 @@ export function resolveAcpAgentConfig(cliArgs: string[]): ResolvedAcpAgentConfig
     return {
       agentName,
       command: known.command,
-      args: [...known.args, ...passthroughArgs],
+      args: [...known.args, ...passthroughArgs, ...(known.trailingArgs ?? [])],
     };
   }
 

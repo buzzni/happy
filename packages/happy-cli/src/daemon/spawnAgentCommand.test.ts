@@ -15,6 +15,16 @@ describe('spawnAgentCommand', () => {
     expect(resolveTmuxSpawnAgentCommand('opencode')).toBe('acp opencode')
   })
 
+  it('spawns grok through its own first-class subcommand', () => {
+    expect(resolveRegularSpawnAgentArgs('grok')).toEqual(['grok'])
+    expect(resolveTmuxSpawnAgentCommand('grok')).toBe('grok')
+  })
+
+  it('carries the xAI api key when grok runs read-only', () => {
+    expect(resolveReadOnlyAgentAuthEnvironment('grok', { XAI_API_KEY: 'xai', OPENAI_API_KEY: 'codex' }))
+      .toEqual({ XAI_API_KEY: 'xai' })
+  })
+
   it('keeps existing agents on their direct commands', () => {
     expect(resolveRegularSpawnAgentArgs('claude')).toEqual(['claude'])
     expect(resolveRegularSpawnAgentArgs('codex')).toEqual(['codex'])

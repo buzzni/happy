@@ -383,30 +383,15 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       process.exit(1)
     }
     return;
-  } else if (subcommand === 'acp') {
+  } else if (subcommand === 'acp' || subcommand === 'grok') {
     try {
-      const { runAcp, resolveAcpAgentConfig } = await import('@/agent/acp');
+      const { runAcp, resolveAcpAgentConfig, parseAcpSubcommandArgs } = await import('@/agent/acp');
 
-      let startedBy: 'daemon' | 'terminal' | undefined = undefined;
-      let verbose = false;
-      const acpArgs: string[] = [];
-      let customCommandMode = false;
-      for (let i = 1; i < args.length; i++) {
-        if (!customCommandMode && args[i] === '--started-by') {
-          startedBy = args[++i] as 'daemon' | 'terminal';
-          continue;
-        }
-        if (!customCommandMode && args[i] === '--verbose') {
-          verbose = true;
-          continue;
-        }
-        if (args[i] === '--') {
-          customCommandMode = true;
-        }
-        acpArgs.push(args[i]);
-      }
+      const { startedBy, verbose, acpArgs } = parseAcpSubcommandArgs(args.slice(1));
 
-      const resolved = resolveAcpAgentConfig(acpArgs);
+      // `happy grok` is `happy acp grok` with the agent name pinned, so every
+      // remaining flag (-m, --reasoning-effort, ...) still reaches the Grok CLI.
+      const resolved = resolveAcpAgentConfig(subcommand === 'grok' ? ['grok', ...acpArgs] : acpArgs);
       const { credentials } = await authAndSetupMachineIfNeeded();
       await ensureDaemonRunning()
 
@@ -714,6 +699,13 @@ ${chalk.bold('To clean up runaway processes:')} Use ${chalk.cyan('happy doctor c
     }
 
     // Show help
+    //
+    // Contract with aplus-dev-studio web-ui: it greps this output for the
+    // literal "happy grok" to decide whether a machine can spawn Grok at all
+    // (packages/web-ui/src/lib/sync/agentLoginProbe.ts). Daemons predating
+    // Grok support reject the agent with "Unsupported agent type", so the
+    // picker hides Grok when the substring is missing. Reflowing or renaming
+    // that line silently removes Grok from the session picker.
     if (showHelp) {
       console.log(`
 ${chalk.bold('happy')} - Claude Code On the Go
@@ -724,6 +716,7 @@ ${chalk.bold('Usage:')}
   happy resume            Resume a previous Happy session by Happy session ID
   happy codex             Start Codex mode
   happy gemini            Start Gemini mode (ACP)
+  happy grok              Start Grok mode (ACP)
   happy acp               Start a generic ACP-compatible agent
   happy connect           Connect AI vendor API keys
   happy sandbox           Configure and manage OS-level sandboxing
@@ -745,6 +738,7 @@ ${chalk.bold('Examples:')}
   happy --js-runtime bun   Use bun instead of node to spawn Claude Code
   happy --claude-env ANTHROPIC_BASE_URL=http://127.0.0.1:3456
                            Use a custom API endpoint (e.g., claude-code-router)
+  happy grok -m grok-4.6   Start Grok on a specific model
   happy acp gemini         Start Gemini via generic ACP runner
   happy acp -- opencode --acp
                            Start a custom ACP command

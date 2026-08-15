@@ -1,11 +1,46 @@
 import { describe, expect, it } from 'vitest';
-import { KNOWN_ACP_AGENTS, resolveAcpAgentConfig } from './acpAgentConfig';
+import { KNOWN_ACP_AGENTS, parseAcpSubcommandArgs, resolveAcpAgentConfig } from './acpAgentConfig';
+
+describe('parseAcpSubcommandArgs', () => {
+  it('extracts happy-owned flags and leaves the agent argv intact', () => {
+    expect(parseAcpSubcommandArgs(['--started-by', 'daemon', '--verbose', 'gemini'])).toEqual({
+      startedBy: 'daemon',
+      verbose: true,
+      acpArgs: ['gemini'],
+    });
+  });
+
+  it('defaults to terminal-unset and non-verbose', () => {
+    expect(parseAcpSubcommandArgs(['gemini'])).toEqual({
+      startedBy: undefined,
+      verbose: false,
+      acpArgs: ['gemini'],
+    });
+  });
+
+  it('stops claiming flags once the -- separator hands argv to the agent', () => {
+    expect(parseAcpSubcommandArgs(['--', 'custom-agent', '--verbose', '--started-by', 'daemon'])).toEqual({
+      startedBy: undefined,
+      verbose: false,
+      acpArgs: ['--', 'custom-agent', '--verbose', '--started-by', 'daemon'],
+    });
+  });
+
+  it('keeps happy flags that precede the -- separator', () => {
+    expect(parseAcpSubcommandArgs(['--verbose', '--', 'custom-agent', '--verbose'])).toEqual({
+      startedBy: undefined,
+      verbose: true,
+      acpArgs: ['--', 'custom-agent', '--verbose'],
+    });
+  });
+});
 
 describe('KNOWN_ACP_AGENTS', () => {
-  it('defines built-in Gemini and OpenCode command mappings', () => {
+  it('defines built-in Gemini, OpenCode and Grok command mappings', () => {
     expect(KNOWN_ACP_AGENTS).toEqual({
       gemini: { command: 'gemini', args: ['--experimental-acp'] },
       opencode: { command: 'opencode', args: ['acp'] },
+      grok: { command: 'grok', args: ['agent'], trailingArgs: ['stdio'] },
     });
   });
 });
@@ -16,6 +51,61 @@ describe('resolveAcpAgentConfig', () => {
       agentName: 'gemini',
       command: 'gemini',
       args: ['--experimental-acp'],
+    });
+  });
+
+  it('resolves grok to its ACP stdio subcommand', () => {
+    expect(resolveAcpAgentConfig(['grok'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', 'stdio'],
+    });
+  });
+
+  it('keeps trailing args last for agents that take flags before their subcommand', () => {
+    expect(resolveAcpAgentConfig(['grok', '--reasoning-effort', 'high', '--always-approve'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', '--reasoning-effort', 'high', '--always-approve', 'stdio'],
+    });
+  });
+
+  // `-m`, `--reasoning-effort` and `--always-approve` belong to `grok agent`,
+  // not to its `stdio` leaf. Appending them after `stdio` makes the Grok CLI
+  // exit with "unexpected argument" before the ACP handshake starts.
+  it('places grok passthrough flags before the stdio subcommand', () => {
+    expect(resolveAcpAgentConfig(['grok', '-m', 'grok-4.6'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', '-m', 'grok-4.6', 'stdio'],
+    });
+  });
+
+  // The daemon appends `--dangerously-skip-permissions` to EVERY remote spawn
+  // that has no explicit permission mode, so translating it into grok's
+  // `--always-approve` would auto-approve every app-started session and bypass
+  // happy's own ACP approval prompt. ACP agents approve in the app instead.
+  it('never turns happy permission flags into grok auto-approve', () => {
+    expect(resolveAcpAgentConfig(['grok', '--dangerously-skip-permissions'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', 'stdio'],
+    });
+  });
+
+  it('still forwards an explicit grok auto-approve flag', () => {
+    expect(resolveAcpAgentConfig(['grok', '--always-approve'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', '--always-approve', 'stdio'],
+    });
+  });
+
+  it('strips happy-internal flags before forwarding to grok', () => {
+    expect(resolveAcpAgentConfig(['grok', '--happy-starting-mode', 'remote', '-m', 'grok-4.6'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', '-m', 'grok-4.6', 'stdio'],
     });
   });
 

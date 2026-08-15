@@ -440,12 +440,15 @@ type PendingTurn = {
   watchdog: TurnInactivityWatchdog;
 };
 
-function resolveSessionFlavor(agentName: string): 'gemini' | 'opencode' | 'acp' {
+function resolveSessionFlavor(agentName: string): 'gemini' | 'opencode' | 'grok' | 'acp' {
   if (agentName === 'gemini') {
     return 'gemini';
   }
   if (agentName === 'opencode') {
     return 'opencode';
+  }
+  if (agentName === 'grok') {
+    return 'grok';
   }
   return 'acp';
 }
