@@ -22,7 +22,7 @@ describe('spawnAgentCommand', () => {
   })
 
   it('carries the xAI api key when grok runs read-only', () => {
-    expect(resolveReadOnlyAgentAuthEnvironment('grok', { XAI_API_KEY: 'xai', OPENAI_API_KEY: 'codex' }))
+    expect(resolveAgentAuthEnvironment('grok', { XAI_API_KEY: 'xai', OPENAI_API_KEY: 'codex' }))
       .toEqual({ XAI_API_KEY: 'xai' })
   })
 
