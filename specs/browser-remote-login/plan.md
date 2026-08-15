@@ -117,3 +117,21 @@ args 빌더가 약속하지 않은 결합을 만든다).
 해당 2건이 실패). 컨테이너 E2E **6/6**: 기동 → 스택 kill → 죽은 것 확인 →
 재기동되고 `/vnc.html` 200 → 새 클라이언트(재시작 모사)가 기존 스택을
 채택(`reused: true`) → 뷰어 포트 listener 가 여전히 1개.
+
+## 후속 수정 — 검은 화면 (2026-08-15)
+
+dev 에서 릴레이 URL 을 열면 noVNC 는 뜨는데 **화면이 검게** 나왔다.
+
+원인: `browser-viewer/open` 라우트가 `status → start → mint` 만 호출하고
+**Chrome 을 띄우는 경로를 전혀 부르지 않았다**. Xvfb 는 그 자체로 아무것도
+그리지 않으므로 빈 디스플레이가 그대로 보인 것이다. Phase 4a 에서 만든
+`browser-setup:launch({ viewer: true })` 가 UI 에서 호출되지 않아 고아로
+남아 있었다.
+
+`startViewerStack` 이 세 경로(신규 기동 / 재사용 / 채택) 모두에서
+`ensureViewerBrowser(display)` 를 거치게 했다. 브라우저 존재 여부는
+캐시가 아니라 CDP 포트 프로브로 판정한다 — 데몬보다 오래 산 Chrome 을
+채택해야 클릭할 때마다 같은 디스플레이에 Chrome 이 한 대씩 쌓이지 않는다.
+
+검증: 유닛 71개. 컨테이너 E2E 4/4 — 스택 기동 후 `xwininfo` 에 Chrome
+창이 실제로 존재하고, 재호출해도 Chrome 프로세스 수가 늘지 않는다.
