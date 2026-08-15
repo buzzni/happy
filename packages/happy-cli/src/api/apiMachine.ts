@@ -60,6 +60,7 @@ import {
     buildXvfbArgs,
     VIEWER_VNC_PORTS,
     VIEWER_WEB_PORTS,
+    decideViewerBrowserAction,
     decideViewerStackAction,
     detectMissingViewerTools,
     isViewerServing,
@@ -1045,6 +1046,7 @@ export class ApiMachineClient {
             adoptable: cachedAlive ? null : await findRunningViewer(),
         });
         if (decision.action === 'reuse' && this.viewer) {
+            await this.ensureViewerBrowser(this.viewer.display);
             return { ...this.viewer, ready: true, reused: true };
         }
         if (decision.action === 'adopt') {
@@ -1052,6 +1054,7 @@ export class ApiMachineClient {
             // spawning a duplicate that leaks ports until none are left.
             const adopted = { display: ':99', vncPort: null, webPort: decision.webPort };
             this.viewer = adopted;
+            await this.ensureViewerBrowser(adopted.display);
             return { ...adopted, ready: true, reused: true };
         }
         this.viewer = null;
@@ -1071,7 +1074,41 @@ export class ApiMachineClient {
         }));
         const ready = await waitForPort(webPort, 15_000);
         this.viewer = { display, vncPort, webPort };
+        await this.ensureViewerBrowser(display);
         return { display, vncPort, webPort, ready, reused: false };
+    }
+
+    /**
+     * Puts a browser on the viewer display, or reuses the one already there.
+     *
+     * Without this the viewer is a black screen: Xvfb renders nothing on its
+     * own, and the "원격 브라우저 화면 열기" flow never called the launch
+     * path. Reuse is probed rather than cached so a browser that outlived the
+     * daemon is adopted instead of a second Chrome being stacked onto the
+     * same display, one per click.
+     */
+    private async ensureViewerBrowser(display: string): Promise<void> {
+        const chrome = await detectChrome();
+        if (!chrome) return; // Chrome 미설치는 별도 버튼이 안내한다.
+        let liveCdpPort: number | null = null;
+        for (const port of CDP_PORT_RANGE) {
+            if (await isCdpReachable(port)) { liveCdpPort = port; break; }
+        }
+        if (decideViewerBrowserAction({ liveCdpPort }).action === 'reuse') return;
+
+        const cdpPort = await pickFreeCdpPort();
+        if (cdpPort === null) return;
+        const userDataDir = resolveProfileUserDataDir(
+            join(configuration.happyHomeDir, 'chrome-profiles'),
+            'default',
+        );
+        const env = { DISPLAY: display };
+        launchChrome(chrome.path, { userDataDir, cdpPort, headless: false }, env);
+        if (!(await waitForCdp(cdpPort, 15_000))) {
+            // Same kernel/namespace fallback the launch RPC uses.
+            launchChrome(chrome.path, { userDataDir, cdpPort, headless: false, noSandbox: true }, env);
+            await waitForCdp(cdpPort, 15_000);
+        }
     }
 
     private requestServerAutomationSync(): void {

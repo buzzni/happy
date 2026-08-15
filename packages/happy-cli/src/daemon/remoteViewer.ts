@@ -147,6 +147,30 @@ export function decideViewerStackAction(input: {
     return { action: 'start' }
 }
 
+export type ViewerBrowserDecision =
+    | { action: 'reuse'; cdpPort: number }
+    | { action: 'launch'; cdpPort?: undefined }
+
+/**
+ * Whether the viewer display still needs a browser put on it.
+ *
+ * Xvfb by itself renders nothing, so a viewer started without a browser is a
+ * black screen — which is exactly what the "원격 브라우저 화면 열기" button
+ * produced: the open flow brought up Xvfb/x11vnc/websockify and never
+ * launched Chrome onto the display.
+ *
+ * `liveCdpPort` must come from probing our own CDP candidate ports, so a
+ * browser that outlived the daemon is reused rather than stacked on top of.
+ */
+export function decideViewerBrowserAction(input: {
+    liveCdpPort: number | null
+}): ViewerBrowserDecision {
+    if (input.liveCdpPort !== null) {
+        return { action: 'reuse', cdpPort: input.liveCdpPort }
+    }
+    return { action: 'launch' }
+}
+
 function which(binary: string): Promise<string | null> {
     return new Promise((resolve) => {
         const child = spawn('which', [binary], { stdio: ['ignore', 'pipe', 'ignore'] })

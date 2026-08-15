@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
     VIEWER_WEB_PORTS,
+    decideViewerBrowserAction,
     decideViewerStackAction,
     buildWebsockifyArgs,
     buildX11vncArgs,
@@ -171,5 +172,24 @@ describe('VIEWER_WEB_PORTS as the single source of truth', () => {
         // be spawned beside it.
         expect(VIEWER_WEB_PORTS.length).toBeGreaterThan(0)
         expect([...VIEWER_WEB_PORTS]).toEqual([6080, 6081, 6082])
+    })
+})
+
+describe('decideViewerBrowserAction', () => {
+    it('launches a browser when the display has none', () => {
+        // A viewer with no browser on it is a black screen — exactly what the
+        // "원격 브라우저 화면 열기" button produced: the open flow started
+        // Xvfb/x11vnc/websockify and never put anything on the display.
+        const decision = decideViewerBrowserAction({ liveCdpPort: null })
+
+        expect(decision).toEqual({ action: 'launch' })
+    })
+
+    it('reuses the browser already on the display instead of stacking another', () => {
+        // Every click would otherwise pile one more Chrome onto the same
+        // Xvfb, each grabbing the next CDP port.
+        const decision = decideViewerBrowserAction({ liveCdpPort: 9222 })
+
+        expect(decision).toEqual({ action: 'reuse', cdpPort: 9222 })
     })
 })
