@@ -308,6 +308,10 @@ export const it: TranslationStructure = {
         forkErrorMissingMetadata: 'Mancano i metadati della sessione necessari per biforcare.',
         forkErrorGeneric: 'Impossibile biforcare la sessione.',
         forkClaudeOnly: 'La biforcazione è attualmente supportata solo per le sessioni Claude.',
+        directoryApprovalRequired: 'Questa sessione non può essere ripresa perché richiede l\'approvazione della directory. Avviala manualmente dalla sua posizione originale.',
+        failedToDeliverInitialPrompt: 'Il recupero della sessione è stato avviato ma non è stato possibile consegnare il tuo messaggio. Per favore riprova.',
+        sendFailedNoRunningAgent: 'No agent is running for this session, so your message was not delivered.',
+        sessionRecoveredInNewConversation: 'Sessione recuperata in una nuova conversazione. Il tuo messaggio è stato consegnato.',
     },
 
     commandPalette: {

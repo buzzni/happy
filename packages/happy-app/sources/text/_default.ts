@@ -324,6 +324,11 @@ export const en = {
         forkErrorMissingMetadata: 'Missing session metadata required to fork.',
         forkErrorGeneric: 'Failed to fork the session.',
         forkClaudeOnly: 'Fork is currently only supported for Claude sessions.',
+        // Session recovery (resume/recover when CLI is dead)
+        directoryApprovalRequired: 'This session cannot be resumed because it requires directory approval. Start it manually from its original location.',
+        failedToDeliverInitialPrompt: 'The session recovery initiated but failed to deliver your message. Please try again.',
+        sendFailedNoRunningAgent: 'No agent is running for this session, so your message was not delivered.',
+        sessionRecoveredInNewConversation: 'Session recovered in a new conversation. Your message has been delivered.',
     },
 
     commandPalette: {

@@ -91,7 +91,7 @@ type OutboxMessage = {
     content: string;
 };
 
-type SendMessageOptions = {
+export type SendMessageOptions = {
     displayText?: string;
     source?: MessageSentSource;
     /** Optional image attachments to send before the text message. */

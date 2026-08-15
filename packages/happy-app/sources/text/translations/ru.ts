@@ -430,6 +430,10 @@ export const ru: TranslationStructure = {
         forkErrorMissingMetadata: 'Не хватает метаданных сессии для форка.',
         forkErrorGeneric: 'Не удалось форкнуть сессию.',
         forkClaudeOnly: 'Форк сейчас поддерживается только для Claude-сессий.',
+        directoryApprovalRequired: 'Эту сессию нельзя возобновить, так как она требует подтверждения создания директории. Запустите её вручную из исходного пути.',
+        failedToDeliverInitialPrompt: 'Восстановление сессии начато, но не удалось доставить ваше сообщение. Попробуйте ещё раз.',
+        sendFailedNoRunningAgent: 'No agent is running for this session, so your message was not delivered.',
+        sessionRecoveredInNewConversation: 'Сессия восстановлена в новой беседе. Ваше сообщение доставлено.',
     },
 
     commandPalette: {

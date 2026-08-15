@@ -309,6 +309,10 @@ export const pt: TranslationStructure = {
         forkErrorMissingMetadata: 'Faltam metadados da sessão necessários para bifurcar.',
         forkErrorGeneric: 'Não foi possível bifurcar a sessão.',
         forkClaudeOnly: 'A bifurcação atualmente só é suportada para sessões Claude.',
+        directoryApprovalRequired: 'Esta sessão não pode ser retomada porque requer aprovação de diretório. Inicie-a manualmente de seu local original.',
+        failedToDeliverInitialPrompt: 'A recuperação da sessão foi iniciada, mas não foi possível entregar sua mensagem. Tente novamente.',
+        sendFailedNoRunningAgent: 'No agent is running for this session, so your message was not delivered.',
+        sessionRecoveredInNewConversation: 'Sessão recuperada em uma nova conversa. Sua mensagem foi entregue.',
     },
 
     commandPalette: {
