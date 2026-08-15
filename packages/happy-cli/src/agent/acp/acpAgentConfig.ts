@@ -10,14 +10,33 @@ export type AcpAgentConfig = {
    * land on the leaf, which rejects them.
    */
   trailingArgs?: string[];
+  /**
+   * Args that stand in for happy's own permission bypass.
+   *
+   * Happy strips `--dangerously-skip-permissions` from the agent argv, so an
+   * agent with no mapping here keeps prompting even though the user asked to
+   * bypass. Agents whose ACP `session/new` reports selectable modes get this
+   * mid-session instead and need no mapping.
+   */
+  bypassPermissionsArgs?: string[];
 };
+
+/** Happy's own way of saying "skip tool approval" (`--yolo` desugars to this). */
+const HAPPY_BYPASS_PERMISSION_FLAG = '--dangerously-skip-permissions';
 
 export const KNOWN_ACP_AGENTS: Record<string, AcpAgentConfig> = {
   gemini: { command: 'gemini', args: ['--experimental-acp'] },
   opencode: { command: 'opencode', args: ['acp'] },
   // `grok agent stdio` speaks ACP protocolVersion 1 over JSON-RPC, which is the
   // version AcpBackend negotiates. The interactive TUI (plain `grok`) does not.
-  grok: { command: 'grok', args: ['agent'], trailingArgs: ['stdio'] },
+  // Grok's `session/new` returns no ACP modes, so permission bypass cannot be
+  // negotiated mid-session and has to be a launch flag.
+  grok: {
+    command: 'grok',
+    args: ['agent'],
+    trailingArgs: ['stdio'],
+    bypassPermissionsArgs: ['--always-approve'],
+  },
 };
 
 export type ResolvedAcpAgentConfig = {
@@ -125,16 +144,20 @@ export function resolveAcpAgentConfig(cliArgs: string[]): ResolvedAcpAgentConfig
   const agentName = cliArgs[0];
   const known = KNOWN_ACP_AGENTS[agentName];
   if (known) {
+    const rawArgs = cliArgs.slice(1);
     const passthroughArgs = filterHappyInternalFlags(
-      cliArgs
-        .slice(1)
+      rawArgs
         // Backward-compatible with old OpenCode docs/flags.
         .filter((arg) => !(agentName === 'opencode' && arg === '--acp')),
     );
+    // Read the bypass intent off the raw argv: the filter above drops the flag.
+    const bypassArgs = rawArgs.includes(HAPPY_BYPASS_PERMISSION_FLAG)
+      ? known.bypassPermissionsArgs ?? []
+      : [];
     return {
       agentName,
       command: known.command,
-      args: [...known.args, ...passthroughArgs, ...(known.trailingArgs ?? [])],
+      args: [...known.args, ...passthroughArgs, ...bypassArgs, ...(known.trailingArgs ?? [])],
     };
   }
 

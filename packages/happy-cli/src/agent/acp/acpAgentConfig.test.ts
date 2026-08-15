@@ -40,7 +40,12 @@ describe('KNOWN_ACP_AGENTS', () => {
     expect(KNOWN_ACP_AGENTS).toEqual({
       gemini: { command: 'gemini', args: ['--experimental-acp'] },
       opencode: { command: 'opencode', args: ['acp'] },
-      grok: { command: 'grok', args: ['agent'], trailingArgs: ['stdio'] },
+      grok: {
+        command: 'grok',
+        args: ['agent'],
+        trailingArgs: ['stdio'],
+        bypassPermissionsArgs: ['--always-approve'],
+      },
     });
   });
 });
@@ -78,6 +83,28 @@ describe('resolveAcpAgentConfig', () => {
       agentName: 'grok',
       command: 'grok',
       args: ['agent', '-m', 'grok-4.6', 'stdio'],
+    });
+  });
+
+  // Happy strips its own `--dangerously-skip-permissions`, so without a mapping
+  // the user asks for bypass and grok silently keeps prompting for every tool.
+  it('translates happy permission bypass into the grok auto-approve flag', () => {
+    expect(resolveAcpAgentConfig(['grok', '--dangerously-skip-permissions'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', '--always-approve', 'stdio'],
+    });
+  });
+
+  it('does not auto-approve grok when bypass was not requested', () => {
+    expect(resolveAcpAgentConfig(['grok']).args).not.toContain('--always-approve');
+  });
+
+  it('leaves agents without a bypass mapping untouched', () => {
+    expect(resolveAcpAgentConfig(['gemini', '--dangerously-skip-permissions'])).toEqual({
+      agentName: 'gemini',
+      command: 'gemini',
+      args: ['--experimental-acp'],
     });
   });
 
