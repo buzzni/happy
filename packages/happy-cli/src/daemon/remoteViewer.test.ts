@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
+    VIEWER_WEB_PORTS,
+    decideViewerStackAction,
     buildWebsockifyArgs,
     buildX11vncArgs,
     buildXvfbArgs,
@@ -102,5 +104,72 @@ describe('planViewerInstall', () => {
         const plan = planViewerInstall({ missing: ['x11vnc'], canSudo: false, platform: 'darwin' })
 
         expect(plan.command ?? '').not.toContain('apt-get')
+    })
+})
+
+describe('decideViewerStackAction', () => {
+    it('reuses the cached stack while its port is still serving', () => {
+        const decision = decideViewerStackAction({
+            cached: { webPort: 6080 },
+            cachedAlive: true,
+            adoptable: null,
+        })
+
+        expect(decision).toEqual({ action: 'reuse', webPort: 6080 })
+    })
+
+    it('starts fresh when the cached stack has died', () => {
+        // The cache was assign-only and never probed, so a crashed x11vnc left
+        // `ready: true` going out forever and every retry handed back the same
+        // dead port — the feature could not recover without a daemon restart.
+        const decision = decideViewerStackAction({
+            cached: { webPort: 6080 },
+            cachedAlive: false,
+            adoptable: null,
+        })
+
+        expect(decision).toEqual({ action: 'start' })
+    })
+
+    it('adopts a stack that outlived the daemon instead of spawning a second one', () => {
+        // Xvfb/x11vnc/websockify are spawned detached, so a daemon restart
+        // leaves them running while the in-memory cache is empty. Starting
+        // again would bind the next port and leak a whole second stack; a few
+        // restarts exhaust the candidate list and the feature dies with
+        // "포트를 찾지 못했습니다".
+        const decision = decideViewerStackAction({
+            cached: null,
+            cachedAlive: false,
+            adoptable: { webPort: 6080 },
+        })
+
+        expect(decision).toEqual({ action: 'adopt', webPort: 6080 })
+    })
+
+    it('prefers adopting over starting when the cached entry is stale', () => {
+        const decision = decideViewerStackAction({
+            cached: { webPort: 6081 },
+            cachedAlive: false,
+            adoptable: { webPort: 6080 },
+        })
+
+        expect(decision).toEqual({ action: 'adopt', webPort: 6080 })
+    })
+
+    it('starts fresh when nothing is cached and nothing is already serving', () => {
+        const decision = decideViewerStackAction({ cached: null, cachedAlive: false, adoptable: null })
+
+        expect(decision).toEqual({ action: 'start' })
+    })
+})
+
+describe('VIEWER_WEB_PORTS as the single source of truth', () => {
+    it('is what both the start path and the adoption scan use', () => {
+        // The adoption scan and pickFreePort each had their own literal list.
+        // Adding a port to one and not the other silently breaks adoption:
+        // a stack on the new port would never be found and a duplicate would
+        // be spawned beside it.
+        expect(VIEWER_WEB_PORTS.length).toBeGreaterThan(0)
+        expect([...VIEWER_WEB_PORTS]).toEqual([6080, 6081, 6082])
     })
 })

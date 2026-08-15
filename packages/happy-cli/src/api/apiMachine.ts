@@ -58,7 +58,11 @@ import {
     buildWebsockifyArgs,
     buildX11vncArgs,
     buildXvfbArgs,
+    VIEWER_VNC_PORTS,
+    VIEWER_WEB_PORTS,
+    decideViewerStackAction,
     detectMissingViewerTools,
+    isViewerServing,
     planViewerInstall,
     spawnDetached,
 } from '@/daemon/remoteViewer';
@@ -304,7 +308,11 @@ export class ApiMachineClient {
     // Live raw-TCP tunnels for preview WebSocket upgrades (previewWsProxy.ts).
     private previewWsProxy: PreviewWsProxy | null = null;
     // Running noVNC stack for the remote browser screen, if started.
-    private viewer: { display: string; vncPort: number; webPort: number } | null = null;
+    // vncPort is null for a stack we adopted from a previous daemon: only the
+    // process that spawned it knows which VNC port it bound, and nothing after
+    // adoption reads it. Guessing it by arithmetic would encode a coupling the
+    // args builders do not actually promise.
+    private viewer: { display: string; vncPort: number | null; webPort: number } | null = null;
     private resumeSessionHandler: ((sessionId: string, options?: {
         model?: string;
         permissionMode?: string;
@@ -1020,16 +1028,37 @@ export class ApiMachineClient {
      * option, so "launch Chrome under the viewer" never spins up a second,
      * disconnected Xvfb (specs/browser-remote-login/).
      */
-    private async startViewerStack(): Promise<{ display: string; vncPort: number; webPort: number; ready: boolean; reused: boolean }> {
+    private async startViewerStack(): Promise<{ display: string; vncPort: number | null; webPort: number; ready: boolean; reused: boolean }> {
         const missing = await detectMissingViewerTools();
         if (missing.length > 0) {
             throw new Error(`원격 화면에 필요한 프로그램이 없습니다: ${missing.join(', ')}`);
         }
-        if (this.viewer) return { ...this.viewer, ready: true, reused: true };
+        // The cache is not evidence: the stack is spawned detached, so it both
+        // outlives the daemon and can die under it. Probe before trusting it.
+        const cachedAlive = this.viewer ? await isViewerServing(this.viewer.webPort) : false;
+        const decision = decideViewerStackAction({
+            cached: this.viewer,
+            cachedAlive,
+            // Scanned whenever the cache is not alive, not just when it is
+            // absent — a stale entry must not stop us adopting a stack that
+            // is genuinely serving, or we spawn a duplicate beside it.
+            adoptable: cachedAlive ? null : await findRunningViewer(),
+        });
+        if (decision.action === 'reuse' && this.viewer) {
+            return { ...this.viewer, ready: true, reused: true };
+        }
+        if (decision.action === 'adopt') {
+            // Left behind by a previous daemon. Re-registering it beats
+            // spawning a duplicate that leaks ports until none are left.
+            const adopted = { display: ':99', vncPort: null, webPort: decision.webPort };
+            this.viewer = adopted;
+            return { ...adopted, ready: true, reused: true };
+        }
+        this.viewer = null;
 
         const display = ':99';
-        const vncPort = await pickFreePort([5900, 5901, 5902]);
-        const webPort = await pickFreePort([6080, 6081, 6082]);
+        const vncPort = await pickFreePort([...VIEWER_VNC_PORTS]);
+        const webPort = await pickFreePort([...VIEWER_WEB_PORTS]);
         if (vncPort === null || webPort === null) {
             throw new Error('원격 화면에 쓸 포트를 찾지 못했습니다.');
         }
@@ -1756,6 +1785,20 @@ function delay(ms: number): Promise<void> {
 async function pickFreePort(candidates: number[]): Promise<number | null> {
     for (const port of candidates) {
         if (await isPortFree(port)) return port;
+    }
+    return null;
+}
+
+/**
+ * A viewer stack left running by a previous daemon, if any.
+ *
+ * Checks that the port actually serves noVNC rather than merely being bound —
+ * adopting an unrelated service would hand the user someone else's page as
+ * their browser screen.
+ */
+async function findRunningViewer(): Promise<{ webPort: number } | null> {
+    for (const webPort of VIEWER_WEB_PORTS) {
+        if (await isViewerServing(webPort)) return { webPort };
     }
     return null;
 }
