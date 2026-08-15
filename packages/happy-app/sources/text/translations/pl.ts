@@ -327,6 +327,9 @@ export const pl: TranslationStructure = {
         forkErrorMissingMetadata: 'Brak metadanych sesji wymaganych do rozwidlenia.',
         forkErrorGeneric: 'Nie udało się rozwidlić sesji.',
         forkClaudeOnly: 'Rozwidlenie jest obecnie obsługiwane tylko dla sesji Claude.',
+        directoryApprovalRequired: 'Ta sesja nie może być wznowiona, ponieważ wymaga zatwierdzenia katalogu. Uruchom ją ręcznie z jej oryginalnej lokalizacji.',
+        failedToDeliverInitialPrompt: 'Odzyskiwanie sesji zostało uruchomione, ale nie udało się dostarczyć wiadomości. Spróbuj ponownie.',
+        sessionRecoveredInNewConversation: 'Sesja odzyskana w nowej rozmowie. Wiadomość została dostarczona.',
     },
 
     commandPalette: {

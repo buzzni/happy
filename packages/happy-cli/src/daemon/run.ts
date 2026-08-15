@@ -53,7 +53,7 @@ import { scrubSessionLineageEnv, SESSION_LINEAGE_ENV_PREFIXES } from './sessionE
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
-import { encodeBase64, decodeBase64 } from '@/api/encryption';
+import { encodeBase64 } from '@/api/encryption';
 import {
   resolveInheritedSpawnEnvironment,
   resolveRegularSpawnAgentArgs,
@@ -87,6 +87,7 @@ import {
   type StopSessionResult,
 } from './sessionIdleReaper';
 import { resolveOrphanAdoption, collectStartupOrphans, resolveTrackedPidOwner } from './orphanAdoption';
+import { hydrateTrackedSessionFromPersisted } from './persistedSessionHydration';
 import { createAutomationStore } from './automations/automationStore';
 import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
@@ -304,6 +305,11 @@ export async function startDaemon(): Promise<void> {
     const pidToAdoptedAt = new Map<number, number>();
     const deadSessionsToCleanup: PersistedTrackedSession[] = [];
 
+    // Read once and share: session recovery, the orphan home-dir sweep and the
+    // finished-session map all need the same snapshot, and nothing writes
+    // sessions.json in between.
+    const persistedSessions = readPersistedSessions();
+
     // Recover sessions from previous daemon run
     const previousState = await readDaemonState();
     if (previousState?.trackedSessions?.length) {
@@ -311,11 +317,21 @@ export async function startDaemon(): Promise<void> {
       for (const persisted of previousState.trackedSessions) {
         if (isPidAlive(persisted.pid)) {
           const recovered: TrackedSession = {
+            // The state file records who and where, but not the session's
+            // encryption or resume cursor. Without them preserveSessionForResume
+            // bails, so the reaper would later kill this session without ever
+            // writing its cursor to disk and resume would refuse for good
+            // (2026-08-15 incident). sessions.json has both.
+            ...(persisted.happySessionId
+              ? hydrateTrackedSessionFromPersisted(persistedSessions[persisted.happySessionId])
+              : {}),
             startedBy: persisted.startedBy,
             pid: persisted.pid,
             happySessionId: persisted.happySessionId,
             tmuxSessionId: persisted.tmuxSessionId,
-            userHomeDir: persisted.userHomeDir,
+            // The state file's staged home dir is the more current one; fall
+            // back to the persisted record rather than clobbering it.
+            ...(persisted.userHomeDir ? { userHomeDir: persisted.userHomeDir } : {}),
           };
           pidToTrackedSession.set(persisted.pid, recovered);
           logger.debug(`[DAEMON RUN] Recovered alive session PID ${persisted.pid}, sessionId: ${persisted.happySessionId || 'pending'}`);
@@ -342,7 +358,7 @@ export async function startDaemon(): Promise<void> {
         .filter((d): d is string => typeof d === 'string');
       // Resumable sessions keep their staged identity across restarts
       // (2026-07-23 incident) — their dirs are claimed, not orphans.
-      const resumableHomeDirs = Object.values(readPersistedSessions())
+      const resumableHomeDirs = Object.values(persistedSessions)
         .map((s) => s.userHomeDir)
         .filter((d): d is string => typeof d === 'string');
       const removed = await sweepOrphanUserHomeDirs([...liveHomeDirs, ...resumableHomeDirs]);
@@ -356,26 +372,16 @@ export async function startDaemon(): Promise<void> {
     // Retain session data after process exits so resume can still find it.
     // Pre-populate from disk so sessions survive daemon restarts.
     const sessionIdToFinishedSession = new Map<string, TrackedSession>();
-    const persisted = readPersistedSessions();
-    for (const [id, s] of Object.entries(persisted)) {
+    for (const [id, s] of Object.entries(persistedSessions)) {
       sessionIdToFinishedSession.set(id, {
+        ...hydrateTrackedSessionFromPersisted(s),
         startedBy: 'persisted',
         happySessionId: id,
-        happySessionMetadataFromLocalWebhook: s.metadata,
-        encryption: {
-          encryptionKey: decodeBase64(s.encryptionKey),
-          encryptionVariant: s.encryptionVariant,
-          seq: s.seq,
-          metadataVersion: s.metadataVersion,
-          agentStateVersion: s.agentStateVersion,
-        },
         pid: 0,
-        userHomeDir: s.userHomeDir,
-        persistedLastProcessedSeq: s.lastProcessedSeq,
       });
     }
-    if (Object.keys(persisted).length > 0) {
-      logger.debug(`[DAEMON RUN] Loaded ${Object.keys(persisted).length} persisted sessions from disk`);
+    if (Object.keys(persistedSessions).length > 0) {
+      logger.debug(`[DAEMON RUN] Loaded ${Object.keys(persistedSessions).length} persisted sessions from disk`);
     }
 
     // Session spawning awaiter system
@@ -416,7 +422,7 @@ export async function startDaemon(): Promise<void> {
     // written state file leaves the same gap.
     try {
       const startupOrphans = collectStartupOrphans({
-        persistedSessions: persisted,
+        persistedSessions,
         trackedPids: new Set(pidToTrackedSession.keys()),
         isPidAlive,
         getProcessStartedAt,
@@ -1074,7 +1080,16 @@ export async function startDaemon(): Promise<void> {
     };
 
     const preserveSessionForResume = (session: TrackedSession, reason: string): boolean => {
-      if (!session.happySessionId || !session.encryption) return false;
+      // Silence here hid the whole 2026-08-15 failure: the reaper logged a clean
+      // stop while this bailed, so nothing recorded that the session had just
+      // been killed in a state no resume could recover from.
+      if (!session.happySessionId || !session.encryption) {
+        logger.debug(
+          `[DAEMON RUN] Cannot preserve session ${session.happySessionId ?? `pid ${session.pid}`} for resume (${reason}):`
+          + ` ${!session.happySessionId ? 'no session id' : 'no encryption data'}`,
+        );
+        return false;
+      }
 
       sessionIdToFinishedSession.set(session.happySessionId, session);
       if (session.happySessionMetadataFromLocalWebhook) {

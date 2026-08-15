@@ -140,7 +140,7 @@ interface MachineStopSessionResponse {
 export type SpawnSessionResult =
     | { type: 'success'; sessionId: string }
     | { type: 'requestToApproveDirectoryCreation'; directory: string }
-    | { type: 'error'; errorMessage: string };
+    | { type: 'error'; errorMessage: string; code?: string };
 
 // Options for spawning a session
 export interface SpawnSessionOptions {
@@ -215,6 +215,16 @@ export interface ResumeSessionOptions {
     machineId: string;
     sessionId: string;
 }
+
+export type RecoverSessionResult =
+    | {
+        type: 'success';
+        sessionId: string;
+        previousSessionId: string;
+        recovery: 'same-session' | 'new-session';
+        initialPromptDelivered: boolean;
+    }
+    | { type: 'error'; code: string; errorMessage: string };
 
 // Exported session operation functions
 
@@ -416,6 +426,25 @@ export async function machineResumeSession(options: ResumeSessionOptions & { mod
         return {
             type: 'error',
             errorMessage: error instanceof Error ? error.message : 'Failed to resume session',
+        };
+    }
+}
+
+export async function machineRecoverSession(options: ResumeSessionOptions & { initialPrompt: string; model?: string; permissionMode?: string }): Promise<RecoverSessionResult> {
+    const { machineId, sessionId, initialPrompt, model, permissionMode } = options;
+
+    try {
+        const result = await apiSocket.machineRPC<RecoverSessionResult, { sessionId: string; initialPrompt: string; model?: string; permissionMode?: string }>(
+            machineId,
+            'recover-happy-session',
+            { sessionId, initialPrompt, model, permissionMode },
+        );
+        return result;
+    } catch (error) {
+        return {
+            type: 'error',
+            code: 'RECOVER_SESSION_FAILED',
+            errorMessage: error instanceof Error ? error.message : 'Failed to recover session',
         };
     }
 }

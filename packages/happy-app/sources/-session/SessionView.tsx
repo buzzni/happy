@@ -20,6 +20,7 @@ import { Avatar } from '@/components/Avatar';
 import { VoiceAssistantStatusBar } from '@/components/VoiceAssistantStatusBar';
 import { useDraft } from '@/hooks/useDraft';
 import { useImagePicker } from '@/hooks/useImagePicker';
+import { useSessionSend } from '@/hooks/useSessionSend';
 import { Modal } from '@/modal';
 import { voiceHooks } from '@/realtime/hooks/voiceHooks';
 import { getCurrentVoiceConversationId, getCurrentVoiceSessionDurationSeconds, startRealtimeSession, stopRealtimeSession } from '@/realtime/RealtimeSession';
@@ -542,15 +543,23 @@ function SessionViewLoaded({ sessionId, session }: { sessionId: string, session:
 
     // handleSend reads the live message via the composer ref, so it doesn't
     // need to re-create on every keystroke.
+    const performSend = useSessionSend(session);
     const handleSend = React.useCallback(() => {
         const liveMessage = composerHandleRef.current?.getMessage() ?? '';
         if (liveMessage.trim() || (expImageUpload && selectedImages.length > 0)) {
             const attachments = expImageUpload ? selectedImages : undefined;
-            composerHandleRef.current?.clearMessage();
-            if (expImageUpload) clearImages();
-            sync.sendMessage(sessionId, liveMessage, { source: 'chat', attachments });
+            // The composer only clears once the message is actually consumed —
+            // sent, or handed to a recovered session. Clearing up front would
+            // destroy the user's text on every recovery failure, since the
+            // composer has no way to restore it.
+            void performSend(liveMessage, { source: 'chat', attachments }).then((consumed) => {
+                if (consumed) {
+                    composerHandleRef.current?.clearMessage();
+                    if (expImageUpload) clearImages();
+                }
+            });
         }
-    }, [sessionId, expImageUpload, selectedImages, clearImages]);
+    }, [expImageUpload, selectedImages, clearImages, performSend]);
 
     const handleAbort = React.useCallback(() => {
         storage.getState().resetSessionAgentOverrides(sessionId);

@@ -39,7 +39,7 @@ type ResumeAvailability = {
     message: string;
 };
 
-function getResumeAvailability(session: Session, machine: Machine | null | undefined, isConnected: boolean): ResumeAvailability {
+export function getResumeAvailability(session: Session, machine: Machine | null | undefined, isConnected: boolean): ResumeAvailability {
     if (isConnected) {
         return {
             canResume: false,

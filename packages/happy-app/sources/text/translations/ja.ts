@@ -311,6 +311,9 @@ export const ja: TranslationStructure = {
         forkErrorMissingMetadata: 'フォークに必要なセッションのメタデータがありません。',
         forkErrorGeneric: 'セッションのフォークに失敗しました。',
         forkClaudeOnly: 'フォークは現在 Claude セッションのみ対応しています。',
+        directoryApprovalRequired: 'このセッションはディレクトリ承認が必要なため、再開できません。元の場所から手動で起動してください。',
+        failedToDeliverInitialPrompt: 'セッション復旧が開始されましたが、メッセージを配信できませんでした。もう一度お試しください。',
+        sessionRecoveredInNewConversation: '新しい会話でセッションが復旧されました。メッセージが配信されました。',
     },
 
     commandPalette: {
