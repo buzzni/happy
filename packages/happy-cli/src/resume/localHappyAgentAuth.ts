@@ -69,16 +69,22 @@ export function getLocalHappyAgentCredentialPath(happyHomeDir: string = configur
     return join(happyHomeDir, 'agent.key');
 }
 
-export function readLocalHappyAgentCredentials(
-    happyHomeDir: string = configuration.happyHomeDir,
-): LocalHappyAgentCredentials | null {
-    const credentialPath = getLocalHappyAgentCredentialPath(happyHomeDir);
-    if (!existsSync(credentialPath)) {
+/**
+ * `agent.key` is written only by the interactive `happy-agent auth login` QR
+ * flow, which provisioned A+ machines never run. `access.key` holds the same
+ * `{ token, secret }` pair for the same account, so it is an equivalent source
+ * for looking up and decrypting that account's own sessions. Upstream
+ * 8735f817 already established that resume must not be gated on agent.key.
+ */
+const CREDENTIAL_FILE_NAMES = ['agent.key', 'access.key'] as const;
+
+function readCredentialFile(path: string): LocalHappyAgentCredentials | null {
+    if (!existsSync(path)) {
         return null;
     }
 
     try {
-        const parsed = AgentCredentialsSchema.parse(JSON.parse(readFileSync(credentialPath, 'utf8')));
+        const parsed = AgentCredentialsSchema.parse(JSON.parse(readFileSync(path, 'utf8')));
         const secret = decodeBase64(parsed.secret);
         return {
             token: parsed.token,
@@ -88,6 +94,18 @@ export function readLocalHappyAgentCredentials(
     } catch {
         return null;
     }
+}
+
+export function readLocalHappyAgentCredentials(
+    happyHomeDir: string = configuration.happyHomeDir,
+): LocalHappyAgentCredentials | null {
+    for (const fileName of CREDENTIAL_FILE_NAMES) {
+        const credentials = readCredentialFile(join(happyHomeDir, fileName));
+        if (credentials) {
+            return credentials;
+        }
+    }
+    return null;
 }
 
 export function hasLocalHappyAgentAuth(happyHomeDir: string = configuration.happyHomeDir): boolean {
