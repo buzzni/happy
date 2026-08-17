@@ -62,8 +62,6 @@ import {
     VIEWER_WEB_PORTS,
     decideViewerBrowserAction,
     decideViewerStackAction,
-    readDisplayFromEnviron,
-    readFlagFromCmdline,
     summariseViewerBrowser,
     type ViewerBrowserSummary,
     detectMissingViewerTools,
@@ -71,7 +69,7 @@ import {
     planViewerInstall,
     spawnDetached,
 } from '@/daemon/remoteViewer';
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import {
     addDaemonTerminalSession,
     getDaemonTerminalSession,
@@ -1111,16 +1109,7 @@ export class ApiMachineClient {
         display: string,
         callerWillLaunchBrowser: boolean,
     ): Promise<ViewerBrowserSummary> {
-        // Checked before any probing: when the caller is about to launch its
-        // own Chrome, scanning for one to reuse only risks claiming the port
-        // and profile it has already picked.
-        const deferred = decideViewerBrowserAction({
-            liveCdpPort: null,
-            callerWillLaunchBrowser,
-            display,
-            profileHolder: null,
-        });
-        if (deferred.action === 'defer') {
+        if (decideViewerBrowserAction({ liveCdpPort: null, callerWillLaunchBrowser }).action === 'defer') {
             return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
         }
         const chrome = await detectChrome();
@@ -1129,40 +1118,21 @@ export class ApiMachineClient {
         // screen (dev, 2026-08-15).
         if (!chrome) return summariseViewerBrowser({ chromeInstalled: false, cdpPort: null });
 
-        const userDataDir = resolveProfileUserDataDir(
-            join(configuration.happyHomeDir, 'chrome-profiles'),
-            'default',
-        );
-        const running = await scanChromeProcesses();
-
-        // Reachable is not enough: it must be the browser on *this* display.
-        // `browser-setup:launch` without the viewer runs Chrome headless on
-        // one of these very ports, and reusing that one reports browserReady
-        // while the user still sees an empty screen.
         let liveCdpPort: number | null = null;
         for (const port of CDP_PORT_RANGE) {
-            if (!running.some((process) => process.cdpPort === port && process.display === display)) continue;
-            if (!await isCdpReachable(port)) continue;
-            liveCdpPort = port;
-            break;
+            if (await isCdpReachable(port)) { liveCdpPort = port; break; }
         }
-        const decision = decideViewerBrowserAction({
-            liveCdpPort,
-            callerWillLaunchBrowser,
-            display,
-            profileHolder: running.find((process) => process.userDataDir === userDataDir) ?? null,
-        });
+        const decision = decideViewerBrowserAction({ liveCdpPort, callerWillLaunchBrowser });
         if (decision.action === 'reuse') {
             return summariseViewerBrowser({ chromeInstalled: true, cdpPort: decision.cdpPort });
-        }
-        if (decision.action === 'blocked') {
-            // Launching would die on the profile's singleton lock, 15s per
-            // attempt, to reach this same answer.
-            return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
         }
 
         const cdpPort = await pickFreeCdpPort();
         if (cdpPort === null) return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
+        const userDataDir = resolveProfileUserDataDir(
+            join(configuration.happyHomeDir, 'chrome-profiles'),
+            'default',
+        );
         const env = { DISPLAY: display };
         launchChrome(chrome.path, { userDataDir, cdpPort, headless: false }, env);
         let up = await waitForCdp(cdpPort, 15_000);
@@ -1852,51 +1822,6 @@ async function pickFreeCdpPort(): Promise<number | null> {
         if (await isPortFree(port)) return port;
     }
     return null;
-}
-
-/** A Chrome we can see running, with the facts the viewer decides on. */
-type RunningChrome = {
-    cdpPort: number | null;
-    userDataDir: string | null;
-    /** DISPLAY from the process environment; null when headless. */
-    display: string | null;
-};
-
-/**
- * Chrome processes visible in /proc.
- *
- * CDP itself answers none of these questions: a headless Chrome and the
- * viewer's look identical over `/json/version`, and they share the profile
- * directory too, so the process is the only place the facts exist.
- */
-async function scanChromeProcesses(): Promise<RunningChrome[]> {
-    // Scanned directly rather than shelling out to `pgrep -f`, whose pattern
-    // would also match the shell running it — and that shell inherits the
-    // daemon's environment. Whole-argument matching (readFlagFromCmdline)
-    // closes the same hole for any other process that merely names the flag.
-    let entries: string[];
-    try {
-        entries = await readdir('/proc');
-    } catch {
-        return []; // No procfs — not a Linux machine, so no viewer either.
-    }
-    const running: RunningChrome[] = [];
-    for (const pid of entries) {
-        if (!/^\d+$/.test(pid)) continue;
-        try {
-            const cmdline = await readFile(`/proc/${pid}/cmdline`, 'utf8');
-            const port = readFlagFromCmdline(cmdline, '--remote-debugging-port');
-            if (port === null) continue;
-            running.push({
-                cdpPort: Number(port) || null,
-                userDataDir: readFlagFromCmdline(cmdline, '--user-data-dir'),
-                display: readDisplayFromEnviron(await readFile(`/proc/${pid}/environ`, 'utf8')),
-            });
-        } catch {
-            // Exited between the listing and the read — skip it.
-        }
-    }
-    return running;
 }
 
 /** Chrome needs a moment before its CDP endpoint answers. */
