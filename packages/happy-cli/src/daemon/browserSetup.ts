@@ -73,6 +73,10 @@ export type ChromeInstallPlan =
 
 const INSTALL_COMMAND = [
     'wget -q -O /tmp/google-chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb',
+    // A local .deb still resolves its dependencies from the apt index, so a
+    // machine whose package list was never refreshed fails with a wall of
+    // "Depends: libX but it is not installable" and Chrome never lands.
+    'sudo apt-get update -qq',
     'sudo apt-get install -y /tmp/google-chrome.deb',
 ].join(' && ')
 

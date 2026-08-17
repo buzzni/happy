@@ -65,7 +65,11 @@ function installCommandFor(missing: string[]): string {
     // novnc ships the web assets websockify serves; pull it whenever anything
     // is missing so the client page exists.
     const packages = [...new Set([...missing.map((tool) => APT_PACKAGE[tool] ?? tool), 'novnc'])]
-    return `sudo apt-get install -y ${packages.join(' ')}`
+    // `apt-get update` first: unlike Chrome's install (a .deb fetched
+    // directly), these come from the apt repo, so a machine whose package
+    // list was never refreshed fails every install with "Unable to locate
+    // package" — observed live on coder-ceb52f63 (2026-08-17).
+    return `sudo apt-get update -qq && sudo apt-get install -y ${packages.join(' ')}`
 }
 
 /**
