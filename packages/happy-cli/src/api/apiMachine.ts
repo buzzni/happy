@@ -1120,14 +1120,20 @@ export class ApiMachineClient {
         // screen (dev, 2026-08-15).
         if (!chrome) return summariseViewerBrowser({ chromeInstalled: false, cdpPort: null });
 
+        const userDataDir = resolveProfileUserDataDir(
+            join(configuration.happyHomeDir, 'chrome-profiles'),
+            'default',
+        );
+        const running = await scanChromeProcesses();
+
         // Reachable is not enough: it must be the browser on *this* display.
         // `browser-setup:launch` without the viewer runs Chrome headless on
         // one of these very ports, and reusing that one reports browserReady
         // while the user still sees an empty screen.
         let liveCdpPort: number | null = null;
         for (const port of CDP_PORT_RANGE) {
+            if (!running.some((process) => process.cdpPort === port && process.display === display)) continue;
             if (!await isCdpReachable(port)) continue;
-            if (await cdpDisplay(port) !== display) continue;
             liveCdpPort = port;
             break;
         }
@@ -1138,10 +1144,6 @@ export class ApiMachineClient {
 
         const cdpPort = await pickFreeCdpPort();
         if (cdpPort === null) return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
-        const userDataDir = resolveProfileUserDataDir(
-            join(configuration.happyHomeDir, 'chrome-profiles'),
-            'default',
-        );
         const env = { DISPLAY: display };
         launchChrome(chrome.path, { userDataDir, cdpPort, headless: false }, env);
         let up = await waitForCdp(cdpPort, 15_000);
@@ -1833,15 +1835,22 @@ async function pickFreeCdpPort(): Promise<number | null> {
     return null;
 }
 
+/** A Chrome we can see running, with the facts the viewer decides on. */
+type RunningChrome = {
+    cdpPort: number | null;
+    userDataDir: string | null;
+    /** DISPLAY from the process environment; null when headless. */
+    display: string | null;
+};
+
 /**
- * The DISPLAY of whatever Chrome holds that CDP port, or null when it has
- * none (headless) or cannot be identified.
+ * Chrome processes visible in /proc.
  *
- * Reads the process environment because CDP itself does not expose the
- * display, and a headless Chrome is otherwise indistinguishable from the
- * viewer's — same profile directory, same port range, same /json/version.
+ * CDP itself answers none of these questions: a headless Chrome and the
+ * viewer's look identical over `/json/version`, and they share the profile
+ * directory too, so the process is the only place the facts exist.
  */
-async function cdpDisplay(cdpPort: number): Promise<string | null> {
+async function scanChromeProcesses(): Promise<RunningChrome[]> {
     // Scanned directly rather than shelling out to `pgrep -f`, whose pattern
     // would also match the shell running it — and that shell inherits the
     // daemon's environment. Whole-argument matching (readFlagFromCmdline)
@@ -1850,20 +1859,25 @@ async function cdpDisplay(cdpPort: number): Promise<string | null> {
     try {
         entries = await readdir('/proc');
     } catch {
-        return null; // No procfs — not a Linux machine, so no viewer either.
+        return []; // No procfs — not a Linux machine, so no viewer either.
     }
+    const running: RunningChrome[] = [];
     for (const pid of entries) {
         if (!/^\d+$/.test(pid)) continue;
         try {
             const cmdline = await readFile(`/proc/${pid}/cmdline`, 'utf8');
-            if (readFlagFromCmdline(cmdline, '--remote-debugging-port') !== String(cdpPort)) continue;
-            const display = readDisplayFromEnviron(await readFile(`/proc/${pid}/environ`, 'utf8'));
-            if (display) return display;
+            const port = readFlagFromCmdline(cmdline, '--remote-debugging-port');
+            if (port === null) continue;
+            running.push({
+                cdpPort: Number(port) || null,
+                userDataDir: readFlagFromCmdline(cmdline, '--user-data-dir'),
+                display: readDisplayFromEnviron(await readFile(`/proc/${pid}/environ`, 'utf8')),
+            });
         } catch {
             // Exited between the listing and the read — skip it.
         }
     }
-    return null;
+    return running;
 }
 
 /** Chrome needs a moment before its CDP endpoint answers. */
