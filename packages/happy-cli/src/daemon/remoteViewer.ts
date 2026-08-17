@@ -149,6 +149,7 @@ export function decideViewerStackAction(input: {
 
 export type ViewerBrowserDecision =
     | { action: 'reuse'; cdpPort: number }
+    | { action: 'blocked'; cdpPort?: undefined }
     | { action: 'launch'; cdpPort?: undefined }
     | { action: 'defer'; cdpPort?: undefined }
 
@@ -162,16 +163,40 @@ export type ViewerBrowserDecision =
  *
  * `liveCdpPort` must come from probing our own CDP candidate ports, so a
  * browser that outlived the daemon is reused rather than stacked on top of.
+ *
+ * `profileHolder` covers what the CDP probe alone gets wrong, because a
+ * profile directory hosts one Chrome at a time — a second process exits on
+ * the singleton lock. So when one is already holding ours, launching cannot
+ * work, and the two waitForCdp calls would spend 30 seconds proving it:
+ *
+ * - on our display, its CDP merely slow: the screen already has its browser,
+ *   so reuse it rather than refusing a viewer that was working
+ * - anywhere else (headless, another display): nothing we can show, and no
+ *   launch can change that — say so at once
+ *
+ * `callerWillLaunchBrowser` outranks both. When `browser-setup:launch` is
+ * bringing the stack up on its way to starting its own Chrome, anything we
+ * do here is a browser it did not ask for, on the port and profile it is
+ * about to claim.
  */
 export function decideViewerBrowserAction(input: {
     liveCdpPort: number | null
     callerWillLaunchBrowser: boolean
+    display: string
+    profileHolder: { cdpPort: number | null; display: string | null } | null
 }): ViewerBrowserDecision {
     if (input.callerWillLaunchBrowser) {
         return { action: 'defer' }
     }
     if (input.liveCdpPort !== null) {
         return { action: 'reuse', cdpPort: input.liveCdpPort }
+    }
+    if (input.profileHolder) {
+        const { cdpPort, display } = input.profileHolder
+        if (display === input.display && cdpPort !== null) {
+            return { action: 'reuse', cdpPort }
+        }
+        return { action: 'blocked' }
     }
     return { action: 'launch' }
 }
@@ -196,6 +221,45 @@ export function summariseViewerBrowser(input: {
     if (!input.chromeInstalled) return { browserReady: false, reason: 'chrome-not-installed' }
     if (input.cdpPort === null) return { browserReady: false, reason: 'browser-failed' }
     return { browserReady: true, cdpPort: input.cdpPort }
+}
+
+/**
+ * The `DISPLAY` of a process, from its `/proc/<pid>/environ` block.
+ *
+ * Which display a browser draws on is what decides whether it can be reused
+ * as the viewer's, and CDP does not report it: `/json/version` looks the same
+ * for a headless Chrome and for one on Xvfb. Both also share the profile
+ * directory, so the environment is the only thing left that tells them apart.
+ *
+ * Returns null when DISPLAY is absent or empty — i.e. headless.
+ */
+export function readDisplayFromEnviron(environ: string): string | null {
+    for (const entry of environ.split('\0')) {
+        if (!entry.startsWith('DISPLAY=')) continue
+        return entry.slice('DISPLAY='.length) || null
+    }
+    return null
+}
+
+/**
+ * The value of `--flag=value` among a `/proc/<pid>/cmdline`'s arguments.
+ *
+ * Matches whole arguments rather than searching the raw block: any process
+ * that merely mentions the flag — a shell running `pgrep -f -- "--remote-
+ * debugging-port=9222"`, say — would otherwise pass for the browser itself.
+ * Started from inside the VNC desktop that shell carries the viewer's
+ * DISPLAY, so the viewer would call it a browser on its screen and report
+ * ready with nothing drawing.
+ *
+ * Returns null when the flag is absent or its value is empty.
+ */
+export function readFlagFromCmdline(cmdline: string, flag: string): string | null {
+    const prefix = `${flag}=`
+    for (const arg of cmdline.split('\0')) {
+        if (!arg.startsWith(prefix)) continue
+        return arg.slice(prefix.length) || null
+    }
+    return null
 }
 
 function which(binary: string): Promise<string | null> {
