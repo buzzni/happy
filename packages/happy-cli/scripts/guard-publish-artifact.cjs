@@ -13,6 +13,9 @@ const DEPENDENCY_FIELDS = [
 ];
 
 const EXPECTED_BUNDLED_FILES = [
+    'package/bin/happy-browser-native-host.mjs',
+    'package/dist/browserNativeMessagingHost.mjs',
+    'package/browser-extension/src/nativePairing.js',
     'package/node_modules/@slopus/happy-wire/package.json',
     'package/node_modules/@slopus/happy-wire/dist/index.mjs',
     'package/node_modules/zod/package.json',
@@ -269,6 +272,14 @@ function runInstallSmoke(tarball, packageJson) {
         const bundledExtensionManifest = path.join(installedRoot, 'browser-extension', 'manifest.json');
         if (!fs.existsSync(bundledExtensionManifest)) {
             throw new Error(`Smoke install is missing the bundled browser extension at ${bundledExtensionManifest}`);
+        }
+        const nativeHelper = path.join(installedRoot, 'bin', 'happy-browser-native-host.mjs');
+        if (process.platform !== 'win32' && (fs.statSync(nativeHelper).mode & 0o111) === 0) {
+            throw new Error(`Native Messaging helper is not executable at ${nativeHelper}`);
+        }
+        const extensionManifest = JSON.parse(fs.readFileSync(bundledExtensionManifest, 'utf8'));
+        if (!extensionManifest.permissions?.includes('nativeMessaging')) {
+            throw new Error('Bundled browser extension is missing the nativeMessaging permission');
         }
 
         assertProductionDependencyClosure(prefix);

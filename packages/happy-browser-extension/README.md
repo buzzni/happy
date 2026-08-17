@@ -18,11 +18,28 @@ WS는 루프백 전용이며, pairing 토큰이 없는 연결은 데몬이 거�
 
 ## 설치
 
+happy CLI를 설치·업데이트하고 데몬을 시작하면 macOS와 Linux의 Google Chrome에
+로컬 자동 연결 도우미가 등록됩니다. 각 Chrome 프로필에 이 확장을 설치하면
+별도의 token 입력이나 `happy browser` 명령 없이 `127.0.0.1:41777`의 로컬
+데몬을 찾아 연결합니다. 프로필마다 서로 다른 기본 이름을 생성하므로 여러
+Chrome 프로필도 동시에 연결됩니다.
+
+확장 아이콘을 누르면 설정 페이지가 열립니다. 자동 연결 상태를 확인하거나,
+원격 데몬처럼 자동 발견할 수 없는 연결을 직접 설정할 때 사용합니다.
+
+자동 연결 도우미를 찾지 못하면 CLI를 업데이트한 뒤 데몬과 Chrome을
+재시작하세요. Chrome은 실행 중 새로 등록된 Native Messaging host를 다시 읽지
+않을 수 있습니다. 그래도 연결되지 않을 때는 기존 수동 절차를 fallback 및 진단
+경로로 사용할 수 있습니다:
+
+### 수동 fallback
+
 ```bash
 happy browser
 ```
 
-토큰, 연결 상태, 설치 절차를 한 번에 보여줍니다. 토큰만 필요하면 `happy browser token`.
+이 명령은 token, 연결 상태, 설치 절차를 한 번에 보여줍니다. token만 필요하면
+`happy browser token`을 사용합니다.
 
 1. 위 명령이 출력한 **pairing 토큰**을 복사합니다
    (파일 경로는 `~/.happy/browser-bridge.token`).

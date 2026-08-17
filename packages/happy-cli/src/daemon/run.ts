@@ -41,6 +41,8 @@ import { preflightDaemonControlServer, startDaemonControlServer } from './contro
 import { BrowserBridge } from './browserBridge';
 import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
+import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
+import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
 import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
@@ -1724,14 +1726,33 @@ export async function startDaemon(): Promise<void> {
       logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
     });
 
+    // Prepare/migrate the token before exposing the helper manifest. Chrome
+    // can launch the helper as soon as the manifest exists, and must not race
+    // legacy-token migration by creating a different machine-wide token.
+    const nativeMessaging = await prepareBrowserNativeMessaging({
+      readToken: () => readOrCreateBrowserBridgeToken(configuration.browserBridgeTokenFile, {
+        migrateFrom: configuration.legacyBrowserBridgeTokenFile
+      }),
+      registerHost: () => registerBrowserNativeHost({
+        platform: process.platform,
+        homeDir: os.homedir(),
+        extensionId: resolveExtensionId(resolveExtensionDir()),
+        helperPath: join(projectPath(), 'bin', 'happy-browser-native-host.mjs'),
+      }),
+      // Browser control can still be paired manually through `happy browser`.
+      // A registration failure must not take the whole daemon down.
+      onRegistrationError: (err) => logger.debug(`[DAEMON RUN] Browser Native Messaging host registration failed: ${err instanceof Error ? err.message : String(err)}`),
+    });
+    if (nativeMessaging.manifestPath) {
+      logger.debug(`[DAEMON RUN] Browser Native Messaging host registered at ${nativeMessaging.manifestPath}`);
+    }
+
     // Chrome extension bridge (specs/chrome-extension-bridge/). Listens on a
     // fixed loopback port because the extension cannot read daemon.state.json
     // to discover an ephemeral one. A bind failure (port taken) must not take
     // the daemon down — browser control is simply unavailable until restart.
     const browserBridge = new BrowserBridge({
-      authToken: await readOrCreateBrowserBridgeToken(configuration.browserBridgeTokenFile, {
-        migrateFrom: configuration.legacyBrowserBridgeTokenFile
-      })
+      authToken: nativeMessaging.token
     });
     let stopBrowserBridge: () => Promise<void> = async () => {};
     try {

@@ -151,6 +151,30 @@ describe('createConnection', () => {
         expect(live).toHaveLength(1)
     })
 
+    it('uses the latest settings when restart is requested during an in-flight config read', async () => {
+        let resolveFirstRead
+        let reads = 0
+        const chrome = fakeChrome()
+        chrome.storage.local.get = vi.fn(() => {
+            reads += 1
+            if (reads === 1) {
+                return new Promise((resolve) => { resolveFirstRead = resolve })
+            }
+            return Promise.resolve({ token: 'new-token', port: 41778, profile: 'new-profile' })
+        })
+        const connection = make(chrome)
+
+        const initial = connection.connect()
+        connection.restart()
+        resolveFirstRead({ token: 'old-token', port: 41777, profile: 'old-profile' })
+        await initial
+
+        expect(FakeWebSocket.instances).toHaveLength(1)
+        expect(FakeWebSocket.instances[0].url).toBe(
+            'ws://127.0.0.1:41778/?token=new-token&profile=new-profile',
+        )
+    })
+
     it('sends a keepalive ping once the socket is open', async () => {
         const connection = make()
         await connection.connect()
