@@ -216,6 +216,27 @@ export function readDisplayFromEnviron(environ: string): string | null {
     return null
 }
 
+/**
+ * The value of `--flag=value` among a `/proc/<pid>/cmdline`'s arguments.
+ *
+ * Matches whole arguments rather than searching the raw block: any process
+ * that merely mentions the flag — a shell running `pgrep -f -- "--remote-
+ * debugging-port=9222"`, say — would otherwise pass for the browser itself.
+ * Started from inside the VNC desktop that shell carries the viewer's
+ * DISPLAY, so the viewer would call it a browser on its screen and report
+ * ready with nothing drawing.
+ *
+ * Returns null when the flag is absent or its value is empty.
+ */
+export function readFlagFromCmdline(cmdline: string, flag: string): string | null {
+    const prefix = `${flag}=`
+    for (const arg of cmdline.split('\0')) {
+        if (!arg.startsWith(prefix)) continue
+        return arg.slice(prefix.length) || null
+    }
+    return null
+}
+
 function which(binary: string): Promise<string | null> {
     return new Promise((resolve) => {
         const child = spawn('which', [binary], { stdio: ['ignore', 'pipe', 'ignore'] })

@@ -63,6 +63,7 @@ import {
     decideViewerBrowserAction,
     decideViewerStackAction,
     readDisplayFromEnviron,
+    readFlagFromCmdline,
     summariseViewerBrowser,
     type ViewerBrowserSummary,
     detectMissingViewerTools,
@@ -1841,11 +1842,10 @@ async function pickFreeCdpPort(): Promise<number | null> {
  * viewer's — same profile directory, same port range, same /json/version.
  */
 async function cdpDisplay(cdpPort: number): Promise<string | null> {
-    // Scanned directly rather than via `pgrep -f`, which would also match the
-    // shell running it — that shell inherits the daemon's environment, so a
-    // daemon started under a DISPLAY would see its own shell and report a
-    // headless Chrome as being on the viewer's screen.
-    const flag = `--remote-debugging-port=${cdpPort}`;
+    // Scanned directly rather than shelling out to `pgrep -f`, whose pattern
+    // would also match the shell running it — and that shell inherits the
+    // daemon's environment. Whole-argument matching (readFlagFromCmdline)
+    // closes the same hole for any other process that merely names the flag.
     let entries: string[];
     try {
         entries = await readdir('/proc');
@@ -1856,7 +1856,7 @@ async function cdpDisplay(cdpPort: number): Promise<string | null> {
         if (!/^\d+$/.test(pid)) continue;
         try {
             const cmdline = await readFile(`/proc/${pid}/cmdline`, 'utf8');
-            if (!cmdline.includes(flag)) continue;
+            if (readFlagFromCmdline(cmdline, '--remote-debugging-port') !== String(cdpPort)) continue;
             const display = readDisplayFromEnviron(await readFile(`/proc/${pid}/environ`, 'utf8'));
             if (display) return display;
         } catch {

@@ -4,6 +4,7 @@ import {
     decideViewerBrowserAction,
     decideViewerStackAction,
     readDisplayFromEnviron,
+    readFlagFromCmdline,
     summariseViewerBrowser,
     buildWebsockifyArgs,
     buildX11vncArgs,
@@ -248,5 +249,34 @@ describe('readDisplayFromEnviron', () => {
 
     it('treats an empty DISPLAY as none', () => {
         expect(readDisplayFromEnviron('DISPLAY=')).toBeNull()
+    })
+})
+
+describe('readFlagFromCmdline', () => {
+    it('reads the value of a flag among the NUL-separated args', () => {
+        const cmdline = '/usr/bin/google-chrome\0--remote-debugging-port=9222\0--user-data-dir=/x'
+
+        expect(readFlagFromCmdline(cmdline, '--remote-debugging-port')).toBe('9222')
+        expect(readFlagFromCmdline(cmdline, '--user-data-dir')).toBe('/x')
+    })
+
+    it('reports none when the flag is absent', () => {
+        expect(readFlagFromCmdline('/usr/bin/google-chrome\0--headless=new', '--remote-debugging-port')).toBeNull()
+    })
+
+    it('ignores the flag when it only appears inside another argument', () => {
+        // A substring test matches any process whose command line merely
+        // mentions the flag — a shell running `pgrep -f -- "--remote-debugging
+        // -port=9222"` is the case that already bit us. Run inside the VNC
+        // desktop that shell carries DISPLAY=:99, so the viewer would read it
+        // as "a browser is on my screen" and report browserReady with no
+        // browser anywhere: a black screen sold as success.
+        const shell = '/bin/sh\0-c\0pgrep -f -- "--remote-debugging-port=9222"'
+
+        expect(readFlagFromCmdline(shell, '--remote-debugging-port')).toBeNull()
+    })
+
+    it('treats an empty value as none', () => {
+        expect(readFlagFromCmdline('chrome\0--user-data-dir=', '--user-data-dir')).toBeNull()
     })
 })
