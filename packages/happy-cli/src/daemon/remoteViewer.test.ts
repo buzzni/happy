@@ -107,6 +107,18 @@ describe('planViewerInstall', () => {
 
         expect(plan.command ?? '').not.toContain('apt-get')
     })
+
+    it('refreshes the package list before installing', () => {
+        // 실측(2026-08-17, coder-ceb52f63): apt update 없이 install 만
+        // 실행하면 캐시가 비어 있는 머신에서 "Unable to locate package"로
+        // 항상 실패한다. Chrome install 은 .deb 파일을 직접 잡아 이 문제가
+        // 없지만, 저장소 패키지로 까는 뷰어 도구는 이 경로를 반드시 탄다.
+        const plan = planViewerInstall({ missing: ['x11vnc'], canSudo: true, platform: 'linux' })
+
+        const command = plan.command ?? ''
+        expect(command).toContain('apt-get update')
+        expect(command.indexOf('apt-get update')).toBeLessThan(command.indexOf('apt-get install'))
+    })
 })
 
 describe('decideViewerStackAction', () => {
