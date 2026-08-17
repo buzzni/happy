@@ -1111,7 +1111,16 @@ export class ApiMachineClient {
         display: string,
         callerWillLaunchBrowser: boolean,
     ): Promise<ViewerBrowserSummary> {
-        if (decideViewerBrowserAction({ liveCdpPort: null, callerWillLaunchBrowser }).action === 'defer') {
+        // Checked before any probing: when the caller is about to launch its
+        // own Chrome, scanning for one to reuse only risks claiming the port
+        // and profile it has already picked.
+        const deferred = decideViewerBrowserAction({
+            liveCdpPort: null,
+            callerWillLaunchBrowser,
+            display,
+            profileHolder: null,
+        });
+        if (deferred.action === 'defer') {
             return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
         }
         const chrome = await detectChrome();
@@ -1137,9 +1146,19 @@ export class ApiMachineClient {
             liveCdpPort = port;
             break;
         }
-        const decision = decideViewerBrowserAction({ liveCdpPort, callerWillLaunchBrowser });
+        const decision = decideViewerBrowserAction({
+            liveCdpPort,
+            callerWillLaunchBrowser,
+            display,
+            profileHolder: running.find((process) => process.userDataDir === userDataDir) ?? null,
+        });
         if (decision.action === 'reuse') {
             return summariseViewerBrowser({ chromeInstalled: true, cdpPort: decision.cdpPort });
+        }
+        if (decision.action === 'blocked') {
+            // Launching would die on the profile's singleton lock, 15s per
+            // attempt, to reach this same answer.
+            return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
         }
 
         const cdpPort = await pickFreeCdpPort();

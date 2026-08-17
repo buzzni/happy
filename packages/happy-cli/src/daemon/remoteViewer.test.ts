@@ -183,6 +183,21 @@ describe('decideViewerBrowserAction', () => {
         const decision = decideViewerBrowserAction({
             liveCdpPort: null,
             callerWillLaunchBrowser: true,
+            display: ':99',
+            profileHolder: null,
+        })
+
+        expect(decision).toEqual({ action: 'defer' })
+    })
+
+    it('still defers when a browser already holds the profile', () => {
+        // The caller owns that profile and port; answering 'blocked' here
+        // would refuse the launch it is on its way to performing.
+        const decision = decideViewerBrowserAction({
+            liveCdpPort: null,
+            callerWillLaunchBrowser: true,
+            display: ':99',
+            profileHolder: { cdpPort: 9222, display: null },
         })
 
         expect(decision).toEqual({ action: 'defer' })
@@ -192,7 +207,12 @@ describe('decideViewerBrowserAction', () => {
         // A viewer with no browser on it is a black screen — exactly what the
         // "원격 브라우저 화면 열기" button produced: the open flow started
         // Xvfb/x11vnc/websockify and never put anything on the display.
-        const decision = decideViewerBrowserAction({ liveCdpPort: null, callerWillLaunchBrowser: false })
+        const decision = decideViewerBrowserAction({
+            liveCdpPort: null,
+            callerWillLaunchBrowser: false,
+            display: ':99',
+            profileHolder: null,
+        })
 
         expect(decision).toEqual({ action: 'launch' })
     })
@@ -200,9 +220,55 @@ describe('decideViewerBrowserAction', () => {
     it('reuses the browser already on the display instead of stacking another', () => {
         // Every click would otherwise pile one more Chrome onto the same
         // Xvfb, each grabbing the next CDP port.
-        const decision = decideViewerBrowserAction({ liveCdpPort: 9222, callerWillLaunchBrowser: false })
+        const decision = decideViewerBrowserAction({
+            liveCdpPort: 9222,
+            callerWillLaunchBrowser: false,
+            display: ':99',
+            profileHolder: null,
+        })
 
         expect(decision).toEqual({ action: 'reuse', cdpPort: 9222 })
+    })
+
+    it('reuses a browser on this display whose CDP is merely slow to answer', () => {
+        // Chrome under load can miss the CDP probe's window while still
+        // drawing perfectly well. Launching then cannot help: the profile
+        // directory takes one Chrome at a time, so the second process exits
+        // on the singleton lock and both waitForCdp calls run their full
+        // 15s — 30 seconds to refuse a screen that was already working.
+        const decision = decideViewerBrowserAction({
+            liveCdpPort: null,
+            callerWillLaunchBrowser: false,
+            display: ':99',
+            profileHolder: { cdpPort: 9222, display: ':99' },
+        })
+
+        expect(decision).toEqual({ action: 'reuse', cdpPort: 9222 })
+    })
+
+    it('refuses immediately when the profile is held by a browser elsewhere', () => {
+        // A headless Chrome on the same profile makes the launch impossible,
+        // and it draws on no display we can show. Saying so at once beats
+        // burning 30s to arrive at the same answer.
+        const decision = decideViewerBrowserAction({
+            liveCdpPort: null,
+            callerWillLaunchBrowser: false,
+            display: ':99',
+            profileHolder: { cdpPort: 9222, display: null },
+        })
+
+        expect(decision).toEqual({ action: 'blocked' })
+    })
+
+    it('launches when nothing holds the profile', () => {
+        const decision = decideViewerBrowserAction({
+            liveCdpPort: null,
+            callerWillLaunchBrowser: false,
+            display: ':99',
+            profileHolder: null,
+        })
+
+        expect(decision).toEqual({ action: 'launch' })
     })
 })
 
