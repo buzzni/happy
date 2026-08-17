@@ -62,6 +62,7 @@ import {
     VIEWER_WEB_PORTS,
     decideViewerBrowserAction,
     decideViewerStackAction,
+    readDisplayFromEnviron,
     summariseViewerBrowser,
     type ViewerBrowserSummary,
     detectMissingViewerTools,
@@ -69,7 +70,7 @@ import {
     planViewerInstall,
     spawnDetached,
 } from '@/daemon/remoteViewer';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import {
     addDaemonTerminalSession,
     getDaemonTerminalSession,
@@ -1118,9 +1119,16 @@ export class ApiMachineClient {
         // screen (dev, 2026-08-15).
         if (!chrome) return summariseViewerBrowser({ chromeInstalled: false, cdpPort: null });
 
+        // Reachable is not enough: it must be the browser on *this* display.
+        // `browser-setup:launch` without the viewer runs Chrome headless on
+        // one of these very ports, and reusing that one reports browserReady
+        // while the user still sees an empty screen.
         let liveCdpPort: number | null = null;
         for (const port of CDP_PORT_RANGE) {
-            if (await isCdpReachable(port)) { liveCdpPort = port; break; }
+            if (!await isCdpReachable(port)) continue;
+            if (await cdpDisplay(port) !== display) continue;
+            liveCdpPort = port;
+            break;
         }
         const decision = decideViewerBrowserAction({ liveCdpPort, callerWillLaunchBrowser });
         if (decision.action === 'reuse') {
@@ -1820,6 +1828,40 @@ function isPortFree(port: number): Promise<boolean> {
 async function pickFreeCdpPort(): Promise<number | null> {
     for (const port of CDP_PORT_RANGE) {
         if (await isPortFree(port)) return port;
+    }
+    return null;
+}
+
+/**
+ * The DISPLAY of whatever Chrome holds that CDP port, or null when it has
+ * none (headless) or cannot be identified.
+ *
+ * Reads the process environment because CDP itself does not expose the
+ * display, and a headless Chrome is otherwise indistinguishable from the
+ * viewer's — same profile directory, same port range, same /json/version.
+ */
+async function cdpDisplay(cdpPort: number): Promise<string | null> {
+    // Scanned directly rather than via `pgrep -f`, which would also match the
+    // shell running it — that shell inherits the daemon's environment, so a
+    // daemon started under a DISPLAY would see its own shell and report a
+    // headless Chrome as being on the viewer's screen.
+    const flag = `--remote-debugging-port=${cdpPort}`;
+    let entries: string[];
+    try {
+        entries = await readdir('/proc');
+    } catch {
+        return null; // No procfs — not a Linux machine, so no viewer either.
+    }
+    for (const pid of entries) {
+        if (!/^\d+$/.test(pid)) continue;
+        try {
+            const cmdline = await readFile(`/proc/${pid}/cmdline`, 'utf8');
+            if (!cmdline.includes(flag)) continue;
+            const display = readDisplayFromEnviron(await readFile(`/proc/${pid}/environ`, 'utf8'));
+            if (display) return display;
+        } catch {
+            // Exited between the listing and the read — skip it.
+        }
     }
     return null;
 }

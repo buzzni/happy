@@ -3,6 +3,7 @@ import {
     VIEWER_WEB_PORTS,
     decideViewerBrowserAction,
     decideViewerStackAction,
+    readDisplayFromEnviron,
     summariseViewerBrowser,
     buildWebsockifyArgs,
     buildX11vncArgs,
@@ -224,5 +225,28 @@ describe('summariseViewerBrowser', () => {
         const summary = summariseViewerBrowser({ chromeInstalled: true, cdpPort: 9222 })
 
         expect(summary).toEqual({ browserReady: true, cdpPort: 9222 })
+    })
+})
+
+describe('readDisplayFromEnviron', () => {
+    it('reads DISPLAY out of the NUL-separated block', () => {
+        expect(readDisplayFromEnviron('PATH=/usr/bin\0DISPLAY=:99\0HOME=/home/coder')).toBe(':99')
+    })
+
+    it('reports none when the process has no DISPLAY at all', () => {
+        // This is the only thing separating a headless Chrome from the
+        // viewer's: both answer CDP, both use the same profile directory, and
+        // only the viewer's is launched with an explicit DISPLAY. Treating a
+        // headless one as reusable hands the user a black screen while
+        // reporting browserReady — the exact failure #194/#196 removed.
+        expect(readDisplayFromEnviron('PATH=/usr/bin\0HOME=/home/coder')).toBeNull()
+    })
+
+    it('does not accept a variable that merely ends in DISPLAY', () => {
+        expect(readDisplayFromEnviron('WAYLAND_DISPLAY=wayland-0')).toBeNull()
+    })
+
+    it('treats an empty DISPLAY as none', () => {
+        expect(readDisplayFromEnviron('DISPLAY=')).toBeNull()
     })
 })

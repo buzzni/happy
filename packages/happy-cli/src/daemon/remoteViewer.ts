@@ -198,6 +198,24 @@ export function summariseViewerBrowser(input: {
     return { browserReady: true, cdpPort: input.cdpPort }
 }
 
+/**
+ * The `DISPLAY` of a process, from its `/proc/<pid>/environ` block.
+ *
+ * Which display a browser draws on is what decides whether it can be reused
+ * as the viewer's, and CDP does not report it: `/json/version` looks the same
+ * for a headless Chrome and for one on Xvfb. Both also share the profile
+ * directory, so the environment is the only thing left that tells them apart.
+ *
+ * Returns null when DISPLAY is absent or empty — i.e. headless.
+ */
+export function readDisplayFromEnviron(environ: string): string | null {
+    for (const entry of environ.split('\0')) {
+        if (!entry.startsWith('DISPLAY=')) continue
+        return entry.slice('DISPLAY='.length) || null
+    }
+    return null
+}
+
 function which(binary: string): Promise<string | null> {
     return new Promise((resolve) => {
         const child = spawn('which', [binary], { stdio: ['ignore', 'pipe', 'ignore'] })
