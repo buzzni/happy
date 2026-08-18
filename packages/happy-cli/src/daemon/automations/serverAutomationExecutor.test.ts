@@ -1116,6 +1116,9 @@ describe('runServerAutomationTick', () => {
       { queueDepth: 1, queuePosition: 3, queueTotal: 4 },
     ])
     expect(notifyGithubTrigger).toHaveBeenCalledTimes(3)
+    expect(transport.report.mock.calls.map(([report]) => report.queueEstimatedAt)).toEqual([
+      now + 60_000, now + 60_000, now + 60_000, now + 60_000,
+    ])
     expect(store.state().githubQueueProgress).toEqual([{
       automationId: 'automation-1', generation: 2, total: 4, completed: 3,
     }])

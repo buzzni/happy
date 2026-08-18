@@ -128,6 +128,7 @@ export interface ServerAutomationExecutorInput {
 
 const SCRIPT_TIMEOUT_MS = 60_000
 const HEARTBEAT_MS = 60_000
+const EXPECTED_NEXT_DAEMON_TICK_MS = 60_000
 const MAX_GITHUB_EVENTS_PER_TICK = 3
 const PR_REVIEW_SANDBOX_CONFIG = JSON.stringify({
   enabled: true,
@@ -850,7 +851,7 @@ export async function runServerAutomationTick(
       )
       queueTotal = progress.total
       queuePosition = progress.position
-      if ((result.queueDepth ?? 0) > 0) queueEstimatedAt = now + githubEventsProcessed + 1
+      if ((result.queueDepth ?? 0) > 0) queueEstimatedAt = now + EXPECTED_NEXT_DAEMON_TICK_MS
     }
 
     if (result.sessionId) {
