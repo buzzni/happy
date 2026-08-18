@@ -1,5 +1,6 @@
 import { parseAllowlist } from './allowlist.js'
 import { parseAutoConnectParams } from './autoConnect.js'
+import { attemptNativePairing } from './nativePairing.js'
 
 const hostInput = document.getElementById('host')
 const portInput = document.getElementById('port')
@@ -7,6 +8,8 @@ const tokenInput = document.getElementById('token')
 const profileInput = document.getElementById('profile')
 const allowlistInput = document.getElementById('allowlist')
 const status = document.getElementById('status')
+const autoPairingStatus = document.getElementById('auto-pairing-status')
+const retryAutoPairingButton = document.getElementById('retry-auto-pairing')
 
 const stored = await chrome.storage.local.get(['host', 'port', 'token', 'profile', 'allowlist'])
 hostInput.value = stored.host || '127.0.0.1'
@@ -71,6 +74,38 @@ if (autoConnect) {
             ? ' 정밀 제어도 켰습니다.'
             : ' 정밀 제어는 껐습니다.'
     }
+}
+
+async function tryNativePairing() {
+    retryAutoPairingButton.hidden = true
+    autoPairingStatus.textContent = '이 컴퓨터의 Happy 데몬을 확인하고 있습니다…'
+    const result = await attemptNativePairing(chrome)
+
+    if (result.status === 'paired') {
+        const local = await chrome.storage.local.get(['host', 'port', 'token'])
+        hostInput.value = local.host
+        portInput.value = local.port
+        tokenInput.value = local.token
+        autoPairingStatus.textContent = '자동 연결 설정을 저장했습니다. Happy 데몬에 연결을 시도합니다.'
+        return
+    }
+    if (result.status === 'already-configured') {
+        autoPairingStatus.textContent = '저장된 연결 설정을 사용하고 있습니다.'
+        return
+    }
+
+    autoPairingStatus.textContent = result.status === 'unavailable'
+        ? '자동 연결 도우미를 찾지 못했습니다. Happy 데몬을 업데이트한 뒤 데몬과 Chrome을 재시작하거나 아래에서 직접 설정하세요.'
+        : '자동 연결 응답을 확인하지 못했습니다. 아래에서 직접 설정하거나 다시 시도하세요.'
+    retryAutoPairingButton.hidden = false
+}
+
+retryAutoPairingButton.addEventListener('click', tryNativePairing)
+
+if (autoConnect) {
+    autoPairingStatus.textContent = '설정 링크의 연결 정보를 사용했습니다.'
+} else {
+    await tryNativePairing()
 }
 
 // The debugger tier is gated by a stored setting, not an optional Chrome

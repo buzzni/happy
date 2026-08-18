@@ -43,6 +43,7 @@ export function createConnection({
     // Set synchronously so two overlapping connect() calls cannot both get past
     // the guard while the first is awaiting the stored config.
     let connecting = false
+    let restartRequested = false
     let reconnectTimer = null
     let consecutiveFailures = 0
 
@@ -83,6 +84,10 @@ export function createConnection({
             config = await readConfig()
         } finally {
             connecting = false
+        }
+        if (restartRequested) {
+            restartRequested = false
+            return connect()
         }
         const { port, token, profile, host } = config
         if (!token) {
@@ -165,6 +170,10 @@ export function createConnection({
             const stale = socket
             socket = null
             stale.close()
+        }
+        if (connecting) {
+            restartRequested = true
+            return
         }
         connect()
     }

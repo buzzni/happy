@@ -12,19 +12,9 @@ import { WebSocketServer } from 'ws'
 import type { AddressInfo } from 'node:net'
 import type { BrowserBridge } from './browserBridge'
 import { logger } from '@/ui/logger'
+import { DEFAULT_BROWSER_BRIDGE_PORT } from './browserBridgeConfig'
 
-export const DEFAULT_BROWSER_BRIDGE_PORT = 41777
-
-/**
- * Bind address for the bridge, from `HAPPY_BROWSER_BRIDGE_HOST`.
- *
- * Loopback by default — a user's own PC pointing its Chrome at a remote
- * happy session has to opt in explicitly, since anything else turns the
- * pairing token into the sole defense on a public interface.
- */
-export function resolveBrowserBridgeHost(env: NodeJS.ProcessEnv): string {
-    return env.HAPPY_BROWSER_BRIDGE_HOST?.trim() || '127.0.0.1'
-}
+export { DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeConfig'
 
 export function startBrowserBridgeServer({ bridge, port, host = '127.0.0.1' }: {
     bridge: BrowserBridge

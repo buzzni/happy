@@ -12,6 +12,7 @@
     "src/options.html",
     "src/options.js",
     "src/autoConnect.js",
+    "src/nativePairing.js",
     "src/profileId.js",
     "src/icons/icon-16.png",
     "src/icons/icon-32.png",

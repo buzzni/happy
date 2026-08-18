@@ -11,9 +11,24 @@
  */
 
 import { createConnection } from './connection.js'
-import { generateDefaultProfileName } from './profileId.js'
+import { attemptNativePairing } from './nativePairing.js'
+import { ensureDefaultProfileName } from './profileId.js'
 
 const connection = createConnection({ chrome, WebSocketImpl: WebSocket })
+let setupPromise = null
+
+function connectOrPair() {
+    if (!setupPromise) {
+        setupPromise = (async () => {
+            await ensureDefaultProfileName(chrome)
+            await attemptNativePairing(chrome)
+            await connection.connect()
+        })().finally(() => { setupPromise = null })
+    }
+    return setupPromise
+}
+
+chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage())
 
 /** Reconnect immediately after the options page saves new settings. */
 chrome.storage.onChanged.addListener((changes, area) => {
@@ -22,18 +37,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
     connection.restart()
 })
 
-chrome.runtime.onStartup.addListener(() => connection.connect())
-chrome.runtime.onInstalled.addListener(async (details) => {
-    // A fresh install's options page has never saved a profile name yet — the
-    // options page itself falls back to displaying "default", which two
-    // never-configured Chrome profiles would both persist verbatim. Pin a
-    // unique one now so that only happens if the user explicitly clears it.
-    if (details.reason === 'install') {
-        const { profile } = await chrome.storage.local.get(['profile'])
-        if (!profile) {
-            await chrome.storage.local.set({ profile: generateDefaultProfileName() })
-        }
-    }
-    connection.connect()
-})
-connection.connect()
+chrome.runtime.onStartup.addListener(() => { void connectOrPair() })
+chrome.runtime.onInstalled.addListener(() => { void connectOrPair() })
+void connectOrPair()

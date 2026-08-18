@@ -9,6 +9,15 @@ export function generateDefaultProfileName(suffix = randomHex4()) {
     return `default-${suffix}`
 }
 
+export async function ensureDefaultProfileName(chromeApi, generate = generateDefaultProfileName) {
+    const { profile } = await chromeApi.storage.local.get(['profile'])
+    if (profile) return profile
+
+    const generated = generate()
+    await chromeApi.storage.local.set({ profile: generated })
+    return generated
+}
+
 function randomHex4() {
     return crypto.randomUUID().replace(/-/g, '').slice(0, 4)
 }
