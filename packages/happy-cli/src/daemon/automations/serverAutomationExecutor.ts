@@ -837,17 +837,7 @@ export async function runServerAutomationTick(
       queueDepth?: number
     }
     try {
-      const queuedGithubEvents = payload.githubTrigger ? githubQueueDepth(input, automation) : undefined
-      if (!payload.githubTrigger
-        && schedule.lastSessionId
-        && input.isSessionRunning(schedule.lastSessionId)) {
-        result = {
-          outcome: 'SKIPPED_GATE', sessionId: schedule.lastSessionId,
-          ...(queuedGithubEvents === undefined ? {} : { queueDepth: queuedGithubEvents }),
-        }
-      } else {
-        result = await executeStartedRun(input, automation, payload, { runId, claimToken }, githubMode)
-      }
+      result = await executeStartedRun(input, automation, payload, { runId, claimToken }, githubMode)
     } catch (error) {
       input.logDebug?.(`[server-automation] ${automation.automationId} failed: ${error}`)
       result = { outcome: 'ERROR', sessionId: null, failureCode: 'AUTOMATION_EXECUTION_FAILED' }
