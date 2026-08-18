@@ -158,6 +158,7 @@ describe('automation wire contract', () => {
       id: 'run-1', automationId: 'automation-1', generation: 1, scheduledFor: 1,
       machineId: 'machine-1', status: 'COMPLETED', sessionId: 'session-1', outcome: 'WOKE',
       detailCiphertext: null, failureCode: null, degradedCode: 'GRANT_MISSING', queueDepth: 2,
+      queuePosition: 1, queueTotal: 3, queueEstimatedAt: 4,
       claimedAt: 1, startedAt: 2, completedAt: 3, lateReport: false,
     };
     expect(automationRunSchema.parse(run)).toEqual(run);

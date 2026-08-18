@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 const migrationDir = join(process.cwd(), 'prisma/migrations/20260810173000_add_server_backed_automations');
 const runNowMigrationDir = join(process.cwd(), 'prisma/migrations/20260818120000_add_automation_run_now_queue_depth');
+const queueProgressMigrationDir = join(process.cwd(), 'prisma/migrations/20260818133000_add_automation_queue_progress');
 
 function readSql(name: string): string {
     return readFileSync(join(migrationDir, name), 'utf8');
@@ -12,6 +13,10 @@ function readSql(name: string): string {
 
 function readRunNowSql(name: string): string {
     return readFileSync(join(runNowMigrationDir, name), 'utf8');
+}
+
+function readQueueProgressSql(name: string): string {
+    return readFileSync(join(queueProgressMigrationDir, name), 'utf8');
 }
 
 describe('server-backed automation migration', () => {
@@ -116,7 +121,7 @@ describe('server-backed automation migration', () => {
         }
     });
 
-    it('adds and rolls back run-now capability, durable requests, and GitHub queue depth', async () => {
+    it('adds and rolls back run-now capability, durable requests, and GitHub queue progress', async () => {
         const pg = new PGlite();
         try {
             await pg.exec(`
@@ -127,23 +132,32 @@ describe('server-backed automation migration', () => {
             `);
             await pg.exec(readSql('migration.sql'));
             await pg.exec(readRunNowSql('migration.sql'));
+            await pg.exec(readQueueProgressSql('migration.sql'));
             const added = await pg.query<{ table_name: string; column_name: string }>(`
                 SELECT table_name, column_name FROM information_schema.columns
                 WHERE (table_name = 'Machine' AND column_name = 'automationProtocolVersion')
                    OR (table_name = 'Automation' AND column_name = 'runRequestedAt')
                    OR (table_name = 'AutomationRun' AND column_name = 'queueDepth')
+                   OR (table_name = 'AutomationRun' AND column_name IN ('queuePosition', 'queueTotal', 'queueEstimatedAt'))
                 ORDER BY table_name, column_name
             `);
             expect(added.rows).toEqual([
                 { table_name: 'Automation', column_name: 'runRequestedAt' },
                 { table_name: 'AutomationRun', column_name: 'queueDepth' },
+                { table_name: 'AutomationRun', column_name: 'queueEstimatedAt' },
+                { table_name: 'AutomationRun', column_name: 'queuePosition' },
+                { table_name: 'AutomationRun', column_name: 'queueTotal' },
                 { table_name: 'Machine', column_name: 'automationProtocolVersion' },
             ]);
 
+            await pg.exec(readQueueProgressSql('rollback.sql'));
             await pg.exec(readRunNowSql('rollback.sql'));
             const remaining = await pg.query<{ column_name: string }>(`
                 SELECT column_name FROM information_schema.columns
-                WHERE column_name IN ('automationProtocolVersion', 'runRequestedAt', 'queueDepth')
+                WHERE column_name IN (
+                    'automationProtocolVersion', 'runRequestedAt', 'queueDepth',
+                    'queuePosition', 'queueTotal', 'queueEstimatedAt'
+                )
             `);
             expect(remaining.rows).toEqual([]);
         } finally {

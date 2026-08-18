@@ -343,6 +343,9 @@ export async function reportAutomationRun(
         failureCode: string | null;
         degradedCode?: string | null;
         queueDepth?: number | null;
+        queuePosition?: number | null;
+        queueTotal?: number | null;
+        queueEstimatedAt?: Date | null;
     },
     now: Date = new Date(),
 ): Promise<Result<{ idempotent: boolean; status: string; outcome: AutomationRunOutcome | null }>> {
@@ -364,6 +367,14 @@ export async function reportAutomationRun(
     }
     const degradedCode = input.degradedCode ?? null;
     const queueDepth = input.queueDepth ?? null;
+    const queuePosition = input.queuePosition ?? null;
+    const queueTotal = input.queueTotal ?? null;
+    const queueEstimatedAt = input.queueEstimatedAt ?? null;
+    if ((queuePosition === null) !== (queueTotal === null)
+        || (queuePosition !== null && queueTotal !== null && queuePosition > queueTotal)
+        || (queueDepth !== null && queueTotal !== null && queueDepth > queueTotal)) {
+        return { ok: false, error: 'report-conflict' };
+    }
     if (input.outcome !== 'WOKE' && degradedCode !== null) {
         return { ok: false, error: 'report-conflict' };
     }
@@ -391,6 +402,9 @@ export async function reportAutomationRun(
                 failureCode: input.failureCode,
                 degradedCode,
                 queueDepth,
+                queuePosition,
+                queueTotal,
+                queueEstimatedAt,
                 completedAt: now,
                 lateReport: run.status === 'ABANDONED'
                     || (run.runLeaseExpiresAt !== null && run.runLeaseExpiresAt < now),

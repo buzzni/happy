@@ -568,6 +568,9 @@ model AutomationRun {
     failureCode       String?
     degradedCode      String?
     queueDepth         Int?
+    queuePosition      Int?
+    queueTotal         Int?
+    queueEstimatedAt   DateTime?
     claimedAt         DateTime              @default(now())
     startedAt         DateTime?
     completedAt       DateTime?
