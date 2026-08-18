@@ -811,7 +811,8 @@ export async function runServerAutomationTick(
       scheduledFor: schedule.nextRunAt,
     })
     if (!claim.ok || !claim.value) {
-      if (claim.error === 'claim-denied' || claim.error === 'already-claimed') {
+      if (claim.error === 'claim-denied' || claim.error === 'already-claimed'
+        || (claim.error === 'active-run' && schedule.runRequestRevision == null)) {
         advanceSchedule(input, automation.automationId, payload, now)
         if (payload.githubTrigger) schedulePendingGithubEvent(input, automation, now)
       }
@@ -882,6 +883,7 @@ export async function runServerAutomationTick(
       detailCiphertext: null,
       failureCode: result.failureCode ?? null,
       degradedCode: result.degradedCode ?? null,
+      notificationOnly: payload.githubTrigger?.action === 'notify' && result.outcome === 'WOKE',
       queueDepth: result.queueDepth ?? null,
       queuePosition,
       queueTotal,

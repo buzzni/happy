@@ -140,6 +140,11 @@ export function automationSocketHandler(accountId: string, machineId: string, so
             detailCiphertext: data?.detailCiphertext === null ? null : bytes(data?.detailCiphertext, 128 * 1024),
             failureCode,
             degradedCode,
+            notificationOnly: data?.notificationOnly === undefined
+                ? undefined
+                : typeof data.notificationOnly === 'boolean'
+                    ? data.notificationOnly
+                    : (() => { throw new Error('invalid-input'); })(),
             queueDepth: data?.queueDepth === null || data?.queueDepth === undefined
                 ? null
                 : integer(data.queueDepth, 0, 10_000),

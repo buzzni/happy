@@ -23,7 +23,7 @@ function automationRecord(patch: Record<string, unknown> = {}) {
         ownerAccountId: 'editor-1',
         machineAccountId: 'owner-1',
         machineId: 'machine-1',
-        targetMachine: { automationProtocolVersion: 2 },
+        targetMachine: { automationProtocolVersion: 2, automationKeyVersion: 3 },
         revision: 1,
         generation: 1,
         payloadVersion: 1,
@@ -86,6 +86,7 @@ function makeTx(options: {
                 accountId: 'owner-1',
                 automationPublicKey: new Uint8Array(32),
                 automationKeyVersion: 3,
+                automationProtocolVersion: 2,
             })),
         },
         automation: {
@@ -213,6 +214,29 @@ describe('automationService', () => {
         expect(tx.automation.updateMany).not.toHaveBeenCalled();
     });
 
+    it('rejects an immediate request when the target machine key has rotated', async () => {
+        const { tx } = makeTx({
+            automation: automationRecord({
+                machineKeyVersion: 3,
+                targetMachine: { automationProtocolVersion: 2, automationKeyVersion: 4 },
+            }),
+        });
+
+        await expect(requestAutomationRun(
+            tx as never, 'editor-1', 'project-1', 'automation-1', 1,
+        )).resolves.toEqual({ ok: false, error: 'machine-key-version-conflict' });
+        expect(tx.automation.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects an immediate request when the project viewer key has rotated', async () => {
+        const { tx } = makeTx({ automation: automationRecord({ viewerKeyVersion: 1 }) });
+
+        await expect(requestAutomationRun(
+            tx as never, 'editor-1', 'project-1', 'automation-1', 1,
+        )).resolves.toEqual({ ok: false, error: 'viewer-key-version-conflict' });
+        expect(tx.automation.updateMany).not.toHaveBeenCalled();
+    });
+
     it('derives owner and target machine instead of trusting client identity', async () => {
         const { tx, created } = makeTx();
 
@@ -327,6 +351,7 @@ describe('automationService', () => {
             .resolves.toEqual({ ok: true, value: expect.objectContaining({
                 machineId: 'machine-1',
                 machineKeyVersion: 3,
+                automationProtocolVersion: 2,
                 viewerKeyVersion: 2,
             }) });
         await expect(setAutomationViewerKey(viewer.tx as never, 'editor-1', 'project-1', {

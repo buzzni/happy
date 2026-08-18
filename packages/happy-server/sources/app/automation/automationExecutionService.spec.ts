@@ -151,6 +151,17 @@ describe('automationExecutionService', () => {
         }, now)).resolves.toEqual({ ok: false, error: 'claim-denied' });
     });
 
+    it('does not revive a durable run-now request after fifteen minutes', async () => {
+        const tx = makeTx();
+        const requestedAt = new Date(now.getTime() - 15 * 60_000 - 1);
+        tx.automation.findFirst.mockResolvedValue(automation({ runRequestedAt: requestedAt }));
+
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
+            automationId: 'automation-1', generation: 3, scheduledFor: requestedAt,
+        }, now)).resolves.toEqual({ ok: false, error: 'claim-denied' });
+        expect(tx.automationRun.createMany).not.toHaveBeenCalled();
+    });
+
     it('denies claims while legacy ownership is still staged', async () => {
         const tx = makeTx();
         tx.automation.findFirst.mockResolvedValue(automation({ legacyMigrationPending: true }));
@@ -348,6 +359,7 @@ describe('automationExecutionService', () => {
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
             outcome: 'WOKE', sessionId: null, detailCiphertext: null, failureCode: null,
+            notificationOnly: true,
             queueDepth: 2, queuePosition: 1, queueTotal: 3,
             queueEstimatedAt: new Date(now.getTime() + 1_000),
         }, now)).resolves.toEqual({
@@ -360,6 +372,21 @@ describe('automationExecutionService', () => {
                 queueEstimatedAt: new Date(now.getTime() + 1_000),
             }),
         }));
+    });
+
+    it('does not infer a notify-only WOKE report from queue progress when intent is false', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({
+            id: 'run-1', status: 'RUNNING', reportId: null,
+            runLeaseExpiresAt: new Date(now.getTime() + 1_000),
+        });
+
+        await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
+            outcome: 'WOKE', sessionId: null, detailCiphertext: null, failureCode: null,
+            notificationOnly: false, queueDepth: 2,
+        }, now)).resolves.toEqual({ ok: false, error: 'report-conflict' });
+        expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
     });
 
     it('rejects inconsistent GitHub queue progress', async () => {

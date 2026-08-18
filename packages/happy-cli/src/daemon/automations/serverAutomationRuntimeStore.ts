@@ -29,6 +29,7 @@ export interface PendingAutomationReport {
   detailCiphertext: string | null
   failureCode?: string | null
   degradedCode?: string | null
+  notificationOnly?: boolean
   queueDepth?: number | null
   queuePosition?: number | null
   queueTotal?: number | null
@@ -191,6 +192,9 @@ function parse(raw: string): ServerAutomationRuntimeState {
         detailCiphertext: nullableText(row.detailCiphertext),
         ...(row.failureCode !== undefined ? { failureCode: nullableText(row.failureCode) } : {}),
         ...(row.degradedCode !== undefined ? { degradedCode: nullableText(row.degradedCode) } : {}),
+        ...(row.notificationOnly !== undefined ? {
+          notificationOnly: row.notificationOnly === true,
+        } : {}),
         ...(row.queueDepth !== undefined ? {
           queueDepth: row.queueDepth === null ? null : integer(row.queueDepth),
         } : {}),

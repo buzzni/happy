@@ -172,7 +172,7 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-key-register', {
             expectedKeyVersion: 3,
             publicKey: Buffer.from(new Uint8Array(32).fill(7)).toString('base64'),
-            protocolVersion: 2,
+            protocolVersion: 3,
         });
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('machine-update-metadata', expect.any(Object));
         client.shutdown();

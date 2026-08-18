@@ -4,6 +4,7 @@ import {
   AutomationApiError,
   automationPayloadSchema,
   automationRunSchema,
+  automationTargetSchema,
   createAutomationApiClient,
   decryptAutomationPayload,
   encryptAutomationPayload,
@@ -153,6 +154,17 @@ const automation: AutomationPublic = {
 };
 
 describe('automation wire contract', () => {
+  it('preserves the target daemon automation capability and defaults legacy responses', () => {
+    const target = {
+      machineAccountId: 'account-1', machineId: 'machine-1',
+      machinePublicKey: Buffer.alloc(32, 1).toString('base64'), machineKeyVersion: 1,
+      viewerPublicKey: null, viewerKeyVersion: 0,
+    };
+    expect(automationTargetSchema.parse({ ...target, automationProtocolVersion: 3 }))
+      .toMatchObject({ automationProtocolVersion: 3 });
+    expect(automationTargetSchema.parse(target)).toMatchObject({ automationProtocolVersion: 1 });
+  });
+
   it('preserves a safe degraded connector code on a completed run', () => {
     const run = {
       id: 'run-1', automationId: 'automation-1', generation: 1, scheduledFor: 1,
