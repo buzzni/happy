@@ -152,6 +152,8 @@ function executable(automation: any, accountId: string, machineId: string, gener
         && automation.viewerKeyVersion === automation.project?.automationViewerKeyVersion;
 }
 
+const AUTOMATION_RUN_NOW_MAX_AGE_MS = 15 * 60_000;
+
 export async function claimAutomationRun(
     tx: Tx,
     accountId: string,
@@ -168,7 +170,8 @@ export async function claimAutomationRun(
     });
     const inClaimWindow = input.scheduledFor.getTime() >= now.getTime() - 90_000
         && input.scheduledFor.getTime() <= now.getTime() + 15_000;
-    const durableRunNowRequest = automation?.runRequestedAt?.getTime() === input.scheduledFor.getTime();
+    const durableRunNowRequest = automation?.runRequestedAt?.getTime() === input.scheduledFor.getTime()
+        && input.scheduledFor.getTime() >= now.getTime() - AUTOMATION_RUN_NOW_MAX_AGE_MS;
     if (!inClaimWindow && !durableRunNowRequest) return { ok: false, error: 'claim-denied' };
     if (!automation || !executable(automation, accountId, machineId, input.generation)
         || input.scheduledFor < automation.enabledAt) {
@@ -342,6 +345,7 @@ export async function reportAutomationRun(
         detailCiphertext: Binary | null;
         failureCode: string | null;
         degradedCode?: string | null;
+        notificationOnly?: boolean;
         queueDepth?: number | null;
         queuePosition?: number | null;
         queueTotal?: number | null;
@@ -378,7 +382,11 @@ export async function reportAutomationRun(
     if (input.outcome !== 'WOKE' && degradedCode !== null) {
         return { ok: false, error: 'report-conflict' };
     }
-    const notifyOnlyGithubRun = input.outcome === 'WOKE' && queueDepth !== null;
+    const notifyOnlyGithubRun = input.notificationOnly === true
+        || (input.notificationOnly === undefined && input.outcome === 'WOKE' && queueDepth !== null);
+    if (input.notificationOnly === true && (input.outcome !== 'WOKE' || input.sessionId !== null)) {
+        return { ok: false, error: 'report-conflict' };
+    }
     if ((input.outcome === 'WOKE' || input.outcome === 'SILENT') && !input.sessionId && !notifyOnlyGithubRun) {
         return { ok: false, error: 'report-conflict' };
     }

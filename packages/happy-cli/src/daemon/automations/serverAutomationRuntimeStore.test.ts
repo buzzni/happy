@@ -44,6 +44,7 @@ describe('serverAutomationRuntimeStore', () => {
       pendingReports: [{
         runId: 'run-1', claimToken: 'claim-token', reportId: 'report-1', status: 'COMPLETED',
         outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,
+        notificationOnly: true,
         degradedCode: 'GRANT_MISSING', queueDepth: 2, queuePosition: 1, queueTotal: 3,
         queueEstimatedAt: 123,
       }],
@@ -79,6 +80,7 @@ describe('serverAutomationRuntimeStore', () => {
       pendingReports: [{
         runId: 'run-1', claimToken: 'claim-token', reportId: 'report-1', status: 'COMPLETED',
         outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,
+        notificationOnly: true,
         degradedCode: 'GRANT_MISSING', queueDepth: 2, queuePosition: 1, queueTotal: 3,
         queueEstimatedAt: 123,
       }],

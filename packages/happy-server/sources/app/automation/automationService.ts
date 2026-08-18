@@ -76,6 +76,7 @@ interface AutomationTarget {
     machineId: string;
     machinePublicKey: Binary;
     machineKeyVersion: number;
+    automationProtocolVersion: number;
 }
 
 async function projectAccess(tx: Tx, actorId: string, projectId: string): Promise<ProjectAccess | null> {
@@ -113,7 +114,13 @@ async function targetForProject(tx: Tx, project: ProjectAccess['project']): Prom
 
     const machine = await tx.machine.findUnique({
         where: { accountId_id: { accountId: project.accountId, id: machineId } },
-        select: { id: true, accountId: true, automationPublicKey: true, automationKeyVersion: true },
+        select: {
+            id: true,
+            accountId: true,
+            automationPublicKey: true,
+            automationKeyVersion: true,
+            automationProtocolVersion: true,
+        },
     });
     if (!machine?.automationPublicKey || machine.automationKeyVersion < 1) return null;
     return {
@@ -121,6 +128,7 @@ async function targetForProject(tx: Tx, project: ProjectAccess['project']): Prom
         machineId: machine.id,
         machinePublicKey: machine.automationPublicKey,
         machineKeyVersion: machine.automationKeyVersion,
+        automationProtocolVersion: machine.automationProtocolVersion,
     };
 }
 
@@ -131,6 +139,7 @@ export interface AutomationTargetView {
     machineKeyVersion: number;
     viewerPublicKey: Binary | null;
     viewerKeyVersion: number;
+    automationProtocolVersion: number;
 }
 
 export async function getAutomationTarget(
@@ -151,6 +160,7 @@ export async function getAutomationTarget(
             machineKeyVersion: target.machineKeyVersion,
             viewerPublicKey: access.project.automationViewerPublicKey,
             viewerKeyVersion: access.project.automationViewerKeyVersion,
+            automationProtocolVersion: target.automationProtocolVersion,
         },
     };
 }
@@ -272,7 +282,11 @@ export async function requestAutomationRun(
     if (!access.canEdit) return { ok: false, error: 'forbidden' };
     const current = await tx.automation.findFirst({
         where: { id: automationId, projectId, deletedAt: null },
-        include: { targetMachine: { select: { automationProtocolVersion: true } } },
+        include: {
+            targetMachine: {
+                select: { automationProtocolVersion: true, automationKeyVersion: true },
+            },
+        },
     });
     if (!current) return { ok: false, error: 'not-found' };
     if (current.revision !== expectedRevision) {
@@ -283,6 +297,12 @@ export async function requestAutomationRun(
     if (!current.machineAccountId || !current.machineId) return { ok: false, error: 'automation-target-unavailable' };
     if ((current.targetMachine?.automationProtocolVersion ?? 1) < AUTOMATION_RUN_NOW_PROTOCOL_VERSION) {
         return { ok: false, error: 'automation-run-unsupported' };
+    }
+    if (current.machineKeyVersion !== current.targetMachine?.automationKeyVersion) {
+        return { ok: false, error: 'machine-key-version-conflict' };
+    }
+    if (current.viewerKeyVersion !== access.project.automationViewerKeyVersion) {
+        return { ok: false, error: 'viewer-key-version-conflict' };
     }
     const requestedAt = new Date(Math.max(
         now.getTime(),

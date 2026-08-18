@@ -837,7 +837,8 @@ export async function runServerAutomationTick(
       scheduledFor: schedule.nextRunAt,
     })
     if (!claim.ok || !claim.value) {
-      if (claim.error === 'claim-denied' || claim.error === 'already-claimed') {
+      if (claim.error === 'claim-denied' || claim.error === 'already-claimed'
+        || (claim.error === 'active-run' && schedule.runRequestRevision == null)) {
         advanceSchedule(input, automation.automationId, payload, now)
         if (payload.githubTrigger) schedulePendingGithubEvent(input, automation, now)
       }
@@ -863,17 +864,7 @@ export async function runServerAutomationTick(
       queueDepth?: number
     }
     try {
-      const queuedGithubEvents = payload.githubTrigger ? githubQueueDepth(input, automation) : undefined
-      if (!payload.githubTrigger
-        && schedule.lastSessionId
-        && input.isSessionRunning(schedule.lastSessionId)) {
-        result = {
-          outcome: 'SKIPPED_GATE', sessionId: schedule.lastSessionId,
-          ...(queuedGithubEvents === undefined ? {} : { queueDepth: queuedGithubEvents }),
-        }
-      } else {
-        result = await executeStartedRun(input, automation, payload, { runId, claimToken }, githubMode)
-      }
+      result = await executeStartedRun(input, automation, payload, { runId, claimToken }, githubMode)
     } catch (error) {
       input.logDebug?.(`[server-automation] ${automation.automationId} failed: ${error}`)
       result = { outcome: 'ERROR', sessionId: null, failureCode: 'AUTOMATION_EXECUTION_FAILED' }
@@ -918,6 +909,7 @@ export async function runServerAutomationTick(
       detailCiphertext: null,
       failureCode: result.failureCode ?? null,
       degradedCode: result.degradedCode ?? null,
+      notificationOnly: payload.githubTrigger?.action === 'notify' && result.outcome === 'WOKE',
       queueDepth: result.queueDepth ?? null,
       queuePosition,
       queueTotal,

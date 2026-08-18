@@ -165,6 +165,17 @@ describe('runServerAutomationTick', () => {
     expect(store.state().schedules[0]!.nextRunAt).toBe(requestedAt)
   })
 
+  it('advances a scheduled slot when another run is already active', async () => {
+    const { input, store, transport, now } = setup({ claim: { ok: false, error: 'active-run' } })
+
+    await runServerAutomationTick(input)
+
+    expect(transport.claim).toHaveBeenCalledWith({
+      automationId: 'automation-1', generation: 2, scheduledFor: now,
+    })
+    expect(store.state().schedules[0]!.nextRunAt).toBe(now + 15 * 60_000)
+  })
+
   it('isolates a corrupt encrypted row so other automations still tick', async () => {
     const { input, decryptPayload, logDebug, transport, now } = setup()
     const corrupt = { ...cacheRecord(), automationId: 'automation-corrupt' }
@@ -1118,11 +1129,12 @@ describe('runServerAutomationTick', () => {
       queueDepth: report.queueDepth,
       queuePosition: report.queuePosition,
       queueTotal: report.queueTotal,
+      notificationOnly: report.notificationOnly,
     }))).toEqual([
-      { queueDepth: 4, queuePosition: 0, queueTotal: 4 },
-      { queueDepth: 3, queuePosition: 1, queueTotal: 4 },
-      { queueDepth: 2, queuePosition: 2, queueTotal: 4 },
-      { queueDepth: 1, queuePosition: 3, queueTotal: 4 },
+      { queueDepth: 4, queuePosition: 0, queueTotal: 4, notificationOnly: false },
+      { queueDepth: 3, queuePosition: 1, queueTotal: 4, notificationOnly: true },
+      { queueDepth: 2, queuePosition: 2, queueTotal: 4, notificationOnly: true },
+      { queueDepth: 1, queuePosition: 3, queueTotal: 4, notificationOnly: true },
     ])
     expect(notifyGithubTrigger).toHaveBeenCalledTimes(3)
     expect(transport.report.mock.calls.map(([report]) => report.queueEstimatedAt)).toEqual([
