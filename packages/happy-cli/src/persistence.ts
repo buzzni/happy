@@ -309,21 +309,35 @@ export async function clearMachineId(): Promise<void> {
   }));
 }
 
+export interface DaemonStateSnapshot {
+  state: DaemonLocallyPersistedState | null;
+  /** Exact file contents `state` was parsed from, so a caller can detect a concurrent rewrite. */
+  raw: string | null;
+}
+
+/**
+ * Read daemon state from local file, keeping the raw contents so a caller that
+ * wants to write back can first check nobody else changed the file meanwhile.
+ */
+export async function readDaemonStateSnapshot(): Promise<DaemonStateSnapshot> {
+  try {
+    if (!existsSync(configuration.daemonStateFile)) {
+      return { state: null, raw: null };
+    }
+    const raw = await readFile(configuration.daemonStateFile, 'utf-8');
+    return { state: JSON.parse(raw) as DaemonLocallyPersistedState, raw };
+  } catch (error) {
+    // State corrupted somehow :(
+    console.error(`[PERSISTENCE] Daemon state file corrupted: ${configuration.daemonStateFile}`, error);
+    return { state: null, raw: null };
+  }
+}
+
 /**
  * Read daemon state from local file
  */
 export async function readDaemonState(): Promise<DaemonLocallyPersistedState | null> {
-  try {
-    if (!existsSync(configuration.daemonStateFile)) {
-      return null;
-    }
-    const content = await readFile(configuration.daemonStateFile, 'utf-8');
-    return JSON.parse(content) as DaemonLocallyPersistedState;
-  } catch (error) {
-    // State corrupted somehow :(
-    console.error(`[PERSISTENCE] Daemon state file corrupted: ${configuration.daemonStateFile}`, error);
-    return null;
-  }
+  return (await readDaemonStateSnapshot()).state;
 }
 
 /**
