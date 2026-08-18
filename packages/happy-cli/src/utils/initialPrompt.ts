@@ -12,6 +12,28 @@ export function consumePendingInitialPrompt(env: NodeJS.ProcessEnv): string | nu
   return text.length > 0 ? text : null
 }
 
+/** Read the daemon-provided initial model seed exactly once (HAPPY_INITIAL_MODEL). */
+export function consumePendingInitialModel(env: NodeJS.ProcessEnv): string | null {
+  const raw = env.HAPPY_INITIAL_MODEL
+  delete env.HAPPY_INITIAL_MODEL
+  if (typeof raw !== 'string') return null
+  const model = raw.trim()
+  return model.length > 0 ? model : null
+}
+
+/**
+ * Read the daemon-provided initial effort seed exactly once
+ * (HAPPY_INITIAL_EFFORT). Validation against the agent's accepted set is the
+ * caller's job — accepted values differ per agent (Claude vs Codex).
+ */
+export function consumePendingInitialEffort(env: NodeJS.ProcessEnv): string | null {
+  const raw = env.HAPPY_INITIAL_EFFORT
+  delete env.HAPPY_INITIAL_EFFORT
+  if (typeof raw !== 'string') return null
+  const effort = raw.trim()
+  return effort.length > 0 ? effort : null
+}
+
 export function consumePendingInitialPromptLocalId(env: NodeJS.ProcessEnv): string | undefined {
   const raw = env.HAPPY_INITIAL_PROMPT_LOCAL_ID
   delete env.HAPPY_INITIAL_PROMPT_LOCAL_ID

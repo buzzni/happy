@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
     listAutomationRuns: vi.fn(),
     listAutomations: vi.fn(),
     replaceAutomationViewerKeyIfUnused: vi.fn(),
+    requestAutomationRun: vi.fn(),
     resolveAutomationRunMcpContext: vi.fn(),
     setAutomationViewerKey: vi.fn(),
     updateAutomation: vi.fn(),
@@ -44,6 +45,7 @@ function record() {
         machineKeyVersion: 1,
         machineKeyEnvelope: new Uint8Array([6, 7]),
         paused: false,
+        runRequestedAt: null,
         enabledAt: new Date(10),
         deletedAt: null,
         appliedRevision: 0,
@@ -97,7 +99,8 @@ describe('automationRoutes', () => {
                 id: 'run-1', automationId: 'automation-1', generation: 1,
                 scheduledFor: new Date(1), machineId: 'machine-1', status: 'COMPLETED',
                 sessionId: 'session-1', outcome: 'WOKE', detailCiphertext: null,
-                failureCode: null, degradedCode: 'GRANT_MISSING', claimedAt: new Date(2),
+                failureCode: null, degradedCode: 'GRANT_MISSING', queueDepth: 2,
+                queuePosition: 1, queueTotal: 3, queueEstimatedAt: new Date(5), claimedAt: new Date(2),
                 startedAt: new Date(3), completedAt: new Date(4), lateReport: false,
             }],
         });
@@ -109,7 +112,10 @@ describe('automationRoutes', () => {
         });
 
         expect(response.statusCode).toBe(200);
-        expect(response.json().runs[0]).toMatchObject({ degradedCode: 'GRANT_MISSING' });
+        expect(response.json().runs[0]).toMatchObject({
+            degradedCode: 'GRANT_MISSING', queueDepth: 2, queuePosition: 1, queueTotal: 3,
+            queueEstimatedAt: 5,
+        });
     });
 
     it('decodes encrypted create fields and derives actor/project outside the body', async () => {
@@ -162,6 +168,31 @@ describe('automationRoutes', () => {
         expect(mocks.replaceAutomationViewerKeyIfUnused).toHaveBeenCalledWith({}, 'user-1', 'project-1', {
             expectedKeyVersion: 2,
             publicKey: new Uint8Array(32).fill(7),
+        });
+    });
+
+    it('queues an immediate run through the revision-safe automation endpoint', async () => {
+        mocks.requestAutomationRun.mockResolvedValue({
+            ok: true,
+            value: { ...record(), revision: 2, runRequestedAt: new Date(40) },
+        });
+        const app = await makeApp();
+
+        const response = await app.inject({
+            method: 'POST',
+            url: '/v1/projects/project-1/automations/automation-1/run',
+            headers: { authorization: 'Bearer test' },
+            payload: { expectedRevision: 1 },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(mocks.requestAutomationRun).toHaveBeenCalledWith(
+            {}, 'user-1', 'project-1', 'automation-1', 1,
+        );
+        expect(response.json().automation).toMatchObject({ revision: 2, runRequestedAt: 40 });
+        expect(mocks.emitAutomationUpdate).toHaveBeenCalledWith('user-1', {
+            projectId: 'project-1', automationId: 'automation-1', revision: 2,
+            generation: 1, reason: 'run',
         });
     });
 

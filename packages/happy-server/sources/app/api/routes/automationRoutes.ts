@@ -18,6 +18,7 @@ import {
     listAutomationRuns,
     listAutomations,
     replaceAutomationViewerKeyIfUnused,
+    requestAutomationRun,
     setAutomationViewerKey,
     updateAutomation,
     type AutomationUpdateInput,
@@ -59,6 +60,7 @@ function serializeAutomation(row: Automation) {
         machineKeyVersion: row.machineKeyVersion,
         paused: row.paused,
         enabledAt: row.enabledAt.getTime(),
+        runRequestedAt: row.runRequestedAt?.getTime() ?? null,
         appliedRevision: row.appliedRevision,
         appliedAt: row.appliedAt?.getTime() ?? null,
         createdAt: row.createdAt.getTime(),
@@ -79,6 +81,10 @@ function serializeRun(row: AutomationRun) {
         detailCiphertext: row.detailCiphertext ? Buffer.from(row.detailCiphertext).toString('base64') : null,
         failureCode: row.failureCode,
         degradedCode: row.degradedCode,
+        queueDepth: row.queueDepth,
+        queuePosition: row.queuePosition,
+        queueTotal: row.queueTotal,
+        queueEstimatedAt: row.queueEstimatedAt?.getTime() ?? null,
         claimedAt: row.claimedAt.getTime(),
         startedAt: row.startedAt?.getTime() ?? null,
         completedAt: row.completedAt?.getTime() ?? null,
@@ -325,6 +331,29 @@ export function automationRoutes(app: Fastify) {
             revision: result.value.revision,
             generation: result.value.generation,
             reason: 'upsert',
+        });
+        return reply.send({ automation: serializeAutomation(result.value) });
+    });
+
+    app.post('/v1/projects/:projectId/automations/:automationId/run', {
+        preHandler: app.authenticate,
+        schema: { params: automationParamsSchema, body: deleteSchema },
+    }, async (request, reply) => {
+        if (rejectWhenDisabled(reply)) return;
+        const result = await inTx((tx) => requestAutomationRun(
+            tx,
+            request.userId,
+            request.params.projectId,
+            request.params.automationId,
+            request.body.expectedRevision,
+        ));
+        if (!result.ok) return sendError(reply, result);
+        await emitAutomationUpdate(request.userId, {
+            projectId: request.params.projectId,
+            automationId: result.value.id,
+            revision: result.value.revision,
+            generation: result.value.generation,
+            reason: 'run',
         });
         return reply.send({ automation: serializeAutomation(result.value) });
     });

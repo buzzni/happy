@@ -260,6 +260,7 @@ model Machine {
     accessKeys         AccessKey[]
     automationPublicKey Bytes?
     automationKeyVersion Int       @default(0)
+    automationProtocolVersion Int  @default(1)
     automations        Automation[] @relation("AutomationTargetMachine")
 
     @@unique([accountId, id])
@@ -512,6 +513,7 @@ model Automation {
     machineKeyEnvelope Bytes
     paused             Boolean   @default(false)
     enabledAt          DateTime  @default(now())
+    runRequestedAt     DateTime?
     deletedAt          DateTime?
     appliedRevision    Int       @default(0)
     appliedAt          DateTime?
@@ -565,6 +567,10 @@ model AutomationRun {
     detailCiphertext  Bytes?
     failureCode       String?
     degradedCode      String?
+    queueDepth         Int?
+    queuePosition      Int?
+    queueTotal         Int?
+    queueEstimatedAt   DateTime?
     claimedAt         DateTime              @default(now())
     startedAt         DateTime?
     completedAt       DateTime?

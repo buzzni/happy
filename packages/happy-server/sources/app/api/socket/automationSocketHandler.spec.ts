@@ -59,6 +59,26 @@ describe('automationSocketHandler', () => {
         }) });
     });
 
+    it('registers run-now protocol support and treats an older daemon as version 1', async () => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        services.registerAutomationMachineKey.mockResolvedValue({ ok: true, value: { keyVersion: 4 } });
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+        const key = Buffer.from(new Uint8Array(32)).toString('base64');
+
+        await handlers.get('automation-key-register')!({
+            expectedKeyVersion: 3, publicKey: key, protocolVersion: 2,
+        }, vi.fn());
+        expect(services.registerAutomationMachineKey).toHaveBeenLastCalledWith(
+            {}, 'account-1', 'machine-1', expect.objectContaining({ protocolVersion: 2 }),
+        );
+
+        await handlers.get('automation-key-register')!({ expectedKeyVersion: 3, publicKey: key }, vi.fn());
+        expect(services.registerAutomationMachineKey).toHaveBeenLastCalledWith(
+            {}, 'account-1', 'machine-1', expect.objectContaining({ protocolVersion: 1 }),
+        );
+    });
+
     it('accepts a safe automation failure code and rejects unstructured values', async () => {
         const handlers = new Map<string, Function>();
         const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
@@ -84,9 +104,13 @@ describe('automationSocketHandler', () => {
             runId: 'run-2', claimToken: 'claim', reportId: 'report-2', status: 'COMPLETED',
             outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null, failureCode: null,
             degradedCode: 'GRANT_MISSING',
+            queueDepth: 2, queuePosition: 1, queueTotal: 3, queueEstimatedAt: 1234,
         }, degraded);
         expect(services.reportAutomationRun).toHaveBeenLastCalledWith(
-            {}, 'account-1', 'machine-1', expect.objectContaining({ degradedCode: 'GRANT_MISSING' }),
+            {}, 'account-1', 'machine-1', expect.objectContaining({
+                degradedCode: 'GRANT_MISSING', queueDepth: 2, queuePosition: 1, queueTotal: 3,
+                queueEstimatedAt: new Date(1234),
+            }),
         );
 
         const rejected = vi.fn();

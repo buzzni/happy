@@ -8,6 +8,7 @@ import {
     listAutomationRuns,
     listAutomations,
     replaceAutomationViewerKeyIfUnused,
+    requestAutomationRun,
     setAutomationViewerKey,
     updateAutomation,
 } from './automationService';
@@ -22,6 +23,7 @@ function automationRecord(patch: Record<string, unknown> = {}) {
         ownerAccountId: 'editor-1',
         machineAccountId: 'owner-1',
         machineId: 'machine-1',
+        targetMachine: { automationProtocolVersion: 2 },
         revision: 1,
         generation: 1,
         payloadVersion: 1,
@@ -32,6 +34,7 @@ function automationRecord(patch: Record<string, unknown> = {}) {
         machineKeyVersion: 3,
         machineKeyEnvelope: envelope,
         paused: false,
+        runRequestedAt: null,
         enabledAt: new Date(0),
         deletedAt: null,
         appliedRevision: 0,
@@ -139,9 +142,75 @@ describe('automationService', () => {
         })).resolves.toEqual({ ok: true, value: [{ id: 'run-1', automationId: 'automation-1' }] });
         expect(tx.automationRun.findMany).toHaveBeenCalledWith({
             where: { automation: { projectId: 'project-1' }, automationId: 'automation-1' },
-            orderBy: { claimedAt: 'desc' },
+            orderBy: [{ claimedAt: 'desc' }, { scheduledFor: 'desc' }],
             take: 20,
         });
+    });
+
+    it('records one revision-safe immediate run request without resetting the generation', async () => {
+        const requestedAt = new Date('2026-08-18T10:00:00.000Z');
+        const requested = automationRecord({ revision: 2, generation: 1, runRequestedAt: requestedAt });
+        const { tx } = makeTx();
+        tx.automation.findUnique = vi.fn(async () => requested);
+
+        await expect(requestAutomationRun(
+            tx as never,
+            'editor-1',
+            'project-1',
+            'automation-1',
+            1,
+            requestedAt,
+        )).resolves.toEqual({ ok: true, value: requested });
+
+        expect(tx.automation.updateMany).toHaveBeenCalledWith({
+            where: {
+                id: 'automation-1', projectId: 'project-1', revision: 1,
+                paused: false, legacyMigrationPending: false, deletedAt: null,
+            },
+            data: { revision: { increment: 1 }, runRequestedAt: requestedAt },
+        });
+        expect(tx.automationChange.create).toHaveBeenCalledWith({
+            data: expect.objectContaining({ revision: 2, generation: 1, kind: 'UPSERT' }),
+        });
+    });
+
+    it('rejects immediate execution for a paused automation', async () => {
+        const { tx } = makeTx({ automation: automationRecord({ paused: true }) });
+
+        await expect(requestAutomationRun(
+            tx as never, 'editor-1', 'project-1', 'automation-1', 1,
+        )).resolves.toEqual({ ok: false, error: 'automation-paused' });
+        expect(tx.automation.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('returns the latest row when a stale run request observes a newly paused automation', async () => {
+        const latest = automationRecord({ revision: 2, paused: true });
+        const { tx } = makeTx({ automation: latest });
+
+        await expect(requestAutomationRun(
+            tx as never, 'editor-1', 'project-1', 'automation-1', 1,
+        )).resolves.toEqual({ ok: false, error: 'revision-conflict', latest });
+        expect(tx.automation.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('does not persist an immediate request when the execution target is unavailable', async () => {
+        const { tx } = makeTx({ automation: automationRecord({ machineAccountId: null, machineId: null }) });
+
+        await expect(requestAutomationRun(
+            tx as never, 'editor-1', 'project-1', 'automation-1', 1,
+        )).resolves.toEqual({ ok: false, error: 'automation-target-unavailable' });
+        expect(tx.automation.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects an immediate request when the target daemon does not support run-now', async () => {
+        const { tx } = makeTx({
+            automation: automationRecord({ targetMachine: { automationProtocolVersion: 1 } }),
+        });
+
+        await expect(requestAutomationRun(
+            tx as never, 'editor-1', 'project-1', 'automation-1', 1,
+        )).resolves.toEqual({ ok: false, error: 'automation-run-unsupported' });
+        expect(tx.automation.updateMany).not.toHaveBeenCalled();
     });
 
     it('derives owner and target machine instead of trusting client identity', async () => {

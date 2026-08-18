@@ -34,6 +34,7 @@ import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
 import { PreviewWsProxy } from '@/daemon/previewWsProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import packageJson from '../../package.json';
+import { AUTOMATION_RUN_NOW_PROTOCOL_VERSION } from '@slopus/happy-wire';
 import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
 import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
@@ -147,6 +148,7 @@ interface DaemonToServerEvents {
     'automation-key-register': (data: {
         expectedKeyVersion: number;
         publicKey: string;
+        protocolVersion: number;
     }, cb: (answer: {
         ok: boolean;
         value?: { keyVersion: number };
@@ -412,6 +414,8 @@ export class ApiMachineClient {
                 machineId,
                 approvedNewDirectoryCreation,
                 agent,
+                model,
+                effort,
                 environmentVariables,
                 token,
                 happyToken,
@@ -454,6 +458,12 @@ export class ApiMachineClient {
             if (exitAfterFirstTurn !== undefined && typeof exitAfterFirstTurn !== 'boolean') {
                 throw new Error('Exit-after-first-turn must be a boolean');
             }
+            if (model !== undefined && (typeof model !== 'string' || !model.trim())) {
+                throw new Error('Model must be a non-empty string');
+            }
+            if (effort !== undefined && (typeof effort !== 'string' || !effort.trim())) {
+                throw new Error('Effort must be a non-empty string');
+            }
             if (exitAfterFirstTurn && initialPrompt === undefined) {
                 throw new Error('Run-once session requires a non-empty initial prompt');
             }
@@ -468,6 +478,8 @@ export class ApiMachineClient {
                 machineId,
                 approvedNewDirectoryCreation,
                 agent,
+                model,
+                effort,
                 environmentVariables,
                 token,
                 happyToken,
@@ -1167,6 +1179,7 @@ export class ApiMachineClient {
         const answer = await this.socket.emitWithAck('automation-key-register', {
             expectedKeyVersion: key.registeredKeyVersion,
             publicKey: Buffer.from(key.publicKey).toString('base64'),
+            protocolVersion: AUTOMATION_RUN_NOW_PROTOCOL_VERSION,
         });
         if (!answer.ok || !answer.value || !Number.isSafeInteger(answer.value.keyVersion)) {
             if (answer.error === 'feature-disabled') {

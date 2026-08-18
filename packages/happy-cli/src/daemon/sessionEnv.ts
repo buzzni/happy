@@ -16,7 +16,9 @@
  * parent session forever — scrub it here so every daemon-spawned session
  * derives its own.
  */
-export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_PROMPT', 'HAPPY_AUTOMATION_', 'APLUS_SESSION_'] as const
+// 'HAPPY_INITIAL_' covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the
+// HAPPY_INITIAL_MODEL / HAPPY_INITIAL_EFFORT spawn seeds.
+export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_AUTOMATION_', 'APLUS_SESSION_'] as const
 
 function isLineageKey(key: string): boolean {
     return SESSION_LINEAGE_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))
