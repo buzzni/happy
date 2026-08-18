@@ -10,6 +10,7 @@ function cacheRecord(generation = 2, migrationPending = false) {
     automationId: 'automation-1', revision: 2, generation, payloadVersion: 1 as const,
     payloadCiphertext: 'encrypted-payload', machineKeyVersion: 1,
     machineKeyEnvelope: 'encrypted-envelope', paused: false, migrationPending, enabledAt: 1,
+    runRequestedAt: null,
   }
 }
 
@@ -117,6 +118,51 @@ describe('runServerAutomationTick', () => {
     expect(runScript).not.toHaveBeenCalled()
     expect(spawnSession).not.toHaveBeenCalled()
     expect(store.state().schedules[0]!.nextRunAt).toBe(now)
+  })
+
+  it('consumes a new immediate run request without changing the automation generation', async () => {
+    const { input, store, transport, now } = setup()
+    store.write({
+      ...store.read(),
+      schedules: [{
+        automationId: 'automation-1', generation: 2, nextRunAt: now + 900_000,
+        lastSessionId: null, runRequestRevision: null,
+      }],
+    })
+    input.cache = { read: () => ({
+      cursor: 1n, serverTime: now, syncedAt: now, pendingAcknowledgements: [],
+      automations: [{ ...cacheRecord(), revision: 3, runRequestedAt: now - 1_000 }],
+    }) }
+
+    await runServerAutomationTick(input)
+
+    expect(transport.claim).toHaveBeenCalledWith({
+      automationId: 'automation-1', generation: 2, scheduledFor: now - 1_000,
+    })
+    expect(store.state().schedules[0]).toMatchObject({ runRequestRevision: 3 })
+  })
+
+  it('keeps an immediate run request due while another run is active', async () => {
+    const { input, store, transport, now } = setup({ claim: { ok: false, error: 'active-run' } })
+    const requestedAt = now - 1_000
+    store.write({
+      ...store.read(),
+      schedules: [{
+        automationId: 'automation-1', generation: 2, nextRunAt: now + 900_000,
+        lastSessionId: null, runRequestRevision: null,
+      }],
+    })
+    input.cache = { read: () => ({
+      cursor: 1n, serverTime: now, syncedAt: now, pendingAcknowledgements: [],
+      automations: [{ ...cacheRecord(), revision: 3, runRequestedAt: requestedAt }],
+    }) }
+
+    await runServerAutomationTick(input)
+
+    expect(transport.claim).toHaveBeenCalledWith({
+      automationId: 'automation-1', generation: 2, scheduledFor: requestedAt,
+    })
+    expect(store.state().schedules[0]!.nextRunAt).toBe(requestedAt)
   })
 
   it('isolates a corrupt encrypted row so other automations still tick', async () => {
@@ -357,6 +403,42 @@ describe('runServerAutomationTick', () => {
     expect(transport.start).not.toHaveBeenCalled()
     expect(runScript).not.toHaveBeenCalled()
     expect(spawnSession).not.toHaveBeenCalled()
+  })
+
+  it('keeps a GitHub backlog eligible for the next tick after a stale claim is rejected', async () => {
+    const { input, store, transport, now } = setup({ claim: { ok: false, error: 'claim-denied' } })
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: {
+          snapshot: [], highestPrNumber: 12, processed: [],
+          pending: [{
+            id: 'opened:12:head-sha', event: 'opened',
+            pr: {
+              number: 12, title: 'PR 12', url: 'https://github.test/o/r/pull/12',
+              author: { login: 'bob' }, baseRefName: 'main', headRefName: 'pr-12',
+              isDraft: false, state: 'OPEN', mergedAt: null, labels: [], changedFiles: 0, files: [],
+            },
+          }],
+        },
+      }],
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const }, prompt: 'Review',
+      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    }))
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+
+    expect(store.state().schedules[0]!.nextRunAt).toBe(now + 1)
+    expect(transport.start).not.toHaveBeenCalled()
   })
 
   it('keeps the due for a later retry when the server is unreachable', async () => {
@@ -987,6 +1069,115 @@ describe('runServerAutomationTick', () => {
     expect(spawnSession).not.toHaveBeenCalled()
   })
 
+  it('reports GitHub backlog depth and schedules the next pending event for the next daemon tick', async () => {
+    const { input, store, transport, queryGithubPullRequests, now } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR notification', schedule: { kind: 'github' as const, minutes: 15 as const }, prompt: 'Opened {pr.number}',
+      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'notify' as const,
+        githubCredentialId: null,
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      pullRequests: [11, 12].map((number) => ({
+        number, title: `PR ${number}`, url: `https://github.test/o/r/pull/${number}`,
+        author: { login: 'bob' }, baseRefName: 'main', headRefName: `pr-${number}`,
+        isDraft: false, state: 'OPEN', mergedAt: null, labels: [], changedFiles: 0, files: [],
+      })),
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({ queueDepth: 1 }))
+    expect(store.state().schedules[0]!.nextRunAt).toBe(now + 1)
+  })
+
+  it('returns an empty GitHub poll to its configured cadence', async () => {
+    const { input, store, transport, now } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR notification', schedule: { kind: 'github' as const, minutes: 15 as const }, prompt: 'Opened',
+      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'notify' as const,
+        githubCredentialId: null,
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'SKIPPED_GATE' },
+    ])
+
+    expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({ queueDepth: 0 }))
+    expect(store.state().schedules[0]!.nextRunAt).toBe(now + 15 * 60_000)
+  })
+
+  it('keeps a queued PR eligible while the previous review session is still running', async () => {
+    const { input, store, transport, queryGithubPullRequests, now } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const }, prompt: 'Review',
+      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    }))
+    store.write({
+      ...store.read(),
+      schedules: store.read().schedules.map((schedule) => ({ ...schedule, lastSessionId: 'active-review' })),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: {
+          snapshot: [], highestPrNumber: 12, processed: [],
+          pending: [{
+            id: 'opened:12:head-sha', event: 'opened',
+            pr: {
+              number: 12, title: 'PR 12', url: 'https://github.test/o/r/pull/12',
+              author: { login: 'bob' }, baseRefName: 'main', headRefName: 'pr-12',
+              isDraft: false, state: 'OPEN', mergedAt: null, labels: [], changedFiles: 0, files: [],
+            },
+          }],
+        },
+      }],
+    })
+    input.isSessionRunning = vi.fn(() => true)
+
+    await runServerAutomationTick(input)
+
+    expect(queryGithubPullRequests).not.toHaveBeenCalled()
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(transport.start).not.toHaveBeenCalled()
+    expect(transport.report).not.toHaveBeenCalled()
+    expect(store.state().schedules[0]!.nextRunAt).toBe(now + 1)
+  })
+
   it('fails closed when the selected GitHub credential cannot query the repository', async () => {
     const { input, queryGithubPullRequests, resolveMcpSpawnContext, spawnSession } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
@@ -1055,9 +1246,10 @@ describe('runServerAutomationTick', () => {
       { automationId: 'automation-1', outcome: 'WOKE' },
       { automationId: 'automation-2', outcome: 'WOKE' },
       { automationId: 'automation-3', outcome: 'WOKE' },
-      { automationId: 'automation-4', outcome: 'SKIPPED_GATE' },
     ])
+    expect(transport.claim).toHaveBeenCalledTimes(3)
     expect(spawnSession).toHaveBeenCalledTimes(3)
     expect(queryGithubPullRequests).toHaveBeenCalledTimes(3)
+    expect(store.state().schedules.find((item) => item.automationId === 'automation-4')?.nextRunAt).toBe(now + 1)
   })
 })

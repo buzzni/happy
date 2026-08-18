@@ -14,6 +14,7 @@ export interface ServerAutomationScheduleState {
   generation: number
   nextRunAt: number
   lastSessionId: string | null
+  runRequestRevision?: number | null
 }
 
 export interface PendingAutomationReport {
@@ -26,6 +27,7 @@ export interface PendingAutomationReport {
   detailCiphertext: string | null
   failureCode?: string | null
   degradedCode?: string | null
+  queueDepth?: number | null
   /** When this report was first queued. Absent on entries persisted before this field existed. */
   createdAt?: number
 }
@@ -120,6 +122,11 @@ function parse(raw: string): ServerAutomationRuntimeState {
         generation: integer(row.generation, 1),
         nextRunAt: integer(row.nextRunAt),
         lastSessionId: nullableText(row.lastSessionId),
+        ...(row.runRequestRevision !== undefined ? {
+          runRequestRevision: row.runRequestRevision === null
+            ? null
+            : integer(row.runRequestRevision, 1),
+        } : {}),
       }
     })
     const outcomes = new Set<ServerAutomationReportOutcome>(['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR'])
@@ -137,6 +144,9 @@ function parse(raw: string): ServerAutomationRuntimeState {
         detailCiphertext: nullableText(row.detailCiphertext),
         ...(row.failureCode !== undefined ? { failureCode: nullableText(row.failureCode) } : {}),
         ...(row.degradedCode !== undefined ? { degradedCode: nullableText(row.degradedCode) } : {}),
+        ...(row.queueDepth !== undefined ? {
+          queueDepth: row.queueDepth === null ? null : integer(row.queueDepth),
+        } : {}),
       }
     })
     const githubRows = disk.githubTriggers === undefined ? [] : disk.githubTriggers

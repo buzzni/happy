@@ -144,6 +144,7 @@ const automation: AutomationPublic = {
   viewerKeyEnvelope: keyEnvelope,
   machineKeyVersion: 4,
   paused: false,
+  runRequestedAt: null,
   enabledAt: 1,
   appliedRevision: 1,
   appliedAt: null,
@@ -156,7 +157,7 @@ describe('automation wire contract', () => {
     const run = {
       id: 'run-1', automationId: 'automation-1', generation: 1, scheduledFor: 1,
       machineId: 'machine-1', status: 'COMPLETED', sessionId: 'session-1', outcome: 'WOKE',
-      detailCiphertext: null, failureCode: null, degradedCode: 'GRANT_MISSING',
+      detailCiphertext: null, failureCode: null, degradedCode: 'GRANT_MISSING', queueDepth: 2,
       claimedAt: 1, startedAt: 2, completedAt: 3, lateReport: false,
     };
     expect(automationRunSchema.parse(run)).toEqual(run);
@@ -246,6 +247,22 @@ describe('createAutomationApiClient', () => {
     }).catch((value: unknown) => value);
     expect(error).toBeInstanceOf(AutomationApiError);
     expect(error).toMatchObject({ status: 409, code: 'revision-conflict', latest: automation });
+  });
+
+  it('requests an immediate run with the current revision', async () => {
+    const fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ automation: { ...automation, revision: 3, runRequestedAt: 100 } }),
+    }));
+    const client = createAutomationApiClient({ baseUrl: 'https://happy.test', token: 'token', fetch });
+
+    await expect(client.runAutomationNow('project-1', 'automation-1', 2))
+      .resolves.toMatchObject({ revision: 3, runRequestedAt: 100 });
+    expect(fetch).toHaveBeenCalledWith(
+      'https://happy.test/v1/projects/project-1/automations/automation-1/run',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ expectedRevision: 2 }) }),
+    );
   });
 
   it('replaces a viewer key through the guarded unused-project endpoint', async () => {

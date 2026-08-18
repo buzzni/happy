@@ -70,6 +70,9 @@ export function automationSocketHandler(accountId: string, machineId: string, so
     on('automation-key-register', async (data, callback) => answer(callback, () => inTx((tx) => registerAutomationMachineKey(tx, accountId, machineId, {
         expectedKeyVersion: integer(data?.expectedKeyVersion, 0, Number.MAX_SAFE_INTEGER),
         publicKey: bytes(data?.publicKey, 32, 32),
+        protocolVersion: data?.protocolVersion === undefined
+            ? 1
+            : integer(data.protocolVersion, 1, Number.MAX_SAFE_INTEGER),
     })), () => emitAutomationUpdate(accountId, { projectId: null, reason: 'machine-key' })));
 
     on('automation-sync', async (data, callback) => answer(callback, () => {
@@ -137,6 +140,9 @@ export function automationSocketHandler(accountId: string, machineId: string, so
             detailCiphertext: data?.detailCiphertext === null ? null : bytes(data?.detailCiphertext, 128 * 1024),
             failureCode,
             degradedCode,
+            queueDepth: data?.queueDepth === null || data?.queueDepth === undefined
+                ? null
+                : integer(data.queueDepth, 0, 10_000),
         }));
     }, () => emitAutomationUpdate(accountId, {
             projectId: null,

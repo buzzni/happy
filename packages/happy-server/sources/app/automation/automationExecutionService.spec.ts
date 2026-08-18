@@ -16,6 +16,7 @@ function automation(patch: Record<string, unknown> = {}) {
     return {
         id: 'automation-1', projectId: 'project-1', ownerAccountId: 'owner-1', machineAccountId: 'account-1', machineId: 'machine-1',
         revision: 2, generation: 3, paused: false, deletedAt: null, enabledAt: new Date(0),
+        runRequestedAt: null,
         legacyMigrationPending: false,
         payloadVersion: 1, payloadCiphertext: new Uint8Array([1]), machineKeyVersion: 4,
         machineKeyEnvelope: new Uint8Array([2]), viewerKeyVersion: 5,
@@ -43,7 +44,7 @@ function makeTx() {
         },
         automationRun: {
             updateMany: vi.fn(async () => ({ count: 1 })),
-            create: vi.fn(async ({ data }: { data: object }) => ({ id: 'run-1', ...data })),
+            createMany: vi.fn(async (_input: { data: object[]; skipDuplicates: boolean }) => ({ count: 1 })),
             findFirst: vi.fn(),
             findUnique: vi.fn(),
         },
@@ -57,10 +58,35 @@ describe('automationExecutionService', () => {
         await expect(registerAutomationMachineKey(tx as never, 'account-1', 'machine-1', {
             expectedKeyVersion: 3,
             publicKey: new Uint8Array(32),
+            protocolVersion: 2,
         })).resolves.toEqual({ ok: true, value: { keyVersion: 4 } });
         expect(tx.machine.updateMany).toHaveBeenCalledWith({
             where: { id: 'machine-1', accountId: 'account-1', automationKeyVersion: 3 },
-            data: { automationPublicKey: new Uint8Array(32), automationKeyVersion: { increment: 1 } },
+            data: {
+                automationPublicKey: new Uint8Array(32),
+                automationKeyVersion: { increment: 1 },
+                automationProtocolVersion: 2,
+            },
+        });
+    });
+
+    it('updates the protocol capability without rotating an unchanged key', async () => {
+        const tx = makeTx();
+        const publicKey = new Uint8Array(32);
+        tx.machine.findFirst.mockResolvedValue({
+            automationPublicKey: publicKey,
+            automationKeyVersion: 4,
+            automationProtocolVersion: 1,
+        });
+
+        await expect(registerAutomationMachineKey(tx as never, 'account-1', 'machine-1', {
+            expectedKeyVersion: 4,
+            publicKey,
+            protocolVersion: 2,
+        })).resolves.toEqual({ ok: true, value: { keyVersion: 4 } });
+        expect(tx.machine.updateMany).toHaveBeenCalledWith({
+            where: { id: 'machine-1', accountId: 'account-1', automationKeyVersion: 4 },
+            data: { automationProtocolVersion: 2 },
         });
     });
 
@@ -68,11 +94,14 @@ describe('automationExecutionService', () => {
         const tx = makeTx();
         const publicKey = new Uint8Array(32);
         tx.machine.updateMany.mockResolvedValue({ count: 0 });
-        tx.machine.findFirst.mockResolvedValue({ automationPublicKey: publicKey, automationKeyVersion: 4 });
+        tx.machine.findFirst.mockResolvedValue({
+            automationPublicKey: publicKey, automationKeyVersion: 4, automationProtocolVersion: 2,
+        });
 
         await expect(registerAutomationMachineKey(tx as never, 'account-1', 'machine-1', {
             expectedKeyVersion: 3,
             publicKey,
+            protocolVersion: 2,
         })).resolves.toEqual({ ok: true, value: { keyVersion: 4 } });
     });
 
@@ -95,13 +124,30 @@ describe('automationExecutionService', () => {
         const result = await claimAutomationRun(tx as never, 'account-1', 'machine-1', {
             automationId: 'automation-1', generation: 3, scheduledFor: new Date(now.getTime() - 30_000),
         }, now);
-        expect(result).toEqual({ ok: true, value: expect.objectContaining({ runId: 'run-1', claimToken: expect.any(String) }) });
-        const data = tx.automationRun.create.mock.calls[0]![0].data as any;
+        expect(result).toEqual({ ok: true, value: expect.objectContaining({ runId: expect.any(String), claimToken: expect.any(String) }) });
+        const data = tx.automationRun.createMany.mock.calls[0]![0].data[0] as any;
         expect(data.claimTokenHash).toBeInstanceOf(Uint8Array);
         expect(Buffer.from(data.claimTokenHash).toString('base64url')).not.toBe((result as any).value.claimToken);
 
         await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
             automationId: 'automation-1', generation: 2, scheduledFor: now,
+        }, now)).resolves.toEqual({ ok: false, error: 'claim-denied' });
+    });
+
+    it('accepts an older due time only when it exactly matches the durable run-now request', async () => {
+        const tx = makeTx();
+        const requestedAt = new Date(now.getTime() - 10 * 60_000);
+        tx.automation.findFirst.mockResolvedValue(automation({ runRequestedAt: requestedAt }));
+
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
+            automationId: 'automation-1', generation: 3, scheduledFor: requestedAt,
+        }, now)).resolves.toEqual({
+            ok: true,
+            value: expect.objectContaining({ runId: expect.any(String) }),
+        });
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
+            automationId: 'automation-1', generation: 3,
+            scheduledFor: new Date(requestedAt.getTime() + 1),
         }, now)).resolves.toEqual({ ok: false, error: 'claim-denied' });
     });
 
@@ -112,19 +158,31 @@ describe('automationExecutionService', () => {
         await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
             automationId: 'automation-1', generation: 3, scheduledFor: now,
         }, now)).resolves.toEqual({ ok: false, error: 'claim-denied' });
-        expect(tx.automationRun.create).not.toHaveBeenCalled();
+        expect(tx.automationRun.createMany).not.toHaveBeenCalled();
     });
 
     it('maps the database uniqueness fence to an already-claimed result', async () => {
         const tx = makeTx();
-        tx.automationRun.create.mockRejectedValue(new Prisma.PrismaClientKnownRequestError('duplicate run', {
-            code: 'P2002',
-            clientVersion: 'test',
-        }));
-
+        tx.automationRun.createMany.mockResolvedValue({ count: 0 });
+        tx.automationRun.findFirst.mockImplementation(async () => {
+            if (tx.automationRun.createMany.mock.calls.length === 0) {
+                throw new Error('current transaction is aborted');
+            }
+            return { id: 'existing-run' };
+        });
         await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
             automationId: 'automation-1', generation: 3, scheduledFor: now,
         }, now)).resolves.toEqual({ ok: false, error: 'already-claimed' });
+    });
+
+    it('distinguishes an overlapping active run from the same scheduled slot', async () => {
+        const tx = makeTx();
+        tx.automationRun.createMany.mockResolvedValue({ count: 0 });
+        tx.automationRun.findFirst.mockResolvedValue(null);
+
+        await expect(claimAutomationRun(tx as never, 'account-1', 'machine-1', {
+            automationId: 'automation-1', generation: 3, scheduledFor: now,
+        }, now)).resolves.toEqual({ ok: false, error: 'active-run' });
     });
 
     it('cancels a claimed run when pause wins before start', async () => {
@@ -278,6 +336,26 @@ describe('automationExecutionService', () => {
             outcome, sessionId: null, detailCiphertext: null, failureCode: null,
         }, now)).resolves.toEqual({ ok: false, error: 'report-conflict' });
         expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('accepts a notify-only GitHub WOKE report with queue depth and no session', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({
+            id: 'run-1', status: 'RUNNING', reportId: null,
+            runLeaseExpiresAt: new Date(now.getTime() + 1_000),
+        });
+
+        await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
+            outcome: 'WOKE', sessionId: null, detailCiphertext: null, failureCode: null,
+            queueDepth: 2,
+        }, now)).resolves.toEqual({
+            ok: true,
+            value: expect.objectContaining({ idempotent: false }),
+        });
+        expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ queueDepth: 2 }),
+        }));
     });
 
     it('maps a cross-run report id uniqueness conflict to report-conflict', async () => {
