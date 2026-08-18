@@ -142,7 +142,7 @@ describe('automationService', () => {
         })).resolves.toEqual({ ok: true, value: [{ id: 'run-1', automationId: 'automation-1' }] });
         expect(tx.automationRun.findMany).toHaveBeenCalledWith({
             where: { automation: { projectId: 'project-1' }, automationId: 'automation-1' },
-            orderBy: { claimedAt: 'desc' },
+            orderBy: [{ claimedAt: 'desc' }, { scheduledFor: 'desc' }],
             take: 20,
         });
     });

@@ -253,7 +253,7 @@ export async function listAutomationRuns(
             automation: { projectId },
             ...(input.automationId ? { automationId: input.automationId } : {}),
         },
-        orderBy: { claimedAt: 'desc' },
+        orderBy: [{ claimedAt: 'desc' }, { scheduledFor: 'desc' }],
         take: input.limit,
     });
     return { ok: true, value: rows };

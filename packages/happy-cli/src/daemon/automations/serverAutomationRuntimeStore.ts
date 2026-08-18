@@ -2,8 +2,10 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'n
 import path from 'node:path'
 
 import type {
+  GithubIssueSnapshot,
   GithubPullRequestSnapshot,
   GithubTriggerEventMatch,
+  GithubTriggerIssueEventMatch,
   GithubTriggerRuntimeState,
 } from './githubTriggerDomain'
 
@@ -114,6 +116,29 @@ function parseGithubEvent(value: unknown): GithubTriggerEventMatch {
   }
 }
 
+function parseIssue(value: unknown): GithubIssueSnapshot {
+  const row = record(value)
+  const author = row.author === null ? null : record(row.author)
+  if (!Array.isArray(row.labels)) invalid()
+  return {
+    number: integer(row.number, 1),
+    title: text(row.title, 10_000),
+    url: text(row.url, 2_000),
+    author: author === null ? null : { login: text(author.login, 200) },
+    labels: row.labels.map((label) => ({ name: text(record(label).name, 200) })),
+  }
+}
+
+function parseGithubIssueEvent(value: unknown): GithubTriggerIssueEventMatch {
+  const row = record(value)
+  if (row.event !== 'issue_opened') invalid()
+  return {
+    id: text(row.id, 256),
+    event: 'issue_opened',
+    issue: parseIssue(row.issue),
+  }
+}
+
 function parseGithubState(value: unknown): GithubTriggerRuntimeState {
   const row = record(value)
   if (!Array.isArray(row.snapshot) || !Array.isArray(row.processed) || !Array.isArray(row.pending)) invalid()
@@ -122,6 +147,14 @@ function parseGithubState(value: unknown): GithubTriggerRuntimeState {
     highestPrNumber: integer(row.highestPrNumber),
     processed: row.processed.map((value) => text(value, 256)),
     pending: row.pending.map(parseGithubEvent),
+    ...(row.highestIssueNumber === undefined ? {} : {
+      highestIssueNumber: integer(row.highestIssueNumber),
+    }),
+    ...(row.pendingIssues === undefined ? {} : {
+      pendingIssues: Array.isArray(row.pendingIssues)
+        ? row.pendingIssues.map(parseGithubIssueEvent)
+        : invalid(),
+    }),
   }
 }
 

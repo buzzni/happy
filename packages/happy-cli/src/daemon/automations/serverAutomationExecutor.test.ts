@@ -1155,6 +1155,53 @@ describe('runServerAutomationTick', () => {
     expect(store.state().schedules[0]!.nextRunAt).toBe(now + 15 * 60_000)
   })
 
+  it('keeps the original batch total when draining a pre-existing queue without progress metadata', async () => {
+    const { input, store, transport, notifyGithubTrigger } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR notification', schedule: { kind: 'github' as const, minutes: 15 as const }, prompt: 'Opened',
+      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'notify' as const,
+        githubCredentialId: null,
+      },
+    }))
+    const pr = (number: number) => ({
+      number, title: `PR ${number}`, url: `https://github.test/o/r/pull/${number}`,
+      author: { login: 'bob' }, baseRefName: 'main', headRefName: `pr-${number}`,
+      isDraft: false, state: 'OPEN', mergedAt: null, labels: [], changedFiles: 0, files: [],
+    })
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: {
+          snapshot: [pr(11), pr(12)], highestPrNumber: 12, processed: [],
+          pending: [
+            { id: 'opened:11:head-11', event: 'opened', pr: pr(11) },
+            { id: 'opened:12:head-12', event: 'opened', pr: pr(12) },
+          ],
+        },
+      }],
+    })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'WOKE' },
+      { automationId: 'automation-1', outcome: 'WOKE' },
+    ])
+
+    expect(transport.report.mock.calls.map(([report]) => ({
+      depth: report.queueDepth, position: report.queuePosition, total: report.queueTotal,
+    }))).toEqual([
+      { depth: 1, position: 1, total: 2 },
+      { depth: 0, position: 2, total: 2 },
+    ])
+    expect(notifyGithubTrigger).toHaveBeenCalledTimes(2)
+  })
+
   it('starts another queued review while below the GitHub worker concurrency limit', async () => {
     const { input, store, transport, queryGithubPullRequests, spawnSession } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
@@ -1244,6 +1291,52 @@ describe('runServerAutomationTick', () => {
     await expect(runServerAutomationTick(input)).resolves.toEqual([])
 
     expect(transport.claim).not.toHaveBeenCalled()
+    expect(store.state().schedules[0]!.nextRunAt).toBe(now + 1)
+  })
+
+  it('counts still-running workers from an older automation generation', async () => {
+    const { input, store, transport, queryGithubPullRequests, spawnSession, now } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const }, prompt: 'Review',
+      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+      githubActiveSessions: [{
+        automationId: 'automation-1', generation: 1,
+        sessionIds: ['old-review-1', 'old-review-2', 'old-review-3'],
+      }],
+    })
+    input.isSessionRunning = vi.fn(() => true)
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      pullRequests: [{
+        number: 13, title: 'PR 13', url: 'https://github.test/o/r/pull/13',
+        author: { login: 'bob' }, baseRefName: 'main', headRefName: 'pr-13',
+        isDraft: false, state: 'OPEN', mergedAt: null, labels: [], changedFiles: 0, files: [],
+      }],
+    })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(store.state().githubActiveSessions).toEqual([{
+      automationId: 'automation-1', generation: 1,
+      sessionIds: ['old-review-1', 'old-review-2', 'old-review-3'],
+    }])
     expect(store.state().schedules[0]!.nextRunAt).toBe(now + 1)
   })
 

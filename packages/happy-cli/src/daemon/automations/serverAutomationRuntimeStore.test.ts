@@ -29,8 +29,16 @@ describe('serverAutomationRuntimeStore', () => {
             labels: [{ name: 'ready' }], changedFiles: 1, files: [{ path: 'apps/web/page.tsx' }],
           }],
           highestPrNumber: 10,
+          highestIssueNumber: 12,
           processed: ['9:opened'],
           pending: [],
+          pendingIssues: [{
+            id: '12:issue_opened', event: 'issue_opened',
+            issue: {
+              number: 12, title: 'Broken search', url: 'https://github.test/o/r/issues/12',
+              author: { login: 'alice' }, labels: [{ name: 'bug' }],
+            },
+          }],
         },
       }],
       pendingReports: [{
@@ -56,8 +64,16 @@ describe('serverAutomationRuntimeStore', () => {
             labels: [{ name: 'ready' }], changedFiles: 1, files: [{ path: 'apps/web/page.tsx' }],
           }],
           highestPrNumber: 10,
+          highestIssueNumber: 12,
           processed: ['9:opened'],
           pending: [],
+          pendingIssues: [{
+            id: '12:issue_opened', event: 'issue_opened',
+            issue: {
+              number: 12, title: 'Broken search', url: 'https://github.test/o/r/issues/12',
+              author: { login: 'alice' }, labels: [{ name: 'bug' }],
+            },
+          }],
         },
       }],
       pendingReports: [{

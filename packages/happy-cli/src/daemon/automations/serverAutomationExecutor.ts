@@ -275,10 +275,10 @@ function reconcileSchedules(
     activeGenerations.get(entry.automationId) === entry.generation
       && payloads.get(entry.automationId)?.githubTrigger !== undefined
   ))
-  const githubActiveSessions = (state.githubActiveSessions ?? []).filter((entry) => (
-    activeGenerations.get(entry.automationId) === entry.generation
-      && payloads.get(entry.automationId)?.githubTrigger !== undefined
-  ))
+  // A worker from an older automation generation can still be running after
+  // the trigger is edited. Keep those rows until isSessionRunning confirms
+  // that they ended so the global worker limit remains accurate.
+  const githubActiveSessions = state.githubActiveSessions ?? []
   const githubQueueProgress = (state.githubQueueProgress ?? []).filter((entry) => (
     activeGenerations.get(entry.automationId) === entry.generation
       && payloads.get(entry.automationId)?.githubTrigger !== undefined
@@ -378,7 +378,9 @@ function activeGithubSessions(
     input.runtimeStore.write({
       ...state,
       githubActiveSessions: [
-        ...(state.githubActiveSessions ?? []).filter((entry) => entry.automationId !== automation.automationId),
+        ...(state.githubActiveSessions ?? []).filter((entry) => (
+          entry.automationId !== automation.automationId || entry.generation !== automation.generation
+        )),
         ...(active.length === 0 ? [] : [{
           automationId: automation.automationId,
           generation: automation.generation,
@@ -388,6 +390,21 @@ function activeGithubSessions(
     })
   }
   return active
+}
+
+function activeGithubSessionsAcrossGenerations(
+  input: ServerAutomationExecutorInput,
+): string[] {
+  const state = input.runtimeStore.read()
+  const current = state.githubActiveSessions ?? []
+  const activeRows = current.flatMap((entry) => {
+    const sessionIds = entry.sessionIds.filter((sessionId) => input.isSessionRunning(sessionId))
+    return sessionIds.length === 0 ? [] : [{ ...entry, sessionIds }]
+  })
+  if (JSON.stringify(activeRows) !== JSON.stringify(current)) {
+    input.runtimeStore.write({ ...state, githubActiveSessions: activeRows })
+  }
+  return [...new Set(activeRows.flatMap((entry) => entry.sessionIds))]
 }
 
 function rememberGithubSession(
@@ -400,7 +417,9 @@ function rememberGithubSession(
   input.runtimeStore.write({
     ...latest,
     githubActiveSessions: [
-      ...(latest.githubActiveSessions ?? []).filter((entry) => entry.automationId !== automation.automationId),
+      ...(latest.githubActiveSessions ?? []).filter((entry) => (
+        entry.automationId !== automation.automationId || entry.generation !== automation.generation
+      )),
       {
         automationId: automation.automationId,
         generation: automation.generation,
@@ -421,7 +440,7 @@ function updateGithubQueueProgress(
   const existing = (state.githubQueueProgress ?? []).find((entry) => (
     entry.automationId === automation.automationId && entry.generation === automation.generation
   ))
-  const total = mode === 'poll' || !existing ? queueDepth || queuedBefore : existing.total
+  const total = mode === 'poll' ? queueDepth : existing?.total ?? queuedBefore
   const completed = mode === 'poll'
     ? 0
     : Math.min(total, (existing?.completed ?? 0) + Math.max(0, queuedBefore - queueDepth))
@@ -752,13 +771,11 @@ export async function runServerAutomationTick(
 
   const outcomes: Array<{ automationId: string; outcome: ServerAutomationReportOutcome }> = []
   let githubEventsProcessed = 0
-  const activeGithubWorkerSessions = new Set<string>()
   for (const automation of decryptableAutomations) {
     if (payloads.get(automation.automationId)?.githubTrigger?.action === 'notify') continue
-    for (const sessionId of activeGithubSessions(input, automation)) {
-      activeGithubWorkerSessions.add(sessionId)
-    }
+    activeGithubSessions(input, automation)
   }
+  const activeGithubWorkerSessions = new Set(activeGithubSessionsAcrossGenerations(input))
   const workQueue = [...decryptableAutomations]
   const immediateWorkerIds = new Set<string>()
   while (workQueue.length > 0) {
