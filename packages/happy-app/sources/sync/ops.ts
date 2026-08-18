@@ -216,6 +216,8 @@ export interface ResumeSessionOptions {
     sessionId: string;
 }
 
+const SESSION_RECOVERY_RPC_TIMEOUT_MS = 15_000;
+
 export type RecoverSessionResult =
     | {
         type: 'success';
@@ -420,11 +422,13 @@ export async function machineResumeSession(options: ResumeSessionOptions & { mod
             machineId,
             'resume-happy-session',
             { sessionId, model, permissionMode },
+            { timeoutMs: SESSION_RECOVERY_RPC_TIMEOUT_MS },
         );
         return result;
     } catch (error) {
         return {
             type: 'error',
+            code: 'RPC_TRANSPORT_ERROR',
             errorMessage: error instanceof Error ? error.message : 'Failed to resume session',
         };
     }
@@ -438,12 +442,13 @@ export async function machineRecoverSession(options: ResumeSessionOptions & { in
             machineId,
             'recover-happy-session',
             { sessionId, initialPrompt, model, permissionMode },
+            { timeoutMs: SESSION_RECOVERY_RPC_TIMEOUT_MS },
         );
         return result;
     } catch (error) {
         return {
             type: 'error',
-            code: 'RECOVER_SESSION_FAILED',
+            code: 'RPC_TRANSPORT_ERROR',
             errorMessage: error instanceof Error ? error.message : 'Failed to recover session',
         };
     }
