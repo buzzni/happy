@@ -8,6 +8,13 @@
  *
  * Not a secret: the value is just the public webapp origin plus the session id.
  * Access to the session itself is still gated by the webapp's own auth.
+ *
+ * Lineage inheritance: daemon-spawned children are protected by the
+ * SESSION_LINEAGE_ENV_PREFIXES scrub in daemon/sessionEnv.ts, which strips an
+ * inherited parent APLUS_SESSION_* before spawn. A nested happy run that does
+ * NOT go through the daemon (agent shell exec'ing happy directly) can still
+ * keep the parent's value due to first-set-wins — not a secret, worst case an
+ * inaccurate link.
  */
 
 /** Builds the web URL for a session, e.g. https://saycode.ai/session/<id>. */
