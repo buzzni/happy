@@ -9,6 +9,7 @@ import { configuration } from '@/configuration';
 import chalk from 'chalk';
 import { Credentials } from '@/persistence';
 import { connectionState, isNetworkError } from '@/utils/serverConnectionErrors';
+import { applySessionUrlEnv } from '@/utils/sessionUrlEnv';
 
 export class ApiClient {
 
@@ -284,6 +285,12 @@ export class ApiClient {
   }
 
   sessionSyncClient(session: Session): ApiSessionClient {
+    // The session id is confirmed exactly here for every flavor (claude, codex,
+    // gemini, openclaw, acp — online, reconnect-in-place, and offline→reconnect
+    // all funnel through this factory before the agent loop starts), so export
+    // the session's own web URL for agent shell subprocesses to inherit
+    // (specs/desktop-issue-pr-session-link R2). First-set wins.
+    applySessionUrlEnv(process.env, session.id, configuration.webappUrl);
     return new ApiSessionClient(this.credential.token, session);
   }
 
