@@ -2087,6 +2087,7 @@ export async function startDaemon(): Promise<void> {
       if (shouldYieldDaemonStateOwnership({
         recordedPid: daemonState?.pid,
         ownPid: process.pid,
+        isProcessAlive: isPidAlive,
       })) {
         logger.debug('[DAEMON RUN] Somehow a different daemon was started without killing us. We should kill ourselves.')
         requestShutdown('exception', 'A different daemon was started without killing us. We should kill ourselves.')

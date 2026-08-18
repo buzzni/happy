@@ -311,7 +311,7 @@ export async function clearMachineId(): Promise<void> {
 
 export interface DaemonStateSnapshot {
   state: DaemonLocallyPersistedState | null;
-  /** Exact file contents `state` was parsed from, so a caller can detect a concurrent rewrite. */
+  /** Exact file contents `state` was parsed from — the token for {@link writeDaemonStateIfUnchanged}. */
   raw: string | null;
 }
 
@@ -345,6 +345,28 @@ export async function readDaemonState(): Promise<DaemonLocallyPersistedState | n
  */
 export function writeDaemonState(state: DaemonLocallyPersistedState): void {
   writeFileSync(configuration.daemonStateFile, JSON.stringify(state, null, 2), 'utf-8');
+}
+
+/**
+ * Compare-and-set write: only writes when the file still holds `expectedRaw`, the
+ * contents the caller based its decision on.
+ *
+ * Needed because several short-lived CLI processes poll the state file while a
+ * daemon is starting. Without the guard, a poller that read the previous daemon's
+ * dead pid writes it back on top of the state the new daemon just wrote, and the
+ * new daemon then sees a foreign pid on its next heartbeat and shuts itself down.
+ *
+ * @returns true if the write happened, false if someone else owns the file now
+ */
+export function writeDaemonStateIfUnchanged(expectedRaw: string | null, state: DaemonLocallyPersistedState): boolean {
+  const current = existsSync(configuration.daemonStateFile)
+    ? readFileSync(configuration.daemonStateFile, 'utf-8')
+    : null;
+  if (current !== expectedRaw) {
+    return false;
+  }
+  writeDaemonState(state);
+  return true;
 }
 
 let pendingDaemonState: DaemonLocallyPersistedState | null = null;
