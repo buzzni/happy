@@ -3,7 +3,7 @@ import { logger } from '@/ui/logger'
 import type { AgentState, CreateSessionResponse, Metadata, Session, Machine, MachineMetadata, DaemonState } from '@/api/types'
 import { ApiSessionClient } from './apiSession';
 import { ApiMachineClient } from './apiMachine';
-import { decodeBase64, encodeBase64, getRandomBytes, encrypt, decrypt, libsodiumEncryptForPublicKey } from './encryption';
+import { decodeBase64, encodeBase64, getRandomBytes, encrypt, decrypt, wrapDataEncryptionKey } from './encryption';
 import { PushNotificationClient } from './pushNotifications';
 import { configuration } from '@/configuration';
 import chalk from 'chalk';
@@ -47,10 +47,7 @@ export class ApiClient {
       // Derive and encrypt data encryption key
       // const contentDataKey = await deriveKey(this.secret, 'Happy EnCoder', ['content']);
       // const publicKey = libsodiumPublicKeyFromSecretKey(contentDataKey);
-      let encryptedDataKey = libsodiumEncryptForPublicKey(encryptionKey, this.credential.encryption.publicKey);
-      dataEncryptionKey = new Uint8Array(encryptedDataKey.length + 1);
-      dataEncryptionKey.set([0], 0); // Version byte
-      dataEncryptionKey.set(encryptedDataKey, 1); // Data key
+      dataEncryptionKey = wrapDataEncryptionKey(encryptionKey, this.credential.encryption.publicKey);
     } else {
       encryptionKey = this.credential.encryption.secret;
       encryptionVariant = 'legacy';
@@ -156,14 +153,20 @@ export class ApiClient {
       // Encrypt data encryption key
       encryptionVariant = 'dataKey';
       encryptionKey = this.credential.encryption.machineKey;
-      let encryptedDataKey = libsodiumEncryptForPublicKey(this.credential.encryption.machineKey, this.credential.encryption.publicKey);
-      dataEncryptionKey = new Uint8Array(encryptedDataKey.length + 1);
-      dataEncryptionKey.set([0], 0); // Version byte
-      dataEncryptionKey.set(encryptedDataKey, 1); // Data key
+      dataEncryptionKey = wrapDataEncryptionKey(this.credential.encryption.machineKey, this.credential.encryption.publicKey);
     } else {
       // Legacy encryption
       encryptionKey = this.credential.encryption.secret;
       encryptionVariant = 'legacy';
+      // aplus §6-1 Phase 3b — legacy 활성이어도 병기된 provisioned 재료가
+      // 있으면 wrap 된 machineKey 를 서버에 등록한다 (서버는 write-once
+      // 백필). RPC 암호화는 여전히 legacy secret — 동작 무변경.
+      if (this.credential.encryption.provisioned) {
+        dataEncryptionKey = wrapDataEncryptionKey(
+          this.credential.encryption.provisioned.machineKey,
+          this.credential.encryption.provisioned.publicKey
+        );
+      }
     }
 
     // Helper to create minimal machine object for offline mode (DRY)

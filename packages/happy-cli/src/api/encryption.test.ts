@@ -54,3 +54,34 @@ describe('decryptBlob', () => {
         }
     });
 });
+
+// aplus §6-1 Phase 3b (aplus-dev-studio specs/20260818-e2ee-account-keypair) —
+// getOrCreateMachine 이 보내는 dataEncryptionKey 봉투의 단일 조립 지점.
+// 포맷: [version 0x00 | ephemeralPub(32) | nonce(24) | box ct] — dataKey
+// 모드가 이미 쓰던 것과 바이트 단위로 동일해야 한다.
+describe('wrapDataEncryptionKey', () => {
+    it('wraps a machine key so the recipient private key can unwrap it', async () => {
+        const { wrapDataEncryptionKey } = await import('./encryption');
+        const recipient = tweetnacl.box.keyPair();
+        const machineKey = getRandomBytes(32);
+
+        const bundle = wrapDataEncryptionKey(machineKey, recipient.publicKey);
+
+        expect(bundle[0]).toBe(0); // version byte
+        const ephemeralPub = bundle.slice(1, 33);
+        const nonce = bundle.slice(33, 33 + 24);
+        const ct = bundle.slice(33 + 24);
+        const opened = tweetnacl.box.open(ct, nonce, ephemeralPub, recipient.secretKey);
+        expect(opened).not.toBeNull();
+        expect(new Uint8Array(opened!)).toEqual(machineKey);
+    });
+
+    it('produces a fresh ephemeral key per call (no bundle reuse)', async () => {
+        const { wrapDataEncryptionKey } = await import('./encryption');
+        const recipient = tweetnacl.box.keyPair();
+        const machineKey = getRandomBytes(32);
+        const a = wrapDataEncryptionKey(machineKey, recipient.publicKey);
+        const b = wrapDataEncryptionKey(machineKey, recipient.publicKey);
+        expect(Buffer.from(a).toString('base64')).not.toBe(Buffer.from(b).toString('base64'));
+    });
+});
