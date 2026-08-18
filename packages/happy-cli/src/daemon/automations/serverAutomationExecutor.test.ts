@@ -746,6 +746,9 @@ describe('runServerAutomationTick', () => {
     })
     const spawned = spawnSession.mock.calls[0]![0]
     expect(spawned.initialPrompt).toContain('Task ID: apply-1')
+    expect(spawned.initialPrompt).toContain('[Review apply quality contract]')
+    expect(spawned.initialPrompt).toContain('PLAUSIBLE-only')
+    expect(spawned.initialPrompt).toContain('Record an applied or skipped decision')
     expect(spawned.initialPrompt).toContain('Retry network failures and 5xx responses')
     expect(spawned.initialPrompt).not.toContain('claim-secret')
     expect(spawned.initialPrompt).not.toContain('complete-secret')
@@ -1012,6 +1015,12 @@ describe('runServerAutomationTick', () => {
       expect(spawnedEnvironment).not.toHaveProperty('GH_REPO')
       if (taskType === 'pr_review.v1') {
         expect(spawned).toMatchObject({ permissionMode: 'read-only' })
+        expect(spawned.initialPrompt).toContain('[PR review quality contract]')
+        expect(spawned.initialPrompt).toContain('correctness, regressions, contracts, security, tests, and resources')
+        expect(spawned.initialPrompt).toContain('[CONFIRMED] or [PLAUSIBLE]')
+        expect(spawned.initialPrompt).toContain('concrete input/state -> incorrect outcome')
+        expect(spawned.initialPrompt.indexOf('[PR review quality contract]'))
+          .toBeGreaterThan(spawned.initialPrompt.indexOf('Additional project instructions: Review safely'))
         expect(JSON.parse(spawnedEnvironment.HAPPY_PROJECT_SANDBOX_CONFIG!)).toMatchObject({
           enabled: true,
           sessionIsolation: 'custom',
