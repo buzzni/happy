@@ -48,7 +48,7 @@ export const automationScheduleSchema = z.discriminatedUnion('kind', [
 ]);
 export type AutomationSchedule = z.infer<typeof automationScheduleSchema>;
 
-export const githubTriggerEventSchema = z.enum(['opened', 'ready_for_review', 'merged', 'closed']);
+export const githubTriggerEventSchema = z.enum(['opened', 'ready_for_review', 'merged', 'closed', 'issue_opened']);
 export type GithubTriggerEvent = z.infer<typeof githubTriggerEventSchema>;
 
 export const githubTriggerSchema = z.object({
@@ -81,6 +81,10 @@ export const automationPayloadSchema = z.object({
   scriptCommand: z.string().trim().min(1).max(8_000).nullable(),
   suppressSilent: z.boolean(),
   agent: automationAgentSchema.nullable(),
+  // Initial model/effort seed for the spawned session (null/absent = agent default).
+  // Older daemons strip these unknown keys and simply spawn with their defaults.
+  model: z.string().nullable().optional(),
+  effort: z.string().nullable().optional(),
   githubTrigger: githubTriggerSchema.optional(),
 }).superRefine((payload, context) => {
   const isGithubSchedule = payload.schedule.kind === 'github';

@@ -10,7 +10,9 @@
  * same happy session. That is the 2026-07-19 incident: chats from every
  * project queued into one session and replayed each other's prompts.
  */
-export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_PROMPT', 'HAPPY_AUTOMATION_'] as const
+// 'HAPPY_INITIAL_' covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the
+// HAPPY_INITIAL_MODEL / HAPPY_INITIAL_EFFORT spawn seeds.
+export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_AUTOMATION_'] as const
 
 function isLineageKey(key: string): boolean {
     return SESSION_LINEAGE_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))

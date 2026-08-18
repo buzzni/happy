@@ -63,6 +63,28 @@ describe('github trigger automation payload', () => {
       githubTrigger: { ...githubTrigger, githubCredentialId: null },
     }).success).toBe(false);
   });
+
+  it('accepts the issue_opened trigger event', () => {
+    const issuePayload = {
+      ...payload,
+      schedule: { kind: 'github' as const, minutes: 15 as const },
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: 'bug', excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    };
+    expect(automationPayloadSchema.parse(issuePayload)).toEqual(issuePayload);
+  });
+
+  it('accepts optional nullable model/effort seeds without requiring them', () => {
+    const seeded = { ...payload, model: 'sonnet', effort: 'high' };
+    expect(automationPayloadSchema.parse(seeded)).toEqual(seeded);
+    expect(automationPayloadSchema.parse({ ...payload, model: null, effort: null }))
+      .toEqual({ ...payload, model: null, effort: null });
+    expect(automationPayloadSchema.parse(payload)).not.toHaveProperty('model');
+  });
 });
 
 function bytes(length: number, value: number): Uint8Array {

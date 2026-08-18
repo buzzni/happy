@@ -20,10 +20,15 @@ import type {
   AutomationAgentTaskEvent,
 } from './automationAgentTaskBridge'
 import {
+  GITHUB_ISSUE_TRIGGER_PROMPT_PREAMBLE,
   GITHUB_TRIGGER_PROMPT_PREAMBLE,
+  planGithubIssueTrigger,
   planGithubTrigger,
+  renderGithubIssueTriggerPrompt,
   renderGithubTriggerPrompt,
+  type GithubIssueSnapshot,
   type GithubPullRequestSnapshot,
+  type GithubTriggerRuntimeState,
 } from './githubTriggerDomain'
 
 type TransportResult = { ok: boolean; value?: any; error?: string }
@@ -52,6 +57,19 @@ export interface ServerAutomationExecutorInput {
     | {
       ok: true
       pullRequests: GithubPullRequestSnapshot[]
+      githubEnvironment?: { GH_TOKEN: string; GH_REPO: string }
+    }
+    | { ok: false; error: string }
+  >
+  queryGithubIssues: (input: {
+    cwd: string
+    githubCredentialId: string | null
+    runId: string
+    claimToken: string
+  }) => Promise<
+    | {
+      ok: true
+      issues: GithubIssueSnapshot[]
       githubEnvironment?: { GH_TOKEN: string; GH_REPO: string }
     }
     | { ok: false; error: string }
@@ -95,6 +113,8 @@ export interface ServerAutomationExecutorInput {
     initialPrompt: string
     createdByAccountId: null
     agent: AutomationAgent
+    model?: string
+    effort?: string
     permissionMode?: 'read-only'
     mcpSpawnContext?: AutomationMcpSpawnContext
     expectedConnectors?: string[]
@@ -261,6 +281,23 @@ function advanceSchedule(
   })
 }
 
+function makeGithubTriggerStatePersister(
+  input: ServerAutomationExecutorInput,
+  automation: EncryptedServerAutomation,
+  state: GithubTriggerRuntimeState,
+): () => void {
+  return () => {
+    const latest = input.runtimeStore.read()
+    input.runtimeStore.write({
+      ...latest,
+      githubTriggers: [
+        ...(latest.githubTriggers ?? []).filter((entry) => entry.automationId !== automation.automationId),
+        { automationId: automation.automationId, generation: automation.generation, state },
+      ],
+    })
+  }
+}
+
 async function executeStartedRun(
   input: ServerAutomationExecutorInput,
   automation: EncryptedServerAutomation,
@@ -276,7 +313,50 @@ async function executeStartedRun(
   let environmentVariables: Record<string, string> | undefined
   let agentTaskDispatch: AutomationAgentTaskDispatch | null = null
   let persistGithubTriggerState: (() => void) | null = null
-  if (payload.githubTrigger) {
+  if (payload.githubTrigger?.event === 'issue_opened') {
+    // Issue triggers only support the notify/start-session actions — AgentTask
+    // review is a PR concept. Fail closed instead of degrading silently.
+    if (payload.githubTrigger.action === 'agent-task-review') {
+      input.logDebug?.(`[server-automation] ${automation.automationId} issue_opened does not support agent-task-review`)
+      return { outcome: 'ERROR', sessionId: null }
+    }
+    const query = await input.queryGithubIssues({
+      cwd: payload.directory,
+      githubCredentialId: payload.githubTrigger.githubCredentialId,
+      runId: run.runId,
+      claimToken: run.claimToken,
+    })
+    if (!query.ok) {
+      input.logDebug?.(`[server-automation] ${automation.automationId} GitHub issue query failed: ${query.error}`)
+      return { outcome: 'ERROR', sessionId: null }
+    }
+    const runtime = input.runtimeStore.read()
+    const previous = (runtime.githubTriggers ?? []).find((entry) => (
+      entry.automationId === automation.automationId && entry.generation === automation.generation
+    ))?.state ?? null
+    const planned = planGithubIssueTrigger({
+      trigger: payload.githubTrigger,
+      current: query.issues,
+      previous,
+    })
+    persistGithubTriggerState = makeGithubTriggerStatePersister(input, automation, planned.state)
+    if (!planned.event) {
+      persistGithubTriggerState()
+      return { outcome: 'SKIPPED_GATE', sessionId: null }
+    }
+    const rendered = renderGithubIssueTriggerPrompt(payload.prompt, planned.event.issue, planned.event.event)
+    if (payload.githubTrigger.action === 'notify') {
+      input.notifyGithubTrigger({
+        title: payload.name,
+        body: rendered.slice(0, 1_000),
+        url: planned.event.issue.url,
+      })
+      persistGithubTriggerState()
+      return { outcome: 'WOKE', sessionId: null }
+    }
+    prompt = `${GITHUB_ISSUE_TRIGGER_PROMPT_PREAMBLE}\n\n${rendered}`
+    environmentVariables = query.githubEnvironment
+  } else if (payload.githubTrigger) {
     const query = await input.queryGithubPullRequests({
       cwd: payload.directory,
       githubCredentialId: payload.githubTrigger.githubCredentialId,
@@ -296,16 +376,7 @@ async function executeStartedRun(
       current: query.pullRequests,
       previous,
     })
-    persistGithubTriggerState = () => {
-      const latest = input.runtimeStore.read()
-      input.runtimeStore.write({
-        ...latest,
-        githubTriggers: [
-          ...(latest.githubTriggers ?? []).filter((entry) => entry.automationId !== automation.automationId),
-          { automationId: automation.automationId, generation: automation.generation, state: planned.state },
-        ],
-      })
-    }
+    persistGithubTriggerState = makeGithubTriggerStatePersister(input, automation, planned.state)
     if (payload.githubTrigger.action === 'agent-task-review') {
       const credentialId = payload.githubTrigger.githubCredentialId
       if (!credentialId) return { outcome: 'ERROR', sessionId: null }
@@ -427,6 +498,8 @@ async function executeStartedRun(
     initialPrompt,
     createdByAccountId: null,
     agent: payload.agent ?? 'claude',
+    ...(payload.model ? { model: payload.model } : {}),
+    ...(payload.effort ? { effort: payload.effort } : {}),
     ...(agentTaskDispatch ? { filterInheritedCredentials: true } : {}),
     ...(agentTaskDispatch?.type === 'pr_review.v1' ? { permissionMode: 'read-only' as const } : {}),
     ...(environmentVariables ? { environmentVariables } : {}),

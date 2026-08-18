@@ -75,12 +75,20 @@ import {
     prepareCodexSessionStart,
 } from './initialPrompt';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
-import { resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
+import {
+    consumePendingInitialEffort,
+    consumePendingInitialModel,
+    resolveInitialPromptPermissionMode,
+} from '@/utils/initialPrompt';
 import { registerCodexSteerHandler } from './codexSteerHandler';
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
 const DEFAULT_CODEX_PERMISSION_MODE: PermissionMode = 'yolo';
+
+const VALID_REMOTE_EFFORTS: readonly ReasoningEffort[] = [
+    'none', 'minimal', 'low', 'medium', 'high', 'xhigh',
+];
 
 /**
  * Main entry point for the codex command with ink UI
@@ -259,14 +267,26 @@ export async function runCodex(opts: {
     // Track current overrides to apply per message
     // Use shared PermissionMode type from api/types for cross-agent compatibility
     let currentPermissionMode: PermissionMode | undefined = initialPermissionMode;
-    let currentModel: string | undefined = DEFAULT_CODEX_MODEL;
-    let currentEffort: ReasoningEffort | undefined = DEFAULT_CODEX_EFFORT;
+    // Daemon-provided per-spawn model/effort seed (HAPPY_INITIAL_MODEL /
+    // HAPPY_INITIAL_EFFORT, e.g. automations). Consumed exactly once — read
+    // then deleted so children never inherit. Effort is whitelisted against
+    // ReasoningEffort; anything else falls back to the default.
+    const initialModelSeed = consumePendingInitialModel(process.env) ?? DEFAULT_CODEX_MODEL;
+    const rawInitialEffortSeed = consumePendingInitialEffort(process.env);
+    if (rawInitialEffortSeed && !(VALID_REMOTE_EFFORTS as readonly string[]).includes(rawInitialEffortSeed)) {
+        logger.debug(`[Codex] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
+    }
+    const initialEffortSeed = rawInitialEffortSeed && (VALID_REMOTE_EFFORTS as readonly string[]).includes(rawInitialEffortSeed)
+        ? rawInitialEffortSeed as ReasoningEffort
+        : DEFAULT_CODEX_EFFORT;
+    let currentModel: string | undefined = initialModelSeed;
+    let currentEffort: ReasoningEffort | undefined = initialEffortSeed;
     let currentAppendSystemPrompt: string | undefined = undefined;
 
     const resetCurrentModeDefaults = () => {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
-        currentModel = DEFAULT_CODEX_MODEL;
-        currentEffort = DEFAULT_CODEX_EFFORT;
+        currentModel = initialModelSeed;
+        currentEffort = initialEffortSeed;
         currentAppendSystemPrompt = undefined;
         logger.debug('[Codex] Reset current mode defaults after abort');
     };
@@ -285,10 +305,6 @@ export async function runCodex(opts: {
         'read-only',
         'safe-yolo',
         'yolo',
-    ];
-
-    const VALID_REMOTE_EFFORTS: readonly ReasoningEffort[] = [
-        'none', 'minimal', 'low', 'medium', 'high', 'xhigh',
     ];
 
     const handleUserMessage = createSerialAsyncHandler<UserMessage>(async (message) => {

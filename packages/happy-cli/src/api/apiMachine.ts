@@ -412,6 +412,8 @@ export class ApiMachineClient {
                 machineId,
                 approvedNewDirectoryCreation,
                 agent,
+                model,
+                effort,
                 environmentVariables,
                 token,
                 happyToken,
@@ -454,6 +456,12 @@ export class ApiMachineClient {
             if (exitAfterFirstTurn !== undefined && typeof exitAfterFirstTurn !== 'boolean') {
                 throw new Error('Exit-after-first-turn must be a boolean');
             }
+            if (model !== undefined && (typeof model !== 'string' || !model.trim())) {
+                throw new Error('Model must be a non-empty string');
+            }
+            if (effort !== undefined && (typeof effort !== 'string' || !effort.trim())) {
+                throw new Error('Effort must be a non-empty string');
+            }
             if (exitAfterFirstTurn && initialPrompt === undefined) {
                 throw new Error('Run-once session requires a non-empty initial prompt');
             }
@@ -468,6 +476,8 @@ export class ApiMachineClient {
                 machineId,
                 approvedNewDirectoryCreation,
                 agent,
+                model,
+                effort,
                 environmentVariables,
                 token,
                 happyToken,

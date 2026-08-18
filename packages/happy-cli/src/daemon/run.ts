@@ -94,6 +94,7 @@ import { runAutomationTick } from './automations/automationTick';
 import { createAutomationTickRunner } from './automations/automationTickRunner';
 import { runAutomationScript } from './automations/runAutomationScript';
 import { queryGithubPullRequests } from './automations/queryGithubPullRequests';
+import { queryGithubIssues } from './automations/queryGithubIssues';
 import {
   dispatchAutomationAgentTask,
   maintainAutomationAgentTaskLease,
@@ -820,6 +821,15 @@ export async function startDaemon(): Promise<void> {
           if (options.initialPromptLocalId) {
             extraEnv.HAPPY_INITIAL_PROMPT_LOCAL_ID = options.initialPromptLocalId;
           }
+        }
+        // Initial model/effort seed: 사용자 입력 문자열이므로 initialPrompt와
+        // 같은 이유로 ${VAR} 확장·검증 이후에 주입한다. 소비(read+delete)는
+        // 자식 CLI(runClaude/runCodex)가 정확히 한 번 수행한다.
+        if (options.model) {
+          extraEnv.HAPPY_INITIAL_MODEL = options.model;
+        }
+        if (options.effort) {
+          extraEnv.HAPPY_INITIAL_EFFORT = options.effort;
         }
         if (options.exitAfterFirstTurn) {
           extraEnv.HAPPY_AUTOMATION_RUN_ONCE = '1';
@@ -1696,6 +1706,8 @@ export async function startDaemon(): Promise<void> {
         initialPrompt: string;
         createdByAccountId: string | null;
         agent: 'claude' | 'codex' | 'gemini' | 'grok' | 'openclaw' | 'opencode';
+        model?: string;
+        effort?: string;
         permissionMode?: 'read-only';
         mcpSpawnContext?: AutomationMcpSpawnContext;
         expectedConnectors?: string[];
@@ -1707,6 +1719,8 @@ export async function startDaemon(): Promise<void> {
         machineId,
         directory: input.directory,
         agent: input.agent,
+        model: input.model,
+        effort: input.effort,
         initialPrompt: input.initialPrompt,
         exitAfterFirstTurn: input.agent === 'claude' || input.agent === 'codex',
         ...(input.permissionMode ? { permissionMode: input.permissionMode } : {}),
@@ -1866,6 +1880,13 @@ export async function startDaemon(): Promise<void> {
         decryptPayload: decryptServerAutomationPayload,
         runScript: (input) => runAutomationScript({ ...input, allowedRoot: automationAllowedRoot }),
         queryGithubPullRequests: (input) => queryGithubPullRequests({
+          ...input,
+          configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+          machineToken: credentials.token,
+          machineId,
+          allowedRoot: automationAllowedRoot,
+        }),
+        queryGithubIssues: (input) => queryGithubIssues({
           ...input,
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
           machineToken: credentials.token,

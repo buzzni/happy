@@ -24,6 +24,8 @@ describe('scrubSessionLineageEnv', () => {
             HAPPY_CREATED_BY_ACCOUNT_ID: 'acct-stale',
             HAPPY_CREATED_BY_DISPLAY_NAME: 'Stale Name',
             HAPPY_INITIAL_PROMPT: 'stale automation prompt',
+            HAPPY_INITIAL_MODEL: 'stale-model',
+            HAPPY_INITIAL_EFFORT: 'stale-effort',
             HAPPY_AUTOMATION_RUN_ONCE: '1',
         }
         const scrubbed = scrubSessionLineageEnv(env)
@@ -44,7 +46,8 @@ describe('scrubSessionLineageEnv', () => {
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_RECONNECT_')
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_FORK')
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_CREATED_BY')
-        expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_INITIAL_PROMPT')
+        // HAPPY_INITIAL_ covers PROMPT(_LOCAL_ID) and the MODEL/EFFORT seeds.
+        expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_INITIAL_')
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_AUTOMATION_')
     })
 })
