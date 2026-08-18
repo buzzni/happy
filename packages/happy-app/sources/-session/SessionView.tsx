@@ -30,6 +30,7 @@ import { storage, useIsDataReady, useLocalSetting, useRealtimeStatus, useSession
 import { useSession } from '@/sync/storage';
 import { Session } from '@/sync/storageTypes';
 import { sync } from '@/sync/sync';
+import { consumedComposerClearPlan } from '@/sync/sessionRecovery';
 import { t } from '@/text';
 import { tracking } from '@/track';
 import { getVoiceMessageCount, getVoiceOnboardingPromptLoadCount } from '@/sync/persistence';
@@ -499,6 +500,8 @@ function SessionViewLoaded({ sessionId, session }: { sessionId: string, session:
     // Image attachment state (expImageUpload feature flag)
     const expImageUpload = useSetting('expImageUpload');
     const { selectedImages, pickImages, removeImage, clearImages, addImages } = useImagePicker();
+    const selectedImagesRef = React.useRef(selectedImages);
+    selectedImagesRef.current = selectedImages;
 
     // ChatComposer owns the message state + useDraft subscription. We only
     // hold an imperative handle so handleSend can read the live text and
@@ -554,9 +557,18 @@ function SessionViewLoaded({ sessionId, session }: { sessionId: string, session:
             // composer has no way to restore it.
             void performSend(liveMessage, { source: 'chat', attachments }).then((consumed) => {
                 if (consumed) {
-                    composerHandleRef.current?.clearMessage();
-                    if (expImageUpload) clearImages();
+                    const clearPlan = consumedComposerClearPlan({
+                        sentText: liveMessage,
+                        currentText: composerHandleRef.current?.getMessage() ?? '',
+                        sentAttachments: attachments,
+                        currentAttachments: expImageUpload ? selectedImagesRef.current : undefined,
+                    });
+                    if (clearPlan.clearMessage) composerHandleRef.current?.clearMessage();
+                    if (expImageUpload && clearPlan.clearAttachments) clearImages();
                 }
+            }).catch(() => {
+                // useSessionSend normally reports failures as `false`; preserve
+                // the composer as a final safeguard if an unexpected rejection escapes.
             });
         }
     }, [expImageUpload, selectedImages, clearImages, performSend]);

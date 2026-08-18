@@ -23,7 +23,7 @@ import { useNavigateToSession } from '@/hooks/useNavigateToSession';
 import { Modal } from '@/modal';
 import { machineRecoverSession, machineResumeSession } from '@/sync/ops';
 import { resolveMessageModeMeta } from '@/sync/messageMeta';
-import { prepareSessionForSend } from '@/sync/sessionRecovery';
+import { prepareSessionForSend, shouldAttemptSessionRecovery } from '@/sync/sessionRecovery';
 import { storage, useMachine, useSetting } from '@/sync/storage';
 import { Session } from '@/sync/storageTypes';
 import { sync, type SendMessageOptions } from '@/sync/sync';
@@ -50,14 +50,16 @@ export function useSessionSend(session: Session) {
     const recoveryInFlightRef = React.useRef(false);
 
     return React.useCallback(async (text: string, options?: SendMessageOptions): Promise<boolean> => {
-        // An attachments-only send (empty text, images experiment) must not
-        // enter the ladder: recover can only carry text, so the daemon rejects
-        // an empty initialPrompt and the user would see a bare RPC error.
-        // Queueing keeps the file events replayable like any other message.
-        const attemptRecovery = !isConnected
-            && expResumeSession
-            && text.trim().length > 0
-            && getResumeAvailability(session, machine, isConnected).canResume;
+        // Sends with attachments must not enter the ladder: recover carries
+        // only initialPrompt text and would silently drop the images. Queueing
+        // keeps the file events replayable like any other message.
+        const attemptRecovery = shouldAttemptSessionRecovery({
+            isConnected,
+            enabled: expResumeSession,
+            text,
+            attachmentCount: options?.attachments?.length ?? 0,
+            canResume: getResumeAvailability(session, machine, isConnected).canResume,
+        });
 
         if (!attemptRecovery) {
             sync.sendMessage(sessionId, text, options);
@@ -88,8 +90,6 @@ export function useSessionSend(session: Session) {
                 case 'prompt-delivered':
                     // The daemon already handed this text to the new session, so
                     // re-sending it here would duplicate the user's message.
-                    // Known limitation: recover carries text only — attachments
-                    // queued alongside it are not forwarded to the new session.
                     Modal.alert(t('common.success'), t('session.sessionRecoveredInNewConversation'));
                     navigateToSession(outcome.sessionId);
                     return true;

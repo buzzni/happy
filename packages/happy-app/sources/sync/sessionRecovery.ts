@@ -14,6 +14,32 @@ export const RECOVERABLE_RESUME_CODES = [
     'SESSION_CURSOR_MISSING',
 ] as const;
 
+export function shouldAttemptSessionRecovery(input: {
+    isConnected: boolean;
+    enabled: boolean;
+    text: string;
+    attachmentCount: number;
+    canResume: boolean;
+}): boolean {
+    return !input.isConnected
+        && input.enabled
+        && input.text.trim().length > 0
+        && input.attachmentCount === 0
+        && input.canResume;
+}
+
+export function consumedComposerClearPlan<T>(input: {
+    sentText: string;
+    currentText: string;
+    sentAttachments: T;
+    currentAttachments: T;
+}): { clearMessage: boolean; clearAttachments: boolean } {
+    return {
+        clearMessage: input.sentText === input.currentText,
+        clearAttachments: input.sentAttachments === input.currentAttachments,
+    };
+}
+
 /**
  * Check if a resume failure code is recoverable via recover-happy-session RPC.
  */
@@ -70,6 +96,10 @@ export async function prepareSessionForSend(input: {
         return { kind: 'failed', reason: 'directory-approval-required' };
     }
 
+    if (resumeResult.code === 'RPC_TRANSPORT_ERROR') {
+        return { kind: 'send-normally' };
+    }
+
     // Resume failed. Check if the error is recoverable.
     const canRecover = isRecoverableResumeFailure(resumeResult.code);
     if (!canRecover) {
@@ -85,6 +115,9 @@ export async function prepareSessionForSend(input: {
     });
 
     if (recoverResult.type === 'error') {
+        if (recoverResult.code === 'RPC_TRANSPORT_ERROR') {
+            return { kind: 'send-normally' };
+        }
         return { kind: 'failed', reason: 'rpc-error', message: recoverResult.errorMessage };
     }
 

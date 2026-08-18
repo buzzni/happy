@@ -34,7 +34,8 @@ function row(patch: Partial<AutomationPublic> = {}): AutomationPublic {
         machineAccountId: 'account-1', machineId: 'machine-1', revision: 1, generation: 1,
         payloadVersion: 1, payloadCiphertext: 'ciphertext', viewerKeyId: 'viewer-key',
         viewerKeyVersion: 1, viewerKeyEnvelope: 'viewer-envelope', machineKeyVersion: 2,
-        paused: false, enabledAt: 1, appliedRevision: 0, appliedAt: null, createdAt: 1, updatedAt: 1,
+        paused: false, enabledAt: 1, appliedRevision: 0, appliedAt: null, runRequestedAt: null,
+        createdAt: 1, updatedAt: 1,
         ...patch,
     };
 }
@@ -69,6 +70,7 @@ describe('server automation repository', () => {
             replaceViewerKeyIfUnused: vi.fn(),
             listAutomations: vi.fn(async () => stored ? [stored] : []),
             listRuns: vi.fn(async () => []),
+            runAutomationNow: vi.fn(),
             createAutomation: vi.fn(async (projectId, input) => {
                 stored = row({ projectId, ...input, viewerKeyVersion: 1 });
                 return stored;
