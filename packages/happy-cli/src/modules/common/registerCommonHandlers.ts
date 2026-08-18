@@ -202,6 +202,14 @@ export interface SpawnSessionOptions {
     sessionId?: string;
     approvedNewDirectoryCreation?: boolean;
     agent?: 'claude' | 'codex' | 'gemini' | 'grok' | 'openclaw' | 'opencode';
+    /**
+     * Initial model/effort seed for the spawned agent, delivered via
+     * HAPPY_INITIAL_MODEL / HAPPY_INITIAL_EFFORT (per-spawn lineage envs,
+     * scrubbed like HAPPY_INITIAL_PROMPT) and consumed exactly once by the
+     * agent startup path. Invalid effort values are ignored by the agent.
+     */
+    model?: string;
+    effort?: string;
     environmentVariables?: Record<string, string>;
     /** OAuth token for the agent CLI (e.g. CLAUDE_CODE_OAUTH_TOKEN). */
     token?: string;

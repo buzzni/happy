@@ -52,7 +52,7 @@ import { deliverPreparedClaudeSessionStart, prepareClaudeInitialPrompt } from '.
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
-import { resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
+import { consumePendingInitialEffort, consumePendingInitialModel, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import { createEnvelope } from '@slopus/happy-wire';
 
 /** JavaScript runtime to use for spawning Claude Code */
@@ -74,6 +74,7 @@ export interface StartOptions {
 const DEFAULT_CLAUDE_PERMISSION_MODE: PermissionMode = 'yolo';
 const DEFAULT_CLAUDE_MODEL = 'opus';
 const DEFAULT_CLAUDE_EFFORT: 'low' | 'medium' | 'high' | 'xhigh' | 'max' = 'medium';
+const VALID_CLAUDE_EFFORTS: ReadonlySet<string> = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 type ClaudeGoalCommand = NonNullable<ReturnType<typeof parseClaudeGoalActionParams>>;
 type PendingClaudeGoalAction = {
     command: ClaudeGoalCommand;
@@ -524,23 +525,35 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Forward messages to the queue
     // Permission modes: Use the unified 7-mode type, mapping happens at SDK boundary in claudeRemote.ts
     let currentPermissionMode: PermissionMode | undefined = initialPermissionMode;
-    let currentModel: string | undefined = options.model ?? DEFAULT_CLAUDE_MODEL; // Track current model state
+    // Daemon-provided per-spawn model/effort seed (HAPPY_INITIAL_MODEL /
+    // HAPPY_INITIAL_EFFORT, e.g. automations). Consumed exactly once — read
+    // then deleted so children never inherit — and treated like a CLI option:
+    // it also survives the post-abort reset. Invalid effort values are ignored.
+    const initialModelSeed = consumePendingInitialModel(process.env) ?? options.model ?? DEFAULT_CLAUDE_MODEL;
+    const rawInitialEffortSeed = consumePendingInitialEffort(process.env);
+    if (rawInitialEffortSeed && !VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)) {
+        logger.debug(`[START] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
+    }
+    const initialEffortSeed = rawInitialEffortSeed && VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)
+        ? rawInitialEffortSeed as 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+        : DEFAULT_CLAUDE_EFFORT;
+    let currentModel: string | undefined = initialModelSeed; // Track current model state
     let currentFallbackModel: string | undefined = undefined; // Track current fallback model
     let currentCustomSystemPrompt: string | undefined = undefined; // Track current custom system prompt
     let currentAppendSystemPrompt: string | undefined = undefined; // Track current append system prompt
     let currentAllowedTools: string[] | undefined = undefined; // Track current allowed tools
     let currentDisallowedTools: string[] | undefined = initialDisallowedTools; // Track current disallowed tools
-    let currentEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined = DEFAULT_CLAUDE_EFFORT; // Track current Claude effort (thinking depth)
+    let currentEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined = initialEffortSeed; // Track current Claude effort (thinking depth)
 
     const resetCurrentModeDefaults = () => {
         currentPermissionMode = initialPermissionMode;
-        currentModel = options.model ?? DEFAULT_CLAUDE_MODEL;
+        currentModel = initialModelSeed;
         currentFallbackModel = undefined;
         currentCustomSystemPrompt = undefined;
         currentAppendSystemPrompt = undefined;
         currentAllowedTools = undefined;
         currentDisallowedTools = initialDisallowedTools;
-        currentEffort = DEFAULT_CLAUDE_EFFORT;
+        currentEffort = initialEffortSeed;
         logger.debug('[loop] Reset current mode defaults after abort');
     };
     const currentEnhancedMode = (): EnhancedMode => ({
@@ -744,14 +757,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         // Validate against the SDK's accepted set so a stale/garbage value
         // from the wire doesn't poison the session.
         let messageEffort = currentEffort;
-        const VALID_EFFORTS: ReadonlySet<string> = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
         if (message.meta?.hasOwnProperty('effort')) {
             const incoming = (message.meta as Record<string, unknown>).effort;
             if (incoming === null || incoming === undefined) {
                 messageEffort = undefined;
                 currentEffort = undefined;
                 logger.debug(`[loop] Effort reset to default`);
-            } else if (typeof incoming === 'string' && VALID_EFFORTS.has(incoming)) {
+            } else if (typeof incoming === 'string' && VALID_CLAUDE_EFFORTS.has(incoming)) {
                 messageEffort = incoming as 'low' | 'medium' | 'high' | 'xhigh' | 'max';
                 currentEffort = messageEffort;
                 logger.debug(`[loop] Effort updated from user message: ${messageEffort}`);

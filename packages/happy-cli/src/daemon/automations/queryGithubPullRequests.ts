@@ -36,7 +36,7 @@ export type QueryGithubPullRequestsResult =
   }
   | { ok: false; error: string }
 
-async function exchangeCredential(input: {
+export async function exchangeCredential(input: {
   configUrl: string | undefined
   machineToken: string
   machineId: string

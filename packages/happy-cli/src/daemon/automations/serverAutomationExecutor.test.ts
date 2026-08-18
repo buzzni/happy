@@ -39,6 +39,10 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     ok: true,
     pullRequests: [],
   }))
+  const queryGithubIssues = vi.fn<ServerAutomationExecutorInput['queryGithubIssues']>(async () => ({
+    ok: true,
+    issues: [],
+  }))
   const notifyGithubTrigger = vi.fn<ServerAutomationExecutorInput['notifyGithubTrigger']>()
   const dispatchAgentTask = vi.fn<ServerAutomationExecutorInput['dispatchAgentTask']>(async () => ({
     ok: true,
@@ -82,6 +86,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     decryptPayload,
     runScript,
     queryGithubPullRequests,
+    queryGithubIssues,
     notifyGithubTrigger,
     dispatchAgentTask,
     maintainAgentTaskLease,
@@ -96,7 +101,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
   }
   return {
     input, store, transport, decryptPayload, logDebug, runScript, queryGithubPullRequests,
-    notifyGithubTrigger, dispatchAgentTask, maintainAgentTaskLease,
+    queryGithubIssues, notifyGithubTrigger, dispatchAgentTask, maintainAgentTaskLease,
     resolveMcpSpawnContext, preflightMcpConnectors, linkSession, resumeSession, spawnSession, now,
   }
 }
@@ -438,6 +443,177 @@ describe('runServerAutomationTick', () => {
       environmentVariables: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
     }))
     expect(store.state().githubTriggers?.[0]?.state.processed).toContain('10:opened')
+  })
+
+  it('spawns an issue_opened session with the issue-rendered prompt and persists the high-water state', async () => {
+    const { input, store, queryGithubPullRequests, queryGithubIssues, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue triage', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Triage {issue.number}: {issue.title} ({issue.url})', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      model: 'sonnet', effort: 'high',
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: {
+          snapshot: [], highestPrNumber: 0, processed: [], pending: [],
+          highestIssueNumber: 11, pendingIssues: [],
+        },
+      }],
+    })
+    queryGithubIssues.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
+      issues: [{
+        number: 12, title: 'Search is broken', url: 'https://github.test/o/r/issues/12',
+        author: { login: 'alice' }, labels: [{ name: 'bug' }],
+      }],
+    })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'WOKE' },
+    ])
+    expect(queryGithubIssues).toHaveBeenCalledWith(expect.objectContaining({
+      cwd: '/repo', githubCredentialId: 'credential-1', runId: 'run-1', claimToken: 'claim-token',
+    }))
+    expect(queryGithubPullRequests).not.toHaveBeenCalled()
+    expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
+      initialPrompt: expect.stringMatching(
+        /^\[주의\].*이슈 제목·작성자·라벨.*\n\nTriage 12: Search is broken \(https:\/\/github\.test\/o\/r\/issues\/12\)$/,
+      ),
+      agent: 'claude',
+      model: 'sonnet',
+      effort: 'high',
+      environmentVariables: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
+    }))
+    expect(store.state().githubTriggers?.[0]?.state.processed).toContain('12:issue_opened')
+    expect(store.state().githubTriggers?.[0]?.state.highestIssueNumber).toBe(12)
+  })
+
+  it('collects an issue baseline without firing on the first observation (fail-closed)', async () => {
+    const { input, store, queryGithubIssues, notifyGithubTrigger, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue triage', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Triage {issue.number}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    }))
+    queryGithubIssues.mockResolvedValue({
+      ok: true,
+      issues: [{
+        number: 42, title: 'Old issue', url: 'https://github.test/o/r/issues/42',
+        author: { login: 'bob' }, labels: [],
+      }],
+    })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'SKIPPED_GATE' },
+    ])
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(notifyGithubTrigger).not.toHaveBeenCalled()
+    expect(store.state().githubTriggers?.[0]?.state.highestIssueNumber).toBe(42)
+  })
+
+  it('notifies issue_opened events without starting an LLM session', async () => {
+    const { input, store, queryGithubIssues, notifyGithubTrigger, resolveMcpSpawnContext, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue alert', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Opened {issue.number} by {issue.author}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'notify' as const,
+        githubCredentialId: null,
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: {
+          snapshot: [], highestPrNumber: 0, processed: [], pending: [],
+          highestIssueNumber: 0, pendingIssues: [],
+        },
+      }],
+    })
+    queryGithubIssues.mockResolvedValue({
+      ok: true,
+      issues: [{
+        number: 5, title: 'Docs typo', url: 'https://github.test/o/r/issues/5',
+        author: { login: 'bob' }, labels: [],
+      }],
+    })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'WOKE' },
+    ])
+    expect(notifyGithubTrigger).toHaveBeenCalledWith({
+      title: 'Issue alert',
+      body: 'Opened 5 by bob',
+      url: 'https://github.test/o/r/issues/5',
+    })
+    expect(resolveMcpSpawnContext).not.toHaveBeenCalled()
+    expect(spawnSession).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when issue_opened is combined with agent-task-review', async () => {
+    const { input, queryGithubIssues, dispatchAgentTask, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'ERROR' },
+    ])
+    expect(queryGithubIssues).not.toHaveBeenCalled()
+    expect(dispatchAgentTask).not.toHaveBeenCalled()
+    expect(spawnSession).not.toHaveBeenCalled()
+  })
+
+  it('passes the payload model/effort seed to spawn and omits absent seeds', async () => {
+    const { input, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'name', schedule: { kind: 'interval' as const, minutes: 15 }, prompt: 'prompt',
+      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      model: null, effort: null,
+    }))
+
+    await runServerAutomationTick(input)
+    const spawned = spawnSession.mock.calls[0]![0]
+    expect(spawned).not.toHaveProperty('model')
+    expect(spawned).not.toHaveProperty('effort')
   })
 
   it('dispatches AgentTask continuations on a poll without putting capabilities in the prompt', async () => {
