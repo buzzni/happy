@@ -1,5 +1,7 @@
 import * as z from 'zod';
 
+export const AUTOMATION_RUN_NOW_PROTOCOL_VERSION = 2;
+
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const PAYLOAD_MAX_BYTES = 128 * 1024;
 const ENVELOPE_BYTES = 105;
@@ -114,6 +116,7 @@ export const automationPublicSchema = z.object({
   machineKeyVersion: positiveInteger,
   paused: z.boolean(),
   enabledAt: timestamp,
+  runRequestedAt: timestamp.nullable().default(null),
   appliedRevision: z.number().int().min(0),
   appliedAt: timestamp.nullable(),
   createdAt: timestamp,
@@ -147,6 +150,7 @@ export const automationRunSchema = z.object({
   detailCiphertext: base64Schema(PAYLOAD_MAX_BYTES).nullable(),
   failureCode: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/).nullable().optional(),
   degradedCode: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/).nullable().optional(),
+  queueDepth: z.number().int().min(0).max(10_000).nullable().optional(),
   claimedAt: timestamp,
   startedAt: timestamp.nullable(),
   completedAt: timestamp.nullable(),
@@ -318,6 +322,7 @@ export interface AutomationApiClient {
   activateAutomationAdoption(projectId: string, automationId: string, expectedRevision: number): Promise<AutomationPublic>;
   updateAutomation(projectId: string, automationId: string, input: AutomationUpdateRequest): Promise<AutomationPublic>;
   deleteAutomation(projectId: string, automationId: string, expectedRevision: number): Promise<AutomationPublic>;
+  runAutomationNow(projectId: string, automationId: string, expectedRevision: number): Promise<AutomationPublic>;
   listRuns(projectId: string, input?: { automationId?: string; limit?: number }): Promise<AutomationRun[]>;
 }
 
@@ -427,6 +432,16 @@ export function createAutomationApiClient(options: {
         `${automationPath(projectId)}/${pathId(automationId)}`,
         z.object({ automation: automationPublicSchema }),
         'DELETE',
+        body,
+      );
+      return value.automation;
+    },
+    async runAutomationNow(projectId, automationId, expectedRevision) {
+      const body = automationDeleteRequestSchema.parse({ expectedRevision });
+      const value = await request(
+        `${automationPath(projectId)}/${pathId(automationId)}/run`,
+        z.object({ automation: automationPublicSchema }),
+        'POST',
         body,
       );
       return value.automation;

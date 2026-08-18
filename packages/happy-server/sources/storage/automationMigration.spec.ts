@@ -4,9 +4,14 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const migrationDir = join(process.cwd(), 'prisma/migrations/20260810173000_add_server_backed_automations');
+const runNowMigrationDir = join(process.cwd(), 'prisma/migrations/20260818120000_add_automation_run_now_queue_depth');
 
 function readSql(name: string): string {
     return readFileSync(join(migrationDir, name), 'utf8');
+}
+
+function readRunNowSql(name: string): string {
+    return readFileSync(join(runNowMigrationDir, name), 'utf8');
 }
 
 describe('server-backed automation migration', () => {
@@ -106,6 +111,41 @@ describe('server-backed automation migration', () => {
                     'CLAIMED', '\\x13', '2026-08-10T08:02:00Z', CURRENT_TIMESTAMP
                 );
             `)).rejects.toThrow(/AutomationRun_automationId_generation_scheduledFor_key/);
+        } finally {
+            await pg.close();
+        }
+    });
+
+    it('adds and rolls back run-now capability, durable requests, and GitHub queue depth', async () => {
+        const pg = new PGlite();
+        try {
+            await pg.exec(`
+                CREATE TABLE "Account" ("id" TEXT PRIMARY KEY);
+                CREATE TABLE "Project" ("id" TEXT PRIMARY KEY);
+                CREATE TABLE "Machine" ("id" TEXT PRIMARY KEY, "accountId" TEXT NOT NULL);
+                CREATE UNIQUE INDEX "Machine_accountId_id_key" ON "Machine"("accountId", "id");
+            `);
+            await pg.exec(readSql('migration.sql'));
+            await pg.exec(readRunNowSql('migration.sql'));
+            const added = await pg.query<{ table_name: string; column_name: string }>(`
+                SELECT table_name, column_name FROM information_schema.columns
+                WHERE (table_name = 'Machine' AND column_name = 'automationProtocolVersion')
+                   OR (table_name = 'Automation' AND column_name = 'runRequestedAt')
+                   OR (table_name = 'AutomationRun' AND column_name = 'queueDepth')
+                ORDER BY table_name, column_name
+            `);
+            expect(added.rows).toEqual([
+                { table_name: 'Automation', column_name: 'runRequestedAt' },
+                { table_name: 'AutomationRun', column_name: 'queueDepth' },
+                { table_name: 'Machine', column_name: 'automationProtocolVersion' },
+            ]);
+
+            await pg.exec(readRunNowSql('rollback.sql'));
+            const remaining = await pg.query<{ column_name: string }>(`
+                SELECT column_name FROM information_schema.columns
+                WHERE column_name IN ('automationProtocolVersion', 'runRequestedAt', 'queueDepth')
+            `);
+            expect(remaining.rows).toEqual([]);
         } finally {
             await pg.close();
         }

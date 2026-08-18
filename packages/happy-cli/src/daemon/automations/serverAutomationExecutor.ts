@@ -248,8 +248,22 @@ function reconcileSchedules(
     byId.set(automation.automationId, {
       automationId: automation.automationId,
       generation: automation.generation,
-      nextRunAt: computeNextRunAt(payload.schedule, Math.max(now, automation.enabledAt)),
+      nextRunAt: automation.runRequestedAt ?? computeNextRunAt(
+        payload.schedule,
+        Math.max(now, automation.enabledAt),
+      ),
       lastSessionId: null,
+      ...(automation.runRequestedAt == null ? {} : { runRequestRevision: automation.revision }),
+    })
+  }
+  for (const automation of cache.automations) {
+    const current = byId.get(automation.automationId)
+    if (!current || automation.runRequestedAt == null
+      || current.runRequestRevision === automation.revision) continue
+    byId.set(automation.automationId, {
+      ...current,
+      nextRunAt: automation.runRequestedAt,
+      runRequestRevision: automation.revision,
     })
   }
   const activeGenerations = new Map(cache.automations.map((automation) => [
@@ -298,6 +312,39 @@ function makeGithubTriggerStatePersister(
   }
 }
 
+function githubQueueDepth(
+  input: ServerAutomationExecutorInput,
+  automation: EncryptedServerAutomation,
+): number {
+  return input.runtimeStore.read().githubTriggers?.find((entry) => (
+    entry.automationId === automation.automationId
+      && entry.generation === automation.generation
+  ))?.state.pending.length ?? 0
+}
+
+function scheduleNextTick(
+  input: ServerAutomationExecutorInput,
+  automationId: string,
+  now: number,
+): void {
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...state,
+    schedules: state.schedules.map((item) => item.automationId === automationId
+      ? { ...item, nextRunAt: now + 1 }
+      : item),
+  })
+}
+
+function schedulePendingGithubEvent(
+  input: ServerAutomationExecutorInput,
+  automation: EncryptedServerAutomation,
+  now: number,
+): void {
+  if (githubQueueDepth(input, automation) === 0) return
+  scheduleNextTick(input, automation.automationId, now)
+}
+
 async function executeStartedRun(
   input: ServerAutomationExecutorInput,
   automation: EncryptedServerAutomation,
@@ -308,6 +355,7 @@ async function executeStartedRun(
   sessionId: string | null
   failureCode?: string
   degradedCode?: string
+  queueDepth?: number
 }> {
   let prompt = payload.prompt
   let environmentVariables: Record<string, string> | undefined
@@ -398,7 +446,9 @@ async function executeStartedRun(
       // later local spawn failure must not enqueue the same root task again.
       persistGithubTriggerState()
       persistGithubTriggerState = null
-      if (!bridged.dispatch) return { outcome: 'SKIPPED_GATE', sessionId: null }
+      if (!bridged.dispatch) return {
+        outcome: 'SKIPPED_GATE', sessionId: null, queueDepth: planned.state.pending.length,
+      }
       agentTaskDispatch = bridged.dispatch
       prompt = buildAgentTaskPrompt(bridged.dispatch, payload.prompt)
       environmentVariables = {
@@ -415,7 +465,7 @@ async function executeStartedRun(
     } else {
       if (!planned.event) {
         persistGithubTriggerState()
-        return { outcome: 'SKIPPED_GATE', sessionId: null }
+        return { outcome: 'SKIPPED_GATE', sessionId: null, queueDepth: planned.state.pending.length }
       }
       const rendered = renderGithubTriggerPrompt(payload.prompt, planned.event.pr, planned.event.event)
       if (payload.githubTrigger.action === 'notify') {
@@ -425,7 +475,7 @@ async function executeStartedRun(
           url: planned.event.pr.url,
         })
         persistGithubTriggerState()
-        return { outcome: 'WOKE', sessionId: null }
+        return { outcome: 'WOKE', sessionId: null, queueDepth: planned.state.pending.length }
       }
       prompt = `${GITHUB_TRIGGER_PROMPT_PREAMBLE}\n\n${rendered}`
       environmentVariables = query.githubEnvironment
@@ -442,7 +492,10 @@ async function executeStartedRun(
     if (!script.ok) return { outcome: 'ERROR', sessionId: null }
     if (!shouldWakeFromScriptOutput(script.stdout)) {
       persistGithubTriggerState?.()
-      return { outcome: 'SKIPPED_GATE', sessionId: null }
+      return {
+        outcome: 'SKIPPED_GATE', sessionId: null,
+        ...(payload.githubTrigger ? { queueDepth: githubQueueDepth(input, automation) } : {}),
+      }
     }
     scriptOutput = script.stdout
   }
@@ -549,6 +602,9 @@ async function executeStartedRun(
         outcome: 'WOKE',
         sessionId: associateSpawnedSession ? spawned.sessionId : null,
         ...(degradedCode ? { degradedCode } : {}),
+        ...(payload.githubTrigger ? {
+          queueDepth: githubQueueDepth(input, automation),
+        } : {}),
       }
     : { outcome: 'ERROR', sessionId: null }
 }
@@ -585,6 +641,17 @@ export async function runServerAutomationTick(
     const schedule = input.runtimeStore.read().schedules.find((item) => item.automationId === automation.automationId)
     if (!schedule || schedule.generation !== automation.generation || schedule.nextRunAt > now) continue
     const payload = payloads.get(automation.automationId)!
+    if (payload.githubTrigger?.action !== 'notify'
+      && schedule.lastSessionId
+      && input.isSessionRunning(schedule.lastSessionId)) {
+      scheduleNextTick(input, automation.automationId, now)
+      continue
+    }
+    if (payload.githubTrigger?.action === 'start-session'
+      && githubSessionStarts >= MAX_GITHUB_SESSION_STARTS_PER_TICK) {
+      scheduleNextTick(input, automation.automationId, now)
+      continue
+    }
     const claim = await input.transport.claim({
       automationId: automation.automationId,
       generation: automation.generation,
@@ -593,6 +660,7 @@ export async function runServerAutomationTick(
     if (!claim.ok || !claim.value) {
       if (claim.error === 'claim-denied' || claim.error === 'already-claimed') {
         advanceSchedule(input, automation.automationId, payload, now)
+        if (payload.githubTrigger) schedulePendingGithubEvent(input, automation, now)
       }
       continue
     }
@@ -613,15 +681,17 @@ export async function runServerAutomationTick(
       sessionId: string | null
       failureCode?: string
       degradedCode?: string
+      queueDepth?: number
     }
     try {
+      const queuedGithubEvents = payload.githubTrigger ? githubQueueDepth(input, automation) : undefined
       if (payload.githubTrigger?.action !== 'notify'
         && schedule.lastSessionId
         && input.isSessionRunning(schedule.lastSessionId)) {
-        result = { outcome: 'SKIPPED_GATE', sessionId: schedule.lastSessionId }
-      } else if (payload.githubTrigger?.action === 'start-session'
-        && githubSessionStarts >= MAX_GITHUB_SESSION_STARTS_PER_TICK) {
-        result = { outcome: 'SKIPPED_GATE', sessionId: null }
+        result = {
+          outcome: 'SKIPPED_GATE', sessionId: schedule.lastSessionId,
+          ...(queuedGithubEvents === undefined ? {} : { queueDepth: queuedGithubEvents }),
+        }
       } else {
         result = await executeStartedRun(input, automation, payload, { runId, claimToken })
       }
@@ -636,6 +706,10 @@ export async function runServerAutomationTick(
       && result.sessionId) githubSessionStarts += 1
 
     if (result.sessionId) advanceSchedule(input, automation.automationId, payload, now, result.sessionId)
+    if (payload.githubTrigger && ((result.queueDepth ?? 0) > 0
+      || (result.outcome === 'SKIPPED_GATE' && result.sessionId !== null))) {
+      scheduleNextTick(input, automation.automationId, now)
+    }
     const report: PendingAutomationReport = {
       runId,
       claimToken,
@@ -646,6 +720,7 @@ export async function runServerAutomationTick(
       detailCiphertext: null,
       failureCode: result.failureCode ?? null,
       degradedCode: result.degradedCode ?? null,
+      queueDepth: result.queueDepth ?? null,
       createdAt: input.now,
     }
     const state = input.runtimeStore.read()

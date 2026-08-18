@@ -18,6 +18,7 @@ export interface EncryptedServerAutomation {
   paused: boolean
   migrationPending?: boolean
   enabledAt: number
+  runRequestedAt?: number | null
 }
 
 export interface ServerAutomationCacheState {
@@ -89,6 +90,9 @@ function parseUpsert(row: Record<string, unknown>): EncryptedServerAutomation {
     paused: row.paused,
     migrationPending: row.migrationPending === true,
     enabledAt: timestamp(row.enabledAt),
+    runRequestedAt: row.runRequestedAt === null || row.runRequestedAt === undefined
+      ? null
+      : timestamp(row.runRequestedAt),
   }
 }
 

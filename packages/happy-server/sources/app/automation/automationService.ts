@@ -1,4 +1,5 @@
 import type { Automation, AutomationRun, Prisma } from '@prisma/client';
+import { AUTOMATION_RUN_NOW_PROTOCOL_VERSION } from '@slopus/happy-wire';
 
 type Tx = Prisma.TransactionClient;
 
@@ -14,6 +15,8 @@ export type AutomationServiceError =
     | 'legacy-target-mismatch'
     | 'migration-pending'
     | 'migration-not-applied'
+    | 'automation-paused'
+    | 'automation-run-unsupported'
     | 'invalid-payload-update'
     | 'revision-conflict';
 
@@ -256,6 +259,62 @@ export async function listAutomationRuns(
     return { ok: true, value: rows };
 }
 
+export async function requestAutomationRun(
+    tx: Tx,
+    actorId: string,
+    projectId: string,
+    automationId: string,
+    expectedRevision: number,
+    now: Date = new Date(),
+): Promise<AutomationServiceResult<Automation>> {
+    const access = await projectAccess(tx, actorId, projectId);
+    if (!access) return { ok: false, error: 'not-found' };
+    if (!access.canEdit) return { ok: false, error: 'forbidden' };
+    const current = await tx.automation.findFirst({
+        where: { id: automationId, projectId, deletedAt: null },
+        include: { targetMachine: { select: { automationProtocolVersion: true } } },
+    });
+    if (!current) return { ok: false, error: 'not-found' };
+    if (current.revision !== expectedRevision) {
+        return { ok: false, error: 'revision-conflict', latest: current };
+    }
+    if (current.paused) return { ok: false, error: 'automation-paused' };
+    if (current.legacyMigrationPending) return { ok: false, error: 'migration-pending' };
+    if (!current.machineAccountId || !current.machineId) return { ok: false, error: 'automation-target-unavailable' };
+    if ((current.targetMachine?.automationProtocolVersion ?? 1) < AUTOMATION_RUN_NOW_PROTOCOL_VERSION) {
+        return { ok: false, error: 'automation-run-unsupported' };
+    }
+    const requestedAt = new Date(Math.max(
+        now.getTime(),
+        (current.runRequestedAt?.getTime() ?? -1) + 1,
+    ));
+
+    const changed = await tx.automation.updateMany({
+        where: {
+            id: automationId,
+            projectId,
+            revision: expectedRevision,
+            paused: false,
+            legacyMigrationPending: false,
+            deletedAt: null,
+        },
+        data: { revision: { increment: 1 }, runRequestedAt: requestedAt },
+    });
+    if (changed.count === 0) {
+        const latest = await tx.automation.findFirst({ where: { id: automationId, projectId, deletedAt: null } });
+        return latest
+            ? { ok: false, error: 'revision-conflict', latest }
+            : { ok: false, error: 'not-found' };
+    }
+    const updated = await tx.automation.findUnique({ where: { id: automationId } });
+    if (!updated) return { ok: false, error: 'not-found' };
+    await appendChange(tx, updated, {
+        machineAccountId: current.machineAccountId,
+        machineId: current.machineId,
+    }, 'UPSERT');
+    return { ok: true, value: updated };
+}
+
 export async function createAutomation(
     tx: Tx,
     actorId: string,
@@ -428,6 +487,7 @@ export async function updateAutomation(
     const data: Prisma.AutomationUncheckedUpdateManyInput = {
         revision: { increment: 1 },
         generation: { increment: 1 },
+        runRequestedAt: null,
         ...(input.paused !== undefined ? { paused: input.paused } : {}),
         ...(target && completePayloadUpdate(input) ? {
             machineAccountId: target.machineAccountId,

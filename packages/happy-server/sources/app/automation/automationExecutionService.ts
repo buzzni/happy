@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Prisma, type AutomationRunOutcome, type Prisma as PrismaTypes } from '@prisma/client';
 
 type Tx = PrismaTypes.TransactionClient;
@@ -9,6 +9,7 @@ export type AutomationExecutionError =
     | 'sync-failed'
     | 'claim-denied'
     | 'already-claimed'
+    | 'active-run'
     | 'claim-not-found'
     | 'claim-cancelled'
     | 'claim-expired'
@@ -25,19 +26,34 @@ export async function registerAutomationMachineKey(
     tx: Tx,
     accountId: string,
     machineId: string,
-    input: { expectedKeyVersion: number; publicKey: Binary },
+    input: { expectedKeyVersion: number; publicKey: Binary; protocolVersion: number },
 ): Promise<Result<{ keyVersion: number }>> {
     const current = await tx.machine.findFirst({
         where: { id: machineId, accountId },
-        select: { automationPublicKey: true, automationKeyVersion: true },
+        select: {
+            automationPublicKey: true,
+            automationKeyVersion: true,
+            automationProtocolVersion: true,
+        },
     });
     if (current?.automationPublicKey
         && Buffer.from(current.automationPublicKey).equals(Buffer.from(input.publicKey))) {
+        if (current.automationProtocolVersion !== input.protocolVersion) {
+            const changed = await tx.machine.updateMany({
+                where: { id: machineId, accountId, automationKeyVersion: current.automationKeyVersion },
+                data: { automationProtocolVersion: input.protocolVersion },
+            });
+            if (changed.count === 0) return { ok: false, error: 'key-version-conflict' };
+        }
         return { ok: true, value: { keyVersion: current.automationKeyVersion } };
     }
     const changed = await tx.machine.updateMany({
         where: { id: machineId, accountId, automationKeyVersion: input.expectedKeyVersion },
-        data: { automationPublicKey: input.publicKey, automationKeyVersion: { increment: 1 } },
+        data: {
+            automationPublicKey: input.publicKey,
+            automationKeyVersion: { increment: 1 },
+            automationProtocolVersion: input.protocolVersion,
+        },
     });
     if (changed.count === 0) return { ok: false, error: 'key-version-conflict' };
     return { ok: true, value: { keyVersion: input.expectedKeyVersion + 1 } };
@@ -87,6 +103,7 @@ export async function syncAutomations(
             paused: automation.paused,
             migrationPending: automation.legacyMigrationPending,
             enabledAt: automation.enabledAt,
+            runRequestedAt: automation.runRequestedAt,
         });
     }
     return {
@@ -142,9 +159,6 @@ export async function claimAutomationRun(
     input: { automationId: string; generation: number; scheduledFor: Date },
     now: Date = new Date(),
 ): Promise<Result<{ runId: string; claimToken: string; claimExpiresAt: Date; serverTime: Date }>> {
-    if (input.scheduledFor.getTime() < now.getTime() - 90_000 || input.scheduledFor.getTime() > now.getTime() + 15_000) {
-        return { ok: false, error: 'claim-denied' };
-    }
     const automation = await tx.automation.findFirst({
         where: { id: input.automationId, machineAccountId: accountId, machineId, deletedAt: null },
         include: {
@@ -152,6 +166,10 @@ export async function claimAutomationRun(
             targetMachine: { select: { automationKeyVersion: true } },
         },
     });
+    const inClaimWindow = input.scheduledFor.getTime() >= now.getTime() - 90_000
+        && input.scheduledFor.getTime() <= now.getTime() + 15_000;
+    const durableRunNowRequest = automation?.runRequestedAt?.getTime() === input.scheduledFor.getTime();
+    if (!inClaimWindow && !durableRunNowRequest) return { ok: false, error: 'claim-denied' };
     if (!automation || !executable(automation, accountId, machineId, input.generation)
         || input.scheduledFor < automation.enabledAt) {
         return { ok: false, error: 'claim-denied' };
@@ -168,26 +186,35 @@ export async function claimAutomationRun(
 
     const claimToken = randomBytes(32).toString('base64url');
     const claimExpiresAt = new Date(now.getTime() + 2 * 60_000);
-    try {
-        const run = await tx.automationRun.create({
-            data: {
+    const runId = randomUUID();
+    const created = await tx.automationRun.createMany({
+        data: [{
+            id: runId,
+            automationId: automation.id,
+            generation: input.generation,
+            scheduledFor: input.scheduledFor,
+            machineAccountId: accountId,
+            machineId,
+            status: 'CLAIMED',
+            claimTokenHash: tokenHash(claimToken),
+            claimExpiresAt,
+        }],
+        skipDuplicates: true,
+    });
+    if (created.count === 0) {
+        const sameSlot = await tx.automationRun.findFirst({
+            where: {
                 automationId: automation.id,
                 generation: input.generation,
                 scheduledFor: input.scheduledFor,
-                machineAccountId: accountId,
-                machineId,
-                status: 'CLAIMED',
-                claimTokenHash: tokenHash(claimToken),
-                claimExpiresAt,
             },
+            select: { id: true },
         });
-        return { ok: true, value: { runId: run.id, claimToken, claimExpiresAt, serverTime: now } };
-    } catch (error) {
-        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
-            return { ok: false, error: 'already-claimed' };
-        }
-        throw error;
+        return sameSlot
+            ? { ok: false, error: 'already-claimed' }
+            : { ok: false, error: 'active-run' };
     }
+    return { ok: true, value: { runId, claimToken, claimExpiresAt, serverTime: now } };
 }
 
 async function claimedRun(tx: Tx, accountId: string, machineId: string, runId: string, claimToken: string) {
@@ -315,6 +342,7 @@ export async function reportAutomationRun(
         detailCiphertext: Binary | null;
         failureCode: string | null;
         degradedCode?: string | null;
+        queueDepth?: number | null;
     },
     now: Date = new Date(),
 ): Promise<Result<{ idempotent: boolean; status: string; outcome: AutomationRunOutcome | null }>> {
@@ -335,10 +363,12 @@ export async function reportAutomationRun(
         return { ok: false, error: 'report-conflict' };
     }
     const degradedCode = input.degradedCode ?? null;
+    const queueDepth = input.queueDepth ?? null;
     if (input.outcome !== 'WOKE' && degradedCode !== null) {
         return { ok: false, error: 'report-conflict' };
     }
-    if ((input.outcome === 'WOKE' || input.outcome === 'SILENT') && !input.sessionId) {
+    const notifyOnlyGithubRun = input.outcome === 'WOKE' && queueDepth !== null;
+    if ((input.outcome === 'WOKE' || input.outcome === 'SILENT') && !input.sessionId && !notifyOnlyGithubRun) {
         return { ok: false, error: 'report-conflict' };
     }
     if (input.sessionId) {
@@ -360,6 +390,7 @@ export async function reportAutomationRun(
                 detailCiphertext: input.detailCiphertext,
                 failureCode: input.failureCode,
                 degradedCode,
+                queueDepth,
                 completedAt: now,
                 lateReport: run.status === 'ABANDONED'
                     || (run.runLeaseExpiresAt !== null && run.runLeaseExpiresAt < now),

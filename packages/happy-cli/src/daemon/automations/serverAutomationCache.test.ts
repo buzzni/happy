@@ -56,11 +56,13 @@ describe('serverAutomationCache', () => {
       changes: [{
         seq: '9', automationId: 'automation-1', revision: 2, generation: 3, kind: 'UPSERT',
         payloadVersion: 1, ...encrypted, machineKeyVersion: 4, paused: false, enabledAt: 500,
+        runRequestedAt: 900,
       }],
     })
 
     expect(applied).toEqual({ nextSeq: 9n, acknowledgements: [{ automationId: 'automation-1', revision: 2 }] })
     expect(cache.read().automations).toHaveLength(1)
+    expect(cache.read().automations[0]).toMatchObject({ revision: 2, runRequestedAt: 900 })
     const raw = readFileSync(file, 'utf8')
     expect(raw).not.toContain('secret name')
     expect(raw).not.toContain('secret prompt')
