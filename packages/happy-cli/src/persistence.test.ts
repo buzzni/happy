@@ -214,6 +214,8 @@ describe('daemon state compare-and-set', () => {
         expect(state).toBeNull();
         expect(writeDaemonStateIfUnchanged(raw, daemonState(222))).toBe(true);
         expect((await readDaemonStateSnapshot()).state?.pid).toBe(222);
+    });
+});
 
 // aplus §6-1 Phase 3b (aplus-dev-studio specs/20260818-e2ee-account-keypair) —
 // access.key 에 secret(legacy, 활성) + encryption(provisioned dataKey 재료)이
