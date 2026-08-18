@@ -27,6 +27,8 @@ describe('scrubSessionLineageEnv', () => {
             HAPPY_INITIAL_MODEL: 'stale-model',
             HAPPY_INITIAL_EFFORT: 'stale-effort',
             HAPPY_AUTOMATION_RUN_ONCE: '1',
+            APLUS_SESSION_URL: 'https://saycode.ai/session/parent-session',
+            APLUS_SESSION_ID: 'parent-session',
         }
         const scrubbed = scrubSessionLineageEnv(env)
         expect(scrubbed).toEqual({
@@ -49,5 +51,8 @@ describe('scrubSessionLineageEnv', () => {
         // HAPPY_INITIAL_ covers PROMPT(_LOCAL_ID) and the MODEL/EFFORT seeds.
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_INITIAL_')
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_AUTOMATION_')
+        // APLUS_SESSION_* is first-set-wins (sessionUrlEnv.ts): without the
+        // scrub, a nested child session would keep the parent's session URL.
+        expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('APLUS_SESSION_')
     })
 })
