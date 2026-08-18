@@ -29,20 +29,31 @@ describe('serverAutomationRuntimeStore', () => {
             labels: [{ name: 'ready' }], changedFiles: 1, files: [{ path: 'apps/web/page.tsx' }],
           }],
           highestPrNumber: 10,
+          highestIssueNumber: 12,
           processed: ['9:opened'],
           pending: [],
+          pendingIssues: [{
+            id: '12:issue_opened', event: 'issue_opened',
+            issue: {
+              number: 12, title: 'Broken search', url: 'https://github.test/o/r/issues/12',
+              author: { login: 'alice' }, labels: [{ name: 'bug' }],
+            },
+          }],
         },
       }],
       pendingReports: [{
         runId: 'run-1', claimToken: 'claim-token', reportId: 'report-1', status: 'COMPLETED',
         outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,
-        degradedCode: 'GRANT_MISSING',
+        degradedCode: 'GRANT_MISSING', queueDepth: 2, queuePosition: 1, queueTotal: 3,
+        queueEstimatedAt: 123,
       }],
     })
 
     const restarted = createServerAutomationRuntimeStore({ filePath: file })
     expect(restarted.read()).toEqual({
       schedules: [{ automationId: 'automation-1', generation: 2, nextRunAt: 100, lastSessionId: null }],
+      githubActiveSessions: [],
+      githubQueueProgress: [],
       githubTriggers: [{
         automationId: 'automation-2',
         generation: 3,
@@ -53,14 +64,23 @@ describe('serverAutomationRuntimeStore', () => {
             labels: [{ name: 'ready' }], changedFiles: 1, files: [{ path: 'apps/web/page.tsx' }],
           }],
           highestPrNumber: 10,
+          highestIssueNumber: 12,
           processed: ['9:opened'],
           pending: [],
+          pendingIssues: [{
+            id: '12:issue_opened', event: 'issue_opened',
+            issue: {
+              number: 12, title: 'Broken search', url: 'https://github.test/o/r/issues/12',
+              author: { login: 'alice' }, labels: [{ name: 'bug' }],
+            },
+          }],
         },
       }],
       pendingReports: [{
         runId: 'run-1', claimToken: 'claim-token', reportId: 'report-1', status: 'COMPLETED',
         outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,
-        degradedCode: 'GRANT_MISSING',
+        degradedCode: 'GRANT_MISSING', queueDepth: 2, queuePosition: 1, queueTotal: 3,
+        queueEstimatedAt: 123,
       }],
     })
     expect(readdirSync(dir)).toEqual(['server-automation-runtime.v1.json'])

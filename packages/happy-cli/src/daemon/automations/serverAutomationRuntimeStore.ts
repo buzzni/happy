@@ -2,8 +2,10 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'n
 import path from 'node:path'
 
 import type {
+  GithubIssueSnapshot,
   GithubPullRequestSnapshot,
   GithubTriggerEventMatch,
+  GithubTriggerIssueEventMatch,
   GithubTriggerRuntimeState,
 } from './githubTriggerDomain'
 
@@ -28,6 +30,9 @@ export interface PendingAutomationReport {
   failureCode?: string | null
   degradedCode?: string | null
   queueDepth?: number | null
+  queuePosition?: number | null
+  queueTotal?: number | null
+  queueEstimatedAt?: number | null
   /** When this report was first queued. Absent on entries persisted before this field existed. */
   createdAt?: number
 }
@@ -38,6 +43,17 @@ export interface ServerAutomationRuntimeState {
     automationId: string
     generation: number
     state: GithubTriggerRuntimeState
+  }>
+  githubActiveSessions?: Array<{
+    automationId: string
+    generation: number
+    sessionIds: string[]
+  }>
+  githubQueueProgress?: Array<{
+    automationId: string
+    generation: number
+    total: number
+    completed: number
   }>
   pendingReports: PendingAutomationReport[]
 }
@@ -100,6 +116,29 @@ function parseGithubEvent(value: unknown): GithubTriggerEventMatch {
   }
 }
 
+function parseIssue(value: unknown): GithubIssueSnapshot {
+  const row = record(value)
+  const author = row.author === null ? null : record(row.author)
+  if (!Array.isArray(row.labels)) invalid()
+  return {
+    number: integer(row.number, 1),
+    title: text(row.title, 10_000),
+    url: text(row.url, 2_000),
+    author: author === null ? null : { login: text(author.login, 200) },
+    labels: row.labels.map((label) => ({ name: text(record(label).name, 200) })),
+  }
+}
+
+function parseGithubIssueEvent(value: unknown): GithubTriggerIssueEventMatch {
+  const row = record(value)
+  if (row.event !== 'issue_opened') invalid()
+  return {
+    id: text(row.id, 256),
+    event: 'issue_opened',
+    issue: parseIssue(row.issue),
+  }
+}
+
 function parseGithubState(value: unknown): GithubTriggerRuntimeState {
   const row = record(value)
   if (!Array.isArray(row.snapshot) || !Array.isArray(row.processed) || !Array.isArray(row.pending)) invalid()
@@ -108,6 +147,14 @@ function parseGithubState(value: unknown): GithubTriggerRuntimeState {
     highestPrNumber: integer(row.highestPrNumber),
     processed: row.processed.map((value) => text(value, 256)),
     pending: row.pending.map(parseGithubEvent),
+    ...(row.highestIssueNumber === undefined ? {} : {
+      highestIssueNumber: integer(row.highestIssueNumber),
+    }),
+    ...(row.pendingIssues === undefined ? {} : {
+      pendingIssues: Array.isArray(row.pendingIssues)
+        ? row.pendingIssues.map(parseGithubIssueEvent)
+        : invalid(),
+    }),
   }
 }
 
@@ -147,6 +194,15 @@ function parse(raw: string): ServerAutomationRuntimeState {
         ...(row.queueDepth !== undefined ? {
           queueDepth: row.queueDepth === null ? null : integer(row.queueDepth),
         } : {}),
+        ...(row.queuePosition !== undefined ? {
+          queuePosition: row.queuePosition === null ? null : integer(row.queuePosition),
+        } : {}),
+        ...(row.queueTotal !== undefined ? {
+          queueTotal: row.queueTotal === null ? null : integer(row.queueTotal),
+        } : {}),
+        ...(row.queueEstimatedAt !== undefined ? {
+          queueEstimatedAt: row.queueEstimatedAt === null ? null : integer(row.queueEstimatedAt),
+        } : {}),
       }
     })
     const githubRows = disk.githubTriggers === undefined ? [] : disk.githubTriggers
@@ -159,7 +215,32 @@ function parse(raw: string): ServerAutomationRuntimeState {
         state: parseGithubState(row.state),
       }
     })
-    return { schedules, githubTriggers, pendingReports }
+    const activeRows = disk.githubActiveSessions === undefined ? [] : disk.githubActiveSessions
+    if (!Array.isArray(activeRows)) invalid()
+    const githubActiveSessions = activeRows.map((value) => {
+      const row = record(value)
+      if (!Array.isArray(row.sessionIds)) invalid()
+      return {
+        automationId: text(row.automationId, 200),
+        generation: integer(row.generation, 1),
+        sessionIds: row.sessionIds.map((value) => text(value, 200)),
+      }
+    })
+    const progressRows = disk.githubQueueProgress === undefined ? [] : disk.githubQueueProgress
+    if (!Array.isArray(progressRows)) invalid()
+    const githubQueueProgress = progressRows.map((value) => {
+      const row = record(value)
+      const total = integer(row.total)
+      const completed = integer(row.completed)
+      if (completed > total) invalid()
+      return {
+        automationId: text(row.automationId, 200),
+        generation: integer(row.generation, 1),
+        total,
+        completed,
+      }
+    })
+    return { schedules, githubTriggers, githubActiveSessions, githubQueueProgress, pendingReports }
   } catch (error) {
     if (error instanceof Error && error.message === 'automation-runtime-invalid') throw error
     invalid()
@@ -175,7 +256,9 @@ export function createServerAutomationRuntimeStore(options: { filePath: string }
         return state
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-          return { schedules: [], githubTriggers: [], pendingReports: [] }
+          return {
+            schedules: [], githubTriggers: [], githubActiveSessions: [], githubQueueProgress: [], pendingReports: [],
+          }
         }
         throw error
       }

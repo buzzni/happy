@@ -49,6 +49,20 @@ describe('planGithubTrigger', () => {
     expect(repeated.state.processed).toContain('10:opened')
   })
 
+  it('polls matching events into pending without consuming them', () => {
+    const baseline = planGithubTrigger({ trigger, current: [], previous: null }).state
+    const polled = planGithubTrigger({
+      trigger,
+      current: [pr(), pr({ number: 11 })],
+      previous: baseline,
+      consume: false,
+    })
+
+    expect(polled.event).toBeNull()
+    expect(polled.state.pending.map((event) => event.id)).toEqual(['10:opened', '11:opened'])
+    expect(polled.state.processed).toEqual([])
+  })
+
   it('matches authors case-insensitively and paths only on segment boundaries', () => {
     const baseline = planGithubTrigger({ trigger, current: [], previous: null }).state
 

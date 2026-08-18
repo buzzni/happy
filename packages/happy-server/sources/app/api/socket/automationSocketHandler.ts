@@ -143,6 +143,15 @@ export function automationSocketHandler(accountId: string, machineId: string, so
             queueDepth: data?.queueDepth === null || data?.queueDepth === undefined
                 ? null
                 : integer(data.queueDepth, 0, 10_000),
+            queuePosition: data?.queuePosition === null || data?.queuePosition === undefined
+                ? null
+                : integer(data.queuePosition, 0, 10_000),
+            queueTotal: data?.queueTotal === null || data?.queueTotal === undefined
+                ? null
+                : integer(data.queueTotal, 0, 10_000),
+            queueEstimatedAt: data?.queueEstimatedAt === null || data?.queueEstimatedAt === undefined
+                ? null
+                : new Date(integer(data.queueEstimatedAt, 0, Number.MAX_SAFE_INTEGER)),
         }));
     }, () => emitAutomationUpdate(accountId, {
             projectId: null,

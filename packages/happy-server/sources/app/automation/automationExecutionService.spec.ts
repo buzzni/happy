@@ -348,14 +348,30 @@ describe('automationExecutionService', () => {
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
             outcome: 'WOKE', sessionId: null, detailCiphertext: null, failureCode: null,
-            queueDepth: 2,
+            queueDepth: 2, queuePosition: 1, queueTotal: 3,
+            queueEstimatedAt: new Date(now.getTime() + 1_000),
         }, now)).resolves.toEqual({
             ok: true,
             value: expect.objectContaining({ idempotent: false }),
         });
         expect(tx.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
-            data: expect.objectContaining({ queueDepth: 2 }),
+            data: expect.objectContaining({
+                queueDepth: 2, queuePosition: 1, queueTotal: 3,
+                queueEstimatedAt: new Date(now.getTime() + 1_000),
+            }),
         }));
+    });
+
+    it('rejects inconsistent GitHub queue progress', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
+
+        await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
+            outcome: 'SKIPPED_GATE', sessionId: null, detailCiphertext: null, failureCode: null,
+            queueDepth: 2, queuePosition: 4, queueTotal: 3, queueEstimatedAt: null,
+        }, now)).resolves.toEqual({ ok: false, error: 'report-conflict' });
+        expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
     });
 
     it('maps a cross-run report id uniqueness conflict to report-conflict', async () => {

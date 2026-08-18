@@ -99,7 +99,8 @@ describe('automationRoutes', () => {
                 id: 'run-1', automationId: 'automation-1', generation: 1,
                 scheduledFor: new Date(1), machineId: 'machine-1', status: 'COMPLETED',
                 sessionId: 'session-1', outcome: 'WOKE', detailCiphertext: null,
-                failureCode: null, degradedCode: 'GRANT_MISSING', claimedAt: new Date(2),
+                failureCode: null, degradedCode: 'GRANT_MISSING', queueDepth: 2,
+                queuePosition: 1, queueTotal: 3, queueEstimatedAt: new Date(5), claimedAt: new Date(2),
                 startedAt: new Date(3), completedAt: new Date(4), lateReport: false,
             }],
         });
@@ -111,7 +112,10 @@ describe('automationRoutes', () => {
         });
 
         expect(response.statusCode).toBe(200);
-        expect(response.json().runs[0]).toMatchObject({ degradedCode: 'GRANT_MISSING' });
+        expect(response.json().runs[0]).toMatchObject({
+            degradedCode: 'GRANT_MISSING', queueDepth: 2, queuePosition: 1, queueTotal: 3,
+            queueEstimatedAt: 5,
+        });
     });
 
     it('decodes encrypted create fields and derives actor/project outside the body', async () => {

@@ -128,7 +128,8 @@ export interface ServerAutomationExecutorInput {
 
 const SCRIPT_TIMEOUT_MS = 60_000
 const HEARTBEAT_MS = 60_000
-const MAX_GITHUB_SESSION_STARTS_PER_TICK = 3
+const EXPECTED_NEXT_DAEMON_TICK_MS = 60_000
+const MAX_GITHUB_EVENTS_PER_TICK = 3
 const PR_REVIEW_SANDBOX_CONFIG = JSON.stringify({
   enabled: true,
   sessionIsolation: 'custom',
@@ -274,7 +275,17 @@ function reconcileSchedules(
     activeGenerations.get(entry.automationId) === entry.generation
       && payloads.get(entry.automationId)?.githubTrigger !== undefined
   ))
-  return { ...state, schedules: [...byId.values()], githubTriggers }
+  // A worker from an older automation generation can still be running after
+  // the trigger is edited. Keep those rows until isSessionRunning confirms
+  // that they ended so the global worker limit remains accurate.
+  const githubActiveSessions = state.githubActiveSessions ?? []
+  const githubQueueProgress = (state.githubQueueProgress ?? []).filter((entry) => (
+    activeGenerations.get(entry.automationId) === entry.generation
+      && payloads.get(entry.automationId)?.githubTrigger !== undefined
+  ))
+  return {
+    ...state, schedules: [...byId.values()], githubTriggers, githubActiveSessions, githubQueueProgress,
+  }
 }
 
 function advanceSchedule(
@@ -316,22 +327,24 @@ function githubQueueDepth(
   input: ServerAutomationExecutorInput,
   automation: EncryptedServerAutomation,
 ): number {
-  return input.runtimeStore.read().githubTriggers?.find((entry) => (
+  const state = input.runtimeStore.read().githubTriggers?.find((entry) => (
     entry.automationId === automation.automationId
       && entry.generation === automation.generation
-  ))?.state.pending.length ?? 0
+  ))?.state
+  return (state?.pending.length ?? 0) + (state?.pendingIssues?.length ?? 0)
 }
 
 function scheduleNextTick(
   input: ServerAutomationExecutorInput,
   automationId: string,
   now: number,
+  sequence = 1,
 ): void {
   const state = input.runtimeStore.read()
   input.runtimeStore.write({
     ...state,
     schedules: state.schedules.map((item) => item.automationId === automationId
-      ? { ...item, nextRunAt: now + 1 }
+      ? { ...item, nextRunAt: now + sequence }
       : item),
   })
 }
@@ -345,11 +358,113 @@ function schedulePendingGithubEvent(
   scheduleNextTick(input, automation.automationId, now)
 }
 
+function activeGithubSessions(
+  input: ServerAutomationExecutorInput,
+  automation: EncryptedServerAutomation,
+): string[] {
+  const state = input.runtimeStore.read()
+  const current = (state.githubActiveSessions ?? []).find((entry) => (
+    entry.automationId === automation.automationId && entry.generation === automation.generation
+  ))?.sessionIds ?? []
+  const legacySessionId = state.schedules.find((entry) => (
+    entry.automationId === automation.automationId && entry.generation === automation.generation
+  ))?.lastSessionId
+  const candidates = [...new Set([
+    ...current,
+    ...(legacySessionId ? [legacySessionId] : []),
+  ])]
+  const active = candidates.filter((sessionId) => input.isSessionRunning(sessionId))
+  if (active.length !== current.length || active.some((sessionId) => !current.includes(sessionId))) {
+    input.runtimeStore.write({
+      ...state,
+      githubActiveSessions: [
+        ...(state.githubActiveSessions ?? []).filter((entry) => (
+          entry.automationId !== automation.automationId || entry.generation !== automation.generation
+        )),
+        ...(active.length === 0 ? [] : [{
+          automationId: automation.automationId,
+          generation: automation.generation,
+          sessionIds: active,
+        }]),
+      ],
+    })
+  }
+  return active
+}
+
+function activeGithubSessionsAcrossGenerations(
+  input: ServerAutomationExecutorInput,
+): string[] {
+  const state = input.runtimeStore.read()
+  const current = state.githubActiveSessions ?? []
+  const activeRows = current.flatMap((entry) => {
+    const sessionIds = entry.sessionIds.filter((sessionId) => input.isSessionRunning(sessionId))
+    return sessionIds.length === 0 ? [] : [{ ...entry, sessionIds }]
+  })
+  if (JSON.stringify(activeRows) !== JSON.stringify(current)) {
+    input.runtimeStore.write({ ...state, githubActiveSessions: activeRows })
+  }
+  return [...new Set(activeRows.flatMap((entry) => entry.sessionIds))]
+}
+
+function rememberGithubSession(
+  input: ServerAutomationExecutorInput,
+  automation: EncryptedServerAutomation,
+  sessionId: string,
+): void {
+  const active = activeGithubSessions(input, automation)
+  const latest = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...latest,
+    githubActiveSessions: [
+      ...(latest.githubActiveSessions ?? []).filter((entry) => (
+        entry.automationId !== automation.automationId || entry.generation !== automation.generation
+      )),
+      {
+        automationId: automation.automationId,
+        generation: automation.generation,
+        sessionIds: [...new Set([...active, sessionId])],
+      },
+    ],
+  })
+}
+
+function updateGithubQueueProgress(
+  input: ServerAutomationExecutorInput,
+  automation: EncryptedServerAutomation,
+  mode: 'poll' | 'work',
+  queuedBefore: number,
+  queueDepth: number,
+): { position: number; total: number } {
+  const state = input.runtimeStore.read()
+  const existing = (state.githubQueueProgress ?? []).find((entry) => (
+    entry.automationId === automation.automationId && entry.generation === automation.generation
+  ))
+  const total = mode === 'poll' ? queueDepth : existing?.total ?? queuedBefore
+  const completed = mode === 'poll'
+    ? 0
+    : Math.min(total, (existing?.completed ?? 0) + Math.max(0, queuedBefore - queueDepth))
+  input.runtimeStore.write({
+    ...state,
+    githubQueueProgress: [
+      ...(state.githubQueueProgress ?? []).filter((entry) => entry.automationId !== automation.automationId),
+      ...(queueDepth === 0 ? [] : [{
+        automationId: automation.automationId,
+        generation: automation.generation,
+        total,
+        completed,
+      }]),
+    ],
+  })
+  return { position: completed, total }
+}
+
 async function executeStartedRun(
   input: ServerAutomationExecutorInput,
   automation: EncryptedServerAutomation,
   payload: ServerAutomationPayload,
   run: { runId: string; claimToken: string },
+  githubMode: 'poll' | 'work' = 'work',
 ): Promise<{
   outcome: ServerAutomationReportOutcome
   sessionId: string | null
@@ -384,13 +499,24 @@ async function executeStartedRun(
     ))?.state ?? null
     const planned = planGithubIssueTrigger({
       trigger: payload.githubTrigger,
-      current: query.issues,
+      current: githubMode === 'work' && previous ? [] : query.issues,
       previous,
+      consume: githubMode === 'work',
     })
     persistGithubTriggerState = makeGithubTriggerStatePersister(input, automation, planned.state)
+    if (githubMode === 'poll') {
+      persistGithubTriggerState()
+      return {
+        outcome: 'SKIPPED_GATE', sessionId: null,
+        queueDepth: planned.state.pendingIssues?.length ?? 0,
+      }
+    }
     if (!planned.event) {
       persistGithubTriggerState()
-      return { outcome: 'SKIPPED_GATE', sessionId: null }
+      return {
+        outcome: 'SKIPPED_GATE', sessionId: null,
+        queueDepth: planned.state.pendingIssues?.length ?? 0,
+      }
     }
     const rendered = renderGithubIssueTriggerPrompt(payload.prompt, planned.event.issue, planned.event.event)
     if (payload.githubTrigger.action === 'notify') {
@@ -400,7 +526,10 @@ async function executeStartedRun(
         url: planned.event.issue.url,
       })
       persistGithubTriggerState()
-      return { outcome: 'WOKE', sessionId: null }
+      return {
+        outcome: 'WOKE', sessionId: null,
+        queueDepth: planned.state.pendingIssues?.length ?? 0,
+      }
     }
     prompt = `${GITHUB_ISSUE_TRIGGER_PROMPT_PREAMBLE}\n\n${rendered}`
     environmentVariables = query.githubEnvironment
@@ -421,10 +550,16 @@ async function executeStartedRun(
     ))?.state ?? null
     const planned = planGithubTrigger({
       trigger: payload.githubTrigger,
-      current: query.pullRequests,
+      current: githubMode === 'work' && previous ? previous.snapshot : query.pullRequests,
       previous,
+      consume: githubMode === 'work',
     })
     persistGithubTriggerState = makeGithubTriggerStatePersister(input, automation, planned.state)
+    if (githubMode === 'poll'
+      && (payload.githubTrigger.action !== 'agent-task-review' || planned.state.pending.length > 0)) {
+      persistGithubTriggerState()
+      return { outcome: 'SKIPPED_GATE', sessionId: null, queueDepth: planned.state.pending.length }
+    }
     if (payload.githubTrigger.action === 'agent-task-review') {
       const credentialId = payload.githubTrigger.githubCredentialId
       if (!credentialId) return { outcome: 'ERROR', sessionId: null }
@@ -635,20 +770,38 @@ export async function runServerAutomationTick(
   }
 
   const outcomes: Array<{ automationId: string; outcome: ServerAutomationReportOutcome }> = []
-  let githubSessionStarts = 0
+  let githubEventsProcessed = 0
   for (const automation of decryptableAutomations) {
+    if (payloads.get(automation.automationId)?.githubTrigger?.action === 'notify') continue
+    activeGithubSessions(input, automation)
+  }
+  const activeGithubWorkerSessions = new Set(activeGithubSessionsAcrossGenerations(input))
+  const workQueue = [...decryptableAutomations]
+  const immediateWorkerIds = new Set<string>()
+  while (workQueue.length > 0) {
+    const automation = workQueue.shift()!
     if (automation.paused || automation.migrationPending === true) continue
     const schedule = input.runtimeStore.read().schedules.find((item) => item.automationId === automation.automationId)
-    if (!schedule || schedule.generation !== automation.generation || schedule.nextRunAt > now) continue
+    const immediateWorker = immediateWorkerIds.delete(automation.automationId)
+    if (!schedule || schedule.generation !== automation.generation
+      || (schedule.nextRunAt > now && !immediateWorker)) continue
     const payload = payloads.get(automation.automationId)!
-    if (payload.githubTrigger?.action !== 'notify'
+    const queuedGithubEvents = payload.githubTrigger ? githubQueueDepth(input, automation) : 0
+    const githubMode = payload.githubTrigger && queuedGithubEvents === 0 ? 'poll' : 'work'
+    if (!payload.githubTrigger
       && schedule.lastSessionId
       && input.isSessionRunning(schedule.lastSessionId)) {
       scheduleNextTick(input, automation.automationId, now)
       continue
     }
-    if (payload.githubTrigger?.action === 'start-session'
-      && githubSessionStarts >= MAX_GITHUB_SESSION_STARTS_PER_TICK) {
+    if (payload.githubTrigger && githubMode === 'work'
+      && githubEventsProcessed >= MAX_GITHUB_EVENTS_PER_TICK) {
+      scheduleNextTick(input, automation.automationId, now)
+      continue
+    }
+    if (payload.githubTrigger && githubMode === 'work'
+      && payload.githubTrigger.action !== 'notify'
+      && activeGithubWorkerSessions.size >= MAX_GITHUB_EVENTS_PER_TICK) {
       scheduleNextTick(input, automation.automationId, now)
       continue
     }
@@ -685,7 +838,7 @@ export async function runServerAutomationTick(
     }
     try {
       const queuedGithubEvents = payload.githubTrigger ? githubQueueDepth(input, automation) : undefined
-      if (payload.githubTrigger?.action !== 'notify'
+      if (!payload.githubTrigger
         && schedule.lastSessionId
         && input.isSessionRunning(schedule.lastSessionId)) {
         result = {
@@ -693,7 +846,7 @@ export async function runServerAutomationTick(
           ...(queuedGithubEvents === undefined ? {} : { queueDepth: queuedGithubEvents }),
         }
       } else {
-        result = await executeStartedRun(input, automation, payload, { runId, claimToken })
+        result = await executeStartedRun(input, automation, payload, { runId, claimToken }, githubMode)
       }
     } catch (error) {
       input.logDebug?.(`[server-automation] ${automation.automationId} failed: ${error}`)
@@ -701,14 +854,33 @@ export async function runServerAutomationTick(
     } finally {
       clearInterval(heartbeat)
     }
-    if (payload.githubTrigger?.action === 'start-session'
-      && result.outcome === 'WOKE'
-      && result.sessionId) githubSessionStarts += 1
+    if (payload.githubTrigger && result.queueDepth === undefined) {
+      result.queueDepth = githubQueueDepth(input, automation)
+    }
+    if (payload.githubTrigger && githubMode === 'work') githubEventsProcessed += 1
 
-    if (result.sessionId) advanceSchedule(input, automation.automationId, payload, now, result.sessionId)
+    let queuePosition: number | null = null
+    let queueTotal: number | null = null
+    let queueEstimatedAt: number | null = null
+    if (payload.githubTrigger) {
+      const progress = updateGithubQueueProgress(
+        input, automation, githubMode, queuedGithubEvents, result.queueDepth ?? 0,
+      )
+      queueTotal = progress.total
+      queuePosition = progress.position
+      if ((result.queueDepth ?? 0) > 0) queueEstimatedAt = now + EXPECTED_NEXT_DAEMON_TICK_MS
+    }
+
+    if (result.sessionId) {
+      if (payload.githubTrigger) {
+        rememberGithubSession(input, automation, result.sessionId)
+        activeGithubWorkerSessions.add(result.sessionId)
+      }
+      advanceSchedule(input, automation.automationId, payload, now, result.sessionId)
+    }
     if (payload.githubTrigger && ((result.queueDepth ?? 0) > 0
       || (result.outcome === 'SKIPPED_GATE' && result.sessionId !== null))) {
-      scheduleNextTick(input, automation.automationId, now)
+      scheduleNextTick(input, automation.automationId, now, githubEventsProcessed + 1)
     }
     const report: PendingAutomationReport = {
       runId,
@@ -721,6 +893,9 @@ export async function runServerAutomationTick(
       failureCode: result.failureCode ?? null,
       degradedCode: result.degradedCode ?? null,
       queueDepth: result.queueDepth ?? null,
+      queuePosition,
+      queueTotal,
+      queueEstimatedAt,
       createdAt: input.now,
     }
     const state = input.runtimeStore.read()
@@ -734,7 +909,14 @@ export async function runServerAutomationTick(
       logLinkOutcome(input, linked, stillRetrying)
       if (!stillRetrying) writeWithoutReport(input.runtimeStore, report.reportId)
     }
-    outcomes.push({ automationId: automation.automationId, outcome: result.outcome })
+    if (!(payload.githubTrigger && githubMode === 'poll' && (result.queueDepth ?? 0) > 0)) {
+      outcomes.push({ automationId: automation.automationId, outcome: result.outcome })
+    }
+    if (payload.githubTrigger && result.outcome !== 'ERROR' && (result.queueDepth ?? 0) > 0
+      && githubEventsProcessed < MAX_GITHUB_EVENTS_PER_TICK) {
+      immediateWorkerIds.add(automation.automationId)
+      workQueue.push(automation)
+    }
   }
   return outcomes
 }

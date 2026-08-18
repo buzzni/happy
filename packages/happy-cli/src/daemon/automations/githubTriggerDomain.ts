@@ -120,6 +120,7 @@ export function planGithubTrigger(input: {
   trigger: GithubTrigger;
   current: GithubPullRequestSnapshot[];
   previous: GithubTriggerRuntimeState | null;
+  consume?: boolean;
 }): { state: GithubTriggerRuntimeState; event: GithubTriggerEventMatch | null } {
   const triggerEvent = input.trigger.event;
   const current = [...input.current].sort((left, right) => left.number - right.number);
@@ -164,7 +165,7 @@ export function planGithubTrigger(input: {
     ...input.previous.pending,
     ...discovered.filter((candidate) => !pendingIds.has(candidate.id)),
   ];
-  const event = pending.shift() ?? null;
+  const event = input.consume === false ? null : pending.shift() ?? null;
   if (event) processed.add(event.id);
 
   return {
@@ -198,6 +199,7 @@ export function planGithubIssueTrigger(input: {
   trigger: GithubTrigger;
   current: GithubIssueSnapshot[];
   previous: GithubTriggerRuntimeState | null;
+  consume?: boolean;
 }): { state: GithubTriggerRuntimeState; event: GithubTriggerIssueEventMatch | null } {
   const current = [...input.current].sort((left, right) => left.number - right.number);
   const previous = input.previous;
@@ -237,7 +239,7 @@ export function planGithubIssueTrigger(input: {
     ...(previous.pendingIssues ?? []),
     ...discovered.filter((candidate) => !pendingIds.has(candidate.id)),
   ];
-  const event = pendingIssues.shift() ?? null;
+  const event = input.consume === false ? null : pendingIssues.shift() ?? null;
   if (event) processed.add(event.id);
 
   return {
