@@ -309,21 +309,35 @@ export async function clearMachineId(): Promise<void> {
   }));
 }
 
+export interface DaemonStateSnapshot {
+  state: DaemonLocallyPersistedState | null;
+  /** Exact file contents `state` was parsed from — the token for {@link writeDaemonStateIfUnchanged}. */
+  raw: string | null;
+}
+
+/**
+ * Read daemon state from local file, keeping the raw contents so a caller that
+ * wants to write back can first check nobody else changed the file meanwhile.
+ */
+export async function readDaemonStateSnapshot(): Promise<DaemonStateSnapshot> {
+  try {
+    if (!existsSync(configuration.daemonStateFile)) {
+      return { state: null, raw: null };
+    }
+    const raw = await readFile(configuration.daemonStateFile, 'utf-8');
+    return { state: JSON.parse(raw) as DaemonLocallyPersistedState, raw };
+  } catch (error) {
+    // State corrupted somehow :(
+    console.error(`[PERSISTENCE] Daemon state file corrupted: ${configuration.daemonStateFile}`, error);
+    return { state: null, raw: null };
+  }
+}
+
 /**
  * Read daemon state from local file
  */
 export async function readDaemonState(): Promise<DaemonLocallyPersistedState | null> {
-  try {
-    if (!existsSync(configuration.daemonStateFile)) {
-      return null;
-    }
-    const content = await readFile(configuration.daemonStateFile, 'utf-8');
-    return JSON.parse(content) as DaemonLocallyPersistedState;
-  } catch (error) {
-    // State corrupted somehow :(
-    console.error(`[PERSISTENCE] Daemon state file corrupted: ${configuration.daemonStateFile}`, error);
-    return null;
-  }
+  return (await readDaemonStateSnapshot()).state;
 }
 
 /**
@@ -331,6 +345,28 @@ export async function readDaemonState(): Promise<DaemonLocallyPersistedState | n
  */
 export function writeDaemonState(state: DaemonLocallyPersistedState): void {
   writeFileSync(configuration.daemonStateFile, JSON.stringify(state, null, 2), 'utf-8');
+}
+
+/**
+ * Compare-and-set write: only writes when the file still holds `expectedRaw`, the
+ * contents the caller based its decision on.
+ *
+ * Needed because several short-lived CLI processes poll the state file while a
+ * daemon is starting. Without the guard, a poller that read the previous daemon's
+ * dead pid writes it back on top of the state the new daemon just wrote, and the
+ * new daemon then sees a foreign pid on its next heartbeat and shuts itself down.
+ *
+ * @returns true if the write happened, false if someone else owns the file now
+ */
+export function writeDaemonStateIfUnchanged(expectedRaw: string | null, state: DaemonLocallyPersistedState): boolean {
+  const current = existsSync(configuration.daemonStateFile)
+    ? readFileSync(configuration.daemonStateFile, 'utf-8')
+    : null;
+  if (current !== expectedRaw) {
+    return false;
+  }
+  writeDaemonState(state);
+  return true;
 }
 
 let pendingDaemonState: DaemonLocallyPersistedState | null = null;

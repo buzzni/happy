@@ -5,8 +5,12 @@ import { join } from 'node:path';
 import { configuration } from './configuration';
 import {
     persistSession,
+    readDaemonStateSnapshot,
     readPersistedSessions,
     SandboxConfigSchema,
+    writeDaemonState,
+    writeDaemonStateIfUnchanged,
+    type DaemonLocallyPersistedState,
     type PersistedSession,
 } from './persistence';
 
@@ -150,5 +154,65 @@ describe('session persistence retention', () => {
             old: oldSession,
             new: expect.objectContaining({ savedAt: expect.any(Number) }),
         });
+    });
+});
+
+describe('daemon state compare-and-set', () => {
+    const originalDaemonStateFile = configuration.daemonStateFile;
+    let testDirectory: string;
+
+    beforeEach(() => {
+        testDirectory = mkdtempSync(join(tmpdir(), 'happy-daemon-state-'));
+        Object.defineProperty(configuration, 'daemonStateFile', {
+            configurable: true,
+            value: join(testDirectory, 'daemon.state.json'),
+        });
+    });
+
+    afterEach(() => {
+        Object.defineProperty(configuration, 'daemonStateFile', {
+            configurable: true,
+            value: originalDaemonStateFile,
+        });
+        rmSync(testDirectory, { recursive: true, force: true });
+    });
+
+    function daemonState(pid: number): DaemonLocallyPersistedState {
+        return {
+            pid,
+            httpPort: 33417,
+            startTime: '8/17/2026, 12:05:29 PM',
+            startedWithCliVersion: '1.1.10',
+            daemonLogPath: join(testDirectory, 'daemon.log'),
+            state: 'running',
+            trackedSessions: [],
+        };
+    }
+
+    it('writes when the file still holds the contents the caller read', async () => {
+        writeDaemonState(daemonState(111));
+        const { raw } = await readDaemonStateSnapshot();
+
+        expect(writeDaemonStateIfUnchanged(raw, daemonState(222))).toBe(true);
+        expect((await readDaemonStateSnapshot()).state?.pid).toBe(222);
+    });
+
+    it('refuses to write when another process rewrote the file first', async () => {
+        writeDaemonState(daemonState(111));
+        const { raw } = await readDaemonStateSnapshot();
+
+        // A daemon starts and claims the file between our read and our write.
+        writeDaemonState(daemonState(999));
+
+        expect(writeDaemonStateIfUnchanged(raw, daemonState(222))).toBe(false);
+        expect((await readDaemonStateSnapshot()).state?.pid).toBe(999);
+    });
+
+    it('writes when the caller read an absent file that is still absent', async () => {
+        const { state, raw } = await readDaemonStateSnapshot();
+
+        expect(state).toBeNull();
+        expect(writeDaemonStateIfUnchanged(raw, daemonState(222))).toBe(true);
+        expect((await readDaemonStateSnapshot()).state?.pid).toBe(222);
     });
 });

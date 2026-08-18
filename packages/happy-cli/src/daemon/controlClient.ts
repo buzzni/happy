@@ -4,7 +4,7 @@
  */
 
 import { logger } from '@/ui/logger';
-import { clearDaemonState, readDaemonState, writeDaemonState } from '@/persistence';
+import { clearDaemonState, readDaemonState, readDaemonStateSnapshot, writeDaemonStateIfUnchanged } from '@/persistence';
 import { Metadata } from '@/api/types';
 import { configuration } from '@/configuration';
 
@@ -159,7 +159,7 @@ export async function stopDaemonHttp(): Promise<void> {
  * For instance when running `happy daemon status` we can show more information.
  */
 export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolean> {
-  const state = await readDaemonState();
+  const { state, raw } = await readDaemonStateSnapshot();
   if (!state) {
     return false;
   }
@@ -169,7 +169,14 @@ export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolea
     process.kill(state.pid, 0);
   } catch {
     logger.debug('[DAEMON RUN] Daemon PID not running, marking state as crashed');
-    writeDaemonState({ ...state, state: 'crashed', stateReason: 'Daemon PID not running' });
+    // Guarded write: `ensureDaemonRunning()` calls us every 100ms while a daemon is
+    // coming up, so the daemon may have claimed the file between our read and here.
+    // An unguarded write would resurrect the dead pid over its state, and its next
+    // heartbeat would read a foreign pid and shut it down.
+    const marked = writeDaemonStateIfUnchanged(raw, { ...state, state: 'crashed', stateReason: 'Daemon PID not running' });
+    if (!marked) {
+      logger.debug('[DAEMON RUN] Daemon state file changed while we were checking it, leaving it to its owner');
+    }
     return false;
   }
 

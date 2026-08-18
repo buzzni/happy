@@ -44,6 +44,7 @@ import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
 import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
 import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
+import { shouldYieldDaemonStateOwnership } from './daemonStateOwnership';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
 import { statSync } from 'fs';
@@ -2125,7 +2126,11 @@ export async function startDaemon(): Promise<void> {
       // Before wrecklessly overriting the daemon state file, we should check if we are the ones who own it
       // Race condition is possible, but thats okay for the time being :D
       const daemonState = await readDaemonState();
-      if (daemonState && daemonState.pid !== process.pid) {
+      if (shouldYieldDaemonStateOwnership({
+        recordedPid: daemonState?.pid,
+        ownPid: process.pid,
+        isProcessAlive: isPidAlive,
+      })) {
         logger.debug('[DAEMON RUN] Somehow a different daemon was started without killing us. We should kill ourselves.')
         requestShutdown('exception', 'A different daemon was started without killing us. We should kill ourselves.')
       }
