@@ -9,10 +9,16 @@
  * child's env — every session the daemon spawns afterwards reconnects to the
  * same happy session. That is the 2026-07-19 incident: chats from every
  * project queued into one session and replayed each other's prompts.
+ *
+ * APLUS_SESSION_* is the session's own web URL/id exported for agent shell
+ * subprocesses (sessionUrlEnv.ts). It is set first-set-wins, so a child
+ * session spawned with a parent's leaked value would keep pointing at the
+ * parent session forever — scrub it here so every daemon-spawned session
+ * derives its own.
  */
 // 'HAPPY_INITIAL_' covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the
 // HAPPY_INITIAL_MODEL / HAPPY_INITIAL_EFFORT spawn seeds.
-export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_AUTOMATION_'] as const
+export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_AUTOMATION_', 'APLUS_SESSION_'] as const
 
 function isLineageKey(key: string): boolean {
     return SESSION_LINEAGE_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))

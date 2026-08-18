@@ -388,7 +388,6 @@ describe('automationExecutionService', () => {
         }, now)).resolves.toEqual({ ok: false, error: 'report-conflict' });
         expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
     });
-
     it('rejects inconsistent GitHub queue progress', async () => {
         const tx = makeTx();
         tx.automationRun.findFirst.mockResolvedValue({ id: 'run-1', status: 'RUNNING', reportId: null });
