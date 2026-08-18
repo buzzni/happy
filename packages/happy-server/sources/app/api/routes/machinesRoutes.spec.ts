@@ -13,6 +13,7 @@ const {
     allocateUserSeqMock,
     emitUpdateSpy,
     emitEphemeralSpy,
+    machineUpdate,
 } = vi.hoisted(() => {
     const emitUpdateSpy = vi.fn();
     const emitEphemeralSpy = vi.fn();
@@ -51,10 +52,14 @@ const {
         return row;
     });
 
-    const dbMock = { machine: { findFirst: machineFindFirst, create: machineCreate } };
+    const machineUpdate = vi.fn(async (args: any) => {
+        state.existingMachine = { ...state.existingMachine, ...args.data };
+        return state.existingMachine;
+    });
+    const dbMock = { machine: { findFirst: machineFindFirst, create: machineCreate, update: machineUpdate } };
     const allocateUserSeqMock = vi.fn(async () => ++state.seq);
 
-    return { state, dbMock, resetState, allocateUserSeqMock, emitUpdateSpy, emitEphemeralSpy };
+    return { state, dbMock, resetState, allocateUserSeqMock, emitUpdateSpy, emitEphemeralSpy, machineUpdate };
 });
 
 // Keep the REAL event-builder functions (buildNewMachineUpdate etc.), but
@@ -175,5 +180,78 @@ describe("machinesRoutes — POST /v1/machines creation emits", () => {
         expect(newMachine).toBeDefined();
         expect(newMachine.payload.body.dataEncryptionKey).toBeNull();
         expect(ApiUpdateContainerSchema.safeParse(newMachine.payload).success).toBe(true);
+    });
+});
+
+// aplus §6-1 Phase 3c (aplus-dev-studio specs/20260818-e2ee-account-keypair) —
+// dataEncryptionKey write-once 백필. 기존 머신은 create 시점에만 키를 저장할
+// 수 있었는데, aplus claim 흐름은 legacy(secret) 모드로 먼저 등록하고 신버전
+// daemon 이 나중에 wrap 된 machineKey 를 제출한다. null 일 때만 채우고,
+// non-null 덮어쓰기는 금지한다 (키 교체 공격·고아 암호문 방지 — 회전은 별도
+// 명시 흐름의 몫).
+describe("machinesRoutes — POST /v1/machines dataEncryptionKey write-once backfill", () => {
+    let app: Fastify;
+    beforeEach(() => { resetState(); emitUpdateSpy.mockClear(); emitEphemeralSpy.mockClear(); machineUpdate.mockClear(); });
+    afterEach(async () => { if (app) await app.close(); });
+
+    const now = new Date("2026-01-01T00:00:00.000Z");
+    const existingRow = (dataEncryptionKey: Uint8Array | null) => ({
+        id: "machine-1",
+        accountId: "user-1",
+        seq: 7,
+        metadata: "encrypted-metadata-blob",
+        metadataVersion: 1,
+        daemonState: null,
+        daemonStateVersion: 0,
+        dataEncryptionKey,
+        active: false,
+        lastActiveAt: now,
+        createdAt: now,
+        updatedAt: now,
+    });
+
+    const post = (payload: Record<string, unknown>) => app.inject({
+        method: "POST",
+        url: "/v1/machines",
+        headers: { "x-user-id": "user-1" },
+        payload: { id: "machine-1", metadata: "encrypted-metadata-blob", ...payload },
+    });
+
+    it("backfills a null dataEncryptionKey from a late submission and echoes it", async () => {
+        app = await createApp();
+        state.existingMachine = existingRow(null);
+        const wrapped = Buffer.from("wrapped-machine-key").toString("base64");
+
+        const res = await post({ dataEncryptionKey: wrapped });
+
+        expect(res.statusCode).toBe(200);
+        expect(machineUpdate).toHaveBeenCalledTimes(1);
+        const updateArg = machineUpdate.mock.calls[0][0];
+        expect(updateArg.where).toEqual({ id: "machine-1" });
+        expect(Buffer.from(updateArg.data.dataEncryptionKey).toString("base64")).toBe(wrapped);
+        expect(res.json().machine.dataEncryptionKey).toBe(wrapped);
+    });
+
+    it("never overwrites an existing dataEncryptionKey (write-once)", async () => {
+        app = await createApp();
+        const original = new Uint8Array(Buffer.from("original-key"));
+        state.existingMachine = existingRow(original);
+
+        const res = await post({ dataEncryptionKey: Buffer.from("attacker-key").toString("base64") });
+
+        expect(res.statusCode).toBe(200);
+        expect(machineUpdate).not.toHaveBeenCalled();
+        expect(res.json().machine.dataEncryptionKey).toBe(Buffer.from("original-key").toString("base64"));
+    });
+
+    it("does nothing when an existing machine re-registers without the field (old CLI)", async () => {
+        app = await createApp();
+        state.existingMachine = existingRow(null);
+
+        const res = await post({});
+
+        expect(res.statusCode).toBe(200);
+        expect(machineUpdate).not.toHaveBeenCalled();
+        expect(res.json().machine.dataEncryptionKey).toBeNull();
     });
 });
