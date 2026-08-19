@@ -605,6 +605,31 @@ function deferGithubIssueProgressMarkerCleanup(
   })
 }
 
+function inactiveGithubIssueProgressMarkersDue(
+  input: ServerAutomationExecutorInput,
+  automation: EncryptedServerAutomation,
+): GithubIssueProgressMarkerState[] {
+  return (input.runtimeStore.read().githubIssueProgressMarkers ?? []).filter((marker) => (
+    marker.automationId === automation.automationId
+      && !input.isSessionRunning(marker.sessionId)
+      && (marker.cleanupRetryAt === undefined || marker.cleanupRetryAt <= input.now)
+  ))
+}
+
+function deferInactiveGithubIssueProgressMarkerCleanup(
+  input: ServerAutomationExecutorInput,
+  automation: EncryptedServerAutomation,
+  payload: ServerAutomationPayload,
+): void {
+  const markers = inactiveGithubIssueProgressMarkersDue(input, automation)
+  if (markers.length === 0) return
+  deferGithubIssueProgressMarkerCleanup(
+    input,
+    markers,
+    computeNextRunAt(payload.schedule, input.now),
+  )
+}
+
 async function cleanupInactiveGithubIssueProgressMarkers(
   input: ServerAutomationExecutorInput,
   automation: EncryptedServerAutomation,
@@ -612,11 +637,7 @@ async function cleanupInactiveGithubIssueProgressMarkers(
   githubEnvironment?: { GH_TOKEN: string; GH_REPO: string },
 ): Promise<string | undefined> {
   const cleanupRetryAt = computeNextRunAt(payload.schedule, input.now)
-  const stale = (input.runtimeStore.read().githubIssueProgressMarkers ?? []).filter((marker) => (
-    marker.automationId === automation.automationId
-      && !input.isSessionRunning(marker.sessionId)
-      && (marker.cleanupRetryAt === undefined || marker.cleanupRetryAt <= input.now)
-  ))
+  const stale = inactiveGithubIssueProgressMarkersDue(input, automation)
   if (stale.length === 0) return undefined
 
   try {
@@ -691,12 +712,7 @@ function scheduleInactiveGithubIssueProgressCleanup(
   now: number,
 ): void {
   const state = input.runtimeStore.read()
-  const cleanupNeeded = (state.githubIssueProgressMarkers ?? []).some((marker) => (
-    marker.automationId === automation.automationId
-      && !input.isSessionRunning(marker.sessionId)
-      && (marker.cleanupRetryAt === undefined || marker.cleanupRetryAt <= input.now)
-  ))
-  if (!cleanupNeeded) return
+  if (inactiveGithubIssueProgressMarkersDue(input, automation).length === 0) return
   const schedule = state.schedules.find((entry) => entry.automationId === automation.automationId)
   if (!schedule || schedule.nextRunAt <= now) return
   input.runtimeStore.write({
@@ -773,6 +789,7 @@ async function executeStartedRun(
       claimToken: run.claimToken,
     })
     if (!query.ok) {
+      deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
       input.logDebug?.(`[server-automation] ${automation.automationId} GitHub issue query failed: ${query.error}`)
       return { outcome: 'ERROR', sessionId: null }
     }
@@ -837,6 +854,7 @@ async function executeStartedRun(
       claimToken: run.claimToken,
     })
     if (!query.ok) {
+      deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
       input.logDebug?.(`[server-automation] ${automation.automationId} GitHub query failed: ${query.error}`)
       return { outcome: 'ERROR', sessionId: null }
     }
@@ -1151,6 +1169,7 @@ export async function runServerAutomationTick(
       if (claim.error === 'claim-denied' || claim.error === 'already-claimed'
         || (claim.error === 'active-run' && schedule.runRequestRevision == null)) {
         advanceSchedule(input, automation.automationId, payload, now)
+        deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
         if (payload.githubTrigger) schedulePendingGithubEvent(input, automation, now)
       }
       continue
@@ -1160,7 +1179,10 @@ export async function runServerAutomationTick(
     const runId = claim.value.runId as string
     const claimToken = claim.value.claimToken as string
     const started = await input.transport.start({ runId, claimToken })
-    if (!started.ok) continue
+    if (!started.ok) {
+      deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
+      continue
+    }
 
     const heartbeat = setInterval(() => {
       void input.transport.heartbeat({ runId, claimToken }).catch((error) => {

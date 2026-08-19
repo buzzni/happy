@@ -222,6 +222,40 @@ describe('runServerAutomationTick', () => {
     expect(spawnSession).not.toHaveBeenCalled()
   })
 
+  it('backs off an ended marker cleanup when the claimed run cannot start', async () => {
+    const { input, store, transport, now } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue triage', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Triage', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubIssueProgressMarkers: [{
+        automationId: 'automation-1', generation: 2, sessionId: 'ended-session',
+        issueNumber: 12, actor: 'automation-bot', repository: 'acme/app', reactionId: 321,
+      }],
+    })
+    transport.start.mockResolvedValue({ ok: false, error: 'start unavailable' })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+    expect(store.state().githubIssueProgressMarkers).toEqual([expect.objectContaining({
+      sessionId: 'ended-session', cleanupRetryAt: now + 15 * 60_000,
+    })])
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(transport.start).toHaveBeenCalledTimes(1)
+  })
+
   it('runs only after claim and start, then durably retries the same completion report', async () => {
     const { input, store, transport, resolveMcpSpawnContext, linkSession, spawnSession, logDebug } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token', claimExpiresAt: 1_100_000, serverTime: 1_000_000 } },
@@ -1763,7 +1797,9 @@ describe('runServerAutomationTick', () => {
   })
 
   it('fails closed when the selected GitHub credential cannot query the repository', async () => {
-    const { input, queryGithubPullRequests, resolveMcpSpawnContext, spawnSession } = setup({
+    const {
+      input, store, transport, queryGithubPullRequests, resolveMcpSpawnContext, spawnSession, now,
+    } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
     })
     input.decryptPayload = vi.fn(() => ({
@@ -1776,6 +1812,13 @@ describe('runServerAutomationTick', () => {
         githubCredentialId: 'missing-credential',
       },
     }))
+    store.write({
+      ...store.read(),
+      githubIssueProgressMarkers: [{
+        automationId: 'automation-1', generation: 1, sessionId: 'ended-issue-session',
+        issueNumber: 9, actor: 'automation-bot', repository: 'acme/app', reactionId: 300,
+      }],
+    })
     queryGithubPullRequests.mockResolvedValue({ ok: false, error: 'credential unavailable' })
 
     await expect(runServerAutomationTick(input)).resolves.toEqual([
@@ -1784,6 +1827,13 @@ describe('runServerAutomationTick', () => {
     expect(queryGithubPullRequests).toHaveBeenCalledTimes(1)
     expect(resolveMcpSpawnContext).not.toHaveBeenCalled()
     expect(spawnSession).not.toHaveBeenCalled()
+    expect(store.state().githubIssueProgressMarkers).toEqual([expect.objectContaining({
+      sessionId: 'ended-issue-session', cleanupRetryAt: now + 15 * 60_000,
+    })])
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(queryGithubPullRequests).toHaveBeenCalledTimes(1)
   })
 
   it('starts at most three GitHub-triggered sessions in one daemon tick', async () => {
