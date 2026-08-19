@@ -123,6 +123,7 @@ import {
 import {
   exchangeAutomationMcpCallerGrant,
   linkAutomationProjectSession,
+  linkSpawnedProjectSessionInBackground,
   type AutomationMcpSpawnContext,
 } from './automations/automationMcpCallerGrant';
 import { preflightAutomationConnectors } from './automations/automationConnectorPreflight';
@@ -1986,6 +1987,17 @@ export async function startDaemon(): Promise<void> {
       portRegistry,
       automationStore,
       aiCredentialRuntime,
+      // specs/daemon-spawn-project-link — a session created by `agent spawn` has no way to
+      // register itself with A+ (its credential does not authenticate /api/*), so the daemon
+      // reports it here. Fire-and-forget: the session is already live either way.
+      linkSpawnedSession: ({ sessionId, directory }) => linkSpawnedProjectSessionInBackground({
+        configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+        machineToken: credentials.token,
+        machineId,
+        sessionId,
+        directory,
+        logDebug: (message) => logger.debug(`[DAEMON RUN] [spawn-link] ${message}`),
+      }),
     });
 
     // Connect to server
