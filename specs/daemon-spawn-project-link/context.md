@@ -1,6 +1,6 @@
 ---
 기능: daemon-spawn-project-link
-상태: 구현 완료(Phase 1·2) — 릴리스와 E2E는 선행 배포 대기
+상태: 완료 — 릴리스·E2E 전부 끝남(서버 쪽 후속 결함 2건 포함)
 마지막 갱신: 2026-08-19
 ---
 
@@ -56,14 +56,18 @@ Phase 1·2 구현 완료. 데몬은 이제 spawn 성공 직후 A+에 세션을 �
   확인했다. **"전체 통과"를 기대하지 말 것.** 추가로 `sessionScanner.test.ts`는 전체 부하에서
   가끔 떨어지는 flake다(단독 재실행하면 통과).
 
+- [2026-08-19] **실사용 E2E에서 발견한 서버 쪽 결함 2건** (이 daemon 배선 코드 자체는 무관):
+  ① `AccessKey`가 프로덕션에서 완전히 비어 있었다 — 아무 Happy 클라이언트도 채우지 않는
+  죽은 코드. `Session.accountId`/`Machine.accountId` same-account 검증으로 교체(happy #220).
+  ② company-shared 머신의 Happy 신원은 회사 공유 계정이라 A+의 개인 User 매핑이 없어 404 —
+  `MachineEntry.ownerId` 폴백 추가(aplus-dev-studio #2232). 둘 다 서버 쪽 문제라 이 daemon
+  배선(linkSpawnedProjectSession 등)은 코드 변경 없이 그대로 유효했다.
+- [2026-08-19] **최종 검증**: 4번째 spawn 시도에서 daemon 로그에 실패 흔적이 전혀 없고
+  A+ `ProjectSessionMap`에 세션이 자동 등록됨을 확인 — 이 spec이 원래 목표했던 "daemon이
+  spawn 성공 직후 조용히 A+에 알린다"가 정확히 그대로 동작한다.
+
 ## 다음 세션 시작점
 
-코드는 끝났다. 남은 것은 **배포 순서**뿐이고, 순서가 중요하다:
-
-1. happy #217(서버 엔드포인트) merge
-2. aplus-dev-studio #2203(A+ 라우트) merge
-3. happy-cli 릴리스(T9) — AGENTS.md §1.8: 로컬 publish 금지, version bump → 태그 push → CI
-4. `vendor/happy` 포인터 bump (aplus-dev-studio 별도 PR)
-5. 실제 `saycode agent spawn` → A+ 프로젝트 목록 확인(T10) → 선행 spec 3개의 마지막 DoD도 함께 체크
-
-**3번을 1번보다 먼저 하지 말 것** — 기능은 안 깨지지만 매 spawn마다 503 debug 로그만 쌓인다.
+이 spec은 완료됐다. 3개 저장소(aplus-dev-studio-desktop, buzzni/happy 서버·데몬,
+aplus-dev-studio 서버)에 걸친 `saycode agent spawn` 프로젝트 자동 등록 기능 전체가
+실사용으로 검증됐다.

@@ -27,11 +27,14 @@
 ## Phase 3: 회귀와 E2E
 
 - [x] T8. `tsc --noEmit` 오류 0건, happy-cli 테스트 전체 통과
-- [ ] T9. 릴리스: AGENTS.md §1.8대로 **로컬 publish 금지** — version bump → 태그 push → CI가
-  유일한 publisher. **아직 하지 않음** — happy #217(서버 엔드포인트)이 merge되기 전에 CLI만
-  올리면 매 spawn마다 503 debug 로그만 쌓인다. #217 merge 후 진행
-- [ ] T10. 선행 배포(happy #217, aplus-dev-studio #2203) 확인 후 실제 `saycode agent spawn` →
-  A+ 프로젝트 대화 목록에 세션이 뜨는지 확인 → 선행 spec들의 마지막 DoD 항목도 함께 체크
+- [x] T9. 릴리스 완료 — `happy-cli-v1.1.10-aplus.120`으로 #217·#218이 함께 배포됨. 그 뒤
+  `AccessKey` 죽은 코드(happy #220)와 company-shared 머신 계정 미해결(aplus-dev-studio #2232)
+  결함 2건이 실사용 E2E에서 발견돼 서버 쪽만 추가로 고쳤다 — 이 daemon 배선 코드 자체는
+  변경 없음
+- [x] T10. **완료** — 실제 `saycode agent spawn` 4회 반복 검증. 서버 쪽 결함 2건(§context.md)을
+  걷어낸 뒤, 마지막 시도는 daemon의 자동 배경 호출만으로(사람 개입 없이) `ProjectSessionMap`에
+  행이 생성됨을 확인. 이 spec과 aplus-dev-studio `specs/cli-agent-spawn-project-visibility-server`
+  양쪽의 마지막 DoD 항목이 닫혔다
 
 ## 승인 대기 중인 추가 작업 (스코프 확장 제안)
 
