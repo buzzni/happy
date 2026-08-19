@@ -1,6 +1,6 @@
 # 데몬 spawn 세션 프로젝트 연결 Plan
 
-> 작성일: 2026-08-19 / 상태: Phase 1·2 완료, Phase 3은 회귀검증만 완료(E2E는 선행 배포 대기)
+> 작성일: 2026-08-19 / 상태: 완료 — Phase 1~3 전부 실사용 E2E로 검증됨
 > 근거 문서: [spec.md](./spec.md)
 
 ## 아키텍처 영향
@@ -50,7 +50,7 @@
   검증: 훅이 `{sessionId, directory}`로 호출되는지 / 훅이 throw해도 spawn 응답이 success인지 /
   훅 미주입(undefined)이어도 동작하는지 / `case 'error'`·`requestToApproveDirectoryCreation`
   분기에서는 호출되지 않는지
-- [~] **Phase 3: 회귀·E2E** → happy-cli 테스트 전체 + typecheck. 선행 배포(#217, #2203) 이후
+- [x] **Phase 3: 회귀·E2E** → happy-cli 테스트 전체 + typecheck. 선행 배포(#217, #2203) 이후
   실제 `saycode agent spawn`으로 A+ 목록 확인
 
 ## 리스크와 대응
