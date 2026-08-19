@@ -15,6 +15,7 @@ import { versionRoutes } from "./routes/versionRoutes";
 import { voiceRoutes } from "./routes/voiceRoutes";
 import { artifactsRoutes } from "./routes/artifactsRoutes";
 import { accessKeysRoutes } from "./routes/accessKeysRoutes";
+import { machineSessionOwnerRoutes } from "./routes/machineSessionOwnerRoutes";
 import { enableMonitoring } from "./utils/enableMonitoring";
 import { enableErrorHandlers } from "./utils/enableErrorHandlers";
 import { enableAuthentication } from "./utils/enableAuthentication";
@@ -141,6 +142,7 @@ export async function startApi(opts: StartApiOptions = {}) {
     machinesRoutes(typed);
     artifactsRoutes(typed);
     accessKeysRoutes(typed);
+    machineSessionOwnerRoutes(typed);
     devRoutes(typed);
     versionRoutes(typed);
     voiceRoutes(typed);
