@@ -99,6 +99,11 @@ import { runAutomationScript } from './automations/runAutomationScript';
 import { queryGithubPullRequests } from './automations/queryGithubPullRequests';
 import { queryGithubIssues } from './automations/queryGithubIssues';
 import {
+  createGithubIssueProgressMarker,
+  removeGithubIssueProgressMarker,
+  resolveGithubIssueProgressMarkerIdentity,
+} from './automations/githubIssueProgressMarker';
+import {
   dispatchAutomationAgentTask,
   maintainAutomationAgentTaskLease,
 } from './automations/automationAgentTaskBridge';
@@ -1918,6 +1923,18 @@ export async function startDaemon(): Promise<void> {
         notifyGithubTrigger: ({ title, body, url }) => {
           api.push().sendToAllDevices(title, body, { kind: 'github-trigger', url });
         },
+        resolveGithubIssueProgressMarkerIdentity: (input) => resolveGithubIssueProgressMarkerIdentity({
+          ...input,
+          allowedRoot: automationAllowedRoot,
+        }),
+        createGithubIssueProgressMarker: (input) => createGithubIssueProgressMarker({
+          ...input,
+          allowedRoot: automationAllowedRoot,
+        }),
+        removeGithubIssueProgressMarker: (input) => removeGithubIssueProgressMarker({
+          ...input,
+          allowedRoot: automationAllowedRoot,
+        }),
         dispatchAgentTask: (input) => dispatchAutomationAgentTask({
           ...input,
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,

@@ -41,6 +41,10 @@ describe('serverAutomationRuntimeStore', () => {
           }],
         },
       }],
+      githubIssueProgressMarkers: [{
+        automationId: 'automation-2', generation: 3, sessionId: 'session-issue-12',
+        issueNumber: 12, actor: 'automation-bot', reactionId: 321,
+      }],
       pendingReports: [{
         runId: 'run-1', claimToken: 'claim-token', reportId: 'report-1', status: 'COMPLETED',
         outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,
@@ -55,6 +59,10 @@ describe('serverAutomationRuntimeStore', () => {
       schedules: [{ automationId: 'automation-1', generation: 2, nextRunAt: 100, lastSessionId: null }],
       githubActiveSessions: [],
       githubQueueProgress: [],
+      githubIssueProgressMarkers: [{
+        automationId: 'automation-2', generation: 3, sessionId: 'session-issue-12',
+        issueNumber: 12, actor: 'automation-bot', reactionId: 321,
+      }],
       githubTriggers: [{
         automationId: 'automation-2',
         generation: 3,
