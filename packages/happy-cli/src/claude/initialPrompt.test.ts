@@ -8,7 +8,7 @@ import {
   prepareClaudeInitialPrompt,
   type InitialPromptSink,
 } from './initialPrompt'
-import { CLAUDE_TITLE_INSTRUCTION } from './utils/titlePrompt'
+import { TITLE_INSTRUCTION } from '@/utils/titlePrompt'
 import { resolveInitialPromptPermissionMode } from '@/utils/initialPrompt'
 
 describe('consumePendingInitialPrompt', () => {
@@ -139,7 +139,7 @@ describe('deliverInitialPrompt', () => {
     // (a) 턴 시작: 제목 지시가 덧붙은 모델 사본 한 건
     expect(pushed).toHaveLength(1)
     expect(pushed[0]).toContain('배포 상태 확인해줘')
-    expect(pushed[0]).toContain(CLAUDE_TITLE_INSTRUCTION)
+    expect(pushed[0]).toContain(TITLE_INSTRUCTION)
 
     // 스캐너 dedupe 스탬프: 원문 + 변형본 둘 다
     expect(recorded).toEqual(['배포 상태 확인해줘', pushed[0]])
