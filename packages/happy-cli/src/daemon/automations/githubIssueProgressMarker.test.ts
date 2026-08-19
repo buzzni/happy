@@ -77,6 +77,34 @@ describe('githubIssueProgressMarker', () => {
     expect(runScript).toHaveBeenCalledTimes(1)
   })
 
+  it('recovers a crash-window marker by deleting the single owned eyes reaction', async () => {
+    const runScript = runner([
+      { ok: true, stdout: JSON.stringify([[
+        { id: 111, content: 'eyes', user: { login: 'someone-else' } },
+        { id: 321, content: 'eyes', user: { login: 'automation-bot' } },
+      ]]) },
+      { ok: true, stdout: '' },
+    ])
+
+    await expect(removeGithubIssueProgressMarker({
+      ...base, runScript, issueNumber: 12, actor: 'automation-bot', reactionId: null,
+      repository: 'acme/app',
+    })).resolves.toEqual({ ok: true, removed: true })
+    expect(runScript.mock.calls[1]![0].command).toContain('reactions/321')
+  })
+
+  it('fails closed when the recorded reaction id belongs to another content type', async () => {
+    const runScript = runner([{ ok: true, stdout: JSON.stringify([[
+      { id: 321, content: '+1', user: { login: 'automation-bot' } },
+    ]]) }])
+
+    await expect(removeGithubIssueProgressMarker({
+      ...base, runScript, issueNumber: 12, actor: 'automation-bot', reactionId: 321,
+      repository: 'acme/app',
+    })).resolves.toEqual({ ok: false, error: 'GitHub issue progress reaction ownership mismatch' })
+    expect(runScript).toHaveBeenCalledTimes(1)
+  })
+
   it('treats an already absent owned reaction as cleaned up', async () => {
     const runScript = runner([{ ok: true, stdout: JSON.stringify([[]]) }])
 

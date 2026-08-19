@@ -62,6 +62,7 @@ export interface ServerAutomationRuntimeState {
     sessionId: string
     issueNumber: number
     actor: string
+    repository: string
     reactionId: number | null
   }>
   pendingReports: PendingAutomationReport[]
@@ -262,6 +263,7 @@ function parse(raw: string): ServerAutomationRuntimeState {
         sessionId: text(row.sessionId, 200),
         issueNumber: integer(row.issueNumber, 1),
         actor: text(row.actor, 200),
+        repository: text(row.repository, 512),
         reactionId: row.reactionId === null ? null : integer(row.reactionId, 1),
       }
     })
