@@ -82,14 +82,46 @@ describe('resolveAcpAgentConfig', () => {
   });
 
   // The daemon appends `--dangerously-skip-permissions` to EVERY remote spawn
-  // that has no explicit permission mode, so translating it into grok's
-  // `--always-approve` would auto-approve every app-started session and bypass
-  // happy's own ACP approval prompt. ACP agents approve in the app instead.
-  it('never turns happy permission flags into grok auto-approve', () => {
+  // that has no explicit permission mode, matching how claude/codex skip every
+  // approval prompt by default. Grok gets the same behavior via its own
+  // `--always-approve` flag instead of happy's ACP approval prompt.
+  it('maps daemon-injected --dangerously-skip-permissions to grok auto-approve', () => {
     expect(resolveAcpAgentConfig(['grok', '--dangerously-skip-permissions'])).toEqual({
       agentName: 'grok',
       command: 'grok',
+      args: ['agent', '--always-approve', 'stdio'],
+    });
+  });
+
+  it('maps --permission-mode yolo to grok auto-approve', () => {
+    expect(resolveAcpAgentConfig(['grok', '--permission-mode', 'yolo'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', '--always-approve', 'stdio'],
+    });
+  });
+
+  it('maps --permission-mode bypassPermissions to grok auto-approve', () => {
+    expect(resolveAcpAgentConfig(['grok', '--permission-mode', 'bypassPermissions'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
+      args: ['agent', '--always-approve', 'stdio'],
+    });
+  });
+
+  it('does not auto-approve grok for non-bypass permission modes', () => {
+    expect(resolveAcpAgentConfig(['grok', '--permission-mode', 'acceptEdits'])).toEqual({
+      agentName: 'grok',
+      command: 'grok',
       args: ['agent', 'stdio'],
+    });
+  });
+
+  it('does not auto-approve other ACP agents on --dangerously-skip-permissions', () => {
+    expect(resolveAcpAgentConfig(['gemini', '--dangerously-skip-permissions'])).toEqual({
+      agentName: 'gemini',
+      command: 'gemini',
+      args: ['--experimental-acp'],
     });
   });
 

@@ -18,13 +18,38 @@ export const KNOWN_ACP_AGENTS: Record<string, AcpAgentConfig> = {
   // `grok agent stdio` speaks ACP protocolVersion 1 over JSON-RPC, which is the
   // version AcpBackend negotiates. The interactive TUI (plain `grok`) does not.
   // Tool approvals go through happy's own ACP prompt, like every other ACP
-  // agent. Happy's `--dangerously-skip-permissions` is deliberately NOT mapped
-  // to grok's `--always-approve`: the daemon appends that flag to every remote
-  // spawn without an explicit permission mode, so mapping it would silently
-  // auto-approve every app-started session. Users who want it pass
-  // `--always-approve` (or `--yolo`, which grok accepts) themselves.
+  // agent, unless a bypass permission mode is requested (see
+  // `shouldAutoApproveGrok` below), which maps to grok's own `--always-approve`
+  // so grok gets the same skip-every-prompt behavior claude/codex get by
+  // default.
   grok: { command: 'grok', args: ['agent'], trailingArgs: ['stdio'] },
 };
+
+/**
+ * Bypass permission modes, mirrored from `PermissionMode` in `src/api/types.ts`.
+ * `yolo` and `bypassPermissions` are treated as equivalent "full access, never
+ * ask" states elsewhere in the codebase (see `claude/utils/permissionMode.ts`
+ * and `codex/executionPolicy.ts`).
+ */
+const BYPASS_PERMISSION_MODES = new Set(['yolo', 'bypassPermissions']);
+
+/**
+ * Whether the raw (pre-filter) ACP argv requests a full-access permission
+ * mode for grok — either via the daemon's default `--dangerously-skip-permissions`
+ * (appended to every remote spawn that doesn't specify a permission mode) or
+ * an explicit `--permission-mode yolo|bypassPermissions`.
+ */
+function shouldAutoApproveGrok(rawArgs: string[]): boolean {
+  for (let i = 0; i < rawArgs.length; i++) {
+    if (rawArgs[i] === '--dangerously-skip-permissions') {
+      return true;
+    }
+    if (rawArgs[i] === '--permission-mode' && BYPASS_PERMISSION_MODES.has(rawArgs[i + 1])) {
+      return true;
+    }
+  }
+  return false;
+}
 
 export type ResolvedAcpAgentConfig = {
   agentName: string;
@@ -131,12 +156,14 @@ export function resolveAcpAgentConfig(cliArgs: string[]): ResolvedAcpAgentConfig
   const agentName = cliArgs[0];
   const known = KNOWN_ACP_AGENTS[agentName];
   if (known) {
-    const passthroughArgs = filterHappyInternalFlags(
-      cliArgs
-        .slice(1)
-        // Backward-compatible with old OpenCode docs/flags.
-        .filter((arg) => !(agentName === 'opencode' && arg === '--acp')),
-    );
+    const rawArgs = cliArgs
+      .slice(1)
+      // Backward-compatible with old OpenCode docs/flags.
+      .filter((arg) => !(agentName === 'opencode' && arg === '--acp'));
+    const passthroughArgs = filterHappyInternalFlags(rawArgs);
+    if (agentName === 'grok' && shouldAutoApproveGrok(rawArgs)) {
+      passthroughArgs.push('--always-approve');
+    }
     return {
       agentName,
       command: known.command,
