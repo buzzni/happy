@@ -32,7 +32,7 @@ import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudeDisallowedTools, resolveInitialClaudePermissionMode, resolveRemoteClaudeDisallowedTools, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
 import { applyAxOrchestration } from '@/orchestrator/prompts/integrate';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
-import { appendClaudeTitleInstruction } from './utils/titlePrompt';
+import { appendTitleInstruction } from '@/utils/titlePrompt';
 import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
 import {
     fetchAplusMcpConfigSnapshot,
@@ -860,7 +860,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         // recordAppPrompt() de-dupes the modified turn so the remote-mode JSONL
         // scanner doesn't forward it back to the app as a second message.
         if (!session.hasTitle()) {
-            const withTitle = appendClaudeTitleInstruction(pushText);
+            const withTitle = appendTitleInstruction(pushText);
             if (withTitle !== pushText) {
                 pushText = withTitle;
                 recordAppPrompt(pushText);

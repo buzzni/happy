@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { TITLE_INSTRUCTION } from '@/utils/titlePrompt';
 
 const mocks = vi.hoisted(() => {
   const sessionHandlers = new Map<string, (params: any) => Promise<any> | any>();
@@ -11,6 +12,8 @@ const mocks = vi.hoisted(() => {
       userMessageHandler = handler;
     }),
     keepAlive: vi.fn(),
+    /** Default to a titled session so existing prompt assertions stay verbatim. */
+    hasTitle: vi.fn(() => true),
     sendSessionProtocolMessage: vi.fn(),
     sendSessionEvent: vi.fn(),
     updateMetadata: vi.fn(),
@@ -252,6 +255,47 @@ describe('runAcp', () => {
     mocks.mockStartHappyServer.mockResolvedValue({
       url: 'http://127.0.0.1:9876',
       stop: vi.fn(),
+    });
+  });
+
+  describe('chat title instruction', () => {
+    async function promptOnce(hasTitle: boolean): Promise<string> {
+      mocks.mockSession.hasTitle.mockReturnValue(hasTitle);
+      const runPromise = runAcp({
+        credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+        agentName: 'grok',
+        command: 'grok',
+        args: ['agent', 'stdio'],
+      });
+
+      await vi.waitFor(() => {
+        expect(mocks.getUserMessageHandler()).toBeTypeOf('function');
+      });
+      mocks.getUserMessageHandler()!({
+        role: 'user',
+        content: { type: 'text', text: 'Fix the login bug' },
+      });
+      await vi.waitFor(() => {
+        expect(mocks.backendState.prompts).toHaveLength(1);
+      });
+      await mocks.getKillHandler()!();
+      await runPromise;
+
+      return mocks.backendState.prompts[0].prompt;
+    }
+
+    it('shouldAppendChangeTitleInstructionWhenSessionHasNoTitle', async () => {
+      const prompt = await promptOnce(false);
+
+      expect(prompt).toContain('Fix the login bug');
+      expect(prompt).toContain('mcp__happy__change_title');
+      expect(prompt).toContain(TITLE_INSTRUCTION);
+    });
+
+    it('shouldLeavePromptUntouchedWhenSessionAlreadyHasTitle', async () => {
+      const prompt = await promptOnce(true);
+
+      expect(prompt).toBe('Fix the login bug');
     });
   });
 

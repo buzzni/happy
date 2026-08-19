@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { CLAUDE_TITLE_INSTRUCTION } from './utils/titlePrompt';
+import { TITLE_INSTRUCTION } from '@/utils/titlePrompt';
 
 const {
     mockApiClientCreate,
@@ -1053,7 +1053,7 @@ describe('runClaude remote JSONL scanner', () => {
         const queued = harness.loopOptions.messageQueue.queue;
         expect(queued).toHaveLength(1);
         expect(queued[0].message.startsWith('로그인 버튼이 안 눌려')).toBe(true);
-        expect(queued[0].message).toContain(CLAUDE_TITLE_INSTRUCTION);
+        expect(queued[0].message).toContain(TITLE_INSTRUCTION);
         await harness.finish();
     });
 
@@ -1070,7 +1070,7 @@ describe('runClaude remote JSONL scanner', () => {
         const queued = harness.loopOptions.messageQueue.queue;
         expect(queued).toHaveLength(1);
         expect(queued[0].message).toBe('fix the parser');
-        expect(queued[0].message).not.toContain(CLAUDE_TITLE_INSTRUCTION);
+        expect(queued[0].message).not.toContain(TITLE_INSTRUCTION);
         await harness.finish();
     });
 });

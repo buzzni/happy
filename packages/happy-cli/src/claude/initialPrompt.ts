@@ -15,7 +15,7 @@
  *     포워딩하지 않게 한다(앱발 프롬프트와 동일한 dedupe 규약).
  */
 
-import { appendClaudeTitleInstruction } from './utils/titlePrompt'
+import { appendTitleInstruction } from '@/utils/titlePrompt'
 import type { RawJSONLines } from './types'
 import {
     buildInitialPromptUserRecord,
@@ -91,7 +91,7 @@ export function deliverInitialPrompt(prompt: string, sink: InitialPromptSink, lo
   // 제목 지시를 덧붙이고, 변형본도 dedupe 스탬프한다.
   let pushText = prompt
   if (!sink.hasTitle()) {
-    const withTitle = appendClaudeTitleInstruction(pushText)
+    const withTitle = appendTitleInstruction(pushText)
     if (withTitle !== pushText) {
       pushText = withTitle
       sink.recordAppPrompt(pushText)

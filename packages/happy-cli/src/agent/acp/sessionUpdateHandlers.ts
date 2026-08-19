@@ -233,6 +233,49 @@ export function handleAgentThoughtChunk(
 }
 
 /**
+ * Grok (`grok agent stdio`) sends the ACP-standard `kind` only on the *follow-up*
+ * `tool_call_update`; the first `tool_call` notification carries the tool name in
+ * `title` and in the `x.ai/tool` metadata extension instead. Reading `kind` alone
+ * therefore labelled every Grok tool call `unknown`
+ * (specs/acp-grok-tool-name-and-title). Agents that do send `kind` are unaffected —
+ * the extra sources are simply absent for them.
+ */
+function xaiToolMeta(update: SessionUpdate): { name?: unknown } | undefined {
+  const meta = update._meta;
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return undefined;
+  const tool = (meta as Record<string, unknown>)['x.ai/tool'];
+  if (!tool || typeof tool !== 'object' || Array.isArray(tool)) return undefined;
+  return tool as { name?: unknown };
+}
+
+function resolveToolName(
+  update: SessionUpdate,
+  toolKindStr: string | undefined,
+  ctx: HandlerContext,
+  toolCallId: string
+): string {
+  const metaName = xaiToolMeta(update)?.name;
+  if (typeof metaName === 'string' && metaName.length > 0) return metaName;
+  if (typeof update.title === 'string' && update.title.length > 0) return update.title;
+  const extracted = ctx.transport.extractToolNameFromId?.(toolCallId);
+  if (extracted) return extracted;
+  return toolKindStr || 'unknown';
+}
+
+/**
+ * ACP puts a tool's *input* in `rawInput`; `content` holds its output blocks.
+ * Grok populates only `rawInput` on the opening notification, so falling back to
+ * `content` alone left every card without a command/path preview.
+ */
+function resolveToolArgs(update: SessionUpdate): Record<string, unknown> {
+  const raw = update.rawInput;
+  if (raw && typeof raw === 'object' && !Array.isArray(raw) && Object.keys(raw).length > 0) {
+    return { ...(raw as Record<string, unknown>) };
+  }
+  return parseArgsFromContent(update.content);
+}
+
+/**
  * Start tracking a new tool call
  */
 export function startToolCall(
@@ -246,9 +289,7 @@ export function startToolCall(
   const toolKindStr = typeof toolKind === 'string' ? toolKind : undefined;
   const isInvestigation = ctx.transport.isInvestigationTool?.(toolCallId, toolKindStr) ?? false;
 
-  // Extract real tool name from toolCallId
-  const extractedName = ctx.transport.extractToolNameFromId?.(toolCallId);
-  const realToolName = extractedName ?? (toolKindStr || 'unknown');
+  const realToolName = resolveToolName(update, toolKindStr, ctx, toolCallId);
 
   // Store mapping for permission requests
   ctx.toolCallIdToNameMap.set(toolCallId, realToolName);
@@ -294,7 +335,7 @@ export function startToolCall(
   ctx.emit({ type: 'status', status: 'running' });
 
   // Parse args and emit tool-call event
-  const args = parseArgsFromContent(update.content);
+  const args = resolveToolArgs(update);
 
   // Extract locations if present
   if (update.locations && Array.isArray(update.locations)) {
@@ -308,7 +349,7 @@ export function startToolCall(
 
   ctx.emit({
     type: 'tool-call',
-    toolName: toolKindStr || 'unknown',
+    toolName: realToolName,
     args,
     callId: toolCallId,
   });
@@ -338,9 +379,11 @@ export function completeToolCall(
 
   logger.debug(`[AcpBackend] ✅ Tool call COMPLETED: ${toolCallId} (${toolKindStr}) - Duration: ${duration}. Active tool calls: ${ctx.activeToolCalls.size}`);
 
+  // Grok's terminal `tool_call_update` carries only `status`/`content`, so the
+  // kind is gone by now — fall back to the name recorded at start.
   ctx.emit({
     type: 'tool-result',
-    toolName: toolKindStr,
+    toolName: ctx.toolCallIdToNameMap.get(toolCallId) ?? toolKindStr,
     result: content,
     callId: toolCallId,
   });
@@ -417,7 +460,7 @@ export function failToolCall(
   // Emit tool-result with error
   ctx.emit({
     type: 'tool-result',
-    toolName: toolKindStr,
+    toolName: ctx.toolCallIdToNameMap.get(toolCallId) ?? toolKindStr,
     result: errorDetail
       ? { error: errorDetail, status }
       : { error: `Tool call ${status}`, status },
