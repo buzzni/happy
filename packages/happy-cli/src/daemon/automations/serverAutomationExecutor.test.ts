@@ -799,7 +799,7 @@ describe('runServerAutomationTick', () => {
 
   it('retains a failed issue marker cleanup and reports typed degradation for retry', async () => {
     const {
-      input, store, transport, queryGithubIssues, removeGithubIssueProgressMarker,
+      input, store, transport, queryGithubIssues, removeGithubIssueProgressMarker, now,
     } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
     })
@@ -835,8 +835,12 @@ describe('runServerAutomationTick', () => {
       degradedCode: 'GITHUB_ISSUE_PROGRESS_MARKER_CLEANUP_FAILED',
     }))
     expect(store.state().githubIssueProgressMarkers).toEqual([expect.objectContaining({
-      sessionId: 'ended-session', reactionId: null,
+      sessionId: 'ended-session', reactionId: null, cleanupRetryAt: now + 15 * 60_000,
     })])
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(removeGithubIssueProgressMarker).toHaveBeenCalledTimes(1)
   })
 
   it('keeps marker cleanup degradation when optional connector preflight also degrades the spawned session', async () => {

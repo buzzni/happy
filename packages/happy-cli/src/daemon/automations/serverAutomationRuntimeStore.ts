@@ -19,6 +19,17 @@ export interface ServerAutomationScheduleState {
   runRequestRevision?: number | null
 }
 
+export interface GithubIssueProgressMarkerState {
+  automationId: string
+  generation: number
+  sessionId: string
+  issueNumber: number
+  actor: string
+  repository: string
+  reactionId: number | null
+  cleanupRetryAt?: number
+}
+
 export interface PendingAutomationReport {
   runId: string
   claimToken: string
@@ -56,15 +67,7 @@ export interface ServerAutomationRuntimeState {
     total: number
     completed: number
   }>
-  githubIssueProgressMarkers?: Array<{
-    automationId: string
-    generation: number
-    sessionId: string
-    issueNumber: number
-    actor: string
-    repository: string
-    reactionId: number | null
-  }>
+  githubIssueProgressMarkers?: GithubIssueProgressMarkerState[]
   pendingReports: PendingAutomationReport[]
 }
 
@@ -265,6 +268,9 @@ function parse(raw: string): ServerAutomationRuntimeState {
         actor: text(row.actor, 200),
         repository: text(row.repository, 512),
         reactionId: row.reactionId === null ? null : integer(row.reactionId, 1),
+        ...(row.cleanupRetryAt === undefined ? {} : {
+          cleanupRetryAt: integer(row.cleanupRetryAt),
+        }),
       }
     })
     return {

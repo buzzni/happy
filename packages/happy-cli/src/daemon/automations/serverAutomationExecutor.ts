@@ -8,6 +8,7 @@ import {
 } from './automationDomain'
 import type { EncryptedServerAutomation, ServerAutomationCacheState, ServerAutomationPayload } from './serverAutomationCache'
 import type {
+  GithubIssueProgressMarkerState,
   PendingAutomationReport,
   ServerAutomationReportOutcome,
   ServerAutomationRuntimeState,
@@ -562,21 +563,44 @@ async function createIssueProgressMarkerAfterSpawn(
   }
 }
 
+function sameGithubIssueProgressMarker(
+  left: GithubIssueProgressMarkerState,
+  right: GithubIssueProgressMarkerState,
+): boolean {
+  return left.automationId === right.automationId
+    && left.generation === right.generation
+    && left.sessionId === right.sessionId
+    && left.issueNumber === right.issueNumber
+    && left.actor === right.actor
+    && left.repository === right.repository
+    && left.reactionId === right.reactionId
+}
+
 function forgetGithubIssueProgressMarker(
   input: ServerAutomationExecutorInput,
-  marker: NonNullable<ServerAutomationRuntimeState['githubIssueProgressMarkers']>[number],
+  marker: GithubIssueProgressMarkerState,
 ): void {
   const state = input.runtimeStore.read()
   input.runtimeStore.write({
     ...state,
-    githubIssueProgressMarkers: (state.githubIssueProgressMarkers ?? []).filter((entry) => !(
-      entry.automationId === marker.automationId
-      && entry.generation === marker.generation
-      && entry.sessionId === marker.sessionId
-      && entry.issueNumber === marker.issueNumber
-      && entry.actor === marker.actor
-      && entry.repository === marker.repository
-      && entry.reactionId === marker.reactionId
+    githubIssueProgressMarkers: (state.githubIssueProgressMarkers ?? []).filter((entry) => (
+      !sameGithubIssueProgressMarker(entry, marker)
+    )),
+  })
+}
+
+function deferGithubIssueProgressMarkerCleanup(
+  input: ServerAutomationExecutorInput,
+  markers: GithubIssueProgressMarkerState[],
+  cleanupRetryAt: number,
+): void {
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...state,
+    githubIssueProgressMarkers: (state.githubIssueProgressMarkers ?? []).map((entry) => (
+      markers.some((marker) => sameGithubIssueProgressMarker(entry, marker))
+        ? { ...entry, cleanupRetryAt }
+        : entry
     )),
   })
 }
@@ -587,9 +611,11 @@ async function cleanupInactiveGithubIssueProgressMarkers(
   payload: ServerAutomationPayload,
   githubEnvironment?: { GH_TOKEN: string; GH_REPO: string },
 ): Promise<string | undefined> {
+  const cleanupRetryAt = computeNextRunAt(payload.schedule, input.now)
   const stale = (input.runtimeStore.read().githubIssueProgressMarkers ?? []).filter((marker) => (
     marker.automationId === automation.automationId
       && !input.isSessionRunning(marker.sessionId)
+      && (marker.cleanupRetryAt === undefined || marker.cleanupRetryAt <= input.now)
   ))
   if (stale.length === 0) return undefined
 
@@ -603,6 +629,7 @@ async function cleanupInactiveGithubIssueProgressMarkers(
       githubEnvironment: identityEnvironment,
     })
     if (!identity.ok) {
+      deferGithubIssueProgressMarkerCleanup(input, stale, cleanupRetryAt)
       input.logDebug?.(
         `[server-automation] ${automation.automationId} GitHub issue progress cleanup identity failed: ${identity.error}`,
       )
@@ -613,6 +640,7 @@ async function cleanupInactiveGithubIssueProgressMarkers(
     for (const marker of stale) {
       if (marker.actor.toLowerCase() !== identity.actor.toLowerCase()) {
         cleanupFailed = true
+        deferGithubIssueProgressMarkerCleanup(input, [marker], cleanupRetryAt)
         input.logDebug?.(
           `[server-automation] ${automation.automationId} GitHub issue progress cleanup actor changed`,
         )
@@ -632,6 +660,7 @@ async function cleanupInactiveGithubIssueProgressMarkers(
         })
         if (!removed.ok) {
           cleanupFailed = true
+          deferGithubIssueProgressMarkerCleanup(input, [marker], cleanupRetryAt)
           input.logDebug?.(
             `[server-automation] ${automation.automationId} GitHub issue progress cleanup failed: ${removed.error}`,
           )
@@ -640,6 +669,7 @@ async function cleanupInactiveGithubIssueProgressMarkers(
         forgetGithubIssueProgressMarker(input, marker)
       } catch (error) {
         cleanupFailed = true
+        deferGithubIssueProgressMarkerCleanup(input, [marker], cleanupRetryAt)
         input.logDebug?.(
           `[server-automation] ${automation.automationId} GitHub issue progress cleanup failed: ${error}`,
         )
@@ -647,6 +677,7 @@ async function cleanupInactiveGithubIssueProgressMarkers(
     }
     return cleanupFailed ? 'GITHUB_ISSUE_PROGRESS_MARKER_CLEANUP_FAILED' : undefined
   } catch (error) {
+    deferGithubIssueProgressMarkerCleanup(input, stale, cleanupRetryAt)
     input.logDebug?.(
       `[server-automation] ${automation.automationId} GitHub issue progress cleanup failed: ${error}`,
     )
@@ -663,6 +694,7 @@ function scheduleInactiveGithubIssueProgressCleanup(
   const cleanupNeeded = (state.githubIssueProgressMarkers ?? []).some((marker) => (
     marker.automationId === automation.automationId
       && !input.isSessionRunning(marker.sessionId)
+      && (marker.cleanupRetryAt === undefined || marker.cleanupRetryAt <= input.now)
   ))
   if (!cleanupNeeded) return
   const schedule = state.schedules.find((entry) => entry.automationId === automation.automationId)
