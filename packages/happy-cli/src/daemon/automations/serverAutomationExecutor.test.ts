@@ -45,6 +45,19 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     issues: [],
   }))
   const notifyGithubTrigger = vi.fn<ServerAutomationExecutorInput['notifyGithubTrigger']>()
+  const resolveGithubIssueProgressMarkerIdentity = vi.fn<ServerAutomationExecutorInput['resolveGithubIssueProgressMarkerIdentity']>(async () => ({
+    ok: true,
+    actor: 'automation-bot',
+    repository: 'acme/app',
+  }))
+  const createGithubIssueProgressMarker = vi.fn<ServerAutomationExecutorInput['createGithubIssueProgressMarker']>(async () => ({
+    ok: true,
+    reactionId: 321,
+  }))
+  const removeGithubIssueProgressMarker = vi.fn<ServerAutomationExecutorInput['removeGithubIssueProgressMarker']>(async () => ({
+    ok: true,
+    removed: true,
+  }))
   const dispatchAgentTask = vi.fn<ServerAutomationExecutorInput['dispatchAgentTask']>(async () => ({
     ok: true,
     dispatch: null,
@@ -89,6 +102,9 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     queryGithubPullRequests,
     queryGithubIssues,
     notifyGithubTrigger,
+    resolveGithubIssueProgressMarkerIdentity,
+    createGithubIssueProgressMarker,
+    removeGithubIssueProgressMarker,
     dispatchAgentTask,
     maintainAgentTaskLease,
     resolveMcpSpawnContext,
@@ -103,6 +119,8 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
   return {
     input, store, transport, decryptPayload, logDebug, runScript, queryGithubPullRequests,
     queryGithubIssues, notifyGithubTrigger, dispatchAgentTask, maintainAgentTaskLease,
+    resolveGithubIssueProgressMarkerIdentity, createGithubIssueProgressMarker,
+    removeGithubIssueProgressMarker,
     resolveMcpSpawnContext, preflightMcpConnectors, linkSession, resumeSession, spawnSession, now,
   }
 }
@@ -202,6 +220,40 @@ describe('runServerAutomationTick', () => {
     expect(transport.claim).not.toHaveBeenCalled()
     expect(runScript).not.toHaveBeenCalled()
     expect(spawnSession).not.toHaveBeenCalled()
+  })
+
+  it('backs off an ended marker cleanup when the claimed run cannot start', async () => {
+    const { input, store, transport, now } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue triage', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Triage', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubIssueProgressMarkers: [{
+        automationId: 'automation-1', generation: 2, sessionId: 'ended-session',
+        issueNumber: 12, actor: 'automation-bot', repository: 'acme/app', reactionId: 321,
+      }],
+    })
+    transport.start.mockResolvedValue({ ok: false, error: 'start unavailable' })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+    expect(store.state().githubIssueProgressMarkers).toEqual([expect.objectContaining({
+      sessionId: 'ended-session', cleanupRetryAt: now + 15 * 60_000,
+    })])
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(transport.start).toHaveBeenCalledTimes(1)
   })
 
   it('runs only after claim and start, then durably retries the same completion report', async () => {
@@ -491,7 +543,10 @@ describe('runServerAutomationTick', () => {
   })
 
   it('persists a matching GitHub event before starting a session with the rendered prompt', async () => {
-    const { input, store, queryGithubPullRequests, spawnSession } = setup({
+    const {
+      input, store, queryGithubPullRequests, spawnSession, createGithubIssueProgressMarker,
+      removeGithubIssueProgressMarker,
+    } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
     })
     input.decryptPayload = vi.fn(() => ({
@@ -510,6 +565,10 @@ describe('runServerAutomationTick', () => {
       githubTriggers: [{
         automationId: 'automation-1', generation: 2,
         state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+      githubIssueProgressMarkers: [{
+        automationId: 'automation-1', generation: 1, sessionId: 'ended-issue-session',
+        issueNumber: 9, actor: 'automation-bot', repository: 'acme/old-app', reactionId: 300,
       }],
     })
     queryGithubPullRequests.mockResolvedValue({
@@ -536,10 +595,20 @@ describe('runServerAutomationTick', () => {
       environmentVariables: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
     }))
     expect(store.state().githubTriggers?.[0]?.state.processed).toContain('10:opened')
+    expect(createGithubIssueProgressMarker).not.toHaveBeenCalled()
+    expect(removeGithubIssueProgressMarker).toHaveBeenCalledWith(expect.objectContaining({
+      issueNumber: 9,
+      repository: 'acme/old-app',
+      reactionId: 300,
+    }))
+    expect(store.state().githubIssueProgressMarkers).toEqual([])
   })
 
   it('spawns an issue_opened session with the issue-rendered prompt and persists the high-water state', async () => {
-    const { input, store, queryGithubPullRequests, queryGithubIssues, spawnSession } = setup({
+    const {
+      input, store, queryGithubPullRequests, queryGithubIssues, spawnSession,
+      resolveGithubIssueProgressMarkerIdentity, createGithubIssueProgressMarker,
+    } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
     })
     input.decryptPayload = vi.fn(() => ({
@@ -591,6 +660,412 @@ describe('runServerAutomationTick', () => {
     }))
     expect(store.state().githubTriggers?.[0]?.state.processed).toContain('12:issue_opened')
     expect(store.state().githubTriggers?.[0]?.state.highestIssueNumber).toBe(12)
+    expect(spawnSession.mock.invocationCallOrder[0]).toBeLessThan(
+      resolveGithubIssueProgressMarkerIdentity.mock.invocationCallOrder[0]!,
+    )
+    expect(resolveGithubIssueProgressMarkerIdentity).toHaveBeenCalledWith({
+      cwd: '/repo',
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
+    })
+    expect(createGithubIssueProgressMarker).toHaveBeenCalledWith({
+      cwd: '/repo',
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
+      issueNumber: 12,
+      actor: 'automation-bot',
+      repository: 'acme/app',
+    })
+    expect(store.state().githubIssueProgressMarkers).toEqual([{
+      automationId: 'automation-1', generation: 2, sessionId: 'session-1', issueNumber: 12,
+      actor: 'automation-bot', repository: 'acme/app', reactionId: 321,
+    }])
+  })
+
+  it('keeps an issue session successful and reports typed degradation when the progress reaction fails', async () => {
+    const {
+      input, store, transport, queryGithubIssues, createGithubIssueProgressMarker,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue triage', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Triage {issue.number}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: {
+          snapshot: [], highestPrNumber: 0, processed: [], pending: [],
+          highestIssueNumber: 11, pendingIssues: [],
+        },
+      }],
+    })
+    queryGithubIssues.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
+      issues: [{
+        number: 12, title: 'Search is broken', url: 'https://github.test/o/r/issues/12',
+        author: { login: 'alice' }, labels: [],
+      }],
+    })
+    createGithubIssueProgressMarker.mockResolvedValue({ ok: false, error: 'reaction denied' })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'WOKE' },
+    ])
+    expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: 'WOKE',
+      sessionId: 'session-1',
+      degradedCode: 'GITHUB_ISSUE_PROGRESS_MARKER_CREATE_FAILED',
+    }))
+    expect(store.state().githubIssueProgressMarkers).toEqual([expect.objectContaining({
+      sessionId: 'session-1', issueNumber: 12, actor: 'automation-bot',
+      repository: 'acme/app', reactionId: null,
+    })])
+  })
+
+  it('removes a persisted issue progress marker after restart when its session is no longer running', async () => {
+    const {
+      input, store, queryGithubIssues, resolveGithubIssueProgressMarkerIdentity,
+      removeGithubIssueProgressMarker,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue triage', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Triage', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: {
+          snapshot: [], highestPrNumber: 0, processed: [], pending: [],
+          highestIssueNumber: 12, pendingIssues: [],
+        },
+      }],
+      githubIssueProgressMarkers: [{
+        automationId: 'automation-1', generation: 2, sessionId: 'ended-session',
+        issueNumber: 12, actor: 'automation-bot', repository: 'acme/old-app', reactionId: 321,
+      }],
+    })
+    queryGithubIssues.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/new-app' },
+      issues: [],
+    })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'SKIPPED_GATE' },
+    ])
+    expect(resolveGithubIssueProgressMarkerIdentity).toHaveBeenCalledWith({
+      cwd: '/repo',
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/old-app' },
+    })
+    expect(removeGithubIssueProgressMarker).toHaveBeenCalledWith({
+      cwd: '/repo',
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/old-app' },
+      issueNumber: 12,
+      actor: 'automation-bot',
+      repository: 'acme/old-app',
+      reactionId: 321,
+    })
+    expect(store.state().githubIssueProgressMarkers).toEqual([])
+  })
+
+  it('brings a future GitHub schedule forward to clean an ended issue marker on the next daemon tick', async () => {
+    const {
+      input, store, transport, queryGithubIssues, removeGithubIssueProgressMarker, now,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue triage', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Triage', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      schedules: [{
+        automationId: 'automation-1', generation: 2, nextRunAt: now + 15 * 60_000,
+        lastSessionId: null,
+      }],
+      githubIssueProgressMarkers: [{
+        automationId: 'automation-1', generation: 2, sessionId: 'ended-session',
+        issueNumber: 12, actor: 'automation-bot', repository: 'acme/app', reactionId: 321,
+      }],
+    })
+    queryGithubIssues.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
+      issues: [],
+    })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'SKIPPED_GATE' },
+    ])
+    expect(transport.claim).toHaveBeenCalledWith({
+      automationId: 'automation-1', generation: 2, scheduledFor: now,
+    })
+    expect(removeGithubIssueProgressMarker).toHaveBeenCalled()
+    expect(store.state().githubIssueProgressMarkers).toEqual([])
+  })
+
+  it('retains a failed issue marker cleanup and reports typed degradation for retry', async () => {
+    const {
+      input, store, transport, queryGithubIssues, removeGithubIssueProgressMarker, now,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue triage', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Triage', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubIssueProgressMarkers: [{
+        automationId: 'automation-1', generation: 2, sessionId: 'ended-session',
+        issueNumber: 12, actor: 'automation-bot', repository: 'acme/app', reactionId: null,
+      }],
+    })
+    queryGithubIssues.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
+      issues: [],
+    })
+    removeGithubIssueProgressMarker.mockResolvedValue({ ok: false, error: 'GitHub unavailable' })
+
+    await runServerAutomationTick(input)
+
+    expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: 'SKIPPED_GATE',
+      degradedCode: 'GITHUB_ISSUE_PROGRESS_MARKER_CLEANUP_FAILED',
+    }))
+    expect(store.state().githubIssueProgressMarkers).toEqual([expect.objectContaining({
+      sessionId: 'ended-session', reactionId: null, cleanupRetryAt: now + 15 * 60_000,
+    })])
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(removeGithubIssueProgressMarker).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps marker cleanup degradation when optional connector preflight also degrades the spawned session', async () => {
+    const {
+      input, store, transport, queryGithubIssues, removeGithubIssueProgressMarker,
+      resolveMcpSpawnContext, preflightMcpConnectors,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue triage', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Triage {issue.number}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: {
+          snapshot: [], highestPrNumber: 0, processed: [], highestIssueNumber: 12, pending: [],
+          pendingIssues: [{
+            id: '12:issue_opened', event: 'issue_opened',
+            issue: {
+              number: 12, title: 'Search is broken', url: 'https://github.test/o/r/issues/12',
+              author: { login: 'alice' }, labels: [],
+            },
+          }],
+        },
+      }],
+      githubIssueProgressMarkers: [{
+        automationId: 'automation-1', generation: 1, sessionId: 'ended-session',
+        issueNumber: 11, actor: 'automation-bot', repository: 'acme/app', reactionId: 300,
+      }],
+    })
+    queryGithubIssues.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
+      issues: [],
+    })
+    removeGithubIssueProgressMarker.mockResolvedValue({ ok: false, error: 'GitHub unavailable' })
+    resolveMcpSpawnContext.mockResolvedValue({
+      ok: true,
+      value: {
+        mcpConfigProjectId: 'P-1', bindingStatus: 'BOUND', connectorPolicy: 'optional',
+        requiredConnectors: ['gmail'],
+      },
+    })
+    preflightMcpConnectors.mockResolvedValue({
+      ok: false, code: 'GRANT_MISSING', unavailableConnectors: ['gmail'],
+    })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'WOKE' },
+    ])
+    expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: 'WOKE',
+      degradedCode: 'GITHUB_ISSUE_PROGRESS_MARKER_CLEANUP_FAILED',
+    }))
+  })
+
+  it('does not remove an issue marker while its session is still running', async () => {
+    const {
+      input, store, queryGithubIssues, resolveGithubIssueProgressMarkerIdentity,
+      removeGithubIssueProgressMarker,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.isSessionRunning = vi.fn((sessionId) => sessionId === 'active-session')
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue triage', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Triage', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubIssueProgressMarkers: [{
+        automationId: 'automation-1', generation: 2, sessionId: 'active-session',
+        issueNumber: 12, actor: 'automation-bot', repository: 'acme/app', reactionId: 321,
+      }],
+    })
+    queryGithubIssues.mockResolvedValue({ ok: true, issues: [] })
+
+    await runServerAutomationTick(input)
+
+    expect(resolveGithubIssueProgressMarkerIdentity).not.toHaveBeenCalled()
+    expect(removeGithubIssueProgressMarker).not.toHaveBeenCalled()
+    expect(store.state().githubIssueProgressMarkers).toEqual([expect.objectContaining({
+      sessionId: 'active-session', reactionId: 321,
+    })])
+  })
+
+  it('keeps a shared issue reaction while another owning session is still running', async () => {
+    const {
+      input, store, queryGithubIssues, removeGithubIssueProgressMarker,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.isSessionRunning = vi.fn((sessionId) => sessionId === 'other-active-session')
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue triage', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Triage', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubIssueProgressMarkers: [{
+        automationId: 'automation-1', generation: 2, sessionId: 'ended-session',
+        issueNumber: 12, actor: 'automation-bot', repository: 'acme/app', reactionId: 321,
+      }, {
+        automationId: 'automation-2', generation: 1, sessionId: 'other-active-session',
+        issueNumber: 12, actor: 'AUTOMATION-BOT', repository: 'ACME/APP', reactionId: 321,
+      }],
+    })
+    queryGithubIssues.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
+      issues: [],
+    })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'SKIPPED_GATE' },
+    ])
+
+    expect(removeGithubIssueProgressMarker).not.toHaveBeenCalled()
+    expect(store.state().githubIssueProgressMarkers).toEqual([expect.objectContaining({
+      automationId: 'automation-2', sessionId: 'other-active-session', reactionId: 321,
+    })])
+  })
+
+  it('does not create an issue progress marker when session spawn fails', async () => {
+    const {
+      input, store, queryGithubIssues, spawnSession,
+      resolveGithubIssueProgressMarkerIdentity, createGithubIssueProgressMarker,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue triage', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Triage', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: {
+          snapshot: [], highestPrNumber: 0, processed: [], pending: [],
+          highestIssueNumber: 11, pendingIssues: [],
+        },
+      }],
+    })
+    queryGithubIssues.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
+      issues: [{
+        number: 12, title: 'Search is broken', url: 'https://github.test/o/r/issues/12',
+        author: { login: 'alice' }, labels: [],
+      }],
+    })
+    spawnSession.mockResolvedValue({ ok: false, error: 'spawn failed' })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'ERROR' },
+    ])
+    expect(resolveGithubIssueProgressMarkerIdentity).not.toHaveBeenCalled()
+    expect(createGithubIssueProgressMarker).not.toHaveBeenCalled()
+    expect(store.state().githubIssueProgressMarkers ?? []).toEqual([])
   })
 
   it('collects an issue baseline without firing on the first observation (fail-closed)', async () => {
@@ -625,7 +1100,10 @@ describe('runServerAutomationTick', () => {
   })
 
   it('notifies issue_opened events without starting an LLM session', async () => {
-    const { input, store, queryGithubIssues, notifyGithubTrigger, resolveMcpSpawnContext, spawnSession } = setup({
+    const {
+      input, store, queryGithubIssues, notifyGithubTrigger, resolveMcpSpawnContext, spawnSession,
+      createGithubIssueProgressMarker,
+    } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
     })
     input.decryptPayload = vi.fn(() => ({
@@ -667,6 +1145,7 @@ describe('runServerAutomationTick', () => {
     })
     expect(resolveMcpSpawnContext).not.toHaveBeenCalled()
     expect(spawnSession).not.toHaveBeenCalled()
+    expect(createGithubIssueProgressMarker).not.toHaveBeenCalled()
   })
 
   it('fails closed when issue_opened is combined with agent-task-review', async () => {
@@ -1362,7 +1841,9 @@ describe('runServerAutomationTick', () => {
   })
 
   it('fails closed when the selected GitHub credential cannot query the repository', async () => {
-    const { input, queryGithubPullRequests, resolveMcpSpawnContext, spawnSession } = setup({
+    const {
+      input, store, transport, queryGithubPullRequests, resolveMcpSpawnContext, spawnSession, now,
+    } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
     })
     input.decryptPayload = vi.fn(() => ({
@@ -1375,6 +1856,13 @@ describe('runServerAutomationTick', () => {
         githubCredentialId: 'missing-credential',
       },
     }))
+    store.write({
+      ...store.read(),
+      githubIssueProgressMarkers: [{
+        automationId: 'automation-1', generation: 1, sessionId: 'ended-issue-session',
+        issueNumber: 9, actor: 'automation-bot', repository: 'acme/app', reactionId: 300,
+      }],
+    })
     queryGithubPullRequests.mockResolvedValue({ ok: false, error: 'credential unavailable' })
 
     await expect(runServerAutomationTick(input)).resolves.toEqual([
@@ -1383,6 +1871,13 @@ describe('runServerAutomationTick', () => {
     expect(queryGithubPullRequests).toHaveBeenCalledTimes(1)
     expect(resolveMcpSpawnContext).not.toHaveBeenCalled()
     expect(spawnSession).not.toHaveBeenCalled()
+    expect(store.state().githubIssueProgressMarkers).toEqual([expect.objectContaining({
+      sessionId: 'ended-issue-session', cleanupRetryAt: now + 15 * 60_000,
+    })])
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(queryGithubPullRequests).toHaveBeenCalledTimes(1)
   })
 
   it('starts at most three GitHub-triggered sessions in one daemon tick', async () => {

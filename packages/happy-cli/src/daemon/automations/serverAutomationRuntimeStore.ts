@@ -19,6 +19,17 @@ export interface ServerAutomationScheduleState {
   runRequestRevision?: number | null
 }
 
+export interface GithubIssueProgressMarkerState {
+  automationId: string
+  generation: number
+  sessionId: string
+  issueNumber: number
+  actor: string
+  repository: string
+  reactionId: number | null
+  cleanupRetryAt?: number
+}
+
 export interface PendingAutomationReport {
   runId: string
   claimToken: string
@@ -56,6 +67,7 @@ export interface ServerAutomationRuntimeState {
     total: number
     completed: number
   }>
+  githubIssueProgressMarkers?: GithubIssueProgressMarkerState[]
   pendingReports: PendingAutomationReport[]
 }
 
@@ -244,7 +256,27 @@ function parse(raw: string): ServerAutomationRuntimeState {
         completed,
       }
     })
-    return { schedules, githubTriggers, githubActiveSessions, githubQueueProgress, pendingReports }
+    const markerRows = disk.githubIssueProgressMarkers === undefined ? [] : disk.githubIssueProgressMarkers
+    if (!Array.isArray(markerRows)) invalid()
+    const githubIssueProgressMarkers = markerRows.map((value) => {
+      const row = record(value)
+      return {
+        automationId: text(row.automationId, 200),
+        generation: integer(row.generation, 1),
+        sessionId: text(row.sessionId, 200),
+        issueNumber: integer(row.issueNumber, 1),
+        actor: text(row.actor, 200),
+        repository: text(row.repository, 512),
+        reactionId: row.reactionId === null ? null : integer(row.reactionId, 1),
+        ...(row.cleanupRetryAt === undefined ? {} : {
+          cleanupRetryAt: integer(row.cleanupRetryAt),
+        }),
+      }
+    })
+    return {
+      schedules, githubTriggers, githubActiveSessions, githubQueueProgress,
+      githubIssueProgressMarkers, pendingReports,
+    }
   } catch (error) {
     if (error instanceof Error && error.message === 'automation-runtime-invalid') throw error
     invalid()
@@ -261,7 +293,8 @@ export function createServerAutomationRuntimeStore(options: { filePath: string }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
           return {
-            schedules: [], githubTriggers: [], githubActiveSessions: [], githubQueueProgress: [], pendingReports: [],
+            schedules: [], githubTriggers: [], githubActiveSessions: [], githubQueueProgress: [],
+            githubIssueProgressMarkers: [], pendingReports: [],
           }
         }
         throw error

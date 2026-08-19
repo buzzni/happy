@@ -8,6 +8,7 @@ import {
 } from './automationDomain'
 import type { EncryptedServerAutomation, ServerAutomationCacheState, ServerAutomationPayload } from './serverAutomationCache'
 import type {
+  GithubIssueProgressMarkerState,
   PendingAutomationReport,
   ServerAutomationReportOutcome,
   ServerAutomationRuntimeState,
@@ -75,6 +76,34 @@ export interface ServerAutomationExecutorInput {
     | { ok: false; error: string }
   >
   notifyGithubTrigger: (input: { title: string; body: string; url: string }) => void
+  resolveGithubIssueProgressMarkerIdentity: (input: {
+    cwd: string
+    githubEnvironment?: Record<string, string>
+  }) => Promise<
+    | { ok: true; actor: string; repository: string }
+    | { ok: false; error: string }
+  >
+  createGithubIssueProgressMarker: (input: {
+    cwd: string
+    githubEnvironment?: Record<string, string>
+    issueNumber: number
+    actor: string
+    repository: string
+  }) => Promise<
+    | { ok: true; reactionId: number }
+    | { ok: false; error: string }
+  >
+  removeGithubIssueProgressMarker: (input: {
+    cwd: string
+    githubEnvironment?: Record<string, string>
+    issueNumber: number
+    actor: string
+    repository: string
+    reactionId: number | null
+  }) => Promise<
+    | { ok: true; removed: boolean }
+    | { ok: false; error: string }
+  >
   dispatchAgentTask: (input: {
     runId: string
     claimToken: string
@@ -455,6 +484,270 @@ function rememberGithubSession(
   })
 }
 
+function rememberGithubIssueProgressMarker(
+  input: ServerAutomationExecutorInput,
+  automation: EncryptedServerAutomation,
+  marker: {
+    sessionId: string
+    issueNumber: number
+    actor: string
+    repository: string
+    reactionId: number | null
+  },
+): void {
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...state,
+    githubIssueProgressMarkers: [
+      ...(state.githubIssueProgressMarkers ?? []).filter((entry) => entry.sessionId !== marker.sessionId),
+      {
+        automationId: automation.automationId,
+        generation: automation.generation,
+        ...marker,
+      },
+    ],
+  })
+}
+
+async function createIssueProgressMarkerAfterSpawn(
+  input: ServerAutomationExecutorInput,
+  automation: EncryptedServerAutomation,
+  payload: ServerAutomationPayload,
+  sessionId: string,
+  issue: { number: number; githubEnvironment?: { GH_TOKEN: string; GH_REPO: string } },
+): Promise<string | undefined> {
+  try {
+    const identity = await input.resolveGithubIssueProgressMarkerIdentity({
+      cwd: payload.directory,
+      githubEnvironment: issue.githubEnvironment,
+    })
+    if (!identity.ok) {
+      input.logDebug?.(
+        `[server-automation] ${automation.automationId} GitHub issue progress identity failed: ${identity.error}`,
+      )
+      return 'GITHUB_ISSUE_PROGRESS_MARKER_CREATE_FAILED'
+    }
+    rememberGithubIssueProgressMarker(input, automation, {
+      sessionId,
+      issueNumber: issue.number,
+      actor: identity.actor,
+      repository: identity.repository,
+      reactionId: null,
+    })
+    const created = await input.createGithubIssueProgressMarker({
+      cwd: payload.directory,
+      githubEnvironment: issue.githubEnvironment,
+      issueNumber: issue.number,
+      actor: identity.actor,
+      repository: identity.repository,
+    })
+    if (!created.ok) {
+      input.logDebug?.(
+        `[server-automation] ${automation.automationId} GitHub issue progress creation failed: ${created.error}`,
+      )
+      return 'GITHUB_ISSUE_PROGRESS_MARKER_CREATE_FAILED'
+    }
+    rememberGithubIssueProgressMarker(input, automation, {
+      sessionId,
+      issueNumber: issue.number,
+      actor: identity.actor,
+      repository: identity.repository,
+      reactionId: created.reactionId,
+    })
+    return undefined
+  } catch (error) {
+    input.logDebug?.(
+      `[server-automation] ${automation.automationId} GitHub issue progress creation failed: ${error}`,
+    )
+    return 'GITHUB_ISSUE_PROGRESS_MARKER_CREATE_FAILED'
+  }
+}
+
+function sameGithubIssueProgressMarker(
+  left: GithubIssueProgressMarkerState,
+  right: GithubIssueProgressMarkerState,
+): boolean {
+  return left.automationId === right.automationId
+    && left.generation === right.generation
+    && left.sessionId === right.sessionId
+    && left.issueNumber === right.issueNumber
+    && left.actor === right.actor
+    && left.repository === right.repository
+    && left.reactionId === right.reactionId
+}
+
+function sameGithubIssueProgressReaction(
+  left: GithubIssueProgressMarkerState,
+  right: GithubIssueProgressMarkerState,
+): boolean {
+  return left.issueNumber === right.issueNumber
+    && left.actor.toLowerCase() === right.actor.toLowerCase()
+    && left.repository.toLowerCase() === right.repository.toLowerCase()
+}
+
+function forgetGithubIssueProgressMarker(
+  input: ServerAutomationExecutorInput,
+  marker: GithubIssueProgressMarkerState,
+): void {
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...state,
+    githubIssueProgressMarkers: (state.githubIssueProgressMarkers ?? []).filter((entry) => (
+      !sameGithubIssueProgressMarker(entry, marker)
+    )),
+  })
+}
+
+function deferGithubIssueProgressMarkerCleanup(
+  input: ServerAutomationExecutorInput,
+  markers: GithubIssueProgressMarkerState[],
+  cleanupRetryAt: number,
+): void {
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...state,
+    githubIssueProgressMarkers: (state.githubIssueProgressMarkers ?? []).map((entry) => (
+      markers.some((marker) => sameGithubIssueProgressMarker(entry, marker))
+        ? { ...entry, cleanupRetryAt }
+        : entry
+    )),
+  })
+}
+
+function inactiveGithubIssueProgressMarkersDue(
+  input: ServerAutomationExecutorInput,
+  automation: EncryptedServerAutomation,
+): GithubIssueProgressMarkerState[] {
+  return (input.runtimeStore.read().githubIssueProgressMarkers ?? []).filter((marker) => (
+    marker.automationId === automation.automationId
+      && !input.isSessionRunning(marker.sessionId)
+      && (marker.cleanupRetryAt === undefined || marker.cleanupRetryAt <= input.now)
+  ))
+}
+
+function deferInactiveGithubIssueProgressMarkerCleanup(
+  input: ServerAutomationExecutorInput,
+  automation: EncryptedServerAutomation,
+  payload: ServerAutomationPayload,
+): void {
+  const markers = inactiveGithubIssueProgressMarkersDue(input, automation)
+  if (markers.length === 0) return
+  deferGithubIssueProgressMarkerCleanup(
+    input,
+    markers,
+    computeNextRunAt(payload.schedule, input.now),
+  )
+}
+
+async function cleanupInactiveGithubIssueProgressMarkers(
+  input: ServerAutomationExecutorInput,
+  automation: EncryptedServerAutomation,
+  payload: ServerAutomationPayload,
+  githubEnvironment?: { GH_TOKEN: string; GH_REPO: string },
+): Promise<string | undefined> {
+  const cleanupRetryAt = computeNextRunAt(payload.schedule, input.now)
+  const stale = inactiveGithubIssueProgressMarkersDue(input, automation)
+  if (stale.length === 0) return undefined
+
+  const markers = input.runtimeStore.read().githubIssueProgressMarkers ?? []
+  const removable: GithubIssueProgressMarkerState[] = []
+  for (const marker of stale) {
+    const sharedByActiveSession = markers.some((entry) => (
+      entry.sessionId !== marker.sessionId
+        && sameGithubIssueProgressReaction(entry, marker)
+        && input.isSessionRunning(entry.sessionId)
+    ))
+    if (sharedByActiveSession) {
+      forgetGithubIssueProgressMarker(input, marker)
+    } else {
+      removable.push(marker)
+    }
+  }
+  if (removable.length === 0) return undefined
+
+  try {
+    const identityEnvironment = {
+      ...(githubEnvironment ?? {}),
+      GH_REPO: removable[0]!.repository,
+    }
+    const identity = await input.resolveGithubIssueProgressMarkerIdentity({
+      cwd: payload.directory,
+      githubEnvironment: identityEnvironment,
+    })
+    if (!identity.ok) {
+      deferGithubIssueProgressMarkerCleanup(input, removable, cleanupRetryAt)
+      input.logDebug?.(
+        `[server-automation] ${automation.automationId} GitHub issue progress cleanup identity failed: ${identity.error}`,
+      )
+      return 'GITHUB_ISSUE_PROGRESS_MARKER_CLEANUP_FAILED'
+    }
+
+    let cleanupFailed = false
+    for (const marker of removable) {
+      if (marker.actor.toLowerCase() !== identity.actor.toLowerCase()) {
+        cleanupFailed = true
+        deferGithubIssueProgressMarkerCleanup(input, [marker], cleanupRetryAt)
+        input.logDebug?.(
+          `[server-automation] ${automation.automationId} GitHub issue progress cleanup actor changed`,
+        )
+        continue
+      }
+      try {
+        const removed = await input.removeGithubIssueProgressMarker({
+          cwd: payload.directory,
+          githubEnvironment: {
+            ...(githubEnvironment ?? {}),
+            GH_REPO: marker.repository,
+          },
+          issueNumber: marker.issueNumber,
+          actor: marker.actor,
+          repository: marker.repository,
+          reactionId: marker.reactionId,
+        })
+        if (!removed.ok) {
+          cleanupFailed = true
+          deferGithubIssueProgressMarkerCleanup(input, [marker], cleanupRetryAt)
+          input.logDebug?.(
+            `[server-automation] ${automation.automationId} GitHub issue progress cleanup failed: ${removed.error}`,
+          )
+          continue
+        }
+        forgetGithubIssueProgressMarker(input, marker)
+      } catch (error) {
+        cleanupFailed = true
+        deferGithubIssueProgressMarkerCleanup(input, [marker], cleanupRetryAt)
+        input.logDebug?.(
+          `[server-automation] ${automation.automationId} GitHub issue progress cleanup failed: ${error}`,
+        )
+      }
+    }
+    return cleanupFailed ? 'GITHUB_ISSUE_PROGRESS_MARKER_CLEANUP_FAILED' : undefined
+  } catch (error) {
+    deferGithubIssueProgressMarkerCleanup(input, removable, cleanupRetryAt)
+    input.logDebug?.(
+      `[server-automation] ${automation.automationId} GitHub issue progress cleanup failed: ${error}`,
+    )
+    return 'GITHUB_ISSUE_PROGRESS_MARKER_CLEANUP_FAILED'
+  }
+}
+
+function scheduleInactiveGithubIssueProgressCleanup(
+  input: ServerAutomationExecutorInput,
+  automation: EncryptedServerAutomation,
+  now: number,
+): void {
+  const state = input.runtimeStore.read()
+  if (inactiveGithubIssueProgressMarkersDue(input, automation).length === 0) return
+  const schedule = state.schedules.find((entry) => entry.automationId === automation.automationId)
+  if (!schedule || schedule.nextRunAt <= now) return
+  input.runtimeStore.write({
+    ...state,
+    schedules: state.schedules.map((entry) => entry.automationId === automation.automationId
+      ? { ...entry, nextRunAt: now }
+      : entry),
+  })
+}
+
 function updateGithubQueueProgress(
   input: ServerAutomationExecutorInput,
   automation: EncryptedServerAutomation,
@@ -502,6 +795,11 @@ async function executeStartedRun(
   let environmentVariables: Record<string, string> | undefined
   let agentTaskDispatch: AutomationAgentTaskDispatch | null = null
   let persistGithubTriggerState: (() => void) | null = null
+  let issueProgressMarker: {
+    number: number
+    githubEnvironment?: { GH_TOKEN: string; GH_REPO: string }
+  } | null = null
+  let degradedCode: string | undefined
   if (payload.githubTrigger?.event === 'issue_opened') {
     // Issue triggers only support the notify/start-session actions — AgentTask
     // review is a PR concept. Fail closed instead of degrading silently.
@@ -516,9 +814,16 @@ async function executeStartedRun(
       claimToken: run.claimToken,
     })
     if (!query.ok) {
+      deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
       input.logDebug?.(`[server-automation] ${automation.automationId} GitHub issue query failed: ${query.error}`)
       return { outcome: 'ERROR', sessionId: null }
     }
+    degradedCode = await cleanupInactiveGithubIssueProgressMarkers(
+      input,
+      automation,
+      payload,
+      query.githubEnvironment,
+    )
     const runtime = input.runtimeStore.read()
     const previous = (runtime.githubTriggers ?? []).find((entry) => (
       entry.automationId === automation.automationId && entry.generation === automation.generation
@@ -535,6 +840,7 @@ async function executeStartedRun(
       return {
         outcome: 'SKIPPED_GATE', sessionId: null,
         queueDepth: planned.state.pendingIssues?.length ?? 0,
+        ...(degradedCode ? { degradedCode } : {}),
       }
     }
     if (!planned.event) {
@@ -542,6 +848,7 @@ async function executeStartedRun(
       return {
         outcome: 'SKIPPED_GATE', sessionId: null,
         queueDepth: planned.state.pendingIssues?.length ?? 0,
+        ...(degradedCode ? { degradedCode } : {}),
       }
     }
     const rendered = renderGithubIssueTriggerPrompt(payload.prompt, planned.event.issue, planned.event.event)
@@ -555,10 +862,15 @@ async function executeStartedRun(
       return {
         outcome: 'WOKE', sessionId: null,
         queueDepth: planned.state.pendingIssues?.length ?? 0,
+        ...(degradedCode ? { degradedCode } : {}),
       }
     }
     prompt = `${GITHUB_ISSUE_TRIGGER_PROMPT_PREAMBLE}\n\n${rendered}`
     environmentVariables = query.githubEnvironment
+    issueProgressMarker = {
+      number: planned.event.issue.number,
+      githubEnvironment: query.githubEnvironment,
+    }
   } else if (payload.githubTrigger) {
     const query = await input.queryGithubPullRequests({
       cwd: payload.directory,
@@ -567,9 +879,16 @@ async function executeStartedRun(
       claimToken: run.claimToken,
     })
     if (!query.ok) {
+      deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
       input.logDebug?.(`[server-automation] ${automation.automationId} GitHub query failed: ${query.error}`)
       return { outcome: 'ERROR', sessionId: null }
     }
+    degradedCode = await cleanupInactiveGithubIssueProgressMarkers(
+      input,
+      automation,
+      payload,
+      query.githubEnvironment,
+    )
     const runtime = input.runtimeStore.read()
     const previous = (runtime.githubTriggers ?? []).find((entry) => (
       entry.automationId === automation.automationId && entry.generation === automation.generation
@@ -584,7 +903,10 @@ async function executeStartedRun(
     if (githubMode === 'poll'
       && (payload.githubTrigger.action !== 'agent-task-review' || planned.state.pending.length > 0)) {
       persistGithubTriggerState()
-      return { outcome: 'SKIPPED_GATE', sessionId: null, queueDepth: planned.state.pending.length }
+      return {
+        outcome: 'SKIPPED_GATE', sessionId: null, queueDepth: planned.state.pending.length,
+        ...(degradedCode ? { degradedCode } : {}),
+      }
     }
     if (payload.githubTrigger.action === 'agent-task-review') {
       const credentialId = payload.githubTrigger.githubCredentialId
@@ -609,6 +931,7 @@ async function executeStartedRun(
       persistGithubTriggerState = null
       if (!bridged.dispatch) return {
         outcome: 'SKIPPED_GATE', sessionId: null, queueDepth: planned.state.pending.length,
+        ...(degradedCode ? { degradedCode } : {}),
       }
       agentTaskDispatch = bridged.dispatch
       prompt = buildAgentTaskPrompt(bridged.dispatch, payload.prompt)
@@ -626,7 +949,10 @@ async function executeStartedRun(
     } else {
       if (!planned.event) {
         persistGithubTriggerState()
-        return { outcome: 'SKIPPED_GATE', sessionId: null, queueDepth: planned.state.pending.length }
+        return {
+          outcome: 'SKIPPED_GATE', sessionId: null, queueDepth: planned.state.pending.length,
+          ...(degradedCode ? { degradedCode } : {}),
+        }
       }
       const rendered = renderGithubTriggerPrompt(payload.prompt, planned.event.pr, planned.event.event)
       if (payload.githubTrigger.action === 'notify') {
@@ -636,7 +962,10 @@ async function executeStartedRun(
           url: planned.event.pr.url,
         })
         persistGithubTriggerState()
-        return { outcome: 'WOKE', sessionId: null, queueDepth: planned.state.pending.length }
+        return {
+          outcome: 'WOKE', sessionId: null, queueDepth: planned.state.pending.length,
+          ...(degradedCode ? { degradedCode } : {}),
+        }
       }
       prompt = `${GITHUB_TRIGGER_PROMPT_PREAMBLE}\n\n${rendered}`
       environmentVariables = query.githubEnvironment
@@ -650,12 +979,16 @@ async function executeStartedRun(
       cwd: payload.directory,
       timeout: SCRIPT_TIMEOUT_MS,
     })
-    if (!script.ok) return { outcome: 'ERROR', sessionId: null }
+    if (!script.ok) return {
+      outcome: 'ERROR', sessionId: null,
+      ...(degradedCode ? { degradedCode } : {}),
+    }
     if (!shouldWakeFromScriptOutput(script.stdout)) {
       persistGithubTriggerState?.()
       return {
         outcome: 'SKIPPED_GATE', sessionId: null,
         ...(payload.githubTrigger ? { queueDepth: githubQueueDepth(input, automation) } : {}),
+        ...(degradedCode ? { degradedCode } : {}),
       }
     }
     scriptOutput = script.stdout
@@ -672,16 +1005,19 @@ async function executeStartedRun(
       outcome: 'ERROR',
       sessionId: null,
       failureCode: mcpContext.code ?? 'GRANT_EXCHANGE_FAILED',
+      ...(degradedCode ? { degradedCode } : {}),
     }
   }
   let spawnMcpContext: AutomationMcpSpawnContext | undefined
   let expectedConnectors: string[] | undefined
-  let degradedCode: string | undefined
   if (!agentTaskDispatch) {
     const context = mcpContext.value
     if (!context || context.connectorPolicy === 'unspecified') {
       input.logDebug?.(`[server-automation] run=${run.runId} automation=${automation.automationId} precondition=POLICY_UNSPECIFIED`)
-      return { outcome: 'ERROR', sessionId: null, failureCode: 'POLICY_UNSPECIFIED' }
+      return {
+        outcome: 'ERROR', sessionId: null, failureCode: 'POLICY_UNSPECIFIED',
+        ...(degradedCode ? { degradedCode } : {}),
+      }
     }
     expectedConnectors = context.requiredConnectors
     if (context.connectorPolicy !== 'none') {
@@ -692,9 +1028,12 @@ async function executeStartedRun(
           + ` providers=${preflight.unavailableConnectors.join(',') || '(none)'}`,
         )
         if (context.connectorPolicy === 'required') {
-          return { outcome: 'ERROR', sessionId: null, failureCode: preflight.code }
+          return {
+            outcome: 'ERROR', sessionId: null, failureCode: preflight.code,
+            ...(degradedCode ? { degradedCode } : {}),
+          }
         }
-        degradedCode = preflight.code
+        degradedCode ??= preflight.code
       } else {
         input.logDebug?.(
           `[server-automation] run=${run.runId} automation=${automation.automationId}`
@@ -757,7 +1096,18 @@ async function executeStartedRun(
     spawned = await input.spawnSession(spawnInput)
   }
   if (spawned.ok && agentTaskDispatch) input.maintainAgentTaskLease(agentTaskDispatch)
-  if (spawned.ok) persistGithubTriggerState?.()
+  if (spawned.ok) {
+    persistGithubTriggerState?.()
+    if (issueProgressMarker) {
+      degradedCode = await createIssueProgressMarkerAfterSpawn(
+        input,
+        automation,
+        payload,
+        spawned.sessionId,
+        issueProgressMarker,
+      ) ?? degradedCode
+    }
+  }
   return spawned.ok
     ? {
         outcome: 'WOKE',
@@ -767,7 +1117,10 @@ async function executeStartedRun(
           queueDepth: githubQueueDepth(input, automation),
         } : {}),
       }
-    : { outcome: 'ERROR', sessionId: null }
+    : {
+        outcome: 'ERROR', sessionId: null,
+        ...(degradedCode ? { degradedCode } : {}),
+      }
 }
 
 export async function runServerAutomationTick(
@@ -798,8 +1151,9 @@ export async function runServerAutomationTick(
   const outcomes: Array<{ automationId: string; outcome: ServerAutomationReportOutcome }> = []
   let githubEventsProcessed = 0
   for (const automation of decryptableAutomations) {
-    if (payloads.get(automation.automationId)?.githubTrigger?.action === 'notify') continue
-    activeGithubSessions(input, automation)
+    const payload = payloads.get(automation.automationId)!
+    if (payload.githubTrigger?.action !== 'notify') activeGithubSessions(input, automation)
+    if (payload.githubTrigger) scheduleInactiveGithubIssueProgressCleanup(input, automation, now)
   }
   const activeGithubWorkerSessions = new Set(activeGithubSessionsAcrossGenerations(input))
   const workQueue = [...decryptableAutomations]
@@ -840,6 +1194,7 @@ export async function runServerAutomationTick(
       if (claim.error === 'claim-denied' || claim.error === 'already-claimed'
         || (claim.error === 'active-run' && schedule.runRequestRevision == null)) {
         advanceSchedule(input, automation.automationId, payload, now)
+        deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
         if (payload.githubTrigger) schedulePendingGithubEvent(input, automation, now)
       }
       continue
@@ -849,7 +1204,10 @@ export async function runServerAutomationTick(
     const runId = claim.value.runId as string
     const claimToken = claim.value.claimToken as string
     const started = await input.transport.start({ runId, claimToken })
-    if (!started.ok) continue
+    if (!started.ok) {
+      deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
+      continue
+    }
 
     const heartbeat = setInterval(() => {
       void input.transport.heartbeat({ runId, claimToken }).catch((error) => {
