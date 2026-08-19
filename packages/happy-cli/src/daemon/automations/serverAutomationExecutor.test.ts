@@ -978,6 +978,50 @@ describe('runServerAutomationTick', () => {
     })])
   })
 
+  it('keeps a shared issue reaction while another owning session is still running', async () => {
+    const {
+      input, store, queryGithubIssues, removeGithubIssueProgressMarker,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.isSessionRunning = vi.fn((sessionId) => sessionId === 'other-active-session')
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue triage', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Triage', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubIssueProgressMarkers: [{
+        automationId: 'automation-1', generation: 2, sessionId: 'ended-session',
+        issueNumber: 12, actor: 'automation-bot', repository: 'acme/app', reactionId: 321,
+      }, {
+        automationId: 'automation-2', generation: 1, sessionId: 'other-active-session',
+        issueNumber: 12, actor: 'AUTOMATION-BOT', repository: 'ACME/APP', reactionId: 321,
+      }],
+    })
+    queryGithubIssues.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
+      issues: [],
+    })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'SKIPPED_GATE' },
+    ])
+
+    expect(removeGithubIssueProgressMarker).not.toHaveBeenCalled()
+    expect(store.state().githubIssueProgressMarkers).toEqual([expect.objectContaining({
+      automationId: 'automation-2', sessionId: 'other-active-session', reactionId: 321,
+    })])
+  })
+
   it('does not create an issue progress marker when session spawn fails', async () => {
     const {
       input, store, queryGithubIssues, spawnSession,

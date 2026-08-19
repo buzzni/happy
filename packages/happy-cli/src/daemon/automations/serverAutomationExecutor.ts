@@ -576,6 +576,15 @@ function sameGithubIssueProgressMarker(
     && left.reactionId === right.reactionId
 }
 
+function sameGithubIssueProgressReaction(
+  left: GithubIssueProgressMarkerState,
+  right: GithubIssueProgressMarkerState,
+): boolean {
+  return left.issueNumber === right.issueNumber
+    && left.actor.toLowerCase() === right.actor.toLowerCase()
+    && left.repository.toLowerCase() === right.repository.toLowerCase()
+}
+
 function forgetGithubIssueProgressMarker(
   input: ServerAutomationExecutorInput,
   marker: GithubIssueProgressMarkerState,
@@ -640,17 +649,33 @@ async function cleanupInactiveGithubIssueProgressMarkers(
   const stale = inactiveGithubIssueProgressMarkersDue(input, automation)
   if (stale.length === 0) return undefined
 
+  const markers = input.runtimeStore.read().githubIssueProgressMarkers ?? []
+  const removable: GithubIssueProgressMarkerState[] = []
+  for (const marker of stale) {
+    const sharedByActiveSession = markers.some((entry) => (
+      entry.sessionId !== marker.sessionId
+        && sameGithubIssueProgressReaction(entry, marker)
+        && input.isSessionRunning(entry.sessionId)
+    ))
+    if (sharedByActiveSession) {
+      forgetGithubIssueProgressMarker(input, marker)
+    } else {
+      removable.push(marker)
+    }
+  }
+  if (removable.length === 0) return undefined
+
   try {
     const identityEnvironment = {
       ...(githubEnvironment ?? {}),
-      GH_REPO: stale[0]!.repository,
+      GH_REPO: removable[0]!.repository,
     }
     const identity = await input.resolveGithubIssueProgressMarkerIdentity({
       cwd: payload.directory,
       githubEnvironment: identityEnvironment,
     })
     if (!identity.ok) {
-      deferGithubIssueProgressMarkerCleanup(input, stale, cleanupRetryAt)
+      deferGithubIssueProgressMarkerCleanup(input, removable, cleanupRetryAt)
       input.logDebug?.(
         `[server-automation] ${automation.automationId} GitHub issue progress cleanup identity failed: ${identity.error}`,
       )
@@ -658,7 +683,7 @@ async function cleanupInactiveGithubIssueProgressMarkers(
     }
 
     let cleanupFailed = false
-    for (const marker of stale) {
+    for (const marker of removable) {
       if (marker.actor.toLowerCase() !== identity.actor.toLowerCase()) {
         cleanupFailed = true
         deferGithubIssueProgressMarkerCleanup(input, [marker], cleanupRetryAt)
@@ -698,7 +723,7 @@ async function cleanupInactiveGithubIssueProgressMarkers(
     }
     return cleanupFailed ? 'GITHUB_ISSUE_PROGRESS_MARKER_CLEANUP_FAILED' : undefined
   } catch (error) {
-    deferGithubIssueProgressMarkerCleanup(input, stale, cleanupRetryAt)
+    deferGithubIssueProgressMarkerCleanup(input, removable, cleanupRetryAt)
     input.logDebug?.(
       `[server-automation] ${automation.automationId} GitHub issue progress cleanup failed: ${error}`,
     )
