@@ -3,12 +3,16 @@ import { serializerCompiler, validatorCompiler, ZodTypeProvider } from "fastify-
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type Fastify } from "../types";
 
-const { state, dbMock, resetState, accessKeyFindUnique } = vi.hoisted(() => {
-    const state = { accessKey: null as any };
-    const resetState = () => { state.accessKey = null; };
-    const accessKeyFindUnique = vi.fn(async () => state.accessKey);
-    const dbMock = { accessKey: { findUnique: accessKeyFindUnique } };
-    return { state, dbMock, resetState, accessKeyFindUnique };
+const { state, dbMock, resetState, sessionFindFirst, machineFindFirst } = vi.hoisted(() => {
+    const state = { session: null as any, machine: null as any };
+    const resetState = () => { state.session = null; state.machine = null; };
+    const sessionFindFirst = vi.fn(async () => state.session);
+    const machineFindFirst = vi.fn(async () => state.machine);
+    const dbMock = {
+        session: { findFirst: sessionFindFirst },
+        machine: { findFirst: machineFindFirst },
+    };
+    return { state, dbMock, resetState, sessionFindFirst, machineFindFirst };
 });
 
 vi.mock("@/storage/db", () => ({ db: dbMock }));
@@ -45,31 +49,44 @@ function ask(app: Fastify, opts: { userId?: string; machineId?: unknown; session
 // specs/cli-agent-spawn-project-visibility-server (aplus-dev-studio).
 //
 // A+ needs to know whether the machine calling it really owns a session that `agent spawn`
-// just created, WITHOUT an automation run claim — a plain spawn has none. The AccessKey row
-// is the proof: it exists exactly when this machine can read that session's data.
+// just created, WITHOUT an automation run claim — a plain spawn has none.
+//
+// The first implementation proved this with the `AccessKey` table (a machine can decrypt a
+// session's data only if it holds a wrapped key for it). Real E2E testing against production
+// found that table permanently empty: no Happy client — not happy-cli, not happy-app — ever
+// calls the route that would populate it. It is unused infrastructure, not a live signal.
+//
+// The proof used here instead: `Session.accountId` and `Machine.accountId` are plain columns
+// (not the encrypted `metadata`/`data` blobs), and `accessKeysRoutes.ts`'s own GET handler
+// already trusts exactly this pair to establish "this account may touch this session/machine".
+// It is a same-account check, not a same-machine check — weaker than the AccessKey model would
+// have been (any of the account's machines can now claim any of the account's sessions), but it
+// is real, and for a daemon self-reporting a session it just spawned that is the same trust bar
+// `chat -p` already assumes end to end.
 describe("machineSessionOwnerRoutes — POST /v1/machine-sessions/:sessionId/owner", () => {
     let app: Fastify;
-    beforeEach(() => { resetState(); accessKeyFindUnique.mockClear(); });
+    beforeEach(() => { resetState(); sessionFindFirst.mockClear(); machineFindFirst.mockClear(); });
     afterEach(async () => { if (app) await app.close(); });
 
-    it("reports the owning account when the machine holds an access key for the session", async () => {
-        state.accessKey = { accountId: "acc-1", machineId: "M-1", sessionId: "S-1" };
+    it("reports the owning account when both the session and the machine belong to it", async () => {
+        state.session = { id: "S-1", accountId: "acc-1" };
+        state.machine = { id: "M-1", accountId: "acc-1" };
         app = await createApp();
 
         const res = await ask(app, { userId: "acc-1" });
 
         expect(res.statusCode).toBe(200);
         expect(res.json()).toEqual({ owner: { ownerAccountId: "acc-1" } });
-        expect(accessKeyFindUnique).toHaveBeenCalledWith({
-            where: { accountId_machineId_sessionId: { accountId: "acc-1", machineId: "M-1", sessionId: "S-1" } },
-        });
+        expect(sessionFindFirst).toHaveBeenCalledWith({ where: { id: "S-1", accountId: "acc-1" } });
+        expect(machineFindFirst).toHaveBeenCalledWith({ where: { id: "M-1", accountId: "acc-1" } });
     });
 
-    it("answers 200 with a null owner when no access key ties this machine to the session", async () => {
+    it("answers 200 with a null owner when the session does not belong to this account", async () => {
         // Deliberately NOT a 404: an older server that does not serve this route at all also
         // answers 404, and the caller must be able to tell "not the owner" (deny) apart from
         // "route unavailable" (retry). Keeping both outcomes on 200 makes any non-200 an outage.
-        state.accessKey = null;
+        state.session = null;
+        state.machine = { id: "M-1", accountId: "acc-1" };
         app = await createApp();
 
         const res = await ask(app, { userId: "acc-1" });
@@ -78,19 +95,26 @@ describe("machineSessionOwnerRoutes — POST /v1/machine-sessions/:sessionId/own
         expect(res.json()).toEqual({ owner: null });
     });
 
-    it("scopes the lookup to the authenticated account, so another account's session is not disclosed", async () => {
-        state.accessKey = null;
+    it("answers 200 with a null owner when the machine does not belong to this account", async () => {
+        state.session = { id: "S-1", accountId: "acc-1" };
+        state.machine = null;
+        app = await createApp();
+
+        const res = await ask(app, { userId: "acc-1" });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.json()).toEqual({ owner: null });
+    });
+
+    it("scopes both lookups to the authenticated account, so another account's session is not disclosed", async () => {
+        state.session = null;
+        state.machine = null;
         app = await createApp();
 
         await ask(app, { userId: "attacker", sessionId: "victim-session" });
 
-        expect(accessKeyFindUnique).toHaveBeenCalledWith({
-            where: {
-                accountId_machineId_sessionId: {
-                    accountId: "attacker", machineId: "M-1", sessionId: "victim-session",
-                },
-            },
-        });
+        expect(sessionFindFirst).toHaveBeenCalledWith({ where: { id: "victim-session", accountId: "attacker" } });
+        expect(machineFindFirst).toHaveBeenCalledWith({ where: { id: "M-1", accountId: "attacker" } });
     });
 
     it("rejects an unauthenticated request", async () => {
@@ -99,7 +123,8 @@ describe("machineSessionOwnerRoutes — POST /v1/machine-sessions/:sessionId/own
         const res = await ask(app);
 
         expect(res.statusCode).toBe(401);
-        expect(accessKeyFindUnique).not.toHaveBeenCalled();
+        expect(sessionFindFirst).not.toHaveBeenCalled();
+        expect(machineFindFirst).not.toHaveBeenCalled();
     });
 
     it("rejects a request with no machineId", async () => {
@@ -113,6 +138,7 @@ describe("machineSessionOwnerRoutes — POST /v1/machine-sessions/:sessionId/own
         });
 
         expect(res.statusCode).toBe(400);
-        expect(accessKeyFindUnique).not.toHaveBeenCalled();
+        expect(sessionFindFirst).not.toHaveBeenCalled();
+        expect(machineFindFirst).not.toHaveBeenCalled();
     });
 });
