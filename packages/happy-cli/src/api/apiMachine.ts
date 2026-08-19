@@ -253,6 +253,14 @@ type MachineRpcHandlers = {
     portRegistry: PortRegistry;
     /** When present, registers the scheduled-automation RPCs and advertises automationSupport. */
     automationStore?: AutomationStore;
+    /**
+     * Reports a freshly spawned session to A+ so it lands in the project's conversation list
+     * (specs/daemon-spawn-project-link). Absent on a plain Happy daemon.
+     *
+     * Returns void on purpose: the spawn path must not be able to await it. The user is waiting
+     * for a session, not for a list to update.
+     */
+    linkSpawnedSession?: (input: { sessionId: string; directory: string }) => void;
     aiCredentialRuntime: AiCredentialRuntime;
 }
 
@@ -326,6 +334,7 @@ export class ApiMachineClient {
         expectedConnectors?: string[];
     }) => Promise<ResumeSessionResult>) | null = null;
     private recoverSessionHandler: ((sessionId: string, options: RecoverSessionOptions) => Promise<RecoverSessionResult>) | null = null;
+    private linkSpawnedSessionHandler: ((input: { sessionId: string; directory: string }) => void) | null = null;
     // specs/remote-terminal-cwd-fallback/ — cached so the
     // terminal-open-fwd handler can run validatePath against the same
     // root the rest of the RPC surface uses (Files tab / writeFile).
@@ -371,9 +380,11 @@ export class ApiMachineClient {
         portRegistry,
         automationStore,
         aiCredentialRuntime,
+        linkSpawnedSession,
     }: MachineRpcHandlers) {
         this.resumeSessionHandler = resumeSession ?? null;
         this.recoverSessionHandler = recoverSession ?? null;
+        this.linkSpawnedSessionHandler = linkSpawnedSession ?? null;
 
         // Scheduled automations CRUD (specs: daemon-scheduled-automations).
         // Handlers live in automationRpcHandlers.ts so they unit-test without
@@ -502,6 +513,14 @@ export class ApiMachineClient {
             switch (result.type) {
                 case 'success':
                     logger.debug(`[API MACHINE] Spawned session ${result.sessionId}`);
+                    // Bookkeeping only, and strictly after the session exists. A failure here
+                    // must never downgrade a live session into a failed spawn, so both the
+                    // synchronous throw and a late rejection are swallowed.
+                    try {
+                        this.linkSpawnedSessionHandler?.({ sessionId: result.sessionId, directory });
+                    } catch (error) {
+                        logger.debug(`[API MACHINE] Project link for ${result.sessionId} failed: ${error}`);
+                    }
                     return { type: 'success', sessionId: result.sessionId };
 
                 case 'requestToApproveDirectoryCreation':

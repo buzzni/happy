@@ -4,6 +4,7 @@ import {
   exchangeAutomationMcpCallerGrant,
   linkAutomationProjectSession,
   linkSpawnedProjectSession,
+  linkSpawnedProjectSessionInBackground,
 } from './automationMcpCallerGrant'
 
 describe('exchangeAutomationMcpCallerGrant', () => {
@@ -272,5 +273,49 @@ describe('linkSpawnedProjectSession', () => {
       directory: '/repo/app',
     })).resolves.toEqual({ ok: false, error: 'invalid Aplus MCP config URL' })
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
+// The spawn hook returns void so the spawn path cannot await it — which also means the spawn
+// path cannot catch anything it leaves behind. That guarantee therefore has to live here.
+describe('linkSpawnedProjectSessionInBackground', () => {
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  const base = {
+    configUrl: 'https://saycode.ai/api/me/mcp-config',
+    machineToken: 'machine-token',
+    machineId: 'M-1',
+    sessionId: 'S-1',
+    directory: '/repo/app',
+  }
+
+  it('returns immediately rather than waiting for the request', async () => {
+    let settle: ((value: Response) => void) | undefined
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => { settle = resolve })))
+
+    expect(linkSpawnedProjectSessionInBackground(base)).toBeUndefined()
+
+    expect(settle).toBeDefined()
+    settle?.(new Response('{}', { status: 200 }))
+  })
+
+  it('logs a failed link at debug level without leaving a rejected promise behind', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('socket hang up') }))
+    const logDebug = vi.fn()
+
+    linkSpawnedProjectSessionInBackground({ ...base, logDebug })
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('spawned session link failed'))
+  })
+
+  it('stays quiet when the link succeeds', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 200 })))
+    const logDebug = vi.fn()
+
+    linkSpawnedProjectSessionInBackground({ ...base, logDebug })
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(logDebug).not.toHaveBeenCalled()
   })
 })

@@ -234,3 +234,31 @@ export async function linkSpawnedProjectSession(input: {
     clearTimeout(timer)
   }
 }
+
+/**
+ * Fire-and-forget form of `linkSpawnedProjectSession`, for the spawn success path.
+ *
+ * The RPC hook returns `void` so the spawn cannot await the link — which also means the spawn
+ * cannot catch whatever the link leaves behind. So the promise is fully settled here: the
+ * happy path is silent, a reported failure is a debug line, and the `.catch` covers the case
+ * where someone later makes the link function itself capable of rejecting. A rejected promise
+ * escaping this function would surface as an unhandled rejection in the daemon.
+ */
+export function linkSpawnedProjectSessionInBackground(input: {
+  configUrl: string | undefined
+  machineToken: string
+  machineId: string
+  sessionId: string
+  directory: string
+  logDebug?: (message: string) => void
+}): void {
+  void linkSpawnedProjectSession(input)
+    .then((result) => {
+      if (!result.ok) {
+        input.logDebug?.(`Spawned session project link failed: ${result.error}`)
+      }
+    })
+    .catch((error) => {
+      input.logDebug?.(`Spawned session project link failed unexpectedly: ${error}`)
+    })
+}
