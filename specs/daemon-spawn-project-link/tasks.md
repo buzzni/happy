@@ -4,10 +4,10 @@
 
 ## Phase 1: 링크 함수
 
-- [ ] T1. (Red) `automationMcpCallerGrant.spec.ts`(또는 형제 spec)에 `linkSpawnedProjectSession`
+- [x] T1. (Red) `automationMcpCallerGrant.spec.ts`(또는 형제 spec)에 `linkSpawnedProjectSession`
   실패 테스트를 쓴다 → 검증: configUrl 없음→`{ok:true,skipped:true}`, 200→`{ok:true}`,
   403/503→`{ok:false,error}`, abort→`{ok:false,error}`. **어떤 케이스도 throw하지 않는다**
-- [ ] T2. (Green) `linkAutomationProjectSession` 옆에 구현. 본문은
+- [x] T2. (Green) `linkAutomationProjectSession` 옆에 구현. 본문은
   `{machineId, sessionId, directory}`, 경로는 `/api/agent-spawn/session-link`,
   타임아웃은 기존 `EXCHANGE_TIMEOUT_MS` 재사용
 

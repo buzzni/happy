@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   exchangeAutomationMcpCallerGrant,
   linkAutomationProjectSession,
+  linkSpawnedProjectSession,
 } from './automationMcpCallerGrant'
 
 describe('exchangeAutomationMcpCallerGrant', () => {
@@ -181,5 +182,95 @@ describe('exchangeAutomationMcpCallerGrant', () => {
       claimToken: 'claim-token',
       sessionId: 'S-1',
     })).resolves.toEqual({ ok: false, error: 'session link returned 503' })
+  })
+})
+
+// specs/daemon-spawn-project-link — the same "tell A+ about this session" job as
+// linkAutomationProjectSession, but for a session `agent spawn` created, which has no
+// automation run behind it. A+ derives the project from the directory; the daemon does not
+// know or decide which project this is.
+describe('linkSpawnedProjectSession', () => {
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('posts the spawn directory so A+ can work out which project it belongs to', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true, linked: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(linkSpawnedProjectSession({
+      configUrl: 'https://saycode.ai/api/me/mcp-config',
+      machineToken: 'machine-token',
+      machineId: 'M-1',
+      sessionId: 'S-1',
+      directory: '/repo/app',
+    })).resolves.toEqual({ ok: true })
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://saycode.ai/api/agent-spawn/session-link',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ Authorization: 'Bearer machine-token' }),
+        body: JSON.stringify({ machineId: 'M-1', sessionId: 'S-1', directory: '/repo/app' }),
+      }),
+    )
+  })
+
+  it('skips when the daemon has no trusted Aplus URL — a plain Happy daemon is not a failure', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const logDebug = vi.fn()
+
+    await expect(linkSpawnedProjectSession({
+      configUrl: undefined,
+      machineToken: 'machine-token',
+      machineId: 'M-1',
+      sessionId: 'S-1',
+      directory: '/repo/app',
+      logDebug,
+    })).resolves.toEqual({ ok: true, skipped: true })
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('HAPPY_APLUS_MCP_CONFIG_URL'))
+  })
+
+  it('reports a non-2xx as a plain result rather than throwing', async () => {
+    // The caller runs on the spawn success path and must never see an exception (R2).
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 503 })))
+
+    await expect(linkSpawnedProjectSession({
+      configUrl: 'https://saycode.ai/api/me/mcp-config',
+      machineToken: 'machine-token',
+      machineId: 'M-1',
+      sessionId: 'S-1',
+      directory: '/repo/app',
+    })).resolves.toEqual({ ok: false, error: 'spawned session link returned 503' })
+  })
+
+  it('reports a transport failure as a plain result rather than throwing', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('socket hang up') }))
+
+    await expect(linkSpawnedProjectSession({
+      configUrl: 'https://saycode.ai/api/me/mcp-config',
+      machineToken: 'machine-token',
+      machineId: 'M-1',
+      sessionId: 'S-1',
+      directory: '/repo/app',
+    })).resolves.toEqual({ ok: false, error: 'spawned session link failed' })
+  })
+
+  it('reports an unusable config URL as a plain result rather than throwing', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(linkSpawnedProjectSession({
+      configUrl: 'not a url',
+      machineToken: 'machine-token',
+      machineId: 'M-1',
+      sessionId: 'S-1',
+      directory: '/repo/app',
+    })).resolves.toEqual({ ok: false, error: 'invalid Aplus MCP config URL' })
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 })

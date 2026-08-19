@@ -42,7 +42,7 @@
 
 ## 단계 (Phases)
 
-- [ ] **Phase 1: 링크 함수** → `linkSpawnedProjectSession` 추가.
+- [x] **Phase 1: 링크 함수** → `linkSpawnedProjectSession` 추가.
   검증: config URL 없음(skip) / 성공 / 비2xx / 타임아웃 네 케이스가 **throw 없이** 결과 객체로
   구분되는지 단위 테스트
 - [ ] **Phase 2: spawn 훅 + DI** → `MachineRpcHandlers` 선택 필드, `apiMachine.ts` 성공 분기,
