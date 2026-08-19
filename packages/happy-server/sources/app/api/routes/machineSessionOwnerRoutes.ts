@@ -13,10 +13,15 @@ import { db } from "@/storage/db";
  * after Happy confirms the machine really owns that session. The existing automation route proves
  * this with a RUNNING run claim; a plain spawn has none.
  *
- * The proof used here is the AccessKey row. It exists exactly when a machine can decrypt a
- * session's data, which is precisely "this machine legitimately holds this session", and it is
- * already the same lookup the `access-key-get` socket handler trusts. No new grant, lease, or
- * claim concept is introduced.
+ * The proof is a same-account check: `Session.accountId` and `Machine.accountId` are plain
+ * columns, and `accessKeysRoutes.ts`'s own handlers already trust exactly this pair before
+ * touching either row. This is NOT the same claim as "this specific machine spawned this specific
+ * session" — any machine on the account can now vouch for any session on the account. A first cut
+ * of this endpoint used the `AccessKey` table for a machine-specific proof instead, on the
+ * assumption that some Happy client populates it (an existing GET handler already trusts it).
+ * Production E2E testing found that table permanently empty — no Happy client, CLI or app, ever
+ * calls the route that would write to it, so it carried no real signal. This is the proof that
+ * is actually backed by data every session and machine already has.
  *
  * Absence answers 200 with `owner: null` rather than 404 on purpose: a server that predates this
  * route also answers 404, and the caller must distinguish "not the owner" (deny, fail closed)
@@ -35,21 +40,16 @@ export function machineSessionOwnerRoutes(app: Fastify) {
             }
         }
     }, async (request, reply) => {
-        // Scoped to the authenticated account, so a caller can only ever learn about sessions
-        // its own token already reaches.
-        const accessKey = await db.accessKey.findUnique({
-            where: {
-                accountId_machineId_sessionId: {
-                    accountId: request.userId,
-                    machineId: request.body.machineId,
-                    sessionId: request.params.sessionId
-                }
-            }
-        });
+        // Scoped to the authenticated account both ways, so a caller can only ever learn about
+        // its own sessions and its own machines.
+        const [session, machine] = await Promise.all([
+            db.session.findFirst({ where: { id: request.params.sessionId, accountId: request.userId } }),
+            db.machine.findFirst({ where: { id: request.body.machineId, accountId: request.userId } }),
+        ]);
 
-        if (!accessKey) {
+        if (!session || !machine) {
             return reply.send({ owner: null });
         }
-        return reply.send({ owner: { ownerAccountId: accessKey.accountId } });
+        return reply.send({ owner: { ownerAccountId: request.userId } });
     });
 }
