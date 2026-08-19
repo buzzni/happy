@@ -21,6 +21,7 @@ import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler'
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { fetchAplusMcpServers } from '@/aplus/fetchAplusMcpServers';
 import { bridgeAplusMcpServers, mergeMcpServers } from '@/aplus/mergeAplusMcpServers';
+import { appendTitleInstruction } from '@/utils/titlePrompt';
 import { projectPath } from '@/projectPath';
 import { BasePermissionHandler, type PermissionResult } from '@/utils/BasePermissionHandler';
 import { connectionState } from '@/utils/serverConnectionErrors';
@@ -432,6 +433,19 @@ class GenericAcpPermissionHandler extends BasePermissionHandler implements AcpPe
       logger.debug(`${this.logPrefix} Permission request sent for tool: ${toolName} (${toolCallId})`);
     });
   }
+}
+
+/**
+ * ACP backends (gemini/opencode/grok) never carried the `change_title` nudge that
+ * the Claude and Codex backends append, so their chats stayed untitled — the
+ * `happy` MCP server is wired in for them (verified: grok runs `tools/list` and
+ * `tools/call` against it), the model was simply never told to call the tool
+ * (specs/acp-grok-tool-name-and-title).
+ *
+ * Only the model's copy of the turn changes; the app renders its own user bubble.
+ */
+function appendTitleInstructionWhileUntitled(session: ApiSessionClient, text: string): string {
+  return session.hasTitle() ? text : appendTitleInstruction(text);
 }
 
 type PendingTurn = {
@@ -1003,7 +1017,7 @@ export async function runAcp(opts: {
         if (typeof batch.mode.model === 'string' && batch.mode.model.length > 0) {
           await switchModelIfRequested(batch.mode.model);
         }
-        await backend.sendPrompt(acpSessionId, batch.message);
+        await backend.sendPrompt(acpSessionId, appendTitleInstructionWhileUntitled(session, batch.message));
         await turnEnded;
         sendEnvelopes(sessionManager.endTurn('completed'));
         session.sendSessionEvent({ type: 'ready' });
