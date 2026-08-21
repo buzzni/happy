@@ -8,9 +8,16 @@ export const MessageMetaSchema = z.object({
   effort: z.string().nullable().optional(),
   customSystemPrompt: z.string().nullable().optional(),
   appendSystemPrompt: z.string().nullable().optional(),
+  saycodeSystemPromptEnabled: z.boolean().optional(),
   allowedTools: z.array(z.string()).nullable().optional(),
   disallowedTools: z.array(z.string()).nullable().optional(),
   displayText: z.string().optional(),
   axStep: z.enum(['plan', 'design', 'free']).optional(),
 });
 export type MessageMeta = z.infer<typeof MessageMetaSchema>;
+
+export function resolveSaycodeSystemPromptEnabled(
+  meta: Pick<MessageMeta, 'saycodeSystemPromptEnabled'>,
+): boolean {
+  return meta.saycodeSystemPromptEnabled ?? true;
+}

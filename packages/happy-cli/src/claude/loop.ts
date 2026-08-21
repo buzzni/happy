@@ -22,6 +22,7 @@ export interface EnhancedMode {
     fallbackModel?: string;
     customSystemPrompt?: string;
     appendSystemPrompt?: string;
+    saycodeSystemPromptEnabled?: boolean;
     allowedTools?: string[];
     disallowedTools?: string[];
     /** Effort level passed through to the Claude Agent SDK as the `effort` option. */

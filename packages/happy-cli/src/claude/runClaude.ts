@@ -517,6 +517,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         fallbackModel: mode.fallbackModel,
         customSystemPrompt: mode.customSystemPrompt,
         appendSystemPrompt: mode.appendSystemPrompt,
+        saycodeSystemPromptEnabled: mode.saycodeSystemPromptEnabled,
         allowedTools: mode.allowedTools,
         disallowedTools: mode.disallowedTools,
         effort: mode.effort,
@@ -541,6 +542,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     let currentFallbackModel: string | undefined = undefined; // Track current fallback model
     let currentCustomSystemPrompt: string | undefined = undefined; // Track current custom system prompt
     let currentAppendSystemPrompt: string | undefined = undefined; // Track current append system prompt
+    let currentSaycodeSystemPromptEnabled: boolean | undefined = undefined;
     let currentAllowedTools: string[] | undefined = undefined; // Track current allowed tools
     let currentDisallowedTools: string[] | undefined = initialDisallowedTools; // Track current disallowed tools
     let currentEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined = initialEffortSeed; // Track current Claude effort (thinking depth)
@@ -551,6 +553,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         currentFallbackModel = undefined;
         currentCustomSystemPrompt = undefined;
         currentAppendSystemPrompt = undefined;
+        currentSaycodeSystemPromptEnabled = undefined;
         currentAllowedTools = undefined;
         currentDisallowedTools = initialDisallowedTools;
         currentEffort = initialEffortSeed;
@@ -562,6 +565,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         fallbackModel: currentFallbackModel,
         customSystemPrompt: currentCustomSystemPrompt,
         appendSystemPrompt: currentAppendSystemPrompt,
+        saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
         allowedTools: currentAllowedTools,
         disallowedTools: currentDisallowedTools,
         effort: currentEffort,
@@ -730,6 +734,11 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             logger.debug(`[loop] User message received with no append system prompt override, using current: ${currentAppendSystemPrompt ? 'set' : 'none'}`);
         }
 
+        if (message.meta?.hasOwnProperty('saycodeSystemPromptEnabled')) {
+            currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
+            logger.debug(`[loop] Saycode system prompt ${currentSaycodeSystemPromptEnabled ? 'enabled' : 'disabled'} by user message`);
+        }
+
         // Resolve allowed tools - use message.meta.allowedTools if provided, otherwise use current
         let messageAllowedTools = currentAllowedTools;
         if (message.meta?.hasOwnProperty('allowedTools')) {
@@ -859,7 +868,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         // Only the model's copy changes; the app renders its own user bubble.
         // recordAppPrompt() de-dupes the modified turn so the remote-mode JSONL
         // scanner doesn't forward it back to the app as a second message.
-        if (!session.hasTitle()) {
+        if (currentSaycodeSystemPromptEnabled !== false && !session.hasTitle()) {
             const withTitle = appendTitleInstruction(pushText);
             if (withTitle !== pushText) {
                 pushText = withTitle;

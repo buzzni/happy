@@ -6,7 +6,19 @@ import { AgentDefaultOverridesSchema } from './agentDefaults';
 //
 
 // Current schema version for backward compatibility
-export const SUPPORTED_SCHEMA_VERSION = 2;
+export const SUPPORTED_SCHEMA_VERSION = 3;
+
+type SaycodeSystemPromptSurface = 'desktop' | 'web' | 'mobile';
+
+export function resolveSaycodeSystemPromptEnabled({
+    preference,
+    surface,
+}: {
+    preference: boolean | null;
+    surface: SaycodeSystemPromptSurface;
+}): boolean {
+    return preference ?? surface !== 'desktop';
+}
 
 export const SettingsSchema = z.object({
     // Schema version for compatibility detection
@@ -25,6 +37,7 @@ export const SettingsSchema = z.object({
     agentInputEnterToSend: z.boolean().describe('Whether pressing Enter submits/sends in the agent input (web)'),
     avatarStyle: z.string().describe('Avatar display style'),
     showFlavorIcons: z.boolean().describe('Whether to show AI provider icons in avatars'),
+    saycodeSystemPromptEnabled: z.boolean().nullable().describe('Whether Saycode-owned system prompt instructions are enabled (null means undecided)'),
 
     hideInactiveSessions: z.boolean().describe('Hide inactive sessions in the main list'),
     expResumeSession: z.boolean().describe('Enable experimental session resume feature'),
@@ -96,6 +109,7 @@ export const settingsDefaults: Settings = {
     agentInputEnterToSend: true,
     avatarStyle: 'brutalist',
     showFlavorIcons: false,
+    saycodeSystemPromptEnabled: null,
 
     hideInactiveSessions: false,
     expResumeSession: false,

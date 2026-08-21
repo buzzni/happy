@@ -55,6 +55,7 @@ import { prepareCodexImageInputItems } from './utils/imageInput';
 import { createSerialAsyncHandler } from './utils/serialAsyncHandler';
 import { buildCodexThreadBackfillEnvelopes } from './utils/threadImageBackfill';
 import {
+    buildCodexDeveloperInstructions,
     buildCodexTurnPrompt,
     hashCodexEnhancedMode,
     type CodexEnhancedMode,
@@ -282,12 +283,14 @@ export async function runCodex(opts: {
     let currentModel: string | undefined = initialModelSeed;
     let currentEffort: ReasoningEffort | undefined = initialEffortSeed;
     let currentAppendSystemPrompt: string | undefined = undefined;
+    let currentSaycodeSystemPromptEnabled: boolean | undefined = undefined;
 
     const resetCurrentModeDefaults = () => {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
         currentModel = initialModelSeed;
         currentEffort = initialEffortSeed;
         currentAppendSystemPrompt = undefined;
+        currentSaycodeSystemPromptEnabled = undefined;
         logger.debug('[Codex] Reset current mode defaults after abort');
     };
 
@@ -365,10 +368,16 @@ export async function runCodex(opts: {
             logger.debug(`[Codex] User message received with no append system prompt override, using current: ${currentAppendSystemPrompt ? 'set' : 'none'}`);
         }
 
+        if (message.meta?.hasOwnProperty('saycodeSystemPromptEnabled')) {
+            currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
+            logger.debug(`[Codex] Saycode system prompt ${currentSaycodeSystemPromptEnabled ? 'enabled' : 'disabled'} by user message`);
+        }
+
         const enhancedMode: EnhancedMode = {
             permissionMode: messagePermissionMode || 'default',
             model: messageModel,
             appendSystemPrompt: messageAppendSystemPrompt,
+            saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
             effort: messageEffort,
         };
         const enqueueResult = enqueueCodexUserText({
@@ -397,6 +406,7 @@ export async function runCodex(opts: {
                 ),
                 model: currentModel,
                 appendSystemPrompt: currentAppendSystemPrompt,
+                saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
                 effort: currentEffort,
             });
             logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
@@ -930,7 +940,7 @@ export async function runCodex(opts: {
         expectedMcpServices: [],
         configuredServerNames: Object.keys(mcpServers),
     });
-    let currentDeveloperInstructions = buildConnectorToolGuidance(listExternalServices({
+    let currentDeveloperInstructions: string | undefined = buildConnectorToolGuidance(listExternalServices({
         ...baseMcpServers,
         ...initialAplusMcpServers,
     }));
@@ -1077,9 +1087,10 @@ export async function runCodex(opts: {
                     threadId: client.threadId,
                     resumeThread: client.threadId
                         ? async ({ threadId, mcpServers }) => {
-                            const nextDeveloperInstructions = buildConnectorToolGuidance(
-                                listExternalServices(mcpServers),
-                            );
+                            const nextDeveloperInstructions = buildCodexDeveloperInstructions({
+                                connectorGuidance: buildConnectorToolGuidance(listExternalServices(mcpServers)),
+                                mode: message.mode,
+                            });
                             const resumed = await client.resumeThread({
                                 threadId,
                                 mcpServers,
@@ -1091,9 +1102,10 @@ export async function runCodex(opts: {
                         : undefined,
                 });
 
-                const nextDeveloperInstructions = buildConnectorToolGuidance(
-                    listExternalServices(mcpSync.mcpServers),
-                );
+                const nextDeveloperInstructions = buildCodexDeveloperInstructions({
+                    connectorGuidance: buildConnectorToolGuidance(listExternalServices(mcpSync.mcpServers)),
+                    mode: message.mode,
+                });
                 if (client.threadId && nextDeveloperInstructions !== currentDeveloperInstructions) {
                     await client.resumeThread({
                         threadId: client.threadId,
@@ -1167,7 +1179,9 @@ export async function runCodex(opts: {
                 }
 
                 const includeAppendSystemPrompt = Boolean(
-                    message.mode.appendSystemPrompt && !appendSystemPromptInjected,
+                    message.mode.saycodeSystemPromptEnabled === undefined
+                    && message.mode.appendSystemPrompt
+                    && !appendSystemPromptInjected,
                 );
                 const imageInputs = await prepareCodexImageInputItems(message.attachments, {
                     sessionId: session.sessionId,

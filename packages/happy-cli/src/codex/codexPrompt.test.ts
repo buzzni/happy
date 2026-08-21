@@ -2,10 +2,30 @@ import { describe, expect, it } from 'vitest';
 
 import { CHANGE_TITLE_INSTRUCTION } from '@/gemini/constants';
 import {
+    buildCodexDeveloperInstructions,
     buildCodexTurnPrompt,
     hashCodexEnhancedMode,
     type CodexEnhancedMode,
 } from './codexPrompt';
+
+describe('buildCodexDeveloperInstructions', () => {
+    it('uses replaceable developer instructions for explicit-policy clients', () => {
+        expect(buildCodexDeveloperInstructions({
+            connectorGuidance: 'CONNECTOR FACTS',
+            mode: {
+                appendSystemPrompt: 'USER AND PROJECT CONTEXT',
+                saycodeSystemPromptEnabled: false,
+            },
+        })).toBe('CONNECTOR FACTS\n\nUSER AND PROJECT CONTEXT');
+    });
+
+    it('keeps legacy client append prompts in the original user-turn position', () => {
+        expect(buildCodexDeveloperInstructions({
+            connectorGuidance: 'CONNECTOR FACTS',
+            mode: { appendSystemPrompt: 'LEGACY APPEND' },
+        })).toBe('CONNECTOR FACTS');
+    });
+});
 
 describe('buildCodexTurnPrompt', () => {
     it('prepends Happy append system prompt before the first Codex user message', () => {
@@ -23,6 +43,18 @@ describe('buildCodexTurnPrompt', () => {
             'pick an option\n\n' +
             CHANGE_TITLE_INSTRUCTION,
         );
+    });
+
+    it('removes the Saycode title instruction but preserves client append prompt when disabled', () => {
+        expect(buildCodexTurnPrompt({
+            message: 'hello',
+            mode: {
+                appendSystemPrompt: 'USER AND PROJECT CONTEXT',
+                saycodeSystemPromptEnabled: false,
+            },
+            includeAppendSystemPrompt: true,
+            includeTitleInstruction: true,
+        })).toBe('USER AND PROJECT CONTEXT\n\nhello');
     });
 
     it('preserves the existing first-turn title instruction when no append prompt is set', () => {
@@ -102,6 +134,18 @@ describe('hashCodexEnhancedMode', () => {
         })).not.toBe(hashCodexEnhancedMode({
             ...baseMode,
             appendSystemPrompt: 'options B',
+        }));
+    });
+
+    it('separates queued messages when the Saycode prompt policy changes', () => {
+        const baseMode: CodexEnhancedMode = { permissionMode: 'default' };
+
+        expect(hashCodexEnhancedMode({
+            ...baseMode,
+            saycodeSystemPromptEnabled: true,
+        })).not.toBe(hashCodexEnhancedMode({
+            ...baseMode,
+            saycodeSystemPromptEnabled: false,
         }));
     });
 });

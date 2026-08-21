@@ -20,6 +20,16 @@ function createSandboxConfig(overrides: Partial<SandboxConfig> = {}): SandboxCon
 }
 
 describe('createSessionMetadata', () => {
+    it('advertises support for per-message Saycode system prompt policy', () => {
+        const { metadata } = createSessionMetadata({
+            flavor: 'claude',
+            machineId: 'machine-1',
+        });
+
+        expect(metadata.runtimeCapabilities).toEqual({
+            saycodeSystemPromptPreference: true,
+        });
+    });
     it('sets metadata.sandbox to the config when enabled', () => {
         const sandbox = createSandboxConfig();
         const { metadata } = createSessionMetadata({

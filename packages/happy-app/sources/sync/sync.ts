@@ -22,7 +22,8 @@ import { syncCurrentPushToken } from './pushRegistration';
 import { Platform, AppState, type AppStateStatus } from 'react-native';
 import { isRunningOnMac } from '@/utils/platform';
 import { NormalizedMessage, normalizeRawMessage, RawRecord } from './typesRaw';
-import { applySettings, Settings, settingsDefaults, settingsParse, settingsToSyncPayload, SUPPORTED_SCHEMA_VERSION } from './settings';
+import { applySettings, resolveSaycodeSystemPromptEnabled, Settings, settingsDefaults, settingsParse, SUPPORTED_SCHEMA_VERSION } from './settings';
+import { syncPendingAccountSettings } from './accountSettingsSync';
 import { Profile, profileParse } from './profile';
 import { loadPendingSettings, savePendingSettings } from './persistence';
 import {
@@ -592,6 +593,10 @@ class Sync {
         }
 
         const modeMeta = resolveMessageModeMeta(session, storage.getState().settings);
+        const saycodeSystemPromptEnabled = resolveSaycodeSystemPromptEnabled({
+            preference: storage.getState().settings.saycodeSystemPromptEnabled,
+            surface: Platform.OS === 'web' ? 'web' : 'mobile',
+        });
         const { displayText, source = 'chat', attachments } = options ?? {};
 
         const flavor = session.metadata?.flavor;
@@ -706,6 +711,7 @@ class Sync {
             meta: {
                 sentFrom,
                 appendSystemPrompt: systemPrompt,
+                saycodeSystemPromptEnabled,
                 ...(modeMeta.permissionMode !== undefined ? { permissionMode: modeMeta.permissionMode } : {}),
                 ...(modeMeta.model !== undefined ? { model: modeMeta.model } : {}),
                 ...(modeMeta.effort !== undefined ? { effort: modeMeta.effort } : {}),
@@ -1532,38 +1538,22 @@ class Sync {
         if (!this.credentials) return;
 
         const API_ENDPOINT = getServerUrl();
-        const maxRetries = 3;
-        let retryCount = 0;
 
         // Apply pending settings
         if (Object.keys(this.pendingSettings).length > 0) {
-
-            while (retryCount < maxRetries) {
-                // Snapshot what we're about to send so we can detect concurrent changes
-                const sentPending = { ...this.pendingSettings };
-                let version = storage.getState().settingsVersion;
-                let settings = applySettings(storage.getState().settings, this.pendingSettings);
-                const response = await fetch(`${API_ENDPOINT}/v1/account/settings`, {
-                    method: 'POST',
-                    body: JSON.stringify({
-                        settings: await this.encryption.encryptRaw(settingsToSyncPayload(settings)),
-                        expectedVersion: version ?? 0
-                    }),
-                    headers: {
-                        'Authorization': `Bearer ${this.credentials.token}`,
-                        'Content-Type': 'application/json',
-                        'X-Happy-Client': getHappyClientId(),
-                    }
-                });
-                const data = await response.json() as {
-                    success: false,
-                    error: string,
-                    currentVersion: number,
-                    currentSettings: string | null
-                } | {
-                    success: true
-                };
-                if (data.success) {
+            await syncPendingAccountSettings({
+                apiBaseUrl: API_ENDPOINT,
+                personalToken: this.credentials.token,
+                clientId: getHappyClientId(),
+                fetchImpl: fetch,
+                encryptSettings: settings => this.encryption.encryptRaw(settings),
+                decryptSettings: settings => this.encryption.decryptRaw(settings),
+                getSnapshot: () => ({
+                    settings: storage.getState().settings,
+                    settingsVersion: storage.getState().settingsVersion,
+                    pending: this.pendingSettings,
+                }),
+                onSuccess: ({ sentPending }) => {
                     // Only clear keys we actually sent — preserve any settings
                     // added by applySettings() calls during the POST roundtrip
                     const newPending: Partial<Settings> = {};
@@ -1574,42 +1564,22 @@ class Sync {
                     }
                     this.pendingSettings = newPending;
                     savePendingSettings(this.pendingSettings);
-                    break;
-                }
-                if (data.error === 'version-mismatch') {
-                    // Parse server settings
-                    const serverSettings = data.currentSettings
-                        ? settingsParse(await this.encryption.decryptRaw(data.currentSettings))
-                        : { ...settingsDefaults };
-
-                    // Merge: server base + our pending changes (our changes win)
-                    const mergedSettings = applySettings(serverSettings, this.pendingSettings);
-
+                },
+                onConflict: ({ settings: mergedSettings, version }) => {
                     // Update local storage with merged result at server's version
-                    this.applyServerSettings(mergedSettings, data.currentVersion);
+                    this.applyServerSettings(mergedSettings, version);
 
                     // Sync tracking state with merged settings
                     if (tracking) {
                         mergedSettings.analyticsOptOut ? tracking.optOut() : tracking.optIn();
                     }
 
-                    // Log and retry
                     console.log('settings version-mismatch, retrying', {
-                        serverVersion: data.currentVersion,
-                        retry: retryCount + 1,
+                        serverVersion: version,
                         pendingKeys: Object.keys(this.pendingSettings)
                     });
-                    retryCount++;
-                    continue;
-                } else {
-                    throw new Error(`Failed to sync settings: ${data.error}`);
-                }
-            }
-        }
-
-        // If exhausted retries, throw to trigger outer backoff delay
-        if (retryCount >= maxRetries) {
-            throw new Error(`Settings sync failed after ${maxRetries} retries due to version conflicts`);
+                },
+            });
         }
 
         // Run request

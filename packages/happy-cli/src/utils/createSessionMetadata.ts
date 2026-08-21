@@ -82,6 +82,9 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         path: process.cwd(),
         host: os.hostname(),
         version: packageJson.version,
+        runtimeCapabilities: {
+            saycodeSystemPromptPreference: true,
+        },
         os: os.platform(),
         machineId: opts.machineId,
         homeDir: os.homedir(),

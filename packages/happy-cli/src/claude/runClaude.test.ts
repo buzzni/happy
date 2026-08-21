@@ -1073,4 +1073,41 @@ describe('runClaude remote JSONL scanner', () => {
         expect(queued[0].message).not.toContain(TITLE_INSTRUCTION);
         await harness.finish();
     });
+
+    it('does not append the change_title instruction when Saycode prompts are disabled', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(false);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'use my own harness' },
+            meta: { saycodeSystemPromptEnabled: false },
+        });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(1);
+        expect(queued[0].message).toBe('use my own harness');
+        expect(queued[0].mode.saycodeSystemPromptEnabled).toBe(false);
+        await harness.finish();
+    });
+
+    it('separates queued turns when the Saycode prompt policy changes', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({ content: { text: 'first' }, meta: { saycodeSystemPromptEnabled: true } });
+        await userMessageHandler({ content: { text: 'second' }, meta: { saycodeSystemPromptEnabled: false } });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(2);
+        expect(queued.map((item: any) => item.mode.saycodeSystemPromptEnabled)).toEqual([true, false]);
+        await harness.finish();
+    });
 });

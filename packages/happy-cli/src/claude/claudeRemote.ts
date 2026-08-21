@@ -20,6 +20,7 @@ import { buildWorkerAgents, readWorkerConfigFromEnv } from "@/orchestrator/worke
 import { buildSkillGovernanceOptions, readSkillGovernanceConfigFromEnv } from "@/orchestrator/skillGovernance";
 import { readExpectedConnectors, readExpectedMcpServices } from '@/aplus/fetchAplusMcpServers';
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
+import { buildClaudeSystemPromptOptions } from './claudePrompt';
 
 export type ClaudeActiveInputSender = (text: string) => boolean;
 
@@ -141,14 +142,13 @@ export async function claudeRemote(opts: {
 
     // Prepare SDK options
     let mode = initial.mode;
-    const orchestratorPromptSuffix = opts.orchestratorMode ? '\n\n' + ORCHESTRATOR_SYSTEM_PROMPT : '';
+    const orchestratorPrompt = opts.orchestratorMode ? ORCHESTRATOR_SYSTEM_PROMPT : undefined;
 
     // Per-session orchestrator/worker delegation: when a cheaper worker model is
     // declared (via HAPPY_WORKER_MODEL, applied to process.env above), register a
     // `worker` subagent bound to it and tell the main model to delegate mechanical
     // work to it. No-op when unset, so single-model sessions are unchanged.
     const workerAgents = buildWorkerAgents(readWorkerConfigFromEnv(process.env));
-    const workerDelegationSuffix = workerAgents.delegationPrompt ? '\n\n' + workerAgents.delegationPrompt : '';
 
     // Per-machine/session skill governance: when HAPPY_SETTING_SOURCES and/or
     // HAPPY_SKILL_ALLOWLIST are set (e.g. on a Saycode-managed machine), scope
@@ -166,7 +166,15 @@ export async function claudeRemote(opts: {
         expectedMcpServices: readExpectedMcpServices(),
         configuredServerNames: Object.keys(mergedMcpServers),
     }));
-    const connectorGuidanceSuffix = connectorGuidance ? '\n\n' + connectorGuidance : '';
+    const promptOptions = buildClaudeSystemPromptOptions({
+        customSystemPrompt: initial.mode.customSystemPrompt,
+        appendSystemPrompt: initial.mode.appendSystemPrompt,
+        saycodeSystemPrompt: systemPrompt,
+        orchestratorPrompt,
+        workerDelegationPrompt: workerAgents.delegationPrompt,
+        connectorGuidance,
+        saycodeSystemPromptEnabled: initial.mode.saycodeSystemPromptEnabled,
+    });
 
     const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
     const sdkOptions: QueryOptions = {
@@ -176,8 +184,8 @@ export async function claudeRemote(opts: {
         permissionMode: mapToClaudeMode(initial.mode.permissionMode),
         model: initial.mode.model,
         fallbackModel: initial.mode.fallbackModel,
-        customSystemPrompt: initial.mode.customSystemPrompt ? initial.mode.customSystemPrompt + '\n\n' + systemPrompt : undefined,
-        appendSystemPrompt: (initial.mode.appendSystemPrompt ? initial.mode.appendSystemPrompt + '\n\n' + systemPrompt : systemPrompt) + orchestratorPromptSuffix + workerDelegationSuffix + connectorGuidanceSuffix,
+        customSystemPrompt: promptOptions.customSystemPrompt,
+        appendSystemPrompt: promptOptions.appendSystemPrompt,
         allowedTools: initial.mode.allowedTools ? initial.mode.allowedTools.concat(opts.allowedTools) : opts.allowedTools,
         disallowedTools: initial.mode.disallowedTools,
         effort: initial.mode.effort,

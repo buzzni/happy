@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { settingsParse, applySettings, settingsDefaults, settingsToSyncPayload, type Settings } from './settings';
+import {
+    settingsParse,
+    applySettings,
+    resolveSaycodeSystemPromptEnabled,
+    settingsDefaults,
+    settingsToSyncPayload,
+    type Settings,
+} from './settings';
 
 describe('settings', () => {
     describe('settingsParse', () => {
@@ -174,7 +181,7 @@ describe('settings', () => {
     describe('settingsDefaults', () => {
         it('should have correct default values', () => {
             expect(settingsDefaults).toEqual({
-                schemaVersion: 2,
+                schemaVersion: 3,
                 viewInline: false,
                 expandTodos: true,
                 showLineNumbers: true,
@@ -188,6 +195,7 @@ describe('settings', () => {
                 agentInputEnterToSend: true,
                 avatarStyle: 'brutalist',
                 showFlavorIcons: false,
+                saycodeSystemPromptEnabled: null,
                 hideInactiveSessions: false,
                 expResumeSession: false,
                 fileDiffsSidebar: false,
@@ -211,6 +219,23 @@ describe('settings', () => {
         it('should be a valid Settings object', () => {
             const parsed = settingsParse(settingsDefaults);
             expect(parsed).toEqual(settingsDefaults);
+        });
+    });
+
+    describe('resolveSaycodeSystemPromptEnabled', () => {
+        it('keeps an explicit account preference on every surface', () => {
+            expect(resolveSaycodeSystemPromptEnabled({ preference: true, surface: 'desktop' })).toBe(true);
+            expect(resolveSaycodeSystemPromptEnabled({ preference: false, surface: 'web' })).toBe(false);
+            expect(resolveSaycodeSystemPromptEnabled({ preference: false, surface: 'mobile' })).toBe(false);
+        });
+
+        it('defaults an undecided desktop account to disabled', () => {
+            expect(resolveSaycodeSystemPromptEnabled({ preference: null, surface: 'desktop' })).toBe(false);
+        });
+
+        it('defaults an undecided web or mobile account to enabled', () => {
+            expect(resolveSaycodeSystemPromptEnabled({ preference: null, surface: 'web' })).toBe(true);
+            expect(resolveSaycodeSystemPromptEnabled({ preference: null, surface: 'mobile' })).toBe(true);
         });
     });
 
