@@ -959,7 +959,7 @@ export async function runGemini(opts: {
       let previousConversationContext: string | undefined;
       let startedNewBackendSession = false;
       
-      // Handle mode change (like Codex) - restart session if permission mode or model changed
+      // Restart when any backend-affecting mode value changes.
       if (wasSessionCreated && currentModeHash && message.hash !== currentModeHash) {
         logger.debug('[Gemini] Mode changed – restarting Gemini session');
         messageBuffer.addMessage('═'.repeat(40), 'status');
@@ -1005,7 +1005,7 @@ export async function runGemini(opts: {
 
         // Use model from factory result (single source of truth - no duplicate resolution)
         const actualModel = backendResult.model;
-        logger.debug(`[gemini] Model change - modelToUse=${modelToUse}, actualModel=${actualModel} (from ${backendResult.modelSource})`);
+        logger.debug(`[gemini] Restart - modelToUse=${modelToUse}, actualModel=${actualModel} (from ${backendResult.modelSource})`);
         
         // Update conversation history with new model
         conversationHistory.setCurrentModel(actualModel);
