@@ -21,7 +21,6 @@ import { initialMachineMetadata } from '@/daemon/run';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
-import { hashObject } from '@/utils/deterministicJson';
 import { projectPath } from '@/projectPath';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { fetchAplusMcpServers } from '@/aplus/fetchAplusMcpServers';
@@ -42,7 +41,8 @@ import { GeminiReasoningProcessor } from '@/gemini/utils/reasoningProcessor';
 import { GeminiDiffProcessor } from '@/gemini/utils/diffProcessor';
 import type { GeminiMode, CodexMessagePayload } from '@/gemini/types';
 import type { PermissionMode } from '@/api/types';
-import { GEMINI_MODEL_ENV, DEFAULT_GEMINI_MODEL, CHANGE_TITLE_INSTRUCTION } from '@/gemini/constants';
+import { GEMINI_MODEL_ENV, DEFAULT_GEMINI_MODEL } from '@/gemini/constants';
+import { buildGeminiTurnPrompt, hashGeminiMode } from '@/gemini/geminiPrompt';
 import {
   readGeminiLocalConfig,
   saveGeminiModelToConfig,
@@ -223,10 +223,7 @@ export async function runGemini(opts: {
     }
   }
 
-  const messageQueue = new MessageQueue2<GeminiMode>((mode) => hashObject({
-    permissionMode: mode.permissionMode,
-    model: mode.model,
-  }));
+  const messageQueue = new MessageQueue2<GeminiMode>(hashGeminiMode);
 
   // Conversation history for context preservation across model changes
   const conversationHistory = new ConversationHistory({ maxMessages: 20, maxCharacters: 50000 });
@@ -234,6 +231,8 @@ export async function runGemini(opts: {
   // Track current overrides to apply per message
   let currentPermissionMode: PermissionMode | undefined = undefined;
   let currentModel: string | undefined = undefined;
+  let currentAppendSystemPrompt: string | undefined = undefined;
+  let currentSaycodeSystemPromptEnabled: boolean | undefined = undefined;
 
   session.onUserMessage((message) => {
     // Resolve permission mode (validate) - same as Codex
@@ -286,28 +285,25 @@ export async function runGemini(opts: {
       // If message.meta.model is undefined, keep currentModel
     }
 
-    // Build the full prompt with appendSystemPrompt if provided
-    // Only include system prompt for the first message to avoid forcing tool usage on every message
     const originalUserMessage = message.content.text;
-    let fullPrompt = originalUserMessage;
-    if (isFirstMessage && message.meta?.appendSystemPrompt) {
-      // Prepend system prompt to user message only for first message
-      // Also add change_title instruction (like Codex does)
-      // Use EXACT same format as Codex: add instruction AFTER user message
-      // This matches Codex's approach exactly - instruction comes after user message
-      // Codex format: system prompt + user message + change_title instruction
-      fullPrompt = message.meta.appendSystemPrompt + '\n\n' + originalUserMessage + '\n\n' + CHANGE_TITLE_INSTRUCTION;
-      isFirstMessage = false;
+    if (message.meta?.hasOwnProperty('appendSystemPrompt')) {
+      currentAppendSystemPrompt = message.meta.appendSystemPrompt || undefined;
+    }
+    if (message.meta?.hasOwnProperty('saycodeSystemPromptEnabled')) {
+      currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
     }
 
     const mode: GeminiMode = {
       permissionMode: messagePermissionMode || 'default',
       model: messageModel,
       originalUserMessage, // Store original message separately
+      appendSystemPrompt: currentAppendSystemPrompt,
+      saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
     };
-    messageQueue.push(fullPrompt, mode);
-    
-    // Record user message in conversation history for context preservation
+    messageQueue.push(originalUserMessage, mode);
+
+    // Record each message before MessageQueue2 batches adjacent messages. A
+    // restarted backend excludes the unanswered trailing turns from context.
     conversationHistory.addUserMessage(originalUserMessage);
   });
 
@@ -316,9 +312,6 @@ export async function runGemini(opts: {
   const keepAliveInterval = setInterval(() => {
     session.keepAlive(thinking, 'remote');
   }, 2000);
-
-  // Track if this is the first message to include system prompt only once
-  let isFirstMessage = true;
 
   const sendReady = () => {
     session.sendSessionEvent({ type: 'ready' });
@@ -963,8 +956,8 @@ export async function runGemini(opts: {
         break;
       }
 
-      // Track if we need to inject conversation history (after model change)
-      let injectHistoryContext = false;
+      let previousConversationContext: string | undefined;
+      let startedNewBackendSession = false;
       
       // Handle mode change (like Codex) - restart session if permission mode or model changed
       if (wasSessionCreated && currentModeHash && message.hash !== currentModeHash) {
@@ -972,9 +965,12 @@ export async function runGemini(opts: {
         messageBuffer.addMessage('═'.repeat(40), 'status');
         
         // Check if we have conversation history to preserve
-        if (conversationHistory.hasHistory()) {
-          messageBuffer.addMessage(`Switching model (preserving ${conversationHistory.size()} messages of context)...`, 'status');
-          injectHistoryContext = true;
+        const restartContext = conversationHistory.getContextForNewSession({
+          excludeTrailingUserMessages: true,
+        });
+        if (restartContext) {
+          messageBuffer.addMessage('Restarting Gemini (preserving completed conversation context)...', 'status');
+          previousConversationContext = restartContext;
           logger.debug(`[Gemini] Will inject conversation history: ${conversationHistory.getSummary()}`);
         } else {
           messageBuffer.addMessage('Starting new Gemini session (mode changed)...', 'status');
@@ -1017,6 +1013,7 @@ export async function runGemini(opts: {
         logger.debug('[gemini] Starting new ACP session with model:', actualModel);
         const { sessionId } = await geminiBackend.startSession();
         acpSessionId = sessionId;
+        startedNewBackendSession = true;
         logger.debug(`[gemini] New ACP session started: ${acpSessionId}`);
         
         // Update displayed model in UI (don't save to config - this is backend initialization)
@@ -1077,6 +1074,7 @@ export async function runGemini(opts: {
             updatePermissionMode(message.mode.permissionMode);
             const { sessionId } = await geminiBackend.startSession();
             acpSessionId = sessionId;
+            startedNewBackendSession = true;
             logger.debug(`[gemini] ACP session started: ${acpSessionId}`);
             wasSessionCreated = true;
             currentModeHash = message.hash;
@@ -1097,10 +1095,10 @@ export async function runGemini(opts: {
         isResponseInProgress = false;
         hadToolCallInTurn = false;
         taskStartedSent = false; // Reset so new turn can send task_started
-        
+
         // Track if this prompt contains change_title instruction
         // If so, don't send task_complete until change_title is completed
-        pendingChangeTitle = message.message.includes('change_title') || 
+        pendingChangeTitle = message.message.includes('change_title') ||
                              message.message.includes('happy__change_title');
         changeTitleCompleted = false;
         
@@ -1108,16 +1106,15 @@ export async function runGemini(opts: {
           throw new Error('Gemini backend or session not initialized');
         }
         
-        // The prompt already includes system prompt and change_title instruction (added in onUserMessage handler)
-        // This is done in the message queue, so message.message already contains everything
-        let promptToSend = message.message;
-        
-        // Inject conversation history context if model was just changed
-        if (injectHistoryContext && conversationHistory.hasHistory()) {
-          const historyContext = conversationHistory.getContextForNewSession();
-          promptToSend = historyContext + promptToSend;
-          logger.debug(`[gemini] Injected conversation history context (${historyContext.length} chars)`);
-          // Don't clear history - keep accumulating for future model changes
+        const promptToSend = buildGeminiTurnPrompt({
+          userText: message.message,
+          appendSystemPrompt: message.mode.appendSystemPrompt,
+          previousConversationContext,
+          saycodeSystemPromptEnabled: message.mode.saycodeSystemPromptEnabled,
+          isNewSession: startedNewBackendSession,
+        });
+        if (previousConversationContext) {
+          logger.debug(`[gemini] Injected conversation history context (${previousConversationContext.length} chars)`);
         }
         
         logger.debug(`[gemini] Sending prompt to Gemini (length: ${promptToSend.length})`);

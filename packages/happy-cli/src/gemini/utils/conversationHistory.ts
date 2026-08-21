@@ -146,12 +146,20 @@ export class ConversationHistory {
    * 
    * @returns Formatted string with previous conversation context, or empty string if no history
    */
-  getContextForNewSession(): string {
-    if (this.messages.length === 0) {
+  getContextForNewSession(options: { excludeTrailingUserMessages?: boolean } = {}): string {
+    let messages = this.messages;
+    if (options.excludeTrailingUserMessages) {
+      let completedLength = messages.length;
+      while (completedLength > 0 && messages[completedLength - 1].role === 'user') {
+        completedLength -= 1;
+      }
+      messages = messages.slice(0, completedLength);
+    }
+    if (messages.length === 0) {
       return '';
     }
 
-    const formattedMessages = this.messages.map(msg => {
+    const formattedMessages = messages.map(msg => {
       const role = msg.role === 'user' ? 'User' : 'Assistant';
       // Truncate very long messages to avoid token limits
       const content = msg.content.length > 2000 
@@ -199,4 +207,3 @@ ${formattedMessages}
     return `${this.messages.length} messages (${userCount} user, ${assistantCount} assistant), ${totalChars} chars`;
   }
 }
-
