@@ -34,6 +34,16 @@ export function consumePendingInitialEffort(env: NodeJS.ProcessEnv): string | nu
   return effort.length > 0 ? effort : null
 }
 
+export function consumePendingInitialSaycodeSystemPromptEnabled(
+  env: NodeJS.ProcessEnv,
+): boolean | undefined {
+  const raw = env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED
+  delete env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED
+  if (raw === 'true') return true
+  if (raw === 'false') return false
+  return undefined
+}
+
 export function consumePendingInitialPromptLocalId(env: NodeJS.ProcessEnv): string | undefined {
   const raw = env.HAPPY_INITIAL_PROMPT_LOCAL_ID
   delete env.HAPPY_INITIAL_PROMPT_LOCAL_ID

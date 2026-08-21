@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { consumePendingInitialEffort, consumePendingInitialModel } from './initialPrompt'
+import {
+  consumePendingInitialEffort,
+  consumePendingInitialModel,
+  consumePendingInitialSaycodeSystemPromptEnabled,
+} from './initialPrompt'
 
 describe('consumePendingInitialModel', () => {
   it('reads the seed exactly once and scrubs it from the environment', () => {
@@ -29,5 +33,24 @@ describe('consumePendingInitialEffort', () => {
   it('treats a blank value as absent', () => {
     expect(consumePendingInitialEffort({ HAPPY_INITIAL_EFFORT: '' })).toBeNull()
     expect(consumePendingInitialEffort({})).toBeNull()
+  })
+})
+
+describe('consumePendingInitialSaycodeSystemPromptEnabled', () => {
+  it('reads an explicit recovery policy exactly once', () => {
+    const env: NodeJS.ProcessEnv = {
+      HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED: 'false',
+    }
+
+    expect(consumePendingInitialSaycodeSystemPromptEnabled(env)).toBe(false)
+    expect(env).not.toHaveProperty('HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED')
+    expect(consumePendingInitialSaycodeSystemPromptEnabled(env)).toBeUndefined()
+  })
+
+  it('preserves legacy enabled behavior for absent or invalid values', () => {
+    expect(consumePendingInitialSaycodeSystemPromptEnabled({})).toBeUndefined()
+    expect(consumePendingInitialSaycodeSystemPromptEnabled({
+      HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED: 'invalid',
+    })).toBeUndefined()
   })
 })

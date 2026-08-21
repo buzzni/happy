@@ -79,6 +79,7 @@ import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import {
     consumePendingInitialEffort,
     consumePendingInitialModel,
+    consumePendingInitialSaycodeSystemPromptEnabled,
     resolveInitialPromptPermissionMode,
 } from '@/utils/initialPrompt';
 import { registerCodexSteerHandler } from './codexSteerHandler';
@@ -280,17 +281,20 @@ export async function runCodex(opts: {
     const initialEffortSeed = rawInitialEffortSeed && (VALID_REMOTE_EFFORTS as readonly string[]).includes(rawInitialEffortSeed)
         ? rawInitialEffortSeed as ReasoningEffort
         : DEFAULT_CODEX_EFFORT;
+    const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
+        process.env,
+    );
     let currentModel: string | undefined = initialModelSeed;
     let currentEffort: ReasoningEffort | undefined = initialEffortSeed;
     let currentAppendSystemPrompt: string | undefined = undefined;
-    let currentSaycodeSystemPromptEnabled: boolean | undefined = undefined;
+    let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
 
     const resetCurrentModeDefaults = () => {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
         currentModel = initialModelSeed;
         currentEffort = initialEffortSeed;
         currentAppendSystemPrompt = undefined;
-        currentSaycodeSystemPromptEnabled = undefined;
+        currentSaycodeSystemPromptEnabled = initialSaycodeSystemPromptEnabled;
         logger.debug('[Codex] Reset current mode defaults after abort');
     };
 

@@ -261,6 +261,7 @@ describe('runClaude remote JSONL scanner', () => {
         delete process.env.HAPPY_CREATED_BY_ACCOUNT_ID;
         delete process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
         delete process.env.HAPPY_INITIAL_PROMPT;
+        delete process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED;
         delete process.env.HAPPY_AUTOMATION_RUN_ONCE;
         delete process.env.HAPPY_AUTOMATION_RESUME_PROMPT;
         delete process.env.HAPPY_PROJECT_SANDBOX_CONFIG;
@@ -427,6 +428,20 @@ describe('runClaude remote JSONL scanner', () => {
 
         expect(harness.loopOptions.exitAfterFirstTurn).toBe(true);
         expect(process.env.HAPPY_AUTOMATION_RUN_ONCE).toBeUndefined();
+
+        await harness.finish();
+    });
+
+    it('applies the recovered Saycode prompt policy to the atomically delivered first turn', async () => {
+        process.env.HAPPY_INITIAL_PROMPT = '복구 후 이어서 작업해줘';
+        process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED = 'false';
+
+        const harness = await startRemoteRunClaudeHarness();
+
+        expect(harness.loopOptions.messageQueue.queue[0].mode).toMatchObject({
+            saycodeSystemPromptEnabled: false,
+        });
+        expect(process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED).toBeUndefined();
 
         await harness.finish();
     });

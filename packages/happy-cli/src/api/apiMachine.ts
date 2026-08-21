@@ -1291,6 +1291,7 @@ export class ApiMachineClient {
                         sessionId,
                         initialPrompt,
                         initialPromptLocalId,
+                        saycodeSystemPromptEnabled,
                         environmentVariables,
                         model,
                         permissionMode,
@@ -1310,6 +1311,12 @@ export class ApiMachineClient {
                         && (typeof initialPromptLocalId !== 'string' || !initialPromptLocalId.trim())
                     ) {
                         throw new Error('Initial prompt local ID must be a non-empty string');
+                    }
+                    if (
+                        saycodeSystemPromptEnabled !== undefined
+                        && typeof saycodeSystemPromptEnabled !== 'boolean'
+                    ) {
+                        throw new Error('Saycode system prompt policy must be a boolean');
                     }
                     if (
                         environmentVariables !== undefined
@@ -1339,6 +1346,7 @@ export class ApiMachineClient {
                     return handler(sessionId, {
                         initialPrompt,
                         initialPromptLocalId,
+                        saycodeSystemPromptEnabled,
                         environmentVariables,
                         model,
                         permissionMode,

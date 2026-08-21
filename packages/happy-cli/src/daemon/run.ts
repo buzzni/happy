@@ -831,6 +831,11 @@ export async function startDaemon(): Promise<void> {
             extraEnv.HAPPY_INITIAL_PROMPT_LOCAL_ID = options.initialPromptLocalId;
           }
         }
+        if (options.saycodeSystemPromptEnabled !== undefined) {
+          extraEnv.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED = String(
+            options.saycodeSystemPromptEnabled,
+          );
+        }
         // Initial model/effort seed: 사용자 입력 문자열이므로 initialPrompt와
         // 같은 이유로 ${VAR} 확장·검증 이후에 주입한다. 소비(read+delete)는
         // 자식 CLI(runClaude/runCodex)가 정확히 한 번 수행한다.
@@ -1488,6 +1493,7 @@ export async function startDaemon(): Promise<void> {
         createdByDisplayName: serverSession.metadata.createdBy?.displayName,
         initialPrompt: options.initialPrompt,
         initialPromptLocalId: options.initialPromptLocalId,
+        saycodeSystemPromptEnabled: options.saycodeSystemPromptEnabled,
       });
       if (spawned.type !== 'success') {
         return {
