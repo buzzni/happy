@@ -240,15 +240,15 @@ describe('settings', () => {
             expect(resolveSaycodeSystemPromptEnabled({ preference: null, surface: 'mobile' })).toBe(true);
         });
 
-        it('resets the Happy App product prompt when the policy is disabled', () => {
+        it('omits only the Happy App product prompt when the policy is disabled', () => {
             expect(resolveSaycodeAppendSystemPrompt({
                 enabled: false,
                 prompt: 'SAYCODE OPTIONS PROMPT',
-            })).toBeNull();
+            })).toBeUndefined();
             expect(resolveSaycodeAppendSystemPrompt({
                 enabled: true,
                 prompt: 'SAYCODE OPTIONS PROMPT',
-            })).toBe('SAYCODE OPTIONS PROMPT');
+            })).toContain('<!-- saycode:owned-prompt -->\nSAYCODE OPTIONS PROMPT\n<!-- saycode:owned-prompt -->');
         });
     });
 

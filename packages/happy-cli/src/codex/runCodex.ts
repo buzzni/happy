@@ -53,6 +53,7 @@ import { enqueueCodexUserText, isCodexClearText } from './codexClearCommand';
 import { downloadCodexFileEventAttachment } from './utils/attachmentEvents';
 import { prepareCodexImageInputItems } from './utils/imageInput';
 import { createSerialAsyncHandler } from './utils/serialAsyncHandler';
+import { resolveSaycodeAppendSystemPromptForMessage } from '@/prompt/promptProvenance';
 import { buildCodexThreadBackfillEnvelopes } from './utils/threadImageBackfill';
 import {
     buildCodexDeveloperInstructions,
@@ -366,10 +367,9 @@ export async function runCodex(opts: {
         }
 
         let messageAppendSystemPrompt = currentAppendSystemPrompt;
-        if (message.meta?.hasOwnProperty('appendSystemPrompt')) {
-            messageAppendSystemPrompt = message.meta.appendSystemPrompt || undefined;
-            currentAppendSystemPrompt = messageAppendSystemPrompt;
-            logger.debug(`[Codex] Append system prompt updated from user message: ${messageAppendSystemPrompt ? 'set' : 'reset to none'}`);
+        const hasAppendSystemPrompt = message.meta?.hasOwnProperty('appendSystemPrompt') ?? false;
+        if (hasAppendSystemPrompt) {
+            logger.debug(`[Codex] Append system prompt updated from user message: ${message.meta?.appendSystemPrompt ? 'set' : 'reset to none'}`);
         } else {
             logger.debug(`[Codex] User message received with no append system prompt override, using current: ${currentAppendSystemPrompt ? 'set' : 'none'}`);
         }
@@ -378,6 +378,14 @@ export async function runCodex(opts: {
             currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
             logger.debug(`[Codex] Saycode system prompt ${currentSaycodeSystemPromptEnabled ? 'enabled' : 'disabled'} by user message`);
         }
+
+        messageAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
+            current: currentAppendSystemPrompt,
+            incoming: message.meta?.appendSystemPrompt,
+            hasIncoming: hasAppendSystemPrompt,
+            saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+        });
+        currentAppendSystemPrompt = messageAppendSystemPrompt;
 
         const enhancedMode: EnhancedMode = {
             permissionMode: messagePermissionMode || 'default',

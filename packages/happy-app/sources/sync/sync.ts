@@ -702,6 +702,10 @@ class Sync {
         }
 
         // Create user message content with metadata
+        const appendSystemPrompt = resolveSaycodeAppendSystemPrompt({
+            enabled: saycodeSystemPromptEnabled,
+            prompt: systemPrompt,
+        });
         const content: RawRecord = {
             role: 'user',
             content: {
@@ -710,10 +714,7 @@ class Sync {
             },
             meta: {
                 sentFrom,
-                appendSystemPrompt: resolveSaycodeAppendSystemPrompt({
-                    enabled: saycodeSystemPromptEnabled,
-                    prompt: systemPrompt,
-                }),
+                ...(appendSystemPrompt !== undefined ? { appendSystemPrompt } : {}),
                 saycodeSystemPromptEnabled,
                 ...(modeMeta.permissionMode !== undefined ? { permissionMode: modeMeta.permissionMode } : {}),
                 ...(modeMeta.model !== undefined ? { model: modeMeta.model } : {}),

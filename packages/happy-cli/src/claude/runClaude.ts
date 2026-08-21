@@ -54,6 +54,7 @@ import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodeSystemPromptEnabled, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import { createEnvelope } from '@slopus/happy-wire';
+import { resolveSaycodeAppendSystemPromptForMessage } from '@/prompt/promptProvenance';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -730,10 +731,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
         // Resolve append system prompt - use message.meta.appendSystemPrompt if provided, otherwise use current
         let messageAppendSystemPrompt = currentAppendSystemPrompt;
-        if (message.meta?.hasOwnProperty('appendSystemPrompt')) {
-            messageAppendSystemPrompt = message.meta.appendSystemPrompt || undefined; // null becomes undefined
-            currentAppendSystemPrompt = messageAppendSystemPrompt;
-            logger.debug(`[loop] Append system prompt updated from user message: ${messageAppendSystemPrompt ? 'set' : 'reset to none'}`);
+        const hasAppendSystemPrompt = message.meta?.hasOwnProperty('appendSystemPrompt') ?? false;
+        if (hasAppendSystemPrompt) {
+            logger.debug(`[loop] Append system prompt updated from user message: ${message.meta?.appendSystemPrompt ? 'set' : 'reset to none'}`);
         } else {
             logger.debug(`[loop] User message received with no append system prompt override, using current: ${currentAppendSystemPrompt ? 'set' : 'none'}`);
         }
@@ -742,10 +742,16 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
             logger.debug(`[loop] Saycode system prompt ${currentSaycodeSystemPromptEnabled ? 'enabled' : 'disabled'} by user message`);
         }
+        messageAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
+            current: currentAppendSystemPrompt,
+            incoming: message.meta?.appendSystemPrompt,
+            hasIncoming: hasAppendSystemPrompt,
+            saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+        });
         if (currentSaycodeSystemPromptEnabled === false) {
             messageAppendSystemPrompt = removeAxSaycodeBasePrompt(messageAppendSystemPrompt);
-            currentAppendSystemPrompt = messageAppendSystemPrompt;
         }
+        currentAppendSystemPrompt = messageAppendSystemPrompt;
 
         // Resolve allowed tools - use message.meta.allowedTools if provided, otherwise use current
         let messageAllowedTools = currentAllowedTools;

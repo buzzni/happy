@@ -1,4 +1,5 @@
 import * as z from 'zod';
+import { wrapSaycodeOwnedPrompt } from '@slopus/happy-wire';
 import { AgentDefaultOverridesSchema } from './agentDefaults';
 
 //
@@ -26,8 +27,8 @@ export function resolveSaycodeAppendSystemPrompt({
 }: {
     enabled: boolean;
     prompt: string;
-}): string | null {
-    return enabled ? prompt : null;
+}): string | undefined {
+    return enabled ? wrapSaycodeOwnedPrompt(prompt) : undefined;
 }
 
 export const SettingsSchema = z.object({

@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { PROMPT_BLOCK_PROVENANCE } from './promptProvenance';
+import {
+  PROMPT_BLOCK_PROVENANCE,
+  resolveSaycodeAppendSystemPromptForMessage,
+} from './promptProvenance';
 
 describe('prompt provenance inventory', () => {
   it('classifies every current Claude, Codex, and client-composed block', () => {
@@ -16,5 +19,29 @@ describe('prompt provenance inventory', () => {
       'codex:connector-guidance': 'operational',
       'client:append-system-prompt': 'client-composed',
     });
+  });
+});
+
+describe('resolveSaycodeAppendSystemPromptForMessage', () => {
+  it('removes owned blocks without clearing user prompt state', () => {
+    expect(resolveSaycodeAppendSystemPromptForMessage({
+      current: [
+        'CUSTOM USER PROMPT',
+        '',
+        '<!-- saycode:owned-prompt -->',
+        'SAYCODE OPTIONS PROMPT',
+        '<!-- saycode:owned-prompt -->',
+      ].join('\n'),
+      hasIncoming: false,
+      saycodeSystemPromptEnabled: false,
+    })).toBe('CUSTOM USER PROMPT');
+  });
+
+  it('keeps the legacy enabled behavior when the policy field is absent', () => {
+    expect(resolveSaycodeAppendSystemPromptForMessage({
+      current: '<!-- saycode:owned-prompt -->\nPRODUCT PROMPT\n<!-- saycode:owned-prompt -->',
+      hasIncoming: false,
+      saycodeSystemPromptEnabled: undefined,
+    })).toContain('PRODUCT PROMPT');
   });
 });

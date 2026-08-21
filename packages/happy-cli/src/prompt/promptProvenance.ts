@@ -1,3 +1,5 @@
+import { stripSaycodeOwnedPromptBlocks } from '@slopus/happy-wire';
+
 export type PromptProvenance =
   | 'saycode'
   | 'selected-feature'
@@ -19,3 +21,15 @@ export const PROMPT_BLOCK_PROVENANCE = {
 } as const satisfies Record<string, PromptProvenance>;
 
 export type PromptBlockId = keyof typeof PROMPT_BLOCK_PROVENANCE;
+
+export function resolveSaycodeAppendSystemPromptForMessage(input: {
+  current: string | undefined;
+  incoming?: string | null;
+  hasIncoming: boolean;
+  saycodeSystemPromptEnabled: boolean | undefined;
+}): string | undefined {
+  const resolved = input.hasIncoming ? input.incoming || undefined : input.current;
+  return input.saycodeSystemPromptEnabled === false
+    ? stripSaycodeOwnedPromptBlocks(resolved)
+    : resolved;
+}

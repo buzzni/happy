@@ -47,6 +47,7 @@ import {
   prepareGeminiInitialPrompt,
   prepareGeminiSessionStart,
 } from '@/gemini/geminiInitialPrompt';
+import { resolveSaycodeAppendSystemPromptForMessage } from '@/prompt/promptProvenance';
 import {
   readGeminiLocalConfig,
   saveGeminiModelToConfig,
@@ -271,12 +272,16 @@ export async function runGemini(opts: {
     }
 
     const originalUserMessage = message.content.text;
-    if (message.meta?.hasOwnProperty('appendSystemPrompt')) {
-      currentAppendSystemPrompt = message.meta.appendSystemPrompt || undefined;
-    }
+    const hasAppendSystemPrompt = message.meta?.hasOwnProperty('appendSystemPrompt') ?? false;
     if (message.meta?.hasOwnProperty('saycodeSystemPromptEnabled')) {
       currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
     }
+    currentAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
+      current: currentAppendSystemPrompt,
+      incoming: message.meta?.appendSystemPrompt,
+      hasIncoming: hasAppendSystemPrompt,
+      saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+    });
 
     const mode: GeminiMode = {
       permissionMode: messagePermissionMode || 'default',
