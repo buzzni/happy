@@ -30,7 +30,7 @@ import {
 } from '@/claude/claudeGoalStatus';
 import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudeDisallowedTools, resolveInitialClaudePermissionMode, resolveRemoteClaudeDisallowedTools, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
-import { applyAxOrchestration } from '@/orchestrator/prompts/integrate';
+import { applyAxOrchestration, removeAxSaycodeBasePrompt } from '@/orchestrator/prompts/integrate';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
 import { appendTitleInstruction } from '@/utils/titlePrompt';
 import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
@@ -741,6 +741,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         if (message.meta?.hasOwnProperty('saycodeSystemPromptEnabled')) {
             currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
             logger.debug(`[loop] Saycode system prompt ${currentSaycodeSystemPromptEnabled ? 'enabled' : 'disabled'} by user message`);
+        }
+        if (currentSaycodeSystemPromptEnabled === false) {
+            messageAppendSystemPrompt = removeAxSaycodeBasePrompt(messageAppendSystemPrompt);
+            currentAppendSystemPrompt = messageAppendSystemPrompt;
         }
 
         // Resolve allowed tools - use message.meta.allowedTools if provided, otherwise use current

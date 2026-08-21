@@ -1134,6 +1134,36 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it('removes a stale AX Saycode base when AX state is no longer available', async () => {
+        const orchestration = vi.spyOn(axIntegration, 'applyAxOrchestration').mockResolvedValue(null);
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'continue without product instructions' },
+            meta: {
+                saycodeSystemPromptEnabled: false,
+                appendSystemPrompt: [
+                    '<!-- ax:base-prompt -->',
+                    'You are the Saycode AI assistant.',
+                    '<!-- ax:base-prompt -->',
+                    '',
+                    'CUSTOM USER PROMPT',
+                ].join('\n'),
+            },
+        });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(1);
+        expect(queued[0].mode.appendSystemPrompt).toBe('CUSTOM USER PROMPT');
+        orchestration.mockRestore();
+        await harness.finish();
+    });
+
     it('separates queued turns when the Saycode prompt policy changes', async () => {
         const harness = await startRemoteRunClaudeHarness();
         harness.sessionClient.hasTitle.mockReturnValue(true);

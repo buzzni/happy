@@ -1100,7 +1100,7 @@ export async function runCodex(opts: {
                             const resumed = await client.resumeThread({
                                 threadId,
                                 mcpServers,
-                                developerInstructions: nextDeveloperInstructions,
+                                developerInstructions: nextDeveloperInstructions ?? null,
                             });
                             currentDeveloperInstructions = nextDeveloperInstructions;
                             return resumed;
@@ -1116,7 +1116,7 @@ export async function runCodex(opts: {
                     await client.resumeThread({
                         threadId: client.threadId,
                         mcpServers: mcpSync.mcpServers,
-                        developerInstructions: nextDeveloperInstructions,
+                        developerInstructions: nextDeveloperInstructions ?? null,
                     });
                     currentDeveloperInstructions = nextDeveloperInstructions;
                 }

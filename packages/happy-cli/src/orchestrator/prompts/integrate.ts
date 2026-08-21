@@ -37,6 +37,10 @@ export interface ApplyAxOrchestrationResult {
     step: AxStep;
 }
 
+export function removeAxSaycodeBasePrompt(value: string | undefined): string | undefined {
+    return stripSentinelBlock(value, BASE_SENTINEL) || undefined;
+}
+
 export async function applyAxOrchestration(
     input: ApplyAxOrchestrationInput,
 ): Promise<ApplyAxOrchestrationResult | null> {
@@ -73,7 +77,7 @@ function mergeAxPrompt(current: string | undefined, base: string | undefined, gu
         : undefined;
     const turnContextBlock = `${TURN_CONTEXT_SENTINEL}\n${guide.trimEnd()}\n\n${context.trimEnd()}\n${TURN_CONTEXT_SENTINEL}`;
     const withoutTurnContext = stripSentinelBlock(current, TURN_CONTEXT_SENTINEL);
-    const withoutAxBlocks = stripSentinelBlock(withoutTurnContext, BASE_SENTINEL);
+    const withoutAxBlocks = removeAxSaycodeBasePrompt(withoutTurnContext);
 
     if (!withoutAxBlocks || withoutAxBlocks.length === 0) {
         return baseBlock ? `${baseBlock}\n\n${turnContextBlock}` : turnContextBlock;

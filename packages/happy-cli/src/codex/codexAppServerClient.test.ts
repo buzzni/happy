@@ -274,6 +274,53 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('clears persisted developer instructions when resume explicitly sends null', async () => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                if (!['thread/start', 'thread/resume', 'thread/fork'].includes(msg.method ?? '') || msg.id == null) {
+                    return;
+                }
+                const threadId = msg.method === 'thread/fork' ? 'thread-forked' : 'thread-1';
+                setTimeout(() => pushJsonLine(stdout, {
+                    id: msg.id,
+                    result: {
+                        thread: { id: threadId, path: `/tmp/${threadId}` },
+                        model: 'gpt-test',
+                        modelProvider: 'openai',
+                        cwd: '/tmp/project',
+                        approvalPolicy: 'on-request',
+                        sandbox: { type: 'workspaceWrite' },
+                        reasoningEffort: null,
+                    },
+                }), 0);
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+
+        await client.startThread({
+            cwd: '/tmp/project',
+            developerInstructions: 'SAYCODE INSTRUCTIONS',
+        });
+        await client.resumeThread({
+            threadId: 'thread-1',
+            developerInstructions: null,
+        });
+        await client.resumeThread({ threadId: 'thread-1' });
+        await client.forkThread({ threadId: 'thread-1' });
+
+        expect(requests.filter(({ method }) => method === 'thread/resume').map(({ params }) => (
+            params.developerInstructions
+        ))).toEqual([null, null]);
+        expect(requests.find(({ method }) => method === 'thread/fork')?.params.developerInstructions)
+            .toBeNull();
+
+        await client.disconnect();
+    });
+
     it('wraps transport when sandbox is enabled', async () => {
         // Dynamic import to ensure mocks are applied
         const { CodexAppServerClient } = await import('./codexAppServerClient');
