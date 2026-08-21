@@ -52,7 +52,7 @@ import { deliverPreparedClaudeSessionStart, prepareClaudeInitialPrompt } from '.
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
-import { consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodeSystemPromptEnabled, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
+import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodeSystemPromptEnabled, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import { createEnvelope } from '@slopus/happy-wire';
 
 /** JavaScript runtime to use for spawning Claude Code */
@@ -541,10 +541,11 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
+    const initialAppendSystemPrompt = consumePendingInitialAppendSystemPrompt(process.env);
     let currentModel: string | undefined = initialModelSeed; // Track current model state
     let currentFallbackModel: string | undefined = undefined; // Track current fallback model
     let currentCustomSystemPrompt: string | undefined = undefined; // Track current custom system prompt
-    let currentAppendSystemPrompt: string | undefined = undefined; // Track current append system prompt
+    let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt; // Track current append system prompt
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
     let currentAllowedTools: string[] | undefined = undefined; // Track current allowed tools
     let currentDisallowedTools: string[] | undefined = initialDisallowedTools; // Track current disallowed tools
@@ -555,7 +556,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         currentModel = initialModelSeed;
         currentFallbackModel = undefined;
         currentCustomSystemPrompt = undefined;
-        currentAppendSystemPrompt = undefined;
+        currentAppendSystemPrompt = initialAppendSystemPrompt;
         currentSaycodeSystemPromptEnabled = initialSaycodeSystemPromptEnabled;
         currentAllowedTools = undefined;
         currentDisallowedTools = initialDisallowedTools;

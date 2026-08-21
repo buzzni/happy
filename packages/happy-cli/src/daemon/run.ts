@@ -831,6 +831,9 @@ export async function startDaemon(): Promise<void> {
             extraEnv.HAPPY_INITIAL_PROMPT_LOCAL_ID = options.initialPromptLocalId;
           }
         }
+        if (options.appendSystemPrompt !== undefined) {
+          extraEnv.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT = options.appendSystemPrompt;
+        }
         if (options.saycodeSystemPromptEnabled !== undefined) {
           extraEnv.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED = String(
             options.saycodeSystemPromptEnabled,
@@ -1493,6 +1496,7 @@ export async function startDaemon(): Promise<void> {
         createdByDisplayName: serverSession.metadata.createdBy?.displayName,
         initialPrompt: options.initialPrompt,
         initialPromptLocalId: options.initialPromptLocalId,
+        appendSystemPrompt: options.appendSystemPrompt,
         saycodeSystemPromptEnabled: options.saycodeSystemPromptEnabled,
       });
       if (spawned.type !== 'success') {

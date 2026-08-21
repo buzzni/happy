@@ -77,6 +77,7 @@ import {
 } from './initialPrompt';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import {
+    consumePendingInitialAppendSystemPrompt,
     consumePendingInitialEffort,
     consumePendingInitialModel,
     consumePendingInitialSaycodeSystemPromptEnabled,
@@ -284,16 +285,17 @@ export async function runCodex(opts: {
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
+    const initialAppendSystemPrompt = consumePendingInitialAppendSystemPrompt(process.env);
     let currentModel: string | undefined = initialModelSeed;
     let currentEffort: ReasoningEffort | undefined = initialEffortSeed;
-    let currentAppendSystemPrompt: string | undefined = undefined;
+    let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt;
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
 
     const resetCurrentModeDefaults = () => {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
         currentModel = initialModelSeed;
         currentEffort = initialEffortSeed;
-        currentAppendSystemPrompt = undefined;
+        currentAppendSystemPrompt = initialAppendSystemPrompt;
         currentSaycodeSystemPromptEnabled = initialSaycodeSystemPromptEnabled;
         logger.debug('[Codex] Reset current mode defaults after abort');
     };

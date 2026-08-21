@@ -44,6 +44,14 @@ export function consumePendingInitialSaycodeSystemPromptEnabled(
   return undefined
 }
 
+export function consumePendingInitialAppendSystemPrompt(
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  const raw = env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT
+  delete env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT
+  return raw && raw.trim().length > 0 ? raw : undefined
+}
+
 export function consumePendingInitialPromptLocalId(env: NodeJS.ProcessEnv): string | undefined {
   const raw = env.HAPPY_INITIAL_PROMPT_LOCAL_ID
   delete env.HAPPY_INITIAL_PROMPT_LOCAL_ID

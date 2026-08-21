@@ -268,6 +268,8 @@ export interface SpawnSessionOptions {
     initialPrompt?: string;
     /** Web optimistic message id preserved on the initial prompt server row. */
     initialPromptLocalId?: string;
+    /** User/project/operational prompt preserved for an atomically delivered first turn. */
+    appendSystemPrompt?: string;
     /** Saycode-owned prompt policy applied to an atomically delivered initial prompt. */
     saycodeSystemPromptEnabled?: boolean;
     /** Exit cleanly after the spawned agent completes its first turn. */
@@ -306,6 +308,7 @@ export type ResumeSessionResult =
 export type RecoverSessionOptions = {
     initialPrompt: string;
     initialPromptLocalId?: string;
+    appendSystemPrompt?: string;
     saycodeSystemPromptEnabled?: boolean;
     environmentVariables?: Record<string, string>;
     model?: string;

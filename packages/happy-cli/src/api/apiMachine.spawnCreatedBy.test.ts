@@ -283,6 +283,7 @@ describe('ApiMachineClient spawn/resume RPC passthrough', () => {
             sessionId: 'happy-old',
             initialPrompt: '이어서 작업해줘',
             initialPromptLocalId: 'web-local-1',
+            appendSystemPrompt: 'USER PROJECT CONTEXT',
             environmentVariables: { PROJECT_TOKEN: '${PROJECT_TOKEN}' },
             model: 'opus',
             permissionMode: 'bypassPermissions',
@@ -300,6 +301,7 @@ describe('ApiMachineClient spawn/resume RPC passthrough', () => {
         expect(recoverSession).toHaveBeenCalledWith('happy-old', {
             initialPrompt: '이어서 작업해줘',
             initialPromptLocalId: 'web-local-1',
+            appendSystemPrompt: 'USER PROJECT CONTEXT',
             environmentVariables: { PROJECT_TOKEN: '${PROJECT_TOKEN}' },
             model: 'opus',
             permissionMode: 'bypassPermissions',

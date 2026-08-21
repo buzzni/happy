@@ -434,13 +434,16 @@ describe('runClaude remote JSONL scanner', () => {
 
     it('applies the recovered Saycode prompt policy to the atomically delivered first turn', async () => {
         process.env.HAPPY_INITIAL_PROMPT = '복구 후 이어서 작업해줘';
+        process.env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT = 'USER PROJECT CONTEXT';
         process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED = 'false';
 
         const harness = await startRemoteRunClaudeHarness();
 
         expect(harness.loopOptions.messageQueue.queue[0].mode).toMatchObject({
+            appendSystemPrompt: 'USER PROJECT CONTEXT',
             saycodeSystemPromptEnabled: false,
         });
+        expect(process.env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT).toBeUndefined();
         expect(process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED).toBeUndefined();
 
         await harness.finish();
