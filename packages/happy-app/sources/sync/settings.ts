@@ -20,6 +20,16 @@ export function resolveSaycodeSystemPromptEnabled({
     return preference ?? surface !== 'desktop';
 }
 
+export function resolveSaycodeAppendSystemPrompt({
+    enabled,
+    prompt,
+}: {
+    enabled: boolean;
+    prompt: string;
+}): string | null {
+    return enabled ? prompt : null;
+}
+
 export const SettingsSchema = z.object({
     // Schema version for compatibility detection
     schemaVersion: z.number().default(SUPPORTED_SCHEMA_VERSION).describe('Settings schema version for compatibility checks'),

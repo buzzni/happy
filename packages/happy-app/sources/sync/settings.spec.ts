@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
     settingsParse,
     applySettings,
+    resolveSaycodeAppendSystemPrompt,
     resolveSaycodeSystemPromptEnabled,
     settingsDefaults,
     settingsToSyncPayload,
@@ -237,6 +238,17 @@ describe('settings', () => {
         it('defaults an undecided web or mobile account to enabled', () => {
             expect(resolveSaycodeSystemPromptEnabled({ preference: null, surface: 'web' })).toBe(true);
             expect(resolveSaycodeSystemPromptEnabled({ preference: null, surface: 'mobile' })).toBe(true);
+        });
+
+        it('resets the Happy App product prompt when the policy is disabled', () => {
+            expect(resolveSaycodeAppendSystemPrompt({
+                enabled: false,
+                prompt: 'SAYCODE OPTIONS PROMPT',
+            })).toBeNull();
+            expect(resolveSaycodeAppendSystemPrompt({
+                enabled: true,
+                prompt: 'SAYCODE OPTIONS PROMPT',
+            })).toBe('SAYCODE OPTIONS PROMPT');
         });
     });
 

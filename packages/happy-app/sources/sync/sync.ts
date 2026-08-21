@@ -22,7 +22,7 @@ import { syncCurrentPushToken } from './pushRegistration';
 import { Platform, AppState, type AppStateStatus } from 'react-native';
 import { isRunningOnMac } from '@/utils/platform';
 import { NormalizedMessage, normalizeRawMessage, RawRecord } from './typesRaw';
-import { applySettings, resolveSaycodeSystemPromptEnabled, Settings, settingsDefaults, settingsParse, SUPPORTED_SCHEMA_VERSION } from './settings';
+import { applySettings, resolveSaycodeAppendSystemPrompt, resolveSaycodeSystemPromptEnabled, Settings, settingsDefaults, settingsParse, SUPPORTED_SCHEMA_VERSION } from './settings';
 import { syncPendingAccountSettings } from './accountSettingsSync';
 import { Profile, profileParse } from './profile';
 import { loadPendingSettings, savePendingSettings } from './persistence';
@@ -710,7 +710,10 @@ class Sync {
             },
             meta: {
                 sentFrom,
-                appendSystemPrompt: systemPrompt,
+                appendSystemPrompt: resolveSaycodeAppendSystemPrompt({
+                    enabled: saycodeSystemPromptEnabled,
+                    prompt: systemPrompt,
+                }),
                 saycodeSystemPromptEnabled,
                 ...(modeMeta.permissionMode !== undefined ? { permissionMode: modeMeta.permissionMode } : {}),
                 ...(modeMeta.model !== undefined ? { model: modeMeta.model } : {}),
