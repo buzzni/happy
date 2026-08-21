@@ -185,7 +185,10 @@ export function applySettings(settings: Settings, delta: Partial<Settings>): Set
 }
 
 export function settingsToSyncPayload(settings: Settings): Partial<Settings> {
-    const result: Partial<Settings> = { ...settings };
+    const result: Partial<Settings> = {
+        ...settings,
+        schemaVersion: Math.max(settings.schemaVersion, SUPPORTED_SCHEMA_VERSION),
+    };
     const compactAgentOverrides = Object.fromEntries(
         Object.entries(settings.agentDefaultOverrides ?? {}).filter(([, value]) => (
             value && typeof value === 'object' && Object.keys(value).length > 0

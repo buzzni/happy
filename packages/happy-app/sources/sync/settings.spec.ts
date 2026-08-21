@@ -5,6 +5,7 @@ import {
     resolveSaycodeSystemPromptEnabled,
     settingsDefaults,
     settingsToSyncPayload,
+    SUPPORTED_SCHEMA_VERSION,
     type Settings,
 } from './settings';
 
@@ -240,6 +241,26 @@ describe('settings', () => {
     });
 
     describe('settingsToSyncPayload', () => {
+        it('upgrades an older local schema when syncing current fields', () => {
+            expect(settingsToSyncPayload({
+                ...settingsDefaults,
+                schemaVersion: 2,
+                saycodeSystemPromptEnabled: false,
+            })).toMatchObject({
+                schemaVersion: SUPPORTED_SCHEMA_VERSION,
+                saycodeSystemPromptEnabled: false,
+            });
+        });
+
+        it('preserves a future schema version when syncing known fields', () => {
+            expect(settingsToSyncPayload({
+                ...settingsDefaults,
+                schemaVersion: SUPPORTED_SCHEMA_VERSION + 1,
+            })).toMatchObject({
+                schemaVersion: SUPPORTED_SCHEMA_VERSION + 1,
+            });
+        });
+
         it('omits empty agent default overrides', () => {
             expect(settingsToSyncPayload(settingsDefaults)).not.toHaveProperty('agentDefaultOverrides');
         });

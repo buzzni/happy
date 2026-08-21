@@ -846,6 +846,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 userText: pushText,
                 currentAppendSystemPrompt: messageAppendSystemPrompt,
                 explicitStep: explicitAxStep,
+                saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
             });
             if (ax) {
                 pushText = ax.userText;

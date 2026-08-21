@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TITLE_INSTRUCTION } from '@/utils/titlePrompt';
+import * as axIntegration from '@/orchestrator/prompts/integrate';
 
 const {
     mockApiClientCreate,
@@ -1109,6 +1110,27 @@ describe('runClaude remote JSONL scanner', () => {
         expect(queued).toHaveLength(1);
         expect(queued[0].message).toBe('use my own harness');
         expect(queued[0].mode.saycodeSystemPromptEnabled).toBe(false);
+        await harness.finish();
+    });
+
+    it('passes the resolved Saycode policy to AX orchestration', async () => {
+        const orchestration = vi.spyOn(axIntegration, 'applyAxOrchestration').mockResolvedValue(null);
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'keep selected AX context only' },
+            meta: { saycodeSystemPromptEnabled: false },
+        });
+
+        expect(orchestration).toHaveBeenCalledWith(expect.objectContaining({
+            saycodeSystemPromptEnabled: false,
+        }));
+        orchestration.mockRestore();
         await harness.finish();
     });
 
