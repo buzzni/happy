@@ -44,6 +44,10 @@ import type { PermissionMode } from '@/api/types';
 import { GEMINI_MODEL_ENV, DEFAULT_GEMINI_MODEL } from '@/gemini/constants';
 import { buildGeminiTurnPrompt, hashGeminiMode } from '@/gemini/geminiPrompt';
 import {
+  prepareGeminiInitialPrompt,
+  prepareGeminiSessionStart,
+} from '@/gemini/geminiInitialPrompt';
+import {
   readGeminiLocalConfig,
   saveGeminiModelToConfig,
   getInitialGeminiModel
@@ -73,6 +77,7 @@ export async function runGemini(opts: {
 
 
   const sessionTag = randomUUID();
+  const preparedInitialPrompt = prepareGeminiInitialPrompt(process.env);
 
   // Set backend for offline warnings (before any API calls)
   connectionState.setBackend('Gemini');
@@ -202,27 +207,6 @@ export async function runGemini(opts: {
   });
   session = initialSession;
 
-  // Report to daemon (only if we have a real session)
-  if (response) {
-    try {
-      logger.debug(`[START] Reporting session ${response.id} to daemon`);
-      const result = await notifyDaemonSessionStarted(response.id, metadata, {
-        encryptionKey: encodeBase64(response.encryptionKey),
-        encryptionVariant: response.encryptionVariant,
-        seq: response.seq,
-        metadataVersion: response.metadataVersion,
-        agentStateVersion: response.agentStateVersion,
-      });
-      if (result.error) {
-        logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
-      } else {
-        logger.debug(`[START] Reported session ${response.id} to daemon`);
-      }
-    } catch (error) {
-      logger.debug('[START] Failed to report to daemon (may not be running):', error);
-    }
-  }
-
   const messageQueue = new MessageQueue2<GeminiMode>(hashGeminiMode);
 
   // Conversation history for context preservation across model changes
@@ -231,8 +215,9 @@ export async function runGemini(opts: {
   // Track current overrides to apply per message
   let currentPermissionMode: PermissionMode | undefined = undefined;
   let currentModel: string | undefined = undefined;
-  let currentAppendSystemPrompt: string | undefined = undefined;
-  let currentSaycodeSystemPromptEnabled: boolean | undefined = undefined;
+  let currentAppendSystemPrompt = preparedInitialPrompt.appendSystemPrompt;
+  let currentSaycodeSystemPromptEnabled =
+    preparedInitialPrompt.saycodeSystemPromptEnabled;
 
   session.onUserMessage((message) => {
     // Resolve permission mode (validate) - same as Codex
@@ -305,6 +290,43 @@ export async function runGemini(opts: {
     // Record each message before MessageQueue2 batches adjacent messages. A
     // restarted backend excludes the unanswered trailing turns from context.
     conversationHistory.addUserMessage(originalUserMessage);
+  });
+
+  await prepareGeminiSessionStart({
+    prepared: preparedInitialPrompt,
+    sendSessionMessage: (envelope, localId) =>
+      session.sendSessionProtocolMessage(envelope, localId),
+    pushPrompt: (prompt) => {
+      messageQueue.unshiftIsolated(prompt, {
+        permissionMode: currentPermissionMode ?? 'default',
+        model: currentModel,
+        originalUserMessage: prompt,
+        appendSystemPrompt: currentAppendSystemPrompt,
+        saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+      });
+      conversationHistory.addUserMessage(prompt);
+    },
+    // The daemon may return recovery success as soon as this report arrives.
+    // Deliver the recovered turn first so success cannot race ahead of its prompt.
+    reportStarted: response ? async () => {
+      try {
+        logger.debug(`[START] Reporting session ${response.id} to daemon`);
+        const result = await notifyDaemonSessionStarted(response.id, metadata, {
+          encryptionKey: encodeBase64(response.encryptionKey),
+          encryptionVariant: response.encryptionVariant,
+          seq: response.seq,
+          metadataVersion: response.metadataVersion,
+          agentStateVersion: response.agentStateVersion,
+        });
+        if (result.error) {
+          logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
+        } else {
+          logger.debug(`[START] Reported session ${response.id} to daemon`);
+        }
+      } catch (error) {
+        logger.debug('[START] Failed to report to daemon (may not be running):', error);
+      }
+    } : undefined,
   });
 
   let thinking = false;
