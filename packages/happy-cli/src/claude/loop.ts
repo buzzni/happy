@@ -56,6 +56,7 @@ interface LoopOptions {
     jsRuntime?: JsRuntime
     exitAfterFirstTurn?: boolean
     getSaycodeSystemPromptEnabled: () => boolean | undefined
+    getSaycodePromptBlocks: () => SaycodePromptBlockOverrides | undefined
 }
 
 export async function loop(opts: LoopOptions): Promise<number> {
@@ -94,6 +95,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
             case 'local': {
                 const result = await claudeLocalLauncher(session, {
                     saycodeSystemPromptEnabled: opts.getSaycodeSystemPromptEnabled(),
+                    saycodePromptBlocks: opts.getSaycodePromptBlocks(),
                 });
                 switch (result.type ) {
                     case 'switch':

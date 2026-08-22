@@ -10,6 +10,7 @@ import { claudeFindLastSession } from "./utils/claudeFindLastSession";
 import { getProjectPath } from "./utils/path";
 import { projectPath } from "@/projectPath";
 import { CHAT_TITLE_SYSTEM_PROMPT, saycodeOwnedSystemPrompt } from "./utils/systemPrompt";
+import { isSaycodePromptBlockEnabled, type SaycodePromptBlockOverrides } from "@/prompt/promptProvenance";
 import type { SandboxConfig } from "@/persistence";
 import { initializeSandbox, wrapCommand } from "@/sandbox/manager";
 import { filterCredentialsFromEnv } from "@/sandbox/config";
@@ -46,6 +47,8 @@ export async function claudeLocal(opts: {
     claudeArgs?: string[],
     allowedTools?: string[],
     saycodeSystemPromptEnabled?: boolean,
+    /** Per-block overrides; a block with no override inherits saycodeSystemPromptEnabled. */
+    saycodePromptBlocks?: SaycodePromptBlockOverrides,
     /** Path to temporary settings file with SessionStart hook (optional - for session tracking) */
     hookSettingsPath?: string,
     sandboxConfig?: SandboxConfig,
@@ -236,7 +239,9 @@ export async function claudeLocal(opts: {
             // the Saycode-owned remainder (commit credits) is gated.
             const localSystemPrompt = [
                 CHAT_TITLE_SYSTEM_PROMPT,
-                opts.saycodeSystemPromptEnabled !== false ? saycodeOwnedSystemPrompt : undefined,
+                isSaycodePromptBlockEnabled(
+                    'coAuthoredCredit', opts.saycodePromptBlocks, opts.saycodeSystemPromptEnabled,
+                ) ? saycodeOwnedSystemPrompt : undefined,
             ].filter(Boolean).join('\n\n');
             args.push('--append-system-prompt', localSystemPrompt);
 

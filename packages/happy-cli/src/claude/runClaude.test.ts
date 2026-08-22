@@ -1234,6 +1234,32 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it('does not batch turns that differ only in per-block Saycode overrides', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'first turn' },
+            meta: { saycodePromptBlocks: { workerDelegation: false } },
+        });
+        await userMessageHandler({
+            content: { text: 'second turn' },
+            meta: { saycodePromptBlocks: { workerDelegation: true } },
+        });
+
+        // collectBatch() merges adjacent queue entries sharing a modeHash and applies the
+        // FIRST entry's mode to the whole batch — so a hash that ignores the overrides
+        // would silently run 'second turn' under the previous turn's block policy.
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(2);
+        expect(queued[0].modeHash).not.toBe(queued[1].modeHash);
+        await harness.finish();
+    });
+
     it('passes the resolved Saycode policy to AX orchestration', async () => {
         const orchestration = vi.spyOn(axIntegration, 'applyAxOrchestration').mockResolvedValue(null);
         const harness = await startRemoteRunClaudeHarness();

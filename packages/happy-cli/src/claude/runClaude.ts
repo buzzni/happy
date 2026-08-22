@@ -523,6 +523,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         customSystemPrompt: mode.customSystemPrompt,
         appendSystemPrompt: mode.appendSystemPrompt,
         saycodeSystemPromptEnabled: mode.saycodeSystemPromptEnabled,
+        saycodePromptBlocks: mode.saycodePromptBlocks,
         allowedTools: mode.allowedTools,
         disallowedTools: mode.disallowedTools,
         effort: mode.effort,
@@ -758,7 +759,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             logger.debug(`[loop] Saycode system prompt ${currentSaycodeSystemPromptEnabled ? 'enabled' : 'disabled'} by user message`);
         }
         if (message.meta?.hasOwnProperty('saycodePromptBlocks')) {
-            currentSaycodePromptBlocks = message.meta.saycodePromptBlocks;
+            currentSaycodePromptBlocks = message.meta.saycodePromptBlocks ?? undefined;
             logger.debug(`[loop] Saycode per-block prompt overrides updated by user message: ${JSON.stringify(currentSaycodePromptBlocks)}`);
         }
         messageAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
@@ -1139,6 +1140,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         jsRuntime: options.jsRuntime,
         exitAfterFirstTurn,
         getSaycodeSystemPromptEnabled: () => currentSaycodeSystemPromptEnabled,
+        getSaycodePromptBlocks: () => currentSaycodePromptBlocks,
     });
 
     // Cleanup session resources (intervals, callbacks) - prevents memory leak

@@ -3,12 +3,16 @@ import { claudeLocal, ExitCodeError } from "./claudeLocal";
 import { Session } from "./session";
 import { Future } from "@/utils/future";
 import { createSessionScanner } from "./utils/sessionScanner";
+import type { SaycodePromptBlockOverrides } from "@/prompt/promptProvenance";
 
 export type LauncherResult = { type: 'switch' } | { type: 'exit', code: number };
 
 export async function claudeLocalLauncher(
     session: Session,
-    options: { saycodeSystemPromptEnabled?: boolean } = {},
+    options: {
+        saycodeSystemPromptEnabled?: boolean
+        saycodePromptBlocks?: SaycodePromptBlockOverrides
+    } = {},
 ): Promise<LauncherResult> {
 
     let scannerMessageChain = Promise.resolve();
@@ -123,6 +127,7 @@ export async function claudeLocalLauncher(
                     mcpServers: session.mcpServers,
                     allowedTools: session.allowedTools,
                     saycodeSystemPromptEnabled: options.saycodeSystemPromptEnabled,
+                    saycodePromptBlocks: options.saycodePromptBlocks,
                     hookSettingsPath: session.hookSettingsPath,
                     sandboxConfig: session.sandboxConfig,
                 });

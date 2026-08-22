@@ -305,6 +305,37 @@ describe('claudeLocal --continue handling', () => {
         expect(spawnArgs).toContain('test-title-prompt\n\ntest-saycode-owned-prompt');
     });
 
+    it('honors a per-block override that turns the Saycode-owned prompt off while the master value is on', async () => {
+        await claudeLocal({
+            abort: new AbortController().signal,
+            sessionId: null,
+            path: '/tmp',
+            onSessionFound,
+            claudeArgs: [],
+            saycodeSystemPromptEnabled: true,
+            saycodePromptBlocks: { coAuthoredCredit: false },
+        });
+
+        const spawnArgs = mockSpawn.mock.calls[0][1];
+        expect(spawnArgs).toContain('test-title-prompt');
+        expect(spawnArgs).not.toContain('test-saycode-owned-prompt');
+    });
+
+    it('honors a per-block override that turns the Saycode-owned prompt on while the master value is off', async () => {
+        await claudeLocal({
+            abort: new AbortController().signal,
+            sessionId: null,
+            path: '/tmp',
+            onSessionFound,
+            claudeArgs: [],
+            saycodeSystemPromptEnabled: false,
+            saycodePromptBlocks: { coAuthoredCredit: true },
+        });
+
+        const spawnArgs = mockSpawn.mock.calls[0][1];
+        expect(spawnArgs).toContain('test-title-prompt\n\ntest-saycode-owned-prompt');
+    });
+
     it('should initialize sandbox, wrap command, and cleanup on exit', async () => {
         await claudeLocal({
             abort: new AbortController().signal,
