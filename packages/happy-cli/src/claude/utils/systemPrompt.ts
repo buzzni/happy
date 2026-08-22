@@ -29,22 +29,13 @@ const CO_AUTHORED_CREDITS = (() => trimIdent(`
 `))();
 
 /**
- * System prompt with conditional Co-Authored-By lines based on Claude's settings.json configuration.
+ * The Saycode-gated half of the prompt: Happy's commit credits. Empty when the
+ * user's Claude settings opt out of Co-Authored-By, so callers can pass it
+ * unconditionally and let the per-block gate decide.
+ *
+ * Deliberately kept separate from {@link CHAT_TITLE_SYSTEM_PROMPT} rather than
+ * pre-joined: a combined export would let a caller inject the credits past the
+ * `coAuthoredCredit` gate just by picking the convenient constant.
  * Settings are read once on startup for performance.
- */
-export const systemPrompt = (() => {
-  const includeCoAuthored = shouldIncludeCoAuthoredBy();
-  
-  if (includeCoAuthored) {
-    return CHAT_TITLE_SYSTEM_PROMPT + '\n\n' + CO_AUTHORED_CREDITS;
-  } else {
-    return CHAT_TITLE_SYSTEM_PROMPT;
-  }
-})();
-
-/**
- * The Saycode-gated remainder of {@link systemPrompt}: Happy's commit credits.
- * Empty when the user's Claude settings opt out of Co-Authored-By, so callers
- * can pass it unconditionally.
  */
 export const saycodeOwnedSystemPrompt = (() => (shouldIncludeCoAuthoredBy() ? CO_AUTHORED_CREDITS : ''))();
