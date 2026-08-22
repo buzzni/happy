@@ -39,7 +39,8 @@ vi.mock('./utils/path', () => ({
 }));
 
 vi.mock('./utils/systemPrompt', () => ({
-    systemPrompt: 'test-system-prompt'
+    CHAT_TITLE_SYSTEM_PROMPT: 'test-title-prompt',
+    saycodeOwnedSystemPrompt: 'test-saycode-owned-prompt',
 }));
 
 vi.mock('node:fs', () => ({
@@ -274,7 +275,7 @@ describe('claudeLocal --continue handling', () => {
         expect(spawnArgs).toContain('-r');
     });
 
-    it('does not append the Saycode system prompt when the current policy is disabled', async () => {
+    it('drops only the Saycode-owned prompt when the current policy is disabled, keeping the chat title instruction', async () => {
         await claudeLocal({
             abort: new AbortController().signal,
             sessionId: null,
@@ -285,11 +286,12 @@ describe('claudeLocal --continue handling', () => {
         });
 
         const spawnArgs = mockSpawn.mock.calls[0][1];
-        expect(spawnArgs).not.toContain('--append-system-prompt');
-        expect(spawnArgs).not.toContain('test-system-prompt');
+        expect(spawnArgs).toContain('--append-system-prompt');
+        expect(spawnArgs).toContain('test-title-prompt');
+        expect(spawnArgs).not.toContain('test-saycode-owned-prompt');
     });
 
-    it('keeps appending the Saycode system prompt when no policy is provided', async () => {
+    it('keeps appending the Saycode-owned prompt alongside the title instruction when no policy is provided', async () => {
         await claudeLocal({
             abort: new AbortController().signal,
             sessionId: null,
@@ -300,7 +302,7 @@ describe('claudeLocal --continue handling', () => {
 
         const spawnArgs = mockSpawn.mock.calls[0][1];
         expect(spawnArgs).toContain('--append-system-prompt');
-        expect(spawnArgs).toContain('test-system-prompt');
+        expect(spawnArgs).toContain('test-title-prompt\n\ntest-saycode-owned-prompt');
     });
 
     it('should initialize sandbox, wrap command, and cleanup on exit', async () => {

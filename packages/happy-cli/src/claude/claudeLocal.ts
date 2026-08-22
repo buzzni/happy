@@ -9,7 +9,7 @@ import { claudeCheckSession } from "./utils/claudeCheckSession";
 import { claudeFindLastSession } from "./utils/claudeFindLastSession";
 import { getProjectPath } from "./utils/path";
 import { projectPath } from "@/projectPath";
-import { systemPrompt } from "./utils/systemPrompt";
+import { CHAT_TITLE_SYSTEM_PROMPT, saycodeOwnedSystemPrompt } from "./utils/systemPrompt";
 import type { SandboxConfig } from "@/persistence";
 import { initializeSandbox, wrapCommand } from "@/sandbox/manager";
 import { filterCredentialsFromEnv } from "@/sandbox/config";
@@ -231,9 +231,14 @@ export async function claudeLocal(opts: {
             }
             // If hasResumeFlag && !startFrom: --resume is in claudeArgs, let Claude handle it
 
-            if (opts.saycodeSystemPromptEnabled !== false) {
-                args.push('--append-system-prompt', systemPrompt);
-            }
+            // The chat title instruction always ships — it is product plumbing,
+            // not Saycode-owned behavioral guidance (see claudePrompt.ts). Only
+            // the Saycode-owned remainder (commit credits) is gated.
+            const localSystemPrompt = [
+                CHAT_TITLE_SYSTEM_PROMPT,
+                opts.saycodeSystemPromptEnabled !== false ? saycodeOwnedSystemPrompt : undefined,
+            ].filter(Boolean).join('\n\n');
+            args.push('--append-system-prompt', localSystemPrompt);
 
             if (opts.mcpServers && Object.keys(opts.mcpServers).length > 0) {
                 args.push('--mcp-config', JSON.stringify({ mcpServers: opts.mcpServers }));
