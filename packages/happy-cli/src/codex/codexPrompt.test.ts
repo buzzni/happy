@@ -45,7 +45,7 @@ describe('buildCodexTurnPrompt', () => {
         );
     });
 
-    it('removes the Saycode title instruction but preserves client append prompt when disabled', () => {
+    it('keeps the title instruction when Saycode prompts are disabled', () => {
         expect(buildCodexTurnPrompt({
             message: 'hello',
             mode: {
@@ -54,7 +54,7 @@ describe('buildCodexTurnPrompt', () => {
             },
             includeAppendSystemPrompt: true,
             includeTitleInstruction: true,
-        })).toBe('USER AND PROJECT CONTEXT\n\nhello');
+        })).toBe(`USER AND PROJECT CONTEXT\n\nhello\n\n${CHANGE_TITLE_INSTRUCTION}`);
     });
 
     it('preserves the existing first-turn title instruction when no append prompt is set', () => {

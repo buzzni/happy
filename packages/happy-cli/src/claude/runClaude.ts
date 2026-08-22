@@ -31,6 +31,7 @@ import {
 import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudeDisallowedTools, resolveInitialClaudePermissionMode, resolveRemoteClaudeDisallowedTools, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
 import { applyAxOrchestration, removeAxSaycodeBasePrompt } from '@/orchestrator/prompts/integrate';
+import { isSaycodePromptBlockEnabled, type SaycodePromptBlockOverrides } from '@/prompt/promptProvenance';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
 import { appendTitleInstruction } from '@/utils/titlePrompt';
 import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
@@ -522,6 +523,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         customSystemPrompt: mode.customSystemPrompt,
         appendSystemPrompt: mode.appendSystemPrompt,
         saycodeSystemPromptEnabled: mode.saycodeSystemPromptEnabled,
+        saycodePromptBlocks: mode.saycodePromptBlocks,
         allowedTools: mode.allowedTools,
         disallowedTools: mode.disallowedTools,
         effort: mode.effort,
@@ -557,6 +559,11 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     let currentCustomSystemPrompt: string | undefined = undefined; // Track current custom system prompt
     let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt; // Track current append system prompt
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
+    // Per-block overrides layered on top of currentSaycodeSystemPromptEnabled — a block
+    // with no override inherits it (see promptProvenance.isSaycodePromptBlockEnabled).
+    // No initial-seed threading yet: daemon-spawned first turns fall back to the legacy
+    // value, which is the intended default for accounts with no per-block prefs.
+    let currentSaycodePromptBlocks: SaycodePromptBlockOverrides | undefined = undefined;
     let currentAllowedTools: string[] | undefined = undefined; // Track current allowed tools
     let currentDisallowedTools: string[] | undefined = initialDisallowedTools; // Track current disallowed tools
     let currentEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined = initialEffortSeed; // Track current Claude effort (thinking depth)
@@ -579,6 +586,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         customSystemPrompt: currentCustomSystemPrompt,
         appendSystemPrompt: currentAppendSystemPrompt,
         saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+        saycodePromptBlocks: currentSaycodePromptBlocks,
         allowedTools: currentAllowedTools,
         disallowedTools: currentDisallowedTools,
         effort: currentEffort,
@@ -750,13 +758,20 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
             logger.debug(`[loop] Saycode system prompt ${currentSaycodeSystemPromptEnabled ? 'enabled' : 'disabled'} by user message`);
         }
+        if (message.meta?.hasOwnProperty('saycodePromptBlocks')) {
+            currentSaycodePromptBlocks = message.meta.saycodePromptBlocks ?? undefined;
+            logger.debug(`[loop] Saycode per-block prompt overrides updated by user message: ${JSON.stringify(currentSaycodePromptBlocks)}`);
+        }
         messageAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
             current: currentAppendSystemPrompt,
             incoming: message.meta?.appendSystemPrompt,
             hasIncoming: hasAppendSystemPrompt,
             saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
         });
-        if (currentSaycodeSystemPromptEnabled === false) {
+        // Cleanup for an already-injected AX base. applyAxOrchestration's own merge strips
+        // it, but returns null on a non-AX / unavailable workspace — then this is the only
+        // path that removes it, so it must honor the same per-block gate as the injection.
+        if (!isSaycodePromptBlockEnabled('axBase', currentSaycodePromptBlocks, currentSaycodeSystemPromptEnabled)) {
             messageAppendSystemPrompt = removeAxSaycodeBasePrompt(messageAppendSystemPrompt);
         }
         currentAppendSystemPrompt = messageAppendSystemPrompt;
@@ -865,6 +880,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 currentAppendSystemPrompt: messageAppendSystemPrompt,
                 explicitStep: explicitAxStep,
                 saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+                saycodePromptBlocks: currentSaycodePromptBlocks,
             });
             if (ax) {
                 pushText = ax.userText;
@@ -891,7 +907,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         // Only the model's copy changes; the app renders its own user bubble.
         // recordAppPrompt() de-dupes the modified turn so the remote-mode JSONL
         // scanner doesn't forward it back to the app as a second message.
-        if (currentSaycodeSystemPromptEnabled !== false && !session.hasTitle()) {
+        if (!session.hasTitle()) {
             const withTitle = appendTitleInstruction(pushText);
             if (withTitle !== pushText) {
                 pushText = withTitle;
@@ -917,7 +933,6 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         sink: {
             sessionId: session.sessionId,
             hasTitle: () => session.hasTitle(),
-            saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
             sendClaudeSessionMessage: (record, localId) => session.sendClaudeSessionMessage(record, localId),
             recordAppPrompt,
             pushPrompt: (text) => {
@@ -1128,6 +1143,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         jsRuntime: options.jsRuntime,
         exitAfterFirstTurn,
         getSaycodeSystemPromptEnabled: () => currentSaycodeSystemPromptEnabled,
+        getSaycodePromptBlocks: () => currentSaycodePromptBlocks,
     });
 
     // Cleanup session resources (intervals, callbacks) - prevents memory leak

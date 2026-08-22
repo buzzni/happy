@@ -52,7 +52,7 @@ export function buildCodexTurnPrompt(opts: {
     }
     parts.push(opts.message);
 
-    if (opts.includeTitleInstruction && opts.mode.saycodeSystemPromptEnabled !== false) {
+    if (opts.includeTitleInstruction) {
         parts.push(CHANGE_TITLE_INSTRUCTION);
     }
 

@@ -1137,7 +1137,6 @@ export async function runGemini(opts: {
           userText: message.message,
           appendSystemPrompt: message.mode.appendSystemPrompt,
           previousConversationContext,
-          saycodeSystemPromptEnabled: message.mode.saycodeSystemPromptEnabled,
           isNewSession: startedNewBackendSession,
         });
         if (previousConversationContext) {

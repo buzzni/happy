@@ -454,7 +454,10 @@ describe('runClaude remote JSONL scanner', () => {
             appendSystemPrompt: 'USER PROJECT CONTEXT',
             saycodeSystemPromptEnabled: false,
         });
-        expect(harness.loopOptions.messageQueue.queue[0].message).toBe('복구 후 이어서 작업해줘');
+        // The recovered turn keeps the chat title nudge: titling is product
+        // plumbing, not a Saycode-owned instruction, so it survives OFF.
+        expect(harness.loopOptions.messageQueue.queue[0].message).toContain('복구 후 이어서 작업해줘');
+        expect(harness.loopOptions.messageQueue.queue[0].message).toContain(TITLE_INSTRUCTION);
         expect(process.env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT).toBeUndefined();
         expect(process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED).toBeUndefined();
 
@@ -1104,7 +1107,7 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
-    it('does not append the change_title instruction when Saycode prompts are disabled', async () => {
+    it('still appends the change_title instruction when Saycode prompts are disabled', async () => {
         const harness = await startRemoteRunClaudeHarness();
         harness.sessionClient.hasTitle.mockReturnValue(false);
         await vi.waitFor(() => {
@@ -1119,7 +1122,8 @@ describe('runClaude remote JSONL scanner', () => {
 
         const queued = harness.loopOptions.messageQueue.queue;
         expect(queued).toHaveLength(1);
-        expect(queued[0].message).toBe('use my own harness');
+        expect(queued[0].message).toContain('use my own harness');
+        expect(queued[0].message).toContain(TITLE_INSTRUCTION);
         expect(queued[0].mode.saycodeSystemPromptEnabled).toBe(false);
         await harness.finish();
     });
@@ -1184,6 +1188,78 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it('passes per-block Saycode prompt overrides through to the queued mode', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'only turn off worker delegation' },
+            meta: {
+                saycodeSystemPromptEnabled: true,
+                saycodePromptBlocks: { workerDelegation: false },
+            },
+        });
+
+        expect(harness.loopOptions.messageQueue.queue[0].mode.saycodePromptBlocks).toEqual({
+            workerDelegation: false,
+        });
+        await harness.finish();
+    });
+
+    it('keeps the latest per-block overrides when abort resets turn-scoped options', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'first turn' },
+            meta: { saycodePromptBlocks: { axBase: false } },
+        });
+        harness.loopOptions.onAbort();
+        await userMessageHandler({
+            content: { text: 'second turn' },
+            meta: {},
+        });
+
+        expect(harness.loopOptions.messageQueue.queue[1].mode.saycodePromptBlocks).toEqual({
+            axBase: false,
+        });
+        await harness.finish();
+    });
+
+    it('does not batch turns that differ only in per-block Saycode overrides', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'first turn' },
+            meta: { saycodePromptBlocks: { workerDelegation: false } },
+        });
+        await userMessageHandler({
+            content: { text: 'second turn' },
+            meta: { saycodePromptBlocks: { workerDelegation: true } },
+        });
+
+        // collectBatch() merges adjacent queue entries sharing a modeHash and applies the
+        // FIRST entry's mode to the whole batch — so a hash that ignores the overrides
+        // would silently run 'second turn' under the previous turn's block policy.
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(2);
+        expect(queued[0].modeHash).not.toBe(queued[1].modeHash);
+        await harness.finish();
+    });
+
     it('passes the resolved Saycode policy to AX orchestration', async () => {
         const orchestration = vi.spyOn(axIntegration, 'applyAxOrchestration').mockResolvedValue(null);
         const harness = await startRemoteRunClaudeHarness();
@@ -1201,6 +1277,41 @@ describe('runClaude remote JSONL scanner', () => {
         expect(orchestration).toHaveBeenCalledWith(expect.objectContaining({
             saycodeSystemPromptEnabled: false,
         }));
+        orchestration.mockRestore();
+        await harness.finish();
+    });
+
+    it('removes a stale AX Saycode base when only the axBase block is turned off', async () => {
+        // applyAxOrchestration's own merge strips the stale base, but it returns null on a
+        // non-AX / unavailable workspace — then this path is the only cleanup. Gating it on
+        // the master boolean alone leaves the base injected forever for a user who turned
+        // just this block off.
+        const orchestration = vi.spyOn(axIntegration, 'applyAxOrchestration').mockResolvedValue(null);
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'continue without the AX base' },
+            meta: {
+                saycodeSystemPromptEnabled: true,
+                saycodePromptBlocks: { axBase: false },
+                appendSystemPrompt: [
+                    '<!-- ax:base-prompt -->',
+                    'You are the Saycode AI assistant.',
+                    '<!-- ax:base-prompt -->',
+                    '',
+                    'CUSTOM USER PROMPT',
+                ].join('\n'),
+            },
+        });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(1);
+        expect(queued[0].mode.appendSystemPrompt).toBe('CUSTOM USER PROMPT');
         orchestration.mockRestore();
         await harness.finish();
     });
