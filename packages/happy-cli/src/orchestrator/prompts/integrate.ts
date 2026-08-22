@@ -7,9 +7,10 @@
  *
  * Otherwise it returns:
  *   - `userText`            — the original visible user message
- *   - `appendSystemPrompt`  — base.md plus L2 (step guide) and L3 (dynamic
- *                              context), merged with any user-supplied value
- *                              without accumulating stale AX blocks
+ *   - `appendSystemPrompt`  — optional Saycode base.md plus L2 (step guide)
+ *                              and L3 (dynamic context), merged with any
+ *                              user-supplied value without accumulating stale
+ *                              AX blocks
  *
  * Corrupt/missing `state.json` degrades silently to `null` so the regular
  * Claude flow still works on workspaces that opt out of the AX workflow.
@@ -27,12 +28,17 @@ export interface ApplyAxOrchestrationInput {
     userText: string;
     currentAppendSystemPrompt?: string;
     explicitStep?: AxStep;
+    saycodeSystemPromptEnabled?: boolean;
 }
 
 export interface ApplyAxOrchestrationResult {
     userText: string;
     appendSystemPrompt: string;
     step: AxStep;
+}
+
+export function removeAxSaycodeBasePrompt(value: string | undefined): string | undefined {
+    return stripSentinelBlock(value, BASE_SENTINEL) || undefined;
 }
 
 export async function applyAxOrchestration(
@@ -56,7 +62,7 @@ export async function applyAxOrchestration(
     const [guide, context, base] = await Promise.all([
         composeStepGuide(state.step),
         composeDynamicContext(input.workspaceRoot, state),
-        loadBasePrompt(),
+        input.saycodeSystemPromptEnabled === false ? undefined : loadBasePrompt(),
     ]);
 
     const userText = input.userText;
@@ -65,20 +71,19 @@ export async function applyAxOrchestration(
     return { userText, appendSystemPrompt, step: state.step };
 }
 
-function mergeAxPrompt(current: string | undefined, base: string, guide: string, context: string): string {
-    const sentinelBlock = `${BASE_SENTINEL}\n${base.trimEnd()}\n${BASE_SENTINEL}`;
+function mergeAxPrompt(current: string | undefined, base: string | undefined, guide: string, context: string): string {
+    const baseBlock = base
+        ? `${BASE_SENTINEL}\n${base.trimEnd()}\n${BASE_SENTINEL}`
+        : undefined;
     const turnContextBlock = `${TURN_CONTEXT_SENTINEL}\n${guide.trimEnd()}\n\n${context.trimEnd()}\n${TURN_CONTEXT_SENTINEL}`;
     const withoutTurnContext = stripSentinelBlock(current, TURN_CONTEXT_SENTINEL);
+    const withoutAxBlocks = removeAxSaycodeBasePrompt(withoutTurnContext);
 
-    if (!withoutTurnContext || withoutTurnContext.length === 0) {
-        return `${sentinelBlock}\n\n${turnContextBlock}`;
+    if (!withoutAxBlocks || withoutAxBlocks.length === 0) {
+        return baseBlock ? `${baseBlock}\n\n${turnContextBlock}` : turnContextBlock;
     }
 
-    if (withoutTurnContext.includes(BASE_SENTINEL)) {
-        return `${withoutTurnContext.trimEnd()}\n\n${turnContextBlock}`;
-    }
-
-    return `${sentinelBlock}\n\n${turnContextBlock}\n\n${withoutTurnContext}`;
+    return [baseBlock, turnContextBlock, withoutAxBlocks].filter(Boolean).join('\n\n');
 }
 
 function stripSentinelBlock(value: string | undefined, sentinel: string): string | undefined {

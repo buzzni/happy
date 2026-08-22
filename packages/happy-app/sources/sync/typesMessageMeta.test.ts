@@ -11,4 +11,9 @@ describe('MessageMetaSchema', () => {
         expect(parsed.permissionMode).toBe('team-custom-mode');
         expect(parsed.model).toBe('custom-model');
     });
+
+    it('preserves an explicit Saycode system prompt policy', () => {
+        expect(MessageMetaSchema.parse({ saycodeSystemPromptEnabled: false }))
+            .toEqual({ saycodeSystemPromptEnabled: false });
+    });
 });

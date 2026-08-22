@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TITLE_INSTRUCTION } from '@/utils/titlePrompt';
+import * as axIntegration from '@/orchestrator/prompts/integrate';
 
 const {
     mockApiClientCreate,
@@ -261,6 +262,7 @@ describe('runClaude remote JSONL scanner', () => {
         delete process.env.HAPPY_CREATED_BY_ACCOUNT_ID;
         delete process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
         delete process.env.HAPPY_INITIAL_PROMPT;
+        delete process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED;
         delete process.env.HAPPY_AUTOMATION_RUN_ONCE;
         delete process.env.HAPPY_AUTOMATION_RESUME_PROMPT;
         delete process.env.HAPPY_PROJECT_SANDBOX_CONFIG;
@@ -427,6 +429,34 @@ describe('runClaude remote JSONL scanner', () => {
 
         expect(harness.loopOptions.exitAfterFirstTurn).toBe(true);
         expect(process.env.HAPPY_AUTOMATION_RUN_ONCE).toBeUndefined();
+
+        await harness.finish();
+    });
+
+    it('applies the recovered Saycode prompt policy to the atomically delivered first turn', async () => {
+        process.env.HAPPY_INITIAL_PROMPT = '복구 후 이어서 작업해줘';
+        process.env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT = [
+            'USER PROJECT CONTEXT',
+            '',
+            '<!-- saycode:owned-prompt -->',
+            'SAYCODE RECOVERY PROMPT',
+            '<!-- saycode:owned-prompt -->',
+            '',
+            '<!-- ax:base-prompt -->',
+            'SAYCODE AX BASE',
+            '<!-- ax:base-prompt -->',
+        ].join('\n');
+        process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED = 'false';
+
+        const harness = await startRemoteRunClaudeHarness();
+
+        expect(harness.loopOptions.messageQueue.queue[0].mode).toMatchObject({
+            appendSystemPrompt: 'USER PROJECT CONTEXT',
+            saycodeSystemPromptEnabled: false,
+        });
+        expect(harness.loopOptions.messageQueue.queue[0].message).toBe('복구 후 이어서 작업해줘');
+        expect(process.env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT).toBeUndefined();
+        expect(process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED).toBeUndefined();
 
         await harness.finish();
     });
@@ -1071,6 +1101,154 @@ describe('runClaude remote JSONL scanner', () => {
         expect(queued).toHaveLength(1);
         expect(queued[0].message).toBe('fix the parser');
         expect(queued[0].message).not.toContain(TITLE_INSTRUCTION);
+        await harness.finish();
+    });
+
+    it('does not append the change_title instruction when Saycode prompts are disabled', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(false);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'use my own harness' },
+            meta: { saycodeSystemPromptEnabled: false },
+        });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(1);
+        expect(queued[0].message).toBe('use my own harness');
+        expect(queued[0].mode.saycodeSystemPromptEnabled).toBe(false);
+        await harness.finish();
+    });
+
+    it('exposes the latest Saycode prompt policy to local mode transitions', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'switch to my local harness' },
+            meta: { saycodeSystemPromptEnabled: false },
+        });
+
+        expect(harness.loopOptions.getSaycodeSystemPromptEnabled()).toBe(false);
+        await harness.finish();
+    });
+
+    it('keeps the latest Saycode prompt policy when abort resets turn-scoped options', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'disable the product prompt' },
+            meta: { saycodeSystemPromptEnabled: false },
+        });
+        harness.loopOptions.onAbort();
+
+        expect(harness.loopOptions.getSaycodeSystemPromptEnabled()).toBe(false);
+        await harness.finish();
+    });
+
+    it('keeps the latest append prompt when abort resets turn-scoped options', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'first turn' },
+            meta: {
+                appendSystemPrompt: 'USER PROJECT CONTEXT',
+                saycodeSystemPromptEnabled: false,
+            },
+        });
+        harness.loopOptions.onAbort();
+        await userMessageHandler({
+            content: { text: 'second turn' },
+            meta: { saycodeSystemPromptEnabled: false },
+        });
+
+        expect(harness.loopOptions.messageQueue.queue[1].mode.appendSystemPrompt).toBe(
+            'USER PROJECT CONTEXT',
+        );
+        await harness.finish();
+    });
+
+    it('passes the resolved Saycode policy to AX orchestration', async () => {
+        const orchestration = vi.spyOn(axIntegration, 'applyAxOrchestration').mockResolvedValue(null);
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'keep selected AX context only' },
+            meta: { saycodeSystemPromptEnabled: false },
+        });
+
+        expect(orchestration).toHaveBeenCalledWith(expect.objectContaining({
+            saycodeSystemPromptEnabled: false,
+        }));
+        orchestration.mockRestore();
+        await harness.finish();
+    });
+
+    it('removes a stale AX Saycode base when AX state is no longer available', async () => {
+        const orchestration = vi.spyOn(axIntegration, 'applyAxOrchestration').mockResolvedValue(null);
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'continue without product instructions' },
+            meta: {
+                saycodeSystemPromptEnabled: false,
+                appendSystemPrompt: [
+                    '<!-- ax:base-prompt -->',
+                    'You are the Saycode AI assistant.',
+                    '<!-- ax:base-prompt -->',
+                    '',
+                    'CUSTOM USER PROMPT',
+                ].join('\n'),
+            },
+        });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(1);
+        expect(queued[0].mode.appendSystemPrompt).toBe('CUSTOM USER PROMPT');
+        orchestration.mockRestore();
+        await harness.finish();
+    });
+
+    it('separates queued turns when the Saycode prompt policy changes', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({ content: { text: 'first' }, meta: { saycodeSystemPromptEnabled: true } });
+        await userMessageHandler({ content: { text: 'second' }, meta: { saycodeSystemPromptEnabled: false } });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(2);
+        expect(queued.map((item: any) => item.mode.saycodeSystemPromptEnabled)).toEqual([true, false]);
         await harness.finish();
     });
 });

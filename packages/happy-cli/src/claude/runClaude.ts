@@ -30,7 +30,7 @@ import {
 } from '@/claude/claudeGoalStatus';
 import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudeDisallowedTools, resolveInitialClaudePermissionMode, resolveRemoteClaudeDisallowedTools, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
-import { applyAxOrchestration } from '@/orchestrator/prompts/integrate';
+import { applyAxOrchestration, removeAxSaycodeBasePrompt } from '@/orchestrator/prompts/integrate';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
 import { appendTitleInstruction } from '@/utils/titlePrompt';
 import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
@@ -52,8 +52,12 @@ import { deliverPreparedClaudeSessionStart, prepareClaudeInitialPrompt } from '.
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
-import { consumePendingInitialEffort, consumePendingInitialModel, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
+import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodeSystemPromptEnabled, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import { createEnvelope } from '@slopus/happy-wire';
+import {
+    resolveInitialSaycodeAppendSystemPrompt,
+    resolveSaycodeAppendSystemPromptForMessage,
+} from '@/prompt/promptProvenance';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -517,6 +521,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         fallbackModel: mode.fallbackModel,
         customSystemPrompt: mode.customSystemPrompt,
         appendSystemPrompt: mode.appendSystemPrompt,
+        saycodeSystemPromptEnabled: mode.saycodeSystemPromptEnabled,
         allowedTools: mode.allowedTools,
         disallowedTools: mode.disallowedTools,
         effort: mode.effort,
@@ -537,24 +542,35 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     const initialEffortSeed = rawInitialEffortSeed && VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)
         ? rawInitialEffortSeed as 'low' | 'medium' | 'high' | 'xhigh' | 'max'
         : DEFAULT_CLAUDE_EFFORT;
+    const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
+        process.env,
+    );
+    const resolvedInitialAppendSystemPrompt = resolveInitialSaycodeAppendSystemPrompt({
+        appendSystemPrompt: consumePendingInitialAppendSystemPrompt(process.env),
+        saycodeSystemPromptEnabled: initialSaycodeSystemPromptEnabled,
+    });
+    const initialAppendSystemPrompt = initialSaycodeSystemPromptEnabled === false
+        ? removeAxSaycodeBasePrompt(resolvedInitialAppendSystemPrompt)
+        : resolvedInitialAppendSystemPrompt;
     let currentModel: string | undefined = initialModelSeed; // Track current model state
     let currentFallbackModel: string | undefined = undefined; // Track current fallback model
     let currentCustomSystemPrompt: string | undefined = undefined; // Track current custom system prompt
-    let currentAppendSystemPrompt: string | undefined = undefined; // Track current append system prompt
+    let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt; // Track current append system prompt
+    let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
     let currentAllowedTools: string[] | undefined = undefined; // Track current allowed tools
     let currentDisallowedTools: string[] | undefined = initialDisallowedTools; // Track current disallowed tools
     let currentEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined = initialEffortSeed; // Track current Claude effort (thinking depth)
 
-    const resetCurrentModeDefaults = () => {
+    const resetTurnScopedOptions = () => {
         currentPermissionMode = initialPermissionMode;
         currentModel = initialModelSeed;
         currentFallbackModel = undefined;
         currentCustomSystemPrompt = undefined;
-        currentAppendSystemPrompt = undefined;
+        // Cached append prompt and account preference survive turn-scoped abort resets.
         currentAllowedTools = undefined;
         currentDisallowedTools = initialDisallowedTools;
         currentEffort = initialEffortSeed;
-        logger.debug('[loop] Reset current mode defaults after abort');
+        logger.debug('[loop] Reset turn-scoped options after abort');
     };
     const currentEnhancedMode = (): EnhancedMode => ({
         permissionMode: currentPermissionMode || 'default',
@@ -562,6 +578,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         fallbackModel: currentFallbackModel,
         customSystemPrompt: currentCustomSystemPrompt,
         appendSystemPrompt: currentAppendSystemPrompt,
+        saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
         allowedTools: currentAllowedTools,
         disallowedTools: currentDisallowedTools,
         effort: currentEffort,
@@ -722,13 +739,27 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
         // Resolve append system prompt - use message.meta.appendSystemPrompt if provided, otherwise use current
         let messageAppendSystemPrompt = currentAppendSystemPrompt;
-        if (message.meta?.hasOwnProperty('appendSystemPrompt')) {
-            messageAppendSystemPrompt = message.meta.appendSystemPrompt || undefined; // null becomes undefined
-            currentAppendSystemPrompt = messageAppendSystemPrompt;
-            logger.debug(`[loop] Append system prompt updated from user message: ${messageAppendSystemPrompt ? 'set' : 'reset to none'}`);
+        const hasAppendSystemPrompt = message.meta?.hasOwnProperty('appendSystemPrompt') ?? false;
+        if (hasAppendSystemPrompt) {
+            logger.debug(`[loop] Append system prompt updated from user message: ${message.meta?.appendSystemPrompt ? 'set' : 'reset to none'}`);
         } else {
             logger.debug(`[loop] User message received with no append system prompt override, using current: ${currentAppendSystemPrompt ? 'set' : 'none'}`);
         }
+
+        if (message.meta?.hasOwnProperty('saycodeSystemPromptEnabled')) {
+            currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
+            logger.debug(`[loop] Saycode system prompt ${currentSaycodeSystemPromptEnabled ? 'enabled' : 'disabled'} by user message`);
+        }
+        messageAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
+            current: currentAppendSystemPrompt,
+            incoming: message.meta?.appendSystemPrompt,
+            hasIncoming: hasAppendSystemPrompt,
+            saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+        });
+        if (currentSaycodeSystemPromptEnabled === false) {
+            messageAppendSystemPrompt = removeAxSaycodeBasePrompt(messageAppendSystemPrompt);
+        }
+        currentAppendSystemPrompt = messageAppendSystemPrompt;
 
         // Resolve allowed tools - use message.meta.allowedTools if provided, otherwise use current
         let messageAllowedTools = currentAllowedTools;
@@ -833,6 +864,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 userText: pushText,
                 currentAppendSystemPrompt: messageAppendSystemPrompt,
                 explicitStep: explicitAxStep,
+                saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
             });
             if (ax) {
                 pushText = ax.userText;
@@ -859,7 +891,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         // Only the model's copy changes; the app renders its own user bubble.
         // recordAppPrompt() de-dupes the modified turn so the remote-mode JSONL
         // scanner doesn't forward it back to the app as a second message.
-        if (!session.hasTitle()) {
+        if (currentSaycodeSystemPromptEnabled !== false && !session.hasTitle()) {
             const withTitle = appendTitleInstruction(pushText);
             if (withTitle !== pushText) {
                 pushText = withTitle;
@@ -885,6 +917,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         sink: {
             sessionId: session.sessionId,
             hasTitle: () => session.hasTitle(),
+            saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
             sendClaudeSessionMessage: (record, localId) => session.sendClaudeSessionMessage(record, localId),
             recordAppPrompt,
             pushPrompt: (text) => {
@@ -1072,7 +1105,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             // Store reference for hook server callback
             currentSession = sessionInstance;
         },
-        onAbort: resetCurrentModeDefaults,
+        onAbort: resetTurnScopedOptions,
         onActiveUserInputAccepted: (text) => {
             recordAppPrompt(text);
             session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }));
@@ -1094,6 +1127,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         hookSettingsPath,
         jsRuntime: options.jsRuntime,
         exitAfterFirstTurn,
+        getSaycodeSystemPromptEnabled: () => currentSaycodeSystemPromptEnabled,
     });
 
     // Cleanup session resources (intervals, callbacks) - prevents memory leak

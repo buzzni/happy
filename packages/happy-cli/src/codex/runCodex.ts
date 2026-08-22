@@ -53,8 +53,13 @@ import { enqueueCodexUserText, isCodexClearText } from './codexClearCommand';
 import { downloadCodexFileEventAttachment } from './utils/attachmentEvents';
 import { prepareCodexImageInputItems } from './utils/imageInput';
 import { createSerialAsyncHandler } from './utils/serialAsyncHandler';
+import {
+    resolveInitialSaycodeAppendSystemPrompt,
+    resolveSaycodeAppendSystemPromptForMessage,
+} from '@/prompt/promptProvenance';
 import { buildCodexThreadBackfillEnvelopes } from './utils/threadImageBackfill';
 import {
+    buildCodexDeveloperInstructions,
     buildCodexTurnPrompt,
     hashCodexEnhancedMode,
     type CodexEnhancedMode,
@@ -76,8 +81,10 @@ import {
 } from './initialPrompt';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import {
+    consumePendingInitialAppendSystemPrompt,
     consumePendingInitialEffort,
     consumePendingInitialModel,
+    consumePendingInitialSaycodeSystemPromptEnabled,
     resolveInitialPromptPermissionMode,
 } from '@/utils/initialPrompt';
 import { registerCodexSteerHandler } from './codexSteerHandler';
@@ -279,16 +286,24 @@ export async function runCodex(opts: {
     const initialEffortSeed = rawInitialEffortSeed && (VALID_REMOTE_EFFORTS as readonly string[]).includes(rawInitialEffortSeed)
         ? rawInitialEffortSeed as ReasoningEffort
         : DEFAULT_CODEX_EFFORT;
+    const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
+        process.env,
+    );
+    const initialAppendSystemPrompt = resolveInitialSaycodeAppendSystemPrompt({
+        appendSystemPrompt: consumePendingInitialAppendSystemPrompt(process.env),
+        saycodeSystemPromptEnabled: initialSaycodeSystemPromptEnabled,
+    });
     let currentModel: string | undefined = initialModelSeed;
     let currentEffort: ReasoningEffort | undefined = initialEffortSeed;
-    let currentAppendSystemPrompt: string | undefined = undefined;
+    let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt;
+    let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
 
-    const resetCurrentModeDefaults = () => {
+    const resetTurnScopedOptions = () => {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
         currentModel = initialModelSeed;
         currentEffort = initialEffortSeed;
-        currentAppendSystemPrompt = undefined;
-        logger.debug('[Codex] Reset current mode defaults after abort');
+        // Cached append prompt and account preference survive turn-scoped abort resets.
+        logger.debug('[Codex] Reset turn-scoped options after abort');
     };
 
     // Valid Codex permission modes from remote messages. Matches the modes
@@ -357,18 +372,31 @@ export async function runCodex(opts: {
         }
 
         let messageAppendSystemPrompt = currentAppendSystemPrompt;
-        if (message.meta?.hasOwnProperty('appendSystemPrompt')) {
-            messageAppendSystemPrompt = message.meta.appendSystemPrompt || undefined;
-            currentAppendSystemPrompt = messageAppendSystemPrompt;
-            logger.debug(`[Codex] Append system prompt updated from user message: ${messageAppendSystemPrompt ? 'set' : 'reset to none'}`);
+        const hasAppendSystemPrompt = message.meta?.hasOwnProperty('appendSystemPrompt') ?? false;
+        if (hasAppendSystemPrompt) {
+            logger.debug(`[Codex] Append system prompt updated from user message: ${message.meta?.appendSystemPrompt ? 'set' : 'reset to none'}`);
         } else {
             logger.debug(`[Codex] User message received with no append system prompt override, using current: ${currentAppendSystemPrompt ? 'set' : 'none'}`);
         }
+
+        if (message.meta?.hasOwnProperty('saycodeSystemPromptEnabled')) {
+            currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
+            logger.debug(`[Codex] Saycode system prompt ${currentSaycodeSystemPromptEnabled ? 'enabled' : 'disabled'} by user message`);
+        }
+
+        messageAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
+            current: currentAppendSystemPrompt,
+            incoming: message.meta?.appendSystemPrompt,
+            hasIncoming: hasAppendSystemPrompt,
+            saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+        });
+        currentAppendSystemPrompt = messageAppendSystemPrompt;
 
         const enhancedMode: EnhancedMode = {
             permissionMode: messagePermissionMode || 'default',
             model: messageModel,
             appendSystemPrompt: messageAppendSystemPrompt,
+            saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
             effort: messageEffort,
         };
         const enqueueResult = enqueueCodexUserText({
@@ -397,6 +425,7 @@ export async function runCodex(opts: {
                 ),
                 model: currentModel,
                 appendSystemPrompt: currentAppendSystemPrompt,
+                saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
                 effort: currentEffort,
             });
             logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
@@ -528,7 +557,7 @@ export async function runCodex(opts: {
             } catch (error) {
                 logger.debug('[Codex] Error during abort:', error);
             } finally {
-                resetCurrentModeDefaults();
+                resetTurnScopedOptions();
                 // Wake up message queue wait if idle
                 abortController.abort();
                 abortController = new AbortController();
@@ -930,7 +959,7 @@ export async function runCodex(opts: {
         expectedMcpServices: [],
         configuredServerNames: Object.keys(mcpServers),
     });
-    let currentDeveloperInstructions = buildConnectorToolGuidance(listExternalServices({
+    let currentDeveloperInstructions: string | undefined = buildConnectorToolGuidance(listExternalServices({
         ...baseMcpServers,
         ...initialAplusMcpServers,
     }));
@@ -1077,13 +1106,14 @@ export async function runCodex(opts: {
                     threadId: client.threadId,
                     resumeThread: client.threadId
                         ? async ({ threadId, mcpServers }) => {
-                            const nextDeveloperInstructions = buildConnectorToolGuidance(
-                                listExternalServices(mcpServers),
-                            );
+                            const nextDeveloperInstructions = buildCodexDeveloperInstructions({
+                                connectorGuidance: buildConnectorToolGuidance(listExternalServices(mcpServers)),
+                                mode: message.mode,
+                            });
                             const resumed = await client.resumeThread({
                                 threadId,
                                 mcpServers,
-                                developerInstructions: nextDeveloperInstructions,
+                                developerInstructions: nextDeveloperInstructions ?? null,
                             });
                             currentDeveloperInstructions = nextDeveloperInstructions;
                             return resumed;
@@ -1091,14 +1121,15 @@ export async function runCodex(opts: {
                         : undefined,
                 });
 
-                const nextDeveloperInstructions = buildConnectorToolGuidance(
-                    listExternalServices(mcpSync.mcpServers),
-                );
+                const nextDeveloperInstructions = buildCodexDeveloperInstructions({
+                    connectorGuidance: buildConnectorToolGuidance(listExternalServices(mcpSync.mcpServers)),
+                    mode: message.mode,
+                });
                 if (client.threadId && nextDeveloperInstructions !== currentDeveloperInstructions) {
                     await client.resumeThread({
                         threadId: client.threadId,
                         mcpServers: mcpSync.mcpServers,
-                        developerInstructions: nextDeveloperInstructions,
+                        developerInstructions: nextDeveloperInstructions ?? null,
                     });
                     currentDeveloperInstructions = nextDeveloperInstructions;
                 }
@@ -1167,7 +1198,9 @@ export async function runCodex(opts: {
                 }
 
                 const includeAppendSystemPrompt = Boolean(
-                    message.mode.appendSystemPrompt && !appendSystemPromptInjected,
+                    message.mode.saycodeSystemPromptEnabled === undefined
+                    && message.mode.appendSystemPrompt
+                    && !appendSystemPromptInjected,
                 );
                 const imageInputs = await prepareCodexImageInputItems(message.attachments, {
                     sessionId: session.sessionId,

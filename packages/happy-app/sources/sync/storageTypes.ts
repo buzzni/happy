@@ -26,6 +26,9 @@ export const MetadataSchema = z.object({
     path: z.string(),
     host: z.string(),
     version: z.string().optional(),
+    runtimeCapabilities: z.object({
+        saycodeSystemPromptPreference: z.boolean().optional(),
+    }).optional(),
     name: z.string().optional(),
     os: z.string().optional(),
     summary: z.object({

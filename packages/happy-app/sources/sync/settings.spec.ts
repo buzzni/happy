@@ -1,5 +1,14 @@
 import { describe, it, expect } from 'vitest';
-import { settingsParse, applySettings, settingsDefaults, settingsToSyncPayload, type Settings } from './settings';
+import {
+    settingsParse,
+    applySettings,
+    resolveSaycodeAppendSystemPrompt,
+    resolveSaycodeSystemPromptEnabled,
+    settingsDefaults,
+    settingsToSyncPayload,
+    SUPPORTED_SCHEMA_VERSION,
+    type Settings,
+} from './settings';
 
 describe('settings', () => {
     describe('settingsParse', () => {
@@ -174,7 +183,7 @@ describe('settings', () => {
     describe('settingsDefaults', () => {
         it('should have correct default values', () => {
             expect(settingsDefaults).toEqual({
-                schemaVersion: 2,
+                schemaVersion: 3,
                 viewInline: false,
                 expandTodos: true,
                 showLineNumbers: true,
@@ -188,6 +197,7 @@ describe('settings', () => {
                 agentInputEnterToSend: true,
                 avatarStyle: 'brutalist',
                 showFlavorIcons: false,
+                saycodeSystemPromptEnabled: null,
                 hideInactiveSessions: false,
                 expResumeSession: false,
                 fileDiffsSidebar: false,
@@ -214,7 +224,55 @@ describe('settings', () => {
         });
     });
 
+    describe('resolveSaycodeSystemPromptEnabled', () => {
+        it('keeps an explicit account preference on every surface', () => {
+            expect(resolveSaycodeSystemPromptEnabled({ preference: true, surface: 'desktop' })).toBe(true);
+            expect(resolveSaycodeSystemPromptEnabled({ preference: false, surface: 'web' })).toBe(false);
+            expect(resolveSaycodeSystemPromptEnabled({ preference: false, surface: 'mobile' })).toBe(false);
+        });
+
+        it('defaults an undecided desktop account to disabled', () => {
+            expect(resolveSaycodeSystemPromptEnabled({ preference: null, surface: 'desktop' })).toBe(false);
+        });
+
+        it('defaults an undecided web or mobile account to enabled', () => {
+            expect(resolveSaycodeSystemPromptEnabled({ preference: null, surface: 'web' })).toBe(true);
+            expect(resolveSaycodeSystemPromptEnabled({ preference: null, surface: 'mobile' })).toBe(true);
+        });
+
+        it('omits only the Happy App product prompt when the policy is disabled', () => {
+            expect(resolveSaycodeAppendSystemPrompt({
+                enabled: false,
+                prompt: 'SAYCODE OPTIONS PROMPT',
+            })).toBeUndefined();
+            expect(resolveSaycodeAppendSystemPrompt({
+                enabled: true,
+                prompt: 'SAYCODE OPTIONS PROMPT',
+            })).toContain('<!-- saycode:owned-prompt -->\nSAYCODE OPTIONS PROMPT\n<!-- saycode:owned-prompt -->');
+        });
+    });
+
     describe('settingsToSyncPayload', () => {
+        it('upgrades an older local schema when syncing current fields', () => {
+            expect(settingsToSyncPayload({
+                ...settingsDefaults,
+                schemaVersion: 2,
+                saycodeSystemPromptEnabled: false,
+            })).toMatchObject({
+                schemaVersion: SUPPORTED_SCHEMA_VERSION,
+                saycodeSystemPromptEnabled: false,
+            });
+        });
+
+        it('preserves a future schema version when syncing known fields', () => {
+            expect(settingsToSyncPayload({
+                ...settingsDefaults,
+                schemaVersion: SUPPORTED_SCHEMA_VERSION + 1,
+            })).toMatchObject({
+                schemaVersion: SUPPORTED_SCHEMA_VERSION + 1,
+            });
+        });
+
         it('omits empty agent default overrides', () => {
             expect(settingsToSyncPayload(settingsDefaults)).not.toHaveProperty('agentDefaultOverrides');
         });

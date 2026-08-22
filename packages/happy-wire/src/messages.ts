@@ -1,6 +1,10 @@
 import * as z from 'zod';
 import { sessionEnvelopeSchema } from './sessionProtocol';
-import { MessageMetaSchema, type MessageMeta } from './messageMeta';
+import {
+  MessageMetaSchema,
+  resolveSaycodeSystemPromptEnabled,
+  type MessageMeta,
+} from './messageMeta';
 import { AgentMessageSchema, UserMessageSchema } from './legacyProtocol';
 
 export const SessionMessageContentSchema = z.object({
@@ -18,7 +22,7 @@ export const SessionMessageSchema = z.object({
   updatedAt: z.number(),
 });
 export type SessionMessage = z.infer<typeof SessionMessageSchema>;
-export { MessageMetaSchema };
+export { MessageMetaSchema, resolveSaycodeSystemPromptEnabled };
 export type { MessageMeta };
 
 export const SessionProtocolMessageSchema = z.object({

@@ -161,6 +161,27 @@ describe('applyAxOrchestration', () => {
         expect(result!.appendSystemPrompt).toMatch(/CUSTOM USER PROMPT/);
     });
 
+    it('removes the AX Saycode base while preserving selected step context and user prompt when disabled', async () => {
+        await bootstrapWorkspace(workspace, 'plan');
+        const enabled = await applyAxOrchestration({
+            workspaceRoot: workspace,
+            userText: 'first',
+            currentAppendSystemPrompt: 'CUSTOM USER PROMPT',
+        });
+        const disabled = await applyAxOrchestration({
+            workspaceRoot: workspace,
+            userText: 'second',
+            currentAppendSystemPrompt: enabled!.appendSystemPrompt,
+            saycodeSystemPromptEnabled: false,
+        });
+
+        expect(disabled!.appendSystemPrompt).not.toMatch(/Saycode AI assistant/);
+        expect(disabled!.appendSystemPrompt).not.toContain('<!-- ax:base-prompt -->');
+        expect(disabled!.appendSystemPrompt).toMatch(/Step: plan/);
+        expect(disabled!.appendSystemPrompt).toMatch(/<ax-dynamic-context>/);
+        expect(disabled!.appendSystemPrompt).toMatch(/CUSTOM USER PROMPT/);
+    });
+
     it('is idempotent — re-applying does not duplicate the base prompt', async () => {
         await bootstrapWorkspace(workspace, 'plan');
         const first = await applyAxOrchestration({

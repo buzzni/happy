@@ -21,7 +21,6 @@ import { initialMachineMetadata } from '@/daemon/run';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
-import { hashObject } from '@/utils/deterministicJson';
 import { projectPath } from '@/projectPath';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { fetchAplusMcpServers } from '@/aplus/fetchAplusMcpServers';
@@ -42,7 +41,13 @@ import { GeminiReasoningProcessor } from '@/gemini/utils/reasoningProcessor';
 import { GeminiDiffProcessor } from '@/gemini/utils/diffProcessor';
 import type { GeminiMode, CodexMessagePayload } from '@/gemini/types';
 import type { PermissionMode } from '@/api/types';
-import { GEMINI_MODEL_ENV, DEFAULT_GEMINI_MODEL, CHANGE_TITLE_INSTRUCTION } from '@/gemini/constants';
+import { GEMINI_MODEL_ENV, DEFAULT_GEMINI_MODEL } from '@/gemini/constants';
+import { buildGeminiTurnPrompt, hashGeminiMode } from '@/gemini/geminiPrompt';
+import {
+  prepareGeminiInitialPrompt,
+  prepareGeminiSessionStart,
+} from '@/gemini/geminiInitialPrompt';
+import { resolveSaycodeAppendSystemPromptForMessage } from '@/prompt/promptProvenance';
 import {
   readGeminiLocalConfig,
   saveGeminiModelToConfig,
@@ -73,6 +78,7 @@ export async function runGemini(opts: {
 
 
   const sessionTag = randomUUID();
+  const preparedInitialPrompt = prepareGeminiInitialPrompt(process.env);
 
   // Set backend for offline warnings (before any API calls)
   connectionState.setBackend('Gemini');
@@ -202,31 +208,7 @@ export async function runGemini(opts: {
   });
   session = initialSession;
 
-  // Report to daemon (only if we have a real session)
-  if (response) {
-    try {
-      logger.debug(`[START] Reporting session ${response.id} to daemon`);
-      const result = await notifyDaemonSessionStarted(response.id, metadata, {
-        encryptionKey: encodeBase64(response.encryptionKey),
-        encryptionVariant: response.encryptionVariant,
-        seq: response.seq,
-        metadataVersion: response.metadataVersion,
-        agentStateVersion: response.agentStateVersion,
-      });
-      if (result.error) {
-        logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
-      } else {
-        logger.debug(`[START] Reported session ${response.id} to daemon`);
-      }
-    } catch (error) {
-      logger.debug('[START] Failed to report to daemon (may not be running):', error);
-    }
-  }
-
-  const messageQueue = new MessageQueue2<GeminiMode>((mode) => hashObject({
-    permissionMode: mode.permissionMode,
-    model: mode.model,
-  }));
+  const messageQueue = new MessageQueue2<GeminiMode>(hashGeminiMode);
 
   // Conversation history for context preservation across model changes
   const conversationHistory = new ConversationHistory({ maxMessages: 20, maxCharacters: 50000 });
@@ -234,6 +216,9 @@ export async function runGemini(opts: {
   // Track current overrides to apply per message
   let currentPermissionMode: PermissionMode | undefined = undefined;
   let currentModel: string | undefined = undefined;
+  let currentAppendSystemPrompt = preparedInitialPrompt.appendSystemPrompt;
+  let currentSaycodeSystemPromptEnabled =
+    preparedInitialPrompt.saycodeSystemPromptEnabled;
 
   session.onUserMessage((message) => {
     // Resolve permission mode (validate) - same as Codex
@@ -286,29 +271,67 @@ export async function runGemini(opts: {
       // If message.meta.model is undefined, keep currentModel
     }
 
-    // Build the full prompt with appendSystemPrompt if provided
-    // Only include system prompt for the first message to avoid forcing tool usage on every message
     const originalUserMessage = message.content.text;
-    let fullPrompt = originalUserMessage;
-    if (isFirstMessage && message.meta?.appendSystemPrompt) {
-      // Prepend system prompt to user message only for first message
-      // Also add change_title instruction (like Codex does)
-      // Use EXACT same format as Codex: add instruction AFTER user message
-      // This matches Codex's approach exactly - instruction comes after user message
-      // Codex format: system prompt + user message + change_title instruction
-      fullPrompt = message.meta.appendSystemPrompt + '\n\n' + originalUserMessage + '\n\n' + CHANGE_TITLE_INSTRUCTION;
-      isFirstMessage = false;
+    const hasAppendSystemPrompt = message.meta?.hasOwnProperty('appendSystemPrompt') ?? false;
+    if (message.meta?.hasOwnProperty('saycodeSystemPromptEnabled')) {
+      currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
     }
+    currentAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
+      current: currentAppendSystemPrompt,
+      incoming: message.meta?.appendSystemPrompt,
+      hasIncoming: hasAppendSystemPrompt,
+      saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+    });
 
     const mode: GeminiMode = {
       permissionMode: messagePermissionMode || 'default',
       model: messageModel,
       originalUserMessage, // Store original message separately
+      appendSystemPrompt: currentAppendSystemPrompt,
+      saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
     };
-    messageQueue.push(fullPrompt, mode);
-    
-    // Record user message in conversation history for context preservation
+    messageQueue.push(originalUserMessage, mode);
+
+    // Record each message before MessageQueue2 batches adjacent messages. A
+    // restarted backend excludes the unanswered trailing turns from context.
     conversationHistory.addUserMessage(originalUserMessage);
+  });
+
+  await prepareGeminiSessionStart({
+    prepared: preparedInitialPrompt,
+    sendSessionMessage: (envelope, localId) =>
+      session.sendSessionProtocolMessage(envelope, localId),
+    pushPrompt: (prompt) => {
+      messageQueue.unshiftIsolated(prompt, {
+        permissionMode: currentPermissionMode ?? 'default',
+        model: currentModel,
+        originalUserMessage: prompt,
+        appendSystemPrompt: currentAppendSystemPrompt,
+        saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+      });
+      conversationHistory.addUserMessage(prompt);
+    },
+    // The daemon may return recovery success as soon as this report arrives.
+    // Deliver the recovered turn first so success cannot race ahead of its prompt.
+    reportStarted: response ? async () => {
+      try {
+        logger.debug(`[START] Reporting session ${response.id} to daemon`);
+        const result = await notifyDaemonSessionStarted(response.id, metadata, {
+          encryptionKey: encodeBase64(response.encryptionKey),
+          encryptionVariant: response.encryptionVariant,
+          seq: response.seq,
+          metadataVersion: response.metadataVersion,
+          agentStateVersion: response.agentStateVersion,
+        });
+        if (result.error) {
+          logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
+        } else {
+          logger.debug(`[START] Reported session ${response.id} to daemon`);
+        }
+      } catch (error) {
+        logger.debug('[START] Failed to report to daemon (may not be running):', error);
+      }
+    } : undefined,
   });
 
   let thinking = false;
@@ -316,9 +339,6 @@ export async function runGemini(opts: {
   const keepAliveInterval = setInterval(() => {
     session.keepAlive(thinking, 'remote');
   }, 2000);
-
-  // Track if this is the first message to include system prompt only once
-  let isFirstMessage = true;
 
   const sendReady = () => {
     session.sendSessionEvent({ type: 'ready' });
@@ -963,18 +983,21 @@ export async function runGemini(opts: {
         break;
       }
 
-      // Track if we need to inject conversation history (after model change)
-      let injectHistoryContext = false;
+      let previousConversationContext: string | undefined;
+      let startedNewBackendSession = false;
       
-      // Handle mode change (like Codex) - restart session if permission mode or model changed
+      // Restart when any backend-affecting mode value changes.
       if (wasSessionCreated && currentModeHash && message.hash !== currentModeHash) {
         logger.debug('[Gemini] Mode changed – restarting Gemini session');
         messageBuffer.addMessage('═'.repeat(40), 'status');
         
         // Check if we have conversation history to preserve
-        if (conversationHistory.hasHistory()) {
-          messageBuffer.addMessage(`Switching model (preserving ${conversationHistory.size()} messages of context)...`, 'status');
-          injectHistoryContext = true;
+        const restartContext = conversationHistory.getContextForNewSession({
+          excludeTrailingUserMessages: true,
+        });
+        if (restartContext) {
+          messageBuffer.addMessage('Restarting Gemini (preserving completed conversation context)...', 'status');
+          previousConversationContext = restartContext;
           logger.debug(`[Gemini] Will inject conversation history: ${conversationHistory.getSummary()}`);
         } else {
           messageBuffer.addMessage('Starting new Gemini session (mode changed)...', 'status');
@@ -1009,7 +1032,7 @@ export async function runGemini(opts: {
 
         // Use model from factory result (single source of truth - no duplicate resolution)
         const actualModel = backendResult.model;
-        logger.debug(`[gemini] Model change - modelToUse=${modelToUse}, actualModel=${actualModel} (from ${backendResult.modelSource})`);
+        logger.debug(`[gemini] Restart - modelToUse=${modelToUse}, actualModel=${actualModel} (from ${backendResult.modelSource})`);
         
         // Update conversation history with new model
         conversationHistory.setCurrentModel(actualModel);
@@ -1017,6 +1040,7 @@ export async function runGemini(opts: {
         logger.debug('[gemini] Starting new ACP session with model:', actualModel);
         const { sessionId } = await geminiBackend.startSession();
         acpSessionId = sessionId;
+        startedNewBackendSession = true;
         logger.debug(`[gemini] New ACP session started: ${acpSessionId}`);
         
         // Update displayed model in UI (don't save to config - this is backend initialization)
@@ -1077,6 +1101,7 @@ export async function runGemini(opts: {
             updatePermissionMode(message.mode.permissionMode);
             const { sessionId } = await geminiBackend.startSession();
             acpSessionId = sessionId;
+            startedNewBackendSession = true;
             logger.debug(`[gemini] ACP session started: ${acpSessionId}`);
             wasSessionCreated = true;
             currentModeHash = message.hash;
@@ -1097,10 +1122,10 @@ export async function runGemini(opts: {
         isResponseInProgress = false;
         hadToolCallInTurn = false;
         taskStartedSent = false; // Reset so new turn can send task_started
-        
+
         // Track if this prompt contains change_title instruction
         // If so, don't send task_complete until change_title is completed
-        pendingChangeTitle = message.message.includes('change_title') || 
+        pendingChangeTitle = message.message.includes('change_title') ||
                              message.message.includes('happy__change_title');
         changeTitleCompleted = false;
         
@@ -1108,16 +1133,15 @@ export async function runGemini(opts: {
           throw new Error('Gemini backend or session not initialized');
         }
         
-        // The prompt already includes system prompt and change_title instruction (added in onUserMessage handler)
-        // This is done in the message queue, so message.message already contains everything
-        let promptToSend = message.message;
-        
-        // Inject conversation history context if model was just changed
-        if (injectHistoryContext && conversationHistory.hasHistory()) {
-          const historyContext = conversationHistory.getContextForNewSession();
-          promptToSend = historyContext + promptToSend;
-          logger.debug(`[gemini] Injected conversation history context (${historyContext.length} chars)`);
-          // Don't clear history - keep accumulating for future model changes
+        const promptToSend = buildGeminiTurnPrompt({
+          userText: message.message,
+          appendSystemPrompt: message.mode.appendSystemPrompt,
+          previousConversationContext,
+          saycodeSystemPromptEnabled: message.mode.saycodeSystemPromptEnabled,
+          isNewSession: startedNewBackendSession,
+        });
+        if (previousConversationContext) {
+          logger.debug(`[gemini] Injected conversation history context (${previousConversationContext.length} chars)`);
         }
         
         logger.debug(`[gemini] Sending prompt to Gemini (length: ${promptToSend.length})`);

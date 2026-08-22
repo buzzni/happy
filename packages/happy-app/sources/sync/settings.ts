@@ -1,4 +1,5 @@
 import * as z from 'zod';
+import { wrapSaycodeOwnedPrompt } from '@slopus/happy-wire';
 import { AgentDefaultOverridesSchema } from './agentDefaults';
 
 //
@@ -6,7 +7,29 @@ import { AgentDefaultOverridesSchema } from './agentDefaults';
 //
 
 // Current schema version for backward compatibility
-export const SUPPORTED_SCHEMA_VERSION = 2;
+export const SUPPORTED_SCHEMA_VERSION = 3;
+
+type SaycodeSystemPromptSurface = 'desktop' | 'web' | 'mobile';
+
+export function resolveSaycodeSystemPromptEnabled({
+    preference,
+    surface,
+}: {
+    preference: boolean | null;
+    surface: SaycodeSystemPromptSurface;
+}): boolean {
+    return preference ?? surface !== 'desktop';
+}
+
+export function resolveSaycodeAppendSystemPrompt({
+    enabled,
+    prompt,
+}: {
+    enabled: boolean;
+    prompt: string;
+}): string | undefined {
+    return enabled ? wrapSaycodeOwnedPrompt(prompt) : undefined;
+}
 
 export const SettingsSchema = z.object({
     // Schema version for compatibility detection
@@ -25,6 +48,7 @@ export const SettingsSchema = z.object({
     agentInputEnterToSend: z.boolean().describe('Whether pressing Enter submits/sends in the agent input (web)'),
     avatarStyle: z.string().describe('Avatar display style'),
     showFlavorIcons: z.boolean().describe('Whether to show AI provider icons in avatars'),
+    saycodeSystemPromptEnabled: z.boolean().nullable().describe('Whether Saycode-owned system prompt instructions are enabled (null means undecided)'),
 
     hideInactiveSessions: z.boolean().describe('Hide inactive sessions in the main list'),
     expResumeSession: z.boolean().describe('Enable experimental session resume feature'),
@@ -96,6 +120,7 @@ export const settingsDefaults: Settings = {
     agentInputEnterToSend: true,
     avatarStyle: 'brutalist',
     showFlavorIcons: false,
+    saycodeSystemPromptEnabled: null,
 
     hideInactiveSessions: false,
     expResumeSession: false,
@@ -171,7 +196,10 @@ export function applySettings(settings: Settings, delta: Partial<Settings>): Set
 }
 
 export function settingsToSyncPayload(settings: Settings): Partial<Settings> {
-    const result: Partial<Settings> = { ...settings };
+    const result: Partial<Settings> = {
+        ...settings,
+        schemaVersion: Math.max(settings.schemaVersion, SUPPORTED_SCHEMA_VERSION),
+    };
     const compactAgentOverrides = Object.fromEntries(
         Object.entries(settings.agentDefaultOverrides ?? {}).filter(([, value]) => (
             value && typeof value === 'object' && Object.keys(value).length > 0

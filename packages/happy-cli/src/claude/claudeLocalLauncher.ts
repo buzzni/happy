@@ -6,7 +6,10 @@ import { createSessionScanner } from "./utils/sessionScanner";
 
 export type LauncherResult = { type: 'switch' } | { type: 'exit', code: number };
 
-export async function claudeLocalLauncher(session: Session): Promise<LauncherResult> {
+export async function claudeLocalLauncher(
+    session: Session,
+    options: { saycodeSystemPromptEnabled?: boolean } = {},
+): Promise<LauncherResult> {
 
     let scannerMessageChain = Promise.resolve();
 
@@ -119,6 +122,7 @@ export async function claudeLocalLauncher(session: Session): Promise<LauncherRes
                     claudeArgs: session.claudeArgs,
                     mcpServers: session.mcpServers,
                     allowedTools: session.allowedTools,
+                    saycodeSystemPromptEnabled: options.saycodeSystemPromptEnabled,
                     hookSettingsPath: session.hookSettingsPath,
                     sandboxConfig: session.sandboxConfig,
                 });
