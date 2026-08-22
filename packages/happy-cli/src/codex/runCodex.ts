@@ -302,8 +302,7 @@ export async function runCodex(opts: {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
         currentModel = initialModelSeed;
         currentEffort = initialEffortSeed;
-        currentAppendSystemPrompt = initialAppendSystemPrompt;
-        // Account-scoped prompt preference survives turn-scoped abort resets.
+        // Session/account-scoped prompt state survives turn-scoped abort resets.
         logger.debug('[Codex] Reset current mode defaults after abort');
     };
 
