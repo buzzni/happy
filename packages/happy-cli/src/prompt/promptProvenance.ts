@@ -66,6 +66,20 @@ export type SaycodePromptBlockName = 'coAuthoredCredit' | 'workerDelegation' | '
 export type SaycodePromptBlockOverrides = Partial<Record<SaycodePromptBlockName, boolean>>;
 
 /**
+ * Ties each toggle to its entry in {@link PROMPT_BLOCK_PROVENANCE}. Without this link
+ * the two catalogs drift: a settings UI reads the provenance map to decide what is
+ * Saycode-owned, but the toggles live in a separate union, so a new owned block can
+ * silently ship with no user control (or a toggle can outlive its block). The
+ * `satisfies` clause catches a missing/misspelled id at compile time; the companion
+ * test catches an owned block that never got a toggle.
+ */
+export const SAYCODE_PROMPT_BLOCK_PROVENANCE_IDS = {
+  coAuthoredCredit: 'claude:co-authored-credit',
+  workerDelegation: 'claude:worker-delegation',
+  axBase: 'claude:ax-base',
+} as const satisfies Record<SaycodePromptBlockName, PromptBlockId>;
+
+/**
  * Resolves whether one Saycode-owned block should render, given an optional
  * per-block override and the legacy on/off value. A per-block override always
  * wins; with none, the block inherits the legacy value (so an account with no

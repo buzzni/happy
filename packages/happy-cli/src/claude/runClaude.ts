@@ -31,7 +31,7 @@ import {
 import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudeDisallowedTools, resolveInitialClaudePermissionMode, resolveRemoteClaudeDisallowedTools, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
 import { applyAxOrchestration, removeAxSaycodeBasePrompt } from '@/orchestrator/prompts/integrate';
-import type { SaycodePromptBlockOverrides } from '@/prompt/promptProvenance';
+import { isSaycodePromptBlockEnabled, type SaycodePromptBlockOverrides } from '@/prompt/promptProvenance';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
 import { appendTitleInstruction } from '@/utils/titlePrompt';
 import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
@@ -768,7 +768,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             hasIncoming: hasAppendSystemPrompt,
             saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
         });
-        if (currentSaycodeSystemPromptEnabled === false) {
+        // Cleanup for an already-injected AX base. applyAxOrchestration's own merge strips
+        // it, but returns null on a non-AX / unavailable workspace — then this is the only
+        // path that removes it, so it must honor the same per-block gate as the injection.
+        if (!isSaycodePromptBlockEnabled('axBase', currentSaycodePromptBlocks, currentSaycodeSystemPromptEnabled)) {
             messageAppendSystemPrompt = removeAxSaycodeBasePrompt(messageAppendSystemPrompt);
         }
         currentAppendSystemPrompt = messageAppendSystemPrompt;

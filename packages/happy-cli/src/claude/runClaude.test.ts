@@ -1281,6 +1281,41 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it('removes a stale AX Saycode base when only the axBase block is turned off', async () => {
+        // applyAxOrchestration's own merge strips the stale base, but it returns null on a
+        // non-AX / unavailable workspace — then this path is the only cleanup. Gating it on
+        // the master boolean alone leaves the base injected forever for a user who turned
+        // just this block off.
+        const orchestration = vi.spyOn(axIntegration, 'applyAxOrchestration').mockResolvedValue(null);
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'continue without the AX base' },
+            meta: {
+                saycodeSystemPromptEnabled: true,
+                saycodePromptBlocks: { axBase: false },
+                appendSystemPrompt: [
+                    '<!-- ax:base-prompt -->',
+                    'You are the Saycode AI assistant.',
+                    '<!-- ax:base-prompt -->',
+                    '',
+                    'CUSTOM USER PROMPT',
+                ].join('\n'),
+            },
+        });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(1);
+        expect(queued[0].mode.appendSystemPrompt).toBe('CUSTOM USER PROMPT');
+        orchestration.mockRestore();
+        await harness.finish();
+    });
+
     it('removes a stale AX Saycode base when AX state is no longer available', async () => {
         const orchestration = vi.spyOn(axIntegration, 'applyAxOrchestration').mockResolvedValue(null);
         const harness = await startRemoteRunClaudeHarness();
