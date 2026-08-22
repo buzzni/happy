@@ -175,6 +175,7 @@ export async function claudeRemote(opts: {
         workerDelegationPrompt: workerAgents.delegationPrompt,
         connectorGuidance,
         saycodeSystemPromptEnabled: initial.mode.saycodeSystemPromptEnabled,
+        saycodePromptBlocks: initial.mode.saycodePromptBlocks,
     });
 
     const hasMcpServers = Object.keys(mergedMcpServers).length > 0;

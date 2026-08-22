@@ -55,3 +55,30 @@ export function resolveSaycodeAppendSystemPromptForMessage(input: {
     ? stripSaycodeOwnedPromptBlocks(resolved)
     : resolved;
 }
+
+/**
+ * Individually toggleable Saycode-owned prompt blocks. `claude:title` /
+ * `codex:title` are deliberately excluded — they are `always-on` (see
+ * PROMPT_BLOCK_PROVENANCE) and never represented as a preference here.
+ */
+export type SaycodePromptBlockName = 'coAuthoredCredit' | 'workerDelegation' | 'axBase';
+
+export type SaycodePromptBlockOverrides = Partial<Record<SaycodePromptBlockName, boolean>>;
+
+/**
+ * Resolves whether one Saycode-owned block should render, given an optional
+ * per-block override and the legacy on/off value. A per-block override always
+ * wins; with none, the block inherits the legacy value (so an account with no
+ * per-block preferences yet behaves exactly as it did before granular
+ * settings existed). Missing legacy value defaults to enabled, matching the
+ * existing wire compatibility rule for older clients/runtimes.
+ */
+export function isSaycodePromptBlockEnabled(
+  blockName: SaycodePromptBlockName,
+  overrides: SaycodePromptBlockOverrides | undefined,
+  saycodeSystemPromptEnabled: boolean | undefined,
+): boolean {
+  const override = overrides?.[blockName];
+  if (override !== undefined) return override;
+  return saycodeSystemPromptEnabled !== false;
+}

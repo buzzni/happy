@@ -1188,6 +1188,52 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it('passes per-block Saycode prompt overrides through to the queued mode', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'only turn off worker delegation' },
+            meta: {
+                saycodeSystemPromptEnabled: true,
+                saycodePromptBlocks: { workerDelegation: false },
+            },
+        });
+
+        expect(harness.loopOptions.messageQueue.queue[0].mode.saycodePromptBlocks).toEqual({
+            workerDelegation: false,
+        });
+        await harness.finish();
+    });
+
+    it('keeps the latest per-block overrides when abort resets turn-scoped options', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'first turn' },
+            meta: { saycodePromptBlocks: { axBase: false } },
+        });
+        harness.loopOptions.onAbort();
+        await userMessageHandler({
+            content: { text: 'second turn' },
+            meta: {},
+        });
+
+        expect(harness.loopOptions.messageQueue.queue[1].mode.saycodePromptBlocks).toEqual({
+            axBase: false,
+        });
+        await harness.finish();
+    });
+
     it('passes the resolved Saycode policy to AX orchestration', async () => {
         const orchestration = vi.spyOn(axIntegration, 'applyAxOrchestration').mockResolvedValue(null);
         const harness = await startRemoteRunClaudeHarness();

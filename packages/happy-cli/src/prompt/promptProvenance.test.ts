@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   PROMPT_BLOCK_PROVENANCE,
+  isSaycodePromptBlockEnabled,
   resolveInitialSaycodeAppendSystemPrompt,
   resolveSaycodeAppendSystemPromptForMessage,
 } from './promptProvenance';
@@ -59,5 +60,22 @@ describe('resolveInitialSaycodeAppendSystemPrompt', () => {
       ].join('\n'),
       saycodeSystemPromptEnabled: false,
     })).toBe('USER PROJECT CONTEXT');
+  });
+});
+
+describe('isSaycodePromptBlockEnabled', () => {
+  it('falls back to the legacy on/off value when no per-block override exists', () => {
+    expect(isSaycodePromptBlockEnabled('workerDelegation', undefined, false)).toBe(false);
+    expect(isSaycodePromptBlockEnabled('workerDelegation', undefined, true)).toBe(true);
+    expect(isSaycodePromptBlockEnabled('workerDelegation', undefined, undefined)).toBe(true);
+  });
+
+  it('lets a per-block override win over the legacy value in either direction', () => {
+    expect(isSaycodePromptBlockEnabled('coAuthoredCredit', { coAuthoredCredit: true }, false)).toBe(true);
+    expect(isSaycodePromptBlockEnabled('axBase', { axBase: false }, true)).toBe(false);
+  });
+
+  it('ignores overrides for other blocks', () => {
+    expect(isSaycodePromptBlockEnabled('axBase', { workerDelegation: false }, true)).toBe(true);
   });
 });

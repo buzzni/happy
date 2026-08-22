@@ -17,6 +17,7 @@
  */
 
 import { readState } from '../state/io';
+import { isSaycodePromptBlockEnabled, type SaycodePromptBlockOverrides } from '@/prompt/promptProvenance';
 import { composeStepGuide, composeDynamicContext, loadBasePrompt } from './compose';
 import { createInitialState, type AxStep } from '../state/schema';
 
@@ -29,6 +30,8 @@ export interface ApplyAxOrchestrationInput {
     currentAppendSystemPrompt?: string;
     explicitStep?: AxStep;
     saycodeSystemPromptEnabled?: boolean;
+    /** Per-block overrides; 'axBase' with no override inherits saycodeSystemPromptEnabled. */
+    saycodePromptBlocks?: SaycodePromptBlockOverrides;
 }
 
 export interface ApplyAxOrchestrationResult {
@@ -62,7 +65,7 @@ export async function applyAxOrchestration(
     const [guide, context, base] = await Promise.all([
         composeStepGuide(state.step),
         composeDynamicContext(input.workspaceRoot, state),
-        input.saycodeSystemPromptEnabled === false ? undefined : loadBasePrompt(),
+        isSaycodePromptBlockEnabled('axBase', input.saycodePromptBlocks, input.saycodeSystemPromptEnabled) ? loadBasePrompt() : undefined,
     ]);
 
     const userText = input.userText;

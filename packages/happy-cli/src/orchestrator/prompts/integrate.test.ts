@@ -182,6 +182,29 @@ describe('applyAxOrchestration', () => {
         expect(disabled!.appendSystemPrompt).toMatch(/CUSTOM USER PROMPT/);
     });
 
+    it('keeps the AX base when saycodePromptBlocks.axBase overrides a disabled legacy value', async () => {
+        await bootstrapWorkspace(workspace, 'plan');
+        const result = await applyAxOrchestration({
+            workspaceRoot: workspace,
+            userText: 'hi',
+            saycodeSystemPromptEnabled: false,
+            saycodePromptBlocks: { axBase: true },
+        });
+        expect(result!.appendSystemPrompt).toMatch(/Saycode AI assistant/);
+    });
+
+    it('removes the AX base when saycodePromptBlocks.axBase overrides an enabled legacy value', async () => {
+        await bootstrapWorkspace(workspace, 'plan');
+        const result = await applyAxOrchestration({
+            workspaceRoot: workspace,
+            userText: 'hi',
+            saycodeSystemPromptEnabled: true,
+            saycodePromptBlocks: { axBase: false },
+        });
+        expect(result!.appendSystemPrompt).not.toMatch(/Saycode AI assistant/);
+        expect(result!.appendSystemPrompt).toMatch(/Step: plan/);
+    });
+
     it('is idempotent — re-applying does not duplicate the base prompt', async () => {
         await bootstrapWorkspace(workspace, 'plan');
         const first = await applyAxOrchestration({

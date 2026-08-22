@@ -8,6 +8,7 @@ import { ApiClient } from "@/lib"
 import type { JsRuntime } from "./runClaude"
 import type { SandboxConfig } from "@/persistence"
 import type { McpConfigSource } from './mcpConfigSynchronizer'
+import type { SaycodePromptBlockOverrides } from '@/prompt/promptProvenance'
 
 // Re-export permission mode type from api/types
 // Single unified type with 7 modes - Codex modes mapped at SDK boundary
@@ -23,6 +24,8 @@ export interface EnhancedMode {
     customSystemPrompt?: string;
     appendSystemPrompt?: string;
     saycodeSystemPromptEnabled?: boolean;
+    /** Per-block overrides; a block with no override inherits saycodeSystemPromptEnabled. */
+    saycodePromptBlocks?: SaycodePromptBlockOverrides;
     allowedTools?: string[];
     disallowedTools?: string[];
     /** Effort level passed through to the Claude Agent SDK as the `effort` option. */

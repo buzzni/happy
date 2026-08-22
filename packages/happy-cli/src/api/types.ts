@@ -203,6 +203,14 @@ export const MessageMetaSchema = z.object({
   customSystemPrompt: z.string().nullable().optional(), // Custom system prompt for this message (null = reset)
   appendSystemPrompt: z.string().nullable().optional(), // Append to system prompt for this message (null = reset)
   saycodeSystemPromptEnabled: z.boolean().optional(), // Explicit policy for Saycode-owned instructions (missing = enabled for compatibility)
+  // Per-block overrides for individually toggleable Saycode-owned blocks. A block with
+  // no entry here inherits saycodeSystemPromptEnabled. The chat title instruction is
+  // deliberately excluded — it is always-on and never represented as a preference.
+  saycodePromptBlocks: z.object({
+    coAuthoredCredit: z.boolean().optional(),
+    workerDelegation: z.boolean().optional(),
+    axBase: z.boolean().optional(),
+  }).optional(),
   allowedTools: z.array(z.string()).nullable().optional(), // Allowed tools for this message (null = reset)
   disallowedTools: z.array(z.string()).nullable().optional(), // Disallowed tools for this message (null = reset)
   axStep: z.enum(['plan', 'design', 'free']).optional(),

@@ -29,3 +29,37 @@ describe('buildClaudeSystemPromptOptions', () => {
     });
   });
 });
+
+describe('buildClaudeSystemPromptOptions with per-block overrides', () => {
+  const input = {
+    customSystemPrompt: 'USER CUSTOM',
+    appendSystemPrompt: 'CLIENT APPEND',
+    chatTitlePrompt: 'CHAT TITLE',
+    saycodeSystemPrompt: 'SAYCODE BASE',
+    orchestratorPrompt: 'ORCHESTRATOR',
+    workerDelegationPrompt: 'WORKER DELEGATION',
+    connectorGuidance: 'CONNECTOR FACTS',
+  };
+
+  it('keeps only the overridden-on block when the legacy value is off', () => {
+    expect(buildClaudeSystemPromptOptions({
+      ...input,
+      saycodeSystemPromptEnabled: false,
+      saycodePromptBlocks: { coAuthoredCredit: true },
+    })).toEqual({
+      customSystemPrompt: 'USER CUSTOM\n\nCHAT TITLE\n\nSAYCODE BASE',
+      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nORCHESTRATOR\n\nCONNECTOR FACTS',
+    });
+  });
+
+  it('drops only the overridden-off block when the legacy value is on', () => {
+    expect(buildClaudeSystemPromptOptions({
+      ...input,
+      saycodeSystemPromptEnabled: true,
+      saycodePromptBlocks: { workerDelegation: false },
+    })).toEqual({
+      customSystemPrompt: 'USER CUSTOM\n\nCHAT TITLE\n\nSAYCODE BASE',
+      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nORCHESTRATOR\n\nCONNECTOR FACTS',
+    });
+  });
+});

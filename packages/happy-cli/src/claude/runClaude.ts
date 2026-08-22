@@ -31,6 +31,7 @@ import {
 import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudeDisallowedTools, resolveInitialClaudePermissionMode, resolveRemoteClaudeDisallowedTools, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
 import { applyAxOrchestration, removeAxSaycodeBasePrompt } from '@/orchestrator/prompts/integrate';
+import type { SaycodePromptBlockOverrides } from '@/prompt/promptProvenance';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
 import { appendTitleInstruction } from '@/utils/titlePrompt';
 import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
@@ -557,6 +558,11 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     let currentCustomSystemPrompt: string | undefined = undefined; // Track current custom system prompt
     let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt; // Track current append system prompt
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
+    // Per-block overrides layered on top of currentSaycodeSystemPromptEnabled — a block
+    // with no override inherits it (see promptProvenance.isSaycodePromptBlockEnabled).
+    // No initial-seed threading yet: daemon-spawned first turns fall back to the legacy
+    // value, which is the intended default for accounts with no per-block prefs.
+    let currentSaycodePromptBlocks: SaycodePromptBlockOverrides | undefined = undefined;
     let currentAllowedTools: string[] | undefined = undefined; // Track current allowed tools
     let currentDisallowedTools: string[] | undefined = initialDisallowedTools; // Track current disallowed tools
     let currentEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined = initialEffortSeed; // Track current Claude effort (thinking depth)
@@ -579,6 +585,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         customSystemPrompt: currentCustomSystemPrompt,
         appendSystemPrompt: currentAppendSystemPrompt,
         saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+        saycodePromptBlocks: currentSaycodePromptBlocks,
         allowedTools: currentAllowedTools,
         disallowedTools: currentDisallowedTools,
         effort: currentEffort,
@@ -750,6 +757,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
             logger.debug(`[loop] Saycode system prompt ${currentSaycodeSystemPromptEnabled ? 'enabled' : 'disabled'} by user message`);
         }
+        if (message.meta?.hasOwnProperty('saycodePromptBlocks')) {
+            currentSaycodePromptBlocks = message.meta.saycodePromptBlocks;
+            logger.debug(`[loop] Saycode per-block prompt overrides updated by user message: ${JSON.stringify(currentSaycodePromptBlocks)}`);
+        }
         messageAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
             current: currentAppendSystemPrompt,
             incoming: message.meta?.appendSystemPrompt,
@@ -865,6 +876,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 currentAppendSystemPrompt: messageAppendSystemPrompt,
                 explicitStep: explicitAxStep,
                 saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+                saycodePromptBlocks: currentSaycodePromptBlocks,
             });
             if (ax) {
                 pushText = ax.userText;
