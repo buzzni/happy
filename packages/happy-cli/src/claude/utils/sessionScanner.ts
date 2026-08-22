@@ -232,6 +232,32 @@ function transcriptEventKey(event: ScannerTranscriptEvent): string {
 }
 
 /**
+ * Recognizes a mid-turn task-notification attachment row and returns the
+ * synthetic user message it should sync as, or null for every other row.
+ * The `happyTaskNotification` marker lets the protocol mapper keep the
+ * active turn open (a plain user row closes it — see
+ * specs/midturn-task-notification-sync R2).
+ */
+function parseTaskNotificationAttachment(message: unknown): RawJSONLines | null {
+    if (!message || typeof message !== 'object') return null;
+    const row = message as { type?: unknown; uuid?: unknown; attachment?: unknown };
+    if (row.type !== 'attachment' || typeof row.uuid !== 'string' || row.uuid.length === 0) return null;
+    const attachment = row.attachment as { type?: unknown; commandMode?: unknown; prompt?: unknown } | undefined;
+    if (!attachment || typeof attachment !== 'object') return null;
+    if (attachment.type !== 'queued_command' || attachment.commandMode !== 'task-notification') return null;
+    if (typeof attachment.prompt !== 'string' || attachment.prompt.trim().length === 0) return null;
+    const synthetic = {
+        type: 'user',
+        uuid: row.uuid,
+        isSidechain: false,
+        happyTaskNotification: true,
+        message: { role: 'user', content: attachment.prompt },
+    };
+    const parsed = RawJSONLinesSchema.safeParse(synthetic);
+    return parsed.success ? parsed.data : null;
+}
+
+/**
  * Read and parse session log file
  * Returns only valid conversation messages and recognized side-channel events,
  * silently skipping internal events.
@@ -258,6 +284,23 @@ async function readSessionEntries(projectDir: string, sessionId: string): Promis
             // Silently skip known internal Claude Code events
             // These are state/tracking events, not conversation messages
             if (message.type && INTERNAL_CLAUDE_EVENT_TYPES.has(message.type)) {
+                continue;
+            }
+
+            // specs/midturn-task-notification-sync — a background-task
+            // completion notification consumed while a turn was running is
+            // recorded only as this attachment row (no 'user' row is ever
+            // written; idle-time consumption produces a real 'user' row and
+            // no attachment row, so promotion cannot duplicate it). Promote
+            // it to a synthetic user message so clients can pair the
+            // background launch with its completion.
+            const taskNotification = parseTaskNotificationAttachment(message);
+            if (taskNotification) {
+                entries.push({
+                    kind: 'message',
+                    key: messageKey(taskNotification),
+                    message: taskNotification,
+                });
                 continue;
             }
 

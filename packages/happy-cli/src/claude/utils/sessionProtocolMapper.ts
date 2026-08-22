@@ -603,6 +603,18 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
             };
         }
         if (typeof message.message.content === 'string') {
+            // A task notification the session scanner promoted from a
+            // mid-turn attachment row belongs to the turn that is still
+            // running — closing it here would record a premature turn-end
+            // (specs/midturn-task-notification-sync R2). Emit the user text
+            // and leave the turn state untouched.
+            if ((message as { happyTaskNotification?: unknown }).happyTaskNotification === true) {
+                envelopes.push(createEnvelope('user', { t: 'text', text: message.message.content }, { claudeUuid }));
+                return {
+                    currentTurnId: state.currentTurnId,
+                    envelopes,
+                };
+            }
             if (message.isSidechain) {
                 const turnId = ensureTurn(state, envelopes);
                 maybeEmitSubagentStart(state, turnId, subagent, envelopes);

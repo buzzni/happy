@@ -25,6 +25,29 @@ describe('mapClaudeLogMessageToSessionEnvelopes', () => {
         expect(result.envelopes[0].ev).toEqual({ t: 'text', text: 'hello from user' });
     });
 
+    // specs/midturn-task-notification-sync R2 — 스캐너가 승격한 턴 중 알림은 진행 중인
+    // 턴의 일부다. 일반 user 행처럼 closeTurn 하면 살아 있는 턴이 중간에 끝난 것으로
+    // 기록돼 클라이언트가 조기 turn-end 를 관찰한다.
+    it('does not close the active turn for a promoted mid-turn task notification', () => {
+        const state = { currentTurnId: 'turn-live' } as any;
+        const result = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'user',
+            uuid: 'att-notif-1',
+            isSidechain: false,
+            happyTaskNotification: true,
+            message: {
+                role: 'user',
+                content: '<task-notification>\n<tool-use-id>toolu_01x</tool-use-id>\n<status>completed</status>\n</task-notification>',
+            },
+        } as any, state);
+
+        expect(result.currentTurnId).toBe('turn-live');
+        expect(result.envelopes).toHaveLength(1);
+        expect(result.envelopes[0].role).toBe('user');
+        expect(result.envelopes[0].ev.t).toBe('text');
+        expect(result.envelopes.some((e: any) => e.ev?.t === 'turn-end')).toBe(false);
+    });
+
     it('maps non-tool user array text to user text without opening an agent turn', () => {
         const result = mapClaudeLogMessageToSessionEnvelopes({
             type: 'user',
