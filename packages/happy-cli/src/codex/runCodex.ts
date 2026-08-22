@@ -303,7 +303,7 @@ export async function runCodex(opts: {
         currentModel = initialModelSeed;
         currentEffort = initialEffortSeed;
         currentAppendSystemPrompt = initialAppendSystemPrompt;
-        currentSaycodeSystemPromptEnabled = initialSaycodeSystemPromptEnabled;
+        // Account-scoped prompt preference survives turn-scoped abort resets.
         logger.debug('[Codex] Reset current mode defaults after abort');
     };
 

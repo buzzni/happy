@@ -1140,6 +1140,23 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it('keeps the latest Saycode prompt policy when abort resets turn-scoped options', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'disable the product prompt' },
+            meta: { saycodeSystemPromptEnabled: false },
+        });
+        harness.loopOptions.onAbort();
+
+        expect(harness.loopOptions.getSaycodeSystemPromptEnabled()).toBe(false);
+        await harness.finish();
+    });
+
     it('passes the resolved Saycode policy to AX orchestration', async () => {
         const orchestration = vi.spyOn(axIntegration, 'applyAxOrchestration').mockResolvedValue(null);
         const harness = await startRemoteRunClaudeHarness();

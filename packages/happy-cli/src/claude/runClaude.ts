@@ -567,7 +567,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         currentFallbackModel = undefined;
         currentCustomSystemPrompt = undefined;
         currentAppendSystemPrompt = initialAppendSystemPrompt;
-        currentSaycodeSystemPromptEnabled = initialSaycodeSystemPromptEnabled;
+        // Account-scoped prompt preference survives turn-scoped abort resets.
         currentAllowedTools = undefined;
         currentDisallowedTools = initialDisallowedTools;
         currentEffort = initialEffortSeed;

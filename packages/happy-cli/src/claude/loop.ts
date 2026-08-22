@@ -52,7 +52,7 @@ interface LoopOptions {
     /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
     jsRuntime?: JsRuntime
     exitAfterFirstTurn?: boolean
-    getSaycodeSystemPromptEnabled?: () => boolean | undefined
+    getSaycodeSystemPromptEnabled: () => boolean | undefined
 }
 
 export async function loop(opts: LoopOptions): Promise<number> {
@@ -90,7 +90,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         switch (mode) {
             case 'local': {
                 const result = await claudeLocalLauncher(session, {
-                    saycodeSystemPromptEnabled: opts.getSaycodeSystemPromptEnabled?.(),
+                    saycodeSystemPromptEnabled: opts.getSaycodeSystemPromptEnabled(),
                 });
                 switch (result.type ) {
                     case 'switch':
