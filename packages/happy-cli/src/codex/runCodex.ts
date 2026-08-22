@@ -298,12 +298,12 @@ export async function runCodex(opts: {
     let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt;
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
 
-    const resetCurrentModeDefaults = () => {
+    const resetTurnScopedOptions = () => {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
         currentModel = initialModelSeed;
         currentEffort = initialEffortSeed;
-        // Session/account-scoped prompt state survives turn-scoped abort resets.
-        logger.debug('[Codex] Reset current mode defaults after abort');
+        // Cached append prompt and account preference survive turn-scoped abort resets.
+        logger.debug('[Codex] Reset turn-scoped options after abort');
     };
 
     // Valid Codex permission modes from remote messages. Matches the modes
@@ -557,7 +557,7 @@ export async function runCodex(opts: {
             } catch (error) {
                 logger.debug('[Codex] Error during abort:', error);
             } finally {
-                resetCurrentModeDefaults();
+                resetTurnScopedOptions();
                 // Wake up message queue wait if idle
                 abortController.abort();
                 abortController = new AbortController();

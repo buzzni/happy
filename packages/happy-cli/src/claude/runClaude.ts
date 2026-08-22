@@ -561,16 +561,16 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     let currentDisallowedTools: string[] | undefined = initialDisallowedTools; // Track current disallowed tools
     let currentEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined = initialEffortSeed; // Track current Claude effort (thinking depth)
 
-    const resetCurrentModeDefaults = () => {
+    const resetTurnScopedOptions = () => {
         currentPermissionMode = initialPermissionMode;
         currentModel = initialModelSeed;
         currentFallbackModel = undefined;
         currentCustomSystemPrompt = undefined;
-        // Session/account-scoped prompt state survives turn-scoped abort resets.
+        // Cached append prompt and account preference survive turn-scoped abort resets.
         currentAllowedTools = undefined;
         currentDisallowedTools = initialDisallowedTools;
         currentEffort = initialEffortSeed;
-        logger.debug('[loop] Reset current mode defaults after abort');
+        logger.debug('[loop] Reset turn-scoped options after abort');
     };
     const currentEnhancedMode = (): EnhancedMode => ({
         permissionMode: currentPermissionMode || 'default',
@@ -1105,7 +1105,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             // Store reference for hook server callback
             currentSession = sessionInstance;
         },
-        onAbort: resetCurrentModeDefaults,
+        onAbort: resetTurnScopedOptions,
         onActiveUserInputAccepted: (text) => {
             recordAppPrompt(text);
             session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }));
