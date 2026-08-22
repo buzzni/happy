@@ -274,6 +274,35 @@ describe('claudeLocal --continue handling', () => {
         expect(spawnArgs).toContain('-r');
     });
 
+    it('does not append the Saycode system prompt when the current policy is disabled', async () => {
+        await claudeLocal({
+            abort: new AbortController().signal,
+            sessionId: null,
+            path: '/tmp',
+            onSessionFound,
+            claudeArgs: [],
+            saycodeSystemPromptEnabled: false,
+        });
+
+        const spawnArgs = mockSpawn.mock.calls[0][1];
+        expect(spawnArgs).not.toContain('--append-system-prompt');
+        expect(spawnArgs).not.toContain('test-system-prompt');
+    });
+
+    it('keeps appending the Saycode system prompt when no policy is provided', async () => {
+        await claudeLocal({
+            abort: new AbortController().signal,
+            sessionId: null,
+            path: '/tmp',
+            onSessionFound,
+            claudeArgs: [],
+        });
+
+        const spawnArgs = mockSpawn.mock.calls[0][1];
+        expect(spawnArgs).toContain('--append-system-prompt');
+        expect(spawnArgs).toContain('test-system-prompt');
+    });
+
     it('should initialize sandbox, wrap command, and cleanup on exit', async () => {
         await claudeLocal({
             abort: new AbortController().signal,

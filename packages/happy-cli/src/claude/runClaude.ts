@@ -1128,6 +1128,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         hookSettingsPath,
         jsRuntime: options.jsRuntime,
         exitAfterFirstTurn,
+        getSaycodeSystemPromptEnabled: () => currentSaycodeSystemPromptEnabled,
     });
 
     // Cleanup session resources (intervals, callbacks) - prevents memory leak

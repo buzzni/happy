@@ -105,12 +105,17 @@ describe('claudeLocalLauncher', () => {
             sandboxConfig: undefined,
         };
 
-        const launcher = claudeLocalLauncher(session as any);
+        const launcher = claudeLocalLauncher(session as any, {
+            saycodeSystemPromptEnabled: false,
+        });
 
         await vi.waitFor(() => {
             expect(observed.localAbortSignal).toBeDefined();
             expect(observed.queueHandler).toBeDefined();
         });
+        expect(mockClaudeLocal).toHaveBeenCalledWith(expect.objectContaining({
+            saycodeSystemPromptEnabled: false,
+        }));
 
         queuedMessages = 1;
         const handler = observed.queueHandler;
