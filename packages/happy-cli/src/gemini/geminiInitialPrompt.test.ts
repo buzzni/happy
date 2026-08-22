@@ -11,7 +11,13 @@ describe('Gemini recovered initial prompt', () => {
     const env: NodeJS.ProcessEnv = {
       HAPPY_INITIAL_PROMPT: 'recover this turn',
       HAPPY_INITIAL_PROMPT_LOCAL_ID: 'local-1',
-      HAPPY_INITIAL_APPEND_SYSTEM_PROMPT: 'USER PROJECT CONTEXT',
+      HAPPY_INITIAL_APPEND_SYSTEM_PROMPT: [
+        'USER PROJECT CONTEXT',
+        '',
+        '<!-- saycode:owned-prompt -->',
+        'SAYCODE RECOVERY PROMPT',
+        '<!-- saycode:owned-prompt -->',
+      ].join('\n'),
       HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED: 'false',
     };
 

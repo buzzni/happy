@@ -53,7 +53,10 @@ import { enqueueCodexUserText, isCodexClearText } from './codexClearCommand';
 import { downloadCodexFileEventAttachment } from './utils/attachmentEvents';
 import { prepareCodexImageInputItems } from './utils/imageInput';
 import { createSerialAsyncHandler } from './utils/serialAsyncHandler';
-import { resolveSaycodeAppendSystemPromptForMessage } from '@/prompt/promptProvenance';
+import {
+    resolveInitialSaycodeAppendSystemPrompt,
+    resolveSaycodeAppendSystemPromptForMessage,
+} from '@/prompt/promptProvenance';
 import { buildCodexThreadBackfillEnvelopes } from './utils/threadImageBackfill';
 import {
     buildCodexDeveloperInstructions,
@@ -286,7 +289,10 @@ export async function runCodex(opts: {
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
-    const initialAppendSystemPrompt = consumePendingInitialAppendSystemPrompt(process.env);
+    const initialAppendSystemPrompt = resolveInitialSaycodeAppendSystemPrompt({
+        appendSystemPrompt: consumePendingInitialAppendSystemPrompt(process.env),
+        saycodeSystemPromptEnabled: initialSaycodeSystemPromptEnabled,
+    });
     let currentModel: string | undefined = initialModelSeed;
     let currentEffort: ReasoningEffort | undefined = initialEffortSeed;
     let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt;

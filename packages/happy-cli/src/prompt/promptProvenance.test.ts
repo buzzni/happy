@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   PROMPT_BLOCK_PROVENANCE,
+  resolveInitialSaycodeAppendSystemPrompt,
   resolveSaycodeAppendSystemPromptForMessage,
 } from './promptProvenance';
 
@@ -43,5 +44,20 @@ describe('resolveSaycodeAppendSystemPromptForMessage', () => {
       hasIncoming: false,
       saycodeSystemPromptEnabled: undefined,
     })).toContain('PRODUCT PROMPT');
+  });
+});
+
+describe('resolveInitialSaycodeAppendSystemPrompt', () => {
+  it('removes owned blocks from a recovered OFF prompt without clearing user context', () => {
+    expect(resolveInitialSaycodeAppendSystemPrompt({
+      appendSystemPrompt: [
+        'USER PROJECT CONTEXT',
+        '',
+        '<!-- saycode:owned-prompt -->',
+        'SAYCODE RECOVERY PROMPT',
+        '<!-- saycode:owned-prompt -->',
+      ].join('\n'),
+      saycodeSystemPromptEnabled: false,
+    })).toBe('USER PROJECT CONTEXT');
   });
 });

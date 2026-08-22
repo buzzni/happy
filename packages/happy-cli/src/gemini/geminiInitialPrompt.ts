@@ -6,6 +6,7 @@ import {
   consumePendingInitialPromptLocalId,
   consumePendingInitialSaycodeSystemPromptEnabled,
 } from '@/utils/initialPrompt';
+import { resolveInitialSaycodeAppendSystemPrompt } from '@/prompt/promptProvenance';
 
 export type PreparedGeminiInitialPrompt = {
   prompt: string | null;
@@ -19,9 +20,12 @@ export function prepareGeminiInitialPrompt(
 ): PreparedGeminiInitialPrompt {
   const prompt = consumePendingInitialPrompt(env);
   const localId = consumePendingInitialPromptLocalId(env);
-  const appendSystemPrompt = consumePendingInitialAppendSystemPrompt(env);
   const saycodeSystemPromptEnabled =
     consumePendingInitialSaycodeSystemPromptEnabled(env);
+  const appendSystemPrompt = resolveInitialSaycodeAppendSystemPrompt({
+    appendSystemPrompt: consumePendingInitialAppendSystemPrompt(env),
+    saycodeSystemPromptEnabled,
+  });
 
   return {
     prompt,

@@ -22,6 +22,18 @@ export const PROMPT_BLOCK_PROVENANCE = {
 
 export type PromptBlockId = keyof typeof PROMPT_BLOCK_PROVENANCE;
 
+export function resolveInitialSaycodeAppendSystemPrompt(input: {
+  appendSystemPrompt: string | undefined;
+  saycodeSystemPromptEnabled: boolean | undefined;
+}): string | undefined {
+  return resolveSaycodeAppendSystemPromptForMessage({
+    current: undefined,
+    incoming: input.appendSystemPrompt,
+    hasIncoming: true,
+    saycodeSystemPromptEnabled: input.saycodeSystemPromptEnabled,
+  });
+}
+
 export function resolveSaycodeAppendSystemPromptForMessage(input: {
   current: string | undefined;
   incoming?: string | null;

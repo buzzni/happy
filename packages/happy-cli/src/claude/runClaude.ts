@@ -54,7 +54,10 @@ import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodeSystemPromptEnabled, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import { createEnvelope } from '@slopus/happy-wire';
-import { resolveSaycodeAppendSystemPromptForMessage } from '@/prompt/promptProvenance';
+import {
+    resolveInitialSaycodeAppendSystemPrompt,
+    resolveSaycodeAppendSystemPromptForMessage,
+} from '@/prompt/promptProvenance';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -542,7 +545,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
-    const initialAppendSystemPrompt = consumePendingInitialAppendSystemPrompt(process.env);
+    const resolvedInitialAppendSystemPrompt = resolveInitialSaycodeAppendSystemPrompt({
+        appendSystemPrompt: consumePendingInitialAppendSystemPrompt(process.env),
+        saycodeSystemPromptEnabled: initialSaycodeSystemPromptEnabled,
+    });
+    const initialAppendSystemPrompt = initialSaycodeSystemPromptEnabled === false
+        ? removeAxSaycodeBasePrompt(resolvedInitialAppendSystemPrompt)
+        : resolvedInitialAppendSystemPrompt;
     let currentModel: string | undefined = initialModelSeed; // Track current model state
     let currentFallbackModel: string | undefined = undefined; // Track current fallback model
     let currentCustomSystemPrompt: string | undefined = undefined; // Track current custom system prompt
@@ -909,6 +918,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         sink: {
             sessionId: session.sessionId,
             hasTitle: () => session.hasTitle(),
+            saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
             sendClaudeSessionMessage: (record, localId) => session.sendClaudeSessionMessage(record, localId),
             recordAppPrompt,
             pushPrompt: (text) => {
