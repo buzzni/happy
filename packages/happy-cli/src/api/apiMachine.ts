@@ -108,7 +108,9 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 interface ServerToDaemonEvents {
     update: (data: Update) => void;
-    'rpc-request': (data: { method: string, params: string }, callback: (response: string) => void) => void;
+    // `callback` is optional because socket.io does not guarantee an ack on
+    // every delivered packet — see createRpcRequestListener.
+    'rpc-request': (data: { method: string, params: string }, callback?: (response: string) => void) => void;
     'proxy-http-request': (
         params: {
             port: number;
