@@ -3,9 +3,13 @@ import { trimIdent } from "@/utils/trimIdent";
 import { shouldIncludeCoAuthoredBy } from "./claudeSettings";
 
 /**
- * Base system prompt shared across all configurations
+ * Chat title instruction. Product plumbing, not Saycode-owned behavioral
+ * guidance: without it the `change_title` tool stays registered but nothing
+ * tells the model to call it, and every client's chat list shows untitled
+ * chats. Exported on its own so callers can keep it while dropping the
+ * Saycode-owned blocks (see claudePrompt.ts).
  */
-const BASE_SYSTEM_PROMPT = (() => trimIdent(`
+export const CHAT_TITLE_SYSTEM_PROMPT = (() => trimIdent(`
     ALWAYS when you start a new chat - you must call a tool "mcp__happy__change_title" once to generate a concise title that represents the user's task, unless the chat already has one. This title is needed to easily find the chat in the future. Help human. Pass a branchSlug too: ${BRANCH_SLUG_SPEC} The title locks after it is first set, so do not call change_title again.
 `))();
 
@@ -32,8 +36,15 @@ export const systemPrompt = (() => {
   const includeCoAuthored = shouldIncludeCoAuthoredBy();
   
   if (includeCoAuthored) {
-    return BASE_SYSTEM_PROMPT + '\n\n' + CO_AUTHORED_CREDITS;
+    return CHAT_TITLE_SYSTEM_PROMPT + '\n\n' + CO_AUTHORED_CREDITS;
   } else {
-    return BASE_SYSTEM_PROMPT;
+    return CHAT_TITLE_SYSTEM_PROMPT;
   }
 })();
+
+/**
+ * The Saycode-gated remainder of {@link systemPrompt}: Happy's commit credits.
+ * Empty when the user's Claude settings opt out of Co-Authored-By, so callers
+ * can pass it unconditionally.
+ */
+export const saycodeOwnedSystemPrompt = (() => (shouldIncludeCoAuthoredBy() ? CO_AUTHORED_CREDITS : ''))();
