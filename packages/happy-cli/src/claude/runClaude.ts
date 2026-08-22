@@ -891,7 +891,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         // Only the model's copy changes; the app renders its own user bubble.
         // recordAppPrompt() de-dupes the modified turn so the remote-mode JSONL
         // scanner doesn't forward it back to the app as a second message.
-        if (currentSaycodeSystemPromptEnabled !== false && !session.hasTitle()) {
+        if (!session.hasTitle()) {
             const withTitle = appendTitleInstruction(pushText);
             if (withTitle !== pushText) {
                 pushText = withTitle;
@@ -917,7 +917,6 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         sink: {
             sessionId: session.sessionId,
             hasTitle: () => session.hasTitle(),
-            saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
             sendClaudeSessionMessage: (record, localId) => session.sendClaudeSessionMessage(record, localId),
             recordAppPrompt,
             pushPrompt: (text) => {

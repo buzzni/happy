@@ -9,7 +9,7 @@ import { logger } from "@/lib";
 import { PushableAsyncIterable } from "@/utils/PushableAsyncIterable";
 import { getProjectPath } from "./utils/path";
 import { awaitFileExist } from "@/modules/watcher/awaitFileExist";
-import { systemPrompt } from "./utils/systemPrompt";
+import { CHAT_TITLE_SYSTEM_PROMPT, saycodeOwnedSystemPrompt } from "./utils/systemPrompt";
 import { PermissionResult } from "./sdk/types";
 import type { JsRuntime } from "./runClaude";
 import { ORCHESTRATOR_SYSTEM_PROMPT } from "@/orchestrator/workerMcp";
@@ -169,7 +169,8 @@ export async function claudeRemote(opts: {
     const promptOptions = buildClaudeSystemPromptOptions({
         customSystemPrompt: initial.mode.customSystemPrompt,
         appendSystemPrompt: initial.mode.appendSystemPrompt,
-        saycodeSystemPrompt: systemPrompt,
+        chatTitlePrompt: CHAT_TITLE_SYSTEM_PROMPT,
+        saycodeSystemPrompt: saycodeOwnedSystemPrompt,
         orchestratorPrompt,
         workerDelegationPrompt: workerAgents.delegationPrompt,
         connectorGuidance,

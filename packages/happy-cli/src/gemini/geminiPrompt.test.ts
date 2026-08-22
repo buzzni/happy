@@ -1,27 +1,25 @@
 import { describe, expect, it } from 'vitest';
 
+import { CHANGE_TITLE_INSTRUCTION } from './constants';
 import { buildGeminiTurnPrompt, hashGeminiMode } from './geminiPrompt';
 
 describe('buildGeminiTurnPrompt', () => {
-  it('keeps client-owned context but omits the Saycode title instruction when disabled', () => {
+  it('keeps the chat title instruction on every new session', () => {
     const prompt = buildGeminiTurnPrompt({
       userText: 'inspect the repository',
       appendSystemPrompt: 'CUSTOM USER PROMPT',
-      saycodeSystemPromptEnabled: false,
       isNewSession: true,
     });
 
     expect(prompt).toContain('CUSTOM USER PROMPT');
     expect(prompt).toContain('inspect the repository');
-    expect(prompt).not.toContain('change_title');
-    expect(prompt).not.toContain('happy__change_title');
+    expect(prompt).toContain('happy__change_title');
   });
 
-  it.each([true, undefined])('preserves the legacy title instruction when enabled is %s', (enabled) => {
+  it('preserves the legacy title instruction', () => {
     const prompt = buildGeminiTurnPrompt({
       userText: 'inspect the repository',
       appendSystemPrompt: 'CLIENT APPEND',
-      saycodeSystemPromptEnabled: enabled,
       isNewSession: true,
     });
 
@@ -33,7 +31,6 @@ describe('buildGeminiTurnPrompt', () => {
   it('preserves the legacy plain first turn when no append prompt exists', () => {
     expect(buildGeminiTurnPrompt({
       userText: 'plain first turn',
-      saycodeSystemPromptEnabled: true,
       isNewSession: true,
     })).toBe('plain first turn');
   });
@@ -42,7 +39,6 @@ describe('buildGeminiTurnPrompt', () => {
     expect(buildGeminiTurnPrompt({
       userText: 'continue',
       appendSystemPrompt: 'CLIENT APPEND',
-      saycodeSystemPromptEnabled: true,
       isNewSession: false,
     })).toBe('continue');
   });
@@ -52,11 +48,12 @@ describe('buildGeminiTurnPrompt', () => {
       userText: 'current turn',
       appendSystemPrompt: 'CLIENT APPEND',
       previousConversationContext: '[PREVIOUS]\nUser: earlier turn\n[/PREVIOUS]\n',
-      saycodeSystemPromptEnabled: false,
       isNewSession: true,
     });
 
-    expect(prompt).toBe('CLIENT APPEND\n\n[PREVIOUS]\nUser: earlier turn\n[/PREVIOUS]\n\ncurrent turn');
+    expect(prompt).toBe(
+      `CLIENT APPEND\n\n[PREVIOUS]\nUser: earlier turn\n[/PREVIOUS]\n\ncurrent turn\n\n${CHANGE_TITLE_INSTRUCTION}`,
+    );
     expect(prompt.match(/current turn/g)).toHaveLength(1);
   });
 });

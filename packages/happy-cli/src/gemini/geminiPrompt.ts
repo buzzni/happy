@@ -6,7 +6,6 @@ export function buildGeminiTurnPrompt(input: {
   userText: string;
   appendSystemPrompt?: string;
   previousConversationContext?: string;
-  saycodeSystemPromptEnabled?: boolean;
   isNewSession: boolean;
 }): string {
   if (!input.isNewSession) return input.userText;
@@ -15,9 +14,7 @@ export function buildGeminiTurnPrompt(input: {
     input.appendSystemPrompt,
     input.previousConversationContext?.trim(),
     input.userText,
-    input.saycodeSystemPromptEnabled === false || !input.appendSystemPrompt
-      ? undefined
-      : CHANGE_TITLE_INSTRUCTION,
+    input.appendSystemPrompt ? CHANGE_TITLE_INSTRUCTION : undefined,
   ].filter((block): block is string => Boolean(block)).join('\n\n');
 }
 

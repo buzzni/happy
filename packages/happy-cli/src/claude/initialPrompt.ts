@@ -31,7 +31,6 @@ export {
 export interface InitialPromptSink {
   sessionId: string | null
   hasTitle(): boolean
-  saycodeSystemPromptEnabled?: boolean
   sendClaudeSessionMessage(record: RawJSONLines, localId?: string): void
   recordAppPrompt(text: string): void
   pushPrompt(text: string): void
@@ -91,7 +90,7 @@ export function deliverInitialPrompt(prompt: string, sink: InitialPromptSink, lo
   // (a) 턴 시작. 새 세션엔 제목이 없으므로 onUserMessage와 동일하게 모델 사본에만
   // 제목 지시를 덧붙이고, 변형본도 dedupe 스탬프한다.
   let pushText = prompt
-  if (sink.saycodeSystemPromptEnabled !== false && !sink.hasTitle()) {
+  if (!sink.hasTitle()) {
     const withTitle = appendTitleInstruction(pushText)
     if (withTitle !== pushText) {
       pushText = withTitle

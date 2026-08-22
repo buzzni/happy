@@ -5,6 +5,7 @@ describe('buildClaudeSystemPromptOptions', () => {
   const input = {
     customSystemPrompt: 'USER CUSTOM',
     appendSystemPrompt: 'CLIENT APPEND',
+    chatTitlePrompt: 'CHAT TITLE',
     saycodeSystemPrompt: 'SAYCODE BASE',
     orchestratorPrompt: 'ORCHESTRATOR',
     workerDelegationPrompt: 'WORKER DELEGATION',
@@ -13,18 +14,18 @@ describe('buildClaudeSystemPromptOptions', () => {
 
   it('preserves the legacy prompt byte-for-byte when enabled or absent', () => {
     const expected = {
-      customSystemPrompt: 'USER CUSTOM\n\nSAYCODE BASE',
-      appendSystemPrompt: 'CLIENT APPEND\n\nSAYCODE BASE\n\nORCHESTRATOR\n\nWORKER DELEGATION\n\nCONNECTOR FACTS',
+      customSystemPrompt: 'USER CUSTOM\n\nCHAT TITLE\n\nSAYCODE BASE',
+      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nORCHESTRATOR\n\nWORKER DELEGATION\n\nCONNECTOR FACTS',
     };
 
     expect(buildClaudeSystemPromptOptions({ ...input, saycodeSystemPromptEnabled: true })).toEqual(expected);
     expect(buildClaudeSystemPromptOptions({ ...input, saycodeSystemPromptEnabled: undefined })).toEqual(expected);
   });
 
-  it('removes only Saycode-owned blocks when disabled', () => {
+  it('removes only Saycode-owned blocks when disabled, keeping the chat title instruction', () => {
     expect(buildClaudeSystemPromptOptions({ ...input, saycodeSystemPromptEnabled: false })).toEqual({
-      customSystemPrompt: 'USER CUSTOM',
-      appendSystemPrompt: 'CLIENT APPEND\n\nORCHESTRATOR\n\nCONNECTOR FACTS',
+      customSystemPrompt: 'USER CUSTOM\n\nCHAT TITLE',
+      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nORCHESTRATOR\n\nCONNECTOR FACTS',
     });
   });
 });

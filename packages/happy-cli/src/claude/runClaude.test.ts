@@ -454,7 +454,10 @@ describe('runClaude remote JSONL scanner', () => {
             appendSystemPrompt: 'USER PROJECT CONTEXT',
             saycodeSystemPromptEnabled: false,
         });
-        expect(harness.loopOptions.messageQueue.queue[0].message).toBe('복구 후 이어서 작업해줘');
+        // The recovered turn keeps the chat title nudge: titling is product
+        // plumbing, not a Saycode-owned instruction, so it survives OFF.
+        expect(harness.loopOptions.messageQueue.queue[0].message).toContain('복구 후 이어서 작업해줘');
+        expect(harness.loopOptions.messageQueue.queue[0].message).toContain(TITLE_INSTRUCTION);
         expect(process.env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT).toBeUndefined();
         expect(process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED).toBeUndefined();
 
@@ -1104,7 +1107,7 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
-    it('does not append the change_title instruction when Saycode prompts are disabled', async () => {
+    it('still appends the change_title instruction when Saycode prompts are disabled', async () => {
         const harness = await startRemoteRunClaudeHarness();
         harness.sessionClient.hasTitle.mockReturnValue(false);
         await vi.waitFor(() => {
@@ -1119,7 +1122,8 @@ describe('runClaude remote JSONL scanner', () => {
 
         const queued = harness.loopOptions.messageQueue.queue;
         expect(queued).toHaveLength(1);
-        expect(queued[0].message).toBe('use my own harness');
+        expect(queued[0].message).toContain('use my own harness');
+        expect(queued[0].message).toContain(TITLE_INSTRUCTION);
         expect(queued[0].mode.saycodeSystemPromptEnabled).toBe(false);
         await harness.finish();
     });
