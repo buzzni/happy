@@ -353,4 +353,81 @@ describe('sessionScanner', () => {
     expect(collectedMessages).toHaveLength(1)
     expect(collectedMessages[0].type).toBe('user')
   })
+
+  // specs/midturn-task-notification-sync — 턴 진행 중 소비된 백그라운드 완료 알림은
+  // user 행 없이 attachment 행으로만 남는다(idle 소비는 실제 user 행이 생기고 attachment
+  // 행이 없다 — 중복 승격 없음의 전제). 스캐너가 이를 합성 user 메시지로 승격해야
+  // 클라이언트의 launch↔알림 짝맞춤이 완성된다.
+  describe('mid-turn task-notification promotion', () => {
+    const NOTIFICATION_PROMPT = '<task-notification>\n<task-id>t1</task-id>\n<tool-use-id>toolu_01x</tool-use-id>\n<status>completed</status>\n<summary>done</summary>\n</task-notification>'
+
+    function notificationAttachmentRow(uuid: string): string {
+      return JSON.stringify({
+        parentUuid: 'parent-1',
+        isSidechain: false,
+        type: 'attachment',
+        uuid,
+        attachment: {
+          type: 'queued_command',
+          prompt: NOTIFICATION_PROMPT,
+          commandMode: 'task-notification',
+          timestamp: '2026-08-21T14:47:29.512Z',
+        },
+      })
+    }
+
+    it('promotes the attachment row to a synthetic user message (R1)', async () => {
+      scanner = await createSessionScanner({
+        sessionId: null,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg),
+        onTranscriptEvent: (event) => collectedTranscriptEvents.push(event),
+      })
+
+      const rows = [
+        JSON.stringify({ type: 'user', uuid: 'user-1', message: { role: 'user', content: 'do work' } }),
+        // 내부 이벤트/무관 attachment 는 기존대로 건너뛴다 (R3).
+        JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-08-21T14:47:29.512Z', sessionId: 's', content: NOTIFICATION_PROMPT }),
+        JSON.stringify({ type: 'attachment', uuid: 'att-other', attachment: { type: 'queued_command', prompt: 'not a notification', commandMode: 'prompt' } }),
+        notificationAttachmentRow('att-notif-1'),
+      ].join('\n') + '\n'
+
+      const sessionId = '11111111-2222-4333-8444-555555555555'
+      await writeFile(join(projectDir, `${sessionId}.jsonl`), rows)
+      scanner.onNewSession(sessionId)
+      await new Promise((resolve) => setTimeout(resolve, 100))
+
+      expect(collectedMessages).toHaveLength(2)
+      const synthetic = collectedMessages[1]
+      expect(synthetic).toMatchObject({
+        type: 'user',
+        uuid: 'att-notif-1',
+        isSidechain: false,
+        happyTaskNotification: true,
+        message: { role: 'user', content: NOTIFICATION_PROMPT },
+      })
+      expect(collectedTranscriptEvents).toHaveLength(0)
+    })
+
+    it('does not re-emit a promoted notification on rescan (R1)', async () => {
+      scanner = await createSessionScanner({
+        sessionId: null,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg),
+      })
+
+      const sessionId = '11111111-2222-4333-8444-666666666666'
+      const sessionFile = join(projectDir, `${sessionId}.jsonl`)
+      await writeFile(sessionFile, notificationAttachmentRow('att-notif-2') + '\n')
+      scanner.onNewSession(sessionId)
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(collectedMessages).toHaveLength(1)
+
+      await appendFile(sessionFile, JSON.stringify({ type: 'user', uuid: 'user-2', message: { role: 'user', content: 'next' } }) + '\n')
+      await new Promise((resolve) => setTimeout(resolve, 200))
+
+      expect(collectedMessages).toHaveLength(2)
+      expect(collectedMessages.filter((m) => (m as { happyTaskNotification?: boolean }).happyTaskNotification)).toHaveLength(1)
+    })
+  })
 })
