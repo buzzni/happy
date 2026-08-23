@@ -10,6 +10,7 @@ export function buildClaudeSystemPromptOptions({
   appendSystemPrompt,
   chatTitlePrompt,
   saycodeSystemPrompt,
+  agentOrchestrationPrompt,
   orchestratorPrompt,
   workerDelegationPrompt,
   connectorGuidance,
@@ -28,6 +29,8 @@ export function buildClaudeSystemPromptOptions({
   chatTitlePrompt?: string;
   /** Co-Authored-By commit credits — gated per-block as 'coAuthoredCredit'. */
   saycodeSystemPrompt: string;
+  /** Global Saycode-owned child-session routing; controlled by the master prompt switch. */
+  agentOrchestrationPrompt?: string;
   orchestratorPrompt?: string;
   /** Gated per-block as 'workerDelegation'. */
   workerDelegationPrompt?: string;
@@ -50,6 +53,7 @@ export function buildClaudeSystemPromptOptions({
       appendSystemPrompt,
       chatTitlePrompt,
       isCoAuthoredCreditEnabled ? saycodeSystemPrompt : undefined,
+      saycodeSystemPromptEnabled !== false ? agentOrchestrationPrompt : undefined,
       orchestratorPrompt,
       isWorkerDelegationEnabled ? workerDelegationPrompt : undefined,
       connectorGuidance,

@@ -43,6 +43,10 @@ vi.mock('./utils/systemPrompt', () => ({
     saycodeOwnedSystemPrompt: 'test-saycode-owned-prompt',
 }));
 
+vi.mock('@/prompt/agentOrchestrationPrompt', () => ({
+    AGENT_ORCHESTRATION_SYSTEM_PROMPT: 'test-agent-orchestration-prompt',
+}));
+
 vi.mock('node:fs', () => ({
     mkdirSync: vi.fn(),
     existsSync: vi.fn(() => true)
@@ -286,9 +290,11 @@ describe('claudeLocal --continue handling', () => {
         });
 
         const spawnArgs = mockSpawn.mock.calls[0][1];
+        const promptArgs = spawnArgs.join('\n');
         expect(spawnArgs).toContain('--append-system-prompt');
-        expect(spawnArgs).toContain('test-title-prompt');
-        expect(spawnArgs).not.toContain('test-saycode-owned-prompt');
+        expect(promptArgs).toContain('test-title-prompt');
+        expect(promptArgs).not.toContain('test-saycode-owned-prompt');
+        expect(promptArgs).not.toContain('test-agent-orchestration-prompt');
     });
 
     it('keeps appending the Saycode-owned prompt alongside the title instruction when no policy is provided', async () => {
@@ -301,8 +307,9 @@ describe('claudeLocal --continue handling', () => {
         });
 
         const spawnArgs = mockSpawn.mock.calls[0][1];
+        const promptArgs = spawnArgs.join('\n');
         expect(spawnArgs).toContain('--append-system-prompt');
-        expect(spawnArgs).toContain('test-title-prompt\n\ntest-saycode-owned-prompt');
+        expect(promptArgs).toContain('test-title-prompt\n\ntest-saycode-owned-prompt\n\ntest-agent-orchestration-prompt');
     });
 
     it('honors a per-block override that turns the Saycode-owned prompt off while the master value is on', async () => {
@@ -317,8 +324,10 @@ describe('claudeLocal --continue handling', () => {
         });
 
         const spawnArgs = mockSpawn.mock.calls[0][1];
-        expect(spawnArgs).toContain('test-title-prompt');
-        expect(spawnArgs).not.toContain('test-saycode-owned-prompt');
+        const promptArgs = spawnArgs.join('\n');
+        expect(promptArgs).toContain('test-title-prompt');
+        expect(promptArgs).not.toContain('test-saycode-owned-prompt');
+        expect(promptArgs).toContain('test-agent-orchestration-prompt');
     });
 
     it('honors a per-block override that turns the Saycode-owned prompt on while the master value is off', async () => {
@@ -333,7 +342,9 @@ describe('claudeLocal --continue handling', () => {
         });
 
         const spawnArgs = mockSpawn.mock.calls[0][1];
-        expect(spawnArgs).toContain('test-title-prompt\n\ntest-saycode-owned-prompt');
+        const promptArgs = spawnArgs.join('\n');
+        expect(promptArgs).toContain('test-title-prompt\n\ntest-saycode-owned-prompt');
+        expect(promptArgs).not.toContain('test-agent-orchestration-prompt');
     });
 
     it('should initialize sandbox, wrap command, and cleanup on exit', async () => {

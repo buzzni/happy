@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   PROMPT_BLOCK_PROVENANCE,
+  SAYCODE_MASTER_PROMPT_PROVENANCE_IDS,
   SAYCODE_PROMPT_BLOCK_PROVENANCE_IDS,
   isSaycodePromptBlockEnabled,
   resolveInitialSaycodeAppendSystemPrompt,
@@ -10,6 +11,7 @@ import {
 describe('prompt provenance inventory', () => {
   it('classifies every current Claude, Codex, and client-composed block', () => {
     expect(PROMPT_BLOCK_PROVENANCE).toEqual({
+      'common:agent-orchestration': 'saycode',
       'claude:title': 'always-on',
       'claude:co-authored-credit': 'saycode',
       'claude:orchestrator': 'selected-feature',
@@ -86,14 +88,17 @@ describe('toggle catalog stays in sync with the provenance inventory', () => {
   // blocks are Saycode-owned, SAYCODE_PROMPT_BLOCK_PROVENANCE_IDS says which of those
   // have a toggle. Drift means a block silently loses (or fakes) a user control — the
   // same doc/code mismatch that had 'claude:title' classified as toggleable.
-  it('gives every Saycode-owned block exactly one toggle', () => {
+  it('gives every Saycode-owned block either one toggle or an explicit master-only gate', () => {
     const ownedIds = Object.entries(PROMPT_BLOCK_PROVENANCE)
       .filter(([, provenance]) => provenance === 'saycode')
       .map(([id]) => id)
       .sort();
-    const toggledIds = Object.values(SAYCODE_PROMPT_BLOCK_PROVENANCE_IDS).sort();
+    const controlledIds = [
+      ...Object.values(SAYCODE_PROMPT_BLOCK_PROVENANCE_IDS),
+      ...SAYCODE_MASTER_PROMPT_PROVENANCE_IDS,
+    ].sort();
 
-    expect(toggledIds).toEqual(ownedIds);
+    expect(controlledIds).toEqual(ownedIds);
   });
 
   it('never exposes a toggle for an always-on block', () => {

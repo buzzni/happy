@@ -17,6 +17,7 @@ export type PromptProvenance =
  * non-toggleable and say so, rather than omitting them from the list.
  */
 export const PROMPT_BLOCK_PROVENANCE = {
+  'common:agent-orchestration': 'saycode',
   'claude:title': 'always-on',
   'claude:co-authored-credit': 'saycode',
   'claude:orchestrator': 'selected-feature',
@@ -29,6 +30,11 @@ export const PROMPT_BLOCK_PROVENANCE = {
   'codex:connector-guidance': 'operational',
   'client:append-system-prompt': 'client-composed',
 } as const satisfies Record<string, PromptProvenance>;
+
+/** Saycode-owned blocks controlled only by the existing master prompt switch. */
+export const SAYCODE_MASTER_PROMPT_PROVENANCE_IDS = [
+  'common:agent-orchestration',
+] as const satisfies readonly PromptBlockId[];
 
 export type PromptBlockId = keyof typeof PROMPT_BLOCK_PROVENANCE;
 

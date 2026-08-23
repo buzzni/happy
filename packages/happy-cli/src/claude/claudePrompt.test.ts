@@ -7,6 +7,7 @@ describe('buildClaudeSystemPromptOptions', () => {
     appendSystemPrompt: 'CLIENT APPEND',
     chatTitlePrompt: 'CHAT TITLE',
     saycodeSystemPrompt: 'SAYCODE BASE',
+    agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
     orchestratorPrompt: 'ORCHESTRATOR',
     workerDelegationPrompt: 'WORKER DELEGATION',
     connectorGuidance: 'CONNECTOR FACTS',
@@ -15,7 +16,7 @@ describe('buildClaudeSystemPromptOptions', () => {
   it('preserves the legacy prompt byte-for-byte when enabled or absent', () => {
     const expected = {
       customSystemPrompt: 'USER CUSTOM\n\nCHAT TITLE\n\nSAYCODE BASE',
-      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nORCHESTRATOR\n\nWORKER DELEGATION\n\nCONNECTOR FACTS',
+      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nAGENT ORCHESTRATION: happy agent spawn\n\nORCHESTRATOR\n\nWORKER DELEGATION\n\nCONNECTOR FACTS',
     };
 
     expect(buildClaudeSystemPromptOptions({ ...input, saycodeSystemPromptEnabled: true })).toEqual(expected);
@@ -36,6 +37,7 @@ describe('buildClaudeSystemPromptOptions with per-block overrides', () => {
     appendSystemPrompt: 'CLIENT APPEND',
     chatTitlePrompt: 'CHAT TITLE',
     saycodeSystemPrompt: 'SAYCODE BASE',
+    agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
     orchestratorPrompt: 'ORCHESTRATOR',
     workerDelegationPrompt: 'WORKER DELEGATION',
     connectorGuidance: 'CONNECTOR FACTS',
@@ -59,7 +61,7 @@ describe('buildClaudeSystemPromptOptions with per-block overrides', () => {
       saycodePromptBlocks: { workerDelegation: false },
     })).toEqual({
       customSystemPrompt: 'USER CUSTOM\n\nCHAT TITLE\n\nSAYCODE BASE',
-      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nORCHESTRATOR\n\nCONNECTOR FACTS',
+      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nAGENT ORCHESTRATION: happy agent spawn\n\nORCHESTRATOR\n\nCONNECTOR FACTS',
     });
   });
 });
