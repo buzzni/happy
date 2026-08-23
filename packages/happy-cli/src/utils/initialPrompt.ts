@@ -44,6 +44,33 @@ export function consumePendingInitialSaycodeSystemPromptEnabled(
   return undefined
 }
 
+/**
+ * Per-block Saycode overrides for a daemon-seeded first turn, as JSON in
+ * HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS. Consumed exactly once (read + delete) like
+ * every other HAPPY_INITIAL_* seed so children never inherit it. A malformed value
+ * degrades to undefined — legacy master inheritance — mirroring MessageMetaSchema's
+ * catch(undefined) on the wire; non-boolean entries are dropped so one bad value
+ * cannot flip a block.
+ */
+export function consumePendingInitialSaycodePromptBlocks(
+  env: NodeJS.ProcessEnv,
+): Record<string, boolean> | undefined {
+  const raw = env.HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS
+  delete env.HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS
+  if (typeof raw !== 'string' || raw.trim().length === 0) return undefined
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+    const blocks = Object.fromEntries(
+      Object.entries(parsed as Record<string, unknown>)
+        .filter((entry): entry is [string, boolean] => typeof entry[1] === 'boolean'),
+    )
+    return Object.keys(blocks).length > 0 ? blocks : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function consumePendingInitialAppendSystemPrompt(
   env: NodeJS.ProcessEnv,
 ): string | undefined {

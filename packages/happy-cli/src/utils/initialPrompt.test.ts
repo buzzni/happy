@@ -4,6 +4,7 @@ import {
   consumePendingInitialAppendSystemPrompt,
   consumePendingInitialEffort,
   consumePendingInitialModel,
+  consumePendingInitialSaycodePromptBlocks,
   consumePendingInitialSaycodeSystemPromptEnabled,
 } from './initialPrompt'
 
@@ -68,5 +69,37 @@ describe('consumePendingInitialSaycodeSystemPromptEnabled', () => {
     expect(consumePendingInitialSaycodeSystemPromptEnabled({
       HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED: 'invalid',
     })).toBeUndefined()
+  })
+})
+
+describe('consumePendingInitialSaycodePromptBlocks', () => {
+  it('reads a JSON block override map exactly once', () => {
+    const env: NodeJS.ProcessEnv = {
+      HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS: '{"workerDelegation":false,"axBase":true}',
+    }
+
+    expect(consumePendingInitialSaycodePromptBlocks(env)).toEqual({
+      workerDelegation: false,
+      axBase: true,
+    })
+    expect(env).not.toHaveProperty('HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS')
+    expect(consumePendingInitialSaycodePromptBlocks(env)).toBeUndefined()
+  })
+
+  it('degrades malformed values to no-override instead of poisoning the session', () => {
+    // A recovery seed is machine-produced but still crosses a process boundary —
+    // a broken value must fall back to the legacy master inheritance, mirroring
+    // MessageMetaSchema's catch(undefined) on the wire.
+    expect(consumePendingInitialSaycodePromptBlocks({})).toBeUndefined()
+    expect(consumePendingInitialSaycodePromptBlocks({
+      HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS: 'not json',
+    })).toBeUndefined()
+    expect(consumePendingInitialSaycodePromptBlocks({
+      HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS: '["array"]',
+    })).toBeUndefined()
+    // Non-boolean entries are dropped, boolean ones survive.
+    expect(consumePendingInitialSaycodePromptBlocks({
+      HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS: '{"workerDelegation":"no","axBase":false}',
+    })).toEqual({ axBase: false })
   })
 })

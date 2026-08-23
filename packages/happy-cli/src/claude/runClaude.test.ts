@@ -464,6 +464,43 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it('seeds per-block Saycode overrides from the recovery env into the first turn', async () => {
+        process.env.HAPPY_INITIAL_PROMPT = '복구 후 이어서 작업해줘';
+        process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED = 'true';
+        process.env.HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS = '{"workerDelegation":false}';
+
+        const harness = await startRemoteRunClaudeHarness();
+
+        expect(harness.loopOptions.messageQueue.queue[0].mode.saycodePromptBlocks).toEqual({
+            workerDelegation: false,
+        });
+        expect(process.env.HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS).toBeUndefined();
+
+        await harness.finish();
+    });
+
+    it('strips a recovered AX base when only its block is seeded off', async () => {
+        // The per-turn path already honors the block gate; the recovery seed path
+        // must apply the same rule or a master-on/axBase-off account's recovered
+        // first turn re-injects the base the user turned off.
+        process.env.HAPPY_INITIAL_PROMPT = '복구 후 이어서 작업해줘';
+        process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED = 'true';
+        process.env.HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS = '{"axBase":false}';
+        process.env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT = [
+            '<!-- ax:base-prompt -->',
+            'SAYCODE AX BASE',
+            '<!-- ax:base-prompt -->',
+            '',
+            'USER PROJECT CONTEXT',
+        ].join('\n');
+
+        const harness = await startRemoteRunClaudeHarness();
+
+        expect(harness.loopOptions.messageQueue.queue[0].mode.appendSystemPrompt).toBe('USER PROJECT CONTEXT');
+
+        await harness.finish();
+    });
+
     it('keeps read-only tool restrictions when a remote message resets disallowed tools', async () => {
         process.env.HAPPY_PROJECT_SANDBOX_CONFIG = JSON.stringify({
             enabled: true,
