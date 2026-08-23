@@ -3,8 +3,10 @@ import {
     parsePairArgs,
     buildPairUrl,
     formatPairOutcome,
+    extensionAvailableAfterLoad,
     pairingConnectionArrived,
     pickTierProbeProfile,
+    shouldLoadUnpackedExtension,
     DEFAULT_CDP_PORT,
 } from './browserPair'
 
@@ -259,6 +261,28 @@ describe('pairingConnectionArrived', () => {
             ['desktop'],
             'viewer-9222',
         )).toBe(true)
+    })
+})
+
+describe('extension load policy', () => {
+    it('refreshes a visible extension for marker pairing so an old bundle cannot miss the protocol', () => {
+        expect(shouldLoadUnpackedExtension(true, 'viewer-9222')).toBe(true)
+    })
+
+    it('keeps the ordinary pairing path from reloading an already visible extension', () => {
+        expect(shouldLoadUnpackedExtension(true)).toBe(false)
+    })
+
+    it('loads the extension when Chrome has no visible extension target', () => {
+        expect(shouldLoadUnpackedExtension(false)).toBe(true)
+    })
+
+    it('keeps an existing extension available when Chrome refuses the refresh', () => {
+        expect(extensionAvailableAfterLoad(true, false)).toBe(true)
+    })
+
+    it('does not invent an extension when neither the old target nor the load succeeded', () => {
+        expect(extensionAvailableAfterLoad(false, false)).toBe(false)
     })
 })
 

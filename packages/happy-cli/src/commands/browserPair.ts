@@ -287,6 +287,15 @@ function hasExtensionTarget(targets: Array<{ url?: string }> | null, extensionId
     return (targets ?? []).some((target) => target.url?.startsWith(`chrome-extension://${extensionId}/`) === true)
 }
 
+/** Marker pairing requires the bundle that understands that marker. */
+export function shouldLoadUnpackedExtension(extensionLoaded: boolean, pairingId?: string): boolean {
+    return !extensionLoaded || pairingId !== undefined
+}
+
+export function extensionAvailableAfterLoad(previouslyLoaded: boolean, loadedNow: boolean): boolean {
+    return previouslyLoaded || loadedNow
+}
+
 /**
  * Install the extension into the running Chrome over CDP.
  *
@@ -445,9 +454,11 @@ export async function runPairing(options: PairOptions): Promise<PairOutcomeInput
     // prove "not installed" — loading again is harmless (Chrome reloads it)
     // and is the only way in on a machine with no GUI.
     let loadUnpackedFailed = false
-    if (cdpReachable && !extensionLoaded) {
-        extensionLoaded = await loadUnpackedExtension(options.cdpPort, extensionDir)
-        loadUnpackedFailed = !extensionLoaded
+    if (cdpReachable && shouldLoadUnpackedExtension(extensionLoaded, options.pairingId)) {
+        const previouslyLoaded = extensionLoaded
+        const loadedNow = await loadUnpackedExtension(options.cdpPort, extensionDir)
+        loadUnpackedFailed = !loadedNow
+        extensionLoaded = extensionAvailableAfterLoad(previouslyLoaded, loadedNow)
     }
 
     let pageOpened = false

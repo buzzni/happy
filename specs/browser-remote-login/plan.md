@@ -171,3 +171,9 @@ unrelated 프로필만 연결되거나 대기 중 새 bystander가 도착해도 
 2026-08-24 셀프 리뷰에서 사용자 프로필명 덮어쓰기와 bystander 조기 종료를 위의
 고유 marker 방식으로 수정했다. browser extension 188개와 CLI 관련 163개 테스트,
 CLI typecheck/build, staged artifact guard/install smoke가 통과했다.
+
+같은 날 2차 리뷰에서 구버전 확장이 이미 보이는 viewer Chrome은 최신 marker
+프로토콜로 갱신되지 않는 업그레이드 결함을 수정했다. marker 페어링에 한해 현재 CLI의
+unpacked extension을 다시 로드하며 일반 수동 페어링의 기존 fast path는 보존한다.
+확장 188개, CLI 관련 168개 테스트와 CLI typecheck/build, staged artifact
+guard/install smoke가 통과했다.
