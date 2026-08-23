@@ -147,3 +147,38 @@ viewer를 직접 여는 경로는 계속 기본 browser를 보장하되, profile
 `callerWillLaunchBrowser` ownership을 전달해 선행 browser 실행을 생략한다. 순수 결정
 test가 defer/launch/reuse 세 경우를 고정하며 browser setup/viewer 유닛 38개와 CLI
 typecheck/package build가 통과했다.
+
+## 후속 수정 — viewer Chrome 브리지 자동 페어링 (2026-08-23)
+
+원격 화면에서 Gmail에 로그인해도 Saycode 세션의 browser tool은
+`No Chrome extension is connected`를 반환했다. viewer 경로가 Xvfb/noVNC와 Chrome만
+보장하고, 확장 주입·token 저장·WebSocket 연결을 담당하는 `runPairing`은 수동
+`browser-setup:pair`에만 연결돼 있었기 때문이다.
+
+`browser-viewer:start`가 신규/재사용 viewer Chrome의 정확한 CDP port로 기존
+`runPairing`을 호출하게 했다. browser 준비와 bridge 준비 결과를 분리해 페어링 실패가
+noVNC 복구 화면 자체를 숨기지 않게 했다. 또한 `/proc`의 정확한 NUL 구분 cmdline과
+DISPLAY를 확인해 headless Chrome을 viewer Chrome으로 성공 오인하지 않는다. pairing
+URL은 사용자 프로필 이름을 바꾸지 않고 실행별 고유 `pairingId`를 전달하며, bridge가
+같은 marker의 연결을 보고해야 성공한다. 따라서 확장이 이미 로드된 viewer 앞에서
+unrelated 프로필만 연결되거나 대기 중 새 bystander가 도착해도 성공 또는 조기 실패로
+오인하지 않는다.
+
+검증: viewer API/browser setup/remote viewer/browser pair focused 68개, browser extension
+전체 187개, CLI typecheck와 package build 통과. 현재 실행 환경의 OrbStack 및
+`walter-gpu` 직접 접속 timeout으로 Linux 실기 E2E는 릴리스 후 머신 검증으로 이월했다.
+
+2026-08-24 셀프 리뷰에서 사용자 프로필명 덮어쓰기와 bystander 조기 종료를 위의
+고유 marker 방식으로 수정했다. browser extension 188개와 CLI 관련 163개 테스트,
+CLI typecheck/build, staged artifact guard/install smoke가 통과했다.
+
+같은 날 2차 리뷰에서 구버전 확장이 이미 보이는 viewer Chrome은 최신 marker
+프로토콜로 갱신되지 않는 업그레이드 결함을 수정했다. marker 페어링에 한해 현재 CLI의
+unpacked extension을 다시 로드하며 일반 수동 페어링의 기존 fast path는 보존한다.
+확장 188개, CLI 관련 168개 테스트와 CLI typecheck/build, staged artifact
+guard/install smoke가 통과했다.
+
+3차 리뷰에서는 기존 확장이 보여도 최신 번들 갱신이 실패한 target-marker 오류가 실제
+원인을 숨기던 진단 누락을 수정했다. 실패 메시지가 Chrome 재기동에 필요한
+`--enable-unsafe-extension-debugging` 플래그를 직접 안내한다.
+Happy CLI 관련 169개 테스트와 typecheck/build가 통과했다.

@@ -1,5 +1,14 @@
 import { describe, it, expect } from 'vitest'
-import { parsePairArgs, buildPairUrl, formatPairOutcome, pickTierProbeProfile, DEFAULT_CDP_PORT } from './browserPair'
+import {
+    parsePairArgs,
+    buildPairUrl,
+    formatPairOutcome,
+    extensionAvailableAfterLoad,
+    pairingConnectionArrived,
+    pickTierProbeProfile,
+    shouldLoadUnpackedExtension,
+    DEFAULT_CDP_PORT,
+} from './browserPair'
 
 describe('parsePairArgs', () => {
     it('defaults to Chrome\'s conventional debugging port and leaves the debugger tier alone', () => {
@@ -64,6 +73,12 @@ describe('buildPairUrl', () => {
         expect(buildPairUrl({ ...base, debuggerTier: true })).toContain('&debugger=1')
         expect(buildPairUrl({ ...base, debuggerTier: false })).toContain('&debugger=0')
     })
+
+    it('carries a pairing id without overwriting the target Chrome profile', () => {
+        const url = buildPairUrl({ ...base, pairingId: 'viewer-9222' })
+        expect(url).toContain('&pairingId=viewer-9222')
+        expect(url).not.toContain('&profile=')
+    })
 })
 
 describe('formatPairOutcome', () => {
@@ -82,6 +97,31 @@ describe('formatPairOutcome', () => {
         const outcome = formatPairOutcome(base)
         expect(outcome.ok).toBe(true)
         expect(outcome.text).toContain('headless-1')
+    })
+
+    it('does not accept an unrelated connection when an exact pairing id was requested', () => {
+        const outcome = formatPairOutcome({
+            ...base,
+            targetPairingId: 'viewer-9222',
+            connections: [{ profile: 'unrelated-headless', pairingId: 'other-run' }],
+            freshProfiles: [],
+        })
+
+        expect(outcome.ok).toBe(false)
+        expect(outcome.text).toContain('viewer-9222')
+    })
+
+    it('explains a failed extension refresh when the old visible bundle cannot emit the target marker', () => {
+        const outcome = formatPairOutcome({
+            ...base,
+            loadUnpackedFailed: true,
+            targetPairingId: 'viewer-9222',
+            connections: [{ profile: 'work' }],
+            freshProfiles: [],
+        })
+
+        expect(outcome.ok).toBe(false)
+        expect(outcome.text).toContain('--enable-unsafe-extension-debugging')
     })
 
     it('leads with the daemon when it is not running — nothing below it can work', () => {
@@ -216,6 +256,46 @@ describe('formatPairOutcome', () => {
         })
         expect(outcome.ok).toBe(true)
         expect(outcome.text).toContain('headless-1')
+    })
+})
+
+describe('pairingConnectionArrived', () => {
+    it('keeps waiting when a bystander connects before the exact target', () => {
+        expect(pairingConnectionArrived(
+            [{ profile: 'desktop' }, { profile: 'bystander', pairingId: 'other-run' }],
+            ['desktop'],
+            'viewer-9222',
+        )).toBe(false)
+    })
+
+    it('finishes when the exact pairing id reconnects under an existing profile', () => {
+        expect(pairingConnectionArrived(
+            [{ profile: 'desktop', pairingId: 'viewer-9222' }],
+            ['desktop'],
+            'viewer-9222',
+        )).toBe(true)
+    })
+})
+
+describe('extension load policy', () => {
+    it('refreshes a visible extension for marker pairing so an old bundle cannot miss the protocol', () => {
+        expect(shouldLoadUnpackedExtension(true, 'viewer-9222')).toBe(true)
+    })
+
+    it('keeps the ordinary pairing path from reloading an already visible extension', () => {
+        expect(shouldLoadUnpackedExtension(true)).toBe(false)
+    })
+
+    it('loads the extension when Chrome has no visible extension target', () => {
+        expect(shouldLoadUnpackedExtension(false)).toBe(true)
+    })
+
+    it('keeps an existing extension available when Chrome refuses the refresh', () => {
+        expect(extensionAvailableAfterLoad(true, false)).toBe(true)
+    })
+
+    it('does not invent an extension when neither the old target nor the load succeeded', () => {
+        expect(extensionAvailableAfterLoad(false, false)).toBe(false)
     })
 })
 

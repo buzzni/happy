@@ -42,6 +42,7 @@ import { validatePath } from '@/modules/common/pathSecurity';
 import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createServer } from 'node:net';
+import { randomUUID } from 'node:crypto';
 import { exec } from 'node:child_process';
 import { readDaemonState } from '@/persistence';
 import { fetchBrowserStatus } from '@/daemon/browserClient';
@@ -63,6 +64,8 @@ import {
     VIEWER_WEB_PORTS,
     decideViewerBrowserAction,
     decideViewerStackAction,
+    readDisplayFromEnviron,
+    readFlagFromCmdline,
     summariseViewerBrowser,
     type ViewerBrowserSummary,
     detectMissingViewerTools,
@@ -70,7 +73,7 @@ import {
     planViewerInstall,
     spawnDetached,
 } from '@/daemon/remoteViewer';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import {
     addDaemonTerminalSession,
     getDaemonTerminalSession,
@@ -237,6 +240,20 @@ interface DaemonToServerEvents {
     'proxy-ws-data': (payload: { tunnelId: string; dataB64: string }) => void;
     'proxy-ws-close': (payload: { tunnelId: string }) => void;
 }
+
+type BrowserPairResult = {
+    ok: boolean;
+    message: string;
+    connections: Array<{ profile: string; pairingId?: string }>;
+    freshProfiles: string[];
+    debuggerTier: boolean | null;
+};
+
+type ViewerBridgeSummary =
+    | { bridgeReady: true; bridgeMessage?: undefined }
+    | { bridgeReady: false; bridgeMessage: string };
+
+type ViewerBrowserState = ViewerBrowserSummary & Partial<ViewerBridgeSummary>;
 
 type MachineRpcHandlers = {
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
@@ -842,17 +859,7 @@ export class ApiMachineClient {
             if (!Number.isInteger(cdpPort) || cdpPort <= 0) {
                 throw new Error('cdpPort is required');
             }
-            // Same sequence the CLI runs — reused, not reimplemented, so the
-            // two paths cannot drift (specs/browser-setup-gui/ AC6).
-            const facts = await runPairing({ cdpPort, debuggerTier: params?.debuggerTier !== false });
-            const outcome = formatPairOutcome(facts);
-            return {
-                ok: outcome.ok,
-                message: stripAnsi(outcome.text),
-                connections: facts.connections,
-                freshProfiles: facts.freshProfiles,
-                debuggerTier: facts.debuggerTierActual ?? null,
-            };
+            return this.pairBrowser(cdpPort, params?.debuggerTier !== false);
         });
 
         // Remote browser screen (noVNC) — lets the user open any site and log
@@ -1139,7 +1146,7 @@ export class ApiMachineClient {
     private async ensureViewerBrowser(
         display: string,
         callerWillLaunchBrowser: boolean,
-    ): Promise<ViewerBrowserSummary> {
+    ): Promise<ViewerBrowserState> {
         if (decideViewerBrowserAction({ liveCdpPort: null, callerWillLaunchBrowser }).action === 'defer') {
             return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
         }
@@ -1149,21 +1156,34 @@ export class ApiMachineClient {
         // screen (dev, 2026-08-15).
         if (!chrome) return summariseViewerBrowser({ chromeInstalled: false, cdpPort: null });
 
-        let liveCdpPort: number | null = null;
-        for (const port of CDP_PORT_RANGE) {
-            if (await isCdpReachable(port)) { liveCdpPort = port; break; }
-        }
-        const decision = decideViewerBrowserAction({ liveCdpPort, callerWillLaunchBrowser });
-        if (decision.action === 'reuse') {
-            return summariseViewerBrowser({ chromeInstalled: true, cdpPort: decision.cdpPort });
-        }
-
-        const cdpPort = await pickFreeCdpPort();
-        if (cdpPort === null) return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
         const userDataDir = resolveProfileUserDataDir(
             join(configuration.happyHomeDir, 'chrome-profiles'),
             'default',
         );
+        const running = await scanChromeProcesses();
+        let liveCdpPort: number | null = null;
+        for (const port of CDP_PORT_RANGE) {
+            if (!running.some((process) => process.cdpPort === port && process.display === display)) continue;
+            if (await isCdpReachable(port)) { liveCdpPort = port; break; }
+        }
+        const decision = decideViewerBrowserAction({ liveCdpPort, callerWillLaunchBrowser });
+        if (decision.action === 'reuse') {
+            return {
+                ...summariseViewerBrowser({ chromeInstalled: true, cdpPort: decision.cdpPort }),
+                ...await this.pairViewerBrowser(decision.cdpPort),
+            };
+        }
+
+        // The default profile is a Chrome singleton. If a headless or other-
+        // display Chrome holds it, launching another one cannot put that
+        // logged-in profile on noVNC; fail honestly instead of pairing the
+        // invisible process or waiting through two doomed launch attempts.
+        if (running.some((process) => process.userDataDir === userDataDir)) {
+            return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
+        }
+
+        const cdpPort = await pickFreeCdpPort();
+        if (cdpPort === null) return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
         const env = { DISPLAY: display };
         launchChrome(chrome.path, { userDataDir, cdpPort, headless: false }, env);
         let up = await waitForCdp(cdpPort, 15_000);
@@ -1172,7 +1192,41 @@ export class ApiMachineClient {
             launchChrome(chrome.path, { userDataDir, cdpPort, headless: false, noSandbox: true }, env);
             up = await waitForCdp(cdpPort, 15_000);
         }
-        return summariseViewerBrowser({ chromeInstalled: true, cdpPort: up ? cdpPort : null });
+        const browser = summariseViewerBrowser({ chromeInstalled: true, cdpPort: up ? cdpPort : null });
+        if (!browser.browserReady) return browser;
+        return { ...browser, ...await this.pairViewerBrowser(cdpPort) };
+    }
+
+    /**
+     * The shared browser-pairing contract behind both the explicit setup RPC
+     * and the noVNC viewer. Keeping the existing runPairing sequence here
+     * preserves extension injection, token storage, and debugger-tier checks.
+     */
+    private async pairBrowser(cdpPort: number, debuggerTier: boolean, pairingId?: string): Promise<BrowserPairResult> {
+        const facts = await runPairing({ cdpPort, debuggerTier, pairingId });
+        const outcome = formatPairOutcome(facts);
+        return {
+            ok: outcome.ok,
+            message: stripAnsi(outcome.text),
+            connections: facts.connections,
+            freshProfiles: facts.freshProfiles,
+            debuggerTier: facts.debuggerTierActual ?? null,
+        };
+    }
+
+    /** Pairing failure must not hide the login screen used to repair it. */
+    private async pairViewerBrowser(cdpPort: number): Promise<ViewerBridgeSummary> {
+        try {
+            const result = await this.pairBrowser(cdpPort, true, `viewer-${cdpPort}-${randomUUID()}`);
+            return result.ok
+                ? { bridgeReady: true }
+                : { bridgeReady: false, bridgeMessage: result.message };
+        } catch (error) {
+            return {
+                bridgeReady: false,
+                bridgeMessage: error instanceof Error ? error.message : '브라우저 브리지를 연결하지 못했습니다.',
+            };
+        }
     }
 
     private requestServerAutomationSync(): void {
@@ -1888,6 +1942,39 @@ async function pickFreeCdpPort(): Promise<number | null> {
         if (await isPortFree(port)) return port;
     }
     return null;
+}
+
+type RunningChrome = {
+    cdpPort: number | null;
+    userDataDir: string | null;
+    display: string | null;
+};
+
+/** Chrome process facts that CDP itself does not expose. */
+async function scanChromeProcesses(): Promise<RunningChrome[]> {
+    let entries: string[];
+    try {
+        entries = await readdir('/proc');
+    } catch {
+        return [];
+    }
+    const running: RunningChrome[] = [];
+    for (const pid of entries) {
+        if (!/^\d+$/.test(pid)) continue;
+        try {
+            const cmdline = await readFile(`/proc/${pid}/cmdline`, 'utf8');
+            const port = readFlagFromCmdline(cmdline, '--remote-debugging-port');
+            if (port === null) continue;
+            running.push({
+                cdpPort: Number(port) || null,
+                userDataDir: readFlagFromCmdline(cmdline, '--user-data-dir'),
+                display: readDisplayFromEnviron(await readFile(`/proc/${pid}/environ`, 'utf8')),
+            });
+        } catch {
+            // The process may exit between listing /proc and reading it.
+        }
+    }
+    return running;
 }
 
 /** Chrome needs a moment before its CDP endpoint answers. */

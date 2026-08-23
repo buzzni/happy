@@ -21,6 +21,11 @@ export function parseAutoConnectParams(search) {
     const host = (params.get('host') ?? '').trim()
     if (host) result.host = host
 
+    // An opaque per-run marker lets the daemon prove which Chrome loaded the
+    // link without replacing the user's stable bridge profile name.
+    const pairingId = (params.get('pairingId') ?? '').trim()
+    if (pairingId) result.pairingId = pairingId
+
     // Absent must stay absent rather than becoming `false`: a machine that
     // re-pairs (new token, same profile) would otherwise silently switch the
     // debugger tier back off for a user who had turned it on.

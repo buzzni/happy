@@ -8,6 +8,8 @@ import {
     buildX11vncArgs,
     buildXvfbArgs,
     planViewerInstall,
+    readDisplayFromEnviron,
+    readFlagFromCmdline,
     VIEWER_TOOLS,
 } from './remoteViewer'
 
@@ -236,5 +238,22 @@ describe('summariseViewerBrowser', () => {
         const summary = summariseViewerBrowser({ chromeInstalled: true, cdpPort: 9222 })
 
         expect(summary).toEqual({ browserReady: true, cdpPort: 9222 })
+    })
+})
+
+describe('viewer Chrome process facts', () => {
+    it('distinguishes the viewer display from a headless process', () => {
+        expect(readDisplayFromEnviron('PATH=/usr/bin\0DISPLAY=:99\0HOME=/home/coder')).toBe(':99')
+        expect(readDisplayFromEnviron('PATH=/usr/bin\0HOME=/home/coder')).toBeNull()
+        expect(readDisplayFromEnviron('WAYLAND_DISPLAY=wayland-0')).toBeNull()
+    })
+
+    it('reads only whole Chrome flag arguments', () => {
+        const chrome = '/usr/bin/google-chrome\0--remote-debugging-port=9222\0--user-data-dir=/x'
+        const shell = '/bin/sh\0-c\0pgrep -f -- "--remote-debugging-port=9222"'
+
+        expect(readFlagFromCmdline(chrome, '--remote-debugging-port')).toBe('9222')
+        expect(readFlagFromCmdline(chrome, '--user-data-dir')).toBe('/x')
+        expect(readFlagFromCmdline(shell, '--remote-debugging-port')).toBeNull()
     })
 })
