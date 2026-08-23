@@ -930,6 +930,9 @@ importers:
       '@anthropic-ai/sdk':
         specifier: 0.96.0
         version: 0.96.0(zod@4.4.3)
+      '@buzzni/saycode-cli':
+        specifier: 0.2.2
+        version: 0.2.2
       '@modelcontextprotocol/sdk':
         specifier: 1.29.0
         version: 1.29.0(zod@4.4.3)
@@ -1955,6 +1958,11 @@ packages:
 
   '@bufbuild/protobuf@1.10.1':
     resolution: {integrity: sha512-wJ8ReQbHxsAfXhrf9ixl0aYbZorRuOWpBNzm8pL8ftmSxQx/wnJD5Eg861NwJU/czy2VXFIebCeZnZrI9rktIQ==}
+
+  '@buzzni/saycode-cli@0.2.2':
+    resolution: {integrity: sha512-A0eGVYCys+s7cgdQNeP7jIa4lJIs9+X6E2P4wRSRORkfmXoiJU+uE4yOVaxaOze+nDtRbu8DDPbRAfUHm26QMg==}
+    engines: {node: '>=20'}
+    hasBin: true
 
   '@chevrotain/cst-dts-gen@11.0.3':
     resolution: {integrity: sha512-BvIKpRLeS/8UbfxXxgC33xOumsacaeCKAjAeLyOn7Pcp95HiRbrpl14S+9vaZLolnbssPIUuiUd8IvgkRyt6NQ==}
@@ -13605,6 +13613,8 @@ snapshots:
       css-tree: 3.2.1
 
   '@bufbuild/protobuf@1.10.1': {}
+
+  '@buzzni/saycode-cli@0.2.2': {}
 
   '@chevrotain/cst-dts-gen@11.0.3':
     dependencies:

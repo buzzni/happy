@@ -23,6 +23,7 @@ function createPublishTarball(
         brokenFastifyRuntime?: boolean
         nativeHelperExecutable?: boolean
         omitNativeMessagingPermission?: boolean
+        omitSaycodeAgent?: boolean
     } = {}
 ): string {
     const fixtureRoot = mkdtempSync(join(tmpdir(), 'happy-cli-guard-test-'))
@@ -34,12 +35,14 @@ function createPublishTarball(
         version: packageVersion,
         bin: { happy: 'bin/happy.mjs' },
         dependencies: {
+            '@buzzni/saycode-cli': '0.2.2',
             '@slopus/happy-wire': '0.0.0-test',
             zod: '0.0.0-test',
             '@paralleldrive/cuid2': '0.0.0-test',
             fastify: '0.0.0-test'
         },
         bundledDependencies: [
+            '@buzzni/saycode-cli',
             '@slopus/happy-wire',
             'zod',
             '@paralleldrive/cuid2',
@@ -54,11 +57,14 @@ function createPublishTarball(
         'bin/happy.mjs',
         [
             `import { writeFileSync } from 'node:fs'`,
+            `import { spawnSync } from 'node:child_process'`,
             `import { join } from 'node:path'`,
+            `import { fileURLToPath } from 'node:url'`,
             options.writeHomeSentinel
                 ? `writeFileSync(join(process.env.HOME, 'guard-cli-was-here'), 'touched')`
                 : '',
             `if (process.argv.includes('--version')) console.log('happy version: ' + ${JSON.stringify(cliVersion)} + ${JSON.stringify(options.extraVersionOutput ?? '')})`,
+            `if (process.argv[2] === 'agent') { const child = spawnSync(process.execPath, [fileURLToPath(new URL('../node_modules/@buzzni/saycode-cli/index.mjs', import.meta.url)), ...process.argv.slice(2)], { encoding: 'utf8' }); process.stdout.write(child.stdout || ''); process.stderr.write(child.stderr || ''); process.exit(child.status ?? 1) }`,
             `if (process.argv[2] === 'daemon' && process.argv[3] === 'preflight') { const { createRequire } = await import('node:module'); const require = createRequire(import.meta.url); const app = require('fastify')({ logger: false }); await app.ready(); await app.close() }`
         ].filter(Boolean).join('\n')
     )
@@ -66,6 +72,19 @@ function createPublishTarball(
     writeFixtureFile(packageRoot, 'bin/happy-browser-native-host.mjs', '#!/usr/bin/env node\n')
     chmodSync(nativeHelper, options.nativeHelperExecutable === false ? 0o644 : 0o755)
     writeFixtureFile(packageRoot, 'dist/browserNativeMessagingHost.mjs', 'export {}\n')
+    if (!options.omitSaycodeAgent) {
+        writeFixtureFile(packageRoot, 'node_modules/@buzzni/saycode-cli/package.json', JSON.stringify({
+            name: '@buzzni/saycode-cli',
+            version: '0.2.2',
+            type: 'module',
+            bin: { saycode: './index.mjs' }
+        }))
+        writeFixtureFile(
+            packageRoot,
+            'node_modules/@buzzni/saycode-cli/index.mjs',
+            `if (process.argv.includes('--help')) console.log('Agent commands')\n`
+        )
+    }
     writeFixtureFile(packageRoot, 'node_modules/@slopus/happy-wire/package.json', JSON.stringify({ name: '@slopus/happy-wire', version: '0.0.0-test' }))
     writeFixtureFile(packageRoot, 'node_modules/@slopus/happy-wire/dist/index.mjs', 'export {};\n')
     writeFixtureFile(packageRoot, 'node_modules/zod/package.json', JSON.stringify({ name: 'zod', version: '0.0.0-test' }))
@@ -113,6 +132,19 @@ afterEach(() => {
 })
 
 describe('guard-publish-artifact', () => {
+    it('rejects an installed artifact that does not expose the bundled Saycode agent facade', () => {
+        const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', {
+            omitSaycodeAgent: true
+        })
+        const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball, '--install-smoke'], {
+            encoding: 'utf8',
+            timeout: 30_000
+        })
+
+        expect(result.status).toBe(1)
+        expect(result.stderr).toContain('Saycode agent facade')
+    }, 40_000)
+
     it('accepts an installed CLI whose reported Happy version matches package metadata', () => {
         const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56')
         const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball, '--install-smoke'], {
