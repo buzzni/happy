@@ -191,6 +191,18 @@ export const it: TranslationStructure = {
     },
 
     settingsFeatures: {
+        saycodeGroupTitle: "Istruzioni Saycode",
+        saycodeGroupFooter: "La generazione del titolo della chat è sempre attiva e non può essere disattivata: è ciò che permette di ritrovare una conversazione nella lista.",
+        saycodeMaster: "Usa le istruzioni Saycode",
+        saycodeMasterSubtitle: "Istruzioni di comportamento aggiunte da Saycode. I tuoi prompt, le istruzioni di progetto e le skill restano sempre.",
+        saycodeBlockOptionsGuidance: "Opzioni di risposta",
+        saycodeBlockOptionsGuidanceSubtitle: "Consente all'agente di offrire opzioni di risposta toccabili.",
+        saycodeBlockWorkerDelegation: "Delega del lavoro",
+        saycodeBlockWorkerDelegationSubtitle: "Affida il lavoro meccanico a un agente worker più economico.",
+        saycodeBlockAxBase: "Flusso di lavoro dalla pianificazione",
+        saycodeBlockAxBaseSubtitle: "Applica le istruzioni base del flusso AX.",
+        saycodeBlockCoAuthoredCredit: "Crediti dei commit",
+        saycodeBlockCoAuthoredCreditSubtitle: "Aggiunge le righe di co-autore di Claude e Happy ai messaggi di commit.",
         // Features settings screen
         experiments: 'Esperimenti',
         experimentsDescription: 'Abilita funzionalità sperimentali ancora in sviluppo. Queste funzionalità possono essere instabili o cambiare senza preavviso.',

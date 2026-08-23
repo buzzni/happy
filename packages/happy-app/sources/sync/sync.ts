@@ -22,7 +22,7 @@ import { syncCurrentPushToken } from './pushRegistration';
 import { Platform, AppState, type AppStateStatus } from 'react-native';
 import { isRunningOnMac } from '@/utils/platform';
 import { NormalizedMessage, normalizeRawMessage, RawRecord } from './typesRaw';
-import { applySettings, resolveSaycodeAppendSystemPrompt, resolveSaycodeSystemPromptEnabled, Settings, settingsDefaults, settingsParse, SUPPORTED_SCHEMA_VERSION } from './settings';
+import { applySettings, Settings, settingsDefaults, settingsParse, SUPPORTED_SCHEMA_VERSION } from './settings';
 import { syncPendingAccountSettings } from './accountSettingsSync';
 import { Profile, profileParse } from './profile';
 import { loadPendingSettings, savePendingSettings } from './persistence';
@@ -48,7 +48,7 @@ import { AsyncLock } from '@/utils/lock';
 import { voiceHooks } from '@/realtime/hooks/voiceHooks';
 import { Message } from './typesMessage';
 import { EncryptionCache } from './encryption/encryptionCache';
-import { systemPrompt } from './prompt/systemPrompt';
+import { buildSaycodeTurnMeta } from './saycodeTurnMeta';
 import { fetchArtifact, fetchArtifacts, createArtifact, updateArtifact } from './apiArtifacts';
 import { DecryptedArtifact, Artifact, ArtifactCreateRequest, ArtifactUpdateRequest } from './artifactTypes';
 import { ArtifactEncryption } from './encryption/artifactEncryption';
@@ -593,10 +593,12 @@ class Sync {
         }
 
         const modeMeta = resolveMessageModeMeta(session, storage.getState().settings);
-        const saycodeSystemPromptEnabled = resolveSaycodeSystemPromptEnabled({
+        const saycodeTurnMeta = buildSaycodeTurnMeta({
             preference: storage.getState().settings.saycodeSystemPromptEnabled,
+            overrides: storage.getState().settings.saycodePromptBlocks,
             surface: Platform.OS === 'web' ? 'web' : 'mobile',
         });
+        const saycodeSystemPromptEnabled = saycodeTurnMeta.saycodeSystemPromptEnabled;
         const { displayText, source = 'chat', attachments } = options ?? {};
 
         const flavor = session.metadata?.flavor;
@@ -702,10 +704,7 @@ class Sync {
         }
 
         // Create user message content with metadata
-        const appendSystemPrompt = resolveSaycodeAppendSystemPrompt({
-            enabled: saycodeSystemPromptEnabled,
-            prompt: systemPrompt,
-        });
+        const appendSystemPrompt = saycodeTurnMeta.appendSystemPrompt;
         const content: RawRecord = {
             role: 'user',
             content: {
@@ -716,6 +715,9 @@ class Sync {
                 sentFrom,
                 ...(appendSystemPrompt !== undefined ? { appendSystemPrompt } : {}),
                 saycodeSystemPromptEnabled,
+                ...(saycodeTurnMeta.saycodePromptBlocks !== undefined
+                    ? { saycodePromptBlocks: saycodeTurnMeta.saycodePromptBlocks }
+                    : {}),
                 ...(modeMeta.permissionMode !== undefined ? { permissionMode: modeMeta.permissionMode } : {}),
                 ...(modeMeta.model !== undefined ? { model: modeMeta.model } : {}),
                 ...(modeMeta.effort !== undefined ? { effort: modeMeta.effort } : {}),

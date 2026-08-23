@@ -194,6 +194,18 @@ export const ja: TranslationStructure = {
     },
 
     settingsFeatures: {
+        saycodeGroupTitle: "Saycode の指示",
+        saycodeGroupFooter: "チャットタイトルの生成は常に有効で、オフにできません。チャット一覧で会話を再び見つけるために必要です。",
+        saycodeMaster: "Saycode の指示を使用",
+        saycodeMasterSubtitle: "Saycode が追加する動作指示です。自分のプロンプト、プロジェクトの指示、スキルは常に維持されます。",
+        saycodeBlockOptionsGuidance: "回答の選択肢",
+        saycodeBlockOptionsGuidanceSubtitle: "エージェントがタップ可能な回答候補を提示できるようにします。",
+        saycodeBlockWorkerDelegation: "作業の委任",
+        saycodeBlockWorkerDelegationSubtitle: "機械的な作業を安価な worker エージェントに任せます。",
+        saycodeBlockAxBase: "企画から始めるワークフロー",
+        saycodeBlockAxBaseSubtitle: "AX ワークフローの基本指示を適用します。",
+        saycodeBlockCoAuthoredCredit: "コミットクレジット",
+        saycodeBlockCoAuthoredCreditSubtitle: "コミットメッセージに Claude と Happy の共同作成者行を追加します。",
         // Features settings screen
         experiments: '実験的機能',
         experimentsDescription: '開発中の実験的機能を有効にします。これらの機能は不安定であったり、予告なく変更される場合があります。',

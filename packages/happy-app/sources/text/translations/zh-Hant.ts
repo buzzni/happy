@@ -193,6 +193,18 @@ export const zhHant: TranslationStructure = {
     },
 
     settingsFeatures: {
+        saycodeGroupTitle: "Saycode 指令",
+        saycodeGroupFooter: "聊天標題產生一律開啟且無法關閉——它讓您能在聊天清單中重新找到對話。",
+        saycodeMaster: "使用 Saycode 指令",
+        saycodeMasterSubtitle: "Saycode 新增的行為指令。您自己的提示詞、專案指令與技能一律保留。",
+        saycodeBlockOptionsGuidance: "回答選項",
+        saycodeBlockOptionsGuidanceSubtitle: "讓智慧代理提供可點選的回答選項。",
+        saycodeBlockWorkerDelegation: "工作委派",
+        saycodeBlockWorkerDelegationSubtitle: "將機械性工作交給較廉價的 worker 代理。",
+        saycodeBlockAxBase: "從規劃開始的工作流程",
+        saycodeBlockAxBaseSubtitle: "套用 AX 工作流程的基礎指令。",
+        saycodeBlockCoAuthoredCredit: "提交署名",
+        saycodeBlockCoAuthoredCreditSubtitle: "在提交訊息中加入 Claude 與 Happy 的共同作者行。",
         // Features settings screen
         experiments: '實驗功能',
         experimentsDescription: '啟用仍在開發中的實驗功能。這些功能可能不穩定或會在沒有通知的情況下改變。',
