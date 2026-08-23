@@ -162,6 +162,12 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
                 chalk.dim(connections.length === 0
                     ? '  현재 연결된 프로필이 없습니다.'
                     : `  현재 연결: ${connections.map((connection) => connection.profile).join(', ')}`),
+                ...(loadUnpackedFailed
+                    ? [
+                        chalk.dim('  현재 CLI의 확장 번들로 갱신하지 못했습니다. Chrome을 아래 플래그로 다시 띄우세요:'),
+                        `  ${chalk.cyan('--enable-unsafe-extension-debugging')}`,
+                    ]
+                    : []),
             ].join('\n'),
         }
     }

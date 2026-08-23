@@ -111,6 +111,19 @@ describe('formatPairOutcome', () => {
         expect(outcome.text).toContain('viewer-9222')
     })
 
+    it('explains a failed extension refresh when the old visible bundle cannot emit the target marker', () => {
+        const outcome = formatPairOutcome({
+            ...base,
+            loadUnpackedFailed: true,
+            targetPairingId: 'viewer-9222',
+            connections: [{ profile: 'work' }],
+            freshProfiles: [],
+        })
+
+        expect(outcome.ok).toBe(false)
+        expect(outcome.text).toContain('--enable-unsafe-extension-debugging')
+    })
+
     it('leads with the daemon when it is not running — nothing below it can work', () => {
         const outcome = formatPairOutcome({ ...base, daemonRunning: false, connections: [] })
         expect(outcome.ok).toBe(false)

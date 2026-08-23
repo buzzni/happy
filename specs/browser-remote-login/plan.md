@@ -177,3 +177,8 @@ CLI typecheck/build, staged artifact guard/install smoke가 통과했다.
 unpacked extension을 다시 로드하며 일반 수동 페어링의 기존 fast path는 보존한다.
 확장 188개, CLI 관련 168개 테스트와 CLI typecheck/build, staged artifact
 guard/install smoke가 통과했다.
+
+3차 리뷰에서는 기존 확장이 보여도 최신 번들 갱신이 실패한 target-marker 오류가 실제
+원인을 숨기던 진단 누락을 수정했다. 실패 메시지가 Chrome 재기동에 필요한
+`--enable-unsafe-extension-debugging` 플래그를 직접 안내한다.
+Happy CLI 관련 169개 테스트와 typecheck/build가 통과했다.
