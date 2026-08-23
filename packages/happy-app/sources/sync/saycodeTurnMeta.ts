@@ -99,12 +99,19 @@ export function buildSaycodeTurnMeta({
         const value = overrides?.[block.id];
         if (typeof value === 'boolean') cliWire[block.id] = value;
     }
+    // happy-cli strips every saycode-owned sentinel block from appendSystemPrompt when
+    // the master flag is off (resolveSaycodeAppendSystemPromptForMessage). A block the
+    // user explicitly overrode on must survive that strip, so under master-off it
+    // travels unwrapped; under master-on the CLI never strips and the wrapper stays as
+    // the provenance marker.
+    const appendSystemPrompt = !optionsGuidanceEnabled
+        ? undefined
+        : saycodeSystemPromptEnabled
+            ? resolveSaycodeAppendSystemPrompt({ enabled: true, prompt: systemPrompt })
+            : systemPrompt;
     return {
         saycodeSystemPromptEnabled,
-        appendSystemPrompt: resolveSaycodeAppendSystemPrompt({
-            enabled: optionsGuidanceEnabled,
-            prompt: systemPrompt,
-        }),
+        appendSystemPrompt,
         saycodePromptBlocks: Object.keys(cliWire).length > 0 ? cliWire : undefined,
     };
 }

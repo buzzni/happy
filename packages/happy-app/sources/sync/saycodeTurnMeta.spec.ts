@@ -54,7 +54,12 @@ describe('buildSaycodeTurnMeta', () => {
             overrides: { optionsGuidance: true },
             surface: 'mobile',
         });
-        expect(meta.appendSystemPrompt).toContain('<!-- saycode:owned-prompt -->');
+        // happy-cli strips every saycode-owned sentinel block from appendSystemPrompt
+        // when the master flag is off — wrapping here would let the CLI silently undo
+        // the user's explicit override. Under master-off the surviving block must
+        // travel unwrapped; under master-on the CLI never strips, so wrapping stays.
+        expect(meta.appendSystemPrompt).toContain('# Options');
+        expect(meta.appendSystemPrompt).not.toContain('<!-- saycode:owned-prompt -->');
         expect(meta.saycodeSystemPromptEnabled).toBe(false);
     });
 });
