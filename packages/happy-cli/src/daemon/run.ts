@@ -52,7 +52,10 @@ import { join } from 'path';
 import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
-import { scrubSessionLineageEnv, SESSION_LINEAGE_ENV_PREFIXES } from './sessionEnv';
+import {
+  buildSessionSpawnEnvironment,
+  SESSION_LINEAGE_ENV_PREFIXES,
+} from './sessionEnv';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
@@ -921,13 +924,7 @@ export async function startDaemon(): Promise<void> {
           const windowName = `happy-${Date.now()}-${agent}`;
           // Explicit agent auth and task callbacks are overlaid after inherited
           // credentials are filtered, so isolated tasks keep only what they need.
-          const daemonEnvFiltered = scrubSessionLineageEnv(
-            inheritedSpawnEnvironment,
-          );
-          const tmuxEnv: Record<string, string> = {
-            ...daemonEnvFiltered,
-            ...extraEnv,
-          };
+          const tmuxEnv = buildSessionSpawnEnvironment(inheritedSpawnEnvironment, extraEnv);
 
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
             sessionName: tmuxSessionName,
@@ -1011,10 +1008,7 @@ export async function startDaemon(): Promise<void> {
             // scrub: 상속된 lineage env(HAPPY_RECONNECT_*/HAPPY_FORK*)가 새
             // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
             // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
-            env: {
-              ...scrubSessionLineageEnv(inheritedSpawnEnvironment),
-              ...extraEnv
-            },
+            env: buildSessionSpawnEnvironment(inheritedSpawnEnvironment, extraEnv),
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
             userHomeDir: stagedUserHomeDir,
@@ -1318,8 +1312,7 @@ export async function startDaemon(): Promise<void> {
           filterCredentials: options?.automation !== undefined,
         });
         const mcpEnvironment = prepareMcpChildEnvironment({
-          environmentVariables: {
-            ...scrubSessionLineageEnv(inheritedResumeEnvironment),
+          environmentVariables: buildSessionSpawnEnvironment(inheritedResumeEnvironment, {
             ...(options?.automation?.environmentVariables ?? {}),
             ...reconnectEnvironment,
             // user-credential 세션은 원래 계정의 스테이징 자격증명으로 복원 —
@@ -1332,7 +1325,7 @@ export async function startDaemon(): Promise<void> {
               HAPPY_AUTOMATION_RESUME_PROMPT: '1',
               HAPPY_AUTOMATION_RUN_ONCE: '1',
             } : {}),
-          },
+          }),
           mcpCallerGrantEnvelope: options?.mcpCallerGrantEnvelope,
           mcpConfigProjectId: options?.mcpConfigProjectId,
           expectedConnectors: options?.expectedConnectors,

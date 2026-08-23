@@ -33,3 +33,14 @@ export function scrubSessionLineageEnv(env: NodeJS.ProcessEnv): Record<string, s
     }
     return scrubbed
 }
+
+/** Builds one child environment after removing stale inherited lineage. */
+export function buildSessionSpawnEnvironment(
+    inherited: NodeJS.ProcessEnv,
+    explicit: Record<string, string>,
+): Record<string, string> {
+    return {
+        ...scrubSessionLineageEnv(inherited),
+        ...explicit,
+    }
+}

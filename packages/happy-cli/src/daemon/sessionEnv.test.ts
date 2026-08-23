@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { scrubSessionLineageEnv, SESSION_LINEAGE_ENV_PREFIXES } from './sessionEnv'
+import {
+    buildSessionSpawnEnvironment,
+    scrubSessionLineageEnv,
+    SESSION_LINEAGE_ENV_PREFIXES,
+} from './sessionEnv'
 
 describe('scrubSessionLineageEnv', () => {
     it('removes reconnect and fork lineage variables while keeping everything else', () => {
@@ -54,5 +58,25 @@ describe('scrubSessionLineageEnv', () => {
         // APLUS_SESSION_* is first-set-wins (sessionUrlEnv.ts): without the
         // scrub, a nested child session would keep the parent's session URL.
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('APLUS_SESSION_')
+    })
+})
+
+describe('buildSessionSpawnEnvironment', () => {
+    it('scrubs inherited lineage before applying the explicit spawn environment', () => {
+        expect(buildSessionSpawnEnvironment(
+            {
+                PATH: '/usr/bin',
+                HAPPY_RECONNECT_SESSION_ID: 'stale-session',
+                APLUS_SESSION_ID: 'parent-session',
+            },
+            {
+                HAPPY_RECONNECT_SESSION_ID: 'target-session',
+                TASK_TOKEN: 'task-token',
+            },
+        )).toEqual({
+            PATH: '/usr/bin',
+            HAPPY_RECONNECT_SESSION_ID: 'target-session',
+            TASK_TOKEN: 'task-token',
+        })
     })
 })
