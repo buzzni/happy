@@ -47,7 +47,7 @@ import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation
 import { shouldYieldDaemonStateOwnership } from './daemonStateOwnership';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
-import { openSync, statSync } from 'fs';
+import { openSync, statSync, writeSync } from 'fs';
 import type { SpawnOptions } from 'node:child_process';
 import { join } from 'path';
 import { projectPath } from '@/projectPath';
@@ -181,9 +181,13 @@ export const initialMachineMetadata: MachineMetadata = {
  * if the file cannot be opened; losing output is better than blocking the
  * handoff.
  */
-function openHandoffReplacementStdio(): SpawnOptions['stdio'] {
+function openHandoffReplacementStdio(attempt: number): SpawnOptions['stdio'] {
   try {
     const fd = openSync(join(configuration.logsDir, 'daemon-handoff-replacement.log'), 'a');
+    // One file accumulates every handoff on this machine, and a replacement
+    // that dies early writes an unattributed stderr blob. Without this marker
+    // the reader cannot tell which handoff — or which attempt — produced it.
+    writeSync(fd, `\n--- handoff from pid ${process.pid} (attempt ${attempt}) at ${new Date().toISOString()} ---\n`);
     return ['ignore', fd, fd];
   } catch (error) {
     logger.debug('[DAEMON RUN] Could not open handoff replacement log; spawning without captured output', error);
@@ -2177,7 +2181,7 @@ export async function startDaemon(): Promise<void> {
             return spawnDetachedHappyCLI(['daemon', 'start'], {
               // Never 'ignore': if the replacement dies before it can open its
               // own log file, this is the only place its failure is recorded.
-              stdio: openHandoffReplacementStdio(),
+              stdio: openHandoffReplacementStdio(attempt),
             });
           },
         });

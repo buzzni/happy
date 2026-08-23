@@ -73,6 +73,16 @@ control server 를 띄울 수 있다" 만 증명하지, 실제 기동 성공을 
 - **R5** 모든 재시도가 실패하면 조용히 끝내지 않는다. 이 프로세스는 더 이상
   daemon 이 아니므로 명확히 로그를 남기고 비정상 종료 코드로 끝낸다.
 - **R6** D4 의 로그 문구를 실제 동작에 맞춘다.
+- **R7** 타임아웃 시 자식을 죽이지 않는다. 이웃한 `preflightInstalledHappyCLI` 는
+  죽이지만 그쪽 자식은 일회용 probe 이고, 이쪽은 머신의 유일한 daemon 이 보고만
+  늦은 것일 수 있다. 여기서 죽이면 이 함수가 막으려는 장애를 그대로 재현한다.
+  타임아웃은 "시작 못 함" 이 아니라 "확인 못 함" 이다.
+- **R8** 재시도 사이에 간격을 둔다. 재시도할 가치가 있는 실패는 일시적 자원
+  실패(메모리 압박 하의 fork, EAGAIN)인데, 같은 몇 밀리초 안에 3번 시도하면
+  한 번 실패할 것을 세 번 실패할 뿐이다.
+- **R9** 후임 로그에 handoff·시도 구분자를 남긴다. 파일 하나에 모든 handoff 가
+  누적되므로 구분자가 없으면 일찍 죽은 후임의 stderr 를 어느 handoff 것인지
+  귀속시킬 수 없다.
 
 ## 비목표
 
@@ -84,6 +94,22 @@ control server 를 띄울 수 있다" 만 증명하지, 실제 기동 성공을 
 - **`clearDaemonState` 가 상태 파일을 남기는 동작 자체는 그대로 둔다.** 추적
   세션 기록이 후임의 복구 근거다. 고치는 것은 문구뿐이다.
 - 번들 교체 빈도(이 저녁 95분간 6회) 자체는 다루지 않는다.
+
+## 재시도의 부작용 검토
+
+R4 의 재시도는 이론상 두 개의 `daemon start` 를 띄울 수 있다 — 1차 spawn 이
+실제로는 성공했는데 `'spawn'` 보고가 타임아웃을 넘긴 경우다. 기존 장치로
+수렴한다고 판단했다:
+
+- `acquireDaemonLock` 이 O_EXCL 락이라 진 쪽이 `exit(0)` 한다.
+- `prepareDaemonStartup` 의 `isDaemonRunningCurrentlyInstalledHappyVersion()` 이
+  같은 버전이 이미 떠 있으면 `'already-running'` 으로 물러난다.
+- 여러 `daemon start` 폴러가 죽은 pid 를 상태 파일에 되써 멀쩡한 daemon 을
+  자살시키던 `daemon-handoff-state-race` 는 `writeDaemonStateIfUnchanged` 가드로
+  이미 닫혀 있다.
+
+즉 최악의 경우에도 daemon 은 하나로 수렴하며, 재시도가 없을 때의 결과(daemon
+영구 부재)보다 항상 낫다.
 
 ## 알려진 한계
 

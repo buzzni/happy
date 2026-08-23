@@ -61,11 +61,18 @@ export async function handoffToReplacedBundle({
   teardownCurrentDaemon,
   spawnReplacement,
   spawnAttempts = 3,
+  waitBetweenAttempts = (attempt) => new Promise(resolve => setTimeout(resolve, attempt * 500)),
 }: {
   preflightReplacement: () => Promise<boolean>
   teardownCurrentDaemon: () => Promise<void>
   spawnReplacement: (attempt: number) => Promise<boolean>
   spawnAttempts?: number
+  /**
+   * Spacing between attempts. The failures worth retrying here are transient
+   * resource ones (fork under memory pressure, EAGAIN); retrying those within
+   * the same few milliseconds just fails three times instead of once.
+   */
+  waitBetweenAttempts?: (attempt: number) => Promise<void>
 }): Promise<'kept-current' | 'handed-off' | 'replacement-not-started'> {
   if (!await preflightReplacement()) {
     return 'kept-current'
@@ -81,6 +88,10 @@ export async function handoffToReplacedBundle({
     } catch {
       // Treat a throwing attempt like a failed one — the next attempt is the
       // only thing that can still put a daemon back on this machine.
+    }
+
+    if (attempt < spawnAttempts) {
+      await waitBetweenAttempts(attempt)
     }
   }
 

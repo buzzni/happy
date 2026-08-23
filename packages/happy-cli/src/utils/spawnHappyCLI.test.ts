@@ -127,6 +127,18 @@ describe('spawnDetachedHappyCLI', () => {
     await expect(started).resolves.toBe(false)
   })
 
+  // Deliberately unlike preflightInstalledHappyCLI, which kills its child on
+  // timeout. That child is a throwaway probe; this one may be the machine's
+  // only daemon, merely slow to report. Killing it would recreate the very
+  // outage this function exists to prevent.
+  it('never kills the child, even when the spawn report times out', async () => {
+    const child = makeChild()
+
+    await spawnDetachedHappyCLI(['daemon', 'start'], { spawn: () => child, timeoutMs: 10 })
+
+    expect(child.kill).not.toHaveBeenCalled()
+  })
+
   it('reports failure when spawning throws synchronously', async () => {
     const spawn = vi.fn(() => { throw new Error('entrypoint missing') })
 

@@ -223,8 +223,13 @@ export async function spawnDetachedHappyCLI(
       resolve(started)
     }
 
+    // NOTE: no `child.kill()` here, unlike preflightInstalledHappyCLI below.
+    // Its child is a throwaway probe; ours may be the machine's only daemon
+    // that was merely slow to report. Killing it would recreate the outage
+    // this function exists to prevent. A timeout here means "could not
+    // confirm", not "did not start".
     const timer = setTimeout(() => {
-      logger.debug(`[SPAWN HAPPY CLI] Detached spawn of \`${description}\` did not start within ${timeoutMs}ms`)
+      logger.debug(`[SPAWN HAPPY CLI] Detached spawn of \`${description}\` did not report starting within ${timeoutMs}ms; leaving it alone`)
       finish(false)
     }, timeoutMs)
 
