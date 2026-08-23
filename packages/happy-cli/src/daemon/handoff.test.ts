@@ -99,10 +99,56 @@ describe('handoffToReplacedBundle', () => {
     const result = await handoffToReplacedBundle({
       preflightReplacement: async () => { events.push('preflight'); return true },
       teardownCurrentDaemon: async () => { events.push('teardown') },
-      spawnReplacement: () => { events.push('spawn') },
+      spawnReplacement: async () => { events.push('spawn'); return true },
     })
 
     expect(result).toBe('handed-off')
     expect(events).toEqual(['preflight', 'teardown', 'spawn'])
+  })
+
+  it('retries the spawn when the replacement process never starts', async () => {
+    const spawnReplacement = vi.fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true)
+
+    const result = await handoffToReplacedBundle({
+      preflightReplacement: async () => true,
+      teardownCurrentDaemon: async () => { },
+      spawnReplacement,
+      spawnAttempts: 3,
+    })
+
+    expect(result).toBe('handed-off')
+    expect(spawnReplacement).toHaveBeenCalledTimes(2)
+  })
+
+  it('reports the replacement never started after exhausting every attempt', async () => {
+    const spawnReplacement = vi.fn(async () => false)
+
+    const result = await handoffToReplacedBundle({
+      preflightReplacement: async () => true,
+      teardownCurrentDaemon: async () => { },
+      spawnReplacement,
+      spawnAttempts: 3,
+    })
+
+    expect(result).toBe('replacement-not-started')
+    expect(spawnReplacement).toHaveBeenCalledTimes(3)
+  })
+
+  it('keeps retrying when a spawn attempt throws', async () => {
+    const spawnReplacement = vi.fn()
+      .mockRejectedValueOnce(new Error('EAGAIN'))
+      .mockResolvedValueOnce(true)
+
+    const result = await handoffToReplacedBundle({
+      preflightReplacement: async () => true,
+      teardownCurrentDaemon: async () => { },
+      spawnReplacement,
+      spawnAttempts: 3,
+    })
+
+    expect(result).toBe('handed-off')
+    expect(spawnReplacement).toHaveBeenCalledTimes(2)
   })
 })

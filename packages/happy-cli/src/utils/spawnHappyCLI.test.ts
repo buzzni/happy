@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
-import { preflightInstalledHappyCLI, resolveHappyCliSpawnCommand } from './spawnHappyCLI';
+import { preflightInstalledHappyCLI, resolveHappyCliSpawnCommand, spawnDetachedHappyCLI } from './spawnHappyCLI';
 
 describe('resolveHappyCliSpawnCommand', () => {
   it('uses the source entrypoint when the current CLI is running from source', () => {
@@ -72,5 +72,77 @@ describe('preflightInstalledHappyCLI', () => {
     child.emit('exit', 1)
 
     await expect(preflight).resolves.toBe(false)
+  })
+})
+
+describe('spawnDetachedHappyCLI', () => {
+  const makeChild = () => {
+    const child = new EventEmitter() as ChildProcess
+    child.kill = vi.fn()
+    child.unref = vi.fn()
+    return child
+  }
+
+  it('resolves only after the child reports it was spawned', async () => {
+    const child = makeChild()
+    const spawn = vi.fn(() => child)
+
+    const started = spawnDetachedHappyCLI(['daemon', 'start'], { spawn, timeoutMs: 1_000 })
+
+    // The OS has not exec'd the child yet — the handoff must not consider
+    // itself done, because exiting here is what loses the replacement.
+    let settled = false
+    void started.then(() => { settled = true })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    child.emit('spawn')
+
+    await expect(started).resolves.toBe(true)
+  })
+
+  it('unrefs the child so the detached replacement outlives this process', async () => {
+    const child = makeChild()
+    const started = spawnDetachedHappyCLI(['daemon', 'start'], { spawn: () => child, timeoutMs: 1_000 })
+
+    child.emit('spawn')
+    await started
+
+    expect(child.unref).toHaveBeenCalled()
+  })
+
+  it('reports failure when the child errors instead of spawning', async () => {
+    const child = makeChild()
+    const started = spawnDetachedHappyCLI(['daemon', 'start'], { spawn: () => child, timeoutMs: 1_000 })
+
+    child.emit('error', new Error('EAGAIN'))
+
+    await expect(started).resolves.toBe(false)
+  })
+
+  it('reports failure when the spawn never reports either way', async () => {
+    const child = makeChild()
+    const started = spawnDetachedHappyCLI(['daemon', 'start'], { spawn: () => child, timeoutMs: 10 })
+
+    await expect(started).resolves.toBe(false)
+  })
+
+  it('reports failure when spawning throws synchronously', async () => {
+    const spawn = vi.fn(() => { throw new Error('entrypoint missing') })
+
+    await expect(
+      spawnDetachedHappyCLI(['daemon', 'start'], { spawn, timeoutMs: 1_000 })
+    ).resolves.toBe(false)
+  })
+
+  it('spawns detached so the replacement survives this process exiting', async () => {
+    const child = makeChild()
+    const spawn = vi.fn(() => child)
+
+    const started = spawnDetachedHappyCLI(['daemon', 'start'], { spawn, timeoutMs: 1_000 })
+    child.emit('spawn')
+    await started
+
+    expect(spawn).toHaveBeenCalledWith(['daemon', 'start'], expect.objectContaining({ detached: true }))
   })
 })

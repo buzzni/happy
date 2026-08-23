@@ -19,7 +19,7 @@ import { configuration } from '@/configuration';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
-import { preflightInstalledHappyCLI, spawnHappyCLI } from '@/utils/spawnHappyCLI';
+import { preflightInstalledHappyCLI, spawnDetachedHappyCLI, spawnHappyCLI } from '@/utils/spawnHappyCLI';
 import {
   writeDaemonState,
   writeDaemonStateDebounced,
@@ -47,7 +47,8 @@ import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation
 import { shouldYieldDaemonStateOwnership } from './daemonStateOwnership';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
-import { statSync } from 'fs';
+import { openSync, statSync } from 'fs';
+import type { SpawnOptions } from 'node:child_process';
 import { join } from 'path';
 import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
@@ -169,6 +170,26 @@ export const initialMachineMetadata: MachineMetadata = {
   resumeSupport: { ...detectResumeSupport(), rpcAvailable: true },
   automationSupport: { rpcAvailable: true },
 };
+
+/**
+ * stdio for the replacement daemon spawned during a bundle handoff.
+ *
+ * The replacement writes its own log only once its logger is up. Anything that
+ * kills it earlier — a broken bundle, a missing runtime — is printed to stderr
+ * and would be lost with `stdio: 'ignore'`, which is exactly why the
+ * 2026-08-23 handoff failure left no evidence at all. Falls back to 'ignore'
+ * if the file cannot be opened; losing output is better than blocking the
+ * handoff.
+ */
+function openHandoffReplacementStdio(): SpawnOptions['stdio'] {
+  try {
+    const fd = openSync(join(configuration.logsDir, 'daemon-handoff-replacement.log'), 'a');
+    return ['ignore', fd, fd];
+  } catch (error) {
+    logger.debug('[DAEMON RUN] Could not open handoff replacement log; spawning without captured output', error);
+    return 'ignore';
+  }
+}
 
 export async function startDaemon(): Promise<void> {
   // The daemon can be auto-(re)started by any happy CLI child — including a
@@ -2151,16 +2172,28 @@ export async function startDaemon(): Promise<void> {
             await releaseDaemonLock(daemonLockHandle);
             await stopCaffeinate();
           },
-          spawnReplacement: () => {
-            spawnHappyCLI(['daemon', 'start'], {
-              detached: true,
-              stdio: 'ignore'
+          spawnReplacement: (attempt) => {
+            logger.debug(`[DAEMON RUN] Spawning replacement daemon (attempt ${attempt})`);
+            return spawnDetachedHappyCLI(['daemon', 'start'], {
+              // Never 'ignore': if the replacement dies before it can open its
+              // own log file, this is the only place its failure is recorded.
+              stdio: openHandoffReplacementStdio(),
             });
           },
         });
 
         if (handoffResult === 'handed-off') {
+          logger.debug('[DAEMON RUN] Replacement daemon started; exiting');
           process.exit(0);
+        }
+
+        if (handoffResult === 'replacement-not-started') {
+          // Teardown already released the socket, control server, state file
+          // and lock, so this process is no longer a working daemon. Exiting
+          // non-zero at least makes the machine's daemon loss visible instead
+          // of leaving a hollow process behind.
+          logger.debug('[DAEMON RUN] FATAL: replacement daemon never started after handoff; this machine now has no daemon');
+          process.exit(1);
         }
 
         logger.debug('[DAEMON RUN] New daemon bundle preflight failed; keeping current daemon running');

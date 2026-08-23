@@ -173,6 +173,69 @@ export function spawnHappyCLI(args: string[], options: SpawnOptions = {}): Child
   });
 }
 
+/**
+ * Spawn a detached Happy CLI process and wait until the OS has actually
+ * started it.
+ *
+ * WHY the wait exists: `child_process.spawn` is asynchronous — it returns a
+ * handle immediately and libuv performs the fork/exec on a later tick. A caller
+ * that spawns and then calls `process.exit()` in the same tick can terminate
+ * before the child is ever exec'd, and with `detached` + ignored stdio there is
+ * no trace that anything was lost. That is how the 2026-08-23 daemon handoff
+ * dropped its replacement: the daemon logged the spawn and its own exit in the
+ * same millisecond, and no successor process ever appeared. Resolving on the
+ * `spawn` event lets the caller exit only once the child exists.
+ */
+export async function spawnDetachedHappyCLI(
+  args: string[],
+  {
+    spawn = spawnHappyCLI,
+    timeoutMs = 10_000,
+    stdio = 'ignore',
+  }: {
+    spawn?: typeof spawnHappyCLI
+    timeoutMs?: number
+    stdio?: SpawnOptions['stdio']
+  } = {},
+): Promise<boolean> {
+  const description = `happy ${args.join(' ')}`
+  let child: ChildProcess
+  try {
+    child = spawn(args, { detached: true, stdio })
+  } catch (error) {
+    logger.debug(`[SPAWN HAPPY CLI] Detached spawn of \`${description}\` threw before starting: ${error}`)
+    return false
+  }
+
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (started: boolean) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      // Detach from our event loop either way; on failure there is nothing to
+      // hold on to, and on success the child must outlive us.
+      try {
+        child.unref()
+      } catch {
+        // Handle already gone — nothing to release.
+      }
+      resolve(started)
+    }
+
+    const timer = setTimeout(() => {
+      logger.debug(`[SPAWN HAPPY CLI] Detached spawn of \`${description}\` did not start within ${timeoutMs}ms`)
+      finish(false)
+    }, timeoutMs)
+
+    child.once('spawn', () => finish(true))
+    child.once('error', (error) => {
+      logger.debug(`[SPAWN HAPPY CLI] Detached spawn of \`${description}\` failed: ${error}`)
+      finish(false)
+    })
+  })
+}
+
 export async function preflightInstalledHappyCLI({
   spawn = spawnHappyCLI,
   timeoutMs = 30_000,
