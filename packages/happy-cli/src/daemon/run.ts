@@ -53,7 +53,9 @@ import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import {
+  buildResumedSessionSpawnEnvironment,
   buildSessionSpawnEnvironment,
+  captureSaycodeAgentEnvironment,
   SESSION_LINEAGE_ENV_PREFIXES,
 } from './sessionEnv';
 import { detectCLIAvailability } from '@/utils/detectCLI';
@@ -941,12 +943,14 @@ export async function startDaemon(): Promise<void> {
             }
 
             // Create a tracked session for tmux windows - now we have the real PID!
+            const agentEnvironment = captureSaycodeAgentEnvironment(tmuxEnv);
             const trackedSession: TrackedSession = {
               startedBy: 'daemon',
               pid: tmuxResult.pid, // Real PID from tmux -P flag
               tmuxSessionId: tmuxResult.sessionId,
               directoryCreated,
               userHomeDir: stagedUserHomeDir,
+              ...(agentEnvironment ? { agentEnvironment } : {}),
               message: directoryCreated
                 ? `The path '${directory}' did not exist. We created a new folder and spawned a new session in tmux session '${tmuxSessionName}'. Use 'tmux attach -t ${tmuxSessionName}' to view the session.`
                 : `Spawned new session in tmux session '${tmuxSessionName}'. Use 'tmux attach -t ${tmuxSessionName}' to view the session.`
@@ -1062,6 +1066,7 @@ export async function startDaemon(): Promise<void> {
 
       logger.debug(`[DAEMON RUN] Spawned process with PID ${happyProcess.pid}`);
 
+      const agentEnvironment = captureSaycodeAgentEnvironment(env);
       const trackedSession: TrackedSession = {
         startedBy: 'daemon',
         pid: happyProcess.pid,
@@ -1069,6 +1074,7 @@ export async function startDaemon(): Promise<void> {
         directoryCreated,
         message,
         userHomeDir,
+        ...(agentEnvironment ? { agentEnvironment } : {}),
       };
 
       pidToTrackedSession.set(happyProcess.pid, trackedSession);
@@ -1312,19 +1318,24 @@ export async function startDaemon(): Promise<void> {
           filterCredentials: options?.automation !== undefined,
         });
         const mcpEnvironment = prepareMcpChildEnvironment({
-          environmentVariables: buildSessionSpawnEnvironment(inheritedResumeEnvironment, {
-            ...(options?.automation?.environmentVariables ?? {}),
-            ...reconnectEnvironment,
-            // user-credential 세션은 원래 계정의 스테이징 자격증명으로 복원 —
-            // 없으면 위의 credentialDecision 이 이미 refuse 했다.
-            ...(credentialDecision.kind === 'user-staged'
-              ? { HAPPY_HOME_DIR: credentialDecision.homeDir }
-              : {}),
-            ...(options?.automation ? {
-              HAPPY_INITIAL_PROMPT: options.automation.initialPrompt,
-              HAPPY_AUTOMATION_RESUME_PROMPT: '1',
-              HAPPY_AUTOMATION_RUN_ONCE: '1',
-            } : {}),
+          environmentVariables: buildResumedSessionSpawnEnvironment({
+            inherited: inheritedResumeEnvironment,
+            explicit: {
+              ...(options?.automation?.environmentVariables ?? {}),
+              ...reconnectEnvironment,
+              // user-credential 세션은 원래 계정의 스테이징 자격증명으로 복원 —
+              // 없으면 위의 credentialDecision 이 이미 refuse 했다.
+              ...(credentialDecision.kind === 'user-staged'
+                ? { HAPPY_HOME_DIR: credentialDecision.homeDir }
+                : {}),
+              ...(options?.automation ? {
+                HAPPY_INITIAL_PROMPT: options.automation.initialPrompt,
+                HAPPY_AUTOMATION_RESUME_PROMPT: '1',
+                HAPPY_AUTOMATION_RUN_ONCE: '1',
+              } : {}),
+            },
+            agentEnvironment: tracked.agentEnvironment,
+            sessionId: happySessionId,
           }),
           mcpCallerGrantEnvelope: options?.mcpCallerGrantEnvelope,
           mcpConfigProjectId: options?.mcpConfigProjectId,

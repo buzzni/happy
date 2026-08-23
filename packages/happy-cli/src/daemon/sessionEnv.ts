@@ -15,10 +15,29 @@
  * session spawned with a parent's leaked value would keep pointing at the
  * parent session forever — scrub it here so every daemon-spawned session
  * derives its own.
+ *
+ * SAYCODE_AGENT_* grants per-session orchestration scope. A daemon restarted
+ * by one agent must not leak that agent's root/depth/id into unrelated spawns;
+ * tracked sessions re-add their captured capability explicitly on resume.
  */
 // 'HAPPY_INITIAL_' covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the
 // HAPPY_INITIAL_MODEL / HAPPY_INITIAL_EFFORT spawn seeds.
-export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_AUTOMATION_', 'APLUS_SESSION_'] as const
+export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_AUTOMATION_', 'APLUS_SESSION_', 'SAYCODE_AGENT_'] as const
+
+const SAYCODE_AGENT_ENV_KEYS = [
+    'SAYCODE_AGENT_ENV',
+    'SAYCODE_AGENT_ROOT',
+    'SAYCODE_AGENT_DEPTH',
+    'SAYCODE_AGENT_MAX_SPAWN',
+    'SAYCODE_AGENT_ID',
+] as const
+
+type SaycodeAgentEnvironmentKey = typeof SAYCODE_AGENT_ENV_KEYS[number]
+
+export type SaycodeAgentEnvironment = Partial<Record<SaycodeAgentEnvironmentKey, string>> & {
+    SAYCODE_AGENT_ENV: '1'
+    SAYCODE_AGENT_ROOT: string
+}
 
 function isLineageKey(key: string): boolean {
     return SESSION_LINEAGE_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))
@@ -43,4 +62,30 @@ export function buildSessionSpawnEnvironment(
         ...scrubSessionLineageEnv(inherited),
         ...explicit,
     }
+}
+
+/** Retains only the per-session Saycode capability needed by a later resume. */
+export function captureSaycodeAgentEnvironment(
+    env: NodeJS.ProcessEnv,
+): SaycodeAgentEnvironment | undefined {
+    if (env.SAYCODE_AGENT_ENV !== '1' || !env.SAYCODE_AGENT_ROOT?.trim()) {
+        return undefined
+    }
+    return Object.fromEntries(
+        SAYCODE_AGENT_ENV_KEYS.flatMap((key) => env[key] === undefined ? [] : [[key, env[key]]]),
+    ) as SaycodeAgentEnvironment
+}
+
+/** Restores one tracked session's capability without inheriting the caller's. */
+export function buildResumedSessionSpawnEnvironment(input: {
+    inherited: NodeJS.ProcessEnv
+    explicit: Record<string, string>
+    agentEnvironment?: SaycodeAgentEnvironment
+    sessionId: string
+}): Record<string, string> {
+    return buildSessionSpawnEnvironment(input.inherited, {
+        ...input.explicit,
+        ...(input.agentEnvironment ?? {}),
+        APLUS_SESSION_ID: input.sessionId,
+    })
 }

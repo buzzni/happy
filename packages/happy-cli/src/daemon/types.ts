@@ -4,6 +4,7 @@
 
 import { Metadata } from '@/api/types';
 import { ChildProcess } from 'child_process';
+import type { SaycodeAgentEnvironment } from './sessionEnv';
 
 export interface SessionEncryptionData {
   encryptionKey: Uint8Array;
@@ -87,4 +88,6 @@ export interface TrackedSession {
    * sweeps it on next startup if cleanup was missed.
    */
   userHomeDir?: string;
+  /** Per-session capability restored only when this daemon resumes the child. */
+  agentEnvironment?: SaycodeAgentEnvironment;
 }

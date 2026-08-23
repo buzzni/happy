@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
+    buildResumedSessionSpawnEnvironment,
     buildSessionSpawnEnvironment,
+    captureSaycodeAgentEnvironment,
     scrubSessionLineageEnv,
     SESSION_LINEAGE_ENV_PREFIXES,
 } from './sessionEnv'
@@ -33,6 +35,8 @@ describe('scrubSessionLineageEnv', () => {
             HAPPY_AUTOMATION_RUN_ONCE: '1',
             APLUS_SESSION_URL: 'https://saycode.ai/session/parent-session',
             APLUS_SESSION_ID: 'parent-session',
+            SAYCODE_AGENT_ENV: '1',
+            SAYCODE_AGENT_ROOT: '/parent',
         }
         const scrubbed = scrubSessionLineageEnv(env)
         expect(scrubbed).toEqual({
@@ -58,6 +62,7 @@ describe('scrubSessionLineageEnv', () => {
         // APLUS_SESSION_* is first-set-wins (sessionUrlEnv.ts): without the
         // scrub, a nested child session would keep the parent's session URL.
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('APLUS_SESSION_')
+        expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('SAYCODE_AGENT_')
     })
 })
 
@@ -77,6 +82,64 @@ describe('buildSessionSpawnEnvironment', () => {
             PATH: '/usr/bin',
             HAPPY_RECONNECT_SESSION_ID: 'target-session',
             TASK_TOKEN: 'task-token',
+        })
+    })
+})
+
+describe('Saycode agent resume environment', () => {
+    it('captures only the validated Saycode agent capability fields', () => {
+        expect(captureSaycodeAgentEnvironment({
+            SAYCODE_AGENT_ENV: '1',
+            SAYCODE_AGENT_ROOT: '/repo/app',
+            SAYCODE_AGENT_DEPTH: '1',
+            SAYCODE_AGENT_MAX_SPAWN: '4',
+            SAYCODE_AGENT_ID: 'child-1',
+            SECRET: 'must-not-be-captured',
+        })).toEqual({
+            SAYCODE_AGENT_ENV: '1',
+            SAYCODE_AGENT_ROOT: '/repo/app',
+            SAYCODE_AGENT_DEPTH: '1',
+            SAYCODE_AGENT_MAX_SPAWN: '4',
+            SAYCODE_AGENT_ID: 'child-1',
+        })
+    })
+
+    it('restores the captured capability and current session id on resume', () => {
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: {
+                PATH: '/usr/bin',
+                SAYCODE_AGENT_ROOT: '/stale',
+                APLUS_SESSION_ID: 'parent-session',
+            },
+            explicit: { HAPPY_RECONNECT_SESSION_ID: 'session-2' },
+            agentEnvironment: {
+                SAYCODE_AGENT_ENV: '1',
+                SAYCODE_AGENT_ROOT: '/repo/app',
+                SAYCODE_AGENT_DEPTH: '1',
+                SAYCODE_AGENT_MAX_SPAWN: '4',
+                SAYCODE_AGENT_ID: 'child-1',
+            },
+            sessionId: 'session-2',
+        })).toEqual({
+            PATH: '/usr/bin',
+            HAPPY_RECONNECT_SESSION_ID: 'session-2',
+            SAYCODE_AGENT_ENV: '1',
+            SAYCODE_AGENT_ROOT: '/repo/app',
+            SAYCODE_AGENT_DEPTH: '1',
+            SAYCODE_AGENT_MAX_SPAWN: '4',
+            SAYCODE_AGENT_ID: 'child-1',
+            APLUS_SESSION_ID: 'session-2',
+        })
+    })
+
+    it('does not invent agent capability for a legacy session', () => {
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/stale' },
+            explicit: { HAPPY_RECONNECT_SESSION_ID: 'legacy-session' },
+            sessionId: 'legacy-session',
+        })).toEqual({
+            HAPPY_RECONNECT_SESSION_ID: 'legacy-session',
+            APLUS_SESSION_ID: 'legacy-session',
         })
     })
 })
