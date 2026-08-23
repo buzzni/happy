@@ -84,6 +84,7 @@ import {
     consumePendingInitialAppendSystemPrompt,
     consumePendingInitialEffort,
     consumePendingInitialModel,
+    consumePendingInitialSaycodePromptBlocks,
     consumePendingInitialSaycodeSystemPromptEnabled,
     resolveInitialPromptPermissionMode,
 } from '@/utils/initialPrompt';
@@ -289,6 +290,10 @@ export async function runCodex(opts: {
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
+    // Codex doesn't gate per-block Saycode prompts, but every HAPPY_INITIAL_* seed is
+    // consume-once: an ignored seed must still be deleted or it leaks into every child
+    // process this session spawns.
+    consumePendingInitialSaycodePromptBlocks(process.env);
     const initialAppendSystemPrompt = resolveInitialSaycodeAppendSystemPrompt({
         appendSystemPrompt: consumePendingInitialAppendSystemPrompt(process.env),
         saycodeSystemPromptEnabled: initialSaycodeSystemPromptEnabled,
