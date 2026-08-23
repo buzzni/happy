@@ -3,6 +3,7 @@ import {
     settingsParse,
     applySettings,
     resolveSaycodeAppendSystemPrompt,
+    resolveSaycodePromptBlockEnabled,
     resolveSaycodeSystemPromptEnabled,
     settingsDefaults,
     settingsToSyncPayload,
@@ -198,6 +199,7 @@ describe('settings', () => {
                 avatarStyle: 'brutalist',
                 showFlavorIcons: false,
                 saycodeSystemPromptEnabled: null,
+                saycodePromptBlocks: {},
                 hideInactiveSessions: false,
                 expResumeSession: false,
                 fileDiffsSidebar: false,
@@ -249,6 +251,66 @@ describe('settings', () => {
                 enabled: true,
                 prompt: 'SAYCODE OPTIONS PROMPT',
             })).toContain('<!-- saycode:owned-prompt -->\nSAYCODE OPTIONS PROMPT\n<!-- saycode:owned-prompt -->');
+        });
+    });
+
+    describe('resolveSaycodePromptBlockEnabled', () => {
+        it('lets a per-block override win over the master value in either direction', () => {
+            expect(resolveSaycodePromptBlockEnabled({
+                blockId: 'workerDelegation',
+                overrides: { workerDelegation: false },
+                preference: true,
+                surface: 'mobile',
+            })).toBe(false);
+            expect(resolveSaycodePromptBlockEnabled({
+                blockId: 'optionsGuidance',
+                overrides: { optionsGuidance: true },
+                preference: false,
+                surface: 'mobile',
+            })).toBe(true);
+        });
+
+        it('inherits the surface-resolved master value when no override exists', () => {
+            // Mirrors happy-cli's order (override > master > surface default) so the
+            // CLI-gated and app-composed halves of a turn never disagree.
+            expect(resolveSaycodePromptBlockEnabled({
+                blockId: 'axBase',
+                overrides: {},
+                preference: null,
+                surface: 'mobile',
+            })).toBe(true);
+            expect(resolveSaycodePromptBlockEnabled({
+                blockId: 'axBase',
+                overrides: undefined,
+                preference: null,
+                surface: 'desktop',
+            })).toBe(false);
+        });
+
+        it('ignores non-boolean entries so one malformed value cannot flip a block', () => {
+            expect(resolveSaycodePromptBlockEnabled({
+                blockId: 'workerDelegation',
+                overrides: { workerDelegation: 'off' as unknown as boolean },
+                preference: true,
+                surface: 'mobile',
+            })).toBe(true);
+        });
+    });
+
+    describe('saycodePromptBlocks settings field', () => {
+        it('parses a stored block map and defaults it to empty', () => {
+            expect(settingsParse({ saycodePromptBlocks: { deployPrompt: false } }).saycodePromptBlocks)
+                .toEqual({ deployPrompt: false });
+            expect(settingsParse({}).saycodePromptBlocks).toEqual({});
+        });
+
+        it('does not fail the whole settings load on a malformed block map', () => {
+            const parsed = settingsParse({
+                viewInline: true,
+                saycodePromptBlocks: 'broken',
+            });
+            expect(parsed.viewInline).toBe(true);
+            expect(parsed.saycodePromptBlocks).toEqual({});
         });
     });
 

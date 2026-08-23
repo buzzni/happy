@@ -9,7 +9,7 @@ import { AgentDefaultOverridesSchema } from './agentDefaults';
 // Current schema version for backward compatibility
 export const SUPPORTED_SCHEMA_VERSION = 3;
 
-type SaycodeSystemPromptSurface = 'desktop' | 'web' | 'mobile';
+export type SaycodeSystemPromptSurface = 'desktop' | 'web' | 'mobile';
 
 export function resolveSaycodeSystemPromptEnabled({
     preference,
@@ -19,6 +19,30 @@ export function resolveSaycodeSystemPromptEnabled({
     surface: SaycodeSystemPromptSurface;
 }): boolean {
     return preference ?? surface !== 'desktop';
+}
+
+/**
+ * Per-block overrides layered on top of the master preference. Keys are block ids
+ * (CLI-wire ids plus this app's own `optionsGuidance`); a block with no entry
+ * inherits the surface-resolved master value. Mirrors happy-cli's
+ * `isSaycodePromptBlockEnabled` order so the CLI-gated and app-composed halves of a
+ * turn never disagree. Non-boolean entries are ignored — one malformed value must
+ * not flip a block.
+ */
+export function resolveSaycodePromptBlockEnabled({
+    blockId,
+    overrides,
+    preference,
+    surface,
+}: {
+    blockId: string;
+    overrides: Record<string, boolean> | undefined;
+    preference: boolean | null;
+    surface: SaycodeSystemPromptSurface;
+}): boolean {
+    const override = overrides?.[blockId];
+    if (typeof override === 'boolean') return override;
+    return resolveSaycodeSystemPromptEnabled({ preference, surface });
 }
 
 export function resolveSaycodeAppendSystemPrompt({
@@ -49,6 +73,10 @@ export const SettingsSchema = z.object({
     avatarStyle: z.string().describe('Avatar display style'),
     showFlavorIcons: z.boolean().describe('Whether to show AI provider icons in avatars'),
     saycodeSystemPromptEnabled: z.boolean().nullable().describe('Whether Saycode-owned system prompt instructions are enabled (null means undecided)'),
+    // Per-block overrides for individually toggleable Saycode-owned blocks. catch({})
+    // because settingsParse falls back to full defaults on any schema failure — a
+    // malformed map must not discard the rest of the user's settings.
+    saycodePromptBlocks: z.record(z.string(), z.boolean()).catch({}).describe('Per-block overrides for Saycode-owned prompt blocks (missing entry inherits the master value)'),
 
     hideInactiveSessions: z.boolean().describe('Hide inactive sessions in the main list'),
     expResumeSession: z.boolean().describe('Enable experimental session resume feature'),
@@ -121,6 +149,7 @@ export const settingsDefaults: Settings = {
     avatarStyle: 'brutalist',
     showFlavorIcons: false,
     saycodeSystemPromptEnabled: null,
+    saycodePromptBlocks: {},
 
     hideInactiveSessions: false,
     expResumeSession: false,
