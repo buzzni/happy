@@ -179,6 +179,18 @@ export const ru: TranslationStructure = {
     },
 
     settingsFeatures: {
+        saycodeGroupTitle: "Инструкции Saycode",
+        saycodeGroupFooter: "Генерация названия чата всегда включена и не может быть отключена — именно она позволяет снова найти разговор в списке.",
+        saycodeMaster: "Использовать инструкции Saycode",
+        saycodeMasterSubtitle: "Поведенческие инструкции, добавляемые Saycode. Ваши собственные промпты, инструкции проекта и навыки всегда сохраняются.",
+        saycodeBlockOptionsGuidance: "Варианты ответа",
+        saycodeBlockOptionsGuidanceSubtitle: "Позволяет агенту предлагать нажимаемые варианты ответа.",
+        saycodeBlockWorkerDelegation: "Делегирование работы",
+        saycodeBlockWorkerDelegationSubtitle: "Передаёт механическую работу более дешёвому агенту worker.",
+        saycodeBlockAxBase: "Рабочий процесс от планирования",
+        saycodeBlockAxBaseSubtitle: "Применяет базовые инструкции процесса AX.",
+        saycodeBlockCoAuthoredCredit: "Авторство коммитов",
+        saycodeBlockCoAuthoredCreditSubtitle: "Добавляет строки соавторства Claude и Happy в сообщения коммитов.",
         // Features settings screen
         experiments: 'Эксперименты',
         experimentsDescription: 'Включить экспериментальные функции, которые всё ещё разрабатываются. Эти функции могут быть нестабильными или изменяться без предупреждения.',

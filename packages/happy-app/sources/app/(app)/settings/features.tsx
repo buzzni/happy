@@ -4,6 +4,13 @@ import { Item } from '@/components/Item';
 import { ItemGroup } from '@/components/ItemGroup';
 import { ItemList } from '@/components/ItemList';
 import { useSettingMutable, useLocalSettingMutable } from '@/sync/storage';
+import {
+    MOBILE_SAYCODE_PROMPT_BLOCKS,
+} from '@/sync/saycodeTurnMeta';
+import {
+    resolveSaycodePromptBlockEnabled,
+    resolveSaycodeSystemPromptEnabled,
+} from '@/sync/settings';
 import { Switch } from '@/components/Switch';
 import { t } from '@/text';
 
@@ -18,6 +25,13 @@ export default function FeaturesSettingsScreen() {
     const [fileDiffsSidebar, setFileDiffsSidebar] = useSettingMutable('fileDiffsSidebar');
     const [groupToolCalls, setGroupToolCalls] = useSettingMutable('groupToolCalls');
     const [expImageUpload, setExpImageUpload] = useSettingMutable('expImageUpload');
+    const [saycodePromptPreference, setSaycodePromptPreference] = useSettingMutable('saycodeSystemPromptEnabled');
+    const [saycodePromptBlocks, setSaycodePromptBlocks] = useSettingMutable('saycodePromptBlocks');
+    const saycodeSurface = Platform.OS === 'web' ? 'web' as const : 'mobile' as const;
+    const saycodeMasterEnabled = resolveSaycodeSystemPromptEnabled({
+        preference: saycodePromptPreference,
+        surface: saycodeSurface,
+    });
 
     return (
         <ItemList style={{ paddingTop: 0 }}>
@@ -170,6 +184,48 @@ export default function FeaturesSettingsScreen() {
                     />
                 </ItemGroup>
             )}
+            {/* Saycode Instructions (R13-R15). The chat title instruction is not listed
+                (R14): it is always-on, and a disabled row would invite the belief that
+                it can be turned off — the group footer states it instead. */}
+            <ItemGroup
+                title={t('settingsFeatures.saycodeGroupTitle')}
+                footer={t('settingsFeatures.saycodeGroupFooter')}
+            >
+                <Item
+                    title={t('settingsFeatures.saycodeMaster')}
+                    subtitle={t('settingsFeatures.saycodeMasterSubtitle')}
+                    icon={<Ionicons name="sparkles-outline" size={29} color="#FF9500" />}
+                    rightElement={
+                        <Switch
+                            value={saycodeMasterEnabled}
+                            onValueChange={setSaycodePromptPreference}
+                        />
+                    }
+                    showChevron={false}
+                />
+                {MOBILE_SAYCODE_PROMPT_BLOCKS.map((block) => (
+                    <Item
+                        key={block.id}
+                        title={t(block.titleKey)}
+                        subtitle={t(block.subtitleKey)}
+                        rightElement={
+                            <Switch
+                                value={resolveSaycodePromptBlockEnabled({
+                                    blockId: block.id,
+                                    overrides: saycodePromptBlocks,
+                                    preference: saycodePromptPreference,
+                                    surface: saycodeSurface,
+                                })}
+                                onValueChange={(enabled) => setSaycodePromptBlocks({
+                                    ...saycodePromptBlocks,
+                                    [block.id]: enabled,
+                                })}
+                            />
+                        }
+                        showChevron={false}
+                    />
+                ))}
+            </ItemGroup>
         </ItemList>
     );
 }

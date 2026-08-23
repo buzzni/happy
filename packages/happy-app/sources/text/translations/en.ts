@@ -207,6 +207,18 @@ export const en: TranslationStructure = {
     },
 
     settingsFeatures: {
+        saycodeGroupTitle: "Saycode Instructions",
+        saycodeGroupFooter: "Chat title generation is always on and cannot be turned off — it is what lets you find a conversation again in the chat list.",
+        saycodeMaster: "Use Saycode instructions",
+        saycodeMasterSubtitle: "Behavior instructions Saycode adds. Your own prompts, project instructions, and skills always remain.",
+        saycodeBlockOptionsGuidance: "Answer options",
+        saycodeBlockOptionsGuidanceSubtitle: "Lets the agent offer tappable answer choices.",
+        saycodeBlockWorkerDelegation: "Work delegation",
+        saycodeBlockWorkerDelegationSubtitle: "Hands mechanical work to a cheaper worker agent.",
+        saycodeBlockAxBase: "Start-from-planning workflow",
+        saycodeBlockAxBaseSubtitle: "Applies the AX workflow's base instructions.",
+        saycodeBlockCoAuthoredCredit: "Commit credits",
+        saycodeBlockCoAuthoredCreditSubtitle: "Adds Claude and Happy co-author lines to commit messages.",
         // Features settings screen
         experiments: 'Experiments',
         experimentsDescription: 'Enable experimental features that are still in development. These features may be unstable or change without notice.',

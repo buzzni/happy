@@ -193,6 +193,18 @@ export const ca: TranslationStructure = {
     },
 
     settingsFeatures: {
+        saycodeGroupTitle: "Instruccions de Saycode",
+        saycodeGroupFooter: "La generació del títol del xat està sempre activa i no es pot desactivar: és el que permet retrobar una conversa a la llista.",
+        saycodeMaster: "Utilitza les instruccions de Saycode",
+        saycodeMasterSubtitle: "Instruccions de comportament que afegeix Saycode. Els teus prompts, instruccions de projecte i skills sempre es conserven.",
+        saycodeBlockOptionsGuidance: "Opcions de resposta",
+        saycodeBlockOptionsGuidanceSubtitle: "Permet a l'agent oferir opcions de resposta seleccionables.",
+        saycodeBlockWorkerDelegation: "Delegació de feina",
+        saycodeBlockWorkerDelegationSubtitle: "Delega la feina mecànica a un agent worker més econòmic.",
+        saycodeBlockAxBase: "Flux de treball des de la planificació",
+        saycodeBlockAxBaseSubtitle: "Aplica les instruccions base del flux AX.",
+        saycodeBlockCoAuthoredCredit: "Crèdits de commit",
+        saycodeBlockCoAuthoredCreditSubtitle: "Afegeix línies de coautoria de Claude i Happy als missatges de commit.",
         // Features settings screen
         experiments: 'Experiments',
         experimentsDescription: 'Activa funcions experimentals que encara estan en desenvolupament. Aquestes funcions poden ser inestables o canviar sense avís.',
