@@ -53,7 +53,7 @@ import { deliverPreparedClaudeSessionStart, prepareClaudeInitialPrompt } from '.
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
-import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodeSystemPromptEnabled, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
+import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import { createEnvelope } from '@slopus/happy-wire';
 import {
     resolveInitialSaycodeAppendSystemPrompt,
@@ -547,11 +547,16 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
+    const initialSaycodePromptBlocks = consumePendingInitialSaycodePromptBlocks(process.env);
     const resolvedInitialAppendSystemPrompt = resolveInitialSaycodeAppendSystemPrompt({
         appendSystemPrompt: consumePendingInitialAppendSystemPrompt(process.env),
         saycodeSystemPromptEnabled: initialSaycodeSystemPromptEnabled,
     });
-    const initialAppendSystemPrompt = initialSaycodeSystemPromptEnabled === false
+    // Same gate as the per-turn path: a master-on/axBase-off account's recovered
+    // first turn must not re-inject the base the user turned off.
+    const initialAppendSystemPrompt = !isSaycodePromptBlockEnabled(
+        'axBase', initialSaycodePromptBlocks, initialSaycodeSystemPromptEnabled,
+    )
         ? removeAxSaycodeBasePrompt(resolvedInitialAppendSystemPrompt)
         : resolvedInitialAppendSystemPrompt;
     let currentModel: string | undefined = initialModelSeed; // Track current model state
@@ -561,9 +566,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
     // Per-block overrides layered on top of currentSaycodeSystemPromptEnabled — a block
     // with no override inherits it (see promptProvenance.isSaycodePromptBlockEnabled).
-    // No initial-seed threading yet: daemon-spawned first turns fall back to the legacy
-    // value, which is the intended default for accounts with no per-block prefs.
-    let currentSaycodePromptBlocks: SaycodePromptBlockOverrides | undefined = undefined;
+    // Seeded once from HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS for daemon-spawned
+    // recovery first turns; later user messages overwrite it via message meta.
+    let currentSaycodePromptBlocks: SaycodePromptBlockOverrides | undefined = initialSaycodePromptBlocks;
     let currentAllowedTools: string[] | undefined = undefined; // Track current allowed tools
     let currentDisallowedTools: string[] | undefined = initialDisallowedTools; // Track current disallowed tools
     let currentEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined = initialEffortSeed; // Track current Claude effort (thinking depth)

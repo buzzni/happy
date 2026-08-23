@@ -272,6 +272,8 @@ export interface SpawnSessionOptions {
     appendSystemPrompt?: string;
     /** Saycode-owned prompt policy applied to an atomically delivered initial prompt. */
     saycodeSystemPromptEnabled?: boolean;
+    /** Per-block Saycode overrides seeded into the spawned session's first turn. */
+    saycodePromptBlocks?: Record<string, boolean>;
     /** Exit cleanly after the spawned agent completes its first turn. */
     exitAfterFirstTurn?: boolean;
     /** Remove inherited daemon credentials before applying the explicit spawn environment. */
@@ -310,6 +312,8 @@ export type RecoverSessionOptions = {
     initialPromptLocalId?: string;
     appendSystemPrompt?: string;
     saycodeSystemPromptEnabled?: boolean;
+    /** Per-block Saycode overrides for the recovered first turn (sanitized at the RPC boundary). */
+    saycodePromptBlocks?: Record<string, boolean>;
     environmentVariables?: Record<string, string>;
     model?: string;
     permissionMode?: PermissionMode;

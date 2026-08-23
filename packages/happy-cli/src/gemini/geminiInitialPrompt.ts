@@ -4,6 +4,7 @@ import {
   consumePendingInitialAppendSystemPrompt,
   consumePendingInitialPrompt,
   consumePendingInitialPromptLocalId,
+  consumePendingInitialSaycodePromptBlocks,
   consumePendingInitialSaycodeSystemPromptEnabled,
 } from '@/utils/initialPrompt';
 import { resolveInitialSaycodeAppendSystemPrompt } from '@/prompt/promptProvenance';
@@ -22,6 +23,10 @@ export function prepareGeminiInitialPrompt(
   const localId = consumePendingInitialPromptLocalId(env);
   const saycodeSystemPromptEnabled =
     consumePendingInitialSaycodeSystemPromptEnabled(env);
+  // Gemini doesn't gate per-block Saycode prompts, but every HAPPY_INITIAL_* seed is
+  // consume-once: an ignored seed must still be deleted or it leaks into every child
+  // process this session spawns.
+  consumePendingInitialSaycodePromptBlocks(env);
   const appendSystemPrompt = resolveInitialSaycodeAppendSystemPrompt({
     appendSystemPrompt: consumePendingInitialAppendSystemPrompt(env),
     saycodeSystemPromptEnabled,

@@ -1293,6 +1293,7 @@ export class ApiMachineClient {
                         initialPromptLocalId,
                         appendSystemPrompt,
                         saycodeSystemPromptEnabled,
+                        saycodePromptBlocks,
                         environmentVariables,
                         model,
                         permissionMode,
@@ -1300,6 +1301,22 @@ export class ApiMachineClient {
                         mcpConfigProjectId,
                         expectedConnectors,
                     } = params || {};
+                    // Sanitize rather than throw: a preference must never abort a
+                    // recovery. Non-boolean entries are dropped and a non-object value
+                    // degrades to undefined (legacy master inheritance), mirroring
+                    // MessageMetaSchema's catch(undefined) on the wire.
+                    const sanitizedSaycodePromptBlocks = (() => {
+                        if (
+                            typeof saycodePromptBlocks !== 'object'
+                            || saycodePromptBlocks === null
+                            || Array.isArray(saycodePromptBlocks)
+                        ) return undefined;
+                        const blocks = Object.fromEntries(
+                            Object.entries(saycodePromptBlocks as Record<string, unknown>)
+                                .filter((entry): entry is [string, boolean] => typeof entry[1] === 'boolean'),
+                        );
+                        return Object.keys(blocks).length > 0 ? blocks : undefined;
+                    })();
 
                     if (typeof sessionId !== 'string' || !sessionId.trim()) {
                         throw new Error('Session ID is required');
@@ -1355,6 +1372,7 @@ export class ApiMachineClient {
                         initialPromptLocalId,
                         appendSystemPrompt,
                         saycodeSystemPromptEnabled,
+                        saycodePromptBlocks: sanitizedSaycodePromptBlocks,
                         environmentVariables,
                         model,
                         permissionMode,

@@ -288,6 +288,7 @@ describe('ApiMachineClient spawn/resume RPC passthrough', () => {
             model: 'opus',
             permissionMode: 'bypassPermissions',
             saycodeSystemPromptEnabled: false,
+            saycodePromptBlocks: { workerDelegation: false },
             mcpCallerGrantEnvelope: 'ENCRYPTED-RECOVERY-GRANT',
             mcpConfigProjectId: 'P-1',
             expectedConnectors: ['gmail', 'knoi'],
@@ -306,9 +307,39 @@ describe('ApiMachineClient spawn/resume RPC passthrough', () => {
             model: 'opus',
             permissionMode: 'bypassPermissions',
             saycodeSystemPromptEnabled: false,
+            saycodePromptBlocks: { workerDelegation: false },
             mcpCallerGrantEnvelope: 'ENCRYPTED-RECOVERY-GRANT',
             mcpConfigProjectId: 'P-1',
             expectedConnectors: ['gmail', 'knoi'],
         });
+    });
+
+    it('sanitizes a malformed saycodePromptBlocks instead of failing the recovery', async () => {
+        // A preference must never abort a recovery: non-boolean entries are dropped
+        // and a non-object value degrades to undefined (legacy master inheritance),
+        // mirroring MessageMetaSchema's catch(undefined) on the wire.
+        const recoverSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-new' });
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ recoverSession }));
+
+        await handlersFrom(client).get('machine-1:recover-happy-session')?.({
+            sessionId: 'happy-old',
+            initialPrompt: '이어서 작업해줘',
+            saycodePromptBlocks: { workerDelegation: 'no', axBase: false },
+        });
+        expect(recoverSession).toHaveBeenCalledWith('happy-old', expect.objectContaining({
+            saycodePromptBlocks: { axBase: false },
+        }));
+
+        recoverSession.mockClear();
+        await handlersFrom(client).get('machine-1:recover-happy-session')?.({
+            sessionId: 'happy-old',
+            initialPrompt: '이어서 작업해줘',
+            saycodePromptBlocks: 'broken',
+        });
+        expect(recoverSession).toHaveBeenCalledWith('happy-old', expect.objectContaining({
+            saycodePromptBlocks: undefined,
+        }));
     });
 });

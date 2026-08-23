@@ -73,3 +73,16 @@ describe('Gemini recovered initial prompt', () => {
     expect(order).toEqual(['server-message', 'backend-queue', 'daemon-report']);
   });
 });
+
+describe('HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS hygiene', () => {
+  it('consumes the block seed even though Gemini never uses it', () => {
+    // Every HAPPY_INITIAL_* seed is consume-once: a backend that ignores a seed
+    // must still delete it, or the value leaks into every child process this
+    // session spawns.
+    const env: NodeJS.ProcessEnv = {
+      HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS: '{"workerDelegation":false}',
+    };
+    prepareGeminiInitialPrompt(env);
+    expect(env).not.toHaveProperty('HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS');
+  });
+});
