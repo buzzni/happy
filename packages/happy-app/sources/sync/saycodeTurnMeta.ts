@@ -66,7 +66,15 @@ export const MOBILE_SAYCODE_PROMPT_BLOCKS: readonly MobileSaycodePromptBlock[] =
 
 export type SaycodeTurnMeta = {
     saycodeSystemPromptEnabled: boolean;
-    appendSystemPrompt: string | undefined;
+    /**
+     * The composed prompt, `null` for an explicit reset, or `undefined` to omit.
+     * Unwrapped blocks (R22) pass the CLI's master-off sentinel strip, so cache
+     * invalidation can no longer ride on it — once the user touched the
+     * optionsGuidance block, an empty composed prompt travels as `null` so the
+     * previously sent guidance cannot linger in the CLI cache. Untouched accounts
+     * keep omitting, preserving non-Saycode context cached by other clients.
+     */
+    appendSystemPrompt: string | null | undefined;
     /** CLI-wire overrides only; undefined when empty so the payload stays byte-identical for untouched accounts. */
     saycodePromptBlocks: Record<string, boolean> | undefined;
 };
@@ -105,7 +113,7 @@ export function buildSaycodeTurnMeta({
     // travels unwrapped; under master-on the CLI never strips and the wrapper stays as
     // the provenance marker.
     const appendSystemPrompt = !optionsGuidanceEnabled
-        ? undefined
+        ? (typeof overrides?.optionsGuidance === 'boolean' ? null : undefined)
         : saycodeSystemPromptEnabled
             ? resolveSaycodeAppendSystemPrompt({ enabled: true, prompt: systemPrompt })
             : systemPrompt;

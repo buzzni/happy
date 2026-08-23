@@ -16,6 +16,17 @@ describe('MOBILE_SAYCODE_PROMPT_BLOCKS', () => {
 });
 
 describe('buildSaycodeTurnMeta', () => {
+    it('keeps the untouched-account omit behavior when the master leaves the prompt empty', () => {
+        // An untouched account must keep omitting (undefined) so non-Saycode context
+        // cached by other clients survives — only touched accounts send explicit null.
+        const meta = buildSaycodeTurnMeta({
+            preference: false,
+            overrides: {},
+            surface: 'mobile',
+        });
+        expect(meta.appendSystemPrompt).toBeUndefined();
+    });
+
     it('keeps the legacy shape byte-identical when no overrides exist', () => {
         const meta = buildSaycodeTurnMeta({
             preference: true,
@@ -27,13 +38,17 @@ describe('buildSaycodeTurnMeta', () => {
         expect(meta.saycodePromptBlocks).toBeUndefined();
     });
 
-    it('drops only the options guidance when its block is overridden off', () => {
+    it('sends an explicit reset when the touched options guidance leaves the prompt empty', () => {
+        // Unwrapped blocks (R22) pass the CLI's master-off sentinel strip, so cache
+        // invalidation can no longer ride on it. Once the user touched the block, an
+        // empty composed prompt must travel as an explicit null — omitting it would
+        // leave the previously sent guidance in the CLI cache, still applying.
         const meta = buildSaycodeTurnMeta({
             preference: true,
             overrides: { optionsGuidance: false },
             surface: 'mobile',
         });
-        expect(meta.appendSystemPrompt).toBeUndefined();
+        expect(meta.appendSystemPrompt).toBeNull();
         // The app-composed id never travels on the wire — happy-cli does not know it.
         expect(meta.saycodePromptBlocks).toBeUndefined();
         expect(meta.saycodeSystemPromptEnabled).toBe(true);
