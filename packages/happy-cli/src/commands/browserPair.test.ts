@@ -64,6 +64,10 @@ describe('buildPairUrl', () => {
         expect(buildPairUrl({ ...base, debuggerTier: true })).toContain('&debugger=1')
         expect(buildPairUrl({ ...base, debuggerTier: false })).toContain('&debugger=0')
     })
+
+    it('pins the target bridge profile when the caller needs exact Chrome identity', () => {
+        expect(buildPairUrl({ ...base, profile: 'viewer-9222' })).toContain('&profile=viewer-9222')
+    })
 })
 
 describe('formatPairOutcome', () => {
@@ -82,6 +86,18 @@ describe('formatPairOutcome', () => {
         const outcome = formatPairOutcome(base)
         expect(outcome.ok).toBe(true)
         expect(outcome.text).toContain('headless-1')
+    })
+
+    it('does not accept an unrelated connection when an exact target profile was requested', () => {
+        const outcome = formatPairOutcome({
+            ...base,
+            targetProfile: 'viewer-9222',
+            connections: [{ profile: 'unrelated-headless' }],
+            freshProfiles: [],
+        })
+
+        expect(outcome.ok).toBe(false)
+        expect(outcome.text).toContain('viewer-9222')
     })
 
     it('leads with the daemon when it is not running — nothing below it can work', () => {

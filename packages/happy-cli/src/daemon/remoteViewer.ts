@@ -202,6 +202,25 @@ export function summariseViewerBrowser(input: {
     return { browserReady: true, cdpPort: input.cdpPort }
 }
 
+/** Reads DISPLAY from a NUL-separated `/proc/<pid>/environ` block. */
+export function readDisplayFromEnviron(environ: string): string | null {
+    for (const entry of environ.split('\0')) {
+        if (!entry.startsWith('DISPLAY=')) continue
+        return entry.slice('DISPLAY='.length) || null
+    }
+    return null
+}
+
+/** Reads an exact `--flag=value` argument from `/proc/<pid>/cmdline`. */
+export function readFlagFromCmdline(cmdline: string, flag: string): string | null {
+    const prefix = `${flag}=`
+    for (const arg of cmdline.split('\0')) {
+        if (!arg.startsWith(prefix)) continue
+        return arg.slice(prefix.length) || null
+    }
+    return null
+}
+
 function which(binary: string): Promise<string | null> {
     return new Promise((resolve) => {
         const child = spawn('which', [binary], { stdio: ['ignore', 'pipe', 'ignore'] })

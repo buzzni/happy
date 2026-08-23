@@ -64,6 +64,7 @@ if (autoConnect) {
     // Only when the link was explicit — otherwise the field keeps the stored
     // value loaded above, and save() below preserves it.
     if (autoConnect.host !== undefined) hostInput.value = autoConnect.host
+    if (autoConnect.profile !== undefined) profileInput.value = autoConnect.profile
     // Scrub the token from the visible URL / this navigation's history entry
     // right away — nothing downstream needs it to stay there.
     history.replaceState(null, '', location.pathname)

@@ -29,6 +29,8 @@ export interface PairOptions {
     cdpPort: number
     /** Absent means "leave whatever the profile already has". */
     debuggerTier?: boolean
+    /** Absent preserves the extension's current bridge profile name. */
+    profile?: string
 }
 
 export function parsePairArgs(args: string[]): PairOptions {
@@ -57,11 +59,12 @@ export function parsePairArgs(args: string[]): PairOptions {
     return options
 }
 
-export function buildPairUrl({ extensionId, token, bridgePort, debuggerTier, bridgeHost = '127.0.0.1' }: {
+export function buildPairUrl({ extensionId, token, bridgePort, debuggerTier, profile, bridgeHost = '127.0.0.1' }: {
     extensionId: string
     token: string
     bridgePort: number
     debuggerTier?: boolean
+    profile?: string
     /** What the daemon's bridge is bound to (resolveBrowserBridgeHost). */
     bridgeHost?: string
 }): string {
@@ -76,6 +79,7 @@ export function buildPairUrl({ extensionId, token, bridgePort, debuggerTier, bri
     // failure used to get blamed on the token.
     const params = new URLSearchParams({ token, port: String(bridgePort), host: bridgeProbeHost(bridgeHost) })
     if (debuggerTier !== undefined) params.set('debugger', debuggerTier ? '1' : '0')
+    if (profile !== undefined) params.set('profile', profile)
     return `chrome-extension://${extensionId}/src/options.html?${params.toString()}`
 }
 
@@ -97,6 +101,8 @@ export interface PairOutcomeInput {
     connections: Array<{ profile: string }>
     /** Profiles among `connections` that were NOT connected before the page opened. */
     freshProfiles: string[]
+    /** Exact profile name assigned by this pairing run, when one was pinned. */
+    targetProfile?: string
     /** What --debugger/--no-debugger asked for; absent when neither was given. */
     debuggerTierRequested?: boolean
     /** What the extension reports now. Absent when it could not be read. */
@@ -110,7 +116,7 @@ export interface PairOutcomeInput {
     authRejected?: boolean
 }
 
-export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpReachable, extensionLoaded, loadUnpackedFailed, pageOpened, connections, freshProfiles, debuggerTierRequested, debuggerTierActual, authRejected }: PairOutcomeInput): { ok: boolean; text: string } {
+export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpReachable, extensionLoaded, loadUnpackedFailed, pageOpened, connections, freshProfiles, targetProfile, debuggerTierRequested, debuggerTierActual, authRejected }: PairOutcomeInput): { ok: boolean; text: string } {
     // Ordered by what has to be true first: a later check failing while an
     // earlier prerequisite is missing would point at the wrong thing.
     if (!daemonRunning) {
@@ -146,11 +152,25 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
         }
     }
 
+    const targetConnected = targetProfile === undefined
+        || connections.some((connection) => connection.profile === targetProfile)
+    if (!targetConnected && extensionLoaded) {
+        return {
+            ok: false,
+            text: [
+                chalk.yellow(`대상 Chrome 프로필(${targetProfile})이 브리지에 연결되지 않았습니다.`),
+                chalk.dim(connections.length === 0
+                    ? '  현재 연결된 프로필이 없습니다.'
+                    : `  현재 연결: ${connections.map((connection) => connection.profile).join(', ')}`),
+            ].join('\n'),
+        }
+    }
+
     // A connection alone is not success: a profile that was already paired
     // before this run proves nothing about the Chrome we just drove. It only
     // counts when something new connected, or when the CDP Chrome at least
     // has the extension (then an unchanged connection reads as a re-pair).
-    if (connections.length > 0 && (freshProfiles.length > 0 || extensionLoaded)) {
+    if (targetConnected && connections.length > 0 && (freshProfiles.length > 0 || extensionLoaded)) {
         // The connection poll can complete before the options page has loaded
         // — so a requested tier change has to be confirmed, not assumed.
         if (debuggerTierRequested !== undefined && debuggerTierActual !== debuggerTierRequested) {
@@ -328,7 +348,7 @@ async function loadUnpackedExtension(cdpPort: number, extensionDir: string): Pro
  * accepted, since answering early would make the bystander case a false
  * success and this is a one-shot diagnostic command.
  */
-async function waitForConnection(controlPort: number, timeoutMs: number, profilesBefore: string[]): Promise<{ connections: Array<{ profile: string }>; authRejected: boolean }> {
+async function waitForConnection(controlPort: number, timeoutMs: number, profilesBefore: string[], targetProfile?: string): Promise<{ connections: Array<{ profile: string }>; authRejected: boolean }> {
     const deadline = Date.now() + timeoutMs
     let connections: Array<{ profile: string }> = []
     // Sticky: the daemon's flag expires on its own window, and a rejection
@@ -339,7 +359,8 @@ async function waitForConnection(controlPort: number, timeoutMs: number, profile
         const status = await fetchBrowserStatus(controlPort)
         connections = status?.connections ?? []
         authRejected ||= status?.hasRecentAuthFailure === true
-        if (connections.some((connection) => !profilesBefore.includes(connection.profile))) break
+        if (connections.some((connection) => connection.profile === targetProfile
+            || !profilesBefore.includes(connection.profile))) break
         await new Promise((resolve) => setTimeout(resolve, 500))
     }
     return { connections, authRejected }
@@ -436,20 +457,21 @@ export async function runPairing(options: PairOptions): Promise<PairOutcomeInput
             token,
             bridgePort: DEFAULT_BROWSER_BRIDGE_PORT,
             debuggerTier: options.debuggerTier,
+            profile: options.profile,
             // Best-effort like `happy browser`: this process's env, which
             // matches the daemon's bind only if nothing changed it since the
             // daemon started.
             bridgeHost: resolveBrowserBridgeHost(process.env),
         }))
         if (pageOpened) {
-            const waited = await waitForConnection(controlPort, 10_000, profilesBefore)
+            const waited = await waitForConnection(controlPort, 10_000, profilesBefore, options.profile)
             connections = waited.connections
             authRejected = waited.authRejected
             freshProfiles = connections
                 .map((connection) => connection.profile)
                 .filter((profile) => !profilesBefore.includes(profile))
             if (connections.length > 0 && options.debuggerTier !== undefined) {
-                const target = pickTierProbeProfile(profilesBefore, connections)
+                const target = options.profile ?? pickTierProbeProfile(profilesBefore, connections)
                 if (target !== undefined) {
                     debuggerTierActual = await waitForDebuggerTier(controlPort, options.debuggerTier, target)
                 }
@@ -467,6 +489,7 @@ export async function runPairing(options: PairOptions): Promise<PairOutcomeInput
         pageOpened,
         connections,
         freshProfiles,
+        targetProfile: options.profile,
         debuggerTierRequested: options.debuggerTier,
         debuggerTierActual,
         authRejected,

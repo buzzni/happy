@@ -147,3 +147,21 @@ viewer를 직접 여는 경로는 계속 기본 browser를 보장하되, profile
 `callerWillLaunchBrowser` ownership을 전달해 선행 browser 실행을 생략한다. 순수 결정
 test가 defer/launch/reuse 세 경우를 고정하며 browser setup/viewer 유닛 38개와 CLI
 typecheck/package build가 통과했다.
+
+## 후속 수정 — viewer Chrome 브리지 자동 페어링 (2026-08-23)
+
+원격 화면에서 Gmail에 로그인해도 Saycode 세션의 browser tool은
+`No Chrome extension is connected`를 반환했다. viewer 경로가 Xvfb/noVNC와 Chrome만
+보장하고, 확장 주입·token 저장·WebSocket 연결을 담당하는 `runPairing`은 수동
+`browser-setup:pair`에만 연결돼 있었기 때문이다.
+
+`browser-viewer:start`가 신규/재사용 viewer Chrome의 정확한 CDP port로 기존
+`runPairing`을 호출하게 했다. browser 준비와 bridge 준비 결과를 분리해 페어링 실패가
+noVNC 복구 화면 자체를 숨기지 않게 했다. 또한 `/proc`의 정확한 NUL 구분 cmdline과
+DISPLAY를 확인해 headless Chrome을 viewer Chrome으로 성공 오인하지 않는다. pairing
+URL은 `viewer-<cdpPort>` 프로필명을 명시하고 해당 이름의 bridge 연결을 확인하므로,
+확장이 이미 로드된 viewer 앞에서 unrelated 프로필만 연결된 경우도 성공 처리하지 않는다.
+
+검증: viewer API/browser setup/remote viewer/browser pair focused 68개, browser extension
+전체 187개, CLI typecheck와 package build 통과. 현재 실행 환경의 OrbStack 및
+`walter-gpu` 직접 접속 timeout으로 Linux 실기 E2E는 릴리스 후 머신 검증으로 이월했다.

@@ -21,6 +21,9 @@ export function parseAutoConnectParams(search) {
     const host = (params.get('host') ?? '').trim()
     if (host) result.host = host
 
+    const profile = (params.get('profile') ?? '').trim()
+    if (profile) result.profile = profile
+
     // Absent must stay absent rather than becoming `false`: a machine that
     // re-pairs (new token, same profile) would otherwise silently switch the
     // debugger tier back off for a user who had turned it on.
