@@ -48,11 +48,14 @@ export function createConnection({
     let consecutiveFailures = 0
 
     async function readConfig() {
-        const { port, token, profile, host } = await chrome.storage.local.get(['port', 'token', 'profile', 'host'])
+        const { port, token, profile, pairingId, host } = await chrome.storage.local.get([
+            'port', 'token', 'profile', 'pairingId', 'host',
+        ])
         return {
             port: port || defaultPort,
             token: token || '',
             profile: profile || 'default',
+            pairingId: pairingId || '',
             // The daemon is usually on this machine, but not always — a user
             // can point their own, already-running Chrome at a remote happy
             // session's bridge instead.
@@ -89,13 +92,14 @@ export function createConnection({
             restartRequested = false
             return connect()
         }
-        const { port, token, profile, host } = config
+        const { port, token, profile, pairingId, host } = config
         if (!token) {
             // Not paired yet — the options page starts the connection once saved.
             return
         }
 
-        const url = `ws://${formatHost(host)}:${port}/?token=${encodeURIComponent(token)}&profile=${encodeURIComponent(profile)}`
+        const pairingQuery = pairingId ? `&pairingId=${encodeURIComponent(pairingId)}` : ''
+        const url = `ws://${formatHost(host)}:${port}/?token=${encodeURIComponent(token)}&profile=${encodeURIComponent(profile)}${pairingQuery}`
         let ws
         try {
             ws = new WebSocketImpl(url)

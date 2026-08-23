@@ -42,6 +42,7 @@ import { validatePath } from '@/modules/common/pathSecurity';
 import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createServer } from 'node:net';
+import { randomUUID } from 'node:crypto';
 import { exec } from 'node:child_process';
 import { readDaemonState } from '@/persistence';
 import { fetchBrowserStatus } from '@/daemon/browserClient';
@@ -243,7 +244,7 @@ interface DaemonToServerEvents {
 type BrowserPairResult = {
     ok: boolean;
     message: string;
-    connections: Array<{ profile: string }>;
+    connections: Array<{ profile: string; pairingId?: string }>;
     freshProfiles: string[];
     debuggerTier: boolean | null;
 };
@@ -1201,8 +1202,8 @@ export class ApiMachineClient {
      * and the noVNC viewer. Keeping the existing runPairing sequence here
      * preserves extension injection, token storage, and debugger-tier checks.
      */
-    private async pairBrowser(cdpPort: number, debuggerTier: boolean, profile?: string): Promise<BrowserPairResult> {
-        const facts = await runPairing({ cdpPort, debuggerTier, profile });
+    private async pairBrowser(cdpPort: number, debuggerTier: boolean, pairingId?: string): Promise<BrowserPairResult> {
+        const facts = await runPairing({ cdpPort, debuggerTier, pairingId });
         const outcome = formatPairOutcome(facts);
         return {
             ok: outcome.ok,
@@ -1216,7 +1217,7 @@ export class ApiMachineClient {
     /** Pairing failure must not hide the login screen used to repair it. */
     private async pairViewerBrowser(cdpPort: number): Promise<ViewerBridgeSummary> {
         try {
-            const result = await this.pairBrowser(cdpPort, true, `viewer-${cdpPort}`);
+            const result = await this.pairBrowser(cdpPort, true, `viewer-${cdpPort}-${randomUUID()}`);
             return result.ok
                 ? { bridgeReady: true }
                 : { bridgeReady: false, bridgeMessage: result.message };

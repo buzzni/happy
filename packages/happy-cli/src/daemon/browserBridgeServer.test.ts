@@ -45,6 +45,14 @@ describe('browserBridgeServer', () => {
         ws.close()
     })
 
+    it('forwards a pairing id independently of the profile', async () => {
+        const { ws } = await connectExtension(port, `token=${TOKEN}&profile=work&pairingId=viewer-9222`)
+        await expect.poll(() => bridge.connections()).toEqual([
+            { profile: 'work', pairingId: 'viewer-9222' },
+        ])
+        ws.close()
+    })
+
     it('closes a connection with a wrong token with code 4401', async () => {
         const { ws } = await connectExtension(port, 'token=wrong')
         const code = await new Promise<number>((resolve) => ws.on('close', resolve))
@@ -136,10 +144,13 @@ describe('controlServer /browser routes', () => {
         const before = await fetch(`${baseUrl}/browser/status`)
         expect(await before.json()).toEqual({ connections: [], hasRecentAuthFailure: false })
 
-        const { ws } = await connectExtension(bridgePort, `token=${TOKEN}&profile=work`)
+        const { ws } = await connectExtension(bridgePort, `token=${TOKEN}&profile=work&pairingId=viewer-9222`)
         await expect.poll(() => bridge.connections().length).toBe(1)
         const after = await fetch(`${baseUrl}/browser/status`)
-        expect(await after.json()).toEqual({ connections: [{ profile: 'work' }], hasRecentAuthFailure: false })
+        expect(await after.json()).toEqual({
+            connections: [{ profile: 'work', pairingId: 'viewer-9222' }],
+            hasRecentAuthFailure: false,
+        })
         ws.close()
     })
 

@@ -54,11 +54,11 @@ export async function requestBrowser({ port, method, params, timeoutMs, profile 
  * answer (nothing connected, or zero tabs), so a failure here is not an error
  * — it just means no extra diagnosis.
  */
-export async function fetchBrowserStatus(port: number): Promise<{ connections: Array<{ profile: string }>; hasRecentAuthFailure: boolean } | null> {
+export async function fetchBrowserStatus(port: number): Promise<{ connections: Array<{ profile: string; pairingId?: string }>; hasRecentAuthFailure: boolean } | null> {
     try {
         const response = await fetch(`http://127.0.0.1:${port}/browser/status`, { signal: AbortSignal.timeout(2_000) })
         if (!response.ok) return null
-        const body = await response.json() as { connections?: Array<{ profile: string }>; hasRecentAuthFailure?: boolean }
+        const body = await response.json() as { connections?: Array<{ profile: string; pairingId?: string }>; hasRecentAuthFailure?: boolean }
         return { connections: body.connections ?? [], hasRecentAuthFailure: body.hasRecentAuthFailure ?? false }
     } catch {
         return null

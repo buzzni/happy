@@ -71,6 +71,16 @@ describe('createConnection', () => {
         expect(FakeWebSocket.instances[0].url).toBe('ws://127.0.0.1:41777/?token=tok&profile=default')
     })
 
+    it('identifies an automated pairing without replacing the user profile', async () => {
+        const connection = make(fakeChrome({
+            token: 'tok', port: 41777, profile: 'work', pairingId: 'viewer-9222',
+        }))
+        await connection.connect()
+        expect(FakeWebSocket.instances[0].url).toBe(
+            'ws://127.0.0.1:41777/?token=tok&profile=work&pairingId=viewer-9222',
+        )
+    })
+
     // The daemon is not always on this machine — a user pointing their own,
     // already-logged-in Chrome at a remote happy session needs the extension
     // to dial out somewhere other than its own loopback.

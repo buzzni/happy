@@ -574,7 +574,10 @@ export function startDaemonControlServer({
         schema: {
           response: {
             200: z.object({
-              connections: z.array(z.object({ profile: z.string() })),
+              connections: z.array(z.object({
+                profile: z.string(),
+                pairingId: z.string().optional(),
+              })),
               hasRecentAuthFailure: z.boolean()
             })
           }

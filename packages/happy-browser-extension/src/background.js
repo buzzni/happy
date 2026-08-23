@@ -33,7 +33,7 @@ chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage())
 /** Reconnect immediately after the options page saves new settings. */
 chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return
-    if (!('token' in changes || 'port' in changes || 'profile' in changes || 'host' in changes)) return
+    if (!('token' in changes || 'port' in changes || 'profile' in changes || 'pairingId' in changes || 'host' in changes)) return
     connection.restart()
 })
 

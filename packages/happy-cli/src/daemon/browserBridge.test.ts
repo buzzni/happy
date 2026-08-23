@@ -90,6 +90,12 @@ describe('BrowserBridge', () => {
             connect('work')
             expect(bridge.connections()).toEqual([{ profile: 'work' }])
         })
+
+        it('reports a pairing id separately from the user profile', () => {
+            const socket = new FakeSocket()
+            bridge.handleConnection(socket, { token: TOKEN, profile: 'work', pairingId: 'viewer-9222' })
+            expect(bridge.connections()).toEqual([{ profile: 'work', pairingId: 'viewer-9222' }])
+        })
     })
 
     describe('hasRecentAuthFailure', () => {

@@ -111,9 +111,9 @@ describe('ApiMachineClient browser viewer RPC', () => {
             cdpReachable: true,
             extensionLoaded: true,
             pageOpened: true,
-            connections: [{ profile: 'viewer-9222' }],
-            freshProfiles: ['viewer-9222'],
-            targetProfile: 'viewer-9222',
+            connections: [{ profile: 'work', pairingId: 'viewer-9222' }],
+            freshProfiles: [],
+            targetPairingId: 'viewer-9222',
             debuggerTierRequested: true,
             debuggerTierActual: true,
         })
@@ -126,7 +126,11 @@ describe('ApiMachineClient browser viewer RPC', () => {
 
         const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({})
 
-        expect(mockRunPairing).toHaveBeenCalledWith({ cdpPort: 9222, debuggerTier: true, profile: 'viewer-9222' })
+        expect(mockRunPairing).toHaveBeenCalledWith({
+            cdpPort: 9222,
+            debuggerTier: true,
+            pairingId: expect.stringMatching(/^viewer-9222-/),
+        })
         expect(result).toMatchObject({
             browserReady: true,
             cdpPort: 9222,
@@ -143,9 +147,9 @@ describe('ApiMachineClient browser viewer RPC', () => {
             extensionLoaded: false,
             loadUnpackedFailed: true,
             pageOpened: true,
-            connections: [{ profile: 'unrelated-headless' }],
+            connections: [{ profile: 'unrelated-headless', pairingId: 'other-run' }],
             freshProfiles: [],
-            targetProfile: 'viewer-9222',
+            targetPairingId: 'viewer-9222',
             debuggerTierRequested: true,
         })
         const { ApiMachineClient } = await import('./apiMachine')
@@ -170,9 +174,9 @@ describe('ApiMachineClient browser viewer RPC', () => {
             cdpReachable: true,
             extensionLoaded: true,
             pageOpened: true,
-            connections: [{ profile: 'unrelated-headless' }],
+            connections: [{ profile: 'unrelated-headless', pairingId: 'other-run' }],
             freshProfiles: [],
-            targetProfile: 'viewer-9222',
+            targetPairingId: 'viewer-9222',
             debuggerTierRequested: true,
             debuggerTierActual: true,
         })
@@ -218,7 +222,11 @@ describe('ApiMachineClient browser viewer RPC', () => {
             expect.objectContaining({ cdpPort: 9222, headless: false }),
             { DISPLAY: ':99' },
         )
-        expect(mockRunPairing).toHaveBeenCalledWith({ cdpPort: 9222, debuggerTier: true, profile: 'viewer-9222' })
+        expect(mockRunPairing).toHaveBeenCalledWith({
+            cdpPort: 9222,
+            debuggerTier: true,
+            pairingId: expect.stringMatching(/^viewer-9222-/),
+        })
         expect(result).toMatchObject({
             browserReady: true,
             cdpPort: 9222,

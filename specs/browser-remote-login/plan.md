@@ -159,9 +159,15 @@ typecheck/package build가 통과했다.
 `runPairing`을 호출하게 했다. browser 준비와 bridge 준비 결과를 분리해 페어링 실패가
 noVNC 복구 화면 자체를 숨기지 않게 했다. 또한 `/proc`의 정확한 NUL 구분 cmdline과
 DISPLAY를 확인해 headless Chrome을 viewer Chrome으로 성공 오인하지 않는다. pairing
-URL은 `viewer-<cdpPort>` 프로필명을 명시하고 해당 이름의 bridge 연결을 확인하므로,
-확장이 이미 로드된 viewer 앞에서 unrelated 프로필만 연결된 경우도 성공 처리하지 않는다.
+URL은 사용자 프로필 이름을 바꾸지 않고 실행별 고유 `pairingId`를 전달하며, bridge가
+같은 marker의 연결을 보고해야 성공한다. 따라서 확장이 이미 로드된 viewer 앞에서
+unrelated 프로필만 연결되거나 대기 중 새 bystander가 도착해도 성공 또는 조기 실패로
+오인하지 않는다.
 
 검증: viewer API/browser setup/remote viewer/browser pair focused 68개, browser extension
 전체 187개, CLI typecheck와 package build 통과. 현재 실행 환경의 OrbStack 및
 `walter-gpu` 직접 접속 timeout으로 Linux 실기 E2E는 릴리스 후 머신 검증으로 이월했다.
+
+2026-08-24 셀프 리뷰에서 사용자 프로필명 덮어쓰기와 bystander 조기 종료를 위의
+고유 marker 방식으로 수정했다. browser extension 188개와 CLI 관련 163개 테스트,
+CLI typecheck/build, staged artifact guard/install smoke가 통과했다.

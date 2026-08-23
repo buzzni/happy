@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest'
-import { parsePairArgs, buildPairUrl, formatPairOutcome, pickTierProbeProfile, DEFAULT_CDP_PORT } from './browserPair'
+import {
+    parsePairArgs,
+    buildPairUrl,
+    formatPairOutcome,
+    pairingConnectionArrived,
+    pickTierProbeProfile,
+    DEFAULT_CDP_PORT,
+} from './browserPair'
 
 describe('parsePairArgs', () => {
     it('defaults to Chrome\'s conventional debugging port and leaves the debugger tier alone', () => {
@@ -65,8 +72,10 @@ describe('buildPairUrl', () => {
         expect(buildPairUrl({ ...base, debuggerTier: false })).toContain('&debugger=0')
     })
 
-    it('pins the target bridge profile when the caller needs exact Chrome identity', () => {
-        expect(buildPairUrl({ ...base, profile: 'viewer-9222' })).toContain('&profile=viewer-9222')
+    it('carries a pairing id without overwriting the target Chrome profile', () => {
+        const url = buildPairUrl({ ...base, pairingId: 'viewer-9222' })
+        expect(url).toContain('&pairingId=viewer-9222')
+        expect(url).not.toContain('&profile=')
     })
 })
 
@@ -88,11 +97,11 @@ describe('formatPairOutcome', () => {
         expect(outcome.text).toContain('headless-1')
     })
 
-    it('does not accept an unrelated connection when an exact target profile was requested', () => {
+    it('does not accept an unrelated connection when an exact pairing id was requested', () => {
         const outcome = formatPairOutcome({
             ...base,
-            targetProfile: 'viewer-9222',
-            connections: [{ profile: 'unrelated-headless' }],
+            targetPairingId: 'viewer-9222',
+            connections: [{ profile: 'unrelated-headless', pairingId: 'other-run' }],
             freshProfiles: [],
         })
 
@@ -232,6 +241,24 @@ describe('formatPairOutcome', () => {
         })
         expect(outcome.ok).toBe(true)
         expect(outcome.text).toContain('headless-1')
+    })
+})
+
+describe('pairingConnectionArrived', () => {
+    it('keeps waiting when a bystander connects before the exact target', () => {
+        expect(pairingConnectionArrived(
+            [{ profile: 'desktop' }, { profile: 'bystander', pairingId: 'other-run' }],
+            ['desktop'],
+            'viewer-9222',
+        )).toBe(false)
+    })
+
+    it('finishes when the exact pairing id reconnects under an existing profile', () => {
+        expect(pairingConnectionArrived(
+            [{ profile: 'desktop', pairingId: 'viewer-9222' }],
+            ['desktop'],
+            'viewer-9222',
+        )).toBe(true)
     })
 })
 

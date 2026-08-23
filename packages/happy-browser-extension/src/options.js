@@ -18,7 +18,7 @@ tokenInput.value = stored.token || ''
 profileInput.value = stored.profile || 'default'
 allowlistInput.value = stored.allowlist || ''
 
-async function save({ debuggerTier } = {}) {
+async function save({ debuggerTier, pairingId } = {}) {
     const token = tokenInput.value.trim()
     if (!token) {
         status.textContent = '토큰을 입력해 주세요.'
@@ -31,6 +31,9 @@ async function save({ debuggerTier } = {}) {
         port: Number(portInput.value) || 41777,
         token,
         profile: profileInput.value.trim() || 'default',
+        // This identifies one automated pairing attempt, not the user's
+        // profile. A manual/ordinary save clears a marker left by that run.
+        pairingId: pairingId || '',
         allowlist,
         // Only when the caller was explicit — see parseAutoConnectParams.
         ...(debuggerTier === undefined ? {} : { debuggerTier }),
@@ -64,11 +67,10 @@ if (autoConnect) {
     // Only when the link was explicit — otherwise the field keeps the stored
     // value loaded above, and save() below preserves it.
     if (autoConnect.host !== undefined) hostInput.value = autoConnect.host
-    if (autoConnect.profile !== undefined) profileInput.value = autoConnect.profile
     // Scrub the token from the visible URL / this navigation's history entry
     // right away — nothing downstream needs it to stay there.
     history.replaceState(null, '', location.pathname)
-    await save({ debuggerTier: autoConnect.debuggerTier })
+    await save({ debuggerTier: autoConnect.debuggerTier, pairingId: autoConnect.pairingId })
     status.textContent = `링크로 자동 연결되었습니다. ${status.textContent}`
     if (autoConnect.debuggerTier !== undefined) {
         status.textContent += autoConnect.debuggerTier

@@ -59,12 +59,12 @@ describe('parseAutoConnectParams', () => {
         expect('host' in parsed).toBe(false)
     })
 
-    it('reads an exact profile name when the pairing link pins one', () => {
-        expect(parseAutoConnectParams('?token=abc123&profile=viewer-9222').profile).toBe('viewer-9222')
+    it('reads a pairing id without changing the user profile name', () => {
+        expect(parseAutoConnectParams('?token=abc123&pairingId=viewer-9222').pairingId).toBe('viewer-9222')
     })
 
-    it('omits profile when the link does not mention it, preserving the existing name', () => {
+    it('omits the pairing id when the link does not mention it', () => {
         const parsed = parseAutoConnectParams('?token=abc123')
-        expect('profile' in parsed).toBe(false)
+        expect('pairingId' in parsed).toBe(false)
     })
 })

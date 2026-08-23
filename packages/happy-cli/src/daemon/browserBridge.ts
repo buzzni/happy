@@ -27,6 +27,7 @@ export interface BridgeSocket {
 export interface BridgeConnectionParams {
     token?: string
     profile?: string
+    pairingId?: string
 }
 
 export class BridgeRequestError extends Error {
@@ -44,6 +45,7 @@ interface PendingRequest {
 
 interface Connection {
     profile: string
+    pairingId?: string
     socket: BridgeSocket
     pending: Map<number, PendingRequest>
 }
@@ -112,7 +114,12 @@ export class BrowserBridge {
             stale.socket.close(4409, 'replaced by a new connection')
         }
 
-        const connection: Connection = { profile, socket, pending: new Map() }
+        const connection: Connection = {
+            profile,
+            ...(params.pairingId ? { pairingId: params.pairingId } : {}),
+            socket,
+            pending: new Map(),
+        }
         this.byProfile.set(profile, connection)
 
         socket.on('message', (data) => this.onMessage(connection, data.toString()))
@@ -126,8 +133,11 @@ export class BrowserBridge {
     }
 
     /** Connected extensions (introspection / status endpoint). */
-    connections(): Array<{ profile: string }> {
-        return Array.from(this.byProfile.keys()).map(profile => ({ profile }))
+    connections(): Array<{ profile: string; pairingId?: string }> {
+        return Array.from(this.byProfile.values()).map(({ profile, pairingId }) => ({
+            profile,
+            ...(pairingId ? { pairingId } : {}),
+        }))
     }
 
     /**
