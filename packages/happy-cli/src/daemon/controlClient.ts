@@ -247,7 +247,11 @@ export async function isDaemonRunningCurrentlyInstalledHappyVersion(): Promise<b
 export async function cleanupDaemonState(): Promise<void> {
   try {
     await clearDaemonState();
-    logger.debug('[DAEMON RUN] Daemon state file removed');
+    // clearDaemonState marks the file stopped and keeps it — the tracked
+    // session records are what a replacement daemon recovers from. Saying
+    // "removed" here sent a 2026-08-23 investigation looking for a phantom
+    // writer that had put the file back.
+    logger.debug('[DAEMON RUN] Daemon state marked stopped and lock released');
   } catch (error) {
     logger.debug('[DAEMON RUN] Error cleaning up daemon metadata', error);
   }
