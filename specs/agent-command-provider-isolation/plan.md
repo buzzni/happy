@@ -43,6 +43,8 @@ environment·exit status만 전달하며 Happy session이나 provider 객체를 
   보강하고 전체 검증을 반복한다.
 - [x] Phase 6: 셀프 리뷰 1/3에서 import-time provider side effect를 재현하고 경량 bootstrap으로
   runtime graph를 격리한 뒤 wrapper dispatch 중복을 제거한다.
+- [x] Phase 7: 셀프 리뷰 2/3에서 source/ESM/CJS/Bun 산출물 경계를 대조하고 CommonJS agent
+  entrypoint를 회귀 테스트 행렬에 추가한다.
 
 ## 리스크와 대응
 

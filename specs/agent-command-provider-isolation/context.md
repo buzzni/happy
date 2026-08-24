@@ -1,6 +1,6 @@
 # Agent 명령 direct-entry provider 격리 Context
 
-> 마지막 갱신: 2026-08-24 / 상태: 셀프 리뷰 1/3 수정·검증 완료 — PR #241 리뷰 대기
+> 마지막 갱신: 2026-08-24 / 상태: 셀프 리뷰 2/3 수정·검증 완료 — PR #241 리뷰 대기
 
 ## 현재 상태
 
@@ -15,7 +15,9 @@ typecheck, build, 전체 unit 214파일/2,238테스트가 통과했고 build 산
 모두 수정했다. 이어진 셀프 리뷰 1/3에서는 direct dispatch 전에 정적 import가 Happy log를 만들고
 Claude settings를 읽는 provider side effect(medium)와 wrapper/bootstrap의 dispatch 중복(low)을
 발견했다. 경량 bootstrap과 runtime main을 분리하고 dispatch를 한 곳으로 합친 뒤 전체 unit
-214파일/2,239테스트를 통과시켰다.
+214파일/2,239테스트를 통과시켰다. 셀프 리뷰 2/3에서는 공식 CommonJS export의 agent 경로가
+회귀 행렬에서 빠진 저위험 누락을 발견해 wrapper/ESM/CJS 세 경로를 같은 isolated HOME 계약으로
+고정했고, source 및 Bun 실행도 확인한 뒤 전체 unit 214파일/2,240테스트를 통과시켰다.
 
 ## 핵심 결정 로그
 
@@ -50,6 +52,8 @@ Claude settings를 읽는 provider side effect(medium)와 wrapper/bootstrap의 d
 
 - `--json`은 Saycode CLI에 없는 옵션이다. prompt와 smoke는 `agent whoami`만 사용해야 한다.
 - 자동 과거 session 복구는 이 spec 비목표다. 재발은 entrypoint 격리로 차단한다.
+- 일반(non-agent) CommonJS entrypoint의 `ERR_REQUIRE_ASYNC_MODULE`은 `origin/main` 산출물에서도
+  동일하게 재현되는 기존 문제다. 이번 agent provider 격리의 회귀가 아니므로 별도 spec 대상으로 남긴다.
 
 ## 다음 세션 시작점
 

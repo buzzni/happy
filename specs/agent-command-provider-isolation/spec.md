@@ -52,5 +52,5 @@ provider 런타임 시작이나 기존 Happy session metadata 변경으로 이�
 - [x] direct-entry `agent` 위임과 exit status를 검증하는 단위 테스트가 통과한다.
 - [x] 실제 build 산출물의 `node dist/index.mjs agent whoami`가 JSON과 exit 0을 반환한다.
 - [x] unsupported `--json`이 provider를 시작하지 않고 Saycode CLI exit 2로 끝난다.
-- [x] Happy CLI typecheck, build, 전체 unit suite가 통과한다(214파일/2,239테스트).
+- [x] Happy CLI typecheck, build, 전체 unit suite가 통과한다(214파일/2,240테스트).
 - [x] 변경 범위가 이 spec과 구현·테스트 파일에 한정된 PR #241이 생성된다.

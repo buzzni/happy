@@ -48,3 +48,10 @@
   bootstrap 계약을 통과하는지 각각 검증한다.
 - [x] **T18.** 전체 CLI unit suite, build/typecheck, diff check를 다시 통과시킨다.
   → 검증: 관련 8개, build/typecheck, 전체 214파일/2,239테스트 통과
+
+## Phase 7: 셀프 리뷰 2/3
+
+- [x] **T19.** package가 공식 노출하는 CommonJS direct entrypoint도 provider runtime을 로드하지 않고
+  agent 명령을 위임하는지 isolated HOME 회귀 행렬에 추가한다.
+- [x] **T20.** source/ESM/CJS/wrapper와 Bun 실행을 점검하고 baseline 대조 후 전체 검증을 반복한다.
+  → 검증: 관련 9개, build/typecheck, 전체 214파일/2,240테스트 통과

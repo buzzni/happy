@@ -70,7 +70,8 @@ describe('happy daemon preflight', () => {
 
 describe.each([
     ['packaged wrapper', join(packageRoot, 'bin', 'happy.mjs')],
-    ['direct entrypoint', join(packageRoot, 'dist', 'index.mjs')],
+    ['direct ESM entrypoint', join(packageRoot, 'dist', 'index.mjs')],
+    ['direct CommonJS entrypoint', join(packageRoot, 'dist', 'index.cjs')],
 ])('Happy CLI agent via %s', (_name, entrypoint) => {
     it('routes malformed commands to Saycode without creating Happy runtime state', () => {
         const isolatedHome = mkdtempSync(join(tmpdir(), 'happy-cli-agent-entrypoint-'))
