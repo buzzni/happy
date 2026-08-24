@@ -67,3 +67,39 @@ describe('happy daemon preflight', () => {
         expect(existsSync(join(happyHome, 'sessions.json'))).toBe(false)
     })
 })
+
+describe.each([
+    ['packaged wrapper', join(packageRoot, 'bin', 'happy.mjs')],
+    ['direct ESM entrypoint', join(packageRoot, 'dist', 'index.mjs')],
+    ['direct CommonJS entrypoint', join(packageRoot, 'dist', 'index.cjs')],
+])('Happy CLI agent via %s', (_name, entrypoint) => {
+    it('routes malformed commands to Saycode without creating Happy runtime state', () => {
+        const isolatedHome = mkdtempSync(join(tmpdir(), 'happy-cli-agent-entrypoint-'))
+        temporaryDirectories.push(isolatedHome)
+        const happyHome = join(isolatedHome, '.happy-test')
+
+        const result = spawnSync(
+            process.execPath,
+            [entrypoint, 'agent', 'not-a-real-agent-verb'],
+            {
+                cwd: packageRoot,
+                encoding: 'utf8',
+                timeout: 3_000,
+                env: {
+                    ...process.env,
+                    HOME: isolatedHome,
+                    USERPROFILE: isolatedHome,
+                    HAPPY_HOME_DIR: happyHome,
+                    HAPPY_SERVER_URL: 'http://127.0.0.1:1',
+                },
+            },
+        )
+
+        expect(result.error).toBeUndefined()
+        expect(result.status).toBe(2)
+        expect(result.stdout).toBe('')
+        expect(result.stderr).toMatch(/^saycode: agent needs one of:/)
+        expect(result.stderr).not.toMatch(/claude|codex|gemini/i)
+        expect(existsSync(happyHome)).toBe(false)
+    })
+})
