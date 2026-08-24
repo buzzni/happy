@@ -264,6 +264,7 @@ type MachineRpcHandlers = {
     resumeSession?: (sessionId: string, options?: {
         model?: string;
         permissionMode?: string;
+        environmentVariables?: Record<string, string>;
         mcpCallerGrantEnvelope?: string;
         mcpConfigProjectId?: string;
         expectedConnectors?: string[];
@@ -350,6 +351,7 @@ export class ApiMachineClient {
     private resumeSessionHandler: ((sessionId: string, options?: {
         model?: string;
         permissionMode?: string;
+        environmentVariables?: Record<string, string>;
         mcpCallerGrantEnvelope?: string;
         mcpConfigProjectId?: string;
         expectedConnectors?: string[];
@@ -1314,6 +1316,7 @@ export class ApiMachineClient {
                         sessionId,
                         model,
                         permissionMode,
+                        environmentVariables,
                         mcpCallerGrantEnvelope,
                         mcpConfigProjectId,
                         expectedConnectors,
@@ -1321,6 +1324,17 @@ export class ApiMachineClient {
 
                     if (!sessionId || typeof sessionId !== 'string') {
                         throw new Error('Session ID is required');
+                    }
+                    if (
+                        environmentVariables !== undefined
+                        && (
+                            environmentVariables === null
+                            || typeof environmentVariables !== 'object'
+                            || Array.isArray(environmentVariables)
+                            || Object.values(environmentVariables).some((value) => typeof value !== 'string')
+                        )
+                    ) {
+                        throw new Error('Environment variables must contain string values only');
                     }
                     if (mcpCallerGrantEnvelope !== undefined && typeof mcpCallerGrantEnvelope !== 'string') {
                         throw new Error('MCP caller grant envelope must be a string');
@@ -1338,6 +1352,7 @@ export class ApiMachineClient {
                     const result = await handler(sessionId, {
                         model,
                         permissionMode,
+                        environmentVariables,
                         mcpCallerGrantEnvelope,
                         mcpConfigProjectId,
                         expectedConnectors: validExpectedConnectors,

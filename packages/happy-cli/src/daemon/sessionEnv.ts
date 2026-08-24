@@ -79,10 +79,14 @@ export function captureSaycodeAgentEnvironment(
 export function buildResumedSessionSpawnEnvironment(input: {
     inherited: NodeJS.ProcessEnv
     explicit: Record<string, string>
+    runtime?: Record<string, string>
+    automation?: Record<string, string>
     agentEnvironment?: SaycodeAgentEnvironment
     sessionId: string
 }): Record<string, string> {
     return buildSessionSpawnEnvironment(input.inherited, {
+        ...scrubSessionLineageEnv(input.runtime ?? {}),
+        ...scrubSessionLineageEnv(input.automation ?? {}),
         ...input.explicit,
         ...(input.agentEnvironment ?? {}),
         APLUS_SESSION_ID: input.sessionId,

@@ -235,6 +235,7 @@ describe('ApiMachineClient spawn/resume RPC passthrough', () => {
         await handlersFrom(client).get('machine-1:resume-happy-session')?.({
             sessionId: 'happy-1',
             permissionMode: 'bypassPermissions',
+            environmentVariables: { ORG_SECRET: 'resume-secret' },
             mcpCallerGrantEnvelope: 'ENCRYPTED-RESUME-GRANT',
             mcpConfigProjectId: 'P-1',
             expectedConnectors: ['gmail', 'knoi'],
@@ -242,6 +243,7 @@ describe('ApiMachineClient spawn/resume RPC passthrough', () => {
 
         expect(resumeSession).toHaveBeenCalledWith('happy-1', expect.objectContaining({
             permissionMode: 'bypassPermissions',
+            environmentVariables: { ORG_SECRET: 'resume-secret' },
             mcpCallerGrantEnvelope: 'ENCRYPTED-RESUME-GRANT',
             mcpConfigProjectId: 'P-1',
             expectedConnectors: ['gmail', 'knoi'],
