@@ -57,3 +57,15 @@ export function hydrateTrackedSessionFromPersisted(persisted: PersistedSession |
     ...(agentEnvironment ? { agentEnvironment } : {}),
   };
 }
+
+export function hydrateRecoveredSessionFromPersisted(
+  persisted: PersistedSession | undefined,
+  baselineSeq: number,
+): Pick<TrackedSession, 'userHomeDir' | 'persistedLastProcessedSeq' | 'agentEnvironment'> {
+  const hydrated = hydrateTrackedSessionFromPersisted(persisted);
+  return {
+    ...(hydrated.userHomeDir ? { userHomeDir: hydrated.userHomeDir } : {}),
+    persistedLastProcessedSeq: baselineSeq,
+    ...(hydrated.agentEnvironment ? { agentEnvironment: hydrated.agentEnvironment } : {}),
+  };
+}

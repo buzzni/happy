@@ -97,7 +97,10 @@ import {
   type StopSessionResult,
 } from './sessionIdleReaper';
 import { resolveOrphanAdoption, collectStartupOrphans, resolveTrackedPidOwner } from './orphanAdoption';
-import { hydrateTrackedSessionFromPersisted } from './persistedSessionHydration';
+import {
+  hydrateRecoveredSessionFromPersisted,
+  hydrateTrackedSessionFromPersisted,
+} from './persistedSessionHydration';
 import { createAutomationStore } from './automations/automationStore';
 import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
@@ -1515,7 +1518,12 @@ export async function startDaemon(): Promise<void> {
       }
 
       if (decision.kind === 'same-session') {
+        const recoveredPersisted = hydrateRecoveredSessionFromPersisted(
+          persistedSession,
+          decision.baselineSeq,
+        );
         const recovered: TrackedSession = {
+          ...recoveredPersisted,
           startedBy: 'recovered from persisted session',
           happySessionId: serverSession.id,
           happySessionMetadataFromLocalWebhook: serverSession.metadata,
@@ -1527,9 +1535,6 @@ export async function startDaemon(): Promise<void> {
             agentStateVersion: serverSession.agentStateVersion,
           },
           pid: 0,
-          userHomeDir: persistedSession?.userHomeDir,
-          persistedLastProcessedSeq: decision.baselineSeq,
-          agentEnvironment: persistedSession?.agentEnvironment,
         };
         sessionIdToFinishedSession.set(serverSession.id, recovered);
         persistSession(serverSession.id, {
@@ -1540,9 +1545,9 @@ export async function startDaemon(): Promise<void> {
           agentStateVersion: serverSession.agentStateVersion,
           metadata: serverSession.metadata,
           savedAt: Date.now(),
-          userHomeDir: persistedSession?.userHomeDir,
+          userHomeDir: recoveredPersisted.userHomeDir,
           lastProcessedSeq: decision.baselineSeq,
-          agentEnvironment: persistedSession?.agentEnvironment,
+          agentEnvironment: recoveredPersisted.agentEnvironment,
         });
 
         const result = await spawnResumedSession(serverSession.id, {

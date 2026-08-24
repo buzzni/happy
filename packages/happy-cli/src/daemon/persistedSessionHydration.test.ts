@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { encodeBase64 } from '@/api/encryption';
 import type { Metadata } from '@/api/types';
-import { hydrateTrackedSessionFromPersisted } from './persistedSessionHydration';
+import {
+  hydrateRecoveredSessionFromPersisted,
+  hydrateTrackedSessionFromPersisted,
+} from './persistedSessionHydration';
 import type { PersistedSession } from '@/persistence';
 
 const metadata = { path: '/work/repo', host: 'mac' } as unknown as Metadata;
@@ -89,5 +92,31 @@ describe('hydrateTrackedSessionFromPersisted', () => {
   // protection depends on runtime being absent until a real report arrives.
   it('shouldNotFabricateRuntimeState', () => {
     expect('runtime' in hydrateTrackedSessionFromPersisted(persisted({ lastProcessedSeq: 41 }))).toBe(false);
+  });
+});
+
+describe('hydrateRecoveredSessionFromPersisted', () => {
+  it('shouldValidateCapabilitiesOnTheExplicitSameSessionRecoveryPath', () => {
+    const agentEnvironment = {
+      SAYCODE_AGENT_ENV: '1',
+      SAYCODE_AGENT_ROOT: 'root-session',
+      NODE_OPTIONS: '--require /tmp/untrusted.cjs',
+    } as unknown as NonNullable<PersistedSession['agentEnvironment']>;
+
+    expect(hydrateRecoveredSessionFromPersisted(
+      persisted({
+        userHomeDir: '/tmp/happy-session-1',
+        lastProcessedSeq: 12,
+        agentEnvironment,
+      }),
+      41,
+    )).toEqual({
+      userHomeDir: '/tmp/happy-session-1',
+      persistedLastProcessedSeq: 41,
+      agentEnvironment: {
+        SAYCODE_AGENT_ENV: '1',
+        SAYCODE_AGENT_ROOT: 'root-session',
+      },
+    });
   });
 });
