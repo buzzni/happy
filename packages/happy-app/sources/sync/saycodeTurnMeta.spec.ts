@@ -27,28 +27,24 @@ describe('buildSaycodeTurnMeta', () => {
         expect(meta.appendSystemPrompt).toBeUndefined();
     });
 
-    it('keeps the legacy shape byte-identical when no overrides exist', () => {
+    it('marks app-composed guidance as client-turn scoped when enabled', () => {
         const meta = buildSaycodeTurnMeta({
             preference: true,
             overrides: {},
             surface: 'mobile',
         });
         expect(meta.saycodeSystemPromptEnabled).toBe(true);
-        expect(meta.appendSystemPrompt).toContain('<!-- saycode:owned-prompt -->');
+        expect(meta.appendSystemPrompt).toMatch(/<!-- saycode:client-turn-prompt:[a-z0-9]+-[a-z0-9]+:start -->/);
         expect(meta.saycodePromptBlocks).toBeUndefined();
     });
 
-    it('sends an explicit reset when the touched options guidance leaves the prompt empty', () => {
-        // Unwrapped blocks (R22) pass the CLI's master-off sentinel strip, so cache
-        // invalidation can no longer ride on it. Once the user touched the block, an
-        // empty composed prompt must travel as an explicit null — omitting it would
-        // leave the previously sent guidance in the CLI cache, still applying.
+    it('omits append when options guidance is off so runtime removes only its cached client-turn block', () => {
         const meta = buildSaycodeTurnMeta({
             preference: true,
             overrides: { optionsGuidance: false },
             surface: 'mobile',
         });
-        expect(meta.appendSystemPrompt).toBeNull();
+        expect(meta.appendSystemPrompt).toBeUndefined();
         // The app-composed id never travels on the wire — happy-cli does not know it.
         expect(meta.saycodePromptBlocks).toBeUndefined();
         expect(meta.saycodeSystemPromptEnabled).toBe(true);
@@ -69,12 +65,8 @@ describe('buildSaycodeTurnMeta', () => {
             overrides: { optionsGuidance: true },
             surface: 'mobile',
         });
-        // happy-cli strips every saycode-owned sentinel block from appendSystemPrompt
-        // when the master flag is off — wrapping here would let the CLI silently undo
-        // the user's explicit override. Under master-off the surviving block must
-        // travel unwrapped; under master-on the CLI never strips, so wrapping stays.
         expect(meta.appendSystemPrompt).toContain('# Options');
-        expect(meta.appendSystemPrompt).not.toContain('<!-- saycode:owned-prompt -->');
+        expect(meta.appendSystemPrompt).toMatch(/<!-- saycode:client-turn-prompt:[a-z0-9]+-[a-z0-9]+:start -->/);
         expect(meta.saycodeSystemPromptEnabled).toBe(false);
     });
 });

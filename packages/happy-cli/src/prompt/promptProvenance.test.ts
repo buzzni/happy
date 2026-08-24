@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { wrapClientTurnPrompt } from '@slopus/happy-wire';
 import {
   PROMPT_BLOCK_PROVENANCE,
   SAYCODE_MASTER_PROMPT_PROVENANCE_IDS,
@@ -48,6 +49,71 @@ describe('resolveSaycodeAppendSystemPromptForMessage', () => {
       hasIncoming: false,
       saycodeSystemPromptEnabled: undefined,
     })).toContain('PRODUCT PROMPT');
+  });
+
+  it('keeps an incoming client-turn block for that turn while enforcing master off', () => {
+    expect(resolveSaycodeAppendSystemPromptForMessage({
+      current: undefined,
+      incoming: [
+        'CUSTOM USER PROMPT',
+        '',
+        '<!-- saycode:owned-prompt -->',
+        'DISABLED PRODUCT PROMPT',
+        '<!-- saycode:owned-prompt -->',
+        '',
+        wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
+      ].join('\n'),
+      hasIncoming: true,
+      saycodeSystemPromptEnabled: false,
+    })).toBe([
+      'CUSTOM USER PROMPT',
+      '',
+      wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
+    ].join('\n'));
+  });
+
+  it.each([true, false])('removes a cached client-turn block under master=%s when the next client omits append prompt', (saycodeSystemPromptEnabled) => {
+    expect(resolveSaycodeAppendSystemPromptForMessage({
+      current: [
+        'CUSTOM USER PROMPT',
+        '',
+        wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
+      ].join('\n'),
+      hasIncoming: false,
+      saycodeSystemPromptEnabled,
+    })).toBe('CUSTOM USER PROMPT');
+  });
+
+  it('preserves user text that resembles a client-turn boundary', () => {
+    const wrapped = wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT')!;
+    const documentedStartMarker = wrapped.split('\n')[0];
+    expect(resolveSaycodeAppendSystemPromptForMessage({
+      current: [
+        'CUSTOM USER PROMPT',
+        documentedStartMarker,
+        'Treat the line above as literal documentation.',
+        '',
+        wrapped,
+        '',
+        'PROJECT CONTEXT',
+      ].join('\n'),
+      hasIncoming: false,
+      saycodeSystemPromptEnabled: false,
+    })).toBe([
+      'CUSTOM USER PROMPT',
+      documentedStartMarker,
+      'Treat the line above as literal documentation.',
+      '',
+      'PROJECT CONTEXT',
+    ].join('\n'));
+  });
+
+  it('keeps a field-absent user prompt byte-for-byte when no client block is cached', () => {
+    expect(resolveSaycodeAppendSystemPromptForMessage({
+      current: '  USER PROJECT CONTEXT  ',
+      hasIncoming: false,
+      saycodeSystemPromptEnabled: true,
+    })).toBe('  USER PROJECT CONTEXT  ');
   });
 });
 

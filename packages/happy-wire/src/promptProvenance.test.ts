@@ -1,16 +1,28 @@
 import { describe, expect, it } from 'vitest';
 import {
+  stripClientTurnPromptBlocks,
   stripSaycodeOwnedPromptBlocks,
+  wrapClientTurnPrompt,
   wrapSaycodeOwnedPrompt,
 } from './promptProvenance';
 
 describe('Saycode-owned prompt provenance', () => {
   it('wraps a product-owned block so it can be removed later', () => {
     expect(wrapSaycodeOwnedPrompt('  PRODUCT PROMPT  ')).toBe([
-      '<!-- saycode:owned-prompt -->',
+      '<!-- saycode:owned-prompt:e-jt9b76:start -->',
       'PRODUCT PROMPT',
-      '<!-- saycode:owned-prompt -->',
+      '<!-- saycode:owned-prompt:e-jt9b76:end -->',
     ].join('\n'));
+  });
+
+  it('still removes a legacy owned sentinel block during rollout', () => {
+    expect(stripSaycodeOwnedPromptBlocks([
+      'CUSTOM USER PROMPT',
+      '',
+      '<!-- saycode:owned-prompt -->',
+      'LEGACY PRODUCT PROMPT',
+      '<!-- saycode:owned-prompt -->',
+    ].join('\n'))).toBe('CUSTOM USER PROMPT');
   });
 
   it('removes only Saycode-owned blocks and preserves user context', () => {
@@ -41,5 +53,96 @@ describe('Saycode-owned prompt provenance', () => {
       'PROJECT CONTEXT',
       'PERSONAL MEMORY',
     ].join('\n\n'));
+  });
+
+  it('does not pair an owned marker mentioned by user context with a product block', () => {
+    const wrapped = wrapSaycodeOwnedPrompt('PRODUCT PROMPT')!;
+    const startMarker = wrapped.split('\n')[0];
+    expect(stripSaycodeOwnedPromptBlocks([
+      'CUSTOM USER PROMPT',
+      startMarker,
+      'Treat the line above as literal documentation.',
+      '',
+      wrapped,
+      '',
+      'PROJECT CONTEXT',
+    ].join('\n'))).toBe([
+      'CUSTOM USER PROMPT',
+      startMarker,
+      'Treat the line above as literal documentation.',
+      '',
+      'PROJECT CONTEXT',
+    ].join('\n'));
+  });
+});
+
+describe('client-turn prompt provenance', () => {
+  it('wraps a client-local block separately from account-owned prompts', () => {
+    expect(wrapClientTurnPrompt('  DESKTOP PREVIEW PROMPT  ')).toBe([
+      '<!-- saycode:client-turn-prompt:m-d7txt3:start -->',
+      'DESKTOP PREVIEW PROMPT',
+      '<!-- saycode:client-turn-prompt:m-d7txt3:end -->',
+    ].join('\n'));
+  });
+
+  it('removes stale client-turn blocks without clearing user context', () => {
+    expect(stripClientTurnPromptBlocks([
+      'CUSTOM USER PROMPT',
+      '',
+      wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
+      '',
+      'PROJECT CONTEXT',
+    ].join('\n'))).toBe('CUSTOM USER PROMPT\n\nPROJECT CONTEXT');
+  });
+
+  it('does not pair a marker mentioned by user context with a product block', () => {
+    const wrapped = wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT')!;
+    const startMarker = wrapped.split('\n')[0];
+    expect(stripClientTurnPromptBlocks([
+      'CUSTOM USER PROMPT',
+      startMarker,
+      'Treat the line above as literal documentation.',
+      '',
+      wrapped,
+      '',
+      'PROJECT CONTEXT',
+    ].join('\n'))).toBe([
+      'CUSTOM USER PROMPT',
+      startMarker,
+      'Treat the line above as literal documentation.',
+      '',
+      'PROJECT CONTEXT',
+    ].join('\n'));
+  });
+
+  it('preserves indentation in user context surrounding a removed block', () => {
+    expect(stripClientTurnPromptBlocks([
+      'CUSTOM USER PROMPT  ',
+      '',
+      wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
+      '',
+      '  INDENTED PROJECT CONTEXT',
+    ].join('\n'))).toBe('CUSTOM USER PROMPT  \n\n  INDENTED PROJECT CONTEXT');
+  });
+
+  it('is byte-preserving when no client-turn block exists', () => {
+    expect(stripClientTurnPromptBlocks('  CUSTOM USER PROMPT  '))
+      .toBe('  CUSTOM USER PROMPT  ');
+  });
+
+  it('preserves outer user whitespace when removing a trailing block', () => {
+    expect(stripClientTurnPromptBlocks([
+      '  CUSTOM USER PROMPT  ',
+      '',
+      wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
+    ].join('\n'))).toBe('  CUSTOM USER PROMPT  ');
+  });
+
+  it('removes multiple client-turn blocks in one composed prompt', () => {
+    expect(stripClientTurnPromptBlocks([
+      wrapClientTurnPrompt('DESKTOP DELEGATION PROMPT'),
+      '',
+      wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
+    ].join('\n'))).toBeUndefined();
   });
 });
