@@ -1,0 +1,28 @@
+# Agent 명령 direct-entry provider 격리 Tasks
+
+> 상태: 승인됨 / 한 작업은 Red → Green → 검증 가능한 단위로 완료한다.
+
+## Phase 1: 재현과 경계 확정
+
+- [x] **T1.** 사고 로그에서 같은 Happy session id에 Codex와 accidental Claude process가 동시에
+  등록되고 이후 `claude-sonnet-5`가 Codex로 전달된 순서를 확인한다.
+- [x] **T2.** 설치형 `bin/happy.mjs`에는 `agent` 분기가 있지만 source `index.ts`에는 없음을 확인한다.
+
+## Phase 2: TDD 구현
+
+- [x] **T3.** direct-entry 위임 handler가 없어서 실패하는 단위 테스트를 먼저 실행한다.
+- [x] **T4.** bundled manifest의 `bin.saycode`를 실행하고 인자·environment·status를 전달하는 최소
+  `handleAgentCommand`를 구현한다.
+- [x] **T5.** `src/index.ts`가 provider 기본 분기 전에 `agent`를 handler로 전달하게 한다.
+
+## Phase 3: 검증
+
+- [x] **T6.** 관련 테스트와 typecheck를 실행한다.
+- [x] **T7.** build 산출물의 `agent whoami` 성공과 unsupported `--json` 실패가 provider를 시작하지
+  않는지 확인한다.
+- [x] **T8.** 전체 Happy CLI unit suite와 diff check를 통과시킨다(214파일/2,236테스트).
+
+## Phase 4: 전달
+
+- [x] **T9.** spec/context 완료 상태와 실제 검증 수치를 동기화한다.
+- [ ] **T10.** 단일 behavioral commit을 push하고 `origin/main` 대상 PR을 생성한다.

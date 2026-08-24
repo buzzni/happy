@@ -35,6 +35,7 @@ import { extractNoSandboxFlag } from './utils/sandboxFlags'
 import { handleResumeCommand } from '@/resume/handleResumeCommand'
 import { ensureDaemonRunning } from './daemon/ensureDaemonRunning'
 import { handleCodexCommand } from './commands/codexCommand'
+import { handleAgentCommand } from './commands/agentCommand'
 import { runPreToolUseCli } from './hooks/runPreToolUseCli'
 import { preflightDaemonControlServer } from './daemon/controlServer'
 import { resolveMcpConfigPresetUrl } from './aplus/mcpConfigPresets'
@@ -55,7 +56,9 @@ import { resolveMcpConfigPresetUrl } from './aplus/mcpConfigPresets'
   if (!args.includes('--version')) {
   }
 
-  if (subcommand === 'doctor') {
+  if (subcommand === 'agent') {
+    process.exit(handleAgentCommand(args.slice(1)))
+  } else if (subcommand === 'doctor') {
     // Check for clean subcommand
     if (args[1] === 'clean') {
       if (args.slice(2).some(a => a === '--help' || a === '-h')) {
