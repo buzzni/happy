@@ -37,7 +37,7 @@ bundled Saycode manifest의 `bin.saycode`를 해석해 동일 Node 실행 파일
 - [x] Phase 1: 사고 경로와 두 entrypoint 차이를 로그·소스로 확정한다.
 - [x] Phase 2: direct-entry 위임 실패 테스트를 먼저 작성하고 최소 handler·dispatch를 구현한다.
 - [x] Phase 3: 관련/전체 테스트, build 산출물 success/failure smoke, diff 검토를 완료한다.
-- [ ] Phase 4: context와 체크리스트를 완료 처리하고 단일 behavioral commit으로 PR을 생성한다.
+- [x] Phase 4: context와 체크리스트를 완료 처리하고 behavioral 구현 commit으로 PR을 생성한다.
 
 ## 리스크와 대응
 

@@ -1,6 +1,6 @@
 # Agent 명령 direct-entry provider 격리 Context
 
-> 마지막 갱신: 2026-08-24 / 상태: 구현·검증 완료, PR 생성 대기
+> 마지막 갱신: 2026-08-24 / 상태: 완료 — PR #241 리뷰 대기
 
 ## 현재 상태
 
@@ -9,7 +9,7 @@
 Codex session에 Claude를 재연결했고 session flavor가 오염됐다. Red 테스트 후 bundled Saycode CLI로
 조기 위임하는 handler와 `index.ts` dispatch를 구현했다. 최신 `origin/main` 기준 관련 테스트 2개,
 typecheck, build, 전체 unit 214파일/2,236테스트가 통과했고 build 산출물의 success/failure smoke도
-각각 exit 0/2로 끝났다. 구현·검증은 완료됐으며 commit·push·PR 생성만 남았다.
+각각 exit 0/2로 끝났다. 구현 commit `42924835`를 push했고 `origin/main` 대상 PR #241을 생성했다.
 
 ## 핵심 결정 로그
 
@@ -35,9 +35,9 @@ typecheck, build, 전체 unit 214파일/2,236테스트가 통과했고 build 산
 
 ## 다음 세션 시작점
 
-1. diff가 spec 범위에만 해당하는지 최종 확인한다.
-2. 단일 behavioral commit을 push하고 PR을 생성한다.
-3. PR URL을 context에 기록하고 완료 처리한다.
+1. PR #241의 CI와 review 결과를 확인한다.
+2. 수정 요청이 있으면 이 spec 범위 안에서 반영하고 같은 검증을 반복한다.
+3. merge/release는 별도 요청과 Happy CLI release 정책에 따른다.
 
 ## 파일 맵
 

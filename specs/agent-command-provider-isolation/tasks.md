@@ -25,4 +25,4 @@
 ## Phase 4: 전달
 
 - [x] **T9.** spec/context 완료 상태와 실제 검증 수치를 동기화한다.
-- [ ] **T10.** 단일 behavioral commit을 push하고 `origin/main` 대상 PR을 생성한다.
+- [x] **T10.** behavioral 구현 commit을 push하고 `origin/main` 대상 PR #241을 생성한다.
