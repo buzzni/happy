@@ -7,6 +7,7 @@ import { getProjectPath } from './path';
 
 export const CLAUDE_SESSION_TRANSFER_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
 export const CLAUDE_SESSION_TRANSFER_MAX_BYTES = 512 * 1024 * 1024;
+export const CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -134,6 +135,7 @@ type PendingClaudeSessionImport = {
     size: number;
     sha256: string;
     bytesWritten: number;
+    cleanupTimer: ReturnType<typeof setTimeout>;
 };
 
 function assertValidImportManifest(size: number, sha256: string): void {
@@ -162,6 +164,15 @@ function decodeTransferChunk(content: string): Buffer {
 export function createClaudeSessionTransferRuntime(input: { allowedRoot: string }) {
     const pending = new Map<string, PendingClaudeSessionImport>();
 
+    const discardPending = async (
+        transferId: string,
+        transfer: PendingClaudeSessionImport,
+    ): Promise<void> => {
+        pending.delete(transferId);
+        clearTimeout(transfer.cleanupTimer);
+        await rm(transfer.tempPath, { force: true });
+    };
+
     return {
         async beginImport(request: {
             directory: string;
@@ -187,12 +198,20 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
             const tempPath = `${finalPath}.aplus-transfer-${transferId}.tmp`;
             const file = await open(tempPath, 'wx');
             await file.close();
+            const cleanupTimer = setTimeout(async () => {
+                const abandoned = pending.get(transferId);
+                if (!abandoned) return;
+                pending.delete(transferId);
+                await rm(abandoned.tempPath, { force: true }).catch(() => {});
+            }, CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS);
+            cleanupTimer.unref();
             pending.set(transferId, {
                 tempPath,
                 finalPath,
                 size: request.size,
                 sha256: request.sha256.toLowerCase(),
                 bytesWritten: 0,
+                cleanupTimer,
             });
             return { status: 'ready', transferId };
         },
@@ -229,8 +248,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
         async abortImport(request: { transferId: string }): Promise<{ aborted: boolean }> {
             const transfer = pending.get(request.transferId);
             if (!transfer) return { aborted: false };
-            pending.delete(request.transferId);
-            await rm(transfer.tempPath, { force: true });
+            await discardPending(request.transferId, transfer);
             return { aborted: true };
         },
 
@@ -241,8 +259,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
             if (!transfer) throw new Error('Unknown Claude session transfer');
 
             const discard = async () => {
-                pending.delete(request.transferId);
-                await rm(transfer.tempPath, { force: true });
+                await discardPending(request.transferId, transfer);
             };
 
             if (transfer.bytesWritten !== transfer.size) {
@@ -277,6 +294,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
             try {
                 await rename(transfer.tempPath, transfer.finalPath);
                 pending.delete(request.transferId);
+                clearTimeout(transfer.cleanupTimer);
                 return { status: 'imported' };
             } catch (error) {
                 await discard();

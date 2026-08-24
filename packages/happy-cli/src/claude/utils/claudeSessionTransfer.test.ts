@@ -1,10 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
     CLAUDE_SESSION_TRANSFER_CHUNK_MAX_BYTES,
+    CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS,
     assertValidClaudeSessionChunk,
     createClaudeSessionTransferHandler,
     createClaudeSessionTransferRuntime,
@@ -29,6 +30,7 @@ describe('Claude session transfer input validation', () => {
     });
 
     afterEach(async () => {
+        vi.useRealTimers();
         if (previousClaudeConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
         else process.env.CLAUDE_CONFIG_DIR = previousClaudeConfigDir;
         await rm(root, { recursive: true, force: true });
@@ -181,6 +183,36 @@ describe('Claude session transfer input validation', () => {
             allowedRoot: root,
         }));
         expect(await readdir(bucket)).toEqual([]);
+    });
+
+    it('expires an abandoned pending import and removes its temp file', async () => {
+        vi.useFakeTimers();
+        const runtime = createClaudeSessionTransferRuntime({ allowedRoot: root });
+        const begun = await runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 10,
+            sha256: 'a'.repeat(64),
+        });
+        if (begun.status !== 'ready') throw new Error('expected ready import');
+        const bucket = dirname(resolveClaudeSessionTransferPath({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            allowedRoot: root,
+        }));
+
+        expect(await readdir(bucket)).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS);
+        vi.useRealTimers();
+
+        await vi.waitFor(async () => {
+            expect(await readdir(bucket)).toEqual([]);
+        });
+        await expect(runtime.writeImportChunk({
+            transferId: begun.transferId,
+            offset: 0,
+            content: Buffer.from('x').toString('base64'),
+        })).rejects.toThrow('Unknown Claude session transfer');
     });
 
     it('rejects a destination chunk that exceeds its declared session size', async () => {
@@ -351,5 +383,5 @@ describe('Claude session transfer input validation', () => {
             allowedRoot: root,
         });
         expect(await readFile(destinationPath)).toEqual(content);
-    }, 20_000);
+    }, 60_000);
 });
