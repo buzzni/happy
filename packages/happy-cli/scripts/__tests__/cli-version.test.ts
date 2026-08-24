@@ -68,14 +68,18 @@ describe('happy daemon preflight', () => {
     })
 })
 
-describe('direct Happy CLI agent entrypoint', () => {
-    it('routes malformed agent commands to Saycode instead of a provider runtime', () => {
+describe.each([
+    ['packaged wrapper', join(packageRoot, 'bin', 'happy.mjs')],
+    ['direct entrypoint', join(packageRoot, 'dist', 'index.mjs')],
+])('Happy CLI agent via %s', (_name, entrypoint) => {
+    it('routes malformed commands to Saycode without creating Happy runtime state', () => {
         const isolatedHome = mkdtempSync(join(tmpdir(), 'happy-cli-agent-entrypoint-'))
         temporaryDirectories.push(isolatedHome)
+        const happyHome = join(isolatedHome, '.happy-test')
 
         const result = spawnSync(
             process.execPath,
-            [join(packageRoot, 'dist', 'index.mjs'), 'agent', 'not-a-real-agent-verb'],
+            [entrypoint, 'agent', 'not-a-real-agent-verb'],
             {
                 cwd: packageRoot,
                 encoding: 'utf8',
@@ -84,7 +88,7 @@ describe('direct Happy CLI agent entrypoint', () => {
                     ...process.env,
                     HOME: isolatedHome,
                     USERPROFILE: isolatedHome,
-                    HAPPY_HOME_DIR: join(isolatedHome, '.happy-test'),
+                    HAPPY_HOME_DIR: happyHome,
                     HAPPY_SERVER_URL: 'http://127.0.0.1:1',
                 },
             },
@@ -95,5 +99,6 @@ describe('direct Happy CLI agent entrypoint', () => {
         expect(result.stdout).toBe('')
         expect(result.stderr).toMatch(/^saycode: agent needs one of:/)
         expect(result.stderr).not.toMatch(/claude|codex|gemini/i)
+        expect(existsSync(happyHome)).toBe(false)
     })
 })

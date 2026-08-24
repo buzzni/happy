@@ -37,3 +37,14 @@
 - [x] **T14.** direct-entry 테스트의 provider 부재 assertion을 대소문자 비구분으로 고정해 실제 로그의
   `[CLAUDE]` 같은 표기도 놓치지 않게 한다.
   → 검증: 관련 7개, typecheck, build, 전체 214파일/2,238테스트 통과
+
+## Phase 6: 셀프 리뷰 1/3
+
+- [x] **T15.** build된 direct entrypoint가 provider dispatch 전 Happy log를 만들고 Claude settings를
+  읽는 import-time side effect를 isolated HOME 회귀 테스트로 재현한다.
+- [x] **T16.** 경량 `index.ts` bootstrap과 기존 runtime command 구현을 분리해 `agent`가 runtime
+  module graph를 로드하기 전에 bundled Saycode로 위임되게 한다.
+- [x] **T17.** `bin/happy.mjs`의 중복 agent dispatch를 제거하고 wrapper/direct entrypoint가 같은
+  bootstrap 계약을 통과하는지 각각 검증한다.
+- [x] **T18.** 전체 CLI unit suite, build/typecheck, diff check를 다시 통과시킨다.
+  → 검증: 관련 8개, build/typecheck, 전체 214파일/2,239테스트 통과

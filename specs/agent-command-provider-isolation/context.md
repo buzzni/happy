@@ -1,6 +1,6 @@
 # Agent 명령 direct-entry provider 격리 Context
 
-> 마지막 갱신: 2026-08-24 / 상태: 셀프 리뷰 1/4 수정·검증 완료 — PR #241 리뷰 대기
+> 마지막 갱신: 2026-08-24 / 상태: 셀프 리뷰 1/3 수정·검증 완료 — PR #241 리뷰 대기
 
 ## 현재 상태
 
@@ -12,10 +12,19 @@ typecheck, build, 전체 unit 214파일/2,238테스트가 통과했고 build 산
 각각 exit 0/2로 끝났다. 구현 commit `42924835`를 push했고 `origin/main` 대상 PR #241을 생성했다.
 셀프 리뷰 1/4에서 실제 `dist/index.mjs` dispatch 회귀 테스트 누락(medium), spawnSync 오류 은폐(low),
 지원하지 않는 `--json` 성공 fixture(nit), provider 부재 assertion의 대소문자 민감성(nit)을 발견해
-모두 수정하고 전체 검증을 반복했다.
+모두 수정했다. 이어진 셀프 리뷰 1/3에서는 direct dispatch 전에 정적 import가 Happy log를 만들고
+Claude settings를 읽는 provider side effect(medium)와 wrapper/bootstrap의 dispatch 중복(low)을
+발견했다. 경량 bootstrap과 runtime main을 분리하고 dispatch를 한 곳으로 합친 뒤 전체 unit
+214파일/2,239테스트를 통과시켰다.
 
 ## 핵심 결정 로그
 
+- [2026-08-24] `src/index.ts`는 `agent` 조기 dispatch만 가진 경량 bootstrap으로 유지하고 나머지
+  command implementation은 `src/main.ts`에서 동적으로 load / 이유: JavaScript 정적 import는 분기
+  실행 전에 provider module graph를 평가하므로 handler 호출 순서만 앞당겨서는 격리가 완성되지 않는다.
+- [2026-08-24] 설치형 wrapper의 별도 agent dispatch는 제거하고 wrapper와 direct entrypoint가 같은
+  bootstrap을 통과 / 이유: 두 구현의 manifest 해석·오류·status 계약이 다시 어긋나는 것을 막고 실제
+  배포 경로와 개발 경로를 같은 테스트로 고정한다.
 - [2026-08-24] 셀프 리뷰 1/4에서 handler unit만으로 완료로 보지 않고 build된 direct entrypoint를
   isolated HOME에서 subprocess로 실행하는 테스트를 추가 / 이유: 이번 사고의 실제 결함은 handler
   내부가 아니라 `index.ts`와 handler 사이의 누락이므로 둘을 함께 실행해야 같은 회귀를 탐지한다.
@@ -50,7 +59,9 @@ typecheck, build, 전체 unit 214파일/2,238테스트가 통과했고 build 산
 
 ## 파일 맵
 
-- `packages/happy-cli/src/index.ts` — provider 기본 분기보다 앞선 command dispatch
+- `packages/happy-cli/src/index.ts` — runtime graph보다 먼저 실행되는 경량 command bootstrap
+- `packages/happy-cli/src/main.ts` — agent 외 기존 Happy runtime command implementation
 - `packages/happy-cli/src/commands/agentCommand.ts` — bundled Saycode CLI 위임
 - `packages/happy-cli/src/commands/agentCommand.test.ts` — 인자·env·exit status 회귀 테스트
-- `packages/happy-cli/bin/happy.mjs` — 기존 설치형 wrapper 계약 참고
+- `packages/happy-cli/bin/happy.mjs` — 모든 비-version 명령을 공통 bootstrap으로 전달하는 설치형 wrapper
+- `packages/happy-cli/scripts/__tests__/cli-version.test.ts` — wrapper/direct entrypoint의 runtime-state 격리 smoke
