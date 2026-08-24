@@ -44,7 +44,9 @@ export type Usage = z.infer<typeof UsageSchema>
  */
 export interface ServerToClientEvents {
   update: (data: Update) => void
-  'rpc-request': (data: { method: string, params: string }, callback: (response: string) => void) => void
+  // `callback` is optional because socket.io does not guarantee an ack on
+  // every delivered packet — see createRpcRequestListener.
+  'rpc-request': (data: { method: string, params: string }, callback?: (response: string) => void) => void
   'rpc-registered': (data: { method: string }) => void
   'rpc-unregistered': (data: { method: string }) => void
   'rpc-error': (data: { type: string, error: string }) => void

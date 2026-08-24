@@ -20,6 +20,7 @@ import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt } from './encryption';
 import { backoff } from '@/utils/time';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
+import { createRpcRequestListener } from './rpc/rpcRequestListener';
 import { detectCLIAvailability, CLIAvailability } from '@/utils/detectCLI';
 import { detectResumeSupport, type ResumeSupport } from '@/resume/localHappyAgentAuth';
 import type { PortRegistry } from '@/daemon/portRegistry';
@@ -110,7 +111,9 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 interface ServerToDaemonEvents {
     update: (data: Update) => void;
-    'rpc-request': (data: { method: string, params: string }, callback: (response: string) => void) => void;
+    // `callback` is optional because socket.io does not guarantee an ack on
+    // every delivered packet — see createRpcRequestListener.
+    'rpc-request': (data: { method: string, params: string }, callback?: (response: string) => void) => void;
     'proxy-http-request': (
         params: {
             port: number;
@@ -1563,10 +1566,11 @@ export class ApiMachineClient {
         });
 
         // Single consolidated RPC handler
-        this.socket.on('rpc-request', async (data: { method: string, params: string }, callback: (response: string) => void) => {
-            logger.debugLargeJson(`[API MACHINE] Received RPC request:`, data);
-            callback(await this.rpcHandlerManager.handleRequest(data));
-        });
+        this.socket.on('rpc-request', createRpcRequestListener({
+            handleRequest: (data) => this.rpcHandlerManager.handleRequest(data),
+            logger: (message) => logger.debug(`[API MACHINE] ${message}`),
+            onRequest: (data) => logger.debugLargeJson(`[API MACHINE] Received RPC request:`, data),
+        }));
 
         // Plain-text preview proxy channel — happy-server relays iframe HTTP
         // requests here without encryption because it needs to inspect/rewrite

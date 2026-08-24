@@ -10,6 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { AsyncLock } from '@/utils/lock';
 import { deriveKey } from '@/utils/deriveKey';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
+import { createRpcRequestListener } from './rpc/rpcRequestListener';
 import { registerCommonHandlers } from '../modules/common/registerCommonHandlers';
 import { calculateCost } from '@/utils/pricing';
 import { shouldReconnect } from '@/utils/lidState';
@@ -376,9 +377,10 @@ export class ApiSessionClient extends EventEmitter {
         })
 
         // Set up global RPC request handler
-        this.socket.on('rpc-request', async (data: { method: string, params: string }, callback: (response: string) => void) => {
-            callback(await this.rpcHandlerManager.handleRequest(data));
-        })
+        this.socket.on('rpc-request', createRpcRequestListener({
+            handleRequest: (data) => this.rpcHandlerManager.handleRequest(data),
+            logger: (message) => logger.debug(`[API] ${message}`),
+        }))
 
         this.socket.on('disconnect', (reason) => {
             logger.debug(`[API] Socket disconnected: ${reason}`);
