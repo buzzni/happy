@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, truncate, utimes, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
     CLAUDE_SESSION_TRANSFER_CHUNK_MAX_BYTES,
+    CLAUDE_SESSION_TRANSFER_MAX_BYTES,
     CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS,
     assertValidClaudeSessionChunk,
     createClaudeSessionTransferHandler,
@@ -124,6 +125,23 @@ describe('Claude session transfer input validation', () => {
         ])).toEqual(content);
         expect(first.eof).toBe(false);
         expect(second.eof).toBe(true);
+    });
+
+    it('rejects an oversized source before hashing it', async () => {
+        const path = resolveClaudeSessionTransferPath({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            allowedRoot: root,
+        });
+        await mkdir(dirname(path), { recursive: true });
+        await writeFile(path, 'seed');
+        await truncate(path, CLAUDE_SESSION_TRANSFER_MAX_BYTES + 1);
+
+        await expect(inspectClaudeSessionTransferSource({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            allowedRoot: root,
+        })).rejects.toThrow('session size');
     });
 
     it('rejects a source that changed after inspection', async () => {

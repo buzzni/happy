@@ -86,6 +86,7 @@ export async function inspectClaudeSessionTransferSource(input: {
     const path = resolveClaudeSessionTransferPath(input);
     const before = await stat(path);
     if (!before.isFile()) throw new Error('Claude session source must be a file');
+    assertValidTransferSize(before.size);
     const sha256 = await sha256File(path);
     const after = await stat(path);
     assertUnchangedSource(after, {
@@ -139,12 +140,16 @@ type PendingClaudeSessionImport = {
     cleanupTimer: ReturnType<typeof setTimeout>;
 };
 
-function assertValidImportManifest(size: number, sha256: string): void {
+function assertValidTransferSize(size: number): void {
     if (!Number.isSafeInteger(size) || size < 1 || size > CLAUDE_SESSION_TRANSFER_MAX_BYTES) {
         throw new Error(
             `Claude session size must be an integer between 1 and ${CLAUDE_SESSION_TRANSFER_MAX_BYTES} bytes`,
         );
     }
+}
+
+function assertValidImportManifest(size: number, sha256: string): void {
+    assertValidTransferSize(size);
     if (!/^[0-9a-f]{64}$/i.test(sha256)) {
         throw new Error('Claude session sha256 must be a 64-character hexadecimal digest');
     }
