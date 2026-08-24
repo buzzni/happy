@@ -103,8 +103,22 @@ happy connect status
 | `happy openclaw` | Start OpenClaw session |
 | `happy acp` | Start any ACP-compatible agent |
 | `happy resume <id>` | Resume a previous session |
+| `happy agent <verb>` | Let an AI agent inspect and control owned child sessions |
 | `happy notify` | Send push notification to your devices |
 | `happy doctor` | Diagnostics & troubleshooting |
+
+### Agent orchestration
+
+`@buzzni/happy-cli` includes the exact compatible `@buzzni/saycode-cli`
+runtime, so sessions started by Happy can use `happy agent` without a separate
+Saycode CLI install. This command is intended for AI agents running inside a
+Happy/Saycode session; it fails closed outside that session environment.
+
+The supported verbs include capability discovery and owned-child lifecycle
+operations such as `whoami`, `ls`, `spawn`, `prompt`, `steer`, `stop`, `read`,
+and `wait`. Run `happy agent --help` for the current machine-readable contract.
+Happy deliberately does not install a top-level `saycode` binary, so an
+independently installed Saycode CLI remains untouched.
 
 ---
 

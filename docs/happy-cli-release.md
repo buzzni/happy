@@ -91,6 +91,11 @@ The source package can use local workspace wiring during development, but the np
 - `dependencies.@slopus/happy-wire` in the publish artifact must be a registry version, not `workspace:*` or `file:../happy-wire`.
 - `@slopus/happy-wire` must be bundled into the CLI artifact until the A+ wire package changes are published independently.
 - The bundled dependency closure currently includes `@slopus/happy-wire`, `@paralleldrive/cuid2`, `@noble/hashes`, and `zod`.
+- `@buzzni/saycode-cli` must remain an exact runtime dependency and bundled
+  dependency. The guard must prove that `happy agent --help` delegates to that
+  bundled artifact and that installing Happy does not create a top-level
+  `saycode` binary. This keeps natural-language child orchestration available
+  without colliding with an independently installed Saycode CLI.
 
 The following commands describe the **GitHub Actions-only** publish section. They are not
 a local release procedure; do not copy the `npm publish` command to a developer machine.
