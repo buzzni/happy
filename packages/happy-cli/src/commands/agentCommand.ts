@@ -16,7 +16,7 @@ type AgentCommandDependencies = {
     command: string,
     args: string[],
     options: { stdio: 'inherit'; env: NodeJS.ProcessEnv },
-  ) => { status: number | null }
+  ) => { status: number | null; error?: Error }
 }
 
 const defaultDependencies: AgentCommandDependencies = {
@@ -47,6 +47,10 @@ export function handleAgentCommand(
     ['--no-warnings', '--no-deprecation', entrypoint, 'agent', ...args],
     { stdio: 'inherit', env: dependencies.env },
   )
+
+  if (result.error) {
+    throw result.error
+  }
 
   return result.status ?? 1
 }

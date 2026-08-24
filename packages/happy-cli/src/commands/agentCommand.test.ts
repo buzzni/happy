@@ -11,7 +11,7 @@ describe('handleAgentCommand', () => {
     }
     const env = { APLUS_SESSION_ID: 'parent-session' }
 
-    const status = handleAgentCommand(['whoami', '--json'], {
+    const status = handleAgentCommand(['whoami'], {
       execPath: '/usr/bin/node',
       env,
       resolveSaycodeManifest: () => '/opt/happy/node_modules/@buzzni/saycode-cli/package.json',
@@ -28,7 +28,6 @@ describe('handleAgentCommand', () => {
         '/opt/happy/node_modules/@buzzni/saycode-cli/index.mjs',
         'agent',
         'whoami',
-        '--json',
       ],
       { stdio: 'inherit', env },
     ]])
@@ -44,5 +43,15 @@ describe('handleAgentCommand', () => {
     })
 
     expect(status).toBe(1)
+  })
+
+  it('surfaces a failure to start the embedded command', () => {
+    expect(() => handleAgentCommand(['whoami'], {
+      execPath: '/usr/bin/node',
+      env: {},
+      resolveSaycodeManifest: () => '/opt/happy/node_modules/@buzzni/saycode-cli/package.json',
+      readManifest: () => JSON.stringify({ bin: { saycode: './index.mjs' } }),
+      run: () => ({ status: null, error: new Error('spawn EACCES') }),
+    })).toThrow('spawn EACCES')
   })
 })

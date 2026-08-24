@@ -57,7 +57,12 @@ import { resolveMcpConfigPresetUrl } from './aplus/mcpConfigPresets'
   }
 
   if (subcommand === 'agent') {
-    process.exit(handleAgentCommand(args.slice(1)))
+    try {
+      process.exit(handleAgentCommand(args.slice(1)))
+    } catch (error) {
+      console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
+      process.exit(1)
+    }
   } else if (subcommand === 'doctor') {
     // Check for clean subcommand
     if (args[1] === 'clean') {

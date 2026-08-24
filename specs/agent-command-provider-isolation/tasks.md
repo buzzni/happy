@@ -26,3 +26,14 @@
 
 - [x] **T9.** spec/context 완료 상태와 실제 검증 수치를 동기화한다.
 - [x] **T10.** behavioral 구현 commit을 push하고 `origin/main` 대상 PR #241을 생성한다.
+
+## Phase 5: 셀프 리뷰 1/4
+
+- [x] **T11.** handler 단위 테스트만으로는 `index.ts` dispatch 누락을 탐지하지 못하는 회귀를 build된
+  direct entrypoint subprocess 테스트로 고정한다.
+- [x] **T12.** bundled command spawn 실패의 `result.error`가 묻히지 않도록 handler에서 전파하고
+  entrypoint에서 사용자 친화적인 오류로 종료한다.
+- [x] **T13.** 지원하지 않는 `--json`을 성공으로 가정한 unit fixture를 실제 `whoami` 계약으로 정정한다.
+- [x] **T14.** direct-entry 테스트의 provider 부재 assertion을 대소문자 비구분으로 고정해 실제 로그의
+  `[CLAUDE]` 같은 표기도 놓치지 않게 한다.
+  → 검증: 관련 7개, typecheck, build, 전체 214파일/2,238테스트 통과

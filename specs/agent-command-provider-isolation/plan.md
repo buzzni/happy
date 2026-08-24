@@ -38,6 +38,8 @@ bundled Saycode manifest의 `bin.saycode`를 해석해 동일 Node 실행 파일
 - [x] Phase 2: direct-entry 위임 실패 테스트를 먼저 작성하고 최소 handler·dispatch를 구현한다.
 - [x] Phase 3: 관련/전체 테스트, build 산출물 success/failure smoke, diff 검토를 완료한다.
 - [x] Phase 4: context와 체크리스트를 완료 처리하고 behavioral 구현 commit으로 PR을 생성한다.
+- [x] Phase 5: 셀프 리뷰 1/4에서 실제 direct entrypoint 회귀, spawn 오류 가시성, fixture 정합성을
+  보강하고 전체 검증을 반복한다.
 
 ## 리스크와 대응
 
