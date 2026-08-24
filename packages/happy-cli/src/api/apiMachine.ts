@@ -841,7 +841,12 @@ export class ApiMachineClient {
             }
             const headless = chosen.headless;
             const env = chosen.display ? { DISPLAY: chosen.display } : undefined;
-            let { pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless }, env);
+            let { pid } = launchChrome(chrome.path, {
+                userDataDir,
+                cdpPort,
+                headless,
+                display: chosen.display ?? undefined,
+            }, env);
             let ready = await waitForCdp(cdpPort, 15_000);
             let sandbox = true;
             if (!ready) {
@@ -850,7 +855,13 @@ export class ApiMachineClient {
                 // "running". Retry once without the sandbox and report the
                 // downgrade rather than leaving a browser that never answers.
                 sandbox = false;
-                ({ pid } = launchChrome(chrome.path, { userDataDir, cdpPort, headless, noSandbox: true }, env));
+                ({ pid } = launchChrome(chrome.path, {
+                    userDataDir,
+                    cdpPort,
+                    headless,
+                    display: chosen.display ?? undefined,
+                    noSandbox: true,
+                }, env));
                 ready = await waitForCdp(cdpPort, 15_000);
             }
             const viewer = viewerState
@@ -1193,11 +1204,17 @@ export class ApiMachineClient {
         const cdpPort = await pickFreeCdpPort();
         if (cdpPort === null) return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
         const env = { DISPLAY: display };
-        launchChrome(chrome.path, { userDataDir, cdpPort, headless: false }, env);
+        launchChrome(chrome.path, { userDataDir, cdpPort, headless: false, display }, env);
         let up = await waitForCdp(cdpPort, 15_000);
         if (!up) {
             // Same kernel/namespace fallback the launch RPC uses.
-            launchChrome(chrome.path, { userDataDir, cdpPort, headless: false, noSandbox: true }, env);
+            launchChrome(chrome.path, {
+                userDataDir,
+                cdpPort,
+                headless: false,
+                display,
+                noSandbox: true,
+            }, env);
             up = await waitForCdp(cdpPort, 15_000);
         }
         const browser = summariseViewerBrowser({ chromeInstalled: true, cdpPort: up ? cdpPort : null });
@@ -1974,10 +1991,12 @@ async function scanChromeProcesses(): Promise<RunningChrome[]> {
             const cmdline = await readFile(`/proc/${pid}/cmdline`, 'utf8');
             const port = readFlagFromCmdline(cmdline, '--remote-debugging-port');
             if (port === null) continue;
+            const explicitDisplay = readFlagFromCmdline(cmdline, '--display');
             running.push({
                 cdpPort: Number(port) || null,
                 userDataDir: readFlagFromCmdline(cmdline, '--user-data-dir'),
-                display: readDisplayFromEnviron(await readFile(`/proc/${pid}/environ`, 'utf8')),
+                display: explicitDisplay
+                    ?? readDisplayFromEnviron(await readFile(`/proc/${pid}/environ`, 'utf8')),
             });
         } catch {
             // The process may exit between listing /proc and reading it.

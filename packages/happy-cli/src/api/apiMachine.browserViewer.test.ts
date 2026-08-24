@@ -138,6 +138,22 @@ describe('ApiMachineClient browser viewer RPC', () => {
         })
     })
 
+    it('reuses the viewer Chrome after Chrome removes DISPLAY from its environment', async () => {
+        fsMocks.readFile.mockImplementation(async (path: string) => path.endsWith('/cmdline')
+            ? '/usr/bin/google-chrome\0--remote-debugging-port=9222\0--user-data-dir=/tmp/happy-test/chrome-profiles/default\0--display=:99'
+            : 'PATH=/usr/bin\0')
+        const { ApiMachineClient } = await import('./apiMachine')
+        const client = new ApiMachineClient('token', machineClient())
+        client.setRPCHandlers(rpcHandlers())
+
+        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({})
+
+        expect(result).toMatchObject({
+            browserReady: true,
+            cdpPort: 9222,
+        })
+    })
+
     it('does not treat another connected profile as proof that the viewer Chrome is paired', async () => {
         mockRunPairing.mockResolvedValue({
             cdpPort: 9222,
