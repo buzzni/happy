@@ -203,6 +203,7 @@ async function removeOrphanedTransferFiles(projectsPath: string): Promise<void> 
 
 export function createClaudeSessionTransferRuntime(input: { allowedRoot: string }) {
     const pending = new Map<string, PendingClaudeSessionImport>();
+    const pendingFinalPaths = new Set<string>();
     const orphanCleanup = removeOrphanedTransferFiles(dirname(getProjectPath(input.allowedRoot)))
         .catch(() => {});
 
@@ -211,6 +212,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
         transfer: PendingClaudeSessionImport,
     ): Promise<void> => {
         pending.delete(transferId);
+        pendingFinalPaths.delete(transfer.finalPath);
         clearTimeout(transfer.cleanupTimer);
         await rm(transfer.tempPath, { force: true });
     };
@@ -225,38 +227,49 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
             await orphanCleanup;
             assertValidImportManifest(request.size, request.sha256);
             const finalPath = resolveClaudeSessionTransferPath({ ...request, allowedRoot: input.allowedRoot });
-            await mkdir(dirname(finalPath), { recursive: true });
-            try {
-                const existing = await stat(finalPath);
-                if (existing.isFile() && existing.size === request.size) {
-                    const existingHash = await sha256File(finalPath);
-                    if (existingHash === request.sha256.toLowerCase()) {
-                        return { status: 'already-present' };
-                    }
-                }
-            } catch (error) {
-                if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+            if (pendingFinalPaths.has(finalPath)) {
+                throw new Error('Claude session import already in progress');
             }
-            const transferId = randomUUID();
-            const tempPath = `${finalPath}.aplus-transfer-${transferId}.tmp`;
-            const file = await open(tempPath, 'wx');
-            await file.close();
-            const cleanupTimer = setTimeout(async () => {
-                const abandoned = pending.get(transferId);
-                if (!abandoned) return;
-                pending.delete(transferId);
-                await rm(abandoned.tempPath, { force: true }).catch(() => {});
-            }, CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS);
-            cleanupTimer.unref();
-            pending.set(transferId, {
-                tempPath,
-                finalPath,
-                size: request.size,
-                sha256: request.sha256.toLowerCase(),
-                bytesWritten: 0,
-                cleanupTimer,
-            });
-            return { status: 'ready', transferId };
+            pendingFinalPaths.add(finalPath);
+            try {
+                await mkdir(dirname(finalPath), { recursive: true });
+                try {
+                    const existing = await stat(finalPath);
+                    if (existing.isFile() && existing.size === request.size) {
+                        const existingHash = await sha256File(finalPath);
+                        if (existingHash === request.sha256.toLowerCase()) {
+                            pendingFinalPaths.delete(finalPath);
+                            return { status: 'already-present' };
+                        }
+                    }
+                } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+                }
+                const transferId = randomUUID();
+                const tempPath = `${finalPath}.aplus-transfer-${transferId}.tmp`;
+                const file = await open(tempPath, 'wx');
+                await file.close();
+                const cleanupTimer = setTimeout(async () => {
+                    const abandoned = pending.get(transferId);
+                    if (!abandoned) return;
+                    pending.delete(transferId);
+                    pendingFinalPaths.delete(abandoned.finalPath);
+                    await rm(abandoned.tempPath, { force: true }).catch(() => {});
+                }, CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS);
+                cleanupTimer.unref();
+                pending.set(transferId, {
+                    tempPath,
+                    finalPath,
+                    size: request.size,
+                    sha256: request.sha256.toLowerCase(),
+                    bytesWritten: 0,
+                    cleanupTimer,
+                });
+                return { status: 'ready', transferId };
+            } catch (error) {
+                pendingFinalPaths.delete(finalPath);
+                throw error;
+            }
         },
 
         async writeImportChunk(request: {
@@ -337,6 +350,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
             try {
                 await rename(transfer.tempPath, transfer.finalPath);
                 pending.delete(request.transferId);
+                pendingFinalPaths.delete(transfer.finalPath);
                 clearTimeout(transfer.cleanupTimer);
                 return { status: 'imported' };
             } catch (error) {

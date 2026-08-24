@@ -203,6 +203,34 @@ describe('Claude session transfer input validation', () => {
         expect(await readdir(bucket)).toEqual([]);
     });
 
+    it('rejects overlapping imports for the same destination session until the first is aborted', async () => {
+        const runtime = createClaudeSessionTransferRuntime({ allowedRoot: root });
+        const first = await runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 10,
+            sha256: 'a'.repeat(64),
+        });
+        if (first.status !== 'ready') throw new Error('expected ready import');
+
+        await expect(runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 12,
+            sha256: 'b'.repeat(64),
+        })).rejects.toThrow('already in progress');
+
+        await runtime.abortImport({ transferId: first.transferId });
+        const retried = await runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 12,
+            sha256: 'b'.repeat(64),
+        });
+        if (retried.status !== 'ready') throw new Error('expected ready import');
+        await runtime.abortImport({ transferId: retried.transferId });
+    });
+
     it('expires an abandoned pending import and removes its temp file', async () => {
         vi.useFakeTimers();
         const runtime = createClaudeSessionTransferRuntime({ allowedRoot: root });
