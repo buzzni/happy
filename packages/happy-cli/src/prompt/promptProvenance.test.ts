@@ -72,7 +72,7 @@ describe('resolveSaycodeAppendSystemPromptForMessage', () => {
     ].join('\n'));
   });
 
-  it('removes a cached client-turn block when the next client omits append prompt', () => {
+  it.each([true, false])('removes a cached client-turn block under master=%s when the next client omits append prompt', (saycodeSystemPromptEnabled) => {
     expect(resolveSaycodeAppendSystemPromptForMessage({
       current: [
         'CUSTOM USER PROMPT',
@@ -80,7 +80,7 @@ describe('resolveSaycodeAppendSystemPromptForMessage', () => {
         wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
       ].join('\n'),
       hasIncoming: false,
-      saycodeSystemPromptEnabled: false,
+      saycodeSystemPromptEnabled,
     })).toBe('CUSTOM USER PROMPT');
   });
 
