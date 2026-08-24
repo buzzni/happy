@@ -43,6 +43,7 @@ const {
             daemonState: args.data.daemonState ?? null,
             daemonStateVersion: args.data.daemonStateVersion ?? 0,
             dataEncryptionKey: args.data.dataEncryptionKey ?? null,
+            serverDataEncryptionKey: args.data.serverDataEncryptionKey ?? null,
             active: false,
             lastActiveAt: now,
             createdAt: now,
@@ -56,7 +57,8 @@ const {
         state.existingMachine = { ...state.existingMachine, ...args.data };
         return state.existingMachine;
     });
-    const dbMock = { machine: { findFirst: machineFindFirst, create: machineCreate, update: machineUpdate } };
+    const machineFindMany = vi.fn(async (): Promise<any[]> => []);
+    const dbMock = { machine: { findFirst: machineFindFirst, create: machineCreate, update: machineUpdate, findMany: machineFindMany } };
     const allocateUserSeqMock = vi.fn(async () => ++state.seq);
 
     return { state, dbMock, resetState, allocateUserSeqMock, emitUpdateSpy, emitEphemeralSpy, machineUpdate };
@@ -253,5 +255,96 @@ describe("machinesRoutes — POST /v1/machines dataEncryptionKey write-once back
         expect(res.statusCode).toBe(200);
         expect(machineUpdate).not.toHaveBeenCalled();
         expect(res.json().machine.dataEncryptionKey).toBeNull();
+    });
+});
+
+describe("machinesRoutes — serverDataEncryptionKey dual-recipient wrap (aplus §6-1 B1)", () => {
+    let app: Fastify;
+    beforeEach(() => { resetState(); emitUpdateSpy.mockClear(); emitEphemeralSpy.mockClear(); machineUpdate.mockClear(); });
+    afterEach(async () => { if (app) await app.close(); });
+
+    const now = new Date("2026-01-01T00:00:00.000Z");
+    const existingRow = (overrides: Record<string, unknown> = {}) => ({
+        id: "machine-1",
+        accountId: "user-1",
+        seq: 7,
+        metadata: "encrypted-metadata-blob",
+        metadataVersion: 1,
+        daemonState: null,
+        daemonStateVersion: 0,
+        dataEncryptionKey: null,
+        serverDataEncryptionKey: null,
+        active: false,
+        lastActiveAt: now,
+        createdAt: now,
+        updatedAt: now,
+        ...overrides,
+    });
+
+    const post = (payload: Record<string, unknown>) => app.inject({
+        method: "POST",
+        url: "/v1/machines",
+        headers: { "x-user-id": "user-1" },
+        payload: { id: "machine-1", metadata: "encrypted-metadata-blob", ...payload },
+    });
+
+    it("stores serverDataEncryptionKey on creation and echoes it", async () => {
+        app = await createApp();
+        const wrapped = Buffer.from("server-wrapped-machine-key").toString("base64");
+
+        const res = await post({ serverDataEncryptionKey: wrapped });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.json().machine.serverDataEncryptionKey).toBe(wrapped);
+        expect(Buffer.from(state.created[0].serverDataEncryptionKey).toString("base64")).toBe(wrapped);
+    });
+
+    it("backfills a null serverDataEncryptionKey from a late submission and echoes it", async () => {
+        app = await createApp();
+        state.existingMachine = existingRow({ dataEncryptionKey: new Uint8Array(Buffer.from("acct-key")) });
+        const wrapped = Buffer.from("server-wrapped-machine-key").toString("base64");
+
+        const res = await post({ serverDataEncryptionKey: wrapped });
+
+        expect(res.statusCode).toBe(200);
+        expect(machineUpdate).toHaveBeenCalledTimes(1);
+        const updateArg = machineUpdate.mock.calls[0][0];
+        expect(Buffer.from(updateArg.data.serverDataEncryptionKey).toString("base64")).toBe(wrapped);
+        // 계정 몫 봉투는 건드리지 않는다.
+        expect(updateArg.data).not.toHaveProperty("dataEncryptionKey");
+        expect(res.json().machine.serverDataEncryptionKey).toBe(wrapped);
+    });
+
+    it("never overwrites an existing serverDataEncryptionKey (write-once)", async () => {
+        app = await createApp();
+        state.existingMachine = existingRow({ serverDataEncryptionKey: new Uint8Array(Buffer.from("original-server-key")) });
+
+        const res = await post({ serverDataEncryptionKey: Buffer.from("attacker-key").toString("base64") });
+
+        expect(res.statusCode).toBe(200);
+        expect(machineUpdate).not.toHaveBeenCalled();
+        expect(res.json().machine.serverDataEncryptionKey).toBe(Buffer.from("original-server-key").toString("base64"));
+    });
+
+    it("re-register without the field leaves it null (old CLI)", async () => {
+        app = await createApp();
+        state.existingMachine = existingRow();
+
+        const res = await post({});
+
+        expect(res.statusCode).toBe(200);
+        expect(machineUpdate).not.toHaveBeenCalled();
+        expect(res.json().machine.serverDataEncryptionKey).toBeNull();
+    });
+
+    it("GET /v1/machines includes serverDataEncryptionKey", async () => {
+        app = await createApp();
+        const wrapped = new Uint8Array(Buffer.from("server-wrapped-machine-key"));
+        dbMock.machine.findMany.mockResolvedValue([existingRow({ serverDataEncryptionKey: wrapped })]);
+
+        const res = await app.inject({ method: "GET", url: "/v1/machines", headers: { "x-user-id": "user-1" } });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.json()[0].serverDataEncryptionKey).toBe(Buffer.from(wrapped).toString("base64"));
     });
 });

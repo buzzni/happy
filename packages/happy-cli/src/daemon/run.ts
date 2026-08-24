@@ -329,7 +329,7 @@ export async function startDaemon(): Promise<void> {
     }
 
     // Ensure auth and machine registration BEFORE anything else
-    const { credentials, machineId } = await authAndSetupMachineIfNeeded();
+    const { credentials, machineId, serverPublicKey } = await authAndSetupMachineIfNeeded();
     logger.debug('[DAEMON RUN] Auth and machine setup complete');
     let machineAutomationKey = loadOrCreateMachineAutomationKey(configuration.automationKeyFile);
     const mcpCallerGrantKeyPair = tweetnacl.box.keyPair();
@@ -1976,7 +1976,8 @@ export async function startDaemon(): Promise<void> {
     const machine = await api.getOrCreateMachine({
       machineId,
       metadata: initialMachineMetadata,
-      daemonState: initialDaemonState
+      daemonState: initialDaemonState,
+      serverPublicKey
     });
     logger.debug(`[DAEMON RUN] Machine registered: ${machine.id}`);
 

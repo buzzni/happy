@@ -52,6 +52,12 @@ interface Settings {
    * 구버전 CLI 는 이 필드를 몰라도 무해하게 보존한다 (plain JSON).
    */
   accountPublicKey?: string
+  /**
+   * aplus §6-1 트랙 B B1 — aplus claim setup 커맨드가 남기는 서버 서비스
+   * box 공개키(base64). 존재하면 머신 등록 시 machineKey 를 서버 몫으로도
+   * wrap 한다(이중 수신자). 구버전 CLI 는 이 필드를 몰라도 무해하게 보존.
+   */
+  serverPublicKey?: string
 }
 
 const defaultSettings: Settings = {

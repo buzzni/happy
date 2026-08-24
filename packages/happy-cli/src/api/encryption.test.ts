@@ -85,3 +85,57 @@ describe('wrapDataEncryptionKey', () => {
         expect(Buffer.from(a).toString('base64')).not.toBe(Buffer.from(b).toString('base64'));
     });
 });
+
+// aplus §6-1 트랙 B B1 (design-db1 §3.2) — 머신 키 이중 수신자 wrap 의
+// 단일 조립 지점. 계정 몫 봉투는 upstream 그대로, 서버 몫 봉투는 서버
+// 서비스 공개키가 알려진 경우에만 추가로 만든다. **세션 DEK 는 이 함수의
+// 입력이 아니다** — machineKey 만 이중 wrap 된다.
+describe('buildMachineKeyEnvelopes', () => {
+    it('wraps the machine key for both the account and the server recipients', async () => {
+        const { buildMachineKeyEnvelopes } = await import('./encryption');
+        const account = tweetnacl.box.keyPair();
+        const server = tweetnacl.box.keyPair();
+        const machineKey = getRandomBytes(32);
+
+        const envelopes = buildMachineKeyEnvelopes(
+            { machineKey, accountPublicKey: account.publicKey },
+            server.publicKey,
+        );
+
+        const unwrap = (bundle: Uint8Array, secretKey: Uint8Array) => {
+            expect(bundle[0]).toBe(0);
+            const opened = tweetnacl.box.open(
+                bundle.slice(33 + 24), bundle.slice(33, 33 + 24), bundle.slice(1, 33), secretKey);
+            expect(opened).not.toBeNull();
+            return new Uint8Array(opened!);
+        };
+        expect(unwrap(envelopes.dataEncryptionKey!, account.secretKey)).toEqual(machineKey);
+        expect(unwrap(envelopes.serverDataEncryptionKey!, server.secretKey)).toEqual(machineKey);
+        // 교차 열람 불가 — 서버 개인키로 계정 몫 봉투를 못 연다 (반대도 동일).
+        expect(tweetnacl.box.open(
+            envelopes.dataEncryptionKey!.slice(33 + 24),
+            envelopes.dataEncryptionKey!.slice(33, 33 + 24),
+            envelopes.dataEncryptionKey!.slice(1, 33),
+            server.secretKey,
+        )).toBeNull();
+    });
+
+    it('omits the server envelope when no server public key is known', async () => {
+        const { buildMachineKeyEnvelopes } = await import('./encryption');
+        const account = tweetnacl.box.keyPair();
+        const envelopes = buildMachineKeyEnvelopes(
+            { machineKey: getRandomBytes(32), accountPublicKey: account.publicKey },
+            null,
+        );
+        expect(envelopes.dataEncryptionKey).not.toBeNull();
+        expect(envelopes.serverDataEncryptionKey).toBeNull();
+    });
+
+    it('returns both null when there is no machine key material (plain legacy)', async () => {
+        const { buildMachineKeyEnvelopes } = await import('./encryption');
+        const server = tweetnacl.box.keyPair();
+        const envelopes = buildMachineKeyEnvelopes(null, server.publicKey);
+        expect(envelopes.dataEncryptionKey).toBeNull();
+        expect(envelopes.serverDataEncryptionKey).toBeNull();
+    });
+});

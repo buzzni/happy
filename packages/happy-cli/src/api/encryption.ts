@@ -99,6 +99,26 @@ export function wrapDataEncryptionKey(machineKey: Uint8Array, recipientPublicKey
   return result;
 }
 
+/**
+ * aplus §6-1 트랙 B B1 (design-db1 §3.2) — 머신 키 이중 수신자 wrap 의 단일
+ * 조립 지점. 계정 몫 봉투(dataEncryptionKey)는 upstream 그대로, 서버 몫
+ * 봉투(serverDataEncryptionKey)는 서버 서비스 공개키가 알려진 경우에만
+ * 추가한다. 세션 DEK 는 이 함수를 거치지 않는다 — machineKey 이중 wrap 이
+ * "서버는 RPC 가능·콘텐츠 불가" 경계 그 자체다.
+ */
+export function buildMachineKeyEnvelopes(
+  material: { machineKey: Uint8Array, accountPublicKey: Uint8Array } | null,
+  serverPublicKey: Uint8Array | null,
+): { dataEncryptionKey: Uint8Array | null, serverDataEncryptionKey: Uint8Array | null } {
+  if (!material) return { dataEncryptionKey: null, serverDataEncryptionKey: null };
+  return {
+    dataEncryptionKey: wrapDataEncryptionKey(material.machineKey, material.accountPublicKey),
+    serverDataEncryptionKey: serverPublicKey
+      ? wrapDataEncryptionKey(material.machineKey, serverPublicKey)
+      : null,
+  };
+}
+
 export function encryptLegacy(data: any, secret: Uint8Array): Uint8Array {
   const nonce = getRandomBytes(tweetnacl.secretbox.nonceLength);
   const encrypted = tweetnacl.secretbox(new TextEncoder().encode(JSON.stringify(data)), nonce, secret);

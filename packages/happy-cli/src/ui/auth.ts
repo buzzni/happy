@@ -253,6 +253,8 @@ export function decryptWithEphemeralKey(encryptedBundle: Uint8Array, recipientSe
 export async function authAndSetupMachineIfNeeded(): Promise<{
     credentials: Credentials;
     machineId: string;
+    /** aplus §6-1 B1 — settings 에 기록된 서버 서비스 공개키(base64), 없으면 null. */
+    serverPublicKey: string | null;
 }> {
     logger.debug('[AUTH] Starting auth and machine setup...');
 
@@ -302,5 +304,5 @@ export async function authAndSetupMachineIfNeeded(): Promise<{
         }
     }
 
-    return { credentials, machineId: settings.machineId! };
+    return { credentials, machineId: settings.machineId!, serverPublicKey: settings.serverPublicKey ?? null };
 }
