@@ -47,6 +47,19 @@ describe('hydrateTrackedSessionFromPersisted', () => {
     expect(hydrateTrackedSessionFromPersisted(persisted({ lastProcessedSeq: 41 })).persistedLastProcessedSeq).toBe(41);
   });
 
+  it('shouldRestoreTheSaycodeAgentCapabilityAcrossDaemonRestarts', () => {
+    const agentEnvironment = {
+      SAYCODE_AGENT_ENV: '1' as const,
+      SAYCODE_AGENT_ROOT: 'root-session',
+      SAYCODE_AGENT_DEPTH: '2',
+      SAYCODE_AGENT_MAX_SPAWN: '4',
+      SAYCODE_AGENT_ID: 'worker-1',
+    };
+
+    expect(hydrateTrackedSessionFromPersisted(persisted({ agentEnvironment })).agentEnvironment)
+      .toEqual(agentEnvironment);
+  });
+
   // Callers spread this over a session that may already hold fresher values, so
   // an absent field must stay absent instead of overwriting one with undefined.
   it('shouldOmitKeysTheRecordDoesNotCarry', () => {
@@ -54,6 +67,7 @@ describe('hydrateTrackedSessionFromPersisted', () => {
 
     expect('persistedLastProcessedSeq' in hydrated).toBe(false);
     expect('userHomeDir' in hydrated).toBe(false);
+    expect('agentEnvironment' in hydrated).toBe(false);
   });
 
   // A fabricated runtime would make the idle guard treat a restored session as

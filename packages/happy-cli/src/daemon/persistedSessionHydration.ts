@@ -20,7 +20,7 @@ import type { TrackedSession } from './types';
 
 type HydratedFields = Pick<
   TrackedSession,
-  'happySessionMetadataFromLocalWebhook' | 'encryption' | 'userHomeDir' | 'persistedLastProcessedSeq'
+  'happySessionMetadataFromLocalWebhook' | 'encryption' | 'userHomeDir' | 'persistedLastProcessedSeq' | 'agentEnvironment'
 >;
 
 /**
@@ -50,5 +50,6 @@ export function hydrateTrackedSessionFromPersisted(persisted: PersistedSession |
     ...(persisted.lastProcessedSeq !== undefined
       ? { persistedLastProcessedSeq: persisted.lastProcessedSeq }
       : {}),
+    ...(persisted.agentEnvironment ? { agentEnvironment: persisted.agentEnvironment } : {}),
   };
 }

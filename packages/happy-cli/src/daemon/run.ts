@@ -516,6 +516,7 @@ export async function startDaemon(): Promise<void> {
       // resumed to deliver (2026-08-05 incident).
       const preserved = sessionIdToFinishedSession.get(sessionId);
       const inheritedLastProcessedSeq = preserved?.runtime?.lastProcessedSeq ?? preserved?.persistedLastProcessedSeq;
+      const existingSession = pidToTrackedSession.get(pid);
 
       // Persist encryption data to disk so it survives daemon restarts
       if (encryption) {
@@ -528,12 +529,11 @@ export async function startDaemon(): Promise<void> {
           metadata: sessionMetadata,
           savedAt: Date.now(),
           lastProcessedSeq: inheritedLastProcessedSeq,
+          agentEnvironment: existingSession?.agentEnvironment ?? preserved?.agentEnvironment,
         });
       }
 
       // Check if we already have this PID (daemon-spawned)
-      const existingSession = pidToTrackedSession.get(pid);
-
       if (existingSession && existingSession.startedBy === 'daemon') {
         // Update daemon-spawned session with reported data
         existingSession.happySessionId = sessionId;
@@ -1164,6 +1164,7 @@ export async function startDaemon(): Promise<void> {
           savedAt: Date.now(),
           userHomeDir: session.userHomeDir,
           lastProcessedSeq: session.runtime?.lastProcessedSeq ?? session.persistedLastProcessedSeq,
+          agentEnvironment: session.agentEnvironment,
         });
       }
       logger.debug(`[DAEMON RUN] Preserved session ${session.happySessionId} for resume (${reason})`);
@@ -1210,6 +1211,7 @@ export async function startDaemon(): Promise<void> {
         savedAt: now,
         userHomeDir: session.userHomeDir,
         lastProcessedSeq: cursor,
+        agentEnvironment: session.agentEnvironment,
       });
       session.persistedLastProcessedSeq = cursor;
       resumeCursorPersistedAt.set(sessionId, now);
@@ -1527,6 +1529,7 @@ export async function startDaemon(): Promise<void> {
           pid: 0,
           userHomeDir: persistedSession?.userHomeDir,
           persistedLastProcessedSeq: decision.baselineSeq,
+          agentEnvironment: persistedSession?.agentEnvironment,
         };
         sessionIdToFinishedSession.set(serverSession.id, recovered);
         persistSession(serverSession.id, {
@@ -1539,6 +1542,7 @@ export async function startDaemon(): Promise<void> {
           savedAt: Date.now(),
           userHomeDir: persistedSession?.userHomeDir,
           lastProcessedSeq: decision.baselineSeq,
+          agentEnvironment: persistedSession?.agentEnvironment,
         });
 
         const result = await spawnResumedSession(serverSession.id, {

@@ -13,6 +13,7 @@ import { configuration } from '@/configuration'
 import * as z from 'zod';
 import { encodeBase64, decodeBase64 } from '@/api/encryption';
 import type { Metadata } from '@/api/types';
+import type { SaycodeAgentEnvironment } from '@/daemon/sessionEnv';
 import { logger } from '@/ui/logger';
 
 export const SandboxConfigSchema = z.object({
@@ -638,6 +639,8 @@ export type PersistedSession = {
    *  seq and swallows messages that arrived while the session had no process
    *  (2026-08-05 incident). */
   lastProcessedSeq?: number;
+  /** Per-session orchestration capability restored after daemon restart. */
+  agentEnvironment?: SaycodeAgentEnvironment;
 };
 
 type SessionsFile = {
