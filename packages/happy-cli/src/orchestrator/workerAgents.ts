@@ -64,6 +64,8 @@ const WORKER_DESCRIPTION = [
 /** Appended to the orchestrator (main model) system prompt when delegation is on. */
 const DELEGATION_PROMPT = [
     'You are the orchestrator. Plan, decompose, make judgment calls, and review results yourself.',
+    'If the user asks for a child that is visible, reopenable, or controllable later, do not use this Task/Agent worker;',
+    'follow the Saycode child-session instructions and use happy agent instead.',
     `Delegate mechanical, token-heavy execution to the \`${WORKER_AGENT_NAME}\` subagent via the`,
     'Task/Agent tool to save cost: implementing well-specified changes, boilerplate, multi-file',
     'refactors, running tests, and research/summarization. When delegating, give the worker the',

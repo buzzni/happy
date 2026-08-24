@@ -18,6 +18,23 @@ describe('natural-language child orchestration routing eval (T14)', () => {
   it.each(routingScenarios)('%s -> %s', (_request, expectedPlan) => {
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain(expectedPlan);
   });
+
+  it('routes an explicitly durable child away from provider-native subagents', () => {
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('visible, reopenable, or controllable later');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('MUST use `happy agent`');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Do not use provider-native `Task`, `Agent`, or `spawn_agent`');
+  });
+
+  it('does not equate an internal native worker with a Saycode child session', () => {
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('one-turn internal decomposition');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('never describe it as a Saycode child session');
+  });
+
+  it('uses command JSON rather than model inference as success evidence', () => {
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain("Treat the command's JSON result as the only success evidence");
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Never claim that the child is visible in Desktop');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Do not substitute a provider-native subagent');
+  });
 });
 
 describe.each([

@@ -29,6 +29,13 @@ describe('buildWorkerAgents', () => {
         expect(result.delegationPrompt).toMatch(/delegate/i)
     })
 
+    it('defers explicit durable child requests to Saycode session orchestration', () => {
+        const prompt = buildWorkerAgents({ workerModel: 'haiku' }).delegationPrompt
+        expect(prompt).toContain('visible, reopenable, or controllable later')
+        expect(prompt).toContain('do not use this Task/Agent worker')
+        expect(prompt).toContain('happy agent')
+    })
+
     it('accepts a full model id and trims whitespace', () => {
         const worker = buildWorkerAgents({ workerModel: '  claude-haiku-4-5  ' }).agents![WORKER_AGENT_NAME]
         expect(worker.model).toBe('claude-haiku-4-5')

@@ -11,10 +11,9 @@
  * project queued into one session and replayed each other's prompts.
  *
  * APLUS_SESSION_* is the session's own web URL/id exported for agent shell
- * subprocesses (sessionUrlEnv.ts). It is set first-set-wins, so a child
- * session spawned with a parent's leaked value would keep pointing at the
- * parent session forever — scrub it here so every daemon-spawned session
- * derives its own.
+ * subprocesses (sessionUrlEnv.ts). Scrub it here so a daemon-spawned session
+ * starts without stale identity; the child session factory then writes its
+ * confirmed current id.
  *
  * SAYCODE_AGENT_* grants per-session orchestration scope. A daemon restarted
  * by one agent must not leak that agent's root/depth/id into unrelated spawns;

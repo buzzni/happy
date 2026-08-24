@@ -59,8 +59,8 @@ describe('scrubSessionLineageEnv', () => {
         // HAPPY_INITIAL_ covers PROMPT(_LOCAL_ID) and the MODEL/EFFORT seeds.
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_INITIAL_')
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_AUTOMATION_')
-        // APLUS_SESSION_* is first-set-wins (sessionUrlEnv.ts): without the
-        // scrub, a nested child session would keep the parent's session URL.
+        // APLUS_SESSION_* is rewritten after the child confirms its id, but the
+        // daemon still scrubs stale lineage before process launch.
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('APLUS_SESSION_')
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('SAYCODE_AGENT_')
     })

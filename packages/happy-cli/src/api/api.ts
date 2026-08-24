@@ -289,7 +289,8 @@ export class ApiClient {
     // gemini, openclaw, acp — online, reconnect-in-place, and offline→reconnect
     // all funnel through this factory before the agent loop starts), so export
     // the session's own web URL for agent shell subprocesses to inherit
-    // (specs/desktop-issue-pr-session-link R2). First-set wins.
+    // (specs/desktop-issue-pr-session-link R2). The confirmed current id wins
+    // over stale values inherited from a parent or an earlier resume process.
     applySessionUrlEnv(process.env, session.id, configuration.webappUrl);
     return new ApiSessionClient(this.credential.token, session);
   }

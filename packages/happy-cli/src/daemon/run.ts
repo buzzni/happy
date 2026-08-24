@@ -130,7 +130,7 @@ import {
 import {
   exchangeAutomationMcpCallerGrant,
   linkAutomationProjectSession,
-  linkSpawnedProjectSessionInBackground,
+  linkSpawnedProjectSession,
   type AutomationMcpSpawnContext,
 } from './automations/automationMcpCallerGrant';
 import { preflightAutomationConnectors } from './automations/automationConnectorPreflight';
@@ -2085,15 +2085,22 @@ export async function startDaemon(): Promise<void> {
       aiCredentialRuntime,
       // specs/daemon-spawn-project-link — a session created by `agent spawn` has no way to
       // register itself with A+ (its credential does not authenticate /api/*), so the daemon
-      // reports it here. Fire-and-forget: the session is already live either way.
-      linkSpawnedSession: ({ sessionId, directory }) => linkSpawnedProjectSessionInBackground({
-        configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
-        machineToken: credentials.token,
-        machineId,
-        sessionId,
-        directory,
-        logDebug: (message) => logger.debug(`[DAEMON RUN] [spawn-link] ${message}`),
-      }),
+      // reports it here. The request is bounded inside linkSpawnedProjectSession and
+      // settles before the RPC response so Desktop can load the child immediately.
+      // A failed link is logged but never turns a live child into a failed spawn.
+      linkSpawnedSession: async ({ sessionId, directory }) => {
+        const result = await linkSpawnedProjectSession({
+          configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+          machineToken: credentials.token,
+          machineId,
+          sessionId,
+          directory,
+          logDebug: (message) => logger.debug(`[DAEMON RUN] [spawn-link] ${message}`),
+        });
+        if (!result.ok) {
+          logger.debug(`[DAEMON RUN] [spawn-link] Spawned session project link failed: ${result.error}`);
+        }
+      },
     });
 
     // Connect to server

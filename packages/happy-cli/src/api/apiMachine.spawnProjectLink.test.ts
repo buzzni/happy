@@ -66,19 +66,31 @@ describe('spawn-happy-session — project link hook', () => {
         await expect(spawn(client)).resolves.toEqual({ type: 'success', sessionId: 'happy-1' });
     });
 
-    it('does not delay the spawn response on a slow link call', async () => {
-        // The user is waiting for a session, not for a list to update.
+    it('settles project linking before returning the spawned session', async () => {
+        // Returning before the link settles races Desktop's first lineage refresh:
+        // the ledger names a child that the project snapshot cannot load yet.
         let release: (() => void) | undefined;
-        const linkSpawnedSession = vi.fn(() => {
-            void new Promise<void>((resolve) => { release = resolve; });
-        });
+        const linkSpawnedSession = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ linkSpawnedSession }));
+
+        let settled = false;
+        const request = spawn(client).finally(() => { settled = true; });
+        await vi.waitFor(() => expect(linkSpawnedSession).toHaveBeenCalledOnce());
+        expect(settled).toBe(false);
+        expect(release).toBeDefined();
+        release?.();
+        await expect(request).resolves.toEqual({ type: 'success', sessionId: 'happy-1' });
+    });
+
+    it('keeps the spawn successful when an async project link rejects', async () => {
+        const linkSpawnedSession = vi.fn(async () => { throw new Error('aplus down'); });
         const { ApiMachineClient } = await import('./apiMachine');
         const client = new ApiMachineClient('token', machineClient());
         client.setRPCHandlers(rpcHandlers({ linkSpawnedSession }));
 
         await expect(spawn(client)).resolves.toEqual({ type: 'success', sessionId: 'happy-1' });
-        expect(release).toBeDefined();
-        release?.();
     });
 
     it('works when no hook is wired at all — a plain Happy daemon has none', async () => {
