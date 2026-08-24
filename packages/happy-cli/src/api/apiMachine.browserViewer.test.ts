@@ -249,4 +249,23 @@ describe('ApiMachineClient browser viewer RPC', () => {
             bridgeReady: true,
         })
     })
+
+    it('shares one in-flight viewer start across concurrent RPC calls', async () => {
+        let releaseToolProbe: (missing: string[]) => void = () => {}
+        viewerMocks.detectMissingViewerTools.mockReturnValueOnce(new Promise((resolve) => {
+            releaseToolProbe = resolve
+        }))
+        const { ApiMachineClient } = await import('./apiMachine')
+        const client = new ApiMachineClient('token', machineClient())
+        client.setRPCHandlers(rpcHandlers())
+        const start = handlersFrom(client).get('machine-1:browser-viewer:start')!
+
+        const first = start({})
+        const second = start({})
+        expect(viewerMocks.detectMissingViewerTools).toHaveBeenCalledTimes(1)
+        releaseToolProbe([])
+
+        await expect(Promise.all([first, second])).resolves.toHaveLength(2)
+        expect(mockRunPairing).toHaveBeenCalledTimes(1)
+    })
 })
