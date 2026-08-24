@@ -12,6 +12,7 @@ describe('buildCodexDeveloperInstructions', () => {
     it('uses replaceable developer instructions for explicit-policy clients', () => {
         expect(buildCodexDeveloperInstructions({
             connectorGuidance: 'CONNECTOR FACTS',
+            agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
             mode: {
                 appendSystemPrompt: 'USER AND PROJECT CONTEXT',
                 saycodeSystemPromptEnabled: false,
@@ -22,7 +23,16 @@ describe('buildCodexDeveloperInstructions', () => {
     it('keeps legacy client append prompts in the original user-turn position', () => {
         expect(buildCodexDeveloperInstructions({
             connectorGuidance: 'CONNECTOR FACTS',
+            agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
             mode: { appendSystemPrompt: 'LEGACY APPEND' },
+        })).toBe('CONNECTOR FACTS\n\nAGENT ORCHESTRATION: happy agent spawn');
+    });
+
+    it('does not inject orchestration when Saycode prompts are off', () => {
+        expect(buildCodexDeveloperInstructions({
+            connectorGuidance: 'CONNECTOR FACTS',
+            agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
+            mode: { saycodeSystemPromptEnabled: false },
         })).toBe('CONNECTOR FACTS');
     });
 });

@@ -65,6 +65,7 @@ import {
     type CodexEnhancedMode,
 } from './codexPrompt';
 import { discoverCodexSkillCommands } from './codexSkills';
+import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
 import { readReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import {
@@ -1113,6 +1114,7 @@ export async function runCodex(opts: {
                         ? async ({ threadId, mcpServers }) => {
                             const nextDeveloperInstructions = buildCodexDeveloperInstructions({
                                 connectorGuidance: buildConnectorToolGuidance(listExternalServices(mcpServers)),
+                                agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
                                 mode: message.mode,
                             });
                             const resumed = await client.resumeThread({
@@ -1128,6 +1130,7 @@ export async function runCodex(opts: {
 
                 const nextDeveloperInstructions = buildCodexDeveloperInstructions({
                     connectorGuidance: buildConnectorToolGuidance(listExternalServices(mcpSync.mcpServers)),
+                    agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
                     mode: message.mode,
                 });
                 if (client.threadId && nextDeveloperInstructions !== currentDeveloperInstructions) {

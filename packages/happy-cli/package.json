@@ -100,6 +100,7 @@
     "@types/qrcode-terminal": "^0.12.2",
     "@types/react": "^19.2.7",
     "@types/tmp": "^0.2.6",
+    "@buzzni/saycode-cli": "0.3.0",
     "ai": "^5.0.107",
     "axios": "^1.13.2",
     "chalk": "^5.6.2",
@@ -125,7 +126,8 @@
     "zod": "^4.0.0"
   },
   "bundledDependencies": [
-    "@slopus/happy-wire"
+    "@slopus/happy-wire",
+    "@buzzni/saycode-cli"
   ],
   "devDependencies": {
     "@eslint/compat": "^1",

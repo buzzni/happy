@@ -21,6 +21,7 @@ import { buildSkillGovernanceOptions, readSkillGovernanceConfigFromEnv } from "@
 import { readExpectedConnectors, readExpectedMcpServices } from '@/aplus/fetchAplusMcpServers';
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
 import { buildClaudeSystemPromptOptions } from './claudePrompt';
+import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
 
 export type ClaudeActiveInputSender = (text: string) => boolean;
 
@@ -171,6 +172,7 @@ export async function claudeRemote(opts: {
         appendSystemPrompt: initial.mode.appendSystemPrompt,
         chatTitlePrompt: CHAT_TITLE_SYSTEM_PROMPT,
         saycodeSystemPrompt: saycodeOwnedSystemPrompt,
+        agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
         orchestratorPrompt,
         workerDelegationPrompt: workerAgents.delegationPrompt,
         connectorGuidance,

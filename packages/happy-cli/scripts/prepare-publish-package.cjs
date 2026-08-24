@@ -6,6 +6,7 @@ const path = require('path');
 
 const BUNDLED_DEPENDENCIES = [
     '@slopus/happy-wire',
+    '@buzzni/saycode-cli',
     '@paralleldrive/cuid2',
     '@noble/hashes',
     'zod'
@@ -126,6 +127,7 @@ function preparePublishPackage() {
         ['README.md', 'package.json', 'dist']
     );
 
+    copyDependency(cliDir, '@buzzni/saycode-cli', outputDir);
     const cuid2Destination = copyDependency(cliDir, '@paralleldrive/cuid2', outputDir);
     copyDependency(cliDir, '@noble/hashes', outputDir);
     copyDependency(cliDir, 'zod', outputDir);

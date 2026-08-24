@@ -16,6 +16,8 @@ const EXPECTED_BUNDLED_FILES = [
     'package/bin/happy-browser-native-host.mjs',
     'package/dist/browserNativeMessagingHost.mjs',
     'package/browser-extension/src/nativePairing.js',
+    'package/node_modules/@buzzni/saycode-cli/package.json',
+    'package/node_modules/@buzzni/saycode-cli/index.mjs',
     'package/node_modules/@slopus/happy-wire/package.json',
     'package/node_modules/@slopus/happy-wire/dist/index.mjs',
     'package/node_modules/zod/package.json',
@@ -23,6 +25,8 @@ const EXPECTED_BUNDLED_FILES = [
     'package/node_modules/@paralleldrive/cuid2/node_modules/@noble/hashes/package.json'
 ];
 const EXPECTED_INSTALLED_FILES = [
+    'node_modules/@buzzni/saycode-cli/package.json',
+    'node_modules/@buzzni/saycode-cli/index.mjs',
     'node_modules/@slopus/happy-wire/package.json',
     'node_modules/@slopus/happy-wire/dist/index.mjs',
     'node_modules/zod/package.json',
@@ -144,6 +148,18 @@ function collectMetadataErrors(packageJson) {
         errors.push(`dependencies.@slopus/happy-wire must be a registry version, got ${wireSpec}`);
     }
 
+    const saycodeSpec = packageJson.dependencies && packageJson.dependencies['@buzzni/saycode-cli'];
+
+    if (!saycodeSpec) {
+        errors.push('dependencies.@buzzni/saycode-cli is missing from publish metadata');
+    } else if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(saycodeSpec)) {
+        errors.push(`dependencies.@buzzni/saycode-cli must be an exact registry version, got ${saycodeSpec}`);
+    }
+
+    if (!packageJson.bundledDependencies?.includes('@buzzni/saycode-cli')) {
+        errors.push('Saycode agent facade dependency must be bundled');
+    }
+
     return errors;
 }
 
@@ -161,6 +177,10 @@ function collectTarErrors(entries) {
         if (!entrySet.has(expectedFile)) {
             errors.push(`tarball is missing bundled file: ${expectedFile}`);
         }
+    }
+
+    if (!entrySet.has('package/node_modules/@buzzni/saycode-cli/index.mjs')) {
+        errors.push('Saycode agent facade implementation is missing from the tarball');
     }
 
     return errors;
@@ -298,6 +318,23 @@ function runInstallSmoke(tarball, packageJson) {
         }
 
         const cliPath = path.join(installedRoot, 'bin', 'happy.mjs');
+        const agentHelp = run(process.execPath, [
+            cliPath,
+            'agent',
+            '--help'
+        ], {
+            env: isolatedEnv,
+            timeout: 30000
+        }).stdout;
+
+        if (!agentHelp.includes('Agent commands')) {
+            throw new Error('Saycode agent facade did not return the bundled CLI help');
+        }
+
+        if (fs.existsSync(path.join(prefix, 'bin', 'saycode'))) {
+            throw new Error('Happy CLI install unexpectedly created a global saycode bin');
+        }
+
         assertDaemonRuntimePreflight(cliPath, isolatedEnv);
 
         run(process.execPath, [

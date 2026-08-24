@@ -27,12 +27,17 @@ export function hashCodexEnhancedMode(mode: CodexEnhancedMode): string {
 
 export function buildCodexDeveloperInstructions({
     connectorGuidance,
+    agentOrchestrationPrompt,
     mode,
 }: {
     connectorGuidance?: string;
+    agentOrchestrationPrompt?: string;
     mode: Pick<CodexEnhancedMode, 'appendSystemPrompt' | 'saycodeSystemPromptEnabled'>;
 }): string | undefined {
     const blocks = [connectorGuidance];
+    if (mode.saycodeSystemPromptEnabled !== false) {
+        blocks.push(agentOrchestrationPrompt);
+    }
     if (mode.saycodeSystemPromptEnabled !== undefined) {
         blocks.push(mode.appendSystemPrompt);
     }

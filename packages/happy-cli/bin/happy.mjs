@@ -3,10 +3,40 @@
 import { execFileSync } from 'child_process';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { join, dirname } from 'path';
+import { createRequire } from 'module';
+import { join, dirname, resolve } from 'path';
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const cliArgs = process.argv.slice(2);
+
+if (cliArgs[0] === 'agent') {
+  const require = createRequire(import.meta.url);
+  const manifestPath = require.resolve('@buzzni/saycode-cli/package.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  const saycodeBin = manifest.bin?.saycode;
+
+  if (typeof saycodeBin !== 'string') {
+    console.error('Bundled @buzzni/saycode-cli does not declare the saycode binary.');
+    process.exit(1);
+  }
+
+  const entrypoint = resolve(dirname(manifestPath), saycodeBin);
+  try {
+    execFileSync(process.execPath, [
+      '--no-warnings',
+      '--no-deprecation',
+      entrypoint,
+      'agent',
+      ...cliArgs.slice(1)
+    ], {
+      stdio: 'inherit',
+      env: process.env
+    });
+  } catch (error) {
+    process.exit(error.status || 1);
+  }
+  process.exit(0);
+}
 
 if (cliArgs.length === 1 && (cliArgs[0] === '--version' || cliArgs[0] === '-v')) {
   const packageJson = JSON.parse(readFileSync(join(projectRoot, 'package.json'), 'utf8'));
