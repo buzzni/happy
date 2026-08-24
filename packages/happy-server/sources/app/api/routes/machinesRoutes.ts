@@ -32,7 +32,22 @@ export function machinesRoutes(app: Fastify) {
         });
 
         if (machine) {
-            // Machine exists - just return it
+            // Machine exists - return it, backfilling dataEncryptionKey once
+            // if it was registered without one (legacy-mode CLI) and the
+            // daemon now submits a wrapped key. Write-once: an existing
+            // non-null key is NEVER overwritten here — replacing it would
+            // orphan ciphertext and allow key-swap; rotation must be an
+            // explicit separate flow. (aplus §6-1 machine key provisioning)
+            let effectiveDataEncryptionKey = machine.dataEncryptionKey;
+            if (!machine.dataEncryptionKey && dataEncryptionKey) {
+                const submitted = new Uint8Array(Buffer.from(dataEncryptionKey, 'base64'));
+                await db.machine.update({
+                    where: { id: machine.id },
+                    data: { dataEncryptionKey: submitted }
+                });
+                effectiveDataEncryptionKey = submitted;
+                log({ module: 'machines', machineId: id, userId }, 'Backfilled dataEncryptionKey for existing machine');
+            }
             log({ module: 'machines', machineId: id, userId }, 'Found existing machine');
             return reply.send({
                 machine: {
@@ -42,7 +57,7 @@ export function machinesRoutes(app: Fastify) {
                     metadataVersion: machine.metadataVersion,
                     daemonState: machine.daemonState,
                     daemonStateVersion: machine.daemonStateVersion,
-                    dataEncryptionKey: machine.dataEncryptionKey ? Buffer.from(machine.dataEncryptionKey).toString('base64') : null,
+                    dataEncryptionKey: effectiveDataEncryptionKey ? Buffer.from(effectiveDataEncryptionKey).toString('base64') : null,
                     active: machine.active,
                     activeAt: machine.lastActiveAt.getTime(),  // Return as activeAt for API consistency
                     createdAt: machine.createdAt.getTime(),

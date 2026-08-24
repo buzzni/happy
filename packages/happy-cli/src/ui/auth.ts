@@ -5,7 +5,7 @@ import tweetnacl from 'tweetnacl';
 import axios from 'axios';
 import { displayQRCode } from "./qrcode";
 import { delay } from "@/utils/time";
-import { writeCredentialsLegacy, readCredentials, updateSettings, Credentials, writeCredentialsDataKey } from "@/persistence";
+import { writeCredentialsLegacy, readCredentials, updateSettings, Credentials, writeCredentialsDataKey, provisionLegacyMachineKey } from "@/persistence";
 import { generateWebAuthUrl } from "@/api/webAuth";
 import { openBrowser } from "@/utils/browser";
 import { AuthSelector, AuthMethod } from "./ink/AuthSelector";
@@ -285,6 +285,22 @@ export async function authAndSetupMachineIfNeeded(): Promise<{
     });
 
     logger.debug(`[AUTH] Machine ID: ${settings.machineId}`);
+
+    // aplus §6-1 Phase 3b — aplus claim setup 이 settings 에 남긴 계정
+    // 공개키가 있으면 legacy 자격증명에 머신 키를 1회 병기 provisioning
+    // 한다. RPC 는 여전히 legacy secret 로 동작하고(동작 무변경), wrap 된
+    // 키는 다음 머신 등록에서 서버로 올라간다. best-effort — 어떤 실패도
+    // 시작을 막지 않는다.
+    if (credentials.encryption.type === 'legacy'
+        && !credentials.encryption.provisioned
+        && settings.accountPublicKey) {
+        try {
+            credentials = await provisionLegacyMachineKey(credentials, settings.accountPublicKey);
+            logger.debug('[AUTH] Provisioned machine data key for account public key');
+        } catch (e) {
+            logger.debug('[AUTH] Machine key provisioning failed — continuing in plain legacy mode', e);
+        }
+    }
 
     return { credentials, machineId: settings.machineId! };
 }

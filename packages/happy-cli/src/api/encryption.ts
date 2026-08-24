@@ -84,6 +84,21 @@ export function libsodiumEncryptForPublicKey(data: Uint8Array, recipientPublicKe
  * @param secret - The secret key to use for encryption
  * @returns The encrypted data
  */
+/**
+ * Wrap a machine data-encryption key for the account public key, in the exact
+ * wire format the server stores and clients unwrap:
+ * [version 0x00 | ephemeralPub(32) | nonce(24) | box ciphertext].
+ * Single assembly point — used by dataKey-mode registration and by the
+ * legacy-mode provisioning path (aplus §6-1 Phase 3b).
+ */
+export function wrapDataEncryptionKey(machineKey: Uint8Array, recipientPublicKey: Uint8Array): Uint8Array {
+  const encrypted = libsodiumEncryptForPublicKey(machineKey, recipientPublicKey);
+  const result = new Uint8Array(encrypted.length + 1);
+  result.set([0], 0); // Version byte
+  result.set(encrypted, 1);
+  return result;
+}
+
 export function encryptLegacy(data: any, secret: Uint8Array): Uint8Array {
   const nonce = getRandomBytes(tweetnacl.secretbox.nonceLength);
   const encrypted = tweetnacl.secretbox(new TextEncoder().encode(JSON.stringify(data)), nonce, secret);

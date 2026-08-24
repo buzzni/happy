@@ -8,6 +8,7 @@ import { FileHandle } from 'node:fs/promises'
 import { readFile, writeFile, mkdir, open, unlink, rename, stat } from 'node:fs/promises'
 import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs'
 import { constants } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { configuration } from '@/configuration'
 import * as z from 'zod';
 import { encodeBase64, decodeBase64 } from '@/api/encryption';
@@ -45,6 +46,12 @@ interface Settings {
   sandboxConfig?: SandboxConfig
   serverUrl?: string
   webappUrl?: string
+  /**
+   * aplus §6-1 Phase 3b — aplus claim setup 커맨드가 남기는 계정 box 공개키
+   * (base64). 존재하면 legacy 자격증명에 머신 키를 1회 provisioning 한다.
+   * 구버전 CLI 는 이 필드를 몰라도 무해하게 보존한다 (plain JSON).
+   */
+  accountPublicKey?: string
 }
 
 const defaultSettings: Settings = {
@@ -239,25 +246,40 @@ const credentialsSchema = z.object({
 export type Credentials = {
   token: string,
   encryption: {
-    type: 'legacy', secret: Uint8Array
+    type: 'legacy', secret: Uint8Array,
+    /**
+     * aplus §6-1 Phase 3b — legacy 활성 상태에서 병기된 dataKey 재료.
+     * RPC 는 여전히 secret(legacy)로 동작하고, 이 재료는 머신 등록 시
+     * wrap 된 dataEncryptionKey 를 서버에 올리는 데만 쓰인다. 컷오버
+     * (secret 제거 → dataKey 활성)는 별도 phase 의 몫이다.
+     */
+    provisioned?: { publicKey: Uint8Array, machineKey: Uint8Array }
   } | {
     type: 'dataKey', publicKey: Uint8Array, machineKey: Uint8Array
   }
 }
 
-export async function readCredentials(): Promise<Credentials | null> {
-  if (!existsSync(configuration.privateKeyFile)) {
-    return null
-  }
+/**
+ * Pure parsing of the access.key payload. secret-first: a file carrying BOTH
+ * secret and encryption parses as legacy-active with the dataKey material
+ * attached as `provisioned` — old CLI versions parse the same file as plain
+ * legacy (unknown/extra fields are ignored by the schema), so the combined
+ * format is backward compatible by construction.
+ */
+export function parseCredentials(raw: unknown): Credentials | null {
   try {
-    const keyBase64 = (await readFile(configuration.privateKeyFile, 'utf8'));
-    const credentials = credentialsSchema.parse(JSON.parse(keyBase64));
+    const credentials = credentialsSchema.parse(raw);
     if (credentials.secret) {
+      const provisioned = credentials.encryption ? {
+        publicKey: new Uint8Array(Buffer.from(credentials.encryption.publicKey, 'base64')),
+        machineKey: new Uint8Array(Buffer.from(credentials.encryption.machineKey, 'base64'))
+      } : undefined;
       return {
         token: credentials.token,
         encryption: {
           type: 'legacy',
-          secret: new Uint8Array(Buffer.from(credentials.secret, 'base64'))
+          secret: new Uint8Array(Buffer.from(credentials.secret, 'base64')),
+          ...(provisioned ? { provisioned } : {})
         }
       };
     } else if (credentials.encryption) {
@@ -274,6 +296,36 @@ export async function readCredentials(): Promise<Credentials | null> {
     return null
   }
   return null
+}
+
+export async function readCredentials(): Promise<Credentials | null> {
+  if (!existsSync(configuration.privateKeyFile)) {
+    return null
+  }
+  try {
+    const keyBase64 = (await readFile(configuration.privateKeyFile, 'utf8'));
+    return parseCredentials(JSON.parse(keyBase64));
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Serialize a legacy credential with provisioned dataKey material into the
+ * combined access.key format (see parseCredentials). Plain object so callers
+ * can inspect/persist it.
+ */
+export function serializeProvisionedLegacyCredentials(input: {
+  token: string, secret: Uint8Array, publicKey: Uint8Array, machineKey: Uint8Array
+}): { token: string, secret: string, encryption: { publicKey: string, machineKey: string } } {
+  return {
+    token: input.token,
+    secret: encodeBase64(input.secret),
+    encryption: {
+      publicKey: encodeBase64(input.publicKey),
+      machineKey: encodeBase64(input.machineKey)
+    }
+  };
 }
 
 export async function writeCredentialsLegacy(credentials: { secret: Uint8Array, token: string }): Promise<void> {
@@ -294,6 +346,64 @@ export async function writeCredentialsDataKey(credentials: { publicKey: Uint8Arr
     encryption: { publicKey: encodeBase64(credentials.publicKey), machineKey: encodeBase64(credentials.machineKey) },
     token: credentials.token
   }, null, 2));
+}
+
+/**
+ * Pure assembly for legacy→provisioned upgrade (aplus §6-1 Phase 3b): attach a
+ * freshly generated machineKey + the account box publicKey to legacy
+ * credentials, and produce the combined access.key payload. Throws on invalid
+ * input — callers treat provisioning as best-effort and must not let a throw
+ * break startup.
+ */
+export function buildProvisionedLegacyCredentials(
+  credentials: Credentials,
+  accountPublicKeyBase64: string,
+  machineKey: Uint8Array,
+): { updated: Credentials, serialized: ReturnType<typeof serializeProvisionedLegacyCredentials> } {
+  if (credentials.encryption.type !== 'legacy') {
+    throw new Error('provisioning applies to legacy credentials only');
+  }
+  if (credentials.encryption.provisioned) {
+    throw new Error('credentials already carry provisioned dataKey material');
+  }
+  const publicKey = new Uint8Array(Buffer.from(accountPublicKeyBase64, 'base64'));
+  if (publicKey.length !== 32) {
+    throw new Error(`account public key must be 32 bytes, got ${publicKey.length}`);
+  }
+  if (machineKey.length !== 32) {
+    throw new Error(`machine key must be 32 bytes, got ${machineKey.length}`);
+  }
+  const serialized = serializeProvisionedLegacyCredentials({
+    token: credentials.token,
+    secret: credentials.encryption.secret,
+    publicKey,
+    machineKey,
+  });
+  const updated: Credentials = {
+    token: credentials.token,
+    encryption: {
+      type: 'legacy',
+      secret: credentials.encryption.secret,
+      provisioned: { publicKey, machineKey },
+    },
+  };
+  return { updated, serialized };
+}
+
+/**
+ * One-shot machine key provisioning (aplus §6-1 Phase 3b): generate a random
+ * machineKey on THIS machine, persist the combined access.key (secret stays
+ * active — RPC unchanged), and return the updated credentials. The wrapped
+ * key reaches the server via getOrCreateMachine on the next registration.
+ */
+export async function provisionLegacyMachineKey(
+  credentials: Credentials,
+  accountPublicKeyBase64: string,
+): Promise<Credentials> {
+  const machineKey = new Uint8Array(randomBytes(32));
+  const { updated, serialized } = buildProvisionedLegacyCredentials(credentials, accountPublicKeyBase64, machineKey);
+  await writeFile(configuration.privateKeyFile, JSON.stringify(serialized, null, 2));
+  return updated;
 }
 
 export async function clearCredentials(): Promise<void> {
