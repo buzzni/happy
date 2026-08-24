@@ -16,6 +16,7 @@
 
 import { decodeBase64 } from '@/api/encryption';
 import type { PersistedSession } from '@/persistence';
+import { captureSaycodeAgentEnvironment } from './sessionEnv';
 import type { TrackedSession } from './types';
 
 type HydratedFields = Pick<
@@ -36,6 +37,9 @@ type HydratedFields = Pick<
  */
 export function hydrateTrackedSessionFromPersisted(persisted: PersistedSession | undefined): HydratedFields {
   if (!persisted) return {};
+  const agentEnvironment = persisted.agentEnvironment
+    ? captureSaycodeAgentEnvironment(persisted.agentEnvironment as NodeJS.ProcessEnv)
+    : undefined;
 
   return {
     happySessionMetadataFromLocalWebhook: persisted.metadata,
@@ -50,6 +54,6 @@ export function hydrateTrackedSessionFromPersisted(persisted: PersistedSession |
     ...(persisted.lastProcessedSeq !== undefined
       ? { persistedLastProcessedSeq: persisted.lastProcessedSeq }
       : {}),
-    ...(persisted.agentEnvironment ? { agentEnvironment: persisted.agentEnvironment } : {}),
+    ...(agentEnvironment ? { agentEnvironment } : {}),
   };
 }

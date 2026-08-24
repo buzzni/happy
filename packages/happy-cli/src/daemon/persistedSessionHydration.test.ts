@@ -60,6 +60,20 @@ describe('hydrateTrackedSessionFromPersisted', () => {
       .toEqual(agentEnvironment);
   });
 
+  it('shouldValidatePersistedAgentCapabilityBeforeAddingItToTheChildEnvironment', () => {
+    const agentEnvironment = {
+      SAYCODE_AGENT_ENV: '1',
+      SAYCODE_AGENT_ROOT: 'root-session',
+      NODE_OPTIONS: '--require /tmp/untrusted.cjs',
+    } as unknown as NonNullable<PersistedSession['agentEnvironment']>;
+
+    expect(hydrateTrackedSessionFromPersisted(persisted({ agentEnvironment })).agentEnvironment)
+      .toEqual({
+        SAYCODE_AGENT_ENV: '1',
+        SAYCODE_AGENT_ROOT: 'root-session',
+      });
+  });
+
   // Callers spread this over a session that may already hold fresher values, so
   // an absent field must stay absent instead of overwriting one with undefined.
   it('shouldOmitKeysTheRecordDoesNotCarry', () => {
