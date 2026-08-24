@@ -264,7 +264,7 @@ type ViewerStackStartResult = {
     webPort: number;
     ready: boolean;
     reused: boolean;
-} & ViewerBrowserSummary;
+} & ViewerBrowserState;
 
 type MachineRpcHandlers = {
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
