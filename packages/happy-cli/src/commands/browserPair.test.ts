@@ -306,6 +306,10 @@ describe('extension load policy', () => {
         expect(shouldLoadUnpackedExtension(true, 'viewer-9222')).toBe(true)
     })
 
+    it('does not refresh a visible extension on the viewer first attempt', () => {
+        expect(shouldLoadUnpackedExtension(true, 'viewer-9222', false)).toBe(false)
+    })
+
     it('keeps the ordinary pairing path from reloading an already visible extension', () => {
         expect(shouldLoadUnpackedExtension(true)).toBe(false)
     })
