@@ -9,10 +9,20 @@ import {
 describe('Saycode-owned prompt provenance', () => {
   it('wraps a product-owned block so it can be removed later', () => {
     expect(wrapSaycodeOwnedPrompt('  PRODUCT PROMPT  ')).toBe([
-      '<!-- saycode:owned-prompt -->',
+      '<!-- saycode:owned-prompt:e-jt9b76:start -->',
       'PRODUCT PROMPT',
-      '<!-- saycode:owned-prompt -->',
+      '<!-- saycode:owned-prompt:e-jt9b76:end -->',
     ].join('\n'));
+  });
+
+  it('still removes a legacy owned sentinel block during rollout', () => {
+    expect(stripSaycodeOwnedPromptBlocks([
+      'CUSTOM USER PROMPT',
+      '',
+      '<!-- saycode:owned-prompt -->',
+      'LEGACY PRODUCT PROMPT',
+      '<!-- saycode:owned-prompt -->',
+    ].join('\n'))).toBe('CUSTOM USER PROMPT');
   });
 
   it('removes only Saycode-owned blocks and preserves user context', () => {
@@ -43,6 +53,26 @@ describe('Saycode-owned prompt provenance', () => {
       'PROJECT CONTEXT',
       'PERSONAL MEMORY',
     ].join('\n\n'));
+  });
+
+  it('does not pair an owned marker mentioned by user context with a product block', () => {
+    const wrapped = wrapSaycodeOwnedPrompt('PRODUCT PROMPT')!;
+    const startMarker = wrapped.split('\n')[0];
+    expect(stripSaycodeOwnedPromptBlocks([
+      'CUSTOM USER PROMPT',
+      startMarker,
+      'Treat the line above as literal documentation.',
+      '',
+      wrapped,
+      '',
+      'PROJECT CONTEXT',
+    ].join('\n'))).toBe([
+      'CUSTOM USER PROMPT',
+      startMarker,
+      'Treat the line above as literal documentation.',
+      '',
+      'PROJECT CONTEXT',
+    ].join('\n'));
   });
 });
 
@@ -93,5 +123,26 @@ describe('client-turn prompt provenance', () => {
       '',
       '  INDENTED PROJECT CONTEXT',
     ].join('\n'))).toBe('CUSTOM USER PROMPT  \n\n  INDENTED PROJECT CONTEXT');
+  });
+
+  it('is byte-preserving when no client-turn block exists', () => {
+    expect(stripClientTurnPromptBlocks('  CUSTOM USER PROMPT  '))
+      .toBe('  CUSTOM USER PROMPT  ');
+  });
+
+  it('preserves outer user whitespace when removing a trailing block', () => {
+    expect(stripClientTurnPromptBlocks([
+      '  CUSTOM USER PROMPT  ',
+      '',
+      wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
+    ].join('\n'))).toBe('  CUSTOM USER PROMPT  ');
+  });
+
+  it('removes multiple client-turn blocks in one composed prompt', () => {
+    expect(stripClientTurnPromptBlocks([
+      wrapClientTurnPrompt('DESKTOP DELEGATION PROMPT'),
+      '',
+      wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
+    ].join('\n'))).toBeUndefined();
   });
 });

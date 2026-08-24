@@ -107,6 +107,14 @@ describe('resolveSaycodeAppendSystemPromptForMessage', () => {
       'PROJECT CONTEXT',
     ].join('\n'));
   });
+
+  it('keeps a field-absent user prompt byte-for-byte when no client block is cached', () => {
+    expect(resolveSaycodeAppendSystemPromptForMessage({
+      current: '  USER PROJECT CONTEXT  ',
+      hasIncoming: false,
+      saycodeSystemPromptEnabled: true,
+    })).toBe('  USER PROJECT CONTEXT  ');
+  });
 });
 
 describe('resolveInitialSaycodeAppendSystemPrompt', () => {

@@ -66,15 +66,8 @@ export const MOBILE_SAYCODE_PROMPT_BLOCKS: readonly MobileSaycodePromptBlock[] =
 
 export type SaycodeTurnMeta = {
     saycodeSystemPromptEnabled: boolean;
-    /**
-     * The composed prompt, `null` for an explicit reset, or `undefined` to omit.
-     * Unwrapped blocks (R22) pass the CLI's master-off sentinel strip, so cache
-     * invalidation can no longer ride on it — once the user touched the
-     * optionsGuidance block, an empty composed prompt travels as `null` so the
-     * previously sent guidance cannot linger in the CLI cache. Untouched accounts
-     * keep omitting, preserving non-Saycode context cached by other clients.
-     */
-    appendSystemPrompt: string | null | undefined;
+    /** App-composed guidance is client-turn scoped; omission removes only its cached envelope. */
+    appendSystemPrompt: string | undefined;
     /** CLI-wire overrides only; undefined when empty so the payload stays byte-identical for untouched accounts. */
     saycodePromptBlocks: Record<string, boolean> | undefined;
 };
@@ -107,16 +100,10 @@ export function buildSaycodeTurnMeta({
         const value = overrides?.[block.id];
         if (typeof value === 'boolean') cliWire[block.id] = value;
     }
-    // happy-cli strips every saycode-owned sentinel block from appendSystemPrompt when
-    // the master flag is off (resolveSaycodeAppendSystemPromptForMessage). A block the
-    // user explicitly overrode on must survive that strip, so under master-off it
-    // travels unwrapped; under master-on the CLI never strips and the wrapper stays as
-    // the provenance marker.
-    const appendSystemPrompt = !optionsGuidanceEnabled
-        ? (typeof overrides?.optionsGuidance === 'boolean' ? null : undefined)
-        : saycodeSystemPromptEnabled
-            ? resolveSaycodeAppendSystemPrompt({ enabled: true, prompt: systemPrompt })
-            : systemPrompt;
+    const appendSystemPrompt = resolveSaycodeAppendSystemPrompt({
+        enabled: optionsGuidanceEnabled,
+        prompt: systemPrompt,
+    });
     return {
         saycodeSystemPromptEnabled,
         appendSystemPrompt,

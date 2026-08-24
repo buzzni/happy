@@ -250,7 +250,7 @@ describe('settings', () => {
             expect(resolveSaycodeAppendSystemPrompt({
                 enabled: true,
                 prompt: 'SAYCODE OPTIONS PROMPT',
-            })).toContain('<!-- saycode:owned-prompt -->\nSAYCODE OPTIONS PROMPT\n<!-- saycode:owned-prompt -->');
+            })).toMatch(/<!-- saycode:client-turn-prompt:[a-z0-9]+-[a-z0-9]+:start -->\nSAYCODE OPTIONS PROMPT\n<!-- saycode:client-turn-prompt:[a-z0-9]+-[a-z0-9]+:end -->/);
         });
     });
 
