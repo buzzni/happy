@@ -81,6 +81,7 @@ import {
   resolveAutomationDirectoryMatch,
   shareInFlight,
 } from './resumeGuards';
+import { decideResumeCursorPersist } from './resumeCursorPersistence';
 import { startLogHousekeeping } from '@/ui/logHousekeepingRunner';
 import {
   readDaemonSessionIdleReaperConfig,
@@ -651,6 +652,11 @@ export async function startDaemon(): Promise<void> {
         ...(mode !== undefined ? { mode } : {}),
         updatedAt: runtime.updatedAt,
       };
+
+      // The cursor only exists in memory until something writes it. A daemon
+      // killed without its clean-stop handlers takes it to the grave and the
+      // session can never be resumed — see persistResumeCursorIfDue.
+      persistResumeCursorIfDue(trackedSession);
     };
 
     // Spawn a new session (sessionId reserved for future --resume functionality)
@@ -1162,6 +1168,52 @@ export async function startDaemon(): Promise<void> {
       }
       logger.debug(`[DAEMON RUN] Preserved session ${session.happySessionId} for resume (${reason})`);
       return true;
+    };
+
+    /**
+     * Last time this daemon wrote a resume cursor to disk, by happy session id.
+     * Only a throttle input — the authoritative "what is on disk" value is
+     * `session.persistedLastProcessedSeq`.
+     */
+    const resumeCursorPersistedAt = new Map<string, number>();
+
+    /**
+     * Keeps the on-disk resume cursor current while the session is running.
+     *
+     * Without this the cursor reaches disk only through
+     * `preserveSessionForResume`, so a daemon that dies without its clean-stop
+     * handlers (pod eviction, OOM, SIGKILL) strands every session it was
+     * running: the persisted record keeps its start-time snapshot and resume
+     * refuses with `SESSION_CURSOR_MISSING` forever.
+     */
+    const persistResumeCursorIfDue = (session: TrackedSession): void => {
+      const sessionId = session.happySessionId;
+      const metadata = session.happySessionMetadataFromLocalWebhook;
+      if (!sessionId || !session.encryption || !metadata) return;
+
+      const cursor = session.runtime?.lastProcessedSeq;
+      const now = Date.now();
+      if (!decideResumeCursorPersist({
+        cursor,
+        persistedCursor: session.persistedLastProcessedSeq,
+        lastPersistAt: resumeCursorPersistedAt.get(sessionId),
+        now,
+      })) return;
+
+      persistSession(sessionId, {
+        encryptionKey: encodeBase64(session.encryption.encryptionKey),
+        encryptionVariant: session.encryption.encryptionVariant,
+        seq: session.encryption.seq,
+        metadataVersion: session.encryption.metadataVersion,
+        agentStateVersion: session.encryption.agentStateVersion,
+        metadata,
+        savedAt: now,
+        userHomeDir: session.userHomeDir,
+        lastProcessedSeq: cursor,
+      });
+      session.persistedLastProcessedSeq = cursor;
+      resumeCursorPersistedAt.set(sessionId, now);
+      logger.debug(`[DAEMON RUN] Persisted resume cursor ${cursor} for session ${sessionId}`);
     };
 
     const fetchServerSessionSnapshot = async (sessionId: string, encryption: SessionEncryptionData, token?: string): Promise<ServerSessionSnapshot | null> => {
@@ -1698,6 +1750,7 @@ export async function startDaemon(): Promise<void> {
       pidToTrackedSession.delete(pid);
       sessionStartTimes.delete(pid);
       pidToAdoptedAt.delete(pid);
+      if (tracked?.happySessionId) resumeCursorPersistedAt.delete(tracked.happySessionId);
       persistTrackedSessions();
       if (tracked?.userHomeDir) {
         const homeDir = tracked.userHomeDir;
