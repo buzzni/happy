@@ -1,4 +1,7 @@
-import { stripSaycodeOwnedPromptBlocks } from '@slopus/happy-wire';
+import {
+  stripClientTurnPromptBlocks,
+  stripSaycodeOwnedPromptBlocks,
+} from '@slopus/happy-wire';
 
 export type PromptProvenance =
   | 'saycode'
@@ -57,9 +60,15 @@ export function resolveSaycodeAppendSystemPromptForMessage(input: {
   saycodeSystemPromptEnabled: boolean | undefined;
 }): string | undefined {
   const resolved = input.hasIncoming ? input.incoming || undefined : input.current;
+  // A client-local block is valid only while that client supplies appendSystemPrompt.
+  // Another client may omit the field to preserve user/project context; remove just
+  // the stale local block instead of clearing the whole cached prompt.
+  const currentClientPrompt = input.hasIncoming
+    ? resolved
+    : stripClientTurnPromptBlocks(resolved);
   return input.saycodeSystemPromptEnabled === false
-    ? stripSaycodeOwnedPromptBlocks(resolved)
-    : resolved;
+    ? stripSaycodeOwnedPromptBlocks(currentClientPrompt)
+    : currentClientPrompt;
 }
 
 /**

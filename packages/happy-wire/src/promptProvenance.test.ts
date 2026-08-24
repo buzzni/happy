@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  stripClientTurnPromptBlocks,
   stripSaycodeOwnedPromptBlocks,
+  wrapClientTurnPrompt,
   wrapSaycodeOwnedPrompt,
 } from './promptProvenance';
 
@@ -41,5 +43,27 @@ describe('Saycode-owned prompt provenance', () => {
       'PROJECT CONTEXT',
       'PERSONAL MEMORY',
     ].join('\n\n'));
+  });
+});
+
+describe('client-turn prompt provenance', () => {
+  it('wraps a client-local block separately from account-owned prompts', () => {
+    expect(wrapClientTurnPrompt('  DESKTOP PREVIEW PROMPT  ')).toBe([
+      '<!-- saycode:client-turn-prompt -->',
+      'DESKTOP PREVIEW PROMPT',
+      '<!-- saycode:client-turn-prompt -->',
+    ].join('\n'));
+  });
+
+  it('removes stale client-turn blocks without clearing user context', () => {
+    expect(stripClientTurnPromptBlocks([
+      'CUSTOM USER PROMPT',
+      '',
+      '<!-- saycode:client-turn-prompt -->',
+      'DESKTOP PREVIEW PROMPT',
+      '<!-- saycode:client-turn-prompt -->',
+      '',
+      'PROJECT CONTEXT',
+    ].join('\n'))).toBe('CUSTOM USER PROMPT\n\nPROJECT CONTEXT');
   });
 });

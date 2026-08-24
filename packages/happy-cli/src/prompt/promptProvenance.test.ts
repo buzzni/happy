@@ -49,6 +49,45 @@ describe('resolveSaycodeAppendSystemPromptForMessage', () => {
       saycodeSystemPromptEnabled: undefined,
     })).toContain('PRODUCT PROMPT');
   });
+
+  it('keeps an incoming client-turn block for that turn while enforcing master off', () => {
+    expect(resolveSaycodeAppendSystemPromptForMessage({
+      current: undefined,
+      incoming: [
+        'CUSTOM USER PROMPT',
+        '',
+        '<!-- saycode:owned-prompt -->',
+        'DISABLED PRODUCT PROMPT',
+        '<!-- saycode:owned-prompt -->',
+        '',
+        '<!-- saycode:client-turn-prompt -->',
+        'DESKTOP PREVIEW PROMPT',
+        '<!-- saycode:client-turn-prompt -->',
+      ].join('\n'),
+      hasIncoming: true,
+      saycodeSystemPromptEnabled: false,
+    })).toBe([
+      'CUSTOM USER PROMPT',
+      '',
+      '<!-- saycode:client-turn-prompt -->',
+      'DESKTOP PREVIEW PROMPT',
+      '<!-- saycode:client-turn-prompt -->',
+    ].join('\n'));
+  });
+
+  it('removes a cached client-turn block when the next client omits append prompt', () => {
+    expect(resolveSaycodeAppendSystemPromptForMessage({
+      current: [
+        'CUSTOM USER PROMPT',
+        '',
+        '<!-- saycode:client-turn-prompt -->',
+        'DESKTOP PREVIEW PROMPT',
+        '<!-- saycode:client-turn-prompt -->',
+      ].join('\n'),
+      hasIncoming: false,
+      saycodeSystemPromptEnabled: false,
+    })).toBe('CUSTOM USER PROMPT');
+  });
 });
 
 describe('resolveInitialSaycodeAppendSystemPrompt', () => {
