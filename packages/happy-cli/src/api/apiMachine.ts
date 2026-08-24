@@ -258,12 +258,20 @@ type ViewerBridgeSummary =
     | { bridgeReady: false; bridgeMessage: string };
 
 type ViewerBrowserState = ViewerBrowserSummary & Partial<ViewerBridgeSummary>;
+type ViewerStackStartResult = {
+    display: string;
+    vncPort: number | null;
+    webPort: number;
+    ready: boolean;
+    reused: boolean;
+} & ViewerBrowserState;
 
 type MachineRpcHandlers = {
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
     resumeSession?: (sessionId: string, options?: {
         model?: string;
         permissionMode?: string;
+        environmentVariables?: Record<string, string>;
         mcpCallerGrantEnvelope?: string;
         mcpConfigProjectId?: string;
         expectedConnectors?: string[];
@@ -347,9 +355,14 @@ export class ApiMachineClient {
     // adoption reads it. Guessing it by arithmetic would encode a coupling the
     // args builders do not actually promise.
     private viewer: { display: string; vncPort: number | null; webPort: number } | null = null;
+    private viewerStartInFlight: {
+        callerWillLaunchBrowser: boolean;
+        promise: Promise<ViewerStackStartResult>;
+    } | null = null;
     private resumeSessionHandler: ((sessionId: string, options?: {
         model?: string;
         permissionMode?: string;
+        environmentVariables?: Record<string, string>;
         mcpCallerGrantEnvelope?: string;
         mcpConfigProjectId?: string;
         expectedConnectors?: string[];
@@ -1096,9 +1109,32 @@ export class ApiMachineClient {
      * option, so "launch Chrome under the viewer" never spins up a second,
      * disconnected Xvfb (specs/browser-remote-login/).
      */
-    private async startViewerStack(
+    private startViewerStack(
         options: { callerWillLaunchBrowser?: boolean } = {},
-    ): Promise<{ display: string; vncPort: number | null; webPort: number; ready: boolean; reused: boolean } & ViewerBrowserSummary> {
+    ): Promise<ViewerStackStartResult> {
+        const callerWillLaunchBrowser = options.callerWillLaunchBrowser ?? false;
+        const inFlight = this.viewerStartInFlight;
+        if (inFlight) {
+            if (inFlight.callerWillLaunchBrowser === callerWillLaunchBrowser) {
+                return inFlight.promise;
+            }
+            // A profile-launch caller intentionally defers the default Chrome,
+            // while a viewer-open caller requires it. Serialize unlike modes,
+            // then re-evaluate the live stack with the second caller's policy.
+            return inFlight.promise.then(() => this.startViewerStack(options));
+        }
+        const promise = this.startViewerStackOnce(options);
+        this.viewerStartInFlight = { callerWillLaunchBrowser, promise };
+        const clear = () => {
+            if (this.viewerStartInFlight?.promise === promise) this.viewerStartInFlight = null;
+        };
+        promise.then(clear, clear);
+        return promise;
+    }
+
+    private async startViewerStackOnce(
+        options: { callerWillLaunchBrowser?: boolean } = {},
+    ): Promise<ViewerStackStartResult> {
         const missing = await detectMissingViewerTools();
         if (missing.length > 0) {
             throw new Error(`원격 화면에 필요한 프로그램이 없습니다: ${missing.join(', ')}`);
@@ -1314,6 +1350,7 @@ export class ApiMachineClient {
                         sessionId,
                         model,
                         permissionMode,
+                        environmentVariables,
                         mcpCallerGrantEnvelope,
                         mcpConfigProjectId,
                         expectedConnectors,
@@ -1321,6 +1358,17 @@ export class ApiMachineClient {
 
                     if (!sessionId || typeof sessionId !== 'string') {
                         throw new Error('Session ID is required');
+                    }
+                    if (
+                        environmentVariables !== undefined
+                        && (
+                            environmentVariables === null
+                            || typeof environmentVariables !== 'object'
+                            || Array.isArray(environmentVariables)
+                            || Object.values(environmentVariables).some((value) => typeof value !== 'string')
+                        )
+                    ) {
+                        throw new Error('Environment variables must contain string values only');
                     }
                     if (mcpCallerGrantEnvelope !== undefined && typeof mcpCallerGrantEnvelope !== 'string') {
                         throw new Error('MCP caller grant envelope must be a string');
@@ -1338,6 +1386,7 @@ export class ApiMachineClient {
                     const result = await handler(sessionId, {
                         model,
                         permissionMode,
+                        environmentVariables,
                         mcpCallerGrantEnvelope,
                         mcpConfigProjectId,
                         expectedConnectors: validExpectedConnectors,

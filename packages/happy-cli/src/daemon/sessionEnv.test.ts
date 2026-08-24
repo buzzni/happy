@@ -143,3 +143,21 @@ describe('Saycode agent resume environment', () => {
         })
     })
 })
+
+describe('mergeResumeSessionEnvironment', () => {
+    it('strips lineage keys from inherited and runtime env while preserving trusted resume values', () => {
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: { KEEP_INHERITED: 'yes', HAPPY_RECONNECT_SESSION_ID: 'stale' },
+            runtime: { KEEP_RUNTIME: 'yes', APLUS_SESSION_ID: 'forged' },
+            automation: { KEEP_AUTOMATION: 'yes', HAPPY_AUTOMATION_ID: 'forged' },
+            explicit: { HAPPY_RECONNECT_SESSION_ID: 'session-1' },
+            sessionId: 'session-1',
+        })).toEqual({
+            KEEP_INHERITED: 'yes',
+            KEEP_RUNTIME: 'yes',
+            KEEP_AUTOMATION: 'yes',
+            HAPPY_RECONNECT_SESSION_ID: 'session-1',
+            APLUS_SESSION_ID: 'session-1',
+        })
+    })
+})

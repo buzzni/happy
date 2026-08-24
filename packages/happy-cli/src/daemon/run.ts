@@ -1236,6 +1236,7 @@ export async function startDaemon(): Promise<void> {
     type ResumeSessionOptions = {
       model?: string;
       permissionMode?: string;
+      environmentVariables?: Record<string, string>;
       mcpCallerGrantEnvelope?: string;
       mcpConfigProjectId?: string;
       expectedConnectors?: string[];
@@ -1397,8 +1398,9 @@ export async function startDaemon(): Promise<void> {
         const mcpEnvironment = prepareMcpChildEnvironment({
           environmentVariables: buildResumedSessionSpawnEnvironment({
             inherited: inheritedResumeEnvironment,
+            runtime: options?.environmentVariables,
+            automation: options?.automation?.environmentVariables,
             explicit: {
-              ...(options?.automation?.environmentVariables ?? {}),
               ...reconnectEnvironment,
               // user-credential 세션은 원래 계정의 스테이징 자격증명으로 복원 —
               // 없으면 위의 credentialDecision 이 이미 refuse 했다.
