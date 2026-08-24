@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
-import { preflightInstalledHappyCLI, resolveHappyCliSpawnCommand, spawnDetachedHappyCLI } from './spawnHappyCLI';
+import { preflightInstalledHappyCLI, resolveHappyCliSpawnCommand, spawnDetachedHappyCLI, startDetachedHappyCLI } from './spawnHappyCLI';
 
 describe('resolveHappyCliSpawnCommand', () => {
   it('uses the source entrypoint when the current CLI is running from source', () => {
@@ -72,6 +72,96 @@ describe('preflightInstalledHappyCLI', () => {
     child.emit('exit', 1)
 
     await expect(preflight).resolves.toBe(false)
+  })
+})
+
+describe('startDetachedHappyCLI', () => {
+  const makeChild = () => {
+    const child = new EventEmitter() as ChildProcess
+    child.kill = vi.fn()
+    child.unref = vi.fn()
+    return child
+  }
+
+  // 2026-08-25: the replacement exec'd fine — the 'spawn' event fired — but
+  // `happy daemon start` then polled for 5s, never saw a daemon, printed
+  // "Failed to start daemon" and exited 1. The handoff had already reported
+  // success on 'spawn' alone, so the old daemon exited and the machine had no
+  // daemon for six hours. Exec success is not startup success.
+  it('does not report success when the command exits non-zero after spawning', async () => {
+    const child = makeChild()
+    const started = startDetachedHappyCLI(['daemon', 'start'], { spawn: () => child, timeoutMs: 1_000 })
+
+    child.emit('spawn')
+    child.emit('exit', 1)
+
+    await expect(started).resolves.toBe(false)
+  })
+
+  it('reports success only once the command confirms startup by exiting zero', async () => {
+    const child = makeChild()
+    const started = startDetachedHappyCLI(['daemon', 'start'], { spawn: () => child, timeoutMs: 1_000 })
+
+    child.emit('spawn')
+
+    let settled = false
+    void started.then(() => { settled = true })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    child.emit('exit', 0)
+
+    await expect(started).resolves.toBe(true)
+  })
+
+  it('reports failure when the child errors instead of starting', async () => {
+    const child = makeChild()
+    const started = startDetachedHappyCLI(['daemon', 'start'], { spawn: () => child, timeoutMs: 1_000 })
+
+    child.emit('error', new Error('EAGAIN'))
+
+    await expect(started).resolves.toBe(false)
+  })
+
+  it('reports failure when the command never reports either way', async () => {
+    const child = makeChild()
+    const started = startDetachedHappyCLI(['daemon', 'start'], { spawn: () => child, timeoutMs: 10 })
+
+    child.emit('spawn')
+
+    await expect(started).resolves.toBe(false)
+  })
+
+  it('reports failure when spawning throws synchronously', async () => {
+    const spawn = vi.fn(() => { throw new Error('entrypoint missing') })
+
+    await expect(
+      startDetachedHappyCLI(['daemon', 'start'], { spawn, timeoutMs: 1_000 })
+    ).resolves.toBe(false)
+  })
+
+  // Unchanged from the previous contract and still load-bearing: an
+  // unconfirmed child may be a daemon that is merely slow, and the retry is
+  // safe because `daemon start` detects an already-running daemon.
+  it('never kills the child, even when startup cannot be confirmed', async () => {
+    const child = makeChild()
+
+    await startDetachedHappyCLI(['daemon', 'start'], { spawn: () => child, timeoutMs: 10 })
+
+    expect(child.kill).not.toHaveBeenCalled()
+  })
+
+  it('spawns detached so the daemon survives this process exiting', async () => {
+    const child = makeChild()
+    const spawn = vi.fn(() => child)
+
+    const started = startDetachedHappyCLI(['daemon', 'start'], { spawn, timeoutMs: 1_000 })
+    child.emit('spawn')
+    child.emit('exit', 0)
+    await started
+
+    expect(spawn).toHaveBeenCalledWith(['daemon', 'start'], expect.objectContaining({ detached: true }))
+    expect(child.unref).toHaveBeenCalled()
   })
 })
 

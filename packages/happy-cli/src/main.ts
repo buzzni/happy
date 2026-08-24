@@ -29,7 +29,7 @@ import { handleSandboxCommand } from './commands/sandbox'
 import { handleBrowserCommand } from './commands/browser'
 import { handleServerCommand } from './commands/server'
 import { handleDataKeyCommand } from './commands/datakey'
-import { spawnHappyCLI } from './utils/spawnHappyCLI'
+import { captureSpawnOutputStdio, spawnHappyCLI } from './utils/spawnHappyCLI'
 import { claudeCliPath } from './claude/claudeLocal'
 import { execFileSync } from 'node:child_process'
 import { extractNoSandboxFlag } from './utils/sandboxFlags'
@@ -540,10 +540,15 @@ Conversation history is preserved on the server, but in-flight tool calls are in
         daemonEnv = { ...process.env, HAPPY_APLUS_MCP_CONFIG_URL: presetUrl }
       }
 
-      // Spawn detached daemon process
+      // Spawn detached daemon process.
+      // stdio is captured, never ignored: if start-sync dies before its logger
+      // is up it leaves no daemon log at all, and its stderr is then the only
+      // record of why. On 2026-08-25 that output was discarded, this branch
+      // printed "Failed to start daemon", and the machine sat without a daemon
+      // for six hours with nothing to diagnose.
       const child = spawnHappyCLI(['daemon', 'start-sync'], {
         detached: true,
-        stdio: 'ignore',
+        stdio: captureSpawnOutputStdio('daemon-start-sync.log', `daemon start from pid ${process.pid}`),
         env: daemonEnv
       });
       child.unref();

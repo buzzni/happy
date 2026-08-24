@@ -19,7 +19,7 @@ import { configuration } from '@/configuration';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
-import { preflightInstalledHappyCLI, spawnDetachedHappyCLI, spawnHappyCLI } from '@/utils/spawnHappyCLI';
+import { captureSpawnOutputStdio, preflightInstalledHappyCLI, spawnHappyCLI, startDetachedHappyCLI } from '@/utils/spawnHappyCLI';
 import {
   writeDaemonState,
   writeDaemonStateDebounced,
@@ -47,8 +47,7 @@ import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation
 import { shouldYieldDaemonStateOwnership } from './daemonStateOwnership';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
-import { openSync, statSync, writeSync } from 'fs';
-import type { SpawnOptions } from 'node:child_process';
+import { statSync } from 'fs';
 import { join } from 'path';
 import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
@@ -176,30 +175,6 @@ export const initialMachineMetadata: MachineMetadata = {
   resumeSupport: { ...detectResumeSupport(), rpcAvailable: true },
   automationSupport: { rpcAvailable: true },
 };
-
-/**
- * stdio for the replacement daemon spawned during a bundle handoff.
- *
- * The replacement writes its own log only once its logger is up. Anything that
- * kills it earlier — a broken bundle, a missing runtime — is printed to stderr
- * and would be lost with `stdio: 'ignore'`, which is exactly why the
- * 2026-08-23 handoff failure left no evidence at all. Falls back to 'ignore'
- * if the file cannot be opened; losing output is better than blocking the
- * handoff.
- */
-function openHandoffReplacementStdio(attempt: number): SpawnOptions['stdio'] {
-  try {
-    const fd = openSync(join(configuration.logsDir, 'daemon-handoff-replacement.log'), 'a');
-    // One file accumulates every handoff on this machine, and a replacement
-    // that dies early writes an unattributed stderr blob. Without this marker
-    // the reader cannot tell which handoff — or which attempt — produced it.
-    writeSync(fd, `\n--- handoff from pid ${process.pid} (attempt ${attempt}) at ${new Date().toISOString()} ---\n`);
-    return ['ignore', fd, fd];
-  } catch (error) {
-    logger.debug('[DAEMON RUN] Could not open handoff replacement log; spawning without captured output', error);
-    return 'ignore';
-  }
-}
 
 export async function startDaemon(): Promise<void> {
   // The daemon can be auto-(re)started by any happy CLI child — including a
@@ -2245,10 +2220,15 @@ export async function startDaemon(): Promise<void> {
           },
           spawnReplacement: (attempt) => {
             logger.debug(`[DAEMON RUN] Spawning replacement daemon (attempt ${attempt})`);
-            return spawnDetachedHappyCLI(['daemon', 'start'], {
-              // Never 'ignore': if the replacement dies before it can open its
-              // own log file, this is the only place its failure is recorded.
-              stdio: openHandoffReplacementStdio(attempt),
+            // startDetached, not spawnDetached: the replacement counts only
+            // once `daemon start` confirms a daemon actually came up. On
+            // 2026-08-25 it exec'd fine and then failed to start one, and
+            // reporting success on exec alone cost six hours of no daemon.
+            return startDetachedHappyCLI(['daemon', 'start'], {
+              stdio: captureSpawnOutputStdio(
+                'daemon-handoff-replacement.log',
+                `handoff from pid ${process.pid} (attempt ${attempt})`,
+              ),
             });
           },
         });

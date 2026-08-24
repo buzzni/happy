@@ -1,6 +1,6 @@
 import { logger } from '@/ui/logger'
 import { checkIfDaemonRunningAndCleanupStaleState, isDaemonRunningCurrentlyInstalledHappyVersion } from './controlClient'
-import { spawnHappyCLI } from '@/utils/spawnHappyCLI'
+import { captureSpawnOutputStdio, spawnHappyCLI } from '@/utils/spawnHappyCLI'
 
 const DAEMON_READY_TIMEOUT_MS = 5000
 const DAEMON_READY_POLL_INTERVAL_MS = 100
@@ -14,9 +14,12 @@ export async function ensureDaemonRunning(): Promise<void> {
 
   logger.debug('Starting Happy background service...')
 
+  // stdio captured rather than ignored — see captureSpawnOutputStdio. A
+  // start-sync that dies before its logger is up leaves no other trace, and
+  // the readiness loop below can then only report a timeout without a cause.
   const daemonProcess = spawnHappyCLI(['daemon', 'start-sync'], {
     detached: true,
-    stdio: 'ignore',
+    stdio: captureSpawnOutputStdio('daemon-start-sync.log', `ensureDaemonRunning from pid ${process.pid}`),
     env: process.env,
   })
   daemonProcess.unref()
