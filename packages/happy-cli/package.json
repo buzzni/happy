@@ -1,6 +1,6 @@
 {
   "name": "@buzzni/happy-cli",
-  "version": "1.1.10-aplus.125",
+  "version": "1.1.10-aplus.126",
   "description": "A+ Dev Studio fork of slopus/happy. Mobile and Web client for Claude Code and Codex.",
   "author": "Kirill Dubovitskiy (upstream), justinbuzzni (aplus fork)",
   "license": "MIT",
@@ -100,7 +100,7 @@
     "@types/qrcode-terminal": "^0.12.2",
     "@types/react": "^19.2.7",
     "@types/tmp": "^0.2.6",
-    "@buzzni/saycode-cli": "0.2.2",
+    "@buzzni/saycode-cli": "0.3.0",
     "ai": "^5.0.107",
     "axios": "^1.13.2",
     "chalk": "^5.6.2",
