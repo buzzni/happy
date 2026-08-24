@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { wrapClientTurnPrompt } from '@slopus/happy-wire';
 import {
   PROMPT_BLOCK_PROVENANCE,
   SAYCODE_MASTER_PROMPT_PROVENANCE_IDS,
@@ -60,18 +61,14 @@ describe('resolveSaycodeAppendSystemPromptForMessage', () => {
         'DISABLED PRODUCT PROMPT',
         '<!-- saycode:owned-prompt -->',
         '',
-        '<!-- saycode:client-turn-prompt -->',
-        'DESKTOP PREVIEW PROMPT',
-        '<!-- saycode:client-turn-prompt -->',
+        wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
       ].join('\n'),
       hasIncoming: true,
       saycodeSystemPromptEnabled: false,
     })).toBe([
       'CUSTOM USER PROMPT',
       '',
-      '<!-- saycode:client-turn-prompt -->',
-      'DESKTOP PREVIEW PROMPT',
-      '<!-- saycode:client-turn-prompt -->',
+      wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
     ].join('\n'));
   });
 
@@ -80,13 +77,35 @@ describe('resolveSaycodeAppendSystemPromptForMessage', () => {
       current: [
         'CUSTOM USER PROMPT',
         '',
-        '<!-- saycode:client-turn-prompt -->',
-        'DESKTOP PREVIEW PROMPT',
-        '<!-- saycode:client-turn-prompt -->',
+        wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
       ].join('\n'),
       hasIncoming: false,
       saycodeSystemPromptEnabled: false,
     })).toBe('CUSTOM USER PROMPT');
+  });
+
+  it('preserves user text that resembles a client-turn boundary', () => {
+    const wrapped = wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT')!;
+    const documentedStartMarker = wrapped.split('\n')[0];
+    expect(resolveSaycodeAppendSystemPromptForMessage({
+      current: [
+        'CUSTOM USER PROMPT',
+        documentedStartMarker,
+        'Treat the line above as literal documentation.',
+        '',
+        wrapped,
+        '',
+        'PROJECT CONTEXT',
+      ].join('\n'),
+      hasIncoming: false,
+      saycodeSystemPromptEnabled: false,
+    })).toBe([
+      'CUSTOM USER PROMPT',
+      documentedStartMarker,
+      'Treat the line above as literal documentation.',
+      '',
+      'PROJECT CONTEXT',
+    ].join('\n'));
   });
 });
 

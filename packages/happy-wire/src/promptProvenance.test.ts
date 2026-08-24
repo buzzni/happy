@@ -49,9 +49,9 @@ describe('Saycode-owned prompt provenance', () => {
 describe('client-turn prompt provenance', () => {
   it('wraps a client-local block separately from account-owned prompts', () => {
     expect(wrapClientTurnPrompt('  DESKTOP PREVIEW PROMPT  ')).toBe([
-      '<!-- saycode:client-turn-prompt -->',
+      '<!-- saycode:client-turn-prompt:m-d7txt3:start -->',
       'DESKTOP PREVIEW PROMPT',
-      '<!-- saycode:client-turn-prompt -->',
+      '<!-- saycode:client-turn-prompt:m-d7txt3:end -->',
     ].join('\n'));
   });
 
@@ -59,11 +59,39 @@ describe('client-turn prompt provenance', () => {
     expect(stripClientTurnPromptBlocks([
       'CUSTOM USER PROMPT',
       '',
-      '<!-- saycode:client-turn-prompt -->',
-      'DESKTOP PREVIEW PROMPT',
-      '<!-- saycode:client-turn-prompt -->',
+      wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
       '',
       'PROJECT CONTEXT',
     ].join('\n'))).toBe('CUSTOM USER PROMPT\n\nPROJECT CONTEXT');
+  });
+
+  it('does not pair a marker mentioned by user context with a product block', () => {
+    const wrapped = wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT')!;
+    const startMarker = wrapped.split('\n')[0];
+    expect(stripClientTurnPromptBlocks([
+      'CUSTOM USER PROMPT',
+      startMarker,
+      'Treat the line above as literal documentation.',
+      '',
+      wrapped,
+      '',
+      'PROJECT CONTEXT',
+    ].join('\n'))).toBe([
+      'CUSTOM USER PROMPT',
+      startMarker,
+      'Treat the line above as literal documentation.',
+      '',
+      'PROJECT CONTEXT',
+    ].join('\n'));
+  });
+
+  it('preserves indentation in user context surrounding a removed block', () => {
+    expect(stripClientTurnPromptBlocks([
+      'CUSTOM USER PROMPT  ',
+      '',
+      wrapClientTurnPrompt('DESKTOP PREVIEW PROMPT'),
+      '',
+      '  INDENTED PROJECT CONTEXT',
+    ].join('\n'))).toBe('CUSTOM USER PROMPT  \n\n  INDENTED PROJECT CONTEXT');
   });
 });
