@@ -134,6 +134,7 @@ export async function readClaudeSessionTransferSourceChunk(input: {
 type PendingClaudeSessionImport = {
     tempPath: string;
     finalPath: string;
+    finalPathReserved: boolean;
     size: number;
     sha256: string;
     bytesWritten: number;
@@ -219,7 +220,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
         transfer: PendingClaudeSessionImport,
     ): Promise<void> => {
         pending.delete(transferId);
-        pendingFinalPaths.delete(transfer.finalPath);
+        if (transfer.finalPathReserved) pendingFinalPaths.delete(transfer.finalPath);
         if (transfer.requestId) reservations.delete(transfer.requestId);
         clearTimeout(transfer.cleanupTimer);
         await rm(transfer.tempPath, { force: true });
@@ -238,7 +239,13 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
                 throw new Error('Claude session import requestId must be a valid UUID');
             }
             const finalPath = resolveClaudeSessionTransferPath({ ...request, allowedRoot: input.allowedRoot });
-            if (pendingFinalPaths.has(finalPath)) {
+            // Request IDs were added with cancellable reservations. An older
+            // web client cannot release a begin whose acknowledgement is lost,
+            // so locking its request here would make retry impossible for the
+            // full 24-hour pending TTL. Keep the pre-reservation behavior for
+            // that rollout combination; current clients always send an ID.
+            const reserveFinalPath = request.requestId !== undefined;
+            if (reserveFinalPath && pendingFinalPaths.has(finalPath)) {
                 throw new Error('Claude session import already in progress');
             }
             const reservation: ClaudeSessionImportReservation | undefined = request.requestId
@@ -250,7 +257,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
                 }
                 reservations.set(request.requestId, reservation);
             }
-            pendingFinalPaths.add(finalPath);
+            if (reserveFinalPath) pendingFinalPaths.add(finalPath);
             let tempPath: string | undefined;
             try {
                 await orphanCleanup;
@@ -263,7 +270,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
                         const existingHash = await sha256File(finalPath);
                         if (reservation?.cancelled) throw new Error('Claude session import was cancelled');
                         if (existingHash === request.sha256.toLowerCase()) {
-                            pendingFinalPaths.delete(finalPath);
+                            if (reserveFinalPath) pendingFinalPaths.delete(finalPath);
                             if (request.requestId) reservations.delete(request.requestId);
                             return { status: 'already-present' };
                         }
@@ -280,7 +287,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
                     const abandoned = pending.get(transferId);
                     if (!abandoned) return;
                     pending.delete(transferId);
-                    pendingFinalPaths.delete(abandoned.finalPath);
+                    if (abandoned.finalPathReserved) pendingFinalPaths.delete(abandoned.finalPath);
                     if (abandoned.requestId) reservations.delete(abandoned.requestId);
                     await rm(abandoned.tempPath, { force: true }).catch(() => {});
                 }, CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS);
@@ -288,6 +295,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
                 pending.set(transferId, {
                     tempPath,
                     finalPath,
+                    finalPathReserved: reserveFinalPath,
                     size: request.size,
                     sha256: request.sha256.toLowerCase(),
                     bytesWritten: 0,
@@ -297,7 +305,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
                 if (reservation) reservation.transferId = transferId;
                 return { status: 'ready', transferId };
             } catch (error) {
-                pendingFinalPaths.delete(finalPath);
+                if (reserveFinalPath) pendingFinalPaths.delete(finalPath);
                 if (request.requestId) reservations.delete(request.requestId);
                 if (tempPath) await rm(tempPath, { force: true }).catch(() => {});
                 throw error;
@@ -400,7 +408,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
             try {
                 await rename(transfer.tempPath, transfer.finalPath);
                 pending.delete(request.transferId);
-                pendingFinalPaths.delete(transfer.finalPath);
+                if (transfer.finalPathReserved) pendingFinalPaths.delete(transfer.finalPath);
                 if (transfer.requestId) reservations.delete(transfer.requestId);
                 clearTimeout(transfer.cleanupTimer);
                 return { status: 'imported' };

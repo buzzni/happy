@@ -210,6 +210,7 @@ describe('Claude session transfer input validation', () => {
             claudeSessionId: SESSION_ID,
             size: 10,
             sha256: 'a'.repeat(64),
+            requestId: '76ea73da-e84b-4dc6-a673-85fbfd90e600',
         });
         if (first.status !== 'ready') throw new Error('expected ready import');
 
@@ -218,6 +219,7 @@ describe('Claude session transfer input validation', () => {
             claudeSessionId: SESSION_ID,
             size: 12,
             sha256: 'b'.repeat(64),
+            requestId: '56f6ca25-bfaf-4bb8-868c-56eca889e8df',
         })).rejects.toThrow('already in progress');
 
         await runtime.abortImport({ transferId: first.transferId });
@@ -226,8 +228,31 @@ describe('Claude session transfer input validation', () => {
             claudeSessionId: SESSION_ID,
             size: 12,
             sha256: 'b'.repeat(64),
+            requestId: '56f6ca25-bfaf-4bb8-868c-56eca889e8df',
         });
         if (retried.status !== 'ready') throw new Error('expected ready import');
+        await runtime.abortImport({ transferId: retried.transferId });
+    });
+
+    it('does not strand a destination lock when an older client loses its begin acknowledgement', async () => {
+        const runtime = createClaudeSessionTransferRuntime({ allowedRoot: root });
+        const first = await runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 10,
+            sha256: 'a'.repeat(64),
+        });
+        if (first.status !== 'ready') throw new Error('expected ready import');
+
+        const retried = await runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 12,
+            sha256: 'b'.repeat(64),
+        });
+        if (retried.status !== 'ready') throw new Error('expected ready import');
+
+        await runtime.abortImport({ transferId: first.transferId });
         await runtime.abortImport({ transferId: retried.transferId });
     });
 
