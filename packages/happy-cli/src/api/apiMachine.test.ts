@@ -125,6 +125,16 @@ describe('ApiMachineClient socket reconnection', () => {
         vi.restoreAllMocks();
     });
 
+    it('registers the machine-scoped Claude session transfer RPC', () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const manager = (client as any).rpcHandlerManager;
+
+        expect(manager.registerHandler).toHaveBeenCalledWith(
+            'claude-session-transfer',
+            expect.any(Function),
+        );
+    });
+
     it('retries after initial socket connection error', async () => {
         vi.useFakeTimers();
 
