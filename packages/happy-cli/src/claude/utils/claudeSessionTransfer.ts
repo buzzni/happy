@@ -138,6 +138,12 @@ type PendingClaudeSessionImport = {
     sha256: string;
     bytesWritten: number;
     cleanupTimer: ReturnType<typeof setTimeout>;
+    requestId?: string;
+};
+
+type ClaudeSessionImportReservation = {
+    cancelled: boolean;
+    transferId?: string;
 };
 
 function assertValidTransferSize(size: number): void {
@@ -204,6 +210,7 @@ async function removeOrphanedTransferFiles(projectsPath: string): Promise<void> 
 export function createClaudeSessionTransferRuntime(input: { allowedRoot: string }) {
     const pending = new Map<string, PendingClaudeSessionImport>();
     const pendingFinalPaths = new Set<string>();
+    const reservations = new Map<string, ClaudeSessionImportReservation>();
     const orphanCleanup = removeOrphanedTransferFiles(dirname(getProjectPath(input.allowedRoot)))
         .catch(() => {});
 
@@ -213,6 +220,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
     ): Promise<void> => {
         pending.delete(transferId);
         pendingFinalPaths.delete(transfer.finalPath);
+        if (transfer.requestId) reservations.delete(transfer.requestId);
         clearTimeout(transfer.cleanupTimer);
         await rm(transfer.tempPath, { force: true });
     };
@@ -223,22 +231,40 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
             claudeSessionId: string;
             size: number;
             sha256: string;
+            requestId?: string;
         }): Promise<{ status: 'ready'; transferId: string } | { status: 'already-present' }> {
-            await orphanCleanup;
             assertValidImportManifest(request.size, request.sha256);
+            if (request.requestId !== undefined && !UUID_RE.test(request.requestId)) {
+                throw new Error('Claude session import requestId must be a valid UUID');
+            }
             const finalPath = resolveClaudeSessionTransferPath({ ...request, allowedRoot: input.allowedRoot });
             if (pendingFinalPaths.has(finalPath)) {
                 throw new Error('Claude session import already in progress');
             }
+            const reservation: ClaudeSessionImportReservation | undefined = request.requestId
+                ? { cancelled: false }
+                : undefined;
+            if (request.requestId && reservation) {
+                if (reservations.has(request.requestId)) {
+                    throw new Error('Claude session import request already in progress');
+                }
+                reservations.set(request.requestId, reservation);
+            }
             pendingFinalPaths.add(finalPath);
+            let tempPath: string | undefined;
             try {
+                await orphanCleanup;
+                if (reservation?.cancelled) throw new Error('Claude session import was cancelled');
                 await mkdir(dirname(finalPath), { recursive: true });
+                if (reservation?.cancelled) throw new Error('Claude session import was cancelled');
                 try {
                     const existing = await stat(finalPath);
                     if (existing.isFile() && existing.size === request.size) {
                         const existingHash = await sha256File(finalPath);
+                        if (reservation?.cancelled) throw new Error('Claude session import was cancelled');
                         if (existingHash === request.sha256.toLowerCase()) {
                             pendingFinalPaths.delete(finalPath);
+                            if (request.requestId) reservations.delete(request.requestId);
                             return { status: 'already-present' };
                         }
                     }
@@ -246,14 +272,16 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
                     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
                 }
                 const transferId = randomUUID();
-                const tempPath = `${finalPath}.aplus-transfer-${transferId}.tmp`;
+                tempPath = `${finalPath}.aplus-transfer-${transferId}.tmp`;
                 const file = await open(tempPath, 'wx');
                 await file.close();
+                if (reservation?.cancelled) throw new Error('Claude session import was cancelled');
                 const cleanupTimer = setTimeout(async () => {
                     const abandoned = pending.get(transferId);
                     if (!abandoned) return;
                     pending.delete(transferId);
                     pendingFinalPaths.delete(abandoned.finalPath);
+                    if (abandoned.requestId) reservations.delete(abandoned.requestId);
                     await rm(abandoned.tempPath, { force: true }).catch(() => {});
                 }, CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS);
                 cleanupTimer.unref();
@@ -264,10 +292,14 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
                     sha256: request.sha256.toLowerCase(),
                     bytesWritten: 0,
                     cleanupTimer,
+                    requestId: request.requestId,
                 });
+                if (reservation) reservation.transferId = transferId;
                 return { status: 'ready', transferId };
             } catch (error) {
                 pendingFinalPaths.delete(finalPath);
+                if (request.requestId) reservations.delete(request.requestId);
+                if (tempPath) await rm(tempPath, { force: true }).catch(() => {});
                 throw error;
             }
         },
@@ -301,11 +333,29 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
             return { bytesWritten: transfer.bytesWritten };
         },
 
-        async abortImport(request: { transferId: string }): Promise<{ aborted: boolean }> {
-            const transfer = pending.get(request.transferId);
-            if (!transfer) return { aborted: false };
-            await discardPending(request.transferId, transfer);
-            return { aborted: true };
+        async abortImport(request: {
+            transferId?: string;
+            requestId?: string;
+        }): Promise<{ aborted: boolean }> {
+            if (request.transferId) {
+                const transfer = pending.get(request.transferId);
+                if (!transfer) return { aborted: false };
+                await discardPending(request.transferId, transfer);
+                return { aborted: true };
+            }
+            if (request.requestId) {
+                const reservation = reservations.get(request.requestId);
+                if (!reservation) return { aborted: false };
+                if (reservation.transferId) {
+                    const transfer = pending.get(reservation.transferId);
+                    if (!transfer) return { aborted: false };
+                    await discardPending(reservation.transferId, transfer);
+                } else {
+                    reservation.cancelled = true;
+                }
+                return { aborted: true };
+            }
+            return { aborted: false };
         },
 
         async commitImport(request: {
@@ -351,6 +401,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
                 await rename(transfer.tempPath, transfer.finalPath);
                 pending.delete(request.transferId);
                 pendingFinalPaths.delete(transfer.finalPath);
+                if (transfer.requestId) reservations.delete(transfer.requestId);
                 clearTimeout(transfer.cleanupTimer);
                 return { status: 'imported' };
             } catch (error) {
@@ -378,10 +429,11 @@ type ClaudeSessionTransferRequest =
         claudeSessionId: string;
         size: number;
         sha256: string;
+        requestId?: string;
     }
     | { action: 'write-import-chunk'; transferId: string; offset: number; content: string }
     | { action: 'commit-import'; transferId: string }
-    | { action: 'abort-import'; transferId: string };
+    | { action: 'abort-import'; transferId?: string; requestId?: string };
 
 export type ClaudeSessionTransferResponse =
     | ({ action: 'inspect-source' } & ClaudeSessionTransferSourceSnapshot)
