@@ -56,6 +56,17 @@ describe('buildChromeLaunchArgs', () => {
 
         expect(args.some((arg) => arg.startsWith('--headless'))).toBe(false)
     })
+
+    it('keeps the viewer display in the process arguments after Chrome sanitizes its environment', () => {
+        const args = buildChromeLaunchArgs({
+            userDataDir: '/p/a',
+            cdpPort: 9222,
+            headless: false,
+            display: ':99',
+        })
+
+        expect(args).toContain('--display=:99')
+    })
 })
 
 describe('resolveProfileUserDataDir', () => {

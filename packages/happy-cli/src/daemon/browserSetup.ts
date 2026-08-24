@@ -22,6 +22,11 @@ export interface ChromeLaunchOptions {
     /** Omitted means headful — the caller decides based on DISPLAY. */
     headless?: boolean
     /**
+     * Headful X11 display, repeated on the command line because Chrome may
+     * remove DISPLAY from its own environment after startup.
+     */
+    display?: string
+    /**
      * Last-resort fallback for kernels that block unprivileged user
      * namespaces (Ubuntu 23.10+ by default, most containers). Chrome's zygote
      * dies at startup there — "Failed to move to new namespace" — and never
@@ -31,7 +36,7 @@ export interface ChromeLaunchOptions {
     noSandbox?: boolean
 }
 
-export function buildChromeLaunchArgs({ userDataDir, cdpPort, headless, noSandbox }: ChromeLaunchOptions): string[] {
+export function buildChromeLaunchArgs({ userDataDir, cdpPort, headless, display, noSandbox }: ChromeLaunchOptions): string[] {
     const args = [
         `--remote-debugging-port=${cdpPort}`,
         `--user-data-dir=${userDataDir}`,
@@ -46,6 +51,9 @@ export function buildChromeLaunchArgs({ userDataDir, cdpPort, headless, noSandbo
         // `--headless=new` specifically: bare --headless is --headless=old,
         // which supports no extensions at all.
         args.push('--headless=new')
+    }
+    if (display) {
+        args.push(`--display=${display}`)
     }
     if (noSandbox) {
         args.push('--no-sandbox')
