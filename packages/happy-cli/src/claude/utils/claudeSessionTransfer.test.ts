@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -213,6 +213,35 @@ describe('Claude session transfer input validation', () => {
             offset: 0,
             content: Buffer.from('x').toString('base64'),
         })).rejects.toThrow('Unknown Claude session transfer');
+    });
+
+    it('removes orphaned transfer files left by a previous daemon before importing', async () => {
+        const destinationPath = resolveClaudeSessionTransferPath({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            allowedRoot: root,
+        });
+        const bucket = dirname(destinationPath);
+        await mkdir(bucket, { recursive: true });
+        const orphanName = `${SESSION_ID}.jsonl.aplus-transfer-93a9705e-bc6a-406d-8dce-8acc014dedbd.tmp`;
+        const orphanPath = join(bucket, orphanName);
+        await writeFile(orphanPath, 'orphan');
+        const expiredAt = new Date(Date.now() - CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS - 1_000);
+        await utimes(orphanPath, expiredAt, expiredAt);
+
+        const runtime = createClaudeSessionTransferRuntime({ allowedRoot: root });
+        const begun = await runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 10,
+            sha256: 'a'.repeat(64),
+        });
+        if (begun.status !== 'ready') throw new Error('expected ready import');
+
+        const entries = await readdir(bucket);
+        expect(entries).toHaveLength(1);
+        expect(entries).not.toContain(orphanName);
+        await runtime.abortImport({ transferId: begun.transferId });
     });
 
     it('rejects a destination chunk that exceeds its declared session size', async () => {

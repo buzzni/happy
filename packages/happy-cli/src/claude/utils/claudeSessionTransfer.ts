@@ -1,7 +1,7 @@
 import { dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { mkdir, open, rename, rm, stat } from 'node:fs/promises';
+import { mkdir, open, readdir, rename, rm, stat } from 'node:fs/promises';
 import { validatePath } from '@/modules/common/pathSecurity';
 import { getProjectPath } from './path';
 
@@ -10,6 +10,7 @@ export const CLAUDE_SESSION_TRANSFER_MAX_BYTES = 512 * 1024 * 1024;
 export const CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const TRANSFER_TEMP_RE = /^[0-9a-f-]{36}\.jsonl\.aplus-transfer-[0-9a-f-]{36}\.tmp$/i;
 
 export type ClaudeSessionTransferSourceSnapshot = {
     size: number;
@@ -161,8 +162,44 @@ function decodeTransferChunk(content: string): Buffer {
     return buffer;
 }
 
+async function removeOrphanedTransferFiles(projectsPath: string): Promise<void> {
+    let buckets;
+    try {
+        buckets = await readdir(projectsPath, { withFileTypes: true });
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+        throw error;
+    }
+    await Promise.all(buckets.filter((entry) => entry.isDirectory()).map(async (bucket) => {
+        const bucketPath = join(projectsPath, bucket.name);
+        const entries = await readdir(bucketPath, { withFileTypes: true }).catch(() => []);
+        await Promise.all(entries
+            .filter((entry) => (
+                (entry.isFile() || entry.isSymbolicLink())
+                && TRANSFER_TEMP_RE.test(entry.name)
+            ))
+            .map(async (entry) => {
+                const path = join(bucketPath, entry.name);
+                const file = await stat(path).catch(() => null);
+                if (!file) return;
+                const age = Date.now() - file.mtimeMs;
+                const remaining = Math.max(0, CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS - age);
+                if (remaining === 0) {
+                    await rm(path, { force: true });
+                    return;
+                }
+                const timer = setTimeout(() => {
+                    void rm(path, { force: true }).catch(() => {});
+                }, remaining);
+                timer.unref();
+            }));
+    }));
+}
+
 export function createClaudeSessionTransferRuntime(input: { allowedRoot: string }) {
     const pending = new Map<string, PendingClaudeSessionImport>();
+    const orphanCleanup = removeOrphanedTransferFiles(dirname(getProjectPath(input.allowedRoot)))
+        .catch(() => {});
 
     const discardPending = async (
         transferId: string,
@@ -180,6 +217,7 @@ export function createClaudeSessionTransferRuntime(input: { allowedRoot: string 
             size: number;
             sha256: string;
         }): Promise<{ status: 'ready'; transferId: string } | { status: 'already-present' }> {
+            await orphanCleanup;
             assertValidImportManifest(request.size, request.sha256);
             const finalPath = resolveClaudeSessionTransferPath({ ...request, allowedRoot: input.allowedRoot });
             await mkdir(dirname(finalPath), { recursive: true });
