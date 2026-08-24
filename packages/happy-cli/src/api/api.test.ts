@@ -28,7 +28,11 @@ vi.mock('./encryption', () => ({
     decodeBase64: vi.fn((data: string) => data),
     encodeBase64: vi.fn((data: any) => data),
     decrypt: vi.fn((_key: any, _variant: any, data: any) => data),
-    encrypt: vi.fn((_key: any, _variant: any, data: any) => data)
+    encrypt: vi.fn((_key: any, _variant: any, data: any) => data),
+    // 부분 mock 함정 방지: getOrCreateMachine 이 무조건 호출하는 조립 함수.
+    // 이 스위트의 자격증명은 wrap 재료가 없는 plain legacy — 실물과 동일하게
+    // 봉투 없음을 돌려준다.
+    buildMachineKeyEnvelopes: vi.fn(() => ({ dataEncryptionKey: null, serverDataEncryptionKey: null }))
 }));
 
 // Mock configuration

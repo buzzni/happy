@@ -3,7 +3,7 @@ import { logger } from '@/ui/logger'
 import type { AgentState, CreateSessionResponse, Metadata, Session, Machine, MachineMetadata, DaemonState } from '@/api/types'
 import { ApiSessionClient } from './apiSession';
 import { ApiMachineClient } from './apiMachine';
-import { decodeBase64, encodeBase64, getRandomBytes, encrypt, decrypt, wrapDataEncryptionKey } from './encryption';
+import { decodeBase64, encodeBase64, getRandomBytes, encrypt, decrypt, wrapDataEncryptionKey, buildMachineKeyEnvelopes } from './encryption';
 import { PushNotificationClient } from './pushNotifications';
 import { configuration } from '@/configuration';
 import chalk from 'chalk';
@@ -143,17 +143,22 @@ export class ApiClient {
     machineId: string,
     metadata: MachineMetadata,
     daemonState?: DaemonState,
+    /** aplus §6-1 B1 — 서버 서비스 공개키(base64). 있으면 machineKey 를
+     *  서버 몫으로도 wrap 해 serverDataEncryptionKey 로 등록한다. */
+    serverPublicKey?: string | null,
   }): Promise<Machine> {
 
-    // Resolve encryption key
-    let dataEncryptionKey: Uint8Array | null = null;
+    // Resolve encryption key + machine-key wrap material
     let encryptionKey: Uint8Array;
     let encryptionVariant: 'legacy' | 'dataKey';
+    let wrapMaterial: { machineKey: Uint8Array, accountPublicKey: Uint8Array } | null = null;
     if (this.credential.encryption.type === 'dataKey') {
-      // Encrypt data encryption key
       encryptionVariant = 'dataKey';
       encryptionKey = this.credential.encryption.machineKey;
-      dataEncryptionKey = wrapDataEncryptionKey(this.credential.encryption.machineKey, this.credential.encryption.publicKey);
+      wrapMaterial = {
+        machineKey: this.credential.encryption.machineKey,
+        accountPublicKey: this.credential.encryption.publicKey,
+      };
     } else {
       // Legacy encryption
       encryptionKey = this.credential.encryption.secret;
@@ -162,12 +167,19 @@ export class ApiClient {
       // 있으면 wrap 된 machineKey 를 서버에 등록한다 (서버는 write-once
       // 백필). RPC 암호화는 여전히 legacy secret — 동작 무변경.
       if (this.credential.encryption.provisioned) {
-        dataEncryptionKey = wrapDataEncryptionKey(
-          this.credential.encryption.provisioned.machineKey,
-          this.credential.encryption.provisioned.publicKey
-        );
+        wrapMaterial = {
+          machineKey: this.credential.encryption.provisioned.machineKey,
+          accountPublicKey: this.credential.encryption.provisioned.publicKey,
+        };
       }
     }
+    // aplus §6-1 B1 — 서버 서비스 공개키가 알려져 있으면 machineKey 를 서버
+    // 몫으로도 wrap 한다 (이중 수신자). 세션 키는 여기 관여하지 않는다.
+    const serverPublicKey = opts.serverPublicKey
+      ? decodeBase64(opts.serverPublicKey)
+      : null;
+    const { dataEncryptionKey, serverDataEncryptionKey } =
+      buildMachineKeyEnvelopes(wrapMaterial, serverPublicKey);
 
     // Helper to create minimal machine object for offline mode (DRY)
     const createMinimalMachine = (): Machine => ({
@@ -188,7 +200,8 @@ export class ApiClient {
           id: opts.machineId,
           metadata: encodeBase64(encrypt(encryptionKey, encryptionVariant, opts.metadata)),
           daemonState: opts.daemonState ? encodeBase64(encrypt(encryptionKey, encryptionVariant, opts.daemonState)) : undefined,
-          dataEncryptionKey: dataEncryptionKey ? encodeBase64(dataEncryptionKey) : undefined
+          dataEncryptionKey: dataEncryptionKey ? encodeBase64(dataEncryptionKey) : undefined,
+          serverDataEncryptionKey: serverDataEncryptionKey ? encodeBase64(serverDataEncryptionKey) : undefined
         },
         {
           headers: {
