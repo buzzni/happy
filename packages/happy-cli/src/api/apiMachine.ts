@@ -93,6 +93,7 @@ import {
     ForkTruncateUuidNotFoundError,
     ForkSourceMissingError,
 } from '@/claude/utils/claudeSessionFork';
+import { createClaudeSessionTransferHandler } from '@/claude/utils/claudeSessionTransfer';
 import { readClaudeCodeUsage } from '@/claudeCodeUsage/readUsage';
 import { CodexAppServerClient } from '@/codex/codexAppServerClient';
 import {
@@ -389,6 +390,10 @@ export class ApiMachineClient {
         });
         this.allowedRoot = allowedRoot;
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot);
+        this.rpcHandlerManager.registerHandler(
+            'claude-session-transfer',
+            createClaudeSessionTransferHandler({ allowedRoot }),
+        );
     }
 
     setRPCHandlers({
