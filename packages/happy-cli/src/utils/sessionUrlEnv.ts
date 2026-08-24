@@ -11,10 +11,9 @@
  *
  * Lineage inheritance: daemon-spawned children are protected by the
  * SESSION_LINEAGE_ENV_PREFIXES scrub in daemon/sessionEnv.ts, which strips an
- * inherited parent APLUS_SESSION_* before spawn. A nested happy run that does
- * NOT go through the daemon (agent shell exec'ing happy directly) can still
- * keep the parent's value due to first-set-wins — not a secret, worst case an
- * inaccurate link.
+ * inherited parent APLUS_SESSION_* before spawn. The session factory also
+ * replaces any stale inherited value once it knows the current Happy session
+ * id, covering nested runs that do not pass through the daemon scrub.
  */
 
 /** Builds the web URL for a session, e.g. https://saycode.ai/session/<id>. */
@@ -23,19 +22,15 @@ export function buildSessionWebUrl(sessionId: string, webappUrl: string): string
 }
 
 /**
- * Sets APLUS_SESSION_URL / APLUS_SESSION_ID on the given env unless already
- * present. First-set wins: an explicitly injected value (e.g. by a spawner)
- * must not be overwritten, and each key is preserved independently.
+ * Sets APLUS_SESSION_URL / APLUS_SESSION_ID to the session this process is
+ * currently syncing. The confirmed session id wins over inherited process
+ * state; otherwise a nested or resumed process can identify its parent as self.
  */
 export function applySessionUrlEnv(
     env: NodeJS.ProcessEnv,
     sessionId: string,
     webappUrl: string,
 ): void {
-    if (!env.APLUS_SESSION_URL) {
-        env.APLUS_SESSION_URL = buildSessionWebUrl(sessionId, webappUrl);
-    }
-    if (!env.APLUS_SESSION_ID) {
-        env.APLUS_SESSION_ID = sessionId;
-    }
+    env.APLUS_SESSION_URL = buildSessionWebUrl(sessionId, webappUrl);
+    env.APLUS_SESSION_ID = sessionId;
 }

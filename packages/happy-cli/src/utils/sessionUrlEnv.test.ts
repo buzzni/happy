@@ -26,18 +26,17 @@ describe('applySessionUrlEnv', () => {
         expect(env.APLUS_SESSION_ID).toBe('abc123');
     });
 
-    it('does not overwrite an existing APLUS_SESSION_URL', () => {
+    it('replaces a stale inherited APLUS_SESSION_URL with the current session', () => {
         const env: NodeJS.ProcessEnv = { APLUS_SESSION_URL: 'https://injected.example/session/other' };
         applySessionUrlEnv(env, 'abc123', 'https://saycode.ai');
-        expect(env.APLUS_SESSION_URL).toBe('https://injected.example/session/other');
-        // The other key is still filled in independently.
+        expect(env.APLUS_SESSION_URL).toBe('https://saycode.ai/session/abc123');
         expect(env.APLUS_SESSION_ID).toBe('abc123');
     });
 
-    it('does not overwrite an existing APLUS_SESSION_ID', () => {
+    it('replaces a stale inherited APLUS_SESSION_ID with the current session', () => {
         const env: NodeJS.ProcessEnv = { APLUS_SESSION_ID: 'injected-id' };
         applySessionUrlEnv(env, 'abc123', 'https://saycode.ai');
-        expect(env.APLUS_SESSION_ID).toBe('injected-id');
+        expect(env.APLUS_SESSION_ID).toBe('abc123');
         expect(env.APLUS_SESSION_URL).toBe('https://saycode.ai/session/abc123');
     });
 
