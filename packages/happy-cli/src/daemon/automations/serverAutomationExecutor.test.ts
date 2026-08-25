@@ -1068,6 +1068,92 @@ describe('runServerAutomationTick', () => {
     expect(store.state().githubIssueProgressMarkers ?? []).toEqual([])
   })
 
+  // .137 이후 query.error 자체가 자기 서술적이라 executor 가 접두사를 또 붙이면
+  // "GitHub query failed: GitHub query failed:" 로 두 번 찍힌다.
+  it('does not repeat the failure prefix the query already carries', async () => {
+    const { input, logDebug, queryGithubPullRequests } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review {pr.number}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    }))
+    queryGithubPullRequests.mockResolvedValue({
+      ok: false,
+      error: 'GitHub query failed: HTTP 504: We could not respond in time',
+    })
+
+    await runServerAutomationTick(input)
+
+    const line = logDebug.mock.calls.map((call) => String(call[0]))
+      .find((message) => message.includes('GitHub query failed'))
+    expect(line).toBeDefined()
+    expect(line!.match(/GitHub query failed/g)).toHaveLength(1)
+    expect(line).toContain('HTTP 504')
+  })
+
+  // 권한이 없으면 gh 는 오류가 아니라 빈 배열을 돌려준다. 첫 baseline 이 조용히
+  // 0건으로 기록되면 운영자는 어떤 로그도 못 본다 — 이 사고에서 가장 오래 헤맨 지점.
+  it('records the observed count when an issue baseline is first established', async () => {
+    const { input, logDebug, queryGithubIssues } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Issue triage', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Triage {issue.number}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'issue_opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    }))
+    queryGithubIssues.mockResolvedValue({ ok: true, issues: [] })
+
+    await runServerAutomationTick(input)
+
+    const line = logDebug.mock.calls.map((call) => String(call[0]))
+      .find((message) => message.includes('baseline'))
+    expect(line).toBeDefined()
+    expect(line).toContain('0')
+    // 0건은 "이슈가 없다" 와 "실행 계정이 이슈를 못 읽는다" 를 구분하지 못한다.
+    expect(line!.toLowerCase()).toContain('permission')
+  })
+
+  it.each([
+    ['asks for the file list only when a path filter needs it', ['projects/api/*'], true],
+    ['skips the expensive file list when no path filter is set', [], false],
+  ])('%s', async (_label, paths, expected) => {
+    const { input, queryGithubPullRequests } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review {pr.number}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    }))
+
+    await runServerAutomationTick(input)
+
+    expect(queryGithubPullRequests).toHaveBeenCalledWith(
+      expect.objectContaining({ includeChangedFiles: expected }),
+    )
+  })
+
   it('collects an issue baseline without firing on the first observation (fail-closed)', async () => {
     const { input, store, queryGithubIssues, notifyGithubTrigger, spawnSession } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },

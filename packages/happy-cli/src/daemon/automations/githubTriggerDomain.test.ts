@@ -5,6 +5,7 @@ import {
   planGithubTrigger,
   renderGithubIssueTriggerPrompt,
   renderGithubTriggerPrompt,
+  describeGithubTriggerBaseline,
 } from './githubTriggerDomain'
 
 const trigger = {
@@ -236,5 +237,49 @@ describe('renderGithubTriggerPrompt', () => {
   it('flattens untrusted PR text and removes command-substitution delimiters', () => {
     expect(renderGithubTriggerPrompt('{pr.title}', pr({ title: 'Fix\n`rm -rf /`' }), 'opened'))
       .toBe("Fix 'rm -rf /'")
+  })
+})
+
+// 권한이 없으면 gh 는 오류가 아니라 빈 배열을 돌려준다. 첫 baseline 이 조용히
+// 기록되면 운영자가 볼 신호가 하나도 없다.
+describe('describeGithubTriggerBaseline', () => {
+  it('says nothing once a baseline already exists', () => {
+    expect(describeGithubTriggerBaseline({
+      previous: { snapshot: [], highestPrNumber: 0, processed: [], pending: [], highestIssueNumber: 3 },
+      event: 'issue_opened',
+      observed: 5,
+    })).toBeNull()
+  })
+
+  it('reports the observed count on the first issue observation', () => {
+    const notice = describeGithubTriggerBaseline({ previous: null, event: 'issue_opened', observed: 4 })
+
+    expect(notice).toContain('4')
+    expect(notice).toContain('baseline')
+  })
+
+  it('names the execution account permission when nothing was observed', () => {
+    const notice = describeGithubTriggerBaseline({ previous: null, event: 'issue_opened', observed: 0 })
+
+    expect(notice).toContain('0')
+    expect(notice!.toLowerCase()).toContain('permission')
+  })
+
+  it('treats a state written before issue support as a first issue observation', () => {
+    expect(describeGithubTriggerBaseline({
+      previous: { snapshot: [], highestPrNumber: 9, processed: [], pending: [] },
+      event: 'issue_opened',
+      observed: 0,
+    })).not.toBeNull()
+  })
+
+  it('reports a pull request baseline from the absence of any previous state', () => {
+    expect(describeGithubTriggerBaseline({ previous: null, event: 'opened', observed: 7 }))
+      .toContain('7')
+    expect(describeGithubTriggerBaseline({
+      previous: { snapshot: [], highestPrNumber: 9, processed: [], pending: [] },
+      event: 'opened',
+      observed: 7,
+    })).toBeNull()
   })
 })
