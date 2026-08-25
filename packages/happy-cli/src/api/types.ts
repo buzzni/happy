@@ -212,12 +212,12 @@ export const MessageMetaSchema = z.object({
   // .catch() because a failed safeParse in apiSession.routeIncomingMessage silently
   // stops routing the message as a user message: a malformed preference must degrade
   // to "no override", never swallow the user's turn.
-	  saycodePromptBlocks: z.object({
-	    agentOrchestration: z.boolean().optional(),
-	    coAuthoredCredit: z.boolean().optional(),
-	    workerDelegation: z.boolean().optional(),
-	    axBase: z.boolean().optional(),
-	  }).nullable().optional().catch(undefined),
+  saycodePromptBlocks: z.object({
+    agentOrchestration: z.boolean().optional(),
+    coAuthoredCredit: z.boolean().optional(),
+    workerDelegation: z.boolean().optional(),
+    axBase: z.boolean().optional(),
+  }).nullable().optional().catch(undefined),
   allowedTools: z.array(z.string()).nullable().optional(), // Allowed tools for this message (null = reset)
   disallowedTools: z.array(z.string()).nullable().optional(), // Disallowed tools for this message (null = reset)
   axStep: z.enum(['plan', 'design', 'free']).optional(),
