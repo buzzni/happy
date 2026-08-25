@@ -51,6 +51,13 @@ describe('natural-language child orchestration routing eval (T14)', () => {
     expect(whoami).toBeLessThan(spawn);
     expect(spawn).toBeLessThan(wait);
   });
+
+  it('never invents omitted spawn selections and requires a discoverable model catalog', () => {
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('include only the corresponding flags');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Never invent an omitted agent, model, or effort');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('spawnModelOptions');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('missing from `whoami`');
+  });
 });
 
 describe.each([
