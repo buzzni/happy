@@ -5,7 +5,9 @@ import tweetnacl from 'tweetnacl';
 import axios from 'axios';
 import { displayQRCode } from "./qrcode";
 import { delay } from "@/utils/time";
-import { writeCredentialsLegacy, readCredentials, updateSettings, Credentials, writeCredentialsDataKey, provisionLegacyMachineKey } from "@/persistence";
+import { writeCredentialsLegacy, readCredentials, updateSettings, Credentials, writeCredentialsDataKey, provisionLegacyMachineKey, readPersistedSessions } from "@/persistence";
+import { planDataKeyOnboarding } from "@/datakey/onboarding";
+import { existsSync, writeFileSync } from "node:fs";
 import { generateWebAuthUrl } from "@/api/webAuth";
 import { openBrowser } from "@/utils/browser";
 import { AuthSelector, AuthMethod } from "./ink/AuthSelector";
@@ -302,6 +304,32 @@ export async function authAndSetupMachineIfNeeded(): Promise<{
         } catch (e) {
             logger.debug('[AUTH] Machine key provisioning failed — continuing in plain legacy mode', e);
         }
+    }
+
+    // aplus §6-1 온보딩 (specs/e2ee-datakey-onboarding) — 신규 머신(로컬
+    // 세션 이력 0)의 dataKey 계정은 여기서 dataKey-활성으로 자동 승격한다.
+    // 이후 세션이 계정 공개키 단독 수신자 DEK 로 등록돼 서버가 콘텐츠를
+    // 못 본다. 기존 세션이 있는 머신은 승격하지 않는다(planDataKeyOnboarding
+    // 의 has-local-sessions 게이트). best-effort — 실패는 legacy 로 계속.
+    try {
+        const plan = planDataKeyOnboarding({
+            credentials,
+            accountPublicKey: settings.accountPublicKey ?? null,
+            hasLocalSessions: Object.keys(readPersistedSessions()).length > 0,
+        });
+        if (plan.ok) {
+            const backupPath = `${configuration.privateKeyFile}.legacy-backup`;
+            if (!existsSync(backupPath)) {
+                writeFileSync(backupPath, JSON.stringify(plan.backup, null, 2));
+            }
+            writeFileSync(configuration.privateKeyFile, JSON.stringify(plan.serialized, null, 2));
+            credentials = (await readCredentials())!;
+            logger.debug('[AUTH] Onboarded fresh machine to dataKey-active');
+        } else {
+            logger.debug(`[AUTH] dataKey onboarding skipped: ${plan.reason}`);
+        }
+    } catch (e) {
+        logger.debug('[AUTH] dataKey onboarding failed — continuing in current mode', e);
     }
 
     return { credentials, machineId: settings.machineId!, serverPublicKey: settings.serverPublicKey ?? null };
