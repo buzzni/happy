@@ -102,3 +102,48 @@ cmt8lc60i GitHub query failed: GitHub query failed: Command failed: gh pr list .
 - 권한 부족을 능동 probe 로 확정하는 것 — GitHub 이 권한 없는 조회를 어떻게
   응답하는지 실측 없이 가정하지 않는다. AC4 는 사실(관측 0건)만 남기고 판단은
   운영자에게 맡긴다.
+
+---
+
+## 후속 — 남은 HTTP 왕복의 사유 폐기 (2026-08-26)
+
+`.138` 배포 직후 `aplus-dev-studio` 트리거의 504 는 사라졌고(PR 100개 정상 조회),
+baseline 로깅도 실제로 동작했다. 그런데 곧바로 다음 계층이 드러났다:
+
+```
+[08:36:28] cmt8lc60i GitHub trigger baseline recorded from 100 pull requests; ...
+[08:36:28] cmt8lc60i AgentTask bridge failed: AgentTask bridge returned 403
+```
+
+`action` 을 `agent-task-review` 로 바꾼 트리거만 실패한다. 같은 저장소·같은
+credential 로 `start-session` 트리거("독립 리뷰")는 오류 없이 완주했다 — 차이는
+AgentTask bridge 한 곳뿐이다.
+
+### 문제 — 같은 실수가 네 곳 더 있었다
+
+전수 조사 결과, 자동화의 서버 왕복 중 **네 곳**이 여전히 status 만 남기고 응답
+본문의 `error` 를 버리고 있었다:
+
+| 위치 | 메시지 |
+|---|---|
+| `automationAgentTaskBridge.ts:64` | `AgentTask bridge returned ${status}` |
+| `automationMcpCallerGrant.ts:98` | `caller grant exchange returned ${status}` |
+| `automationMcpCallerGrant.ts:159` | `session link returned ${status}` |
+| `automationMcpCallerGrant.ts:225` | `spawned session link returned ${status}` |
+
+`/api/automation/agent-task` 는 403 을 네 가지 이유로 낸다(claim, 머신 접근,
+저장소 미연결, credential 접근). 지금 로그로는 구분할 수 없다.
+
+### AC7 — 자동화의 모든 HTTP 거절이 서버 사유를 남긴다
+- Given 서버가 `{ error }` 를 담아 거절한 응답
+- When 자동화 클라이언트가 실패를 보고하면
+- Then 기존 메시지 뒤에 그 사유가 붙는다
+- And 본문이 JSON 이 아니거나 `error` 가 문자열이 아니면 기존 메시지를 유지한다
+- And `error` 외의 필드는 읽지 않아 토큰이 로그로 새지 않는다
+- And 사유는 200자로 자르고 공백을 접는다
+
+### AC8 — 사유 생성 로직이 한 벌이다
+- Given 네 곳 이상이 같은 처리를 필요로 할 때
+- When 사유를 만들면
+- Then 모두 같은 모듈(`describeHttpFailure`)을 쓴다
+- And 본문을 이미 읽은 호출부는 파싱된 값을 재사용한다 (Response 는 한 번만 읽힌다)
