@@ -102,6 +102,66 @@ describe('queryGithubPullRequests', () => {
     expect(input.runScript).not.toHaveBeenCalled()
   })
 
+  // 403 은 서버에서 다섯 가지 이유로 나온다. status 만 남기면 운영자가 원인을
+  // 좁힐 수 없어 응답 본문의 error 를 함께 보고한다.
+  it('reports the server reason so a rejected exchange names which check failed', async () => {
+    const input = baseInput()
+    input.githubCredentialId = 'credential-1'
+    input.fetchImpl.mockResolvedValue(new Response(
+      JSON.stringify({ error: 'Selected GitHub credential cannot access the project repository' }),
+      { status: 403, headers: { 'Content-Type': 'application/json' } },
+    ))
+
+    await expect(queryGithubPullRequests(input)).resolves.toEqual({
+      ok: false,
+      error: 'GitHub credential exchange returned 403: '
+        + 'Selected GitHub credential cannot access the project repository',
+    })
+    expect(input.runScript).not.toHaveBeenCalled()
+  })
+
+  it('keeps the bare status when the rejection body carries no usable reason', async () => {
+    const input = baseInput()
+    input.githubCredentialId = 'credential-1'
+    input.fetchImpl.mockResolvedValue(new Response('<html>Gateway blocked</html>', {
+      status: 403,
+      headers: { 'Content-Type': 'text/html' },
+    }))
+
+    await expect(queryGithubPullRequests(input)).resolves.toEqual({
+      ok: false,
+      error: 'GitHub credential exchange returned 403',
+    })
+  })
+
+  it('never leaks a token that a non-ok response happens to carry', async () => {
+    const input = baseInput()
+    input.githubCredentialId = 'credential-1'
+    input.fetchImpl.mockResolvedValue(new Response(
+      JSON.stringify({ error: 'nope', token: 'ghp_supersecret', repository: 'acme/app' }),
+      { status: 403, headers: { 'Content-Type': 'application/json' } },
+    ))
+
+    const result = await queryGithubPullRequests(input)
+    expect(result).toEqual({ ok: false, error: 'GitHub credential exchange returned 403: nope' })
+    expect(JSON.stringify(result)).not.toContain('ghp_supersecret')
+  })
+
+  it('truncates an oversized server reason instead of flooding the daemon log', async () => {
+    const input = baseInput()
+    input.githubCredentialId = 'credential-1'
+    input.fetchImpl.mockResolvedValue(new Response(
+      JSON.stringify({ error: 'x'.repeat(500) }),
+      { status: 403, headers: { 'Content-Type': 'application/json' } },
+    ))
+
+    const result = await queryGithubPullRequests(input)
+    expect(result).toEqual({
+      ok: false,
+      error: `GitHub credential exchange returned 403: ${'x'.repeat(200)}…`,
+    })
+  })
+
   it('rejects malformed gh output instead of advancing the trigger baseline', async () => {
     const input = baseInput()
     input.runScript.mockResolvedValue({ ok: true, stdout: '{not-json' })

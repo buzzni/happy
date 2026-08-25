@@ -36,6 +36,32 @@ export type QueryGithubPullRequestsResult =
   }
   | { ok: false; error: string }
 
+const EXCHANGE_REASON_MAX_CHARS = 200
+
+/**
+ * 거절 응답의 사유만 뽑아 로그에 남긴다. 서버는 같은 403 을 다섯 가지 이유로
+ * 내므로(claim, 머신 접근, 프로젝트 접근, 저장소 미연결, credential 저장소 접근)
+ * status 만으로는 운영자가 원인을 좁힐 수 없다.
+ *
+ * 성공 응답은 PAT 을 담으므로 이 함수는 거절 응답에만 쓰고, 본문에서 `error`
+ * 문자열 외에는 아무것도 읽지 않는다.
+ */
+async function readExchangeFailureReason(response: Response): Promise<string> {
+  try {
+    const body = await response.json() as unknown
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return ''
+    const reason = (body as { error?: unknown }).error
+    if (typeof reason !== 'string') return ''
+    const collapsed = reason.replace(/\s+/g, ' ').trim()
+    if (!collapsed) return ''
+    return collapsed.length > EXCHANGE_REASON_MAX_CHARS
+      ? `: ${collapsed.slice(0, EXCHANGE_REASON_MAX_CHARS)}\u2026`
+      : `: ${collapsed}`
+  } catch {
+    return ''
+  }
+}
+
 export async function exchangeCredential(input: {
   configUrl: string | undefined
   machineToken: string
@@ -70,7 +96,8 @@ export async function exchangeCredential(input: {
       signal: controller.signal,
     })
     if (!response.ok) {
-      return { ok: false, error: `GitHub credential exchange returned ${response.status}` }
+      const reason = await readExchangeFailureReason(response)
+      return { ok: false, error: `GitHub credential exchange returned ${response.status}${reason}` }
     }
     const value = credentialResponseSchema.safeParse(await response.json())
     return value.success
