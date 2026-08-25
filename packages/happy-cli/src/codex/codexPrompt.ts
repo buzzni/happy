@@ -1,4 +1,4 @@
-import type { PermissionMode } from '@/api/types';
+import type { MessageMeta, PermissionMode } from '@/api/types';
 import { CHANGE_TITLE_INSTRUCTION } from '@/gemini/constants';
 import {
     isSaycodePromptBlockEnabled,
@@ -19,6 +19,17 @@ export interface CodexEnhancedMode {
     saycodePromptBlocks?: SaycodePromptBlockOverrides;
     /** Reasoning effort passed through to Codex's sendTurnAndWait. */
     effort?: ReasoningEffort;
+}
+
+export function resolveCodexSaycodePromptBlocks(
+    current: CodexEnhancedMode['saycodePromptBlocks'],
+    meta: Pick<MessageMeta, 'saycodePromptBlocks'> | undefined,
+): CodexEnhancedMode['saycodePromptBlocks'] {
+    if (!Object.prototype.hasOwnProperty.call(meta ?? {}, 'saycodePromptBlocks')) {
+        return current;
+    }
+
+    return meta?.saycodePromptBlocks ?? undefined;
 }
 
 export function hashCodexEnhancedMode(mode: CodexEnhancedMode): string {

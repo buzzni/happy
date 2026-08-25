@@ -5,8 +5,26 @@ import {
     buildCodexDeveloperInstructions,
     buildCodexTurnPrompt,
     hashCodexEnhancedMode,
+    resolveCodexSaycodePromptBlocks,
     type CodexEnhancedMode,
 } from './codexPrompt';
+
+describe('resolveCodexSaycodePromptBlocks', () => {
+    it('applies an explicit block override and preserves it on later absent turns', () => {
+        const disabled = resolveCodexSaycodePromptBlocks(undefined, {
+            saycodePromptBlocks: { agentOrchestration: false },
+        });
+        expect(disabled).toEqual({ agentOrchestration: false });
+        expect(resolveCodexSaycodePromptBlocks(disabled, undefined)).toBe(disabled);
+    });
+
+    it('resets cached block overrides only for an explicit null', () => {
+        expect(resolveCodexSaycodePromptBlocks(
+            { agentOrchestration: false },
+            { saycodePromptBlocks: null },
+        )).toBeUndefined();
+    });
+});
 
 describe('buildCodexDeveloperInstructions', () => {
     it('uses replaceable developer instructions for explicit-policy clients', () => {

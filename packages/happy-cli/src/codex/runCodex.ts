@@ -62,6 +62,7 @@ import {
     buildCodexDeveloperInstructions,
     buildCodexTurnPrompt,
     hashCodexEnhancedMode,
+    resolveCodexSaycodePromptBlocks,
     type CodexEnhancedMode,
 } from './codexPrompt';
 import { discoverCodexSkillCommands } from './codexSkills';
@@ -291,10 +292,7 @@ export async function runCodex(opts: {
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
-    // Codex doesn't gate per-block Saycode prompts, but every HAPPY_INITIAL_* seed is
-    // consume-once: an ignored seed must still be deleted or it leaks into every child
-    // process this session spawns.
-    consumePendingInitialSaycodePromptBlocks(process.env);
+    const initialSaycodePromptBlocks = consumePendingInitialSaycodePromptBlocks(process.env);
     const initialAppendSystemPrompt = resolveInitialSaycodeAppendSystemPrompt({
         appendSystemPrompt: consumePendingInitialAppendSystemPrompt(process.env),
         saycodeSystemPromptEnabled: initialSaycodeSystemPromptEnabled,
@@ -303,6 +301,7 @@ export async function runCodex(opts: {
     let currentEffort: ReasoningEffort | undefined = initialEffortSeed;
     let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt;
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
+    let currentSaycodePromptBlocks: CodexEnhancedMode['saycodePromptBlocks'] = initialSaycodePromptBlocks;
 
     const resetTurnScopedOptions = () => {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
@@ -390,6 +389,11 @@ export async function runCodex(opts: {
             logger.debug(`[Codex] Saycode system prompt ${currentSaycodeSystemPromptEnabled ? 'enabled' : 'disabled'} by user message`);
         }
 
+        currentSaycodePromptBlocks = resolveCodexSaycodePromptBlocks(
+            currentSaycodePromptBlocks,
+            message.meta,
+        );
+
         messageAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
             current: currentAppendSystemPrompt,
             incoming: message.meta?.appendSystemPrompt,
@@ -403,6 +407,7 @@ export async function runCodex(opts: {
             model: messageModel,
             appendSystemPrompt: messageAppendSystemPrompt,
             saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+            saycodePromptBlocks: currentSaycodePromptBlocks,
             effort: messageEffort,
         };
         const enqueueResult = enqueueCodexUserText({
@@ -432,6 +437,7 @@ export async function runCodex(opts: {
                 model: currentModel,
                 appendSystemPrompt: currentAppendSystemPrompt,
                 saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+                saycodePromptBlocks: currentSaycodePromptBlocks,
                 effort: currentEffort,
             });
             logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
