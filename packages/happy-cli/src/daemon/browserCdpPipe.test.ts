@@ -55,4 +55,23 @@ describe('createBrowserCdpPipe', () => {
         expect(chromeInput.destroyed).toBe(true)
         pipe.close()
     })
+
+    it('rejects a pending request as soon as Chrome closes the input pipe', async () => {
+        const chromeInput = new PassThrough()
+        const chromeOutput = new PassThrough()
+        const pipe = createBrowserCdpPipe(chromeInput, chromeOutput)
+        const result = pipe.request('Extensions.loadUnpacked').then(
+            () => 'resolved',
+            (error: Error) => error.message,
+        )
+
+        chromeInput.emit('close')
+
+        await expect(Promise.race([
+            result,
+            new Promise((resolve) => setImmediate(() => resolve('still pending'))),
+        ])).resolves.toBe('Chrome CDP pipe closed')
+        expect(chromeOutput.destroyed).toBe(true)
+        pipe.close()
+    })
 })

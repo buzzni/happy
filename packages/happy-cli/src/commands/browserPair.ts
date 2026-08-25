@@ -97,7 +97,7 @@ export interface PairOutcomeInput {
      * visible, or this run loaded it over CDP.
      */
     extensionLoaded: boolean
-    /** The CDP load attempt was made and Chrome refused it. */
+    /** The required CDP load could not run or Chrome refused it. */
     loadUnpackedFailed?: boolean
     /** Chrome accepted /json/new for the pairing URL. */
     pageOpened: boolean
@@ -137,10 +137,8 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
             ok: false,
             text: [
                 chalk.yellow(`Chrome이 디버깅 포트 ${cdpPort}에서 응답하지 않습니다.`),
-                chalk.dim('  Chrome을 아래처럼 띄운 뒤 다시 실행하세요 (확장은 이 명령이 직접 넣습니다):'),
-                `  ${chalk.cyan(`google-chrome --headless=new --remote-debugging-port=${cdpPort} \\`)}`,
-                `  ${chalk.cyan('    --remote-debugging-pipe --user-data-dir=~/.happy-chrome \\')}`,
-                `  ${chalk.cyan('    --enable-unsafe-extension-debugging')}`,
+                chalk.dim('  머신 관리의 Chrome 실행 또는 원격 브라우저 화면 열기로 Chrome을 시작한 뒤 다시 실행하세요.'),
+                chalk.dim(`  Happy가 --remote-debugging-port=${cdpPort}와 CDP pipe의 fd 3/4를 함께 준비해야 합니다.`),
             ].join('\n'),
         }
     }
@@ -168,8 +166,9 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
                     : `  현재 연결: ${connections.map((connection) => connection.profile).join(', ')}`),
                 ...(loadUnpackedFailed
                     ? [
-                        chalk.dim('  현재 CLI의 확장 번들로 갱신하지 못했습니다. Chrome에는 아래 두 플래그가 모두 필요합니다:'),
+                        chalk.dim('  현재 CLI의 확장 번들로 갱신하지 못했습니다. 시작 프로세스가 fd 3/4와 아래 두 플래그를 함께 준비해야 합니다:'),
                         `  ${chalk.cyan('--remote-debugging-pipe --enable-unsafe-extension-debugging')}`,
+                        chalk.dim('  원격 화면에서 기존 Chrome을 종료한 뒤 머신 관리의 원격 브라우저 화면 열기로 다시 시작하세요.'),
                     ]
                     : []),
             ].join('\n'),
@@ -230,10 +229,10 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
             text: [
                 chalk.yellow('확장을 Chrome에 넣지 못했습니다.'),
                 chalk.dim('  Chrome 137부터 --load-extension은 무시되므로 launch-time CDP pipe로 확장을 넣습니다.'),
-                chalk.dim('  그 호출에는 아래 두 플래그가 모두 필요합니다:'),
+                chalk.dim('  그 호출은 시작 프로세스가 fd 3/4를 열고 아래 두 플래그를 함께 전달해야 합니다:'),
                 `  ${chalk.cyan('--remote-debugging-pipe --enable-unsafe-extension-debugging')}`,
                 chalk.dim(`  확장 경로: ${extensionDir}`),
-                chalk.dim('  구형 --headless는 확장을 지원하지 않습니다. --headless=new 또는 Xvfb를 쓰세요.'),
+                chalk.dim('  원격 화면에서 기존 Chrome을 종료한 뒤 머신 관리의 원격 브라우저 화면 열기로 다시 시작하세요.'),
             ].join('\n'),
         }
     }
@@ -321,7 +320,8 @@ export function extensionAvailableAfterLoad(previouslyLoaded: boolean, loadedNow
  * The caller keeps that pipe open for Chrome's lifetime. Closing it after this
  * request terminates Chrome, which was the production failure on Chrome 151.
  */
-export async function loadUnpackedExtension(request: BrowserCdpRequest, extensionDir: string): Promise<boolean> {
+export async function loadUnpackedExtension(request: BrowserCdpRequest | undefined, extensionDir: string): Promise<boolean> {
+    if (!request) return false
     try {
         const result = await request('Extensions.loadUnpacked', { path: extensionDir }) as { id?: string }
         return typeof result?.id === 'string'
@@ -438,7 +438,7 @@ export async function runPairing(options: PairOptions): Promise<PairOutcomeInput
     // prove "not installed" — loading again is harmless (Chrome reloads it)
     // and is the only way in on a machine with no GUI.
     let loadUnpackedFailed = false
-    if (cdpReachable && options.browserCdpRequest && shouldLoadUnpackedExtension(extensionLoaded, options.pairingId)) {
+    if (cdpReachable && shouldLoadUnpackedExtension(extensionLoaded, options.pairingId)) {
         const previouslyLoaded = extensionLoaded
         const loadedNow = await loadUnpackedExtension(options.browserCdpRequest, extensionDir)
         loadUnpackedFailed = !loadedNow

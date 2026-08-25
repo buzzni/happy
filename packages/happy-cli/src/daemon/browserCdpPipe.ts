@@ -68,6 +68,7 @@ export function createBrowserCdpPipe(input: Writable, output: Readable): Browser
         closeStreams()
     }
     input.on('error', fail)
+    input.on('close', fail)
     output.on('error', fail)
     output.on('end', fail)
     output.on('close', fail)
