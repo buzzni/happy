@@ -28,6 +28,7 @@ import { handleConnectCommand } from './commands/connect'
 import { handleSandboxCommand } from './commands/sandbox'
 import { handleBrowserCommand } from './commands/browser'
 import { handleServerCommand } from './commands/server'
+import { handleDataKeyCommand } from './commands/datakey'
 import { spawnHappyCLI } from './utils/spawnHappyCLI'
 import { claudeCliPath } from './claude/claudeLocal'
 import { execFileSync } from 'node:child_process'
@@ -128,6 +129,18 @@ Conversation history is preserved on the server, but in-flight tool calls are in
   } else if (subcommand === 'server') {
     try {
       await handleServerCommand(args.slice(1));
+    } catch (error) {
+      console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
+      if (process.env.DEBUG) {
+        console.error(error)
+      }
+      process.exit(1)
+    }
+    return;
+  } else if (subcommand === 'datakey') {
+    // aplus §6-1 — dataKey-활성 전환 관리 (specs/e2ee-cli-datakey-activation)
+    try {
+      await handleDataKeyCommand(args.slice(1));
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
       if (process.env.DEBUG) {
