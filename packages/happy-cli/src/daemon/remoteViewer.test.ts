@@ -256,4 +256,13 @@ describe('viewer Chrome process facts', () => {
         expect(readFlagFromCmdline(chrome, '--user-data-dir')).toBe('/x')
         expect(readFlagFromCmdline(shell, '--remote-debugging-port')).toBeNull()
     })
+
+    it('reads flags after Chrome rewrites cmdline into one space-separated argument', () => {
+        const chrome = '/opt/google/chrome/chrome --remote-debugging-port=9222 '
+            + '--user-data-dir=/home/walter/.happy/chrome-profiles/default --display=:99\0'
+
+        expect(readFlagFromCmdline(chrome, '--remote-debugging-port')).toBe('9222')
+        expect(readFlagFromCmdline(chrome, '--user-data-dir')).toBe('/home/walter/.happy/chrome-profiles/default')
+        expect(readFlagFromCmdline(chrome, '--display')).toBe(':99')
+    })
 })

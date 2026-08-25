@@ -214,7 +214,11 @@ export function readDisplayFromEnviron(environ: string): string | null {
 /** Reads an exact `--flag=value` argument from `/proc/<pid>/cmdline`. */
 export function readFlagFromCmdline(cmdline: string, flag: string): string | null {
     const prefix = `${flag}=`
-    for (const arg of cmdline.split('\0')) {
+    const nulSeparatedArgs = cmdline.split('\0').filter(Boolean)
+    const args = nulSeparatedArgs.length === 1
+        ? nulSeparatedArgs[0].trim().split(/\s+/)
+        : nulSeparatedArgs
+    for (const arg of args) {
         if (!arg.startsWith(prefix)) continue
         return arg.slice(prefix.length) || null
     }
