@@ -50,6 +50,10 @@ export function buildChromeLaunchArgs({ userDataDir, cdpPort, headless, display,
         // the extension over the launch-time CDP pipe instead. Chromium
         // requires both that pipe and this opt-in flag for the unsafe call.
         '--enable-unsafe-extension-debugging',
+        // Remote Linux machines commonly mount /dev/shm at only 64 MB.
+        // Chrome 151 can exhaust it while starting the extension renderer
+        // and terminate with ENOSPC, so keep its shared files under /tmp.
+        '--disable-dev-shm-usage',
         '--no-first-run',
         '--no-default-browser-check',
     ]
