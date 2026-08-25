@@ -5,7 +5,18 @@ import type { GithubPullRequestSnapshot } from './githubTriggerDomain'
 
 const EXCHANGE_TIMEOUT_MS = 3_000
 const QUERY_TIMEOUT_MS = 60_000
-const GH_PR_LIST_COMMAND = 'gh pr list --state all --limit 100 --search "sort:updated-desc" --json number,title,url,author,baseRefName,headRefName,isDraft,state,mergedAt,labels,changedFiles,files'
+const GH_PR_LIST_FIELDS = 'number,title,url,author,baseRefName,headRefName,isDraft,state,mergedAt,labels'
+// changedFiles/files 는 PR 100개 각각의 변경 파일을 GraphQL 로 가져오는, 이 쿼리에서
+// 가장 비싼 필드다. matchesFilter 는 filter.paths 가 있을 때만 참조하므로 경로 필터가
+// 없으면 요청하지 않는다 — 큰 저장소에서 GitHub 이 504 를 내던 원인이다.
+const GH_PR_LIST_FILE_FIELDS = 'changedFiles,files'
+
+function buildPrListCommand(includeChangedFiles: boolean): string {
+  const fields = includeChangedFiles
+    ? `${GH_PR_LIST_FIELDS},${GH_PR_LIST_FILE_FIELDS}`
+    : GH_PR_LIST_FIELDS
+  return `gh pr list --state all --limit 100 --search "sort:updated-desc" --json ${fields}`
+}
 
 const pullRequestSchema = z.object({
   number: z.number().int().positive(),
@@ -18,8 +29,9 @@ const pullRequestSchema = z.object({
   state: z.enum(['OPEN', 'CLOSED', 'MERGED']),
   mergedAt: z.string().max(100).nullable(),
   labels: z.array(z.object({ name: z.string().min(1).max(200) })).max(100),
-  changedFiles: z.number().int().min(0),
-  files: z.array(z.object({ path: z.string().min(1).max(2_000) })).max(100),
+  // 경로 필터가 없으면 요청하지 않으므로 없을 수 있다 (buildPrListCommand 참고).
+  changedFiles: z.number().int().min(0).optional().default(0),
+  files: z.array(z.object({ path: z.string().min(1).max(2_000) })).max(100).optional().default([]),
 })
 
 const pullRequestsSchema = z.array(pullRequestSchema).max(100)
@@ -46,9 +58,20 @@ const EXCHANGE_REASON_MAX_CHARS = 200
  *
  * 명령 문자열과 stderr 만 담기고 토큰은 환경변수로만 전달되므로 로그에 새지 않는다.
  */
+/**
+ * Node 의 exec 오류는 `Command failed: <명령>\n<stderr>` 다. gh 명령은 180자가 넘어
+ * 그대로 두면 사유 예산을 명령 에코가 다 먹고 정작 stderr 가 잘린다.
+ */
+function stripCommandEcho(error: string): string {
+  if (!error.startsWith('Command failed: ')) return error
+  const newline = error.indexOf('\n')
+  if (newline === -1) return error
+  return error.slice(newline + 1).trim() || error
+}
+
 export function describeQueryFailure(error: string | undefined): string {
   if (!error) return ''
-  const collapsed = error.replace(/\s+/g, ' ').trim()
+  const collapsed = stripCommandEcho(error).replace(/\s+/g, ' ').trim()
   if (!collapsed) return ''
   return collapsed.length > EXCHANGE_REASON_MAX_CHARS
     ? `: ${collapsed.slice(0, EXCHANGE_REASON_MAX_CHARS)}\u2026`
@@ -141,6 +164,8 @@ export async function queryGithubPullRequests(input: {
   githubCredentialId: string | null
   cwd: string
   allowedRoot: string
+  /** 경로 필터가 있는 트리거만 파일 목록이 필요하다. 생략하면 기존대로 포함한다. */
+  includeChangedFiles?: boolean
   fetchImpl?: typeof fetch
   runScript?: typeof runAutomationScript
 }): Promise<QueryGithubPullRequestsResult> {
@@ -156,7 +181,7 @@ export async function queryGithubPullRequests(input: {
   }
 
   const query = await (input.runScript ?? runAutomationScript)({
-    command: GH_PR_LIST_COMMAND,
+    command: buildPrListCommand(input.includeChangedFiles ?? true),
     cwd: input.cwd,
     timeout: QUERY_TIMEOUT_MS,
     allowedRoot: input.allowedRoot,

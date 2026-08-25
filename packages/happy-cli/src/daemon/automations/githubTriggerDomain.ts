@@ -116,6 +116,32 @@ function derivesEvent(input: {
   return previous.state === 'OPEN' && current.state === 'CLOSED' && current.mergedAt === null;
 }
 
+/**
+ * 첫 관측에서 baseline 만 기록할 때 남길 한 줄. 이미 baseline 이 있으면 null.
+ *
+ * 실행 계정에 권한이 없으면 gh 는 오류가 아니라 빈 배열을 돌려주므로(GitHub 은
+ * 권한 없는 리소스를 "없는 것" 으로 취급한다) 어떤 오류 로깅에도 걸리지 않는다.
+ * 관측이 0건이라는 사실만 남기고 판단은 운영자에게 맡긴다 — 권한 여부를 능동
+ * probe 로 단정하지 않는다.
+ */
+export function describeGithubTriggerBaseline(input: {
+  previous: GithubTriggerRuntimeState | null;
+  event: GithubTriggerEvent;
+  observed: number;
+}): string | null {
+  const isIssueEvent = input.event === 'issue_opened';
+  const alreadyBaselined = isIssueEvent
+    ? Boolean(input.previous) && input.previous!.highestIssueNumber !== undefined
+    : Boolean(input.previous);
+  if (alreadyBaselined) return null;
+  const noun = isIssueEvent ? 'open issues' : 'pull requests';
+  const hint = input.observed === 0
+    ? ` — 0 can also mean the execution account has no permission to read ${noun}`
+    : '';
+  return `GitHub trigger baseline recorded from ${input.observed} ${noun};`
+    + ` nothing fires until a newer one appears${hint}`;
+}
+
 export function planGithubTrigger(input: {
   trigger: GithubTrigger;
   current: GithubPullRequestSnapshot[];

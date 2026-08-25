@@ -24,6 +24,7 @@ function baseInput() {
     githubCredentialId: null as string | null,
     cwd: '/repo',
     allowedRoot: '/repo',
+    includeChangedFiles: undefined as boolean | undefined,
     fetchImpl,
     runScript,
   }
@@ -184,8 +185,7 @@ describe('queryGithubPullRequests', () => {
 
     await expect(queryGithubPullRequests(input)).resolves.toEqual({
       ok: false,
-      error: 'GitHub query failed: Command failed: gh pr list '
-        + 'gh: Resource not accessible by personal access token (HTTP 403)',
+      error: 'GitHub query failed: gh: Resource not accessible by personal access token (HTTP 403)',
     })
   })
 
@@ -199,6 +199,34 @@ describe('queryGithubPullRequests', () => {
     })
   })
 
+  // Node 의 exec 오류는 `Command failed: <명령>\n<stderr>` 다. gh 명령이 180자라
+  // 명령 에코를 그대로 두면 200자 예산을 다 먹고 정작 stderr 가 잘린다.
+  it('drops the command echo so the budget is spent on stderr', async () => {
+    const input = baseInput()
+    input.runScript.mockResolvedValue({
+      ok: false,
+      stdout: '',
+      error: `Command failed: ${'gh pr list --json a,b,c '.repeat(8)}\nHTTP 504: We couldn't respond in time`,
+    })
+
+    const result = await queryGithubPullRequests(input)
+
+    expect(result).toEqual({
+      ok: false,
+      error: "GitHub query failed: HTTP 504: We couldn't respond in time",
+    })
+  })
+
+  it('keeps the original message when there is no stderr after the command echo', async () => {
+    const input = baseInput()
+    input.runScript.mockResolvedValue({ ok: false, stdout: '', error: 'Command failed: gh pr list' })
+
+    await expect(queryGithubPullRequests(input)).resolves.toEqual({
+      ok: false,
+      error: 'GitHub query failed: Command failed: gh pr list',
+    })
+  })
+
   it('truncates an oversized runner error instead of flooding the daemon log', async () => {
     const input = baseInput()
     input.runScript.mockResolvedValue({ ok: false, stdout: '', error: 'y'.repeat(500) })
@@ -207,5 +235,54 @@ describe('queryGithubPullRequests', () => {
       ok: false,
       error: `GitHub query failed: ${'y'.repeat(200)}\u2026`,
     })
+  })
+
+  // files 는 PR 100개 각각의 변경 파일을 GraphQL 로 가져오는 가장 비싼 필드인데,
+  // matchesFilter 는 filter.paths 가 있을 때만 참조한다. 경로 필터가 없는 트리거가
+  // 매 폴링마다 이걸 긁어오다 큰 저장소에서 GitHub 504 를 맞았다.
+  it('omits the file list when the trigger has no path filter', async () => {
+    const input = baseInput()
+    input.includeChangedFiles = false
+    input.runScript.mockResolvedValue({
+      ok: true,
+      stdout: JSON.stringify(rows.map(({ changedFiles: _c, files: _f, ...rest }) => rest)),
+    })
+
+    const result = await queryGithubPullRequests(input)
+
+    const command = input.runScript.mock.calls[0]![0].command
+    expect(command).not.toContain('changedFiles')
+    expect(command).not.toContain(',files')
+    expect(result.ok).toBe(true)
+  })
+
+  it('fills the omitted file fields so path-free planning still parses', async () => {
+    const input = baseInput()
+    input.includeChangedFiles = false
+    input.runScript.mockResolvedValue({
+      ok: true,
+      stdout: JSON.stringify(rows.map(({ changedFiles: _c, files: _f, ...rest }) => rest)),
+    })
+
+    const result = await queryGithubPullRequests(input)
+
+    expect(result.ok && result.pullRequests[0]).toMatchObject({ changedFiles: 0, files: [] })
+  })
+
+  it('still requests the file list when a path filter needs it', async () => {
+    const input = baseInput()
+    input.includeChangedFiles = true
+
+    await queryGithubPullRequests(input)
+
+    expect(input.runScript.mock.calls[0]![0].command).toContain('changedFiles,files')
+  })
+
+  it('keeps requesting the file list when the caller says nothing', async () => {
+    const input = baseInput()
+
+    await queryGithubPullRequests(input)
+
+    expect(input.runScript.mock.calls[0]![0].command).toContain('changedFiles,files')
   })
 })

@@ -23,6 +23,7 @@ import type {
 import {
   GITHUB_ISSUE_TRIGGER_PROMPT_PREAMBLE,
   GITHUB_TRIGGER_PROMPT_PREAMBLE,
+  describeGithubTriggerBaseline,
   planGithubIssueTrigger,
   planGithubTrigger,
   renderGithubIssueTriggerPrompt,
@@ -54,6 +55,7 @@ export interface ServerAutomationExecutorInput {
     githubCredentialId: string | null
     runId: string
     claimToken: string
+    includeChangedFiles: boolean
   }) => Promise<
     | {
       ok: true
@@ -815,7 +817,7 @@ async function executeStartedRun(
     })
     if (!query.ok) {
       deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
-      input.logDebug?.(`[server-automation] ${automation.automationId} GitHub issue query failed: ${query.error}`)
+      input.logDebug?.(`[server-automation] ${automation.automationId} ${query.error}`)
       return { outcome: 'ERROR', sessionId: null }
     }
     degradedCode = await cleanupInactiveGithubIssueProgressMarkers(
@@ -828,6 +830,14 @@ async function executeStartedRun(
     const previous = (runtime.githubTriggers ?? []).find((entry) => (
       entry.automationId === automation.automationId && entry.generation === automation.generation
     ))?.state ?? null
+    const issueBaselineNotice = describeGithubTriggerBaseline({
+      previous,
+      event: payload.githubTrigger.event,
+      observed: query.issues.length,
+    })
+    if (issueBaselineNotice) {
+      input.logDebug?.(`[server-automation] ${automation.automationId} ${issueBaselineNotice}`)
+    }
     const planned = planGithubIssueTrigger({
       trigger: payload.githubTrigger,
       current: githubMode === 'work' && previous ? [] : query.issues,
@@ -877,10 +887,12 @@ async function executeStartedRun(
       githubCredentialId: payload.githubTrigger.githubCredentialId,
       runId: run.runId,
       claimToken: run.claimToken,
+      // 경로 필터가 있을 때만 파일 목록이 쓰인다 (matchesFilter).
+      includeChangedFiles: payload.githubTrigger.filter.paths.length > 0,
     })
     if (!query.ok) {
       deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
-      input.logDebug?.(`[server-automation] ${automation.automationId} GitHub query failed: ${query.error}`)
+      input.logDebug?.(`[server-automation] ${automation.automationId} ${query.error}`)
       return { outcome: 'ERROR', sessionId: null }
     }
     degradedCode = await cleanupInactiveGithubIssueProgressMarkers(
@@ -893,6 +905,14 @@ async function executeStartedRun(
     const previous = (runtime.githubTriggers ?? []).find((entry) => (
       entry.automationId === automation.automationId && entry.generation === automation.generation
     ))?.state ?? null
+    const prBaselineNotice = describeGithubTriggerBaseline({
+      previous,
+      event: payload.githubTrigger.event,
+      observed: query.pullRequests.length,
+    })
+    if (prBaselineNotice) {
+      input.logDebug?.(`[server-automation] ${automation.automationId} ${prBaselineNotice}`)
+    }
     const planned = planGithubTrigger({
       trigger: payload.githubTrigger,
       current: githubMode === 'work' && previous ? previous.snapshot : query.pullRequests,
