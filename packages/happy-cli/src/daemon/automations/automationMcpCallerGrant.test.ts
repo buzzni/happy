@@ -126,7 +126,7 @@ describe('exchangeAutomationMcpCallerGrant', () => {
       claimToken: 'claim-token',
     })).resolves.toEqual({
       ok: false,
-      error: `caller grant exchange returned ${status}`,
+      error: `caller grant exchange returned ${status}: ${responseCode}`,
       code: expectedCode,
     })
   })

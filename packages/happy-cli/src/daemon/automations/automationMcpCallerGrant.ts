@@ -1,3 +1,5 @@
+import { describeHttpFailure, describeHttpFailureBody } from './describeHttpFailure'
+
 export type AutomationMcpSpawnContext = {
   mcpCallerGrant?: string
   mcpConfigProjectId: string
@@ -95,7 +97,7 @@ export async function exchangeAutomationMcpCallerGrant(input: {
           : undefined
       return {
         ok: false,
-        error: `caller grant exchange returned ${response.status}`,
+        error: `caller grant exchange returned ${response.status}${describeHttpFailureBody(body)}`,
         ...(code ? { code } : {}),
       }
     }
@@ -156,7 +158,7 @@ export async function linkAutomationProjectSession(input: {
     })
     return response.ok
       ? { ok: true }
-      : { ok: false, error: `session link returned ${response.status}` }
+      : { ok: false, error: `session link returned ${response.status}${await describeHttpFailure(response)}` }
   } catch {
     return {
       ok: false,
@@ -222,7 +224,7 @@ export async function linkSpawnedProjectSession(input: {
     })
     return response.ok
       ? { ok: true }
-      : { ok: false, error: `spawned session link returned ${response.status}` }
+      : { ok: false, error: `spawned session link returned ${response.status}${await describeHttpFailure(response)}` }
   } catch {
     return {
       ok: false,

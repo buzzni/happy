@@ -1,3 +1,4 @@
+import { describeHttpFailure } from './describeHttpFailure'
 import { z } from 'zod'
 
 const BRIDGE_TIMEOUT_MS = 60_000
@@ -61,7 +62,10 @@ export async function dispatchAutomationAgentTask(input: {
       }),
       signal: controller.signal,
     })
-    if (!response.ok) return { ok: false, error: `AgentTask bridge returned ${response.status}` }
+    if (!response.ok) {
+      // 서버는 이 403 을 네 가지 이유로 낸다 — status 만으로는 좁힐 수 없다.
+      return { ok: false, error: `AgentTask bridge returned ${response.status}${await describeHttpFailure(response)}` }
+    }
     const parsed = responseSchema.safeParse(await response.json())
     return parsed.success
       ? {
