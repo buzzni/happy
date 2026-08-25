@@ -14,7 +14,6 @@
  */
 
 import chalk from 'chalk'
-import { WebSocket } from 'ws'
 import { configuration } from '@/configuration'
 import { readDaemonState } from '@/persistence'
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken'
@@ -31,7 +30,11 @@ export interface PairOptions {
     debuggerTier?: boolean
     /** Opaque per-run marker used to prove which Chrome loaded the link. */
     pairingId?: string
+    /** Launch-time pipe request channel required by unsafe extension commands. */
+    browserCdpRequest?: BrowserCdpRequest
 }
+
+export type BrowserCdpRequest = (method: string, params?: Record<string, unknown>) => Promise<unknown>
 
 export function parsePairArgs(args: string[]): PairOptions {
     const options: PairOptions = { cdpPort: DEFAULT_CDP_PORT }
@@ -94,7 +97,7 @@ export interface PairOutcomeInput {
      * visible, or this run loaded it over CDP.
      */
     extensionLoaded: boolean
-    /** The CDP load attempt was made and Chrome refused it. */
+    /** The required CDP load could not run or Chrome refused it. */
     loadUnpackedFailed?: boolean
     /** Chrome accepted /json/new for the pairing URL. */
     pageOpened: boolean
@@ -134,9 +137,8 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
             ok: false,
             text: [
                 chalk.yellow(`Chrome이 디버깅 포트 ${cdpPort}에서 응답하지 않습니다.`),
-                chalk.dim('  Chrome을 아래처럼 띄운 뒤 다시 실행하세요 (확장은 이 명령이 직접 넣습니다):'),
-                `  ${chalk.cyan(`google-chrome --headless=new --remote-debugging-port=${cdpPort} \\`)}`,
-                `  ${chalk.cyan('    --user-data-dir=~/.happy-chrome --enable-unsafe-extension-debugging')}`,
+                chalk.dim('  머신 관리의 Chrome 실행 또는 원격 브라우저 화면 열기로 Chrome을 시작한 뒤 다시 실행하세요.'),
+                chalk.dim(`  Happy가 --remote-debugging-port=${cdpPort}와 CDP pipe의 fd 3/4를 함께 준비해야 합니다.`),
             ].join('\n'),
         }
     }
@@ -164,8 +166,9 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
                     : `  현재 연결: ${connections.map((connection) => connection.profile).join(', ')}`),
                 ...(loadUnpackedFailed
                     ? [
-                        chalk.dim('  현재 CLI의 확장 번들로 갱신하지 못했습니다. Chrome을 아래 플래그로 다시 띄우세요:'),
-                        `  ${chalk.cyan('--enable-unsafe-extension-debugging')}`,
+                        chalk.dim('  현재 CLI의 확장 번들로 갱신하지 못했습니다. 시작 프로세스가 fd 3/4와 아래 두 플래그를 함께 준비해야 합니다:'),
+                        `  ${chalk.cyan('--remote-debugging-pipe --enable-unsafe-extension-debugging')}`,
+                        chalk.dim('  원격 화면에서 기존 Chrome을 종료한 뒤 머신 관리의 원격 브라우저 화면 열기로 다시 시작하세요.'),
                     ]
                     : []),
             ].join('\n'),
@@ -225,11 +228,11 @@ export function formatPairOutcome({ cdpPort, extensionDir, daemonRunning, cdpRea
             ok: false,
             text: [
                 chalk.yellow('확장을 Chrome에 넣지 못했습니다.'),
-                chalk.dim('  Chrome 137부터 --load-extension은 무시되므로 이 명령은 CDP로 확장을 넣습니다.'),
-                chalk.dim('  그 호출은 아래 플래그로 띄운 Chrome에서만 허용됩니다:'),
-                `  ${chalk.cyan('--enable-unsafe-extension-debugging')}`,
+                chalk.dim('  Chrome 137부터 --load-extension은 무시되므로 launch-time CDP pipe로 확장을 넣습니다.'),
+                chalk.dim('  그 호출은 시작 프로세스가 fd 3/4를 열고 아래 두 플래그를 함께 전달해야 합니다:'),
+                `  ${chalk.cyan('--remote-debugging-pipe --enable-unsafe-extension-debugging')}`,
                 chalk.dim(`  확장 경로: ${extensionDir}`),
-                chalk.dim('  구형 --headless는 확장을 지원하지 않습니다. --headless=new 또는 Xvfb를 쓰세요.'),
+                chalk.dim('  원격 화면에서 기존 Chrome을 종료한 뒤 머신 관리의 원격 브라우저 화면 열기로 다시 시작하세요.'),
             ].join('\n'),
         }
     }
@@ -311,45 +314,20 @@ export function extensionAvailableAfterLoad(previouslyLoaded: boolean, loadedNow
  * `--disable-features=DisableLoadExtensionCommandLineSwitch` revives it), so
  * a terminal-only machine has no command line that gets the extension in.
  * `Extensions.loadUnpacked` does, and Chrome allows it only when started with
- * `--enable-unsafe-extension-debugging`.
+ * `--enable-unsafe-extension-debugging` and driven through the launch-time
+ * `--remote-debugging-pipe` client.
  *
- * Verified that the extension outlives this CDP session — it stays loaded and
- * connected after the socket closes, which is what makes loading it from a
- * one-shot command worth doing at all.
+ * The caller keeps that pipe open for Chrome's lifetime. Closing it after this
+ * request terminates Chrome, which was the production failure on Chrome 151.
  */
-async function loadUnpackedExtension(cdpPort: number, extensionDir: string): Promise<boolean> {
-    let browserSocketUrl: string
+export async function loadUnpackedExtension(request: BrowserCdpRequest | undefined, extensionDir: string): Promise<boolean> {
+    if (!request) return false
     try {
-        const response = await fetch(`http://127.0.0.1:${cdpPort}/json/version`, { signal: AbortSignal.timeout(2_000) })
-        const body = await response.json() as { webSocketDebuggerUrl?: string }
-        if (!body.webSocketDebuggerUrl) return false
-        browserSocketUrl = body.webSocketDebuggerUrl
+        const result = await request('Extensions.loadUnpacked', { path: extensionDir }) as { id?: string }
+        return typeof result?.id === 'string'
     } catch {
         return false
     }
-
-    return new Promise<boolean>((resolve) => {
-        const socket = new WebSocket(browserSocketUrl)
-        const finish = (loaded: boolean) => {
-            clearTimeout(timer)
-            socket.close()
-            resolve(loaded)
-        }
-        const timer = setTimeout(() => finish(false), 10_000)
-        socket.on('open', () => {
-            socket.send(JSON.stringify({ id: 1, method: 'Extensions.loadUnpacked', params: { path: extensionDir } }))
-        })
-        socket.on('message', (raw) => {
-            try {
-                const message = JSON.parse(raw.toString()) as { id?: number; result?: { id?: string }; error?: unknown }
-                if (message.id === 1) finish(typeof message.result?.id === 'string')
-            } catch {
-                // Not our reply; keep waiting for one that parses.
-            }
-        })
-        socket.on('error', () => finish(false))
-        socket.on('close', () => finish(false))
-    })
 }
 
 /**
@@ -462,7 +440,7 @@ export async function runPairing(options: PairOptions): Promise<PairOutcomeInput
     let loadUnpackedFailed = false
     if (cdpReachable && shouldLoadUnpackedExtension(extensionLoaded, options.pairingId)) {
         const previouslyLoaded = extensionLoaded
-        const loadedNow = await loadUnpackedExtension(options.cdpPort, extensionDir)
+        const loadedNow = await loadUnpackedExtension(options.browserCdpRequest, extensionDir)
         loadUnpackedFailed = !loadedNow
         extensionLoaded = extensionAvailableAfterLoad(previouslyLoaded, loadedNow)
     }

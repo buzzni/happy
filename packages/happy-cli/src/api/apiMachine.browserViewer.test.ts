@@ -5,6 +5,10 @@ const { browserMocks, viewerMocks, fsMocks, mockRunPairing } = vi.hoisted(() => 
         detectChrome: vi.fn(),
         isCdpReachable: vi.fn(),
         launchChrome: vi.fn(),
+        cdpPipe: {
+            request: vi.fn(),
+            close: vi.fn(),
+        },
     },
     viewerMocks: {
         detectMissingViewerTools: vi.fn(),
@@ -99,7 +103,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
             version: 'Chrome test',
         })
         browserMocks.isCdpReachable.mockImplementation(async (port: number) => port === 9222)
-        browserMocks.launchChrome.mockReturnValue({ pid: 1234 })
+        browserMocks.launchChrome.mockReturnValue({ pid: 1234, cdpPipe: browserMocks.cdpPipe })
         fsMocks.readdir.mockResolvedValue(['100'])
         fsMocks.readFile.mockImplementation(async (path: string) => path.endsWith('/cmdline')
             ? '/usr/bin/google-chrome\0--remote-debugging-port=9222\0--user-data-dir=/tmp/happy-test/chrome-profiles/default'
@@ -242,7 +246,14 @@ describe('ApiMachineClient browser viewer RPC', () => {
             cdpPort: 9222,
             debuggerTier: true,
             pairingId: expect.stringMatching(/^viewer-9222-/),
+            browserCdpRequest: expect.any(Function),
         })
+        const pairingOptions = mockRunPairing.mock.calls[0]?.[0]
+        await pairingOptions.browserCdpRequest('Extensions.loadUnpacked', { path: '/extension' })
+        expect(browserMocks.cdpPipe.request).toHaveBeenCalledWith(
+            'Extensions.loadUnpacked',
+            { path: '/extension' },
+        )
         expect(result).toMatchObject({
             browserReady: true,
             cdpPort: 9222,

@@ -4,11 +4,28 @@ import {
     buildPairUrl,
     formatPairOutcome,
     extensionAvailableAfterLoad,
+    loadUnpackedExtension,
     pairingConnectionArrived,
     pickTierProbeProfile,
     shouldLoadUnpackedExtension,
     DEFAULT_CDP_PORT,
 } from './browserPair'
+
+describe('loadUnpackedExtension', () => {
+    it('sends the unsafe command through the launch-time debugging pipe', async () => {
+        const request = async (method: string, params?: Record<string, unknown>) => {
+            expect(method).toBe('Extensions.loadUnpacked')
+            expect(params).toEqual({ path: '/opt/happy/browser-extension' })
+            return { id: 'extension-id' }
+        }
+
+        await expect(loadUnpackedExtension(request, '/opt/happy/browser-extension')).resolves.toBe(true)
+    })
+
+    it('reports that loading is unavailable when this process does not own the debugging pipe', async () => {
+        await expect(loadUnpackedExtension(undefined, '/opt/happy/browser-extension')).resolves.toBe(false)
+    })
+})
 
 describe('parsePairArgs', () => {
     it('defaults to Chrome\'s conventional debugging port and leaves the debugger tier alone', () => {
@@ -122,6 +139,8 @@ describe('formatPairOutcome', () => {
 
         expect(outcome.ok).toBe(false)
         expect(outcome.text).toContain('--enable-unsafe-extension-debugging')
+        expect(outcome.text).toContain('fd 3/4')
+        expect(outcome.text).toContain('머신 관리')
     })
 
     it('leads with the daemon when it is not running — nothing below it can work', () => {
@@ -134,6 +153,8 @@ describe('formatPairOutcome', () => {
         const outcome = formatPairOutcome({ ...base, cdpReachable: false, connections: [] })
         expect(outcome.ok).toBe(false)
         expect(outcome.text).toContain('--remote-debugging-port=9222')
+        expect(outcome.text).toContain('머신 관리')
+        expect(outcome.text).not.toContain('google-chrome')
     })
 
     // Verified against Chrome 151: --load-extension is ignored outright
@@ -149,14 +170,17 @@ describe('formatPairOutcome', () => {
         expect(outcome.text).toMatch(/--load-extension은 무시/)
     })
 
-    // pair loads the extension itself over CDP now, so the only way it can
-    // still be missing is Chrome refusing that call — which it does unless
-    // started with --enable-unsafe-extension-debugging.
+    // pair loads the extension through the launch owner's CDP pipe. A direct
+    // shell invocation cannot retrofit fd 3/4 onto an already-running Chrome,
+    // so recovery has to name the machine-managed restart path.
     it('names the flag CDP loading needs when it could not load the extension', () => {
         const outcome = formatPairOutcome({ ...base, extensionLoaded: false, loadUnpackedFailed: true, connections: [] })
         expect(outcome.ok).toBe(false)
         expect(outcome.text).toContain('--enable-unsafe-extension-debugging')
+        expect(outcome.text).toContain('--remote-debugging-pipe')
         expect(outcome.text).toContain('/opt/happy/browser-extension')
+        expect(outcome.text).toContain('머신 관리')
+        expect(outcome.text).not.toContain('google-chrome')
     })
 
     // Reached the page and the extension is there, but no socket arrived: a

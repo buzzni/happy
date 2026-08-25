@@ -12,6 +12,8 @@
 import { spawn } from 'node:child_process'
 import { mkdirSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
+import type { Readable, Writable } from 'node:stream'
+import { createBrowserCdpPipe, type BrowserCdpPipe } from './browserCdpPipe'
 
 /** Binaries that ship Chrome's CDP + extension support, most preferred first. */
 export const CHROME_BINARIES = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser']
@@ -39,11 +41,19 @@ export interface ChromeLaunchOptions {
 export function buildChromeLaunchArgs({ userDataDir, cdpPort, headless, display, noSandbox }: ChromeLaunchOptions): string[] {
     const args = [
         `--remote-debugging-port=${cdpPort}`,
+        // Chromium gates unsafe extension commands on a launch-time pipe
+        // client. Keep the port too: viewer/browser tooling still discovers
+        // targets and opens tabs through the HTTP endpoint.
+        '--remote-debugging-pipe',
         `--user-data-dir=${userDataDir}`,
         // Chrome 137+ ignores --load-extension; `happy browser pair` injects
-        // the extension over CDP instead, and Chrome only allows that call
-        // when this flag is present. Dropping it breaks pairing outright.
+        // the extension over the launch-time CDP pipe instead. Chromium
+        // requires both that pipe and this opt-in flag for the unsafe call.
         '--enable-unsafe-extension-debugging',
+        // Remote Linux machines commonly mount /dev/shm at only 64 MB.
+        // Chrome 151 can exhaust it while starting the extension renderer
+        // and terminate with ENOSPC, so keep its shared files under /tmp.
+        '--disable-dev-shm-usage',
         '--no-first-run',
         '--no-default-browser-check',
     ]
@@ -157,8 +167,9 @@ export async function canSudoWithoutPassword(): Promise<boolean> {
 }
 
 /**
- * Starts Chrome detached so it outlives the daemon that spawned it — the
- * whole point is a browser that stays logged in across restarts.
+ * Starts Chrome with an owned debugging pipe. The profile data outlives the
+ * daemon; the Chrome process intentionally follows the pipe owner's lifetime
+ * because Chromium exits when the launch-time pipe closes.
  */
 export function launchChrome(
     chromePath: string,
@@ -167,15 +178,22 @@ export function launchChrome(
     // (usually unset on a terminal-only box) must not decide this — the
     // caller resolves it via resolveChromeDisplay and passes the viewer's.
     env?: NodeJS.ProcessEnv,
-): { pid: number | undefined } {
+): { pid: number | undefined; cdpPipe: BrowserCdpPipe } {
     mkdirSync(options.userDataDir, { recursive: true })
     const child = spawn(chromePath, buildChromeLaunchArgs(options), {
         detached: true,
-        stdio: 'ignore',
+        // Chromium reads commands from fd 3 and writes replies to fd 4.
+        stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'],
         env: env ? { ...process.env, ...env } : process.env,
     })
+    const input = child.stdio[3]
+    const output = child.stdio[4]
+    if (!input || !output) throw new Error('Chrome CDP pipe was not created')
     child.unref()
-    return { pid: child.pid }
+    return {
+        pid: child.pid,
+        cdpPipe: createBrowserCdpPipe(input as Writable, output as Readable),
+    }
 }
 
 /**

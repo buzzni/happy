@@ -1,5 +1,14 @@
-import { describe, expect, it } from 'vitest'
-import { buildChromeLaunchArgs, planChromeInstall, resolveChromeDisplay, resolveProfileUserDataDir } from './browserSetup'
+import { PassThrough } from 'node:stream'
+import { describe, expect, it, vi } from 'vitest'
+import { buildChromeLaunchArgs, launchChrome, planChromeInstall, resolveChromeDisplay, resolveProfileUserDataDir } from './browserSetup'
+
+const { mkdirSyncMock, spawnMock } = vi.hoisted(() => ({
+    mkdirSyncMock: vi.fn(),
+    spawnMock: vi.fn(),
+}))
+
+vi.mock('node:child_process', () => ({ spawn: spawnMock }))
+vi.mock('node:fs', () => ({ mkdirSync: mkdirSyncMock }))
 
 describe('buildChromeLaunchArgs', () => {
     it('includes --enable-unsafe-extension-debugging', () => {
@@ -16,6 +25,26 @@ describe('buildChromeLaunchArgs', () => {
         const args = buildChromeLaunchArgs({ userDataDir: '/p/alice', cdpPort: 9333 })
 
         expect(args).toContain('--remote-debugging-port=9333')
+    })
+
+    it('keeps an official debugging pipe open for unsafe extension commands', () => {
+        // Chrome 151 terminates when Extensions.loadUnpacked is sent over the
+        // port WebSocket. Chromium only supports that unsafe command from a
+        // client attached through --remote-debugging-pipe, while the port is
+        // still needed by the viewer and browser tools.
+        const args = buildChromeLaunchArgs({ userDataDir: '/p/alice', cdpPort: 9222 })
+
+        expect(args).toContain('--remote-debugging-pipe')
+        expect(args).toContain('--remote-debugging-port=9222')
+    })
+
+    it('keeps Chrome shared files out of a constrained shared-memory mount', () => {
+        // The remote Linux machines expose a 64 MB /dev/shm. Chrome 151 can
+        // otherwise terminate nondeterministically after loading the bridge
+        // with font_data_service_impl.cc: No space left on device.
+        const args = buildChromeLaunchArgs({ userDataDir: '/p/alice', cdpPort: 9222 })
+
+        expect(args).toContain('--disable-dev-shm-usage')
     })
 
     it('pins the user data dir so logins survive restarts', () => {
@@ -66,6 +95,27 @@ describe('buildChromeLaunchArgs', () => {
         })
 
         expect(args).toContain('--display=:99')
+    })
+})
+
+describe('launchChrome', () => {
+    it('returns the live fd 3/4 debugging pipe owned by the launched Chrome', () => {
+        const chromeInput = new PassThrough()
+        const chromeOutput = new PassThrough()
+        spawnMock.mockReturnValue({
+            pid: 1234,
+            stdio: [null, null, null, chromeInput, chromeOutput],
+            unref: vi.fn(),
+        })
+
+        const launched = launchChrome('/usr/bin/google-chrome', {
+            userDataDir: '/p/alice',
+            cdpPort: 9222,
+        })
+
+        expect(spawnMock.mock.calls[0]?.[2]?.stdio).toEqual(['ignore', 'ignore', 'ignore', 'pipe', 'pipe'])
+        expect(launched).toMatchObject({ pid: 1234, cdpPipe: expect.any(Object) })
+        launched.cdpPipe.close()
     })
 })
 
