@@ -171,4 +171,41 @@ describe('queryGithubPullRequests', () => {
       error: 'GitHub query returned invalid data',
     })
   })
+
+  // credential exchange 사유를 로그에 남긴 뒤, 다음 벽은 gh 실행 실패였다.
+  // runAutomationScript 는 이미 error 를 채워주는데 여기서 버리고 있었다.
+  it('reports why gh failed instead of a fixed message', async () => {
+    const input = baseInput()
+    input.runScript.mockResolvedValue({
+      ok: false,
+      stdout: '',
+      error: 'Command failed: gh pr list\ngh: Resource not accessible by personal access token (HTTP 403)',
+    })
+
+    await expect(queryGithubPullRequests(input)).resolves.toEqual({
+      ok: false,
+      error: 'GitHub query failed: Command failed: gh pr list '
+        + 'gh: Resource not accessible by personal access token (HTTP 403)',
+    })
+  })
+
+  it('keeps the bare message when the runner gives no reason', async () => {
+    const input = baseInput()
+    input.runScript.mockResolvedValue({ ok: false, stdout: '' })
+
+    await expect(queryGithubPullRequests(input)).resolves.toEqual({
+      ok: false,
+      error: 'GitHub query failed',
+    })
+  })
+
+  it('truncates an oversized runner error instead of flooding the daemon log', async () => {
+    const input = baseInput()
+    input.runScript.mockResolvedValue({ ok: false, stdout: '', error: 'y'.repeat(500) })
+
+    await expect(queryGithubPullRequests(input)).resolves.toEqual({
+      ok: false,
+      error: `GitHub query failed: ${'y'.repeat(200)}\u2026`,
+    })
+  })
 })

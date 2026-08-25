@@ -1,7 +1,7 @@
 import { z } from 'zod'
 
 import { runAutomationScript } from './runAutomationScript'
-import { exchangeCredential } from './queryGithubPullRequests'
+import { describeQueryFailure, exchangeCredential } from './queryGithubPullRequests'
 import type { GithubIssueSnapshot } from './githubTriggerDomain'
 
 const QUERY_TIMEOUT_MS = 60_000
@@ -55,7 +55,7 @@ export async function queryGithubIssues(input: {
     allowedRoot: input.allowedRoot,
     environmentVariables: githubEnvironment,
   })
-  if (!query.ok) return { ok: false, error: 'GitHub issue query failed' }
+  if (!query.ok) return { ok: false, error: `GitHub issue query failed${describeQueryFailure(query.error)}` }
   try {
     const issues = issuesSchema.parse(JSON.parse(query.stdout))
     return {

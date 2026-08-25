@@ -39,6 +39,23 @@ export type QueryGithubPullRequestsResult =
 const EXCHANGE_REASON_MAX_CHARS = 200
 
 /**
+ * gh 실행 실패 사유를 기존 메시지 뒤에 붙인다. runAutomationScript 는 비0 종료의
+ * stderr 와 타임아웃을 이미 error 에 담아 주는데, 호출부가 이를 버리면 운영자는
+ * "GitHub query failed" 한 줄만 보고 원인을 좁힐 수 없다 — credential exchange 에서
+ * 겪은 것과 같은 정보 손실이다.
+ *
+ * 명령 문자열과 stderr 만 담기고 토큰은 환경변수로만 전달되므로 로그에 새지 않는다.
+ */
+export function describeQueryFailure(error: string | undefined): string {
+  if (!error) return ''
+  const collapsed = error.replace(/\s+/g, ' ').trim()
+  if (!collapsed) return ''
+  return collapsed.length > EXCHANGE_REASON_MAX_CHARS
+    ? `: ${collapsed.slice(0, EXCHANGE_REASON_MAX_CHARS)}\u2026`
+    : `: ${collapsed}`
+}
+
+/**
  * 거절 응답의 사유만 뽑아 로그에 남긴다. 서버는 같은 403 을 다섯 가지 이유로
  * 내므로(claim, 머신 접근, 프로젝트 접근, 저장소 미연결, credential 저장소 접근)
  * status 만으로는 운영자가 원인을 좁힐 수 없다.
@@ -145,7 +162,7 @@ export async function queryGithubPullRequests(input: {
     allowedRoot: input.allowedRoot,
     environmentVariables: githubEnvironment,
   })
-  if (!query.ok) return { ok: false, error: 'GitHub query failed' }
+  if (!query.ok) return { ok: false, error: `GitHub query failed${describeQueryFailure(query.error)}` }
   try {
     const pullRequests = pullRequestsSchema.parse(JSON.parse(query.stdout))
     return {
