@@ -78,6 +78,7 @@
     "test": "pnpm run build && vitest run --project unit",
     "test:integration": "pnpm run build && vitest run --project integration-empty --project integration-plan-mode --project integration-authenticated",
     "cli:install": "node scripts/install-local.cjs",
+    "cli:install:isolated": "node scripts/install-isolated.cjs",
     "prepare:publish": "node scripts/prepare-publish-package.cjs",
     "guard:publish": "node scripts/guard-publish-artifact.cjs",
     "prepublishOnly": "node scripts/assert-publish-tool.cjs && pnpm test && node scripts/guard-publish-artifact.cjs . --install-smoke",

@@ -14,12 +14,18 @@
  *
  * Reuses ~/.happy/ - no separate dev home dir. Auth and sessions carry over.
  * To undo: uninstall this manifest's package name and reinstall its latest registry release.
+ *
+ * Refuses to run when a live daemon is tracking sessions, because replacing the
+ * global bundle hands every one of those sessions to a new daemon. Use
+ * `pnpm cli:install:isolated` to test a build without touching the global
+ * install, or set HAPPY_CLI_INSTALL_GLOBAL=1 to proceed anyway.
  */
 
 const fs = require('fs');
 const os = require('os');
 const { spawnSync } = require('child_process');
 const path = require('path');
+const { decideGlobalInstall } = require('./globalInstallGuard.cjs');
 
 const PACKAGE_DIR = path.resolve(__dirname, '..');
 const PACKAGE_NAME = JSON.parse(fs.readFileSync(path.join(PACKAGE_DIR, 'package.json'), 'utf8')).name;
@@ -173,6 +179,56 @@ function verifyBundledDependency(globalPrefix) {
 
     console.log(`\n✓ Bundled @slopus/happy-wire found at ${wireEntry}`);
 }
+
+function happyHomeDir() {
+    const configured = process.env.HAPPY_HOME_DIR;
+    if (configured) return configured.replace(/^~/, os.homedir());
+    return path.join(os.homedir(), '.happy');
+}
+
+function readDaemonState() {
+    try {
+        return JSON.parse(fs.readFileSync(path.join(happyHomeDir(), 'daemon.state.json'), 'utf8'));
+    } catch {
+        // No daemon has ever run here, or the file is unreadable — nothing to protect.
+        return null;
+    }
+}
+
+function isPidAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function assertGlobalInstallIsSafe() {
+    const decision = decideGlobalInstall({
+        state: readDaemonState(),
+        isPidAlive,
+        override: process.env.HAPPY_CLI_INSTALL_GLOBAL,
+    });
+
+    if (!decision.blocked) return;
+
+    console.error(`
+\u2716 Global daemon (pid ${decision.pid}) is tracking ${decision.sessionCount} session(s).
+  Installing globally replaces the bundle it watches, so every one of those
+  sessions is handed to a new daemon. That handoff failed twice — 2026-08-23
+  and 2026-08-25 — leaving the machine without a daemon for about six hours.
+
+  Test this build without touching them:
+      pnpm cli:install:isolated
+
+  Install globally anyway (you are replacing those sessions' daemon):
+      HAPPY_CLI_INSTALL_GLOBAL=1 pnpm cli:install
+`);
+    process.exit(1);
+}
+
+assertGlobalInstallIsSafe();
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'happy-cli-local-install-'));
 const preparedDir = path.join(tempDir, 'package');
