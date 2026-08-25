@@ -11,7 +11,7 @@ describe('MOBILE_SAYCODE_PROMPT_BLOCKS', () => {
 
     it('lists the CLI-wire blocks plus the app-composed options guidance', () => {
         expect(MOBILE_SAYCODE_PROMPT_BLOCKS.map((b) => b.id).sort())
-            .toEqual(['axBase', 'coAuthoredCredit', 'optionsGuidance', 'workerDelegation']);
+            .toEqual(['agentOrchestration', 'axBase', 'coAuthoredCredit', 'optionsGuidance', 'workerDelegation']);
     });
 });
 
@@ -25,6 +25,10 @@ describe('buildSaycodeTurnMeta', () => {
             surface: 'mobile',
         });
         expect(meta.appendSystemPrompt).toBeUndefined();
+        expect(meta.saycodePromptBlocks).toEqual({
+            agentOrchestration: true,
+            workerDelegation: true,
+        });
     });
 
     it('marks app-composed guidance as client-turn scoped when enabled', () => {
@@ -57,6 +61,18 @@ describe('buildSaycodeTurnMeta', () => {
             surface: 'mobile',
         });
         expect(meta.saycodePromptBlocks).toEqual({ workerDelegation: false });
+    });
+
+    it('keeps explicit child-agent off without disabling worker delegation', () => {
+        const meta = buildSaycodeTurnMeta({
+            preference: false,
+            overrides: { agentOrchestration: false },
+            surface: 'mobile',
+        });
+        expect(meta.saycodePromptBlocks).toEqual({
+            agentOrchestration: false,
+            workerDelegation: true,
+        });
     });
 
     it('keeps the options guidance when the master is off but its block is overridden on', () => {

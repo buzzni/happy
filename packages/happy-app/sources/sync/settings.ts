@@ -11,6 +11,11 @@ export const SUPPORTED_SCHEMA_VERSION = 3;
 
 export type SaycodeSystemPromptSurface = 'desktop' | 'web' | 'mobile';
 
+const DEFAULT_ON_SAYCODE_PROMPT_BLOCK_IDS = new Set([
+    'agentOrchestration',
+    'workerDelegation',
+]);
+
 export function resolveSaycodeSystemPromptEnabled({
     preference,
     surface,
@@ -23,11 +28,11 @@ export function resolveSaycodeSystemPromptEnabled({
 
 /**
  * Per-block overrides layered on top of the master preference. Keys are block ids
- * (CLI-wire ids plus this app's own `optionsGuidance`); a block with no entry
- * inherits the surface-resolved master value. Mirrors happy-cli's
- * `isSaycodePromptBlockEnabled` order so the CLI-gated and app-composed halves of a
- * turn never disagree. Non-boolean entries are ignored — one malformed value must
- * not flip a block.
+ * (CLI-wire ids plus this app's own `optionsGuidance`). Independent default-on
+ * blocks stay enabled when no entry exists; other blocks inherit the surface-resolved
+ * master value. Mirrors happy-cli's `isSaycodePromptBlockEnabled` order so the
+ * CLI-gated and app-composed halves of a turn never disagree. Non-boolean entries are
+ * ignored — one malformed value must not flip a block.
  */
 export function resolveSaycodePromptBlockEnabled({
     blockId,
@@ -42,6 +47,7 @@ export function resolveSaycodePromptBlockEnabled({
 }): boolean {
     const override = overrides?.[blockId];
     if (typeof override === 'boolean') return override;
+    if (DEFAULT_ON_SAYCODE_PROMPT_BLOCK_IDS.has(blockId)) return true;
     return resolveSaycodeSystemPromptEnabled({ preference, surface });
 }
 
@@ -76,7 +82,7 @@ export const SettingsSchema = z.object({
     // Per-block overrides for individually toggleable Saycode-owned blocks. catch({})
     // because settingsParse falls back to full defaults on any schema failure — a
     // malformed map must not discard the rest of the user's settings.
-    saycodePromptBlocks: z.record(z.string(), z.boolean()).catch({}).describe('Per-block overrides for Saycode-owned prompt blocks (missing entry inherits the master value)'),
+    saycodePromptBlocks: z.record(z.string(), z.boolean()).catch({}).describe('Per-block overrides for Saycode-owned prompt blocks (missing independent defaults stay on; other entries inherit the master value)'),
 
     hideInactiveSessions: z.boolean().describe('Hide inactive sessions in the main list'),
     expResumeSession: z.boolean().describe('Enable experimental session resume feature'),

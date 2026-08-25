@@ -295,6 +295,23 @@ describe('settings', () => {
                 surface: 'mobile',
             })).toBe(true);
         });
+
+        it('keeps child-agent calls and worker delegation on independently of the master', () => {
+            for (const blockId of ['agentOrchestration', 'workerDelegation']) {
+                expect(resolveSaycodePromptBlockEnabled({
+                    blockId,
+                    overrides: {},
+                    preference: false,
+                    surface: 'mobile',
+                })).toBe(true);
+                expect(resolveSaycodePromptBlockEnabled({
+                    blockId,
+                    overrides: { [blockId]: false },
+                    preference: false,
+                    surface: 'mobile',
+                })).toBe(false);
+            }
+        });
     });
 
     describe('saycodePromptBlocks settings field', () => {
