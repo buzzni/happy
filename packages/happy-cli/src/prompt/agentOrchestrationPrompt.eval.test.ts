@@ -35,6 +35,22 @@ describe('natural-language child orchestration routing eval (T14)', () => {
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Never claim that the child is visible in Desktop');
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Do not substitute a provider-native subagent');
   });
+
+  it('preserves explicit agent, canonical model, and effort through spawn and result collection', () => {
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain(
+      'happy agent spawn --prompt <text> --agent <agent> --model <canonical-model-id> --effort <level>',
+    );
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Do not shorten or alias the model id');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('happy agent wait <returned-session-id>');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('happy agent read <returned-session-id>');
+    const whoami = AGENT_ORCHESTRATION_SYSTEM_PROMPT.indexOf('happy agent whoami');
+    const spawn = AGENT_ORCHESTRATION_SYSTEM_PROMPT.indexOf(
+      'happy agent spawn --prompt <text> --agent <agent> --model <canonical-model-id> --effort <level>',
+    );
+    const wait = AGENT_ORCHESTRATION_SYSTEM_PROMPT.indexOf('happy agent wait <returned-session-id>');
+    expect(whoami).toBeLessThan(spawn);
+    expect(spawn).toBeLessThan(wait);
+  });
 });
 
 describe.each([
