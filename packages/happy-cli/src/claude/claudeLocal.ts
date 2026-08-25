@@ -48,7 +48,7 @@ export async function claudeLocal(opts: {
     claudeArgs?: string[],
     allowedTools?: string[],
     saycodeSystemPromptEnabled?: boolean,
-    /** Per-block overrides; a block with no override inherits saycodeSystemPromptEnabled. */
+    /** Per-block overrides; default-on blocks do not inherit saycodeSystemPromptEnabled. */
     saycodePromptBlocks?: SaycodePromptBlockOverrides,
     /** Path to temporary settings file with SessionStart hook (optional - for session tracking) */
     hookSettingsPath?: string,
@@ -243,7 +243,9 @@ export async function claudeLocal(opts: {
                 isSaycodePromptBlockEnabled(
                     'coAuthoredCredit', opts.saycodePromptBlocks, opts.saycodeSystemPromptEnabled,
                 ) ? saycodeOwnedSystemPrompt : undefined,
-                opts.saycodeSystemPromptEnabled !== false ? AGENT_ORCHESTRATION_SYSTEM_PROMPT : undefined,
+                isSaycodePromptBlockEnabled(
+                    'agentOrchestration', opts.saycodePromptBlocks, opts.saycodeSystemPromptEnabled,
+                ) ? AGENT_ORCHESTRATION_SYSTEM_PROMPT : undefined,
             ].filter(Boolean).join('\n\n');
             args.push('--append-system-prompt', localSystemPrompt);
 

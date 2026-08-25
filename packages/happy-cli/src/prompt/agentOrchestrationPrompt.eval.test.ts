@@ -40,23 +40,32 @@ describe('natural-language child orchestration routing eval (T14)', () => {
 describe.each([
   {
     provider: 'Claude',
-    compose: (enabled: boolean) => buildClaudeSystemPromptOptions({
+    compose: (enabled: boolean, agentOrchestration?: boolean) => buildClaudeSystemPromptOptions({
       saycodeSystemPrompt: '',
       agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
       saycodeSystemPromptEnabled: enabled,
+      saycodePromptBlocks: agentOrchestration === undefined ? undefined : { agentOrchestration },
     }).appendSystemPrompt,
   },
   {
     provider: 'Codex',
-    compose: (enabled: boolean) => buildCodexDeveloperInstructions({
+    compose: (enabled: boolean, agentOrchestration?: boolean) => buildCodexDeveloperInstructions({
       agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
-      mode: { saycodeSystemPromptEnabled: enabled },
+      mode: {
+        saycodeSystemPromptEnabled: enabled,
+        saycodePromptBlocks: agentOrchestration === undefined ? undefined : { agentOrchestration },
+      },
     }),
   },
 ])('$provider orchestration prompt lifecycle (T13, T15)', ({ compose }) => {
-  it('injects the common block on create/resume and removes it after prompt-off', () => {
+  it('injects the common block independently from the master setting', () => {
     expect(compose(true)).toContain('happy agent whoami');
-    expect(compose(false) ?? '').not.toContain('happy agent');
+    expect(compose(false)).toContain('happy agent whoami');
+  });
+
+  it('removes the common block only after its explicit block toggle is off', () => {
+    expect(compose(true, false) ?? '').not.toContain('happy agent');
+    expect(compose(false, false) ?? '').not.toContain('happy agent');
   });
 
   it.each([

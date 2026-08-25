@@ -35,9 +35,7 @@ export const PROMPT_BLOCK_PROVENANCE = {
 } as const satisfies Record<string, PromptProvenance>;
 
 /** Saycode-owned blocks controlled only by the existing master prompt switch. */
-export const SAYCODE_MASTER_PROMPT_PROVENANCE_IDS = [
-  'common:agent-orchestration',
-] as const satisfies readonly PromptBlockId[];
+export const SAYCODE_MASTER_PROMPT_PROVENANCE_IDS = [] as const satisfies readonly PromptBlockId[];
 
 export type PromptBlockId = keyof typeof PROMPT_BLOCK_PROVENANCE;
 
@@ -76,7 +74,11 @@ export function resolveSaycodeAppendSystemPromptForMessage(input: {
  * `codex:title` are deliberately excluded — they are `always-on` (see
  * PROMPT_BLOCK_PROVENANCE) and never represented as a preference here.
  */
-export type SaycodePromptBlockName = 'coAuthoredCredit' | 'workerDelegation' | 'axBase';
+export type SaycodePromptBlockName =
+  | 'agentOrchestration'
+  | 'coAuthoredCredit'
+  | 'workerDelegation'
+  | 'axBase';
 
 export type SaycodePromptBlockOverrides = Partial<Record<SaycodePromptBlockName, boolean>>;
 
@@ -89,6 +91,7 @@ export type SaycodePromptBlockOverrides = Partial<Record<SaycodePromptBlockName,
  * test catches an owned block that never got a toggle.
  */
 export const SAYCODE_PROMPT_BLOCK_PROVENANCE_IDS = {
+  agentOrchestration: 'common:agent-orchestration',
   coAuthoredCredit: 'claude:co-authored-credit',
   workerDelegation: 'claude:worker-delegation',
   axBase: 'claude:ax-base',
@@ -97,10 +100,10 @@ export const SAYCODE_PROMPT_BLOCK_PROVENANCE_IDS = {
 /**
  * Resolves whether one Saycode-owned block should render, given an optional
  * per-block override and the legacy on/off value. A per-block override always
- * wins; with none, the block inherits the legacy value (so an account with no
- * per-block preferences yet behaves exactly as it did before granular
- * settings existed). Missing legacy value defaults to enabled, matching the
- * existing wire compatibility rule for older clients/runtimes.
+ * wins. Delegation blocks are product capabilities and default on independently
+ * from the master switch; the remaining blocks inherit the legacy value.
+ * Missing legacy value defaults to enabled, matching the existing wire
+ * compatibility rule for older clients/runtimes.
  */
 export function isSaycodePromptBlockEnabled(
   blockName: SaycodePromptBlockName,
@@ -109,5 +112,6 @@ export function isSaycodePromptBlockEnabled(
 ): boolean {
   const override = overrides?.[blockName];
   if (override !== undefined) return override;
+  if (blockName === 'agentOrchestration' || blockName === 'workerDelegation') return true;
   return saycodeSystemPromptEnabled !== false;
 }

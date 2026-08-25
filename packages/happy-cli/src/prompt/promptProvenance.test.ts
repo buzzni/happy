@@ -133,10 +133,23 @@ describe('resolveInitialSaycodeAppendSystemPrompt', () => {
 });
 
 describe('isSaycodePromptBlockEnabled', () => {
+  it('keeps default-on delegation blocks enabled when the master is off', () => {
+    expect(isSaycodePromptBlockEnabled('agentOrchestration', undefined, false)).toBe(true);
+    expect(isSaycodePromptBlockEnabled('workerDelegation', undefined, false)).toBe(true);
+  });
+
+  it('allows an explicit override to disable a default-on delegation block', () => {
+    expect(isSaycodePromptBlockEnabled(
+      'agentOrchestration',
+      { agentOrchestration: false },
+      true,
+    )).toBe(false);
+  });
+
   it('falls back to the legacy on/off value when no per-block override exists', () => {
-    expect(isSaycodePromptBlockEnabled('workerDelegation', undefined, false)).toBe(false);
-    expect(isSaycodePromptBlockEnabled('workerDelegation', undefined, true)).toBe(true);
-    expect(isSaycodePromptBlockEnabled('workerDelegation', undefined, undefined)).toBe(true);
+    expect(isSaycodePromptBlockEnabled('coAuthoredCredit', undefined, false)).toBe(false);
+    expect(isSaycodePromptBlockEnabled('coAuthoredCredit', undefined, true)).toBe(true);
+    expect(isSaycodePromptBlockEnabled('coAuthoredCredit', undefined, undefined)).toBe(true);
   });
 
   it('lets a per-block override win over the legacy value in either direction', () => {

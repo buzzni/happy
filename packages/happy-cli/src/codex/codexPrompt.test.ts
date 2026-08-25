@@ -17,7 +17,7 @@ describe('buildCodexDeveloperInstructions', () => {
                 appendSystemPrompt: 'USER AND PROJECT CONTEXT',
                 saycodeSystemPromptEnabled: false,
             },
-        })).toBe('CONNECTOR FACTS\n\nUSER AND PROJECT CONTEXT');
+        })).toBe('CONNECTOR FACTS\n\nAGENT ORCHESTRATION: happy agent spawn\n\nUSER AND PROJECT CONTEXT');
     });
 
     it('keeps legacy client append prompts in the original user-turn position', () => {
@@ -28,11 +28,22 @@ describe('buildCodexDeveloperInstructions', () => {
         })).toBe('CONNECTOR FACTS\n\nAGENT ORCHESTRATION: happy agent spawn');
     });
 
-    it('does not inject orchestration when Saycode prompts are off', () => {
+    it('keeps default-on orchestration when Saycode prompts are off', () => {
         expect(buildCodexDeveloperInstructions({
             connectorGuidance: 'CONNECTOR FACTS',
             agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
             mode: { saycodeSystemPromptEnabled: false },
+        })).toBe('CONNECTOR FACTS\n\nAGENT ORCHESTRATION: happy agent spawn');
+    });
+
+    it('does not inject orchestration when its block is explicitly off', () => {
+        expect(buildCodexDeveloperInstructions({
+            connectorGuidance: 'CONNECTOR FACTS',
+            agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
+            mode: {
+                saycodeSystemPromptEnabled: true,
+                saycodePromptBlocks: { agentOrchestration: false },
+            },
         })).toBe('CONNECTOR FACTS');
     });
 });

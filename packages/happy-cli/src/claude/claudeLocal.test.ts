@@ -279,7 +279,7 @@ describe('claudeLocal --continue handling', () => {
         expect(spawnArgs).toContain('-r');
     });
 
-    it('drops only the Saycode-owned prompt when the current policy is disabled, keeping the chat title instruction', async () => {
+    it('keeps default-on child-session routing when the current policy is disabled', async () => {
         await claudeLocal({
             abort: new AbortController().signal,
             sessionId: null,
@@ -294,7 +294,7 @@ describe('claudeLocal --continue handling', () => {
         expect(spawnArgs).toContain('--append-system-prompt');
         expect(promptArgs).toContain('test-title-prompt');
         expect(promptArgs).not.toContain('test-saycode-owned-prompt');
-        expect(promptArgs).not.toContain('test-agent-orchestration-prompt');
+        expect(promptArgs).toContain('test-agent-orchestration-prompt');
     });
 
     it('keeps appending the Saycode-owned prompt alongside the title instruction when no policy is provided', async () => {
@@ -344,6 +344,22 @@ describe('claudeLocal --continue handling', () => {
         const spawnArgs = mockSpawn.mock.calls[0][1];
         const promptArgs = spawnArgs.join('\n');
         expect(promptArgs).toContain('test-title-prompt\n\ntest-saycode-owned-prompt');
+        expect(promptArgs).toContain('test-agent-orchestration-prompt');
+    });
+
+    it('drops child-session routing only when its block is explicitly disabled', async () => {
+        await claudeLocal({
+            abort: new AbortController().signal,
+            sessionId: null,
+            path: '/tmp',
+            onSessionFound,
+            claudeArgs: [],
+            saycodeSystemPromptEnabled: true,
+            saycodePromptBlocks: { agentOrchestration: false },
+        });
+
+        const promptArgs = mockSpawn.mock.calls[0][1].join('\n');
+        expect(promptArgs).toContain('test-title-prompt');
         expect(promptArgs).not.toContain('test-agent-orchestration-prompt');
     });
 
