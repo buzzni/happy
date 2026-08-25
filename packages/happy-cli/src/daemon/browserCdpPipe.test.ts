@@ -21,4 +21,38 @@ describe('createBrowserCdpPipe', () => {
 
         pipe.close()
     })
+
+    it('preserves a UTF-8 error message split between stream chunks', async () => {
+        const chromeInput = new PassThrough()
+        const chromeOutput = new PassThrough()
+        const pipe = createBrowserCdpPipe(chromeInput, chromeOutput)
+        const response = pipe.request('Extensions.loadUnpacked')
+        const frame = Buffer.from(`${JSON.stringify({ id: 1, error: { message: '확장 실패' } })}\0`)
+        const splitAt = frame.indexOf(Buffer.from('확')) + 1
+
+        chromeOutput.write(frame.subarray(0, splitAt))
+        chromeOutput.write(frame.subarray(splitAt))
+
+        await expect(response).rejects.toThrow('확장 실패')
+        pipe.close()
+    })
+
+    it('rejects a pending request as soon as Chrome ends the output pipe', async () => {
+        const chromeInput = new PassThrough()
+        const chromeOutput = new PassThrough()
+        const pipe = createBrowserCdpPipe(chromeInput, chromeOutput)
+        const result = pipe.request('Extensions.loadUnpacked').then(
+            () => 'resolved',
+            (error: Error) => error.message,
+        )
+
+        chromeOutput.emit('end')
+
+        await expect(Promise.race([
+            result,
+            new Promise((resolve) => setImmediate(() => resolve('still pending'))),
+        ])).resolves.toBe('Chrome CDP pipe closed')
+        expect(chromeInput.destroyed).toBe(true)
+        pipe.close()
+    })
 })

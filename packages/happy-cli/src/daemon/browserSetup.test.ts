@@ -38,7 +38,7 @@ describe('buildChromeLaunchArgs', () => {
         expect(args).toContain('--remote-debugging-port=9222')
     })
 
-    it('keeps Chrome profile data out of a constrained shared-memory mount', () => {
+    it('keeps Chrome shared files out of a constrained shared-memory mount', () => {
         // The remote Linux machines expose a 64 MB /dev/shm. Chrome 151 can
         // otherwise terminate nondeterministically after loading the bridge
         // with font_data_service_impl.cc: No space left on device.

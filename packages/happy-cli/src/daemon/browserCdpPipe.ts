@@ -1,4 +1,5 @@
 import type { Readable, Writable } from 'node:stream'
+import { StringDecoder } from 'node:string_decoder'
 
 export interface BrowserCdpPipe {
     request<T>(method: string, params?: Record<string, unknown>): Promise<T>
@@ -16,6 +17,7 @@ export function createBrowserCdpPipe(input: Writable, output: Readable): Browser
     let nextId = 1
     let buffer = ''
     let closed = false
+    const decoder = new StringDecoder('utf8')
     const pending = new Map<number, PendingRequest>()
 
     const rejectAll = (error: Error) => {
@@ -26,8 +28,13 @@ export function createBrowserCdpPipe(input: Writable, output: Readable): Browser
         pending.clear()
     }
 
+    const closeStreams = () => {
+        input.destroy()
+        output.destroy()
+    }
+
     output.on('data', (chunk) => {
-        buffer += Buffer.isBuffer(chunk) ? chunk.toString() : String(chunk)
+        buffer += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
         for (let separator = buffer.indexOf('\0'); separator >= 0; separator = buffer.indexOf('\0')) {
             const frame = buffer.slice(0, separator)
             buffer = buffer.slice(separator + 1)
@@ -58,9 +65,11 @@ export function createBrowserCdpPipe(input: Writable, output: Readable): Browser
         if (closed) return
         closed = true
         rejectAll(new Error('Chrome CDP pipe closed'))
+        closeStreams()
     }
     input.on('error', fail)
     output.on('error', fail)
+    output.on('end', fail)
     output.on('close', fail)
 
     return {
@@ -90,8 +99,7 @@ export function createBrowserCdpPipe(input: Writable, output: Readable): Browser
             if (closed) return
             closed = true
             rejectAll(new Error('Chrome CDP pipe closed'))
-            input.end()
-            output.destroy()
+            closeStreams()
         },
     }
 }
