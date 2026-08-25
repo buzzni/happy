@@ -84,6 +84,7 @@ import {
     removeDaemonTerminalSession,
 } from '@/daemon/daemonTerminalSessions';
 import type { ChildProcess } from 'node:child_process';
+import type { BrowserCdpPipe } from '@/daemon/browserCdpPipe';
 import { shouldReconnect } from '@/utils/lidState';
 import { getProjectPath } from '@/claude/utils/path';
 import {
@@ -359,6 +360,10 @@ export class ApiMachineClient {
         callerWillLaunchBrowser: boolean;
         promise: Promise<ViewerStackStartResult>;
     } | null = null;
+    // Unsafe extension commands are accepted only from the fd 3/4 pipe that
+    // launched Chrome. Keep that owner alive for as long as this daemon uses
+    // the browser; a CDP port cannot recreate or replace the pipe later.
+    private browserCdpPipes = new Map<number, BrowserCdpPipe>();
     private resumeSessionHandler: ((sessionId: string, options?: {
         model?: string;
         permissionMode?: string;
@@ -854,12 +859,13 @@ export class ApiMachineClient {
             }
             const headless = chosen.headless;
             const env = chosen.display ? { DISPLAY: chosen.display } : undefined;
-            let { pid } = launchChrome(chrome.path, {
+            let launched = launchChrome(chrome.path, {
                 userDataDir,
                 cdpPort,
                 headless,
                 display: chosen.display ?? undefined,
             }, env);
+            let { pid } = launched;
             let ready = await waitForCdp(cdpPort, 15_000);
             let sandbox = true;
             if (!ready) {
@@ -868,15 +874,19 @@ export class ApiMachineClient {
                 // "running". Retry once without the sandbox and report the
                 // downgrade rather than leaving a browser that never answers.
                 sandbox = false;
-                ({ pid } = launchChrome(chrome.path, {
+                launched.cdpPipe.close();
+                launched = launchChrome(chrome.path, {
                     userDataDir,
                     cdpPort,
                     headless,
                     display: chosen.display ?? undefined,
                     noSandbox: true,
-                }, env));
+                }, env);
+                ({ pid } = launched);
                 ready = await waitForCdp(cdpPort, 15_000);
             }
+            if (ready) this.rememberBrowserCdpPipe(cdpPort, launched.cdpPipe);
+            else launched.cdpPipe.close();
             const viewer = viewerState
                 ? {
                     ...viewerState,
@@ -1240,11 +1250,12 @@ export class ApiMachineClient {
         const cdpPort = await pickFreeCdpPort();
         if (cdpPort === null) return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
         const env = { DISPLAY: display };
-        launchChrome(chrome.path, { userDataDir, cdpPort, headless: false, display }, env);
+        let launched = launchChrome(chrome.path, { userDataDir, cdpPort, headless: false, display }, env);
         let up = await waitForCdp(cdpPort, 15_000);
         if (!up) {
             // Same kernel/namespace fallback the launch RPC uses.
-            launchChrome(chrome.path, {
+            launched.cdpPipe.close();
+            launched = launchChrome(chrome.path, {
                 userDataDir,
                 cdpPort,
                 headless: false,
@@ -1253,6 +1264,8 @@ export class ApiMachineClient {
             }, env);
             up = await waitForCdp(cdpPort, 15_000);
         }
+        if (up) this.rememberBrowserCdpPipe(cdpPort, launched.cdpPipe);
+        else launched.cdpPipe.close();
         const browser = summariseViewerBrowser({ chromeInstalled: true, cdpPort: up ? cdpPort : null });
         if (!browser.browserReady) return browser;
         return { ...browser, ...await this.pairViewerBrowser(cdpPort) };
@@ -1264,7 +1277,13 @@ export class ApiMachineClient {
      * preserves extension injection, token storage, and debugger-tier checks.
      */
     private async pairBrowser(cdpPort: number, debuggerTier: boolean, pairingId?: string): Promise<BrowserPairResult> {
-        const facts = await runPairing({ cdpPort, debuggerTier, pairingId });
+        const cdpPipe = this.browserCdpPipes.get(cdpPort);
+        const facts = await runPairing({
+            cdpPort,
+            debuggerTier,
+            pairingId,
+            ...(cdpPipe ? { browserCdpRequest: cdpPipe.request.bind(cdpPipe) } : {}),
+        });
         const outcome = formatPairOutcome(facts);
         return {
             ok: outcome.ok,
@@ -1288,6 +1307,12 @@ export class ApiMachineClient {
                 bridgeMessage: error instanceof Error ? error.message : '브라우저 브리지를 연결하지 못했습니다.',
             };
         }
+    }
+
+    private rememberBrowserCdpPipe(cdpPort: number, cdpPipe: BrowserCdpPipe): void {
+        const previous = this.browserCdpPipes.get(cdpPort);
+        if (previous && previous !== cdpPipe) previous.close();
+        this.browserCdpPipes.set(cdpPort, cdpPipe);
     }
 
     private requestServerAutomationSync(): void {
@@ -1984,6 +2009,8 @@ export class ApiMachineClient {
     shutdown() {
         logger.debug('[API MACHINE] Shutting down');
         this.stopKeepAlive();
+        for (const cdpPipe of this.browserCdpPipes.values()) cdpPipe.close();
+        this.browserCdpPipes.clear();
         if (this.reconnectInterval) {
             clearInterval(this.reconnectInterval);
             this.reconnectInterval = null;

@@ -4,11 +4,24 @@ import {
     buildPairUrl,
     formatPairOutcome,
     extensionAvailableAfterLoad,
+    loadUnpackedExtension,
     pairingConnectionArrived,
     pickTierProbeProfile,
     shouldLoadUnpackedExtension,
     DEFAULT_CDP_PORT,
 } from './browserPair'
+
+describe('loadUnpackedExtension', () => {
+    it('sends the unsafe command through the launch-time debugging pipe', async () => {
+        const request = async (method: string, params?: Record<string, unknown>) => {
+            expect(method).toBe('Extensions.loadUnpacked')
+            expect(params).toEqual({ path: '/opt/happy/browser-extension' })
+            return { id: 'extension-id' }
+        }
+
+        await expect(loadUnpackedExtension(request, '/opt/happy/browser-extension')).resolves.toBe(true)
+    })
+})
 
 describe('parsePairArgs', () => {
     it('defaults to Chrome\'s conventional debugging port and leaves the debugger tier alone', () => {
@@ -156,6 +169,7 @@ describe('formatPairOutcome', () => {
         const outcome = formatPairOutcome({ ...base, extensionLoaded: false, loadUnpackedFailed: true, connections: [] })
         expect(outcome.ok).toBe(false)
         expect(outcome.text).toContain('--enable-unsafe-extension-debugging')
+        expect(outcome.text).toContain('--remote-debugging-pipe')
         expect(outcome.text).toContain('/opt/happy/browser-extension')
     })
 
