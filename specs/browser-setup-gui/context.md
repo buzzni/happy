@@ -52,3 +52,17 @@ Ubuntu 23.10+ 는 이 설정이 기본이라 실제 서버에서도 같은 증�
   계층까지만 실기 확인했다.
 - 로그인 GUI 패널은 범위 밖(spec.md 참고).
 - 프로필 이름은 UI 에서 'default' 고정 — 입력란은 아직 없다.
+
+## PR #248 최신 main 통합 (2026-08-26)
+
+- `origin/main` 위로 `review-fixes-claude-session`을 리베이스했다.
+- 최신 main의 launch-time CDP pipe와 PR #248의 지연 extension reload를
+  결합했다. viewer는 기존 bridge를 먼저 재사용하고 marker pairing 실패
+  시에만 같은 CDP pipe로 reload한다.
+- focused unit 4 files, 83 tests 통과.
+- happy-cli typecheck 통과.
+- happy-cli 전체 build + unit 221 files, 2,404 tests 통과.
+- 첫 전체 실행은 로컬 `node_modules`에 lockfile 의
+  `@buzzni/saycode-cli`가 빠져 wrapper 테스트 3건이 실패했으나,
+  `pnpm install --frozen-lockfile`로 workspace를 동기화한 뒤 해당 6건과
+  전체 suite가 통과했다. 소스 수정은 필요하지 않았다.

@@ -55,4 +55,4 @@ happy-cli 전체 unit/typecheck/build, PR Linux/Windows smoke CI.
 - [x] Phase 3
 - [x] Phase 4
 - [x] Phase 5
-- [ ] Phase 6
+- [x] Phase 6
