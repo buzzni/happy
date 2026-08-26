@@ -131,6 +131,63 @@ export async function exchangeCredential(input: {
   }
 }
 
+const pullRequestFilesSchema = z.object({
+  number: z.number().int().positive(),
+  changedFiles: z.number().int().min(0),
+  files: z.array(z.object({ path: z.string().min(1).max(2_000) })).max(100),
+})
+
+export type PullRequestFiles = z.infer<typeof pullRequestFilesSchema>
+
+/**
+ * 지연 조회한 파일 목록을 원본 PR 에 채운다. 조회하지 않은 PR 은 그대로 둔다
+ * (경로 필터 판정 대상이 아니므로 기본값 0/[] 로 충분하다).
+ */
+export function mergePullRequestFiles(
+  pullRequests: GithubPullRequestSnapshot[],
+  details: PullRequestFiles[],
+): GithubPullRequestSnapshot[] {
+  if (details.length === 0) return pullRequests
+  const byNumber = new Map(details.map((detail) => [detail.number, detail]))
+  return pullRequests.map((pullRequest) => {
+    const detail = byNumber.get(pullRequest.number)
+    return detail
+      ? { ...pullRequest, changedFiles: detail.changedFiles, files: detail.files }
+      : pullRequest
+  })
+}
+
+/**
+ * 후보 PR 의 파일 목록만 받아온다. 목록 조회에서 files 를 빼면 hsmoa_backend
+ * 기준 3,506ms → 933ms 이고, 후보는 보통 폴링당 0~2건이라 추가 비용이 작다.
+ */
+export async function queryGithubPullRequestFiles(input: {
+  numbers: number[]
+  cwd: string
+  allowedRoot: string
+  environmentVariables?: { GH_TOKEN: string; GH_REPO: string }
+  runScript?: typeof runAutomationScript
+}): Promise<{ ok: true; files: PullRequestFiles[] } | { ok: false; error: string }> {
+  if (input.numbers.length === 0) return { ok: true, files: [] }
+  const details: PullRequestFiles[] = []
+  for (const number of input.numbers) {
+    const query = await (input.runScript ?? runAutomationScript)({
+      command: `gh pr view ${number} --json number,changedFiles,files`,
+      cwd: input.cwd,
+      timeout: QUERY_TIMEOUT_MS,
+      allowedRoot: input.allowedRoot,
+      environmentVariables: input.environmentVariables,
+    })
+    if (!query.ok) {
+      return { ok: false, error: `GitHub file query failed${describeQueryFailure(query.error)}` }
+    }
+    const parsed = pullRequestFilesSchema.safeParse(JSON.parse(query.stdout || 'null'))
+    if (!parsed.success) return { ok: false, error: 'GitHub file query returned invalid data' }
+    details.push(parsed.data)
+  }
+  return { ok: true, files: details }
+}
+
 export async function queryGithubPullRequests(input: {
   configUrl: string | undefined
   machineToken: string

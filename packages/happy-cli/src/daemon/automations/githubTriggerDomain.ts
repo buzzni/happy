@@ -142,6 +142,43 @@ export function describeGithubTriggerBaseline(input: {
     + ` nothing fires until a newer one appears${hint}`;
 }
 
+/**
+ * 파일 목록을 실제로 받아야 하는 PR 번호. 경로 필터가 없으면 빈 배열.
+ *
+ * `files` 는 이 쿼리에서 가장 비싼 필드인데(hsmoa_backend 실측 933ms → 3,506ms)
+ * `matchesFilter` 의 경로 검사에만 쓰인다. `derivesEvent` 는 파일을 전혀 보지
+ * 않으므로, 이벤트를 유발하고 경로 외 필터를 통과한 PR(보통 폴링당 0~2건)에만
+ * 파일을 받으면 된다. 판정 순서는 planGithubTrigger 와 동일하게 유지한다.
+ */
+export function selectPathFilterCandidates(input: {
+  trigger: GithubTrigger;
+  current: GithubPullRequestSnapshot[];
+  previous: GithubTriggerRuntimeState | null;
+}): number[] {
+  const triggerEvent = input.trigger.event;
+  if (input.trigger.filter.paths.length === 0 || triggerEvent === 'issue_opened') return [];
+  const previous = input.previous;
+  // 첫 관측은 baseline 만 기록하고 발화하지 않는다 — 받을 이유가 없다.
+  if (!previous) return [];
+  const previousByNumber = new Map(previous.snapshot.map((pr) => [pr.number, pr]));
+  const processed = new Set(previous.processed);
+  const withoutPaths: GithubTrigger = {
+    ...input.trigger,
+    filter: { ...input.trigger.filter, paths: [] },
+  };
+  return [...input.current]
+    .sort((left, right) => left.number - right.number)
+    .filter((pr) => !processed.has(`${pr.number}:${triggerEvent}`)
+      && derivesEvent({
+        event: triggerEvent,
+        current: pr,
+        previous: previousByNumber.get(pr.number),
+        previousHighest: previous.highestPrNumber,
+      })
+      && matchesFilter(withoutPaths, pr))
+    .map((pr) => pr.number);
+}
+
 export function planGithubTrigger(input: {
   trigger: GithubTrigger;
   current: GithubPullRequestSnapshot[];

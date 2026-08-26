@@ -147,3 +147,49 @@ AgentTask bridge 한 곳뿐이다.
 - When 사유를 만들면
 - Then 모두 같은 모듈(`describeHttpFailure`)을 쓴다
 - And 본문을 이미 읽은 호출부는 파싱된 값을 재사용한다 (Response 는 한 번만 읽힌다)
+
+---
+
+## 후속 2 — 경로 필터 트리거의 GitHub 504 (2026-08-26)
+
+AC1 은 `filter.paths` 가 **빈** 트리거만 구했다. 경로 필터가 있는 트리거는 파일
+목록이 실제로 필요해 여전히 무거운 쿼리를 돌고, `buzzni/hsmoa_backend` 의
+`cmt2c1aeq`(경로 9개)가 계속 504 를 맞는다.
+
+같은 09:22 tick 에서 경량 쿼리 트리거는 통과하고 이 트리거만 504 가 났다.
+
+### 실측 (buzzni/hsmoa_backend)
+
+| 쿼리 | 소요 | 응답 |
+|---|---|---|
+| `files` 포함, limit 100 (현재) | 3,506ms | 250KB |
+| `files` 포함, limit 50 | 1,778ms | 140KB |
+| `changedFiles` 만, limit 100 | 1,934ms | 46KB |
+| **`files` 제외, limit 100** | **933ms** | 44KB |
+
+비용의 대부분은 `files` 다. `--limit` 을 줄이면 비용은 내려가지만 폴링 사이에
+갱신된 PR 이 창 밖으로 밀려 **발화를 놓칠 수 있어** 채택하지 않는다.
+
+### 관찰 — 파일은 극소수 PR 에만 필요하다
+
+`planGithubTrigger` 는 `processed` → `derivesEvent` → `matchesFilter` 순으로
+거른다. `derivesEvent` 는 파일 정보를 **전혀 쓰지 않고**, 파일은 `matchesFilter`
+의 경로 검사에서만 쓰인다. 즉 이벤트를 유발하는 PR(보통 폴링당 0~2건)에만
+파일이 필요한데 100건 전부에 대해 가져오고 있다.
+
+### AC9 — 파일은 이벤트를 유발하는 PR 에만 가져온다
+- Given 경로 필터가 있는 트리거
+- When 데몬이 PR 을 조회하면
+- Then 목록 조회는 `changedFiles`/`files` 없이 수행한다
+- And 이벤트를 유발하고 경로 외 필터를 통과한 PR 에 대해서만 파일을 추가 조회한다
+- And 후보가 없으면 추가 조회를 하지 않는다
+
+### AC10 — 경로 필터링 결과가 달라지지 않는다
+- Given 같은 PR 집합과 같은 경로 필터
+- When 지연 조회로 파일을 채워 계획하면
+- Then 일괄 조회로 계획한 것과 동일한 이벤트가 나온다
+- And 잘린 파일 목록(`changedFiles > files.length`)의 fail-closed 가 유지된다
+
+### 범위 밖
+- `--limit` 조정 — 발화 누락 위험(위 참조)
+- 504 재시도 — AC9 로 비용이 줄면 필요 여부를 다시 판단한다

@@ -103,7 +103,7 @@ import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
 import { createAutomationTickRunner } from './automations/automationTickRunner';
 import { runAutomationScript } from './automations/runAutomationScript';
-import { queryGithubPullRequests } from './automations/queryGithubPullRequests';
+import { queryGithubPullRequestFiles, queryGithubPullRequests } from './automations/queryGithubPullRequests';
 import { queryGithubIssues } from './automations/queryGithubIssues';
 import {
   createGithubIssueProgressMarker,
@@ -2011,6 +2011,10 @@ export async function startDaemon(): Promise<void> {
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
           machineToken: credentials.token,
           machineId,
+          allowedRoot: automationAllowedRoot,
+        }),
+        queryGithubPullRequestFiles: (input) => queryGithubPullRequestFiles({
+          ...input,
           allowedRoot: automationAllowedRoot,
         }),
         queryGithubIssues: (input) => queryGithubIssues({

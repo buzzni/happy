@@ -1,3 +1,4 @@
+import { mergePullRequestFiles, type PullRequestFiles } from './queryGithubPullRequests'
 import { randomUUID } from 'node:crypto'
 
 import {
@@ -26,6 +27,7 @@ import {
   describeGithubTriggerBaseline,
   planGithubIssueTrigger,
   planGithubTrigger,
+  selectPathFilterCandidates,
   renderGithubIssueTriggerPrompt,
   renderGithubTriggerPrompt,
   type GithubIssueSnapshot,
@@ -64,6 +66,11 @@ export interface ServerAutomationExecutorInput {
     }
     | { ok: false; error: string }
   >
+  queryGithubPullRequestFiles: (input: {
+    numbers: number[]
+    cwd: string
+    environmentVariables?: { GH_TOKEN: string; GH_REPO: string }
+  }) => Promise<{ ok: true; files: PullRequestFiles[] } | { ok: false; error: string }>
   queryGithubIssues: (input: {
     cwd: string
     githubCredentialId: string | null
@@ -888,7 +895,8 @@ async function executeStartedRun(
       runId: run.runId,
       claimToken: run.claimToken,
       // 경로 필터가 있을 때만 파일 목록이 쓰인다 (matchesFilter).
-      includeChangedFiles: payload.githubTrigger.filter.paths.length > 0,
+      // 파일은 이벤트를 유발하는 PR 에만 필요하다 — 목록은 항상 가볍게 받는다.
+      includeChangedFiles: false,
     })
     if (!query.ok) {
       deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
@@ -913,9 +921,29 @@ async function executeStartedRun(
     if (prBaselineNotice) {
       input.logDebug?.(`[server-automation] ${automation.automationId} ${prBaselineNotice}`)
     }
+    // 경로 필터가 있으면 후보 PR 의 파일만 따로 받아 채운다 (AC9).
+    let pullRequests = query.pullRequests
+    const fileCandidates = selectPathFilterCandidates({
+      trigger: payload.githubTrigger,
+      current: pullRequests,
+      previous,
+    })
+    if (fileCandidates.length > 0) {
+      const details = await input.queryGithubPullRequestFiles({
+        numbers: fileCandidates,
+        cwd: payload.directory,
+        ...(query.githubEnvironment ? { environmentVariables: query.githubEnvironment } : {}),
+      })
+      if (!details.ok) {
+        deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
+        input.logDebug?.(`[server-automation] ${automation.automationId} ${details.error}`)
+        return { outcome: 'ERROR', sessionId: null }
+      }
+      pullRequests = mergePullRequestFiles(pullRequests, details.files)
+    }
     const planned = planGithubTrigger({
       trigger: payload.githubTrigger,
-      current: githubMode === 'work' && previous ? previous.snapshot : query.pullRequests,
+      current: githubMode === 'work' && previous ? previous.snapshot : pullRequests,
       previous,
       consume: githubMode === 'work',
     })
