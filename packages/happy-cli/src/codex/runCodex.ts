@@ -992,7 +992,6 @@ export async function runCodex(opts: {
         },
     });
     const mcpRuntimeRecovery = new CodexMcpRuntimeRecovery(client);
-    let first = true;
     let appendSystemPromptInjected = false;
 
     try {
@@ -1010,7 +1009,6 @@ export async function runCodex(opts: {
                 mcpServers: mcpConfigSynchronizer.mcpServers,
                 developerInstructions: currentDeveloperInstructions,
             });
-            first = false;
             appendSystemPromptInjected = true;
         }
 
@@ -1234,7 +1232,7 @@ export async function runCodex(opts: {
                     message: message.message,
                     mode: message.mode,
                     includeAppendSystemPrompt,
-                    includeTitleInstruction: first,
+                    hasTitle: session.hasTitle(),
                 });
 
                 const result = await client.sendTurnAndWait(turnPrompt, {
@@ -1244,7 +1242,6 @@ export async function runCodex(opts: {
                     effort: message.mode.effort,
                     extraInputItems: imageInputs.inputItems,
                 });
-                first = false;
                 if (includeAppendSystemPrompt) {
                     appendSystemPromptInjected = true;
                 }

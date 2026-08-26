@@ -11,20 +11,19 @@ export function buildGeminiTurnPrompt(input: {
   saycodeSystemPromptEnabled?: boolean;
   saycodePromptBlocks?: GeminiMode['saycodePromptBlocks'];
   isNewSession: boolean;
+  hasTitle: boolean;
 }): string {
-  if (!input.isNewSession) return input.userText;
-
   const agentOrchestrationPrompt = isSaycodePromptBlockEnabled(
     'agentOrchestration',
     input.saycodePromptBlocks,
     input.saycodeSystemPromptEnabled,
   ) ? input.agentOrchestrationPrompt : undefined;
   return [
-    input.appendSystemPrompt,
-    agentOrchestrationPrompt,
-    input.previousConversationContext?.trim(),
+    input.isNewSession ? input.appendSystemPrompt : undefined,
+    input.isNewSession ? agentOrchestrationPrompt : undefined,
+    input.isNewSession ? input.previousConversationContext?.trim() : undefined,
     input.userText,
-    CHANGE_TITLE_INSTRUCTION,
+    input.hasTitle ? undefined : CHANGE_TITLE_INSTRUCTION,
   ].filter((block): block is string => Boolean(block)).join('\n\n');
 }
 

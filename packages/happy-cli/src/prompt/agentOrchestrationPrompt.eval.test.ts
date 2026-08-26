@@ -89,6 +89,7 @@ describe.each([
       saycodeSystemPromptEnabled: enabled,
       saycodePromptBlocks: agentOrchestration === undefined ? undefined : { agentOrchestration },
       isNewSession: true,
+      hasTitle: true,
     }),
   },
 ])('$provider orchestration prompt lifecycle (T13, T15)', ({ compose }) => {

@@ -1132,6 +1132,7 @@ export async function runGemini(opts: {
           saycodePromptBlocks: message.mode.saycodePromptBlocks,
           previousConversationContext,
           isNewSession: startedNewBackendSession,
+          hasTitle: session.hasTitle(),
         });
         if (previousConversationContext) {
           logger.debug(`[gemini] Injected conversation history context (${previousConversationContext.length} chars)`);

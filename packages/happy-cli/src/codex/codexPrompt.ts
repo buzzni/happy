@@ -80,7 +80,7 @@ export function buildCodexTurnPrompt(opts: {
     message: string;
     mode: Pick<CodexEnhancedMode, 'appendSystemPrompt' | 'saycodeSystemPromptEnabled'>;
     includeAppendSystemPrompt: boolean;
-    includeTitleInstruction: boolean;
+    hasTitle: boolean;
 }): string {
     const parts: string[] = [];
 
@@ -89,7 +89,7 @@ export function buildCodexTurnPrompt(opts: {
     }
     parts.push(opts.message);
 
-    if (opts.includeTitleInstruction) {
+    if (!opts.hasTitle) {
         parts.push(CHANGE_TITLE_INSTRUCTION);
     }
 

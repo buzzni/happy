@@ -85,7 +85,7 @@ describe('buildCodexTurnPrompt', () => {
                 appendSystemPrompt: '<options><option>Yes</option></options>',
             },
             includeAppendSystemPrompt: true,
-            includeTitleInstruction: true,
+            hasTitle: false,
         });
 
         expect(prompt).toBe(
@@ -103,7 +103,7 @@ describe('buildCodexTurnPrompt', () => {
                 saycodeSystemPromptEnabled: false,
             },
             includeAppendSystemPrompt: true,
-            includeTitleInstruction: true,
+            hasTitle: false,
         })).toBe(`USER AND PROJECT CONTEXT\n\nhello\n\n${CHANGE_TITLE_INSTRUCTION}`);
     });
 
@@ -112,7 +112,7 @@ describe('buildCodexTurnPrompt', () => {
             message: 'hello',
             mode: {},
             includeAppendSystemPrompt: true,
-            includeTitleInstruction: true,
+            hasTitle: false,
         });
 
         expect(prompt).toBe(`hello\n\n${CHANGE_TITLE_INSTRUCTION}`);
@@ -129,10 +129,21 @@ describe('buildCodexTurnPrompt', () => {
                 appendSystemPrompt: '<options><option>Yes</option></options>',
             },
             includeAppendSystemPrompt: false,
-            includeTitleInstruction: false,
+            hasTitle: true,
         });
 
         expect(prompt).toBe('continue');
+    });
+
+    it('keeps nudging on follow-up turns while the chat is untitled', () => {
+        const prompt = buildCodexTurnPrompt({
+            message: 'continue',
+            mode: {},
+            includeAppendSystemPrompt: false,
+            hasTitle: false,
+        });
+
+        expect(prompt).toBe(`continue\n\n${CHANGE_TITLE_INSTRUCTION}`);
     });
 
     it('can re-inject Happy append prompt without title instruction after a thread reset', () => {
@@ -142,7 +153,7 @@ describe('buildCodexTurnPrompt', () => {
                 appendSystemPrompt: '<options><option>Yes</option></options>',
             },
             includeAppendSystemPrompt: true,
-            includeTitleInstruction: false,
+            hasTitle: true,
         });
 
         expect(prompt).toBe(
@@ -156,13 +167,13 @@ describe('buildCodexTurnPrompt', () => {
             message: 'check KNOI',
             mode: {},
             includeAppendSystemPrompt: false,
-            includeTitleInstruction: false,
+            hasTitle: true,
         });
         const followUp = buildCodexTurnPrompt({
             message: 'continue',
             mode: {},
             includeAppendSystemPrompt: false,
-            includeTitleInstruction: false,
+            hasTitle: true,
         });
 
         expect(first).toBe('check KNOI');

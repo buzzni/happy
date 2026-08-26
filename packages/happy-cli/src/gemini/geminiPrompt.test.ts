@@ -9,6 +9,7 @@ describe('buildGeminiTurnPrompt', () => {
       userText: 'inspect the repository',
       appendSystemPrompt: 'CUSTOM USER PROMPT',
       isNewSession: true,
+      hasTitle: false,
     });
 
     expect(prompt).toContain('CUSTOM USER PROMPT');
@@ -21,6 +22,7 @@ describe('buildGeminiTurnPrompt', () => {
       userText: 'inspect the repository',
       appendSystemPrompt: 'CLIENT APPEND',
       isNewSession: true,
+      hasTitle: false,
     });
 
     expect(prompt).toContain('CLIENT APPEND');
@@ -32,6 +34,7 @@ describe('buildGeminiTurnPrompt', () => {
     expect(buildGeminiTurnPrompt({
       userText: 'plain first turn',
       isNewSession: true,
+      hasTitle: false,
     })).toBe(`plain first turn\n\n${CHANGE_TITLE_INSTRUCTION}`);
   });
 
@@ -40,7 +43,26 @@ describe('buildGeminiTurnPrompt', () => {
       userText: 'continue',
       appendSystemPrompt: 'CLIENT APPEND',
       isNewSession: false,
+      hasTitle: true,
     })).toBe('continue');
+  });
+
+  it('keeps nudging on a continuing ACP session while the chat is untitled', () => {
+    expect(buildGeminiTurnPrompt({
+      userText: 'continue',
+      appendSystemPrompt: 'CLIENT APPEND',
+      isNewSession: false,
+      hasTitle: false,
+    })).toBe(`continue\n\n${CHANGE_TITLE_INSTRUCTION}`);
+  });
+
+  it('does not ask a resumed titled chat to change its title again', () => {
+    expect(buildGeminiTurnPrompt({
+      userText: 'resume',
+      appendSystemPrompt: 'CLIENT APPEND',
+      isNewSession: true,
+      hasTitle: true,
+    })).toBe('CLIENT APPEND\n\nresume');
   });
 
   it('keeps child-session orchestration on when the master is off unless its block is explicitly off', () => {
@@ -49,6 +71,7 @@ describe('buildGeminiTurnPrompt', () => {
       agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
       saycodeSystemPromptEnabled: false,
       isNewSession: true,
+      hasTitle: true,
     };
 
     expect(buildGeminiTurnPrompt(base)).toContain('happy agent spawn');
@@ -64,6 +87,7 @@ describe('buildGeminiTurnPrompt', () => {
       appendSystemPrompt: 'CLIENT APPEND',
       previousConversationContext: '[PREVIOUS]\nUser: earlier turn\n[/PREVIOUS]\n',
       isNewSession: true,
+      hasTitle: false,
     });
 
     expect(prompt).toBe(
