@@ -564,8 +564,8 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     let currentCustomSystemPrompt: string | undefined = undefined; // Track current custom system prompt
     let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt; // Track current append system prompt
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
-    // Per-block overrides layered on top of currentSaycodeSystemPromptEnabled — a block
-    // with no override inherits it (see promptProvenance.isSaycodePromptBlockEnabled).
+    // Per-block overrides layered on top of currentSaycodeSystemPromptEnabled — default-on
+    // delegation blocks stay enabled without one; the remaining blocks inherit the master.
     // Seeded once from HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS for daemon-spawned
     // recovery first turns; later user messages overwrite it via message meta.
     let currentSaycodePromptBlocks: SaycodePromptBlockOverrides | undefined = initialSaycodePromptBlocks;
