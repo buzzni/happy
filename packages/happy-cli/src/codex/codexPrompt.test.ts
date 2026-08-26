@@ -5,8 +5,37 @@ import {
     buildCodexDeveloperInstructions,
     buildCodexTurnPrompt,
     hashCodexEnhancedMode,
+    isSupportedCodexReasoningEffort,
+    resolveCodexSaycodePromptBlocks,
     type CodexEnhancedMode,
 } from './codexPrompt';
+
+describe('isSupportedCodexReasoningEffort', () => {
+    it.each(['max', 'ultra'])('accepts the GPT-5.6 effort advertised by the spawn facade: %s', (effort) => {
+        expect(isSupportedCodexReasoningEffort(effort)).toBe(true);
+    });
+
+    it('rejects an unknown effort instead of poisoning the next turn', () => {
+        expect(isSupportedCodexReasoningEffort('maximum')).toBe(false);
+    });
+});
+
+describe('resolveCodexSaycodePromptBlocks', () => {
+    it('applies an explicit block override and preserves it on later absent turns', () => {
+        const disabled = resolveCodexSaycodePromptBlocks(undefined, {
+            saycodePromptBlocks: { agentOrchestration: false },
+        });
+        expect(disabled).toEqual({ agentOrchestration: false });
+        expect(resolveCodexSaycodePromptBlocks(disabled, undefined)).toBe(disabled);
+    });
+
+    it('resets cached block overrides only for an explicit null', () => {
+        expect(resolveCodexSaycodePromptBlocks(
+            { agentOrchestration: false },
+            { saycodePromptBlocks: null },
+        )).toBeUndefined();
+    });
+});
 
 describe('buildCodexDeveloperInstructions', () => {
     it('uses replaceable developer instructions for explicit-policy clients', () => {
@@ -17,7 +46,7 @@ describe('buildCodexDeveloperInstructions', () => {
                 appendSystemPrompt: 'USER AND PROJECT CONTEXT',
                 saycodeSystemPromptEnabled: false,
             },
-        })).toBe('CONNECTOR FACTS\n\nUSER AND PROJECT CONTEXT');
+        })).toBe('CONNECTOR FACTS\n\nAGENT ORCHESTRATION: happy agent spawn\n\nUSER AND PROJECT CONTEXT');
     });
 
     it('keeps legacy client append prompts in the original user-turn position', () => {
@@ -28,11 +57,22 @@ describe('buildCodexDeveloperInstructions', () => {
         })).toBe('CONNECTOR FACTS\n\nAGENT ORCHESTRATION: happy agent spawn');
     });
 
-    it('does not inject orchestration when Saycode prompts are off', () => {
+    it('keeps default-on orchestration when Saycode prompts are off', () => {
         expect(buildCodexDeveloperInstructions({
             connectorGuidance: 'CONNECTOR FACTS',
             agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
             mode: { saycodeSystemPromptEnabled: false },
+        })).toBe('CONNECTOR FACTS\n\nAGENT ORCHESTRATION: happy agent spawn');
+    });
+
+    it('does not inject orchestration when its block is explicitly off', () => {
+        expect(buildCodexDeveloperInstructions({
+            connectorGuidance: 'CONNECTOR FACTS',
+            agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
+            mode: {
+                saycodeSystemPromptEnabled: true,
+                saycodePromptBlocks: { agentOrchestration: false },
+            },
         })).toBe('CONNECTOR FACTS');
     });
 });
@@ -45,7 +85,7 @@ describe('buildCodexTurnPrompt', () => {
                 appendSystemPrompt: '<options><option>Yes</option></options>',
             },
             includeAppendSystemPrompt: true,
-            includeTitleInstruction: true,
+            hasTitle: false,
         });
 
         expect(prompt).toBe(
@@ -63,7 +103,7 @@ describe('buildCodexTurnPrompt', () => {
                 saycodeSystemPromptEnabled: false,
             },
             includeAppendSystemPrompt: true,
-            includeTitleInstruction: true,
+            hasTitle: false,
         })).toBe(`USER AND PROJECT CONTEXT\n\nhello\n\n${CHANGE_TITLE_INSTRUCTION}`);
     });
 
@@ -72,7 +112,7 @@ describe('buildCodexTurnPrompt', () => {
             message: 'hello',
             mode: {},
             includeAppendSystemPrompt: true,
-            includeTitleInstruction: true,
+            hasTitle: false,
         });
 
         expect(prompt).toBe(`hello\n\n${CHANGE_TITLE_INSTRUCTION}`);
@@ -89,10 +129,21 @@ describe('buildCodexTurnPrompt', () => {
                 appendSystemPrompt: '<options><option>Yes</option></options>',
             },
             includeAppendSystemPrompt: false,
-            includeTitleInstruction: false,
+            hasTitle: true,
         });
 
         expect(prompt).toBe('continue');
+    });
+
+    it('keeps nudging on follow-up turns while the chat is untitled', () => {
+        const prompt = buildCodexTurnPrompt({
+            message: 'continue',
+            mode: {},
+            includeAppendSystemPrompt: false,
+            hasTitle: false,
+        });
+
+        expect(prompt).toBe(`continue\n\n${CHANGE_TITLE_INSTRUCTION}`);
     });
 
     it('can re-inject Happy append prompt without title instruction after a thread reset', () => {
@@ -102,7 +153,7 @@ describe('buildCodexTurnPrompt', () => {
                 appendSystemPrompt: '<options><option>Yes</option></options>',
             },
             includeAppendSystemPrompt: true,
-            includeTitleInstruction: false,
+            hasTitle: true,
         });
 
         expect(prompt).toBe(
@@ -116,13 +167,13 @@ describe('buildCodexTurnPrompt', () => {
             message: 'check KNOI',
             mode: {},
             includeAppendSystemPrompt: false,
-            includeTitleInstruction: false,
+            hasTitle: true,
         });
         const followUp = buildCodexTurnPrompt({
             message: 'continue',
             mode: {},
             includeAppendSystemPrompt: false,
-            includeTitleInstruction: false,
+            hasTitle: true,
         });
 
         expect(first).toBe('check KNOI');

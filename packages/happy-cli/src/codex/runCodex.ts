@@ -62,6 +62,8 @@ import {
     buildCodexDeveloperInstructions,
     buildCodexTurnPrompt,
     hashCodexEnhancedMode,
+    isSupportedCodexReasoningEffort,
+    resolveCodexSaycodePromptBlocks,
     type CodexEnhancedMode,
 } from './codexPrompt';
 import { discoverCodexSkillCommands } from './codexSkills';
@@ -94,10 +96,6 @@ import { registerCodexSteerHandler } from './codexSteerHandler';
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
 const DEFAULT_CODEX_PERMISSION_MODE: PermissionMode = 'yolo';
-
-const VALID_REMOTE_EFFORTS: readonly ReasoningEffort[] = [
-    'none', 'minimal', 'low', 'medium', 'high', 'xhigh',
-];
 
 /**
  * Main entry point for the codex command with ink UI
@@ -282,19 +280,16 @@ export async function runCodex(opts: {
     // ReasoningEffort; anything else falls back to the default.
     const initialModelSeed = consumePendingInitialModel(process.env) ?? DEFAULT_CODEX_MODEL;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env);
-    if (rawInitialEffortSeed && !(VALID_REMOTE_EFFORTS as readonly string[]).includes(rawInitialEffortSeed)) {
+    if (rawInitialEffortSeed && !isSupportedCodexReasoningEffort(rawInitialEffortSeed)) {
         logger.debug(`[Codex] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
     }
-    const initialEffortSeed = rawInitialEffortSeed && (VALID_REMOTE_EFFORTS as readonly string[]).includes(rawInitialEffortSeed)
-        ? rawInitialEffortSeed as ReasoningEffort
+    const initialEffortSeed = isSupportedCodexReasoningEffort(rawInitialEffortSeed)
+        ? rawInitialEffortSeed
         : DEFAULT_CODEX_EFFORT;
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
-    // Codex doesn't gate per-block Saycode prompts, but every HAPPY_INITIAL_* seed is
-    // consume-once: an ignored seed must still be deleted or it leaks into every child
-    // process this session spawns.
-    consumePendingInitialSaycodePromptBlocks(process.env);
+    const initialSaycodePromptBlocks = consumePendingInitialSaycodePromptBlocks(process.env);
     const initialAppendSystemPrompt = resolveInitialSaycodeAppendSystemPrompt({
         appendSystemPrompt: consumePendingInitialAppendSystemPrompt(process.env),
         saycodeSystemPromptEnabled: initialSaycodeSystemPromptEnabled,
@@ -303,6 +298,7 @@ export async function runCodex(opts: {
     let currentEffort: ReasoningEffort | undefined = initialEffortSeed;
     let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt;
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
+    let currentSaycodePromptBlocks: CodexEnhancedMode['saycodePromptBlocks'] = initialSaycodePromptBlocks;
 
     const resetTurnScopedOptions = () => {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
@@ -366,8 +362,8 @@ export async function runCodex(opts: {
                 messageEffort = undefined;
                 currentEffort = undefined;
                 logger.debug(`[Codex] Effort reset to default`);
-            } else if (typeof incoming === 'string' && (VALID_REMOTE_EFFORTS as readonly string[]).includes(incoming)) {
-                messageEffort = incoming as ReasoningEffort;
+            } else if (isSupportedCodexReasoningEffort(incoming)) {
+                messageEffort = incoming;
                 currentEffort = messageEffort;
                 logger.debug(`[Codex] Effort updated from user message: ${messageEffort}`);
             } else {
@@ -390,6 +386,11 @@ export async function runCodex(opts: {
             logger.debug(`[Codex] Saycode system prompt ${currentSaycodeSystemPromptEnabled ? 'enabled' : 'disabled'} by user message`);
         }
 
+        currentSaycodePromptBlocks = resolveCodexSaycodePromptBlocks(
+            currentSaycodePromptBlocks,
+            message.meta,
+        );
+
         messageAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
             current: currentAppendSystemPrompt,
             incoming: message.meta?.appendSystemPrompt,
@@ -403,6 +404,7 @@ export async function runCodex(opts: {
             model: messageModel,
             appendSystemPrompt: messageAppendSystemPrompt,
             saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+            saycodePromptBlocks: currentSaycodePromptBlocks,
             effort: messageEffort,
         };
         const enqueueResult = enqueueCodexUserText({
@@ -432,6 +434,7 @@ export async function runCodex(opts: {
                 model: currentModel,
                 appendSystemPrompt: currentAppendSystemPrompt,
                 saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+                saycodePromptBlocks: currentSaycodePromptBlocks,
                 effort: currentEffort,
             });
             logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
@@ -989,7 +992,6 @@ export async function runCodex(opts: {
         },
     });
     const mcpRuntimeRecovery = new CodexMcpRuntimeRecovery(client);
-    let first = true;
     let appendSystemPromptInjected = false;
 
     try {
@@ -1007,7 +1009,6 @@ export async function runCodex(opts: {
                 mcpServers: mcpConfigSynchronizer.mcpServers,
                 developerInstructions: currentDeveloperInstructions,
             });
-            first = false;
             appendSystemPromptInjected = true;
         }
 
@@ -1231,7 +1232,7 @@ export async function runCodex(opts: {
                     message: message.message,
                     mode: message.mode,
                     includeAppendSystemPrompt,
-                    includeTitleInstruction: first,
+                    hasTitle: session.hasTitle(),
                 });
 
                 const result = await client.sendTurnAndWait(turnPrompt, {
@@ -1241,7 +1242,6 @@ export async function runCodex(opts: {
                     effort: message.mode.effort,
                     extraInputItems: imageInputs.inputItems,
                 });
-                first = false;
                 if (includeAppendSystemPrompt) {
                     appendSystemPromptInjected = true;
                 }

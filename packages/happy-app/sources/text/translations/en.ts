@@ -208,12 +208,14 @@ export const en: TranslationStructure = {
 
     settingsFeatures: {
         saycodeGroupTitle: "Saycode Instructions",
-        saycodeGroupFooter: "Chat title generation is always on and cannot be turned off — it is what lets you find a conversation again in the chat list.",
+        saycodeGroupFooter: "Child Agent calls and internal task delegation stay on by default even when Saycode instructions are off. Chat title generation is always on and cannot be turned off.",
         saycodeMaster: "Use Saycode instructions",
         saycodeMasterSubtitle: "Behavior instructions Saycode adds. Your own prompts, project instructions, and skills always remain.",
         saycodeBlockOptionsGuidance: "Answer options",
         saycodeBlockOptionsGuidanceSubtitle: "Lets the agent offer tappable answer choices.",
-        saycodeBlockWorkerDelegation: "Work delegation",
+        saycodeBlockAgentOrchestration: "Child Agent calls",
+        saycodeBlockAgentOrchestrationSubtitle: "Delegates natural-language requests to an independent child Agent session and collects its result.",
+        saycodeBlockWorkerDelegation: "Internal task delegation",
         saycodeBlockWorkerDelegationSubtitle: "Hands mechanical work to a cheaper worker agent.",
         saycodeBlockAxBase: "Start-from-planning workflow",
         saycodeBlockAxBaseSubtitle: "Applies the AX workflow's base instructions.",

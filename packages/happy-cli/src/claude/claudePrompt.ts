@@ -29,14 +29,14 @@ export function buildClaudeSystemPromptOptions({
   chatTitlePrompt?: string;
   /** Co-Authored-By commit credits — gated per-block as 'coAuthoredCredit'. */
   saycodeSystemPrompt: string;
-  /** Global Saycode-owned child-session routing; controlled by the master prompt switch. */
+  /** Default-on child-session routing; gated per-block as 'agentOrchestration'. */
   agentOrchestrationPrompt?: string;
   orchestratorPrompt?: string;
   /** Gated per-block as 'workerDelegation'. */
   workerDelegationPrompt?: string;
   connectorGuidance?: string;
   saycodeSystemPromptEnabled?: boolean;
-  /** Per-block overrides; a block with no override inherits saycodeSystemPromptEnabled. */
+  /** Per-block overrides; default-on blocks do not inherit saycodeSystemPromptEnabled. */
   saycodePromptBlocks?: SaycodePromptBlockOverrides;
 }): { customSystemPrompt?: string; appendSystemPrompt?: string } {
   const isCoAuthoredCreditEnabled = isSaycodePromptBlockEnabled(
@@ -44,6 +44,9 @@ export function buildClaudeSystemPromptOptions({
   );
   const isWorkerDelegationEnabled = isSaycodePromptBlockEnabled(
     'workerDelegation', saycodePromptBlocks, saycodeSystemPromptEnabled,
+  );
+  const isAgentOrchestrationEnabled = isSaycodePromptBlockEnabled(
+    'agentOrchestration', saycodePromptBlocks, saycodeSystemPromptEnabled,
   );
   return {
     customSystemPrompt: customSystemPrompt
@@ -53,7 +56,7 @@ export function buildClaudeSystemPromptOptions({
       appendSystemPrompt,
       chatTitlePrompt,
       isCoAuthoredCreditEnabled ? saycodeSystemPrompt : undefined,
-      saycodeSystemPromptEnabled !== false ? agentOrchestrationPrompt : undefined,
+      isAgentOrchestrationEnabled ? agentOrchestrationPrompt : undefined,
       orchestratorPrompt,
       isWorkerDelegationEnabled ? workerDelegationPrompt : undefined,
       connectorGuidance,

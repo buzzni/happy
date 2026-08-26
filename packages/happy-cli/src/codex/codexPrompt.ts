@@ -1,5 +1,9 @@
-import type { PermissionMode } from '@/api/types';
+import type { MessageMeta, PermissionMode } from '@/api/types';
 import { CHANGE_TITLE_INSTRUCTION } from '@/gemini/constants';
+import {
+    isSaycodePromptBlockEnabled,
+    type SaycodePromptBlockOverrides,
+} from '@/prompt/promptProvenance';
 import { hashObject } from '@/utils/deterministicJson';
 
 import type { ReasoningEffort } from './codexAppServerTypes';
@@ -11,8 +15,31 @@ export interface CodexEnhancedMode {
     appendSystemPrompt?: string;
     /** Explicit policy for Saycode-owned instructions. Missing preserves legacy enabled behavior. */
     saycodeSystemPromptEnabled?: boolean;
+    /** Per-block overrides; default-on blocks do not inherit the master policy. */
+    saycodePromptBlocks?: SaycodePromptBlockOverrides;
     /** Reasoning effort passed through to Codex's sendTurnAndWait. */
     effort?: ReasoningEffort;
+}
+
+// Keep this identifier and array form stable: Desktop's staged-runtime guard also
+// recognizes it in the bundled CLI while older Happy releases still need patching.
+const VALID_REMOTE_EFFORTS: readonly ReasoningEffort[] = [
+    'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
+];
+
+export function isSupportedCodexReasoningEffort(value: unknown): value is ReasoningEffort {
+    return typeof value === 'string' && VALID_REMOTE_EFFORTS.includes(value as ReasoningEffort);
+}
+
+export function resolveCodexSaycodePromptBlocks(
+    current: CodexEnhancedMode['saycodePromptBlocks'],
+    meta: Pick<MessageMeta, 'saycodePromptBlocks'> | undefined,
+): CodexEnhancedMode['saycodePromptBlocks'] {
+    if (!Object.prototype.hasOwnProperty.call(meta ?? {}, 'saycodePromptBlocks')) {
+        return current;
+    }
+
+    return meta?.saycodePromptBlocks ?? undefined;
 }
 
 export function hashCodexEnhancedMode(mode: CodexEnhancedMode): string {
@@ -21,6 +48,7 @@ export function hashCodexEnhancedMode(mode: CodexEnhancedMode): string {
         model: mode.model,
         appendSystemPrompt: mode.appendSystemPrompt,
         saycodeSystemPromptEnabled: mode.saycodeSystemPromptEnabled,
+        saycodePromptBlocks: mode.saycodePromptBlocks,
         effort: mode.effort,
     });
 }
@@ -32,10 +60,14 @@ export function buildCodexDeveloperInstructions({
 }: {
     connectorGuidance?: string;
     agentOrchestrationPrompt?: string;
-    mode: Pick<CodexEnhancedMode, 'appendSystemPrompt' | 'saycodeSystemPromptEnabled'>;
+    mode: Pick<CodexEnhancedMode, 'appendSystemPrompt' | 'saycodeSystemPromptEnabled' | 'saycodePromptBlocks'>;
 }): string | undefined {
     const blocks = [connectorGuidance];
-    if (mode.saycodeSystemPromptEnabled !== false) {
+    if (isSaycodePromptBlockEnabled(
+        'agentOrchestration',
+        mode.saycodePromptBlocks,
+        mode.saycodeSystemPromptEnabled,
+    )) {
         blocks.push(agentOrchestrationPrompt);
     }
     if (mode.saycodeSystemPromptEnabled !== undefined) {
@@ -48,7 +80,7 @@ export function buildCodexTurnPrompt(opts: {
     message: string;
     mode: Pick<CodexEnhancedMode, 'appendSystemPrompt' | 'saycodeSystemPromptEnabled'>;
     includeAppendSystemPrompt: boolean;
-    includeTitleInstruction: boolean;
+    hasTitle: boolean;
 }): string {
     const parts: string[] = [];
 
@@ -57,7 +89,7 @@ export function buildCodexTurnPrompt(opts: {
     }
     parts.push(opts.message);
 
-    if (opts.includeTitleInstruction) {
+    if (!opts.hasTitle) {
         parts.push(CHANGE_TITLE_INSTRUCTION);
     }
 

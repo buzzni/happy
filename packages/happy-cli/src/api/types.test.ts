@@ -10,7 +10,11 @@ describe('MessageMetaSchema', () => {
   it('preserves per-block Saycode prompt overrides', () => {
     const input = {
       saycodeSystemPromptEnabled: false,
-      saycodePromptBlocks: { coAuthoredCredit: true, workerDelegation: false },
+      saycodePromptBlocks: {
+        agentOrchestration: false,
+        coAuthoredCredit: true,
+        workerDelegation: false,
+      },
     };
     expect(MessageMetaSchema.parse(input)).toEqual(input);
   });

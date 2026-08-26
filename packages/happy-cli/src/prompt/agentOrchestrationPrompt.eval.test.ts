@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildClaudeSystemPromptOptions } from '@/claude/claudePrompt';
 import { buildCodexDeveloperInstructions } from '@/codex/codexPrompt';
+import { buildGeminiTurnPrompt } from '@/gemini/geminiPrompt';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from './agentOrchestrationPrompt';
 
 const routingScenarios = [
@@ -35,28 +36,71 @@ describe('natural-language child orchestration routing eval (T14)', () => {
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Never claim that the child is visible in Desktop');
     expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Do not substitute a provider-native subagent');
   });
+
+  it('preserves explicit agent, canonical model, and effort through spawn and result collection', () => {
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain(
+      'happy agent spawn --prompt <text> --agent <agent> --model <canonical-model-id> --effort <level>',
+    );
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Do not shorten or alias the model id');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('happy agent wait <returned-session-id>');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('happy agent read <returned-session-id>');
+    const whoami = AGENT_ORCHESTRATION_SYSTEM_PROMPT.indexOf('happy agent whoami');
+    const spawn = AGENT_ORCHESTRATION_SYSTEM_PROMPT.indexOf(
+      'happy agent spawn --prompt <text> --agent <agent> --model <canonical-model-id> --effort <level>',
+    );
+    const wait = AGENT_ORCHESTRATION_SYSTEM_PROMPT.indexOf('happy agent wait <returned-session-id>');
+    expect(whoami).toBeLessThan(spawn);
+    expect(spawn).toBeLessThan(wait);
+  });
+
+  it('never invents omitted spawn selections and requires a discoverable model catalog', () => {
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('include only the corresponding flags');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('Never invent an omitted agent, model, or effort');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('spawnModelOptions');
+    expect(AGENT_ORCHESTRATION_SYSTEM_PROMPT).toContain('missing from `whoami`');
+  });
 });
 
 describe.each([
   {
     provider: 'Claude',
-    compose: (enabled: boolean) => buildClaudeSystemPromptOptions({
+    compose: (enabled: boolean, agentOrchestration?: boolean) => buildClaudeSystemPromptOptions({
       saycodeSystemPrompt: '',
       agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
       saycodeSystemPromptEnabled: enabled,
+      saycodePromptBlocks: agentOrchestration === undefined ? undefined : { agentOrchestration },
     }).appendSystemPrompt,
   },
   {
     provider: 'Codex',
-    compose: (enabled: boolean) => buildCodexDeveloperInstructions({
+    compose: (enabled: boolean, agentOrchestration?: boolean) => buildCodexDeveloperInstructions({
       agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
-      mode: { saycodeSystemPromptEnabled: enabled },
+      mode: {
+        saycodeSystemPromptEnabled: enabled,
+        saycodePromptBlocks: agentOrchestration === undefined ? undefined : { agentOrchestration },
+      },
+    }),
+  },
+  {
+    provider: 'Gemini',
+    compose: (enabled: boolean, agentOrchestration?: boolean) => buildGeminiTurnPrompt({
+      userText: 'USER',
+      agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
+      saycodeSystemPromptEnabled: enabled,
+      saycodePromptBlocks: agentOrchestration === undefined ? undefined : { agentOrchestration },
+      isNewSession: true,
+      hasTitle: true,
     }),
   },
 ])('$provider orchestration prompt lifecycle (T13, T15)', ({ compose }) => {
-  it('injects the common block on create/resume and removes it after prompt-off', () => {
+  it('injects the common block independently from the master setting', () => {
     expect(compose(true)).toContain('happy agent whoami');
-    expect(compose(false) ?? '').not.toContain('happy agent');
+    expect(compose(false)).toContain('happy agent whoami');
+  });
+
+  it('removes the common block only after its explicit block toggle is off', () => {
+    expect(compose(true, false) ?? '').not.toContain('happy agent');
+    expect(compose(false, false) ?? '').not.toContain('happy agent');
   });
 
   it.each([

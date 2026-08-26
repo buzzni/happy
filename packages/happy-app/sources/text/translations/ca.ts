@@ -194,12 +194,14 @@ export const ca: TranslationStructure = {
 
     settingsFeatures: {
         saycodeGroupTitle: "Instruccions de Saycode",
-        saycodeGroupFooter: "La generació del títol del xat està sempre activa i no es pot desactivar: és el que permet retrobar una conversa a la llista.",
+        saycodeGroupFooter: "Les crides a Agent fill i la delegació interna de tasques estan activades per defecte encara que les instruccions de Saycode estiguin desactivades. La generació del títol del xat està sempre activa.",
         saycodeMaster: "Utilitza les instruccions de Saycode",
         saycodeMasterSubtitle: "Instruccions de comportament que afegeix Saycode. Els teus prompts, instruccions de projecte i skills sempre es conserven.",
         saycodeBlockOptionsGuidance: "Opcions de resposta",
         saycodeBlockOptionsGuidanceSubtitle: "Permet a l'agent oferir opcions de resposta seleccionables.",
-        saycodeBlockWorkerDelegation: "Delegació de feina",
+        saycodeBlockAgentOrchestration: "Crides a Agent fill",
+        saycodeBlockAgentOrchestrationSubtitle: "Delega sol·licituds en llenguatge natural a una sessió independent d'Agent fill i en recull el resultat.",
+        saycodeBlockWorkerDelegation: "Delegació interna de tasques",
         saycodeBlockWorkerDelegationSubtitle: "Delega la feina mecànica a un agent worker més econòmic.",
         saycodeBlockAxBase: "Flux de treball des de la planificació",
         saycodeBlockAxBaseSubtitle: "Aplica les instruccions base del flux AX.",

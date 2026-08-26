@@ -13,6 +13,7 @@ import {
  */
 export const MOBILE_SAYCODE_BLOCK_IDS = [
     'optionsGuidance',
+    'agentOrchestration',
     'workerDelegation',
     'axBase',
     'coAuthoredCredit',
@@ -43,6 +44,12 @@ export const MOBILE_SAYCODE_PROMPT_BLOCKS: readonly MobileSaycodePromptBlock[] =
         layer: 'app-composed',
         titleKey: 'settingsFeatures.saycodeBlockOptionsGuidance',
         subtitleKey: 'settingsFeatures.saycodeBlockOptionsGuidanceSubtitle',
+    },
+    {
+        id: 'agentOrchestration',
+        layer: 'cli-wire',
+        titleKey: 'settingsFeatures.saycodeBlockAgentOrchestration',
+        subtitleKey: 'settingsFeatures.saycodeBlockAgentOrchestrationSubtitle',
     },
     {
         id: 'workerDelegation',
@@ -98,7 +105,17 @@ export function buildSaycodeTurnMeta({
     for (const block of MOBILE_SAYCODE_PROMPT_BLOCKS) {
         if (block.layer !== 'cli-wire') continue;
         const value = overrides?.[block.id];
-        if (typeof value === 'boolean') cliWire[block.id] = value;
+        if (typeof value === 'boolean') {
+            cliWire[block.id] = value;
+            continue;
+        }
+        const enabled = resolveSaycodePromptBlockEnabled({
+            blockId: block.id,
+            overrides,
+            preference,
+            surface,
+        });
+        if (enabled !== saycodeSystemPromptEnabled) cliWire[block.id] = enabled;
     }
     const appendSystemPrompt = resolveSaycodeAppendSystemPrompt({
         enabled: optionsGuidanceEnabled,

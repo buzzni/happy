@@ -180,12 +180,14 @@ export const ru: TranslationStructure = {
 
     settingsFeatures: {
         saycodeGroupTitle: "Инструкции Saycode",
-        saycodeGroupFooter: "Генерация названия чата всегда включена и не может быть отключена — именно она позволяет снова найти разговор в списке.",
+        saycodeGroupFooter: "Вызов дочернего Agent и внутреннее делегирование задач включены по умолчанию, даже если инструкции Saycode отключены. Генерация названия чата всегда включена.",
         saycodeMaster: "Использовать инструкции Saycode",
         saycodeMasterSubtitle: "Поведенческие инструкции, добавляемые Saycode. Ваши собственные промпты, инструкции проекта и навыки всегда сохраняются.",
         saycodeBlockOptionsGuidance: "Варианты ответа",
         saycodeBlockOptionsGuidanceSubtitle: "Позволяет агенту предлагать нажимаемые варианты ответа.",
-        saycodeBlockWorkerDelegation: "Делегирование работы",
+        saycodeBlockAgentOrchestration: "Вызов дочернего Agent",
+        saycodeBlockAgentOrchestrationSubtitle: "Передаёт запросы на естественном языке независимой сессии дочернего Agent и собирает результат.",
+        saycodeBlockWorkerDelegation: "Внутреннее делегирование задач",
         saycodeBlockWorkerDelegationSubtitle: "Передаёт механическую работу более дешёвому агенту worker.",
         saycodeBlockAxBase: "Рабочий процесс от планирования",
         saycodeBlockAxBaseSubtitle: "Применяет базовые инструкции процесса AX.",

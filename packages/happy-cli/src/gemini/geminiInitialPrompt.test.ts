@@ -33,6 +33,20 @@ describe('Gemini recovered initial prompt', () => {
     expect(env).not.toHaveProperty('HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED');
   });
 
+  it('carries the daemon model seed into the first Gemini mode and consumes spawn selections once', () => {
+    const env: NodeJS.ProcessEnv = {
+      HAPPY_INITIAL_MODEL: ' gemini-3.1-pro-preview ',
+      HAPPY_INITIAL_EFFORT: 'high',
+    };
+
+    expect(prepareGeminiInitialPrompt(env)).toEqual({
+      prompt: null,
+      model: 'gemini-3.1-pro-preview',
+    });
+    expect(env).not.toHaveProperty('HAPPY_INITIAL_MODEL');
+    expect(env).not.toHaveProperty('HAPPY_INITIAL_EFFORT');
+  });
+
   it('publishes and queues the recovered user turn only once', () => {
     const prepared = prepareGeminiInitialPrompt({
       HAPPY_INITIAL_PROMPT: 'recover this turn',
@@ -75,14 +89,13 @@ describe('Gemini recovered initial prompt', () => {
 });
 
 describe('HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS hygiene', () => {
-  it('consumes the block seed even though Gemini never uses it', () => {
-    // Every HAPPY_INITIAL_* seed is consume-once: a backend that ignores a seed
-    // must still delete it, or the value leaks into every child process this
-    // session spawns.
+  it('carries the block seed into the first Gemini mode and consumes it once', () => {
     const env: NodeJS.ProcessEnv = {
       HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS: '{"workerDelegation":false}',
     };
-    prepareGeminiInitialPrompt(env);
+    expect(prepareGeminiInitialPrompt(env).saycodePromptBlocks).toEqual({
+      workerDelegation: false,
+    });
     expect(env).not.toHaveProperty('HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS');
   });
 });

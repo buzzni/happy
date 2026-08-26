@@ -24,7 +24,7 @@ export interface EnhancedMode {
     customSystemPrompt?: string;
     appendSystemPrompt?: string;
     saycodeSystemPromptEnabled?: boolean;
-    /** Per-block overrides; a block with no override inherits saycodeSystemPromptEnabled. */
+    /** Per-block overrides; default-on blocks stay enabled, while other missing blocks inherit the master. */
     saycodePromptBlocks?: SaycodePromptBlockOverrides;
     allowedTools?: string[];
     disallowedTools?: string[];

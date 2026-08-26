@@ -194,12 +194,14 @@ export const zhHant: TranslationStructure = {
 
     settingsFeatures: {
         saycodeGroupTitle: "Saycode 指令",
-        saycodeGroupFooter: "聊天標題產生一律開啟且無法關閉——它讓您能在聊天清單中重新找到對話。",
+        saycodeGroupFooter: "即使關閉 Saycode 指令，子 Agent 呼叫與內部任務委派仍會預設開啟。聊天標題產生一律開啟且無法關閉。",
         saycodeMaster: "使用 Saycode 指令",
         saycodeMasterSubtitle: "Saycode 新增的行為指令。您自己的提示詞、專案指令與技能一律保留。",
         saycodeBlockOptionsGuidance: "回答選項",
         saycodeBlockOptionsGuidanceSubtitle: "讓智慧代理提供可點選的回答選項。",
-        saycodeBlockWorkerDelegation: "工作委派",
+        saycodeBlockAgentOrchestration: "子 Agent 呼叫",
+        saycodeBlockAgentOrchestrationSubtitle: "將自然語言請求委派給獨立的子 Agent 工作階段並收集結果。",
+        saycodeBlockWorkerDelegation: "內部任務委派",
         saycodeBlockWorkerDelegationSubtitle: "將機械性工作交給較廉價的 worker 代理。",
         saycodeBlockAxBase: "從規劃開始的工作流程",
         saycodeBlockAxBaseSubtitle: "套用 AX 工作流程的基礎指令。",

@@ -48,6 +48,7 @@ import {
   prepareGeminiSessionStart,
 } from '@/gemini/geminiInitialPrompt';
 import { resolveSaycodeAppendSystemPromptForMessage } from '@/prompt/promptProvenance';
+import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
 import {
   readGeminiLocalConfig,
   saveGeminiModelToConfig,
@@ -215,10 +216,11 @@ export async function runGemini(opts: {
 
   // Track current overrides to apply per message
   let currentPermissionMode: PermissionMode | undefined = undefined;
-  let currentModel: string | undefined = undefined;
+  let currentModel: string | undefined = preparedInitialPrompt.model;
   let currentAppendSystemPrompt = preparedInitialPrompt.appendSystemPrompt;
   let currentSaycodeSystemPromptEnabled =
     preparedInitialPrompt.saycodeSystemPromptEnabled;
+  let currentSaycodePromptBlocks = preparedInitialPrompt.saycodePromptBlocks;
 
   session.onUserMessage((message) => {
     // Resolve permission mode (validate) - same as Codex
@@ -276,6 +278,9 @@ export async function runGemini(opts: {
     if (message.meta?.hasOwnProperty('saycodeSystemPromptEnabled')) {
       currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
     }
+    if (message.meta?.hasOwnProperty('saycodePromptBlocks')) {
+      currentSaycodePromptBlocks = message.meta.saycodePromptBlocks ?? undefined;
+    }
     currentAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
       current: currentAppendSystemPrompt,
       incoming: message.meta?.appendSystemPrompt,
@@ -289,6 +294,7 @@ export async function runGemini(opts: {
       originalUserMessage, // Store original message separately
       appendSystemPrompt: currentAppendSystemPrompt,
       saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+      saycodePromptBlocks: currentSaycodePromptBlocks,
     };
     messageQueue.push(originalUserMessage, mode);
 
@@ -308,6 +314,7 @@ export async function runGemini(opts: {
         originalUserMessage: prompt,
         appendSystemPrompt: currentAppendSystemPrompt,
         saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+        saycodePromptBlocks: currentSaycodePromptBlocks,
       });
       conversationHistory.addUserMessage(prompt);
     },
@@ -595,8 +602,6 @@ export async function runGemini(opts: {
   let isResponseInProgress = false;
   let currentResponseMessageId: string | null = null; // Track the message ID for current response
   let hadToolCallInTurn = false; // Track if any tool calls happened in this turn (for task_complete)
-  let pendingChangeTitle = false; // Track if we're waiting for change_title to complete
-  let changeTitleCompleted = false; // Track if change_title was completed in this turn
   let taskStartedSent = false; // Track if task_started was sent this turn (prevent duplicates)
 
   /**
@@ -741,14 +746,6 @@ export async function runGemini(opts: {
         break;
 
       case 'tool-result':
-        // Track change_title completion
-        if (msg.toolName === 'change_title' || 
-            msg.callId?.includes('change_title') ||
-            msg.toolName === 'happy__change_title') {
-          changeTitleCompleted = true;
-          logger.debug('[gemini] change_title completed');
-        }
-        
         // Show tool result in UI like Codex does
         // Check if result contains error information
         const isError = msg.result && typeof msg.result === 'object' && 'error' in msg.result;
@@ -1123,12 +1120,6 @@ export async function runGemini(opts: {
         hadToolCallInTurn = false;
         taskStartedSent = false; // Reset so new turn can send task_started
 
-        // Track if this prompt contains change_title instruction
-        // If so, don't send task_complete until change_title is completed
-        pendingChangeTitle = message.message.includes('change_title') ||
-                             message.message.includes('happy__change_title');
-        changeTitleCompleted = false;
-        
         if (!geminiBackend || !acpSessionId) {
           throw new Error('Gemini backend or session not initialized');
         }
@@ -1136,8 +1127,12 @@ export async function runGemini(opts: {
         const promptToSend = buildGeminiTurnPrompt({
           userText: message.message,
           appendSystemPrompt: message.mode.appendSystemPrompt,
+          agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
+          saycodeSystemPromptEnabled: message.mode.saycodeSystemPromptEnabled,
+          saycodePromptBlocks: message.mode.saycodePromptBlocks,
           previousConversationContext,
           isNewSession: startedNewBackendSession,
+          hasTitle: session.hasTitle(),
         });
         if (previousConversationContext) {
           logger.debug(`[gemini] Injected conversation history context (${previousConversationContext.length} chars)`);
@@ -1340,8 +1335,6 @@ export async function runGemini(opts: {
         
         // Reset tracking flags
         hadToolCallInTurn = false;
-        pendingChangeTitle = false;
-        changeTitleCompleted = false;
         taskStartedSent = false;
         
         thinking = false;

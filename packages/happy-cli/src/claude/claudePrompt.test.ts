@@ -26,7 +26,7 @@ describe('buildClaudeSystemPromptOptions', () => {
   it('removes only Saycode-owned blocks when disabled, keeping the chat title instruction', () => {
     expect(buildClaudeSystemPromptOptions({ ...input, saycodeSystemPromptEnabled: false })).toEqual({
       customSystemPrompt: 'USER CUSTOM\n\nCHAT TITLE',
-      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nORCHESTRATOR\n\nCONNECTOR FACTS',
+      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nAGENT ORCHESTRATION: happy agent spawn\n\nORCHESTRATOR\n\nWORKER DELEGATION\n\nCONNECTOR FACTS',
     });
   });
 });
@@ -50,8 +50,18 @@ describe('buildClaudeSystemPromptOptions with per-block overrides', () => {
       saycodePromptBlocks: { coAuthoredCredit: true },
     })).toEqual({
       customSystemPrompt: 'USER CUSTOM\n\nCHAT TITLE\n\nSAYCODE BASE',
-      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nORCHESTRATOR\n\nCONNECTOR FACTS',
+      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nAGENT ORCHESTRATION: happy agent spawn\n\nORCHESTRATOR\n\nWORKER DELEGATION\n\nCONNECTOR FACTS',
     });
+  });
+
+  it('removes child-session routing only when its block is explicitly off', () => {
+    expect(buildClaudeSystemPromptOptions({
+      ...input,
+      saycodeSystemPromptEnabled: false,
+      saycodePromptBlocks: { agentOrchestration: false },
+    }).appendSystemPrompt).toBe(
+      'CLIENT APPEND\n\nCHAT TITLE\n\nORCHESTRATOR\n\nWORKER DELEGATION\n\nCONNECTOR FACTS',
+    );
   });
 
   it('drops only the overridden-off block when the legacy value is on', () => {
