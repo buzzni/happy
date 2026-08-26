@@ -1619,6 +1619,60 @@ describe('runServerAutomationTick', () => {
     expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('queue-empty'))
   })
 
+  // 2026-08-26 프로덕션 — 서버가 dispatch 를 정상적으로 돌려줬는데(pr_review.v1,
+  // scriptCommand 없음) worker 가 스폰되지 않았고 데몬 로그에 아무 흔적도 없었다.
+  // spawnSession 이 반환하는 error 를 이 실행기가 완전히 버리고 있었다 — 사유를
+  // 아는 코드가 그것을 버리는 같은 패턴이 dispatch 이후 spawn 단계에도 있었다.
+  it('logs the spawn error instead of silently discarding it after a successful dispatch', async () => {
+    const {
+      input, store, queryGithubPullRequests, dispatchAgentTask, spawnSession, logDebug,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review safely', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      pullRequests: [{
+        number: 17, title: 'Review me', url: 'https://github.test/o/r/pull/17', author: { login: 'alice' },
+        baseRefName: 'main', headRefName: 'feature/review', isDraft: false, state: 'OPEN', mergedAt: null,
+        labels: [], changedFiles: 1, files: [{ path: 'src/index.ts' }],
+      }],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'task-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret', targetSessionId: null,
+        input: { prNumber: 17 }, context: [], controlUrl: 'https://studio.example/api/agent-tasks',
+      },
+    })
+    spawnSession.mockResolvedValue({ ok: false, error: 'directory does not exist' })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'ERROR' },
+    ])
+
+    expect(store.state().githubTriggers?.[0]?.state.processed).toContain('17:opened')
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('directory does not exist'))
+  })
+
   it('leaves a GitHub event pending when the AgentTask bridge fails', async () => {
     const { input, store, queryGithubPullRequests, dispatchAgentTask, spawnSession } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },

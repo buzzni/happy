@@ -1163,6 +1163,13 @@ async function executeStartedRun(
       ) ?? degradedCode
     }
   }
+  if (!spawned.ok) {
+    // 사유를 아는 코드가 그것을 버리던 자리 — 서버가 dispatch 를 정상적으로
+    // 돌려줘도(스크립트 게이트도, 커넥터 preflight 도 통과해도) spawnSession
+    // 자체가 실패하면 그 error 가 여기서 완전히 사라졌다. 프로덕션에서 dispatch
+    // 는 성공했는데 worker 가 하나도 안 뜨고 로그도 없는 상태로 관측됐다.
+    input.logDebug?.(`[server-automation] ${automation.automationId} spawn failed: ${spawned.error}`)
+  }
   return spawned.ok
     ? {
         outcome: 'WOKE',
