@@ -20,6 +20,10 @@ vi.mock('./controlClient', () => ({
 
 vi.mock('@/utils/spawnHappyCLI', () => ({
   spawnHappyCLI: mocks.mockSpawnHappyCLI,
+  // Keep in sync with the module's exports: this factory replaces the whole
+  // module, so any export ensureDaemonRunning starts using must be listed here
+  // or the call throws at runtime instead of failing a meaningful assertion.
+  captureSpawnOutputStdio: () => 'ignore',
 }))
 
 import { ensureDaemonRunning } from './ensureDaemonRunning'
