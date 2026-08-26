@@ -15,9 +15,9 @@ export type PromptProvenance =
  * guidance: `saycodeSystemPromptEnabled: false` never removes them. The chat
  * title instruction is the only current member — every client's chat list
  * depends on the `change_title` tool actually being called, and that tool
- * stays registered even when Saycode prompts are off (see claudePrompt.ts /
- * codexPrompt.ts). Settings UI should render `always-on` blocks as
- * non-toggleable and say so, rather than omitting them from the list.
+ * stays registered even when Saycode prompts are off (see claudePrompt.ts,
+ * codexPrompt.ts, and geminiPrompt.ts). Settings UI should render `always-on`
+ * blocks as non-toggleable and say so, rather than omitting them from the list.
  */
 export const PROMPT_BLOCK_PROVENANCE = {
   'common:agent-orchestration': 'saycode',
@@ -31,6 +31,7 @@ export const PROMPT_BLOCK_PROVENANCE = {
   'claude:ax-dynamic-context': 'selected-feature',
   'codex:title': 'always-on',
   'codex:connector-guidance': 'operational',
+  'gemini:title': 'always-on',
   'client:append-system-prompt': 'client-composed',
 } as const satisfies Record<string, PromptProvenance>;
 
@@ -70,8 +71,8 @@ export function resolveSaycodeAppendSystemPromptForMessage(input: {
 }
 
 /**
- * Individually toggleable Saycode-owned prompt blocks. `claude:title` /
- * `codex:title` are deliberately excluded — they are `always-on` (see
+ * Individually toggleable Saycode-owned prompt blocks. Provider title blocks
+ * are deliberately excluded — they are `always-on` (see
  * PROMPT_BLOCK_PROVENANCE) and never represented as a preference here.
  */
 export type SaycodePromptBlockName =

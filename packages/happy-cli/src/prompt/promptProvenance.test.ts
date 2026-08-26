@@ -10,7 +10,7 @@ import {
 } from './promptProvenance';
 
 describe('prompt provenance inventory', () => {
-  it('classifies every current Claude, Codex, and client-composed block', () => {
+  it('classifies every current provider and client-composed block', () => {
     expect(PROMPT_BLOCK_PROVENANCE).toEqual({
       'common:agent-orchestration': 'saycode',
       'claude:title': 'always-on',
@@ -23,6 +23,7 @@ describe('prompt provenance inventory', () => {
       'claude:ax-dynamic-context': 'selected-feature',
       'codex:title': 'always-on',
       'codex:connector-guidance': 'operational',
+      'gemini:title': 'always-on',
       'client:append-system-prompt': 'client-composed',
     });
   });
