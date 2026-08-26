@@ -28,11 +28,11 @@ describe('buildGeminiTurnPrompt', () => {
     expect(prompt).toContain('happy__change_title');
   });
 
-  it('preserves the legacy plain first turn when no append prompt exists', () => {
+  it('keeps the chat title instruction when no append prompt exists', () => {
     expect(buildGeminiTurnPrompt({
       userText: 'plain first turn',
       isNewSession: true,
-    })).toBe('plain first turn');
+    })).toBe(`plain first turn\n\n${CHANGE_TITLE_INSTRUCTION}`);
   });
 
   it('does not repeat session instructions on a continuing ACP session', () => {

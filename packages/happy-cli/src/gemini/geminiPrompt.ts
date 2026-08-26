@@ -24,7 +24,7 @@ export function buildGeminiTurnPrompt(input: {
     agentOrchestrationPrompt,
     input.previousConversationContext?.trim(),
     input.userText,
-    input.appendSystemPrompt ? CHANGE_TITLE_INSTRUCTION : undefined,
+    CHANGE_TITLE_INSTRUCTION,
   ].filter((block): block is string => Boolean(block)).join('\n\n');
 }
 
