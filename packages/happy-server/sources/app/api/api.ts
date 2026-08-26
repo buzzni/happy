@@ -24,6 +24,7 @@ import { feedRoutes } from "./routes/feedRoutes";
 import { internalFeedRoutes } from "./routes/internalFeedRoutes";
 import { kvRoutes } from "./routes/kvRoutes";
 import { v3SessionRoutes } from "./routes/v3SessionRoutes";
+import { sessionRewrapRoutes } from "./routes/sessionRewrapRoutes";
 import { v3SessionEventRoutes } from "./routes/v3SessionEventRoutes";
 import { projectRoutes } from "./routes/projectRoutes";
 import { projectMemberRoutes } from "./routes/projectMemberRoutes";
@@ -151,6 +152,7 @@ export async function startApi(opts: StartApiOptions = {}) {
     internalFeedRoutes(typed);
     kvRoutes(typed);
     v3SessionRoutes(typed);
+    sessionRewrapRoutes(typed);
     v3SessionEventRoutes(typed);
     projectRoutes(typed);
     projectMemberRoutes(typed);
