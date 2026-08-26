@@ -602,8 +602,6 @@ export async function runGemini(opts: {
   let isResponseInProgress = false;
   let currentResponseMessageId: string | null = null; // Track the message ID for current response
   let hadToolCallInTurn = false; // Track if any tool calls happened in this turn (for task_complete)
-  let pendingChangeTitle = false; // Track if we're waiting for change_title to complete
-  let changeTitleCompleted = false; // Track if change_title was completed in this turn
   let taskStartedSent = false; // Track if task_started was sent this turn (prevent duplicates)
 
   /**
@@ -748,14 +746,6 @@ export async function runGemini(opts: {
         break;
 
       case 'tool-result':
-        // Track change_title completion
-        if (msg.toolName === 'change_title' || 
-            msg.callId?.includes('change_title') ||
-            msg.toolName === 'happy__change_title') {
-          changeTitleCompleted = true;
-          logger.debug('[gemini] change_title completed');
-        }
-        
         // Show tool result in UI like Codex does
         // Check if result contains error information
         const isError = msg.result && typeof msg.result === 'object' && 'error' in msg.result;
@@ -1130,12 +1120,6 @@ export async function runGemini(opts: {
         hadToolCallInTurn = false;
         taskStartedSent = false; // Reset so new turn can send task_started
 
-        // Track if this prompt contains change_title instruction
-        // If so, don't send task_complete until change_title is completed
-        pendingChangeTitle = message.message.includes('change_title') ||
-                             message.message.includes('happy__change_title');
-        changeTitleCompleted = false;
-        
         if (!geminiBackend || !acpSessionId) {
           throw new Error('Gemini backend or session not initialized');
         }
@@ -1350,8 +1334,6 @@ export async function runGemini(opts: {
         
         // Reset tracking flags
         hadToolCallInTurn = false;
-        pendingChangeTitle = false;
-        changeTitleCompleted = false;
         taskStartedSent = false;
         
         thinking = false;
