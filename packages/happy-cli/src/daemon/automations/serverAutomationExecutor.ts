@@ -119,7 +119,7 @@ export interface ServerAutomationExecutorInput {
     credentialId: string
     event: AutomationAgentTaskEvent
   }) => Promise<
-    | { ok: true; dispatch: AutomationAgentTaskDispatch | null }
+    | { ok: true; dispatch: AutomationAgentTaskDispatch | null; reason?: string }
     | { ok: false; error: string }
   >
   maintainAgentTaskLease: (dispatch: AutomationAgentTaskDispatch) => void
@@ -977,9 +977,16 @@ async function executeStartedRun(
       // later local spawn failure must not enqueue the same root task again.
       persistGithubTriggerState()
       persistGithubTriggerState = null
-      if (!bridged.dispatch) return {
-        outcome: 'SKIPPED_GATE', sessionId: null, queueDepth: planned.state.pending.length,
-        ...(degradedCode ? { degradedCode } : {}),
+      if (!bridged.dispatch) {
+        // 사유를 아는 코드가 그것을 버리던 자리 — 서버가 준 reason 을 로그로
+        // 남기지 않으면 "실행했는데 아무 일도 안 일어남" 으로만 보인다.
+        if (bridged.reason) {
+          input.logDebug?.(`[server-automation] ${automation.automationId} AgentTask dispatch empty: ${bridged.reason}`)
+        }
+        return {
+          outcome: 'SKIPPED_GATE', sessionId: null, queueDepth: planned.state.pending.length,
+          ...(degradedCode ? { degradedCode } : {}),
+        }
       }
       agentTaskDispatch = bridged.dispatch
       prompt = buildAgentTaskPrompt(bridged.dispatch, payload.prompt)

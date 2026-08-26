@@ -1574,6 +1574,51 @@ describe('runServerAutomationTick', () => {
     expect(maintainAgentTaskLease).not.toHaveBeenCalled()
   })
 
+  // 2026-08-26 프로덕션 — 서버가 dispatch:null 과 함께 사유를 보내기 시작했는데
+  // 이 실행기가 그걸 로그로 남기지 않으면 데몬 로그에는 여전히 아무것도 안 남고
+  // "실행했는데 아무 일도 안 일어남" 이 반복된다. SKIPPED_GATE 로 조용히
+  // 빠지기 전에 사유를 logDebug 로 남긴다.
+  it('logs the reason before skipping when the server explains an empty dispatch', async () => {
+    const { input, store, queryGithubPullRequests, dispatchAgentTask, spawnSession, logDebug } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review safely', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      pullRequests: [{
+        number: 17, title: 'Review me', url: 'https://github.test/o/r/pull/17', author: { login: 'alice' },
+        baseRefName: 'main', headRefName: 'feature/review', isDraft: false, state: 'OPEN', mergedAt: null,
+        labels: [], changedFiles: 1, files: [{ path: 'src/index.ts' }],
+      }],
+    })
+    dispatchAgentTask.mockResolvedValue({ ok: true, dispatch: null, reason: 'queue-empty' })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'SKIPPED_GATE' },
+    ])
+
+    expect(store.state().githubTriggers?.[0]?.state.processed).toContain('17:opened')
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('queue-empty'))
+  })
+
   it('leaves a GitHub event pending when the AgentTask bridge fails', async () => {
     const { input, store, queryGithubPullRequests, dispatchAgentTask, spawnSession } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
