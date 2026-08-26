@@ -92,6 +92,48 @@ describe('syncPendingAccountSettings', () => {
         });
     });
 
+    it('preserves a concurrently changed block when retrying a different block change', async () => {
+        const serverSettings = JSON.stringify({
+            ...settingsDefaults,
+            saycodePromptBlocks: { agentOrchestration: false },
+        });
+        const fetchImpl = vi.fn()
+            .mockResolvedValueOnce({
+                json: async () => ({
+                    success: false,
+                    error: 'version-mismatch',
+                    currentVersion: 8,
+                    currentSettings: serverSettings,
+                }),
+            })
+            .mockResolvedValueOnce({ json: async () => ({ success: true, version: 9 }) });
+        let snapshot = {
+            settings: { ...settingsDefaults },
+            settingsVersion: 7 as number | null,
+            pending: { saycodePromptBlocks: { workerDelegation: false } },
+        };
+
+        await syncPendingAccountSettings({
+            apiBaseUrl: 'https://happy.example',
+            personalToken: 'personal-token',
+            clientId: 'mobile',
+            fetchImpl,
+            encryptSettings: async settings => JSON.stringify(settings),
+            decryptSettings: async settings => JSON.parse(settings),
+            getSnapshot: () => snapshot,
+            onConflict: ({ settings, version }) => {
+                snapshot = { ...snapshot, settings, settingsVersion: version };
+            },
+            onSuccess: vi.fn(),
+        });
+
+        const retryRequest = JSON.parse(fetchImpl.mock.calls[1][1].body);
+        expect(JSON.parse(retryRequest.settings).saycodePromptBlocks).toEqual({
+            agentOrchestration: false,
+            workerDelegation: false,
+        });
+    });
+
     it('stops after the bounded number of version conflicts', async () => {
         const fetchImpl = vi.fn().mockResolvedValue({
             json: async () => ({

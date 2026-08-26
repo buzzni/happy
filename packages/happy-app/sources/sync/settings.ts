@@ -216,9 +216,28 @@ export function settingsParse(settings: unknown): Settings {
 // NOTE: May be something more sophisticated here around defaults and merging, but for now this is fine.
 //
 
+/**
+ * Merges one settings delta while preserving independently changed prompt blocks.
+ * Most settings are scalar and keep last-write-wins semantics; the block map is a
+ * collection of independent preferences, so a sparse delta must merge by block id.
+ */
+export function mergeSettingsDelta<T extends Partial<Settings>>(
+    settings: T,
+    delta: Partial<Settings>,
+): T & Partial<Settings> {
+    const result = { ...settings, ...delta };
+    if (delta.saycodePromptBlocks !== undefined) {
+        result.saycodePromptBlocks = {
+            ...(settings.saycodePromptBlocks ?? {}),
+            ...delta.saycodePromptBlocks,
+        };
+    }
+    return result;
+}
+
 export function applySettings(settings: Settings, delta: Partial<Settings>): Settings {
     // Original behavior: start with settings, apply delta, fill in missing with defaults
-    const result = { ...settings, ...delta };
+    const result = mergeSettingsDelta(settings, delta);
 
     // Fill in any missing fields with defaults
     Object.keys(settingsDefaults).forEach(key => {

@@ -22,7 +22,7 @@ import { syncCurrentPushToken } from './pushRegistration';
 import { Platform, AppState, type AppStateStatus } from 'react-native';
 import { isRunningOnMac } from '@/utils/platform';
 import { NormalizedMessage, normalizeRawMessage, RawRecord } from './typesRaw';
-import { applySettings, Settings, settingsDefaults, settingsParse, SUPPORTED_SCHEMA_VERSION } from './settings';
+import { applySettings, mergeSettingsDelta, Settings, settingsDefaults, settingsParse, SUPPORTED_SCHEMA_VERSION } from './settings';
 import { syncPendingAccountSettings } from './accountSettingsSync';
 import { Profile, profileParse } from './profile';
 import { loadPendingSettings, savePendingSettings } from './persistence';
@@ -760,7 +760,7 @@ class Sync {
         storage.getState().applySettingsLocal(delta);
 
         // Save pending settings
-        this.pendingSettings = { ...this.pendingSettings, ...delta };
+        this.pendingSettings = mergeSettingsDelta(this.pendingSettings, delta);
         savePendingSettings(this.pendingSettings);
 
         // Sync PostHog opt-out state if it was changed

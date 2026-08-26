@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
     settingsParse,
     applySettings,
+    mergeSettingsDelta,
     resolveSaycodeAppendSystemPrompt,
     resolveSaycodePromptBlockEnabled,
     resolveSaycodeSystemPromptEnabled,
@@ -328,6 +329,33 @@ describe('settings', () => {
             });
             expect(parsed.viewInline).toBe(true);
             expect(parsed.saycodePromptBlocks).toEqual({});
+        });
+
+        it('merges a sparse block delta without erasing other block choices', () => {
+            const current = {
+                ...settingsDefaults,
+                saycodePromptBlocks: { agentOrchestration: false },
+            };
+
+            expect(applySettings(current, {
+                saycodePromptBlocks: { workerDelegation: false },
+            }).saycodePromptBlocks).toEqual({
+                agentOrchestration: false,
+                workerDelegation: false,
+            });
+        });
+
+        it('accumulates consecutive sparse block deltas in the pending map', () => {
+            const first = mergeSettingsDelta({}, {
+                saycodePromptBlocks: { agentOrchestration: false },
+            });
+
+            expect(mergeSettingsDelta(first, {
+                saycodePromptBlocks: { workerDelegation: false },
+            }).saycodePromptBlocks).toEqual({
+                agentOrchestration: false,
+                workerDelegation: false,
+            });
         });
     });
 

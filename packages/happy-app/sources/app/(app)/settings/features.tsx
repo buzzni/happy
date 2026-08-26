@@ -3,7 +3,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { Item } from '@/components/Item';
 import { ItemGroup } from '@/components/ItemGroup';
 import { ItemList } from '@/components/ItemList';
-import { storage, useSettingMutable, useLocalSettingMutable } from '@/sync/storage';
+import { useSettingMutable, useLocalSettingMutable } from '@/sync/storage';
 import {
     MOBILE_SAYCODE_PROMPT_BLOCKS,
 } from '@/sync/saycodeTurnMeta';
@@ -217,11 +217,6 @@ export default function FeaturesSettingsScreen() {
                                     surface: saycodeSurface,
                                 })}
                                 onValueChange={(enabled) => setSaycodePromptBlocks({
-                                    // Spread the freshest stored map, not the rendered
-                                    // one: two toggles in the same frame would otherwise
-                                    // each spread the pre-render map and the second
-                                    // write would silently drop the first.
-                                    ...storage.getState().settings.saycodePromptBlocks,
                                     [block.id]: enabled,
                                 })}
                             />
