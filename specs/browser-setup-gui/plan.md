@@ -37,6 +37,17 @@ TDD 대상(비즈니스 로직):
 `machine/[id].tsx`에 "브라우저" 섹션. UI-only이므로 새 테스트 없음
 (CLAUDE.md 프론트엔드 분류 규칙). 기존 테스트 회귀만 확인.
 
+## Phase 6 — PR #248 최신 main 통합
+
+- 최신 `main`의 launch-time CDP pipe 소유권과 요청 채널을 유지한다.
+- viewer pairing은 이미 로드된 bridge를 먼저 재사용하고, marker pairing이
+  실패한 경우에만 같은 CDP pipe로 extension reload를 시도한다.
+- PR #248의 Claude transfer 및 세션 capability 보강은 동작을 바꾸지 않고
+  최신 `main` 위에 재적용한다.
+
+검증: browser viewer/pairing, Claude transfer, persisted hydration focused unit,
+happy-cli 전체 unit/typecheck/build, PR Linux/Windows smoke CI.
+
 ## 상태
 
 - [x] Phase 1
@@ -44,3 +55,4 @@ TDD 대상(비즈니스 로직):
 - [x] Phase 3
 - [x] Phase 4
 - [x] Phase 5
+- [ ] Phase 6
