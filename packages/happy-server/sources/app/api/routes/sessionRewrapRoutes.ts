@@ -146,38 +146,43 @@ export function sessionRewrapRoutes(app: Fastify) {
             return reply.code(409).send({ error: 'not-rewrapped' });
         }
 
-        const results = await db.$transaction(async (tx) => {
-            const outcomes: { seq: number; outcome: 'applied' | 'mismatch' | 'not-found' }[] = [];
-            for (const message of messages) {
-                const existing = await tx.sessionMessage.findFirst({
-                    where: { sessionId, seq: message.seq },
-                    select: { content: true }
-                });
-                if (!existing) {
-                    outcomes.push({ seq: message.seq, outcome: 'not-found' });
-                    continue;
-                }
-                const content = existing.content as { t?: unknown; c?: unknown } | null;
-                const ciphertext = content && content.t === 'encrypted' && typeof content.c === 'string'
-                    ? content.c
-                    : null;
-                if (ciphertext === null || sha256Hex(ciphertext) !== message.expectedContentSha256) {
-                    outcomes.push({ seq: message.seq, outcome: 'mismatch' });
-                    continue;
-                }
-                await tx.sessionMessage.updateMany({
-                    where: { sessionId, seq: message.seq },
-                    data: {
-                        content: {
-                            t: 'encrypted',
-                            c: message.newContent
-                        }
-                    }
-                });
-                outcomes.push({ seq: message.seq, outcome: 'applied' });
+        // 항목별 독립 CAS — 트랜잭션 불필요(원자성 요구가 per-item 이고,
+        // 대형 세션의 긴 인터랙티브 tx 타임아웃 위험만 남는다). 읽기와
+        // 쓰기 사이의 동시 변형은 updateMany 의 content 동등 조건이 잡는다:
+        // 그 사이 값이 바뀌면 count 0 → mismatch (덮어쓰기 없음).
+        const results: { seq: number; outcome: 'applied' | 'mismatch' | 'not-found' }[] = [];
+        for (const message of messages) {
+            const existing = await db.sessionMessage.findFirst({
+                where: { sessionId, seq: message.seq },
+                select: { content: true }
+            });
+            if (!existing) {
+                results.push({ seq: message.seq, outcome: 'not-found' });
+                continue;
             }
-            return outcomes;
-        });
+            const content = existing.content as { t?: unknown; c?: unknown } | null;
+            const ciphertext = content && content.t === 'encrypted' && typeof content.c === 'string'
+                ? content.c
+                : null;
+            if (ciphertext === null || sha256Hex(ciphertext) !== message.expectedContentSha256) {
+                results.push({ seq: message.seq, outcome: 'mismatch' });
+                continue;
+            }
+            const updated = await db.sessionMessage.updateMany({
+                where: {
+                    sessionId,
+                    seq: message.seq,
+                    content: { equals: { t: 'encrypted', c: ciphertext } }
+                },
+                data: {
+                    content: {
+                        t: 'encrypted',
+                        c: message.newContent
+                    }
+                }
+            });
+            results.push({ seq: message.seq, outcome: updated.count > 0 ? 'applied' : 'mismatch' });
+        }
 
         return reply.send({ results });
     });
