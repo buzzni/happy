@@ -29,13 +29,15 @@ const { state, dbMock, resetState, seedSession, seedMessage } = vi.hoisted(() =>
     const state = {
         sessions: [] as SessionRecord[],
         messages: [] as MessageRecord[],
-        nextMessageId: 1
+        nextMessageId: 1,
+        afterMessageFindFirst: null as (() => void) | null
     };
 
     const resetState = () => {
         state.sessions = [];
         state.messages = [];
         state.nextMessageId = 1;
+        state.afterMessageFindFirst = null;
     };
 
     const seedSession = (input: Partial<SessionRecord> & Pick<SessionRecord, "id" | "accountId">) => {
@@ -97,14 +99,18 @@ const { state, dbMock, resetState, seedSession, seedMessage } = vi.hoisted(() =>
             message.sessionId === args?.where?.sessionId &&
             message.seq === args?.where?.seq
         ));
-        if (!row) return null;
-        return selectFields(row as unknown as Record<string, unknown>, args?.select);
+        const selected = row ? selectFields(row as unknown as Record<string, unknown>, args?.select) : null;
+        // 읽기와 쓰기 사이의 동시 변형 재현용 훅 — 반환값 캡처 후 실행.
+        state.afterMessageFindFirst?.();
+        return selected;
     });
 
     const sessionMessageUpdateMany = vi.fn(async (args: any) => {
+        const equalsFilter = args?.where?.content?.equals;
         const rows = state.messages.filter((message) => (
             message.sessionId === args?.where?.sessionId &&
-            message.seq === args?.where?.seq
+            message.seq === args?.where?.seq &&
+            (equalsFilter === undefined || JSON.stringify(message.content) === JSON.stringify(equalsFilter))
         ));
         for (const row of rows) {
             row.content = args.data.content;
@@ -372,6 +378,27 @@ describe("sessionRewrapRoutes", () => {
 
             expect(response.statusCode).toBe(400);
             expect(state.messages[0].content).toEqual({ t: "encrypted", c: "legacy-ct-1" });
+        });
+
+        it("reports mismatch (and does not overwrite) when the content changes between read and conditional write", async () => {
+            seedSession({ id: "s1", accountId: "u1", dataEncryptionKey: dek });
+            seedMessage({ sessionId: "s1", seq: 1, content: { t: "encrypted", c: "legacy-ct-1" } });
+            state.afterMessageFindFirst = () => {
+                state.messages[0].content = { t: "encrypted", c: "changed-under-us" };
+            };
+
+            const response = await app.inject({
+                method: "POST",
+                url: "/v3/sessions/s1/rewrap-messages",
+                headers: { "x-user-id": "u1" },
+                payload: {
+                    messages: [{ seq: 1, expectedContentSha256: sha256Hex("legacy-ct-1"), newContent: validGcmB64() }]
+                }
+            });
+
+            expect(response.statusCode).toBe(200);
+            expect(response.json()).toEqual({ results: [{ seq: 1, outcome: "mismatch" }] });
+            expect(state.messages[0].content).toEqual({ t: "encrypted", c: "changed-under-us" });
         });
 
         it("treats a message whose stored content is not the encrypted shape as mismatch", async () => {
