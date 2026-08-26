@@ -5,6 +5,7 @@
  */
 
 import type { PermissionMode } from '@/api/types';
+import type { SaycodePromptBlockOverrides } from '@/prompt/promptProvenance';
 
 /**
  * Mode configuration for Gemini messages
@@ -15,6 +16,7 @@ export interface GeminiMode {
   originalUserMessage?: string; // Original user message without system prompt
   appendSystemPrompt?: string;
   saycodeSystemPromptEnabled?: boolean;
+  saycodePromptBlocks?: SaycodePromptBlockOverrides;
 }
 
 /**

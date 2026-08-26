@@ -48,6 +48,7 @@ import {
   prepareGeminiSessionStart,
 } from '@/gemini/geminiInitialPrompt';
 import { resolveSaycodeAppendSystemPromptForMessage } from '@/prompt/promptProvenance';
+import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
 import {
   readGeminiLocalConfig,
   saveGeminiModelToConfig,
@@ -215,10 +216,11 @@ export async function runGemini(opts: {
 
   // Track current overrides to apply per message
   let currentPermissionMode: PermissionMode | undefined = undefined;
-  let currentModel: string | undefined = undefined;
+  let currentModel: string | undefined = preparedInitialPrompt.model;
   let currentAppendSystemPrompt = preparedInitialPrompt.appendSystemPrompt;
   let currentSaycodeSystemPromptEnabled =
     preparedInitialPrompt.saycodeSystemPromptEnabled;
+  let currentSaycodePromptBlocks = preparedInitialPrompt.saycodePromptBlocks;
 
   session.onUserMessage((message) => {
     // Resolve permission mode (validate) - same as Codex
@@ -276,6 +278,9 @@ export async function runGemini(opts: {
     if (message.meta?.hasOwnProperty('saycodeSystemPromptEnabled')) {
       currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
     }
+    if (message.meta?.hasOwnProperty('saycodePromptBlocks')) {
+      currentSaycodePromptBlocks = message.meta.saycodePromptBlocks ?? undefined;
+    }
     currentAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
       current: currentAppendSystemPrompt,
       incoming: message.meta?.appendSystemPrompt,
@@ -308,6 +313,7 @@ export async function runGemini(opts: {
         originalUserMessage: prompt,
         appendSystemPrompt: currentAppendSystemPrompt,
         saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+        saycodePromptBlocks: currentSaycodePromptBlocks,
       });
       conversationHistory.addUserMessage(prompt);
     },
@@ -1136,6 +1142,9 @@ export async function runGemini(opts: {
         const promptToSend = buildGeminiTurnPrompt({
           userText: message.message,
           appendSystemPrompt: message.mode.appendSystemPrompt,
+          agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
+          saycodeSystemPromptEnabled: message.mode.saycodeSystemPromptEnabled,
+          saycodePromptBlocks: message.mode.saycodePromptBlocks,
           previousConversationContext,
           isNewSession: startedNewBackendSession,
         });

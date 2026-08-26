@@ -43,6 +43,21 @@ describe('buildGeminiTurnPrompt', () => {
     })).toBe('continue');
   });
 
+  it('keeps child-session orchestration on when the master is off unless its block is explicitly off', () => {
+    const base = {
+      userText: 'delegate this',
+      agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
+      saycodeSystemPromptEnabled: false,
+      isNewSession: true,
+    };
+
+    expect(buildGeminiTurnPrompt(base)).toContain('happy agent spawn');
+    expect(buildGeminiTurnPrompt({
+      ...base,
+      saycodePromptBlocks: { agentOrchestration: false },
+    })).not.toContain('happy agent spawn');
+  });
+
   it('places prior conversation between client context and the current user turn', () => {
     const prompt = buildGeminiTurnPrompt({
       userText: 'current turn',
@@ -73,5 +88,15 @@ describe('hashGeminiMode', () => {
   it('treats an absent policy as the legacy enabled policy', () => {
     expect(hashGeminiMode({ ...base, appendSystemPrompt: 'A' }))
       .toBe(hashGeminiMode({ ...base, appendSystemPrompt: 'A', saycodeSystemPromptEnabled: true }));
+  });
+
+  it('restarts the ACP session when child orchestration is explicitly toggled', () => {
+    expect(hashGeminiMode({ ...base, saycodePromptBlocks: { agentOrchestration: true } }))
+      .not.toBe(hashGeminiMode({ ...base, saycodePromptBlocks: { agentOrchestration: false } }));
+  });
+
+  it('does not restart for an explicit value equal to the default-on orchestration policy', () => {
+    expect(hashGeminiMode(base))
+      .toBe(hashGeminiMode({ ...base, saycodePromptBlocks: { agentOrchestration: true } }));
   });
 });

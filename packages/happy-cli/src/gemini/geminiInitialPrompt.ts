@@ -2,31 +2,37 @@ import { createEnvelope, type SessionEnvelope } from '@slopus/happy-wire';
 
 import {
   consumePendingInitialAppendSystemPrompt,
+  consumePendingInitialEffort,
+  consumePendingInitialModel,
   consumePendingInitialPrompt,
   consumePendingInitialPromptLocalId,
   consumePendingInitialSaycodePromptBlocks,
   consumePendingInitialSaycodeSystemPromptEnabled,
 } from '@/utils/initialPrompt';
 import { resolveInitialSaycodeAppendSystemPrompt } from '@/prompt/promptProvenance';
+import type { SaycodePromptBlockOverrides } from '@/prompt/promptProvenance';
 
 export type PreparedGeminiInitialPrompt = {
   prompt: string | null;
+  model?: string;
   localId?: string;
   appendSystemPrompt?: string;
   saycodeSystemPromptEnabled?: boolean;
+  saycodePromptBlocks?: SaycodePromptBlockOverrides;
 };
 
 export function prepareGeminiInitialPrompt(
   env: NodeJS.ProcessEnv,
 ): PreparedGeminiInitialPrompt {
   const prompt = consumePendingInitialPrompt(env);
+  const model = consumePendingInitialModel(env);
+  // Gemini has no effort control, but every spawn seed is consume-once so it
+  // cannot leak into tools or children launched by this session.
+  consumePendingInitialEffort(env);
   const localId = consumePendingInitialPromptLocalId(env);
   const saycodeSystemPromptEnabled =
     consumePendingInitialSaycodeSystemPromptEnabled(env);
-  // Gemini doesn't gate per-block Saycode prompts, but every HAPPY_INITIAL_* seed is
-  // consume-once: an ignored seed must still be deleted or it leaks into every child
-  // process this session spawns.
-  consumePendingInitialSaycodePromptBlocks(env);
+  const saycodePromptBlocks = consumePendingInitialSaycodePromptBlocks(env);
   const appendSystemPrompt = resolveInitialSaycodeAppendSystemPrompt({
     appendSystemPrompt: consumePendingInitialAppendSystemPrompt(env),
     saycodeSystemPromptEnabled,
@@ -34,11 +40,13 @@ export function prepareGeminiInitialPrompt(
 
   return {
     prompt,
+    ...(model ? { model } : {}),
     ...(prompt && localId ? { localId } : {}),
     ...(appendSystemPrompt ? { appendSystemPrompt } : {}),
     ...(saycodeSystemPromptEnabled !== undefined
       ? { saycodeSystemPromptEnabled }
       : {}),
+    ...(saycodePromptBlocks ? { saycodePromptBlocks } : {}),
   };
 }
 
