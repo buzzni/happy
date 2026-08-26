@@ -70,3 +70,36 @@ Phase 1~4 완료. 실행 순서는 계획과 동일하되, Phase 1 이 기존 �
 
 - `daemon/automations` 18파일 **231건** 통과 (신규 13건)
 - `pnpm --filter @buzzni/happy-cli run typecheck` 통과
+
+## Phase 6 — 경로 필터 트리거의 지연 파일 조회 (AC9, AC10)
+
+**Status: Done**
+
+- `selectPathFilterCandidates` (순수 함수) 가 파일이 실제로 필요한 PR 번호를
+  고른다. `planGithubTrigger` 와 동일한 판정 순서(processed → derivesEvent →
+  경로 외 필터)를 쓰고, 경로 필터가 없거나 첫 관측이면 빈 배열이다.
+- `queryGithubPullRequestFiles` 가 후보 PR 만 `gh pr view` 로 받고,
+  `mergePullRequestFiles` 가 원본 목록에 채운다.
+- executor 는 목록을 항상 가볍게 받고(`includeChangedFiles: false`) 후보가 있을
+  때만 추가 조회한다.
+
+### 실측 (buzzni/hsmoa_backend, 후보 2건 기준)
+
+| 방식 | 소요 | 응답 |
+|---|---|---|
+| 기존 — 목록에 `files` 포함 | 3,545ms | 250KB |
+| **신규 — 가벼운 목록 + 후보 2건** | **2,025ms** | **49KB** |
+
+실제 폴링에서 후보는 보통 0~1건이라 대개 1초 안쪽이다. 후보가 0건이면 추가
+조회 자체를 하지 않는다.
+
+### 계약 변경
+
+`.138` 의 "경로 필터가 있으면 목록에 `files` 를 포함한다" 테스트는 AC9 가
+대체하므로 새 계약으로 갱신했다.
+
+### 검증
+
+- `daemon/automations` 19파일 **249건** 통과 (신규 11건)
+- `typecheck` 통과 — `run.ts` 배선 누락을 여기서 잡았다
+- 실제 `gh` 로 2단계 조회 실측 (위 표)

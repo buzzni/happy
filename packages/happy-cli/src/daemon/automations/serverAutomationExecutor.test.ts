@@ -40,6 +40,9 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     ok: true,
     pullRequests: [],
   }))
+  const queryGithubPullRequestFiles = vi.fn<
+    ServerAutomationExecutorInput['queryGithubPullRequestFiles']
+  >(async () => ({ ok: true, files: [] }))
   const queryGithubIssues = vi.fn<ServerAutomationExecutorInput['queryGithubIssues']>(async () => ({
     ok: true,
     issues: [],
@@ -100,6 +103,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     decryptPayload,
     runScript,
     queryGithubPullRequests,
+    queryGithubPullRequestFiles,
     queryGithubIssues,
     notifyGithubTrigger,
     resolveGithubIssueProgressMarkerIdentity,
@@ -117,7 +121,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     logDebug,
   }
   return {
-    input, store, transport, decryptPayload, logDebug, runScript, queryGithubPullRequests,
+    input, store, transport, decryptPayload, logDebug, runScript, queryGithubPullRequests, queryGithubPullRequestFiles,
     queryGithubIssues, notifyGithubTrigger, dispatchAgentTask, maintainAgentTaskLease,
     resolveGithubIssueProgressMarkerIdentity, createGithubIssueProgressMarker,
     removeGithubIssueProgressMarker,
@@ -1128,9 +1132,11 @@ describe('runServerAutomationTick', () => {
     expect(line!.toLowerCase()).toContain('permission')
   })
 
+  // AC9 로 계약이 바뀌었다 — 목록 조회는 경로 필터 유무와 무관하게 항상 가볍고,
+  // 파일은 이벤트를 유발하는 PR 에만 따로 받는다.
   it.each([
-    ['asks for the file list only when a path filter needs it', ['projects/api/*'], true],
-    ['skips the expensive file list when no path filter is set', [], false],
+    ['keeps the list query light even when a path filter exists', ['projects/api/*'], false],
+    ['keeps the list query light when no path filter is set', [], false],
   ])('%s', async (_label, paths, expected) => {
     const { input, queryGithubPullRequests } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
@@ -1152,6 +1158,73 @@ describe('runServerAutomationTick', () => {
     expect(queryGithubPullRequests).toHaveBeenCalledWith(
       expect.objectContaining({ includeChangedFiles: expected }),
     )
+  })
+
+  it('fetches files only for the pull requests that derive an event', async () => {
+    const { input, queryGithubPullRequests, queryGithubPullRequestFiles, store } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review {pr.number}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: ['api/'] },
+        action: 'start-session' as const, githubCredentialId: null,
+      },
+    }))
+    store.write({
+      ...store.state(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 10, processed: [], pending: [] },
+      }],
+    })
+    const row = (n: number) => ({
+      number: n, title: 't', url: 'u', author: { login: 'a' }, baseRefName: 'main',
+      headRefName: 'f', isDraft: false, state: 'OPEN' as const, mergedAt: null,
+      labels: [], changedFiles: 0, files: [],
+    })
+    queryGithubPullRequests.mockResolvedValue({ ok: true, pullRequests: [row(9), row(11)] })
+
+    await runServerAutomationTick(input)
+
+    // 목록 조회는 파일 없이, 파일은 후보 11 에만.
+    expect(queryGithubPullRequests).toHaveBeenCalledWith(
+      expect.objectContaining({ includeChangedFiles: false }),
+    )
+    expect(queryGithubPullRequestFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ numbers: [11] }),
+    )
+  })
+
+  it('does not fetch files when no pull request derives an event', async () => {
+    const { input, queryGithubPullRequests, queryGithubPullRequestFiles, store } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review {pr.number}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: ['api/'] },
+        action: 'start-session' as const, githubCredentialId: null,
+      },
+    }))
+    store.write({
+      ...store.state(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 99, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({ ok: true, pullRequests: [] })
+
+    await runServerAutomationTick(input)
+
+    expect(queryGithubPullRequestFiles).not.toHaveBeenCalled()
   })
 
   it('collects an issue baseline without firing on the first observation (fail-closed)', async () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { queryGithubPullRequests } from './queryGithubPullRequests'
+import { mergePullRequestFiles, queryGithubPullRequests } from './queryGithubPullRequests'
 import type { RunAutomationScriptInput, RunAutomationScriptResult } from './runAutomationScript'
 
 const rows = [{
@@ -284,5 +284,38 @@ describe('queryGithubPullRequests', () => {
     await queryGithubPullRequests(input)
 
     expect(input.runScript.mock.calls[0]![0].command).toContain('changedFiles,files')
+  })
+})
+
+// 경로 필터가 있는 트리거는 파일이 필요하지만, 이벤트를 유발하는 PR 에만 필요하다.
+describe('mergePullRequestFiles', () => {
+  const pr = (n: number) => ({
+    number: n, title: 't', url: 'u', author: { login: 'a' }, baseRefName: 'main',
+    headRefName: 'f', isDraft: false, state: 'OPEN' as const, mergedAt: null,
+    labels: [], changedFiles: 0, files: [],
+  })
+
+  it('fills only the requested pull requests', () => {
+    const merged = mergePullRequestFiles([pr(1), pr(2)], [
+      { number: 2, changedFiles: 3, files: [{ path: 'api/a.ts' }] },
+    ])
+
+    expect(merged.find((p) => p.number === 2)).toMatchObject({
+      changedFiles: 3, files: [{ path: 'api/a.ts' }],
+    })
+    expect(merged.find((p) => p.number === 1)).toMatchObject({ changedFiles: 0, files: [] })
+  })
+
+  it('keeps the original order and length', () => {
+    const merged = mergePullRequestFiles([pr(5), pr(3), pr(9)], [{ number: 3, changedFiles: 1, files: [] }])
+
+    expect(merged.map((p) => p.number)).toEqual([5, 3, 9])
+  })
+
+  it('ignores a detail for a pull request that is not in the list', () => {
+    const merged = mergePullRequestFiles([pr(1)], [{ number: 77, changedFiles: 9, files: [] }])
+
+    expect(merged).toHaveLength(1)
+    expect(merged[0]).toMatchObject({ number: 1, changedFiles: 0 })
   })
 })

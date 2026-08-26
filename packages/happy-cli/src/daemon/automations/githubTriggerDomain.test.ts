@@ -6,6 +6,7 @@ import {
   renderGithubIssueTriggerPrompt,
   renderGithubTriggerPrompt,
   describeGithubTriggerBaseline,
+  selectPathFilterCandidates,
 } from './githubTriggerDomain'
 
 const trigger = {
@@ -281,5 +282,68 @@ describe('describeGithubTriggerBaseline', () => {
       event: 'opened',
       observed: 7,
     })).toBeNull()
+  })
+})
+
+// files 는 이 쿼리에서 가장 비싼 필드인데(933ms → 3,506ms) 경로 검사에만 쓰인다.
+// derivesEvent 는 파일을 전혀 안 보므로, 이벤트를 유발하는 PR 에만 파일을 받으면 된다.
+describe('selectPathFilterCandidates', () => {
+  const base = { number: 0, title: 't', url: 'u', author: { login: 'a' },
+    baseRefName: 'main', headRefName: 'f', isDraft: false, state: 'OPEN' as const,
+    mergedAt: null, labels: [], changedFiles: 0, files: [] }
+  const pr = (n: number, over: Partial<typeof base> = {}) => ({ ...base, number: n, ...over })
+  const trigger = (over: Record<string, unknown> = {}) => ({
+    event: 'opened' as const,
+    filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: ['api/'] },
+    action: 'start-session' as const, githubCredentialId: null, ...over,
+  })
+  const previous = (over: Record<string, unknown> = {}) => ({
+    snapshot: [], highestPrNumber: 10, processed: [], pending: [], ...over,
+  })
+
+  it('asks for nothing when the trigger has no path filter', () => {
+    expect(selectPathFilterCandidates({
+      trigger: trigger({ filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] } }),
+      current: [pr(11)],
+      previous: previous(),
+    })).toEqual([])
+  })
+
+  it('asks for nothing on the first observation because nothing fires', () => {
+    expect(selectPathFilterCandidates({ trigger: trigger(), current: [pr(11)], previous: null })).toEqual([])
+  })
+
+  it('asks only for pull requests that derive an event', () => {
+    expect(selectPathFilterCandidates({
+      trigger: trigger(),
+      current: [pr(9), pr(10), pr(11), pr(12)],
+      previous: previous(),
+    })).toEqual([11, 12])
+  })
+
+  it('skips pull requests already processed', () => {
+    expect(selectPathFilterCandidates({
+      trigger: trigger(),
+      current: [pr(11), pr(12)],
+      previous: previous({ processed: ['11:opened'] }),
+    })).toEqual([12])
+  })
+
+  it('applies the non-path filters before asking for files', () => {
+    expect(selectPathFilterCandidates({
+      trigger: trigger({
+        filter: { baseBranch: 'release', label: null, excludeDraft: true, authors: [], paths: ['api/'] },
+      }),
+      current: [pr(11, { baseRefName: 'main' }), pr(12, { baseRefName: 'release' }), pr(13, { baseRefName: 'release', isDraft: true })],
+      previous: previous(),
+    })).toEqual([12])
+  })
+
+  it('asks for nothing on an issue trigger', () => {
+    expect(selectPathFilterCandidates({
+      trigger: trigger({ event: 'issue_opened' }),
+      current: [pr(11)],
+      previous: previous(),
+    })).toEqual([])
   })
 })
