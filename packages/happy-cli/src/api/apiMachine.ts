@@ -1276,12 +1276,18 @@ export class ApiMachineClient {
      * and the noVNC viewer. Keeping the existing runPairing sequence here
      * preserves extension injection, token storage, and debugger-tier checks.
      */
-    private async pairBrowser(cdpPort: number, debuggerTier: boolean, pairingId?: string): Promise<BrowserPairResult> {
+    private async pairBrowser(
+        cdpPort: number,
+        debuggerTier: boolean,
+        pairingId?: string,
+        forceExtensionReload?: boolean,
+    ): Promise<BrowserPairResult> {
         const cdpPipe = this.browserCdpPipes.get(cdpPort);
         const facts = await runPairing({
             cdpPort,
             debuggerTier,
             pairingId,
+            forceExtensionReload,
             ...(cdpPipe ? { browserCdpRequest: cdpPipe.request.bind(cdpPipe) } : {}),
         });
         const outcome = formatPairOutcome(facts);
@@ -1297,7 +1303,11 @@ export class ApiMachineClient {
     /** Pairing failure must not hide the login screen used to repair it. */
     private async pairViewerBrowser(cdpPort: number): Promise<ViewerBridgeSummary> {
         try {
-            const result = await this.pairBrowser(cdpPort, true, `viewer-${cdpPort}-${randomUUID()}`);
+            const pairingId = `viewer-${cdpPort}-${randomUUID()}`;
+            let result = await this.pairBrowser(cdpPort, true, pairingId, false);
+            if (!result.ok) {
+                result = await this.pairBrowser(cdpPort, true, pairingId, true);
+            }
             return result.ok
                 ? { bridgeReady: true }
                 : { bridgeReady: false, bridgeMessage: result.message };

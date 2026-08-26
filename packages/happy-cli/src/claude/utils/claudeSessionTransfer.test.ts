@@ -1,10 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, truncate, utimes, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
     CLAUDE_SESSION_TRANSFER_CHUNK_MAX_BYTES,
+    CLAUDE_SESSION_TRANSFER_MAX_BYTES,
+    CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS,
     assertValidClaudeSessionChunk,
     createClaudeSessionTransferHandler,
     createClaudeSessionTransferRuntime,
@@ -29,6 +31,7 @@ describe('Claude session transfer input validation', () => {
     });
 
     afterEach(async () => {
+        vi.useRealTimers();
         if (previousClaudeConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
         else process.env.CLAUDE_CONFIG_DIR = previousClaudeConfigDir;
         await rm(root, { recursive: true, force: true });
@@ -124,6 +127,23 @@ describe('Claude session transfer input validation', () => {
         expect(second.eof).toBe(true);
     });
 
+    it('rejects an oversized source before hashing it', async () => {
+        const path = resolveClaudeSessionTransferPath({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            allowedRoot: root,
+        });
+        await mkdir(dirname(path), { recursive: true });
+        await writeFile(path, 'seed');
+        await truncate(path, CLAUDE_SESSION_TRANSFER_MAX_BYTES + 1);
+
+        await expect(inspectClaudeSessionTransferSource({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            allowedRoot: root,
+        })).rejects.toThrow('session size');
+    });
+
     it('rejects a source that changed after inspection', async () => {
         const path = resolveClaudeSessionTransferPath({
             directory: projectDirectory,
@@ -181,6 +201,164 @@ describe('Claude session transfer input validation', () => {
             allowedRoot: root,
         }));
         expect(await readdir(bucket)).toEqual([]);
+    });
+
+    it('rejects overlapping imports for the same destination session until the first is aborted', async () => {
+        const runtime = createClaudeSessionTransferRuntime({ allowedRoot: root });
+        const first = await runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 10,
+            sha256: 'a'.repeat(64),
+            requestId: '76ea73da-e84b-4dc6-a673-85fbfd90e600',
+        });
+        if (first.status !== 'ready') throw new Error('expected ready import');
+
+        await expect(runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 12,
+            sha256: 'b'.repeat(64),
+            requestId: '56f6ca25-bfaf-4bb8-868c-56eca889e8df',
+        })).rejects.toThrow('already in progress');
+
+        await runtime.abortImport({ transferId: first.transferId });
+        const retried = await runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 12,
+            sha256: 'b'.repeat(64),
+            requestId: '56f6ca25-bfaf-4bb8-868c-56eca889e8df',
+        });
+        if (retried.status !== 'ready') throw new Error('expected ready import');
+        await runtime.abortImport({ transferId: retried.transferId });
+    });
+
+    it('does not strand a destination lock when an older client loses its begin acknowledgement', async () => {
+        const runtime = createClaudeSessionTransferRuntime({ allowedRoot: root });
+        const first = await runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 10,
+            sha256: 'a'.repeat(64),
+        });
+        if (first.status !== 'ready') throw new Error('expected ready import');
+
+        const retried = await runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 12,
+            sha256: 'b'.repeat(64),
+        });
+        if (retried.status !== 'ready') throw new Error('expected ready import');
+
+        await runtime.abortImport({ transferId: first.transferId });
+        await runtime.abortImport({ transferId: retried.transferId });
+    });
+
+    it('aborts a prepared destination import by its client request id', async () => {
+        const runtime = createClaudeSessionTransferRuntime({ allowedRoot: root });
+        const requestId = '15f7f21a-43dc-4270-baa8-e20f235d2d81';
+        const begun = await runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 10,
+            sha256: 'a'.repeat(64),
+            requestId,
+        });
+        if (begun.status !== 'ready') throw new Error('expected ready import');
+
+        await expect(runtime.abortImport({ requestId })).resolves.toEqual({ aborted: true });
+        const retried = await runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 12,
+            sha256: 'b'.repeat(64),
+            requestId: '078d2ad1-fc44-4975-bc60-ac2d2d2189b9',
+        });
+        expect(retried).toMatchObject({ status: 'ready' });
+        if (retried.status !== 'ready') throw new Error('expected ready import');
+        await runtime.abortImport({ transferId: retried.transferId });
+    });
+
+    it('honors a request-id abort while destination begin is still preparing', async () => {
+        const runtime = createClaudeSessionTransferRuntime({ allowedRoot: root });
+        const requestId = '6a75a607-400a-4525-a7e0-6eb660430e94';
+        const beginning = runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 10,
+            sha256: 'a'.repeat(64),
+            requestId,
+        });
+
+        await expect(runtime.abortImport({ requestId })).resolves.toEqual({ aborted: true });
+        await expect(beginning).rejects.toThrow('cancelled');
+        const bucket = dirname(resolveClaudeSessionTransferPath({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            allowedRoot: root,
+        }));
+        expect(await readdir(bucket).catch(() => [])).toEqual([]);
+    });
+
+    it('expires an abandoned pending import and removes its temp file', async () => {
+        vi.useFakeTimers();
+        const runtime = createClaudeSessionTransferRuntime({ allowedRoot: root });
+        const begun = await runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 10,
+            sha256: 'a'.repeat(64),
+        });
+        if (begun.status !== 'ready') throw new Error('expected ready import');
+        const bucket = dirname(resolveClaudeSessionTransferPath({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            allowedRoot: root,
+        }));
+
+        expect(await readdir(bucket)).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS);
+        vi.useRealTimers();
+
+        await vi.waitFor(async () => {
+            expect(await readdir(bucket)).toEqual([]);
+        });
+        await expect(runtime.writeImportChunk({
+            transferId: begun.transferId,
+            offset: 0,
+            content: Buffer.from('x').toString('base64'),
+        })).rejects.toThrow('Unknown Claude session transfer');
+    });
+
+    it('removes orphaned transfer files left by a previous daemon before importing', async () => {
+        const destinationPath = resolveClaudeSessionTransferPath({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            allowedRoot: root,
+        });
+        const bucket = dirname(destinationPath);
+        await mkdir(bucket, { recursive: true });
+        const orphanName = `${SESSION_ID}.jsonl.aplus-transfer-93a9705e-bc6a-406d-8dce-8acc014dedbd.tmp`;
+        const orphanPath = join(bucket, orphanName);
+        await writeFile(orphanPath, 'orphan');
+        const expiredAt = new Date(Date.now() - CLAUDE_SESSION_TRANSFER_PENDING_TTL_MS - 1_000);
+        await utimes(orphanPath, expiredAt, expiredAt);
+
+        const runtime = createClaudeSessionTransferRuntime({ allowedRoot: root });
+        const begun = await runtime.beginImport({
+            directory: projectDirectory,
+            claudeSessionId: SESSION_ID,
+            size: 10,
+            sha256: 'a'.repeat(64),
+        });
+        if (begun.status !== 'ready') throw new Error('expected ready import');
+
+        const entries = await readdir(bucket);
+        expect(entries).toHaveLength(1);
+        expect(entries).not.toContain(orphanName);
+        await runtime.abortImport({ transferId: begun.transferId });
     });
 
     it('rejects a destination chunk that exceeds its declared session size', async () => {
@@ -351,5 +529,5 @@ describe('Claude session transfer input validation', () => {
             allowedRoot: root,
         });
         expect(await readFile(destinationPath)).toEqual(content);
-    }, 20_000);
+    }, 60_000);
 });

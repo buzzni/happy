@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { encodeBase64 } from '@/api/encryption';
 import type { Metadata } from '@/api/types';
-import { hydrateTrackedSessionFromPersisted } from './persistedSessionHydration';
+import {
+  hydrateRecoveredSessionFromPersisted,
+  hydrateTrackedSessionFromPersisted,
+} from './persistedSessionHydration';
 import type { PersistedSession } from '@/persistence';
 
 const metadata = { path: '/work/repo', host: 'mac' } as unknown as Metadata;
@@ -47,6 +50,33 @@ describe('hydrateTrackedSessionFromPersisted', () => {
     expect(hydrateTrackedSessionFromPersisted(persisted({ lastProcessedSeq: 41 })).persistedLastProcessedSeq).toBe(41);
   });
 
+  it('shouldRestoreTheSaycodeAgentCapabilityAcrossDaemonRestarts', () => {
+    const agentEnvironment = {
+      SAYCODE_AGENT_ENV: '1' as const,
+      SAYCODE_AGENT_ROOT: 'root-session',
+      SAYCODE_AGENT_DEPTH: '2',
+      SAYCODE_AGENT_MAX_SPAWN: '4',
+      SAYCODE_AGENT_ID: 'worker-1',
+    };
+
+    expect(hydrateTrackedSessionFromPersisted(persisted({ agentEnvironment })).agentEnvironment)
+      .toEqual(agentEnvironment);
+  });
+
+  it('shouldValidatePersistedAgentCapabilityBeforeAddingItToTheChildEnvironment', () => {
+    const agentEnvironment = {
+      SAYCODE_AGENT_ENV: '1',
+      SAYCODE_AGENT_ROOT: 'root-session',
+      NODE_OPTIONS: '--require /tmp/untrusted.cjs',
+    } as unknown as NonNullable<PersistedSession['agentEnvironment']>;
+
+    expect(hydrateTrackedSessionFromPersisted(persisted({ agentEnvironment })).agentEnvironment)
+      .toEqual({
+        SAYCODE_AGENT_ENV: '1',
+        SAYCODE_AGENT_ROOT: 'root-session',
+      });
+  });
+
   // Callers spread this over a session that may already hold fresher values, so
   // an absent field must stay absent instead of overwriting one with undefined.
   it('shouldOmitKeysTheRecordDoesNotCarry', () => {
@@ -54,6 +84,7 @@ describe('hydrateTrackedSessionFromPersisted', () => {
 
     expect('persistedLastProcessedSeq' in hydrated).toBe(false);
     expect('userHomeDir' in hydrated).toBe(false);
+    expect('agentEnvironment' in hydrated).toBe(false);
   });
 
   // A fabricated runtime would make the idle guard treat a restored session as
@@ -61,5 +92,31 @@ describe('hydrateTrackedSessionFromPersisted', () => {
   // protection depends on runtime being absent until a real report arrives.
   it('shouldNotFabricateRuntimeState', () => {
     expect('runtime' in hydrateTrackedSessionFromPersisted(persisted({ lastProcessedSeq: 41 }))).toBe(false);
+  });
+});
+
+describe('hydrateRecoveredSessionFromPersisted', () => {
+  it('shouldValidateCapabilitiesOnTheExplicitSameSessionRecoveryPath', () => {
+    const agentEnvironment = {
+      SAYCODE_AGENT_ENV: '1',
+      SAYCODE_AGENT_ROOT: 'root-session',
+      NODE_OPTIONS: '--require /tmp/untrusted.cjs',
+    } as unknown as NonNullable<PersistedSession['agentEnvironment']>;
+
+    expect(hydrateRecoveredSessionFromPersisted(
+      persisted({
+        userHomeDir: '/tmp/happy-session-1',
+        lastProcessedSeq: 12,
+        agentEnvironment,
+      }),
+      41,
+    )).toEqual({
+      userHomeDir: '/tmp/happy-session-1',
+      persistedLastProcessedSeq: 41,
+      agentEnvironment: {
+        SAYCODE_AGENT_ENV: '1',
+        SAYCODE_AGENT_ROOT: 'root-session',
+      },
+    });
   });
 });

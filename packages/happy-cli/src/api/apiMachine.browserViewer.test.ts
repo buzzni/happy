@@ -134,6 +134,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
             cdpPort: 9222,
             debuggerTier: true,
             pairingId: expect.stringMatching(/^viewer-9222-/),
+            forceExtensionReload: false,
         })
         expect(result).toMatchObject({
             browserReady: true,
@@ -184,6 +185,49 @@ describe('ApiMachineClient browser viewer RPC', () => {
             bridgeReady: false,
         })
         expect(result.bridgeMessage).toContain('--enable-unsafe-extension-debugging')
+    })
+
+    it('reloads the extension only after marker pairing fails without a reload', async () => {
+        mockRunPairing
+            .mockResolvedValueOnce({
+                cdpPort: 9222,
+                extensionDir: '/opt/happy/browser-extension',
+                daemonRunning: true,
+                cdpReachable: true,
+                extensionLoaded: true,
+                pageOpened: true,
+                connections: [{ profile: 'work' }],
+                freshProfiles: [],
+                targetPairingId: 'viewer-9222',
+                debuggerTierRequested: true,
+            })
+            .mockResolvedValueOnce({
+                cdpPort: 9222,
+                extensionDir: '/opt/happy/browser-extension',
+                daemonRunning: true,
+                cdpReachable: true,
+                extensionLoaded: true,
+                pageOpened: true,
+                connections: [{ profile: 'work', pairingId: 'viewer-9222' }],
+                freshProfiles: [],
+                targetPairingId: 'viewer-9222',
+                debuggerTierRequested: true,
+                debuggerTierActual: true,
+            })
+        const { ApiMachineClient } = await import('./apiMachine')
+        const client = new ApiMachineClient('token', machineClient())
+        client.setRPCHandlers(rpcHandlers())
+
+        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({})
+
+        expect(mockRunPairing).toHaveBeenCalledTimes(2)
+        expect(mockRunPairing).toHaveBeenNthCalledWith(1, expect.objectContaining({
+            forceExtensionReload: false,
+        }))
+        expect(mockRunPairing).toHaveBeenNthCalledWith(2, expect.objectContaining({
+            forceExtensionReload: true,
+        }))
+        expect(result).toMatchObject({ bridgeReady: true })
     })
 
     it('does not accept an unrelated connection even when the viewer extension is already loaded', async () => {
@@ -247,6 +291,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
             debuggerTier: true,
             pairingId: expect.stringMatching(/^viewer-9222-/),
             browserCdpRequest: expect.any(Function),
+            forceExtensionReload: false,
         })
         const pairingOptions = mockRunPairing.mock.calls[0]?.[0]
         await pairingOptions.browserCdpRequest('Extensions.loadUnpacked', { path: '/extension' })

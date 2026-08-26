@@ -32,6 +32,8 @@ export interface PairOptions {
     pairingId?: string
     /** Launch-time pipe request channel required by unsafe extension commands. */
     browserCdpRequest?: BrowserCdpRequest
+    /** Internal viewer fallback: refresh only after marker pairing fails. */
+    forceExtensionReload?: boolean
 }
 
 export type BrowserCdpRequest = (method: string, params?: Record<string, unknown>) => Promise<unknown>
@@ -297,8 +299,12 @@ function hasExtensionTarget(targets: Array<{ url?: string }> | null, extensionId
 }
 
 /** Marker pairing requires the bundle that understands that marker. */
-export function shouldLoadUnpackedExtension(extensionLoaded: boolean, pairingId?: string): boolean {
-    return !extensionLoaded || pairingId !== undefined
+export function shouldLoadUnpackedExtension(
+    extensionLoaded: boolean,
+    pairingId?: string,
+    forceExtensionReload = pairingId !== undefined,
+): boolean {
+    return !extensionLoaded || forceExtensionReload
 }
 
 export function extensionAvailableAfterLoad(previouslyLoaded: boolean, loadedNow: boolean): boolean {
@@ -438,7 +444,11 @@ export async function runPairing(options: PairOptions): Promise<PairOutcomeInput
     // prove "not installed" — loading again is harmless (Chrome reloads it)
     // and is the only way in on a machine with no GUI.
     let loadUnpackedFailed = false
-    if (cdpReachable && shouldLoadUnpackedExtension(extensionLoaded, options.pairingId)) {
+    if (cdpReachable && shouldLoadUnpackedExtension(
+        extensionLoaded,
+        options.pairingId,
+        options.forceExtensionReload,
+    )) {
         const previouslyLoaded = extensionLoaded
         const loadedNow = await loadUnpackedExtension(options.browserCdpRequest, extensionDir)
         loadUnpackedFailed = !loadedNow

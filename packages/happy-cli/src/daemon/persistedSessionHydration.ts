@@ -16,11 +16,12 @@
 
 import { decodeBase64 } from '@/api/encryption';
 import type { PersistedSession } from '@/persistence';
+import { captureSaycodeAgentEnvironment } from './sessionEnv';
 import type { TrackedSession } from './types';
 
 type HydratedFields = Pick<
   TrackedSession,
-  'happySessionMetadataFromLocalWebhook' | 'encryption' | 'userHomeDir' | 'persistedLastProcessedSeq'
+  'happySessionMetadataFromLocalWebhook' | 'encryption' | 'userHomeDir' | 'persistedLastProcessedSeq' | 'agentEnvironment'
 >;
 
 /**
@@ -36,6 +37,9 @@ type HydratedFields = Pick<
  */
 export function hydrateTrackedSessionFromPersisted(persisted: PersistedSession | undefined): HydratedFields {
   if (!persisted) return {};
+  const agentEnvironment = persisted.agentEnvironment
+    ? captureSaycodeAgentEnvironment(persisted.agentEnvironment as NodeJS.ProcessEnv)
+    : undefined;
 
   return {
     happySessionMetadataFromLocalWebhook: persisted.metadata,
@@ -50,5 +54,18 @@ export function hydrateTrackedSessionFromPersisted(persisted: PersistedSession |
     ...(persisted.lastProcessedSeq !== undefined
       ? { persistedLastProcessedSeq: persisted.lastProcessedSeq }
       : {}),
+    ...(agentEnvironment ? { agentEnvironment } : {}),
+  };
+}
+
+export function hydrateRecoveredSessionFromPersisted(
+  persisted: PersistedSession | undefined,
+  baselineSeq: number,
+): Pick<TrackedSession, 'userHomeDir' | 'persistedLastProcessedSeq' | 'agentEnvironment'> {
+  const hydrated = hydrateTrackedSessionFromPersisted(persisted);
+  return {
+    ...(hydrated.userHomeDir ? { userHomeDir: hydrated.userHomeDir } : {}),
+    persistedLastProcessedSeq: baselineSeq,
+    ...(hydrated.agentEnvironment ? { agentEnvironment: hydrated.agentEnvironment } : {}),
   };
 }

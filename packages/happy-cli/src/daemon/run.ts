@@ -97,7 +97,10 @@ import {
   type StopSessionResult,
 } from './sessionIdleReaper';
 import { resolveOrphanAdoption, collectStartupOrphans, resolveTrackedPidOwner } from './orphanAdoption';
-import { hydrateTrackedSessionFromPersisted } from './persistedSessionHydration';
+import {
+  hydrateRecoveredSessionFromPersisted,
+  hydrateTrackedSessionFromPersisted,
+} from './persistedSessionHydration';
 import { createAutomationStore } from './automations/automationStore';
 import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
@@ -516,6 +519,7 @@ export async function startDaemon(): Promise<void> {
       // resumed to deliver (2026-08-05 incident).
       const preserved = sessionIdToFinishedSession.get(sessionId);
       const inheritedLastProcessedSeq = preserved?.runtime?.lastProcessedSeq ?? preserved?.persistedLastProcessedSeq;
+      const existingSession = pidToTrackedSession.get(pid);
 
       // Persist encryption data to disk so it survives daemon restarts
       if (encryption) {
@@ -528,12 +532,11 @@ export async function startDaemon(): Promise<void> {
           metadata: sessionMetadata,
           savedAt: Date.now(),
           lastProcessedSeq: inheritedLastProcessedSeq,
+          agentEnvironment: existingSession?.agentEnvironment ?? preserved?.agentEnvironment,
         });
       }
 
       // Check if we already have this PID (daemon-spawned)
-      const existingSession = pidToTrackedSession.get(pid);
-
       if (existingSession && existingSession.startedBy === 'daemon') {
         // Update daemon-spawned session with reported data
         existingSession.happySessionId = sessionId;
@@ -1164,6 +1167,7 @@ export async function startDaemon(): Promise<void> {
           savedAt: Date.now(),
           userHomeDir: session.userHomeDir,
           lastProcessedSeq: session.runtime?.lastProcessedSeq ?? session.persistedLastProcessedSeq,
+          agentEnvironment: session.agentEnvironment,
         });
       }
       logger.debug(`[DAEMON RUN] Preserved session ${session.happySessionId} for resume (${reason})`);
@@ -1210,6 +1214,7 @@ export async function startDaemon(): Promise<void> {
         savedAt: now,
         userHomeDir: session.userHomeDir,
         lastProcessedSeq: cursor,
+        agentEnvironment: session.agentEnvironment,
       });
       session.persistedLastProcessedSeq = cursor;
       resumeCursorPersistedAt.set(sessionId, now);
@@ -1513,7 +1518,12 @@ export async function startDaemon(): Promise<void> {
       }
 
       if (decision.kind === 'same-session') {
+        const recoveredPersisted = hydrateRecoveredSessionFromPersisted(
+          persistedSession,
+          decision.baselineSeq,
+        );
         const recovered: TrackedSession = {
+          ...recoveredPersisted,
           startedBy: 'recovered from persisted session',
           happySessionId: serverSession.id,
           happySessionMetadataFromLocalWebhook: serverSession.metadata,
@@ -1525,8 +1535,6 @@ export async function startDaemon(): Promise<void> {
             agentStateVersion: serverSession.agentStateVersion,
           },
           pid: 0,
-          userHomeDir: persistedSession?.userHomeDir,
-          persistedLastProcessedSeq: decision.baselineSeq,
         };
         sessionIdToFinishedSession.set(serverSession.id, recovered);
         persistSession(serverSession.id, {
@@ -1537,8 +1545,9 @@ export async function startDaemon(): Promise<void> {
           agentStateVersion: serverSession.agentStateVersion,
           metadata: serverSession.metadata,
           savedAt: Date.now(),
-          userHomeDir: persistedSession?.userHomeDir,
+          userHomeDir: recoveredPersisted.userHomeDir,
           lastProcessedSeq: decision.baselineSeq,
+          agentEnvironment: recoveredPersisted.agentEnvironment,
         });
 
         const result = await spawnResumedSession(serverSession.id, {
