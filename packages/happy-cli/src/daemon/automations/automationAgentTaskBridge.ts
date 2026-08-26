@@ -14,7 +14,7 @@ const dispatchSchema = z.object({
   context: z.array(z.object({ kind: z.string(), body: z.unknown() })),
 })
 
-const responseSchema = z.object({ dispatch: dispatchSchema.nullable() })
+const responseSchema = z.object({ dispatch: dispatchSchema.nullable(), reason: z.string().min(1).max(64).optional() })
 
 export type AutomationAgentTaskEvent = {
   event: 'opened' | 'ready_for_review' | 'merged' | 'closed'
@@ -34,7 +34,7 @@ export async function dispatchAutomationAgentTask(input: {
   event: AutomationAgentTaskEvent
   fetchImpl?: typeof fetch
 }): Promise<
-  | { ok: true; dispatch: AutomationAgentTaskDispatch | null }
+  | { ok: true; dispatch: AutomationAgentTaskDispatch | null; reason?: string }
   | { ok: false; error: string }
 > {
   let url: string
@@ -76,6 +76,7 @@ export async function dispatchAutomationAgentTask(input: {
             controlUrl: new URL('/api/agent-tasks', input.configUrl).toString().replace(/\/$/, ''),
           }
           : null,
+        ...(parsed.data.reason !== undefined ? { reason: parsed.data.reason } : {}),
       }
       : { ok: false, error: 'AgentTask bridge returned invalid data' }
   } catch {

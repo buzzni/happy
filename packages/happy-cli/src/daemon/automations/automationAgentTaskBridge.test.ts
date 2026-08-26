@@ -43,6 +43,20 @@ describe('automation AgentTask bridge client', () => {
     })
   })
 
+  // 2026-08-26 프로덕션 — 서버가 dispatch:null 과 함께 사유를 보내기 시작했는데
+  // 이 브리지가 그 필드를 버리면 다시 "실행했는데 아무 일도 안 일어남" 으로
+  // 돌아간다. reason 을 파싱해 호출자가 로그로 남길 수 있게 한다.
+  it('surfaces the reason when the server explains an empty dispatch', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      dispatch: null, reason: 'queue-empty',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    await expect(dispatchAutomationAgentTask({
+      configUrl: 'https://studio.example', machineToken: 'machine-secret', machineId: 'machine-1',
+      runId: 'run-1', claimToken: 'run-secret', credentialId: 'credential-1', event: null,
+      fetchImpl: fetchImpl as never,
+    })).resolves.toEqual({ ok: true, dispatch: null, reason: 'queue-empty' })
+  })
+
   it('returns a redacted failure for non-success responses', async () => {
     await expect(dispatchAutomationAgentTask({
       configUrl: 'https://studio.example', machineToken: 'machine-secret', machineId: 'machine-1',
