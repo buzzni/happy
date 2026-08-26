@@ -81,6 +81,7 @@ import {
   shareInFlight,
 } from './resumeGuards';
 import { decideResumeCursorPersist } from './resumeCursorPersistence';
+import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
 import { startLogHousekeeping } from '@/ui/logHousekeepingRunner';
 import {
   readDaemonSessionIdleReaperConfig,
@@ -840,7 +841,11 @@ export async function startDaemon(): Promise<void> {
         // 참조가 아니라 내용이다. 그래서 확장/검증 이후에 주입한다. tmux 경로와
         // 일반 경로 모두 extraEnv를 그대로 사용하므로 이 한 곳이면 충분하다.
         if (options.initialPrompt) {
-          extraEnv.HAPPY_INITIAL_PROMPT = options.initialPrompt;
+          // 큰 프롬프트(AgentTask 리뷰는 diff 를 인라인한다)를 env 값으로 넘기면
+          // Linux 의 단일 env 한도(MAX_ARG_STRLEN)에 걸려 spawn 이 E2BIG 으로
+          // 죽는다. 한도 이상이면 파일로 넘기고 경로만 env 에 싣는다.
+          const stagedPrompt = await stageInitialPromptEnvironment(options.initialPrompt);
+          Object.assign(extraEnv, stagedPrompt.env);
           if (options.initialPromptLocalId) {
             extraEnv.HAPPY_INITIAL_PROMPT_LOCAL_ID = options.initialPromptLocalId;
           }
@@ -1370,6 +1375,12 @@ export async function startDaemon(): Promise<void> {
 
         await fs.access(launch.cwd);
 
+        // resume 도 같은 단일 env 한도에 걸린다 — review_apply 는 원 세션을
+        // 재개하면서 diff 가 인라인된 같은 프롬프트를 싣는다.
+        const stagedResumePrompt = options?.automation
+          ? await stageInitialPromptEnvironment(options.automation.initialPrompt)
+          : null;
+
         const inheritedResumeEnvironment = resolveInheritedSpawnEnvironment({
           agent: launch.args[0] === 'codex' ? 'codex' : 'claude',
           env: process.env,
@@ -1388,7 +1399,7 @@ export async function startDaemon(): Promise<void> {
                 ? { HAPPY_HOME_DIR: credentialDecision.homeDir }
                 : {}),
               ...(options?.automation ? {
-                HAPPY_INITIAL_PROMPT: options.automation.initialPrompt,
+                ...stagedResumePrompt!.env,
                 HAPPY_AUTOMATION_RESUME_PROMPT: '1',
                 HAPPY_AUTOMATION_RUN_ONCE: '1',
               } : {}),

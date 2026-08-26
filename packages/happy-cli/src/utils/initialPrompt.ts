@@ -1,12 +1,87 @@
 import { randomUUID } from 'node:crypto'
+import { readFileSync, rmSync } from 'node:fs'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import type { RawJSONLines } from '@/claude/types'
 import type { PermissionMode } from '@/api/types'
 
-/** Read a daemon-provided initial prompt exactly once without leaking it to children. */
+/**
+ * Largest prompt we still pass inline as an environment value.
+ *
+ * Linux caps a *single* argv/env entry at MAX_ARG_STRLEN (32 * PAGE_SIZE =
+ * 131072 bytes on a 4K-page system) independently of the much larger ARG_MAX
+ * total. AgentTask review prompts inline the PR diff, so a normal-sized change
+ * blows past that and `spawn` fails with E2BIG — observed 2026-08-27 with a
+ * 143,500-byte diff. Anything at or over this limit is staged to a file
+ * instead. Kept well under the kernel constant so the other spawn variables
+ * (and non-Linux limits) still have room.
+ */
+export const INITIAL_PROMPT_INLINE_LIMIT_BYTES = 64 * 1024
+
+export type StagedInitialPrompt = {
+  env: { HAPPY_INITIAL_PROMPT?: string; HAPPY_INITIAL_PROMPT_FILE?: string }
+  /** Removes a staged file when the spawn never consumed it. */
+  cleanup?: () => Promise<void>
+}
+
+/**
+ * Chooses how a daemon-provided initial prompt reaches the spawned agent.
+ *
+ * Small prompts keep the original inline path untouched — that is the path
+ * that works today, and a filesystem failure must not be able to break it.
+ * Only oversized prompts, which currently fail 100% of the time, take the
+ * file path.
+ */
+export async function stageInitialPromptEnvironment(
+  prompt: string,
+  deps: { makeTempDir?: () => Promise<string> } = {},
+): Promise<StagedInitialPrompt> {
+  if (Buffer.byteLength(prompt, 'utf8') < INITIAL_PROMPT_INLINE_LIMIT_BYTES) {
+    return { env: { HAPPY_INITIAL_PROMPT: prompt } }
+  }
+  const makeTempDir = deps.makeTempDir
+    ?? (() => mkdtemp(join(tmpdir(), 'happy-initial-prompt-')))
+  const directory = await makeTempDir()
+  const file = join(directory, 'initial-prompt.txt')
+  // 0600: the prompt carries untrusted repository text and project context.
+  await writeFile(file, prompt, { encoding: 'utf8', mode: 0o600 })
+  return {
+    env: { HAPPY_INITIAL_PROMPT_FILE: file },
+    cleanup: async () => { await rm(directory, { recursive: true, force: true }) },
+  }
+}
+
+/**
+ * Read a daemon-provided initial prompt exactly once without leaking it to
+ * children. Accepts both the inline value and a staged file (see
+ * `stageInitialPromptEnvironment`); a staged file is deleted after reading.
+ */
 export function consumePendingInitialPrompt(env: NodeJS.ProcessEnv): string | null {
   const raw = env.HAPPY_INITIAL_PROMPT
   delete env.HAPPY_INITIAL_PROMPT
+  const file = env.HAPPY_INITIAL_PROMPT_FILE
+  delete env.HAPPY_INITIAL_PROMPT_FILE
+  if (typeof file === 'string' && file.length > 0) {
+    // A missing or unreadable file must not abort the session — starting
+    // without the prompt beats failing the spawn outright.
+    let staged: string | null = null
+    try {
+      staged = readFileSync(file, 'utf8')
+    } catch {
+      staged = null
+    }
+    try {
+      rmSync(file, { force: true })
+    } catch {
+      // best-effort cleanup
+    }
+    if (staged !== null) {
+      const text = staged.trim()
+      return text.length > 0 ? text : null
+    }
+  }
   if (typeof raw !== 'string') return null
   const text = raw.trim()
   return text.length > 0 ? text : null
