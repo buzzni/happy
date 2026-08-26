@@ -74,7 +74,11 @@ describe('buildGeminiTurnPrompt', () => {
 });
 
 describe('hashGeminiMode', () => {
-  const base = { permissionMode: 'default' as const, model: 'gemini-2.5-pro' };
+  const base = {
+    permissionMode: 'default' as const,
+    model: 'gemini-2.5-pro',
+    saycodePromptBlocks: undefined,
+  };
 
   it('restarts the ACP session when prompt policy or client context changes', () => {
     const enabled = hashGeminiMode({ ...base, appendSystemPrompt: 'A', saycodeSystemPromptEnabled: true });

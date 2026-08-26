@@ -294,6 +294,7 @@ export async function runGemini(opts: {
       originalUserMessage, // Store original message separately
       appendSystemPrompt: currentAppendSystemPrompt,
       saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+      saycodePromptBlocks: currentSaycodePromptBlocks,
     };
     messageQueue.push(originalUserMessage, mode);
 

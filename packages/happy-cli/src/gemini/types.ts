@@ -16,7 +16,8 @@ export interface GeminiMode {
   originalUserMessage?: string; // Original user message without system prompt
   appendSystemPrompt?: string;
   saycodeSystemPromptEnabled?: boolean;
-  saycodePromptBlocks?: SaycodePromptBlockOverrides;
+  /** Required snapshot property; undefined means default-on/inherit semantics. */
+  saycodePromptBlocks: SaycodePromptBlockOverrides | undefined;
 }
 
 /**
