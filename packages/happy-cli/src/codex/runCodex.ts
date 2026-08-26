@@ -62,6 +62,7 @@ import {
     buildCodexDeveloperInstructions,
     buildCodexTurnPrompt,
     hashCodexEnhancedMode,
+    isSupportedCodexReasoningEffort,
     resolveCodexSaycodePromptBlocks,
     type CodexEnhancedMode,
 } from './codexPrompt';
@@ -95,10 +96,6 @@ import { registerCodexSteerHandler } from './codexSteerHandler';
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
 const DEFAULT_CODEX_PERMISSION_MODE: PermissionMode = 'yolo';
-
-const VALID_REMOTE_EFFORTS: readonly ReasoningEffort[] = [
-    'none', 'minimal', 'low', 'medium', 'high', 'xhigh',
-];
 
 /**
  * Main entry point for the codex command with ink UI
@@ -283,11 +280,11 @@ export async function runCodex(opts: {
     // ReasoningEffort; anything else falls back to the default.
     const initialModelSeed = consumePendingInitialModel(process.env) ?? DEFAULT_CODEX_MODEL;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env);
-    if (rawInitialEffortSeed && !(VALID_REMOTE_EFFORTS as readonly string[]).includes(rawInitialEffortSeed)) {
+    if (rawInitialEffortSeed && !isSupportedCodexReasoningEffort(rawInitialEffortSeed)) {
         logger.debug(`[Codex] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
     }
-    const initialEffortSeed = rawInitialEffortSeed && (VALID_REMOTE_EFFORTS as readonly string[]).includes(rawInitialEffortSeed)
-        ? rawInitialEffortSeed as ReasoningEffort
+    const initialEffortSeed = isSupportedCodexReasoningEffort(rawInitialEffortSeed)
+        ? rawInitialEffortSeed
         : DEFAULT_CODEX_EFFORT;
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
@@ -365,8 +362,8 @@ export async function runCodex(opts: {
                 messageEffort = undefined;
                 currentEffort = undefined;
                 logger.debug(`[Codex] Effort reset to default`);
-            } else if (typeof incoming === 'string' && (VALID_REMOTE_EFFORTS as readonly string[]).includes(incoming)) {
-                messageEffort = incoming as ReasoningEffort;
+            } else if (isSupportedCodexReasoningEffort(incoming)) {
+                messageEffort = incoming;
                 currentEffort = messageEffort;
                 logger.debug(`[Codex] Effort updated from user message: ${messageEffort}`);
             } else {

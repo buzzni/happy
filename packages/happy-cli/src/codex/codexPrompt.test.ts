@@ -5,9 +5,20 @@ import {
     buildCodexDeveloperInstructions,
     buildCodexTurnPrompt,
     hashCodexEnhancedMode,
+    isSupportedCodexReasoningEffort,
     resolveCodexSaycodePromptBlocks,
     type CodexEnhancedMode,
 } from './codexPrompt';
+
+describe('isSupportedCodexReasoningEffort', () => {
+    it.each(['max', 'ultra'])('accepts the GPT-5.6 effort advertised by the spawn facade: %s', (effort) => {
+        expect(isSupportedCodexReasoningEffort(effort)).toBe(true);
+    });
+
+    it('rejects an unknown effort instead of poisoning the next turn', () => {
+        expect(isSupportedCodexReasoningEffort('maximum')).toBe(false);
+    });
+});
 
 describe('resolveCodexSaycodePromptBlocks', () => {
     it('applies an explicit block override and preserves it on later absent turns', () => {

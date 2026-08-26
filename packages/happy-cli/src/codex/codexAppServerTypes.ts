@@ -1,5 +1,6 @@
 /**
- * Cherry-picked types from `codex app-server generate-ts` (Codex 0.107.0).
+ * Cherry-picked types from `codex app-server generate-ts` (Codex 0.107.0),
+ * with the GPT-5.6 max/ultra effort extension supported by Saycode runtimes.
  * Only the essential types needed for our integration.
  */
 
@@ -290,7 +291,7 @@ export type ReviewDecision =
 
 export type ApprovalPolicy = "untrusted" | "on-failure" | "on-request" | "never";
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
-export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type ReasoningSummary = "auto" | "concise" | "detailed" | "none";
 export type TurnAbortReason = "interrupted" | "replaced" | "review_ended";
 

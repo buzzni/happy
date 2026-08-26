@@ -21,6 +21,16 @@ export interface CodexEnhancedMode {
     effort?: ReasoningEffort;
 }
 
+// Keep this identifier and array form stable: Desktop's staged-runtime guard also
+// recognizes it in the bundled CLI while older Happy releases still need patching.
+const VALID_REMOTE_EFFORTS: readonly ReasoningEffort[] = [
+    'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
+];
+
+export function isSupportedCodexReasoningEffort(value: unknown): value is ReasoningEffort {
+    return typeof value === 'string' && VALID_REMOTE_EFFORTS.includes(value as ReasoningEffort);
+}
+
 export function resolveCodexSaycodePromptBlocks(
     current: CodexEnhancedMode['saycodePromptBlocks'],
     meta: Pick<MessageMeta, 'saycodePromptBlocks'> | undefined,
