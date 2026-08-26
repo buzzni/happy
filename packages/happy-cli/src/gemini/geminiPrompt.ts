@@ -1,7 +1,7 @@
+import { isSaycodePromptBlockEnabled } from '@/prompt/promptProvenance';
 import { hashObject } from '@/utils/deterministicJson';
 import { CHANGE_TITLE_INSTRUCTION } from './constants';
 import type { GeminiMode } from './types';
-import { isSaycodePromptBlockEnabled } from '@/prompt/promptProvenance';
 
 export function buildGeminiTurnPrompt(input: {
   userText: string;
@@ -33,7 +33,6 @@ export function hashGeminiMode(mode: GeminiMode): string {
     permissionMode: mode.permissionMode,
     model: mode.model,
     appendSystemPrompt: mode.appendSystemPrompt,
-    saycodeSystemPromptEnabled: mode.saycodeSystemPromptEnabled !== false,
     agentOrchestrationEnabled: isSaycodePromptBlockEnabled(
       'agentOrchestration',
       mode.saycodePromptBlocks,

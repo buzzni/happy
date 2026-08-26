@@ -80,13 +80,16 @@ describe('hashGeminiMode', () => {
     saycodePromptBlocks: undefined,
   };
 
-  it('restarts the ACP session when prompt policy or client context changes', () => {
+  it('restarts the ACP session when effective client context changes', () => {
     const enabled = hashGeminiMode({ ...base, appendSystemPrompt: 'A', saycodeSystemPromptEnabled: true });
 
-    expect(hashGeminiMode({ ...base, appendSystemPrompt: 'A', saycodeSystemPromptEnabled: false }))
-      .not.toBe(enabled);
     expect(hashGeminiMode({ ...base, appendSystemPrompt: 'B', saycodeSystemPromptEnabled: true }))
       .not.toBe(enabled);
+  });
+
+  it('does not restart when only the unrelated master switch changes', () => {
+    expect(hashGeminiMode({ ...base, appendSystemPrompt: 'A', saycodeSystemPromptEnabled: true }))
+      .toBe(hashGeminiMode({ ...base, appendSystemPrompt: 'A', saycodeSystemPromptEnabled: false }));
   });
 
   it('treats an absent policy as the legacy enabled policy', () => {

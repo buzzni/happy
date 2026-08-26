@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildClaudeSystemPromptOptions } from '@/claude/claudePrompt';
 import { buildCodexDeveloperInstructions } from '@/codex/codexPrompt';
+import { buildGeminiTurnPrompt } from '@/gemini/geminiPrompt';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from './agentOrchestrationPrompt';
 
 const routingScenarios = [
@@ -78,6 +79,16 @@ describe.each([
         saycodeSystemPromptEnabled: enabled,
         saycodePromptBlocks: agentOrchestration === undefined ? undefined : { agentOrchestration },
       },
+    }),
+  },
+  {
+    provider: 'Gemini',
+    compose: (enabled: boolean, agentOrchestration?: boolean) => buildGeminiTurnPrompt({
+      userText: 'USER',
+      agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
+      saycodeSystemPromptEnabled: enabled,
+      saycodePromptBlocks: agentOrchestration === undefined ? undefined : { agentOrchestration },
+      isNewSession: true,
     }),
   },
 ])('$provider orchestration prompt lifecycle (T13, T15)', ({ compose }) => {
