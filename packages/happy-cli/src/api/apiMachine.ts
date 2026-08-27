@@ -97,6 +97,7 @@ import {
 import { createClaudeSessionTransferHandler } from '@/claude/utils/claudeSessionTransfer';
 import { readClaudeCodeUsage } from '@/claudeCodeUsage/readUsage';
 import { CodexAppServerClient } from '@/codex/codexAppServerClient';
+import { ADDITIONAL_DIRECTORIES_CAPABILITY, parseAdditionalDirectories } from '@/daemon/additionalDirectories';
 import {
     CodexForkRewindPointNotFoundError,
     forkCodexThread,
@@ -471,6 +472,7 @@ export class ApiMachineClient {
                 model,
                 effort,
                 environmentVariables,
+                additionalDirectories,
                 token,
                 happyToken,
                 happySecret,
@@ -503,6 +505,10 @@ export class ApiMachineClient {
                 throw new Error('MCP config project id must be a non-empty string');
             }
             const validExpectedConnectors = readExpectedConnectors(expectedConnectors);
+            const validAdditionalDirectories = parseAdditionalDirectories(additionalDirectories);
+            if (validAdditionalDirectories && agent !== 'claude' && agent !== 'codex') {
+                throw new Error('Additional directories are only supported for Claude and Codex');
+            }
             if (
                 initialPrompt !== undefined
                 && (typeof initialPrompt !== 'string' || !initialPrompt.trim())
@@ -535,6 +541,7 @@ export class ApiMachineClient {
                 model,
                 effort,
                 environmentVariables,
+                additionalDirectories: validAdditionalDirectories,
                 token,
                 happyToken,
                 happySecret,
@@ -564,7 +571,13 @@ export class ApiMachineClient {
                     } catch (error) {
                         logger.debug(`[API MACHINE] Project link for ${result.sessionId} failed: ${error}`);
                     }
-                    return { type: 'success', sessionId: result.sessionId };
+                    return {
+                        type: 'success',
+                        sessionId: result.sessionId,
+                        ...(result.additionalDirectories
+                            ? { additionalDirectories: result.additionalDirectories }
+                            : {}),
+                    };
 
                 case 'requestToApproveDirectoryCreation':
                     logger.debug(`[API MACHINE] Requesting directory creation approval for: ${result.directory}`);
@@ -1976,6 +1989,7 @@ export class ApiMachineClient {
                         serverBacked: this.automationServerKeyVersion !== null,
                         ...(this.automationServerKeyVersion !== null ? { keyVersion: this.automationServerKeyVersion } : {}),
                     },
+                    additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
                     happyCliVersion: newCliVersion,
                 })).catch((err) => {
                     logger.debug('[API MACHINE] Failed to update machine capabilities:', err);

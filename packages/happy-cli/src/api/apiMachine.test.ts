@@ -135,6 +135,72 @@ describe('ApiMachineClient socket reconnection', () => {
         );
     });
 
+    it('validates and forwards additional directories through the spawn RPC result', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const manager = (client as any).rpcHandlerManager;
+        const spawnSession = vi.fn(async () => ({
+            type: 'success' as const,
+            sessionId: 'session-1',
+            additionalDirectories: {
+                version: 1 as const,
+                accepted: ['/home/user/frontend'],
+                skipped: { missing: 1 },
+            },
+        }));
+        client.setRPCHandlers({
+            spawnSession,
+            stopSession: vi.fn(() => ({ stopped: true as const })),
+            requestShutdown: vi.fn(),
+            portRegistry: {} as any,
+            aiCredentialRuntime: {
+                capture: vi.fn(), apply: vi.fn(), status: vi.fn(), rotation: vi.fn(),
+            } as any,
+        });
+        const spawnHandler = manager.registerHandler.mock.calls
+            .find(([method]: [string]) => method === 'spawn-happy-session')?.[1];
+
+        await expect(spawnHandler({
+            directory: '/home/user/primary',
+            agent: 'claude',
+            additionalDirectories: ['/home/user/frontend'],
+        })).resolves.toEqual({
+            type: 'success',
+            sessionId: 'session-1',
+            additionalDirectories: {
+                version: 1,
+                accepted: ['/home/user/frontend'],
+                skipped: { missing: 1 },
+            },
+        });
+        expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
+            additionalDirectories: ['/home/user/frontend'],
+        }));
+    });
+
+    it('rejects malformed additional directories before spawning', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const manager = (client as any).rpcHandlerManager;
+        const spawnSession = vi.fn();
+        client.setRPCHandlers({
+            spawnSession,
+            stopSession: vi.fn(() => ({ stopped: true as const })),
+            requestShutdown: vi.fn(),
+            portRegistry: {} as any,
+            aiCredentialRuntime: {
+                capture: vi.fn(), apply: vi.fn(), status: vi.fn(), rotation: vi.fn(),
+            } as any,
+        });
+        const spawnHandler = manager.registerHandler.mock.calls
+            .find(([method]: [string]) => method === 'spawn-happy-session')?.[1];
+
+        await expect(spawnHandler({
+            directory: '/home/user/primary',
+            agent: 'claude',
+            additionalDirectories: ['relative/path'],
+        })).rejects.toThrow('Additional directories')
+        expect(spawnSession).not.toHaveBeenCalled();
+    });
+
     it('retries after initial socket connection error', async () => {
         vi.useFakeTimers();
 

@@ -1,4 +1,24 @@
-import type { ApprovalPolicy, SandboxMode } from './codexAppServerTypes';
+import type { ApprovalPolicy, SandboxMode, SandboxPolicy } from './codexAppServerTypes';
+
+export function resolveCodexSandboxPolicy(
+    sandbox: SandboxMode,
+    writableRoots: readonly string[],
+): SandboxPolicy {
+    switch (sandbox) {
+        case 'workspace-write':
+            return {
+                type: 'workspaceWrite',
+                writableRoots: [...writableRoots],
+                networkAccess: true,
+                excludeTmpdirEnvVar: false,
+                excludeSlashTmp: false,
+            };
+        case 'danger-full-access':
+            return { type: 'dangerFullAccess' };
+        case 'read-only':
+            return { type: 'readOnly' };
+    }
+}
 
 export function resolveCodexExecutionPolicy(
     permissionMode: import('@/api/types').PermissionMode,

@@ -41,6 +41,7 @@ import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import type { PermissionMode } from '@/api/types';
 import type { ApiSessionClient } from '@/api/apiSession';
 import { resolveCodexExecutionPolicy } from './executionPolicy';
+import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
 import {
     mapCodexMcpMessageToSessionEnvelopes,
     mapCodexProcessorMessageToSessionEnvelopes,
@@ -158,6 +159,7 @@ export async function runCodex(opts: {
     //
 
     const settings = await readSettings();
+    const additionalDirectories = readAdditionalDirectoriesEnvironment(process.env);
     let machineId = settings?.machineId;
     const sandboxConfig = opts.noSandbox ? undefined : settings?.sandboxConfig;
     if (!machineId) {
@@ -1120,6 +1122,7 @@ export async function runCodex(opts: {
                             });
                             const resumed = await client.resumeThread({
                                 threadId,
+                                writableRoots: additionalDirectories,
                                 mcpServers,
                                 developerInstructions: nextDeveloperInstructions ?? null,
                             });
@@ -1137,6 +1140,7 @@ export async function runCodex(opts: {
                 if (client.threadId && nextDeveloperInstructions !== currentDeveloperInstructions) {
                     await client.resumeThread({
                         threadId: client.threadId,
+                        writableRoots: additionalDirectories,
                         mcpServers: mcpSync.mcpServers,
                         developerInstructions: nextDeveloperInstructions ?? null,
                     });
@@ -1151,6 +1155,7 @@ export async function runCodex(opts: {
                         cwd: process.cwd(),
                         approvalPolicy: executionPolicy.approvalPolicy,
                         sandbox: executionPolicy.sandbox,
+                        writableRoots: additionalDirectories,
                         mcpServers: mcpSync.mcpServers,
                         developerInstructions: nextDeveloperInstructions,
                     });
@@ -1239,6 +1244,7 @@ export async function runCodex(opts: {
                     model: message.mode.model,
                     approvalPolicy: executionPolicy.approvalPolicy,
                     sandbox: executionPolicy.sandbox,
+                    writableRoots: additionalDirectories,
                     effort: message.mode.effort,
                     extraInputItems: imageInputs.inputItems,
                 });

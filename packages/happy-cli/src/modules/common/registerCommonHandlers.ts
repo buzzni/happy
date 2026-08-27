@@ -211,6 +211,8 @@ export interface SpawnSessionOptions {
     model?: string;
     effort?: string;
     environmentVariables?: Record<string, string>;
+    /** Existing, daemon-canonicalized read-write roots mounted for this session. */
+    additionalDirectories?: string[];
     /** OAuth token for the agent CLI (e.g. CLAUDE_CODE_OAUTH_TOKEN). */
     token?: string;
     /**
@@ -283,7 +285,15 @@ export interface SpawnSessionOptions {
 }
 
 export type SpawnSessionResult =
-    | { type: 'success'; sessionId: string }
+    | {
+        type: 'success';
+        sessionId: string;
+        additionalDirectories?: {
+            version: 1;
+            accepted: string[];
+            skipped: Partial<Record<'missing' | 'not-directory' | 'canonicalize-failed' | 'duplicate' | 'primary', number>>;
+        };
+    }
     | { type: 'requestToApproveDirectoryCreation'; directory: string }
     | { type: 'error'; errorMessage: string };
 

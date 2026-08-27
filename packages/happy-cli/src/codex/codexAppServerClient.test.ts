@@ -274,6 +274,57 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('persists additional writable roots across thread start, resume, and every workspace-write turn', async () => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                if (['thread/start', 'thread/resume'].includes(msg.method ?? '') && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-roots', path: '/tmp/thread-roots' },
+                            model: 'gpt-test', modelProvider: 'openai', cwd: '/tmp/project',
+                            approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' }, reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-roots' } } });
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: { threadId: 'thread-roots', turn: { id: 'turn-roots', status: 'completed' } },
+                        });
+                    }, 0);
+                }
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const writableRoots = ['/repo/frontend', '/repo/backend'];
+        await client.connect();
+
+        await client.startThread({ cwd: '/tmp/project', sandbox: 'workspace-write', writableRoots });
+        await client.resumeThread({ threadId: 'thread-roots' });
+        await client.sendTurnAndWait('edit both projects', { sandbox: 'workspace-write' });
+
+        for (const request of requests.filter(({ method }) => method === 'thread/start' || method === 'thread/resume')) {
+            expect(request.params.config).toMatchObject({
+                sandbox_workspace_write: { writable_roots: writableRoots },
+            });
+        }
+        expect(requests.find(({ method }) => method === 'turn/start')?.params.sandboxPolicy).toEqual({
+            type: 'workspaceWrite',
+            writableRoots,
+            networkAccess: true,
+            excludeTmpdirEnvVar: false,
+            excludeSlashTmp: false,
+        });
+
+        await client.disconnect();
+    });
+
     it('clears persisted developer instructions when resume explicitly sends null', async () => {
         const requests: MockRpcMessage[] = [];
         mockSpawn.mockImplementation(() => createMockProcess({

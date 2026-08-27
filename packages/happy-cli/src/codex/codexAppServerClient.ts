@@ -58,6 +58,7 @@ import { CODEX_INACTIVITY_ABORT_REASON, type CodexInactivityAbortFields } from '
 import { prepareCodexMultiAuthProxy, type PreparedCodexMultiAuthProxy } from './codexMultiAuthProxy';
 import { initializeSandbox, wrapForMcpTransport } from '@/sandbox/manager';
 import packageJson from '../../package.json';
+import { resolveCodexSandboxPolicy } from './executionPolicy';
 
 type PendingRequest = {
     resolve: (result: unknown) => void;
@@ -229,6 +230,7 @@ export class CodexAppServerClient {
         cwd?: string;
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
+        writableRoots?: string[];
         mcpServers?: Record<string, unknown>;
         developerInstructions?: string | null;
     } | null = null;
@@ -891,8 +893,16 @@ export class CodexAppServerClient {
         return cleanup;
     }
 
-    private buildThreadConfig(mcpServers?: Record<string, unknown>): Record<string, unknown> | null {
-        return mcpServers ? { mcp_servers: mcpServers } : null;
+    private buildThreadConfig(
+        mcpServers?: Record<string, unknown>,
+        writableRoots?: readonly string[],
+    ): Record<string, unknown> | null {
+        const config: Record<string, unknown> = {};
+        if (mcpServers) config.mcp_servers = mcpServers;
+        if (writableRoots?.length) {
+            config.sandbox_workspace_write = { writable_roots: [...writableRoots] };
+        }
+        return Object.keys(config).length > 0 ? config : null;
     }
 
     private rememberThreadDefaults(opts: {
@@ -900,6 +910,7 @@ export class CodexAppServerClient {
         cwd?: string;
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
+        writableRoots?: string[];
         mcpServers?: Record<string, unknown>;
         developerInstructions?: string | null;
     }): void {
@@ -908,6 +919,7 @@ export class CodexAppServerClient {
             cwd: opts.cwd,
             approvalPolicy: opts.approvalPolicy,
             sandbox: opts.sandbox,
+            writableRoots: opts.writableRoots,
             mcpServers: opts.mcpServers,
             developerInstructions: opts.developerInstructions,
         };
@@ -920,6 +932,7 @@ export class CodexAppServerClient {
         cwd?: string;
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
+        writableRoots?: string[];
         mcpServers?: Record<string, unknown>;
         developerInstructions?: string | null;
     }): Promise<{ threadId: string; model: string }> {
@@ -930,7 +943,7 @@ export class CodexAppServerClient {
             cwd: opts.cwd ?? process.cwd(),
             approvalPolicy: opts.approvalPolicy ?? null,
             sandbox: opts.sandbox ?? null,
-            config: this.buildThreadConfig(opts.mcpServers),
+            config: this.buildThreadConfig(opts.mcpServers, opts.writableRoots),
             baseInstructions: null,
             developerInstructions: opts.developerInstructions ?? null,
             compactPrompt: null,
@@ -953,6 +966,7 @@ export class CodexAppServerClient {
         cwd?: string;
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
+        writableRoots?: string[];
         mcpServers?: Record<string, unknown>;
         developerInstructions?: string | null;
     }): Promise<{ threadId: string; model: string }> {
@@ -972,7 +986,10 @@ export class CodexAppServerClient {
             cwd: opts?.cwd ?? defaults.cwd ?? process.cwd(),
             approvalPolicy: opts?.approvalPolicy ?? defaults.approvalPolicy ?? null,
             sandbox: opts?.sandbox ?? defaults.sandbox ?? null,
-            config: this.buildThreadConfig(opts?.mcpServers ?? defaults.mcpServers),
+            config: this.buildThreadConfig(
+                opts?.mcpServers ?? defaults.mcpServers,
+                opts?.writableRoots ?? defaults.writableRoots,
+            ),
             baseInstructions: null,
             developerInstructions,
             persistExtendedHistory: true,
@@ -986,6 +1003,7 @@ export class CodexAppServerClient {
             cwd: opts?.cwd ?? defaults.cwd,
             approvalPolicy: opts?.approvalPolicy ?? defaults.approvalPolicy,
             sandbox: opts?.sandbox ?? defaults.sandbox,
+            writableRoots: opts?.writableRoots ?? defaults.writableRoots,
             mcpServers: opts?.mcpServers ?? defaults.mcpServers,
             developerInstructions,
         });
@@ -999,6 +1017,7 @@ export class CodexAppServerClient {
         cwd?: string;
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
+        writableRoots?: string[];
         mcpServers?: Record<string, unknown>;
         developerInstructions?: string | null;
     }): Promise<{ threadId: string; model: string; thread: Thread }> {
@@ -1013,7 +1032,10 @@ export class CodexAppServerClient {
             cwd: opts.cwd ?? defaults.cwd ?? process.cwd(),
             approvalPolicy: opts.approvalPolicy ?? defaults.approvalPolicy ?? null,
             sandbox: opts.sandbox ?? defaults.sandbox ?? null,
-            config: this.buildThreadConfig(opts.mcpServers ?? defaults.mcpServers),
+            config: this.buildThreadConfig(
+                opts.mcpServers ?? defaults.mcpServers,
+                opts.writableRoots ?? defaults.writableRoots,
+            ),
             baseInstructions: null,
             developerInstructions,
             ephemeral: false,
@@ -1028,6 +1050,7 @@ export class CodexAppServerClient {
             cwd: opts.cwd ?? defaults.cwd,
             approvalPolicy: opts.approvalPolicy ?? defaults.approvalPolicy,
             sandbox: opts.sandbox ?? defaults.sandbox,
+            writableRoots: opts.writableRoots ?? defaults.writableRoots,
             mcpServers: opts.mcpServers ?? defaults.mcpServers,
             developerInstructions,
         });
@@ -1344,6 +1367,7 @@ export class CodexAppServerClient {
         cwd?: string;
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
+        writableRoots?: string[];
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
     }): Promise<void> {
@@ -1368,19 +1392,12 @@ export class CodexAppServerClient {
         if (opts?.model) params.model = opts.model;
         if (opts?.effort) params.effort = opts.effort;
 
-        // Map sandbox mode to the camelCase policy format the server expects
+        // Map sandbox mode to the camelCase policy format the server expects.
         if (opts?.sandbox) {
-            switch (opts.sandbox) {
-                case 'workspace-write':
-                    params.sandboxPolicy = { type: 'workspaceWrite' };
-                    break;
-                case 'danger-full-access':
-                    params.sandboxPolicy = { type: 'dangerFullAccess' };
-                    break;
-                case 'read-only':
-                    params.sandboxPolicy = { type: 'readOnly' };
-                    break;
-            }
+            params.sandboxPolicy = resolveCodexSandboxPolicy(
+                opts.sandbox,
+                opts.writableRoots ?? this.threadDefaults?.writableRoots ?? [],
+            );
         }
 
         // turn/start returns immediately; turn completes via events.
@@ -1418,6 +1435,7 @@ export class CodexAppServerClient {
         cwd?: string;
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
+        writableRoots?: string[];
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
         /** Max time without any turn activity before interrupting the provider. */
