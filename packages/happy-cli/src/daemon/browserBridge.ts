@@ -15,7 +15,7 @@
  * send/close/on, so this stays unit-testable (same pattern as PreviewWsProxy).
  */
 
-import { timingSafeEqual } from 'node:crypto'
+import { createHmac, timingSafeEqual } from 'node:crypto'
 
 export interface BridgeSocket {
     send(data: string): void
@@ -28,6 +28,7 @@ export interface BridgeConnectionParams {
     token?: string
     profile?: string
     pairingId?: string
+    viewerKey?: string
 }
 
 export class BridgeRequestError extends Error {
@@ -46,6 +47,7 @@ interface PendingRequest {
 interface Connection {
     profile: string
     pairingId?: string
+    viewerKey?: string
     socket: BridgeSocket
     pending: Map<number, PendingRequest>
 }
@@ -53,6 +55,25 @@ interface Connection {
 const DEFAULT_PROFILE = 'default'
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 const AUTH_FAILURE_WINDOW_MS = 60_000
+const MAX_AUTH_FAILURE_SCOPES = 256
+const VIEWER_ACTIVITY_INTERVAL_MS = 60_000
+const LEGACY_VIEWER_SCOPE = 'legacy'
+const VIEWER_KEY_RE = /^bv1_[A-Za-z0-9_-]{32}$/
+
+export function deriveBrowserViewerBridgeToken(authToken: string, viewerKey: string): string {
+    return createHmac('sha256', authToken)
+        .update('browser-viewer-bridge-v1\0')
+        .update(viewerKey)
+        .digest('base64url')
+}
+
+function connectionKey(viewerKey: string | undefined, profile: string): string {
+    return `${viewerKey ?? LEGACY_VIEWER_SCOPE}\0${profile}`
+}
+
+function viewerScope(viewerKey: string | undefined): string {
+    return viewerKey ?? LEGACY_VIEWER_SCOPE
+}
 
 /**
  * Constant-time token comparison.
@@ -83,13 +104,16 @@ function tokensMatch(offered: string, expected: string): boolean {
 export class BrowserBridge {
     private readonly authToken: string
     private readonly requestTimeoutMs: number
-    private readonly byProfile = new Map<string, Connection>()
+    private readonly onViewerActivity?: (viewerKey: string) => void
+    private readonly byTarget = new Map<string, Connection>()
     private nextRequestId = 1
-    private lastAuthFailureAt: number | null = null
+    private readonly lastAuthFailureByScope = new Map<string, number>()
+    private readonly lastViewerActivityByScope = new Map<string, number>()
 
-    constructor(opts: { authToken: string; requestTimeoutMs?: number }) {
+    constructor(opts: { authToken: string; requestTimeoutMs?: number; onViewerActivity?: (viewerKey: string) => void }) {
         this.authToken = opts.authToken
         this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+        this.onViewerActivity = opts.onViewerActivity
     }
 
     /**
@@ -99,17 +123,25 @@ export class BrowserBridge {
      * "the live service worker".
      */
     handleConnection(socket: BridgeSocket, params: BridgeConnectionParams): boolean {
-        if (!params.token || !tokensMatch(params.token, this.authToken)) {
-            this.lastAuthFailureAt = Date.now()
+        if (params.viewerKey !== undefined && !VIEWER_KEY_RE.test(params.viewerKey)) {
+            socket.close(4401, 'invalid viewer key')
+            return false
+        }
+        const expectedToken = params.viewerKey
+            ? deriveBrowserViewerBridgeToken(this.authToken, params.viewerKey)
+            : this.authToken
+        if (!params.token || !tokensMatch(params.token, expectedToken)) {
+            this.recordAuthFailure(viewerScope(params.viewerKey))
             socket.close(4401, 'invalid token')
             return false
         }
-        this.lastAuthFailureAt = null
+        this.lastAuthFailureByScope.delete(viewerScope(params.viewerKey))
         const profile = params.profile || DEFAULT_PROFILE
+        const key = connectionKey(params.viewerKey, profile)
 
-        const stale = this.byProfile.get(profile)
+        const stale = this.byTarget.get(key)
         if (stale) {
-            this.byProfile.delete(profile)
+            this.byTarget.delete(key)
             this.rejectAllPending(stale, new BridgeRequestError('EXTENSION_DISCONNECTED', 'replaced by a new connection'))
             stale.socket.close(4409, 'replaced by a new connection')
         }
@@ -117,15 +149,22 @@ export class BrowserBridge {
         const connection: Connection = {
             profile,
             ...(params.pairingId ? { pairingId: params.pairingId } : {}),
+            ...(params.viewerKey ? { viewerKey: params.viewerKey } : {}),
             socket,
             pending: new Map(),
         }
-        this.byProfile.set(profile, connection)
+        this.byTarget.set(key, connection)
 
         socket.on('message', (data) => this.onMessage(connection, data.toString()))
         socket.on('close', () => {
-            if (this.byProfile.get(profile) === connection) {
-                this.byProfile.delete(profile)
+            if (this.byTarget.get(key) === connection) {
+                this.byTarget.delete(key)
+            }
+            if (
+                connection.viewerKey
+                && ![...this.byTarget.values()].some(({ viewerKey }) => viewerKey === connection.viewerKey)
+            ) {
+                this.lastViewerActivityByScope.delete(connection.viewerKey)
             }
             this.rejectAllPending(connection, new BridgeRequestError('EXTENSION_DISCONNECTED', 'extension disconnected'))
         })
@@ -133,11 +172,14 @@ export class BrowserBridge {
     }
 
     /** Connected extensions (introspection / status endpoint). */
-    connections(): Array<{ profile: string; pairingId?: string }> {
-        return Array.from(this.byProfile.values()).map(({ profile, pairingId }) => ({
-            profile,
-            ...(pairingId ? { pairingId } : {}),
-        }))
+    connections(viewerKey?: string): Array<{ profile: string; pairingId?: string; viewerKey?: string }> {
+        return Array.from(this.byTarget.values())
+            .filter((connection) => connection.viewerKey === viewerKey)
+            .map(({ profile, pairingId, viewerKey }) => ({
+                profile,
+                ...(pairingId ? { pairingId } : {}),
+                ...(viewerKey ? { viewerKey } : {}),
+            }))
     }
 
     /**
@@ -147,8 +189,13 @@ export class BrowserBridge {
      * connections() only reports successes, so nothing else distinguishes
      * this from "no extension has ever tried to connect".
      */
-    hasRecentAuthFailure(): boolean {
-        return this.lastAuthFailureAt !== null && Date.now() - this.lastAuthFailureAt < AUTH_FAILURE_WINDOW_MS
+    hasRecentAuthFailure(viewerKey?: string): boolean {
+        const scope = viewerScope(viewerKey)
+        const failedAt = this.lastAuthFailureByScope.get(scope)
+        if (failedAt === undefined) return false
+        if (Date.now() - failedAt < AUTH_FAILURE_WINDOW_MS) return true
+        this.lastAuthFailureByScope.delete(scope)
+        return false
     }
 
     /**
@@ -161,22 +208,28 @@ export class BrowserBridge {
      * windows, which answers `capabilities` happily and then reports zero tabs
      * forever. A named error the caller can act on beats a silent wrong target.
      */
-    request(method: string, params: unknown, opts: { timeoutMs?: number; profile?: string } = {}): Promise<unknown> {
-        if (!opts.profile && this.byProfile.size > 1) {
-            const names = Array.from(this.byProfile.keys()).join(', ')
+    request(
+        method: string,
+        params: unknown,
+        opts: { timeoutMs?: number; profile?: string; viewerKey?: string } = {},
+    ): Promise<unknown> {
+        const connections = Array.from(this.byTarget.values())
+            .filter((connection) => connection.viewerKey === opts.viewerKey)
+        if (!opts.profile && connections.length > 1) {
+            const names = connections.map(({ profile }) => profile).join(', ')
             return Promise.reject(new BridgeRequestError(
                 'AMBIGUOUS_PROFILE',
-                `${this.byProfile.size} Chrome profiles are connected (${names}) — pass profile to choose one`
+                `${connections.length} Chrome profiles are connected (${names}) — pass profile to choose one`
             ))
         }
         const connection = opts.profile
-            ? this.byProfile.get(opts.profile)
-            : this.byProfile.values().next().value
+            ? connections.find(({ profile }) => profile === opts.profile)
+            : connections[0]
         if (!connection) {
             // Naming what *is* connected turns "nothing is connected" (false,
             // and unactionable, when the caller simply named the wrong
             // profile) into something the caller can correct on its own.
-            const connected = Array.from(this.byProfile.keys())
+            const connected = connections.map(({ profile }) => profile)
             const detail = opts.profile && connected.length > 0
                 ? `no Chrome extension is connected for profile "${opts.profile}" (connected: ${connected.join(', ')})`
                 : 'no Chrome extension is connected to the bridge'
@@ -185,6 +238,7 @@ export class BrowserBridge {
 
         const id = this.nextRequestId++
         const timeoutMs = opts.timeoutMs ?? this.requestTimeoutMs
+        if (connection.viewerKey) this.reportViewerActivity(connection.viewerKey)
         return new Promise<unknown>((resolve, reject) => {
             const timer = setTimeout(() => {
                 connection.pending.delete(id)
@@ -193,6 +247,28 @@ export class BrowserBridge {
             connection.pending.set(id, { resolve, reject, timer })
             connection.socket.send(JSON.stringify({ id, method, params }))
         })
+    }
+
+    private recordAuthFailure(scope: string): void {
+        const now = Date.now()
+        this.lastAuthFailureByScope.delete(scope)
+        for (const [key, failedAt] of this.lastAuthFailureByScope) {
+            if (now - failedAt >= AUTH_FAILURE_WINDOW_MS) this.lastAuthFailureByScope.delete(key)
+        }
+        while (this.lastAuthFailureByScope.size >= MAX_AUTH_FAILURE_SCOPES) {
+            const oldest = this.lastAuthFailureByScope.keys().next().value
+            if (oldest === undefined) break
+            this.lastAuthFailureByScope.delete(oldest)
+        }
+        this.lastAuthFailureByScope.set(scope, now)
+    }
+
+    private reportViewerActivity(viewerKey: string): void {
+        const now = Date.now()
+        const lastAt = this.lastViewerActivityByScope.get(viewerKey)
+        if (lastAt !== undefined && now - lastAt < VIEWER_ACTIVITY_INTERVAL_MS) return
+        this.lastViewerActivityByScope.set(viewerKey, now)
+        this.onViewerActivity?.(viewerKey)
     }
 
     private onMessage(connection: Connection, raw: string): void {

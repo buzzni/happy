@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'node:events'
-import { BrowserBridge, BridgeRequestError } from './browserBridge'
+import {
+    BrowserBridge,
+    BridgeRequestError,
+    deriveBrowserViewerBridgeToken,
+} from './browserBridge'
 
 /**
  * Fake of the `ws` WebSocket surface the bridge uses. Mirrors the
@@ -31,6 +35,8 @@ class FakeSocket extends EventEmitter {
 }
 
 const TOKEN = 'secret-token'
+const ALICE_KEY = 'bv1_abcdefghijklmnopqrstuvwxyz012345'
+const BOB_KEY = 'bv1_abcdefghijklmnopqrstuvwxyz012346'
 
 describe('BrowserBridge', () => {
     let bridge: BrowserBridge
@@ -96,6 +102,53 @@ describe('BrowserBridge', () => {
             bridge.handleConnection(socket, { token: TOKEN, profile: 'work', pairingId: 'viewer-9222' })
             expect(bridge.connections()).toEqual([{ profile: 'work', pairingId: 'viewer-9222' }])
         })
+
+        it('requires a viewer-scoped credential for a viewer connection', () => {
+            const wrong = new FakeSocket()
+            expect(bridge.handleConnection(wrong, {
+                token: TOKEN,
+                profile: 'default',
+                viewerKey: ALICE_KEY,
+            })).toBe(false)
+
+            const scoped = new FakeSocket()
+            expect(bridge.handleConnection(scoped, {
+                token: deriveBrowserViewerBridgeToken(TOKEN, ALICE_KEY),
+                profile: 'default',
+                viewerKey: ALICE_KEY,
+            })).toBe(true)
+        })
+
+        it('rejects a malformed viewer key before registering a scope', () => {
+            const socket = new FakeSocket()
+            expect(bridge.handleConnection(socket, {
+                token: deriveBrowserViewerBridgeToken(TOKEN, 'short'),
+                viewerKey: 'short',
+            })).toBe(false)
+            expect(socket.closed?.code).toBe(4401)
+            expect(bridge.connections()).toEqual([])
+        })
+
+        it('keeps recent authentication failures inside their viewer scope', () => {
+            const wrong = new FakeSocket()
+            bridge.handleConnection(wrong, {
+                token: 'wrong-token',
+                viewerKey: BOB_KEY,
+            })
+
+            expect(bridge.hasRecentAuthFailure(BOB_KEY)).toBe(true)
+            expect(bridge.hasRecentAuthFailure(ALICE_KEY)).toBe(false)
+            expect(bridge.hasRecentAuthFailure()).toBe(false)
+        })
+
+        it('bounds authentication failure scopes from untrusted viewer keys', () => {
+            for (let index = 0; index < 300; index += 1) {
+                const viewerKey = `bv1_${index.toString(36).padStart(32, 'a')}`
+                bridge.handleConnection(new FakeSocket(), { token: 'wrong-token', viewerKey })
+            }
+
+            expect((bridge as any).lastAuthFailureByScope.size).toBeLessThanOrEqual(256)
+        })
     })
 
     describe('hasRecentAuthFailure', () => {
@@ -127,6 +180,37 @@ describe('BrowserBridge', () => {
     })
 
     describe('request/response correlation', () => {
+        it('reports activity for a scoped bridge request', async () => {
+            const onViewerActivity = vi.fn()
+            const scopedBridge = new BrowserBridge({ authToken: TOKEN, onViewerActivity })
+            const socket = new FakeSocket()
+            scopedBridge.handleConnection(socket, {
+                token: deriveBrowserViewerBridgeToken(TOKEN, ALICE_KEY),
+                viewerKey: ALICE_KEY,
+            })
+
+            const promise = scopedBridge.request('tabs_list', {}, { viewerKey: ALICE_KEY })
+            const sent = socket.lastSent()
+            socket.receive({ id: sent.id, result: [] })
+            await promise
+
+            expect(onViewerActivity).toHaveBeenCalledWith(ALICE_KEY)
+
+            const repeated = scopedBridge.request('tabs_list', {}, { viewerKey: ALICE_KEY })
+            socket.receive({ id: socket.lastSent().id, result: [] })
+            await repeated
+            expect(onViewerActivity).toHaveBeenCalledTimes(1)
+
+            vi.advanceTimersByTime(60_000)
+            const later = scopedBridge.request('tabs_list', {}, { viewerKey: ALICE_KEY })
+            socket.receive({ id: socket.lastSent().id, result: [] })
+            await later
+            expect(onViewerActivity).toHaveBeenCalledTimes(2)
+
+            socket.close()
+            expect((scopedBridge as any).lastViewerActivityByScope.size).toBe(0)
+        })
+
         it('resolves a request with the result matching its id', async () => {
             const socket = connect()
             const promise = bridge.request('tabs_list', {})
@@ -259,6 +343,71 @@ describe('BrowserBridge', () => {
             connect('work')
             expect(stale.closed?.code).toBe(4409)
             expect(bridge.connections()).toEqual([{ profile: 'work' }])
+        })
+
+        it('routes only within the caller viewer key', async () => {
+            const alice = new FakeSocket()
+            const bob = new FakeSocket()
+            expect(bridge.handleConnection(alice, {
+                token: deriveBrowserViewerBridgeToken(TOKEN, ALICE_KEY),
+                profile: 'default',
+                viewerKey: ALICE_KEY,
+            })).toBe(true)
+            expect(bridge.handleConnection(bob, {
+                token: deriveBrowserViewerBridgeToken(TOKEN, BOB_KEY),
+                profile: 'default',
+                viewerKey: BOB_KEY,
+            })).toBe(true)
+
+            const promise = bridge.request('tabs_list', {}, { viewerKey: ALICE_KEY })
+            expect(bob.sent).toHaveLength(0)
+            const sent = alice.lastSent()
+            alice.receive({ id: sent.id, result: 'alice-tabs' })
+
+            await expect(promise).resolves.toBe('alice-tabs')
+        })
+
+        it('does not allow a profile name to cross the caller viewer boundary', async () => {
+            const alice = new FakeSocket()
+            const bob = new FakeSocket()
+            bridge.handleConnection(alice, {
+                token: deriveBrowserViewerBridgeToken(TOKEN, ALICE_KEY),
+                profile: 'work',
+                viewerKey: ALICE_KEY,
+            })
+            bridge.handleConnection(bob, {
+                token: deriveBrowserViewerBridgeToken(TOKEN, BOB_KEY),
+                profile: 'home',
+                viewerKey: BOB_KEY,
+            })
+
+            const promise = bridge.request('tabs_list', {}, {
+                viewerKey: ALICE_KEY,
+                profile: 'home',
+            })
+            expect(bob.sent).toHaveLength(0)
+            await expect(promise).rejects.toMatchObject({ code: 'NO_EXTENSION_CONNECTED' })
+        })
+
+        it('does not expose another viewer key or profile through status introspection', () => {
+            const alice = new FakeSocket()
+            const bob = new FakeSocket()
+            bridge.handleConnection(alice, {
+                token: deriveBrowserViewerBridgeToken(TOKEN, ALICE_KEY),
+                profile: 'alice-profile',
+                viewerKey: ALICE_KEY,
+            })
+            bridge.handleConnection(bob, {
+                token: deriveBrowserViewerBridgeToken(TOKEN, BOB_KEY),
+                profile: 'bob-profile',
+                viewerKey: BOB_KEY,
+            })
+
+            expect(bridge.connections(ALICE_KEY)).toEqual([{
+                profile: 'alice-profile',
+                viewerKey: ALICE_KEY,
+            }])
+            expect(bridge.connections()).toEqual([])
         })
     })
 })

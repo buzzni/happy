@@ -19,6 +19,7 @@ import { readDaemonState } from '@/persistence'
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken'
 import { fetchBrowserStatus, requestBrowser } from '@/daemon/browserClient'
 import { DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from '@/daemon/browserBridgeServer'
+import { deriveBrowserViewerBridgeToken } from '@/daemon/browserBridge'
 import { resolveExtensionDir, resolveExtensionId, bridgeProbeHost } from './browser'
 
 /** Chrome's conventional `--remote-debugging-port`. */
@@ -34,6 +35,8 @@ export interface PairOptions {
     browserCdpRequest?: BrowserCdpRequest
     /** Internal viewer fallback: refresh only after marker pairing fails. */
     forceExtensionReload?: boolean
+    /** Internal ownership boundary for a daemon-managed viewer Chrome. */
+    viewerKey?: string
 }
 
 export type BrowserCdpRequest = (method: string, params?: Record<string, unknown>) => Promise<unknown>
@@ -64,12 +67,13 @@ export function parsePairArgs(args: string[]): PairOptions {
     return options
 }
 
-export function buildPairUrl({ extensionId, token, bridgePort, debuggerTier, pairingId, bridgeHost = '127.0.0.1' }: {
+export function buildPairUrl({ extensionId, token, bridgePort, debuggerTier, pairingId, viewerKey, bridgeHost = '127.0.0.1' }: {
     extensionId: string
     token: string
     bridgePort: number
     debuggerTier?: boolean
     pairingId?: string
+    viewerKey?: string
     /** What the daemon's bridge is bound to (resolveBrowserBridgeHost). */
     bridgeHost?: string
 }): string {
@@ -85,6 +89,7 @@ export function buildPairUrl({ extensionId, token, bridgePort, debuggerTier, pai
     const params = new URLSearchParams({ token, port: String(bridgePort), host: bridgeProbeHost(bridgeHost) })
     if (debuggerTier !== undefined) params.set('debugger', debuggerTier ? '1' : '0')
     if (pairingId !== undefined) params.set('pairingId', pairingId)
+    if (viewerKey !== undefined) params.set('viewerKey', viewerKey)
     return `chrome-extension://${extensionId}/src/options.html?${params.toString()}`
 }
 
@@ -356,7 +361,13 @@ export function pairingConnectionArrived(
     return connections.some((connection) => !profilesBefore.includes(connection.profile))
 }
 
-async function waitForConnection(controlPort: number, timeoutMs: number, profilesBefore: string[], targetPairingId?: string): Promise<{ connections: Array<{ profile: string; pairingId?: string }>; authRejected: boolean }> {
+async function waitForConnection(
+    controlPort: number,
+    timeoutMs: number,
+    profilesBefore: string[],
+    targetPairingId?: string,
+    viewerKey?: string,
+): Promise<{ connections: Array<{ profile: string; pairingId?: string; viewerKey?: string }>; authRejected: boolean }> {
     const deadline = Date.now() + timeoutMs
     let connections: Array<{ profile: string; pairingId?: string }> = []
     // Sticky: the daemon's flag expires on its own window, and a rejection
@@ -364,8 +375,9 @@ async function waitForConnection(controlPort: number, timeoutMs: number, profile
     // even if a later poll no longer reports it.
     let authRejected = false
     while (Date.now() < deadline) {
-        const status = await fetchBrowserStatus(controlPort)
-        connections = status?.connections ?? []
+        const status = await fetchBrowserStatus(controlPort, viewerKey)
+        connections = (status?.connections ?? [])
+            .filter((connection) => connection.viewerKey === viewerKey)
         authRejected ||= status?.hasRecentAuthFailure === true
         if (pairingConnectionArrived(connections, profilesBefore, targetPairingId)) break
         await new Promise((resolve) => setTimeout(resolve, 500))
@@ -400,12 +412,23 @@ export function pickTierProbeProfile(profilesBefore: string[], connections: Arra
  * has loaded — an already-paired profile is connected the whole time — so
  * "connected" is not evidence that `--debugger` took effect.
  */
-async function waitForDebuggerTier(controlPort: number, expected: boolean, profile: string): Promise<boolean | undefined> {
+async function waitForDebuggerTier(
+    controlPort: number,
+    expected: boolean,
+    profile: string,
+    viewerKey?: string,
+): Promise<boolean | undefined> {
     const deadline = Date.now() + 5_000
     let actual: boolean | undefined
     while (Date.now() < deadline) {
         try {
-            const capabilities = await requestBrowser({ port: controlPort, method: 'capabilities', timeoutMs: 3_000, profile }) as { debugger?: boolean }
+            const capabilities = await requestBrowser({
+                port: controlPort,
+                method: 'capabilities',
+                timeoutMs: 3_000,
+                profile,
+                viewerKey,
+            }) as { debugger?: boolean }
             actual = capabilities?.debugger
             if (actual === expected) return actual
         } catch {
@@ -425,9 +448,12 @@ async function waitForDebuggerTier(controlPort: number, expected: boolean, profi
  * exact sequence instead of reimplementing it. See specs/browser-setup-gui/.
  */
 export async function runPairing(options: PairOptions): Promise<PairOutcomeInput> {
-    const token = await readOrCreateBrowserBridgeToken(configuration.browserBridgeTokenFile, {
+    const bridgeToken = await readOrCreateBrowserBridgeToken(configuration.browserBridgeTokenFile, {
         migrateFrom: configuration.legacyBrowserBridgeTokenFile,
     })
+    const token = options.viewerKey
+        ? deriveBrowserViewerBridgeToken(bridgeToken, options.viewerKey)
+        : bridgeToken
     const extensionDir = resolveExtensionDir()
     const extensionId = resolveExtensionId(extensionDir)
     const state = await readDaemonState()
@@ -464,20 +490,29 @@ export async function runPairing(options: PairOptions): Promise<PairOutcomeInput
         // Snapshotted before the page opens so a newly-arrived profile can be
         // told apart from ones that were already there — both the success
         // verdict and the tier probe depend on that distinction.
-        const profilesBefore = ((await fetchBrowserStatus(controlPort))?.connections ?? []).map((connection) => connection.profile)
+        const profilesBefore = ((await fetchBrowserStatus(controlPort, options.viewerKey))?.connections ?? [])
+            .filter((connection) => connection.viewerKey === options.viewerKey)
+            .map((connection) => connection.profile)
         pageOpened = await openTab(options.cdpPort, buildPairUrl({
             extensionId,
             token,
             bridgePort: DEFAULT_BROWSER_BRIDGE_PORT,
             debuggerTier: options.debuggerTier,
             pairingId: options.pairingId,
+            viewerKey: options.viewerKey,
             // Best-effort like `happy browser`: this process's env, which
             // matches the daemon's bind only if nothing changed it since the
             // daemon started.
             bridgeHost: resolveBrowserBridgeHost(process.env),
         }))
         if (pageOpened) {
-            const waited = await waitForConnection(controlPort, 10_000, profilesBefore, options.pairingId)
+            const waited = await waitForConnection(
+                controlPort,
+                10_000,
+                profilesBefore,
+                options.pairingId,
+                options.viewerKey,
+            )
             connections = waited.connections
             authRejected = waited.authRejected
             freshProfiles = connections
@@ -488,7 +523,12 @@ export async function runPairing(options: PairOptions): Promise<PairOutcomeInput
                     ? pickTierProbeProfile(profilesBefore, connections)
                     : connections.find((connection) => connection.pairingId === options.pairingId)?.profile
                 if (target !== undefined) {
-                    debuggerTierActual = await waitForDebuggerTier(controlPort, options.debuggerTier, target)
+                    debuggerTierActual = await waitForDebuggerTier(
+                        controlPort,
+                        options.debuggerTier,
+                        target,
+                        options.viewerKey,
+                    )
                 }
             }
         }
