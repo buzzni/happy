@@ -1,6 +1,10 @@
 <!DOCTYPE html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Happy Bridge Verify Page</title></head>
+<head>
+  <meta charset="utf-8">
+  <title>Happy Bridge Verify Page</title>
+  <style>html { scroll-behavior: smooth; }</style>
+</head>
 <body>
   <h1>Happy Bridge Verify Page</h1>
   <input id="name-input" placeholder="Your name">
@@ -13,13 +17,22 @@
   <div style="display:none"><button>Display none fixture action</button></div>
   <section>
     <h2>Nested lazy results</h2>
-    <div id="nested-results" aria-label="Nested lazy results" style="height:180px; overflow-y:auto; border:1px solid #999">
+    <div id="nested-results" aria-label="Nested lazy results" style="height:180px; overflow-y:auto; scroll-behavior:smooth; border:1px solid #999">
       <button>Nested first item</button>
       <div style="height:700px"></div>
       <div id="nested-sentinel">Nested loading sentinel</div>
     </div>
   </section>
+  <section>
+    <h2>Script-scrollable hidden overflow</h2>
+    <div id="hidden-overflow-results" aria-label="Hidden overflow results" style="position:fixed; top:430px; right:10px; width:300px; height:100px; overflow-y:hidden; scroll-behavior:smooth; border:1px solid #999">
+      <button>Hidden overflow first item</button>
+      <div style="height:500px"></div>
+    </div>
+  </section>
   <div id="long-page-prefix"></div>
+  <div id="clipping-fixture" style="position:fixed; top:0; left:0; width:300px; height:1px; overflow:hidden"></div>
+  <button id="visible-after-clipped" style="position:fixed; top:300px; right:10px">Visible after clipped controls</button>
   <div style="height:1400px"></div>
   <div id="document-sentinel">Document loading sentinel</div>
   <script>
@@ -33,6 +46,14 @@
       const button = document.createElement('button')
       button.textContent = 'Earlier action ' + i
       longPagePrefix.appendChild(button)
+    }
+    const clippingFixture = document.getElementById('clipping-fixture')
+    for (let i = 0; i < 20; i += 1) {
+      const button = document.createElement('button')
+      button.style.position = 'absolute'
+      button.style.top = '40px'
+      button.textContent = 'Clipped fixture action ' + i
+      clippingFixture.appendChild(button)
     }
 
     new IntersectionObserver(function (entries, observer) {

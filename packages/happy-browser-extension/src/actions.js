@@ -131,7 +131,7 @@ export function scrollRef(ref, deltaX, deltaY) {
         const style = element.ownerDocument.defaultView.getComputedStyle(element)
         const overflowX = style.overflowX || style.overflow
         const overflowY = style.overflowY || style.overflow
-        const permitsScroll = (overflow) => overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay'
+        const permitsScroll = (overflow) => overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay' || overflow === 'hidden'
         return (x === 0 || (max.x > 0 && permitsScroll(overflowX)))
             && (y === 0 || (max.y > 0 && permitsScroll(overflowY)))
     }
@@ -158,8 +158,11 @@ export function scrollRef(ref, deltaX, deltaY) {
     const rtl = target.ownerDocument.defaultView.getComputedStyle(target).direction === 'rtl'
     const minLeft = rtl ? -max.x : 0
     const maxLeft = rtl ? 0 : max.x
-    target.scrollLeft = Math.max(minLeft, Math.min(maxLeft, before.x + x))
-    target.scrollTop = Math.max(0, Math.min(max.y, before.y + y))
+    target.scrollTo({
+        left: Math.max(minLeft, Math.min(maxLeft, before.x + x)),
+        top: Math.max(0, Math.min(max.y, before.y + y)),
+        behavior: 'instant',
+    })
     const after = { x: target.scrollLeft, y: target.scrollTop }
 
     return {
