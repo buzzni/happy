@@ -277,12 +277,29 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     } finally {
       await deps.rm(tempDir, { recursive: true, force: true })
     }
-    const status = await deps.execFile('cswap', ['list', '--json'], {
+    let status = await deps.execFile('cswap', ['list', '--json'], {
       maxOutputBytes: MAX_PAYLOAD_BYTES,
       timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
     })
-    if (!parseClaudeList(status.stdout).configured) {
+    let details = parseClaudeListDetails(status.stdout)
+    if (!details.configured) {
       throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+    }
+    if (!details.activeUsable) {
+      if (details.usableAccountNumber === null) {
+        throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+      }
+      await deps.execFile('cswap', [
+        'switch', String(details.usableAccountNumber), '--force', '--json',
+      ], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+      status = await deps.execFile('cswap', ['list', '--json'], {
+        maxOutputBytes: MAX_PAYLOAD_BYTES,
+        timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+      })
+      details = parseClaudeListDetails(status.stdout)
+      if (!details.activeUsable) {
+        throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+      }
     }
     await deps.supervisor.enable()
     return {
@@ -623,7 +640,14 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   return { capture, apply, purge, status, rotation }
 }
 
-function parseClaudeList(stdout: string): { configured: boolean; activeAccount: string | null } {
+type ClaudeListDetails = {
+  configured: boolean
+  activeAccount: string | null
+  activeUsable: boolean
+  usableAccountNumber: number | null
+}
+
+function parseClaudeListDetails(stdout: string): ClaudeListDetails {
   try {
     const parsed = JSON.parse(stdout) as unknown
     if (!isObject(parsed)
@@ -633,26 +657,49 @@ function parseClaudeList(stdout: string): { configured: boolean; activeAccount: 
         && !Number.isInteger(parsed.activeAccountNumber))) {
       throw new Error('invalid status')
     }
+    const accounts: Array<Record<string, unknown>> = []
     for (const account of parsed.accounts) {
       if (!isObject(account)
         || !Number.isInteger(account.number)
         || typeof account.email !== 'string') {
         throw new Error('invalid account')
       }
+      accounts.push(account)
     }
+    const hasUsageStatus = accounts.some(({ usageStatus }) => typeof usageStatus === 'string')
+    const usable = (account: Record<string, unknown>) => account.disabled !== true
+      && (!hasUsageStatus || account.usageStatus === 'ok')
+    const usableAccount = accounts.find(usable)
     if (parsed.activeAccountNumber === null) {
-      return { configured: parsed.accounts.length > 0, activeAccount: null }
+      return {
+        configured: accounts.length > 0,
+        activeAccount: null,
+        activeUsable: false,
+        usableAccountNumber: typeof usableAccount?.number === 'number'
+          ? usableAccount.number
+          : null,
+      }
     }
-    const active = parsed.accounts.find((account) => (
-      isObject(account) && account.number === parsed.activeAccountNumber
-    ))
-    if (!isObject(active) || typeof active.email !== 'string') {
+    const active = accounts.find((account) => account.number === parsed.activeAccountNumber)
+    if (!active || typeof active.email !== 'string') {
       throw new Error('active account missing')
     }
-    return { configured: true, activeAccount: maskEmail(active.email) }
+    return {
+      configured: true,
+      activeAccount: maskEmail(active.email),
+      activeUsable: usable(active),
+      usableAccountNumber: typeof usableAccount?.number === 'number'
+        ? usableAccount.number
+        : null,
+    }
   } catch {
     throw new AiCredentialRuntimeError('CLAUDE_STATUS_INVALID')
   }
+}
+
+function parseClaudeList(stdout: string): { configured: boolean; activeAccount: string | null } {
+  const { configured, activeAccount } = parseClaudeListDetails(stdout)
+  return { configured, activeAccount }
 }
 
 type CodexMultiAuthAccount = CodexAccountIdentity & {

@@ -580,6 +580,124 @@ describe('AI credential machine runtime', () => {
     expect(supervisor.enable).toHaveBeenCalledOnce()
   })
 
+  it('activates a usable Claude account when import leaves no active account', async () => {
+    let switched = false
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'cswap' && args[0] === '--version') {
+        return { stdout: 'cswap 0.25.0', stderr: '' }
+      }
+      if (command === 'cswap' && args[0] === 'list') {
+        return {
+          stdout: JSON.stringify({
+            schemaVersion: 1,
+            activeAccountNumber: switched ? 2 : null,
+            accounts: [
+              {
+                number: 1,
+                email: 'expired@example.com',
+                disabled: false,
+                usageStatus: 'relogin_required',
+              },
+              {
+                number: 2,
+                email: 'ready@example.com',
+                disabled: false,
+                usageStatus: 'ok',
+              },
+            ],
+          }),
+          stderr: '',
+        }
+      }
+      if (command === 'cswap' && args[0] === 'switch') switched = true
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime, supervisor } = setup({ execFile })
+
+    await expect(runtime.apply({ provider: 'claude', payload: '{}' }))
+      .resolves.toMatchObject({ provider: 'claude', configured: true })
+
+    expect(execFile).toHaveBeenCalledWith(
+      'cswap', ['switch', '2', '--force', '--json'], expect.anything(),
+    )
+    expect(execFile.mock.calls.filter(([, args]) => args[0] === 'list')).toHaveLength(2)
+    expect(supervisor.enable).toHaveBeenCalledOnce()
+  })
+
+  it('replaces an unusable active Claude account with a usable account', async () => {
+    let activeAccountNumber = 1
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'cswap' && args[0] === '--version') {
+        return { stdout: 'cswap 0.25.0', stderr: '' }
+      }
+      if (command === 'cswap' && args[0] === 'list') {
+        return {
+          stdout: JSON.stringify({
+            schemaVersion: 1,
+            activeAccountNumber,
+            accounts: [
+              {
+                number: 1,
+                email: 'expired@example.com',
+                disabled: false,
+                usageStatus: 'relogin_required',
+              },
+              {
+                number: 2,
+                email: 'ready@example.com',
+                disabled: false,
+                usageStatus: 'ok',
+              },
+            ],
+          }),
+          stderr: '',
+        }
+      }
+      if (command === 'cswap' && args[0] === 'switch') activeAccountNumber = Number(args[1])
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime, supervisor } = setup({ execFile })
+
+    await expect(runtime.apply({ provider: 'claude', payload: '{}' }))
+      .resolves.toMatchObject({ provider: 'claude', configured: true })
+
+    expect(execFile).toHaveBeenCalledWith(
+      'cswap', ['switch', '2', '--force', '--json'], expect.anything(),
+    )
+    expect(supervisor.enable).toHaveBeenCalledOnce()
+  })
+
+  it('rejects imported Claude credentials when every account requires login', async () => {
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'cswap' && args[0] === '--version') {
+        return { stdout: 'cswap 0.25.0', stderr: '' }
+      }
+      if (command === 'cswap' && args[0] === 'list') {
+        return {
+          stdout: JSON.stringify({
+            schemaVersion: 1,
+            activeAccountNumber: null,
+            accounts: [{
+              number: 1,
+              email: 'expired@example.com',
+              disabled: false,
+              usageStatus: 'relogin_required',
+            }],
+          }),
+          stderr: '',
+        }
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime, supervisor } = setup({ execFile })
+
+    await expect(runtime.apply({ provider: 'claude', payload: '{}' }))
+      .rejects.toMatchObject({ kind: 'CLAUDE_APPLY_VERIFICATION_FAILED' })
+
+    expect(execFile.mock.calls.some(([, args]) => args[0] === 'switch')).toBe(false)
+    expect(supervisor.enable).not.toHaveBeenCalled()
+  })
+
   it('installs the managed claude-swap version when the current version differs', async () => {
     const execFile = vi.fn(async (command: string, args: string[]) => {
       if (command === 'cswap' && args[0] === '--version') {
