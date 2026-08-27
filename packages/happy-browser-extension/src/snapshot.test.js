@@ -265,6 +265,19 @@ describe('collectSnapshot', () => {
         expect(collectSnapshot().elements.find((element) => element.name === 'Contained fixed action')).toBeUndefined()
     })
 
+    it('does not clip a viewport-fixed control under a container-type ancestor', () => {
+        render(`
+            ${Array.from({ length: 200 }, (_, i) => `<button>earlier-${i}</button>`).join('')}
+            <div id="clipping-parent" style="container-type:size;overflow-x:hidden;overflow-y:hidden">
+                <button id="fixed-action" style="position:fixed">Container query fixed action</button>
+            </div>
+        `)
+        document.getElementById('clipping-parent').getBoundingClientRect = () => ({ top: 0, left: 0, bottom: 1, right: 1, width: 1, height: 1 })
+        document.getElementById('fixed-action').getBoundingClientRect = () => ({ top: 300, left: 20, bottom: 340, right: 180, width: 160, height: 40 })
+
+        expect(collectSnapshot().elements.some((element) => element.name === 'Container query fixed action')).toBe(true)
+    })
+
     it('does not treat a slotted control clipped by its shadow container as viewport-visible', () => {
         render(`
             ${Array.from({ length: 200 }, (_, i) => `<button>earlier-${i}</button>`).join('')}

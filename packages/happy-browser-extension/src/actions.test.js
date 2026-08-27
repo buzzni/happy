@@ -228,6 +228,22 @@ describe('scrollRef', () => {
         expect(result).toMatchObject({ ok: true, moved: true, after: { y: 250 } })
     })
 
+    it('does not treat container-type as a fixed containing block', () => {
+        render(`
+            <div id="results" style="container-type:size;overflow-y:auto">
+                <div style="position:fixed"><button>Fixed result</button></div>
+            </div>
+        `)
+        const results = document.getElementById('results')
+        markScrollable(results)
+        collectSnapshot()
+
+        const result = scrollRef('@e1', 0, 250)
+
+        expect(results.scrollTop).toBe(0)
+        expect(result).toMatchObject({ ok: false, code: 'NOT_SCROLLABLE' })
+    })
+
     it('supports Chrome RTL horizontal coordinates and reports the left boundary', () => {
         render('<div id="rail" dir="rtl" style="overflow-x:auto"><button>First card</button></div>')
         const rail = document.getElementById('rail')

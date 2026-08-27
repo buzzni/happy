@@ -119,10 +119,12 @@ async function runVerification() {
     check('a visible control after clipped controls stays actionable', snap1.elements.some((e) => e.name === 'Visible after clipped controls'), JSON.stringify(snap1.elements))
     check('a fixed control escapes a non-containing overflow ancestor', snap1.elements.some((e) => e.name === 'Fixed escape action'), JSON.stringify(snap1.elements))
     check('a fixed control is clipped by a will-change containing block', !snap1.elements.some((e) => e.role === 'button' && e.name === 'Contained fixed fixture action'), JSON.stringify(snap1.elements))
+    check('container-type does not clip a viewport-fixed control', snap1.elements.some((e) => e.name === 'Container query fixed action'), JSON.stringify(snap1.elements))
     const inputRef = snap1.elements.find((e) => e.name === 'Your name').ref
     const buttonRef = snap1.elements.find((e) => e.name === 'Submit').ref
     const editableRef = snap1.elements.find((e) => e.role === 'textbox' && e.tag === 'div')?.ref
     const fixedNonScrollerRef = snap1.elements.find((e) => e.name === 'Fixed non-scroller action')?.ref
+    const containerQueryFixedRef = snap1.elements.find((e) => e.name === 'Container query fixed action')?.ref
 
     console.log('3. reject background document scrolling for a viewport-fixed ref')
     check('snapshot exposes the viewport-fixed ref', !!fixedNonScrollerRef, JSON.stringify(snap1.elements))
@@ -133,6 +135,14 @@ async function runVerification() {
         fixedScrollError = error.message
     }
     check('viewport-fixed ref has no false document scroll ancestor', /NOT_SCROLLABLE/.test(fixedScrollError), fixedScrollError)
+    check('snapshot exposes the container-query viewport-fixed ref', !!containerQueryFixedRef, JSON.stringify(snap1.elements))
+    let containerQueryScrollError = ''
+    try {
+        await call('scroll', { tabId: tab.id, ref: containerQueryFixedRef, deltaY: 200 })
+    } catch (error) {
+        containerQueryScrollError = error.message
+    }
+    check('container-type is not mistaken for a scrollable fixed containing block', /NOT_SCROLLABLE/.test(containerQueryScrollError), containerQueryScrollError)
 
     console.log('4. fill the name input, then snapshot to confirm the value actually landed')
     const fillResult = await call('fill', { tabId: tab.id, ref: inputRef, value: 'Happy' })

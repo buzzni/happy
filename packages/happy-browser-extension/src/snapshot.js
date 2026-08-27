@@ -183,7 +183,6 @@ export function collectSnapshot() {
                 || nonNone(style.backdropFilter)
                 || nonNone(style.webkitBackdropFilter)
                 || /(?:^|\s)(?:layout|paint|strict|content)(?:\s|$)/.test(contain)
-                || (style.containerType && style.containerType !== 'normal')
                 || style.contentVisibility === 'auto'
                 || willChange.some((value) => ['transform', 'translate', 'rotate', 'scale', 'perspective', 'filter', 'backdrop-filter'].includes(value))
         }
