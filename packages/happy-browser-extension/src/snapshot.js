@@ -52,6 +52,7 @@ export function collectSnapshot() {
     const isInHiddenTree = (element) => {
         if (hiddenTrees.has(element)) return hiddenTrees.get(element)
         const parent = parentAcrossShadow(element)
+        const style = styleOf(element)
         const firstSummary = parent?.tagName === 'DETAILS'
             ? Array.from(parent.children).find((child) => child.tagName === 'SUMMARY')
             : null
@@ -61,7 +62,8 @@ export function collectSnapshot() {
         const hidden = element.hasAttribute('hidden')
             || element.hasAttribute('inert')
             || element.getAttribute('aria-hidden') === 'true'
-            || styleOf(element).display === 'none'
+            || style.display === 'none'
+            || style.contentVisibility === 'hidden'
             || collapsedByDetails
             || (parent ? isInHiddenTree(parent) : false)
         hiddenTrees.set(element, hidden)
@@ -183,7 +185,7 @@ export function collectSnapshot() {
                 || /(?:^|\s)(?:layout|paint|strict|content)(?:\s|$)/.test(contain)
                 || (style.containerType && style.containerType !== 'normal')
                 || style.contentVisibility === 'auto'
-                || willChange.some((value) => value === 'transform' || value === 'perspective' || value === 'filter')
+                || willChange.some((value) => ['transform', 'translate', 'rotate', 'scale', 'perspective', 'filter', 'backdrop-filter'].includes(value))
         }
 
         let clippingParent = parentAcrossShadow(element)

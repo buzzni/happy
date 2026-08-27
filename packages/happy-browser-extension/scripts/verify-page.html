@@ -15,6 +15,7 @@
   <div aria-hidden="true"><button>Aria hidden fixture action</button></div>
   <div inert><button>Inert fixture action</button></div>
   <div style="display:none"><button>Display none fixture action</button></div>
+  <div style="content-visibility:hidden"><button>Content visibility fixture action</button></div>
   <details>
     <summary>Collapsed details summary</summary>
     <button>Collapsed details action</button>
@@ -43,6 +44,12 @@
   <div id="long-page-prefix"></div>
   <div id="clipping-fixture" style="position:fixed; top:0; left:0; width:300px; height:1px; overflow:hidden">
     <button style="position:fixed; top:360px; right:10px">Fixed escape action</button>
+  </div>
+  <div style="position:fixed; top:0; left:320px; width:300px; height:1px; overflow:clip; will-change:translate">
+    <button style="position:fixed; top:360px; right:10px">Contained fixed fixture action</button>
+  </div>
+  <div style="position:fixed; top:240px; right:10px">
+    <button>Fixed non-scroller action</button>
   </div>
   <button id="visible-after-clipped" style="position:fixed; top:300px; right:10px">Visible after clipped controls</button>
   <div style="height:1400px"></div>
