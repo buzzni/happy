@@ -110,8 +110,9 @@ async function runVerification() {
     const snap1 = await snapshotUntilReady(tab.id)
     check('found the name input', snap1.elements.some((e) => e.role === 'textbox' && e.name === 'Your name'), JSON.stringify(snap1.elements))
     check('found the submit button', snap1.elements.some((e) => e.role === 'button' && e.name === 'Submit'), JSON.stringify(snap1.elements))
-    const hiddenFixtureNames = ['Hidden attribute fixture action', 'Aria hidden fixture action', 'Inert fixture action', 'Display none fixture action', 'Content visibility fixture action']
+    const hiddenFixtureNames = ['Hidden attribute fixture action', 'Aria hidden fixture action', 'Inert fixture action', 'Display none fixture action', 'Content visibility fixture action', 'Content-hidden nested action']
     check('hidden ancestor subtrees stay out of the snapshot', !snap1.elements.some((e) => hiddenFixtureNames.includes(e.name)), JSON.stringify(snap1.elements))
+    check('content-visibility keeps the interactive element shell', snap1.elements.some((e) => e.role === 'button' && e.name === 'Visible content-hidden shell'), JSON.stringify(snap1.elements))
     check('closed details exposes its summary', snap1.elements.some((e) => e.role === 'button' && e.name === 'Collapsed details summary'), JSON.stringify(snap1.elements))
     check('closed details keeps collapsed controls out', !snap1.elements.some((e) => e.name === 'Collapsed details action'), JSON.stringify(snap1.elements))
     check('clipped controls stay out of the viewport tail', !snap1.elements.some((e) => e.role === 'button' && e.name.startsWith('Clipped fixture action')), JSON.stringify(snap1.elements))

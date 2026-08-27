@@ -63,8 +63,8 @@ export function collectSnapshot() {
             || element.hasAttribute('inert')
             || element.getAttribute('aria-hidden') === 'true'
             || style.display === 'none'
-            || style.contentVisibility === 'hidden'
             || collapsedByDetails
+            || (parent && styleOf(parent).contentVisibility === 'hidden')
             || (parent ? isInHiddenTree(parent) : false)
         hiddenTrees.set(element, hidden)
         return hidden
@@ -188,25 +188,29 @@ export function collectSnapshot() {
                 || willChange.some((value) => ['transform', 'translate', 'rotate', 'scale', 'perspective', 'filter', 'backdrop-filter'].includes(value))
         }
 
-        let clippingParent = parentAcrossShadow(element)
-        if (styleOf(element).position === 'fixed') {
-            while (clippingParent && !establishesFixedContainingBlock(styleOf(clippingParent))) {
-                clippingParent = parentAcrossShadow(clippingParent)
-            }
-        }
-
-        for (let parent = clippingParent; parent; parent = parentAcrossShadow(parent)) {
+        let escapesAncestors = styleOf(element).position === 'fixed'
+        for (let parent = parentAcrossShadow(element); parent;) {
             const style = styleOf(parent)
-            if (!clips(style.overflowX || style.overflow) && !clips(style.overflowY || style.overflow)) continue
-            const parentBox = parent.getBoundingClientRect()
-            if (clips(style.overflowX || style.overflow)) {
-                left = Math.max(left, parentBox.left)
-                right = Math.min(right, parentBox.right)
+            if (escapesAncestors && !establishesFixedContainingBlock(style)) {
+                parent = parentAcrossShadow(parent)
+                continue
             }
-            if (clips(style.overflowY || style.overflow)) {
-                top = Math.max(top, parentBox.top)
-                bottom = Math.min(bottom, parentBox.bottom)
+            escapesAncestors = false
+            const clipsX = clips(style.overflowX || style.overflow)
+            const clipsY = clips(style.overflowY || style.overflow)
+            if (clipsX || clipsY) {
+                const parentBox = parent.getBoundingClientRect()
+                if (clipsX) {
+                    left = Math.max(left, parentBox.left)
+                    right = Math.min(right, parentBox.right)
+                }
+                if (clipsY) {
+                    top = Math.max(top, parentBox.top)
+                    bottom = Math.min(bottom, parentBox.bottom)
+                }
             }
+            if (style.position === 'fixed') escapesAncestors = true
+            parent = parentAcrossShadow(parent)
         }
 
         return right > left && bottom > top

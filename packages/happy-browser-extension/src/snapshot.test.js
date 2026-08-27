@@ -98,6 +98,16 @@ describe('collectSnapshot', () => {
         expect(collectSnapshot().elements.map((e) => e.name)).toEqual(['Shown'])
     })
 
+    it('keeps an interactive content-visibility:hidden element while skipping its contents', () => {
+        render(`
+            <button style="content-visibility:hidden" aria-label="Visible button shell">
+                <span role="button">Skipped child action</span>
+            </button>
+        `)
+
+        expect(collectSnapshot().elements.map((e) => e.name)).toEqual(['Visible button shell'])
+    })
+
     it('picks up elements made interactive by role or contenteditable', () => {
         render(`
             <div role="button">역할 버튼</div>
@@ -224,6 +234,22 @@ describe('collectSnapshot', () => {
         document.getElementById('fixed-action').getBoundingClientRect = () => ({ top: 300, left: 20, bottom: 340, right: 180, width: 160, height: 40 })
 
         expect(collectSnapshot().elements.some((element) => element.name === 'Fixed action')).toBe(true)
+    })
+
+    it('keeps a control inside a viewport-fixed wrapper visible outside a clipping ancestor', () => {
+        render(`
+            ${Array.from({ length: 200 }, (_, i) => `<button>earlier-${i}</button>`).join('')}
+            <div id="clipping-parent" style="overflow-x:hidden;overflow-y:hidden">
+                <div id="fixed-wrapper" style="position:fixed">
+                    <button id="fixed-child">Fixed child action</button>
+                </div>
+            </div>
+        `)
+        document.getElementById('clipping-parent').getBoundingClientRect = () => ({ top: 0, left: 0, bottom: 1, right: 1, width: 1, height: 1 })
+        document.getElementById('fixed-wrapper').getBoundingClientRect = () => ({ top: 300, left: 20, bottom: 340, right: 180, width: 160, height: 40 })
+        document.getElementById('fixed-child').getBoundingClientRect = () => ({ top: 300, left: 20, bottom: 340, right: 180, width: 160, height: 40 })
+
+        expect(collectSnapshot().elements.some((element) => element.name === 'Fixed child action')).toBe(true)
     })
 
     it('clips a fixed control inside a will-change containing block', () => {

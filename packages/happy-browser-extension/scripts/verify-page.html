@@ -16,6 +16,9 @@
   <div inert><button>Inert fixture action</button></div>
   <div style="display:none"><button>Display none fixture action</button></div>
   <div style="content-visibility:hidden"><button>Content visibility fixture action</button></div>
+  <button style="content-visibility:hidden" aria-label="Visible content-hidden shell">
+    <span role="button">Content-hidden nested action</span>
+  </button>
   <details>
     <summary>Collapsed details summary</summary>
     <button>Collapsed details action</button>
@@ -43,7 +46,7 @@
   </section>
   <div id="long-page-prefix"></div>
   <div id="clipping-fixture" style="position:fixed; top:0; left:0; width:300px; height:1px; overflow:hidden">
-    <button style="position:fixed; top:360px; right:10px">Fixed escape action</button>
+    <div style="position:fixed; top:360px; right:10px"><button>Fixed escape action</button></div>
   </div>
   <div style="position:fixed; top:0; left:320px; width:300px; height:1px; overflow:clip; will-change:translate">
     <button style="position:fixed; top:360px; right:10px">Contained fixed fixture action</button>
