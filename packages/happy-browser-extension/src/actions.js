@@ -94,3 +94,80 @@ export function fillRef(ref, value) {
 
     return { ok: false, code: 'NOT_FILLABLE', message: `Element ${ref} (<${tag}>) is not a text input, textarea or contenteditable element` }
 }
+
+/**
+ * Scroll the document, or the nearest scrollable container of a snapshot ref.
+ *
+ * This function is injected with chrome.scripting.executeScript, so it must be
+ * self-contained just like clickRef/fillRef above. Basic scripted scrolling is
+ * intentionally permission-free; a trusted CDP wheel is a separate tier and
+ * must not be required for ordinary pages and virtual lists.
+ */
+export function scrollRef(ref, deltaX, deltaY) {
+    const x = Number(deltaX ?? 0)
+    const y = Number(deltaY ?? 0)
+    if (!Number.isFinite(x) || !Number.isFinite(y) || (x === 0 && y === 0)) {
+        return { ok: false, code: 'INVALID_SCROLL_DELTA', message: 'deltaX and deltaY must be finite numbers and at least one must be non-zero' }
+    }
+
+    let source = null
+    if (ref) {
+        source = window.__happyRefs && window.__happyRefs.get(ref)
+        if (!source || !source.isConnected) {
+            return { ok: false, code: 'REF_NOT_FOUND', message: `No element for ${ref} — the page may have changed since the last snapshot. Take a new snapshot and use its refs.` }
+        }
+    }
+
+    const documentScroller = document.scrollingElement || document.documentElement || document.body
+    const maxFor = (element) => ({
+        x: Math.max(0, element.scrollWidth - element.clientWidth),
+        y: Math.max(0, element.scrollHeight - element.clientHeight),
+    })
+    const supportsRequestedAxes = (element) => {
+        const max = maxFor(element)
+        if (element === documentScroller) {
+            return (x === 0 || max.x > 0) && (y === 0 || max.y > 0)
+        }
+        const style = element.ownerDocument.defaultView.getComputedStyle(element)
+        const overflowX = style.overflowX || style.overflow
+        const overflowY = style.overflowY || style.overflow
+        const permitsScroll = (overflow) => overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay'
+        return (x === 0 || (max.x > 0 && permitsScroll(overflowX)))
+            && (y === 0 || (max.y > 0 && permitsScroll(overflowY)))
+    }
+    const parentAcrossShadow = (element) => {
+        if (element.parentElement) return element.parentElement
+        const root = typeof element.getRootNode === 'function' ? element.getRootNode() : null
+        return root && root.host ? root.host : null
+    }
+
+    let target = source || documentScroller
+    if (source) {
+        while (target && !supportsRequestedAxes(target)) target = parentAcrossShadow(target)
+        if (!target && supportsRequestedAxes(documentScroller)) target = documentScroller
+        if (!target) {
+            return { ok: false, code: 'NOT_SCROLLABLE', message: `No scrollable container for ${ref} in the requested direction` }
+        }
+    }
+
+    const before = { x: target.scrollLeft, y: target.scrollTop }
+    const max = maxFor(target)
+    target.scrollLeft = Math.max(0, Math.min(max.x, before.x + x))
+    target.scrollTop = Math.max(0, Math.min(max.y, before.y + y))
+    const after = { x: target.scrollLeft, y: target.scrollTop }
+
+    return {
+        ok: true,
+        target: ref || 'document',
+        moved: after.x !== before.x || after.y !== before.y,
+        before,
+        after,
+        max,
+        atBoundary: {
+            top: after.y <= 0,
+            bottom: after.y >= max.y,
+            left: after.x <= 0,
+            right: after.x >= max.x,
+        },
+    }
+}

@@ -7,7 +7,7 @@
  */
 
 import { collectSnapshot } from './snapshot.js'
-import { clickRef, fillRef, locateRef } from './actions.js'
+import { clickRef, fillRef, locateRef, scrollRef } from './actions.js'
 import { parseAllowlist, isUrlAllowed } from './allowlist.js'
 import { isDebuggerTierEnabled, captureFullPage, captureViewport, dispatchTrustedClick, insertTrustedText } from './cdp.js'
 import { decodeRef, mergeFrameSnapshots } from './frameRefs.js'
@@ -274,6 +274,22 @@ const handlers = {
             return insertTrustedText(chrome, tab.id, params.value)
         }
         return runPageAction(fillRef, [innerRef, params.value], params, chrome, allowlist, frameId)
+    },
+
+    scroll: async (params, chrome, allowlist) => {
+        const deltaX = params.deltaX ?? 0
+        const deltaY = params.deltaY ?? 0
+        if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY) || (deltaX === 0 && deltaY === 0)) {
+            throw new CommandError('INVALID_SCROLL_DELTA', 'deltaX and deltaY must be finite numbers and at least one must be non-zero')
+        }
+        if (Math.abs(deltaX) > 10_000 || Math.abs(deltaY) > 10_000) {
+            throw new CommandError('INVALID_SCROLL_DELTA', 'deltaX and deltaY must be between -10000 and 10000 pixels')
+        }
+        const { frameId, innerRef } = params.ref
+            ? decodeRef(params.ref)
+            : { frameId: 0, innerRef: null }
+        const result = await runPageAction(scrollRef, [innerRef, deltaX, deltaY], params, chrome, allowlist, frameId)
+        return params.ref ? { ...result, target: params.ref } : result
     },
 
     navigate: async (params, chrome, allowlist) => {

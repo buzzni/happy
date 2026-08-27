@@ -7,10 +7,37 @@
   <button id="submit-btn">Submit</button>
   <input id="result" aria-label="Result" readonly>
   <div contenteditable="true" id="editable-area">edit me</div>
+  <section>
+    <h2>Nested lazy results</h2>
+    <div id="nested-results" aria-label="Nested lazy results" style="height:180px; overflow-y:auto; border:1px solid #999">
+      <button>Nested first item</button>
+      <div style="height:700px"></div>
+      <div id="nested-sentinel">Nested loading sentinel</div>
+    </div>
+  </section>
+  <div style="height:1400px"></div>
+  <div id="document-sentinel">Document loading sentinel</div>
   <script>
     document.getElementById('submit-btn').addEventListener('click', function () {
       document.getElementById('result').value = 'Hello, ' + document.getElementById('name-input').value + '!'
     })
+
+    const nestedResults = document.getElementById('nested-results')
+    new IntersectionObserver(function (entries, observer) {
+      if (!entries.some(function (entry) { return entry.isIntersecting })) return
+      const button = document.createElement('button')
+      button.textContent = 'Nested lazy item'
+      nestedResults.appendChild(button)
+      observer.disconnect()
+    }, { root: nestedResults }).observe(document.getElementById('nested-sentinel'))
+
+    new IntersectionObserver(function (entries, observer) {
+      if (!entries.some(function (entry) { return entry.isIntersecting })) return
+      const button = document.createElement('button')
+      button.textContent = 'Document lazy item'
+      document.body.appendChild(button)
+      observer.disconnect()
+    }).observe(document.getElementById('document-sentinel'))
   </script>
 </body>
 </html>

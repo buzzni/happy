@@ -1,11 +1,22 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach } from 'vitest'
 import { collectSnapshot } from './snapshot.js'
-import { clickRef, fillRef } from './actions.js'
+import { clickRef, fillRef, scrollRef } from './actions.js'
 
 function render(html) {
     document.body.innerHTML = html
     delete window.__happyRefs
+}
+
+function markScrollable(element, { scrollTop = 0, scrollLeft = 0, scrollHeight = 1000, scrollWidth = 200, clientHeight = 200, clientWidth = 200 } = {}) {
+    Object.defineProperties(element, {
+        scrollTop: { configurable: true, writable: true, value: scrollTop },
+        scrollLeft: { configurable: true, writable: true, value: scrollLeft },
+        scrollHeight: { configurable: true, value: scrollHeight },
+        scrollWidth: { configurable: true, value: scrollWidth },
+        clientHeight: { configurable: true, value: clientHeight },
+        clientWidth: { configurable: true, value: clientWidth },
+    })
 }
 
 /**
@@ -100,6 +111,82 @@ describe('fillRef', () => {
     })
 })
 
+describe('scrollRef', () => {
+    beforeEach(() => render(''))
+
+    it('scrolls the document when no ref is supplied', () => {
+        markScrollable(document.documentElement, { scrollHeight: 1400, clientHeight: 400 })
+
+        const result = scrollRef(null, 0, 600)
+
+        expect(document.documentElement.scrollTop).toBe(600)
+        expect(result).toMatchObject({
+            ok: true,
+            target: 'document',
+            moved: true,
+            before: { x: 0, y: 0 },
+            after: { x: 0, y: 600 },
+            max: { x: 0, y: 1000 },
+            atBoundary: { top: false, bottom: false, left: true, right: true },
+        })
+    })
+
+    it('scrolls the nearest scrollable ancestor of an interactive ref', () => {
+        render('<div id="results" style="overflow-y:auto"><button>First item</button></div>')
+        const results = document.getElementById('results')
+        markScrollable(results)
+        collectSnapshot()
+
+        const result = scrollRef('@e1', 0, 250)
+
+        expect(results.scrollTop).toBe(250)
+        expect(result).toMatchObject({ ok: true, target: '@e1', moved: true, after: { y: 250 } })
+    })
+
+    it('supports horizontal scrolling', () => {
+        render('<div id="rail" style="overflow-x:auto"><button>First card</button></div>')
+        const rail = document.getElementById('rail')
+        markScrollable(rail, { scrollWidth: 1000, clientWidth: 200, scrollHeight: 200, clientHeight: 200 })
+        collectSnapshot()
+
+        const result = scrollRef('@e1', 300, 0)
+
+        expect(rail.scrollLeft).toBe(300)
+        expect(result).toMatchObject({ ok: true, moved: true, after: { x: 300, y: 0 } })
+    })
+
+    it('reports a boundary instead of claiming movement', () => {
+        render('<div id="results" style="overflow-y:auto"><button>Last item</button></div>')
+        const results = document.getElementById('results')
+        markScrollable(results, { scrollTop: 800 })
+        collectSnapshot()
+
+        expect(scrollRef('@e1', 0, 300)).toMatchObject({
+            ok: true,
+            moved: false,
+            after: { y: 800 },
+            atBoundary: { bottom: true },
+        })
+    })
+
+    it('reports REF_NOT_FOUND for a stale scroll target', () => {
+        render('<div id="results" style="overflow-y:auto"><button>Item</button></div>')
+        markScrollable(document.getElementById('results'))
+        collectSnapshot()
+        render('<button>Replacement</button>')
+
+        expect(scrollRef('@e1', 0, 200)).toMatchObject({ ok: false, code: 'REF_NOT_FOUND' })
+    })
+
+    it('reports NOT_SCROLLABLE when neither the ref nor its document can move', () => {
+        render('<button>Only item</button>')
+        markScrollable(document.documentElement, { scrollHeight: 300, clientHeight: 300, scrollWidth: 300, clientWidth: 300 })
+        collectSnapshot()
+
+        expect(scrollRef('@e1', 0, 200)).toMatchObject({ ok: false, code: 'NOT_SCROLLABLE' })
+    })
+})
+
 describe('self-containment (chrome.scripting.executeScript reconstitutes each function alone)', () => {
     it('clickRef succeeds detached from this module — success path', () => {
         render('<button>Save</button>')
@@ -121,5 +208,10 @@ describe('self-containment (chrome.scripting.executeScript reconstitutes each fu
     it('fillRef succeeds detached from this module — error path', () => {
         render('')
         expect(detachFromModuleScope(fillRef)('@e1', 'x')).toMatchObject({ ok: false, code: 'REF_NOT_FOUND' })
+    })
+
+    it('scrollRef succeeds detached from this module', () => {
+        markScrollable(document.documentElement, { scrollHeight: 900, clientHeight: 300 })
+        expect(detachFromModuleScope(scrollRef)(null, 0, 200)).toMatchObject({ ok: true, moved: true })
     })
 })

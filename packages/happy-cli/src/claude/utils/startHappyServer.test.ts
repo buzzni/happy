@@ -131,12 +131,65 @@ describe('startHappyServer tool registration', () => {
                 'browser_screenshot',
                 'browser_click',
                 'browser_fill',
+                'browser_scroll',
                 'browser_navigate',
                 'browser_open_tab',
                 'browser_close_tab',
                 'browser_capabilities',
             ]));
             expect(names).toEqual(expect.arrayContaining(server.toolNames));
+        } finally {
+            server.stop();
+        }
+    });
+
+    it('rejects a zero browser scroll before reaching the daemon', async () => {
+        const client = { hasTitle: () => false, sendClaudeSessionMessage: vi.fn(), sessionId: 'test' } as unknown as ApiSessionClient;
+        const server = await startHappyServer(client);
+        try {
+            const response = await fetch(server.url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Accept: 'application/json, text/event-stream',
+                },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 2,
+                    method: 'tools/call',
+                    params: { name: 'browser_scroll', arguments: { deltaX: 0, deltaY: 0 } },
+                }),
+            });
+            const raw = await response.text();
+            const payload = JSON.parse(raw.startsWith('event:') ? raw.slice(raw.indexOf('data: ') + 6) : raw);
+            expect(payload.result.isError).toBe(true);
+            expect(payload.result.content[0].text).toMatch(/non-zero/i);
+        } finally {
+            server.stop();
+        }
+    });
+
+    it('rejects an unbounded browser scroll in the MCP schema', async () => {
+        const client = { hasTitle: () => false, sendClaudeSessionMessage: vi.fn(), sessionId: 'test' } as unknown as ApiSessionClient;
+        const server = await startHappyServer(client);
+        try {
+            const response = await fetch(server.url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Accept: 'application/json, text/event-stream',
+                },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 3,
+                    method: 'tools/call',
+                    params: { name: 'browser_scroll', arguments: { deltaY: 10_001 } },
+                }),
+            });
+            const raw = await response.text();
+            const payload = JSON.parse(raw.startsWith('event:') ? raw.slice(raw.indexOf('data: ') + 6) : raw);
+            expect(payload.result.isError).toBe(true);
+            expect(payload.result.content[0].text).toContain('10000');
         } finally {
             server.stop();
         }

@@ -13,6 +13,7 @@ export const BROWSER_TOOL_NAMES = [
     'browser_screenshot',
     'browser_click',
     'browser_fill',
+    'browser_scroll',
     'browser_navigate',
     'browser_open_tab',
     'browser_close_tab',
@@ -123,7 +124,10 @@ function renderSnapshot(result: any): string {
     const elements = (result?.elements ?? []).map((element: any) => {
         const value = element.value ? ` value=${JSON.stringify(element.value)}` : ''
         const disabled = element.disabled ? ' [disabled]' : ''
-        return `${element.ref} ${element.role} ${JSON.stringify(element.name ?? '')}${value}${disabled}`
+        const scrollable = element.scrollable
+            ? ` [scrollable${element.scrollable.x ? ` x=${element.scrollable.left}/${element.scrollable.maxLeft}` : ''}${element.scrollable.y ? ` y=${element.scrollable.top}/${element.scrollable.maxTop}` : ''}]`
+            : ''
+        return `${element.ref} ${element.role} ${JSON.stringify(element.name ?? '')}${value}${disabled}${scrollable}`
     })
     const body = elements.length > 0 ? elements.join('\n') : 'No interactive elements found.'
     const note = result?.truncated
@@ -134,7 +138,7 @@ function renderSnapshot(result: any): string {
 
 export type BrowserBridgeMethod =
     | 'tabs_list' | 'snapshot' | 'screenshot'
-    | 'click' | 'fill' | 'navigate' | 'tabs_open' | 'tabs_close'
+    | 'click' | 'fill' | 'scroll' | 'navigate' | 'tabs_open' | 'tabs_close'
     | 'capabilities'
 
 function renderCapabilities(result: any): string {
@@ -153,6 +157,19 @@ function renderSuccess(method: BrowserBridgeMethod, params: any, result: any): s
             return `Clicked ${params.ref}.`
         case 'fill':
             return `Filled ${params.ref} with ${JSON.stringify(params.value)}.`
+        case 'scroll': {
+            const before = `(${result.before?.x ?? '?'},${result.before?.y ?? '?'})`
+            const after = `(${result.after?.x ?? '?'},${result.after?.y ?? '?'})`
+            const max = `(${result.max?.x ?? '?'},${result.max?.y ?? '?'})`
+            const boundaries = Object.entries(result.atBoundary ?? {})
+                .filter(([, reached]) => reached)
+                .map(([name]) => name)
+                .join(', ')
+            const movement = result.moved
+                ? `Scrolled ${result.target ?? params.ref ?? 'document'} from ${before} to ${after} of ${max}.`
+                : `Scroll target ${result.target ?? params.ref ?? 'document'} did not move${boundaries ? ` (at boundary: ${boundaries})` : ''}; position remains ${after} of ${max}.`
+            return `${movement} Run browser_snapshot again before using refs because scrolling may lazy-load or replace page content.`
+        }
         case 'navigate':
             return `Navigated to ${params.url}.`
         case 'tabs_open':

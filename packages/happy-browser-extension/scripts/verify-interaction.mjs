@@ -92,6 +92,15 @@ async function snapshotUntilReady(tabId, tries = 6) {
     throw new Error('page never produced a snapshot with elements — did it load?')
 }
 
+async function snapshotUntilNamed(tabId, name, tries = 10) {
+    for (let i = 0; i < tries; i++) {
+        const snap = await call('snapshot', { tabId })
+        if (snap.elements.some((element) => element.name === name)) return snap
+        await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+    throw new Error(`${name} never appeared after scrolling`)
+}
+
 async function runVerification() {
     console.log('1. tabs_open')
     const tab = await call('tabs_open', { url: pageUrl })
@@ -127,11 +136,29 @@ async function runVerification() {
         console.log('6. (skipped — no contenteditable ref found in snapshot)')
     }
 
-    console.log('7. screenshot')
+    console.log('7. scroll a nested lazy-loading region')
+    const nestedBefore = await call('snapshot', { tabId: tab.id })
+    check('nested lazy item starts absent', !nestedBefore.elements.some((element) => element.name === 'Nested lazy item'), JSON.stringify(nestedBefore.elements))
+    const nestedRegion = nestedBefore.elements.find((element) => element.role === 'scrollable' && element.name === 'Nested lazy results')
+    check('snapshot exposes the nested scrollable region', !!nestedRegion, JSON.stringify(nestedBefore.elements))
+    const nestedScroll = await call('scroll', { tabId: tab.id, ref: nestedRegion.ref, deltaY: 800 })
+    check('nested region actually moved', nestedScroll.moved && nestedScroll.after.y > nestedScroll.before.y, JSON.stringify(nestedScroll))
+    await snapshotUntilNamed(tab.id, 'Nested lazy item')
+    console.log('  ok  nested lazy item appeared after scroll + re-snapshot')
+
+    console.log('8. scroll the document to a lazy-loading item')
+    const documentBefore = await call('snapshot', { tabId: tab.id })
+    check('document lazy item starts absent', !documentBefore.elements.some((element) => element.name === 'Document lazy item'), JSON.stringify(documentBefore.elements))
+    const documentScroll = await call('scroll', { tabId: tab.id, deltaY: 1800 })
+    check('document actually moved', documentScroll.moved && documentScroll.after.y > documentScroll.before.y, JSON.stringify(documentScroll))
+    await snapshotUntilNamed(tab.id, 'Document lazy item')
+    console.log('  ok  document lazy item appeared after scroll + re-snapshot')
+
+    console.log('9. screenshot')
     const shot = await call('screenshot', { tabId: tab.id })
     check('screenshot has png data', shot.mimeType === 'image/png' && shot.dataB64.length > 100, `len=${shot.dataB64?.length}`)
 
-    console.log('8. REF_NOT_FOUND on a stale ref after fill changed the page')
+    console.log('10. REF_NOT_FOUND on an unknown ref')
     let staleRejected = false
     let staleOutcome
     try {
@@ -143,6 +170,6 @@ async function runVerification() {
     }
     check('unknown ref is rejected with guidance', staleRejected, `expected a REF_NOT_FOUND-style error, got: ${JSON.stringify(staleOutcome)}`)
 
-    console.log('9. tabs_close')
+    console.log('11. tabs_close')
     await call('tabs_close', { tabId: tab.id })
 }

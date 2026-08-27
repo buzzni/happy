@@ -139,12 +139,16 @@ node packages/happy-browser-extension/scripts/dev-bridge.mjs
 | `screenshot` | `tabId?`, `fullPage?` | `{ mimeType, dataB64 }` (기본은 보이는 영역 PNG) |
 | `click` | `ref`, `tabId?`, `trusted?` | `{ ok: true }` |
 | `fill` | `ref`, `value`, `tabId?`, `trusted?` | `{ ok: true }` (`value: ""` 로 필드 지우기) |
+| `scroll` | `deltaX?`, `deltaY?`, `ref?`, `tabId?` | 실제 이동 전후 위치와 경계 상태 |
 | `capabilities` | — | `{ debugger, commands }` |
 | `navigate` | `url`, `tabId?` | `{ ok: true }` |
 | `tabs_open` | `url` | 새 탭 정보 (id, windowId, url) |
 | `tabs_close` | `tabId` | `{ ok: true }` |
 
-`tabId` 를 생략하면 활성 탭을 대상으로 합니다. `ref` 는 가장 최근 `snapshot` 이
+`tabId` 를 생략하면 활성 탭을 대상으로 합니다. `scroll`의 `ref`를 생략하면 문서
+전체를 스크롤하고, 지정하면 해당 요소 또는 가장 가까운 스크롤 가능 조상을
+이동합니다. lazy loading으로 DOM이 바뀔 수 있으므로 스크롤 뒤에는 새 `snapshot`을
+가져옵니다. `ref` 는 가장 최근 `snapshot` 이
 돌려준 `@eN` 값입니다 — 페이지가 바뀌면(내비게이션 포함) 무효화되므로 그때는
 다시 스냅샷을 떠야 합니다. 무효한 ref 로 click/fill 을 호출하면 재스냅샷을
 안내하는 메시지와 함께 실패합니다.
@@ -163,7 +167,8 @@ node packages/happy-browser-extension/scripts/dev-bridge.mjs
 
 세션 쪽에서는 `mcp__happy__browser_tabs` / `browser_snapshot` /
 `browser_screenshot` / `browser_click` / `browser_fill` / `browser_navigate` /
-`browser_open_tab` / `browser_close_tab` / `browser_capabilities` 도구로 노출됩니다.
+`browser_scroll` / `browser_open_tab` / `browser_close_tab` /
+`browser_capabilities` 도구로 노출됩니다.
 
 ## 테스트
 

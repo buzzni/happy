@@ -10,6 +10,7 @@
 
 export function collectSnapshot() {
     const MAX_ELEMENTS = 200
+    const MAX_SCROLLABLES = 20
     const MAX_NAME_LENGTH = 120
 
     const INTERACTIVE_SELECTOR = [
@@ -78,7 +79,9 @@ export function collectSnapshot() {
     }
 
     const refs = new Map()
+    const entriesByElement = new Map()
     const elements = []
+    const scrollableCandidates = []
     let truncated = false
 
     const record = (element) => {
@@ -93,6 +96,36 @@ export function collectSnapshot() {
         if (typeof element.value === 'string' && element.value !== '') entry.value = element.value
         if (element.disabled === true) entry.disabled = true
         elements.push(entry)
+        entriesByElement.set(element, entry)
+    }
+
+    const scrollableMetrics = (element) => {
+        const style = element.ownerDocument.defaultView.getComputedStyle(element)
+        const overflowX = style.overflowX || style.overflow
+        const overflowY = style.overflowY || style.overflow
+        const permitsScroll = (overflow) => overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay'
+        const maxLeft = Math.max(0, element.scrollWidth - element.clientWidth)
+        const maxTop = Math.max(0, element.scrollHeight - element.clientHeight)
+        const x = maxLeft > 0 && permitsScroll(overflowX)
+        const y = maxTop > 0 && permitsScroll(overflowY)
+        return {
+            x,
+            y,
+            left: element.scrollLeft,
+            top: element.scrollTop,
+            maxLeft,
+            maxTop,
+        }
+    }
+
+    const isInViewport = (element) => {
+        const box = element.getBoundingClientRect()
+        return box.width > 0
+            && box.height > 0
+            && box.bottom > 0
+            && box.right > 0
+            && box.top < element.ownerDocument.defaultView.innerHeight
+            && box.left < element.ownerDocument.defaultView.innerWidth
     }
 
     // Walks every element under `root`, stepping into open shadow roots as it
@@ -108,6 +141,10 @@ export function collectSnapshot() {
                 return
             }
             if (element.matches(INTERACTIVE_SELECTOR) && isVisible(element)) record(element)
+            if (isVisible(element) && isInViewport(element)) {
+                const metrics = scrollableMetrics(element)
+                if (metrics.x || metrics.y) scrollableCandidates.push({ element, metrics })
+            }
             if (element.shadowRoot) {
                 walk(element.shadowRoot)
                 if (truncated) return
@@ -116,6 +153,25 @@ export function collectSnapshot() {
     }
 
     walk(document)
+
+    for (const { element, metrics } of scrollableCandidates.slice(0, MAX_SCROLLABLES)) {
+        const existing = entriesByElement.get(element)
+        if (existing) {
+            existing.scrollable = metrics
+            continue
+        }
+        const ref = `@e${elements.length + 1}`
+        refs.set(ref, element)
+        const entry = {
+            ref,
+            tag: element.tagName.toLowerCase(),
+            role: 'scrollable',
+            name: nameOf(element),
+            scrollable: metrics,
+        }
+        elements.push(entry)
+        entriesByElement.set(element, entry)
+    }
 
     // Replaced wholesale so refs always match the snapshot just handed out.
     window.__happyRefs = refs
