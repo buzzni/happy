@@ -9,6 +9,7 @@ import { allocateUserSeq } from "@/storage/seq";
 import { buildNewMachineUpdate, buildUpdateMachineUpdate, buildDeleteMachineUpdate } from "@/app/events/eventRouter";
 
 const MACHINE_DATA_KEY_ENVELOPE_LENGTH = 105;
+const MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH = 140;
 
 function decodeMachineDataKeyEnvelope(value: string): Uint8Array | null {
     const decoded = Buffer.from(value, 'base64');
@@ -18,6 +19,10 @@ function decodeMachineDataKeyEnvelope(value: string): Uint8Array | null {
         return null;
     }
     return new Uint8Array(decoded);
+}
+
+function machineDataKeyEnvelopesEqual(left: Uint8Array, right: Uint8Array): boolean {
+    return Buffer.from(left).equals(Buffer.from(right));
 }
 
 export function machinesRoutes(app: Fastify) {
@@ -162,8 +167,8 @@ export function machinesRoutes(app: Fastify) {
                 id: z.string()
             }),
             body: z.object({
-                expectedDataEncryptionKey: z.string(),
-                replacementDataEncryptionKey: z.string()
+                expectedDataEncryptionKey: z.string().max(MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH),
+                replacementDataEncryptionKey: z.string().max(MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH)
             })
         }
     }, async (request, reply) => {
@@ -175,32 +180,34 @@ export function machinesRoutes(app: Fastify) {
         if (!expected || !replacement) {
             return reply.code(400).send({ error: 'invalid-data-encryption-key-envelope' });
         }
-
-        const updated = await db.machine.updateMany({
-            where: {
-                id,
-                accountId: userId,
-                dataEncryptionKey: new Uint8Array(expected)
-            },
-            data: {
-                dataEncryptionKey: new Uint8Array(replacement)
-            }
-        });
-        if (updated.count === 0) {
-            const machine = await db.machine.findFirst({
-                where: { id, accountId: userId },
-                select: { dataEncryptionKey: true }
+        if (!machineDataKeyEnvelopesEqual(expected, replacement)) {
+            const updated = await db.machine.updateMany({
+                where: {
+                    id,
+                    accountId: userId,
+                    dataEncryptionKey: new Uint8Array(expected)
+                },
+                data: {
+                    dataEncryptionKey: new Uint8Array(replacement)
+                }
             });
-            if (!machine) {
-                return reply.code(404).send({ error: 'Machine not found' });
+            if (updated.count > 0) {
+                return reply.send({ ok: true, changed: true });
             }
-            if (machine.dataEncryptionKey
-                && Buffer.from(machine.dataEncryptionKey).equals(Buffer.from(replacement))) {
-                return reply.send({ ok: true, changed: false });
-            }
-            return reply.code(409).send({ error: 'data-encryption-key-conflict' });
         }
-        return reply.send({ ok: true, changed: true });
+
+        const machine = await db.machine.findFirst({
+            where: { id, accountId: userId },
+            select: { dataEncryptionKey: true }
+        });
+        if (!machine) {
+            return reply.code(404).send({ error: 'Machine not found' });
+        }
+        if (machine.dataEncryptionKey
+            && machineDataKeyEnvelopesEqual(machine.dataEncryptionKey, replacement)) {
+            return reply.send({ ok: true, changed: false });
+        }
+        return reply.code(409).send({ error: 'data-encryption-key-conflict' });
     });
 
 

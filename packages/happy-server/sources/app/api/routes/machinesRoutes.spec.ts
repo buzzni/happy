@@ -361,6 +361,53 @@ describe("machinesRoutes — PATCH /v1/machines/:id/data-encryption-key CAS", ()
         expect(machineUpdateMany).toHaveBeenCalledTimes(1);
     });
 
+    it("does not write when expected and replacement envelopes are identical", async () => {
+        app = await createApp();
+        const dataEncryptionKey = envelope(1);
+        state.existingMachine = {
+            id: "machine-1",
+            accountId: "user-1",
+            dataEncryptionKey: new Uint8Array(Buffer.from(dataEncryptionKey, "base64")),
+        };
+
+        const res = await app.inject({
+            method: "PATCH",
+            url: "/v1/machines/machine-1/data-encryption-key",
+            headers: { "x-user-id": "user-1" },
+            payload: {
+                expectedDataEncryptionKey: dataEncryptionKey,
+                replacementDataEncryptionKey: dataEncryptionKey,
+            },
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.json()).toEqual({ ok: true, changed: false });
+        expect(machineUpdateMany).not.toHaveBeenCalled();
+    });
+
+    it("still enforces account ownership for identical envelopes", async () => {
+        app = await createApp();
+        const dataEncryptionKey = envelope(1);
+        state.existingMachine = {
+            id: "machine-1",
+            accountId: "user-2",
+            dataEncryptionKey: new Uint8Array(Buffer.from(dataEncryptionKey, "base64")),
+        };
+
+        const res = await app.inject({
+            method: "PATCH",
+            url: "/v1/machines/machine-1/data-encryption-key",
+            headers: { "x-user-id": "user-1" },
+            payload: {
+                expectedDataEncryptionKey: dataEncryptionKey,
+                replacementDataEncryptionKey: dataEncryptionKey,
+            },
+        });
+
+        expect(res.statusCode).toBe(404);
+        expect(machineUpdateMany).not.toHaveBeenCalled();
+    });
+
     it("rejects a stale expected envelope without changing the machine", async () => {
         app = await createApp();
         const currentDataEncryptionKey = envelope(3);
@@ -441,6 +488,7 @@ describe("machinesRoutes — PATCH /v1/machines/:id/data-encryption-key CAS", ()
     it.each([
         ["wrong-length expected envelope", Buffer.from(new Uint8Array(104)).toString("base64"), envelope(2)],
         ["unsupported-version replacement envelope", envelope(1), Buffer.from(new Uint8Array(105).fill(1)).toString("base64")],
+        ["oversized replacement envelope", envelope(1), "A".repeat(141)],
     ])("rejects a %s", async (_case, expectedDataEncryptionKey, replacementDataEncryptionKey) => {
         app = await createApp();
         state.existingMachine = {
