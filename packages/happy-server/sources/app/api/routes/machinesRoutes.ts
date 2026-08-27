@@ -8,6 +8,23 @@ import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { allocateUserSeq } from "@/storage/seq";
 import { buildNewMachineUpdate, buildUpdateMachineUpdate, buildDeleteMachineUpdate } from "@/app/events/eventRouter";
 
+const MACHINE_DATA_KEY_ENVELOPE_LENGTH = 105;
+const MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH = 140;
+
+function decodeMachineDataKeyEnvelope(value: string): Uint8Array | null {
+    const decoded = Buffer.from(value, 'base64');
+    if (decoded.toString('base64') !== value
+        || decoded.length !== MACHINE_DATA_KEY_ENVELOPE_LENGTH
+        || decoded[0] !== 0x00) {
+        return null;
+    }
+    return new Uint8Array(decoded);
+}
+
+function machineDataKeyEnvelopesEqual(left: Uint8Array, right: Uint8Array): boolean {
+    return Buffer.from(left).equals(Buffer.from(right));
+}
+
 export function machinesRoutes(app: Fastify) {
     app.post('/v1/machines', {
         preHandler: app.authenticate,
@@ -141,6 +158,56 @@ export function machinesRoutes(app: Fastify) {
                 }
             });
         }
+    });
+
+    app.patch('/v1/machines/:id/data-encryption-key', {
+        preHandler: app.authenticate,
+        schema: {
+            params: z.object({
+                id: z.string()
+            }),
+            body: z.object({
+                expectedDataEncryptionKey: z.string().max(MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH),
+                replacementDataEncryptionKey: z.string().max(MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH)
+            })
+        }
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { id } = request.params;
+        const { expectedDataEncryptionKey, replacementDataEncryptionKey } = request.body;
+        const expected = decodeMachineDataKeyEnvelope(expectedDataEncryptionKey);
+        const replacement = decodeMachineDataKeyEnvelope(replacementDataEncryptionKey);
+        if (!expected || !replacement) {
+            return reply.code(400).send({ error: 'invalid-data-encryption-key-envelope' });
+        }
+        if (!machineDataKeyEnvelopesEqual(expected, replacement)) {
+            const updated = await db.machine.updateMany({
+                where: {
+                    id,
+                    accountId: userId,
+                    dataEncryptionKey: new Uint8Array(expected)
+                },
+                data: {
+                    dataEncryptionKey: new Uint8Array(replacement)
+                }
+            });
+            if (updated.count > 0) {
+                return reply.send({ ok: true, changed: true });
+            }
+        }
+
+        const machine = await db.machine.findFirst({
+            where: { id, accountId: userId },
+            select: { dataEncryptionKey: true }
+        });
+        if (!machine) {
+            return reply.code(404).send({ error: 'Machine not found' });
+        }
+        if (machine.dataEncryptionKey
+            && machineDataKeyEnvelopesEqual(machine.dataEncryptionKey, replacement)) {
+            return reply.send({ ok: true, changed: false });
+        }
+        return reply.code(409).send({ error: 'data-encryption-key-conflict' });
     });
 
 
