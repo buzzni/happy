@@ -43,7 +43,12 @@ export async function startBrowserSessionBrokerServer(input: {
     if (!input.allowNonRootForTests && process.getuid?.() !== 0) {
         throw new Error('browser session broker must run as root')
     }
-    await mkdir(dirname(input.socketPath), { recursive: true, mode: 0o750 })
+    const socketDir = dirname(input.socketPath)
+    const createdDir = await mkdir(socketDir, { recursive: true, mode: 0o750 })
+    if (!input.allowNonRootForTests && createdDir !== undefined) {
+        await chown(socketDir, 0, input.socketGid)
+        await chmod(socketDir, 0o750)
+    }
     try {
         const current = await lstat(input.socketPath)
         if (!current.isSocket()) throw new Error('refusing to replace non-socket broker path')

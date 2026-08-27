@@ -5,27 +5,40 @@ import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { startBrowserSessionBrokerServer } from './browserSessionBrokerServer'
 
+const { chownMock } = vi.hoisted(() => ({
+    chownMock: vi.fn(async () => undefined),
+}))
+
+vi.mock('node:fs/promises', async (importOriginal) => ({
+    ...await importOriginal<typeof import('node:fs/promises')>(),
+    chown: chownMock,
+}))
+
 const VIEWER_KEY = 'bv1_abcdefghijklmnopqrstuvwxyz012345'
+
+function broker() {
+    return {
+        reconcile: vi.fn(async () => undefined),
+        sweepIdle: vi.fn(async () => []),
+        ensure: vi.fn(async (viewerKey: string) => ({
+            viewerKey, webPort: 49100, profileVolume: 'volume-a', ready: true,
+            lastUsedAt: 1, isolation: 'container' as const,
+        })),
+        lookup: vi.fn(async () => null),
+        touch: vi.fn(async () => null),
+        touchWebPort: vi.fn(async () => null),
+        stop: vi.fn(async () => true),
+        migrateLegacy: vi.fn(async () => true),
+    }
+}
 
 describe('browser session broker Unix socket', () => {
     it('uses group-only permissions and exposes only the bounded request protocol', async () => {
         const dir = await mkdtemp(join(tmpdir(), 'browser-broker-socket-'))
         const socketPath = join(dir, 'broker.sock')
-        const broker = {
-            reconcile: vi.fn(async () => undefined),
-            sweepIdle: vi.fn(async () => []),
-            ensure: vi.fn(async (viewerKey: string) => ({
-                viewerKey, webPort: 49100, profileVolume: 'volume-a', ready: true,
-                lastUsedAt: 1, isolation: 'container' as const,
-            })),
-            lookup: vi.fn(async () => null),
-            touch: vi.fn(async () => null),
-            touchWebPort: vi.fn(async () => null),
-            stop: vi.fn(async () => true),
-            migrateLegacy: vi.fn(async () => true),
-        }
+        const brokerInstance = broker()
         const server = await startBrowserSessionBrokerServer({
-            broker: broker as any,
+            broker: brokerInstance as any,
             socketPath,
             socketGid: process.getgid?.() ?? 0,
             allowNonRootForTests: true,
@@ -52,8 +65,31 @@ describe('browser session broker Unix socket', () => {
                 socket.on('end', resolve)
                 socket.on('error', reject)
             })
-            expect(broker.touchWebPort).toHaveBeenCalledWith(49100)
+            expect(brokerInstance.touchWebPort).toHaveBeenCalledWith(49100)
         } finally {
+            await server.stop()
+        }
+    })
+
+    it('makes a fresh socket directory traversable by the daemon group', async () => {
+        const dir = await mkdtemp(join(tmpdir(), 'browser-broker-parent-'))
+        const socketDir = join(dir, 'run', 'happy-browser')
+        const socketPath = join(socketDir, 'broker.sock')
+        const socketGid = 4242
+        const getuid = process.getuid
+        process.getuid = () => 0
+        chownMock.mockClear()
+
+        const server = await startBrowserSessionBrokerServer({
+            broker: broker() as any,
+            socketPath,
+            socketGid,
+        })
+        try {
+            expect(chownMock).toHaveBeenCalledWith(socketDir, 0, socketGid)
+            expect(chownMock).toHaveBeenCalledWith(socketPath, 0, socketGid)
+        } finally {
+            process.getuid = getuid
             await server.stop()
         }
     })
