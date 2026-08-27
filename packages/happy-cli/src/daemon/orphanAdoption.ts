@@ -91,16 +91,15 @@ export function resolveRecoveredPendingPromotion(input: {
   if (!input.tracked || input.tracked.pid !== input.hostPid) {
     return { promoted: false, reason: 'pid-mismatch' };
   }
-  if (!input.isPidAlive(input.hostPid)) {
-    return { promoted: false, reason: 'pid-dead' };
-  }
-  const processStartedAt = input.getProcessStartedAt(input.hostPid);
-  if (processStartedAt === undefined) {
-    return { promoted: false, reason: 'process-start-unknown' };
-  }
-  if (processStartedAt > input.recoveredPendingStartedAt) {
-    return { promoted: false, reason: 'pid-reused' };
-  }
+  const processIdentity = classifyRecoveredTrackedProcess({
+    pid: input.hostPid,
+    recordedStartedAt: input.recoveredPendingStartedAt,
+    isPidAlive: input.isPidAlive,
+    getProcessStartedAt: input.getProcessStartedAt,
+  });
+  if (processIdentity === 'dead') return { promoted: false, reason: 'pid-dead' };
+  if (processIdentity === 'unverified') return { promoted: false, reason: 'process-start-unknown' };
+  if (processIdentity === 'reused') return { promoted: false, reason: 'pid-reused' };
   if (input.tracked.happySessionId !== undefined) {
     return { promoted: false, reason: 'not-pending' };
   }
@@ -134,6 +133,20 @@ export function decideRecoveredPendingWebhook(
   if (promotion.promoted) return { action: 'promote', session: promotion.session };
   if (promotion.reason === 'pid-reused') return { action: 'release-and-register-external' };
   return { action: 'ignore', reason: promotion.reason };
+}
+
+export type RecoveredTrackedProcessIdentity = 'dead' | 'unverified' | 'reused' | 'verified';
+
+export function classifyRecoveredTrackedProcess(input: {
+  pid: number;
+  recordedStartedAt: number;
+  isPidAlive: (pid: number) => boolean;
+  getProcessStartedAt: (pid: number) => number | undefined;
+}): RecoveredTrackedProcessIdentity {
+  if (!input.isPidAlive(input.pid)) return 'dead';
+  const processStartedAt = input.getProcessStartedAt(input.pid);
+  if (processStartedAt === undefined) return 'unverified';
+  return processStartedAt > input.recordedStartedAt ? 'reused' : 'verified';
 }
 
 /**

@@ -102,6 +102,7 @@ import {
   resolveTrackedPidOwner,
   resolveRecoveredPendingPromotion,
   decideRecoveredPendingWebhook,
+  classifyRecoveredTrackedProcess,
 } from './orphanAdoption';
 import {
   hydrateRecoveredSessionFromPersisted,
@@ -334,6 +335,7 @@ export async function startDaemon(): Promise<void> {
     // spawn in this process still has a live webhook awaiter and must retain
     // PENDING_SPAWN_OWNER protection until that webhook arrives.
     const recoveredPendingSpawnStartedAt = new Map<number, number>();
+    const unverifiedRecoveredHomeDirs: string[] = [];
     // When a session was adopted from a previous daemon, keyed by PID. Feeds the
     // idle guard's grace window — an adopted session keeps its real age, so it
     // can be reap-eligible the instant it is adopted.
@@ -350,7 +352,13 @@ export async function startDaemon(): Promise<void> {
     if (previousState?.trackedSessions?.length) {
       logger.debug(`[DAEMON RUN] Found ${previousState.trackedSessions.length} sessions from previous daemon (state: ${previousState.state || 'unknown'})`);
       for (const persisted of previousState.trackedSessions) {
-        if (isPidAlive(persisted.pid)) {
+        const processIdentity = classifyRecoveredTrackedProcess({
+          pid: persisted.pid,
+          recordedStartedAt: persisted.startedAt,
+          isPidAlive,
+          getProcessStartedAt,
+        });
+        if (processIdentity === 'verified') {
           const recovered: TrackedSession = {
             // The state file records who and where, but not the session's
             // encryption or resume cursor. Without them preserveSessionForResume
@@ -373,9 +381,16 @@ export async function startDaemon(): Promise<void> {
             recoveredPendingSpawnStartedAt.set(persisted.pid, persisted.startedAt);
           }
           logger.debug(`[DAEMON RUN] Recovered alive session PID ${persisted.pid}, sessionId: ${persisted.happySessionId || 'pending'}`);
+        } else if (processIdentity === 'unverified') {
+          if (persisted.userHomeDir) unverifiedRecoveredHomeDirs.push(persisted.userHomeDir);
+          logger.debug(
+            `[DAEMON RUN] Skipped unverified previous session PID ${persisted.pid}, sessionId: ${persisted.happySessionId || 'pending'}`,
+          );
         } else {
           deadSessionsToCleanup.push(persisted);
-          logger.debug(`[DAEMON RUN] Previous session PID ${persisted.pid} is dead (sessionId: ${persisted.happySessionId || 'pending'})`);
+          logger.debug(
+            `[DAEMON RUN] Previous session PID ${persisted.pid} is ${processIdentity} (sessionId: ${persisted.happySessionId || 'pending'})`,
+          );
         }
       }
     } else if (!previousState) {
@@ -399,7 +414,11 @@ export async function startDaemon(): Promise<void> {
       const resumableHomeDirs = Object.values(persistedSessions)
         .map((s) => s.userHomeDir)
         .filter((d): d is string => typeof d === 'string');
-      const removed = await sweepOrphanUserHomeDirs([...liveHomeDirs, ...resumableHomeDirs]);
+      const removed = await sweepOrphanUserHomeDirs([
+        ...liveHomeDirs,
+        ...unverifiedRecoveredHomeDirs,
+        ...resumableHomeDirs,
+      ]);
       if (removed.length > 0) {
         logger.debug(`[DAEMON RUN] Swept ${removed.length} orphan user home dir(s) from /tmp`);
       }

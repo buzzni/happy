@@ -5,6 +5,7 @@ import {
   resolveTrackedPidOwner,
   resolveRecoveredPendingPromotion,
   decideRecoveredPendingWebhook,
+  classifyRecoveredTrackedProcess,
   EXTERNAL_SESSION_STARTED_BY,
   PENDING_SPAWN_OWNER,
 } from './orphanAdoption'
@@ -475,6 +476,26 @@ describe('decideRecoveredPendingWebhook', () => {
       action: 'promote',
       session: { ...pending, happySessionId: 'sess-recovered' },
     })
+  })
+})
+
+describe('classifyRecoveredTrackedProcess', () => {
+  it('rejects a live pid that started after the daemon state record', () => {
+    expect(classifyRecoveredTrackedProcess({
+      pid: 4242,
+      recordedStartedAt: 10_000,
+      isPidAlive: () => true,
+      getProcessStartedAt: () => 20_000,
+    })).toBe('reused')
+  })
+
+  it('keeps an unreadable live process unverified instead of treating it as the session', () => {
+    expect(classifyRecoveredTrackedProcess({
+      pid: 4242,
+      recordedStartedAt: 10_000,
+      isPidAlive: () => true,
+      getProcessStartedAt: () => undefined,
+    })).toBe('unverified')
   })
 })
 
