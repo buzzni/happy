@@ -164,6 +164,24 @@ describe('createEnvelope', () => {
     });
   });
 
+  // specs/agent-activity-indicator Phase 22 — the launch receipt's task id is
+  // the only link between a background launch and the later stop / cleanup
+  // notice that names it. createEnvelope parses through the schema, so a field
+  // the schema does not declare is silently dropped in transit.
+  it('keeps the background task id on a tool-call-end envelope', () => {
+    const envelope = createEnvelope(
+      'agent',
+      { t: 'tool-call-end', call: 'call-1', backgroundTaskId: 'b59ok9s5w' },
+      { id: 'fixed-id', time: 12345 },
+    );
+
+    expect(envelope.ev).toEqual({
+      t: 'tool-call-end',
+      call: 'call-1',
+      backgroundTaskId: 'b59ok9s5w',
+    });
+  });
+
   it('validates role/event compatibility', () => {
     expect(() => createEnvelope('user', { t: 'service', text: 'internal event' })).toThrow();
   });
