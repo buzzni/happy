@@ -119,8 +119,9 @@ vi.mock("@/storage/inTx", () => ({ inTx: async (fn: any) => fn({}), afterTx: (_t
 vi.mock("@/utils/log", () => ({ log: logSpy, warn: vi.fn(), error: vi.fn() }));
 
 import { machinesRoutes } from "./machinesRoutes";
+import { enableErrorHandlers } from "../utils/enableErrorHandlers";
 
-async function createApp() {
+async function createApp({ withErrorHandlers = false } = {}) {
     const app = fastify();
     app.setValidatorCompiler(validatorCompiler);
     app.setSerializerCompiler(serializerCompiler);
@@ -132,6 +133,9 @@ async function createApp() {
         }
         request.userId = userId;
     });
+    if (withErrorHandlers) {
+        enableErrorHandlers(typed, { skipNotFoundHandler: true });
+    }
     machinesRoutes(typed);
     await typed.ready();
     return typed;
@@ -508,6 +512,27 @@ describe("machinesRoutes — PATCH /v1/machines/:id/data-encryption-key CAS", ()
         expect(machineUpdateMany).not.toHaveBeenCalled();
     });
 
+    it("does not expose an oversized envelope through validation errors or logs", async () => {
+        app = await createApp({ withErrorHandlers: true });
+        const expectedDataEncryptionKey = envelope(1);
+        const oversizedEnvelope = `sensitive-envelope-${"A".repeat(141)}`;
+
+        const res = await app.inject({
+            method: "PATCH",
+            url: "/v1/machines/machine-1/data-encryption-key",
+            headers: { "x-user-id": "user-1" },
+            payload: {
+                expectedDataEncryptionKey,
+                replacementDataEncryptionKey: oversizedEnvelope,
+            },
+        });
+
+        expect(res.statusCode).toBe(400);
+        expect(res.body).not.toContain("sensitive-envelope");
+        expect(JSON.stringify(logSpy.mock.calls)).not.toContain("sensitive-envelope");
+        expect(machineUpdateMany).not.toHaveBeenCalled();
+    });
+
     it("changes only dataEncryptionKey and does not expose either envelope", async () => {
         app = await createApp();
         const expectedDataEncryptionKey = envelope(1);
@@ -540,9 +565,19 @@ describe("machinesRoutes — PATCH /v1/machines/:id/data-encryption-key CAS", ()
         expect(machineUpdateMany.mock.calls[0][0].data).toEqual({
             dataEncryptionKey: new Uint8Array(Buffer.from(replacementDataEncryptionKey, "base64")),
         });
-        expect(state.existingMachine).toEqual({
-            ...original,
+        expect(state.existingMachine).toMatchObject({
+            id: original.id,
+            accountId: original.accountId,
+            seq: original.seq,
+            metadata: original.metadata,
+            metadataVersion: original.metadataVersion,
+            daemonState: original.daemonState,
+            daemonStateVersion: original.daemonStateVersion,
             dataEncryptionKey: new Uint8Array(Buffer.from(replacementDataEncryptionKey, "base64")),
+            serverDataEncryptionKey: original.serverDataEncryptionKey,
+            active: original.active,
+            lastActiveAt: original.lastActiveAt,
+            createdAt: original.createdAt,
         });
         expect(accessKeyMutationSpy).not.toHaveBeenCalled();
         expect(sessionMutationSpy).not.toHaveBeenCalled();

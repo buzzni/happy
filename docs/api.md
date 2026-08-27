@@ -5,6 +5,7 @@ This document covers the HTTP API surface and authentication flows. For WebSocke
 ## Method conventions
 - **GET** is used for reads.
 - **POST** is used for mutations or actions, even when the operation doesn't map cleanly to a single entity.
+- **PATCH** is reserved for explicit, field-scoped compare-and-swap replacements.
 - **DELETE** is used when intent is unambiguous (e.g., removing a token or deleting a session/artifact).
 
 We intentionally avoid the full REST verb palette because many operations span multiple entities or have non-CRUD semantics.
@@ -48,6 +49,11 @@ Auth flows:
 
 ### Machines
 - `POST /v1/machines` (create or load by id)
+- `PATCH /v1/machines/:id/data-encryption-key`
+  - Body: `{ expectedDataEncryptionKey, replacementDataEncryptionKey }` (canonical version-0 base64 envelopes)
+  - Atomically replaces only `dataEncryptionKey` when the authenticated account owns the machine and the stored value matches `expectedDataEncryptionKey`.
+  - Response: `{ ok: true, changed: true }`, or `{ ok: true, changed: false }` when the replacement is already stored.
+  - Returns `400` for invalid envelopes, `404` for an absent/foreign machine, and `409` when the expected envelope is stale.
 - `GET /v1/machines`
 - `GET /v1/machines/:id`
 
