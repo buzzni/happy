@@ -45,10 +45,18 @@ export const sessionToolCallStartEventSchema = z.object({
 // stream is already the transport the client decrypts and renders text
 // through, so no new upload/download/decrypt path is needed. Optional —
 // existing consumers that only read `.call` are unaffected.
+// specs/agent-activity-indicator Phase 22 — a background launch's tool_result
+// names the detached job by an id of its own; every later report about that
+// job (a stop, a previous-session cleanup notice) uses that id, never the
+// tool_use id. Riding it here is what lets a client match a stop back to the
+// launch it belongs to — without it a stopped task shows as running forever.
+// Transport metadata, never rendered. Optional — consumers that only read
+// `.call` are unaffected.
 export const sessionToolCallEndEventSchema = z.object({
   t: z.literal('tool-call-end'),
   call: z.string(),
   images: z.array(z.object({ mediaType: z.string(), data: z.string() })).optional(),
+  backgroundTaskId: z.string().optional(),
 });
 
 // chat-tool-output-streaming Phase 3 — daemon-emitted incremental

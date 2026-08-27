@@ -57,6 +57,40 @@ function extractToolResultImages(content: unknown): ToolResultImage[] | undefine
     return images.length > 0 ? images : undefined;
 }
 
+/**
+ * Pull the background task id out of a launch's tool_result body.
+ *
+ * The launch tool call returns immediately with an id that identifies the
+ * detached job; every later report about that job (a TaskStop, a
+ * previous-session cleanup notice) names it by that id, never by the
+ * tool_use id. Dropping it here leaves the web indicator unable to match a
+ * stop to the launch it belongs to, so a stopped task shows as running
+ * forever (specs/agent-activity-indicator Phase 22).
+ *
+ * Only the two harness-authored launch receipts are read. Anything else
+ * yields undefined — this must never guess an id out of arbitrary output.
+ */
+function extractBackgroundTaskId(content: unknown): string | undefined {
+    const text = typeof content === 'string'
+        ? content
+        : Array.isArray(content)
+            ? content
+                .filter((block): block is { type: 'text'; text: string } => (
+                    !!block && typeof block === 'object'
+                    && (block as { type?: unknown }).type === 'text'
+                    && typeof (block as { text?: unknown }).text === 'string'
+                ))
+                .map((block) => block.text)
+                .join('\n')
+            : null;
+    if (!text) return undefined;
+    const shell = text.match(/Command running in background with ID:\s*([A-Za-z0-9_-]+)/);
+    if (shell) return shell[1];
+    const agent = text.match(/^\s*agentId:\s*([A-Za-z0-9_-]+)/m);
+    if (agent) return agent[1];
+    return undefined;
+}
+
 function isSubagentTool(name: string): boolean {
     return name === 'Task' || name === 'Agent';
 }
@@ -674,13 +708,21 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                         maybeEmitSubagentStop(state, turnId, sessionSubagentForToolResult, envelopes);
                     }
                 }
-                const images = shouldRedact(getToolNameById(block.tool_use_id))
+                const redacted = shouldRedact(getToolNameById(block.tool_use_id));
+                const images = redacted
                     ? undefined
                     : extractToolResultImages((block as { content?: unknown }).content);
+                // Same redact gate as the images above: one rule for the whole
+                // result body. Redacted tools do not launch background jobs, so
+                // honouring the gate costs the indicator nothing.
+                const backgroundTaskId = redacted
+                    ? undefined
+                    : extractBackgroundTaskId((block as { content?: unknown }).content);
                 envelopes.push(createEnvelope('agent', {
                     t: 'tool-call-end',
                     call: block.tool_use_id,
                     ...(images ? { images } : {}),
+                    ...(backgroundTaskId ? { backgroundTaskId } : {}),
                 }, { turn: turnId, subagent }));
                 clearActiveBashStreamCall(block.tool_use_id);
                 continue;

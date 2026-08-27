@@ -218,6 +218,114 @@ describe('mapClaudeLogMessageToSessionEnvelopes', () => {
         );
     });
 
+    // specs/agent-activity-indicator Phase 22 — the background task id lives
+    // only in the launch's tool_result text. Without it the web indicator
+    // cannot tell which launch a TaskStop / previous-session cleanup refers
+    // to, so a stopped task stays "running" forever.
+    it('rides the background task id of a background shell launch on tool-call-end', () => {
+        const started = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'assistant',
+            uuid: 'a-bg-1',
+            message: {
+                role: 'assistant',
+                content: [
+                    { type: 'tool_use', id: 'tool-bg-1', name: 'Bash', input: { command: 'sleep 180', run_in_background: true } },
+                ],
+            },
+        } as any, { currentTurnId: null });
+
+        const ended = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'user',
+            uuid: 'u-bg-1',
+            message: {
+                role: 'user',
+                content: [
+                    {
+                        type: 'tool_result',
+                        tool_use_id: 'tool-bg-1',
+                        content: 'Command running in background with ID: b59ok9s5w. Output is being written to: /tmp/tasks/b59ok9s5w.output.',
+                    },
+                ],
+            },
+        } as any, { currentTurnId: started.currentTurnId });
+
+        expect(ended.envelopes).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({
+                    ev: { t: 'tool-call-end', call: 'tool-bg-1', backgroundTaskId: 'b59ok9s5w' },
+                }),
+            ]),
+        );
+    });
+
+    it('rides the background task id of a background agent launch on tool-call-end', () => {
+        const started = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'assistant',
+            uuid: 'a-bga-1',
+            message: {
+                role: 'assistant',
+                content: [
+                    { type: 'tool_use', id: 'tool-bga-1', name: 'Agent', input: { description: '검토', run_in_background: true } },
+                ],
+            },
+        } as any, { currentTurnId: null });
+
+        const ended = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'user',
+            uuid: 'u-bga-1',
+            message: {
+                role: 'user',
+                content: [
+                    {
+                        type: 'tool_result',
+                        tool_use_id: 'tool-bga-1',
+                        content: [
+                            { type: 'text', text: 'Async agent launched successfully.\nagentId: a1958ec940e6b45bf (internal ID - do not mention)' },
+                        ],
+                    },
+                ],
+            },
+        } as any, { currentTurnId: started.currentTurnId });
+
+        expect(ended.envelopes).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({
+                    ev: { t: 'tool-call-end', call: 'tool-bga-1', backgroundTaskId: 'a1958ec940e6b45bf' },
+                }),
+            ]),
+        );
+    });
+
+    it('omits the background task id for an ordinary foreground result', () => {
+        const started = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'assistant',
+            uuid: 'a-fg-1',
+            message: {
+                role: 'assistant',
+                content: [
+                    { type: 'tool_use', id: 'tool-fg-1', name: 'Bash', input: { command: 'ls' } },
+                ],
+            },
+        } as any, { currentTurnId: null });
+
+        const ended = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'user',
+            uuid: 'u-fg-1',
+            message: {
+                role: 'user',
+                content: [
+                    { type: 'tool_result', tool_use_id: 'tool-fg-1', content: 'a.txt\nb.txt' },
+                ],
+            },
+        } as any, { currentTurnId: started.currentTurnId });
+
+        expect(ended.envelopes).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({ ev: { t: 'tool-call-end', call: 'tool-fg-1' } }),
+            ]),
+        );
+    });
+
     it('drops images from a tool whose name matches the redact policy', () => {
         // The MCP prefix policy already redacts text for these tools
         // (redactGate.ts); images from the same tools must not leak either.
