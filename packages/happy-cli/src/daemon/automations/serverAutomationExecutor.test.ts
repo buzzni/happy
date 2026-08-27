@@ -131,6 +131,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     prepareGithubWorktree,
     discardGithubWorktree,
     isSessionRunning: vi.fn(() => false),
+    isDirectoryInUse: vi.fn(() => false),
     randomId: () => 'report-1',
     logDebug,
   }
@@ -2309,6 +2310,49 @@ describe('runServerAutomationTick', () => {
     expect(store.state().githubTriggers?.[0]?.state.pending).toHaveLength(1)
   })
 
+  it('keeps the isolated worktree when a timed-out spawn process still uses its directory', async () => {
+    const {
+      input, store, queryGithubPullRequests, spawnSession, discardGithubWorktree, now,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const }, prompt: 'Review',
+      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      pullRequests: [{
+        number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10', author: { login: 'alice' },
+        baseRefName: 'main', headRefName: 'feature/search', headRefOid: 'a'.repeat(40),
+        isDraft: false, state: 'OPEN', mergedAt: null, labels: [], changedFiles: 0, files: [],
+      }],
+    })
+    spawnSession.mockResolvedValue({ ok: false, error: 'Session webhook timeout for PID 101' })
+    input.isDirectoryInUse = vi.fn((directory) => directory === '/isolated/run-1')
+
+    await runServerAutomationTick(input)
+
+    expect(discardGithubWorktree).not.toHaveBeenCalled()
+    expect(store.state().githubWorktrees).toEqual([expect.objectContaining({
+      runId: 'run-1', sessionId: null, cleanupRetryAt: now + 60_000,
+    })])
+    expect(store.state().githubTriggers?.[0]?.state.pending).toHaveLength(1)
+  })
+
   it('journals the isolated worktree before preparation and associates it with the spawned session', async () => {
     const {
       input, store, queryGithubPullRequests, prepareGithubWorktree,
@@ -2436,5 +2480,50 @@ describe('runServerAutomationTick', () => {
 
     expect(discardGithubWorktree).not.toHaveBeenCalled()
     expect(store.state().githubWorktrees).toHaveLength(1)
+  })
+
+  it('does not retry a pending event while a timed-out worker still owns its journaled directory', async () => {
+    const { input, store, transport, queryGithubPullRequests, spawnSession } = setup()
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const }, prompt: 'Review',
+      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    }))
+    input.isDirectoryInUse = vi.fn((directory) => directory === '/isolated/run-old')
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: {
+          snapshot: [], highestPrNumber: 10, processed: [],
+          pending: [{
+            id: '10:opened', event: 'opened',
+            pr: {
+              number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10',
+              author: { login: 'alice' }, baseRefName: 'main', headRefName: 'feature/search',
+              headRefOid: 'a'.repeat(40), isDraft: false, state: 'OPEN', mergedAt: null,
+              labels: [], changedFiles: 0, files: [],
+            },
+          }],
+        },
+      }],
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old', directory: '/isolated/run-old',
+        sessionId: null, createdAt: 1,
+      }],
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(queryGithubPullRequests).not.toHaveBeenCalled()
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(store.state().githubTriggers?.[0]?.state.pending).toHaveLength(1)
   })
 })

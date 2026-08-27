@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
+  isGithubTriggerWorktreeDirectoryInUse,
   prepareGithubTriggerWorktree,
   removeGithubTriggerWorktree,
   type GithubTriggerWorktreeCommand,
@@ -158,5 +159,32 @@ describe('removeGithubTriggerWorktree', () => {
 
     expect(result).toEqual({ ok: false, dirty: true, error: 'GitHub automation worktree is dirty' })
     expect(runCommand).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('isGithubTriggerWorktreeDirectoryInUse', () => {
+  it('keeps a pending pre-webhook spawn alive by its persisted launch directory', () => {
+    const sessions = new Map([[101, {
+      startedBy: 'daemon', pid: 101, directory: '/happy/automation-worktrees/run-1/apps/web',
+    }]])
+
+    expect(isGithubTriggerWorktreeDirectoryInUse({
+      directory: '/happy/automation-worktrees/run-1/apps/web',
+      sessions,
+      isPidAlive: (pid) => pid === 101,
+    })).toBe(true)
+  })
+
+  it('falls back to webhook metadata for sessions persisted before the launch directory field', () => {
+    const sessions = new Map([[102, {
+      startedBy: 'daemon', pid: 102,
+      happySessionMetadataFromLocalWebhook: { path: '/happy/automation-worktrees/run-2' },
+    }]])
+
+    expect(isGithubTriggerWorktreeDirectoryInUse({
+      directory: '/happy/automation-worktrees/run-2',
+      sessions,
+      isPidAlive: () => true,
+    })).toBe(true)
   })
 })

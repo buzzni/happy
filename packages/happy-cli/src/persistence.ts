@@ -85,6 +85,8 @@ function migrateSettings(raw: any, fromVersion: number): any {
  */
 export interface PersistedTrackedSession {
   pid: number;
+  /** Absolute launch cwd; present for daemon spawns created by newer clients. */
+  directory?: string;
   happySessionId?: string;
   startedBy: string;
   tmuxSessionId?: string;

@@ -176,7 +176,7 @@ export interface ServerAutomationExecutorInput {
     worktreePath: string
   }) => Promise<{ ok: true } | { ok: false; dirty: boolean; error: string }>
   isSessionRunning: (sessionId: string) => boolean
-  isDirectoryInUse?: (directory: string) => boolean
+  isDirectoryInUse: (directory: string) => boolean
   randomId?: () => string
   logDebug?: (message: string) => void
 }
@@ -847,7 +847,7 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
   for (const worktree of worktrees) {
     if ((worktree.cleanupRetryAt ?? 0) > input.now) continue
     if (worktree.sessionId && input.isSessionRunning(worktree.sessionId)) continue
-    if (!worktree.sessionId && input.isDirectoryInUse?.(worktree.directory)) continue
+    if (!worktree.sessionId && input.isDirectoryInUse(worktree.directory)) continue
     const discarded = await input.discardGithubWorktree({
       repositoryRoot: worktree.repositoryRoot,
       worktreePath: worktree.worktreePath,
@@ -1303,21 +1303,28 @@ async function executeStartedRun(
     // 는 성공했는데 worker 가 하나도 안 뜨고 로그도 없는 상태로 관측됐다.
     input.logDebug?.(`[server-automation] ${automation.automationId} spawn failed: ${spawned.error}`)
     if (githubWorktree) {
-      const discarded = await input.discardGithubWorktree({
-        repositoryRoot: githubWorktree.repositoryRoot,
-        worktreePath: githubWorktree.worktreePath,
-      })
-      if (!discarded.ok) {
+      if (input.isDirectoryInUse(githubWorktree.directory)) {
         input.logDebug?.(
-          `[server-automation] ${automation.automationId} GitHub worktree cleanup failed: ${discarded.error}`,
+          `[server-automation] ${automation.automationId} GitHub worktree cleanup deferred: spawn process still uses ${githubWorktree.directory}`,
         )
-        deferGithubWorktreeCleanup(
-          input,
-          run.runId,
-          discarded.dirty ? DIRTY_WORKTREE_RETRY_MS : WORKTREE_CLEANUP_RETRY_MS,
-        )
+        deferGithubWorktreeCleanup(input, run.runId, WORKTREE_CLEANUP_RETRY_MS)
       } else {
-        removeGithubWorktreeJournal(input, run.runId)
+        const discarded = await input.discardGithubWorktree({
+          repositoryRoot: githubWorktree.repositoryRoot,
+          worktreePath: githubWorktree.worktreePath,
+        })
+        if (!discarded.ok) {
+          input.logDebug?.(
+            `[server-automation] ${automation.automationId} GitHub worktree cleanup failed: ${discarded.error}`,
+          )
+          deferGithubWorktreeCleanup(
+            input,
+            run.runId,
+            discarded.dirty ? DIRTY_WORKTREE_RETRY_MS : WORKTREE_CLEANUP_RETRY_MS,
+          )
+        } else {
+          removeGithubWorktreeJournal(input, run.runId)
+        }
       }
     }
   }
@@ -1370,6 +1377,12 @@ export async function runServerAutomationTick(
     if (payload.githubTrigger) scheduleInactiveGithubIssueProgressCleanup(input, automation, now)
   }
   const activeGithubWorkerSessions = new Set(activeGithubSessionsAcrossGenerations(input))
+  const pendingGithubWorktreeAutomationIds = new Set<string>()
+  for (const worktree of input.runtimeStore.read().githubWorktrees ?? []) {
+    if (worktree.sessionId || !input.isDirectoryInUse(worktree.directory)) continue
+    pendingGithubWorktreeAutomationIds.add(worktree.automationId)
+    activeGithubWorkerSessions.add(`worktree:${worktree.runId}`)
+  }
   const workQueue = [...decryptableAutomations]
   const immediateWorkerIds = new Set<string>()
   while (workQueue.length > 0) {
@@ -1390,6 +1403,11 @@ export async function runServerAutomationTick(
     }
     if (payload.githubTrigger && githubMode === 'work'
       && githubEventsProcessed >= MAX_GITHUB_EVENTS_PER_TICK) {
+      scheduleNextTick(input, automation.automationId, now)
+      continue
+    }
+    if (payload.githubTrigger && githubMode === 'work'
+      && pendingGithubWorktreeAutomationIds.has(automation.automationId)) {
       scheduleNextTick(input, automation.automationId, now)
       continue
     }

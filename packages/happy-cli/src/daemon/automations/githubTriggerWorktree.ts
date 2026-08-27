@@ -21,6 +21,21 @@ export interface GithubTriggerWorktreePlan {
   directory: string
 }
 
+export function isGithubTriggerWorktreeDirectoryInUse(input: {
+  directory: string
+  sessions: Iterable<[number, {
+    directory?: string
+    happySessionMetadataFromLocalWebhook?: { path?: string }
+  }]>
+  isPidAlive: (pid: number) => boolean
+}): boolean {
+  for (const [pid, session] of input.sessions) {
+    const sessionDirectory = session.directory ?? session.happySessionMetadataFromLocalWebhook?.path
+    if (sessionDirectory === input.directory && input.isPidAlive(pid)) return true
+  }
+  return false
+}
+
 type CommandResult = { ok: true; stdout: string } | { ok: false; error: string }
 
 async function defaultRunCommand(command: GithubTriggerWorktreeCommand): Promise<CommandResult> {
