@@ -153,6 +153,18 @@ describe('ApiMachineClient browser viewer RPC', () => {
         })
     })
 
+    it('reports the container-backed viewer as installed without host viewer tools', async () => {
+        viewerMocks.detectMissingViewerTools.mockResolvedValue(['Xvfb', 'x11vnc', 'websockify'])
+        const { ApiMachineClient } = await import('./apiMachine')
+        const client = new ApiMachineClient('token', machineClient()) as any
+        client.browserSessionBroker = { request: vi.fn() }
+        client.setRPCHandlers(rpcHandlers())
+
+        const status = await handlersFrom(client).get('machine-1:browser-viewer:status')?.({})
+
+        expect(status).toMatchObject({ installed: true, missing: [] })
+    })
+
     it('rate-limits broker touches from active relay frames', async () => {
         const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
         const { ApiMachineClient } = await import('./apiMachine')

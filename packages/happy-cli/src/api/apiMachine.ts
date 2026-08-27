@@ -956,7 +956,7 @@ export class ApiMachineClient {
         // bridge's own click/fill are ref-based and cannot drive a captcha,
         // which is why this exists. See specs/browser-remote-login/.
         this.rpcHandlerManager.registerHandler('browser-viewer:status', async () => {
-            const missing = await detectMissingViewerTools();
+            const missing = this.browserSessionBroker ? [] : await detectMissingViewerTools();
             return {
                 installed: missing.length === 0,
                 missing,
