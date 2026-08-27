@@ -143,10 +143,14 @@ export function collectSnapshot() {
         const overflowX = style.overflowX || style.overflow
         const overflowY = style.overflowY || style.overflow
         const permitsScroll = (overflow) => overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay' || overflow === 'hidden'
-        const maxLeft = Math.max(0, element.scrollWidth - element.clientWidth)
-        const maxTop = Math.max(0, element.scrollHeight - element.clientHeight)
-        const x = maxLeft > 0 && permitsScroll(overflowX)
-        const y = maxTop > 0 && permitsScroll(overflowY)
+        const permitsX = permitsScroll(overflowX)
+        const permitsY = permitsScroll(overflowY)
+        if (!permitsX && !permitsY) return null
+        const maxLeft = permitsX ? Math.max(0, element.scrollWidth - element.clientWidth) : 0
+        const maxTop = permitsY ? Math.max(0, element.scrollHeight - element.clientHeight) : 0
+        const x = maxLeft > 0
+        const y = maxTop > 0
+        if (!x && !y) return null
         return {
             x,
             y,
@@ -241,7 +245,7 @@ export function collectSnapshot() {
             }
             if (visible && scrollableCandidates.length < MAX_SCROLLABLES) {
                 const metrics = scrollableMetrics(element)
-                if ((metrics.x || metrics.y) && getInViewport()) scrollableCandidates.push({ element, metrics })
+                if (metrics && getInViewport()) scrollableCandidates.push({ element, metrics })
             }
             if (element.shadowRoot) walk(element.shadowRoot)
         }

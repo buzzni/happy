@@ -296,14 +296,24 @@ describe('collectSnapshot', () => {
         expect(collectSnapshot().truncated).toBe(false)
     })
 
-    it('does not measure viewport geometry for ordinary non-interactive elements', () => {
+    it('does not measure layout geometry for ordinary non-interactive elements', () => {
         render(Array.from({ length: 500 }, () => '<div>plain content</div>').join(''))
         let measurements = 0
+        const measure = () => {
+            measurements += 1
+            return 10
+        }
         for (const element of document.querySelectorAll('*')) {
             element.getBoundingClientRect = () => {
                 measurements += 1
                 return { top: 0, left: 0, bottom: 10, right: 10, width: 10, height: 10 }
             }
+            Object.defineProperties(element, {
+                scrollWidth: { configurable: true, get: measure },
+                clientWidth: { configurable: true, get: measure },
+                scrollHeight: { configurable: true, get: measure },
+                clientHeight: { configurable: true, get: measure },
+            })
         }
 
         collectSnapshot()
