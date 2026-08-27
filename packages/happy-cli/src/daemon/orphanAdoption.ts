@@ -61,6 +61,8 @@ export type RecoveredPendingPromotionResult =
       | 'not-recovered-pending'
       | 'pid-mismatch'
       | 'pid-dead'
+      | 'process-start-unknown'
+      | 'pid-reused'
       | 'not-pending'
       | 'not-daemon-spawn';
   };
@@ -79,10 +81,11 @@ export function resolveRecoveredPendingPromotion(input: {
   hostPid: number;
   tracked: TrackedSession | undefined;
   resumable?: TrackedSession;
-  recoveredPending: boolean;
+  recoveredPendingStartedAt?: number;
   isPidAlive: (pid: number) => boolean;
+  getProcessStartedAt: (pid: number) => number | undefined;
 }): RecoveredPendingPromotionResult {
-  if (!input.recoveredPending) {
+  if (input.recoveredPendingStartedAt === undefined) {
     return { promoted: false, reason: 'not-recovered-pending' };
   }
   if (!input.tracked || input.tracked.pid !== input.hostPid) {
@@ -90,6 +93,13 @@ export function resolveRecoveredPendingPromotion(input: {
   }
   if (!input.isPidAlive(input.hostPid)) {
     return { promoted: false, reason: 'pid-dead' };
+  }
+  const processStartedAt = input.getProcessStartedAt(input.hostPid);
+  if (processStartedAt === undefined) {
+    return { promoted: false, reason: 'process-start-unknown' };
+  }
+  if (processStartedAt > input.recoveredPendingStartedAt) {
+    return { promoted: false, reason: 'pid-reused' };
   }
   if (input.tracked.happySessionId !== undefined) {
     return { promoted: false, reason: 'not-pending' };

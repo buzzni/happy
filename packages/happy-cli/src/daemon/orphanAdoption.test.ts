@@ -329,6 +329,10 @@ describe('resolveRecoveredPendingPromotion', () => {
     tmuxSessionId: 'automation:1',
     userHomeDir: '/tmp/happy-session-4242',
   }
+  const recoveredIdentity = {
+    recoveredPendingStartedAt: 10_000,
+    getProcessStartedAt: () => 9_000,
+  }
 
   it('promotes a recovered daemon spawn when the live reporter owns the same pid', () => {
     const encryption = {
@@ -349,7 +353,7 @@ describe('resolveRecoveredPendingPromotion', () => {
         encryption,
         persistedLastProcessedSeq: 41,
       },
-      recoveredPending: true,
+      ...recoveredIdentity,
       isPidAlive: () => true,
     })
 
@@ -369,8 +373,8 @@ describe('resolveRecoveredPendingPromotion', () => {
       sessionId: 'sess-racing-report',
       hostPid: 4242,
       tracked: pending,
-      recoveredPending: false,
       isPidAlive: () => true,
+      getProcessStartedAt: () => 9_000,
     })).toEqual({ promoted: false, reason: 'not-recovered-pending' })
   })
 
@@ -379,7 +383,7 @@ describe('resolveRecoveredPendingPromotion', () => {
       sessionId: 'sess-other-pid',
       hostPid: 9999,
       tracked: pending,
-      recoveredPending: true,
+      ...recoveredIdentity,
       isPidAlive: () => true,
     })).toEqual({ promoted: false, reason: 'pid-mismatch' })
   })
@@ -389,9 +393,31 @@ describe('resolveRecoveredPendingPromotion', () => {
       sessionId: 'sess-dead',
       hostPid: 4242,
       tracked: pending,
-      recoveredPending: true,
+      ...recoveredIdentity,
       isPidAlive: () => false,
     })).toEqual({ promoted: false, reason: 'pid-dead' })
+  })
+
+  it('does not promote a process that reused the recovered pid', () => {
+    expect(resolveRecoveredPendingPromotion({
+      sessionId: 'sess-reused-pid',
+      hostPid: 4242,
+      tracked: pending,
+      recoveredPendingStartedAt: 10_000,
+      isPidAlive: () => true,
+      getProcessStartedAt: () => 20_000,
+    })).toEqual({ promoted: false, reason: 'pid-reused' })
+  })
+
+  it('does not promote when the reporter process start time cannot be verified', () => {
+    expect(resolveRecoveredPendingPromotion({
+      sessionId: 'sess-unverified-pid',
+      hostPid: 4242,
+      tracked: pending,
+      recoveredPendingStartedAt: 10_000,
+      isPidAlive: () => true,
+      getProcessStartedAt: () => undefined,
+    })).toEqual({ promoted: false, reason: 'process-start-unknown' })
   })
 
   it('does not overwrite a recovered session that already has an id', () => {
@@ -399,7 +425,7 @@ describe('resolveRecoveredPendingPromotion', () => {
       sessionId: 'sess-other',
       hostPid: 4242,
       tracked: { ...pending, happySessionId: 'sess-existing' },
-      recoveredPending: true,
+      ...recoveredIdentity,
       isPidAlive: () => true,
     })).toEqual({ promoted: false, reason: 'not-pending' })
   })
@@ -409,7 +435,7 @@ describe('resolveRecoveredPendingPromotion', () => {
       sessionId: 'sess-other',
       hostPid: 4242,
       tracked: { ...pending, startedBy: EXTERNAL_SESSION_STARTED_BY },
-      recoveredPending: true,
+      ...recoveredIdentity,
       isPidAlive: () => true,
     })).toEqual({ promoted: false, reason: 'not-daemon-spawn' })
   })
