@@ -17,6 +17,25 @@ function makeFakeClient(hasTitle: boolean) {
     } as unknown as ApiSessionClient;
 }
 
+async function callTool(serverUrl: string, id: number, name: string, args: Record<string, unknown>) {
+    const response = await fetch(serverUrl, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json, text/event-stream',
+        },
+        body: JSON.stringify({
+            jsonrpc: '2.0',
+            id,
+            method: 'tools/call',
+            params: { name, arguments: args },
+        }),
+    });
+    expect(response.status).toBe(200);
+    const raw = await response.text();
+    return JSON.parse(raw.startsWith('event:') ? raw.slice(raw.indexOf('data: ') + 6) : raw);
+}
+
 describe('createChangeTitleHandler', () => {
     it('sets the title when the session has none yet', async () => {
         const client = makeFakeClient(false);
@@ -147,21 +166,7 @@ describe('startHappyServer tool registration', () => {
         const client = { hasTitle: () => false, sendClaudeSessionMessage: vi.fn(), sessionId: 'test' } as unknown as ApiSessionClient;
         const server = await startHappyServer(client);
         try {
-            const response = await fetch(server.url, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Accept: 'application/json, text/event-stream',
-                },
-                body: JSON.stringify({
-                    jsonrpc: '2.0',
-                    id: 2,
-                    method: 'tools/call',
-                    params: { name: 'browser_scroll', arguments: { deltaX: 0, deltaY: 0 } },
-                }),
-            });
-            const raw = await response.text();
-            const payload = JSON.parse(raw.startsWith('event:') ? raw.slice(raw.indexOf('data: ') + 6) : raw);
+            const payload = await callTool(server.url, 2, 'browser_scroll', { deltaX: 0, deltaY: 0 });
             expect(payload.result.isError).toBe(true);
             expect(payload.result.content[0].text).toMatch(/non-zero/i);
         } finally {
@@ -173,23 +178,21 @@ describe('startHappyServer tool registration', () => {
         const client = { hasTitle: () => false, sendClaudeSessionMessage: vi.fn(), sessionId: 'test' } as unknown as ApiSessionClient;
         const server = await startHappyServer(client);
         try {
-            const response = await fetch(server.url, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Accept: 'application/json, text/event-stream',
-                },
-                body: JSON.stringify({
-                    jsonrpc: '2.0',
-                    id: 3,
-                    method: 'tools/call',
-                    params: { name: 'browser_scroll', arguments: { deltaY: 10_001 } },
-                }),
-            });
-            const raw = await response.text();
-            const payload = JSON.parse(raw.startsWith('event:') ? raw.slice(raw.indexOf('data: ') + 6) : raw);
+            const payload = await callTool(server.url, 3, 'browser_scroll', { deltaY: 10_001 });
             expect(payload.result.isError).toBe(true);
             expect(payload.result.content[0].text).toContain('10000');
+        } finally {
+            server.stop();
+        }
+    });
+
+    it('rejects an empty browser scroll ref in the MCP schema', async () => {
+        const client = { hasTitle: () => false, sendClaudeSessionMessage: vi.fn(), sessionId: 'test' } as unknown as ApiSessionClient;
+        const server = await startHappyServer(client);
+        try {
+            const payload = await callTool(server.url, 4, 'browser_scroll', { ref: '', deltaY: 300 });
+            expect(payload.result.isError).toBe(true);
+            expect(payload.result.content[0].text).toMatch(/>=1 characters|at least 1 character/i);
         } finally {
             server.stop();
         }
@@ -205,26 +208,10 @@ describe('startHappyServer tool registration', () => {
         } as unknown as ApiSessionClient;
         const server = await startHappyServer(client);
         try {
-            const response = await fetch(server.url, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Accept: 'application/json, text/event-stream',
-                },
-                body: JSON.stringify({
-                    jsonrpc: '2.0',
-                    id: 1,
-                    method: 'tools/call',
-                    params: { name: 'change_title', arguments: { title: 'Fix login bug', branchSlug: 'fix-login-bug' } },
-                }),
-            });
-            expect(response.status).toBe(200);
-
             // Assert the slug the caller sent is the one that gets stored — a bare
             // "updateMetadata was called" check still passes if the tool wires the
             // wrong argument (e.g. the title) into the handler's slug parameter.
-            const raw = await response.text();
-            const payload = JSON.parse(raw.startsWith('event:') ? raw.slice(raw.indexOf('data: ') + 6) : raw);
+            const payload = await callTool(server.url, 1, 'change_title', { title: 'Fix login bug', branchSlug: 'fix-login-bug' });
             expect(payload.result.isError).toBe(false);
 
             expect(updateMetadata).toHaveBeenCalledTimes(1);

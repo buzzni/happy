@@ -279,7 +279,7 @@ function registerBrowserTools(mcp: McpServer): void {
         inputSchema: z.object({
             deltaX: z.number().min(-10_000).max(10_000).optional().describe('Horizontal pixel delta; negative scrolls left and positive scrolls right'),
             deltaY: z.number().min(-10_000).max(10_000).optional().describe('Vertical pixel delta; negative scrolls up and positive scrolls down'),
-            ref: z.string().optional().describe('Optional element or scrollable-region ref from browser_snapshot, e.g. "@e3" or "@f7:e2"'),
+            ref: z.string().min(1).optional().describe('Optional element or scrollable-region ref from browser_snapshot, e.g. "@e3" or "@f7:e2"'),
             tabId: z.number().optional().describe('Tab to scroll (defaults to the active tab)'),
             profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
         }).refine((args) => (args.deltaX ?? 0) !== 0 || (args.deltaY ?? 0) !== 0, {

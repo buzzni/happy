@@ -15,6 +15,7 @@
       <div id="nested-sentinel">Nested loading sentinel</div>
     </div>
   </section>
+  <div id="long-page-prefix"></div>
   <div style="height:1400px"></div>
   <div id="document-sentinel">Document loading sentinel</div>
   <script>
@@ -23,6 +24,13 @@
     })
 
     const nestedResults = document.getElementById('nested-results')
+    const longPagePrefix = document.getElementById('long-page-prefix')
+    for (let i = 0; i < 205; i += 1) {
+      const button = document.createElement('button')
+      button.textContent = 'Earlier action ' + i
+      longPagePrefix.appendChild(button)
+    }
+
     new IntersectionObserver(function (entries, observer) {
       if (!entries.some(function (entry) { return entry.isIntersecting })) return
       const button = document.createElement('button')

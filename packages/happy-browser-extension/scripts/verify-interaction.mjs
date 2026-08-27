@@ -148,11 +148,13 @@ async function runVerification() {
 
     console.log('8. scroll the document to a lazy-loading item')
     const documentBefore = await call('snapshot', { tabId: tab.id })
+    check('long page snapshot is truncated', documentBefore.truncated === true, JSON.stringify(documentBefore))
     check('document lazy item starts absent', !documentBefore.elements.some((element) => element.name === 'Document lazy item'), JSON.stringify(documentBefore.elements))
-    const documentScroll = await call('scroll', { tabId: tab.id, deltaY: 1800 })
+    const documentScroll = await call('scroll', { tabId: tab.id, deltaY: 10_000 })
     check('document actually moved', documentScroll.moved && documentScroll.after.y > documentScroll.before.y, JSON.stringify(documentScroll))
-    await snapshotUntilNamed(tab.id, 'Document lazy item')
-    console.log('  ok  document lazy item appeared after scroll + re-snapshot')
+    const documentAfter = await snapshotUntilNamed(tab.id, 'Document lazy item')
+    const documentLazyRef = documentAfter.elements.find((element) => element.name === 'Document lazy item').ref
+    check('document lazy item is actionable beyond the first 200 refs', Number(documentLazyRef.slice(2)) > 200, documentLazyRef)
 
     console.log('9. screenshot')
     const shot = await call('screenshot', { tabId: tab.id })

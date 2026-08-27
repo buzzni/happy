@@ -150,7 +150,7 @@ node packages/happy-browser-extension/scripts/dev-bridge.mjs
 이동합니다. lazy loading으로 DOM이 바뀔 수 있으므로 스크롤 뒤에는 새 `snapshot`을
 가져옵니다. `ref` 는 가장 최근 `snapshot` 이
 돌려준 `@eN` 값입니다 — 페이지가 바뀌면(내비게이션 포함) 무효화되므로 그때는
-다시 스냅샷을 떠야 합니다. 무효한 ref 로 click/fill 을 호출하면 재스냅샷을
+다시 스냅샷을 떠야 합니다. 무효한 ref 로 click/fill/scroll 을 호출하면 재스냅샷을
 안내하는 메시지와 함께 실패합니다.
 
 ### 스냅샷 범위: shadow DOM 과 iframe

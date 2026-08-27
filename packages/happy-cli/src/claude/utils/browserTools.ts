@@ -131,7 +131,7 @@ function renderSnapshot(result: any): string {
     })
     const body = elements.length > 0 ? elements.join('\n') : 'No interactive elements found.'
     const note = result?.truncated
-        ? '\n\n(truncated — only the first elements of the page are listed)'
+        ? '\n\n(truncated — the first elements and up to 20 currently visible later elements are listed)'
         : ''
     return `${header}\n\n${body}${note}`
 }
