@@ -269,7 +269,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
         const client = new ApiMachineClient('token', machineClient())
         client.setRPCHandlers(rpcHandlers())
 
-        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({})
+        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
 
         expect(mockRunPairing).toHaveBeenCalledTimes(2)
         expect(mockRunPairing).toHaveBeenNthCalledWith(1, expect.objectContaining({
@@ -324,23 +324,28 @@ describe('ApiMachineClient browser viewer RPC', () => {
 
     it('pairs a newly launched viewer Chrome on the port that became reachable', async () => {
         fsMocks.readdir.mockResolvedValue([])
-        const probeResults = [false, false, false, false, false, false, false, true]
-        browserMocks.isCdpReachable.mockImplementation(async () => probeResults.shift() ?? true)
+        const reachablePorts = new Set<number>()
+        browserMocks.isCdpReachable.mockImplementation(async (port: number) => reachablePorts.has(port))
+        browserMocks.launchChrome.mockImplementation((_path: string, options: { cdpPort: number }) => {
+            reachablePorts.add(options.cdpPort)
+            return { pid: 1234, cdpPipe: browserMocks.cdpPipe }
+        })
         const { ApiMachineClient } = await import('./apiMachine')
         const client = new ApiMachineClient('token', machineClient())
         client.setRPCHandlers(rpcHandlers())
 
         const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
 
+        const launchedOptions = browserMocks.launchChrome.mock.calls[0]?.[1]
         expect(browserMocks.launchChrome).toHaveBeenCalledWith(
             '/usr/bin/google-chrome',
-            expect.objectContaining({ cdpPort: 9222, headless: false }),
+            expect.objectContaining({ cdpPort: launchedOptions.cdpPort, headless: false }),
             { DISPLAY: ':99' },
         )
         expect(mockRunPairing).toHaveBeenCalledWith({
-            cdpPort: 9222,
+            cdpPort: launchedOptions.cdpPort,
             debuggerTier: true,
-            pairingId: expect.stringMatching(/^viewer-9222-/),
+            pairingId: expect.stringMatching(new RegExp(`^viewer-${launchedOptions.cdpPort}-`)),
             viewerKey: ALICE_KEY,
             browserCdpRequest: expect.any(Function),
             forceExtensionReload: false,
@@ -353,7 +358,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
         )
         expect(result).toMatchObject({
             browserReady: true,
-            cdpPort: 9222,
+            cdpPort: launchedOptions.cdpPort,
             bridgeReady: true,
         })
     })
@@ -380,6 +385,12 @@ describe('ApiMachineClient browser viewer RPC', () => {
     })
 
     it('isolates viewer leases for different viewer keys on the same machine', async () => {
+        const reachablePorts = new Set([9222])
+        browserMocks.isCdpReachable.mockImplementation(async (port: number) => reachablePorts.has(port))
+        browserMocks.launchChrome.mockImplementation((_path: string, options: { cdpPort: number }) => {
+            reachablePorts.add(options.cdpPort)
+            return { pid: 1234, cdpPipe: browserMocks.cdpPipe }
+        })
         const { ApiMachineClient } = await import('./apiMachine')
         const client = new ApiMachineClient('token', machineClient())
         client.setRPCHandlers(rpcHandlers())
