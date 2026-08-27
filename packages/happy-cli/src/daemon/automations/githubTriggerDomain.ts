@@ -7,6 +7,8 @@ export interface GithubPullRequestSnapshot {
   author: { login: string } | null;
   baseRefName: string;
   headRefName: string;
+  /** Absent only in runtime snapshots written before worktree isolation shipped. */
+  headRefOid?: string;
   isDraft: boolean;
   state: string;
   mergedAt: string | null;

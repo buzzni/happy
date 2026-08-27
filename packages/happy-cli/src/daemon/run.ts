@@ -122,6 +122,10 @@ import { runAutomationScript } from './automations/runAutomationScript';
 import { queryGithubPullRequestFiles, queryGithubPullRequests } from './automations/queryGithubPullRequests';
 import { queryGithubIssues } from './automations/queryGithubIssues';
 import {
+  prepareGithubTriggerWorktree,
+  removeGithubTriggerWorktree,
+} from './automations/githubTriggerWorktree';
+import {
   createGithubIssueProgressMarker,
   removeGithubIssueProgressMarker,
   resolveGithubIssueProgressMarkerIdentity,
@@ -1973,6 +1977,12 @@ export async function startDaemon(): Promise<void> {
       }
       return false;
     };
+    const isAutomationDirectoryInUse = (directory: string): boolean => {
+      for (const [pid, session] of pidToTrackedSession.entries()) {
+        if (session.happySessionMetadataFromLocalWebhook?.path === directory) return isPidAlive(pid);
+      }
+      return false;
+    };
     const spawnAutomationSession = async (
       input: {
         directory: string;
@@ -2259,7 +2269,13 @@ export async function startDaemon(): Promise<void> {
         }),
         resumeSession: resumeAutomationSession,
         spawnSession: spawnAutomationSession,
+        prepareGithubWorktree: (input) => prepareGithubTriggerWorktree({
+          ...input,
+          managedRoot: join(configuration.happyHomeDir, 'automation-worktrees'),
+        }),
+        discardGithubWorktree: removeGithubTriggerWorktree,
         isSessionRunning: isAutomationSessionRunning,
+        isDirectoryInUse: isAutomationDirectoryInUse,
         logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
       }),
       logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),

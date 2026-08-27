@@ -30,6 +30,18 @@ export interface GithubIssueProgressMarkerState {
   cleanupRetryAt?: number
 }
 
+export interface GithubAutomationWorktreeState {
+  automationId: string
+  generation: number
+  runId: string
+  repositoryRoot: string
+  worktreePath: string
+  directory: string
+  sessionId: string | null
+  createdAt: number
+  cleanupRetryAt?: number
+}
+
 export interface PendingAutomationReport {
   runId: string
   claimToken: string
@@ -68,6 +80,7 @@ export interface ServerAutomationRuntimeState {
     completed: number
   }>
   githubIssueProgressMarkers?: GithubIssueProgressMarkerState[]
+  githubWorktrees?: GithubAutomationWorktreeState[]
   pendingReports: PendingAutomationReport[]
 }
 
@@ -110,6 +123,7 @@ function parsePullRequest(value: unknown): GithubPullRequestSnapshot {
     author: author === null ? null : { login: text(author.login, 200) },
     baseRefName: text(row.baseRefName, 512),
     headRefName: text(row.headRefName, 512),
+    ...(row.headRefOid === undefined ? {} : { headRefOid: text(row.headRefOid, 64) }),
     isDraft: row.isDraft,
     state: text(row.state, 32),
     mergedAt: nullableText(row.mergedAt),
@@ -273,9 +287,27 @@ function parse(raw: string): ServerAutomationRuntimeState {
         }),
       }
     })
+    const worktreeRows = disk.githubWorktrees === undefined ? [] : disk.githubWorktrees
+    if (!Array.isArray(worktreeRows)) invalid()
+    const githubWorktrees = worktreeRows.map((value) => {
+      const row = record(value)
+      return {
+        automationId: text(row.automationId, 200),
+        generation: integer(row.generation, 1),
+        runId: text(row.runId, 200),
+        repositoryRoot: text(row.repositoryRoot, 4_096),
+        worktreePath: text(row.worktreePath, 4_096),
+        directory: text(row.directory, 4_096),
+        sessionId: nullableText(row.sessionId),
+        createdAt: integer(row.createdAt),
+        ...(row.cleanupRetryAt === undefined ? {} : {
+          cleanupRetryAt: integer(row.cleanupRetryAt),
+        }),
+      }
+    })
     return {
       schedules, githubTriggers, githubActiveSessions, githubQueueProgress,
-      githubIssueProgressMarkers, pendingReports,
+      githubIssueProgressMarkers, githubWorktrees, pendingReports,
     }
   } catch (error) {
     if (error instanceof Error && error.message === 'automation-runtime-invalid') throw error
@@ -294,7 +326,7 @@ export function createServerAutomationRuntimeStore(options: { filePath: string }
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
           return {
             schedules: [], githubTriggers: [], githubActiveSessions: [], githubQueueProgress: [],
-            githubIssueProgressMarkers: [], pendingReports: [],
+            githubIssueProgressMarkers: [], githubWorktrees: [], pendingReports: [],
           }
         }
         throw error

@@ -91,6 +91,18 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
   }))
   const logDebug = vi.fn()
+  const prepareGithubWorktree = vi.fn<ServerAutomationExecutorInput['prepareGithubWorktree']>(async ({ runId, onPlanned }) => {
+    const plan = {
+      directory: `/isolated/${runId}`,
+      worktreePath: `/isolated/${runId}`,
+      repositoryRoot: '/repo',
+    }
+    onPlanned(plan)
+    return { ok: true as const, ...plan }
+  })
+  const discardGithubWorktree = vi.fn<ServerAutomationExecutorInput['discardGithubWorktree']>(async () => ({
+    ok: true as const,
+  }))
   const input: ServerAutomationExecutorInput = {
     cache: { read: () => ({
       cursor: 1n, serverTime: now, syncedAt: now, pendingAcknowledgements: [],
@@ -116,6 +128,8 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     linkSession,
     resumeSession,
     spawnSession,
+    prepareGithubWorktree,
+    discardGithubWorktree,
     isSessionRunning: vi.fn(() => false),
     randomId: () => 'report-1',
     logDebug,
@@ -125,7 +139,8 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     queryGithubIssues, notifyGithubTrigger, dispatchAgentTask, maintainAgentTaskLease,
     resolveGithubIssueProgressMarkerIdentity, createGithubIssueProgressMarker,
     removeGithubIssueProgressMarker,
-    resolveMcpSpawnContext, preflightMcpConnectors, linkSession, resumeSession, spawnSession, now,
+    resolveMcpSpawnContext, preflightMcpConnectors, linkSession, resumeSession, spawnSession,
+    prepareGithubWorktree, discardGithubWorktree, now,
   }
 }
 
@@ -1716,7 +1731,9 @@ describe('runServerAutomationTick', () => {
   it.each(['pr_review.v1', 'testing.v1'] as const)(
     'does not grant the repository credential to a %s session',
     async (taskType) => {
-      const { input, store, queryGithubPullRequests, dispatchAgentTask, spawnSession } = setup({
+      const {
+        input, store, queryGithubPullRequests, dispatchAgentTask, spawnSession, prepareGithubWorktree,
+      } = setup({
         claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
       })
       input.decryptPayload = vi.fn(() => ({
@@ -1761,6 +1778,7 @@ describe('runServerAutomationTick', () => {
       }))
       expect(spawnedEnvironment).not.toHaveProperty('GH_TOKEN')
       expect(spawnedEnvironment).not.toHaveProperty('GH_REPO')
+      expect(prepareGithubWorktree).not.toHaveBeenCalled()
       if (taskType === 'pr_review.v1') {
         expect(spawned).toMatchObject({ permissionMode: 'read-only' })
         expect(spawned.initialPrompt).toContain('[PR review quality contract]')
@@ -1785,6 +1803,7 @@ describe('runServerAutomationTick', () => {
   it('records notify-only GitHub events without issuing an MCP grant or starting an LLM session', async () => {
     const {
       input, store, queryGithubPullRequests, notifyGithubTrigger, resolveMcpSpawnContext, spawnSession,
+      prepareGithubWorktree,
     } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
     })
@@ -1824,6 +1843,7 @@ describe('runServerAutomationTick', () => {
     })
     expect(resolveMcpSpawnContext).not.toHaveBeenCalled()
     expect(spawnSession).not.toHaveBeenCalled()
+    expect(prepareGithubWorktree).not.toHaveBeenCalled()
   })
 
   it('polls first, then drains multiple queued GitHub events in the same daemon tick', async () => {
@@ -2139,7 +2159,9 @@ describe('runServerAutomationTick', () => {
   })
 
   it('starts at most three GitHub-triggered sessions in one daemon tick', async () => {
-    const { input, store, transport, queryGithubPullRequests, spawnSession, now } = setup()
+    const {
+      input, store, transport, queryGithubPullRequests, spawnSession, prepareGithubWorktree, now,
+    } = setup()
     const automationIds = ['automation-1', 'automation-2', 'automation-3', 'automation-4']
     store.write({
       schedules: automationIds.map((automationId) => ({
@@ -2185,7 +2207,234 @@ describe('runServerAutomationTick', () => {
     ])
     expect(transport.claim).toHaveBeenCalledTimes(7)
     expect(spawnSession).toHaveBeenCalledTimes(3)
+    expect(prepareGithubWorktree).toHaveBeenCalledTimes(3)
+    expect(spawnSession.mock.calls.map(([call]) => call.directory)).toEqual([
+      '/isolated/run-automation-1',
+      '/isolated/run-automation-2',
+      '/isolated/run-automation-3',
+    ])
+    expect(new Set(spawnSession.mock.calls.map(([call]) => call.directory)).size).toBe(3)
+    expect(spawnSession.mock.calls.some(([call]) => call.directory === '/repo')).toBe(false)
     expect(queryGithubPullRequests).toHaveBeenCalledTimes(7)
     expect(store.state().schedules.find((item) => item.automationId === 'automation-4')?.nextRunAt).toBe(now + 1)
+  })
+
+  it('keeps a GitHub event pending instead of spawning in the shared directory when worktree preparation fails', async () => {
+    const {
+      input, store, transport, queryGithubPullRequests, spawnSession, prepareGithubWorktree,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const }, prompt: 'Review',
+      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      pullRequests: [{
+        number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10', author: { login: 'alice' },
+        baseRefName: 'main', headRefName: 'feature/search', isDraft: false, state: 'OPEN', mergedAt: null,
+        labels: [], changedFiles: 1, files: [{ path: 'apps/web/page.tsx' }],
+      }],
+    })
+    prepareGithubWorktree.mockResolvedValue({ ok: false, error: 'worktree checkout failed' } as never)
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'ERROR' },
+    ])
+
+    expect(prepareGithubWorktree).toHaveBeenCalledTimes(1)
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(transport.report).toHaveBeenLastCalledWith(expect.objectContaining({
+      status: 'FAILED', outcome: 'ERROR', sessionId: null,
+    }))
+    expect(store.state().githubTriggers?.[0]?.state.pending).toHaveLength(1)
+  })
+
+  it('discards the isolated worktree and keeps the event pending when session spawn fails', async () => {
+    const {
+      input, store, queryGithubPullRequests, spawnSession, prepareGithubWorktree, discardGithubWorktree,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const }, prompt: 'Review',
+      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      pullRequests: [{
+        number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10', author: { login: 'alice' },
+        baseRefName: 'main', headRefName: 'feature/search', headRefOid: 'a'.repeat(40),
+        isDraft: false, state: 'OPEN', mergedAt: null,
+        labels: [], changedFiles: 1, files: [{ path: 'apps/web/page.tsx' }],
+      }],
+    })
+    spawnSession.mockResolvedValue({ ok: false, error: 'spawn failed' })
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'ERROR' },
+    ])
+
+    expect(prepareGithubWorktree).toHaveBeenCalledTimes(1)
+    expect(discardGithubWorktree).toHaveBeenCalledWith({
+      repositoryRoot: '/repo', worktreePath: '/isolated/run-1',
+    })
+    expect(store.state().githubTriggers?.[0]?.state.pending).toHaveLength(1)
+  })
+
+  it('journals the isolated worktree before preparation and associates it with the spawned session', async () => {
+    const {
+      input, store, queryGithubPullRequests, prepareGithubWorktree,
+    } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const }, prompt: 'Review',
+      directory: '/repo/apps/web', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      pullRequests: [{
+        number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10', author: { login: 'alice' },
+        baseRefName: 'main', headRefName: 'feature/search', headRefOid: 'a'.repeat(40),
+        isDraft: false, state: 'OPEN', mergedAt: null, labels: [], changedFiles: 0, files: [],
+      }],
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(prepareGithubWorktree.mock.calls[0]?.[0].onPlanned).toEqual(expect.any(Function))
+    expect(store.state().githubWorktrees).toEqual([{
+      automationId: 'automation-1', generation: 2, runId: 'run-1',
+      repositoryRoot: '/repo', worktreePath: '/isolated/run-1', directory: '/isolated/run-1',
+      sessionId: 'session-1', createdAt: 1_000_000,
+    }])
+  })
+
+  it('removes a journaled worktree after restart when its session is no longer running', async () => {
+    const { input, store, discardGithubWorktree } = setup()
+    input.cache = { read: () => ({
+      cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
+    }) }
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old', directory: '/isolated/run-old',
+        sessionId: 'ended-session', createdAt: 1,
+      }],
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(discardGithubWorktree).toHaveBeenCalledWith({
+      repositoryRoot: '/repo', worktreePath: '/isolated/run-old',
+    })
+    expect(store.state().githubWorktrees).toEqual([])
+  })
+
+  it('preserves a dirty ended worktree in the journal for manual recovery', async () => {
+    const { input, store, discardGithubWorktree, logDebug, now } = setup()
+    input.cache = { read: () => ({
+      cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
+    }) }
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old', directory: '/isolated/run-old',
+        sessionId: 'ended-session', createdAt: 1,
+      }],
+    })
+    discardGithubWorktree.mockResolvedValue({ ok: false, dirty: true, error: 'worktree is dirty' })
+
+    await runServerAutomationTick(input)
+
+    expect(store.state().githubWorktrees).toEqual([expect.objectContaining({
+      worktreePath: '/isolated/run-old', cleanupRetryAt: now + 15 * 60_000,
+    })])
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('worktree is dirty'))
+  })
+
+  it('does not clean a journaled worktree while its session remains live after restart', async () => {
+    const { input, store, discardGithubWorktree } = setup()
+    input.cache = { read: () => ({
+      cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
+    }) }
+    input.isSessionRunning = vi.fn((sessionId) => sessionId === 'live-session')
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old', directory: '/isolated/run-old',
+        sessionId: 'live-session', createdAt: 1,
+      }],
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(discardGithubWorktree).not.toHaveBeenCalled()
+    expect(store.state().githubWorktrees).toHaveLength(1)
+  })
+
+  it('does not clean an unassociated journal entry while a restarted session uses its directory', async () => {
+    const { input, store, discardGithubWorktree } = setup()
+    input.cache = { read: () => ({
+      cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
+    }) }
+    input.isDirectoryInUse = vi.fn((directory) => directory === '/isolated/run-old/apps/web')
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old',
+        directory: '/isolated/run-old/apps/web', sessionId: null, createdAt: 1,
+      }],
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(discardGithubWorktree).not.toHaveBeenCalled()
+    expect(store.state().githubWorktrees).toHaveLength(1)
   })
 })

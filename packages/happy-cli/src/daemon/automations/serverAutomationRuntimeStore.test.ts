@@ -25,7 +25,8 @@ describe('serverAutomationRuntimeStore', () => {
         state: {
           snapshot: [{
             number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10', author: { login: 'alice' },
-            baseRefName: 'main', headRefName: 'feature/search', isDraft: false, state: 'OPEN', mergedAt: null,
+            baseRefName: 'main', headRefName: 'feature/search', headRefOid: 'a'.repeat(40),
+            isDraft: false, state: 'OPEN', mergedAt: null,
             labels: [{ name: 'ready' }], changedFiles: 1, files: [{ path: 'apps/web/page.tsx' }],
           }],
           highestPrNumber: 10,
@@ -46,6 +47,11 @@ describe('serverAutomationRuntimeStore', () => {
         issueNumber: 12, actor: 'automation-bot', repository: 'acme/app', reactionId: 321,
         cleanupRetryAt: 999,
       }],
+      githubWorktrees: [{
+        automationId: 'automation-2', generation: 3, runId: 'run-2',
+        repositoryRoot: '/repo', worktreePath: '/managed/run-2', directory: '/managed/run-2/apps/web',
+        sessionId: 'session-2', createdAt: 777,
+      }],
       pendingReports: [{
         runId: 'run-1', claimToken: 'claim-token', reportId: 'report-1', status: 'COMPLETED',
         outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,
@@ -65,13 +71,19 @@ describe('serverAutomationRuntimeStore', () => {
         issueNumber: 12, actor: 'automation-bot', repository: 'acme/app', reactionId: 321,
         cleanupRetryAt: 999,
       }],
+      githubWorktrees: [{
+        automationId: 'automation-2', generation: 3, runId: 'run-2',
+        repositoryRoot: '/repo', worktreePath: '/managed/run-2', directory: '/managed/run-2/apps/web',
+        sessionId: 'session-2', createdAt: 777,
+      }],
       githubTriggers: [{
         automationId: 'automation-2',
         generation: 3,
         state: {
           snapshot: [{
             number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10', author: { login: 'alice' },
-            baseRefName: 'main', headRefName: 'feature/search', isDraft: false, state: 'OPEN', mergedAt: null,
+            baseRefName: 'main', headRefName: 'feature/search', headRefOid: 'a'.repeat(40),
+            isDraft: false, state: 'OPEN', mergedAt: null,
             labels: [{ name: 'ready' }], changedFiles: 1, files: [{ path: 'apps/web/page.tsx' }],
           }],
           highestPrNumber: 10,
