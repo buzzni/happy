@@ -1203,15 +1203,27 @@ export async function startDaemon(): Promise<void> {
 
     const fetchServerSessionSnapshot = async (sessionId: string, encryption: SessionEncryptionData, token?: string): Promise<ServerSessionSnapshot | null> => {
       try {
-        const response = await axios.get(`${configuration.serverUrl}/v1/sessions`, {
+        // `/v1/sessions` returns only the account's 150 most-recently-updated
+        // sessions. On a shared daemon account that window can be under a day,
+        // so a session idle longer than that would never be found — resume
+        // refuses forever even though the server still has it (2026-08-27
+        // incident). `/v2/sessions/lookup` looks up this one id directly with
+        // no window.
+        const response = await axios.post(`${configuration.serverUrl}/v2/sessions/lookup`, {
+          ids: [sessionId],
+        }, {
           headers: { Authorization: `Bearer ${token ?? credentials.token}` },
           timeout: 10_000,
         });
-        return parseServerSessionSnapshot(
+        const snapshot = parseServerSessionSnapshot(
           (response.data as { sessions?: unknown }).sessions,
           sessionId,
           encryption,
         );
+        if (!snapshot) {
+          logger.debug(`[DAEMON RUN] Server lookup for session ${sessionId} returned no matching record`);
+        }
+        return snapshot;
       } catch (error) {
         logger.debug(`[DAEMON RUN] Failed to fetch session snapshot from server: ${error instanceof Error ? error.message : error}`);
         return null;
