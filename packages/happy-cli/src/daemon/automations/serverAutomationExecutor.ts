@@ -393,8 +393,8 @@ function makeGithubTriggerStatePersister(
   input: ServerAutomationExecutorInput,
   automation: EncryptedServerAutomation,
   state: GithubTriggerRuntimeState,
-): () => void {
-  return () => {
+): (spawnedWorktree?: { runId: string; sessionId: string }) => void {
+  return (spawnedWorktree) => {
     const latest = input.runtimeStore.read()
     input.runtimeStore.write({
       ...latest,
@@ -402,6 +402,13 @@ function makeGithubTriggerStatePersister(
         ...(latest.githubTriggers ?? []).filter((entry) => entry.automationId !== automation.automationId),
         { automationId: automation.automationId, generation: automation.generation, state },
       ],
+      ...(spawnedWorktree ? {
+        githubWorktrees: (latest.githubWorktrees ?? []).map((entry) => (
+          entry.runId === spawnedWorktree.runId
+            ? { ...entry, sessionId: spawnedWorktree.sessionId }
+            : entry
+        )),
+      } : {}),
     })
   }
 }
@@ -883,7 +890,9 @@ async function executeStartedRun(
   let prompt = payload.prompt
   let environmentVariables: Record<string, string> | undefined
   let agentTaskDispatch: AutomationAgentTaskDispatch | null = null
-  let persistGithubTriggerState: (() => void) | null = null
+  let persistGithubTriggerState: ((
+    spawnedWorktree?: { runId: string; sessionId: string }
+  ) => void) | null = null
   let issueProgressMarker: {
     number: number
     githubEnvironment?: { GH_TOKEN: string; GH_REPO: string }
@@ -1280,12 +1289,10 @@ async function executeStartedRun(
   }
   if (spawned.ok && agentTaskDispatch) input.maintainAgentTaskLease(agentTaskDispatch)
   if (spawned.ok) {
-    if (githubWorktree) {
-      const state = input.runtimeStore.read()
-      const journaled = (state.githubWorktrees ?? []).find((entry) => entry.runId === run.runId)
-      if (journaled) writeGithubWorktree(input, { ...journaled, sessionId: spawned.sessionId })
-    }
-    persistGithubTriggerState?.()
+    persistGithubTriggerState?.(githubWorktree ? {
+      runId: run.runId,
+      sessionId: spawned.sessionId,
+    } : undefined)
     if (issueProgressMarker) {
       degradedCode = await createIssueProgressMarkerAfterSpawn(
         input,

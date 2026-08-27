@@ -2414,7 +2414,7 @@ describe('runServerAutomationTick', () => {
     expect(store.state().githubTriggers?.[0]?.state.pending).toHaveLength(1)
   })
 
-  it('journals the isolated worktree before preparation and associates it with the spawned session', async () => {
+  it('journals before preparation and atomically associates the spawned session with event consumption', async () => {
     const {
       input, store, queryGithubPullRequests, prepareGithubWorktree,
     } = setup({
@@ -2454,6 +2454,10 @@ describe('runServerAutomationTick', () => {
       repositoryRoot: '/repo', worktreePath: '/isolated/run-1', directory: '/isolated/run-1',
       sessionId: 'session-1', createdAt: 1_000_000,
     }])
+    expect(store.write.mock.calls.some(([state]) => (
+      state.githubWorktrees?.some((entry) => entry.sessionId === 'session-1')
+        && state.githubTriggers?.some((entry) => entry.state.pending.length > 0)
+    ))).toBe(false)
   })
 
   it('removes a journaled worktree after restart when its session is no longer running', async () => {
