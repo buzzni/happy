@@ -12,6 +12,7 @@ import { execSync } from 'node:child_process';
 import { logger } from '@/ui/logger';
 import { installBroadKillShims } from '@/utils/broadKillShims';
 import { Credentials, readSettings } from '@/persistence';
+import { resolveSessionSandboxConfig } from '@/sandbox/resolveSessionSandboxConfig';
 import { initialMachineMetadata } from '@/daemon/run';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
@@ -164,7 +165,14 @@ export async function runCodex(opts: {
     const settings = await readSettings();
     const additionalDirectories = readAdditionalDirectoriesEnvironment(process.env);
     let machineId = settings?.machineId;
-    const sandboxConfig = opts.noSandbox ? undefined : settings?.sandboxConfig;
+    // daemon 이 서버 지시대로 넘긴 설정(AgentTask pr_review 의 networkMode:'allowed' 등)을
+    // 로컬 머신 설정보다 우선한다. 이 배선이 없어서 agent=codex 워커가 샌드박스 없이 떴고,
+    // Codex 네이티브 readOnly 정책으로 떨어져 lifecycle 콜백을 전부 놓쳤다.
+    const sandboxConfig = resolveSessionSandboxConfig({
+        noSandbox: Boolean(opts.noSandbox),
+        env: process.env,
+        settings,
+    });
     if (!machineId) {
         console.error(`[START] No machine ID found in settings, which is unexpected since authAndSetupMachineIfNeeded should have created it. Please report this issue on https://github.com/slopus/happy-cli/issues`);
         process.exit(1);
