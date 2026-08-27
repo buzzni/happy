@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import net, { AddressInfo } from 'node:net'
 import { PreviewWsProxy } from './previewWsProxy'
 
@@ -88,6 +88,20 @@ describe('PreviewWsProxy', () => {
 
     await waitFor(() => Buffer.concat(received).toString().includes('frame-1'))
     expect(Buffer.concat(received).toString()).toBe('frame-1')
+  })
+
+  it('reports the target port while an active relay carries browser traffic', async () => {
+    const srv = await startTcpServer((socket) => { socket.on('data', () => {}) })
+    stop = srv.stop
+    const onActivity = vi.fn()
+    const proxy = new PreviewWsProxy(new RecordingEmitter(), { onActivity })
+    activeProxy = proxy
+
+    await proxy.open({ tunnelId: 'active', port: srv.port, dataB64: '' })
+    proxy.data({ tunnelId: 'active', dataB64: Buffer.from('vnc-frame').toString('base64') })
+
+    expect(onActivity).toHaveBeenCalledWith(srv.port)
+    expect(onActivity).toHaveBeenCalledTimes(2)
   })
 
   it('rejects an out-of-range port without connecting', async () => {

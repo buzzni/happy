@@ -67,4 +67,8 @@ describe('parseAutoConnectParams', () => {
         const parsed = parseAutoConnectParams('?token=abc123')
         expect('pairingId' in parsed).toBe(false)
     })
+
+    it('reads an opaque viewer key for scoped bridge routing', () => {
+        expect(parseAutoConnectParams('?token=abc123&viewerKey=bv1_alice').viewerKey).toBe('bv1_alice')
+    })
 })

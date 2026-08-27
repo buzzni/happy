@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { WebSocket } from 'ws'
-import { BrowserBridge } from './browserBridge'
+import { BrowserBridge, deriveBrowserViewerBridgeToken } from './browserBridge'
 import { startBrowserBridgeServer } from './browserBridgeServer'
 import { startDaemonControlServer } from './controlServer'
 import type { PortRegistry } from './portRegistry'
@@ -152,6 +152,28 @@ describe('controlServer /browser routes', () => {
             hasRecentAuthFailure: false,
         })
         ws.close()
+    })
+
+    it('GET /browser/status returns only the requested viewer boundary', async () => {
+        const aliceKey = 'bv1_abcdefghijklmnopqrstuvwxyz012345'
+        const bobKey = 'bv1_abcdefghijklmnopqrstuvwxyz012346'
+        const alice = await connectExtension(
+            bridgePort,
+            `token=${deriveBrowserViewerBridgeToken(TOKEN, aliceKey)}&profile=alice&viewerKey=${aliceKey}`,
+        )
+        const bob = await connectExtension(
+            bridgePort,
+            `token=${deriveBrowserViewerBridgeToken(TOKEN, bobKey)}&profile=bob&viewerKey=${bobKey}`,
+        )
+        await expect.poll(() => bridge.connections(aliceKey).length).toBe(1)
+
+        const response = await fetch(`${baseUrl}/browser/status?viewerKey=${aliceKey}`)
+        expect(await response.json()).toEqual({
+            connections: [{ profile: 'alice', viewerKey: aliceKey }],
+            hasRecentAuthFailure: false,
+        })
+        alice.ws.close()
+        bob.ws.close()
     })
 
     it('POST /browser/request relays to the extension and returns its result', async () => {

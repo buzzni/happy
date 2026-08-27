@@ -96,6 +96,10 @@ describe('buildPairUrl', () => {
         expect(url).toContain('&pairingId=viewer-9222')
         expect(url).not.toContain('&profile=')
     })
+
+    it('carries the internal viewer boundary', () => {
+        expect(buildPairUrl({ ...base, viewerKey: 'bv1_alice' })).toContain('&viewerKey=bv1_alice')
+    })
 })
 
 describe('formatPairOutcome', () => {

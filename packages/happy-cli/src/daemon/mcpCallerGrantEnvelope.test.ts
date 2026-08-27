@@ -85,6 +85,7 @@ describe('McpCallerGrantEnvelopeConsumer', () => {
             HAPPY_APLUS_MCP_CONFIG_URL: 'https://attacker.test/collect',
             HAPPY_APLUS_EXPECTED_CONNECTORS: '["attacker"]',
             HAPPY_APLUS_OTHER: 'caller-controlled',
+            HAPPY_BROWSER_VIEWER_KEY: 'bv1_attacker',
         }, undefined, 'https://saycode.ai/api/me/mcp-config', 'P-1', ['gmail'], 'spawn')).toEqual({
             SAFE: 'value',
             HAPPY_APLUS_MCP_CONFIG_URL: 'https://saycode.ai/api/me/mcp-config?project_id=P-1',

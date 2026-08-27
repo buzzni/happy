@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+    VIEWER_SLOTS,
     VIEWER_WEB_PORTS,
     decideViewerBrowserAction,
     decideViewerStackAction,
@@ -10,7 +11,11 @@ import {
     planViewerInstall,
     readDisplayFromEnviron,
     readFlagFromCmdline,
+    viewerProcessMatchesLease,
     VIEWER_TOOLS,
+    resolveViewerProfileDir,
+    selectViewerSlot,
+    validateViewerKey,
 } from './remoteViewer'
 
 describe('buildXvfbArgs', () => {
@@ -190,6 +195,33 @@ describe('VIEWER_WEB_PORTS as the single source of truth', () => {
     })
 })
 
+describe('per-user viewer slots', () => {
+    it('keeps display, VNC, and web ports in one atomic slot definition', () => {
+        expect(VIEWER_SLOTS).toEqual([
+            { slot: 0, display: ':99', vncPort: 5900, webPort: 6080 },
+            { slot: 1, display: ':100', vncPort: 5901, webPort: 6081 },
+            { slot: 2, display: ':101', vncPort: 5902, webPort: 6082 },
+        ])
+        expect(VIEWER_WEB_PORTS).toEqual(VIEWER_SLOTS.map((entry) => entry.webPort))
+    })
+
+    it('selects the first unoccupied slot without stealing another viewer lease', () => {
+        expect(selectViewerSlot(new Set([0, 2]))).toEqual(VIEWER_SLOTS[1])
+        expect(selectViewerSlot(new Set([0, 1, 2]))).toBeNull()
+    })
+
+    it('accepts only opaque viewer keys safe for filesystem paths', () => {
+        expect(validateViewerKey('bv1_abcdefghijklmnopqrstuvwxyz012345')).toBe(true)
+        expect(validateViewerKey('../alice')).toBe(false)
+        expect(validateViewerKey('alice')).toBe(false)
+    })
+
+    it('resolves a dedicated profile directory for each viewer key', () => {
+        expect(resolveViewerProfileDir('/home/coder/.happy', 'bv1_abcdefghijklmnopqrstuvwxyz012345'))
+            .toBe('/home/coder/.happy/browser-viewers/bv1_abcdefghijklmnopqrstuvwxyz012345/chrome-profile')
+    })
+})
+
 describe('decideViewerBrowserAction', () => {
     it('defers to the profile launch caller instead of occupying its CDP port', () => {
         const decision = decideViewerBrowserAction({
@@ -264,5 +296,45 @@ describe('viewer Chrome process facts', () => {
         expect(readFlagFromCmdline(chrome, '--remote-debugging-port')).toBe('9222')
         expect(readFlagFromCmdline(chrome, '--user-data-dir')).toBe('/home/walter/.happy/chrome-profiles/default')
         expect(readFlagFromCmdline(chrome, '--display')).toBe(':99')
+    })
+})
+
+describe('viewer process ownership', () => {
+    const lease = { display: ':99', vncPort: 5900, webPort: 6080 }
+
+    it('matches only the process signature owned by the lease slot', () => {
+        expect(viewerProcessMatchesLease(
+            'xvfb',
+            ['/usr/bin/Xvfb', ':99', '-screen', '0', '1920x1080x24', ''].join('\0'),
+            lease,
+        )).toBe(true)
+        expect(viewerProcessMatchesLease(
+            'x11vnc',
+            ['/usr/bin/x11vnc', '-display', ':99', '-rfbport', '5900', ''].join('\0'),
+            lease,
+        )).toBe(true)
+        expect(viewerProcessMatchesLease(
+            'websockify',
+            ['/usr/bin/python3', '/usr/bin/websockify', '--web', '/usr/share/novnc', '127.0.0.1:6080', '127.0.0.1:5900', ''].join('\0'),
+            lease,
+        )).toBe(true)
+    })
+
+    it('rejects a reused pid whose process belongs to another slot or program', () => {
+        expect(viewerProcessMatchesLease(
+            'xvfb',
+            ['/usr/bin/node', 'server.js', ':99', ''].join('\0'),
+            lease,
+        )).toBe(false)
+        expect(viewerProcessMatchesLease(
+            'x11vnc',
+            ['/usr/bin/x11vnc', '-display', ':100', '-rfbport', '5901', ''].join('\0'),
+            lease,
+        )).toBe(false)
+        expect(viewerProcessMatchesLease(
+            'websockify',
+            ['/usr/bin/websockify', '127.0.0.1:6081', '127.0.0.1:5901', ''].join('\0'),
+            lease,
+        )).toBe(false)
     })
 })

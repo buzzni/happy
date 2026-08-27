@@ -9,6 +9,8 @@ describe('fetchAplusMcpServersResult', () => {
     beforeEach(() => {
         delete process.env.HAPPY_APLUS_EXPECTED_CONNECTORS;
         delete process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES;
+        delete process.env.HAPPY_BROWSER_VIEWER_KEY;
+        delete process.env.HAPPY_BROWSER_VIEWER_SCOPE_REQUIRED;
         process.env.HAPPY_APLUS_MCP_CONFIG_URL = 'http://aplus.test/api/me/mcp-config';
     });
 
@@ -19,6 +21,8 @@ describe('fetchAplusMcpServersResult', () => {
         delete process.env.HAPPY_APLUS_EXPECTED_CONNECTORS;
         delete process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES;
         delete process.env.HAPPY_APLUS_MCP_INITIAL_LIFECYCLE;
+        delete process.env.HAPPY_BROWSER_VIEWER_KEY;
+        delete process.env.HAPPY_BROWSER_VIEWER_SCOPE_REQUIRED;
     });
 
     it('returns a successful server map', async () => {
@@ -52,6 +56,19 @@ describe('fetchAplusMcpServersResult', () => {
                 'X-Aplus-Caller-Grant': 'signed-caller-grant',
             });
         }
+    });
+
+    it('installs only the server-resolved viewer routing key in the child process', async () => {
+        process.env.HAPPY_APLUS_MCP_CALLER_GRANT = 'signed-caller-grant';
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+            mcpServers: {},
+            browserViewerRouting: { required: true, viewerKey: 'bv1_abcdefghijklmnopqrstuvwxyz012345' },
+        }), { status: 200 })));
+
+        await fetchAplusMcpServersResult('company-token', 'machine-1');
+
+        expect(process.env.HAPPY_BROWSER_VIEWER_SCOPE_REQUIRED).toBe('1');
+        expect(process.env.HAPPY_BROWSER_VIEWER_KEY).toBe('bv1_abcdefghijklmnopqrstuvwxyz012345');
     });
 
     it('uses an explicit automation context without copying credentials into process env', async () => {

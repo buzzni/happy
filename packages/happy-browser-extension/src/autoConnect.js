@@ -26,6 +26,9 @@ export function parseAutoConnectParams(search) {
     const pairingId = (params.get('pairingId') ?? '').trim()
     if (pairingId) result.pairingId = pairingId
 
+    const viewerKey = (params.get('viewerKey') ?? '').trim()
+    if (viewerKey) result.viewerKey = viewerKey
+
     // Absent must stay absent rather than becoming `false`: a machine that
     // re-pairs (new token, same profile) would otherwise silently switch the
     // debugger tier back off for a user who had turned it on.
