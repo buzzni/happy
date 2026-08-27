@@ -19,19 +19,20 @@ export class BrowserClientError extends Error {
 
 const DEFAULT_TIMEOUT_MS = 35_000
 
-export async function requestBrowser({ port, method, params, timeoutMs, profile }: {
+export async function requestBrowser({ port, method, params, timeoutMs, profile, viewerKey }: {
     port: number
     method: string
     params?: unknown
     timeoutMs?: number
     profile?: string
+    viewerKey?: string
 }): Promise<unknown> {
     let response: Response
     try {
         response = await fetch(`http://127.0.0.1:${port}/browser/request`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ method, params: params ?? {}, timeoutMs, profile }),
+            body: JSON.stringify({ method, params: params ?? {}, timeoutMs, profile, viewerKey }),
             signal: AbortSignal.timeout(timeoutMs ? timeoutMs + 5_000 : DEFAULT_TIMEOUT_MS),
         })
     } catch (e) {
@@ -54,12 +55,19 @@ export async function requestBrowser({ port, method, params, timeoutMs, profile 
  * answer (nothing connected, or zero tabs), so a failure here is not an error
  * — it just means no extra diagnosis.
  */
-export async function fetchBrowserStatus(port: number): Promise<{ connections: Array<{ profile: string; pairingId?: string }>; hasRecentAuthFailure: boolean } | null> {
+export async function fetchBrowserStatus(
+    port: number,
+    viewerKey?: string,
+): Promise<{ connections: Array<{ profile: string; pairingId?: string; viewerKey?: string }>; hasRecentAuthFailure: boolean } | null> {
     try {
-        const response = await fetch(`http://127.0.0.1:${port}/browser/status`, { signal: AbortSignal.timeout(2_000) })
+        const query = viewerKey ? `?viewerKey=${encodeURIComponent(viewerKey)}` : ''
+        const response = await fetch(`http://127.0.0.1:${port}/browser/status${query}`, { signal: AbortSignal.timeout(2_000) })
         if (!response.ok) return null
-        const body = await response.json() as { connections?: Array<{ profile: string; pairingId?: string }>; hasRecentAuthFailure?: boolean }
-        return { connections: body.connections ?? [], hasRecentAuthFailure: body.hasRecentAuthFailure ?? false }
+        const body = await response.json() as { connections?: Array<{ profile: string; pairingId?: string; viewerKey?: string }>; hasRecentAuthFailure?: boolean }
+        return {
+            connections: (body.connections ?? []).filter((connection) => connection.viewerKey === viewerKey),
+            hasRecentAuthFailure: body.hasRecentAuthFailure ?? false,
+        }
     } catch {
         return null
     }

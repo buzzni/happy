@@ -209,6 +209,7 @@ export async function fetchAplusMcpConfigSnapshot(
             }
             const body = (await res.json()) as {
                 mcpServers?: AplusMcpServersMap
+                browserViewerRouting?: { required?: unknown; viewerKey?: unknown }
                 connectorReadiness?: { expected?: unknown }
                 mcpReadiness?: { expected?: unknown; configured?: unknown; missing?: unknown }
             }
@@ -217,6 +218,18 @@ export async function fetchAplusMcpConfigSnapshot(
                 return snapshot({ ok: false, reason: 'invalid-response', error: 'mcp-config response is invalid' })
             }
             const keys = Object.keys(body.mcpServers)
+            if (body.browserViewerRouting?.required === true) {
+                process.env.HAPPY_BROWSER_VIEWER_SCOPE_REQUIRED = '1'
+                const viewerKey = body.browserViewerRouting.viewerKey
+                if (typeof viewerKey === 'string' && /^bv1_[A-Za-z0-9_-]{32}$/.test(viewerKey)) {
+                    process.env.HAPPY_BROWSER_VIEWER_KEY = viewerKey
+                } else {
+                    delete process.env.HAPPY_BROWSER_VIEWER_KEY
+                }
+            } else {
+                delete process.env.HAPPY_BROWSER_VIEWER_SCOPE_REQUIRED
+                delete process.env.HAPPY_BROWSER_VIEWER_KEY
+            }
             const authoritativeExpected = connectorNames(body.connectorReadiness?.expected)
             if (authoritativeExpected) {
                 process.env.HAPPY_APLUS_EXPECTED_CONNECTORS = JSON.stringify(authoritativeExpected)

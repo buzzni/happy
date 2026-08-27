@@ -18,7 +18,8 @@
   },
   "bin": {
     "happy": "bin/happy.mjs",
-    "happy-mcp": "bin/happy-mcp.mjs"
+    "happy-mcp": "bin/happy-mcp.mjs",
+    "happy-browser-session-broker": "bin/happy-browser-session-broker.mjs"
   },
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
@@ -56,6 +57,9 @@
     },
     "./browserNativeMessagingHost": {
       "import": "./dist/browserNativeMessagingHost.mjs"
+    },
+    "./browserSessionBrokerMain": {
+      "import": "./dist/browserSessionBrokerMain.mjs"
     }
   },
   "files": [
@@ -63,6 +67,7 @@
     "bin",
     "scripts",
     "browser-extension",
+    "browser-session-image",
     "tools/archives",
     "tools/licenses",
     "package.json"

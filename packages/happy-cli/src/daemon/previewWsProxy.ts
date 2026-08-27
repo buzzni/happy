@@ -48,6 +48,7 @@ export interface PreviewWsProxyOptions {
     portMax?: number
     connectTimeoutMs?: number
     logger?: { debug: (msg: string) => void }
+    onActivity?: (port: number) => void
 }
 
 /**
@@ -56,17 +57,19 @@ export interface PreviewWsProxyOptions {
  * disconnect (call `closeAll`).
  */
 export class PreviewWsProxy {
-    private readonly tunnels = new Map<string, net.Socket>()
+    private readonly tunnels = new Map<string, { socket: net.Socket; port: number }>()
     private readonly portMin: number
     private readonly portMax: number
     private readonly connectTimeoutMs: number
     private readonly logger?: { debug: (msg: string) => void }
+    private readonly onActivity?: (port: number) => void
 
     constructor(private readonly emitter: PreviewWsEmitter, opts: PreviewWsProxyOptions = {}) {
         this.portMin = opts.portMin ?? DEFAULT_PORT_MIN
         this.portMax = opts.portMax ?? DEFAULT_PORT_MAX
         this.connectTimeoutMs = opts.connectTimeoutMs ?? 15_000
         this.logger = opts.logger
+        this.onActivity = opts.onActivity
     }
 
     /**
@@ -102,7 +105,8 @@ export class PreviewWsProxy {
 
             upstream.once('connect', () => {
                 clearTimeout(timer)
-                this.tunnels.set(tunnelId, upstream)
+                this.tunnels.set(tunnelId, { socket: upstream, port })
+                this.onActivity?.(port)
                 const initial = dataB64 ? Buffer.from(dataB64, 'base64') : null
                 if (initial && initial.length > 0) upstream.write(initial)
                 this.logger?.debug(`[preview-ws] tunnel ${tunnelId} open → 127.0.0.1:${port}`)
@@ -137,24 +141,25 @@ export class PreviewWsProxy {
 
     /** Write browser→upstream bytes for an existing tunnel. */
     data(payload: { tunnelId: string; dataB64: string }): void {
-        const upstream = this.tunnels.get(payload?.tunnelId)
-        if (upstream && upstream.writable && payload.dataB64) {
-            upstream.write(Buffer.from(payload.dataB64, 'base64'))
+        const tunnel = this.tunnels.get(payload?.tunnelId)
+        if (tunnel && tunnel.socket.writable && payload.dataB64) {
+            this.onActivity?.(tunnel.port)
+            tunnel.socket.write(Buffer.from(payload.dataB64, 'base64'))
         }
     }
 
     /** Close a single tunnel (server-initiated or on error). */
     close(tunnelId: string): void {
-        const upstream = this.tunnels.get(tunnelId)
-        if (upstream) {
+        const tunnel = this.tunnels.get(tunnelId)
+        if (tunnel) {
             this.tunnels.delete(tunnelId)
-            upstream.destroy()
+            tunnel.socket.destroy()
         }
     }
 
     /** Tear down every tunnel — call on daemon socket disconnect. */
     closeAll(): void {
-        for (const upstream of this.tunnels.values()) upstream.destroy()
+        for (const { socket } of this.tunnels.values()) socket.destroy()
         this.tunnels.clear()
     }
 

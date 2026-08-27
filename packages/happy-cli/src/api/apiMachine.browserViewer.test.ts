@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { browserMocks, viewerMocks, fsMocks, mockRunPairing } = vi.hoisted(() => ({
+const { browserMocks, viewerMocks, fsMocks, leaseRegistryMocks, mockRunPairing } = vi.hoisted(() => ({
     browserMocks: {
         detectChrome: vi.fn(),
         isCdpReachable: vi.fn(),
@@ -17,6 +17,9 @@ const { browserMocks, viewerMocks, fsMocks, mockRunPairing } = vi.hoisted(() => 
     fsMocks: {
         readdir: vi.fn(),
         readFile: vi.fn(),
+    },
+    leaseRegistryMocks: {
+        records: new Map<string, any>(),
     },
     mockRunPairing: vi.fn(),
 }))
@@ -52,6 +55,15 @@ vi.mock('@/daemon/remoteViewer', async (importOriginal) => ({
 vi.mock('@/commands/browserPair', async (importOriginal) => ({
     ...await importOriginal<typeof import('@/commands/browserPair')>(),
     runPairing: mockRunPairing,
+}))
+
+vi.mock('@/daemon/browserViewerLeaseRegistry', () => ({
+    BrowserViewerLeaseRegistry: class {
+        async list() { return [...leaseRegistryMocks.records.values()] }
+        async get(viewerKey: string) { return leaseRegistryMocks.records.get(viewerKey) ?? null }
+        async set(lease: any) { leaseRegistryMocks.records.set(lease.viewerKey, lease) }
+        async delete(viewerKey: string) { return leaseRegistryMocks.records.delete(viewerKey) }
+    },
 }))
 
 vi.mock('node:fs/promises', async (importOriginal) => ({
@@ -93,9 +105,27 @@ function rpcHandlers() {
     } as any
 }
 
+const ALICE_KEY = 'bv1_abcdefghijklmnopqrstuvwxyz012345'
+const BOB_KEY = 'bv1_abcdefghijklmnopqrstuvwxyz012346'
+
+function lease(viewerKey: string, slot: number) {
+    return {
+        viewerKey,
+        slot,
+        display: `:${99 + slot}`,
+        vncPort: 5900 + slot,
+        webPort: 6080 + slot,
+        cdpPort: 9222 + slot,
+        profileDir: `/tmp/happy-test/browser-viewers/${viewerKey}/chrome-profile`,
+        lastUsedAt: 1,
+    }
+}
+
 describe('ApiMachineClient browser viewer RPC', () => {
     beforeEach(() => {
         vi.clearAllMocks()
+        leaseRegistryMocks.records.clear()
+        leaseRegistryMocks.records.set(ALICE_KEY, lease(ALICE_KEY, 0))
         viewerMocks.detectMissingViewerTools.mockResolvedValue([])
         viewerMocks.isViewerServing.mockResolvedValue(true)
         browserMocks.detectChrome.mockResolvedValue({
@@ -106,7 +136,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
         browserMocks.launchChrome.mockReturnValue({ pid: 1234, cdpPipe: browserMocks.cdpPipe })
         fsMocks.readdir.mockResolvedValue(['100'])
         fsMocks.readFile.mockImplementation(async (path: string) => path.endsWith('/cmdline')
-            ? '/usr/bin/google-chrome\0--remote-debugging-port=9222\0--user-data-dir=/tmp/happy-test/chrome-profiles/default'
+            ? `/usr/bin/google-chrome\0--remote-debugging-port=9222\0--user-data-dir=/tmp/happy-test/browser-viewers/${ALICE_KEY}/chrome-profile`
             : 'PATH=/usr/bin\0DISPLAY=:99\0')
         mockRunPairing.mockResolvedValue({
             cdpPort: 9222,
@@ -123,18 +153,39 @@ describe('ApiMachineClient browser viewer RPC', () => {
         })
     })
 
+    it('rate-limits broker touches from active relay frames', async () => {
+        const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+        const { ApiMachineClient } = await import('./apiMachine')
+        const client = new ApiMachineClient('token', machineClient()) as any
+        const request = vi.fn().mockResolvedValue({ ok: true, lease: null })
+        client.browserSessionBroker = { request }
+        try {
+            client.touchBrokerViewerPort(6080)
+            client.touchBrokerViewerPort(6080)
+            expect(request).toHaveBeenCalledTimes(1)
+            expect(request).toHaveBeenCalledWith({ op: 'touch-port', webPort: 6080 })
+
+            now.mockReturnValue(61_000)
+            client.touchBrokerViewerPort(6080)
+            expect(request).toHaveBeenCalledTimes(2)
+        } finally {
+            now.mockRestore()
+        }
+    })
+
     it('pairs a reused viewer Chrome on the exact CDP port before reporting bridge readiness', async () => {
         const { ApiMachineClient } = await import('./apiMachine')
         const client = new ApiMachineClient('token', machineClient())
         client.setRPCHandlers(rpcHandlers())
 
-        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({})
+        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
 
         expect(mockRunPairing).toHaveBeenCalledWith({
             cdpPort: 9222,
             debuggerTier: true,
             pairingId: expect.stringMatching(/^viewer-9222-/),
             forceExtensionReload: false,
+            viewerKey: ALICE_KEY,
         })
         expect(result).toMatchObject({
             browserReady: true,
@@ -145,13 +196,13 @@ describe('ApiMachineClient browser viewer RPC', () => {
 
     it('reuses the viewer Chrome after Chrome removes DISPLAY from its environment', async () => {
         fsMocks.readFile.mockImplementation(async (path: string) => path.endsWith('/cmdline')
-            ? '/usr/bin/google-chrome\0--remote-debugging-port=9222\0--user-data-dir=/tmp/happy-test/chrome-profiles/default\0--display=:99'
+            ? `/usr/bin/google-chrome\0--remote-debugging-port=9222\0--user-data-dir=/tmp/happy-test/browser-viewers/${ALICE_KEY}/chrome-profile\0--display=:99`
             : 'PATH=/usr/bin\0')
         const { ApiMachineClient } = await import('./apiMachine')
         const client = new ApiMachineClient('token', machineClient())
         client.setRPCHandlers(rpcHandlers())
 
-        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({})
+        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
 
         expect(result).toMatchObject({
             browserReady: true,
@@ -177,7 +228,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
         const client = new ApiMachineClient('token', machineClient())
         client.setRPCHandlers(rpcHandlers())
 
-        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({})
+        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
 
         expect(result).toMatchObject({
             browserReady: true,
@@ -248,7 +299,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
         const client = new ApiMachineClient('token', machineClient())
         client.setRPCHandlers(rpcHandlers())
 
-        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({})
+        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
 
         expect(result).toMatchObject({ bridgeReady: false })
         expect(result.bridgeMessage).toContain('viewer-9222')
@@ -256,13 +307,13 @@ describe('ApiMachineClient browser viewer RPC', () => {
 
     it('does not reuse a reachable headless Chrome as the browser shown by noVNC', async () => {
         fsMocks.readFile.mockImplementation(async (path: string) => path.endsWith('/cmdline')
-            ? '/usr/bin/google-chrome\0--remote-debugging-port=9222\0--user-data-dir=/tmp/happy-test/chrome-profiles/default'
+            ? `/usr/bin/google-chrome\0--remote-debugging-port=9222\0--user-data-dir=/tmp/happy-test/browser-viewers/${ALICE_KEY}/chrome-profile`
             : 'PATH=/usr/bin\0')
         const { ApiMachineClient } = await import('./apiMachine')
         const client = new ApiMachineClient('token', machineClient())
         client.setRPCHandlers(rpcHandlers())
 
-        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({})
+        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
 
         expect(result).toMatchObject({
             browserReady: false,
@@ -279,7 +330,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
         const client = new ApiMachineClient('token', machineClient())
         client.setRPCHandlers(rpcHandlers())
 
-        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({})
+        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
 
         expect(browserMocks.launchChrome).toHaveBeenCalledWith(
             '/usr/bin/google-chrome',
@@ -290,6 +341,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
             cdpPort: 9222,
             debuggerTier: true,
             pairingId: expect.stringMatching(/^viewer-9222-/),
+            viewerKey: ALICE_KEY,
             browserCdpRequest: expect.any(Function),
             forceExtensionReload: false,
         })
@@ -316,12 +368,57 @@ describe('ApiMachineClient browser viewer RPC', () => {
         client.setRPCHandlers(rpcHandlers())
         const start = handlersFrom(client).get('machine-1:browser-viewer:start')!
 
-        const first = start({})
-        const second = start({})
-        expect(viewerMocks.detectMissingViewerTools).toHaveBeenCalledTimes(1)
+        const first = start({ viewerKey: ALICE_KEY })
+        const second = start({ viewerKey: ALICE_KEY })
+        await vi.waitFor(() => {
+            expect(viewerMocks.detectMissingViewerTools).toHaveBeenCalledTimes(1)
+        })
         releaseToolProbe([])
 
         await expect(Promise.all([first, second])).resolves.toHaveLength(2)
         expect(mockRunPairing).toHaveBeenCalledTimes(1)
+    })
+
+    it('isolates viewer leases for different viewer keys on the same machine', async () => {
+        const { ApiMachineClient } = await import('./apiMachine')
+        const client = new ApiMachineClient('token', machineClient())
+        client.setRPCHandlers(rpcHandlers())
+        const start = handlersFrom(client).get('machine-1:browser-viewer:start')!
+
+        leaseRegistryMocks.records.set(BOB_KEY, lease(BOB_KEY, 1))
+        const alice = await start({ viewerKey: ALICE_KEY })
+        const bob = await start({ viewerKey: BOB_KEY })
+
+        expect(alice.viewerKey).toBe(ALICE_KEY)
+        expect(bob.viewerKey).toBe(BOB_KEY)
+        expect(bob.display).not.toBe(alice.display)
+        expect(bob.webPort).not.toBe(alice.webPort)
+        expect(bob.profileDir).not.toBe(alice.profileDir)
+    })
+
+    it('looks up and stops only the requested viewer lease', async () => {
+        leaseRegistryMocks.records.set(BOB_KEY, lease(BOB_KEY, 1))
+        const { ApiMachineClient } = await import('./apiMachine')
+        const client = new ApiMachineClient('token', machineClient())
+        client.setRPCHandlers(rpcHandlers())
+        const handlers = handlersFrom(client)
+
+        await expect(handlers.get('machine-1:browser-viewer:lookup')?.({ viewerKey: ALICE_KEY }))
+            .resolves.toMatchObject({ viewerKey: ALICE_KEY, webPort: 6080, ready: true })
+        await expect(handlers.get('machine-1:browser-viewer:stop')?.({ viewerKey: ALICE_KEY }))
+            .resolves.toEqual({ viewerKey: ALICE_KEY, stopped: true })
+        expect(leaseRegistryMocks.records.has(ALICE_KEY)).toBe(false)
+        expect(leaseRegistryMocks.records.has(BOB_KEY)).toBe(true)
+        await expect(handlers.get('machine-1:browser-viewer:lookup')?.({ viewerKey: ALICE_KEY }))
+            .resolves.toBeNull()
+    })
+
+    it('rejects viewer start without a server-derived viewer key', async () => {
+        const { ApiMachineClient } = await import('./apiMachine')
+        const client = new ApiMachineClient('token', machineClient())
+        client.setRPCHandlers(rpcHandlers())
+        const start = handlersFrom(client).get('machine-1:browser-viewer:start')!
+
+        await expect(start({})).rejects.toThrow('viewerKey is required')
     })
 })

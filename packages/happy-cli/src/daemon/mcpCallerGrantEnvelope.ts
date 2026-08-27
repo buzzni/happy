@@ -43,7 +43,10 @@ export function injectMcpCallerGrant(
 ): Record<string, string> {
     const sanitized = Object.fromEntries(
         Object.entries(environmentVariables)
-            .filter(([key]) => !key.startsWith('HAPPY_APLUS_')),
+            .filter(([key]) => (
+                !key.startsWith('HAPPY_APLUS_')
+                && !key.startsWith('HAPPY_BROWSER_VIEWER_')
+            )),
     );
     if (trustedConfigUrl) {
         try {

@@ -3,8 +3,12 @@ export const BROWSER_NATIVE_HOST_NAME = 'ai.saycode.happy_browser'
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1'])
 
 export async function attemptNativePairing(chromeApi) {
-    const stored = await chromeApi.storage.local.get(['token'])
-    if (hasToken(stored)) {
+    const stored = await chromeApi.storage.local.get(['token', 'viewerKey'])
+    const storedToken = stored.token
+    const storedViewerKey = stored.viewerKey
+    const viewerScoped = typeof stored.viewerKey === 'string'
+        && /^bv1_[A-Za-z0-9_-]{32}$/.test(stored.viewerKey)
+    if (hasToken(stored) && !viewerScoped) {
         return { status: 'already-configured' }
     }
 
@@ -21,7 +25,8 @@ export async function attemptNativePairing(chromeApi) {
     if (!isValidPairingResponse(response)) {
         return { status: 'invalid-response' }
     }
-    if (hasToken(await chromeApi.storage.local.get(['token']))) {
+    const current = await chromeApi.storage.local.get(['token', 'viewerKey'])
+    if (current.token !== storedToken || current.viewerKey !== storedViewerKey) {
         return { status: 'already-configured' }
     }
 
@@ -29,6 +34,7 @@ export async function attemptNativePairing(chromeApi) {
         token: response.config.token,
         port: response.config.port,
         host: response.config.host,
+        ...(response.config.viewerKey ? { viewerKey: response.config.viewerKey } : {}),
     })
     return { status: 'paired' }
 }
@@ -45,5 +51,12 @@ function isValidPairingResponse(response) {
         && Number.isInteger(config?.port)
         && config.port > 0
         && config.port <= 65535
-        && LOOPBACK_HOSTS.has(config?.host)
+        && (
+            LOOPBACK_HOSTS.has(config?.host)
+            || (
+                config?.host === 'host.docker.internal'
+                && typeof config?.viewerKey === 'string'
+                && /^bv1_[A-Za-z0-9_-]{32}$/.test(config.viewerKey)
+            )
+        )
 }

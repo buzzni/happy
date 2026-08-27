@@ -81,6 +81,16 @@ describe('createConnection', () => {
         )
     })
 
+    it('attaches the daemon-issued viewer boundary to the socket', async () => {
+        const connection = make(fakeChrome({
+            token: 'scoped', port: 41777, profile: 'work', viewerKey: 'bv1_alice',
+        }))
+        await connection.connect()
+        expect(FakeWebSocket.instances[0].url).toBe(
+            'ws://127.0.0.1:41777/?token=scoped&profile=work&viewerKey=bv1_alice',
+        )
+    })
+
     // The daemon is not always on this machine — a user pointing their own,
     // already-logged-in Chrome at a remote happy session needs the extension
     // to dial out somewhere other than its own loopback.
