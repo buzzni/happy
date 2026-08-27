@@ -110,24 +110,48 @@ async function runVerification() {
     const snap1 = await snapshotUntilReady(tab.id)
     check('found the name input', snap1.elements.some((e) => e.role === 'textbox' && e.name === 'Your name'), JSON.stringify(snap1.elements))
     check('found the submit button', snap1.elements.some((e) => e.role === 'button' && e.name === 'Submit'), JSON.stringify(snap1.elements))
-    check('hidden ancestor subtrees stay out of the snapshot', !snap1.elements.some((e) => e.name.endsWith('fixture action')), JSON.stringify(snap1.elements))
+    const hiddenFixtureNames = ['Hidden attribute fixture action', 'Aria hidden fixture action', 'Inert fixture action', 'Display none fixture action', 'Content visibility fixture action', 'Content-hidden nested action']
+    check('hidden ancestor subtrees stay out of the snapshot', !snap1.elements.some((e) => hiddenFixtureNames.includes(e.name)), JSON.stringify(snap1.elements))
+    check('content-visibility keeps the interactive element shell', snap1.elements.some((e) => e.role === 'button' && e.name === 'Visible content-hidden shell'), JSON.stringify(snap1.elements))
     check('closed details exposes its summary', snap1.elements.some((e) => e.role === 'button' && e.name === 'Collapsed details summary'), JSON.stringify(snap1.elements))
     check('closed details keeps collapsed controls out', !snap1.elements.some((e) => e.name === 'Collapsed details action'), JSON.stringify(snap1.elements))
     check('clipped controls stay out of the viewport tail', !snap1.elements.some((e) => e.role === 'button' && e.name.startsWith('Clipped fixture action')), JSON.stringify(snap1.elements))
     check('a visible control after clipped controls stays actionable', snap1.elements.some((e) => e.name === 'Visible after clipped controls'), JSON.stringify(snap1.elements))
     check('a fixed control escapes a non-containing overflow ancestor', snap1.elements.some((e) => e.name === 'Fixed escape action'), JSON.stringify(snap1.elements))
+    check('a fixed control is clipped by a will-change containing block', !snap1.elements.some((e) => e.role === 'button' && e.name === 'Contained fixed fixture action'), JSON.stringify(snap1.elements))
+    check('container-type does not clip a viewport-fixed control', snap1.elements.some((e) => e.name === 'Container query fixed action'), JSON.stringify(snap1.elements))
     const inputRef = snap1.elements.find((e) => e.name === 'Your name').ref
     const buttonRef = snap1.elements.find((e) => e.name === 'Submit').ref
     const editableRef = snap1.elements.find((e) => e.role === 'textbox' && e.tag === 'div')?.ref
+    const fixedNonScrollerRef = snap1.elements.find((e) => e.name === 'Fixed non-scroller action')?.ref
+    const containerQueryFixedRef = snap1.elements.find((e) => e.name === 'Container query fixed action')?.ref
 
-    console.log('3. fill the name input, then snapshot to confirm the value actually landed')
+    console.log('3. reject background document scrolling for a viewport-fixed ref')
+    check('snapshot exposes the viewport-fixed ref', !!fixedNonScrollerRef, JSON.stringify(snap1.elements))
+    let fixedScrollError = ''
+    try {
+        await call('scroll', { tabId: tab.id, ref: fixedNonScrollerRef, deltaY: 200 })
+    } catch (error) {
+        fixedScrollError = error.message
+    }
+    check('viewport-fixed ref has no false document scroll ancestor', /NOT_SCROLLABLE/.test(fixedScrollError), fixedScrollError)
+    check('snapshot exposes the container-query viewport-fixed ref', !!containerQueryFixedRef, JSON.stringify(snap1.elements))
+    let containerQueryScrollError = ''
+    try {
+        await call('scroll', { tabId: tab.id, ref: containerQueryFixedRef, deltaY: 200 })
+    } catch (error) {
+        containerQueryScrollError = error.message
+    }
+    check('container-type is not mistaken for a scrollable fixed containing block', /NOT_SCROLLABLE/.test(containerQueryScrollError), containerQueryScrollError)
+
+    console.log('4. fill the name input, then snapshot to confirm the value actually landed')
     const fillResult = await call('fill', { tabId: tab.id, ref: inputRef, value: 'Happy' })
     console.log(`   fill() immediate readback: ${JSON.stringify(fillResult)}`)
     const snapAfterFill = await call('snapshot', { tabId: tab.id })
     const nameValue = (snapAfterFill.elements.find((e) => e.name === 'Your name') || {}).value
     check('name input value is "Happy" after fill', nameValue === 'Happy', `got: ${JSON.stringify(snapAfterFill.elements.map((e) => [e.name, e.value]))}`)
 
-    console.log('4. click submit, then snapshot to confirm its click handler ran')
+    console.log('5. click submit, then snapshot to confirm its click handler ran')
     await call('click', { tabId: tab.id, ref: buttonRef })
     const snap2 = await call('snapshot', { tabId: tab.id })
     const resultValue = (snap2.elements.find((e) => e.name === 'Result') || {}).value

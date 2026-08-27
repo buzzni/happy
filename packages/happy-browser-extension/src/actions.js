@@ -141,11 +141,38 @@ export function scrollRef(ref, deltaX, deltaY) {
         const root = typeof element.getRootNode === 'function' ? element.getRootNode() : null
         return root && root.host ? root.host : null
     }
+    const establishesFixedContainingBlock = (element) => {
+        const style = element.ownerDocument.defaultView.getComputedStyle(element)
+        const nonNone = (value) => Boolean(value) && value !== 'none'
+        const contain = style.contain || ''
+        const willChange = (style.willChange || '').split(',').map((value) => value.trim())
+        return nonNone(style.transform)
+            || nonNone(style.translate)
+            || nonNone(style.rotate)
+            || nonNone(style.scale)
+            || nonNone(style.perspective)
+            || nonNone(style.filter)
+            || nonNone(style.backdropFilter)
+            || nonNone(style.webkitBackdropFilter)
+            || /(?:^|\s)(?:layout|paint|strict|content)(?:\s|$)/.test(contain)
+            || style.contentVisibility === 'auto'
+            || willChange.some((value) => ['transform', 'translate', 'rotate', 'scale', 'perspective', 'filter', 'backdrop-filter'].includes(value))
+    }
+    const fixedContainingBlock = (element) => {
+        for (let parent = parentAcrossShadow(element); parent; parent = parentAcrossShadow(parent)) {
+            if (establishesFixedContainingBlock(parent)) return parent
+        }
+        return null
+    }
 
     let target = source || documentScroller
     if (source) {
-        while (target && !supportsRequestedAxes(target)) target = parentAcrossShadow(target)
-        if (!target && supportsRequestedAxes(documentScroller)) target = documentScroller
+        while (target && !supportsRequestedAxes(target)) {
+            const style = target.ownerDocument.defaultView.getComputedStyle(target)
+            target = style.position === 'fixed'
+                ? fixedContainingBlock(target)
+                : parentAcrossShadow(target)
+        }
         if (!target) {
             return { ok: false, code: 'NOT_SCROLLABLE', message: `No scrollable container for ${ref} in the requested direction` }
         }

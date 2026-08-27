@@ -123,15 +123,36 @@ function renderTabs(result: any, status: BridgeStatus | null): string {
     return header ? `${header}\n${listing}` : listing
 }
 
+function describeFrameUrl(value: unknown): string {
+    if (typeof value !== 'string' || value.length === 0) return ''
+
+    let label = value
+    try {
+        const url = new URL(value)
+        label = url.protocol === 'http:' || url.protocol === 'https:'
+            ? `${url.origin}${url.pathname}`
+            : url.protocol
+    } catch {
+        // Keep malformed bridge data useful without letting it dominate the snapshot.
+    }
+    return label.length > 240 ? `${label.slice(0, 239)}…` : label
+}
+
 function renderSnapshot(result: any): string {
     const header = `${result?.title ?? ''} — ${result?.url ?? ''}`.trim()
+    const describedFrames = new Set<string>()
     const elements = (result?.elements ?? []).map((element: any) => {
         const value = element.value ? ` value=${JSON.stringify(element.value)}` : ''
+        const frameUrl = describeFrameUrl(element.frameUrl)
+        const frameRef = typeof element.ref === 'string' ? /^(@f\d+):/.exec(element.ref)?.[1] : undefined
+        const showFrame = frameUrl && (!frameRef || !describedFrames.has(frameRef))
+        if (frameRef) describedFrames.add(frameRef)
+        const frame = showFrame ? ` [frame=${JSON.stringify(frameUrl)}]` : ''
         const disabled = element.disabled ? ' [disabled]' : ''
         const scrollable = element.scrollable
             ? ` [scrollable${element.scrollable.x ? ` x=${element.scrollable.left}/${element.scrollable.maxLeft}` : ''}${element.scrollable.y ? ` y=${element.scrollable.top}/${element.scrollable.maxTop}` : ''}]`
             : ''
-        return `${element.ref} ${element.role} ${JSON.stringify(element.name ?? '')}${value}${disabled}${scrollable}`
+        return `${element.ref} ${element.role} ${JSON.stringify(element.name ?? '')}${frame}${value}${disabled}${scrollable}`
     })
     const body = elements.length > 0 ? elements.join('\n') : 'No interactive elements found.'
     const note = result?.truncated

@@ -89,6 +89,25 @@ describe('collectSnapshot', () => {
         expect(collectSnapshot().elements.map((e) => e.name)).toEqual(['Shown'])
     })
 
+    it('skips interactive descendants of content-visibility:hidden ancestors', () => {
+        render(`
+            <div style="content-visibility:hidden"><button>Skipped content</button></div>
+            <button>Shown</button>
+        `)
+
+        expect(collectSnapshot().elements.map((e) => e.name)).toEqual(['Shown'])
+    })
+
+    it('keeps an interactive content-visibility:hidden element while skipping its contents', () => {
+        render(`
+            <button style="content-visibility:hidden" aria-label="Visible button shell">
+                <span role="button">Skipped child action</span>
+            </button>
+        `)
+
+        expect(collectSnapshot().elements.map((e) => e.name)).toEqual(['Visible button shell'])
+    })
+
     it('picks up elements made interactive by role or contenteditable', () => {
         render(`
             <div role="button">역할 버튼</div>
@@ -217,6 +236,48 @@ describe('collectSnapshot', () => {
         expect(collectSnapshot().elements.some((element) => element.name === 'Fixed action')).toBe(true)
     })
 
+    it('keeps a control inside a viewport-fixed wrapper visible outside a clipping ancestor', () => {
+        render(`
+            ${Array.from({ length: 200 }, (_, i) => `<button>earlier-${i}</button>`).join('')}
+            <div id="clipping-parent" style="overflow-x:hidden;overflow-y:hidden">
+                <div id="fixed-wrapper" style="position:fixed">
+                    <button id="fixed-child">Fixed child action</button>
+                </div>
+            </div>
+        `)
+        document.getElementById('clipping-parent').getBoundingClientRect = () => ({ top: 0, left: 0, bottom: 1, right: 1, width: 1, height: 1 })
+        document.getElementById('fixed-wrapper').getBoundingClientRect = () => ({ top: 300, left: 20, bottom: 340, right: 180, width: 160, height: 40 })
+        document.getElementById('fixed-child').getBoundingClientRect = () => ({ top: 300, left: 20, bottom: 340, right: 180, width: 160, height: 40 })
+
+        expect(collectSnapshot().elements.some((element) => element.name === 'Fixed child action')).toBe(true)
+    })
+
+    it('clips a fixed control inside a will-change containing block', () => {
+        render(`
+            ${Array.from({ length: 200 }, (_, i) => `<button>earlier-${i}</button>`).join('')}
+            <div id="clipping-parent" style="will-change:translate;overflow-x:hidden;overflow-y:hidden">
+                <button id="fixed-action" style="position:fixed">Contained fixed action</button>
+            </div>
+        `)
+        document.getElementById('clipping-parent').getBoundingClientRect = () => ({ top: 0, left: 0, bottom: 1, right: 1, width: 1, height: 1 })
+        document.getElementById('fixed-action').getBoundingClientRect = () => ({ top: 300, left: 20, bottom: 340, right: 180, width: 160, height: 40 })
+
+        expect(collectSnapshot().elements.find((element) => element.name === 'Contained fixed action')).toBeUndefined()
+    })
+
+    it('does not clip a viewport-fixed control under a container-type ancestor', () => {
+        render(`
+            ${Array.from({ length: 200 }, (_, i) => `<button>earlier-${i}</button>`).join('')}
+            <div id="clipping-parent" style="container-type:size;overflow-x:hidden;overflow-y:hidden">
+                <button id="fixed-action" style="position:fixed">Container query fixed action</button>
+            </div>
+        `)
+        document.getElementById('clipping-parent').getBoundingClientRect = () => ({ top: 0, left: 0, bottom: 1, right: 1, width: 1, height: 1 })
+        document.getElementById('fixed-action').getBoundingClientRect = () => ({ top: 300, left: 20, bottom: 340, right: 180, width: 160, height: 40 })
+
+        expect(collectSnapshot().elements.some((element) => element.name === 'Container query fixed action')).toBe(true)
+    })
+
     it('does not treat a slotted control clipped by its shadow container as viewport-visible', () => {
         render(`
             ${Array.from({ length: 200 }, (_, i) => `<button>earlier-${i}</button>`).join('')}
@@ -235,14 +296,24 @@ describe('collectSnapshot', () => {
         expect(collectSnapshot().truncated).toBe(false)
     })
 
-    it('does not measure viewport geometry for ordinary non-interactive elements', () => {
+    it('does not measure layout geometry for ordinary non-interactive elements', () => {
         render(Array.from({ length: 500 }, () => '<div>plain content</div>').join(''))
         let measurements = 0
+        const measure = () => {
+            measurements += 1
+            return 10
+        }
         for (const element of document.querySelectorAll('*')) {
             element.getBoundingClientRect = () => {
                 measurements += 1
                 return { top: 0, left: 0, bottom: 10, right: 10, width: 10, height: 10 }
             }
+            Object.defineProperties(element, {
+                scrollWidth: { configurable: true, get: measure },
+                clientWidth: { configurable: true, get: measure },
+                scrollHeight: { configurable: true, get: measure },
+                clientHeight: { configurable: true, get: measure },
+            })
         }
 
         collectSnapshot()

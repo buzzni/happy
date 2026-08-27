@@ -52,6 +52,7 @@ export function collectSnapshot() {
     const isInHiddenTree = (element) => {
         if (hiddenTrees.has(element)) return hiddenTrees.get(element)
         const parent = parentAcrossShadow(element)
+        const style = styleOf(element)
         const firstSummary = parent?.tagName === 'DETAILS'
             ? Array.from(parent.children).find((child) => child.tagName === 'SUMMARY')
             : null
@@ -61,8 +62,9 @@ export function collectSnapshot() {
         const hidden = element.hasAttribute('hidden')
             || element.hasAttribute('inert')
             || element.getAttribute('aria-hidden') === 'true'
-            || styleOf(element).display === 'none'
+            || style.display === 'none'
             || collapsedByDetails
+            || (parent && styleOf(parent).contentVisibility === 'hidden')
             || (parent ? isInHiddenTree(parent) : false)
         hiddenTrees.set(element, hidden)
         return hidden
@@ -141,10 +143,14 @@ export function collectSnapshot() {
         const overflowX = style.overflowX || style.overflow
         const overflowY = style.overflowY || style.overflow
         const permitsScroll = (overflow) => overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay' || overflow === 'hidden'
-        const maxLeft = Math.max(0, element.scrollWidth - element.clientWidth)
-        const maxTop = Math.max(0, element.scrollHeight - element.clientHeight)
-        const x = maxLeft > 0 && permitsScroll(overflowX)
-        const y = maxTop > 0 && permitsScroll(overflowY)
+        const permitsX = permitsScroll(overflowX)
+        const permitsY = permitsScroll(overflowY)
+        if (!permitsX && !permitsY) return null
+        const maxLeft = permitsX ? Math.max(0, element.scrollWidth - element.clientWidth) : 0
+        const maxTop = permitsY ? Math.max(0, element.scrollHeight - element.clientHeight) : 0
+        const x = maxLeft > 0
+        const y = maxTop > 0
+        if (!x && !y) return null
         return {
             x,
             y,
@@ -181,30 +187,33 @@ export function collectSnapshot() {
                 || nonNone(style.backdropFilter)
                 || nonNone(style.webkitBackdropFilter)
                 || /(?:^|\s)(?:layout|paint|strict|content)(?:\s|$)/.test(contain)
-                || (style.containerType && style.containerType !== 'normal')
                 || style.contentVisibility === 'auto'
-                || willChange.some((value) => value === 'transform' || value === 'perspective' || value === 'filter')
+                || willChange.some((value) => ['transform', 'translate', 'rotate', 'scale', 'perspective', 'filter', 'backdrop-filter'].includes(value))
         }
 
-        let clippingParent = parentAcrossShadow(element)
-        if (styleOf(element).position === 'fixed') {
-            while (clippingParent && !establishesFixedContainingBlock(styleOf(clippingParent))) {
-                clippingParent = parentAcrossShadow(clippingParent)
-            }
-        }
-
-        for (let parent = clippingParent; parent; parent = parentAcrossShadow(parent)) {
+        let escapesAncestors = styleOf(element).position === 'fixed'
+        for (let parent = parentAcrossShadow(element); parent;) {
             const style = styleOf(parent)
-            if (!clips(style.overflowX || style.overflow) && !clips(style.overflowY || style.overflow)) continue
-            const parentBox = parent.getBoundingClientRect()
-            if (clips(style.overflowX || style.overflow)) {
-                left = Math.max(left, parentBox.left)
-                right = Math.min(right, parentBox.right)
+            if (escapesAncestors && !establishesFixedContainingBlock(style)) {
+                parent = parentAcrossShadow(parent)
+                continue
             }
-            if (clips(style.overflowY || style.overflow)) {
-                top = Math.max(top, parentBox.top)
-                bottom = Math.min(bottom, parentBox.bottom)
+            escapesAncestors = false
+            const clipsX = clips(style.overflowX || style.overflow)
+            const clipsY = clips(style.overflowY || style.overflow)
+            if (clipsX || clipsY) {
+                const parentBox = parent.getBoundingClientRect()
+                if (clipsX) {
+                    left = Math.max(left, parentBox.left)
+                    right = Math.min(right, parentBox.right)
+                }
+                if (clipsY) {
+                    top = Math.max(top, parentBox.top)
+                    bottom = Math.min(bottom, parentBox.bottom)
+                }
             }
+            if (style.position === 'fixed') escapesAncestors = true
+            parent = parentAcrossShadow(parent)
         }
 
         return right > left && bottom > top
@@ -236,7 +245,7 @@ export function collectSnapshot() {
             }
             if (visible && scrollableCandidates.length < MAX_SCROLLABLES) {
                 const metrics = scrollableMetrics(element)
-                if ((metrics.x || metrics.y) && getInViewport()) scrollableCandidates.push({ element, metrics })
+                if (metrics && getInViewport()) scrollableCandidates.push({ element, metrics })
             }
             if (element.shadowRoot) walk(element.shadowRoot)
         }
