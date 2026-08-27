@@ -16,6 +16,14 @@ function markScrollable(element, { scrollTop = 0, scrollLeft = 0, scrollHeight =
         scrollWidth: { configurable: true, value: scrollWidth },
         clientHeight: { configurable: true, value: clientHeight },
         clientWidth: { configurable: true, value: clientWidth },
+        scrollTo: {
+            configurable: true,
+            value: ({ left, top, behavior }) => {
+                element.scrollLeft = left
+                element.scrollTop = top
+                element.dataset.scrollBehavior = behavior
+            },
+        },
     })
 }
 
@@ -153,6 +161,30 @@ describe('scrollRef', () => {
 
         expect(rail.scrollLeft).toBe(300)
         expect(result).toMatchObject({ ok: true, moved: true, after: { x: 300, y: 0 } })
+    })
+
+    it('forces instant movement when the page requests smooth scrolling', () => {
+        render('<div id="results" style="overflow-y:auto;scroll-behavior:smooth"><button>First item</button></div>')
+        const results = document.getElementById('results')
+        markScrollable(results)
+        collectSnapshot()
+
+        const result = scrollRef('@e1', 0, 250)
+
+        expect(results.dataset.scrollBehavior).toBe('instant')
+        expect(result).toMatchObject({ ok: true, moved: true, after: { y: 250 } })
+    })
+
+    it('scrolls a script-scrollable overflow-hidden ancestor', () => {
+        render('<div id="results" style="overflow-y:hidden"><button>First item</button></div>')
+        const results = document.getElementById('results')
+        markScrollable(results)
+        collectSnapshot()
+
+        const result = scrollRef('@e1', 0, 250)
+
+        expect(results.scrollTop).toBe(250)
+        expect(result).toMatchObject({ ok: true, moved: true, after: { y: 250 } })
     })
 
     it('supports Chrome RTL horizontal coordinates and reports the left boundary', () => {

@@ -156,6 +156,27 @@ describe('collectSnapshot', () => {
         expect(window.__happyRefs.get('@e202')).toBe(results)
     })
 
+    it('does not let clipped controls displace visible controls after the first 200 elements', () => {
+        render(`
+            ${Array.from({ length: 200 }, (_, i) => `<button>earlier-${i}</button>`).join('')}
+            <div id="clipping-parent" style="overflow-y:hidden">
+                ${Array.from({ length: 20 }, (_, i) => `<button class="clipped">clipped-${i}</button>`).join('')}
+            </div>
+            <button id="visible-action">Visible action</button>
+        `)
+        const clippingParent = document.getElementById('clipping-parent')
+        clippingParent.getBoundingClientRect = () => ({ top: 0, left: 0, bottom: 100, right: 300, width: 300, height: 100 })
+        for (const clipped of document.querySelectorAll('.clipped')) {
+            clipped.getBoundingClientRect = () => ({ top: 200, left: 10, bottom: 240, right: 160, width: 150, height: 40 })
+        }
+        document.getElementById('visible-action').getBoundingClientRect = () => ({ top: 300, left: 10, bottom: 340, right: 160, width: 150, height: 40 })
+
+        const snapshot = collectSnapshot()
+
+        expect(snapshot.elements.some((element) => element.name === 'Visible action')).toBe(true)
+        expect(snapshot.elements.some((element) => element.name.startsWith('clipped-'))).toBe(false)
+    })
+
     it('does not flag truncation for a normal page', () => {
         render('<button>Save</button>')
         expect(collectSnapshot().truncated).toBe(false)
@@ -183,6 +204,24 @@ describe('collectSnapshot', () => {
             scrollable: { x: false, y: true, left: 0, top: 120, maxLeft: 0, maxTop: 800 },
         })
         expect(window.__happyRefs.get('@e3')).toBe(document.getElementById('results'))
+    })
+
+    it('exposes an overflow-hidden region that can be scrolled by script', () => {
+        render('<div id="carousel" aria-label="Carousel" style="overflow-x:hidden"></div>')
+        const carousel = document.getElementById('carousel')
+        Object.defineProperties(carousel, {
+            scrollTop: { configurable: true, writable: true, value: 0 },
+            scrollLeft: { configurable: true, writable: true, value: 0 },
+            scrollHeight: { configurable: true, value: 100 },
+            scrollWidth: { configurable: true, value: 900 },
+            clientHeight: { configurable: true, value: 100 },
+            clientWidth: { configurable: true, value: 300 },
+        })
+        carousel.getBoundingClientRect = () => ({ top: 10, left: 10, bottom: 110, right: 310, width: 300, height: 100 })
+
+        expect(collectSnapshot().elements).toMatchObject([
+            { role: 'scrollable', name: 'Carousel', scrollable: { x: true, y: false } },
+        ])
     })
 
     describe('shadow DOM', () => {

@@ -130,7 +130,7 @@ export function collectSnapshot() {
         const style = styleOf(element)
         const overflowX = style.overflowX || style.overflow
         const overflowY = style.overflowY || style.overflow
-        const permitsScroll = (overflow) => overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay'
+        const permitsScroll = (overflow) => overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay' || overflow === 'hidden'
         const maxLeft = Math.max(0, element.scrollWidth - element.clientWidth)
         const maxTop = Math.max(0, element.scrollHeight - element.clientHeight)
         const x = maxLeft > 0 && permitsScroll(overflowX)
@@ -147,12 +147,32 @@ export function collectSnapshot() {
 
     const isInViewport = (element) => {
         const box = element.getBoundingClientRect()
-        return box.width > 0
-            && box.height > 0
-            && box.bottom > 0
-            && box.right > 0
-            && box.top < element.ownerDocument.defaultView.innerHeight
-            && box.left < element.ownerDocument.defaultView.innerWidth
+        const view = element.ownerDocument.defaultView
+        let top = Math.max(0, box.top)
+        let right = Math.min(view.innerWidth, box.right)
+        let bottom = Math.min(view.innerHeight, box.bottom)
+        let left = Math.max(0, box.left)
+        const clips = (overflow) => overflow === 'auto'
+            || overflow === 'scroll'
+            || overflow === 'overlay'
+            || overflow === 'hidden'
+            || overflow === 'clip'
+
+        for (let parent = parentAcrossShadow(element); parent; parent = parentAcrossShadow(parent)) {
+            const style = styleOf(parent)
+            if (!clips(style.overflowX || style.overflow) && !clips(style.overflowY || style.overflow)) continue
+            const parentBox = parent.getBoundingClientRect()
+            if (clips(style.overflowX || style.overflow)) {
+                left = Math.max(left, parentBox.left)
+                right = Math.min(right, parentBox.right)
+            }
+            if (clips(style.overflowY || style.overflow)) {
+                top = Math.max(top, parentBox.top)
+                bottom = Math.min(bottom, parentBox.bottom)
+            }
+        }
+
+        return right > left && bottom > top
     }
 
     // Walks every element under `root`, stepping into open shadow roots as it

@@ -111,6 +111,8 @@ async function runVerification() {
     check('found the name input', snap1.elements.some((e) => e.role === 'textbox' && e.name === 'Your name'), JSON.stringify(snap1.elements))
     check('found the submit button', snap1.elements.some((e) => e.role === 'button' && e.name === 'Submit'), JSON.stringify(snap1.elements))
     check('hidden ancestor subtrees stay out of the snapshot', !snap1.elements.some((e) => e.name.endsWith('fixture action')), JSON.stringify(snap1.elements))
+    check('clipped controls stay out of the viewport tail', !snap1.elements.some((e) => e.role === 'button' && e.name.startsWith('Clipped fixture action')), JSON.stringify(snap1.elements))
+    check('a visible control after clipped controls stays actionable', snap1.elements.some((e) => e.name === 'Visible after clipped controls'), JSON.stringify(snap1.elements))
     const inputRef = snap1.elements.find((e) => e.name === 'Your name').ref
     const buttonRef = snap1.elements.find((e) => e.name === 'Submit').ref
     const editableRef = snap1.elements.find((e) => e.role === 'textbox' && e.tag === 'div')?.ref
@@ -147,7 +149,14 @@ async function runVerification() {
     await snapshotUntilNamed(tab.id, 'Nested lazy item')
     console.log('  ok  nested lazy item appeared after scroll + re-snapshot')
 
-    console.log('8. scroll the document to a lazy-loading item')
+    console.log('8. scroll an overflow-hidden region with forced instant behavior')
+    const hiddenOverflowBefore = await call('snapshot', { tabId: tab.id })
+    const hiddenOverflowRegion = hiddenOverflowBefore.elements.find((element) => element.role === 'scrollable' && element.name === 'Hidden overflow results')
+    check('snapshot exposes the overflow-hidden region', !!hiddenOverflowRegion, JSON.stringify(hiddenOverflowBefore.elements))
+    const hiddenOverflowScroll = await call('scroll', { tabId: tab.id, ref: hiddenOverflowRegion.ref, deltaY: 400 })
+    check('overflow-hidden region moves immediately despite smooth CSS', hiddenOverflowScroll.moved && hiddenOverflowScroll.after.y > hiddenOverflowScroll.before.y, JSON.stringify(hiddenOverflowScroll))
+
+    console.log('9. scroll the document to a lazy-loading item')
     const documentBefore = await call('snapshot', { tabId: tab.id })
     check('long page snapshot is truncated', documentBefore.truncated === true, JSON.stringify(documentBefore))
     check('document lazy item starts absent', !documentBefore.elements.some((element) => element.name === 'Document lazy item'), JSON.stringify(documentBefore.elements))
@@ -157,11 +166,11 @@ async function runVerification() {
     const documentLazyRef = documentAfter.elements.find((element) => element.name === 'Document lazy item').ref
     check('document lazy item is actionable beyond the first 200 refs', Number(documentLazyRef.slice(2)) > 200, documentLazyRef)
 
-    console.log('9. screenshot')
+    console.log('10. screenshot')
     const shot = await call('screenshot', { tabId: tab.id })
     check('screenshot has png data', shot.mimeType === 'image/png' && shot.dataB64.length > 100, `len=${shot.dataB64?.length}`)
 
-    console.log('10. REF_NOT_FOUND on an unknown ref')
+    console.log('11. REF_NOT_FOUND on an unknown ref')
     let staleRejected = false
     let staleOutcome
     try {
@@ -173,6 +182,6 @@ async function runVerification() {
     }
     check('unknown ref is rejected with guidance', staleRejected, `expected a REF_NOT_FOUND-style error, got: ${JSON.stringify(staleOutcome)}`)
 
-    console.log('11. tabs_close')
+    console.log('12. tabs_close')
     await call('tabs_close', { tabId: tab.id })
 }

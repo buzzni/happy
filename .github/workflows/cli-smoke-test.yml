@@ -5,12 +5,14 @@ on:
     branches: [ main ]
     paths:
       - 'packages/happy-cli/**'
+      - 'packages/happy-browser-extension/**'
       - 'packages/happy-server/**'
       - '.github/workflows/cli-smoke-test.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'packages/happy-cli/**'
+      - 'packages/happy-browser-extension/**'
       - 'packages/happy-server/**'
       - '.github/workflows/cli-smoke-test.yml'
   workflow_dispatch:
