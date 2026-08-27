@@ -170,10 +170,10 @@ export function scrollRef(ref, deltaX, deltaY) {
         after,
         max,
         atBoundary: {
-            top: after.y <= 0,
-            bottom: after.y >= max.y,
-            left: after.x <= minLeft,
-            right: after.x >= maxLeft,
+            top: y !== 0 && after.y <= 0,
+            bottom: y !== 0 && after.y >= max.y,
+            left: x !== 0 && after.x <= minLeft,
+            right: x !== 0 && after.x >= maxLeft,
         },
     }
 }

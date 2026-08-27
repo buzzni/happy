@@ -127,7 +127,7 @@ describe('scrollRef', () => {
             before: { x: 0, y: 0 },
             after: { x: 0, y: 600 },
             max: { x: 0, y: 1000 },
-            atBoundary: { top: false, bottom: false, left: true, right: true },
+            atBoundary: { top: false, bottom: false, left: false, right: false },
         })
     })
 
@@ -190,7 +190,7 @@ describe('scrollRef', () => {
             ok: true,
             moved: false,
             after: { y: 800 },
-            atBoundary: { bottom: true },
+            atBoundary: { top: false, bottom: true, left: false, right: false },
         })
     })
 
