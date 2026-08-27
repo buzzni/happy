@@ -140,10 +140,14 @@ function describeFrameUrl(value: unknown): string {
 
 function renderSnapshot(result: any): string {
     const header = `${result?.title ?? ''} — ${result?.url ?? ''}`.trim()
+    const describedFrames = new Set<string>()
     const elements = (result?.elements ?? []).map((element: any) => {
         const value = element.value ? ` value=${JSON.stringify(element.value)}` : ''
         const frameUrl = describeFrameUrl(element.frameUrl)
-        const frame = frameUrl ? ` [frame=${JSON.stringify(frameUrl)}]` : ''
+        const frameRef = typeof element.ref === 'string' ? /^(@f\d+):/.exec(element.ref)?.[1] : undefined
+        const showFrame = frameUrl && (!frameRef || !describedFrames.has(frameRef))
+        if (frameRef) describedFrames.add(frameRef)
+        const frame = showFrame ? ` [frame=${JSON.stringify(frameUrl)}]` : ''
         const disabled = element.disabled ? ' [disabled]' : ''
         const scrollable = element.scrollable
             ? ` [scrollable${element.scrollable.x ? ` x=${element.scrollable.left}/${element.scrollable.maxLeft}` : ''}${element.scrollable.y ? ` y=${element.scrollable.top}/${element.scrollable.maxTop}` : ''}]`

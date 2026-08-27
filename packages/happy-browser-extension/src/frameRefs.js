@@ -17,6 +17,21 @@
 const MAIN_FRAME_ID = 0
 const FRAME_REF_PATTERN = /^@f(\d+):(e.+)$/
 
+function describeFrameUrl(value) {
+    if (typeof value !== 'string' || value.length === 0) return ''
+
+    let label = value
+    try {
+        const url = new URL(value)
+        label = url.protocol === 'http:' || url.protocol === 'https:'
+            ? `${url.origin}${url.pathname}`
+            : url.protocol
+    } catch {
+        // Keep malformed frame data useful without letting it dominate the payload.
+    }
+    return label.length > 240 ? `${label.slice(0, 239)}…` : label
+}
+
 export function encodeRef(frameId, innerRef) {
     if (frameId === MAIN_FRAME_ID) return innerRef
     return `@f${frameId}:${innerRef.slice(1)}`
@@ -56,11 +71,12 @@ export function mergeFrameSnapshots(injectionResults) {
 
     for (const frame of frames) {
         if (frame.result.truncated) truncated = true
-        for (const element of frame.result.elements ?? []) {
+        const frameUrl = frame.frameId === MAIN_FRAME_ID ? '' : describeFrameUrl(frame.result.url)
+        for (const [index, element] of (frame.result.elements ?? []).entries()) {
             const entry = { ...element, ref: encodeRef(frame.frameId, element.ref) }
-            // Only annotate child frames — saying "frameUrl" on every main
-            // frame element would be noise on the overwhelmingly common page.
-            if (frame.frameId !== MAIN_FRAME_ID) entry.frameUrl = frame.result.url
+            // One label per child frame is enough to identify its qualified
+            // refs; repeating a long URL on every element bloats the payload.
+            if (frameUrl && index === 0) entry.frameUrl = frameUrl
             elements.push(entry)
         }
     }

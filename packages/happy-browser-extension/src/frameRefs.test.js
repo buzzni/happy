@@ -62,6 +62,37 @@ describe('mergeFrameSnapshots', () => {
         expect(merged.elements[1].frameUrl).toBe('https://embed.example/')
     })
 
+    it('carries one safe child frame label instead of duplicating full urls on every element', () => {
+        const childWithManyElements = {
+            ...childFrame,
+            result: {
+                ...childFrame.result,
+                url: 'https://embed.example/?session=secret#fragment',
+                elements: [
+                    { ref: '@e1', name: 'First frame control' },
+                    { ref: '@e2', name: 'Second frame control' },
+                ],
+            },
+        }
+        const dataFrame = {
+            frameId: 8,
+            result: {
+                url: 'data:text/html,<button>unbounded embedded document</button>',
+                title: 'Data frame',
+                elements: [{ ref: '@e1', name: 'Data frame control' }],
+                truncated: false,
+            },
+        }
+
+        const merged = mergeFrameSnapshots([mainFrame, childWithManyElements, dataFrame])
+
+        expect(merged.elements.filter((element) => element.frameUrl).map((element) => element.frameUrl)).toEqual([
+            'https://embed.example/',
+            'data:',
+        ])
+        expect(merged.elements.map((element) => element.ref)).toEqual(['@e1', '@f7:e1', '@f7:e2', '@f8:e1'])
+    })
+
     it('reports truncation if any frame truncated', () => {
         const truncatedChild = { ...childFrame, result: { ...childFrame.result, truncated: true } }
         expect(mergeFrameSnapshots([mainFrame, truncatedChild]).truncated).toBe(true)

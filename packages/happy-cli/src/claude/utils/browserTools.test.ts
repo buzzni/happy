@@ -188,6 +188,12 @@ describe('runBrowserTool', () => {
                         frameUrl: 'https://checkout.example/embedded?session=secret#payment',
                     },
                     {
+                        ref: '@f7:e2',
+                        role: 'textbox',
+                        name: 'Card number',
+                        frameUrl: 'https://checkout.example/embedded?session=secret#payment',
+                    },
+                    {
                         ref: '@f8:e1',
                         role: 'button',
                         name: 'Continue',
@@ -203,7 +209,9 @@ describe('runBrowserTool', () => {
         const text = textOf(result)
         expect(text).toContain('@e1 button "Continue"')
         expect(text).toContain('@f7:e1 button "Continue" [frame="https://checkout.example/embedded"]')
+        expect(text).toContain('@f7:e2 textbox "Card number"')
         expect(text).toContain('@f8:e1 button "Continue" [frame="data:"]')
+        expect(text.match(/https:\/\/checkout\.example\/embedded/g)).toHaveLength(1)
         expect(text).not.toContain('secret')
         expect(text).not.toContain('unbounded embedded document')
     })
