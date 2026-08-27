@@ -53,6 +53,102 @@ export function resolveTrackedPidOwner(tracked: { happySessionId?: string } | un
   return tracked.happySessionId ?? PENDING_SPAWN_OWNER;
 }
 
+export type RecoveredPendingPromotionResult =
+  | { promoted: true; session: TrackedSession }
+  | {
+    promoted: false;
+    reason:
+      | 'not-recovered-pending'
+      | 'pid-mismatch'
+      | 'pid-dead'
+      | 'process-start-unknown'
+      | 'pid-reused'
+      | 'not-pending'
+      | 'not-daemon-spawn';
+  };
+
+/**
+ * Upgrade a daemon-spawned placeholder recovered from the previous daemon.
+ *
+ * A fresh spawn in this process must keep waiting for its session-started
+ * webhook: promoting it from a racing runtime report would bypass the webhook
+ * awaiter and recreate the 2026-08-15 timeout. A recovered placeholder has no
+ * awaiter in this process, so the live process's self-reported PID is the only
+ * remaining authoritative bridge to its real Happy session id.
+ */
+export function resolveRecoveredPendingPromotion(input: {
+  sessionId: string;
+  hostPid: number;
+  tracked: TrackedSession | undefined;
+  resumable?: TrackedSession;
+  recoveredPendingStartedAt?: number;
+  isPidAlive: (pid: number) => boolean;
+  getProcessStartedAt: (pid: number) => number | undefined;
+}): RecoveredPendingPromotionResult {
+  if (input.recoveredPendingStartedAt === undefined) {
+    return { promoted: false, reason: 'not-recovered-pending' };
+  }
+  if (!input.tracked || input.tracked.pid !== input.hostPid) {
+    return { promoted: false, reason: 'pid-mismatch' };
+  }
+  const processIdentity = classifyRecoveredTrackedProcess({
+    pid: input.hostPid,
+    recordedStartedAt: input.recoveredPendingStartedAt,
+    isPidAlive: input.isPidAlive,
+    getProcessStartedAt: input.getProcessStartedAt,
+  });
+  if (processIdentity === 'dead') return { promoted: false, reason: 'pid-dead' };
+  if (processIdentity === 'unverified') return { promoted: false, reason: 'process-start-unknown' };
+  if (processIdentity === 'reused') return { promoted: false, reason: 'pid-reused' };
+  if (input.tracked.happySessionId !== undefined) {
+    return { promoted: false, reason: 'not-pending' };
+  }
+  if (input.tracked.startedBy !== 'daemon') {
+    return { promoted: false, reason: 'not-daemon-spawn' };
+  }
+  return {
+    promoted: true,
+    session: {
+      ...input.resumable,
+      ...input.tracked,
+      happySessionId: input.sessionId,
+    },
+  };
+}
+
+export type RecoveredPendingWebhookDecision =
+  | { action: 'promote'; session: TrackedSession }
+  | { action: 'release-and-register-external' }
+  | { action: 'ignore'; reason: Exclude<RecoveredPendingPromotionResult, { promoted: true }>['reason'] };
+
+/**
+ * Apply recovered-pending PID validation before the session-started webhook
+ * consumes that marker. Webhooks normally arrive before runtime reports, so
+ * validating only the runtime path leaves the PID reuse guard bypassable.
+ */
+export function decideRecoveredPendingWebhook(
+  input: Parameters<typeof resolveRecoveredPendingPromotion>[0],
+): RecoveredPendingWebhookDecision {
+  const promotion = resolveRecoveredPendingPromotion(input);
+  if (promotion.promoted) return { action: 'promote', session: promotion.session };
+  if (promotion.reason === 'pid-reused') return { action: 'release-and-register-external' };
+  return { action: 'ignore', reason: promotion.reason };
+}
+
+export type RecoveredTrackedProcessIdentity = 'dead' | 'unverified' | 'reused' | 'verified';
+
+export function classifyRecoveredTrackedProcess(input: {
+  pid: number;
+  recordedStartedAt: number;
+  isPidAlive: (pid: number) => boolean;
+  getProcessStartedAt: (pid: number) => number | undefined;
+}): RecoveredTrackedProcessIdentity {
+  if (!input.isPidAlive(input.pid)) return 'dead';
+  const processStartedAt = input.getProcessStartedAt(input.pid);
+  if (processStartedAt === undefined) return 'unverified';
+  return processStartedAt > input.recordedStartedAt ? 'reused' : 'verified';
+}
+
 /**
  * Decide whether a runtime report from an untracked session should be adopted.
  */

@@ -4,6 +4,7 @@ import type { Metadata } from '@/api/types';
 import {
   hydrateRecoveredSessionFromPersisted,
   hydrateTrackedSessionFromPersisted,
+  mergeTrackedSessionWebhook,
 } from './persistedSessionHydration';
 import type { PersistedSession } from '@/persistence';
 
@@ -117,6 +118,25 @@ describe('hydrateRecoveredSessionFromPersisted', () => {
         SAYCODE_AGENT_ENV: '1',
         SAYCODE_AGENT_ROOT: 'root-session',
       },
+    });
+  });
+});
+
+describe('mergeTrackedSessionWebhook', () => {
+  it('shouldPreserveRecoveredEncryptionWhenAnOlderWebhookOmitsIt', () => {
+    const encryption = hydrateTrackedSessionFromPersisted(persisted()).encryption;
+    const merged = mergeTrackedSessionWebhook({
+      tracked: { startedBy: 'daemon', pid: 4242, encryption },
+      sessionId: 'sess-recovered',
+      metadata,
+      persistedLastProcessedSeq: 41,
+    });
+
+    expect(merged.encryption).toBe(encryption);
+    expect(merged).toMatchObject({
+      happySessionId: 'sess-recovered',
+      happySessionMetadataFromLocalWebhook: metadata,
+      persistedLastProcessedSeq: 41,
     });
   });
 });

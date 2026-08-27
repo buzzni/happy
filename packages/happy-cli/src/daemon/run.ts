@@ -96,15 +96,27 @@ import {
   type StopSessionContext,
   type StopSessionResult,
 } from './sessionIdleReaper';
-import { resolveOrphanAdoption, collectStartupOrphans, resolveTrackedPidOwner } from './orphanAdoption';
+import {
+  resolveOrphanAdoption,
+  collectStartupOrphans,
+  resolveTrackedPidOwner,
+  resolveRecoveredPendingPromotion,
+  decideRecoveredPendingWebhook,
+  classifyRecoveredTrackedProcess,
+} from './orphanAdoption';
 import {
   hydrateRecoveredSessionFromPersisted,
   hydrateTrackedSessionFromPersisted,
+  mergeTrackedSessionWebhook,
 } from './persistedSessionHydration';
 import { createAutomationStore } from './automations/automationStore';
 import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
 import { createAutomationTickRunner } from './automations/automationTickRunner';
+import {
+  decideAutomationAwareHandoff,
+  resumeAutomationRunnersAfterFailedHandoff,
+} from './daemonHandoffAutomationGate';
 import { runAutomationScript } from './automations/runAutomationScript';
 import { queryGithubPullRequestFiles, queryGithubPullRequests } from './automations/queryGithubPullRequests';
 import { queryGithubIssues } from './automations/queryGithubIssues';
@@ -319,6 +331,11 @@ export async function startDaemon(): Promise<void> {
 
     // Setup state - key by PID
     const pidToTrackedSession = new Map<number, TrackedSession>();
+    // Only placeholders restored from the previous daemon belong here. A new
+    // spawn in this process still has a live webhook awaiter and must retain
+    // PENDING_SPAWN_OWNER protection until that webhook arrives.
+    const recoveredPendingSpawnStartedAt = new Map<number, number>();
+    const unverifiedRecoveredHomeDirs: string[] = [];
     // When a session was adopted from a previous daemon, keyed by PID. Feeds the
     // idle guard's grace window — an adopted session keeps its real age, so it
     // can be reap-eligible the instant it is adopted.
@@ -335,7 +352,13 @@ export async function startDaemon(): Promise<void> {
     if (previousState?.trackedSessions?.length) {
       logger.debug(`[DAEMON RUN] Found ${previousState.trackedSessions.length} sessions from previous daemon (state: ${previousState.state || 'unknown'})`);
       for (const persisted of previousState.trackedSessions) {
-        if (isPidAlive(persisted.pid)) {
+        const processIdentity = classifyRecoveredTrackedProcess({
+          pid: persisted.pid,
+          recordedStartedAt: persisted.startedAt,
+          isPidAlive,
+          getProcessStartedAt,
+        });
+        if (processIdentity === 'verified') {
           const recovered: TrackedSession = {
             // The state file records who and where, but not the session's
             // encryption or resume cursor. Without them preserveSessionForResume
@@ -354,10 +377,20 @@ export async function startDaemon(): Promise<void> {
             ...(persisted.userHomeDir ? { userHomeDir: persisted.userHomeDir } : {}),
           };
           pidToTrackedSession.set(persisted.pid, recovered);
+          if (!persisted.happySessionId) {
+            recoveredPendingSpawnStartedAt.set(persisted.pid, persisted.startedAt);
+          }
           logger.debug(`[DAEMON RUN] Recovered alive session PID ${persisted.pid}, sessionId: ${persisted.happySessionId || 'pending'}`);
+        } else if (processIdentity === 'unverified') {
+          if (persisted.userHomeDir) unverifiedRecoveredHomeDirs.push(persisted.userHomeDir);
+          logger.debug(
+            `[DAEMON RUN] Skipped unverified previous session PID ${persisted.pid}, sessionId: ${persisted.happySessionId || 'pending'}`,
+          );
         } else {
           deadSessionsToCleanup.push(persisted);
-          logger.debug(`[DAEMON RUN] Previous session PID ${persisted.pid} is dead (sessionId: ${persisted.happySessionId || 'pending'})`);
+          logger.debug(
+            `[DAEMON RUN] Previous session PID ${persisted.pid} is ${processIdentity} (sessionId: ${persisted.happySessionId || 'pending'})`,
+          );
         }
       }
     } else if (!previousState) {
@@ -381,7 +414,11 @@ export async function startDaemon(): Promise<void> {
       const resumableHomeDirs = Object.values(persistedSessions)
         .map((s) => s.userHomeDir)
         .filter((d): d is string => typeof d === 'string');
-      const removed = await sweepOrphanUserHomeDirs([...liveHomeDirs, ...resumableHomeDirs]);
+      const removed = await sweepOrphanUserHomeDirs([
+        ...liveHomeDirs,
+        ...unverifiedRecoveredHomeDirs,
+        ...resumableHomeDirs,
+      ]);
       if (removed.length > 0) {
         logger.debug(`[DAEMON RUN] Swept ${removed.length} orphan user home dir(s) from /tmp`);
       }
@@ -429,6 +466,7 @@ export async function startDaemon(): Promise<void> {
       if (resumable?.encryption) {
         session.encryption = resumable.encryption;
       }
+      recoveredPendingSpawnStartedAt.delete(session.pid);
       pidToTrackedSession.set(session.pid, session);
       sessionStartTimes.set(session.pid, startedAt);
       pidToAdoptedAt.set(session.pid, Date.now());
@@ -475,6 +513,24 @@ export async function startDaemon(): Promise<void> {
     // Forward declaration — assigned after fileState is available
     let persistTrackedSessions: () => void = () => {};
 
+    const releaseRecoveredPendingAfterPidReuse = (pid: number) => {
+      const stalePending = pidToTrackedSession.get(pid);
+      recoveredPendingSpawnStartedAt.delete(pid);
+      pidToTrackedSession.delete(pid);
+      sessionStartTimes.delete(pid);
+      pidToAdoptedAt.delete(pid);
+      persistTrackedSessions();
+      logger.debug(`[DAEMON RUN] Released recovered pending spawn after PID reuse was detected (pid ${pid})`);
+      if (stalePending?.userHomeDir) {
+        void unstageUserCredentials(stalePending.userHomeDir).then(
+          () => logger.debug(`[DAEMON RUN] Unstaged reused-PID pending home dir ${stalePending.userHomeDir}`),
+          (error) => logger.debug(
+            `[DAEMON RUN] Failed to unstage reused-PID pending home dir: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        );
+      }
+    };
+
     // Handle webhook from happy session reporting itself
     const onHappySessionWebhook = (sessionId: string, sessionMetadata: Metadata, encryption?: SessionEncryptionData) => {
       logger.debugLargeJson(`[DAEMON RUN] Session reported`, sessionMetadata);
@@ -495,7 +551,31 @@ export async function startDaemon(): Promise<void> {
       // resumed to deliver (2026-08-05 incident).
       const preserved = sessionIdToFinishedSession.get(sessionId);
       const inheritedLastProcessedSeq = preserved?.runtime?.lastProcessedSeq ?? preserved?.persistedLastProcessedSeq;
-      const existingSession = pidToTrackedSession.get(pid);
+      let existingSession = pidToTrackedSession.get(pid);
+      let rejectedRecoveredPendingReason: string | undefined;
+      const recoveredPendingStartedAt = recoveredPendingSpawnStartedAt.get(pid);
+      if (existingSession && recoveredPendingStartedAt !== undefined) {
+        const decision = decideRecoveredPendingWebhook({
+          sessionId,
+          hostPid: pid,
+          tracked: existingSession,
+          resumable: preserved,
+          recoveredPendingStartedAt,
+          isPidAlive,
+          getProcessStartedAt,
+        });
+        if (decision.action === 'promote') {
+          existingSession = decision.session;
+          recoveredPendingSpawnStartedAt.delete(pid);
+          pidToTrackedSession.set(pid, existingSession);
+        } else if (decision.action === 'release-and-register-external') {
+          releaseRecoveredPendingAfterPidReuse(pid);
+          existingSession = undefined;
+        } else {
+          rejectedRecoveredPendingReason = decision.reason;
+          existingSession = undefined;
+        }
+      }
 
       // Persist encryption data to disk so it survives daemon restarts
       if (encryption) {
@@ -512,13 +592,27 @@ export async function startDaemon(): Promise<void> {
         });
       }
 
+      if (rejectedRecoveredPendingReason) {
+        logger.debug(
+          `[DAEMON RUN] Ignoring recovered pending webhook ${sessionId} for PID ${pid}: ${rejectedRecoveredPendingReason}`,
+        );
+        return;
+      }
+
       // Check if we already have this PID (daemon-spawned)
       if (existingSession && existingSession.startedBy === 'daemon') {
         // Update daemon-spawned session with reported data
-        existingSession.happySessionId = sessionId;
-        existingSession.happySessionMetadataFromLocalWebhook = sessionMetadata;
-        existingSession.encryption = encryption;
-        existingSession.persistedLastProcessedSeq = inheritedLastProcessedSeq;
+        recoveredPendingSpawnStartedAt.delete(pid);
+        existingSession = mergeTrackedSessionWebhook({
+          tracked: existingSession,
+          sessionId,
+          metadata: sessionMetadata,
+          ...(encryption ? { encryption } : {}),
+          ...(inheritedLastProcessedSeq !== undefined
+            ? { persistedLastProcessedSeq: inheritedLastProcessedSeq }
+            : {}),
+        });
+        pidToTrackedSession.set(pid, existingSession);
         if (!sessionStartTimes.has(pid)) {
           sessionStartTimes.set(pid, Date.now());
         }
@@ -543,6 +637,7 @@ export async function startDaemon(): Promise<void> {
           pid,
           persistedLastProcessedSeq: inheritedLastProcessedSeq,
         };
+        recoveredPendingSpawnStartedAt.delete(pid);
         pidToTrackedSession.set(pid, trackedSession);
         sessionStartTimes.set(pid, Date.now());
         logger.debug(`[DAEMON RUN] Registered externally-started session ${sessionId}`);
@@ -596,6 +691,31 @@ export async function startDaemon(): Promise<void> {
       reporter?: { hostPid?: number },
     ) => {
       let trackedSession = getCurrentChildren().find(session => session.happySessionId === sessionId);
+      if (!trackedSession && reporter?.hostPid !== undefined) {
+        const promotion = resolveRecoveredPendingPromotion({
+          sessionId,
+          hostPid: reporter.hostPid,
+          tracked: pidToTrackedSession.get(reporter.hostPid),
+          resumable: sessionIdToFinishedSession.get(sessionId),
+          recoveredPendingStartedAt: recoveredPendingSpawnStartedAt.get(reporter.hostPid),
+          isPidAlive,
+          getProcessStartedAt,
+        });
+        if (promotion.promoted) {
+          trackedSession = promotion.session;
+          recoveredPendingSpawnStartedAt.delete(reporter.hostPid);
+          pidToTrackedSession.set(reporter.hostPid, trackedSession);
+          persistTrackedSessions();
+          logger.debug(
+            `[DAEMON RUN] Promoted recovered pending spawn to session ${sessionId} (pid ${reporter.hostPid})`,
+          );
+        } else if (promotion.reason === 'pid-reused') {
+          // The pending record belongs to the process that previously owned
+          // this PID. Release it before orphan adoption or its sentinel owner
+          // would permanently block the actual reporter now using the PID.
+          releaseRecoveredPendingAfterPidReuse(reporter.hostPid);
+        }
+      }
       if (!trackedSession) {
         // A session we don't know about is reporting to us: it outlived the
         // daemon that spawned it (version upgrade, crash, lost state file) and
@@ -971,6 +1091,7 @@ export async function startDaemon(): Promise<void> {
             };
 
             // Add to tracking map so webhook can find it later
+            recoveredPendingSpawnStartedAt.delete(tmuxResult.pid);
             pidToTrackedSession.set(tmuxResult.pid, trackedSession);
             sessionStartTimes.set(tmuxResult.pid, Date.now());
 
@@ -1091,6 +1212,7 @@ export async function startDaemon(): Promise<void> {
         ...(agentEnvironment ? { agentEnvironment } : {}),
       };
 
+      recoveredPendingSpawnStartedAt.delete(happyProcess.pid);
       pidToTrackedSession.set(happyProcess.pid, trackedSession);
       sessionStartTimes.set(happyProcess.pid, Date.now());
       persistTrackedSessions();
@@ -1737,6 +1859,7 @@ export async function startDaemon(): Promise<void> {
           }
 
           pidToTrackedSession.delete(pid);
+          recoveredPendingSpawnStartedAt.delete(pid);
           sessionStartTimes.delete(pid);
           pidToAdoptedAt.delete(pid);
           persistTrackedSessions();
@@ -1757,6 +1880,7 @@ export async function startDaemon(): Promise<void> {
         logger.debug(`[DAEMON RUN] Removing exited process PID ${pid} from tracking`);
       }
       pidToTrackedSession.delete(pid);
+      recoveredPendingSpawnStartedAt.delete(pid);
       sessionStartTimes.delete(pid);
       pidToAdoptedAt.delete(pid);
       if (tracked?.happySessionId) resumeCursorPersistedAt.delete(tracked.happySessionId);
@@ -1996,6 +2120,7 @@ export async function startDaemon(): Promise<void> {
     stopClaudeSwapSupervisor = () => claudeSwapSupervisor.shutdown();
     await claudeSwapSupervisor.restore();
     const aiCredentialRuntime = createNodeAiCredentialRuntime(claudeSwapSupervisor);
+    let activeServerAutomationLeaseCount = 0;
     apiMachine.setAutomationKey(machineAutomationKey, (keyVersion) => {
       machineAutomationKey = updateMachineAutomationKeyRegistration(
         configuration.automationKeyFile,
@@ -2053,7 +2178,13 @@ export async function startDaemon(): Promise<void> {
           machineId,
         }),
         maintainAgentTaskLease: (dispatch) => {
-          maintainAutomationAgentTaskLease({ dispatch });
+          activeServerAutomationLeaseCount += 1;
+          maintainAutomationAgentTaskLease({
+            dispatch,
+            onStop: () => {
+              activeServerAutomationLeaseCount = Math.max(0, activeServerAutomationLeaseCount - 1);
+            },
+          });
         },
         resolveMcpSpawnContext: ({ runId, claimToken }) => exchangeAutomationMcpCallerGrant({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
@@ -2160,6 +2291,7 @@ export async function startDaemon(): Promise<void> {
         if (!isPidAlive(pid)) {
           logger.debug(`[DAEMON RUN] Removing stale session with PID ${pid} (process no longer exists)`);
           pidToTrackedSession.delete(pid);
+          recoveredPendingSpawnStartedAt.delete(pid);
           sessionStartTimes.delete(pid);
           pidToAdoptedAt.delete(pid);
           sessionsPruned = true;
@@ -2211,17 +2343,11 @@ export async function startDaemon(): Promise<void> {
         });
       }
 
-      // Scheduled automations tick — 하트비트 케이던스로 기동하되 await하지
-      // 않는다(detach). spawn webhook 대기가 하트비트의 나머지 임무(자가
-      // 업그레이드 감지·상태 기록)를 막거나 heartbeatRunning 가드로 다음 틱을
-      // 스킵시키지 않게 하기 위함이다. 중복 기동은 러너의 자체 가드가 막고,
-      // 스킵된 due는 claim이 실행 직전에만 반영되므로 다음 tick이 집어간다.
-      if (apiMachine.shouldRunLegacyAutomationScheduler()) automationTickRunner.trigger();
-      serverAutomationTickRunner.trigger();
-
       // Check if daemon needs update by detecting whether `dist/index.mjs` was
       // replaced on disk since the daemon started (npm install rewrites the file).
-      // Skip if we never captured an initial mtime (dev mode).
+      // This must run before automation triggers. Starting a detached tick and
+      // then tearing down the control server in the same heartbeat loses the
+      // spawned session's webhook, report and project link.
       let bundleReplaced = false;
       if (initialBundleMtimeMs > 0) {
         try {
@@ -2231,7 +2357,33 @@ export async function startDaemon(): Promise<void> {
           // File temporarily missing (e.g. mid-install) — retry on next heartbeat.
         }
       }
-      if (bundleReplaced) {
+      const handoffDecision = decideAutomationAwareHandoff({
+        bundleReplaced,
+        legacyAutomationRunning: automationTickRunner.isRunning(),
+        serverAutomationRunning: serverAutomationTickRunner.isRunning(),
+        serverAutomationLeaseRunning: activeServerAutomationLeaseCount > 0,
+      });
+
+      if (handoffDecision === 'run-automations') {
+        // Scheduled automations tick — 하트비트 케이던스로 기동하되 await하지
+        // 않는다(detach). spawn webhook 대기가 하트비트의 나머지 임무(자가
+        // 업그레이드 감지·상태 기록)를 막거나 heartbeatRunning 가드로 다음 틱을
+        // 스킵시키지 않게 하기 위함이다. 중복 기동은 러너의 자체 가드가 막고,
+        // 스킵된 due는 claim이 실행 직전에만 반영되므로 다음 tick이 집어간다.
+        if (apiMachine.shouldRunLegacyAutomationScheduler()) automationTickRunner.trigger();
+        serverAutomationTickRunner.trigger();
+      } else {
+        // Pause first so no later trigger can enter between the idle check and
+        // teardown. A tick already in flight is allowed to finish normally.
+        automationTickRunner.pause();
+        serverAutomationTickRunner.pause();
+      }
+
+      if (handoffDecision === 'defer-handoff') {
+        logger.debug('[DAEMON RUN] Daemon bundle replaced on disk, waiting for automation work to finish before handoff');
+      }
+
+      if (handoffDecision === 'handoff') {
         // TODO: We probably do not want to keep this in-process self-restart logic long-term.
         // A native service manager would make startup and upgrades much simpler: the CLI would
         // ask the OS to start the latest daemon instead of hand-rolling respawn/kill behavior here.
@@ -2284,6 +2436,11 @@ export async function startDaemon(): Promise<void> {
         }
 
         logger.debug('[DAEMON RUN] New daemon bundle preflight failed; keeping current daemon running');
+        resumeAutomationRunnersAfterFailedHandoff({
+          legacyAutomationEnabled: apiMachine.shouldRunLegacyAutomationScheduler(),
+          legacyRunner: automationTickRunner,
+          serverRunner: serverAutomationTickRunner,
+        });
       }
 
       // Before wrecklessly overriting the daemon state file, we should check if we are the ones who own it

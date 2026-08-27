@@ -103,6 +103,46 @@ describe('automation AgentTask bridge client', () => {
     vi.useRealTimers()
   })
 
+  it('reports lease termination exactly once so daemon handoff can continue', () => {
+    vi.useFakeTimers()
+    const onStop = vi.fn()
+    const stop = maintainAutomationAgentTaskLease({
+      dispatch: {
+        taskId: 'task-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret', input: {}, context: [],
+        controlUrl: 'https://studio.test/api/agent-tasks',
+      },
+      onStop,
+    })
+
+    stop()
+    stop()
+    vi.useRealTimers()
+
+    expect(onStop).toHaveBeenCalledOnce()
+  })
+
+  it('reports lease termination after pre-start heartbeat retries are exhausted', async () => {
+    vi.useFakeTimers()
+    const onStop = vi.fn()
+    maintainAutomationAgentTaskLease({
+      dispatch: {
+        taskId: 'task-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret', input: {}, context: [],
+        controlUrl: 'https://studio.test/api/agent-tasks',
+      },
+      intervalMs: 30_000,
+      maxPreStartFailures: 1,
+      fetchImpl: vi.fn(async () => new Response('{}', { status: 409 })) as never,
+      onStop,
+    })
+
+    await vi.advanceTimersByTimeAsync(30_000)
+    vi.useRealTimers()
+
+    expect(onStop).toHaveBeenCalledOnce()
+  })
+
   it('retries a transient heartbeat failure after the lease was established', async () => {
     vi.useFakeTimers()
     const fetchImpl = vi.fn()

@@ -14,6 +14,8 @@ export interface AutomationTickRunner {
   /** 이전 실행이 진행 중이면 스킵하고, 아니면 tick을 detach로 시작한다. */
   trigger(): void
   isRunning(): boolean
+  pause(): void
+  resume(options?: { trigger?: boolean }): void
 }
 
 export function createAutomationTickRunner(opts: {
@@ -21,9 +23,21 @@ export function createAutomationTickRunner(opts: {
   logDebug?: (message: string) => void
 }): AutomationTickRunner {
   let running = false
-  return {
+  let paused = false
+  const runner: AutomationTickRunner = {
     isRunning: () => running,
+    pause() {
+      paused = true
+    },
+    resume(options) {
+      paused = false
+      if (options?.trigger) runner.trigger()
+    },
     trigger() {
+      if (paused) {
+        opts.logDebug?.('[automation-tick] runner paused; skipping this heartbeat')
+        return
+      }
       if (running) {
         opts.logDebug?.('[automation-tick] previous tick still running; skipping this heartbeat')
         return
@@ -41,4 +55,5 @@ export function createAutomationTickRunner(opts: {
         })
     },
   }
+  return runner
 }
