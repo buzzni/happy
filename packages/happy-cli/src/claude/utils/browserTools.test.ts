@@ -174,6 +174,40 @@ describe('runBrowserTool', () => {
         expect(textOf(result)).toContain('y=120/800')
     })
 
+    it('labels child-frame refs without exposing URL secrets or embedded data', async () => {
+        const result = await runBrowserTool({
+            request: ok({
+                url: 'https://host.example',
+                title: 'Host',
+                elements: [
+                    { ref: '@e1', role: 'button', name: 'Continue' },
+                    {
+                        ref: '@f7:e1',
+                        role: 'button',
+                        name: 'Continue',
+                        frameUrl: 'https://checkout.example/embedded?session=secret#payment',
+                    },
+                    {
+                        ref: '@f8:e1',
+                        role: 'button',
+                        name: 'Continue',
+                        frameUrl: 'data:text/html,<button>unbounded embedded document</button>',
+                    },
+                ],
+                truncated: false,
+            }),
+            method: 'snapshot',
+            params: {},
+        })
+
+        const text = textOf(result)
+        expect(text).toContain('@e1 button "Continue"')
+        expect(text).toContain('@f7:e1 button "Continue" [frame="https://checkout.example/embedded"]')
+        expect(text).toContain('@f8:e1 button "Continue" [frame="data:"]')
+        expect(text).not.toContain('secret')
+        expect(text).not.toContain('unbounded embedded document')
+    })
+
     it('passes the caller params through to the bridge', async () => {
         let seen: unknown
         await runBrowserTool({
