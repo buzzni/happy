@@ -486,18 +486,24 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return serialize(() => withSafeErrors(
       `${selected.toUpperCase()}_APPLY_FAILED`,
       async () => {
+        let requestedLease: TrialAiCredentialLeaseMarker | undefined
+        let marker: TrialAiCredentialMarkerFile | undefined
         if (input.trialLease !== undefined) {
-          const requestedLease = trialLease(input.trialLease)
-          const marker = await readTrialMarker()
+          requestedLease = trialLease(input.trialLease)
+          marker = await readTrialMarker()
           const currentLease = marker.leases[selected]
           if (currentLease && currentLease.leaseId !== requestedLease.leaseId) {
             throw new AiCredentialRuntimeError('TRIAL_LEASE_CONFLICT')
           }
+        }
+        const result = selected === 'claude'
+          ? await applyClaude(input.payload)
+          : await applyCodex(input.payload)
+        if (requestedLease && marker) {
           marker.leases[selected] = requestedLease
           await writeTrialMarker(marker)
         }
-        if (selected === 'claude') return applyClaude(input.payload)
-        return applyCodex(input.payload)
+        return result
       },
     ))
   }

@@ -121,6 +121,29 @@ describe('AI credential machine runtime', () => {
     expect(marker).not.toContain('trial-secret')
   })
 
+  it('does not let a failed trial apply authorize purging restored Codex credentials', async () => {
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'codex' && args[0] === 'login') {
+        throw new Error('trial credential rejected')
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime, files } = setup({ execFile })
+    const authPath = '/home/operator/.codex/auth.json'
+    const codexLease = { ...trialLease, leaseId: 'lease-codex-failed' }
+    files.set(authPath, 'operator-existing-credential')
+
+    await expect(runtime.apply({
+      provider: 'codex', payload: 'invalid-trial-credential', trialLease: codexLease,
+    })).rejects.toMatchObject({ kind: 'CODEX_APPLY_FAILED' })
+    expect(files.get(authPath)).toBe('operator-existing-credential')
+    expect(files.has('/home/operator/.happy/trial-ai-credential-leases.json')).toBe(false)
+
+    const purgeResult = await runtime.purge({ provider: 'codex', leaseId: codexLease.leaseId })
+    expect(files.get(authPath)).toBe('operator-existing-credential')
+    expect(purgeResult).toEqual({ provider: 'codex', purged: true, alreadyPurged: true })
+  })
+
   it('refuses to replace a marker owned by a different active lease', async () => {
     const { runtime, files, calls } = setup()
     files.set('/home/operator/.happy/trial-ai-credential-leases.json', JSON.stringify({
