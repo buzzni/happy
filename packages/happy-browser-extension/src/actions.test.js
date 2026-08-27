@@ -155,6 +155,31 @@ describe('scrollRef', () => {
         expect(result).toMatchObject({ ok: true, moved: true, after: { x: 300, y: 0 } })
     })
 
+    it('supports Chrome RTL horizontal coordinates and reports the left boundary', () => {
+        render('<div id="rail" dir="rtl" style="overflow-x:auto"><button>First card</button></div>')
+        const rail = document.getElementById('rail')
+        markScrollable(rail, { scrollWidth: 1000, clientWidth: 200, scrollHeight: 200, clientHeight: 200 })
+        collectSnapshot()
+
+        const moved = scrollRef('@e1', -300, 0)
+
+        expect(rail.scrollLeft).toBe(-300)
+        expect(moved).toMatchObject({
+            ok: true,
+            moved: true,
+            after: { x: -300, y: 0 },
+            atBoundary: { left: false, right: false },
+        })
+
+        const boundary = scrollRef('@e1', -600, 0)
+        expect(boundary).toMatchObject({
+            ok: true,
+            moved: true,
+            after: { x: -800, y: 0 },
+            atBoundary: { left: true, right: false },
+        })
+    })
+
     it('reports a boundary instead of claiming movement', () => {
         render('<div id="results" style="overflow-y:auto"><button>Last item</button></div>')
         const results = document.getElementById('results')

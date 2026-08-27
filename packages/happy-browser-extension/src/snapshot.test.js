@@ -121,6 +121,29 @@ describe('collectSnapshot', () => {
         expect(snapshot.truncated).toBe(true)
     })
 
+    it('keeps visible controls and scrollable regions actionable after the first 200 elements', () => {
+        render(`
+            ${Array.from({ length: 200 }, (_, i) => `<button>earlier-${i}</button>`).join('')}
+            <div id="results" aria-label="Later results" style="overflow-y:auto">
+                <button id="current-action">Current viewport action</button>
+            </div>
+        `)
+        const results = document.getElementById('results')
+        const currentAction = document.getElementById('current-action')
+        markVisibleScrollable(results)
+        currentAction.getBoundingClientRect = () => ({ top: 20, left: 20, bottom: 60, right: 180, width: 160, height: 40 })
+
+        const snapshot = collectSnapshot()
+
+        expect(snapshot.truncated).toBe(true)
+        expect(snapshot.elements.slice(-2)).toMatchObject([
+            { ref: '@e201', role: 'button', name: 'Current viewport action' },
+            { ref: '@e202', role: 'scrollable', name: 'Later results' },
+        ])
+        expect(window.__happyRefs.get('@e201')).toBe(currentAction)
+        expect(window.__happyRefs.get('@e202')).toBe(results)
+    })
+
     it('does not flag truncation for a normal page', () => {
         render('<button>Save</button>')
         expect(collectSnapshot().truncated).toBe(false)

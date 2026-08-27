@@ -450,6 +450,17 @@ describe('handleCommand', () => {
             expect(response.error.code).toBe('NO_RESULT')
         })
 
+        it('reports NO_RESULT when a target frame disappears and Chrome returns no injection entry', async () => {
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                executeScript: async () => [],
+            })
+
+            const response = await handleCommand({ id: 140, method: 'scroll', params: { ref: '@f12:e4', deltaY: 300 } }, chrome)
+
+            expect(response.error.code).toBe('NO_RESULT')
+        })
+
         it('reports MISSING_PARAM when click is called without a ref', async () => {
             const response = await handleCommand({ id: 15, method: 'click', params: {} }, fakeChrome({ tabs: [ACTIVE_TAB] }))
             expect(response.error.code).toBe('MISSING_PARAM')
@@ -511,6 +522,22 @@ describe('handleCommand', () => {
             const response = await handleCommand({ id: 73, method: 'scroll', params: { deltaY: 10_001 } }, fakeChrome({ tabs: [ACTIVE_TAB] }))
             expect(response.error.code).toBe('INVALID_SCROLL_DELTA')
             expect(response.error.message).toContain('10000')
+        })
+
+        it('rejects an explicitly empty ref instead of scrolling the document', async () => {
+            let injections = 0
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                executeScript: async () => {
+                    injections += 1
+                    return [{ result: { ok: true } }]
+                },
+            })
+
+            const response = await handleCommand({ id: 74, method: 'scroll', params: { ref: '', deltaY: 300 } }, chrome)
+
+            expect(response.error.code).toBe('MISSING_PARAM')
+            expect(injections).toBe(0)
         })
     })
 

@@ -151,6 +151,7 @@ describe('runBrowserTool', () => {
             params: {},
         })
         expect(textOf(result)).toContain('truncated')
+        expect(textOf(result)).toMatch(/currently visible later elements/i)
     })
 
     it('renders scrollable refs with their current and maximum positions', async () => {

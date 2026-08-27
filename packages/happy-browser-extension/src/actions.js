@@ -152,7 +152,13 @@ export function scrollRef(ref, deltaX, deltaY) {
 
     const before = { x: target.scrollLeft, y: target.scrollTop }
     const max = maxFor(target)
-    target.scrollLeft = Math.max(0, Math.min(max.x, before.x + x))
+    // Chrome represents an RTL scroller as 0 at its right edge and negative
+    // values toward its left edge. Clamping every element to 0..max makes an
+    // RTL rail impossible to move left at all.
+    const rtl = target.ownerDocument.defaultView.getComputedStyle(target).direction === 'rtl'
+    const minLeft = rtl ? -max.x : 0
+    const maxLeft = rtl ? 0 : max.x
+    target.scrollLeft = Math.max(minLeft, Math.min(maxLeft, before.x + x))
     target.scrollTop = Math.max(0, Math.min(max.y, before.y + y))
     const after = { x: target.scrollLeft, y: target.scrollTop }
 
@@ -166,8 +172,8 @@ export function scrollRef(ref, deltaX, deltaY) {
         atBoundary: {
             top: after.y <= 0,
             bottom: after.y >= max.y,
-            left: after.x <= 0,
-            right: after.x >= max.x,
+            left: after.x <= minLeft,
+            right: after.x >= maxLeft,
         },
     }
 }

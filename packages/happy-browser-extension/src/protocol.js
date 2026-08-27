@@ -129,7 +129,7 @@ async function runPageAction(func, args, params, chrome, allowlist, frameId = 0)
         throw new CommandError('INJECTION_FAILED', e instanceof Error ? e.message : String(e))
     }
     const injectionResult = results[0]
-    const result = injectionResult.result
+    const result = injectionResult?.result
     // A missing result is not success — surface it instead of silently
     // treating "we don't know what happened" as "it worked". Includes the
     // raw injection result so a real-Chrome mismatch is diagnosable without
@@ -285,11 +285,12 @@ const handlers = {
         if (Math.abs(deltaX) > 10_000 || Math.abs(deltaY) > 10_000) {
             throw new CommandError('INVALID_SCROLL_DELTA', 'deltaX and deltaY must be between -10000 and 10000 pixels')
         }
-        const { frameId, innerRef } = params.ref
-            ? decodeRef(params.ref)
+        const hasRef = params.ref !== undefined && params.ref !== null
+        const { frameId, innerRef } = hasRef
+            ? decodeRef(requireParam(params, 'ref'))
             : { frameId: 0, innerRef: null }
         const result = await runPageAction(scrollRef, [innerRef, deltaX, deltaY], params, chrome, allowlist, frameId)
-        return params.ref ? { ...result, target: params.ref } : result
+        return hasRef ? { ...result, target: params.ref } : result
     },
 
     navigate: async (params, chrome, allowlist) => {

@@ -10,6 +10,7 @@
 
 export function collectSnapshot() {
     const MAX_ELEMENTS = 200
+    const MAX_VIEWPORT_INTERACTIVES = 20
     const MAX_SCROLLABLES = 20
     const MAX_NAME_LENGTH = 120
 
@@ -81,6 +82,7 @@ export function collectSnapshot() {
     const refs = new Map()
     const entriesByElement = new Map()
     const elements = []
+    const viewportInteractiveCandidates = []
     const scrollableCandidates = []
     let truncated = false
 
@@ -136,23 +138,34 @@ export function collectSnapshot() {
     // unreachable by design, not an oversight here.
     const walk = (root) => {
         for (const element of root.querySelectorAll('*')) {
-            if (elements.length >= MAX_ELEMENTS) {
-                truncated = true
-                return
+            const visible = isVisible(element)
+            const inViewport = visible && isInViewport(element)
+            if (element.matches(INTERACTIVE_SELECTOR) && visible) {
+                if (elements.length < MAX_ELEMENTS) {
+                    record(element)
+                } else {
+                    truncated = true
+                    if (inViewport && viewportInteractiveCandidates.length < MAX_VIEWPORT_INTERACTIVES) {
+                        viewportInteractiveCandidates.push(element)
+                    }
+                }
             }
-            if (element.matches(INTERACTIVE_SELECTOR) && isVisible(element)) record(element)
-            if (isVisible(element) && isInViewport(element)) {
+            if (inViewport) {
                 const metrics = scrollableMetrics(element)
                 if (metrics.x || metrics.y) scrollableCandidates.push({ element, metrics })
             }
-            if (element.shadowRoot) {
-                walk(element.shadowRoot)
-                if (truncated) return
-            }
+            if (element.shadowRoot) walk(element.shadowRoot)
         }
     }
 
     walk(document)
+
+    // Keep the long-page prefix stable for compatibility, but do not let it
+    // hide the controls the user just scrolled into view. This bounded tail is
+    // what makes snapshot → scroll → snapshot useful on pages with more than
+    // MAX_ELEMENTS controls without turning the snapshot into an unbounded
+    // DOM dump.
+    for (const element of viewportInteractiveCandidates) record(element)
 
     for (const { element, metrics } of scrollableCandidates.slice(0, MAX_SCROLLABLES)) {
         const existing = entriesByElement.get(element)
