@@ -21,6 +21,7 @@ describe('BROWSER_TOOL_NAMES', () => {
             'browser_screenshot',
             'browser_click',
             'browser_fill',
+            'browser_scroll',
             'browser_navigate',
             'browser_open_tab',
             'browser_close_tab',
@@ -150,6 +151,26 @@ describe('runBrowserTool', () => {
             params: {},
         })
         expect(textOf(result)).toContain('truncated')
+    })
+
+    it('renders scrollable refs with their current and maximum positions', async () => {
+        const result = await runBrowserTool({
+            request: ok({
+                url: 'https://a.com',
+                title: 'A',
+                elements: [{
+                    ref: '@e3',
+                    role: 'scrollable',
+                    name: 'Search results',
+                    scrollable: { x: false, y: true, left: 0, top: 120, maxLeft: 0, maxTop: 800 },
+                }],
+                truncated: false,
+            }),
+            method: 'snapshot',
+            params: {},
+        })
+        expect(textOf(result)).toContain('@e3 scrollable "Search results"')
+        expect(textOf(result)).toContain('y=120/800')
     })
 
     it('passes the caller params through to the bridge', async () => {
@@ -286,6 +307,43 @@ describe('runBrowserTool', () => {
             const result = await runBrowserTool({ request: ok({ ok: true }), method: 'fill', params: { ref: '@e2', value: 'hi' } })
             expect(result.isError).toBe(false)
             expect(textOf(result)).toContain('@e2')
+        })
+
+        it('reports actual scroll movement and tells the agent to re-snapshot', async () => {
+            const result = await runBrowserTool({
+                request: ok({
+                    ok: true,
+                    target: 'document',
+                    moved: true,
+                    before: { x: 0, y: 0 },
+                    after: { x: 0, y: 600 },
+                    max: { x: 0, y: 1200 },
+                    atBoundary: { top: false, bottom: false, left: true, right: true },
+                }),
+                method: 'scroll',
+                params: { deltaY: 600 },
+            })
+            expect(result.isError).toBe(false)
+            expect(textOf(result)).toContain('0,600')
+            expect(textOf(result)).toContain('browser_snapshot')
+        })
+
+        it('does not describe a boundary scroll as movement', async () => {
+            const result = await runBrowserTool({
+                request: ok({
+                    ok: true,
+                    target: '@e3',
+                    moved: false,
+                    before: { x: 0, y: 800 },
+                    after: { x: 0, y: 800 },
+                    max: { x: 0, y: 800 },
+                    atBoundary: { top: false, bottom: true, left: true, right: true },
+                }),
+                method: 'scroll',
+                params: { ref: '@e3', deltaY: 300 },
+            })
+            expect(textOf(result)).toMatch(/did not move/i)
+            expect(textOf(result)).toMatch(/bottom/i)
         })
 
         it('confirms navigation with the destination url', async () => {

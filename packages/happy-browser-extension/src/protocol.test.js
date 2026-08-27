@@ -456,6 +456,64 @@ describe('handleCommand', () => {
         })
     })
 
+    describe('scroll', () => {
+        it('injects a document scroll into the main frame', async () => {
+            let injected
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                executeScript: async (options) => {
+                    injected = options
+                    return [{ result: { ok: true, target: 'document', moved: true } }]
+                },
+            })
+
+            const response = await handleCommand({ id: 70, method: 'scroll', params: { deltaY: 600 } }, chrome)
+
+            expect(injected.target).toEqual({ tabId: 7, frameIds: [0] })
+            expect(injected.args).toEqual([null, 0, 600])
+            expect(response.result).toMatchObject({ ok: true, moved: true })
+        })
+
+        it('routes a frame-qualified ref to that frame only', async () => {
+            let injected
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                executeScript: async (options) => {
+                    injected = options
+                    return [{ result: { ok: true, target: '@e4', moved: true } }]
+                },
+            })
+
+            const response = await handleCommand({ id: 71, method: 'scroll', params: { ref: '@f12:e4', deltaY: 400 } }, chrome)
+
+            expect(injected.target).toEqual({ tabId: 7, frameIds: [12] })
+            expect(injected.args).toEqual(['@e4', 0, 400])
+            expect(response.result.target).toBe('@f12:e4')
+        })
+
+        it('rejects a zero scroll before injecting', async () => {
+            let injections = 0
+            const chrome = fakeChrome({
+                tabs: [ACTIVE_TAB],
+                executeScript: async () => {
+                    injections += 1
+                    return [{ result: { ok: true } }]
+                },
+            })
+
+            const response = await handleCommand({ id: 72, method: 'scroll', params: { deltaX: 0, deltaY: 0 } }, chrome)
+
+            expect(response.error.code).toBe('INVALID_SCROLL_DELTA')
+            expect(injections).toBe(0)
+        })
+
+        it('rejects an unbounded pixel delta before injecting', async () => {
+            const response = await handleCommand({ id: 73, method: 'scroll', params: { deltaY: 10_001 } }, fakeChrome({ tabs: [ACTIVE_TAB] }))
+            expect(response.error.code).toBe('INVALID_SCROLL_DELTA')
+            expect(response.error.message).toContain('10000')
+        })
+    })
+
     describe('navigate', () => {
         it('updates the target tab to the given url', async () => {
             let updated
@@ -516,8 +574,8 @@ describe('handleCommand', () => {
             // ids and reads the URLs it is not allowed to see straight out of
             // the error messages.
             const chrome = fakeChrome({ tabs: [WORK_TAB, BANK_TAB], allowlist: 'work.test' })
-            for (const method of ['snapshot', 'screenshot', 'click', 'tabs_close']) {
-                const response = await handleCommand({ id: 31, method, params: { tabId: 3, ref: '@e1' } }, chrome)
+            for (const method of ['snapshot', 'screenshot', 'click', 'scroll', 'tabs_close']) {
+                const response = await handleCommand({ id: 31, method, params: { tabId: 3, ref: '@e1', deltaY: 100 } }, chrome)
                 expect(response.error.code).toBe('SITE_NOT_ALLOWED')
                 expect(response.error.message).not.toContain('bank.example')
                 expect(response.error.message).not.toContain('/accounts')

@@ -7,6 +7,18 @@ function render(html) {
     delete window.__happyRefs
 }
 
+function markVisibleScrollable(element) {
+    Object.defineProperties(element, {
+        scrollTop: { configurable: true, writable: true, value: 120 },
+        scrollLeft: { configurable: true, writable: true, value: 0 },
+        scrollHeight: { configurable: true, value: 1000 },
+        scrollWidth: { configurable: true, value: 300 },
+        clientHeight: { configurable: true, value: 200 },
+        clientWidth: { configurable: true, value: 300 },
+    })
+    element.getBoundingClientRect = () => ({ top: 10, left: 10, bottom: 210, right: 310, width: 300, height: 200 })
+}
+
 describe('collectSnapshot', () => {
     beforeEach(() => {
         render('')
@@ -112,6 +124,30 @@ describe('collectSnapshot', () => {
     it('does not flag truncation for a normal page', () => {
         render('<button>Save</button>')
         expect(collectSnapshot().truncated).toBe(false)
+    })
+
+    it('appends visible scrollable regions without renumbering interactive refs', () => {
+        render(`
+            <div id="results" aria-label="Search results" style="overflow-y:auto">
+                <button>First result</button>
+            </div>
+            <button>After results</button>
+        `)
+        markVisibleScrollable(document.getElementById('results'))
+
+        const { elements } = collectSnapshot()
+
+        expect(elements.slice(0, 2).map((element) => [element.ref, element.name])).toEqual([
+            ['@e1', 'First result'],
+            ['@e2', 'After results'],
+        ])
+        expect(elements[2]).toMatchObject({
+            ref: '@e3',
+            role: 'scrollable',
+            name: 'Search results',
+            scrollable: { x: false, y: true, left: 0, top: 120, maxLeft: 0, maxTop: 800 },
+        })
+        expect(window.__happyRefs.get('@e3')).toBe(document.getElementById('results'))
     })
 
     describe('shadow DOM', () => {

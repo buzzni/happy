@@ -272,6 +272,32 @@ function registerBrowserTools(mcp: McpServer): void {
         },
     }, async (args) => runBrowserTool({ request: bridge, status, method: 'fill', params: { profile: args.profile, ref: args.ref, value: args.value, tabId: args.tabId, trusted: args.trusted } }));
 
+    mcp.registerTool('browser_scroll', {
+        description:
+            "Scroll a page or a scrollable region in the user's Chrome by pixel deltas. Omit ref to scroll the document; pass a ref from browser_snapshot to scroll that element or its nearest scrollable ancestor. Re-run browser_snapshot after scrolling because lazy-loaded content can change the page and its refs.",
+        title: 'Scroll a browser page or region',
+        inputSchema: z.object({
+            deltaX: z.number().min(-10_000).max(10_000).optional().describe('Horizontal pixel delta; negative scrolls left and positive scrolls right'),
+            deltaY: z.number().min(-10_000).max(10_000).optional().describe('Vertical pixel delta; negative scrolls up and positive scrolls down'),
+            ref: z.string().optional().describe('Optional element or scrollable-region ref from browser_snapshot, e.g. "@e3" or "@f7:e2"'),
+            tabId: z.number().optional().describe('Tab to scroll (defaults to the active tab)'),
+            profile: z.string().optional().describe('Which connected Chrome profile to act on. Only needed when browser_capabilities or an AMBIGUOUS_PROFILE error says more than one is connected.'),
+        }).refine((args) => (args.deltaX ?? 0) !== 0 || (args.deltaY ?? 0) !== 0, {
+            message: 'At least one of deltaX or deltaY must be non-zero',
+        }),
+    }, async (args) => runBrowserTool({
+        request: bridge,
+        status,
+        method: 'scroll',
+        params: {
+            profile: args.profile,
+            ref: args.ref,
+            tabId: args.tabId,
+            deltaX: args.deltaX ?? 0,
+            deltaY: args.deltaY ?? 0,
+        },
+    }));
+
     mcp.registerTool('browser_navigate', {
         description: "Navigate a tab in the user's Chrome to a URL. This invalidates any refs from an earlier browser_snapshot of that tab — re-snapshot after navigating.",
         title: 'Navigate a tab',
