@@ -72,8 +72,10 @@ describe('browser session broker Unix socket', () => {
     })
 
     it('makes a fresh socket directory traversable by the daemon group', async () => {
-        const dir = await mkdtemp(join(tmpdir(), 'browser-broker-parent-'))
-        const socketDir = join(dir, 'run', 'happy-browser')
+        // macOS sockaddr_un.sun_path is limited to 104 bytes; keep the
+        // nested path short while still exercising fresh-directory setup.
+        const dir = await mkdtemp(join(tmpdir(), 'bb-'))
+        const socketDir = join(dir, 'run')
         const socketPath = join(socketDir, 'broker.sock')
         const socketGid = 4242
         const getuid = process.getuid
