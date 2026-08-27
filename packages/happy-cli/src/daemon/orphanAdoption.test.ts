@@ -4,6 +4,7 @@ import {
   collectStartupOrphans,
   resolveTrackedPidOwner,
   resolveRecoveredPendingPromotion,
+  decideRecoveredPendingWebhook,
   EXTERNAL_SESSION_STARTED_BY,
   PENDING_SPAWN_OWNER,
 } from './orphanAdoption'
@@ -438,6 +439,42 @@ describe('resolveRecoveredPendingPromotion', () => {
       ...recoveredIdentity,
       isPidAlive: () => true,
     })).toEqual({ promoted: false, reason: 'not-daemon-spawn' })
+  })
+})
+
+describe('decideRecoveredPendingWebhook', () => {
+  const pending = {
+    startedBy: 'daemon' as const,
+    pid: 4242,
+    userHomeDir: '/tmp/happy-session-4242',
+  }
+
+  // Session startup normally reports its webhook before its first runtime
+  // heartbeat. The webhook must apply the same PID identity check as runtime,
+  // or it can consume the recovered marker before reuse is detected.
+  it('releases a recovered pending entry when a webhook comes from a reused pid', () => {
+    expect(decideRecoveredPendingWebhook({
+      sessionId: 'sess-new-process',
+      hostPid: 4242,
+      tracked: pending,
+      recoveredPendingStartedAt: 10_000,
+      isPidAlive: () => true,
+      getProcessStartedAt: () => 20_000,
+    })).toEqual({ action: 'release-and-register-external' })
+  })
+
+  it('promotes a recovered pending entry when the webhook process identity matches', () => {
+    expect(decideRecoveredPendingWebhook({
+      sessionId: 'sess-recovered',
+      hostPid: 4242,
+      tracked: pending,
+      recoveredPendingStartedAt: 10_000,
+      isPidAlive: () => true,
+      getProcessStartedAt: () => 9_000,
+    })).toEqual({
+      action: 'promote',
+      session: { ...pending, happySessionId: 'sess-recovered' },
+    })
   })
 })
 

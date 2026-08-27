@@ -117,6 +117,25 @@ export function resolveRecoveredPendingPromotion(input: {
   };
 }
 
+export type RecoveredPendingWebhookDecision =
+  | { action: 'promote'; session: TrackedSession }
+  | { action: 'release-and-register-external' }
+  | { action: 'ignore'; reason: Exclude<RecoveredPendingPromotionResult, { promoted: true }>['reason'] };
+
+/**
+ * Apply recovered-pending PID validation before the session-started webhook
+ * consumes that marker. Webhooks normally arrive before runtime reports, so
+ * validating only the runtime path leaves the PID reuse guard bypassable.
+ */
+export function decideRecoveredPendingWebhook(
+  input: Parameters<typeof resolveRecoveredPendingPromotion>[0],
+): RecoveredPendingWebhookDecision {
+  const promotion = resolveRecoveredPendingPromotion(input);
+  if (promotion.promoted) return { action: 'promote', session: promotion.session };
+  if (promotion.reason === 'pid-reused') return { action: 'release-and-register-external' };
+  return { action: 'ignore', reason: promotion.reason };
+}
+
 /**
  * Decide whether a runtime report from an untracked session should be adopted.
  */

@@ -15,9 +15,10 @@
  */
 
 import { decodeBase64 } from '@/api/encryption';
+import type { Metadata } from '@/api/types';
 import type { PersistedSession } from '@/persistence';
 import { captureSaycodeAgentEnvironment } from './sessionEnv';
-import type { TrackedSession } from './types';
+import type { SessionEncryptionData, TrackedSession } from './types';
 
 type HydratedFields = Pick<
   TrackedSession,
@@ -67,5 +68,23 @@ export function hydrateRecoveredSessionFromPersisted(
     ...(hydrated.userHomeDir ? { userHomeDir: hydrated.userHomeDir } : {}),
     persistedLastProcessedSeq: baselineSeq,
     ...(hydrated.agentEnvironment ? { agentEnvironment: hydrated.agentEnvironment } : {}),
+  };
+}
+
+export function mergeTrackedSessionWebhook(input: {
+  tracked: TrackedSession;
+  sessionId: string;
+  metadata: Metadata;
+  encryption?: SessionEncryptionData;
+  persistedLastProcessedSeq?: number;
+}): TrackedSession {
+  return {
+    ...input.tracked,
+    happySessionId: input.sessionId,
+    happySessionMetadataFromLocalWebhook: input.metadata,
+    ...(input.encryption ? { encryption: input.encryption } : {}),
+    ...(input.persistedLastProcessedSeq !== undefined
+      ? { persistedLastProcessedSeq: input.persistedLastProcessedSeq }
+      : {}),
   };
 }

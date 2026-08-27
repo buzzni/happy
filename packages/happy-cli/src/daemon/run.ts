@@ -101,10 +101,12 @@ import {
   collectStartupOrphans,
   resolveTrackedPidOwner,
   resolveRecoveredPendingPromotion,
+  decideRecoveredPendingWebhook,
 } from './orphanAdoption';
 import {
   hydrateRecoveredSessionFromPersisted,
   hydrateTrackedSessionFromPersisted,
+  mergeTrackedSessionWebhook,
 } from './persistedSessionHydration';
 import { createAutomationStore } from './automations/automationStore';
 import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
@@ -492,6 +494,24 @@ export async function startDaemon(): Promise<void> {
     // Forward declaration — assigned after fileState is available
     let persistTrackedSessions: () => void = () => {};
 
+    const releaseRecoveredPendingAfterPidReuse = (pid: number) => {
+      const stalePending = pidToTrackedSession.get(pid);
+      recoveredPendingSpawnStartedAt.delete(pid);
+      pidToTrackedSession.delete(pid);
+      sessionStartTimes.delete(pid);
+      pidToAdoptedAt.delete(pid);
+      persistTrackedSessions();
+      logger.debug(`[DAEMON RUN] Released recovered pending spawn after PID reuse was detected (pid ${pid})`);
+      if (stalePending?.userHomeDir) {
+        void unstageUserCredentials(stalePending.userHomeDir).then(
+          () => logger.debug(`[DAEMON RUN] Unstaged reused-PID pending home dir ${stalePending.userHomeDir}`),
+          (error) => logger.debug(
+            `[DAEMON RUN] Failed to unstage reused-PID pending home dir: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        );
+      }
+    };
+
     // Handle webhook from happy session reporting itself
     const onHappySessionWebhook = (sessionId: string, sessionMetadata: Metadata, encryption?: SessionEncryptionData) => {
       logger.debugLargeJson(`[DAEMON RUN] Session reported`, sessionMetadata);
@@ -512,7 +532,31 @@ export async function startDaemon(): Promise<void> {
       // resumed to deliver (2026-08-05 incident).
       const preserved = sessionIdToFinishedSession.get(sessionId);
       const inheritedLastProcessedSeq = preserved?.runtime?.lastProcessedSeq ?? preserved?.persistedLastProcessedSeq;
-      const existingSession = pidToTrackedSession.get(pid);
+      let existingSession = pidToTrackedSession.get(pid);
+      let rejectedRecoveredPendingReason: string | undefined;
+      const recoveredPendingStartedAt = recoveredPendingSpawnStartedAt.get(pid);
+      if (existingSession && recoveredPendingStartedAt !== undefined) {
+        const decision = decideRecoveredPendingWebhook({
+          sessionId,
+          hostPid: pid,
+          tracked: existingSession,
+          resumable: preserved,
+          recoveredPendingStartedAt,
+          isPidAlive,
+          getProcessStartedAt,
+        });
+        if (decision.action === 'promote') {
+          existingSession = decision.session;
+          recoveredPendingSpawnStartedAt.delete(pid);
+          pidToTrackedSession.set(pid, existingSession);
+        } else if (decision.action === 'release-and-register-external') {
+          releaseRecoveredPendingAfterPidReuse(pid);
+          existingSession = undefined;
+        } else {
+          rejectedRecoveredPendingReason = decision.reason;
+          existingSession = undefined;
+        }
+      }
 
       // Persist encryption data to disk so it survives daemon restarts
       if (encryption) {
@@ -529,14 +573,27 @@ export async function startDaemon(): Promise<void> {
         });
       }
 
+      if (rejectedRecoveredPendingReason) {
+        logger.debug(
+          `[DAEMON RUN] Ignoring recovered pending webhook ${sessionId} for PID ${pid}: ${rejectedRecoveredPendingReason}`,
+        );
+        return;
+      }
+
       // Check if we already have this PID (daemon-spawned)
       if (existingSession && existingSession.startedBy === 'daemon') {
         // Update daemon-spawned session with reported data
         recoveredPendingSpawnStartedAt.delete(pid);
-        existingSession.happySessionId = sessionId;
-        existingSession.happySessionMetadataFromLocalWebhook = sessionMetadata;
-        existingSession.encryption = encryption;
-        existingSession.persistedLastProcessedSeq = inheritedLastProcessedSeq;
+        existingSession = mergeTrackedSessionWebhook({
+          tracked: existingSession,
+          sessionId,
+          metadata: sessionMetadata,
+          ...(encryption ? { encryption } : {}),
+          ...(inheritedLastProcessedSeq !== undefined
+            ? { persistedLastProcessedSeq: inheritedLastProcessedSeq }
+            : {}),
+        });
+        pidToTrackedSession.set(pid, existingSession);
         if (!sessionStartTimes.has(pid)) {
           sessionStartTimes.set(pid, Date.now());
         }
@@ -637,23 +694,7 @@ export async function startDaemon(): Promise<void> {
           // The pending record belongs to the process that previously owned
           // this PID. Release it before orphan adoption or its sentinel owner
           // would permanently block the actual reporter now using the PID.
-          const stalePending = pidToTrackedSession.get(reporter.hostPid);
-          recoveredPendingSpawnStartedAt.delete(reporter.hostPid);
-          pidToTrackedSession.delete(reporter.hostPid);
-          sessionStartTimes.delete(reporter.hostPid);
-          pidToAdoptedAt.delete(reporter.hostPid);
-          persistTrackedSessions();
-          logger.debug(
-            `[DAEMON RUN] Released recovered pending spawn after PID reuse was detected (pid ${reporter.hostPid})`,
-          );
-          if (stalePending?.userHomeDir) {
-            void unstageUserCredentials(stalePending.userHomeDir).then(
-              () => logger.debug(`[DAEMON RUN] Unstaged reused-PID pending home dir ${stalePending.userHomeDir}`),
-              (error) => logger.debug(
-                `[DAEMON RUN] Failed to unstage reused-PID pending home dir: ${error instanceof Error ? error.message : String(error)}`,
-              ),
-            );
-          }
+          releaseRecoveredPendingAfterPidReuse(reporter.hostPid);
         }
       }
       if (!trackedSession) {
