@@ -14,9 +14,16 @@ const {
     emitUpdateSpy,
     emitEphemeralSpy,
     machineUpdate,
+    machineUpdateMany,
+    accessKeyMutationSpy,
+    sessionMutationSpy,
+    logSpy,
 } = vi.hoisted(() => {
     const emitUpdateSpy = vi.fn();
     const emitEphemeralSpy = vi.fn();
+    const accessKeyMutationSpy = vi.fn();
+    const sessionMutationSpy = vi.fn();
+    const logSpy = vi.fn();
     const state = {
         existingMachine: null as any,
         created: [] as any[],
@@ -29,7 +36,14 @@ const {
         state.seq = 0;
     };
 
-    const machineFindFirst = vi.fn(async () => state.existingMachine);
+    const machineFindFirst = vi.fn(async (args?: any) => {
+        const machine = state.existingMachine;
+        if (!machine) return null;
+        const where = args?.where ?? {};
+        if (where.id !== undefined && machine.id !== where.id) return null;
+        if (where.accountId !== undefined && machine.accountId !== where.accountId) return null;
+        return machine;
+    });
     const machineCreate = vi.fn(async (args: any) => {
         // Mirror a Prisma Machine row: server defaults active=false on create
         // ("Default to offline - in case the user does not start daemon").
@@ -57,11 +71,39 @@ const {
         state.existingMachine = { ...state.existingMachine, ...args.data };
         return state.existingMachine;
     });
+    const machineUpdateMany = vi.fn(async (args: any) => {
+        const machine = state.existingMachine;
+        const expected = args.where.dataEncryptionKey;
+        const matchesExpected = machine?.dataEncryptionKey instanceof Uint8Array
+            && expected instanceof Uint8Array
+            && Buffer.from(machine.dataEncryptionKey).equals(Buffer.from(expected));
+        if (!machine || machine.id !== args.where.id || machine.accountId !== args.where.accountId || !matchesExpected) {
+            return { count: 0 };
+        }
+        state.existingMachine = { ...machine, ...args.data };
+        return { count: 1 };
+    });
     const machineFindMany = vi.fn(async (): Promise<any[]> => []);
-    const dbMock = { machine: { findFirst: machineFindFirst, create: machineCreate, update: machineUpdate, findMany: machineFindMany } };
+    const dbMock = {
+        machine: { findFirst: machineFindFirst, create: machineCreate, update: machineUpdate, updateMany: machineUpdateMany, findMany: machineFindMany },
+        accessKey: { updateMany: accessKeyMutationSpy, deleteMany: accessKeyMutationSpy },
+        session: { updateMany: sessionMutationSpy, deleteMany: sessionMutationSpy },
+    };
     const allocateUserSeqMock = vi.fn(async () => ++state.seq);
 
-    return { state, dbMock, resetState, allocateUserSeqMock, emitUpdateSpy, emitEphemeralSpy, machineUpdate };
+    return {
+        state,
+        dbMock,
+        resetState,
+        allocateUserSeqMock,
+        emitUpdateSpy,
+        emitEphemeralSpy,
+        machineUpdate,
+        machineUpdateMany,
+        accessKeyMutationSpy,
+        sessionMutationSpy,
+        logSpy,
+    };
 });
 
 // Keep the REAL event-builder functions (buildNewMachineUpdate etc.), but
@@ -74,7 +116,7 @@ vi.mock("@/app/events/eventRouter", async (importOriginal) => {
 vi.mock("@/storage/db", () => ({ db: dbMock }));
 vi.mock("@/storage/seq", () => ({ allocateUserSeq: allocateUserSeqMock }));
 vi.mock("@/storage/inTx", () => ({ inTx: async (fn: any) => fn({}), afterTx: (_tx: any, cb: () => void) => cb() }));
-vi.mock("@/utils/log", () => ({ log: vi.fn(), warn: vi.fn(), error: vi.fn() }));
+vi.mock("@/utils/log", () => ({ log: logSpy, warn: vi.fn(), error: vi.fn() }));
 
 import { machinesRoutes } from "./machinesRoutes";
 
@@ -255,6 +297,210 @@ describe("machinesRoutes — POST /v1/machines dataEncryptionKey write-once back
         expect(res.statusCode).toBe(200);
         expect(machineUpdate).not.toHaveBeenCalled();
         expect(res.json().machine.dataEncryptionKey).toBeNull();
+    });
+});
+
+describe("machinesRoutes — PATCH /v1/machines/:id/data-encryption-key CAS", () => {
+    let app: Fastify;
+    beforeEach(() => {
+        resetState();
+        machineUpdateMany.mockClear();
+        accessKeyMutationSpy.mockClear();
+        sessionMutationSpy.mockClear();
+        logSpy.mockClear();
+    });
+    afterEach(async () => { if (app) await app.close(); });
+
+    const envelope = (fill: number) => {
+        const bytes = new Uint8Array(105).fill(fill);
+        bytes[0] = 0;
+        return Buffer.from(bytes).toString("base64");
+    };
+
+    it("replaces the authenticated account's matching dataEncryptionKey", async () => {
+        app = await createApp();
+        const expectedDataEncryptionKey = envelope(1);
+        const replacementDataEncryptionKey = envelope(2);
+        state.existingMachine = {
+            id: "machine-1",
+            accountId: "user-1",
+            dataEncryptionKey: new Uint8Array(Buffer.from(expectedDataEncryptionKey, "base64")),
+        };
+
+        const res = await app.inject({
+            method: "PATCH",
+            url: "/v1/machines/machine-1/data-encryption-key",
+            headers: { "x-user-id": "user-1" },
+            payload: { expectedDataEncryptionKey, replacementDataEncryptionKey },
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.json()).toEqual({ ok: true, changed: true });
+        expect(Buffer.from(state.existingMachine.dataEncryptionKey).toString("base64")).toBe(replacementDataEncryptionKey);
+    });
+
+    it("treats the same replacement as an idempotent success", async () => {
+        app = await createApp();
+        const expectedDataEncryptionKey = envelope(1);
+        const replacementDataEncryptionKey = envelope(2);
+        state.existingMachine = {
+            id: "machine-1",
+            accountId: "user-1",
+            dataEncryptionKey: new Uint8Array(Buffer.from(replacementDataEncryptionKey, "base64")),
+        };
+
+        const res = await app.inject({
+            method: "PATCH",
+            url: "/v1/machines/machine-1/data-encryption-key",
+            headers: { "x-user-id": "user-1" },
+            payload: { expectedDataEncryptionKey, replacementDataEncryptionKey },
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.json()).toEqual({ ok: true, changed: false });
+        expect(machineUpdateMany).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects a stale expected envelope without changing the machine", async () => {
+        app = await createApp();
+        const currentDataEncryptionKey = envelope(3);
+        state.existingMachine = {
+            id: "machine-1",
+            accountId: "user-1",
+            dataEncryptionKey: new Uint8Array(Buffer.from(currentDataEncryptionKey, "base64")),
+        };
+
+        const res = await app.inject({
+            method: "PATCH",
+            url: "/v1/machines/machine-1/data-encryption-key",
+            headers: { "x-user-id": "user-1" },
+            payload: {
+                expectedDataEncryptionKey: envelope(1),
+                replacementDataEncryptionKey: envelope(2),
+            },
+        });
+
+        expect(res.statusCode).toBe(409);
+        expect(res.json()).toEqual({ error: "data-encryption-key-conflict" });
+        expect(Buffer.from(state.existingMachine.dataEncryptionKey).toString("base64")).toBe(currentDataEncryptionKey);
+    });
+
+    it.each([
+        ["owned by another account", "user-2"],
+        ["absent", null],
+    ])("returns 404 when the machine is %s", async (_case, accountId) => {
+        app = await createApp();
+        const originalDataEncryptionKey = envelope(1);
+        state.existingMachine = accountId ? {
+            id: "machine-1",
+            accountId,
+            dataEncryptionKey: new Uint8Array(Buffer.from(originalDataEncryptionKey, "base64")),
+        } : null;
+
+        const res = await app.inject({
+            method: "PATCH",
+            url: "/v1/machines/machine-1/data-encryption-key",
+            headers: { "x-user-id": "user-1" },
+            payload: {
+                expectedDataEncryptionKey: originalDataEncryptionKey,
+                replacementDataEncryptionKey: envelope(2),
+            },
+        });
+
+        expect(res.statusCode).toBe(404);
+        expect(res.json()).toEqual({ error: "Machine not found" });
+        if (state.existingMachine) {
+            expect(Buffer.from(state.existingMachine.dataEncryptionKey).toString("base64")).toBe(originalDataEncryptionKey);
+        }
+    });
+
+    it("rejects malformed base64 without writing it", async () => {
+        app = await createApp();
+        const originalDataEncryptionKey = envelope(1);
+        state.existingMachine = {
+            id: "machine-1",
+            accountId: "user-1",
+            dataEncryptionKey: new Uint8Array(Buffer.from(originalDataEncryptionKey, "base64")),
+        };
+
+        const res = await app.inject({
+            method: "PATCH",
+            url: "/v1/machines/machine-1/data-encryption-key",
+            headers: { "x-user-id": "user-1" },
+            payload: {
+                expectedDataEncryptionKey: originalDataEncryptionKey,
+                replacementDataEncryptionKey: "!!!not-base64!!!",
+            },
+        });
+
+        expect(res.statusCode).toBe(400);
+        expect(res.json()).toEqual({ error: "invalid-data-encryption-key-envelope" });
+        expect(machineUpdateMany).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ["wrong-length expected envelope", Buffer.from(new Uint8Array(104)).toString("base64"), envelope(2)],
+        ["unsupported-version replacement envelope", envelope(1), Buffer.from(new Uint8Array(105).fill(1)).toString("base64")],
+    ])("rejects a %s", async (_case, expectedDataEncryptionKey, replacementDataEncryptionKey) => {
+        app = await createApp();
+        state.existingMachine = {
+            id: "machine-1",
+            accountId: "user-1",
+            dataEncryptionKey: new Uint8Array(Buffer.from(envelope(1), "base64")),
+        };
+
+        const res = await app.inject({
+            method: "PATCH",
+            url: "/v1/machines/machine-1/data-encryption-key",
+            headers: { "x-user-id": "user-1" },
+            payload: { expectedDataEncryptionKey, replacementDataEncryptionKey },
+        });
+
+        expect(res.statusCode).toBe(400);
+        expect(machineUpdateMany).not.toHaveBeenCalled();
+    });
+
+    it("changes only dataEncryptionKey and does not expose either envelope", async () => {
+        app = await createApp();
+        const expectedDataEncryptionKey = envelope(1);
+        const replacementDataEncryptionKey = envelope(2);
+        const original = {
+            id: "machine-1",
+            accountId: "user-1",
+            seq: 17,
+            metadata: "encrypted-metadata",
+            metadataVersion: 4,
+            daemonState: "encrypted-daemon-state",
+            daemonStateVersion: 6,
+            dataEncryptionKey: new Uint8Array(Buffer.from(expectedDataEncryptionKey, "base64")),
+            serverDataEncryptionKey: new Uint8Array(Buffer.from(envelope(3), "base64")),
+            active: true,
+            lastActiveAt: new Date("2026-08-27T00:00:00.000Z"),
+            createdAt: new Date("2026-08-01T00:00:00.000Z"),
+            updatedAt: new Date("2026-08-26T00:00:00.000Z"),
+        };
+        state.existingMachine = original;
+
+        const res = await app.inject({
+            method: "PATCH",
+            url: "/v1/machines/machine-1/data-encryption-key",
+            headers: { "x-user-id": "user-1" },
+            payload: { expectedDataEncryptionKey, replacementDataEncryptionKey },
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(machineUpdateMany.mock.calls[0][0].data).toEqual({
+            dataEncryptionKey: new Uint8Array(Buffer.from(replacementDataEncryptionKey, "base64")),
+        });
+        expect(state.existingMachine).toEqual({
+            ...original,
+            dataEncryptionKey: new Uint8Array(Buffer.from(replacementDataEncryptionKey, "base64")),
+        });
+        expect(accessKeyMutationSpy).not.toHaveBeenCalled();
+        expect(sessionMutationSpy).not.toHaveBeenCalled();
+        expect(logSpy).not.toHaveBeenCalled();
+        expect(res.body).not.toContain(expectedDataEncryptionKey);
+        expect(res.body).not.toContain(replacementDataEncryptionKey);
     });
 });
 

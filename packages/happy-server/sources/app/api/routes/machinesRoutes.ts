@@ -8,6 +8,18 @@ import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { allocateUserSeq } from "@/storage/seq";
 import { buildNewMachineUpdate, buildUpdateMachineUpdate, buildDeleteMachineUpdate } from "@/app/events/eventRouter";
 
+const MACHINE_DATA_KEY_ENVELOPE_LENGTH = 105;
+
+function decodeMachineDataKeyEnvelope(value: string): Uint8Array | null {
+    const decoded = Buffer.from(value, 'base64');
+    if (decoded.toString('base64') !== value
+        || decoded.length !== MACHINE_DATA_KEY_ENVELOPE_LENGTH
+        || decoded[0] !== 0x00) {
+        return null;
+    }
+    return new Uint8Array(decoded);
+}
+
 export function machinesRoutes(app: Fastify) {
     app.post('/v1/machines', {
         preHandler: app.authenticate,
@@ -141,6 +153,54 @@ export function machinesRoutes(app: Fastify) {
                 }
             });
         }
+    });
+
+    app.patch('/v1/machines/:id/data-encryption-key', {
+        preHandler: app.authenticate,
+        schema: {
+            params: z.object({
+                id: z.string()
+            }),
+            body: z.object({
+                expectedDataEncryptionKey: z.string(),
+                replacementDataEncryptionKey: z.string()
+            })
+        }
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { id } = request.params;
+        const { expectedDataEncryptionKey, replacementDataEncryptionKey } = request.body;
+        const expected = decodeMachineDataKeyEnvelope(expectedDataEncryptionKey);
+        const replacement = decodeMachineDataKeyEnvelope(replacementDataEncryptionKey);
+        if (!expected || !replacement) {
+            return reply.code(400).send({ error: 'invalid-data-encryption-key-envelope' });
+        }
+
+        const updated = await db.machine.updateMany({
+            where: {
+                id,
+                accountId: userId,
+                dataEncryptionKey: new Uint8Array(expected)
+            },
+            data: {
+                dataEncryptionKey: new Uint8Array(replacement)
+            }
+        });
+        if (updated.count === 0) {
+            const machine = await db.machine.findFirst({
+                where: { id, accountId: userId },
+                select: { dataEncryptionKey: true }
+            });
+            if (!machine) {
+                return reply.code(404).send({ error: 'Machine not found' });
+            }
+            if (machine.dataEncryptionKey
+                && Buffer.from(machine.dataEncryptionKey).equals(Buffer.from(replacement))) {
+                return reply.send({ ok: true, changed: false });
+            }
+            return reply.code(409).send({ error: 'data-encryption-key-conflict' });
+        }
+        return reply.send({ ok: true, changed: true });
     });
 
 
