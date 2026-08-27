@@ -214,6 +214,101 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('completes MCP runtime recovery before starting the next user turn', async () => {
+        const requests: MockRpcMessage[] = [];
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                appServerStdout = stdout;
+                requests.push(msg);
+                if (msg.id == null) return;
+                if (msg.method === 'thread/start') {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { thread: { id: 'thread-1', path: '/tmp/thread-1' }, model: 'gpt-test' },
+                    }), 0);
+                }
+                if (msg.method === 'mcpServerStatus/list') {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            data: [{ name: 'argos', authStatus: 'unsupported', tools: { search: {} } }],
+                            nextCursor: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'thread/resume') {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            method: 'mcpServer/startupStatus/updated',
+                            params: { threadId: 'thread-1', name: 'argos', status: 'ready' },
+                        });
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { thread: { id: 'thread-1', path: '/tmp/thread-1' }, model: 'gpt-test' },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'turn/start') {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-1' } } });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'inProgress' } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: {
+                                threadId: 'thread-1',
+                                turn: { id: 'turn-1', status: 'completed', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        }));
+        const [{ CodexAppServerClient }, { CodexMcpRuntimeRecovery }] = await Promise.all([
+            import('./codexAppServerClient'),
+            import('./codexMcpRuntimeRecovery'),
+        ]);
+        const client = new CodexAppServerClient();
+        await client.connect();
+        await client.startThread({
+            cwd: '/tmp/project',
+            mcpServers: { argos: { url: 'https://argos.test/mcp' } },
+            developerInstructions: 'Discover Argos tools before fallback.',
+        });
+        if (!appServerStdout) throw new Error('app-server stdout unavailable');
+        pushJsonLine(appServerStdout, {
+            method: 'mcpServer/startupStatus/updated',
+            params: { threadId: 'thread-1', name: 'argos', status: 'failed' },
+        });
+        await waitFor(() => client.getMcpStartupStatuses().some(({ status }) => status === 'failed'));
+
+        const recovery = new CodexMcpRuntimeRecovery(client, { maxAttempts: 1, backoffMs: 0 });
+        await expect(recovery.recoverBeforeTurn({
+            threadId: 'thread-1',
+            mcpServers: { argos: { url: 'https://argos.test/mcp' } },
+            expectedServerNames: ['argos'],
+            developerInstructions: 'Discover Argos tools before fallback.',
+        })).resolves.toEqual({ status: 'recovered', affectedServers: ['argos'] });
+        await expect(client.sendTurnAndWait('Use Argos now.')).resolves.toEqual({ aborted: false });
+
+        const resumeIndex = requests.findIndex(({ method }) => method === 'thread/resume');
+        const turnIndex = requests.findIndex(({ method }) => method === 'turn/start');
+        expect(resumeIndex).toBeGreaterThan(-1);
+        expect(resumeIndex).toBeLessThan(turnIndex);
+        expect(requests[resumeIndex]?.params).toEqual(expect.objectContaining({
+            threadId: 'thread-1',
+            developerInstructions: 'Discover Argos tools before fallback.',
+            config: {
+                mcp_servers: { argos: { url: 'https://argos.test/mcp' } },
+            },
+        }));
+
+        await client.disconnect();
+    });
+
     it('persists developer instructions across start, topology-update resume, and fork', async () => {
         const requests: MockRpcMessage[] = [];
         mockSpawn.mockImplementation(() => createMockProcess({
