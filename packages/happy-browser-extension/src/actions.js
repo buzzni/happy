@@ -136,6 +136,7 @@ export function scrollRef(ref, deltaX, deltaY) {
             && (y === 0 || (max.y > 0 && permitsScroll(overflowY)))
     }
     const parentAcrossShadow = (element) => {
+        if (element.assignedSlot) return element.assignedSlot
         if (element.parentElement) return element.parentElement
         const root = typeof element.getRootNode === 'function' ? element.getRootNode() : null
         return root && root.host ? root.host : null

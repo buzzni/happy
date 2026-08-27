@@ -27,12 +27,14 @@ export function collectSnapshot() {
         '[role="tab"]',
         '[role="menuitem"]',
         '[role="textbox"]',
+        'summary',
         '[contenteditable="true"]',
     ].join(',')
 
     const clean = (text) => (text || '').replace(/\s+/g, ' ').trim().slice(0, MAX_NAME_LENGTH)
 
     const parentAcrossShadow = (element) => {
+        if (element.assignedSlot) return element.assignedSlot
         if (element.parentElement) return element.parentElement
         const root = typeof element.getRootNode === 'function' ? element.getRootNode() : null
         return root && root.host ? root.host : null
@@ -50,10 +52,17 @@ export function collectSnapshot() {
     const isInHiddenTree = (element) => {
         if (hiddenTrees.has(element)) return hiddenTrees.get(element)
         const parent = parentAcrossShadow(element)
+        const firstSummary = parent?.tagName === 'DETAILS'
+            ? Array.from(parent.children).find((child) => child.tagName === 'SUMMARY')
+            : null
+        const collapsedByDetails = parent?.tagName === 'DETAILS'
+            && !parent.hasAttribute('open')
+            && element !== firstSummary
         const hidden = element.hasAttribute('hidden')
             || element.hasAttribute('inert')
             || element.getAttribute('aria-hidden') === 'true'
             || styleOf(element).display === 'none'
+            || collapsedByDetails
             || (parent ? isInHiddenTree(parent) : false)
         hiddenTrees.set(element, hidden)
         return hidden
@@ -71,6 +80,7 @@ export function collectSnapshot() {
         const tag = element.tagName.toLowerCase()
         if (tag === 'a') return 'link'
         if (tag === 'button') return 'button'
+        if (tag === 'summary') return 'button'
         if (tag === 'select') return 'combobox'
         if (tag === 'textarea') return 'textbox'
         if (element.isContentEditable || element.getAttribute('contenteditable') === 'true') return 'textbox'
@@ -158,7 +168,32 @@ export function collectSnapshot() {
             || overflow === 'hidden'
             || overflow === 'clip'
 
-        for (let parent = parentAcrossShadow(element); parent; parent = parentAcrossShadow(parent)) {
+        const establishesFixedContainingBlock = (style) => {
+            const nonNone = (value) => Boolean(value) && value !== 'none'
+            const contain = style.contain || ''
+            const willChange = (style.willChange || '').split(',').map((value) => value.trim())
+            return nonNone(style.transform)
+                || nonNone(style.translate)
+                || nonNone(style.rotate)
+                || nonNone(style.scale)
+                || nonNone(style.perspective)
+                || nonNone(style.filter)
+                || nonNone(style.backdropFilter)
+                || nonNone(style.webkitBackdropFilter)
+                || /(?:^|\s)(?:layout|paint|strict|content)(?:\s|$)/.test(contain)
+                || (style.containerType && style.containerType !== 'normal')
+                || style.contentVisibility === 'auto'
+                || willChange.some((value) => value === 'transform' || value === 'perspective' || value === 'filter')
+        }
+
+        let clippingParent = parentAcrossShadow(element)
+        if (styleOf(element).position === 'fixed') {
+            while (clippingParent && !establishesFixedContainingBlock(styleOf(clippingParent))) {
+                clippingParent = parentAcrossShadow(clippingParent)
+            }
+        }
+
+        for (let parent = clippingParent; parent; parent = parentAcrossShadow(parent)) {
             const style = styleOf(parent)
             if (!clips(style.overflowX || style.overflow) && !clips(style.overflowY || style.overflow)) continue
             const parentBox = parent.getBoundingClientRect()
@@ -184,20 +219,24 @@ export function collectSnapshot() {
     const walk = (root) => {
         for (const element of root.querySelectorAll('*')) {
             const visible = isVisible(element)
-            const inViewport = visible && isInViewport(element)
+            let inViewport
+            const getInViewport = () => {
+                if (inViewport === undefined) inViewport = isInViewport(element)
+                return inViewport
+            }
             if (element.matches(INTERACTIVE_SELECTOR) && visible) {
                 if (elements.length < MAX_ELEMENTS) {
                     record(element)
                 } else {
                     truncated = true
-                    if (inViewport && viewportInteractiveCandidates.length < MAX_VIEWPORT_INTERACTIVES) {
+                    if (viewportInteractiveCandidates.length < MAX_VIEWPORT_INTERACTIVES && getInViewport()) {
                         viewportInteractiveCandidates.push(element)
                     }
                 }
             }
-            if (inViewport) {
+            if (visible && scrollableCandidates.length < MAX_SCROLLABLES) {
                 const metrics = scrollableMetrics(element)
-                if (metrics.x || metrics.y) scrollableCandidates.push({ element, metrics })
+                if ((metrics.x || metrics.y) && getInViewport()) scrollableCandidates.push({ element, metrics })
             }
             if (element.shadowRoot) walk(element.shadowRoot)
         }
