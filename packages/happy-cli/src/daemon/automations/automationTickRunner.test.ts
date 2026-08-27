@@ -15,6 +15,40 @@ function deferred() {
 const settle = () => new Promise<void>((res) => setTimeout(res, 0))
 
 describe('createAutomationTickRunner', () => {
+  it('shouldNotStartANewTickWhilePaused', async () => {
+    let runs = 0
+    const logs: string[] = []
+    const runner = createAutomationTickRunner({
+      runTick: async () => {
+        runs += 1
+      },
+      logDebug: (message) => logs.push(message),
+    })
+
+    runner.pause()
+    runner.trigger()
+    await settle()
+
+    expect(runs).toBe(0)
+    expect(logs.some((line) => line.includes('runner paused'))).toBe(true)
+  })
+
+  it('shouldAllowTicksAgainAfterResume', async () => {
+    let runs = 0
+    const runner = createAutomationTickRunner({
+      runTick: async () => {
+        runs += 1
+      },
+    })
+
+    runner.pause()
+    runner.resume()
+    runner.trigger()
+    await settle()
+
+    expect(runs).toBe(1)
+  })
+
   it('shouldSkipTriggerWhileTickIsStillRunning', async () => {
     const gate = deferred()
     let runs = 0

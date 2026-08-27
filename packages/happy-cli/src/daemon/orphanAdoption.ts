@@ -53,6 +53,60 @@ export function resolveTrackedPidOwner(tracked: { happySessionId?: string } | un
   return tracked.happySessionId ?? PENDING_SPAWN_OWNER;
 }
 
+export type RecoveredPendingPromotionResult =
+  | { promoted: true; session: TrackedSession }
+  | {
+    promoted: false;
+    reason:
+      | 'not-recovered-pending'
+      | 'pid-mismatch'
+      | 'pid-dead'
+      | 'not-pending'
+      | 'not-daemon-spawn';
+  };
+
+/**
+ * Upgrade a daemon-spawned placeholder recovered from the previous daemon.
+ *
+ * A fresh spawn in this process must keep waiting for its session-started
+ * webhook: promoting it from a racing runtime report would bypass the webhook
+ * awaiter and recreate the 2026-08-15 timeout. A recovered placeholder has no
+ * awaiter in this process, so the live process's self-reported PID is the only
+ * remaining authoritative bridge to its real Happy session id.
+ */
+export function resolveRecoveredPendingPromotion(input: {
+  sessionId: string;
+  hostPid: number;
+  tracked: TrackedSession | undefined;
+  resumable?: TrackedSession;
+  recoveredPending: boolean;
+  isPidAlive: (pid: number) => boolean;
+}): RecoveredPendingPromotionResult {
+  if (!input.recoveredPending) {
+    return { promoted: false, reason: 'not-recovered-pending' };
+  }
+  if (!input.tracked || input.tracked.pid !== input.hostPid) {
+    return { promoted: false, reason: 'pid-mismatch' };
+  }
+  if (!input.isPidAlive(input.hostPid)) {
+    return { promoted: false, reason: 'pid-dead' };
+  }
+  if (input.tracked.happySessionId !== undefined) {
+    return { promoted: false, reason: 'not-pending' };
+  }
+  if (input.tracked.startedBy !== 'daemon') {
+    return { promoted: false, reason: 'not-daemon-spawn' };
+  }
+  return {
+    promoted: true,
+    session: {
+      ...input.resumable,
+      ...input.tracked,
+      happySessionId: input.sessionId,
+    },
+  };
+}
+
 /**
  * Decide whether a runtime report from an untracked session should be adopted.
  */

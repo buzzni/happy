@@ -3,6 +3,7 @@ import {
   resolveOrphanAdoption,
   collectStartupOrphans,
   resolveTrackedPidOwner,
+  resolveRecoveredPendingPromotion,
   EXTERNAL_SESSION_STARTED_BY,
   PENDING_SPAWN_OWNER,
 } from './orphanAdoption'
@@ -318,6 +319,99 @@ describe('resolveTrackedPidOwner', () => {
     })
 
     expect(result).toEqual({ adopted: false, reason: 'pid-conflict' })
+  })
+})
+
+describe('resolveRecoveredPendingPromotion', () => {
+  const pending = {
+    startedBy: 'daemon' as const,
+    pid: 4242,
+    tmuxSessionId: 'automation:1',
+    userHomeDir: '/tmp/happy-session-4242',
+  }
+
+  it('promotes a recovered daemon spawn when the live reporter owns the same pid', () => {
+    const encryption = {
+      encryptionKey: new Uint8Array(32).fill(7),
+      encryptionVariant: 'dataKey' as const,
+      seq: 9,
+      metadataVersion: 2,
+      agentStateVersion: 3,
+    }
+    const result = resolveRecoveredPendingPromotion({
+      sessionId: 'sess-recovered',
+      hostPid: 4242,
+      tracked: pending,
+      resumable: {
+        startedBy: 'persisted',
+        pid: 0,
+        happySessionId: 'sess-recovered',
+        encryption,
+        persistedLastProcessedSeq: 41,
+      },
+      recoveredPending: true,
+      isPidAlive: () => true,
+    })
+
+    expect(result).toEqual({
+      promoted: true,
+      session: {
+        ...pending,
+        happySessionId: 'sess-recovered',
+        encryption,
+        persistedLastProcessedSeq: 41,
+      },
+    })
+  })
+
+  it('does not promote a same-daemon pending spawn that still has a webhook awaiter', () => {
+    expect(resolveRecoveredPendingPromotion({
+      sessionId: 'sess-racing-report',
+      hostPid: 4242,
+      tracked: pending,
+      recoveredPending: false,
+      isPidAlive: () => true,
+    })).toEqual({ promoted: false, reason: 'not-recovered-pending' })
+  })
+
+  it('does not promote a report for a different pid', () => {
+    expect(resolveRecoveredPendingPromotion({
+      sessionId: 'sess-other-pid',
+      hostPid: 9999,
+      tracked: pending,
+      recoveredPending: true,
+      isPidAlive: () => true,
+    })).toEqual({ promoted: false, reason: 'pid-mismatch' })
+  })
+
+  it('does not promote a dead recovered process', () => {
+    expect(resolveRecoveredPendingPromotion({
+      sessionId: 'sess-dead',
+      hostPid: 4242,
+      tracked: pending,
+      recoveredPending: true,
+      isPidAlive: () => false,
+    })).toEqual({ promoted: false, reason: 'pid-dead' })
+  })
+
+  it('does not overwrite a recovered session that already has an id', () => {
+    expect(resolveRecoveredPendingPromotion({
+      sessionId: 'sess-other',
+      hostPid: 4242,
+      tracked: { ...pending, happySessionId: 'sess-existing' },
+      recoveredPending: true,
+      isPidAlive: () => true,
+    })).toEqual({ promoted: false, reason: 'not-pending' })
+  })
+
+  it('does not promote an externally-started session', () => {
+    expect(resolveRecoveredPendingPromotion({
+      sessionId: 'sess-other',
+      hostPid: 4242,
+      tracked: { ...pending, startedBy: EXTERNAL_SESSION_STARTED_BY },
+      recoveredPending: true,
+      isPidAlive: () => true,
+    })).toEqual({ promoted: false, reason: 'not-daemon-spawn' })
   })
 })
 
