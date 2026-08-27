@@ -39,19 +39,20 @@ export class BrowserSessionBroker {
     }
 
     async ensure(viewerKey: string, bridgeToken: string): Promise<BrowserSessionBrokerLease> {
-        const current = this.leases.get(viewerKey)
-        if (current) {
-            const runtime = await this.options.runtime.lookup(viewerKey)
-            if (runtime) {
-                const touched = { ...current, ...runtime, lastUsedAt: this.now() }
-                this.leases.set(viewerKey, touched)
-                return touched
-            }
-            this.leases.delete(viewerKey)
-        }
         const inFlight = this.starting.get(viewerKey)
         if (inFlight) return inFlight
-        if (this.leases.size + this.starting.size >= this.options.maxActive) {
+        const current = this.leases.get(viewerKey)
+        if (current) {
+            const refresh = this.refresh(current, bridgeToken)
+            this.starting.set(viewerKey, refresh)
+            try {
+                return await refresh
+            } finally {
+                if (this.starting.get(viewerKey) === refresh) this.starting.delete(viewerKey)
+            }
+        }
+        const reservedViewers = new Set([...this.leases.keys(), ...this.starting.keys()])
+        if (reservedViewers.size >= this.options.maxActive) {
             this.capacityRejections += 1
             await this.audit('capacity-rejected', viewerKey, false)
             throw new Error('viewer-capacity-exhausted')
@@ -210,6 +211,26 @@ export class BrowserSessionBroker {
             return lease
         } catch (error) {
             await this.audit('ensure', viewerKey, false)
+            throw error
+        }
+    }
+
+    private async refresh(
+        current: BrowserSessionBrokerLease,
+        bridgeToken: string,
+    ): Promise<BrowserSessionBrokerLease> {
+        try {
+            const runtime = await this.options.runtime.ensure(current.viewerKey, bridgeToken)
+            const touched = {
+                ...current,
+                webPort: runtime.webPort,
+                profileVolume: runtime.profileVolume,
+                lastUsedAt: this.now(),
+            }
+            this.leases.set(current.viewerKey, touched)
+            return touched
+        } catch (error) {
+            this.leases.delete(current.viewerKey)
             throw error
         }
     }

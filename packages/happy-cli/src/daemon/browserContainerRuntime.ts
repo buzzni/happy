@@ -87,8 +87,9 @@ export class BrowserContainerRuntime {
         if (state.exists && !running) {
             await this.removeContainer(viewerKey)
         } else if (running) {
-            const health = await this.health(name)
-            if (health === 'unhealthy' || health === 'missing') {
+            const hasCurrentBridgeToken = await this.hasBridgeToken(name, bridgeToken)
+            const health = hasCurrentBridgeToken ? await this.health(name) : 'stale-bridge-token'
+            if (health === 'unhealthy' || health === 'missing' || health === 'stale-bridge-token') {
                 await this.removeContainer(viewerKey)
                 running = false
             }
@@ -176,6 +177,17 @@ export class BrowserContainerRuntime {
     private health(name: string): Promise<string> {
         return this.exec('docker', ['inspect', '--format', '{{.State.Health.Status}}', name])
             .then((value) => value.trim(), () => 'missing')
+    }
+
+    private async hasBridgeToken(name: string, expectedToken: string): Promise<boolean> {
+        try {
+            const output = await this.exec('docker', ['inspect', '--format', '{{json .Config.Env}}', name])
+            const environment = JSON.parse(output) as unknown
+            return Array.isArray(environment)
+                && environment.includes(`HAPPY_BROWSER_BRIDGE_TOKEN=${expectedToken}`)
+        } catch {
+            return false
+        }
     }
 
     private async ensureNetwork(viewerKey: string): Promise<void> {

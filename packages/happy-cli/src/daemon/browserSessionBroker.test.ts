@@ -37,6 +37,16 @@ describe('BrowserSessionBroker', () => {
         expect(docker.stop).not.toHaveBeenCalled()
     })
 
+    it('reapplies the latest scoped bridge token to a cached viewer runtime', async () => {
+        const docker = runtime()
+        const broker = new BrowserSessionBroker({ runtime: docker, maxActive: 1 })
+
+        await broker.ensure(A, 'previous-scoped-token')
+        await broker.ensure(A, 'current-scoped-token')
+
+        expect(docker.ensure).toHaveBeenNthCalledWith(2, A, 'current-scoped-token')
+    })
+
     it('stops only idle runtimes and preserves profile volumes', async () => {
         let now = 1_000
         const docker = runtime()

@@ -29,6 +29,9 @@ describe('browser container runtime', () => {
         const exec = vi.fn(async (_command: string, args: string[]) => {
             if (args[0] === 'inspect' && args.some((arg) => arg.includes('.State.Running'))) return 'true\n'
             if (args[0] === 'inspect' && args.some((arg) => arg.includes('.State.Health.Status'))) return 'healthy\n'
+            if (args[0] === 'inspect' && args.some((arg) => arg.includes('.Config.Env'))) {
+                return '["HAPPY_BROWSER_BRIDGE_TOKEN=scoped-token-value"]\n'
+            }
             if (args[0] === 'port') return '127.0.0.1:49123\n'
             return ''
         })
@@ -39,6 +42,27 @@ describe('browser container runtime', () => {
         expect(exec.mock.calls.some(([, args]) => args[0] === 'run')).toBe(false)
     })
 
+    it('recreates a healthy container when its scoped bridge token changed', async () => {
+        const exec = vi.fn(async (_command: string, args: string[]) => {
+            if (args[0] === 'inspect' && args.some((arg) => arg.includes('.State.Running'))) return 'true\n'
+            if (args[0] === 'inspect' && args.some((arg) => arg.includes('.State.Health.Status'))) return 'healthy\n'
+            if (args[0] === 'inspect' && args.some((arg) => arg.includes('.Config.Env'))) {
+                return '["HAPPY_BROWSER_BRIDGE_TOKEN=previous-scoped-token"]\n'
+            }
+            if (args[0] === 'network' && args[1] === 'inspect') throw new Error('missing network')
+            if (args[0] === 'port') return '127.0.0.1:49123\n'
+            return ''
+        })
+        const runtime = new BrowserContainerRuntime({ image: IMAGE, exec })
+
+        await runtime.ensure(VIEWER_KEY, 'current-scoped-token')
+
+        expect(exec.mock.calls.some(([, args]) => args[0] === 'rm' && args.includes('--force'))).toBe(true)
+        expect(exec.mock.calls.some(([, args]) => (
+            args[0] === 'run' && args.includes('HAPPY_BROWSER_BRIDGE_TOKEN=current-scoped-token')
+        ))).toBe(true)
+    })
+
     it('waits for a running container whose healthcheck is still starting', async () => {
         let healthChecks = 0
         const exec = vi.fn(async (_command: string, args: string[]) => {
@@ -46,6 +70,9 @@ describe('browser container runtime', () => {
             if (args[0] === 'inspect' && args.some((arg) => arg.includes('.State.Health.Status'))) {
                 healthChecks += 1
                 return healthChecks < 2 ? 'starting\n' : 'healthy\n'
+            }
+            if (args[0] === 'inspect' && args.some((arg) => arg.includes('.Config.Env'))) {
+                return '["HAPPY_BROWSER_BRIDGE_TOKEN=scoped-token-value"]\n'
             }
             if (args[0] === 'port') return '127.0.0.1:49123\n'
             return ''
