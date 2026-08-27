@@ -83,6 +83,34 @@ describe('BrowserSessionBroker', () => {
         expect(await readFile(join(stateDir, 'audit.jsonl'), 'utf8')).toContain('migrate-legacy')
     })
 
+    it('shares one legacy profile copy across concurrent migration requests', async () => {
+        const stateDir = await mkdtemp(join(tmpdir(), 'happy-browser-broker-'))
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => { release = resolve })
+        let firstCopyStarted!: () => void
+        const copyStarted = new Promise<void>((resolve) => { firstCopyStarted = resolve })
+        const docker = runtime()
+        docker.migrateLegacyProfile.mockImplementation(async () => {
+            firstCopyStarted()
+            await gate
+        })
+        const broker = new BrowserSessionBroker({
+            runtime: docker,
+            maxActive: 2,
+            stateDir,
+            legacyProfileDir: '/root/.happy/chrome-profiles/default',
+        })
+
+        const first = broker.migrateLegacy(A)
+        await copyStarted
+        const concurrent = broker.migrateLegacy(A)
+        await new Promise((resolve) => setTimeout(resolve, 10))
+
+        expect(docker.migrateLegacyProfile).toHaveBeenCalledTimes(1)
+        release()
+        await expect(Promise.all([first, concurrent])).resolves.toEqual([true, true])
+    })
+
     it('stops a runtime that exceeds its persistent profile quota without deleting the volume', async () => {
         const docker = runtime()
         docker.profileBytes.mockImplementation(async (viewerKey: string) => viewerKey === A ? 101 : 10)

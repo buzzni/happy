@@ -14,6 +14,7 @@ type Runtime = {
 export class BrowserSessionBroker {
     private readonly leases = new Map<string, BrowserSessionBrokerLease>()
     private readonly starting = new Map<string, Promise<BrowserSessionBrokerLease>>()
+    private readonly migrations = new Map<string, Promise<boolean>>()
     private readonly now: () => number
     private readonly idleTtlMs: number
     private readonly stateDir: string | null
@@ -144,7 +145,19 @@ export class BrowserSessionBroker {
         }
     }
 
-    async migrateLegacy(viewerKey: string): Promise<boolean> {
+    migrateLegacy(viewerKey: string): Promise<boolean> {
+        const current = this.migrations.get(viewerKey)
+        if (current) return current
+        const migration = this.migrateLegacyOnce(viewerKey)
+        this.migrations.set(viewerKey, migration)
+        const clear = () => {
+            if (this.migrations.get(viewerKey) === migration) this.migrations.delete(viewerKey)
+        }
+        migration.then(clear, clear)
+        return migration
+    }
+
+    private async migrateLegacyOnce(viewerKey: string): Promise<boolean> {
         if (!this.stateDir || !this.options.legacyProfileDir) throw new Error('legacy-migration-not-configured')
         await mkdir(join(this.stateDir, 'migrations'), { recursive: true, mode: 0o700 })
         const marker = join(this.stateDir, 'migrations', `${viewerKey}.done`)
