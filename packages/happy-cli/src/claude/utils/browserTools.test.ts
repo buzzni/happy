@@ -338,13 +338,15 @@ describe('runBrowserTool', () => {
                     before: { x: 0, y: 800 },
                     after: { x: 0, y: 800 },
                     max: { x: 0, y: 800 },
-                    atBoundary: { top: false, bottom: true, left: true, right: true },
+                    atBoundary: { top: false, bottom: true, left: false, right: false },
                 }),
                 method: 'scroll',
                 params: { ref: '@e3', deltaY: 300 },
             })
-            expect(textOf(result)).toMatch(/did not move/i)
-            expect(textOf(result)).toMatch(/bottom/i)
+            const text = textOf(result)
+            expect(text).toMatch(/did not move/i)
+            expect(text).toMatch(/bottom/i)
+            expect(text).not.toMatch(/left|right/i)
         })
 
         it('confirms navigation with the destination url', async () => {

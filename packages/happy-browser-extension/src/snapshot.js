@@ -32,12 +32,37 @@ export function collectSnapshot() {
 
     const clean = (text) => (text || '').replace(/\s+/g, ' ').trim().slice(0, MAX_NAME_LENGTH)
 
+    const parentAcrossShadow = (element) => {
+        if (element.parentElement) return element.parentElement
+        const root = typeof element.getRootNode === 'function' ? element.getRootNode() : null
+        return root && root.host ? root.host : null
+    }
+
+    const styles = new Map()
+    const styleOf = (element) => {
+        if (!styles.has(element)) {
+            styles.set(element, element.ownerDocument.defaultView.getComputedStyle(element))
+        }
+        return styles.get(element)
+    }
+
+    const hiddenTrees = new Map()
+    const isInHiddenTree = (element) => {
+        if (hiddenTrees.has(element)) return hiddenTrees.get(element)
+        const parent = parentAcrossShadow(element)
+        const hidden = element.hasAttribute('hidden')
+            || element.hasAttribute('inert')
+            || element.getAttribute('aria-hidden') === 'true'
+            || styleOf(element).display === 'none'
+            || (parent ? isInHiddenTree(parent) : false)
+        hiddenTrees.set(element, hidden)
+        return hidden
+    }
+
     const isVisible = (element) => {
-        if (element.hasAttribute('hidden')) return false
-        if (element.getAttribute('aria-hidden') === 'true') return false
-        const style = element.ownerDocument.defaultView.getComputedStyle(element)
-        if (style.display === 'none' || style.visibility === 'hidden') return false
-        return true
+        if (isInHiddenTree(element)) return false
+        const visibility = styleOf(element).visibility
+        return visibility !== 'hidden' && visibility !== 'collapse'
     }
 
     const roleOf = (element) => {
@@ -102,7 +127,7 @@ export function collectSnapshot() {
     }
 
     const scrollableMetrics = (element) => {
-        const style = element.ownerDocument.defaultView.getComputedStyle(element)
+        const style = styleOf(element)
         const overflowX = style.overflowX || style.overflow
         const overflowY = style.overflowY || style.overflow
         const permitsScroll = (overflow) => overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay'

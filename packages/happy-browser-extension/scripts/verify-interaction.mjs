@@ -110,6 +110,7 @@ async function runVerification() {
     const snap1 = await snapshotUntilReady(tab.id)
     check('found the name input', snap1.elements.some((e) => e.role === 'textbox' && e.name === 'Your name'), JSON.stringify(snap1.elements))
     check('found the submit button', snap1.elements.some((e) => e.role === 'button' && e.name === 'Submit'), JSON.stringify(snap1.elements))
+    check('hidden ancestor subtrees stay out of the snapshot', !snap1.elements.some((e) => e.name.endsWith('fixture action')), JSON.stringify(snap1.elements))
     const inputRef = snap1.elements.find((e) => e.name === 'Your name').ref
     const buttonRef = snap1.elements.find((e) => e.name === 'Submit').ref
     const editableRef = snap1.elements.find((e) => e.role === 'textbox' && e.tag === 'div')?.ref

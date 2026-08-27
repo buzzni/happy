@@ -77,6 +77,18 @@ describe('collectSnapshot', () => {
         expect(collectSnapshot().elements.map((e) => e.name)).toEqual(['Shown'])
     })
 
+    it('skips interactive descendants of hidden ancestors', () => {
+        render(`
+            <div hidden><button>Hidden attribute descendant</button></div>
+            <div aria-hidden="true"><button>Aria hidden descendant</button></div>
+            <div inert><button>Inert descendant</button></div>
+            <div style="display:none"><button>Display none descendant</button></div>
+            <button>Shown</button>
+        `)
+
+        expect(collectSnapshot().elements.map((e) => e.name)).toEqual(['Shown'])
+    })
+
     it('picks up elements made interactive by role or contenteditable', () => {
         render(`
             <div role="button">역할 버튼</div>
@@ -208,6 +220,13 @@ describe('collectSnapshot', () => {
             const root = attachShadow('host', '<button>In shadow</button>')
             const { elements } = collectSnapshot()
             expect(window.__happyRefs.get(elements[0].ref)).toBe(root.querySelector('button'))
+        })
+
+        it('honours hidden state on a shadow host', () => {
+            render('<div id="host" aria-hidden="true"></div><button>Shown</button>')
+            attachShadow('host', '<button>Hidden in shadow</button>')
+
+            expect(collectSnapshot().elements.map((e) => e.name)).toEqual(['Shown'])
         })
 
         it('cannot see into a closed shadow root, and that is a browser limit not a bug', () => {
