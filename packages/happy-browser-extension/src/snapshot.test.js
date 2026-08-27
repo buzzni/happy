@@ -98,6 +98,33 @@ describe('collectSnapshot', () => {
         expect(collectSnapshot().elements.map((e) => e.role)).toEqual(['button', 'textbox'])
     })
 
+    it('exposes a closed details summary but not its collapsed controls', () => {
+        render(`
+            <details>
+                <summary>More filters</summary>
+                <button>Collapsed filter</button>
+            </details>
+        `)
+
+        expect(collectSnapshot().elements).toMatchObject([
+            { role: 'button', name: 'More filters' },
+        ])
+    })
+
+    it('exposes controls inside an open details element', () => {
+        render(`
+            <details open>
+                <summary>More filters</summary>
+                <button>Visible filter</button>
+            </details>
+        `)
+
+        expect(collectSnapshot().elements.map((element) => element.name)).toEqual([
+            'More filters',
+            'Visible filter',
+        ])
+    })
+
     it('returns the page url and title alongside the elements', () => {
         document.title = 'Test page'
         render('<button>Save</button>')
@@ -177,9 +204,50 @@ describe('collectSnapshot', () => {
         expect(snapshot.elements.some((element) => element.name.startsWith('clipped-'))).toBe(false)
     })
 
+    it('keeps a viewport-fixed control visible when its DOM parent clips overflow', () => {
+        render(`
+            ${Array.from({ length: 200 }, (_, i) => `<button>earlier-${i}</button>`).join('')}
+            <div id="clipping-parent" style="overflow-x:hidden;overflow-y:hidden">
+                <button id="fixed-action" style="position:fixed">Fixed action</button>
+            </div>
+        `)
+        document.getElementById('clipping-parent').getBoundingClientRect = () => ({ top: 0, left: 0, bottom: 1, right: 1, width: 1, height: 1 })
+        document.getElementById('fixed-action').getBoundingClientRect = () => ({ top: 300, left: 20, bottom: 340, right: 180, width: 160, height: 40 })
+
+        expect(collectSnapshot().elements.some((element) => element.name === 'Fixed action')).toBe(true)
+    })
+
+    it('does not treat a slotted control clipped by its shadow container as viewport-visible', () => {
+        render(`
+            ${Array.from({ length: 200 }, (_, i) => `<button>earlier-${i}</button>`).join('')}
+            <div id="host"><button id="slotted-action" slot="items">Slotted clipped action</button></div>
+        `)
+        const shadow = document.getElementById('host').attachShadow({ mode: 'open' })
+        shadow.innerHTML = '<div id="clip" style="overflow-x:hidden;overflow-y:hidden"><slot name="items"></slot></div>'
+        shadow.getElementById('clip').getBoundingClientRect = () => ({ top: 0, left: 0, bottom: 100, right: 300, width: 300, height: 100 })
+        document.getElementById('slotted-action').getBoundingClientRect = () => ({ top: 200, left: 10, bottom: 240, right: 160, width: 150, height: 40 })
+
+        expect(collectSnapshot().elements.some((element) => element.name === 'Slotted clipped action')).toBe(false)
+    })
+
     it('does not flag truncation for a normal page', () => {
         render('<button>Save</button>')
         expect(collectSnapshot().truncated).toBe(false)
+    })
+
+    it('does not measure viewport geometry for ordinary non-interactive elements', () => {
+        render(Array.from({ length: 500 }, () => '<div>plain content</div>').join(''))
+        let measurements = 0
+        for (const element of document.querySelectorAll('*')) {
+            element.getBoundingClientRect = () => {
+                measurements += 1
+                return { top: 0, left: 0, bottom: 10, right: 10, width: 10, height: 10 }
+            }
+        }
+
+        collectSnapshot()
+
+        expect(measurements).toBe(0)
     })
 
     it('appends visible scrollable regions without renumbering interactive refs', () => {

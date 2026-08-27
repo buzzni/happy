@@ -111,8 +111,11 @@ async function runVerification() {
     check('found the name input', snap1.elements.some((e) => e.role === 'textbox' && e.name === 'Your name'), JSON.stringify(snap1.elements))
     check('found the submit button', snap1.elements.some((e) => e.role === 'button' && e.name === 'Submit'), JSON.stringify(snap1.elements))
     check('hidden ancestor subtrees stay out of the snapshot', !snap1.elements.some((e) => e.name.endsWith('fixture action')), JSON.stringify(snap1.elements))
+    check('closed details exposes its summary', snap1.elements.some((e) => e.role === 'button' && e.name === 'Collapsed details summary'), JSON.stringify(snap1.elements))
+    check('closed details keeps collapsed controls out', !snap1.elements.some((e) => e.name === 'Collapsed details action'), JSON.stringify(snap1.elements))
     check('clipped controls stay out of the viewport tail', !snap1.elements.some((e) => e.role === 'button' && e.name.startsWith('Clipped fixture action')), JSON.stringify(snap1.elements))
     check('a visible control after clipped controls stays actionable', snap1.elements.some((e) => e.name === 'Visible after clipped controls'), JSON.stringify(snap1.elements))
+    check('a fixed control escapes a non-containing overflow ancestor', snap1.elements.some((e) => e.name === 'Fixed escape action'), JSON.stringify(snap1.elements))
     const inputRef = snap1.elements.find((e) => e.name === 'Your name').ref
     const buttonRef = snap1.elements.find((e) => e.name === 'Submit').ref
     const editableRef = snap1.elements.find((e) => e.role === 'textbox' && e.tag === 'div')?.ref
@@ -156,7 +159,14 @@ async function runVerification() {
     const hiddenOverflowScroll = await call('scroll', { tabId: tab.id, ref: hiddenOverflowRegion.ref, deltaY: 400 })
     check('overflow-hidden region moves immediately despite smooth CSS', hiddenOverflowScroll.moved && hiddenOverflowScroll.after.y > hiddenOverflowScroll.before.y, JSON.stringify(hiddenOverflowScroll))
 
-    console.log('9. scroll the document to a lazy-loading item')
+    console.log('9. scroll a shadow container through its slotted control')
+    const slottedBefore = await call('snapshot', { tabId: tab.id })
+    const slottedItem = slottedBefore.elements.find((element) => element.name === 'Slotted first item')
+    check('snapshot exposes the slotted control', !!slottedItem, JSON.stringify(slottedBefore.elements))
+    const slottedScroll = await call('scroll', { tabId: tab.id, ref: slottedItem.ref, deltaY: 300 })
+    check('assigned-slot traversal reaches the shadow scroller', slottedScroll.moved && slottedScroll.after.y > slottedScroll.before.y, JSON.stringify(slottedScroll))
+
+    console.log('10. scroll the document to a lazy-loading item')
     const documentBefore = await call('snapshot', { tabId: tab.id })
     check('long page snapshot is truncated', documentBefore.truncated === true, JSON.stringify(documentBefore))
     check('document lazy item starts absent', !documentBefore.elements.some((element) => element.name === 'Document lazy item'), JSON.stringify(documentBefore.elements))
@@ -166,11 +176,11 @@ async function runVerification() {
     const documentLazyRef = documentAfter.elements.find((element) => element.name === 'Document lazy item').ref
     check('document lazy item is actionable beyond the first 200 refs', Number(documentLazyRef.slice(2)) > 200, documentLazyRef)
 
-    console.log('10. screenshot')
+    console.log('11. screenshot')
     const shot = await call('screenshot', { tabId: tab.id })
     check('screenshot has png data', shot.mimeType === 'image/png' && shot.dataB64.length > 100, `len=${shot.dataB64?.length}`)
 
-    console.log('11. REF_NOT_FOUND on an unknown ref')
+    console.log('12. REF_NOT_FOUND on an unknown ref')
     let staleRejected = false
     let staleOutcome
     try {
@@ -182,6 +192,6 @@ async function runVerification() {
     }
     check('unknown ref is rejected with guidance', staleRejected, `expected a REF_NOT_FOUND-style error, got: ${JSON.stringify(staleOutcome)}`)
 
-    console.log('12. tabs_close')
+    console.log('13. tabs_close')
     await call('tabs_close', { tabId: tab.id })
 }
