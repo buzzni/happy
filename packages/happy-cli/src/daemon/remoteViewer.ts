@@ -11,6 +11,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { join } from 'node:path'
 
 /** Binaries the remote screen needs, in the order a user should install them. */
 export const VIEWER_TOOLS = ['Xvfb', 'x11vnc', 'websockify'] as const
@@ -110,10 +111,33 @@ export function planViewerInstall({ missing, canSudo, platform = process.platfor
  * only one of them would never be adopted, and a duplicate stack would be
  * spawned next to the one already serving it.
  */
-export const VIEWER_WEB_PORTS = [6080, 6081, 6082] as const
+export const VIEWER_SLOTS = [
+    { slot: 0, display: ':99', vncPort: 5900, webPort: 6080 },
+    { slot: 1, display: ':100', vncPort: 5901, webPort: 6081 },
+    { slot: 2, display: ':101', vncPort: 5902, webPort: 6082 },
+] as const
+
+export type ViewerSlot = (typeof VIEWER_SLOTS)[number]
+
+export const VIEWER_WEB_PORTS = VIEWER_SLOTS.map(({ webPort }) => webPort)
 
 /** VNC ports paired with VIEWER_WEB_PORTS, same ordering. */
-export const VIEWER_VNC_PORTS = [5900, 5901, 5902] as const
+export const VIEWER_VNC_PORTS = VIEWER_SLOTS.map(({ vncPort }) => vncPort)
+
+const VIEWER_KEY_RE = /^bv1_[A-Za-z0-9_-]{32}$/
+
+export function validateViewerKey(viewerKey: string): boolean {
+    return VIEWER_KEY_RE.test(viewerKey)
+}
+
+export function selectViewerSlot(occupiedSlots: ReadonlySet<number>): ViewerSlot | null {
+    return VIEWER_SLOTS.find(({ slot }) => !occupiedSlots.has(slot)) ?? null
+}
+
+export function resolveViewerProfileDir(happyHomeDir: string, viewerKey: string): string {
+    if (!validateViewerKey(viewerKey)) throw new Error('invalid viewerKey')
+    return join(happyHomeDir, 'browser-viewers', viewerKey, 'chrome-profile')
+}
 
 export type ViewerStackDecision =
     | { action: 'reuse'; webPort: number }
@@ -223,6 +247,27 @@ export function readFlagFromCmdline(cmdline: string, flag: string): string | nul
         return arg.slice(prefix.length) || null
     }
     return null
+}
+
+export function viewerProcessMatchesLease(
+    kind: 'xvfb' | 'x11vnc' | 'websockify',
+    cmdline: string,
+    lease: { display: string; vncPort: number; webPort: number },
+): boolean {
+    const nulSeparated = cmdline.split('\0').filter(Boolean)
+    const args = nulSeparated.length === 1
+        ? nulSeparated[0].trim().split(/\s+/)
+        : nulSeparated
+    const hasExecutable = args.some((arg) => arg.split('/').pop()?.toLowerCase() === kind)
+    if (!hasExecutable) return false
+    if (kind === 'xvfb') return args.includes(lease.display)
+    if (kind === 'x11vnc') {
+        const displayAt = args.indexOf('-display')
+        const portAt = args.indexOf('-rfbport')
+        return args[displayAt + 1] === lease.display && args[portAt + 1] === String(lease.vncPort)
+    }
+    return args.includes(`127.0.0.1:${lease.webPort}`)
+        && args.includes(`127.0.0.1:${lease.vncPort}`)
 }
 
 function which(binary: string): Promise<string | null> {

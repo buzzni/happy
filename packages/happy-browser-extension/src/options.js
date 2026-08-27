@@ -18,7 +18,7 @@ tokenInput.value = stored.token || ''
 profileInput.value = stored.profile || 'default'
 allowlistInput.value = stored.allowlist || ''
 
-async function save({ debuggerTier, pairingId } = {}) {
+async function save({ debuggerTier, pairingId, viewerKey } = {}) {
     const token = tokenInput.value.trim()
     if (!token) {
         status.textContent = '토큰을 입력해 주세요.'
@@ -34,6 +34,8 @@ async function save({ debuggerTier, pairingId } = {}) {
         // This identifies one automated pairing attempt, not the user's
         // profile. A manual/ordinary save clears a marker left by that run.
         pairingId: pairingId || '',
+        // Manual saves return to the legacy/manual bridge boundary.
+        viewerKey: viewerKey || '',
         allowlist,
         // Only when the caller was explicit — see parseAutoConnectParams.
         ...(debuggerTier === undefined ? {} : { debuggerTier }),
@@ -70,7 +72,11 @@ if (autoConnect) {
     // Scrub the token from the visible URL / this navigation's history entry
     // right away — nothing downstream needs it to stay there.
     history.replaceState(null, '', location.pathname)
-    await save({ debuggerTier: autoConnect.debuggerTier, pairingId: autoConnect.pairingId })
+    await save({
+        debuggerTier: autoConnect.debuggerTier,
+        pairingId: autoConnect.pairingId,
+        viewerKey: autoConnect.viewerKey,
+    })
     status.textContent = `링크로 자동 연결되었습니다. ${status.textContent}`
     if (autoConnect.debuggerTier !== undefined) {
         status.textContent += autoConnect.debuggerTier

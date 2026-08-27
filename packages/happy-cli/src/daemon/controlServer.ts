@@ -572,18 +572,25 @@ export function startDaemonControlServer({
     if (browserBridge) {
       typed.get('/browser/status', {
         schema: {
+          querystring: z.object({
+            viewerKey: z.string().regex(/^bv1_[A-Za-z0-9_-]{32}$/).optional()
+          }),
           response: {
             200: z.object({
               connections: z.array(z.object({
                 profile: z.string(),
                 pairingId: z.string().optional(),
+                viewerKey: z.string().optional(),
               })),
               hasRecentAuthFailure: z.boolean()
             })
           }
         }
-      }, async () => {
-        return { connections: browserBridge.connections(), hasRecentAuthFailure: browserBridge.hasRecentAuthFailure() };
+      }, async (request) => {
+        return {
+          connections: browserBridge.connections(request.query.viewerKey),
+          hasRecentAuthFailure: browserBridge.hasRecentAuthFailure(request.query.viewerKey)
+        };
       });
 
       typed.post('/browser/request', {
@@ -592,7 +599,8 @@ export function startDaemonControlServer({
             method: z.string().min(1),
             params: z.unknown().optional(),
             timeoutMs: z.number().int().positive().optional(),
-            profile: z.string().optional()
+            profile: z.string().optional(),
+            viewerKey: z.string().regex(/^bv1_[A-Za-z0-9_-]{32}$/).optional()
           }),
           response: {
             200: z.object({
@@ -613,11 +621,12 @@ export function startDaemonControlServer({
           }
         }
       }, async (request, reply) => {
-        const { method, params, timeoutMs, profile } = request.body;
+        const { method, params, timeoutMs, profile, viewerKey } = request.body;
         try {
           const result = await browserBridge.request(method, params ?? {}, {
             ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-            ...(profile !== undefined ? { profile } : {})
+            ...(profile !== undefined ? { profile } : {}),
+            ...(viewerKey !== undefined ? { viewerKey } : {})
           });
           logger.debug(`[CONTROL SERVER] browser/request ${method} -> ok`);
           return { result };

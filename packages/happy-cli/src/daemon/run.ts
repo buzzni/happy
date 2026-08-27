@@ -39,6 +39,7 @@ import { decideResumeCredentials, readStagedTokenFromHomeDir, tokensShareIdentit
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { preflightDaemonControlServer, startDaemonControlServer } from './controlServer';
 import { BrowserBridge } from './browserBridge';
+import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
@@ -1885,8 +1886,20 @@ export async function startDaemon(): Promise<void> {
     // fixed loopback port because the extension cannot read daemon.state.json
     // to discover an ephemeral one. A bind failure (port taken) must not take
     // the daemon down — browser control is simply unavailable until restart.
+    const browserSessionBroker = process.env.HAPPY_BROWSER_BROKER_SOCKET
+      ? new BrowserSessionBrokerClient(process.env.HAPPY_BROWSER_BROKER_SOCKET)
+      : null;
     const browserBridge = new BrowserBridge({
-      authToken: nativeMessaging.token
+      authToken: nativeMessaging.token,
+      ...(browserSessionBroker ? {
+        onViewerActivity: (viewerKey: string) => {
+          void browserSessionBroker.request({ op: 'touch', viewerKey }).then((response) => {
+            if (!response.ok) logger.debug(`[DAEMON RUN] Browser bridge activity touch failed: ${response.code}`);
+          }).catch((error) => {
+            logger.debug(`[DAEMON RUN] Browser bridge activity touch failed: ${error instanceof Error ? error.message : String(error)}`);
+          });
+        },
+      } : {}),
     });
     let stopBrowserBridge: () => Promise<void> = async () => {};
     try {

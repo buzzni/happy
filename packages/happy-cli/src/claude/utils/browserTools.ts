@@ -31,7 +31,11 @@ export interface BrowserToolResult {
     isError: boolean
 }
 
-export type BridgeRequest = (method: string, params: unknown, opts?: { profile?: string }) => Promise<unknown>
+export type BridgeRequest = (
+    method: string,
+    params: unknown,
+    opts?: { profile?: string; viewerKey?: string },
+) => Promise<unknown>
 
 const PAIRING_HINT =
     'No Chrome extension is connected to this machine\'s browser bridge. Ask the user to load the Happy Browser Bridge extension in Chrome and paste the token from ~/.happy/browser-bridge.token into its options page.'

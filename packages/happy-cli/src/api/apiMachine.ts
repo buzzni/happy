@@ -61,6 +61,7 @@ import {
     buildWebsockifyArgs,
     buildX11vncArgs,
     buildXvfbArgs,
+    VIEWER_SLOTS,
     VIEWER_VNC_PORTS,
     VIEWER_WEB_PORTS,
     decideViewerBrowserAction,
@@ -72,8 +73,19 @@ import {
     detectMissingViewerTools,
     isViewerServing,
     planViewerInstall,
+    resolveViewerProfileDir,
+    selectViewerSlot,
     spawnDetached,
+    validateViewerKey,
+    viewerProcessMatchesLease,
 } from '@/daemon/remoteViewer';
+import {
+    BrowserViewerLeaseRegistry,
+    type BrowserViewerLeaseRecord,
+} from '@/daemon/browserViewerLeaseRegistry';
+import { BrowserSessionBrokerClient } from '@/daemon/browserSessionBrokerContract';
+import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken';
+import { deriveBrowserViewerBridgeToken } from '@/daemon/browserBridge';
 import { readFile, readdir } from 'node:fs/promises';
 import {
     addDaemonTerminalSession,
@@ -110,6 +122,7 @@ import type { PendingAutomationReport } from '@/daemon/automations/serverAutomat
 import type { AiCredentialRuntime } from '@/daemon/aiCredentialRuntime';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const BROKER_ACTIVITY_TOUCH_INTERVAL_MS = 60_000;
 
 interface ServerToDaemonEvents {
     update: (data: Update) => void;
@@ -267,6 +280,17 @@ type ViewerStackStartResult = {
     reused: boolean;
 } & ViewerBrowserState;
 
+type IsolatedViewerStartResult = {
+    viewerKey: string;
+    slot: number;
+    display: string;
+    vncPort: number;
+    webPort: number;
+    profileDir: string;
+    ready: boolean;
+    reused: boolean;
+} & ViewerBrowserState;
+
 type MachineRpcHandlers = {
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
     resumeSession?: (sessionId: string, options?: {
@@ -360,6 +384,16 @@ export class ApiMachineClient {
         callerWillLaunchBrowser: boolean;
         promise: Promise<ViewerStackStartResult>;
     } | null = null;
+    private isolatedViewerLeases = new Map<string, BrowserViewerLeaseRecord>();
+    private isolatedViewerStarts = new Map<string, Promise<IsolatedViewerStartResult>>();
+    private isolatedViewerMutation: Promise<void> = Promise.resolve();
+    private isolatedViewerRegistry = new BrowserViewerLeaseRegistry(
+        join(configuration.happyHomeDir, 'browser-viewers', 'leases.json'),
+    );
+    private browserSessionBroker = process.env.HAPPY_BROWSER_BROKER_SOCKET
+        ? new BrowserSessionBrokerClient(process.env.HAPPY_BROWSER_BROKER_SOCKET)
+        : null;
+    private brokerRelayTouchedAt = new Map<number, number>();
     // Unsafe extension commands are accepted only from the fd 3/4 pipe that
     // launched Chrome. Keep that owner alive for as long as this daemon uses
     // the browser; a CDP port cannot recreate or replace the pipe later.
@@ -942,8 +976,63 @@ export class ApiMachineClient {
             };
         });
 
-        this.rpcHandlerManager.registerHandler('browser-viewer:start', async () => {
-            return this.startViewerStack();
+        this.rpcHandlerManager.registerHandler('browser-viewer:start', async (params: any) => {
+            const viewerKey = requireNonEmptyString(params?.viewerKey, 'viewerKey');
+            if (!validateViewerKey(viewerKey)) throw new Error('viewerKey is invalid');
+            if (this.browserSessionBroker) return this.startBrokerViewer(viewerKey);
+            return this.startIsolatedViewerStack(viewerKey);
+        });
+
+        this.rpcHandlerManager.registerHandler('browser-viewer:lookup', async (params: any) => {
+            const viewerKey = requireNonEmptyString(params?.viewerKey, 'viewerKey');
+            if (!validateViewerKey(viewerKey)) throw new Error('viewerKey is invalid');
+            if (this.browserSessionBroker) {
+                const response = await this.browserSessionBroker.request({ op: 'lookup', viewerKey });
+                if (!response.ok) throw new Error(response.code);
+                return response.lease;
+            }
+            const lease = this.isolatedViewerLeases.get(viewerKey)
+                ?? await this.isolatedViewerRegistry.get(viewerKey);
+            if (!lease) return null;
+            const ready = await isViewerServing(lease.webPort);
+            const touched = { ...lease, lastUsedAt: Date.now() };
+            if (ready) {
+                this.isolatedViewerLeases.set(viewerKey, touched);
+                await this.isolatedViewerRegistry.set(touched);
+            }
+            return { ...touched, ready };
+        });
+
+        this.rpcHandlerManager.registerHandler('browser-viewer:stop', async (params: any) => {
+            const viewerKey = requireNonEmptyString(params?.viewerKey, 'viewerKey');
+            if (!validateViewerKey(viewerKey)) throw new Error('viewerKey is invalid');
+            if (this.browserSessionBroker) {
+                const response = await this.browserSessionBroker.request({ op: 'stop', viewerKey });
+                if (!response.ok) throw new Error(response.code);
+                return { viewerKey, stopped: response.stopped === true };
+            }
+            return this.withIsolatedViewerMutation(async () => {
+                const lease = this.isolatedViewerLeases.get(viewerKey)
+                    ?? await this.isolatedViewerRegistry.get(viewerKey);
+                if (!lease) return { viewerKey, stopped: false };
+                await this.stopIsolatedViewerProcesses(lease);
+                if (lease.cdpPort !== null) {
+                    this.browserCdpPipes.get(lease.cdpPort)?.close();
+                    this.browserCdpPipes.delete(lease.cdpPort);
+                }
+                this.isolatedViewerLeases.delete(viewerKey);
+                await this.isolatedViewerRegistry.delete(viewerKey);
+                return { viewerKey, stopped: true };
+            });
+        });
+
+        this.rpcHandlerManager.registerHandler('browser-viewer:migrate-legacy', async (params: any) => {
+            const viewerKey = requireNonEmptyString(params?.viewerKey, 'viewerKey');
+            if (!validateViewerKey(viewerKey)) throw new Error('viewerKey is invalid');
+            if (!this.browserSessionBroker) throw new Error('browser-broker-required');
+            const response = await this.browserSessionBroker.request({ op: 'migrate-legacy', viewerKey });
+            if (!response.ok) throw new Error(response.code);
+            return { viewerKey, migrated: response.migrated === true };
         });
 
         // Register stop daemon handler
@@ -1199,6 +1288,195 @@ export class ApiMachineClient {
         return { display, vncPort, webPort, ready, reused: false, ...browser };
     }
 
+    private startIsolatedViewerStack(viewerKey: string): Promise<IsolatedViewerStartResult> {
+        const inFlight = this.isolatedViewerStarts.get(viewerKey);
+        if (inFlight) return inFlight;
+
+        const promise = this.withIsolatedViewerMutation(
+            () => this.startIsolatedViewerStackOnce(viewerKey),
+        );
+        this.isolatedViewerStarts.set(viewerKey, promise);
+        const clear = () => {
+            if (this.isolatedViewerStarts.get(viewerKey) === promise) {
+                this.isolatedViewerStarts.delete(viewerKey);
+            }
+        };
+        promise.then(clear, clear);
+        return promise;
+    }
+
+    private async startBrokerViewer(viewerKey: string): Promise<{
+        viewerKey: string
+        webPort: number
+        profileDir: string
+        ready: true
+        browserReady: true
+        bridgeReady: true
+        isolation: 'container'
+    }> {
+        if (!this.browserSessionBroker) throw new Error('browser broker is not configured');
+        const authToken = await readOrCreateBrowserBridgeToken(configuration.browserBridgeTokenFile, {
+            migrateFrom: configuration.legacyBrowserBridgeTokenFile,
+        });
+        const response = await this.browserSessionBroker.request({
+            op: 'ensure',
+            viewerKey,
+            bridgeToken: deriveBrowserViewerBridgeToken(authToken, viewerKey),
+        });
+        if (!response.ok) throw new Error(response.code);
+        if (!response.lease || response.lease.viewerKey !== viewerKey || !response.lease.ready) {
+            throw new Error('browser-broker-owner-mismatch');
+        }
+        return {
+            viewerKey,
+            webPort: response.lease.webPort,
+            profileDir: response.lease.profileVolume,
+            ready: true,
+            browserReady: true,
+            bridgeReady: true,
+            isolation: 'container',
+        };
+    }
+
+    private touchBrokerViewerPort(webPort: number): void {
+        if (!this.browserSessionBroker || !Number.isInteger(webPort)) return;
+        const now = Date.now();
+        const touchedAt = this.brokerRelayTouchedAt.get(webPort);
+        if (touchedAt !== undefined && now - touchedAt < BROKER_ACTIVITY_TOUCH_INTERVAL_MS) return;
+        this.brokerRelayTouchedAt.set(webPort, now);
+        void this.browserSessionBroker.request({ op: 'touch-port', webPort }).then((response) => {
+            if (!response.ok) logger.debug(`[API MACHINE] Browser relay activity touch failed: ${response.code}`);
+        }).catch((error) => {
+            logger.debug(`[API MACHINE] Browser relay activity touch failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+    }
+
+    private withIsolatedViewerMutation<T>(operation: () => Promise<T>): Promise<T> {
+        const run = this.isolatedViewerMutation.then(operation, operation);
+        this.isolatedViewerMutation = run.then(() => undefined, () => undefined);
+        return run;
+    }
+
+    private async startIsolatedViewerStackOnce(viewerKey: string): Promise<IsolatedViewerStartResult> {
+        const missing = await detectMissingViewerTools();
+        if (missing.length > 0) {
+            throw new Error(`원격 화면에 필요한 프로그램이 없습니다: ${missing.join(', ')}`);
+        }
+
+        const persisted = this.isolatedViewerLeases.get(viewerKey)
+            ?? await this.isolatedViewerRegistry.get(viewerKey);
+        if (persisted && await isViewerServing(persisted.webPort)) {
+            this.isolatedViewerLeases.set(viewerKey, persisted);
+            const browser = await this.ensureViewerBrowser(
+                persisted.display,
+                false,
+                persisted.profileDir,
+                viewerKey,
+            );
+            const next = {
+                ...persisted,
+                cdpPort: browser.browserReady ? browser.cdpPort : null,
+                lastUsedAt: Date.now(),
+            };
+            await this.isolatedViewerRegistry.set(next);
+            this.isolatedViewerLeases.set(viewerKey, next);
+            return {
+                viewerKey,
+                slot: next.slot,
+                display: next.display,
+                vncPort: next.vncPort,
+                webPort: next.webPort,
+                profileDir: next.profileDir,
+                ready: true,
+                reused: true,
+                ...browser,
+            };
+        }
+
+        const records = await this.isolatedViewerRegistry.list();
+        const occupiedSlots = new Set<number>();
+        for (const record of records) {
+            if (record.viewerKey === viewerKey) continue;
+            if (await isViewerServing(record.webPort)) occupiedSlots.add(record.slot);
+            else await this.isolatedViewerRegistry.delete(record.viewerKey);
+        }
+        for (const slot of VIEWER_SLOTS) {
+            if (occupiedSlots.has(slot.slot)) continue;
+            const ownedByCurrent = persisted?.slot === slot.slot;
+            if (!ownedByCurrent && await isViewerServing(slot.webPort)) {
+                occupiedSlots.add(slot.slot);
+            }
+        }
+
+        const persistedSlot = persisted
+            ? VIEWER_SLOTS.find((slot) => slot.slot === persisted.slot) ?? null
+            : null;
+        const slot = persistedSlot && !occupiedSlots.has(persistedSlot.slot)
+            ? persistedSlot
+            : selectViewerSlot(occupiedSlots);
+        if (!slot) throw new Error('viewer-capacity-exhausted');
+
+        const profileDir = resolveViewerProfileDir(configuration.happyHomeDir, viewerKey);
+        mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+        const xvfb = spawnDetached('Xvfb', buildXvfbArgs({ display: slot.display, width: 1920, height: 1080 }));
+        await delay(1500);
+        const x11vnc = spawnDetached('x11vnc', buildX11vncArgs({ display: slot.display, vncPort: slot.vncPort }));
+        await delay(800);
+        const websockify = spawnDetached('websockify', buildWebsockifyArgs({
+            webPort: slot.webPort,
+            vncPort: slot.vncPort,
+            webRoot: resolveNovncWebRoot(),
+        }));
+        const ready = await waitForPort(slot.webPort, 15_000);
+        const browser = await this.ensureViewerBrowser(slot.display, false, profileDir, viewerKey);
+        const lease: BrowserViewerLeaseRecord = {
+            viewerKey,
+            slot: slot.slot,
+            display: slot.display,
+            vncPort: slot.vncPort,
+            webPort: slot.webPort,
+            cdpPort: browser.browserReady ? browser.cdpPort : null,
+            profileDir,
+            lastUsedAt: Date.now(),
+            processIds: {
+                ...(xvfb.pid ? { xvfb: xvfb.pid } : {}),
+                ...(x11vnc.pid ? { x11vnc: x11vnc.pid } : {}),
+                ...(websockify.pid ? { websockify: websockify.pid } : {}),
+            },
+        };
+        await this.isolatedViewerRegistry.set(lease);
+        this.isolatedViewerLeases.set(viewerKey, lease);
+        return {
+            viewerKey,
+            slot: slot.slot,
+            display: slot.display,
+            vncPort: slot.vncPort,
+            webPort: slot.webPort,
+            profileDir,
+            ready,
+            reused: false,
+            ...browser,
+        };
+    }
+
+    private async stopIsolatedViewerProcesses(lease: BrowserViewerLeaseRecord): Promise<void> {
+        for (const [kind, pid] of Object.entries(lease.processIds ?? {}) as Array<[
+            'xvfb' | 'x11vnc' | 'websockify',
+            number,
+        ]>) {
+            if (!pid) continue;
+            try {
+                const cmdline = await readFile(`/proc/${pid}/cmdline`, 'utf8');
+                if (!viewerProcessMatchesLease(kind, cmdline, lease)) continue;
+                // Viewer processes are detached process-group leaders. Targeting
+                // that exact group avoids touching another user's slot.
+                process.kill(-pid, 'SIGTERM');
+            } catch {
+                // Already exited is an idempotent stop success.
+            }
+        }
+    }
+
     /**
      * Puts a browser on the viewer display, or reuses the one already there.
      *
@@ -1211,6 +1489,8 @@ export class ApiMachineClient {
     private async ensureViewerBrowser(
         display: string,
         callerWillLaunchBrowser: boolean,
+        profileDir?: string,
+        viewerKey?: string,
     ): Promise<ViewerBrowserState> {
         if (decideViewerBrowserAction({ liveCdpPort: null, callerWillLaunchBrowser }).action === 'defer') {
             return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
@@ -1221,21 +1501,25 @@ export class ApiMachineClient {
         // screen (dev, 2026-08-15).
         if (!chrome) return summariseViewerBrowser({ chromeInstalled: false, cdpPort: null });
 
-        const userDataDir = resolveProfileUserDataDir(
+        const userDataDir = profileDir ?? resolveProfileUserDataDir(
             join(configuration.happyHomeDir, 'chrome-profiles'),
             'default',
         );
         const running = await scanChromeProcesses();
         let liveCdpPort: number | null = null;
         for (const port of CDP_PORT_RANGE) {
-            if (!running.some((process) => process.cdpPort === port && process.display === display)) continue;
+            if (!running.some((process) => (
+                process.cdpPort === port
+                && process.display === display
+                && process.userDataDir === userDataDir
+            ))) continue;
             if (await isCdpReachable(port)) { liveCdpPort = port; break; }
         }
         const decision = decideViewerBrowserAction({ liveCdpPort, callerWillLaunchBrowser });
         if (decision.action === 'reuse') {
             return {
                 ...summariseViewerBrowser({ chromeInstalled: true, cdpPort: decision.cdpPort }),
-                ...await this.pairViewerBrowser(decision.cdpPort),
+                ...await this.pairViewerBrowser(decision.cdpPort, viewerKey),
             };
         }
 
@@ -1268,7 +1552,7 @@ export class ApiMachineClient {
         else launched.cdpPipe.close();
         const browser = summariseViewerBrowser({ chromeInstalled: true, cdpPort: up ? cdpPort : null });
         if (!browser.browserReady) return browser;
-        return { ...browser, ...await this.pairViewerBrowser(cdpPort) };
+        return { ...browser, ...await this.pairViewerBrowser(cdpPort, viewerKey) };
     }
 
     /**
@@ -1276,12 +1560,18 @@ export class ApiMachineClient {
      * and the noVNC viewer. Keeping the existing runPairing sequence here
      * preserves extension injection, token storage, and debugger-tier checks.
      */
-    private async pairBrowser(cdpPort: number, debuggerTier: boolean, pairingId?: string): Promise<BrowserPairResult> {
+    private async pairBrowser(
+        cdpPort: number,
+        debuggerTier: boolean,
+        pairingId?: string,
+        viewerKey?: string,
+    ): Promise<BrowserPairResult> {
         const cdpPipe = this.browserCdpPipes.get(cdpPort);
         const facts = await runPairing({
             cdpPort,
             debuggerTier,
             pairingId,
+            ...(viewerKey ? { viewerKey } : {}),
             ...(cdpPipe ? { browserCdpRequest: cdpPipe.request.bind(cdpPipe) } : {}),
         });
         const outcome = formatPairOutcome(facts);
@@ -1295,9 +1585,14 @@ export class ApiMachineClient {
     }
 
     /** Pairing failure must not hide the login screen used to repair it. */
-    private async pairViewerBrowser(cdpPort: number): Promise<ViewerBridgeSummary> {
+    private async pairViewerBrowser(cdpPort: number, viewerKey?: string): Promise<ViewerBridgeSummary> {
         try {
-            const result = await this.pairBrowser(cdpPort, true, `viewer-${cdpPort}-${randomUUID()}`);
+            const result = await this.pairBrowser(
+                cdpPort,
+                true,
+                `viewer-${cdpPort}-${randomUUID()}`,
+                viewerKey,
+            );
             return result.ok
                 ? { bridgeReady: true }
                 : { bridgeReady: false, bridgeMessage: result.message };
@@ -1706,7 +2001,10 @@ export class ApiMachineClient {
         // actual WS handshake with the browser end-to-end. See previewWsProxy.ts.
         this.previewWsProxy = new PreviewWsProxy(
             { emit: (event: any, payload: any) => this.socket.emit(event, payload) },
-            { logger: { debug: (msg: string) => logger.debug(msg) } },
+            {
+                logger: { debug: (msg: string) => logger.debug(msg) },
+                onActivity: (port) => this.touchBrokerViewerPort(port),
+            },
         );
         this.socket.on('proxy-ws-open', async (params, ack) => {
             ack(await this.previewWsProxy!.open(params));

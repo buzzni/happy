@@ -53,6 +53,7 @@ export function startBrowserBridgeServer({ bridge, port, host = '127.0.0.1' }: {
                 token: url.searchParams.get('token') ?? undefined,
                 profile: url.searchParams.get('profile') ?? undefined,
                 pairingId: url.searchParams.get('pairingId') ?? undefined,
+                viewerKey: url.searchParams.get('viewerKey') ?? undefined,
             })
         })
     })

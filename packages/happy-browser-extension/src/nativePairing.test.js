@@ -40,6 +40,27 @@ describe('attemptNativePairing', () => {
         })
     })
 
+    it('stores a viewer-scoped container pairing response', async () => {
+        const { chrome, set } = fakeChrome({
+            response: {
+                ok: true,
+                config: {
+                    token: 'scoped-token',
+                    port: 41777,
+                    host: 'host.docker.internal',
+                    viewerKey: 'bv1_abcdefghijklmnopqrstuvwxyz012345',
+                },
+            },
+        })
+
+        await expect(attemptNativePairing(chrome)).resolves.toEqual({ status: 'paired' })
+        expect(set).toHaveBeenCalledWith(expect.objectContaining({
+            token: 'scoped-token',
+            host: 'host.docker.internal',
+            viewerKey: 'bv1_abcdefghijklmnopqrstuvwxyz012345',
+        }))
+    })
+
     it('reports that automatic pairing is unavailable when the native host is absent', async () => {
         const { chrome, set } = fakeChrome({ error: new Error('Specified native messaging host not found') })
 
@@ -68,6 +89,29 @@ describe('attemptNativePairing', () => {
         await expect(attemptNativePairing(chrome)).resolves.toEqual({ status: 'already-configured' })
         expect(sendNativeMessage).not.toHaveBeenCalled()
         expect(set).not.toHaveBeenCalled()
+    })
+
+    it('refreshes an existing viewer-scoped pairing after its container restarts', async () => {
+        const viewerKey = 'bv1_abcdefghijklmnopqrstuvwxyz012345'
+        const { chrome, set, sendNativeMessage } = fakeChrome({
+            stored: { token: 'previous-scoped-token', viewerKey },
+            response: {
+                ok: true,
+                config: {
+                    token: 'current-scoped-token',
+                    port: 41777,
+                    host: 'host.docker.internal',
+                    viewerKey,
+                },
+            },
+        })
+
+        await expect(attemptNativePairing(chrome)).resolves.toEqual({ status: 'paired' })
+        expect(sendNativeMessage).toHaveBeenCalled()
+        expect(set).toHaveBeenCalledWith(expect.objectContaining({
+            token: 'current-scoped-token',
+            viewerKey,
+        }))
     })
 
     it('does not overwrite settings saved while the native host is responding', async () => {
