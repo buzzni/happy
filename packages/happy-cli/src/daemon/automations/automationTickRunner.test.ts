@@ -33,7 +33,7 @@ describe('createAutomationTickRunner', () => {
     expect(logs.some((line) => line.includes('runner paused'))).toBe(true)
   })
 
-  it('shouldAllowTicksAgainAfterResume', async () => {
+  it('shouldRunATickImmediatelyWhenRequestedOnResume', async () => {
     let runs = 0
     const runner = createAutomationTickRunner({
       runTick: async () => {
@@ -42,8 +42,23 @@ describe('createAutomationTickRunner', () => {
     })
 
     runner.pause()
-    runner.resume()
-    runner.trigger()
+    runner.resume({ trigger: true })
+    await settle()
+
+    expect(runs).toBe(1)
+  })
+
+  it('shouldNotRequireAMethodReceiverWhenResumeIsPassedAsACallback', async () => {
+    let runs = 0
+    const runner = createAutomationTickRunner({
+      runTick: async () => {
+        runs += 1
+      },
+    })
+    runner.pause()
+
+    const resume = runner.resume
+    resume({ trigger: true })
     await settle()
 
     expect(runs).toBe(1)

@@ -15,7 +15,7 @@ export interface AutomationTickRunner {
   trigger(): void
   isRunning(): boolean
   pause(): void
-  resume(): void
+  resume(options?: { trigger?: boolean }): void
 }
 
 export function createAutomationTickRunner(opts: {
@@ -24,13 +24,14 @@ export function createAutomationTickRunner(opts: {
 }): AutomationTickRunner {
   let running = false
   let paused = false
-  return {
+  const runner: AutomationTickRunner = {
     isRunning: () => running,
     pause() {
       paused = true
     },
-    resume() {
+    resume(options) {
       paused = false
+      if (options?.trigger) runner.trigger()
     },
     trigger() {
       if (paused) {
@@ -54,4 +55,5 @@ export function createAutomationTickRunner(opts: {
         })
     },
   }
+  return runner
 }

@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
 import { createAutomationTickRunner } from './automations/automationTickRunner'
-import { decideAutomationAwareHandoff } from './daemonHandoffAutomationGate'
+import {
+  decideAutomationAwareHandoff,
+  resumeAutomationRunnersAfterFailedHandoff,
+} from './daemonHandoffAutomationGate'
 
 function deferred() {
   let resolve!: () => void
@@ -75,5 +78,52 @@ describe('decideAutomationAwareHandoff', () => {
       legacyAutomationRunning: false,
       serverAutomationRunning: runner.isRunning(),
     })).toBe('handoff')
+  })
+})
+
+describe('resumeAutomationRunnersAfterFailedHandoff', () => {
+  it('shouldImmediatelyRunEnabledSchedulersBeforeTheNextHandoffRetry', async () => {
+    const events: string[] = []
+    const legacyRunner = createAutomationTickRunner({
+      runTick: async () => { events.push('legacy') },
+    })
+    const serverRunner = createAutomationTickRunner({
+      runTick: async () => { events.push('server') },
+    })
+    legacyRunner.pause()
+    serverRunner.pause()
+
+    resumeAutomationRunnersAfterFailedHandoff({
+      legacyAutomationEnabled: true,
+      legacyRunner,
+      serverRunner,
+    })
+    await settle()
+
+    expect(events).toEqual(['legacy', 'server'])
+  })
+
+  it('shouldResumeButNotRunTheDisabledLegacyScheduler', async () => {
+    const events: string[] = []
+    const legacyRunner = createAutomationTickRunner({
+      runTick: async () => { events.push('legacy') },
+    })
+    const serverRunner = createAutomationTickRunner({
+      runTick: async () => { events.push('server') },
+    })
+    legacyRunner.pause()
+    serverRunner.pause()
+
+    resumeAutomationRunnersAfterFailedHandoff({
+      legacyAutomationEnabled: false,
+      legacyRunner,
+      serverRunner,
+    })
+    await settle()
+    expect(events).toEqual(['server'])
+
+    legacyRunner.trigger()
+    await settle()
+    expect(events).toEqual(['server', 'legacy'])
   })
 })

@@ -110,7 +110,10 @@ import { createAutomationStore } from './automations/automationStore';
 import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
 import { createAutomationTickRunner } from './automations/automationTickRunner';
-import { decideAutomationAwareHandoff } from './daemonHandoffAutomationGate';
+import {
+  decideAutomationAwareHandoff,
+  resumeAutomationRunnersAfterFailedHandoff,
+} from './daemonHandoffAutomationGate';
 import { runAutomationScript } from './automations/runAutomationScript';
 import { queryGithubPullRequestFiles, queryGithubPullRequests } from './automations/queryGithubPullRequests';
 import { queryGithubIssues } from './automations/queryGithubIssues';
@@ -2343,8 +2346,11 @@ export async function startDaemon(): Promise<void> {
         }
 
         logger.debug('[DAEMON RUN] New daemon bundle preflight failed; keeping current daemon running');
-        automationTickRunner.resume();
-        serverAutomationTickRunner.resume();
+        resumeAutomationRunnersAfterFailedHandoff({
+          legacyAutomationEnabled: apiMachine.shouldRunLegacyAutomationScheduler(),
+          legacyRunner: automationTickRunner,
+          serverRunner: serverAutomationTickRunner,
+        });
       }
 
       // Before wrecklessly overriting the daemon state file, we should check if we are the ones who own it
