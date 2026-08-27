@@ -44,6 +44,15 @@ describe('decideAutomationAwareHandoff', () => {
     })).toBe('handoff')
   })
 
+  it('shouldDeferHandoffWhileAnAgentTaskLeaseIsActive', () => {
+    expect(decideAutomationAwareHandoff({
+      bundleReplaced: true,
+      legacyAutomationRunning: false,
+      serverAutomationRunning: false,
+      serverAutomationLeaseRunning: true,
+    })).toBe('defer-handoff')
+  })
+
   it('shouldKeepTheDaemonUntilSpawnWebhookReportAndLinkFinish', async () => {
     const webhook = deferred()
     const events: string[] = []

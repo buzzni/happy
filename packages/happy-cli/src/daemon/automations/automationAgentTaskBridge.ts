@@ -94,6 +94,7 @@ export function maintainAutomationAgentTaskLease(input: {
   fetchImpl?: typeof fetch
   intervalMs?: number
   maxPreStartFailures?: number
+  onStop?: () => void
 }): () => void {
   const fetchImpl = input.fetchImpl ?? fetch
   const intervalMs = input.intervalMs ?? 30_000
@@ -106,6 +107,7 @@ export function maintainAutomationAgentTaskLease(input: {
     if (stopped) return
     stopped = true
     clearInterval(timer)
+    input.onStop?.()
   }
   const timer = setInterval(() => {
     if (requestRunning || stopped) return

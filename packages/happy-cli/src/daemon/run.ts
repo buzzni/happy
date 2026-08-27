@@ -2060,6 +2060,7 @@ export async function startDaemon(): Promise<void> {
     stopClaudeSwapSupervisor = () => claudeSwapSupervisor.shutdown();
     await claudeSwapSupervisor.restore();
     const aiCredentialRuntime = createNodeAiCredentialRuntime(claudeSwapSupervisor);
+    let activeServerAutomationLeaseCount = 0;
     apiMachine.setAutomationKey(machineAutomationKey, (keyVersion) => {
       machineAutomationKey = updateMachineAutomationKeyRegistration(
         configuration.automationKeyFile,
@@ -2117,7 +2118,13 @@ export async function startDaemon(): Promise<void> {
           machineId,
         }),
         maintainAgentTaskLease: (dispatch) => {
-          maintainAutomationAgentTaskLease({ dispatch });
+          activeServerAutomationLeaseCount += 1;
+          maintainAutomationAgentTaskLease({
+            dispatch,
+            onStop: () => {
+              activeServerAutomationLeaseCount = Math.max(0, activeServerAutomationLeaseCount - 1);
+            },
+          });
         },
         resolveMcpSpawnContext: ({ runId, claimToken }) => exchangeAutomationMcpCallerGrant({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
@@ -2294,6 +2301,7 @@ export async function startDaemon(): Promise<void> {
         bundleReplaced,
         legacyAutomationRunning: automationTickRunner.isRunning(),
         serverAutomationRunning: serverAutomationTickRunner.isRunning(),
+        serverAutomationLeaseRunning: activeServerAutomationLeaseCount > 0,
       });
 
       if (handoffDecision === 'run-automations') {
@@ -2312,7 +2320,7 @@ export async function startDaemon(): Promise<void> {
       }
 
       if (handoffDecision === 'defer-handoff') {
-        logger.debug('[DAEMON RUN] Daemon bundle replaced on disk, waiting for automation tick(s) to finish before handoff');
+        logger.debug('[DAEMON RUN] Daemon bundle replaced on disk, waiting for automation work to finish before handoff');
       }
 
       if (handoffDecision === 'handoff') {
