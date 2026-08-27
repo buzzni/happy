@@ -2220,6 +2220,67 @@ describe('runServerAutomationTick', () => {
     expect(store.state().schedules.find((item) => item.automationId === 'automation-4')?.nextRunAt).toBe(now + 1)
   })
 
+  it('counts a newly timed-out worker against the concurrency limit in the same tick', async () => {
+    const {
+      input, store, transport, spawnSession, now,
+    } = setup()
+    const automationIds = ['automation-1', 'automation-2', 'automation-3']
+    const pendingEvent = {
+      id: 'opened:10:head-sha', event: 'opened' as const,
+      pr: {
+        number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10',
+        author: { login: 'alice' }, baseRefName: 'main', headRefName: 'feature/search',
+        headRefOid: 'a'.repeat(40), isDraft: false, state: 'OPEN', mergedAt: null,
+        labels: [], changedFiles: 0, files: [],
+      },
+    }
+    store.write({
+      schedules: automationIds.map((automationId) => ({
+        automationId, generation: 2, nextRunAt: now, lastSessionId: null,
+      })),
+      githubTriggers: automationIds.map((automationId) => ({
+        automationId, generation: 2,
+        state: { snapshot: [], highestPrNumber: 10, processed: [], pending: [pendingEvent] },
+      })),
+      githubActiveSessions: [{
+        automationId: 'older-automation', generation: 1,
+        sessionIds: ['review-1', 'review-2'],
+      }],
+      pendingReports: [],
+    })
+    input.cache = { read: () => ({
+      cursor: 1n, serverTime: now, syncedAt: now, pendingAcknowledgements: [],
+      automations: automationIds.map((automationId) => ({ ...cacheRecord(), automationId })),
+    }) }
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const }, prompt: 'Review',
+      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: null,
+      },
+    }))
+    transport.claim.mockImplementation(async ({ automationId }: { automationId: string }) => ({
+      ok: true,
+      value: { runId: `run-${automationId}`, claimToken: `claim-${automationId}` },
+    }))
+    input.isSessionRunning = vi.fn((sessionId) => sessionId === 'review-1' || sessionId === 'review-2')
+    input.isDirectoryInUse = vi.fn((directory) => directory === '/isolated/run-automation-1')
+    spawnSession.mockResolvedValue({ ok: false, error: 'Session webhook timeout for PID 101' })
+
+    await runServerAutomationTick(input)
+
+    expect(spawnSession).toHaveBeenCalledTimes(1)
+    expect(transport.claim).toHaveBeenCalledTimes(1)
+    expect(store.state().githubWorktrees).toEqual([expect.objectContaining({
+      runId: 'run-automation-1', sessionId: null,
+    })])
+    expect(store.state().schedules.filter((schedule) => schedule.nextRunAt === now + 1)
+      .map((schedule) => schedule.automationId)).toEqual(['automation-2', 'automation-3'])
+  })
+
   it('keeps a GitHub event pending instead of spawning in the shared directory when worktree preparation fails', async () => {
     const {
       input, store, transport, queryGithubPullRequests, spawnSession, prepareGithubWorktree,

@@ -1378,11 +1378,14 @@ export async function runServerAutomationTick(
   }
   const activeGithubWorkerSessions = new Set(activeGithubSessionsAcrossGenerations(input))
   const pendingGithubWorktreeAutomationIds = new Set<string>()
-  for (const worktree of input.runtimeStore.read().githubWorktrees ?? []) {
-    if (worktree.sessionId || !input.isDirectoryInUse(worktree.directory)) continue
-    pendingGithubWorktreeAutomationIds.add(worktree.automationId)
-    activeGithubWorkerSessions.add(`worktree:${worktree.runId}`)
+  const trackLivePendingGithubWorktrees = () => {
+    for (const worktree of input.runtimeStore.read().githubWorktrees ?? []) {
+      if (worktree.sessionId || !input.isDirectoryInUse(worktree.directory)) continue
+      pendingGithubWorktreeAutomationIds.add(worktree.automationId)
+      activeGithubWorkerSessions.add(`worktree:${worktree.runId}`)
+    }
   }
+  trackLivePendingGithubWorktrees()
   const workQueue = [...decryptableAutomations]
   const immediateWorkerIds = new Set<string>()
   while (workQueue.length > 0) {
@@ -1461,6 +1464,7 @@ export async function runServerAutomationTick(
     } finally {
       clearInterval(heartbeat)
     }
+    if (payload.githubTrigger && result.sessionId === null) trackLivePendingGithubWorktrees()
     if (payload.githubTrigger && result.queueDepth === undefined) {
       result.queueDepth = githubQueueDepth(input, automation)
     }
