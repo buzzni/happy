@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { access, chmod, mkdir } from 'node:fs/promises'
+import { access, chmod, mkdir, realpath } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
@@ -119,6 +119,7 @@ export async function prepareGithubTriggerWorktree(input: {
   runCommand?: (command: GithubTriggerWorktreeCommand) => Promise<CommandResult>
   ensureDirectory?: (path: string) => Promise<void>
   pathExists?: (path: string) => Promise<boolean>
+  resolveRealPath?: (path: string) => Promise<string>
   onPlanned: (plan: GithubTriggerWorktreePlan) => void
 }): Promise<
   | ({ ok: true } & GithubTriggerWorktreePlan)
@@ -223,6 +224,22 @@ export async function prepareGithubTriggerWorktree(input: {
   })
   if (!await pathExists(directory)) {
     return failAfterCreation('GitHub automation project directory is absent from the prepared worktree')
+  }
+
+  try {
+    const resolveRealPath = input.resolveRealPath ?? realpath
+    const actualWorktreePath = await resolveRealPath(worktreePath)
+    const actualDirectory = await resolveRealPath(directory)
+    const actualRelativePath = relative(actualWorktreePath, actualDirectory)
+    if (actualRelativePath === '..'
+        || actualRelativePath.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)
+        || isAbsolute(actualRelativePath)) {
+      return failAfterCreation('GitHub automation project directory resolves outside the prepared worktree')
+    }
+  } catch (error) {
+    return failAfterCreation(
+      `GitHub automation project directory resolution failed: ${error instanceof Error ? error.message : String(error)}`,
+    )
   }
 
   return { ok: true, ...plan }

@@ -1,3 +1,9 @@
+import { execFile } from 'node:child_process'
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { promisify } from 'node:util'
+
 import { describe, expect, it, vi } from 'vitest'
 
 import {
@@ -8,6 +14,7 @@ import {
 } from './githubTriggerWorktree'
 
 const HEAD = 'a'.repeat(40)
+const execFileAsync = promisify(execFile)
 
 function commandRunner(outputs: string[]) {
   return vi.fn(async (_command: GithubTriggerWorktreeCommand) => ({
@@ -29,6 +36,7 @@ describe('prepareGithubTriggerWorktree', () => {
       githubEnvironment: { GH_TOKEN: 'secret', GH_REPO: 'acme/app' },
       runCommand,
       pathExists: vi.fn(async () => true),
+      resolveRealPath: vi.fn(async (path) => path),
       ensureDirectory: vi.fn(async () => undefined),
       onPlanned,
     })
@@ -67,6 +75,7 @@ describe('prepareGithubTriggerWorktree', () => {
       pullRequest: { number: 12, expectedHeadSha: HEAD },
       runCommand,
       pathExists: vi.fn(async () => true),
+      resolveRealPath: vi.fn(async (path) => path),
       ensureDirectory: vi.fn(async () => undefined),
       onPlanned: vi.fn(),
     })
@@ -95,6 +104,7 @@ describe('prepareGithubTriggerWorktree', () => {
       pullRequest: { number: 12, expectedHeadSha: HEAD },
       runCommand,
       pathExists,
+      resolveRealPath: vi.fn(async (path) => path),
       ensureDirectory: vi.fn(async () => undefined),
       onPlanned: vi.fn(),
     })
@@ -129,6 +139,75 @@ describe('prepareGithubTriggerWorktree', () => {
     })
     expect(onPlanned).not.toHaveBeenCalled()
     expect(runCommand).toHaveBeenCalledTimes(1)
+  })
+
+  it.skipIf(process.platform === 'win32')('rejects a PR project path that resolves outside the managed worktree', async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), 'happy-worktree-symlink-'))
+    const repositoryRoot = join(fixtureRoot, 'repo')
+    const projectPath = join(repositoryRoot, 'apps', 'web')
+    const outsidePath = join(fixtureRoot, 'outside')
+    const managedRoot = join(fixtureRoot, 'managed')
+    let plannedWorktreePath: string | undefined
+
+    const git = async (args: string[], cwd = repositoryRoot) => {
+      const result = await execFileAsync('git', args, { cwd, encoding: 'utf8' })
+      return result.stdout
+    }
+
+    try {
+      await mkdir(projectPath, { recursive: true })
+      await mkdir(outsidePath, { recursive: true })
+      await git(['init'])
+      await git(['config', 'user.name', 'Test'])
+      await git(['config', 'user.email', 'test@example.com'])
+      await writeFile(join(projectPath, 'app.ts'), 'export {}\n')
+      await git(['add', '.'])
+      await git(['commit', '-m', 'base'])
+      const baseHead = (await git(['rev-parse', 'HEAD'])).trim()
+
+      await rm(projectPath, { recursive: true })
+      await symlink(outsidePath, projectPath, 'dir')
+      await git(['add', '-A'])
+      await git(['commit', '-m', 'replace project with external symlink'])
+      const pullRequestHead = (await git(['rev-parse', 'HEAD'])).trim()
+      await git(['checkout', '--detach', baseHead])
+
+      const result = await prepareGithubTriggerWorktree({
+        runId: 'symlink-escape',
+        directory: projectPath,
+        managedRoot,
+        pullRequest: { number: 12, expectedHeadSha: pullRequestHead },
+        runCommand: async (command) => {
+          const executable = command.executable === 'gh' ? 'git' : command.executable
+          const args = command.executable === 'gh'
+            ? ['checkout', '--detach', pullRequestHead]
+            : command.args
+          try {
+            const commandResult = await execFileAsync(executable, args, {
+              cwd: command.cwd,
+              encoding: 'utf8',
+            })
+            return { ok: true, stdout: commandResult.stdout }
+          } catch (error) {
+            return { ok: false, error: error instanceof Error ? error.message : String(error) }
+          }
+        },
+        onPlanned: (plan) => {
+          plannedWorktreePath = plan.worktreePath
+        },
+      })
+
+      expect(result).toEqual({
+        ok: false,
+        error: 'GitHub automation project directory resolves outside the prepared worktree',
+        cleaned: true,
+      })
+    } finally {
+      if (plannedWorktreePath) {
+        await git(['worktree', 'remove', plannedWorktreePath]).catch(() => undefined)
+      }
+      await rm(fixtureRoot, { recursive: true })
+    }
   })
 })
 
