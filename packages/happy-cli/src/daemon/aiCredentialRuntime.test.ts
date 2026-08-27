@@ -100,6 +100,114 @@ function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
 }
 
 describe('AI credential machine runtime', () => {
+  const trialLease = {
+    leaseId: 'lease-claude-1',
+    contentHash: 'a'.repeat(64),
+    bundleVersion: 1,
+  }
+
+  it('writes only a non-secret trial ownership marker after a successful apply', async () => {
+    const { runtime, files } = setup()
+
+    await runtime.apply({ provider: 'claude', payload: '{"oauth":"trial-secret"}', trialLease })
+
+    const marker = files.get('/home/operator/.happy/trial-ai-credential-leases.json')
+    expect(JSON.parse(marker!)).toEqual({
+      version: 1,
+      leases: {
+        claude: { ...trialLease },
+      },
+    })
+    expect(marker).not.toContain('trial-secret')
+  })
+
+  it('refuses to replace a marker owned by a different active lease', async () => {
+    const { runtime, files, calls } = setup()
+    files.set('/home/operator/.happy/trial-ai-credential-leases.json', JSON.stringify({
+      version: 1,
+      leases: { claude: { ...trialLease, leaseId: 'other-lease' } },
+    }))
+
+    await expect(runtime.apply({
+      provider: 'claude', payload: '{"oauth":"must-not-apply"}', trialLease,
+    })).rejects.toMatchObject({ kind: 'TRIAL_LEASE_CONFLICT' })
+    expect(calls.some(({ command, args }) => command === 'cswap' && args[0] === 'import')).toBe(false)
+    expect(files.get('/home/operator/.happy/trial-ai-credential-leases.json'))
+      .toContain('other-lease')
+  })
+
+  it('purges only a matching Claude trial lease and is idempotent', async () => {
+    const { runtime, files, supervisor } = setup()
+    await runtime.apply({ provider: 'claude', payload: '{}', trialLease })
+    files.set('/home/operator/.claude/.credentials.json', 'claude-secret')
+    files.set('/home/operator/.claude-swap/accounts/1.json', 'profile-secret')
+    files.set('/home/operator/.config/claude-swap/config.json', 'profile-secret')
+
+    await expect(runtime.purge({ provider: 'claude', leaseId: trialLease.leaseId }))
+      .resolves.toEqual({ provider: 'claude', purged: true, alreadyPurged: false })
+    expect(supervisor.stop).toHaveBeenCalledTimes(1)
+    expect(files.has('/home/operator/.claude/.credentials.json')).toBe(false)
+    expect(files.has('/home/operator/.claude-swap/accounts/1.json')).toBe(false)
+    expect(files.has('/home/operator/.config/claude-swap/config.json')).toBe(false)
+    expect(files.has('/home/operator/.happy/trial-ai-credential-leases.json')).toBe(false)
+
+    await expect(runtime.purge({ provider: 'claude', leaseId: trialLease.leaseId }))
+      .resolves.toEqual({ provider: 'claude', purged: true, alreadyPurged: true })
+    expect(supervisor.stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not purge credentials when the expected lease id differs', async () => {
+    const { runtime, files, supervisor } = setup()
+    await runtime.apply({ provider: 'claude', payload: '{}', trialLease })
+    files.set('/home/operator/.claude/.credentials.json', 'keep-this-secret')
+
+    await expect(runtime.purge({ provider: 'claude', leaseId: 'stale-lease' }))
+      .rejects.toMatchObject({ kind: 'TRIAL_LEASE_MISMATCH' })
+    expect(files.get('/home/operator/.claude/.credentials.json')).toBe('keep-this-secret')
+    expect(supervisor.stop).not.toHaveBeenCalled()
+  })
+
+  it('keeps the marker fail-closed when purge only partially removes files', async () => {
+    let files!: Map<string, string>
+    const configured = setup({
+      rm: vi.fn(async (path: string, options?: { recursive?: boolean }) => {
+        if (path === '/home/operator/.claude-swap') throw new Error('secret-path permission denied')
+        for (const filePath of files.keys()) {
+          if (filePath === path || (options?.recursive && filePath.startsWith(`${path}/`))) {
+            files.delete(filePath)
+          }
+        }
+      }),
+    })
+    files = configured.files
+    await configured.runtime.apply({ provider: 'claude', payload: '{}', trialLease })
+    files.set('/home/operator/.claude/.credentials.json', 'removed-first')
+    files.set('/home/operator/.claude-swap/accounts/1.json', 'still-present')
+
+    const error = await configured.runtime.purge({
+      provider: 'claude', leaseId: trialLease.leaseId,
+    }).catch((caught) => caught)
+    expect(error).toMatchObject({ kind: 'TRIAL_PURGE_FAILED' })
+    expect(error.message).not.toContain('secret-path')
+    expect(files.has('/home/operator/.happy/trial-ai-credential-leases.json')).toBe(true)
+    expect(files.get('/home/operator/.claude-swap/accounts/1.json')).toBe('still-present')
+  })
+
+  it('purges managed Codex auth and multi-auth files for the matching lease', async () => {
+    const { runtime, files } = setup()
+    const codexLease = { ...trialLease, leaseId: 'lease-codex-1' }
+    await runtime.apply({
+      provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()), trialLease: codexLease,
+    })
+    files.set('/home/operator/.codex/auth.json', 'legacy-secret')
+
+    await expect(runtime.purge({ provider: 'codex', leaseId: codexLease.leaseId }))
+      .resolves.toMatchObject({ provider: 'codex', purged: true })
+    expect(files.has('/home/operator/.codex/auth.json')).toBe(false)
+    expect(files.has('/home/operator/.codex/multi-auth/openai-codex-accounts.json')).toBe(false)
+    expect(files.has('/home/operator/.happy/trial-ai-credential-leases.json')).toBe(false)
+  })
+
   it('orders ready Codex accounts by the least remaining quota instead of storage order', () => {
     const accounts = [
       { accountId: 'account-a', enabled: true },

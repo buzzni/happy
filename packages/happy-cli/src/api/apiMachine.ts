@@ -485,6 +485,9 @@ export class ApiMachineClient {
         this.rpcHandlerManager.registerHandler('ai-credential:apply', (params) => (
             aiCredentialRuntime.apply(params)
         ));
+        this.rpcHandlerManager.registerHandler('ai-credential:purge', (params) => (
+            aiCredentialRuntime.purge(params)
+        ));
         this.rpcHandlerManager.registerHandler('ai-credential:status', (params) => (
             aiCredentialRuntime.status(params)
         ));

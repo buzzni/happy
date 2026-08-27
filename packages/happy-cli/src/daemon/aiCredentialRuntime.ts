@@ -15,6 +15,17 @@ const CODEX_MULTI_AUTH_THRESHOLD = 5
 
 export type AiCredentialProvider = 'claude' | 'codex'
 
+export type TrialAiCredentialLeaseMarker = {
+  leaseId: string
+  contentHash: string
+  bundleVersion: number
+}
+
+type TrialAiCredentialMarkerFile = {
+  version: 1
+  leases: Partial<Record<AiCredentialProvider, TrialAiCredentialLeaseMarker>>
+}
+
 export type AiCredentialCommandResult = {
   stdout: string
   stderr: string
@@ -148,6 +159,63 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   function codexMultiAuthDir(): string {
     const configured = deps.env.CODEX_MULTI_AUTH_DIR
     return configured && configured.length > 0 ? configured : join(codexHome(), 'multi-auth')
+  }
+
+  function trialMarkerPath(): string {
+    return join(deps.homeDir, '.happy', 'trial-ai-credential-leases.json')
+  }
+
+  function trialLease(value: unknown): TrialAiCredentialLeaseMarker {
+    if (!isObject(value)
+      || typeof value.leaseId !== 'string'
+      || !/^[A-Za-z0-9_-]{1,128}$/.test(value.leaseId)
+      || typeof value.contentHash !== 'string'
+      || !/^[a-f0-9]{64}$/.test(value.contentHash)
+      || !Number.isInteger(value.bundleVersion)
+      || Number(value.bundleVersion) < 1) {
+      throw new AiCredentialRuntimeError('TRIAL_MARKER_INVALID')
+    }
+    return {
+      leaseId: value.leaseId,
+      contentHash: value.contentHash,
+      bundleVersion: Number(value.bundleVersion),
+    }
+  }
+
+  async function readTrialMarker(): Promise<TrialAiCredentialMarkerFile> {
+    let raw: string
+    try {
+      raw = await deps.readFile(trialMarkerPath())
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { version: 1, leases: {} }
+      }
+      throw error
+    }
+    try {
+      const parsed = JSON.parse(raw) as unknown
+      if (!isObject(parsed) || parsed.version !== 1 || !isObject(parsed.leases)) {
+        throw new Error('invalid marker')
+      }
+      const leases: TrialAiCredentialMarkerFile['leases'] = {}
+      for (const selected of ['claude', 'codex'] as const) {
+        if (parsed.leases[selected] !== undefined) {
+          leases[selected] = trialLease(parsed.leases[selected])
+        }
+      }
+      if (Object.keys(parsed.leases).some((key) => key !== 'claude' && key !== 'codex')) {
+        throw new Error('invalid provider')
+      }
+      return { version: 1, leases }
+    } catch (error) {
+      if (error instanceof AiCredentialRuntimeError) throw error
+      throw new AiCredentialRuntimeError('TRIAL_MARKER_INVALID')
+    }
+  }
+
+  async function writeTrialMarker(marker: TrialAiCredentialMarkerFile): Promise<void> {
+    await deps.mkdir(join(deps.homeDir, '.happy'), { recursive: true, mode: 0o700 })
+    await writeAtomicFile(deps, trialMarkerPath(), JSON.stringify(marker))
   }
 
   async function capture(input: { provider: AiCredentialProvider }) {
@@ -405,7 +473,11 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     }
   }
 
-  async function apply(input: { provider: AiCredentialProvider; payload: string }) {
+  async function apply(input: {
+    provider: AiCredentialProvider
+    payload: string
+    trialLease?: TrialAiCredentialLeaseMarker
+  }) {
     const selected = provider(input?.provider)
     if (typeof input?.payload !== 'string') {
       throw new AiCredentialRuntimeError('INVALID_PAYLOAD')
@@ -414,10 +486,61 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return serialize(() => withSafeErrors(
       `${selected.toUpperCase()}_APPLY_FAILED`,
       async () => {
+        if (input.trialLease !== undefined) {
+          const requestedLease = trialLease(input.trialLease)
+          const marker = await readTrialMarker()
+          const currentLease = marker.leases[selected]
+          if (currentLease && currentLease.leaseId !== requestedLease.leaseId) {
+            throw new AiCredentialRuntimeError('TRIAL_LEASE_CONFLICT')
+          }
+          marker.leases[selected] = requestedLease
+          await writeTrialMarker(marker)
+        }
         if (selected === 'claude') return applyClaude(input.payload)
         return applyCodex(input.payload)
       },
     ))
+  }
+
+  async function purgeManagedProvider(selected: AiCredentialProvider): Promise<void> {
+    if (selected === 'claude') {
+      await deps.supervisor.stop()
+      const claudeConfig = deps.env.CLAUDE_CONFIG_DIR || join(deps.homeDir, '.claude')
+      await deps.rm(join(claudeConfig, '.credentials.json'), { force: true })
+      await deps.rm(join(deps.homeDir, '.claude-swap'), { recursive: true, force: true })
+      await deps.rm(join(deps.homeDir, '.config', 'claude-swap'), { recursive: true, force: true })
+      return
+    }
+    const home = codexHome()
+    await deps.rm(join(home, 'auth.json'), { force: true })
+    await deps.rm(join(home, 'auth.json.happy-backup'), { force: true })
+    await deps.rm(join(home, '.auth.json.happy-tmp'), { force: true })
+    await deps.rm(codexMultiAuthDir(), { recursive: true, force: true })
+  }
+
+  async function purge(input: { provider: AiCredentialProvider; leaseId: string }) {
+    const selected = provider(input?.provider)
+    if (typeof input?.leaseId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(input.leaseId)) {
+      throw new AiCredentialRuntimeError('TRIAL_MARKER_INVALID')
+    }
+    return serialize(() => withSafeErrors('TRIAL_PURGE_FAILED', async () => {
+      const marker = await readTrialMarker()
+      const currentLease = marker.leases[selected]
+      if (!currentLease) {
+        return { provider: selected, purged: true, alreadyPurged: true }
+      }
+      if (currentLease.leaseId !== input.leaseId) {
+        throw new AiCredentialRuntimeError('TRIAL_LEASE_MISMATCH')
+      }
+      await purgeManagedProvider(selected)
+      delete marker.leases[selected]
+      if (Object.keys(marker.leases).length === 0) {
+        await deps.rm(trialMarkerPath(), { force: true })
+      } else {
+        await writeTrialMarker(marker)
+      }
+      return { provider: selected, purged: true, alreadyPurged: false }
+    }))
   }
 
   async function status(input: { provider: AiCredentialProvider }) {
@@ -497,7 +620,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     }))
   }
 
-  return { capture, apply, status, rotation }
+  return { capture, apply, purge, status, rotation }
 }
 
 function parseClaudeList(stdout: string): { configured: boolean; activeAccount: string | null } {
