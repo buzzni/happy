@@ -157,6 +157,11 @@ import {
   classifyRecoveryLookupError,
   decideUntrackedSessionRecovery,
 } from './sessionRecovery';
+import {
+  ADDITIONAL_DIRECTORIES_CAPABILITY,
+  prepareAdditionalDirectories,
+} from './additionalDirectories';
+import { mergeAdditionalDirectoriesIntoSandboxEnvironment } from '@/utils/additionalDirectoriesEnv';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -178,6 +183,7 @@ export const initialMachineMetadata: MachineMetadata = {
   cliAvailability: detectCLIAvailability(),
   resumeSupport: { ...detectResumeSupport(), rpcAvailable: true },
   automationSupport: { rpcAvailable: true },
+  additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
 };
 
 export async function startDaemon(): Promise<void> {
@@ -699,6 +705,27 @@ export async function startDaemon(): Promise<void> {
       }
 
       try {
+        const additionalDirectoryResult = await prepareAdditionalDirectories({
+          requested: options.additionalDirectories,
+          primaryDirectory: directory,
+          allowedRoot: resolveAllowedRoot({
+            registryWorkspaceRoot: process.env.HAPPY_WORKSPACE_ROOT ?? null,
+            homeDir: os.homedir(),
+          }),
+        });
+        const finishSpawn = async (spawn: Promise<SpawnSessionResult>): Promise<SpawnSessionResult> => {
+          const result = await spawn;
+          if (result.type !== 'success' || options.additionalDirectories === undefined) return result;
+          return {
+            ...result,
+            additionalDirectories: {
+              version: 1,
+              accepted: additionalDirectoryResult.accepted,
+              skipped: additionalDirectoryResult.skipped,
+            },
+          };
+        };
+
         if (trustedMcpContext && options.mcpCallerGrantEnvelope) {
           return {
             type: 'error',
@@ -873,6 +900,13 @@ export async function startDaemon(): Promise<void> {
         if (options.exitAfterFirstTurn) {
           extraEnv.HAPPY_AUTOMATION_RUN_ONCE = '1';
         }
+        if (additionalDirectoryResult.accepted.length > 0) {
+          extraEnv.HAPPY_ADDITIONAL_DIRECTORIES = JSON.stringify(additionalDirectoryResult.accepted);
+          mergeAdditionalDirectoriesIntoSandboxEnvironment(
+            extraEnv,
+            additionalDirectoryResult.accepted,
+          );
+        }
 
         // Isolated sessions must not inherit unrelated daemon credentials.
         const hasSandbox = extraEnv.HAPPY_PROJECT_SANDBOX_CONFIG !== undefined;
@@ -974,12 +1008,12 @@ export async function startDaemon(): Promise<void> {
             pidToTrackedSession.set(tmuxResult.pid, trackedSession);
             sessionStartTimes.set(tmuxResult.pid, Date.now());
 
-            return waitForSessionWebhook({
+            return finishSpawn(waitForSessionWebhook({
               pid: tmuxResult.pid,
               pidToAwaiter,
               label: '(tmux)',
               logger,
-            });
+            }));
           } else {
             logger.debug(`[DAEMON RUN] Failed to spawn in tmux: ${tmuxResult.error}, falling back to regular spawning`);
             useTmux = false;
@@ -1020,7 +1054,7 @@ export async function startDaemon(): Promise<void> {
 
           // TODO: In future, sessionId could be used with --resume to continue existing sessions
           // For now, we ignore it - each spawn creates a new session
-          return spawnTrackedHappyProcess({
+          return finishSpawn(spawnTrackedHappyProcess({
             args,
             cwd: directory,
             // scrub: 상속된 lineage env(HAPPY_RECONNECT_*/HAPPY_FORK*)가 새
@@ -1030,7 +1064,7 @@ export async function startDaemon(): Promise<void> {
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
             userHomeDir: stagedUserHomeDir,
-          });
+          }));
         }
 
         // This should never be reached, but TypeScript requires a return statement

@@ -156,6 +156,12 @@ export const MachineMetadataSchema = z.object({
     serverBacked: z.boolean().optional(),
     keyVersion: z.number().int().min(1).optional(),
   }).optional(),
+  additionalDirectories: z.object({
+    version: z.literal(1),
+    maxDirectories: z.literal(8),
+    agents: z.tuple([z.literal('claude'), z.literal('codex')]),
+    access: z.literal('read-write'),
+  }).optional(),
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>

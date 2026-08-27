@@ -25,4 +25,29 @@ describe('query adapter', () => {
             }),
         }));
     });
+
+    it('forwards additional directories to the Claude Agent SDK for new and resumed queries', () => {
+        for (const resume of [undefined, 'claude-session-id']) {
+            query({
+                prompt: 'continue',
+                options: {
+                    additionalDirectories: ['/repo/frontend', '/repo/backend'],
+                    resume,
+                },
+            });
+        }
+
+        expect(sdkQuery).toHaveBeenNthCalledWith(1, expect.objectContaining({
+            options: expect.objectContaining({
+                additionalDirectories: ['/repo/frontend', '/repo/backend'],
+                resume: undefined,
+            }),
+        }));
+        expect(sdkQuery).toHaveBeenNthCalledWith(2, expect.objectContaining({
+            options: expect.objectContaining({
+                additionalDirectories: ['/repo/frontend', '/repo/backend'],
+                resume: 'claude-session-id',
+            }),
+        }));
+    });
 });

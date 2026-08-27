@@ -36,6 +36,7 @@ export interface QueryOptions {
     appendSystemPrompt?: string
     customSystemPrompt?: string
     cwd?: string
+    additionalDirectories?: string[]
     disallowedTools?: string[]
     maxTurns?: number
     /** Emit Claude's predicted next user prompt after completed turns. */

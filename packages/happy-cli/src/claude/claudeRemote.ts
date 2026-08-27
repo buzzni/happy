@@ -22,6 +22,7 @@ import { readExpectedConnectors, readExpectedMcpServices } from '@/aplus/fetchAp
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
 import { buildClaudeSystemPromptOptions } from './claudePrompt';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
+import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
 
 export type ClaudeActiveInputSender = (text: string) => boolean;
 
@@ -183,6 +184,7 @@ export async function claudeRemote(opts: {
     const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
     const sdkOptions: QueryOptions = {
         cwd: opts.path,
+        additionalDirectories: readAdditionalDirectoriesEnvironment(process.env),
         resume: startFrom ?? undefined,
         mcpServers: hasMcpServers ? mergedMcpServers : undefined,
         permissionMode: mapToClaudeMode(initial.mode.permissionMode),
