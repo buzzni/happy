@@ -1,3 +1,5 @@
+import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
+
 export type CodexMcpStartupStatus = {
     threadId?: string | null;
     name: string;
@@ -34,6 +36,37 @@ export type CodexMcpRecoveryResult = {
     }>;
 };
 
+export function buildCodexMcpRecoveryMetadataStatuses(input: {
+    recovery: CodexMcpRecoveryResult;
+    connectorNames: readonly string[];
+    checkedAt: number;
+}): McpRuntimeServerStatus[] {
+    const connectorNames = new Set(input.connectorNames);
+    const serverStatuses = input.recovery.serverStatuses
+        ?? input.recovery.affectedServers.map((name) => ({
+            name,
+            status: input.recovery.status,
+        }));
+
+    return serverStatuses.map(({ name, status }) => {
+        const runtimeStatus = status === 'recovered'
+            ? 'connected' as const
+            : status === 'needs-auth'
+                ? (connectorNames.has(name) ? 'connector-needs-auth' as const : 'needs-auth' as const)
+                : (connectorNames.has(name) ? 'connector-runtime-failed' as const : 'failed' as const);
+        return {
+            name,
+            status: runtimeStatus,
+            ...(status === 'needs-auth'
+                ? { error: 'MCP authentication is required' }
+                : status === 'failed'
+                    ? { error: 'MCP runtime initialization failed' }
+                    : {}),
+            checkedAt: input.checkedAt,
+        };
+    });
+}
+
 type RecoveryOptions = {
     maxAttempts?: number;
     backoffMs?: number;
@@ -67,7 +100,7 @@ export class CodexMcpRuntimeRecovery {
     private readonly now: () => number;
     private readonly sleep: (ms: number) => Promise<void>;
     private readonly inFlight = new Map<string, Promise<CodexMcpRecoveryResult>>();
-    private readonly cooldownUntil = new Map<string, number>();
+    private readonly cooldowns = new Map<string, { failureSignature: string; until: number }>();
     private readonly unhealthyServers = new Map<string, string[]>();
 
     constructor(
@@ -99,7 +132,7 @@ export class CodexMcpRuntimeRecovery {
         const previouslyRecovered = (this.unhealthyServers.get(input.threadId) ?? [])
             .filter((name) => expected.has(name) && !initiallyUnhealthy.has(name));
         if (initial.status === 'ready') {
-            this.cooldownUntil.delete(input.threadId);
+            this.cooldowns.delete(input.threadId);
             this.unhealthyServers.delete(input.threadId);
             if (previouslyRecovered.length > 0) {
                 return { status: 'recovered', affectedServers: previouslyRecovered };
@@ -107,10 +140,13 @@ export class CodexMcpRuntimeRecovery {
             return { status: 'ready', affectedServers: [] };
         }
         if (initial.failedServers.length === 0) {
+            this.cooldowns.delete(input.threadId);
             this.unhealthyServers.set(input.threadId, initial.affectedServers);
             return this.toResult(initial, previouslyRecovered);
         }
-        if ((this.cooldownUntil.get(input.threadId) ?? 0) > this.now()) {
+        const failureSignature = JSON.stringify(initial.failedServers);
+        const cooldown = this.cooldowns.get(input.threadId);
+        if (cooldown?.failureSignature === failureSignature && cooldown.until > this.now()) {
             this.unhealthyServers.set(input.threadId, initial.affectedServers);
             return this.toResult(initial, previouslyRecovered);
         }
@@ -142,7 +178,7 @@ export class CodexMcpRuntimeRecovery {
             if (!resumed) continue;
             latest = await this.inspect(input);
             if (latest.status === 'ready') {
-                this.cooldownUntil.delete(input.threadId);
+                this.cooldowns.delete(input.threadId);
                 this.unhealthyServers.delete(input.threadId);
                 return {
                     status: 'recovered',
@@ -150,13 +186,16 @@ export class CodexMcpRuntimeRecovery {
                 };
             }
             if (latest.failedServers.length === 0) {
-                this.cooldownUntil.delete(input.threadId);
+                this.cooldowns.delete(input.threadId);
                 this.unhealthyServers.set(input.threadId, latest.affectedServers);
                 return this.toResult(latest, recoveredSinceInitial(latest.affectedServers));
             }
         }
 
-        this.cooldownUntil.set(input.threadId, this.now() + this.cooldownMs);
+        this.cooldowns.set(input.threadId, {
+            failureSignature: JSON.stringify(latest.failedServers),
+            until: this.now() + this.cooldownMs,
+        });
         this.unhealthyServers.set(input.threadId, latest.affectedServers);
         return this.toResult(latest, recoveredSinceInitial(latest.affectedServers));
     }

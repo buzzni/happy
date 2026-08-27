@@ -47,7 +47,10 @@ import {
 } from './utils/sessionProtocolMapper';
 import { resumeExistingThread } from './resumeExistingThread';
 import { CodexMcpConfigSynchronizer } from './codexMcpConfigSynchronizer';
-import { CodexMcpRuntimeRecovery } from './codexMcpRuntimeRecovery';
+import {
+    buildCodexMcpRecoveryMetadataStatuses,
+    CodexMcpRuntimeRecovery,
+} from './codexMcpRuntimeRecovery';
 import { emitReadyIfIdle } from './emitReadyIfIdle';
 import { enqueueCodexUserText, isCodexClearText } from './codexClearCommand';
 import { downloadCodexFileEventAttachment } from './utils/attachmentEvents';
@@ -1169,33 +1172,19 @@ export async function runCodex(opts: {
                     developerInstructions: currentDeveloperInstructions,
                 });
                 if (runtimeRecovery.status !== 'ready') {
-                    const connectorNames = new Set(readExpectedConnectors());
-                    const serverStatuses = runtimeRecovery.serverStatuses
-                        ?? runtimeRecovery.affectedServers.map((name) => ({
-                            name,
-                            status: runtimeRecovery.status,
-                        }));
-                    for (const serverRecovery of serverStatuses) {
-                        const { name } = serverRecovery;
-                        const status = serverRecovery.status === 'recovered'
-                            ? 'connected' as const
-                            : serverRecovery.status === 'needs-auth'
-                                ? (connectorNames.has(name) ? 'connector-needs-auth' as const : 'needs-auth' as const)
-                                : (connectorNames.has(name) ? 'connector-runtime-failed' as const : 'failed' as const);
+                    const metadataStatuses = buildCodexMcpRecoveryMetadataStatuses({
+                        recovery: runtimeRecovery,
+                        connectorNames: readExpectedConnectors(),
+                        checkedAt: Date.now(),
+                    });
+                    for (const metadataStatus of metadataStatuses) {
                         session.updateMetadata((currentMetadata) => ({
                             ...currentMetadata,
                             mcpServers: [
-                                ...(currentMetadata.mcpServers ?? []).filter((server) => server.name !== name),
-                                {
-                                    name,
-                                    status,
-                                    ...(serverRecovery.status === 'needs-auth'
-                                        ? { error: 'MCP authentication is required' }
-                                        : serverRecovery.status === 'failed'
-                                            ? { error: 'MCP runtime initialization failed' }
-                                            : {}),
-                                    checkedAt: Date.now(),
-                                },
+                                ...(currentMetadata.mcpServers ?? []).filter(
+                                    (server) => server.name !== metadataStatus.name,
+                                ),
+                                metadataStatus,
                             ],
                         }));
                     }
