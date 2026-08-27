@@ -491,10 +491,29 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
-    it('falls back to non-sandbox transport when sandbox initialization fails', async () => {
+    // 2026-08-28 프로덕션 — 이 테스트는 원래 버그를 정상으로 못박고 있었다.
+    // sandboxConfig.networkMode 는 'allowed' 인데, 초기화가 실패하면 계속 진행해
+    // sandboxEnabled=false 로 떨어졌다. 그 뒤 AgentTask 워커가 permissionMode
+    // read-only 로 Codex 네이티브 readOnly 정책(네트워크 없음)에 떨어졌고, 몇 분
+    // 뒤 exec_command 안의 네트워크 호출이 실패할 때가 돼서야 드러났다. 네트워크가
+    // 명시적으로 필요했던 자리에서는 조용히 계속 진행하지 않고 스폰 시점에 바로
+    // 실패해야 한다.
+    it('refuses to continue when network was required and sandbox init fails', async () => {
         mockInitializeSandbox.mockRejectedValue(new Error('sandbox init failed'));
         const { CodexAppServerClient } = await import('./codexAppServerClient');
         const client = new CodexAppServerClient(sandboxConfig);
+
+        await expect(client.connect()).rejects.toThrow(/network access was required/);
+
+        expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
+    it('still falls back to non-sandbox transport when the sandbox deliberately blocks network', async () => {
+        // 네트워크를 원래도 안 쓰려던 자리는 초기화가 실패해도 계속 진행해도 된다 —
+        // Codex 네이티브 readOnly 정책도 어차피 네트워크가 없으므로 의도와 일치한다.
+        mockInitializeSandbox.mockRejectedValue(new Error('sandbox init failed'));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient({ ...sandboxConfig, networkMode: 'blocked' });
 
         await client.connect();
 

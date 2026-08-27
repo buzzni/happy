@@ -57,6 +57,7 @@ import type { SandboxConfig } from '@/persistence';
 import { CODEX_INACTIVITY_ABORT_REASON, type CodexInactivityAbortFields } from './codexAbortNotice';
 import { prepareCodexMultiAuthProxy, type PreparedCodexMultiAuthProxy } from './codexMultiAuthProxy';
 import { initializeSandbox, wrapForMcpTransport } from '@/sandbox/manager';
+import { isNetworkRequiredSandboxFailureFatal } from './sandboxInitFailurePolicy';
 import packageJson from '../../package.json';
 import { resolveCodexSandboxPolicy } from './executionPolicy';
 
@@ -697,6 +698,15 @@ export class CodexAppServerClient {
             } catch (error) {
                 logger.warn('[CodexAppServer] Failed to initialize sandbox; continuing without.', error);
                 this.sandboxCleanup = null;
+                if (isNetworkRequiredSandboxFailureFatal(this.sandboxConfig)) {
+                    throw new Error(
+                        `Sandbox initialization failed but network access was required `
+                        + `(networkMode=${this.sandboxConfig?.networkMode}). Continuing without the `
+                        + `sandbox would silently drop to Codex's native read-only policy, which has no `
+                        + `network at all. Original error: `
+                        + `${error instanceof Error ? error.message : String(error)}`,
+                    );
+                }
             }
         }
 
