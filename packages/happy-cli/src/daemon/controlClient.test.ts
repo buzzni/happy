@@ -22,7 +22,7 @@ vi.mock('@/ui/logger', () => ({
   logger: { debug: mocks.mockLoggerDebug },
 }))
 
-import { checkIfDaemonRunningAndCleanupStaleState } from './controlClient'
+import { checkIfDaemonRunningAndCleanupStaleState, stopDaemon } from './controlClient'
 
 const DEAD_PID = 3058947
 const HTTP_PORT = 33417
@@ -102,6 +102,29 @@ describe('checkIfDaemonRunningAndCleanupStaleState', () => {
       )
       expect(mocks.mockWriteDaemonStateIfUnchanged).not.toHaveBeenCalled()
     } finally {
+      fetchSpy.mockRestore()
+    }
+  })
+})
+
+describe('stopDaemon', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('does not signal a reused pid after stale daemon state was marked stopped', async () => {
+    const state = { ...stateWithPid(process.pid), state: 'stopped' as const }
+    mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
+    const killSpy = vi.spyOn(process, 'kill').mockReturnValue(true)
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('stale control port'))
+
+    try {
+      await stopDaemon()
+
+      expect(killSpy).not.toHaveBeenCalled()
+      expect(fetchSpy).not.toHaveBeenCalled()
+    } finally {
+      killSpy.mockRestore()
       fetchSpy.mockRestore()
     }
   })
