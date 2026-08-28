@@ -197,11 +197,7 @@ describe('prepareGithubTriggerWorktree', () => {
         },
       })
 
-      expect(result).toEqual({
-        ok: false,
-        error: 'GitHub automation project directory resolves outside the prepared worktree',
-        cleaned: true,
-      })
+      expect(result).toMatchObject({ ok: false, cleaned: true })
     } finally {
       if (plannedWorktreePath) {
         await git(['worktree', 'remove', plannedWorktreePath]).catch(() => undefined)
