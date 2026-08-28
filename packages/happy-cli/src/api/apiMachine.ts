@@ -352,6 +352,10 @@ async function withCodexAppServerClient<T>(handler: (client: CodexAppServerClien
 export class ApiMachineClient {
     private socket!: Socket<ServerToDaemonEvents, DaemonToServerEvents>;
     private keepAliveInterval: NodeJS.Timeout | null = null;
+    private runtimeActivityProvider: (() => {
+        activeSessionCount: number;
+        activeAutomationCount: number;
+    }) | null = null;
     private lastKnownCLIAvailability: CLIAvailability | null = null;
     private lastKnownResumeSupport: ResumeSupport | null = null;
     // specs/20260521-happy-cli-version-republish — daemon 재시작 후 새 cli
@@ -2247,6 +2251,20 @@ export class ApiMachineClient {
                 logger.debugLargeJson(`[API MACHINE] Emitting machine-alive`, payload);
             }
             this.socket.emit('machine-alive', payload);
+            const activity = this.runtimeActivityProvider?.();
+            if (activity) {
+                this.updateDaemonState((state) => ({
+                    ...state,
+                    status: state?.status ?? 'running',
+                    activity: {
+                        activeSessionCount: Math.max(0, Math.floor(activity.activeSessionCount)),
+                        activeAutomationCount: Math.max(0, Math.floor(activity.activeAutomationCount)),
+                        reportedAt: Date.now(),
+                    },
+                })).catch((err) => {
+                    logger.debug('[API MACHINE] Failed to publish runtime activity:', err);
+                });
+            }
             if (this.automationServerKeyVersion !== null) this.requestServerAutomationSync();
 
             // Re-detect CLI availability and push metadata update if changed
@@ -2289,6 +2307,13 @@ export class ApiMachineClient {
             }
         }, 20000);
         logger.debug('[API MACHINE] Keep-alive started (20s interval)');
+    }
+
+    setRuntimeActivityProvider(provider: () => {
+        activeSessionCount: number;
+        activeAutomationCount: number;
+    }): void {
+        this.runtimeActivityProvider = provider;
     }
 
     private startSmartReconnect() {

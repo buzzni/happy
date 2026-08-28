@@ -106,6 +106,24 @@ describe('handoffToReplacedBundle', () => {
     expect(events).toEqual(['preflight', 'teardown', 'spawn'])
   })
 
+  it('defers after preflight when activity starts before teardown', async () => {
+    const events: string[] = []
+    const teardownCurrentDaemon = vi.fn(async () => {})
+    const spawnReplacement = vi.fn(async () => true)
+
+    const result = await handoffToReplacedBundle({
+      preflightReplacement: async () => { events.push('preflight'); return true },
+      canHandoff: () => { events.push('activity-check'); return false },
+      teardownCurrentDaemon,
+      spawnReplacement,
+    })
+
+    expect(result).toBe('deferred')
+    expect(events).toEqual(['preflight', 'activity-check'])
+    expect(teardownCurrentDaemon).not.toHaveBeenCalled()
+    expect(spawnReplacement).not.toHaveBeenCalled()
+  })
+
   it('retries the spawn when the replacement process never starts', async () => {
     const spawnReplacement = vi.fn()
       .mockResolvedValueOnce(false)

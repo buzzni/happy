@@ -184,7 +184,12 @@ export const DaemonStateSchema = z.object({
       z.string() // Forward compatibility
     ]).optional(),
   /** Process-local X25519 public key used only for MCP caller grant envelopes. */
-  mcpCallerGrantPublicKey: z.string().optional()
+  mcpCallerGrantPublicKey: z.string().optional(),
+  activity: z.object({
+    activeSessionCount: z.number().int().min(0),
+    activeAutomationCount: z.number().int().min(0),
+    reportedAt: z.number(),
+  }).optional(),
 })
 
 export type DaemonState = z.infer<typeof DaemonStateSchema>

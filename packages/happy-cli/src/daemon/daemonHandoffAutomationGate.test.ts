@@ -36,6 +36,15 @@ describe('decideAutomationAwareHandoff', () => {
     })).toBe('defer-handoff')
   })
 
+  it('shouldDeferHandoffWhileAnInteractiveOrTerminalSessionIsRunning', () => {
+    expect(decideAutomationAwareHandoff({
+      bundleReplaced: true,
+      legacyAutomationRunning: false,
+      serverAutomationRunning: false,
+      activeSessionCount: 1,
+    })).toBe('defer-handoff')
+  })
+
   it('shouldHandoffAfterEveryAutomationTickBecomesIdle', () => {
     expect(decideAutomationAwareHandoff({
       bundleReplaced: true,

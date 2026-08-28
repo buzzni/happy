@@ -40,6 +40,7 @@ import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stop
 import { preflightDaemonControlServer, startDaemonControlServer } from './controlServer';
 import { BrowserBridge } from './browserBridge';
 import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
+import { getDaemonTerminalSessionCount } from './daemonTerminalSessions';
 import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
@@ -2324,6 +2325,14 @@ export async function startDaemon(): Promise<void> {
         }
       },
     });
+    const getRuntimeActivity = () => ({
+      activeSessionCount: getCurrentChildren().filter((session) => isPidAlive(session.pid)).length
+        + getDaemonTerminalSessionCount(),
+      activeAutomationCount: Number(automationTickRunner.isRunning())
+        + Number(serverAutomationTickRunner.isRunning())
+        + activeServerAutomationLeaseCount,
+    });
+    apiMachine.setRuntimeActivityProvider(getRuntimeActivity);
 
     // Connect to server
     apiMachine.connect();
@@ -2439,6 +2448,7 @@ export async function startDaemon(): Promise<void> {
         legacyAutomationRunning: automationTickRunner.isRunning(),
         serverAutomationRunning: serverAutomationTickRunner.isRunning(),
         serverAutomationLeaseRunning: activeServerAutomationLeaseCount > 0,
+        activeSessionCount: getRuntimeActivity().activeSessionCount,
       });
 
       if (handoffDecision === 'run-automations') {
@@ -2457,7 +2467,7 @@ export async function startDaemon(): Promise<void> {
       }
 
       if (handoffDecision === 'defer-handoff') {
-        logger.debug('[DAEMON RUN] Daemon bundle replaced on disk, waiting for automation work to finish before handoff');
+        logger.debug('[DAEMON RUN] Daemon bundle replaced on disk, waiting for runtime activity to finish before handoff');
       }
 
       if (handoffDecision === 'handoff') {
@@ -2468,6 +2478,10 @@ export async function startDaemon(): Promise<void> {
 
         const handoffResult = await handoffToReplacedBundle({
           preflightReplacement: () => preflightInstalledHappyCLI(),
+          canHandoff: () => {
+            const activity = getRuntimeActivity();
+            return activity.activeSessionCount === 0 && activity.activeAutomationCount === 0;
+          },
           teardownCurrentDaemon: async () => {
             clearInterval(restartOnStaleVersionAndHeartbeat);
 
@@ -2512,12 +2526,16 @@ export async function startDaemon(): Promise<void> {
           process.exit(1);
         }
 
-        logger.debug('[DAEMON RUN] New daemon bundle preflight failed; keeping current daemon running');
-        resumeAutomationRunnersAfterFailedHandoff({
-          legacyAutomationEnabled: apiMachine.shouldRunLegacyAutomationScheduler(),
-          legacyRunner: automationTickRunner,
-          serverRunner: serverAutomationTickRunner,
-        });
+        if (handoffResult === 'deferred') {
+          logger.debug('[DAEMON RUN] Runtime activity started during preflight; deferring daemon handoff');
+        } else {
+          logger.debug('[DAEMON RUN] New daemon bundle preflight failed; keeping current daemon running');
+          resumeAutomationRunnersAfterFailedHandoff({
+            legacyAutomationEnabled: apiMachine.shouldRunLegacyAutomationScheduler(),
+            legacyRunner: automationTickRunner,
+            serverRunner: serverAutomationTickRunner,
+          });
+        }
       }
 
       // Before wrecklessly overriting the daemon state file, we should check if we are the ones who own it

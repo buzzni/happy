@@ -10,11 +10,13 @@ export function decideAutomationAwareHandoff(input: {
   legacyAutomationRunning: boolean
   serverAutomationRunning: boolean
   serverAutomationLeaseRunning?: boolean
+  activeSessionCount?: number
 }): AutomationAwareHandoffDecision {
   if (!input.bundleReplaced) return 'run-automations'
   if (input.legacyAutomationRunning
     || input.serverAutomationRunning
-    || input.serverAutomationLeaseRunning) return 'defer-handoff'
+    || input.serverAutomationLeaseRunning
+    || (input.activeSessionCount ?? 0) > 0) return 'defer-handoff'
   return 'handoff'
 }
 
