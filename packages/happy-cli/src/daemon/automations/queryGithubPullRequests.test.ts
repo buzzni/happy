@@ -5,7 +5,8 @@ import type { RunAutomationScriptInput, RunAutomationScriptResult } from './runA
 
 const rows = [{
   number: 10, title: 'Add search', url: 'https://github.com/acme/app/pull/10', author: { login: 'alice' },
-  baseRefName: 'main', headRefName: 'feature/search', isDraft: false, state: 'OPEN', mergedAt: null,
+  baseRefName: 'main', headRefName: 'feature/search', headRefOid: 'a'.repeat(40),
+  isDraft: false, state: 'OPEN', mergedAt: null,
   labels: [{ name: 'ready' }], changedFiles: 1, files: [{ path: 'apps/web/page.tsx' }],
 }]
 
@@ -38,7 +39,7 @@ describe('queryGithubPullRequests', () => {
     expect(input.fetchImpl).not.toHaveBeenCalled()
     expect(input.runScript).toHaveBeenCalledWith(expect.objectContaining({
       cwd: '/repo',
-      command: expect.stringMatching(/gh pr list .*--search "sort:updated-desc"/),
+      command: expect.stringMatching(/gh pr list .*--search "sort:updated-desc".*headRefOid/),
       environmentVariables: undefined,
     }))
   })

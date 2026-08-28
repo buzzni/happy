@@ -6,7 +6,7 @@ import type { GithubPullRequestSnapshot } from './githubTriggerDomain'
 
 const EXCHANGE_TIMEOUT_MS = 3_000
 const QUERY_TIMEOUT_MS = 60_000
-const GH_PR_LIST_FIELDS = 'number,title,url,author,baseRefName,headRefName,isDraft,state,mergedAt,labels'
+const GH_PR_LIST_FIELDS = 'number,title,url,author,baseRefName,headRefName,headRefOid,isDraft,state,mergedAt,labels'
 // changedFiles/files 는 PR 100개 각각의 변경 파일을 GraphQL 로 가져오는, 이 쿼리에서
 // 가장 비싼 필드다. matchesFilter 는 filter.paths 가 있을 때만 참조하므로 경로 필터가
 // 없으면 요청하지 않는다 — 큰 저장소에서 GitHub 이 504 를 내던 원인이다.
@@ -26,6 +26,7 @@ const pullRequestSchema = z.object({
   author: z.object({ login: z.string().min(1).max(200) }).nullable(),
   baseRefName: z.string().min(1).max(512),
   headRefName: z.string().min(1).max(512),
+  headRefOid: z.string().regex(/^[a-f0-9]{40,64}$/i),
   isDraft: z.boolean(),
   state: z.enum(['OPEN', 'CLOSED', 'MERGED']),
   mergedAt: z.string().max(100).nullable(),

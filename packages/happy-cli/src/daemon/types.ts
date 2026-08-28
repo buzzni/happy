@@ -62,6 +62,8 @@ export interface SessionRuntimeState {
  */
 export interface TrackedSession {
   startedBy: 'daemon' | string;
+  /** Absolute launch cwd, persisted before the session-start webhook arrives. */
+  directory?: string;
   happySessionId?: string;
   happySessionMetadataFromLocalWebhook?: Metadata;
   runtime?: SessionRuntimeState;

@@ -23,6 +23,7 @@ const pr = (patch: Record<string, unknown> = {}) => ({
   author: { login: 'alice' },
   baseRefName: 'main',
   headRefName: 'feature/search',
+  headRefOid: 'a'.repeat(40),
   isDraft: false,
   state: 'OPEN',
   mergedAt: null,
@@ -62,6 +63,9 @@ describe('planGithubTrigger', () => {
 
     expect(polled.event).toBeNull()
     expect(polled.state.pending.map((event) => event.id)).toEqual(['10:opened', '11:opened'])
+    expect(polled.state.pending.map((event) => event.pr.headRefOid)).toEqual([
+      'a'.repeat(40), 'a'.repeat(40),
+    ])
     expect(polled.state.processed).toEqual([])
   })
 

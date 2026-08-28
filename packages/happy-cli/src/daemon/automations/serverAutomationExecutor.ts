@@ -9,6 +9,7 @@ import {
 } from './automationDomain'
 import type { EncryptedServerAutomation, ServerAutomationCacheState, ServerAutomationPayload } from './serverAutomationCache'
 import type {
+  GithubAutomationWorktreeState,
   GithubIssueProgressMarkerState,
   PendingAutomationReport,
   ServerAutomationReportOutcome,
@@ -17,6 +18,7 @@ import type {
 } from './serverAutomationRuntimeStore'
 import type { AutomationMcpCallerGrantResult, AutomationMcpSpawnContext } from './automationMcpCallerGrant'
 import type { AutomationConnectorPreflightResult } from './automationConnectorPreflight'
+import type { GithubTriggerWorktreePlan } from './githubTriggerWorktree'
 import type {
   AutomationAgentTaskDispatch,
   AutomationAgentTaskEvent,
@@ -159,7 +161,22 @@ export interface ServerAutomationExecutorInput {
     filterInheritedCredentials?: boolean
     environmentVariables?: Record<string, string>
   }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
+  prepareGithubWorktree: (input: {
+    runId: string
+    directory: string
+    pullRequest?: { number: number; expectedHeadSha?: string | null }
+    githubEnvironment?: Record<string, string>
+    onPlanned: (plan: GithubTriggerWorktreePlan) => void
+  }) => Promise<
+    | ({ ok: true } & GithubTriggerWorktreePlan)
+    | { ok: false; error: string; cleaned: boolean }
+  >
+  discardGithubWorktree: (input: {
+    repositoryRoot: string
+    worktreePath: string
+  }) => Promise<{ ok: true } | { ok: false; dirty: boolean; error: string }>
   isSessionRunning: (sessionId: string) => boolean
+  isDirectoryInUse: (directory: string) => boolean
   randomId?: () => string
   logDebug?: (message: string) => void
 }
@@ -168,6 +185,8 @@ const SCRIPT_TIMEOUT_MS = 60_000
 const HEARTBEAT_MS = 60_000
 const EXPECTED_NEXT_DAEMON_TICK_MS = 60_000
 const MAX_GITHUB_EVENTS_PER_TICK = 3
+const DIRTY_WORKTREE_RETRY_MS = 15 * 60_000
+const WORKTREE_CLEANUP_RETRY_MS = 60_000
 const PR_REVIEW_SANDBOX_CONFIG = JSON.stringify({
   enabled: true,
   sessionIsolation: 'custom',
@@ -374,8 +393,8 @@ function makeGithubTriggerStatePersister(
   input: ServerAutomationExecutorInput,
   automation: EncryptedServerAutomation,
   state: GithubTriggerRuntimeState,
-): () => void {
-  return () => {
+): (spawnedWorktree?: { runId: string; sessionId: string }) => void {
+  return (spawnedWorktree) => {
     const latest = input.runtimeStore.read()
     input.runtimeStore.write({
       ...latest,
@@ -383,6 +402,13 @@ function makeGithubTriggerStatePersister(
         ...(latest.githubTriggers ?? []).filter((entry) => entry.automationId !== automation.automationId),
         { automationId: automation.automationId, generation: automation.generation, state },
       ],
+      ...(spawnedWorktree ? {
+        githubWorktrees: (latest.githubWorktrees ?? []).map((entry) => (
+          entry.runId === spawnedWorktree.runId
+            ? { ...entry, sessionId: spawnedWorktree.sessionId }
+            : entry
+        )),
+      } : {}),
     })
   }
 }
@@ -787,6 +813,67 @@ function updateGithubQueueProgress(
   return { position: completed, total }
 }
 
+function writeGithubWorktree(
+  input: ServerAutomationExecutorInput,
+  worktree: GithubAutomationWorktreeState,
+): void {
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...state,
+    githubWorktrees: [
+      ...(state.githubWorktrees ?? []).filter((entry) => entry.runId !== worktree.runId),
+      worktree,
+    ],
+  })
+}
+
+function removeGithubWorktreeJournal(input: ServerAutomationExecutorInput, runId: string): void {
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...state,
+    githubWorktrees: (state.githubWorktrees ?? []).filter((entry) => entry.runId !== runId),
+  })
+}
+
+function deferGithubWorktreeCleanup(
+  input: ServerAutomationExecutorInput,
+  runId: string,
+  delayMs: number,
+): void {
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...state,
+    githubWorktrees: (state.githubWorktrees ?? []).map((entry) => (
+      entry.runId === runId ? { ...entry, cleanupRetryAt: input.now + delayMs } : entry
+    )),
+  })
+}
+
+async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInput): Promise<void> {
+  const worktrees = input.runtimeStore.read().githubWorktrees ?? []
+  for (const worktree of worktrees) {
+    if ((worktree.cleanupRetryAt ?? 0) > input.now) continue
+    if (worktree.sessionId && input.isSessionRunning(worktree.sessionId)) continue
+    if (!worktree.sessionId && input.isDirectoryInUse(worktree.directory)) continue
+    const discarded = await input.discardGithubWorktree({
+      repositoryRoot: worktree.repositoryRoot,
+      worktreePath: worktree.worktreePath,
+    })
+    if (discarded.ok) {
+      removeGithubWorktreeJournal(input, worktree.runId)
+      continue
+    }
+    input.logDebug?.(
+      `[server-automation] GitHub worktree cleanup failed for ${worktree.worktreePath}: ${discarded.error}`,
+    )
+    deferGithubWorktreeCleanup(
+      input,
+      worktree.runId,
+      discarded.dirty ? DIRTY_WORKTREE_RETRY_MS : WORKTREE_CLEANUP_RETRY_MS,
+    )
+  }
+}
+
 async function executeStartedRun(
   input: ServerAutomationExecutorInput,
   automation: EncryptedServerAutomation,
@@ -803,10 +890,16 @@ async function executeStartedRun(
   let prompt = payload.prompt
   let environmentVariables: Record<string, string> | undefined
   let agentTaskDispatch: AutomationAgentTaskDispatch | null = null
-  let persistGithubTriggerState: (() => void) | null = null
+  let persistGithubTriggerState: ((
+    spawnedWorktree?: { runId: string; sessionId: string }
+  ) => void) | null = null
   let issueProgressMarker: {
     number: number
     githubEnvironment?: { GH_TOKEN: string; GH_REPO: string }
+  } | null = null
+  let githubWorktreeRequest: {
+    pullRequest?: { number: number; expectedHeadSha?: string | null }
+    githubEnvironment?: Record<string, string>
   } | null = null
   let degradedCode: string | undefined
   if (payload.githubTrigger?.event === 'issue_opened') {
@@ -884,6 +977,9 @@ async function executeStartedRun(
     }
     prompt = `${GITHUB_ISSUE_TRIGGER_PROMPT_PREAMBLE}\n\n${rendered}`
     environmentVariables = query.githubEnvironment
+    githubWorktreeRequest = {
+      ...(query.githubEnvironment ? { githubEnvironment: query.githubEnvironment } : {}),
+    }
     issueProgressMarker = {
       number: planned.event.issue.number,
       githubEnvironment: query.githubEnvironment,
@@ -1024,6 +1120,13 @@ async function executeStartedRun(
       }
       prompt = `${GITHUB_TRIGGER_PROMPT_PREAMBLE}\n\n${rendered}`
       environmentVariables = query.githubEnvironment
+      githubWorktreeRequest = {
+        pullRequest: {
+          number: planned.event.pr.number,
+          expectedHeadSha: planned.event.pr.headRefOid,
+        },
+        ...(query.githubEnvironment ? { githubEnvironment: query.githubEnvironment } : {}),
+      }
     }
   }
 
@@ -1100,9 +1203,43 @@ async function executeStartedRun(
       }
     }
   }
+  let githubWorktree: GithubTriggerWorktreePlan | null = null
+  if (githubWorktreeRequest) {
+    let plannedWorktree: GithubTriggerWorktreePlan | null = null
+    const prepared = await input.prepareGithubWorktree({
+      runId: run.runId,
+      directory: payload.directory,
+      ...githubWorktreeRequest,
+      onPlanned: (plan) => {
+        plannedWorktree = plan
+        writeGithubWorktree(input, {
+          automationId: automation.automationId,
+          generation: automation.generation,
+          runId: run.runId,
+          ...plan,
+          sessionId: null,
+          createdAt: input.now,
+        })
+      },
+    })
+    if (!prepared.ok) {
+      if (plannedWorktree) {
+        if (prepared.cleaned) removeGithubWorktreeJournal(input, run.runId)
+        else deferGithubWorktreeCleanup(input, run.runId, WORKTREE_CLEANUP_RETRY_MS)
+      }
+      input.logDebug?.(
+        `[server-automation] ${automation.automationId} GitHub worktree preparation failed: ${prepared.error}`,
+      )
+      return {
+        outcome: 'ERROR', sessionId: null,
+        ...(degradedCode ? { degradedCode } : {}),
+      }
+    }
+    githubWorktree = prepared
+  }
   const initialPrompt = buildAutomationPrompt(prompt, scriptOutput)
   const spawnInput = {
-    directory: payload.directory,
+    directory: githubWorktree?.directory ?? payload.directory,
     initialPrompt,
     createdByAccountId: null,
     agent: payload.agent ?? 'claude',
@@ -1152,7 +1289,10 @@ async function executeStartedRun(
   }
   if (spawned.ok && agentTaskDispatch) input.maintainAgentTaskLease(agentTaskDispatch)
   if (spawned.ok) {
-    persistGithubTriggerState?.()
+    persistGithubTriggerState?.(githubWorktree ? {
+      runId: run.runId,
+      sessionId: spawned.sessionId,
+    } : undefined)
     if (issueProgressMarker) {
       degradedCode = await createIssueProgressMarkerAfterSpawn(
         input,
@@ -1169,6 +1309,31 @@ async function executeStartedRun(
     // 자체가 실패하면 그 error 가 여기서 완전히 사라졌다. 프로덕션에서 dispatch
     // 는 성공했는데 worker 가 하나도 안 뜨고 로그도 없는 상태로 관측됐다.
     input.logDebug?.(`[server-automation] ${automation.automationId} spawn failed: ${spawned.error}`)
+    if (githubWorktree) {
+      if (input.isDirectoryInUse(githubWorktree.directory)) {
+        input.logDebug?.(
+          `[server-automation] ${automation.automationId} GitHub worktree cleanup deferred: spawn process still uses ${githubWorktree.directory}`,
+        )
+        deferGithubWorktreeCleanup(input, run.runId, WORKTREE_CLEANUP_RETRY_MS)
+      } else {
+        const discarded = await input.discardGithubWorktree({
+          repositoryRoot: githubWorktree.repositoryRoot,
+          worktreePath: githubWorktree.worktreePath,
+        })
+        if (!discarded.ok) {
+          input.logDebug?.(
+            `[server-automation] ${automation.automationId} GitHub worktree cleanup failed: ${discarded.error}`,
+          )
+          deferGithubWorktreeCleanup(
+            input,
+            run.runId,
+            discarded.dirty ? DIRTY_WORKTREE_RETRY_MS : WORKTREE_CLEANUP_RETRY_MS,
+          )
+        } else {
+          removeGithubWorktreeJournal(input, run.runId)
+        }
+      }
+    }
   }
   return spawned.ok
     ? {
@@ -1189,6 +1354,7 @@ export async function runServerAutomationTick(
   input: ServerAutomationExecutorInput,
 ): Promise<Array<{ automationId: string; outcome: ServerAutomationReportOutcome }>> {
   await flushPendingReports(input)
+  await cleanupInactiveGithubWorktrees(input)
   const cache = input.cache.read()
   if (cache.cursor === 0n) return []
   const now = serverNow(cache, input.now)
@@ -1218,6 +1384,15 @@ export async function runServerAutomationTick(
     if (payload.githubTrigger) scheduleInactiveGithubIssueProgressCleanup(input, automation, now)
   }
   const activeGithubWorkerSessions = new Set(activeGithubSessionsAcrossGenerations(input))
+  const pendingGithubWorktreeAutomationIds = new Set<string>()
+  const trackLivePendingGithubWorktrees = () => {
+    for (const worktree of input.runtimeStore.read().githubWorktrees ?? []) {
+      if (worktree.sessionId || !input.isDirectoryInUse(worktree.directory)) continue
+      pendingGithubWorktreeAutomationIds.add(worktree.automationId)
+      activeGithubWorkerSessions.add(`worktree:${worktree.runId}`)
+    }
+  }
+  trackLivePendingGithubWorktrees()
   const workQueue = [...decryptableAutomations]
   const immediateWorkerIds = new Set<string>()
   while (workQueue.length > 0) {
@@ -1238,6 +1413,11 @@ export async function runServerAutomationTick(
     }
     if (payload.githubTrigger && githubMode === 'work'
       && githubEventsProcessed >= MAX_GITHUB_EVENTS_PER_TICK) {
+      scheduleNextTick(input, automation.automationId, now)
+      continue
+    }
+    if (payload.githubTrigger && githubMode === 'work'
+      && pendingGithubWorktreeAutomationIds.has(automation.automationId)) {
       scheduleNextTick(input, automation.automationId, now)
       continue
     }
@@ -1291,6 +1471,7 @@ export async function runServerAutomationTick(
     } finally {
       clearInterval(heartbeat)
     }
+    if (payload.githubTrigger && result.sessionId === null) trackLivePendingGithubWorktrees()
     if (payload.githubTrigger && result.queueDepth === undefined) {
       result.queueDepth = githubQueueDepth(input, automation)
     }

@@ -123,6 +123,11 @@ import { runAutomationScript } from './automations/runAutomationScript';
 import { queryGithubPullRequestFiles, queryGithubPullRequests } from './automations/queryGithubPullRequests';
 import { queryGithubIssues } from './automations/queryGithubIssues';
 import {
+  isGithubTriggerWorktreeDirectoryInUse,
+  prepareGithubTriggerWorktree,
+  removeGithubTriggerWorktree,
+} from './automations/githubTriggerWorktree';
+import {
   createGithubIssueProgressMarker,
   removeGithubIssueProgressMarker,
   resolveGithubIssueProgressMarkerIdentity,
@@ -384,6 +389,7 @@ export async function startDaemon(): Promise<void> {
               : {}),
             startedBy: persisted.startedBy,
             pid: persisted.pid,
+            directory: persisted.directory,
             happySessionId: persisted.happySessionId,
             tmuxSessionId: persisted.tmuxSessionId,
             // The state file's staged home dir is the more current one; fall
@@ -516,6 +522,7 @@ export async function startDaemon(): Promise<void> {
     const serializeTrackedSessions = (): PersistedTrackedSession[] => {
       return Array.from(pidToTrackedSession.values()).map(s => ({
         pid: s.pid,
+        directory: s.directory,
         happySessionId: s.happySessionId,
         startedBy: s.startedBy,
         tmuxSessionId: s.tmuxSessionId,
@@ -1123,6 +1130,7 @@ export async function startDaemon(): Promise<void> {
             const trackedSession: TrackedSession = {
               startedBy: 'daemon',
               pid: tmuxResult.pid, // Real PID from tmux -P flag
+              directory,
               tmuxSessionId: tmuxResult.sessionId,
               directoryCreated,
               userHomeDir: stagedUserHomeDir,
@@ -1136,6 +1144,7 @@ export async function startDaemon(): Promise<void> {
             recoveredPendingSpawnStartedAt.delete(tmuxResult.pid);
             pidToTrackedSession.set(tmuxResult.pid, trackedSession);
             sessionStartTimes.set(tmuxResult.pid, Date.now());
+            persistTrackedSessions();
 
             return finishSpawn(waitForSessionWebhook({
               pid: tmuxResult.pid,
@@ -1247,6 +1256,7 @@ export async function startDaemon(): Promise<void> {
       const trackedSession: TrackedSession = {
         startedBy: 'daemon',
         pid: happyProcess.pid,
+        directory: cwd,
         childProcess: happyProcess,
         directoryCreated,
         message,
@@ -1980,6 +1990,13 @@ export async function startDaemon(): Promise<void> {
       }
       return false;
     };
+    const isAutomationDirectoryInUse = (directory: string): boolean => {
+      return isGithubTriggerWorktreeDirectoryInUse({
+        directory,
+        sessions: pidToTrackedSession,
+        isPidAlive,
+      });
+    };
     const spawnAutomationSession = async (
       input: {
         directory: string;
@@ -2266,7 +2283,13 @@ export async function startDaemon(): Promise<void> {
         }),
         resumeSession: resumeAutomationSession,
         spawnSession: spawnAutomationSession,
+        prepareGithubWorktree: (input) => prepareGithubTriggerWorktree({
+          ...input,
+          managedRoot: join(configuration.happyHomeDir, 'automation-worktrees'),
+        }),
+        discardGithubWorktree: removeGithubTriggerWorktree,
         isSessionRunning: isAutomationSessionRunning,
+        isDirectoryInUse: isAutomationDirectoryInUse,
         logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
       }),
       logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
