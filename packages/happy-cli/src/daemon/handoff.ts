@@ -58,12 +58,14 @@ export async function prepareDaemonStartup({
  */
 export async function handoffToReplacedBundle({
   preflightReplacement,
+  canHandoff,
   teardownCurrentDaemon,
   spawnReplacement,
   spawnAttempts = 3,
   waitBetweenAttempts = (attempt) => new Promise(resolve => setTimeout(resolve, attempt * 500)),
 }: {
   preflightReplacement: () => Promise<boolean>
+  canHandoff?: () => boolean
   teardownCurrentDaemon: () => Promise<void>
   spawnReplacement: (attempt: number) => Promise<boolean>
   spawnAttempts?: number
@@ -73,9 +75,13 @@ export async function handoffToReplacedBundle({
    * the same few milliseconds just fails three times instead of once.
    */
   waitBetweenAttempts?: (attempt: number) => Promise<void>
-}): Promise<'kept-current' | 'handed-off' | 'replacement-not-started'> {
+}): Promise<'kept-current' | 'deferred' | 'handed-off' | 'replacement-not-started'> {
   if (!await preflightReplacement()) {
     return 'kept-current'
+  }
+
+  if (canHandoff && !canHandoff()) {
+    return 'deferred'
   }
 
   await teardownCurrentDaemon()
