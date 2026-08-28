@@ -264,6 +264,10 @@ export async function stopDaemon() {
       logger.debug('No daemon state found');
       return;
     }
+    if (state.state === 'stopped' || state.state === 'crashed') {
+      logger.debug(`Daemon state is ${state.state}, nothing to stop`);
+      return;
+    }
 
     logger.debug(`Stopping daemon with PID ${state.pid}`);
 
