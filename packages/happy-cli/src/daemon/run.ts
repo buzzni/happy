@@ -40,6 +40,7 @@ import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stop
 import { preflightDaemonControlServer, startDaemonControlServer } from './controlServer';
 import { BrowserBridge } from './browserBridge';
 import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
+import { getDaemonTerminalSessionCount } from './daemonTerminalSessions';
 import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
@@ -2324,6 +2325,13 @@ export async function startDaemon(): Promise<void> {
         }
       },
     });
+    apiMachine.setRuntimeActivityProvider(() => ({
+      activeSessionCount: getCurrentChildren().filter((session) => isPidAlive(session.pid)).length
+        + getDaemonTerminalSessionCount(),
+      activeAutomationCount: Number(automationTickRunner.isRunning())
+        + Number(serverAutomationTickRunner.isRunning())
+        + activeServerAutomationLeaseCount,
+    }));
 
     // Connect to server
     apiMachine.connect();

@@ -224,6 +224,37 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    it('publishes runtime activity on the encrypted daemon heartbeat', async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(0);
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        const client = new ApiMachineClient('fake-token', machine);
+        client.setRuntimeActivityProvider(() => ({
+            activeSessionCount: 2,
+            activeAutomationCount: 1,
+        }));
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.advanceTimersByTimeAsync(20_000);
+
+        expect(machine.daemonState?.activity).toEqual({
+            activeSessionCount: 2,
+            activeAutomationCount: 1,
+            reportedAt: 20_000,
+        });
+        client.shutdown();
+    });
+
     it('registers the persistent automation public key on connect and persists the acknowledged version', async () => {
         mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
             if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 4 } };

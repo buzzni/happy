@@ -93,6 +93,10 @@ export function getDaemonTerminalSession(id: string | undefined | null): DaemonT
     return sessions.get(id) ?? null
 }
 
+export function getDaemonTerminalSessionCount(): number {
+    return sessions.size
+}
+
 export function removeDaemonTerminalSession(id: string): boolean {
     const entry = sessions.get(id)
     if (!entry) return false

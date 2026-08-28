@@ -3,6 +3,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import {
     addDaemonTerminalSession,
     getDaemonTerminalSession,
+    getDaemonTerminalSessionCount,
     removeDaemonTerminalSession,
     killAllDaemonTerminalSessions,
     recordBytesIn,
@@ -57,6 +58,15 @@ describe('daemonTerminalSessions', () => {
         expect(getDaemonTerminalSession('nope')).toBeNull()
         expect(getDaemonTerminalSession(undefined)).toBeNull()
         expect(getDaemonTerminalSession('')).toBeNull()
+    })
+
+    it('reports the active terminal count for daemon activity checks', () => {
+        const pty = spawn()
+        expect(getDaemonTerminalSessionCount()).toBe(0)
+        addDaemonTerminalSession('abc', pty, { userId: 'u', idleTimeoutMs: 0 })
+        expect(getDaemonTerminalSessionCount()).toBe(1)
+        removeDaemonTerminalSession('abc')
+        expect(getDaemonTerminalSessionCount()).toBe(0)
     })
 
     it('remove() reports whether the entry existed and clears it', () => {
