@@ -83,6 +83,7 @@ import {
 } from './resumeGuards';
 import { decideResumeCursorPersist } from './resumeCursorPersistence';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
+import { reportSandboxDependencyPreflight } from '@/sandbox/dependencyPreflight';
 import { startLogHousekeeping } from '@/ui/logHousekeepingRunner';
 import {
   readDaemonSessionIdleReaperConfig,
@@ -211,6 +212,12 @@ export async function startDaemon(): Promise<void> {
       delete process.env[key];
     }
   }
+
+  // 이 머신이 샌드박스를 쓸 수 있는지 기동 시점에 한 번 확인한다. checkDependencies()
+  // 는 원래 initialize() 안에서만 불려서, 의존성이 빠진 머신은 AgentTask 워커가 실제로
+  // 뜰 때까지 그 사실을 몰랐다 — 증상은 몇 분 뒤 네트워크 호출 실패로 나타나 원인과
+  // 멀리 떨어졌다(2026-08-28: socat 부재).
+  reportSandboxDependencyPreflight();
 
   // We don't have cleanup function at the time of server construction
   // Control flow is:
