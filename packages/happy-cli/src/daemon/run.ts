@@ -49,7 +49,7 @@ import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation
 import { shouldYieldDaemonStateOwnership } from './daemonStateOwnership';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
-import { existsSync, rmSync, statSync } from 'fs';
+import { existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
@@ -88,6 +88,7 @@ import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
 import {
   removeDeferredContinuationContextFile,
   stageDeferredContinuationContext,
+  sweepOrphanDeferredContinuationContextFiles,
 } from '@/utils/deferredContinuationContext';
 import { reportSandboxDependencyPreflight } from '@/sandbox/dependencyPreflight';
 import { startLogHousekeeping } from '@/ui/logHousekeepingRunner';
@@ -361,6 +362,7 @@ export async function startDaemon(): Promise<void> {
     // PENDING_SPAWN_OWNER protection until that webhook arrives.
     const recoveredPendingSpawnStartedAt = new Map<number, number>();
     const unverifiedRecoveredHomeDirs: string[] = [];
+    const unverifiedRecoveredContextFiles: string[] = [];
     // When a session was adopted from a previous daemon, keyed by PID. Feeds the
     // idle guard's grace window — an adopted session keeps its real age, so it
     // can be reap-eligible the instant it is adopted.
@@ -412,6 +414,9 @@ export async function startDaemon(): Promise<void> {
           logger.debug(`[DAEMON RUN] Recovered alive session PID ${persisted.pid}, sessionId: ${persisted.happySessionId || 'pending'}`);
         } else if (processIdentity === 'unverified') {
           if (persisted.userHomeDir) unverifiedRecoveredHomeDirs.push(persisted.userHomeDir);
+          if (persisted.deferredContinuationContextFile) {
+            unverifiedRecoveredContextFiles.push(persisted.deferredContinuationContextFile);
+          }
           logger.debug(
             `[DAEMON RUN] Skipped unverified previous session PID ${persisted.pid}, sessionId: ${persisted.happySessionId || 'pending'}`,
           );
@@ -453,6 +458,27 @@ export async function startDaemon(): Promise<void> {
       }
     } catch (e) {
       logger.debug(`[DAEMON RUN] Orphan sweep failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    try {
+      const pendingContextFiles = [
+        ...Array.from(pidToTrackedSession.values())
+          .map((session) => session.deferredContinuationContextFile)
+          .filter((file): file is string => typeof file === 'string'),
+        ...unverifiedRecoveredContextFiles,
+        ...Object.values(persistedSessions)
+          .map((session) => session.deferredContinuationContextFile)
+          .filter((file): file is string => typeof file === 'string'),
+      ];
+      const removed = await sweepOrphanDeferredContinuationContextFiles(
+        configuration.happyHomeDir,
+        pendingContextFiles,
+      );
+      if (removed.length > 0) {
+        logger.debug(`[DAEMON RUN] Swept ${removed.length} orphan deferred continuation context file(s)`);
+      }
+    } catch (e) {
+      logger.debug(`[DAEMON RUN] Deferred continuation context sweep failed: ${e instanceof Error ? e.message : String(e)}`);
     }
 
     // Retain session data after process exits so resume can still find it.
@@ -856,8 +882,9 @@ export async function startDaemon(): Promise<void> {
       let stagedDeferredContinuationContextFile: string | undefined;
       const cleanupStagedDeferredContinuationContext = (): void => {
         if (!stagedDeferredContinuationContextFile) return;
-        rmSync(stagedDeferredContinuationContextFile, { force: true });
+        const file = stagedDeferredContinuationContextFile;
         stagedDeferredContinuationContextFile = undefined;
+        removeDeferredContinuationContextFile(file);
       };
 
       try {

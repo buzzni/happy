@@ -7,6 +7,7 @@ import {
   createDeferredContinuationContextConsumer,
   DEFERRED_CONTINUATION_CONTEXT_MAX_BYTES,
   stageDeferredContinuationContext,
+  sweepOrphanDeferredContinuationContextFiles,
 } from './deferredContinuationContext'
 
 describe('deferred continuation context', () => {
@@ -105,5 +106,18 @@ describe('deferred continuation context', () => {
     expect(consumer.prepare('/clear')).toBeNull()
     expect(existsSync(staged.file)).toBe(false)
     expect(consumer.prepare('start fresh')).toBeNull()
+  })
+
+  it('removes crash-orphaned context files while preserving persisted pending context', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'happy-deferred-context-'))
+    directories.push(home)
+    const pending = await stageDeferredContinuationContext('pending context', home)
+    const orphan = await stageDeferredContinuationContext('orphan context', home)
+
+    const removed = await sweepOrphanDeferredContinuationContextFiles(home, [pending.file])
+
+    expect(removed).toEqual([orphan.file])
+    expect(existsSync(pending.file)).toBe(true)
+    expect(existsSync(orphan.file)).toBe(false)
   })
 })

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, rmSync } from 'node:fs'
-import { writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { readdir, rm, writeFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 import { parseSpecialCommand } from '@/parsers/specialCommands'
 import { logger } from '@/ui/logger'
 
@@ -40,6 +40,35 @@ export async function stageDeferredContinuationContext(
   const file = join(directory, `${randomUUID()}.txt`)
   await writeFile(file, context.trim(), { encoding: 'utf8', mode: 0o600 })
   return { file }
+}
+
+export async function sweepOrphanDeferredContinuationContextFiles(
+  happyHomeDir: string,
+  knownPendingFiles: Iterable<string>,
+): Promise<string[]> {
+  const directory = join(happyHomeDir, CONTEXT_DIRECTORY)
+  const keep = new Set(Array.from(knownPendingFiles, (file) => resolve(file)))
+  let entries
+  try {
+    entries = await readdir(directory, { withFileTypes: true })
+  } catch {
+    return []
+  }
+
+  const removed: string[] = []
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.txt')) continue
+    const file = resolve(directory, entry.name)
+    if (keep.has(file)) continue
+    try {
+      await rm(file, { force: true })
+      removed.push(file)
+    } catch {
+      // Best-effort startup hygiene: one unreadable orphan must not prevent
+      // the daemon from preserving and serving valid pending sessions.
+    }
+  }
+  return removed
 }
 
 type PreparedDeferredContinuationTurn = {

@@ -69,8 +69,8 @@ export function buildSpawnRequestEnvironment(
     requested: Record<string, string> | undefined,
 ): Record<string, string> {
     return {
-        ...auth,
         ...scrubSessionLineageEnv(requested ?? {}),
+        ...auth,
     }
 }
 
