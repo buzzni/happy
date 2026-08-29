@@ -93,4 +93,17 @@ describe('deferred continuation context', () => {
     expect(() => prepared?.commit()).not.toThrow()
     expect(consumer.prepare('second turn')).toBeNull()
   })
+
+  it('discards pending context when the first explicit input clears the conversation', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'happy-deferred-context-'))
+    directories.push(home)
+    const staged = await stageDeferredContinuationContext('previous context', home)
+    const consumer = createDeferredContinuationContextConsumer({
+      HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE: staged.file,
+    })
+
+    expect(consumer.prepare('/clear')).toBeNull()
+    expect(existsSync(staged.file)).toBe(false)
+    expect(consumer.prepare('start fresh')).toBeNull()
+  })
 })

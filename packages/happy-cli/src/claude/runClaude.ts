@@ -839,6 +839,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
         if (specialCommand.type === 'clear') {
             logger.debug('[start] Detected /clear command');
+            deferredContinuation.prepare(message.content.text);
             messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage);
             logger.debugLargeJson('[start] /clear command pushed to queue:', message);
             return;

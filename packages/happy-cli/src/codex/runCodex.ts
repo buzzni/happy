@@ -422,9 +422,7 @@ export async function runCodex(opts: {
             saycodePromptBlocks: currentSaycodePromptBlocks,
             effort: messageEffort,
         };
-        const deferredTurn = isCodexClearText(message.content.text)
-            ? null
-            : deferredContinuation.prepare(message.content.text);
+        const deferredTurn = deferredContinuation.prepare(message.content.text);
         let enqueueResult: ReturnType<typeof enqueueCodexUserText>;
         try {
             enqueueResult = enqueueCodexUserText({

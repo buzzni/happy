@@ -63,6 +63,17 @@ export function buildSessionSpawnEnvironment(
     }
 }
 
+/** Keeps request-supplied project env from impersonating daemon-owned session state. */
+export function buildSpawnRequestEnvironment(
+    auth: Record<string, string>,
+    requested: Record<string, string> | undefined,
+): Record<string, string> {
+    return {
+        ...auth,
+        ...scrubSessionLineageEnv(requested ?? {}),
+    }
+}
+
 /** Retains only the per-session Saycode capability needed by a later resume. */
 export function captureSaycodeAgentEnvironment(
     env: NodeJS.ProcessEnv,

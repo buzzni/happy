@@ -56,6 +56,7 @@ import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTm
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import {
   buildResumedSessionSpawnEnvironment,
+  buildSpawnRequestEnvironment,
   buildSessionSpawnEnvironment,
   captureSaycodeAgentEnvironment,
   SESSION_LINEAGE_ENV_PREFIXES,
@@ -959,10 +960,14 @@ export async function startDaemon(): Promise<void> {
           logger.debug(`[DAEMON RUN] User credentials staged at ${homeDir}/access.key`);
         }
 
-        let extraEnv: Record<string, string> = injectMcpCallerGrant({
-          ...authEnv,
-          ...(options.environmentVariables ?? {}),
-        }, mcpCallerGrant, process.env.HAPPY_APLUS_MCP_CONFIG_URL, mcpConfigProjectId, options.expectedConnectors, 'spawn');
+        let extraEnv: Record<string, string> = injectMcpCallerGrant(
+          buildSpawnRequestEnvironment(authEnv, options.environmentVariables),
+          mcpCallerGrant,
+          process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+          mcpConfigProjectId,
+          options.expectedConnectors,
+          'spawn',
+        );
         if (options.parentSessionId) {
           extraEnv.HAPPY_FORKED_FROM_SESSION_ID = options.parentSessionId;
         }

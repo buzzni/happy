@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, rmSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { parseSpecialCommand } from '@/parsers/specialCommands'
 import { logger } from '@/ui/logger'
 
 export const DEFERRED_CONTINUATION_CONTEXT_MAX_BYTES = 256 * 1024
@@ -69,6 +70,12 @@ export function createDeferredContinuationContextConsumer(
 
   return {
     prepare(userText: string): PreparedDeferredContinuationTurn | null {
+      if (parseSpecialCommand(userText).type === 'clear') {
+        context = null
+        reserved = false
+        removeDeferredContinuationContextFile(file)
+        return null
+      }
       if (!context || reserved) return null
       reserved = true
       const text = [
