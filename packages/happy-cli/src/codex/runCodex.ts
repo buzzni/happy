@@ -97,6 +97,7 @@ import {
     resolveInitialPromptPermissionMode,
 } from '@/utils/initialPrompt';
 import { registerCodexSteerHandler } from './codexSteerHandler';
+import { createDeferredContinuationContextConsumer } from '@/utils/deferredContinuationContext';
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
@@ -112,6 +113,7 @@ export async function runCodex(opts: {
     resumeThreadId?: string;
     permissionMode?: PermissionMode;
 }): Promise<void> {
+    const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
     // Shield killall/pkill against broad kills before anything is spawned —
     // Codex has no PreToolUse hook system, so the PATH shim is its only guard.
     installBroadKillShims();
@@ -420,12 +422,20 @@ export async function runCodex(opts: {
             saycodePromptBlocks: currentSaycodePromptBlocks,
             effort: messageEffort,
         };
-        const enqueueResult = enqueueCodexUserText({
-            text: message.content.text,
-            mode: enhancedMode,
-            queue: messageQueue,
-            attachments: attachmentsForThisMessage,
-        });
+        const deferredTurn = deferredContinuation.prepare(message.content.text);
+        let enqueueResult: ReturnType<typeof enqueueCodexUserText>;
+        try {
+            enqueueResult = enqueueCodexUserText({
+                text: deferredTurn?.text ?? message.content.text,
+                mode: enhancedMode,
+                queue: messageQueue,
+                attachments: attachmentsForThisMessage,
+            });
+            deferredTurn?.commit();
+        } catch (error) {
+            deferredTurn?.rollback();
+            throw error;
+        }
         if (enqueueResult === 'clear') {
             logger.debug('[Codex] /clear command pushed to isolated queue');
         }

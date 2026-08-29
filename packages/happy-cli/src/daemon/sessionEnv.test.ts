@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
     buildResumedSessionSpawnEnvironment,
+    buildSpawnRequestEnvironment,
     buildSessionSpawnEnvironment,
     captureSaycodeAgentEnvironment,
     scrubSessionLineageEnv,
@@ -82,6 +83,31 @@ describe('buildSessionSpawnEnvironment', () => {
             PATH: '/usr/bin',
             HAPPY_RECONNECT_SESSION_ID: 'target-session',
             TASK_TOKEN: 'task-token',
+        })
+    })
+})
+
+describe('buildSpawnRequestEnvironment', () => {
+    it('rejects request-controlled continuation and lineage variables', () => {
+        expect(buildSpawnRequestEnvironment(
+            {
+                HAPPY_HOME_DIR: '/trusted/home',
+                CODEX_HOME: '/trusted/codex',
+                CLAUDE_CODE_OAUTH_TOKEN: 'trusted-claude-token',
+            },
+            {
+                PROJECT_TOKEN: 'project-token',
+                HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE: '/private/secret',
+                HAPPY_FORK_CLAUDE_SESSION_ID: 'attacker-session',
+                HAPPY_HOME_DIR: '/attacker/home',
+                CODEX_HOME: '/attacker/codex',
+                CLAUDE_CODE_OAUTH_TOKEN: 'attacker-claude-token',
+            },
+        )).toEqual({
+            HAPPY_HOME_DIR: '/trusted/home',
+            CODEX_HOME: '/trusted/codex',
+            CLAUDE_CODE_OAUTH_TOKEN: 'trusted-claude-token',
+            PROJECT_TOKEN: 'project-token',
         })
     })
 })

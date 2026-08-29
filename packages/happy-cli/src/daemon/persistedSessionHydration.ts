@@ -22,7 +22,7 @@ import type { SessionEncryptionData, TrackedSession } from './types';
 
 type HydratedFields = Pick<
   TrackedSession,
-  'happySessionMetadataFromLocalWebhook' | 'encryption' | 'userHomeDir' | 'persistedLastProcessedSeq' | 'agentEnvironment'
+  'happySessionMetadataFromLocalWebhook' | 'encryption' | 'userHomeDir' | 'persistedLastProcessedSeq' | 'agentEnvironment' | 'deferredContinuationContextFile'
 >;
 
 /**
@@ -56,18 +56,24 @@ export function hydrateTrackedSessionFromPersisted(persisted: PersistedSession |
       ? { persistedLastProcessedSeq: persisted.lastProcessedSeq }
       : {}),
     ...(agentEnvironment ? { agentEnvironment } : {}),
+    ...(persisted.deferredContinuationContextFile
+      ? { deferredContinuationContextFile: persisted.deferredContinuationContextFile }
+      : {}),
   };
 }
 
 export function hydrateRecoveredSessionFromPersisted(
   persisted: PersistedSession | undefined,
   baselineSeq: number,
-): Pick<TrackedSession, 'userHomeDir' | 'persistedLastProcessedSeq' | 'agentEnvironment'> {
+): Pick<TrackedSession, 'userHomeDir' | 'persistedLastProcessedSeq' | 'agentEnvironment' | 'deferredContinuationContextFile'> {
   const hydrated = hydrateTrackedSessionFromPersisted(persisted);
   return {
     ...(hydrated.userHomeDir ? { userHomeDir: hydrated.userHomeDir } : {}),
     persistedLastProcessedSeq: baselineSeq,
     ...(hydrated.agentEnvironment ? { agentEnvironment: hydrated.agentEnvironment } : {}),
+    ...(hydrated.deferredContinuationContextFile
+      ? { deferredContinuationContextFile: hydrated.deferredContinuationContextFile }
+      : {}),
   };
 }
 
