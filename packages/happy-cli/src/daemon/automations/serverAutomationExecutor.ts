@@ -18,6 +18,7 @@ import type {
 } from './serverAutomationRuntimeStore'
 import type { AutomationMcpCallerGrantResult, AutomationMcpSpawnContext } from './automationMcpCallerGrant'
 import type { AutomationConnectorPreflightResult } from './automationConnectorPreflight'
+import { isPermanentGithubTriggerFailure } from './githubTriggerPermanentFailure'
 import type { GithubTriggerWorktreePlan } from './githubTriggerWorktree'
 import type {
   AutomationAgentTaskDispatch,
@@ -1230,6 +1231,20 @@ async function executeStartedRun(
       input.logDebug?.(
         `[server-automation] ${automation.automationId} GitHub worktree preparation failed: ${prepared.error}`,
       )
+      // 되돌릴 수 없는 실패(삭제된 브랜치 등)는 재시도해도 결과가 같다. ERROR 로
+      // 돌아가면 이 경로가 persistGithubTriggerState 에 도달하지 않아 이벤트가
+      // 소비되지 않고 매분 재시도된다(2026-08-29: 머지 후 삭제된 브랜치 하나가
+      // 그렇게 돌았다). 이벤트를 소비하고 SKIPPED_GATE 로 끊는다.
+      if (isPermanentGithubTriggerFailure(prepared.error)) {
+        input.logDebug?.(
+          `[server-automation] ${automation.automationId} skipping permanently unavailable GitHub event`,
+        )
+        persistGithubTriggerState?.()
+        return {
+          outcome: 'SKIPPED_GATE', sessionId: null,
+          ...(degradedCode ? { degradedCode } : {}),
+        }
+      }
       return {
         outcome: 'ERROR', sessionId: null,
         ...(degradedCode ? { degradedCode } : {}),
