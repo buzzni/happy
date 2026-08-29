@@ -19,6 +19,7 @@ import { AcpSessionManager } from '@/agent/acp/AcpSessionManager';
 import type { SessionEnvelope } from '@slopus/happy-wire';
 import { logger } from '@/ui/logger';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
+import { createDeferredContinuationContextConsumer } from '@/utils/deferredContinuationContext';
 import { Credentials, readSettings } from '@/persistence';
 import { initialMachineMetadata } from '@/daemon/run';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
@@ -136,6 +137,7 @@ function resolveGatewayConfig(opts: RunOpenClawOptions): OpenClawGatewayConfig {
 }
 
 export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
+  const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
   const verbose = opts.verbose === true;
   const turnInactivityTimeoutMs = opts.turnInactivityTimeoutMs ?? TURN_INACTIVITY_TIMEOUT_MS;
   const sessionTag = randomUUID();
@@ -313,7 +315,14 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
 
   session.onUserMessage((message) => {
     if (!message.content.text) return;
-    messageQueue.push(message.content.text, {});
+    const deferredTurn = deferredContinuation.prepare(message.content.text);
+    try {
+      messageQueue.push(deferredTurn?.text ?? message.content.text, {});
+      deferredTurn?.commit();
+    } catch (error) {
+      deferredTurn?.rollback();
+      throw error;
+    }
   });
   session.keepAlive(thinking, 'remote');
 

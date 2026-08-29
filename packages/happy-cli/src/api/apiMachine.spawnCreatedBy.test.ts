@@ -207,6 +207,48 @@ describe('ApiMachineClient spawn/resume RPC passthrough', () => {
         }));
     });
 
+    it.each(['claude', 'codex', 'gemini', 'grok', 'openclaw', 'opencode'])(
+        'forwards deferred continuation context without starting an initial turn for %s',
+        async (agent) => {
+            const spawnSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-1' });
+            const { ApiMachineClient } = await import('./apiMachine');
+            const client = new ApiMachineClient('token', machineClient());
+            client.setRPCHandlers(rpcHandlers({ spawnSession }));
+
+            await handlersFrom(client).get('machine-1:spawn-happy-session')?.({
+                directory: '/tmp/project',
+                agent,
+                deferredContinuationContext: 'Earlier transcript context',
+            });
+
+            expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
+                agent,
+                deferredContinuationContext: 'Earlier transcript context',
+            }));
+            expect(spawnSession).not.toHaveBeenCalledWith(expect.objectContaining({
+                initialPrompt: expect.anything(),
+            }));
+        },
+    );
+
+    it.each([
+        { value: '', message: 'Deferred continuation context must be a non-empty string' },
+        { value: 42, message: 'Deferred continuation context must be a non-empty string' },
+        { value: 'a'.repeat(256 * 1024 + 1), message: 'Deferred continuation context is too large' },
+    ])('rejects invalid deferred continuation context: $message', async ({ value, message }) => {
+        const spawnSession = vi.fn();
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ spawnSession }));
+
+        await expect(handlersFrom(client).get('machine-1:spawn-happy-session')?.({
+            directory: '/tmp/project',
+            agent: 'codex',
+            deferredContinuationContext: value,
+        })).rejects.toThrow(message);
+        expect(spawnSession).not.toHaveBeenCalled();
+    });
+
     it.each([
         { params: { exitAfterFirstTurn: true }, message: 'Run-once session requires a non-empty initial prompt' },
         { params: { initialPrompt: 42 }, message: 'Initial prompt must be a non-empty string' },

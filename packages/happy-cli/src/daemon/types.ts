@@ -92,4 +92,6 @@ export interface TrackedSession {
   userHomeDir?: string;
   /** Per-session capability restored only when this daemon resumes the child. */
   agentEnvironment?: SaycodeAgentEnvironment;
+  /** Persistent file consumed only after the first explicit user turn is accepted. */
+  deferredContinuationContextFile?: string;
 }

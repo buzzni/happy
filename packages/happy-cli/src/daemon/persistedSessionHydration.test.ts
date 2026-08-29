@@ -51,6 +51,12 @@ describe('hydrateTrackedSessionFromPersisted', () => {
     expect(hydrateTrackedSessionFromPersisted(persisted({ lastProcessedSeq: 41 })).persistedLastProcessedSeq).toBe(41);
   });
 
+  it('shouldRestoreDeferredContinuationContextAcrossDaemonRestarts', () => {
+    expect(hydrateTrackedSessionFromPersisted(persisted({
+      deferredContinuationContextFile: '/tmp/context-1.txt',
+    })).deferredContinuationContextFile).toBe('/tmp/context-1.txt');
+  });
+
   it('shouldRestoreTheSaycodeAgentCapabilityAcrossDaemonRestarts', () => {
     const agentEnvironment = {
       SAYCODE_AGENT_ENV: '1' as const,
@@ -86,6 +92,7 @@ describe('hydrateTrackedSessionFromPersisted', () => {
     expect('persistedLastProcessedSeq' in hydrated).toBe(false);
     expect('userHomeDir' in hydrated).toBe(false);
     expect('agentEnvironment' in hydrated).toBe(false);
+    expect('deferredContinuationContextFile' in hydrated).toBe(false);
   });
 
   // A fabricated runtime would make the idle guard treat a restored session as

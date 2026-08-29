@@ -49,7 +49,7 @@ import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation
 import { shouldYieldDaemonStateOwnership } from './daemonStateOwnership';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
-import { statSync } from 'fs';
+import { existsSync, rmSync, statSync } from 'fs';
 import { join } from 'path';
 import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
@@ -84,6 +84,7 @@ import {
 } from './resumeGuards';
 import { decideResumeCursorPersist } from './resumeCursorPersistence';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
+import { stageDeferredContinuationContext } from '@/utils/deferredContinuationContext';
 import { reportSandboxDependencyPreflight } from '@/sandbox/dependencyPreflight';
 import { startLogHousekeeping } from '@/ui/logHousekeepingRunner';
 import {
@@ -611,6 +612,9 @@ export async function startDaemon(): Promise<void> {
           savedAt: Date.now(),
           lastProcessedSeq: inheritedLastProcessedSeq,
           agentEnvironment: existingSession?.agentEnvironment ?? preserved?.agentEnvironment,
+          deferredContinuationContextFile:
+            existingSession?.deferredContinuationContextFile
+            ?? preserved?.deferredContinuationContextFile,
         });
       }
 
@@ -840,6 +844,13 @@ export async function startDaemon(): Promise<void> {
         }
       }
 
+      let stagedDeferredContinuationContextFile: string | undefined;
+      const cleanupStagedDeferredContinuationContext = (): void => {
+        if (!stagedDeferredContinuationContextFile) return;
+        rmSync(stagedDeferredContinuationContextFile, { force: true });
+        stagedDeferredContinuationContextFile = undefined;
+      };
+
       try {
         const additionalDirectoryResult = await prepareAdditionalDirectories({
           requested: options.additionalDirectories,
@@ -850,16 +861,24 @@ export async function startDaemon(): Promise<void> {
           }),
         });
         const finishSpawn = async (spawn: Promise<SpawnSessionResult>): Promise<SpawnSessionResult> => {
-          const result = await spawn;
-          if (result.type !== 'success' || options.additionalDirectories === undefined) return result;
-          return {
-            ...result,
-            additionalDirectories: {
-              version: 1,
-              accepted: additionalDirectoryResult.accepted,
-              skipped: additionalDirectoryResult.skipped,
-            },
-          };
+          try {
+            const result = await spawn;
+            if (result.type !== 'success') {
+              cleanupStagedDeferredContinuationContext();
+            }
+            if (result.type !== 'success' || options.additionalDirectories === undefined) return result;
+            return {
+              ...result,
+              additionalDirectories: {
+                version: 1,
+                accepted: additionalDirectoryResult.accepted,
+                skipped: additionalDirectoryResult.skipped,
+              },
+            };
+          } catch (error) {
+            cleanupStagedDeferredContinuationContext();
+            throw error;
+          }
         };
 
         if (trustedMcpContext && options.mcpCallerGrantEnvelope) {
@@ -1036,6 +1055,14 @@ export async function startDaemon(): Promise<void> {
         if (options.exitAfterFirstTurn) {
           extraEnv.HAPPY_AUTOMATION_RUN_ONCE = '1';
         }
+        if (options.deferredContinuationContext) {
+          const staged = await stageDeferredContinuationContext(
+            options.deferredContinuationContext,
+            configuration.happyHomeDir,
+          );
+          stagedDeferredContinuationContextFile = staged.file;
+          extraEnv.HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE = staged.file;
+        }
         if (additionalDirectoryResult.accepted.length > 0) {
           extraEnv.HAPPY_ADDITIONAL_DIRECTORIES = JSON.stringify(additionalDirectoryResult.accepted);
           mergeAdditionalDirectoriesIntoSandboxEnvironment(
@@ -1086,10 +1113,10 @@ export async function startDaemon(): Promise<void> {
           // Determine agent command - support claude, codex, gemini, openclaw, opencode.
           const agent = resolveTmuxSpawnAgentCommand(options.agent);
           if (!agent) {
-            return {
+            return finishSpawn(Promise.resolve({
               type: 'error',
               errorMessage: `Unsupported agent type: '${options.agent}'. Please update your CLI to the latest version.`
-            };
+            }));
           }
           const resumeId = agent === 'claude'
             ? options.resumeClaudeSessionId
@@ -1128,6 +1155,7 @@ export async function startDaemon(): Promise<void> {
 
             // Create a tracked session for tmux windows - now we have the real PID!
             const agentEnvironment = captureSaycodeAgentEnvironment(tmuxEnv);
+            const deferredContinuationContextFile = tmuxEnv.HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE;
             const trackedSession: TrackedSession = {
               startedBy: 'daemon',
               pid: tmuxResult.pid, // Real PID from tmux -P flag
@@ -1136,6 +1164,7 @@ export async function startDaemon(): Promise<void> {
               directoryCreated,
               userHomeDir: stagedUserHomeDir,
               ...(agentEnvironment ? { agentEnvironment } : {}),
+              ...(deferredContinuationContextFile ? { deferredContinuationContextFile } : {}),
               message: directoryCreated
                 ? `The path '${directory}' did not exist. We created a new folder and spawned a new session in tmux session '${tmuxSessionName}'. Use 'tmux attach -t ${tmuxSessionName}' to view the session.`
                 : `Spawned new session in tmux session '${tmuxSessionName}'. Use 'tmux attach -t ${tmuxSessionName}' to view the session.`
@@ -1167,10 +1196,10 @@ export async function startDaemon(): Promise<void> {
           // openclaw, and opencode (opencode runs over ACP: `happy acp opencode`).
           const agentArgs = resolveRegularSpawnAgentArgs(options.agent);
           if (!agentArgs) {
-            return {
+            return finishSpawn(Promise.resolve({
               type: 'error',
               errorMessage: `Unsupported agent type: '${options.agent}'. Please update your CLI to the latest version.`
-            };
+            }));
           }
           const agentCommand = agentArgs[0];
           const args = [
@@ -1207,11 +1236,12 @@ export async function startDaemon(): Promise<void> {
         }
 
         // This should never be reached, but TypeScript requires a return statement
-        return {
+        return finishSpawn(Promise.resolve({
           type: 'error',
           errorMessage: 'Unexpected error in session spawning'
-        };
+        }));
       } catch (error) {
+        cleanupStagedDeferredContinuationContext();
         const errorMessage = error instanceof Error ? error.message : String(error);
         logger.debug('[DAEMON RUN] Failed to spawn session:', error);
         return {
@@ -1254,6 +1284,7 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[DAEMON RUN] Spawned process with PID ${happyProcess.pid}`);
 
       const agentEnvironment = captureSaycodeAgentEnvironment(env);
+      const deferredContinuationContextFile = env.HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE;
       const trackedSession: TrackedSession = {
         startedBy: 'daemon',
         pid: happyProcess.pid,
@@ -1263,6 +1294,7 @@ export async function startDaemon(): Promise<void> {
         message,
         userHomeDir,
         ...(agentEnvironment ? { agentEnvironment } : {}),
+        ...(deferredContinuationContextFile ? { deferredContinuationContextFile } : {}),
       };
 
       recoveredPendingSpawnStartedAt.delete(happyProcess.pid);
@@ -1323,6 +1355,7 @@ export async function startDaemon(): Promise<void> {
           userHomeDir: session.userHomeDir,
           lastProcessedSeq: session.runtime?.lastProcessedSeq ?? session.persistedLastProcessedSeq,
           agentEnvironment: session.agentEnvironment,
+          deferredContinuationContextFile: session.deferredContinuationContextFile,
         });
       }
       logger.debug(`[DAEMON RUN] Preserved session ${session.happySessionId} for resume (${reason})`);
@@ -1370,6 +1403,7 @@ export async function startDaemon(): Promise<void> {
         userHomeDir: session.userHomeDir,
         lastProcessedSeq: cursor,
         agentEnvironment: session.agentEnvironment,
+        deferredContinuationContextFile: session.deferredContinuationContextFile,
       });
       session.persistedLastProcessedSeq = cursor;
       resumeCursorPersistedAt.set(sessionId, now);
@@ -1580,6 +1614,13 @@ export async function startDaemon(): Promise<void> {
             automation: options?.automation?.environmentVariables,
             explicit: {
               ...reconnectEnvironment,
+              ...(tracked.deferredContinuationContextFile
+                && existsSync(tracked.deferredContinuationContextFile)
+                ? {
+                  HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE:
+                    tracked.deferredContinuationContextFile,
+                }
+                : {}),
               // user-credential 세션은 원래 계정의 스테이징 자격증명으로 복원 —
               // 없으면 위의 credentialDecision 이 이미 refuse 했다.
               ...(credentialDecision.kind === 'user-staged'
@@ -1721,6 +1762,7 @@ export async function startDaemon(): Promise<void> {
           userHomeDir: recoveredPersisted.userHomeDir,
           lastProcessedSeq: decision.baselineSeq,
           agentEnvironment: recoveredPersisted.agentEnvironment,
+          deferredContinuationContextFile: recoveredPersisted.deferredContinuationContextFile,
         });
 
         const result = await spawnResumedSession(serverSession.id, {

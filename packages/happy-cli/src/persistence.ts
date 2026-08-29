@@ -643,6 +643,8 @@ export type PersistedSession = {
   lastProcessedSeq?: number;
   /** Per-session orchestration capability restored after daemon restart. */
   agentEnvironment?: SaycodeAgentEnvironment;
+  /** File containing context pending delivery on the first explicit user turn. */
+  deferredContinuationContextFile?: string;
 };
 
 type SessionsFile = {
