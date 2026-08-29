@@ -84,7 +84,10 @@ import {
 } from './resumeGuards';
 import { decideResumeCursorPersist } from './resumeCursorPersistence';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
-import { stageDeferredContinuationContext } from '@/utils/deferredContinuationContext';
+import {
+  removeDeferredContinuationContextFile,
+  stageDeferredContinuationContext,
+} from '@/utils/deferredContinuationContext';
 import { reportSandboxDependencyPreflight } from '@/sandbox/dependencyPreflight';
 import { startLogHousekeeping } from '@/ui/logHousekeepingRunner';
 import {
@@ -397,6 +400,9 @@ export async function startDaemon(): Promise<void> {
             // The state file's staged home dir is the more current one; fall
             // back to the persisted record rather than clobbering it.
             ...(persisted.userHomeDir ? { userHomeDir: persisted.userHomeDir } : {}),
+            ...(persisted.deferredContinuationContextFile
+              ? { deferredContinuationContextFile: persisted.deferredContinuationContextFile }
+              : {}),
           };
           pidToTrackedSession.set(persisted.pid, recovered);
           if (!persisted.happySessionId) {
@@ -530,6 +536,7 @@ export async function startDaemon(): Promise<void> {
         tmuxSessionId: s.tmuxSessionId,
         startedAt: sessionStartTimes.get(s.pid) ?? Date.now(),
         userHomeDir: s.userHomeDir,
+        deferredContinuationContextFile: s.deferredContinuationContextFile,
       }));
     };
 
@@ -552,6 +559,7 @@ export async function startDaemon(): Promise<void> {
           ),
         );
       }
+      removeDeferredContinuationContextFile(stalePending?.deferredContinuationContextFile);
     };
 
     // Handle webhook from happy session reporting itself
@@ -1973,6 +1981,7 @@ export async function startDaemon(): Promise<void> {
       const preservedForResume = tracked ? preserveSessionForResume(tracked, `process-exit:${pid}`) : false;
       if (!preservedForResume) {
         logger.debug(`[DAEMON RUN] Removing exited process PID ${pid} from tracking`);
+        removeDeferredContinuationContextFile(tracked?.deferredContinuationContextFile);
       }
       pidToTrackedSession.delete(pid);
       recoveredPendingSpawnStartedAt.delete(pid);
@@ -2383,6 +2392,9 @@ export async function startDaemon(): Promise<void> {
     if (deadSessionsToCleanup.length > 0) {
       logger.debug(`[DAEMON RUN] Cleaning up ${deadSessionsToCleanup.length} dead sessions from previous run`);
       for (const dead of deadSessionsToCleanup) {
+        if (!dead.happySessionId || !persistedSessions[dead.happySessionId]) {
+          removeDeferredContinuationContextFile(dead.deferredContinuationContextFile);
+        }
         if (dead.happySessionId) {
           api.postSessionEvent(dead.happySessionId, 'session-end', '').catch((error) => {
             logger.debug(`[DAEMON RUN] Failed to emit session-end for dead session ${dead.happySessionId}: ${error}`);
@@ -2414,19 +2426,11 @@ export async function startDaemon(): Promise<void> {
       }
 
       // Prune stale sessions
-      let sessionsPruned = false;
       for (const [pid, _] of pidToTrackedSession.entries()) {
         if (!isPidAlive(pid)) {
           logger.debug(`[DAEMON RUN] Removing stale session with PID ${pid} (process no longer exists)`);
-          pidToTrackedSession.delete(pid);
-          recoveredPendingSpawnStartedAt.delete(pid);
-          sessionStartTimes.delete(pid);
-          pidToAdoptedAt.delete(pid);
-          sessionsPruned = true;
+          onChildExited(pid);
         }
-      }
-      if (sessionsPruned) {
-        persistTrackedSessions();
       }
 
       // Reclaim sessions whose runtime stopped reporting entirely (dead process

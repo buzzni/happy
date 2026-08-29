@@ -93,6 +93,8 @@ export interface PersistedTrackedSession {
   startedAt: number;
   /** Tmp HAPPY_HOME_DIR staged for this session, if any. Cleaned on exit. */
   userHomeDir?: string;
+  /** Context file awaiting the first explicit user turn. */
+  deferredContinuationContextFile?: string;
 }
 
 /**

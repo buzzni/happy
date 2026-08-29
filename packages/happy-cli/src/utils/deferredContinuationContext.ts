@@ -1,12 +1,27 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { logger } from '@/ui/logger'
 
 export const DEFERRED_CONTINUATION_CONTEXT_MAX_BYTES = 256 * 1024
 
 const CONTEXT_DIRECTORY = 'deferred-continuations'
 const CONTEXT_ENV_KEY = 'HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE'
+
+export function removeDeferredContinuationContextFile(file: string | undefined): void {
+  if (!file) return
+  try {
+    rmSync(file, { force: true })
+  } catch (error) {
+    // Cleanup is diagnostic/storage hygiene after the turn has already been
+    // accepted. It must not turn that accepted enqueue into a retry that
+    // injects the same context twice.
+    logger.warn('[deferred-continuation] Failed to remove staged context file', {
+      errorName: error instanceof Error ? error.name : typeof error,
+    })
+  }
+}
 
 export async function stageDeferredContinuationContext(
   context: string,
@@ -39,12 +54,15 @@ export function createDeferredContinuationContextConsumer(
   delete env[CONTEXT_ENV_KEY]
 
   let context: string | null = null
-  if (typeof file === 'string' && file.length > 0 && existsSync(file)) {
+  if (typeof file === 'string' && file.length > 0) {
     try {
       const loaded = readFileSync(file, 'utf8').trim()
-      context = loaded.length > 0 ? loaded : null
+      if (!loaded) throw new Error('empty context')
+      context = loaded
     } catch {
-      context = null
+      // A staged path means continuation context is a premise of this child.
+      // Proceeding without it silently starts an unrelated conversation.
+      throw new Error('Deferred continuation context could not be loaded')
     }
   }
   let reserved = false
@@ -70,7 +88,7 @@ export function createDeferredContinuationContextConsumer(
           if (!reserved) return
           reserved = false
           context = null
-          if (file) rmSync(file, { force: true })
+          removeDeferredContinuationContextFile(file)
         },
         rollback: () => {
           reserved = false

@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -54,7 +54,7 @@ describe('deferred continuation context', () => {
     )).rejects.toThrow('Deferred continuation context is too large')
   })
 
-  it('does not consume a context file that disappeared before restart hydration', () => {
+  it('fails closed when a staged context file disappears before the child reads it', () => {
     const home = mkdtempSync(join(tmpdir(), 'happy-deferred-context-'))
     directories.push(home)
     const file = join(home, 'missing-context.txt')
@@ -62,10 +62,35 @@ describe('deferred continuation context', () => {
     expect(readFileSync(file, 'utf8')).toBe('context')
     rmSync(file)
 
-    const consumer = createDeferredContinuationContextConsumer({
+    expect(() => createDeferredContinuationContextConsumer({
       HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE: file,
-    })
+    })).toThrow('Deferred continuation context could not be loaded')
+  })
 
-    expect(consumer.prepare('next')).toBeNull()
+  it('fails closed when a staged context file is empty', () => {
+    const home = mkdtempSync(join(tmpdir(), 'happy-deferred-context-'))
+    directories.push(home)
+    const file = join(home, 'empty-context.txt')
+    writeFileSync(file, '   ', 'utf8')
+
+    expect(() => createDeferredContinuationContextConsumer({
+      HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE: file,
+    })).toThrow('Deferred continuation context could not be loaded')
+  })
+
+  it('does not replay accepted context when staged file cleanup fails', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'happy-deferred-context-'))
+    directories.push(home)
+    const staged = await stageDeferredContinuationContext('previous context', home)
+    const consumer = createDeferredContinuationContextConsumer({
+      HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE: staged.file,
+    })
+    const prepared = consumer.prepare('first explicit turn')
+
+    rmSync(staged.file)
+    mkdirSync(staged.file)
+
+    expect(() => prepared?.commit()).not.toThrow()
+    expect(consumer.prepare('second turn')).toBeNull()
   })
 })
