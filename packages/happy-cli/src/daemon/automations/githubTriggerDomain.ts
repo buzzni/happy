@@ -1,4 +1,5 @@
 import type { GithubTrigger, GithubTriggerEvent } from '@slopus/happy-wire';
+import { isPromotionPullRequest } from './promotionPullRequest';
 
 export interface GithubPullRequestSnapshot {
   number: number;
@@ -79,6 +80,10 @@ function matchesPathPrefix(path: string, prefix: string): boolean {
 
 function matchesFilter(trigger: GithubTrigger, pr: GithubPullRequestSnapshot): boolean {
   const filter = trigger.filter;
+  // 장수 브랜치끼리 오가는 승격·동기화 PR 은 리뷰 대상이 아니다. head 가 계속
+  // 움직여 checkout 시점마다 HEAD 가 어긋나고, 나르는 커밋들은 이미 각자 자기
+  // PR 에서 리뷰를 거쳤다.
+  if (isPromotionPullRequest(pr)) return false;
   if (filter.baseBranch !== null && pr.baseRefName !== filter.baseBranch) return false;
   if (filter.excludeDraft && pr.isDraft) return false;
   if (filter.label !== null && !pr.labels.some((label) => label.name.toLowerCase() === filter.label!.toLowerCase())) {
