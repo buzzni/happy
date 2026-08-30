@@ -1380,10 +1380,13 @@ export class CodexAppServerClient {
         writableRoots?: string[];
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
+        beforeTurn?: () => Promise<void>;
     }): Promise<void> {
         if (!this._threadId) {
             throw new Error('No active thread. Call startThread first.');
         }
+
+        await opts?.beforeTurn?.();
 
         const extraInputItems = opts?.extraInputItems ?? [];
         const input: InputItem[] = [];
@@ -1448,6 +1451,7 @@ export class CodexAppServerClient {
         writableRoots?: string[];
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
+        beforeTurn?: () => Promise<void>;
         /** Max time without any turn activity before interrupting the provider. */
         turnTimeoutMs?: number;
     }): Promise<{ aborted: boolean }> {
@@ -1465,6 +1469,8 @@ export class CodexAppServerClient {
         // Clear any stale watchdog snapshot so it can only describe this turn's abort.
         this.pendingInactivityAbort = null;
 
+        await opts?.beforeTurn?.();
+
         const timeoutMs = opts?.turnTimeoutMs ?? CodexAppServerClient.TURN_TIMEOUT_MS;
         const completion = new Promise<boolean>((resolve) => {
             this.pendingTurnCompletion = {
@@ -1480,7 +1486,7 @@ export class CodexAppServerClient {
         });
 
         try {
-            await this.sendTurn(prompt, opts);
+            await this.sendTurn(prompt, opts ? { ...opts, beforeTurn: undefined } : undefined);
         } catch (err) {
             this.resolvePendingTurn(true);
             throw err;

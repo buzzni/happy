@@ -36,6 +36,84 @@ describe('claudeRemote', () => {
         expect(query).not.toHaveBeenCalled();
     });
 
+    it('does not dispatch a protected turn when the checkpoint gate fails', async () => {
+        const calls: string[] = [];
+        vi.mocked(query).mockImplementation(() => {
+            calls.push('provider');
+            return {
+                setPermissionMode: vi.fn(),
+                mcpServerStatus: vi.fn(async () => []),
+                async *[Symbol.asyncIterator]() {
+                    yield { type: 'result', subtype: 'success' };
+                },
+            } as any;
+        });
+        const beforeTurn = vi.fn(async () => {
+            calls.push('gate');
+            throw new Error('checkpoint unavailable');
+        });
+        const options = {
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            exitAfterFirstTurn: true,
+            nextMessage: async () => ({ message: 'edit the project', mode }),
+            beforeTurn,
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+        };
+
+        await expect(claudeRemote(options)).rejects.toThrow('checkpoint unavailable');
+
+        expect(beforeTurn).toHaveBeenCalledOnce();
+        expect(query).not.toHaveBeenCalled();
+        expect(calls).toEqual(['gate']);
+    });
+
+    it('waits for excluded-path confirmation before dispatching a protected turn', async () => {
+        vi.mocked(query).mockReturnValue({
+            setPermissionMode: vi.fn(),
+            mcpServerStatus: vi.fn(async () => []),
+            async *[Symbol.asyncIterator]() {
+                yield { type: 'result', subtype: 'success' };
+            },
+        } as any);
+        let rejectConfirmation!: (reason: Error) => void;
+        const confirmation = new Promise<void>((_, reject) => {
+            rejectConfirmation = reject;
+        });
+        const beforeTurn = vi.fn(() => confirmation);
+        const options = {
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            exitAfterFirstTurn: true,
+            nextMessage: async () => ({ message: 'update the excluded .env file', mode }),
+            beforeTurn,
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+        };
+
+        const running = claudeRemote(options);
+        await vi.waitFor(() => expect(beforeTurn).toHaveBeenCalledOnce());
+
+        expect(query).not.toHaveBeenCalled();
+
+        rejectConfirmation(new Error('excluded path confirmation cancelled'));
+        await expect(running).rejects.toThrow('excluded path confirmation cancelled');
+        expect(query).not.toHaveBeenCalled();
+    });
+
     it('returns after the first completed turn without waiting for more automation input', async () => {
         vi.mocked(query).mockReturnValue({
             setPermissionMode: vi.fn(),
@@ -527,6 +605,9 @@ describe('claudeRemote', () => {
         } as any);
         const onApplied = vi.fn();
         const boundaryOrder: string[] = [];
+        const beforeTurn = vi.fn(async () => {
+            boundaryOrder.push('checkpoint-gate');
+        });
         let messageCount = 0;
 
         await claudeRemote({
@@ -534,6 +615,7 @@ describe('claudeRemote', () => {
             path: process.cwd(),
             allowedTools: [],
             hookSettingsPath: '/tmp/happy-test-settings.json',
+            beforeTurn,
             nextMessage: async () => {
                 boundaryOrder.push('next-message');
                 messageCount += 1;
@@ -559,7 +641,14 @@ describe('claudeRemote', () => {
             },
         });
 
-        expect(boundaryOrder.slice(0, 3)).toEqual(['next-message', 'next-message', 'mcp-sync']);
+        await vi.waitFor(() => expect(beforeTurn).toHaveBeenCalledTimes(2));
+        expect(boundaryOrder.slice(0, 5)).toEqual([
+            'next-message',
+            'checkpoint-gate',
+            'next-message',
+            'mcp-sync',
+            'checkpoint-gate',
+        ]);
         await vi.waitFor(() => {
             expect(setMcpServers).toHaveBeenCalledWith({
                 happy: { type: 'http', url: 'http://happy.test/mcp' },

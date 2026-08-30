@@ -420,6 +420,92 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('does not dispatch a protected turn when the checkpoint gate fails', async () => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-protected', path: '/tmp/thread-protected' },
+                            model: 'gpt-test', modelProvider: 'openai', cwd: '/tmp/project',
+                            approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' }, reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { turn: { id: 'turn-should-not-start' } },
+                    }), 0);
+                }
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const beforeTurn = vi.fn(async () => {
+            throw new Error('checkpoint unavailable');
+        });
+        await client.connect();
+        await client.startThread({ cwd: '/tmp/project', sandbox: 'workspace-write' });
+
+        await expect(client.sendTurn('edit the project', { beforeTurn } as any))
+            .rejects.toThrow('checkpoint unavailable');
+
+        expect(beforeTurn).toHaveBeenCalledOnce();
+        expect(requests.some(({ method }) => method === 'turn/start')).toBe(false);
+        await client.disconnect();
+    });
+
+    it('waits for excluded-path confirmation before dispatching a protected turn', async () => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-excluded', path: '/tmp/thread-excluded' },
+                            model: 'gpt-test', modelProvider: 'openai', cwd: '/tmp/project',
+                            approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' }, reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { turn: { id: 'turn-should-not-start' } },
+                    }), 0);
+                }
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        let rejectConfirmation!: (reason: Error) => void;
+        const confirmation = new Promise<void>((_, reject) => {
+            rejectConfirmation = reject;
+        });
+        const beforeTurn = vi.fn(() => confirmation);
+        await client.connect();
+        await client.startThread({ cwd: '/tmp/project', sandbox: 'workspace-write' });
+
+        const running = client.sendTurnAndWait(
+            'update the excluded .env file',
+            { beforeTurn } as any,
+        );
+        await vi.waitFor(() => expect(beforeTurn).toHaveBeenCalledOnce());
+
+        expect(requests.some(({ method }) => method === 'turn/start')).toBe(false);
+
+        rejectConfirmation(new Error('excluded path confirmation cancelled'));
+        await expect(running).rejects.toThrow('excluded path confirmation cancelled');
+        expect(requests.some(({ method }) => method === 'turn/start')).toBe(false);
+        await client.disconnect();
+    });
+
     it('clears persisted developer instructions when resume explicitly sends null', async () => {
         const requests: MockRpcMessage[] = [];
         mockSpawn.mockImplementation(() => createMockProcess({

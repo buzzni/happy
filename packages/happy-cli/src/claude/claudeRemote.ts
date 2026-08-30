@@ -51,6 +51,7 @@ export async function claudeRemote(opts: {
 
     // Dynamic parameters
     nextMessage: () => Promise<{ message: MessageParam['content'], mode: EnhancedMode } | null>,
+    beforeTurn?: () => Promise<void>,
     onReady: () => void,
     isAborted: (toolCallId: string) => boolean,
 
@@ -131,6 +132,8 @@ export async function claudeRemote(opts: {
         opts.onReady();
         return;
     }
+
+    await opts.beforeTurn?.();
 
     // Handle /compact command
     let isCompactCommand = false;
@@ -362,6 +365,12 @@ export async function claudeRemote(opts: {
                         messages.end();
                     } else {
                         await mcpConfigSynchronizer?.sync();
+                        try {
+                            await opts.beforeTurn?.();
+                        } catch (error) {
+                            messages.setError(error instanceof Error ? error : new Error(String(error)));
+                            return;
+                        }
                         acceptsPromptSuggestion = false;
                         opts.onPromptSuggestionChange?.(null);
                         opts.onMcpControllerReady?.(null);
