@@ -39,6 +39,7 @@ import { agentProfileRoutes } from "./routes/agentProfileRoutes";
 import { isLocalStorage, getLocalFilesDir } from "@/storage/files";
 import * as path from "path";
 import * as fs from "fs";
+import { startUsageOutboxWorker } from "@/app/usage/usageOutbox";
 
 export interface StartApiOptions {
     port?: number;
@@ -51,6 +52,11 @@ export async function startApi(opts: StartApiOptions = {}) {
 
     // Configure
     log('Starting API...');
+    const usageIngestUrl = process.env.SAYCODE_USAGE_INGEST_URL;
+    const usageIngestSecret = process.env.SAYCODE_USAGE_INGEST_SECRET;
+    if (!!usageIngestUrl !== !!usageIngestSecret) {
+        throw new Error('SAYCODE_USAGE_INGEST_URL and SAYCODE_USAGE_INGEST_SECRET must be configured together');
+    }
 
     // Start API
     const app = fastify({
@@ -236,6 +242,16 @@ export async function startApi(opts: StartApiOptions = {}) {
     // upgrade listener is already in place (they coexist on app.server; see
     // previewWebSocketRelay.ts). Handles /v1/preview/:machineId/:port/* upgrades.
     previewWebSocketRelay(typed);
+
+    if (usageIngestUrl && usageIngestSecret) {
+        const usageOutboxWorker = startUsageOutboxWorker({
+            endpoint: usageIngestUrl,
+            secret: usageIngestSecret,
+        });
+        onShutdown('usage-outbox', async () => {
+            usageOutboxWorker.stop();
+        });
+    }
 
     // End
     log(`API ready on http://${host}:${port}`);

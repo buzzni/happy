@@ -118,6 +118,55 @@ describe('planGithubTrigger', () => {
   })
 })
 
+describe('경로 필터의 glob 접미어', () => {
+  // 2026-08-31 프로덕션 — hsmoa_backend 리뷰 자동화 2개가 한 건도 돌지 않았다.
+  // 경로 필터가 `projects/hsmoa_catalog/*` 처럼 저장돼 있었는데 매처는 glob 이
+  // 아니라 리터럴 접두어 비교라, 9개 경로 전부가 어떤 파일과도 매칭되지 않았다.
+  // UI 는 `/*` 를 경고 없이 저장했고 매칭 0건은 아무 로그도 남기지 않아,
+  // "필터가 제대로 걸러냈다" 와 "필터가 고장났다" 를 구분할 수 없었다.
+  const base = { number: 0, title: 't', url: 'u', author: { login: 'a' },
+    baseRefName: 'main', headRefName: 'f', isDraft: false, state: 'OPEN' as const,
+    mergedAt: null, labels: [], changedFiles: 0, files: [] }
+  const withPaths = (paths: string[]) => ({
+    event: 'opened' as const,
+    filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths },
+    action: 'start-session' as const, githubCredentialId: null,
+  })
+  const prTouching = (n: number, ...files: string[]) => ({
+    ...base, number: n, changedFiles: files.length, files: files.map((path) => ({ path })),
+  })
+  const fires = (paths: string[], pr: ReturnType<typeof prTouching>) => planGithubTrigger({
+    trigger: withPaths(paths),
+    current: [pr],
+    previous: { snapshot: [], highestPrNumber: pr.number - 1, processed: [], pending: [] },
+  }).event !== null
+
+  it('matches a directory written with a trailing /*', () => {
+    expect(fires(['projects/hsmoa_catalog/*'],
+      prTouching(21022, 'projects/hsmoa_catalog/services/service.py'))).toBe(true)
+  })
+
+  it('matches a directory written with a trailing /**', () => {
+    expect(fires(['apps/web/**'], prTouching(11, 'apps/web/src/index.ts'))).toBe(true)
+  })
+
+  it('still refuses a sibling directory that merely shares a name prefix', () => {
+    // `/*` 를 벗긴다고 접두어가 헐거워지면 안 된다. apps/web-legacy 는 별개 디렉터리다.
+    expect(fires(['apps/web/*'], prTouching(11, 'apps/web-legacy/src/index.ts'))).toBe(false)
+  })
+
+  it('keeps matching a plain directory prefix', () => {
+    expect(fires(['apps/web'], prTouching(11, 'apps/web/src/index.ts'))).toBe(true)
+    expect(fires(['apps/web'], prTouching(11, 'apps/api/src/index.ts'))).toBe(false)
+  })
+
+  it('does not fire when a bare * would otherwise match everything', () => {
+    // `*` 만 남은 접두어는 "모든 경로" 를 뜻하는 glob 이지만, 이 매처는 glob 을
+    // 지원하지 않는다. 조용히 전체 통과시키면 필터가 없는 것과 같아진다.
+    expect(fires(['*'], prTouching(11, 'anything/at/all.ts'))).toBe(false)
+  })
+})
+
 const issueTrigger = {
   event: 'issue_opened' as const,
   filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },

@@ -4,3 +4,4 @@ export * from './sessionProtocol';
 export * from './voice';
 export * from './automation';
 export * from './promptProvenance';
+export * from './usage';

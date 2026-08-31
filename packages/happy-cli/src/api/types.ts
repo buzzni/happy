@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import type { Update, UpdateMachineBody } from '@slopus/happy-wire';
+import type { ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
 import type { SandboxConfig } from '@/persistence'
 
@@ -110,6 +110,7 @@ export interface ClientToServerEvents {
       [key: string]: number
     }
   }) => void
+  'provider-usage-report': (data: ProviderUsageEventV1) => void
 }
 
 /**
