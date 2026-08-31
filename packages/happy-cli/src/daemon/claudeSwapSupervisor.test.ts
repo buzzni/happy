@@ -71,10 +71,26 @@ describe('Claude swap supervisor', () => {
     expect(JSON.stringify(supervisor.status())).not.toContain('secret')
     expect(JSON.stringify(supervisor.status())).not.toContain('owner@example.com')
 
-    await supervisor.stop()
+    let stopped = false
+    const stopping = supervisor.stop().then(() => { stopped = true })
+    await vi.waitFor(() => expect(children[0].kill).toHaveBeenCalledWith('SIGTERM'))
+    expect(stopped).toBe(false)
+    children[0].emit('exit', 0, 'SIGTERM')
+    await stopping
     expect(children[0].kill).toHaveBeenCalledWith('SIGTERM')
     expect(writeEnabled).toHaveBeenLastCalledWith(false)
     expect(supervisor.status()).toEqual({ state: 'stopped', lastErrorKind: null })
+  })
+
+  it('does not report a successful stop when the child emits an error before exit', async () => {
+    const { supervisor, children } = setup()
+    await supervisor.enable()
+
+    const stopping = supervisor.stop()
+    await vi.waitFor(() => expect(children[0].kill).toHaveBeenCalledWith('SIGTERM'))
+    children[0].emit('error', new Error('kill failed'))
+
+    await expect(stopping).rejects.toThrow('claude-swap child failed while stopping')
   })
 
   it('records only masked switch metadata from fragmented JSON events', async () => {

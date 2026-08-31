@@ -18,6 +18,21 @@ const configuredClaudeList = JSON.stringify({
   accounts: [{ number: 1, email: 'owner@example.com', active: true }],
 })
 
+function claudeOauthPayload(accounts: Array<{ email: string; organizationUuid?: string }>): string {
+  return JSON.stringify({
+    version: 1,
+    encrypted: false,
+    activeAccountNumber: 1,
+    accounts: accounts.map((account, index) => ({
+      number: index + 1,
+      email: account.email,
+      organizationUuid: account.organizationUuid ?? '',
+      credentials: { claudeAiOauth: { accessToken: `oauth-${index + 1}` } },
+      config: { oauthAccount: { emailAddress: account.email } },
+    })),
+  })
+}
+
 function codexMultiAuthBundle() {
   return {
     version: 1,
@@ -958,8 +973,103 @@ describe('AI credential machine runtime', () => {
     expect(supervisor.enable).toHaveBeenCalledOnce()
   })
 
+  it('removes prior OAuth accounts and verifies only the imported bundle', async () => {
+    let activeAccountNumber: number | null = 1
+    let accounts = [
+      { number: 1, email: 'old-company@example.com', organizationUuid: 'old-org', usageStatus: 'ok' },
+      { number: 2, email: 'new-company@example.com', organizationUuid: 'new-org', usageStatus: 'ok' },
+    ]
+    const execFile = vi.fn(async (
+      command: string,
+      args: string[],
+      options?: { input?: string },
+    ) => {
+      if (command === 'cswap' && args[0] === '--version') {
+        return { stdout: 'cswap 0.25.0', stderr: '' }
+      }
+      if (command === 'cswap' && args[0] === 'list') {
+        return {
+          stdout: JSON.stringify({ schemaVersion: 1, activeAccountNumber, accounts }),
+          stderr: '',
+        }
+      }
+      if (command === 'cswap' && args[0] === 'remove' && options?.input === 'y\n') {
+        const removed = Number(args[1])
+        accounts = accounts.filter((account) => account.number !== removed)
+        if (activeAccountNumber === removed) activeAccountNumber = null
+      }
+      if (command === 'cswap' && args[0] === 'switch') activeAccountNumber = Number(args[1])
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime, supervisor } = setup({ execFile })
+
+    await expect(runtime.apply({
+      provider: 'claude',
+      payload: claudeOauthPayload([{
+        email: 'new-company@example.com', organizationUuid: 'new-org',
+      }]),
+    })).resolves.toMatchObject({ provider: 'claude', configured: true })
+
+    expect(execFile).toHaveBeenCalledWith(
+      'cswap', ['remove', '1'], expect.objectContaining({ input: 'y\n' }),
+    )
+    expect(execFile).toHaveBeenCalledWith(
+      'cswap', ['switch', '2', '--force', '--json'], expect.anything(),
+    )
+    expect(accounts).toEqual([
+      { number: 2, email: 'new-company@example.com', organizationUuid: 'new-org', usageStatus: 'ok' },
+    ])
+    const importCallOrder = execFile.mock.invocationCallOrder[
+      execFile.mock.calls.findIndex(([, args]) => args[0] === 'import')
+    ]
+    expect(supervisor.stop.mock.invocationCallOrder[0]).toBeLessThan(importCallOrder)
+    expect(supervisor.stop).toHaveBeenCalledBefore(supervisor.enable)
+  })
+
+  it('does not accept a usable prior OAuth account for an unusable imported bundle', async () => {
+    let activeAccountNumber: number | null = 1
+    let accounts = [
+      { number: 1, email: 'old-company@example.com', organizationUuid: 'old-org', usageStatus: 'ok' },
+      { number: 2, email: 'new-company@example.com', organizationUuid: 'new-org', usageStatus: 'relogin_required' },
+    ]
+    const execFile = vi.fn(async (
+      command: string,
+      args: string[],
+      options?: { input?: string },
+    ) => {
+      if (command === 'cswap' && args[0] === '--version') {
+        return { stdout: 'cswap 0.25.0', stderr: '' }
+      }
+      if (command === 'cswap' && args[0] === 'list') {
+        return {
+          stdout: JSON.stringify({ schemaVersion: 1, activeAccountNumber, accounts }),
+          stderr: '',
+        }
+      }
+      if (command === 'cswap' && args[0] === 'remove' && options?.input === 'y\n') {
+        const removed = Number(args[1])
+        accounts = accounts.filter((account) => account.number !== removed)
+        if (activeAccountNumber === removed) activeAccountNumber = null
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime, supervisor } = setup({ execFile })
+
+    await expect(runtime.apply({
+      provider: 'claude',
+      payload: claudeOauthPayload([{
+        email: 'new-company@example.com', organizationUuid: 'new-org',
+      }]),
+    })).rejects.toMatchObject({ kind: 'CLAUDE_APPLY_VERIFICATION_FAILED' })
+
+    expect(accounts).toEqual([
+      { number: 2, email: 'new-company@example.com', organizationUuid: 'new-org', usageStatus: 'relogin_required' },
+    ])
+    expect(supervisor.enable).not.toHaveBeenCalled()
+  })
+
   it('activates an imported Claude API key, removes prior accounts, and stops OAuth rotation', async () => {
-    let activeAccountNumber = 1
+    let activeAccountNumber: number | null = 1
     let accounts = [
       { number: 1, email: 'oauth@example.com', usageStatus: 'ok' },
       { number: 2, email: 'api-key-1@token.local', usageStatus: 'api_key' },
@@ -984,7 +1094,9 @@ describe('AI credential machine runtime', () => {
       }
       if (command === 'cswap' && args[0] === 'switch') activeAccountNumber = Number(args[1])
       if (command === 'cswap' && args[0] === 'remove' && options?.input === 'y\n') {
-        accounts = accounts.filter((account) => account.number !== Number(args[1]))
+        const removed = Number(args[1])
+        accounts = accounts.filter((account) => account.number !== removed)
+        if (activeAccountNumber === removed) activeAccountNumber = null
       }
       return { stdout: '', stderr: '' }
     })
@@ -1572,6 +1684,23 @@ describe('AI credential machine runtime', () => {
   it('rejects malformed Claude list output instead of reporting configured', async () => {
     const { runtime } = setup({
       execFile: vi.fn(async () => ({ stdout: '{"schemaVersion":1,"error":{"message":"secret"}}', stderr: '' })),
+    })
+
+    await expect(runtime.status({ provider: 'claude' })).rejects.toMatchObject({
+      kind: 'CLAUDE_STATUS_INVALID',
+    })
+  })
+
+  it('rejects malformed Claude account identity fields', async () => {
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: JSON.stringify({
+          schemaVersion: 1,
+          activeAccountNumber: 1,
+          accounts: [{ number: 1, email: 'owner@example.com', organizationUuid: 42 }],
+        }),
+        stderr: '',
+      })),
     })
 
     await expect(runtime.status({ provider: 'claude' })).rejects.toMatchObject({

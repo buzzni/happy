@@ -340,6 +340,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   async function applyClaude(payload: string) {
     await purgeManagedProvider('zai')
     const apiKeyTargetEmail = claudeApiKeyTargetEmail(payload)
+    const importedAccountIdentities = claudeImportedAccountIdentities(payload)
+    if (importedAccountIdentities !== null) await deps.supervisor.stop()
     await ensureClaudeSwap()
     const tempDir = await deps.makeTempDir()
     const tempFile = join(tempDir, 'claude-swap.json')
@@ -357,6 +359,30 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     let details = parseClaudeListDetails(status.stdout)
     if (!details.configured) {
       throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+    }
+    if (importedAccountIdentities !== null) {
+      const previousAccounts = details.accounts.filter((account) => (
+        !importedAccountIdentities.has(claudeListAccountIdentity(account))
+      ))
+      for (const account of previousAccounts) {
+        await deps.execFile('cswap', ['remove', String(account.number)], {
+          input: 'y\n',
+          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+        })
+      }
+      if (previousAccounts.length > 0) {
+        status = await deps.execFile('cswap', ['list', '--json'], {
+          maxOutputBytes: MAX_PAYLOAD_BYTES,
+          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+        })
+        details = parseClaudeListDetails(status.stdout)
+      }
+      const remainingIdentities = new Set(details.accounts.map(claudeListAccountIdentity))
+      if (details.accounts.length !== importedAccountIdentities.size
+        || remainingIdentities.size !== importedAccountIdentities.size
+        || [...importedAccountIdentities].some((identity) => !remainingIdentities.has(identity))) {
+        throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+      }
     }
     if (apiKeyTargetEmail !== null) {
       let target = details.accounts.find((account) => (
@@ -381,31 +407,6 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           && account.disabled !== true
         ))
         if (!target || details.activeAccountNumber !== target.number) {
-          throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
-        }
-      }
-      await deps.supervisor.stop()
-      const previousAccounts = details.accounts.filter((account) => account.number !== targetNumber)
-      for (const account of previousAccounts) {
-        await deps.execFile('cswap', ['remove', String(account.number)], {
-          input: 'y\n',
-          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
-        })
-      }
-      if (previousAccounts.length > 0) {
-        status = await deps.execFile('cswap', ['list', '--json'], {
-          maxOutputBytes: MAX_PAYLOAD_BYTES,
-          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
-        })
-        details = parseClaudeListDetails(status.stdout)
-        target = details.accounts.find((account) => (
-          account.email === apiKeyTargetEmail
-          && account.usageStatus === 'api_key'
-          && account.disabled !== true
-        ))
-        if (!target
-          || details.activeAccountNumber !== target.number
-          || details.accounts.length !== 1) {
           throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
         }
       }
@@ -1015,6 +1016,34 @@ function claudeApiKeyTargetEmail(payload: string): string | null {
   }
 }
 
+function claudeImportedAccountIdentities(payload: string): Set<string> | null {
+  try {
+    const parsed = JSON.parse(payload) as unknown
+    if (!isObject(parsed) || parsed.version !== 1 || parsed.encrypted === true
+      || !Array.isArray(parsed.accounts) || parsed.accounts.length === 0) return null
+    const identities = new Set<string>()
+    for (const account of parsed.accounts) {
+      if (!isObject(account)
+        || typeof account.email !== 'string'
+        || (account.organizationUuid !== undefined
+          && typeof account.organizationUuid !== 'string')) return null
+      identities.add(JSON.stringify([account.email, account.organizationUuid ?? '']))
+    }
+    return identities.size === parsed.accounts.length ? identities : null
+  } catch {
+    return null
+  }
+}
+
+function claudeListAccountIdentity(
+  account: Record<string, unknown> & { email: string },
+): string {
+  return JSON.stringify([
+    account.email,
+    typeof account.organizationUuid === 'string' ? account.organizationUuid : '',
+  ])
+}
+
 function parseClaudeListDetails(stdout: string): ClaudeListDetails {
   try {
     const parsed = JSON.parse(stdout) as unknown
@@ -1029,7 +1058,9 @@ function parseClaudeListDetails(stdout: string): ClaudeListDetails {
     for (const account of parsed.accounts) {
       if (!isObject(account)
         || !Number.isInteger(account.number)
-        || typeof account.email !== 'string') {
+        || typeof account.email !== 'string'
+        || (account.organizationUuid !== undefined
+          && typeof account.organizationUuid !== 'string')) {
         throw new Error('invalid account')
       }
       accounts.push(account)

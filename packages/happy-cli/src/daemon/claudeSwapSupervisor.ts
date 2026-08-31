@@ -62,20 +62,58 @@ export class ClaudeSwapSupervisor {
       this.enabled = wasEnabled
       throw error
     }
-    this.shutdown()
+    await this.terminateChild()
   }
 
   shutdown(): void {
+    const running = this.detachChild()
+    if (running) running.kill('SIGTERM')
+  }
+
+  private detachChild(): ClaudeSwapChild | null {
     if (this.restartHandle !== null) {
       this.deps.clearSchedule(this.restartHandle)
       this.restartHandle = null
     }
     const running = this.child
     this.child = null
-    if (running) running.kill('SIGTERM')
     this.restartAttempts = 0
     this.stdoutBuffer = ''
     this.currentStatus = { state: 'stopped', lastErrorKind: null }
+    return running
+  }
+
+  private async terminateChild(): Promise<void> {
+    const running = this.detachChild()
+    if (!running) return
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      let timeout: unknown = null
+      const finish = (error?: Error) => {
+        if (settled) return
+        settled = true
+        if (timeout !== null) this.deps.clearSchedule(timeout)
+        if (error) reject(error)
+        else resolve()
+      }
+      running.on('exit', () => finish())
+      running.on('error', () => finish(
+        new Error('claude-swap child failed while stopping'),
+      ))
+      timeout = this.deps.schedule(() => {
+        try {
+          running.kill('SIGKILL')
+        } catch {
+          // The failed hard kill is represented by the same fail-closed timeout error.
+        }
+        finish(new Error('claude-swap child did not exit after SIGTERM'))
+      }, 5_000)
+      try {
+        running.kill('SIGTERM')
+      } catch {
+        finish(new Error('claude-swap child failed while stopping'))
+      }
+    })
   }
 
   status(): AiCredentialRotationStatus {
