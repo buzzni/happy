@@ -149,6 +149,56 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(new CodexAppServerClient().supportsGoalActions()).toBe(false);
     });
 
+    it('emits response-scoped usage with the native Codex response id', async () => {
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (_msg, stdout) => {
+                appServerStdout = stdout;
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((event) => events.push(event));
+
+        await client.connect();
+        if (!appServerStdout) throw new Error('app-server stdout unavailable');
+        pushJsonLine(appServerStdout, {
+            method: 'rawResponse/completed',
+            params: {
+                threadId: 'thread-1',
+                turnId: 'turn-1',
+                responseId: 'response-1',
+                usage: {
+                    totalTokens: 150,
+                    inputTokens: 120,
+                    cachedInputTokens: 70,
+                    cacheWriteInputTokens: 10,
+                    outputTokens: 30,
+                    reasoningOutputTokens: 5,
+                },
+            },
+        });
+
+        await waitFor(() => events.length === 1);
+        expect(events[0]).toEqual({
+            type: 'codex_usage',
+            thread_id: 'thread-1',
+            turn_id: 'turn-1',
+            response_id: 'response-1',
+            usage: {
+                totalTokens: 150,
+                inputTokens: 120,
+                cachedInputTokens: 70,
+                cacheWriteInputTokens: 10,
+                outputTokens: 30,
+                reasoningOutputTokens: 5,
+            },
+        });
+
+        await client.disconnect();
+    });
+
     it('adapts MCP startup notifications and paginated tool/auth inventory', async () => {
         const requests: MockRpcMessage[] = [];
         let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;

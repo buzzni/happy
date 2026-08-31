@@ -23,6 +23,11 @@ import {
 import { InvalidateSync } from '@/utils/sync';
 import { notifyDaemonSessionRuntime } from '@/daemon/controlClient';
 import axios from 'axios';
+import {
+    ProviderUsageEventV1Schema,
+    type ProviderUsageEventV1,
+} from '@slopus/happy-wire';
+import { createClaudeUsageEvent } from '@/usage/providerUsageAdapters';
 
 const DAEMON_RUNTIME_REPORT_MAX_INTERVAL_MS = 30_000;
 
@@ -988,6 +993,27 @@ export class ApiSessionClient extends EventEmitter {
         // Track usage from assistant messages
         if (body.type === 'assistant' && body.message?.usage) {
             try {
+                const rawMessage = body.message as { id?: unknown; model?: unknown };
+                const rawTimestamp = (body as { timestamp?: unknown }).timestamp;
+                const parsedTimestamp = typeof rawTimestamp === 'string'
+                    ? Date.parse(rawTimestamp)
+                    : rawTimestamp;
+                const occurredAt = typeof parsedTimestamp === 'number' && Number.isFinite(parsedTimestamp)
+                    ? Math.floor(parsedTimestamp)
+                    : Date.now();
+                this.sendProviderUsageEvent(createClaudeUsageEvent({
+                    sessionId: this.sessionId,
+                    occurredAt,
+                    messageId: typeof rawMessage.id === 'string' ? rawMessage.id : null,
+                    transcriptUuid: body.uuid,
+                    model: typeof rawMessage.model === 'string' ? rawMessage.model : null,
+                    usage: body.message.usage,
+                }));
+            } catch (error) {
+                logger.warn('[SOCKET] Failed to normalize provider usage data:', error);
+            }
+
+            try {
                 this.sendUsageData(body.message.usage, body.message.model);
             } catch (error) {
                 logger.debug('[SOCKET] Failed to send usage data:', error);
@@ -1331,6 +1357,10 @@ export class ApiSessionClient extends EventEmitter {
         }
         logger.debugLargeJson('[SOCKET] Sending usage data:', usageReport)
         this.socket.emit('usage-report', usageReport);
+    }
+
+    sendProviderUsageEvent(event: ProviderUsageEventV1) {
+        this.socket.emit('provider-usage-report', ProviderUsageEventV1Schema.parse(event));
     }
 
     /**

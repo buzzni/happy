@@ -43,6 +43,7 @@ model Account {
     TerminalAuthRequest TerminalAuthRequest[]
     AccountAuthRequest  AccountAuthRequest[]
     UsageReport         UsageReport[]
+    ProviderUsageEvent  ProviderUsageEvent[]
     Machine             Machine[]
     UploadedFile        UploadedFile[]
     ServiceAccountToken ServiceAccountToken[]
@@ -237,6 +238,41 @@ model UsageReport {
     @@unique([accountId, sessionId, key])
     @@index([accountId])
     @@index([sessionId])
+}
+
+model ProviderUsageEvent {
+    id            String   @id @default(cuid())
+    accountId     String
+    account       Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+    sessionId     String
+    source        String
+    sourceEventId String
+    occurredAt    DateTime
+    /// [AiUsageEventV1]
+    data          Json
+    createdAt     DateTime @default(now())
+    outbox        UsageDeliveryOutbox?
+
+    @@unique([source, sourceEventId])
+    @@index([accountId, occurredAt])
+    @@index([sessionId, occurredAt])
+}
+
+model UsageDeliveryOutbox {
+    id            String   @id @default(cuid())
+    usageEventId  String   @unique
+    usageEvent    ProviderUsageEvent @relation(fields: [usageEventId], references: [id], onDelete: Cascade)
+    status        String   @default("pending")
+    attemptCount  Int      @default(0)
+    nextAttemptAt DateTime @default(now())
+    leaseUntil    DateTime?
+    lastError     String?
+    deliveredAt   DateTime?
+    createdAt     DateTime @default(now())
+    updatedAt     DateTime @updatedAt
+
+    @@index([status, nextAttemptAt])
+    @@index([status, leaseUntil])
 }
 
 //

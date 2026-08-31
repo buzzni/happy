@@ -88,6 +88,7 @@ import {
     prepareCodexSessionStart,
 } from './initialPrompt';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
+import { createCodexUsageEvent } from '@/usage/providerUsageAdapters';
 import {
     consumePendingInitialAppendSystemPrompt,
     consumePendingInitialEffort,
@@ -816,6 +817,20 @@ export async function runCodex(opts: {
     // Event handler: same EventMsg types as the legacy MCP server — no changes needed
     client.setEventHandler((msg) => {
         logger.debug(`[Codex] Event: ${JSON.stringify(msg)}`);
+
+        if (msg.type === 'codex_usage') {
+            try {
+                session.sendProviderUsageEvent(createCodexUsageEvent({
+                    sessionId: session.sessionId,
+                    responseId: String(msg.response_id ?? ''),
+                    occurredAt: Date.now(),
+                    model: currentModel ?? DEFAULT_CODEX_MODEL,
+                    usage: msg.usage as Parameters<typeof createCodexUsageEvent>[0]['usage'],
+                }));
+            } catch (error) {
+                logger.warn('[Codex] Failed to normalize provider usage data:', error);
+            }
+        }
 
         // Add messages to the ink UI buffer based on message type
         if (msg.type === 'agent_message') {
