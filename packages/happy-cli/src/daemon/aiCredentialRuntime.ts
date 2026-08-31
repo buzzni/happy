@@ -63,6 +63,7 @@ type Supervisor = {
 
 export type AiCredentialRuntimeDependencies = {
   homeDir: string
+  now(): number
   env: Record<string, string | undefined>
   execFile(command: string, args: string[], options?: CommandOptions): Promise<AiCredentialCommandResult>
   readFile(path: string): Promise<string>
@@ -211,10 +212,15 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       }
     }
     const current = generations[selected] ?? 0
+    const now = deps.now()
+    const clockGeneration = now * 1000
+    if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(clockGeneration)) {
+      throw new AiCredentialRuntimeError('APPLY_GENERATION_INVALID')
+    }
     if (current >= Number.MAX_SAFE_INTEGER) {
       throw new AiCredentialRuntimeError('APPLY_GENERATION_INVALID')
     }
-    const next = current + 1
+    const next = Math.max(current + 1, clockGeneration)
     generations[selected] = next
     await deps.mkdir(join(deps.homeDir, '.happy'), { recursive: true, mode: 0o700 })
     await writeAtomicFile(deps, applyGenerationPath(), JSON.stringify({
@@ -1294,6 +1300,7 @@ export function createNodeAiCredentialRuntime(
 ) {
   return createAiCredentialRuntime({
     homeDir,
+    now: Date.now,
     env,
     execFile: runAiCredentialCommand,
     readFile: (path) => readFile(path, 'utf8'),

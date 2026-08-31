@@ -36,7 +36,9 @@ function codexMultiAuthBundle() {
   }
 }
 
-function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
+function setup(
+  overrides: Partial<AiCredentialRuntimeDependencies> & { now?: () => number } = {},
+) {
   const calls: Array<{ command: string; args: string[] }> = []
   const files = new Map<string, string>()
   files.set('/global/node_modules/codex-multi-auth/package.json', JSON.stringify({ version: '2.8.5' }))
@@ -82,6 +84,7 @@ function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
   const writeFile = vi.fn(async (path: string, content: string) => { files.set(path, content) })
   const runtime = createAiCredentialRuntime({
     homeDir: '/home/operator',
+    now: () => 0,
     env: {},
     execFile,
     readFile: vi.fn(async (path: string) => files.get(path) ?? Promise.reject(Object.assign(new Error('missing'), { code: 'ENOENT' }))),
@@ -1203,6 +1206,21 @@ describe('AI credential machine runtime', () => {
     expect(secondResult).toMatchObject({ applyGeneration: 2 })
     expect(JSON.parse(files.get('/home/operator/.happy/ai-credential-apply-generations.json')!))
       .toEqual({ version: 1, generations: { codex: 2 } })
+  })
+
+  it('advances a restored apply counter to the current clock epoch', async () => {
+    const now = 1_700_000_000_000
+    const { runtime, files } = setup({ now: () => now })
+    files.set('/home/operator/.happy/ai-credential-apply-generations.json', JSON.stringify({
+      version: 1,
+      generations: { codex: 7 },
+    }))
+
+    await expect(runtime.apply({
+      provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
+    })).resolves.toMatchObject({ applyGeneration: now * 1000 })
+    expect(JSON.parse(files.get('/home/operator/.happy/ai-credential-apply-generations.json')!))
+      .toEqual({ version: 1, generations: { codex: now * 1000 } })
   })
 
   it('serializes capture behind an in-progress credential replacement', async () => {
