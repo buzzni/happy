@@ -1105,7 +1105,10 @@ describe('AI credential machine runtime', () => {
 
     await expect(runtime.apply({
       provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
-    })).rejects.toMatchObject({ kind: 'CODEX_BACKUP_FAILED' })
+    })).rejects.toMatchObject({
+      kind: 'CODEX_BACKUP_FAILED',
+      message: 'AI credential operation failed (CODEX_BACKUP_FAILED) [applyGeneration=1]',
+    })
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"old"}')
   })
 

@@ -77,8 +77,11 @@ export type AiCredentialRuntimeDependencies = {
 }
 
 export class AiCredentialRuntimeError extends Error {
-  constructor(public readonly kind: string) {
-    super(`AI credential operation failed (${kind})`)
+  constructor(public readonly kind: string, applyGeneration?: number) {
+    super(
+      `AI credential operation failed (${kind})`
+      + (applyGeneration === undefined ? '' : ` [applyGeneration=${applyGeneration}]`),
+    )
   }
 }
 
@@ -679,26 +682,28 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         let requestedLease: TrialAiCredentialLeaseMarker | undefined
         let marker: TrialAiCredentialMarkerFile | undefined
         let previousLease: TrialAiCredentialLeaseMarker | undefined
-        if (input.trialLease !== undefined) {
-          requestedLease = trialLease(input.trialLease)
-          marker = await readTrialMarker()
-          const currentLease = marker.leases[selected]
-          if (currentLease && currentLease.leaseId !== requestedLease.leaseId) {
-            throw new AiCredentialRuntimeError('TRIAL_LEASE_CONFLICT')
-          }
-          const conflictingClaudeRuntime = selected === 'zai'
-            ? marker.leases.claude
-            : selected === 'claude'
-              ? marker.leases.zai
-              : undefined
-          if (conflictingClaudeRuntime) {
-            throw new AiCredentialRuntimeError('TRIAL_LEASE_CONFLICT')
-          }
-          previousLease = currentLease
-          marker.leases[selected] = requestedLease
-          await writeTrialMarker(marker)
-        }
+        let markerChanged = false
         try {
+          if (input.trialLease !== undefined) {
+            requestedLease = trialLease(input.trialLease)
+            marker = await readTrialMarker()
+            const currentLease = marker.leases[selected]
+            if (currentLease && currentLease.leaseId !== requestedLease.leaseId) {
+              throw new AiCredentialRuntimeError('TRIAL_LEASE_CONFLICT')
+            }
+            const conflictingClaudeRuntime = selected === 'zai'
+              ? marker.leases.claude
+              : selected === 'claude'
+                ? marker.leases.zai
+                : undefined
+            if (conflictingClaudeRuntime) {
+              throw new AiCredentialRuntimeError('TRIAL_LEASE_CONFLICT')
+            }
+            previousLease = currentLease
+            marker.leases[selected] = requestedLease
+            await writeTrialMarker(marker)
+            markerChanged = true
+          }
           const result = selected === 'claude'
             ? await applyClaude(input.payload)
             : selected === 'zai'
@@ -728,7 +733,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           }
           return { ...result, applyGeneration }
         } catch (error) {
-          if (requestedLease && marker) {
+          if (requestedLease && marker && markerChanged) {
             if (previousLease) marker.leases[selected] = previousLease
             else delete marker.leases[selected]
             try {
@@ -742,7 +747,9 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
               // the server can still issue a matching purge RPC.
             }
           }
-          throw error
+          throw error instanceof AiCredentialRuntimeError
+            ? new AiCredentialRuntimeError(error.kind, applyGeneration)
+            : new AiCredentialRuntimeError(`${selected.toUpperCase()}_APPLY_FAILED`, applyGeneration)
         }
       },
     ))
