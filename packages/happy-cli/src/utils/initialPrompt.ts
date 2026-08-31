@@ -96,6 +96,18 @@ export function consumePendingInitialModel(env: NodeJS.ProcessEnv): string | nul
   return model.length > 0 ? model : null
 }
 
+export function normalizeClaudeModelForRuntime(
+  model: string | undefined,
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  if (env.ANTHROPIC_BASE_URL !== 'https://api.z.ai/api/anthropic' || !model) return model
+  if (model === 'fable' || model.startsWith('claude-fable-')) return undefined
+  if (model.startsWith('claude-opus-')) return 'opus'
+  if (model.startsWith('claude-sonnet-')) return 'sonnet'
+  if (model.startsWith('claude-haiku-')) return 'haiku'
+  return model
+}
+
 /**
  * Read the daemon-provided initial effort seed exactly once
  * (HAPPY_INITIAL_EFFORT). Validation against the agent's accepted set is the

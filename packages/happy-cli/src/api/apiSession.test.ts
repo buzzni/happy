@@ -547,6 +547,63 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
     });
 
+    it('emits idempotent provider usage events for duplicate Claude message sources', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        mockAxiosPost.mockImplementation(async (_url: string, payload: { messages: Array<{ localId: string }> }) => ({
+            data: {
+                messages: payload.messages.map((message, index) => ({
+                    id: `msg-${index + 1}`,
+                    seq: index + 1,
+                    localId: message.localId,
+                    createdAt: 1,
+                    updatedAt: 1,
+                })),
+            },
+        }));
+        const assistantMessage = {
+            type: 'assistant',
+            timestamp: 1_788_000_000_000,
+            message: {
+                id: 'msg-native-1',
+                model: 'claude-sonnet-4-5',
+                content: [],
+                usage: {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    cache_creation_input_tokens: 40,
+                    cache_read_input_tokens: 300,
+                },
+            },
+        } as any;
+
+        client.sendClaudeSessionMessage({ ...assistantMessage, uuid: 'sdk-random-uuid' });
+        client.sendClaudeSessionMessage({ ...assistantMessage, uuid: 'transcript-uuid' });
+
+        const events = mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === 'provider-usage-report')
+            .map(([, event]: [string, unknown]) => event);
+        expect(events).toHaveLength(2);
+        expect(events[0]).toEqual(events[1]);
+        expect(events[0]).toMatchObject({
+            sourceEventId: 'test-session-id:anthropic:msg-native-1',
+            occurredAt: 1_788_000_000_000,
+            model: 'claude-sonnet-4-5',
+            tokens: {
+                input: 100,
+                output: 20,
+                cacheRead: 300,
+                cacheWrite: 40,
+                reasoning: 0,
+                total: 460,
+            },
+        });
+
+        await waitForCheck(() => {
+            expect(mockAxiosPost).toHaveBeenCalled();
+        });
+        await client.close();
+    });
+
     it('preserves the Studio optimistic id on a Claude initial prompt', async () => {
         const client = new ApiSessionClient('fake-token', session);
         mockAxiosPost.mockResolvedValueOnce({

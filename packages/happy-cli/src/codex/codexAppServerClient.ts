@@ -57,7 +57,6 @@ import type { SandboxConfig } from '@/persistence';
 import { CODEX_INACTIVITY_ABORT_REASON, type CodexInactivityAbortFields } from './codexAbortNotice';
 import { prepareCodexMultiAuthProxy, type PreparedCodexMultiAuthProxy } from './codexMultiAuthProxy';
 import { initializeSandbox, wrapForMcpTransport } from '@/sandbox/manager';
-import { isNetworkRequiredSandboxFailureFatal } from './sandboxInitFailurePolicy';
 import packageJson from '../../package.json';
 import { resolveCodexSandboxPolicy } from './executionPolicy';
 
@@ -223,6 +222,14 @@ export class CodexAppServerClient {
     private multiAuthProxy: PreparedCodexMultiAuthProxy | null = null;
     private multiAuthProxyCleanup: Promise<void> | null = null;
     public sandboxEnabled = false;
+    /**
+     * 샌드박스가 요청됐지만 초기화가 실패해 네이티브 정책으로 떨어진 상태.
+     * connect() 시점에는 permissionMode 를 아직 모르므로(턴마다 결정된다)
+     * 여기서는 사실만 기록하고, 네트워크를 실제로 잃는지는 호출자가 모드를
+     * 아는 턴 시점에 isSandboxFallbackNetworkLoss 로 판정한다.
+     */
+    public sandboxInitFailed = false;
+    public sandboxInitFailureReason: string | null = null;
 
     // Session state
     private _threadId: string | null = null;
@@ -330,6 +337,7 @@ export class CodexAppServerClient {
             || method === 'turn/completed'
             || method === 'thread/status/changed'
             || method === 'thread/tokenUsage/updated'
+            || method === 'rawResponse/completed'
             || method.startsWith('item/');
 
         if (!isRawNotification) {
@@ -550,6 +558,25 @@ export class CodexAppServerClient {
             return true;
         }
 
+        if (method === 'rawResponse/completed') {
+            const responseId = typeof params?.responseId === 'string' ? params.responseId : '';
+            const usage = params?.usage;
+            if (!responseId || !usage || typeof usage !== 'object') {
+                logger.warn('[CodexAppServer] Ignoring malformed rawResponse/completed usage notification');
+                return true;
+            }
+            const threadId = typeof params?.threadId === 'string' ? params.threadId : undefined;
+            const turnId = typeof params?.turnId === 'string' ? params.turnId : undefined;
+            this.eventHandler?.({
+                type: 'codex_usage',
+                ...(threadId ? { thread_id: threadId } : {}),
+                ...(turnId ? { turn_id: turnId } : {}),
+                response_id: responseId,
+                usage,
+            });
+            return true;
+        }
+
         const item = params?.item;
         if (!item || typeof item !== 'object') {
             return method.startsWith('item/');
@@ -688,6 +715,8 @@ export class CodexAppServerClient {
             ...(this.multiAuthProxy?.args ?? []),
         ];
         this.sandboxEnabled = false;
+        this.sandboxInitFailed = false;
+        this.sandboxInitFailureReason = null;
 
         if (this.sandboxConfig?.enabled && process.platform !== 'win32') {
             try {
@@ -699,20 +728,12 @@ export class CodexAppServerClient {
                 logger.info(`[CodexAppServer] Sandbox enabled`);
             } catch (error) {
                 this.sandboxCleanup = null;
+                this.sandboxInitFailed = true;
+                this.sandboxInitFailureReason = error instanceof Error ? error.message : String(error);
                 if (this.beforeTurn) {
                     throw new Error(
                         'checkpoint protection sandbox initialization failed; refusing to start Codex. '
                         + `Original error: ${error instanceof Error ? error.message : String(error)}`,
-                    );
-                }
-                logger.warn('[CodexAppServer] Failed to initialize sandbox; continuing without.', error);
-                if (isNetworkRequiredSandboxFailureFatal(this.sandboxConfig)) {
-                    throw new Error(
-                        `Sandbox initialization failed but network access was required `
-                        + `(networkMode=${this.sandboxConfig?.networkMode}). Continuing without the `
-                        + `sandbox would silently drop to Codex's native read-only policy, which has no `
-                        + `network at all. Original error: `
-                        + `${error instanceof Error ? error.message : String(error)}`,
                     );
                 }
             }
@@ -1239,6 +1260,7 @@ export class CodexAppServerClient {
         if (!pending) return;
         const isTurnActivity = method === 'turn/started'
             || method === 'thread/tokenUsage/updated'
+            || method === 'rawResponse/completed'
             || method === 'turn/diff/updated'
             || method.startsWith('item/')
             || method === 'codex/event'

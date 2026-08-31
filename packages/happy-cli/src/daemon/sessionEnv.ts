@@ -70,6 +70,43 @@ export function buildSessionSpawnEnvironment(
     }
 }
 
+export function overlayManagedCredentialEnvironment(
+    requested: Record<string, string>,
+    managed: Record<string, string>,
+): Record<string, string> {
+    return { ...stripManagedCredentialConflicts(requested, managed), ...managed }
+}
+
+export function stripManagedCredentialConflicts(
+    requested: Record<string, string>,
+    managed: Record<string, string>,
+): Record<string, string> {
+    const effectiveRequested = { ...requested }
+    for (const key of Object.keys(managed)) delete effectiveRequested[key]
+    if (managed.ANTHROPIC_BASE_URL === 'https://api.z.ai/api/anthropic') {
+        delete effectiveRequested.ANTHROPIC_API_KEY
+        delete effectiveRequested.CLAUDE_CODE_OAUTH_TOKEN
+        delete effectiveRequested.ANTHROPIC_MODEL
+        delete effectiveRequested.ANTHROPIC_SMALL_FAST_MODEL
+        delete effectiveRequested.ANTHROPIC_CUSTOM_HEADERS
+        delete effectiveRequested.CLAUDE_CODE_USE_BEDROCK
+        delete effectiveRequested.CLAUDE_CODE_USE_VERTEX
+        delete effectiveRequested.CLAUDE_CODE_USE_FOUNDRY
+    }
+    return effectiveRequested
+}
+
+export function buildManagedSessionSpawnEnvironment(
+    inherited: NodeJS.ProcessEnv,
+    explicit: Record<string, string>,
+    managed: Record<string, string>,
+): Record<string, string> {
+    return overlayManagedCredentialEnvironment(
+        buildSessionSpawnEnvironment(inherited, explicit),
+        managed,
+    )
+}
+
 /** Retains only the per-session Saycode capability needed by a later resume. */
 export function captureSaycodeAgentEnvironment(
     env: NodeJS.ProcessEnv,

@@ -89,7 +89,7 @@ describe('prepareGithubTriggerWorktree', () => {
       executable: 'git', args: ['status', '--porcelain', '--untracked-files=all'],
     })
     expect(runCommand.mock.calls.at(-1)?.[0]).toMatchObject({
-      executable: 'git', args: ['worktree', 'remove', expect.any(String)], cwd: '/repo',
+      executable: 'git', args: ['worktree', 'remove', '--force', expect.any(String)], cwd: '/repo',
     })
   })
 
@@ -115,7 +115,7 @@ describe('prepareGithubTriggerWorktree', () => {
       cleaned: true,
     })
     expect(runCommand.mock.calls.at(-1)?.[0]).toMatchObject({
-      executable: 'git', args: ['worktree', 'remove', expect.any(String)], cwd: '/repo',
+      executable: 'git', args: ['worktree', 'remove', '--force', expect.any(String)], cwd: '/repo',
     })
   })
 
@@ -234,6 +234,44 @@ describe('removeGithubTriggerWorktree', () => {
 
     expect(result).toEqual({ ok: false, dirty: true, error: 'GitHub automation worktree is dirty' })
     expect(runCommand).toHaveBeenCalledTimes(1)
+  })
+
+  // 2026-08-30 프로덕션 — 리뷰가 끝난 worktree 11개가 지워지지 않고 2.3GB 를 물고
+  // 앉아 있었다. 매분 재시도해 누적 1,192회 실패했다.
+  //   fatal: working trees containing submodules cannot be moved or removed
+  // 이 저장소는 vendor/happy 서브모듈을 갖고 있어 평범한 remove 가 항상 거부된다.
+  // 바로 앞의 dirty 검사가 이미 "잃을 것이 없다"를 보장하므로 --force 가 안전하다.
+  it('forces removal so a worktree containing submodules can be cleaned', async () => {
+    const runCommand = commandRunner(['', ''])
+
+    const result = await removeGithubTriggerWorktree({
+      repositoryRoot: '/repo',
+      worktreePath: '/happy/automation-worktrees/run-1',
+      runCommand,
+      pathExists: vi.fn(async () => true),
+    })
+
+    expect(result).toEqual({ ok: true })
+    const removeCall = runCommand.mock.calls
+      .map(([command]) => command)
+      .find((command) => command.args[0] === 'worktree')
+    expect(removeCall?.args).toEqual(['worktree', 'remove', '--force', '/happy/automation-worktrees/run-1'])
+  })
+
+  it('still refuses to force a dirty worktree', async () => {
+    // --force 는 서브모듈을 넘기 위한 것이지, 작업 중인 변경을 버리기 위한 것이
+    // 아니다. dirty 검사가 먼저 막아야 한다.
+    const runCommand = commandRunner([' M src/app.ts\n'])
+
+    const result = await removeGithubTriggerWorktree({
+      repositoryRoot: '/repo',
+      worktreePath: '/happy/automation-worktrees/run-1',
+      runCommand,
+      pathExists: vi.fn(async () => true),
+    })
+
+    expect(result).toMatchObject({ ok: false, dirty: true })
+    expect(runCommand.mock.calls.every(([c]) => c.args[0] !== 'worktree')).toBe(true)
   })
 })
 

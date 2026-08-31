@@ -54,7 +54,7 @@ import { deliverPreparedClaudeSessionStart, prepareClaudeInitialPrompt } from '.
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
-import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
+import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import { createEnvelope } from '@slopus/happy-wire';
 import {
     resolveInitialSaycodeAppendSystemPrompt,
@@ -551,7 +551,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // HAPPY_INITIAL_EFFORT, e.g. automations). Consumed exactly once — read
     // then deleted so children never inherit — and treated like a CLI option:
     // it also survives the post-abort reset. Invalid effort values are ignored.
-    const initialModelSeed = consumePendingInitialModel(process.env) ?? options.model ?? DEFAULT_CLAUDE_MODEL;
+    const initialModelSeed = normalizeClaudeModelForRuntime(
+        consumePendingInitialModel(process.env) ?? options.model ?? DEFAULT_CLAUDE_MODEL,
+        process.env,
+    ) ?? DEFAULT_CLAUDE_MODEL;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env);
     if (rawInitialEffortSeed && !VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)) {
         logger.debug(`[START] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
@@ -738,7 +741,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         // Resolve model - use message.meta.model if provided, otherwise use current model
         let messageModel = currentModel;
         if (message.meta?.hasOwnProperty('model')) {
-            messageModel = message.meta.model || undefined; // null becomes undefined
+            messageModel = normalizeClaudeModelForRuntime(
+                message.meta.model || undefined,
+                process.env,
+            ); // null and Z.AI-incompatible Fable become undefined
             currentModel = messageModel;
             logger.debug(`[loop] Model updated from user message: ${messageModel || 'reset to default'}`);
         } else {
@@ -758,7 +764,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         // Resolve fallback model - use message.meta.fallbackModel if provided, otherwise use current fallback model
         let messageFallbackModel = currentFallbackModel;
         if (message.meta?.hasOwnProperty('fallbackModel')) {
-            messageFallbackModel = message.meta.fallbackModel || undefined; // null becomes undefined
+            messageFallbackModel = normalizeClaudeModelForRuntime(
+                message.meta.fallbackModel || undefined,
+                process.env,
+            ); // null and Z.AI-incompatible Fable become undefined
             currentFallbackModel = messageFallbackModel;
             logger.debug(`[loop] Fallback model updated from user message: ${messageFallbackModel || 'reset to none'}`);
         } else {
