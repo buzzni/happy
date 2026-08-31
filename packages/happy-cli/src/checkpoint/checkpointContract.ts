@@ -28,6 +28,7 @@ export const checkpointProtectionStateSchema = z.discriminatedUnion('status', [
         reason: z.enum([
             'snapshot-failed',
             'excluded-path',
+            'unsupported-platform',
             'unsupported-provider',
             'invalid-project-binding',
         ]),

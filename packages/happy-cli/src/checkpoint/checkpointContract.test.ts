@@ -53,6 +53,10 @@ describe('checkpoint protection state contract', () => {
         })).toEqual({ status: 'unavailable', reason: 'snapshot-failed' });
         expect(checkpointProtectionStateSchema.parse({ status: 'legacy' }))
             .toEqual({ status: 'legacy' });
+        expect(checkpointProtectionStateSchema.parse({
+            status: 'unavailable',
+            reason: 'unsupported-platform',
+        })).toEqual({ status: 'unavailable', reason: 'unsupported-platform' });
 
         expect(checkpointProtectionStateSchema.safeParse({ status: 'disabled' }).success)
             .toBe(false);
