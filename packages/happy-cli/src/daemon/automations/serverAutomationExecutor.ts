@@ -30,6 +30,7 @@ import {
   GITHUB_TRIGGER_PROMPT_PREAMBLE,
   describeGithubTriggerBaseline,
   planGithubIssueTrigger,
+  isUnsupportedPathFilter,
   planGithubTrigger,
   selectPathFilterCandidates,
   renderGithubIssueTriggerPrompt,
@@ -1063,6 +1064,22 @@ async function executeStartedRun(
       previous,
       consume: githubMode === 'work',
     })
+    // 후보가 있었는데 경로 필터가 전부 떨어뜨렸고, 그 필터가 이 매처로는 표현할 수
+    // 없는 glob 이라면 설정 오류다. 조용히 0건이 되면 "제대로 걸렀다" 와 "고장났다" 를
+    // 구분할 수 없어, 2026-08-31 에는 그 상태로 자동화 두 개가 하루 넘게 멈춰 있었다.
+    // 후보가 있을 때만 알리므로, 정말 해당 없는 PR 만 흐르는 저장소는 조용하다.
+    // 후보를 받아왔는데 큐가 그대로 비어 있으면 경로 필터가 전부 떨어뜨렸다는 뜻이다.
+    // poll 단계는 consume:false 라 event 로는 판정할 수 없어 pending 을 본다.
+    if (fileCandidates.length > 0 && planned.state.pending.length === 0) {
+      const unsupported = payload.githubTrigger.filter.paths.filter(isUnsupportedPathFilter)
+      if (unsupported.length > 0) {
+        input.logDebug?.(
+          `[server-automation] ${automation.automationId} path filter matched nothing:`
+          + ` ${unsupported.join(', ')} cannot be matched — this matcher takes directory`
+          + ' prefixes (a trailing /* or /** is allowed), not general globs',
+        )
+      }
+    }
     persistGithubTriggerState = makeGithubTriggerStatePersister(input, automation, planned.state)
     if (githubMode === 'poll'
       && (payload.githubTrigger.action !== 'agent-task-review' || planned.state.pending.length > 0)) {

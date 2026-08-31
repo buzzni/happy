@@ -2506,6 +2506,107 @@ describe('runServerAutomationTick', () => {
     expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('worktree is dirty'))
   })
 
+  it('stays quiet about an unsupported glob while another prefix still fires', async () => {
+    // 경고가 발화한 실행에도 붙으면 매 tick 노이즈가 되고, 진짜 멈춘 자동화가
+    // 그 안에 묻힌다. 필터가 실제로 아무것도 못 고른 순간에만 말한다.
+    const { input, store, logDebug, queryGithubPullRequests,
+      queryGithubPullRequestFiles, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review {pr.number}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: {
+          baseBranch: null, label: null, excludeDraft: true, authors: [],
+          paths: ['projects/*/src', 'apps/web/*'],
+        },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 9, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 't', GH_REPO: 'acme/app' },
+      pullRequests: [{
+        number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10',
+        author: { login: 'alice' }, baseRefName: 'main', headRefName: 'feature/search',
+        isDraft: false, state: 'OPEN', mergedAt: null, labels: [], changedFiles: 0, files: [],
+      }],
+    })
+    queryGithubPullRequestFiles.mockResolvedValue({
+      ok: true,
+      files: [{ number: 10, changedFiles: 1, files: [{ path: 'apps/web/page.tsx' }] }],
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(spawnSession).toHaveBeenCalled()
+    expect(logDebug).not.toHaveBeenCalledWith(expect.stringContaining('path filter matched nothing'))
+  })
+
+  it('warns when an unsupported path glob silently filters every candidate out', async () => {
+    // 2026-08-31 프로덕션 — 경로 필터가 `projects/x/*` 로 저장돼 리터럴 비교에서
+    // 전부 탈락했고, hsmoa_backend 리뷰 자동화 두 개가 한 건도 돌지 않았다.
+    // 후행 glob 은 이제 매처가 받아주지만, 그 자리를 넘어서는 glob 은 여전히
+    // 지원하지 않는다. 그때 아무 말 없이 0건이 되면 "필터가 제대로 걸렀다" 와
+    // "필터가 고장났다" 를 사용자가 구분할 수 없다.
+    const { input, store, logDebug, queryGithubPullRequests,
+      queryGithubPullRequestFiles, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review {pr.number}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: {
+          baseBranch: null, label: null, excludeDraft: true, authors: [],
+          paths: ['projects/*/src'],
+        },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 9, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 't', GH_REPO: 'acme/app' },
+      pullRequests: [{
+        number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10',
+        author: { login: 'alice' }, baseRefName: 'main', headRefName: 'feature/search',
+        isDraft: false, state: 'OPEN', mergedAt: null, labels: [], changedFiles: 0, files: [],
+      }],
+    })
+    queryGithubPullRequestFiles.mockResolvedValue({
+      ok: true,
+      files: [{ number: 10, changedFiles: 1, files: [{ path: 'projects/web/src/index.ts' }] }],
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(queryGithubPullRequestFiles).toHaveBeenCalled()
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('projects/*/src'))
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('path filter'))
+  })
+
   it('counts each failed cleanup so a stuck worktree cannot be retried forever', async () => {
     const { input, store, discardGithubWorktree, now } = setup()
     input.cache = { read: () => ({
