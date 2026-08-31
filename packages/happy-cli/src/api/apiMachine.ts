@@ -109,6 +109,7 @@ import {
 import { createClaudeSessionTransferHandler } from '@/claude/utils/claudeSessionTransfer';
 import { readClaudeCodeUsage } from '@/claudeCodeUsage/readUsage';
 import { CodexAppServerClient } from '@/codex/codexAppServerClient';
+import { createCodexThreadTransferHandler } from '@/codex/codexThreadTransfer';
 import { ADDITIONAL_DIRECTORIES_CAPABILITY, parseAdditionalDirectories } from '@/daemon/additionalDirectories';
 import {
     CodexForkRewindPointNotFoundError,
@@ -482,6 +483,24 @@ export class ApiMachineClient {
         this.rpcHandlerManager.registerHandler(
             'claude-session-transfer',
             createClaudeSessionTransferHandler({ allowedRoot }),
+        );
+        this.rpcHandlerManager.registerHandler(
+            'codex-thread-transfer',
+            createCodexThreadTransferHandler({
+                allowedRoot,
+                codexHome: process.env.CODEX_HOME ?? join(homedir(), '.codex'),
+                readThreadPath: async (threadId) => withCodexAppServerClient(async (client) => {
+                    const { thread } = await client.readThread({ threadId, includeTurns: false });
+                    if (typeof thread.path !== 'string' || thread.path.length === 0) {
+                        throw new Error('Codex thread rollout path is unavailable');
+                    }
+                    return thread.path;
+                }),
+                forkThreadFromPath: async ({ path, cwd }) => withCodexAppServerClient(async (client) => {
+                    const forked = await client.forkThreadFromPath({ path, cwd });
+                    return { threadId: forked.threadId };
+                }),
+            }),
         );
     }
 
