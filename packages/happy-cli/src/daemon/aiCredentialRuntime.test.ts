@@ -958,9 +958,17 @@ describe('AI credential machine runtime', () => {
     expect(supervisor.enable).toHaveBeenCalledOnce()
   })
 
-  it('activates an imported Claude API key and stops OAuth rotation', async () => {
+  it('activates an imported Claude API key, removes prior accounts, and stops OAuth rotation', async () => {
     let activeAccountNumber = 1
-    const execFile = vi.fn(async (command: string, args: string[]) => {
+    let accounts = [
+      { number: 1, email: 'oauth@example.com', usageStatus: 'ok' },
+      { number: 2, email: 'api-key-1@token.local', usageStatus: 'api_key' },
+    ]
+    const execFile = vi.fn(async (
+      command: string,
+      args: string[],
+      options?: { input?: string },
+    ) => {
       if (command === 'cswap' && args[0] === '--version') {
         return { stdout: 'cswap 0.25.0', stderr: '' }
       }
@@ -969,15 +977,15 @@ describe('AI credential machine runtime', () => {
           stdout: JSON.stringify({
             schemaVersion: 1,
             activeAccountNumber,
-            accounts: [
-              { number: 1, email: 'oauth@example.com', usageStatus: 'ok' },
-              { number: 2, email: 'api-key-1@token.local', usageStatus: 'api_key' },
-            ],
+            accounts,
           }),
           stderr: '',
         }
       }
       if (command === 'cswap' && args[0] === 'switch') activeAccountNumber = Number(args[1])
+      if (command === 'cswap' && args[0] === 'remove' && options?.input === 'y\n') {
+        accounts = accounts.filter((account) => account.number !== Number(args[1]))
+      }
       return { stdout: '', stderr: '' }
     })
     const { runtime, supervisor } = setup({ execFile })
@@ -1000,6 +1008,10 @@ describe('AI credential machine runtime', () => {
     expect(execFile).toHaveBeenCalledWith(
       'cswap', ['switch', '2', '--force', '--json'], expect.anything(),
     )
+    expect(execFile).toHaveBeenCalledWith(
+      'cswap', ['remove', '1'], expect.objectContaining({ input: 'y\n' }),
+    )
+    expect(execFile.mock.calls.filter(([, args]) => args[0] === 'list')).toHaveLength(3)
     expect(supervisor.stop).toHaveBeenCalledOnce()
     expect(supervisor.enable).not.toHaveBeenCalled()
   })
@@ -1594,6 +1606,30 @@ describe('AI credential machine runtime', () => {
     child.emit('close', 0)
 
     await expect(result).resolves.toEqual({ stdout: '{"complete":true}', stderr: '' })
+  })
+
+  it('pipes fixed confirmation input to interactive credential commands', async () => {
+    const stdin = Object.assign(new EventEmitter(), { end: vi.fn() })
+    const child = Object.assign(new EventEmitter(), {
+      stdin,
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      kill: vi.fn(),
+    })
+    const spawnCommand = vi.fn(() => child) as unknown as typeof spawn
+
+    const result = runAiCredentialCommand('cswap', ['remove', '1'], {
+      input: 'y\n',
+    }, spawnCommand)
+
+    expect(spawnCommand).toHaveBeenCalledWith('cswap', ['remove', '1'], {
+      env: expect.any(Object),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    expect(stdin.end).toHaveBeenCalledWith('y\n')
+    child.emit('close', 0)
+    await expect(result).resolves.toEqual({ stdout: '', stderr: '' })
   })
 
   it('caps stdout and stderr independently so diagnostics do not consume the payload budget', async () => {

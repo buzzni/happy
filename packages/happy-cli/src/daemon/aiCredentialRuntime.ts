@@ -53,6 +53,7 @@ type CommandOptions = {
   timeoutMs?: number
   acceptNonZeroExit?: boolean
   environment?: NodeJS.ProcessEnv
+  input?: string
 }
 
 type Supervisor = {
@@ -364,9 +365,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         && account.disabled !== true
       ))
       if (!target) throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
-      if (details.activeAccountNumber !== target.number) {
+      const targetNumber = target.number
+      if (details.activeAccountNumber !== targetNumber) {
         await deps.execFile('cswap', [
-          'switch', String(target.number), '--force', '--json',
+          'switch', String(targetNumber), '--force', '--json',
         ], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
         status = await deps.execFile('cswap', ['list', '--json'], {
           maxOutputBytes: MAX_PAYLOAD_BYTES,
@@ -383,6 +385,30 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         }
       }
       await deps.supervisor.stop()
+      const previousAccounts = details.accounts.filter((account) => account.number !== targetNumber)
+      for (const account of previousAccounts) {
+        await deps.execFile('cswap', ['remove', String(account.number)], {
+          input: 'y\n',
+          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+        })
+      }
+      if (previousAccounts.length > 0) {
+        status = await deps.execFile('cswap', ['list', '--json'], {
+          maxOutputBytes: MAX_PAYLOAD_BYTES,
+          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+        })
+        details = parseClaudeListDetails(status.stdout)
+        target = details.accounts.find((account) => (
+          account.email === apiKeyTargetEmail
+          && account.usageStatus === 'api_key'
+          && account.disabled !== true
+        ))
+        if (!target
+          || details.activeAccountNumber !== target.number
+          || details.accounts.length !== 1) {
+          throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+        }
+      }
       return {
         provider: 'claude' as const,
         configured: true,
@@ -1324,7 +1350,7 @@ export function runAiCredentialCommand(
     const child = spawnCommand(command, args, {
       env: options.environment
         ?? (command === 'cswap' ? withUvToolBinOnPath() : process.env),
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       windowsHide: true,
     })
     const stdout: Buffer[] = []
@@ -1350,8 +1376,8 @@ export function runAiCredentialCommand(
         target.push(chunk)
       }
     }
-    child.stdout.on('data', collect(stdout))
-    child.stderr.on('data', collect(stderr))
+    child.stdout!.on('data', collect(stdout))
+    child.stderr!.on('data', collect(stderr))
     child.on('error', () => fail('COMMAND_NOT_AVAILABLE'))
     child.on('close', (code) => {
       if (settled) return
@@ -1370,6 +1396,10 @@ export function runAiCredentialCommand(
       })
     })
     timeout = setTimeout(() => fail('COMMAND_TIMED_OUT'), options.timeoutMs ?? 30_000)
+    if (options.input !== undefined) {
+      child.stdin?.on('error', () => fail('COMMAND_FAILED'))
+      child.stdin?.end(options.input)
+    }
   })
 }
 
