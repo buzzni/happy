@@ -60,6 +60,7 @@ import {
     resolveInitialSaycodeAppendSystemPrompt,
     resolveSaycodeAppendSystemPromptForMessage,
 } from '@/prompt/promptProvenance';
+import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -200,6 +201,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Handle server unreachable case - run Claude locally with hot reconnection
     // Note: connectionState.notifyOffline() was already called by api.ts with error details
     if (!response) {
+        if (sandboxConfig?.checkpointProtection) {
+            throw new Error('checkpoint protection requires an authoritative server session');
+        }
         if (automationRunOnceRequested) {
             throw new Error('Claude automation cannot start while the Happy server is unavailable');
         }
@@ -279,6 +283,17 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     }
 
     logger.debug(`Session created: ${response.id}`);
+    if (sandboxConfig?.checkpointProtection && (options.startingMode ?? 'local') !== 'remote') {
+        throw new Error('checkpoint protection supports Claude remote mode only');
+    }
+    const checkpointComposition = await createCheckpointSessionComposition({
+        provider: 'claude-remote',
+        platform: process.platform,
+        projectPath: workingDirectory,
+        sessionId: response.id,
+        sandboxConfig,
+        env: process.env,
+    });
 
     // SDK metadata (tools, slash commands) is now extracted from the
     // system.init message in claudeRemote.ts via onSDKMetadata callback
@@ -1143,7 +1158,8 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         session,
         claudeEnvVars: options.claudeEnvVars,
         claudeArgs: options.claudeArgs,
-        sandboxConfig,
+        sandboxConfig: checkpointComposition.sandboxConfig,
+        checkpointComposition,
         hookSettingsPath,
         jsRuntime: options.jsRuntime,
         exitAfterFirstTurn,

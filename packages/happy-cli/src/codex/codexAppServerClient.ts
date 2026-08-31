@@ -218,6 +218,7 @@ export class CodexAppServerClient {
     private processEpoch = 0;
     private connected = false;
     private sandboxConfig?: SandboxConfig;
+    private readonly beforeTurn?: () => Promise<void>;
     private sandboxCleanup: (() => Promise<void>) | null = null;
     private multiAuthProxy: PreparedCodexMultiAuthProxy | null = null;
     private multiAuthProxyCleanup: Promise<void> | null = null;
@@ -280,8 +281,9 @@ export class CodexAppServerClient {
     private eventHandler: ((msg: EventMsg) => void) | null = null;
     private approvalHandler: ApprovalHandler | null = null;
 
-    constructor(sandboxConfig?: SandboxConfig) {
+    constructor(sandboxConfig?: SandboxConfig, beforeTurn?: () => Promise<void>) {
         this.sandboxConfig = sandboxConfig;
+        this.beforeTurn = beforeTurn;
     }
 
     get threadId(): string | null {
@@ -696,8 +698,14 @@ export class CodexAppServerClient {
                 this.sandboxEnabled = true;
                 logger.info(`[CodexAppServer] Sandbox enabled`);
             } catch (error) {
-                logger.warn('[CodexAppServer] Failed to initialize sandbox; continuing without.', error);
                 this.sandboxCleanup = null;
+                if (this.beforeTurn) {
+                    throw new Error(
+                        'checkpoint protection sandbox initialization failed; refusing to start Codex. '
+                        + `Original error: ${error instanceof Error ? error.message : String(error)}`,
+                    );
+                }
+                logger.warn('[CodexAppServer] Failed to initialize sandbox; continuing without.', error);
                 if (isNetworkRequiredSandboxFailureFatal(this.sandboxConfig)) {
                     throw new Error(
                         `Sandbox initialization failed but network access was required `
@@ -1386,7 +1394,7 @@ export class CodexAppServerClient {
             throw new Error('No active thread. Call startThread first.');
         }
 
-        await opts?.beforeTurn?.();
+        await this.resolveBeforeTurn(opts)?.();
 
         const extraInputItems = opts?.extraInputItems ?? [];
         const input: InputItem[] = [];
@@ -1473,7 +1481,7 @@ export class CodexAppServerClient {
         // Clear any stale watchdog snapshot so it can only describe this turn's abort.
         this.pendingInactivityAbort = null;
 
-        await opts?.beforeTurn?.();
+        await this.resolveBeforeTurn(opts)?.();
 
         const timeoutMs = opts?.turnTimeoutMs ?? CodexAppServerClient.TURN_TIMEOUT_MS;
         const completion = new Promise<boolean>((resolve) => {
@@ -1498,6 +1506,12 @@ export class CodexAppServerClient {
 
         const aborted = await completion;
         return { aborted };
+    }
+
+    private resolveBeforeTurn(opts: { beforeTurn?: () => Promise<void> } | undefined) {
+        return opts && Object.prototype.hasOwnProperty.call(opts, 'beforeTurn')
+            ? opts.beforeTurn
+            : this.beforeTurn;
     }
 
     async steerTurn(prompt: string): Promise<void> {

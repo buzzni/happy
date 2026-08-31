@@ -97,6 +97,8 @@ import {
     resolveInitialPromptPermissionMode,
 } from '@/utils/initialPrompt';
 import { registerCodexSteerHandler } from './codexSteerHandler';
+import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
+import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
@@ -232,6 +234,19 @@ export async function runCodex(opts: {
         automationRunOnceRequested,
         serverAvailable: response !== null,
     });
+    if (!response && sandboxConfig?.checkpointProtection) {
+        throw new Error('checkpoint protection requires an authoritative server session');
+    }
+    const checkpointComposition = response
+        ? await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: process.platform,
+            projectPath: process.cwd(),
+            sessionId: response.id,
+            sandboxConfig,
+            env: process.env,
+        })
+        : { sandboxConfig };
 
     // Handle server unreachable case - create offline stub with hot reconnection
     let session: ApiSessionClient;
@@ -694,7 +709,10 @@ export async function runCodex(opts: {
     // Start Context 
     //
 
-    client = new CodexAppServerClient(sandboxConfig);
+    client = new CodexAppServerClient(
+        checkpointComposition.sandboxConfig,
+        checkpointComposition.beforeTurn,
+    );
 
     registerCodexSteerHandler({
         client,
@@ -1267,8 +1285,9 @@ export async function runCodex(opts: {
                 // would have produced from a real turn_aborted, reusing its guard logic
                 // (harmless no-op if currentTurnId is already null).
                 logger.warn('Error in codex session:', error);
-                messageBuffer.addMessage('Process exited unexpectedly', 'status');
-                session.sendSessionEvent({ type: 'message', message: 'Process exited unexpectedly' });
+                const failureMessage = describeCheckpointFailure(error) ?? 'Process exited unexpectedly';
+                messageBuffer.addMessage(failureMessage, 'status');
+                session.sendSessionEvent({ type: 'message', message: failureMessage });
                 const closed = mapCodexMcpMessageToSessionEnvelopes(
                     { type: 'turn_aborted', status: 'failed' },
                     {

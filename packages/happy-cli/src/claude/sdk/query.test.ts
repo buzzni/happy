@@ -50,4 +50,19 @@ describe('query adapter', () => {
             }),
         }));
     });
+
+    it('forwards fail-closed sandbox settings to the Claude Agent SDK', () => {
+        const sandbox = {
+            enabled: true,
+            failIfUnavailable: true,
+            allowUnsandboxedCommands: false,
+            filesystem: { denyWrite: ['/project/**/.env*'] },
+        };
+
+        query({ prompt: 'edit', options: { sandbox } });
+
+        expect(sdkQuery).toHaveBeenCalledWith(expect.objectContaining({
+            options: expect.objectContaining({ sandbox }),
+        }));
+    });
 });

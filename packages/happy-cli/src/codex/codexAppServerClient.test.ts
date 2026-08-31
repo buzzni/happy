@@ -633,6 +633,42 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('runs its protected runtime gate before every turn dispatch', async () => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-runtime', path: '/tmp/thread-runtime' },
+                            model: 'gpt-test', modelProvider: 'openai', cwd: '/tmp/project',
+                            approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' }, reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { turn: { id: 'turn-runtime' } },
+                    }), 0);
+                }
+            },
+        }));
+        const beforeTurn = vi.fn(async () => {});
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(sandboxConfig, beforeTurn);
+        await client.connect();
+        await client.startThread({ cwd: '/tmp/project' });
+
+        await client.sendTurn('edit the project');
+
+        expect(beforeTurn).toHaveBeenCalledOnce();
+        expect(requests.some(({ method }) => method === 'turn/start')).toBe(true);
+        await client.disconnect();
+    });
+
     // 2026-08-28 프로덕션 — 이 테스트는 원래 버그를 정상으로 못박고 있었다.
     // sandboxConfig.networkMode 는 'allowed' 인데, 초기화가 실패하면 계속 진행해
     // sandboxEnabled=false 로 떨어졌다. 그 뒤 AgentTask 워커가 permissionMode
@@ -672,6 +708,19 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(client.sandboxEnabled).toBe(false);
 
         await client.disconnect();
+    });
+
+    it('fails closed when a protected runtime cannot initialize its sandbox', async () => {
+        mockInitializeSandbox.mockRejectedValue(new Error('sandbox init failed'));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(
+            { ...sandboxConfig, networkMode: 'blocked' },
+            vi.fn(async () => {}),
+        );
+
+        await expect(client.connect()).rejects.toThrow(/checkpoint protection sandbox initialization failed/);
+
+        expect(mockSpawn).not.toHaveBeenCalled();
     });
 
     it('routes managed Codex sessions through multi-auth and closes the proxy on disconnect', async () => {

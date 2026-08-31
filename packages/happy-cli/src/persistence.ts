@@ -28,6 +28,12 @@ export const SandboxConfigSchema = z.object({
   allowedDomains: z.array(z.string()).default([]),
   deniedDomains: z.array(z.string()).default([]),
   allowLocalBinding: z.boolean().default(true),
+  checkpointProtection: z.object({
+    secretPatterns: z.array(z.string()),
+    maxFileBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    maxFiles: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    maxTotalBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  }).strict().optional(),
 });
 
 export type SandboxConfig = z.infer<typeof SandboxConfigSchema>;

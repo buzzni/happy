@@ -22,6 +22,8 @@ export type CheckpointStoreLayout = {
 export type CheckpointSnapshotRequest = Omit<CheckpointStoreBinding, 'checkpointRoot'> & {
     operationId: string;
     projectPath: string;
+    excludedPaths?: string[];
+    excludedPatterns?: string[];
 };
 
 export type CheckpointSnapshotResult = {
@@ -155,7 +157,28 @@ export class CheckpointStore {
             await rm(layout.indexFile, { force: true });
         }
 
-        await runGit(['add', '-A'], projectPath, environment);
+        const excludedPaths = normalizeExcludedPaths(request.excludedPaths ?? []);
+        const excludedPatterns = normalizeExcludedPatterns(request.excludedPatterns ?? []);
+        await runGit([
+            'add',
+            '-A',
+            '--',
+            '.',
+            ...excludedPaths.map((path) => `:(exclude,top,literal)${path}`),
+            ...excludedPatterns.map((pattern) => `:(exclude,top,glob)${pattern}`),
+        ], projectPath, environment);
+        if (excludedPaths.length > 0 || excludedPatterns.length > 0) {
+            await runGit([
+                'rm',
+                '-r',
+                '-f',
+                '--cached',
+                '--ignore-unmatch',
+                '--',
+                ...excludedPaths.map((path) => `:(top,literal)${path}`),
+                ...excludedPatterns.map((pattern) => `:(top,glob)${pattern}`),
+            ], projectPath, environment);
+        }
         const tree = (await runGit(['write-tree'], projectPath, environment)).stdout.trim();
         if (parentId) {
             const parentTree = (await runGit(
@@ -205,6 +228,35 @@ export class CheckpointStore {
         delete environment.GIT_ALTERNATE_OBJECT_DIRECTORIES;
         return environment;
     }
+}
+
+function normalizeExcludedPatterns(patterns: string[]): string[] {
+    return [...new Set(patterns.map((pattern) => {
+        if (
+            pattern.length === 0
+            || pattern.includes('\0')
+            || pattern.startsWith('/')
+            || pattern.startsWith('!')
+            || pattern.split('/').includes('..')
+        ) {
+            throw new Error('checkpoint excluded pattern must be a project-relative glob');
+        }
+        return pattern;
+    }))].sort();
+}
+
+function normalizeExcludedPaths(paths: string[]): string[] {
+    return [...new Set(paths.map((path) => {
+        if (
+            path.length === 0
+            || path.includes('\0')
+            || /^(?:[A-Za-z]:|[\\/])/.test(path)
+            || path.split(/[\\/]+/).includes('..')
+        ) {
+            throw new Error('checkpoint excluded path must be project-relative');
+        }
+        return path.split(sep).join('/');
+    }))].sort();
 }
 
 async function bindProjectPath(

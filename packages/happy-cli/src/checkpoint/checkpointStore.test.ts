@@ -199,4 +199,32 @@ describe('CheckpointStore', () => {
         ]);
         expect(count.trim()).toBe('1');
     });
+
+    it('excludes secret globs even when an exact manifest path was not supplied', async () => {
+        await writeFile(join(projectPath, 'source.txt'), 'safe\n');
+        await writeFile(join(projectPath, '.env.raced'), 'SECRET=value\n');
+        const binding = {
+            sessionId: 'session-1',
+            projectId: 'project-1',
+            worktreeId: null,
+            projectPath,
+        };
+
+        const snapshot = await new CheckpointStore(checkpointRoot).snapshotTurn({
+            ...binding,
+            operationId: 'turn-1',
+            excludedPatterns: ['**/.env*'],
+        });
+        const layout = resolveCheckpointStoreLayout({ checkpointRoot, ...binding });
+        const { stdout } = await execFileAsync('git', [
+            `--git-dir=${layout.gitDirectory}`,
+            'ls-tree',
+            '-r',
+            '--name-only',
+            snapshot.checkpointId,
+        ]);
+
+        expect(stdout.split('\n')).toContain('source.txt');
+        expect(stdout.split('\n')).not.toContain('.env.raced');
+    });
 });

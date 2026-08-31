@@ -49,6 +49,7 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         agents: opts?.agents,
         settingSources: opts?.settingSources,
         skills: opts?.skills,
+        sandbox: opts?.sandbox,
     }
 
     // Map abort signal -> AbortController

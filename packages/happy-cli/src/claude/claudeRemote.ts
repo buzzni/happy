@@ -48,6 +48,7 @@ export async function claudeRemote(opts: {
     /** MCP servers to add for orchestrator worker management */
     orchestratorMcpServers?: Record<string, unknown>,
     mcpConfig?: McpConfigSource,
+    sandbox?: QueryOptions['sandbox'],
 
     // Dynamic parameters
     nextMessage: () => Promise<{ message: MessageParam['content'], mode: EnhancedMode } | null>,
@@ -205,6 +206,7 @@ export async function claudeRemote(opts: {
         abort: opts.signal,
         settingsPath: opts.hookSettingsPath,
         promptSuggestions: true,
+        sandbox: opts.sandbox,
     }
 
     // Track thinking state

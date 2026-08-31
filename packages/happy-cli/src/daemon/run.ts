@@ -182,6 +182,10 @@ import {
   prepareAdditionalDirectories,
 } from './additionalDirectories';
 import { mergeAdditionalDirectoriesIntoSandboxEnvironment } from '@/utils/additionalDirectoriesEnv';
+import {
+  injectCheckpointSpawnContext,
+  readCheckpointSpawnContext,
+} from '@/checkpoint/checkpointSpawnContext';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -869,6 +873,7 @@ export async function startDaemon(): Promise<void> {
           };
         }
         let mcpCallerGrant: string | undefined = trustedMcpContext?.mcpCallerGrant;
+        let hasAuthoritativeProjectBinding = trustedMcpContext !== undefined;
         const mcpConfigProjectId = trustedMcpContext?.mcpConfigProjectId
           ?? options.mcpConfigProjectId?.trim()
           ?? null;
@@ -884,6 +889,7 @@ export async function startDaemon(): Promise<void> {
             };
           }
           mcpCallerGrant = consumed.grant;
+          hasAuthoritativeProjectBinding = true;
         }
         if (options.bootstrapFiles) {
           await materializeSpawnBootstrapFiles(directory, options.bootstrapFiles);
@@ -936,6 +942,7 @@ export async function startDaemon(): Promise<void> {
           ...authEnv,
           ...(options.environmentVariables ?? {}),
         }, mcpCallerGrant, process.env.HAPPY_APLUS_MCP_CONFIG_URL, mcpConfigProjectId, options.expectedConnectors, 'spawn');
+        extraEnv = injectCheckpointSpawnContext(extraEnv, undefined);
         if (options.parentSessionId) {
           extraEnv.HAPPY_FORKED_FROM_SESSION_ID = options.parentSessionId;
         }
@@ -998,6 +1005,13 @@ export async function startDaemon(): Promise<void> {
             errorMessage
           };
         }
+        extraEnv = injectCheckpointSpawnContext(extraEnv, mcpConfigProjectId && hasAuthoritativeProjectBinding
+          ? {
+            projectId: mcpConfigProjectId,
+            worktreeId: null,
+            checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
+          }
+          : undefined);
 
         // Initial prompt (scheduled automations 등): 불투명한 사용자 텍스트라
         // 위의 ${VAR} 확장·검증을 통과시키면 안 된다 — 프롬프트 속 "${FOO}"는
@@ -1573,6 +1587,7 @@ export async function startDaemon(): Promise<void> {
           env: process.env,
           filterCredentials: options?.automation !== undefined,
         });
+        const priorCheckpointContext = readCheckpointSpawnContext(tracked.agentEnvironment ?? {});
         const mcpEnvironment = prepareMcpChildEnvironment({
           environmentVariables: buildResumedSessionSpawnEnvironment({
             inherited: inheritedResumeEnvironment,
@@ -1607,13 +1622,38 @@ export async function startDaemon(): Promise<void> {
             errorMessage: `MCP caller grant rejected (${mcpEnvironment.reason})`,
           };
         }
+        const checkpointProjectId = options?.mcpConfigProjectId?.trim()
+          || priorCheckpointContext?.projectId;
+        if (
+          priorCheckpointContext
+          && checkpointProjectId
+          && priorCheckpointContext.projectId !== checkpointProjectId
+        ) {
+          return {
+            type: 'error',
+            code: 'SESSION_RESUME_FAILED',
+            errorMessage: 'Checkpoint project binding cannot change while resuming a session',
+          };
+        }
+        const authoritativeCheckpointProjectId = priorCheckpointContext?.projectId
+          ?? (options?.mcpCallerGrantEnvelope ? checkpointProjectId : undefined);
+        const resumedEnvironment = injectCheckpointSpawnContext(
+          mcpEnvironment.environmentVariables,
+          authoritativeCheckpointProjectId
+            ? {
+              projectId: authoritativeCheckpointProjectId,
+              worktreeId: priorCheckpointContext?.worktreeId ?? null,
+              checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
+            }
+            : undefined,
+        );
 
         const result = await spawnTrackedHappyProcess({
           args: launch.args,
           cwd: launch.cwd,
           // resume 는 이 spawn 하나에 한해 lineage 를 명시적으로 부여한다 —
           // 상속분은 scrub 하고 이 세션의 값만 아래에서 다시 넣는다.
-          env: mcpEnvironment.environmentVariables,
+          env: resumedEnvironment,
           userHomeDir: credentialDecision.kind === 'user-staged' ? credentialDecision.homeDir : undefined,
         });
         return result.type === 'error'

@@ -60,6 +60,10 @@ export class CheckpointExclusionGuard {
         this.manifest = manifest;
     }
 
+    get secretPatterns(): string[] {
+        return [...this.policy.secretPatterns];
+    }
+
     static async create(policy: CheckpointExclusionPolicy): Promise<CheckpointExclusionGuard> {
         const canonicalProjectPath = await realpath(policy.projectPath);
         const canonicalPolicy = {

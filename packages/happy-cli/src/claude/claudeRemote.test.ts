@@ -75,6 +75,43 @@ describe('claudeRemote', () => {
         expect(calls).toEqual(['gate']);
     });
 
+    it('starts the provider with the protected sandbox fixed before its first turn', async () => {
+        vi.mocked(query).mockReturnValue({
+            setPermissionMode: vi.fn(),
+            mcpServerStatus: vi.fn(async () => []),
+            async *[Symbol.asyncIterator]() {
+                yield { type: 'result', subtype: 'success' };
+            },
+        } as any);
+        const sandbox = {
+            enabled: true,
+            failIfUnavailable: true,
+            allowUnsandboxedCommands: false,
+            filesystem: { denyWrite: ['/project/**/.env*'] },
+        };
+
+        await claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            exitAfterFirstTurn: true,
+            sandbox,
+            nextMessage: async () => ({ message: 'edit the project', mode }),
+            beforeTurn: vi.fn(async () => {}),
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+        });
+
+        expect(query).toHaveBeenCalledWith(expect.objectContaining({
+            options: expect.objectContaining({ sandbox }),
+        }));
+    });
+
     it('does not dispatch an excluded-path retry while protection confirmation is pending', async () => {
         vi.mocked(query).mockReturnValue({
             setPermissionMode: vi.fn(),

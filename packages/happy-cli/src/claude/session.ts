@@ -6,6 +6,7 @@ import type { JsRuntime } from "./runClaude";
 import type { SandboxConfig } from "@/persistence";
 import type { AplusMcpServersMap } from '@/aplus/fetchAplusMcpServers';
 import type { McpConfigSource } from './mcpConfigSynchronizer';
+import type { CheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 
 export class Session {
     readonly path: string;
@@ -19,6 +20,7 @@ export class Session {
     readonly mcpConfig?: McpConfigSource;
     readonly allowedTools?: string[];
     readonly sandboxConfig?: SandboxConfig;
+    readonly checkpointComposition?: CheckpointSessionComposition;
     readonly _onModeChange: (mode: 'local' | 'remote') => void;
     readonly _onAbort?: () => void;
     readonly onActiveUserInputAccepted?: (text: string) => void;
@@ -56,6 +58,7 @@ export class Session {
         onActiveUserInputAccepted?: (text: string) => void,
         allowedTools?: string[],
         sandboxConfig?: SandboxConfig,
+        checkpointComposition?: CheckpointSessionComposition,
         /** Path to temporary settings file with SessionStart hook (required for session tracking) */
         hookSettingsPath: string,
         /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
@@ -78,6 +81,7 @@ export class Session {
         this.mcpConfig = opts.mcpConfig;
         this.allowedTools = opts.allowedTools;
         this.sandboxConfig = opts.sandboxConfig;
+        this.checkpointComposition = opts.checkpointComposition;
         this._onModeChange = opts.onModeChange;
         this._onAbort = opts.onAbort;
         this.onActiveUserInputAccepted = opts.onActiveUserInputAccepted;
