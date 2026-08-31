@@ -66,6 +66,9 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     dispatch: null,
   }))
   const maintainAgentTaskLease = vi.fn<ServerAutomationExecutorInput['maintainAgentTaskLease']>()
+  const ensureReviewObjects = vi.fn<NonNullable<ServerAutomationExecutorInput['ensureReviewObjects']>>(
+    async () => ({ ok: true, fetched: [] }),
+  )
   const spawnSession = vi.fn<ServerAutomationExecutorInput['spawnSession']>(async () => ({
     ok: true as const,
     sessionId: 'session-1',
@@ -122,6 +125,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     createGithubIssueProgressMarker,
     removeGithubIssueProgressMarker,
     dispatchAgentTask,
+    ensureReviewObjects,
     maintainAgentTaskLease,
     resolveMcpSpawnContext,
     preflightMcpConnectors,
@@ -138,6 +142,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
   return {
     input, store, transport, decryptPayload, logDebug, runScript, queryGithubPullRequests, queryGithubPullRequestFiles,
     queryGithubIssues, notifyGithubTrigger, dispatchAgentTask, maintainAgentTaskLease,
+    ensureReviewObjects,
     resolveGithubIssueProgressMarkerIdentity, createGithubIssueProgressMarker,
     removeGithubIssueProgressMarker,
     resolveMcpSpawnContext, preflightMcpConnectors, linkSession, resumeSession, spawnSession,
@@ -1321,6 +1326,105 @@ describe('runServerAutomationTick', () => {
     expect(resolveMcpSpawnContext).not.toHaveBeenCalled()
     expect(spawnSession).not.toHaveBeenCalled()
     expect(createGithubIssueProgressMarker).not.toHaveBeenCalled()
+  })
+
+  it('provisions the review commits before the pr_review worker starts', async () => {
+    // 2026-08-31 프로덕션 — hsmoa_backend AgentTask 리뷰가 "전달된 baseSha/headSha 가
+    // 워크스페이스에 없어 호출부 검증과 소스 SHA 테스트를 실행하지 못했다" 고 보고했다.
+    // 프로젝트 워크스페이스가 기본 브랜치 단일 refspec 의 shallow clone 이었고,
+    // preset 은 워커가 스스로 checkout·조회하는 것을 금지한다. 워커가 아니라 여기서
+    // 객체를 준비해 줘야 리뷰가 diff 밖 문맥을 볼 수 있다.
+    const { input, store, queryGithubPullRequests, dispatchAgentTask, ensureReviewObjects } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Follow project review rules', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'review-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { baseSha: 'b'.repeat(40), headSha: 'c'.repeat(40) },
+        context: [{ kind: 'diff', body: 'diff --git a/x b/x' }],
+      },
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(ensureReviewObjects).toHaveBeenCalledWith(expect.objectContaining({
+      directory: '/repo',
+      shas: ['b'.repeat(40), 'c'.repeat(40)],
+    }))
+  })
+
+  it('starts the worker anyway when the review commits cannot be fetched', async () => {
+    // 객체가 없어도 immutable diff artifact 로 리뷰는 가능하다. 여기서 멈추면 고칠 수
+    // 있었던 리뷰까지 잃는다. 다만 왜 문맥이 없는지는 남긴다 (AGENTS.md §1.13).
+    const { input, store, queryGithubPullRequests, dispatchAgentTask, ensureReviewObjects,
+      spawnSession, logDebug } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Follow project review rules', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'review-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { baseSha: 'b'.repeat(40), headSha: 'c'.repeat(40) },
+        context: [{ kind: 'diff', body: 'diff --git a/x b/x' }],
+      },
+    })
+    ensureReviewObjects.mockResolvedValue({ ok: false, error: 'remote hung up unexpectedly' })
+
+    await runServerAutomationTick(input)
+
+    expect(spawnSession).toHaveBeenCalled()
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('remote hung up unexpectedly'))
   })
 
   it('fails closed when issue_opened is combined with agent-task-review', async () => {
