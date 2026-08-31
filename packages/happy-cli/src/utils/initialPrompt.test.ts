@@ -12,6 +12,7 @@ import {
   consumePendingInitialPrompt,
   consumePendingInitialSaycodePromptBlocks,
   consumePendingInitialSaycodeSystemPromptEnabled,
+  normalizeClaudeModelForRuntime,
   stageInitialPromptEnvironment,
 } from './initialPrompt'
 
@@ -122,6 +123,27 @@ describe('consumePendingInitialModel', () => {
   it('treats a blank value as absent', () => {
     expect(consumePendingInitialModel({ HAPPY_INITIAL_MODEL: '   ' })).toBeNull()
     expect(consumePendingInitialModel({})).toBeNull()
+  })
+})
+
+describe('normalizeClaudeModelForRuntime', () => {
+  it('maps Claude model families to Z.AI aliases and removes Fable', () => {
+    expect(normalizeClaudeModelForRuntime('claude-fable-5', {
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    })).toBeUndefined()
+    expect(normalizeClaudeModelForRuntime('fable', {
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    })).toBeUndefined()
+    expect(normalizeClaudeModelForRuntime('claude-opus-5', {
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    })).toBe('opus')
+    expect(normalizeClaudeModelForRuntime('claude-sonnet-5', {
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    })).toBe('sonnet')
+    expect(normalizeClaudeModelForRuntime('claude-haiku-4-5', {
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    })).toBe('haiku')
+    expect(normalizeClaudeModelForRuntime('claude-fable-5', {})).toBe('claude-fable-5')
   })
 })
 

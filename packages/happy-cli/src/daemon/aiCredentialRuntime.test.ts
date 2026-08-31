@@ -43,7 +43,12 @@ function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
   const execFile = vi.fn(async (
     command: string,
     args: string[],
-    _options?: { maxOutputBytes?: number; timeoutMs?: number },
+    _options?: {
+      maxOutputBytes?: number
+      timeoutMs?: number
+      acceptNonZeroExit?: boolean
+      environment?: NodeJS.ProcessEnv
+    },
   ): Promise<AiCredentialCommandResult> => {
     calls.push({ command, args })
     if (command === 'cswap' && args[0] === 'export') {
@@ -61,6 +66,9 @@ function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
     if (command === 'codex-multi-auth' && args[0] === '--version') {
       return { stdout: '2.8.5\n', stderr: '' }
     }
+    if (command === 'claude' && args[0] === '--print') {
+      return { stdout: JSON.stringify({ result: 'CLAUDE_AUTH_OK' }), stderr: '' }
+    }
     if (command === 'npm' && args[0] === 'root') {
       return { stdout: '/global/node_modules\n', stderr: '' }
     }
@@ -71,12 +79,13 @@ function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
     stop: vi.fn(async () => undefined),
     status: vi.fn(() => ({ state: 'running' as const, lastErrorKind: null })),
   }
+  const writeFile = vi.fn(async (path: string, content: string) => { files.set(path, content) })
   const runtime = createAiCredentialRuntime({
     homeDir: '/home/operator',
     env: {},
     execFile,
     readFile: vi.fn(async (path: string) => files.get(path) ?? Promise.reject(Object.assign(new Error('missing'), { code: 'ENOENT' }))),
-    writeFile: vi.fn(async (path: string, content: string) => { files.set(path, content) }),
+    writeFile,
     mkdir: vi.fn(async () => undefined),
     rename: vi.fn(async (from: string, to: string) => {
       const value = files.get(from)
@@ -96,7 +105,7 @@ function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
     supervisor,
     ...overrides,
   })
-  return { runtime, calls, files, supervisor }
+  return { runtime, calls, files, supervisor, writeFile, execFile }
 }
 
 describe('AI credential machine runtime', () => {
@@ -105,6 +114,271 @@ describe('AI credential machine runtime', () => {
     contentHash: 'a'.repeat(64),
     bundleVersion: 1,
   }
+
+  const zaiPayload = JSON.stringify({
+    version: 1,
+    kind: 'zai-anthropic',
+    apiKey: 'zai-secret-key',
+  })
+
+  it('stores a Z.AI fallback with mode 0600 and exposes it only to Claude sessions', async () => {
+    const { runtime, files, supervisor, writeFile } = setup()
+    const zaiLease = { ...trialLease, leaseId: 'lease-zai-1' }
+
+    await expect(runtime.apply({ provider: 'zai', payload: zaiPayload, trialLease: zaiLease }))
+      .resolves.toEqual({ provider: 'zai', configured: true, accountCount: 1 })
+
+    expect(supervisor.stop).toHaveBeenCalledTimes(1)
+    expect(writeFile).toHaveBeenCalledWith(
+      '/home/operator/.happy/zai-claude-env.json.happy-tmp',
+      expect.any(String),
+      { mode: 0o600 },
+    )
+    expect(JSON.parse(files.get('/home/operator/.happy/zai-claude-env.json')!)).toEqual({
+      ANTHROPIC_AUTH_TOKEN: 'zai-secret-key',
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+      API_TIMEOUT_MS: '3000000',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7',
+    })
+    expect(files.get('/home/operator/.happy/trial-ai-credential-leases.json'))
+      .not.toContain('zai-secret-key')
+    await expect(runtime.sessionEnvironment('claude')).resolves.toEqual({
+      ANTHROPIC_AUTH_TOKEN: 'zai-secret-key',
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+      API_TIMEOUT_MS: '3000000',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7',
+    })
+    await expect(runtime.sessionEnvironment('codex')).resolves.toEqual({})
+  })
+
+  it('removes stale managed Claude credentials before enabling a Z.AI fallback', async () => {
+    const { runtime, files, execFile } = setup()
+    files.set('/home/operator/.claude/.credentials.json', 'stale-oauth-secret')
+    files.set('/home/operator/.claude-swap/accounts/1.json', 'stale-profile-secret')
+    files.set('/home/operator/.config/claude-swap/config.json', 'stale-profile-secret')
+
+    await runtime.apply({
+      provider: 'zai',
+      payload: zaiPayload,
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })
+
+    expect(files.has('/home/operator/.claude/.credentials.json')).toBe(false)
+    expect(files.has('/home/operator/.claude-swap/accounts/1.json')).toBe(false)
+    expect(files.has('/home/operator/.config/claude-swap/config.json')).toBe(false)
+  })
+
+  it('removes a stale managed Z.AI secret before enabling native Claude', async () => {
+    const { runtime, files } = setup()
+    files.set('/home/operator/.happy/zai-claude-env.json', JSON.stringify({
+      ANTHROPIC_AUTH_TOKEN: 'stale-zai-secret',
+    }))
+
+    await runtime.apply({ provider: 'claude', payload: '{}', trialLease })
+
+    expect(files.has('/home/operator/.happy/zai-claude-env.json')).toBe(false)
+  })
+
+  it('validates, reports, and purges a matching Z.AI fallback lease', async () => {
+    const { runtime, files, execFile } = setup()
+    const zaiLease = { ...trialLease, leaseId: 'lease-zai-1' }
+
+    await runtime.apply({ provider: 'zai', payload: zaiPayload, trialLease: zaiLease })
+    await expect(runtime.status({ provider: 'zai' })).resolves.toEqual({
+      provider: 'zai', configured: true, accountCount: 1,
+    })
+    expect(execFile).toHaveBeenCalledWith(
+      'claude',
+      [
+        '--print',
+        '--no-session-persistence',
+        '--safe-mode',
+        '--output-format',
+        'json',
+        '--model',
+        'sonnet',
+        '--tools',
+        '',
+        'Reply with exactly: CLAUDE_AUTH_OK',
+      ],
+      expect.objectContaining({
+        acceptNonZeroExit: true,
+        environment: expect.objectContaining({
+          ANTHROPIC_AUTH_TOKEN: 'zai-secret-key',
+          ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+        }),
+      }),
+    )
+    await expect(runtime.purge({ provider: 'zai', leaseId: zaiLease.leaseId }))
+      .resolves.toEqual({ provider: 'zai', purged: true, alreadyPurged: false })
+    expect(files.has('/home/operator/.happy/zai-claude-env.json')).toBe(false)
+    await expect(runtime.sessionEnvironment('claude')).resolves.toEqual({})
+  })
+
+  it('isolates the Z.AI probe from inherited native Claude credentials and model overrides', async () => {
+    const { runtime, execFile } = setup({
+      env: {
+        SAFE_INHERITED_VALUE: 'kept',
+        ANTHROPIC_API_KEY: 'stale-api-key',
+        CLAUDE_CODE_OAUTH_TOKEN: 'stale-oauth-token',
+        ANTHROPIC_MODEL: 'claude-opus-5',
+        ANTHROPIC_SMALL_FAST_MODEL: 'claude-haiku-4-5',
+      },
+    })
+
+    await runtime.apply({
+      provider: 'zai',
+      payload: zaiPayload,
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })
+    await runtime.status({ provider: 'zai' })
+
+    const probeEnvironment = execFile.mock.calls.find(([command]) => command === 'claude')?.[2]
+      ?.environment
+    expect(probeEnvironment).toEqual(expect.objectContaining({
+      SAFE_INHERITED_VALUE: 'kept',
+      ANTHROPIC_AUTH_TOKEN: 'zai-secret-key',
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3',
+    }))
+    expect(probeEnvironment).not.toHaveProperty('ANTHROPIC_API_KEY')
+    expect(probeEnvironment).not.toHaveProperty('CLAUDE_CODE_OAUTH_TOKEN')
+    expect(probeEnvironment).not.toHaveProperty('ANTHROPIC_MODEL')
+    expect(probeEnvironment).not.toHaveProperty('ANTHROPIC_SMALL_FAST_MODEL')
+  })
+
+  it('reports a missing or corrupt managed Z.AI environment as unconfigured', async () => {
+    const { runtime, files } = setup()
+    const zaiLease = { ...trialLease, leaseId: 'lease-zai-1' }
+
+    await runtime.apply({ provider: 'zai', payload: zaiPayload, trialLease: zaiLease })
+    files.delete('/home/operator/.happy/zai-claude-env.json')
+    await expect(runtime.status({ provider: 'zai' })).resolves.toEqual({
+      provider: 'zai', configured: false, accountCount: 0,
+    })
+
+    files.set('/home/operator/.happy/zai-claude-env.json', '{"unexpected":true}')
+    await expect(runtime.status({ provider: 'zai' })).resolves.toEqual({
+      provider: 'zai', configured: false, accountCount: 0,
+    })
+  })
+
+  it('reports a Z.AI key as unconfigured when the live Claude probe is not exact', async () => {
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: JSON.stringify({ result: 'not authenticated' }),
+        stderr: '',
+      })),
+    })
+
+    await runtime.apply({
+      provider: 'zai',
+      payload: zaiPayload,
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })
+
+    await expect(runtime.status({ provider: 'zai' })).resolves.toEqual({
+      provider: 'zai', configured: false, accountCount: 0,
+    })
+  })
+
+  it('does not accept exact Z.AI probe text from a failed Claude process', async () => {
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: JSON.stringify({ result: 'CLAUDE_AUTH_OK' }),
+        stderr: '401 Unauthorized: invalid API key',
+        exitCode: 1,
+      })),
+    })
+
+    await runtime.apply({
+      provider: 'zai',
+      payload: zaiPayload,
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })
+
+    await expect(runtime.status({ provider: 'zai' })).resolves.toMatchObject({
+      provider: 'zai', configured: false,
+    })
+  })
+
+  it('does not quarantine a Z.AI key for a transient live probe failure', async () => {
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: '',
+        stderr: '429 Too Many Requests',
+        exitCode: 1,
+      })),
+    })
+
+    await runtime.apply({
+      provider: 'zai',
+      payload: zaiPayload,
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })
+
+    await expect(runtime.status({ provider: 'zai' })).rejects.toMatchObject({
+      kind: 'ZAI_PROBE_FAILED',
+    })
+  })
+
+  it('removes the secret temporary file when Z.AI environment installation fails', async () => {
+    let filesRef!: Map<string, string>
+    const prepared = setup({
+      rename: vi.fn(async (from: string, to: string) => {
+        if (to.endsWith('/zai-claude-env.json')) throw new Error('rename failed')
+        const value = filesRef.get(from)
+        if (value === undefined) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+        filesRef.set(to, value)
+        filesRef.delete(from)
+      }),
+    })
+    filesRef = prepared.files
+
+    await expect(prepared.runtime.apply({
+      provider: 'zai',
+      payload: zaiPayload,
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })).rejects.toMatchObject({ kind: 'ZAI_APPLY_FAILED' })
+
+    expect(prepared.files.has('/home/operator/.happy/zai-claude-env.json.happy-tmp')).toBe(false)
+    expect(prepared.files.has('/home/operator/.happy/trial-ai-credential-leases.json')).toBe(false)
+  })
+
+  it('does not orphan an installed Z.AI secret on a redundant post-rename chmod', async () => {
+    const prepared = setup({
+      chmod: vi.fn(async (path: string) => {
+        if (path.endsWith('/zai-claude-env.json')) throw new Error('chmod failed')
+      }),
+    })
+
+    await expect(prepared.runtime.apply({
+      provider: 'zai',
+      payload: zaiPayload,
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })).resolves.toMatchObject({ provider: 'zai', configured: true })
+
+    expect(prepared.files.has('/home/operator/.happy/zai-claude-env.json')).toBe(true)
+    expect(prepared.files.has('/home/operator/.happy/trial-ai-credential-leases.json')).toBe(true)
+  })
+
+  it('rejects malformed Z.AI payloads and native/Z.AI lease overlap', async () => {
+    const { runtime } = setup()
+    await expect(runtime.apply({
+      provider: 'zai', payload: '{"version":1,"kind":"zai-anthropic","apiKey":""}',
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })).rejects.toMatchObject({ kind: 'ZAI_PAYLOAD_INVALID' })
+
+    await runtime.apply({ provider: 'claude', payload: '{}', trialLease })
+    await expect(runtime.apply({
+      provider: 'zai', payload: zaiPayload,
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })).rejects.toMatchObject({ kind: 'TRIAL_LEASE_CONFLICT' })
+  })
 
   it('writes only a non-secret trial ownership marker after a successful apply', async () => {
     const { runtime, files } = setup()
@@ -1208,6 +1482,27 @@ describe('AI credential machine runtime', () => {
     child.emit('close', 0)
 
     await expect(result).resolves.toEqual({ stdout: '1234', stderr: 'note' })
+  })
+
+  it('returns a nonzero exit code only when the caller explicitly accepts it', async () => {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      kill: vi.fn(),
+    })
+    const spawnCommand = vi.fn(() => child) as unknown as typeof spawn
+    const result = runAiCredentialCommand('claude', ['--print'], {
+      acceptNonZeroExit: true,
+    }, spawnCommand)
+
+    child.stdout.emit('data', Buffer.from('{"result":"CLAUDE_AUTH_OK"}'))
+    child.emit('close', 1)
+
+    await expect(result).resolves.toEqual({
+      stdout: '{"result":"CLAUDE_AUTH_OK"}',
+      stderr: '',
+      exitCode: 1,
+    })
   })
 
   it('does not let the uv tool bin shadow non-cswap commands', async () => {
