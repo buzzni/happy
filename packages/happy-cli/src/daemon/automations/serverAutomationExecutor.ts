@@ -19,6 +19,10 @@ import type {
 import type { AutomationMcpCallerGrantResult, AutomationMcpSpawnContext } from './automationMcpCallerGrant'
 import type { AutomationConnectorPreflightResult } from './automationConnectorPreflight'
 import { isPermanentGithubTriggerFailure } from './githubTriggerPermanentFailure'
+import {
+  ensureAgentTaskReviewObjects,
+  reviewShasFromDispatchInput,
+} from './agentTaskReviewObjects'
 import { shouldGiveUpWorktreeCleanup } from './worktreeCleanupGiveUp'
 import type { GithubTriggerWorktreePlan } from './githubTriggerWorktree'
 import type {
@@ -128,6 +132,16 @@ export interface ServerAutomationExecutorInput {
     | { ok: false; error: string }
   >
   maintainAgentTaskLease: (dispatch: AutomationAgentTaskDispatch) => void
+  /**
+   * pr_review 워커가 diff 밖 문맥을 볼 수 있도록 base/head 커밋을 워크스페이스에
+   * 확보한다. 프로젝트 clone 은 기본 브랜치 단일 refspec 의 shallow 라 PR 커밋이
+   * 없고, preset 은 워커가 스스로 checkout·조회하는 것을 금지한다.
+   */
+  ensureReviewObjects?: (input: {
+    directory: string
+    shas: string[]
+    environmentVariables?: Record<string, string>
+  }) => Promise<{ ok: true; fetched: string[] } | { ok: false; error: string }>
   resolveMcpSpawnContext: (input: {
     runId: string
     claimToken: string
@@ -1122,6 +1136,25 @@ async function executeStartedRun(
         }
       }
       agentTaskDispatch = bridged.dispatch
+      if (bridged.dispatch.type === 'pr_review.v1') {
+        const shas = reviewShasFromDispatchInput(bridged.dispatch.input)
+        if (shas.length > 0) {
+          const provisioned = await (input.ensureReviewObjects ?? ensureAgentTaskReviewObjects)({
+            directory: payload.directory,
+            shas,
+            ...(query.githubEnvironment ? { environmentVariables: query.githubEnvironment } : {}),
+          })
+          // 객체가 없어도 immutable diff artifact 로 리뷰는 가능하므로 멈추지 않는다.
+          // 다만 왜 문맥이 없는지는 남긴다 — 조용히 넘어가면 리뷰 품질이 낮아진 이유를
+          // 아무도 모른다 (AGENTS.md §1.13).
+          if (!provisioned.ok) {
+            input.logDebug?.(
+              `[server-automation] ${automation.automationId} review objects unavailable`
+              + ` — the worker cannot inspect call sites beyond the diff: ${provisioned.error}`,
+            )
+          }
+        }
+      }
       prompt = buildAgentTaskPrompt(bridged.dispatch, payload.prompt)
       environmentVariables = {
         ...(bridged.dispatch.type === 'review_apply.v1' ? query.githubEnvironment ?? {} : {}),
