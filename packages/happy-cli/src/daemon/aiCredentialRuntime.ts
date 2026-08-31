@@ -685,7 +685,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   function isRejectedZaiAuthentication(probe: AiCredentialCommandResult): boolean {
-    const diagnostic = `${probe.stdout}\n${probe.stderr}`
+    const stderrLines = probe.stderr.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+    const diagnostic = stderrLines[stderrLines.length - 1] ?? ''
     return /\b401\b|\bunauthorized\b|authentication[_ -]*error|invalid[_ -]*(?:api[_ -]*)?key/i
       .test(diagnostic)
   }
