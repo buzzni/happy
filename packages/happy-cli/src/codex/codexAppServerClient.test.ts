@@ -541,21 +541,34 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
-    // 2026-08-28 프로덕션 — 이 테스트는 원래 버그를 정상으로 못박고 있었다.
-    // sandboxConfig.networkMode 는 'allowed' 인데, 초기화가 실패하면 계속 진행해
-    // sandboxEnabled=false 로 떨어졌다. 그 뒤 AgentTask 워커가 permissionMode
-    // read-only 로 Codex 네이티브 readOnly 정책(네트워크 없음)에 떨어졌고, 몇 분
-    // 뒤 exec_command 안의 네트워크 호출이 실패할 때가 돼서야 드러났다. 네트워크가
-    // 명시적으로 필요했던 자리에서는 조용히 계속 진행하지 않고 스폰 시점에 바로
-    // 실패해야 한다.
-    it('refuses to continue when network was required and sandbox init fails', async () => {
+    // 2026-08-31 회귀 — 8/28 수정이 스폰 시점에 무조건 죽이도록 만들어, 폴백해도
+    // 네트워크가 멀쩡한 세션까지 전부 죽였다. connect() 시점에는 permissionMode 를
+    // 아직 모른다 (턴마다 결정된다). 그러니 여기서는 초기화 실패 사실만 기록하고,
+    // 네트워크를 실제로 잃는지는 모드를 아는 턴 시점에서 판정한다.
+    it('records sandbox init failure and still connects — the turn decides if it is fatal', async () => {
         mockInitializeSandbox.mockRejectedValue(new Error('sandbox init failed'));
         const { CodexAppServerClient } = await import('./codexAppServerClient');
         const client = new CodexAppServerClient(sandboxConfig);
 
-        await expect(client.connect()).rejects.toThrow(/network access was required/);
+        await client.connect();
 
-        expect(mockSpawn).not.toHaveBeenCalled();
+        expect(client.sandboxEnabled).toBe(false);
+        expect(client.sandboxInitFailed).toBe(true);
+        expect(mockSpawn).toHaveBeenCalled();
+
+        await client.disconnect();
+    });
+
+    it('leaves sandboxInitFailed false when the sandbox initialised cleanly', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(sandboxConfig);
+
+        await client.connect();
+
+        expect(client.sandboxEnabled).toBe(true);
+        expect(client.sandboxInitFailed).toBe(false);
+
+        await client.disconnect();
     });
 
     it('still falls back to non-sandbox transport when the sandbox deliberately blocks network', async () => {

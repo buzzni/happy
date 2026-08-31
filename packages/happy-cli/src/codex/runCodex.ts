@@ -42,6 +42,7 @@ import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import type { PermissionMode } from '@/api/types';
 import type { ApiSessionClient } from '@/api/apiSession';
 import { resolveCodexExecutionPolicy } from './executionPolicy';
+import { isSandboxFallbackNetworkLoss } from './sandboxInitFailurePolicy';
 import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
 import {
     mapCodexMcpMessageToSessionEnvelopes,
@@ -1136,6 +1137,25 @@ export async function runCodex(opts: {
                     message.mode.permissionMode,
                     sandboxManagedByHappy,
                 );
+
+                // 샌드박스 초기화가 실패했고, 이 턴의 모드가 하필 네트워크를 잃는
+                // 네이티브 정책으로 떨어지는 경우다. 조용히 돌면 몇 분 뒤 턴 안의
+                // 네트워크 호출이 DNS 에서 실패할 때가 돼서야 드러난다 — 그 자리에서
+                // 사유를 밝히고 턴을 멈춘다. 네트워크가 남는 모드는 그대로 진행한다.
+                if (
+                    client.sandboxInitFailed
+                    && isSandboxFallbackNetworkLoss(sandboxConfig, executionPolicy.sandbox)
+                ) {
+                    const notice = `Sandbox initialization failed, so permission mode `
+                        + `'${message.mode.permissionMode}' falls back to Codex's native read-only `
+                        + `policy, which has no network access at all — but this session requested `
+                        + `network (networkMode=${sandboxConfig?.networkMode}). Refusing to run the `
+                        + `turn without it. Original error: ${client.sandboxInitFailureReason}`;
+                    logger.warn(`[Codex] ${notice}`);
+                    messageBuffer.addMessage(notice, 'status');
+                    session.sendSessionEvent({ type: 'message', message: notice });
+                    continue;
+                }
 
                 const mcpSync = await mcpConfigSynchronizer.sync({
                     threadId: client.threadId,
