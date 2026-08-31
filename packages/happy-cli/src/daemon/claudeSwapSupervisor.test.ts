@@ -126,6 +126,37 @@ describe('Claude swap supervisor', () => {
     expect(supervisor.status()).toEqual({ state: 'stopped', lastErrorKind: null })
   })
 
+  it('keeps tracking a retained child after a later process error', async () => {
+    const { supervisor, children, scheduled } = setup()
+    await supervisor.enable()
+
+    const firstStop = supervisor.stop()
+    await vi.waitFor(() => expect(children[0].kill).toHaveBeenCalledWith('SIGTERM'))
+    scheduled[0].callback()
+    await expect(firstStop).rejects.toThrow('claude-swap child did not exit after SIGTERM')
+
+    children[0].emit('error', new Error('still running'))
+    expect(supervisor.status()).toEqual({ state: 'blocked', lastErrorKind: 'ROTATION_ERROR' })
+
+    let retryStopped = false
+    const retryStop = supervisor.stop().then(() => { retryStopped = true })
+    await vi.waitFor(() => expect(children[0].kill).toHaveBeenCalledTimes(3))
+    expect(retryStopped).toBe(false)
+    children[0].emit('exit', 0, 'SIGKILL')
+    await retryStop
+  })
+
+  it('restarts a child that could not be spawned', async () => {
+    const { supervisor, children, scheduled } = setup()
+    await supervisor.enable()
+    children[0].pid = undefined
+
+    children[0].emit('error', new Error('spawn failed'))
+
+    expect(supervisor.status()).toEqual({ state: 'blocked', lastErrorKind: 'PROCESS_START_FAILED' })
+    expect(scheduled[0].delay).toBe(1_000)
+  })
+
   it('records only masked switch metadata from fragmented JSON events', async () => {
     const { supervisor, children } = setup()
     await supervisor.enable()

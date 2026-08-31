@@ -157,7 +157,18 @@ export class ClaudeSwapSupervisor {
         this.start()
       }, delay)
     }
-    child.on('error', () => scheduleRestart('PROCESS_START_FAILED'))
+    child.on('error', () => {
+      if (child.pid === undefined) {
+        scheduleRestart('PROCESS_START_FAILED')
+        return
+      }
+      if (this.child !== child) return
+      this.currentStatus = {
+        ...this.currentStatus,
+        state: 'blocked',
+        lastErrorKind: 'ROTATION_ERROR',
+      }
+    })
     child.on('exit', (code) => scheduleRestart(code === 0 ? 'PROCESS_STOPPED' : 'PROCESS_EXITED'))
   }
 

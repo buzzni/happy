@@ -1745,6 +1745,28 @@ describe('AI credential machine runtime', () => {
     })
   })
 
+  it('rejects Claude account slot numbers outside the safe integer range', async () => {
+    const unsafeSlot = Number.MAX_SAFE_INTEGER + 1
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: JSON.stringify({
+          schemaVersion: 1,
+          activeAccountNumber: unsafeSlot,
+          accounts: [{
+            number: unsafeSlot,
+            email: 'owner@example.com',
+            organizationUuid: 'org',
+          }],
+        }),
+        stderr: '',
+      })),
+    })
+
+    await expect(runtime.status({ provider: 'claude' })).rejects.toMatchObject({
+      kind: 'CLAUDE_STATUS_INVALID',
+    })
+  })
+
   it('terminates commands that exceed their timeout without returning process output', async () => {
     await expect(runAiCredentialCommand(
       process.execPath,

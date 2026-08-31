@@ -1051,14 +1051,14 @@ function parseClaudeListDetails(stdout: string): ClaudeListDetails {
       || parsed.schemaVersion !== 1
       || !Array.isArray(parsed.accounts)
       || (parsed.activeAccountNumber !== null
-        && !Number.isInteger(parsed.activeAccountNumber))) {
+        && !Number.isSafeInteger(parsed.activeAccountNumber))) {
       throw new Error('invalid status')
     }
     const accounts: Array<Record<string, unknown>> = []
     const accountNumbers = new Set<number>()
     for (const account of parsed.accounts) {
       if (!isObject(account)
-        || !Number.isInteger(account.number)
+        || !Number.isSafeInteger(account.number)
         || Number(account.number) < 1
         || typeof account.email !== 'string'
         || (account.organizationUuid !== undefined
