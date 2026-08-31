@@ -1885,6 +1885,18 @@ describe('runServerAutomationTick', () => {
       expect(spawnedEnvironment).not.toHaveProperty('GH_TOKEN')
       expect(spawnedEnvironment).not.toHaveProperty('GH_REPO')
       expect(prepareGithubWorktree).not.toHaveBeenCalled()
+      // 2026-08-31 프로덕션 — pr_review 워커가 리뷰를 끝내고도 결과를 제출하지 못했다:
+      //   "결과 제출 요청이 로컬 셸 보간으로 손상되어 HTTP 400 으로 거부됐고,
+      //    프로토콜에 따라 재시도하지 못했습니다."
+      // 지시가 "POST /complete with ... result" 라고만 해서 워커가 셸에서 JSON 을
+      // 조립했고, 리뷰 본문의 따옴표·백틱·$ 가 보간을 타며 본문이 깨졌다. 바로 다음
+      // 줄의 "4xx 는 재시도하지 말라" 규칙까지 정확히 지켜 조용히 끝났다.
+      // 제출 방법을 못박아 셸을 경유하지 않게 한다.
+      expect(spawned.initialPrompt).toContain('--data-binary @')
+      expect(spawned.initialPrompt).toMatch(/never (build|assemble).*(shell|inline)|do not .*inline .*-d/i)
+      // 4xx 는 재시도로 풀리지 않지만 조용히 끝나서도 안 된다. 이번 사고에서 400 은
+      // 워커 세션 안에서만 보였고 서버·데몬 로그에는 아무 흔적이 없었다.
+      expect(spawned.initialPrompt).toMatch(/4xx.*status code and response body/i)
       if (taskType === 'pr_review.v1') {
         expect(spawned).toMatchObject({ permissionMode: 'read-only' })
         expect(spawned.initialPrompt).toContain('[PR review quality contract]')
