@@ -107,16 +107,22 @@ export async function deliverUsageOutboxBatch(input: {
     limit?: number;
     requestTimeoutMs?: number;
 }): Promise<{ claimed: number; delivered: number; failed: number; leaseLost: number }> {
-    const now = input.now ?? new Date();
-    const leaseUntil = new Date(now.getTime() + DELIVERY_LEASE_MS);
-    const items = await input.repository.claimDue(now, leaseUntil, input.limit ?? DEFAULT_BATCH_SIZE);
+    const currentTime = () => input.now ?? new Date();
+    const limit = input.limit ?? DEFAULT_BATCH_SIZE;
+    let claimed = 0;
     let delivered = 0;
     let failed = 0;
     let leaseLost = 0;
 
-    for (const item of items) {
+    for (let index = 0; index < limit; index += 1) {
+        const claimTime = currentTime();
+        const leaseUntil = new Date(claimTime.getTime() + DELIVERY_LEASE_MS);
+        const [item] = await input.repository.claimDue(claimTime, leaseUntil, 1);
+        if (!item) break;
+        claimed += 1;
+
         const body = JSON.stringify(item.event);
-        const timestamp = String(Math.floor(now.getTime() / 1000));
+        const timestamp = String(Math.floor(currentTime().getTime() / 1000));
         const signature = createHmac('sha256', input.secret)
             .update(`${timestamp}.${body}`)
             .digest('hex');
@@ -148,9 +154,10 @@ export async function deliverUsageOutboxBatch(input: {
                 error.name = 'UsageDeliveryHttpError';
                 throw error;
             }
-            if (await input.repository.markDelivered(item.id, leaseUntil, now)) delivered += 1;
+            if (await input.repository.markDelivered(item.id, leaseUntil, currentTime())) delivered += 1;
             else leaseLost += 1;
         } catch (error) {
+            const failedAt = currentTime();
             const attemptCount = item.attemptCount + 1;
             const retryMs = Math.min(BASE_RETRY_MS * (2 ** Math.min(item.attemptCount, 10)), MAX_RETRY_MS);
             const safeError = error instanceof Error && error.name === 'UsageDeliveryHttpError'
@@ -160,14 +167,14 @@ export async function deliverUsageOutboxBatch(input: {
                 item.id,
                 leaseUntil,
                 attemptCount,
-                new Date(now.getTime() + retryMs),
+                new Date(failedAt.getTime() + retryMs),
                 safeError,
             )) failed += 1;
             else leaseLost += 1;
         }
     }
 
-    return { claimed: items.length, delivered, failed, leaseLost };
+    return { claimed, delivered, failed, leaseLost };
 }
 
 export function startUsageOutboxWorker(input: {

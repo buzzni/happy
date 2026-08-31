@@ -24,7 +24,9 @@ function repository(): UsageOutboxRepository & {
     markFailed: ReturnType<typeof vi.fn>;
 } {
     return {
-        claimDue: vi.fn().mockResolvedValue([{ id: 'outbox-1', attemptCount: 0, event }]),
+        claimDue: vi.fn()
+            .mockResolvedValueOnce([{ id: 'outbox-1', attemptCount: 0, event }])
+            .mockResolvedValue([]),
         markDelivered: vi.fn().mockResolvedValue(true),
         markFailed: vi.fn().mockResolvedValue(true),
     };
@@ -160,5 +162,52 @@ describe('deliverUsageOutboxBatch', () => {
         );
         expect(fetchImpl.mock.calls[0]![1].signal.aborted).toBe(true);
         expect(result).toEqual({ claimed: 1, delivered: 0, failed: 1, leaseLost: 0 });
+    });
+
+    it('claims and signs each item with the current time instead of the batch start time', async () => {
+        vi.useFakeTimers();
+        const firstNow = new Date('2026-08-31T04:00:00.000Z');
+        const secondNow = new Date(firstNow.getTime() + 301_000);
+        vi.setSystemTime(firstNow);
+        const repo = repository();
+        repo.claimDue.mockReset()
+            .mockResolvedValueOnce([{ id: 'outbox-1', attemptCount: 0, event }])
+            .mockResolvedValueOnce([{
+                id: 'outbox-2',
+                attemptCount: 0,
+                event: { ...event, sourceEventId: 'session-1:anthropic:msg-2' },
+            }]);
+        const timestamps: string[] = [];
+        const fetchImpl = vi.fn(async (_url: string, init: { headers: Record<string, string> }) => {
+            timestamps.push(init.headers['x-saycode-usage-timestamp']);
+            if (timestamps.length === 1) vi.setSystemTime(secondNow);
+            return { ok: true, status: 202 };
+        });
+
+        const result = await deliverUsageOutboxBatch({
+            repository: repo,
+            fetchImpl,
+            endpoint: 'https://saycode.test/api/internal/ai-usage/events',
+            secret: 'test-secret',
+            limit: 2,
+        });
+
+        expect(timestamps).toEqual([
+            String(Math.floor(firstNow.getTime() / 1000)),
+            String(Math.floor(secondNow.getTime() / 1000)),
+        ]);
+        expect(repo.claimDue).toHaveBeenNthCalledWith(
+            1,
+            firstNow,
+            new Date(firstNow.getTime() + 30_000),
+            1,
+        );
+        expect(repo.claimDue).toHaveBeenNthCalledWith(
+            2,
+            secondNow,
+            new Date(secondNow.getTime() + 30_000),
+            1,
+        );
+        expect(result).toEqual({ claimed: 2, delivered: 2, failed: 0, leaseLost: 0 });
     });
 });
