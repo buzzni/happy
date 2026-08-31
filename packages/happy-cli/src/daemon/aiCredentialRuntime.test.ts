@@ -395,6 +395,18 @@ describe('AI credential machine runtime', () => {
     expect(marker).not.toContain('trial-secret')
   })
 
+  it('clears a prior trial marker only after a non-trial replacement succeeds', async () => {
+    const { runtime, files } = setup()
+    files.set('/home/operator/.happy/trial-ai-credential-leases.json', JSON.stringify({
+      version: 1,
+      leases: { claude: { ...trialLease } },
+    }))
+
+    await runtime.apply({ provider: 'claude', payload: '{}' })
+
+    expect(files.has('/home/operator/.happy/trial-ai-credential-leases.json')).toBe(false)
+  })
+
   it('refuses to replace a marker owned by a different active lease', async () => {
     const { runtime, files, calls } = setup()
     files.set('/home/operator/.happy/trial-ai-credential-leases.json', JSON.stringify({
@@ -939,6 +951,53 @@ describe('AI credential machine runtime', () => {
       'cswap', ['switch', '2', '--force', '--json'], expect.anything(),
     )
     expect(supervisor.enable).toHaveBeenCalledOnce()
+  })
+
+  it('activates an imported Claude API key and stops OAuth rotation', async () => {
+    let activeAccountNumber = 1
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'cswap' && args[0] === '--version') {
+        return { stdout: 'cswap 0.25.0', stderr: '' }
+      }
+      if (command === 'cswap' && args[0] === 'list') {
+        return {
+          stdout: JSON.stringify({
+            schemaVersion: 1,
+            activeAccountNumber,
+            accounts: [
+              { number: 1, email: 'oauth@example.com', usageStatus: 'ok' },
+              { number: 2, email: 'api-key-1@token.local', usageStatus: 'api_key' },
+            ],
+          }),
+          stderr: '',
+        }
+      }
+      if (command === 'cswap' && args[0] === 'switch') activeAccountNumber = Number(args[1])
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime, supervisor } = setup({ execFile })
+    const payload = JSON.stringify({
+      version: 1,
+      encrypted: false,
+      activeAccountNumber: 1,
+      accounts: [{
+        number: 1,
+        email: 'api-key-1@token.local',
+        kind: 'api_key',
+        credentials: `sk-ant-api${'a'.repeat(20)}`,
+        config: { oauthAccount: { emailAddress: 'api-key-1@token.local' } },
+      }],
+    })
+
+    await expect(runtime.apply({ provider: 'claude', payload })).resolves.toMatchObject({
+      provider: 'claude', configured: true, credentialKind: 'api_key',
+    })
+
+    expect(execFile).toHaveBeenCalledWith(
+      'cswap', ['switch', '2', '--force', '--json'], expect.anything(),
+    )
+    expect(supervisor.stop).toHaveBeenCalledOnce()
+    expect(supervisor.enable).not.toHaveBeenCalled()
   })
 
   it('rejects imported Claude credentials when every account requires login', async () => {

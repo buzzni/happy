@@ -277,6 +277,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
 
   async function applyClaude(payload: string) {
     await purgeManagedProvider('zai')
+    const apiKeyTargetEmail = claudeApiKeyTargetEmail(payload)
     await ensureClaudeSwap()
     const tempDir = await deps.makeTempDir()
     const tempFile = join(tempDir, 'claude-swap.json')
@@ -294,6 +295,39 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     let details = parseClaudeListDetails(status.stdout)
     if (!details.configured) {
       throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+    }
+    if (apiKeyTargetEmail !== null) {
+      let target = details.accounts.find((account) => (
+        account.email === apiKeyTargetEmail
+        && account.usageStatus === 'api_key'
+        && account.disabled !== true
+      ))
+      if (!target) throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+      if (details.activeAccountNumber !== target.number) {
+        await deps.execFile('cswap', [
+          'switch', String(target.number), '--force', '--json',
+        ], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+        status = await deps.execFile('cswap', ['list', '--json'], {
+          maxOutputBytes: MAX_PAYLOAD_BYTES,
+          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+        })
+        details = parseClaudeListDetails(status.stdout)
+        target = details.accounts.find((account) => (
+          account.email === apiKeyTargetEmail
+          && account.usageStatus === 'api_key'
+          && account.disabled !== true
+        ))
+        if (!target || details.activeAccountNumber !== target.number) {
+          throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+        }
+      }
+      await deps.supervisor.stop()
+      return {
+        provider: 'claude' as const,
+        configured: true,
+        credentialKind: 'api_key' as const,
+        rotation: deps.supervisor.status(),
+      }
     }
     if (!details.activeUsable) {
       if (details.usableAccountNumber === null) {
@@ -612,11 +646,34 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           await writeTrialMarker(marker)
         }
         try {
-          return selected === 'claude'
+          const result = selected === 'claude'
             ? await applyClaude(input.payload)
             : selected === 'zai'
               ? await applyZai(input.payload)
               : await applyCodex(input.payload)
+          if (!requestedLease) {
+            const nonTrialMarker = await readTrialMarker()
+            const providersToClear: AiCredentialProvider[] = selected === 'claude'
+              ? ['claude', 'zai']
+              : selected === 'zai'
+                ? ['zai', 'claude']
+                : ['codex']
+            let changed = false
+            for (const providerToClear of providersToClear) {
+              if (nonTrialMarker.leases[providerToClear]) {
+                delete nonTrialMarker.leases[providerToClear]
+                changed = true
+              }
+            }
+            if (changed) {
+              if (Object.keys(nonTrialMarker.leases).length === 0) {
+                await deps.rm(trialMarkerPath(), { force: true })
+              } else {
+                await writeTrialMarker(nonTrialMarker)
+              }
+            }
+          }
+          return result
         } catch (error) {
           if (requestedLease && marker) {
             if (previousLease) marker.leases[selected] = previousLease
@@ -829,8 +886,27 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
 type ClaudeListDetails = {
   configured: boolean
   activeAccount: string | null
+  activeAccountNumber: number | null
   activeUsable: boolean
   usableAccountNumber: number | null
+  accounts: Array<Record<string, unknown> & { number: number; email: string }>
+}
+
+function claudeApiKeyTargetEmail(payload: string): string | null {
+  try {
+    const parsed = JSON.parse(payload) as unknown
+    if (!isObject(parsed) || parsed.version !== 1 || parsed.encrypted === true
+      || !Array.isArray(parsed.accounts) || parsed.accounts.length !== 1) return null
+    const account = parsed.accounts[0]
+    if (!isObject(account)
+      || account.kind !== 'api_key'
+      || typeof account.email !== 'string'
+      || typeof account.credentials !== 'string'
+      || !account.credentials.startsWith('sk-ant-api')) return null
+    return account.email
+  } catch {
+    return null
+  }
 }
 
 function parseClaudeListDetails(stdout: string): ClaudeListDetails {
@@ -860,10 +936,12 @@ function parseClaudeListDetails(stdout: string): ClaudeListDetails {
       return {
         configured: accounts.length > 0,
         activeAccount: null,
+        activeAccountNumber: null,
         activeUsable: false,
         usableAccountNumber: typeof usableAccount?.number === 'number'
           ? usableAccount.number
           : null,
+        accounts: accounts as ClaudeListDetails['accounts'],
       }
     }
     const active = accounts.find((account) => account.number === parsed.activeAccountNumber)
@@ -873,10 +951,12 @@ function parseClaudeListDetails(stdout: string): ClaudeListDetails {
     return {
       configured: true,
       activeAccount: maskEmail(active.email),
+      activeAccountNumber: Number(parsed.activeAccountNumber),
       activeUsable: usable(active),
       usableAccountNumber: typeof usableAccount?.number === 'number'
         ? usableAccount.number
         : null,
+      accounts: accounts as ClaudeListDetails['accounts'],
     }
   } catch {
     throw new AiCredentialRuntimeError('CLAUDE_STATUS_INVALID')
