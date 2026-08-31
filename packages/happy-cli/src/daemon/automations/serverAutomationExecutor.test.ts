@@ -1329,6 +1329,46 @@ describe('runServerAutomationTick', () => {
     expect(createGithubIssueProgressMarker).not.toHaveBeenCalled()
   })
 
+  it('forwards escalation handles so the server comment can mention them', async () => {
+    // 2026-08-31 — hsmoa 프롬프트의 "high 이면 @eunchong 을 멘션하라" 가 한 번도
+    // 동작하지 않은 이유는 코멘트를 워커가 아니라 서버가 조립하기 때문이다. 담당자는
+    // 설정에만 있고 서버는 자동화 payload 를 복호화할 수 없으므로, 데몬이 dispatch 에
+    // 실어 보내야 서버가 알 수 있다.
+    const { input, store, queryGithubPullRequests, dispatchAgentTask } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review safely', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+        escalateTo: ['eunchong'],
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(dispatchAgentTask).toHaveBeenCalledWith(expect.objectContaining({
+      escalateTo: ['eunchong'],
+    }))
+  })
+
   it('provisions the review commits before the pr_review worker starts', async () => {
     // 2026-08-31 프로덕션 — hsmoa_backend AgentTask 리뷰가 "전달된 baseSha/headSha 가
     // 워크스페이스에 없어 호출부 검증과 소스 SHA 테스트를 실행하지 못했다" 고 보고했다.
@@ -1514,6 +1554,9 @@ describe('runServerAutomationTick', () => {
     expect(dispatchAgentTask).toHaveBeenCalledWith({
       runId: 'run-1', claimToken: 'claim-token', credentialId: 'credential-1', event: null,
     })
+    // 2026-08-31 — 담당자 소환은 서버가 조립하는 코멘트에서만 가능하므로, 설정값이
+    // dispatch 를 타고 서버까지 가야 한다. 지정하지 않은 자동화는 필드가 없다.
+    expect(dispatchAgentTask.mock.calls[0]![0]).not.toHaveProperty('escalateTo')
     const spawned = spawnSession.mock.calls[0]![0]
     expect(spawned.initialPrompt).toContain('Task ID: apply-1')
     expect(spawned.initialPrompt).toContain('[Review apply quality contract]')
