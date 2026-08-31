@@ -983,7 +983,6 @@ describe('AI credential machine runtime', () => {
       accounts: [{
         number: 1,
         email: 'api-key-1@token.local',
-        kind: 'api_key',
         credentials: `sk-ant-api${'a'.repeat(20)}`,
         config: { oauthAccount: { emailAddress: 'api-key-1@token.local' } },
       }],
@@ -1318,9 +1317,41 @@ describe('AI credential machine runtime', () => {
     await expect(runtime.status({ provider: 'claude' })).resolves.toEqual({
       provider: 'claude',
       configured: true,
+      credentialKind: 'oauth',
       activeAccount: 'o***@example.com',
       rotation: { state: 'running', lastErrorKind: null },
     })
+  })
+
+  it('reports an active Claude API key as rotation-not-applicable', async () => {
+    const { runtime, supervisor } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: JSON.stringify({
+          schemaVersion: 1,
+          activeAccountNumber: 2,
+          accounts: [{
+            number: 2,
+            email: 'api-key-aabbcc@token.local',
+            usageStatus: 'api_key',
+          }],
+        }),
+        stderr: '',
+      })),
+    })
+
+    await expect(runtime.status({ provider: 'claude' })).resolves.toEqual({
+      provider: 'claude',
+      configured: true,
+      credentialKind: 'api_key',
+      activeAccount: 'a***@token.local',
+      rotation: { state: 'not-applicable', lastErrorKind: null },
+    })
+    await expect(runtime.rotation({ action: 'start' })).resolves.toMatchObject({
+      credentialKind: 'api_key',
+      rotation: { state: 'not-applicable' },
+    })
+    expect(supervisor.enable).not.toHaveBeenCalled()
+    expect(supervisor.stop).toHaveBeenCalledOnce()
   })
 
   it('reports managed Codex routing with the least-remaining active account masked', async () => {
@@ -1472,6 +1503,7 @@ describe('AI credential machine runtime', () => {
       ['cswap', ['--version']],
       ['cswap', ['config', 'set', 'autoswitch.threshold', '95']],
       ['cswap', ['config', 'set', 'autoswitch.strategy', 'consume-first']],
+      ['cswap', ['list', '--json']],
     ])
     expect(supervisor.enable).toHaveBeenCalledOnce()
   })

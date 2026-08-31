@@ -34,7 +34,7 @@ export type AiCredentialCommandResult = {
 }
 
 export type AiCredentialRotationStatus = {
-  state: 'stopped' | 'starting' | 'running' | 'needs-reauth' | 'blocked' | 'quota-unknown' | 'not-routed'
+  state: 'stopped' | 'starting' | 'running' | 'needs-reauth' | 'blocked' | 'quota-unknown' | 'not-routed' | 'not-applicable'
   lastErrorKind: string | null
   lastSwitchAt?: string
   activeAccount?: string
@@ -326,7 +326,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         provider: 'claude' as const,
         configured: true,
         credentialKind: 'api_key' as const,
-        rotation: deps.supervisor.status(),
+        rotation: apiKeyRotationStatus(),
       }
     }
     if (!details.activeUsable) {
@@ -851,7 +851,9 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       return {
         provider: selected,
         ...claudeStatus,
-        rotation: deps.supervisor.status(),
+        rotation: claudeStatus.credentialKind === 'api_key'
+          ? apiKeyRotationStatus()
+          : deps.supervisor.status(),
       }
     }))
   }
@@ -863,6 +865,18 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return serialize(() => withSafeErrors('ROTATION_UPDATE_FAILED', async () => {
       if (input.action === 'start') {
         await ensureClaudeSwap()
+        const result = await deps.execFile('cswap', ['list', '--json'], {
+          maxOutputBytes: MAX_PAYLOAD_BYTES,
+          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+        })
+        if (parseClaudeListDetails(result.stdout).activeCredentialKind === 'api_key') {
+          await deps.supervisor.stop()
+          return {
+            provider: 'claude' as const,
+            credentialKind: 'api_key' as const,
+            rotation: apiKeyRotationStatus(),
+          }
+        }
         await deps.supervisor.enable()
       } else {
         await deps.supervisor.stop()
@@ -889,6 +903,7 @@ type ClaudeListDetails = {
   activeAccountNumber: number | null
   activeUsable: boolean
   usableAccountNumber: number | null
+  activeCredentialKind: 'oauth' | 'api_key' | null
   accounts: Array<Record<string, unknown> & { number: number; email: string }>
 }
 
@@ -899,7 +914,6 @@ function claudeApiKeyTargetEmail(payload: string): string | null {
       || !Array.isArray(parsed.accounts) || parsed.accounts.length !== 1) return null
     const account = parsed.accounts[0]
     if (!isObject(account)
-      || account.kind !== 'api_key'
       || typeof account.email !== 'string'
       || typeof account.credentials !== 'string'
       || !account.credentials.startsWith('sk-ant-api')) return null
@@ -941,6 +955,7 @@ function parseClaudeListDetails(stdout: string): ClaudeListDetails {
         usableAccountNumber: typeof usableAccount?.number === 'number'
           ? usableAccount.number
           : null,
+        activeCredentialKind: null,
         accounts: accounts as ClaudeListDetails['accounts'],
       }
     }
@@ -956,6 +971,7 @@ function parseClaudeListDetails(stdout: string): ClaudeListDetails {
       usableAccountNumber: typeof usableAccount?.number === 'number'
         ? usableAccount.number
         : null,
+      activeCredentialKind: active.usageStatus === 'api_key' ? 'api_key' : 'oauth',
       accounts: accounts as ClaudeListDetails['accounts'],
     }
   } catch {
@@ -963,9 +979,21 @@ function parseClaudeListDetails(stdout: string): ClaudeListDetails {
   }
 }
 
-function parseClaudeList(stdout: string): { configured: boolean; activeAccount: string | null } {
-  const { configured, activeAccount } = parseClaudeListDetails(stdout)
-  return { configured, activeAccount }
+function apiKeyRotationStatus(): AiCredentialRotationStatus {
+  return { state: 'not-applicable', lastErrorKind: null }
+}
+
+function parseClaudeList(stdout: string): {
+  configured: boolean
+  activeAccount: string | null
+  credentialKind?: 'oauth' | 'api_key'
+} {
+  const { configured, activeAccount, activeCredentialKind } = parseClaudeListDetails(stdout)
+  return {
+    configured,
+    activeAccount,
+    ...(activeCredentialKind ? { credentialKind: activeCredentialKind } : {}),
+  }
 }
 
 type CodexMultiAuthAccount = CodexAccountIdentity & {
