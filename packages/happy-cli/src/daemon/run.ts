@@ -191,6 +191,12 @@ import {
   prepareAdditionalDirectories,
 } from './additionalDirectories';
 import { mergeAdditionalDirectoriesIntoSandboxEnvironment } from '@/utils/additionalDirectoriesEnv';
+import { AutonomousQualityGateRunStore } from './autonomousQualityGateStore';
+import { AutonomousQualityGateDaemonRegistry } from './autonomousQualityGateRegistry';
+import { captureAutonomousWorktreeFingerprint } from './autonomousQualityGateFingerprint';
+import { runAutonomousQualityGatePhase } from './autonomousQualityGateRunner';
+import { sendAutonomousQualityGateRepair } from './autonomousQualityGateMessageSender';
+import { createAutonomousQualityGateRpcHandlers } from './autonomousQualityGateRpc';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -480,6 +486,29 @@ export async function startDaemon(): Promise<void> {
 
     // Helper functions
     const getCurrentChildren = () => Array.from(pidToTrackedSession.values());
+    const autonomousQualityGateStore = await AutonomousQualityGateRunStore.open(
+      join(configuration.happyHomeDir, 'autonomous-quality-gates.json'),
+    );
+    const autonomousQualityGateRegistry = new AutonomousQualityGateDaemonRegistry({
+      store: autonomousQualityGateStore,
+      capture: captureAutonomousWorktreeFingerprint,
+      runPhase: (phase, cwd, signal) => runAutonomousQualityGatePhase(phase, { cwd, signal }),
+      sendRepair: async (sessionId, message) => {
+        const session = getCurrentChildren().find(candidate => candidate.happySessionId === sessionId);
+        if (!session?.encryption) throw new Error(`Session encryption unavailable for ${sessionId}`);
+        await sendAutonomousQualityGateRepair({
+          sessionId,
+          message,
+          token: credentials.token,
+          serverUrl: configuration.serverUrl,
+          encryption: session.encryption,
+        });
+      },
+      isSessionIdle: (sessionId) => {
+        const runtime = getCurrentChildren().find(candidate => candidate.happySessionId === sessionId)?.runtime;
+        return !!runtime && !runtime.thinking && !runtime.hasOpenToolCall && !runtime.pendingUserInput;
+      },
+    });
 
     // Serialize tracked sessions for disk persistence
     const sessionStartTimes = restoreSessionStartTimes({
@@ -786,6 +815,13 @@ export async function startDaemon(): Promise<void> {
         ...(mode !== undefined ? { mode } : {}),
         updatedAt: runtime.updatedAt,
       };
+      autonomousQualityGateRegistry.noteSessionRuntime(sessionId, {
+        idle: !trackedSession.runtime.thinking
+          && !trackedSession.runtime.hasOpenToolCall
+          && !trackedSession.runtime.pendingUserInput,
+        userInput: lastUserInteractionAt !== undefined
+          && lastUserInteractionAt !== prev?.lastUserInteractionAt,
+      });
 
       // The cursor only exists in memory until something writes it. A daemon
       // killed without its clean-stop handlers takes it to the grave and the
@@ -2438,6 +2474,7 @@ export async function startDaemon(): Promise<void> {
       portRegistry,
       automationStore,
       aiCredentialRuntime,
+      autonomousQualityGate: createAutonomousQualityGateRpcHandlers(autonomousQualityGateRegistry),
       // specs/daemon-spawn-project-link — a session created by `agent spawn` has no way to
       // register itself with A+ (its credential does not authenticate /api/*), so the daemon
       // reports it here. The request is bounded inside linkSpawnedProjectSession and
