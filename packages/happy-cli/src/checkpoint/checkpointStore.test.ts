@@ -65,6 +65,12 @@ describe('resolveCheckpointStoreLayout', () => {
             otherProject.metadataFile,
             otherSession.metadataFile,
         ])).toHaveLength(4);
+        expect(new Set([
+            main.ledgerFile,
+            worktree.ledgerFile,
+            otherProject.ledgerFile,
+            otherSession.ledgerFile,
+        ])).toHaveLength(4);
     });
 
     it('keeps opaque binding identifiers inside the machine-local root', () => {

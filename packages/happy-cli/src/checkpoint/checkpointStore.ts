@@ -16,6 +16,7 @@ export type CheckpointStoreLayout = {
     refName: string;
     indexFile: string;
     metadataFile: string;
+    ledgerFile: string;
 };
 
 export type CheckpointSnapshotRequest = Omit<CheckpointStoreBinding, 'checkpointRoot'> & {
@@ -51,6 +52,7 @@ export function resolveCheckpointStoreLayout(
         refName: `refs/saycode-checkpoints/${identityKey}`,
         indexFile: join(gitDirectory, 'indexes', identityKey),
         metadataFile: join(gitDirectory, 'bindings', `${identityKey}.json`),
+        ledgerFile: join(gitDirectory, 'ledgers', `${identityKey}.jsonl`),
     };
 }
 
