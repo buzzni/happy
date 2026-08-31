@@ -75,7 +75,7 @@ describe('claudeRemote', () => {
         expect(calls).toEqual(['gate']);
     });
 
-    it('waits for excluded-path confirmation before dispatching a protected turn', async () => {
+    it('does not dispatch an excluded-path retry while protection confirmation is pending', async () => {
         vi.mocked(query).mockReturnValue({
             setPermissionMode: vi.fn(),
             mcpServerStatus: vi.fn(async () => []),
@@ -94,7 +94,7 @@ describe('claudeRemote', () => {
             allowedTools: [],
             hookSettingsPath: '/tmp/happy-test-settings.json',
             exitAfterFirstTurn: true,
-            nextMessage: async () => ({ message: 'update the excluded .env file', mode }),
+            nextMessage: async () => ({ message: 'retry after the excluded .env write was denied', mode }),
             beforeTurn,
             onReady: vi.fn(),
             canCallTool: async () => ({ behavior: 'allow' }) as any,
@@ -112,6 +112,54 @@ describe('claudeRemote', () => {
         rejectConfirmation(new Error('excluded path confirmation cancelled'));
         await expect(running).rejects.toThrow('excluded path confirmation cancelled');
         expect(query).not.toHaveBeenCalled();
+    });
+
+    it('does not enqueue a follow-up prompt when its checkpoint gate fails', async () => {
+        const deliveredPrompts: unknown[] = [];
+        vi.mocked(query).mockImplementation((request) => {
+            const prompt = (request.prompt as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+            return {
+                setPermissionMode: vi.fn(),
+                mcpServerStatus: vi.fn(async () => []),
+                async *[Symbol.asyncIterator]() {
+                    const initial = await prompt.next();
+                    deliveredPrompts.push(initial.value);
+                    yield { type: 'result', subtype: 'success' };
+                    await prompt.next();
+                },
+            } as any;
+        });
+        const beforeTurn = vi.fn()
+            .mockResolvedValueOnce(undefined)
+            .mockRejectedValueOnce(new Error('follow-up checkpoint unavailable'));
+        let messageCount = 0;
+
+        await expect(claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage: async () => {
+                messageCount += 1;
+                return messageCount <= 2
+                    ? { message: `message-${messageCount}`, mode }
+                    : null;
+            },
+            beforeTurn,
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+        })).rejects.toThrow('follow-up checkpoint unavailable');
+
+        expect(beforeTurn).toHaveBeenCalledTimes(2);
+        expect(deliveredPrompts).toEqual([
+            expect.objectContaining({
+                message: expect.objectContaining({ content: 'message-1' }),
+            }),
+        ]);
     });
 
     it('returns after the first completed turn without waiting for more automation input', async () => {

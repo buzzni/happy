@@ -451,7 +451,7 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.connect();
         await client.startThread({ cwd: '/tmp/project', sandbox: 'workspace-write' });
 
-        await expect(client.sendTurn('edit the project', { beforeTurn } as any))
+        await expect(client.sendTurn('edit the project', { beforeTurn }))
             .rejects.toThrow('checkpoint unavailable');
 
         expect(beforeTurn).toHaveBeenCalledOnce();
@@ -459,7 +459,18 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
-    it('waits for excluded-path confirmation before dispatching a protected turn', async () => {
+    it('does not create a checkpoint when no provider thread can accept the turn', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const beforeTurn = vi.fn(async () => {});
+
+        await expect(client.sendTurnAndWait('edit the project', { beforeTurn }))
+            .rejects.toThrow('No active thread');
+
+        expect(beforeTurn).not.toHaveBeenCalled();
+    });
+
+    it('does not dispatch an excluded-path retry while protection confirmation is pending', async () => {
         const requests: MockRpcMessage[] = [];
         mockSpawn.mockImplementation(() => createMockProcess({
             onRequest: (msg, stdout) => {
@@ -493,8 +504,8 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.startThread({ cwd: '/tmp/project', sandbox: 'workspace-write' });
 
         const running = client.sendTurnAndWait(
-            'update the excluded .env file',
-            { beforeTurn } as any,
+            'retry after the excluded .env write was denied',
+            { beforeTurn },
         );
         await vi.waitFor(() => expect(beforeTurn).toHaveBeenCalledOnce());
 

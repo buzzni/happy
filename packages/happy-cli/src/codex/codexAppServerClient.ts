@@ -1455,6 +1455,10 @@ export class CodexAppServerClient {
         /** Max time without any turn activity before interrupting the provider. */
         turnTimeoutMs?: number;
     }): Promise<{ aborted: boolean }> {
+        if (!this._threadId) {
+            throw new Error('No active thread. Call startThread first.');
+        }
+
         // Wait for any in-flight interruptTurn() to complete before starting a new
         // turn. Otherwise the stale turn/interrupt RPC can reach Codex after our
         // turn/start and abort the wrong turn.

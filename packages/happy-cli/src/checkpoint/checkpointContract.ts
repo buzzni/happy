@@ -3,7 +3,7 @@ import { z } from 'zod';
 const identifierSchema = z.string().min(1).max(128);
 
 const projectRelativePathSchema = z.string().min(1).refine((value) => {
-    if (/^(?:[A-Za-z]:[\\/]|[\\/])/.test(value)) return false;
+    if (value.includes('\0') || /^(?:[A-Za-z]:|[\\/])/.test(value)) return false;
     return !value.split(/[\\/]+/).includes('..');
 }, 'path must be project-relative');
 

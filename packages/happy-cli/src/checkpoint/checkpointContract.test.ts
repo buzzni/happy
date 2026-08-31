@@ -71,7 +71,9 @@ describe('encrypted checkpoint event detail contract', () => {
     it.each([
         '/Users/person/project/src/index.ts',
         '../../outside.txt',
+        'C:outside.txt',
         'C:\\Users\\person\\project\\src\\index.ts',
+        'src/index.ts\0.env',
     ])('rejects non-relative summary path %s', (path) => {
         expect(checkpointEventDetailSchema.safeParse({
             ...validDetail,

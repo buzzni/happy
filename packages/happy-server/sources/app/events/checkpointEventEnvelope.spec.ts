@@ -11,7 +11,7 @@ describe('checkpointEventEnvelopeSchema', () => {
         timestamp: 1_788_111_000_000,
     };
 
-    it('accepts versioned metadata needed for ownership and idempotency checks', () => {
+    it('accepts versioned metadata needed for idempotency and rendering', () => {
         expect(checkpointEventEnvelopeSchema.parse(validEnvelope)).toEqual(validEnvelope);
     });
 
