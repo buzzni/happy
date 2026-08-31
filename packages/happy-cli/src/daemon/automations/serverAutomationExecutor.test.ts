@@ -4,6 +4,7 @@ import { runServerAutomationTick, type ServerAutomationExecutorInput } from './s
 import type { AutomationMcpCallerGrantResult } from './automationMcpCallerGrant'
 import type { EncryptedServerAutomation } from './serverAutomationCache'
 import type { ServerAutomationRuntimeState } from './serverAutomationRuntimeStore'
+import { MAX_WORKTREE_CLEANUP_ATTEMPTS } from './worktreeCleanupGiveUp'
 
 function cacheRecord(generation = 2, migrationPending = false) {
   return {
@@ -2604,6 +2605,84 @@ describe('runServerAutomationTick', () => {
     expect(spawnSession).not.toHaveBeenCalled()
     expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('projects/*/src'))
     expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('path filter'))
+  })
+
+  it('counts each failed cleanup so a stuck worktree cannot be retried forever', async () => {
+    const { input, store, discardGithubWorktree, now } = setup()
+    input.cache = { read: () => ({
+      cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
+    }) }
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old', directory: '/isolated/run-old',
+        sessionId: 'ended-session', createdAt: 1, cleanupAttempts: 3,
+      }],
+    })
+    discardGithubWorktree.mockResolvedValue({ ok: false, dirty: false, error: 'boom' })
+
+    await runServerAutomationTick(input)
+
+    expect(store.state().githubWorktrees).toEqual([expect.objectContaining({
+      worktreePath: '/isolated/run-old', cleanupAttempts: 4, cleanupRetryAt: now + 60_000,
+    })])
+  })
+
+  it('never gives up on a dirty worktree, however many attempts it has taken', async () => {
+    // dirty 는 고장이 아니라 "사람이 회수할 작업물이 남아 있다" 는 의도된 보류다.
+    // 예산으로 이것까지 지우면 자동화가 사람의 작업물을 조용히 버리게 된다.
+    const { input, store, discardGithubWorktree, now } = setup()
+    input.cache = { read: () => ({
+      cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
+    }) }
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old', directory: '/isolated/run-old',
+        sessionId: 'ended-session', createdAt: 1,
+        cleanupAttempts: MAX_WORKTREE_CLEANUP_ATTEMPTS + 50,
+      }],
+    })
+    discardGithubWorktree.mockResolvedValue({ ok: false, dirty: true, error: 'worktree is dirty' })
+
+    await runServerAutomationTick(input)
+
+    expect(store.state().githubWorktrees).toEqual([expect.objectContaining({
+      worktreePath: '/isolated/run-old', cleanupRetryAt: now + 15 * 60_000,
+    })])
+  })
+
+  it('gives up loudly once the cleanup attempt budget is spent', async () => {
+    // 2026-08-30 프로덕션 — 서브모듈 때문에 remove 가 거부되자 재시도 상한이 없어
+    // 누적 1,192회 실패하며 worktree 11개가 2.3GB 를 물고 있었다. 실패는 debug 로그에만
+    // 쌓였고 아무도 몰랐다. 예산을 다 쓰면 멈추고, 남은 경로를 사람이 볼 수 있게 알린다.
+    const { input, store, discardGithubWorktree, logDebug } = setup()
+    input.cache = { read: () => ({
+      cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
+    }) }
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old', directory: '/isolated/run-old',
+        sessionId: 'ended-session', createdAt: 1,
+        cleanupAttempts: MAX_WORKTREE_CLEANUP_ATTEMPTS - 1,
+      }],
+    })
+    discardGithubWorktree.mockResolvedValue({ ok: false, dirty: false, error: 'boom' })
+
+    await runServerAutomationTick(input)
+
+    // journal 에서 빠져야 다음 tick 이 다시 시도하지 않는다.
+    expect(store.state().githubWorktrees).toEqual([])
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('giving up'))
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('/isolated/run-old'))
+
+    discardGithubWorktree.mockClear()
+    await runServerAutomationTick(input)
+    expect(discardGithubWorktree).not.toHaveBeenCalled()
   })
 
   it('does not clean a journaled worktree while its session remains live after restart', async () => {

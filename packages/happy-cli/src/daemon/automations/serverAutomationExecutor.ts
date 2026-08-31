@@ -19,6 +19,7 @@ import type {
 import type { AutomationMcpCallerGrantResult, AutomationMcpSpawnContext } from './automationMcpCallerGrant'
 import type { AutomationConnectorPreflightResult } from './automationConnectorPreflight'
 import { isPermanentGithubTriggerFailure } from './githubTriggerPermanentFailure'
+import { shouldGiveUpWorktreeCleanup } from './worktreeCleanupGiveUp'
 import type { GithubTriggerWorktreePlan } from './githubTriggerWorktree'
 import type {
   AutomationAgentTaskDispatch,
@@ -846,7 +847,13 @@ function deferGithubWorktreeCleanup(
   input.runtimeStore.write({
     ...state,
     githubWorktrees: (state.githubWorktrees ?? []).map((entry) => (
-      entry.runId === runId ? { ...entry, cleanupRetryAt: input.now + delayMs } : entry
+      entry.runId === runId
+        ? {
+          ...entry,
+          cleanupRetryAt: input.now + delayMs,
+          cleanupAttempts: (entry.cleanupAttempts ?? 0) + 1,
+        }
+        : entry
     )),
   })
 }
@@ -868,6 +875,18 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
     input.logDebug?.(
       `[server-automation] GitHub worktree cleanup failed for ${worktree.worktreePath}: ${discarded.error}`,
     )
+    // dirty 는 사람이 작업물을 회수할 때까지 기다리는 의도된 보류이므로 예산을 쓰지
+    // 않는다. 그 밖의 실패는 예산 안에서만 재시도한다 — 상한이 없으면 2026-08-30 처럼
+    // 매분 영원히 실패하며 디스크만 찬다.
+    const attempts = (worktree.cleanupAttempts ?? 0) + 1
+    if (!discarded.dirty && shouldGiveUpWorktreeCleanup(attempts)) {
+      input.logDebug?.(
+        `[server-automation] giving up on GitHub worktree cleanup for ${worktree.worktreePath}`
+        + ` after ${attempts} attempts; remove it manually: ${discarded.error}`,
+      )
+      removeGithubWorktreeJournal(input, worktree.runId)
+      continue
+    }
     deferGithubWorktreeCleanup(
       input,
       worktree.runId,

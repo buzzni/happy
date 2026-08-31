@@ -104,7 +104,11 @@ export async function removeGithubTriggerWorktree(input: {
   }
   const removed = await commandOrError(runCommand, {
     executable: 'git',
-    args: ['worktree', 'remove', input.worktreePath],
+    // --force 없이는 서브모듈을 가진 worktree 를 git 이 거부한다
+    // ("working trees containing submodules cannot be moved or removed").
+    // 바로 위의 dirty 검사가 이미 "잃을 변경이 없다"를 보장하므로, 여기서의
+    // --force 는 서브모듈 제약을 넘기 위한 것이지 작업물을 버리는 것이 아니다.
+    args: ['worktree', 'remove', '--force', input.worktreePath],
     cwd: input.repositoryRoot,
   }, 'GitHub automation worktree removal failed')
   return removed.ok ? { ok: true } : { ok: false, dirty: false, error: removed.error }
