@@ -268,7 +268,20 @@ function buildAgentTaskPrompt(
     '3. Perform only the task. PR review is read-only. Before review_apply, verify the PR is open and current HEAD equals reviewedHeadSha; otherwise return stale/failed without mutating. review_apply may then edit, test, commit, and push; testing runs checks only.',
     `4. Complete with exactly this result shape: ${AGENT_TASK_RESULT_CONTRACTS[dispatch.type]}`,
     '5. POST /complete with version=1, token=$APLUS_AGENT_TASK_COMPLETE_TOKEN, agentRunId, a stable idempotencyKey, and result.',
+    // 2026-08-31 프로덕션 — pr_review 워커가 리뷰를 끝내고도 결과를 제출하지 못했다.
+    // 지시가 "POST ... and result" 뿐이라 워커가 셸에서 JSON 을 조립했고, 리뷰 본문의
+    // 따옴표·백틱·$ 가 보간을 타며 본문이 깨져 400 이 났다. 바로 아래 "4xx 는 재시도
+    // 금지" 규칙까지 정확히 지켜 조용히 끝났다 — 워커 잘못이 아니라 방법을 안 정해준
+    // 탓이다. 리뷰 본문은 임의의 코드 조각을 담으므로 셸을 거치면 언제든 깨진다.
+    'Write every request body to a file and send it with curl --data-binary @<file>'
+      + ' (or an equivalent that reads the file directly). Never build the JSON inline in a'
+      + ' shell argument such as -d \'{...}\' — findings quote code, so backticks, quotes,'
+      + ' and $ get interpolated and the body arrives corrupted.',
     'Retry network failures and 5xx responses with the same idempotencyKey; do not retry 4xx responses.',
+    // 손상된 본문은 재시도로 풀리지 않지만, 조용히 끝나서도 안 된다. 4xx 를 만나면
+    // 상태 코드와 응답 본문을 남겨 왜 제출이 실패했는지 사람이 볼 수 있게 한다.
+    'If /complete returns 4xx, report the status code and response body in your final message'
+      + ' before stopping, then POST /fail with the same reason.',
     'If the work cannot complete, POST /fail with the complete token and a concise reason. Do not put capabilities in output, commits, or PR text.',
   ].join('\n')
 }
