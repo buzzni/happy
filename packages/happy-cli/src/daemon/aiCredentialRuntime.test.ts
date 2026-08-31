@@ -366,6 +366,46 @@ describe('AI credential machine runtime', () => {
     })
   })
 
+  it('does not treat an unrelated invalid-key stderr line as a rejected Z.AI credential', async () => {
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: '',
+        stderr: 'plugin initialization failed: invalid key mapping',
+        exitCode: 1,
+      })),
+    })
+
+    await runtime.apply({
+      provider: 'zai',
+      payload: zaiPayload,
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })
+
+    await expect(runtime.status({ provider: 'zai' })).rejects.toMatchObject({
+      kind: 'ZAI_PROBE_FAILED',
+    })
+  })
+
+  it('still recognizes an explicit invalid API key Z.AI error', async () => {
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: '',
+        stderr: 'Invalid API key',
+        exitCode: 1,
+      })),
+    })
+
+    await runtime.apply({
+      provider: 'zai',
+      payload: zaiPayload,
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })
+
+    await expect(runtime.status({ provider: 'zai' })).resolves.toEqual({
+      provider: 'zai', configured: false, accountCount: 0,
+    })
+  })
+
   it('removes the secret temporary file when Z.AI environment installation fails', async () => {
     let filesRef!: Map<string, string>
     const prepared = setup({
