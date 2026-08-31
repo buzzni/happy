@@ -2118,6 +2118,10 @@ describe('CodexAppServerClient sandbox integration', () => {
             approvalPolicy: 'on-request',
             sandbox: 'workspace-write',
         });
+        const imported = await client.forkThreadFromPath({
+            path: '/tmp/imported-rollout.jsonl',
+            cwd: '/tmp/moved-project',
+        });
         const read = await client.readThread({ threadId: forked.threadId, includeTurns: true });
         const rolledBack = await client.rollbackThread({ threadId: forked.threadId, numTurns: 2 });
         const injected = await client.injectItems({
@@ -2130,6 +2134,7 @@ describe('CodexAppServerClient sandbox integration', () => {
         });
 
         expect(forked.threadId).toBe('thread-forked');
+        expect(imported.threadId).toBe('thread-forked');
         expect(read.thread.turns).toHaveLength(1);
         expect(rolledBack.thread.turns).toHaveLength(1);
         expect(injected).toEqual({});
@@ -2138,6 +2143,14 @@ describe('CodexAppServerClient sandbox integration', () => {
             cwd: '/tmp/project',
             approvalPolicy: 'on-request',
             sandbox: 'workspace-write',
+        }));
+        expect(requests.find((msg) => (
+            msg.method === 'thread/fork'
+            && (msg.params as { path?: string } | undefined)?.path === '/tmp/imported-rollout.jsonl'
+        ))?.params).toEqual(expect.objectContaining({
+            threadId: '',
+            path: '/tmp/imported-rollout.jsonl',
+            cwd: '/tmp/moved-project',
         }));
         expect(requests.find((msg) => msg.method === 'thread/read')?.params).toEqual({
             threadId: 'thread-forked',

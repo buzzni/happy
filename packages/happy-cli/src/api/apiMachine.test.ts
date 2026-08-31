@@ -136,6 +136,16 @@ describe('ApiMachineClient socket reconnection', () => {
         );
     });
 
+    it('registers the machine-scoped Codex thread transfer RPC', () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const manager = (client as any).rpcHandlerManager;
+
+        expect(manager.registerHandler).toHaveBeenCalledWith(
+            'codex-thread-transfer',
+            expect.any(Function),
+        );
+    });
+
     it('validates and forwards additional directories through the spawn RPC result', async () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         const manager = (client as any).rpcHandlerManager;

@@ -1023,6 +1023,7 @@ export class CodexAppServerClient {
 
     async forkThread(opts: {
         threadId: string;
+        path?: string;
         model?: string;
         cwd?: string;
         approvalPolicy?: ApprovalPolicy;
@@ -1037,6 +1038,7 @@ export class CodexAppServerClient {
             : defaults.developerInstructions ?? null;
         const params: ForkConversationParams = {
             threadId: opts.threadId,
+            ...(opts.path ? { path: opts.path } : {}),
             model: opts.model ?? defaults.model ?? null,
             modelProvider: null,
             cwd: opts.cwd ?? defaults.cwd ?? process.cwd(),
@@ -1066,6 +1068,17 @@ export class CodexAppServerClient {
         });
         logger.debug('[CodexAppServer] Thread forked:', opts.threadId, '->', this._threadId);
         return { threadId: result.thread.id, model: result.model, thread: result.thread };
+    }
+
+    async forkThreadFromPath(opts: {
+        path: string;
+        cwd: string;
+    }): Promise<{ threadId: string; model: string; thread: Thread }> {
+        return this.forkThread({
+            threadId: '',
+            path: opts.path,
+            cwd: opts.cwd,
+        });
     }
 
     async readThread(opts: {
