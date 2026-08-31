@@ -4,6 +4,7 @@ import { runServerAutomationTick, type ServerAutomationExecutorInput } from './s
 import type { AutomationMcpCallerGrantResult } from './automationMcpCallerGrant'
 import type { EncryptedServerAutomation } from './serverAutomationCache'
 import type { ServerAutomationRuntimeState } from './serverAutomationRuntimeStore'
+import { MAX_WORKTREE_CLEANUP_ATTEMPTS } from './worktreeCleanupGiveUp'
 
 function cacheRecord(generation = 2, migrationPending = false) {
   return {
@@ -66,6 +67,9 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     dispatch: null,
   }))
   const maintainAgentTaskLease = vi.fn<ServerAutomationExecutorInput['maintainAgentTaskLease']>()
+  const ensureReviewObjects = vi.fn<NonNullable<ServerAutomationExecutorInput['ensureReviewObjects']>>(
+    async () => ({ ok: true, fetched: [] }),
+  )
   const spawnSession = vi.fn<ServerAutomationExecutorInput['spawnSession']>(async () => ({
     ok: true as const,
     sessionId: 'session-1',
@@ -122,6 +126,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     createGithubIssueProgressMarker,
     removeGithubIssueProgressMarker,
     dispatchAgentTask,
+    ensureReviewObjects,
     maintainAgentTaskLease,
     resolveMcpSpawnContext,
     preflightMcpConnectors,
@@ -138,6 +143,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
   return {
     input, store, transport, decryptPayload, logDebug, runScript, queryGithubPullRequests, queryGithubPullRequestFiles,
     queryGithubIssues, notifyGithubTrigger, dispatchAgentTask, maintainAgentTaskLease,
+    ensureReviewObjects,
     resolveGithubIssueProgressMarkerIdentity, createGithubIssueProgressMarker,
     removeGithubIssueProgressMarker,
     resolveMcpSpawnContext, preflightMcpConnectors, linkSession, resumeSession, spawnSession,
@@ -1323,6 +1329,105 @@ describe('runServerAutomationTick', () => {
     expect(createGithubIssueProgressMarker).not.toHaveBeenCalled()
   })
 
+  it('provisions the review commits before the pr_review worker starts', async () => {
+    // 2026-08-31 프로덕션 — hsmoa_backend AgentTask 리뷰가 "전달된 baseSha/headSha 가
+    // 워크스페이스에 없어 호출부 검증과 소스 SHA 테스트를 실행하지 못했다" 고 보고했다.
+    // 프로젝트 워크스페이스가 기본 브랜치 단일 refspec 의 shallow clone 이었고,
+    // preset 은 워커가 스스로 checkout·조회하는 것을 금지한다. 워커가 아니라 여기서
+    // 객체를 준비해 줘야 리뷰가 diff 밖 문맥을 볼 수 있다.
+    const { input, store, queryGithubPullRequests, dispatchAgentTask, ensureReviewObjects } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Follow project review rules', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'review-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { baseSha: 'b'.repeat(40), headSha: 'c'.repeat(40) },
+        context: [{ kind: 'diff', body: 'diff --git a/x b/x' }],
+      },
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(ensureReviewObjects).toHaveBeenCalledWith(expect.objectContaining({
+      directory: '/repo',
+      shas: ['b'.repeat(40), 'c'.repeat(40)],
+    }))
+  })
+
+  it('starts the worker anyway when the review commits cannot be fetched', async () => {
+    // 객체가 없어도 immutable diff artifact 로 리뷰는 가능하다. 여기서 멈추면 고칠 수
+    // 있었던 리뷰까지 잃는다. 다만 왜 문맥이 없는지는 남긴다 (AGENTS.md §1.13).
+    const { input, store, queryGithubPullRequests, dispatchAgentTask, ensureReviewObjects,
+      spawnSession, logDebug } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Follow project review rules', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'review-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { baseSha: 'b'.repeat(40), headSha: 'c'.repeat(40) },
+        context: [{ kind: 'diff', body: 'diff --git a/x b/x' }],
+      },
+    })
+    ensureReviewObjects.mockResolvedValue({ ok: false, error: 'remote hung up unexpectedly' })
+
+    await runServerAutomationTick(input)
+
+    expect(spawnSession).toHaveBeenCalled()
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('remote hung up unexpectedly'))
+  })
+
   it('fails closed when issue_opened is combined with agent-task-review', async () => {
     const { input, queryGithubIssues, dispatchAgentTask, spawnSession } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
@@ -1780,6 +1885,18 @@ describe('runServerAutomationTick', () => {
       expect(spawnedEnvironment).not.toHaveProperty('GH_TOKEN')
       expect(spawnedEnvironment).not.toHaveProperty('GH_REPO')
       expect(prepareGithubWorktree).not.toHaveBeenCalled()
+      // 2026-08-31 프로덕션 — pr_review 워커가 리뷰를 끝내고도 결과를 제출하지 못했다:
+      //   "결과 제출 요청이 로컬 셸 보간으로 손상되어 HTTP 400 으로 거부됐고,
+      //    프로토콜에 따라 재시도하지 못했습니다."
+      // 지시가 "POST /complete with ... result" 라고만 해서 워커가 셸에서 JSON 을
+      // 조립했고, 리뷰 본문의 따옴표·백틱·$ 가 보간을 타며 본문이 깨졌다. 바로 다음
+      // 줄의 "4xx 는 재시도하지 말라" 규칙까지 정확히 지켜 조용히 끝났다.
+      // 제출 방법을 못박아 셸을 경유하지 않게 한다.
+      expect(spawned.initialPrompt).toContain('--data-binary @')
+      expect(spawned.initialPrompt).toMatch(/never (build|assemble).*(shell|inline)|do not .*inline .*-d/i)
+      // 4xx 는 재시도로 풀리지 않지만 조용히 끝나서도 안 된다. 이번 사고에서 400 은
+      // 워커 세션 안에서만 보였고 서버·데몬 로그에는 아무 흔적이 없었다.
+      expect(spawned.initialPrompt).toMatch(/4xx.*status code and response body/i)
       if (taskType === 'pr_review.v1') {
         expect(spawned).toMatchObject({ permissionMode: 'read-only' })
         expect(spawned.initialPrompt).toContain('[PR review quality contract]')
@@ -2503,6 +2620,185 @@ describe('runServerAutomationTick', () => {
       worktreePath: '/isolated/run-old', cleanupRetryAt: now + 15 * 60_000,
     })])
     expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('worktree is dirty'))
+  })
+
+  it('stays quiet about an unsupported glob while another prefix still fires', async () => {
+    // 경고가 발화한 실행에도 붙으면 매 tick 노이즈가 되고, 진짜 멈춘 자동화가
+    // 그 안에 묻힌다. 필터가 실제로 아무것도 못 고른 순간에만 말한다.
+    const { input, store, logDebug, queryGithubPullRequests,
+      queryGithubPullRequestFiles, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review {pr.number}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: {
+          baseBranch: null, label: null, excludeDraft: true, authors: [],
+          paths: ['projects/*/src', 'apps/web/*'],
+        },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 9, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 't', GH_REPO: 'acme/app' },
+      pullRequests: [{
+        number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10',
+        author: { login: 'alice' }, baseRefName: 'main', headRefName: 'feature/search',
+        isDraft: false, state: 'OPEN', mergedAt: null, labels: [], changedFiles: 0, files: [],
+      }],
+    })
+    queryGithubPullRequestFiles.mockResolvedValue({
+      ok: true,
+      files: [{ number: 10, changedFiles: 1, files: [{ path: 'apps/web/page.tsx' }] }],
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(spawnSession).toHaveBeenCalled()
+    expect(logDebug).not.toHaveBeenCalledWith(expect.stringContaining('path filter matched nothing'))
+  })
+
+  it('warns when an unsupported path glob silently filters every candidate out', async () => {
+    // 2026-08-31 프로덕션 — 경로 필터가 `projects/x/*` 로 저장돼 리터럴 비교에서
+    // 전부 탈락했고, hsmoa_backend 리뷰 자동화 두 개가 한 건도 돌지 않았다.
+    // 후행 glob 은 이제 매처가 받아주지만, 그 자리를 넘어서는 glob 은 여전히
+    // 지원하지 않는다. 그때 아무 말 없이 0건이 되면 "필터가 제대로 걸렀다" 와
+    // "필터가 고장났다" 를 사용자가 구분할 수 없다.
+    const { input, store, logDebug, queryGithubPullRequests,
+      queryGithubPullRequestFiles, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review {pr.number}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: {
+          baseBranch: null, label: null, excludeDraft: true, authors: [],
+          paths: ['projects/*/src'],
+        },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 9, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 't', GH_REPO: 'acme/app' },
+      pullRequests: [{
+        number: 10, title: 'Add search', url: 'https://github.test/o/r/pull/10',
+        author: { login: 'alice' }, baseRefName: 'main', headRefName: 'feature/search',
+        isDraft: false, state: 'OPEN', mergedAt: null, labels: [], changedFiles: 0, files: [],
+      }],
+    })
+    queryGithubPullRequestFiles.mockResolvedValue({
+      ok: true,
+      files: [{ number: 10, changedFiles: 1, files: [{ path: 'projects/web/src/index.ts' }] }],
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(queryGithubPullRequestFiles).toHaveBeenCalled()
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('projects/*/src'))
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('path filter'))
+  })
+
+  it('counts each failed cleanup so a stuck worktree cannot be retried forever', async () => {
+    const { input, store, discardGithubWorktree, now } = setup()
+    input.cache = { read: () => ({
+      cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
+    }) }
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old', directory: '/isolated/run-old',
+        sessionId: 'ended-session', createdAt: 1, cleanupAttempts: 3,
+      }],
+    })
+    discardGithubWorktree.mockResolvedValue({ ok: false, dirty: false, error: 'boom' })
+
+    await runServerAutomationTick(input)
+
+    expect(store.state().githubWorktrees).toEqual([expect.objectContaining({
+      worktreePath: '/isolated/run-old', cleanupAttempts: 4, cleanupRetryAt: now + 60_000,
+    })])
+  })
+
+  it('never gives up on a dirty worktree, however many attempts it has taken', async () => {
+    // dirty 는 고장이 아니라 "사람이 회수할 작업물이 남아 있다" 는 의도된 보류다.
+    // 예산으로 이것까지 지우면 자동화가 사람의 작업물을 조용히 버리게 된다.
+    const { input, store, discardGithubWorktree, now } = setup()
+    input.cache = { read: () => ({
+      cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
+    }) }
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old', directory: '/isolated/run-old',
+        sessionId: 'ended-session', createdAt: 1,
+        cleanupAttempts: MAX_WORKTREE_CLEANUP_ATTEMPTS + 50,
+      }],
+    })
+    discardGithubWorktree.mockResolvedValue({ ok: false, dirty: true, error: 'worktree is dirty' })
+
+    await runServerAutomationTick(input)
+
+    expect(store.state().githubWorktrees).toEqual([expect.objectContaining({
+      worktreePath: '/isolated/run-old', cleanupRetryAt: now + 15 * 60_000,
+    })])
+  })
+
+  it('gives up loudly once the cleanup attempt budget is spent', async () => {
+    // 2026-08-30 프로덕션 — 서브모듈 때문에 remove 가 거부되자 재시도 상한이 없어
+    // 누적 1,192회 실패하며 worktree 11개가 2.3GB 를 물고 있었다. 실패는 debug 로그에만
+    // 쌓였고 아무도 몰랐다. 예산을 다 쓰면 멈추고, 남은 경로를 사람이 볼 수 있게 알린다.
+    const { input, store, discardGithubWorktree, logDebug } = setup()
+    input.cache = { read: () => ({
+      cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
+    }) }
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old', directory: '/isolated/run-old',
+        sessionId: 'ended-session', createdAt: 1,
+        cleanupAttempts: MAX_WORKTREE_CLEANUP_ATTEMPTS - 1,
+      }],
+    })
+    discardGithubWorktree.mockResolvedValue({ ok: false, dirty: false, error: 'boom' })
+
+    await runServerAutomationTick(input)
+
+    // journal 에서 빠져야 다음 tick 이 다시 시도하지 않는다.
+    expect(store.state().githubWorktrees).toEqual([])
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('giving up'))
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('/isolated/run-old'))
+
+    discardGithubWorktree.mockClear()
+    await runServerAutomationTick(input)
+    expect(discardGithubWorktree).not.toHaveBeenCalled()
   })
 
   it('does not clean a journaled worktree while its session remains live after restart', async () => {

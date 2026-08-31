@@ -71,10 +71,27 @@ function normalizedPath(value: string): string {
   return value.trim().replace(/^\.\//, '').replace(/^\/+|\/+$/g, '');
 }
 
+// 경로 필터는 glob 이 아니라 디렉터리 접두어다. 다만 사람은 "이 디렉터리 아래
+// 전부" 를 `foo/*` 나 `foo/**` 로 쓰는 게 자연스럽고, UI 도 그렇게 받아 저장해 왔다.
+// 2026-08-31 에는 그렇게 저장된 접두어 9개가 리터럴로 비교되어 어떤 파일과도
+// 매칭되지 않았고, hsmoa_backend 리뷰 자동화 두 개가 한 건도 돌지 않았다.
+// 후행 glob 은 접두어와 같은 뜻이므로 벗겨서 받아준다. 그 자리를 넘어서는 glob
+// (`a/*/b`, 홀로 선 `*`)은 여전히 지원하지 않으며 — 조용히 넓게 매칭시키면
+// 필터가 없는 것과 같아지므로 — matchesFilter 호출부가 경고로 드러낸다.
+function directoryPrefix(prefix: string): string {
+  return normalizedPath(normalizedPath(prefix).replace(/\/\*{1,2}$/, ''));
+}
+
+export function isUnsupportedPathFilter(prefix: string): boolean {
+  const directory = directoryPrefix(prefix);
+  return directory.length === 0 || directory.includes('*') || directory.includes('?');
+}
+
 function matchesPathPrefix(path: string, prefix: string): boolean {
   const normalized = normalizedPath(path);
-  const normalizedPrefix = normalizedPath(prefix);
+  const normalizedPrefix = directoryPrefix(prefix);
   return normalizedPrefix.length > 0
+    && !isUnsupportedPathFilter(normalizedPrefix)
     && (normalized === normalizedPrefix || normalized.startsWith(`${normalizedPrefix}/`));
 }
 

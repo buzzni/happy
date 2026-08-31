@@ -19,6 +19,11 @@ import type {
 import type { AutomationMcpCallerGrantResult, AutomationMcpSpawnContext } from './automationMcpCallerGrant'
 import type { AutomationConnectorPreflightResult } from './automationConnectorPreflight'
 import { isPermanentGithubTriggerFailure } from './githubTriggerPermanentFailure'
+import {
+  ensureAgentTaskReviewObjects,
+  reviewShasFromDispatchInput,
+} from './agentTaskReviewObjects'
+import { shouldGiveUpWorktreeCleanup } from './worktreeCleanupGiveUp'
 import type { GithubTriggerWorktreePlan } from './githubTriggerWorktree'
 import type {
   AutomationAgentTaskDispatch,
@@ -29,6 +34,7 @@ import {
   GITHUB_TRIGGER_PROMPT_PREAMBLE,
   describeGithubTriggerBaseline,
   planGithubIssueTrigger,
+  isUnsupportedPathFilter,
   planGithubTrigger,
   selectPathFilterCandidates,
   renderGithubIssueTriggerPrompt,
@@ -126,6 +132,16 @@ export interface ServerAutomationExecutorInput {
     | { ok: false; error: string }
   >
   maintainAgentTaskLease: (dispatch: AutomationAgentTaskDispatch) => void
+  /**
+   * pr_review 워커가 diff 밖 문맥을 볼 수 있도록 base/head 커밋을 워크스페이스에
+   * 확보한다. 프로젝트 clone 은 기본 브랜치 단일 refspec 의 shallow 라 PR 커밋이
+   * 없고, preset 은 워커가 스스로 checkout·조회하는 것을 금지한다.
+   */
+  ensureReviewObjects?: (input: {
+    directory: string
+    shas: string[]
+    environmentVariables?: Record<string, string>
+  }) => Promise<{ ok: true; fetched: string[] } | { ok: false; error: string }>
   resolveMcpSpawnContext: (input: {
     runId: string
     claimToken: string
@@ -252,7 +268,20 @@ function buildAgentTaskPrompt(
     '3. Perform only the task. PR review is read-only. Before review_apply, verify the PR is open and current HEAD equals reviewedHeadSha; otherwise return stale/failed without mutating. review_apply may then edit, test, commit, and push; testing runs checks only.',
     `4. Complete with exactly this result shape: ${AGENT_TASK_RESULT_CONTRACTS[dispatch.type]}`,
     '5. POST /complete with version=1, token=$APLUS_AGENT_TASK_COMPLETE_TOKEN, agentRunId, a stable idempotencyKey, and result.',
+    // 2026-08-31 프로덕션 — pr_review 워커가 리뷰를 끝내고도 결과를 제출하지 못했다.
+    // 지시가 "POST ... and result" 뿐이라 워커가 셸에서 JSON 을 조립했고, 리뷰 본문의
+    // 따옴표·백틱·$ 가 보간을 타며 본문이 깨져 400 이 났다. 바로 아래 "4xx 는 재시도
+    // 금지" 규칙까지 정확히 지켜 조용히 끝났다 — 워커 잘못이 아니라 방법을 안 정해준
+    // 탓이다. 리뷰 본문은 임의의 코드 조각을 담으므로 셸을 거치면 언제든 깨진다.
+    'Write every request body to a file and send it with curl --data-binary @<file>'
+      + ' (or an equivalent that reads the file directly). Never build the JSON inline in a'
+      + ' shell argument such as -d \'{...}\' — findings quote code, so backticks, quotes,'
+      + ' and $ get interpolated and the body arrives corrupted.',
     'Retry network failures and 5xx responses with the same idempotencyKey; do not retry 4xx responses.',
+    // 손상된 본문은 재시도로 풀리지 않지만, 조용히 끝나서도 안 된다. 4xx 를 만나면
+    // 상태 코드와 응답 본문을 남겨 왜 제출이 실패했는지 사람이 볼 수 있게 한다.
+    'If /complete returns 4xx, report the status code and response body in your final message'
+      + ' before stopping, then POST /fail with the same reason.',
     'If the work cannot complete, POST /fail with the complete token and a concise reason. Do not put capabilities in output, commits, or PR text.',
   ].join('\n')
 }
@@ -845,7 +874,13 @@ function deferGithubWorktreeCleanup(
   input.runtimeStore.write({
     ...state,
     githubWorktrees: (state.githubWorktrees ?? []).map((entry) => (
-      entry.runId === runId ? { ...entry, cleanupRetryAt: input.now + delayMs } : entry
+      entry.runId === runId
+        ? {
+          ...entry,
+          cleanupRetryAt: input.now + delayMs,
+          cleanupAttempts: (entry.cleanupAttempts ?? 0) + 1,
+        }
+        : entry
     )),
   })
 }
@@ -867,6 +902,18 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
     input.logDebug?.(
       `[server-automation] GitHub worktree cleanup failed for ${worktree.worktreePath}: ${discarded.error}`,
     )
+    // dirty 는 사람이 작업물을 회수할 때까지 기다리는 의도된 보류이므로 예산을 쓰지
+    // 않는다. 그 밖의 실패는 예산 안에서만 재시도한다 — 상한이 없으면 2026-08-30 처럼
+    // 매분 영원히 실패하며 디스크만 찬다.
+    const attempts = (worktree.cleanupAttempts ?? 0) + 1
+    if (!discarded.dirty && shouldGiveUpWorktreeCleanup(attempts)) {
+      input.logDebug?.(
+        `[server-automation] giving up on GitHub worktree cleanup for ${worktree.worktreePath}`
+        + ` after ${attempts} attempts; remove it manually: ${discarded.error}`,
+      )
+      removeGithubWorktreeJournal(input, worktree.runId)
+      continue
+    }
     deferGithubWorktreeCleanup(
       input,
       worktree.runId,
@@ -1044,6 +1091,22 @@ async function executeStartedRun(
       previous,
       consume: githubMode === 'work',
     })
+    // 후보가 있었는데 경로 필터가 전부 떨어뜨렸고, 그 필터가 이 매처로는 표현할 수
+    // 없는 glob 이라면 설정 오류다. 조용히 0건이 되면 "제대로 걸렀다" 와 "고장났다" 를
+    // 구분할 수 없어, 2026-08-31 에는 그 상태로 자동화 두 개가 하루 넘게 멈춰 있었다.
+    // 후보가 있을 때만 알리므로, 정말 해당 없는 PR 만 흐르는 저장소는 조용하다.
+    // 후보를 받아왔는데 큐가 그대로 비어 있으면 경로 필터가 전부 떨어뜨렸다는 뜻이다.
+    // poll 단계는 consume:false 라 event 로는 판정할 수 없어 pending 을 본다.
+    if (fileCandidates.length > 0 && planned.state.pending.length === 0) {
+      const unsupported = payload.githubTrigger.filter.paths.filter(isUnsupportedPathFilter)
+      if (unsupported.length > 0) {
+        input.logDebug?.(
+          `[server-automation] ${automation.automationId} path filter matched nothing:`
+          + ` ${unsupported.join(', ')} cannot be matched — this matcher takes directory`
+          + ' prefixes (a trailing /* or /** is allowed), not general globs',
+        )
+      }
+    }
     persistGithubTriggerState = makeGithubTriggerStatePersister(input, automation, planned.state)
     if (githubMode === 'poll'
       && (payload.githubTrigger.action !== 'agent-task-review' || planned.state.pending.length > 0)) {
@@ -1086,6 +1149,25 @@ async function executeStartedRun(
         }
       }
       agentTaskDispatch = bridged.dispatch
+      if (bridged.dispatch.type === 'pr_review.v1') {
+        const shas = reviewShasFromDispatchInput(bridged.dispatch.input)
+        if (shas.length > 0) {
+          const provisioned = await (input.ensureReviewObjects ?? ensureAgentTaskReviewObjects)({
+            directory: payload.directory,
+            shas,
+            ...(query.githubEnvironment ? { environmentVariables: query.githubEnvironment } : {}),
+          })
+          // 객체가 없어도 immutable diff artifact 로 리뷰는 가능하므로 멈추지 않는다.
+          // 다만 왜 문맥이 없는지는 남긴다 — 조용히 넘어가면 리뷰 품질이 낮아진 이유를
+          // 아무도 모른다 (AGENTS.md §1.13).
+          if (!provisioned.ok) {
+            input.logDebug?.(
+              `[server-automation] ${automation.automationId} review objects unavailable`
+              + ` — the worker cannot inspect call sites beyond the diff: ${provisioned.error}`,
+            )
+          }
+        }
+      }
       prompt = buildAgentTaskPrompt(bridged.dispatch, payload.prompt)
       environmentVariables = {
         ...(bridged.dispatch.type === 'review_apply.v1' ? query.githubEnvironment ?? {} : {}),
