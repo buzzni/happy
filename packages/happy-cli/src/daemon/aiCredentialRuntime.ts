@@ -27,6 +27,11 @@ type TrialAiCredentialMarkerFile = {
   leases: Partial<Record<AiCredentialProvider, TrialAiCredentialLeaseMarker>>
 }
 
+type AiCredentialApplyGenerationFile = {
+  version: 1
+  generations: Partial<Record<AiCredentialProvider, number>>
+}
+
 export type AiCredentialCommandResult = {
   stdout: string
   stderr: string
@@ -34,7 +39,7 @@ export type AiCredentialCommandResult = {
 }
 
 export type AiCredentialRotationStatus = {
-  state: 'stopped' | 'starting' | 'running' | 'needs-reauth' | 'blocked' | 'quota-unknown' | 'not-routed'
+  state: 'stopped' | 'starting' | 'running' | 'needs-reauth' | 'blocked' | 'quota-unknown' | 'not-routed' | 'not-applicable'
   lastErrorKind: string | null
   lastSwitchAt?: string
   activeAccount?: string
@@ -48,6 +53,7 @@ type CommandOptions = {
   timeoutMs?: number
   acceptNonZeroExit?: boolean
   environment?: NodeJS.ProcessEnv
+  input?: string
 }
 
 type Supervisor = {
@@ -58,6 +64,7 @@ type Supervisor = {
 
 export type AiCredentialRuntimeDependencies = {
   homeDir: string
+  now(): number
   env: Record<string, string | undefined>
   execFile(command: string, args: string[], options?: CommandOptions): Promise<AiCredentialCommandResult>
   readFile(path: string): Promise<string>
@@ -72,8 +79,11 @@ export type AiCredentialRuntimeDependencies = {
 }
 
 export class AiCredentialRuntimeError extends Error {
-  constructor(public readonly kind: string) {
-    super(`AI credential operation failed (${kind})`)
+  constructor(public readonly kind: string, applyGeneration?: number) {
+    super(
+      `AI credential operation failed (${kind})`
+      + (applyGeneration === undefined ? '' : ` [applyGeneration=${applyGeneration}]`),
+    )
   }
 }
 
@@ -167,6 +177,58 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
 
   function trialMarkerPath(): string {
     return join(deps.homeDir, '.happy', 'trial-ai-credential-leases.json')
+  }
+
+  function applyGenerationPath(): string {
+    return join(deps.homeDir, '.happy', 'ai-credential-apply-generations.json')
+  }
+
+  async function reserveApplyGeneration(
+    selected: AiCredentialProvider,
+  ): Promise<number> {
+    let generations: AiCredentialApplyGenerationFile['generations'] = {}
+    try {
+      const parsed = JSON.parse(await deps.readFile(applyGenerationPath())) as unknown
+      if (!isObject(parsed) || parsed.version !== 1 || !isObject(parsed.generations)) {
+        throw new Error('invalid apply generation file')
+      }
+      generations = {}
+      for (const candidate of ['claude', 'codex', 'zai'] as const) {
+        const value = parsed.generations[candidate]
+        if (value !== undefined) {
+          if (!Number.isSafeInteger(value) || Number(value) < 1) {
+            throw new Error('invalid apply generation')
+          }
+          generations[candidate] = Number(value)
+        }
+      }
+      if (Object.keys(parsed.generations).some((key) => (
+        key !== 'claude' && key !== 'codex' && key !== 'zai'
+      ))) {
+        throw new Error('invalid provider')
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new AiCredentialRuntimeError('APPLY_GENERATION_INVALID')
+      }
+    }
+    const current = generations[selected] ?? 0
+    const now = deps.now()
+    const clockGeneration = now * 1000
+    if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(clockGeneration)) {
+      throw new AiCredentialRuntimeError('APPLY_GENERATION_INVALID')
+    }
+    if (current >= Number.MAX_SAFE_INTEGER) {
+      throw new AiCredentialRuntimeError('APPLY_GENERATION_INVALID')
+    }
+    const next = Math.max(current + 1, clockGeneration)
+    generations[selected] = next
+    await deps.mkdir(join(deps.homeDir, '.happy'), { recursive: true, mode: 0o700 })
+    await writeAtomicFile(deps, applyGenerationPath(), JSON.stringify({
+      version: 1,
+      generations,
+    } satisfies AiCredentialApplyGenerationFile))
+    return next
   }
 
   function trialLease(value: unknown): TrialAiCredentialLeaseMarker {
@@ -277,6 +339,9 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
 
   async function applyClaude(payload: string) {
     await purgeManagedProvider('zai')
+    const apiKeyTargetEmail = claudeApiKeyTargetEmail(payload)
+    const importedAccountIdentities = claudeImportedAccountIdentities(payload)
+    if (importedAccountIdentities !== null) await deps.supervisor.stop()
     await ensureClaudeSwap()
     const tempDir = await deps.makeTempDir()
     const tempFile = join(tempDir, 'claude-swap.json')
@@ -294,6 +359,63 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     let details = parseClaudeListDetails(status.stdout)
     if (!details.configured) {
       throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+    }
+    if (importedAccountIdentities !== null) {
+      const previousAccounts = details.accounts.filter((account) => (
+        !importedAccountIdentities.has(claudeListAccountIdentity(account))
+      ))
+      for (const account of previousAccounts) {
+        await deps.execFile('cswap', ['remove', String(account.number)], {
+          input: 'y\n',
+          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+        })
+      }
+      if (previousAccounts.length > 0) {
+        status = await deps.execFile('cswap', ['list', '--json'], {
+          maxOutputBytes: MAX_PAYLOAD_BYTES,
+          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+        })
+        details = parseClaudeListDetails(status.stdout)
+      }
+      const remainingIdentities = new Set(details.accounts.map(claudeListAccountIdentity))
+      if (details.accounts.length !== importedAccountIdentities.size
+        || remainingIdentities.size !== importedAccountIdentities.size
+        || [...importedAccountIdentities].some((identity) => !remainingIdentities.has(identity))) {
+        throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+      }
+    }
+    if (apiKeyTargetEmail !== null) {
+      let target = details.accounts.find((account) => (
+        account.email === apiKeyTargetEmail
+        && account.usageStatus === 'api_key'
+        && account.disabled !== true
+      ))
+      if (!target) throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+      const targetNumber = target.number
+      if (details.activeAccountNumber !== targetNumber) {
+        await deps.execFile('cswap', [
+          'switch', String(targetNumber), '--force', '--json',
+        ], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+        status = await deps.execFile('cswap', ['list', '--json'], {
+          maxOutputBytes: MAX_PAYLOAD_BYTES,
+          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+        })
+        details = parseClaudeListDetails(status.stdout)
+        target = details.accounts.find((account) => (
+          account.email === apiKeyTargetEmail
+          && account.usageStatus === 'api_key'
+          && account.disabled !== true
+        ))
+        if (!target || details.activeAccountNumber !== target.number) {
+          throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+        }
+      }
+      return {
+        provider: 'claude' as const,
+        configured: true,
+        credentialKind: 'api_key' as const,
+        rotation: apiKeyRotationStatus(),
+      }
     }
     if (!details.activeUsable) {
       if (details.usableAccountNumber === null) {
@@ -563,8 +685,9 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   function isRejectedZaiAuthentication(probe: AiCredentialCommandResult): boolean {
-    const diagnostic = `${probe.stdout}\n${probe.stderr}`
-    return /\b401\b|\bunauthorized\b|authentication[_ -]*error|invalid[_ -]*(?:api[_ -]*)?key/i
+    const stderrLines = probe.stderr.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+    const diagnostic = stderrLines[stderrLines.length - 1] ?? ''
+    return /\b401\b|\bunauthorized\b|authentication[_ -]*error|invalid[_ -]*api[_ -]*key/i
       .test(diagnostic)
   }
 
@@ -589,36 +712,62 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return serialize(() => withSafeErrors(
       `${selected.toUpperCase()}_APPLY_FAILED`,
       async () => {
+        const applyGeneration = await reserveApplyGeneration(selected)
         let requestedLease: TrialAiCredentialLeaseMarker | undefined
         let marker: TrialAiCredentialMarkerFile | undefined
         let previousLease: TrialAiCredentialLeaseMarker | undefined
-        if (input.trialLease !== undefined) {
-          requestedLease = trialLease(input.trialLease)
-          marker = await readTrialMarker()
-          const currentLease = marker.leases[selected]
-          if (currentLease && currentLease.leaseId !== requestedLease.leaseId) {
-            throw new AiCredentialRuntimeError('TRIAL_LEASE_CONFLICT')
-          }
-          const conflictingClaudeRuntime = selected === 'zai'
-            ? marker.leases.claude
-            : selected === 'claude'
-              ? marker.leases.zai
-              : undefined
-          if (conflictingClaudeRuntime) {
-            throw new AiCredentialRuntimeError('TRIAL_LEASE_CONFLICT')
-          }
-          previousLease = currentLease
-          marker.leases[selected] = requestedLease
-          await writeTrialMarker(marker)
-        }
+        let markerChanged = false
         try {
-          return selected === 'claude'
+          if (input.trialLease !== undefined) {
+            requestedLease = trialLease(input.trialLease)
+            marker = await readTrialMarker()
+            const currentLease = marker.leases[selected]
+            if (currentLease && currentLease.leaseId !== requestedLease.leaseId) {
+              throw new AiCredentialRuntimeError('TRIAL_LEASE_CONFLICT')
+            }
+            const conflictingClaudeRuntime = selected === 'zai'
+              ? marker.leases.claude
+              : selected === 'claude'
+                ? marker.leases.zai
+                : undefined
+            if (conflictingClaudeRuntime) {
+              throw new AiCredentialRuntimeError('TRIAL_LEASE_CONFLICT')
+            }
+            previousLease = currentLease
+            marker.leases[selected] = requestedLease
+            await writeTrialMarker(marker)
+            markerChanged = true
+          }
+          const result = selected === 'claude'
             ? await applyClaude(input.payload)
             : selected === 'zai'
               ? await applyZai(input.payload)
               : await applyCodex(input.payload)
+          if (!requestedLease) {
+            const nonTrialMarker = await readTrialMarker()
+            const providersToClear: AiCredentialProvider[] = selected === 'claude'
+              ? ['claude', 'zai']
+              : selected === 'zai'
+                ? ['zai', 'claude']
+                : ['codex']
+            let changed = false
+            for (const providerToClear of providersToClear) {
+              if (nonTrialMarker.leases[providerToClear]) {
+                delete nonTrialMarker.leases[providerToClear]
+                changed = true
+              }
+            }
+            if (changed) {
+              if (Object.keys(nonTrialMarker.leases).length === 0) {
+                await deps.rm(trialMarkerPath(), { force: true })
+              } else {
+                await writeTrialMarker(nonTrialMarker)
+              }
+            }
+          }
+          return { ...result, applyGeneration }
         } catch (error) {
-          if (requestedLease && marker) {
+          if (requestedLease && marker && markerChanged) {
             if (previousLease) marker.leases[selected] = previousLease
             else delete marker.leases[selected]
             try {
@@ -632,7 +781,9 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
               // the server can still issue a matching purge RPC.
             }
           }
-          throw error
+          throw error instanceof AiCredentialRuntimeError
+            ? new AiCredentialRuntimeError(error.kind, applyGeneration)
+            : new AiCredentialRuntimeError(`${selected.toUpperCase()}_APPLY_FAILED`, applyGeneration)
         }
       },
     ))
@@ -794,7 +945,9 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       return {
         provider: selected,
         ...claudeStatus,
-        rotation: deps.supervisor.status(),
+        rotation: claudeStatus.credentialKind === 'api_key'
+          ? apiKeyRotationStatus()
+          : deps.supervisor.status(),
       }
     }))
   }
@@ -806,6 +959,18 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return serialize(() => withSafeErrors('ROTATION_UPDATE_FAILED', async () => {
       if (input.action === 'start') {
         await ensureClaudeSwap()
+        const result = await deps.execFile('cswap', ['list', '--json'], {
+          maxOutputBytes: MAX_PAYLOAD_BYTES,
+          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+        })
+        if (parseClaudeListDetails(result.stdout).activeCredentialKind === 'api_key') {
+          await deps.supervisor.stop()
+          return {
+            provider: 'claude' as const,
+            credentialKind: 'api_key' as const,
+            rotation: apiKeyRotationStatus(),
+          }
+        }
         await deps.supervisor.enable()
       } else {
         await deps.supervisor.stop()
@@ -829,8 +994,55 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
 type ClaudeListDetails = {
   configured: boolean
   activeAccount: string | null
+  activeAccountNumber: number | null
   activeUsable: boolean
   usableAccountNumber: number | null
+  activeCredentialKind: 'oauth' | 'api_key' | null
+  accounts: Array<Record<string, unknown> & { number: number; email: string }>
+}
+
+function claudeApiKeyTargetEmail(payload: string): string | null {
+  try {
+    const parsed = JSON.parse(payload) as unknown
+    if (!isObject(parsed) || parsed.version !== 1 || parsed.encrypted === true
+      || !Array.isArray(parsed.accounts) || parsed.accounts.length !== 1) return null
+    const account = parsed.accounts[0]
+    if (!isObject(account)
+      || typeof account.email !== 'string'
+      || typeof account.credentials !== 'string'
+      || !account.credentials.startsWith('sk-ant-api')) return null
+    return account.email
+  } catch {
+    return null
+  }
+}
+
+function claudeImportedAccountIdentities(payload: string): Set<string> | null {
+  try {
+    const parsed = JSON.parse(payload) as unknown
+    if (!isObject(parsed) || parsed.version !== 1 || parsed.encrypted === true
+      || !Array.isArray(parsed.accounts) || parsed.accounts.length === 0) return null
+    const identities = new Set<string>()
+    for (const account of parsed.accounts) {
+      if (!isObject(account)
+        || typeof account.email !== 'string'
+        || (account.organizationUuid !== undefined
+          && typeof account.organizationUuid !== 'string')) return null
+      identities.add(JSON.stringify([account.email, account.organizationUuid ?? '']))
+    }
+    return identities.size === parsed.accounts.length ? identities : null
+  } catch {
+    return null
+  }
+}
+
+function claudeListAccountIdentity(
+  account: Record<string, unknown> & { email: string },
+): string {
+  return JSON.stringify([
+    account.email,
+    typeof account.organizationUuid === 'string' ? account.organizationUuid : '',
+  ])
 }
 
 function parseClaudeListDetails(stdout: string): ClaudeListDetails {
@@ -840,16 +1052,22 @@ function parseClaudeListDetails(stdout: string): ClaudeListDetails {
       || parsed.schemaVersion !== 1
       || !Array.isArray(parsed.accounts)
       || (parsed.activeAccountNumber !== null
-        && !Number.isInteger(parsed.activeAccountNumber))) {
+        && !Number.isSafeInteger(parsed.activeAccountNumber))) {
       throw new Error('invalid status')
     }
     const accounts: Array<Record<string, unknown>> = []
+    const accountNumbers = new Set<number>()
     for (const account of parsed.accounts) {
       if (!isObject(account)
-        || !Number.isInteger(account.number)
-        || typeof account.email !== 'string') {
+        || !Number.isSafeInteger(account.number)
+        || Number(account.number) < 1
+        || typeof account.email !== 'string'
+        || (account.organizationUuid !== undefined
+          && typeof account.organizationUuid !== 'string')
+        || accountNumbers.has(Number(account.number))) {
         throw new Error('invalid account')
       }
+      accountNumbers.add(Number(account.number))
       accounts.push(account)
     }
     const hasUsageStatus = accounts.some(({ usageStatus }) => typeof usageStatus === 'string')
@@ -860,10 +1078,13 @@ function parseClaudeListDetails(stdout: string): ClaudeListDetails {
       return {
         configured: accounts.length > 0,
         activeAccount: null,
+        activeAccountNumber: null,
         activeUsable: false,
         usableAccountNumber: typeof usableAccount?.number === 'number'
           ? usableAccount.number
           : null,
+        activeCredentialKind: null,
+        accounts: accounts as ClaudeListDetails['accounts'],
       }
     }
     const active = accounts.find((account) => account.number === parsed.activeAccountNumber)
@@ -873,19 +1094,34 @@ function parseClaudeListDetails(stdout: string): ClaudeListDetails {
     return {
       configured: true,
       activeAccount: maskEmail(active.email),
+      activeAccountNumber: Number(parsed.activeAccountNumber),
       activeUsable: usable(active),
       usableAccountNumber: typeof usableAccount?.number === 'number'
         ? usableAccount.number
         : null,
+      activeCredentialKind: active.usageStatus === 'api_key' ? 'api_key' : 'oauth',
+      accounts: accounts as ClaudeListDetails['accounts'],
     }
   } catch {
     throw new AiCredentialRuntimeError('CLAUDE_STATUS_INVALID')
   }
 }
 
-function parseClaudeList(stdout: string): { configured: boolean; activeAccount: string | null } {
-  const { configured, activeAccount } = parseClaudeListDetails(stdout)
-  return { configured, activeAccount }
+function apiKeyRotationStatus(): AiCredentialRotationStatus {
+  return { state: 'not-applicable', lastErrorKind: null }
+}
+
+function parseClaudeList(stdout: string): {
+  configured: boolean
+  activeAccount: string | null
+  credentialKind?: 'oauth' | 'api_key'
+} {
+  const { configured, activeAccount, activeCredentialKind } = parseClaudeListDetails(stdout)
+  return {
+    configured,
+    activeAccount,
+    ...(activeCredentialKind ? { credentialKind: activeCredentialKind } : {}),
+  }
 }
 
 type CodexMultiAuthAccount = CodexAccountIdentity & {
@@ -1126,6 +1362,7 @@ export function createNodeAiCredentialRuntime(
 ) {
   return createAiCredentialRuntime({
     homeDir,
+    now: Date.now,
     env,
     execFile: runAiCredentialCommand,
     readFile: (path) => readFile(path, 'utf8'),
@@ -1149,7 +1386,7 @@ export function runAiCredentialCommand(
     const child = spawnCommand(command, args, {
       env: options.environment
         ?? (command === 'cswap' ? withUvToolBinOnPath() : process.env),
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       windowsHide: true,
     })
     const stdout: Buffer[] = []
@@ -1175,8 +1412,8 @@ export function runAiCredentialCommand(
         target.push(chunk)
       }
     }
-    child.stdout.on('data', collect(stdout))
-    child.stderr.on('data', collect(stderr))
+    child.stdout!.on('data', collect(stdout))
+    child.stderr!.on('data', collect(stderr))
     child.on('error', () => fail('COMMAND_NOT_AVAILABLE'))
     child.on('close', (code) => {
       if (settled) return
@@ -1195,6 +1432,10 @@ export function runAiCredentialCommand(
       })
     })
     timeout = setTimeout(() => fail('COMMAND_TIMED_OUT'), options.timeoutMs ?? 30_000)
+    if (options.input !== undefined) {
+      child.stdin?.on('error', () => fail('COMMAND_FAILED'))
+      child.stdin?.end(options.input)
+    }
   })
 }
 

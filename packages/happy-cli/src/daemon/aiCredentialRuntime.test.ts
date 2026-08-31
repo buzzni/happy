@@ -18,6 +18,21 @@ const configuredClaudeList = JSON.stringify({
   accounts: [{ number: 1, email: 'owner@example.com', active: true }],
 })
 
+function claudeOauthPayload(accounts: Array<{ email: string; organizationUuid?: string }>): string {
+  return JSON.stringify({
+    version: 1,
+    encrypted: false,
+    activeAccountNumber: 1,
+    accounts: accounts.map((account, index) => ({
+      number: index + 1,
+      email: account.email,
+      organizationUuid: account.organizationUuid ?? '',
+      credentials: { claudeAiOauth: { accessToken: `oauth-${index + 1}` } },
+      config: { oauthAccount: { emailAddress: account.email } },
+    })),
+  })
+}
+
 function codexMultiAuthBundle() {
   return {
     version: 1,
@@ -36,7 +51,9 @@ function codexMultiAuthBundle() {
   }
 }
 
-function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
+function setup(
+  overrides: Partial<AiCredentialRuntimeDependencies> & { now?: () => number } = {},
+) {
   const calls: Array<{ command: string; args: string[] }> = []
   const files = new Map<string, string>()
   files.set('/global/node_modules/codex-multi-auth/package.json', JSON.stringify({ version: '2.8.5' }))
@@ -82,6 +99,7 @@ function setup(overrides: Partial<AiCredentialRuntimeDependencies> = {}) {
   const writeFile = vi.fn(async (path: string, content: string) => { files.set(path, content) })
   const runtime = createAiCredentialRuntime({
     homeDir: '/home/operator',
+    now: () => 0,
     env: {},
     execFile,
     readFile: vi.fn(async (path: string) => files.get(path) ?? Promise.reject(Object.assign(new Error('missing'), { code: 'ENOENT' }))),
@@ -126,7 +144,9 @@ describe('AI credential machine runtime', () => {
     const zaiLease = { ...trialLease, leaseId: 'lease-zai-1' }
 
     await expect(runtime.apply({ provider: 'zai', payload: zaiPayload, trialLease: zaiLease }))
-      .resolves.toEqual({ provider: 'zai', configured: true, accountCount: 1 })
+      .resolves.toEqual({
+        provider: 'zai', configured: true, accountCount: 1, applyGeneration: 1,
+      })
 
     expect(supervisor.stop).toHaveBeenCalledTimes(1)
     expect(writeFile).toHaveBeenCalledWith(
@@ -326,6 +346,66 @@ describe('AI credential machine runtime', () => {
     })
   })
 
+  it('does not treat unrelated stdout text as a rejected Z.AI credential', async () => {
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: 'plugin diagnostic: invalid key mapping',
+        stderr: 'plugin initialization failed',
+        exitCode: 1,
+      })),
+    })
+
+    await runtime.apply({
+      provider: 'zai',
+      payload: zaiPayload,
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })
+
+    await expect(runtime.status({ provider: 'zai' })).rejects.toMatchObject({
+      kind: 'ZAI_PROBE_FAILED',
+    })
+  })
+
+  it('does not treat an unrelated invalid-key stderr line as a rejected Z.AI credential', async () => {
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: '',
+        stderr: 'plugin initialization failed: invalid key mapping',
+        exitCode: 1,
+      })),
+    })
+
+    await runtime.apply({
+      provider: 'zai',
+      payload: zaiPayload,
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })
+
+    await expect(runtime.status({ provider: 'zai' })).rejects.toMatchObject({
+      kind: 'ZAI_PROBE_FAILED',
+    })
+  })
+
+  it('still recognizes an explicit invalid API key Z.AI error', async () => {
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: '',
+        stderr: 'Invalid API key',
+        exitCode: 1,
+      })),
+    })
+
+    await runtime.apply({
+      provider: 'zai',
+      payload: zaiPayload,
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })
+
+    await expect(runtime.status({ provider: 'zai' })).resolves.toEqual({
+      provider: 'zai', configured: false, accountCount: 0,
+    })
+  })
+
   it('removes the secret temporary file when Z.AI environment installation fails', async () => {
     let filesRef!: Map<string, string>
     const prepared = setup({
@@ -393,6 +473,18 @@ describe('AI credential machine runtime', () => {
       },
     })
     expect(marker).not.toContain('trial-secret')
+  })
+
+  it('clears a prior trial marker only after a non-trial replacement succeeds', async () => {
+    const { runtime, files } = setup()
+    files.set('/home/operator/.happy/trial-ai-credential-leases.json', JSON.stringify({
+      version: 1,
+      leases: { claude: { ...trialLease } },
+    }))
+
+    await runtime.apply({ provider: 'claude', payload: '{}' })
+
+    expect(files.has('/home/operator/.happy/trial-ai-credential-leases.json')).toBe(false)
   })
 
   it('refuses to replace a marker owned by a different active lease', async () => {
@@ -941,6 +1033,161 @@ describe('AI credential machine runtime', () => {
     expect(supervisor.enable).toHaveBeenCalledOnce()
   })
 
+  it('removes prior OAuth accounts and verifies only the imported bundle', async () => {
+    let activeAccountNumber: number | null = 1
+    let accounts = [
+      { number: 1, email: 'old-company@example.com', organizationUuid: 'old-org', usageStatus: 'ok' },
+      { number: 2, email: 'new-company@example.com', organizationUuid: 'new-org', usageStatus: 'ok' },
+    ]
+    const execFile = vi.fn(async (
+      command: string,
+      args: string[],
+      options?: { input?: string },
+    ) => {
+      if (command === 'cswap' && args[0] === '--version') {
+        return { stdout: 'cswap 0.25.0', stderr: '' }
+      }
+      if (command === 'cswap' && args[0] === 'list') {
+        return {
+          stdout: JSON.stringify({ schemaVersion: 1, activeAccountNumber, accounts }),
+          stderr: '',
+        }
+      }
+      if (command === 'cswap' && args[0] === 'remove' && options?.input === 'y\n') {
+        const removed = Number(args[1])
+        accounts = accounts.filter((account) => account.number !== removed)
+        if (activeAccountNumber === removed) activeAccountNumber = null
+      }
+      if (command === 'cswap' && args[0] === 'switch') activeAccountNumber = Number(args[1])
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime, supervisor } = setup({ execFile })
+
+    await expect(runtime.apply({
+      provider: 'claude',
+      payload: claudeOauthPayload([{
+        email: 'new-company@example.com', organizationUuid: 'new-org',
+      }]),
+    })).resolves.toMatchObject({ provider: 'claude', configured: true })
+
+    expect(execFile).toHaveBeenCalledWith(
+      'cswap', ['remove', '1'], expect.objectContaining({ input: 'y\n' }),
+    )
+    expect(execFile).toHaveBeenCalledWith(
+      'cswap', ['switch', '2', '--force', '--json'], expect.anything(),
+    )
+    expect(accounts).toEqual([
+      { number: 2, email: 'new-company@example.com', organizationUuid: 'new-org', usageStatus: 'ok' },
+    ])
+    const importCallOrder = execFile.mock.invocationCallOrder[
+      execFile.mock.calls.findIndex(([, args]) => args[0] === 'import')
+    ]
+    expect(supervisor.stop.mock.invocationCallOrder[0]).toBeLessThan(importCallOrder)
+    expect(supervisor.stop).toHaveBeenCalledBefore(supervisor.enable)
+  })
+
+  it('does not accept a usable prior OAuth account for an unusable imported bundle', async () => {
+    let activeAccountNumber: number | null = 1
+    let accounts = [
+      { number: 1, email: 'old-company@example.com', organizationUuid: 'old-org', usageStatus: 'ok' },
+      { number: 2, email: 'new-company@example.com', organizationUuid: 'new-org', usageStatus: 'relogin_required' },
+    ]
+    const execFile = vi.fn(async (
+      command: string,
+      args: string[],
+      options?: { input?: string },
+    ) => {
+      if (command === 'cswap' && args[0] === '--version') {
+        return { stdout: 'cswap 0.25.0', stderr: '' }
+      }
+      if (command === 'cswap' && args[0] === 'list') {
+        return {
+          stdout: JSON.stringify({ schemaVersion: 1, activeAccountNumber, accounts }),
+          stderr: '',
+        }
+      }
+      if (command === 'cswap' && args[0] === 'remove' && options?.input === 'y\n') {
+        const removed = Number(args[1])
+        accounts = accounts.filter((account) => account.number !== removed)
+        if (activeAccountNumber === removed) activeAccountNumber = null
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime, supervisor } = setup({ execFile })
+
+    await expect(runtime.apply({
+      provider: 'claude',
+      payload: claudeOauthPayload([{
+        email: 'new-company@example.com', organizationUuid: 'new-org',
+      }]),
+    })).rejects.toMatchObject({ kind: 'CLAUDE_APPLY_VERIFICATION_FAILED' })
+
+    expect(accounts).toEqual([
+      { number: 2, email: 'new-company@example.com', organizationUuid: 'new-org', usageStatus: 'relogin_required' },
+    ])
+    expect(supervisor.enable).not.toHaveBeenCalled()
+  })
+
+  it('activates an imported Claude API key, removes prior accounts, and stops OAuth rotation', async () => {
+    let activeAccountNumber: number | null = 1
+    let accounts = [
+      { number: 1, email: 'oauth@example.com', usageStatus: 'ok' },
+      { number: 2, email: 'api-key-1@token.local', usageStatus: 'api_key' },
+    ]
+    const execFile = vi.fn(async (
+      command: string,
+      args: string[],
+      options?: { input?: string },
+    ) => {
+      if (command === 'cswap' && args[0] === '--version') {
+        return { stdout: 'cswap 0.25.0', stderr: '' }
+      }
+      if (command === 'cswap' && args[0] === 'list') {
+        return {
+          stdout: JSON.stringify({
+            schemaVersion: 1,
+            activeAccountNumber,
+            accounts,
+          }),
+          stderr: '',
+        }
+      }
+      if (command === 'cswap' && args[0] === 'switch') activeAccountNumber = Number(args[1])
+      if (command === 'cswap' && args[0] === 'remove' && options?.input === 'y\n') {
+        const removed = Number(args[1])
+        accounts = accounts.filter((account) => account.number !== removed)
+        if (activeAccountNumber === removed) activeAccountNumber = null
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime, supervisor } = setup({ execFile })
+    const payload = JSON.stringify({
+      version: 1,
+      encrypted: false,
+      activeAccountNumber: 1,
+      accounts: [{
+        number: 1,
+        email: 'api-key-1@token.local',
+        credentials: `sk-ant-api${'a'.repeat(20)}`,
+        config: { oauthAccount: { emailAddress: 'api-key-1@token.local' } },
+      }],
+    })
+
+    await expect(runtime.apply({ provider: 'claude', payload })).resolves.toMatchObject({
+      provider: 'claude', configured: true, credentialKind: 'api_key',
+    })
+
+    expect(execFile).toHaveBeenCalledWith(
+      'cswap', ['switch', '2', '--force', '--json'], expect.anything(),
+    )
+    expect(execFile).toHaveBeenCalledWith(
+      'cswap', ['remove', '1'], expect.objectContaining({ input: 'y\n' }),
+    )
+    expect(execFile.mock.calls.filter(([, args]) => args[0] === 'list')).toHaveLength(3)
+    expect(supervisor.stop).toHaveBeenCalledOnce()
+    expect(supervisor.enable).not.toHaveBeenCalled()
+  })
+
   it('rejects imported Claude credentials when every account requires login', async () => {
     const execFile = vi.fn(async (command: string, args: string[]) => {
       if (command === 'cswap' && args[0] === '--version') {
@@ -1017,7 +1264,9 @@ describe('AI credential machine runtime', () => {
 
     await expect(runtime.apply({
       provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
-    })).resolves.toEqual({ provider: 'codex', configured: true, status: 'authenticated' })
+    })).resolves.toEqual({
+      provider: 'codex', configured: true, status: 'authenticated', applyGeneration: 1,
+    })
 
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"new-secret"}')
     expect(files.has('/home/operator/.codex/auth.json.happy-backup')).toBe(false)
@@ -1027,15 +1276,26 @@ describe('AI credential machine runtime', () => {
   })
 
   it('preserves the existing Codex auth when the backup cannot be created', async () => {
-    const rename = vi.fn(async () => {
+    let files!: Map<string, string>
+    const rename = vi.fn(async (from: string, to: string) => {
+      if (from.endsWith('ai-credential-apply-generations.json.happy-tmp')) {
+        files.set(to, files.get(from)!)
+        files.delete(from)
+        return
+      }
       throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
     })
-    const { runtime, files } = setup({ rename })
+    const configured = setup({ rename })
+    files = configured.files
+    const { runtime } = configured
     files.set('/home/operator/.codex/auth.json', '{"OPENAI_API_KEY":"old"}')
 
     await expect(runtime.apply({
       provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
-    })).rejects.toMatchObject({ kind: 'CODEX_BACKUP_FAILED' })
+    })).rejects.toMatchObject({
+      kind: 'CODEX_BACKUP_FAILED',
+      message: 'AI credential operation failed (CODEX_BACKUP_FAILED) [applyGeneration=1]',
+    })
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"old"}')
   })
 
@@ -1063,7 +1323,9 @@ describe('AI credential machine runtime', () => {
 
     await expect(runtime.apply({
       provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
-    })).resolves.toEqual({ provider: 'codex', configured: true, status: 'authenticated' })
+    })).resolves.toEqual({
+      provider: 'codex', configured: true, status: 'authenticated', applyGeneration: 1,
+    })
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"new-secret"}')
     expect(files.has('/home/operator/.codex/auth.json.happy-backup')).toBe(false)
   })
@@ -1121,9 +1383,28 @@ describe('AI credential machine runtime', () => {
     expect(statusCalls).toBe(1)
 
     releaseFirst()
-    await Promise.all([first, second])
+    const [firstResult, secondResult] = await Promise.all([first, second])
     expect(statusCalls).toBe(2)
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"two"}')
+    expect(firstResult).toMatchObject({ applyGeneration: 1 })
+    expect(secondResult).toMatchObject({ applyGeneration: 2 })
+    expect(JSON.parse(files.get('/home/operator/.happy/ai-credential-apply-generations.json')!))
+      .toEqual({ version: 1, generations: { codex: 2 } })
+  })
+
+  it('advances a restored apply counter to the current clock epoch', async () => {
+    const now = 1_700_000_000_000
+    const { runtime, files } = setup({ now: () => now })
+    files.set('/home/operator/.happy/ai-credential-apply-generations.json', JSON.stringify({
+      version: 1,
+      generations: { codex: 7 },
+    }))
+
+    await expect(runtime.apply({
+      provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
+    })).resolves.toMatchObject({ applyGeneration: now * 1000 })
+    expect(JSON.parse(files.get('/home/operator/.happy/ai-credential-apply-generations.json')!))
+      .toEqual({ version: 1, generations: { codex: now * 1000 } })
   })
 
   it('serializes capture behind an in-progress credential replacement', async () => {
@@ -1259,9 +1540,41 @@ describe('AI credential machine runtime', () => {
     await expect(runtime.status({ provider: 'claude' })).resolves.toEqual({
       provider: 'claude',
       configured: true,
+      credentialKind: 'oauth',
       activeAccount: 'o***@example.com',
       rotation: { state: 'running', lastErrorKind: null },
     })
+  })
+
+  it('reports an active Claude API key as rotation-not-applicable', async () => {
+    const { runtime, supervisor } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: JSON.stringify({
+          schemaVersion: 1,
+          activeAccountNumber: 2,
+          accounts: [{
+            number: 2,
+            email: 'api-key-aabbcc@token.local',
+            usageStatus: 'api_key',
+          }],
+        }),
+        stderr: '',
+      })),
+    })
+
+    await expect(runtime.status({ provider: 'claude' })).resolves.toEqual({
+      provider: 'claude',
+      configured: true,
+      credentialKind: 'api_key',
+      activeAccount: 'a***@token.local',
+      rotation: { state: 'not-applicable', lastErrorKind: null },
+    })
+    await expect(runtime.rotation({ action: 'start' })).resolves.toMatchObject({
+      credentialKind: 'api_key',
+      rotation: { state: 'not-applicable' },
+    })
+    expect(supervisor.enable).not.toHaveBeenCalled()
+    expect(supervisor.stop).toHaveBeenCalledOnce()
   })
 
   it('reports managed Codex routing with the least-remaining active account masked', async () => {
@@ -1413,6 +1726,7 @@ describe('AI credential machine runtime', () => {
       ['cswap', ['--version']],
       ['cswap', ['config', 'set', 'autoswitch.threshold', '95']],
       ['cswap', ['config', 'set', 'autoswitch.strategy', 'consume-first']],
+      ['cswap', ['list', '--json']],
     ])
     expect(supervisor.enable).toHaveBeenCalledOnce()
   })
@@ -1430,6 +1744,82 @@ describe('AI credential machine runtime', () => {
   it('rejects malformed Claude list output instead of reporting configured', async () => {
     const { runtime } = setup({
       execFile: vi.fn(async () => ({ stdout: '{"schemaVersion":1,"error":{"message":"secret"}}', stderr: '' })),
+    })
+
+    await expect(runtime.status({ provider: 'claude' })).rejects.toMatchObject({
+      kind: 'CLAUDE_STATUS_INVALID',
+    })
+  })
+
+  it('rejects malformed Claude account identity fields', async () => {
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: JSON.stringify({
+          schemaVersion: 1,
+          activeAccountNumber: 1,
+          accounts: [{ number: 1, email: 'owner@example.com', organizationUuid: 42 }],
+        }),
+        stderr: '',
+      })),
+    })
+
+    await expect(runtime.status({ provider: 'claude' })).rejects.toMatchObject({
+      kind: 'CLAUDE_STATUS_INVALID',
+    })
+  })
+
+  it('rejects duplicate Claude account slot numbers', async () => {
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: JSON.stringify({
+          schemaVersion: 1,
+          activeAccountNumber: 1,
+          accounts: [
+            { number: 1, email: 'first@example.com', organizationUuid: 'first-org' },
+            { number: 1, email: 'second@example.com', organizationUuid: 'second-org' },
+          ],
+        }),
+        stderr: '',
+      })),
+    })
+
+    await expect(runtime.status({ provider: 'claude' })).rejects.toMatchObject({
+      kind: 'CLAUDE_STATUS_INVALID',
+    })
+  })
+
+  it('rejects non-positive Claude account slot numbers', async () => {
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: JSON.stringify({
+          schemaVersion: 1,
+          activeAccountNumber: null,
+          accounts: [{ number: 0, email: 'owner@example.com', organizationUuid: 'org' }],
+        }),
+        stderr: '',
+      })),
+    })
+
+    await expect(runtime.status({ provider: 'claude' })).rejects.toMatchObject({
+      kind: 'CLAUDE_STATUS_INVALID',
+    })
+  })
+
+  it('rejects Claude account slot numbers outside the safe integer range', async () => {
+    const unsafeSlot = Number.MAX_SAFE_INTEGER + 1
+    const { runtime } = setup({
+      execFile: vi.fn(async () => ({
+        stdout: JSON.stringify({
+          schemaVersion: 1,
+          activeAccountNumber: unsafeSlot,
+          accounts: [{
+            number: unsafeSlot,
+            email: 'owner@example.com',
+            organizationUuid: 'org',
+          }],
+        }),
+        stderr: '',
+      })),
     })
 
     await expect(runtime.status({ provider: 'claude' })).rejects.toMatchObject({
@@ -1464,6 +1854,30 @@ describe('AI credential machine runtime', () => {
     child.emit('close', 0)
 
     await expect(result).resolves.toEqual({ stdout: '{"complete":true}', stderr: '' })
+  })
+
+  it('pipes fixed confirmation input to interactive credential commands', async () => {
+    const stdin = Object.assign(new EventEmitter(), { end: vi.fn() })
+    const child = Object.assign(new EventEmitter(), {
+      stdin,
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      kill: vi.fn(),
+    })
+    const spawnCommand = vi.fn(() => child) as unknown as typeof spawn
+
+    const result = runAiCredentialCommand('cswap', ['remove', '1'], {
+      input: 'y\n',
+    }, spawnCommand)
+
+    expect(spawnCommand).toHaveBeenCalledWith('cswap', ['remove', '1'], {
+      env: expect.any(Object),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    expect(stdin.end).toHaveBeenCalledWith('y\n')
+    child.emit('close', 0)
+    await expect(result).resolves.toEqual({ stdout: '', stderr: '' })
   })
 
   it('caps stdout and stderr independently so diagnostics do not consume the payload budget', async () => {
