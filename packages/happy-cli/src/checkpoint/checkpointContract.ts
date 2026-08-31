@@ -1,6 +1,9 @@
 import { z } from 'zod';
 
-const identifierSchema = z.string().min(1).max(128);
+const identifierSchema = z.string().min(1).max(128).refine(
+    (value) => value.trim() === value && !/[\u0000-\u001F\u007F]/.test(value),
+    'identifier must not contain surrounding whitespace or control characters',
+);
 
 const projectRelativePathSchema = z.string().min(1).refine((value) => {
     if (value.includes('\0') || /^(?:[A-Za-z]:|[\\/])/.test(value)) return false;

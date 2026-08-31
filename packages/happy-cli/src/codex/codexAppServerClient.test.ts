@@ -470,6 +470,51 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(beforeTurn).not.toHaveBeenCalled();
     });
 
+    it('runs the checkpoint gate exactly once before dispatching a protected turn', async () => {
+        const order: string[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-gated', path: '/tmp/thread-gated' },
+                            model: 'gpt-test', modelProvider: 'openai', cwd: '/tmp/project',
+                            approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' }, reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    order.push('provider');
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-gated' } } });
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: {
+                                threadId: 'thread-gated',
+                                turn: { id: 'turn-gated', status: 'completed', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const beforeTurn = vi.fn(async () => {
+            order.push('gate');
+        });
+        await client.connect();
+        await client.startThread({ cwd: '/tmp/project', sandbox: 'workspace-write' });
+
+        await expect(client.sendTurnAndWait('edit the project', { beforeTurn }))
+            .resolves.toEqual({ aborted: false });
+
+        expect(beforeTurn).toHaveBeenCalledOnce();
+        expect(order).toEqual(['gate', 'provider']);
+        await client.disconnect();
+    });
+
     it('does not dispatch an excluded-path retry while protection confirmation is pending', async () => {
         const requests: MockRpcMessage[] = [];
         mockSpawn.mockImplementation(() => createMockProcess({

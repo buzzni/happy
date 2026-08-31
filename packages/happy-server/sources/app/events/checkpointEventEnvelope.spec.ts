@@ -40,4 +40,18 @@ describe('checkpointEventEnvelopeSchema', () => {
             content: 'SECRET=value',
         }).success).toBe(false);
     });
+
+    it.each(['   ', 'identifier\n2', 'identifier\0two'])(
+        'rejects unsafe operation and checkpoint identifiers %j',
+        (identifier) => {
+            expect(checkpointEventEnvelopeSchema.safeParse({
+                ...validEnvelope,
+                operationId: identifier,
+            }).success).toBe(false);
+            expect(checkpointEventEnvelopeSchema.safeParse({
+                ...validEnvelope,
+                checkpointId: identifier,
+            }).success).toBe(false);
+        },
+    );
 });

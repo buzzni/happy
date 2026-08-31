@@ -31,6 +31,16 @@ describe('checkpoint mutation gate contract', () => {
             accountId: 'account-from-caller',
         }).success).toBe(false);
     });
+
+    it.each(['   ', 'operation\n2', 'operation\0two'])(
+        'rejects an unsafe operation identifier %j',
+        (operationId) => {
+            expect(checkpointMutationGateRequestSchema.safeParse({
+                ...validRequest,
+                operationId,
+            }).success).toBe(false);
+        },
+    );
 });
 
 describe('checkpoint protection state contract', () => {
@@ -97,4 +107,14 @@ describe('encrypted checkpoint event detail contract', () => {
             credential: 'token',
         }).success).toBe(false);
     });
+
+    it.each(['   ', 'checkpoint\n2', 'checkpoint\0two'])(
+        'rejects an unsafe checkpoint identifier %j',
+        (checkpointId) => {
+            expect(checkpointEventDetailSchema.safeParse({
+                ...validDetail,
+                checkpointId,
+            }).success).toBe(false);
+        },
+    );
 });
