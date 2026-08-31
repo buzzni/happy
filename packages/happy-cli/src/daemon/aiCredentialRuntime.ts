@@ -27,6 +27,11 @@ type TrialAiCredentialMarkerFile = {
   leases: Partial<Record<AiCredentialProvider, TrialAiCredentialLeaseMarker>>
 }
 
+type AiCredentialApplyGenerationFile = {
+  version: 1
+  generations: Partial<Record<AiCredentialProvider, number>>
+}
+
 export type AiCredentialCommandResult = {
   stdout: string
   stderr: string
@@ -167,6 +172,53 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
 
   function trialMarkerPath(): string {
     return join(deps.homeDir, '.happy', 'trial-ai-credential-leases.json')
+  }
+
+  function applyGenerationPath(): string {
+    return join(deps.homeDir, '.happy', 'ai-credential-apply-generations.json')
+  }
+
+  async function reserveApplyGeneration(
+    selected: AiCredentialProvider,
+  ): Promise<number> {
+    let generations: AiCredentialApplyGenerationFile['generations'] = {}
+    try {
+      const parsed = JSON.parse(await deps.readFile(applyGenerationPath())) as unknown
+      if (!isObject(parsed) || parsed.version !== 1 || !isObject(parsed.generations)) {
+        throw new Error('invalid apply generation file')
+      }
+      generations = {}
+      for (const candidate of ['claude', 'codex', 'zai'] as const) {
+        const value = parsed.generations[candidate]
+        if (value !== undefined) {
+          if (!Number.isSafeInteger(value) || Number(value) < 1) {
+            throw new Error('invalid apply generation')
+          }
+          generations[candidate] = Number(value)
+        }
+      }
+      if (Object.keys(parsed.generations).some((key) => (
+        key !== 'claude' && key !== 'codex' && key !== 'zai'
+      ))) {
+        throw new Error('invalid provider')
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new AiCredentialRuntimeError('APPLY_GENERATION_INVALID')
+      }
+    }
+    const current = generations[selected] ?? 0
+    if (current >= Number.MAX_SAFE_INTEGER) {
+      throw new AiCredentialRuntimeError('APPLY_GENERATION_INVALID')
+    }
+    const next = current + 1
+    generations[selected] = next
+    await deps.mkdir(join(deps.homeDir, '.happy'), { recursive: true, mode: 0o700 })
+    await writeAtomicFile(deps, applyGenerationPath(), JSON.stringify({
+      version: 1,
+      generations,
+    } satisfies AiCredentialApplyGenerationFile))
+    return next
   }
 
   function trialLease(value: unknown): TrialAiCredentialLeaseMarker {
@@ -623,6 +675,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return serialize(() => withSafeErrors(
       `${selected.toUpperCase()}_APPLY_FAILED`,
       async () => {
+        const applyGeneration = await reserveApplyGeneration(selected)
         let requestedLease: TrialAiCredentialLeaseMarker | undefined
         let marker: TrialAiCredentialMarkerFile | undefined
         let previousLease: TrialAiCredentialLeaseMarker | undefined
@@ -673,7 +726,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
               }
             }
           }
-          return result
+          return { ...result, applyGeneration }
         } catch (error) {
           if (requestedLease && marker) {
             if (previousLease) marker.leases[selected] = previousLease

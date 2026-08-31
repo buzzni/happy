@@ -126,7 +126,9 @@ describe('AI credential machine runtime', () => {
     const zaiLease = { ...trialLease, leaseId: 'lease-zai-1' }
 
     await expect(runtime.apply({ provider: 'zai', payload: zaiPayload, trialLease: zaiLease }))
-      .resolves.toEqual({ provider: 'zai', configured: true, accountCount: 1 })
+      .resolves.toEqual({
+        provider: 'zai', configured: true, accountCount: 1, applyGeneration: 1,
+      })
 
     expect(supervisor.stop).toHaveBeenCalledTimes(1)
     expect(writeFile).toHaveBeenCalledWith(
@@ -1075,7 +1077,9 @@ describe('AI credential machine runtime', () => {
 
     await expect(runtime.apply({
       provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
-    })).resolves.toEqual({ provider: 'codex', configured: true, status: 'authenticated' })
+    })).resolves.toEqual({
+      provider: 'codex', configured: true, status: 'authenticated', applyGeneration: 1,
+    })
 
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"new-secret"}')
     expect(files.has('/home/operator/.codex/auth.json.happy-backup')).toBe(false)
@@ -1085,10 +1089,18 @@ describe('AI credential machine runtime', () => {
   })
 
   it('preserves the existing Codex auth when the backup cannot be created', async () => {
-    const rename = vi.fn(async () => {
+    let files!: Map<string, string>
+    const rename = vi.fn(async (from: string, to: string) => {
+      if (from.endsWith('ai-credential-apply-generations.json.happy-tmp')) {
+        files.set(to, files.get(from)!)
+        files.delete(from)
+        return
+      }
       throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
     })
-    const { runtime, files } = setup({ rename })
+    const configured = setup({ rename })
+    files = configured.files
+    const { runtime } = configured
     files.set('/home/operator/.codex/auth.json', '{"OPENAI_API_KEY":"old"}')
 
     await expect(runtime.apply({
@@ -1121,7 +1133,9 @@ describe('AI credential machine runtime', () => {
 
     await expect(runtime.apply({
       provider: 'codex', payload: '{"OPENAI_API_KEY":"new-secret"}',
-    })).resolves.toEqual({ provider: 'codex', configured: true, status: 'authenticated' })
+    })).resolves.toEqual({
+      provider: 'codex', configured: true, status: 'authenticated', applyGeneration: 1,
+    })
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"new-secret"}')
     expect(files.has('/home/operator/.codex/auth.json.happy-backup')).toBe(false)
   })
@@ -1179,9 +1193,13 @@ describe('AI credential machine runtime', () => {
     expect(statusCalls).toBe(1)
 
     releaseFirst()
-    await Promise.all([first, second])
+    const [firstResult, secondResult] = await Promise.all([first, second])
     expect(statusCalls).toBe(2)
     expect(files.get('/home/operator/.codex/auth.json')).toBe('{"OPENAI_API_KEY":"two"}')
+    expect(firstResult).toMatchObject({ applyGeneration: 1 })
+    expect(secondResult).toMatchObject({ applyGeneration: 2 })
+    expect(JSON.parse(files.get('/home/operator/.happy/ai-credential-apply-generations.json')!))
+      .toEqual({ version: 1, generations: { codex: 2 } })
   })
 
   it('serializes capture behind an in-progress credential replacement', async () => {
