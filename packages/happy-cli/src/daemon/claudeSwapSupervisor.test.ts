@@ -93,6 +93,39 @@ describe('Claude swap supervisor', () => {
     await expect(stopping).rejects.toThrow('claude-swap child failed while stopping')
   })
 
+  it('retains a child that missed the stop deadline so a retry cannot skip termination', async () => {
+    const { supervisor, children, scheduled } = setup()
+    await supervisor.enable()
+
+    const firstStop = supervisor.stop()
+    await vi.waitFor(() => expect(children[0].kill).toHaveBeenCalledWith('SIGTERM'))
+    scheduled[0].callback()
+    await expect(firstStop).rejects.toThrow('claude-swap child did not exit after SIGTERM')
+    expect(children[0].kill).toHaveBeenCalledWith('SIGKILL')
+    expect(supervisor.status()).toEqual({ state: 'blocked', lastErrorKind: 'ROTATION_ERROR' })
+
+    let retryStopped = false
+    const retryStop = supervisor.stop().then(() => { retryStopped = true })
+    await vi.waitFor(() => expect(children[0].kill).toHaveBeenCalledTimes(3))
+    expect(retryStopped).toBe(false)
+    children[0].emit('exit', 0, 'SIGTERM')
+    await retryStop
+  })
+
+  it('settles to stopped when a retained child exits after the stop timeout', async () => {
+    const { supervisor, children, scheduled } = setup()
+    await supervisor.enable()
+
+    const stopping = supervisor.stop()
+    await vi.waitFor(() => expect(children[0].kill).toHaveBeenCalledWith('SIGTERM'))
+    scheduled[0].callback()
+    await expect(stopping).rejects.toThrow('claude-swap child did not exit after SIGTERM')
+
+    children[0].emit('exit', 0, 'SIGKILL')
+
+    expect(supervisor.status()).toEqual({ state: 'stopped', lastErrorKind: null })
+  })
+
   it('records only masked switch metadata from fragmented JSON events', async () => {
     const { supervisor, children } = setup()
     await supervisor.enable()

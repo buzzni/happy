@@ -89,16 +89,22 @@ export class ClaudeSwapSupervisor {
     await new Promise<void>((resolve, reject) => {
       let settled = false
       let timeout: unknown = null
-      const finish = (error?: Error) => {
+      const finish = (error?: Error, retainForRetry = false) => {
         if (settled) return
         settled = true
         if (timeout !== null) this.deps.clearSchedule(timeout)
-        if (error) reject(error)
-        else resolve()
+        if (error) {
+          if (retainForRetry && this.child === null) this.child = running
+          this.currentStatus = { state: 'blocked', lastErrorKind: 'ROTATION_ERROR' }
+          reject(error)
+        } else {
+          resolve()
+        }
       }
       running.on('exit', () => finish())
       running.on('error', () => finish(
         new Error('claude-swap child failed while stopping'),
+        true,
       ))
       timeout = this.deps.schedule(() => {
         try {
@@ -106,12 +112,12 @@ export class ClaudeSwapSupervisor {
         } catch {
           // The failed hard kill is represented by the same fail-closed timeout error.
         }
-        finish(new Error('claude-swap child did not exit after SIGTERM'))
+        finish(new Error('claude-swap child did not exit after SIGTERM'), true)
       }, 5_000)
       try {
         running.kill('SIGTERM')
       } catch {
-        finish(new Error('claude-swap child failed while stopping'))
+        finish(new Error('claude-swap child failed while stopping'), true)
       }
     })
   }
@@ -135,7 +141,10 @@ export class ClaudeSwapSupervisor {
     const scheduleRestart = (lastErrorKind: string) => {
       if (this.child !== child) return
       this.child = null
-      if (!this.enabled) return
+      if (!this.enabled) {
+        this.currentStatus = { state: 'stopped', lastErrorKind: null }
+        return
+      }
       this.currentStatus = {
         ...this.currentStatus,
         state: 'blocked',

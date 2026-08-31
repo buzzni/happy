@@ -1055,14 +1055,18 @@ function parseClaudeListDetails(stdout: string): ClaudeListDetails {
       throw new Error('invalid status')
     }
     const accounts: Array<Record<string, unknown>> = []
+    const accountNumbers = new Set<number>()
     for (const account of parsed.accounts) {
       if (!isObject(account)
         || !Number.isInteger(account.number)
+        || Number(account.number) < 1
         || typeof account.email !== 'string'
         || (account.organizationUuid !== undefined
-          && typeof account.organizationUuid !== 'string')) {
+          && typeof account.organizationUuid !== 'string')
+        || accountNumbers.has(Number(account.number))) {
         throw new Error('invalid account')
       }
+      accountNumbers.add(Number(account.number))
       accounts.push(account)
     }
     const hasUsageStatus = accounts.some(({ usageStatus }) => typeof usageStatus === 'string')
