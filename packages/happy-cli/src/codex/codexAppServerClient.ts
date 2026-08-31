@@ -328,6 +328,7 @@ export class CodexAppServerClient {
             || method === 'turn/completed'
             || method === 'thread/status/changed'
             || method === 'thread/tokenUsage/updated'
+            || method === 'rawResponse/completed'
             || method.startsWith('item/');
 
         if (!isRawNotification) {
@@ -545,6 +546,25 @@ export class CodexAppServerClient {
                     ...tokenUsage,
                 });
             }
+            return true;
+        }
+
+        if (method === 'rawResponse/completed') {
+            const responseId = typeof params?.responseId === 'string' ? params.responseId : '';
+            const usage = params?.usage;
+            if (!responseId || !usage || typeof usage !== 'object') {
+                logger.warn('[CodexAppServer] Ignoring malformed rawResponse/completed usage notification');
+                return true;
+            }
+            const threadId = typeof params?.threadId === 'string' ? params.threadId : undefined;
+            const turnId = typeof params?.turnId === 'string' ? params.turnId : undefined;
+            this.eventHandler?.({
+                type: 'codex_usage',
+                ...(threadId ? { thread_id: threadId } : {}),
+                ...(turnId ? { turn_id: turnId } : {}),
+                response_id: responseId,
+                usage,
+            });
             return true;
         }
 
@@ -1231,6 +1251,7 @@ export class CodexAppServerClient {
         if (!pending) return;
         const isTurnActivity = method === 'turn/started'
             || method === 'thread/tokenUsage/updated'
+            || method === 'rawResponse/completed'
             || method === 'turn/diff/updated'
             || method.startsWith('item/')
             || method === 'codex/event'
