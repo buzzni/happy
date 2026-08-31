@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -220,5 +220,46 @@ describe('CheckpointRestorePlanner', () => {
         });
 
         expect(plan.entries).toEqual([]);
+    });
+
+    it('reports a conflict instead of following a symlinked parent outside the project', async () => {
+        await mkdir(join(projectPath, 'src'));
+        await writeFile(join(projectPath, 'src', 'tracked.txt'), 'before\n');
+        const snapshot = await new CheckpointStore(checkpointRoot).snapshotTurn({
+            ...binding,
+            operationId: 'turn-1',
+            projectPath,
+        });
+        await writeFile(join(projectPath, 'src', 'tracked.txt'), 'agent version\n');
+        await new CheckpointLedger(checkpointRoot).recordMutation({
+            ...binding,
+            operationId: 'turn-1',
+            mutationId: 'mutation-1',
+            projectPath,
+            path: 'src/tracked.txt',
+            action: 'written',
+        });
+        const outsidePath = join(fixtureRoot, 'outside');
+        await mkdir(outsidePath);
+        await writeFile(join(outsidePath, 'tracked.txt'), 'agent version\n');
+        await rm(join(projectPath, 'src'), { recursive: true });
+        await symlink(outsidePath, join(projectPath, 'src'), 'dir');
+
+        const plan = await new CheckpointRestorePlanner(checkpointRoot).plan({
+            ...binding,
+            projectPath,
+            checkpointId: snapshot.checkpointId,
+        });
+
+        expect(plan.entries).toContainEqual({
+            path: 'src/tracked.txt',
+            action: 'conflict',
+            reason: 'unsafe-path',
+        });
+        expect(plan.entries).not.toContainEqual({
+            path: 'src/tracked.txt',
+            action: 'restore',
+            reason: 'agent-modified',
+        });
     });
 });

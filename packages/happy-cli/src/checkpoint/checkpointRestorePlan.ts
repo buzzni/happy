@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import { createReadStream, type Stats } from 'node:fs';
 import { lstat, mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { CheckpointLedger, type CheckpointLedgerBinding } from './checkpointLedger';
@@ -15,7 +15,7 @@ export type CheckpointRestorePlanEntry =
     | { path: string; action: 'restore'; reason: 'agent-modified' | 'agent-deleted' }
     | { path: string; action: 'delete'; reason: 'agent-created' }
     | { path: string; action: 'skip'; reason: 'user-modified' | 'provenance-unknown' }
-    | { path: string; action: 'conflict'; reason: 'unsupported-file-type' };
+    | { path: string; action: 'conflict'; reason: 'unsupported-file-type' | 'unsafe-path' };
 
 export type CheckpointRestorePlanRequest = CheckpointLedgerBinding & {
     checkpointId: string;
@@ -29,7 +29,7 @@ export type CheckpointRestorePlan = {
 type CurrentFileState =
     | { kind: 'missing' }
     | { kind: 'regular'; contentHash: string }
-    | { kind: 'unsupported' };
+    | { kind: 'unsupported'; reason: 'unsupported-file-type' | 'unsafe-path' };
 
 export class CheckpointRestorePlanner {
     private readonly checkpointRoot: string;
@@ -64,13 +64,13 @@ export class CheckpointRestorePlanner {
                 continue;
             }
             const [current, targetHash] = await Promise.all([
-                readCurrentFileState(resolve(projectPath, path)),
+                readCurrentFileState(projectPath, path),
                 this.readCheckpointFileHash(request, path, projectPath),
             ]);
             if (current.kind === 'regular' && current.contentHash === targetHash) continue;
             if (current.kind === 'missing' && targetHash === null) continue;
             if (current.kind === 'unsupported') {
-                entries.push({ path, action: 'conflict', reason: 'unsupported-file-type' });
+                entries.push({ path, action: 'conflict', reason: current.reason });
             } else if (record.action === 'written' && current.kind === 'regular') {
                 entries.push(current.contentHash === record.contentHash
                     ? targetHash === null
@@ -179,20 +179,48 @@ function validateCheckpointId(checkpointId: string): void {
     }
 }
 
-async function readCurrentFileState(path: string): Promise<CurrentFileState> {
+async function readCurrentFileState(
+    projectPath: string,
+    path: string,
+): Promise<CurrentFileState> {
+    const segments = path.split('/');
+    if (
+        segments.length === 0
+        || segments.some((segment) => segment.length === 0 || segment === '.' || segment === '..')
+    ) {
+        return { kind: 'unsupported', reason: 'unsafe-path' };
+    }
+    let currentPath = projectPath;
+    for (const segment of segments.slice(0, -1)) {
+        currentPath = join(currentPath, segment);
+        const parent = await lstatOrMissing(currentPath);
+        if (parent === null) return { kind: 'missing' };
+        if (parent.isSymbolicLink()) return { kind: 'unsupported', reason: 'unsafe-path' };
+        if (!parent.isDirectory()) {
+            return { kind: 'unsupported', reason: 'unsupported-file-type' };
+        }
+    }
+    const absolutePath = join(currentPath, segments.at(-1)!);
+    const stats = await lstatOrMissing(absolutePath);
+    if (stats === null) return { kind: 'missing' };
+    if (stats.isSymbolicLink()) return { kind: 'unsupported', reason: 'unsafe-path' };
+    if (!stats.isFile()) return { kind: 'unsupported', reason: 'unsupported-file-type' };
+    const hash = createHash('sha256');
+    for await (const chunk of createReadStream(absolutePath)) hash.update(chunk);
+    return { kind: 'regular', contentHash: hash.digest('hex') };
+}
+
+async function lstatOrMissing(path: string): Promise<Stats | null> {
     let stats;
     try {
         stats = await lstat(path);
     } catch (error) {
         if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
-            return { kind: 'missing' };
+            return null;
         }
         throw error;
     }
-    if (!stats.isFile()) return { kind: 'unsupported' };
-    const hash = createHash('sha256');
-    for await (const chunk of createReadStream(path)) hash.update(chunk);
-    return { kind: 'regular', contentHash: hash.digest('hex') };
+    return stats;
 }
 
 function checkpointGitEnvironment(
