@@ -6,6 +6,7 @@ import {
   getCodexMultiAuthProxyStatus,
   isManagedCodexRotationSettings,
 } from '../codex/codexMultiAuthProxy'
+import { overlayManagedCredentialEnvironment } from './sessionEnv'
 
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 const CLAUDE_SWAP_VERSION = '0.25.0'
@@ -13,7 +14,7 @@ const CLAUDE_STATUS_TIMEOUT_MS = 120_000
 const CODEX_MULTI_AUTH_VERSION = '2.8.5'
 const CODEX_MULTI_AUTH_THRESHOLD = 5
 
-export type AiCredentialProvider = 'claude' | 'codex'
+export type AiCredentialProvider = 'claude' | 'codex' | 'zai'
 
 export type TrialAiCredentialLeaseMarker = {
   leaseId: string
@@ -29,6 +30,7 @@ type TrialAiCredentialMarkerFile = {
 export type AiCredentialCommandResult = {
   stdout: string
   stderr: string
+  exitCode?: number
 }
 
 export type AiCredentialRotationStatus = {
@@ -44,6 +46,8 @@ export type AiCredentialRotationStatus = {
 type CommandOptions = {
   maxOutputBytes?: number
   timeoutMs?: number
+  acceptNonZeroExit?: boolean
+  environment?: NodeJS.ProcessEnv
 }
 
 type Supervisor = {
@@ -139,7 +143,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   function provider(value: unknown): AiCredentialProvider {
-    if (value !== 'claude' && value !== 'codex') {
+    if (value !== 'claude' && value !== 'codex' && value !== 'zai') {
       throw new AiCredentialRuntimeError('UNSUPPORTED_PROVIDER')
     }
     return value
@@ -198,12 +202,14 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         throw new Error('invalid marker')
       }
       const leases: TrialAiCredentialMarkerFile['leases'] = {}
-      for (const selected of ['claude', 'codex'] as const) {
+      for (const selected of ['claude', 'codex', 'zai'] as const) {
         if (parsed.leases[selected] !== undefined) {
           leases[selected] = trialLease(parsed.leases[selected])
         }
       }
-      if (Object.keys(parsed.leases).some((key) => key !== 'claude' && key !== 'codex')) {
+      if (Object.keys(parsed.leases).some((key) => (
+        key !== 'claude' && key !== 'codex' && key !== 'zai'
+      ))) {
         throw new Error('invalid provider')
       }
       return { version: 1, leases }
@@ -221,6 +227,9 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   async function capture(input: { provider: AiCredentialProvider }) {
     const selected = provider(input?.provider)
     return serialize(() => withSafeErrors(`${selected.toUpperCase()}_CAPTURE_FAILED`, async () => {
+      if (selected === 'zai') {
+        throw new AiCredentialRuntimeError('ZAI_CAPTURE_UNSUPPORTED')
+      }
       let payload: string
       if (selected === 'claude') {
         const result = await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })
@@ -267,6 +276,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   async function applyClaude(payload: string) {
+    await purgeManagedProvider('zai')
     await ensureClaudeSwap()
     const tempDir = await deps.makeTempDir()
     const tempFile = join(tempDir, 'claude-swap.json')
@@ -490,6 +500,82 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     }
   }
 
+  function zaiEnvironmentPath(): string {
+    return join(deps.homeDir, '.happy', 'zai-claude-env.json')
+  }
+
+  function parseZaiPayload(payload: string): Record<string, string> {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(payload)
+    } catch {
+      throw new AiCredentialRuntimeError('ZAI_PAYLOAD_INVALID')
+    }
+    if (!isObject(parsed)
+      || parsed.version !== 1
+      || parsed.kind !== 'zai-anthropic'
+      || typeof parsed.apiKey !== 'string'
+      || !/^[\x21-\x7e]{1,1024}$/.test(parsed.apiKey)) {
+      throw new AiCredentialRuntimeError('ZAI_PAYLOAD_INVALID')
+    }
+    return {
+      ANTHROPIC_AUTH_TOKEN: parsed.apiKey,
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+      API_TIMEOUT_MS: '3000000',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7',
+    }
+  }
+
+  function parseZaiEnvironment(raw: string): Record<string, string> {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      throw new AiCredentialRuntimeError('ZAI_ENV_INVALID')
+    }
+    if (!isObject(parsed)) throw new AiCredentialRuntimeError('ZAI_ENV_INVALID')
+    const values = Object.values(parsed)
+    if (Object.keys(parsed).length !== 6
+      || values.some((value) => typeof value !== 'string')
+      || parsed.ANTHROPIC_BASE_URL !== 'https://api.z.ai/api/anthropic'
+      || parsed.API_TIMEOUT_MS !== '3000000'
+      || parsed.ANTHROPIC_DEFAULT_OPUS_MODEL !== 'glm-5.3'
+      || parsed.ANTHROPIC_DEFAULT_SONNET_MODEL !== 'glm-4.7'
+      || parsed.ANTHROPIC_DEFAULT_HAIKU_MODEL !== 'glm-4.7'
+      || typeof parsed.ANTHROPIC_AUTH_TOKEN !== 'string'
+      || !/^[\x21-\x7e]{1,1024}$/.test(parsed.ANTHROPIC_AUTH_TOKEN)) {
+      throw new AiCredentialRuntimeError('ZAI_ENV_INVALID')
+    }
+    return parsed as Record<string, string>
+  }
+
+  function isAuthenticatedZaiProbe(raw: string): boolean {
+    try {
+      const parsed = JSON.parse(raw) as unknown
+      return isObject(parsed)
+        && typeof parsed.result === 'string'
+        && parsed.result.trim() === 'CLAUDE_AUTH_OK'
+    } catch {
+      return false
+    }
+  }
+
+  function isRejectedZaiAuthentication(probe: AiCredentialCommandResult): boolean {
+    const diagnostic = `${probe.stdout}\n${probe.stderr}`
+    return /\b401\b|\bunauthorized\b|authentication[_ -]*error|invalid[_ -]*(?:api[_ -]*)?key/i
+      .test(diagnostic)
+  }
+
+  async function applyZai(payload: string) {
+    const environment = parseZaiPayload(payload)
+    await purgeManagedProvider('claude')
+    await deps.mkdir(join(deps.homeDir, '.happy'), { recursive: true, mode: 0o700 })
+    await writeAtomicFile(deps, zaiEnvironmentPath(), JSON.stringify(environment))
+    return { provider: 'zai' as const, configured: true, accountCount: 1 }
+  }
+
   async function apply(input: {
     provider: AiCredentialProvider
     payload: string
@@ -503,18 +589,51 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return serialize(() => withSafeErrors(
       `${selected.toUpperCase()}_APPLY_FAILED`,
       async () => {
+        let requestedLease: TrialAiCredentialLeaseMarker | undefined
+        let marker: TrialAiCredentialMarkerFile | undefined
+        let previousLease: TrialAiCredentialLeaseMarker | undefined
         if (input.trialLease !== undefined) {
-          const requestedLease = trialLease(input.trialLease)
-          const marker = await readTrialMarker()
+          requestedLease = trialLease(input.trialLease)
+          marker = await readTrialMarker()
           const currentLease = marker.leases[selected]
           if (currentLease && currentLease.leaseId !== requestedLease.leaseId) {
             throw new AiCredentialRuntimeError('TRIAL_LEASE_CONFLICT')
           }
+          const conflictingClaudeRuntime = selected === 'zai'
+            ? marker.leases.claude
+            : selected === 'claude'
+              ? marker.leases.zai
+              : undefined
+          if (conflictingClaudeRuntime) {
+            throw new AiCredentialRuntimeError('TRIAL_LEASE_CONFLICT')
+          }
+          previousLease = currentLease
           marker.leases[selected] = requestedLease
           await writeTrialMarker(marker)
         }
-        if (selected === 'claude') return applyClaude(input.payload)
-        return applyCodex(input.payload)
+        try {
+          return selected === 'claude'
+            ? await applyClaude(input.payload)
+            : selected === 'zai'
+              ? await applyZai(input.payload)
+              : await applyCodex(input.payload)
+        } catch (error) {
+          if (requestedLease && marker) {
+            if (previousLease) marker.leases[selected] = previousLease
+            else delete marker.leases[selected]
+            try {
+              if (Object.keys(marker.leases).length === 0) {
+                await deps.rm(trialMarkerPath(), { force: true })
+              } else {
+                await writeTrialMarker(marker)
+              }
+            } catch {
+              // Keep the newly written ownership marker when rollback fails so
+              // the server can still issue a matching purge RPC.
+            }
+          }
+          throw error
+        }
       },
     ))
   }
@@ -526,6 +645,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       await deps.rm(join(claudeConfig, '.credentials.json'), { force: true })
       await deps.rm(join(deps.homeDir, '.claude-swap'), { recursive: true, force: true })
       await deps.rm(join(deps.homeDir, '.config', 'claude-swap'), { recursive: true, force: true })
+      return
+    }
+    if (selected === 'zai') {
+      await deps.rm(zaiEnvironmentPath(), { force: true })
       return
     }
     const home = codexHome()
@@ -563,6 +686,60 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   async function status(input: { provider: AiCredentialProvider }) {
     const selected = provider(input?.provider)
     return serialize(() => withSafeErrors(`${selected.toUpperCase()}_STATUS_FAILED`, async () => {
+      if (selected === 'zai') {
+        const marker = await readTrialMarker()
+        if (!marker.leases.zai) {
+          return { provider: selected, configured: false, accountCount: 0 }
+        }
+        let environment: Record<string, string>
+        try {
+          environment = parseZaiEnvironment(await deps.readFile(zaiEnvironmentPath()))
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT'
+            || (error instanceof AiCredentialRuntimeError && error.kind === 'ZAI_ENV_INVALID')) {
+            return { provider: selected, configured: false, accountCount: 0 }
+          }
+          throw error
+        }
+        const probe = await deps.execFile(
+          'claude',
+          [
+            '--print',
+            '--no-session-persistence',
+            '--safe-mode',
+            '--output-format',
+            'json',
+            '--model',
+            'sonnet',
+            '--tools',
+            '',
+            'Reply with exactly: CLAUDE_AUTH_OK',
+          ],
+          {
+            maxOutputBytes: MAX_PAYLOAD_BYTES,
+            timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+            acceptNonZeroExit: true,
+            environment: overlayManagedCredentialEnvironment(
+              Object.fromEntries(
+                Object.entries(deps.env).filter(
+                  (entry): entry is [string, string] => entry[1] !== undefined,
+                ),
+              ),
+              environment,
+            ),
+          },
+        )
+        if (probe.exitCode !== undefined && probe.exitCode !== 0) {
+          if (isRejectedZaiAuthentication(probe)) {
+            return { provider: selected, configured: false, accountCount: 0 }
+          }
+          throw new AiCredentialRuntimeError('ZAI_PROBE_FAILED')
+        }
+        if (!isAuthenticatedZaiProbe(probe.stdout)) {
+          return { provider: selected, configured: false, accountCount: 0 }
+        }
+        return { provider: selected, configured: true, accountCount: 1 }
+      }
       if (selected === 'codex') {
         const root = codexMultiAuthDir()
         const bundle = parseCodexMultiAuthBundle(JSON.stringify({
@@ -637,7 +814,16 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     }))
   }
 
-  return { capture, apply, purge, status, rotation }
+  async function sessionEnvironment(agent: string | undefined): Promise<Record<string, string>> {
+    if (agent !== undefined && agent !== 'claude') return {}
+    return serialize(async () => {
+      const marker = await readTrialMarker()
+      if (!marker.leases.zai) return {}
+      return parseZaiEnvironment(await deps.readFile(zaiEnvironmentPath()))
+    })
+  }
+
+  return { capture, apply, purge, status, rotation, sessionEnvironment }
 }
 
 type ClaudeListDetails = {
@@ -891,10 +1077,14 @@ async function writeAtomicFile(
   content: string,
 ): Promise<void> {
   const tempPath = `${path}.happy-tmp`
-  await deps.writeFile(tempPath, content, { mode: 0o600 })
-  await deps.chmod(tempPath, 0o600)
-  await deps.rename(tempPath, path)
-  await deps.chmod(path, 0o600)
+  try {
+    await deps.writeFile(tempPath, content, { mode: 0o600 })
+    await deps.chmod(tempPath, 0o600)
+    await deps.rename(tempPath, path)
+  } catch (error) {
+    await deps.rm(tempPath, { force: true }).catch(() => undefined)
+    throw error
+  }
 }
 
 async function withSafeErrors<T>(kind: string, operation: () => Promise<T>): Promise<T> {
@@ -957,7 +1147,8 @@ export function runAiCredentialCommand(
 ): Promise<AiCredentialCommandResult> {
   return new Promise((resolve, reject) => {
     const child = spawnCommand(command, args, {
-      env: command === 'cswap' ? withUvToolBinOnPath() : process.env,
+      env: options.environment
+        ?? (command === 'cswap' ? withUvToolBinOnPath() : process.env),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     })
@@ -992,12 +1183,15 @@ export function runAiCredentialCommand(
       settled = true
       if (timeout) clearTimeout(timeout)
       if (code !== 0) {
-        reject(new AiCredentialRuntimeError('COMMAND_FAILED'))
-        return
+        if (!options.acceptNonZeroExit) {
+          reject(new AiCredentialRuntimeError('COMMAND_FAILED'))
+          return
+        }
       }
       resolve({
         stdout: Buffer.concat(stdout).toString('utf8'),
         stderr: Buffer.concat(stderr).toString('utf8'),
+        ...(options.acceptNonZeroExit && { exitCode: code ?? -1 }),
       })
     })
     timeout = setTimeout(() => fail('COMMAND_TIMED_OUT'), options.timeoutMs ?? 30_000)

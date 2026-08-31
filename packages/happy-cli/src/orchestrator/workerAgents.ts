@@ -19,6 +19,7 @@
  */
 
 import type { AgentDefinition } from '@anthropic-ai/claude-agent-sdk'
+import { normalizeClaudeModelForRuntime } from '@/utils/initialPrompt'
 
 /** The single subagent name the orchestrator prompt tells the model to delegate to. */
 export const WORKER_AGENT_NAME = 'worker'
@@ -76,7 +77,7 @@ const DELEGATION_PROMPT = [
 /** Reads the per-session worker config from a process env-like record (pure). */
 export function readWorkerConfigFromEnv(env: Record<string, string | undefined>): WorkerConfig {
     return {
-        workerModel: env.HAPPY_WORKER_MODEL,
+        workerModel: normalizeClaudeModelForRuntime(env.HAPPY_WORKER_MODEL, env),
         workerEffort: env.HAPPY_WORKER_EFFORT,
     }
 }

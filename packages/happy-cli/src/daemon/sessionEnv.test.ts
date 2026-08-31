@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
+    buildManagedSessionSpawnEnvironment,
     buildResumedSessionSpawnEnvironment,
     buildSessionSpawnEnvironment,
     captureSaycodeAgentEnvironment,
+    stripManagedCredentialConflicts,
     scrubSessionLineageEnv,
     SESSION_LINEAGE_ENV_PREFIXES,
 } from './sessionEnv'
+import { expandEnvironmentVariables } from '../utils/expandEnvVars'
 
 describe('scrubSessionLineageEnv', () => {
     it('removes reconnect and fork lineage variables while keeping everything else', () => {
@@ -67,6 +70,65 @@ describe('scrubSessionLineageEnv', () => {
 })
 
 describe('buildSessionSpawnEnvironment', () => {
+    it('lets daemon-managed credentials override inherited and caller-supplied auth fields', () => {
+        expect(buildManagedSessionSpawnEnvironment({
+            PATH: '/usr/bin',
+            ANTHROPIC_API_KEY: 'inherited-api-key',
+            CLAUDE_CODE_OAUTH_TOKEN: 'inherited-oauth-token',
+            ANTHROPIC_MODEL: 'claude-opus-5',
+            ANTHROPIC_SMALL_FAST_MODEL: 'claude-haiku-4-5',
+            CLAUDE_CODE_USE_BEDROCK: '1',
+            ANTHROPIC_CUSTOM_HEADERS: 'x-api-key: inherited-key',
+        }, {
+            SAFE: 'value',
+            ANTHROPIC_AUTH_TOKEN: 'caller-token',
+            ANTHROPIC_BASE_URL: 'https://caller.invalid',
+            CLAUDE_CODE_USE_VERTEX: '1',
+            CLAUDE_CODE_USE_FOUNDRY: '1',
+            ANTHROPIC_CUSTOM_HEADERS: 'x-api-key: caller-key',
+        }, {
+            ANTHROPIC_AUTH_TOKEN: 'managed-token',
+            ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+        })).toEqual({
+            PATH: '/usr/bin',
+            SAFE: 'value',
+            ANTHROPIC_AUTH_TOKEN: 'managed-token',
+            ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+        })
+    })
+
+    it('keeps caller model overrides for native Claude credentials', () => {
+        expect(buildManagedSessionSpawnEnvironment({}, {
+            ANTHROPIC_MODEL: 'claude-opus-5',
+            ANTHROPIC_SMALL_FAST_MODEL: 'claude-haiku-4-5',
+        }, {
+            CLAUDE_CODE_OAUTH_TOKEN: 'managed-oauth-token',
+        })).toMatchObject({
+            ANTHROPIC_MODEL: 'claude-opus-5',
+            ANTHROPIC_SMALL_FAST_MODEL: 'claude-haiku-4-5',
+        })
+    })
+
+    it('keeps managed credential secrets out of caller variable expansion', () => {
+        const managed = {
+            ANTHROPIC_AUTH_TOKEN: 'managed-${MUST_STAY_LITERAL}',
+            ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+        }
+        const requested = stripManagedCredentialConflicts({
+            SAFE: '${EXPAND_ME}',
+            ANTHROPIC_AUTH_TOKEN: '${MISSING_CALLER_TOKEN}',
+            ANTHROPIC_API_KEY: '${MISSING_NATIVE_KEY}',
+            CLAUDE_CODE_OAUTH_TOKEN: '${MISSING_NATIVE_OAUTH}',
+        }, managed)
+
+        expect(expandEnvironmentVariables(requested, { EXPAND_ME: 'expanded' })).toEqual({
+            SAFE: 'expanded',
+        })
+        expect(buildManagedSessionSpawnEnvironment({}, requested, managed)).toMatchObject({
+            ANTHROPIC_AUTH_TOKEN: 'managed-${MUST_STAY_LITERAL}',
+        })
+    })
+
     it('scrubs inherited lineage before applying the explicit spawn environment', () => {
         expect(buildSessionSpawnEnvironment(
             {

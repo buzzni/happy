@@ -55,10 +55,12 @@ import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import {
+  buildManagedSessionSpawnEnvironment,
   buildResumedSessionSpawnEnvironment,
-  buildSessionSpawnEnvironment,
   captureSaycodeAgentEnvironment,
+  overlayManagedCredentialEnvironment,
   SESSION_LINEAGE_ENV_PREFIXES,
+  stripManagedCredentialConflicts,
 } from './sessionEnv';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
@@ -780,6 +782,10 @@ export async function startDaemon(): Promise<void> {
       persistResumeCursorIfDue(trackedSession);
     };
 
+    let resolveManagedAiCredentialEnvironment = async (
+      _agent: string | undefined,
+    ): Promise<Record<string, string>> => ({});
+
     // Spawn a new session (sessionId reserved for future --resume functionality)
     const spawnSession = async (
       options: SpawnSessionOptions,
@@ -932,10 +938,11 @@ export async function startDaemon(): Promise<void> {
           logger.debug(`[DAEMON RUN] User credentials staged at ${homeDir}/access.key`);
         }
 
-        let extraEnv: Record<string, string> = injectMcpCallerGrant({
+        const managedAiCredentialEnvironment = await resolveManagedAiCredentialEnvironment(options.agent);
+        let extraEnv: Record<string, string> = injectMcpCallerGrant(stripManagedCredentialConflicts({
           ...authEnv,
           ...(options.environmentVariables ?? {}),
-        }, mcpCallerGrant, process.env.HAPPY_APLUS_MCP_CONFIG_URL, mcpConfigProjectId, options.expectedConnectors, 'spawn');
+        }, managedAiCredentialEnvironment), mcpCallerGrant, process.env.HAPPY_APLUS_MCP_CONFIG_URL, mcpConfigProjectId, options.expectedConnectors, 'spawn');
         if (options.parentSessionId) {
           extraEnv.HAPPY_FORKED_FROM_SESSION_ID = options.parentSessionId;
         }
@@ -998,6 +1005,14 @@ export async function startDaemon(): Promise<void> {
             errorMessage
           };
         }
+
+        // Managed credentials are already validated by the credential runtime.
+        // Overlay them only after caller variable expansion so secret text such
+        // as `${...}` is never interpreted as a daemon environment reference.
+        extraEnv = overlayManagedCredentialEnvironment(
+          extraEnv,
+          managedAiCredentialEnvironment,
+        );
 
         // Initial prompt (scheduled automations 등): 불투명한 사용자 텍스트라
         // 위의 ${VAR} 확장·검증을 통과시키면 안 된다 — 프롬프트 속 "${FOO}"는
@@ -1110,7 +1125,11 @@ export async function startDaemon(): Promise<void> {
           const windowName = `happy-${Date.now()}-${agent}`;
           // Explicit agent auth and task callbacks are overlaid after inherited
           // credentials are filtered, so isolated tasks keep only what they need.
-          const tmuxEnv = buildSessionSpawnEnvironment(inheritedSpawnEnvironment, extraEnv);
+          const tmuxEnv = buildManagedSessionSpawnEnvironment(
+            inheritedSpawnEnvironment,
+            extraEnv,
+            managedAiCredentialEnvironment,
+          );
 
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
             sessionName: tmuxSessionName,
@@ -1199,7 +1218,11 @@ export async function startDaemon(): Promise<void> {
             // scrub: 상속된 lineage env(HAPPY_RECONNECT_*/HAPPY_FORK*)가 새
             // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
             // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
-            env: buildSessionSpawnEnvironment(inheritedSpawnEnvironment, extraEnv),
+            env: buildManagedSessionSpawnEnvironment(
+              inheritedSpawnEnvironment,
+              extraEnv,
+              managedAiCredentialEnvironment,
+            ),
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
             userHomeDir: stagedUserHomeDir,
@@ -1568,13 +1591,15 @@ export async function startDaemon(): Promise<void> {
           ? await stageInitialPromptEnvironment(options.automation.initialPrompt)
           : null;
 
+        const resumeAgent = launch.args[0] === 'codex' ? 'codex' : 'claude';
         const inheritedResumeEnvironment = resolveInheritedSpawnEnvironment({
-          agent: launch.args[0] === 'codex' ? 'codex' : 'claude',
+          agent: resumeAgent,
           env: process.env,
           filterCredentials: options?.automation !== undefined,
         });
+        const managedAiCredentialEnvironment = await resolveManagedAiCredentialEnvironment(resumeAgent);
         const mcpEnvironment = prepareMcpChildEnvironment({
-          environmentVariables: buildResumedSessionSpawnEnvironment({
+          environmentVariables: overlayManagedCredentialEnvironment(buildResumedSessionSpawnEnvironment({
             inherited: inheritedResumeEnvironment,
             runtime: options?.environmentVariables,
             automation: options?.automation?.environmentVariables,
@@ -1593,7 +1618,7 @@ export async function startDaemon(): Promise<void> {
             },
             agentEnvironment: tracked.agentEnvironment,
             sessionId: happySessionId,
-          }),
+          }), managedAiCredentialEnvironment),
           mcpCallerGrantEnvelope: options?.mcpCallerGrantEnvelope,
           mcpConfigProjectId: options?.mcpConfigProjectId,
           expectedConnectors: options?.expectedConnectors,
@@ -2192,6 +2217,7 @@ export async function startDaemon(): Promise<void> {
     stopClaudeSwapSupervisor = () => claudeSwapSupervisor.shutdown();
     await claudeSwapSupervisor.restore();
     const aiCredentialRuntime = createNodeAiCredentialRuntime(claudeSwapSupervisor);
+    resolveManagedAiCredentialEnvironment = (agent) => aiCredentialRuntime.sessionEnvironment(agent);
     let activeServerAutomationLeaseCount = 0;
     apiMachine.setAutomationKey(machineAutomationKey, (keyVersion) => {
       machineAutomationKey = updateMachineAutomationKeyRegistration(
