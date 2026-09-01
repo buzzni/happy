@@ -207,7 +207,12 @@ const EXPECTED_NEXT_DAEMON_TICK_MS = 60_000
 export const MAX_GITHUB_EVENTS_PER_TICK = 3
 // 동시에 살아 있을 수 있는 GitHub 워커 세션 수. 위와 다른 개념이다 — 유입 속도와
 // 동시 실행 수를 한 상수로 묶으면 둘 중 하나만 바꾸고 싶을 때 다른 하나가 끌려간다.
-export const MAX_GITHUB_WORKER_SESSIONS = 3
+//
+// 워커 하나가 에이전트 세션 하나라 메모리·CPU 를 쓴다. 2026-09-01 프로덕션 머신
+// 실측(12코어 load 5.24, 가용 메모리 30GB, 이미 에이전트 프로세스 113개)에서 여유가
+// 있어 3 → 6 으로 올렸다. 유입은 MAX_GITHUB_EVENTS_PER_TICK 이 틱당 3건으로 계속
+// 잡아 주므로, 한 번에 몰려도 상한까지 두 틱에 걸쳐 올라간다.
+export const MAX_GITHUB_WORKER_SESSIONS = 6
 const DIRTY_WORKTREE_RETRY_MS = 15 * 60_000
 const WORKTREE_CLEANUP_RETRY_MS = 60_000
 const PR_REVIEW_SANDBOX_CONFIG = JSON.stringify({
