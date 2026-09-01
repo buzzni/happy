@@ -22,6 +22,7 @@ import { isPermanentGithubTriggerFailure } from './githubTriggerPermanentFailure
 import {
   ensureAgentTaskReviewObjects,
   reviewShasFromDispatchInput,
+  reviewWorktreeRequestFromDispatchInput,
 } from './agentTaskReviewObjects'
 import { shouldGiveUpWorktreeCleanup } from './worktreeCleanupGiveUp'
 import type { GithubTriggerWorktreePlan } from './githubTriggerWorktree'
@@ -1166,6 +1167,15 @@ async function executeStartedRun(
       }
       agentTaskDispatch = bridged.dispatch
       if (bridged.dispatch.type === 'pr_review.v1') {
+        // 리뷰 대상 head 로 체크아웃된 전용 worktree 에서 돌린다. 프로젝트 디렉터리에서
+        // 그대로 돌면 HEAD 가 사용자가 마지막에 둔 커밋이라, 워커가 대상 SHA 테스트를
+        // 실행할 수 없고 호출부도 git show 로 한 장씩 읽어야 한다.
+        githubWorktreeRequest = reviewWorktreeRequestFromDispatchInput(bridged.dispatch.input)
+          ? {
+            ...reviewWorktreeRequestFromDispatchInput(bridged.dispatch.input)!,
+            ...(query.githubEnvironment ? { githubEnvironment: query.githubEnvironment } : {}),
+          }
+          : null
         const shas = reviewShasFromDispatchInput(bridged.dispatch.input)
         if (shas.length > 0) {
           const provisioned = await (input.ensureReviewObjects ?? ensureAgentTaskReviewObjects)({
@@ -1329,6 +1339,16 @@ async function executeStartedRun(
       input.logDebug?.(
         `[server-automation] ${automation.automationId} GitHub worktree preparation failed: ${prepared.error}`,
       )
+      // AgentTask 는 이 시점에 서버가 task 를 이미 확정했다. 여기서 중단하면 그 task 는
+      // 워커 없이 lease 만료까지 남는다. worktree 는 리뷰 품질을 올려 주는 것이지
+      // 전제가 아니므로, 준비에 실패하면 기존처럼 프로젝트 디렉터리에서 계속한다 —
+      // 그 경우 대상 SHA 테스트는 못 돌지만 immutable diff 로 리뷰 자체는 된다.
+      if (agentTaskDispatch) {
+        input.logDebug?.(
+          `[server-automation] ${automation.automationId} reviewing in the project directory instead`
+          + ' — the worker cannot run target-SHA tests there',
+        )
+      } else {
       // 되돌릴 수 없는 실패(삭제된 브랜치 등)는 재시도해도 결과가 같다. ERROR 로
       // 돌아가면 이 경로가 persistGithubTriggerState 에 도달하지 않아 이벤트가
       // 소비되지 않고 매분 재시도된다(2026-08-29: 머지 후 삭제된 브랜치 하나가
@@ -1347,8 +1367,10 @@ async function executeStartedRun(
         outcome: 'ERROR', sessionId: null,
         ...(degradedCode ? { degradedCode } : {}),
       }
+      }
+    } else {
+      githubWorktree = prepared
     }
-    githubWorktree = prepared
   }
   const initialPrompt = buildAutomationPrompt(prompt, scriptOutput)
   const spawnInput = {
