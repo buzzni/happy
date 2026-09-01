@@ -62,20 +62,64 @@ export class ClaudeSwapSupervisor {
       this.enabled = wasEnabled
       throw error
     }
-    this.shutdown()
+    await this.terminateChild()
   }
 
   shutdown(): void {
+    const running = this.detachChild()
+    if (running) running.kill('SIGTERM')
+  }
+
+  private detachChild(): ClaudeSwapChild | null {
     if (this.restartHandle !== null) {
       this.deps.clearSchedule(this.restartHandle)
       this.restartHandle = null
     }
     const running = this.child
     this.child = null
-    if (running) running.kill('SIGTERM')
     this.restartAttempts = 0
     this.stdoutBuffer = ''
     this.currentStatus = { state: 'stopped', lastErrorKind: null }
+    return running
+  }
+
+  private async terminateChild(): Promise<void> {
+    const running = this.detachChild()
+    if (!running) return
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      let timeout: unknown = null
+      const finish = (error?: Error, retainForRetry = false) => {
+        if (settled) return
+        settled = true
+        if (timeout !== null) this.deps.clearSchedule(timeout)
+        if (error) {
+          if (retainForRetry && this.child === null) this.child = running
+          this.currentStatus = { state: 'blocked', lastErrorKind: 'ROTATION_ERROR' }
+          reject(error)
+        } else {
+          resolve()
+        }
+      }
+      running.on('exit', () => finish())
+      running.on('error', () => finish(
+        new Error('claude-swap child failed while stopping'),
+        true,
+      ))
+      timeout = this.deps.schedule(() => {
+        try {
+          running.kill('SIGKILL')
+        } catch {
+          // The failed hard kill is represented by the same fail-closed timeout error.
+        }
+        finish(new Error('claude-swap child did not exit after SIGTERM'), true)
+      }, 5_000)
+      try {
+        running.kill('SIGTERM')
+      } catch {
+        finish(new Error('claude-swap child failed while stopping'), true)
+      }
+    })
   }
 
   status(): AiCredentialRotationStatus {
@@ -97,7 +141,10 @@ export class ClaudeSwapSupervisor {
     const scheduleRestart = (lastErrorKind: string) => {
       if (this.child !== child) return
       this.child = null
-      if (!this.enabled) return
+      if (!this.enabled) {
+        this.currentStatus = { state: 'stopped', lastErrorKind: null }
+        return
+      }
       this.currentStatus = {
         ...this.currentStatus,
         state: 'blocked',
@@ -110,7 +157,18 @@ export class ClaudeSwapSupervisor {
         this.start()
       }, delay)
     }
-    child.on('error', () => scheduleRestart('PROCESS_START_FAILED'))
+    child.on('error', () => {
+      if (child.pid === undefined) {
+        scheduleRestart('PROCESS_START_FAILED')
+        return
+      }
+      if (this.child !== child) return
+      this.currentStatus = {
+        ...this.currentStatus,
+        state: 'blocked',
+        lastErrorKind: 'ROTATION_ERROR',
+      }
+    })
     child.on('exit', (code) => scheduleRestart(code === 0 ? 'PROCESS_STOPPED' : 'PROCESS_EXITED'))
   }
 
