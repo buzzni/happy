@@ -1436,6 +1436,62 @@ describe('runServerAutomationTick', () => {
     }))
   })
 
+  it('skips a merged PR whose branch is gone instead of falling back', async () => {
+    // 2026-09-01 프로덕션 — happy #319 가 머지되며 브랜치가 삭제됐고, 그 이벤트를
+    // 처리하던 AgentTask 리뷰가 worktree 준비에 실패하자 프로젝트 디렉터리로
+    // 폴백해 워커를 띄웠다. 삭제된 브랜치는 되돌릴 수 없는 실패라 폴백해도 리뷰할
+    // 대상이 없다 — 이벤트를 소비하고 끊어야 한다. AgentTask 폴백을 영구 실패
+    // 판정보다 앞에 두어 생긴 문제다.
+    const { input, store, queryGithubPullRequests, dispatchAgentTask,
+      prepareGithubWorktree, spawnSession, logDebug } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review safely', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'review-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { prNumber: 319, baseSha: 'b'.repeat(40), headSha: 'c'.repeat(40) },
+        context: [{ kind: 'diff', body: 'diff --git a/x b/x' }],
+      },
+    })
+    prepareGithubWorktree.mockResolvedValue({
+      ok: false,
+      error: "GitHub pull request checkout failed: fatal: couldn't find remote ref refs/heads/gone",
+      cleaned: true,
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('permanently unavailable'))
+    expect(logDebug).not.toHaveBeenCalledWith(expect.stringContaining('project directory instead'))
+  })
+
   it('still reviews in the project directory when the worktree cannot be prepared', async () => {
     // dispatch 시점에 서버가 task 를 이미 확정했다. 여기서 중단하면 그 task 는 워커
     // 없이 lease 만료까지 남는다. worktree 는 있으면 좋은 것이지 전제가 아니므로,
