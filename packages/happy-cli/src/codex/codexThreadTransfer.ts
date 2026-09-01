@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { lstat, mkdir, open, readFile, realpath, rename, rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat } from 'node:fs/promises';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { validatePath } from '@/modules/common/pathSecurity';
 
@@ -9,6 +9,7 @@ export const CODEX_THREAD_TRANSFER_MAX_BYTES = 512 * 1024 * 1024;
 export const CODEX_THREAD_TRANSFER_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
 
 const REQUEST_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const TRANSFER_FILE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.aplus-codex-transfer-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.jsonl$/i;
 
 type SourceSnapshot = {
     path: string;
@@ -26,6 +27,7 @@ type PendingImport = {
     size: number;
     sha256: string;
     bytesWritten: number;
+    writeChain: Promise<void>;
     cleanupTimer: ReturnType<typeof setTimeout>;
 };
 
@@ -171,11 +173,34 @@ export function createCodexThreadTransferRuntime(deps: CodexThreadTransferDeps) 
     const pending = new Map<string, PendingImport>();
     const pendingRequestIds = new Set<string>();
     const sourceSnapshots = new Map<string, SourceSnapshot>();
+    const stagingCleanup = new Map<string, Promise<void>>();
+
+    const removeOrphanedTransferFiles = async (stagingDir: string): Promise<void> => {
+        const existing = stagingCleanup.get(stagingDir);
+        if (existing) return existing;
+        const cleanup = (async () => {
+            const entries = await readdir(stagingDir, { withFileTypes: true });
+            await Promise.all(entries
+                .filter((entry) => (
+                    TRANSFER_FILE_RE.test(entry.name)
+                    && (entry.isFile() || entry.isSymbolicLink())
+                ))
+                .map((entry) => rm(join(stagingDir, entry.name), { force: true })));
+        })();
+        stagingCleanup.set(stagingDir, cleanup);
+        try {
+            await cleanup;
+        } catch (error) {
+            stagingCleanup.delete(stagingDir);
+            throw error;
+        }
+    };
 
     const discard = async (transferId: string, transfer: PendingImport): Promise<void> => {
         pending.delete(transferId);
         pendingRequestIds.delete(transfer.requestId);
         clearTimeout(transfer.cleanupTimer);
+        await transfer.writeChain;
         await rm(transfer.tempPath, { force: true });
     };
 
@@ -262,6 +287,7 @@ export function createCodexThreadTransferRuntime(deps: CodexThreadTransferDeps) 
                 directory: validation.resolvedPath,
                 allowedRoot: deps.allowedRoot,
             });
+            await removeOrphanedTransferFiles(stagingDir);
             const receiptPath = join(stagingDir, `${input.requestId}.receipt.json`);
             try {
                 const receiptEntry = await lstat(receiptPath);
@@ -315,6 +341,7 @@ export function createCodexThreadTransferRuntime(deps: CodexThreadTransferDeps) 
                 size: input.size,
                 sha256: input.sha256.toLowerCase(),
                 bytesWritten: 0,
+                writeChain: Promise.resolve(),
                 cleanupTimer,
             });
             return { status: 'ready', transferId };
@@ -323,22 +350,35 @@ export function createCodexThreadTransferRuntime(deps: CodexThreadTransferDeps) 
         async writeImportChunk(input: { transferId: string; offset: number; content: string }) {
             const transfer = pending.get(input.transferId);
             if (!transfer) throw new Error('Unknown Codex thread transfer');
-            if (input.offset !== transfer.bytesWritten) {
-                throw new Error(`Chunk offset must match next offset ${transfer.bytesWritten}`);
-            }
-            const buffer = decodeChunk(input.content);
-            assertChunk({ offset: input.offset, length: buffer.length, declaredSize: transfer.size });
-            const file = await open(transfer.tempPath, 'r+');
+            const previousWrite = transfer.writeChain;
+            let releaseWrite!: () => void;
+            transfer.writeChain = new Promise<void>((resolve) => {
+                releaseWrite = resolve;
+            });
+            await previousWrite;
             try {
-                const written = await file.write(buffer, 0, buffer.length, input.offset);
-                if (written.bytesWritten !== buffer.length) {
-                    throw new Error('Failed to write the complete Codex thread chunk');
+                if (pending.get(input.transferId) !== transfer) {
+                    throw new Error('Unknown Codex thread transfer');
                 }
+                if (input.offset !== transfer.bytesWritten) {
+                    throw new Error(`Chunk offset must match next offset ${transfer.bytesWritten}`);
+                }
+                const buffer = decodeChunk(input.content);
+                assertChunk({ offset: input.offset, length: buffer.length, declaredSize: transfer.size });
+                const file = await open(transfer.tempPath, 'r+');
+                try {
+                    const written = await file.write(buffer, 0, buffer.length, input.offset);
+                    if (written.bytesWritten !== buffer.length) {
+                        throw new Error('Failed to write the complete Codex thread chunk');
+                    }
+                } finally {
+                    await file.close();
+                }
+                transfer.bytesWritten += buffer.length;
+                return { bytesWritten: transfer.bytesWritten };
             } finally {
-                await file.close();
+                releaseWrite();
             }
-            transfer.bytesWritten += buffer.length;
-            return { bytesWritten: transfer.bytesWritten };
         },
 
         async abortImport(input: { transferId: string }) {
