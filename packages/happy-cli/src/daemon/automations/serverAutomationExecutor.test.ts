@@ -1,6 +1,17 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { runServerAutomationTick, type ServerAutomationExecutorInput } from './serverAutomationExecutor'
+import {
+  MAX_GITHUB_WORKER_SESSIONS,
+  runServerAutomationTick,
+  type ServerAutomationExecutorInput,
+} from './serverAutomationExecutor'
+
+// 상한을 상수에서 끌어와 만든다. 개수를 하드코딩하면 상한을 올릴 때 테스트가
+// "한계에 도달했다" 를 더는 재현하지 못하면서 조용히 통과한다.
+const workerSessionIds = (prefix: string, count = MAX_GITHUB_WORKER_SESSIONS) => Array.from(
+  { length: count },
+  (_, index) => `${prefix}-${index + 1}`,
+)
 import type { AutomationMcpCallerGrantResult } from './automationMcpCallerGrant'
 import type { EncryptedServerAutomation } from './serverAutomationCache'
 import type { ServerAutomationRuntimeState } from './serverAutomationRuntimeStore'
@@ -2222,7 +2233,7 @@ describe('runServerAutomationTick', () => {
       }],
       githubActiveSessions: [{
         automationId: 'automation-1', generation: 2,
-        sessionIds: ['review-1', 'review-2', 'review-3'],
+        sessionIds: workerSessionIds('review'),
       }],
     })
     input.isSessionRunning = vi.fn(() => true)
@@ -2255,7 +2266,7 @@ describe('runServerAutomationTick', () => {
       }],
       githubActiveSessions: [{
         automationId: 'automation-1', generation: 1,
-        sessionIds: ['old-review-1', 'old-review-2', 'old-review-3'],
+        sessionIds: workerSessionIds('old-review'),
       }],
     })
     input.isSessionRunning = vi.fn(() => true)
@@ -2274,7 +2285,7 @@ describe('runServerAutomationTick', () => {
     expect(spawnSession).not.toHaveBeenCalled()
     expect(store.state().githubActiveSessions).toEqual([{
       automationId: 'automation-1', generation: 1,
-      sessionIds: ['old-review-1', 'old-review-2', 'old-review-3'],
+      sessionIds: workerSessionIds('old-review'),
     }])
     expect(store.state().schedules[0]!.nextRunAt).toBe(now + 1)
   })
@@ -2384,6 +2395,8 @@ describe('runServerAutomationTick', () => {
     const {
       input, store, transport, spawnSession, now,
     } = setup()
+    // 살아있는 세션 상한-1 개 + 이번 틱에 타임아웃된 워커 1개 = 상한
+    const liveSessions = workerSessionIds('review', MAX_GITHUB_WORKER_SESSIONS - 1)
     const automationIds = ['automation-1', 'automation-2', 'automation-3']
     const pendingEvent = {
       id: 'opened:10:head-sha', event: 'opened' as const,
@@ -2404,7 +2417,7 @@ describe('runServerAutomationTick', () => {
       })),
       githubActiveSessions: [{
         automationId: 'older-automation', generation: 1,
-        sessionIds: ['review-1', 'review-2'],
+        sessionIds: liveSessions,
       }],
       pendingReports: [],
     })
@@ -2426,7 +2439,7 @@ describe('runServerAutomationTick', () => {
       ok: true,
       value: { runId: `run-${automationId}`, claimToken: `claim-${automationId}` },
     }))
-    input.isSessionRunning = vi.fn((sessionId) => sessionId === 'review-1' || sessionId === 'review-2')
+    input.isSessionRunning = vi.fn((sessionId) => liveSessions.includes(sessionId))
     input.isDirectoryInUse = vi.fn((directory) => directory === '/isolated/run-automation-1')
     spawnSession.mockResolvedValue({ ok: false, error: 'Session webhook timeout for PID 101' })
 
