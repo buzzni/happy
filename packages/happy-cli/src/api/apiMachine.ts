@@ -2322,7 +2322,7 @@ export class ApiMachineClient {
 
     private startKeepAlive() {
         this.stopKeepAlive();
-        this.keepAliveInterval = setInterval(() => {
+        const publishKeepAlive = () => {
             const payload = {
                 machineId: this.machine.id,
                 time: Date.now()
@@ -2383,16 +2383,19 @@ export class ApiMachineClient {
                         sessionFollowup: true,
                         protocolVersion: AUTOMATION_PROTOCOL_VERSION,
                     },
-                    ...(this.autonomousQualityGateRpcAvailable
-                        ? { autonomousQualityGateSupport: { apiVersion: 1, rpcAvailable: true } }
-                        : {}),
+                    autonomousQualityGateSupport: {
+                        apiVersion: 1,
+                        rpcAvailable: this.autonomousQualityGateRpcAvailable,
+                    },
                     additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
                     happyCliVersion: newCliVersion,
                 })).catch((err) => {
                     logger.debug('[API MACHINE] Failed to update machine capabilities:', err);
                 });
             }
-        }, 20000);
+        };
+        publishKeepAlive();
+        this.keepAliveInterval = setInterval(publishKeepAlive, 20000);
         logger.debug('[API MACHINE] Keep-alive started (20s interval)');
     }
 

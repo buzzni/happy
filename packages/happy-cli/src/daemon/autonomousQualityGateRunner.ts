@@ -41,6 +41,9 @@ export function runAutonomousQualityGatePhase(
         let killTimer: NodeJS.Timeout | undefined;
         let timeout: NodeJS.Timeout | undefined;
         let readinessTimer: NodeJS.Timeout | undefined;
+        let teardownPollTimer: NodeJS.Timeout | undefined;
+        let pendingClose: { exitCode: number | null; error?: Error } | undefined;
+        let forceSent = false;
         let startPassed = false;
         let child: ChildProcess;
 
@@ -50,6 +53,7 @@ export function runAutonomousQualityGatePhase(
             if (timeout) clearTimeout(timeout);
             if (killTimer) clearTimeout(killTimer);
             if (readinessTimer) clearTimeout(readinessTimer);
+            if (teardownPollTimer) clearTimeout(teardownPollTimer);
             options.signal?.removeEventListener('abort', abort);
             if (error) stderr.append(Buffer.from(error.message));
             const status = forcedStatus
@@ -69,9 +73,36 @@ export function runAutonomousQualityGatePhase(
             if (settled || forcedStatus) return;
             forcedStatus = status;
             killProcessTree(child, false);
-            killTimer = setTimeout(() => killProcessTree(child, true), options.killGraceMs ?? DEFAULT_KILL_GRACE_MS);
+            scheduleForcedTeardown();
         };
         const abort = () => stop('aborted');
+        const finishAfterForcedTeardown = (attempt = 0) => {
+            if (!pendingClose) return;
+            if (processTreeAlive(child) && attempt < 100) {
+                teardownPollTimer = setTimeout(() => finishAfterForcedTeardown(attempt + 1), 10);
+                return;
+            }
+            const close = pendingClose;
+            pendingClose = undefined;
+            finish(close.exitCode, close.error);
+        };
+        const scheduleForcedTeardown = () => {
+            if (killTimer || forceSent) return;
+            killTimer = setTimeout(() => {
+                killTimer = undefined;
+                forceSent = true;
+                killProcessTree(child, true);
+                finishAfterForcedTeardown();
+            }, options.killGraceMs ?? DEFAULT_KILL_GRACE_MS);
+        };
+        const close = (exitCode: number | null, error?: Error) => {
+            if ((forcedStatus || startPassed) && processTreeAlive(child)) {
+                pendingClose = { exitCode, ...(error ? { error } : {}) };
+                if (forceSent) finishAfterForcedTeardown();
+                return;
+            }
+            finish(exitCode, error);
+        };
 
         try {
             child = spawn('bash', ['-lc', phase.command], {
@@ -87,16 +118,20 @@ export function runAutonomousQualityGatePhase(
         }
         child.stdout?.on('data', (chunk: Buffer) => stdout.append(chunk));
         child.stderr?.on('data', (chunk: Buffer) => stderr.append(chunk));
-        child.once('error', error => finish(null, error));
-        child.once('close', code => finish(code));
+        child.once('error', error => close(null, error));
+        child.once('close', code => close(code));
         options.signal?.addEventListener('abort', abort, { once: true });
         timeout = setTimeout(() => stop('timed-out'), phase.timeoutMs);
         if (phase.name === 'start') {
             const ready = () => {
                 if (settled || forcedStatus) return;
                 startPassed = true;
+                if (timeout) {
+                    clearTimeout(timeout);
+                    timeout = undefined;
+                }
                 killProcessTree(child, false);
-                killTimer = setTimeout(() => killProcessTree(child, true), options.killGraceMs ?? DEFAULT_KILL_GRACE_MS);
+                scheduleForcedTeardown();
             };
             if (!phase.readinessUrl) {
                 readinessTimer = setTimeout(ready, 1_000);
@@ -168,5 +203,16 @@ function killProcessTree(child: ChildProcess, force: boolean): void {
         process.kill(-child.pid, force ? 'SIGKILL' : 'SIGTERM');
     } catch {
         try { child.kill(force ? 'SIGKILL' : 'SIGTERM'); } catch { /* already exited */ }
+    }
+}
+
+function processTreeAlive(child: ChildProcess): boolean {
+    if (!child.pid) return false;
+    if (process.platform === 'win32') return child.exitCode === null;
+    try {
+        process.kill(-child.pid, 0);
+        return true;
+    } catch {
+        return false;
     }
 }

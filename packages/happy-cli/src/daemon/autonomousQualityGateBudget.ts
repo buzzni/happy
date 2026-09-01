@@ -1,5 +1,10 @@
 import type { AutonomousQualityGateStartRequestV1 } from '../api/autonomousQualityGateProtocol';
-import type { AutonomousLimitReason } from './autonomousQualityGateState';
+
+export type AutonomousLimitReason =
+    | 'max-continuations'
+    | 'max-turns'
+    | 'max-tokens'
+    | 'timeout';
 
 export type AutonomousQualityGateLimits = AutonomousQualityGateStartRequestV1['limits'];
 

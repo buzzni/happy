@@ -84,4 +84,27 @@ describe('autonomous quality gate v1 protocol', () => {
         expect(parsed.lastPhase).not.toHaveProperty('cwd');
         expect(parsed.lastPhase).not.toHaveProperty('output');
     });
+
+    it.each([
+        { stage: 'passed', lastPhase: { name: 'test', status: 'failed', exitCode: 1, timedOut: false, outputTruncated: false } },
+        { stage: 'repairing', blockedReason: 'runtime-error' },
+        { stage: 'repairing', limitReason: 'max-turns' },
+        { stage: 'blocked' },
+        { stage: 'limit-reached' },
+    ])('rejects contradictory terminal status semantics', (patch) => {
+        expect(AutonomousQualityGateStatusV1Schema.safeParse({
+            schemaVersion: 1,
+            runId: 'run-1',
+            revision: 3,
+            sessionId: 'session-1',
+            projectId: 'project-1',
+            attempt: 1,
+            usage: { continuations: 1, turns: 2, tokens: 400, elapsedMs: 5_000 },
+            limits: startRequest.limits,
+            lastPhase: { name: 'test', status: 'failed', exitCode: 1, timedOut: false, outputTruncated: true },
+            fingerprintChanged: false,
+            nextAction: 'wait',
+            ...patch,
+        }).success).toBe(false);
+    });
 });

@@ -10,6 +10,7 @@ import {
 } from './autonomousQualityGateBudget';
 import {
     buildAutonomousGateFailureArtifact,
+    redactAutonomousGatePhaseResult,
     serializeAutonomousGateFailureContinuation,
 } from './autonomousQualityGateFailureArtifact';
 import type { AutonomousWorktreeFingerprint } from './autonomousQualityGateFingerprint';
@@ -31,6 +32,9 @@ interface AutonomousQualityGateRuntimeDependencies {
         signal: AbortSignal,
     ) => Promise<AutonomousQualityGatePhaseResult>;
     sendRepair: (message: string) => Promise<void>;
+    onRepairAdmission?: () => void;
+    checkpoint?: () => Promise<void>;
+    initialSessionUsage?: { turns: number; tokens: number };
     restored?: AutonomousQualityGateRuntimeSnapshot;
 }
 
@@ -38,6 +42,9 @@ export interface AutonomousQualityGateRuntimeSnapshot {
     status: AutonomousQualityGateStatusV1;
     startedAt: number;
     inputEpoch: number;
+    reportedTurns: number;
+    reportedTokens: number;
+    pausedFrom?: AutonomousQualityGateStatusV1['stage'];
     previousFailure?: AutonomousPreviousGateFailure;
 }
 
@@ -46,7 +53,10 @@ export class AutonomousQualityGateRuntime {
     private readonly startedAt: number;
     private readonly now: () => number;
     private previousFailure?: AutonomousPreviousGateFailure;
+    private reportedTurns: number;
+    private reportedTokens: number;
     private pausedFrom: AutonomousQualityGateStatusV1['stage'] = 'awaiting-completion';
+    private pendingRepairStage?: 'repairing' | 'unchanged-after-failure';
     private status: AutonomousQualityGateStatusV1;
 
     constructor(
@@ -56,7 +66,15 @@ export class AutonomousQualityGateRuntime {
         this.now = deps.now ?? Date.now;
         this.startedAt = deps.restored?.startedAt ?? this.now();
         this.admission = new AutonomousQualityGateAdmission(deps.restored?.inputEpoch);
-        this.previousFailure = deps.restored?.previousFailure;
+        this.previousFailure = deps.restored?.previousFailure
+            ? {
+                ...deps.restored.previousFailure,
+                result: redactAutonomousGatePhaseResult(deps.restored.previousFailure.result),
+            }
+            : undefined;
+        this.reportedTurns = deps.restored?.reportedTurns ?? deps.initialSessionUsage?.turns ?? 0;
+        this.reportedTokens = deps.restored?.reportedTokens ?? deps.initialSessionUsage?.tokens ?? 0;
+        this.pausedFrom = deps.restored?.pausedFrom ?? 'awaiting-completion';
         this.status = deps.restored?.status ?? {
             schemaVersion: 1,
             runId: deps.runId,
@@ -70,6 +88,15 @@ export class AutonomousQualityGateRuntime {
             fingerprintChanged: null,
             nextAction: 'wait',
         };
+        if (deps.restored?.status.stage === 'verifying') {
+            this.status = {
+                ...this.status,
+                revision: this.status.revision + 1,
+                stage: 'blocked',
+                blockedReason: 'interrupted-operation',
+                nextAction: 'none',
+            };
+        }
     }
 
     getStatus(): AutonomousQualityGateStatusV1 {
@@ -81,6 +108,9 @@ export class AutonomousQualityGateRuntime {
             status: this.getStatus(),
             startedAt: this.startedAt,
             inputEpoch: this.admission.inputEpoch,
+            reportedTurns: this.reportedTurns,
+            reportedTokens: this.reportedTokens,
+            pausedFrom: this.pausedFrom,
             ...(this.previousFailure ? { previousFailure: structuredClone(this.previousFailure) } : {}),
         };
     }
@@ -93,20 +123,33 @@ export class AutonomousQualityGateRuntime {
         this.admission.noteUserInput();
     }
 
+    isAwaitingRepairTurn(): boolean {
+        return isRepairStage(this.status.stage)
+            || (this.status.stage === 'paused' && isRepairStage(this.pausedFrom))
+            || this.pendingRepairStage !== undefined;
+    }
+
+    block(reason: NonNullable<AutonomousQualityGateStatusV1['blockedReason']>): void {
+        if (!isTerminal(this.status.stage)) {
+            this.admission.cancelActiveOperation();
+            this.update({ stage: 'blocked', blockedReason: reason, nextAction: 'none' });
+        }
+    }
+
     control(
         action: 'pause' | 'resume' | 'stop',
         expectedRevision: number,
     ): { accepted: boolean; conflict?: boolean; status: AutonomousQualityGateStatusV1 } {
         if (action === 'stop') {
-            this.admission.cancelActiveOperation();
+            this.admission.noteUserInput();
             if (this.status.stage !== 'stopped') this.update({ stage: 'stopped', nextAction: 'none' });
             return { accepted: true, status: this.getStatus() };
         }
         if (action === 'pause') {
             if (isTerminal(this.status.stage)) return { accepted: false, status: this.getStatus() };
+            this.admission.noteUserInput();
             if (this.status.stage !== 'paused') {
-                this.pausedFrom = this.status.stage;
-                this.admission.cancelActiveOperation();
+                this.pausedFrom = this.pendingRepairStage ?? this.status.stage;
                 this.update({ stage: 'paused', nextAction: 'resume' });
             }
             return { accepted: true, status: this.getStatus() };
@@ -115,28 +158,46 @@ export class AutonomousQualityGateRuntime {
             return { accepted: false, conflict: true, status: this.getStatus() };
         }
         if (this.status.stage !== 'paused') return { accepted: false, status: this.getStatus() };
-        const resumedStage = this.pausedFrom === 'repairing' || this.pausedFrom === 'unchanged-after-failure'
+        const resumedStage = isRepairStage(this.pausedFrom)
             ? this.pausedFrom
             : 'awaiting-completion';
         this.update({ stage: resumedStage, nextAction: 'wait' });
         return { accepted: true, status: this.getStatus() };
     }
 
-    recordAssistantTurn(providerTokens: { total: number }): void {
+    failClosedAfterResumePersistenceError(): void {
+        if (isTerminal(this.status.stage) || this.status.stage === 'paused') return;
+        this.admission.noteUserInput();
+        this.update({ stage: 'paused', nextAction: 'resume' });
+    }
+
+    recordSessionUsage(totals: { turns?: number; tokens?: number }): boolean {
+        if (isTerminal(this.status.stage)) return false;
+        const turns = totals.turns === undefined ? 0 : cumulativeDelta(this.reportedTurns, totals.turns);
+        const tokens = totals.tokens === undefined ? 0 : cumulativeDelta(this.reportedTokens, totals.tokens);
+        if (totals.turns !== undefined) this.reportedTurns = totals.turns;
+        if (totals.tokens !== undefined) this.reportedTokens = totals.tokens;
+        const usage = consumeAutonomousQualityGateBudget(this.status.usage, {
+            turns,
+            providerTokens: { total: tokens },
+            startedAt: this.startedAt,
+            now: this.now(),
+        });
+        const limitReason = findAutonomousQualityGateLimit(usage, this.request.limits);
+        const changed = turns > 0 || tokens > 0 || usage.elapsedMs !== this.status.usage.elapsedMs;
+        if (!changed && !limitReason) return false;
+        if (limitReason) this.admission.cancelActiveOperation();
         this.status = {
             ...this.status,
             revision: this.status.revision + 1,
-            usage: consumeAutonomousQualityGateBudget(this.status.usage, {
-                turns: 1,
-                providerTokens,
-                startedAt: this.startedAt,
-                now: this.now(),
-            }),
+            usage,
+            ...(limitReason ? { stage: 'limit-reached' as const, limitReason, nextAction: 'none' as const } : {}),
         };
+        return true;
     }
 
     async onCompletionCandidate(): Promise<AutonomousQualityGateStatusV1> {
-        if (isTerminal(this.status.stage) || !this.admission.sessionIdle) return this.getStatus();
+        if (!canStartGate(this.status.stage) || !this.admission.sessionIdle) return this.getStatus();
         this.refreshElapsed();
         const limitReason = findAutonomousQualityGateLimit(this.status.usage, this.request.limits);
         if (limitReason) {
@@ -145,18 +206,28 @@ export class AutonomousQualityGateRuntime {
         }
 
         const operation = this.admission.beginGateOperation();
-        this.update({ stage: 'verifying', nextAction: 'wait' });
-        const outcome = await runAutonomousQualityGateAttempt({
-            plan: this.request.plan,
-            previousFailure: this.previousFailure,
-            maxGateAttempts: this.request.limits.maxGateAttempts,
-            capture: this.deps.capture,
-            runPhase: phase => this.deps.runPhase(phase, operation.signal),
-        });
-        operation.finish();
+        this.update({ stage: 'verifying', fingerprintChanged: null, nextAction: 'wait' });
+        let outcome: Awaited<ReturnType<typeof runAutonomousQualityGateAttempt>>;
+        try {
+            await this.deps.checkpoint?.();
+            outcome = await runAutonomousQualityGateAttempt({
+                plan: this.request.plan,
+                previousFailure: this.previousFailure,
+                maxGateAttempts: this.request.limits.maxGateAttempts,
+                capture: this.deps.capture,
+                runPhase: phase => this.deps.runPhase(phase, operation.signal),
+            });
+        } catch {
+            if (!preserveConcurrentControlState(this.status.stage)) {
+                this.update({ stage: 'blocked', blockedReason: 'runtime-error', nextAction: 'none' });
+            }
+            return this.getStatus();
+        } finally {
+            operation.finish();
+        }
 
         if (operation.signal.aborted || operation.inputEpoch !== this.admission.inputEpoch) {
-            if (this.status.stage === 'paused' || this.status.stage === 'stopped') return this.getStatus();
+            if (preserveConcurrentControlState(this.status.stage)) return this.getStatus();
             this.update({ stage: 'awaiting-completion', nextAction: 'wait' });
             return this.getStatus();
         }
@@ -184,12 +255,17 @@ export class AutonomousQualityGateRuntime {
 
         const failureResult = outcome.status === 'failed' ? outcome.result : outcome.previousResult;
         const fingerprint = outcome.fingerprint;
-        this.previousFailure = { attempt: outcome.attempt, fingerprint, result: failureResult };
+        const fingerprintChanged = this.fingerprintChanged(fingerprint);
+        this.previousFailure = {
+            attempt: outcome.attempt,
+            fingerprint,
+            result: redactAutonomousGatePhaseResult(failureResult),
+        };
         if (outcome.status === 'retry-exhausted') {
             this.update({
                 stage: 'limit-reached',
                 attempt: outcome.attempt,
-                fingerprintChanged: this.fingerprintChanged(fingerprint),
+                fingerprintChanged,
                 lastPhase: publicPhaseResult(failureResult),
                 limitReason: 'max-gate-attempts',
                 nextAction: 'none',
@@ -205,25 +281,64 @@ export class AutonomousQualityGateRuntime {
             fingerprint,
             result: failureResult,
         });
-        const admitted = await this.admission.admitRepair(operation.inputEpoch, () => (
-            this.deps.sendRepair(serializeAutonomousGateFailureContinuation(artifact))
-        ));
+        const repairStage = outcome.status === 'failed' ? 'repairing' : 'unchanged-after-failure';
+        let admitted: boolean;
+        let repairSent = false;
+        try {
+            admitted = await this.admission.admitRepair(operation.inputEpoch, async () => {
+                this.pendingRepairStage = repairStage;
+                this.deps.onRepairAdmission?.();
+                await this.deps.sendRepair(serializeAutonomousGateFailureContinuation(artifact));
+                repairSent = true;
+            });
+        } catch {
+            if (this.status.stage === 'paused' && this.pendingRepairStage === this.pausedFrom) {
+                this.pausedFrom = 'awaiting-completion';
+            }
+            this.pendingRepairStage = undefined;
+            if (!preserveConcurrentControlState(this.status.stage)) {
+                this.update({ stage: 'blocked', blockedReason: 'repair-delivery-failed', nextAction: 'none' });
+            }
+            return this.getStatus();
+        }
+        this.pendingRepairStage = undefined;
+        const chargeSentRepair = (): void => {
+            if (!repairSent) return;
+            repairSent = false;
+            this.status = {
+                ...this.status,
+                revision: this.status.revision + 1,
+                usage: consumeAutonomousQualityGateBudget(this.status.usage, {
+                    continuations: 1,
+                    startedAt: this.startedAt,
+                    now: this.now(),
+                }),
+            };
+        };
         if (!admitted) {
+            const delivered = repairSent;
+            chargeSentRepair();
+            if (preserveConcurrentControlState(this.status.stage)
+                || (delivered && isRepairStage(this.status.stage))) return this.getStatus();
             this.update({ stage: 'awaiting-completion', nextAction: 'wait' });
+            return this.getStatus();
+        }
+        if (preserveConcurrentControlState(this.status.stage)) {
+            chargeSentRepair();
             return this.getStatus();
         }
 
         this.status = {
             ...this.status,
             revision: this.status.revision + 1,
-            stage: outcome.status === 'failed' ? 'repairing' : 'unchanged-after-failure',
+            stage: repairStage,
             attempt: outcome.attempt,
             usage: consumeAutonomousQualityGateBudget(this.status.usage, {
                 continuations: 1,
                 startedAt: this.startedAt,
                 now: this.now(),
             }),
-            fingerprintChanged: this.fingerprintChanged(fingerprint),
+            fingerprintChanged,
             lastPhase: publicPhaseResult(failureResult),
             nextAction: 'wait',
         };
@@ -245,8 +360,15 @@ export class AutonomousQualityGateRuntime {
     }
 
     private update(patch: Partial<AutonomousQualityGateStatusV1>): void {
-        this.status = { ...this.status, ...patch, revision: this.status.revision + 1 };
+        const next = { ...this.status, ...patch, revision: this.status.revision + 1 };
+        if (next.stage !== 'blocked') delete next.blockedReason;
+        if (next.stage !== 'limit-reached') delete next.limitReason;
+        this.status = next;
     }
+}
+
+function cumulativeDelta(previous: number, current: number): number {
+    return current >= previous ? current - previous : current;
 }
 
 function publicPhaseResult(
@@ -262,5 +384,19 @@ function publicPhaseResult(
 }
 
 function isTerminal(stage: AutonomousQualityGateStatusV1['stage']): boolean {
-    return stage === 'passed' || stage === 'stopped' || stage === 'limit-reached';
+    return stage === 'passed' || stage === 'stopped' || stage === 'blocked' || stage === 'limit-reached';
+}
+
+function canStartGate(stage: AutonomousQualityGateStatusV1['stage']): boolean {
+    return stage === 'awaiting-completion' || stage === 'repairing' || stage === 'unchanged-after-failure';
+}
+
+function isRepairStage(
+    stage: AutonomousQualityGateStatusV1['stage'],
+): stage is 'repairing' | 'unchanged-after-failure' {
+    return stage === 'repairing' || stage === 'unchanged-after-failure';
+}
+
+function preserveConcurrentControlState(stage: AutonomousQualityGateStatusV1['stage']): boolean {
+    return stage === 'paused' || isTerminal(stage);
 }

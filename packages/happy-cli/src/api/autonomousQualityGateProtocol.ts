@@ -96,8 +96,19 @@ export const AutonomousQualityGateStatusV1Schema = z.object({
         outputTruncated: z.boolean(),
     }).nullable().optional(),
     fingerprintChanged: z.boolean().nullable(),
+    blockedReason: z.enum(['runtime-error', 'repair-delivery-failed', 'interrupted-operation', 'worktree-in-use']).optional(),
     limitReason: z.enum(['max-continuations', 'max-turns', 'max-tokens', 'timeout', 'max-gate-attempts']).optional(),
     nextAction: z.enum(['wait', 'verify', 'repair', 'resume', 'stop', 'review', 'none']),
+}).superRefine((status, context) => {
+    if (status.stage === 'passed' && status.lastPhase?.status !== 'passed') {
+        context.addIssue({ code: 'custom', message: 'passed status requires a passed last phase' });
+    }
+    if ((status.stage === 'blocked') !== (status.blockedReason !== undefined)) {
+        context.addIssue({ code: 'custom', message: 'blocked reason must match blocked stage' });
+    }
+    if ((status.stage === 'limit-reached') !== (status.limitReason !== undefined)) {
+        context.addIssue({ code: 'custom', message: 'limit reason must match limit-reached stage' });
+    }
 });
 
 export type AutonomousQualityGateCapabilityAdvertisement = z.infer<typeof AutonomousQualityGateCapabilityAdvertisementSchema>;

@@ -6,6 +6,8 @@ export interface AutonomousFingerprintCandidate {
     path: string;
     size: number;
     binary: boolean;
+    fileMode?: number;
+    symlinkTarget?: string;
 }
 
 export interface AutonomousFingerprintInput {
@@ -23,7 +25,7 @@ export interface AutonomousFingerprintPlan {
 const EXCLUDED_DIRECTORY = /^(?:\.git|node_modules|dist|build|coverage|target)(?:\/|$)/i;
 const SECRET_BASENAME = /^(?:\.env(?:\..+)?|\.npmrc|\.pypirc|credentials?|id_(?:rsa|dsa|ecdsa|ed25519)|.+\.(?:pem|key|p12|pfx))$/i;
 
-function safeFingerprintPath(path: string): boolean {
+export function isSafeAutonomousFingerprintPath(path: string): boolean {
     if (!path || path.length > 4_096 || path.includes('\0') || path.includes('\\')) return false;
     if (path.startsWith('/') || /^[a-z]:\//i.test(path)) return false;
     const parts = path.split('/');
@@ -37,7 +39,7 @@ export function planAutonomousFingerprintInputs(
     candidates: readonly AutonomousFingerprintCandidate[],
 ): AutonomousFingerprintPlan {
     const safe = candidates
-        .filter(candidate => safeFingerprintPath(candidate.path))
+        .filter(candidate => isSafeAutonomousFingerprintPath(candidate.path))
         .sort((a, b) => a.path.localeCompare(b.path))
         .slice(0, MAX_AUTONOMOUS_FINGERPRINT_ENTRIES);
     let contentBytes = 0;
@@ -61,13 +63,15 @@ export function planAutonomousFingerprintInputs(
     };
 }
 
-const AUTHORIZATION_BEARER = /(authorization["']?\s*[:=]\s*)["']?bearer\s+[^\s,"';}]+/gi;
+const AUTHORIZATION_CREDENTIAL = /(authorization["']?\s*[:=]\s*)["']?((?:bearer|basic))\s+[^\s,"';}]+/gi;
+const COOKIE_HEADER = /((?:set-)?cookie["']?\s*[:=]\s*)[^\r\n]+/gi;
 const SECRET_ASSIGNMENT = /(["']?(?:api[_-]?key|access[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password|passphrase|private[_-]?key)["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\r\n]+)/gi;
 const COMMON_BARE_TOKEN = /\b(?:gh[pousr]_[a-z0-9]{20,}|sk-[a-z0-9_-]{12,})\b/gi;
 
 export function redactAutonomousGateText(text: string): string {
     return text
-        .replace(AUTHORIZATION_BEARER, '$1Bearer [REDACTED]')
+        .replace(AUTHORIZATION_CREDENTIAL, '$1$2 [REDACTED]')
+        .replace(COOKIE_HEADER, '$1[REDACTED]')
         .replace(SECRET_ASSIGNMENT, '$1[REDACTED]')
         .replace(COMMON_BARE_TOKEN, '[REDACTED]');
 }

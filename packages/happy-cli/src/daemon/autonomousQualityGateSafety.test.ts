@@ -48,10 +48,12 @@ describe('autonomous quality gate fingerprint safety', () => {
 });
 
 describe('autonomous quality gate output redaction', () => {
-    it('redacts credential assignments, authorization headers, and common bare token formats', () => {
+    it('redacts credential assignments, auth/cookie headers, and common bare token formats', () => {
         const output = [
             'OPENAI_API_KEY=sk-live-secret-value',
             'Authorization: Bearer bearer-secret-value',
+            'Authorization: Basic basic-secret-value',
+            'Set-Cookie: session=session-secret-value; HttpOnly',
             '{"accessToken":"json-secret-value","safe":"visible"}',
             'push failed for ghp_123456789012345678901234567890123456',
         ].join('\n');
@@ -60,9 +62,11 @@ describe('autonomous quality gate output redaction', () => {
 
         expect(redacted).toContain('safe');
         expect(redacted).toContain('visible');
-        expect(redacted.match(/\[REDACTED\]/g)).toHaveLength(4);
+        expect(redacted.match(/\[REDACTED\]/g)).toHaveLength(6);
         expect(redacted).not.toContain('sk-live-secret-value');
         expect(redacted).not.toContain('bearer-secret-value');
+        expect(redacted).not.toContain('basic-secret-value');
+        expect(redacted).not.toContain('session-secret-value');
         expect(redacted).not.toContain('json-secret-value');
         expect(redacted).not.toContain('ghp_123456789012345678901234567890123456');
     });

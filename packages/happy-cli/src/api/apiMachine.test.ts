@@ -266,6 +266,68 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    it('publishes autonomous quality-gate capability on the first connection', async () => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        const client = new ApiMachineClient('fake-token', machine);
+        client.setRPCHandlers({
+            spawnSession: vi.fn(),
+            stopSession: vi.fn(),
+            requestShutdown: vi.fn(),
+            portRegistry: {} as any,
+            aiCredentialRuntime: {} as any,
+            autonomousQualityGate: {
+                start: vi.fn(), status: vi.fn(), control: vi.fn(),
+            },
+        });
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.autonomousQualityGateSupport).toEqual({
+            apiVersion: 1,
+            rpcAvailable: true,
+        }));
+
+        client.shutdown();
+    });
+
+    it('clears stale autonomous quality-gate capability when RPC handlers are unavailable', async () => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        machine.metadata = {
+            ...machine.metadata,
+            autonomousQualityGateSupport: { apiVersion: 1, rpcAvailable: true },
+        };
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.autonomousQualityGateSupport).toEqual({
+            apiVersion: 1,
+            rpcAvailable: false,
+        }));
+
+        client.shutdown();
+    });
+
     it('registers the persistent automation public key on connect and persists the acknowledged version', async () => {
         mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
             if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 4 } };

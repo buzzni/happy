@@ -30,8 +30,7 @@ export function buildAutonomousGateFailureArtifact(input: {
     result: AutonomousQualityGatePhaseResult;
 }): AutonomousGateFailureArtifactV1 {
     const command = boundedHead(redactAutonomousGateText(safeText(input.command)), MAX_FAILURE_COMMAND_BYTES);
-    const stdout = boundedTail(redactAutonomousGateText(safeText(input.result.stdoutTail)), MAX_FAILURE_STREAM_BYTES);
-    const stderr = boundedTail(redactAutonomousGateText(safeText(input.result.stderrTail)), MAX_FAILURE_STREAM_BYTES);
+    const result = redactAutonomousGatePhaseResult(input.result);
     return {
         schemaVersion: 1,
         kind: 'autonomous-quality-gate-failure',
@@ -44,9 +43,22 @@ export function buildAutonomousGateFailureArtifact(input: {
         timedOut: input.result.timedOut,
         durationMs: input.result.durationMs,
         fingerprint: input.fingerprint,
+        stdoutTail: result.stdoutTail,
+        stderrTail: result.stderrTail,
+        outputTruncated: result.outputTruncated || command.truncated,
+    };
+}
+
+export function redactAutonomousGatePhaseResult(
+    result: AutonomousQualityGatePhaseResult,
+): AutonomousQualityGatePhaseResult {
+    const stdout = boundedTail(redactAutonomousGateText(safeText(result.stdoutTail)), MAX_FAILURE_STREAM_BYTES);
+    const stderr = boundedTail(redactAutonomousGateText(safeText(result.stderrTail)), MAX_FAILURE_STREAM_BYTES);
+    return {
+        ...result,
         stdoutTail: stdout.value,
         stderrTail: stderr.value,
-        outputTruncated: input.result.outputTruncated || command.truncated || stdout.truncated || stderr.truncated,
+        outputTruncated: result.outputTruncated || stdout.truncated || stderr.truncated,
     };
 }
 

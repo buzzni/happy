@@ -99,11 +99,14 @@ export function startDaemonControlServer({
       schema: {
         body: z.object({
           sessionId: z.string(),
+          reportSeq: z.number().int().min(1).optional(),
           thinking: z.boolean().optional(),
           hasOpenToolCall: z.boolean().optional(),
           pendingUserInput: z.boolean().optional(),
           lastUserInteractionAt: z.number().optional(),
           lastTurnEndAt: z.number().optional(),
+          assistantTurns: z.number().int().min(0).optional(),
+          providerTokens: z.number().int().min(0).optional(),
           launchedBackgroundJob: z.boolean().optional(),
           /** Last message seq delivered to the agent loop. Absent on older CLIs. */
           lastProcessedSeq: z.number().optional(),
@@ -118,14 +121,17 @@ export function startDaemonControlServer({
         }
       }
     }, async (request) => {
-      const { sessionId, thinking, hasOpenToolCall, pendingUserInput, lastUserInteractionAt, lastTurnEndAt, launchedBackgroundJob, lastProcessedSeq, mode, hostPid } = request.body;
+      const { sessionId, reportSeq, thinking, hasOpenToolCall, pendingUserInput, lastUserInteractionAt, lastTurnEndAt, assistantTurns, providerTokens, launchedBackgroundJob, lastProcessedSeq, mode, hostPid } = request.body;
 
       onHappySessionRuntime(sessionId, {
+        ...(reportSeq !== undefined ? { reportSeq } : {}),
         ...(thinking !== undefined ? { thinking } : {}),
         ...(hasOpenToolCall !== undefined ? { hasOpenToolCall } : {}),
         ...(pendingUserInput !== undefined ? { pendingUserInput } : {}),
         ...(lastUserInteractionAt !== undefined ? { lastUserInteractionAt } : {}),
         ...(lastTurnEndAt !== undefined ? { lastTurnEndAt } : {}),
+        ...(assistantTurns !== undefined ? { assistantTurns } : {}),
+        ...(providerTokens !== undefined ? { providerTokens } : {}),
         ...(launchedBackgroundJob !== undefined ? { launchedBackgroundJob } : {}),
         ...(lastProcessedSeq !== undefined ? { lastProcessedSeq } : {}),
         ...(mode !== undefined ? { mode } : {}),

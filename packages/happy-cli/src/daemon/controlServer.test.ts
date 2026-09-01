@@ -292,6 +292,22 @@ describe('controlServer POST /session-runtime', () => {
     expect(runtimeReports[0].runtime.updatedAt).toBeGreaterThan(0)
   })
 
+  it('forwards cumulative assistant turn and provider token counters', async () => {
+    const res = await fetch(`${baseUrl}/session-runtime`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: 'session-1',
+        assistantTurns: 3,
+        providerTokens: 1_200,
+        reportSeq: 7,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(runtimeReports[0].runtime).toMatchObject({ assistantTurns: 3, providerTokens: 1_200, reportSeq: 7 })
+  })
+
   // The reporting process announces its own PID so the daemon can adopt a
   // session it isn't tracking (orphaned by a daemon restart) without guessing
   // the PID from a 14-day-old persisted record, which PID reuse can poison.
