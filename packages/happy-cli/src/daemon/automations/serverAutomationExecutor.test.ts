@@ -1380,6 +1380,113 @@ describe('runServerAutomationTick', () => {
     }))
   })
 
+  it('reviews in a worktree checked out at the dispatched head sha', async () => {
+    // 2026-09-01 프로덕션 — PR #317 리뷰가 "대상 SHA 테스트를 실행하지 못했다" 고
+    // 보고했다. AgentTask 워커만 프로젝트 디렉터리에서 그대로 돌아 HEAD 가 사용자가
+    // 마지막에 둔 커밋이었기 때문이다(start-session 리뷰는 전용 worktree 를 받는다).
+    // 그래서 워커는 git show 로 파일을 한 장씩 읽는 우회를 하고 테스트는 포기했다.
+    const { input, store, queryGithubPullRequests, dispatchAgentTask,
+      prepareGithubWorktree, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review safely', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'review-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { prNumber: 317, baseSha: 'b'.repeat(40), headSha: 'c'.repeat(40) },
+        context: [{ kind: 'diff', body: 'diff --git a/x b/x' }],
+      },
+    })
+
+    await runServerAutomationTick(input)
+
+    // 이벤트가 아니라 dispatch 가 준 SHA 여야 한다 — 큐에서 나온 task 는 지금
+    // planned 이벤트와 다른 PR 일 수 있다.
+    expect(prepareGithubWorktree).toHaveBeenCalledWith(expect.objectContaining({
+      directory: '/repo',
+      pullRequest: { number: 317, expectedHeadSha: 'c'.repeat(40) },
+    }))
+    expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
+      directory: '/isolated/run-1',
+    }))
+  })
+
+  it('still reviews in the project directory when the worktree cannot be prepared', async () => {
+    // dispatch 시점에 서버가 task 를 이미 확정했다. 여기서 중단하면 그 task 는 워커
+    // 없이 lease 만료까지 남는다. worktree 는 있으면 좋은 것이지 전제가 아니므로,
+    // 실패하면 사유를 남기고 기존처럼 프로젝트 디렉터리에서 리뷰한다.
+    const { input, store, queryGithubPullRequests, dispatchAgentTask,
+      prepareGithubWorktree, spawnSession, logDebug } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review safely', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'review-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { prNumber: 317, baseSha: 'b'.repeat(40), headSha: 'c'.repeat(40) },
+        context: [{ kind: 'diff', body: 'diff --git a/x b/x' }],
+      },
+    })
+    prepareGithubWorktree.mockResolvedValue({
+      ok: false, error: 'worktree add failed: disk full', cleaned: true,
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({ directory: '/repo' }))
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('disk full'))
+  })
+
   it('provisions the review commits before the pr_review worker starts', async () => {
     // 2026-08-31 프로덕션 — hsmoa_backend AgentTask 리뷰가 "전달된 baseSha/headSha 가
     // 워크스페이스에 없어 호출부 검증과 소스 SHA 테스트를 실행하지 못했다" 고 보고했다.

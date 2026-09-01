@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { ensureAgentTaskReviewObjects, reviewShasFromDispatchInput } from './agentTaskReviewObjects';
+import {
+  ensureAgentTaskReviewObjects,
+  reviewShasFromDispatchInput,
+  reviewWorktreeRequestFromDispatchInput,
+} from './agentTaskReviewObjects';
 
 // 2026-08-31 프로덕션 — hsmoa_backend AgentTask 리뷰가 이렇게 보고했다:
 //   "전달된 baseSha/headSha Git 객체가 워크스페이스에 없어 소스 SHA 기반 테스트와
@@ -88,5 +92,33 @@ describe('ensureAgentTaskReviewObjects', () => {
 
     expect(result).toEqual({ ok: true, fetched: [] });
     expect(runCommand).not.toHaveBeenCalled();
+  });
+});
+
+describe('reviewWorktreeRequestFromDispatchInput', () => {
+  const head = 'c'.repeat(40);
+
+  it('builds the worktree request from the dispatched pr and head', () => {
+    expect(reviewWorktreeRequestFromDispatchInput({ prNumber: 317, headSha: head, baseSha: 'b'.repeat(40) }))
+      .toEqual({ pullRequest: { number: 317, expectedHeadSha: head } });
+  });
+
+  it('refuses a head that is not a git object name', () => {
+    // 이 값은 git 인자로 나간다. 형태를 좁히지 않으면 임의 문자열이 그대로 전달된다.
+    expect(reviewWorktreeRequestFromDispatchInput({ prNumber: 317, headSha: 'HEAD; rm -rf /' })).toBeNull();
+    expect(reviewWorktreeRequestFromDispatchInput({ prNumber: 317, headSha: 'main' })).toBeNull();
+    expect(reviewWorktreeRequestFromDispatchInput({ prNumber: 317 })).toBeNull();
+  });
+
+  it('refuses a pr number that is not a positive integer', () => {
+    expect(reviewWorktreeRequestFromDispatchInput({ prNumber: 0, headSha: head })).toBeNull();
+    expect(reviewWorktreeRequestFromDispatchInput({ prNumber: -3, headSha: head })).toBeNull();
+    expect(reviewWorktreeRequestFromDispatchInput({ prNumber: 3.5, headSha: head })).toBeNull();
+    expect(reviewWorktreeRequestFromDispatchInput({ prNumber: '317', headSha: head })).toBeNull();
+  });
+
+  it('ignores an input that carries no review target', () => {
+    expect(reviewWorktreeRequestFromDispatchInput(null)).toBeNull();
+    expect(reviewWorktreeRequestFromDispatchInput({ reviewedHeadSha: head })).toBeNull();
   });
 });

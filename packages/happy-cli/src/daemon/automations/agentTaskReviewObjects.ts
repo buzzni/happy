@@ -97,3 +97,25 @@ export async function ensureAgentTaskReviewObjects(input: {
   if (!fetched.ok) return { ok: false, error: fetched.error };
   return { ok: true, fetched: missing };
 }
+
+/**
+ * pr_review dispatch input 에서 worktree 요청을 만든다.
+ *
+ * 2026-09-01 프로덕션 — AgentTask 리뷰만 프로젝트 디렉터리에서 그대로 돌아 HEAD 가
+ * 리뷰 대상과 달랐고, 워커가 "대상 SHA 테스트를 실행하지 못했다" 고 보고했다.
+ * start-session 리뷰는 이미 전용 worktree 를 받는다 — 같은 대우를 해준다.
+ *
+ * SHA 는 planned 이벤트가 아니라 dispatch input 에서 가져와야 한다. 큐에서 나온
+ * task 는 지금 감지한 PR 과 다른 PR 일 수 있다.
+ */
+export function reviewWorktreeRequestFromDispatchInput(
+  input: unknown,
+): { pullRequest: { number: number; expectedHeadSha: string } } | null {
+  if (!input || typeof input !== 'object') return null;
+  const record = input as Record<string, unknown>;
+  const number = record.prNumber;
+  const headSha = record.headSha;
+  if (typeof number !== 'number' || !Number.isInteger(number) || number <= 0) return null;
+  if (typeof headSha !== 'string' || !SHA_PATTERN.test(headSha)) return null;
+  return { pullRequest: { number, expectedHeadSha: headSha } };
+}
