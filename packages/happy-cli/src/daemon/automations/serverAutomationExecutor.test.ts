@@ -16,6 +16,7 @@ import type { AutomationMcpCallerGrantResult } from './automationMcpCallerGrant'
 import type { EncryptedServerAutomation } from './serverAutomationCache'
 import type { ServerAutomationRuntimeState } from './serverAutomationRuntimeStore'
 import { MAX_WORKTREE_CLEANUP_ATTEMPTS } from './worktreeCleanupGiveUp'
+import { buildSandboxRuntimeConfig } from '@/sandbox/config'
 
 function cacheRecord(generation = 2, migrationPending = false) {
   return {
@@ -2115,25 +2116,89 @@ describe('runServerAutomationTick', () => {
       // 워커 세션 안에서만 보였고 서버·데몬 로그에는 아무 흔적이 없었다.
       expect(spawned.initialPrompt).toMatch(/4xx.*status code and response body/i)
       if (taskType === 'pr_review.v1') {
-        expect(spawned).toMatchObject({ permissionMode: 'read-only' })
+        // 2026-09-01 검증 — 리뷰 워커가 대상 SHA worktree 에서 돌기 시작하자 그 다음
+        // 층이 드러났다: worktree 는 빈 체크아웃이라 node_modules 가 없고,
+        // permissionMode 'read-only' 와 샌드박스가 함께 설치를 막아 vitest 를 실행하지
+        // 못했다. 이제 강제는 샌드박스 한 곳에서만 한다 — 이중으로 걸면 어느 쪽이
+        // 막았는지 알 수 없고, review_apply 도 permissionMode 없이 도는 것과 어긋난다.
+        expect(spawned).not.toHaveProperty('permissionMode')
         expect(spawned.initialPrompt).toContain('[PR review quality contract]')
         expect(spawned.initialPrompt).toContain('correctness, regressions, contracts, security, tests, and resources')
         expect(spawned.initialPrompt).toContain('[CONFIRMED] or [PLAUSIBLE]')
         expect(spawned.initialPrompt).toContain('concrete input/state -> incorrect outcome')
         expect(spawned.initialPrompt.indexOf('[PR review quality contract]'))
           .toBeGreaterThan(spawned.initialPrompt.indexOf('Additional project instructions: Review safely'))
-        expect(JSON.parse(spawnedEnvironment.HAPPY_PROJECT_SANDBOX_CONFIG!)).toMatchObject({
-          enabled: true,
-          sessionIsolation: 'custom',
-          customWritePaths: [],
-          networkMode: 'allowed',
-        })
+        // 설정 모양이 아니라 그 설정이 만들어 내는 쓰기 경로를 본다. 모양만 고정하면
+        // sessionIsolation 해석이 바뀌어도 테스트가 눈치채지 못한다.
+        const sandboxConfig = JSON.parse(spawnedEnvironment.HAPPY_PROJECT_SANDBOX_CONFIG!)
+        expect(sandboxConfig).toMatchObject({ enabled: true, networkMode: 'allowed' })
+        const runtimeConfig = buildSandboxRuntimeConfig(sandboxConfig, '/review/worktree')
+        // 리뷰 worktree 가 쓰기 가능해야 의존성을 설치해 대상 SHA 테스트를 돌릴 수 있다.
+        expect(runtimeConfig.filesystem.allowWrite).toContain('/review/worktree')
+        // 완화한 것은 worktree 하나뿐이다 — 자격증명 읽기는 그대로 막혀 있어야 한다.
+        expect(runtimeConfig.filesystem.denyRead).toEqual(
+          expect.arrayContaining([expect.stringContaining('/.ssh'), expect.stringContaining('/.aws')]),
+        )
       } else {
         expect(spawned).not.toHaveProperty('permissionMode')
         expect(spawnedEnvironment).not.toHaveProperty('HAPPY_PROJECT_SANDBOX_CONFIG')
       }
     },
   )
+
+  it('tells the pr_review worker how to install dependencies before running the target checks', async () => {
+    const { input, store, queryGithubPullRequests, dispatchAgentTask, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review safely', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'must-not-reach-reviewer', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'install-1', type: 'pr_review.v1' as const, agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { headSha: 'a'.repeat(40) }, context: [],
+      },
+    })
+
+    await runServerAutomationTick(input)
+    const prompt = spawnSession.mock.calls[0]![0].initialPrompt
+
+    // 2026-09-01 프로덕션 — worktree 를 받고도 테스트를 못 돌렸다:
+    //   "ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL: Command vitest not found.
+    //    Dependencies were not installed because PR review is read-only."
+    // 워커는 지시를 정확히 따랐다. 설치가 허용된다는 사실을 알려주지 않으면
+    // 쓰기 권한만 열어도 그대로 포기한다.
+    expect(prompt).toMatch(/install .*dependencies/i)
+    // 설치 스크립트는 PR 작성자가 쓴 임의 코드다. 실행 시점을 테스트 하나로 좁힌다.
+    expect(prompt).toContain('--ignore-scripts')
+    // 완화한 것은 "돌려보기" 까지다. 리뷰가 PR 을 고치기 시작하면 안 된다.
+    expect(prompt).toMatch(/never commit, push/i)
+    // 설치 실패를 조용히 넘기면 "검사를 안 했다" 가 "검사가 통과했다" 로 보인다.
+    expect(prompt).toMatch(/install fails[^\n]*not_run/i)
+  })
 
   it('records notify-only GitHub events without issuing an MCP grant or starting an LLM session', async () => {
     const {
