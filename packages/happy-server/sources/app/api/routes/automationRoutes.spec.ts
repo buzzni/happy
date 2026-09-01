@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
     setAutomationViewerKey: vi.fn(),
     updateAutomation: vi.fn(),
     emitAutomationUpdate: vi.fn(),
+    emitProjectAutomationUpdate: vi.fn(),
 }));
 
 vi.mock('@/storage/inTx', () => ({ inTx: (callback: (tx: unknown) => unknown) => callback({}) }));
@@ -24,7 +25,10 @@ vi.mock('@/app/automation/automationService', () => mocks);
 vi.mock('@/app/automation/automationExecutionService', () => ({
     resolveAutomationRunMcpContext: mocks.resolveAutomationRunMcpContext,
 }));
-vi.mock('@/app/automation/automationUpdate', () => ({ emitAutomationUpdate: mocks.emitAutomationUpdate }));
+vi.mock('@/app/automation/automationUpdate', () => ({
+    emitAutomationUpdate: mocks.emitAutomationUpdate,
+    emitProjectAutomationUpdate: mocks.emitProjectAutomationUpdate,
+}));
 
 import { automationRoutes } from './automationRoutes';
 
@@ -165,6 +169,9 @@ describe('automationRoutes', () => {
 
         expect(response.statusCode).toBe(200);
         expect(response.json()).toEqual({ keyVersion: 3 });
+        expect(mocks.emitProjectAutomationUpdate).toHaveBeenCalledWith(
+            'project-1', { projectId: 'project-1', reason: 'viewer-key' }, 'user-1',
+        );
         expect(mocks.replaceAutomationViewerKeyIfUnused).toHaveBeenCalledWith({}, 'user-1', 'project-1', {
             expectedKeyVersion: 2,
             publicKey: new Uint8Array(32).fill(7),

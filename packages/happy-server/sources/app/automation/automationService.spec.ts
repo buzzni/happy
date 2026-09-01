@@ -55,7 +55,9 @@ function makeTx(options: {
     actorStatus?: string;
     automation?: ReturnType<typeof automationRecord> | null;
     machineAccountId?: string;
+    automationProtocolVersion?: number;
     activeAutomationCount?: number;
+    followupCount?: number;
 } = {}) {
     const actorId = options.actorId ?? 'editor-1';
     const project = {
@@ -86,7 +88,7 @@ function makeTx(options: {
                 accountId: 'owner-1',
                 automationPublicKey: new Uint8Array(32),
                 automationKeyVersion: 3,
-                automationProtocolVersion: 2,
+                automationProtocolVersion: options.automationProtocolVersion ?? 2,
             })),
         },
         automation: {
@@ -108,6 +110,12 @@ function makeTx(options: {
         automationRun: {
             findMany: vi.fn(async () => [{ id: 'run-1', automationId: 'automation-1' }]),
         },
+        sessionFollowup: {
+            count: vi.fn(async () => options.followupCount ?? 0),
+            findMany: vi.fn(async () => []),
+        },
+        sessionFollowupChange: { create: vi.fn(async () => ({})) },
+        sessionFollowupHistory: { create: vi.fn(async () => ({})) },
     };
     return { tx, project, created, updated };
 }
@@ -134,6 +142,20 @@ describe('automationService', () => {
             .resolves.toEqual({ ok: true, value: [automationRecord()] });
         await expect(listAutomations(pending.tx as never, 'editor-1', 'project-1'))
             .resolves.toEqual({ ok: false, error: 'not-found' });
+    });
+
+    it('advertises session follow-ups only at the shared protocol threshold', async () => {
+        const oldDaemon = makeTx({ automationProtocolVersion: 3 });
+        const currentDaemon = makeTx({ automationProtocolVersion: 4 });
+
+        await expect(getAutomationTarget(oldDaemon.tx as never, 'editor-1', 'project-1'))
+            .resolves.toEqual({ ok: true, value: expect.objectContaining({
+                sessionFollowupSupported: false,
+            }) });
+        await expect(getAutomationTarget(currentDaemon.tx as never, 'editor-1', 'project-1'))
+            .resolves.toEqual({ ok: true, value: expect.objectContaining({
+                sessionFollowupSupported: true,
+            }) });
     });
 
     it('lists shared run history through the same project access boundary', async () => {
@@ -362,11 +384,17 @@ describe('automationService', () => {
             expectedKeyVersion: 2,
             publicKey: new Uint8Array(32),
         })).resolves.toEqual({ ok: true, value: { keyVersion: 3 } });
+        expect(owner.tx.sessionFollowup.findMany).toHaveBeenCalledWith({ where: expect.objectContaining({
+            projectId: 'project-1',
+        }) });
     });
 
-    it('replaces a mismatched viewer key only when the project has no active DB automations', async () => {
+    it('replaces a mismatched viewer key only when no automation or follow-up uses it', async () => {
         const empty = makeTx({ actorId: 'owner-1', automation: null });
         const inUse = makeTx({ actorId: 'owner-1', activeAutomationCount: 1 });
+        const followupInUse = makeTx({
+            actorId: 'owner-1', automation: null, followupCount: 1,
+        });
         const publicKey = new Uint8Array(32).fill(7);
 
         await expect(replaceAutomationViewerKeyIfUnused(empty.tx as never, 'owner-1', 'project-1', {
@@ -374,6 +402,9 @@ describe('automationService', () => {
             publicKey,
         })).resolves.toEqual({ ok: true, value: { keyVersion: 3 } });
         expect(empty.tx.automation.count).toHaveBeenCalledWith({
+            where: { projectId: 'project-1', deletedAt: null },
+        });
+        expect(empty.tx.sessionFollowup.count).toHaveBeenCalledWith({
             where: { projectId: 'project-1', deletedAt: null },
         });
         expect(empty.tx.project.updateMany).toHaveBeenCalledWith({
@@ -386,6 +417,14 @@ describe('automationService', () => {
             publicKey,
         })).resolves.toEqual({ ok: false, error: 'viewer-key-in-use' });
         expect(inUse.tx.project.updateMany).not.toHaveBeenCalled();
+
+        await expect(replaceAutomationViewerKeyIfUnused(
+            followupInUse.tx as never,
+            'owner-1',
+            'project-1',
+            { expectedKeyVersion: 2, publicKey },
+        )).resolves.toEqual({ ok: false, error: 'viewer-key-in-use' });
+        expect(followupInUse.tx.project.updateMany).not.toHaveBeenCalled();
     });
 
     it('rejects a viewer mutation and a stale machine envelope', async () => {

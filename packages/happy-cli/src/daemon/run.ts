@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import os from 'os';
 import * as tmp from 'tmp';
 import axios from 'axios';
+import { AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
 
 import { ApiClient } from '@/api/api';
 import { TrackedSession, SessionEncryptionData } from './types';
@@ -65,7 +66,7 @@ import {
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
-import { encodeBase64 } from '@/api/encryption';
+import { decodeBase64, decrypt, encodeBase64, encrypt } from '@/api/encryption';
 import {
   resolveInheritedSpawnEnvironment,
   resolveRegularSpawnAgentArgs,
@@ -145,6 +146,7 @@ import {
 } from './automations/machineAutomationKey';
 import {
   createServerAutomationCache,
+  decryptSessionFollowupDaemonPayload,
   decryptServerAutomationPayload,
 } from './automations/serverAutomationCache';
 import { createServerAutomationRuntimeStore } from './automations/serverAutomationRuntimeStore';
@@ -152,6 +154,11 @@ import {
   runServerAutomationTick,
   type ServerAutomationExecutorInput,
 } from './automations/serverAutomationExecutor';
+import {
+  createSessionFollowupSyncState,
+  runSessionFollowupTick,
+  type EncryptedFollowupMessage,
+} from './automations/sessionFollowupRunner';
 import {
   exchangeAutomationMcpCallerGrant,
   linkAutomationProjectSession,
@@ -204,7 +211,11 @@ export const initialMachineMetadata: MachineMetadata = {
   happyLibDir: projectPath(),
   cliAvailability: detectCLIAvailability(),
   resumeSupport: { ...detectResumeSupport(), rpcAvailable: true },
-  automationSupport: { rpcAvailable: true },
+  automationSupport: {
+    rpcAvailable: true,
+    sessionFollowup: true,
+    protocolVersion: AUTOMATION_PROTOCOL_VERSION,
+  },
   additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
 };
 
@@ -2321,6 +2332,101 @@ export async function startDaemon(): Promise<void> {
       }),
       logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
     });
+    const sessionFollowupSyncState = createSessionFollowupSyncState();
+    const sessionFollowupTickRunner = createAutomationTickRunner({
+      runTick: () => runSessionFollowupTick({
+        transport: apiMachine.sessionFollowupTransport(),
+        decryptPayload: (followup) => decryptSessionFollowupDaemonPayload(
+          followup,
+          machineAutomationKey.secretKey,
+        ),
+        resolveSession: (sessionId) => {
+          const tracked = findTrackedSessionById(sessionId);
+          const directory = tracked?.happySessionMetadataFromLocalWebhook?.path ?? tracked?.directory;
+          if (!tracked?.encryption || !directory) return null;
+          return {
+            sessionId,
+            directory,
+            encryptionKey: tracked.encryption.encryptionKey,
+            encryptionVariant: tracked.encryption.encryptionVariant,
+            live: hasLiveDaemonChild(sessionId, pidToTrackedSession.values(), isPidAlive),
+          };
+        },
+        sameDirectory: async (left, right) => (
+          await resolveAutomationDirectoryMatch(left, right)
+        ) === true,
+        fetchMessages: async ({ sessionId, afterSeq }) => {
+          const messages: EncryptedFollowupMessage[] = [];
+          let cursor = afterSeq;
+          let complete = false;
+          for (let page = 0; page < 100; page += 1) {
+            const response = await axios.get<{
+              messages?: Array<{
+                seq?: unknown;
+                localId?: unknown;
+                content?: { t?: unknown; c?: unknown };
+              }>;
+              hasMore?: unknown;
+            }>(`${configuration.serverUrl}/v3/sessions/${encodeURIComponent(sessionId)}/messages`, {
+              params: { after_seq: cursor, limit: 500 },
+              headers: { Authorization: `Bearer ${credentials.token}` },
+              timeout: 60_000,
+            });
+            const pageMessages = Array.isArray(response.data.messages) ? response.data.messages : [];
+            let maxSeq = cursor;
+            for (const message of pageMessages) {
+              if (!Number.isSafeInteger(message.seq) || (message.seq as number) <= cursor
+                || message.content?.t !== 'encrypted' || typeof message.content.c !== 'string') {
+                throw new Error('session-followup-message-invalid');
+              }
+              const seq = message.seq as number;
+              maxSeq = Math.max(maxSeq, seq);
+              messages.push({
+                seq,
+                localId: typeof message.localId === 'string' ? message.localId : null,
+                contentCiphertext: message.content.c,
+              });
+            }
+            if (response.data.hasMore !== true) {
+              complete = true;
+              break;
+            }
+            if (maxSeq === cursor) throw new Error('session-followup-pagination-stalled');
+            cursor = maxSeq;
+          }
+          if (!complete) throw new Error('session-followup-pagination-limit');
+          return messages;
+        },
+        decryptMessage: (binding, ciphertext) => decrypt(
+          binding.encryptionKey,
+          binding.encryptionVariant,
+          decodeBase64(ciphertext),
+        ),
+        encryptUserMessage: (binding, message) => encodeBase64(encrypt(
+          binding.encryptionKey,
+          binding.encryptionVariant,
+          message,
+        )),
+        ensureSessionRunning: async ({ sessionId }) => {
+          // Share the same per-session resume fence as interactive and recovery
+          // callers. Bypassing it can double-spawn when a user resume races the
+          // follow-up daemon after an idle child exits.
+          const result = await resumeSession(sessionId);
+          return result.type === 'success'
+            ? { ok: true }
+            : {
+              ok: false,
+              error: result.type === 'error' ? result.errorMessage : `unexpected resume result: ${result.type}`,
+              retryable: result.type === 'error' && [
+                'SESSION_SERVER_UNAVAILABLE',
+                'SESSION_ALIVE_ELSEWHERE',
+              ].includes(result.code),
+            };
+        },
+        logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
+      }, sessionFollowupSyncState),
+      logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
+    });
 
     // Set RPC handlers
     apiMachine.setRPCHandlers({
@@ -2356,6 +2462,7 @@ export async function startDaemon(): Promise<void> {
         + getDaemonTerminalSessionCount(),
       activeAutomationCount: Number(automationTickRunner.isRunning())
         + Number(serverAutomationTickRunner.isRunning())
+        + Number(sessionFollowupTickRunner.isRunning())
         + activeServerAutomationLeaseCount,
     });
     apiMachine.setRuntimeActivityProvider(getRuntimeActivity);
@@ -2472,7 +2579,8 @@ export async function startDaemon(): Promise<void> {
       const handoffDecision = decideAutomationAwareHandoff({
         bundleReplaced,
         legacyAutomationRunning: automationTickRunner.isRunning(),
-        serverAutomationRunning: serverAutomationTickRunner.isRunning(),
+        serverAutomationRunning: serverAutomationTickRunner.isRunning()
+          || sessionFollowupTickRunner.isRunning(),
         serverAutomationLeaseRunning: activeServerAutomationLeaseCount > 0,
         activeSessionCount: getRuntimeActivity().activeSessionCount,
       });
@@ -2485,11 +2593,13 @@ export async function startDaemon(): Promise<void> {
         // 스킵된 due는 claim이 실행 직전에만 반영되므로 다음 tick이 집어간다.
         if (apiMachine.shouldRunLegacyAutomationScheduler()) automationTickRunner.trigger();
         serverAutomationTickRunner.trigger();
+        sessionFollowupTickRunner.trigger();
       } else {
         // Pause first so no later trigger can enter between the idle check and
         // teardown. A tick already in flight is allowed to finish normally.
         automationTickRunner.pause();
         serverAutomationTickRunner.pause();
+        sessionFollowupTickRunner.pause();
       }
 
       if (handoffDecision === 'defer-handoff') {
@@ -2561,6 +2671,7 @@ export async function startDaemon(): Promise<void> {
             legacyRunner: automationTickRunner,
             serverRunner: serverAutomationTickRunner,
           });
+          sessionFollowupTickRunner.resume();
         }
       }
 

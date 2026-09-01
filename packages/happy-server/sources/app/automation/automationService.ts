@@ -1,5 +1,9 @@
 import type { Automation, AutomationRun, Prisma } from '@prisma/client';
-import { AUTOMATION_RUN_NOW_PROTOCOL_VERSION } from '@slopus/happy-wire';
+import {
+    AUTOMATION_RUN_NOW_PROTOCOL_VERSION,
+    AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION,
+} from '@slopus/happy-wire';
+import { invalidateSessionFollowups } from './sessionFollowupInvalidationService';
 
 type Tx = Prisma.TransactionClient;
 
@@ -140,6 +144,7 @@ export interface AutomationTargetView {
     viewerPublicKey: Binary | null;
     viewerKeyVersion: number;
     automationProtocolVersion: number;
+    sessionFollowupSupported: boolean;
 }
 
 export async function getAutomationTarget(
@@ -161,6 +166,8 @@ export async function getAutomationTarget(
             viewerPublicKey: access.project.automationViewerPublicKey,
             viewerKeyVersion: access.project.automationViewerKeyVersion,
             automationProtocolVersion: target.automationProtocolVersion,
+            sessionFollowupSupported:
+                target.automationProtocolVersion >= AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION,
         },
     };
 }
@@ -182,6 +189,7 @@ export async function setAutomationViewerKey(
         },
     });
     if (changed.count === 0) return { ok: false, error: 'viewer-key-version-conflict' };
+    await invalidateSessionFollowups(tx, { projectId }, 'DECRYPT_FAILED');
     return { ok: true, value: { keyVersion: input.expectedKeyVersion + 1 } };
 }
 
@@ -194,10 +202,13 @@ export async function replaceAutomationViewerKeyIfUnused(
     const access = await projectAccess(tx, actorId, projectId);
     if (!access) return { ok: false, error: 'not-found' };
     if (!access.canManageKeys) return { ok: false, error: 'forbidden' };
-    const activeAutomationCount = await tx.automation.count({
-        where: { projectId, deletedAt: null },
-    });
-    if (activeAutomationCount > 0) return { ok: false, error: 'viewer-key-in-use' };
+    const [activeAutomationCount, followupCount] = await Promise.all([
+        tx.automation.count({ where: { projectId, deletedAt: null } }),
+        tx.sessionFollowup.count({ where: { projectId, deletedAt: null } }),
+    ]);
+    if (activeAutomationCount > 0 || followupCount > 0) {
+        return { ok: false, error: 'viewer-key-in-use' };
+    }
     return setAutomationViewerKey(tx, actorId, projectId, input);
 }
 

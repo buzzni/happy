@@ -48,6 +48,9 @@ function makeTx() {
             findFirst: vi.fn(),
             findUnique: vi.fn(),
         },
+        sessionFollowup: { findMany: vi.fn(async () => []) },
+        sessionFollowupChange: { create: vi.fn(async () => ({})) },
+        sessionFollowupHistory: { create: vi.fn(async () => ({})) },
         session: { findFirst: vi.fn(async (): Promise<{ id: string } | null> => null) },
     };
 }
@@ -59,7 +62,7 @@ describe('automationExecutionService', () => {
             expectedKeyVersion: 3,
             publicKey: new Uint8Array(32),
             protocolVersion: 2,
-        })).resolves.toEqual({ ok: true, value: { keyVersion: 4 } });
+        })).resolves.toEqual({ ok: true, value: { keyVersion: 4, invalidatedProjectIds: [] } });
         expect(tx.machine.updateMany).toHaveBeenCalledWith({
             where: { id: 'machine-1', accountId: 'account-1', automationKeyVersion: 3 },
             data: {
@@ -68,6 +71,9 @@ describe('automationExecutionService', () => {
                 automationProtocolVersion: 2,
             },
         });
+        expect(tx.sessionFollowup.findMany).toHaveBeenCalledWith({ where: expect.objectContaining({
+            machineAccountId: 'account-1', machineId: 'machine-1',
+        }) });
     });
 
     it('updates the protocol capability without rotating an unchanged key', async () => {
@@ -83,7 +89,7 @@ describe('automationExecutionService', () => {
             expectedKeyVersion: 4,
             publicKey,
             protocolVersion: 2,
-        })).resolves.toEqual({ ok: true, value: { keyVersion: 4 } });
+        })).resolves.toEqual({ ok: true, value: { keyVersion: 4, invalidatedProjectIds: [] } });
         expect(tx.machine.updateMany).toHaveBeenCalledWith({
             where: { id: 'machine-1', accountId: 'account-1', automationKeyVersion: 4 },
             data: { automationProtocolVersion: 2 },
@@ -102,7 +108,7 @@ describe('automationExecutionService', () => {
             expectedKeyVersion: 3,
             publicKey,
             protocolVersion: 2,
-        })).resolves.toEqual({ ok: true, value: { keyVersion: 4 } });
+        })).resolves.toEqual({ ok: true, value: { keyVersion: 4, invalidatedProjectIds: [] } });
     });
 
     it('returns only machine-targeted deltas without the viewer envelope', async () => {
