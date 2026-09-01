@@ -2,7 +2,8 @@ import * as z from 'zod';
 
 export const AUTOMATION_RUN_NOW_PROTOCOL_VERSION = 2;
 export const AUTOMATION_ISSUE_TRIGGER_PROTOCOL_VERSION = 3;
-export const AUTOMATION_PROTOCOL_VERSION = AUTOMATION_ISSUE_TRIGGER_PROTOCOL_VERSION;
+export const AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION = 4;
+export const AUTOMATION_PROTOCOL_VERSION = AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION;
 
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const PAYLOAD_MAX_BYTES = 128 * 1024;
@@ -138,6 +139,7 @@ export const automationTargetSchema = z.object({
   viewerPublicKey: publicKeySchema.nullable(),
   viewerKeyVersion: z.number().int().min(0),
   automationProtocolVersion: positiveInteger.default(1),
+  sessionFollowupSupported: z.boolean().default(false),
 });
 export type AutomationTarget = z.infer<typeof automationTargetSchema>;
 

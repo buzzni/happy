@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { AgentGoalStatusSchema, AgentStateSchema, MetadataSchema } from './storageTypes';
+import { AgentGoalStatusSchema, AgentStateSchema, MachineMetadataSchema, MetadataSchema } from './storageTypes';
 
 describe('MetadataSchema', () => {
     it('preserves archive lifecycle metadata', () => {
@@ -35,6 +35,33 @@ describe('MetadataSchema', () => {
             text: 'Fix login bug',
             updatedAt: 123,
             branchSlug: 'fix-login-bug',
+        });
+    });
+});
+
+describe('MachineMetadataSchema', () => {
+    it('preserves durable session follow-up capability metadata', () => {
+        const metadata = MachineMetadataSchema.parse({
+            host: 'daemon-host',
+            platform: 'darwin',
+            happyCliVersion: '1.2.3',
+            happyHomeDir: '/tmp/happy',
+            homeDir: '/tmp/home',
+            automationSupport: {
+                rpcAvailable: true,
+                serverBacked: true,
+                keyVersion: 4,
+                sessionFollowup: true,
+                protocolVersion: 4,
+            },
+        });
+
+        expect(metadata.automationSupport).toEqual({
+            rpcAvailable: true,
+            serverBacked: true,
+            keyVersion: 4,
+            sessionFollowup: true,
+            protocolVersion: 4,
         });
     });
 });

@@ -35,6 +35,28 @@ export async function projectDelete(ctx: Context, projectId: string): Promise<Re
                 })),
             });
         }
+        const sessionFollowups = await tx.sessionFollowup.findMany({
+            where: { projectId, deletedAt: null },
+            select: {
+                id: true,
+                revision: true,
+                generation: true,
+                machineAccountId: true,
+                machineId: true,
+            },
+        });
+        if (sessionFollowups.length > 0) {
+            await tx.sessionFollowupChange.createMany({
+                data: sessionFollowups.map((followup) => ({
+                    followupId: followup.id,
+                    revision: followup.revision + 1,
+                    generation: followup.generation + 1,
+                    machineAccountId: followup.machineAccountId,
+                    machineId: followup.machineId,
+                    kind: 'TOMBSTONE' as const,
+                })),
+            });
+        }
         await tx.project.delete({ where: { id: projectId } });
         return { ok: true, value: true };
     });

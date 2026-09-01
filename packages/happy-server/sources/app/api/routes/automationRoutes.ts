@@ -27,7 +27,7 @@ import {
 import { resolveAutomationRunMcpContext } from '@/app/automation/automationExecutionService';
 import { inTx } from '@/storage/inTx';
 import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
-import { emitAutomationUpdate } from '@/app/automation/automationUpdate';
+import { emitAutomationUpdate, emitProjectAutomationUpdate } from '@/app/automation/automationUpdate';
 import type { Fastify } from '../types';
 
 const paramsSchema = z.object({ projectId: z.string().min(1) });
@@ -168,10 +168,11 @@ export function automationRoutes(app: Fastify) {
             publicKey: decode(request.body.publicKey),
         }));
         if (!result.ok) return sendError(reply, result);
-        await emitAutomationUpdate(request.userId, {
-            projectId: request.params.projectId,
-            reason: 'viewer-key',
-        });
+        await emitProjectAutomationUpdate(
+            request.params.projectId,
+            { projectId: request.params.projectId, reason: 'viewer-key' },
+            request.userId,
+        );
         return reply.send(result.value);
     });
 
@@ -193,10 +194,11 @@ export function automationRoutes(app: Fastify) {
             },
         ));
         if (!result.ok) return sendError(reply, result);
-        await emitAutomationUpdate(request.userId, {
-            projectId: request.params.projectId,
-            reason: 'viewer-key',
-        });
+        await emitProjectAutomationUpdate(
+            request.params.projectId,
+            { projectId: request.params.projectId, reason: 'viewer-key' },
+            request.userId,
+        );
         return reply.send(result.value);
     });
 

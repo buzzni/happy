@@ -120,6 +120,7 @@ import type { ServerAutomationCache } from '@/daemon/automations/serverAutomatio
 import { syncServerAutomationDeltas } from '@/daemon/automations/serverAutomationSync';
 import type { ServerAutomationTransport } from '@/daemon/automations/serverAutomationExecutor';
 import type { PendingAutomationReport } from '@/daemon/automations/serverAutomationRuntimeStore';
+import type { SessionFollowupTransport } from '@/daemon/automations/sessionFollowupRunner';
 import type { AiCredentialRuntime } from '@/daemon/aiCredentialRuntime';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -206,6 +207,37 @@ interface DaemonToServerEvents {
         value?: unknown;
         error?: string;
     }) => void) => void;
+    'session-followup-sync': (data: {
+        wireVersion: 1;
+        afterSeq: string;
+        limit: number;
+    }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
+    'session-followup-claim': (data: {
+        wireVersion: 1;
+        followupId: string;
+        generation: number;
+        step: number;
+    }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
+    'session-followup-evaluate': (data: {
+        wireVersion: 1;
+        followupId: string;
+        generation: number;
+        step: number;
+        claimToken: string;
+        decision: 'WAIT' | 'CONTINUE' | 'TERMINATE';
+        observedSeq: number;
+        terminalCode?: string;
+    }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
+    'session-followup-deliver': (data: {
+        wireVersion: 1;
+        followupId: string;
+        generation: number;
+        step: number;
+        claimToken: string;
+        expectedSeq: number;
+        localId: string;
+        contentCiphertext: string;
+    }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
     'machine-alive': (data: {
         machineId: string;
         time: number;
@@ -1222,6 +1254,21 @@ export class ApiMachineClient {
         };
     }
 
+    sessionFollowupTransport(): SessionFollowupTransport {
+        const normalize = async (request: Promise<{ ok: boolean; value?: unknown; error?: string }>) => {
+            const response = await request;
+            return response.ok
+                ? { ok: true as const, value: response.value }
+                : { ok: false as const, error: response.error };
+        };
+        return {
+            sync: (input) => normalize(this.socket.emitWithAck('session-followup-sync', input)),
+            claim: (input) => normalize(this.socket.emitWithAck('session-followup-claim', input)),
+            evaluate: (input) => normalize(this.socket.emitWithAck('session-followup-evaluate', input)),
+            deliver: (input) => normalize(this.socket.emitWithAck('session-followup-deliver', input)),
+        };
+    }
+
     /**
      * Idempotent: returns the running stack if one is already up. Shared by
      * the `browser-viewer:start` RPC and `browser-setup:launch`'s `viewer`
@@ -1677,6 +1724,8 @@ export class ApiMachineClient {
                 rpcAvailable: this.automationRpcAvailable,
                 serverBacked: true,
                 keyVersion,
+                sessionFollowup: true,
+                protocolVersion: AUTOMATION_PROTOCOL_VERSION,
             },
         }));
     }
@@ -2298,6 +2347,8 @@ export class ApiMachineClient {
                         rpcAvailable: this.automationRpcAvailable,
                         serverBacked: this.automationServerKeyVersion !== null,
                         ...(this.automationServerKeyVersion !== null ? { keyVersion: this.automationServerKeyVersion } : {}),
+                        sessionFollowup: true,
+                        protocolVersion: AUTOMATION_PROTOCOL_VERSION,
                     },
                     additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
                     happyCliVersion: newCliVersion,

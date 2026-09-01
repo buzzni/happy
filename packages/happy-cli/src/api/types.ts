@@ -156,6 +156,8 @@ export const MachineMetadataSchema = z.object({
     rpcAvailable: z.boolean(),
     serverBacked: z.boolean().optional(),
     keyVersion: z.number().int().min(1).optional(),
+    sessionFollowup: z.literal(true).optional(),
+    protocolVersion: z.number().int().min(1).optional(),
   }).optional(),
   additionalDirectories: z.object({
     version: z.literal(1),
