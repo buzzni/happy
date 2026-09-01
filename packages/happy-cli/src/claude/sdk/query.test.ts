@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const sdkQuery = vi.hoisted(() => vi.fn(() => ({ mocked: true })));
 
@@ -64,5 +67,25 @@ describe('query adapter', () => {
         expect(sdkQuery).toHaveBeenCalledWith(expect.objectContaining({
             options: expect.objectContaining({ sandbox }),
         }));
+    });
+
+    it('inlines hook settings when sandbox settings must be merged by the SDK', () => {
+        const directory = mkdtempSync(join(tmpdir(), 'happy-query-settings-'));
+        const settingsPath = join(directory, 'settings.json');
+        const hooks = { hooks: { SessionStart: [{ matcher: '*' }] } };
+        writeFileSync(settingsPath, JSON.stringify(hooks));
+        const sandbox = { enabled: true, failIfUnavailable: true };
+        try {
+            query({ prompt: 'edit', options: { settingsPath, sandbox } });
+
+            const settings = (sdkQuery.mock.calls as unknown as Array<Array<any>>)[0][0].options.settings;
+            expect(typeof settings).toBe('string');
+            expect(JSON.parse(settings as string)).toEqual(hooks);
+            expect(sdkQuery).toHaveBeenCalledWith(expect.objectContaining({
+                options: expect.objectContaining({ sandbox }),
+            }));
+        } finally {
+            rmSync(directory, { recursive: true, force: true });
+        }
     });
 });

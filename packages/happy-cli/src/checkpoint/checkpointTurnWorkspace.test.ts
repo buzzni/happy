@@ -28,6 +28,18 @@ describe('CheckpointTurnWorkspace', () => {
         await rm(fixtureRoot, { recursive: true, force: true });
     });
 
+    it('never reuses a writable path across turn operations', () => {
+        const workspaces = new CheckpointTurnWorkspace(checkpointRoot);
+        const binding = {
+            sessionId: 'session-1',
+            projectId: 'project-1',
+            worktreeId: null,
+        };
+
+        expect(workspaces.pathFor({ ...binding, operationId: 'turn-1' }))
+            .not.toBe(workspaces.pathFor({ ...binding, operationId: 'turn-2' }));
+    });
+
     it('materializes only the checkpoint tree outside the original project', async () => {
         const binding = {
             sessionId: 'session-1',
@@ -61,5 +73,31 @@ describe('CheckpointTurnWorkspace', () => {
         await expect(execFileAsync('git', ['status', '--porcelain'], { cwd: workspace.path }))
             .resolves.toMatchObject({ stdout: ' M source.txt\n' });
         await expect(readFile(join(projectPath, '.git', 'HEAD'), 'utf8')).resolves.toBe('original-git');
+    });
+
+    it('atomically moves a completed turn outside its writable sandbox path', async () => {
+        const binding = {
+            sessionId: 'session-1',
+            projectId: 'project-1',
+            worktreeId: null,
+        };
+        const snapshot = await new CheckpointStore(checkpointRoot).snapshotTurn({
+            ...binding,
+            operationId: 'turn-freeze',
+            projectPath,
+        });
+        const workspaces = new CheckpointTurnWorkspace(checkpointRoot);
+        const workspace = await workspaces.prepare({
+            ...binding,
+            operationId: 'turn-freeze',
+            checkpointId: snapshot.checkpointId,
+        });
+        await writeFile(join(workspace.path, 'source.txt'), 'completed');
+
+        const frozen = await workspaces.freeze({ ...binding, operationId: 'turn-freeze' });
+
+        expect(frozen.path).not.toBe(workspace.path);
+        await expect(access(workspace.path)).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(readFile(join(frozen.path, 'source.txt'), 'utf8')).resolves.toBe('completed');
     });
 });

@@ -41,20 +41,29 @@ describe('CheckpointTurnApplier', () => {
             operationId: 'turn-1',
             projectPath,
         });
-        const workspace = await new CheckpointTurnWorkspace(checkpointRoot).prepare({
+        const workspaces = new CheckpointTurnWorkspace(checkpointRoot);
+        const workspace = await workspaces.prepare({
             ...binding,
             operationId: 'turn-1',
             checkpointId: snapshot.checkpointId,
         });
         await writeFile(join(workspace.path, 'source.txt'), 'agent');
         await writeFile(join(projectPath, 'source.txt'), 'user');
+        await expect(new CheckpointTurnApplier(checkpointRoot).plan({
+            ...binding,
+            operationId: 'turn-1',
+            checkpointId: snapshot.checkpointId,
+            projectPath,
+            workspacePath: workspace.path,
+        })).rejects.toThrow('workspace binding mismatch');
+        const frozen = await workspaces.freeze({ ...binding, operationId: 'turn-1' });
 
         const plan = await new CheckpointTurnApplier(checkpointRoot).plan({
             ...binding,
             operationId: 'turn-1',
             checkpointId: snapshot.checkpointId,
             projectPath,
-            workspacePath: workspace.path,
+            workspacePath: frozen.path,
         });
 
         expect(plan.entries).toEqual([
@@ -80,6 +89,10 @@ describe('CheckpointTurnApplier', () => {
         });
         await writeFile(join(workspace.path, 'source.txt'), 'agent-modified');
         await writeFile(join(workspace.path, 'created.txt'), 'agent-created');
+        const frozen = await new CheckpointTurnWorkspace(checkpointRoot).freeze({
+            ...binding,
+            operationId: 'turn-2',
+        });
 
         const layout = resolveCheckpointStoreLayout({ checkpointRoot, ...binding });
         const journalFile = checkpointTurnApplyJournalPath(layout, 'turn-2');
@@ -97,7 +110,7 @@ describe('CheckpointTurnApplier', () => {
             operationId: 'turn-2',
             checkpointId: snapshot.checkpointId,
             projectPath,
-            workspacePath: workspace.path,
+            workspacePath: frozen.path,
         });
 
         expect(result).toMatchObject({
@@ -132,12 +145,16 @@ describe('CheckpointTurnApplier', () => {
             checkpointId: snapshot.checkpointId,
         });
         await writeFile(join(workspace.path, 'source.txt'), 'agent');
+        const frozen = await new CheckpointTurnWorkspace(checkpointRoot).freeze({
+            ...binding,
+            operationId: 'turn-3',
+        });
         const request = {
             ...binding,
             operationId: 'turn-3',
             checkpointId: snapshot.checkpointId,
             projectPath,
-            workspacePath: workspace.path,
+            workspacePath: frozen.path,
         };
         await new CheckpointTurnApplier(checkpointRoot).execute(request);
 
@@ -184,13 +201,17 @@ describe('CheckpointTurnApplier', () => {
             checkpointId: ownSnapshot.checkpointId,
         });
         await writeFile(join(workspace.path, 'source.txt'), 'agent');
+        const frozen = await new CheckpointTurnWorkspace(checkpointRoot).freeze({
+            ...binding,
+            operationId: 'turn-own',
+        });
 
         await expect(new CheckpointTurnApplier(checkpointRoot).plan({
             ...binding,
             operationId: 'turn-own',
             checkpointId: foreignSnapshot.checkpointId,
             projectPath,
-            workspacePath: workspace.path,
+            workspacePath: frozen.path,
         })).rejects.toThrow('does not belong to binding');
         await expect(readFile(join(projectPath, 'source.txt'), 'utf8')).resolves.toBe('before');
     });
@@ -207,13 +228,17 @@ describe('CheckpointTurnApplier', () => {
             checkpointId: snapshot.checkpointId,
         });
         await unlink(join(workspace.path, 'source.txt'));
+        const frozen = await new CheckpointTurnWorkspace(checkpointRoot).freeze({
+            ...binding,
+            operationId: 'turn-delete',
+        });
 
         const result = await new CheckpointTurnApplier(checkpointRoot).execute({
             ...binding,
             operationId: 'turn-delete',
             checkpointId: snapshot.checkpointId,
             projectPath,
-            workspacePath: workspace.path,
+            workspacePath: frozen.path,
         });
 
         expect(result.entries).toEqual([
@@ -241,13 +266,17 @@ describe('CheckpointTurnApplier', () => {
             checkpointId: snapshot.checkpointId,
         });
         await writeFile(join(workspace.path, '.env.future'), 'secret');
+        const frozen = await new CheckpointTurnWorkspace(checkpointRoot).freeze({
+            ...binding,
+            operationId: 'turn-excluded',
+        });
 
         const result = await new CheckpointTurnApplier(checkpointRoot).execute({
             ...binding,
             operationId: 'turn-excluded',
             checkpointId: snapshot.checkpointId,
             projectPath,
-            workspacePath: workspace.path,
+            workspacePath: frozen.path,
             excludedPaths: [],
             excludedPatterns: ['**/.env*'],
         });

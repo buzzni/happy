@@ -1,6 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { lstat, mkdir, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { cp, lstat, mkdir, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import * as tar from 'tar';
@@ -31,12 +32,36 @@ export class CheckpointTurnWorkspace {
             this.checkpointRoot,
             'workspaces',
             opaqueKey([request.sessionId, request.projectId, request.worktreeId]),
-            'active-turn',
+            'turns',
+            opaqueKey([request.operationId]),
+            'active',
         );
     }
 
+    frozenPathFor(request: CheckpointTurnWorkspaceKey): string {
+        return join(dirname(this.pathFor(request)), 'sealed');
+    }
+
+    async freeze(request: CheckpointTurnWorkspaceKey): Promise<PreparedCheckpointTurnWorkspace> {
+        const activePath = this.pathFor(request);
+        const turnPath = dirname(activePath);
+        const volatilePath = join(turnPath, 'volatile');
+        const sealedPath = this.frozenPathFor(request);
+        if (await pathExists(sealedPath)) return { path: sealedPath };
+        if (await pathExists(activePath)) {
+            if (await pathExists(volatilePath)) {
+                throw new Error('checkpoint volatile turn workspace already exists');
+            }
+            await rename(activePath, volatilePath);
+        } else if (!(await pathExists(volatilePath))) {
+            throw new Error('checkpoint active turn workspace is missing');
+        }
+        await createStableSealedCopy(volatilePath, sealedPath);
+        return { path: sealedPath };
+    }
+
     async remove(request: CheckpointTurnWorkspaceKey): Promise<void> {
-        await rm(this.pathFor(request), { recursive: true, force: true });
+        await rm(dirname(this.pathFor(request)), { recursive: true, force: true });
     }
 
     async prepare(
@@ -74,9 +99,73 @@ export class CheckpointTurnWorkspace {
             );
             return { path: workspacePath };
         } catch (error) {
-            await rm(workspacePath, { recursive: true, force: true });
+            await rm(dirname(workspacePath), { recursive: true, force: true });
             throw error;
         }
+    }
+}
+
+async function createStableSealedCopy(sourcePath: string, sealedPath: string): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        const temporaryPath = `${sealedPath}.sealing-${randomUUID()}`;
+        try {
+            const before = await fingerprintTree(sourcePath);
+            await cp(sourcePath, temporaryPath, {
+                recursive: true,
+                force: false,
+                errorOnExist: true,
+                preserveTimestamps: true,
+                verbatimSymlinks: true,
+            });
+            const [after, sealed] = await Promise.all([
+                fingerprintTree(sourcePath),
+                fingerprintTree(temporaryPath),
+            ]);
+            if (before === after && after === sealed) {
+                await rename(temporaryPath, sealedPath);
+                return;
+            }
+        } finally {
+            await rm(temporaryPath, { recursive: true, force: true });
+        }
+    }
+    throw new Error('checkpoint turn workspace did not become stable before apply');
+}
+
+async function fingerprintTree(rootPath: string): Promise<string> {
+    const hash = createHash('sha256');
+    const visit = async (relativePath: string): Promise<void> => {
+        const directoryPath = join(rootPath, relativePath);
+        const entries = await readdir(directoryPath, { withFileTypes: true });
+        entries.sort((left, right) => left.name.localeCompare(right.name));
+        for (const entry of entries) {
+            const entryRelativePath = join(relativePath, entry.name);
+            const entryPath = join(rootPath, entryRelativePath);
+            const stats = await lstat(entryPath);
+            if (stats.isDirectory()) {
+                hash.update(JSON.stringify(['directory', entryRelativePath, stats.mode]));
+                await visit(entryRelativePath);
+            } else if (stats.isFile()) {
+                hash.update(JSON.stringify(['file', entryRelativePath, stats.mode, stats.size]));
+                for await (const chunk of createReadStream(entryPath)) hash.update(chunk);
+            } else if (stats.isSymbolicLink()) {
+                hash.update(JSON.stringify(['symlink', entryRelativePath, await readlink(entryPath)]));
+            } else {
+                throw new Error(`checkpoint turn workspace contains unsupported entry: ${entryRelativePath}`);
+            }
+        }
+    };
+    await visit('');
+    return hash.digest('hex');
+}
+
+async function pathExists(path: string): Promise<boolean> {
+    try {
+        await lstat(path);
+        return true;
+    } catch (error) {
+        if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return false;
+        throw error;
     }
 }
 

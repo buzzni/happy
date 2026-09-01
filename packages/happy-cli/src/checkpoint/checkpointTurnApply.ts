@@ -232,7 +232,7 @@ export class CheckpointTurnApplier {
     }
 
     private async resolveOwnedWorkspace(request: CheckpointTurnApplyRequest): Promise<string> {
-        const expectedPath = new CheckpointTurnWorkspace(this.checkpointRoot).pathFor(request);
+        const expectedPath = new CheckpointTurnWorkspace(this.checkpointRoot).frozenPathFor(request);
         if (resolve(request.workspacePath) !== expectedPath) {
             throw new Error('checkpoint turn workspace binding mismatch');
         }

@@ -6,6 +6,7 @@ const POLL_INTERVAL_MS = 20;
 
 export class CheckpointWriterProcessTree {
     private readonly processGroupIds = new Set<number>();
+    private readonly exitedRootProcessGroupIds = new Set<number>();
 
     track(child: Pick<ChildProcess, 'pid' | 'once'>): void {
         if (!child.pid) {
@@ -13,7 +14,10 @@ export class CheckpointWriterProcessTree {
         }
         const processGroupId = child.pid;
         this.processGroupIds.add(processGroupId);
-        child.once('exit', () => this.forgetIfGone(processGroupId));
+        child.once('exit', () => {
+            this.exitedRootProcessGroupIds.add(processGroupId);
+            this.forgetIfGone(processGroupId);
+        });
     }
 
     async quiesce(closeProvider: () => void | Promise<void>): Promise<void> {
@@ -41,8 +45,11 @@ export class CheckpointWriterProcessTree {
             try {
                 process.kill(-processGroupId, signal);
             } catch (error) {
-                if (!isMissingProcess(error)) throw error;
-                this.processGroupIds.delete(processGroupId);
+                if (this.isGoneOrInaccessibleAfterRootExit(error, processGroupId)) {
+                    this.forget(processGroupId);
+                } else if (!isProcessError(error, 'EPERM')) {
+                    throw error;
+                }
             }
         }
     }
@@ -51,7 +58,9 @@ export class CheckpointWriterProcessTree {
         try {
             process.kill(-processGroupId, 0);
         } catch (error) {
-            if (isMissingProcess(error)) this.processGroupIds.delete(processGroupId);
+            if (this.isGoneOrInaccessibleAfterRootExit(error, processGroupId)) {
+                this.forget(processGroupId);
+            }
         }
     }
 
@@ -62,8 +71,11 @@ export class CheckpointWriterProcessTree {
                 try {
                     process.kill(-processGroupId, 0);
                 } catch (error) {
-                    if (!isMissingProcess(error)) throw error;
-                    this.processGroupIds.delete(processGroupId);
+                    if (this.isGoneOrInaccessibleAfterRootExit(error, processGroupId)) {
+                        this.forget(processGroupId);
+                    } else if (!isProcessError(error, 'EPERM')) {
+                        throw error;
+                    }
                 }
             }
             if (this.processGroupIds.size === 0) return true;
@@ -71,8 +83,20 @@ export class CheckpointWriterProcessTree {
         } while (Date.now() < deadline);
         return false;
     }
+
+    private isGoneOrInaccessibleAfterRootExit(error: unknown, processGroupId: number): boolean {
+        return isProcessError(error, 'ESRCH') || (
+            isProcessError(error, 'EPERM')
+            && this.exitedRootProcessGroupIds.has(processGroupId)
+        );
+    }
+
+    private forget(processGroupId: number): void {
+        this.processGroupIds.delete(processGroupId);
+        this.exitedRootProcessGroupIds.delete(processGroupId);
+    }
 }
 
-function isMissingProcess(error: unknown): boolean {
-    return error instanceof Error && 'code' in error && error.code === 'ESRCH';
+function isProcessError(error: unknown, code: string): boolean {
+    return error instanceof Error && 'code' in error && error.code === code;
 }

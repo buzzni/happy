@@ -1,8 +1,31 @@
 import { spawn } from 'node:child_process';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { CheckpointWriterProcessTree } from './checkpointWriterProcessTree';
 
 describe('CheckpointWriterProcessTree', () => {
+    it('accepts an inaccessible process group only after its tracked root exits', async () => {
+        const exitListeners: Array<() => void> = [];
+        const child = {
+            pid: 424_242,
+            once: (_event: string, listener: () => void) => {
+                exitListeners.push(listener);
+                return child;
+            },
+        };
+        const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+            throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+        });
+        try {
+            const tree = new CheckpointWriterProcessTree();
+            tree.track(child as any);
+            exitListeners[0]();
+
+            await expect(tree.quiesce(() => {})).resolves.toBeUndefined();
+        } finally {
+            kill.mockRestore();
+        }
+    });
+
     it.runIf(process.platform !== 'win32')(
         'does not report quiescence while a detached descendant can still write',
         async () => {

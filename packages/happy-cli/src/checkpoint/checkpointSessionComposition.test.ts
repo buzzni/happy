@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { SandboxConfigSchema } from '@/persistence';
 import { CHECKPOINT_SPAWN_CONTEXT_ENV_KEY } from './checkpointSpawnContext';
@@ -102,6 +102,7 @@ describe('createCheckpointSessionComposition', () => {
             ]));
             expect(result.beforeTurn).toEqual(expect.any(Function));
             const turn = await result.beforeTurn?.();
+            const canonicalCheckpointRoot = await realpath(checkpointRoot);
             expect(turn).toMatchObject({
                 operationId: expect.any(String),
                 checkpointId: expect.stringMatching(/^[a-f0-9]{40,64}$/),
@@ -110,6 +111,7 @@ describe('createCheckpointSessionComposition', () => {
                     denyWritePaths: expect.arrayContaining([canonicalProjectPath]),
                 },
             });
+            expect(turn!.providerPath.startsWith(`${canonicalCheckpointRoot}${sep}`)).toBe(true);
             await expect(readFile(join(turn!.providerPath, 'source.txt'), 'utf8')).resolves.toBe('before');
             if (provider === 'claude-remote') {
                 expect(turn!.claudeSandbox).toMatchObject({
@@ -174,7 +176,7 @@ describe('createCheckpointSessionComposition', () => {
         expect(result.protectedBashCwd?.()).toBeNull();
     });
 
-    it('starts the next turn from a fresh checkpoint in the stable provider workspace slot', async () => {
+    it('rotates the sandbox to a never-reused provider workspace after each completed turn', async () => {
         const result = await createCheckpointSessionComposition({
             provider: 'claude-remote',
             platform: 'darwin',
@@ -190,7 +192,11 @@ describe('createCheckpointSessionComposition', () => {
         await result.completeTurn(async () => {});
         const second = await result.beforeTurn();
 
-        expect(second.providerPath).toBe(first.providerPath);
+        expect(second.providerPath).not.toBe(first.providerPath);
+        expect(result.providerPath).toBe(second.providerPath);
+        expect(result.sandboxConfig?.customWritePaths).toEqual([second.providerPath]);
+        expect(result.claudeSandbox?.filesystem?.allowWrite).toContain(second.providerPath);
+        expect(result.claudeSandbox?.filesystem?.allowWrite).not.toContain(first.providerPath);
         expect(second.operationId).not.toBe(first.operationId);
         expect(second.checkpointId).not.toBe(first.checkpointId);
         await expect(readFile(join(second.providerPath, 'source.txt'), 'utf8')).resolves.toBe('first turn');

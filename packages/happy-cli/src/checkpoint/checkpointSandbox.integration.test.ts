@@ -1,4 +1,4 @@
-import { exec } from 'node:child_process';
+import { exec, spawn } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,7 @@ import { initializeSandbox, wrapCommand } from '@/sandbox/manager';
 import { CheckpointExclusionGuard } from './checkpointExclusionPolicy';
 import { CHECKPOINT_SPAWN_CONTEXT_ENV_KEY } from './checkpointSpawnContext';
 import { createCheckpointSessionComposition } from './checkpointSessionComposition';
+import { CheckpointTurnWorkspace } from './checkpointTurnWorkspace';
 
 const execAsync = promisify(exec);
 
@@ -102,14 +103,16 @@ describe.skipIf(process.platform !== 'darwin')('checkpoint macOS sandbox enforce
         if (!composition.beforeTurn || !composition.completeTurn || !composition.sandboxConfig) {
             throw new Error('expected protected composition');
         }
+        if (!composition.providerPath) throw new Error('expected reserved provider path');
+        cleanupSandbox = await initializeSandbox(composition.sandboxConfig, composition.providerPath);
+        const prewrappedAllowedWrite = await wrapCommand(
+            `printf agent > ${shellQuote(join(composition.providerPath, 'source.txt'))}`,
+        );
         const turn = await composition.beforeTurn();
         await expect(readFile(join(turn.providerPath, 'dependencies', 'package.txt'), 'utf8'))
             .resolves.toBe('cached dependency');
-        cleanupSandbox = await initializeSandbox(composition.sandboxConfig, turn.providerPath);
 
-        await execAsync(await wrapCommand(
-            `printf agent > ${shellQuote(join(turn.providerPath, 'source.txt'))}`,
-        ));
+        await execAsync(prewrappedAllowedWrite);
         await expect(execAsync(await wrapCommand(
             `printf secret > ${shellQuote(join(turn.providerPath, '.env.future'))}`,
         ))).rejects.toBeDefined();
@@ -129,7 +132,97 @@ describe.skipIf(process.platform !== 'darwin')('checkpoint macOS sandbox enforce
         await expect(readFile(join(projectPath, 'source.txt'), 'utf8')).resolves.toBe('agent');
         await expect(stat(join(projectPath, '.env.future'))).rejects.toMatchObject({ code: 'ENOENT' });
     });
+
+    it('seals apply input before a child in a new process session can write through an open descriptor', async () => {
+        checkpointRoot = await mkdtemp('/var/tmp/happy-checkpoint-store-');
+        await writeFile(join(projectPath, 'source.txt'), 'before');
+        const composition = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-escape',
+            sandboxConfig: SandboxConfigSchema.parse({
+                checkpointProtection: {
+                    secretPatterns: ['.env*'],
+                    maxFileBytes: 1024,
+                    maxFiles: 100,
+                    maxTotalBytes: 4096,
+                },
+                extraWritePaths: [],
+                denyReadPaths: [],
+                networkMode: 'blocked',
+                allowLocalBinding: false,
+            }),
+            env: {
+                [CHECKPOINT_SPAWN_CONTEXT_ENV_KEY]: JSON.stringify({
+                    schemaVersion: 1,
+                    projectId: 'project-escape',
+                    worktreeId: null,
+                    checkpointRoot,
+                }),
+            },
+        });
+        const turn = await composition.beforeTurn?.();
+        if (!turn?.sandboxConfig) throw new Error('expected protected turn');
+        cleanupSandbox = await initializeSandbox(turn.sandboxConfig, turn.providerPath);
+        const triggerPath = join(checkpointRoot, 'release-writer');
+        const script = [
+            'import os, time',
+            'pid = os.fork()',
+            'if pid: os._exit(0)',
+            'os.setsid()',
+            `handle = open(${JSON.stringify(join(turn.providerPath, 'source.txt'))}, 'r+')`,
+            "print(f'READY {os.getpid()}', flush=True)",
+            `while not os.path.exists(${JSON.stringify(triggerPath)}): time.sleep(0.01)`,
+            'try:',
+            "    handle.seek(0); handle.write('escaped'); handle.flush(); os.fsync(handle.fileno())",
+            "    print('WROTE', flush=True)",
+            'except OSError:',
+            "    print('DENIED', flush=True)",
+        ].join('\n');
+        const writer = spawn('sh', ['-c', await wrapCommand(`python3 -c ${shellQuote(script)}`)], {
+            detached: true,
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let escapedPid: number | null = null;
+        try {
+            const ready = await waitForOutput(writer, /^READY (\d+)$/m);
+            escapedPid = Number(ready[1]);
+            const frozen = await new CheckpointTurnWorkspace(checkpointRoot).freeze({
+                sessionId: 'session-escape',
+                projectId: 'project-escape',
+                worktreeId: null,
+                operationId: turn.operationId,
+            });
+            const outcome = waitForOutput(writer, /^(DENIED|WROTE)$/m);
+            await writeFile(triggerPath, 'go');
+
+            await expect(outcome).resolves.toMatchObject({ 1: 'WROTE' });
+            await expect(readFile(join(frozen.path, 'source.txt'), 'utf8')).resolves.toBe('before');
+        } finally {
+            if (escapedPid) {
+                try { process.kill(escapedPid, 'SIGKILL'); } catch { /* already exited */ }
+            }
+            try { process.kill(-writer.pid!, 'SIGKILL'); } catch { /* already exited */ }
+        }
+    });
 });
+
+function waitForOutput(child: ReturnType<typeof spawn>, pattern: RegExp): Promise<RegExpMatchArray> {
+    return new Promise((resolve, reject) => {
+        let output = '';
+        const onData = (chunk: Buffer) => {
+            output += chunk.toString('utf8');
+            const match = output.match(pattern);
+            if (match) {
+                child.stdout?.off('data', onData);
+                resolve(match);
+            }
+        };
+        child.once('error', reject);
+        child.stdout?.on('data', onData);
+    });
+}
 
 function shellQuote(value: string): string {
     return `'${value.replaceAll("'", "'\\''")}'`;

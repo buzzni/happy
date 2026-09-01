@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { ChildProcess } from 'node:child_process';
-import { realpath } from 'node:fs/promises';
+import { mkdir, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { SandboxConfig } from '@/persistence';
 import { buildSandboxRuntimeConfig } from '@/sandbox/config';
@@ -38,20 +38,23 @@ export async function createCheckpointSessionComposition(input: {
     sandboxConfig: SandboxConfig | undefined;
     env: Record<string, string | undefined>;
 }): Promise<CheckpointSessionComposition> {
-    const protection = input.sandboxConfig?.checkpointProtection;
+    const inputSandboxConfig = input.sandboxConfig;
+    const protection = inputSandboxConfig?.checkpointProtection;
     if (!protection) return { sandboxConfig: input.sandboxConfig };
-    if (!input.sandboxConfig?.enabled) {
+    if (!inputSandboxConfig.enabled) {
         throw new Error('checkpoint protection requires an enabled sandbox');
     }
     const context = readCheckpointSpawnContext(input.env);
     if (!context) {
         throw new Error('checkpoint protection requires authoritative checkpoint spawn context');
     }
+    await mkdir(context.checkpointRoot, { recursive: true, mode: 0o700 });
+    const canonicalCheckpointRoot = await realpath(context.checkpointRoot);
     const runtime = await createCheckpointRuntime({
         provider: input.provider,
         platform: input.platform,
         projectPath: input.projectPath,
-        checkpointRoot: context.checkpointRoot,
+        checkpointRoot: canonicalCheckpointRoot,
         binding: {
             sessionId: input.sessionId,
             projectId: context.projectId,
@@ -64,48 +67,57 @@ export async function createCheckpointSessionComposition(input: {
         throw new Error(`checkpoint protection unavailable: ${reason}`);
     }
 
-    const turnWorkspace = new CheckpointTurnWorkspace(context.checkpointRoot);
+    const turnWorkspace = new CheckpointTurnWorkspace(canonicalCheckpointRoot);
     const canonicalProjectPath = await realpath(input.projectPath);
     const workspaceBinding = {
         sessionId: input.sessionId,
         projectId: context.projectId,
         worktreeId: context.worktreeId,
     };
-    const providerPath = turnWorkspace.pathFor({ ...workspaceBinding, operationId: 'path-slot' });
-    const workspaceDenyWritePaths = [
-        ...runtime.excludedPaths.map((path) => join(providerPath, path)),
-        ...runtime.excludedPatterns.map((pattern) => join(providerPath, pattern)),
-    ];
-    const sandboxConfig: SandboxConfig = {
-        ...input.sandboxConfig,
+    const sandboxConfigFor = (path: string): SandboxConfig => ({
+        ...inputSandboxConfig,
         sessionIsolation: 'custom',
-        customWritePaths: [providerPath],
+        customWritePaths: [path],
         denyWritePaths: [...new Set([
-            ...input.sandboxConfig.denyWritePaths,
+            ...inputSandboxConfig.denyWritePaths,
             ...runtime.denyWritePaths,
-            ...workspaceDenyWritePaths,
+            ...runtime.excludedPaths.map((excludedPath) => join(path, excludedPath)),
+            ...runtime.excludedPatterns.map((pattern) => join(path, pattern)),
             canonicalProjectPath,
         ])],
-    };
-    const sandboxRuntime = buildSandboxRuntimeConfig(sandboxConfig, providerPath);
-    const claudeSandbox: QueryOptions['sandbox'] | undefined = input.provider === 'claude-remote'
-        ? {
+    });
+    const claudeSandboxFor = (config: SandboxConfig, path: string): QueryOptions['sandbox'] => {
+        const sandboxRuntime = buildSandboxRuntimeConfig(config, path);
+        return {
             enabled: true,
             failIfUnavailable: true,
             allowUnsandboxedCommands: false,
             enableWeakerNetworkIsolation: sandboxRuntime.enableWeakerNetworkIsolation,
             network: sandboxRuntime.network,
             filesystem: sandboxRuntime.filesystem,
-        }
+        };
+    };
+    let nextOperationId = randomUUID();
+    let providerPath = turnWorkspace.pathFor({ ...workspaceBinding, operationId: nextOperationId });
+    const sandboxConfig = sandboxConfigFor(providerPath);
+    const claudeSandbox: QueryOptions['sandbox'] | undefined = input.provider === 'claude-remote'
+        ? claudeSandboxFor(sandboxConfig, providerPath)
         : undefined;
+    const rotateProviderPath = () => {
+        nextOperationId = randomUUID();
+        providerPath = turnWorkspace.pathFor({ ...workspaceBinding, operationId: nextOperationId });
+        Object.assign(sandboxConfig, sandboxConfigFor(providerPath));
+        if (claudeSandbox) Object.assign(claudeSandbox, claudeSandboxFor(sandboxConfig, providerPath));
+    };
     let activeTurn: CheckpointTurnPreparation | null = null;
+    let frozenWorkspacePath: string | null = null;
     let acceptsProtectedWriters = false;
     const protectedWriterTree = new CheckpointWriterProcessTree();
     const beforeTurn = async () => {
         if (activeTurn) {
             throw new Error('checkpoint protected turn is already active');
         }
-        const operationId = randomUUID();
+        const operationId = nextOperationId;
         const snapshot = await runtime.beforeTurn(operationId);
         const workspace = await turnWorkspace.prepare({
             ...workspaceBinding,
@@ -133,12 +145,18 @@ export async function createCheckpointSessionComposition(input: {
         await quiesceWriters();
         await protectedWriterTree.quiesce(() => {});
         const completedTurn = activeTurn;
-        const result = await new CheckpointTurnApplier(context.checkpointRoot).execute({
+        if (!frozenWorkspacePath) {
+            frozenWorkspacePath = (await turnWorkspace.freeze({
+                ...workspaceBinding,
+                operationId: completedTurn.operationId,
+            })).path;
+        }
+        const result = await new CheckpointTurnApplier(canonicalCheckpointRoot).execute({
             ...workspaceBinding,
             operationId: completedTurn.operationId,
             checkpointId: completedTurn.checkpointId,
             projectPath: canonicalProjectPath,
-            workspacePath: completedTurn.providerPath,
+            workspacePath: frozenWorkspacePath,
             excludedPaths: runtime.excludedPaths,
             excludedPatterns: runtime.excludedPatterns,
             readOnlyPassthroughPaths: runtime.readOnlyPassthroughPaths,
@@ -149,6 +167,8 @@ export async function createCheckpointSessionComposition(input: {
                 operationId: completedTurn.operationId,
             });
             activeTurn = null;
+            frozenWorkspacePath = null;
+            rotateProviderPath();
         }
         return result;
     };
@@ -156,7 +176,7 @@ export async function createCheckpointSessionComposition(input: {
     if (input.provider !== 'claude-remote') {
         return {
             sandboxConfig,
-            providerPath,
+            get providerPath() { return providerPath; },
             beforeTurn,
             completeTurn,
             protectedBashCwd,
@@ -166,7 +186,7 @@ export async function createCheckpointSessionComposition(input: {
 
     return {
         sandboxConfig,
-        providerPath,
+        get providerPath() { return providerPath; },
         beforeTurn,
         completeTurn,
         protectedBashCwd,
