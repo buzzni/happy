@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readdir, symlink, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
     CODEX_THREAD_TRANSFER_PENDING_TTL_MS,
@@ -11,6 +11,13 @@ import {
 
 describe('Codex native thread transfer', () => {
     const roots: string[] = [];
+
+    const stagingDirectory = (codexHome: string, targetDirectory: string) => join(
+        codexHome,
+        '.aplus',
+        'native-session-transfers',
+        createHash('sha256').update(targetDirectory).digest('hex'),
+    );
 
     afterEach(async () => {
         const { rm } = await import('node:fs/promises');
@@ -41,9 +48,11 @@ describe('Codex native thread transfer', () => {
         await writeFile(sourcePath, content);
 
         const readThreadPath = vi.fn(async () => sourcePath);
-        const forkThreadFromPath = vi.fn(async (_input: { path: string; cwd: string }) => ({
-            threadId: 'thread-target',
-        }));
+        let importFileMode: number | undefined;
+        const forkThreadFromPath = vi.fn(async (input: { path: string; cwd: string }) => {
+            importFileMode = (await stat(input.path)).mode & 0o777;
+            return { threadId: 'thread-target' };
+        });
         const runtime = createCodexThreadTransferRuntime({
             allowedRoot: root,
             codexHome,
@@ -85,7 +94,11 @@ describe('Codex native thread transfer', () => {
             path: expect.stringContaining('.aplus-codex-transfer-'),
             cwd: targetDirectory,
         });
-        expect(existsSync(forkThreadFromPath.mock.calls[0]![0].path)).toBe(false);
+        const importedPath = forkThreadFromPath.mock.calls[0]![0].path;
+        expect(relative(targetDirectory, importedPath)).toMatch(/^\.\.[/\\]/);
+        expect(existsSync(join(targetDirectory, '.aplus'))).toBe(false);
+        expect(importFileMode).toBe(0o600);
+        expect(existsSync(importedPath)).toBe(false);
         expect(readThreadPath).toHaveBeenCalledWith('thread-source');
         expect(readThreadPath).toHaveBeenCalledTimes(1);
 
@@ -165,16 +178,17 @@ describe('Codex native thread transfer', () => {
             .rejects.toThrow('must be a regular file');
     });
 
-    it('rejects a symlinked target staging directory before creating transfer files', async () => {
+    it('rejects a symlinked Codex staging directory before creating transfer files', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-codex-transfer-target-security-'));
         roots.push(root);
         const codexHome = join(root, '.codex');
         const targetDirectory = join(root, 'workspace', 'target');
         const outsideStaging = join(root, 'outside-staging');
         await mkdir(join(codexHome, 'sessions'), { recursive: true });
-        await mkdir(join(targetDirectory, '.aplus'), { recursive: true });
+        await mkdir(targetDirectory, { recursive: true });
+        await mkdir(join(codexHome, '.aplus'), { recursive: true });
         await mkdir(outsideStaging, { recursive: true });
-        await symlink(outsideStaging, join(targetDirectory, '.aplus', 'native-session-transfers'));
+        await symlink(outsideStaging, join(codexHome, '.aplus', 'native-session-transfers'));
         const runtime = createCodexThreadTransferRuntime({
             allowedRoot: root,
             codexHome,
@@ -192,20 +206,44 @@ describe('Codex native thread transfer', () => {
         expect(await readdir(outsideStaging)).toEqual([]);
     });
 
+    it('rejects a Codex home inside the target directory', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-codex-transfer-home-security-'));
+        roots.push(root);
+        const targetDirectory = join(root, 'workspace', 'target');
+        const codexHome = join(targetDirectory, '.codex');
+        await mkdir(join(codexHome, 'sessions'), { recursive: true });
+        const runtime = createCodexThreadTransferRuntime({
+            allowedRoot: root,
+            codexHome,
+            readThreadPath: vi.fn(),
+            forkThreadFromPath: vi.fn(),
+        });
+
+        await expect(runtime.beginImport({
+            directory: targetDirectory,
+            sourceCodexThreadId: 'thread-source',
+            requestId: '99999999-9999-4999-8999-999999999999',
+            size: 2,
+            sha256: 'a'.repeat(64),
+        })).rejects.toThrow('Codex home must be outside the target directory');
+        expect(existsSync(join(codexHome, '.aplus'))).toBe(false);
+    });
+
     it('removes expired transfer files left by a previous daemon runtime', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-codex-transfer-orphan-'));
         roots.push(root);
         const codexHome = join(root, '.codex');
         const targetDirectory = join(root, 'workspace', 'target');
-        const stagingDirectory = join(targetDirectory, '.aplus', 'native-session-transfers');
+        const transferDirectory = stagingDirectory(codexHome, targetDirectory);
         await mkdir(join(codexHome, 'sessions'), { recursive: true });
-        await mkdir(stagingDirectory, { recursive: true });
+        await mkdir(targetDirectory, { recursive: true });
+        await mkdir(transferDirectory, { recursive: true });
         const orphanName = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.aplus-codex-transfer-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl';
-        const orphanPath = join(stagingDirectory, orphanName);
+        const orphanPath = join(transferDirectory, orphanName);
         await writeFile(orphanPath, 'orphan');
         const expiredAt = new Date(Date.now() - CODEX_THREAD_TRANSFER_PENDING_TTL_MS - 1_000);
         await utimes(orphanPath, expiredAt, expiredAt);
-        await writeFile(join(stagingDirectory, 'keep.txt'), 'keep');
+        await writeFile(join(transferDirectory, 'keep.txt'), 'keep');
         const runtime = createCodexThreadTransferRuntime({
             allowedRoot: root,
             codexHome,
@@ -222,8 +260,8 @@ describe('Codex native thread transfer', () => {
         });
         if (begun.status !== 'ready') throw new Error('expected ready transfer');
 
-        expect(await readdir(stagingDirectory)).not.toContain(orphanName);
-        expect(await readdir(stagingDirectory)).toContain('keep.txt');
+        expect(await readdir(transferDirectory)).not.toContain(orphanName);
+        expect(await readdir(transferDirectory)).toContain('keep.txt');
         await runtime.abortImport({ transferId: begun.transferId });
     });
 
@@ -232,11 +270,12 @@ describe('Codex native thread transfer', () => {
         roots.push(root);
         const codexHome = join(root, '.codex');
         const targetDirectory = join(root, 'workspace', 'target');
-        const stagingDirectory = join(targetDirectory, '.aplus', 'native-session-transfers');
+        const transferDirectory = stagingDirectory(codexHome, targetDirectory);
         await mkdir(join(codexHome, 'sessions'), { recursive: true });
-        await mkdir(stagingDirectory, { recursive: true });
+        await mkdir(targetDirectory, { recursive: true });
+        await mkdir(transferDirectory, { recursive: true });
         const activeName = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.aplus-codex-transfer-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl';
-        await writeFile(join(stagingDirectory, activeName), 'still-active');
+        await writeFile(join(transferDirectory, activeName), 'still-active');
         const runtime = createCodexThreadTransferRuntime({
             allowedRoot: root,
             codexHome,
@@ -253,7 +292,7 @@ describe('Codex native thread transfer', () => {
         });
         if (begun.status !== 'ready') throw new Error('expected ready transfer');
 
-        expect(await readdir(stagingDirectory)).toContain(activeName);
+        expect(await readdir(transferDirectory)).toContain(activeName);
         await runtime.abortImport({ transferId: begun.transferId });
     });
 
@@ -299,5 +338,46 @@ describe('Codex native thread transfer', () => {
             status: 'imported',
             newCodexThreadId: 'thread-target',
         });
+    });
+
+    it('forks only once when the same completed import is committed concurrently', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-codex-transfer-concurrent-commit-'));
+        roots.push(root);
+        const codexHome = join(root, '.codex');
+        const targetDirectory = join(root, 'workspace', 'target');
+        const content = Buffer.from('abc');
+        await mkdir(join(codexHome, 'sessions'), { recursive: true });
+        await mkdir(targetDirectory, { recursive: true });
+        const forkThreadFromPath = vi.fn(async () => ({ threadId: 'thread-target' }));
+        const runtime = createCodexThreadTransferRuntime({
+            allowedRoot: root,
+            codexHome,
+            readThreadPath: vi.fn(),
+            forkThreadFromPath,
+        });
+        const begun = await runtime.beginImport({
+            directory: targetDirectory,
+            sourceCodexThreadId: 'thread-source',
+            requestId: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+            size: content.length,
+            sha256: createHash('sha256').update(content).digest('hex'),
+        });
+        if (begun.status !== 'ready') throw new Error('expected ready transfer');
+        await runtime.writeImportChunk({
+            transferId: begun.transferId,
+            offset: 0,
+            content: content.toString('base64'),
+        });
+
+        const results = await Promise.all([
+            runtime.commitImport({ transferId: begun.transferId }),
+            runtime.commitImport({ transferId: begun.transferId }),
+        ]);
+
+        expect(forkThreadFromPath).toHaveBeenCalledOnce();
+        expect(results).toEqual([
+            { status: 'imported', newCodexThreadId: 'thread-target' },
+            { status: 'imported', newCodexThreadId: 'thread-target' },
+        ]);
     });
 });

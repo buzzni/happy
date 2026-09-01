@@ -104,19 +104,25 @@ function isErrno(error: unknown, code: string): boolean {
 async function ensureTransferDirectory(input: {
     directory: string;
     allowedRoot: string;
-}): Promise<string> {
-    const [canonicalTarget, canonicalAllowedRoot] = await Promise.all([
+    codexHome: string;
+}): Promise<{ canonicalTarget: string; stagingDir: string }> {
+    const [canonicalTarget, canonicalAllowedRoot, canonicalCodexHome] = await Promise.all([
         realpath(input.directory),
         realpath(input.allowedRoot),
+        realpath(input.codexHome),
     ]);
     if (!isInside(canonicalTarget, canonicalAllowedRoot)) {
         throw new Error('directory is outside the working directory');
     }
-    let parent = canonicalTarget;
-    for (const name of ['.aplus', 'native-session-transfers']) {
+    if (isInside(canonicalCodexHome, canonicalTarget)) {
+        throw new Error('Codex home must be outside the target directory for thread transfers');
+    }
+    let parent = canonicalCodexHome;
+    const targetKey = createHash('sha256').update(canonicalTarget).digest('hex');
+    for (const name of ['.aplus', 'native-session-transfers', targetKey]) {
         const next = join(parent, name);
         try {
-            await mkdir(next);
+            await mkdir(next, { mode: 0o700 });
         } catch (error) {
             if (!isErrno(error, 'EEXIST')) throw error;
         }
@@ -128,12 +134,12 @@ async function ensureTransferDirectory(input: {
             throw new Error(`Codex thread transfer directory '${name}' must be a directory`);
         }
         const canonicalNext = await realpath(next);
-        if (!isInside(canonicalNext, canonicalTarget)) {
-            throw new Error(`Codex thread transfer directory '${name}' is outside the target directory`);
+        if (!isInside(canonicalNext, canonicalCodexHome)) {
+            throw new Error(`Codex thread transfer directory '${name}' is outside the Codex home directory`);
         }
         parent = canonicalNext;
     }
-    return parent;
+    return { canonicalTarget, stagingDir: parent };
 }
 
 async function inspectRollout(input: {
@@ -174,6 +180,10 @@ export function createCodexThreadTransferRuntime(deps: CodexThreadTransferDeps) 
     const pendingRequestIds = new Set<string>();
     const sourceSnapshots = new Map<string, SourceSnapshot>();
     const stagingCleanup = new Map<string, Promise<void>>();
+    const committing = new Map<string, Promise<{
+        status: 'imported';
+        newCodexThreadId: string;
+    }>>();
 
     const removeOrphanedTransferFiles = async (stagingDir: string): Promise<void> => {
         const existing = stagingCleanup.get(stagingDir);
@@ -306,9 +316,10 @@ export function createCodexThreadTransferRuntime(deps: CodexThreadTransferDeps) 
             if (!validation.valid || !validation.resolvedPath) {
                 throw new Error(validation.error ?? 'directory is outside the working directory');
             }
-            const stagingDir = await ensureTransferDirectory({
+            const { canonicalTarget, stagingDir } = await ensureTransferDirectory({
                 directory: validation.resolvedPath,
                 allowedRoot: deps.allowedRoot,
+                codexHome: deps.codexHome,
             });
             await removeOrphanedTransferFiles(stagingDir);
             const receiptPath = join(stagingDir, `${input.requestId}.receipt.json`);
@@ -343,7 +354,7 @@ export function createCodexThreadTransferRuntime(deps: CodexThreadTransferDeps) 
             if (existing) {
                 const [existingTransferId, transfer] = existing;
                 if (
-                    transfer.directory !== validation.resolvedPath
+                    transfer.directory !== canonicalTarget
                     || transfer.sourceCodexThreadId !== input.sourceCodexThreadId
                     || transfer.size !== input.size
                     || transfer.sha256 !== input.sha256.toLowerCase()
@@ -362,7 +373,7 @@ export function createCodexThreadTransferRuntime(deps: CodexThreadTransferDeps) 
             const transferId = randomUUID();
             const tempPath = join(stagingDir, `${input.requestId}.aplus-codex-transfer-${transferId}.jsonl`);
             try {
-                const file = await open(tempPath, 'wx');
+                const file = await open(tempPath, 'wx', 0o600);
                 await file.close();
             } catch (error) {
                 pendingRequestIds.delete(input.requestId);
@@ -374,7 +385,7 @@ export function createCodexThreadTransferRuntime(deps: CodexThreadTransferDeps) 
             }, CODEX_THREAD_TRANSFER_PENDING_TTL_MS);
             cleanupTimer.unref();
             pending.set(transferId, {
-                directory: validation.resolvedPath,
+                directory: canonicalTarget,
                 tempPath,
                 receiptPath,
                 sourceCodexThreadId: input.sourceCodexThreadId,
@@ -430,39 +441,57 @@ export function createCodexThreadTransferRuntime(deps: CodexThreadTransferDeps) 
         },
 
         async commitImport(input: { transferId: string }) {
+            const existingCommit = committing.get(input.transferId);
+            if (existingCommit) return existingCommit;
             const transfer = pending.get(input.transferId);
             if (!transfer) throw new Error('Unknown Codex thread transfer');
-            if (transfer.bytesWritten !== transfer.size) {
-                await discard(input.transferId, transfer);
-                throw new Error(
-                    `Codex thread transfer is incomplete: ${transfer.bytesWritten}/${transfer.size} bytes`,
-                );
-            }
-            if (await sha256File(transfer.tempPath) !== transfer.sha256) {
-                await discard(input.transferId, transfer);
-                throw new Error('Codex thread transfer hash mismatch');
-            }
-            try {
-                const forked = await deps.forkThreadFromPath({
-                    path: transfer.tempPath,
-                    cwd: transfer.directory,
-                });
-                const receiptTempPath = `${transfer.receiptPath}.${randomUUID()}.tmp`;
-                const receiptFile = await open(receiptTempPath, 'wx');
+            pending.delete(input.transferId);
+            clearTimeout(transfer.cleanupTimer);
+            const commit = (async () => {
                 try {
-                    await receiptFile.writeFile(JSON.stringify({
-                        version: 1,
-                        sourceCodexThreadId: transfer.sourceCodexThreadId,
-                        sha256: transfer.sha256,
-                        newCodexThreadId: forked.threadId,
-                    }));
+                    if (transfer.bytesWritten !== transfer.size) {
+                        throw new Error(
+                            `Codex thread transfer is incomplete: ${transfer.bytesWritten}/${transfer.size} bytes`,
+                        );
+                    }
+                    if (await sha256File(transfer.tempPath) !== transfer.sha256) {
+                        throw new Error('Codex thread transfer hash mismatch');
+                    }
+                    let receiptTempPath: string | undefined;
+                    try {
+                        const forked = await deps.forkThreadFromPath({
+                            path: transfer.tempPath,
+                            cwd: transfer.directory,
+                        });
+                        receiptTempPath = `${transfer.receiptPath}.${randomUUID()}.tmp`;
+                        const receiptFile = await open(receiptTempPath, 'wx', 0o600);
+                        try {
+                            await receiptFile.writeFile(JSON.stringify({
+                                version: 1,
+                                sourceCodexThreadId: transfer.sourceCodexThreadId,
+                                sha256: transfer.sha256,
+                                newCodexThreadId: forked.threadId,
+                            }));
+                        } finally {
+                            await receiptFile.close();
+                        }
+                        await rename(receiptTempPath, transfer.receiptPath);
+                        receiptTempPath = undefined;
+                        return { status: 'imported' as const, newCodexThreadId: forked.threadId };
+                    } finally {
+                        if (receiptTempPath) await rm(receiptTempPath, { force: true });
+                    }
                 } finally {
-                    await receiptFile.close();
+                    await discard(input.transferId, transfer);
                 }
-                await rename(receiptTempPath, transfer.receiptPath);
-                return { status: 'imported' as const, newCodexThreadId: forked.threadId };
+            })();
+            committing.set(input.transferId, commit);
+            try {
+                return await commit;
             } finally {
-                await discard(input.transferId, transfer);
+                if (committing.get(input.transferId) === commit) {
+                    committing.delete(input.transferId);
+                }
             }
         },
     };
