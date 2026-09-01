@@ -19,6 +19,7 @@ export type CheckpointExclusionPolicy = {
     maxFileBytes: number;
     maxFiles: number;
     maxTotalBytes: number;
+    readOnlyPassthroughPaths?: string[];
 };
 
 type CheckpointExcludedPath = CheckpointEventDetail['summary']['excluded'][number];
@@ -26,6 +27,7 @@ type CheckpointExcludedPath = CheckpointEventDetail['summary']['excluded'][numbe
 export type CheckpointExclusionManifest = {
     excluded: CheckpointExcludedPath[];
     denyWritePaths: string[];
+    readOnlyPassthroughPaths: string[];
     fingerprint: string;
 };
 
@@ -122,6 +124,16 @@ async function buildCheckpointExclusionManifest(
     }
 
     excluded.sort((left, right) => left.path.localeCompare(right.path));
+    const readOnlyPassthroughPaths = normalizeReadOnlyPassthroughPaths(
+        policy.readOnlyPassthroughPaths ?? [],
+    );
+    for (const path of readOnlyPassthroughPaths) {
+        const exclusion = excluded.find((entry) => entry.path === path);
+        const stats = await lstat(join(projectPath, path));
+        if (exclusion?.reason !== 'ignored' || !stats.isDirectory() || stats.isSymbolicLink()) {
+            throw new Error('checkpoint read-only passthrough must be an ignored directory');
+        }
+    }
     const denyWritePaths = [...new Set([
         ...policy.secretPatterns.map((pattern) => join(projectPath, pattern)),
         ...excluded.map((entry) => join(projectPath, entry.path)),
@@ -132,10 +144,25 @@ async function buildCheckpointExclusionManifest(
             limits: [policy.maxFileBytes, policy.maxFiles, policy.maxTotalBytes],
             excluded,
             denyWritePaths,
+            readOnlyPassthroughPaths,
         }))
         .digest('hex');
 
-    return { excluded, denyWritePaths, fingerprint };
+    return { excluded, denyWritePaths, readOnlyPassthroughPaths, fingerprint };
+}
+
+function normalizeReadOnlyPassthroughPaths(paths: string[]): string[] {
+    return [...new Set(paths.map((path) => {
+        if (
+            path.length === 0
+            || path.includes('\0')
+            || /^(?:[A-Za-z]:|[\\/])/.test(path)
+            || path.split(/[\\/]+/).includes('..')
+        ) {
+            throw new Error('checkpoint read-only passthrough must be a project-relative path');
+        }
+        return path.split(/[\\/]+/).filter(Boolean).join('/');
+    }))].sort();
 }
 
 function normalizeSecretPatterns(patterns: string[]): string[] {

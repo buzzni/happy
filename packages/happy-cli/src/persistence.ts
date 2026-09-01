@@ -33,6 +33,7 @@ export const SandboxConfigSchema = z.object({
     maxFileBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     maxFiles: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     maxTotalBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    readOnlyPassthroughPaths: z.array(z.string()).optional(),
   }).strict().optional(),
 });
 

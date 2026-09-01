@@ -16,7 +16,7 @@ export type {
     SettingSource,
 } from '@anthropic-ai/claude-agent-sdk'
 
-import type { AgentDefinition, SandboxSettings, SettingSource } from '@anthropic-ai/claude-agent-sdk'
+import type { AgentDefinition, Options, SandboxSettings, SettingSource } from '@anthropic-ai/claude-agent-sdk'
 
 // Re-export AbortError class
 export { AbortError } from '@anthropic-ai/claude-agent-sdk'
@@ -79,6 +79,7 @@ export interface QueryOptions {
      */
     skills?: string[] | 'all'
     sandbox?: SandboxSettings
+    spawnClaudeCodeProcess?: Options['spawnClaudeCodeProcess']
 }
 
 /**

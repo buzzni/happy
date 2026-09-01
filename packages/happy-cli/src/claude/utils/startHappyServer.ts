@@ -8,6 +8,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createServer } from "node:http";
+import type { ChildProcess } from 'node:child_process';
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { AddressInfo } from "node:net";
 import { z } from "zod";
@@ -30,6 +31,8 @@ export const BASH_STREAM_AGENT_TOOL_NAME = 'mcp__happy__bash_stream';
 export interface HappyServerHandlers {
     changeTitle: (title: string, branchSlug?: string) => Promise<{ success: boolean; error?: string }>;
     client: ApiSessionClient;
+    protectedBashCwd?: () => string | null;
+    trackProtectedBashProcess?: (child: ChildProcess) => void;
 }
 
 // The first title generated through change_title is the one users rely on to
@@ -134,9 +137,15 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
     }, async (args) => {
         logger.debug(`[bash_stream:tool] invoked command=${String(args.command).slice(0, 100)}`);
         try {
+            const protectedCwd = handlers.protectedBashCwd?.();
+            if (handlers.protectedBashCwd && !protectedCwd) {
+                throw new Error('checkpoint protection has no active turn workspace');
+            }
             const result = await runBashStream({
                 command: args.command,
-                cwd: args.cwd,
+                cwd: protectedCwd ?? args.cwd,
+                detached: Boolean(handlers.protectedBashCwd),
+                onSpawn: handlers.trackProtectedBashProcess,
                 onProgress: (progress) => {
                     const call = getActiveBashStreamCall();
                     logger.debug(`[bash_stream:tool] flush stream=${progress.stream} lines=${progress.lines.length} call=${call ?? '(none)'}`);
@@ -349,13 +358,24 @@ function registerBrowserTools(mcp: McpServer): void {
     }, async (args) => runBrowserTool({ request: bridge, status, method: 'tabs_close', params: { profile: args.profile, tabId: args.tabId } }));
 }
 
-export async function startHappyServer(client: ApiSessionClient) {
+export async function startHappyServer(
+    client: ApiSessionClient,
+    options: {
+        protectedBashCwd?: () => string | null;
+        trackProtectedBashProcess?: (child: ChildProcess) => void;
+    } = {},
+) {
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
 
     const changeTitle = createChangeTitleHandler(client);
 
     const server = createServer(async (req, res) => {
-        const mcp = createMcpServer({ changeTitle, client });
+        const mcp = createMcpServer({
+            changeTitle,
+            client,
+            protectedBashCwd: options.protectedBashCwd,
+            trackProtectedBashProcess: options.trackProtectedBashProcess,
+        });
         try {
             const transport = new StreamableHTTPServerTransport({
                 sessionIdGenerator: undefined

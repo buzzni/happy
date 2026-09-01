@@ -714,6 +714,7 @@ export async function runCodex(opts: {
     client = new CodexAppServerClient(
         checkpointComposition.sandboxConfig,
         checkpointComposition.beforeTurn,
+        checkpointComposition.completeTurn,
     );
 
     registerCodexSteerHandler({
@@ -976,7 +977,10 @@ export async function runCodex(opts: {
     });
 
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
-    const happyServer = await startHappyServer(session);
+    const happyServer = await startHappyServer(session, {
+        protectedBashCwd: checkpointComposition.protectedBashCwd,
+        trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
+    });
     // Launch the bridge via `node <path>` (rather than relying on the .mjs shebang)
     // so it works on Windows, where Windows can't execute shebang scripts directly.
     // codex would otherwise fail to start the MCP server, the change_title tool would
@@ -1148,6 +1152,13 @@ export async function runCodex(opts: {
             }
 
             try {
+                if (checkpointComposition.completeTurn && !client.isConnected) {
+                    const expectedThreadId = client.threadId;
+                    const resumed = await client.reconnectAndResumeThread();
+                    if (expectedThreadId && !resumed) {
+                        throw new Error('checkpoint protection could not resume the Codex thread');
+                    }
+                }
                 // Map permission mode to approval policy and sandbox.
                 // With app-server, these are per-turn — no restart needed on mode change.
                 const sandboxManagedByHappy = client.sandboxEnabled;

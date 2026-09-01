@@ -89,6 +89,7 @@ describe('claudeRemote', () => {
             allowUnsandboxedCommands: false,
             filesystem: { denyWrite: ['/project/**/.env*'] },
         };
+        const providerPath = '/private/checkpoints/turn-1';
 
         await claudeRemote({
             sessionId: null,
@@ -98,7 +99,12 @@ describe('claudeRemote', () => {
             exitAfterFirstTurn: true,
             sandbox,
             nextMessage: async () => ({ message: 'edit the project', mode }),
-            beforeTurn: vi.fn(async () => {}),
+            beforeTurn: vi.fn(async () => ({
+                operationId: 'turn-1',
+                checkpointId: 'a'.repeat(40),
+                providerPath,
+                claudeSandbox: sandbox,
+            })),
             onReady: vi.fn(),
             canCallTool: async () => ({ behavior: 'allow' }) as any,
             isAborted: () => false,
@@ -108,8 +114,49 @@ describe('claudeRemote', () => {
         });
 
         expect(query).toHaveBeenCalledWith(expect.objectContaining({
-            options: expect.objectContaining({ sandbox }),
+            options: expect.objectContaining({ sandbox, cwd: providerPath }),
         }));
+    });
+
+    it('closes the protected provider tree before applying and announcing ready', async () => {
+        const calls: string[] = [];
+        const close = vi.fn(() => calls.push('close'));
+        vi.mocked(query).mockReturnValue({
+            close,
+            setPermissionMode: vi.fn(),
+            mcpServerStatus: vi.fn(async () => []),
+            async *[Symbol.asyncIterator]() {
+                yield { type: 'result', subtype: 'success' };
+            },
+        } as any);
+
+        const result = await claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage: async () => ({ message: 'edit the project', mode }),
+            beforeTurn: vi.fn(async () => ({
+                operationId: 'turn-1',
+                checkpointId: 'a'.repeat(40),
+                providerPath: '/private/checkpoints/active-turn',
+            })),
+            completeTurn: vi.fn(async (quiesceWriters) => {
+                await quiesceWriters();
+                calls.push('apply');
+                return { status: 'completed' as const, entries: [] };
+            }),
+            onReady: () => calls.push('ready'),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+        });
+
+        expect(result).toBe('protected-turn-complete');
+        expect(close).toHaveBeenCalledOnce();
+        expect(calls).toEqual(['close', 'apply', 'ready']);
     });
 
     it('does not dispatch an excluded-path retry while protection confirmation is pending', async () => {

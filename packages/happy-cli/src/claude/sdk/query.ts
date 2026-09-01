@@ -50,6 +50,7 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         settingSources: opts?.settingSources,
         skills: opts?.skills,
         sandbox: opts?.sandbox,
+        spawnClaudeCodeProcess: opts?.spawnClaudeCodeProcess,
     }
 
     // Map abort signal -> AbortController

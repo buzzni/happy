@@ -476,7 +476,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     });
 
     // Start Happy MCP server
-    const happyServer = await startHappyServer(session);
+    const happyServer = await startHappyServer(session, {
+        protectedBashCwd: checkpointComposition.protectedBashCwd,
+        trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
+    });
     logger.debug(`[START] Happy MCP server started at ${happyServer.url}`);
 
     // Variable to track current session instance (updated via onSessionReady callback)

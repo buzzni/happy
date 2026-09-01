@@ -157,6 +157,43 @@ describe('CheckpointExclusionGuard', () => {
         expect(guard.manifest.denyWritePaths).toContain(join(projectPath, '**', '.env*'));
     });
 
+    it('allows read-only passthrough only for an ignored directory', async () => {
+        await mkdir(join(projectPath, 'dependencies'));
+        await writeFile(join(projectPath, '.gitignore'), 'dependencies/\n');
+        const guard = await CheckpointExclusionGuard.create({
+            projectPath,
+            secretPatterns: [],
+            readOnlyPassthroughPaths: ['dependencies'],
+            maxFileBytes: 1024,
+            maxFiles: 100,
+            maxTotalBytes: 4096,
+        });
+
+        expect(guard.manifest.readOnlyPassthroughPaths).toEqual(['dependencies']);
+        await expect(CheckpointExclusionGuard.create({
+            projectPath,
+            secretPatterns: [],
+            readOnlyPassthroughPaths: ['.gitignore'],
+            maxFileBytes: 1024,
+            maxFiles: 100,
+            maxTotalBytes: 4096,
+        })).rejects.toThrow('ignored directory');
+    });
+
+    it.each(['/absolute', '../outside'])(
+        'rejects an unsafe read-only passthrough path: %j',
+        async (readOnlyPassthroughPath) => {
+            await expect(CheckpointExclusionGuard.create({
+                projectPath,
+                secretPatterns: [],
+                readOnlyPassthroughPaths: [readOnlyPassthroughPath],
+                maxFileBytes: 1024,
+                maxFiles: 100,
+                maxTotalBytes: 4096,
+            })).rejects.toThrow('project-relative');
+        },
+    );
+
     it.each(['', '/etc/**', '../outside/**', '!safe.env'])(
         'rejects a secret deny pattern that can escape or weaken protection: %j',
         async (secretPattern) => {

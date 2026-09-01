@@ -522,8 +522,10 @@ describe('CodexAppServerClient sandbox integration', () => {
 
     it('runs the checkpoint gate exactly once before dispatching a protected turn', async () => {
         const order: string[] = [];
+        const requests: MockRpcMessage[] = [];
         mockSpawn.mockImplementation(() => createMockProcess({
             onRequest: (msg, stdout) => {
+                requests.push(msg);
                 if (msg.method === 'thread/start' && msg.id != null) {
                     setTimeout(() => pushJsonLine(stdout, {
                         id: msg.id,
@@ -549,19 +551,32 @@ describe('CodexAppServerClient sandbox integration', () => {
                 }
             },
         }));
-        const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient();
         const beforeTurn = vi.fn(async () => {
             order.push('gate');
+            return {
+                operationId: 'turn-1',
+                checkpointId: 'a'.repeat(40),
+                providerPath: '/private/checkpoints/codex-turn-1',
+            };
         });
+        const completeTurn = vi.fn(async (quiesceWriters: () => Promise<void>) => {
+            await quiesceWriters();
+            order.push('apply');
+            return { status: 'completed' as const, entries: [] };
+        });
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(undefined, beforeTurn, completeTurn);
         await client.connect();
         await client.startThread({ cwd: '/tmp/project', sandbox: 'workspace-write' });
 
-        await expect(client.sendTurnAndWait('edit the project', { beforeTurn }))
+        await expect(client.sendTurnAndWait('edit the project'))
             .resolves.toEqual({ aborted: false });
 
         expect(beforeTurn).toHaveBeenCalledOnce();
-        expect(order).toEqual(['gate', 'provider']);
+        expect(completeTurn).toHaveBeenCalledOnce();
+        expect(order).toEqual(['gate', 'provider', 'apply']);
+        expect(requests.find(({ method }) => method === 'turn/start')?.params.cwd)
+            .toBe('/private/checkpoints/codex-turn-1');
         await client.disconnect();
     });
 

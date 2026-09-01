@@ -346,6 +346,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     hookSettingsPath: session.hookSettingsPath,
                     sandbox: session.checkpointComposition?.claudeSandbox,
                     beforeTurn: session.checkpointComposition?.beforeTurn,
+                    completeTurn: session.checkpointComposition?.completeTurn,
                     jsRuntime: session.jsRuntime,
                     canCallTool: permissionHandler.handleToolCall,
                     isAborted: (toolCallId: string) => {

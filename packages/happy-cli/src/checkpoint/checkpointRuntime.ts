@@ -42,6 +42,9 @@ export type CheckpointRuntime =
     | {
         status: 'protected';
         denyWritePaths: string[];
+        excludedPaths: string[];
+        excludedPatterns: string[];
+        readOnlyPassthroughPaths: string[];
         beforeTurn(operationId: string): Promise<CheckpointSnapshotResult>;
         recordMutation(mutation: RuntimeMutation): Promise<CheckpointLedgerRecord>;
     };
@@ -70,10 +73,15 @@ export async function createCheckpointRuntime(
     return {
         status: 'protected',
         denyWritePaths: guard.manifest.denyWritePaths,
+        excludedPaths: guard.manifest.excluded.map((entry) => entry.path),
+        excludedPatterns: guard.secretPatterns,
+        readOnlyPassthroughPaths: guard.manifest.readOnlyPassthroughPaths,
         beforeTurn: (operationId) => guard.dispatchAfterPolicyCheck(() => store.snapshotTurn({
             ...binding,
             operationId,
-            excludedPaths: guard.manifest.excluded.map((entry) => entry.path),
+            excludedPaths: guard.manifest.excluded
+                .filter((entry) => entry.reason !== 'ignored')
+                .map((entry) => entry.path),
             excludedPatterns: guard.secretPatterns,
         })),
         recordMutation: (mutation) => ledger.recordMutation({

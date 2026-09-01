@@ -1,4 +1,5 @@
 import { EnhancedMode } from "./loop";
+import { spawn } from 'node:child_process';
 import { query, type QueryOptions, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
 import type { MessageParam } from '@anthropic-ai/sdk/resources'
 import { mapToClaudeMode } from "./utils/permissionMode";
@@ -23,6 +24,8 @@ import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/con
 import { buildClaudeSystemPromptOptions } from './claudePrompt';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
 import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
+import type { CheckpointSessionComposition, CheckpointTurnPreparation } from '@/checkpoint/checkpointSessionComposition';
+import { CheckpointWriterProcessTree } from '@/checkpoint/checkpointWriterProcessTree';
 
 export type ClaudeActiveInputSender = (text: string) => boolean;
 
@@ -52,7 +55,8 @@ export async function claudeRemote(opts: {
 
     // Dynamic parameters
     nextMessage: () => Promise<{ message: MessageParam['content'], mode: EnhancedMode } | null>,
-    beforeTurn?: () => Promise<void>,
+    beforeTurn?: () => Promise<CheckpointTurnPreparation | void>,
+    completeTurn?: CheckpointSessionComposition['completeTurn'],
     onReady: () => void,
     isAborted: (toolCallId: string) => boolean,
 
@@ -72,7 +76,7 @@ export async function claudeRemote(opts: {
 
     // Check if session is valid
     let startFrom = opts.sessionId;
-    if (opts.sessionId && !claudeCheckSession(opts.sessionId, opts.path)) {
+    if (opts.sessionId && !opts.completeTurn && !claudeCheckSession(opts.sessionId, opts.path)) {
         startFrom = null;
     }
     
@@ -134,7 +138,9 @@ export async function claudeRemote(opts: {
         return;
     }
 
-    await opts.beforeTurn?.();
+    const initialTurn = await opts.beforeTurn?.();
+    const providerPath = initialTurn?.providerPath ?? opts.path;
+    const providerSandbox = initialTurn?.claudeSandbox ?? opts.sandbox;
 
     // Handle /compact command
     let isCompactCommand = false;
@@ -186,8 +192,9 @@ export async function claudeRemote(opts: {
     });
 
     const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
+    const writerProcessTree = opts.completeTurn ? new CheckpointWriterProcessTree() : null;
     const sdkOptions: QueryOptions = {
-        cwd: opts.path,
+        cwd: providerPath,
         additionalDirectories: readAdditionalDirectoriesEnvironment(process.env),
         resume: startFrom ?? undefined,
         mcpServers: hasMcpServers ? mergedMcpServers : undefined,
@@ -206,7 +213,22 @@ export async function claudeRemote(opts: {
         abort: opts.signal,
         settingsPath: opts.hookSettingsPath,
         promptSuggestions: true,
-        sandbox: opts.sandbox,
+        sandbox: providerSandbox,
+        spawnClaudeCodeProcess: writerProcessTree
+            ? (spawnOptions) => {
+                const child = spawn(spawnOptions.command, spawnOptions.args, {
+                    cwd: spawnOptions.cwd,
+                    env: spawnOptions.env,
+                    signal: spawnOptions.signal,
+                    detached: true,
+                    stdio: ['pipe', 'pipe', 'inherit'],
+                });
+                writerProcessTree.track(child);
+                return child as NonNullable<QueryOptions['spawnClaudeCodeProcess']> extends (...args: any[]) => infer Result
+                    ? Result
+                    : never;
+            }
+            : undefined,
     }
 
     // Track thinking state
@@ -314,7 +336,7 @@ export async function claudeRemote(opts: {
                 // Start a watcher for to detect the session id
                 if (systemInit.session_id) {
                     logger.debug(`[claudeRemote] Waiting for session file to be written to disk: ${systemInit.session_id}`);
-                    const projectDir = getProjectPath(opts.path);
+                    const projectDir = getProjectPath(providerPath);
                     const found = await awaitFileExist(join(projectDir, `${systemInit.session_id}.jsonl`), 30000);
                     logger.debug(`[claudeRemote] Session file found: ${systemInit.session_id} ${found}`);
                     if (!found) {
@@ -352,6 +374,23 @@ export async function claudeRemote(opts: {
                     isCompactCommand = false;
                 }
 
+                if (opts.completeTurn) {
+                    messages.end();
+                    const applyResult = await opts.completeTurn(() => {
+                        if (!writerProcessTree) {
+                            throw new Error('checkpoint writer process tree is unavailable');
+                        }
+                        return writerProcessTree.quiesce(() => response.close());
+                    });
+                    if (applyResult.status !== 'completed') {
+                        throw new Error('checkpoint turn apply did not complete');
+                    }
+                    opts.onReady();
+                    return opts.exitAfterFirstTurn
+                        ? 'turn-complete' as const
+                        : 'protected-turn-complete' as const;
+                }
+
                 // Send ready event
                 opts.onReady();
 
@@ -368,7 +407,10 @@ export async function claudeRemote(opts: {
                     } else {
                         await mcpConfigSynchronizer?.sync();
                         try {
-                            await opts.beforeTurn?.();
+                            const nextTurn = await opts.beforeTurn?.();
+                            if (nextTurn?.providerPath && nextTurn.providerPath !== providerPath) {
+                                throw new Error('checkpoint protection requires a provider restart for the next turn');
+                            }
                         } catch (error) {
                             messages.setError(error instanceof Error ? error : new Error(String(error)));
                             return;
