@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Prisma, type AutomationRunOutcome, type Prisma as PrismaTypes } from '@prisma/client';
+import { AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION } from '@slopus/happy-wire';
 import { invalidateSessionFollowups } from './sessionFollowupInvalidationService';
 
 type Tx = PrismaTypes.TransactionClient;
@@ -46,7 +47,20 @@ export async function registerAutomationMachineKey(
             });
             if (changed.count === 0) return { ok: false, error: 'key-version-conflict' };
         }
-        return { ok: true, value: { keyVersion: current.automationKeyVersion, invalidatedProjectIds: [] } };
+        const invalidated = input.protocolVersion < AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION
+            ? await invalidateSessionFollowups(
+                tx,
+                { machineAccountId: accountId, machineId },
+                'TARGET_MISMATCH',
+            )
+            : [];
+        return {
+            ok: true,
+            value: {
+                keyVersion: current.automationKeyVersion,
+                invalidatedProjectIds: [...new Set(invalidated.map((followup) => followup.projectId as string))],
+            },
+        };
     }
     const changed = await tx.machine.updateMany({
         where: { id: machineId, accountId, automationKeyVersion: input.expectedKeyVersion },

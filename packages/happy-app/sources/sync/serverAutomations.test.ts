@@ -62,6 +62,7 @@ describe('server automation repository', () => {
             machineAccountId: 'account-1', machineId: 'machine-1',
             machinePublicKey: encodeBase64(machine.publicKey), machineKeyVersion: 2,
             viewerPublicKey: null, viewerKeyVersion: 0, automationProtocolVersion: 1,
+            sessionFollowupSupported: false,
         };
         let stored: AutomationPublic | null = null;
         const api: AutomationApiClient = {
