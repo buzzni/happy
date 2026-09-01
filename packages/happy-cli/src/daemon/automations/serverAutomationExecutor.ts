@@ -1339,20 +1339,12 @@ async function executeStartedRun(
       input.logDebug?.(
         `[server-automation] ${automation.automationId} GitHub worktree preparation failed: ${prepared.error}`,
       )
-      // AgentTask 는 이 시점에 서버가 task 를 이미 확정했다. 여기서 중단하면 그 task 는
-      // 워커 없이 lease 만료까지 남는다. worktree 는 리뷰 품질을 올려 주는 것이지
-      // 전제가 아니므로, 준비에 실패하면 기존처럼 프로젝트 디렉터리에서 계속한다 —
-      // 그 경우 대상 SHA 테스트는 못 돌지만 immutable diff 로 리뷰 자체는 된다.
-      if (agentTaskDispatch) {
-        input.logDebug?.(
-          `[server-automation] ${automation.automationId} reviewing in the project directory instead`
-          + ' — the worker cannot run target-SHA tests there',
-        )
-      } else {
-      // 되돌릴 수 없는 실패(삭제된 브랜치 등)는 재시도해도 결과가 같다. ERROR 로
-      // 돌아가면 이 경로가 persistGithubTriggerState 에 도달하지 않아 이벤트가
-      // 소비되지 않고 매분 재시도된다(2026-08-29: 머지 후 삭제된 브랜치 하나가
-      // 그렇게 돌았다). 이벤트를 소비하고 SKIPPED_GATE 로 끊는다.
+      // 되돌릴 수 없는 실패(삭제된 브랜치 등)는 재시도해도, 폴백해도 결과가 같다 —
+      // 리뷰할 대상 자체가 없다. AgentTask 든 아니든 이벤트를 소비하고 끊는다.
+      //
+      // 이 판정이 아래 AgentTask 폴백보다 먼저 와야 한다. 2026-09-01 에 순서가
+      // 뒤바뀌어 있어, 머지되며 브랜치가 사라진 PR 을 프로젝트 디렉터리에서
+      // 리뷰하려고 워커를 띄웠다.
       if (isPermanentGithubTriggerFailure(prepared.error)) {
         input.logDebug?.(
           `[server-automation] ${automation.automationId} skipping permanently unavailable GitHub event`,
@@ -1363,10 +1355,20 @@ async function executeStartedRun(
           ...(degradedCode ? { degradedCode } : {}),
         }
       }
-      return {
-        outcome: 'ERROR', sessionId: null,
-        ...(degradedCode ? { degradedCode } : {}),
-      }
+      // 일시적 실패(디스크, 잠금 등)에서 AgentTask 는 이 시점에 서버가 task 를 이미
+      // 확정했다. 여기서 중단하면 그 task 는 워커 없이 lease 만료까지 남는다.
+      // worktree 는 리뷰 품질을 올려 주는 것이지 전제가 아니므로 프로젝트
+      // 디렉터리에서 계속한다 — 대상 SHA 테스트는 못 돌지만 리뷰 자체는 된다.
+      if (agentTaskDispatch) {
+        input.logDebug?.(
+          `[server-automation] ${automation.automationId} reviewing in the project directory instead`
+          + ' — the worker cannot run target-SHA tests there',
+        )
+      } else {
+        return {
+          outcome: 'ERROR', sessionId: null,
+          ...(degradedCode ? { degradedCode } : {}),
+        }
       }
     } else {
       githubWorktree = prepared
