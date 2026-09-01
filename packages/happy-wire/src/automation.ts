@@ -66,6 +66,10 @@ export const githubTriggerSchema = z.object({
   }),
   action: z.enum(['notify', 'start-session', 'agent-task-review']),
   githubCredentialId: z.string().trim().min(1).max(200).nullable(),
+  // high 발견이 있을 때 AgentTask 리뷰 코멘트에서 소환할 GitHub 핸들. 코멘트를
+  // 조립하는 건 서버라 워커 프롬프트로는 전달할 수 없다 — 설정이 유일한 통로다.
+  // 값의 형식(핸들 모양)은 코멘트를 만드는 쪽에서 다시 검증한다.
+  escalateTo: z.array(z.string().trim().min(1).max(64)).max(10).optional(),
 }).superRefine((trigger, context) => {
   if (trigger.action === 'agent-task-review' && trigger.githubCredentialId === null) {
     context.addIssue({

@@ -123,6 +123,7 @@ export interface ServerAutomationExecutorInput {
     | { ok: false; error: string }
   >
   dispatchAgentTask: (input: {
+    escalateTo?: string[]
     runId: string
     claimToken: string
     credentialId: string
@@ -1123,6 +1124,11 @@ async function executeStartedRun(
         runId: run.runId,
         claimToken: run.claimToken,
         credentialId,
+        // 담당자 소환은 서버가 조립하는 코멘트에서만 가능하다. 서버는 자동화 payload 를
+        // 복호화할 수 없으므로 여기서 실어 보내야 알 수 있다.
+        ...(payload.githubTrigger.escalateTo?.length
+          ? { escalateTo: payload.githubTrigger.escalateTo }
+          : {}),
         event: planned.event ? {
           event: planned.event.event,
           prNumber: planned.event.pr.number,
