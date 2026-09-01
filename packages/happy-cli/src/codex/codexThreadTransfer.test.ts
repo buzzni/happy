@@ -1,10 +1,13 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readdir, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createCodexThreadTransferRuntime } from './codexThreadTransfer';
+import {
+    CODEX_THREAD_TRANSFER_PENDING_TTL_MS,
+    createCodexThreadTransferRuntime,
+} from './codexThreadTransfer';
 
 describe('Codex native thread transfer', () => {
     const roots: string[] = [];
@@ -153,7 +156,7 @@ describe('Codex native thread transfer', () => {
         expect(await readdir(outsideStaging)).toEqual([]);
     });
 
-    it('removes untracked transfer files left by a previous daemon runtime', async () => {
+    it('removes expired transfer files left by a previous daemon runtime', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-codex-transfer-orphan-'));
         roots.push(root);
         const codexHome = join(root, '.codex');
@@ -162,7 +165,10 @@ describe('Codex native thread transfer', () => {
         await mkdir(join(codexHome, 'sessions'), { recursive: true });
         await mkdir(stagingDirectory, { recursive: true });
         const orphanName = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.aplus-codex-transfer-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl';
-        await writeFile(join(stagingDirectory, orphanName), 'orphan');
+        const orphanPath = join(stagingDirectory, orphanName);
+        await writeFile(orphanPath, 'orphan');
+        const expiredAt = new Date(Date.now() - CODEX_THREAD_TRANSFER_PENDING_TTL_MS - 1_000);
+        await utimes(orphanPath, expiredAt, expiredAt);
         await writeFile(join(stagingDirectory, 'keep.txt'), 'keep');
         const runtime = createCodexThreadTransferRuntime({
             allowedRoot: root,
@@ -182,6 +188,36 @@ describe('Codex native thread transfer', () => {
 
         expect(await readdir(stagingDirectory)).not.toContain(orphanName);
         expect(await readdir(stagingDirectory)).toContain('keep.txt');
+        await runtime.abortImport({ transferId: begun.transferId });
+    });
+
+    it('preserves recent transfer files that may belong to an overlapping daemon runtime', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-codex-transfer-overlap-'));
+        roots.push(root);
+        const codexHome = join(root, '.codex');
+        const targetDirectory = join(root, 'workspace', 'target');
+        const stagingDirectory = join(targetDirectory, '.aplus', 'native-session-transfers');
+        await mkdir(join(codexHome, 'sessions'), { recursive: true });
+        await mkdir(stagingDirectory, { recursive: true });
+        const activeName = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.aplus-codex-transfer-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl';
+        await writeFile(join(stagingDirectory, activeName), 'still-active');
+        const runtime = createCodexThreadTransferRuntime({
+            allowedRoot: root,
+            codexHome,
+            readThreadPath: vi.fn(),
+            forkThreadFromPath: vi.fn(),
+        });
+
+        const begun = await runtime.beginImport({
+            directory: targetDirectory,
+            sourceCodexThreadId: 'thread-source',
+            requestId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+            size: 2,
+            sha256: 'a'.repeat(64),
+        });
+        if (begun.status !== 'ready') throw new Error('expected ready transfer');
+
+        expect(await readdir(stagingDirectory)).toContain(activeName);
         await runtime.abortImport({ transferId: begun.transferId });
     });
 

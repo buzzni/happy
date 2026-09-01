@@ -180,12 +180,35 @@ export function createCodexThreadTransferRuntime(deps: CodexThreadTransferDeps) 
         if (existing) return existing;
         const cleanup = (async () => {
             const entries = await readdir(stagingDir, { withFileTypes: true });
-            await Promise.all(entries
-                .filter((entry) => (
-                    TRANSFER_FILE_RE.test(entry.name)
-                    && (entry.isFile() || entry.isSymbolicLink())
-                ))
-                .map((entry) => rm(join(stagingDir, entry.name), { force: true })));
+            await Promise.all(entries.map(async (entry) => {
+                if (!TRANSFER_FILE_RE.test(entry.name)) return;
+                const path = join(stagingDir, entry.name);
+                if (entry.isSymbolicLink()) {
+                    await rm(path, { force: true });
+                    return;
+                }
+                if (!entry.isFile()) return;
+                let file;
+                try {
+                    file = await lstat(path);
+                } catch (error) {
+                    if (isErrno(error, 'ENOENT')) return;
+                    throw error;
+                }
+                const remainingTtl = file.mtimeMs
+                    + CODEX_THREAD_TRANSFER_PENDING_TTL_MS
+                    - Date.now();
+                if (remainingTtl <= 0) {
+                    await rm(path, { force: true });
+                    return;
+                }
+                const timer = setTimeout(() => {
+                    void rm(path, { force: true }).catch((error) => {
+                        console.warn('[codex-thread-transfer] orphan cleanup failed', error);
+                    });
+                }, remainingTtl);
+                timer.unref();
+            }));
         })();
         stagingCleanup.set(stagingDir, cleanup);
         try {
