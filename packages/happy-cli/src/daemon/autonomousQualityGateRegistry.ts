@@ -45,7 +45,11 @@ interface RegistryDependencies {
         cwd: string,
         signal: AbortSignal,
     ): Promise<AutonomousQualityGatePhaseResult>;
-    sendRepair(sessionId: string, message: string): Promise<void>;
+    sendRepair(
+        sessionId: string,
+        message: string,
+        options: { signal: AbortSignal; timeoutMs: number },
+    ): Promise<void>;
     resolveSessionDirectory(sessionId: string, requestedDirectory: string): Promise<string | null>;
     isSessionIdle?(sessionId: string): boolean;
     getSessionRuntime?(sessionId: string): {
@@ -80,6 +84,7 @@ const STALE_START_ERROR = 'autonomous quality gate start request is stale';
 export class AutonomousQualityGateDaemonRegistry {
     private readonly entries = new Map<string, RuntimeEntry>();
     private readonly starts = new Map<string, ActiveStart>();
+    private readonly controls = new Map<string, Promise<AutonomousQualityGateControlResult>>();
     private readonly repairTurnObserved = new Set<string>();
     private readonly repairReady = new Set<string>();
     private notificationReadErrorReported = false;
@@ -159,8 +164,9 @@ export class AutonomousQualityGateDaemonRegistry {
         const persisted = this.deps.store.getBySessionId(sessionId);
         const entry = this.loadSession(sessionId);
         if (!entry) return null;
+        const timedOut = entry.runtime.expireIfTimedOut();
         const snapshot = entry.runtime.snapshot();
-        if (JSON.stringify(snapshot.previousFailure) !== JSON.stringify(persisted?.previousFailure)) {
+        if (timedOut || JSON.stringify(snapshot.previousFailure) !== JSON.stringify(persisted?.previousFailure)) {
             await this.persistSnapshot(entry);
         }
         return entry.runtime.getStatus();
@@ -180,16 +186,32 @@ export class AutonomousQualityGateDaemonRegistry {
                 ? { ...original, duplicate: true }
                 : { accepted: false, duplicate: true, conflict: true, status: entry.runtime.getStatus() };
         }
+        const active = this.controls.get(operationKey);
+        if (active) return { ...await active, duplicate: true };
+        const operation = this.applyControl(entry, request, operationKey);
+        this.controls.set(operationKey, operation);
+        try {
+            return await operation;
+        } finally {
+            if (this.controls.get(operationKey) === operation) this.controls.delete(operationKey);
+        }
+    }
+
+    private async applyControl(
+        entry: RuntimeEntry,
+        request: AutonomousQualityGateControlRequestV1,
+        operationKey: string,
+    ): Promise<AutonomousQualityGateControlResult> {
         const result = entry.runtime.control(request.action, request.expectedRevision);
         try {
             await this.persistOperation(operationKey, entry, result);
+            return result;
         } catch (error) {
             if (request.action === 'resume' && result.accepted) {
                 entry.runtime.failClosedAfterResumePersistenceError();
             }
             throw error;
         }
-        return result;
     }
 
     noteSessionRuntime(sessionId: string, input: {
@@ -415,7 +437,7 @@ export class AutonomousQualityGateDaemonRegistry {
             now: this.deps.now,
             capture: () => this.deps.capture(start.directory),
             runPhase: (phase, signal) => this.deps.runPhase(phase, start.directory, signal),
-            sendRepair: message => this.deps.sendRepair(start.sessionId, message),
+            sendRepair: (message, options) => this.deps.sendRepair(start.sessionId, message, options),
             onRepairAdmission: () => {
                 entry.repairBaselineLastTurnEndAt = this.sessionRuntime(start.sessionId).lastTurnEndAt;
             },

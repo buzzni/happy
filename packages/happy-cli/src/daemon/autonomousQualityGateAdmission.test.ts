@@ -35,4 +35,26 @@ describe('AutonomousQualityGateAdmission', () => {
             admission.noteUserInput();
         })).resolves.toBe(false);
     });
+
+    it('aborts an in-flight repair transport when user input takes priority', async () => {
+        const admission = new AutonomousQualityGateAdmission();
+        admission.setSessionIdle(true);
+        let observedSignal: AbortSignal | undefined;
+        let repairStarted!: () => void;
+        const started = new Promise<void>(resolve => { repairStarted = resolve; });
+        const send = vi.fn(async (signal?: AbortSignal) => {
+            observedSignal = signal;
+            repairStarted();
+            await new Promise<void>((_resolve, reject) => {
+                signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+            });
+        });
+
+        const repair = admission.admitRepair(0, send);
+        await started;
+        admission.noteUserInput();
+
+        await expect(repair).rejects.toBeDefined();
+        expect(observedSignal?.aborted).toBe(true);
+    });
 });

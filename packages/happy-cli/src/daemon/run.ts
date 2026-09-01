@@ -498,7 +498,7 @@ export async function startDaemon(): Promise<void> {
       store: autonomousQualityGateStore,
       capture: captureAutonomousWorktreeFingerprint,
       runPhase: (phase, cwd, signal) => runAutonomousQualityGatePhase(phase, { cwd, signal }),
-      sendRepair: async (sessionId, message) => {
+      sendRepair: async (sessionId, message, options) => {
         const session = getCurrentChildren().find(candidate => candidate.happySessionId === sessionId);
         if (!session?.encryption) throw new Error(`Session encryption unavailable for ${sessionId}`);
         await sendAutonomousQualityGateRepair({
@@ -507,6 +507,8 @@ export async function startDaemon(): Promise<void> {
           token: credentials.token,
           serverUrl: configuration.serverUrl,
           encryption: session.encryption,
+          signal: options.signal,
+          timeoutMs: options.timeoutMs,
         });
       },
       resolveSessionDirectory: async (sessionId, requestedDirectory) => {

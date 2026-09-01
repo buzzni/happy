@@ -52,15 +52,23 @@ export class AutonomousQualityGateAdmission {
         };
     }
 
-    async admitRepair(expectedInputEpoch: number, send: () => Promise<void>): Promise<boolean> {
+    async admitRepair(
+        expectedInputEpoch: number,
+        send: (signal: AbortSignal) => Promise<void>,
+    ): Promise<boolean> {
         if (!this.idle || this.epoch !== expectedInputEpoch) return false;
         this.idle = false;
+        this.activeOperation?.abort();
+        const controller = new AbortController();
+        this.activeOperation = controller;
         try {
-            await send();
+            await send(controller.signal);
         } catch (error) {
             if (this.epoch === expectedInputEpoch) this.idle = true;
             throw error;
+        } finally {
+            if (this.activeOperation === controller) this.activeOperation = undefined;
         }
-        return this.epoch === expectedInputEpoch;
+        return !controller.signal.aborted && this.epoch === expectedInputEpoch;
     }
 }

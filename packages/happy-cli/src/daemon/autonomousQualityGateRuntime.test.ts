@@ -128,6 +128,48 @@ describe('AutonomousQualityGateRuntime', () => {
         await expect(runtime.onCompletionCandidate()).resolves.toMatchObject({ stage: 'limit-reached' });
     });
 
+    it('clips phase timeouts to the remaining run budget and does not repair after the deadline', async () => {
+        let now = 1_000;
+        const runPhase = vi.fn(async (phase) => {
+            now = 2_001;
+            return {
+                name: phase.name,
+                status: 'failed' as const,
+                exitCode: 1,
+                timedOut: false,
+                durationMs: 1_001,
+                stdoutTail: '',
+                stderrTail: 'late failure',
+                outputTruncated: false,
+            };
+        });
+        const sendRepair = vi.fn();
+        const runtime = new AutonomousQualityGateRuntime({
+            ...request,
+            plan: { phases: [{ name: 'test', command: 'npm test', timeoutMs: 30_000 }] },
+            limits: { ...request.limits, timeoutMs: 1_000 },
+        }, {
+            runId: 'run-total-timeout',
+            now: () => now,
+            capture: async () => ({ digest: 'same', entryCount: 0, excludedCount: 0 }),
+            runPhase,
+            sendRepair,
+        });
+        runtime.setSessionIdle(true);
+
+        await expect(runtime.onCompletionCandidate()).resolves.toMatchObject({
+            stage: 'limit-reached',
+            limitReason: 'timeout',
+            nextAction: 'none',
+            usage: { elapsedMs: 1_001 },
+        });
+        expect(runPhase).toHaveBeenCalledWith(
+            expect.objectContaining({ timeoutMs: 1_000 }),
+            expect.any(AbortSignal),
+        );
+        expect(sendRepair).not.toHaveBeenCalled();
+    });
+
     it('enters limit-reached as soon as a runtime report exhausts the budget', () => {
         const runtime = new AutonomousQualityGateRuntime({
             ...request,
@@ -180,6 +222,35 @@ describe('AutonomousQualityGateRuntime', () => {
             limitReason: 'max-tokens',
             nextAction: 'none',
         });
+    });
+
+    it('does not turn an abort rejection into a terminal block after user input', async () => {
+        let phaseStarted!: () => void;
+        const started = new Promise<void>(resolve => { phaseStarted = resolve; });
+        const runtime = new AutonomousQualityGateRuntime(request, {
+            runId: 'run-user-input-abort-rejection',
+            now: () => 1_000,
+            capture: async () => ({ digest: 'same', entryCount: 0, excludedCount: 0 }),
+            runPhase: async (_phase, signal) => {
+                phaseStarted();
+                await new Promise<void>((_resolve, reject) => {
+                    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+                });
+                throw new Error('unreachable');
+            },
+            sendRepair: vi.fn(),
+        });
+        runtime.setSessionIdle(true);
+
+        const completion = runtime.onCompletionCandidate();
+        await started;
+        runtime.noteUserInput();
+
+        await expect(completion).resolves.toMatchObject({
+            stage: 'awaiting-completion',
+            nextAction: 'wait',
+        });
+        expect(runtime.getStatus()).not.toHaveProperty('blockedReason');
     });
 
     it('fails closed when gate infrastructure throws instead of remaining verifying', async () => {

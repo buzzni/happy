@@ -11,10 +11,12 @@ interface MessageSenderInput {
         encryptionKey: Uint8Array;
         encryptionVariant: 'legacy' | 'dataKey';
     };
+    signal?: AbortSignal;
+    timeoutMs?: number;
     post?: (
         url: string,
         body: { messages: Array<{ localId: string; content: string }> },
-        options: { headers: Record<string, string>; timeout: number },
+        options: { headers: Record<string, string>; timeout: number; signal?: AbortSignal },
     ) => Promise<unknown>;
 }
 
@@ -38,7 +40,8 @@ export async function sendAutonomousQualityGateRepair(input: MessageSenderInput)
                 'Content-Type': 'application/json',
                 'X-Happy-Client': 'cli-daemon/autonomous-quality-gate',
             },
-            timeout: 60_000,
+            timeout: Math.max(1, Math.min(60_000, input.timeoutMs ?? 60_000)),
+            ...(input.signal ? { signal: input.signal } : {}),
         },
     );
 }

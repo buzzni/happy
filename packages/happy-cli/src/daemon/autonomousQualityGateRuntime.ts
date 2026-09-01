@@ -31,7 +31,10 @@ interface AutonomousQualityGateRuntimeDependencies {
         phase: AutonomousQualityGatePhasePlan,
         signal: AbortSignal,
     ) => Promise<AutonomousQualityGatePhaseResult>;
-    sendRepair: (message: string) => Promise<void>;
+    sendRepair: (
+        message: string,
+        options: { signal: AbortSignal; timeoutMs: number },
+    ) => Promise<void>;
     onRepairAdmission?: () => void;
     checkpoint?: () => Promise<void>;
     initialSessionUsage?: { turns: number; tokens: number };
@@ -196,6 +199,15 @@ export class AutonomousQualityGateRuntime {
         return true;
     }
 
+    expireIfTimedOut(): boolean {
+        if (isTerminal(this.status.stage)) return false;
+        this.refreshElapsed();
+        if (this.status.usage.elapsedMs < this.request.limits.timeoutMs) return false;
+        this.admission.cancelActiveOperation();
+        this.update({ stage: 'limit-reached', limitReason: 'timeout', nextAction: 'none' });
+        return true;
+    }
+
     async onCompletionCandidate(): Promise<AutonomousQualityGateStatusV1> {
         if (!canStartGate(this.status.stage) || !this.admission.sessionIdle) return this.getStatus();
         this.refreshElapsed();
@@ -215,10 +227,17 @@ export class AutonomousQualityGateRuntime {
                 previousFailure: this.previousFailure,
                 maxGateAttempts: this.request.limits.maxGateAttempts,
                 capture: this.deps.capture,
-                runPhase: phase => this.deps.runPhase(phase, operation.signal),
+                runPhase: phase => this.deps.runPhase({
+                    ...phase,
+                    timeoutMs: Math.max(1, Math.min(phase.timeoutMs, this.remainingTimeoutMs())),
+                }, operation.signal),
             });
         } catch {
-            if (!preserveConcurrentControlState(this.status.stage)) {
+            if (operation.signal.aborted || operation.inputEpoch !== this.admission.inputEpoch) {
+                if (!preserveConcurrentControlState(this.status.stage)) {
+                    this.update({ stage: 'awaiting-completion', nextAction: 'wait' });
+                }
+            } else if (!preserveConcurrentControlState(this.status.stage) && !this.expireIfTimedOut()) {
                 this.update({ stage: 'blocked', blockedReason: 'runtime-error', nextAction: 'none' });
             }
             return this.getStatus();
@@ -231,6 +250,7 @@ export class AutonomousQualityGateRuntime {
             this.update({ stage: 'awaiting-completion', nextAction: 'wait' });
             return this.getStatus();
         }
+        if (this.expireIfTimedOut()) return this.getStatus();
         if (outcome.status === 'stale') {
             this.update({
                 stage: 'awaiting-completion',
@@ -285,10 +305,13 @@ export class AutonomousQualityGateRuntime {
         let admitted: boolean;
         let repairSent = false;
         try {
-            admitted = await this.admission.admitRepair(operation.inputEpoch, async () => {
+            admitted = await this.admission.admitRepair(operation.inputEpoch, async (signal) => {
                 this.pendingRepairStage = repairStage;
                 this.deps.onRepairAdmission?.();
-                await this.deps.sendRepair(serializeAutonomousGateFailureContinuation(artifact));
+                await this.deps.sendRepair(serializeAutonomousGateFailureContinuation(artifact), {
+                    signal,
+                    timeoutMs: this.remainingTimeoutMs(),
+                });
                 repairSent = true;
             });
         } catch {
@@ -296,7 +319,10 @@ export class AutonomousQualityGateRuntime {
                 this.pausedFrom = 'awaiting-completion';
             }
             this.pendingRepairStage = undefined;
-            if (!preserveConcurrentControlState(this.status.stage)) {
+            if (preserveConcurrentControlState(this.status.stage)) return this.getStatus();
+            if (operation.inputEpoch !== this.admission.inputEpoch) {
+                this.update({ stage: 'awaiting-completion', nextAction: 'wait' });
+            } else if (!this.expireIfTimedOut()) {
                 this.update({ stage: 'blocked', blockedReason: 'repair-delivery-failed', nextAction: 'none' });
             }
             return this.getStatus();
@@ -325,6 +351,11 @@ export class AutonomousQualityGateRuntime {
         }
         if (preserveConcurrentControlState(this.status.stage)) {
             chargeSentRepair();
+            return this.getStatus();
+        }
+        if (this.status.usage.elapsedMs >= this.request.limits.timeoutMs || this.remainingTimeoutMs() <= 0) {
+            chargeSentRepair();
+            this.expireIfTimedOut();
             return this.getStatus();
         }
 
@@ -357,6 +388,13 @@ export class AutonomousQualityGateRuntime {
 
     private fingerprintChanged(fingerprint: string): boolean | null {
         return this.previousFailure ? this.previousFailure.fingerprint !== fingerprint : null;
+    }
+
+    private remainingTimeoutMs(): number {
+        return Math.max(0, this.request.limits.timeoutMs - Math.max(
+            this.status.usage.elapsedMs,
+            Math.max(0, Math.trunc(this.now() - this.startedAt)),
+        ));
     }
 
     private update(patch: Partial<AutonomousQualityGateStatusV1>): void {

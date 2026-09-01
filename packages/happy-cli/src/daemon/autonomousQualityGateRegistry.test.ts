@@ -699,6 +699,38 @@ describe('AutonomousQualityGateDaemonRegistry', () => {
         await expect(restarted.status('session-1')).resolves.toMatchObject({ stage: 'paused' });
     });
 
+    it('expires an idle persisted run when status observes the total timeout', async () => {
+        const store = memoryStore();
+        let now = 1_000;
+        const registry = new AutonomousQualityGateDaemonRegistry({
+            ...matchingSessionDirectory,
+            store,
+            capture: vi.fn(),
+            runPhase: vi.fn(),
+            sendRepair: vi.fn(),
+            isSessionIdle: () => false,
+            createRunId: () => 'run-idle-timeout',
+            now: () => now,
+        });
+        await expect(registry.start({
+            ...request,
+            limits: { ...request.limits, timeoutMs: 1_000 },
+        })).resolves.toMatchObject({ stage: 'awaiting-completion' });
+
+        now = 2_001;
+
+        await expect(registry.status('session-1')).resolves.toMatchObject({
+            stage: 'limit-reached',
+            limitReason: 'timeout',
+            nextAction: 'none',
+            usage: { elapsedMs: 1_001 },
+        });
+        expect(store.update).toHaveBeenCalled();
+        expect(store.runs.get('session-1')).toMatchObject({
+            status: { stage: 'limit-reached', limitReason: 'timeout' },
+        });
+    });
+
     it('re-admits an exact second-window start after the repair turn is observed busy then idle', async () => {
         const store = memoryStore();
         let fingerprint = 'before';
@@ -1114,6 +1146,63 @@ describe('AutonomousQualityGateDaemonRegistry', () => {
         });
 
         expect(duplicate).toMatchObject({ accepted: false, duplicate: true, status: { stage: 'passed' } });
+    });
+
+    it('coalesces concurrent duplicate resume controls before either result reaches the journal', async () => {
+        const store = memoryStore();
+        const registry = new AutonomousQualityGateDaemonRegistry({
+            ...matchingSessionDirectory,
+            store,
+            capture: vi.fn(),
+            runPhase: vi.fn(),
+            sendRepair: vi.fn(),
+            isSessionIdle: () => false,
+            createRunId: () => 'run-concurrent-control',
+        });
+        const started = await registry.start(request);
+        const paused = await registry.control({
+            schemaVersion: 1,
+            requestId: 'pause-before-concurrent-resume',
+            runId: started.runId,
+            expectedRevision: started.revision,
+            action: 'pause',
+        }) as { status: { revision: number } };
+        const basePut = store.put.getMockImplementation()!;
+        let resumeWriteStarted!: () => void;
+        let releaseResumeWrite!: () => void;
+        const writeStarted = new Promise<void>(resolve => { resumeWriteStarted = resolve; });
+        const writeReleased = new Promise<void>(resolve => { releaseResumeWrite = resolve; });
+        store.put.mockImplementation(async (requestId: string, run: any, result?: any) => {
+            if (result?.accepted && result.status.stage === 'awaiting-completion') {
+                resumeWriteStarted();
+                await writeReleased;
+            }
+            return basePut(requestId, run, result);
+        });
+        const resume = {
+            schemaVersion: 1 as const,
+            requestId: 'concurrent-resume',
+            runId: started.runId,
+            expectedRevision: paused.status.revision,
+            action: 'resume' as const,
+        };
+
+        const first = registry.control(resume);
+        await writeStarted;
+        const duplicate = registry.control(resume);
+        releaseResumeWrite();
+
+        await expect(first).resolves.toMatchObject({ accepted: true, status: { stage: 'awaiting-completion' } });
+        await expect(duplicate).resolves.toMatchObject({
+            accepted: true,
+            duplicate: true,
+            status: { stage: 'awaiting-completion' },
+        });
+        await expect(registry.control(resume)).resolves.toMatchObject({
+            accepted: true,
+            duplicate: true,
+            status: { stage: 'awaiting-completion' },
+        });
     });
 
     it('does not alias the same control request id across runs', async () => {
