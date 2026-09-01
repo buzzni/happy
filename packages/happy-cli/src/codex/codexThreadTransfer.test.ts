@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readdir, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -12,11 +12,11 @@ import {
 describe('Codex native thread transfer', () => {
     const roots: string[] = [];
 
-    const stagingDirectory = (codexHome: string, targetDirectory: string) => join(
-        codexHome,
+    const stagingDirectory = async (codexHome: string, targetDirectory: string) => join(
+        await realpath(codexHome),
         '.aplus',
         'native-session-transfers',
-        createHash('sha256').update(targetDirectory).digest('hex'),
+        createHash('sha256').update(await realpath(targetDirectory)).digest('hex'),
     );
 
     afterEach(async () => {
@@ -92,7 +92,7 @@ describe('Codex native thread transfer', () => {
         expect(await readFile(sourcePath)).toEqual(content);
         expect(forkThreadFromPath).toHaveBeenCalledWith({
             path: expect.stringContaining('.aplus-codex-transfer-'),
-            cwd: targetDirectory,
+            cwd: await realpath(targetDirectory),
         });
         const importedPath = forkThreadFromPath.mock.calls[0]![0].path;
         expect(relative(targetDirectory, importedPath)).toMatch(/^\.\.[/\\]/);
@@ -234,9 +234,9 @@ describe('Codex native thread transfer', () => {
         roots.push(root);
         const codexHome = join(root, '.codex');
         const targetDirectory = join(root, 'workspace', 'target');
-        const transferDirectory = stagingDirectory(codexHome, targetDirectory);
         await mkdir(join(codexHome, 'sessions'), { recursive: true });
         await mkdir(targetDirectory, { recursive: true });
+        const transferDirectory = await stagingDirectory(codexHome, targetDirectory);
         await mkdir(transferDirectory, { recursive: true });
         const orphanName = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.aplus-codex-transfer-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl';
         const orphanPath = join(transferDirectory, orphanName);
@@ -270,9 +270,9 @@ describe('Codex native thread transfer', () => {
         roots.push(root);
         const codexHome = join(root, '.codex');
         const targetDirectory = join(root, 'workspace', 'target');
-        const transferDirectory = stagingDirectory(codexHome, targetDirectory);
         await mkdir(join(codexHome, 'sessions'), { recursive: true });
         await mkdir(targetDirectory, { recursive: true });
+        const transferDirectory = await stagingDirectory(codexHome, targetDirectory);
         await mkdir(transferDirectory, { recursive: true });
         const activeName = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.aplus-codex-transfer-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl';
         await writeFile(join(transferDirectory, activeName), 'still-active');
