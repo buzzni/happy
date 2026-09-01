@@ -102,6 +102,42 @@ describe('Codex native thread transfer', () => {
         expect(forkThreadFromPath).toHaveBeenCalledOnce();
     });
 
+    it('reuses an untouched pending import when the begin response is retried', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-codex-transfer-retry-'));
+        roots.push(root);
+        const codexHome = join(root, '.codex');
+        const targetDirectory = join(root, 'workspace', 'target');
+        await mkdir(join(codexHome, 'sessions'), { recursive: true });
+        await mkdir(targetDirectory, { recursive: true });
+        const runtime = createCodexThreadTransferRuntime({
+            allowedRoot: root,
+            codexHome,
+            readThreadPath: vi.fn(),
+            forkThreadFromPath: vi.fn(),
+        });
+        const input = {
+            directory: targetDirectory,
+            sourceCodexThreadId: 'thread-source',
+            requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+            size: 3,
+            sha256: 'a'.repeat(64),
+        };
+
+        const first = await runtime.beginImport(input);
+        if (first.status !== 'ready') throw new Error('expected ready transfer');
+
+        await expect(runtime.beginImport(input)).resolves.toEqual(first);
+        await runtime.writeImportChunk({
+            transferId: first.transferId,
+            offset: 0,
+            content: Buffer.from('a').toString('base64'),
+        });
+        const restarted = await runtime.beginImport(input);
+        if (restarted.status !== 'ready') throw new Error('expected restarted transfer');
+        expect(restarted.transferId).not.toBe(first.transferId);
+        await runtime.abortImport({ transferId: restarted.transferId });
+    });
+
     it('rejects rollout paths outside the Codex sessions root and symbolic links', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-codex-transfer-security-'));
         roots.push(root);

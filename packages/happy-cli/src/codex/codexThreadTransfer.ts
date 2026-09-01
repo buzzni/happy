@@ -337,6 +337,24 @@ export function createCodexThreadTransferRuntime(deps: CodexThreadTransferDeps) 
             } catch (error) {
                 if (!isErrno(error, 'ENOENT')) throw error;
             }
+            const existing = [...pending.entries()].find(([, transfer]) => (
+                transfer.requestId === input.requestId
+            ));
+            if (existing) {
+                const [existingTransferId, transfer] = existing;
+                if (
+                    transfer.directory !== validation.resolvedPath
+                    || transfer.sourceCodexThreadId !== input.sourceCodexThreadId
+                    || transfer.size !== input.size
+                    || transfer.sha256 !== input.sha256.toLowerCase()
+                ) {
+                    throw new Error('Codex thread import request conflicts with an existing transfer');
+                }
+                if (transfer.bytesWritten === 0) {
+                    return { status: 'ready', transferId: existingTransferId };
+                }
+                await discard(existingTransferId, transfer);
+            }
             if (pendingRequestIds.has(input.requestId)) {
                 throw new Error('Codex thread import request is already in progress');
             }
