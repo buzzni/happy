@@ -309,9 +309,14 @@ export class ApiSessionClient extends EventEmitter {
         pendingUserInput: boolean;
         reportedAt: number;
     } | null = null;
+    private daemonRuntimeReportSeq = 0;
     private currentMode: 'local' | 'remote' = 'remote';
     private lastUserInteractionAt: number | undefined;
     private lastTurnEndAt: number | undefined;
+    private assistantTurns = 0;
+    private providerTokens = 0;
+    private providerUsageEventIds = new Set<string>();
+    private inputObservedForNextTurn = false;
     private launchedBackgroundJob = false;
 
     constructor(token: string, session: Session) {
@@ -680,6 +685,11 @@ export class ApiSessionClient extends EventEmitter {
     private routeIncomingMessage(message: unknown) {
         const userResult = UserMessageSchema.safeParse(message);
         if (userResult.success) {
+            this.inputObservedForNextTurn = true;
+            if (userResult.data.meta?.sentFrom !== 'daemon') {
+                this.lastUserInteractionAt = Date.now();
+            }
+            this.reportDaemonRuntime(this.currentThinking, true);
             if (this.pendingMessageCallback) {
                 this.pendingMessageCallback(userResult.data);
             } else {
@@ -1280,9 +1290,11 @@ export class ApiSessionClient extends EventEmitter {
         // the user just answered. The daemon idle guard uses this to protect
         // sessions the user touched recently, without conflating it with
         // keep-alive liveness.
-        if ((daemonThinking && !prev?.thinking) || (prev?.pendingUserInput === true && !pendingUserInput)) {
+        if ((daemonThinking && !prev?.thinking && !this.inputObservedForNextTurn)
+            || (prev?.pendingUserInput === true && !pendingUserInput)) {
             this.lastUserInteractionAt = now;
         }
+        if (daemonThinking && !prev?.thinking) this.inputObservedForNextTurn = false;
 
         // Stamp a turn-end timestamp when the agent goes from busy to fully idle
         // (finished a turn, now waiting on the user). This marks a safe point to
@@ -1291,6 +1303,7 @@ export class ApiSessionClient extends EventEmitter {
         const nowIdle = !daemonThinking && !hasOpenToolCall && !pendingUserInput;
         if (prevBusy && nowIdle) {
             this.lastTurnEndAt = now;
+            this.assistantTurns += 1;
         }
 
         if (!force && prev
@@ -1308,11 +1321,14 @@ export class ApiSessionClient extends EventEmitter {
             reportedAt: now
         };
         void notifyDaemonSessionRuntime(this.sessionId, {
+            reportSeq: ++this.daemonRuntimeReportSeq,
             thinking: daemonThinking,
             hasOpenToolCall,
             pendingUserInput,
             ...(this.lastUserInteractionAt !== undefined ? { lastUserInteractionAt: this.lastUserInteractionAt } : {}),
             ...(this.lastTurnEndAt !== undefined ? { lastTurnEndAt: this.lastTurnEndAt } : {}),
+            ...(this.assistantTurns > 0 ? { assistantTurns: this.assistantTurns } : {}),
+            ...(this.providerTokens > 0 ? { providerTokens: this.providerTokens } : {}),
             ...(this.launchedBackgroundJob ? { launchedBackgroundJob: true } : {}),
             // Resume skip-baseline: the last seq delivered to the agent loop.
             // Without it the daemon falls back to the server-head seq, which
@@ -1360,7 +1376,13 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     sendProviderUsageEvent(event: ProviderUsageEventV1) {
-        this.socket.emit('provider-usage-report', ProviderUsageEventV1Schema.parse(event));
+        const parsed = ProviderUsageEventV1Schema.parse(event);
+        this.socket.emit('provider-usage-report', parsed);
+        if (!this.providerUsageEventIds.has(parsed.sourceEventId)) {
+            this.providerUsageEventIds.add(parsed.sourceEventId);
+            this.providerTokens += parsed.tokens.total;
+            this.reportDaemonRuntime(this.currentThinking, true);
+        }
     }
 
     /**

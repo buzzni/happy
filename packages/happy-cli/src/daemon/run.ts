@@ -191,6 +191,17 @@ import {
   prepareAdditionalDirectories,
 } from './additionalDirectories';
 import { mergeAdditionalDirectoriesIntoSandboxEnvironment } from '@/utils/additionalDirectoriesEnv';
+import { AutonomousQualityGateRunStore } from './autonomousQualityGateStore';
+import { AutonomousQualityGateDaemonRegistry } from './autonomousQualityGateRegistry';
+import {
+  mergeCumulativeRuntimeCounter,
+  runtimeReportBelongsToTrackedProcess,
+  shouldAcceptSessionRuntimeReport,
+} from './sessionRuntimeCounters';
+import { captureAutonomousWorktreeFingerprint } from './autonomousQualityGateFingerprint';
+import { runAutonomousQualityGatePhase } from './autonomousQualityGateRunner';
+import { sendAutonomousQualityGateRepair } from './autonomousQualityGateMessageSender';
+import { createAutonomousQualityGateRpcHandlers } from './autonomousQualityGateRpc';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -480,6 +491,53 @@ export async function startDaemon(): Promise<void> {
 
     // Helper functions
     const getCurrentChildren = () => Array.from(pidToTrackedSession.values());
+    const autonomousQualityGateStore = await AutonomousQualityGateRunStore.open(
+      join(configuration.happyHomeDir, 'autonomous-quality-gates.json'),
+    );
+    const autonomousQualityGateRegistry = new AutonomousQualityGateDaemonRegistry({
+      store: autonomousQualityGateStore,
+      capture: captureAutonomousWorktreeFingerprint,
+      runPhase: (phase, cwd, signal) => runAutonomousQualityGatePhase(phase, { cwd, signal }),
+      sendRepair: async (sessionId, message, options) => {
+        const session = getCurrentChildren().find(candidate => candidate.happySessionId === sessionId);
+        if (!session?.encryption) throw new Error(`Session encryption unavailable for ${sessionId}`);
+        await sendAutonomousQualityGateRepair({
+          sessionId,
+          message,
+          token: credentials.token,
+          serverUrl: configuration.serverUrl,
+          encryption: session.encryption,
+          signal: options.signal,
+          timeoutMs: options.timeoutMs,
+        });
+      },
+      resolveSessionDirectory: async (sessionId, requestedDirectory) => {
+        const session = getCurrentChildren().find(candidate => candidate.happySessionId === sessionId);
+        const sessionDirectory = session?.happySessionMetadataFromLocalWebhook?.path ?? session?.directory;
+        if (!sessionDirectory) return null;
+        try {
+          const [canonicalSessionDirectory, canonicalRequestedDirectory] = await Promise.all([
+            fs.realpath(sessionDirectory),
+            fs.realpath(requestedDirectory),
+          ]);
+          return canonicalSessionDirectory === canonicalRequestedDirectory
+            ? canonicalSessionDirectory
+            : null;
+        } catch {
+          return null;
+        }
+      },
+      getSessionRuntime: (sessionId) => {
+        const runtime = getCurrentChildren().find(candidate => candidate.happySessionId === sessionId)?.runtime;
+        return {
+          idle: !!runtime && !runtime.thinking && !runtime.hasOpenToolCall && !runtime.pendingUserInput,
+          ...(runtime?.assistantTurns !== undefined ? { turns: runtime.assistantTurns } : {}),
+          ...(runtime?.providerTokens !== undefined ? { tokens: runtime.providerTokens } : {}),
+          ...(runtime?.lastTurnEndAt !== undefined ? { lastTurnEndAt: runtime.lastTurnEndAt } : {}),
+        };
+      },
+      onPersistenceError: error => logger.warn('[AUTONOMOUS QUALITY GATE] Failed to persist runtime state', error),
+    });
 
     // Serialize tracked sessions for disk persistence
     const sessionStartTimes = restoreSessionStartTimes({
@@ -713,11 +771,14 @@ export async function startDaemon(): Promise<void> {
     const onHappySessionRuntime = (
       sessionId: string,
       runtime: {
+        reportSeq?: number;
         thinking?: boolean;
         hasOpenToolCall?: boolean;
         pendingUserInput?: boolean;
         lastUserInteractionAt?: number;
         lastTurnEndAt?: number;
+        assistantTurns?: number;
+        providerTokens?: number;
         launchedBackgroundJob?: boolean;
         lastProcessedSeq?: number;
         mode?: 'local' | 'remote';
@@ -763,9 +824,24 @@ export async function startDaemon(): Promise<void> {
         }
       }
 
+      if (!runtimeReportBelongsToTrackedProcess(trackedSession.pid, reporter?.hostPid)) {
+        logger.debug(
+          `[DAEMON RUN] Ignoring runtime report for ${sessionId} from stale pid ${reporter?.hostPid}`,
+        );
+        return;
+      }
+
       const prev = trackedSession.runtime;
-      const lastUserInteractionAt = runtime.lastUserInteractionAt ?? prev?.lastUserInteractionAt;
-      const lastTurnEndAt = runtime.lastTurnEndAt ?? prev?.lastTurnEndAt;
+      if (!shouldAcceptSessionRuntimeReport(prev?.reportSeq, runtime.reportSeq)) {
+        return;
+      }
+      const lastUserInteractionAt = mergeCumulativeRuntimeCounter(
+        prev?.lastUserInteractionAt,
+        runtime.lastUserInteractionAt,
+      );
+      const lastTurnEndAt = mergeCumulativeRuntimeCounter(prev?.lastTurnEndAt, runtime.lastTurnEndAt);
+      const assistantTurns = mergeCumulativeRuntimeCounter(prev?.assistantTurns, runtime.assistantTurns);
+      const providerTokens = mergeCumulativeRuntimeCounter(prev?.providerTokens, runtime.providerTokens);
       // Sticky once set: a conversation that ever launched a background job
       // stays exempt from the turn-end reap for the rest of its life.
       const launchedBackgroundJob = runtime.launchedBackgroundJob || prev?.launchedBackgroundJob;
@@ -776,16 +852,29 @@ export async function startDaemon(): Promise<void> {
         : undefined;
       const mode = runtime.mode ?? prev?.mode;
       trackedSession.runtime = {
+        ...(runtime.reportSeq !== undefined ? { reportSeq: runtime.reportSeq } : {}),
         thinking: runtime.thinking ?? prev?.thinking ?? false,
         hasOpenToolCall: runtime.hasOpenToolCall ?? prev?.hasOpenToolCall ?? false,
         pendingUserInput: runtime.pendingUserInput ?? prev?.pendingUserInput ?? false,
         ...(lastUserInteractionAt !== undefined ? { lastUserInteractionAt } : {}),
         ...(lastTurnEndAt !== undefined ? { lastTurnEndAt } : {}),
+        ...(assistantTurns !== undefined ? { assistantTurns } : {}),
+        ...(providerTokens !== undefined ? { providerTokens } : {}),
         ...(launchedBackgroundJob ? { launchedBackgroundJob } : {}),
         ...(lastProcessedSeq !== undefined ? { lastProcessedSeq } : {}),
         ...(mode !== undefined ? { mode } : {}),
         updatedAt: runtime.updatedAt,
       };
+      autonomousQualityGateRegistry.noteSessionRuntime(sessionId, {
+        idle: !trackedSession.runtime.thinking
+          && !trackedSession.runtime.hasOpenToolCall
+          && !trackedSession.runtime.pendingUserInput,
+        userInput: lastUserInteractionAt !== undefined
+          && lastUserInteractionAt !== prev?.lastUserInteractionAt,
+        turns: trackedSession.runtime.assistantTurns,
+        tokens: trackedSession.runtime.providerTokens,
+        lastTurnEndAt: trackedSession.runtime.lastTurnEndAt,
+      });
 
       // The cursor only exists in memory until something writes it. A daemon
       // killed without its clean-stop handlers takes it to the grave and the
@@ -1928,6 +2017,7 @@ export async function startDaemon(): Promise<void> {
             );
           }
 
+          autonomousQualityGateRegistry.noteSessionStopped(session.happySessionId ?? sessionId);
           preserveSessionForResume(session, `stop-session:${context?.source ?? mode}`);
 
           if (session.startedBy === 'daemon' && session.childProcess) {
@@ -1964,6 +2054,7 @@ export async function startDaemon(): Promise<void> {
     // Handle child process exit — preserve session data for resume
     const onChildExited = (pid: number) => {
       const tracked = pidToTrackedSession.get(pid);
+      if (tracked?.happySessionId) autonomousQualityGateRegistry.noteSessionStopped(tracked.happySessionId);
       const preservedForResume = tracked ? preserveSessionForResume(tracked, `process-exit:${pid}`) : false;
       if (!preservedForResume) {
         logger.debug(`[DAEMON RUN] Removing exited process PID ${pid} from tracking`);
@@ -2438,6 +2529,7 @@ export async function startDaemon(): Promise<void> {
       portRegistry,
       automationStore,
       aiCredentialRuntime,
+      autonomousQualityGate: createAutonomousQualityGateRpcHandlers(autonomousQualityGateRegistry),
       // specs/daemon-spawn-project-link — a session created by `agent spawn` has no way to
       // register itself with A+ (its credential does not authenticate /api/*), so the daemon
       // reports it here. The request is bounded inside linkSpawnedProjectSession and

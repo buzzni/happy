@@ -123,6 +123,7 @@ import type { ServerAutomationTransport } from '@/daemon/automations/serverAutom
 import type { PendingAutomationReport } from '@/daemon/automations/serverAutomationRuntimeStore';
 import type { SessionFollowupTransport } from '@/daemon/automations/sessionFollowupRunner';
 import type { AiCredentialRuntime } from '@/daemon/aiCredentialRuntime';
+import type { AutonomousQualityGateRpcHandlers } from '@/daemon/autonomousQualityGateRpc';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BROKER_ACTIVITY_TOUCH_INTERVAL_MS = 60_000;
@@ -350,6 +351,7 @@ type MachineRpcHandlers = {
      */
     linkSpawnedSession?: (input: { sessionId: string; directory: string }) => void | Promise<void>;
     aiCredentialRuntime: AiCredentialRuntime;
+    autonomousQualityGate?: AutonomousQualityGateRpcHandlers;
 }
 
 function requireNonEmptyString(value: unknown, name: string): string {
@@ -400,6 +402,8 @@ export class ApiMachineClient {
     // automationStore). Advertised as metadata.automationSupport.rpcAvailable.
     private automationRpcAvailable = false;
     private lastKnownAutomationRpcAvailable: boolean | null = null;
+    private autonomousQualityGateRpcAvailable = false;
+    private lastKnownAutonomousQualityGateRpcAvailable: boolean | null = null;
     private automationKey: MachineAutomationKey | null = null;
     private persistAutomationKeyVersion: ((version: number) => void) | null = null;
     private automationServerKeyVersion: number | null = null;
@@ -513,11 +517,19 @@ export class ApiMachineClient {
         portRegistry,
         automationStore,
         aiCredentialRuntime,
+        autonomousQualityGate,
         linkSpawnedSession,
     }: MachineRpcHandlers) {
         this.resumeSessionHandler = resumeSession ?? null;
         this.recoverSessionHandler = recoverSession ?? null;
         this.linkSpawnedSessionHandler = linkSpawnedSession ?? null;
+
+        if (autonomousQualityGate) {
+            this.rpcHandlerManager.registerHandler('autonomous-quality-gate:start', autonomousQualityGate.start);
+            this.rpcHandlerManager.registerHandler('autonomous-quality-gate:status', autonomousQualityGate.status);
+            this.rpcHandlerManager.registerHandler('autonomous-quality-gate:control', autonomousQualityGate.control);
+            this.autonomousQualityGateRpcAvailable = true;
+        }
 
         // Scheduled automations CRUD (specs: daemon-scheduled-automations).
         // Handlers live in automationRpcHandlers.ts so they unit-test without
@@ -2310,7 +2322,7 @@ export class ApiMachineClient {
 
     private startKeepAlive() {
         this.stopKeepAlive();
-        this.keepAliveInterval = setInterval(() => {
+        const publishKeepAlive = () => {
             const payload = {
                 machineId: this.machine.id,
                 time: Date.now()
@@ -2348,15 +2360,17 @@ export class ApiMachineClient {
                 || prevResume.happyAgentAuthenticated !== newResumeSupport.happyAgentAuthenticated;
             const cliVersionChanged = prevCliVersion !== newCliVersion;
             const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable;
+            const autonomousQualityGateSupportChanged = this.lastKnownAutonomousQualityGateRpcAvailable !== this.autonomousQualityGateRpcAvailable;
             const automationServerKeyChanged = this.lastKnownAutomationServerKeyVersion !== this.automationServerKeyVersion;
 
             this.syncResumeSessionRpcRegistration();
 
-            if (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || automationServerKeyChanged) {
+            if (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
                 this.lastKnownAutomationRpcAvailable = this.automationRpcAvailable;
+                this.lastKnownAutonomousQualityGateRpcAvailable = this.autonomousQualityGateRpcAvailable;
                 this.lastKnownAutomationServerKeyVersion = this.automationServerKeyVersion;
                 this.updateMachineMetadata((metadata) => ({
                     ...(metadata || {} as any),
@@ -2369,13 +2383,19 @@ export class ApiMachineClient {
                         sessionFollowup: true,
                         protocolVersion: AUTOMATION_PROTOCOL_VERSION,
                     },
+                    autonomousQualityGateSupport: {
+                        apiVersion: 1,
+                        rpcAvailable: this.autonomousQualityGateRpcAvailable,
+                    },
                     additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
                     happyCliVersion: newCliVersion,
                 })).catch((err) => {
                     logger.debug('[API MACHINE] Failed to update machine capabilities:', err);
                 });
             }
-        }, 20000);
+        };
+        publishKeepAlive();
+        this.keepAliveInterval = setInterval(publishKeepAlive, 20000);
         logger.debug('[API MACHINE] Keep-alive started (20s interval)');
     }
 
