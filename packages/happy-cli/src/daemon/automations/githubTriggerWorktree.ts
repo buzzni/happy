@@ -4,6 +4,8 @@ import { access, chmod, mkdir, realpath } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
+import { releaseDanglingSubmoduleWorktreePointers } from './submoduleWorktreePointer'
+
 const execFileAsync = promisify(execFile)
 const COMMAND_TIMEOUT_MS = 60_000
 const COMMAND_MAX_BUFFER = 2 * 1024 * 1024
@@ -78,6 +80,7 @@ export async function removeGithubTriggerWorktree(input: {
   repositoryRoot: string
   worktreePath: string
   runCommand?: (command: GithubTriggerWorktreeCommand) => Promise<CommandResult>
+  releaseSubmodulePointers?: (input: { repositoryRoot: string }) => Promise<{ released: string[] }>
   pathExists?: (path: string) => Promise<boolean>
 }): Promise<
   | { ok: true }
@@ -111,7 +114,13 @@ export async function removeGithubTriggerWorktree(input: {
     args: ['worktree', 'remove', '--force', input.worktreePath],
     cwd: input.repositoryRoot,
   }, 'GitHub automation worktree removal failed')
-  return removed.ok ? { ok: true } : { ok: false, dirty: false, error: removed.error }
+  if (!removed.ok) return { ok: false, dirty: false, error: removed.error }
+  // 방금 지운 worktree 를 서브모듈 core.worktree 가 가리키고 있으면 저장소의 모든
+  // 체크아웃에서 git 이 죽는다. 청소의 일부다.
+  await (input.releaseSubmodulePointers ?? releaseDanglingSubmoduleWorktreePointers)({
+    repositoryRoot: input.repositoryRoot,
+  })
+  return { ok: true }
 }
 
 export async function prepareGithubTriggerWorktree(input: {
@@ -121,6 +130,7 @@ export async function prepareGithubTriggerWorktree(input: {
   pullRequest?: { number: number; expectedHeadSha?: string | null }
   githubEnvironment?: Record<string, string>
   runCommand?: (command: GithubTriggerWorktreeCommand) => Promise<CommandResult>
+  releaseSubmodulePointers?: (input: { repositoryRoot: string }) => Promise<{ released: string[] }>
   ensureDirectory?: (path: string) => Promise<void>
   pathExists?: (path: string) => Promise<boolean>
   resolveRealPath?: (path: string) => Promise<string>
@@ -180,6 +190,12 @@ export async function prepareGithubTriggerWorktree(input: {
     : worktreePath
   const plan = { repositoryRoot, worktreePath, directory }
   input.onPlanned(plan)
+
+  // 앞선 실행이 남긴 core.worktree 가 이미 지워진 worktree 를 가리키면 이 저장소의
+  // git 명령이 전부 죽는다 — worktree add 자체도 같은 오류로 실패하므로 먼저 푼다.
+  await (input.releaseSubmodulePointers ?? releaseDanglingSubmoduleWorktreePointers)({
+    repositoryRoot,
+  })
 
   const added = await commandOrError(runCommand, {
     executable: 'git', args: ['worktree', 'add', '--detach', worktreePath, 'HEAD'], cwd: repositoryRoot,
