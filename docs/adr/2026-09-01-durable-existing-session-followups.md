@@ -190,3 +190,20 @@ weak cross-project heuristic — the server has no session→project link, and a
 editor can already run arbitrary prompts on the target machine — so the
 authorization boundary is unchanged: project editor role, machine ownership,
 key versions, and an active session owned by the machine account.
+
+## Amendment 2026-09-03: daemon self-upgrade must not pause follow-ups
+
+After the 2026-09-02 fix shipped, follow-ups still froze at "round N of M".
+The daemon heartbeat detects a replaced `dist/index.mjs` (any `npm i -g` on
+the machine) and waits to hand off to the new bundle until runtime activity
+is zero; while waiting it paused every automation runner, including the
+session follow-up tick. Interactive sessions live for hours, so on a machine
+with long-running sessions the runners stayed paused indefinitely and server
+rows sat in `WAITING` with `lastObservedSeq == responseBoundarySeq`.
+
+Decision: while active sessions defer the handoff, automations keep running.
+The runners are paused only when the sole remaining blockers are in-flight
+automation ticks or leases, i.e. when the handoff is imminent. The daemon
+therefore keeps serving follow-ups on the old bundle until the machine is
+idle; the cost is that a spawn started in that window runs the old CLI,
+which was already true for interactive sessions.
