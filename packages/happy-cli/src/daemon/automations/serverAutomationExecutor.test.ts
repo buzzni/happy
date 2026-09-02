@@ -1737,6 +1737,14 @@ describe('runServerAutomationTick', () => {
     expect(spawned.initialPrompt).toContain('[Review apply quality contract]')
     expect(spawned.initialPrompt).toContain('PLAUSIBLE-only')
     expect(spawned.initialPrompt).toContain('Record an applied or skipped decision')
+    // 2026-09-02 — apply 가 작성자 브랜치에 직접 push 해 원하지 않은 커밋이 들어갔다.
+    // 되돌리려면 revert 가 이력에 남는다. 수정은 스택 PR 로 제안한다 — 머지하면
+    // 반영, 닫으면 흔적 없이 폐기. 독립 리뷰의 review-fix/ 관례를 그대로 쓴다.
+    expect(spawned.initialPrompt).toMatch(/never push to the pull request'?s own branch/i)
+    expect(spawned.initialPrompt).toContain('review-fix/<prNumber>-<reviewedHeadSha7>')
+    expect(spawned.initialPrompt).toMatch(/base (is|=) the reviewed pull request'?s head branch/i)
+    expect(spawned.initialPrompt).toContain('"fixBranch"')
+    expect(spawned.initialPrompt).toContain('"fixPrUrl"')
     expect(spawned.initialPrompt).toContain('Retry network failures and 5xx responses')
     expect(spawned.initialPrompt).not.toContain('claim-secret')
     expect(spawned.initialPrompt).not.toContain('complete-secret')

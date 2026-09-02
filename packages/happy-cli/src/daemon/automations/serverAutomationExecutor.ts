@@ -243,7 +243,7 @@ const PR_REVIEW_SANDBOX_CONFIG = JSON.stringify({
 
 const AGENT_TASK_RESULT_CONTRACTS: Record<AutomationAgentTaskDispatch['type'], string> = {
   'pr_review.v1': '{"reviewedHeadSha":"40-64 hex","verdict":"approve|changes_requested","findings":[{"id":"stable-id","severity":"high|medium|low","file":"path","line":1,"title":"...","evidence":"...","suggestedFix":"...","confidence":0.0}],"checks":[{"name":"...","status":"passed|failed|not_run","details":"..."}]}',
-  'review_apply.v1': '{"status":"applied|no_changes|stale|failed","reviewedHeadSha":"40-64 hex","currentHeadSha":"40-64 hex","findings":[{"findingId":"...","decision":"applied|skipped","reason":"..."}],"checks":[{"name":"...","status":"passed|failed|not_run","details":"..."}],"commitSha":"40-64 hex or null","pushUrl":"https URL or null"}',
+  'review_apply.v1': '{"status":"applied|no_changes|stale|failed","reviewedHeadSha":"40-64 hex","currentHeadSha":"40-64 hex","findings":[{"findingId":"...","decision":"applied|skipped","reason":"..."}],"checks":[{"name":"...","status":"passed|failed|not_run","details":"..."}],"commitSha":"40-64 hex or null","pushUrl":"https URL or null","fixBranch":"review-fix/<prNumber>-<reviewedHeadSha7> or null","fixPrUrl":"https URL of the stacked pull request or null"}',
   'testing.v1': '{"sourceSha":"40-64 hex","verdict":"passed|failed|blocked","checks":[{"name":"...","status":"passed|failed|not_run","details":"..."}],"logArtifactRef":null}',
 }
 
@@ -265,6 +265,12 @@ const AGENT_TASK_QUALITY_CONTRACTS: Record<AutomationAgentTaskDispatch['type'], 
     '- Apply only high or medium findings that are CONFIRMED or can first be reproduced with a concrete failing test. Skip low and PLAUSIBLE-only findings automatically.',
     '- Keep changes within the validated finding scope; do not add unrelated refactors, formatting, or speculative improvements.',
     '- Run the smallest relevant tests for each applied change, then the appropriate related checks before commit and push.',
+    // 2026-09-02 — 작성자 브랜치에 직접 push 한 커밋이 원하지 않은 변경으로 남았다.
+    // 되돌리면 revert 가 이력에 남는다. 스택 PR 은 opt-in 이다: 머지하면 반영, 닫으면
+    // 흔적 없이 폐기. 독립 리뷰가 쓰는 review-fix/ 관례를 그대로 따른다.
+    '- Never push to the pull request\'s own branch. Create review-fix/<prNumber>-<reviewedHeadSha7> from reviewedHeadSha,'
+      + ' commit there, push that branch, and open a stacked pull request whose base is the reviewed pull request\'s head branch'
+      + ' (read it with `gh pr view <prNumber> --json headRefName`). Report fixBranch and fixPrUrl; pushUrl is the fix pull request URL.',
     '- Record an applied or skipped decision and reason for every finding, plus all passed, failed, blocked, or not-run checks.',
   ].join('\n'),
   'testing.v1': '',
@@ -299,7 +305,7 @@ function buildAgentTaskPrompt(
       + ' build step the repository requires for its workspace packages, before running'
       + ' targeted checks, and if the install fails record the affected check as not_run with the reason instead of dropping it.'
       + ' Before review_apply, verify the PR is open and current HEAD equals reviewedHeadSha; otherwise return stale/failed'
-      + ' without mutating. review_apply may then edit, test, commit, and push; testing runs checks only.',
+      + ' without mutating. review_apply may then edit, test, commit to its review-fix branch, push it, and open the stacked pull request; testing runs checks only.',
     `4. Complete with exactly this result shape: ${AGENT_TASK_RESULT_CONTRACTS[dispatch.type]}`,
     '5. POST /complete with version=1, token=$APLUS_AGENT_TASK_COMPLETE_TOKEN, agentRunId, a stable idempotencyKey, and result.',
     // 2026-08-31 프로덕션 — pr_review 워커가 리뷰를 끝내고도 결과를 제출하지 못했다.
