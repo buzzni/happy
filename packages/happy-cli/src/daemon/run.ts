@@ -2309,8 +2309,12 @@ export async function startDaemon(): Promise<void> {
     // does not recognise lands in the outer catch, which is a straight
     // process.exit(1). A daemon that exits is a daemon that is not there to
     // restart itself, and the whole point of it is to be present — so no
-    // registration failure whatsoever is worth dying for. Carry on with local
-    // state and let the reconnect loop pick the server up when it returns.
+    // registration failure whatsoever is worth dying for.
+    //
+    // The degraded state is safe but not self-repairing: metadata and daemon
+    // state versions reconcile against the server on the next update, but
+    // nothing re-runs registration for the life of the process, so if the row
+    // was never created the socket RPCs keep failing until the daemon restarts.
     let machine: Machine;
     try {
       machine = await api.getOrCreateMachine({

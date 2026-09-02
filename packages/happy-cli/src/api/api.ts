@@ -89,7 +89,15 @@ export class ApiClient {
     } catch (error) {
       logger.debug('[API] [ERROR] Failed to get or create session:', error);
 
-      // Check if it's a connection error.
+      // Classify on whether the server answered at all, before looking at any
+      // error code. axios stamps a `code` on HTTP failures too — every 5xx
+      // carries ERR_BAD_RESPONSE and every 4xx ERR_BAD_REQUEST — so consulting
+      // codes first would let a real HTTP response be misread as a transport
+      // failure.
+      const errorResponse = axios.isAxiosError(error) ? error.response : undefined;
+      const errorCode = errorResponse ? undefined : connectionErrorCode(error);
+
+      // No reply at all — a transport failure.
       //
       // Deliberately the narrow `isNetworkError` net, not `isConnectivityError`:
       // this call mints a fresh data encryption key on every invocation, and
@@ -97,9 +105,7 @@ export class ApiClient {
       // in fact persisted a timed-out request, it keeps the first key and
       // ignores the resubmitted one, so treating an ambiguous failure as
       // "offline" would leave the session encrypted under a key the app does
-      // not hold — silent corruption in place of a loud failure. Only codes
-      // that prove the request never landed are safe to swallow here.
-      const errorCode = connectionErrorCode(error);
+      // not hold — silent corruption in place of a loud failure.
       if (isNetworkError(errorCode)) {
         connectionState.fail({
           operation: 'Session creation',
@@ -281,30 +287,16 @@ export class ApiClient {
       };
       return machine;
     } catch (error) {
-      // Handle connection errors gracefully.
-      //
-      // The wide `isConnectivityError` net, unlike the session path above:
-      // `POST /v1/machines` is an idempotent upsert keyed on a machine id, and
-      // the machine key is derived from credentials rather than generated per
-      // call, so replaying a request the server already applied is harmless.
-      // Registering is also on the daemon's startup path, where an unhandled
-      // error is a FATAL exit — being generous here is what keeps the daemon
-      // alive through a network blip.
-      const errorCode = connectionErrorCode(error);
-      if (isConnectivityError(errorCode)) {
-        connectionState.fail({
-          operation: 'Machine registration',
-          caller: 'api.getOrCreateMachine',
-          errorCode,
-          url: `${configuration.serverUrl}/v1/machines`
-        });
-        return createMinimalMachine();
-      }
+      // Classify on whether the server answered at all, before looking at any
+      // error code. axios stamps a `code` on HTTP failures too — every 5xx
+      // carries ERR_BAD_RESPONSE and every 4xx ERR_BAD_REQUEST — so consulting
+      // codes first would swallow real HTTP responses as transport failures and
+      // leave the status branches below unreachable.
+      const errorResponse = axios.isAxiosError(error) ? error.response : undefined;
 
-      // Handle 403/409 - server rejected request due to authorization conflict
-      // This is NOT "server unreachable" - server responded, so don't use connectionState
-      if (axios.isAxiosError(error) && error.response?.status) {
-        const status = error.response.status;
+      // The server answered. It is reachable, so this is not offline mode.
+      if (errorResponse?.status) {
+        const status = errorResponse.status;
 
         if (status === 403 || status === 409) {
           // Re-auth conflict: machine registered to old account, re-association not allowed
@@ -349,7 +341,10 @@ export class ApiClient {
 
         // Handle 401 - the token expired or was rotated. Recoverable by the
         // user, so say what to do rather than dying with an opaque stack.
+        // Logged as well as printed: the daemon is spawned with stdio 'ignore',
+        // so on the path this matters most console output goes nowhere.
         if (status === 401) {
+          logger.debug('[API] Machine registration rejected with 401 — credentials are no longer valid, run `happy auth`');
           console.log(chalk.yellow(
             `⚠️  Machine registration rejected by the server with status 401`
           ));
@@ -359,16 +354,54 @@ export class ApiClient {
           return createMinimalMachine();
         }
 
-        // Any other status the server managed to return (429 rate limiting and
-        // the rest). The server is up and talking to us, so this is far more
-        // likely transient than fatal — degrade instead of taking the caller
-        // down. Registration runs on the daemon's startup path, where throwing
-        // means a FATAL exit and a multi-minute outage.
+        // Rate limiting is transient by definition, and the reconnect loop is
+        // the right thing to wait on.
+        if (status === 429) {
+          connectionState.fail({
+            operation: 'Machine registration',
+            errorCode: '429',
+            url: `${configuration.serverUrl}/v1/machines`,
+            details: ['Will retry automatically']
+          });
+          return createMinimalMachine();
+        }
+
+        // Any other status the server managed to return — 400 and 422 from a
+        // request this client built wrong, 426 for a client too old, and so on.
+        // These are permanent: retrying identical bytes will fail identically,
+        // and registration is attempted exactly once per process. Saying
+        // "server unreachable, will retry" would be false twice over, so report
+        // it as the contract problem it is. Still return a local machine rather
+        // than throwing — the daemon staying up is the point of this path.
+        logger.debug(`[API] Machine registration rejected with ${status}`, errorResponse.data);
+        console.log(chalk.yellow(
+          `⚠️  The server rejected machine registration with status ${status}`
+        ));
+        console.log(chalk.yellow(
+          `   → Continuing with local-only state; this machine will not sync`
+        ));
+        console.log(chalk.yellow(
+          `   → This is a client/server mismatch rather than a network problem — please report it`
+        ));
+        return createMinimalMachine();
+      }
+
+      // No reply at all — a transport failure.
+      //
+      // The wide `isConnectivityError` net, unlike the session path above:
+      // `POST /v1/machines` is an idempotent upsert keyed on a machine id, and
+      // the machine key is derived from credentials rather than generated per
+      // call, so replaying a request the server already applied is harmless.
+      // Registration is also on the daemon's startup path, where an unhandled
+      // error is a FATAL exit — being generous here is what keeps the daemon
+      // alive through a network blip.
+      const errorCode = connectionErrorCode(error);
+      if (isConnectivityError(errorCode)) {
         connectionState.fail({
           operation: 'Machine registration',
-          errorCode: String(status),
-          url: `${configuration.serverUrl}/v1/machines`,
-          details: ['Will retry automatically']
+          caller: 'api.getOrCreateMachine',
+          errorCode,
+          url: `${configuration.serverUrl}/v1/machines`
         });
         return createMinimalMachine();
       }

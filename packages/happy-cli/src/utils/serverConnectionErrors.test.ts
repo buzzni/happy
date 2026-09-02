@@ -621,6 +621,15 @@ describe('isConnectivityError', () => {
         expect(isConnectivityError('ERR_INVALID_URL')).toBe(false);
         expect(isConnectivityError(undefined)).toBe(false);
     });
+
+    // axios stamps ERR_BAD_REQUEST on every 4xx and ERR_BAD_RESPONSE on every
+    // 5xx (lib/core/settle.js). Those are HTTP outcomes from a server that
+    // answered, not transport failures — classifying them as connectivity
+    // would swallow real responses and leave the status branches unreachable.
+    it('should not classify HTTP response codes as connectivity failures', () => {
+        expect(isConnectivityError('ERR_BAD_REQUEST')).toBe(false);
+        expect(isConnectivityError('ERR_BAD_RESPONSE')).toBe(false);
+    });
 });
 
 describe('connectionErrorCode', () => {

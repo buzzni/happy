@@ -245,52 +245,56 @@ export function startOfflineReconnection<TSession>(
 // ============================================================================
 
 /**
- * Transport failures where the request provably produced no server-side effect:
- * DNS never resolved, the connection was refused or never established, or it
- * dropped before the server could answer.
+ * Transport failures treated as "the server is unreachable", so callers degrade
+ * to offline mode and retry later instead of propagating the error. Codes that
+ * no classification helper recognises bubble up as unexpected failures — on the
+ * daemon's startup path that means a FATAL exit, so a transient blip would take
+ * the whole process down.
  *
- * Because retrying one of these can never duplicate work, callers degrade to
- * offline mode and retry later instead of propagating the error. Codes missing
- * from the classification helpers bubble up as unexpected failures — for the
- * daemon that means a FATAL exit, so a transient blip would take the whole
- * process down. Keep transient transport failures classified.
+ * These are the codes safe enough for callers that are *not* idempotent. Most
+ * are connection-establishment failures, which prove the request never reached
+ * the server:
  *
- * Note on ETIMEDOUT: axios reports its own `timeout` expiry as ETIMEDOUT only
- * when `transitional.clarifyTimeoutError` is set, which this codebase does not
- * do — so here ETIMEDOUT is the kernel's connect timeout and belongs with the
- * unambiguous failures.
+ *   ECONNREFUSED ENOTFOUND EAI_AGAIN EHOSTUNREACH ENETUNREACH ENETDOWN
+ *   EHOSTDOWN EADDRNOTAVAIL
+ *
+ * Two members are weaker than that and are kept here for compatibility with
+ * long-standing behaviour rather than because they satisfy the invariant:
+ * `ECONNRESET` and `ETIMEDOUT` can both occur on an already-established
+ * connection *after* the server committed a write — a proxy recycling a worker,
+ * or a read timeout on a request that did land. Do not add new codes with that
+ * property; put them in AMBIGUOUS_DELIVERY_ERROR_CODES instead.
  */
 export const NETWORK_ERROR_CODES = [
-    // Connection never established, or dropped before a reply
-    'ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT',
-    'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH',
+    // Connection never established
+    'ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH',
     // Interface/route torn out from under us — laptop sleep, VPN toggle
     'ENETDOWN', 'EHOSTDOWN', 'EADDRNOTAVAIL',
-    // Connection closed while the request was still being written
-    'EPIPE',
     // Temporary DNS failure — resolver reachable but no answer yet
     'EAI_AGAIN',
-    // Axios' generic "request failed without a response" code
-    'ERR_NETWORK'
+    // Weaker members, kept for compatibility — see the note above
+    'ECONNRESET', 'ETIMEDOUT'
 ] as const;
 
 /**
- * Failures where no usable reply arrived but the server may well have processed
- * the request anyway.
+ * Failures where no reply arrived but the server may well have processed the
+ * request anyway.
  *
  * `ECONNABORTED` is axios' *client-side* `timeout` expiry: the socket usually
  * connected fine and the server simply did not answer within the deadline — it
- * may still have committed the write. `ERR_BAD_RESPONSE` means a reply arrived
- * but was truncated or unparsable, which likewise says nothing about whether
- * the request took effect.
+ * may still have committed the write. `ERR_NETWORK` is axios' own "request
+ * failed without a response", which by definition says nothing about whether
+ * the request landed. `EPIPE` means the peer closed while we were writing,
+ * which is usually a benign keep-alive race but can also follow a completed,
+ * committed request.
  *
  * Only treat these as "offline" for operations that are idempotent. For a
- * request that mints new state (a fresh session encryption key, say), silently
- * assuming failure and retrying can strand the state the server already
- * persisted — see `isConnectivityError`.
+ * request that mints new state — a fresh session encryption key, say —
+ * assuming failure and retrying can strand state the server already persisted.
+ * See `isConnectivityError`.
  */
 export const AMBIGUOUS_DELIVERY_ERROR_CODES = [
-    'ECONNABORTED', 'ERR_BAD_RESPONSE'
+    'ECONNABORTED', 'ERR_NETWORK', 'EPIPE'
 ] as const;
 
 /**
@@ -352,11 +356,11 @@ export const ERROR_DESCRIPTIONS: Record<string, string> = {
     EAI_AGAIN: 'temporary DNS resolution failure',
     ERR_NETWORK: 'network request failed without a response',
     ECONNABORTED: 'request timed out waiting for the server',
-    ERR_BAD_RESPONSE: 'server reply was truncated or unparsable',
     // HTTP errors
     '401': 'authentication failed - run `happy auth`',
     '403': 'access forbidden',
     '404': 'endpoint not found, check server deployment',
+    '429': 'rate limited by the server',
     '500': 'server internal error',
     '502': 'bad gateway',
     '503': 'service unavailable',
