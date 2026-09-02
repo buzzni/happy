@@ -34,7 +34,7 @@ export type CheckpointExclusionManifest = {
 export class CheckpointPolicyDriftError extends Error {
     readonly action = 'restart-sandbox-or-disable-protection' as const;
 
-    constructor() {
+    constructor(readonly excluded: CheckpointExcludedPath[] = []) {
         super('checkpoint exclusion policy changed; restart sandbox or disable protection');
         this.name = 'CheckpointPolicyDriftError';
     }
@@ -66,6 +66,12 @@ export class CheckpointExclusionGuard {
         return [...this.policy.secretPatterns];
     }
 
+    excludedReason(path: string): CheckpointExcludedPath['reason'] | null {
+        const manifestEntry = this.manifest.excluded.find((entry) => entry.path === path);
+        if (manifestEntry) return manifestEntry.reason;
+        return ignore().add(this.policy.secretPatterns).ignores(path) ? 'secret' : null;
+    }
+
     static async create(policy: CheckpointExclusionPolicy): Promise<CheckpointExclusionGuard> {
         const canonicalProjectPath = await realpath(policy.projectPath);
         const canonicalPolicy = {
@@ -82,10 +88,25 @@ export class CheckpointExclusionGuard {
     async dispatchAfterPolicyCheck<T>(dispatch: () => Promise<T>): Promise<T> {
         const current = await buildCheckpointExclusionManifest(this.policy);
         if (current.fingerprint !== this.manifest.fingerprint) {
-            throw new CheckpointPolicyDriftError();
+            throw new CheckpointPolicyDriftError(changedExclusions(
+                this.manifest.excluded,
+                current.excluded,
+            ));
         }
         return dispatch();
     }
+}
+
+function changedExclusions(
+    previous: CheckpointExcludedPath[],
+    current: CheckpointExcludedPath[],
+): CheckpointExcludedPath[] {
+    const previousByPath = new Map(previous.map((entry) => [entry.path, entry]));
+    const currentByPath = new Map(current.map((entry) => [entry.path, entry]));
+    return [...new Set([...previousByPath.keys(), ...currentByPath.keys()])]
+        .filter((path) => previousByPath.get(path)?.reason !== currentByPath.get(path)?.reason)
+        .map((path) => currentByPath.get(path) ?? previousByPath.get(path)!)
+        .sort((left, right) => left.path.localeCompare(right.path));
 }
 
 async function buildCheckpointExclusionManifest(

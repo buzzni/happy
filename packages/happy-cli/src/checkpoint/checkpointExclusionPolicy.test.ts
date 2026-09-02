@@ -222,6 +222,7 @@ describe('CheckpointExclusionGuard', () => {
         await expect(guard.dispatchAfterPolicyCheck(dispatch)).rejects.toMatchObject({
             name: 'CheckpointPolicyDriftError',
             action: 'restart-sandbox-or-disable-protection',
+            excluded: [{ path: '.env.production', reason: 'secret' }],
         });
         expect(dispatch).not.toHaveBeenCalled();
     });

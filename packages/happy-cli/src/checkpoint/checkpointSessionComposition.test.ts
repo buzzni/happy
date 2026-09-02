@@ -4,6 +4,7 @@ import { join, sep } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { SandboxConfigSchema } from '@/persistence';
 import { CHECKPOINT_SPAWN_CONTEXT_ENV_KEY } from './checkpointSpawnContext';
+import { CheckpointProtectionStateStore } from './checkpointProtectionState';
 import { createCheckpointSessionComposition } from './checkpointSessionComposition';
 
 describe('createCheckpointSessionComposition', () => {
@@ -201,5 +202,99 @@ describe('createCheckpointSessionComposition', () => {
         expect(second.checkpointId).not.toBe(first.checkpointId);
         await expect(readFile(join(second.providerPath, 'source.txt'), 'utf8')).resolves.toBe('first turn');
         await result.completeTurn(async () => {});
+    });
+
+    it('records a daemon-readable pending decision when policy drift blocks dispatch', async () => {
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-1',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+        });
+        await writeFile(join(projectPath, '.env.production'), 'secret');
+
+        await expect(result.beforeTurn?.()).rejects.toMatchObject({
+            name: 'CheckpointPolicyDriftError',
+        });
+        await expect(new CheckpointProtectionStateStore(checkpointRoot).read({
+            sessionId: 'session-1',
+            projectId: 'project-1',
+            worktreeId: null,
+            projectPath,
+        })).resolves.toMatchObject({
+            protection: { status: 'protected' },
+            pendingDecision: {
+                operationId: expect.any(String),
+                source: 'policy-drift',
+                excluded: [{ path: '.env.production', reason: 'secret' }],
+            },
+        });
+    });
+
+    it('records an excluded-path conflict discovered by the turn applier', async () => {
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-1',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+        });
+        const turn = await result.beforeTurn?.();
+        if (!turn || !result.completeTurn) throw new Error('expected protected turn lifecycle');
+        await writeFile(join(turn.providerPath, '.env.future'), 'sandbox bypass');
+
+        await expect(result.completeTurn(async () => {})).resolves.toMatchObject({
+            entries: [{ path: '.env.future', action: 'conflict', outcome: 'conflict' }],
+        });
+        await expect(new CheckpointProtectionStateStore(checkpointRoot).read({
+            sessionId: 'session-1',
+            projectId: 'project-1',
+            worktreeId: null,
+            projectPath,
+        })).resolves.toMatchObject({
+            protection: { status: 'protected' },
+            pendingDecision: {
+                operationId: turn.operationId,
+                source: 'turn-apply',
+                excluded: [{ path: '.env.future', reason: 'secret' }],
+            },
+        });
+        await expect(result.beforeTurn?.()).rejects.toThrow('excluded path decision is pending');
+    });
+
+    it('starts a restarted session without checkpoint protection after explicit disable', async () => {
+        const state = new CheckpointProtectionStateStore(checkpointRoot);
+        const binding = {
+            sessionId: 'session-1',
+            projectId: 'project-1',
+            worktreeId: null,
+            projectPath,
+        } as const;
+        await state.reportPending({
+            ...binding,
+            operationId: 'turn-1',
+            source: 'policy-drift',
+            excluded: [],
+        });
+        await state.resolveDecision({
+            ...binding,
+            operationId: 'turn-1',
+            decision: 'disable-protection',
+        });
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-1',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+        });
+
+        expect(result.beforeTurn).toBeUndefined();
+        expect(result.sandboxConfig?.checkpointProtection).toBeUndefined();
+        expect(result.sandboxConfig?.enabled).toBe(true);
     });
 });

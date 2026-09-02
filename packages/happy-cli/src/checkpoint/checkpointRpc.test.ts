@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CheckpointLedger } from './checkpointLedger';
 import { createCheckpointRpcHandlers } from './checkpointRpc';
+import { CheckpointProtectionStateStore } from './checkpointProtectionState';
 import { CheckpointRestoreExecutor, type CheckpointRestoreMutation } from './checkpointRestore';
 import { CheckpointStore } from './checkpointStore';
 
@@ -30,18 +31,21 @@ describe('checkpoint daemon RPC', () => {
     });
 
     function createHandlers(restoreExecutor?: CheckpointRestoreExecutor) {
+        const protectionState = new CheckpointProtectionStateStore(checkpointRoot);
         return createCheckpointRpcHandlers({
             checkpointRoot,
             ...(restoreExecutor ? { restoreExecutor } : {}),
-            resolveAuthority: async (sessionId) => sessionId === authority.sessionId
-                ? {
+            resolveAuthority: async (sessionId) => {
+                if (sessionId !== authority.sessionId) return null;
+                const state = await protectionState.read({ ...authority, projectPath });
+                return {
                     ...authority,
                     projectPath,
-                    protection: { status: 'protected' as const },
+                    ...state,
                     excludedPaths: [],
                     excludedPatterns: [],
-                }
-                : null,
+                };
+            },
         });
     }
 
@@ -52,6 +56,7 @@ describe('checkpoint daemon RPC', () => {
                 ...authority,
                 projectPath,
                 protection: { status: 'unavailable' as const, reason: 'excluded-path' as const },
+                pendingDecision: null,
                 excludedPaths: [],
                 excludedPatterns: [],
             }),
@@ -131,6 +136,86 @@ describe('checkpoint daemon RPC', () => {
             schemaVersion: 1,
             ...authority,
             protection: { status: 'protected' },
+            pendingDecision: null,
+        });
+    });
+
+    it('exact-binds cancellation of a pending excluded-path decision', async () => {
+        const store = new CheckpointProtectionStateStore(checkpointRoot);
+        await store.reportPending({
+            ...authority,
+            projectPath,
+            operationId: 'turn-current',
+            source: 'policy-drift',
+            excluded: [{ path: '.env', reason: 'secret' }],
+        });
+        const handlers = createHandlers();
+
+        await expect(handlers.status({ schemaVersion: 1, ...authority })).resolves.toMatchObject({
+            protection: { status: 'protected' },
+            pendingDecision: {
+                operationId: 'turn-current',
+                excluded: [{ path: '.env', reason: 'secret' }],
+                warnings: {
+                    partialExecutionPossible: true,
+                    externalSideEffectsMayRepeat: true,
+                },
+            },
+        });
+        await expect(handlers.decision({
+            schemaVersion: 1,
+            ...authority,
+            operationId: 'turn-stale',
+            decision: 'cancel',
+        })).rejects.toThrow('pending operation mismatch');
+        await expect(handlers.decision({
+            schemaVersion: 1,
+            ...authority,
+            projectId: 'other-project',
+            operationId: 'turn-current',
+            decision: 'cancel',
+        })).rejects.toThrow('binding mismatch');
+        await expect(handlers.decision({
+            schemaVersion: 1,
+            ...authority,
+            operationId: 'turn-current',
+            decision: 'cancel',
+        })).resolves.toEqual({
+            schemaVersion: 1,
+            ...authority,
+            protection: { status: 'protected' },
+            pendingDecision: null,
+        });
+    });
+
+    it('durably disables protection only after an explicit pending decision', async () => {
+        const store = new CheckpointProtectionStateStore(checkpointRoot);
+        await store.reportPending({
+            ...authority,
+            projectPath,
+            operationId: 'turn-1',
+            source: 'turn-apply',
+            excluded: [{ path: 'large.bin', reason: 'too-large' }],
+        });
+        const handlers = createHandlers();
+
+        await expect(handlers.decision({
+            schemaVersion: 1,
+            ...authority,
+            operationId: 'turn-1',
+            decision: 'disable-protection',
+        })).resolves.toEqual({
+            schemaVersion: 1,
+            ...authority,
+            protection: { status: 'unavailable', reason: 'excluded-path' },
+            pendingDecision: null,
+        });
+        await expect(createHandlers().status({
+            schemaVersion: 1,
+            ...authority,
+        })).resolves.toMatchObject({
+            protection: { status: 'unavailable', reason: 'excluded-path' },
+            pendingDecision: null,
         });
     });
 

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { injectCheckpointSpawnContext } from '@/checkpoint/checkpointSpawnContext';
+import { CheckpointProtectionStateStore } from '@/checkpoint/checkpointProtectionState';
 import { SandboxConfigSchema } from '@/persistence';
 import { resolveCheckpointSessionAuthority } from './checkpointSessionAuthority';
 import { captureSaycodeAgentEnvironment } from './sessionEnv';
@@ -107,6 +108,60 @@ describe('resolveCheckpointSessionAuthority', () => {
             protection: { status: 'unavailable', reason: 'unsupported-platform' },
             excludedPaths: [],
             excludedPatterns: [],
+        });
+    });
+
+    it('preserves daemon-authoritative pending and disabled protection state', async () => {
+        const store = new CheckpointProtectionStateStore(checkpointRoot);
+        const binding = {
+            sessionId: 'session-1',
+            projectId: 'project-1',
+            worktreeId: null,
+            projectPath,
+        } as const;
+        await store.reportPending({
+            ...binding,
+            operationId: 'turn-1',
+            source: 'policy-drift',
+            excluded: [{ path: '.env', reason: 'secret' }],
+        });
+
+        await expect(resolveCheckpointSessionAuthority({
+            sessionId: 'session-1',
+            trackedSession: trackedSession(),
+            checkpointRoot,
+            platform: 'darwin',
+        })).resolves.toMatchObject({
+            protection: { status: 'protected' },
+            pendingDecision: { operationId: 'turn-1' },
+        });
+
+        await store.resolveDecision({
+            ...binding,
+            operationId: 'turn-1',
+            decision: 'disable-protection',
+        });
+        const disabledTracked = trackedSession();
+        disabledTracked.happySessionMetadataFromLocalWebhook = {
+            ...disabledTracked.happySessionMetadataFromLocalWebhook,
+            sandbox: SandboxConfigSchema.parse({
+                checkpointProtection: {
+                    secretPatterns: ['.env*'],
+                    maxFileBytes: 1024,
+                    maxFiles: 100,
+                    maxTotalBytes: 4096,
+                    readOnlyPassthroughPaths: ['missing-cache'],
+                },
+            }),
+        } as TrackedSession['happySessionMetadataFromLocalWebhook'];
+        await expect(resolveCheckpointSessionAuthority({
+            sessionId: 'session-1',
+            trackedSession: disabledTracked,
+            checkpointRoot,
+            platform: 'darwin',
+        })).resolves.toMatchObject({
+            protection: { status: 'unavailable', reason: 'excluded-path' },
+            pendingDecision: null,
         });
     });
 });

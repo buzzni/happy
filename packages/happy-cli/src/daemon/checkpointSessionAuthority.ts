@@ -5,6 +5,7 @@ import {
     resolveCheckpointProtectionCapability,
 } from '@/checkpoint/checkpointExclusionPolicy';
 import type { CheckpointRpcSessionAuthority } from '@/checkpoint/checkpointRpc';
+import { CheckpointProtectionStateStore } from '@/checkpoint/checkpointProtectionState';
 import { readCheckpointSpawnContext } from '@/checkpoint/checkpointSpawnContext';
 import type { TrackedSession } from './types';
 
@@ -36,6 +37,7 @@ export async function resolveCheckpointSessionAuthority(input: {
         return {
             ...base,
             protection: { status: 'legacy' },
+            pendingDecision: null,
             excludedPaths: [],
             excludedPatterns: [],
         };
@@ -51,12 +53,23 @@ export async function resolveCheckpointSessionAuthority(input: {
         return {
             ...base,
             protection: { status: 'unavailable', reason: capability.reason },
+            pendingDecision: null,
             excludedPaths: [],
             excludedPatterns: [],
         };
     }
 
     try {
+        const persisted = await new CheckpointProtectionStateStore(input.checkpointRoot).read(base);
+        if (persisted.protection.status === 'unavailable') {
+            return {
+                ...base,
+                protection: persisted.protection,
+                pendingDecision: null,
+                excludedPaths: [],
+                excludedPatterns: [],
+            };
+        }
         const guard = await CheckpointExclusionGuard.create({
             projectPath,
             ...checkpointProtection,
@@ -64,6 +77,7 @@ export async function resolveCheckpointSessionAuthority(input: {
         return {
             ...base,
             protection: { status: 'protected' },
+            pendingDecision: persisted.pendingDecision,
             excludedPaths: guard.manifest.excluded.map((entry) => entry.path),
             excludedPatterns: guard.secretPatterns,
         };
@@ -71,6 +85,7 @@ export async function resolveCheckpointSessionAuthority(input: {
         return {
             ...base,
             protection: { status: 'unavailable', reason: 'snapshot-failed' },
+            pendingDecision: null,
             excludedPaths: [],
             excludedPatterns: [],
         };

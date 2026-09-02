@@ -2,6 +2,10 @@ import { execFile } from 'node:child_process';
 import { access } from 'node:fs/promises';
 import { z } from 'zod';
 import type { CheckpointProtectionState } from './checkpointContract';
+import {
+    CheckpointProtectionStateStore,
+    type CheckpointPendingDecision,
+} from './checkpointProtectionState';
 import { CheckpointRestoreExecutor } from './checkpointRestore';
 import { CheckpointRestorePlanner } from './checkpointRestorePlan';
 import { resolveCheckpointStoreLayout } from './checkpointStore';
@@ -24,6 +28,10 @@ const previewRequestSchema = bindingRequestSchema.extend({
 
 const cancelRequestSchema = bindingRequestSchema.extend({
     operationId: identifierSchema,
+}).strict();
+
+const decisionRequestSchema = cancelRequestSchema.extend({
+    decision: z.enum(['cancel', 'disable-protection']),
 }).strict();
 
 const projectRelativePathSchema = z.string().min(1).refine((value) => (
@@ -73,6 +81,7 @@ export type CheckpointRpcSessionAuthority = {
     worktreeId: string | null;
     projectPath: string;
     protection: CheckpointProtectionState;
+    pendingDecision: CheckpointPendingDecision | null;
     excludedPaths: string[];
     excludedPatterns: string[];
 };
@@ -84,6 +93,7 @@ export type CheckpointRpcHandlers = {
     execute(params: unknown): Promise<unknown>;
     retry(params: unknown): Promise<unknown>;
     cancel(params: unknown): Promise<unknown>;
+    decision(params: unknown): Promise<unknown>;
 };
 
 export function createCheckpointRpcHandlers(input: {
@@ -92,6 +102,7 @@ export function createCheckpointRpcHandlers(input: {
     restoreExecutor?: CheckpointRestoreExecutor;
 }): CheckpointRpcHandlers {
     const restoreExecutor = input.restoreExecutor ?? new CheckpointRestoreExecutor(input.checkpointRoot);
+    const protectionState = new CheckpointProtectionStateStore(input.checkpointRoot);
     const resolveRequestAuthority = async (request: z.infer<typeof bindingRequestSchema>) => {
         const authority = await input.resolveAuthority(request.sessionId);
         if (!authority) throw new Error('checkpoint RPC session authority is unavailable');
@@ -115,6 +126,7 @@ export function createCheckpointRpcHandlers(input: {
                 projectId: authority.projectId,
                 worktreeId: authority.worktreeId,
                 protection: authority.protection,
+                pendingDecision: authority.pendingDecision,
             };
         },
         list: async (params) => {
@@ -196,6 +208,25 @@ export function createCheckpointRpcHandlers(input: {
                 schemaVersion: 1 as const,
                 operationId: request.operationId,
                 status: 'cancelled' as const,
+            };
+        },
+        decision: async (params) => {
+            const request = decisionRequestSchema.parse(params);
+            const authority = await resolveRequestAuthority(request);
+            const status = await protectionState.resolveDecision({
+                sessionId: authority.sessionId,
+                projectId: authority.projectId,
+                worktreeId: authority.worktreeId,
+                projectPath: authority.projectPath,
+                operationId: request.operationId,
+                decision: request.decision,
+            });
+            return {
+                schemaVersion: 1 as const,
+                sessionId: authority.sessionId,
+                projectId: authority.projectId,
+                worktreeId: authority.worktreeId,
+                ...status,
             };
         },
     };

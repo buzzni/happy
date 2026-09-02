@@ -45,6 +45,7 @@ export type CheckpointRuntime =
         excludedPaths: string[];
         excludedPatterns: string[];
         readOnlyPassthroughPaths: string[];
+        excludedReason(path: string): 'secret' | 'ignored' | 'too-large' | 'file-limit' | 'total-size-limit' | null;
         beforeTurn(operationId: string): Promise<CheckpointSnapshotResult>;
         recordMutation(mutation: RuntimeMutation): Promise<CheckpointLedgerRecord>;
     };
@@ -76,6 +77,7 @@ export async function createCheckpointRuntime(
         excludedPaths: guard.manifest.excluded.map((entry) => entry.path),
         excludedPatterns: guard.secretPatterns,
         readOnlyPassthroughPaths: guard.manifest.readOnlyPassthroughPaths,
+        excludedReason: (path) => guard.excludedReason(path),
         beforeTurn: (operationId) => guard.dispatchAfterPolicyCheck(() => store.snapshotTurn({
             ...binding,
             operationId,

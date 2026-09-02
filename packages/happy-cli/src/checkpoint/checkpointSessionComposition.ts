@@ -7,7 +7,8 @@ import { buildSandboxRuntimeConfig } from '@/sandbox/config';
 import type { QueryOptions } from '@/claude/sdk';
 import { createCheckpointRuntime } from './checkpointRuntime';
 import { readCheckpointSpawnContext } from './checkpointSpawnContext';
-import type { CheckpointProvider } from './checkpointExclusionPolicy';
+import { CheckpointPolicyDriftError, type CheckpointProvider } from './checkpointExclusionPolicy';
+import { CheckpointProtectionStateStore } from './checkpointProtectionState';
 import { CheckpointTurnWorkspace } from './checkpointTurnWorkspace';
 import { CheckpointTurnApplier, type CheckpointTurnApplyResult } from './checkpointTurnApply';
 import { CheckpointWriterProcessTree } from './checkpointWriterProcessTree';
@@ -50,6 +51,21 @@ export async function createCheckpointSessionComposition(input: {
     }
     await mkdir(context.checkpointRoot, { recursive: true, mode: 0o700 });
     const canonicalCheckpointRoot = await realpath(context.checkpointRoot);
+    const canonicalProjectPath = await realpath(input.projectPath);
+    const workspaceBinding = {
+        sessionId: input.sessionId,
+        projectId: context.projectId,
+        worktreeId: context.worktreeId,
+    };
+    const protectionState = new CheckpointProtectionStateStore(canonicalCheckpointRoot);
+    const persistedProtection = await protectionState.read({
+        ...workspaceBinding,
+        projectPath: canonicalProjectPath,
+    });
+    if (persistedProtection.protection.status === 'unavailable') {
+        const { checkpointProtection: _checkpointProtection, ...unprotectedSandbox } = inputSandboxConfig;
+        return { sandboxConfig: unprotectedSandbox };
+    }
     const runtime = await createCheckpointRuntime({
         provider: input.provider,
         platform: input.platform,
@@ -68,12 +84,6 @@ export async function createCheckpointSessionComposition(input: {
     }
 
     const turnWorkspace = new CheckpointTurnWorkspace(canonicalCheckpointRoot);
-    const canonicalProjectPath = await realpath(input.projectPath);
-    const workspaceBinding = {
-        sessionId: input.sessionId,
-        projectId: context.projectId,
-        worktreeId: context.worktreeId,
-    };
     const sandboxConfigFor = (path: string): SandboxConfig => ({
         ...inputSandboxConfig,
         sessionIsolation: 'custom',
@@ -118,7 +128,31 @@ export async function createCheckpointSessionComposition(input: {
             throw new Error('checkpoint protected turn is already active');
         }
         const operationId = nextOperationId;
-        const snapshot = await runtime.beforeTurn(operationId);
+        const currentProtection = await protectionState.read({
+            ...workspaceBinding,
+            projectPath: canonicalProjectPath,
+        });
+        if (currentProtection.protection.status !== 'protected') {
+            throw new Error('checkpoint protection unavailable: excluded-path');
+        }
+        if (currentProtection.pendingDecision) {
+            throw new Error('checkpoint excluded path decision is pending');
+        }
+        let snapshot;
+        try {
+            snapshot = await runtime.beforeTurn(operationId);
+        } catch (error) {
+            if (error instanceof CheckpointPolicyDriftError) {
+                await protectionState.reportPending({
+                    ...workspaceBinding,
+                    projectPath: canonicalProjectPath,
+                    operationId,
+                    source: 'policy-drift',
+                    excluded: error.excluded,
+                });
+            }
+            throw error;
+        }
         const workspace = await turnWorkspace.prepare({
             ...workspaceBinding,
             operationId,
@@ -161,6 +195,20 @@ export async function createCheckpointSessionComposition(input: {
             excludedPatterns: runtime.excludedPatterns,
             readOnlyPassthroughPaths: runtime.readOnlyPassthroughPaths,
         });
+        const excluded = result.entries.flatMap((entry) => (
+            entry.action === 'conflict' && runtime.excludedReason(entry.path)
+                ? [{ path: entry.path, reason: excludedReasonFor(runtime, entry.path) }]
+                : []
+        ));
+        if (excluded.length > 0) {
+            await protectionState.reportPending({
+                ...workspaceBinding,
+                projectPath: canonicalProjectPath,
+                operationId: completedTurn.operationId,
+                source: 'turn-apply',
+                excluded,
+            });
+        }
         if (result.status === 'completed') {
             await turnWorkspace.remove({
                 ...workspaceBinding,
@@ -193,4 +241,13 @@ export async function createCheckpointSessionComposition(input: {
         trackProtectedWriter,
         claudeSandbox,
     };
+}
+
+function excludedReasonFor(
+    runtime: Extract<Awaited<ReturnType<typeof createCheckpointRuntime>>, { status: 'protected' }>,
+    path: string,
+): 'secret' | 'ignored' | 'too-large' | 'file-limit' | 'total-size-limit' {
+    const reason = runtime.excludedReason(path);
+    if (!reason) throw new Error('checkpoint excluded conflict is missing from the policy');
+    return reason;
 }
