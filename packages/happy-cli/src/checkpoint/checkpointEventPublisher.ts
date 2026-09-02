@@ -49,6 +49,9 @@ export type CheckpointEventRequest = {
 };
 
 type CheckpointEventPost = (request: CheckpointEventRequest) => Promise<unknown>;
+const operationIdSchema = z.string().regex(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+);
 
 const acknowledgementSchema = z.object({
     event: z.object({
@@ -83,6 +86,7 @@ export function createCheckpointEventPublisher(
         operationId: string,
         detailInput: unknown,
     ): Promise<CheckpointEventAck> => {
+        const parsedOperationId = operationIdSchema.parse(operationId);
         const detail = checkpointEventDetailSchema.parse(detailInput);
         const response = await post({
             url: `${serverUrl}/v3/sessions/${encodeURIComponent(input.sessionId)}/events`,
@@ -96,7 +100,7 @@ export function createCheckpointEventPublisher(
                 )),
                 checkpoint: {
                     schemaVersion: 1,
-                    operationId,
+                    operationId: parsedOperationId,
                     checkpointId: detail.checkpointId,
                     state: detail.state,
                     actor: detail.actor,

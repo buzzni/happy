@@ -17,8 +17,8 @@ import { persistCheckpointSessionEvent } from './persistCheckpointSessionEvent';
 
 const checkpoint = {
     schemaVersion: 1,
-    operationId: 'operation-1',
-    checkpointId: 'checkpoint-1',
+    operationId: '123e4567-e89b-42d3-a456-426614174000',
+    checkpointId: 'a'.repeat(40),
     state: 'created',
     actor: 'agent',
     timestamp: 1_788_111_000_000,
@@ -58,7 +58,7 @@ describe('persistCheckpointSessionEvent', () => {
                 seq: 7,
                 content: { t: 'encrypted', c: 'encrypted-detail' },
                 checkpoint,
-                idempotencyKey: 'checkpoint-snapshot:operation-1:created',
+                idempotencyKey: 'checkpoint-snapshot:123e4567-e89b-42d3-a456-426614174000:created',
             },
             select: { id: true, seq: true, createdAt: true },
         });
@@ -90,7 +90,7 @@ describe('persistCheckpointSessionEvent', () => {
         expect(mocks.findFirst).toHaveBeenCalledWith({
             where: {
                 sessionId: 'session-1',
-                idempotencyKey: 'checkpoint-snapshot:operation-1:created',
+                idempotencyKey: 'checkpoint-snapshot:123e4567-e89b-42d3-a456-426614174000:created',
             },
             select: { id: true, seq: true, createdAt: true },
         });

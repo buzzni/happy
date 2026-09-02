@@ -68,7 +68,7 @@ describe('checkpoint protection state contract', () => {
 describe('encrypted checkpoint event detail contract', () => {
     const validDetail = {
         schemaVersion: 1,
-        checkpointId: 'checkpoint-1',
+        checkpointId: 'a'.repeat(40),
         state: 'created',
         actor: 'agent',
         timestamp: 1_788_111_000_000,

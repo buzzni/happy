@@ -4,6 +4,7 @@ const identifierSchema = z.string().min(1).max(128).refine(
     (value) => value.trim() === value && !/[\u0000-\u001F\u007F]/.test(value),
     'identifier must not contain surrounding whitespace or control characters',
 );
+const checkpointIdSchema = z.string().regex(/^[a-f0-9]{40,64}$/);
 
 const projectRelativePathSchema = z.string().min(1).refine((value) => {
     if (value.includes('\0') || /^(?:[A-Za-z]:|[\\/])/.test(value)) return false;
@@ -50,7 +51,7 @@ const checkpointExcludedSummarySchema = z.object({
 
 export const checkpointEventDetailSchema = z.object({
     schemaVersion: z.literal(1),
-    checkpointId: identifierSchema,
+    checkpointId: checkpointIdSchema,
     state: z.enum(['created', 'completed', 'partial', 'failed']),
     actor: z.enum(['agent', 'user']),
     timestamp: z.number().int().nonnegative(),

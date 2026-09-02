@@ -8,6 +8,8 @@ import {
 describe('checkpoint event publisher', () => {
     const encryptionKey = new Uint8Array(32).fill(7);
     const now = 1_788_111_000_000;
+    const turnOperationId = '123e4567-e89b-42d3-a456-426614174000';
+    const restoreOperationId = '123e4567-e89b-42d3-a456-426614174001';
 
     it('encrypts relative-path detail while exposing only the idempotency envelope', async () => {
         const post = vi.fn(async (_request: CheckpointEventRequest) => ({
@@ -21,7 +23,7 @@ describe('checkpoint event publisher', () => {
         }, { post, now: () => now });
 
         await expect(publisher.snapshot({
-            operationId: 'turn-1',
+            operationId: turnOperationId,
             checkpointId: 'a'.repeat(40),
             excluded: [{ path: '.env.local', reason: 'secret' }],
         })).resolves.toEqual({ id: 'event-1', seq: 7, createdAt: now, idempotent: false });
@@ -35,7 +37,7 @@ describe('checkpoint event publisher', () => {
                 eventType: 'checkpoint-snapshot',
                 checkpoint: {
                     schemaVersion: 1,
-                    operationId: 'turn-1',
+                    operationId: turnOperationId,
                     checkpointId: 'a'.repeat(40),
                     state: 'created',
                     actor: 'agent',
@@ -44,6 +46,8 @@ describe('checkpoint event publisher', () => {
             },
         });
         expect(request?.body.checkpoint).not.toHaveProperty('summary');
+        expect(JSON.stringify(request?.body)).not.toContain('.env.local');
+        expect(JSON.stringify(request?.body)).not.toContain('token-1');
         expect(decrypt(
             encryptionKey,
             'legacy',
@@ -76,7 +80,7 @@ describe('checkpoint event publisher', () => {
             encryption: { encryptionKey, encryptionVariant: 'legacy' },
         }, { post, now: () => now });
         const rewind = {
-            operationId: 'restore-1',
+            operationId: restoreOperationId,
             checkpointId: 'b'.repeat(40),
             state: 'partial' as const,
             files: [{ path: 'src/app.ts', action: 'modified' as const }],
@@ -88,8 +92,8 @@ describe('checkpoint event publisher', () => {
         });
 
         expect(post.mock.calls.map(([request]) => request.body.checkpoint)).toEqual([
-            expect.objectContaining({ operationId: 'restore-1', state: 'partial' }),
-            expect.objectContaining({ operationId: 'restore-1', state: 'partial' }),
+            expect.objectContaining({ operationId: restoreOperationId, state: 'partial' }),
+            expect.objectContaining({ operationId: restoreOperationId, state: 'partial' }),
         ]);
     });
 
@@ -100,7 +104,7 @@ describe('checkpoint event publisher', () => {
             serverUrl: 'https://api.happy.engineering',
             encryption: { encryptionKey, encryptionVariant: 'legacy' as const },
         };
-        const event = { operationId: 'turn-1', checkpointId: 'c'.repeat(40), excluded: [] };
+        const event = { operationId: turnOperationId, checkpointId: 'c'.repeat(40), excluded: [] };
 
         await expect(createCheckpointEventPublisher(input, {
             post: vi.fn(async () => { throw new Error('offline'); }),
@@ -110,5 +114,38 @@ describe('checkpoint event publisher', () => {
                 event: { id: 'event-1', seq: -1, createdAt: 0, idempotent: false },
             })),
         }).snapshot(event)).rejects.toThrow('invalid acknowledgement');
+    });
+
+    it('rejects paths and credential-shaped values smuggled through event identifiers', async () => {
+        const post = vi.fn(async () => ({
+            event: { id: 'event-1', seq: 1, createdAt: now, idempotent: false },
+        }));
+        const publisher = createCheckpointEventPublisher({
+            token: 'token-1',
+            sessionId: 'session-1',
+            serverUrl: 'https://api.happy.engineering',
+            encryption: { encryptionKey, encryptionVariant: 'legacy' },
+        }, { post });
+
+        await expect(publisher.snapshot({
+            operationId: '/Users/ada/project/.env',
+            checkpointId: 'a'.repeat(40),
+            excluded: [],
+        })).rejects.toThrow();
+        await expect(publisher.snapshot({
+            operationId: '123e4567-e89b-42d3-a456-426614174000',
+            checkpointId: 'sk-live-secret-credential',
+            excluded: [],
+        })).rejects.toThrow();
+        await expect(publisher.snapshot({
+            operationId: '123e4567-e89b-42d3-a456-426614174000',
+            checkpointId: 'a'.repeat(40),
+            excluded: [{
+                path: '.env',
+                reason: 'secret',
+                content: 'SECRET=value',
+            } as never],
+        })).rejects.toThrow();
+        expect(post).not.toHaveBeenCalled();
     });
 });

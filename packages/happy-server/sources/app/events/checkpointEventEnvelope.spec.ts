@@ -4,8 +4,8 @@ import { checkpointEventEnvelopeSchema } from './checkpointEventEnvelope';
 describe('checkpointEventEnvelopeSchema', () => {
     const validEnvelope = {
         schemaVersion: 1,
-        operationId: 'operation-1',
-        checkpointId: 'checkpoint-1',
+        operationId: '123e4567-e89b-42d3-a456-426614174000',
+        checkpointId: 'a'.repeat(40),
         state: 'created',
         actor: 'agent',
         timestamp: 1_788_111_000_000,
@@ -54,4 +54,16 @@ describe('checkpointEventEnvelopeSchema', () => {
             }).success).toBe(false);
         },
     );
+
+    it.each([
+        { operationId: '/Users/person/project/.env' },
+        { operationId: 'SECRET=credential' },
+        { checkpointId: '/Users/person/project/source.ts' },
+        { checkpointId: 'sk-live-secret-credential' },
+    ])('rejects filesystem or credential data encoded as an identifier (%j)', (override) => {
+        expect(checkpointEventEnvelopeSchema.safeParse({
+            ...validEnvelope,
+            ...override,
+        }).success).toBe(false);
+    });
 });
