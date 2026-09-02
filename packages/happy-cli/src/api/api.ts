@@ -8,7 +8,7 @@ import { PushNotificationClient } from './pushNotifications';
 import { configuration } from '@/configuration';
 import chalk from 'chalk';
 import { Credentials } from '@/persistence';
-import { connectionState, isNetworkError } from '@/utils/serverConnectionErrors';
+import { connectionState, isNetworkError, isConnectivityError, connectionErrorCode } from '@/utils/serverConnectionErrors';
 import { applySessionUrlEnv } from '@/utils/sessionUrlEnv';
 
 export class ApiClient {
@@ -89,18 +89,25 @@ export class ApiClient {
     } catch (error) {
       logger.debug('[API] [ERROR] Failed to get or create session:', error);
 
-      // Check if it's a connection error
-      if (error && typeof error === 'object' && 'code' in error) {
-        const errorCode = (error as any).code;
-        if (isNetworkError(errorCode)) {
-          connectionState.fail({
-            operation: 'Session creation',
-            caller: 'api.getOrCreateSession',
-            errorCode,
-            url: `${configuration.serverUrl}/v1/sessions`
-          });
-          return null;
-        }
+      // Check if it's a connection error.
+      //
+      // Deliberately the narrow `isNetworkError` net, not `isConnectivityError`:
+      // this call mints a fresh data encryption key on every invocation, and
+      // the reconnect path retries under the *same* session tag. If the server
+      // in fact persisted a timed-out request, it keeps the first key and
+      // ignores the resubmitted one, so treating an ambiguous failure as
+      // "offline" would leave the session encrypted under a key the app does
+      // not hold — silent corruption in place of a loud failure. Only codes
+      // that prove the request never landed are safe to swallow here.
+      const errorCode = connectionErrorCode(error);
+      if (isNetworkError(errorCode)) {
+        connectionState.fail({
+          operation: 'Session creation',
+          caller: 'api.getOrCreateSession',
+          errorCode,
+          url: `${configuration.serverUrl}/v1/sessions`
+        });
+        return null;
       }
 
       // Handle 404 gracefully - server endpoint may not be available yet
@@ -131,8 +138,77 @@ export class ApiClient {
         }
       }
 
-      throw new Error(`Failed to get or create session: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      // Keep the transport code and the original error attached. Diagnosing
+      // the daemon crash this guard exists for hinged on seeing the bare
+      // `code: 'ECONNABORTED'` in the logs; flattening to a message string
+      // throws that away.
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      throw new Error(
+        `Failed to get or create session: ${errorCode ? `${errorCode} — ` : ''}${message}`,
+        { cause: error }
+      );
     }
+  }
+
+  /**
+   * Resolve the machine encryption key and the wrap material used to register
+   * it. Shared so the offline fallback keys its machine exactly the way a
+   * successful registration would.
+   */
+  private resolveMachineEncryption(): {
+    encryptionKey: Uint8Array,
+    encryptionVariant: 'legacy' | 'dataKey',
+    wrapMaterial: { machineKey: Uint8Array, accountPublicKey: Uint8Array } | null,
+  } {
+    if (this.credential.encryption.type === 'dataKey') {
+      return {
+        encryptionKey: this.credential.encryption.machineKey,
+        encryptionVariant: 'dataKey',
+        wrapMaterial: {
+          machineKey: this.credential.encryption.machineKey,
+          accountPublicKey: this.credential.encryption.publicKey,
+        },
+      };
+    }
+    // Legacy encryption.
+    // aplus §6-1 Phase 3b — legacy 활성이어도 병기된 provisioned 재료가
+    // 있으면 wrap 된 machineKey 를 서버에 등록한다 (서버는 write-once
+    // 백필). RPC 암호화는 여전히 legacy secret — 동작 무변경.
+    return {
+      encryptionKey: this.credential.encryption.secret,
+      encryptionVariant: 'legacy',
+      wrapMaterial: this.credential.encryption.provisioned
+        ? {
+          machineKey: this.credential.encryption.provisioned.machineKey,
+          accountPublicKey: this.credential.encryption.provisioned.publicKey,
+        }
+        : null,
+    };
+  }
+
+  /**
+   * Build the local-only machine used when the server cannot be reached.
+   *
+   * Versions start at 0; the sync client reconciles them against the server on
+   * reconnect via its version-mismatch retry, so starting low is self-healing.
+   * Exposed so callers that must not fail — the daemon's startup path — can
+   * fall back even when getOrCreateMachine throws.
+   */
+  buildOfflineMachine(opts: {
+    machineId: string,
+    metadata: MachineMetadata,
+    daemonState?: DaemonState,
+  }): Machine {
+    const { encryptionKey, encryptionVariant } = this.resolveMachineEncryption();
+    return {
+      id: opts.machineId,
+      encryptionKey,
+      encryptionVariant,
+      metadata: opts.metadata,
+      metadataVersion: 0,
+      daemonState: opts.daemonState || null,
+      daemonStateVersion: 0,
+    };
   }
 
   /**
@@ -148,31 +224,7 @@ export class ApiClient {
     serverPublicKey?: string | null,
   }): Promise<Machine> {
 
-    // Resolve encryption key + machine-key wrap material
-    let encryptionKey: Uint8Array;
-    let encryptionVariant: 'legacy' | 'dataKey';
-    let wrapMaterial: { machineKey: Uint8Array, accountPublicKey: Uint8Array } | null = null;
-    if (this.credential.encryption.type === 'dataKey') {
-      encryptionVariant = 'dataKey';
-      encryptionKey = this.credential.encryption.machineKey;
-      wrapMaterial = {
-        machineKey: this.credential.encryption.machineKey,
-        accountPublicKey: this.credential.encryption.publicKey,
-      };
-    } else {
-      // Legacy encryption
-      encryptionKey = this.credential.encryption.secret;
-      encryptionVariant = 'legacy';
-      // aplus §6-1 Phase 3b — legacy 활성이어도 병기된 provisioned 재료가
-      // 있으면 wrap 된 machineKey 를 서버에 등록한다 (서버는 write-once
-      // 백필). RPC 암호화는 여전히 legacy secret — 동작 무변경.
-      if (this.credential.encryption.provisioned) {
-        wrapMaterial = {
-          machineKey: this.credential.encryption.provisioned.machineKey,
-          accountPublicKey: this.credential.encryption.provisioned.publicKey,
-        };
-      }
-    }
+    const { encryptionKey, encryptionVariant, wrapMaterial } = this.resolveMachineEncryption();
     // aplus §6-1 B1 — 서버 서비스 공개키가 알려져 있으면 machineKey 를 서버
     // 몫으로도 wrap 한다 (이중 수신자). 세션 키는 여기 관여하지 않는다.
     const serverPublicKey = opts.serverPublicKey
@@ -182,15 +234,7 @@ export class ApiClient {
       buildMachineKeyEnvelopes(wrapMaterial, serverPublicKey);
 
     // Helper to create minimal machine object for offline mode (DRY)
-    const createMinimalMachine = (): Machine => ({
-      id: opts.machineId,
-      encryptionKey: encryptionKey,
-      encryptionVariant: encryptionVariant,
-      metadata: opts.metadata,
-      metadataVersion: 0,
-      daemonState: opts.daemonState || null,
-      daemonStateVersion: 0,
-    });
+    const createMinimalMachine = (): Machine => this.buildOfflineMachine(opts);
 
     // Create machine
     try {
@@ -237,12 +281,21 @@ export class ApiClient {
       };
       return machine;
     } catch (error) {
-      // Handle connection errors gracefully
-      if (axios.isAxiosError(error) && error.code && isNetworkError(error.code)) {
+      // Handle connection errors gracefully.
+      //
+      // The wide `isConnectivityError` net, unlike the session path above:
+      // `POST /v1/machines` is an idempotent upsert keyed on a machine id, and
+      // the machine key is derived from credentials rather than generated per
+      // call, so replaying a request the server already applied is harmless.
+      // Registering is also on the daemon's startup path, where an unhandled
+      // error is a FATAL exit — being generous here is what keeps the daemon
+      // alive through a network blip.
+      const errorCode = connectionErrorCode(error);
+      if (isConnectivityError(errorCode)) {
         connectionState.fail({
           operation: 'Machine registration',
           caller: 'api.getOrCreateMachine',
-          errorCode: error.code,
+          errorCode,
           url: `${configuration.serverUrl}/v1/machines`
         });
         return createMinimalMachine();
@@ -293,9 +346,36 @@ export class ApiClient {
           });
           return createMinimalMachine();
         }
+
+        // Handle 401 - the token expired or was rotated. Recoverable by the
+        // user, so say what to do rather than dying with an opaque stack.
+        if (status === 401) {
+          console.log(chalk.yellow(
+            `⚠️  Machine registration rejected by the server with status 401`
+          ));
+          console.log(chalk.yellow(
+            `   → Your credentials are no longer valid — run 'happy auth' to sign in again`
+          ));
+          return createMinimalMachine();
+        }
+
+        // Any other status the server managed to return (429 rate limiting and
+        // the rest). The server is up and talking to us, so this is far more
+        // likely transient than fatal — degrade instead of taking the caller
+        // down. Registration runs on the daemon's startup path, where throwing
+        // means a FATAL exit and a multi-minute outage.
+        connectionState.fail({
+          operation: 'Machine registration',
+          errorCode: String(status),
+          url: `${configuration.serverUrl}/v1/machines`,
+          details: ['Will retry automatically']
+        });
+        return createMinimalMachine();
       }
 
-      // For other errors, rethrow
+      // Anything left is not a transport failure and not an HTTP response —
+      // a genuine defect (bad encryption input, a programming error). Those
+      // must stay loud rather than be masked as "offline".
       throw error;
     }
   }
