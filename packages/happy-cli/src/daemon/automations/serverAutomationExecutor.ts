@@ -23,6 +23,8 @@ import {
   ensureAgentTaskReviewObjects,
   reviewShasFromDispatchInput,
   reviewWorktreeRequestFromDispatchInput,
+  applyWorktreeRequestFromDispatchInput,
+  readWorkspaceHeadSha,
 } from './agentTaskReviewObjects'
 import { shouldGiveUpWorktreeCleanup } from './worktreeCleanupGiveUp'
 import type { GithubTriggerWorktreePlan } from './githubTriggerWorktree'
@@ -144,6 +146,11 @@ export interface ServerAutomationExecutorInput {
     shas: string[]
     environmentVariables?: Record<string, string>
   }) => Promise<{ ok: true; fetched: string[] } | { ok: false; error: string }>
+  /**
+   * review_apply 를 사용자 세션에서 재개해도 되는지 판정하기 위해 워크스페이스의
+   * 현재 HEAD 를 읽는다. 읽지 못하면 null 이고, 그때는 재개하지 않는다.
+   */
+  readHeadSha?: (input: { directory: string }) => Promise<string | null>
   resolveMcpSpawnContext: (input: {
     runId: string
     claimToken: string
@@ -1208,6 +1215,30 @@ async function executeStartedRun(
             )
           }
         }
+      } else if (bridged.dispatch.type === 'review_apply.v1') {
+        // 사용자 세션 재개는 원 리뷰 대화의 맥락과 "내 세션에서 고쳐진다" 는 가시성을
+        // 준다. 다만 그 디렉터리가 리뷰 대상 head 가 아니면 계약상 apply 는 mutate 없이
+        // stale 로 끝난다 — 사용자가 PR 을 올린 뒤 계속 일하는 정상 흐름이 곧 실패
+        // 조건이라, 지금까지 대부분의 apply 가 아무것도 반영하지 못했다.
+        const applyRequest = applyWorktreeRequestFromDispatchInput(bridged.dispatch.input)
+        if (applyRequest) {
+          const headSha = await (input.readHeadSha ?? readWorkspaceHeadSha)({
+            directory: payload.directory,
+          })
+          // 읽지 못한 경우도 어긋난 것으로 다룬다. 모르는 채로 사용자 디렉터리에서
+          // 시작하면 우리가 고치려는 그 조용한 stale 로 되돌아간다.
+          if (headSha !== applyRequest.pullRequest.expectedHeadSha) {
+            input.logDebug?.(
+              `[server-automation] ${automation.automationId} applying review findings in a worktree`
+              + ` — ${payload.directory} is at ${headSha ?? 'an unreadable HEAD'},`
+              + ` not the reviewed ${applyRequest.pullRequest.expectedHeadSha}`,
+            )
+            githubWorktreeRequest = {
+              ...applyRequest,
+              ...(query.githubEnvironment ? { githubEnvironment: query.githubEnvironment } : {}),
+            }
+          }
+        }
       }
       prompt = buildAgentTaskPrompt(bridged.dispatch, payload.prompt)
       environmentVariables = {
@@ -1406,7 +1437,9 @@ async function executeStartedRun(
   let associateSpawnedSession = true
   if (agentTaskDispatch?.type === 'review_apply.v1'
       && agentTaskDispatch.targetSessionId
-      && environmentVariables) {
+      && environmentVariables
+      // worktree 를 준비했다면 사용자 디렉터리가 리뷰 대상 head 가 아니라는 뜻이다.
+      && !githubWorktree) {
     const resumed = await input.resumeSession({
       sessionId: agentTaskDispatch.targetSessionId,
       directory: payload.directory,

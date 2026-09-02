@@ -1821,6 +1821,169 @@ describe('runServerAutomationTick', () => {
     )
   })
 
+  it('runs review_apply in a worktree at the reviewed head when the project directory has moved on', async () => {
+    const {
+      input, store, queryGithubPullRequests, dispatchAgentTask, resumeSession, spawnSession,
+      prepareGithubWorktree,
+    } = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } } })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Apply verified findings', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'apply-1', type: 'review_apply.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        targetSessionId: 'creator-session', controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { prNumber: 12896, reviewedHeadSha: 'b'.repeat(40) },
+        context: [{ kind: 'review', body: { findings: [] } }],
+      },
+    })
+    resumeSession.mockResolvedValue({ ok: true, sessionId: 'creator-session' })
+    input.readHeadSha = vi.fn(async () => 'd'.repeat(40))
+
+    await runServerAutomationTick(input)
+
+    // 2026-09-01 프로덕션 — PR #12896 의 apply 가 아무것도 반영하지 못하고 stale 로
+    // 끝났다. 원격 PR 은 열려 있고 원격 head 도 리뷰 SHA 와 같았지만, 재개된 사용자
+    // 세션의 디렉터리는 사용자가 마지막에 둔 커밋이었다. 워커는 계약대로 행동했다 —
+    // 잘못은 어긋난 HEAD 위에서 apply 를 시작하게 둔 쪽에 있다.
+    //
+    // 사용자가 PR 을 올린 뒤 계속 일하는 것이 정상이므로, 이건 드문 경우가 아니라
+    // 기본 경로다. 재개 전에 판정해서 어긋나면 리뷰 대상 head 로 체크아웃한다.
+    expect(resumeSession).not.toHaveBeenCalled()
+    expect(prepareGithubWorktree).toHaveBeenCalledWith(expect.objectContaining({
+      directory: '/repo',
+      pullRequest: { number: 12896, expectedHeadSha: 'b'.repeat(40) },
+    }))
+    expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
+      directory: '/isolated/run-1',
+    }))
+  })
+
+  it('keeps resuming the creator session for review_apply while the project directory is on the reviewed head', async () => {
+    const {
+      input, store, queryGithubPullRequests, dispatchAgentTask, resumeSession, spawnSession,
+      prepareGithubWorktree,
+    } = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } } })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Apply verified findings', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'apply-1', type: 'review_apply.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        targetSessionId: 'creator-session', controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { prNumber: 12896, reviewedHeadSha: 'b'.repeat(40) },
+        context: [{ kind: 'review', body: { findings: [] } }],
+      },
+    })
+    resumeSession.mockResolvedValue({ ok: true, sessionId: 'creator-session' })
+    input.readHeadSha = vi.fn(async () => 'b'.repeat(40))
+
+    await runServerAutomationTick(input)
+
+    // HEAD 가 맞으면 사용자 세션에서 그대로 반영한다 — 원 리뷰 대화의 맥락과
+    // "내 세션에서 고쳐진다" 는 가시성은 worktree 로 옮기면 잃는 것들이다.
+    expect(prepareGithubWorktree).not.toHaveBeenCalled()
+    expect(resumeSession).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'creator-session', directory: '/repo',
+    }))
+    expect(spawnSession).not.toHaveBeenCalled()
+  })
+
+  it('does not resume the creator session for review_apply when the project HEAD cannot be read', async () => {
+    const {
+      input, store, queryGithubPullRequests, dispatchAgentTask, resumeSession, spawnSession,
+      prepareGithubWorktree,
+    } = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } } })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Apply verified findings', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'apply-1', type: 'review_apply.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        targetSessionId: 'creator-session', controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { prNumber: 12896, reviewedHeadSha: 'b'.repeat(40) },
+        context: [{ kind: 'review', body: { findings: [] } }],
+      },
+    })
+    resumeSession.mockResolvedValue({ ok: true, sessionId: 'creator-session' })
+    input.readHeadSha = vi.fn(async () => null)
+
+    await runServerAutomationTick(input)
+
+    // 모르면 어긋난 것으로 다룬다. 확인하지 못한 채 사용자 디렉터리에서 시작하면
+    // 우리가 고치려는 그 조용한 stale 로 되돌아간다.
+    expect(resumeSession).not.toHaveBeenCalled()
+    expect(prepareGithubWorktree).toHaveBeenCalledWith(expect.objectContaining({
+      pullRequest: { number: 12896, expectedHeadSha: 'b'.repeat(40) },
+    }))
+  })
+
   it('falls back to one new apply worker when the original creator session cannot resume', async () => {
     const { input, store, queryGithubPullRequests, dispatchAgentTask, resumeSession, spawnSession } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
