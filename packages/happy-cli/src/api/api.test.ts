@@ -430,6 +430,33 @@ describe('Api server error handling', () => {
             consoleSpy.mockRestore();
         });
 
+        // A 200 whose body will not parse (captive portal, proxy serving HTML)
+        // reaches the catch with `response` set and a 2xx status. Reporting
+        // that as a rejection would be self-contradictory, so it must fail
+        // with a message that says what actually happened.
+        it('should fail with a readable message when a 2xx body cannot be parsed', async () => {
+            connectionState.reset();
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+            mockPost.mockRejectedValue({
+                response: { status: 200 },
+                code: 'ERR_BAD_RESPONSE',
+                message: "Unexpected token '<', \"<html>\"... is not valid JSON",
+                isAxiosError: true
+            });
+
+            await expect(api.getOrCreateMachine({
+                machineId: 'test-machine',
+                metadata: testMachineMetadata
+            })).rejects.toThrow('unreadable response (status 200)');
+
+            expect(consoleSpy).not.toHaveBeenCalledWith(
+                expect.stringContaining('rejected machine registration')
+            );
+
+            consoleSpy.mockRestore();
+        });
+
         // Guards the reordering fix: axios stamps ERR_BAD_RESPONSE on every
         // 5xx, so classifying by code before status once made this dedicated
         // branch unreachable and reported a real server error as a mangled

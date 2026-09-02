@@ -96,10 +96,11 @@ export class ApiClient {
       // failure.
       const errorResponse = axios.isAxiosError(error) ? error.response : undefined;
       // Only a reply-less failure is a transport failure, so classification
-      // must ignore any code attached to an HTTP response. Diagnostics should
-      // not: keep whatever code there is for the message below.
-      const transportCode = errorResponse ? undefined : connectionErrorCode(error);
-      const diagnosticCode = transportCode ?? connectionErrorCode(error);
+      // must ignore any code attached to an HTTP response — axios stamps one
+      // on those too. Diagnostics should not: the message below keeps whatever
+      // code there is, response or not.
+      const diagnosticCode = connectionErrorCode(error);
+      const transportCode = errorResponse ? undefined : diagnosticCode;
 
       // No reply at all — a transport failure.
       //
@@ -391,10 +392,17 @@ export class ApiClient {
           return createMinimalMachine();
         }
 
-        // A non-4xx status that still rejected: axios also raises
-        // ERR_BAD_RESPONSE with `response` set and a 2xx status when it cannot
-        // parse the body. Calling that a rejection would be false, so let it
-        // fall through to the throw below — the daemon guard catches it.
+        // A non-4xx status that still rejected: axios raises ERR_BAD_RESPONSE
+        // with `response` set and a 2xx status when the body will not parse —
+        // a captive portal or proxy answering 200 with HTML. Calling that a
+        // rejection would be false, and a body we cannot read means we cannot
+        // trust anything about the registration, so fail instead of pretending
+        // to be offline. The daemon guard keeps the daemon up; the agent CLIs
+        // print this message, so say something better than a parser error.
+        throw new Error(
+          `Machine registration returned an unreadable response (status ${status})`,
+          { cause: error }
+        );
       }
 
       // No reply at all — a transport failure.
