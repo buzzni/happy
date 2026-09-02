@@ -124,6 +124,7 @@ import type { PendingAutomationReport } from '@/daemon/automations/serverAutomat
 import type { SessionFollowupTransport } from '@/daemon/automations/sessionFollowupRunner';
 import type { AiCredentialRuntime } from '@/daemon/aiCredentialRuntime';
 import type { AutonomousQualityGateRpcHandlers } from '@/daemon/autonomousQualityGateRpc';
+import type { CheckpointRpcHandlers } from '@/checkpoint/checkpointRpc';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BROKER_ACTIVITY_TOUCH_INTERVAL_MS = 60_000;
@@ -352,6 +353,7 @@ type MachineRpcHandlers = {
     linkSpawnedSession?: (input: { sessionId: string; directory: string }) => void | Promise<void>;
     aiCredentialRuntime: AiCredentialRuntime;
     autonomousQualityGate?: AutonomousQualityGateRpcHandlers;
+    checkpoint?: CheckpointRpcHandlers;
 }
 
 function requireNonEmptyString(value: unknown, name: string): string {
@@ -518,6 +520,7 @@ export class ApiMachineClient {
         automationStore,
         aiCredentialRuntime,
         autonomousQualityGate,
+        checkpoint,
         linkSpawnedSession,
     }: MachineRpcHandlers) {
         this.resumeSessionHandler = resumeSession ?? null;
@@ -529,6 +532,15 @@ export class ApiMachineClient {
             this.rpcHandlerManager.registerHandler('autonomous-quality-gate:status', autonomousQualityGate.status);
             this.rpcHandlerManager.registerHandler('autonomous-quality-gate:control', autonomousQualityGate.control);
             this.autonomousQualityGateRpcAvailable = true;
+        }
+
+        if (checkpoint) {
+            this.rpcHandlerManager.registerHandler('checkpoint:status', checkpoint.status);
+            this.rpcHandlerManager.registerHandler('checkpoint:list', checkpoint.list);
+            this.rpcHandlerManager.registerHandler('checkpoint:preview', checkpoint.preview);
+            this.rpcHandlerManager.registerHandler('checkpoint:execute', checkpoint.execute);
+            this.rpcHandlerManager.registerHandler('checkpoint:cancel', checkpoint.cancel);
+            this.rpcHandlerManager.registerHandler('checkpoint:retry', checkpoint.retry);
         }
 
         // Scheduled automations CRUD (specs: daemon-scheduled-automations).

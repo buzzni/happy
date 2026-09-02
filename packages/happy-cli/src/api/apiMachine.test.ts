@@ -147,6 +147,35 @@ describe('ApiMachineClient socket reconnection', () => {
         );
     });
 
+    it('registers the checkpoint daemon RPC surface', () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const manager = (client as any).rpcHandlerManager;
+        const checkpoint = {
+            status: vi.fn(),
+            list: vi.fn(),
+            preview: vi.fn(),
+            execute: vi.fn(),
+            cancel: vi.fn(),
+            retry: vi.fn(),
+        };
+
+        client.setRPCHandlers({
+            spawnSession: vi.fn(),
+            stopSession: vi.fn(() => ({ stopped: true as const })),
+            requestShutdown: vi.fn(),
+            portRegistry: {} as any,
+            aiCredentialRuntime: {} as any,
+            checkpoint,
+        });
+
+        for (const method of Object.keys(checkpoint) as Array<keyof typeof checkpoint>) {
+            expect(manager.registerHandler).toHaveBeenCalledWith(
+                `checkpoint:${method}`,
+                checkpoint[method],
+            );
+        }
+    });
+
     it('validates and forwards additional directories through the spawn RPC result', async () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         const manager = (client as any).rpcHandlerManager;

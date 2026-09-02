@@ -1,0 +1,277 @@
+import { execFile } from 'node:child_process';
+import { access } from 'node:fs/promises';
+import { z } from 'zod';
+import type { CheckpointProtectionState } from './checkpointContract';
+import { CheckpointRestoreExecutor } from './checkpointRestore';
+import { CheckpointRestorePlanner } from './checkpointRestorePlan';
+import { resolveCheckpointStoreLayout } from './checkpointStore';
+
+const identifierSchema = z.string().min(1).max(128).refine(
+    (value) => value.trim() === value && !/[\u0000-\u001F\u007F]/.test(value),
+    'identifier must not contain surrounding whitespace or control characters',
+);
+
+const bindingRequestSchema = z.object({
+    schemaVersion: z.literal(1),
+    sessionId: identifierSchema,
+    projectId: identifierSchema,
+    worktreeId: identifierSchema.nullable(),
+}).strict();
+
+const previewRequestSchema = bindingRequestSchema.extend({
+    checkpointId: z.string().regex(/^[a-f0-9]{40,64}$/),
+}).strict();
+
+const cancelRequestSchema = bindingRequestSchema.extend({
+    operationId: identifierSchema,
+}).strict();
+
+const projectRelativePathSchema = z.string().min(1).refine((value) => (
+    !value.includes('\0')
+    && !/^(?:[A-Za-z]:|[\\/])/.test(value)
+    && !value.split(/[\\/]+/).includes('..')
+), 'path must be project-relative');
+
+const restorePlanEntrySchema = z.discriminatedUnion('action', [
+    z.object({
+        path: projectRelativePathSchema,
+        action: z.literal('restore'),
+        reason: z.enum(['agent-modified', 'agent-deleted']),
+    }).strict(),
+    z.object({
+        path: projectRelativePathSchema,
+        action: z.literal('delete'),
+        reason: z.literal('agent-created'),
+    }).strict(),
+    z.object({
+        path: projectRelativePathSchema,
+        action: z.literal('skip'),
+        reason: z.enum(['user-modified', 'provenance-unknown']),
+    }).strict(),
+    z.object({
+        path: projectRelativePathSchema,
+        action: z.literal('conflict'),
+        reason: z.enum(['unsupported-file-type', 'unsafe-path']),
+    }).strict(),
+]);
+
+const restorePlanSchema = z.object({
+    schemaVersion: z.literal(1),
+    checkpointId: z.string().regex(/^[a-f0-9]{40,64}$/),
+    entries: z.array(restorePlanEntrySchema),
+}).strict();
+
+const executeRequestSchema = bindingRequestSchema.extend({
+    operationId: identifierSchema,
+    confirmed: z.literal(true),
+    plan: restorePlanSchema,
+}).strict();
+
+export type CheckpointRpcSessionAuthority = {
+    sessionId: string;
+    projectId: string;
+    worktreeId: string | null;
+    projectPath: string;
+    protection: CheckpointProtectionState;
+    excludedPaths: string[];
+    excludedPatterns: string[];
+};
+
+export type CheckpointRpcHandlers = {
+    status(params: unknown): Promise<unknown>;
+    list(params: unknown): Promise<unknown>;
+    preview(params: unknown): Promise<unknown>;
+    execute(params: unknown): Promise<unknown>;
+    retry(params: unknown): Promise<unknown>;
+    cancel(params: unknown): Promise<unknown>;
+};
+
+export function createCheckpointRpcHandlers(input: {
+    checkpointRoot: string;
+    resolveAuthority(sessionId: string): Promise<CheckpointRpcSessionAuthority | null>;
+    restoreExecutor?: CheckpointRestoreExecutor;
+}): CheckpointRpcHandlers {
+    const restoreExecutor = input.restoreExecutor ?? new CheckpointRestoreExecutor(input.checkpointRoot);
+    const resolveRequestAuthority = async (request: z.infer<typeof bindingRequestSchema>) => {
+        const authority = await input.resolveAuthority(request.sessionId);
+        if (!authority) throw new Error('checkpoint RPC session authority is unavailable');
+        if (
+            authority.sessionId !== request.sessionId
+            || authority.projectId !== request.projectId
+            || authority.worktreeId !== request.worktreeId
+        ) {
+            throw new Error('checkpoint RPC binding mismatch');
+        }
+        return authority;
+    };
+
+    return {
+        status: async (params) => {
+            const request = bindingRequestSchema.parse(params);
+            const authority = await resolveRequestAuthority(request);
+            return {
+                schemaVersion: 1 as const,
+                sessionId: authority.sessionId,
+                projectId: authority.projectId,
+                worktreeId: authority.worktreeId,
+                protection: authority.protection,
+            };
+        },
+        list: async (params) => {
+            const request = bindingRequestSchema.parse(params);
+            const authority = await resolveRequestAuthority(request);
+            return {
+                schemaVersion: 1 as const,
+                checkpoints: await listOwnedCheckpoints(input.checkpointRoot, authority),
+            };
+        },
+        preview: async (params) => {
+            const request = previewRequestSchema.parse(params);
+            const authority = await resolveRequestAuthority(request);
+            const plan = await new CheckpointRestorePlanner(input.checkpointRoot).plan({
+                sessionId: authority.sessionId,
+                projectId: authority.projectId,
+                worktreeId: authority.worktreeId,
+                projectPath: authority.projectPath,
+                checkpointId: request.checkpointId,
+            });
+            return { schemaVersion: 1 as const, ...plan };
+        },
+        execute: async (params) => {
+            const request = executeRequestSchema.parse(params);
+            const authority = await resolveRequestAuthority(request);
+            if (authority.protection.status !== 'protected') {
+                throw new Error('checkpoint RPC mutation requires protected status');
+            }
+            const result = await restoreExecutor.execute({
+                sessionId: authority.sessionId,
+                projectId: authority.projectId,
+                worktreeId: authority.worktreeId,
+                projectPath: authority.projectPath,
+                operationId: request.operationId,
+                confirmed: true,
+                plan: {
+                    checkpointId: request.plan.checkpointId,
+                    entries: request.plan.entries,
+                },
+                excludedPaths: authority.excludedPaths,
+                excludedPatterns: authority.excludedPatterns,
+            });
+            return {
+                schemaVersion: 1 as const,
+                operationId: request.operationId,
+                ...result,
+            };
+        },
+        retry: async (params) => {
+            const request = executeRequestSchema.parse(params);
+            const authority = await resolveRequestAuthority(request);
+            if (authority.protection.status !== 'protected') {
+                throw new Error('checkpoint RPC mutation requires protected status');
+            }
+            const result = await restoreExecutor.execute({
+                sessionId: authority.sessionId,
+                projectId: authority.projectId,
+                worktreeId: authority.worktreeId,
+                projectPath: authority.projectPath,
+                operationId: request.operationId,
+                confirmed: true,
+                plan: {
+                    checkpointId: request.plan.checkpointId,
+                    entries: request.plan.entries,
+                },
+                excludedPaths: authority.excludedPaths,
+                excludedPatterns: authority.excludedPatterns,
+            });
+            return {
+                schemaVersion: 1 as const,
+                operationId: request.operationId,
+                ...result,
+            };
+        },
+        cancel: async (params) => {
+            const request = cancelRequestSchema.parse(params);
+            await resolveRequestAuthority(request);
+            return {
+                schemaVersion: 1 as const,
+                operationId: request.operationId,
+                status: 'cancelled' as const,
+            };
+        },
+    };
+}
+
+async function listOwnedCheckpoints(
+    checkpointRoot: string,
+    authority: CheckpointRpcSessionAuthority,
+): Promise<Array<{ checkpointId: string; createdAt: number }>> {
+    const layout = resolveCheckpointStoreLayout({ checkpointRoot, ...authority });
+    try {
+        await access(layout.gitDirectory);
+    } catch (error) {
+        if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+        throw error;
+    }
+    const environment = checkpointGitEnvironment(layout.gitDirectory);
+    const ref = await runGit(['show-ref', '--verify', '--quiet', layout.refName], authority.projectPath, environment);
+    if (ref.exitCode === 1) return [];
+    if (ref.exitCode !== 0) throw new Error(`checkpoint list failed: ${ref.stderr}`);
+    const history = await runGit(
+        ['rev-list', '--timestamp', layout.refName],
+        authority.projectPath,
+        environment,
+    );
+    if (history.exitCode !== 0) throw new Error(`checkpoint list failed: ${history.stderr}`);
+    return history.stdout.trim().split('\n').filter(Boolean).map((line) => {
+        const [timestamp, checkpointId, ...remainder] = line.split(' ');
+        if (
+            remainder.length > 0
+            || !/^\d+$/.test(timestamp ?? '')
+            || !/^[a-f0-9]{40,64}$/.test(checkpointId ?? '')
+        ) {
+            throw new Error('checkpoint list contains invalid history');
+        }
+        return { checkpointId: checkpointId!, createdAt: Number(timestamp) * 1000 };
+    });
+}
+
+function checkpointGitEnvironment(gitDirectory: string): NodeJS.ProcessEnv {
+    const environment: NodeJS.ProcessEnv = {
+        ...process.env,
+        GIT_DIR: gitDirectory,
+        GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null',
+        GIT_CONFIG_SYSTEM: process.platform === 'win32' ? 'NUL' : '/dev/null',
+        GIT_CONFIG_NOSYSTEM: '1',
+    };
+    delete environment.GIT_WORK_TREE;
+    delete environment.GIT_INDEX_FILE;
+    delete environment.GIT_NAMESPACE;
+    delete environment.GIT_ALTERNATE_OBJECT_DIRECTORIES;
+    return environment;
+}
+
+function runGit(
+    args: string[],
+    cwd: string,
+    environment: NodeJS.ProcessEnv,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    return new Promise((resolvePromise, rejectPromise) => {
+        execFile('git', args, {
+            cwd,
+            env: environment,
+            encoding: 'utf8',
+            maxBuffer: 10 * 1024 * 1024,
+            timeout: 60_000,
+        }, (error, stdout, stderr) => {
+            if (error && typeof error.code !== 'number') {
+                rejectPromise(error);
+                return;
+            }
+            resolvePromise({
+                exitCode: error && typeof error.code === 'number' ? error.code : 0,
+                stdout,
+                stderr,
+            });
+        });
+    });
+}

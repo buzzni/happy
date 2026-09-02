@@ -195,6 +195,8 @@ import {
   injectCheckpointSpawnContext,
   readCheckpointSpawnContext,
 } from '@/checkpoint/checkpointSpawnContext';
+import { createCheckpointRpcHandlers } from '@/checkpoint/checkpointRpc';
+import { resolveCheckpointSessionAuthority } from './checkpointSessionAuthority';
 import { AutonomousQualityGateRunStore } from './autonomousQualityGateStore';
 import { AutonomousQualityGateDaemonRegistry } from './autonomousQualityGateRegistry';
 import {
@@ -2570,6 +2572,15 @@ export async function startDaemon(): Promise<void> {
       automationStore,
       aiCredentialRuntime,
       autonomousQualityGate: createAutonomousQualityGateRpcHandlers(autonomousQualityGateRegistry),
+      checkpoint: createCheckpointRpcHandlers({
+        checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
+        resolveAuthority: (sessionId) => resolveCheckpointSessionAuthority({
+          sessionId,
+          trackedSession: findTrackedSessionById(sessionId),
+          checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
+          platform: process.platform,
+        }),
+      }),
       // specs/daemon-spawn-project-link — a session created by `agent spawn` has no way to
       // register itself with A+ (its credential does not authenticate /api/*), so the daemon
       // reports it here. The request is bounded inside linkSpawnedProjectSession and
