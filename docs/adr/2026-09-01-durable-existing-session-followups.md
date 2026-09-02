@@ -219,3 +219,19 @@ automation ticks or leases, i.e. when the handoff is imminent. The daemon
 therefore keeps serving follow-ups on the old bundle until the machine is
 idle; the cost is that a spawn started in that window runs the old CLI,
 which was already true for interactive sessions.
+
+## Amendment 2026-09-03 (2): mid-turn task notifications are not user intervention
+
+With the daemon running follow-ups again, loops on sessions that use
+background tasks ended after one round as `USER_INTERVENTION`. Claude Code
+records a background-task completion consumed mid-turn as a user row
+(`<task-notification>`), and the session scanner forwards it as a user text
+envelope that deliberately leaves the turn open
+(specs/midturn-task-notification-sync R2). The evaluator treated every user
+envelope after the boundary as a person taking over.
+
+Decision: a session-protocol user envelope observed while the turn is open
+(after `turn-start`, before `turn-end`) is part of that turn and is ignored.
+A root user message, or a user envelope after the turn has ended, still
+terminates the follow-up. This mirrors the scanner's own encoding of
+"belongs to the running turn" instead of matching on notification text.

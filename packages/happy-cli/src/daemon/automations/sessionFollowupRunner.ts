@@ -118,6 +118,12 @@ export function observeFollowupTurn(messages: Array<{ seq: number; localId: stri
   let complete = false
   let failed = false
   let userIntervened = false
+  // Claude Code records a background-task completion mid-turn as a user row;
+  // the session scanner forwards it as a user envelope *without* closing the
+  // turn (specs/midturn-task-notification-sync R2). A user envelope inside the
+  // running turn is therefore that notification, not a person taking over —
+  // a real prompt reaches us either as a root user message or after turn-end.
+  let turnOpen = false
   const agentTexts: string[] = []
   for (const message of messages) {
     observedSeq = Math.max(observedSeq, message.seq)
@@ -132,13 +138,15 @@ export function observeFollowupTurn(messages: Array<{ seq: number; localId: stri
       const envelope = contentRecord(wrapper?.data ?? wrapper)
       const event = contentRecord(envelope?.ev)
       if (envelope?.role === 'user') {
-        userIntervened = true
+        if (!turnOpen) userIntervened = true
         continue
       }
+      if (event?.t === 'turn-start') turnOpen = true
       if (envelope?.role === 'agent' && event?.t === 'text' && typeof event.text === 'string' && event.thinking !== true) {
         agentTexts.push(event.text)
       }
       if (event?.t === 'turn-end') {
+        turnOpen = false
         complete = true
         failed = event.status !== 'completed'
       }
