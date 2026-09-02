@@ -2291,7 +2291,8 @@ describe('runServerAutomationTick', () => {
     // cycle-1 이라 그 PR 은 다시 리뷰되지 않았다. 지시가 워커에게 자기 작업을 파괴하게
     // 시킨 것이다 — 결과가 유효하면 /fail 은 하지 말아야 한다.
     expect(spawned.initialPrompt).toMatch(/do not POST \/fail (if|when) (the )?(work|result)/i)
-    expect(spawned.initialPrompt).toMatch(/\/fail (only )?(when|if).*(cannot|could not) (produce|complete)/i)
+    const failLine = spawned.initialPrompt.split('\n').find((line) => line.startsWith('POST /fail'))
+    expect(failLine).toMatch(/only when you could not produce a result/i)
       if (taskType === 'pr_review.v1') {
         // 2026-09-01 검증 — 리뷰 워커가 대상 SHA worktree 에서 돌기 시작하자 그 다음
         // 층이 드러났다: worktree 는 빈 체크아웃이라 node_modules 가 없고,
