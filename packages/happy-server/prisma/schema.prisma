@@ -158,16 +158,20 @@ model SessionMessage {
 }
 
 model SessionEvent {
-    id        String   @id @default(cuid())
-    sessionId String
-    session   Session  @relation(fields: [sessionId], references: [id])
-    eventType String
-    seq       Int
+    id             String   @id @default(cuid())
+    sessionId      String
+    session        Session  @relation(fields: [sessionId], references: [id])
+    eventType      String
+    seq            Int
     /// [SessionEventContent]
-    content   Json
-    createdAt DateTime @default(now())
-    updatedAt DateTime @updatedAt
+    content        Json
+    /// [CheckpointEventMetadata]
+    checkpoint     Json?
+    idempotencyKey String?
+    createdAt      DateTime @default(now())
+    updatedAt      DateTime @updatedAt
 
+    @@unique([sessionId, idempotencyKey])
     @@index([sessionId, seq])
     @@index([sessionId, eventType])
 }
