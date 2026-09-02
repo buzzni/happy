@@ -22,6 +22,7 @@ import { isPermanentGithubTriggerFailure } from './githubTriggerPermanentFailure
 import {
   ensureAgentTaskReviewObjects,
   reviewShasFromDispatchInput,
+  reviewWorktreeRequestFromDispatchInput,
 } from './agentTaskReviewObjects'
 import { shouldGiveUpWorktreeCleanup } from './worktreeCleanupGiveUp'
 import type { GithubTriggerWorktreePlan } from './githubTriggerWorktree'
@@ -202,7 +203,17 @@ export interface ServerAutomationExecutorInput {
 const SCRIPT_TIMEOUT_MS = 60_000
 const HEARTBEAT_MS = 60_000
 const EXPECTED_NEXT_DAEMON_TICK_MS = 60_000
-const MAX_GITHUB_EVENTS_PER_TICK = 3
+// 한 틱이 새로 집어오는 GitHub 이벤트 수. 폭주하는 저장소가 한 번에 큐를 다 비우지
+// 않게 하는 유입 제한이다.
+export const MAX_GITHUB_EVENTS_PER_TICK = 3
+// 동시에 살아 있을 수 있는 GitHub 워커 세션 수. 위와 다른 개념이다 — 유입 속도와
+// 동시 실행 수를 한 상수로 묶으면 둘 중 하나만 바꾸고 싶을 때 다른 하나가 끌려간다.
+//
+// 워커 하나가 에이전트 세션 하나라 메모리·CPU 를 쓴다. 2026-09-01 프로덕션 머신
+// 실측(12코어 load 5.24, 가용 메모리 30GB, 이미 에이전트 프로세스 113개)에서 여유가
+// 있어 3 → 6 으로 올렸다. 유입은 MAX_GITHUB_EVENTS_PER_TICK 이 틱당 3건으로 계속
+// 잡아 주므로, 한 번에 몰려도 상한까지 두 틱에 걸쳐 올라간다.
+export const MAX_GITHUB_WORKER_SESSIONS = 6
 const DIRTY_WORKTREE_RETRY_MS = 15 * 60_000
 const WORKTREE_CLEANUP_RETRY_MS = 60_000
 const PR_REVIEW_SANDBOX_CONFIG = JSON.stringify({
@@ -1156,6 +1167,15 @@ async function executeStartedRun(
       }
       agentTaskDispatch = bridged.dispatch
       if (bridged.dispatch.type === 'pr_review.v1') {
+        // 리뷰 대상 head 로 체크아웃된 전용 worktree 에서 돌린다. 프로젝트 디렉터리에서
+        // 그대로 돌면 HEAD 가 사용자가 마지막에 둔 커밋이라, 워커가 대상 SHA 테스트를
+        // 실행할 수 없고 호출부도 git show 로 한 장씩 읽어야 한다.
+        githubWorktreeRequest = reviewWorktreeRequestFromDispatchInput(bridged.dispatch.input)
+          ? {
+            ...reviewWorktreeRequestFromDispatchInput(bridged.dispatch.input)!,
+            ...(query.githubEnvironment ? { githubEnvironment: query.githubEnvironment } : {}),
+          }
+          : null
         const shas = reviewShasFromDispatchInput(bridged.dispatch.input)
         if (shas.length > 0) {
           const provisioned = await (input.ensureReviewObjects ?? ensureAgentTaskReviewObjects)({
@@ -1319,10 +1339,12 @@ async function executeStartedRun(
       input.logDebug?.(
         `[server-automation] ${automation.automationId} GitHub worktree preparation failed: ${prepared.error}`,
       )
-      // 되돌릴 수 없는 실패(삭제된 브랜치 등)는 재시도해도 결과가 같다. ERROR 로
-      // 돌아가면 이 경로가 persistGithubTriggerState 에 도달하지 않아 이벤트가
-      // 소비되지 않고 매분 재시도된다(2026-08-29: 머지 후 삭제된 브랜치 하나가
-      // 그렇게 돌았다). 이벤트를 소비하고 SKIPPED_GATE 로 끊는다.
+      // 되돌릴 수 없는 실패(삭제된 브랜치 등)는 재시도해도, 폴백해도 결과가 같다 —
+      // 리뷰할 대상 자체가 없다. AgentTask 든 아니든 이벤트를 소비하고 끊는다.
+      //
+      // 이 판정이 아래 AgentTask 폴백보다 먼저 와야 한다. 2026-09-01 에 순서가
+      // 뒤바뀌어 있어, 머지되며 브랜치가 사라진 PR 을 프로젝트 디렉터리에서
+      // 리뷰하려고 워커를 띄웠다.
       if (isPermanentGithubTriggerFailure(prepared.error)) {
         input.logDebug?.(
           `[server-automation] ${automation.automationId} skipping permanently unavailable GitHub event`,
@@ -1333,12 +1355,24 @@ async function executeStartedRun(
           ...(degradedCode ? { degradedCode } : {}),
         }
       }
-      return {
-        outcome: 'ERROR', sessionId: null,
-        ...(degradedCode ? { degradedCode } : {}),
+      // 일시적 실패(디스크, 잠금 등)에서 AgentTask 는 이 시점에 서버가 task 를 이미
+      // 확정했다. 여기서 중단하면 그 task 는 워커 없이 lease 만료까지 남는다.
+      // worktree 는 리뷰 품질을 올려 주는 것이지 전제가 아니므로 프로젝트
+      // 디렉터리에서 계속한다 — 대상 SHA 테스트는 못 돌지만 리뷰 자체는 된다.
+      if (agentTaskDispatch) {
+        input.logDebug?.(
+          `[server-automation] ${automation.automationId} reviewing in the project directory instead`
+          + ' — the worker cannot run target-SHA tests there',
+        )
+      } else {
+        return {
+          outcome: 'ERROR', sessionId: null,
+          ...(degradedCode ? { degradedCode } : {}),
+        }
       }
+    } else {
+      githubWorktree = prepared
     }
-    githubWorktree = prepared
   }
   const initialPrompt = buildAutomationPrompt(prompt, scriptOutput)
   const spawnInput = {
@@ -1526,7 +1560,7 @@ export async function runServerAutomationTick(
     }
     if (payload.githubTrigger && githubMode === 'work'
       && payload.githubTrigger.action !== 'notify'
-      && activeGithubWorkerSessions.size >= MAX_GITHUB_EVENTS_PER_TICK) {
+      && activeGithubWorkerSessions.size >= MAX_GITHUB_WORKER_SESSIONS) {
       scheduleNextTick(input, automation.automationId, now)
       continue
     }

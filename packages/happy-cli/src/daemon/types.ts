@@ -15,6 +15,8 @@ export interface SessionEncryptionData {
 }
 
 export interface SessionRuntimeState {
+  /** Monotonic sequence assigned by the session process to reject delayed reports. */
+  reportSeq?: number;
   thinking: boolean;
   hasOpenToolCall: boolean;
   /**
@@ -38,6 +40,10 @@ export interface SessionRuntimeState {
    * clean a done-and-idle conversation well before the multi-day absolute cut.
    */
   lastTurnEndAt?: number;
+  /** Cumulative assistant turns reported by this session process. */
+  assistantTurns?: number;
+  /** Cumulative provider-neutral billable tokens reported by this session process. */
+  providerTokens?: number;
   /**
    * True once this conversation has launched a background job (e.g. a Bash tool
    * call with run_in_background). Such a session may look idle at turn end while

@@ -1,6 +1,17 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { runServerAutomationTick, type ServerAutomationExecutorInput } from './serverAutomationExecutor'
+import {
+  MAX_GITHUB_WORKER_SESSIONS,
+  runServerAutomationTick,
+  type ServerAutomationExecutorInput,
+} from './serverAutomationExecutor'
+
+// 상한을 상수에서 끌어와 만든다. 개수를 하드코딩하면 상한을 올릴 때 테스트가
+// "한계에 도달했다" 를 더는 재현하지 못하면서 조용히 통과한다.
+const workerSessionIds = (prefix: string, count = MAX_GITHUB_WORKER_SESSIONS) => Array.from(
+  { length: count },
+  (_, index) => `${prefix}-${index + 1}`,
+)
 import type { AutomationMcpCallerGrantResult } from './automationMcpCallerGrant'
 import type { EncryptedServerAutomation } from './serverAutomationCache'
 import type { ServerAutomationRuntimeState } from './serverAutomationRuntimeStore'
@@ -1369,6 +1380,169 @@ describe('runServerAutomationTick', () => {
     }))
   })
 
+  it('reviews in a worktree checked out at the dispatched head sha', async () => {
+    // 2026-09-01 프로덕션 — PR #317 리뷰가 "대상 SHA 테스트를 실행하지 못했다" 고
+    // 보고했다. AgentTask 워커만 프로젝트 디렉터리에서 그대로 돌아 HEAD 가 사용자가
+    // 마지막에 둔 커밋이었기 때문이다(start-session 리뷰는 전용 worktree 를 받는다).
+    // 그래서 워커는 git show 로 파일을 한 장씩 읽는 우회를 하고 테스트는 포기했다.
+    const { input, store, queryGithubPullRequests, dispatchAgentTask,
+      prepareGithubWorktree, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review safely', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'review-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { prNumber: 317, baseSha: 'b'.repeat(40), headSha: 'c'.repeat(40) },
+        context: [{ kind: 'diff', body: 'diff --git a/x b/x' }],
+      },
+    })
+
+    await runServerAutomationTick(input)
+
+    // 이벤트가 아니라 dispatch 가 준 SHA 여야 한다 — 큐에서 나온 task 는 지금
+    // planned 이벤트와 다른 PR 일 수 있다.
+    expect(prepareGithubWorktree).toHaveBeenCalledWith(expect.objectContaining({
+      directory: '/repo',
+      pullRequest: { number: 317, expectedHeadSha: 'c'.repeat(40) },
+    }))
+    expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
+      directory: '/isolated/run-1',
+    }))
+  })
+
+  it('skips a merged PR whose branch is gone instead of falling back', async () => {
+    // 2026-09-01 프로덕션 — happy #319 가 머지되며 브랜치가 삭제됐고, 그 이벤트를
+    // 처리하던 AgentTask 리뷰가 worktree 준비에 실패하자 프로젝트 디렉터리로
+    // 폴백해 워커를 띄웠다. 삭제된 브랜치는 되돌릴 수 없는 실패라 폴백해도 리뷰할
+    // 대상이 없다 — 이벤트를 소비하고 끊어야 한다. AgentTask 폴백을 영구 실패
+    // 판정보다 앞에 두어 생긴 문제다.
+    const { input, store, queryGithubPullRequests, dispatchAgentTask,
+      prepareGithubWorktree, spawnSession, logDebug } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review safely', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'review-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { prNumber: 319, baseSha: 'b'.repeat(40), headSha: 'c'.repeat(40) },
+        context: [{ kind: 'diff', body: 'diff --git a/x b/x' }],
+      },
+    })
+    prepareGithubWorktree.mockResolvedValue({
+      ok: false,
+      error: "GitHub pull request checkout failed: fatal: couldn't find remote ref refs/heads/gone",
+      cleaned: true,
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('permanently unavailable'))
+    expect(logDebug).not.toHaveBeenCalledWith(expect.stringContaining('project directory instead'))
+  })
+
+  it('still reviews in the project directory when the worktree cannot be prepared', async () => {
+    // dispatch 시점에 서버가 task 를 이미 확정했다. 여기서 중단하면 그 task 는 워커
+    // 없이 lease 만료까지 남는다. worktree 는 있으면 좋은 것이지 전제가 아니므로,
+    // 실패하면 사유를 남기고 기존처럼 프로젝트 디렉터리에서 리뷰한다.
+    const { input, store, queryGithubPullRequests, dispatchAgentTask,
+      prepareGithubWorktree, spawnSession, logDebug } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'AgentTask review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review safely', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'agent-task-review' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'review-1', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        controlUrl: 'https://studio.test/api/agent-tasks',
+        input: { prNumber: 317, baseSha: 'b'.repeat(40), headSha: 'c'.repeat(40) },
+        context: [{ kind: 'diff', body: 'diff --git a/x b/x' }],
+      },
+    })
+    prepareGithubWorktree.mockResolvedValue({
+      ok: false, error: 'worktree add failed: disk full', cleaned: true,
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({ directory: '/repo' }))
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('disk full'))
+  })
+
   it('provisions the review commits before the pr_review worker starts', async () => {
     // 2026-08-31 프로덕션 — hsmoa_backend AgentTask 리뷰가 "전달된 baseSha/headSha 가
     // 워크스페이스에 없어 호출부 검증과 소스 SHA 테스트를 실행하지 못했다" 고 보고했다.
@@ -2222,7 +2396,7 @@ describe('runServerAutomationTick', () => {
       }],
       githubActiveSessions: [{
         automationId: 'automation-1', generation: 2,
-        sessionIds: ['review-1', 'review-2', 'review-3'],
+        sessionIds: workerSessionIds('review'),
       }],
     })
     input.isSessionRunning = vi.fn(() => true)
@@ -2255,7 +2429,7 @@ describe('runServerAutomationTick', () => {
       }],
       githubActiveSessions: [{
         automationId: 'automation-1', generation: 1,
-        sessionIds: ['old-review-1', 'old-review-2', 'old-review-3'],
+        sessionIds: workerSessionIds('old-review'),
       }],
     })
     input.isSessionRunning = vi.fn(() => true)
@@ -2274,7 +2448,7 @@ describe('runServerAutomationTick', () => {
     expect(spawnSession).not.toHaveBeenCalled()
     expect(store.state().githubActiveSessions).toEqual([{
       automationId: 'automation-1', generation: 1,
-      sessionIds: ['old-review-1', 'old-review-2', 'old-review-3'],
+      sessionIds: workerSessionIds('old-review'),
     }])
     expect(store.state().schedules[0]!.nextRunAt).toBe(now + 1)
   })
@@ -2384,6 +2558,8 @@ describe('runServerAutomationTick', () => {
     const {
       input, store, transport, spawnSession, now,
     } = setup()
+    // 살아있는 세션 상한-1 개 + 이번 틱에 타임아웃된 워커 1개 = 상한
+    const liveSessions = workerSessionIds('review', MAX_GITHUB_WORKER_SESSIONS - 1)
     const automationIds = ['automation-1', 'automation-2', 'automation-3']
     const pendingEvent = {
       id: 'opened:10:head-sha', event: 'opened' as const,
@@ -2404,7 +2580,7 @@ describe('runServerAutomationTick', () => {
       })),
       githubActiveSessions: [{
         automationId: 'older-automation', generation: 1,
-        sessionIds: ['review-1', 'review-2'],
+        sessionIds: liveSessions,
       }],
       pendingReports: [],
     })
@@ -2426,7 +2602,7 @@ describe('runServerAutomationTick', () => {
       ok: true,
       value: { runId: `run-${automationId}`, claimToken: `claim-${automationId}` },
     }))
-    input.isSessionRunning = vi.fn((sessionId) => sessionId === 'review-1' || sessionId === 'review-2')
+    input.isSessionRunning = vi.fn((sessionId) => liveSessions.includes(sessionId))
     input.isDirectoryInUse = vi.fn((directory) => directory === '/isolated/run-automation-1')
     spawnSession.mockResolvedValue({ ok: false, error: 'Session webhook timeout for PID 101' })
 

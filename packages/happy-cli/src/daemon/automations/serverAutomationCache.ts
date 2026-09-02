@@ -1,7 +1,13 @@
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import tweetnacl from 'tweetnacl'
-import { automationPayloadSchema, type AutomationPayload } from '@slopus/happy-wire'
+import {
+  automationPayloadSchema,
+  sessionFollowupPayloadSchema,
+  type AutomationPayload,
+  type SessionFollowupDaemon,
+  type SessionFollowupPayload,
+} from '@slopus/happy-wire'
 
 const PAYLOAD_MAX_BYTES = 128 * 1024
 const ENVELOPE_BYTES = 1 + tweetnacl.box.publicKeyLength + tweetnacl.box.nonceLength
@@ -223,5 +229,34 @@ export function decryptServerAutomationPayload(
     return automationPayloadSchema.parse(JSON.parse(new TextDecoder().decode(plaintext)))
   } catch {
     throw new Error('automation-decrypt-failed')
+  }
+}
+
+export function decryptSessionFollowupDaemonPayload(
+  followup: SessionFollowupDaemon,
+  machineSecretKey: Uint8Array,
+): SessionFollowupPayload {
+  if (machineSecretKey.length !== tweetnacl.box.secretKeyLength) throw new Error('session-followup-decrypt-failed')
+  const envelope = new Uint8Array(Buffer.from(followup.machineKeyEnvelope, 'base64'))
+  if (envelope.length !== ENVELOPE_BYTES || envelope[0] !== 1) throw new Error('session-followup-decrypt-failed')
+  const ephemeralPublicKey = envelope.slice(1, 1 + tweetnacl.box.publicKeyLength)
+  const envelopeNonce = envelope.slice(
+    1 + tweetnacl.box.publicKeyLength,
+    ENVELOPE_BYTES - tweetnacl.box.overheadLength - tweetnacl.secretbox.keyLength,
+  )
+  const encryptedDek = envelope.slice(1 + tweetnacl.box.publicKeyLength + tweetnacl.box.nonceLength)
+  const dek = tweetnacl.box.open(encryptedDek, envelopeNonce, ephemeralPublicKey, machineSecretKey)
+  if (!dek || dek.length !== tweetnacl.secretbox.keyLength) throw new Error('session-followup-decrypt-failed')
+  const payload = new Uint8Array(Buffer.from(followup.payloadCiphertext, 'base64'))
+  if (payload.length < 1 + tweetnacl.secretbox.nonceLength + tweetnacl.secretbox.overheadLength
+    || payload[0] !== 1) throw new Error('session-followup-decrypt-failed')
+  const nonce = payload.slice(1, 1 + tweetnacl.secretbox.nonceLength)
+  const ciphertext = payload.slice(1 + tweetnacl.secretbox.nonceLength)
+  const plaintext = tweetnacl.secretbox.open(ciphertext, nonce, dek)
+  if (!plaintext) throw new Error('session-followup-decrypt-failed')
+  try {
+    return sessionFollowupPayloadSchema.parse(JSON.parse(new TextDecoder().decode(plaintext)))
+  } catch {
+    throw new Error('session-followup-decrypt-failed')
   }
 }

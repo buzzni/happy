@@ -10,7 +10,20 @@ import {
 } from '@/app/automation/automationExecutionService';
 import { inTx } from '@/storage/inTx';
 import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
-import { emitAutomationUpdate } from '@/app/automation/automationUpdate';
+import { emitAutomationUpdate, emitProjectAutomationUpdate } from '@/app/automation/automationUpdate';
+import {
+    claimSessionFollowup,
+    deliverSessionFollowupMessage,
+    reportSessionFollowupEvaluation,
+    syncSessionFollowups,
+} from '@/app/automation/sessionFollowupExecutionService';
+import { emitSessionFollowupMessageUpdate } from '@/app/automation/sessionFollowupUpdate';
+import {
+    sessionFollowupClaimRequestSchema,
+    sessionFollowupDeliverRequestSchema,
+    sessionFollowupEvaluationRequestSchema,
+    sessionFollowupSyncRequestSchema,
+} from '@slopus/happy-wire';
 
 type Callback = (response: { ok: boolean; value?: unknown; error?: string }) => void;
 
@@ -73,7 +86,13 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         protocolVersion: data?.protocolVersion === undefined
             ? 1
             : integer(data.protocolVersion, 1, Number.MAX_SAFE_INTEGER),
-    })), () => emitAutomationUpdate(accountId, { projectId: null, reason: 'machine-key' })));
+    })), async (value) => {
+        await emitAutomationUpdate(accountId, { projectId: null, reason: 'machine-key' });
+        const result = value as { invalidatedProjectIds?: string[] };
+        await Promise.all((result.invalidatedProjectIds ?? []).map((projectId) =>
+            emitProjectAutomationUpdate(projectId, { projectId, reason: 'sync' }, accountId),
+        ));
+    }));
 
     on('automation-sync', async (data, callback) => answer(callback, () => {
         const afterSeq = BigInt(requiredString(data?.afterSeq));
@@ -163,4 +182,86 @@ export function automationSocketHandler(accountId: string, machineId: string, so
             runId: requiredString(data?.runId),
             reason: 'run',
         })));
+
+    on('session-followup-sync', async (data, callback) => answer(callback, () => {
+        const input = sessionFollowupSyncRequestSchema.parse(data);
+        return inTx((tx) => syncSessionFollowups(tx, accountId, machineId, {
+            afterSeq: BigInt(input.afterSeq),
+            limit: input.limit,
+        }));
+    }));
+
+    on('session-followup-claim', async (data, callback) => answer(callback, () => {
+        const input = sessionFollowupClaimRequestSchema.parse(data);
+        return inTx((tx) => claimSessionFollowup(tx, accountId, machineId, {
+            followupId: input.followupId,
+            generation: input.generation,
+            step: input.step,
+        }));
+    }));
+
+    on('session-followup-evaluate', async (data, callback) => answer(callback, () => {
+        const input = sessionFollowupEvaluationRequestSchema.parse(data);
+        return inTx((tx) => reportSessionFollowupEvaluation(tx, accountId, machineId, {
+            followupId: input.followupId,
+            generation: input.generation,
+            step: input.step,
+            claimToken: input.claimToken,
+            decision: input.decision,
+            observedSeq: input.observedSeq,
+            ...(input.terminalCode ? { terminalCode: input.terminalCode } : {}),
+        }));
+    }, (value) => {
+        const followup = value as { projectId?: string };
+        return followup.projectId
+            ? emitProjectAutomationUpdate(
+                followup.projectId,
+                { projectId: followup.projectId, reason: 'sync' },
+                accountId,
+            )
+            : emitAutomationUpdate(accountId, { projectId: null, reason: 'sync' });
+    }));
+
+    on('session-followup-deliver', async (data, callback) => answer(callback, () => {
+        const input = sessionFollowupDeliverRequestSchema.parse(data);
+        return inTx((tx) => deliverSessionFollowupMessage(tx, accountId, machineId, {
+            followupId: input.followupId,
+            generation: input.generation,
+            step: input.step,
+            claimToken: input.claimToken,
+            expectedSeq: input.expectedSeq,
+            localId: input.localId,
+            contentCiphertext: input.contentCiphertext,
+        }));
+    }, async (value) => {
+        const result = value as {
+            messageSeq?: number | null;
+            deliveredMessage?: {
+                id: string;
+                localId: string | null;
+                createdAt: Date;
+                updatedAt: Date;
+            } | null;
+            followup?: { projectId?: string; sessionId?: string };
+        };
+        if (result.followup?.projectId) {
+            await emitProjectAutomationUpdate(
+                result.followup.projectId,
+                { projectId: result.followup.projectId, reason: 'sync' },
+                accountId,
+            );
+        } else {
+            await emitAutomationUpdate(accountId, { projectId: null, reason: 'sync' });
+        }
+        if (result.deliveredMessage && result.messageSeq !== null && result.messageSeq !== undefined
+            && result.followup?.sessionId) {
+            await emitSessionFollowupMessageUpdate({
+                userId: accountId,
+                sessionId: result.followup.sessionId,
+                seq: result.messageSeq,
+                contentCiphertext: requiredString(data?.contentCiphertext),
+                ...result.deliveredMessage,
+            });
+        }
+    }));
 }

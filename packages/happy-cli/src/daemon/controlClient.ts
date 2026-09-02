@@ -93,11 +93,14 @@ export async function notifyDaemonSessionStarted(
 export async function notifyDaemonSessionRuntime(
   sessionId: string,
   runtime: {
+    reportSeq?: number;
     thinking?: boolean;
     hasOpenToolCall?: boolean;
     pendingUserInput?: boolean;
     lastUserInteractionAt?: number;
     lastTurnEndAt?: number;
+    assistantTurns?: number;
+    providerTokens?: number;
     launchedBackgroundJob?: boolean;
     lastProcessedSeq?: number;
     mode?: 'local' | 'remote';

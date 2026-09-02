@@ -2,6 +2,7 @@ import { Context } from "@/context";
 import { inTx } from "@/storage/inTx";
 import { Result } from "./types";
 import { getProjectAsOwner } from "./projectAccessCheck";
+import { invalidateSessionFollowups } from "@/app/automation/sessionFollowupInvalidationService";
 
 /**
  * Remove a member from a project.
@@ -28,6 +29,11 @@ export async function projectMemberRemove(
             }
         }
 
+        await invalidateSessionFollowups(
+            tx,
+            { projectId, ownerAccountId: member.accountId },
+            'PERMISSION_REVOKED',
+        );
         await tx.projectMember.delete({
             where: { id: memberId }
         });

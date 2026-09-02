@@ -597,6 +597,9 @@ describe('ApiSessionClient v3 messages API migration', () => {
                 total: 460,
             },
         });
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', expect.objectContaining({
+            providerTokens: 460,
+        }));
 
         await waitForCheck(() => {
             expect(mockAxiosPost).toHaveBeenCalled();
@@ -832,6 +835,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             mode: 'remote'
         }));
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalledWith('test-session-id', {
+            reportSeq: expect.any(Number),
             thinking: true,
             hasOpenToolCall: false,
             pendingUserInput: false,
@@ -839,6 +843,40 @@ describe('ApiSessionClient v3 messages API migration', () => {
             lastProcessedSeq: expect.any(Number),
             mode: 'remote'
         });
+    });
+
+    it('does not report a daemon repair continuation as user intervention', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.keepAlive(false, 'remote');
+        mockNotifyDaemonSessionRuntime.mockClear();
+
+        (client as any).routeIncomingMessage({
+            role: 'user',
+            content: { type: 'text', text: '<quality-gate-evidence />' },
+            meta: { sentFrom: 'daemon' },
+        });
+        client.keepAlive(true, 'remote');
+
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalled();
+        for (const [, runtime] of mockNotifyDaemonSessionRuntime.mock.calls as unknown as Array<[string, Record<string, unknown>]>) {
+            expect(runtime).not.toHaveProperty('lastUserInteractionAt');
+        }
+    });
+
+    it('reports a routed human message as user intervention before the turn starts', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.keepAlive(false, 'remote');
+        mockNotifyDaemonSessionRuntime.mockClear();
+
+        (client as any).routeIncomingMessage({
+            role: 'user',
+            content: { type: 'text', text: 'manual instruction' },
+            meta: { sentFrom: 'app' },
+        });
+
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', expect.objectContaining({
+            lastUserInteractionAt: expect.any(Number),
+        }));
     });
 
     // The daemon uses this as the resume skip-baseline: report the seq actually
@@ -894,6 +932,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
 
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', {
+            reportSeq: expect.any(Number),
             thinking: true,
             hasOpenToolCall: true,
             pendingUserInput: false,
@@ -911,6 +950,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
 
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', {
+            reportSeq: expect.any(Number),
             thinking: true,
             hasOpenToolCall: false,
             pendingUserInput: false,
@@ -926,6 +966,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         // A fresh idle report (no prior busy state) must NOT stamp a turn-end.
         client.keepAlive(false, 'remote');
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', {
+            reportSeq: expect.any(Number),
             thinking: false,
             hasOpenToolCall: false,
             pendingUserInput: false,
@@ -940,11 +981,13 @@ describe('ApiSessionClient v3 messages API migration', () => {
         // …then finishes it (busy → idle): this is a turn-end.
         client.keepAlive(false, 'remote');
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', {
+            reportSeq: expect.any(Number),
             thinking: false,
             hasOpenToolCall: false,
             pendingUserInput: false,
             lastUserInteractionAt: expect.any(Number),
             lastTurnEndAt: expect.any(Number),
+            assistantTurns: 1,
             lastProcessedSeq: expect.any(Number),
             mode: 'remote'
         });
@@ -1010,6 +1053,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
 
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalledWith('test-session-id', {
+            reportSeq: expect.any(Number),
             thinking: false,
             hasOpenToolCall: false,
             pendingUserInput: true,
@@ -1033,6 +1077,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         client.keepAlive(true, 'remote');
 
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalledWith('test-session-id', {
+            reportSeq: expect.any(Number),
             thinking: false,
             hasOpenToolCall: false,
             pendingUserInput: true,

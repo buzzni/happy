@@ -1,5 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Prisma, type AutomationRunOutcome, type Prisma as PrismaTypes } from '@prisma/client';
+import { AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION } from '@slopus/happy-wire';
+import { invalidateSessionFollowups } from './sessionFollowupInvalidationService';
 
 type Tx = PrismaTypes.TransactionClient;
 type Binary = Uint8Array<ArrayBuffer>;
@@ -27,7 +29,7 @@ export async function registerAutomationMachineKey(
     accountId: string,
     machineId: string,
     input: { expectedKeyVersion: number; publicKey: Binary; protocolVersion: number },
-): Promise<Result<{ keyVersion: number }>> {
+): Promise<Result<{ keyVersion: number; invalidatedProjectIds: string[] }>> {
     const current = await tx.machine.findFirst({
         where: { id: machineId, accountId },
         select: {
@@ -45,7 +47,20 @@ export async function registerAutomationMachineKey(
             });
             if (changed.count === 0) return { ok: false, error: 'key-version-conflict' };
         }
-        return { ok: true, value: { keyVersion: current.automationKeyVersion } };
+        const invalidated = input.protocolVersion < AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION
+            ? await invalidateSessionFollowups(
+                tx,
+                { machineAccountId: accountId, machineId },
+                'TARGET_MISMATCH',
+            )
+            : [];
+        return {
+            ok: true,
+            value: {
+                keyVersion: current.automationKeyVersion,
+                invalidatedProjectIds: [...new Set(invalidated.map((followup) => followup.projectId as string))],
+            },
+        };
     }
     const changed = await tx.machine.updateMany({
         where: { id: machineId, accountId, automationKeyVersion: input.expectedKeyVersion },
@@ -56,7 +71,18 @@ export async function registerAutomationMachineKey(
         },
     });
     if (changed.count === 0) return { ok: false, error: 'key-version-conflict' };
-    return { ok: true, value: { keyVersion: input.expectedKeyVersion + 1 } };
+    const invalidated = await invalidateSessionFollowups(
+        tx,
+        { machineAccountId: accountId, machineId },
+        'DECRYPT_FAILED',
+    );
+    return {
+        ok: true,
+        value: {
+            keyVersion: input.expectedKeyVersion + 1,
+            invalidatedProjectIds: [...new Set(invalidated.map((followup) => followup.projectId as string))],
+        },
+    };
 }
 
 export async function syncAutomations(

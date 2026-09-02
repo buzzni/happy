@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
 import { ApiMachineClient } from './apiMachine';
 import type { Machine } from './types';
 
@@ -136,6 +137,16 @@ describe('ApiMachineClient socket reconnection', () => {
         );
     });
 
+    it('registers the machine-scoped Codex thread transfer RPC', () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const manager = (client as any).rpcHandlerManager;
+
+        expect(manager.registerHandler).toHaveBeenCalledWith(
+            'codex-thread-transfer',
+            expect.any(Function),
+        );
+    });
+
     it('validates and forwards additional directories through the spawn RPC result', async () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         const manager = (client as any).rpcHandlerManager;
@@ -255,6 +266,68 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    it('publishes autonomous quality-gate capability on the first connection', async () => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        const client = new ApiMachineClient('fake-token', machine);
+        client.setRPCHandlers({
+            spawnSession: vi.fn(),
+            stopSession: vi.fn(),
+            requestShutdown: vi.fn(),
+            portRegistry: {} as any,
+            aiCredentialRuntime: {} as any,
+            autonomousQualityGate: {
+                start: vi.fn(), status: vi.fn(), control: vi.fn(),
+            },
+        });
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.autonomousQualityGateSupport).toEqual({
+            apiVersion: 1,
+            rpcAvailable: true,
+        }));
+
+        client.shutdown();
+    });
+
+    it('clears stale autonomous quality-gate capability when RPC handlers are unavailable', async () => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        machine.metadata = {
+            ...machine.metadata,
+            autonomousQualityGateSupport: { apiVersion: 1, rpcAvailable: true },
+        };
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.autonomousQualityGateSupport).toEqual({
+            apiVersion: 1,
+            rpcAvailable: false,
+        }));
+
+        client.shutdown();
+    });
+
     it('registers the persistent automation public key on connect and persists the acknowledged version', async () => {
         mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
             if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 4 } };
@@ -280,7 +353,7 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-key-register', {
             expectedKeyVersion: 3,
             publicKey: Buffer.from(new Uint8Array(32).fill(7)).toString('base64'),
-            protocolVersion: 3,
+            protocolVersion: AUTOMATION_PROTOCOL_VERSION,
         });
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('machine-update-metadata', expect.any(Object));
         client.shutdown();

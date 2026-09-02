@@ -109,6 +109,7 @@ import {
 import { createClaudeSessionTransferHandler } from '@/claude/utils/claudeSessionTransfer';
 import { readClaudeCodeUsage } from '@/claudeCodeUsage/readUsage';
 import { CodexAppServerClient } from '@/codex/codexAppServerClient';
+import { createCodexThreadTransferHandler } from '@/codex/codexThreadTransfer';
 import { ADDITIONAL_DIRECTORIES_CAPABILITY, parseAdditionalDirectories } from '@/daemon/additionalDirectories';
 import {
     CodexForkRewindPointNotFoundError,
@@ -120,7 +121,9 @@ import type { ServerAutomationCache } from '@/daemon/automations/serverAutomatio
 import { syncServerAutomationDeltas } from '@/daemon/automations/serverAutomationSync';
 import type { ServerAutomationTransport } from '@/daemon/automations/serverAutomationExecutor';
 import type { PendingAutomationReport } from '@/daemon/automations/serverAutomationRuntimeStore';
+import type { SessionFollowupTransport } from '@/daemon/automations/sessionFollowupRunner';
 import type { AiCredentialRuntime } from '@/daemon/aiCredentialRuntime';
+import type { AutonomousQualityGateRpcHandlers } from '@/daemon/autonomousQualityGateRpc';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BROKER_ACTIVITY_TOUCH_INTERVAL_MS = 60_000;
@@ -206,6 +209,37 @@ interface DaemonToServerEvents {
         value?: unknown;
         error?: string;
     }) => void) => void;
+    'session-followup-sync': (data: {
+        wireVersion: 1;
+        afterSeq: string;
+        limit: number;
+    }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
+    'session-followup-claim': (data: {
+        wireVersion: 1;
+        followupId: string;
+        generation: number;
+        step: number;
+    }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
+    'session-followup-evaluate': (data: {
+        wireVersion: 1;
+        followupId: string;
+        generation: number;
+        step: number;
+        claimToken: string;
+        decision: 'WAIT' | 'CONTINUE' | 'TERMINATE';
+        observedSeq: number;
+        terminalCode?: string;
+    }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
+    'session-followup-deliver': (data: {
+        wireVersion: 1;
+        followupId: string;
+        generation: number;
+        step: number;
+        claimToken: string;
+        expectedSeq: number;
+        localId: string;
+        contentCiphertext: string;
+    }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
     'machine-alive': (data: {
         machineId: string;
         time: number;
@@ -317,6 +351,7 @@ type MachineRpcHandlers = {
      */
     linkSpawnedSession?: (input: { sessionId: string; directory: string }) => void | Promise<void>;
     aiCredentialRuntime: AiCredentialRuntime;
+    autonomousQualityGate?: AutonomousQualityGateRpcHandlers;
 }
 
 function requireNonEmptyString(value: unknown, name: string): string {
@@ -367,6 +402,8 @@ export class ApiMachineClient {
     // automationStore). Advertised as metadata.automationSupport.rpcAvailable.
     private automationRpcAvailable = false;
     private lastKnownAutomationRpcAvailable: boolean | null = null;
+    private autonomousQualityGateRpcAvailable = false;
+    private lastKnownAutonomousQualityGateRpcAvailable: boolean | null = null;
     private automationKey: MachineAutomationKey | null = null;
     private persistAutomationKeyVersion: ((version: number) => void) | null = null;
     private automationServerKeyVersion: number | null = null;
@@ -451,6 +488,24 @@ export class ApiMachineClient {
             'claude-session-transfer',
             createClaudeSessionTransferHandler({ allowedRoot }),
         );
+        this.rpcHandlerManager.registerHandler(
+            'codex-thread-transfer',
+            createCodexThreadTransferHandler({
+                allowedRoot,
+                codexHome: process.env.CODEX_HOME ?? join(homedir(), '.codex'),
+                readThreadPath: async (threadId) => withCodexAppServerClient(async (client) => {
+                    const { thread } = await client.readThread({ threadId, includeTurns: false });
+                    if (typeof thread.path !== 'string' || thread.path.length === 0) {
+                        throw new Error('Codex thread rollout path is unavailable');
+                    }
+                    return thread.path;
+                }),
+                forkThreadFromPath: async ({ path, cwd }) => withCodexAppServerClient(async (client) => {
+                    const forked = await client.forkThreadFromPath({ path, cwd });
+                    return { threadId: forked.threadId };
+                }),
+            }),
+        );
     }
 
     setRPCHandlers({
@@ -462,11 +517,19 @@ export class ApiMachineClient {
         portRegistry,
         automationStore,
         aiCredentialRuntime,
+        autonomousQualityGate,
         linkSpawnedSession,
     }: MachineRpcHandlers) {
         this.resumeSessionHandler = resumeSession ?? null;
         this.recoverSessionHandler = recoverSession ?? null;
         this.linkSpawnedSessionHandler = linkSpawnedSession ?? null;
+
+        if (autonomousQualityGate) {
+            this.rpcHandlerManager.registerHandler('autonomous-quality-gate:start', autonomousQualityGate.start);
+            this.rpcHandlerManager.registerHandler('autonomous-quality-gate:status', autonomousQualityGate.status);
+            this.rpcHandlerManager.registerHandler('autonomous-quality-gate:control', autonomousQualityGate.control);
+            this.autonomousQualityGateRpcAvailable = true;
+        }
 
         // Scheduled automations CRUD (specs: daemon-scheduled-automations).
         // Handlers live in automationRpcHandlers.ts so they unit-test without
@@ -1222,6 +1285,21 @@ export class ApiMachineClient {
         };
     }
 
+    sessionFollowupTransport(): SessionFollowupTransport {
+        const normalize = async (request: Promise<{ ok: boolean; value?: unknown; error?: string }>) => {
+            const response = await request;
+            return response.ok
+                ? { ok: true as const, value: response.value }
+                : { ok: false as const, error: response.error };
+        };
+        return {
+            sync: (input) => normalize(this.socket.emitWithAck('session-followup-sync', input)),
+            claim: (input) => normalize(this.socket.emitWithAck('session-followup-claim', input)),
+            evaluate: (input) => normalize(this.socket.emitWithAck('session-followup-evaluate', input)),
+            deliver: (input) => normalize(this.socket.emitWithAck('session-followup-deliver', input)),
+        };
+    }
+
     /**
      * Idempotent: returns the running stack if one is already up. Shared by
      * the `browser-viewer:start` RPC and `browser-setup:launch`'s `viewer`
@@ -1677,6 +1755,8 @@ export class ApiMachineClient {
                 rpcAvailable: this.automationRpcAvailable,
                 serverBacked: true,
                 keyVersion,
+                sessionFollowup: true,
+                protocolVersion: AUTOMATION_PROTOCOL_VERSION,
             },
         }));
     }
@@ -2242,7 +2322,7 @@ export class ApiMachineClient {
 
     private startKeepAlive() {
         this.stopKeepAlive();
-        this.keepAliveInterval = setInterval(() => {
+        const publishKeepAlive = () => {
             const payload = {
                 machineId: this.machine.id,
                 time: Date.now()
@@ -2280,15 +2360,17 @@ export class ApiMachineClient {
                 || prevResume.happyAgentAuthenticated !== newResumeSupport.happyAgentAuthenticated;
             const cliVersionChanged = prevCliVersion !== newCliVersion;
             const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable;
+            const autonomousQualityGateSupportChanged = this.lastKnownAutonomousQualityGateRpcAvailable !== this.autonomousQualityGateRpcAvailable;
             const automationServerKeyChanged = this.lastKnownAutomationServerKeyVersion !== this.automationServerKeyVersion;
 
             this.syncResumeSessionRpcRegistration();
 
-            if (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || automationServerKeyChanged) {
+            if (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
                 this.lastKnownAutomationRpcAvailable = this.automationRpcAvailable;
+                this.lastKnownAutonomousQualityGateRpcAvailable = this.autonomousQualityGateRpcAvailable;
                 this.lastKnownAutomationServerKeyVersion = this.automationServerKeyVersion;
                 this.updateMachineMetadata((metadata) => ({
                     ...(metadata || {} as any),
@@ -2298,6 +2380,12 @@ export class ApiMachineClient {
                         rpcAvailable: this.automationRpcAvailable,
                         serverBacked: this.automationServerKeyVersion !== null,
                         ...(this.automationServerKeyVersion !== null ? { keyVersion: this.automationServerKeyVersion } : {}),
+                        sessionFollowup: true,
+                        protocolVersion: AUTOMATION_PROTOCOL_VERSION,
+                    },
+                    autonomousQualityGateSupport: {
+                        apiVersion: 1,
+                        rpcAvailable: this.autonomousQualityGateRpcAvailable,
                     },
                     additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
                     happyCliVersion: newCliVersion,
@@ -2305,7 +2393,9 @@ export class ApiMachineClient {
                     logger.debug('[API MACHINE] Failed to update machine capabilities:', err);
                 });
             }
-        }, 20000);
+        };
+        publishKeepAlive();
+        this.keepAliveInterval = setInterval(publishKeepAlive, 20000);
         logger.debug('[API MACHINE] Keep-alive started (20s interval)');
     }
 

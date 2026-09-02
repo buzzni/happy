@@ -61,6 +61,7 @@ model Account {
     MergeRequestComment MergeRequestComment[]
     VoiceConversation   VoiceConversation[]
     AutomationOwner     Automation[]         @relation("AutomationOwner")
+    SessionFollowupOwner SessionFollowup[]    @relation("SessionFollowupOwner")
     AgentLaunchProfile  AgentLaunchProfile[]
 }
 
@@ -470,6 +471,7 @@ model Project {
     workspaces           Workspace[]
     mergeRequests        MergeRequest[]
     automations          Automation[]
+    sessionFollowups     SessionFollowup[]
 
     @@index([accountId])
 }
@@ -621,6 +623,125 @@ model AutomationRun {
     @@unique([automationId, generation, scheduledFor])
     @@index([automationId, status])
     @@index([machineAccountId, machineId, status])
+}
+
+enum SessionFollowupStatus {
+    WAITING
+    DELIVERY_PENDING
+    PAUSED
+    COMPLETED
+    CANCELLED
+    FAILED
+}
+
+enum SessionFollowupTerminalCode {
+    CLEAN
+    LOW_OR_NIT_ONLY
+    UNSTRUCTURED
+    ROUNDS_EXHAUSTED
+    USER_INTERVENTION
+    STOPPED
+    SESSION_UNAVAILABLE
+    TARGET_MISMATCH
+    DECRYPT_FAILED
+    PERMISSION_REVOKED
+}
+
+enum SessionFollowupChangeKind {
+    UPSERT
+    TOMBSTONE
+}
+
+enum SessionFollowupHistoryKind {
+    STARTED
+    CONTINUATION_RESERVED
+    CONTINUATION_DELIVERED
+    TERMINATED
+    PAUSED
+    RESUMED
+    STOPPED
+    DELETED
+}
+
+// Durable control plane for a bounded sequence of prompts in one existing
+// E2EE session. Payload and runtime detail remain opaque to the server.
+model SessionFollowup {
+    id                    String   @id @default(cuid())
+    projectId             String
+    project               Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+    ownerAccountId        String
+    ownerAccount          Account  @relation("SessionFollowupOwner", fields: [ownerAccountId], references: [id])
+    machineAccountId      String
+    machineId             String
+    // Deliberately no FK: machine deletion must not discard durable history or
+    // block the existing machine lifecycle. Execution re-resolves this target.
+    // Deliberately no FK: a deleted session must leave an auditable terminal
+    // aggregate and a machine-targeted tombstone.
+    sessionId             String
+    revision              Int      @default(1)
+    generation            Int      @default(1)
+    step                  Int      @default(1)
+    payloadVersion        Int      @default(1)
+    payloadCiphertext     Bytes
+    viewerKeyId           String
+    viewerKeyVersion      Int
+    viewerKeyEnvelope     Bytes
+    machineKeyVersion     Int
+    machineKeyEnvelope    Bytes
+    status                SessionFollowupStatus @default(WAITING)
+    terminalCode          SessionFollowupTerminalCode?
+    totalRounds           Int
+    currentRound          Int
+    responseBoundarySeq   Int
+    lastObservedSeq       Int
+    pendingExpectedSeq    Int?
+    pendingLocalId        String?  @unique
+    claimTokenHash        Bytes?   @unique
+    claimExpiresAt        DateTime?
+    claimedGeneration     Int?
+    claimedStep           Int?
+    deletedAt             DateTime?
+    completedAt           DateTime?
+    createdAt             DateTime @default(now())
+    updatedAt             DateTime @updatedAt
+    history               SessionFollowupHistory[]
+
+    // A migration-owned partial unique index on sessionId
+    // prevents concurrent creation of multiple non-terminal loops.
+    @@index([projectId, sessionId, deletedAt])
+    @@index([machineAccountId, machineId, status, deletedAt])
+}
+
+// No FK by design: tombstones survive aggregate/project hard deletion.
+model SessionFollowupChange {
+    seq              BigInt @id @default(autoincrement())
+    followupId       String
+    machineAccountId String
+    machineId        String
+    revision         Int
+    generation       Int
+    kind             SessionFollowupChangeKind
+    createdAt        DateTime @default(now())
+
+    @@unique([followupId, revision, machineAccountId, machineId, kind])
+    @@index([machineAccountId, machineId, seq])
+    @@index([followupId])
+}
+
+model SessionFollowupHistory {
+    id             String @id @default(cuid())
+    followupId     String
+    followup       SessionFollowup @relation(fields: [followupId], references: [id], onDelete: Cascade)
+    generation     Int
+    step           Int
+    round          Int
+    kind           SessionFollowupHistoryKind
+    terminalCode   SessionFollowupTerminalCode?
+    observedSeq    Int?
+    detailCiphertext Bytes?
+    createdAt      DateTime @default(now())
+
+    @@index([followupId, createdAt(sort: Desc)])
 }
 
 model MergeRequest {
