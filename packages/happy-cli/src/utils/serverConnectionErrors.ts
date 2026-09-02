@@ -244,10 +244,28 @@ export function startOfflineReconnection<TSession>(
 // Connection State - Simple state machine for offline status with deduplication
 // ============================================================================
 
-/** All network error codes that trigger offline mode */
+/**
+ * All network error codes that trigger offline mode.
+ *
+ * Anything listed here is treated as "the server is unreachable right now", so
+ * callers degrade to offline mode and retry later instead of propagating the
+ * error. Codes missing from this list bubble up as unexpected failures — for
+ * the daemon that means a FATAL exit, so a transient network blip would take
+ * the whole process down. Keep transient transport failures listed here.
+ */
 export const NETWORK_ERROR_CODES = [
+    // Node.js socket-level failures
     'ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT',
-    'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH'
+    'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH',
+    'EPIPE',
+    // Temporary DNS failure — resolver reachable but no answer yet
+    'EAI_AGAIN',
+    // Axios client-side request timeout (its `timeout` option). Distinct from
+    // the kernel's ETIMEDOUT: the socket may have connected fine and the
+    // server simply never answered in time.
+    'ECONNABORTED',
+    // Axios' generic "request failed without a response" code
+    'ERR_NETWORK'
 ] as const;
 
 /** Check if error code indicates server unreachable */
@@ -264,6 +282,10 @@ export const ERROR_DESCRIPTIONS: Record<string, string> = {
     ECONNRESET: 'connection reset by server',
     EHOSTUNREACH: 'server host unreachable',
     ENETUNREACH: 'network unreachable',
+    EPIPE: 'connection closed while sending request',
+    EAI_AGAIN: 'temporary DNS resolution failure',
+    ECONNABORTED: 'request timed out waiting for the server',
+    ERR_NETWORK: 'network request failed without a response',
     // HTTP errors
     '401': 'authentication failed - run `happy auth`',
     '403': 'access forbidden',

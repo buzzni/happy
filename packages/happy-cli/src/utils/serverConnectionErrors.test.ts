@@ -16,7 +16,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { startOfflineReconnection, printOfflineWarning, connectionState, isNetworkError, NETWORK_ERROR_CODES } from './serverConnectionErrors';
+import { startOfflineReconnection, printOfflineWarning, connectionState, isNetworkError, NETWORK_ERROR_CODES, ERROR_DESCRIPTIONS } from './serverConnectionErrors';
 
 // Mock axios - only isAxiosError needed for error type detection
 vi.mock('axios', () => ({
@@ -560,6 +560,23 @@ describe('isNetworkError', () => {
         expect(isNetworkError('ECONNRESET')).toBe(true);
         expect(isNetworkError('EHOSTUNREACH')).toBe(true);
         expect(isNetworkError('ENETUNREACH')).toBe(true);
+        expect(isNetworkError('EPIPE')).toBe(true);
+        expect(isNetworkError('EAI_AGAIN')).toBe(true);
+        expect(isNetworkError('ECONNABORTED')).toBe(true);
+        expect(isNetworkError('ERR_NETWORK')).toBe(true);
+    });
+
+    // Regression: an axios `timeout` expiry surfaces as ECONNABORTED. It used
+    // to be unclassified, so machine registration rethrew it and the daemon
+    // died with a FATAL exit instead of falling back to offline mode.
+    it('should classify the axios request timeout code as a network error', () => {
+        expect(isNetworkError('ECONNABORTED')).toBe(true);
+    });
+
+    // ERR_CANCELED means the caller aborted deliberately, so it must not be
+    // laundered into "the server is unreachable".
+    it('should not treat a deliberate cancellation as a network error', () => {
+        expect(isNetworkError('ERR_CANCELED')).toBe(false);
     });
 
     it('should return false for non-network error codes', () => {
@@ -577,13 +594,23 @@ describe('isNetworkError', () => {
         expect(isNetworkError('')).toBe(false);
     });
 
-    it('should have exactly 6 network error codes', () => {
-        expect(NETWORK_ERROR_CODES).toHaveLength(6);
+    it('should have exactly 10 network error codes', () => {
+        expect(NETWORK_ERROR_CODES).toHaveLength(10);
         expect(NETWORK_ERROR_CODES).toContain('ECONNREFUSED');
         expect(NETWORK_ERROR_CODES).toContain('ENOTFOUND');
         expect(NETWORK_ERROR_CODES).toContain('ETIMEDOUT');
         expect(NETWORK_ERROR_CODES).toContain('ECONNRESET');
         expect(NETWORK_ERROR_CODES).toContain('EHOSTUNREACH');
         expect(NETWORK_ERROR_CODES).toContain('ENETUNREACH');
+        expect(NETWORK_ERROR_CODES).toContain('EPIPE');
+        expect(NETWORK_ERROR_CODES).toContain('EAI_AGAIN');
+        expect(NETWORK_ERROR_CODES).toContain('ECONNABORTED');
+        expect(NETWORK_ERROR_CODES).toContain('ERR_NETWORK');
+    });
+
+    it('should describe every network error code', () => {
+        for (const code of NETWORK_ERROR_CODES) {
+            expect(ERROR_DESCRIPTIONS[code]).toBeDefined();
+        }
     });
 });
