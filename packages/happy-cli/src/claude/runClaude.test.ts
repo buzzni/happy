@@ -12,6 +12,7 @@ const {
     mockStartHookServer,
     mockRegisterKillSessionHandler,
     mockCreateCheckpointSessionComposition,
+    mockCreateCheckpointEventPublisher,
 } = vi.hoisted(() => ({
     mockApiClientCreate: vi.fn(),
     mockCreateSessionScanner: vi.fn(),
@@ -22,6 +23,7 @@ const {
     mockStartHookServer: vi.fn(),
     mockRegisterKillSessionHandler: vi.fn(),
     mockCreateCheckpointSessionComposition: vi.fn(),
+    mockCreateCheckpointEventPublisher: vi.fn(),
 }));
 
 vi.mock('@/api/api', () => ({
@@ -70,6 +72,10 @@ vi.mock('./registerKillSessionHandler', () => ({
 
 vi.mock('@/checkpoint/checkpointSessionComposition', () => ({
     createCheckpointSessionComposition: mockCreateCheckpointSessionComposition,
+}));
+
+vi.mock('@/checkpoint/checkpointEventPublisher', () => ({
+    createCheckpointEventPublisher: mockCreateCheckpointEventPublisher,
 }));
 
 vi.mock('@/ui/logger', () => ({
@@ -346,15 +352,23 @@ describe('runClaude remote JSONL scanner', () => {
             beforeTurn,
             claudeSandbox,
         });
+        const checkpointEvents = { snapshot: vi.fn(), rewind: vi.fn() };
+        mockCreateCheckpointEventPublisher.mockReturnValue(checkpointEvents);
 
         const harness = await startRemoteRunClaudeHarness();
 
+        expect(mockCreateCheckpointEventPublisher).toHaveBeenCalledWith(expect.objectContaining({
+            token: expect.any(String),
+            sessionId: 'happy-session-1',
+            encryption: expect.objectContaining({ encryptionVariant: expect.any(String) }),
+        }));
         expect(mockCreateCheckpointSessionComposition).toHaveBeenCalledWith(expect.objectContaining({
             provider: 'claude-remote',
             platform: process.platform,
             projectPath: process.cwd(),
             sessionId: 'happy-session-1',
             env: process.env,
+            checkpointEvents,
         }));
         expect(harness.loopOptions.checkpointComposition).toMatchObject({
             beforeTurn,

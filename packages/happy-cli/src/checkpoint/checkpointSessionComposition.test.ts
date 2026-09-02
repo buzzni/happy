@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SandboxConfigSchema } from '@/persistence';
 import { CHECKPOINT_SPAWN_CONTEXT_ENV_KEY } from './checkpointSpawnContext';
 import { CheckpointProtectionStateStore } from './checkpointProtectionState';
@@ -29,6 +29,11 @@ describe('createCheckpointSessionComposition', () => {
         maxFileBytes: 1024,
         maxFiles: 100,
         maxTotalBytes: 4096,
+    };
+    const checkpointEvents = {
+        snapshot: async () => ({
+            id: 'event-1', seq: 1, createdAt: Date.now(), idempotent: false,
+        }),
     };
 
     function contextEnv() {
@@ -76,6 +81,17 @@ describe('createCheckpointSessionComposition', () => {
         })).rejects.toThrow('unsupported-platform');
     });
 
+    it('fails closed when a protected runtime has no durable event publisher', async () => {
+        await expect(createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-1',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+        })).rejects.toThrow('durable event publisher');
+    });
+
     it.each(['claude-remote', 'codex'] as const)(
         'binds %s sandbox and turn gate to the same protected runtime',
         async (provider) => {
@@ -89,6 +105,7 @@ describe('createCheckpointSessionComposition', () => {
                     denyWritePaths: ['existing-deny'],
                 }),
                 env: contextEnv(),
+                checkpointEvents,
             });
             const canonicalProjectPath = await realpath(projectPath);
             if (!result.sandboxConfig) throw new Error('expected protected sandbox config');
@@ -145,6 +162,35 @@ describe('createCheckpointSessionComposition', () => {
         },
     );
 
+    it('waits for a durable snapshot event acknowledgement before opening the provider turn', async () => {
+        const snapshot = vi.fn()
+            .mockRejectedValueOnce(new Error('event server unavailable'))
+            .mockResolvedValueOnce({
+                id: 'event-1', seq: 1, createdAt: Date.now(), idempotent: true,
+            });
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-1',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents: { snapshot },
+        });
+
+        await expect(result.beforeTurn?.()).rejects.toThrow('event server unavailable');
+        expect(result.protectedBashCwd?.()).toBeNull();
+        const retry = await result.beforeTurn?.();
+
+        expect(retry).toBeDefined();
+        expect(snapshot).toHaveBeenCalledTimes(2);
+        expect(snapshot.mock.calls[1]?.[0]).toEqual(snapshot.mock.calls[0]?.[0]);
+        expect(snapshot.mock.calls[0]?.[0]).toMatchObject({
+            operationId: retry?.operationId,
+            checkpointId: retry?.checkpointId,
+        });
+    });
+
     it('applies an isolated diff only after the provider writer tree is quiescent', async () => {
         const result = await createCheckpointSessionComposition({
             provider: 'codex',
@@ -153,6 +199,7 @@ describe('createCheckpointSessionComposition', () => {
             sessionId: 'session-1',
             sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
             env: contextEnv(),
+            checkpointEvents,
         });
         expect(result.protectedBashCwd?.()).toBeNull();
         const turn = await result.beforeTurn?.();
@@ -185,6 +232,7 @@ describe('createCheckpointSessionComposition', () => {
             sessionId: 'session-1',
             sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
             env: contextEnv(),
+            checkpointEvents,
         });
         if (!result.beforeTurn || !result.completeTurn) throw new Error('expected protected turn lifecycle');
 
@@ -212,6 +260,7 @@ describe('createCheckpointSessionComposition', () => {
             sessionId: 'session-1',
             sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
             env: contextEnv(),
+            checkpointEvents,
         });
         await writeFile(join(projectPath, '.env.production'), 'secret');
 
@@ -241,6 +290,7 @@ describe('createCheckpointSessionComposition', () => {
             sessionId: 'session-1',
             sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
             env: contextEnv(),
+            checkpointEvents,
         });
         const turn = await result.beforeTurn?.();
         if (!turn || !result.completeTurn) throw new Error('expected protected turn lifecycle');
@@ -291,6 +341,7 @@ describe('createCheckpointSessionComposition', () => {
             sessionId: 'session-1',
             sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
             env: contextEnv(),
+            checkpointEvents,
         });
 
         expect(result.beforeTurn).toBeUndefined();

@@ -196,6 +196,7 @@ import {
   readCheckpointSpawnContext,
 } from '@/checkpoint/checkpointSpawnContext';
 import { createCheckpointRpcHandlers } from '@/checkpoint/checkpointRpc';
+import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 import { resolveCheckpointSessionAuthority } from './checkpointSessionAuthority';
 import { AutonomousQualityGateRunStore } from './autonomousQualityGateStore';
 import { AutonomousQualityGateDaemonRegistry } from './autonomousQualityGateRegistry';
@@ -2580,6 +2581,15 @@ export async function startDaemon(): Promise<void> {
           checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
           platform: process.platform,
         }),
+        resolveEventPublisher: async (sessionId) => {
+          const trackedSession = findTrackedSessionById(sessionId);
+          if (!trackedSession?.encryption) return null;
+          return createCheckpointEventPublisher({
+            token: credentials.token,
+            sessionId,
+            encryption: trackedSession.encryption,
+          });
+        },
       }),
       // specs/daemon-spawn-project-link — a session created by `agent spawn` has no way to
       // register itself with A+ (its credential does not authenticate /api/*), so the daemon

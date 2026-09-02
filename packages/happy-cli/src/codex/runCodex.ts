@@ -100,6 +100,7 @@ import {
 } from '@/utils/initialPrompt';
 import { registerCodexSteerHandler } from './codexSteerHandler';
 import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
+import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
@@ -247,6 +248,16 @@ export async function runCodex(opts: {
             sessionId: response.id,
             sandboxConfig,
             env: process.env,
+            checkpointEvents: sandboxConfig?.checkpointProtection
+                ? createCheckpointEventPublisher({
+                    token: opts.credentials.token,
+                    sessionId: response.id,
+                    encryption: {
+                        encryptionKey: response.encryptionKey,
+                        encryptionVariant: response.encryptionVariant,
+                    },
+                })
+                : undefined,
         })
         : { sandboxConfig };
 

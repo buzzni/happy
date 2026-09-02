@@ -61,6 +61,7 @@ import {
     resolveSaycodeAppendSystemPromptForMessage,
 } from '@/prompt/promptProvenance';
 import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
+import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -286,6 +287,16 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     if (sandboxConfig?.checkpointProtection && (options.startingMode ?? 'local') !== 'remote') {
         throw new Error('checkpoint protection supports Claude remote mode only');
     }
+    const checkpointEvents = sandboxConfig?.checkpointProtection
+        ? createCheckpointEventPublisher({
+            token: credentials.token,
+            sessionId: response.id,
+            encryption: {
+                encryptionKey: response.encryptionKey,
+                encryptionVariant: response.encryptionVariant,
+            },
+        })
+        : undefined;
     const checkpointComposition = await createCheckpointSessionComposition({
         provider: 'claude-remote',
         platform: process.platform,
@@ -293,6 +304,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         sessionId: response.id,
         sandboxConfig,
         env: process.env,
+        checkpointEvents,
     });
 
     // SDK metadata (tools, slash commands) is now extracted from the

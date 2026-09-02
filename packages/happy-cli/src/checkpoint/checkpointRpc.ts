@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { access } from 'node:fs/promises';
 import { z } from 'zod';
 import type { CheckpointProtectionState } from './checkpointContract';
+import type { CheckpointEventPublisher } from './checkpointEventPublisher';
 import {
     CheckpointProtectionStateStore,
     type CheckpointPendingDecision,
@@ -99,6 +100,7 @@ export type CheckpointRpcHandlers = {
 export function createCheckpointRpcHandlers(input: {
     checkpointRoot: string;
     resolveAuthority(sessionId: string): Promise<CheckpointRpcSessionAuthority | null>;
+    resolveEventPublisher(sessionId: string): Promise<Pick<CheckpointEventPublisher, 'rewind'> | null>;
     restoreExecutor?: CheckpointRestoreExecutor;
 }): CheckpointRpcHandlers {
     const restoreExecutor = input.restoreExecutor ?? new CheckpointRestoreExecutor(input.checkpointRoot);
@@ -155,6 +157,8 @@ export function createCheckpointRpcHandlers(input: {
             if (authority.protection.status !== 'protected') {
                 throw new Error('checkpoint RPC mutation requires protected status');
             }
+            const eventPublisher = await input.resolveEventPublisher(request.sessionId);
+            if (!eventPublisher) throw new Error('checkpoint event publisher is unavailable');
             const result = await restoreExecutor.execute({
                 sessionId: authority.sessionId,
                 projectId: authority.projectId,
@@ -169,6 +173,7 @@ export function createCheckpointRpcHandlers(input: {
                 excludedPaths: authority.excludedPaths,
                 excludedPatterns: authority.excludedPatterns,
             });
+            await publishRewindResult(eventPublisher, request, result);
             return {
                 schemaVersion: 1 as const,
                 operationId: request.operationId,
@@ -181,6 +186,8 @@ export function createCheckpointRpcHandlers(input: {
             if (authority.protection.status !== 'protected') {
                 throw new Error('checkpoint RPC mutation requires protected status');
             }
+            const eventPublisher = await input.resolveEventPublisher(request.sessionId);
+            if (!eventPublisher) throw new Error('checkpoint event publisher is unavailable');
             const result = await restoreExecutor.execute({
                 sessionId: authority.sessionId,
                 projectId: authority.projectId,
@@ -195,6 +202,7 @@ export function createCheckpointRpcHandlers(input: {
                 excludedPaths: authority.excludedPaths,
                 excludedPatterns: authority.excludedPatterns,
             });
+            await publishRewindResult(eventPublisher, request, result);
             return {
                 schemaVersion: 1 as const,
                 operationId: request.operationId,
@@ -230,6 +238,35 @@ export function createCheckpointRpcHandlers(input: {
             };
         },
     };
+}
+
+async function publishRewindResult(
+    publisher: Pick<CheckpointEventPublisher, 'rewind'>,
+    request: z.infer<typeof executeRequestSchema>,
+    result: Awaited<ReturnType<CheckpointRestoreExecutor['execute']>>,
+): Promise<void> {
+    if (result.status !== 'completed' && result.status !== 'partial') return;
+    const files = result.entries.map((entry, index) => {
+        const planEntry = request.plan.entries[index];
+        if (!planEntry || planEntry.path !== entry.path || planEntry.action !== entry.action) {
+            throw new Error('checkpoint restore result does not match its confirmed plan');
+        }
+        if (planEntry.action === 'restore') {
+            return {
+                path: planEntry.path,
+                action: planEntry.reason === 'agent-deleted' ? 'created' as const : 'modified' as const,
+            };
+        }
+        if (planEntry.action === 'delete') return { path: planEntry.path, action: 'deleted' as const };
+        if (planEntry.action === 'skip') return { path: planEntry.path, action: 'skipped' as const };
+        return { path: planEntry.path, action: 'conflict' as const };
+    });
+    await publisher.rewind({
+        operationId: request.operationId,
+        checkpointId: request.plan.checkpointId,
+        state: result.status,
+        files,
+    });
 }
 
 async function listOwnedCheckpoints(

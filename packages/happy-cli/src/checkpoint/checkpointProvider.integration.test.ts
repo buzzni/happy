@@ -9,6 +9,11 @@ import { CHECKPOINT_SPAWN_CONTEXT_ENV_KEY } from './checkpointSpawnContext';
 import { createCheckpointSessionComposition } from './checkpointSessionComposition';
 
 const providerSmokeEnabled = process.env.HAPPY_RUN_CHECKPOINT_PROVIDER_SMOKE === '1';
+const checkpointEvents = {
+    snapshot: async () => ({
+        id: 'event-1', seq: 1, createdAt: Date.now(), idempotent: false,
+    }),
+};
 
 describe.skipIf(process.platform !== 'darwin' || !providerSmokeEnabled)(
     'checkpoint protected provider smoke',
@@ -64,6 +69,7 @@ describe.skipIf(process.platform !== 'darwin' || !providerSmokeEnabled)(
                         checkpointRoot,
                     }),
                 },
+                checkpointEvents,
             });
             client = new CodexAppServerClient(
                 composition.sandboxConfig,
@@ -133,6 +139,7 @@ describe.skipIf(process.platform !== 'darwin' || !providerSmokeEnabled)(
                         checkpointRoot,
                     }),
                 },
+                checkpointEvents,
             });
             const mode: EnhancedMode = {
                 permissionMode: 'bypassPermissions',

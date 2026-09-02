@@ -8,6 +8,7 @@ import type { QueryOptions } from '@/claude/sdk';
 import { createCheckpointRuntime } from './checkpointRuntime';
 import { readCheckpointSpawnContext } from './checkpointSpawnContext';
 import { CheckpointPolicyDriftError, type CheckpointProvider } from './checkpointExclusionPolicy';
+import type { CheckpointEventPublisher } from './checkpointEventPublisher';
 import { CheckpointProtectionStateStore } from './checkpointProtectionState';
 import { CheckpointTurnWorkspace } from './checkpointTurnWorkspace';
 import { CheckpointTurnApplier, type CheckpointTurnApplyResult } from './checkpointTurnApply';
@@ -38,6 +39,7 @@ export async function createCheckpointSessionComposition(input: {
     sessionId: string;
     sandboxConfig: SandboxConfig | undefined;
     env: Record<string, string | undefined>;
+    checkpointEvents?: Pick<CheckpointEventPublisher, 'snapshot'>;
 }): Promise<CheckpointSessionComposition> {
     const inputSandboxConfig = input.sandboxConfig;
     const protection = inputSandboxConfig?.checkpointProtection;
@@ -81,6 +83,10 @@ export async function createCheckpointSessionComposition(input: {
     if (runtime.status !== 'protected') {
         const reason = runtime.status === 'unavailable' ? runtime.reason : 'disabled';
         throw new Error(`checkpoint protection unavailable: ${reason}`);
+    }
+    const checkpointEvents = input.checkpointEvents;
+    if (!checkpointEvents) {
+        throw new Error('checkpoint protection requires a durable event publisher');
     }
 
     const turnWorkspace = new CheckpointTurnWorkspace(canonicalCheckpointRoot);
@@ -153,6 +159,14 @@ export async function createCheckpointSessionComposition(input: {
             }
             throw error;
         }
+        await checkpointEvents.snapshot({
+            operationId,
+            checkpointId: snapshot.checkpointId,
+            excluded: runtime.excludedPaths.map((path) => ({
+                path,
+                reason: excludedReasonFor(runtime, path),
+            })),
+        });
         const workspace = await turnWorkspace.prepare({
             ...workspaceBinding,
             operationId,

@@ -12,6 +12,11 @@ import { createCheckpointSessionComposition } from './checkpointSessionCompositi
 import { CheckpointTurnWorkspace } from './checkpointTurnWorkspace';
 
 const execAsync = promisify(exec);
+const checkpointEvents = {
+    snapshot: async () => ({
+        id: 'event-1', seq: 1, createdAt: Date.now(), idempotent: false,
+    }),
+};
 
 describe.skipIf(process.platform !== 'darwin')('checkpoint macOS sandbox enforcement', () => {
     let projectPath: string;
@@ -99,6 +104,7 @@ describe.skipIf(process.platform !== 'darwin')('checkpoint macOS sandbox enforce
                     checkpointRoot,
                 }),
             },
+            checkpointEvents,
         });
         if (!composition.beforeTurn || !composition.completeTurn || !composition.sandboxConfig) {
             throw new Error('expected protected composition');
@@ -161,6 +167,7 @@ describe.skipIf(process.platform !== 'darwin')('checkpoint macOS sandbox enforce
                     checkpointRoot,
                 }),
             },
+            checkpointEvents,
         });
         const turn = await composition.beforeTurn?.();
         if (!turn?.sandboxConfig) throw new Error('expected protected turn');

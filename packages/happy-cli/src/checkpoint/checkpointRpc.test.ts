@@ -1,7 +1,7 @@
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CheckpointLedger } from './checkpointLedger';
 import { createCheckpointRpcHandlers } from './checkpointRpc';
 import { CheckpointProtectionStateStore } from './checkpointProtectionState';
@@ -30,11 +30,17 @@ describe('checkpoint daemon RPC', () => {
         await rm(fixtureRoot, { recursive: true, force: true });
     });
 
-    function createHandlers(restoreExecutor?: CheckpointRestoreExecutor) {
+    function createHandlers(
+        restoreExecutor?: CheckpointRestoreExecutor,
+        rewind = vi.fn(async () => ({
+            id: 'event-1', seq: 1, createdAt: Date.now(), idempotent: false,
+        })),
+    ) {
         const protectionState = new CheckpointProtectionStateStore(checkpointRoot);
         return createCheckpointRpcHandlers({
             checkpointRoot,
             ...(restoreExecutor ? { restoreExecutor } : {}),
+            resolveEventPublisher: async () => ({ rewind }),
             resolveAuthority: async (sessionId) => {
                 if (sessionId !== authority.sessionId) return null;
                 const state = await protectionState.read({ ...authority, projectPath });
@@ -52,6 +58,7 @@ describe('checkpoint daemon RPC', () => {
     function createUnavailableHandlers() {
         return createCheckpointRpcHandlers({
             checkpointRoot,
+            resolveEventPublisher: async () => null,
             resolveAuthority: async () => ({
                 ...authority,
                 projectPath,
@@ -301,6 +308,46 @@ describe('checkpoint daemon RPC', () => {
             .resolves.toBe('agent version\n');
     });
 
+    it('rejects before filesystem mutation when the durable event publisher is unavailable', async () => {
+        const checkpointId = await createAgentModifiedCheckpoint();
+        const preview = await createHandlers().preview({
+            schemaVersion: 1,
+            ...authority,
+            checkpointId,
+        });
+        let mutations = 0;
+        const handlers = createCheckpointRpcHandlers({
+            checkpointRoot,
+            restoreExecutor: new CheckpointRestoreExecutor(checkpointRoot, {
+                mutate: async (mutation) => {
+                    mutations += 1;
+                    await mutation.apply();
+                },
+            }),
+            resolveEventPublisher: async () => null,
+            resolveAuthority: async () => ({
+                ...authority,
+                projectPath,
+                protection: { status: 'protected' },
+                pendingDecision: null,
+                excludedPaths: [],
+                excludedPatterns: [],
+            }),
+        });
+
+        await expect(handlers.execute({
+            schemaVersion: 1,
+            ...authority,
+            operationId: 'restore-no-event-publisher',
+            confirmed: true,
+            plan: preview,
+        })).rejects.toThrow('event publisher is unavailable');
+
+        expect(mutations).toBe(0);
+        await expect(readFile(join(projectPath, 'tracked.txt'), 'utf8'))
+            .resolves.toBe('agent version\n');
+    });
+
     it('executes the exact confirmed preview through the restore executor', async () => {
         const checkpointId = await createAgentModifiedCheckpoint();
         const handlers = createHandlers();
@@ -326,6 +373,45 @@ describe('checkpoint daemon RPC', () => {
 
         await expect(readFile(join(projectPath, 'tracked.txt'), 'utf8'))
             .resolves.toBe('before\n');
+    });
+
+    it('retries a completed rewind event after a lost acknowledgement without repeating mutation', async () => {
+        const checkpointId = await createAgentModifiedCheckpoint();
+        let mutations = 0;
+        const restoreExecutor = new CheckpointRestoreExecutor(checkpointRoot, {
+            mutate: async (mutation) => {
+                mutations += 1;
+                await mutation.apply();
+            },
+        });
+        const rewind = vi.fn()
+            .mockRejectedValueOnce(new Error('checkpoint event acknowledgement lost'))
+            .mockResolvedValueOnce({
+                id: 'event-existing', seq: 9, createdAt: Date.now(), idempotent: true,
+            });
+        const handlers = createHandlers(restoreExecutor, rewind);
+        const plan = await handlers.preview({ schemaVersion: 1, ...authority, checkpointId });
+        const request = {
+            schemaVersion: 1,
+            ...authority,
+            operationId: 'restore-event-retry',
+            confirmed: true,
+            plan,
+        };
+
+        await expect(handlers.execute(request)).rejects.toThrow('acknowledgement lost');
+        await expect(readFile(join(projectPath, 'tracked.txt'), 'utf8')).resolves.toBe('before\n');
+        await expect(handlers.retry(request)).resolves.toMatchObject({ status: 'completed' });
+
+        expect(mutations).toBe(1);
+        expect(rewind).toHaveBeenCalledTimes(2);
+        expect(rewind.mock.calls[1]?.[0]).toEqual(rewind.mock.calls[0]?.[0]);
+        expect(rewind.mock.calls[0]?.[0]).toMatchObject({
+            operationId: 'restore-event-retry',
+            checkpointId,
+            state: 'completed',
+            files: [{ path: 'tracked.txt', action: 'modified' }],
+        });
     });
 
     it('rejects a stale preview after a concurrent user edit', async () => {
