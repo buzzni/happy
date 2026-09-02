@@ -56,7 +56,7 @@ cascade removes the aggregate, matching the scheduled-automation lifecycle.
 The daemon owns:
 
 - payload and session-message decryption;
-- target validation against the project workspace, encrypted payload directory, and locally tracked session directory;
+- target validation of the encrypted payload directory against the locally tracked session directory (see the 2026-09-02 amendment);
 - agent-turn completion and explicit user-intervention detection;
 - parsing the last structured review JSON and mapping it to `CONTINUE` or a safe terminal code;
 - encrypting the next prompt and resuming the same local session when required.
@@ -171,3 +171,22 @@ Migration `20260901090000_add_session_followups` creates the aggregate, durable 
 ## Consequences
 
 Desktop can exit completely after starting the action. The server and daemon continue safely through daemon restarts, claim retries, and temporary disconnects. The cost is a dedicated aggregate and daemon execution path, which keeps scheduled-run semantics stable and makes the E2EE boundary explicit.
+
+## Amendment 2026-09-02: no project-workspace binding
+
+The original design required `project.config.workspaceDir` at creation and made
+the daemon demand `workspaceDir == payload.directory == session.directory`.
+In production that invariant never held: Desktop only writes `workspaceDir`
+for projects created from an existing folder (0 of 50 projects had one), and
+worktree sessions run outside the project root by design. Every follow-up
+start was therefore rejected with `automation-target-unavailable` after
+Desktop had already sent round 1, so the loop stopped after a single round.
+
+Decision: creation no longer requires `workspaceDir` (scheduled automations
+never did), and the daemon binds only on the tracked session directory
+matching the payload directory. `projectWorkspaceDir` stays in the daemon view
+for wire compatibility but is no longer consulted. The lost check was only a
+weak cross-project heuristic — the server has no session→project link, and an
+editor can already run arbitrary prompts on the target machine — so the
+authorization boundary is unchanged: project editor role, machine ownership,
+key versions, and an active session owned by the machine account.

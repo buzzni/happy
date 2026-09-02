@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  applyWorktreeRequestFromDispatchInput,
   ensureAgentTaskReviewObjects,
+  readWorkspaceHeadSha,
   reviewShasFromDispatchInput,
   reviewWorktreeRequestFromDispatchInput,
 } from './agentTaskReviewObjects';
@@ -120,5 +122,47 @@ describe('reviewWorktreeRequestFromDispatchInput', () => {
   it('ignores an input that carries no review target', () => {
     expect(reviewWorktreeRequestFromDispatchInput(null)).toBeNull();
     expect(reviewWorktreeRequestFromDispatchInput({ reviewedHeadSha: head })).toBeNull();
+  });
+});
+
+describe('applyWorktreeRequestFromDispatchInput', () => {
+  const head = 'b'.repeat(40);
+
+  it('reads the reviewed head that review_apply names differently from pr_review', () => {
+    expect(applyWorktreeRequestFromDispatchInput({ prNumber: 12896, reviewedHeadSha: head }))
+      .toEqual({ pullRequest: { number: 12896, expectedHeadSha: head } });
+  });
+
+  it('ignores an input without a usable pull request or reviewed head', () => {
+    expect(applyWorktreeRequestFromDispatchInput(null)).toBeNull();
+    expect(applyWorktreeRequestFromDispatchInput({ reviewedHeadSha: head })).toBeNull();
+    expect(applyWorktreeRequestFromDispatchInput({ prNumber: 12896 })).toBeNull();
+    expect(applyWorktreeRequestFromDispatchInput({ prNumber: 0, reviewedHeadSha: head })).toBeNull();
+    expect(applyWorktreeRequestFromDispatchInput({ prNumber: 12896, reviewedHeadSha: 'not-a-sha' }))
+      .toBeNull();
+  });
+});
+
+describe('readWorkspaceHeadSha', () => {
+  const head = 'c'.repeat(40);
+
+  it('reports the current commit of the workspace', async () => {
+    const runCommand = vi.fn(async () => ({ ok: true as const, stdout: `${head}\n` }));
+    await expect(readWorkspaceHeadSha({ directory: '/repo', runCommand })).resolves.toBe(head);
+    expect(runCommand).toHaveBeenCalledWith(expect.objectContaining({
+      executable: 'git', args: ['rev-parse', 'HEAD'], cwd: '/repo',
+    }));
+  });
+
+  it('reports null when the workspace has no readable commit', async () => {
+    const runCommand = vi.fn(async () => ({ ok: false as const, error: 'not a git repository' }));
+    await expect(readWorkspaceHeadSha({ directory: '/repo', runCommand })).resolves.toBeNull();
+  });
+
+  // `git rev-parse HEAD` 는 태어나지 않은 브랜치에서 종료 코드와 무관하게 'HEAD' 를
+  // 그대로 뱉는다. 이걸 커밋으로 믿으면 리뷰 SHA 와 비교하는 판정이 무의미해진다.
+  it('reports null when the output is not a commit object name', async () => {
+    const runCommand = vi.fn(async () => ({ ok: true as const, stdout: 'HEAD\n' }));
+    await expect(readWorkspaceHeadSha({ directory: '/repo', runCommand })).resolves.toBeNull();
   });
 });

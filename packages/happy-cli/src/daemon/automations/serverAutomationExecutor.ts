@@ -23,6 +23,8 @@ import {
   ensureAgentTaskReviewObjects,
   reviewShasFromDispatchInput,
   reviewWorktreeRequestFromDispatchInput,
+  applyWorktreeRequestFromDispatchInput,
+  readWorkspaceHeadSha,
 } from './agentTaskReviewObjects'
 import { shouldGiveUpWorktreeCleanup } from './worktreeCleanupGiveUp'
 import type { GithubTriggerWorktreePlan } from './githubTriggerWorktree'
@@ -144,6 +146,11 @@ export interface ServerAutomationExecutorInput {
     shas: string[]
     environmentVariables?: Record<string, string>
   }) => Promise<{ ok: true; fetched: string[] } | { ok: false; error: string }>
+  /**
+   * review_apply 를 사용자 세션에서 재개해도 되는지 판정하기 위해 워크스페이스의
+   * 현재 HEAD 를 읽는다. 읽지 못하면 null 이고, 그때는 재개하지 않는다.
+   */
+  readHeadSha?: (input: { directory: string }) => Promise<string | null>
   resolveMcpSpawnContext: (input: {
     runId: string
     claimToken: string
@@ -216,9 +223,14 @@ export const MAX_GITHUB_EVENTS_PER_TICK = 3
 export const MAX_GITHUB_WORKER_SESSIONS = 6
 const DIRTY_WORKTREE_RETRY_MS = 15 * 60_000
 const WORKTREE_CLEANUP_RETRY_MS = 60_000
+// 리뷰 worktree 는 대상 head 로만 체크아웃된 일회용 디렉토리다. 'strict' 는 그
+// 세션 경로만 쓰기 가능하게 하므로, 워커가 여기에 의존성을 설치해 대상 SHA 의
+// 테스트를 돌릴 수 있으면서도 저장소 밖으로는 여전히 나가지 못한다.
+// 2026-09-01 검증 전까지는 'custom' + 빈 목록이라 node_modules 조차 만들지 못해
+// 모든 테스트가 not_run 으로 끝났다.
 const PR_REVIEW_SANDBOX_CONFIG = JSON.stringify({
   enabled: true,
-  sessionIsolation: 'custom',
+  sessionIsolation: 'strict',
   customWritePaths: [],
   denyReadPaths: ['~/.ssh', '~/.aws', '~/.gnupg'],
   extraWritePaths: ['/tmp'],
@@ -277,7 +289,17 @@ function buildAgentTaskPrompt(
     'Use APLUS_AGENT_TASK_URL and the capability environment variables. Never print or echo the token values.',
     '1. POST $APLUS_AGENT_TASK_URL/$APLUS_AGENT_TASK_ID/start with version=1, token=$APLUS_AGENT_TASK_CLAIM_TOKEN, agentRunId=$APLUS_AGENT_TASK_RUN_ID, and a stable idempotencyKey.',
     '2. Keep the lease alive while working by POSTing /heartbeat at least every 30 seconds with the claim token.',
-    '3. Perform only the task. PR review is read-only. Before review_apply, verify the PR is open and current HEAD equals reviewedHeadSha; otherwise return stale/failed without mutating. review_apply may then edit, test, commit, and push; testing runs checks only.',
+    // 2026-09-01 프로덕션 — worktree 를 받고도 vitest 를 못 찾아 검사를 전부 포기했다.
+    // 이유는 워커가 지시를 정확히 지켰기 때문이다: "PR review is read-only" 라고만
+    // 하면 빈 worktree 에 의존성을 설치해도 되는지 알 수 없다. 무엇이 금지인지를
+    // PR 변경으로 좁히고, 설치는 허용하되 실패를 조용히 넘기지 못하게 한다.
+    '3. Perform only the task. PR review must not change the pull request — never commit, push, or edit tracked files —'
+      + ' but its worktree is a throwaway checkout of the reviewed head, so it may install dependencies and run checks there.'
+      + ' The worktree starts empty: install with the repository package manager using --ignore-scripts, plus any'
+      + ' build step the repository requires for its workspace packages, before running'
+      + ' targeted checks, and if the install fails record the affected check as not_run with the reason instead of dropping it.'
+      + ' Before review_apply, verify the PR is open and current HEAD equals reviewedHeadSha; otherwise return stale/failed'
+      + ' without mutating. review_apply may then edit, test, commit, and push; testing runs checks only.',
     `4. Complete with exactly this result shape: ${AGENT_TASK_RESULT_CONTRACTS[dispatch.type]}`,
     '5. POST /complete with version=1, token=$APLUS_AGENT_TASK_COMPLETE_TOKEN, agentRunId, a stable idempotencyKey, and result.',
     // 2026-08-31 프로덕션 — pr_review 워커가 리뷰를 끝내고도 결과를 제출하지 못했다.
@@ -1193,6 +1215,30 @@ async function executeStartedRun(
             )
           }
         }
+      } else if (bridged.dispatch.type === 'review_apply.v1') {
+        // 사용자 세션 재개는 원 리뷰 대화의 맥락과 "내 세션에서 고쳐진다" 는 가시성을
+        // 준다. 다만 그 디렉터리가 리뷰 대상 head 가 아니면 계약상 apply 는 mutate 없이
+        // stale 로 끝난다 — 사용자가 PR 을 올린 뒤 계속 일하는 정상 흐름이 곧 실패
+        // 조건이라, 지금까지 대부분의 apply 가 아무것도 반영하지 못했다.
+        const applyRequest = applyWorktreeRequestFromDispatchInput(bridged.dispatch.input)
+        if (applyRequest) {
+          const headSha = await (input.readHeadSha ?? readWorkspaceHeadSha)({
+            directory: payload.directory,
+          })
+          // 읽지 못한 경우도 어긋난 것으로 다룬다. 모르는 채로 사용자 디렉터리에서
+          // 시작하면 우리가 고치려는 그 조용한 stale 로 되돌아간다.
+          if (headSha !== applyRequest.pullRequest.expectedHeadSha) {
+            input.logDebug?.(
+              `[server-automation] ${automation.automationId} applying review findings in a worktree`
+              + ` — ${payload.directory} is at ${headSha ?? 'an unreadable HEAD'},`
+              + ` not the reviewed ${applyRequest.pullRequest.expectedHeadSha}`,
+            )
+            githubWorktreeRequest = {
+              ...applyRequest,
+              ...(query.githubEnvironment ? { githubEnvironment: query.githubEnvironment } : {}),
+            }
+          }
+        }
       }
       prompt = buildAgentTaskPrompt(bridged.dispatch, payload.prompt)
       environmentVariables = {
@@ -1383,7 +1429,6 @@ async function executeStartedRun(
     ...(payload.model ? { model: payload.model } : {}),
     ...(payload.effort ? { effort: payload.effort } : {}),
     ...(agentTaskDispatch ? { filterInheritedCredentials: true } : {}),
-    ...(agentTaskDispatch?.type === 'pr_review.v1' ? { permissionMode: 'read-only' as const } : {}),
     ...(environmentVariables ? { environmentVariables } : {}),
     ...(spawnMcpContext ? { mcpSpawnContext: spawnMcpContext } : {}),
     ...(expectedConnectors && expectedConnectors.length > 0 ? { expectedConnectors } : {}),
@@ -1392,7 +1437,9 @@ async function executeStartedRun(
   let associateSpawnedSession = true
   if (agentTaskDispatch?.type === 'review_apply.v1'
       && agentTaskDispatch.targetSessionId
-      && environmentVariables) {
+      && environmentVariables
+      // worktree 를 준비했다면 사용자 디렉터리가 리뷰 대상 head 가 아니라는 뜻이다.
+      && !githubWorktree) {
     const resumed = await input.resumeSession({
       sessionId: agentTaskDispatch.targetSessionId,
       directory: payload.directory,

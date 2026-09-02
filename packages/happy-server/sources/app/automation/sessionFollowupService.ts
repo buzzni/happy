@@ -115,11 +115,9 @@ export async function createSessionFollowup(
     const projectAccess = await access(tx, actorId, projectId);
     if (!projectAccess) return { ok: false, error: 'not-found' };
     if (!projectAccess.canEdit) return { ok: false, error: 'forbidden' };
-    if (!projectAccess.project.config || typeof projectAccess.project.config !== 'object'
-        || typeof projectAccess.project.config.workspaceDir !== 'string'
-        || projectAccess.project.config.workspaceDir.length === 0) {
-        return { ok: false, error: 'automation-target-unavailable' };
-    }
+    // No workspaceDir precondition: a follow-up targets an existing session, and
+    // the directory it must run in travels inside the encrypted payload. Most
+    // projects never set config.workspaceDir (the client derives one per project).
     const machine = await target(tx, projectAccess.project);
     if (!machine) return { ok: false, error: 'automation-target-unavailable' };
     if (machine.automationProtocolVersion < AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION) {

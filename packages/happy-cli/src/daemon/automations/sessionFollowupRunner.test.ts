@@ -364,6 +364,28 @@ describe('sessionFollowupRunner', () => {
     expect(transport.deliver).not.toHaveBeenCalled()
   })
 
+  it('binds to the tracked session directory alone when the project has no workspaceDir', async () => {
+    // Worktree sessions run outside the project root and most projects never
+    // set workspaceDir — the session's own directory is the binding that counts.
+    const worktree = '/workspace/project/.aplus/worktrees/project-1/branch'
+    const { input, transport, pending } = harness()
+    transport.claim = vi.fn(async (body) => ({
+      ok: true as const,
+      value: { claimToken: 'claim', followup: body.step === pending.step ? pending : action() },
+    }))
+    input.decryptPayload = vi.fn(() => ({
+      kind: 'existing-session-prompt', directory: worktree,
+      prompt: 'Review again and return JSON.', evaluator: { kind: 'review-findings-v1' },
+    } satisfies SessionFollowupPayload))
+    input.resolveSession = vi.fn(() => ({
+      sessionId: 'session-1', directory: worktree,
+      encryptionKey: new Uint8Array(32), encryptionVariant: 'dataKey', live: true,
+    } as const))
+    await runSessionFollowupTick(input)
+    expect(transport.evaluate).toHaveBeenCalledWith(expect.objectContaining({ decision: 'CONTINUE' }))
+    expect(transport.evaluate).not.toHaveBeenCalledWith(expect.objectContaining({ terminalCode: 'TARGET_MISMATCH' }))
+  })
+
   it('fails closed when a reserved delivery cannot resume the target session', async () => {
     const { input, transport } = harness()
     input.ensureSessionRunning = vi.fn(async () => ({ ok: false, error: 'resume-failed' }))

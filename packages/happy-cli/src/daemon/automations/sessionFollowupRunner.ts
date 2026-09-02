@@ -263,12 +263,10 @@ async function validateBinding(
   if (!binding || binding.sessionId !== action.sessionId) {
     return { ok: false, terminalCode: 'SESSION_UNAVAILABLE' }
   }
-  if (!action.projectWorkspaceDir) return { ok: false, terminalCode: 'TARGET_MISMATCH' }
-  const [sessionMatchesPayload, projectMatchesPayload] = await Promise.all([
-    input.sameDirectory(binding.directory, payload.directory),
-    input.sameDirectory(action.projectWorkspaceDir, payload.directory),
-  ])
-  return sessionMatchesPayload && projectMatchesPayload
+  // The tracked session directory is the only binding: projects rarely carry
+  // an explicit workspaceDir, and worktree sessions never run inside it. See
+  // docs/adr/2026-09-01-durable-existing-session-followups.md (2026-09-02).
+  return await input.sameDirectory(binding.directory, payload.directory)
     ? { ok: true, binding }
     : { ok: false, terminalCode: 'TARGET_MISMATCH' }
 }

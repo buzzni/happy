@@ -119,3 +119,42 @@ export function reviewWorktreeRequestFromDispatchInput(
   if (typeof headSha !== 'string' || !SHA_PATTERN.test(headSha)) return null;
   return { pullRequest: { number, expectedHeadSha: headSha } };
 }
+
+/**
+ * review_apply dispatch input 에서 worktree 요청을 만든다.
+ *
+ * 2026-09-01 프로덕션 — PR #12896 의 apply 가 아무것도 반영하지 못하고 stale 로
+ * 끝났다. 원격 PR 은 열려 있고 원격 head 도 리뷰 SHA 와 같았지만, 재개된 사용자
+ * 세션의 디렉터리 HEAD 는 사용자가 마지막에 둔 커밋이었다. 사용자가 PR 을 올린 뒤
+ * 계속 일하는 것이 정상이므로 이건 드문 경우가 아니라 기본 경로다.
+ *
+ * pr_review 는 `headSha`, review_apply 는 `reviewedHeadSha` 로 같은 값을 부른다.
+ * 검증 규칙은 하나로 두고 이름만 맞춰 넘긴다.
+ */
+export function applyWorktreeRequestFromDispatchInput(
+  input: unknown,
+): { pullRequest: { number: number; expectedHeadSha: string } } | null {
+  if (!input || typeof input !== 'object') return null;
+  const record = input as Record<string, unknown>;
+  return reviewWorktreeRequestFromDispatchInput({ ...record, headSha: record.reviewedHeadSha });
+}
+
+/**
+ * 워크스페이스의 현재 HEAD 커밋을 읽는다. 읽지 못하면 null 이다 — 호출부는 이를
+ * "일치하지 않는다" 로 다뤄야 한다. 모르는 채로 사용자 디렉터리에서 apply 를
+ * 시작하면 우리가 고치려는 그 조용한 stale 로 되돌아간다.
+ */
+export async function readWorkspaceHeadSha(input: {
+  directory: string;
+  runCommand?: (command: ReviewObjectCommand) => Promise<ReviewObjectCommandResult>;
+}): Promise<string | null> {
+  const runCommand = input.runCommand ?? defaultRunCommand;
+  const result = await runCommand({
+    executable: 'git',
+    args: ['rev-parse', 'HEAD'],
+    cwd: input.directory,
+  });
+  if (!result.ok) return null;
+  const sha = result.stdout.trim();
+  return SHA_PATTERN.test(sha) ? sha : null;
+}
