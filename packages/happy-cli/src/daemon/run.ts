@@ -2696,6 +2696,8 @@ export async function startDaemon(): Promise<void> {
 
       if (handoffDecision === 'defer-handoff') {
         logger.debug('[DAEMON RUN] Daemon bundle replaced on disk, waiting for runtime activity to finish before handoff');
+      } else if (handoffDecision === 'run-automations' && bundleReplaced) {
+        logger.debug('[DAEMON RUN] Daemon bundle replaced on disk; sessions still active, automations keep running until they finish');
       }
 
       if (handoffDecision === 'handoff') {
