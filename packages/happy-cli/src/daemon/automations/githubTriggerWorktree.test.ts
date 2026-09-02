@@ -207,7 +207,54 @@ describe('prepareGithubTriggerWorktree', () => {
   })
 })
 
+  // 2026-09-02 프로덕션 — 공유 .git/modules/vendor/happy/config 의 core.worktree 가
+  // 삭제된 자동화 worktree 를 가리켜 저장소의 모든 체크아웃에서 git 이 죽었다.
+  // worktree 를 만들기 전에 풀어야 한다 — 막힌 저장소에서는 worktree add 자체가
+  // 같은 오류로 실패한다.
+  it('releases dangling submodule worktree pointers before creating the worktree', async () => {
+    const order: string[] = []
+    const runCommand = vi.fn(async (command: { executable: string; args: string[] }) => {
+      order.push(`${command.executable} ${command.args.slice(0, 2).join(' ')}`)
+      return { ok: true as const, stdout: command.args[0] === 'rev-parse' ? '/repo\n' : '' }
+    })
+    const releaseSubmodulePointers = vi.fn(async () => {
+      order.push('release')
+      return { released: ['/repo/.git/modules/vendor/happy/config'] }
+    })
+
+    await prepareGithubTriggerWorktree({
+      runId: 'run-1',
+      directory: '/repo',
+      managedRoot: '/happy/automation-worktrees',
+      runCommand,
+      releaseSubmodulePointers,
+      pathExists: vi.fn(async () => true),
+      resolveRealPath: vi.fn(async (path: string) => path),
+      ensureDirectory: vi.fn(async () => undefined),
+      onPlanned: vi.fn(),
+    })
+
+    expect(releaseSubmodulePointers).toHaveBeenCalledWith({ repositoryRoot: '/repo' })
+    expect(order.indexOf('release')).toBeLessThan(order.indexOf('git worktree add'))
+  })
+
 describe('removeGithubTriggerWorktree', () => {
+  it('releases dangling submodule worktree pointers after removing the worktree', async () => {
+    const runCommand = vi.fn(async () => ({ ok: true as const, stdout: '' }))
+    const releaseSubmodulePointers = vi.fn(async () => ({ released: [] }))
+
+    const result = await removeGithubTriggerWorktree({
+      repositoryRoot: '/repo',
+      worktreePath: '/happy/automation-worktrees/abc',
+      runCommand,
+      releaseSubmodulePointers,
+      pathExists: vi.fn(async () => true),
+    })
+
+    expect(result).toEqual({ ok: true })
+    expect(releaseSubmodulePointers).toHaveBeenCalledWith({ repositoryRoot: '/repo' })
+  })
+
   it('treats an already absent worktree as cleaned without invoking git', async () => {
     const runCommand = commandRunner([])
 
