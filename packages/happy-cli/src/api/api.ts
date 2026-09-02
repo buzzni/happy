@@ -95,7 +95,11 @@ export class ApiClient {
       // codes first would let a real HTTP response be misread as a transport
       // failure.
       const errorResponse = axios.isAxiosError(error) ? error.response : undefined;
-      const errorCode = errorResponse ? undefined : connectionErrorCode(error);
+      // Only a reply-less failure is a transport failure, so classification
+      // must ignore any code attached to an HTTP response. Diagnostics should
+      // not: keep whatever code there is for the message below.
+      const transportCode = errorResponse ? undefined : connectionErrorCode(error);
+      const diagnosticCode = transportCode ?? connectionErrorCode(error);
 
       // No reply at all — a transport failure.
       //
@@ -106,11 +110,11 @@ export class ApiClient {
       // ignores the resubmitted one, so treating an ambiguous failure as
       // "offline" would leave the session encrypted under a key the app does
       // not hold — silent corruption in place of a loud failure.
-      if (isNetworkError(errorCode)) {
+      if (isNetworkError(transportCode)) {
         connectionState.fail({
           operation: 'Session creation',
           caller: 'api.getOrCreateSession',
-          errorCode,
+          errorCode: transportCode,
           url: `${configuration.serverUrl}/v1/sessions`
         });
         return null;
@@ -150,7 +154,7 @@ export class ApiClient {
       // throws that away.
       const message = error instanceof Error ? error.message : 'Unknown error';
       throw new Error(
-        `Failed to get or create session: ${errorCode ? `${errorCode} — ` : ''}${message}`,
+        `Failed to get or create session: ${diagnosticCode ? `${diagnosticCode} — ` : ''}${message}`,
         { cause: error }
       );
     }
@@ -366,24 +370,31 @@ export class ApiClient {
           return createMinimalMachine();
         }
 
-        // Any other status the server managed to return — 400 and 422 from a
+        // Any other 4xx the server managed to return — 400 and 422 from a
         // request this client built wrong, 426 for a client too old, and so on.
         // These are permanent: retrying identical bytes will fail identically,
         // and registration is attempted exactly once per process. Saying
         // "server unreachable, will retry" would be false twice over, so report
         // it as the contract problem it is. Still return a local machine rather
         // than throwing — the daemon staying up is the point of this path.
-        logger.debug(`[API] Machine registration rejected with ${status}`, errorResponse.data);
-        console.log(chalk.yellow(
-          `⚠️  The server rejected machine registration with status ${status}`
-        ));
-        console.log(chalk.yellow(
-          `   → Continuing with local-only state; this machine will not sync`
-        ));
-        console.log(chalk.yellow(
-          `   → This is a client/server mismatch rather than a network problem — please report it`
-        ));
-        return createMinimalMachine();
+        if (status >= 400) {
+          logger.debug(`[API] Machine registration rejected with ${status}`, errorResponse.data);
+          console.log(chalk.yellow(
+            `⚠️  The server rejected machine registration with status ${status}`
+          ));
+          console.log(chalk.yellow(
+            `   → Continuing with local-only state; this machine will not sync`
+          ));
+          console.log(chalk.yellow(
+            `   → This is a client/server mismatch rather than a network problem — please report it`
+          ));
+          return createMinimalMachine();
+        }
+
+        // A non-4xx status that still rejected: axios also raises
+        // ERR_BAD_RESPONSE with `response` set and a 2xx status when it cannot
+        // parse the body. Calling that a rejection would be false, so let it
+        // fall through to the throw below — the daemon guard catches it.
       }
 
       // No reply at all — a transport failure.

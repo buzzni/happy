@@ -430,6 +430,33 @@ describe('Api server error handling', () => {
             consoleSpy.mockRestore();
         });
 
+        // Guards the reordering fix: axios stamps ERR_BAD_RESPONSE on every
+        // 5xx, so classifying by code before status once made this dedicated
+        // branch unreachable and reported a real server error as a mangled
+        // reply. Without a machine-path 5xx test that could regress silently.
+        it('should return minimal machine object and report the status when the server returns 503', async () => {
+            connectionState.reset();
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+            mockPost.mockRejectedValue({
+                response: { status: 503 },
+                code: 'ERR_BAD_RESPONSE',
+                isAxiosError: true
+            });
+
+            const result = await api.getOrCreateMachine({
+                machineId: 'test-machine',
+                metadata: testMachineMetadata
+            });
+
+            expect(result.id).toBe('test-machine');
+            expect(consoleSpy).toHaveBeenCalledWith(
+                expect.stringContaining('Machine registration failed: 503')
+            );
+
+            consoleSpy.mockRestore();
+        });
+
         // A permanent rejection must not claim the server is unreachable or
         // promise a retry that never comes — registration runs once per
         // process. It still returns a local machine so the daemon lives.
