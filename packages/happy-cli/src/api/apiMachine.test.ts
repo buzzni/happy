@@ -158,6 +158,7 @@ describe('ApiMachineClient socket reconnection', () => {
             cancel: vi.fn(),
             retry: vi.fn(),
             decision: vi.fn(),
+            restart: vi.fn(),
         };
 
         client.setRPCHandlers({

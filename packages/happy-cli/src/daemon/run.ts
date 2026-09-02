@@ -195,9 +195,14 @@ import {
   injectCheckpointSpawnContext,
   readCheckpointSpawnContext,
 } from '@/checkpoint/checkpointSpawnContext';
-import { createCheckpointRpcHandlers } from '@/checkpoint/checkpointRpc';
+import {
+  createCheckpointRpcHandlers,
+  type CheckpointRpcSessionAuthority,
+} from '@/checkpoint/checkpointRpc';
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 import { resolveCheckpointSessionAuthority } from './checkpointSessionAuthority';
+import { restartCheckpointProtectedSession } from './checkpointProtectedRestart';
+import { stopServerProcess } from './stopServer';
 import { AutonomousQualityGateRunStore } from './autonomousQualityGateStore';
 import { AutonomousQualityGateDaemonRegistry } from './autonomousQualityGateRegistry';
 import {
@@ -1552,6 +1557,7 @@ export async function startDaemon(): Promise<void> {
       mcpCallerGrantEnvelope?: string;
       mcpConfigProjectId?: string;
       expectedConnectors?: string[];
+      checkpointRestart?: true;
       automation?: {
         directory: string;
         initialPrompt: string;
@@ -1595,6 +1601,24 @@ export async function startDaemon(): Promise<void> {
             code: 'SESSION_ENCRYPTION_MISSING',
             errorMessage: `Session ${happySessionId} has no stored encryption data. It was likely started before this feature was available. Restart the daemon and start a new session to enable resume.`,
           };
+        }
+        if (!options?.checkpointRestart) {
+          const checkpointAuthority = await resolveCheckpointSessionAuthority({
+            sessionId: happySessionId,
+            trackedSession: tracked,
+            checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
+            platform: process.platform,
+          });
+          if (
+            checkpointAuthority?.protection.status === 'unavailable'
+            && checkpointAuthority.protection.reason === 'excluded-path'
+          ) {
+            return {
+              type: 'error',
+              code: 'SESSION_RESUME_FAILED',
+              errorMessage: `Session ${happySessionId} requires the dedicated checkpoint restart action.`,
+            };
+          }
         }
 
         // 2026-07-23 incident: pin preflight and child to ONE identity.
@@ -1804,6 +1828,52 @@ export async function startDaemon(): Promise<void> {
     const resumeInFlight = new Map<string, Promise<ResumeSessionResult>>();
     const resumeSession = (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> =>
       shareInFlight(resumeInFlight, happySessionId, () => spawnResumedSession(happySessionId, options));
+
+    const checkpointRestartInFlight = new Map<string, Promise<void>>();
+    const restartCheckpointSession = (authority: CheckpointRpcSessionAuthority): Promise<void> =>
+      shareInFlight(checkpointRestartInFlight, authority.sessionId, async () => {
+        await restartCheckpointProtectedSession(authority, {
+          resolveTarget: async (sessionId) => {
+            const tracked = findTrackedSessionById(sessionId);
+            const sandboxConfig = tracked?.happySessionMetadataFromLocalWebhook?.sandbox;
+            const context = readCheckpointSpawnContext(tracked?.agentEnvironment ?? {});
+            if (!tracked?.directory || !tracked.encryption || !sandboxConfig || !context) return null;
+            const projectPath = await fs.realpath(tracked.directory);
+            return {
+              sessionId,
+              projectId: context.projectId,
+              worktreeId: context.worktreeId,
+              projectPath,
+              pid: tracked.pid,
+              active: pidToTrackedSession.get(tracked.pid) === tracked,
+              knownStopped: tracked.startedBy !== 'persisted',
+              sandboxConfig,
+              terminate: async () => {
+                if (pidToTrackedSession.get(tracked.pid) !== tracked) {
+                  throw new Error('checkpoint protected restart target changed before termination');
+                }
+                if (!preserveSessionForResume(tracked, 'checkpoint-protection-disabled')) {
+                  throw new Error('checkpoint protected restart cannot preserve the session');
+                }
+                await stopServerProcess({ pid: tracked.pid });
+                if (pidToTrackedSession.get(tracked.pid) === tracked) {
+                  pidToTrackedSession.delete(tracked.pid);
+                  recoveredPendingSpawnStartedAt.delete(tracked.pid);
+                  sessionStartTimes.delete(tracked.pid);
+                  pidToAdoptedAt.delete(tracked.pid);
+                  resumeCursorPersistedAt.delete(sessionId);
+                  persistTrackedSessions();
+                }
+              },
+            };
+          },
+          isProcessAlive: isPidAlive,
+          resume: (sessionId, environmentVariables) => spawnResumedSession(sessionId, {
+            environmentVariables,
+            checkpointRestart: true,
+          }),
+        });
+      });
 
     const verifyRecoveryNativeSession = async (session: ReconnectableHappySession): Promise<boolean> => {
       const metadata = session.metadata;
@@ -2590,6 +2660,7 @@ export async function startDaemon(): Promise<void> {
             encryption: trackedSession.encryption,
           });
         },
+        restartSession: restartCheckpointSession,
       }),
       // specs/daemon-spawn-project-link — a session created by `agent spawn` has no way to
       // register itself with A+ (its credential does not authenticate /api/*), so the daemon

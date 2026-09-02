@@ -35,12 +35,14 @@ describe('checkpoint daemon RPC', () => {
         rewind = vi.fn(async () => ({
             id: 'event-1', seq: 1, createdAt: Date.now(), idempotent: false,
         })),
+        restartSession = vi.fn(async () => {}),
     ) {
         const protectionState = new CheckpointProtectionStateStore(checkpointRoot);
         return createCheckpointRpcHandlers({
             checkpointRoot,
             ...(restoreExecutor ? { restoreExecutor } : {}),
             resolveEventPublisher: async () => ({ rewind }),
+            restartSession,
             resolveAuthority: async (sessionId) => {
                 if (sessionId !== authority.sessionId) return null;
                 const state = await protectionState.read({ ...authority, projectPath });
@@ -59,6 +61,7 @@ describe('checkpoint daemon RPC', () => {
         return createCheckpointRpcHandlers({
             checkpointRoot,
             resolveEventPublisher: async () => null,
+            restartSession: async () => {},
             resolveAuthority: async () => ({
                 ...authority,
                 projectPath,
@@ -226,6 +229,45 @@ describe('checkpoint daemon RPC', () => {
         });
     });
 
+    it('restarts only the exact-bound session after protection was explicitly disabled', async () => {
+        const store = new CheckpointProtectionStateStore(checkpointRoot);
+        await store.reportPending({
+            ...authority,
+            projectPath,
+            operationId: 'turn-restart',
+            source: 'policy-drift',
+            excluded: [{ path: '.env', reason: 'secret' }],
+        });
+        const restartSession = vi.fn(async () => {});
+        const handlers = createHandlers(undefined, undefined, restartSession);
+        await expect(handlers.restart({
+            schemaVersion: 1,
+            ...authority,
+            timeout: 70_000,
+        })).rejects.toThrow('requires disabled checkpoint protection');
+        await handlers.decision({
+            schemaVersion: 1,
+            ...authority,
+            operationId: 'turn-restart',
+            decision: 'disable-protection',
+        });
+
+        await expect(handlers.restart({
+            schemaVersion: 1,
+            ...authority,
+            timeout: 70_000,
+        })).resolves.toEqual({
+            schemaVersion: 1,
+            ...authority,
+            status: 'restarted',
+        });
+        expect(restartSession).toHaveBeenCalledWith(expect.objectContaining({
+            ...authority,
+            projectPath,
+            protection: { status: 'unavailable', reason: 'excluded-path' },
+        }));
+    });
+
     it('lists only checkpoint ids owned by the authoritative binding', async () => {
         const firstCheckpointId = await createAgentModifiedCheckpoint();
         const second = await new CheckpointStore(checkpointRoot).snapshotTurn({
@@ -325,6 +367,7 @@ describe('checkpoint daemon RPC', () => {
                 },
             }),
             resolveEventPublisher: async () => null,
+            restartSession: async () => {},
             resolveAuthority: async () => ({
                 ...authority,
                 projectPath,

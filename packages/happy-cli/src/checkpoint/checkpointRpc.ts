@@ -35,6 +35,10 @@ const decisionRequestSchema = cancelRequestSchema.extend({
     decision: z.enum(['cancel', 'disable-protection']),
 }).strict();
 
+const restartRequestSchema = bindingRequestSchema.extend({
+    timeout: z.literal(70_000),
+}).strict();
+
 const projectRelativePathSchema = z.string().min(1).refine((value) => (
     !value.includes('\0')
     && !/^(?:[A-Za-z]:|[\\/])/.test(value)
@@ -95,12 +99,14 @@ export type CheckpointRpcHandlers = {
     retry(params: unknown): Promise<unknown>;
     cancel(params: unknown): Promise<unknown>;
     decision(params: unknown): Promise<unknown>;
+    restart(params: unknown): Promise<unknown>;
 };
 
 export function createCheckpointRpcHandlers(input: {
     checkpointRoot: string;
     resolveAuthority(sessionId: string): Promise<CheckpointRpcSessionAuthority | null>;
     resolveEventPublisher(sessionId: string): Promise<Pick<CheckpointEventPublisher, 'rewind'> | null>;
+    restartSession(authority: CheckpointRpcSessionAuthority): Promise<void>;
     restoreExecutor?: CheckpointRestoreExecutor;
 }): CheckpointRpcHandlers {
     const restoreExecutor = input.restoreExecutor ?? new CheckpointRestoreExecutor(input.checkpointRoot);
@@ -235,6 +241,24 @@ export function createCheckpointRpcHandlers(input: {
                 projectId: authority.projectId,
                 worktreeId: authority.worktreeId,
                 ...status,
+            };
+        },
+        restart: async (params) => {
+            const request = restartRequestSchema.parse(params);
+            const authority = await resolveRequestAuthority(request);
+            if (
+                authority.protection.status !== 'unavailable'
+                || authority.protection.reason !== 'excluded-path'
+            ) {
+                throw new Error('checkpoint restart requires disabled checkpoint protection');
+            }
+            await input.restartSession(authority);
+            return {
+                schemaVersion: 1 as const,
+                sessionId: authority.sessionId,
+                projectId: authority.projectId,
+                worktreeId: authority.worktreeId,
+                status: 'restarted' as const,
             };
         },
     };

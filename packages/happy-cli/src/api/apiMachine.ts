@@ -542,6 +542,7 @@ export class ApiMachineClient {
             this.rpcHandlerManager.registerHandler('checkpoint:cancel', checkpoint.cancel);
             this.rpcHandlerManager.registerHandler('checkpoint:retry', checkpoint.retry);
             this.rpcHandlerManager.registerHandler('checkpoint:decision', checkpoint.decision);
+            this.rpcHandlerManager.registerHandler('checkpoint:restart', checkpoint.restart);
         }
 
         // Scheduled automations CRUD (specs: daemon-scheduled-automations).
