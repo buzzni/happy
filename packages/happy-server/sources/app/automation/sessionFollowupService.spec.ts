@@ -98,6 +98,19 @@ describe('sessionFollowupService', () => {
         }) });
     });
 
+    it('starts against a project that has a target machine but no explicit workspaceDir', async () => {
+        // A follow-up binds to an existing session, whose directory is already
+        // inside the encrypted payload. Projects without an explicit workspace
+        // directory (Desktop resolves one per project) are the common case.
+        const { tx, created } = makeTx();
+        tx.project.findUnique.mockResolvedValue({
+            id: 'project-1', accountId: 'owner-1', config: { machineId: 'machine-1' },
+            automationViewerKeyVersion: 2,
+        } as never);
+        await expect(createSessionFollowup(tx as never, 'editor-1', 'project-1', createInput))
+            .resolves.toEqual({ ok: true, value: created });
+    });
+
     it('refuses cross-tenant, missing, inactive, and protocol-incompatible targets', async () => {
         const crossTenant = makeTx({ sessionAccountId: 'foreign' });
         crossTenant.tx.session.findFirst.mockResolvedValue(null);
