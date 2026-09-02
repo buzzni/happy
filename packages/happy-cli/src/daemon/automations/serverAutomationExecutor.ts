@@ -320,9 +320,15 @@ function buildAgentTaskPrompt(
     'Retry network failures and 5xx responses with the same idempotencyKey; do not retry 4xx responses.',
     // 손상된 본문은 재시도로 풀리지 않지만, 조용히 끝나서도 안 된다. 4xx 를 만나면
     // 상태 코드와 응답 본문을 남겨 왜 제출이 실패했는지 사람이 볼 수 있게 한다.
-    'If /complete returns 4xx, report the status code and response body in your final message'
-      + ' before stopping, then POST /fail with the same reason.',
-    'If the work cannot complete, POST /fail with the complete token and a concise reason. Do not put capabilities in output, commits, or PR text.',
+    // 2026-09-03 프로덕션 — 워커가 리뷰를 끝내고 /complete 에서 409 를 받자 이 지시대로
+    // /fail 을 불러 task 를 failed 로 닫았다. pr_review 는 maxAttempts 1 이고 dedupe 가
+    // cycle-1 이라 그 PR 은 다시 리뷰되지 않았다. /fail 은 "결과를 못 만들었다" 는 뜻이지
+    // "제출이 막혔다" 는 뜻이 아니다 — 둘을 섞으면 끝낸 작업을 워커가 스스로 파괴한다.
+    'If /complete returns 4xx, report the status code and response body in your final message and stop.'
+      + ' Do not POST /fail when the work finished and only the submission was refused — that discards a'
+      + ' completed result the task cannot produce again. Leave the task for the server to reconcile.',
+    'POST /fail with the complete token and a concise reason only when you could not produce a result at all.'
+      + ' Do not put capabilities in output, commits, or PR text.',
   ].join('\n')
 }
 
