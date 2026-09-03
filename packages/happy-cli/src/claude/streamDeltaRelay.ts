@@ -54,7 +54,7 @@ export function createStreamDeltaRelay(opts: {
     clearTimer?: (handle: unknown) => void;
 }): StreamDeltaRelay {
     const flushMs = opts.flushMs ?? DEFAULT_STREAM_FLUSH_MS;
-    const maxBytes = opts.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
+    const maxBytes = Math.max(1, Math.floor(opts.maxBytes ?? DEFAULT_STREAM_MAX_BYTES));
     const setTimer = opts.setTimer ?? ((cb, ms) => setTimeout(cb, ms));
     const clearTimer = opts.clearTimer ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
 
@@ -78,7 +78,16 @@ export function createStreamDeltaRelay(opts: {
             const offset = sentChars.get(block.key) ?? 0;
             if (block.final) sentChars.delete(block.key);
             else sentChars.set(block.key, offset + block.text.length);
-            opts.emit({ messageId: block.messageId, index: block.index, offset, delta: block.text, final: block.final });
+            for (let start = 0; start < block.text.length; start += maxBytes) {
+                const delta = block.text.slice(start, start + maxBytes);
+                opts.emit({
+                    messageId: block.messageId,
+                    index: block.index,
+                    offset: offset + start,
+                    delta,
+                    final: block.final && start + delta.length === block.text.length,
+                });
+            }
         }
     };
 
