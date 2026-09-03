@@ -1743,6 +1743,13 @@ describe('runServerAutomationTick', () => {
     expect(spawned.initialPrompt).toMatch(/never push to the pull request'?s own branch/i)
     expect(spawned.initialPrompt).toContain('review-fix/<prNumber>-<reviewedHeadSha7>')
     expect(spawned.initialPrompt).toMatch(/base (is|=) the reviewed pull request'?s head branch/i)
+    // 2026-09-03 — 스택 PR 만 보면 어느 리뷰에서 나온 수정인지 알 수 없다. 본문에서
+    // 원본 PR 로 되돌아갈 수 있어야 한다.
+    expect(spawned.initialPrompt).toMatch(/body.*link(s)? back to the reviewed pull request/i)
+    expect(spawned.initialPrompt).toContain('https://github.com/<repository>/pull/<prNumber>')
+    // "Fixes #N" 같은 종결 키워드는 원본을 닫아 버릴 수 있다.
+    const bodyLine = spawned.initialPrompt.split('\n').find((line) => line.includes('link back to the reviewed pull request'))
+    expect(bodyLine).toMatch(/closing keyword/i)
     expect(spawned.initialPrompt).toContain('"fixBranch"')
     expect(spawned.initialPrompt).toContain('"fixPrUrl"')
     expect(spawned.initialPrompt).toContain('Retry network failures and 5xx responses')

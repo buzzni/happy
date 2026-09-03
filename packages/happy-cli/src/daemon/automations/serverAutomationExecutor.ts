@@ -271,6 +271,12 @@ const AGENT_TASK_QUALITY_CONTRACTS: Record<AutomationAgentTaskDispatch['type'], 
     '- Never push to the pull request\'s own branch. Create review-fix/<prNumber>-<reviewedHeadSha7> from reviewedHeadSha,'
       + ' commit there, push that branch, and open a stacked pull request whose base is the reviewed pull request\'s head branch'
       + ' (read it with `gh pr view <prNumber> --json headRefName`). Report fixBranch and fixPrUrl; pushUrl is the fix pull request URL.',
+    // 2026-09-03 — 스택 PR 만 보면 어느 리뷰에서 나온 수정인지 알 수 없다. 되돌아갈
+    // 링크를 본문에 넣는다. 종결 키워드(Fixes/Closes/Resolves)는 쓰지 않는다 — 수정
+    // PR 이 머지될 때 원본을 닫아 버릴 수 있다.
+    '- The stacked pull request body must link back to the reviewed pull request as'
+      + ' https://github.com/<repository>/pull/<prNumber> and name the reviewed head SHA, so a reader can return to it.'
+      + ' Use a plain reference; never a closing keyword such as Fixes, Closes, or Resolves.',
     '- Record an applied or skipped decision and reason for every finding, plus all passed, failed, blocked, or not-run checks.',
   ].join('\n'),
   'testing.v1': '',
