@@ -175,11 +175,21 @@ export function observeFollowupTurn(messages: Array<{ seq: number; localId: stri
   return { observedSeq, complete, failed, userIntervened, agentTexts }
 }
 
-const COMPLETION_SIGNAL_OPEN_RE = /<saycode-complete\b(?=[^>]*\bstatus\s*=\s*"(?:completed|blocked)")[^>]*>/gi
+const COMPLETION_SIGNAL_OPEN_RE = /<saycode-complete\b([^>]*)>/gi
+const COMPLETION_SIGNAL_ATTRIBUTE_RE = /([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*"([^"]*)"/g
 const COMPLETION_SIGNAL_CLOSE = '</saycode-complete>'
+
+function hasValidCompletionStatus(rawAttributes: string): boolean {
+  let status: string | null = null
+  for (const match of rawAttributes.matchAll(COMPLETION_SIGNAL_ATTRIBUTE_RE)) {
+    if (match[1]!.toLowerCase() === 'status') status = match[2]!.toLowerCase()
+  }
+  return status === 'completed' || status === 'blocked'
+}
 
 function terminalCompletionSignalStart(text: string): number | null {
   const openings = [...text.matchAll(COMPLETION_SIGNAL_OPEN_RE)]
+    .filter((match) => hasValidCompletionStatus(match[1]!))
   if (openings.length !== 1) return null
   const opening = openings[0]!
   const start = opening.index ?? 0

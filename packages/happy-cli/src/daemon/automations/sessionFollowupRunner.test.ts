@@ -183,6 +183,16 @@ describe('sessionFollowupRunner', () => {
     ])).toEqual({ kind: 'continue' })
   })
 
+  it.each([
+    ['a similarly named attribute', '<saycode-complete data-status="completed">Done.</saycode-complete>'],
+    ['a later invalid duplicate status', '<saycode-complete status="completed" status="done">Done.</saycode-complete>'],
+  ])('fails closed on a completion signal with %s', (_name, signal) => {
+    expect(evaluateReviewFindings([
+      '{"findings":[{"severity":"medium"}]}\n',
+      signal,
+    ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
+  })
+
   it('fails closed when two complete raw review responses are concatenated', () => {
     expect(evaluateReviewFindings([
       '{"findings":[{"severity":"medium"}]}\n',
