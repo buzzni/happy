@@ -6,6 +6,9 @@ type StreamBlock = {
     final: boolean;
 };
 
+export const SESSION_STREAM_PREVIEW_MAX_CHARS = 256 * 1_024;
+export const SESSION_STREAM_PREVIEW_MAX_BLOCKS = 256;
+
 export type SessionStreamPreviewState = {
     messageId: string;
     createdAt: number;
@@ -26,6 +29,9 @@ export function reduceSessionStreamPreview(
         if (frame.offset !== 0) {
             return { messageId: frame.messageId, createdAt, blocks: null };
         }
+        if (frame.delta.length > SESSION_STREAM_PREVIEW_MAX_CHARS) {
+            return { messageId: frame.messageId, createdAt, blocks: null };
+        }
         return {
             messageId: frame.messageId,
             createdAt,
@@ -41,6 +47,16 @@ export function reduceSessionStreamPreview(
 
     const block = current.blocks[frame.index];
     if ((block?.text.length ?? 0) !== frame.offset || block?.final === true) {
+        return { ...current, blocks: null };
+    }
+
+    const blockCount = Object.keys(current.blocks).length + (block ? 0 : 1);
+    const characterCount = Object.values(current.blocks)
+        .reduce((total, existingBlock) => total + existingBlock.text.length, frame.delta.length);
+    if (
+        blockCount > SESSION_STREAM_PREVIEW_MAX_BLOCKS
+        || characterCount > SESSION_STREAM_PREVIEW_MAX_CHARS
+    ) {
         return { ...current, blocks: null };
     }
 
