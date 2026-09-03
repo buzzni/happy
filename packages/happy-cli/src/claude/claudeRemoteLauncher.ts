@@ -22,6 +22,7 @@ import type { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
+import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
 
 interface PermissionsField {
     date: number;
@@ -350,6 +351,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         },
                     } : undefined,
                     hookSettingsPath: session.hookSettingsPath,
+                    sandbox: session.checkpointComposition?.claudeSandbox,
+                    beforeTurn: session.checkpointComposition?.beforeTurn,
+                    completeTurn: session.checkpointComposition?.completeTurn,
                     jsRuntime: session.jsRuntime,
                     canCallTool: permissionHandler.handleToolCall,
                     isAborted: (toolCallId: string) => {
@@ -515,7 +519,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 logger.debug('[remote]: launch error', e);
                 if (!exitReason) {
                     session.client.closeClaudeSessionTurn('failed');
-                    session.client.sendSessionEvent({ type: 'message', message: 'Process exited unexpectedly' });
+                    session.client.sendSessionEvent({
+                        type: 'message',
+                        message: describeCheckpointFailure(e) ?? 'Process exited unexpectedly',
+                    });
                     continue;
                 }
             } finally {

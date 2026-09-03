@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { createChangeTitleHandler, startHappyServer } from './startHappyServer';
 import type { ApiSessionClient } from '@/api/apiSession';
@@ -219,6 +222,40 @@ describe('startHappyServer tool registration', () => {
             expect(updater({}).summary.branchSlug).toBe('fix-login-bug');
         } finally {
             server.stop();
+        }
+    });
+
+    it('forces protected bash_stream writes into the active turn workspace', async () => {
+        const fixtureRoot = await mkdtemp(join(tmpdir(), 'happy-protected-mcp-'));
+        const originalPath = join(fixtureRoot, 'original');
+        const workspacePath = join(fixtureRoot, 'workspace');
+        await Promise.all([mkdir(originalPath), mkdir(workspacePath)]);
+        const client = {
+            hasTitle: () => false,
+            sendClaudeSessionMessage: vi.fn(),
+            sessionId: 'test',
+        } as unknown as ApiSessionClient;
+        const trackProtectedBashProcess = vi.fn();
+        const server = await startHappyServer(client, {
+            protectedBashCwd: () => workspacePath,
+            trackProtectedBashProcess,
+        });
+        try {
+            const payload = await callTool(server.url, 5, 'bash_stream', {
+                command: 'printf isolated > mutation.txt; pwd',
+                cwd: originalPath,
+            });
+
+            expect(payload.result.isError).toBe(false);
+            const reportedCwd = payload.result.content[0].text.split('\n')[0];
+            await expect(realpath(reportedCwd)).resolves.toBe(await realpath(workspacePath));
+            await expect(readFile(join(workspacePath, 'mutation.txt'), 'utf8')).resolves.toBe('isolated');
+            await expect(readFile(join(originalPath, 'mutation.txt'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+            expect(trackProtectedBashProcess).toHaveBeenCalledOnce();
+            expect(trackProtectedBashProcess.mock.calls[0][0].pid).toEqual(expect.any(Number));
+        } finally {
+            server.stop();
+            await rm(fixtureRoot, { recursive: true, force: true });
         }
     });
 });

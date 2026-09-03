@@ -55,6 +55,22 @@ describe('SandboxConfigSchema', () => {
         expect(parsed.allowLocalBinding).toBe(false);
     });
 
+    it('keeps checkpoint protection opt-in and requires every policy value', () => {
+        expect(SandboxConfigSchema.parse({})).not.toHaveProperty('checkpointProtection');
+
+        const checkpointProtection = {
+            secretPatterns: ['.env*'],
+            maxFileBytes: 1_000_000,
+            maxFiles: 10_000,
+            maxTotalBytes: 100_000_000,
+        };
+        expect(SandboxConfigSchema.parse({ checkpointProtection }).checkpointProtection)
+            .toEqual(checkpointProtection);
+        expect(() => SandboxConfigSchema.parse({
+            checkpointProtection: { secretPatterns: ['.env*'] },
+        })).toThrow();
+    });
+
     it('rejects invalid enum values', () => {
         expect(() =>
             SandboxConfigSchema.parse({

@@ -71,6 +71,18 @@ describe('resolveSessionSandboxConfig', () => {
         })).toBe(local);
     });
 
+    it('fails closed when an explicit checkpoint block is malformed', () => {
+        expect(() => resolveSessionSandboxConfig({
+            noSandbox: false,
+            env: {
+                HAPPY_PROJECT_SANDBOX_CONFIG: JSON.stringify({
+                    checkpointProtection: { secretPatterns: ['.env*'] },
+                }),
+            },
+            settings: { sandboxConfig: { enabled: true, networkMode: 'blocked' } as never },
+        })).toThrow();
+    });
+
     it('returns undefined when neither source has anything', () => {
         expect(resolveSessionSandboxConfig({ noSandbox: false, env: {}, settings: undefined }))
             .toBeUndefined();

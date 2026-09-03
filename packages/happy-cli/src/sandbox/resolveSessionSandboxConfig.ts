@@ -21,11 +21,29 @@ export function resolveSessionSandboxConfig(input: {
 
     const injected = input.env.HAPPY_PROJECT_SANDBOX_CONFIG;
     if (injected !== undefined) {
+        let parsed: unknown;
         try {
-            return SandboxConfigSchema.parse(JSON.parse(injected));
+            parsed = JSON.parse(injected);
         } catch (error) {
             // 깨진 주입 하나로 세션 전체를 죽이지 않는다. 로컬 설정으로 물러나되
             // 조용히 넘어가지는 않는다 — 이 경로가 조용해서 사고를 늦게 찾았다.
+            logger.debug(
+                `[sandbox] Ignoring malformed HAPPY_PROJECT_SANDBOX_CONFIG: ${
+                    error instanceof Error ? error.message : 'unknown'
+                }`,
+            );
+            return input.settings?.sandboxConfig;
+        }
+        if (
+            typeof parsed === 'object'
+            && parsed !== null
+            && Object.prototype.hasOwnProperty.call(parsed, 'checkpointProtection')
+        ) {
+            return SandboxConfigSchema.parse(parsed);
+        }
+        try {
+            return SandboxConfigSchema.parse(parsed);
+        } catch (error) {
             logger.debug(
                 `[sandbox] Ignoring malformed HAPPY_PROJECT_SANDBOX_CONFIG: ${
                     error instanceof Error ? error.message : 'unknown'

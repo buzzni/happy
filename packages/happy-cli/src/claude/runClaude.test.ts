@@ -11,6 +11,8 @@ const {
     mockStartHappyServer,
     mockStartHookServer,
     mockRegisterKillSessionHandler,
+    mockCreateCheckpointSessionComposition,
+    mockCreateCheckpointEventPublisher,
 } = vi.hoisted(() => ({
     mockApiClientCreate: vi.fn(),
     mockCreateSessionScanner: vi.fn(),
@@ -20,6 +22,8 @@ const {
     mockStartHappyServer: vi.fn(),
     mockStartHookServer: vi.fn(),
     mockRegisterKillSessionHandler: vi.fn(),
+    mockCreateCheckpointSessionComposition: vi.fn(),
+    mockCreateCheckpointEventPublisher: vi.fn(),
 }));
 
 vi.mock('@/api/api', () => ({
@@ -64,6 +68,14 @@ vi.mock('@/claude/utils/generateHookSettings', () => ({
 
 vi.mock('./registerKillSessionHandler', () => ({
     registerKillSessionHandler: mockRegisterKillSessionHandler,
+}));
+
+vi.mock('@/checkpoint/checkpointSessionComposition', () => ({
+    createCheckpointSessionComposition: mockCreateCheckpointSessionComposition,
+}));
+
+vi.mock('@/checkpoint/checkpointEventPublisher', () => ({
+    createCheckpointEventPublisher: mockCreateCheckpointEventPublisher,
 }));
 
 vi.mock('@/ui/logger', () => ({
@@ -285,6 +297,9 @@ describe('runClaude remote JSONL scanner', () => {
             onNewSession: vi.fn(),
             cleanup: vi.fn(),
         });
+        mockCreateCheckpointSessionComposition.mockImplementation(async (input) => ({
+            sandboxConfig: input.sandboxConfig,
+        }));
     });
 
     afterEach(() => {
@@ -315,6 +330,50 @@ describe('runClaude remote JSONL scanner', () => {
         });
         expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
 
+        await harness.finish();
+    });
+
+    it('injects the protected composition into Claude remote before its loop starts', async () => {
+        const checkpointProtection = {
+            secretPatterns: ['.env*'],
+            maxFileBytes: 1024,
+            maxFiles: 100,
+            maxTotalBytes: 4096,
+        };
+        process.env.HAPPY_PROJECT_SANDBOX_CONFIG = JSON.stringify({ checkpointProtection });
+        const beforeTurn = vi.fn(async () => {});
+        const claudeSandbox = {
+            enabled: true,
+            failIfUnavailable: true,
+            allowUnsandboxedCommands: false,
+        };
+        mockCreateCheckpointSessionComposition.mockResolvedValue({
+            sandboxConfig: { checkpointProtection, enabled: true },
+            beforeTurn,
+            claudeSandbox,
+        });
+        const checkpointEvents = { snapshot: vi.fn(), rewind: vi.fn() };
+        mockCreateCheckpointEventPublisher.mockReturnValue(checkpointEvents);
+
+        const harness = await startRemoteRunClaudeHarness();
+
+        expect(mockCreateCheckpointEventPublisher).toHaveBeenCalledWith(expect.objectContaining({
+            token: expect.any(String),
+            sessionId: 'happy-session-1',
+            encryption: expect.objectContaining({ encryptionVariant: expect.any(String) }),
+        }));
+        expect(mockCreateCheckpointSessionComposition).toHaveBeenCalledWith(expect.objectContaining({
+            provider: 'claude-remote',
+            platform: process.platform,
+            projectPath: process.cwd(),
+            sessionId: 'happy-session-1',
+            env: process.env,
+            checkpointEvents,
+        }));
+        expect(harness.loopOptions.checkpointComposition).toMatchObject({
+            beforeTurn,
+            claudeSandbox,
+        });
         await harness.finish();
     });
 
