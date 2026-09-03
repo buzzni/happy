@@ -1,5 +1,6 @@
 import type { GithubTrigger, GithubTriggerEvent } from '@slopus/happy-wire';
 import { isPromotionPullRequest } from './promotionPullRequest';
+import { isReviewFixPullRequest } from './reviewFixPullRequest';
 
 export interface GithubPullRequestSnapshot {
   number: number;
@@ -101,6 +102,9 @@ function matchesFilter(trigger: GithubTrigger, pr: GithubPullRequestSnapshot): b
   // 움직여 checkout 시점마다 HEAD 가 어긋나고, 나르는 커밋들은 이미 각자 자기
   // PR 에서 리뷰를 거쳤다.
   if (isPromotionPullRequest(pr)) return false;
+  // 리뷰가 만들어 낸 수정 PR 은 리뷰 대상이 아니다. 잡으면 자동화가 자기 산출물을
+  // 리뷰하며 스택이 계속 쌓이고, 종료 보장이 없다.
+  if (isReviewFixPullRequest(pr)) return false;
   if (filter.baseBranch !== null && pr.baseRefName !== filter.baseBranch) return false;
   if (filter.excludeDraft && pr.isDraft) return false;
   if (filter.label !== null && !pr.labels.some((label) => label.name.toLowerCase() === filter.label!.toLowerCase())) {

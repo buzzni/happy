@@ -42,6 +42,33 @@ describe('planGithubTrigger', () => {
     expect(result.state.processed).toEqual([])
   })
 
+  // 2026-09-03 프로덕션 — 스택 PR 전환 뒤 자동화가 자기 수정 PR(#342
+  // review-fix/341-74fd43c)을 다시 리뷰해 그 위에 또 수정(#344)을 쌓았다. 수정 PR 도
+  // 새 PR 이라 트리거가 그대로 잡는다. 순수 함수만 덮으면 배선이 빠져도 통과하므로
+  // 트리거 수준에서 고정한다.
+  it('does not fire for a pull request the review itself created', () => {
+    const baseline = planGithubTrigger({ trigger, current: [], previous: null }).state
+    const opened = planGithubTrigger({
+      trigger,
+      current: [pr({ number: 344, headRefName: 'review-fix/342-cd6c673' })],
+      previous: baseline,
+    })
+
+    expect(opened.event).toBeNull()
+  })
+
+  // 승격 PR 제외도 같은 배선을 탄다 — 이 경로가 비면 둘 다 조용히 되살아난다.
+  it('does not fire for a long-lived promotion pull request', () => {
+    const baseline = planGithubTrigger({ trigger, current: [], previous: null }).state
+    const opened = planGithubTrigger({
+      trigger,
+      current: [pr({ number: 345, headRefName: 'develop', baseRefName: 'main' })],
+      previous: baseline,
+    })
+
+    expect(opened.event).toBeNull()
+  })
+
   it('fires one matching event once and preserves the idempotency ledger', () => {
     const baseline = planGithubTrigger({ trigger, current: [], previous: null }).state
     const opened = planGithubTrigger({ trigger, current: [pr()], previous: baseline })
