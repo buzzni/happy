@@ -191,6 +191,18 @@ import {
   prepareAdditionalDirectories,
 } from './additionalDirectories';
 import { mergeAdditionalDirectoriesIntoSandboxEnvironment } from '@/utils/additionalDirectoriesEnv';
+import {
+  injectCheckpointSpawnContext,
+  readCheckpointSpawnContext,
+} from '@/checkpoint/checkpointSpawnContext';
+import {
+  createCheckpointRpcHandlers,
+  type CheckpointRpcSessionAuthority,
+} from '@/checkpoint/checkpointRpc';
+import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
+import { resolveCheckpointSessionAuthority } from './checkpointSessionAuthority';
+import { restartCheckpointProtectedSession } from './checkpointProtectedRestart';
+import { stopServerProcess } from './stopServer';
 import { AutonomousQualityGateRunStore } from './autonomousQualityGateStore';
 import { AutonomousQualityGateDaemonRegistry } from './autonomousQualityGateRegistry';
 import {
@@ -975,6 +987,7 @@ export async function startDaemon(): Promise<void> {
           };
         }
         let mcpCallerGrant: string | undefined = trustedMcpContext?.mcpCallerGrant;
+        let hasAuthoritativeProjectBinding = trustedMcpContext !== undefined;
         const mcpConfigProjectId = trustedMcpContext?.mcpConfigProjectId
           ?? options.mcpConfigProjectId?.trim()
           ?? null;
@@ -990,6 +1003,7 @@ export async function startDaemon(): Promise<void> {
             };
           }
           mcpCallerGrant = consumed.grant;
+          hasAuthoritativeProjectBinding = true;
         }
         if (options.bootstrapFiles) {
           await materializeSpawnBootstrapFiles(directory, options.bootstrapFiles);
@@ -1043,6 +1057,7 @@ export async function startDaemon(): Promise<void> {
           ...authEnv,
           ...(options.environmentVariables ?? {}),
         }, managedAiCredentialEnvironment), mcpCallerGrant, process.env.HAPPY_APLUS_MCP_CONFIG_URL, mcpConfigProjectId, options.expectedConnectors, 'spawn');
+        extraEnv = injectCheckpointSpawnContext(extraEnv, undefined);
         if (options.parentSessionId) {
           extraEnv.HAPPY_FORKED_FROM_SESSION_ID = options.parentSessionId;
         }
@@ -1105,6 +1120,13 @@ export async function startDaemon(): Promise<void> {
             errorMessage
           };
         }
+        extraEnv = injectCheckpointSpawnContext(extraEnv, mcpConfigProjectId && hasAuthoritativeProjectBinding
+          ? {
+            projectId: mcpConfigProjectId,
+            worktreeId: null,
+            checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
+          }
+          : undefined);
 
         // Managed credentials are already validated by the credential runtime.
         // Overlay them only after caller variable expansion so secret text such
@@ -1535,6 +1557,7 @@ export async function startDaemon(): Promise<void> {
       mcpCallerGrantEnvelope?: string;
       mcpConfigProjectId?: string;
       expectedConnectors?: string[];
+      checkpointRestart?: true;
       automation?: {
         directory: string;
         initialPrompt: string;
@@ -1578,6 +1601,24 @@ export async function startDaemon(): Promise<void> {
             code: 'SESSION_ENCRYPTION_MISSING',
             errorMessage: `Session ${happySessionId} has no stored encryption data. It was likely started before this feature was available. Restart the daemon and start a new session to enable resume.`,
           };
+        }
+        if (!options?.checkpointRestart) {
+          const checkpointAuthority = await resolveCheckpointSessionAuthority({
+            sessionId: happySessionId,
+            trackedSession: tracked,
+            checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
+            platform: process.platform,
+          });
+          if (
+            checkpointAuthority?.protection.status === 'unavailable'
+            && checkpointAuthority.protection.reason === 'excluded-path'
+          ) {
+            return {
+              type: 'error',
+              code: 'SESSION_RESUME_FAILED',
+              errorMessage: `Session ${happySessionId} requires the dedicated checkpoint restart action.`,
+            };
+          }
         }
 
         // 2026-07-23 incident: pin preflight and child to ONE identity.
@@ -1697,6 +1738,7 @@ export async function startDaemon(): Promise<void> {
           env: process.env,
           filterCredentials: options?.automation !== undefined,
         });
+        const priorCheckpointContext = readCheckpointSpawnContext(tracked.agentEnvironment ?? {});
         const managedAiCredentialEnvironment = await resolveManagedAiCredentialEnvironment(resumeAgent);
         const mcpEnvironment = prepareMcpChildEnvironment({
           environmentVariables: overlayManagedCredentialEnvironment(buildResumedSessionSpawnEnvironment({
@@ -1732,13 +1774,38 @@ export async function startDaemon(): Promise<void> {
             errorMessage: `MCP caller grant rejected (${mcpEnvironment.reason})`,
           };
         }
+        const checkpointProjectId = options?.mcpConfigProjectId?.trim()
+          || priorCheckpointContext?.projectId;
+        if (
+          priorCheckpointContext
+          && checkpointProjectId
+          && priorCheckpointContext.projectId !== checkpointProjectId
+        ) {
+          return {
+            type: 'error',
+            code: 'SESSION_RESUME_FAILED',
+            errorMessage: 'Checkpoint project binding cannot change while resuming a session',
+          };
+        }
+        const authoritativeCheckpointProjectId = priorCheckpointContext?.projectId
+          ?? (options?.mcpCallerGrantEnvelope ? checkpointProjectId : undefined);
+        const resumedEnvironment = injectCheckpointSpawnContext(
+          mcpEnvironment.environmentVariables,
+          authoritativeCheckpointProjectId
+            ? {
+              projectId: authoritativeCheckpointProjectId,
+              worktreeId: priorCheckpointContext?.worktreeId ?? null,
+              checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
+            }
+            : undefined,
+        );
 
         const result = await spawnTrackedHappyProcess({
           args: launch.args,
           cwd: launch.cwd,
           // resume 는 이 spawn 하나에 한해 lineage 를 명시적으로 부여한다 —
           // 상속분은 scrub 하고 이 세션의 값만 아래에서 다시 넣는다.
-          env: mcpEnvironment.environmentVariables,
+          env: resumedEnvironment,
           userHomeDir: credentialDecision.kind === 'user-staged' ? credentialDecision.homeDir : undefined,
         });
         return result.type === 'error'
@@ -1761,6 +1828,52 @@ export async function startDaemon(): Promise<void> {
     const resumeInFlight = new Map<string, Promise<ResumeSessionResult>>();
     const resumeSession = (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> =>
       shareInFlight(resumeInFlight, happySessionId, () => spawnResumedSession(happySessionId, options));
+
+    const checkpointRestartInFlight = new Map<string, Promise<void>>();
+    const restartCheckpointSession = (authority: CheckpointRpcSessionAuthority): Promise<void> =>
+      shareInFlight(checkpointRestartInFlight, authority.sessionId, async () => {
+        await restartCheckpointProtectedSession(authority, {
+          resolveTarget: async (sessionId) => {
+            const tracked = findTrackedSessionById(sessionId);
+            const sandboxConfig = tracked?.happySessionMetadataFromLocalWebhook?.sandbox;
+            const context = readCheckpointSpawnContext(tracked?.agentEnvironment ?? {});
+            if (!tracked?.directory || !tracked.encryption || !sandboxConfig || !context) return null;
+            const projectPath = await fs.realpath(tracked.directory);
+            return {
+              sessionId,
+              projectId: context.projectId,
+              worktreeId: context.worktreeId,
+              projectPath,
+              pid: tracked.pid,
+              active: pidToTrackedSession.get(tracked.pid) === tracked,
+              knownStopped: tracked.startedBy !== 'persisted',
+              sandboxConfig,
+              terminate: async () => {
+                if (pidToTrackedSession.get(tracked.pid) !== tracked) {
+                  throw new Error('checkpoint protected restart target changed before termination');
+                }
+                if (!preserveSessionForResume(tracked, 'checkpoint-protection-disabled')) {
+                  throw new Error('checkpoint protected restart cannot preserve the session');
+                }
+                await stopServerProcess({ pid: tracked.pid });
+                if (pidToTrackedSession.get(tracked.pid) === tracked) {
+                  pidToTrackedSession.delete(tracked.pid);
+                  recoveredPendingSpawnStartedAt.delete(tracked.pid);
+                  sessionStartTimes.delete(tracked.pid);
+                  pidToAdoptedAt.delete(tracked.pid);
+                  resumeCursorPersistedAt.delete(sessionId);
+                  persistTrackedSessions();
+                }
+              },
+            };
+          },
+          isProcessAlive: isPidAlive,
+          resume: (sessionId, environmentVariables) => spawnResumedSession(sessionId, {
+            environmentVariables,
+            checkpointRestart: true,
+          }),
+        });
+      });
 
     const verifyRecoveryNativeSession = async (session: ReconnectableHappySession): Promise<boolean> => {
       const metadata = session.metadata;
@@ -2530,6 +2643,25 @@ export async function startDaemon(): Promise<void> {
       automationStore,
       aiCredentialRuntime,
       autonomousQualityGate: createAutonomousQualityGateRpcHandlers(autonomousQualityGateRegistry),
+      checkpoint: createCheckpointRpcHandlers({
+        checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
+        resolveAuthority: (sessionId) => resolveCheckpointSessionAuthority({
+          sessionId,
+          trackedSession: findTrackedSessionById(sessionId),
+          checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
+          platform: process.platform,
+        }),
+        resolveEventPublisher: async (sessionId) => {
+          const trackedSession = findTrackedSessionById(sessionId);
+          if (!trackedSession?.encryption) return null;
+          return createCheckpointEventPublisher({
+            token: credentials.token,
+            sessionId,
+            encryption: trackedSession.encryption,
+          });
+        },
+        restartSession: restartCheckpointSession,
+      }),
       // specs/daemon-spawn-project-link — a session created by `agent spawn` has no way to
       // register itself with A+ (its credential does not authenticate /api/*), so the daemon
       // reports it here. The request is bounded inside linkSpawnedProjectSession and

@@ -9,6 +9,7 @@ import type { JsRuntime } from "./runClaude"
 import type { SandboxConfig } from "@/persistence"
 import type { McpConfigSource } from './mcpConfigSynchronizer'
 import type { SaycodePromptBlockOverrides } from '@/prompt/promptProvenance'
+import type { CheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition'
 
 // Re-export permission mode type from api/types
 // Single unified type with 7 modes - Codex modes mapped at SDK boundary
@@ -47,6 +48,7 @@ interface LoopOptions {
     messageQueue: MessageQueue2<EnhancedMode>
     allowedTools?: string[]
     sandboxConfig?: SandboxConfig
+    checkpointComposition?: CheckpointSessionComposition
     onSessionReady?: (session: Session) => void
     onAbort?: () => void
     onActiveUserInputAccepted?: (text: string) => void
@@ -76,6 +78,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         messageQueue: opts.messageQueue,
         allowedTools: opts.allowedTools,
         sandboxConfig: opts.sandboxConfig,
+        checkpointComposition: opts.checkpointComposition,
         onModeChange: opts.onModeChange,
         onAbort: opts.onAbort,
         onActiveUserInputAccepted: opts.onActiveUserInputAccepted,
@@ -90,6 +93,9 @@ export async function loop(opts: LoopOptions): Promise<number> {
     let mode: 'local' | 'remote' = opts.startingMode ?? 'local';
     while (true) {
         logger.debug(`[loop] Iteration with mode: ${mode}`);
+        if (opts.checkpointComposition?.beforeTurn && mode !== 'remote') {
+            throw new Error('checkpoint protection supports Claude remote mode only');
+        }
 
         switch (mode) {
             case 'local': {

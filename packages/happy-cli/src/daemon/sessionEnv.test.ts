@@ -40,6 +40,7 @@ describe('scrubSessionLineageEnv', () => {
             APLUS_SESSION_ID: 'parent-session',
             SAYCODE_AGENT_ENV: '1',
             SAYCODE_AGENT_ROOT: '/parent',
+            HAPPY_CHECKPOINT_SPAWN_CONTEXT: '{"schemaVersion":1,"projectId":"stale","worktreeId":null,"checkpointRoot":"/stale"}',
         }
         const scrubbed = scrubSessionLineageEnv(env)
         expect(scrubbed).toEqual({
@@ -66,6 +67,7 @@ describe('scrubSessionLineageEnv', () => {
         // daemon still scrubs stale lineage before process launch.
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('APLUS_SESSION_')
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('SAYCODE_AGENT_')
+        expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_CHECKPOINT_')
     })
 })
 
@@ -190,6 +192,31 @@ describe('Saycode agent resume environment', () => {
             SAYCODE_AGENT_DEPTH: '1',
             SAYCODE_AGENT_MAX_SPAWN: '4',
             SAYCODE_AGENT_ID: 'child-1',
+            APLUS_SESSION_ID: 'session-2',
+        })
+    })
+
+    it('captures and restores a validated checkpoint binding without unrelated environment', () => {
+        const encoded = JSON.stringify({
+            schemaVersion: 1,
+            projectId: 'project-1',
+            worktreeId: null,
+            checkpointRoot: '/machine/checkpoints',
+        })
+        const captured = captureSaycodeAgentEnvironment({
+            HAPPY_CHECKPOINT_SPAWN_CONTEXT: encoded,
+            SECRET: 'must-not-be-captured',
+        })
+
+        expect(captured).toEqual({ HAPPY_CHECKPOINT_SPAWN_CONTEXT: encoded })
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: { HAPPY_CHECKPOINT_SPAWN_CONTEXT: 'stale' },
+            explicit: { HAPPY_RECONNECT_SESSION_ID: 'session-2' },
+            agentEnvironment: captured,
+            sessionId: 'session-2',
+        })).toEqual({
+            HAPPY_RECONNECT_SESSION_ID: 'session-2',
+            HAPPY_CHECKPOINT_SPAWN_CONTEXT: encoded,
             APLUS_SESSION_ID: 'session-2',
         })
     })

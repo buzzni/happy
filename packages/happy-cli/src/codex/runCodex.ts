@@ -99,6 +99,9 @@ import {
     resolveInitialPromptPermissionMode,
 } from '@/utils/initialPrompt';
 import { registerCodexSteerHandler } from './codexSteerHandler';
+import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
+import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
+import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
@@ -234,6 +237,29 @@ export async function runCodex(opts: {
         automationRunOnceRequested,
         serverAvailable: response !== null,
     });
+    if (!response && sandboxConfig?.checkpointProtection) {
+        throw new Error('checkpoint protection requires an authoritative server session');
+    }
+    const checkpointComposition = response
+        ? await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: process.platform,
+            projectPath: process.cwd(),
+            sessionId: response.id,
+            sandboxConfig,
+            env: process.env,
+            checkpointEvents: sandboxConfig?.checkpointProtection
+                ? createCheckpointEventPublisher({
+                    token: opts.credentials.token,
+                    sessionId: response.id,
+                    encryption: {
+                        encryptionKey: response.encryptionKey,
+                        encryptionVariant: response.encryptionVariant,
+                    },
+                })
+                : undefined,
+        })
+        : { sandboxConfig };
 
     // Handle server unreachable case - create offline stub with hot reconnection
     let session: ApiSessionClient;
@@ -696,7 +722,11 @@ export async function runCodex(opts: {
     // Start Context 
     //
 
-    client = new CodexAppServerClient(sandboxConfig);
+    client = new CodexAppServerClient(
+        checkpointComposition.sandboxConfig,
+        checkpointComposition.beforeTurn,
+        checkpointComposition.completeTurn,
+    );
 
     registerCodexSteerHandler({
         client,
@@ -958,7 +988,10 @@ export async function runCodex(opts: {
     });
 
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
-    const happyServer = await startHappyServer(session);
+    const happyServer = await startHappyServer(session, {
+        protectedBashCwd: checkpointComposition.protectedBashCwd,
+        trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
+    });
     // Launch the bridge via `node <path>` (rather than relying on the .mjs shebang)
     // so it works on Windows, where Windows can't execute shebang scripts directly.
     // codex would otherwise fail to start the MCP server, the change_title tool would
@@ -1130,6 +1163,13 @@ export async function runCodex(opts: {
             }
 
             try {
+                if (checkpointComposition.completeTurn && !client.isConnected) {
+                    const expectedThreadId = client.threadId;
+                    const resumed = await client.reconnectAndResumeThread();
+                    if (expectedThreadId && !resumed) {
+                        throw new Error('checkpoint protection could not resume the Codex thread');
+                    }
+                }
                 // Map permission mode to approval policy and sandbox.
                 // With app-server, these are per-turn — no restart needed on mode change.
                 const sandboxManagedByHappy = client.sandboxEnabled;
@@ -1302,8 +1342,9 @@ export async function runCodex(opts: {
                 // would have produced from a real turn_aborted, reusing its guard logic
                 // (harmless no-op if currentTurnId is already null).
                 logger.warn('Error in codex session:', error);
-                messageBuffer.addMessage('Process exited unexpectedly', 'status');
-                session.sendSessionEvent({ type: 'message', message: 'Process exited unexpectedly' });
+                const failureMessage = describeCheckpointFailure(error) ?? 'Process exited unexpectedly';
+                messageBuffer.addMessage(failureMessage, 'status');
+                session.sendSessionEvent({ type: 'message', message: failureMessage });
                 const closed = mapCodexMcpMessageToSessionEnvelopes(
                     { type: 'turn_aborted', status: 'failed' },
                     {

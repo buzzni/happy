@@ -1,4 +1,6 @@
 import { persistSessionEvent } from "@/app/events/persistSessionEvent";
+import { checkpointEventEnvelopeSchema } from "@/app/events/checkpointEventEnvelope";
+import { persistCheckpointSessionEvent } from "@/app/events/persistCheckpointSessionEvent";
 import { SESSION_EVENT_TYPES, type SessionEventType } from "@/app/events/sessionEventTypes";
 import { db } from "@/storage/db";
 import { z } from "zod";
@@ -6,10 +8,27 @@ import { type Fastify } from "../types";
 
 const validEventTypes = Object.values(SESSION_EVENT_TYPES) as [string, ...string[]];
 
-const sendEventBodySchema = z.object({
-    eventType: z.enum(validEventTypes),
-    content: z.string(),
-});
+const checkpointEventTypes = new Set<string>([
+    SESSION_EVENT_TYPES.CHECKPOINT_SNAPSHOT,
+    SESSION_EVENT_TYPES.CHECKPOINT_REWIND,
+]);
+const checkpointEventTypeValues = [...checkpointEventTypes] as [string, ...string[]];
+const legacyEventTypeValues = validEventTypes.filter(
+    (eventType) => !checkpointEventTypes.has(eventType),
+) as [string, ...string[]];
+
+export const sendEventBodySchema = z.union([
+    z.object({
+        eventType: z.enum(checkpointEventTypeValues),
+        content: z.string(),
+        checkpoint: checkpointEventEnvelopeSchema,
+    }).strict(),
+    z.object({
+        eventType: z.enum(legacyEventTypeValues),
+        content: z.string(),
+        checkpoint: z.never().optional(),
+    }),
+]);
 
 export const getEventsQuerySchema = z
     .object({
@@ -31,16 +50,21 @@ interface SelectedEvent {
     eventType: string;
     seq: number;
     content: unknown;
+    checkpoint: unknown;
     createdAt: Date;
     updatedAt: Date;
 }
 
 function toResponseEvent(event: SelectedEvent) {
+    const checkpoint = event.checkpoint === null
+        ? null
+        : checkpointEventEnvelopeSchema.parse(event.checkpoint);
     return {
         id: event.id,
         eventType: event.eventType,
         seq: event.seq,
         content: event.content,
+        ...(checkpoint ? { checkpoint } : {}),
         createdAt: event.createdAt.getTime(),
         updatedAt: event.updatedAt.getTime(),
     };
@@ -93,6 +117,7 @@ export function v3SessionEventRoutes(app: Fastify) {
                 eventType: true,
                 seq: true,
                 content: true,
+                checkpoint: true,
                 createdAt: true,
                 updatedAt: true,
             },
@@ -118,7 +143,7 @@ export function v3SessionEventRoutes(app: Fastify) {
     }, async (request, reply) => {
         const userId = request.userId;
         const { sessionId } = request.params;
-        const { eventType, content } = request.body;
+        const { eventType, content, checkpoint } = request.body;
 
         const session = await db.session.findFirst({
             where: {
@@ -132,7 +157,15 @@ export function v3SessionEventRoutes(app: Fastify) {
             return reply.code(404).send({ error: 'Session not found' });
         }
 
-        const event = await persistSessionEvent({
+        const checkpointEvent = checkpoint
+            ? await persistCheckpointSessionEvent({
+                sessionId,
+                eventType: eventType as SessionEventType,
+                content,
+                checkpoint,
+            })
+            : null;
+        const event = checkpointEvent ?? await persistSessionEvent({
             sessionId,
             eventType: eventType as SessionEventType,
             content,
@@ -143,6 +176,7 @@ export function v3SessionEventRoutes(app: Fastify) {
                 id: event.id,
                 seq: event.seq,
                 createdAt: event.createdAt.getTime(),
+                ...(checkpointEvent ? { idempotent: checkpointEvent.idempotent } : {}),
             },
         });
     });

@@ -18,10 +18,18 @@
  * SAYCODE_AGENT_* grants per-session orchestration scope. A daemon restarted
  * by one agent must not leak that agent's root/depth/id into unrelated spawns;
  * tracked sessions re-add their captured capability explicitly on resume.
+ *
+ * HAPPY_CHECKPOINT_* binds protected checkpoint state to one daemon-verified
+ * project/worktree. It follows the same no-implicit-inheritance rule.
  */
+import {
+    CHECKPOINT_SPAWN_CONTEXT_ENV_KEY,
+    readCheckpointSpawnContext,
+} from '@/checkpoint/checkpointSpawnContext'
+
 // 'HAPPY_INITIAL_' covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the
 // HAPPY_INITIAL_MODEL / HAPPY_INITIAL_EFFORT spawn seeds.
-export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_AUTOMATION_', 'HAPPY_ADDITIONAL_DIRECTORIES', 'APLUS_SESSION_', 'SAYCODE_AGENT_'] as const
+export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_AUTOMATION_', 'HAPPY_ADDITIONAL_DIRECTORIES', 'HAPPY_CHECKPOINT_', 'APLUS_SESSION_', 'SAYCODE_AGENT_'] as const
 
 const SAYCODE_AGENT_ENV_KEYS = [
     'SAYCODE_AGENT_ENV',
@@ -32,11 +40,10 @@ const SAYCODE_AGENT_ENV_KEYS = [
 ] as const
 
 type SaycodeAgentEnvironmentKey = typeof SAYCODE_AGENT_ENV_KEYS[number]
+const CHECKPOINT_CONTEXT_KEY = CHECKPOINT_SPAWN_CONTEXT_ENV_KEY
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof CHECKPOINT_CONTEXT_KEY
 
-export type SaycodeAgentEnvironment = Partial<Record<SaycodeAgentEnvironmentKey, string>> & {
-    SAYCODE_AGENT_ENV: '1'
-    SAYCODE_AGENT_ROOT: string
-}
+export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey, string>>
 
 function isLineageKey(key: string): boolean {
     return SESSION_LINEAGE_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))
@@ -104,12 +111,17 @@ export function buildManagedSessionSpawnEnvironment(
 export function captureSaycodeAgentEnvironment(
     env: NodeJS.ProcessEnv,
 ): SaycodeAgentEnvironment | undefined {
-    if (env.SAYCODE_AGENT_ENV !== '1' || !env.SAYCODE_AGENT_ROOT?.trim()) {
-        return undefined
+    const captured: SaycodeAgentEnvironment = {}
+    if (env.SAYCODE_AGENT_ENV === '1' && env.SAYCODE_AGENT_ROOT?.trim()) {
+        Object.assign(captured, Object.fromEntries(
+            SAYCODE_AGENT_ENV_KEYS.flatMap((key) => env[key] === undefined ? [] : [[key, env[key]]]),
+        ))
     }
-    return Object.fromEntries(
-        SAYCODE_AGENT_ENV_KEYS.flatMap((key) => env[key] === undefined ? [] : [[key, env[key]]]),
-    ) as SaycodeAgentEnvironment
+    const encodedCheckpointContext = env[CHECKPOINT_CONTEXT_KEY]
+    if (encodedCheckpointContext && readCheckpointSpawnContext(env)) {
+        captured[CHECKPOINT_CONTEXT_KEY] = encodedCheckpointContext
+    }
+    return Object.keys(captured).length > 0 ? captured : undefined
 }
 
 /** Restores one tracked session's capability without inheriting the caller's. */

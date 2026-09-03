@@ -4,6 +4,7 @@
  */
 
 import { query as sdkQuery, type Options, type Query } from '@anthropic-ai/claude-agent-sdk'
+import { readFileSync } from 'node:fs'
 import type { QueryOptions, QueryPrompt, SDKMessage } from './types'
 import type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 import { ensureLocalProxyBypass } from '../utils/proxyBypass'
@@ -14,6 +15,7 @@ import { resolveHappyEntrypoint } from './happyEntrypoint'
  */
 export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): Query {
     const opts = params.options
+    const settings = resolveSettings(opts)
 
     // Build system prompt
     let systemPrompt: Options['systemPrompt'] = undefined
@@ -42,13 +44,15 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         disallowedTools: opts?.disallowedTools,
         mcpServers: opts?.mcpServers as Options['mcpServers'],
         systemPrompt,
-        settings: opts?.settingsPath,
+        settings,
         strictMcpConfig: opts?.strictMcpConfig,
         sessionId: undefined,
         effort: opts?.effort,
         agents: opts?.agents,
         settingSources: opts?.settingSources,
         skills: opts?.skills,
+        sandbox: opts?.sandbox,
+        spawnClaudeCodeProcess: opts?.spawnClaudeCodeProcess,
     }
 
     // Map abort signal -> AbortController
@@ -86,4 +90,19 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         prompt: params.prompt as string | AsyncIterable<SDKUserMessage>,
         options: sdkOptions,
     })
+}
+
+function resolveSettings(opts: QueryOptions | undefined): string | undefined {
+    if (!opts?.settingsPath || !opts.sandbox) return opts?.settingsPath
+    const rawSettings = readFileSync(opts.settingsPath, 'utf8')
+    let parsedSettings: unknown
+    try {
+        parsedSettings = JSON.parse(rawSettings)
+    } catch (error) {
+        throw new Error('Claude hook settings must contain valid JSON before sandbox merge', { cause: error })
+    }
+    if (!parsedSettings || typeof parsedSettings !== 'object' || Array.isArray(parsedSettings)) {
+        throw new Error('Claude hook settings must be a JSON object before sandbox merge')
+    }
+    return JSON.stringify(parsedSettings)
 }

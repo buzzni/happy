@@ -54,6 +54,8 @@ import type {
     ListMcpServerStatusResponse,
 } from './codexAppServerTypes';
 import type { SandboxConfig } from '@/persistence';
+import type { CheckpointSessionComposition, CheckpointTurnPreparation } from '@/checkpoint/checkpointSessionComposition';
+import { CheckpointWriterProcessTree } from '@/checkpoint/checkpointWriterProcessTree';
 import { CODEX_INACTIVITY_ABORT_REASON, type CodexInactivityAbortFields } from './codexAbortNotice';
 import { prepareCodexMultiAuthProxy, type PreparedCodexMultiAuthProxy } from './codexMultiAuthProxy';
 import { initializeSandbox, wrapForMcpTransport } from '@/sandbox/manager';
@@ -209,6 +211,20 @@ function normalizeRawFileChangeList(changes: unknown): LegacyPatchChanges | unde
     return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
+function applyCheckpointTurnPreparation<
+    T extends { cwd?: string; writableRoots?: string[] },
+>(
+    opts: T | undefined,
+    preparation: CheckpointTurnPreparation | void,
+): T | undefined {
+    if (!preparation) return opts;
+    return {
+        ...(opts ?? {}),
+        cwd: preparation.providerPath,
+        writableRoots: [preparation.providerPath],
+    } as T;
+}
+
 export class CodexAppServerClient {
     private process: ChildProcess | null = null;
     private readline: ReadlineInterface | null = null;
@@ -217,6 +233,9 @@ export class CodexAppServerClient {
     private processEpoch = 0;
     private connected = false;
     private sandboxConfig?: SandboxConfig;
+    private readonly beforeTurn?: () => Promise<CheckpointTurnPreparation | void>;
+    private readonly completeTurn?: CheckpointSessionComposition['completeTurn'];
+    private readonly protectedWriterTree: CheckpointWriterProcessTree | null;
     private sandboxCleanup: (() => Promise<void>) | null = null;
     private multiAuthProxy: PreparedCodexMultiAuthProxy | null = null;
     private multiAuthProxyCleanup: Promise<void> | null = null;
@@ -287,8 +306,15 @@ export class CodexAppServerClient {
     private eventHandler: ((msg: EventMsg) => void) | null = null;
     private approvalHandler: ApprovalHandler | null = null;
 
-    constructor(sandboxConfig?: SandboxConfig) {
+    constructor(
+        sandboxConfig?: SandboxConfig,
+        beforeTurn?: () => Promise<CheckpointTurnPreparation | void>,
+        completeTurn?: CheckpointSessionComposition['completeTurn'],
+    ) {
         this.sandboxConfig = sandboxConfig;
+        this.beforeTurn = beforeTurn;
+        this.completeTurn = completeTurn;
+        this.protectedWriterTree = completeTurn ? new CheckpointWriterProcessTree() : null;
     }
 
     get threadId(): string | null {
@@ -297,6 +323,10 @@ export class CodexAppServerClient {
 
     get turnId(): string | null {
         return this._turnId;
+    }
+
+    get isConnected(): boolean {
+        return this.connected;
     }
 
     supportsGoalActions(): boolean {
@@ -725,10 +755,15 @@ export class CodexAppServerClient {
                 this.sandboxEnabled = true;
                 logger.info(`[CodexAppServer] Sandbox enabled`);
             } catch (error) {
-                logger.warn('[CodexAppServer] Failed to initialize sandbox; continuing without.', error);
                 this.sandboxCleanup = null;
                 this.sandboxInitFailed = true;
                 this.sandboxInitFailureReason = error instanceof Error ? error.message : String(error);
+                if (this.beforeTurn) {
+                    throw new Error(
+                        'checkpoint protection sandbox initialization failed; refusing to start Codex. '
+                        + `Original error: ${error instanceof Error ? error.message : String(error)}`,
+                    );
+                }
             }
         }
 
@@ -759,12 +794,14 @@ export class CodexAppServerClient {
                 stdio: ['pipe', 'pipe', 'pipe'],
                 env,
                 windowsHide: true,
+                detached: Boolean(this.protectedWriterTree),
             });
         } catch (error) {
             await this.disconnectInternal();
             throw error;
         }
         this.process = proc;
+        this.protectedWriterTree?.track(proc);
 
         proc.on('error', (err) => {
             logger.debug('[CodexAppServer] Process error:', err);
@@ -857,6 +894,7 @@ export class CodexAppServerClient {
                 } catch { /* already dead */ }
             }, 2000);
             killTimer.unref();
+            proc?.once('exit', () => clearTimeout(killTimer));
         }
 
         this.process = null;
@@ -1416,10 +1454,14 @@ export class CodexAppServerClient {
         writableRoots?: string[];
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
+        beforeTurn?: () => Promise<CheckpointTurnPreparation | void>;
     }): Promise<void> {
         if (!this._threadId) {
             throw new Error('No active thread. Call startThread first.');
         }
+
+        const turnPreparation = await this.resolveBeforeTurn(opts)?.();
+        const effectiveOpts = applyCheckpointTurnPreparation(opts, turnPreparation);
 
         const extraInputItems = opts?.extraInputItems ?? [];
         const input: InputItem[] = [];
@@ -1433,16 +1475,16 @@ export class CodexAppServerClient {
             threadId: this._threadId,
             input,
         };
-        if (opts?.cwd) params.cwd = opts.cwd;
-        if (opts?.approvalPolicy) params.approvalPolicy = opts.approvalPolicy;
-        if (opts?.model) params.model = opts.model;
-        if (opts?.effort) params.effort = opts.effort;
+        if (effectiveOpts?.cwd) params.cwd = effectiveOpts.cwd;
+        if (effectiveOpts?.approvalPolicy) params.approvalPolicy = effectiveOpts.approvalPolicy;
+        if (effectiveOpts?.model) params.model = effectiveOpts.model;
+        if (effectiveOpts?.effort) params.effort = effectiveOpts.effort;
 
         // Map sandbox mode to the camelCase policy format the server expects.
-        if (opts?.sandbox) {
+        if (effectiveOpts?.sandbox) {
             params.sandboxPolicy = resolveCodexSandboxPolicy(
-                opts.sandbox,
-                opts.writableRoots ?? this.threadDefaults?.writableRoots ?? [],
+                effectiveOpts.sandbox,
+                effectiveOpts.writableRoots ?? this.threadDefaults?.writableRoots ?? [],
             );
         }
 
@@ -1484,9 +1526,14 @@ export class CodexAppServerClient {
         writableRoots?: string[];
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
+        beforeTurn?: () => Promise<CheckpointTurnPreparation | void>;
         /** Max time without any turn activity before interrupting the provider. */
         turnTimeoutMs?: number;
     }): Promise<{ aborted: boolean }> {
+        if (!this._threadId) {
+            throw new Error('No active thread. Call startThread first.');
+        }
+
         // Wait for any in-flight interruptTurn() to complete before starting a new
         // turn. Otherwise the stale turn/interrupt RPC can reach Codex after our
         // turn/start and abort the wrong turn.
@@ -1500,6 +1547,9 @@ export class CodexAppServerClient {
 
         // Clear any stale watchdog snapshot so it can only describe this turn's abort.
         this.pendingInactivityAbort = null;
+
+        const turnPreparation = await this.resolveBeforeTurn(opts)?.();
+        const effectiveOpts = applyCheckpointTurnPreparation(opts, turnPreparation);
 
         const timeoutMs = opts?.turnTimeoutMs ?? CodexAppServerClient.TURN_TIMEOUT_MS;
         const completion = new Promise<boolean>((resolve) => {
@@ -1516,14 +1566,38 @@ export class CodexAppServerClient {
         });
 
         try {
-            await this.sendTurn(prompt, opts);
+            await this.sendTurn(
+                prompt,
+                effectiveOpts ? { ...effectiveOpts, beforeTurn: undefined } : undefined,
+            );
         } catch (err) {
             this.resolvePendingTurn(true);
             throw err;
         }
 
         const aborted = await completion;
+        if (this.completeTurn) {
+            const applyResult = await this.completeTurn(async () => {
+                if (!this.protectedWriterTree) {
+                    throw new Error('checkpoint writer process tree is unavailable');
+                }
+                await this.protectedWriterTree.quiesce(() => this.disconnectInternal({
+                    preserveThreadState: true,
+                }));
+            });
+            if (applyResult.status !== 'completed') {
+                throw new Error('checkpoint turn apply did not complete');
+            }
+        }
         return { aborted };
+    }
+
+    private resolveBeforeTurn(
+        opts: { beforeTurn?: () => Promise<CheckpointTurnPreparation | void> } | undefined,
+    ) {
+        return opts && Object.prototype.hasOwnProperty.call(opts, 'beforeTurn')
+            ? opts.beforeTurn
+            : this.beforeTurn;
     }
 
     async steerTurn(prompt: string): Promise<void> {

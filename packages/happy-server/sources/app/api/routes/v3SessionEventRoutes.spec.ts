@@ -1,5 +1,43 @@
-import { describe, it, expect } from 'vitest';
-import { getEventsQuerySchema } from './v3SessionEventRoutes';
+import fastify from 'fastify';
+import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-type-provider-zod';
+import { beforeEach, describe, it, expect, vi } from 'vitest';
+import type { Fastify } from '../types';
+
+const mocks = vi.hoisted(() => ({
+    findSession: vi.fn(),
+    findEvents: vi.fn(),
+    persistEvent: vi.fn(),
+    persistCheckpointEvent: vi.fn(),
+}));
+
+vi.mock('@/storage/db', () => ({
+    db: {
+        session: { findFirst: mocks.findSession },
+        sessionEvent: { findMany: mocks.findEvents },
+    },
+}));
+vi.mock('@/app/events/persistSessionEvent', () => ({ persistSessionEvent: mocks.persistEvent }));
+vi.mock('@/app/events/persistCheckpointSessionEvent', () => ({
+    persistCheckpointSessionEvent: mocks.persistCheckpointEvent,
+}));
+
+import { getEventsQuerySchema, sendEventBodySchema } from './v3SessionEventRoutes';
+import { v3SessionEventRoutes } from './v3SessionEventRoutes';
+
+async function createApp() {
+    const app = fastify();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    const typed = app.withTypeProvider<ZodTypeProvider>() as unknown as Fastify;
+    typed.decorate('authenticate', async (request: any, reply: any) => {
+        const userId = request.headers['x-user-id'];
+        if (typeof userId !== 'string') return reply.code(401).send({ error: 'Unauthorized' });
+        request.userId = userId;
+    });
+    v3SessionEventRoutes(typed);
+    await typed.ready();
+    return typed;
+}
 
 describe('getEventsQuerySchema', () => {
     it('defaults order to asc when the caller does not send one', () => {
@@ -46,5 +84,167 @@ describe('getEventsQuerySchema', () => {
         expect(() =>
             getEventsQuerySchema.parse({ after_seq: 10, before_seq: 500 }),
         ).toThrow();
+    });
+});
+
+describe('sendEventBodySchema', () => {
+    const checkpoint = {
+        schemaVersion: 1,
+        operationId: '123e4567-e89b-42d3-a456-426614174000',
+        checkpointId: 'a'.repeat(40),
+        state: 'created',
+        actor: 'agent',
+        timestamp: 1_788_111_000_000,
+    } as const;
+
+    it('requires validated server-visible metadata for checkpoint events', () => {
+        expect(sendEventBodySchema.parse({
+            eventType: 'checkpoint-snapshot',
+            content: 'encrypted-detail',
+            checkpoint,
+        })).toEqual({
+            eventType: 'checkpoint-snapshot',
+            content: 'encrypted-detail',
+            checkpoint,
+        });
+
+        expect(sendEventBodySchema.safeParse({
+            eventType: 'checkpoint-snapshot',
+            content: 'encrypted-detail',
+        }).success).toBe(false);
+    });
+
+    it('rejects checkpoint metadata on unrelated session events', () => {
+        expect(sendEventBodySchema.safeParse({
+            eventType: 'session-end',
+            content: 'encrypted-detail',
+            checkpoint,
+        }).success).toBe(false);
+    });
+
+    it('preserves legacy parsing that strips unrelated extra fields', () => {
+        expect(sendEventBodySchema.parse({
+            eventType: 'session-end',
+            content: 'encrypted-detail',
+            legacyExtra: 'ignored',
+        })).toEqual({
+            eventType: 'session-end',
+            content: 'encrypted-detail',
+        });
+    });
+});
+
+describe('checkpoint session event route', () => {
+    const checkpoint = {
+        schemaVersion: 1,
+        operationId: '123e4567-e89b-42d3-a456-426614174000',
+        checkpointId: 'a'.repeat(40),
+        state: 'created',
+        actor: 'agent',
+        timestamp: 1_788_111_000_000,
+    } as const;
+
+    beforeEach(() => vi.clearAllMocks());
+
+    it('persists a checkpoint event only under the authenticated session owner', async () => {
+        const createdAt = new Date('2026-09-02T00:00:00.000Z');
+        mocks.findSession.mockResolvedValue({ id: 'session-1' });
+        mocks.persistCheckpointEvent.mockResolvedValue({
+            id: 'event-1',
+            seq: 3,
+            createdAt,
+            idempotent: false,
+        });
+        const app = await createApp();
+
+        const response = await app.inject({
+            method: 'POST',
+            url: '/v3/sessions/session-1/events',
+            headers: { 'x-user-id': 'account-1' },
+            payload: {
+                eventType: 'checkpoint-snapshot',
+                content: 'encrypted-detail',
+                checkpoint,
+            },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(mocks.findSession).toHaveBeenCalledWith({
+            where: { id: 'session-1', accountId: 'account-1' },
+            select: { id: true },
+        });
+        expect(mocks.persistCheckpointEvent).toHaveBeenCalledWith({
+            sessionId: 'session-1',
+            eventType: 'checkpoint-snapshot',
+            content: 'encrypted-detail',
+            checkpoint,
+        });
+        expect(mocks.persistEvent).not.toHaveBeenCalled();
+        expect(response.json()).toEqual({
+            event: {
+                id: 'event-1',
+                seq: 3,
+                createdAt: createdAt.getTime(),
+                idempotent: false,
+            },
+        });
+        await app.close();
+    });
+
+    it('does not reveal or persist another account session', async () => {
+        mocks.findSession.mockResolvedValue(null);
+        const app = await createApp();
+
+        const response = await app.inject({
+            method: 'POST',
+            url: '/v3/sessions/session-foreign/events',
+            headers: { 'x-user-id': 'account-1' },
+            payload: {
+                eventType: 'checkpoint-rewind',
+                content: 'encrypted-detail',
+                checkpoint,
+            },
+        });
+
+        expect(response.statusCode).toBe(404);
+        expect(mocks.persistCheckpointEvent).not.toHaveBeenCalled();
+        expect(mocks.persistEvent).not.toHaveBeenCalled();
+        await app.close();
+    });
+
+    it('returns validated checkpoint metadata with the encrypted timeline event', async () => {
+        const createdAt = new Date('2026-09-02T00:00:00.000Z');
+        mocks.findSession.mockResolvedValue({ id: 'session-1' });
+        mocks.findEvents.mockResolvedValue([{
+            id: 'event-1',
+            eventType: 'checkpoint-snapshot',
+            seq: 3,
+            content: { t: 'encrypted', c: 'encrypted-detail' },
+            checkpoint,
+            createdAt,
+            updatedAt: createdAt,
+        }]);
+        const app = await createApp();
+
+        const response = await app.inject({
+            method: 'GET',
+            url: '/v3/sessions/session-1/events?type=checkpoint-snapshot',
+            headers: { 'x-user-id': 'account-1' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toEqual({
+            events: [{
+                id: 'event-1',
+                eventType: 'checkpoint-snapshot',
+                seq: 3,
+                content: { t: 'encrypted', c: 'encrypted-detail' },
+                checkpoint,
+                createdAt: createdAt.getTime(),
+                updatedAt: createdAt.getTime(),
+            }],
+            hasMore: false,
+        });
+        await app.close();
     });
 });
