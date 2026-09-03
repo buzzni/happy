@@ -1,42 +1,46 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { claudeRemote } from '@/claude/claudeRemote';
 import type { EnhancedMode } from '@/claude/loop';
 import { CodexAppServerClient } from '@/codex/codexAppServerClient';
 import { SandboxConfigSchema } from '@/persistence';
+import { CheckpointRestoreExecutor } from './checkpointRestore';
+import { CheckpointRestorePlanner } from './checkpointRestorePlan';
 import { CHECKPOINT_SPAWN_CONTEXT_ENV_KEY } from './checkpointSpawnContext';
 import { createCheckpointSessionComposition } from './checkpointSessionComposition';
 
 const providerSmokeEnabled = process.env.HAPPY_RUN_CHECKPOINT_PROVIDER_SMOKE === '1';
-const checkpointEvents = {
-    snapshot: async () => ({
-        id: 'event-1', seq: 1, createdAt: Date.now(), idempotent: false,
-    }),
-};
-
+const providerSmokeRoot = process.env.HAPPY_CHECKPOINT_PROVIDER_SMOKE_ROOT ?? tmpdir();
 describe.skipIf(process.platform !== 'darwin' || !providerSmokeEnabled)(
     'checkpoint protected provider smoke',
     { timeout: 180_000 },
     () => {
-        let projectPath: string;
-        let checkpointRoot: string;
+        let projectPath: string | null = null;
+        let checkpointRoot: string | null = null;
         let client: CodexAppServerClient | null;
 
         beforeEach(async () => {
-            projectPath = await mkdtemp('/var/tmp/happy-checkpoint-provider-project-');
-            checkpointRoot = await mkdtemp('/var/tmp/happy-checkpoint-provider-store-');
+            projectPath = null;
+            checkpointRoot = null;
+            await mkdir(providerSmokeRoot, { recursive: true });
+            projectPath = await mkdtemp(join(providerSmokeRoot, 'happy-checkpoint-provider-project-'));
+            checkpointRoot = await mkdtemp(join(providerSmokeRoot, 'happy-checkpoint-provider-store-'));
             client = null;
             await writeFile(join(projectPath, 'README.md'), '# Provider smoke\n');
         });
 
         afterEach(async () => {
             await client?.disconnect();
-            await rm(projectPath, { recursive: true, force: true });
-            await rm(checkpointRoot, { recursive: true, force: true });
+            if (projectPath) await rm(projectPath, { recursive: true, force: true });
+            if (checkpointRoot) await rm(checkpointRoot, { recursive: true, force: true });
         });
 
         it('applies a real Codex file edit only through the protected turn boundary', async () => {
+            if (!projectPath || !checkpointRoot) throw new Error('provider smoke fixture is unavailable');
+            const checkpointEvents = captureCheckpointEvents();
             const events: Array<{
                 type: string;
                 message?: string;
@@ -69,7 +73,7 @@ describe.skipIf(process.platform !== 'darwin' || !providerSmokeEnabled)(
                         checkpointRoot,
                     }),
                 },
-                checkpointEvents,
+                checkpointEvents: checkpointEvents.publisher,
             });
             client = new CodexAppServerClient(
                 composition.sandboxConfig,
@@ -109,9 +113,17 @@ describe.skipIf(process.platform !== 'darwin' || !providerSmokeEnabled)(
                     cause: error,
                 });
             }
+            await restoreProviderEdit({
+                checkpointRoot,
+                projectPath,
+                sessionId: 'provider-smoke-codex',
+                checkpointId: checkpointEvents.checkpointId(),
+            });
         });
 
         it('applies a real Claude file edit only through the protected turn boundary', async () => {
+            if (!projectPath || !checkpointRoot) throw new Error('provider smoke fixture is unavailable');
+            const checkpointEvents = captureCheckpointEvents();
             const hookSettingsPath = join(checkpointRoot, 'claude-settings.json');
             await writeFile(hookSettingsPath, '{}\n');
             const composition = await createCheckpointSessionComposition({
@@ -139,7 +151,7 @@ describe.skipIf(process.platform !== 'darwin' || !providerSmokeEnabled)(
                         checkpointRoot,
                     }),
                 },
-                checkpointEvents,
+                checkpointEvents: checkpointEvents.publisher,
             });
             const mode: EnhancedMode = {
                 permissionMode: 'bypassPermissions',
@@ -170,6 +182,70 @@ describe.skipIf(process.platform !== 'darwin' || !providerSmokeEnabled)(
             expect(result).toBe('turn-complete');
             await expect(readFile(join(projectPath, 'provider-smoke.txt'), 'utf8'))
                 .resolves.toBe('protected claude\n');
+            await restoreProviderEdit({
+                checkpointRoot,
+                projectPath,
+                sessionId: 'provider-smoke-claude',
+                checkpointId: checkpointEvents.checkpointId(),
+            });
         });
     },
 );
+
+function captureCheckpointEvents(): {
+    publisher: {
+        snapshot(event: { checkpointId: string }): Promise<{
+            id: string;
+            seq: number;
+            createdAt: number;
+            idempotent: boolean;
+        }>;
+    };
+    checkpointId(): string;
+} {
+    let checkpointId: string | null = null;
+    return {
+        publisher: {
+            snapshot: async (event) => {
+                checkpointId = event.checkpointId;
+                return { id: 'event-1', seq: 1, createdAt: Date.now(), idempotent: false };
+            },
+        },
+        checkpointId: () => {
+            if (!checkpointId) throw new Error('provider smoke did not publish a snapshot');
+            return checkpointId;
+        },
+    };
+}
+
+async function restoreProviderEdit(input: {
+    checkpointRoot: string;
+    projectPath: string;
+    sessionId: string;
+    checkpointId: string;
+}): Promise<void> {
+    const binding = {
+        sessionId: input.sessionId,
+        projectId: 'provider-smoke-project',
+        worktreeId: null,
+        projectPath: input.projectPath,
+    } as const;
+    const plan = await new CheckpointRestorePlanner(input.checkpointRoot).plan({
+        ...binding,
+        checkpointId: input.checkpointId,
+    });
+    expect(plan.entries).toContainEqual({
+        path: 'provider-smoke.txt',
+        action: 'delete',
+        reason: 'agent-created',
+    });
+
+    await expect(new CheckpointRestoreExecutor(input.checkpointRoot).execute({
+        ...binding,
+        operationId: randomUUID(),
+        plan,
+        confirmed: true,
+    })).resolves.toMatchObject({ status: 'completed' });
+    await expect(readFile(join(input.projectPath, 'provider-smoke.txt'), 'utf8'))
+        .rejects.toMatchObject({ code: 'ENOENT' });
+}
