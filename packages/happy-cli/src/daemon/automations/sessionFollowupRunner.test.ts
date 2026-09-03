@@ -158,6 +158,21 @@ describe('sessionFollowupRunner', () => {
     ])).toEqual({ kind: 'continue' })
   })
 
+  it('does not mistake a completion-tag mention in the summary for the block start', () => {
+    expect(evaluateReviewFindings([
+      '{"findings":[{"severity":"medium"}]}\n',
+      '<saycode-complete status="completed" findings="1">Validated the `<saycode-complete>` and `</saycode-complete>` boundaries.</saycode-complete>',
+    ])).toEqual({ kind: 'continue' })
+  })
+
+  it('does not mistake a completion-tag mention before the raw contract for the signal', () => {
+    expect(evaluateReviewFindings([
+      'Reviewed the `<saycode-complete>` boundary.\n',
+      '{"findings":[{"severity":"medium"}]}\n',
+      '<saycode-complete status="completed" findings="1">Done.</saycode-complete>',
+    ])).toEqual({ kind: 'continue' })
+  })
+
   it('fails closed when human-readable text contains multiple raw JSON contracts', () => {
     expect(evaluateReviewFindings([
       'First result:\n{"findings":[{"severity":"medium"}]}\n',
