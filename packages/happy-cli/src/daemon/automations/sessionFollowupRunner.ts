@@ -237,7 +237,10 @@ function parseJsonCandidate(text: string): unknown {
   if (fences.length > 1 || fenceStarts !== fences.length) throw new Error('multiple-json-contracts')
   if (fences.length === 1) {
     const fence = fences[0]!
-    const trailing = trimmed.slice((fence.index ?? 0) + fence[0].length).trim()
+    const fenceStart = fence.index ?? 0
+    const leading = trimmed.slice(0, fenceStart)
+    if (parseTopLevelRawJsonObjects(leading).length > 0) throw new Error('multiple-json-contracts')
+    const trailing = trimmed.slice(fenceStart + fence[0].length).trim()
     if (trailing && terminalCompletionSignalStart(trailing) !== 0) {
       throw new Error('json-contract-is-not-final')
     }

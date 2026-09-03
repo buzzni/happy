@@ -219,6 +219,14 @@ describe('sessionFollowupRunner', () => {
     ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
   })
 
+  it('fails closed when a raw contract precedes a fenced contract', () => {
+    expect(evaluateReviewFindings([
+      '{"findings":[{"severity":"medium"}]}\n',
+      '```json\n{"findings":[]}\n```\n',
+      '<saycode-complete status="completed" findings="0">Done.</saycode-complete>',
+    ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
+  })
+
   it('fails closed when an additional JSON contract fence is incomplete', () => {
     expect(evaluateReviewFindings([
       '```json\n{"findings":[{"severity":"medium"}]}\n```\n',
