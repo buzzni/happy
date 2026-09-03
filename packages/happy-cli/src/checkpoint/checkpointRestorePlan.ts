@@ -3,8 +3,14 @@ import { createHash } from 'node:crypto';
 import { createReadStream, type Stats } from 'node:fs';
 import { lstat, mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { CheckpointLedger, type CheckpointLedgerBinding } from './checkpointLedger';
 import {
+    CheckpointLedger,
+    type CheckpointLedgerBinding,
+    type CheckpointLedgerRecord,
+} from './checkpointLedger';
+import {
+    checkpointOperationRefPrefix,
+    checkpointPinRefPrefix,
     CheckpointStore,
     resolveCheckpointStoreLayout,
     type CheckpointSnapshotRequest,
@@ -59,34 +65,41 @@ export class CheckpointRestorePlanner {
 
         for (const path of [...changedPaths].sort()) {
             const record = latestByPath.get(path);
-            if (!record) {
-                entries.push({ path, action: 'skip', reason: 'provenance-unknown' });
-                continue;
-            }
-            const [current, targetHash] = await Promise.all([
-                readCurrentFileState(projectPath, path),
-                this.readCheckpointFileHash(request, path, projectPath),
-            ]);
-            if (current.kind === 'regular' && current.contentHash === targetHash) continue;
-            if (current.kind === 'missing' && targetHash === null) continue;
-            if (current.kind === 'unsupported') {
-                entries.push({ path, action: 'conflict', reason: current.reason });
-            } else if (record.action === 'written' && current.kind === 'regular') {
-                entries.push(current.contentHash === record.contentHash
-                    ? targetHash === null
-                        ? { path, action: 'delete', reason: 'agent-created' }
-                        : { path, action: 'restore', reason: 'agent-modified' }
-                    : { path, action: 'skip', reason: 'user-modified' });
-            } else if (record.action === 'deleted' && current.kind === 'missing') {
-                if (targetHash !== null) {
-                    entries.push({ path, action: 'restore', reason: 'agent-deleted' });
-                }
-            } else {
-                entries.push({ path, action: 'skip', reason: 'user-modified' });
-            }
+            const current = await readCurrentFileState(projectPath, path);
+            const targetHash = current.kind === 'unsupported'
+                ? null
+                : await this.readCheckpointFileHash(request, path, projectPath);
+            const entry = createPlanEntry(path, record, current, targetHash);
+            if (entry) entries.push(entry);
         }
 
         return { checkpointId: request.checkpointId, entries };
+    }
+
+    async matchesCurrentEntry(
+        request: CheckpointRestorePlanRequest,
+        expected: CheckpointRestorePlanEntry,
+    ): Promise<boolean> {
+        validateCheckpointId(request.checkpointId);
+        const projectPath = await realpath(request.projectPath);
+        const records = await new CheckpointLedger(this.checkpointRoot).readRecords({
+            ...request,
+            projectPath,
+        });
+        await this.assertCheckpointOwnedByBinding(request, projectPath);
+        let record: CheckpointLedgerRecord | undefined;
+        for (let index = records.length - 1; index >= 0; index -= 1) {
+            if (records[index]?.path === expected.path) {
+                record = records[index];
+                break;
+            }
+        }
+        const current = await readCurrentFileState(projectPath, expected.path);
+        const targetHash = current.kind === 'unsupported'
+            ? null
+            : await this.readCheckpointFileHash(request, expected.path, projectPath);
+        return JSON.stringify(createPlanEntry(expected.path, record, current, targetHash))
+            === JSON.stringify(expected);
     }
 
     private async assertCheckpointOwnedByBinding(
@@ -99,6 +112,14 @@ export class CheckpointRestorePlanner {
             projectId: request.projectId,
             worktreeId: request.worktreeId,
         });
+        const ownedRefs = await runGit([
+            'for-each-ref',
+            '--format=%(refname)',
+            `--points-at=${request.checkpointId}`,
+            checkpointOperationRefPrefix(layout),
+            checkpointPinRefPrefix(layout),
+        ], projectPath, checkpointGitEnvironment(layout.gitDirectory));
+        if (ownedRefs.toString('utf8').trim().length > 0) return;
         const containingRef = await runGit([
             'for-each-ref',
             '--format=%(refname)',
@@ -171,6 +192,32 @@ export class CheckpointRestorePlanner {
         const contents = await runGit(['cat-file', 'blob', header[2]], projectPath, environment);
         return createHash('sha256').update(contents).digest('hex');
     }
+}
+
+function createPlanEntry(
+    path: string,
+    record: CheckpointLedgerRecord | undefined,
+    current: CurrentFileState,
+    targetHash: string | null,
+): CheckpointRestorePlanEntry | null {
+    if (!record) return { path, action: 'skip', reason: 'provenance-unknown' };
+    if (current.kind === 'regular' && current.contentHash === targetHash) return null;
+    if (current.kind === 'missing' && targetHash === null) return null;
+    if (current.kind === 'unsupported') {
+        return { path, action: 'conflict', reason: current.reason };
+    }
+    if (record.action === 'written' && current.kind === 'regular') {
+        if (current.contentHash !== record.contentHash) {
+            return { path, action: 'skip', reason: 'user-modified' };
+        }
+        return targetHash === null
+            ? { path, action: 'delete', reason: 'agent-created' }
+            : { path, action: 'restore', reason: 'agent-modified' };
+    }
+    if (record.action === 'deleted' && current.kind === 'missing' && targetHash !== null) {
+        return { path, action: 'restore', reason: 'agent-deleted' };
+    }
+    return { path, action: 'skip', reason: 'user-modified' };
 }
 
 function validateCheckpointId(checkpointId: string): void {

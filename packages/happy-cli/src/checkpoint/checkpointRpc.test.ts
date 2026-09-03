@@ -8,6 +8,10 @@ import { CheckpointProtectionStateStore } from './checkpointProtectionState';
 import { CheckpointRestoreExecutor, type CheckpointRestoreMutation } from './checkpointRestore';
 import { CheckpointStore } from './checkpointStore';
 
+const operationId = (sequence: number): string => (
+    `123e4567-e89b-42d3-a456-${sequence.toString().padStart(12, '0')}`
+);
+
 describe('checkpoint daemon RPC', () => {
     let fixtureRoot: string;
     let checkpointRoot: string;
@@ -77,13 +81,13 @@ describe('checkpoint daemon RPC', () => {
         await writeFile(join(projectPath, 'tracked.txt'), 'before\n');
         const snapshot = await new CheckpointStore(checkpointRoot).snapshotTurn({
             ...authority,
-            operationId: 'turn-1',
+            operationId: operationId(1),
             projectPath,
         });
         await writeFile(join(projectPath, 'tracked.txt'), 'agent version\n');
         await new CheckpointLedger(checkpointRoot).recordMutation({
             ...authority,
-            operationId: 'turn-1',
+            operationId: operationId(1),
             mutationId: 'mutation-1',
             projectPath,
             path: 'tracked.txt',
@@ -96,14 +100,14 @@ describe('checkpoint daemon RPC', () => {
         await writeFile(join(projectPath, 'a.txt'), 'a before\n');
         const snapshot = await new CheckpointStore(checkpointRoot).snapshotTurn({
             ...authority,
-            operationId: 'turn-two-files',
+            operationId: operationId(2),
             projectPath,
         });
         const ledger = new CheckpointLedger(checkpointRoot);
         await writeFile(join(projectPath, 'a.txt'), 'a agent\n');
         await ledger.recordMutation({
             ...authority,
-            operationId: 'turn-two-files',
+            operationId: operationId(2),
             mutationId: 'mutation-a',
             projectPath,
             path: 'a.txt',
@@ -112,7 +116,7 @@ describe('checkpoint daemon RPC', () => {
         await writeFile(join(projectPath, 'b.txt'), 'b agent-created\n');
         await ledger.recordMutation({
             ...authority,
-            operationId: 'turn-two-files',
+            operationId: operationId(2),
             mutationId: 'mutation-b',
             projectPath,
             path: 'b.txt',
@@ -136,6 +140,25 @@ describe('checkpoint daemon RPC', () => {
         await expect(access(checkpointRoot)).rejects.toMatchObject({ code: 'ENOENT' });
     });
 
+    it('rejects a non-UUID restore operation before resolving authority or mutating files', async () => {
+        const checkpointId = await createAgentModifiedCheckpoint();
+        const handlers = createHandlers();
+        const plan = await handlers.preview({
+            schemaVersion: 1,
+            ...authority,
+            checkpointId,
+        });
+
+        await expect(handlers.execute({
+            schemaVersion: 1,
+            ...authority,
+            operationId: 'restore-not-a-uuid',
+            confirmed: true,
+            plan,
+        })).rejects.toThrow();
+        await expect(readFile(join(projectPath, 'tracked.txt'), 'utf8')).resolves.toBe('agent version\n');
+    });
+
     it('reports protection status from daemon session authority', async () => {
         const handlers = createHandlers();
 
@@ -155,7 +178,7 @@ describe('checkpoint daemon RPC', () => {
         await store.reportPending({
             ...authority,
             projectPath,
-            operationId: 'turn-current',
+            operationId: operationId(3),
             source: 'policy-drift',
             excluded: [{ path: '.env', reason: 'secret' }],
         });
@@ -164,7 +187,7 @@ describe('checkpoint daemon RPC', () => {
         await expect(handlers.status({ schemaVersion: 1, ...authority })).resolves.toMatchObject({
             protection: { status: 'protected' },
             pendingDecision: {
-                operationId: 'turn-current',
+                operationId: operationId(3),
                 excluded: [{ path: '.env', reason: 'secret' }],
                 warnings: {
                     partialExecutionPossible: true,
@@ -175,20 +198,20 @@ describe('checkpoint daemon RPC', () => {
         await expect(handlers.decision({
             schemaVersion: 1,
             ...authority,
-            operationId: 'turn-stale',
+            operationId: operationId(4),
             decision: 'cancel',
         })).rejects.toThrow('pending operation mismatch');
         await expect(handlers.decision({
             schemaVersion: 1,
             ...authority,
             projectId: 'other-project',
-            operationId: 'turn-current',
+            operationId: operationId(3),
             decision: 'cancel',
         })).rejects.toThrow('binding mismatch');
         await expect(handlers.decision({
             schemaVersion: 1,
             ...authority,
-            operationId: 'turn-current',
+            operationId: operationId(3),
             decision: 'cancel',
         })).resolves.toEqual({
             schemaVersion: 1,
@@ -203,7 +226,7 @@ describe('checkpoint daemon RPC', () => {
         await store.reportPending({
             ...authority,
             projectPath,
-            operationId: 'turn-1',
+            operationId: operationId(1),
             source: 'turn-apply',
             excluded: [{ path: 'large.bin', reason: 'too-large' }],
         });
@@ -212,7 +235,7 @@ describe('checkpoint daemon RPC', () => {
         await expect(handlers.decision({
             schemaVersion: 1,
             ...authority,
-            operationId: 'turn-1',
+            operationId: operationId(1),
             decision: 'disable-protection',
         })).resolves.toEqual({
             schemaVersion: 1,
@@ -234,7 +257,7 @@ describe('checkpoint daemon RPC', () => {
         await store.reportPending({
             ...authority,
             projectPath,
-            operationId: 'turn-restart',
+            operationId: operationId(5),
             source: 'policy-drift',
             excluded: [{ path: '.env', reason: 'secret' }],
         });
@@ -248,7 +271,7 @@ describe('checkpoint daemon RPC', () => {
         await handlers.decision({
             schemaVersion: 1,
             ...authority,
-            operationId: 'turn-restart',
+            operationId: operationId(5),
             decision: 'disable-protection',
         });
 
@@ -272,7 +295,7 @@ describe('checkpoint daemon RPC', () => {
         const firstCheckpointId = await createAgentModifiedCheckpoint();
         const second = await new CheckpointStore(checkpointRoot).snapshotTurn({
             ...authority,
-            operationId: 'turn-2',
+            operationId: operationId(6),
             projectPath,
         });
         const handlers = createHandlers();
@@ -297,10 +320,10 @@ describe('checkpoint daemon RPC', () => {
         await expect(handlers.cancel({
             schemaVersion: 1,
             ...authority,
-            operationId: 'restore-1',
+            operationId: operationId(7),
         })).resolves.toEqual({
             schemaVersion: 1,
-            operationId: 'restore-1',
+            operationId: operationId(7),
             status: 'cancelled',
         });
 
@@ -321,7 +344,7 @@ describe('checkpoint daemon RPC', () => {
         await expect(handlers.execute({
             schemaVersion: 1,
             ...authority,
-            operationId: 'restore-unconfirmed',
+            operationId: operationId(8),
             confirmed: false,
             plan: preview,
         })).rejects.toBeDefined();
@@ -341,7 +364,7 @@ describe('checkpoint daemon RPC', () => {
         await expect(createUnavailableHandlers().execute({
             schemaVersion: 1,
             ...authority,
-            operationId: 'restore-unavailable',
+            operationId: operationId(9),
             confirmed: true,
             plan: preview,
         })).rejects.toThrow('checkpoint RPC mutation requires protected status');
@@ -381,7 +404,7 @@ describe('checkpoint daemon RPC', () => {
         await expect(handlers.execute({
             schemaVersion: 1,
             ...authority,
-            operationId: 'restore-no-event-publisher',
+            operationId: operationId(10),
             confirmed: true,
             plan: preview,
         })).rejects.toThrow('event publisher is unavailable');
@@ -403,12 +426,12 @@ describe('checkpoint daemon RPC', () => {
         await expect(handlers.execute({
             schemaVersion: 1,
             ...authority,
-            operationId: 'restore-confirmed',
+            operationId: operationId(11),
             confirmed: true,
             plan: preview,
         })).resolves.toMatchObject({
             schemaVersion: 1,
-            operationId: 'restore-confirmed',
+            operationId: operationId(11),
             status: 'completed',
             safetyCheckpointId: expect.stringMatching(/^[a-f0-9]{40,64}$/),
             entries: [{ path: 'tracked.txt', action: 'restore', outcome: 'restored' }],
@@ -437,7 +460,7 @@ describe('checkpoint daemon RPC', () => {
         const request = {
             schemaVersion: 1,
             ...authority,
-            operationId: 'restore-event-retry',
+            operationId: operationId(12),
             confirmed: true,
             plan,
         };
@@ -450,7 +473,7 @@ describe('checkpoint daemon RPC', () => {
         expect(rewind).toHaveBeenCalledTimes(2);
         expect(rewind.mock.calls[1]?.[0]).toEqual(rewind.mock.calls[0]?.[0]);
         expect(rewind.mock.calls[0]?.[0]).toMatchObject({
-            operationId: 'restore-event-retry',
+            operationId: operationId(12),
             checkpointId,
             state: 'completed',
             files: [{ path: 'tracked.txt', action: 'modified' }],
@@ -470,12 +493,12 @@ describe('checkpoint daemon RPC', () => {
         await expect(handlers.execute({
             schemaVersion: 1,
             ...authority,
-            operationId: 'restore-stale',
+            operationId: operationId(13),
             confirmed: true,
             plan: preview,
         })).resolves.toEqual({
             schemaVersion: 1,
-            operationId: 'restore-stale',
+            operationId: operationId(13),
             status: 'stale-plan',
         });
 
@@ -506,14 +529,14 @@ describe('checkpoint daemon RPC', () => {
         const request = {
             schemaVersion: 1,
             ...authority,
-            operationId: 'restore-partial',
+            operationId: operationId(14),
             confirmed: true,
             plan: preview,
         } as const;
 
         await expect(handlers.execute(request)).resolves.toMatchObject({
             schemaVersion: 1,
-            operationId: 'restore-partial',
+            operationId: operationId(14),
             status: 'partial',
             entries: [
                 { path: 'a.txt', action: 'restore', outcome: 'failed' },
@@ -524,7 +547,7 @@ describe('checkpoint daemon RPC', () => {
 
         await expect(handlers.retry(request)).resolves.toMatchObject({
             schemaVersion: 1,
-            operationId: 'restore-partial',
+            operationId: operationId(14),
             status: 'completed',
             entries: [
                 { path: 'a.txt', action: 'restore', outcome: 'restored' },

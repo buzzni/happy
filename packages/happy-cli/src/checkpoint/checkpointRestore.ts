@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, realpath, rm, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { CheckpointLedgerBinding } from './checkpointLedger';
+import { withCheckpointPin } from './checkpointGarbageCollector';
 import {
     checkpointRestoreJournalPath,
     checkpointRestoreRequestFingerprint,
@@ -80,11 +81,17 @@ export class CheckpointRestoreExecutor {
             worktreeId: request.worktreeId,
         });
         const journalFile = checkpointRestoreJournalPath(layout, request.operationId);
-        return enqueueRestore(projectPath, () => this.executeConfirmed(
+        return withCheckpointPin(this.checkpointRoot, {
+            sessionId: request.sessionId,
+            projectId: request.projectId,
+            worktreeId: request.worktreeId,
+            checkpointId: request.plan.checkpointId,
+            operationId: `${request.operationId}:restore-target`,
+        }, () => enqueueRestore(projectPath, () => this.executeConfirmed(
             request,
             projectPath,
             journalFile,
-        ));
+        )));
     }
 
     private async executeConfirmed(
@@ -198,7 +205,19 @@ export class CheckpointRestoreExecutor {
                     );
                     await this.mutate({
                         entry,
-                        apply: () => applyMutation(entry, projectPath, environment),
+                        apply: async () => {
+                            const current = await new CheckpointRestorePlanner(this.checkpointRoot).matchesCurrentEntry({
+                                sessionId: request.sessionId,
+                                projectId: request.projectId,
+                                worktreeId: request.worktreeId,
+                                projectPath,
+                                checkpointId: request.plan.checkpointId,
+                            }, entry);
+                            if (!current) {
+                                throw new Error('checkpoint restore file changed before mutation');
+                            }
+                            await applyMutation(entry, projectPath, environment);
+                        },
                     });
                     journalEntry.outcome = entry.action === 'restore' ? 'restored' : 'deleted';
                 } catch {

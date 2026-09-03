@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createCheckpointRuntime } from './checkpointRuntime';
-import { resolveCheckpointStoreLayout } from './checkpointStore';
+import { checkpointOperationRefPrefix, resolveCheckpointStoreLayout } from './checkpointStore';
 
 const execFileAsync = promisify(execFile);
 
@@ -106,10 +106,10 @@ describe('createCheckpointRuntime', () => {
         const layout = resolveCheckpointStoreLayout({ checkpointRoot, ...binding });
         const { stdout: count } = await execFileAsync('git', [
             `--git-dir=${layout.gitDirectory}`,
-            'rev-list',
-            '--count',
-            layout.refName,
+            'for-each-ref',
+            '--format=%(objectname)',
+            checkpointOperationRefPrefix(layout),
         ]);
-        expect(count.trim()).toBe('1');
+        expect(count.trim().split('\n').filter(Boolean)).toHaveLength(1);
     });
 });

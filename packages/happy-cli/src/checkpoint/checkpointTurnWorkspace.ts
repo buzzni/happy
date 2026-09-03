@@ -5,7 +5,12 @@ import { cp, lstat, mkdir, readdir, readlink, realpath, rename, rm, symlink, wri
 import { pipeline } from 'node:stream/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import * as tar from 'tar';
-import { resolveCheckpointStoreLayout, type CheckpointStoreBinding } from './checkpointStore';
+import {
+    checkpointOperationRefPrefix,
+    checkpointPinRefPrefix,
+    resolveCheckpointStoreLayout,
+    type CheckpointStoreBinding,
+} from './checkpointStore';
 
 export type CheckpointTurnWorkspaceRequest = Omit<CheckpointStoreBinding, 'checkpointRoot'> & {
     operationId: string;
@@ -249,6 +254,16 @@ export async function assertCheckpointOwnedByBinding(
     refName: string,
     checkpointId: string,
 ): Promise<void> {
+    const layout = { refName };
+    const ownedRefs = await runGitBuffer([
+        `--git-dir=${gitDirectory}`,
+        'for-each-ref',
+        '--format=%(refname)',
+        `--points-at=${checkpointId}`,
+        checkpointOperationRefPrefix(layout),
+        checkpointPinRefPrefix(layout),
+    ], gitDirectory);
+    if (ownedRefs.toString('utf8').trim().length > 0) return;
     const refs = await runGitBuffer([
         `--git-dir=${gitDirectory}`,
         'for-each-ref',

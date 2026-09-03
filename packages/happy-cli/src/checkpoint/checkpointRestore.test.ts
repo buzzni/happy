@@ -5,13 +5,18 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CheckpointLedger } from './checkpointLedger';
+import { CheckpointGarbageCollector } from './checkpointGarbageCollector';
 import {
     CheckpointRestoreExecutor,
     type CheckpointRestoreMutation,
 } from './checkpointRestore';
 import { checkpointRestoreJournalPath } from './checkpointRestoreJournal';
 import { CheckpointRestorePlanner, type CheckpointRestorePlan } from './checkpointRestorePlan';
-import { CheckpointStore, resolveCheckpointStoreLayout } from './checkpointStore';
+import {
+    checkpointOperationRefPrefix,
+    CheckpointStore,
+    resolveCheckpointStoreLayout,
+} from './checkpointStore';
 
 const execFileAsync = promisify(execFile);
 
@@ -106,13 +111,13 @@ describe('CheckpointRestoreExecutor', () => {
         const layout = resolveCheckpointStoreLayout({ checkpointRoot, ...binding });
         const { stdout: checkpointCount } = await execFileAsync('git', [
             `--git-dir=${layout.gitDirectory}`,
-            'rev-list',
-            '--count',
-            layout.refName,
+            'for-each-ref',
+            '--format=%(objectname)',
+            checkpointOperationRefPrefix(layout),
         ]);
         expect(result).toEqual({ status: 'cancelled' });
         expect(await readFile(join(projectPath, 'tracked.txt'), 'utf8')).toBe('agent version\n');
-        expect(checkpointCount.trim()).toBe('1');
+        expect(checkpointCount.trim().split('\n').filter(Boolean)).toHaveLength(1);
     });
 
     it('creates a safety checkpoint before applying a confirmed restore', async () => {
@@ -157,15 +162,78 @@ describe('CheckpointRestoreExecutor', () => {
         const layout = resolveCheckpointStoreLayout({ checkpointRoot, ...binding });
         const { stdout: checkpointCount } = await execFileAsync('git', [
             `--git-dir=${layout.gitDirectory}`,
-            'rev-list',
-            '--count',
-            layout.refName,
+            'for-each-ref',
+            '--format=%(objectname)',
+            checkpointOperationRefPrefix(layout),
         ]);
         expect(result).toEqual({ status: 'stale-plan' });
         expect(await readFile(join(projectPath, 'tracked.txt'), 'utf8')).toBe(
             'user edit after preview\n',
         );
-        expect(checkpointCount.trim()).toBe('1');
+        expect(checkpointCount.trim().split('\n').filter(Boolean)).toHaveLength(1);
+    });
+
+    it('preserves a user edit made after restore execution starts but before its file mutation', async () => {
+        const plan = await createAgentModifiedPlan();
+        const executor = new CheckpointRestoreExecutor(checkpointRoot, {
+            mutate: async (mutation) => {
+                await writeFile(join(projectPath, mutation.entry.path), 'concurrent user edit\n');
+                await mutation.apply();
+            },
+        });
+
+        const result = await executor.execute({
+            ...binding,
+            operationId: 'rewind-concurrent-user-edit',
+            projectPath,
+            plan,
+            confirmed: true,
+        });
+
+        expect(result).toMatchObject({
+            status: 'partial',
+            entries: [{
+                path: 'tracked.txt',
+                action: 'restore',
+                outcome: 'failed',
+                failureCode: 'mutation-failed',
+            }],
+        });
+        expect(await readFile(join(projectPath, 'tracked.txt'), 'utf8')).toBe(
+            'concurrent user edit\n',
+        );
+    });
+
+    it('pins the restore target and safety checkpoint during concurrent garbage collection', async () => {
+        const plan = await createAgentModifiedPlan();
+        let gcResult: Awaited<ReturnType<CheckpointGarbageCollector['collect']>> | undefined;
+        const executor = new CheckpointRestoreExecutor(checkpointRoot, {
+            mutate: async (mutation) => {
+                gcResult = await new CheckpointGarbageCollector(checkpointRoot).collect({
+                    maxCheckpointsPerBinding: 0,
+                });
+                await mutation.apply();
+            },
+        });
+
+        const result = await executor.execute({
+            ...binding,
+            operationId: 'rewind-with-concurrent-gc',
+            projectPath,
+            plan,
+            confirmed: true,
+        });
+
+        expect(result).toMatchObject({ status: 'completed' });
+        expect(gcResult).toMatchObject({ prunedCheckpoints: 0, retainedActive: 1 });
+        if (result.status !== 'completed') throw new Error('expected completed restore');
+        const layout = resolveCheckpointStoreLayout({ checkpointRoot, ...binding });
+        await expect(execFileAsync('git', [
+            `--git-dir=${layout.gitDirectory}`,
+            'cat-file',
+            '-e',
+            `${result.safetyCheckpointId}^{commit}`,
+        ])).resolves.toBeDefined();
     });
 
     it('journals partial failure and retries only failed entries with the same operation id', async () => {
@@ -229,11 +297,11 @@ describe('CheckpointRestoreExecutor', () => {
         const layout = resolveCheckpointStoreLayout({ checkpointRoot, ...binding });
         const { stdout: checkpointCount } = await execFileAsync('git', [
             `--git-dir=${layout.gitDirectory}`,
-            'rev-list',
-            '--count',
-            layout.refName,
+            'for-each-ref',
+            '--format=%(objectname)',
+            checkpointOperationRefPrefix(layout),
         ]);
-        expect(checkpointCount.trim()).toBe('2');
+        expect(checkpointCount.trim().split('\n').filter(Boolean)).toHaveLength(2);
     });
 
     it('fails closed when a durable journal contains an impossible action outcome', async () => {

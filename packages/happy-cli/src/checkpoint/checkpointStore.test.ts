@@ -1,10 +1,11 @@
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join, parse, relative } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+    checkpointOperationRefPrefix,
     CheckpointStore,
     resolveCheckpointStoreLayout,
     validateCheckpointProjectPath,
@@ -144,9 +145,9 @@ describe('CheckpointStore', () => {
         const layout = resolveCheckpointStoreLayout({ checkpointRoot, ...binding });
         const { stdout: count } = await execFileAsync('git', [
             `--git-dir=${layout.gitDirectory}`,
-            'rev-list',
-            '--count',
-            layout.refName,
+            'for-each-ref',
+            '--format=%(objectname)',
+            checkpointOperationRefPrefix(layout),
         ]);
         const [{ stdout: before }, { stdout: after }] = await Promise.all([
             execFileAsync('git', [
@@ -161,9 +162,71 @@ describe('CheckpointStore', () => {
             ]),
         ]);
 
-        expect(count.trim()).toBe('2');
+        expect(count.trim().split('\n').filter(Boolean)).toHaveLength(2);
         expect(before).toBe('before\n');
         expect(after).toBe('after\n');
+    });
+
+    it('reuses the durable operation checkpoint after a daemon restart', async () => {
+        const binding = {
+            sessionId: 'session-1',
+            projectId: 'project-1',
+            worktreeId: null,
+            projectPath,
+        };
+        await writeFile(join(projectPath, 'message.txt'), 'before\n');
+        const first = await new CheckpointStore(checkpointRoot).snapshotTurn({
+            ...binding,
+            operationId: 'turn-retried-after-restart',
+        });
+        await writeFile(join(projectPath, 'message.txt'), 'changed after checkpoint\n');
+
+        const retried = await new CheckpointStore(checkpointRoot).snapshotTurn({
+            ...binding,
+            operationId: 'turn-retried-after-restart',
+        });
+
+        expect(retried).toEqual({ checkpointId: first.checkpointId, created: false });
+        const layout = resolveCheckpointStoreLayout({ checkpointRoot, ...binding });
+        const { stdout: count } = await execFileAsync('git', [
+            `--git-dir=${layout.gitDirectory}`,
+            'for-each-ref',
+            '--format=%(objectname)',
+            checkpointOperationRefPrefix(layout),
+        ]);
+        expect(count.trim().split('\n').filter(Boolean)).toHaveLength(1);
+    });
+
+    it('converges concurrent daemon instances on one durable operation checkpoint', async () => {
+        const request = {
+            sessionId: 'session-1',
+            projectId: 'project-1',
+            worktreeId: null,
+            projectPath,
+            operationId: 'turn-overlapping-daemons',
+        } as const;
+        await writeFile(join(projectPath, 'message.txt'), 'before\n');
+        await new CheckpointStore(checkpointRoot).snapshotTurn({
+            ...request,
+            operationId: 'turn-bootstrap-store',
+        });
+        await writeFile(join(projectPath, 'message.txt'), 'overlapping daemon version\n');
+
+        const results = await Promise.all([
+            new CheckpointStore(checkpointRoot).snapshotTurn(request),
+            new CheckpointStore(checkpointRoot).snapshotTurn(request),
+        ]);
+
+        expect(new Set(results.map(({ checkpointId }) => checkpointId))).toHaveLength(1);
+        expect(results.filter(({ created }) => created)).toHaveLength(1);
+        const layout = resolveCheckpointStoreLayout({ checkpointRoot, ...request });
+        const { stdout } = await execFileAsync('git', [
+            `--git-dir=${layout.gitDirectory}`,
+            'for-each-ref',
+            '--format=%(objectname)',
+            checkpointOperationRefPrefix(layout),
+        ]);
+        expect(stdout.trim().split('\n').filter(Boolean)).toHaveLength(2);
     });
 
     it('rejects rebinding the same identity to another project path', async () => {
@@ -171,6 +234,13 @@ describe('CheckpointStore', () => {
         await mkdir(otherProjectPath);
         await writeFile(join(projectPath, 'message.txt'), 'first project\n');
         await writeFile(join(otherProjectPath, 'message.txt'), 'other project\n');
+        await new CheckpointStore(checkpointRoot).snapshotTurn({
+            sessionId: 'bootstrap-session',
+            projectId: 'bootstrap-project',
+            worktreeId: null,
+            operationId: 'turn-bootstrap-binding-race',
+            projectPath,
+        });
         const store = new CheckpointStore(checkpointRoot);
         const binding = {
             sessionId: 'session-1',
@@ -193,11 +263,44 @@ describe('CheckpointStore', () => {
         const layout = resolveCheckpointStoreLayout({ checkpointRoot, ...binding });
         const { stdout: count } = await execFileAsync('git', [
             `--git-dir=${layout.gitDirectory}`,
-            'rev-list',
-            '--count',
-            layout.refName,
+            'for-each-ref',
+            '--format=%(objectname)',
+            checkpointOperationRefPrefix(layout),
         ]);
-        expect(count.trim()).toBe('1');
+        expect(count.trim().split('\n').filter(Boolean)).toHaveLength(1);
+    });
+
+    it('atomically binds one project when different paths race on first snapshot', async () => {
+        const otherProjectPath = join(fixtureRoot, 'other-project');
+        await mkdir(otherProjectPath);
+        await writeFile(join(projectPath, 'message.txt'), 'first project\n');
+        await writeFile(join(otherProjectPath, 'message.txt'), 'other project\n');
+        const binding = {
+            sessionId: 'session-1',
+            projectId: 'project-1',
+            worktreeId: null,
+        } as const;
+        const results = await Promise.allSettled([
+            new CheckpointStore(checkpointRoot).snapshotTurn({
+                ...binding,
+                operationId: 'turn-first-project',
+                projectPath,
+            }),
+            new CheckpointStore(checkpointRoot).snapshotTurn({
+                ...binding,
+                operationId: 'turn-other-project',
+                projectPath: otherProjectPath,
+            }),
+        ]);
+
+        expect(results.filter(({ status }) => status === 'fulfilled')).toHaveLength(1);
+        expect(results.filter(({ status }) => status === 'rejected')).toHaveLength(1);
+        const winningIndex = results.findIndex(({ status }) => status === 'fulfilled');
+        const layout = resolveCheckpointStoreLayout({ checkpointRoot, ...binding });
+        const metadata = JSON.parse(await readFile(layout.metadataFile, 'utf8')) as { projectPath: string };
+        expect(metadata.projectPath).toBe(await realpath(
+            winningIndex === 0 ? projectPath : otherProjectPath,
+        ));
     });
 
     it('excludes secret globs even when an exact manifest path was not supplied', async () => {

@@ -9,11 +9,14 @@ import {
 } from './checkpointProtectionState';
 import { CheckpointRestoreExecutor } from './checkpointRestore';
 import { CheckpointRestorePlanner } from './checkpointRestorePlan';
-import { resolveCheckpointStoreLayout } from './checkpointStore';
+import { checkpointOperationRefPrefix, resolveCheckpointStoreLayout } from './checkpointStore';
 
 const identifierSchema = z.string().min(1).max(128).refine(
     (value) => value.trim() === value && !/[\u0000-\u001F\u007F]/.test(value),
     'identifier must not contain surrounding whitespace or control characters',
+);
+const operationIdSchema = z.string().regex(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
 );
 
 const bindingRequestSchema = z.object({
@@ -28,7 +31,7 @@ const previewRequestSchema = bindingRequestSchema.extend({
 }).strict();
 
 const cancelRequestSchema = bindingRequestSchema.extend({
-    operationId: identifierSchema,
+    operationId: operationIdSchema,
 }).strict();
 
 const decisionRequestSchema = cancelRequestSchema.extend({
@@ -75,7 +78,7 @@ const restorePlanSchema = z.object({
 }).strict();
 
 const executeRequestSchema = bindingRequestSchema.extend({
-    operationId: identifierSchema,
+    operationId: operationIdSchema,
     confirmed: z.literal(true),
     plan: restorePlanSchema,
 }).strict();
@@ -305,17 +308,20 @@ async function listOwnedCheckpoints(
         throw error;
     }
     const environment = checkpointGitEnvironment(layout.gitDirectory);
-    const ref = await runGit(['show-ref', '--verify', '--quiet', layout.refName], authority.projectPath, environment);
-    if (ref.exitCode === 1) return [];
-    if (ref.exitCode !== 0) throw new Error(`checkpoint list failed: ${ref.stderr}`);
-    const history = await runGit(
-        ['rev-list', '--timestamp', layout.refName],
+    const operationRefs = await runGit(
+        [
+            'for-each-ref',
+            '--format=%(objectname)%09%(contents:subject)%09%(creatordate:unix)',
+            checkpointOperationRefPrefix(layout),
+        ],
         authority.projectPath,
         environment,
     );
-    if (history.exitCode !== 0) throw new Error(`checkpoint list failed: ${history.stderr}`);
-    return history.stdout.trim().split('\n').filter(Boolean).map((line) => {
-        const [timestamp, checkpointId, ...remainder] = line.split(' ');
+    if (operationRefs.exitCode !== 0) throw new Error(`checkpoint list failed: ${operationRefs.stderr}`);
+    let history = operationRefs.stdout.trim().split('\n').filter(Boolean).map((line) => {
+        const [checkpointId, subject, fallbackTimestamp, ...remainder] = line.split('\t');
+        const messageTimestamp = subject?.match(/^saycode-checkpoint-v1 (\d+)$/)?.[1];
+        const timestamp = messageTimestamp ?? (fallbackTimestamp && `${Number(fallbackTimestamp) * 1000}`);
         if (
             remainder.length > 0
             || !/^\d+$/.test(timestamp ?? '')
@@ -323,8 +329,24 @@ async function listOwnedCheckpoints(
         ) {
             throw new Error('checkpoint list contains invalid history');
         }
-        return { checkpointId: checkpointId!, createdAt: Number(timestamp) * 1000 };
+        return { checkpointId: checkpointId!, createdAt: Number(timestamp) };
     });
+    if (history.length === 0) {
+        const ref = await runGit(['show-ref', '--verify', '--quiet', layout.refName], authority.projectPath, environment);
+        if (ref.exitCode === 1) return [];
+        if (ref.exitCode !== 0) throw new Error(`checkpoint list failed: ${ref.stderr}`);
+        const legacy = await runGit(['rev-list', '--timestamp', layout.refName], authority.projectPath, environment);
+        if (legacy.exitCode !== 0) throw new Error(`checkpoint list failed: ${legacy.stderr}`);
+        history = legacy.stdout.trim().split('\n').filter(Boolean).map((line) => {
+            const [timestamp, checkpointId, ...remainder] = line.split(' ');
+            if (remainder.length > 0 || !/^\d+$/.test(timestamp ?? '') || !/^[a-f0-9]{40,64}$/.test(checkpointId ?? '')) {
+                throw new Error('checkpoint list contains invalid history');
+            }
+            return { checkpointId: checkpointId!, createdAt: Number(timestamp) * 1000 };
+        });
+    }
+    return [...new Map(history.map((checkpoint) => [checkpoint.checkpointId, checkpoint])).values()]
+        .sort((left, right) => right.createdAt - left.createdAt || right.checkpointId.localeCompare(left.checkpointId));
 }
 
 function checkpointGitEnvironment(gitDirectory: string): NodeJS.ProcessEnv {
