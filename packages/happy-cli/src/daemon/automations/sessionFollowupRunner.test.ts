@@ -173,6 +173,16 @@ describe('sessionFollowupRunner', () => {
     ])).toEqual({ kind: 'continue' })
   })
 
+  it.each([
+    ['an omitted findings attribute', '<saycode-complete status="blocked">Blocked.</saycode-complete>'],
+    ['status and tag casing with attribute whitespace', '<saycode-complete STATUS = "Completed">Done.</SAYCODE-COMPLETE>'],
+  ])('accepts the Desktop completion-signal contract with %s', (_name, signal) => {
+    expect(evaluateReviewFindings([
+      '{"findings":[{"severity":"medium"}]}\n',
+      signal,
+    ])).toEqual({ kind: 'continue' })
+  })
+
   it('fails closed when two complete raw review responses are concatenated', () => {
     expect(evaluateReviewFindings([
       '{"findings":[{"severity":"medium"}]}\n',

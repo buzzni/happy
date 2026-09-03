@@ -90,7 +90,9 @@ running when an agent follows the semantic contract but omits only the Markdown
 fence; multiple objects, multiple completion signals, malformed objects, text
 between the final object and the completion signal, or content after the signal's
 first closing tag remain `UNSTRUCTURED`. The completion signal is a boundary, not a
-verdict: its `findings` count never substitutes for parsing the review object.
+verdict: a valid `completed`/`blocked` status is required case-insensitively, while
+the `findings` attribute is optional and never substitutes for parsing the review
+object.
 
 `findings` is interpreted as follows:
 

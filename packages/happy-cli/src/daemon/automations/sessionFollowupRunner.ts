@@ -175,7 +175,7 @@ export function observeFollowupTurn(messages: Array<{ seq: number; localId: stri
   return { observedSeq, complete, failed, userIntervened, agentTexts }
 }
 
-const COMPLETION_SIGNAL_OPEN_RE = /<saycode-complete\b(?=[^>]*\bstatus="(?:completed|blocked)")(?=[^>]*\bfindings="\d+")[^>]*>/g
+const COMPLETION_SIGNAL_OPEN_RE = /<saycode-complete\b(?=[^>]*\bstatus\s*=\s*"(?:completed|blocked)")[^>]*>/gi
 const COMPLETION_SIGNAL_CLOSE = '</saycode-complete>'
 
 function terminalCompletionSignalStart(text: string): number | null {
@@ -183,7 +183,7 @@ function terminalCompletionSignalStart(text: string): number | null {
   if (openings.length !== 1) return null
   const opening = openings[0]!
   const start = opening.index ?? 0
-  const closeStart = text.indexOf(COMPLETION_SIGNAL_CLOSE, start + opening[0].length)
+  const closeStart = text.toLowerCase().indexOf(COMPLETION_SIGNAL_CLOSE, start + opening[0].length)
   return closeStart >= 0 && closeStart + COMPLETION_SIGNAL_CLOSE.length === text.length
     ? start
     : null
