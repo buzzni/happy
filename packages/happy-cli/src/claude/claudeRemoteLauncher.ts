@@ -21,6 +21,7 @@ import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
 import type { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
+import { createStreamDeltaRelay } from './streamDeltaRelay';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
 
 interface PermissionsField {
@@ -134,6 +135,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     // reset() moves any stale entries to completedRequests with status
     // 'canceled' so the UI reflects what actually happened.
     permissionHandler.reset('Previous CLI process exited before responding');
+
+    // Token-level preview frames ride a separate volatile channel and never
+    // enter the persisted message queue below.
+    const streamRelay = createStreamDeltaRelay({
+        emit: (frame) => session.client.sendStreamDelta(frame),
+    });
 
     // Create outgoing message queue
     const messageQueue = new OutgoingMessageQueue(
@@ -464,6 +471,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     claudeEnvVars: session.claudeEnvVars,
                     claudeArgs: session.claudeArgs,
                     onMessage,
+                    onStreamEvent: streamRelay.handleStreamEvent,
                     onCompletionEvent: (message: string) => {
                         logger.debug(`[remote]: Completion event: ${message}`);
                         session.client.sendSessionEvent({ type: 'message', message });
@@ -520,6 +528,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             } finally {
 
                 mcpController = null;
+                // The process is gone: whatever text is still buffered can
+                // never be completed, so ship it as-is rather than let it
+                // leak into the next launch's frames.
+                streamRelay.flush();
 
                 logger.debug('[remote]: launch finally');
 
@@ -552,6 +564,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     } finally {
 
         activeInputSender = null;
+        streamRelay.dispose();
 
         // Clean up permission handler
         permissionHandler.reset();

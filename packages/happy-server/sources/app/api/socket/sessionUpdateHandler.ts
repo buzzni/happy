@@ -7,8 +7,19 @@ import { AsyncLock } from "@/utils/lock";
 import { log } from "@/utils/log";
 import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { persistSessionEvent } from "@/app/events/persistSessionEvent";
+import { sessionStreamRateLimiter } from "@/app/events/sessionStreamRateLimiter";
 import { SESSION_EVENT_TYPES } from "@/app/events/sessionEventTypes";
 import { Socket } from "socket.io";
+
+// streamDeltaRelay caps a delta at DEFAULT_STREAM_MAX_BYTES = 2048 UTF-16
+// code units — but that bounds *characters*, not bytes: dense CJK text (this
+// is a Korean-language product) is 3 UTF-8 bytes/char, so worst case is
+// ~2048*3 = 6144 bytes of delta text alone, plus JSON structure (~300B) and
+// secretbox/AES-GCM overhead (nonce+MAC, ~40B) = ~6.5KB raw ciphertext, which
+// becomes ~8.7KB once base64-encoded (4/3 expansion). 16KB leaves comfortable
+// margin above that worst case while still bounding a flooding client to a
+// fraction of what the unbounded 64KB default would have allowed.
+const SESSION_STREAM_MAX_DATA_LENGTH = 16 * 1024;
 
 export function sessionUpdateHandler(userId: string, socket: Socket, connection: ClientConnection) {
     const labels = getMetricsLabelsFromSocket(socket);
@@ -182,6 +193,43 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             });
         } catch (error) {
             log({ module: 'websocket', level: 'error' }, `Error in session-alive: ${error}`);
+        }
+    });
+
+    // Token-level assistant preview. Pure relay: no persistence, no decrypt.
+    // The persisted message that follows is authoritative, so a dropped frame
+    // (volatile on the CLI side) is harmless.
+    socket.on('session-stream', async (data: {
+        sid: string;
+        time: number;
+        data: string;
+    }) => {
+        try {
+            websocketEventsCounter.inc({ event_type: 'session-stream', ...labels });
+            if (!data || typeof data.sid !== 'string' || typeof data.time !== 'number' || typeof data.data !== 'string') {
+                return;
+            }
+            if (data.data.length > SESSION_STREAM_MAX_DATA_LENGTH) {
+                return;
+            }
+            // Cheap and ownership-agnostic: cap admission before the
+            // isSessionValid lookup, since that check itself (plus the
+            // ephemeral fan-out below) is the cost a flooding client would
+            // otherwise spend unbounded.
+            if (!sessionStreamRateLimiter.admit(userId, data.sid)) {
+                return;
+            }
+            const isValid = await activityCache.isSessionValid(data.sid, userId);
+            if (!isValid) {
+                return;
+            }
+            eventRouter.emitEphemeral({
+                userId,
+                payload: { type: 'stream', id: data.sid, time: data.time, data: data.data },
+                recipientFilter: { type: 'user-scoped-only' }
+            });
+        } catch (error) {
+            log({ module: 'websocket', level: 'error' }, `Error in session-stream: ${error}`);
         }
     });
 

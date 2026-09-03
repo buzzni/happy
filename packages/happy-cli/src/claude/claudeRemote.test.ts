@@ -275,6 +275,46 @@ describe('claudeRemote', () => {
         expect(nextMessage).toHaveBeenCalledOnce();
     });
 
+    it('routes stream_event partials to onStreamEvent and keeps them out of the persisted onMessage path', async () => {
+        const streamEvent = {
+            type: 'stream_event',
+            uuid: 'evt-1',
+            session_id: 'claude-session',
+            parent_tool_use_id: null,
+            event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Hel' } },
+        };
+        vi.mocked(query).mockReturnValue({
+            setPermissionMode: vi.fn(),
+            mcpServerStatus: vi.fn(async () => []),
+            async *[Symbol.asyncIterator]() {
+                yield streamEvent;
+                yield { type: 'result', subtype: 'success' };
+            },
+        } as any);
+        const onMessage = vi.fn();
+        const onStreamEvent = vi.fn();
+
+        await claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            exitAfterFirstTurn: true,
+            nextMessage: vi.fn(async () => ({ message: 'hi', mode })),
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage,
+            onStreamEvent,
+        });
+
+        expect(onStreamEvent).toHaveBeenCalledWith(streamEvent);
+        expect(onMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'stream_event' }));
+        expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'result' }));
+    });
+
     it('pushes active-turn input into the running SDK prompt stream', async () => {
         let releaseResult!: () => void;
         const resultGate = new Promise<void>((resolve) => {

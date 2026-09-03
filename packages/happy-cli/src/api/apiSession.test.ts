@@ -203,6 +203,21 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(mockSocket.connect).toHaveBeenCalledTimes(1);
     });
 
+    it('sends stream deltas as volatile, session-key encrypted session-stream frames', () => {
+        const client = new ApiSessionClient('fake-token', session);
+
+        client.sendStreamDelta({ messageId: 'msg_1', index: 0, offset: 3, delta: 'Hel', final: false });
+
+        expect(mockSocket.emit).not.toHaveBeenCalledWith('session-stream', expect.anything());
+        expect(mockSocket.volatile.emit).toHaveBeenCalledTimes(1);
+        const [event, payload] = mockSocket.volatile.emit.mock.calls[0];
+        expect(event).toBe('session-stream');
+        expect(payload.sid).toBe('test-session-id');
+        expect(typeof payload.time).toBe('number');
+        expect(decrypt(session.encryptionKey, session.encryptionVariant, decodeBase64(payload.data)))
+            .toEqual({ messageId: 'msg_1', index: 0, offset: 3, delta: 'Hel', final: false });
+    });
+
     it('reapplies a metadata patch to the newest server document after a version mismatch', async () => {
         session.metadata = {
             ...session.metadata,

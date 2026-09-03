@@ -31,6 +31,8 @@ import { isMutableTool } from "@/components/tools/knownTools";
 import { DecryptedArtifact } from "./artifactTypes";
 import { FeedItem } from "./feedTypes";
 import { sessionUpdateMetadata } from "./ops";
+import { buildSessionStreamPreviewMessage, reduceSessionStreamPreview, type SessionStreamPreviewState } from './streamPreview';
+import type { ApiSessionStreamDelta } from './apiTypes';
 
 // Debounce timer for realtimeMode changes
 let realtimeModeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -151,6 +153,7 @@ interface StorageState {
     sessionsData: SessionListItem[] | null;  // Legacy - to be removed
     sessionListViewData: SessionListViewItem[] | null;
     sessionMessages: Record<string, SessionMessages>;
+    sessionStreamPreviews: Record<string, SessionStreamPreviewState>;
     pathGitStatus: Record<string, GitStatus | null>;        // keyed by "machineId:path"
     pathGitStatusFiles: Record<string, GitStatusFiles | null>; // keyed by "machineId:path"
     pathProjectFiles: Record<string, ProjectFilesList | null>;  // keyed by "machineId:path"
@@ -179,6 +182,8 @@ interface StorageState {
     applyLoaded: () => void;
     applyReady: () => void;
     applyMessages: (sessionId: string, messages: NormalizedMessage[]) => { changed: string[], hasReadyEvent: boolean };
+    applySessionStreamFrame: (sessionId: string, createdAt: number, frame: ApiSessionStreamDelta) => void;
+    clearSessionStreamPreview: (sessionId: string) => void;
     applyMessagesLoaded: (sessionId: string) => void;
     applyOlderMessagesPagination: (sessionId: string, info: { hasMore: boolean }) => void;
     applyOlderMessagesLoading: (sessionId: string, isLoading: boolean) => void;
@@ -357,6 +362,7 @@ export const storage = create<StorageState>()((set, get) => {
         sessionsData: null,  // Legacy - to be removed
         sessionListViewData: null,
         sessionMessages: {},
+        sessionStreamPreviews: {},
         pathGitStatus: {},
         pathGitStatusFiles: {},
         pathProjectFiles: {},
@@ -991,6 +997,18 @@ export const storage = create<StorageState>()((set, get) => {
                 }, REALTIME_MODE_DEBOUNCE_MS);
             }
         },
+        applySessionStreamFrame: (sessionId, createdAt, frame) => set((state) => ({
+            ...state,
+            sessionStreamPreviews: {
+                ...state.sessionStreamPreviews,
+                [sessionId]: reduceSessionStreamPreview(state.sessionStreamPreviews[sessionId], frame, createdAt),
+            },
+        })),
+        clearSessionStreamPreview: (sessionId) => set((state) => {
+            if (!(sessionId in state.sessionStreamPreviews)) return state;
+            const { [sessionId]: _removed, ...remaining } = state.sessionStreamPreviews;
+            return { ...state, sessionStreamPreviews: remaining };
+        }),
         clearRealtimeModeDebounce: () => {
             if (realtimeModeDebounceTimer) {
                 clearTimeout(realtimeModeDebounceTimer);
@@ -1265,6 +1283,7 @@ export const storage = create<StorageState>()((set, get) => {
             
             // Remove session messages if they exist
             const { [sessionId]: deletedMessages, ...remainingSessionMessages } = state.sessionMessages;
+            const { [sessionId]: _streamPreview, ...remainingStreamPreviews } = state.sessionStreamPreviews;
             
             const { [sessionId]: _fileCache, ...remainingFileCache } = state.sessionFileCache;
 
@@ -1292,6 +1311,7 @@ export const storage = create<StorageState>()((set, get) => {
                 ...state,
                 sessions: remainingSessions,
                 sessionMessages: remainingSessionMessages,
+                sessionStreamPreviews: remainingStreamPreviews,
                 sessionFileCache: remainingFileCache,
                 sessionListViewData
             };
@@ -1482,6 +1502,12 @@ export function useSessionMessages(sessionId: string): {
             isLoadingOlder: session?.isLoadingOlder ?? false
         };
     }));
+}
+
+export function useSessionStreamPreview(sessionId: string): Message | null {
+    return storage(useShallow((state) =>
+        buildSessionStreamPreviewMessage(state.sessionStreamPreviews[sessionId])
+    ));
 }
 
 export function useMessage(sessionId: string, messageId: string): Message | null {

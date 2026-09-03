@@ -53,6 +53,9 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         skills: opts?.skills,
         sandbox: opts?.sandbox,
         spawnClaudeCodeProcess: opts?.spawnClaudeCodeProcess,
+        // Token-level partials (`stream_event`) let the app render text as it
+        // is produced instead of after a whole content block completes.
+        includePartialMessages: true,
     }
 
     // Map abort signal -> AbortController
