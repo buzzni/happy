@@ -82,7 +82,19 @@ Sync pages include an explicit `hasMore` bit computed with a `limit + 1` query. 
 
 ## Review contract and fail-closed behavior
 
-The decrypted final agent response must be a JSON object (raw or a single JSON fence). `findings` is interpreted as follows:
+The decrypted final agent response must contain exactly one JSON review object. The
+preferred form is a single JSON fence after the human-readable summary. A raw object
+is also accepted when it is the entire response, or when it is the final object
+immediately before a terminal `<saycode-complete>` signal. The latter keeps the loop
+running when an agent follows the semantic contract but omits only the Markdown
+fence; multiple objects, multiple completion signals, malformed objects, text
+between the final object and the completion signal, or content after the signal's
+first closing tag remain `UNSTRUCTURED`. The completion signal is a boundary, not a
+verdict: a valid `completed`/`blocked` status is required case-insensitively, while
+the `findings` attribute is optional and never substitutes for parsing the review
+object.
+
+`findings` is interpreted as follows:
 
 - any `medium` or `high`: continue only if `currentRound < totalRounds`;
 - only `low`/`nit`: `LOW_OR_NIT_ONLY`;

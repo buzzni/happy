@@ -142,10 +142,108 @@ describe('sessionFollowupRunner', () => {
     ])).toEqual({ kind: 'continue' })
   })
 
+  it('fails closed when text appears between a fenced contract and the completion signal', () => {
+    expect(evaluateReviewFindings([
+      '```json\n{"findings":[{"severity":"medium"}]}\n```\n',
+      'This is the final result.\n',
+      '<saycode-complete status="completed" findings="1">Done.</saycode-complete>',
+    ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
+  })
+
+  it('reads a single trailing raw JSON contract before the completion signal', () => {
+    expect(evaluateReviewFindings([
+      'Fixed the runtime guard and synchronized the documentation.\n\n',
+      '{\n  "summary": "fixed",\n  "findings": [\n    { "severity": "medium", "title": "missing guard" },\n    { "severity": "low", "title": "stale docs" }\n  ]\n}\n',
+      '<saycode-complete status="completed" findings="2">Done.</saycode-complete>',
+    ])).toEqual({ kind: 'continue' })
+  })
+
+  it('does not mistake a completion-tag mention in the summary for the block start', () => {
+    expect(evaluateReviewFindings([
+      '{"findings":[{"severity":"medium"}]}\n',
+      '<saycode-complete status="completed" findings="1">Validated the `<saycode-complete>` boundary.</saycode-complete>',
+    ])).toEqual({ kind: 'continue' })
+  })
+
+  it('does not mistake a completion-tag mention before the raw contract for the signal', () => {
+    expect(evaluateReviewFindings([
+      'Reviewed the `<saycode-complete>` boundary.\n',
+      '{"findings":[{"severity":"medium"}]}\n',
+      '<saycode-complete status="completed" findings="1">Done.</saycode-complete>',
+    ])).toEqual({ kind: 'continue' })
+  })
+
+  it.each([
+    ['an omitted findings attribute', '<saycode-complete status="blocked">Blocked.</saycode-complete>'],
+    ['status and tag casing with attribute whitespace', '<saycode-complete STATUS = "Completed">Done.</SAYCODE-COMPLETE>'],
+  ])('accepts the Desktop completion-signal contract with %s', (_name, signal) => {
+    expect(evaluateReviewFindings([
+      '{"findings":[{"severity":"medium"}]}\n',
+      signal,
+    ])).toEqual({ kind: 'continue' })
+  })
+
+  it.each([
+    ['a similarly named attribute', '<saycode-complete data-status="completed">Done.</saycode-complete>'],
+    ['a later invalid duplicate status', '<saycode-complete status="completed" status="done">Done.</saycode-complete>'],
+  ])('fails closed on a completion signal with %s', (_name, signal) => {
+    expect(evaluateReviewFindings([
+      '{"findings":[{"severity":"medium"}]}\n',
+      signal,
+    ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
+  })
+
+  it('fails closed when two complete raw review responses are concatenated', () => {
+    expect(evaluateReviewFindings([
+      '{"findings":[{"severity":"medium"}]}\n',
+      '<saycode-complete status="completed" findings="1">First.</saycode-complete>\n',
+      '{"findings":[]}\n',
+      '<saycode-complete status="completed" findings="0">Second.</saycode-complete>',
+    ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
+  })
+
+  it('fails closed when content follows the first completion-signal close', () => {
+    expect(evaluateReviewFindings([
+      '{"findings":[{"severity":"medium"}]}\n',
+      '<saycode-complete status="completed" findings="1">First.</saycode-complete>\n',
+      '{"findings":[]}\n',
+      '</saycode-complete>',
+    ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
+  })
+
+  it('fails closed when human-readable text contains multiple raw JSON contracts', () => {
+    expect(evaluateReviewFindings([
+      'First result:\n{"findings":[{"severity":"medium"}]}\n',
+      'Final result:\n{"findings":[]}\n',
+      '<saycode-complete status="completed" findings="0">Done.</saycode-complete>',
+    ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
+  })
+
+  it('does not extract a raw JSON contract from prose without a completion signal', () => {
+    expect(evaluateReviewFindings([
+      'Fixed the issue.\n{"findings":[{"severity":"medium"}]}',
+    ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
+  })
+
+  it('fails closed when text appears between a raw JSON contract and the completion signal', () => {
+    expect(evaluateReviewFindings([
+      '{"findings":[{"severity":"medium"}]}\nThis is the final result.\n',
+      '<saycode-complete status="completed" findings="1">Done.</saycode-complete>',
+    ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
+  })
+
   it('fails closed when a response contains multiple JSON contracts', () => {
     expect(evaluateReviewFindings([
       '```json\n{"findings":[{"severity":"medium"}]}\n```\n',
       '```json\n{"findings":[]}\n```',
+    ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
+  })
+
+  it('fails closed when a raw contract precedes a fenced contract', () => {
+    expect(evaluateReviewFindings([
+      '{"findings":[{"severity":"medium"}]}\n',
+      '```json\n{"findings":[]}\n```\n',
+      '<saycode-complete status="completed" findings="0">Done.</saycode-complete>',
     ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
   })
 
