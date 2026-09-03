@@ -80,6 +80,13 @@ export interface QueryOptions {
     skills?: string[] | 'all'
     sandbox?: SandboxSettings
     spawnClaudeCodeProcess?: Options['spawnClaudeCodeProcess']
+    /**
+     * Forwarded straight to the underlying SDK option of the same name — emits
+     * `SDKPartialAssistantMessage` (`type: 'stream_event'`) as text/thinking
+     * blocks stream in, ahead of the completed message that already comes
+     * through unconditionally. See specs/desktop-speed-breakthrough-token-streaming.
+     */
+    includePartialMessages?: boolean
 }
 
 /**

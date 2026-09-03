@@ -18,6 +18,8 @@ import { getAskUserQuestionToolCallIds } from "./utils/questionNotification";
 import { cleanupStdinAfterInk } from "@/utils/terminalStdinCleanup";
 import type { MessageParam, ContentBlockParam } from '@anthropic-ai/sdk/resources';
 import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
+import { randomUUID } from 'node:crypto';
+import { createStreamTextCoalescer, type StreamTextCoalescer, type StreamTextEvent } from './streamTextCoalescer';
 import type { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
@@ -157,7 +159,38 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let ongoingToolCalls = new Map<string, { parentToolCallId: string | null }>();
     let notifiedQuestionToolCalls = new Set<string>();
 
+    // specs/desktop-speed-breakthrough-token-streaming: this streaming turn id
+    // is local to this preview channel — it is NOT `claudeSessionProtocolState
+    // .currentTurnId`. That id is only allocated once the *complete* assistant
+    // message arrives (`ensureTurn`, sessionProtocolMapper.ts), which is after
+    // every partial for that turn has already streamed in, so it is always
+    // stale (the previous turn's id, or null) for the deltas that need it.
+    // A fresh id per `message_start` is a self-contained correlation key: the
+    // desktop side is not expected to equality-match it against the persisted
+    // turn id (see spec R6 — the overlay is a self-healing latest snapshot).
+    let streamCoalescer: StreamTextCoalescer | null = null;
+
+    function handleStreamEvent(event: StreamTextEvent) {
+        if (event.type === 'message_start') {
+            streamCoalescer = createStreamTextCoalescer({ turnId: randomUUID() });
+            return;
+        }
+        if (!streamCoalescer) return;
+        const snapshot = streamCoalescer.push(event, Date.now());
+        if (snapshot) {
+            session.sendStreamTextPreview(snapshot.turnId, snapshot.blockIndex, snapshot.text);
+        }
+    }
+
     function onMessage(message: SDKMessage) {
+        // Ephemeral token-stream preview only — never reaches the ink transcript
+        // or the persisted-message pipeline below. One `stream_event` arrives
+        // per token chunk; routing it through those would spam the terminal and
+        // feed types neither of them was written to expect.
+        if (message.type === 'stream_event') {
+            handleStreamEvent(message.event as unknown as StreamTextEvent);
+            return;
+        }
 
         // Write to message log
         formatClaudeMessageForInk(message, messageBuffer);

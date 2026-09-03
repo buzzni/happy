@@ -229,6 +229,12 @@ export async function claudeRemote(opts: {
                     : never;
             }
             : undefined,
+        // specs/desktop-speed-breakthrough-token-streaming: lets `onMessage`
+        // receive `stream_event` messages so text can be relayed as it is
+        // generated instead of only once a full block completes. The final
+        // block-complete message this loop already emits is unaffected — this
+        // only adds a new message type to the stream, additive.
+        includePartialMessages: true,
     }
 
     // Track thinking state

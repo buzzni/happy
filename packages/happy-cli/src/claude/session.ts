@@ -118,6 +118,10 @@ export class Session {
         this.client.keepAlive(thinking, this.mode);
     }
 
+    sendStreamTextPreview = (turnId: string, blockIndex: number, text: string) => {
+        this.client.sendStreamTextPreview(turnId, blockIndex, text);
+    }
+
     onModeChange = (mode: 'local' | 'remote') => {
         this.mode = mode;
         this.client.keepAlive(this.thinking, mode);

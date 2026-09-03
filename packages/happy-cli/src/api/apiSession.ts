@@ -1268,6 +1268,21 @@ export class ApiSessionClient extends EventEmitter {
         this.reportDaemonRuntime(thinking);
     }
 
+    /**
+     * Ephemeral token-stream preview (specs/desktop-speed-breakthrough-token-streaming).
+     * `volatile` — a dropped frame is fine, the coalescer's next snapshot is
+     * self-contained and the durable `text` envelope that follows is
+     * unaffected either way.
+     */
+    sendStreamTextPreview(turnId: string, blockIndex: number, text: string) {
+        this.socket.volatile.emit('session-stream-text', {
+            sid: this.sessionId,
+            turnId,
+            blockIndex,
+            content: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, text)),
+        });
+    }
+
     private reportDaemonRuntime(thinking: boolean, force = false) {
         const hasOpenToolCall = this.openToolCallIds.size > 0;
         // Blocked waiting on a human: an open AskUserQuestion, or a pending
