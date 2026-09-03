@@ -175,11 +175,13 @@ export function observeFollowupTurn(messages: Array<{ seq: number; localId: stri
   return { observedSeq, complete, failed, userIntervened, agentTexts }
 }
 
-const COMPLETION_SIGNAL_BLOCK_RE = /<saycode-complete\b(?=[^>]*\bstatus="(?:completed|blocked)")(?=[^>]*\bfindings="\d+")[^>]*>[\s\S]*<\/saycode-complete>$/
+const COMPLETION_SIGNAL_OPEN_RE = /<saycode-complete\b(?=[^>]*\bstatus="(?:completed|blocked)")(?=[^>]*\bfindings="\d+")[^>]*>/g
+const COMPLETION_SIGNAL_CLOSE = '</saycode-complete>'
 
 function terminalCompletionSignalStart(text: string): number | null {
-  const match = COMPLETION_SIGNAL_BLOCK_RE.exec(text)
-  return match?.index ?? null
+  const openings = [...text.matchAll(COMPLETION_SIGNAL_OPEN_RE)]
+  if (openings.length !== 1 || !text.endsWith(COMPLETION_SIGNAL_CLOSE)) return null
+  return openings[0]!.index ?? null
 }
 
 type RawJsonObject = { end: number; value: unknown }

@@ -87,9 +87,10 @@ preferred form is a single JSON fence after the human-readable summary. A raw ob
 is also accepted when it is the entire response, or when it is the final object
 immediately before a terminal `<saycode-complete>` signal. The latter keeps the loop
 running when an agent follows the semantic contract but omits only the Markdown
-fence; multiple objects, malformed objects, or text between the final object and the
-completion signal remain `UNSTRUCTURED`. The completion signal is a boundary, not a
-verdict: its `findings` count never substitutes for parsing the review object.
+fence; multiple objects, multiple completion signals, malformed objects, or text
+between the final object and the completion signal remain `UNSTRUCTURED`. The
+completion signal is a boundary, not a verdict: its `findings` count never
+substitutes for parsing the review object.
 
 `findings` is interpreted as follows:
 

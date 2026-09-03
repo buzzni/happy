@@ -173,6 +173,15 @@ describe('sessionFollowupRunner', () => {
     ])).toEqual({ kind: 'continue' })
   })
 
+  it('fails closed when two complete raw review responses are concatenated', () => {
+    expect(evaluateReviewFindings([
+      '{"findings":[{"severity":"medium"}]}\n',
+      '<saycode-complete status="completed" findings="1">First.</saycode-complete>\n',
+      '{"findings":[]}\n',
+      '<saycode-complete status="completed" findings="0">Second.</saycode-complete>',
+    ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
+  })
+
   it('fails closed when human-readable text contains multiple raw JSON contracts', () => {
     expect(evaluateReviewFindings([
       'First result:\n{"findings":[{"severity":"medium"}]}\n',
