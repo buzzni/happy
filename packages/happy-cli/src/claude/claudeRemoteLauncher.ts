@@ -176,7 +176,17 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             return;
         }
         if (!streamCoalescer) return;
-        const snapshot = streamCoalescer.push(event, Date.now());
+        const now = Date.now();
+        // A block can close inside the 80ms coalescing window, and `push` only
+        // emits once that window elapses — so the last few characters written
+        // just before `content_block_stop` could otherwise never reach the
+        // preview channel at all (the coalescer drops the block's state on
+        // this same event). Flush whatever is pending first.
+        if (event.type === 'content_block_stop') {
+            const final = streamCoalescer.flush(event.index, now);
+            if (final) session.sendStreamTextPreview(final.turnId, final.blockIndex, final.text);
+        }
+        const snapshot = streamCoalescer.push(event, now);
         if (snapshot) {
             session.sendStreamTextPreview(snapshot.turnId, snapshot.blockIndex, snapshot.text);
         }
@@ -188,6 +198,16 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         // per token chunk; routing it through those would spam the terminal and
         // feed types neither of them was written to expect.
         if (message.type === 'stream_event') {
+            // Subagent (Task tool) activity shares this same message stream —
+            // `parent_tool_use_id` is how assistant/user messages below already
+            // detect it ("sidechain"). A subagent's own message_start/
+            // content_block_start reuse block index 0 like any fresh stream, so
+            // routing it into the single main-thread coalescer would either
+            // corrupt in-flight text (same index, different block) or wipe it
+            // outright (message_start replaces the whole coalescer). Subagent
+            // text preview isn't a stated goal, so the safe and simple fix is
+            // to only preview the main thread's own stream.
+            if (message.parent_tool_use_id != null) return;
             handleStreamEvent(message.event as unknown as StreamTextEvent);
             return;
         }
