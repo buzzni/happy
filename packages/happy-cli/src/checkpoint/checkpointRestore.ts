@@ -4,6 +4,7 @@ import { lstat, mkdir, mkdtemp, realpath, rm, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { CheckpointLedgerBinding } from './checkpointLedger';
 import { withCheckpointPin } from './checkpointGarbageCollector';
+import { observeCheckpointOperation, type CheckpointOperationObserver } from './checkpointObservability';
 import {
     checkpointRestoreJournalPath,
     checkpointRestoreRequestFingerprint,
@@ -55,6 +56,7 @@ export type CheckpointRestoreMutation = {
 
 export type CheckpointRestoreExecutorOptions = {
     mutate?: (mutation: CheckpointRestoreMutation) => Promise<void>;
+    observer?: CheckpointOperationObserver;
 };
 
 const restoreExecutionQueues = new Map<string, Promise<void>>();
@@ -62,13 +64,26 @@ const restoreExecutionQueues = new Map<string, Promise<void>>();
 export class CheckpointRestoreExecutor {
     private readonly checkpointRoot: string;
     private readonly mutate: (mutation: CheckpointRestoreMutation) => Promise<void>;
+    private readonly observer: CheckpointOperationObserver | undefined;
 
     constructor(checkpointRoot: string, options: CheckpointRestoreExecutorOptions = {}) {
         this.checkpointRoot = resolve(checkpointRoot);
         this.mutate = options.mutate ?? ((mutation) => mutation.apply());
+        this.observer = options.observer;
     }
 
-    async execute(
+    execute(
+        request: CheckpointRestoreExecuteRequest,
+    ): Promise<CheckpointRestoreExecuteResult> {
+        return observeCheckpointOperation(
+            'restore',
+            () => this.executeRequest(request),
+            summarizeRestore,
+            { observer: this.observer },
+        );
+    }
+
+    private async executeRequest(
         request: CheckpointRestoreExecuteRequest,
     ): Promise<CheckpointRestoreExecuteResult> {
         if (!request.confirmed) return { status: 'cancelled' };
@@ -230,6 +245,15 @@ export class CheckpointRestoreExecutor {
             await rm(temporaryDirectory, { recursive: true, force: true });
         }
     }
+}
+
+function summarizeRestore(result: CheckpointRestoreExecuteResult) {
+    const entries = 'entries' in result ? result.entries : [];
+    return {
+        status: result.status,
+        files: entries.length,
+        failed: entries.filter((entry) => entry.outcome === 'failed').length,
+    };
 }
 
 function validateOperationId(operationId: string): void {

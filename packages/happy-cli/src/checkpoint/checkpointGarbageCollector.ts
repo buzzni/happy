@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { access, lstat, readdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { observeCheckpointOperation, type CheckpointOperationObserver } from './checkpointObservability';
 import {
     checkpointOperationRefPrefix,
     checkpointPinRefPrefix,
@@ -31,12 +32,27 @@ type CheckpointPins = {
 
 export class CheckpointGarbageCollector {
     private readonly checkpointRoot: string;
+    private readonly observer: CheckpointOperationObserver | undefined;
 
-    constructor(checkpointRoot: string) {
+    constructor(checkpointRoot: string, options: { observer?: CheckpointOperationObserver } = {}) {
         this.checkpointRoot = resolve(checkpointRoot);
+        this.observer = options.observer;
     }
 
-    async collect(policy: RetentionPolicy): Promise<{
+    collect(policy: RetentionPolicy): Promise<{
+        prunedCheckpoints: number;
+        retainedActive: number;
+        storeBytes: number;
+    }> {
+        return observeCheckpointOperation(
+            'gc',
+            () => this.collectPolicy(policy),
+            (result) => result,
+            { observer: this.observer },
+        );
+    }
+
+    private async collectPolicy(policy: RetentionPolicy): Promise<{
         prunedCheckpoints: number;
         retainedActive: number;
         storeBytes: number;

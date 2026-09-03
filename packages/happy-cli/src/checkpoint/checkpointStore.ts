@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
+import { observeCheckpointOperation, type CheckpointOperationObserver } from './checkpointObservability';
 import { withCheckpointStoreLock } from './checkpointStoreLock';
 
 export type CheckpointStoreBinding = {
@@ -99,14 +100,16 @@ function isWithin(parent: string, child: string): boolean {
 
 export class CheckpointStore {
     private readonly checkpointRoot: string;
+    private readonly observer: CheckpointOperationObserver | undefined;
     private initialization: Promise<void> | null = null;
     private readonly latestOperationByRef = new Map<string, {
         operationId: string;
         snapshot: Promise<CheckpointSnapshotResult>;
     }>();
 
-    constructor(checkpointRoot: string) {
+    constructor(checkpointRoot: string, options: { observer?: CheckpointOperationObserver } = {}) {
         this.checkpointRoot = resolve(checkpointRoot);
+        this.observer = options.observer;
     }
 
     snapshotTurn(request: CheckpointSnapshotRequest): Promise<CheckpointSnapshotResult> {
@@ -121,7 +124,12 @@ export class CheckpointStore {
             return current.snapshot;
         }
 
-        const createSnapshot = this.createSnapshot(request, layout);
+        const createSnapshot = observeCheckpointOperation(
+            'snapshot',
+            () => this.createSnapshot(request, layout),
+            (result) => ({ created: result.created }),
+            { observer: this.observer },
+        );
         const snapshot = createSnapshot.then(
             (result) => {
                 this.clearInFlightOperation(layout.refName, snapshot);

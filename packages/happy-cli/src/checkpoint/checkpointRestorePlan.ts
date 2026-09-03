@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream, type Stats } from 'node:fs';
 import { lstat, mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { observeCheckpointOperation, type CheckpointOperationObserver } from './checkpointObservability';
 import {
     CheckpointLedger,
     type CheckpointLedgerBinding,
@@ -39,18 +40,29 @@ type CurrentFileState =
 
 export class CheckpointRestorePlanner {
     private readonly checkpointRoot: string;
+    private readonly observer: CheckpointOperationObserver | undefined;
 
-    constructor(checkpointRoot: string) {
+    constructor(checkpointRoot: string, options: { observer?: CheckpointOperationObserver } = {}) {
         this.checkpointRoot = resolve(checkpointRoot);
+        this.observer = options.observer;
     }
 
     checkpointBeforeRestore(
         request: CheckpointSnapshotRequest,
     ): Promise<CheckpointSnapshotResult> {
-        return new CheckpointStore(this.checkpointRoot).snapshotTurn(request);
+        return new CheckpointStore(this.checkpointRoot, { observer: this.observer }).snapshotTurn(request);
     }
 
-    async plan(request: CheckpointRestorePlanRequest): Promise<CheckpointRestorePlan> {
+    plan(request: CheckpointRestorePlanRequest): Promise<CheckpointRestorePlan> {
+        return observeCheckpointOperation(
+            'plan',
+            () => this.createPlan(request),
+            summarizePlan,
+            { observer: this.observer },
+        );
+    }
+
+    private async createPlan(request: CheckpointRestorePlanRequest): Promise<CheckpointRestorePlan> {
         validateCheckpointId(request.checkpointId);
         const projectPath = await realpath(request.projectPath);
         const records = await new CheckpointLedger(this.checkpointRoot).readRecords({
@@ -192,6 +204,12 @@ export class CheckpointRestorePlanner {
         const contents = await runGit(['cat-file', 'blob', header[2]], projectPath, environment);
         return createHash('sha256').update(contents).digest('hex');
     }
+}
+
+function summarizePlan(plan: CheckpointRestorePlan) {
+    const counts = { restore: 0, delete: 0, skip: 0, conflict: 0 };
+    for (const entry of plan.entries) counts[entry.action] += 1;
+    return { files: plan.entries.length, ...counts };
 }
 
 function createPlanEntry(
