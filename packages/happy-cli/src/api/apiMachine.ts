@@ -18,6 +18,7 @@ import {
 import { resolveAllowedRoot } from '../modules/common/resolveAllowedRoot';
 import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt } from './encryption';
+import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer';
 import { backoff } from '@/utils/time';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { createRpcRequestListener } from './rpc/rpcRequestListener';
@@ -2204,16 +2205,31 @@ export class ApiMachineClient {
                         (cwdDecision.fallback.error ? ` error=${JSON.stringify(cwdDecision.fallback.error)}` : ''),
                     );
                 }
+                // Coalescing spec: specs/platform-performance-roadmap D1 —
+                // every OS-read chunk would otherwise be its own
+                // encrypt+emit+relay+decrypt round trip; an output firehose
+                // (yes, find /) turns into a per-chunk message storm.
+                const outputCoalescer = createTerminalOutputCoalescer({
+                    sessionId,
+                    emit: (chunk) => {
+                        try {
+                            const data = encodeBase64(encrypt(machineKey, machineVariant, chunk));
+                            this.socket.emit('terminal-frame', { sessionId, data });
+                        } catch (e) {
+                            logger.debug(`[API MACHINE] terminal-frame encrypt failed: ${(e as Error).message}`);
+                        }
+                    },
+                });
                 pty.onData((chunk) => {
                     recordBytesOut(sessionId, chunk.length);
-                    try {
-                        const data = encodeBase64(encrypt(machineKey, machineVariant, chunk));
-                        this.socket.emit('terminal-frame', { sessionId, data });
-                    } catch (e) {
-                        logger.debug(`[API MACHINE] terminal-frame encrypt failed: ${(e as Error).message}`);
-                    }
+                    outputCoalescer.push(chunk);
                 });
                 pty.onExit((code, signal) => {
+                    // The process is gone: ship whatever output is still
+                    // buffered before the close frame, so the client's last
+                    // visible output isn't silently dropped.
+                    outputCoalescer.flush();
+                    outputCoalescer.dispose();
                     this.socket.emit('terminal-closed', { sessionId, code, signal });
                     const closedAt = Date.now();
                     // Audit log per specs/remote-terminal/ §3 #7. Body is
