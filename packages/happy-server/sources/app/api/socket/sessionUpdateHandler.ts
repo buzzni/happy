@@ -1,6 +1,7 @@
 import { getMetricsLabelsFromSocket, sessionAliveEventsCounter, websocketEventsCounter } from "@/app/monitoring/metrics2";
 import { activityCache } from "@/app/presence/sessionCache";
-import { buildNewMessageUpdate, buildSessionActivityEphemeral, buildUpdateSessionUpdate, ClientConnection, eventRouter } from "@/app/events/eventRouter";
+import { buildNewMessageUpdate, buildSessionActivityEphemeral, buildStreamTextEphemeral, buildUpdateSessionUpdate, ClientConnection, eventRouter } from "@/app/events/eventRouter";
+import { parseStreamTextPayload } from "@/app/events/streamTextPayload";
 import { db } from "@/storage/db";
 import { allocateSessionSeq, allocateUserSeq } from "@/storage/seq";
 import { AsyncLock } from "@/utils/lock";
@@ -182,6 +183,34 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             });
         } catch (error) {
             log({ module: 'websocket', level: 'error' }, `Error in session-alive: ${error}`);
+        }
+    });
+    // specs/desktop-speed-breakthrough-token-streaming: coalesced token-stream
+    // preview, relayed but never persisted or replayed — no DB write here,
+    // unlike session-alive's queueSessionUpdate. A client that does not know
+    // this event simply never emits it; the server accepting it is additive
+    // and does not change any existing wire contract.
+    socket.on('session-stream-text', async (data: unknown) => {
+        try {
+            websocketEventsCounter.inc({ event_type: 'session-stream-text', ...labels });
+
+            const payload = parseStreamTextPayload(data);
+            if (!payload) {
+                return;
+            }
+
+            const isValid = await activityCache.isSessionValid(payload.sid, userId);
+            if (!isValid) {
+                return;
+            }
+
+            eventRouter.emitEphemeral({
+                userId,
+                payload: buildStreamTextEphemeral(payload.sid, payload.turnId, payload.blockIndex, payload.content),
+                recipientFilter: { type: 'user-scoped-only' }
+            });
+        } catch (error) {
+            log({ module: 'websocket', level: 'error' }, `Error in session-stream-text: ${error}`);
         }
     });
 

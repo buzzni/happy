@@ -203,6 +203,18 @@ export type EphemeralEvent = {
     title: string;
     body: string;
     timestamp: number;
+} | {
+    // specs/desktop-speed-breakthrough-token-streaming: coalesced token-stream
+    // preview. Never persisted or replayed — the durable `text` envelope that
+    // follows is the only thing consumers keep. Ciphertext (E2EE), same as
+    // regular session messages; the server never sees plaintext.
+    type: 'stream-text';
+    sessionId: string;
+    turnId: string;
+    blockIndex: number;
+    /** Base64 ciphertext, same `encrypt()` call the CLI uses for message content. */
+    content: string;
+    timestamp: number;
 };
 
 // === EVENT PAYLOAD TYPES ===
@@ -577,6 +589,22 @@ export function buildMachineStatusEphemeral(machineId: string, online: boolean):
         type: 'machine-status',
         machineId,
         online,
+        timestamp: Date.now()
+    };
+}
+
+export function buildStreamTextEphemeral(
+    sessionId: string,
+    turnId: string,
+    blockIndex: number,
+    content: string,
+): EphemeralPayload {
+    return {
+        type: 'stream-text',
+        sessionId,
+        turnId,
+        blockIndex,
+        content,
         timestamp: Date.now()
     };
 }
