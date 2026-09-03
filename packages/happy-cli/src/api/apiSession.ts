@@ -1270,16 +1270,17 @@ export class ApiSessionClient extends EventEmitter {
 
     /**
      * Ephemeral token-stream preview (specs/desktop-speed-breakthrough-token-streaming).
-     * `volatile` — a dropped frame is fine, the coalescer's next snapshot is
-     * self-contained and the durable `text` envelope that follows is
-     * unaffected either way.
+     * `volatile` — the receiver uses the sequence to hide an incomplete
+     * preview after a dropped chunk, and the durable `text` envelope that
+     * follows is unaffected either way.
      */
-    sendStreamTextPreview(turnId: string, blockIndex: number, text: string) {
+    sendStreamTextPreview(turnId: string, blockIndex: number, sequence: number, delta: string) {
         this.socket.volatile.emit('session-stream-text', {
             sid: this.sessionId,
             turnId,
             blockIndex,
-            content: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, text)),
+            sequence,
+            content: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, delta)),
         });
     }
 

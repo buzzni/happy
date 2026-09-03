@@ -203,6 +203,13 @@ export type EphemeralEvent = {
     title: string;
     body: string;
     timestamp: number;
+} | {
+    type: 'stream-text';
+    sessionId: string;
+    turnId: string;
+    blockIndex: number;
+    sequence: number;
+    content: string;
 };
 
 // === EVENT PAYLOAD TYPES ===

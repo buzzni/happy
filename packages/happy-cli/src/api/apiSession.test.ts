@@ -824,6 +824,26 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(typeof (sessionOnly as any).content.time).toBe('number');
     });
 
+    it('encrypts and emits sequenced stream text chunks on the volatile channel', () => {
+        const client = new ApiSessionClient('fake-token', session);
+
+        client.sendStreamTextPreview('turn-1', 2, 3, 'partial text');
+
+        expect(mockSocket.volatile.emit).toHaveBeenCalledWith('session-stream-text', {
+            sid: 'test-session-id',
+            turnId: 'turn-1',
+            blockIndex: 2,
+            sequence: 3,
+            content: expect.any(String),
+        });
+        const payload = mockSocket.volatile.emit.mock.calls[0][1];
+        expect(decrypt(
+            session.encryptionKey,
+            session.encryptionVariant,
+            decodeBase64(payload.content),
+        )).toBe('partial text');
+    });
+
     it('reports keep-alive thinking state to the local daemon', () => {
         const client = new ApiSessionClient('fake-token', session);
 

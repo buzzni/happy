@@ -31,6 +31,12 @@ import { isMutableTool } from "@/components/tools/knownTools";
 import { DecryptedArtifact } from "./artifactTypes";
 import { FeedItem } from "./feedTypes";
 import { sessionUpdateMetadata } from "./ops";
+import {
+    applyStreamTextChunk as reduceStreamTextChunk,
+    streamTextPreviewMessages,
+    type StreamTextChunk,
+    type StreamTextPreviewState,
+} from "./streamTextPreview";
 
 // Debounce timer for realtimeMode changes
 let realtimeModeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -151,6 +157,7 @@ interface StorageState {
     sessionsData: SessionListItem[] | null;  // Legacy - to be removed
     sessionListViewData: SessionListViewItem[] | null;
     sessionMessages: Record<string, SessionMessages>;
+    streamTextPreviews: Record<string, StreamTextPreviewState>;
     pathGitStatus: Record<string, GitStatus | null>;        // keyed by "machineId:path"
     pathGitStatusFiles: Record<string, GitStatusFiles | null>; // keyed by "machineId:path"
     pathProjectFiles: Record<string, ProjectFilesList | null>;  // keyed by "machineId:path"
@@ -179,6 +186,8 @@ interface StorageState {
     applyLoaded: () => void;
     applyReady: () => void;
     applyMessages: (sessionId: string, messages: NormalizedMessage[]) => { changed: string[], hasReadyEvent: boolean };
+    applyStreamTextChunk: (sessionId: string, chunk: StreamTextChunk) => void;
+    clearStreamTextPreview: (sessionId: string) => void;
     applyMessagesLoaded: (sessionId: string) => void;
     applyOlderMessagesPagination: (sessionId: string, info: { hasMore: boolean }) => void;
     applyOlderMessagesLoading: (sessionId: string, isLoading: boolean) => void;
@@ -357,6 +366,7 @@ export const storage = create<StorageState>()((set, get) => {
         sessionsData: null,  // Legacy - to be removed
         sessionListViewData: null,
         sessionMessages: {},
+        streamTextPreviews: {},
         pathGitStatus: {},
         pathGitStatusFiles: {},
         pathProjectFiles: {},
@@ -764,6 +774,18 @@ export const storage = create<StorageState>()((set, get) => {
 
             return { changed: Array.from(changed), hasReadyEvent };
         },
+        applyStreamTextChunk: (sessionId: string, chunk: StreamTextChunk) => set((state) => ({
+            ...state,
+            streamTextPreviews: {
+                ...state.streamTextPreviews,
+                [sessionId]: reduceStreamTextChunk(state.streamTextPreviews[sessionId], chunk, Date.now()),
+            },
+        })),
+        clearStreamTextPreview: (sessionId: string) => set((state) => {
+            if (!state.streamTextPreviews[sessionId]) return state;
+            const { [sessionId]: _preview, ...remaining } = state.streamTextPreviews;
+            return { ...state, streamTextPreviews: remaining };
+        }),
         applyMessagesLoaded: (sessionId: string) => set((state) => {
             const existingSession = state.sessionMessages[sessionId];
             let result: StorageState;
@@ -1265,6 +1287,7 @@ export const storage = create<StorageState>()((set, get) => {
             
             // Remove session messages if they exist
             const { [sessionId]: deletedMessages, ...remainingSessionMessages } = state.sessionMessages;
+            const { [sessionId]: _preview, ...remainingStreamTextPreviews } = state.streamTextPreviews;
             
             const { [sessionId]: _fileCache, ...remainingFileCache } = state.sessionFileCache;
 
@@ -1292,6 +1315,7 @@ export const storage = create<StorageState>()((set, get) => {
                 ...state,
                 sessions: remainingSessions,
                 sessionMessages: remainingSessionMessages,
+                streamTextPreviews: remainingStreamTextPreviews,
                 sessionFileCache: remainingFileCache,
                 sessionListViewData
             };
@@ -1475,8 +1499,11 @@ export function useSessionMessages(sessionId: string): {
 } {
     return storage(useShallow((state) => {
         const session = state.sessionMessages[sessionId];
+        const previews = streamTextPreviewMessages(state.streamTextPreviews[sessionId]);
         return {
-            messages: session?.messages ?? emptyArray,
+            messages: previews.length > 0
+                ? [...previews, ...(session?.messages ?? emptyArray)]
+                : session?.messages ?? emptyArray,
             isLoaded: session?.isLoaded ?? false,
             hasMoreOlder: session?.hasMoreOlder ?? false,
             isLoadingOlder: session?.isLoadingOlder ?? false

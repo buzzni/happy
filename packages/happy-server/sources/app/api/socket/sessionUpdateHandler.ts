@@ -10,6 +10,32 @@ import { persistSessionEvent } from "@/app/events/persistSessionEvent";
 import { SESSION_EVENT_TYPES } from "@/app/events/sessionEventTypes";
 import { Socket } from "socket.io";
 
+const MAX_STREAM_TEXT_CONTENT_LENGTH = 256 * 1024;
+
+function isStreamTextPreview(data: unknown): data is {
+    sid: string;
+    turnId: string;
+    blockIndex: number;
+    sequence: number;
+    content: string;
+} {
+    if (!data || typeof data !== 'object') return false;
+    const value = data as Record<string, unknown>;
+    return typeof value.sid === 'string'
+        && value.sid.length > 0
+        && value.sid.length <= 128
+        && typeof value.turnId === 'string'
+        && value.turnId.length > 0
+        && value.turnId.length <= 128
+        && Number.isSafeInteger(value.blockIndex)
+        && (value.blockIndex as number) >= 0
+        && Number.isSafeInteger(value.sequence)
+        && (value.sequence as number) >= 0
+        && typeof value.content === 'string'
+        && value.content.length > 0
+        && value.content.length <= MAX_STREAM_TEXT_CONTENT_LENGTH;
+}
+
 export function sessionUpdateHandler(userId: string, socket: Socket, connection: ClientConnection) {
     const labels = getMetricsLabelsFromSocket(socket);
     socket.on('update-metadata', async (data: any, callback: (response: any) => void) => {
@@ -183,6 +209,26 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
         } catch (error) {
             log({ module: 'websocket', level: 'error' }, `Error in session-alive: ${error}`);
         }
+    });
+
+    socket.on('session-stream-text', (data: unknown) => {
+        websocketEventsCounter.inc({ event_type: 'session-stream-text', ...labels });
+        if (!isStreamTextPreview(data)) return;
+        if (connection.connectionType !== 'session-scoped' || connection.sessionId !== data.sid) return;
+
+        eventRouter.emitEphemeral({
+            userId,
+            payload: {
+                type: 'stream-text',
+                sessionId: data.sid,
+                turnId: data.turnId,
+                blockIndex: data.blockIndex,
+                sequence: data.sequence,
+                content: data.content,
+            },
+            recipientFilter: { type: 'all-interested-in-session', sessionId: data.sid },
+            skipSenderConnection: connection,
+        });
     });
 
     const receiveMessageLock = new AsyncLock();
