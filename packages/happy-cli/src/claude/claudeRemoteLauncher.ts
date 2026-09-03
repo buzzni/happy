@@ -167,7 +167,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     // stale (the previous turn's id, or null) for the deltas that need it.
     // A fresh id per `message_start` is a self-contained correlation key: the
     // desktop side is not expected to equality-match it against the persisted
-    // turn id (see spec R6 — the overlay is a self-healing latest snapshot).
+    // turn id; it only scopes the transient preview chunks for this turn.
     let streamCoalescer: StreamTextCoalescer | null = null;
 
     function handleStreamEvent(event: StreamTextEvent) {
@@ -181,14 +181,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         // emits once that window elapses — so the last few characters written
         // just before `content_block_stop` could otherwise never reach the
         // preview channel at all (the coalescer drops the block's state on
-        // this same event). Flush whatever is pending first.
+        // this same event, see `streamTextCoalescer.ts`'s `push`). Flush
+        // whatever is pending first.
         if (event.type === 'content_block_stop') {
-            const final = streamCoalescer.flush(event.index, now);
-            if (final) session.sendStreamTextPreview(final.turnId, final.blockIndex, final.text);
+            for (const chunk of streamCoalescer.flush(event.index, now)) {
+                session.sendStreamTextPreview(chunk.turnId, chunk.blockIndex, chunk.sequence, chunk.delta);
+            }
         }
-        const snapshot = streamCoalescer.push(event, now);
-        if (snapshot) {
-            session.sendStreamTextPreview(snapshot.turnId, snapshot.blockIndex, snapshot.text);
+        for (const chunk of streamCoalescer.push(event, now)) {
+            session.sendStreamTextPreview(chunk.turnId, chunk.blockIndex, chunk.sequence, chunk.delta);
         }
     }
 

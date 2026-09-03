@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ApiUpdateSchema, ApiUpdateContainerSchema } from './apiTypes';
+import { ApiEphemeralUpdateSchema, ApiUpdateSchema, ApiUpdateContainerSchema } from './apiTypes';
 
 describe('ApiUpdateSchema', () => {
     it('accepts shared wire update-session payload', () => {
@@ -83,5 +83,29 @@ describe('ApiUpdateSchema', () => {
                 reason: 'upsert',
             },
         }).success).toBe(true);
+    });
+});
+
+describe('ApiEphemeralUpdateSchema', () => {
+    it('accepts the server stream-text payload', () => {
+        expect(ApiEphemeralUpdateSchema.safeParse({
+            type: 'stream-text',
+            sessionId: 'session-1',
+            turnId: 'turn-1',
+            blockIndex: 0,
+            sequence: 1,
+            content: 'encrypted-delta',
+        }).success).toBe(true);
+    });
+
+    it('rejects malformed stream-text sequence values', () => {
+        expect(ApiEphemeralUpdateSchema.safeParse({
+            type: 'stream-text',
+            sessionId: 'session-1',
+            turnId: 'turn-1',
+            blockIndex: 0,
+            sequence: -1,
+            content: 'encrypted-delta',
+        }).success).toBe(false);
     });
 });

@@ -1,25 +1,28 @@
 /**
- * Coalesces SDK `stream_event` text deltas into throttled ephemeral snapshots
+ * Coalesces SDK `stream_event` text deltas into throttled ephemeral chunks
  * (specs/desktop-speed-breakthrough-token-streaming T1).
  *
  * The SDK's `includePartialMessages: true` option emits one event per token
  * chunk — far too fine-grained to relay individually without flooding the
  * socket. This tracks each content block's type (text deltas share their wire
  * shape with thinking deltas, so the block type must be tracked from its
- * `content_block_start`) and only lets a snapshot out once per
- * `STREAM_TEXT_COALESCE_MS` window per block.
+ * `content_block_start`) and only lets chunks out once per
+ * `STREAM_TEXT_COALESCE_MS` window per block. Chunks carry a monotonic sequence
+ * so a receiver can reject an incomplete preview after a volatile packet loss.
  *
  * Pure: no I/O, no SDK types imported (the caller narrows `stream_event`
  * payloads to the shapes below), so this is testable without a live API call.
  */
 
 export const STREAM_TEXT_COALESCE_MS = 80;
+export const STREAM_TEXT_MAX_CHUNK_CHARS = 16 * 1024;
 
-export interface StreamTextSnapshot {
+export interface StreamTextChunk {
     turnId: string;
     blockIndex: number;
-    /** Cumulative text for the block so far — a snapshot, not a delta. */
-    text: string;
+    sequence: number;
+    /** Incremental text since the previous chunk. */
+    delta: string;
 }
 
 interface ContentBlockStartEvent {
@@ -46,28 +49,38 @@ export type StreamTextEvent = ContentBlockStartEvent | ContentBlockDeltaEvent | 
 
 interface TrackedBlock {
     isText: boolean;
-    text: string;
-    /** Text carried in `text` that has not been emitted yet. */
-    dirty: boolean;
+    pendingText: string;
+    nextSequence: number;
     /** Seeded from the block's start time, so the first delta also waits out the window. */
     lastEmitAt: number;
 }
 
 export interface StreamTextCoalescer {
-    /** Feed one stream event; returns a snapshot only when the window has elapsed. */
-    push(event: StreamTextEvent, now: number): StreamTextSnapshot | null;
-    /** Emits the current text for a block immediately, bypassing the window. */
-    flush(index: number, now: number): StreamTextSnapshot | null;
+    /** Feed one stream event; returns chunks only when the window has elapsed. */
+    push(event: StreamTextEvent, now: number): StreamTextChunk[];
+    /** Emits pending text for a block immediately, bypassing the window. */
+    flush(index: number, now: number): StreamTextChunk[];
 }
 
 export function createStreamTextCoalescer(opts: { turnId: string }): StreamTextCoalescer {
     const blocks = new Map<number, TrackedBlock>();
 
-    function emit(index: number, block: TrackedBlock, now: number): StreamTextSnapshot | null {
-        if (!block.dirty || block.text.length === 0) return null;
-        block.dirty = false;
+    function emit(index: number, block: TrackedBlock, now: number): StreamTextChunk[] {
+        if (block.pendingText.length === 0) return [];
+        const chunks: StreamTextChunk[] = [];
+        while (block.pendingText.length > 0) {
+            const delta = block.pendingText.slice(0, STREAM_TEXT_MAX_CHUNK_CHARS);
+            block.pendingText = block.pendingText.slice(delta.length);
+            chunks.push({
+                turnId: opts.turnId,
+                blockIndex: index,
+                sequence: block.nextSequence,
+                delta,
+            });
+            block.nextSequence += 1;
+        }
         block.lastEmitAt = now;
-        return { turnId: opts.turnId, blockIndex: index, text: block.text };
+        return chunks;
     }
 
     return {
@@ -75,32 +88,31 @@ export function createStreamTextCoalescer(opts: { turnId: string }): StreamTextC
             if (event.type === 'content_block_start') {
                 blocks.set(event.index, {
                     isText: event.content_block.type === 'text',
-                    text: '',
-                    dirty: false,
+                    pendingText: '',
+                    nextSequence: 0,
                     lastEmitAt: now,
                 });
-                return null;
+                return [];
             }
 
             if (event.type === 'content_block_stop') {
                 blocks.delete(event.index);
-                return null;
+                return [];
             }
 
-            if (event.type !== 'content_block_delta') return null;
+            if (event.type !== 'content_block_delta') return [];
             const block = blocks.get(event.index);
-            if (!block || !block.isText) return null;
-            if (event.delta.type !== 'text_delta' || typeof event.delta.text !== 'string') return null;
+            if (!block || !block.isText) return [];
+            if (event.delta.type !== 'text_delta' || typeof event.delta.text !== 'string') return [];
 
-            block.text += event.delta.text;
-            block.dirty = true;
+            block.pendingText += event.delta.text;
 
-            if (now - block.lastEmitAt < STREAM_TEXT_COALESCE_MS) return null;
+            if (now - block.lastEmitAt < STREAM_TEXT_COALESCE_MS) return [];
             return emit(event.index, block, now);
         },
         flush(index, now) {
             const block = blocks.get(index);
-            if (!block) return null;
+            if (!block) return [];
             return emit(index, block, now);
         },
     };

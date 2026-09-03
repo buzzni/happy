@@ -233,14 +233,25 @@ export const ApiEphemeralSessionEventUpdateSchema = z.object({
     timestamp: z.number(),
 });
 
+export const ApiEphemeralStreamTextUpdateSchema = z.object({
+    type: z.literal('stream-text'),
+    sessionId: z.string().min(1).max(128),
+    turnId: z.string().min(1).max(128),
+    blockIndex: z.number().int().nonnegative(),
+    sequence: z.number().int().nonnegative(),
+    content: z.string().min(1).max(256 * 1024),
+});
+
 export const ApiEphemeralUpdateSchema = z.union([
     ApiEphemeralActivityUpdateSchema,
     ApiEphemeralUsageUpdateSchema,
     ApiEphemeralMachineActivityUpdateSchema,
     ApiEphemeralSessionEventUpdateSchema,
+    ApiEphemeralStreamTextUpdateSchema,
 ]);
 
 export type ApiEphemeralActivityUpdate = z.infer<typeof ApiEphemeralActivityUpdateSchema>;
+export type ApiEphemeralStreamTextUpdate = z.infer<typeof ApiEphemeralStreamTextUpdateSchema>;
 export type ApiEphemeralUpdate = z.infer<typeof ApiEphemeralUpdateSchema>;
 
 // Machine metadata updates use Partial<MachineMetadata> from storageTypes

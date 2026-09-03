@@ -12,7 +12,7 @@ import {
     getAttachmentDiagnostic,
 } from './attachmentDiagnostics';
 import { ApiEphemeralUpdateSchema, ApiMessage, ApiUpdateContainerSchema } from './apiTypes';
-import type { ApiEphemeralActivityUpdate } from './apiTypes';
+import type { ApiEphemeralActivityUpdate, ApiEphemeralStreamTextUpdate } from './apiTypes';
 import { Session, Machine } from './storageTypes';
 import { InvalidateSync } from '@/utils/sync';
 import { ActivityUpdateAccumulator } from './reducer/activityUpdateAccumulator';
@@ -64,6 +64,7 @@ import { readFileBytes } from '@/utils/readFileBytes';
 import { Modal } from '@/modal';
 import { t } from '@/text';
 import { emitAutomationUpdate } from './automationUpdates';
+import { STREAM_TEXT_MAX_CHUNK_CHARS } from './streamTextPreview';
 
 type V3GetSessionMessagesResponse = {
     messages: ApiMessage[];
@@ -139,6 +140,7 @@ class Sync {
     private backgroundSendTimeout: ReturnType<typeof setTimeout> | null = null;
     private backgroundSendNotificationId: string | null = null;
     private backgroundSendStartedAt: number | null = null;
+    private streamTextPreviewQueue: Promise<void> = Promise.resolve();
     revenueCatInitialized = false;
 
     // Generic locking mechanism
@@ -2139,6 +2141,10 @@ class Sync {
                 const decrypted = await encryption.decryptMessage(updateData.body.message);
                 if (decrypted) {
                     lastMessage = normalizeRawMessage(decrypted.id, decrypted.localId, decrypted.createdAt, decrypted.content);
+                    if (lastMessage?.role === 'agent') {
+                        await this.streamTextPreviewQueue;
+                        storage.getState().clearStreamTextPreview(updateData.body.sid);
+                    }
 
                     // Check for task lifecycle events to update thinking state
                     // This ensures UI updates even if volatile activity updates are lost
@@ -2656,6 +2662,23 @@ class Sync {
         }
     }
 
+    private enqueueStreamTextPreview(update: ApiEphemeralStreamTextUpdate) {
+        this.streamTextPreviewQueue = this.streamTextPreviewQueue.then(async () => {
+            const encryption = this.encryption.getSessionEncryption(update.sessionId);
+            if (!encryption) return;
+            const delta = await encryption.decryptRaw(update.content);
+            if (typeof delta !== 'string' || delta.length === 0 || delta.length > STREAM_TEXT_MAX_CHUNK_CHARS) return;
+            storage.getState().applyStreamTextChunk(update.sessionId, {
+                turnId: update.turnId,
+                blockIndex: update.blockIndex,
+                sequence: update.sequence,
+                delta,
+            });
+        }).catch((error) => {
+            console.error('Failed to process stream text preview:', error);
+        });
+    }
+
     private handleEphemeralUpdate = (update: unknown) => {
         const validatedUpdate = ApiEphemeralUpdateSchema.safeParse(update);
         if (!validatedUpdate.success) {
@@ -2667,10 +2690,18 @@ class Sync {
         }
         const updateData = validatedUpdate.data;
 
+        if (updateData.type === 'stream-text') {
+            this.enqueueStreamTextPreview(updateData);
+            return;
+        }
+
         // Process activity updates through smart debounce accumulator
         if (updateData.type === 'activity') {
             // console.log('adding activity update ' + updateData.id);
             this.activityAccumulator.addUpdate(updateData);
+            if (!updateData.active) {
+                storage.getState().clearStreamTextPreview(updateData.id);
+            }
         }
 
         // Handle machine activity updates

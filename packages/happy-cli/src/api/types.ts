@@ -69,7 +69,7 @@ export interface ClientToServerEvents {
     mode?: 'local' | 'remote';
   }) => void
   // specs/desktop-speed-breakthrough-token-streaming: ephemeral, never persisted.
-  'session-stream-text': (data: { sid: string, turnId: string, blockIndex: number, content: string }) => void
+  'session-stream-text': (data: { sid: string, turnId: string, blockIndex: number, sequence: number, content: string }) => void
   'session-end': (data: { sid: string, time: number }) => void,
   'update-metadata': (data: { sid: string, expectedVersion: number, metadata: string }, cb: (answer: {
     result: 'error'
