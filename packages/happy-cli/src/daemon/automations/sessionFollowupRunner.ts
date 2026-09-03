@@ -175,6 +175,53 @@ export function observeFollowupTurn(messages: Array<{ seq: number; localId: stri
   return { observedSeq, complete, failed, userIntervened, agentTexts }
 }
 
+const COMPLETION_SIGNAL_BLOCK_RE = /^<saycode-complete\b[^>]*>[\s\S]*<\/saycode-complete>$/
+
+function terminalCompletionSignalStart(text: string): number | null {
+  const start = text.lastIndexOf('<saycode-complete')
+  return start >= 0 && COMPLETION_SIGNAL_BLOCK_RE.test(text.slice(start)) ? start : null
+}
+
+type RawJsonObject = { end: number; value: unknown }
+
+function parseTopLevelRawJsonObjects(text: string): RawJsonObject[] {
+  const objects: RawJsonObject[] = []
+  let start = -1
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]!
+    if (start < 0) {
+      if (char === '{') {
+        start = index
+        depth = 1
+      }
+      continue
+    }
+    if (inString) {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') inString = true
+    else if (char === '{') depth += 1
+    else if (char === '}') {
+      depth -= 1
+      if (depth === 0) {
+        try {
+          objects.push({ end: index + 1, value: JSON.parse(text.slice(start, index + 1)) })
+        } catch {
+          // Invalid brace-delimited prose is not a review contract.
+        }
+        start = -1
+      }
+    }
+  }
+  return objects
+}
+
 function parseJsonCandidate(text: string): unknown {
   const trimmed = text.trim()
   if (!trimmed) throw new Error('empty')
@@ -184,12 +231,22 @@ function parseJsonCandidate(text: string): unknown {
   if (fences.length === 1) {
     const fence = fences[0]!
     const trailing = trimmed.slice((fence.index ?? 0) + fence[0].length).trim()
-    if (trailing && !/^<saycode-complete\b[^>]*>[\s\S]*<\/saycode-complete>$/.test(trailing)) {
+    if (trailing && terminalCompletionSignalStart(trailing) !== 0) {
       throw new Error('json-contract-is-not-final')
     }
     return JSON.parse(fence[1]!)
   }
-  return JSON.parse(trimmed)
+  try {
+    return JSON.parse(trimmed)
+  } catch {
+    const completionSignalStart = terminalCompletionSignalStart(trimmed)
+    if (completionSignalStart === null) throw new Error('invalid-raw-json-contract')
+    const body = trimmed.slice(0, completionSignalStart).trim()
+    const objects = parseTopLevelRawJsonObjects(body)
+    const contract = objects.length === 1 ? objects[0] : null
+    if (!contract || contract.end !== body.length) throw new Error('invalid-raw-json-contract')
+    return contract.value
+  }
 }
 
 export type ReviewEvaluation =
