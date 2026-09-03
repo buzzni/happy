@@ -22,6 +22,10 @@ const WINDOW_MS = 1_000;
  * still meaningfully capping a client that ignores the CLI's own
  * coalescing. */
 const MAX_PER_WINDOW = 40;
+/** A user may legitimately have several live sessions, so keep a separate
+ * aggregate ceiling with headroom while preventing arbitrary sid churn from
+ * turning every frame into a fresh pre-lookup budget. */
+const MAX_PER_USER_WINDOW = 400;
 /** Bounded like errorLogThrottle — a long-lived server must not grow this
  * map without limit across many distinct sessions. */
 const MAX_TRACKED_KEYS = 10_000;
@@ -34,24 +38,37 @@ export interface SessionStreamRateLimiter {
 }
 
 export function createSessionStreamRateLimiter(
-    opts: { windowMs?: number; maxPerWindow?: number } = {},
+    opts: { windowMs?: number; maxPerWindow?: number; maxPerUserWindow?: number } = {},
 ): SessionStreamRateLimiter {
     const windowMs = opts.windowMs ?? WINDOW_MS;
     const maxPerWindow = opts.maxPerWindow ?? MAX_PER_WINDOW;
+    const maxPerUserWindow = opts.maxPerUserWindow ?? MAX_PER_USER_WINDOW;
     const state = new Map<string, { windowStart: number; count: number }>();
+    const userState = new Map<string, { windowStart: number; count: number }>();
 
-    const evictOldestIfFull = () => {
-        if (state.size < MAX_TRACKED_KEYS) return;
-        const oldestKey = state.keys().next().value;
-        if (oldestKey !== undefined) state.delete(oldestKey);
+    const evictOldestIfFull = <T>(entries: Map<string, T>) => {
+        if (entries.size < MAX_TRACKED_KEYS) return;
+        const oldestKey = entries.keys().next().value;
+        if (oldestKey !== undefined) entries.delete(oldestKey);
     };
 
     return {
         admit(userId, sid, now = Date.now()) {
+            const userEntry = userState.get(userId);
+            if (!userEntry || now - userEntry.windowStart >= windowMs) {
+                if (userEntry) userState.delete(userId);
+                evictOldestIfFull(userState);
+                userState.set(userId, { windowStart: now, count: 1 });
+            } else {
+                if (userEntry.count >= maxPerUserWindow) return false;
+                userEntry.count += 1;
+            }
+
             const key = `${userId}:${sid}`;
             const entry = state.get(key);
             if (!entry || now - entry.windowStart >= windowMs) {
-                evictOldestIfFull();
+                if (entry) state.delete(key);
+                evictOldestIfFull(state);
                 state.set(key, { windowStart: now, count: 1 });
                 return true;
             }
