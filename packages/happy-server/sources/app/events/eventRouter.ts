@@ -197,6 +197,13 @@ export type EphemeralEvent = {
     online: boolean;
     timestamp: number;
 } | {
+    // Token-level assistant preview relayed from the CLI. `data` is an
+    // opaque session-key ciphertext; the server neither stores nor reads it.
+    type: 'stream';
+    id: string;
+    time: number;
+    data: string;
+} | {
     type: 'session-event';
     sessionId: string;
     kind: 'done' | 'permission' | 'question';

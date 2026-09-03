@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events'
 import { io, Socket } from 'socket.io-client'
 import { AgentState, ClientToServerEvents, FileEventMessage, FileEventMessageSchema, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
 import { decodeBase64, decryptBlob, decrypt, encodeBase64, encrypt, encryptBlob } from './encryption';
+import type { StreamDeltaFrame } from '@/claude/streamDeltaRelay';
 import { backoff, delay, isSessionGoneError } from '@/utils/time';
 import { configuration } from '@/configuration';
 import { RawJSONLines } from '@/claude/types';
@@ -1242,6 +1243,20 @@ export class ApiSessionClient extends EventEmitter {
             }
         };
         this.enqueueMessage(content);
+    }
+
+    /**
+     * Relay one coalesced slice of streaming assistant text. Volatile on
+     * purpose: a dropped frame costs nothing because the persisted assistant
+     * message that follows is authoritative, and the consumer detects the gap
+     * via `seq`.
+     */
+    sendStreamDelta(frame: StreamDeltaFrame) {
+        this.socket.volatile.emit('session-stream', {
+            sid: this.sessionId,
+            time: Date.now(),
+            data: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, frame)),
+        });
     }
 
     /**

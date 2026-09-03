@@ -58,6 +58,8 @@ export async function claudeRemote(opts: {
     onSessionFound: (id: string) => void,
     onThinkingChange?: (thinking: boolean) => void,
     onMessage: (message: SDKMessage) => void,
+    /** Token-level partials. Never persisted — see streamDeltaRelay. */
+    onStreamEvent?: (message: Extract<SDKMessage, { type: 'stream_event' }>) => void,
     onPromptSuggestionChange?: (suggestion: string | null) => void,
     onCompletionEvent?: (message: string) => void,
     onSessionReset?: () => void,
@@ -273,6 +275,13 @@ export async function claudeRemote(opts: {
                         opts.onPromptSuggestionChange?.(suggestion);
                     }
                 }
+                continue;
+            }
+
+            // Partial assistant output is a preview, not transcript: keep it
+            // out of the persisted onMessage path.
+            if (message.type === 'stream_event') {
+                opts.onStreamEvent?.(message);
                 continue;
             }
 

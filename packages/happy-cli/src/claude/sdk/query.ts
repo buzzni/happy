@@ -49,6 +49,9 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         agents: opts?.agents,
         settingSources: opts?.settingSources,
         skills: opts?.skills,
+        // Token-level partials (`stream_event`) let the app render text as it
+        // is produced instead of after a whole content block completes.
+        includePartialMessages: true,
     }
 
     // Map abort signal -> AbortController

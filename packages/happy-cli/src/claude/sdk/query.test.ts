@@ -26,6 +26,14 @@ describe('query adapter', () => {
         }));
     });
 
+    it('enables partial assistant message streaming so the app can render tokens before a block completes', () => {
+        query({ prompt: 'continue', options: {} });
+
+        expect(sdkQuery).toHaveBeenCalledWith(expect.objectContaining({
+            options: expect.objectContaining({ includePartialMessages: true }),
+        }));
+    });
+
     it('forwards additional directories to the Claude Agent SDK for new and resumed queries', () => {
         for (const resume of [undefined, 'claude-session-id']) {
             query({

@@ -112,6 +112,8 @@ export interface ClientToServerEvents {
     }
   }) => void
   'provider-usage-report': (data: ProviderUsageEventV1) => void
+  /** Volatile token-level preview frame; `data` is session-key encrypted. */
+  'session-stream': (data: { sid: string; time: number; data: string }) => void
 }
 
 /**
