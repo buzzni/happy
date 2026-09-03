@@ -180,8 +180,13 @@ const COMPLETION_SIGNAL_CLOSE = '</saycode-complete>'
 
 function terminalCompletionSignalStart(text: string): number | null {
   const openings = [...text.matchAll(COMPLETION_SIGNAL_OPEN_RE)]
-  if (openings.length !== 1 || !text.endsWith(COMPLETION_SIGNAL_CLOSE)) return null
-  return openings[0]!.index ?? null
+  if (openings.length !== 1) return null
+  const opening = openings[0]!
+  const start = opening.index ?? 0
+  const closeStart = text.indexOf(COMPLETION_SIGNAL_CLOSE, start + opening[0].length)
+  return closeStart >= 0 && closeStart + COMPLETION_SIGNAL_CLOSE.length === text.length
+    ? start
+    : null
 }
 
 type RawJsonObject = { end: number; value: unknown }

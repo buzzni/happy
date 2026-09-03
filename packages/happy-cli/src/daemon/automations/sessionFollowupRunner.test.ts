@@ -161,7 +161,7 @@ describe('sessionFollowupRunner', () => {
   it('does not mistake a completion-tag mention in the summary for the block start', () => {
     expect(evaluateReviewFindings([
       '{"findings":[{"severity":"medium"}]}\n',
-      '<saycode-complete status="completed" findings="1">Validated the `<saycode-complete>` and `</saycode-complete>` boundaries.</saycode-complete>',
+      '<saycode-complete status="completed" findings="1">Validated the `<saycode-complete>` boundary.</saycode-complete>',
     ])).toEqual({ kind: 'continue' })
   })
 
@@ -179,6 +179,15 @@ describe('sessionFollowupRunner', () => {
       '<saycode-complete status="completed" findings="1">First.</saycode-complete>\n',
       '{"findings":[]}\n',
       '<saycode-complete status="completed" findings="0">Second.</saycode-complete>',
+    ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
+  })
+
+  it('fails closed when content follows the first completion-signal close', () => {
+    expect(evaluateReviewFindings([
+      '{"findings":[{"severity":"medium"}]}\n',
+      '<saycode-complete status="completed" findings="1">First.</saycode-complete>\n',
+      '{"findings":[]}\n',
+      '</saycode-complete>',
     ])).toEqual({ kind: 'terminate', terminalCode: 'UNSTRUCTURED' })
   })
 
