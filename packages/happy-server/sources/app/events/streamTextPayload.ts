@@ -15,17 +15,24 @@ export interface StreamTextPayload {
     content: string;
 }
 
-function nonEmptyString(value: unknown): value is string {
-    return typeof value === 'string' && value.length > 0;
+const MAX_STREAM_TEXT_IDENTIFIER_BYTES = 128;
+const MAX_STREAM_TEXT_CONTENT_BYTES = 1024 * 1024;
+const BASE64_CIPHERTEXT_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/;
+
+function boundedNonEmptyString(value: unknown, maxBytes: number): value is string {
+    return typeof value === 'string'
+        && value.length > 0
+        && Buffer.byteLength(value, 'utf8') <= maxBytes;
 }
 
 export function parseStreamTextPayload(raw: unknown): StreamTextPayload | null {
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
     const { sid, turnId, blockIndex, content } = raw as Record<string, unknown>;
 
-    if (!nonEmptyString(sid)) return null;
-    if (!nonEmptyString(turnId)) return null;
-    if (!nonEmptyString(content)) return null;
+    if (!boundedNonEmptyString(sid, MAX_STREAM_TEXT_IDENTIFIER_BYTES)) return null;
+    if (!boundedNonEmptyString(turnId, MAX_STREAM_TEXT_IDENTIFIER_BYTES)) return null;
+    if (!boundedNonEmptyString(content, MAX_STREAM_TEXT_CONTENT_BYTES)) return null;
+    if (content.length % 4 !== 0 || !BASE64_CIPHERTEXT_PATTERN.test(content)) return null;
     if (typeof blockIndex !== 'number' || !Number.isInteger(blockIndex) || blockIndex < 0) return null;
 
     return { sid, turnId, blockIndex, content };

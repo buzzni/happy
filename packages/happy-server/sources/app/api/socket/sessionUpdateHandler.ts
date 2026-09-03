@@ -190,6 +190,7 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
     // unlike session-alive's queueSessionUpdate. A client that does not know
     // this event simply never emits it; the server accepting it is additive
     // and does not change any existing wire contract.
+    const receiveStreamTextLock = new AsyncLock();
     socket.on('session-stream-text', async (data: unknown) => {
         try {
             websocketEventsCounter.inc({ event_type: 'session-stream-text', ...labels });
@@ -199,15 +200,21 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                 return;
             }
 
-            const isValid = await activityCache.isSessionValid(payload.sid, userId);
-            if (!isValid) {
+            if (connection.connectionType !== 'session-scoped' || connection.sessionId !== payload.sid) {
                 return;
             }
 
-            eventRouter.emitEphemeral({
-                userId,
-                payload: buildStreamTextEphemeral(payload.sid, payload.turnId, payload.blockIndex, payload.content),
-                recipientFilter: { type: 'user-scoped-only' }
+            await receiveStreamTextLock.inLock(async () => {
+                const isValid = await activityCache.isSessionValid(payload.sid, userId);
+                if (!isValid) {
+                    return;
+                }
+
+                eventRouter.emitEphemeral({
+                    userId,
+                    payload: buildStreamTextEphemeral(payload.sid, payload.turnId, payload.blockIndex, payload.content),
+                    recipientFilter: { type: 'user-scoped-only' }
+                });
             });
         } catch (error) {
             log({ module: 'websocket', level: 'error' }, `Error in session-stream-text: ${error}`);
