@@ -106,6 +106,33 @@ describe('Api server error handling', () => {
             consoleSpy.mockRestore();
         });
 
+        // The session path deliberately does NOT swallow an axios client-side
+        // timeout. This call mints a fresh data encryption key per invocation
+        // and the reconnect path retries under the same session tag; if the
+        // server did persist the timed-out request it keeps the original key
+        // and ignores the resubmitted one, leaving a session encrypted under a
+        // key the app cannot hold. Failing loudly beats silent E2EE corruption.
+        it('should rethrow a request timeout (ECONNABORTED) rather than silently going offline', async () => {
+            connectionState.reset();
+            mockPost.mockRejectedValue({
+                code: 'ECONNABORTED',
+                message: 'timeout of 60000ms exceeded',
+                isAxiosError: true
+            });
+
+            // Must throw rather than resolve to null — null is the "we went
+            // offline, retry under the same tag" signal, and that is exactly
+            // the path that would corrupt the session key here.
+            await expect(api.getOrCreateSession({
+                tag: 'test-tag',
+                metadata: testMetadata,
+                state: null
+            })).rejects.toMatchObject({
+                message: expect.stringContaining('ECONNABORTED'),
+                cause: expect.objectContaining({ code: 'ECONNABORTED' })
+            });
+        });
+
         it('should return null when Happy server cannot be found (ENOTFOUND)', async () => {
             connectionState.reset();
             const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -155,6 +182,7 @@ describe('Api server error handling', () => {
             // Mock axios to return 404
             mockPost.mockRejectedValue({
                 response: { status: 404 },
+                code: 'ERR_BAD_REQUEST',
                 isAxiosError: true
             });
 
@@ -183,6 +211,7 @@ describe('Api server error handling', () => {
             // Mock axios to return 500 error
             mockPost.mockRejectedValue({
                 response: { status: 500 },
+                code: 'ERR_BAD_RESPONSE',
                 isAxiosError: true
             });
 
@@ -206,6 +235,7 @@ describe('Api server error handling', () => {
             // Mock axios to return 503 error
             mockPost.mockRejectedValue({
                 response: { status: 503 },
+                code: 'ERR_BAD_RESPONSE',
                 isAxiosError: true
             });
 
@@ -230,7 +260,7 @@ describe('Api server error handling', () => {
 
             await expect(
                 api.getOrCreateSession({ tag: 'test-tag', metadata: testMetadata, state: null })
-            ).rejects.toThrow('Failed to get or create session: Invalid API key');
+            ).rejects.toThrow('Failed to get or create session: UNAUTHORIZED — Invalid API key');
 
             // Should not show the offline mode message
             const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -316,6 +346,209 @@ describe('Api server error handling', () => {
             consoleSpy.mockRestore();
         });
 
+        // 회귀 테스트: 프로덕션에서 데몬을 죽였던 바로 그 오류.
+        // axios 는 자기 `timeout` 옵션이 만료되면 커널의 ETIMEDOUT 이 아니라
+        // ECONNABORTED 를 쓴다. 이 코드가 NETWORK_ERROR_CODES 에 없던 동안에는
+        // 여기서 오류가 다시 던져졌고, 데몬 최상위 catch 가 그걸 받아
+        // process.exit(1) 로 프로세스를 통째로 내렸다.
+        it('should return minimal machine object when the request times out (ECONNABORTED)', async () => {
+            connectionState.reset();
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+            mockPost.mockRejectedValue({
+                code: 'ECONNABORTED',
+                message: 'timeout of 60000ms exceeded',
+                isAxiosError: true
+            });
+
+            const result = await api.getOrCreateMachine({
+                machineId: 'test-machine',
+                metadata: testMachineMetadata,
+                daemonState: { status: 'running', pid: 1234 }
+            });
+
+            expect(result).toEqual({
+                id: 'test-machine',
+                encryptionKey: expect.any(Uint8Array),
+                encryptionVariant: 'legacy',
+                metadata: testMachineMetadata,
+                metadataVersion: 0,
+                daemonState: { status: 'running', pid: 1234 },
+                daemonStateVersion: 0,
+            });
+
+            expect(consoleSpy).toHaveBeenCalledWith(
+                expect.stringContaining('⚠️  Happy server unreachable')
+            );
+
+            consoleSpy.mockRestore();
+        });
+
+        // Not every transport failure arrives as an AxiosError — some surface
+        // as a plain Error carrying `code`, or wrap the real failure on
+        // `cause`. Missing those means a crash instead of offline mode.
+        it('should return minimal machine object for a transport error carried on cause', async () => {
+            connectionState.reset();
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+            mockPost.mockRejectedValue(Object.assign(new Error('fetch failed'), {
+                cause: { code: 'EAI_AGAIN' }
+            }));
+
+            const result = await api.getOrCreateMachine({
+                machineId: 'test-machine',
+                metadata: testMachineMetadata
+            });
+
+            expect(result.id).toBe('test-machine');
+            expect(result.metadataVersion).toBe(0);
+            consoleSpy.mockRestore();
+        });
+
+        // 401 used to fall through every branch and be rethrown, which on the
+        // daemon startup path meant a FATAL exit with an opaque stack.
+        it('should return minimal machine object and explain how to recover on 401', async () => {
+            connectionState.reset();
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+            mockPost.mockRejectedValue({
+                response: { status: 401 },
+                code: 'ERR_BAD_REQUEST',
+                isAxiosError: true
+            });
+
+            const result = await api.getOrCreateMachine({
+                machineId: 'test-machine',
+                metadata: testMachineMetadata
+            });
+
+            expect(result.id).toBe('test-machine');
+            expect(consoleSpy).toHaveBeenCalledWith(
+                expect.stringContaining("run 'happy auth'")
+            );
+
+            consoleSpy.mockRestore();
+        });
+
+        // A 200 whose body will not parse (captive portal, proxy serving HTML)
+        // reaches the catch with `response` set and a 2xx status. Reporting
+        // that as a rejection would be self-contradictory, so it must fail
+        // with a message that says what actually happened.
+        it('should fail with a readable message when a 2xx body cannot be parsed', async () => {
+            connectionState.reset();
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+            mockPost.mockRejectedValue({
+                response: { status: 200 },
+                code: 'ERR_BAD_RESPONSE',
+                message: "Unexpected token '<', \"<html>\"... is not valid JSON",
+                isAxiosError: true
+            });
+
+            await expect(api.getOrCreateMachine({
+                machineId: 'test-machine',
+                metadata: testMachineMetadata
+            })).rejects.toThrow('unreadable response (status 200)');
+
+            expect(consoleSpy).not.toHaveBeenCalledWith(
+                expect.stringContaining('rejected machine registration')
+            );
+
+            consoleSpy.mockRestore();
+        });
+
+        // Guards the reordering fix: axios stamps ERR_BAD_RESPONSE on every
+        // 5xx, so classifying by code before status once made this dedicated
+        // branch unreachable and reported a real server error as a mangled
+        // reply. Without a machine-path 5xx test that could regress silently.
+        it('should return minimal machine object and report the status when the server returns 503', async () => {
+            connectionState.reset();
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+            mockPost.mockRejectedValue({
+                response: { status: 503 },
+                code: 'ERR_BAD_RESPONSE',
+                isAxiosError: true
+            });
+
+            const result = await api.getOrCreateMachine({
+                machineId: 'test-machine',
+                metadata: testMachineMetadata
+            });
+
+            expect(result.id).toBe('test-machine');
+            expect(consoleSpy).toHaveBeenCalledWith(
+                expect.stringContaining('Machine registration failed: 503')
+            );
+
+            consoleSpy.mockRestore();
+        });
+
+        // A permanent rejection must not claim the server is unreachable or
+        // promise a retry that never comes — registration runs once per
+        // process. It still returns a local machine so the daemon lives.
+        it('should report a 400 as a contract problem rather than as being offline', async () => {
+            connectionState.reset();
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+            mockPost.mockRejectedValue({
+                response: { status: 400 },
+                code: 'ERR_BAD_REQUEST',
+                isAxiosError: true
+            });
+
+            const result = await api.getOrCreateMachine({
+                machineId: 'test-machine',
+                metadata: testMachineMetadata
+            });
+
+            expect(result.id).toBe('test-machine');
+            expect(consoleSpy).toHaveBeenCalledWith(
+                expect.stringContaining('rejected machine registration with status 400')
+            );
+            expect(consoleSpy).not.toHaveBeenCalledWith(
+                expect.stringContaining('Happy server unreachable')
+            );
+
+            consoleSpy.mockRestore();
+        });
+
+        // A rate limiter answering mid-burst is transient, not fatal.
+        it('should return minimal machine object when the server returns 429', async () => {
+            connectionState.reset();
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+            mockPost.mockRejectedValue({
+                response: { status: 429 },
+                code: 'ERR_BAD_REQUEST',
+                isAxiosError: true
+            });
+
+            const result = await api.getOrCreateMachine({
+                machineId: 'test-machine',
+                metadata: testMachineMetadata
+            });
+
+            expect(result.id).toBe('test-machine');
+            consoleSpy.mockRestore();
+        });
+
+        // Genuine defects must stay loud rather than be masked as "offline".
+        it('should rethrow a non-transport, non-HTTP error', async () => {
+            connectionState.reset();
+            mockIsAxiosError.mockReturnValue(false);
+            mockPost.mockRejectedValue(new TypeError('bad encryption input'));
+
+            try {
+                await expect(api.getOrCreateMachine({
+                    machineId: 'test-machine',
+                    metadata: testMachineMetadata
+                })).rejects.toThrow(TypeError);
+            } finally {
+                mockIsAxiosError.mockReturnValue(true);
+            }
+        });
+
         it('should return minimal machine object when server endpoint returns 404', async () => {
             connectionState.reset();
             const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -323,6 +556,7 @@ describe('Api server error handling', () => {
             // Mock axios to return 404
             mockPost.mockRejectedValue({
                 response: { status: 404 },
+                code: 'ERR_BAD_REQUEST',
                 isAxiosError: true
             });
 

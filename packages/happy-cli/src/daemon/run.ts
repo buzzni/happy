@@ -6,7 +6,7 @@ import { AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
 
 import { ApiClient } from '@/api/api';
 import { TrackedSession, SessionEncryptionData } from './types';
-import { MachineMetadata, DaemonState, Metadata } from '@/api/types';
+import { MachineMetadata, DaemonState, Metadata, Machine } from '@/api/types';
 import {
   type RecoverSessionOptions,
   type RecoverSessionResult,
@@ -2415,14 +2415,36 @@ export async function startDaemon(): Promise<void> {
     // Create API client
     const api = await ApiClient.create(credentials);
 
-    // Get or create machine
-    const machine = await api.getOrCreateMachine({
-      machineId,
-      metadata: initialMachineMetadata,
-      daemonState: initialDaemonState,
-      serverPublicKey
-    });
-    logger.debug(`[DAEMON RUN] Machine registered: ${machine.id}`);
+    // Get or create machine.
+    //
+    // Defence in depth. getOrCreateMachine already degrades to offline mode for
+    // every failure it recognises, but this is the startup path: anything it
+    // does not recognise lands in the outer catch, which is a straight
+    // process.exit(1). A daemon that exits is a daemon that is not there to
+    // restart itself, and the whole point of it is to be present — so no
+    // registration failure whatsoever is worth dying for.
+    //
+    // The degraded state is safe but not self-repairing: metadata and daemon
+    // state versions reconcile against the server on the next update, but
+    // nothing re-runs registration for the life of the process, so if the row
+    // was never created the socket RPCs keep failing until the daemon restarts.
+    let machine: Machine;
+    try {
+      machine = await api.getOrCreateMachine({
+        machineId,
+        metadata: initialMachineMetadata,
+        daemonState: initialDaemonState,
+        serverPublicKey
+      });
+      logger.debug(`[DAEMON RUN] Machine registered: ${machine.id}`);
+    } catch (error) {
+      logger.debug('[DAEMON RUN] Machine registration failed unexpectedly, starting offline', error);
+      machine = api.buildOfflineMachine({
+        machineId,
+        metadata: initialMachineMetadata,
+        daemonState: initialDaemonState
+      });
+    }
 
     // Create realtime machine session
     const apiMachine = api.machineSyncClient(machine);
