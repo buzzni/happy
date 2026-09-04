@@ -94,6 +94,7 @@ import {
   runDaemonSessionIdleReaperTick,
   readIdleStopGuardConfig,
   evaluateIdleStopGuard,
+  evaluateBusyOnlyStopGuard,
   resolveStopSessionMode,
   restoreSessionStartTimes,
   readEmptySessionReaperMs,
@@ -166,7 +167,7 @@ import {
   type AutomationMcpSpawnContext,
 } from './automations/automationMcpCallerGrant';
 import { preflightAutomationConnectors } from './automations/automationConnectorPreflight';
-import { resolveAllowedRoot } from '@/modules/common/resolveAllowedRoot';
+import { resolveDaemonAllowedRoot } from '@/modules/common/resolveAllowedRoot';
 import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
@@ -962,10 +963,7 @@ export async function startDaemon(): Promise<void> {
         const additionalDirectoryResult = await prepareAdditionalDirectories({
           requested: options.additionalDirectories,
           primaryDirectory: directory,
-          allowedRoot: resolveAllowedRoot({
-            registryWorkspaceRoot: process.env.HAPPY_WORKSPACE_ROOT ?? null,
-            homeDir: os.homedir(),
-          }),
+          allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
         });
         const finishSpawn = async (spawn: Promise<SpawnSessionResult>): Promise<SpawnSessionResult> => {
           const result = await spawn;
@@ -2109,7 +2107,15 @@ export async function startDaemon(): Promise<void> {
         if (session.happySessionId === sessionId ||
           (sessionId.startsWith('PID-') && pid === parseInt(sessionId.replace('PID-', '')))) {
 
-          if (mode === 'if-idle') {
+          if (mode === 'if-not-busy') {
+            const decision = evaluateBusyOnlyStopGuard({ runtime: session.runtime });
+            if (!decision.allow) {
+              logger.debug(
+                `[session-idle-guard] sessionId=${sessionId} source=${context?.source ?? 'unknown'} decision=deny guard=${decision.guard} mode=if-not-busy`,
+              );
+              return { stopped: false, reason: 'active', guard: decision.guard, activity: decision.activity };
+            }
+          } else if (mode === 'if-idle') {
             const decision = evaluateIdleStopGuard({
               runtime: session.runtime,
               sessionStartedAt: sessionStartTimes.get(pid),
@@ -2220,10 +2226,7 @@ export async function startDaemon(): Promise<void> {
       automationStore.replaceAll(rebasedAutomations);
     }
     // 스크립트 cwd 검증 루트 — apiMachine의 머신 RPC 표면과 같은 규칙.
-    const automationAllowedRoot = resolveAllowedRoot({
-      registryWorkspaceRoot: process.env.HAPPY_WORKSPACE_ROOT ?? null,
-      homeDir: os.homedir(),
-    });
+    const automationAllowedRoot = resolveDaemonAllowedRoot(process.env, os.homedir());
     // 겹침 가드(R5)용: 데몬이 추적 중인 자식 세션의 프로세스 생존 여부.
     const isAutomationSessionRunning = (sessionId: string): boolean => {
       for (const [pid, session] of pidToTrackedSession.entries()) {
@@ -2364,10 +2367,8 @@ export async function startDaemon(): Promise<void> {
       onHappySessionRuntime,
       portRegistry,
       browserBridge,
-      allowedRoot: resolveAllowedRoot({
-        registryWorkspaceRoot: process.env.HAPPY_WORKSPACE_ROOT ?? null,
-        homeDir: os.homedir(),
-      }),
+      // 제어 서버의 파일 접근도 같은 잠금 정책을 따른다(HAPPY_RPC_ALLOWED_ROOT).
+      allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
       getMachineEncryption: () => machineEncryptionForTerminalWs,
     });
 

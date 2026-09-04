@@ -15,7 +15,8 @@ import {
     type SpawnSessionOptions,
     type SpawnSessionResult,
 } from '../modules/common/registerCommonHandlers';
-import { resolveAllowedRoot } from '../modules/common/resolveAllowedRoot';
+import { resolveDaemonAllowedRoot } from '../modules/common/resolveAllowedRoot';
+import { REMOTE_TERMINAL_DISABLED_ERROR, resolveMachineLockdownPolicy } from '../daemon/machineLockdownPolicy';
 import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt } from './encryption';
 import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer';
@@ -481,10 +482,7 @@ export class ApiMachineClient {
         // breaking the cross-identity Files tab when the daemon was
         // launched from / or any directory that doesn't enclose the
         // project's workspaceDir.
-        const allowedRoot = resolveAllowedRoot({
-            registryWorkspaceRoot: process.env.HAPPY_WORKSPACE_ROOT ?? null,
-            homeDir: homedir(),
-        });
+        const allowedRoot = resolveDaemonAllowedRoot(process.env, homedir());
         this.allowedRoot = allowedRoot;
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot);
         this.rpcHandlerManager.registerHandler(
@@ -2151,6 +2149,14 @@ export class ApiMachineClient {
                 const { sessionId, params } = msg || {};
                 if (!sessionId || typeof sessionId !== 'string') {
                     ack({ ok: false, error: 'sessionId is required' });
+                    return;
+                }
+                // aplus-dev-studio specs/trial-auto-onboarding-budget D6 — trial
+                // machines refuse shells outright; the daemon is the only layer
+                // that can, because the trial user owns this daemon.
+                if (resolveMachineLockdownPolicy(process.env).remoteTerminalDisabled) {
+                    logger.debug('[API MACHINE] terminal-open-fwd refused: remote terminal disabled by machine policy');
+                    ack({ ok: false, error: REMOTE_TERMINAL_DISABLED_ERROR });
                     return;
                 }
                 let opts: any = null;

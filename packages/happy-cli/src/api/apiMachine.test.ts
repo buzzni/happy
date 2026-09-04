@@ -127,6 +127,22 @@ describe('ApiMachineClient socket reconnection', () => {
         vi.restoreAllMocks();
     });
 
+    it('refuses terminal-open-fwd with TERMINAL_DISABLED under the trial lockdown policy', async () => {
+        const previous = process.env.HAPPY_REMOTE_TERMINAL_POLICY;
+        process.env.HAPPY_REMOTE_TERMINAL_POLICY = 'disabled';
+        try {
+            const client = new ApiMachineClient('fake-token', makeMachine());
+            client.connect();
+            const ack = vi.fn();
+            emitSocketEvent('terminal-open-fwd', { sessionId: 'term-1', params: null }, ack);
+            await vi.waitFor(() => expect(ack).toHaveBeenCalled());
+            expect(ack).toHaveBeenCalledWith({ ok: false, error: 'TERMINAL_DISABLED' });
+        } finally {
+            if (previous === undefined) delete process.env.HAPPY_REMOTE_TERMINAL_POLICY;
+            else process.env.HAPPY_REMOTE_TERMINAL_POLICY = previous;
+        }
+    });
+
     it('registers the machine-scoped Claude session transfer RPC', () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         const manager = (client as any).rpcHandlerManager;

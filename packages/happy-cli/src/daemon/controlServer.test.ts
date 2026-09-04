@@ -757,7 +757,7 @@ describe('controlServer /stop-session v2 contract', () => {
   let dir: string
   let baseUrl: string
   let stopServer: () => Promise<void>
-  let received: Array<{ sessionId: string; context?: { source?: string; reason?: string; mode?: 'force' | 'if-idle' } }>
+  let received: Array<{ sessionId: string; context?: { source?: string; reason?: string; mode?: 'force' | 'if-idle' | 'if-not-busy' } }>
   let controlSecret = ''
   const fetch = makeAuthedFetch(() => controlSecret)
 
