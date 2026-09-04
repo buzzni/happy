@@ -36,6 +36,51 @@ describe('claudeRemote', () => {
         expect(query).not.toHaveBeenCalled();
     });
 
+    it('recovers a server that died while idle before the next turn starts', async () => {
+        const boundaryOrder: string[] = [];
+        // 결과 직후 복구는 정상을 보고, 다음 입력을 기다리는 동안 서버가 죽는다.
+        const mcpServerStatus = vi.fn()
+            .mockResolvedValueOnce([{ name: 'argos', status: 'connected' }])
+            .mockResolvedValue([{ name: 'argos', status: 'failed' }]);
+        vi.mocked(query).mockReturnValue({
+            setPermissionMode: vi.fn(),
+            mcpServerStatus,
+            reconnectMcpServer: vi.fn(async (name: string) => {
+                boundaryOrder.push('mcp-recover');
+                return { serverName: name, status: 'connected' as const };
+            }),
+            async *[Symbol.asyncIterator]() {
+                yield { type: 'result', subtype: 'success' };
+            },
+        } as any);
+        const beforeTurn = vi.fn(async () => { boundaryOrder.push('checkpoint-gate'); });
+        let messageCount = 0;
+
+        await claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            beforeTurn,
+            nextMessage: async () => {
+                messageCount += 1;
+                return messageCount <= 2 ? { message: `hello-${messageCount}`, mode } : null;
+            },
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+        } as any);
+
+        // result 는 한 번뿐이라 결과 직후 복구도 한 번뿐이고, 그때는 아직
+        // connected 였다. 그러므로 재연결이 일어났다는 사실 자체가 다음 턴
+        // 시작 전에 복구했다는 증거다.
+        await vi.waitFor(() => expect(boundaryOrder).toContain('mcp-recover'));
+        expect(beforeTurn).toHaveBeenCalled();
+    });
+
     it('does not dispatch a protected turn when the checkpoint gate fails', async () => {
         const calls: string[] = [];
         vi.mocked(query).mockImplementation(() => {
