@@ -1260,6 +1260,22 @@ async function executeStartedRun(
       }
       prompt = buildAgentTaskPrompt(bridged.dispatch, payload.prompt)
       environmentVariables = {
+        // 2026-09-04 프로덕션 — 리뷰 워커 31건이 뜨자마자 exit 1 로 죽어 3시간 동안
+        // 리뷰가 한 건도 완료되지 않았다:
+        //   [aplus] MCP topology mismatch expected=gmail,google-drive,knoi,slack
+        //           configured=(none) missing=... attempt=2  → 세션 종료
+        //
+        // expected 는 서버가 만든 값이 아니라 워커가 헤더로 보낸 값이고, 출처는
+        // 데몬에서 상속된 이 환경변수다. 공용 머신에서 다른 계정 세션이 커넥터를
+        // 요구하며 값을 남기면 그때부터 모든 리뷰가 죽는다 — 리뷰 자신의 설정과
+        // 무관하게 옆 세션에 좌우된다.
+        //
+        // AgentTask 워커는 filterInheritedCredentials 로 사용자 토큰을 떼고 돌기
+        // 때문에 caller 가 (bearer-unmatched) 이고, 개인 커넥터를 받을 수단이
+        // 구조적으로 없다. 기대치가 비어 있지 않으면 100% mismatch 다. 리뷰는
+        // 커넥터를 쓰지 않으므로 여기서 명시적으로 비운다.
+        HAPPY_APLUS_EXPECTED_CONNECTORS: '[]',
+        HAPPY_APLUS_EXPECTED_MCP_SERVICES: '[]',
         ...(bridged.dispatch.type === 'review_apply.v1' ? query.githubEnvironment ?? {} : {}),
         ...(bridged.dispatch.type === 'pr_review.v1'
           ? { HAPPY_PROJECT_SANDBOX_CONFIG: PR_REVIEW_SANDBOX_CONFIG }

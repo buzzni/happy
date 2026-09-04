@@ -2350,8 +2350,15 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[DAEMON RUN] Browser bridge failed to start on ${DEFAULT_BROWSER_BRIDGE_PORT}: ${err instanceof Error ? err.message : String(err)}`);
     }
 
+    // /terminal (local-direct) needs the machine's E2EE key to decrypt open
+    // params / encrypt frames the same way the relay path does, but the
+    // machine object below doesn't exist until `api.getOrCreateMachine()`
+    // resolves, well after this server starts — a ref the terminal route
+    // reads lazily, rather than reordering daemon startup around it.
+    let machineEncryptionForTerminalWs: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' } | null = null;
+
     // Start control server
-    const { port: controlPort, stop: stopControlServer } = await startDaemonControlServer({
+    const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
       getChildren: getCurrentChildren,
       stopSession,
       spawnSession,
@@ -2359,7 +2366,12 @@ export async function startDaemon(): Promise<void> {
       onHappySessionWebhook,
       onHappySessionRuntime,
       portRegistry,
-      browserBridge
+      browserBridge,
+      allowedRoot: resolveAllowedRoot({
+        registryWorkspaceRoot: process.env.HAPPY_WORKSPACE_ROOT ?? null,
+        homeDir: os.homedir(),
+      }),
+      getMachineEncryption: () => machineEncryptionForTerminalWs,
     });
 
     // Write initial daemon state (no lock needed for state file)
@@ -2371,6 +2383,7 @@ export async function startDaemon(): Promise<void> {
       daemonLogPath: logger.logFilePath,
       state: 'running',
       trackedSessions: serializeTrackedSessions(),
+      controlSecret,
     };
     writeDaemonState(fileState);
     logger.debug('[DAEMON RUN] Daemon state written');
@@ -2448,6 +2461,10 @@ export async function startDaemon(): Promise<void> {
         daemonState: initialDaemonState
       });
     }
+    // Local-direct terminal (/terminal) only needs the locally-derived
+    // encryption key, not server registration — set it either way so an
+    // offline-degraded daemon still serves same-machine desktop clients.
+    machineEncryptionForTerminalWs = { encryptionKey: machine.encryptionKey, encryptionVariant: machine.encryptionVariant };
 
     // Create realtime machine session
     const apiMachine = api.machineSyncClient(machine);
@@ -2949,6 +2966,7 @@ export async function startDaemon(): Promise<void> {
           daemonLogPath: fileState.daemonLogPath,
           state: 'running',
           trackedSessions: serializeTrackedSessions(),
+          controlSecret: fileState.controlSecret,
         };
         writeDaemonState(updatedState);
         if (process.env.DEBUG) {
