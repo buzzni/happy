@@ -67,7 +67,9 @@ export type DaemonSessionIdleReaperRequest = {
 
 type DaemonSessionIdleReaperCandidate = {
   sessionId: string;
-  projectId: string;
+  /** Server-side display value; null for sessions without a project mapping
+   *  (personal chats) that a trial budget stop still targets. */
+  projectId: string | null;
   machineId: string;
   lastActiveAt: number;
   idleMs: number;
