@@ -2367,10 +2367,8 @@ export async function startDaemon(): Promise<void> {
       onHappySessionRuntime,
       portRegistry,
       browserBridge,
-      allowedRoot: resolveAllowedRoot({
-        registryWorkspaceRoot: process.env.HAPPY_WORKSPACE_ROOT ?? null,
-        homeDir: os.homedir(),
-      }),
+      // 제어 서버의 파일 접근도 같은 잠금 정책을 따른다(HAPPY_RPC_ALLOWED_ROOT).
+      allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
       getMachineEncryption: () => machineEncryptionForTerminalWs,
     });
 
