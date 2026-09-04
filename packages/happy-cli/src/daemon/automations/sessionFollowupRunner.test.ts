@@ -330,6 +330,38 @@ describe('sessionFollowupRunner', () => {
     expect(transport.deliver).not.toHaveBeenCalled()
   })
 
+  // 2026-09-03: Claude Code 는 백그라운드 작업 완료를 턴 중간에 `<task-notification>` 사용자 행으로
+  // 기록하고, 세션 스캐너는 이를 턴을 닫지 않는 user 텍스트 envelope 로 올린다
+  // (specs/midturn-task-notification-sync R2). 열린 턴 안의 user envelope 는 사용자 개입이 아니다.
+  it('ignores a session-protocol user envelope inside the running turn as a task notification', async () => {
+    const { input, transport } = harness({
+      messages: [
+        message(11, { role: 'session', content: { type: 'session', data: { id: 'e1', time: 1, role: 'agent', turn: 't1', ev: { t: 'turn-start' } } } }),
+        message(12, { role: 'session', content: { type: 'session', data: { id: 'e2', time: 2, role: 'user', ev: { t: 'text', text: '<task-notification>\n<status>completed</status>\n</task-notification>' } } } }),
+        message(13, { role: 'session', content: { type: 'session', data: { id: 'e3', time: 3, role: 'agent', turn: 't1', ev: { t: 'text', text: '```json\n{"findings":[{"severity":"medium"}]}\n```' } } } }),
+        message(14, { role: 'session', content: { type: 'session', data: { id: 'e4', time: 4, role: 'agent', turn: 't1', ev: { t: 'turn-end', status: 'completed' } } } }),
+      ],
+    })
+    await runSessionFollowupTick(input)
+    expect(transport.evaluate).not.toHaveBeenCalledWith(expect.objectContaining({ terminalCode: 'USER_INTERVENTION' }))
+    expect(transport.deliver).toHaveBeenCalledTimes(1)
+  })
+
+  it('still stops on a session-protocol user envelope after the turn has ended', async () => {
+    const { input, transport } = harness({
+      messages: [
+        message(11, { role: 'session', content: { type: 'session', data: { id: 'e1', time: 1, role: 'agent', turn: 't1', ev: { t: 'turn-start' } } } }),
+        message(12, { role: 'session', content: { type: 'session', data: { id: 'e2', time: 2, role: 'agent', turn: 't1', ev: { t: 'turn-end', status: 'completed' } } } }),
+        message(13, { role: 'session', content: { type: 'session', data: { id: 'e3', time: 3, role: 'user', ev: { t: 'text', text: 'change direction' } } } }),
+      ],
+    })
+    await runSessionFollowupTick(input)
+    expect(transport.evaluate).toHaveBeenCalledWith(expect.objectContaining({
+      decision: 'TERMINATE', terminalCode: 'USER_INTERVENTION', observedSeq: 13,
+    }))
+    expect(transport.deliver).not.toHaveBeenCalled()
+  })
+
   it('fails closed when the observed agent turn aborts', async () => {
     const { input, transport } = harness({
       messages: [
