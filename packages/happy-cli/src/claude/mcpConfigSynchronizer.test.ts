@@ -19,6 +19,74 @@ const initialAplusServers = {
 };
 
 describe('McpConfigSynchronizer', () => {
+    it('keeps a session-start org MCP server that a later ok response omits', async () => {
+        const setMcpServers = vi.fn(async () => ({ added: [], removed: [], errors: {} }));
+        const synchronizer = new McpConfigSynchronizer({ setMcpServers } as any, {
+            baseServers,
+            initialAplusServers,
+            floorServerNames: ['argos'],
+            fetchAplusServers: vi.fn(async () => ({
+                ok: true as const,
+                // project scope 를 잃은 응답. argos 가 빠졌지만 200 이다.
+                servers: { notion: { type: 'http' as const, url: 'https://gw.test/mcp/connector/notion' } },
+            })),
+        });
+
+        await synchronizer.sync();
+
+        const applied = setMcpServers.mock.calls[0][0] as Record<string, unknown>;
+        expect(Object.keys(applied).sort()).toEqual(['argos', 'happy', 'notion']);
+        expect(applied.argos).toEqual(initialAplusServers.argos);
+    });
+
+    it('still applies additions and header refreshes while holding the floor', async () => {
+        const setMcpServers = vi.fn(async () => ({ added: [], removed: [], errors: {} }));
+        const synchronizer = new McpConfigSynchronizer({ setMcpServers } as any, {
+            baseServers,
+            initialAplusServers: {
+                ...initialAplusServers,
+                notion: { type: 'http' as const, url: 'https://gw.test/mcp/connector/notion', headers: { Authorization: 'Bearer stale' } },
+            },
+            floorServerNames: ['argos'],
+            fetchAplusServers: vi.fn(async () => ({
+                ok: true as const,
+                servers: {
+                    notion: { type: 'http' as const, url: 'https://gw.test/mcp/connector/notion', headers: { Authorization: 'Bearer fresh' } },
+                },
+            })),
+        });
+
+        await synchronizer.sync();
+
+        const applied = setMcpServers.mock.calls[0][0] as Record<string, any>;
+        // 커넥터는 바닥선이 아니므로 새 헤더가 그대로 반영된다.
+        expect(applied.notion.headers.Authorization).toBe('Bearer fresh');
+        // 조직 등록 MCP 는 바닥선이라 유지된다.
+        expect(applied.argos).toEqual(initialAplusServers.argos);
+    });
+
+    it('drops a session-start connector that a later ok response omits', async () => {
+        const setMcpServers = vi.fn(async () => ({ added: [], removed: [], errors: {} }));
+        const synchronizer = new McpConfigSynchronizer({ setMcpServers } as any, {
+            baseServers,
+            initialAplusServers: {
+                ...initialAplusServers,
+                notion: { type: 'http' as const, url: 'https://gw.test/mcp/connector/notion' },
+            },
+            floorServerNames: ['argos'],
+            fetchAplusServers: vi.fn(async () => ({
+                ok: true as const,
+                servers: initialAplusServers,
+            })),
+        });
+
+        await synchronizer.sync();
+
+        const applied = setMcpServers.mock.calls[0][0] as Record<string, unknown>;
+        // 재연결이 필요한 커넥터는 게이트웨이가 거부하므로 유지하지 않는다.
+        expect(Object.keys(applied).sort()).toEqual(['argos', 'happy']);
+    });
+
     it('treats an unconfigured A+ source as disabled instead of failed', async () => {
         const onStatus = vi.fn();
         const synchronizer = new McpConfigSynchronizer({ setMcpServers: vi.fn() } as any, {
