@@ -21,6 +21,7 @@ import { projectPath } from '@/projectPath';
 import { join } from 'node:path';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
+import { refreshMcpCallerGrantIfExpiring } from '@/aplus/refreshMcpCallerGrant';
 import {
     fetchAplusMcpConfigSnapshot,
     fetchAplusMcpServersResult,
@@ -1039,11 +1040,16 @@ export async function runCodex(opts: {
         baseServers: baseMcpServers,
         initialAplusServers: initialAplusMcpServers,
         floorServerNames: resolveMcpFloorServerNames(initialAplusMcpServers, readExpectedConnectors()),
-        fetchAplusServers: () => fetchAplusMcpServersResult(
-            opts.credentials.token,
-            machineId,
-            { sessionId: session.sessionId, lifecycle: 'turn' },
-        ),
+        fetchAplusServers: async () => {
+            // 조회 직전에 교환해야 새 grant 로 조회된다. 24시간을 넘겨 사는
+            // 세션이 403 으로 마지막 정상 설정에 갇히는 것을 막는다.
+            await refreshMcpCallerGrantIfExpiring(opts.credentials.token, machineId);
+            return fetchAplusMcpServersResult(
+                opts.credentials.token,
+                machineId,
+                { sessionId: session.sessionId, lifecycle: 'turn' },
+            );
+        },
         bridgeAplusServers: (servers) => bridgeAplusMcpServers(servers, bridgeOptions),
         onStatus: (status) => {
             session.updateMetadata((currentMetadata) => ({
