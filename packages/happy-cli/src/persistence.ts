@@ -6,7 +6,7 @@
 
 import { FileHandle } from 'node:fs/promises'
 import { readFile, writeFile, mkdir, open, unlink, rename, stat } from 'node:fs/promises'
-import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs'
+import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync, chmodSync } from 'node:fs'
 import { constants } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { configuration } from '@/configuration'
@@ -117,6 +117,14 @@ export interface DaemonLocallyPersistedState {
   state?: 'running' | 'stopped' | 'crashed';
   stateReason?: string;
   trackedSessions?: PersistedTrackedSession[];
+  /**
+   * Loopback-only Bearer secret for the control server (ADR-061,
+   * specs/desktop-speed-breakthrough-local-direct). Optional so state files
+   * written before this field existed still parse; a daemon that started
+   * before the auth rollout has no secret and its control server falls back
+   * to whatever `controlServer.ts` does for that case.
+   */
+  controlSecret?: string;
 }
 
 export async function readSettings(): Promise<Settings> {
@@ -467,10 +475,16 @@ export async function readDaemonState(): Promise<DaemonLocallyPersistedState | n
 }
 
 /**
- * Write daemon state to local file (synchronously for atomic operation)
+ * Write daemon state to local file (synchronously for atomic operation).
+ *
+ * Since 2026-09 this file can carry `controlSecret` (ADR-061), so it must be
+ * unreadable by other local users. `mode` on `writeFileSync` only applies when
+ * the file is newly created — a file that pre-dates this field (or was
+ * otherwise created with a looser mode) needs an explicit chmod too.
  */
 export function writeDaemonState(state: DaemonLocallyPersistedState): void {
-  writeFileSync(configuration.daemonStateFile, JSON.stringify(state, null, 2), 'utf-8');
+  writeFileSync(configuration.daemonStateFile, JSON.stringify(state, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  chmodSync(configuration.daemonStateFile, 0o600);
 }
 
 /**
