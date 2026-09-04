@@ -5,6 +5,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
 import { releaseDanglingSubmoduleWorktreePointers } from './submoduleWorktreePointer'
+import { hasUnsavedWorktreeChanges } from './worktreeDirtyState'
 
 const execFileAsync = promisify(execFile)
 const COMMAND_TIMEOUT_MS = 60_000
@@ -102,7 +103,10 @@ export async function removeGithubTriggerWorktree(input: {
     cwd: input.worktreePath,
   }, 'GitHub automation worktree status failed')
   if (!status.ok) return { ok: false, dirty: false, error: status.error }
-  if (status.stdout.trim().length > 0) {
+  // 한 줄이라도 있으면 보존하던 것이 worktree 45개(23GB)를 쌓았다. 사유가 작업물이
+  // 아니라 에이전트 산출물(?? memory/)과 서브모듈 gitlink( M vendor/happy)였기 때문이다.
+  // 무해하다고 아는 것만 무시하고, 하나라도 진짜 변경이 섞이면 그대로 지킨다.
+  if (hasUnsavedWorktreeChanges(status.stdout)) {
     return { ok: false, dirty: true, error: 'GitHub automation worktree is dirty' }
   }
   const removed = await commandOrError(runCommand, {
