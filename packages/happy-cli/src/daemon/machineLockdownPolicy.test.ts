@@ -32,14 +32,20 @@ describe('resolveMachineLockdownPolicy', () => {
 
     it('denies credential directories, /proc and environment dumps for the agent', () => {
         const rules = managedCredentialDenyRules('/home/trial/');
-        expect(rules).toContain('Read(/home/trial/.happy/**)');
-        expect(rules).toContain('Read(/home/trial/.claude/**)');
-        expect(rules).toContain('Read(/home/trial/.claude-swap/**)');
-        expect(rules).toContain('Read(/home/trial/.codex/**)');
+        // Home-relative and absolute (`//`) forms — a bare `/home/...` would be
+        // project-relative in Claude Code's rule syntax and match nothing.
+        expect(rules).toContain('Read(~/.happy/**)');
+        expect(rules).toContain('Read(///home/trial/.happy/**)');
+        expect(rules).toContain('Edit(~/.happy/**)');
+        expect(rules).toContain('Write(~/.claude/**)');
+        expect(rules).toContain('Read(~/.claude-swap/**)');
+        expect(rules).toContain('Read(~/.codex/**)');
+        expect(rules).toContain('Bash(cat ~/.happy/*)');
         expect(rules).toContain('Bash(cat /home/trial/.happy/*)');
-        expect(rules).toContain('Read(/proc/**)');
+        expect(rules).toContain('Read(//proc/**)');
         expect(rules).toContain('Bash(env)');
         expect(rules).toContain('Bash(printenv:*)');
+        expect(rules.some((rule) => /^Read\(\/home\//.test(rule))).toBe(false);
         expect(REMOTE_TERMINAL_DISABLED_ERROR).toBe('TERMINAL_DISABLED');
     });
 });

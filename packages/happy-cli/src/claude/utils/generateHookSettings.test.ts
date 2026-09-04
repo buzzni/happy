@@ -20,7 +20,8 @@ describe('buildHookSettings', () => {
             policy: resolveMachineLockdownPolicy({ HAPPY_RPC_ALLOWED_ROOT: 'workspace' }),
         }) as { permissions: { deny: string[] } };
         expect(settings.permissions.deny).toContain('Bash(killall:*)');
-        expect(settings.permissions.deny).toContain('Read(/home/trial/.happy/**)');
+        expect(settings.permissions.deny).toContain('Read(~/.happy/**)');
+        expect(settings.permissions.deny).toContain('Read(///home/trial/.happy/**)');
         expect(settings.permissions.deny).toContain('Bash(env)');
     });
 });

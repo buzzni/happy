@@ -40,24 +40,31 @@ export function resolveMachineLockdownPolicy(
 
 /**
  * Claude Code `permissions.deny` patterns that keep an agent session from
- * reading the daemon-managed credential files or dumping its own process
- * environment (which carries the injected ANTHROPIC_AUTH_TOKEN).
+ * reading (or rewriting) the daemon-managed credential files and hook
+ * settings, or dumping its own process environment (which carries the
+ * injected ANTHROPIC_AUTH_TOKEN).
+ *
+ * Path rule syntax (Claude Code permissions): `~/x` is home-relative and
+ * `//x` is absolute from the filesystem root. A plain `/x` would be relative
+ * to the project root and match nothing here, so both forms are emitted.
  */
 export function managedCredentialDenyRules(homeDir: string): string[] {
     const home = homeDir.replace(/\/+$/, '');
-    const protectedDirs = [
-        `${home}/.happy`,
-        `${home}/.claude`,
-        `${home}/.claude-swap`,
-        `${home}/.codex`,
-    ];
-    return [
-        ...protectedDirs.flatMap((dir) => [`Read(${dir}/**)`, `Bash(cat ${dir}/*)`]),
-        'Read(/proc/**)',
+    const protectedDirs = ['.happy', '.claude', '.claude-swap', '.codex'];
+    const rules: string[] = [];
+    for (const dir of protectedDirs) {
+        for (const tool of ['Read', 'Edit', 'Write']) {
+            rules.push(`${tool}(~/${dir}/**)`, `${tool}(//${home}/${dir}/**)`);
+        }
+        rules.push(`Bash(cat ~/${dir}/*)`, `Bash(cat ${home}/${dir}/*)`);
+    }
+    rules.push(
+        'Read(//proc/**)',
         'Bash(env)',
         'Bash(env:*)',
         'Bash(printenv:*)',
         'Bash(export)',
         'Bash(set)',
-    ];
+    );
+    return rules;
 }
