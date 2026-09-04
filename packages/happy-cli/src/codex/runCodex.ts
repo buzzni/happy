@@ -27,6 +27,7 @@ import {
     mcpConfigFailureStatuses,
     readExpectedConnectors,
     readExpectedMcpServices,
+    resolveMcpFloorServerNames,
 } from '@/aplus/fetchAplusMcpServers';
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
 import { bridgeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
@@ -1037,6 +1038,7 @@ export async function runCodex(opts: {
     const mcpConfigSynchronizer = new CodexMcpConfigSynchronizer({
         baseServers: baseMcpServers,
         initialAplusServers: initialAplusMcpServers,
+        floorServerNames: resolveMcpFloorServerNames(initialAplusMcpServers, readExpectedConnectors()),
         fetchAplusServers: () => fetchAplusMcpServersResult(
             opts.credentials.token,
             machineId,

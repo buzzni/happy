@@ -26,6 +26,30 @@ function bridge(servers: AplusMcpServersMap) {
 }
 
 describe('CodexMcpConfigSynchronizer', () => {
+    it('keeps a session-start org MCP server that a later ok response omits', async () => {
+        const withArgos = {
+            ...initialAplusServers,
+            argos: {
+                type: 'http' as const,
+                url: 'https://argos.test/mcp',
+                headers: { Authorization: 'Bearer argos-1' },
+            },
+        };
+        const resumeThread = vi.fn(async () => ({ threadId: 'thread-1', model: 'gpt-test' }));
+        const synchronizer = new CodexMcpConfigSynchronizer({
+            baseServers,
+            initialAplusServers: withArgos,
+            floorServerNames: ['argos'],
+            // project scope 를 잃은 응답. argos 가 빠졌지만 200 이다.
+            fetchAplusServers: vi.fn(async () => ({ ok: true as const, servers: initialAplusServers })),
+            bridgeAplusServers: bridge,
+        });
+
+        const out = await synchronizer.sync({ threadId: 'thread-1', resumeThread });
+
+        expect(Object.keys(out.mcpServers).sort()).toEqual(['aplus-common', 'argos', 'happy']);
+    });
+
     it('resumes the same active thread with a newly connected server before the turn', async () => {
         const fetchAplusServers = vi.fn(async () => ({
             ok: true as const,
