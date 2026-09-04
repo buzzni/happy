@@ -18,8 +18,9 @@ import { proxyHttp, PreviewProxyError } from './previewProxy';
 import { startServerProcess, StartServerError } from './startServer';
 import { stopServerProcess, StopServerError } from './stopServer';
 import { BrowserBridge, BridgeRequestError } from './browserBridge';
-import { attachTerminalWsRoute } from './controlServerTerminalWs';
+import { attachTerminalWsRoute, type MachineEncryption as TerminalMachineEncryption } from './controlServerTerminalWs';
 import type { ChildProcess } from 'node:child_process';
+import { homedir } from 'node:os';
 
 export function startDaemonControlServer({
   getChildren,
@@ -29,7 +30,9 @@ export function startDaemonControlServer({
   onHappySessionWebhook,
   onHappySessionRuntime = () => {},
   portRegistry,
-  browserBridge
+  browserBridge,
+  allowedRoot = homedir(),
+  getMachineEncryption = () => null
 }: {
   getChildren: () => TrackedSession[];
   stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
@@ -45,6 +48,17 @@ export function startDaemonControlServer({
   ) => void;
   portRegistry: PortRegistry;
   browserBridge?: BrowserBridge;
+  /** `/terminal` PTY cwd fallback boundary (decideTerminalCwd) — same value
+   *  `spawnSession`'s own additionalDirectories handling already resolves.
+   *  Defaults to homedir; only real callers that actually offer `/terminal`
+   *  local-direct need to pass the caller's actual value. */
+  allowedRoot?: string;
+  /** Null until the daemon's machine registration resolves (it starts after
+   *  this server does) — `/terminal` fails closed with a clean error until
+   *  set. Defaults to an always-null getter (no local-direct support) so
+   *  callers that don't wire this up (most tests, `preflightDaemonControlServer`)
+   *  don't have to. */
+  getMachineEncryption?: () => TerminalMachineEncryption | null;
 }): Promise<{ port: number; stop: () => Promise<void>; controlSecret: string }> {
   return new Promise((resolve) => {
     const app = fastify({
@@ -68,7 +82,12 @@ export function startDaemonControlServer({
     // Same secret, same loopback trust boundary — but a WS upgrade never goes
     // through Fastify's route handlers/hooks above, so it needs its own check
     // at `verifyClient` (attachTerminalWsRoute).
-    const terminalWs = attachTerminalWsRoute(app.server, { path: '/terminal', controlSecret });
+    const terminalWs = attachTerminalWsRoute(app.server, {
+      path: '/terminal',
+      controlSecret,
+      allowedRoot,
+      getMachineEncryption,
+    });
 
     // Set up Zod type provider
     app.setValidatorCompiler(validatorCompiler);
