@@ -427,6 +427,15 @@ export async function claudeRemote(opts: {
                         acceptsPromptSuggestion = false;
                         opts.onPromptSuggestionChange?.(null);
                         opts.onMcpControllerReady?.(null);
+                        // 결과 직후 복구 뒤에도 다음 입력을 기다리는 동안 서버가
+                        // 죽을 수 있다. 턴 dispatch 직전(= SDK 가 idle 인 경계)에
+                        // 한 번 더 살린다. 턴이 끝난 뒤 복구하면 그 턴 전체를
+                        // 도구 없이 돈다. Codex 의 recoverBeforeTurn 과 같은 취지다.
+                        //
+                        // 이 await 는 acceptsPromptSuggestion 플립 뒤에 와야 한다.
+                        // 앞에 두면 직전 턴의 늦은 prompt_suggestion 이 새 턴으로
+                        // 새어든다.
+                        await mcpRecovery.recoverFailedServers();
                         mode = next.mode;
                         acceptsActiveInput = true;
                         opts.onActiveInputReady?.(sendActiveInput);
