@@ -32,7 +32,13 @@ async function daemonPost(path: string, body?: any): Promise<{ error?: string } 
     const timeout = process.env.HAPPY_DAEMON_HTTP_TIMEOUT ? parseInt(process.env.HAPPY_DAEMON_HTTP_TIMEOUT) : 10_000;
     const response = await fetch(`http://127.0.0.1:${state.httpPort}${path}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        // ADR-061: the control server rejects every request without this —
+        // absent on a state file from before the auth rollout, in which case
+        // the server's 401 surfaces through the existing `!response.ok` path.
+        ...(state.controlSecret ? { Authorization: `Bearer ${state.controlSecret}` } : {}),
+      },
       body: JSON.stringify(body || {}),
       // Mostly increased for stress test
       signal: AbortSignal.timeout(timeout)
@@ -189,7 +195,10 @@ export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolea
     try {
       const response = await fetch(`http://127.0.0.1:${state.httpPort}/list`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(state.controlSecret ? { Authorization: `Bearer ${state.controlSecret}` } : {}),
+        },
         body: '{}',
         signal: AbortSignal.timeout(2000)
       });

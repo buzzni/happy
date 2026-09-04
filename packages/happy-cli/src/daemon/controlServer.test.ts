@@ -8,11 +8,29 @@ import { createPortRegistry } from './portRegistry'
 import { startDaemonControlServer } from './controlServer'
 import type { SpawnSessionOptions } from '@/modules/common/registerCommonHandlers'
 
+const realFetch = globalThis.fetch
+
+/**
+ * Every route requires `Authorization: Bearer <controlSecret>` (ADR-061). Each
+ * describe block below shadows the module-local `fetch` with this — every
+ * existing raw `fetch(...)` call site picks it up lexically, so route tests
+ * exercise real auth without threading a header through ~30 call sites.
+ */
+function makeAuthedFetch(getSecret: () => string) {
+  return (input: Parameters<typeof realFetch>[0], init?: RequestInit) =>
+    realFetch(input, {
+      ...init,
+      headers: { ...(init?.headers as Record<string, string> | undefined), Authorization: `Bearer ${getSecret()}` },
+    })
+}
+
 describe('controlServer port allocation endpoints', () => {
   const userId = 'test-user'
   let dir: string
   let baseUrl: string
   let stopServer: () => Promise<void>
+  let controlSecret = ''
+  const fetch = makeAuthedFetch(() => controlSecret)
 
   beforeEach(async () => {
     dir = mkdtempSync(path.join(tmpdir(), 'control-server-'))
@@ -22,7 +40,7 @@ describe('controlServer port allocation endpoints', () => {
       portMax: 30010,
       isPortBindable: async () => true,
     })
-    const { port, stop } = await startDaemonControlServer({
+    const { port, stop, controlSecret: secret } = await startDaemonControlServer({
       getChildren: () => [],
       stopSession: () => ({ stopped: false, reason: 'not-found' }),
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused in this test' }),
@@ -32,6 +50,7 @@ describe('controlServer port allocation endpoints', () => {
     })
     baseUrl = `http://127.0.0.1:${port}`
     stopServer = stop
+    controlSecret = secret
   })
 
   afterEach(async () => {
@@ -153,6 +172,8 @@ describe('controlServer POST /spawn-session', () => {
   let baseUrl: string
   let stopServer: () => Promise<void>
   let spawnRequests: SpawnSessionOptions[]
+  let controlSecret = ''
+  const fetch = makeAuthedFetch(() => controlSecret)
 
   beforeEach(async () => {
     dir = mkdtempSync(path.join(tmpdir(), 'control-server-'))
@@ -163,7 +184,7 @@ describe('controlServer POST /spawn-session', () => {
       portMax: 30010,
       isPortBindable: async () => true,
     })
-    const { port, stop } = await startDaemonControlServer({
+    const { port, stop, controlSecret: secret } = await startDaemonControlServer({
       getChildren: () => [],
       stopSession: () => ({ stopped: false, reason: 'not-found' }),
       spawnSession: async (options) => {
@@ -176,6 +197,7 @@ describe('controlServer POST /spawn-session', () => {
     })
     baseUrl = `http://127.0.0.1:${port}`
     stopServer = stop
+    controlSecret = secret
   })
 
   afterEach(async () => {
@@ -237,6 +259,8 @@ describe('controlServer POST /session-runtime', () => {
     runtime: { thinking?: boolean; hasOpenToolCall?: boolean; updatedAt: number }
     reporter?: { hostPid?: number }
   }>
+  let controlSecret = ''
+  const fetch = makeAuthedFetch(() => controlSecret)
 
   beforeEach(async () => {
     dir = mkdtempSync(path.join(tmpdir(), 'control-server-'))
@@ -247,7 +271,7 @@ describe('controlServer POST /session-runtime', () => {
       portMax: 30010,
       isPortBindable: async () => true,
     })
-    const { port, stop } = await startDaemonControlServer({
+    const { port, stop, controlSecret: secret } = await startDaemonControlServer({
       getChildren: () => [],
       stopSession: () => ({ stopped: false, reason: 'not-found' }),
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused in this test' }),
@@ -260,6 +284,7 @@ describe('controlServer POST /session-runtime', () => {
     })
     baseUrl = `http://127.0.0.1:${port}`
     stopServer = stop
+    controlSecret = secret
   })
 
   afterEach(async () => {
@@ -361,6 +386,8 @@ describe('controlServer port allocation — range exhaustion', () => {
   let dir: string
   let baseUrl: string
   let stopServer: () => Promise<void>
+  let controlSecret = ''
+  const fetch = makeAuthedFetch(() => controlSecret)
 
   beforeEach(async () => {
     dir = mkdtempSync(path.join(tmpdir(), 'control-server-'))
@@ -370,7 +397,7 @@ describe('controlServer port allocation — range exhaustion', () => {
       portMax: 30001,
       isPortBindable: async () => true,
     })
-    const { port, stop } = await startDaemonControlServer({
+    const { port, stop, controlSecret: secret } = await startDaemonControlServer({
       getChildren: () => [],
       stopSession: () => ({ stopped: false, reason: 'not-found' }),
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
@@ -380,6 +407,7 @@ describe('controlServer port allocation — range exhaustion', () => {
     })
     baseUrl = `http://127.0.0.1:${port}`
     stopServer = stop
+    controlSecret = secret
   })
 
   afterEach(async () => {
@@ -411,6 +439,8 @@ describe('controlServer POST /proxy-http', () => {
   let baseUrl: string
   let stopServer: () => Promise<void>
   let upstream: { port: number; stop: () => Promise<void> } | null = null
+  let controlSecret = ''
+  const fetch = makeAuthedFetch(() => controlSecret)
 
   const startUpstream = async (handler: (req: IncomingMessage, res: ServerResponse) => void) => {
     const srv = http.createServer(handler)
@@ -428,7 +458,7 @@ describe('controlServer POST /proxy-http', () => {
       portMax: 30010,
       isPortBindable: async () => true,
     })
-    const { port, stop } = await startDaemonControlServer({
+    const { port, stop, controlSecret: secret } = await startDaemonControlServer({
       getChildren: () => [],
       stopSession: () => ({ stopped: false, reason: 'not-found' }),
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
@@ -438,6 +468,7 @@ describe('controlServer POST /proxy-http', () => {
     })
     baseUrl = `http://127.0.0.1:${port}`
     stopServer = stop
+    controlSecret = secret
   })
 
   afterEach(async () => {
@@ -519,6 +550,8 @@ describe('controlServer POST /start-server', () => {
   let baseUrl: string
   let stopServer: () => Promise<void>
   const spawnedPids: number[] = []
+  let controlSecret = ''
+  const fetch = makeAuthedFetch(() => controlSecret)
 
   const kill = (pid: number) => {
     try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
@@ -532,7 +565,7 @@ describe('controlServer POST /start-server', () => {
       portMax: 30010,
       isPortBindable: async () => true,
     })
-    const { port, stop } = await startDaemonControlServer({
+    const { port, stop, controlSecret: secret } = await startDaemonControlServer({
       getChildren: () => [],
       stopSession: () => ({ stopped: false, reason: 'not-found' }),
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
@@ -542,6 +575,7 @@ describe('controlServer POST /start-server', () => {
     })
     baseUrl = `http://127.0.0.1:${port}`
     stopServer = stop
+    controlSecret = secret
   })
 
   afterEach(async () => {
@@ -631,6 +665,8 @@ describe('controlServer POST /stop-server', () => {
   let baseUrl: string
   let stopServer: () => Promise<void>
   const spawnedPids: number[] = []
+  let controlSecret = ''
+  const fetch = makeAuthedFetch(() => controlSecret)
 
   const killPid = (pid: number) => {
     try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
@@ -644,7 +680,7 @@ describe('controlServer POST /stop-server', () => {
       portMax: 30010,
       isPortBindable: async () => true,
     })
-    const { port, stop } = await startDaemonControlServer({
+    const { port, stop, controlSecret: secret } = await startDaemonControlServer({
       getChildren: () => [],
       stopSession: () => ({ stopped: false, reason: 'not-found' }),
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
@@ -654,6 +690,7 @@ describe('controlServer POST /stop-server', () => {
     })
     baseUrl = `http://127.0.0.1:${port}`
     stopServer = stop
+    controlSecret = secret
   })
 
   afterEach(async () => {
@@ -721,6 +758,8 @@ describe('controlServer /stop-session v2 contract', () => {
   let baseUrl: string
   let stopServer: () => Promise<void>
   let received: Array<{ sessionId: string; context?: { source?: string; reason?: string; mode?: 'force' | 'if-idle' } }>
+  let controlSecret = ''
+  const fetch = makeAuthedFetch(() => controlSecret)
 
   beforeEach(async () => {
     dir = mkdtempSync(path.join(tmpdir(), 'control-server-stop-'))
@@ -731,7 +770,7 @@ describe('controlServer /stop-session v2 contract', () => {
       portMax: 30010,
       isPortBindable: async () => true,
     })
-    const { port, stop } = await startDaemonControlServer({
+    const { port, stop, controlSecret: secret } = await startDaemonControlServer({
       getChildren: () => [],
       stopSession: (sessionId, context) => {
         received.push({ sessionId, ...(context !== undefined ? { context } : {}) })
@@ -755,6 +794,7 @@ describe('controlServer /stop-session v2 contract', () => {
     })
     baseUrl = `http://127.0.0.1:${port}`
     stopServer = stop
+    controlSecret = secret
   })
 
   afterEach(async () => {
@@ -796,5 +836,94 @@ describe('controlServer /stop-session v2 contract', () => {
     const { status, body } = await stopSessionPost({ sessionId: 'session-missing' })
     expect(status).toBe(200)
     expect(body).toEqual({ success: false, stopped: false, reason: 'not-found' })
+  })
+})
+
+// ADR-061 / specs/desktop-speed-breakthrough-local-direct T2: the control
+// server is a loopback HTTP server with no auth today — any local process
+// (any local user, on a shared machine) can call `/spawn-session` or
+// `/proxy-http`. Every route must require the per-daemon-run Bearer secret,
+// with no exceptions for routes that were "already" unauthenticated.
+describe('controlServer authentication', () => {
+  let dir: string
+  let baseUrl: string
+  let stopServer: () => Promise<void>
+  let controlSecret: string
+
+  beforeEach(async () => {
+    dir = mkdtempSync(path.join(tmpdir(), 'control-server-auth-'))
+    const registry = createPortRegistry({
+      filePath: path.join(dir, 'port-registry.json'),
+      portMin: 30000,
+      portMax: 30010,
+      isPortBindable: async () => true,
+    })
+    const { port, stop, controlSecret: secret } = await startDaemonControlServer({
+      getChildren: () => [],
+      stopSession: () => ({ stopped: false, reason: 'not-found' }),
+      spawnSession: async () => ({ type: 'error', errorMessage: 'unused in this test' }),
+      requestShutdown: () => {},
+      onHappySessionWebhook: () => {},
+      portRegistry: registry,
+    })
+    baseUrl = `http://127.0.0.1:${port}`
+    stopServer = stop
+    controlSecret = secret
+  })
+
+  afterEach(async () => {
+    await stopServer()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('issues a non-empty, per-run-unique secret', async () => {
+    expect(controlSecret.length).toBeGreaterThanOrEqual(32)
+
+    const other = await startDaemonControlServer({
+      getChildren: () => [],
+      stopSession: () => ({ stopped: false, reason: 'not-found' }),
+      spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
+      requestShutdown: () => {},
+      onHappySessionWebhook: () => {},
+      portRegistry: createPortRegistry({
+        filePath: path.join(dir, 'port-registry-2.json'),
+        portMin: 30020,
+        portMax: 30030,
+        isPortBindable: async () => true,
+      }),
+    })
+    try {
+      expect(other.controlSecret).not.toBe(controlSecret)
+    } finally {
+      await other.stop()
+    }
+  })
+
+  it('rejects a request with no Authorization header', async () => {
+    const res = await realFetch(`${baseUrl}/port-registry`)
+    expect(res.status).toBe(401)
+  })
+
+  it('rejects a request with the wrong secret', async () => {
+    const res = await realFetch(`${baseUrl}/port-registry`, {
+      headers: { Authorization: 'Bearer not-the-secret' },
+    })
+    expect(res.status).toBe(401)
+  })
+
+  it('rejects a POST route with a body but no Authorization header — a route that was unauthenticated before ADR-061 must not be an exception', async () => {
+    const res = await realFetch(`${baseUrl}/spawn-session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ directory: dir }),
+    })
+    expect(res.status).toBe(401)
+  })
+
+  it('accepts a request with the correct secret', async () => {
+    const res = await realFetch(`${baseUrl}/port-registry`, {
+      headers: { Authorization: `Bearer ${controlSecret}` },
+    })
+    expect(res.status).toBe(200)
   })
 })

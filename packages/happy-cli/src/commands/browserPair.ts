@@ -363,6 +363,7 @@ export function pairingConnectionArrived(
 
 async function waitForConnection(
     controlPort: number,
+    controlSecret: string,
     timeoutMs: number,
     profilesBefore: string[],
     targetPairingId?: string,
@@ -375,7 +376,7 @@ async function waitForConnection(
     // even if a later poll no longer reports it.
     let authRejected = false
     while (Date.now() < deadline) {
-        const status = await fetchBrowserStatus(controlPort, viewerKey)
+        const status = await fetchBrowserStatus(controlPort, controlSecret, viewerKey)
         connections = (status?.connections ?? [])
             .filter((connection) => connection.viewerKey === viewerKey)
         authRejected ||= status?.hasRecentAuthFailure === true
@@ -414,6 +415,7 @@ export function pickTierProbeProfile(profilesBefore: string[], connections: Arra
  */
 async function waitForDebuggerTier(
     controlPort: number,
+    controlSecret: string,
     expected: boolean,
     profile: string,
     viewerKey?: string,
@@ -424,6 +426,7 @@ async function waitForDebuggerTier(
         try {
             const capabilities = await requestBrowser({
                 port: controlPort,
+                controlSecret,
                 method: 'capabilities',
                 timeoutMs: 3_000,
                 profile,
@@ -458,6 +461,7 @@ export async function runPairing(options: PairOptions): Promise<PairOutcomeInput
     const extensionId = resolveExtensionId(extensionDir)
     const state = await readDaemonState()
     const controlPort = state?.httpPort
+    const controlSecret = state?.controlSecret
 
     // Checked before opening anything: once the options page is open it has a
     // chrome-extension:// target of its own, so "is the extension loaded"
@@ -486,11 +490,11 @@ export async function runPairing(options: PairOptions): Promise<PairOutcomeInput
     let debuggerTierActual: boolean | undefined
     let freshProfiles: string[] = []
     let authRejected = false
-    if (controlPort && cdpReachable) {
+    if (controlPort && controlSecret && cdpReachable) {
         // Snapshotted before the page opens so a newly-arrived profile can be
         // told apart from ones that were already there — both the success
         // verdict and the tier probe depend on that distinction.
-        const profilesBefore = ((await fetchBrowserStatus(controlPort, options.viewerKey))?.connections ?? [])
+        const profilesBefore = ((await fetchBrowserStatus(controlPort, controlSecret, options.viewerKey))?.connections ?? [])
             .filter((connection) => connection.viewerKey === options.viewerKey)
             .map((connection) => connection.profile)
         pageOpened = await openTab(options.cdpPort, buildPairUrl({
@@ -508,6 +512,7 @@ export async function runPairing(options: PairOptions): Promise<PairOutcomeInput
         if (pageOpened) {
             const waited = await waitForConnection(
                 controlPort,
+                controlSecret,
                 10_000,
                 profilesBefore,
                 options.pairingId,
@@ -525,6 +530,7 @@ export async function runPairing(options: PairOptions): Promise<PairOutcomeInput
                 if (target !== undefined) {
                     debuggerTierActual = await waitForDebuggerTier(
                         controlPort,
+                        controlSecret,
                         options.debuggerTier,
                         target,
                         options.viewerKey,

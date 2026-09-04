@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { configuration } from './configuration';
 import {
     persistSession,
+    readDaemonState,
     readDaemonStateSnapshot,
     readPersistedSessions,
     SandboxConfigSchema,
@@ -238,6 +239,66 @@ describe('daemon state compare-and-set', () => {
 // **병기**된 파일의 파싱 계약. secret 우선이라 RPC 는 legacy 그대로지만,
 // provisioned 재료는 버리지 않고 실어 나른다 (getOrCreateMachine 이
 // dataEncryptionKey 를 서버에 등록하는 데 쓴다).
+describe('daemon state file permissions', () => {
+    const originalDaemonStateFile = configuration.daemonStateFile;
+    let testDirectory: string;
+    let stateFile: string;
+
+    beforeEach(() => {
+        testDirectory = mkdtempSync(join(tmpdir(), 'happy-daemon-state-perms-'));
+        stateFile = join(testDirectory, 'daemon.state.json');
+        Object.defineProperty(configuration, 'daemonStateFile', {
+            configurable: true,
+            value: stateFile,
+        });
+    });
+
+    afterEach(() => {
+        Object.defineProperty(configuration, 'daemonStateFile', {
+            configurable: true,
+            value: originalDaemonStateFile,
+        });
+        rmSync(testDirectory, { recursive: true, force: true });
+    });
+
+    function daemonState(controlSecret?: string): DaemonLocallyPersistedState {
+        return {
+            pid: 111,
+            httpPort: 33417,
+            startTime: '8/17/2026, 12:05:29 PM',
+            startedWithCliVersion: '1.1.10',
+            state: 'running',
+            trackedSessions: [],
+            controlSecret,
+        };
+    }
+
+    // Loopback control server auth (ADR-061) relies on this file being
+    // unreadable by other local users — a world/group-readable secret defeats
+    // the whole point of the Bearer check.
+    it.skipIf(process.platform === 'win32')('writes the daemon state file with 0600 permissions', () => {
+        writeDaemonState(daemonState('s3cr3t'));
+
+        const mode = statSync(stateFile).mode & 0o777;
+        expect(mode).toBe(0o600);
+    });
+
+    it.skipIf(process.platform === 'win32')('tightens permissions on a file that pre-existed with looser mode', () => {
+        writeFileSync(stateFile, '{}', { mode: 0o644 });
+
+        writeDaemonState(daemonState('s3cr3t'));
+
+        const mode = statSync(stateFile).mode & 0o777;
+        expect(mode).toBe(0o600);
+    });
+
+    it('round-trips controlSecret through write and read', async () => {
+        writeDaemonState(daemonState('s3cr3t'));
+
+        expect((await readDaemonState())?.controlSecret).toBe('s3cr3t');
+    });
+});
+
 describe('parseCredentials', () => {
     it('keeps plain legacy files as pure legacy (no provisioned)', async () => {
         const { parseCredentials } = await import('./persistence');

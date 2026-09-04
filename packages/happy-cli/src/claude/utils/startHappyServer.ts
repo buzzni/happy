@@ -220,12 +220,12 @@ function registerBrowserTools(mcp: McpServer): void {
                 'Per-user browser routing is required but the server did not issue a viewer key',
             )
         }
-        const port = await readDaemonControlPort();
-        if (port === null) {
+        const connection = await readDaemonControlPort();
+        if (connection === null) {
             throw new BrowserClientError('DAEMON_UNREACHABLE', 'No happy daemon is running on this machine');
         }
         return requestBrowser({
-            port,
+            ...connection,
             method,
             params,
             ...(opts?.profile !== undefined ? { profile: opts.profile } : {}),
@@ -235,8 +235,10 @@ function registerBrowserTools(mcp: McpServer): void {
 
     // Only consulted when a command comes back looking wrong (see runBrowserTool).
     const status = async () => {
-        const port = await readDaemonControlPort();
-        return port === null ? null : fetchBrowserStatus(port, process.env.HAPPY_BROWSER_VIEWER_KEY);
+        const connection = await readDaemonControlPort();
+        return connection === null
+            ? null
+            : fetchBrowserStatus(connection.port, connection.controlSecret, process.env.HAPPY_BROWSER_VIEWER_KEY);
     };
 
     mcp.registerTool('browser_tabs', {

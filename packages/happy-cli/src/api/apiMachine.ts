@@ -923,7 +923,9 @@ export class ApiMachineClient {
             const chrome = await detectChrome();
             const state = await readDaemonState();
             const controlPort = state?.httpPort;
-            const status = controlPort ? await fetchBrowserStatus(controlPort) : null;
+            const status = (controlPort && state?.controlSecret)
+                ? await fetchBrowserStatus(controlPort, state.controlSecret)
+                : null;
             return {
                 chromeInstalled: Boolean(chrome),
                 chromePath: chrome?.path ?? null,
