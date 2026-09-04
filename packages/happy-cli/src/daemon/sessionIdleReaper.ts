@@ -73,7 +73,7 @@ type DaemonSessionIdleReaperCandidate = {
   idleMs: number;
   /** Why the server selected this session. Absent from servers that predate
    *  the turn-end reap — treated as the absolute-idle-cut for logging. */
-  reason?: 'absolute-idle-cut' | 'turn-end';
+  reason?: 'absolute-idle-cut' | 'turn-end' | 'trial-budget-exhausted';
 };
 
 type DaemonSessionIdleReaperResponse = {
@@ -116,7 +116,20 @@ export type DaemonSessionIdleReaperTickResult = {
   deferredSessions: number;
 };
 
-export type StopSessionMode = 'force' | 'if-idle';
+/**
+ * 'force' stops unconditionally (user-initiated), 'if-idle' runs the full local
+ * idle guard (background cleanup), and 'if-not-busy' runs only the hard blocks
+ * — used by aplus-dev-studio's trial budget stop (specs/trial-auto-onboarding-budget
+ * D5), where a session must end as soon as its turn finishes even though the
+ * user interacted seconds ago. Soft guards (recent interaction, minimum age,
+ * local mode, stale runtime) exist to protect work the user may return to; a
+ * budget-exhausted trial session has no such future — the shared credential
+ * must leave the process.
+ */
+export type StopSessionMode = 'force' | 'if-idle' | 'if-not-busy';
+
+/** Candidate reason that must bypass the soft idle guards. */
+export const TRIAL_BUDGET_EXHAUSTED_REASON = 'trial-budget-exhausted';
 
 export function restoreSessionStartTimes(input: {
   trackedSessions: readonly Pick<TrackedSession, 'pid'>[];
@@ -158,8 +171,35 @@ export function isPolicyStopSource(source: unknown): boolean {
 }
 
 export function resolveStopSessionMode(context?: StopSessionContext): StopSessionMode {
-  if (context?.mode === 'force' || context?.mode === 'if-idle') return context.mode;
+  if (context?.mode === 'force' || context?.mode === 'if-idle' || context?.mode === 'if-not-busy') {
+    return context.mode;
+  }
+  if (context?.reason === TRIAL_BUDGET_EXHAUSTED_REASON) return 'if-not-busy';
   return isPolicyStopSource(context?.source) ? 'if-idle' : 'force';
+}
+
+/**
+ * Hard blocks only: the session is stopped unless it is mid-turn. Absent runtime
+ * state denies, because "no report yet" is not evidence that nothing is running.
+ */
+export function evaluateBusyOnlyStopGuard(input: {
+  runtime?: SessionRuntimeState;
+}): IdleStopGuardDecision {
+  const { runtime } = input;
+  const activity: IdleStopGuardActivity = {
+    thinking: runtime?.thinking === true,
+    hasOpenToolCall: runtime?.hasOpenToolCall === true,
+    pendingUserInput: runtime?.pendingUserInput === true,
+    ...(runtime?.lastUserInteractionAt !== undefined ? { lastUserInteractionAt: runtime.lastUserInteractionAt } : {}),
+    ...(runtime?.mode !== undefined ? { mode: runtime.mode } : {}),
+    ...(runtime?.updatedAt !== undefined ? { runtimeUpdatedAt: runtime.updatedAt } : {}),
+  };
+  const deny = (guard: string): IdleStopGuardDecision => ({ allow: false, guard, activity });
+  if (runtime === undefined) return deny('unknown-runtime');
+  if (activity.thinking) return deny('thinking');
+  if (activity.hasOpenToolCall) return deny('open-tool-call');
+  if (activity.pendingUserInput) return deny('pending-user-input');
+  return { allow: true };
 }
 
 export type IdleStopGuardConfig = {
@@ -444,10 +484,12 @@ export async function runDaemonSessionIdleReaperTick(
     // Even though the server already excludes busy sessions, the daemon
     // re-validates locally (if-idle) because it is the only component that sees
     // real user activity for the child process it owns.
+    // 예산 소진 후보는 소프트 가드를 우회한다(하드 블록은 유지) — 방금 턴을 마친
+    // 세션이 바로 대상이며, 그 세션이 공용 키를 들고 있기 때문이다.
     const stopResult = input.stopSession(candidate.sessionId, {
       source: 'session-idle-reaper',
       reason,
-      mode: 'if-idle',
+      mode: reason === TRIAL_BUDGET_EXHAUSTED_REASON ? 'if-not-busy' : 'if-idle',
     });
     if (stopResult.stopped) {
       result.stoppedSessions += 1;

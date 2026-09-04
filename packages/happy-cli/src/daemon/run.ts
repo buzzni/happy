@@ -94,6 +94,7 @@ import {
   runDaemonSessionIdleReaperTick,
   readIdleStopGuardConfig,
   evaluateIdleStopGuard,
+  evaluateBusyOnlyStopGuard,
   resolveStopSessionMode,
   restoreSessionStartTimes,
   readEmptySessionReaperMs,
@@ -2106,7 +2107,15 @@ export async function startDaemon(): Promise<void> {
         if (session.happySessionId === sessionId ||
           (sessionId.startsWith('PID-') && pid === parseInt(sessionId.replace('PID-', '')))) {
 
-          if (mode === 'if-idle') {
+          if (mode === 'if-not-busy') {
+            const decision = evaluateBusyOnlyStopGuard({ runtime: session.runtime });
+            if (!decision.allow) {
+              logger.debug(
+                `[session-idle-guard] sessionId=${sessionId} source=${context?.source ?? 'unknown'} decision=deny guard=${decision.guard} mode=if-not-busy`,
+              );
+              return { stopped: false, reason: 'active', guard: decision.guard, activity: decision.activity };
+            }
+          } else if (mode === 'if-idle') {
             const decision = evaluateIdleStopGuard({
               runtime: session.runtime,
               sessionStartedAt: sessionStartTimes.get(pid),

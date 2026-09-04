@@ -720,7 +720,7 @@ describe('controlServer /stop-session v2 contract', () => {
   let dir: string
   let baseUrl: string
   let stopServer: () => Promise<void>
-  let received: Array<{ sessionId: string; context?: { source?: string; reason?: string; mode?: 'force' | 'if-idle' } }>
+  let received: Array<{ sessionId: string; context?: { source?: string; reason?: string; mode?: 'force' | 'if-idle' | 'if-not-busy' } }>
 
   beforeEach(async () => {
     dir = mkdtempSync(path.join(tmpdir(), 'control-server-stop-'))
