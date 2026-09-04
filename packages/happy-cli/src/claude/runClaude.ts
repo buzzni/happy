@@ -39,10 +39,11 @@ import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
 import {
     fetchAplusMcpConfigSnapshot,
     fetchAplusMcpServersResult,
+    mcpConfigFailureStatuses,
     readExpectedConnectors,
     resolveMcpFloorServerNames,
-    mcpConfigFailureStatuses,
 } from '@/aplus/fetchAplusMcpServers';
+import { refreshMcpCallerGrantIfExpiring } from '@/aplus/refreshMcpCallerGrant';
 import { mergeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { encodeBase64 } from '@/api/encryption';
 import type { Session as ApiSession } from '@/api/types';
@@ -1176,11 +1177,16 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             baseServers: baseMcpServers,
             initialAplusServers: aplusMcpServers,
             floorServerNames: resolveMcpFloorServerNames(aplusMcpServers, readExpectedConnectors()),
-            fetchAplusServers: () => fetchAplusMcpServersResult(
-                credentials.token,
-                machineId,
-                { sessionId: session.sessionId, lifecycle: 'turn' },
-            ),
+            fetchAplusServers: async () => {
+                // 조회 직전에 교환해야 새 grant 로 조회된다. 24시간을 넘겨 사는
+                // 세션이 403 으로 마지막 정상 설정에 갇히는 것을 막는다.
+                await refreshMcpCallerGrantIfExpiring(credentials.token, machineId);
+                return fetchAplusMcpServersResult(
+                    credentials.token,
+                    machineId,
+                    { sessionId: session.sessionId, lifecycle: 'turn' },
+                );
+            },
         },
         session,
         claudeEnvVars: options.claudeEnvVars,
