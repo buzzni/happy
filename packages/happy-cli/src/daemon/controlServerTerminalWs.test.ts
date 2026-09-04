@@ -305,4 +305,56 @@ describe('/terminal WS protocol (T7-T8)', () => {
     expect(getDaemonTerminalSessionCount()).toBe(0)
     ws.close()
   })
+
+  // T9: two /terminal connections on the same daemon are independent PTYs —
+  // frames must not cross between them.
+  it('keeps two concurrent connections isolated', async () => {
+    const wsA = await connect()
+    const wsB = await connect()
+
+    wsA.send(JSON.stringify({
+      reqId: randomUUID(),
+      event: 'terminal-open',
+      data: {
+        machineId: 'm1',
+        params: openParams({ script: "process.stdin.on('data', (c) => process.stdout.write('A:' + c))" }),
+      },
+    }))
+    wsB.send(JSON.stringify({
+      reqId: randomUUID(),
+      event: 'terminal-open',
+      data: {
+        machineId: 'm1',
+        params: openParams({ script: "process.stdin.on('data', (c) => process.stdout.write('B:' + c))" }),
+      },
+    }))
+    const [ackA, ackB] = await Promise.all([nextMessage(wsA), nextMessage(wsB)])
+    expect(ackA.data.sessionId).not.toBe(ackB.data.sessionId)
+    expect(getDaemonTerminalSessionCount()).toBe(2)
+
+    wsA.send(JSON.stringify({
+      event: 'terminal-frame',
+      data: { sessionId: ackA.data.sessionId, data: encodeBase64(encrypt(machineEncryption!.encryptionKey, 'legacy', 'ONLY-A\n')) },
+    }))
+
+    let textA = ''
+    for (let i = 0; i < 10 && !textA.includes('A:ONLY-A'); i++) {
+      textA += decryptFrame(await nextMessage(wsA))
+    }
+    expect(textA).toContain('A:ONLY-A')
+
+    // B's own pty must never have seen A's input, and A's own connection
+    // must never receive a frame carrying B's sessionId.
+    wsB.send(JSON.stringify({ event: 'terminal-close', data: { sessionId: ackB.data.sessionId } }))
+    let bClosed: any = null
+    for (let i = 0; i < 5 && !bClosed; i++) {
+      const msg = await nextMessage(wsB)
+      if (msg.data?.event === 'terminal-closed') bClosed = msg
+    }
+    expect(bClosed.data.sessionId).toBe(ackB.data.sessionId)
+    expect(getDaemonTerminalSessionCount()).toBe(1)
+
+    wsA.close()
+    wsB.close()
+  })
 })
