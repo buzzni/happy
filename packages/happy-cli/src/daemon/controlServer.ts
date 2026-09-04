@@ -6,6 +6,7 @@
 import fastify, { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-type-provider-zod';
+import { WebSocketServer } from 'ws';
 import { logger } from '@/ui/logger';
 import { Metadata } from '@/api/types';
 import { decodeBase64, encodeBase64Url, getRandomBytes } from '@/api/encryption';
@@ -17,6 +18,7 @@ import { proxyHttp, PreviewProxyError } from './previewProxy';
 import { startServerProcess, StartServerError } from './startServer';
 import { stopServerProcess, StopServerError } from './stopServer';
 import { BrowserBridge, BridgeRequestError } from './browserBridge';
+import { attachTerminalWsRoute } from './controlServerTerminalWs';
 import type { ChildProcess } from 'node:child_process';
 
 export function startDaemonControlServer({
@@ -62,6 +64,11 @@ export function startDaemonControlServer({
         await reply.code(401).send({ error: 'unauthorized' });
       }
     });
+
+    // Same secret, same loopback trust boundary — but a WS upgrade never goes
+    // through Fastify's route handlers/hooks above, so it needs its own check
+    // at `verifyClient` (attachTerminalWsRoute).
+    const terminalWs = attachTerminalWsRoute(app.server, { path: '/terminal', controlSecret });
 
     // Set up Zod type provider
     app.setValidatorCompiler(validatorCompiler);
@@ -700,6 +707,7 @@ export function startDaemonControlServer({
         controlSecret,
         stop: async () => {
           logger.debug('[CONTROL SERVER] Stopping server');
+          await terminalWs.close();
           await app.close();
           logger.debug('[CONTROL SERVER] Server stopped');
         }
