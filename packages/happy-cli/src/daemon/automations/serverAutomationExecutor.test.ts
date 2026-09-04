@@ -2280,6 +2280,21 @@ describe('runServerAutomationTick', () => {
       }))
       expect(spawnedEnvironment).not.toHaveProperty('GH_TOKEN')
       expect(spawnedEnvironment).not.toHaveProperty('GH_REPO')
+      // 2026-09-04 프로덕션 — 리뷰 워커 31건이 뜨자마자 exit 1 로 죽어 3시간 동안
+      // 리뷰가 한 건도 완료되지 않았다:
+      //   [aplus] MCP topology mismatch expected=gmail,google-drive,knoi,slack
+      //           configured=(none) missing=... attempt=2  → 세션 종료
+      // 서버 로그가 원인을 확정했다 — expected 는 서버가 만든 값이 아니라 워커가
+      // 헤더로 보낸 값이고, 출처는 데몬에서 상속된 HAPPY_APLUS_EXPECTED_CONNECTORS 다.
+      // 공용 머신에서 다른 계정 세션이 커넥터를 요구하며 그 값을 남기면 그때부터
+      // 모든 리뷰가 죽는다.
+      //
+      // AgentTask 워커는 filterInheritedCredentials 로 사용자 토큰을 떼고 돌아
+      // caller 가 (bearer-unmatched) 이므로 개인 커넥터를 받을 수단이 구조적으로 없다.
+      // 기대치가 비어 있지 않으면 100% mismatch 다. 리뷰는 커넥터를 쓰지 않으므로
+      // 기대치를 명시적으로 비운다 — 상속에 맡기면 옆 세션에 좌우된다.
+      expect(spawnedEnvironment.HAPPY_APLUS_EXPECTED_CONNECTORS).toBe('[]')
+      expect(spawnedEnvironment.HAPPY_APLUS_EXPECTED_MCP_SERVICES).toBe('[]')
       expect(prepareGithubWorktree).not.toHaveBeenCalled()
       // 2026-08-31 프로덕션 — pr_review 워커가 리뷰를 끝내고도 결과를 제출하지 못했다:
       //   "결과 제출 요청이 로컬 셸 보간으로 손상되어 HTTP 400 으로 거부됐고,
