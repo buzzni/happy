@@ -166,7 +166,7 @@ import {
   type AutomationMcpSpawnContext,
 } from './automations/automationMcpCallerGrant';
 import { preflightAutomationConnectors } from './automations/automationConnectorPreflight';
-import { resolveAllowedRoot } from '@/modules/common/resolveAllowedRoot';
+import { resolveDaemonAllowedRoot } from '@/modules/common/resolveAllowedRoot';
 import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
@@ -962,10 +962,7 @@ export async function startDaemon(): Promise<void> {
         const additionalDirectoryResult = await prepareAdditionalDirectories({
           requested: options.additionalDirectories,
           primaryDirectory: directory,
-          allowedRoot: resolveAllowedRoot({
-            registryWorkspaceRoot: process.env.HAPPY_WORKSPACE_ROOT ?? null,
-            homeDir: os.homedir(),
-          }),
+          allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
         });
         const finishSpawn = async (spawn: Promise<SpawnSessionResult>): Promise<SpawnSessionResult> => {
           const result = await spawn;
@@ -2220,10 +2217,7 @@ export async function startDaemon(): Promise<void> {
       automationStore.replaceAll(rebasedAutomations);
     }
     // 스크립트 cwd 검증 루트 — apiMachine의 머신 RPC 표면과 같은 규칙.
-    const automationAllowedRoot = resolveAllowedRoot({
-      registryWorkspaceRoot: process.env.HAPPY_WORKSPACE_ROOT ?? null,
-      homeDir: os.homedir(),
-    });
+    const automationAllowedRoot = resolveDaemonAllowedRoot(process.env, os.homedir());
     // 겹침 가드(R5)용: 데몬이 추적 중인 자식 세션의 프로세스 생존 여부.
     const isAutomationSessionRunning = (sessionId: string): boolean => {
       for (const [pid, session] of pidToTrackedSession.entries()) {
