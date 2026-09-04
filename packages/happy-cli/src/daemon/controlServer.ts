@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-type-provider-zod';
 import { logger } from '@/ui/logger';
 import { Metadata } from '@/api/types';
-import { decodeBase64 } from '@/api/encryption';
+import { decodeBase64, encodeBase64Url, getRandomBytes } from '@/api/encryption';
 import { TrackedSession, SessionEncryptionData, SessionRuntimeState } from './types';
 import type { StopSessionContext, StopSessionResult } from './sessionIdleReaper';
 import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
@@ -43,10 +43,24 @@ export function startDaemonControlServer({
   ) => void;
   portRegistry: PortRegistry;
   browserBridge?: BrowserBridge;
-}): Promise<{ port: number; stop: () => Promise<void> }> {
+}): Promise<{ port: number; stop: () => Promise<void>; controlSecret: string }> {
   return new Promise((resolve) => {
     const app = fastify({
       logger: false // We use our own logger
+    });
+
+    // Loopback-only Bearer secret (ADR-061, specs/desktop-speed-breakthrough-
+    // local-direct). This server binds 127.0.0.1 only, but loopback is shared
+    // by every local user on the machine — without this, any other local
+    // process could list/spawn/stop sessions or reach `/proxy-http`. Every
+    // route requires it, with no legacy unauthenticated exceptions: the caller
+    // persists this secret (daemon.state.json, 0600) and reads it back to
+    // authenticate, so there is no bootstrap chicken-and-egg to work around.
+    const controlSecret = encodeBase64Url(getRandomBytes(32));
+    app.addHook('onRequest', async (request, reply) => {
+      if (request.headers.authorization !== `Bearer ${controlSecret}`) {
+        await reply.code(401).send({ error: 'unauthorized' });
+      }
     });
 
     // Set up Zod type provider
@@ -683,6 +697,7 @@ export function startDaemonControlServer({
 
       resolve({
         port,
+        controlSecret,
         stop: async () => {
           logger.debug('[CONTROL SERVER] Stopping server');
           await app.close();

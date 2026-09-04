@@ -2348,7 +2348,7 @@ export async function startDaemon(): Promise<void> {
     }
 
     // Start control server
-    const { port: controlPort, stop: stopControlServer } = await startDaemonControlServer({
+    const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
       getChildren: getCurrentChildren,
       stopSession,
       spawnSession,
@@ -2368,6 +2368,7 @@ export async function startDaemon(): Promise<void> {
       daemonLogPath: logger.logFilePath,
       state: 'running',
       trackedSessions: serializeTrackedSessions(),
+      controlSecret,
     };
     writeDaemonState(fileState);
     logger.debug('[DAEMON RUN] Daemon state written');
@@ -2946,6 +2947,7 @@ export async function startDaemon(): Promise<void> {
           daemonLogPath: fileState.daemonLogPath,
           state: 'running',
           trackedSessions: serializeTrackedSessions(),
+          controlSecret: fileState.controlSecret,
         };
         writeDaemonState(updatedState);
         if (process.env.DEBUG) {
