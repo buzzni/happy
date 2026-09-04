@@ -22,9 +22,16 @@ import { db } from "@/storage/db";
 import { machineSocketIdentityExists } from "./socket/machineSocketAuth";
 import { automationSocketHandler } from "./socket/automationSocketHandler";
 import { markMachineOffline, markMachineOnline } from "@/app/presence/machinePresence";
+import { wrapServerForPreviewSubdomainBypass } from "@/modules/preview/previewEngineIoGuard";
 
 export function startSocket(app: Fastify) {
-    const io = new Server(app.server, {
+    // engine.io claims `/v1/updates` purely by path prefix, blind to Host —
+    // so a preview-subdomain request for it would otherwise be swallowed by
+    // engine.io instead of relayed to the previewed dev server the way every
+    // other path already is (Fastify's rewriteUrl, api.ts). Wrapping the
+    // server object here makes engine.io's own attach() behave as if those
+    // specific requests never matched its path. See previewEngineIoGuard.ts.
+    const io = new Server(wrapServerForPreviewSubdomainBypass(app.server), {
         cors: {
             origin: "*",
             methods: ["GET", "POST", "OPTIONS"],
