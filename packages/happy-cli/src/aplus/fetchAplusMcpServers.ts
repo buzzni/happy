@@ -114,6 +114,24 @@ export function readExpectedMcpServices(): string[] {
     return readExpectedNames('HAPPY_APLUS_EXPECTED_MCP_SERVICES')
 }
 
+/**
+ * 대화를 열 때 있던 MCP 중 세션 동안 지켜야 할 이름.
+ *
+ * 조직 등록 MCP 는 외부 URL 을 정적 헤더로 직접 호출하므로, 조직이 사용을
+ * 중단해도 이미 세션에 들어온 엔트리는 계속 동작한다. 중단을 다음 대화부터
+ * 적용하는 편이 살아있는 대화에서 도구가 통째로 사라지는 것보다 낫다.
+ *
+ * 커넥터는 제외한다. 재연결이 필요해진 커넥터는 게이트웨이가 거부하므로
+ * 유지해봐야 죽은 툴만 남는다.
+ */
+export function resolveMcpFloorServerNames(
+    sessionStartServers: AplusMcpServersMap,
+    sessionStartConnectors: string[],
+): string[] {
+    const connectors = new Set(sessionStartConnectors)
+    return Object.keys(sessionStartServers).filter((name) => !connectors.has(name)).sort()
+}
+
 function correlationValue(value: string | undefined): string | undefined {
     const normalized = value?.trim()
     return normalized && /^[A-Za-z0-9._:-]{1,128}$/.test(normalized) ? normalized : undefined
@@ -204,6 +222,12 @@ export async function fetchAplusMcpConfigSnapshot(
                 signal: ctl.signal,
             })
             if (!res.ok) {
+                // 5xx 는 일시적일 수 있다. 여기서 바로 포기하면 세션이 A+ MCP
+                // 0개로 시작한다. 4xx 는 재시도해도 같은 답이므로 그대로 둔다.
+                if (res.status >= 500 && attempt === 0) {
+                    logger.debug(`[aplus] mcp-config 응답 ${res.status} — retry`)
+                    continue
+                }
                 logger.debug(`[aplus] mcp-config 응답 ${res.status} — skip`)
                 return snapshot({ ok: false, reason: 'http-error', error: `mcp-config responded with ${res.status}` })
             }
@@ -285,6 +309,11 @@ export async function fetchAplusMcpConfigSnapshot(
             return snapshot({ ok: true, servers: body.mcpServers }, body.mcpServers)
         } catch {
             const timedOut = ctl.signal.aborted
+            // timeout/네트워크 오류도 일시적이다. 한 번은 다시 시도한다.
+            if (attempt === 0) {
+                logger.debug(`[aplus] mcp-config fetch 실패 — retry: ${timedOut ? 'timeout' : 'network error'}`)
+                continue
+            }
             logger.debug(`[aplus] mcp-config fetch 실패 — skip: ${timedOut ? 'timeout' : 'network error'}`)
             return snapshot(timedOut
                 ? { ok: false, reason: 'timeout', error: 'mcp-config request timed out' }

@@ -39,6 +39,8 @@ import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
 import {
     fetchAplusMcpConfigSnapshot,
     fetchAplusMcpServersResult,
+    readExpectedConnectors,
+    resolveMcpFloorServerNames,
     mcpConfigFailureStatuses,
 } from '@/aplus/fetchAplusMcpServers';
 import { mergeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
@@ -1173,6 +1175,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         mcpConfig: {
             baseServers: baseMcpServers,
             initialAplusServers: aplusMcpServers,
+            floorServerNames: resolveMcpFloorServerNames(aplusMcpServers, readExpectedConnectors()),
             fetchAplusServers: () => fetchAplusMcpServersResult(
                 credentials.token,
                 machineId,
