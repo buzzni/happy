@@ -85,6 +85,32 @@ describe('/terminal WS auth (T6)', () => {
     ws.close()
   })
 
+  // The desktop renderer's WebSocket is the standard browser API, which
+  // cannot set an Authorization header on the upgrade request — only the
+  // URL is under the caller's control. Without this, local-direct auth would
+  // be Node-only and the desktop client (the actual point of ADR-061) could
+  // never authenticate at all.
+  it('accepts an upgrade authenticated via a ?token= query param instead of a header', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/terminal?token=${encodeURIComponent(controlSecret)}`)
+    const outcome = await new Promise<'open' | { code: number }>((resolve) => {
+      ws.on('open', () => resolve('open'))
+      ws.on('unexpected-response', (_req, res) => resolve({ code: res.statusCode ?? 0 }))
+      ws.on('error', () => {})
+    })
+    expect(outcome).toBe('open')
+    ws.close()
+  })
+
+  it('rejects an upgrade with the wrong secret in the query param', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/terminal?token=not-the-secret`)
+    const outcome = await new Promise<'open' | { code: number }>((resolve) => {
+      ws.on('open', () => resolve('open'))
+      ws.on('unexpected-response', (_req, res) => resolve({ code: res.statusCode ?? 0 }))
+      ws.on('error', () => {})
+    })
+    expect(outcome).toEqual({ code: 401 })
+  })
+
   it('stop() closes an open /terminal connection instead of leaving it dangling', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/terminal`, {
       headers: { Authorization: `Bearer ${controlSecret}` },

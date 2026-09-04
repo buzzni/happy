@@ -79,7 +79,13 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
     server: httpServer,
     path: opts.path,
     verifyClient: (info, callback) => {
-      if (info.req.headers.authorization !== `Bearer ${opts.controlSecret}`) {
+      // The desktop renderer's WebSocket is the standard browser API, which
+      // cannot set an Authorization header on the upgrade request — a
+      // `?token=` query param is the only channel it has. The header stays
+      // for any future Node-side caller; either is sufficient.
+      const headerToken = info.req.headers.authorization === `Bearer ${opts.controlSecret}`;
+      const queryToken = new URL(info.req.url ?? '', 'http://localhost').searchParams.get('token') === opts.controlSecret;
+      if (!headerToken && !queryToken) {
         callback(false, 401, 'Unauthorized');
         return;
       }
