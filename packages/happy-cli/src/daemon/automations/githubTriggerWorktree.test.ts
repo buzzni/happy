@@ -269,6 +269,40 @@ describe('removeGithubTriggerWorktree', () => {
     expect(runCommand).not.toHaveBeenCalled()
   })
 
+  // 2026-09-04 프로덕션 — 정리가 `git status` 한 줄만 있어도 보존해 worktree 45개
+  // (23GB)가 쌓였다. 사유는 작업물이 아니라 에이전트 산출물과 서브모듈 gitlink 였다.
+  // 순수 함수만 덮으면 배선이 빠져도 통과하므로 정리 경로에서 고정한다.
+  it('removes a worktree whose only changes are agent scratch and the submodule gitlink', async () => {
+    const runCommand = commandRunner(['?? memory/\n M vendor/happy\n', ''])
+
+    const result = await removeGithubTriggerWorktree({
+      repositoryRoot: '/repo',
+      worktreePath: '/happy/automation-worktrees/run-1',
+      runCommand,
+      releaseSubmodulePointers: async () => ({ released: [] }),
+      pathExists: vi.fn(async () => true),
+    })
+
+    expect(result).toEqual({ ok: true })
+    expect(runCommand.mock.calls.map(([c]) => c.args.slice(0, 2))).toEqual([
+      ['status', '--porcelain'],
+      ['worktree', 'remove'],
+    ])
+  })
+
+  it('still preserves a worktree when a real change is mixed with scratch output', async () => {
+    const runCommand = commandRunner(['?? memory/\n M src/app.ts\n'])
+
+    const result = await removeGithubTriggerWorktree({
+      repositoryRoot: '/repo',
+      worktreePath: '/happy/automation-worktrees/run-1',
+      runCommand,
+      pathExists: vi.fn(async () => true),
+    })
+
+    expect(result).toMatchObject({ ok: false, dirty: true })
+  })
+
   it('preserves a dirty worktree without force removal', async () => {
     const runCommand = commandRunner([' M src/app.ts\n'])
 
