@@ -26,6 +26,46 @@ describe('fetchAplusMcpServersResult', () => {
         delete process.env.HAPPY_BROWSER_VIEWER_SCOPE_REQUIRED;
     });
 
+    it('retries a 5xx instead of starting the session with no A+ servers', async () => {
+        const fetchMock = vi.fn<typeof fetch>()
+            .mockResolvedValueOnce(new Response('upstream down', { status: 503 }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                mcpServers: { argos: { type: 'http', url: 'https://argos.test/mcp' } },
+            }), { status: 200 }));
+        vi.stubGlobal('fetch', fetchMock);
+
+        await expect(fetchAplusMcpServersResult('happy-token', 'machine-1')).resolves.toEqual({
+            ok: true,
+            servers: { argos: { type: 'http', url: 'https://argos.test/mcp' } },
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries a network failure instead of starting the session with no A+ servers', async () => {
+        const fetchMock = vi.fn<typeof fetch>()
+            .mockRejectedValueOnce(new Error('socket hang up'))
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                mcpServers: { argos: { type: 'http', url: 'https://argos.test/mcp' } },
+            }), { status: 200 }));
+        vi.stubGlobal('fetch', fetchMock);
+
+        await expect(fetchAplusMcpServersResult('happy-token', 'machine-1')).resolves.toEqual({
+            ok: true,
+            servers: { argos: { type: 'http', url: 'https://argos.test/mcp' } },
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not retry a 403 — an expired or forged grant will not fix itself', async () => {
+        const fetchMock = vi.fn<typeof fetch>(async () => new Response('nope', { status: 403 }));
+        vi.stubGlobal('fetch', fetchMock);
+
+        const result = await fetchAplusMcpServersResult('happy-token', 'machine-1');
+
+        expect(result).toMatchObject({ ok: false, reason: 'http-error' });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
     it('returns a successful server map', async () => {
         vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
             mcpServers: {

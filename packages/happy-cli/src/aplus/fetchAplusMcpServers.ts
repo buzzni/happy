@@ -222,6 +222,12 @@ export async function fetchAplusMcpConfigSnapshot(
                 signal: ctl.signal,
             })
             if (!res.ok) {
+                // 5xx 는 일시적일 수 있다. 여기서 바로 포기하면 세션이 A+ MCP
+                // 0개로 시작한다. 4xx 는 재시도해도 같은 답이므로 그대로 둔다.
+                if (res.status >= 500 && attempt === 0) {
+                    logger.debug(`[aplus] mcp-config 응답 ${res.status} — retry`)
+                    continue
+                }
                 logger.debug(`[aplus] mcp-config 응답 ${res.status} — skip`)
                 return snapshot({ ok: false, reason: 'http-error', error: `mcp-config responded with ${res.status}` })
             }
@@ -303,6 +309,11 @@ export async function fetchAplusMcpConfigSnapshot(
             return snapshot({ ok: true, servers: body.mcpServers }, body.mcpServers)
         } catch {
             const timedOut = ctl.signal.aborted
+            // timeout/네트워크 오류도 일시적이다. 한 번은 다시 시도한다.
+            if (attempt === 0) {
+                logger.debug(`[aplus] mcp-config fetch 실패 — retry: ${timedOut ? 'timeout' : 'network error'}`)
+                continue
+            }
             logger.debug(`[aplus] mcp-config fetch 실패 — skip: ${timedOut ? 'timeout' : 'network error'}`)
             return snapshot(timedOut
                 ? { ok: false, reason: 'timeout', error: 'mcp-config request timed out' }
