@@ -34,7 +34,7 @@ describe('McpConfigSynchronizer', () => {
 
         await synchronizer.sync();
 
-        const applied = setMcpServers.mock.calls[0][0] as Record<string, unknown>;
+        const applied = (setMcpServers.mock.calls[0] as unknown[])[0] as Record<string, unknown>;
         expect(Object.keys(applied).sort()).toEqual(['argos', 'happy', 'notion']);
         expect(applied.argos).toEqual(initialAplusServers.argos);
     });
@@ -58,7 +58,7 @@ describe('McpConfigSynchronizer', () => {
 
         await synchronizer.sync();
 
-        const applied = setMcpServers.mock.calls[0][0] as Record<string, any>;
+        const applied = (setMcpServers.mock.calls[0] as unknown[])[0] as Record<string, any>;
         // 커넥터는 바닥선이 아니므로 새 헤더가 그대로 반영된다.
         expect(applied.notion.headers.Authorization).toBe('Bearer fresh');
         // 조직 등록 MCP 는 바닥선이라 유지된다.
@@ -82,7 +82,7 @@ describe('McpConfigSynchronizer', () => {
 
         await synchronizer.sync();
 
-        const applied = setMcpServers.mock.calls[0][0] as Record<string, unknown>;
+        const applied = (setMcpServers.mock.calls[0] as unknown[])[0] as Record<string, unknown>;
         // 재연결이 필요한 커넥터는 게이트웨이가 거부하므로 유지하지 않는다.
         expect(Object.keys(applied).sort()).toEqual(['argos', 'happy']);
     });

@@ -114,6 +114,24 @@ export function readExpectedMcpServices(): string[] {
     return readExpectedNames('HAPPY_APLUS_EXPECTED_MCP_SERVICES')
 }
 
+/**
+ * 대화를 열 때 있던 MCP 중 세션 동안 지켜야 할 이름.
+ *
+ * 조직 등록 MCP 는 외부 URL 을 정적 헤더로 직접 호출하므로, 조직이 사용을
+ * 중단해도 이미 세션에 들어온 엔트리는 계속 동작한다. 중단을 다음 대화부터
+ * 적용하는 편이 살아있는 대화에서 도구가 통째로 사라지는 것보다 낫다.
+ *
+ * 커넥터는 제외한다. 재연결이 필요해진 커넥터는 게이트웨이가 거부하므로
+ * 유지해봐야 죽은 툴만 남는다.
+ */
+export function resolveMcpFloorServerNames(
+    sessionStartServers: AplusMcpServersMap,
+    sessionStartConnectors: string[],
+): string[] {
+    const connectors = new Set(sessionStartConnectors)
+    return Object.keys(sessionStartServers).filter((name) => !connectors.has(name)).sort()
+}
+
 function correlationValue(value: string | undefined): string | undefined {
     const normalized = value?.trim()
     return normalized && /^[A-Za-z0-9._:-]{1,128}$/.test(normalized) ? normalized : undefined

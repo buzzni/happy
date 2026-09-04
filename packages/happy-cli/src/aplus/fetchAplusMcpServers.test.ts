@@ -3,6 +3,7 @@ import {
     fetchAplusMcpServers,
     fetchAplusMcpServersResult,
     mcpConfigFailureStatuses,
+    resolveMcpFloorServerNames,
 } from './fetchAplusMcpServers';
 
 describe('fetchAplusMcpServersResult', () => {
@@ -321,5 +322,19 @@ describe('fetchAplusMcpServersResult', () => {
         )).resolves.toMatchObject({ ok: true });
 
         expect(process.env.HAPPY_APLUS_EXPECTED_MCP_SERVICES).toBe('[]');
+    });
+
+    describe('resolveMcpFloorServerNames', () => {
+        it('protects org-registered servers but not connectors', () => {
+            const names = resolveMcpFloorServerNames(
+                { 'aplus-common': {} as any, argos: {} as any, notion: {} as any },
+                ['notion'],
+            );
+            expect(names).toEqual(['aplus-common', 'argos']);
+        });
+
+        it('returns nothing when the session started with connectors only', () => {
+            expect(resolveMcpFloorServerNames({ notion: {} as any }, ['notion'])).toEqual([]);
+        });
     });
 });
