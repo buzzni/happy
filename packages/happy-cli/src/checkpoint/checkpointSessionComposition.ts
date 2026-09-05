@@ -33,6 +33,8 @@ export type CheckpointSessionComposition = {
     dispose?: () => Promise<void>;
     /** Discards a turn that was opened but never dispatched, then rotates to a fresh workspace. */
     abortTurn?: () => Promise<void>;
+    /** Marks the open turn as sent to the provider: its result is no longer discardable. */
+    markTurnDispatched?: () => void;
     claudeSandbox?: QueryOptions['sandbox'];
 };
 
@@ -143,15 +145,19 @@ export async function createCheckpointSessionComposition(input: {
     };
     let activeTurn: CheckpointTurnPreparation | null = null;
     let frozenWorkspacePath: string | null = null;
-    // 'prepared' — the gate opened the turn but no apply has started, so it can still be discarded.
-    // 'applying'  — freeze/apply has begun; a partial result keeps the sealed copy for a retry and
-    //               must never be deleted by the abort path.
-    let turnPhase: 'idle' | 'prepared' | 'applying' = 'idle';
+    // 'prepared'   — the gate opened the turn but nothing was sent yet, so it is discardable.
+    // 'dispatched' — the prompt reached the provider; it may already have written files, so the
+    //                workspace is preserved even when the turn ends in an error or a timeout.
+    // 'applying'   — freeze/apply has begun; a partial result keeps the sealed copy for a retry.
+    let turnPhase: 'idle' | 'prepared' | 'dispatched' | 'applying' = 'idle';
     let acceptsProtectedWriters = false;
     const protectedWriterTree = new CheckpointWriterProcessTree();
     const beforeTurn = async () => {
         if (activeTurn) {
-            throw new Error('checkpoint protected turn is already active');
+            throw new Error(
+                'checkpoint protected turn is already active — the previous turn did not finish; '
+                + 'restart the session to open a new one',
+            );
         }
         const operationId = nextOperationId;
         const currentProtection = await protectionState.read({
@@ -211,9 +217,11 @@ export async function createCheckpointSessionComposition(input: {
             throw new Error('checkpoint protected turn is not active');
         }
         acceptsProtectedWriters = false;
-        turnPhase = 'applying';
         await quiesceWriters();
         await protectedWriterTree.quiesce(() => {});
+        // Only once the writers are quiescent: a failed quiesce leaves the turn dispatched (its work
+        // is preserved) rather than stuck in a phase that neither aborts nor completes.
+        turnPhase = 'applying';
         const completedTurn = activeTurn;
         if (!frozenWorkspacePath) {
             frozenWorkspacePath = (await turnWorkspace.freeze({
@@ -258,6 +266,9 @@ export async function createCheckpointSessionComposition(input: {
         return result;
     };
     const trackProtectedWriter = (child: ChildProcess) => protectedWriterTree.track(child);
+    const markTurnDispatched = () => {
+        if (turnPhase === 'prepared') turnPhase = 'dispatched';
+    };
     // specs/linux-checkpoint-enforcement-backend R4 — the gate opens the turn before the provider
     // process exists, so a turn that is never dispatched (reconnect failure, refused turn, session
     // exit) has to be discarded: its snapshot stays in the store as history, but the materialized
@@ -296,6 +307,7 @@ export async function createCheckpointSessionComposition(input: {
             trackProtectedWriter,
             dispose,
             abortTurn,
+            markTurnDispatched,
         };
     }
 
@@ -308,6 +320,7 @@ export async function createCheckpointSessionComposition(input: {
         trackProtectedWriter,
         dispose,
         abortTurn,
+        markTurnDispatched,
         claudeSandbox,
     };
 }

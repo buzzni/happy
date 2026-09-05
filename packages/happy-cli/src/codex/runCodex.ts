@@ -736,6 +736,7 @@ export async function runCodex(opts: {
         checkpointComposition.sandboxConfig,
         checkpointComposition.beforeTurn,
         checkpointComposition.completeTurn,
+        checkpointComposition.markTurnDispatched,
     );
 
     registerCodexSteerHandler({

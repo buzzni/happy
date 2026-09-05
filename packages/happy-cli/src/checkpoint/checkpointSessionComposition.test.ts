@@ -414,7 +414,9 @@ describe('createCheckpointSessionComposition', () => {
         await expect(result.abortTurn()).resolves.toBeUndefined();
     });
 
-    it('abortTurn preserves the sealed workspace of a partially applied turn', async () => {
+    // chmod cannot take write access away from root (CAP_DAC_OVERRIDE), so the failure this test
+    // injects only materializes for an unprivileged user.
+    it.skipIf(process.getuid?.() === 0)('abortTurn preserves the sealed workspace of a partially applied turn', async () => {
         // A partial apply keeps activeTurn and the sealed copy so the failed files can be retried
         // from the journal. The abort path must not confuse that with a turn that was never sent.
         const result = await createCheckpointSessionComposition({
@@ -445,6 +447,33 @@ describe('createCheckpointSessionComposition', () => {
 
         // The apply input survives: a partial turn is recoverable, not discardable.
         await expect(readFile(join(sealedPath, 'source.txt'), 'utf8')).resolves.toBe('agent change');
+    });
+
+    it('abortTurn keeps a dispatched turn whose outcome is unknown', async () => {
+        // A turn that reached the provider may already have produced work. If the response never
+        // arrives (turn timeout, transport error) the workspace must be preserved, not discarded.
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-dispatched',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+        if (!result.beforeTurn || !result.completeTurn || !result.abortTurn || !result.markTurnDispatched) {
+            throw new Error('expected protected turn lifecycle');
+        }
+        const turn = await result.beforeTurn();
+        result.markTurnDispatched();
+        await writeFile(join(turn.providerPath, 'source.txt'), 'agent work in flight');
+
+        await result.abortTurn();
+
+        await expect(readFile(join(turn.providerPath, 'source.txt'), 'utf8')).resolves.toBe('agent work in flight');
+        // Still the active turn, so the session fails closed instead of silently starting a new one.
+        await expect(result.beforeTurn()).rejects.toThrow('already active');
+        await expect(result.completeTurn(async () => {})).resolves.toMatchObject({ status: 'completed' });
     });
 
     it('records a daemon-readable pending decision when policy drift blocks dispatch', async () => {

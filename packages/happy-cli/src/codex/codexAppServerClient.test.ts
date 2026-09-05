@@ -803,6 +803,14 @@ describe('CodexAppServerClient sandbox integration', () => {
             await vi.advanceTimersByTimeAsync(10_000);
             await assertion;
             expect(beforeTurn).not.toHaveBeenCalled();
+
+            // A retry must not slip past the check: the old process is still alive and still holds
+            // its bwrap mount points, so the gate stays closed until it is really gone.
+            const retry = client.prepareProtectedTurn();
+            const retryAssertion = expect(retry).rejects.toThrow('did not exit');
+            await vi.advanceTimersByTimeAsync(10_000);
+            await retryAssertion;
+            expect(beforeTurn).not.toHaveBeenCalled();
         } finally {
             vi.useRealTimers();
         }

@@ -235,6 +235,7 @@ export class CodexAppServerClient {
     private sandboxConfig?: SandboxConfig;
     private readonly beforeTurn?: () => Promise<CheckpointTurnPreparation | void>;
     private readonly completeTurn?: CheckpointSessionComposition['completeTurn'];
+    private readonly markTurnDispatched?: () => void;
     private readonly protectedWriterTree: CheckpointWriterProcessTree | null;
     private sandboxCleanup: (() => Promise<void>) | null = null;
     private multiAuthProxy: PreparedCodexMultiAuthProxy | null = null;
@@ -318,10 +319,12 @@ export class CodexAppServerClient {
         sandboxConfig?: SandboxConfig,
         beforeTurn?: () => Promise<CheckpointTurnPreparation | void>,
         completeTurn?: CheckpointSessionComposition['completeTurn'],
+        markTurnDispatched?: () => void,
     ) {
         this.sandboxConfig = sandboxConfig;
         this.beforeTurn = beforeTurn;
         this.completeTurn = completeTurn;
+        this.markTurnDispatched = markTurnDispatched;
         this.protectedWriterTree = completeTurn ? new CheckpointWriterProcessTree() : null;
     }
 
@@ -911,6 +914,28 @@ export class CodexAppServerClient {
             proc?.once('exit', () => clearTimeout(killTimer));
         }
 
+        if (opts?.awaitProcessExit && proc && proc.exitCode == null && proc.signalCode == null) {
+            // The SIGKILL timer above fires at 2s; anything still alive after the cap is unkillable
+            // (uninterruptible I/O), and its bwrap mount points cannot be released. Fail closed
+            // rather than run the sandbox cleanup — and the next gate — on a stale process.
+            let exitTimer: ReturnType<typeof setTimeout> | undefined;
+            let onExit: (() => void) | undefined;
+            try {
+                await new Promise<void>((resolve, reject) => {
+                    onExit = () => resolve();
+                    proc.once('exit', onExit);
+                    exitTimer = setTimeout(
+                        () => reject(new Error('Codex process did not exit before the sandbox cleanup')),
+                        CodexAppServerClient.PROCESS_EXIT_WAIT_MS,
+                    );
+                    exitTimer.unref();
+                });
+            } finally {
+                if (exitTimer) clearTimeout(exitTimer);
+                if (onExit) proc.off('exit', onExit);
+            }
+        }
+
         this.process = null;
         this.connected = false;
         this._turnId = null;
@@ -940,28 +965,6 @@ export class CodexAppServerClient {
         // loop from dispatching its next turn against an unresumed app-server.
         if (!opts?.preservePendingTurnCompletion) {
             this.resolvePendingTurn(true);
-        }
-
-        if (opts?.awaitProcessExit && proc && proc.exitCode == null && proc.signalCode == null) {
-            // The SIGKILL timer above fires at 2s; anything still alive after the cap is unkillable
-            // (uninterruptible I/O), and its bwrap mount points cannot be released. Fail closed
-            // rather than run the sandbox cleanup — and the next gate — on a stale process.
-            let exitTimer: ReturnType<typeof setTimeout> | undefined;
-            let onExit: (() => void) | undefined;
-            try {
-                await new Promise<void>((resolve, reject) => {
-                    onExit = () => resolve();
-                    proc.once('exit', onExit);
-                    exitTimer = setTimeout(
-                        () => reject(new Error('Codex process did not exit before the sandbox cleanup')),
-                        CodexAppServerClient.PROCESS_EXIT_WAIT_MS,
-                    );
-                    exitTimer.unref();
-                });
-            } finally {
-                if (exitTimer) clearTimeout(exitTimer);
-                if (onExit) proc.off('exit', onExit);
-            }
         }
 
         if (this.sandboxCleanup) {
@@ -1524,6 +1527,9 @@ export class CodexAppServerClient {
 
         const turnPreparation = this.consumePreparedTurn(opts)
             ?? await this.resolveBeforeTurn(opts)?.();
+        // From here the prompt goes to the provider: whatever happens next, the turn's workspace is
+        // no longer discardable. specs/linux-checkpoint-enforcement-backend R4.
+        this.markTurnDispatched?.();
         const effectiveOpts = applyCheckpointTurnPreparation(opts, turnPreparation);
 
         const extraInputItems = opts?.extraInputItems ?? [];
@@ -1613,6 +1619,9 @@ export class CodexAppServerClient {
 
         const turnPreparation = this.consumePreparedTurn(opts)
             ?? await this.resolveBeforeTurn(opts)?.();
+        // From here the prompt goes to the provider: whatever happens next, the turn's workspace is
+        // no longer discardable. specs/linux-checkpoint-enforcement-backend R4.
+        this.markTurnDispatched?.();
         const effectiveOpts = applyCheckpointTurnPreparation(opts, turnPreparation);
 
         const timeoutMs = opts?.turnTimeoutMs ?? CodexAppServerClient.TURN_TIMEOUT_MS;
