@@ -4,6 +4,7 @@ import {
   MAX_GITHUB_WORKER_SESSIONS,
   runServerAutomationTick,
   type ServerAutomationExecutorInput,
+  DIRTY_WORKTREE_BLOCKED_AFTER_ATTEMPTS,
 } from './serverAutomationExecutor'
 
 // 상한을 상수에서 끌어와 만든다. 개수를 하드코딩하면 상한을 올릴 때 테스트가
@@ -3227,6 +3228,47 @@ describe('runServerAutomationTick', () => {
     expect(store.state().githubWorktrees).toEqual([expect.objectContaining({
       worktreePath: '/isolated/run-old', cleanupAttempts: 4, cleanupRetryAt: now + 60_000,
     })])
+  })
+
+  // 2026-09-05 프로덕션 — dirty 보류는 자동화를 worktree 게이트에 걸어 그 저장소의
+  // 리뷰를 통째로 멈춘다. 그런데 로그는 15분마다 같은 debug 한 줄이라 큐가 멈춘
+  // 사실이 어디에도 드러나지 않았다(aplus#3447 이 2시간 넘게 대기, 사용자가 물어봐서
+  // 발견). 보류가 오래가면 결과를 말한다.
+  async function runDirtyCleanup(cleanupAttempts: number) {
+    const { input, store, discardGithubWorktree, logDebug } = setup()
+    input.cache = { read: () => ({
+      cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
+    }) }
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old', directory: '/isolated/run-old',
+        sessionId: 'ended-session', createdAt: 1, cleanupAttempts,
+      }],
+    })
+    discardGithubWorktree.mockResolvedValue({
+      ok: false, dirty: true, error: 'GitHub automation worktree is dirty (notes.md)',
+    })
+
+    await runServerAutomationTick(input)
+    return logDebug
+  }
+
+  it('says the automation queue is blocked once a dirty hold has lasted', async () => {
+    const logDebug = await runDirtyCleanup(DIRTY_WORKTREE_BLOCKED_AFTER_ATTEMPTS - 1)
+
+    const blocked = logDebug.mock.calls.map(([line]) => String(line)).filter((line) => /queue is blocked/.test(line))
+    expect(blocked).toHaveLength(1)
+    expect(blocked[0]).toContain('automation-1')
+    expect(blocked[0]).toContain('notes.md')
+  })
+
+  it('does not cry blocked while the hold is still young', async () => {
+    const logDebug = await runDirtyCleanup(0)
+
+    expect(logDebug.mock.calls.map(([line]) => String(line)).filter((line) => /queue is blocked/.test(line)))
+      .toHaveLength(0)
   })
 
   it('never gives up on a dirty worktree, however many attempts it has taken', async () => {
