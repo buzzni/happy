@@ -1,17 +1,21 @@
 # 진행 상태
 
-> 갱신: 2026-09-05 / 상태: 진행중 (Phase 0~3 완료, Phase 4 문서 진행 중, R8 필터 승인 대기) / 브랜치 `feat/linux-checkpoint-protection` (worktree `.aplus/worktrees/linux-checkpoint-protection`, 커밋 3개, PR 미오픈)
+> 갱신: 2026-09-05 / 상태: 구현 완료 · provider smoke(실머신) 대기 / 브랜치 `feat/linux-checkpoint-protection` (worktree `.aplus/worktrees/linux-checkpoint-protection`, 커밋 6개, push·PR 미실행)
 
 ## 현재 상태
 
-Phase 0 스파이크(Ubuntu 22.04 컨테이너, 실제 bwrap) → Phase 1 R4 수정(`reserve()`) → Phase 2
-게이트+프로브 → Phase 3 Linux integration 테스트 편입까지 커밋 3개로 끝났다. Linux 컨테이너에서
-실제 게이트·실제 프로브로 6/6, macOS integration 3/3, checkpoint 단위 148/148, tsc 0. 남은 것:
-(1) **R8 필터 승인** — passthrough가 있으면 Linux protected 턴이 아예 못 뜨는 문제의 해결안, spec
-R3와 충돌해 사용자 승인 필요. (2) provider smoke는 계정이 필요해 미실행 — 실행 전에는 실사용
-광고 금지. (3) ADR Proposed 상태, PR 미오픈.
+Phase 0~4 완료. 커밋 6개: R4 `reserve()`(d63f5e89) → 게이트+프로브(136ed6f3) → Linux integration
+테스트+컨테이너 하네스(38b53564) → 문서·ADR(b586ca55) → **R8 필터**(f3c16a99, 사용자 승인) → 문서.
+최종 검증: Linux 컨테이너(실제 게이트·프로브, 커밋된 하네스 스크립트) 5/5, macOS integration 3/3,
+checkpoint+sandbox 단위 182/182, tsc 0. 남은 것은 (1) provider smoke를 실제 Linux 머신+계정으로 —
+통과 전 실사용 광고 금지, (2) push/PR(사용자 지시 대기), (3) Desktop ADR-059 갱신, (4) MCP
+`bash_stream` 별도 스펙.
 
 ## 핵심 결정 로그 (최신이 위)
+
+- [2026-09-05] 결정(사용자 승인): Linux에서 srt deny 목록의 glob 항목·passthrough symlink 항목만
+  제외(R3 개정) / 이유: glob은 미강제+잔여물, symlink는 bwrap 기동 실패, 대상은 `/` ro-bind로
+  이미 read-only / 실측: Linux R8 통과(읽기 OK·쓰기 거부·symlink 교체 시 원본 불변·`**` 없음)
 
 - [2026-09-05] 결정: R4는 (a) `CheckpointTurnWorkspace.reserve()`로 workspace 경로를 빈 dir로
   미리 만들고 `prepare()`는 비어 있지 않은 dir만 거부 / 이유: Codex `connect()` 순서를 건드리지
@@ -116,6 +120,10 @@ worktree를 `/src:ro`로 마운트해 `/work`에 복사 후 `pnpm install`. 테�
   #11(allowWrite 구성·manifest 스캔 세부, 표에 반영), #13(observability v1 범위 → R9).
 
 - bwrap mount-point 잔여물: 정상 경로는 freeze 전 cleanup 확인(위). 비정상 경로만 Phase 0 관찰.
+- **[범위 밖] `SandboxConfig` 기본 `denyWritePaths`의 상대 경로 `.env`**가 `resolvePaths`로 sessionPath
+  (=workspace) 기준 `WS/.env`가 되어, Linux에서 srt가 workspace 루트에 0바이트 `.env` mount-point를
+  만든다(SRT_DEBUG 실측, R8 필터와 무관). 정상 cleanup 뒤 사라지지만 일반(비보호) Codex sandbox에서는
+  프로젝트 cwd에 프로세스 수명 동안 ghost `.env`가 생긴다 — 체크포인트가 아닌 일반 sandbox 이슈.
 - Desktop `src/domain/checkpointTimeline.ts` `UNAVAILABLE_REASONS`가 닫힌 집합. 새
   reason은 Desktop 선배포 필요. 원격 daemon은 `npm i -g` 별도 설치라 버전 스큐 전제.
 - 기존 `checkpointSandbox.integration.test.ts`가 셸 write만 검증하는지, Claude native

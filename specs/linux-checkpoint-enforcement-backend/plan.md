@@ -55,7 +55,7 @@ R5-a는 보장 축소, MCP bash_stream은 호스트 실행)은 전부 "코드 �
 - [x] **Phase 3: Linux integration 테스트 정식 편입** — `38b53564`. CI는 happy-cli vitest 자체를 안 돌리므로 job 추가 대신 컨테이너 스크립트(`scripts/checkpoint-linux-sandbox-check/`)로 대체 → Phase 0 테스트를 우회 없이 통과,
       vitest `integration-empty`에 등록, CI ubuntu job에 apt 설치 추가. Ubuntu 24.04 러너의
       userns 제한이면 skip-with-reason. → 검증: CI 초록 또는 컨테이너 실행 기록
-- [ ] **Phase 4: ADR·문서·후속** — ADR 초안 `docs/adr/2026-09-05-linux-checkpoint-protection.md`(Proposed) → happy `docs/adr/2026-09-XX-linux-checkpoint-protection.md`
+- [x] **Phase 4: ADR·문서** — ADR `docs/adr/2026-09-05-linux-checkpoint-protection.md`(Proposed, R8 필터 승인 반영). 후속 항목은 아래 목록 → happy `docs/adr/2026-09-XX-linux-checkpoint-protection.md`
       (Linux 개방 결정, R4 순서, 알려진 한계). context.md 완료 요약. Desktop ADR-059 갱신·
       MCP `bash_stream` 경계·Desktop 파서 관용화를 후속 이슈로. → 검증: 문서 리뷰
 
@@ -82,7 +82,7 @@ R5-a는 보장 축소, MCP bash_stream은 호스트 실행)은 전부 "코드 �
 
 ## 승인 대기 중인 추가 작업 (스코프 확장 제안)
 
-- [ ] (제안) **R8 필터 — Linux에서 workspace deny 목록 중 glob 항목과 passthrough symlink 항목만
+- [x] (승인 2026-09-05, `f3c16a99`) **R8 필터 — Linux에서 workspace deny 목록 중 glob 항목과 passthrough symlink 항목만
       srt에 넘기지 않는다** — 필요해진 이유: Phase 0 실측에서 srt Linux의 symlink 교체 방어가
       passthrough symlink에 `/dev/null` bind를 시도해 **bwrap이 기동조차 못 한다**(readOnlyPassthroughPaths가
       있으면 Linux protected 턴 불가). glob 항목은 Linux에서 무효인데 `ws/**` 잔여물만 남긴다.

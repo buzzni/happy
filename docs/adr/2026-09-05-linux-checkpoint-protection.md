@@ -40,7 +40,7 @@ ADR-059는 v1 체크포인트 보호(`protected`)를 macOS Claude remote/Codex�
    `excluded-path` conflict + `pendingDecision.source: 'turn-apply'`가 계약이며 Linux
    integration 테스트로 고정한다. gitignore된 신규 secret은 원본 미반영이지만 pending을
    보장하지 않는다.
-4. (승인 대기) Linux에서 srt에 넘기는 workspace deny 목록에서 **glob 항목**과 **passthrough
+4. (2026-09-05 승인) Linux에서 srt에 넘기는 workspace deny 목록에서 **glob 항목**과 **passthrough
    symlink 항목**만 제외한다. glob은 Linux에서 원래 무효이고, passthrough 대상은 `/` ro-bind로
    이미 read-only다. 그 외 열거된 리터럴 deny(secret·too-large·ignored 파일)는 유지한다.
 
