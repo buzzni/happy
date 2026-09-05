@@ -21,6 +21,11 @@ const SCRATCH_UNTRACKED = [
   'memory/',
   '.omc/',
   'node_modules/',
+  // 2026-09-05 — 리뷰 워커가 제출을 끝낸 뒤 `.agenttask-3446-result.json` 을 루트에
+  // 남겼다. 그 한 줄로 정리가 거부되고 자동화가 worktree 게이트에 걸려 그 저장소의
+  // 리뷰가 통째로 멈췄다. 결과는 이미 서버에 있으므로 파일에는 잃을 것이 없다.
+  // 루트의 것만 무시한다 — 하위 경로에 같은 이름이 있으면 그건 저장소 내용이다.
+  '.agenttask-',
 ];
 
 /**
@@ -38,6 +43,7 @@ function isIgnorableEntry(line: string): boolean {
   if (status === '??') {
     return SCRATCH_UNTRACKED.some((prefix) => path === prefix || path.startsWith(prefix));
   }
+
   if (status === ' M' || status === 'M ') {
     return GITLINK_PATHS.includes(path);
   }
@@ -49,9 +55,26 @@ function isIgnorableEntry(line: string): boolean {
  * 있는지 본다.
  */
 export function hasUnsavedWorktreeChanges(porcelainStatus: string): boolean {
+  return unsavedEntries(porcelainStatus).length > 0;
+}
+
+/** 한 로그 줄에 담을 만큼만. 목록이 길다는 사실 자체가 이미 신호다. */
+const MAX_DESCRIBED_PATHS = 10;
+
+/**
+ * 정리를 막고 있는 경로들. 2026-09-05 에는 로그가 "dirty" 라고만 해서, 무엇 때문에
+ * 그 저장소의 리뷰 큐가 멈췄는지 알아내려면 사람이 직접 git status 를 쳐야 했다.
+ */
+export function describeUnsavedWorktreeChanges(porcelainStatus: string): string[] {
+  return unsavedEntries(porcelainStatus)
+    .slice(0, MAX_DESCRIBED_PATHS)
+    .map((line) => line.slice(3).trim());
+}
+
+function unsavedEntries(porcelainStatus: string): string[] {
   return porcelainStatus
     .split('\n')
     .map((line) => line.replace(/\r$/, ''))
     .filter((line) => line.trim().length > 0)
-    .some((line) => !isIgnorableEntry(line));
+    .filter((line) => !isIgnorableEntry(line));
 }

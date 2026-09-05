@@ -222,6 +222,16 @@ export const MAX_GITHUB_EVENTS_PER_TICK = 3
 // 잡아 주므로, 한 번에 몰려도 상한까지 두 틱에 걸쳐 올라간다.
 export const MAX_GITHUB_WORKER_SESSIONS = 6
 const DIRTY_WORKTREE_RETRY_MS = 15 * 60_000
+/**
+ * dirty 보류가 이만큼 이어지면 결과를 말한다(15분 간격이므로 4회 = 1시간).
+ *
+ * 2026-09-05 프로덕션 — 리뷰 워커가 남긴 결과 파일 한 개로 정리가 거부됐고, 그
+ * 자동화가 worktree 게이트에 걸려 그 저장소의 리뷰가 통째로 멈췄다. 로그는 15분마다
+ * 같은 debug 한 줄이라 큐가 멈춘 사실은 어디에도 드러나지 않았고, 사용자가 "왜 아직
+ * pending 이냐" 고 물어서야 발견됐다(aplus#3447, 2시간 이상). 보류 자체는 의도된
+ * 동작이지만 그 대가는 말해야 한다.
+ */
+export const DIRTY_WORKTREE_BLOCKED_AFTER_ATTEMPTS = 4
 const WORKTREE_CLEANUP_RETRY_MS = 60_000
 // 리뷰 worktree 는 대상 head 로만 체크아웃된 일회용 디렉토리다. 'strict' 는 그
 // 세션 경로만 쓰기 가능하게 하므로, 워커가 여기에 의존성을 설치해 대상 SHA 의
@@ -958,6 +968,13 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
     // 않는다. 그 밖의 실패는 예산 안에서만 재시도한다 — 상한이 없으면 2026-08-30 처럼
     // 매분 영원히 실패하며 디스크만 찬다.
     const attempts = (worktree.cleanupAttempts ?? 0) + 1
+    if (discarded.dirty && attempts === DIRTY_WORKTREE_BLOCKED_AFTER_ATTEMPTS) {
+      input.logDebug?.(
+        `[server-automation] ${worktree.automationId} GitHub queue is blocked:`
+        + ` ${worktree.worktreePath} has been dirty for ${attempts} cleanup attempts`
+        + ` — ${discarded.error}`,
+      )
+    }
     if (!discarded.dirty && shouldGiveUpWorktreeCleanup(attempts)) {
       input.logDebug?.(
         `[server-automation] giving up on GitHub worktree cleanup for ${worktree.worktreePath}`
