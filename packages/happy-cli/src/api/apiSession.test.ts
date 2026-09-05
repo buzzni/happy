@@ -194,6 +194,68 @@ describe('ApiSessionClient v3 messages API migration', () => {
         vi.restoreAllMocks();
     });
 
+    // 2026-09-05 프로덕션 — 리뷰 워커가 turn 을 끝내고 정리까지 마쳤는데
+    // (sendSessionDeath → flush → close → client.disconnect → happyServer.stop)
+    // 프로세스가 2시간 11분 살아남았다. close() 가 socket.close() 를 부르면 그
+    // 'disconnect' 핸들러가 startSmartReconnect() 를 걸어, 1초 뒤 소켓이 다시
+    // 붙는다. 살아있는 소켓이 이벤트 루프를 붙잡아 run-once 세션이 끝나지 못했고,
+    // 그 프로세스가 worktree 를 점유해 그 저장소의 리뷰 큐가 통째로 멈췄다.
+    it('never reconnects after the session was deliberately closed', async () => {
+        vi.useFakeTimers();
+        const client = new ApiSessionClient('fake-token', session);
+        mockSocket.connect.mockClear();
+
+        await client.close();
+        mockSocket.connected = false;
+        // close() 가 유발하는 disconnect 는 재연결을 걸면 안 된다.
+        emitSocketEvent('disconnect', 'io client disconnect');
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(mockSocket.connect).not.toHaveBeenCalled();
+    });
+
+    it('does not let a connect error revive a closed session either', async () => {
+        vi.useFakeTimers();
+        const client = new ApiSessionClient('fake-token', session);
+        mockSocket.connect.mockClear();
+
+        await client.close();
+        mockSocket.connected = false;
+        emitSocketEvent('connect_error', new Error('boom'));
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(mockSocket.connect).not.toHaveBeenCalled();
+    });
+
+    // close() 는 interval 은 지우지만 이미 예약된 1초 타이머는 지우지 못한다.
+    // 프로덕션에서 소켓이 다시 붙은 것이 close() 1.1초 뒤였다.
+    it('does not let a reconnect scheduled before close still fire', async () => {
+        vi.useFakeTimers();
+        const client = new ApiSessionClient('fake-token', session);
+        mockSocket.connected = false;
+        emitSocketEvent('disconnect', 'transport close');
+        mockSocket.connect.mockClear();
+
+        await client.close();
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(mockSocket.connect).not.toHaveBeenCalled();
+    });
+
+    // 닫지 않은 세션은 끊기면 당연히 다시 붙어야 한다 — 이 수정으로 그것까지
+    // 막으면 네트워크 순단마다 세션을 잃는다.
+    it('still reconnects a live session that dropped', async () => {
+        vi.useFakeTimers();
+        new ApiSessionClient('fake-token', session);
+        mockSocket.connect.mockClear();
+        mockSocket.connected = false;
+
+        emitSocketEvent('disconnect', 'transport close');
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        expect(mockSocket.connect).toHaveBeenCalled();
+    });
+
     it('registers core socket handlers and connects', () => {
         new ApiSessionClient('fake-token', session);
 
