@@ -34,6 +34,9 @@ export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', '
 const SAYCODE_AGENT_ENV_KEYS = [
     'SAYCODE_AGENT_ENV',
     'SAYCODE_AGENT_ROOT',
+    // The tree siblings may live in (saycode-cli 0.4.0, Desktop ADR-061). Without it a
+    // resumed hub silently shrinks back to its own worktree.
+    'SAYCODE_AGENT_SCOPE',
     'SAYCODE_AGENT_DEPTH',
     'SAYCODE_AGENT_MAX_SPAWN',
     'SAYCODE_AGENT_ID',
