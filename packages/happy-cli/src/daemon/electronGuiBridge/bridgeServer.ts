@@ -132,7 +132,51 @@ export async function createElectronGuiBridgeServer(options: {
 }): Promise<ElectronGuiBridgeServer> {
     const { source } = options
     const log = options.log ?? (() => {})
-    let active: WebSocket | null = null
+    const viewers = new Set<WebSocket>()
+    let lastFrame: ElectronGuiFrame | null = null
+    let running = false
+    // Start/stop are serialized: a viewer leaving while the start is still in
+    // flight (or joining while the stop is) must not interleave the two on the
+    // debugger, which would leave a capture attached that nobody consumes.
+    let queue: Promise<unknown> = Promise.resolve()
+    const serialize = <T,>(task: () => Promise<T>): Promise<T> => {
+        const next = queue.then(task, task)
+        queue = next.catch(() => {})
+        return next
+    }
+
+    const frameMessage = (frame: ElectronGuiFrame) =>
+        JSON.stringify({ t: 'frame', data: frame.data, width: frame.width, height: frame.height })
+
+    const broadcast = (frame: ElectronGuiFrame) => {
+        lastFrame = frame
+        const message = frameMessage(frame)
+        for (const viewer of viewers) {
+            if (viewer.readyState === viewer.OPEN) viewer.send(message)
+        }
+    }
+
+    // One screencast shared by every viewer: started by the first, stopped by
+    // the last. Starting per viewer would restart the capture under the
+    // others' feet; rejecting extra viewers would race the desktop's probe.
+    const ensureScreencast = () =>
+        serialize(async () => {
+            if (running || viewers.size === 0) return
+            await source.startScreencast(broadcast)
+            running = true
+        })
+
+    const releaseScreencast = () =>
+        serialize(async () => {
+            if (viewers.size > 0 || !running) return
+            running = false
+            lastFrame = null
+            try {
+                await source.stopScreencast()
+            } catch (error) {
+                log(`stopScreencast failed: ${String(error)}`)
+            }
+        })
 
     const server: Server = createServer((request, response) => {
         const pathname = pathnameOf(request)
@@ -155,43 +199,25 @@ export async function createElectronGuiBridgeServer(options: {
     })
 
     wss.on('connection', (ws) => {
-        if (active) {
-            // A second attach would restart the screencast under the first
-            // viewer's feet; the desktop only ever holds one sidecar per app.
-            ws.send(JSON.stringify({ t: 'error', reason: 'busy' }))
-            ws.close(1013, 'busy')
-            return
+        viewers.add(ws)
+        const leave = () => {
+            if (!viewers.delete(ws)) return
+            void releaseScreencast()
         }
-        active = ws
-        let stopped = false
-        const stop = async () => {
-            if (stopped) return
-            stopped = true
-            if (active === ws) active = null
-            try {
-                await source.stopScreencast()
-            } catch (error) {
-                log(`stopScreencast failed: ${String(error)}`)
-            }
-        }
-        ws.on('close', () => { void stop() })
-        ws.on('error', () => { void stop() })
+        ws.on('close', leave)
+        ws.on('error', leave)
         ws.on('message', (raw) => {
             const event = parseElectronGuiInput(raw.toString())
             if (!event) return
             source.dispatchInput(event).catch((error) => log(`dispatchInput failed: ${String(error)}`))
         })
         ws.send(JSON.stringify({ t: 'ready' }))
-        source
-            .startScreencast((frame) => {
-                if (ws.readyState !== ws.OPEN) return
-                ws.send(JSON.stringify({ t: 'frame', data: frame.data, width: frame.width, height: frame.height }))
-            })
-            .catch((error) => {
-                log(`startScreencast failed: ${String(error)}`)
-                if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ t: 'error', reason: 'screencast-failed', message: String(error) }))
-                ws.close(1011, 'screencast failed')
-            })
+        if (lastFrame) ws.send(frameMessage(lastFrame))
+        ensureScreencast().catch((error) => {
+            log(`startScreencast failed: ${String(error)}`)
+            if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ t: 'error', reason: 'screencast-failed', message: String(error) }))
+            ws.close(1011, 'screencast failed')
+        })
     })
 
     await new Promise<void>((resolve, reject) => {

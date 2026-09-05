@@ -28,7 +28,7 @@ type ElectronWindowLike = {
 type ElectronLike = {
     app: {
         whenReady(): Promise<void>
-        on(event: 'browser-window-created', listener: (event: unknown, window: ElectronWindowLike) => void): void
+        once(event: 'browser-window-created', listener: (event: unknown, window: ElectronWindowLike) => void): void
         on(event: 'will-quit', listener: () => void): void
     }
     BrowserWindow: {
@@ -56,8 +56,10 @@ function pickWindow(electron: ElectronLike): ElectronWindowLike | null {
 function waitForWindow(electron: ElectronLike): Promise<ElectronWindowLike> {
     const existing = pickWindow(electron)
     if (existing) return Promise.resolve(existing)
+    // `once`: every viewer connection that arrives before the first window
+    // would otherwise leave a permanent listener behind.
     return new Promise((resolve) => {
-        electron.app.on('browser-window-created', (_event, window) => resolve(window))
+        electron.app.once('browser-window-created', (_event, window) => resolve(window))
     })
 }
 

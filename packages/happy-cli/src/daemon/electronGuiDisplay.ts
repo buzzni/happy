@@ -69,7 +69,7 @@ export function planElectronGuiDisplay(input: {
 // ---------------------------------------------------------------------------
 
 import { execFile } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawnDetached, buildXvfbArgs } from './remoteViewer'
 
@@ -103,6 +103,10 @@ function xSocketPath(display: string): string {
 async function ensureXvfb(display: string): Promise<boolean> {
     const socket = xSocketPath(display)
     if (existsSync(socket)) return true
+    // A crashed Xvfb leaves /tmp/.X<n>-lock behind with no socket; the next
+    // start then refuses the display number forever. Only the lock is stale
+    // here — an alive server would still own the socket checked above.
+    rmSync(`/tmp/.X${display.slice(1)}-lock`, { force: true })
     spawnDetached('Xvfb', buildXvfbArgs({ display, width: 1280, height: 800 }))
     const deadline = Date.now() + 5000
     while (Date.now() < deadline) {

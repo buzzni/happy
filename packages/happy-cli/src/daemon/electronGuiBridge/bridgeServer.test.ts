@@ -57,6 +57,17 @@ function nextMessage(client: Client): Promise<string> {
     return client.next()
 }
 
+function slowSource() {
+    const calls: string[] = []
+    let releaseStart: (() => void) | null = null
+    const source: ElectronGuiScreencastSource = {
+        startScreencast: () => new Promise<void>((resolve) => { calls.push('start'); releaseStart = resolve }),
+        async stopScreencast() { calls.push('stop') },
+        async dispatchInput() {},
+    }
+    return { source, calls, finishStart: () => releaseStart?.() }
+}
+
 describe('electron GUI bridge server', () => {
     let started: Started | null = null
     afterEach(async () => { await started?.close(); started = null })
@@ -112,14 +123,47 @@ describe('electron GUI bridge server', () => {
         ws.close()
     })
 
-    it('rejects a second viewer while one is streaming instead of double-attaching', async () => {
+    // The desktop's liveness probe opens a socket on the same path moments
+    // before (or while) the canvas connects, and a user may open the stream in a
+    // second tab. One shared screencast fans out to every viewer; a "busy"
+    // rejection would turn the probe into a race against the real viewer.
+    it('fans one screencast out to every viewer and stops only after the last one leaves', async () => {
         const fake = fakeSource()
         started = await createElectronGuiBridgeServer({ port: 0, host: '127.0.0.1', source: fake.source })
         const first = await openClient(started.port)
-        await nextMessage(first)
+        expect(JSON.parse(await nextMessage(first))).toMatchObject({ t: 'ready' })
+        fake.emit('FIRST')
+        expect(JSON.parse(await nextMessage(first))).toMatchObject({ t: 'frame', data: 'FIRST' })
+
         const second = await openClient(started.port)
-        const message = JSON.parse(await nextMessage(second))
-        expect(message).toMatchObject({ t: 'error', reason: 'busy' })
-        first.close(); second.close()
+        expect(JSON.parse(await nextMessage(second))).toMatchObject({ t: 'ready' })
+        // A late joiner is painted immediately from the last frame instead of
+        // waiting for the window to change.
+        expect(JSON.parse(await nextMessage(second))).toMatchObject({ t: 'frame', data: 'FIRST' })
+        fake.emit('SECOND')
+        expect(JSON.parse(await nextMessage(first))).toMatchObject({ t: 'frame', data: 'SECOND' })
+        expect(JSON.parse(await nextMessage(second))).toMatchObject({ t: 'frame', data: 'SECOND' })
+
+        first.close()
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        expect(fake.stops()).toBe(0)
+        second.close()
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        expect(fake.stops()).toBe(1)
+    })
+
+    it('stops a screencast whose start was still pending when the last viewer left', async () => {
+        const slow = slowSource()
+        started = await createElectronGuiBridgeServer({ port: 0, host: '127.0.0.1', source: slow.source })
+        const viewer = await openClient(started.port)
+        await nextMessage(viewer)
+        viewer.close()
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        // Stop must wait for the start to settle — otherwise the debugger ends
+        // up attached with a capture nobody consumes.
+        expect(slow.calls).toEqual(['start'])
+        slow.finishStart()
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        expect(slow.calls).toEqual(['start', 'stop'])
     })
 })
