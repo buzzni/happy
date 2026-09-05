@@ -974,9 +974,11 @@ export class CodexAppServerClient {
      * the checkpoint gate. Returns null when the session is not protected.
      * specs/linux-checkpoint-enforcement-backend R4
      */
-    /** Drops a cached preparation that will not be dispatched; the composition owns the cleanup. */
-    abortPreparedTurn(): void {
+    /** Drops a cached preparation that will not be dispatched; returns whether it needs cleanup. */
+    abortPreparedTurn(): boolean {
+        const hadPreparedTurn = this.preparedTurn !== null;
         this.preparedTurn = null;
+        return hadPreparedTurn;
     }
 
     async prepareProtectedTurn(): Promise<CheckpointTurnPreparation | null> {
