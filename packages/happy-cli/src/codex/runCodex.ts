@@ -1417,6 +1417,7 @@ export async function runCodex(opts: {
         }
         logger.debug('[codex]: client.disconnect begin');
         await client.disconnect();
+        await checkpointComposition.dispose?.();
         logger.debug('[codex]: client.disconnect done');
         // Stop Happy MCP server
         logger.debug('[codex]: happyServer.stop');

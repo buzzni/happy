@@ -14,7 +14,8 @@ import { createCheckpointSessionComposition } from './checkpointSessionCompositi
 
 const providerSmokeEnabled = process.env.HAPPY_RUN_CHECKPOINT_PROVIDER_SMOKE === '1';
 const providerSmokeRoot = process.env.HAPPY_CHECKPOINT_PROVIDER_SMOKE_ROOT ?? tmpdir();
-describe.skipIf(process.platform !== 'darwin' || !providerSmokeEnabled)(
+// specs/linux-checkpoint-enforcement-backend — runs on macOS and Linux (bubblewrap); still opt-in.
+describe.skipIf((process.platform !== 'darwin' && process.platform !== 'linux') || !providerSmokeEnabled)(
     'checkpoint protected provider smoke',
     { timeout: 180_000 },
     () => {
@@ -50,7 +51,7 @@ describe.skipIf(process.platform !== 'darwin' || !providerSmokeEnabled)(
             }> = [];
             const composition = await createCheckpointSessionComposition({
                 provider: 'codex',
-                platform: 'darwin',
+                platform: process.platform,
                 projectPath,
                 sessionId: 'provider-smoke-codex',
                 sandboxConfig: SandboxConfigSchema.parse({
@@ -128,7 +129,7 @@ describe.skipIf(process.platform !== 'darwin' || !providerSmokeEnabled)(
             await writeFile(hookSettingsPath, '{}\n');
             const composition = await createCheckpointSessionComposition({
                 provider: 'claude-remote',
-                platform: 'darwin',
+                platform: process.platform,
                 projectPath,
                 sessionId: 'provider-smoke-claude',
                 sandboxConfig: SandboxConfigSchema.parse({

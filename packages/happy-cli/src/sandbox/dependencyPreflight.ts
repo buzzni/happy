@@ -58,25 +58,32 @@ const KNOWN_BINARIES = ['bwrap', 'socat', 'rg'] as const;
 
 export function probeLinuxSandboxDependencies(
   check: () => { errors: string[]; warnings: string[] } = () => SandboxManager.checkDependencies(),
+  log: (message: string) => void = () => {},
 ): LinuxSandboxDependencyStatus {
-  let errors: string[];
+  let result: { errors: string[]; warnings: string[] };
   try {
-    errors = check().errors;
+    result = check();
   } catch {
+    log('[checkpoint] Linux sandbox dependency probe failed; protection unavailable');
     return { ok: false, missing: ['probe-failed'] };
   }
-  if (errors.length === 0) return { ok: true };
-  const missing = errors.map((error) => (
+  if (result.warnings.length > 0) {
+    // srt only warns about the seccomp filter today; keep the log to fixed codes, never srt text.
+    log('[checkpoint] Linux sandbox warning: seccomp-unavailable (unix sockets unrestricted)');
+  }
+  if (result.errors.length === 0) return { ok: true };
+  const missing = [...new Set(result.errors.map((error) => (
     KNOWN_BINARIES.find((binary) => new RegExp(`\\b${binary}\\b`).test(error))
       ?? (error === 'Unsupported platform' ? 'unsupported-platform' : 'unknown')
-  ));
-  return { ok: false, missing: [...new Set(missing)] };
+  )))];
+  log(`[checkpoint] Linux sandbox dependencies missing: ${missing.join(', ')}; protection unavailable`);
+  return { ok: false, missing };
 }
 
 let cachedStatus: LinuxSandboxDependencyStatus | null = null;
 
 /** Memoized for the daemon lifetime — the checkpoint authority re-resolves on every RPC. */
 export function cachedLinuxSandboxDependencyStatus(): LinuxSandboxDependencyStatus {
-  cachedStatus ??= probeLinuxSandboxDependencies();
+  cachedStatus ??= probeLinuxSandboxDependencies(undefined, (message) => console.warn(message));
   return cachedStatus;
 }

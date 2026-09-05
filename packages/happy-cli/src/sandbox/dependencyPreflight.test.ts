@@ -94,6 +94,19 @@ describe('probeLinuxSandboxDependencies', () => {
     }))).toEqual({ ok: false, missing: ['bwrap', 'socat', 'rg'] });
   });
 
+  it('logs only fixed codes and binary names, never srt text', () => {
+    const logs: string[] = [];
+    probeLinuxSandboxDependencies(() => ({
+      errors: ['bubblewrap (bwrap) not installed at /opt/secret/bin'],
+      warnings: ['seccomp not available - unix socket access not restricted'],
+    }), (message) => logs.push(message));
+    expect(logs).toEqual([
+      '[checkpoint] Linux sandbox warning: seccomp-unavailable (unix sockets unrestricted)',
+      '[checkpoint] Linux sandbox dependencies missing: bwrap; protection unavailable',
+    ]);
+    expect(logs.join('\n')).not.toContain('/opt/secret');
+  });
+
   it('fails closed when the probe throws or reports an unrecognized error', () => {
     expect(probeLinuxSandboxDependencies(() => { throw new Error('/usr/bin/which: EACCES /secret/path'); }))
       .toEqual({ ok: false, missing: ['probe-failed'] });

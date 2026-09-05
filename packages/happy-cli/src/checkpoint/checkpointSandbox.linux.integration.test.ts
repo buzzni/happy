@@ -170,14 +170,15 @@ describe.skipIf(process.platform !== 'linux')('checkpoint Linux bubblewrap enfor
         const attempt = await execAsync(await wrapCommand(
             `rm ${shellQuote(join(ws, 'dependencies'))} && mkdir ${shellQuote(join(ws, 'dependencies'))} `
             + `&& printf injected > ${shellQuote(join(ws, 'dependencies', 'new.txt'))} && echo REPLACED`,
-        )).catch((error: Error) => ({ stdout: `DENIED ${error.message.split('\n')[0]}` }));
-        // eslint-disable-next-line no-console
-        console.log(`[linux-spike] passthrough replace attempt: ${attempt.stdout.trim()}`);
+        ));
+        expect(attempt.stdout.trim()).toBe('REPLACED');
+        await expect(readFile(join(ws, 'dependencies', 'new.txt'), 'utf8')).resolves.toBe('injected');
         await cleanupSandbox();
         cleanupSandbox = null;
         const result = await composition.completeTurn(async () => {});
-        // eslint-disable-next-line no-console
-        console.log(`[linux-spike] passthrough replace apply: ${JSON.stringify(result.entries)}`);
+        // The replaced passthrough is gitignored in the synthetic baseline, so apply never lists it as a
+        // candidate: nothing is written to the original and no conflict/pending is raised (spec R8).
+        expect(result.status).toBe('completed');
         await expect(readFile(join(projectPath, 'dependencies', 'package.txt'), 'utf8')).resolves.toBe('cached dependency');
         await expect(stat(join(projectPath, 'dependencies', 'new.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
         expect(await readdir(join(projectPath, 'dependencies'))).toEqual(['package.txt']);

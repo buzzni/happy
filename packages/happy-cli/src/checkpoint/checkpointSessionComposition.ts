@@ -29,6 +29,8 @@ export type CheckpointSessionComposition = {
     completeTurn?: (quiesceWriters: () => Promise<void>) => Promise<CheckpointTurnApplyResult>;
     protectedBashCwd?: () => string | null;
     trackProtectedWriter?: (child: ChildProcess) => void;
+    /** Removes a reserved-but-unused provider workspace; an active turn is left untouched. */
+    dispose?: () => Promise<void>;
     claudeSandbox?: QueryOptions['sandbox'];
 };
 
@@ -93,20 +95,26 @@ export async function createCheckpointSessionComposition(input: {
     // specs/linux-checkpoint-enforcement-backend R3/R8 — bubblewrap cannot enforce glob deny
     // entries (it only leaves ws/** mount-point residue) and refuses to start when a deny entry is
     // a symlink inside the writable workspace. The passthrough target is already read-only through
-    // the root ro-bind, so dropping these two kinds on Linux removes no guarantee.
+    // the root ro-bind, so dropping these two kinds on Linux removes no guarantee. The selection is
+    // by *source* (pattern-derived entries, passthrough entries), never by inspecting literal paths:
+    // a project path may legitimately contain '[' or '?'.
+    const linux = input.platform === 'linux';
+    const patternEntries = (root: string) => runtime.excludedPatterns.map((pattern) => join(root, pattern));
     const sandboxConfigFor = (path: string): SandboxConfig => ({
         ...inputSandboxConfig,
         sessionIsolation: 'custom',
         customWritePaths: [path],
         denyWritePaths: [...new Set([
             ...inputSandboxConfig.denyWritePaths,
-            ...runtime.denyWritePaths,
+            ...(linux
+                ? runtime.denyWritePaths.filter((entry) => !patternEntries(canonicalProjectPath).includes(entry))
+                : runtime.denyWritePaths),
             ...runtime.excludedPaths
-                .filter((excludedPath) => input.platform !== 'linux' || !runtime.readOnlyPassthroughPaths.includes(excludedPath))
+                .filter((excludedPath) => !linux || !runtime.readOnlyPassthroughPaths.includes(excludedPath))
                 .map((excludedPath) => join(path, excludedPath)),
-            ...runtime.excludedPatterns.map((pattern) => join(path, pattern)),
+            ...(linux ? [] : patternEntries(path)),
             canonicalProjectPath,
-        ])].filter((entry) => input.platform !== 'linux' || !/[*?[\]]/.test(entry)),
+        ])],
     });
     const claudeSandboxFor = (config: SandboxConfig, path: string): QueryOptions['sandbox'] => {
         const sandboxRuntime = buildSandboxRuntimeConfig(config, path);
@@ -241,6 +249,12 @@ export async function createCheckpointSessionComposition(input: {
         return result;
     };
     const trackProtectedWriter = (child: ChildProcess) => protectedWriterTree.track(child);
+    // specs/linux-checkpoint-enforcement-backend R4 — reserve() leaves an empty directory for the next
+    // turn; a session that ends without starting it must not leak that directory.
+    const dispose = async () => {
+        if (activeTurn) return;
+        await turnWorkspace.remove({ ...workspaceBinding, operationId: nextOperationId });
+    };
     if (input.provider !== 'claude-remote') {
         return {
             sandboxConfig,
@@ -249,6 +263,7 @@ export async function createCheckpointSessionComposition(input: {
             completeTurn,
             protectedBashCwd,
             trackProtectedWriter,
+            dispose,
         };
     }
 
@@ -259,6 +274,7 @@ export async function createCheckpointSessionComposition(input: {
         completeTurn,
         protectedBashCwd,
         trackProtectedWriter,
+        dispose,
         claudeSandbox,
     };
 }

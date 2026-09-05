@@ -311,10 +311,12 @@ describe('createCheckpointSessionComposition', () => {
 
         const linux = await configFor('linux');
         expect(linux.deny).toEqual(expect.arrayContaining([
+            'user-glob/*.pem',
             canonicalProjectPath,
             join(linux.ws, 'large.bin'),
         ]));
-        expect(linux.deny.filter((entry) => /[*?[\]]/.test(entry))).toEqual([]);
+        expect(linux.deny).not.toContain(join(canonicalProjectPath, '**', '.env*'));
+        expect(linux.deny).not.toContain(join(linux.ws, '**', '.env*'));
         expect(linux.deny).not.toContain(join(linux.ws, 'dependencies'));
 
         const darwin = await configFor('darwin');
@@ -326,6 +328,56 @@ describe('createCheckpointSessionComposition', () => {
             join(darwin.ws, 'dependencies'),
             join(darwin.ws, 'large.bin'),
         ]));
+    });
+
+    it('keeps literal deny entries on Linux even when the project path contains glob characters', async () => {
+        const oddProjectPath = join(fixtureRoot, 'app[1]?');
+        await mkdir(oddProjectPath);
+        await writeFile(join(oddProjectPath, 'source.txt'), 'before');
+        await writeFile(join(oddProjectPath, 'large.bin'), 'x'.repeat(2048));
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'linux',
+            projectPath: oddProjectPath,
+            sessionId: 'session-odd',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+        if (!result.sandboxConfig || !result.providerPath) throw new Error('expected protected sandbox config');
+        const canonicalOddPath = await realpath(oddProjectPath);
+        expect(result.sandboxConfig.denyWritePaths).toEqual(expect.arrayContaining([
+            canonicalOddPath,
+            join(canonicalOddPath, 'large.bin'),
+            join(result.providerPath, 'large.bin'),
+        ]));
+        expect(result.sandboxConfig.denyWritePaths).not.toContain(join(canonicalOddPath, '**', '.env*'));
+    });
+
+    it('dispose removes an unused workspace reservation but never an active turn', async () => {
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-dispose',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+        if (!result.beforeTurn || !result.completeTurn || !result.providerPath || !result.dispose) {
+            throw new Error('expected protected turn lifecycle');
+        }
+        const reserved = result.providerPath;
+        const turn = await result.beforeTurn();
+        await result.dispose();
+        await expect(readFile(join(turn.providerPath, 'source.txt'), 'utf8')).resolves.toBe('before');
+        await result.completeTurn(async () => {});
+
+        const nextReserved = result.providerPath;
+        expect(nextReserved).not.toBe(reserved);
+        await result.dispose();
+        await expect(stat(nextReserved)).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(result.dispose()).resolves.toBeUndefined();
     });
 
     it('records a daemon-readable pending decision when policy drift blocks dispatch', async () => {
