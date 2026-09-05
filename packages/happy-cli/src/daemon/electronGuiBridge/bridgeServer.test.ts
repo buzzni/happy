@@ -152,6 +152,27 @@ describe('electron GUI bridge server', () => {
         expect(fake.stops()).toBe(1)
     })
 
+    // Hot reload (electronmon / electron-vite) restarts the whole main process;
+    // the new bridge can reach listen() while the old process still holds the
+    // port for a moment. Giving up on the first EADDRINUSE would leave the
+    // preview dead until the next manual restart.
+    it('retries listen while the port is still held by the previous process', async () => {
+        const { createServer } = await import('node:http')
+        const blocker = createServer()
+        await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve))
+        const address = blocker.address()
+        const port = typeof address === 'object' && address ? address.port : 0
+        setTimeout(() => blocker.close(), 400)
+        started = await createElectronGuiBridgeServer({
+            port,
+            host: '127.0.0.1',
+            source: fakeSource().source,
+            listenRetry: { attempts: 20, delayMs: 100 },
+        })
+        expect(started.port).toBe(port)
+        expect((await fetch(`http://127.0.0.1:${port}/vnc.html`)).status).toBe(200)
+    })
+
     it('stops a screencast whose start was still pending when the last viewer left', async () => {
         const slow = slowSource()
         started = await createElectronGuiBridgeServer({ port: 0, host: '127.0.0.1', source: slow.source })

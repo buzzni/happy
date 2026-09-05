@@ -124,11 +124,52 @@ function isSocketPath(pathname: string): boolean {
     return pathname.replace(/\/+$/, '').endsWith('/websockify')
 }
 
+/**
+ * Hot reload (electronmon / electron-vite) restarts the whole Electron main
+ * process, and the new bridge can reach listen() while the previous process
+ * is still tearing down and holding the stream port. Giving up on the first
+ * EADDRINUSE would leave the preview dead until the next manual restart, so
+ * the default keeps trying for ~10s.
+ */
+export const DEFAULT_LISTEN_RETRY = { attempts: 20, delayMs: 500 } as const
+
+function listenWithRetry(
+    server: Server,
+    port: number,
+    host: string,
+    retry: { attempts: number; delayMs: number },
+    log: (message: string) => void,
+): Promise<void> {
+    const attemptListen = () =>
+        new Promise<void>((resolve, reject) => {
+            const onError = (error: Error) => reject(error)
+            server.once('error', onError)
+            server.listen(port, host, () => {
+                server.off('error', onError)
+                resolve()
+            })
+        })
+    return (async () => {
+        for (let attempt = 1; ; attempt += 1) {
+            try {
+                await attemptListen()
+                return
+            } catch (error) {
+                const code = (error as NodeJS.ErrnoException).code
+                if (code !== 'EADDRINUSE' || attempt >= retry.attempts) throw error
+                if (attempt === 1) log(`port ${port} is still in use (previous process?); retrying`)
+                await new Promise((resolve) => setTimeout(resolve, retry.delayMs))
+            }
+        }
+    })()
+}
+
 export async function createElectronGuiBridgeServer(options: {
     port: number
     host: string
     source: ElectronGuiScreencastSource
     log?: (message: string) => void
+    listenRetry?: { attempts: number; delayMs: number }
 }): Promise<ElectronGuiBridgeServer> {
     const { source } = options
     const log = options.log ?? (() => {})
@@ -220,13 +261,7 @@ export async function createElectronGuiBridgeServer(options: {
         })
     })
 
-    await new Promise<void>((resolve, reject) => {
-        server.once('error', reject)
-        server.listen(options.port, options.host, () => {
-            server.off('error', reject)
-            resolve()
-        })
-    })
+    await listenWithRetry(server, options.port, options.host, options.listenRetry ?? DEFAULT_LISTEN_RETRY, log)
     const address = server.address()
     const port = typeof address === 'object' && address ? address.port : options.port
 
