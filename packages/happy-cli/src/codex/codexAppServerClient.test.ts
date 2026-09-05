@@ -785,6 +785,29 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('refuses to open the gate when the provider process will not exit', async () => {
+        // If codex never dies, bwrap still holds its mount points and the sandbox cleanup silently
+        // fails, so materializing the workspace would fail later with a confusing error. Fail closed.
+        vi.useFakeTimers();
+        try {
+            mockSpawn.mockImplementation(() => createMockProcess({ exitDelayMs: 60_000 }));
+            const beforeTurn = vi.fn(async () => {});
+            const { CodexAppServerClient } = await import('./codexAppServerClient');
+            const client = new CodexAppServerClient(sandboxConfig, beforeTurn);
+            const connecting = client.connect();
+            await vi.advanceTimersByTimeAsync(50);
+            await connecting;
+
+            const preparing = client.prepareProtectedTurn();
+            const assertion = expect(preparing).rejects.toThrow('did not exit');
+            await vi.advanceTimersByTimeAsync(10_000);
+            await assertion;
+            expect(beforeTurn).not.toHaveBeenCalled();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it('disconnects a running codex process before preparing the next protected turn', async () => {
         const order: string[] = [];
         mockSandboxCleanup.mockImplementation(async () => { order.push('sandbox-cleanup'); });

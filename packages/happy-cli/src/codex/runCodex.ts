@@ -663,6 +663,14 @@ export async function runCodex(opts: {
             // Stop Happy MCP server
             happyServer.stop();
 
+            // This RPC exits the process directly, so the loop's finally never runs — release the
+            // reserved checkpoint workspace here too. specs/linux-checkpoint-enforcement-backend R4.
+            try {
+                await checkpointComposition.dispose?.();
+            } catch (e) {
+                logger.debug('[Codex] Error disposing checkpoint reservation during termination', e);
+            }
+
             logger.debug('[Codex] Session termination complete, exiting');
             process.exit(0);
         } catch (error) {

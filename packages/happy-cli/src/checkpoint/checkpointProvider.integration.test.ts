@@ -92,6 +92,9 @@ describe.skipIf((process.platform !== 'darwin' && process.platform !== 'linux') 
                     ...('output' in event ? { output: event.output } : {}),
                 });
             });
+            // Mirror runCodex: the gate opens (and materializes) the turn workspace before codex is
+            // wrapped and spawned. specs/linux-checkpoint-enforcement-backend R4.
+            await client.prepareProtectedTurn();
             await client.connect();
             await client.startThread({
                 cwd: projectPath,

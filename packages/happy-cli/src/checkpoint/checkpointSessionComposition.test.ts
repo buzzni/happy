@@ -1,6 +1,6 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, sep } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SandboxConfigSchema } from '@/persistence';
 import { CHECKPOINT_SPAWN_CONTEXT_ENV_KEY } from './checkpointSpawnContext';
@@ -412,6 +412,39 @@ describe('createCheckpointSessionComposition', () => {
         expect(second.providerPath).toBe(result.providerPath);
         await expect(result.completeTurn(async () => {})).resolves.toMatchObject({ status: 'completed' });
         await expect(result.abortTurn()).resolves.toBeUndefined();
+    });
+
+    it('abortTurn preserves the sealed workspace of a partially applied turn', async () => {
+        // A partial apply keeps activeTurn and the sealed copy so the failed files can be retried
+        // from the journal. The abort path must not confuse that with a turn that was never sent.
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-partial',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+        if (!result.beforeTurn || !result.completeTurn || !result.abortTurn) {
+            throw new Error('expected protected turn lifecycle');
+        }
+        const turn = await result.beforeTurn();
+        await writeFile(join(turn.providerPath, 'source.txt'), 'agent change');
+        // Make the original unwritable so the applier reports a failed mutation (status: partial).
+        await chmod(projectPath, 0o555);
+        try {
+            await expect(result.completeTurn(async () => {})).resolves.toMatchObject({ status: 'partial' });
+        } finally {
+            await chmod(projectPath, 0o755);
+        }
+        const sealedPath = join(dirname(turn.providerPath), 'sealed');
+        await expect(readFile(join(sealedPath, 'source.txt'), 'utf8')).resolves.toBe('agent change');
+
+        await result.abortTurn();
+
+        // The apply input survives: a partial turn is recoverable, not discardable.
+        await expect(readFile(join(sealedPath, 'source.txt'), 'utf8')).resolves.toBe('agent change');
     });
 
     it('records a daemon-readable pending decision when policy drift blocks dispatch', async () => {

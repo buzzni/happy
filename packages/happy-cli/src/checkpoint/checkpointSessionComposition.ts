@@ -143,6 +143,10 @@ export async function createCheckpointSessionComposition(input: {
     };
     let activeTurn: CheckpointTurnPreparation | null = null;
     let frozenWorkspacePath: string | null = null;
+    // 'prepared' — the gate opened the turn but no apply has started, so it can still be discarded.
+    // 'applying'  — freeze/apply has begun; a partial result keeps the sealed copy for a retry and
+    //               must never be deleted by the abort path.
+    let turnPhase: 'idle' | 'prepared' | 'applying' = 'idle';
     let acceptsProtectedWriters = false;
     const protectedWriterTree = new CheckpointWriterProcessTree();
     const beforeTurn = async () => {
@@ -198,6 +202,7 @@ export async function createCheckpointSessionComposition(input: {
             claudeSandbox,
         };
         acceptsProtectedWriters = true;
+        turnPhase = 'prepared';
         return activeTurn;
     };
     const protectedBashCwd = () => acceptsProtectedWriters ? activeTurn?.providerPath ?? null : null;
@@ -206,6 +211,7 @@ export async function createCheckpointSessionComposition(input: {
             throw new Error('checkpoint protected turn is not active');
         }
         acceptsProtectedWriters = false;
+        turnPhase = 'applying';
         await quiesceWriters();
         await protectedWriterTree.quiesce(() => {});
         const completedTurn = activeTurn;
@@ -246,6 +252,7 @@ export async function createCheckpointSessionComposition(input: {
             });
             activeTurn = null;
             frozenWorkspacePath = null;
+            turnPhase = 'idle';
             await rotateProviderPath();
         }
         return result;
@@ -256,14 +263,22 @@ export async function createCheckpointSessionComposition(input: {
     // exit) has to be discarded: its snapshot stays in the store as history, but the materialized
     // workspace is removed and the writable path rotates so it is never reused.
     const abortTurn = async () => {
-        if (!activeTurn) return;
+        // Only a turn that never reached apply is discardable. A partial apply keeps its sealed
+        // workspace and operation id so the journal can retry the failed files.
+        if (!activeTurn || turnPhase !== 'prepared') return;
         const abandoned = activeTurn;
         acceptsProtectedWriters = false;
         await protectedWriterTree.quiesce(() => {});
-        activeTurn = null;
-        frozenWorkspacePath = null;
-        await turnWorkspace.remove({ ...workspaceBinding, operationId: abandoned.operationId });
-        await rotateProviderPath();
+        // Deleting is best effort: a leftover directory is recoverable, but failing to rotate would
+        // wedge the session on 'checkpoint protected turn is already active'.
+        try {
+            await turnWorkspace.remove({ ...workspaceBinding, operationId: abandoned.operationId });
+        } finally {
+            activeTurn = null;
+            frozenWorkspacePath = null;
+            turnPhase = 'idle';
+            await rotateProviderPath();
+        }
     };
     // specs/linux-checkpoint-enforcement-backend R4 — reserve() leaves an empty directory for the next
     // turn; a session that ends without starting it must not leak that directory.

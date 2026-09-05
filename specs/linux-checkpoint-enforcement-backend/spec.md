@@ -89,7 +89,10 @@ Linux의 잔여 위험: (a) glob 전용 신규 secret 내용이 daemon 소유 wo
   실제로 종료될 때까지 기다린 뒤**(살아 있는 bwrap이 잡고 있는 mount-point는 지울 수 없다) sandbox
   cleanup을 돌리고, 그 다음 gate를 돌린 뒤에 wrap·spawn 한다. 실제 dispatch 경로인
   `sendTurnAndWait`(그리고 `sendTurn`)가 이미 열린 turn을 소비하고 gate를 두 번 돌리지 않는다.
-  dispatch되지 않고 끝난 turn은 `composition.abortTurn()`이 workspace를 지우고 경로를 회전시킨다. Claude remote는 Bash 명령마다 bwrap을
+  dispatch되지 않고 끝난 turn은 `composition.abortTurn()`이 workspace를 지우고 경로를 회전시킨다.
+  **abort는 아직 apply가 시작되지 않은 turn에만 적용한다** — `partial` apply는 sealed workspace와
+  operation id를 재시도용으로 남기므로 폐기 대상이 아니다. 프로세스가 상한 안에 종료되지 않으면
+  gate를 열지 않고 실패한다(fail-closed). Claude remote는 Bash 명령마다 bwrap을
   띄우고 그 명령이 항상 prepare 뒤에 실행되므로 이 순서 문제가 없다.
 - Phase 0 Linux 테스트는 운영과 같은 **wrap → beforeTurn 순서**를 보존해야 이 결함이 잡힌다
   (기존 macOS 테스트 `checkpointSandbox.integration.test.ts:113`이 같은 순서).

@@ -943,12 +943,25 @@ export class CodexAppServerClient {
         }
 
         if (opts?.awaitProcessExit && proc && proc.exitCode == null && proc.signalCode == null) {
-            // Bounded: the SIGKILL timer above fires at 2s, so this resolves either way.
-            await new Promise<void>((resolve) => {
-                const done = () => resolve();
-                proc.once('exit', done);
-                setTimeout(done, CodexAppServerClient.PROCESS_EXIT_WAIT_MS).unref();
-            });
+            // The SIGKILL timer above fires at 2s; anything still alive after the cap is unkillable
+            // (uninterruptible I/O), and its bwrap mount points cannot be released. Fail closed
+            // rather than run the sandbox cleanup — and the next gate — on a stale process.
+            let exitTimer: ReturnType<typeof setTimeout> | undefined;
+            let onExit: (() => void) | undefined;
+            try {
+                await new Promise<void>((resolve, reject) => {
+                    onExit = () => resolve();
+                    proc.once('exit', onExit);
+                    exitTimer = setTimeout(
+                        () => reject(new Error('Codex process did not exit before the sandbox cleanup')),
+                        CodexAppServerClient.PROCESS_EXIT_WAIT_MS,
+                    );
+                    exitTimer.unref();
+                });
+            } finally {
+                if (exitTimer) clearTimeout(exitTimer);
+                if (onExit) proc.off('exit', onExit);
+            }
         }
 
         if (this.sandboxCleanup) {
