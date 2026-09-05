@@ -1,11 +1,16 @@
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cachedLinuxSandboxDependencyStatus } from '@/sandbox/dependencyPreflight';
 import { injectCheckpointSpawnContext } from '@/checkpoint/checkpointSpawnContext';
 import { CheckpointProtectionStateStore } from '@/checkpoint/checkpointProtectionState';
 import { SandboxConfigSchema } from '@/persistence';
 import { resolveCheckpointSessionAuthority } from './checkpointSessionAuthority';
+
+vi.mock('@/sandbox/dependencyPreflight', () => ({
+    cachedLinuxSandboxDependencyStatus: vi.fn(() => ({ ok: true })),
+}));
 import { captureSaycodeAgentEnvironment } from './sessionEnv';
 import type { TrackedSession } from './types';
 
@@ -103,11 +108,33 @@ describe('resolveCheckpointSessionAuthority', () => {
             sessionId: 'session-1',
             trackedSession: trackedSession(),
             checkpointRoot,
-            platform: 'linux',
+            platform: 'win32',
         })).resolves.toMatchObject({
             protection: { status: 'unavailable', reason: 'unsupported-platform' },
             excludedPaths: [],
             excludedPatterns: [],
+        });
+    });
+
+    // specs/linux-checkpoint-enforcement-backend R1/R2
+    it('advertises Linux protection only when the bubblewrap dependencies are present', async () => {
+        vi.mocked(cachedLinuxSandboxDependencyStatus).mockReturnValueOnce({ ok: false, missing: ['socat'] });
+        await expect(resolveCheckpointSessionAuthority({
+            sessionId: 'session-1',
+            trackedSession: trackedSession(),
+            checkpointRoot,
+            platform: 'linux',
+        })).resolves.toMatchObject({
+            protection: { status: 'unavailable', reason: 'unsupported-platform' },
+        });
+        await expect(resolveCheckpointSessionAuthority({
+            sessionId: 'session-1',
+            trackedSession: trackedSession(),
+            checkpointRoot,
+            platform: 'linux',
+        })).resolves.toMatchObject({
+            protection: { status: 'protected' },
+            excludedPatterns: ['**/.env*'],
         });
     });
 

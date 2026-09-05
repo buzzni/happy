@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { reportSandboxDependencyPreflight } from './dependencyPreflight';
+import {
+  probeLinuxSandboxDependencies,
+  reportSandboxDependencyPreflight,
+} from './dependencyPreflight';
 
 // 2026-08-28 프로덕션 — 이 머신에 socat 이 없어 bwrap 초기화가 실패했고, 그 사실이
 // AgentTask 워커가 실제로 뜰 때까지 드러나지 않았다. 증상은 몇 분 뒤 exec_command
@@ -70,5 +73,44 @@ describe('reportSandboxDependencyPreflight', () => {
 
     expect(ok).toBe(true);
     expect(logs.join('\n')).toContain('boom');
+  });
+});
+
+// specs/linux-checkpoint-enforcement-backend R2/R9 — the checkpoint capability gate reuses the same
+// srt probe but must fail closed on exceptions and must not carry srt's raw error text (it is logged
+// with only binary names).
+describe('probeLinuxSandboxDependencies', () => {
+  it('reports ok when srt has no errors, ignoring warnings', () => {
+    expect(probeLinuxSandboxDependencies(() => ({
+      errors: [],
+      warnings: ['seccomp not available - unix socket access not restricted'],
+    }))).toEqual({ ok: true });
+  });
+
+  it('maps srt error strings to bare binary names only', () => {
+    expect(probeLinuxSandboxDependencies(() => ({
+      errors: ['bubblewrap (bwrap) not installed', 'socat not installed', 'ripgrep (rg) not found'],
+      warnings: [],
+    }))).toEqual({ ok: false, missing: ['bwrap', 'socat', 'rg'] });
+  });
+
+  it('logs only fixed codes and binary names, never srt text', () => {
+    const logs: string[] = [];
+    probeLinuxSandboxDependencies(() => ({
+      errors: ['bubblewrap (bwrap) not installed at /opt/secret/bin'],
+      warnings: ['seccomp not available - unix socket access not restricted'],
+    }), (message) => logs.push(message));
+    expect(logs).toEqual([
+      '[checkpoint] Linux sandbox warning: seccomp-unavailable (unix sockets unrestricted)',
+      '[checkpoint] Linux sandbox dependencies missing: bwrap; protection unavailable',
+    ]);
+    expect(logs.join('\n')).not.toContain('/opt/secret');
+  });
+
+  it('fails closed when the probe throws or reports an unrecognized error', () => {
+    expect(probeLinuxSandboxDependencies(() => { throw new Error('/usr/bin/which: EACCES /secret/path'); }))
+      .toEqual({ ok: false, missing: ['probe-failed'] });
+    expect(probeLinuxSandboxDependencies(() => ({ errors: ['Unsupported platform'], warnings: [] })))
+      .toEqual({ ok: false, missing: ['unsupported-platform'] });
   });
 });

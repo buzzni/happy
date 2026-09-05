@@ -663,6 +663,14 @@ export async function runCodex(opts: {
             // Stop Happy MCP server
             happyServer.stop();
 
+            // This RPC exits the process directly, so the loop's finally never runs — release the
+            // reserved checkpoint workspace here too. specs/linux-checkpoint-enforcement-backend R4.
+            try {
+                await checkpointComposition.dispose?.();
+            } catch (e) {
+                logger.debug('[Codex] Error disposing checkpoint reservation during termination', e);
+            }
+
             logger.debug('[Codex] Session termination complete, exiting');
             process.exit(0);
         } catch (error) {
@@ -728,6 +736,7 @@ export async function runCodex(opts: {
         checkpointComposition.sandboxConfig,
         checkpointComposition.beforeTurn,
         checkpointComposition.completeTurn,
+        checkpointComposition.markTurnDispatched,
     );
 
     registerCodexSteerHandler({
@@ -1171,11 +1180,18 @@ export async function runCodex(opts: {
             }
 
             try {
-                if (checkpointComposition.completeTurn && !client.isConnected) {
-                    const expectedThreadId = client.threadId;
-                    const resumed = await client.reconnectAndResumeThread();
-                    if (expectedThreadId && !resumed) {
-                        throw new Error('checkpoint protection could not resume the Codex thread');
+                if (checkpointComposition.completeTurn) {
+                    // specs/linux-checkpoint-enforcement-backend R4 — open the checkpoint turn (and
+                    // materialize its workspace) before codex is wrapped and spawned. On Linux bwrap
+                    // binds mount points into the writable root the moment it starts, so a workspace
+                    // prepared afterwards would be materialized into a non-empty directory.
+                    await client.prepareProtectedTurn();
+                    if (!client.isConnected) {
+                        const expectedThreadId = client.threadId;
+                        const resumed = await client.reconnectAndResumeThread();
+                        if (expectedThreadId && !resumed) {
+                            throw new Error('checkpoint protection could not resume the Codex thread');
+                        }
                     }
                 }
                 // Map permission mode to approval policy and sandbox.
@@ -1372,6 +1388,16 @@ export async function runCodex(opts: {
                     session.sendSessionProtocolMessage(envelope);
                 }
             } finally {
+                // specs/linux-checkpoint-enforcement-backend R4 — the checkpoint turn is opened before
+                // codex is spawned, so a message that never reached completeTurn (refused turn, resume
+                // failure, thrown dispatch) would otherwise leave the turn open and block the next gate.
+                // abortTurn() no-ops after a completed turn.
+                client.abortPreparedTurn();
+                try {
+                    await checkpointComposition.abortTurn?.();
+                } catch (error) {
+                    logger.debug('[codex]: checkpoint abortTurn failed', error);
+                }
                 // Reset permission handler, reasoning processor, and diff processor
                 permissionHandler.reset();
                 reasoningProcessor.abort();  // Use abort to properly finish any in-progress tool calls
@@ -1417,6 +1443,7 @@ export async function runCodex(opts: {
         }
         logger.debug('[codex]: client.disconnect begin');
         await client.disconnect();
+        await checkpointComposition.dispose?.();
         logger.debug('[codex]: client.disconnect done');
         // Stop Happy MCP server
         logger.debug('[codex]: happyServer.stop');

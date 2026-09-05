@@ -29,6 +29,12 @@ export type CheckpointSessionComposition = {
     completeTurn?: (quiesceWriters: () => Promise<void>) => Promise<CheckpointTurnApplyResult>;
     protectedBashCwd?: () => string | null;
     trackProtectedWriter?: (child: ChildProcess) => void;
+    /** Removes a reserved-but-unused provider workspace; an active turn is left untouched. */
+    dispose?: () => Promise<void>;
+    /** Discards a turn that was opened but never dispatched, then rotates to a fresh workspace. */
+    abortTurn?: () => Promise<void>;
+    /** Marks the open turn as sent to the provider: its result is no longer discardable. */
+    markTurnDispatched?: () => void;
     claudeSandbox?: QueryOptions['sandbox'];
 };
 
@@ -90,15 +96,27 @@ export async function createCheckpointSessionComposition(input: {
     }
 
     const turnWorkspace = new CheckpointTurnWorkspace(canonicalCheckpointRoot);
+    // specs/linux-checkpoint-enforcement-backend R3/R8 — bubblewrap cannot enforce glob deny
+    // entries (it only leaves ws/** mount-point residue) and refuses to start when a deny entry is
+    // a symlink inside the writable workspace. The passthrough target is already read-only through
+    // the root ro-bind, so dropping these two kinds on Linux removes no guarantee. The selection is
+    // by *source* (pattern-derived entries, passthrough entries), never by inspecting literal paths:
+    // a project path may legitimately contain '[' or '?'.
+    const linux = input.platform === 'linux';
+    const patternEntries = (root: string) => runtime.excludedPatterns.map((pattern) => join(root, pattern));
     const sandboxConfigFor = (path: string): SandboxConfig => ({
         ...inputSandboxConfig,
         sessionIsolation: 'custom',
         customWritePaths: [path],
         denyWritePaths: [...new Set([
             ...inputSandboxConfig.denyWritePaths,
-            ...runtime.denyWritePaths,
-            ...runtime.excludedPaths.map((excludedPath) => join(path, excludedPath)),
-            ...runtime.excludedPatterns.map((pattern) => join(path, pattern)),
+            ...(linux
+                ? runtime.denyWritePaths.filter((entry) => !patternEntries(canonicalProjectPath).includes(entry))
+                : runtime.denyWritePaths),
+            ...runtime.excludedPaths
+                .filter((excludedPath) => !linux || !runtime.readOnlyPassthroughPaths.includes(excludedPath))
+                .map((excludedPath) => join(path, excludedPath)),
+            ...(linux ? [] : patternEntries(path)),
             canonicalProjectPath,
         ])],
     });
@@ -114,24 +132,32 @@ export async function createCheckpointSessionComposition(input: {
         };
     };
     let nextOperationId = randomUUID();
-    let providerPath = turnWorkspace.pathFor({ ...workspaceBinding, operationId: nextOperationId });
+    let providerPath = (await turnWorkspace.reserve({ ...workspaceBinding, operationId: nextOperationId })).path;
     const sandboxConfig = sandboxConfigFor(providerPath);
     const claudeSandbox: QueryOptions['sandbox'] | undefined = input.provider === 'claude-remote'
         ? claudeSandboxFor(sandboxConfig, providerPath)
         : undefined;
-    const rotateProviderPath = () => {
+    const rotateProviderPath = async () => {
         nextOperationId = randomUUID();
-        providerPath = turnWorkspace.pathFor({ ...workspaceBinding, operationId: nextOperationId });
+        providerPath = (await turnWorkspace.reserve({ ...workspaceBinding, operationId: nextOperationId })).path;
         Object.assign(sandboxConfig, sandboxConfigFor(providerPath));
         if (claudeSandbox) Object.assign(claudeSandbox, claudeSandboxFor(sandboxConfig, providerPath));
     };
     let activeTurn: CheckpointTurnPreparation | null = null;
     let frozenWorkspacePath: string | null = null;
+    // 'prepared'   — the gate opened the turn but nothing was sent yet, so it is discardable.
+    // 'dispatched' — the prompt reached the provider; it may already have written files, so the
+    //                workspace is preserved even when the turn ends in an error or a timeout.
+    // 'applying'   — freeze/apply has begun; a partial result keeps the sealed copy for a retry.
+    let turnPhase: 'idle' | 'prepared' | 'dispatched' | 'applying' = 'idle';
     let acceptsProtectedWriters = false;
     const protectedWriterTree = new CheckpointWriterProcessTree();
     const beforeTurn = async () => {
         if (activeTurn) {
-            throw new Error('checkpoint protected turn is already active');
+            throw new Error(
+                'checkpoint protected turn is already active — the previous turn did not finish; '
+                + 'restart the session to open a new one',
+            );
         }
         const operationId = nextOperationId;
         const currentProtection = await protectionState.read({
@@ -182,6 +208,7 @@ export async function createCheckpointSessionComposition(input: {
             claudeSandbox,
         };
         acceptsProtectedWriters = true;
+        turnPhase = 'prepared';
         return activeTurn;
     };
     const protectedBashCwd = () => acceptsProtectedWriters ? activeTurn?.providerPath ?? null : null;
@@ -192,6 +219,9 @@ export async function createCheckpointSessionComposition(input: {
         acceptsProtectedWriters = false;
         await quiesceWriters();
         await protectedWriterTree.quiesce(() => {});
+        // Only once the writers are quiescent: a failed quiesce leaves the turn dispatched (its work
+        // is preserved) rather than stuck in a phase that neither aborts nor completes.
+        turnPhase = 'applying';
         const completedTurn = activeTurn;
         if (!frozenWorkspacePath) {
             frozenWorkspacePath = (await turnWorkspace.freeze({
@@ -230,11 +260,43 @@ export async function createCheckpointSessionComposition(input: {
             });
             activeTurn = null;
             frozenWorkspacePath = null;
-            rotateProviderPath();
+            turnPhase = 'idle';
+            await rotateProviderPath();
         }
         return result;
     };
     const trackProtectedWriter = (child: ChildProcess) => protectedWriterTree.track(child);
+    const markTurnDispatched = () => {
+        if (turnPhase === 'prepared') turnPhase = 'dispatched';
+    };
+    // specs/linux-checkpoint-enforcement-backend R4 — the gate opens the turn before the provider
+    // process exists, so a turn that is never dispatched (reconnect failure, refused turn, session
+    // exit) has to be discarded: its snapshot stays in the store as history, but the materialized
+    // workspace is removed and the writable path rotates so it is never reused.
+    const abortTurn = async () => {
+        // Only a turn that never reached apply is discardable. A partial apply keeps its sealed
+        // workspace and operation id so the journal can retry the failed files.
+        if (!activeTurn || turnPhase !== 'prepared') return;
+        const abandoned = activeTurn;
+        acceptsProtectedWriters = false;
+        await protectedWriterTree.quiesce(() => {});
+        // Deleting is best effort: a leftover directory is recoverable, but failing to rotate would
+        // wedge the session on 'checkpoint protected turn is already active'.
+        try {
+            await turnWorkspace.remove({ ...workspaceBinding, operationId: abandoned.operationId });
+        } finally {
+            activeTurn = null;
+            frozenWorkspacePath = null;
+            turnPhase = 'idle';
+            await rotateProviderPath();
+        }
+    };
+    // specs/linux-checkpoint-enforcement-backend R4 — reserve() leaves an empty directory for the next
+    // turn; a session that ends without starting it must not leak that directory.
+    const dispose = async () => {
+        if (activeTurn) return;
+        await turnWorkspace.remove({ ...workspaceBinding, operationId: nextOperationId });
+    };
     if (input.provider !== 'claude-remote') {
         return {
             sandboxConfig,
@@ -243,6 +305,9 @@ export async function createCheckpointSessionComposition(input: {
             completeTurn,
             protectedBashCwd,
             trackProtectedWriter,
+            dispose,
+            abortTurn,
+            markTurnDispatched,
         };
     }
 
@@ -253,6 +318,9 @@ export async function createCheckpointSessionComposition(input: {
         completeTurn,
         protectedBashCwd,
         trackProtectedWriter,
+        dispose,
+        abortTurn,
+        markTurnDispatched,
         claudeSandbox,
     };
 }

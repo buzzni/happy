@@ -235,6 +235,7 @@ export class CodexAppServerClient {
     private sandboxConfig?: SandboxConfig;
     private readonly beforeTurn?: () => Promise<CheckpointTurnPreparation | void>;
     private readonly completeTurn?: CheckpointSessionComposition['completeTurn'];
+    private readonly markTurnDispatched?: () => void;
     private readonly protectedWriterTree: CheckpointWriterProcessTree | null;
     private sandboxCleanup: (() => Promise<void>) | null = null;
     private multiAuthProxy: PreparedCodexMultiAuthProxy | null = null;
@@ -306,14 +307,24 @@ export class CodexAppServerClient {
     private eventHandler: ((msg: EventMsg) => void) | null = null;
     private approvalHandler: ApprovalHandler | null = null;
 
+    // specs/linux-checkpoint-enforcement-backend R4 — the turn workspace materialized by beforeTurn()
+    // must exist before the wrapped process starts: bubblewrap binds a mount point on the host for
+    // every non-existent deny path the moment bwrap runs, which would leave the freshly reserved
+    // workspace non-empty. prepareProtectedTurn() runs the gate first and sendTurnAndWait() consumes
+    // the result instead of running the gate a second time.
+    private preparedTurn: CheckpointTurnPreparation | null = null;
+    private static readonly PROCESS_EXIT_WAIT_MS = 5_000;
+
     constructor(
         sandboxConfig?: SandboxConfig,
         beforeTurn?: () => Promise<CheckpointTurnPreparation | void>,
         completeTurn?: CheckpointSessionComposition['completeTurn'],
+        markTurnDispatched?: () => void,
     ) {
         this.sandboxConfig = sandboxConfig;
         this.beforeTurn = beforeTurn;
         this.completeTurn = completeTurn;
+        this.markTurnDispatched = markTurnDispatched;
         this.protectedWriterTree = completeTurn ? new CheckpointWriterProcessTree() : null;
     }
 
@@ -865,6 +876,12 @@ export class CodexAppServerClient {
     private async disconnectInternal(opts?: {
         preserveThreadState?: boolean;
         preservePendingTurnCompletion?: boolean;
+        /**
+         * Wait for the provider process to exit before running the sandbox cleanup. On Linux the
+         * cleanup removes the bwrap mount points from the writable workspace, and those cannot be
+         * unlinked while bwrap still holds them. specs/linux-checkpoint-enforcement-backend R4/R7.
+         */
+        awaitProcessExit?: boolean;
     }): Promise<void> {
         if (!this.connected
             && !this.process
@@ -895,6 +912,28 @@ export class CodexAppServerClient {
             }, 2000);
             killTimer.unref();
             proc?.once('exit', () => clearTimeout(killTimer));
+        }
+
+        if (opts?.awaitProcessExit && proc && proc.exitCode == null && proc.signalCode == null) {
+            // The SIGKILL timer above fires at 2s; anything still alive after the cap is unkillable
+            // (uninterruptible I/O), and its bwrap mount points cannot be released. Fail closed
+            // rather than run the sandbox cleanup — and the next gate — on a stale process.
+            let exitTimer: ReturnType<typeof setTimeout> | undefined;
+            let onExit: (() => void) | undefined;
+            try {
+                await new Promise<void>((resolve, reject) => {
+                    onExit = () => resolve();
+                    proc.once('exit', onExit);
+                    exitTimer = setTimeout(
+                        () => reject(new Error('Codex process did not exit before the sandbox cleanup')),
+                        CodexAppServerClient.PROCESS_EXIT_WAIT_MS,
+                    );
+                    exitTimer.unref();
+                });
+            } finally {
+                if (exitTimer) clearTimeout(exitTimer);
+                if (onExit) proc.off('exit', onExit);
+            }
         }
 
         this.process = null;
@@ -943,6 +982,32 @@ export class CodexAppServerClient {
 
     async disconnect(): Promise<void> {
         await this.disconnectInternal();
+    }
+
+    /**
+     * Opens the next protected turn before the provider process exists. Stops a running codex first
+     * so its sandbox cleanup removes any bwrap mount points from the reserved workspace, then runs
+     * the checkpoint gate. Returns null when the session is not protected.
+     * specs/linux-checkpoint-enforcement-backend R4
+     */
+    /** Drops a cached preparation that will not be dispatched; the composition owns the cleanup. */
+    abortPreparedTurn(): void {
+        this.preparedTurn = null;
+    }
+
+    async prepareProtectedTurn(): Promise<CheckpointTurnPreparation | null> {
+        if (!this.beforeTurn) return null;
+        if (this.preparedTurn) return this.preparedTurn;
+        if (this.connected || this.process) {
+            await this.disconnectInternal({
+                preserveThreadState: true,
+                preservePendingTurnCompletion: true,
+                awaitProcessExit: true,
+            });
+        }
+        const preparation = await this.beforeTurn();
+        this.preparedTurn = preparation ?? null;
+        return this.preparedTurn;
     }
 
     private cleanupMultiAuthProxy(): Promise<void> {
@@ -1460,7 +1525,11 @@ export class CodexAppServerClient {
             throw new Error('No active thread. Call startThread first.');
         }
 
-        const turnPreparation = await this.resolveBeforeTurn(opts)?.();
+        const turnPreparation = this.consumePreparedTurn(opts)
+            ?? await this.resolveBeforeTurn(opts)?.();
+        // From here the prompt goes to the provider: whatever happens next, the turn's workspace is
+        // no longer discardable. specs/linux-checkpoint-enforcement-backend R4.
+        this.markTurnDispatched?.();
         const effectiveOpts = applyCheckpointTurnPreparation(opts, turnPreparation);
 
         const extraInputItems = opts?.extraInputItems ?? [];
@@ -1548,7 +1617,11 @@ export class CodexAppServerClient {
         // Clear any stale watchdog snapshot so it can only describe this turn's abort.
         this.pendingInactivityAbort = null;
 
-        const turnPreparation = await this.resolveBeforeTurn(opts)?.();
+        const turnPreparation = this.consumePreparedTurn(opts)
+            ?? await this.resolveBeforeTurn(opts)?.();
+        // From here the prompt goes to the provider: whatever happens next, the turn's workspace is
+        // no longer discardable. specs/linux-checkpoint-enforcement-backend R4.
+        this.markTurnDispatched?.();
         const effectiveOpts = applyCheckpointTurnPreparation(opts, turnPreparation);
 
         const timeoutMs = opts?.turnTimeoutMs ?? CodexAppServerClient.TURN_TIMEOUT_MS;
@@ -1583,6 +1656,7 @@ export class CodexAppServerClient {
                 }
                 await this.protectedWriterTree.quiesce(() => this.disconnectInternal({
                     preserveThreadState: true,
+                    awaitProcessExit: true,
                 }));
             });
             if (applyResult.status !== 'completed') {
@@ -1598,6 +1672,16 @@ export class CodexAppServerClient {
         return opts && Object.prototype.hasOwnProperty.call(opts, 'beforeTurn')
             ? opts.beforeTurn
             : this.beforeTurn;
+    }
+
+    /** An explicit per-call beforeTurn overrides the pre-opened turn, matching resolveBeforeTurn. */
+    private consumePreparedTurn(
+        opts: { beforeTurn?: () => Promise<CheckpointTurnPreparation | void> } | undefined,
+    ): CheckpointTurnPreparation | null {
+        if (opts && Object.prototype.hasOwnProperty.call(opts, 'beforeTurn')) return null;
+        const preparation = this.preparedTurn;
+        this.preparedTurn = null;
+        return preparation;
     }
 
     async steerTurn(prompt: string): Promise<void> {

@@ -48,3 +48,42 @@ export function reportSandboxDependencyPreflight(
   );
   return false;
 }
+
+// specs/linux-checkpoint-enforcement-backend R2/R9 — the checkpoint capability gate on Linux.
+// Fails closed on exceptions (unlike the startup preflight above, which is diagnostic only) and
+// reduces srt's messages to bare binary names so callers can log them without leaking paths.
+export type LinuxSandboxDependencyStatus = { ok: true } | { ok: false; missing: string[] };
+
+const KNOWN_BINARIES = ['bwrap', 'socat', 'rg'] as const;
+
+export function probeLinuxSandboxDependencies(
+  check: () => { errors: string[]; warnings: string[] } = () => SandboxManager.checkDependencies(),
+  log: (message: string) => void = () => {},
+): LinuxSandboxDependencyStatus {
+  let result: { errors: string[]; warnings: string[] };
+  try {
+    result = check();
+  } catch {
+    log('[checkpoint] Linux sandbox dependency probe failed; protection unavailable');
+    return { ok: false, missing: ['probe-failed'] };
+  }
+  if (result.warnings.length > 0) {
+    // srt only warns about the seccomp filter today; keep the log to fixed codes, never srt text.
+    log('[checkpoint] Linux sandbox warning: seccomp-unavailable (unix sockets unrestricted)');
+  }
+  if (result.errors.length === 0) return { ok: true };
+  const missing = [...new Set(result.errors.map((error) => (
+    KNOWN_BINARIES.find((binary) => new RegExp(`\\b${binary}\\b`).test(error))
+      ?? (error === 'Unsupported platform' ? 'unsupported-platform' : 'unknown')
+  )))];
+  log(`[checkpoint] Linux sandbox dependencies missing: ${missing.join(', ')}; protection unavailable`);
+  return { ok: false, missing };
+}
+
+let cachedStatus: LinuxSandboxDependencyStatus | null = null;
+
+/** Memoized for the daemon lifetime — the checkpoint authority re-resolves on every RPC. */
+export function cachedLinuxSandboxDependencyStatus(): LinuxSandboxDependencyStatus {
+  cachedStatus ??= probeLinuxSandboxDependencies(undefined, (message) => console.warn(message));
+  return cachedStatus;
+}

@@ -2,6 +2,10 @@ import { createHash } from 'node:crypto';
 import { lstat, readFile, readdir, realpath } from 'node:fs/promises';
 import { join, relative, resolve, sep } from 'node:path';
 import ignore, { type Ignore } from 'ignore';
+import {
+    cachedLinuxSandboxDependencyStatus,
+    type LinuxSandboxDependencyStatus,
+} from '@/sandbox/dependencyPreflight';
 import type { CheckpointEventDetail } from './checkpointContract';
 
 export type CheckpointProvider = 'claude-remote' | 'codex' | string;
@@ -43,14 +47,32 @@ export class CheckpointPolicyDriftError extends Error {
 export function resolveCheckpointProtectionCapability(input: {
     platform: NodeJS.Platform;
     provider: CheckpointProvider;
+    // specs/linux-checkpoint-enforcement-backend R2 — injectable for tests; defaults to the
+    // daemon-lifetime cached @anthropic-ai/sandbox-runtime probe.
+    linuxSandboxDependencies?: () => LinuxSandboxDependencyStatus;
 }): CheckpointProtectionCapability {
-    if (input.platform !== 'darwin') {
+    if (input.platform !== 'darwin' && input.platform !== 'linux') {
+        return { supported: false, reason: 'unsupported-platform' };
+    }
+    if (input.platform === 'linux' && !linuxSandboxReady(input.linuxSandboxDependencies)) {
+        // Missing bubblewrap/socat/ripgrep reuses 'unsupported-platform': Desktop parses the
+        // reason enum as a closed set and remote daemons are installed unpinned (spec R6).
         return { supported: false, reason: 'unsupported-platform' };
     }
     if (input.provider !== 'claude-remote' && input.provider !== 'codex') {
         return { supported: false, reason: 'unsupported-provider' };
     }
     return { supported: true };
+}
+
+function linuxSandboxReady(
+    probe: () => LinuxSandboxDependencyStatus = cachedLinuxSandboxDependencyStatus,
+): boolean {
+    try {
+        return probe().ok;
+    } catch {
+        return false;
+    }
 }
 
 export class CheckpointExclusionGuard {

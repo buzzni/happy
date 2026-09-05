@@ -1,11 +1,15 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, sep } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SandboxConfigSchema } from '@/persistence';
 import { CHECKPOINT_SPAWN_CONTEXT_ENV_KEY } from './checkpointSpawnContext';
 import { CheckpointProtectionStateStore } from './checkpointProtectionState';
 import { createCheckpointSessionComposition } from './checkpointSessionComposition';
+
+vi.mock('@/sandbox/dependencyPreflight', () => ({
+    cachedLinuxSandboxDependencyStatus: vi.fn(() => ({ ok: true })),
+}));
 
 describe('createCheckpointSessionComposition', () => {
     let fixtureRoot: string;
@@ -73,7 +77,7 @@ describe('createCheckpointSessionComposition', () => {
         })).rejects.toThrow('authoritative checkpoint spawn context');
         await expect(createCheckpointSessionComposition({
             provider: 'codex',
-            platform: 'linux',
+            platform: 'win32',
             projectPath,
             sessionId: 'session-1',
             sandboxConfig,
@@ -250,6 +254,226 @@ describe('createCheckpointSessionComposition', () => {
         expect(second.checkpointId).not.toBe(first.checkpointId);
         await expect(readFile(join(second.providerPath, 'source.txt'), 'utf8')).resolves.toBe('first turn');
         await result.completeTurn(async () => {});
+    });
+
+    it('reserves the provider workspace directory before the first turn and after each rotation', async () => {
+        // specs/linux-checkpoint-enforcement-backend R4 — Codex wraps its sandbox in connect(), before
+        // beforeTurn() materializes the workspace. Linux bubblewrap skips allowWrite paths that do not
+        // exist yet, so the reserved path must already be a directory when the sandbox is built.
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-1',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+        if (!result.beforeTurn || !result.completeTurn || !result.providerPath) throw new Error('expected protected turn lifecycle');
+
+        await expect(stat(result.providerPath)).resolves.toMatchObject({ mode: expect.any(Number) });
+        expect((await stat(result.providerPath)).isDirectory()).toBe(true);
+        const first = await result.beforeTurn();
+        expect(first.providerPath).toBe(result.providerPath);
+        await expect(readFile(join(first.providerPath, 'source.txt'), 'utf8')).resolves.toBe('before');
+        await result.completeTurn(async () => {});
+
+        expect(result.providerPath).not.toBe(first.providerPath);
+        expect((await stat(result.providerPath)).isDirectory()).toBe(true);
+        await expect(stat(first.providerPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+
+    it('omits glob and passthrough deny entries from the Linux sandbox only', async () => {
+        // specs/linux-checkpoint-enforcement-backend R3 (2026-09-05 개정) / R8 — bubblewrap cannot
+        // enforce globs (and leaves ws/** mount points) and refuses to start when a deny entry is a
+        // symlink inside the writable workspace; the passthrough target is already read-only via /.
+        await writeFile(join(projectPath, '.gitignore'), 'dependencies/\n');
+        await mkdir(join(projectPath, 'dependencies'));
+        await writeFile(join(projectPath, 'dependencies', 'package.txt'), 'cached');
+        await writeFile(join(projectPath, 'large.bin'), 'x'.repeat(2048));
+        const canonicalProjectPath = await realpath(projectPath);
+        const configFor = async (platform: NodeJS.Platform) => {
+            const result = await createCheckpointSessionComposition({
+                provider: 'codex',
+                platform,
+                projectPath,
+                sessionId: `session-${platform}`,
+                sandboxConfig: SandboxConfigSchema.parse({
+                    checkpointProtection: { ...protection, readOnlyPassthroughPaths: ['dependencies'] },
+                    denyWritePaths: ['user-glob/*.pem'],
+                }),
+                env: contextEnv(),
+                checkpointEvents,
+            });
+            if (!result.sandboxConfig || !result.providerPath) throw new Error('expected protected sandbox config');
+            return { deny: result.sandboxConfig.denyWritePaths, ws: result.providerPath };
+        };
+
+        const linux = await configFor('linux');
+        expect(linux.deny).toEqual(expect.arrayContaining([
+            'user-glob/*.pem',
+            canonicalProjectPath,
+            join(linux.ws, 'large.bin'),
+        ]));
+        expect(linux.deny).not.toContain(join(canonicalProjectPath, '**', '.env*'));
+        expect(linux.deny).not.toContain(join(linux.ws, '**', '.env*'));
+        expect(linux.deny).not.toContain(join(linux.ws, 'dependencies'));
+
+        const darwin = await configFor('darwin');
+        expect(darwin.deny).toEqual(expect.arrayContaining([
+            'user-glob/*.pem',
+            canonicalProjectPath,
+            join(canonicalProjectPath, '**', '.env*'),
+            join(darwin.ws, '**', '.env*'),
+            join(darwin.ws, 'dependencies'),
+            join(darwin.ws, 'large.bin'),
+        ]));
+    });
+
+    it('keeps literal deny entries on Linux even when the project path contains glob characters', async () => {
+        const oddProjectPath = join(fixtureRoot, 'app[1]?');
+        await mkdir(oddProjectPath);
+        await writeFile(join(oddProjectPath, 'source.txt'), 'before');
+        await writeFile(join(oddProjectPath, 'large.bin'), 'x'.repeat(2048));
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'linux',
+            projectPath: oddProjectPath,
+            sessionId: 'session-odd',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+        if (!result.sandboxConfig || !result.providerPath) throw new Error('expected protected sandbox config');
+        const canonicalOddPath = await realpath(oddProjectPath);
+        expect(result.sandboxConfig.denyWritePaths).toEqual(expect.arrayContaining([
+            canonicalOddPath,
+            join(canonicalOddPath, 'large.bin'),
+            join(result.providerPath, 'large.bin'),
+        ]));
+        expect(result.sandboxConfig.denyWritePaths).not.toContain(join(canonicalOddPath, '**', '.env*'));
+    });
+
+    it('dispose removes an unused workspace reservation but never an active turn', async () => {
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-dispose',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+        if (!result.beforeTurn || !result.completeTurn || !result.providerPath || !result.dispose) {
+            throw new Error('expected protected turn lifecycle');
+        }
+        const reserved = result.providerPath;
+        const turn = await result.beforeTurn();
+        await result.dispose();
+        await expect(readFile(join(turn.providerPath, 'source.txt'), 'utf8')).resolves.toBe('before');
+        await result.completeTurn(async () => {});
+
+        const nextReserved = result.providerPath;
+        expect(nextReserved).not.toBe(reserved);
+        await result.dispose();
+        await expect(stat(nextReserved)).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(result.dispose()).resolves.toBeUndefined();
+    });
+
+    it('abortTurn discards a turn that was opened but never dispatched', async () => {
+        // specs/linux-checkpoint-enforcement-backend R4 — the gate now opens the turn before the
+        // provider process starts, so a turn that never gets dispatched (reconnect failure, refusal,
+        // session exit) must not leave the workspace materialized nor block the next gate.
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-abort',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+        if (!result.beforeTurn || !result.completeTurn || !result.abortTurn) {
+            throw new Error('expected protected turn lifecycle');
+        }
+        const first = await result.beforeTurn();
+        await writeFile(join(first.providerPath, 'source.txt'), 'never dispatched');
+
+        await result.abortTurn();
+
+        // The abandoned workspace is gone, the original is untouched, and the writable path rotates.
+        await expect(stat(first.providerPath)).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(readFile(join(projectPath, 'source.txt'), 'utf8')).resolves.toBe('before');
+        expect(result.providerPath).not.toBe(first.providerPath);
+        expect(result.protectedBashCwd?.()).toBeNull();
+
+        // The next gate opens normally instead of throwing 'already active'.
+        const second = await result.beforeTurn();
+        expect(second.providerPath).toBe(result.providerPath);
+        await expect(result.completeTurn(async () => {})).resolves.toMatchObject({ status: 'completed' });
+        await expect(result.abortTurn()).resolves.toBeUndefined();
+    });
+
+    // chmod cannot take write access away from root (CAP_DAC_OVERRIDE), so the failure this test
+    // injects only materializes for an unprivileged user.
+    it.skipIf(process.getuid?.() === 0)('abortTurn preserves the sealed workspace of a partially applied turn', async () => {
+        // A partial apply keeps activeTurn and the sealed copy so the failed files can be retried
+        // from the journal. The abort path must not confuse that with a turn that was never sent.
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-partial',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+        if (!result.beforeTurn || !result.completeTurn || !result.abortTurn) {
+            throw new Error('expected protected turn lifecycle');
+        }
+        const turn = await result.beforeTurn();
+        await writeFile(join(turn.providerPath, 'source.txt'), 'agent change');
+        // Make the original unwritable so the applier reports a failed mutation (status: partial).
+        await chmod(projectPath, 0o555);
+        try {
+            await expect(result.completeTurn(async () => {})).resolves.toMatchObject({ status: 'partial' });
+        } finally {
+            await chmod(projectPath, 0o755);
+        }
+        const sealedPath = join(dirname(turn.providerPath), 'sealed');
+        await expect(readFile(join(sealedPath, 'source.txt'), 'utf8')).resolves.toBe('agent change');
+
+        await result.abortTurn();
+
+        // The apply input survives: a partial turn is recoverable, not discardable.
+        await expect(readFile(join(sealedPath, 'source.txt'), 'utf8')).resolves.toBe('agent change');
+    });
+
+    it('abortTurn keeps a dispatched turn whose outcome is unknown', async () => {
+        // A turn that reached the provider may already have produced work. If the response never
+        // arrives (turn timeout, transport error) the workspace must be preserved, not discarded.
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-dispatched',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+        if (!result.beforeTurn || !result.completeTurn || !result.abortTurn || !result.markTurnDispatched) {
+            throw new Error('expected protected turn lifecycle');
+        }
+        const turn = await result.beforeTurn();
+        result.markTurnDispatched();
+        await writeFile(join(turn.providerPath, 'source.txt'), 'agent work in flight');
+
+        await result.abortTurn();
+
+        await expect(readFile(join(turn.providerPath, 'source.txt'), 'utf8')).resolves.toBe('agent work in flight');
+        // Still the active turn, so the session fails closed instead of silently starting a new one.
+        await expect(result.beforeTurn()).rejects.toThrow('already active');
+        await expect(result.completeTurn(async () => {})).resolves.toMatchObject({ status: 'completed' });
     });
 
     it('records a daemon-readable pending decision when policy drift blocks dispatch', async () => {
