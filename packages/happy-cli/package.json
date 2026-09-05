@@ -60,6 +60,9 @@
     },
     "./browserSessionBrokerMain": {
       "import": "./dist/browserSessionBrokerMain.mjs"
+    },
+    "./electronGuiPreload": {
+      "require": "./dist/electronGuiPreload.cjs"
     }
   },
   "files": [
