@@ -85,9 +85,11 @@ Linux의 잔여 위험: (a) glob 전용 신규 secret 내용이 daemon 소유 wo
   뜨는 순간 writable root 안의 미존재 deny 경로마다 mount-point를 만들어 예약 디렉터리를 비어
   있지 않게 만들고, 그 파일은 프로세스가 살아 있는 동안 삭제되지 않는다(EBUSY). 그래서
   (a) `CheckpointTurnWorkspace.reserve()`로 경로를 빈 디렉터리로 예약하고,
-  (b) `CodexAppServerClient.prepareProtectedTurn()`이 **실행 중인 codex를 먼저 끊어**(그 sandbox
-  cleanup이 mount-point를 지운다) gate를 돌린 뒤에 wrap·spawn 하도록 순서를 바꾼다. `sendTurnAndWait`는
-  이미 열린 turn을 소비하고 gate를 두 번 돌리지 않는다. Claude remote는 Bash 명령마다 bwrap을
+  (b) `CodexAppServerClient.prepareProtectedTurn()`이 **실행 중인 codex를 먼저 끊고 그 프로세스가
+  실제로 종료될 때까지 기다린 뒤**(살아 있는 bwrap이 잡고 있는 mount-point는 지울 수 없다) sandbox
+  cleanup을 돌리고, 그 다음 gate를 돌린 뒤에 wrap·spawn 한다. 실제 dispatch 경로인
+  `sendTurnAndWait`(그리고 `sendTurn`)가 이미 열린 turn을 소비하고 gate를 두 번 돌리지 않는다.
+  dispatch되지 않고 끝난 turn은 `composition.abortTurn()`이 workspace를 지우고 경로를 회전시킨다. Claude remote는 Bash 명령마다 bwrap을
   띄우고 그 명령이 항상 prepare 뒤에 실행되므로 이 순서 문제가 없다.
 - Phase 0 Linux 테스트는 운영과 같은 **wrap → beforeTurn 순서**를 보존해야 이 결함이 잡힌다
   (기존 macOS 테스트 `checkpointSandbox.integration.test.ts:113`이 같은 순서).
@@ -128,9 +130,10 @@ Linux의 잔여 위험: (a) glob 전용 신규 secret 내용이 daemon 소유 wo
 
 - Given workspace 안의 passthrough symlink(→ 원본의 ignored 디렉터리)와 R3 개정의 Linux deny
   필터, When provider가 그 경로를 읽고 쓰려 하면, Then bwrap이 정상 기동하고 읽기는 성공하며
-  쓰기는 실패한다. 또한 provider가 symlink를
-  지우고 같은 이름의 실제 디렉터리를 만들어도 원본 ignored 디렉터리는 불변이고 apply는 그
-  경로를 `excluded-path`로 처리한다. 실제 bwrap 실행으로만 확인 가능(UNCERTAIN) — Phase 0 케이스.
+  쓰기는 실패한다. 또한 provider가 workspace 안의 symlink를 지우고 같은 이름의 실제 디렉터리를
+  만들어 파일을 써도 원본 ignored 디렉터리는 불변이다. **이때 apply는 그 경로를 후보로 보지
+  않는다** — passthrough 경로는 `.gitignore` 대상이라 `git ls-files --others --exclude-standard`에
+  잡히지 않으므로 conflict도 pending도 생기지 않고 조용히 버려진다(2026-09-05 실측).
 - `extraWritePaths`나 `workspaceRoot`가 원본 프로젝트를 포함하더라도 `canonicalProjectPath`
   리터럴 deny(존재하는 경로 → `--ro-bind` 자기 자신)로 원본이 계속 read-only인지 Phase 0에서
   경로 중첩 케이스로 확인한다.

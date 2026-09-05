@@ -380,6 +380,40 @@ describe('createCheckpointSessionComposition', () => {
         await expect(result.dispose()).resolves.toBeUndefined();
     });
 
+    it('abortTurn discards a turn that was opened but never dispatched', async () => {
+        // specs/linux-checkpoint-enforcement-backend R4 — the gate now opens the turn before the
+        // provider process starts, so a turn that never gets dispatched (reconnect failure, refusal,
+        // session exit) must not leave the workspace materialized nor block the next gate.
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-abort',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+        if (!result.beforeTurn || !result.completeTurn || !result.abortTurn) {
+            throw new Error('expected protected turn lifecycle');
+        }
+        const first = await result.beforeTurn();
+        await writeFile(join(first.providerPath, 'source.txt'), 'never dispatched');
+
+        await result.abortTurn();
+
+        // The abandoned workspace is gone, the original is untouched, and the writable path rotates.
+        await expect(stat(first.providerPath)).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(readFile(join(projectPath, 'source.txt'), 'utf8')).resolves.toBe('before');
+        expect(result.providerPath).not.toBe(first.providerPath);
+        expect(result.protectedBashCwd?.()).toBeNull();
+
+        // The next gate opens normally instead of throwing 'already active'.
+        const second = await result.beforeTurn();
+        expect(second.providerPath).toBe(result.providerPath);
+        await expect(result.completeTurn(async () => {})).resolves.toMatchObject({ status: 'completed' });
+        await expect(result.abortTurn()).resolves.toBeUndefined();
+    });
+
     it('records a daemon-readable pending decision when policy drift blocks dispatch', async () => {
         const result = await createCheckpointSessionComposition({
             provider: 'codex',

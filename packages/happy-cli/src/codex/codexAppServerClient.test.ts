@@ -65,6 +65,8 @@ function pushJsonLine(stdout: NodeJS.ReadableStream & { push: (chunk: string) =>
 function createMockProcess(opts?: {
     pid?: number;
     initializeDelayMs?: number;
+    exitDelayMs?: number;
+    onExit?: () => void;
     onRequest?: (msg: MockRpcMessage, stdout: NodeJS.ReadableStream & { push: (chunk: string) => void }) => void;
 }) {
     const { Readable, Writable } = require('stream');
@@ -72,12 +74,24 @@ function createMockProcess(opts?: {
     const stdin = new Writable({ write: (_: any, __: any, cb: () => void) => cb() });
     const stdout = new Readable({ read() {} });
     const stderr = new Readable({ read() {} });
-    const proc = Object.assign(new (require('events').EventEmitter)(), {
+    const proc: any = Object.assign(new (require('events').EventEmitter)(), {
         stdin,
         stdout,
         stderr,
         pid: opts?.pid ?? 12345,
-        kill: vi.fn(),
+        exitCode: null,
+        signalCode: null,
+        // A real process exits after SIGTERM; callers wait for that before releasing sandbox
+        // resources (bwrap mount points), so the mock must model it.
+        kill: vi.fn(() => {
+            setTimeout(() => {
+                if (proc.exitCode !== null) return;
+                proc.exitCode = 0;
+                opts?.onExit?.();
+                proc.emit('exit', 0, null);
+            }, opts?.exitDelayMs ?? 5);
+            return true;
+        }),
     });
     // Send initialize response immediately when stdin is written to
     const origWrite = stdin.write.bind(stdin);
@@ -723,10 +737,17 @@ describe('CodexAppServerClient sandbox integration', () => {
                     }
                     if (msg.method === 'turn/start' && msg.id != null) {
                         order.push('turn-start');
-                        setTimeout(() => pushJsonLine(stdout, {
-                            id: msg.id,
-                            result: { turn: { id: 'turn-order' } },
-                        }), 0);
+                        setTimeout(() => {
+                            pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-order' } } });
+                            pushJsonLine(stdout, {
+                                method: 'turn/started',
+                                params: { threadId: 'thread-order', turn: { id: 'turn-order', status: 'inProgress' } },
+                            });
+                            pushJsonLine(stdout, {
+                                method: 'turn/completed',
+                                params: { threadId: 'thread-order', turn: { id: 'turn-order', status: 'completed', error: null } },
+                            });
+                        }, 0);
                     }
                 },
             });
@@ -746,10 +767,20 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(prepared?.providerPath).toBe('/tmp/workspace-order');
         await client.connect();
         await client.startThread({ cwd: '/tmp/project' });
-        await client.sendTurn('edit the project');
+        // The real runCodex path is sendTurnAndWait, not sendTurn.
+        await expect(client.sendTurnAndWait('edit the project')).resolves.toEqual({ aborted: false });
 
         // The gate runs once, and it runs before the sandbox is built for the process.
         expect(beforeTurn).toHaveBeenCalledOnce();
+        expect(order).toEqual(['before-turn', 'sandbox-init', 'spawn', 'turn-start']);
+        order.length = 0;
+
+        // A second protected turn opens its own gate — the consumed preparation is not reused.
+        await client.prepareProtectedTurn();
+        await client.connect();
+        await client.startThread({ cwd: '/tmp/project' });
+        await expect(client.sendTurnAndWait('and again')).resolves.toEqual({ aborted: false });
+        expect(beforeTurn).toHaveBeenCalledTimes(2);
         expect(order).toEqual(['before-turn', 'sandbox-init', 'spawn', 'turn-start']);
         await client.disconnect();
     });
@@ -757,7 +788,12 @@ describe('CodexAppServerClient sandbox integration', () => {
     it('disconnects a running codex process before preparing the next protected turn', async () => {
         const order: string[] = [];
         mockSandboxCleanup.mockImplementation(async () => { order.push('sandbox-cleanup'); });
-        mockSpawn.mockImplementation(() => createMockProcess());
+        // bwrap only releases its mount points when the process is gone, so the cleanup that removes
+        // them must not run while codex is still alive (spec R4/R7).
+        mockSpawn.mockImplementation(() => createMockProcess({
+            exitDelayMs: 30,
+            onExit: () => order.push('process-exit'),
+        }));
         const beforeTurn = vi.fn(async () => {
             order.push('before-turn');
             return { operationId: 'op-2', checkpointId: 'b'.repeat(40), providerPath: '/tmp/workspace-second' };
@@ -770,7 +806,7 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.prepareProtectedTurn();
 
         expect(client.isConnected).toBe(false);
-        expect(order).toEqual(['sandbox-cleanup', 'before-turn']);
+        expect(order).toEqual(['process-exit', 'sandbox-cleanup', 'before-turn']);
     });
 
     it('runs its protected runtime gate before every turn dispatch', async () => {

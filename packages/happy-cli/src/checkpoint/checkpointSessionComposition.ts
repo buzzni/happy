@@ -31,6 +31,8 @@ export type CheckpointSessionComposition = {
     trackProtectedWriter?: (child: ChildProcess) => void;
     /** Removes a reserved-but-unused provider workspace; an active turn is left untouched. */
     dispose?: () => Promise<void>;
+    /** Discards a turn that was opened but never dispatched, then rotates to a fresh workspace. */
+    abortTurn?: () => Promise<void>;
     claudeSandbox?: QueryOptions['sandbox'];
 };
 
@@ -249,6 +251,20 @@ export async function createCheckpointSessionComposition(input: {
         return result;
     };
     const trackProtectedWriter = (child: ChildProcess) => protectedWriterTree.track(child);
+    // specs/linux-checkpoint-enforcement-backend R4 — the gate opens the turn before the provider
+    // process exists, so a turn that is never dispatched (reconnect failure, refused turn, session
+    // exit) has to be discarded: its snapshot stays in the store as history, but the materialized
+    // workspace is removed and the writable path rotates so it is never reused.
+    const abortTurn = async () => {
+        if (!activeTurn) return;
+        const abandoned = activeTurn;
+        acceptsProtectedWriters = false;
+        await protectedWriterTree.quiesce(() => {});
+        activeTurn = null;
+        frozenWorkspacePath = null;
+        await turnWorkspace.remove({ ...workspaceBinding, operationId: abandoned.operationId });
+        await rotateProviderPath();
+    };
     // specs/linux-checkpoint-enforcement-backend R4 — reserve() leaves an empty directory for the next
     // turn; a session that ends without starting it must not leak that directory.
     const dispose = async () => {
@@ -264,6 +280,7 @@ export async function createCheckpointSessionComposition(input: {
             protectedBashCwd,
             trackProtectedWriter,
             dispose,
+            abortTurn,
         };
     }
 
@@ -275,6 +292,7 @@ export async function createCheckpointSessionComposition(input: {
         protectedBashCwd,
         trackProtectedWriter,
         dispose,
+        abortTurn,
         claudeSandbox,
     };
 }

@@ -38,7 +38,8 @@ ADR-059는 v1 체크포인트 보호(`protected`)를 macOS Claude remote/Codex�
    디렉터리로 예약하고, **보호 모드 Codex는 실행 중인 프로세스를 끊은 뒤에 checkpoint gate를
    돌리고 그 다음에 wrap·spawn 한다**(`CodexAppServerClient.prepareProtectedTurn()`). 예약만으로는
    부족하다 — bwrap이 살아 있는 동안 만든 mount-point는 삭제할 수 없어(EBUSY) `prepare()`가
-   "not empty"로 실패한다. 프로세스를 끊으면 srt cleanup이 그 파일들을 지운다. macOS 동작은 불변.
+   "not empty"로 실패한다. 프로세스 종료를 기다린 뒤 srt cleanup이 그 파일들을 지운다. dispatch되지
+   않은 turn은 `composition.abortTurn()`으로 폐기한다. macOS는 mount-point가 없어 동작이 같다.
 3. glob 전용 secret 신규 생성의 write-time 차단은 Linux v1에서 보장하지 않는다. apply-time
    `excluded-path` conflict + `pendingDecision.source: 'turn-apply'`가 계약이며 Linux
    integration 테스트로 고정한다. gitignore된 신규 secret은 원본 미반영이지만 pending을

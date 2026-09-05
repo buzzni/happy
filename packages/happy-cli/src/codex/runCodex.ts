@@ -1379,6 +1379,16 @@ export async function runCodex(opts: {
                     session.sendSessionProtocolMessage(envelope);
                 }
             } finally {
+                // specs/linux-checkpoint-enforcement-backend R4 — the checkpoint turn is opened before
+                // codex is spawned, so a message that never reached completeTurn (refused turn, resume
+                // failure, thrown dispatch) would otherwise leave the turn open and block the next gate.
+                // abortTurn() no-ops after a completed turn.
+                client.abortPreparedTurn();
+                try {
+                    await checkpointComposition.abortTurn?.();
+                } catch (error) {
+                    logger.debug('[codex]: checkpoint abortTurn failed', error);
+                }
                 // Reset permission handler, reasoning processor, and diff processor
                 permissionHandler.reset();
                 reasoningProcessor.abort();  // Use abort to properly finish any in-progress tool calls
