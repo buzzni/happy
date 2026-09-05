@@ -785,6 +785,65 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('reports whether a prepared protected turn still needs abort cleanup', async () => {
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-cleanup', path: '/tmp/thread-cleanup' },
+                            model: 'gpt-test', modelProvider: 'openai', cwd: '/tmp/project',
+                            approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' }, reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-cleanup' } } });
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: {
+                                threadId: 'thread-cleanup',
+                                turn: { id: 'turn-cleanup', status: 'completed', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        }));
+        const beforeTurn = vi.fn(async () => ({
+            operationId: 'op-cleanup',
+            checkpointId: 'c'.repeat(40),
+            providerPath: '/tmp/workspace-cleanup',
+        }));
+        const completeTurn = vi.fn(async (quiesceWriters: () => Promise<void>) => {
+            await quiesceWriters();
+            return {
+                status: 'partial' as const,
+                entries: [{
+                    path: 'source.txt',
+                    action: 'write' as const,
+                    outcome: 'failed' as const,
+                    failureCode: 'mutation-failed' as const,
+                }],
+            };
+        });
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(sandboxConfig, beforeTurn, completeTurn);
+
+        await client.prepareProtectedTurn();
+        expect(client.abortPreparedTurn()).toBe(true);
+
+        await client.prepareProtectedTurn();
+        await client.connect();
+        await client.startThread({ cwd: '/tmp/project' });
+        await expect(client.sendTurnAndWait('edit the project'))
+            .rejects.toThrow('checkpoint turn apply did not complete');
+        expect(client.abortPreparedTurn()).toBe(false);
+        await client.disconnect();
+    });
+
     it('disconnects a running codex process before preparing the next protected turn', async () => {
         const order: string[] = [];
         mockSandboxCleanup.mockImplementation(async () => { order.push('sandbox-cleanup'); });
