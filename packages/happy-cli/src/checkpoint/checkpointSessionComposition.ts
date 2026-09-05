@@ -90,6 +90,10 @@ export async function createCheckpointSessionComposition(input: {
     }
 
     const turnWorkspace = new CheckpointTurnWorkspace(canonicalCheckpointRoot);
+    // specs/linux-checkpoint-enforcement-backend R3/R8 — bubblewrap cannot enforce glob deny
+    // entries (it only leaves ws/** mount-point residue) and refuses to start when a deny entry is
+    // a symlink inside the writable workspace. The passthrough target is already read-only through
+    // the root ro-bind, so dropping these two kinds on Linux removes no guarantee.
     const sandboxConfigFor = (path: string): SandboxConfig => ({
         ...inputSandboxConfig,
         sessionIsolation: 'custom',
@@ -97,10 +101,12 @@ export async function createCheckpointSessionComposition(input: {
         denyWritePaths: [...new Set([
             ...inputSandboxConfig.denyWritePaths,
             ...runtime.denyWritePaths,
-            ...runtime.excludedPaths.map((excludedPath) => join(path, excludedPath)),
+            ...runtime.excludedPaths
+                .filter((excludedPath) => input.platform !== 'linux' || !runtime.readOnlyPassthroughPaths.includes(excludedPath))
+                .map((excludedPath) => join(path, excludedPath)),
             ...runtime.excludedPatterns.map((pattern) => join(path, pattern)),
             canonicalProjectPath,
-        ])],
+        ])].filter((entry) => input.platform !== 'linux' || !/[*?[\]]/.test(entry)),
     });
     const claudeSandboxFor = (config: SandboxConfig, path: string): QueryOptions['sandbox'] => {
         const sandboxRuntime = buildSandboxRuntimeConfig(config, path);

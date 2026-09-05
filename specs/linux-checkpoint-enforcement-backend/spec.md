@@ -1,6 +1,6 @@
 # 체크포인트 보호 — Linux daemon 머신 지원 Spec
 
-> 작성일: 2026-09-05 / 상태: **승인됨** (v4, 2026-09-05. Codex gpt-6-astra medium 리뷰 2라운드 반영. MCP `bash_stream` 경계는 사용자 결정으로 **선택지 (1): 별도 스펙**, Linux는 macOS와 같은 기준으로 개방)
+> 작성일: 2026-09-05 / 상태: **승인됨** (v4 + R3/R8 개정 2026-09-05 사용자 승인. Codex gpt-6-astra medium 리뷰 2라운드 반영. MCP `bash_stream` 경계는 사용자 결정으로 **선택지 (1): 별도 스펙**, Linux는 macOS와 같은 기준으로 개방)
 > ⚠️ 승인 후에는 사용자 지시 없이 수정 금지
 
 ## 목표
@@ -65,12 +65,16 @@ Linux의 잔여 위험: (a) glob 전용 신규 secret 내용이 daemon 소유 wo
 - unprivileged userns 비활성 등 spawn 시점 실패는 기존 fail-closed 경로에 맡긴다. Phase 0에서
   그 오류 메시지가 원인을 말하는지 확인하고, 아니면 메시지만 보강한다.
 
-### R3. 매니페스트 사전 스캔·apply 게이트·workspace deny 목록은 변경하지 않는다
+### R3. 매니페스트 사전 스캔·apply 게이트는 변경하지 않는다. deny 목록은 Linux에서 두 종류만 뺀다
 
-- `buildCheckpointExclusionManifest`, `createExcludedPathMatcher`, `sandboxConfigFor`의
-  deny 항목 구성은 플랫폼 무관이며 그대로 둔다. v2의 R5-a(Linux에서 workspace 내부 deny
-  항목 생략)는 **폐기** — secret뿐 아니라 ignored·용량 제한·passthrough의 write-time 차단까지
-  낮추는 ADR-059 보장 축소였다.
+- `buildCheckpointExclusionManifest`, `createExcludedPathMatcher`는 플랫폼 무관이며 그대로 둔다.
+  v2의 R5-a(Linux에서 workspace 내부 deny 항목 전부 생략)는 **폐기** — ignored·용량 제한 파일의
+  write-time 차단까지 낮추는 ADR-059 보장 축소였다.
+- **(2026-09-05 개정, 사용자 승인)** Linux에서 `sandboxConfigFor`가 srt에 넘기는 deny 목록에서
+  (i) glob 문자를 포함한 항목, (ii) read-only passthrough 경로(`join(workspace, passthrough)`)만
+  제외한다. (i)는 srt Linux가 강제하지 못하면서 `ws/**` 같은 mount-point 잔여물을 만들고, (ii)는
+  srt의 symlink 교체 방어가 bwrap 기동을 막는데 그 대상은 `/` ro-bind로 이미 read-only다. 그 외
+  열거된 리터럴 deny(secret·too-large·ignored 파일, 원본 경로)는 유지한다. macOS 목록은 불변.
 
 ### R4. Codex Linux는 workspace가 존재한 뒤에 bwrap 인자를 만들어야 한다 (신규)
 
@@ -118,8 +122,9 @@ Linux의 잔여 위험: (a) glob 전용 신규 secret 내용이 daemon 소유 wo
 
 ### R8. read-only passthrough가 Linux bwrap에서 유지된다
 
-- Given workspace 안의 passthrough symlink(→ 원본의 ignored 디렉터리), When provider가
-  그 경로를 읽고 쓰려 하면, Then 읽기는 성공하고 쓰기는 실패한다. 또한 provider가 symlink를
+- Given workspace 안의 passthrough symlink(→ 원본의 ignored 디렉터리)와 R3 개정의 Linux deny
+  필터, When provider가 그 경로를 읽고 쓰려 하면, Then bwrap이 정상 기동하고 읽기는 성공하며
+  쓰기는 실패한다. 또한 provider가 symlink를
   지우고 같은 이름의 실제 디렉터리를 만들어도 원본 ignored 디렉터리는 불변이고 apply는 그
   경로를 `excluded-path`로 처리한다. 실제 bwrap 실행으로만 확인 가능(UNCERTAIN) — Phase 0 케이스.
 - `extraWritePaths`나 `workspaceRoot`가 원본 프로젝트를 포함하더라도 `canonicalProjectPath`

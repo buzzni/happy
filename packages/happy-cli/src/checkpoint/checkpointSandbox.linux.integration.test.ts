@@ -150,30 +150,16 @@ describe.skipIf(process.platform !== 'linux')('checkpoint Linux bubblewrap enfor
         await expect(stat(ws)).rejects.toMatchObject({ code: 'ENOENT' });
     });
 
-    it('R8a (as-is): a passthrough symlink in the deny list makes bwrap refuse to start', async () => {
-        const composition = await compose('session-symlink-asis');
-        if (!composition.beforeTurn || !composition.completeTurn) throw new Error('expected protected composition');
-        const turn = await composition.beforeTurn();
-        cleanupSandbox = await initializeSandbox(turn.sandboxConfig!, turn.providerPath);
-        const outcome = await execAsync(await wrapCommand('echo STARTED'))
-            .then((r) => r.stdout.trim(), (error: Error) => `FAILED ${error.message.match(/bwrap: [^\n]*/)?.[0] ?? ''}`);
-        // eslint-disable-next-line no-console
-        console.log(`[linux-spike] passthrough as-is: ${outcome}`);
-        expect(outcome).toMatch(/^FAILED bwrap: Can't create file/);
-    });
-
-    it('R8b (proposed filter): dropping passthrough-symlink and glob deny entries on Linux keeps passthrough read-only', async () => {
+    it('R8: a read-only passthrough stays readable, unwritable and never reaches the original', async () => {
+        // R3 (2026-09-05 개정): the composition drops glob and passthrough deny entries on Linux, so
+        // bubblewrap starts even though the passthrough is a symlink inside the writable workspace.
         const composition = await compose('session-symlink');
         if (!composition.beforeTurn || !composition.completeTurn) throw new Error('expected protected composition');
         const turn = await composition.beforeTurn();
         const ws = turn.providerPath;
-        const filtered = {
-            ...turn.sandboxConfig!,
-            denyWritePaths: turn.sandboxConfig!.denyWritePaths.filter((path) => (
-                path !== join(ws, 'dependencies') && !/[*?[\]]/.test(path)
-            )),
-        };
-        cleanupSandbox = await initializeSandbox(filtered, ws);
+        expect(turn.sandboxConfig!.denyWritePaths.filter((entry) => /[*?[\]]/.test(entry))).toEqual([]);
+        expect(turn.sandboxConfig!.denyWritePaths).not.toContain(join(ws, 'dependencies'));
+        cleanupSandbox = await initializeSandbox(turn.sandboxConfig!, ws);
         const run = async (command: string) => execAsync(await wrapCommand(command));
         await expect(run(`cat ${shellQuote(join(ws, 'dependencies', 'package.txt'))}`))
             .resolves.toMatchObject({ stdout: 'cached dependency' });
@@ -210,6 +196,8 @@ describe.skipIf(process.platform !== 'linux')('checkpoint Linux bubblewrap enfor
             `printf bypass > ${shellQuote(join(projectPath, 'brand-new.txt'))}`,
         ))).rejects.toBeDefined();
         await expect(readFile(join(projectPath, 'source.txt'), 'utf8')).resolves.toBe('before');
+        // glob deny entries are dropped on Linux, so no `**` mount point is ever created in the original
+        expect(await readdir(projectPath)).not.toContain('**');
     });
 
     it('R7 (abnormal): skipping sandbox cleanup before completeTurn — observe residue', async () => {

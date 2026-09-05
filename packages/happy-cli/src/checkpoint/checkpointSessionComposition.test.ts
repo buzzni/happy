@@ -7,6 +7,10 @@ import { CHECKPOINT_SPAWN_CONTEXT_ENV_KEY } from './checkpointSpawnContext';
 import { CheckpointProtectionStateStore } from './checkpointProtectionState';
 import { createCheckpointSessionComposition } from './checkpointSessionComposition';
 
+vi.mock('@/sandbox/dependencyPreflight', () => ({
+    cachedLinuxSandboxDependencyStatus: vi.fn(() => ({ ok: true })),
+}));
+
 describe('createCheckpointSessionComposition', () => {
     let fixtureRoot: string;
     let projectPath: string;
@@ -277,6 +281,51 @@ describe('createCheckpointSessionComposition', () => {
         expect(result.providerPath).not.toBe(first.providerPath);
         expect((await stat(result.providerPath)).isDirectory()).toBe(true);
         await expect(stat(first.providerPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+
+    it('omits glob and passthrough deny entries from the Linux sandbox only', async () => {
+        // specs/linux-checkpoint-enforcement-backend R3 (2026-09-05 개정) / R8 — bubblewrap cannot
+        // enforce globs (and leaves ws/** mount points) and refuses to start when a deny entry is a
+        // symlink inside the writable workspace; the passthrough target is already read-only via /.
+        await writeFile(join(projectPath, '.gitignore'), 'dependencies/\n');
+        await mkdir(join(projectPath, 'dependencies'));
+        await writeFile(join(projectPath, 'dependencies', 'package.txt'), 'cached');
+        await writeFile(join(projectPath, 'large.bin'), 'x'.repeat(2048));
+        const canonicalProjectPath = await realpath(projectPath);
+        const configFor = async (platform: NodeJS.Platform) => {
+            const result = await createCheckpointSessionComposition({
+                provider: 'codex',
+                platform,
+                projectPath,
+                sessionId: `session-${platform}`,
+                sandboxConfig: SandboxConfigSchema.parse({
+                    checkpointProtection: { ...protection, readOnlyPassthroughPaths: ['dependencies'] },
+                    denyWritePaths: ['user-glob/*.pem'],
+                }),
+                env: contextEnv(),
+                checkpointEvents,
+            });
+            if (!result.sandboxConfig || !result.providerPath) throw new Error('expected protected sandbox config');
+            return { deny: result.sandboxConfig.denyWritePaths, ws: result.providerPath };
+        };
+
+        const linux = await configFor('linux');
+        expect(linux.deny).toEqual(expect.arrayContaining([
+            canonicalProjectPath,
+            join(linux.ws, 'large.bin'),
+        ]));
+        expect(linux.deny.filter((entry) => /[*?[\]]/.test(entry))).toEqual([]);
+        expect(linux.deny).not.toContain(join(linux.ws, 'dependencies'));
+
+        const darwin = await configFor('darwin');
+        expect(darwin.deny).toEqual(expect.arrayContaining([
+            'user-glob/*.pem',
+            canonicalProjectPath,
+            join(canonicalProjectPath, '**', '.env*'),
+            join(darwin.ws, '**', '.env*'),
+            join(darwin.ws, 'dependencies'),
+            join(darwin.ws, 'large.bin'),
+        ]));
     });
 
     it('records a daemon-readable pending decision when policy drift blocks dispatch', async () => {
