@@ -81,10 +81,14 @@ Linux의 잔여 위험: (a) glob 전용 신규 secret 내용이 daemon 소유 wo
 - Given Linux Codex 보호 세션, When `connect`가 sandbox를 초기화하고 wrap할 때, Then 그
   턴의 workspace 디렉터리가 이미 존재해 allowWrite bind에 포함된다. 최초 턴과 rotate 후
   후속 턴 모두.
-- 구현 방식(Phase 0에서 택일): (a) `rotateProviderPath`/composition 생성 시 workspace
-  디렉터리를 미리 만들고 `prepare`의 `mkdir(recursive: false)`(`checkpointTurnWorkspace.ts:86`)를
-  기존 빈 디렉터리 허용으로 바꿈 — composition + turnWorkspace 두 파일 수정, (b) Codex
-  `connect`를 `beforeTurn` 뒤로 옮김 — client 한 파일 수정. macOS 동작을 바꾸지 않는 쪽을 택한다.
+- **(2026-09-05 확정, 실측 후 개정)** (a)와 (b)를 **둘 다** 한다. (a)만으로는 부족하다: bwrap은
+  뜨는 순간 writable root 안의 미존재 deny 경로마다 mount-point를 만들어 예약 디렉터리를 비어
+  있지 않게 만들고, 그 파일은 프로세스가 살아 있는 동안 삭제되지 않는다(EBUSY). 그래서
+  (a) `CheckpointTurnWorkspace.reserve()`로 경로를 빈 디렉터리로 예약하고,
+  (b) `CodexAppServerClient.prepareProtectedTurn()`이 **실행 중인 codex를 먼저 끊어**(그 sandbox
+  cleanup이 mount-point를 지운다) gate를 돌린 뒤에 wrap·spawn 하도록 순서를 바꾼다. `sendTurnAndWait`는
+  이미 열린 turn을 소비하고 gate를 두 번 돌리지 않는다. Claude remote는 Bash 명령마다 bwrap을
+  띄우고 그 명령이 항상 prepare 뒤에 실행되므로 이 순서 문제가 없다.
 - Phase 0 Linux 테스트는 운영과 같은 **wrap → beforeTurn 순서**를 보존해야 이 결함이 잡힌다
   (기존 macOS 테스트 `checkpointSandbox.integration.test.ts:113`이 같은 순서).
 

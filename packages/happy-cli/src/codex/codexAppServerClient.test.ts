@@ -698,6 +698,81 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    // specs/linux-checkpoint-enforcement-backend R4 — bubblewrap binds a mount point for every
+    // non-existent deny path the moment the wrapped process starts, so on Linux the turn workspace
+    // must be materialized *before* the sandbox is initialized and codex is spawned.
+    it('prepares the protected turn workspace before the sandbox wraps and spawns codex', async () => {
+        const order: string[] = [];
+        mockInitializeSandbox.mockImplementation(async () => {
+            order.push('sandbox-init');
+            return mockSandboxCleanup;
+        });
+        mockSpawn.mockImplementation(() => {
+            order.push('spawn');
+            return createMockProcess({
+                onRequest: (msg, stdout) => {
+                    if (msg.method === 'thread/start' && msg.id != null) {
+                        setTimeout(() => pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: {
+                                thread: { id: 'thread-order', path: '/tmp/thread-order' },
+                                model: 'gpt-test', modelProvider: 'openai', cwd: '/tmp/project',
+                                approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' }, reasoningEffort: null,
+                            },
+                        }), 0);
+                    }
+                    if (msg.method === 'turn/start' && msg.id != null) {
+                        order.push('turn-start');
+                        setTimeout(() => pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { turn: { id: 'turn-order' } },
+                        }), 0);
+                    }
+                },
+            });
+        });
+        const beforeTurn = vi.fn(async () => {
+            order.push('before-turn');
+            return {
+                operationId: 'op-1',
+                checkpointId: 'a'.repeat(40),
+                providerPath: '/tmp/workspace-order',
+            };
+        });
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(sandboxConfig, beforeTurn);
+
+        const prepared = await client.prepareProtectedTurn();
+        expect(prepared?.providerPath).toBe('/tmp/workspace-order');
+        await client.connect();
+        await client.startThread({ cwd: '/tmp/project' });
+        await client.sendTurn('edit the project');
+
+        // The gate runs once, and it runs before the sandbox is built for the process.
+        expect(beforeTurn).toHaveBeenCalledOnce();
+        expect(order).toEqual(['before-turn', 'sandbox-init', 'spawn', 'turn-start']);
+        await client.disconnect();
+    });
+
+    it('disconnects a running codex process before preparing the next protected turn', async () => {
+        const order: string[] = [];
+        mockSandboxCleanup.mockImplementation(async () => { order.push('sandbox-cleanup'); });
+        mockSpawn.mockImplementation(() => createMockProcess());
+        const beforeTurn = vi.fn(async () => {
+            order.push('before-turn');
+            return { operationId: 'op-2', checkpointId: 'b'.repeat(40), providerPath: '/tmp/workspace-second' };
+        });
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(sandboxConfig, beforeTurn);
+        await client.connect();
+        expect(client.isConnected).toBe(true);
+
+        await client.prepareProtectedTurn();
+
+        expect(client.isConnected).toBe(false);
+        expect(order).toEqual(['sandbox-cleanup', 'before-turn']);
+    });
+
     it('runs its protected runtime gate before every turn dispatch', async () => {
         const requests: MockRpcMessage[] = [];
         mockSpawn.mockImplementation(() => createMockProcess({

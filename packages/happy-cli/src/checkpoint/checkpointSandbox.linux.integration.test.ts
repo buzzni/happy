@@ -2,7 +2,7 @@
 // Expectations differ from macOS on purpose: bubblewrap cannot enforce glob deny patterns, so a
 // glob-only new secret is written into the turn workspace and rejected at apply time instead of
 // failing at write time (spec R5). Everything else must match the macOS guarantees.
-import { exec } from 'node:child_process';
+import { exec, spawn } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -102,6 +102,40 @@ describe.skipIf(process.platform !== 'linux')('checkpoint Linux bubblewrap enfor
             entries: [{ path: 'source.txt', action: 'write', outcome: 'written' }],
         });
         await expect(readFile(join(projectPath, 'source.txt'), 'utf8')).resolves.toBe('agent');
+    });
+
+    it('R4b: a live bwrap process before the turn does not poison the reserved workspace', async () => {
+        // Reproduces the real Codex order: connect() wraps AND starts the process, beforeTurn() only
+        // runs later. bwrap binds a mount point for every non-existent deny path inside the writable
+        // root, so the reserved workspace is non-empty while that process lives. The fix is ordering:
+        // CodexAppServerClient.prepareProtectedTurn() stops the process (its sandbox cleanup removes
+        // the mount points) before the gate materializes the workspace.
+        const composition = await compose('session-order-live', { passthrough: false });
+        if (!composition.beforeTurn || !composition.completeTurn || !composition.sandboxConfig || !composition.providerPath) {
+            throw new Error('expected protected composition');
+        }
+        const reserved = composition.providerPath;
+        cleanupSandbox = await initializeSandbox(composition.sandboxConfig, reserved);
+        const trigger = join(checkpointRoot, 'release');
+        const live = spawn('sh', ['-c', await wrapCommand(
+            `while [ ! -e ${shellQuote(trigger)} ]; do sleep 0.05; done`,
+        )], { stdio: ['ignore', 'pipe', 'pipe'] });
+        try {
+            await waitFor(async () => (await readdir(reserved)).length > 0);
+            expect(await readdir(reserved)).toEqual(expect.arrayContaining(['large.bin']));
+            // Preparing the turn while that process still runs is exactly what used to fail.
+            await expect(composition.beforeTurn()).rejects.toThrow('checkpoint turn workspace is not empty');
+        } finally {
+            await writeFile(trigger, 'go');
+            await new Promise((resolve) => live.once('exit', resolve));
+        }
+        // The client stops codex first; after its sandbox cleanup the reserved workspace is empty again.
+        await cleanupSandbox();
+        cleanupSandbox = null;
+        expect(await readdir(reserved)).toEqual([]);
+        const turn = await composition.beforeTurn();
+        expect(turn.providerPath).toBe(reserved);
+        await expect(readFile(join(turn.providerPath, 'source.txt'), 'utf8')).resolves.toBe('before');
     });
 
     it('R3/R5/R7: enumerated exclusions deny at write time, glob-only secrets are rejected at apply time', async () => {
@@ -216,6 +250,14 @@ describe.skipIf(process.platform !== 'linux')('checkpoint Linux bubblewrap enfor
         expect((await readFile(join(projectPath, 'large.bin'), 'utf8')).length).toBe(2048);
     });
 });
+
+async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 5_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!(await predicate())) {
+        if (Date.now() >= deadline) throw new Error('timed out waiting for the sandbox to start');
+        await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+}
 
 function shellQuote(value: string): string {
     return `'${value.replaceAll("'", "'\\''")}'`;

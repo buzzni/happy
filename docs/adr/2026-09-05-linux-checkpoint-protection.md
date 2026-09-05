@@ -35,7 +35,10 @@ ADR-059는 v1 체크포인트 보호(`protected`)를 macOS Claude remote/Codex�
    수명 동안 캐시한다. 의존성 부재 사유는 기존 `unsupported-platform`을 재사용한다 — 공개
    계약(`protection`, reason enum, event envelope)은 바꾸지 않는다.
 2. provider workspace 경로는 sandbox 구성 전에 `CheckpointTurnWorkspace.reserve()`로 빈
-   디렉터리로 예약한다. `prepare()`는 비어 있지 않은 디렉터리만 거부한다. macOS 동작은 불변.
+   디렉터리로 예약하고, **보호 모드 Codex는 실행 중인 프로세스를 끊은 뒤에 checkpoint gate를
+   돌리고 그 다음에 wrap·spawn 한다**(`CodexAppServerClient.prepareProtectedTurn()`). 예약만으로는
+   부족하다 — bwrap이 살아 있는 동안 만든 mount-point는 삭제할 수 없어(EBUSY) `prepare()`가
+   "not empty"로 실패한다. 프로세스를 끊으면 srt cleanup이 그 파일들을 지운다. macOS 동작은 불변.
 3. glob 전용 secret 신규 생성의 write-time 차단은 Linux v1에서 보장하지 않는다. apply-time
    `excluded-path` conflict + `pendingDecision.source: 'turn-apply'`가 계약이며 Linux
    integration 테스트로 고정한다. gitignore된 신규 secret은 원본 미반영이지만 pending을
@@ -51,8 +54,12 @@ ADR-059는 v1 체크포인트 보호(`protected`)를 macOS Claude remote/Codex�
   daemon-first로 불가.
 - Linux에서 workspace deny 목록 전체 생략 — ignored·용량 제한 파일의 write-time 차단까지 잃는
   ADR-059 보장 축소. 기각.
-- Codex `connect()`를 `beforeTurn()` 뒤로 이동 — 재접속·스레드 재개 흐름을 건드려 위험. 빈
-  디렉터리 예약이 더 작고 플랫폼 중립적.
+- 빈 디렉터리 예약만으로 순서 문제를 덮기 — 실측에서 실패. 살아 있는 bwrap이 만든 mount-point는
+  EBUSY로 지울 수 없어 `prepare()`가 거부한다.
+- Linux Codex를 `unavailable`로 남기기 — 순서 변경이 기존 재접속 경로(매 보호 턴마다 이미
+  disconnect→reconnect 한다)를 재사용하는 작은 변경이라 기각.
+- 제외 경로를 placeholder 파일로 미리 만들어 bwrap이 기존 경로를 ro-bind하게 하기 — placeholder가
+  synthetic baseline에 커밋되고 provider에게 빈 파일로 보이므로 기각.
 
 ## Consequences
 

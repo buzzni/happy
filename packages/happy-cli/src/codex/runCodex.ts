@@ -1171,11 +1171,18 @@ export async function runCodex(opts: {
             }
 
             try {
-                if (checkpointComposition.completeTurn && !client.isConnected) {
-                    const expectedThreadId = client.threadId;
-                    const resumed = await client.reconnectAndResumeThread();
-                    if (expectedThreadId && !resumed) {
-                        throw new Error('checkpoint protection could not resume the Codex thread');
+                if (checkpointComposition.completeTurn) {
+                    // specs/linux-checkpoint-enforcement-backend R4 — open the checkpoint turn (and
+                    // materialize its workspace) before codex is wrapped and spawned. On Linux bwrap
+                    // binds mount points into the writable root the moment it starts, so a workspace
+                    // prepared afterwards would be materialized into a non-empty directory.
+                    await client.prepareProtectedTurn();
+                    if (!client.isConnected) {
+                        const expectedThreadId = client.threadId;
+                        const resumed = await client.reconnectAndResumeThread();
+                        if (expectedThreadId && !resumed) {
+                            throw new Error('checkpoint protection could not resume the Codex thread');
+                        }
                     }
                 }
                 // Map permission mode to approval policy and sandbox.

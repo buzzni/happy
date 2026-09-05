@@ -306,6 +306,13 @@ export class CodexAppServerClient {
     private eventHandler: ((msg: EventMsg) => void) | null = null;
     private approvalHandler: ApprovalHandler | null = null;
 
+    // specs/linux-checkpoint-enforcement-backend R4 — the turn workspace materialized by beforeTurn()
+    // must exist before the wrapped process starts: bubblewrap binds a mount point on the host for
+    // every non-existent deny path the moment bwrap runs, which would leave the freshly reserved
+    // workspace non-empty. prepareProtectedTurn() runs the gate first and sendTurnAndWait() consumes
+    // the result instead of running the gate a second time.
+    private preparedTurn: CheckpointTurnPreparation | null = null;
+
     constructor(
         sandboxConfig?: SandboxConfig,
         beforeTurn?: () => Promise<CheckpointTurnPreparation | void>,
@@ -945,6 +952,26 @@ export class CodexAppServerClient {
         await this.disconnectInternal();
     }
 
+    /**
+     * Opens the next protected turn before the provider process exists. Stops a running codex first
+     * so its sandbox cleanup removes any bwrap mount points from the reserved workspace, then runs
+     * the checkpoint gate. Returns null when the session is not protected.
+     * specs/linux-checkpoint-enforcement-backend R4
+     */
+    async prepareProtectedTurn(): Promise<CheckpointTurnPreparation | null> {
+        if (!this.beforeTurn) return null;
+        if (this.preparedTurn) return this.preparedTurn;
+        if (this.connected || this.process) {
+            await this.disconnectInternal({
+                preserveThreadState: true,
+                preservePendingTurnCompletion: true,
+            });
+        }
+        const preparation = await this.beforeTurn();
+        this.preparedTurn = preparation ?? null;
+        return this.preparedTurn;
+    }
+
     private cleanupMultiAuthProxy(): Promise<void> {
         if (this.multiAuthProxyCleanup) return this.multiAuthProxyCleanup;
         const proxy = this.multiAuthProxy;
@@ -1460,7 +1487,8 @@ export class CodexAppServerClient {
             throw new Error('No active thread. Call startThread first.');
         }
 
-        const turnPreparation = await this.resolveBeforeTurn(opts)?.();
+        const turnPreparation = this.consumePreparedTurn(opts)
+            ?? await this.resolveBeforeTurn(opts)?.();
         const effectiveOpts = applyCheckpointTurnPreparation(opts, turnPreparation);
 
         const extraInputItems = opts?.extraInputItems ?? [];
@@ -1598,6 +1626,16 @@ export class CodexAppServerClient {
         return opts && Object.prototype.hasOwnProperty.call(opts, 'beforeTurn')
             ? opts.beforeTurn
             : this.beforeTurn;
+    }
+
+    /** An explicit per-call beforeTurn overrides the pre-opened turn, matching resolveBeforeTurn. */
+    private consumePreparedTurn(
+        opts: { beforeTurn?: () => Promise<CheckpointTurnPreparation | void> } | undefined,
+    ): CheckpointTurnPreparation | null {
+        if (opts && Object.prototype.hasOwnProperty.call(opts, 'beforeTurn')) return null;
+        const preparation = this.preparedTurn;
+        this.preparedTurn = null;
+        return preparation;
     }
 
     async steerTurn(prompt: string): Promise<void> {
