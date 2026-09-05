@@ -79,12 +79,27 @@ export type AiCredentialRuntimeDependencies = {
 }
 
 export class AiCredentialRuntimeError extends Error {
-  constructor(public readonly kind: string, applyGeneration?: number) {
+  /** 프로브 실패 진단(종료 코드, stderr 마지막 줄). 데몬 로그의 오류 객체에 함께 찍힌다. */
+  readonly probe?: { exitCode: number | undefined; stderrTail: string }
+
+  constructor(
+    public readonly kind: string,
+    applyGeneration?: number,
+    probe?: { exitCode: number | undefined; stderrTail: string },
+  ) {
     super(
       `AI credential operation failed (${kind})`
       + (applyGeneration === undefined ? '' : ` [applyGeneration=${applyGeneration}]`),
     )
+    if (probe) this.probe = probe
   }
+}
+
+const PROBE_STDERR_TAIL_MAX = 200
+
+function lastLine(text: string): string {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  return (lines[lines.length - 1] ?? '').slice(0, PROBE_STDERR_TAIL_MAX)
 }
 
 type CodexQuotaWindow = { usedPercent?: unknown }
@@ -862,9 +877,12 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
             'json',
             '--model',
             'sonnet',
+            // `--tools <tools...>` 는 가변 인자라 뒤에 오는 프롬프트까지 삼킨다
+            // (Claude Code 2.1.246: "Input must be provided ... when using --print").
+            // 프롬프트를 먼저 두고 빈 `--tools` 를 마지막에 둔다.
+            'Reply with exactly: CLAUDE_AUTH_OK',
             '--tools',
             '',
-            'Reply with exactly: CLAUDE_AUTH_OK',
           ],
           {
             maxOutputBytes: MAX_PAYLOAD_BYTES,
@@ -884,7 +902,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           if (isRejectedZaiAuthentication(probe)) {
             return { provider: selected, configured: false, accountCount: 0 }
           }
-          throw new AiCredentialRuntimeError('ZAI_PROBE_FAILED')
+          throw new AiCredentialRuntimeError('ZAI_PROBE_FAILED', undefined, {
+            exitCode: probe.exitCode,
+            stderrTail: lastLine(probe.stderr),
+          })
         }
         if (!isAuthenticatedZaiProbe(probe.stdout)) {
           return { provider: selected, configured: false, accountCount: 0 }
