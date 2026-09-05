@@ -221,9 +221,9 @@ describe('AI credential machine runtime', () => {
         'json',
         '--model',
         'sonnet',
+        'Reply with exactly: CLAUDE_AUTH_OK',
         '--tools',
         '',
-        'Reply with exactly: CLAUDE_AUTH_OK',
       ],
       expect.objectContaining({
         acceptNonZeroExit: true,
@@ -343,6 +343,8 @@ describe('AI credential machine runtime', () => {
 
     await expect(runtime.status({ provider: 'zai' })).rejects.toMatchObject({
       kind: 'ZAI_PROBE_FAILED',
+      // 운영자가 데몬 로그만 보고 원인을 알 수 있게 종료 코드와 stderr 마지막 줄을 싣는다.
+      probe: { exitCode: 1, stderrTail: '429 Too Many Requests' },
     })
   })
 
