@@ -18,15 +18,53 @@ describe('resolveCheckpointProtectionCapability', () => {
         },
     );
 
-    it.each(['linux', 'win32'] as const)(
-        'keeps protected sessions unavailable on %s',
-        (platform) => {
+    // specs/linux-checkpoint-enforcement-backend R1/R2 — Linux is protected only when the bubblewrap
+    // backend of @anthropic-ai/sandbox-runtime can actually run; the probe result is injected so the
+    // matrix does not depend on the host.
+    it.each(['claude-remote', 'codex'] as const)(
+        'supports protected %s sessions on Linux when the sandbox dependencies are present',
+        (provider) => {
             expect(resolveCheckpointProtectionCapability({
-                platform,
-                provider: 'codex',
-            })).toEqual({ supported: false, reason: 'unsupported-platform' });
+                platform: 'linux',
+                provider,
+                linuxSandboxDependencies: () => ({ ok: true }),
+            })).toEqual({ supported: true });
         },
     );
+
+    it('keeps Linux unavailable when bubblewrap dependencies are missing', () => {
+        expect(resolveCheckpointProtectionCapability({
+            platform: 'linux',
+            provider: 'codex',
+            linuxSandboxDependencies: () => ({ ok: false, missing: ['bwrap', 'socat'] }),
+        })).toEqual({ supported: false, reason: 'unsupported-platform' });
+    });
+
+    it('keeps Linux unavailable when the dependency probe itself fails', () => {
+        expect(resolveCheckpointProtectionCapability({
+            platform: 'linux',
+            provider: 'codex',
+            linuxSandboxDependencies: () => { throw new Error('which exploded'); },
+        })).toEqual({ supported: false, reason: 'unsupported-platform' });
+    });
+
+    it('does not consult the Linux probe on macOS', () => {
+        const probe = vi.fn(() => ({ ok: false as const, missing: ['bwrap'] }));
+        expect(resolveCheckpointProtectionCapability({
+            platform: 'darwin',
+            provider: 'codex',
+            linuxSandboxDependencies: probe,
+        })).toEqual({ supported: true });
+        expect(probe).not.toHaveBeenCalled();
+    });
+
+    it('keeps protected sessions unavailable on win32', () => {
+        expect(resolveCheckpointProtectionCapability({
+            platform: 'win32',
+            provider: 'codex',
+            linuxSandboxDependencies: () => ({ ok: true }),
+        })).toEqual({ supported: false, reason: 'unsupported-platform' });
+    });
 
     it('keeps providers without a proven pre-write gate unavailable', () => {
         expect(resolveCheckpointProtectionCapability({

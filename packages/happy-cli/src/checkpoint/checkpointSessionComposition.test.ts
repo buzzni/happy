@@ -73,7 +73,7 @@ describe('createCheckpointSessionComposition', () => {
         })).rejects.toThrow('authoritative checkpoint spawn context');
         await expect(createCheckpointSessionComposition({
             provider: 'codex',
-            platform: 'linux',
+            platform: 'win32',
             projectPath,
             sessionId: 'session-1',
             sandboxConfig,

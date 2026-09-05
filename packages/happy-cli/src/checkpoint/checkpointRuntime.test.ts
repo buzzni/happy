@@ -3,8 +3,13 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cachedLinuxSandboxDependencyStatus } from '@/sandbox/dependencyPreflight';
 import { createCheckpointRuntime } from './checkpointRuntime';
+
+vi.mock('@/sandbox/dependencyPreflight', () => ({
+    cachedLinuxSandboxDependencyStatus: vi.fn(() => ({ ok: true })),
+}));
 import { checkpointOperationRefPrefix, resolveCheckpointStoreLayout } from './checkpointStore';
 
 const execFileAsync = promisify(execFile);
@@ -52,12 +57,35 @@ describe('createCheckpointRuntime', () => {
     it('reports unsupported platforms without creating a protected runtime', async () => {
         expect(await createCheckpointRuntime({
             provider: 'codex',
+            platform: 'win32',
+            projectPath,
+            checkpointRoot,
+            binding,
+            protection,
+        })).toEqual({ status: 'unavailable', reason: 'unsupported-platform' });
+    });
+
+    // specs/linux-checkpoint-enforcement-backend R1/R2
+    it('opens a protected runtime on Linux only when the bubblewrap dependencies are present', async () => {
+        vi.mocked(cachedLinuxSandboxDependencyStatus).mockReturnValueOnce({ ok: false, missing: ['bwrap'] });
+        expect(await createCheckpointRuntime({
+            provider: 'codex',
             platform: 'linux',
             projectPath,
             checkpointRoot,
             binding,
             protection,
         })).toEqual({ status: 'unavailable', reason: 'unsupported-platform' });
+
+        vi.mocked(cachedLinuxSandboxDependencyStatus).mockReturnValueOnce({ ok: true });
+        expect(await createCheckpointRuntime({
+            provider: 'claude-remote',
+            platform: 'linux',
+            projectPath,
+            checkpointRoot,
+            binding,
+            protection,
+        })).toMatchObject({ status: 'protected' });
     });
 
     it('fixes sandbox deny before the first snapshot and excludes secret content from Git', async () => {
