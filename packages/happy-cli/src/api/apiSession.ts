@@ -28,7 +28,8 @@ import {
     ProviderUsageEventV1Schema,
     type ProviderUsageEventV1,
 } from '@slopus/happy-wire';
-import { createClaudeUsageEvent } from '@/usage/providerUsageAdapters';
+import { ClaudeTurnUsageTracker } from '@/usage/claudeTurnUsage';
+import { createClaudeTurnUsageEvent, createClaudeUsageEvent } from '@/usage/providerUsageAdapters';
 
 const DAEMON_RUNTIME_REPORT_MAX_INTERVAL_MS = 30_000;
 
@@ -317,6 +318,8 @@ export class ApiSessionClient extends EventEmitter {
     private assistantTurns = 0;
     private providerTokens = 0;
     private providerUsageEventIds = new Set<string>();
+    private readonly claudeTurnUsage = new ClaudeTurnUsageTracker();
+    private lastClaudeTurnResultUuid: string | null = null;
     private inputObservedForNextTurn = false;
     private launchedBackgroundJob = false;
 
@@ -1020,6 +1023,10 @@ export class ApiSessionClient extends EventEmitter {
                     model: typeof rawMessage.model === 'string' ? rawMessage.model : null,
                     usage: body.message.usage,
                 }));
+                this.claudeTurnUsage.noteAssistant({
+                    usage: body.message.usage,
+                    model: typeof rawMessage.model === 'string' ? rawMessage.model : null,
+                });
             } catch (error) {
                 logger.warn('[SOCKET] Failed to normalize provider usage data:', error);
             }
@@ -1363,6 +1370,43 @@ export class ApiSessionClient extends EventEmitter {
     /**
      * Send usage data to the server
      */
+    /**
+     * 턴 종료 result 메시지. Z.AI 호환 경로처럼 assistant usage 가 0 으로 온 턴은 result 의
+     * 토큰으로 한 번 보정한다 (src/usage/claudeTurnUsage.ts). 이미 계량된 턴은 건드리지 않는다.
+     */
+    applyClaudeTurnResult(result: {
+        uuid?: unknown;
+        usage?: unknown;
+        modelUsage?: unknown;
+    }) {
+        // 같은 result 가 두 번 전달돼도(SDK 재전달) 한 턴은 한 번만 본다.
+        if (typeof result.uuid === 'string' && result.uuid === this.lastClaudeTurnResultUuid) return;
+        if (typeof result.uuid === 'string') this.lastClaudeTurnResultUuid = result.uuid;
+        const usage = result.usage && typeof result.usage === 'object' ? result.usage as Usage : null;
+        const modelUsage = result.modelUsage && typeof result.modelUsage === 'object'
+            ? result.modelUsage as Record<string, { inputTokens?: number; outputTokens?: number }>
+            : null;
+        const fallback = this.claudeTurnUsage.resolveResult({ usage, modelUsage });
+        if (!fallback || typeof result.uuid !== 'string' || !result.uuid.trim()) return;
+        try {
+            this.sendProviderUsageEvent(createClaudeTurnUsageEvent({
+                sessionId: this.sessionId,
+                occurredAt: Date.now(),
+                resultUuid: result.uuid,
+                model: fallback.model,
+                usage: fallback.usage,
+            }));
+        } catch (error) {
+            logger.warn('[SOCKET] Failed to normalize turn usage data:', error);
+            return;
+        }
+        try {
+            this.sendUsageData(fallback.usage, fallback.model ?? undefined);
+        } catch (error) {
+            logger.debug('[SOCKET] Failed to send turn usage data:', error);
+        }
+    }
+
     sendUsageData(usage: Usage, model?: string) {
         // Calculate total tokens
         const totalTokens = usage.input_tokens + usage.output_tokens + (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0);

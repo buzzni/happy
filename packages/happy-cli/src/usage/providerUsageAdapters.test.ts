@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createClaudeUsageEvent, createCodexUsageEvent } from './providerUsageAdapters';
+import { createClaudeTurnUsageEvent, createClaudeUsageEvent, createCodexUsageEvent } from './providerUsageAdapters';
 
 describe('createClaudeUsageEvent', () => {
     it('uses the native message id so SDK and transcript copies are idempotent', () => {
@@ -47,6 +47,27 @@ describe('createClaudeUsageEvent', () => {
         });
 
         expect(event.sourceEventId).toBe('happy-session-1:anthropic:transcript-uuid');
+    });
+});
+
+describe('createClaudeTurnUsageEvent', () => {
+    it('keys the turn fallback on the result uuid so it never collides with message events', () => {
+        const event = createClaudeTurnUsageEvent({
+            sessionId: 'happy-session-1',
+            occurredAt: 1_788_000_000_000,
+            resultUuid: 'result-uuid-1',
+            model: 'glm-4.7',
+            usage: { input_tokens: 962, output_tokens: 3, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        });
+
+        expect(event).toMatchObject({
+            sourceEventId: 'happy-session-1:anthropic:turn:result-uuid-1',
+            provider: 'anthropic',
+            agent: 'claude',
+            model: 'glm-4.7',
+            measurement: 'delta',
+            tokens: { input: 962, output: 3, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 965 },
+        });
     });
 });
 

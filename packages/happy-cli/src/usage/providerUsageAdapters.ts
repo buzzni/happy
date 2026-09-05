@@ -60,6 +60,27 @@ export function createClaudeUsageEvent(input: {
     });
 }
 
+/**
+ * 턴 종료 result 기준 보정 이벤트 (src/usage/claudeTurnUsage.ts 참조). id 는 result uuid 로
+ * 만들어 assistant 메시지 이벤트와 절대 겹치지 않고, 같은 result 가 두 번 전달돼도 idempotent 하다.
+ */
+export function createClaudeTurnUsageEvent(input: {
+    sessionId: string;
+    occurredAt: number;
+    resultUuid: string;
+    model?: string | null;
+    usage: ClaudeUsage;
+}): ProviderUsageEventV1 {
+    return createClaudeUsageEvent({
+        sessionId: input.sessionId,
+        occurredAt: input.occurredAt,
+        messageId: `turn:${input.resultUuid.trim()}`,
+        transcriptUuid: input.resultUuid,
+        model: input.model,
+        usage: input.usage,
+    });
+}
+
 export function createCodexUsageEvent(input: {
     sessionId: string;
     responseId: string;
