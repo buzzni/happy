@@ -271,6 +271,17 @@ export class ApiSessionClient extends EventEmitter {
     private encryptionKey: Uint8Array;
     private encryptionVariant: 'legacy' | 'dataKey';
     private reconnectInterval: NodeJS.Timeout | null = null;
+    /**
+     * close() 로 의도적으로 끝낸 세션인가.
+     *
+     * 2026-09-05 프로덕션 — 리뷰 워커가 turn 을 끝내고 정리까지 마쳤는데
+     * (sendSessionDeath → flush → close → client.disconnect → happyServer.stop)
+     * 프로세스가 2시간 11분 살아남았다. close() 의 socket.close() 가 'disconnect'
+     * 핸들러를 깨우고, 그 핸들러가 startSmartReconnect() 를 걸어 1초 뒤 소켓이 다시
+     * 붙는다. 살아있는 소켓이 이벤트 루프를 붙잡아 run-once 세션이 끝나지 못했고,
+     * 그 프로세스가 worktree 를 점유해 그 저장소의 리뷰 큐가 통째로 멈췄다.
+     */
+    private closed = false;
     private ignoreArchiveSignal = false;
     private syncFatalHandled = false;
     // Durable session-end event log baseline, captured on first connect.
@@ -1565,6 +1576,8 @@ export class ApiSessionClient extends EventEmitter {
 
     async close() {
         logger.debug('[API] socket.close() called');
+        // socket.close() 가 부를 disconnect 핸들러보다 먼저 세운다.
+        this.closed = true;
         this.sendSync.stop();
         this.receiveSync.stop();
         this.stopReceivePolling();
@@ -1576,6 +1589,10 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private startSmartReconnect() {
+        if (this.closed) {
+            logger.debug('[API] Session closed — not reconnecting');
+            return;
+        }
         if (this.reconnectInterval) return;
 
         this.reconnectInterval = setInterval(() => {
@@ -1594,7 +1611,11 @@ export class ApiSessionClient extends EventEmitter {
 
         if (shouldReconnect()) {
             logger.debug('[API] Network up + lid open — reconnecting in 1s');
-            setTimeout(() => { if (!this.socket.connected) this.socket.connect() }, 1000);
+            // 이 타이머가 뜨는 사이 close() 가 들어올 수 있다.
+            setTimeout(() => {
+                if (this.closed) return;
+                if (!this.socket.connected) this.socket.connect();
+            }, 1000);
         }
     }
 }
