@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { execFile } from 'node:child_process';
@@ -73,6 +73,42 @@ describe('CheckpointTurnWorkspace', () => {
         await expect(execFileAsync('git', ['status', '--porcelain'], { cwd: workspace.path }))
             .resolves.toMatchObject({ stdout: ' M source.txt\n' });
         await expect(readFile(join(projectPath, '.git', 'HEAD'), 'utf8')).resolves.toBe('original-git');
+    });
+
+    it('reserves an empty directory that prepare later materializes into, and refuses a non-empty one', async () => {
+        // specs/linux-checkpoint-enforcement-backend R4 — the sandbox may be built before the turn starts.
+        const binding = {
+            sessionId: 'session-1',
+            projectId: 'project-1',
+            worktreeId: null,
+        };
+        const workspaces = new CheckpointTurnWorkspace(checkpointRoot);
+        const reserved = await workspaces.reserve({ ...binding, operationId: 'turn-1' });
+        expect(reserved.path).toBe(workspaces.pathFor({ ...binding, operationId: 'turn-1' }));
+        expect((await stat(reserved.path)).isDirectory()).toBe(true);
+        await expect(workspaces.reserve({ ...binding, operationId: 'turn-1' })).resolves.toEqual(reserved);
+
+        const snapshot = await new CheckpointStore(checkpointRoot).snapshotTurn({
+            ...binding,
+            operationId: 'turn-1',
+            projectPath,
+            excludedPatterns: ['**/.env*'],
+        });
+        const workspace = await workspaces.prepare({
+            ...binding,
+            operationId: 'turn-1',
+            checkpointId: snapshot.checkpointId,
+        });
+        expect(workspace.path).toBe(reserved.path);
+        await expect(readFile(join(workspace.path, 'source.txt'), 'utf8')).resolves.toBe('captured');
+
+        const dirty = await workspaces.reserve({ ...binding, operationId: 'turn-2' });
+        await writeFile(join(dirty.path, 'stray.txt'), 'not ours');
+        await expect(workspaces.prepare({
+            ...binding,
+            operationId: 'turn-2',
+            checkpointId: snapshot.checkpointId,
+        })).rejects.toThrow('checkpoint turn workspace is not empty');
     });
 
     it('atomically moves a completed turn outside its writable sandbox path', async () => {

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -250,6 +250,33 @@ describe('createCheckpointSessionComposition', () => {
         expect(second.checkpointId).not.toBe(first.checkpointId);
         await expect(readFile(join(second.providerPath, 'source.txt'), 'utf8')).resolves.toBe('first turn');
         await result.completeTurn(async () => {});
+    });
+
+    it('reserves the provider workspace directory before the first turn and after each rotation', async () => {
+        // specs/linux-checkpoint-enforcement-backend R4 — Codex wraps its sandbox in connect(), before
+        // beforeTurn() materializes the workspace. Linux bubblewrap skips allowWrite paths that do not
+        // exist yet, so the reserved path must already be a directory when the sandbox is built.
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-1',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+        if (!result.beforeTurn || !result.completeTurn || !result.providerPath) throw new Error('expected protected turn lifecycle');
+
+        await expect(stat(result.providerPath)).resolves.toMatchObject({ mode: expect.any(Number) });
+        expect((await stat(result.providerPath)).isDirectory()).toBe(true);
+        const first = await result.beforeTurn();
+        expect(first.providerPath).toBe(result.providerPath);
+        await expect(readFile(join(first.providerPath, 'source.txt'), 'utf8')).resolves.toBe('before');
+        await result.completeTurn(async () => {});
+
+        expect(result.providerPath).not.toBe(first.providerPath);
+        expect((await stat(result.providerPath)).isDirectory()).toBe(true);
+        await expect(stat(first.providerPath)).rejects.toMatchObject({ code: 'ENOENT' });
     });
 
     it('records a daemon-readable pending decision when policy drift blocks dispatch', async () => {

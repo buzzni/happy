@@ -69,6 +69,15 @@ export class CheckpointTurnWorkspace {
         await rm(dirname(this.pathFor(request)), { recursive: true, force: true });
     }
 
+    // specs/linux-checkpoint-enforcement-backend R4 — the provider sandbox can be built before the
+    // turn starts (Codex wraps in connect()). Linux bubblewrap only binds allowWrite paths that exist,
+    // so the writable path must be a directory as soon as it is handed out. Idempotent.
+    async reserve(request: CheckpointTurnWorkspaceKey): Promise<PreparedCheckpointTurnWorkspace> {
+        const workspacePath = this.pathFor(request);
+        await mkdir(workspacePath, { recursive: true, mode: 0o700 });
+        return { path: workspacePath };
+    }
+
     async prepare(
         request: CheckpointTurnWorkspaceRequest,
     ): Promise<PreparedCheckpointTurnWorkspace> {
@@ -81,9 +90,10 @@ export class CheckpointTurnWorkspace {
         });
         await assertCheckpointOwnedByBinding(layout.gitDirectory, layout.refName, request.checkpointId);
 
-        const workspacePath = this.pathFor(request);
-        await mkdir(dirname(workspacePath), { recursive: true, mode: 0o700 });
-        await mkdir(workspacePath, { recursive: false, mode: 0o700 });
+        const workspacePath = (await this.reserve(request)).path;
+        if ((await readdir(workspacePath)).length > 0) {
+            throw new Error('checkpoint turn workspace is not empty');
+        }
         try {
             await extractGitArchive([
                 `--git-dir=${layout.gitDirectory}`,

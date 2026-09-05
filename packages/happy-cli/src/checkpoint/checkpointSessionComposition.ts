@@ -114,14 +114,14 @@ export async function createCheckpointSessionComposition(input: {
         };
     };
     let nextOperationId = randomUUID();
-    let providerPath = turnWorkspace.pathFor({ ...workspaceBinding, operationId: nextOperationId });
+    let providerPath = (await turnWorkspace.reserve({ ...workspaceBinding, operationId: nextOperationId })).path;
     const sandboxConfig = sandboxConfigFor(providerPath);
     const claudeSandbox: QueryOptions['sandbox'] | undefined = input.provider === 'claude-remote'
         ? claudeSandboxFor(sandboxConfig, providerPath)
         : undefined;
-    const rotateProviderPath = () => {
+    const rotateProviderPath = async () => {
         nextOperationId = randomUUID();
-        providerPath = turnWorkspace.pathFor({ ...workspaceBinding, operationId: nextOperationId });
+        providerPath = (await turnWorkspace.reserve({ ...workspaceBinding, operationId: nextOperationId })).path;
         Object.assign(sandboxConfig, sandboxConfigFor(providerPath));
         if (claudeSandbox) Object.assign(claudeSandbox, claudeSandboxFor(sandboxConfig, providerPath));
     };
@@ -230,7 +230,7 @@ export async function createCheckpointSessionComposition(input: {
             });
             activeTurn = null;
             frozenWorkspacePath = null;
-            rotateProviderPath();
+            await rotateProviderPath();
         }
         return result;
     };
