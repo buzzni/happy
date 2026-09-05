@@ -39,6 +39,7 @@ import { notifyDaemonSessionStarted } from "@/daemon/controlClient";
 import { encodeBase64 } from '@/api/encryption';
 import type { Session as ApiSession, UserMessage } from '@/api/types';
 import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler";
+import { createTerminationSignalHandler } from "@/codex/terminationSignals";
 import { connectionState } from '@/utils/serverConnectionErrors';
 import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import type { PermissionMode } from '@/api/types';
@@ -675,6 +676,19 @@ export async function runCodex(opts: {
     session.rpcHandlerManager.registerHandler('abort', handleAbort);
 
     registerKillSessionHandler(session.rpcHandlerManager, handleKillSession);
+
+    // The daemon stops sessions with a bare SIGTERM (daemon/run.ts) — the idle
+    // reaper, the stop-session RPC and Ctrl-C all land here, never on the
+    // killSession RPC above. Without a handler Node's default disposition kills
+    // us on the spot, so sendSessionDeath/flush/close never run and the tail of
+    // the conversation is lost. runClaude has had these handlers all along;
+    // the Codex runner never grew them.
+    const handleTerminationSignal = createTerminationSignalHandler({
+        terminate: handleKillSession,
+        forceExit: (code) => process.exit(code),
+    });
+    process.on('SIGTERM', () => { void handleTerminationSignal('SIGTERM'); });
+    process.on('SIGINT', () => { void handleTerminationSignal('SIGINT'); });
 
     // Exit when the session is archived/deleted server-side: the web archive
     // button (ephemeral with reason='archived') or a fatal 404 from the
