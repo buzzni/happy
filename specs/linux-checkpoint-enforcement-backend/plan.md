@@ -47,7 +47,9 @@ R5-a는 보장 축소, MCP bash_stream은 호스트 실행)은 전부 "코드 �
       8. (R8 추가) passthrough symlink를 지우고 실제 dir로 바꾼 뒤 apply 결과, 그리고
          `extraWritePaths`에 원본 경로를 넣은 중첩 케이스에서 원본 ro 유지.
       → 검증: 7개 결과가 context.md 표에 있고 R4 방식(a/b)이 택일됨.
-- [x] **Phase 1: R4 순서 수정** — `d63f5e89`, 방식 (a) `reserve()` → 택일한 방식 구현. macOS integration 테스트 무회귀 확인.
+- [x] **Phase 1: R4 순서 수정** — `d63f5e89`(예약) + `c3a3c931`(순서) + `1fbe968e`·`b83b105e`(리뷰 반영).
+      (a)와 (b)를 모두 적용했다: 빈 dir 예약만으로는 살아 있는 bwrap의 mount-point 때문에 실패해,
+      `prepareProtectedTurn()`이 종료 확인 → gate → wrap·spawn 순서를 강제한다. macOS 무회귀 확인.
       → 검증: `checkpointSessionComposition.test.ts` 또는 `codexAppServerClient` 테스트 + macOS integration(로컬)
 - [x] **Phase 2: 게이트 확장 + 프로브 (R1, R2)** — `136ed6f3` → `resolveCheckpointProtectionCapability`에
       `checkDependencies` 결과 주입, `linux` 분기, daemon 수명 캐시. 매트릭스 테스트

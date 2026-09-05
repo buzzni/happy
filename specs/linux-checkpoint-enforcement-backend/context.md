@@ -17,9 +17,13 @@ checkpoint+sandbox 단위 182/182, tsc 0. 남은 것은 (1) provider smoke를 �
   제외(R3 개정) / 이유: glob은 미강제+잔여물, symlink는 bwrap 기동 실패, 대상은 `/` ro-bind로
   이미 read-only / 실측: Linux R8 통과(읽기 OK·쓰기 거부·symlink 교체 시 원본 불변·`**` 없음)
 
-- [2026-09-05] 결정: R4는 (a) `CheckpointTurnWorkspace.reserve()`로 workspace 경로를 빈 dir로
-  미리 만들고 `prepare()`는 비어 있지 않은 dir만 거부 / 이유: Codex `connect()` 순서를 건드리지
-  않고 플랫폼 중립, macOS integration 무회귀 / 기각: (b) connect를 beforeTurn 뒤로 이동
+- [2026-09-05] 결정(최종): R4는 (a) `reserve()`와 (b) 순서 변경을 **둘 다** 한다 —
+  `CheckpointTurnWorkspace.reserve()`로 경로를 빈 dir로 예약하고, `prepareProtectedTurn()`이
+  실행 중인 codex를 끊고 **종료를 확인한 뒤** gate를 돌리고 그 다음 wrap·spawn 한다 /
+  이유: (a)만으로는 부족했다. 살아 있는 bwrap이 예약 dir에 만든 mount-point는 EBUSY로 지울 수
+  없어 `prepare()`가 "not empty"로 실패했다(Ubuntu 22.04 실측) / 처음엔 (b)를 "재접속 흐름을
+  건드려 위험"으로 기각했으나 실측이 그 판단을 뒤집었다. 보호 턴은 이미 매번
+  disconnect→reconnect 하므로 그 경로를 재사용하는 작은 변경이었다 (커밋 `c3a3c931`)
 - [2026-09-05] 결정: CI job 추가 대신 컨테이너 스크립트 커밋 / 이유: happy 저장소 CI는 happy-cli
   vitest를 아예 돌리지 않아(unit도) integration job 하나를 새로 세우는 건 이 스펙 범위 밖
 - [2026-09-05] 결정: `unsupported-platform` 재사용, 프로브 결과 로그는 바이너리 이름만 / 이유: spec R2·R9

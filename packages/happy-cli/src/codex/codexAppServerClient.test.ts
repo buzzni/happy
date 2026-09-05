@@ -785,6 +785,46 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('marks the turn dispatched on the real send paths, before the outcome is known', async () => {
+        // The composition only preserves a turn's workspace once it is marked dispatched, so this
+        // pins the client-side wiring: reverting the markTurnDispatched() call fails here.
+        const marks: string[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-dispatch', path: '/tmp/thread-dispatch' },
+                            model: 'gpt-test', modelProvider: 'openai', cwd: '/tmp/project',
+                            approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' }, reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    marks.push('turn-start');
+                    // No completion notification: the turn outcome stays unknown on purpose.
+                    setTimeout(() => pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-dispatch' } } }), 0);
+                }
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(
+            sandboxConfig,
+            async () => {},
+            undefined,
+            () => marks.push('dispatched'),
+        );
+        await client.connect();
+        await client.startThread({ cwd: '/tmp/project' });
+
+        await client.sendTurn('edit the project');
+
+        // Marked before the provider is even asked to start the turn, and before any outcome.
+        expect(marks).toEqual(['dispatched', 'turn-start']);
+        await client.disconnect();
+    });
+
     it('refuses to open the gate when the provider process will not exit', async () => {
         // If codex never dies, bwrap still holds its mount points and the sandbox cleanup silently
         // fails, so materializing the workspace would fail later with a confusing error. Fail closed.
