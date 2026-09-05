@@ -35,15 +35,13 @@ export const ELECTRON_GUI_VIEWER_HTML = `<!doctype html>
   var reconnect = params.get('reconnect') !== 'false';
   var socket = null;
 
+  // The relay's HTML shim strips its prefix from the current pathname and leaves
+  // ws:// URLs alone, so without an explicit \`path\` the socket path comes from
+  // document.baseURI — the injected <base href> still carries the prefix, and
+  // a direct or subdomain-origin load resolves the same way.
   function socketUrl() {
     var path = params.get('path');
-    var base;
-    if (path) {
-      base = '/' + path.replace(/^\\/+/, '');
-    } else {
-      var dir = location.pathname.replace(/[^/]*$/, '');
-      base = dir + 'websockify';
-    }
+    var base = path ? '/' + path.replace(/^\\/+/, '') : new URL('websockify', document.baseURI).pathname;
     return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + base;
   }
 

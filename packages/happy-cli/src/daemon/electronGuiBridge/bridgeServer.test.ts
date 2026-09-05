@@ -83,6 +83,16 @@ describe('electron GUI bridge server', () => {
         expect((await fetch(`http://127.0.0.1:${started.port}/nope`)).status).toBe(404)
     })
 
+    // The cloud relay's HTML shim strips the prefix from location.pathname and
+    // does not re-prefix ws:// URLs (scheme differs from ORIGIN), so the socket
+    // path must come from document.baseURI, where the injected <base> keeps it.
+    it('derives the socket path from document.baseURI, never from location.pathname', async () => {
+        started = await createElectronGuiBridgeServer({ port: 0, host: '127.0.0.1', source: fakeSource().source })
+        const html = await (await fetch(`http://127.0.0.1:${started.port}/vnc.html`)).text()
+        expect(html).toContain("new URL('websockify', document.baseURI)")
+        expect(html).not.toContain('location.pathname')
+    })
+
     it('streams screencast frames to a viewer connected at /websockify and stops when it leaves', async () => {
         const fake = fakeSource()
         started = await createElectronGuiBridgeServer({ port: 0, host: '127.0.0.1', source: fake.source })
