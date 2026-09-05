@@ -89,6 +89,8 @@ import { BrowserSessionBrokerClient } from '@/daemon/browserSessionBrokerContrac
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken';
 import { deriveBrowserViewerBridgeToken } from '@/daemon/browserBridge';
 import { readFile, readdir } from 'node:fs/promises';
+import { ensureElectronGuiDisplay } from '@/daemon/electronGuiDisplay';
+import { projectPath } from '@/projectPath';
 import {
     addDaemonTerminalSession,
     getDaemonTerminalSession,
@@ -1131,6 +1133,18 @@ export class ApiMachineClient {
             const response = await this.browserSessionBroker.request({ op: 'migrate-legacy', viewerKey });
             if (!response.ok) throw new Error(response.code);
             return { viewerKey, migrated: response.migrated === true };
+        });
+
+        // Host-mode Electron preview (no docker): make sure a window can be
+        // created here (Xvfb on Linux, a GUI session on macOS) and hand back
+        // the env that preloads the cdp-screencast bridge into the app.
+        // aplus-dev-studio specs/electron-gui-preview-cross-platform Phase 3.
+        this.rpcHandlerManager.registerHandler('gui-display:ensure', async (params: any) => {
+            return ensureElectronGuiDisplay({
+                streamPort: params?.streamPort,
+                packageRoot: projectPath(),
+                canSudo: canSudoWithoutPassword,
+            });
         });
 
         // Register stop daemon handler
