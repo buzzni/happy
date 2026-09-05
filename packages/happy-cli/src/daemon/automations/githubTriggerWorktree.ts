@@ -5,7 +5,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
 import { releaseDanglingSubmoduleWorktreePointers } from './submoduleWorktreePointer'
-import { hasUnsavedWorktreeChanges } from './worktreeDirtyState'
+import { describeUnsavedWorktreeChanges, hasUnsavedWorktreeChanges } from './worktreeDirtyState'
 
 const execFileAsync = promisify(execFile)
 const COMMAND_TIMEOUT_MS = 60_000
@@ -107,7 +107,10 @@ export async function removeGithubTriggerWorktree(input: {
   // 아니라 에이전트 산출물(?? memory/)과 서브모듈 gitlink( M vendor/happy)였기 때문이다.
   // 무해하다고 아는 것만 무시하고, 하나라도 진짜 변경이 섞이면 그대로 지킨다.
   if (hasUnsavedWorktreeChanges(status.stdout)) {
-    return { ok: false, dirty: true, error: 'GitHub automation worktree is dirty' }
+    // 무엇이 막고 있는지 말한다 — 이 보류는 그 저장소의 리뷰 큐를 멈추므로,
+    // 사람이 git status 를 다시 치게 만들면 그만큼 큐가 더 오래 멈춘다.
+    const blocking = describeUnsavedWorktreeChanges(status.stdout).join(', ')
+    return { ok: false, dirty: true, error: `GitHub automation worktree is dirty (${blocking})` }
   }
   const removed = await commandOrError(runCommand, {
     executable: 'git',

@@ -313,7 +313,12 @@ describe('removeGithubTriggerWorktree', () => {
       pathExists: vi.fn(async () => true),
     })
 
-    expect(result).toEqual({ ok: false, dirty: true, error: 'GitHub automation worktree is dirty' })
+    // 2026-09-05 — "dirty" 만으로는 사람이 직접 git status 를 쳐야 했고, 그 사이
+    // 그 저장소의 리뷰 큐가 멈춰 있었다. 무엇이 막고 있는지 말한다.
+    expect(result).toEqual({
+      ok: false, dirty: true,
+      error: 'GitHub automation worktree is dirty (src/app.ts)',
+    })
     expect(runCommand).toHaveBeenCalledTimes(1)
   })
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { hasUnsavedWorktreeChanges } from './worktreeDirtyState';
+import { describeUnsavedWorktreeChanges, hasUnsavedWorktreeChanges } from './worktreeDirtyState';
 
 // 2026-09-04 프로덕션 — 자동화 worktree 45개(23GB)가 지워지지 않고 쌓였다. 정리는
 // `git status --porcelain` 이 한 줄이라도 있으면 "dirty" 로 보고 보존하는데, 실제
@@ -44,3 +44,42 @@ describe('hasUnsavedWorktreeChanges', () => {
     expect(hasUnsavedWorktreeChanges(' M vendor/happy/src/index.ts\n')).toBe(true);
   });
 });
+
+// 2026-09-05 프로덕션 — 리뷰 워커가 제출을 끝낸 뒤 `.agenttask-3446-result.json` 을
+// worktree 루트에 남겼다. 그 한 줄 때문에 정리가 거부됐고, 자동화가 worktree 게이트에
+// 걸려 그 저장소의 리뷰가 통째로 멈췄다(aplus#3447 이 2시간 넘게 대기). 결과는 이미
+// 서버에 제출된 뒤라 파일에는 잃을 것이 없다.
+describe('에이전트가 남긴 제출 결과 파일', () => {
+  it('does not hold a worktree hostage for a scratch result the agent already submitted', () => {
+    expect(hasUnsavedWorktreeChanges('?? .agenttask-3446-result.json\n')).toBe(false);
+  });
+
+  it('still protects a real untracked file that only looks similar', () => {
+    expect(hasUnsavedWorktreeChanges('?? agenttask-notes.md\n')).toBe(true);
+    expect(hasUnsavedWorktreeChanges('?? src/.agenttask-3446-result.json\n')).toBe(true);
+  });
+
+  it('keeps protecting real work that sits next to the scratch file', () => {
+    expect(hasUnsavedWorktreeChanges('?? .agenttask-3446-result.json\n M src/app.ts\n')).toBe(true);
+  });
+});
+
+// 2026-09-05 — 로그는 "worktree is dirty" 만 말했고, 무엇이 dirty 한지 알아내려면
+// 사람이 직접 git status 를 쳐야 했다. 그 사이 리뷰 큐는 멈춰 있었다.
+describe('describeUnsavedWorktreeChanges', () => {
+  it('names what is actually blocking so nobody has to run git status by hand', () => {
+    expect(describeUnsavedWorktreeChanges('?? memory/\n M src/app.ts\n?? notes.md\n'))
+      .toEqual(['src/app.ts', 'notes.md']);
+  });
+
+  it('is empty when nothing blocks', () => {
+    expect(describeUnsavedWorktreeChanges('?? memory/\n')).toEqual([]);
+  });
+
+  it('caps the list so one log line cannot become a thousand', () => {
+    const many = Array.from({ length: 50 }, (_, i) => `?? file${i}.txt`).join('\n');
+
+    expect(describeUnsavedWorktreeChanges(many)).toHaveLength(10);
+  });
+});
+
