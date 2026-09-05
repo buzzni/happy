@@ -64,24 +64,42 @@ function waitForWindow(electron: ElectronLike): Promise<ElectronWindowLike> {
 }
 
 /**
- * Follows the app's windows: each viewer connection attaches to the current
- * focused window; when that window closes the screencast ends and the viewer's
- * reconnect picks the next one (hot reload restarts of the main process are
- * covered the same way — the whole bridge restarts with the process).
+ * Follows the app's windows: the screencast attaches to the current focused
+ * window, and when that window closes it re-attaches to the next one on its
+ * own. Waiting for the viewer to reconnect would never happen — the bridge
+ * socket stays open when only the window goes away, so from the viewer's side
+ * there is nothing to reconnect; without re-attach the canvas freezes on the
+ * last frame forever. (Hot-reload restarts of the main process are different:
+ * the whole bridge dies with the process and the socket close does trigger
+ * the viewer's reconnect.)
  */
 export function createWindowScreencastSource(electron: ElectronLike): ElectronGuiScreencastSource {
     let current: ElectronGuiScreencastSource | null = null
+    // Identifies one startScreencast..stopScreencast span; a re-attach from a
+    // window that closed after stopScreencast must not revive the capture.
+    let session: symbol | null = null
+
+    const attach = async (token: symbol, onFrame: (frame: ElectronGuiFrame) => void): Promise<void> => {
+        const window = await waitForWindow(electron)
+        if (session !== token) return
+        const source = createDebuggerScreencastSource(window.webContents.debugger)
+        current = source
+        window.once('closed', () => {
+            if (session !== token) return
+            current = null
+            attach(token, onFrame).catch((error) => log(`re-attach failed: ${String(error)}`))
+        })
+        await source.startScreencast(onFrame)
+    }
+
     return {
         async startScreencast(onFrame: (frame: ElectronGuiFrame) => void) {
-            const window = await waitForWindow(electron)
-            const source = createDebuggerScreencastSource(window.webContents.debugger)
-            current = source
-            window.once('closed', () => {
-                if (current === source) current = null
-            })
-            await source.startScreencast(onFrame)
+            const token = Symbol('screencast')
+            session = token
+            await attach(token, onFrame)
         },
         async stopScreencast() {
+            session = null
             const source = current
             current = null
             if (!source) return
