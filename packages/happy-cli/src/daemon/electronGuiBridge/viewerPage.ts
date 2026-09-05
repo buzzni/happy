@@ -34,7 +34,6 @@ export const ELECTRON_GUI_VIEWER_HTML = `<!doctype html>
   var status = document.getElementById('status');
   var reconnect = params.get('reconnect') !== 'false';
   var socket = null;
-  var frameW = 0, frameH = 0;
 
   function socketUrl() {
     var path = params.get('path');
@@ -54,7 +53,6 @@ export const ELECTRON_GUI_VIEWER_HTML = `<!doctype html>
     var img = new Image();
     img.onload = function () {
       if (canvas.width !== img.width || canvas.height !== img.height) { canvas.width = img.width; canvas.height = img.height; }
-      frameW = msg.width; frameH = msg.height;
       ctx.drawImage(img, 0, 0);
     };
     img.src = 'data:image/jpeg;base64,' + msg.data;
