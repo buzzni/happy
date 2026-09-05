@@ -168,6 +168,22 @@ describe('Saycode agent resume environment', () => {
         })
     })
 
+    it('captures the discovery scope so a resumed session keeps seeing sibling worktrees', () => {
+        // SAYCODE_AGENT_SCOPE (saycode-cli 0.4.0, Desktop ADR-061) widens ls/read/steer to the
+        // project tree. Dropping it on resume silently shrinks a hub back to its own worktree.
+        expect(captureSaycodeAgentEnvironment({
+            SAYCODE_AGENT_ENV: '1',
+            SAYCODE_AGENT_ROOT: '/repo/.aplus/worktrees/p/a',
+            SAYCODE_AGENT_SCOPE: '/repo',
+            SAYCODE_AGENT_DEPTH: '0',
+        })).toEqual({
+            SAYCODE_AGENT_ENV: '1',
+            SAYCODE_AGENT_ROOT: '/repo/.aplus/worktrees/p/a',
+            SAYCODE_AGENT_SCOPE: '/repo',
+            SAYCODE_AGENT_DEPTH: '0',
+        })
+    })
+
     it('restores the captured capability and current session id on resume', () => {
         expect(buildResumedSessionSpawnEnvironment({
             inherited: {
