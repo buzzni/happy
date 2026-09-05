@@ -103,7 +103,7 @@ export const ELECTRON_GUI_VIEWER_HTML = `<!doctype html>
       try { msg = JSON.parse(event.data); } catch (e) { return; }
       if (msg.t === 'frame') { setStatus(null); drawFrame(msg); }
       else if (msg.t === 'ready') { setStatus('Electron 창을 기다리는 중…'); }
-      else if (msg.t === 'error') { setStatus(msg.reason === 'busy' ? '다른 뷰어가 이미 이 화면을 보고 있습니다.' : ('화면 스트림 오류: ' + (msg.message || msg.reason))); }
+      else if (msg.t === 'error') { setStatus('화면 스트림 오류: ' + (msg.message || msg.reason)); }
     };
     socket.onclose = function () {
       setStatus('연결이 끊겼습니다.' + (reconnect ? ' 다시 연결하는 중…' : ''));
