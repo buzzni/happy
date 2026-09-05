@@ -169,6 +169,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         // Write to message log
         formatClaudeMessageForInk(message, messageBuffer);
 
+        // 턴 종료 result 는 transcript 로 가지 않는다 — 사용량 보정만 세션에 넘긴다
+        // (Z.AI 호환 경로의 assistant usage 0 문제, src/usage/claudeTurnUsage.ts).
+        if (message.type === 'result') {
+            session.client.applyClaudeTurnResult(message as unknown as { uuid?: unknown; usage?: unknown; modelUsage?: unknown });
+        }
+
         // Track active tool calls
         if (message.type === 'assistant') {
             let umessage = message as SDKAssistantMessage;

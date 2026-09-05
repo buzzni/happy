@@ -622,6 +622,63 @@ describe('ApiSessionClient v3 messages API migration', () => {
         await client.close();
     });
 
+    it('emits one turn usage event from the result when assistant messages reported zero tokens', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        mockAxiosPost.mockImplementation(async (_url: string, payload: { messages: Array<{ localId: string }> }) => ({
+            data: { messages: payload.messages.map((message, index) => ({ id: `msg-${index + 1}`, seq: index + 1, localId: message.localId, createdAt: 1, updatedAt: 1 })) },
+        }));
+        // Z.AI 호환 경로: assistant usage 0, result 에만 토큰이 있다.
+        client.sendClaudeSessionMessage({
+            type: 'assistant',
+            uuid: 'sdk-uuid-zai',
+            timestamp: 1_788_000_000_000,
+            message: { id: 'msg-zai-1', model: 'glm-5.3-flash', content: [], usage: { input_tokens: 0, output_tokens: 0 } },
+        } as any);
+        client.applyClaudeTurnResult({
+            uuid: 'result-uuid-1',
+            usage: { input_tokens: 962, output_tokens: 3, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+            modelUsage: { 'glm-4.7': { inputTokens: 962, outputTokens: 3 } },
+        });
+        // 같은 result 가 다시 와도(중복 전달) 보정은 한 번뿐이다.
+        client.applyClaudeTurnResult({
+            uuid: 'result-uuid-1',
+            usage: { input_tokens: 962, output_tokens: 3 },
+        });
+
+        const events = mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === 'provider-usage-report')
+            .map(([, event]: [string, unknown]) => event);
+        expect(events.map((event: any) => event.sourceEventId)).toEqual([
+            'test-session-id:anthropic:msg-zai-1',
+            'test-session-id:anthropic:turn:result-uuid-1',
+        ]);
+        expect(events[1]).toMatchObject({ model: 'glm-4.7', tokens: { input: 962, output: 3, total: 965 } });
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', expect.objectContaining({
+            providerTokens: 965,
+        }));
+        await client.close();
+    });
+
+    it('does not emit a turn usage event when assistant messages already carried tokens', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        mockAxiosPost.mockImplementation(async (_url: string, payload: { messages: Array<{ localId: string }> }) => ({
+            data: { messages: payload.messages.map((message, index) => ({ id: `msg-${index + 1}`, seq: index + 1, localId: message.localId, createdAt: 1, updatedAt: 1 })) },
+        }));
+        client.sendClaudeSessionMessage({
+            type: 'assistant',
+            uuid: 'sdk-uuid-anthropic',
+            timestamp: 1_788_000_000_000,
+            message: { id: 'msg-a-1', model: 'claude-sonnet-4-5', content: [], usage: { input_tokens: 100, output_tokens: 20 } },
+        } as any);
+        client.applyClaudeTurnResult({ uuid: 'result-uuid-2', usage: { input_tokens: 100, output_tokens: 20 } });
+
+        const events = mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === 'provider-usage-report')
+            .map(([, event]: [string, unknown]) => event);
+        expect(events).toHaveLength(1);
+        await client.close();
+    });
+
     it('preserves the Studio optimistic id on a Claude initial prompt', async () => {
         const client = new ApiSessionClient('fake-token', session);
         mockAxiosPost.mockResolvedValueOnce({
