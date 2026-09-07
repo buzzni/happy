@@ -44,6 +44,7 @@ import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import type { PermissionMode } from '@/api/types';
 import type { ApiSessionClient } from '@/api/apiSession';
 import { resolveCodexExecutionPolicy } from './executionPolicy';
+import { resolveRemoteCodexPermissionMode } from './permissionMode';
 import { isSandboxFallbackNetworkLoss } from './sandboxInitFailurePolicy';
 import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
 import {
@@ -351,38 +352,19 @@ export async function runCodex(opts: {
         logger.debug('[Codex] Reset turn-scoped options after abort');
     };
 
-    // Valid Codex permission modes from remote messages. Matches the modes
-    // the mobile UI exposes for Codex sessions (see modelModeOptions.ts:
-    // getCodexPermissionModes) and mirrors the Gemini validation pattern at
-    // runGemini.ts:222. Anything outside this set is silently ignored — the
-    // previous code blindly cast `message.meta.permissionMode as PermissionMode`
-    // at runtime, meaning a crafted value like `'totally_unsafe'` would be
-    // accepted and then fall through to the `default` branch in
-    // resolveCodexExecutionPolicy() — or worse, an attacker-chosen valid value
-    // could escalate sandbox scope (issue #1092).
-    const VALID_REMOTE_PERMISSION_MODES: readonly PermissionMode[] = [
-        'default',
-        'read-only',
-        'safe-yolo',
-        'yolo',
-    ];
-
     const handleUserMessage = createSerialAsyncHandler<UserMessage>(async (message) => {
         const attachmentsForThisMessage = await session.drainAttachmentsForUserMessage();
 
-        // Resolve permission mode (validate against Codex-native modes)
-        let messagePermissionMode = currentPermissionMode;
-        if (message.meta?.permissionMode) {
-            const incoming = message.meta.permissionMode as PermissionMode;
-            if (VALID_REMOTE_PERMISSION_MODES.includes(incoming)) {
-                messagePermissionMode = incoming;
-                currentPermissionMode = messagePermissionMode;
-                logger.debug(`[Codex] Permission mode updated from user message to: ${currentPermissionMode}`);
-            } else {
-                logger.debug(`[Codex] Ignoring invalid permission mode from user message: ${String(message.meta.permissionMode)}`);
-            }
+        // Resolve permission mode (validated + downgrade-guarded in permissionMode.ts)
+        const messagePermissionMode = resolveRemoteCodexPermissionMode(
+            currentPermissionMode,
+            message.meta?.permissionMode as PermissionMode | undefined,
+        );
+        if (messagePermissionMode !== currentPermissionMode) {
+            currentPermissionMode = messagePermissionMode;
+            logger.debug(`[Codex] Permission mode updated from user message to: ${currentPermissionMode}`);
         } else {
-            logger.debug(`[Codex] User message received with no permission mode override, using current: ${currentPermissionMode ?? 'default (effective)'}`);
+            logger.debug(`[Codex] Keeping current permission mode: ${currentPermissionMode ?? 'default (effective)'}`);
         }
 
         // Resolve model; explicit null resets to default (undefined)
