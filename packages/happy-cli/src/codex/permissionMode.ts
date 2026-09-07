@@ -17,10 +17,19 @@ const VALID_REMOTE_PERMISSION_MODES: readonly PermissionMode[] = [
     'yolo',
 ];
 
+function isCodexBypassEquivalent(mode: PermissionMode | undefined): boolean {
+    return mode === 'yolo' || mode === 'bypassPermissions';
+}
+
 /**
  * Resolve a permission mode override arriving on a remote user message.
- * Anything outside VALID_REMOTE_PERMISSION_MODES is ignored and the current
- * mode is kept.
+ *
+ * Clients attach `permissionMode` to every message, and some of them send the
+ * ambient `"default"` even when the session was started in yolo/bypass mode.
+ * Letting that through drops the session to `untrusted` (executionPolicy.ts), so
+ * every subsequent shell call raises an approval card. Guard it the same way
+ * Claude does in resolveRemoteClaudePermissionMode(), while still letting an
+ * explicit mode such as read-only or safe-yolo take effect.
  */
 export function resolveRemoteCodexPermissionMode(
     currentMode: PermissionMode | undefined,
@@ -28,5 +37,6 @@ export function resolveRemoteCodexPermissionMode(
 ): PermissionMode | undefined {
     if (!incomingMode) return currentMode;
     if (!VALID_REMOTE_PERMISSION_MODES.includes(incomingMode)) return currentMode;
+    if (isCodexBypassEquivalent(currentMode) && incomingMode === 'default') return currentMode;
     return incomingMode;
 }
