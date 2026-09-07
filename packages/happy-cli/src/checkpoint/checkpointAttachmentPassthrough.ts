@@ -11,13 +11,11 @@
  * fingerprint and fails every later turn with `CheckpointPolicyDriftError`.
  *
  * Both problems are solved by the mechanism ADR-059 already reserves for
- * ignored dependency/cache directories: a read-only passthrough. A passthrough
- * must name a directory that the manifest classifies exactly as `ignored`, so
- * this module writes a self-scoped `.aplus/.gitignore` (`*`) rather than
- * relying on the project's root `.gitignore` — the root file mentions `.aplus`
- * in some projects and not others, and when it does the ignored entry is
- * `.aplus` itself (the scan does not descend into ignored directories), which
- * is not the path we want to expose.
+ * ignored dependency/cache directories: a read-only passthrough. This module
+ * writes a self-scoped `.aplus/.gitignore` (`*`) when safe and only offers the
+ * narrow upload directory. When the project's root `.gitignore` ignores
+ * `.aplus`, the exclusion policy can validate the narrow path through that
+ * ignored ancestor without exposing sibling files.
  *
  * This runs before the exclusion baseline is built, so the files it creates are
  * part of the baseline and never read as drift.
@@ -33,24 +31,10 @@ const APLUS_DIRECTORY = '.aplus';
 const SELF_SCOPED_IGNORE = '*\n';
 
 /**
- * Prepares the upload directory and returns the passthrough paths to try, most
- * specific first. An empty list means "no passthrough".
- *
- * Two shapes exist because a project's root `.gitignore` decides which one the
- * manifest can even name, and the caller cannot know which in advance:
- *
- * - The root says nothing about `.aplus`. The scan descends into it, the
- *   `.aplus/.gitignore` written here marks `uploads/` ignored, and the narrow
- *   `.aplus/uploads` passthrough is the one that works.
- * - The root ignores `.aplus/`. The scan stops at `.aplus` and never names
- *   anything beneath it, so `.aplus` itself is the only nameable passthrough.
- *   It is wider than we would like — the whole Saycode directory becomes
- *   reachable read-only from the turn workspace — so it is only ever the
- *   fallback.
- *
- * Rather than reimplement that classification, the caller builds the exclusion
- * manifest with each candidate in turn and keeps the first it accepts; the
- * manifest stays the single authority on what counts as an ignored directory.
+ * Prepares the upload directory and returns the narrow passthrough path to try.
+ * An empty list means "no passthrough". The exclusion manifest remains the
+ * authority on whether the directory is ignored, including through an ignored
+ * ancestor.
  */
 export async function checkpointAttachmentPassthroughCandidates(
     projectPath: string,
@@ -65,7 +49,7 @@ export async function checkpointAttachmentPassthroughCandidates(
         if (aplusStats && !(aplusStats.isDirectory() && !aplusStats.isSymbolicLink())) return [];
         await mkdir(join(aplusPath, 'uploads'), { recursive: true, mode: 0o700 });
         if (!(await ensureSelfScopedIgnore(aplusPath))) return [];
-        return [CHECKPOINT_ATTACHMENT_UPLOAD_PATH, APLUS_DIRECTORY];
+        return [CHECKPOINT_ATTACHMENT_UPLOAD_PATH];
     } catch {
         return [];
     }
@@ -79,9 +63,8 @@ export async function checkpointAttachmentPassthroughCandidates(
  * Otherwise the new rule would newly classify a project's own file there (a
  * checked-in `worktree-setup.sh`, say) as ignored, dropping it out of the turn
  * workspace and out of checkpoint snapshots — a silent loss of protection for
- * a file that has nothing to do with attachments. In that case the caller falls
- * back to the wider `.aplus` candidate, which works when the project's root
- * ignore already covers the directory, and otherwise to no passthrough at all.
+ * a file that has nothing to do with attachments. In that case the caller
+ * offers no passthrough.
  */
 async function ensureSelfScopedIgnore(aplusPath: string): Promise<boolean> {
     const existing = await readIgnoreFile(join(aplusPath, '.gitignore'));

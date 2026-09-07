@@ -8,7 +8,11 @@ import type { QueryOptions } from '@/claude/sdk';
 import { createCheckpointRuntime } from './checkpointRuntime';
 import { readCheckpointSpawnContext } from './checkpointSpawnContext';
 import { checkpointAttachmentPassthroughCandidates } from './checkpointAttachmentPassthrough';
-import { CheckpointPolicyDriftError, type CheckpointProvider } from './checkpointExclusionPolicy';
+import {
+    CheckpointPolicyDriftError,
+    resolveCheckpointProtectionCapability,
+    type CheckpointProvider,
+} from './checkpointExclusionPolicy';
 import type { CheckpointEventPublisher } from './checkpointEventPublisher';
 import { CheckpointProtectionStateStore } from './checkpointProtectionState';
 import { CheckpointTurnWorkspace } from './checkpointTurnWorkspace';
@@ -69,6 +73,14 @@ export async function createCheckpointSessionComposition(input: {
         const { checkpointProtection: _checkpointProtection, ...unprotectedSandbox } = inputSandboxConfig;
         return { sandboxConfig: unprotectedSandbox };
     }
+    const capability = resolveCheckpointProtectionCapability(input);
+    if (!capability.supported) {
+        throw new Error(`checkpoint protection unavailable: ${capability.reason}`);
+    }
+    const checkpointEvents = input.checkpointEvents;
+    if (!checkpointEvents) {
+        throw new Error('checkpoint protection requires a durable event publisher');
+    }
     const buildRuntime = (passthroughPaths: string[] | undefined) => createCheckpointRuntime({
         provider: input.provider,
         platform: input.platform,
@@ -107,10 +119,6 @@ export async function createCheckpointSessionComposition(input: {
     if (runtime.status !== 'protected') {
         const reason = runtime.status === 'unavailable' ? runtime.reason : 'disabled';
         throw new Error(`checkpoint protection unavailable: ${reason}`);
-    }
-    const checkpointEvents = input.checkpointEvents;
-    if (!checkpointEvents) {
-        throw new Error('checkpoint protection requires a durable event publisher');
     }
 
     const turnWorkspace = new CheckpointTurnWorkspace(canonicalCheckpointRoot);
