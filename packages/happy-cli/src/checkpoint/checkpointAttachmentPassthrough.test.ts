@@ -64,12 +64,14 @@ describe('checkpointAttachmentPassthroughCandidates', () => {
             .resolves.toBe(CHECKPOINT_ATTACHMENT_UPLOAD_PATH);
     });
 
-    it('falls back to .aplus when the root gitignore stops the scan at .aplus', async () => {
+    it('keeps the narrow upload path when the root gitignore stops the scan at .aplus', async () => {
         await writeFile(join(projectPath, '.gitignore'), '.aplus/\n');
 
         const candidates = await checkpointAttachmentPassthroughCandidates(projectPath);
 
-        await expect(firstAcceptedCandidate(candidates)).resolves.toBe('.aplus');
+        expect(candidates).toEqual([CHECKPOINT_ATTACHMENT_UPLOAD_PATH]);
+        await expect(firstAcceptedCandidate(candidates))
+            .resolves.toBe(CHECKPOINT_ATTACHMENT_UPLOAD_PATH);
     });
 
     it('keeps a later upload of any size out of the exclusion fingerprint', async () => {

@@ -79,6 +79,7 @@ describe('createCheckpointSessionComposition', () => {
             sandboxConfig,
             env: contextEnv(),
         })).rejects.toThrow('unsupported-platform');
+        await expect(lstat(join(projectPath, '.aplus'))).rejects.toThrow();
     });
 
     it('fails closed when a protected runtime has no durable event publisher', async () => {
@@ -90,6 +91,7 @@ describe('createCheckpointSessionComposition', () => {
             sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
             env: contextEnv(),
         })).rejects.toThrow('durable event publisher');
+        await expect(lstat(join(projectPath, '.aplus'))).rejects.toThrow();
     });
 
     it.each(['claude-remote', 'codex'] as const)(
@@ -364,12 +366,14 @@ describe('createCheckpointSessionComposition', () => {
 
         await mkdir(join(projectPath, '.aplus', 'uploads'), { recursive: true });
         await writeFile(join(projectPath, '.aplus', 'uploads', 'attachment.txt'), 'uploaded content');
+        await writeFile(join(projectPath, '.aplus', '.env.production'), 'dummy-secret');
 
         const turn = await result.beforeTurn?.();
         if (!turn) throw new Error('expected turn preparation');
 
         await expect(readFile(join(turn.providerPath, '.aplus', 'uploads', 'attachment.txt'), 'utf8'))
             .resolves.toBe('uploaded content');
+        await expect(lstat(join(turn.providerPath, '.aplus', '.env.production'))).rejects.toThrow();
     });
 
     it('exposes .aplus/uploads through the provider path when the root gitignore never mentions .aplus', async () => {
