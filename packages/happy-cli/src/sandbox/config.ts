@@ -1,10 +1,16 @@
 import { homedir } from 'node:os';
+import { realpathSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import type { SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime';
 import type { SandboxConfig } from '@/persistence';
 
 function expandPath(pathValue: string, sessionPath: string): string {
     const expandedHome = pathValue.replace(/^~(?=\/|$)/, homedir());
+    // sandbox-runtime 0.0.37 recognises /tmp/... but misses the /tmp alias itself.
+    if (process.platform === 'darwin' && resolve(sessionPath, expandedHome) === '/tmp'
+        && realpathSync('/tmp') === '/private/tmp') {
+        return '/private/tmp';
+    }
     if (isAbsolute(expandedHome)) {
         return expandedHome;
     }
@@ -131,6 +137,7 @@ export function buildSandboxRuntimeConfig(
         enableWeakerNetworkIsolation,
         network,
         filesystem: {
+            allowGitConfig: sandboxConfig.allowGitConfig === true && !sandboxConfig.checkpointProtection,
             denyRead: resolvePaths(sandboxConfig.denyReadPaths, sessionPath),
             allowWrite,
             denyWrite: resolvePaths(sandboxConfig.denyWritePaths, sessionPath),
