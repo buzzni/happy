@@ -190,6 +190,27 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       process.exit(1)
     }
     return;
+  } else if (subcommand === 'standard-copilot') {
+    try {
+      const { runStandardCopilot } = await import('@/standardCopilot/runStandardCopilot');
+      let startedBy: 'daemon' | 'terminal' | undefined;
+      let verbose = false;
+      for (let i = 1; i < args.length; i++) {
+        if (args[i] === '--started-by') {
+          startedBy = args[++i] as 'daemon' | 'terminal';
+        } else if (args[i] === '--verbose') {
+          verbose = true;
+        }
+      }
+      const { credentials } = await authAndSetupMachineIfNeeded();
+      await ensureDaemonRunning();
+      await runStandardCopilot({ credentials, startedBy, verbose });
+    } catch (error) {
+      console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+      if (process.env.DEBUG) console.error(error);
+      process.exit(1);
+    }
+    return;
   } else if (subcommand === 'gemini') {
     // Handle gemini subcommands
     const geminiSubcommand = args[1];
@@ -733,6 +754,7 @@ ${chalk.bold('Usage:')}
   happy auth              Manage authentication
   happy resume            Resume a previous Happy session by Happy session ID
   happy codex             Start Codex mode
+  happy standard-copilot Start Standard Copilot (Work IQ) mode
   happy gemini            Start Gemini mode (ACP)
   happy grok              Start Grok mode (ACP)
   happy acp               Start a generic ACP-compatible agent

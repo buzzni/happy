@@ -21,6 +21,26 @@ describe('spawnAgentCommand', () => {
     expect(resolveTmuxSpawnAgentCommand('grok')).toBe('grok')
   })
 
+  it('spawns Standard Copilot through its first-class subcommand', () => {
+    expect(resolveRegularSpawnAgentArgs('standard-copilot')).toEqual(['standard-copilot'])
+    expect(resolveTmuxSpawnAgentCommand('standard-copilot')).toBe('standard-copilot')
+  })
+
+  it('carries only Work IQ public-client settings through an isolated spawn', () => {
+    expect(resolveAgentAuthEnvironment('standard-copilot', {
+      WORKIQ_TENANT_ID: 'tenant',
+      WORKIQ_CLIENT_ID: 'client',
+      WORKIQ_SCOPE: 'scope',
+      WORKIQ_AUTH_URL_FILE: '/tmp/auth-url',
+      OPENAI_API_KEY: 'other-agent-auth',
+    })).toEqual({
+      WORKIQ_TENANT_ID: 'tenant',
+      WORKIQ_CLIENT_ID: 'client',
+      WORKIQ_SCOPE: 'scope',
+      WORKIQ_AUTH_URL_FILE: '/tmp/auth-url',
+    })
+  })
+
   it('carries the xAI api key when grok runs read-only', () => {
     expect(resolveAgentAuthEnvironment('grok', { XAI_API_KEY: 'xai', OPENAI_API_KEY: 'codex' }))
       .toEqual({ XAI_API_KEY: 'xai' })

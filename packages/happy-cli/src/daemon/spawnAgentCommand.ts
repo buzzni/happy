@@ -26,6 +26,8 @@ export function resolveAgentAuthEnvironment(
         return ['GEMINI_API_KEY', 'GOOGLE_API_KEY']
       case 'grok':
         return ['XAI_API_KEY']
+      case 'standard-copilot':
+        return ['WORKIQ_TENANT_ID', 'WORKIQ_CLIENT_ID', 'WORKIQ_SCOPE', 'WORKIQ_AUTH_URL_FILE']
       case 'openclaw':
       case 'opencode':
         return []
@@ -63,6 +65,8 @@ export function resolveTmuxSpawnAgentCommand(agent: SpawnAgent): string | undefi
       return 'gemini'
     case 'grok':
       return 'grok'
+    case 'standard-copilot':
+      return 'standard-copilot'
     case 'openclaw':
       return 'openclaw'
     case 'opencode':
@@ -81,6 +85,8 @@ export function resolveRegularSpawnAgentArgs(agent: SpawnAgent): string[] | unde
       return ['gemini']
     case 'grok':
       return ['grok']
+    case 'standard-copilot':
+      return ['standard-copilot']
     case 'openclaw':
       return ['openclaw']
     case 'opencode':

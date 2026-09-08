@@ -201,7 +201,7 @@ export interface SpawnSessionOptions {
     directory: string;
     sessionId?: string;
     approvedNewDirectoryCreation?: boolean;
-    agent?: 'claude' | 'codex' | 'gemini' | 'grok' | 'openclaw' | 'opencode';
+    agent?: 'claude' | 'codex' | 'gemini' | 'grok' | 'openclaw' | 'opencode' | 'standard-copilot';
     /**
      * Initial model/effort seed for the spawned agent, delivered via
      * HAPPY_INITIAL_MODEL / HAPPY_INITIAL_EFFORT (per-spawn lineage envs,
