@@ -949,6 +949,19 @@ model ManagedSessionGrant {
     runId       String
     attemptId   String
     sessionId   String
+    /// What this grant is **for**, and therefore what it may reach.
+    ///
+    /// Without it a grant handed to a browser for reading is the same object a
+    /// runner uses to post messages and register tools — that is, giving
+    /// somebody a transcript would give them execution on that session.
+    ///
+    /// `runner` is the historical behaviour and stays the default so existing
+    /// rows and callers keep working. An unknown value is never folded into it:
+    /// folding an unrecognised purpose into `runner` turns "we do not know what
+    /// this is for" into full execution.
+    ///
+    /// 'runner' | 'transcript-read' | 'approval-control'
+    purpose     String @default("runner")
     /// The account this run acts as. Compared against `Session.accountId` on
     /// every action; never inherited from the workspace.
     accountId   String

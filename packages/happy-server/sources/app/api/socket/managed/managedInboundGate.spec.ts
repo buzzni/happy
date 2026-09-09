@@ -8,7 +8,10 @@ import type { SessionScopedClaims } from '@/app/auth/sessionScopedToken';
 const SID = 'session-under-grant';
 const OTHER = 'someone-elses-session';
 
-const claims = { sessionId: SID } as SessionScopedClaims;
+// Real claims always carry a purpose — `parseSessionScopedClaims` normalises a
+// token minted before that axis existed to `runner`. A fixture without one
+// would be testing a shape the verifier cannot produce.
+const claims = { sessionId: SID, purpose: 'runner' } as SessionScopedClaims;
 import type { ManagedGrantProbe } from '@/app/api/socket/managed/managedInboundGate';
 
 const live: ManagedGrantProbe = async () => ({ ok: true });

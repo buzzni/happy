@@ -115,6 +115,7 @@ function claimsFor(over: Partial<SessionScopedClaims> = {}): SessionScopedClaims
         epoch: s.epoch,
         workspaceAuthorityVersion: s.workspaceAuthorityVersion,
         runAuthorityVersion: s.runAuthorityVersion,
+        purpose: 'runner' as const,
         expiresAt: NOW + HOUR,
         ...over,
     };
@@ -1222,6 +1223,153 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
                 }),
                 now: NOW,
             })).toEqual({ ok: false, reason: 'grant-unknown' });
+        });
+    });
+
+    describe('what a grant is for', () => {
+        it('shouldKeepAReadGrantAndTheRunnerGrantAsSeparateLiveGrants', async () => {
+            /*
+             * They are two grants for one scope, and both must be able to exist.
+             * Sharing a family would mean issuing a transcript grant either
+             * fails against the runner's, or replaces it — the run losing its
+             * own credential because somebody opened a transcript.
+             */
+            const runner = await grants.issueSessionGrant(issueInput());
+            expect(runner.ok).toBe(true);
+            const read = await grants.issueSessionGrant(issueInput({ purpose: 'transcript-read' }));
+            expect(read.ok).toBe(true);
+            if (!runner.ok || !read.ok) return;
+            expect(read.grant.purpose).toBe('transcript-read');
+            expect(runner.grant.purpose).toBe('runner');
+            expect(read.grant.family).not.toBe(runner.grant.family);
+            // And both rows are still there.
+            const rows = await db.managedSessionGrant.findMany({
+                where: { grantId: { in: [runner.grant.grantId, read.grant.grantId] } },
+            });
+            expect(rows).toHaveLength(2);
+        });
+
+        it('shouldDefaultToRunnerSoExistingCallersAreUnchanged', async () => {
+            const issued = await grants.issueSessionGrant(issueInput());
+            expect(issued.ok).toBe(true);
+            if (issued.ok) expect(issued.grant.purpose).toBe('runner');
+        });
+
+        it('shouldResolveEachPurposeAsItsOwnGrant', async () => {
+            // Fixed at `runner`, the lookup found the runner's row for every
+            // caller: a read grant could not be resolved at all, and the row it
+            // did find carried authority nobody asked for.
+            const runner = await grants.issueSessionGrant(issueInput());
+            const read = await grants.issueSessionGrant(issueInput({ purpose: 'transcript-read' }));
+            expect(runner.ok && read.ok).toBe(true);
+            if (!runner.ok || !read.ok) return;
+
+            const resolvedRead = await grants.resolveSessionGrant({
+                scope: scope(), now: NOW, requestedTokenExpiresAt: NOW + 60_000,
+                purpose: 'transcript-read',
+            });
+            expect(resolvedRead.ok).toBe(true);
+            if (resolvedRead.ok) {
+                expect(resolvedRead.resolved.grant.grantId).toBe(read.grant.grantId);
+                expect(resolvedRead.resolved.grant.purpose).toBe('transcript-read');
+            }
+
+            const resolvedRunner = await grants.resolveSessionGrant({
+                scope: scope(), now: NOW, requestedTokenExpiresAt: NOW + 60_000,
+            });
+            expect(resolvedRunner.ok).toBe(true);
+            if (resolvedRunner.ok) {
+                expect(resolvedRunner.resolved.grant.grantId).toBe(runner.grant.grantId);
+            }
+        });
+
+        it('shouldRenewEachPurposeWithoutTouchingTheOther', async () => {
+            const runner = await grants.issueSessionGrant(issueInput());
+            const read = await grants.issueSessionGrant(issueInput({ purpose: 'transcript-read' }));
+            expect(runner.ok && read.ok).toBe(true);
+            if (!runner.ok || !read.ok) return;
+
+            const renewed = await grants.renewSessionGrant({
+                scope: scope(),
+                expectedGrantId: read.grant.grantId,
+                expectedRenewalSeq: read.grant.renewalSeq,
+                expiresAt: NOW + 2 * HOUR,
+                now: NOW,
+                purpose: 'transcript-read',
+            });
+            expect(renewed.ok).toBe(true);
+            if (renewed.ok) expect(renewed.grant.purpose).toBe('transcript-read');
+
+            // The runner's own grant is untouched: same expiry, same sequence.
+            const runnerRow = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: runner.grant.grantId },
+            });
+            expect(Number(runnerRow.expiresAt)).toBe(runner.grant.expiresAt);
+            expect(runnerRow.renewalSeq).toBe(runner.grant.renewalSeq);
+        });
+
+        it('shouldRevokeOnlyTheGrantItNames', async () => {
+            // A revoke aimed at a read grant must not close the run's own
+            // credential — that would stop the run because somebody closed a
+            // browser tab.
+            const runner = await grants.issueSessionGrant(issueInput());
+            const read = await grants.issueSessionGrant(issueInput({ purpose: 'transcript-read' }));
+            expect(runner.ok && read.ok).toBe(true);
+            if (!runner.ok || !read.ok) return;
+
+            const revoked = await grants.revokeSessionGrant({
+                scope: scope(), reason: 'viewer-closed', now: NOW, purpose: 'transcript-read',
+            });
+            expect(revoked.ok).toBe(true);
+            const readRow = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: read.grant.grantId },
+            });
+            const runnerRow = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: runner.grant.grantId },
+            });
+            expect(readRow.revokedAt).not.toBeNull();
+            expect(runnerRow.revokedAt).toBeNull();
+        });
+
+        it('shouldRefuseARowWhosePurposeDisagreesWithTheTokenThatNamesIt', async () => {
+            /*
+             * `resolveLiveGrant` finds the row by grant id, not by family, so
+             * the family derivation cannot be what protects this path. A row
+             * whose purpose was changed underneath a live token — a repair, a
+             * migration, an operator edit — must stop that token rather than
+             * lending it authority it was never minted with.
+             */
+            const read = await grants.issueSessionGrant(issueInput({ purpose: 'transcript-read' }));
+            expect(read.ok).toBe(true);
+            if (!read.ok) return;
+            await db.managedSessionGrant.update({
+                where: { grantId: read.grant.grantId },
+                data: { purpose: 'runner' },
+            });
+            const live = await grants.resolveLiveGrant({
+                claims: claimsFor({
+                    grantId: read.grant.grantId,
+                    purpose: 'transcript-read',
+                    expiresAt: read.grant.expiresAt,
+                }),
+                now: NOW,
+            });
+            expect(live).toEqual({ ok: false, reason: 'claims-mismatch' });
+        });
+
+        it('shouldRefuseToReadAGrantWhosePurposeThisServerDoesNotKnow', async () => {
+            // Folding an unrecognised purpose into `runner` would read "we do
+            // not know what this is for" as "execution".
+            const issued = await grants.issueSessionGrant(issueInput());
+            expect(issued.ok).toBe(true);
+            if (!issued.ok) return;
+            await db.managedSessionGrant.update({
+                where: { grantId: issued.grant.grantId },
+                data: { purpose: 'anything-else' },
+            });
+            await expect(grants.resolveSessionGrant({
+                scope: scope(), now: NOW, requestedTokenExpiresAt: NOW + 60_000,
+            })).rejects.toThrow(/unknown purpose/);
         });
     });
 });

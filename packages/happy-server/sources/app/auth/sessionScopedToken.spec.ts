@@ -44,6 +44,7 @@ function scope(overrides: Partial<SessionScopedClaims> = {}): SessionScopedClaim
         epoch: 3,
         workspaceAuthorityVersion: 7,
         runAuthorityVersion: 2,
+        purpose: 'runner' as const,
         expiresAt: NOW + 60_000,
         ...overrides,
     };
@@ -221,6 +222,29 @@ describe('claims are validated, not trusted', () => {
             expect(parseSessionScopedClaims({ ...scope(), runId })).toBeNull();
         }
     });
+
+        it('reads a token minted before purposes existed as a runner token', () => {
+            // Those tokens are runner tokens, and that is what they have always
+            // been allowed to do. Refusing them would end every live session.
+            const claims = parseSessionScopedClaims({ ...scope() });
+            expect(claims?.purpose).toBe('runner');
+        });
+
+        it.each([['transcript-read'], ['approval-control'], ['runner']])(
+            'carries %s through unchanged', (purpose) => {
+                expect(parseSessionScopedClaims({ ...scope(), purpose })?.purpose).toBe(purpose);
+            });
+
+        it.each([['administrator'], [''], [42], [null]])(
+            'refuses a purpose this server does not know: %s', (purpose) => {
+                /*
+                 * Never folded into `runner`. Folding would read "we cannot
+                 * classify this token" as "this token may execute", which is
+                 * the one direction the mistake must not go.
+                 */
+                expect(parseSessionScopedClaims({ ...scope(), purpose } as never)).toBeNull();
+            });
+
 
     it('accepts a complete claim set', () => {
         expect(parseSessionScopedClaims(scope())).toMatchObject({ sessionId: 'session-1' });

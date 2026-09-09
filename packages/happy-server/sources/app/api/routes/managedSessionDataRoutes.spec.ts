@@ -111,6 +111,7 @@ function claimsFor(over: Partial<SessionScopedClaims> = {}): SessionScopedClaims
         runAuthorityVersion: s.runAuthorityVersion,
         // Exactly the grant's own expiry: a token may never claim to outlive
         // the row that authorises it.
+        purpose: 'runner' as const,
         expiresAt: grantExpiresAt,
         ...over,
     };
@@ -318,6 +319,70 @@ describe.skipIf(!enabled)('managed session data routes (real Fastify + PostgreSQ
                 token: scopedToken,
             });
             expect(read.statusCode).toBe(200);
+        });
+    });
+
+    describe('a read bearer reads, and only reads', () => {
+        /*
+         * The unit tests prove the allowlist branches. What only this level can
+         * show is that the **real** consumer passes the purpose it verified: a
+         * read token that reached this surface as a runner would be a browser
+         * holding execution on somebody's session, and every branch test would
+         * still be green.
+         */
+        /**
+         * A **real** read grant, and a token minted from it.
+         *
+         * Minting a read token against the runner's row proves nothing: the row
+         * is what carries the authority, and a token claiming a purpose its row
+         * does not have is refused for that reason alone — which would make a
+         * write-refusal test pass while the purpose gate was never consulted.
+         */
+        async function readBearer(): Promise<string> {
+            const issued = await modules.grants.issueSessionGrant({
+                scope: scope() as never,
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: Date.now() + HOUR,
+                now: Date.now(),
+                purpose: 'transcript-read',
+            });
+            if (!issued.ok) throw new Error(`fixture read grant failed: ${issued.reason}`);
+            return mintScopedToken({
+                purpose: 'transcript-read',
+                grantId: issued.grant.grantId,
+                expiresAt: issued.grant.expiresAt,
+            });
+        }
+
+        it('refuses a read bearer posting into the session, and writes nothing', async () => {
+            const readToken = await readBearer();
+            const before = await db.sessionMessage.count({ where: { sessionId } });
+            const posted = await request({
+                method: 'POST', url: `/v3/sessions/${sessionId}/messages`,
+                token: readToken, body: messageBody,
+            });
+            expect(posted.statusCode).toBe(403);
+            // A refusal that still stored the message would be a refusal in
+            // name only — the status code is not the property under test.
+            expect(await db.sessionMessage.count({ where: { sessionId } })).toBe(before);
+        });
+
+        it('lets the same bearer read the transcript it was issued for', async () => {
+            // The refusal above must be about the write, not about the token.
+            const readToken = await readBearer();
+            const read = await request({
+                method: 'GET', url: `/v3/sessions/${sessionId}/messages`, token: readToken,
+            });
+            expect(read.statusCode).toBe(200);
+        });
+
+        it('still lets a runner post', async () => {
+            const posted = await request({
+                method: 'POST', url: `/v3/sessions/${sessionId}/messages`,
+                token: scopedToken, body: messageBody,
+            });
+            expect(posted.statusCode).toBe(200);
         });
     });
 

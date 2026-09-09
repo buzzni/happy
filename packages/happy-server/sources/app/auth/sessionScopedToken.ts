@@ -38,6 +38,21 @@ const MAX_ID_LENGTH = 200;
  * payload so a caller can compare the bearer against the authority projection
  * without a second lookup deciding what the token meant.
  */
+/**
+ * What a grant is for, and therefore what its token may reach.
+ *
+ *  - `runner` — the run itself: posting messages, registering tools. The
+ *    historical behaviour and the default.
+ *  - `transcript-read` — reading what was said. Deliberately **not** tied to a
+ *    live run: a finished run, a stopped runtime and a session that has since
+ *    been replaced all still have transcripts somebody is entitled to read.
+ *  - `approval-control` — answering permission prompts. This one *is* tied to
+ *    the current run, because an approval that arrived for a superseded attempt
+ *    would be answering a question nobody is still asking.
+ */
+export const SESSION_SCOPED_PURPOSES = ['runner', 'transcript-read', 'approval-control'] as const;
+export type SessionScopedPurpose = (typeof SESSION_SCOPED_PURPOSES)[number];
+
 export type SessionScopedClaims = {
     v: number;
     /**
@@ -71,6 +86,13 @@ export type SessionScopedClaims = {
     workspaceAuthorityVersion: number;
     runAuthorityVersion: number;
     expiresAt: number;
+    /**
+     * Absent means `runner`: tokens minted before this axis existed are runner
+     * tokens, and that is what they have always been allowed to do. An
+     * unrecognised value is **refused**, never folded into the default —
+     * folding it would turn "we do not know what this is for" into execution.
+     */
+    purpose: SessionScopedPurpose;
 };
 
 export type SessionScopedVerifyFailure =
@@ -134,6 +156,14 @@ export function parseSessionScopedClaims(raw: unknown): SessionScopedClaims | nu
         if (value === null) return null;
     }
 
+    // Absent is the pre-purpose past, and that past is `runner`. Anything else
+    // that is not one of the three is not a purpose this server knows, and a
+    // token it cannot classify is not a token it can authorise.
+    const rawPurpose = record.purpose === undefined ? 'runner' : record.purpose;
+    if (typeof rawPurpose !== 'string') return null;
+    if (!(SESSION_SCOPED_PURPOSES as readonly string[]).includes(rawPurpose)) return null;
+    const purpose = rawPurpose as SessionScopedPurpose;
+
     const epoch = readInt(record.epoch, 0);
     const workspaceAuthorityVersion = readInt(record.workspaceAuthorityVersion, 0);
     const runAuthorityVersion = readInt(record.runAuthorityVersion, 0);
@@ -158,6 +188,7 @@ export function parseSessionScopedClaims(raw: unknown): SessionScopedClaims | nu
         workspaceAuthorityVersion,
         runAuthorityVersion,
         expiresAt,
+        purpose,
     };
 }
 

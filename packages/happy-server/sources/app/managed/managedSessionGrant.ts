@@ -29,6 +29,10 @@
 
 import { db } from '@/storage/db';
 import { inTx } from '@/storage/inTx';
+import {
+    SESSION_SCOPED_PURPOSES,
+    type SessionScopedPurpose,
+} from '@/app/auth/sessionScopedToken';
 import { canonicalDigest } from '@/app/managed/canonicalDigest';
 import type { SessionScopedClaims } from '@/app/auth/sessionScopedToken';
 
@@ -73,7 +77,34 @@ export type ManagedScope = {
  * in a different family. Including them would give a caller a new family for
  * every version bump — the revoke bypass this derivation exists to close.
  */
-export function deriveGrantFamily(scope: ManagedScope): string {
+export function deriveGrantFamily(
+    scope: ManagedScope,
+    /**
+     * Part of the family, so two purposes for one scope are two grants.
+     *
+     * Without this a read grant and the runner's grant would be the same
+     * family: minting one would either be refused as "family-exists" or replace
+     * the other, which is the run losing its own credential because somebody
+     * opened a transcript.
+     *
+     * `runner` contributes nothing to the digest, deliberately: every grant
+     * that exists today is a runner grant, and changing their family value
+     * would orphan every stored row from the derivation that finds it.
+     */
+    purpose: SessionScopedPurpose = 'runner',
+): string {
+    if (purpose !== 'runner') {
+        return canonicalDigest({
+            tenantId: scope.tenantId,
+            projectId: scope.projectId,
+            workspaceId: scope.workspaceId,
+            runId: scope.runId,
+            attemptId: scope.attemptId,
+            sessionId: scope.sessionId,
+            accountId: scope.accountId,
+            purpose,
+        });
+    }
     return canonicalDigest({
         tenantId: scope.tenantId,
         projectId: scope.projectId,
@@ -155,6 +186,7 @@ export type LiveGrant = {
     runAuthorityVersion: number;
     renewalSeq: number;
     expiresAt: number;
+    purpose: SessionScopedPurpose;
 };
 
 export type GrantResult<F> =
@@ -166,6 +198,8 @@ type GrantRow = {
     workspaceId: string; runId: string; attemptId: string; epoch: number;
     workspaceAuthorityVersion: number; runAuthorityVersion: number;
     renewalSeq: number; expiresAt: bigint;
+    /** Stored as text; classified on the way out, never trusted as typed. */
+    purpose: string;
 };
 
 type AuthorityRow = {
@@ -194,7 +228,19 @@ function toLiveGrant(row: GrantRow): LiveGrant {
         runAuthorityVersion: row.runAuthorityVersion,
         renewalSeq: row.renewalSeq,
         expiresAt: Number(row.expiresAt),
+        // A stored value outside the three the server knows is not classified,
+        // and an unclassified grant is not one this server will act on. It is
+        // never folded into `runner`, which would be reading "unknown" as
+        // "execution".
+        purpose: readStoredPurpose(row.purpose),
     };
+}
+
+function readStoredPurpose(value: unknown): SessionScopedPurpose {
+    if (typeof value !== 'string' || !(SESSION_SCOPED_PURPOSES as readonly string[]).includes(value)) {
+        throw new Error('managed session grant carries an unknown purpose');
+    }
+    return value as SessionScopedPurpose;
 }
 
 const AUTHORITY_INCLUDE = {
@@ -240,7 +286,22 @@ function compareScope(authority: AuthorityRow | null, scope: ManagedScope): Scop
  * family is re-derived here too: a row whose scope hashes elsewhere is not this
  * scope's grant even when every field above matches.
  */
-function compareStoredGrant(grant: GrantRow, scope: ManagedScope): 'mismatch' | null {
+function compareStoredGrant(
+    grant: GrantRow,
+    scope: ManagedScope,
+    /**
+     * What the caller says this grant is for.
+     *
+     * Compared as its own axis **and** folded into the family below, because
+     * the two answer different questions: the family says which row to look
+     * for, and this says the row we found is the one the caller means. Left
+     * fixed at `runner`, a read grant was never found by its own purpose — the
+     * lookup returned the runner row, and every later check compared against
+     * that row's authority.
+     */
+    purpose: SessionScopedPurpose,
+): 'mismatch' | null {
+    if (readStoredPurpose(grant.purpose) !== purpose) return 'mismatch';
     if (grant.sessionId !== scope.sessionId
         || grant.accountId !== scope.accountId
         || grant.workspaceId !== scope.workspaceId
@@ -251,7 +312,7 @@ function compareStoredGrant(grant: GrantRow, scope: ManagedScope): 'mismatch' | 
         || grant.runAuthorityVersion !== scope.runAuthorityVersion) {
         return 'mismatch';
     }
-    if (grant.family !== deriveGrantFamily(scope)) return 'mismatch';
+    if (grant.family !== deriveGrantFamily(scope, purpose)) return 'mismatch';
     return null;
 }
 
@@ -261,6 +322,8 @@ export type IssueGrantInput = {
     expiresAt: number;
     requestId: string;
     now: number;
+    /** Defaults to `runner`: the behaviour every existing caller relies on. */
+    purpose?: SessionScopedPurpose;
 };
 
 /**
@@ -284,11 +347,15 @@ export async function issueSessionGrant(
 async function issueSessionGrantOnce(
     input: IssueGrantInput,
 ): Promise<GrantResult<GrantIssueFailure>> {
-    const family = deriveGrantFamily(input.scope);
+    const purpose = input.purpose ?? 'runner';
+    const family = deriveGrantFamily(input.scope, purpose);
     const digest = canonicalDigest({
         scope: input.scope,
         grantId: input.grantId,
         expiresAt: input.expiresAt,
+        // Part of the body: a retry that asks for a different purpose under the
+        // same request id is a different request, not the same one again.
+        ...(purpose === 'runner' ? {} : { purpose }),
     });
 
     return inTx(async (tx) => {
@@ -403,6 +470,7 @@ async function issueSessionGrantOnce(
                 family,
                 sessionId: input.scope.sessionId,
                 accountId: input.scope.accountId,
+                purpose,
                 workspaceId: input.scope.workspaceId,
                 runId: input.scope.runId,
                 attemptId: input.scope.attemptId,
@@ -442,8 +510,14 @@ export async function renewSessionGrant(input: {
     expectedRenewalSeq: number;
     expiresAt: number;
     now: number;
+    /**
+     * Which grant for this scope. A renewal extends one grant; fixed at
+     * `runner` it could only ever find the runner's, so a read grant could not
+     * be renewed at all and a revoke aimed at the runner's row instead.
+     */
+    purpose?: SessionScopedPurpose;
 }): Promise<GrantResult<GrantRenewFailure>> {
-    const family = deriveGrantFamily(input.scope);
+    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner');
 
     return inTx(async (tx) => {
         const authority = await tx.managedRunAuthority.findUnique({
@@ -546,6 +620,8 @@ export async function revokeSessionGrant(input: {
     scope: ManagedScope;
     reason: string;
     now: number;
+    /** Which grant to withdraw. Omitted means `runner`. */
+    purpose?: SessionScopedPurpose;
 }): Promise<RevokeResult> {
     return retryOnUniqueRace(
         () => revokeSessionGrantOnce(input),
@@ -559,8 +635,9 @@ async function revokeSessionGrantOnce(input: {
     scope: ManagedScope;
     reason: string;
     now: number;
+    purpose?: SessionScopedPurpose;
 }): Promise<RevokeResult> {
-    const family = deriveGrantFamily(input.scope);
+    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner');
 
     return inTx(async (tx) => {
         const grant = await tx.managedSessionGrant.findUnique({ where: { family } });
@@ -678,7 +755,13 @@ export async function resolveLiveGrant(input: {
         };
         // Same comparison the resolve path makes: the stored row has to be the
         // one this scope was issued for, not merely a member of its family.
-        if (compareStoredGrant(grant, scope)) return { ok: false, reason: 'claims-mismatch' };
+        // Including the purpose: the row found by `grantId` must be the grant
+        // this token says it is. Without it a read token carried a runner row's
+        // authority, and a runner token would have been accepted against a read
+        // row just as readily.
+        if (compareStoredGrant(grant, scope, claims.purpose)) {
+            return { ok: false, reason: 'claims-mismatch' };
+        }
 
         const authority = await tx.managedRunAuthority.findUnique({
             where: { runId: claims.runId },
@@ -742,6 +825,11 @@ export type ResolveGrantInput = {
     /** The latest the caller signed for. The answer is never later than this. */
     requestedTokenExpiresAt: number;
     now: number;
+    /**
+     * Which grant for this scope. Omitted means `runner`, so every existing
+     * caller resolves exactly what it resolved before.
+     */
+    purpose?: SessionScopedPurpose;
 };
 
 export type ResolvedGrant = {
@@ -773,7 +861,7 @@ export type ResolveGrantResult =
 export async function resolveSessionGrant(
     input: ResolveGrantInput,
 ): Promise<ResolveGrantResult> {
-    const family = deriveGrantFamily(input.scope);
+    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner');
 
     return inTx(async (tx) => {
         const authority = await tx.managedRunAuthority.findUnique({
@@ -798,7 +886,9 @@ export async function resolveSessionGrant(
         // The row must be the one this exact scope was issued for. Without this
         // an authority advance leaves an old row that the fresh scope still
         // finds, and the answer would mix an old grant with a new DTO.
-        if (compareStoredGrant(grant, input.scope)) return { ok: false, reason: 'grant-stale' };
+        if (compareStoredGrant(grant, input.scope, input.purpose ?? 'runner')) {
+            return { ok: false, reason: 'grant-stale' };
+        }
 
         const grantExpiresAt = Number(grant.expiresAt);
         if (!Number.isSafeInteger(grantExpiresAt)) return { ok: false, reason: 'expired' };

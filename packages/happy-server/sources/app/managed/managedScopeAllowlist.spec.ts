@@ -19,7 +19,9 @@ const allow = { ok: true };
 const denied = (reason: string) => ({ ok: false, reason });
 
 function http(method: string, path: string, body?: unknown) {
-    return authorizeManagedHttpRequest({ method, path, sessionId: SID, body });
+    return authorizeManagedHttpRequest({ method, path, sessionId: SID, body,
+            purpose: 'runner' as const,
+        });
 }
 
 describe('HTTP surface', () => {
@@ -77,6 +79,7 @@ describe('HTTP surface', () => {
     it('matches a percent-encoded session id by its decoded value', () => {
         expect(authorizeManagedHttpRequest({
             method: 'GET', path: '/v3/sessions/a%20b/messages', sessionId: 'a b',
+            purpose: 'runner' as const,
         })).toEqual(allow);
     });
 });
@@ -104,7 +107,9 @@ describe('session lookup', () => {
 
 describe('socket events', () => {
     function event(name: string, payload: unknown) {
-        return authorizeManagedSocketEvent({ event: name, payload, sessionId: SID });
+        return authorizeManagedSocketEvent({ event: name, payload, sessionId: SID,
+            purpose: 'runner' as const,
+        });
     }
 
     it('allows the volatile session events a running agent emits', () => {
@@ -148,7 +153,9 @@ describe('socket events', () => {
 
 describe('RPC names', () => {
     function rpc(method: string) {
-        return authorizeManagedRpcName({ method, sessionId: SID });
+        return authorizeManagedRpcName({ method, sessionId: SID,
+            purpose: 'runner' as const,
+        });
     }
 
     it('allows the session lifecycle handlers Claude and Codex register', () => {
@@ -214,6 +221,85 @@ describe('the surface is stated, not inferred', () => {
             const scoped = route.includes('/:sessionId/');
             const fixed = route.endsWith('/v2/sessions/lookup');
             expect(scoped || fixed, route).toBe(true);
+        }
+    });
+});
+
+describe('what each purpose may reach', () => {
+    const SESSION = 'session-1';
+
+    it('lets a reader read the transcript, its events and its key envelope', () => {
+        // Everything a browser needs to show what was said, and to decrypt it.
+        for (const [method, path] of [
+            ['GET', `/v3/sessions/${SESSION}/messages`],
+            ['GET', `/v3/sessions/${SESSION}/events`],
+            ['GET', `/v1/sessions/${SESSION}/attachments/file-1`],
+        ] as const) {
+            expect(authorizeManagedHttpRequest({
+                method, path, sessionId: SESSION, purpose: 'transcript-read',
+            })).toEqual({ ok: true });
+        }
+        expect(authorizeManagedHttpRequest({
+            method: 'POST',
+            path: '/v2/sessions/lookup',
+            sessionId: SESSION,
+            // The route takes its scope from the body, and the body names
+            // exactly one session — the granted one.
+            body: { ids: [SESSION] },
+            purpose: 'transcript-read',
+        })).toEqual({ ok: true });
+    });
+
+    it.each([
+        ['posting into the session', 'POST', `/v3/sessions/${SESSION}/messages`],
+        ['uploading into it', 'POST', `/v1/sessions/${SESSION}/attachments/request-upload`],
+        ['writing an attachment', 'PUT', `/v1/sessions/${SESSION}/attachments/file-1`],
+    ])('refuses a reader %s', (_name, method, path) => {
+        /*
+         * The point of the purpose axis: without it, handing somebody a
+         * transcript hands them the ability to act as that session.
+         */
+        expect(authorizeManagedHttpRequest({
+            method, path, sessionId: SESSION, purpose: 'transcript-read',
+        })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
+    });
+
+    it('leaves a runner exactly as it was', () => {
+        // Every bearer minted before this axis existed decodes as a runner, and
+        // none of them may change behaviour.
+        expect(authorizeManagedHttpRequest({
+            method: 'POST', path: `/v3/sessions/${SESSION}/messages`, sessionId: SESSION,
+            purpose: 'runner',
+        })).toEqual({ ok: true });
+    });
+
+    it('lets an approver answer prompts and nothing else', () => {
+        expect(authorizeManagedRpcName({
+            method: `${SESSION}:permission`, sessionId: SESSION, purpose: 'approval-control',
+        })).toEqual({ ok: true });
+        for (const name of ['bash', 'writeFile', 'goal-action', 'killSession']) {
+            expect(authorizeManagedRpcName({
+                method: `${SESSION}:${name}`, sessionId: SESSION, purpose: 'approval-control',
+            })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
+        }
+    });
+
+    it('lets a reader register nothing', () => {
+        expect(authorizeManagedRpcName({
+            method: `${SESSION}:permission`, sessionId: SESSION, purpose: 'transcript-read',
+        })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
+        expect(authorizeManagedSocketEvent({
+            event: 'rpc-register', payload: {}, sessionId: SESSION, purpose: 'transcript-read',
+        })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
+    });
+
+    it('refuses every session event from a non-runner', () => {
+        // These report or change what the run is doing. Reading a transcript
+        // and approving a prompt are neither.
+        for (const purpose of ['transcript-read', 'approval-control'] as const) {
+            expect(authorizeManagedSocketEvent({
+                event: 'session-stream', payload: { sid: SESSION }, sessionId: SESSION, purpose,
+            })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
         }
     });
 });

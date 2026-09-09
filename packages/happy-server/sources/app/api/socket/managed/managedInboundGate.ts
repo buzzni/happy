@@ -63,6 +63,7 @@ export async function authorizeManagedInbound(input: {
         event: input.event,
         payload: input.payload,
         sessionId: input.claims.sessionId,
+        purpose: input.claims.purpose,
     });
     if (!shape.ok) {
         return { ok: false, reason: shape.reason as ManagedInboundDenial };
@@ -71,7 +72,11 @@ export async function authorizeManagedInbound(input: {
     if (input.event === 'rpc-register' || input.event === 'rpc-unregister') {
         const method = (input.payload as { method?: unknown } | null)?.method;
         if (typeof method !== 'string') return { ok: false, reason: 'rpc-name-malformed' };
-        const named = authorizeManagedRpcName({ method, sessionId: input.claims.sessionId });
+        const named = authorizeManagedRpcName({
+            method,
+            sessionId: input.claims.sessionId,
+            purpose: input.claims.purpose,
+        });
         if (!named.ok) return { ok: false, reason: named.reason as ManagedInboundDenial };
     }
 

@@ -144,10 +144,28 @@ const mintSchema = z.object({
     grantId: identifier,
     requestId: identifier,
     expiresAt: z.number().int().min(1),
+    /**
+     * What the grant is for. Omitted means `runner`, which is what every
+     * caller before this axis existed was asking for.
+     *
+     * An unrecognised value is a 400 rather than a default: the server owns
+     * this enumeration, and reading an unknown purpose as `runner` would hand
+     * execution to a caller who asked for something else entirely.
+     */
+    purpose: z.enum(['runner', 'transcript-read', 'approval-control']).optional(),
 }).strict();
 
 const renewSchema = z.object({
     scope: scopeSchema,
+    /**
+     * Which grant for this scope is being renewed. Omitted means `runner`.
+     *
+     * Signed with the rest of the body, so a caller cannot be made to extend a
+     * grant of a different purpose than the one it asked about — and without it
+     * a read grant could not be renewed at all, because the lookup only ever
+     * found the runner's row.
+     */
+    purpose: z.enum(['runner', 'transcript-read', 'approval-control']).optional(),
     /**
      * The grant the caller believes it holds.
      *
@@ -173,11 +191,19 @@ const resolveSchema = z.object({
     requestId: identifier,
     scope: scopeSchema,
     requestedTokenExpiresAt: instant,
+    /** Which grant for this scope to resolve. Omitted means `runner`. */
+    purpose: z.enum(['runner', 'transcript-read', 'approval-control']).optional(),
 }).strict();
 
 const revokeSchema = z.object({
     scope: scopeSchema,
     reason: z.string().trim().min(1).max(200),
+    /**
+     * Which grant to withdraw. Omitted means `runner`, so an existing caller
+     * withdraws exactly what it withdrew before — and a revoke aimed at a read
+     * grant no longer silently closes the run's own credential instead.
+     */
+    purpose: z.enum(['runner', 'transcript-read', 'approval-control']).optional(),
 }).strict();
 
 /**
@@ -678,6 +704,7 @@ export function managedControlRoutes(
             requestId: request.body.requestId,
             expiresAt: request.body.expiresAt,
             now,
+            ...(request.body.purpose ? { purpose: request.body.purpose } : {}),
         });
         if (!issued.ok) return reply.code(failureStatus(issued.reason)).send({ error: issued.reason });
 
@@ -698,6 +725,10 @@ export function managedControlRoutes(
             workspaceAuthorityVersion: issued.grant.workspaceAuthorityVersion,
             runAuthorityVersion: issued.grant.runAuthorityVersion,
             expiresAt: issued.grant.expiresAt,
+            // From the stored grant, not the request: the token says what the
+            // row authorises, and a caller that asked for one purpose and was
+            // given another must be able to see that and refuse.
+            purpose: issued.grant.purpose,
         }, now);
         if (!minted.ok) return reply.code(500).send({ error: 'Grant token could not be minted' });
 
@@ -706,6 +737,7 @@ export function managedControlRoutes(
             grantId: issued.grant.grantId,
             expiresAt: issued.grant.expiresAt,
             renewalSeq: issued.grant.renewalSeq,
+            purpose: issued.grant.purpose,
             idempotent: issued.idempotent,
             serverUrl: runtime.publicUrl,
         });
@@ -729,6 +761,7 @@ export function managedControlRoutes(
             expectedRenewalSeq: request.body.expectedRenewalSeq,
             expiresAt: request.body.expiresAt,
             now,
+            ...(request.body.purpose ? { purpose: request.body.purpose } : {}),
         });
         if (!renewed.ok) return reply.code(failureStatus(renewed.reason)).send({ error: renewed.reason });
 
@@ -747,6 +780,9 @@ export function managedControlRoutes(
             workspaceAuthorityVersion: renewed.grant.workspaceAuthorityVersion,
             runAuthorityVersion: renewed.grant.runAuthorityVersion,
             expiresAt: renewed.grant.expiresAt,
+            // Carried across the renewal: a renewal extends a grant, it does
+            // not reclassify one.
+            purpose: renewed.grant.purpose,
         }, now);
         if (!minted.ok) return reply.code(500).send({ error: 'Grant token could not be minted' });
 
@@ -755,6 +791,7 @@ export function managedControlRoutes(
             grantId: renewed.grant.grantId,
             expiresAt: renewed.grant.expiresAt,
             renewalSeq: renewed.grant.renewalSeq,
+            purpose: renewed.grant.purpose,
             idempotent: renewed.idempotent,
             serverUrl: runtime.publicUrl,
         });
@@ -784,6 +821,7 @@ export function managedControlRoutes(
             scope,
             requestedTokenExpiresAt: request.body.requestedTokenExpiresAt,
             now: Date.now(),
+            ...(request.body.purpose ? { purpose: request.body.purpose } : {}),
         });
         if (!resolved.ok) {
             return reply.code(failureStatus(resolved.reason)).send({ error: resolved.reason });
@@ -810,6 +848,7 @@ export function managedControlRoutes(
             workspaceAuthorityVersion: grant.workspaceAuthorityVersion,
             runAuthorityVersion: grant.runAuthorityVersion,
             expiresAt: tokenExpiresAt,
+            purpose: grant.purpose,
         }, issuedAt);
         if (!minted.ok) return reply.code(500).send({ error: 'Grant token could not be minted' });
 
@@ -820,6 +859,7 @@ export function managedControlRoutes(
             token: minted.token,
             tokenExpiresAt,
             grantExpiresAt: grant.expiresAt,
+            purpose: grant.purpose,
             renewalSeq: grant.renewalSeq,
         });
     });
@@ -833,7 +873,12 @@ export function managedControlRoutes(
         if (scope.accountId !== request.userId) {
             return reply.code(403).send({ error: 'Bearer does not own this scope' });
         }
-        const result = await revokeSessionGrant({ scope, reason: request.body.reason, now: Date.now() });
+        const result = await revokeSessionGrant({
+            scope,
+            reason: request.body.reason,
+            now: Date.now(),
+            ...(request.body.purpose ? { purpose: request.body.purpose } : {}),
+        });
         if (!result.ok) return reply.code(failureStatus(result.reason)).send({ error: result.reason });
         return reply.send({ state: result.state, alreadyRevoked: result.alreadyRevoked });
     });

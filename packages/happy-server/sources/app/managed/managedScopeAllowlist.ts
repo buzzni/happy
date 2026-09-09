@@ -21,6 +21,8 @@
  * action.
  */
 
+import type { SessionScopedPurpose } from '@/app/auth/sessionScopedToken';
+
 export type ManagedScopeDenial =
     | 'route-not-allowed'
     | 'method-not-allowed'
@@ -30,7 +32,9 @@ export type ManagedScopeDenial =
     | 'event-not-allowed'
     | 'rpc-name-not-allowed'
     | 'rpc-name-malformed'
-    | 'capability-not-supported';
+    | 'capability-not-supported'
+    /** The bearer is real and live, and this is not what it is for. */
+    | 'purpose-not-allowed';
 
 export type ManagedScopeDecision =
     | { ok: true }
@@ -169,6 +173,17 @@ export function authorizeManagedHttpRequest(input: {
     path: string;
     sessionId: string;
     body?: unknown;
+    /**
+     * What the bearer is for. **Required**, and deliberately not optional.
+     *
+     * An optional field with a `runner` default is a field a new call site
+     * forgets — and forgetting it here means a read token is authorised as a
+     * runner, which is the exact failure this axis exists to prevent. Tokens
+     * minted before this axis existed are normalised to `runner` where they
+     * are decoded (`parseSessionScopedClaims`), so every caller has a value to
+     * pass and none has to invent one.
+     */
+    purpose: SessionScopedPurpose;
 }): ManagedScopeDecision {
     const segments = pathSegments(input.path);
     if (!segments) return deny('malformed-path');
@@ -184,10 +199,43 @@ export function authorizeManagedHttpRequest(input: {
 
     if (!matchesSession(route, segments, input.sessionId)) return deny('session-mismatch');
 
+    /*
+     * A read bearer reads. It reaches the transcript, the events, the key
+     * envelope it needs to decrypt them, and attachment **downloads** — and
+     * nothing that writes or runs. Handing somebody a transcript must not hand
+     * them the ability to post into the session or upload into it.
+     *
+     * `approval-control` adds no HTTP surface of its own: answering a
+     * permission prompt happens over RPC, and the read surface is what it needs
+     * to show the person what they are approving.
+     */
+    if (input.purpose !== 'runner' && !isReadableRoute(route)) {
+        return deny('purpose-not-allowed');
+    }
+
     if (route.segments[route.segments.length - 1] === 'lookup') {
         return authorizeLookupBody(input.body, input.sessionId);
     }
     return ALLOW;
+}
+
+/**
+ * The routes a non-runner bearer may use.
+ *
+ * Written as a list of what is allowed rather than of what is not: a route
+ * added to `ALLOWED_ROUTES` later is then reachable by runners only, and
+ * opening it to readers is a deliberate edit here.
+ */
+const READABLE_ROUTES: readonly string[] = [
+    'GET /v3/sessions/:sessionId/messages',
+    'GET /v3/sessions/:sessionId/events',
+    'POST /v2/sessions/lookup',
+    'POST /v1/sessions/:sessionId/attachments/request-download',
+    'GET /v1/sessions/:sessionId/attachments/:file',
+];
+
+function isReadableRoute(route: RouteTemplate): boolean {
+    return READABLE_ROUTES.includes(`${route.method} /${route.segments.join('/')}`);
 }
 
 /** Route shape without the session comparison, so a mismatch is reported as one. */
@@ -222,10 +270,28 @@ function authorizeLookupBody(body: unknown, sessionId: string): ManagedScopeDeci
  * checked by `authorizeManagedRpcName`, which is where the scope actually lives.
  */
 export function authorizeManagedSocketEvent(input: {
+    /** Required for the same reason as above: an omitted purpose is a runner. */
+    purpose: SessionScopedPurpose;
     event: string;
     payload: unknown;
     sessionId: string;
 }): ManagedScopeDecision {
+    /*
+     * A non-runner bearer emits nothing on this socket. Every event here
+     * reports or changes what the run is doing — streaming its output, ending
+     * it, rewriting its metadata — and none of that is reading a transcript or
+     * answering a prompt. `rpc-register` stays reachable so an approval bearer
+     * can register the one name it is allowed; the name itself is checked in
+     * `authorizeManagedRpcName`.
+     */
+    const purpose = input.purpose;
+    if (purpose !== 'runner' && !SESSIONLESS_EVENTS.includes(input.event)) {
+        return deny('purpose-not-allowed');
+    }
+    if (purpose === 'transcript-read' && input.event !== 'ping') {
+        // A reader registers nothing at all.
+        return deny('purpose-not-allowed');
+    }
     if (SESSIONLESS_EVENTS.includes(input.event)) return ALLOW;
 
     const field = ALLOWED_EVENTS[input.event];
@@ -246,6 +312,7 @@ export function authorizeManagedSocketEvent(input: {
 export function authorizeManagedRpcName(input: {
     method: string;
     sessionId: string;
+    purpose: SessionScopedPurpose;
 }): ManagedScopeDecision {
     const prefix = `${input.sessionId}:`;
     if (!input.method.startsWith(prefix)) return deny('session-mismatch');
@@ -253,7 +320,19 @@ export function authorizeManagedRpcName(input: {
     if (name.length === 0 || name.includes(':')) return deny('rpc-name-malformed');
     if (UNSUPPORTED_RPC_NAMES.includes(name)) return deny('capability-not-supported');
     if (!ALLOWED_RPC_NAMES.includes(name)) return deny('rpc-name-not-allowed');
-    return ALLOW;
+    /*
+     * `runner` keeps the whole list — that is the run's own credential.
+     *
+     * `approval-control` answers permission prompts and nothing else: not
+     * `bash`, not `writeFile`, not `goal-action`. Those are the run's work, and
+     * a person approving a prompt is not taking the run over.
+     *
+     * `transcript-read` registers nothing at all. Reading is reading.
+     */
+    const purpose = input.purpose;
+    if (purpose === 'runner') return ALLOW;
+    if (purpose === 'approval-control' && name === 'permission') return ALLOW;
+    return deny('purpose-not-allowed');
 }
 
 /** Exposed so a coverage test can compare the list against real consumers. */

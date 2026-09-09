@@ -92,6 +92,7 @@ function claimsFor(over: Partial<SessionScopedClaims> = {}): SessionScopedClaims
         runtimeId: s.runtimeId, runId: s.runId, attemptId: s.attemptId, epoch: s.epoch,
         workspaceAuthorityVersion: s.workspaceAuthorityVersion,
         runAuthorityVersion: s.runAuthorityVersion,
+        purpose: 'runner' as const,
         expiresAt: grantExpiresAt, ...over,
     };
 }

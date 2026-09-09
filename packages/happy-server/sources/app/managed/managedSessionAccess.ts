@@ -48,6 +48,11 @@ export async function authorizeManagedSessionRequest(input: {
         path: input.path,
         sessionId: input.claims.sessionId,
         body: input.body,
+        // From the verified claims, which is the only place that says what this
+        // bearer is for. Omitting it here made every read token authorise as a
+        // runner — the write gate was open to exactly the bearers it was added
+        // to keep out.
+        purpose: input.claims.purpose,
     });
     if (!allowed.ok) return { ok: false, reason: allowed.reason };
 
