@@ -373,3 +373,133 @@ describe('trusted path requires every ancestor, not just the leaf', () => {
             .toMatchObject({ status: 'refused' });
     });
 });
+
+describe('a missing marker is only BYOS when the path it would live in is trusted', () => {
+    // The absence walk is Linux policy (see the platform boundary suite), so
+    // these pin the platform rather than depending on the host running them.
+    const linux = (over: Parameters<typeof deps>[0] = {}) => deps({ platform: 'linux', ...over });
+
+    it('reports absent when no managed root exists at all', () => {
+        // The ordinary BYOS machine: nothing was ever provisioned here, and no
+        // ancestor check may turn that into a refusal.
+        expect(resolveManagedRuntimeIdentity(join(root, 'nowhere', 'managed-runtime.json'), linux()))
+            .toEqual({ status: 'absent' });
+    });
+
+    it('refuses when the marker is gone but its directory is agent-writable', () => {
+        // The downgrade: the same directory would be refused while the marker
+        // is present, so deleting the marker must not open the legacy surface.
+        const dir = join(root, 'saycode');
+        mkdirSync(dir);
+        chmodSync(dir, 0o777);
+        const result = resolveManagedRuntimeIdentity(join(dir, 'managed-runtime.json'), linux());
+        expect(result.status).toBe('refused');
+    });
+
+    it('refuses when the marker is gone and an ancestor was replaced by a symlink', () => {
+        const real = join(root, 'real-saycode');
+        const link = join(root, 'saycode-link');
+        mkdirSync(real);
+        symlinkSync(real, link);
+        const result = resolveManagedRuntimeIdentity(join(link, 'managed-runtime.json'), linux());
+        expect(result.status).toBe('refused');
+    });
+
+    it('accepts absence when the existing directory is trusted', () => {
+        const dir = join(root, 'trusted-saycode');
+        mkdirSync(dir);
+        chmodSync(dir, 0o755);
+        expect(resolveManagedRuntimeIdentity(join(dir, 'managed-runtime.json'), linux()))
+            .toEqual({ status: 'absent' });
+    });
+
+    it('judges on the deepest directory that exists, not on ones that do not', () => {
+        // A mid-chain ENOENT is ordinary absence; only what exists can be
+        // untrustworthy.
+        const dir = join(root, 'partial');
+        mkdirSync(dir);
+        chmodSync(dir, 0o755);
+        expect(resolveManagedRuntimeIdentity(join(dir, 'deeper', 'managed-runtime.json'), linux()))
+            .toEqual({ status: 'absent' });
+    });
+
+    it('refuses when a deeper missing path sits under an untrusted existing directory', () => {
+        const dir = join(root, 'partial-unsafe');
+        mkdirSync(dir);
+        chmodSync(dir, 0o777);
+        const result = resolveManagedRuntimeIdentity(
+            join(dir, 'deeper', 'managed-runtime.json'), linux(),
+        );
+        expect(result.status).toBe('refused');
+    });
+});
+
+describe('platform boundary for the default production path', () => {
+    it('reports absent on a real non-Linux host with no marker', () => {
+        // Real filesystem, real uid, no injected deps. On macOS `/etc` is a
+        // root-owned symlink to `private/etc`, so an ancestor walk here would
+        // refuse and stop every BYOS daemon on the platform from starting.
+        // Managed runtimes are Linux-only, so a missing marker off Linux is
+        // plain absence.
+        if (process.platform === 'linux') return;
+        expect(resolveManagedRuntimeIdentity()).toEqual({ status: 'absent' });
+    });
+
+    it('still refuses a marker that exists but cannot be trusted, on any platform', () => {
+        // The support boundary applies to *absence*. A marker that is present
+        // and untrustworthy must never fall back to the legacy surface,
+        // whatever the platform.
+        writeProvisioning();
+        chmodSync(provisioningPath, 0o666);
+        const result = resolveManagedRuntimeIdentity(provisioningPath, deps({
+            statGate: (stat) => assertProvisioningStat({ ...stat, uid: 0 }),
+        }));
+        expect(result).toMatchObject({ status: 'refused', reason: 'world-or-group-writable' });
+    });
+
+    it('still refuses a corrupt marker on any platform', () => {
+        writeFileSync(provisioningPath, '{not json', { mode: 0o644 });
+        expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()))
+            .toMatchObject({ status: 'refused', reason: 'malformed' });
+    });
+
+    it('reports absent when the host has no uid concept at all', () => {
+        // Windows has no `process.getuid`; that is not a managed host either,
+        // and refusing there would block a BYOS daemon for the same reason.
+        expect(resolveManagedRuntimeIdentity(join(root, 'gone', 'managed-runtime.json'), deps({
+            getuid: () => -1,
+            platform: 'win32',
+        }))).toEqual({ status: 'absent' });
+    });
+
+    it('applies the absence walk on Linux', () => {
+        const dir = join(root, 'linux-unsafe');
+        mkdirSync(dir);
+        chmodSync(dir, 0o777);
+        // The same input that is absence off Linux is a refusal on it.
+        expect(resolveManagedRuntimeIdentity(join(dir, 'managed-runtime.json'), deps({
+            platform: 'linux',
+        })).status).toBe('refused');
+    });
+
+    it('refuses when a file sits where an ancestor directory should be', () => {
+        const blocker = join(root, 'blocker-file');
+        writeFileSync(blocker, 'x');
+        // ENOTDIR on the chain is a tamper signal, not absence — the same
+        // fail-closed rule the marker itself follows.
+        expect(resolveManagedRuntimeIdentity(join(blocker, 'sub', 'managed-runtime.json'), deps({
+            platform: 'linux',
+        })).status).toBe('refused');
+    });
+});
+
+describe('the Linux absence walk needs a uid to stand on', () => {
+    it('refuses on Linux when the daemon uid cannot be determined', () => {
+        // Without a uid the trust premise cannot be established, and an
+        // unestablished premise is a refusal — not a downgrade to BYOS.
+        expect(resolveManagedRuntimeIdentity(join(root, 'gone', 'managed-runtime.json'), deps({
+            platform: 'linux',
+            getuid: () => -1,
+        }))).toMatchObject({ status: 'refused' });
+    });
+});

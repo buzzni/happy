@@ -11,10 +11,14 @@
  *
  * Three outcomes, and the middle one carries the weight:
  *   - absent    → no marker. An ordinary BYOS machine; nothing changes for it.
- *                 Only ENOENT/ENOTDIR produce this. A marker we cannot read
- *                 (EACCES, EIO, ELOOP) is a refusal, never an absence —
- *                 treating "cannot read" as "not managed" would let anyone
- *                 downgrade the runtime by making the file unreadable.
+ *                 Only ENOENT produces this. A marker we cannot read (EACCES,
+ *                 EIO, ELOOP) is a refusal, and so is ENOTDIR — a file sitting
+ *                 where a directory belongs is producible by anyone who can
+ *                 write the parent, so treating it as "not managed" would be a
+ *                 switch for turning managed mode off. On Linux the directory
+ *                 the marker would live in is walked before absence is granted;
+ *                 off Linux, where no managed runtime can exist, a missing
+ *                 marker is absence outright.
  *   - refused   → a marker exists but cannot be trusted. Managed RPCs are not
  *                 served AND legacy spawn is not restored.
  *   - active    → verified provisioning, verified state directory, and an
@@ -78,6 +82,8 @@ export type IsolationProbeResult = { verified: true } | { verified: false; reaso
 
 export type ManagedProvisioningDeps = {
     getuid: () => number;
+    /** Managed runtimes are Linux-only; see `absenceRefusal`. */
+    platform?: NodeJS.Platform;
     /** Ownership/mode of a directory, without following a final symlink. */
     lstatDir: (path: string) => { uid: number; mode: number; isDirectory: boolean; isSymbolicLink: boolean };
     /** Trust decision about the opened provisioning file. */
@@ -105,6 +111,7 @@ export function probeIsolationBackendUnavailable(): IsolationProbeResult {
 
 const defaultDeps: ManagedProvisioningDeps = {
     getuid: () => (typeof process.getuid === 'function' ? process.getuid() : -1),
+    platform: process.platform,
     lstatDir: (path) => {
         const stat = lstatSync(path);
         return {
@@ -211,29 +218,83 @@ function readProvisioningFile(
  * is not a safe home for fencing state, and guessing that it is would be the
  * kind of assumption this check exists to remove.
  */
-function trustedPathRefusal(
-    target: string,
-    agentUid: number,
-    reason: ManagedIdentityRefusal,
-    deps: ManagedProvisioningDeps,
-): { reason: ManagedIdentityRefusal; detail: string } | null {
-    const resolved = resolve(target);
-    const parts = resolved.split(sep).filter((part) => part.length > 0);
+function pathChain(target: string): string[] {
+    const parts = resolve(target).split(sep).filter((part) => part.length > 0);
     const chain: string[] = [sep];
     for (let i = 0; i < parts.length; i += 1) {
         chain.push(sep + parts.slice(0, i + 1).join(sep));
     }
-    for (const component of chain) {
+    return chain;
+}
+
+/**
+ * Trust is ownership by root or by this daemon, nothing else.
+ *
+ * Naming the *agent* uid and refusing only that would leave every other
+ * unprivileged account on the host able to own a link in the chain. Since the
+ * daemon and the agent already run under different uids, refusing anything that
+ * is neither root nor the daemon covers the agent case and is strictly tighter.
+ */
+function componentRefusal(
+    stat: { uid: number; mode: number; isDirectory: boolean; isSymbolicLink: boolean },
+    daemonUid: number,
+): string | null {
+    if (stat.isSymbolicLink) return 'symlink';
+    if (!stat.isDirectory) return 'not a directory';
+    if (stat.uid !== 0 && stat.uid !== daemonUid) return 'not owned by root or the daemon';
+    if ((stat.mode & 0o022) !== 0) return 'group or world writable';
+    return null;
+}
+
+function trustedPathRefusal(
+    target: string,
+    daemonUid: number,
+    reason: ManagedIdentityRefusal,
+    deps: ManagedProvisioningDeps,
+): { reason: ManagedIdentityRefusal; detail: string } | null {
+    for (const component of pathChain(target)) {
         let stat: { uid: number; mode: number; isDirectory: boolean; isSymbolicLink: boolean };
         try {
             stat = deps.lstatDir(component);
         } catch (error) {
             return { reason, detail: `${component}: ${(error as NodeJS.ErrnoException).code ?? 'stat failed'}` };
         }
-        if (stat.isSymbolicLink) return { reason, detail: `${component}: symlink` };
-        if (!stat.isDirectory) return { reason, detail: `${component}: not a directory` };
-        if (stat.uid === agentUid) return { reason, detail: `${component}: owned by agent uid` };
-        if ((stat.mode & 0o022) !== 0) return { reason, detail: `${component}: group or world writable` };
+        const refusal = componentRefusal(stat, daemonUid);
+        if (refusal) return { reason, detail: `${component}: ${refusal}` };
+    }
+    return null;
+}
+
+/**
+ * Whether a missing marker may be read as "this is a BYOS machine".
+ *
+ * A marker that is absent because an agent deleted it from a directory it can
+ * write is not the same fact as a marker that was never provisioned, and the
+ * first one must not reopen the legacy surface. Only what exists can be
+ * untrustworthy, so the walk stops at the deepest directory that is there: a
+ * chain that simply does not exist is ordinary absence, which is what every
+ * BYOS machine looks like.
+ */
+function absenceRefusal(
+    markerPath: string,
+    daemonUid: number,
+    deps: ManagedProvisioningDeps,
+): { reason: ManagedIdentityRefusal; detail: string } | null {
+    for (const component of pathChain(dirname(resolve(markerPath)))) {
+        let stat: { uid: number; mode: number; isDirectory: boolean; isSymbolicLink: boolean };
+        try {
+            stat = deps.lstatDir(component);
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            // Nothing is here, so nothing below can exist either.
+            if (code === 'ENOENT') return null;
+            // ENOTDIR means a file sits where a directory belongs — producible
+            // by anyone who can write the parent, so it is a tamper signal and
+            // gets the same fail-closed treatment the marker itself gets.
+            return { reason: 'unreadable', detail: `${component}: ${code ?? 'stat failed'}` };
+        }
+        const refusal = componentRefusal(stat, daemonUid);
+        if (refusal) return { reason: 'not-root-owned', detail: `${component}: ${refusal}` };
     }
     return null;
 }
@@ -247,7 +308,7 @@ function trustedPathRefusal(
 function stateDirRefusal(
     stateDir: string,
     workspaceDir: string,
-    agentUid: number,
+    daemonUid: number,
     deps: ManagedProvisioningDeps,
 ): { reason: ManagedIdentityRefusal; detail: string } | null {
     if (!isAbsolute(stateDir)) return { reason: 'state-dir-unsafe', detail: 'not absolute' };
@@ -257,15 +318,38 @@ function stateDirRefusal(
     if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) {
         return { reason: 'state-dir-unsafe', detail: 'inside workspace' };
     }
-    return trustedPathRefusal(resolvedState, agentUid, 'state-dir-unsafe', deps);
+    return trustedPathRefusal(resolvedState, daemonUid, 'state-dir-unsafe', deps);
 }
 
 export function resolveManagedRuntimeIdentity(
     path: string = managedProvisioningPath(),
     deps: ManagedProvisioningDeps = defaultDeps,
 ): ManagedIdentityResolution {
+    const daemonUid = deps.getuid();
     const file = readProvisioningFile(path, deps.statGate ?? assertProvisioningStat);
-    if (file.kind === 'absent') return { status: 'absent' };
+    if (file.kind === 'absent') {
+        // Absence is only interrogated where a managed runtime could actually
+        // exist. Managed runtimes are Linux (the writer lock is a Linux
+        // abstract socket), and off Linux this walk would refuse on things
+        // that are normal there — macOS ships `/etc` as a root-owned symlink
+        // to `private/etc`, and Windows has no uid at all — which would stop
+        // every BYOS daemon on those platforms from starting.
+        //
+        // This is a boundary, not an escape hatch: a marker that *exists* is
+        // still validated and still refused on every platform, so no host can
+        // fall back to the legacy surface by being the wrong OS.
+        const platform = deps.platform ?? process.platform;
+        if (platform !== 'linux') return { status: 'absent' };
+        // On Linux the walk is the premise for calling this BYOS, and without a
+        // uid it cannot be established — which is a refusal, not an absence.
+        if (daemonUid < 0) {
+            return { status: 'refused', reason: 'unreadable', detail: 'daemon uid unavailable' };
+        }
+        const unsafe = absenceRefusal(path, daemonUid, deps);
+        return unsafe
+            ? { status: 'refused', reason: unsafe.reason, detail: unsafe.detail }
+            : { status: 'absent' };
+    }
     if (file.kind === 'refused') {
         return { status: 'refused', reason: file.reason, ...(file.detail ? { detail: file.detail } : {}) };
     }
@@ -313,19 +397,18 @@ export function resolveManagedRuntimeIdentity(
         return { status: 'refused', reason: 'isolation-unverified', detail: 'incomplete attestation' };
     }
 
-    const daemonUid = deps.getuid();
     if (daemonUid < 0 || daemonUid === agentUid) {
         return { status: 'refused', reason: 'isolation-unverified', detail: 'daemon shares the agent uid' };
     }
 
     // The marker decides this runtime's identity, so an agent that can replace
     // it chooses who the runtime is. Its directory chain gets the same walk.
-    const unsafeMarkerDir = trustedPathRefusal(dirname(resolve(path)), agentUid, 'not-root-owned', deps);
+    const unsafeMarkerDir = trustedPathRefusal(dirname(resolve(path)), daemonUid, 'not-root-owned', deps);
     if (unsafeMarkerDir) {
         return { status: 'refused', reason: 'not-root-owned', detail: unsafeMarkerDir.detail };
     }
 
-    const unsafeStateDir = stateDirRefusal(stateDir, workspaceDir, agentUid, deps);
+    const unsafeStateDir = stateDirRefusal(stateDir, workspaceDir, daemonUid, deps);
     if (unsafeStateDir) {
         return { status: 'refused', reason: unsafeStateDir.reason, detail: unsafeStateDir.detail };
     }

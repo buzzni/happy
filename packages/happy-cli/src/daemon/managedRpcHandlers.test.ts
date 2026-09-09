@@ -91,7 +91,6 @@ beforeEach(() => {
         isPidAlive: (pid) => livePgids.has(pid),
         now: () => wallClock,
         monotonicNow: () => monotonic,
-        stopGraceMs: 20,
         processGroupDeps: {
             kill: (target, signal) => {
                 killed.push([target, signal]);
@@ -296,7 +295,7 @@ describe('lease expiry does not silently leave a child running', () => {
         await handlers.spawn(call('spawn', { directory: '/w' }));
         monotonic += 120_000;
 
-        const outcome = await handlers.enforceLeaseExpiry();
+        const outcome = await handlers.runLeaseMaintenance();
         // Nothing here can stop a child that outlived the lease, so this must
         // say so rather than report a clean stop.
         expect(outcome.expired).toBe(true);
@@ -403,7 +402,7 @@ describe('lease expiry hands off by stable identity', () => {
             proveGenerationStopped: async () => ({ proven: false, detail: 'unproven' }),
             requestStop: async (input) => { calls.push(input); return { requested: true, detail: 'ok' }; },
         };
-        await handlers.enforceLeaseExpiry();
+        await handlers.runLeaseMaintenance();
         expect(calls).toHaveLength(1);
         // A pgid is meaningless to a backend that outlives this process.
         expect(calls[0]).toMatchObject({ runId: RUN, attemptId: ATTEMPT });
@@ -416,7 +415,7 @@ describe('lease expiry hands off by stable identity', () => {
             requestStop: async (input) => { calls.push(input); return { requested: true, detail: 'ok' }; },
         };
         runtime.store.update(OP_KEY, { state: 'spawning', pid: null, pgid: null }, wallClock);
-        await handlers.enforceLeaseExpiry();
+        await handlers.runLeaseMaintenance();
         // `spawning` means a child may exist whose pid was never recorded.
         expect(calls).toHaveLength(1);
     });
@@ -427,7 +426,7 @@ describe('lease expiry hands off by stable identity', () => {
             requestStop: async () => ({ requested: true, detail: 'ok' }),
         };
         livePgids.delete(4242);
-        const outcome = await handlers.enforceLeaseExpiry();
+        const outcome = await handlers.runLeaseMaintenance();
         // No local trace only means nothing is visible from here.
         expect(outcome.actionRequired).toBe(true);
     });
@@ -437,7 +436,7 @@ describe('lease expiry hands off by stable identity', () => {
             proveGenerationStopped: async () => ({ proven: true, detail: 'provider stopped' }),
             requestStop: async () => ({ requested: true, detail: 'ok' }),
         };
-        const outcome = await handlers.enforceLeaseExpiry();
+        const outcome = await handlers.runLeaseMaintenance();
         expect(outcome.actionRequired).toBe(false);
     });
 });
@@ -578,21 +577,30 @@ describe('lease renewal, promotion and expiry share one serial section', () => {
         // The expiry sees an expired lease, but a renewal is queued behind it.
         // If the two are not serialized the expiry stops a child that the
         // renewal has just made legitimate again.
-        const expiry = handlers.enforceLeaseExpiry();
+        const expiry = handlers.runLeaseMaintenance();
         const renewal = handlers.lease(call('lease', {}, {
             renewalSeq: 2, leaseMs: 60_000, absoluteExpiry: NOW + 900_000,
             iat: wallClock, exp: wallClock + 60_000,
         }));
         const [expiryOutcome] = await Promise.all([expiry, renewal]);
 
-        if (expiryOutcome.expired) {
-            // Expiry ran first: the renewal must have observed a valid lease
-            // afterwards, and no stop may be issued once it did.
-            expect(handlers.isLeaseValid()).toBe(true);
+        expect(handlers.isLeaseValid()).toBe(true);
+        const obligation = runtime.store.read(OP_KEY);
+        expect(obligation.kind).toBe('ok');
+
+        const before = stops.length;
+        await handlers.runLeaseMaintenance();
+        if (expiryOutcome.expired && obligation.kind === 'ok'
+            && obligation.receipt.stopRequestedAt !== null) {
+            // The expiry got there first and recorded the obligation, so the
+            // retry continues — a renewal restores the right to run new work,
+            // not the right to forget a stop (see the obligation suite below).
+            expect(stops.length).toBeGreaterThan(before);
+        } else {
+            // The renewal got there first: the lease was valid when the expiry
+            // looked, so it must not have invented an obligation at all.
+            expect(stops.length).toBe(before);
         }
-        const stopsAfterRenewal = stops.length;
-        await handlers.enforceLeaseExpiry();
-        expect(stops.length).toBe(stopsAfterRenewal);
     });
 
     it('blocks a new spawn until expiry handling has finished', async () => {
@@ -608,7 +616,7 @@ describe('lease renewal, promotion and expiry share one serial section', () => {
         });
         runtime.store.update(OP_KEY, { state: 'running', pid: 4242, pgid: 4242 }, wallClock);
 
-        const expiry = handlers.enforceLeaseExpiry();
+        const expiry = handlers.runLeaseMaintenance();
         await Promise.resolve();
         const other = managedOperationKey({ runId: 'run-2', attemptId: 'a-2' });
         expect(other).not.toBe(OP_KEY);
@@ -659,9 +667,9 @@ describe('lease renewal, promotion and expiry share one serial section', () => {
             return { requested: true, detail: 'ok' };
         };
         await Promise.all([
-            handlers.enforceLeaseExpiry(),
-            handlers.enforceLeaseExpiry(),
-            handlers.enforceLeaseExpiry(),
+            handlers.runLeaseMaintenance(),
+            handlers.runLeaseMaintenance(),
+            handlers.runLeaseMaintenance(),
         ]);
         expect(maxConcurrent).toBe(1);
     });
@@ -681,7 +689,7 @@ describe('lease renewal, promotion and expiry share one serial section', () => {
             finished = true;
             return { requested: true, detail: 'ok' };
         };
-        void handlers.enforceLeaseExpiry();
+        void handlers.runLeaseMaintenance();
         // Teardown must wait for whatever is running, not just the last tick.
         await handlers.drainLeaseWork();
         expect(finished).toBe(true);
@@ -727,7 +735,7 @@ describe('expiry versus a spawn that is still in flight', () => {
         await handlers.spawn(call('spawn', { directory: '/w' }));
         monotonic += 5_000;
 
-        await handlers.enforceLeaseExpiry();
+        await handlers.runLeaseMaintenance();
         const stored = runtime.store.read(OP_KEY);
         expect(stored.kind).toBe('ok');
         // Without this the intent lives only in the backend call, so a process
@@ -747,7 +755,7 @@ describe('expiry versus a spawn that is still in flight', () => {
         await Promise.resolve();
 
         monotonic += 5_000;
-        await handlers.enforceLeaseExpiry();
+        await handlers.runLeaseMaintenance();
 
         livePgids.add(4242);
         release({ type: 'success', sessionId: 'sess-1', pid: 4242 });
@@ -770,7 +778,7 @@ describe('expiry versus a spawn that is still in flight', () => {
         await Promise.resolve();
         monotonic += 5_000;
 
-        const outcome = await handlers.enforceLeaseExpiry();
+        const outcome = await handlers.runLeaseMaintenance();
         // A proof taken now cannot cover a child that has not started yet.
         expect(outcome.actionRequired).toBe(true);
 
@@ -797,7 +805,7 @@ describe('expiry versus a spawn that is still in flight', () => {
         const inFlight = handlers.spawn(call('spawn', { directory: '/w' }));
         await Promise.resolve();
         monotonic += 5_000;
-        await handlers.enforceLeaseExpiry();
+        await handlers.runLeaseMaintenance();
         stopFinished = false;
 
         await handlers.drainLeaseWork();
@@ -807,5 +815,177 @@ describe('expiry versus a spawn that is still in flight', () => {
         expect(launched).toBe(true);
         expect(stopFinished).toBe(true);
         await inFlight;
+    });
+});
+
+describe('shutdown entry gate is separate from store ownership', () => {
+    it('refuses a new spawn once entries are closed', async () => {
+        await grantLease();
+        handlers.closeEntries();
+        await expect(handlers.spawn(call('spawn', { directory: '/w' })))
+            .rejects.toThrowError(/shutting-down/);
+        expect(spawnCalls).toBe(0);
+    });
+
+    it('refuses a new stop and a new lease once entries are closed', async () => {
+        await grantLease();
+        handlers.closeEntries();
+        await expect(handlers.stop(call('stop', {}))).rejects.toThrowError(/shutting-down/);
+        await expect(grantLease({ renewalSeq: 9 })).rejects.toThrowError(/shutting-down/);
+    });
+
+    it('lets an already-entered spawn finish its bookkeeping', async () => {
+        await grantLease();
+        let release: (v: ManagedSpawnOutcome) => void = () => {};
+        spawnResult = () => new Promise((resolve) => { release = resolve; });
+        const inFlight = handlers.spawn(call('spawn', { directory: '/w' }));
+        await Promise.resolve();
+
+        handlers.closeEntries();
+        release({ type: 'success', sessionId: 'sess-1', pid: 4242 });
+        const result = await inFlight;
+
+        // Closing the door must not undo work that is already inside.
+        expect(result.accepted).toBe(true);
+        const stored = runtime.store.read(OP_KEY);
+        if (stored.kind === 'ok') expect(stored.receipt.state).toBe('running');
+    });
+});
+
+describe('explicit stop is drained too', () => {
+    it('waits for a stop that is still handing over to the backend', async () => {
+        await grantLease();
+        livePgids.add(4242);
+        await handlers.spawn(call('spawn', { directory: '/w' }));
+
+        let handoverFinished = false;
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: false, detail: 'unproven' }),
+            requestStop: async () => {
+                await new Promise((resolve) => setTimeout(resolve, 15));
+                handoverFinished = true;
+                return { requested: true, detail: 'ok' };
+            },
+        };
+        void handlers.stop(call('stop', {}));
+        await Promise.resolve();
+
+        await handlers.drainLeaseWork();
+        // Without tracking the stop RPC the drain finds nothing outstanding and
+        // the writer lock goes while the handover is still in progress.
+        expect(handoverFinished).toBe(true);
+    });
+});
+
+describe('a stop obligation survives a lease renewal', () => {
+    async function refusedExpiryStop() {
+        let accept = false;
+        const stops: Array<Record<string, unknown>> = [];
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: accept, detail: 'x' }),
+            requestStop: async (input) => {
+                stops.push(input);
+                return accept ? { requested: true, detail: 'ok' } : { requested: false, detail: 'down' };
+            },
+        };
+        await grantLease({ renewalSeq: 1, leaseMs: 1_000 });
+        livePgids.add(4242);
+        await handlers.spawn(call('spawn', { directory: '/w' }));
+        monotonic += 5_000;
+        const expiry = await handlers.runLeaseMaintenance();
+        expect(expiry.actionRequired).toBe(true);
+        return { stops, acceptFrom: () => { accept = true; } };
+    }
+
+    it('keeps retrying after a same-epoch renewal extends the deadline', async () => {
+        const ctx = await refusedExpiryStop();
+        const beforeRenewal = ctx.stops.length;
+
+        await handlers.lease(call('lease', {}, {
+            renewalSeq: 2, leaseMs: 60_000, absoluteExpiry: NOW + 900_000,
+            iat: wallClock, exp: wallClock + 60_000,
+        }));
+        expect(handlers.isLeaseValid()).toBe(true);
+
+        // The obligation was already recorded; a renewal restores the right to
+        // run new work, not the right to forget a stop that was refused.
+        ctx.acceptFrom();
+        const tick = await handlers.runLeaseMaintenance();
+        expect(ctx.stops.length).toBeGreaterThan(beforeRenewal);
+        expect(tick.pendingStopsRetried).toBe(1);
+    });
+
+    it('stops retrying once the receipt reaches a trusted terminal state', async () => {
+        const ctx = await refusedExpiryStop();
+        runtime.store.update(OP_KEY, { state: 'stopped' }, wallClock);
+        const before = ctx.stops.length;
+        const tick = await handlers.runLeaseMaintenance();
+        expect(ctx.stops.length).toBe(before);
+        expect(tick.pendingStopsRetried).toBe(0);
+    });
+
+    it('does not treat a recorded stop request as a termination', async () => {
+        const ctx = await refusedExpiryStop();
+        const stored = runtime.store.read(OP_KEY);
+        expect(stored.kind).toBe('ok');
+        if (stored.kind === 'ok') {
+            expect(stored.receipt.stopRequestedAt).not.toBeNull();
+            // Requested is not terminated: the receipt must not have moved to a
+            // terminal state on the strength of an unaccepted handover.
+            expect(stored.receipt.state).not.toBe('stopped');
+        }
+        expect(ctx.stops.length).toBeGreaterThan(0);
+    });
+
+    it('reports the outstanding obligation while the lease is valid', async () => {
+        await refusedExpiryStop();
+        await handlers.lease(call('lease', {}, {
+            renewalSeq: 2, leaseMs: 60_000, absoluteExpiry: NOW + 900_000,
+            iat: wallClock, exp: wallClock + 60_000,
+        }));
+        const tick = await handlers.runLeaseMaintenance();
+        expect(tick.expired).toBe(false);
+        expect(tick.actionRequired).toBe(true);
+    });
+});
+
+describe('maintenance reports what it could not read', () => {
+    it('requires action when the receipt store is unreadable under a valid lease', async () => {
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: true, detail: 'ok' }),
+            requestStop: async () => ({ requested: true, detail: 'ok' }),
+        };
+        await grantLease();
+        const { writeFileSync } = await import('node:fs');
+        const { join: joinPath } = await import('node:path');
+        const { managedReceiptFileName } = await import('./managedReceiptStore');
+        writeFileSync(joinPath(root, 'receipts', managedReceiptFileName(OP_KEY)), '{broken');
+
+        const tick = await handlers.runLeaseMaintenance();
+        // A store we cannot read may hold a pending stop; reporting all-clear
+        // would drop that obligation silently.
+        expect(tick.expired).toBe(false);
+        expect(tick.actionRequired).toBe(true);
+        expect(tick.storeUnreadable).toBe(true);
+    });
+
+    it('asks the backend once per attempt in a tick, not twice', async () => {
+        const stops: Array<Record<string, unknown>> = [];
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: true, detail: 'ok' }),
+            requestStop: async (input) => { stops.push(input); return { requested: true, detail: 'ok' }; },
+        };
+        await grantLease({ renewalSeq: 1, leaseMs: 1_000 });
+        livePgids.add(4242);
+        await handlers.spawn(call('spawn', { directory: '/w' }));
+        monotonic += 5_000;
+
+        await handlers.runLeaseMaintenance();
+        const first = stops.length;
+        await handlers.runLeaseMaintenance();
+        // The pending pass and the expiry pass must not both hand over the
+        // same attempt within one tick.
+        expect(first).toBe(1);
+        expect(stops.length - first).toBe(1);
     });
 });

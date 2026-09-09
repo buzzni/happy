@@ -120,6 +120,7 @@ import { resolveManagedRuntimeIdentity } from './managedRuntimeIdentity';
 import { acquireManagedWriterLock } from './managedWriterLock';
 import { createManagedReceiptStore } from './managedReceiptStore';
 import { createManagedRpcHandlers, type ManagedRpcHandlers } from './managedRpcHandlers';
+import { teardownManagedRuntime as runManagedTeardown } from './managedTeardown';
 import { createAutomationStore } from './automations/automationStore';
 import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
@@ -2505,44 +2506,39 @@ export async function startDaemon(): Promise<void> {
     // Create realtime machine session
     const apiMachine = api.machineSyncClient(machine);
     let managedLeaseWatchdog: ReturnType<typeof setInterval> | null = null;
-    /** Drains every in-flight lease operation; set once the handlers exist. */
+    /** Drains every in-flight managed operation; set once the handlers exist. */
     let managedDrainLeaseWork: (() => Promise<void>) | null = null;
+    /** Refuses new managed RPC entries; set once the handlers exist. */
+    let managedCloseEntries: (() => void) | null = null;
 
     /**
      * Shared by both exits — normal shutdown and the self-update replacement.
      *
-     * Order matters: the lock is dropped only after this process can no longer
-     * write, because the moment it goes another daemon may claim the receipts.
-     * `managedWriterLockHeld` is cleared first so an in-flight RPC or watchdog
-     * tick that resumes mid-teardown is refused by the store instead of writing
-     * into a directory this process no longer owns.
-     *
-     * Children still running are NOT reused from the BYOS preserve-for-resume
-     * path: that keeps a session alive on purpose, which is the opposite of
-     * what a managed shutdown needs. Stopping them belongs to the privileged
-     * backend (T09); with none wired this records that it could not be done.
+     * The ordering lives in `managedTeardown.ts` so the daemon and its tests
+     * exercise the same function rather than two descriptions of it.
      */
-    const teardownManagedRuntime = async (): Promise<void> => {
-      if (managedIdentity.status !== 'active') return;
-      if (managedLeaseWatchdog) {
-        clearInterval(managedLeaseWatchdog);
-        managedLeaseWatchdog = null;
-      }
-      managedWriterLockHeld = false;
-      // Every queued or running lease operation, not just the most recent one:
-      // a stop handed to the backend mid-teardown must finish before the writer
-      // lock goes, or another daemon can claim the receipts underneath it.
-      if (managedDrainLeaseWork) await managedDrainLeaseWork().catch(() => undefined);
-      if (!managedFencingBackendWired) {
-        logger.debug('[managed] shutting down with no launch backend; running children are not fenced');
-      }
-      if (releaseManagedWriterLock) {
-        await releaseManagedWriterLock().catch((error: Error) => {
-          logger.debug(`[managed] writer lock release failed: ${error.message}`);
-        });
+    const teardownManagedRuntime = async (): Promise<void> => runManagedTeardown({
+      active: managedIdentity.status === 'active',
+      stopWatchdog: () => {
+        if (managedLeaseWatchdog) {
+          clearInterval(managedLeaseWatchdog);
+          managedLeaseWatchdog = null;
+        }
+      },
+      closeEntries: () => managedCloseEntries?.(),
+      drain: async () => { await managedDrainLeaseWork?.(); },
+      // Only after the drain: work already inside must be able to record what
+      // it did, or a launch that succeeded is left looking unfinished.
+      closeWrites: () => { managedWriterLockHeld = false; },
+      releaseLock: async () => {
+        if (!releaseManagedWriterLock) return;
+        const release = releaseManagedWriterLock;
         releaseManagedWriterLock = null;
-      }
-    };
+        await release();
+      },
+      backendWired: managedFencingBackendWired,
+      logDebug: (message) => logger.debug(message),
+    });
 
     // The managed dispatch surface. Identity and the writer lock were settled
     // during early bootstrap; this only builds what needs `spawnSession`.
@@ -2591,6 +2587,7 @@ export async function startDaemon(): Promise<void> {
       // the constructor already registered and intercepts the rest.
       apiMachine.setManagedRuntime(managedHandlers);
       managedDrainLeaseWork = () => managedHandlers.drainLeaseWork();
+      managedCloseEntries = () => managedHandlers.closeEntries();
       // The handler serializes expiry against renewal and promotion, so the
       // interval only has to avoid piling work onto that queue: a tick is
       // skipped while the previous one is still outstanding.
@@ -2598,11 +2595,14 @@ export async function startDaemon(): Promise<void> {
       managedLeaseWatchdog = setInterval(() => {
         if (watchdogBusy) return;
         watchdogBusy = true;
-        void managedHandlers.enforceLeaseExpiry().then((outcome) => {
-          if (outcome.expired && outcome.actionRequired) {
+        void managedHandlers.runLeaseMaintenance().then((outcome) => {
+          // Keyed on `actionRequired` alone: a refused stop under a *valid*
+          // lease is exactly the case an `expired &&` condition would hide.
+          if (outcome.actionRequired) {
             logger.debug(
-              `[managed] lease expired; ${outcome.live.length} run(s) handed over, `
-              + `${outcome.unstoppable.length} not accepted by any backend`,
+              `[managed] action required (expired=${outcome.expired}); `
+              + `${outcome.live.length} handed over, ${outcome.unstoppable.length} not accepted, `
+              + `${outcome.pendingStopsRetried} stop(s) retried, storeUnreadable=${outcome.storeUnreadable}`,
             );
           }
         }).catch((error) => {
