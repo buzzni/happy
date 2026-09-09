@@ -8,6 +8,7 @@ import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { allocateUserSeq } from "@/storage/seq";
 import { sessionDelete } from "@/app/session/sessionDelete";
 import { sessionArchive } from "@/app/session/sessionArchive";
+import { requireSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
 
 export function sessionRoutes(app: Fastify) {
 
@@ -123,8 +124,10 @@ export function sessionRoutes(app: Fastify) {
         });
     });
 
+    // A managed child may look up exactly its own session; the allowlist
+    // checks the body, because this route takes its scope from there.
     app.post('/v2/sessions/lookup', {
-        preHandler: app.authenticate,
+        preHandler: requireSessionScopeAuth(app) as never,
         schema: {
             body: z.object({
                 ids: z.array(z.string().min(1)).min(1).max(200)

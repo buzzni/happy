@@ -18,7 +18,7 @@ import { accessKeysRoutes } from "./routes/accessKeysRoutes";
 import { machineSessionOwnerRoutes } from "./routes/machineSessionOwnerRoutes";
 import { enableMonitoring } from "./utils/enableMonitoring";
 import { enableErrorHandlers } from "./utils/enableErrorHandlers";
-import { enableAuthentication } from "./utils/enableAuthentication";
+import { enableAuthentication, enableSessionScopeAuthentication } from "./utils/enableAuthentication";
 import { userRoutes } from "./routes/userRoutes";
 import { feedRoutes } from "./routes/feedRoutes";
 import { internalFeedRoutes } from "./routes/internalFeedRoutes";
@@ -146,6 +146,10 @@ export async function startApi(opts: StartApiOptions = {}) {
     // keys; `createManagedControlRuntime` returns null when it has not, and the
     // routes then refuse rather than falling back to the account bearer.
     const managedControl: ManagedControlRuntime | null = await createManagedControlRuntime(process.env);
+
+    // The one configured issuer, handed to the session-data decorator. Building
+    // a second here would verify against a second key.
+    enableSessionScopeAuthentication(typed, () => managedControl?.scopedTokens ?? null);
 
     // Routes
     managedControlRoutes(typed, () => managedControl);
