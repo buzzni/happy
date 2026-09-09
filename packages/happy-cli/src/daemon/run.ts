@@ -116,6 +116,10 @@ import {
   hydrateTrackedSessionFromPersisted,
   mergeTrackedSessionWebhook,
 } from './persistedSessionHydration';
+import { resolveManagedRuntimeIdentity } from './managedRuntimeIdentity';
+import { acquireManagedWriterLock } from './managedWriterLock';
+import { createManagedReceiptStore } from './managedReceiptStore';
+import { createManagedRpcHandlers, type ManagedRpcHandlers } from './managedRpcHandlers';
 import { createAutomationStore } from './automations/automationStore';
 import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
@@ -379,6 +383,39 @@ export async function startDaemon(): Promise<void> {
     // Ensure auth and machine registration BEFORE anything else
     const { credentials, machineId, serverPublicKey } = await authAndSetupMachineIfNeeded();
     logger.debug('[DAEMON RUN] Auth and machine setup complete');
+
+    // ── Managed runtime admission, decided before anything can accept work ──
+    //
+    // This runs ahead of the control server, the RPC listener and session
+    // restoration on purpose. Deciding later leaves a window in which the
+    // legacy spawn entry points are already reachable on a runtime that should
+    // never have served them.
+    //
+    // Resolved exactly once: a later edit to the provisioning file cannot flip
+    // a running daemon's mode. `refused` does not fall back to BYOS — a marker
+    // that exists but cannot be trusted is a downgrade attempt, and reopening
+    // the legacy path is the outcome it is after.
+    const managedIdentity = resolveManagedRuntimeIdentity();
+    if (managedIdentity.status === 'refused') {
+      throw new Error(
+        `[managed] provisioning marker present but not trusted (${managedIdentity.reason}); refusing to start`,
+      );
+    }
+    let managedWriterLockHeld = false;
+    // No privileged launch backend exists yet (T09); kept explicit so shutdown
+    // says what it could not do instead of implying a clean stop.
+    const managedFencingBackendWired = false;
+    let releaseManagedWriterLock: (() => Promise<void>) | null = null;
+    if (managedIdentity.status === 'active') {
+      const lock = await acquireManagedWriterLock({ runtimeId: managedIdentity.identity.runtimeId });
+      if (!lock.ok) {
+        // Never steal and never guess: another writer may hold the receipts.
+        throw new Error(`[managed] writer lock unavailable (${lock.reason}); refusing to start`);
+      }
+      managedWriterLockHeld = true;
+      releaseManagedWriterLock = lock.release;
+      logger.debug(`[managed] runtime ${managedIdentity.identity.runtimeId} admitted`);
+    }
     let machineAutomationKey = loadOrCreateMachineAutomationKey(configuration.automationKeyFile);
     const mcpCallerGrantKeyPair = tweetnacl.box.keyPair();
     const mcpCallerGrantConsumer = new McpCallerGrantEnvelopeConsumer({
@@ -2369,6 +2406,7 @@ export async function startDaemon(): Promise<void> {
       browserBridge,
       // 제어 서버의 파일 접근도 같은 잠금 정책을 따른다(HAPPY_RPC_ALLOWED_ROOT).
       allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+      managedRuntime: managedIdentity.status === 'active',
       getMachineEncryption: () => machineEncryptionForTerminalWs,
     });
 
@@ -2466,6 +2504,101 @@ export async function startDaemon(): Promise<void> {
 
     // Create realtime machine session
     const apiMachine = api.machineSyncClient(machine);
+    let managedLeaseWatchdog: ReturnType<typeof setInterval> | null = null;
+    /** Resolves when the watchdog tick that is already running has finished. */
+    let managedWatchdogTick: Promise<unknown> = Promise.resolve();
+
+    /**
+     * Shared by both exits — normal shutdown and the self-update replacement.
+     *
+     * Order matters: the lock is dropped only after this process can no longer
+     * write, because the moment it goes another daemon may claim the receipts.
+     * `managedWriterLockHeld` is cleared first so an in-flight RPC or watchdog
+     * tick that resumes mid-teardown is refused by the store instead of writing
+     * into a directory this process no longer owns.
+     *
+     * Children still running are NOT reused from the BYOS preserve-for-resume
+     * path: that keeps a session alive on purpose, which is the opposite of
+     * what a managed shutdown needs. Stopping them belongs to the privileged
+     * backend (T09); with none wired this records that it could not be done.
+     */
+    const teardownManagedRuntime = async (): Promise<void> => {
+      if (managedIdentity.status !== 'active') return;
+      if (managedLeaseWatchdog) {
+        clearInterval(managedLeaseWatchdog);
+        managedLeaseWatchdog = null;
+      }
+      managedWriterLockHeld = false;
+      await managedWatchdogTick.catch(() => undefined);
+      if (!managedFencingBackendWired) {
+        logger.debug('[managed] shutting down with no launch backend; running children are not fenced');
+      }
+      if (releaseManagedWriterLock) {
+        await releaseManagedWriterLock().catch((error: Error) => {
+          logger.debug(`[managed] writer lock release failed: ${error.message}`);
+        });
+        releaseManagedWriterLock = null;
+      }
+    };
+
+    // The managed dispatch surface. Identity and the writer lock were settled
+    // during early bootstrap; this only builds what needs `spawnSession`.
+    if (managedIdentity.status === 'active') {
+      const identity = managedIdentity.identity;
+      const store = createManagedReceiptStore(identity.stateDir, {
+        assertHeld: (action) => {
+          if (!managedWriterLockHeld) {
+            throw new Error(`managed writer lock not held; refusing ${action}`);
+          }
+        },
+      });
+      const managedHandlers = createManagedRpcHandlers({
+        identity,
+        store,
+        // The managed path reuses the existing spawn implementation rather than
+        // duplicating it; only admission and bookkeeping are new.
+        spawn: async (request, context) => {
+          logger.debug(
+            `[managed] launching run=${context.runId} attempt=${context.attemptId} epoch=${context.epoch}`,
+          );
+          const result = await spawnSession({
+            directory: request.directory,
+            agent: request.agent as SpawnSessionOptions['agent'],
+            ...(request.environmentVariables ? { environmentVariables: request.environmentVariables } : {}),
+            ...(request.initialPrompt ? { initialPrompt: request.initialPrompt } : {}),
+            ...(request.initialPromptLocalId ? { initialPromptLocalId: request.initialPromptLocalId } : {}),
+          });
+          if (result.type === 'success' && result.sessionId) {
+            const tracked = findTrackedSessionById(result.sessionId);
+            if (tracked?.pid) return { type: 'success', sessionId: result.sessionId, pid: tracked.pid };
+            // The session exists but its pid was never seen: reporting an error
+            // without `started: false` keeps it reconcilable instead of closed.
+            return { type: 'error', errorMessage: 'session started without a tracked pid' };
+          }
+          if (result.type === 'requestToApproveDirectoryCreation') {
+            return { type: 'error', errorMessage: 'directory approval required', started: false };
+          }
+          return { type: 'error', errorMessage: 'spawn failed' };
+        },
+        isPidAlive,
+        now: Date.now,
+        monotonicNow: () => Number(process.hrtime.bigint() / 1_000_000n),
+      });
+      // Installed before setRPCHandlers so the allowlist sweeps the handlers
+      // the constructor already registered and intercepts the rest.
+      apiMachine.setManagedRuntime(managedHandlers);
+      managedLeaseWatchdog = setInterval(() => {
+        managedWatchdogTick = managedHandlers.enforceLeaseExpiry().then((outcome) => {
+          if (outcome.expired && outcome.actionRequired) {
+            logger.debug(`[managed] lease expired with ${outcome.live.length} unresolved run(s)`);
+          }
+        }).catch((error) => {
+          logger.debug(`[managed] lease watchdog failed: ${(error as Error).message}`);
+        });
+        void managedWatchdogTick;
+      }, 5_000);
+      managedLeaseWatchdog.unref();
+    }
     const claudeSwapSupervisor = createClaudeSwapSupervisor(
       join(configuration.happyHomeDir, 'claude-swap-supervisor.json'),
     );
@@ -2896,6 +3029,7 @@ export async function startDaemon(): Promise<void> {
             await stopControlServer();
             await stopBrowserBridge();
             await cleanupDaemonState();
+            await teardownManagedRuntime();
             await releaseDaemonLock(daemonLockHandle);
             await stopCaffeinate();
           },
@@ -3015,6 +3149,7 @@ export async function startDaemon(): Promise<void> {
       });
 
       await stopCaffeinate();
+      await teardownManagedRuntime();
       await releaseDaemonLock(daemonLockHandle);
 
       logger.debug('[DAEMON RUN] Cleanup completed, exiting process');

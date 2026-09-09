@@ -21,6 +21,7 @@ import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt } from './encryption';
 import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer';
 import { backoff } from '@/utils/time';
+import { applyManagedRpcRestrictions, registerManagedRpcHandlers, type ManagedRpcHandlers } from '@/daemon/managedRpcHandlers';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { createRpcRequestListener } from './rpc/rpcRequestListener';
 import { detectCLIAvailability, CLIAvailability } from '@/utils/detectCLI';
@@ -430,6 +431,8 @@ export class ApiMachineClient {
         callerWillLaunchBrowser: boolean;
         promise: Promise<ViewerStackStartResult>;
     } | null = null;
+    /** Set only on a verified managed runtime; null on every BYOS machine. */
+    private managedHandlers: ManagedRpcHandlers | null = null;
     private isolatedViewerLeases = new Map<string, BrowserViewerLeaseRecord>();
     private isolatedViewerStarts = new Map<string, Promise<IsolatedViewerStartResult>>();
     private isolatedViewerMutation: Promise<void> = Promise.resolve();
@@ -507,6 +510,14 @@ export class ApiMachineClient {
                 }),
             }),
         );
+    }
+
+    /**
+     * Enables the managed dispatch surface. Must be called before
+     * `setRPCHandlers`, which applies the restrictions as its last step.
+     */
+    setManagedRuntime(handlers: ManagedRpcHandlers): void {
+        this.managedHandlers = handlers;
     }
 
     setRPCHandlers({
@@ -1276,6 +1287,15 @@ export class ApiMachineClient {
         // RPC envelope can't be used. The preview payload is inherently
         // non-sensitive (it's the HTTP request flowing from the iframe,
         // and happy-server already sees it to rewrite HTML).
+
+        // Applied last so it wins over every legacy registration above,
+        // regardless of the order those modules ran in. On a BYOS machine
+        // `managedHandlers` is null and nothing below executes, so the
+        // existing surface is untouched.
+        if (this.managedHandlers) {
+            applyManagedRpcRestrictions(this.rpcHandlerManager);
+            registerManagedRpcHandlers(this.rpcHandlerManager, this.managedHandlers);
+        }
     }
 
     setAutomationKey(key: MachineAutomationKey, persistVersion: (version: number) => void): void {
@@ -2122,7 +2142,9 @@ export class ApiMachineClient {
                 onActivity: (port) => this.touchBrokerViewerPort(port),
             },
         );
-        this.socket.on('proxy-ws-open', async (params, ack) => {
+        // Not attached on a managed runtime: the preview WebSocket proxy reaches the host outside
+        // the RPC dispatch gate, so the allowlist there would not see it.
+        if (!this.managedHandlers) this.socket.on('proxy-ws-open', async (params, ack) => {
             ack(await this.previewWsProxy!.open(params));
         });
         this.socket.on('proxy-ws-data', (payload) => {
@@ -2144,7 +2166,9 @@ export class ApiMachineClient {
         const machineKey = this.machine.encryptionKey;
         const machineVariant = this.machine.encryptionVariant;
         const machineId = this.machine.id;
-        this.socket.on('terminal-open-fwd', async (msg, ack) => {
+        // Not attached on a managed runtime: the forwarded terminal opener reaches the host outside
+        // the RPC dispatch gate, so the allowlist there would not see it.
+        if (!this.managedHandlers) this.socket.on('terminal-open-fwd', async (msg, ack) => {
             try {
                 const { sessionId, params } = msg || {};
                 if (!sessionId || typeof sessionId !== 'string') {
@@ -2276,7 +2300,9 @@ export class ApiMachineClient {
             }
         });
 
-        this.socket.on('terminal-frame-fwd', (msg) => {
+        // Not attached on a managed runtime: forwarded terminal frames reaches the host outside
+        // the RPC dispatch gate, so the allowlist there would not see it.
+        if (!this.managedHandlers) this.socket.on('terminal-frame-fwd', (msg) => {
             const { sessionId, data } = msg || {};
             const entry = getDaemonTerminalSession(sessionId);
             if (!entry || typeof data !== 'string') return;

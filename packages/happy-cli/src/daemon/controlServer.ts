@@ -19,6 +19,23 @@ import { startServerProcess, StartServerError } from './startServer';
 import { stopServerProcess, StopServerError } from './stopServer';
 import { BrowserBridge, BridgeRequestError } from './browserBridge';
 import { attachTerminalWsRoute, type MachineEncryption as TerminalMachineEncryption } from './controlServerTerminalWs';
+
+/**
+ * The only control-server paths a managed runtime may serve, and even these
+ * are not open on the shared bearer alone.
+ *
+ * The bearer secret is loopback-wide: on a managed runtime the agent's own
+ * tools can read it, so it proves "something on this host" and nothing about
+ * *which* launch is reporting. A report accepted on that basis lets arbitrary
+ * code forge another Run's session id. Each report is therefore additionally
+ * checked against the launch registry by `verifyManagedReport`, and when no
+ * verifier is wired — the current state, since T09 owns the launcher — the
+ * path is refused rather than opened.
+ *
+ * `/stop` is deliberately absent: shutting the daemon down would also kill the
+ * lease watchdog, and that authority does not belong with report authority.
+ */
+const MANAGED_REPORT_PATHS = new Set(['/session-started', '/session-runtime']);
 import type { ChildProcess } from 'node:child_process';
 import { homedir } from 'node:os';
 
@@ -32,7 +49,9 @@ export function startDaemonControlServer({
   portRegistry,
   browserBridge,
   allowedRoot = homedir(),
-  getMachineEncryption = () => null
+  getMachineEncryption = () => null,
+  managedRuntime = false,
+  verifyManagedReport,
 }: {
   getChildren: () => TrackedSession[];
   stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
@@ -59,6 +78,14 @@ export function startDaemonControlServer({
    *  callers that don't wire this up (most tests, `preflightDaemonControlServer`)
    *  don't have to. */
   getMachineEncryption?: () => TerminalMachineEncryption | null;
+  /** True on a verified managed runtime — closes the loopback spawn path. */
+  managedRuntime?: boolean;
+  /**
+   * Checks a managed lifecycle report against the trusted launch registry.
+   * Absent means no launcher is wired, and managed reports are then refused.
+   */
+  verifyManagedReport?: (input: { path: string; headers: Record<string, unknown> }) =>
+    Promise<{ ok: true } | { ok: false; reason: string }>;
 }): Promise<{ port: number; stop: () => Promise<void>; controlSecret: string }> {
   return new Promise((resolve) => {
     const app = fastify({
@@ -74,6 +101,31 @@ export function startDaemonControlServer({
     // authenticate, so there is no bootstrap chicken-and-egg to work around.
     const controlSecret = encodeBase64Url(getRandomBytes(32));
     app.addHook('onRequest', async (request, reply) => {
+      // On a managed runtime this loopback server is reachable by the agent's
+      // own tools, so only the reports the daemon genuinely needs stay open.
+      // Everything else here — spawn, stop, shell (`/start-server`), the HTTP
+      // and browser proxies — would be an unsigned path to start or influence
+      // work, which is what the managed dispatch RPCs exist to prevent.
+      if (managedRuntime) {
+        const path = new URL(request.url, 'http://127.0.0.1').pathname;
+        if (!MANAGED_REPORT_PATHS.has(path)) {
+          await reply.code(403).send({
+            error: 'control endpoint is not available on a managed runtime',
+            code: 'MANAGED_CAPABILITY_REQUIRED',
+          });
+          return;
+        }
+        const verified = verifyManagedReport
+          ? await verifyManagedReport({ path, headers: request.headers as Record<string, unknown> })
+          : { ok: false as const, reason: 'no-launch-verifier' };
+        if (!verified.ok) {
+          await reply.code(403).send({
+            error: `managed report rejected (${verified.reason})`,
+            code: 'MANAGED_LAUNCH_SCOPE_REQUIRED',
+          });
+          return;
+        }
+      }
       if (request.headers.authorization !== `Bearer ${controlSecret}`) {
         await reply.code(401).send({ error: 'unauthorized' });
       }
@@ -82,7 +134,9 @@ export function startDaemonControlServer({
     // Same secret, same loopback trust boundary — but a WS upgrade never goes
     // through Fastify's route handlers/hooks above, so it needs its own check
     // at `verifyClient` (attachTerminalWsRoute).
-    const terminalWs = attachTerminalWsRoute(app.server, {
+    // The terminal WebSocket is a shell into the runtime and bypasses the RPC
+    // dispatch gate entirely, so a managed runtime does not attach it at all.
+    const terminalWs = managedRuntime ? null : attachTerminalWsRoute(app.server, {
       path: '/terminal',
       controlSecret,
       allowedRoot,
@@ -297,6 +351,16 @@ export function startDaemonControlServer({
       } = request.body;
 
       logger.debug(`[CONTROL SERVER] Spawn session request: dir=${directory}, sessionId=${sessionId || 'new'}, agent=${agent || 'default'}, hasUserCreds=${!!(happyToken && happySecret)}`);
+      // The loopback control server is reachable by any code running inside the
+      // runtime, including the agent's own tools. On a managed runtime that
+      // would be an unsigned path to start work, so it is closed here.
+      if (managedRuntime) {
+        reply.code(500);
+        return {
+          success: false,
+          error: 'spawn-session is not available on a managed runtime; use the managed dispatch RPCs',
+        };
+      }
       const result = await spawnSession({
         directory,
         sessionId,
@@ -726,7 +790,7 @@ export function startDaemonControlServer({
         controlSecret,
         stop: async () => {
           logger.debug('[CONTROL SERVER] Stopping server');
-          await terminalWs.close();
+          await terminalWs?.close();
           await app.close();
           logger.debug('[CONTROL SERVER] Server stopped');
         }
