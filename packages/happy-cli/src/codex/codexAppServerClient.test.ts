@@ -3026,6 +3026,22 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(events.filter((event) => event.type === 'exec_command_end')).toHaveLength(1);
         expect(events.filter((event) => event.type === 'agent_message' && event.message === 'the real final answer')).toHaveLength(1);
 
+        let mapperState = {
+            currentTurnId: null as string | null,
+            currentProviderTurnId: null as string | null,
+        };
+        const lifecycleTypes = events.flatMap((event) => {
+            const mapped = mapCodexMcpMessageToSessionEnvelopes(event, mapperState);
+            mapperState = mapped;
+            return mapped.envelopes.map((envelope) => envelope.ev.t);
+        }).filter((type) => type === 'turn-start' || type === 'turn-end');
+        expect(lifecycleTypes).toEqual([
+            'turn-start',
+            'turn-end',
+            'turn-start',
+            'turn-end',
+        ]);
+
         await client.disconnect();
     });
 
