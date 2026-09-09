@@ -72,12 +72,23 @@ export type ControlOperation =
      * variant of the read above.
      */
     | 'grant-resolve'
-    | 'grant-revoke';
+    | 'grant-revoke'
+    /**
+     * Issues a grant for **reading** a transcript, and withdraws one.
+     *
+     * Their own operations rather than variants of the run-scoped pair: a read
+     * grant names no run, is scoped to a viewer, and is withdrawn when a
+     * project's access list changes rather than when a run ends. An assertion
+     * signed for minting a runner's credential must not also mint a reader's.
+     */
+    | 'read-grant-mint'
+    | 'read-grant-revoke';
 
 export const CONTROL_OPERATIONS: readonly ControlOperation[] = [
     'authority-sync', 'authority-snapshot',
     'daemon-bootstrap', 'daemon-renew', 'daemon-resolve',
     'grant-mint', 'grant-renew', 'grant-resolve', 'grant-revoke',
+    'read-grant-mint', 'read-grant-revoke',
 ];
 
 export type ControlAssertionFailure =

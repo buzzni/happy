@@ -178,12 +178,23 @@ export type LiveGrant = {
     family: string;
     sessionId: string;
     accountId: string;
-    workspaceId: string;
-    runId: string;
-    attemptId: string;
-    epoch: number;
-    workspaceAuthorityVersion: number;
-    runAuthorityVersion: number;
+    /** Null on a read grant: there is no run to name. */
+    workspaceId: string | null;
+    runId: string | null;
+    attemptId: string | null;
+    epoch: number | null;
+    workspaceAuthorityVersion: number | null;
+    runAuthorityVersion: number | null;
+    /** Set when somebody other than the owner is reading. */
+    viewerAccountId?: string | null;
+    /**
+     * The session key envelope resealed for that viewer, when there is one.
+     *
+     * Carried on the grant so a handler can answer **this bearer** — the
+     * owner's envelope is bytes a viewer cannot open, and serving it would show
+     * an empty conversation instead of an honest "locked".
+     */
+    viewerDataEncryptionKey?: Uint8Array | null;
     renewalSeq: number;
     expiresAt: number;
     purpose: SessionScopedPurpose;
@@ -195,11 +206,18 @@ export type GrantResult<F> =
 
 type GrantRow = {
     grantId: string; family: string; sessionId: string; accountId: string;
-    workspaceId: string; runId: string; attemptId: string; epoch: number;
-    workspaceAuthorityVersion: number; runAuthorityVersion: number;
+    /**
+     * Null on a read grant — a transcript outlives its run — so every consumer
+     * has to say what it does without them rather than assume they are there.
+     */
+    workspaceId: string | null; runId: string | null; attemptId: string | null;
+    epoch: number | null;
+    workspaceAuthorityVersion: number | null; runAuthorityVersion: number | null;
     renewalSeq: number; expiresAt: bigint;
     /** Stored as text; classified on the way out, never trusted as typed. */
     purpose: string;
+    viewerAccountId?: string | null;
+    viewerDataEncryptionKey?: Uint8Array | null;
 };
 
 type AuthorityRow = {
@@ -233,6 +251,10 @@ function toLiveGrant(row: GrantRow): LiveGrant {
         // never folded into `runner`, which would be reading "unknown" as
         // "execution".
         purpose: readStoredPurpose(row.purpose),
+        ...(row.viewerAccountId ? { viewerAccountId: row.viewerAccountId } : {}),
+        ...(row.viewerDataEncryptionKey
+            ? { viewerDataEncryptionKey: row.viewerDataEncryptionKey }
+            : {}),
     };
 }
 
@@ -740,6 +762,40 @@ export async function resolveLiveGrant(input: {
         }
         if (claims.expiresAt > Number(grant.expiresAt)) return { ok: false, reason: 'claims-mismatch' };
 
+        /*
+         * A read token has no run to compare against, and there is nothing to
+         * invent: the row it names has no run either. What is compared instead
+         * is what a read grant is made of — the session, its owner and the
+         * viewer — and that comparison lives below.
+         */
+        if (claims.purpose === 'transcript-read') {
+            if (grant.runId !== null || grant.attemptId !== null) {
+                // A read token naming a runner row, or the reverse. The row is
+                // the authority, and this is not it.
+                return { ok: false, reason: 'claims-mismatch' };
+            }
+            if (grant.sessionId !== claims.sessionId || grant.accountId !== claims.accountId) {
+                return { ok: false, reason: 'claims-mismatch' };
+            }
+            if ((grant.viewerAccountId ?? null) !== (claims.viewerAccountId ?? null)) {
+                // One viewer's grant must never authorise another's token: the
+                // resealed key envelope on that row is for one account.
+                return { ok: false, reason: 'claims-mismatch' };
+            }
+            if (readStoredPurpose(grant.purpose) !== 'transcript-read') {
+                return { ok: false, reason: 'claims-mismatch' };
+            }
+            return { ok: true, grant: toLiveGrant(grant as never) };
+        }
+        if (claims.workspaceId === undefined || claims.runtimeId === undefined
+            || claims.runId === undefined || claims.attemptId === undefined
+            || claims.epoch === undefined || claims.workspaceAuthorityVersion === undefined
+            || claims.runAuthorityVersion === undefined) {
+            // Refused rather than defaulted: a runner token that cannot name its
+            // run is not a runner token.
+            return { ok: false, reason: 'claims-mismatch' };
+        }
+
         const scope: ManagedScope = {
             tenantId: claims.tenantId,
             projectId: claims.projectId,
@@ -910,4 +966,327 @@ export async function resolveSessionGrant(
             },
         };
     });
+}
+
+/**
+ * What a read grant is scoped to.
+ *
+ * Deliberately **not** a `ManagedScope`: a transcript outlives its run, so
+ * there is no run, attempt, runtime or epoch to name. Requiring them is what
+ * made a dormant project unreadable — the run had finished, the runtime was
+ * gone, and the authority row a runner grant compares against did not exist.
+ *
+ * What it is checked against instead is ownership: the session exists, and the
+ * account the caller says owns it really does. The caller is the control plane,
+ * which has already proved it may act for this tenant and project; who may read
+ * a project is the parent's decision, and it is not re-derived here.
+ */
+export type ManagedReadScope = {
+    tenantId: string;
+    projectId: string;
+    sessionId: string;
+    /** The authority. Compared against the session, never adopted from it. */
+    sessionOwnerAccountId: string;
+    /** Who is reading. The same account as the owner is normal, not special. */
+    viewerAccountId: string;
+};
+
+/**
+ * A read grant's family: one live grant per session **per viewer**.
+ *
+ * The viewer is part of it because two members of a company project reading the
+ * same session are two grants — one revoked must not close the other, and one
+ * viewer's resealed key envelope must never be handed to another.
+ */
+export function deriveReadGrantFamily(
+    scope: ManagedReadScope,
+    purpose: SessionScopedPurpose,
+): string {
+    return canonicalDigest({
+        tenantId: scope.tenantId,
+        projectId: scope.projectId,
+        sessionId: scope.sessionId,
+        sessionOwnerAccountId: scope.sessionOwnerAccountId,
+        viewerAccountId: scope.viewerAccountId,
+        purpose,
+    });
+}
+
+export type ReadGrantFailure =
+    | 'session-unknown'
+    /** The caller named an owner the session does not have. Never guessed at. */
+    | 'session-owner-mismatch'
+    | 'already-expired'
+    | 'family-revoked'
+    | 'family-exists'
+    | 'request-conflict'
+    | 'viewer-envelope-malformed'
+    /** A viewer who is not the owner cannot read without one of their own. */
+    | 'viewer-envelope-required';
+
+/** The DEK envelope shape this server accepts, and the only thing it checks. */
+const DEK_ENVELOPE_BYTES = 105;
+
+/**
+ * The longest a read grant may live.
+ *
+ * A ceiling, and explicitly **not** a substitute for revocation: when a project
+ * withdraws someone's access, the parent calls `revokeReadGrant` and the bearer
+ * stops working immediately. This bounds the other case — a withdrawal that
+ * never reaches this server, because the caller crashed, or a deployment that
+ * has not wired the call yet. Without it "until it expires" could mean a day.
+ *
+ * Fifteen minutes is short enough that a missed revocation is measured in
+ * minutes, and long enough that a browser reading a transcript does not spend
+ * its time renewing.
+ */
+export const MANAGED_READ_GRANT_MAX_TTL_MS = 15 * 60_000;
+
+/**
+ * Issues a grant for reading a transcript.
+ *
+ * Three things it does not do, each for a reason:
+ *
+ *  - It does not require a run. See `ManagedReadScope`.
+ *  - It does not reseal the session key. This server holds the wrapped envelope
+ *    and nothing that opens it — no plaintext key, no account private key — so
+ *    a viewer envelope can only come from whoever does hold the plaintext. What
+ *    arrives is stored; what does not arrive is absent, and a viewer who cannot
+ *    decrypt is told that rather than handed the owner's envelope.
+ *  - It does not decide who may read. That is the parent's ACL, proved by the
+ *    control-plane assertion the route already verified.
+ */
+export async function issueReadGrant(input: {
+    scope: ManagedReadScope;
+    grantId: string;
+    requestId: string;
+    expiresAt: number;
+    now: number;
+    purpose?: SessionScopedPurpose;
+    /** The session key envelope resealed for the viewer, base64, if there is one. */
+    viewerDataEncryptionKey?: string;
+}): Promise<GrantResult<ReadGrantFailure>> {
+    const purpose = input.purpose ?? 'transcript-read';
+    const family = deriveReadGrantFamily(input.scope, purpose);
+    const digest = canonicalDigest({
+        scope: input.scope,
+        grantId: input.grantId,
+        expiresAt: input.expiresAt,
+        purpose,
+        /*
+         * The envelope is **part of the body**.
+         *
+         * Left out, a retry under the same request id with a *different*
+         * envelope was answered with the first attempt's success — so the
+         * viewer would be told they had a grant while the row still held the
+         * envelope they no longer had a key for, and the transcript would come
+         * back undecryptable with nothing reporting why.
+         *
+         * Included, an identical retry converges as it should and a changed one
+         * is a different request, which is what it is.
+         */
+        viewerDataEncryptionKey: input.viewerDataEncryptionKey ?? null,
+    });
+
+    /*
+     * A viewer who is not the owner **must** arrive with a resealed envelope.
+     *
+     * The stored envelope is sealed for the owner's account; without one of
+     * their own, that viewer could hold a perfectly valid grant and never
+     * decrypt a single message. Issuing it anyway would move the failure to the
+     * screen, where it looks like an empty conversation. Refused at issue
+     * instead, while the caller still knows why.
+     */
+    if (input.scope.viewerAccountId !== input.scope.sessionOwnerAccountId
+        && input.viewerDataEncryptionKey === undefined) {
+        return { ok: false, reason: 'viewer-envelope-required' };
+    }
+
+    let viewerEnvelope: Uint8Array<ArrayBuffer> | null = null;
+    if (input.viewerDataEncryptionKey !== undefined) {
+        const decoded = Buffer.from(input.viewerDataEncryptionKey, 'base64');
+        // Shape only — this server cannot judge whether the box really holds
+        // that session's key, and does not claim to. Re-encoding catches the
+        // values `Buffer.from` accepts silently.
+        if (decoded.length !== DEK_ENVELOPE_BYTES || decoded[0] !== 0
+            || decoded.toString('base64') !== input.viewerDataEncryptionKey) {
+            return { ok: false, reason: 'viewer-envelope-malformed' };
+        }
+        // Copied into a plain view: Prisma's `Bytes` is a `Uint8Array` over a
+        // real `ArrayBuffer`, and a Node `Buffer` may sit on a shared one.
+        const copy = new Uint8Array(new ArrayBuffer(decoded.length));
+        copy.set(decoded);
+        viewerEnvelope = copy;
+    }
+
+    return retryOnUniqueRace(() => inTx(async (tx) => {
+        const session = await tx.session.findUnique({
+            where: { id: input.scope.sessionId },
+            select: { accountId: true },
+        });
+        if (!session) return { ok: false, reason: 'session-unknown' as const };
+        // The authority, compared rather than believed. A caller that could
+        // name the owner would be choosing whose session it is reading.
+        if (session.accountId !== input.scope.sessionOwnerAccountId) {
+            return { ok: false, reason: 'session-owner-mismatch' as const };
+        }
+        if (input.expiresAt <= input.now) return { ok: false, reason: 'already-expired' as const };
+        // Capped rather than refused: a caller asking for longer gets a shorter
+        // grant, which is the answer that keeps working. Refusing would make a
+        // generous parent unable to issue anything at all.
+        const expiresAt = Math.min(input.expiresAt, input.now + MANAGED_READ_GRANT_MAX_TTL_MS);
+
+        const existingFamily = await tx.managedSessionGrant.findUnique({ where: { family } });
+        if (existingFamily && (existingFamily.revokedAt !== null || existingFamily.tombstone)) {
+            return { ok: false, reason: 'family-revoked' as const };
+        }
+        const existingRequest = await tx.managedSessionGrant.findUnique({
+            where: { requestId: input.requestId },
+        });
+        if (existingRequest) {
+            if (existingRequest.bodyDigest !== digest || existingRequest.family !== family) {
+                return { ok: false, reason: 'request-conflict' as const };
+            }
+            if (Number(existingRequest.expiresAt) <= input.now) {
+                return { ok: false, reason: 'already-expired' as const };
+            }
+            return {
+                ok: true as const,
+                grant: {
+                    ...toLiveGrant(existingRequest as never),
+                    expiresAt: Math.min(Number(existingRequest.expiresAt), input.expiresAt),
+                },
+                idempotent: true,
+            };
+        }
+        if (existingFamily && Number(existingFamily.expiresAt) > input.now) {
+            return { ok: false, reason: 'family-exists' as const };
+        }
+
+        const data = {
+            grantId: input.grantId,
+            family,
+            sessionId: input.scope.sessionId,
+            accountId: input.scope.sessionOwnerAccountId,
+            viewerAccountId: input.scope.viewerAccountId,
+            // `null` rather than an absent key: the column is nullable, and an
+            // optional property widens the type Prisma accepts here.
+            viewerDataEncryptionKey: viewerEnvelope,
+            purpose,
+            renewalSeq: 0,
+            expiresAt: BigInt(expiresAt),
+            requestId: input.requestId,
+            bodyDigest: digest,
+            createdAt: BigInt(input.now),
+            updatedAt: BigInt(input.now),
+        };
+        const row = existingFamily
+            // The previous grant for this viewer lapsed. Replaced in place, so
+            // one viewer never accumulates live grants for one session.
+            ? await tx.managedSessionGrant.update({ where: { family }, data })
+            : await tx.managedSessionGrant.create({ data });
+        return { ok: true as const, grant: toLiveGrant(row as never), idempotent: false };
+    }));
+}
+
+export type ReadRevokeFailure = 'binding-mismatch';
+
+export type ReadRevokeResult =
+    | { ok: true; state: 'revoked' | 'tombstoned'; alreadyRevoked: boolean }
+    | { ok: false; reason: ReadRevokeFailure };
+
+/**
+ * Withdraws a viewer's read grant, and closes the door behind it.
+ *
+ * A separate function because a read grant is found by a different family: the
+ * runner path derives one from a run, and a read row has none. Left to that
+ * path, a read grant simply could not be revoked — the lookup would never find
+ * it, and a viewer whose access had been withdrawn upstream would keep reading
+ * with a bearer nobody could take back.
+ *
+ * A tombstone is written when there is nothing to revoke yet, for the same
+ * reason it is on the runner path: a withdrawal that arrives before the grant
+ * must still prevent it. Reading is not exempt — a race between "the parent
+ * removed this member" and "the browser asked for a token" is exactly when it
+ * matters.
+ */
+export async function revokeReadGrant(input: {
+    scope: ManagedReadScope;
+    reason: string;
+    now: number;
+    purpose?: SessionScopedPurpose;
+}): Promise<ReadRevokeResult> {
+    const purpose = input.purpose ?? 'transcript-read';
+    const family = deriveReadGrantFamily(input.scope, purpose);
+
+    return retryOnUniqueRace(() => inTx(async (tx) => {
+        /*
+         * The scope is verified even though no bearer identity is.
+         *
+         * A revoke is authorised by the control assertion, not by whoever holds
+         * a token — the viewer whose access is ending may have none. What stops
+         * a made-up scope is this: the session has to exist, and it has to
+         * belong to the account named as its owner. Without that check the
+         * relaxed bearer rule would let a caller write tombstones against
+         * sessions it merely guessed at.
+         */
+        const session = await tx.session.findUnique({
+            where: { id: input.scope.sessionId },
+            select: { accountId: true },
+        });
+        if (!session || session.accountId !== input.scope.sessionOwnerAccountId) {
+            return { ok: false as const, reason: 'binding-mismatch' as const };
+        }
+
+        const grant = await tx.managedSessionGrant.findUnique({ where: { family } });
+        if (grant) {
+            // The family already ties the row to this scope; this catches a row
+            // that somehow carries a different binding rather than withdrawing
+            // something other than what the caller named.
+            if (!grant.tombstone && (grant.sessionId !== input.scope.sessionId
+                || grant.accountId !== input.scope.sessionOwnerAccountId
+                || (grant.viewerAccountId ?? null) !== input.scope.viewerAccountId)) {
+                return { ok: false as const, reason: 'binding-mismatch' as const };
+            }
+            if (grant.revokedAt !== null) {
+                // Terminal: the first reason stands, so an audit reads what
+                // actually ended the access.
+                return {
+                    ok: true as const,
+                    state: (grant.tombstone ? 'tombstoned' : 'revoked') as 'tombstoned' | 'revoked',
+                    alreadyRevoked: true,
+                };
+            }
+            await tx.managedSessionGrant.update({
+                where: { family },
+                data: {
+                    revokedAt: BigInt(input.now),
+                    revokedReason: input.reason,
+                    updatedAt: BigInt(input.now),
+                },
+            });
+            return { ok: true as const, state: 'revoked' as const, alreadyRevoked: false };
+        }
+
+        await tx.managedSessionGrant.create({
+            data: {
+                grantId: `tombstone:${family}`,
+                family,
+                sessionId: input.scope.sessionId,
+                accountId: input.scope.sessionOwnerAccountId,
+                viewerAccountId: input.scope.viewerAccountId,
+                purpose,
+                renewalSeq: 0,
+                expiresAt: BigInt(input.now),
+                revokedAt: BigInt(input.now),
+                revokedReason: input.reason,
+                tombstone: true,
+                requestId: `tombstone:${family}`,
+                bodyDigest: '',
+                createdAt: BigInt(input.now),
+                updatedAt: BigInt(input.now),
+            },
+        });
+        return { ok: true as const, state: 'tombstoned' as const, alreadyRevoked: false };
+    }), () => ({ ok: false as const, reason: 'binding-mismatch' as const }));
 }

@@ -143,6 +143,13 @@ export function startManagedSocket(
             return next(new Error('Authorization unavailable'));
         }
         if (!grant.ok) return next(new Error('Forbidden'));
+        /*
+         * This server is the managed **child's** connection: the run's own
+         * socket. A bearer that carries no run cannot be one — reading a
+         * transcript happens over HTTP, and admitting a read bearer here would
+         * register it in a registry whose entries are keyed by run.
+         */
+        if (verified.claims.purpose !== 'runner') return next(new Error('Forbidden'));
 
         socket.data.claims = verified.claims;
         socket.data.grantId = grant.grant.grantId;
@@ -179,8 +186,10 @@ export function startManagedSocket(
             accountId: claims.accountId,
             sessionId: claims.sessionId,
             grantId: socket.data.grantId as string,
-            runId: claims.runId,
-            attemptId: claims.attemptId,
+            // Run-scoped by admission: the gate above refuses anything that is
+            // not a runner, so these are always present here.
+            runId: claims.runId!,
+            attemptId: claims.attemptId!,
             channel,
             rpcNames: new Set<string>(),
             connectedAt: Date.now(),

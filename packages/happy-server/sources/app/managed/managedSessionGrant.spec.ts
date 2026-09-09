@@ -1372,4 +1372,256 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
             })).rejects.toThrow(/unknown purpose/);
         });
     });
+
+    describe('reading a transcript that no run is behind', () => {
+        const OTHER_VIEWER = 'viewer-account-1';
+        const ENVELOPE = Buffer.concat([
+            Buffer.from([0]), Buffer.alloc(104, 7),
+        ]).toString('base64');
+
+        function readScope(over: Partial<GrantModule.ManagedReadScope> = {}): GrantModule.ManagedReadScope {
+            const s = scope();
+            return {
+                tenantId: s.tenantId,
+                projectId: s.projectId,
+                sessionId: s.sessionId,
+                sessionOwnerAccountId: s.accountId,
+                viewerAccountId: s.accountId,
+                ...over,
+            };
+        }
+
+        function readInput(over: Record<string, unknown> = {}) {
+            return {
+                scope: readScope(),
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: NOW + HOUR,
+                now: NOW,
+                ...over,
+            } as Parameters<typeof grants.issueReadGrant>[0];
+        }
+
+        it('shouldIssueWithoutAnyRunAxis', async () => {
+            /*
+             * The whole point: a dormant project, a stopped runtime and a
+             * replaced session all still have transcripts somebody may read.
+             * Requiring a run made those unreadable, and the run authority row
+             * they would have been compared against does not exist.
+             */
+            const issued = await grants.issueReadGrant(readInput());
+            expect(issued.ok).toBe(true);
+            if (!issued.ok) return;
+            expect(issued.grant.purpose).toBe('transcript-read');
+            expect(issued.grant.runId).toBeNull();
+            expect(issued.grant.attemptId).toBeNull();
+            expect(issued.grant.epoch).toBeNull();
+        });
+
+        it('shouldIssueToAViewerWhoIsNotTheOwner', async () => {
+            // A company project read by a member whose Happy account is not the
+            // session owner's — the case the owner-equality check made
+            // impossible.
+            const issued = await grants.issueReadGrant(readInput({
+                scope: readScope({ viewerAccountId: OTHER_VIEWER }),
+                viewerDataEncryptionKey: ENVELOPE,
+            }));
+            expect(issued.ok).toBe(true);
+            if (!issued.ok) return;
+            expect(issued.grant.viewerAccountId).toBe(OTHER_VIEWER);
+            const row = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: issued.grant.grantId },
+            });
+            expect(Buffer.from(row.viewerDataEncryptionKey!).toString('base64')).toBe(ENVELOPE);
+        });
+
+        it('shouldRefuseAnOwnerTheSessionDoesNotHave', async () => {
+            // Never guessed at: a caller that could name the owner would be
+            // choosing whose session it is reading.
+            // Owner named wrongly **and** a proper envelope supplied, so the
+            // refusal can only be about the ownership claim.
+            expect(await grants.issueReadGrant(readInput({
+                scope: readScope({ sessionOwnerAccountId: 'someone-else' }),
+                viewerDataEncryptionKey: ENVELOPE,
+            }))).toEqual({ ok: false, reason: 'session-owner-mismatch' });
+        });
+
+        it('shouldRefuseANonOwnerViewerWithNoEnvelopeOfItsOwn', async () => {
+            /*
+             * The grant would be valid and useless: the stored envelope is
+             * sealed for the owner, so this viewer could never decrypt a
+             * message. Refused while the caller can still see why, rather than
+             * arriving on screen as an empty conversation.
+             */
+            expect(await grants.issueReadGrant(readInput({
+                scope: readScope({ viewerAccountId: OTHER_VIEWER }),
+            }))).toEqual({ ok: false, reason: 'viewer-envelope-required' });
+        });
+
+        it('shouldNotRequireAnEnvelopeWhenTheViewerIsTheOwner', async () => {
+            // The session's own envelope is already sealed for them.
+            const issued = await grants.issueReadGrant(readInput());
+            expect(issued.ok).toBe(true);
+        });
+
+        it('shouldConvergeAnIdenticalRetryAndRefuseAChangedEnvelope', async () => {
+            /*
+             * The envelope is part of what a request *is*. Omitted from the
+             * digest, a retry under the same id with a different envelope was
+             * answered with the first attempt's success: the caller was told it
+             * had a grant while the row still carried the envelope it no longer
+             * had a key for, and the transcript came back undecryptable with
+             * nothing to say why.
+             */
+            const requestId = `req-${randomUUID()}`;
+            const grantId = `grant-${randomUUID()}`;
+            const other = Buffer.concat([Buffer.from([0]), Buffer.alloc(104, 8)]).toString('base64');
+            const first = await grants.issueReadGrant(readInput({
+                scope: readScope({ viewerAccountId: OTHER_VIEWER }),
+                requestId, grantId, viewerDataEncryptionKey: ENVELOPE,
+            }));
+            expect(first.ok).toBe(true);
+
+            // Byte-identical retry: the same request, answered the same way.
+            const same = await grants.issueReadGrant(readInput({
+                scope: readScope({ viewerAccountId: OTHER_VIEWER }),
+                requestId, grantId, viewerDataEncryptionKey: ENVELOPE,
+            }));
+            expect(same).toMatchObject({ ok: true, idempotent: true });
+
+            // Different envelope, same id: a different request.
+            expect(await grants.issueReadGrant(readInput({
+                scope: readScope({ viewerAccountId: OTHER_VIEWER }),
+                requestId, grantId, viewerDataEncryptionKey: other,
+            }))).toEqual({ ok: false, reason: 'request-conflict' });
+
+            // And the stored envelope is still the one that was accepted.
+            const row = await db.managedSessionGrant.findUniqueOrThrow({ where: { grantId } });
+            expect(Buffer.from(row.viewerDataEncryptionKey!).toString('base64')).toBe(ENVELOPE);
+        });
+
+        it('shouldRefuseAnEnvelopeThatIsNotOne', async () => {
+            // Shape only — this server cannot judge whether the box holds that
+            // session's key, and does not claim to.
+            for (const bad of ['not-base64!!', Buffer.alloc(104, 1).toString('base64'),
+                Buffer.concat([Buffer.from([1]), Buffer.alloc(104, 1)]).toString('base64')]) {
+                expect(await grants.issueReadGrant(readInput({ viewerDataEncryptionKey: bad })))
+                    .toEqual({ ok: false, reason: 'viewer-envelope-malformed' });
+            }
+        });
+
+        it('shouldKeepTwoViewersOfOneSessionApart', async () => {
+            // One revoked must not close the other, and one viewer's resealed
+            // envelope must never be handed to another.
+            const first = await grants.issueReadGrant(readInput());
+            const second = await grants.issueReadGrant(readInput({
+                scope: readScope({ viewerAccountId: OTHER_VIEWER }),
+                viewerDataEncryptionKey: ENVELOPE,
+            }));
+            expect(first.ok && second.ok).toBe(true);
+            if (!first.ok || !second.ok) return;
+            expect(first.grant.family).not.toBe(second.grant.family);
+        });
+
+        it('shouldNotCollideWithTheRunnerGrantForTheSameSession', async () => {
+            const runner = await grants.issueSessionGrant(issueInput());
+            const read = await grants.issueReadGrant(readInput());
+            expect(runner.ok && read.ok).toBe(true);
+            if (!runner.ok || !read.ok) return;
+            expect(read.grant.family).not.toBe(runner.grant.family);
+        });
+
+        it('shouldRevokeAReadGrantTheRunnerPathCannotEvenFind', async () => {
+            /*
+             * The gap this closes: `revokeSessionGrant` derives its family from
+             * a run, and a read row has none — so a viewer whose access was
+             * withdrawn upstream kept a bearer nobody could take back.
+             */
+            const issued = await grants.issueReadGrant(readInput());
+            expect(issued.ok).toBe(true);
+            if (!issued.ok) return;
+
+            const revoked = await grants.revokeReadGrant({
+                scope: readScope(), reason: 'acl-withdrawn', now: NOW,
+            });
+            expect(revoked).toEqual({ ok: true, state: 'revoked', alreadyRevoked: false });
+            const row = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: issued.grant.grantId },
+            });
+            expect(row.revokedAt).not.toBeNull();
+            expect(row.revokedReason).toBe('acl-withdrawn');
+        });
+
+        it('shouldKeepOneViewersRevokeOffAnother', async () => {
+            // Two members reading the same session. Withdrawing one must not
+            // end the other's access.
+            const mine = await grants.issueReadGrant(readInput());
+            const theirs = await grants.issueReadGrant(readInput({
+                scope: readScope({ viewerAccountId: OTHER_VIEWER }),
+                viewerDataEncryptionKey: ENVELOPE,
+            }));
+            expect(mine.ok && theirs.ok).toBe(true);
+            if (!mine.ok || !theirs.ok) return;
+            await grants.revokeReadGrant({
+                scope: readScope({ viewerAccountId: OTHER_VIEWER }), reason: 'left-company', now: NOW,
+            });
+            const mineRow = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: mine.grant.grantId },
+            });
+            expect(mineRow.revokedAt).toBeNull();
+        });
+
+        it('shouldTombstoneAWithdrawalThatArrivesFirst', async () => {
+            // The race that matters: the parent removed the member while the
+            // browser was asking for a token. The grant must not then be
+            // issued.
+            const revoked = await grants.revokeReadGrant({
+                scope: readScope(), reason: 'acl-withdrawn', now: NOW,
+            });
+            expect(revoked).toEqual({ ok: true, state: 'tombstoned', alreadyRevoked: false });
+            expect(await grants.issueReadGrant(readInput()))
+                .toEqual({ ok: false, reason: 'family-revoked' });
+        });
+
+        it('shouldKeepTheFirstReasonWhenRevokedTwice', async () => {
+            await grants.issueReadGrant(readInput());
+            await grants.revokeReadGrant({ scope: readScope(), reason: 'first', now: NOW });
+            expect(await grants.revokeReadGrant({
+                scope: readScope(), reason: 'second', now: NOW + 1_000,
+            })).toEqual({ ok: true, state: 'revoked', alreadyRevoked: true });
+            const row = await db.managedSessionGrant.findFirstOrThrow({
+                where: { purpose: 'transcript-read', viewerAccountId: scope().accountId },
+                orderBy: { createdAt: 'desc' },
+            });
+            expect(row.revokedReason).toBe('first');
+        });
+
+        it('shouldCapHowLongAReadGrantCanLive', async () => {
+            /*
+             * A ceiling on the case where a withdrawal never arrives — the
+             * caller crashed, or a deployment has not wired the revoke yet.
+             * Not a substitute for revocation, which is immediate; this bounds
+             * how long a miss can last.
+             */
+            const issued = await grants.issueReadGrant(readInput({ expiresAt: NOW + 24 * HOUR }));
+            expect(issued.ok).toBe(true);
+            if (!issued.ok) return;
+            expect(issued.grant.expiresAt)
+                .toBe(NOW + grants.MANAGED_READ_GRANT_MAX_TTL_MS);
+        });
+
+        it('shouldLeaveAShorterRequestAlone', async () => {
+            // The cap is a maximum, not a target: a caller asking for two
+            // minutes gets two minutes.
+            const issued = await grants.issueReadGrant(readInput({ expiresAt: NOW + 120_000 }));
+            expect(issued.ok).toBe(true);
+            if (issued.ok) expect(issued.grant.expiresAt).toBe(NOW + 120_000);
+        });
+
+        it('shouldRefuseASessionThatDoesNotExist', async () => {
+            expect(await grants.issueReadGrant(readInput({
+                scope: readScope({ sessionId: 'no-such-session' }),
+            }))).toEqual({ ok: false, reason: 'session-unknown' });
+        });
+    });
 });

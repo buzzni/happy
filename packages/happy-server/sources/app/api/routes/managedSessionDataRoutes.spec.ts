@@ -339,20 +339,42 @@ describe.skipIf(!enabled)('managed session data routes (real Fastify + PostgreSQ
          * write-refusal test pass while the purpose gate was never consulted.
          */
         async function readBearer(): Promise<string> {
-            const issued = await modules.grants.issueSessionGrant({
-                scope: scope() as never,
+            // The read path, not the runner path with a different label: a read
+            // grant has no run, and a row that has one is a runner row wearing
+            // the wrong name.
+            const issued = await modules.grants.issueReadGrant({
+                scope: {
+                    tenantId: 'tenant-1',
+                    projectId: 'project-1',
+                    sessionId,
+                    sessionOwnerAccountId: accountId,
+                    viewerAccountId: accountId,
+                },
                 grantId: `grant-${randomUUID()}`,
                 requestId: `req-${randomUUID()}`,
                 expiresAt: Date.now() + HOUR,
                 now: Date.now(),
-                purpose: 'transcript-read',
             });
             if (!issued.ok) throw new Error(`fixture read grant failed: ${issued.reason}`);
-            return mintScopedToken({
+            /*
+             * Minted in the shape a read bearer actually has: the session and
+             * its project, the viewer, and **no run** — the row it names has
+             * none either, and a token that claimed one would be describing a
+             * generation that is not what authorises it.
+             */
+            const base = claimsFor({
                 purpose: 'transcript-read',
                 grantId: issued.grant.grantId,
                 expiresAt: issued.grant.expiresAt,
             });
+            const { workspaceId, runtimeId, runId, attemptId, epoch,
+                workspaceAuthorityVersion, runAuthorityVersion, ...read } = base;
+            const minted = await issuer.mint(
+                { ...read, viewerAccountId: issued.grant.viewerAccountId ?? accountId } as never,
+                Date.now(),
+            );
+            if (!minted.ok) throw new Error(`fixture mint failed: ${minted.reason}`);
+            return minted.token;
         }
 
         it('refuses a read bearer posting into the session, and writes nothing', async () => {
@@ -375,6 +397,151 @@ describe.skipIf(!enabled)('managed session data routes (real Fastify + PostgreSQ
                 method: 'GET', url: `/v3/sessions/${sessionId}/messages`, token: readToken,
             });
             expect(read.statusCode).toBe(200);
+        });
+
+        it('refuses a read token whose grant belongs to another viewer', async () => {
+            /*
+             * One viewer's grant must never authorise another's token: the
+             * resealed key envelope on that row is for one account, and lending
+             * the row would lend the envelope with it.
+             */
+            const readToken = await readBearer();
+            const issued = await modules.grants.issueReadGrant({
+                scope: {
+                    tenantId: 'tenant-1', projectId: 'project-1', sessionId,
+                    sessionOwnerAccountId: accountId, viewerAccountId: 'another-viewer',
+                },
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: Date.now() + HOUR,
+                now: Date.now(),
+                // A viewer who is not the owner cannot be issued without one.
+                viewerDataEncryptionKey: Buffer.concat([
+                    Buffer.from([0]), Buffer.alloc(104, 4),
+                ]).toString('base64'),
+            });
+            expect(issued.ok).toBe(true);
+            if (!issued.ok) return;
+            // The other viewer's grant id, carried by this viewer's token.
+            const base = claimsFor({
+                purpose: 'transcript-read',
+                grantId: issued.grant.grantId,
+                expiresAt: issued.grant.expiresAt,
+            });
+            const { workspaceId, runtimeId, runId, attemptId, epoch,
+                workspaceAuthorityVersion, runAuthorityVersion, ...read } = base;
+            const minted = await issuer.mint(
+                { ...read, viewerAccountId: accountId } as never, Date.now(),
+            );
+            expect(minted.ok).toBe(true);
+            if (!minted.ok) return;
+            expect((await request({
+                method: 'GET', url: `/v3/sessions/${sessionId}/messages`, token: minted.token,
+            })).statusCode).toBe(403);
+            expect(readToken).not.toBe(minted.token);
+        });
+
+        it('refuses a read token that names a runner grant', async () => {
+            /*
+             * The row is what authorises, and a runner row authorises a run.
+             * A read token pointed at one would inherit that authority while
+             * being checked by none of the rules a runner token is checked by.
+             */
+            const base = claimsFor({ purpose: 'transcript-read' });
+            const { workspaceId, runtimeId, runId, attemptId, epoch,
+                workspaceAuthorityVersion, runAuthorityVersion, ...read } = base;
+            const minted = await issuer.mint(
+                { ...read, viewerAccountId: accountId } as never, Date.now(),
+            );
+            expect(minted.ok).toBe(true);
+            if (!minted.ok) return;
+            expect((await request({
+                method: 'GET', url: `/v3/sessions/${sessionId}/messages`, token: minted.token,
+            })).statusCode).toBe(403);
+        });
+
+        it('refuses a read token that names a runner grant and no viewer', async () => {
+            /*
+             * The variant the viewer comparison cannot catch: no viewer on
+             * either side, so what is left is the row's own shape. A runner row
+             * has a run and says `runner`, and a read token must be refused by
+             * that alone.
+             */
+            const base = claimsFor({ purpose: 'transcript-read' });
+            const { workspaceId, runtimeId, runId, attemptId, epoch,
+                workspaceAuthorityVersion, runAuthorityVersion, ...read } = base;
+            const minted = await issuer.mint({ ...read } as never, Date.now());
+            expect(minted.ok).toBe(true);
+            if (!minted.ok) return;
+            expect((await request({
+                method: 'GET', url: `/v3/sessions/${sessionId}/messages`, token: minted.token,
+            })).statusCode).toBe(403);
+        });
+
+        it('hands a viewer its own key envelope, not the owner\'s', async () => {
+            /*
+             * The owner's envelope is sealed for the owner's account. Serving it
+             * to a member of a company project gives them bytes they cannot
+             * open, and the screen shows an empty conversation rather than a
+             * permissions problem. The viewer's own resealed envelope is what
+             * makes the transcript readable at all.
+             */
+            const envelope = Buffer.concat([Buffer.from([0]), Buffer.alloc(104, 9)]);
+            const viewerAccountId = 'company-member-1';
+            const issued = await modules.grants.issueReadGrant({
+                scope: {
+                    tenantId: 'tenant-1', projectId: 'project-1', sessionId,
+                    sessionOwnerAccountId: accountId, viewerAccountId,
+                },
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: Date.now() + HOUR,
+                now: Date.now(),
+                viewerDataEncryptionKey: envelope.toString('base64'),
+            });
+            expect(issued.ok).toBe(true);
+            if (!issued.ok) return;
+            const base = claimsFor({
+                purpose: 'transcript-read',
+                grantId: issued.grant.grantId,
+                expiresAt: issued.grant.expiresAt,
+            });
+            const { workspaceId, runtimeId, runId, attemptId, epoch,
+                workspaceAuthorityVersion, runAuthorityVersion, ...read } = base;
+            const minted = await issuer.mint(
+                { ...read, viewerAccountId } as never, Date.now(),
+            );
+            expect(minted.ok).toBe(true);
+            if (!minted.ok) return;
+
+            const response = await request({
+                method: 'POST', url: '/v2/sessions/lookup',
+                token: minted.token, body: { ids: [sessionId] },
+            });
+            expect(response.statusCode).toBe(200);
+            expect(response.json().sessions[0].dataEncryptionKey)
+                .toBe(envelope.toString('base64'));
+        });
+
+        it('leaves an owner reading their own transcript with the session\'s envelope', async () => {
+            /*
+             * The reader **is** the owner here, and the stored envelope is
+             * already sealed for them. Handing back `null` because a read grant
+             * carries no resealed copy would lock an owner out of their own
+             * transcript — the resealing exists for somebody else.
+             */
+            const owned = Buffer.concat([Buffer.from([0]), Buffer.alloc(104, 3)]);
+            await db.session.update({
+                where: { id: sessionId },
+                data: { dataEncryptionKey: owned },
+            });
+            const readToken = await readBearer();
+            const response = await request({
+                method: 'POST', url: '/v2/sessions/lookup',
+                token: readToken, body: { ids: [sessionId] },
+            });
+            expect(response.statusCode).toBe(200);
+            expect(response.json().sessions[0].dataEncryptionKey).toBe(owned.toString('base64'));
         });
 
         it('still lets a runner post', async () => {

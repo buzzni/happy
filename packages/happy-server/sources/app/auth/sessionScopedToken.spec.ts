@@ -235,6 +235,39 @@ describe('claims are validated, not trusted', () => {
                 expect(parseSessionScopedClaims({ ...scope(), purpose })?.purpose).toBe(purpose);
             });
 
+        it('reads a transcript token that names no run', () => {
+            /*
+             * The shape a read bearer actually has: a session, a project, a
+             * purpose — and no run, because the run it would name has finished.
+             * Requiring one is what made a dormant project unreadable.
+             */
+            const { workspaceId, runtimeId, runId, attemptId, epoch,
+                workspaceAuthorityVersion, runAuthorityVersion, ...rest } = scope() as Record<string, unknown>;
+            const claims = parseSessionScopedClaims({
+                ...rest, purpose: 'transcript-read', viewerAccountId: 'viewer-1',
+            });
+            expect(claims?.purpose).toBe('transcript-read');
+            expect(claims?.runId).toBeUndefined();
+            expect(claims?.viewerAccountId).toBe('viewer-1');
+        });
+
+        it.each([['runner'], ['approval-control']])(
+            'refuses a %s token that names no run', (purpose) => {
+                // Acting on a run means being able to say which one. Only
+                // reading may travel without that.
+                const { workspaceId, runtimeId, runId, attemptId, epoch,
+                    workspaceAuthorityVersion, runAuthorityVersion, ...rest } = scope() as Record<string, unknown>;
+                expect(parseSessionScopedClaims({ ...rest, purpose })).toBeNull();
+            });
+
+        it('refuses a token carrying only part of a run scope', () => {
+            // Half a scope is compared field by field against an authority row,
+            // and the missing halves pass silently.
+            const { attemptId, ...rest } = scope() as Record<string, unknown>;
+            expect(parseSessionScopedClaims({ ...rest, purpose: 'transcript-read' })).toBeNull();
+            expect(parseSessionScopedClaims({ ...rest })).toBeNull();
+        });
+
         it.each([['administrator'], [''], [42], [null]])(
             'refuses a purpose this server does not know: %s', (purpose) => {
                 /*

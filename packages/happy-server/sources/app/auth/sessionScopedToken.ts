@@ -70,12 +70,25 @@ export type SessionScopedClaims = {
     /** Immutable ownership binding of the workspace. */
     tenantId: string;
     projectId: string;
-    workspaceId: string;
-    /** The runtime generation this grant was minted for. */
-    runtimeId: string;
-    runId: string;
-    attemptId: string;
-    epoch: number;
+    /**
+     * The execution axes, and they are **absent on a read token**.
+     *
+     * A transcript outlives the run that produced it: a finished run, a stopped
+     * runtime and a session that has since been replaced all still have
+     * transcripts somebody is entitled to read. Requiring these to read one is
+     * what made a dormant project unreadable — there is no live generation to
+     * name, and naming a dead one would be a claim about something that no
+     * longer exists.
+     *
+     * `approval-control` keeps them: answering a permission prompt is an act on
+     * the run that is asking, and an approval for a superseded attempt would be
+     * answering a question nobody is still posing.
+     */
+    workspaceId?: string;
+    runtimeId?: string;
+    runId?: string;
+    attemptId?: string;
+    epoch?: number;
     /**
      * The two authority versions are separate because they move independently:
      * a workspace-level change (epoch, runtime, project) does not advance a
@@ -83,9 +96,11 @@ export type SessionScopedClaims = {
      * the workspace. Collapsing them into one number would let either kind of
      * staleness pass as fresh.
      */
-    workspaceAuthorityVersion: number;
-    runAuthorityVersion: number;
+    workspaceAuthorityVersion?: number;
+    runAuthorityVersion?: number;
     expiresAt: number;
+    /** Who is reading, when that is not the account that owns the session. */
+    viewerAccountId?: string;
     /**
      * Absent means `runner`: tokens minted before this axis existed are runner
      * tokens, and that is what they have always been allowed to do. An
@@ -141,16 +156,13 @@ export function parseSessionScopedClaims(raw: unknown): SessionScopedClaims | nu
 
     if (readInt(record.v, SCOPED_TOKEN_VERSION) !== SCOPED_TOKEN_VERSION) return null;
 
+    /** Present on every token, whatever it is for. */
     const ids = {
         grantId: readId(record.grantId),
         accountId: readId(record.accountId),
         sessionId: readId(record.sessionId),
         tenantId: readId(record.tenantId),
         projectId: readId(record.projectId),
-        workspaceId: readId(record.workspaceId),
-        runtimeId: readId(record.runtimeId),
-        runId: readId(record.runId),
-        attemptId: readId(record.attemptId),
     };
     for (const value of Object.values(ids)) {
         if (value === null) return null;
@@ -164,14 +176,39 @@ export function parseSessionScopedClaims(raw: unknown): SessionScopedClaims | nu
     if (!(SESSION_SCOPED_PURPOSES as readonly string[]).includes(rawPurpose)) return null;
     const purpose = rawPurpose as SessionScopedPurpose;
 
+    const expiresAt = readInt(record.expiresAt, 1);
+    if (expiresAt === null) return null;
+
+    /*
+     * The execution axes travel together or not at all.
+     *
+     * A token carrying some of them is not a shape either side of this split
+     * produces: a runner token has every one, and a read token has none. Half a
+     * scope would be compared against an authority row field by field, and the
+     * fields that were missing would silently pass.
+     */
+    const execution = {
+        workspaceId: readId(record.workspaceId),
+        runtimeId: readId(record.runtimeId),
+        runId: readId(record.runId),
+        attemptId: readId(record.attemptId),
+    };
     const epoch = readInt(record.epoch, 0);
     const workspaceAuthorityVersion = readInt(record.workspaceAuthorityVersion, 0);
     const runAuthorityVersion = readInt(record.runAuthorityVersion, 0);
-    const expiresAt = readInt(record.expiresAt, 1);
-    if (epoch === null || workspaceAuthorityVersion === null
-        || runAuthorityVersion === null || expiresAt === null) {
-        return null;
-    }
+    const present = [...Object.values(execution), epoch, workspaceAuthorityVersion, runAuthorityVersion]
+        .filter((value) => value !== null).length;
+    const executionCarried = present === 7;
+    if (present !== 0 && !executionCarried) return null;
+
+    // Reading is the only thing that may travel without them. A runner or an
+    // approver acts on a run, and a token that cannot name one is not either.
+    if (!executionCarried && purpose !== 'transcript-read') return null;
+
+    const viewerAccountId = record.viewerAccountId === undefined
+        ? null
+        : readId(record.viewerAccountId);
+    if (record.viewerAccountId !== undefined && viewerAccountId === null) return null;
 
     return {
         v: SCOPED_TOKEN_VERSION,
@@ -180,13 +217,18 @@ export function parseSessionScopedClaims(raw: unknown): SessionScopedClaims | nu
         sessionId: ids.sessionId!,
         tenantId: ids.tenantId!,
         projectId: ids.projectId!,
-        workspaceId: ids.workspaceId!,
-        runtimeId: ids.runtimeId!,
-        runId: ids.runId!,
-        attemptId: ids.attemptId!,
-        epoch,
-        workspaceAuthorityVersion,
-        runAuthorityVersion,
+        ...(executionCarried
+            ? {
+                workspaceId: execution.workspaceId!,
+                runtimeId: execution.runtimeId!,
+                runId: execution.runId!,
+                attemptId: execution.attemptId!,
+                epoch: epoch!,
+                workspaceAuthorityVersion: workspaceAuthorityVersion!,
+                runAuthorityVersion: runAuthorityVersion!,
+            }
+            : {}),
+        ...(viewerAccountId ? { viewerAccountId } : {}),
         expiresAt,
         purpose,
     };

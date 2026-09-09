@@ -1925,4 +1925,237 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             expect(replay.json().expiresAt).toBe(body.expiresAt);
         });
     });
+
+    describe('reading a transcript', () => {
+        function readScope(over: Record<string, unknown> = {}) {
+            return {
+                tenantId: 'tenant-1',
+                projectId: 'project-1',
+                sessionId,
+                sessionOwnerAccountId: accountId,
+                viewerAccountId: accountId,
+                ...over,
+            };
+        }
+
+        it('mints a bearer that names no run', async () => {
+            /*
+             * The point of the separate surface: a transcript outlives its run,
+             * so the token that reads one names none. Minted through
+             * `grants/mint` it would have to, and a dormant project has nothing
+             * to name.
+             */
+            const body = {
+                scope: readScope(),
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: Date.now() + HOUR,
+            };
+            const response = await call({ path: '/v1/managed/control/grants/read/mint', op: 'read-grant-mint', body });
+            expect(response.statusCode).toBe(200);
+            expect(response.json().purpose).toBe('transcript-read');
+            // The token is opaque on the wire; what this level can say is that
+            // the row it was minted from carries no run, and that the purpose
+            // came back as asked.
+            const row = await db.managedSessionGrant.findUniqueOrThrow({ where: { grantId: body.grantId } });
+            expect(row.runId).toBeNull();
+            expect(row.purpose).toBe('transcript-read');
+        });
+
+        it('refuses an assertion signed for minting a runner credential', async () => {
+            // One assertion must not mint both: a control plane authorised to
+            // start work would otherwise be authorised to hand out reading.
+            const body = {
+                scope: readScope(),
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: Date.now() + HOUR,
+            };
+            const response = await call({
+                path: '/v1/managed/control/grants/read/mint',
+                op: 'read-grant-mint',
+                body,
+                assertion: assertionFor('grant-mint', body),
+            });
+            expect(response.statusCode).toBe(403);
+        });
+
+        it('mints for a viewer who is not the owner, and serves that viewer its own envelope', async () => {
+            /*
+             * The shared case, end to end and on real rows: a company project
+             * read by a member whose Happy account is not the session owner's.
+             * The parent holds **that member's** bearer — the owner's is not
+             * available and must never be invented — and proves the member may
+             * read with the control assertion this route requires.
+             *
+             * The envelope comes with the request because this server cannot
+             * make one: it holds the wrapped key and nothing that opens it.
+             */
+            const envelope = Buffer.concat([Buffer.from([0]), Buffer.alloc(104, 5)]).toString('base64');
+            const body = {
+                scope: {
+                    tenantId: 'tenant-1',
+                    projectId: 'project-1',
+                    sessionId,
+                    sessionOwnerAccountId: accountId,
+                    viewerAccountId: otherAccountId,
+                },
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: Date.now() + HOUR,
+                viewerDataEncryptionKey: envelope,
+            };
+            const response = await call({
+                path: '/v1/managed/control/grants/read/mint',
+                op: 'read-grant-mint',
+                body,
+                // The viewer's own bearer, which is what the parent has.
+                token: otherToken,
+            });
+            expect(response.statusCode).toBe(200);
+            expect(response.json().viewerAccountId).toBe(otherAccountId);
+
+            const row = await db.managedSessionGrant.findUniqueOrThrow({ where: { grantId: body.grantId } });
+            expect(row.accountId).toBe(accountId);
+            expect(row.viewerAccountId).toBe(otherAccountId);
+            expect(Buffer.from(row.viewerDataEncryptionKey!).toString('base64')).toBe(envelope);
+            expect(row.runId).toBeNull();
+        });
+
+        it('refuses a viewer with no envelope of its own', async () => {
+            // A grant that is valid and useless: the stored envelope is the
+            // owner's, so this viewer could never decrypt anything.
+            const body = {
+                scope: {
+                    tenantId: 'tenant-1', projectId: 'project-1', sessionId,
+                    sessionOwnerAccountId: accountId, viewerAccountId: otherAccountId,
+                },
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: Date.now() + HOUR,
+            };
+            const response = await call({
+                path: '/v1/managed/control/grants/read/mint', op: 'read-grant-mint', body, token: otherToken,
+            });
+            expect(response.statusCode).toBeGreaterThanOrEqual(400);
+            expect(await db.managedSessionGrant.findUnique({ where: { grantId: body.grantId } })).toBeNull();
+        });
+
+        it('withdraws a viewer without that viewer presenting anything', async () => {
+            /*
+             * The removal that matters most: a member taken off a project, an
+             * account unlinked, a credential already revoked. Requiring the
+             * viewer to co-operate in ending their own access would make those
+             * exact cases impossible.
+             *
+             * The parent's assertion is the authority; the bearer here is the
+             * admin's, not the removed member's.
+             */
+            const envelope = Buffer.concat([Buffer.from([0]), Buffer.alloc(104, 6)]).toString('base64');
+            const scope = {
+                tenantId: 'tenant-1', projectId: 'project-1', sessionId,
+                sessionOwnerAccountId: accountId, viewerAccountId: otherAccountId,
+            };
+            const grantId = `grant-${randomUUID()}`;
+            const minted = await call({
+                path: '/v1/managed/control/grants/read/mint',
+                op: 'read-grant-mint',
+                body: {
+                    scope, grantId, requestId: `req-${randomUUID()}`,
+                    expiresAt: Date.now() + HOUR, viewerDataEncryptionKey: envelope,
+                },
+                token: otherToken,
+            });
+            expect(minted.statusCode).toBe(200);
+
+            // The owner's bearer — the removed member presents nothing at all.
+            const revoked = await call({
+                path: '/v1/managed/control/grants/read/revoke',
+                op: 'read-grant-revoke',
+                body: { scope, reason: 'member-removed' },
+            });
+            expect(revoked.statusCode).toBe(200);
+            const row = await db.managedSessionGrant.findUniqueOrThrow({ where: { grantId } });
+            expect(row.revokedAt).not.toBeNull();
+            expect(row.revokedReason).toBe('member-removed');
+        });
+
+        it('refuses a revoke aimed at a scope whose owner does not hold the session', async () => {
+            // The bearer identity is not the authority here, so the scope is
+            // what must be checked: a caller cannot write tombstones against
+            // sessions it merely guessed at.
+            const response = await call({
+                path: '/v1/managed/control/grants/read/revoke',
+                op: 'read-grant-revoke',
+                body: {
+                    scope: {
+                        tenantId: 'tenant-1', projectId: 'project-1', sessionId,
+                        sessionOwnerAccountId: otherAccountId, viewerAccountId: otherAccountId,
+                    },
+                    reason: 'guessed',
+                },
+            });
+            expect(response.statusCode).toBeGreaterThanOrEqual(400);
+        });
+
+        it('refuses one account minting a read grant for another account\'s session', async () => {
+            /*
+             * The bearer is a real account, and the owner it names really does
+             * own the session — so the ownership comparison inside the grant
+             * path is satisfied. What must stop this is the route: an account
+             * may only mint against **itself**, or any account could hand out
+             * reading of anyone's session it could name.
+             */
+            const body = {
+                scope: readScope(),
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: Date.now() + HOUR,
+            };
+            // The scope names this account as the viewer, and a different
+            // account presents it. Minting for somebody else's viewing is how
+            // one account would hand out reading in another's name.
+            const response = await call({
+                path: '/v1/managed/control/grants/read/mint',
+                op: 'read-grant-mint',
+                body,
+                token: otherToken,
+            });
+            expect(response.statusCode).toBe(403);
+            expect(await db.managedSessionGrant.findUnique({ where: { grantId: body.grantId } }))
+                .toBeNull();
+        });
+
+        it('refuses an owner the bearer does not own', async () => {
+            const body = {
+                scope: readScope({ sessionOwnerAccountId: 'someone-else' }),
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: Date.now() + HOUR,
+            };
+            expect((await call({
+                path: '/v1/managed/control/grants/read/mint', op: 'read-grant-mint', body,
+            })).statusCode).toBe(403);
+        });
+
+        it('withdraws a viewer, and says so again on a repeat', async () => {
+            const grantId = `grant-${randomUUID()}`;
+            await call({
+                path: '/v1/managed/control/grants/read/mint',
+                op: 'read-grant-mint',
+                body: {
+                    scope: readScope(), grantId,
+                    requestId: `req-${randomUUID()}`, expiresAt: Date.now() + HOUR,
+                },
+            });
+            const body = { scope: readScope(), reason: 'acl-withdrawn' };
+            const first = await call({ path: '/v1/managed/control/grants/read/revoke', op: 'read-grant-revoke', body });
+            expect(first.statusCode).toBe(200);
+            expect(first.json()).toEqual({ state: 'revoked', alreadyRevoked: false });
+            const again = await call({ path: '/v1/managed/control/grants/read/revoke', op: 'read-grant-revoke', body });
+            expect(again.json()).toEqual({ state: 'revoked', alreadyRevoked: true });
+            const row = await db.managedSessionGrant.findUniqueOrThrow({ where: { grantId } });
+            expect(row.revokedAt).not.toBeNull();
+        });
+    });
 });

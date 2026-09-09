@@ -945,9 +945,18 @@ model ManagedRunAuthority {
 model ManagedSessionGrant {
     grantId     String @id
     family      String
-    workspaceId String
-    runId       String
-    attemptId   String
+    /**
+     * The run axes a **runner** grant is bound to.
+     *
+     * Null for a `transcript-read` grant, and that is the point: a transcript
+     * outlives the run that produced it. A finished run, a stopped runtime and
+     * a session that has since been replaced all still have transcripts
+     * somebody is entitled to read, and requiring a live run to read one is
+     * what made a dormant project unreadable.
+     */
+    workspaceId String?
+    runId       String?
+    attemptId   String?
     sessionId   String
     /// What this grant is **for**, and therefore what it may reach.
     ///
@@ -964,12 +973,27 @@ model ManagedSessionGrant {
     purpose     String @default("runner")
     /// The account this run acts as. Compared against `Session.accountId` on
     /// every action; never inherited from the workspace.
+    /// The account that owns the session. For a runner grant this is also the
+    /// account the run acts as; for a read grant it is the authority the
+    /// request is checked against, never a value the caller may assert.
     accountId   String
-    epoch       Int
+    /// Who is reading, when that is not the owner.
+    ///
+    /// A company project may be read by a member whose Happy account is not
+    /// the session owner's. Null on a runner grant, where there is no separate
+    /// viewer.
+    viewerAccountId String?
+    /// The session key envelope resealed for `viewerAccountId`.
+    ///
+    /// Produced by whoever holds the plaintext key — this server never does,
+    /// and never invents one. Absent means the viewer cannot decrypt, which is
+    /// reported as such rather than papered over with the owner's envelope.
+    viewerDataEncryptionKey Bytes?
+    epoch       Int?
     /// Authority versions this grant was minted against. A later projection
     /// update makes the grant stale without needing to touch this row.
-    workspaceAuthorityVersion Int
-    runAuthorityVersion       Int
+    workspaceAuthorityVersion Int?
+    runAuthorityVersion       Int?
     expiresAt   BigInt
     revokedAt   BigInt?
     /// Reason code only — never provider text or request content.
@@ -986,8 +1010,9 @@ model ManagedSessionGrant {
     createdAt   BigInt
     updatedAt   BigInt
 
-    workspace ManagedWorkspaceAuthority @relation(fields: [workspaceId], references: [workspaceId], onDelete: Restrict)
-    run       ManagedRunAuthority       @relation(fields: [runId], references: [runId], onDelete: Restrict)
+    /// Optional because a read grant has no run: the transcript outlives it.
+    workspace ManagedWorkspaceAuthority? @relation(fields: [workspaceId], references: [workspaceId], onDelete: Restrict)
+    run       ManagedRunAuthority?       @relation(fields: [runId], references: [runId], onDelete: Restrict)
 
     /// At most one live grant per family: a renewal supersedes in place.
     @@unique([family])

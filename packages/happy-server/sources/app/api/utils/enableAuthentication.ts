@@ -112,6 +112,10 @@ export function enableSessionScopeAuthentication(
         // condition rather than a replacement for them.
         request.userId = principal.claims.accountId;
         request.principal = principal;
+        // The grant the request was authorised by, for handlers that must
+        // answer *this* bearer rather than the account it acts for — a viewer
+        // gets its own key envelope, and the owner's is not a substitute.
+        request.managedGrant = allowed.grant;
     });
 }
 

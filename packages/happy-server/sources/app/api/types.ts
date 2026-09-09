@@ -51,6 +51,8 @@ export type Fastify = FastifyInstance<
     ZodTypeProvider
 >;
 
+import type { LiveGrant } from '@/app/managed/managedSessionGrant';
+
 declare module 'fastify' {
     interface FastifyRequest {
         userId: string;
@@ -67,6 +69,17 @@ declare module 'fastify' {
          * a managed principal; everywhere else `authenticate` rejects one.
          */
         principal?: Principal;
+        /**
+         * The grant row this request was authorised by, when a managed bearer
+         * made it.
+         *
+         * Present only for managed principals, and only after the route, the
+         * session and the grant were all checked. A handler reads it when the
+         * answer belongs to *this bearer* rather than to the account it acts
+         * for — the resealed key envelope of a viewer, for instance, which the
+         * owner's envelope may never stand in for.
+         */
+        managedGrant?: LiveGrant;
         startTime?: number;
     }
     interface FastifyInstance {
