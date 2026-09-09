@@ -87,8 +87,19 @@ export function createManagedHandlerBridge(input: {
                 else handler();
                 return;
             }
-            if (callback) handler(payload, callback);
-            else handler(payload);
+            // A payload-bearing handler is written against Socket.IO, where an
+            // acknowledgement is optional on the wire but present as an
+            // argument. `sessionUpdateHandler` calls it unguarded on its
+            // success and version-mismatch paths, so a child that sends
+            // `update-metadata` without one makes the handler throw *after* the
+            // write — swallowed by its own catch, leaving a state change that
+            // reports as a failure to nobody.
+            //
+            // The stand-in is local and does nothing. The real callback, when
+            // there is one, is passed through untouched: it is already the
+            // channel-gated reply, and replacing it would take the answer off
+            // the boundary that checks the grant.
+            handler(payload, callback ?? (() => { /* the child asked for no answer */ }));
         },
     };
 }

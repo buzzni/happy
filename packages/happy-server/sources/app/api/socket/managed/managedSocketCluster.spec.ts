@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -10,6 +10,8 @@ import { io as connectClient, type Socket as ClientSocket } from 'socket.io-clie
 import type { PrismaClient } from '@prisma/client';
 import type { SessionScopedClaims, SessionScopedTokenIssuer } from '@/app/auth/sessionScopedToken';
 import { MANAGED_SOCKET_PATH } from '@/app/api/socket/managed/managedSocketPath';
+import * as logModule from '@/utils/log';
+import { eventRouter } from '@/app/events/eventRouter';
 
 /**
  * Two replicas, a real Redis stream between them, real sockets and the real
@@ -512,6 +514,74 @@ describe.skipIf(!enabled)('managed sockets across two replicas', () => {
         expect(session.metadata).toBe('managed-metadata');
         expect(session.metadataVersion).toBe(1);
     });
+
+    it('completes an update sent without an acknowledgement, without failing inside the handler', async () => {
+        // `sessionUpdateHandler` calls its acknowledgement unguarded once the
+        // write has happened. A child that wants no answer would otherwise make
+        // it throw *after* the state changed, and the handler's own catch would
+        // swallow that — a partial success nobody is told about.
+        //
+        // Completion is observed, not waited out. The handler emits its update
+        // and then calls back synchronously, so the update packet arriving at
+        // the client means the callback has already run: a sleep long enough
+        // for the write but short of `allocateUserSeq` would let the throw
+        // happen after the log spy was removed.
+        const [holder, producer] = [await startReplica(), await startReplica()];
+        const client = await connect(holder, await mint());
+        await waitForRegistry(holder, sessionId);
+        // Fan-out to a managed child goes out over the relay, so the emitting
+        // side must be the peer of the replica holding the socket.
+        eventRouter.initManaged(producer.io);
+
+        const updates: Array<{ body?: { id?: string; metadata?: { value?: string; version?: number }; agentState?: { value?: string; version?: number } } }> = [];
+        client.on('update', (payload: unknown) => updates.push(payload as never));
+
+        const swallowed: string[] = [];
+        const spy = vi.spyOn(logModule, 'log').mockImplementation(((...args: unknown[]) => {
+            const text = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+            // Only errors raised inside the handlers under test; unrelated
+            // server logging must not make this fail.
+            if (/Error in update-(metadata|state)/.test(text)) swallowed.push(text);
+        }) as never);
+
+        async function waitForUpdate(match: (u: typeof updates[number]) => boolean, what: string) {
+            const deadline = Date.now() + 5_000;
+            while (Date.now() < deadline) {
+                if (updates.some(match)) return;
+                await new Promise((resolve) => setTimeout(resolve, 20));
+            }
+            throw new Error(`no ${what} update reached the client`);
+        }
+
+        try {
+            client.emit('update-metadata', {
+                sid: sessionId, metadata: 'no-ack-metadata', expectedVersion: 0,
+            });
+            await waitForUpdate((u) => u.body?.id === sessionId
+                && u.body?.metadata?.value === 'no-ack-metadata'
+                && u.body?.metadata?.version === 1, 'metadata');
+
+            client.emit('update-state', {
+                sid: sessionId, agentState: 'no-ack-state', expectedVersion: 0,
+            });
+            await waitForUpdate((u) => u.body?.id === sessionId
+                && u.body?.agentState?.value === 'no-ack-state'
+                && u.body?.agentState?.version === 1, 'agent state');
+
+            const session = await db.session.findUniqueOrThrow({ where: { id: sessionId } });
+            expect(session.metadata).toBe('no-ack-metadata');
+            expect(session.metadataVersion).toBe(1);
+            expect(session.agentState).toBe('no-ack-state');
+            expect(session.agentStateVersion).toBe(1);
+            // The distinguishing assertion, made while the spy is still in
+            // place: a write that landed while the handler threw would satisfy
+            // the four above on its own.
+            expect(swallowed).toEqual([]);
+        } finally {
+            spy.mockRestore();
+            eventRouter.initManaged(null);
+        }
+    }, 30_000);
 
     it('answers a callback through the channel, and not after a revoke', async () => {
         const holder = await startReplica();
