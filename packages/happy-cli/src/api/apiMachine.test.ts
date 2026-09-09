@@ -375,7 +375,7 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
-    it('registers the persistent automation public key on connect and persists the acknowledged version', async () => {
+    it.each([undefined, 5])('registers the persistent automation key with the verified protocol %s', async (protocolVersion) => {
         mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
             if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 4 } };
             if (event === 'machine-update-metadata') {
@@ -391,7 +391,7 @@ describe('ApiMachineClient socket reconnection', () => {
             publicKey: new Uint8Array(32).fill(7),
             secretKey: new Uint8Array(32).fill(8),
             registeredKeyVersion: 3,
-        }, persistVersion);
+        }, persistVersion, protocolVersion);
         client.connect();
 
         socketHandlers.connect![0]!();
@@ -400,7 +400,7 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-key-register', {
             expectedKeyVersion: 3,
             publicKey: Buffer.from(new Uint8Array(32).fill(7)).toString('base64'),
-            protocolVersion: AUTOMATION_PROTOCOL_VERSION,
+            protocolVersion: protocolVersion ?? AUTOMATION_PROTOCOL_VERSION,
         });
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('machine-update-metadata', expect.any(Object));
         client.shutdown();

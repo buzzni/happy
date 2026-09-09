@@ -493,4 +493,13 @@ describe('automationService', () => {
         await expect(deleteAutomation(foreign.tx as never, 'editor-1', 'project-1', 'automation-1', 1))
             .resolves.toEqual({ ok: false, error: 'not-found' });
     });
+
+    it('rejects legacy deletion of script automations so their deterministic registration key is not stranded', async () => {
+        const { tx } = makeTx({ automation: automationRecord({ payloadVersion: 3, scriptRegistrationKey: 'collect' }) });
+
+        await expect(deleteAutomation(tx as never, 'editor-1', 'project-1', 'automation-1', 1))
+            .resolves.toEqual({ ok: false, error: 'invalid-payload-update' });
+        expect(tx.automation.updateMany).not.toHaveBeenCalled();
+        expect(tx.automationChange.create).not.toHaveBeenCalled();
+    });
 });

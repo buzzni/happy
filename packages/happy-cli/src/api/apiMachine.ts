@@ -409,6 +409,7 @@ export class ApiMachineClient {
     private autonomousQualityGateRpcAvailable = false;
     private lastKnownAutonomousQualityGateRpcAvailable: boolean | null = null;
     private automationKey: MachineAutomationKey | null = null;
+    private automationProtocolVersion: number = AUTOMATION_PROTOCOL_VERSION;
     private persistAutomationKeyVersion: ((version: number) => void) | null = null;
     private automationServerKeyVersion: number | null = null;
     // Fail closed while server-backed ownership is unresolved. Legacy file ticks
@@ -1278,8 +1279,9 @@ export class ApiMachineClient {
         // and happy-server already sees it to rewrite HTML).
     }
 
-    setAutomationKey(key: MachineAutomationKey, persistVersion: (version: number) => void): void {
+    setAutomationKey(key: MachineAutomationKey, persistVersion: (version: number) => void, protocolVersion: number = AUTOMATION_PROTOCOL_VERSION): void {
         this.automationKey = key;
+        this.automationProtocolVersion = protocolVersion;
         this.persistAutomationKeyVersion = persistVersion;
     }
 
@@ -1747,7 +1749,7 @@ export class ApiMachineClient {
         const answer = await this.socket.emitWithAck('automation-key-register', {
             expectedKeyVersion: key.registeredKeyVersion,
             publicKey: Buffer.from(key.publicKey).toString('base64'),
-            protocolVersion: AUTOMATION_PROTOCOL_VERSION,
+            protocolVersion: this.automationProtocolVersion,
         });
         if (!answer.ok || !answer.value || !Number.isSafeInteger(answer.value.keyVersion)) {
             if (answer.error === 'feature-disabled') {
@@ -1771,7 +1773,7 @@ export class ApiMachineClient {
                 serverBacked: true,
                 keyVersion,
                 sessionFollowup: true,
-                protocolVersion: AUTOMATION_PROTOCOL_VERSION,
+                protocolVersion: this.automationProtocolVersion,
             },
         }));
     }
@@ -2419,7 +2421,7 @@ export class ApiMachineClient {
                         serverBacked: this.automationServerKeyVersion !== null,
                         ...(this.automationServerKeyVersion !== null ? { keyVersion: this.automationServerKeyVersion } : {}),
                         sessionFollowup: true,
-                        protocolVersion: AUTOMATION_PROTOCOL_VERSION,
+                        protocolVersion: this.automationProtocolVersion,
                     },
                     autonomousQualityGateSupport: {
                         apiVersion: 1,
