@@ -27,6 +27,10 @@ import {
     syncRunAuthority,
     syncWorkspaceAuthority,
 } from '@/app/managed/managedAuthorityProjection';
+import { MANAGED_DAEMON_MAX_TTL_MS, parseManagedDaemonClaims } from '@/app/auth/managedDaemonToken';
+import { db } from '@/storage/db';
+import { inTx } from '@/storage/inTx';
+import { issueManagedDaemonGrant } from '@/app/managed/managedDaemonGrant';
 import {
     issueSessionGrant,
     renewSessionGrant,
@@ -84,6 +88,56 @@ const runSyncSchema = z.object({
         cancelled: z.boolean(),
     }).strict(),
 }).strict();
+
+/** Rolls the transaction back: a refusal must not commit what it wrote. */
+class MachineBootstrapConflict extends Error {}
+class WorkspaceAuthorityChanged extends Error {}
+/**
+ * The request's lifetime ran out while its rows were being written.
+ *
+ * Thrown so the transaction rolls back: while it is still open this is fully
+ * recoverable, and committing a grant for a lifetime that has already passed
+ * leaves a row nobody can mint against and a bootstrap that cannot be reissued
+ * under the same body.
+ */
+class BootstrapExpiredDuringWrite extends Error {}
+
+class DaemonGrantRefused extends Error {
+    constructor(readonly reason: string) {
+        super(reason);
+    }
+}
+
+/** How many times the bootstrap transaction may be replayed after a race. */
+const MAX_BOOTSTRAP_ATTEMPTS = 2;
+
+/**
+ * The wrapped machine key's wire shape, from `wrapDataEncryptionKey`
+ * (happy-cli src/api/encryption.ts:94): a version byte, then the bundle
+ * `libsodiumEncryptForPublicKey` produces — ephemeral public key (32), nonce
+ * (24), and the box over a 32-byte machine key with its 16-byte MAC.
+ */
+const MACHINE_KEY_ENVELOPE_BYTES = 1 + 32 + 24 + 32 + 16;
+const MACHINE_KEY_ENVELOPE_VERSION = 0;
+
+const daemonBootstrapSchema = z.object({
+    accountId: z.string(),
+    machineId: z.string(),
+    runtimeId: z.string(),
+    provisioningOperationId: z.string(),
+    workspaceId: z.string(),
+    projectId: z.string(),
+    epoch: z.number().int().min(0),
+    daemonGrantId: z.string(),
+    requestId: z.string(),
+    expiresAt: z.number().int().min(0),
+    /** Encrypted machine metadata, as the ordinary machine route takes it. */
+    metadata: z.string(),
+    /** The account's share of the machine key, wrapped. Write-once. */
+    dataEncryptionKey: z.string(),
+    /** The server's share, when the deployment provisions one. */
+    serverDataEncryptionKey: z.string().nullish(),
+});
 
 const mintSchema = z.object({
     scope: scopeSchema,
@@ -263,6 +317,346 @@ export function managedControlRoutes(
             requestId: request.body.requestId,
             workspace: snapshot.workspace,
             run: snapshot.run,
+        });
+    });
+
+    /**
+     * Registers the Machine a managed runtime will run as, and issues that
+     * runtime's own credential.
+     *
+     * ## Why the daemon never gets the account bearer
+     *
+     * The Machine belongs to the caller's account — that is how the runtime
+     * appears in their list — but the daemon runs code the customer's own
+     * agent can influence. An account bearer reaches every session on that
+     * account, so what goes to the runtime is a credential of its own purpose
+     * that names the account and can act as nothing on it.
+     *
+     * ## Why the key material comes from the caller
+     *
+     * `POST /v1/machines` treats `dataEncryptionKey` as write-once: an
+     * existing key is never replaced. So the trusted parent stores the
+     * envelopes durably *before* the first call and resends the same ones on
+     * every retry — if it minted a fresh key after a lost response, it would
+     * hold a key this server never kept and the daemon could never attach.
+     * This route follows the same rule: it creates the Machine when absent and
+     * otherwise adopts what is stored, never overwriting.
+     */
+    app.post('/v1/managed/control/daemon/bootstrap', {
+        onRequest: [app.authenticate, requireConfigured],
+        schema: { body: daemonBootstrapSchema },
+    }, async (request, reply) => {
+        const runtime = authorize(request as never, reply as never, 'daemon-bootstrap');
+        if (!runtime) return;
+        const body = request.body;
+        if (body.accountId !== request.userId) {
+            return reply.code(403).send({ error: 'Bearer does not own this scope' });
+        }
+
+        const now = Date.now();
+
+        // Everything the credential will assert, checked before a single row
+        // is written. These used to be caught at mint — after the Machine and
+        // the grant existed — so a refusal left rows behind and the corrected
+        // retry collided on the digest of the body it was fixing.
+        const identifiers = [
+            body.accountId, body.machineId, body.runtimeId, body.provisioningOperationId,
+            body.workspaceId, body.projectId, body.daemonGrantId, body.requestId,
+        ];
+        // Judged by the parser the credential will be read back through, not by
+        // a second set of conditions written here. An emptiness check alone let
+        // an id longer than the token's ceiling commit the Machine and the
+        // grant and fail only at mint — the refusal-after-mutation this route
+        // was restructured to prevent. It also let ' machine ' through, which
+        // the parser trims: the row would hold the padded id while the token
+        // claimed the trimmed one, one credential naming two identities.
+        //
+        // The probe puts the candidate in every id slot and requires it to come
+        // back unchanged, so the ceiling and the trimming stay defined in one
+        // place and canonical form is required without changing what tokens
+        // accept. `generation` is not submitted — the grant row owns it — and
+        // the numeric axes are checked below on their own terms.
+        const isCanonicalIdentifier = (value: string): boolean => parseManagedDaemonClaims({
+            v: 1,
+            accountId: value,
+            machineId: value,
+            runtimeId: value,
+            provisioningOperationId: value,
+            daemonGrantId: value,
+            generation: 0,
+            workspaceId: value,
+            projectId: value,
+            epoch: 0,
+            expiresAt: 1,
+        })?.machineId === value;
+        if (!identifiers.every(isCanonicalIdentifier)) {
+            return reply.code(400).send({ error: 'malformed' });
+        }
+        if (body.expiresAt <= now) return reply.code(400).send({ error: 'expired' });
+        if (body.expiresAt - now > MANAGED_DAEMON_MAX_TTL_MS) {
+            return reply.code(400).send({ error: 'ttl-too-long' });
+        }
+        // The envelope's shape is the one its single assembly point produces
+        // (`wrapDataEncryptionKey`, happy-cli src/api/encryption.ts:94):
+        // version 0x00 ‖ ephemeralPub(32) ‖ nonce(24) ‖ box(32-byte machine key
+        // + 16-byte MAC). Canonical base64 alone accepted `AQ==`, a version-1
+        // byte, and anything short or long — and this key is write-once, so a
+        // wrong one is registered permanently and the machine can never be
+        // read by the account it was supposedly wrapped for.
+        //
+        // Shape is all this server can judge. It does not hold the machine key
+        // or the recipient's private key, so whether the box actually contains
+        // that key is not something it can claim — and it does not.
+        const decodeEnvelope = (value: string): Buffer | null => {
+            const decoded = Buffer.from(value, 'base64');
+            if (decoded.length !== MACHINE_KEY_ENVELOPE_BYTES) return null;
+            if (decoded[0] !== MACHINE_KEY_ENVELOPE_VERSION) return null;
+            return decoded.toString('base64') === value ? decoded : null;
+        };
+        const keyBytes = decodeEnvelope(body.dataEncryptionKey);
+        if (!keyBytes) return reply.code(400).send({ error: 'malformed' });
+        const serverKeyBytes = body.serverDataEncryptionKey
+            ? decodeEnvelope(body.serverDataEncryptionKey)
+            : null;
+        if (body.serverDataEncryptionKey && !serverKeyBytes) {
+            return reply.code(400).send({ error: 'malformed' });
+        }
+
+        // The projection first, and exactly. A credential minted for a
+        // workspace the control plane has never projected — or for a
+        // generation, runtime or project other than the one it recorded — is a
+        // credential for something nobody has fenced. Checked before anything
+        // is written, so a refusal leaves no machine and no grant behind.
+        const authority = await db.managedWorkspaceAuthority.findUnique({
+            where: { workspaceId: body.workspaceId },
+        });
+        if (!authority
+            || authority.epoch !== body.epoch
+            || authority.runtimeId !== body.runtimeId
+            || authority.projectId !== body.projectId) {
+            return reply.code(409).send({ error: 'workspace-authority-mismatch' });
+        }
+
+        const submittedKey = keyBytes;
+        const submittedServerKey = serverKeyBytes;
+
+        // Every field of the precreate body is immutable. A retry that changed
+        // one is a different request wearing the same id, and adopting it would
+        // hand back a credential for a machine whose contents the parent cannot
+        // read.
+        const machineMismatch = (existing: {
+            metadata: string;
+            dataEncryptionKey: Uint8Array | null;
+            serverDataEncryptionKey: Uint8Array | null;
+        }) => {
+            if (existing.metadata !== body.metadata) return true;
+            if (existing.dataEncryptionKey
+                && !Buffer.from(existing.dataEncryptionKey).equals(submittedKey)) return true;
+            // Both directions. Stored-null against submitted-non-null used to
+            // compare equal, which let a different body through as if it were
+            // the same request — and only once the machine already had a key,
+            // where adopting the wrong one is unrecoverable.
+            const storedServer = existing.serverDataEncryptionKey
+                ? Buffer.from(existing.serverDataEncryptionKey)
+                : null;
+            if ((storedServer === null) !== (submittedServerKey === null)) {
+                // Before the account share exists the machine is still
+                // unwritten, and the submitted body is what will fill it.
+                if (existing.dataEncryptionKey) return true;
+            } else if (storedServer && submittedServerKey && !storedServer.equals(submittedServerKey)) {
+                return true;
+            }
+            return false;
+        };
+
+        // Two replicas retrying together both find no machine and both insert.
+        // The loser gets a unique violation, which is a convergence signal
+        // rather than an error the caller should ever see.
+        //
+        // The recovery is to run the whole transaction again, not to patch up
+        // around it afterwards. Everything this decision rests on — the
+        // projection, the Machine, the key material — was read inside the
+        // transaction that failed, and a repair built on those reads is built
+        // on a snapshot the database has already rejected. The retry is
+        // bounded: a second violation would mean a third writer, and this is
+        // not a place to loop against the database.
+        let issued: Awaited<ReturnType<typeof issueManagedDaemonGrant>> | null = null;
+        for (let attempt = 1; ; attempt++) {
+          try {
+            // A previous attempt may have got as far as issuing before failing.
+            issued = null;
+            await inTx(async (tx) => {
+                // Re-read inside the transaction that writes. The check above
+                // happened before this section and a generation raised in
+                // between would otherwise be committed against.
+                const settledAuthority = await tx.managedWorkspaceAuthority.findUnique({
+                    where: { workspaceId: body.workspaceId },
+                });
+                if (!settledAuthority
+                    || settledAuthority.epoch !== body.epoch
+                    || settledAuthority.runtimeId !== body.runtimeId
+                    || settledAuthority.projectId !== body.projectId) {
+                    throw new WorkspaceAuthorityChanged();
+                }
+
+                const existing = await tx.machine.findFirst({
+                where: { accountId: request.userId, id: body.machineId },
+            });
+            if (existing) {
+                if (machineMismatch(existing)) {
+                    // Thrown, not returned: a refusal returned from inside the
+                    // transaction commits whatever it has already written.
+                    throw new MachineBootstrapConflict();
+                }
+                if (!existing.dataEncryptionKey) {
+                    // Write-once, and only from absent. `updateMany` with the
+                    // null guard makes the loser of a race a no-op rather than
+                    // an overwrite.
+                    const claimed = await tx.machine.updateMany({
+                        where: { id: existing.id, dataEncryptionKey: null },
+                        data: {
+                            dataEncryptionKey: new Uint8Array(submittedKey),
+                            ...(submittedServerKey
+                                ? { serverDataEncryptionKey: new Uint8Array(submittedServerKey) }
+                                : {}),
+                        },
+                    });
+                    // Read back what actually landed, whether this call won the
+                    // guard or not. The row above was read before it ran, so a
+                    // loser would otherwise carry on believing its own material
+                    // was stored — and hand back a credential for a machine
+                    // whose contents it cannot read.
+                    const settled = await tx.machine.findFirst({ where: { id: existing.id } });
+                    const lost = claimed.count === 0;
+                    if (!settled || !settled.dataEncryptionKey
+                        || machineMismatch(settled)
+                        || (lost && !Buffer.from(settled.dataEncryptionKey).equals(submittedKey))) {
+                        throw new MachineBootstrapConflict();
+                    }
+                }
+                } else {
+                    await tx.machine.create({
+                    data: {
+                        id: body.machineId,
+                        accountId: request.userId,
+                        metadata: body.metadata,
+                        dataEncryptionKey: new Uint8Array(submittedKey),
+                        ...(submittedServerKey
+                            ? { serverDataEncryptionKey: new Uint8Array(submittedServerKey) }
+                            : {}),
+                        },
+                    });
+                }
+
+                // Same transaction: a Machine created for a grant that then
+                // fails to issue is a machine nobody asked for, and a grant
+                // without its machine is a credential for nothing.
+                issued = await issueManagedDaemonGrant({
+                    scope: {
+                        accountId: request.userId,
+                        machineId: body.machineId,
+                        runtimeId: body.runtimeId,
+                        provisioningOperationId: body.provisioningOperationId,
+                        workspaceId: body.workspaceId,
+                        projectId: body.projectId,
+                        epoch: body.epoch,
+                    },
+                    daemonGrantId: body.daemonGrantId,
+                    requestId: body.requestId,
+                    expiresAt: body.expiresAt,
+                    now,
+                    tx: tx as never,
+                });
+                if (!issued.ok) {
+                    // Same reason: the grant issue reports a refusal rather
+                    // than throwing, and a Machine created alongside it would
+                    // otherwise commit — a machine nobody asked for, which then
+                    // makes every corrected retry look like a mismatch.
+                    throw new DaemonGrantRefused(issued.reason);
+                }
+
+                // The last act of the transaction. The work above can wait on
+                // locks and be re-run, so the lifetime checked on arrival may
+                // already be spent by now. While this transaction is open the
+                // refusal is free — nothing is kept — which is why the check
+                // belongs here and not only at mint.
+                if (Date.now() >= body.expiresAt) throw new BootstrapExpiredDuringWrite();
+            });
+            break;
+          } catch (error) {
+            if (error instanceof WorkspaceAuthorityChanged) {
+                return reply.code(409).send({ error: 'workspace-authority-mismatch' });
+            }
+            if (error instanceof MachineBootstrapConflict) {
+                return reply.code(409).send({ error: 'machine-bootstrap-mismatch' });
+            }
+            if (error instanceof DaemonGrantRefused) {
+                return reply.code(409).send({ error: error.reason });
+            }
+            if (error instanceof BootstrapExpiredDuringWrite) {
+                return reply.code(400).send({ error: 'expired' });
+            }
+            if ((error as { code?: string }).code !== 'P2002') throw error;
+            // The other replica got there first. On the next pass the Machine
+            // and the grant are found rather than created, and the same
+            // comparisons decide whether what it stored is this body.
+            if (attempt >= MAX_BOOTSTRAP_ATTEMPTS) {
+                // Still colliding after a clean re-read, so this is not two
+                // replicas converging on one body: an identifier in it already
+                // belongs to something else — a reused grant id, most often.
+                // That is a conflict, and calling it a server fault would
+                // invite the caller to retry it forever.
+                return reply.code(409).send({ error: 'daemon-grant-conflict' });
+            }
+          }
+        }
+        if (!issued) return reply.code(500).send({ error: 'daemon grant was not issued' });
+
+        const result = issued as Awaited<ReturnType<typeof issueManagedDaemonGrant>>;
+        if (!result.ok) return reply.code(409).send({ error: result.reason });
+
+        // Minted from the stored row, never from the request: a credential must
+        // never claim more than the grant that authorises it.
+        const minted = await runtime.daemonTokens.mint({
+            v: 1,
+            accountId: result.grant.accountId,
+            machineId: result.grant.machineId,
+            runtimeId: result.grant.runtimeId,
+            provisioningOperationId: result.grant.provisioningOperationId,
+            workspaceId: result.grant.workspaceId,
+            projectId: result.grant.projectId,
+            epoch: result.grant.epoch,
+            daemonGrantId: result.grant.daemonGrantId,
+            generation: result.grant.generation,
+            // The lower of the two, always. An idempotent retry can return a
+            // row that has since been renewed to a later expiry, and minting
+            // against that would let a replayed original request collect a
+            // credential outliving what it asked for.
+            expiresAt: Math.min(Number(result.grant.expiresAt), body.expiresAt),
+            // Read again here rather than reusing the arrival time. What
+            // happens in between is unbounded, and minting against the older
+            // reading would hand back a credential already expired in real
+            // time and report it as a success.
+            //
+            // This is the backstop, not the recovery: the transaction refuses
+            // and rolls back while it still can. Past its commit the grant is
+            // durable and its body is immutable, so a new lifetime is not
+            // reachable from here at all — not by resending this body with a
+            // later expiry, and not by a new request id, which would collide
+            // on the one grant this runtime generation may have. The control
+            // plane recovers it by renewing the existing grant under its own
+            // fresh proof.
+        }, Date.now());
+        if (!minted.ok) return reply.code(400).send({ error: minted.reason });
+
+        return reply.send({
+            token: minted.token,
+            daemonGrantId: result.grant.daemonGrantId,
+            generation: result.grant.generation,
+            machineId: result.grant.machineId,
+            expiresAt: Math.min(Number(result.grant.expiresAt), body.expiresAt),
+            idempotent: result.idempotent,
+            serverUrl: runtime.publicUrl,
         });
     });
 

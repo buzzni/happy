@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { generateKeyPairSync, randomUUID, sign as signBytes } from 'node:crypto';
+import { generateKeyPairSync, randomBytes, randomUUID, sign as signBytes } from 'node:crypto';
+import nacl from 'tweetnacl';
 import fastify, { type FastifyInstance } from 'fastify';
 import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from 'fastify-type-provider-zod';
 
@@ -151,7 +152,7 @@ async function call(input: {
  * else.
  */
 async function managedRowSnapshot() {
-    const [workspaces, runs, grants] = await Promise.all([
+    const [workspaces, runs, grants, machines, daemonGrants] = await Promise.all([
         db.managedWorkspaceAuthority.findMany({
             where: { workspaceId: { in: [...createdWorkspaceIds] } },
             orderBy: { workspaceId: 'asc' },
@@ -164,8 +165,114 @@ async function managedRowSnapshot() {
             where: { runId: { in: [...createdRunIds] } },
             orderBy: { grantId: 'asc' },
         }),
+        // The daemon bootstrap route writes Machines and daemon grants, so a
+        // snapshot without them cannot see a refusal that left either behind —
+        // which is the whole class of defect these assertions exist for.
+        db.machine.findMany({ where: { accountId }, orderBy: { id: 'asc' } }),
+        db.managedDaemonGrant.findMany({ where: { accountId }, orderBy: { daemonGrantId: 'asc' } }),
     ]);
-    return { workspaces, runs, grants };
+    return { workspaces, runs, grants, machines, daemonGrants };
+}
+
+/**
+ * Prisma write methods on the models the bootstrap route creates rows in.
+ * Reads are deliberately not hooked: the point of the barrier below is to hold
+ * a transaction *after* it has read and *before* it writes.
+ */
+const HOOKED_WRITES = new Set(['create', 'update', 'updateMany', 'upsert']);
+const HOOKED_MODELS = new Set(['machine', 'managedDaemonGrant']);
+
+function hookWrites<T extends object>(tx: T, onWrite: () => Promise<void>): T {
+    const wrapModel = (model: Record<string | symbol, unknown>) => new Proxy(model, {
+        get(target, prop) {
+            const value = Reflect.get(target, prop);
+            if (typeof value !== 'function') return value;
+            const method = value as (...args: unknown[]) => unknown;
+            if (!HOOKED_WRITES.has(String(prop))) return method.bind(target);
+            return async (...args: unknown[]) => {
+                await onWrite();
+                return method.apply(target, args);
+            };
+        },
+    });
+    return new Proxy(tx, {
+        get(target, prop) {
+            const value = Reflect.get(target, prop);
+            if (HOOKED_MODELS.has(String(prop)) && value && typeof value === 'object') {
+                return wrapModel(value as Record<string | symbol, unknown>);
+            }
+            return typeof value === 'function' ? (value as Function).bind(target) : value;
+        },
+    }) as T;
+}
+
+/**
+ * Run a callback at the start of every transaction, and once inside each
+ * transaction just before its first write.
+ *
+ * `inTx` goes through `db.$transaction`, so replacing it here puts the hook
+ * inside the same real transaction the handler runs in — not around it.
+ */
+function installTransactionHook(hook: {
+    onStart?: () => Promise<void>;
+    onFirstWrite?: () => Promise<void>;
+}): () => void {
+    // Assigned and put back by value, not through `vi.spyOn`: `$transaction`
+    // is not an own property of this client, so restoring a spy on it (or
+    // deleting the override) leaves the property `undefined`, and every later
+    // transaction in the file fails with "$transaction is not a function".
+    const client = db as unknown as Record<string, unknown>;
+    const previous = client.$transaction;
+    const original = db.$transaction.bind(db) as (...args: unknown[]) => unknown;
+    client.$transaction = (fn: unknown, options: unknown) => {
+        if (typeof fn !== 'function') return original(fn, options);
+        return original(async (tx: object) => {
+            await hook.onStart?.();
+            let fired = false;
+            const once = async () => {
+                if (fired || !hook.onFirstWrite) return;
+                fired = true;
+                await hook.onFirstWrite();
+            };
+            return (fn as (tx: object) => Promise<unknown>)(
+                hook.onFirstWrite ? hookWrites(tx, once) : tx,
+            );
+        }, options);
+    };
+    return () => { client.$transaction = previous; };
+}
+
+/**
+ * A barrier inside the database, not a hopeful `Promise.all`.
+ *
+ * Two requests issued together need not overlap at all: the first can open its
+ * transaction, insert and commit before the second opens one, and a "race"
+ * test written that way proves only that a sequential retry converges. This
+ * holds every transaction that reaches its first write until `arrivals` of
+ * them are inside — so all of them have finished reading before any of them
+ * writes, which is the only interleaving that produces the conflict.
+ *
+ * `gated()` reports how many were actually held. A test that does not assert
+ * it cannot tell a real race from a barrier that never engaged.
+ */
+function transactionBarrier(arrivals: number) {
+    let gated = 0;
+    let opened = false;
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    const restore = installTransactionHook({
+        onFirstWrite: async () => {
+            if (!opened) {
+                gated++;
+                if (gated >= arrivals) { opened = true; open(); }
+            }
+            await gate;
+        },
+    });
+    return {
+        gated: () => gated,
+        restore: () => { opened = true; open(); restore(); },
+    };
 }
 
 async function expectInert<T extends { statusCode: number }>(run: () => Promise<T>, status: number): Promise<T> {
@@ -238,11 +345,16 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             where: { workspaceId: { in: [...createdWorkspaceIds] } },
         });
         await db.session.deleteMany({ where: { id: { in: [...createdSessionIds] } } });
+        // Daemon bootstrap creates a Machine and a grant for the fixture
+        // account; both reference it, so both go before it does.
+        await db.managedDaemonGrant.deleteMany({ where: { accountId: { in: [...createdAccountIds] } } });
+        await db.machine.deleteMany({ where: { accountId: { in: [...createdAccountIds] } } });
         await db.account.deleteMany({ where: { id: { in: [...createdAccountIds] } } });
     });
 
     afterAll(async () => {
-        expect(await managedRowSnapshot()).toEqual({ workspaces: [], runs: [], grants: [] });
+        expect(await managedRowSnapshot())
+            .toEqual({ workspaces: [], runs: [], grants: [], machines: [], daemonGrants: [] });
         await app?.close();
         await unconfiguredApp?.close();
         await db.$disconnect();
@@ -1199,6 +1311,618 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
                 path: '/v1/managed/control/grants/mint', op: 'grant-mint',
                 body: { ...mintBody(), somethingElse: true },
             }), 400);
+        });
+    });
+
+    /**
+     * Registering the Machine a managed runtime runs as, and issuing that
+     * runtime's own credential.
+     *
+     * Exercised through the real route: the access helper passing says the
+     * rules are right, not that anything reaches them.
+     */
+    describe('daemon bootstrap', () => {
+        /**
+         * The account this machine key is wrapped for. Held here so a test can
+         * open what the route stored — the only way to show the bytes that
+         * survived are still the recipient's to read.
+         */
+        const recipient = nacl.box.keyPair();
+
+        /**
+         * The CLI's own envelope producer, loaded at runtime.
+         *
+         * A fixture that rebuilds the envelope here would only prove the route
+         * accepts the fixture. This proves it accepts what the CLI actually
+         * sends. The specifier is computed rather than written as a literal so
+         * this package's compiler does not pull the CLI's sources — and its
+         * newer language level — into its own program.
+         */
+        let buildMachineKeyEnvelopes: (
+            material: { machineKey: Uint8Array; accountPublicKey: Uint8Array } | null,
+            serverPublicKey: Uint8Array | null,
+        ) => { dataEncryptionKey: Uint8Array | null; serverDataEncryptionKey: Uint8Array | null };
+
+        beforeAll(async () => {
+            // Anchored to this file, not to the working directory: vitest
+            // reports the running spec's absolute path, so the fixture resolves
+            // the same however the suite is invoked.
+            const here = expect.getState().testPath!;
+            const specifier = `${here.slice(0, here.lastIndexOf('/sources/'))}`
+                + '/../happy-cli/src/api/encryption.ts';
+            ({ buildMachineKeyEnvelopes } = await import(specifier));
+        });
+
+        /**
+         * A real envelope from its single assembly point, not a byte pattern of
+         * the right length. `Buffer.alloc(105, 7)` has a version byte of 7 and
+         * a box that opens to nothing; it passed every check this route used to
+         * make, so those checks could not have caught a wrong key — and the key
+         * is write-once.
+         */
+        function machineEnvelope(machineKey: Uint8Array = new Uint8Array(randomBytes(32))) {
+            const { dataEncryptionKey } = buildMachineKeyEnvelopes(
+                { machineKey, accountPublicKey: recipient.publicKey },
+                null,
+            );
+            return Buffer.from(dataEncryptionKey!).toString('base64');
+        }
+
+        function bootstrapBody(over: Record<string, unknown> = {}) {
+            return {
+                accountId,
+                machineId: `machine-${randomUUID()}`,
+                runtimeId: 'runtime-1',
+                provisioningOperationId: `op-${randomUUID()}`,
+                workspaceId,
+                projectId: 'project-1',
+                epoch: 1,
+                daemonGrantId: `dgrant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: Date.now() + 3_600_000,
+                metadata: '{}',
+                dataEncryptionKey: machineEnvelope(),
+                ...over,
+            };
+        }
+
+        /** The projection a runtime is fenced into, as the control plane records it. */
+        async function projectWorkspace() {
+            const response = await call({
+                path: '/v1/managed/control/authority/workspace',
+                op: 'authority-sync',
+                body: {
+                    ownerAccountId: accountId,
+                    expectedVersion: 0,
+                    body: {
+                        workspaceId, tenantId: 'tenant-1', projectId: 'project-1',
+                        epoch: 1, runtimeId: 'runtime-1',
+                    },
+                },
+            });
+            expect(response.statusCode).toBe(200);
+        }
+
+        async function bootstrap(body: Record<string, unknown>, over: Record<string, unknown> = {}) {
+            return call({
+                path: '/v1/managed/control/daemon/bootstrap',
+                op: 'daemon-bootstrap',
+                body,
+                ...over,
+            });
+        }
+
+        it('creates the machine and issues a credential for it', async () => {
+            await projectWorkspace();
+            const body = bootstrapBody();
+            const response = await bootstrap(body);
+            expect(response.statusCode).toBe(200);
+            const payload = response.json();
+            expect(payload.machineId).toBe(body.machineId);
+            expect(payload.generation).toBe(0);
+            expect(typeof payload.token).toBe('string');
+
+            const machine = await db.machine.findFirst({
+                where: { id: body.machineId as string, accountId },
+            });
+            expect(machine).not.toBeNull();
+            expect(Buffer.from(machine!.dataEncryptionKey!).toString('base64'))
+                .toBe(body.dataEncryptionKey);
+        });
+
+        it('stores an envelope its recipient can still open', async () => {
+            await projectWorkspace();
+            // The cross fixture: the CLI's own producer on one side, the
+            // account's private key on the other, and this route in between.
+            // Shape checks alone would pass on bytes nobody can open.
+            const machineKey = new Uint8Array(randomBytes(32));
+            const body = bootstrapBody({ dataEncryptionKey: machineEnvelope(machineKey) });
+            expect((await bootstrap(body)).statusCode).toBe(200);
+
+            const machine = await db.machine.findFirst({
+                where: { id: body.machineId as string, accountId },
+            });
+            const stored = Buffer.from(machine!.dataEncryptionKey!);
+            expect(stored.length).toBe(105);
+            expect(stored[0]).toBe(0);
+            const opened = nacl.box.open(
+                new Uint8Array(stored.subarray(57)),
+                new Uint8Array(stored.subarray(33, 57)),
+                new Uint8Array(stored.subarray(1, 33)),
+                recipient.secretKey,
+            );
+            expect(opened).not.toBeNull();
+            expect(new Uint8Array(opened!)).toEqual(machineKey);
+        });
+
+        it.each([
+            ['a one-byte payload', 'AQ=='],
+            ['the wrong version byte', () => {
+                const raw = Buffer.from(machineEnvelope(), 'base64');
+                raw[0] = 1;
+                return raw.toString('base64');
+            }],
+            ['a truncated envelope', () => Buffer.from(machineEnvelope(), 'base64')
+                .subarray(0, 104).toString('base64')],
+            ['a padded envelope', () => Buffer.concat([
+                Buffer.from(machineEnvelope(), 'base64'), Buffer.alloc(1),
+            ]).toString('base64')],
+            ['an empty field', ''],
+            ['something that is not base64 at all', 'not base64!!'],
+            ['base64 that does not round-trip', 'AAAA='],
+        ])('refuses %s as a machine key, writing nothing', async (_name, value) => {
+            // This key is write-once: a wrong one is registered permanently and
+            // the account can never read its own machine. Canonical base64 by
+            // itself accepted every value in this table.
+            await projectWorkspace();
+            const dataEncryptionKey = typeof value === 'function' ? value() : value;
+            const before = await managedRowSnapshot();
+
+            const response = await bootstrap(bootstrapBody({ dataEncryptionKey }));
+            expect(response.statusCode).toBe(400);
+            expect(await managedRowSnapshot()).toEqual(before);
+
+            // The corrected request still works — nothing was kept.
+            expect((await bootstrap(bootstrapBody())).statusCode).toBe(200);
+        });
+
+        it('refuses a malformed server share the same way', async () => {
+            await projectWorkspace();
+            const before = await managedRowSnapshot();
+            const response = await bootstrap(bootstrapBody({
+                serverDataEncryptionKey: 'AQ==',
+            }));
+            expect(response.statusCode).toBe(400);
+            expect(await managedRowSnapshot()).toEqual(before);
+        });
+
+        it.each([
+            ['an id longer than the credential allows', { machineId: 'm'.repeat(201) }],
+            ['a workspace id longer than the credential allows', { workspaceId: 'w'.repeat(201) }],
+            ['an id with surrounding whitespace', { machineId: ' machine-padded ' }],
+            ['a request id with surrounding whitespace', { requestId: ' req-padded ' }],
+            ['an id that is only whitespace', { runtimeId: '   ' }],
+        ])('refuses %s before writing anything', async (_name, over) => {
+            // A 201-character id passed the route's emptiness check, committed
+            // the Machine and the grant, and failed at mint: rows left behind
+            // for a request that was refused. A padded id passed too, and would
+            // have stored one identity while the token claimed another.
+            await projectWorkspace();
+            const before = await managedRowSnapshot();
+
+            const response = await bootstrap(bootstrapBody(over));
+            expect(response.statusCode).toBe(400);
+            expect(await managedRowSnapshot()).toEqual(before);
+
+            // The corrected request still works, because nothing was kept.
+            expect((await bootstrap(bootstrapBody())).statusCode).toBe(200);
+        });
+
+        it('refuses without the control assertion', async () => {
+            // The bearer alone is not enough: a stolen account token must not
+            // be able to create a machine and mint a runtime credential.
+            const response = await bootstrap(bootstrapBody(), { assertion: null });
+            expect(response.statusCode).toBe(403);
+        });
+
+        it('refuses an assertion signed for another operation', async () => {
+            const body = bootstrapBody();
+            const response = await bootstrap(body, { assertion: assertionFor('grant-mint', body) });
+            expect(response.statusCode).toBe(403);
+        });
+
+        it('refuses a scope the bearer does not own', async () => {
+            const response = await bootstrap(bootstrapBody({ accountId: 'somebody-else' }));
+            expect(response.statusCode).toBe(403);
+        });
+
+        it('converges on a lost response instead of making a second machine', async () => {
+            await projectWorkspace();
+            // The parent stored its key material before the first call and
+            // resends the same body. A second row — or a second credential —
+            // would be a machine the parent cannot read.
+            const body = bootstrapBody();
+            const first = await bootstrap(body);
+            const again = await bootstrap(body);
+            expect(first.statusCode).toBe(200);
+            expect(again.statusCode).toBe(200);
+            expect(again.json().idempotent).toBe(true);
+            expect(again.json().daemonGrantId).toBe(first.json().daemonGrantId);
+            expect(await db.machine.count({ where: { id: body.machineId as string } })).toBe(1);
+        });
+
+        it('refuses material that disagrees with what was already stored', async () => {
+            await projectWorkspace();
+            // Write-once. Accepting a different key here would hand back a
+            // credential for a machine whose contents the parent cannot read.
+            const body = bootstrapBody();
+            await bootstrap(body);
+            const conflicting = await bootstrap(bootstrapBody({
+                machineId: body.machineId,
+                dataEncryptionKey: machineEnvelope(),
+            }));
+            expect(conflicting.statusCode).toBe(409);
+        });
+
+        it('refuses a workspace with no projection, changing nothing', async () => {
+            // The prose said this; the route did not do it. A daemon minted
+            // for a workspace the control plane has never projected is a
+            // credential for a generation nobody has fenced.
+            const before = await db.machine.count();
+            const grantsBefore = await db.managedDaemonGrant.count();
+            const response = await bootstrap(bootstrapBody({ workspaceId: `ws-${randomUUID()}` }));
+            expect(response.statusCode).toBe(409);
+            expect(await db.machine.count()).toBe(before);
+            expect(await db.managedDaemonGrant.count()).toBe(grantsBefore);
+        });
+
+        it.each([
+            ['epoch', { epoch: 99 }],
+            ['runtimeId', { runtimeId: 'runtime-somebody-else' }],
+            ['projectId', { projectId: 'project-somebody-else' }],
+        ])('refuses when %s disagrees with the projection, changing nothing', async (_name, over) => {
+            const before = await db.machine.count();
+            const grantsBefore = await db.managedDaemonGrant.count();
+            const response = await bootstrap(bootstrapBody(over));
+            expect(response.statusCode).toBe(409);
+            expect(await db.machine.count()).toBe(before);
+            expect(await db.managedDaemonGrant.count()).toBe(grantsBefore);
+        });
+
+        it.each([
+            ['metadata', () => ({ metadata: '{"different":true}' })],
+            ['serverDataEncryptionKey', () => ({ serverDataEncryptionKey: machineEnvelope() })],
+        ])('refuses a retry whose %s disagrees with what was stored', async (_name, build) => {
+            await projectWorkspace();
+            // Every field of the precreate body is immutable. A retry that
+            // changed one is a different request wearing the same id.
+            const over = build();
+            const body = bootstrapBody({ serverDataEncryptionKey: machineEnvelope() });
+            expect((await bootstrap(body)).statusCode).toBe(200);
+            const conflicting = await bootstrap({ ...body, ...over });
+            expect(conflicting.statusCode).toBe(409);
+        });
+
+        it('converges when two replicas are inside the database at once', async () => {
+            await projectWorkspace();
+            // Two control-plane replicas retrying together. Issuing both and
+            // hoping they overlap does not test this: the first can commit
+            // before the second opens a transaction, and then the assertions
+            // pass on a plain sequential retry. The barrier holds both after
+            // their reads and before their writes, so the unique violation
+            // really happens — and the loser must not surface it.
+            const body = bootstrapBody();
+            const barrier = transactionBarrier(2);
+            let responses: Awaited<ReturnType<typeof bootstrap>>[];
+            try {
+                responses = await Promise.all([bootstrap(body), bootstrap(body)]);
+            } finally {
+                barrier.restore();
+            }
+            const [a, b] = responses;
+            expect(barrier.gated()).toBe(2);
+            expect([a.statusCode, b.statusCode]).toEqual([200, 200]);
+            expect(a.json().daemonGrantId).toBe(b.json().daemonGrantId);
+            expect(a.json().machineId).toBe(b.json().machineId);
+            expect(await db.machine.count({ where: { id: body.machineId as string } })).toBe(1);
+            expect(await db.managedDaemonGrant.count({ where: { accountId } })).toBe(1);
+        });
+
+        it.each([
+            ['an empty machine id', { machineId: '' }],
+            ['an expiry already past', { expiresAt: Date.now() - 1_000 }],
+            ['a lifetime beyond the ceiling', { expiresAt: Date.now() + 25 * 3_600_000 }],
+        ])('refuses %s before writing anything', async (_name, over) => {
+            // These used to be caught at mint — after the Machine and the
+            // grant had already been written. The rows stayed, and a corrected
+            // retry then collided on the digest of the body it was fixing:
+            // unrecoverable without an operator.
+            await projectWorkspace();
+            const body = bootstrapBody(over);
+            const before = await managedRowSnapshot();
+            const machinesBefore = await db.machine.count();
+
+            const response = await bootstrap(body);
+            expect(response.statusCode).toBeGreaterThanOrEqual(400);
+            expect(await managedRowSnapshot()).toEqual(before);
+            expect(await db.machine.count()).toBe(machinesBefore);
+
+            // And the corrected request still works, because nothing was kept.
+            const fixed = await bootstrap(bootstrapBody({
+                ...over,
+                machineId: `machine-${randomUUID()}`,
+                expiresAt: Date.now() + 3_600_000,
+            }));
+            expect(fixed.statusCode).toBe(200);
+        });
+
+        it('rolls the machine back when the grant is refused', async () => {
+            // The grant issue returns a refusal rather than throwing. Returned
+            // normally from inside the transaction, the Machine created
+            // alongside it commits anyway — a machine nobody asked for, and one
+            // that then makes every corrected retry look like a mismatch.
+            await projectWorkspace();
+            const taken = bootstrapBody();
+            expect((await bootstrap(taken)).statusCode).toBe(200);
+
+            const machinesBefore = await db.machine.count();
+            // A different request naming the same runtime generation: the
+            // grant refuses, so nothing about this call may persist.
+            const response = await bootstrap(bootstrapBody({
+                runtimeId: taken.runtimeId,
+                provisioningOperationId: taken.provisioningOperationId,
+            }));
+            expect(response.statusCode).toBe(409);
+            expect(await db.machine.count()).toBe(machinesBefore);
+        });
+
+        it('re-runs the whole transaction when another replica commits first', async () => {
+            await projectWorkspace();
+            // The interleaving the retry exists for: this transaction reads,
+            // finds no machine, and another replica commits that very machine
+            // before it writes. The unique violation arrives inside the
+            // transaction, so nothing read in it can be trusted afterwards —
+            // the recovery is to run the whole thing again, which re-reads the
+            // projection, the machine and the key material and then adopts
+            // what the other replica stored.
+            const body = bootstrapBody();
+            let raced = false;
+            const restore = installTransactionHook({
+                onFirstWrite: async () => {
+                    if (raced) return;
+                    raced = true;
+                    await db.machine.create({
+                        data: {
+                            id: body.machineId,
+                            accountId,
+                            metadata: body.metadata,
+                            dataEncryptionKey: new Uint8Array(
+                                Buffer.from(body.dataEncryptionKey, 'base64'),
+                            ),
+                        },
+                    });
+                },
+            });
+            let response: Awaited<ReturnType<typeof bootstrap>>;
+            try {
+                response = await bootstrap(body);
+            } finally {
+                restore();
+            }
+            expect(raced).toBe(true);
+            expect(response.statusCode).toBe(200);
+            expect(response.json().machineId).toBe(body.machineId);
+            expect(await db.machine.count({ where: { id: body.machineId as string } })).toBe(1);
+            expect(await db.managedDaemonGrant.count({ where: { accountId } })).toBe(1);
+        });
+
+        it('rolls back rather than committing a grant whose lifetime ran out', async () => {
+            await projectWorkspace();
+            // The row work between arrival and commit is unbounded. Judged
+            // against the arrival time, this answers 200 with a credential
+            // already expired in real time — a success the caller cannot use
+            // and cannot tell from a working one.
+            //
+            // Refusing while the transaction is still open is what makes it
+            // recoverable: once the grant commits its body is immutable and
+            // its runtime generation may have only one grant, so no variation
+            // of this request can ask for a longer life. Only the control
+            // plane's own renewal can.
+            const body = bootstrapBody({ expiresAt: Date.now() + 400 });
+            const before = await managedRowSnapshot();
+            let stalled = false;
+            const restore = installTransactionHook({
+                onStart: async () => {
+                    if (stalled) return;
+                    stalled = true;
+                    await new Promise((resolve) => setTimeout(resolve, 700));
+                },
+            });
+            let response: Awaited<ReturnType<typeof bootstrap>>;
+            try {
+                response = await bootstrap(body);
+            } finally {
+                restore();
+            }
+            expect(stalled).toBe(true);
+            expect(response.statusCode).toBe(400);
+            expect(response.json().error).toBe('expired');
+            // Nothing kept: no machine, and no grant that could never be minted.
+            expect(await managedRowSnapshot()).toEqual(before);
+        });
+
+        it('recovers when two machines race for the same runtime grant', async () => {
+            await projectWorkspace();
+            // Same runtime generation and provisioning operation, different
+            // machines and different grant ids. Both create their own Machine
+            // and then contend on the single grant a generation may have.
+            // Held at the barrier, both read no grant before either writes, so
+            // the conflict is real: one is serialized behind the other and
+            // must be told the generation already has its credential rather
+            // than being handed a second one.
+            const shared = {
+                runtimeId: 'runtime-1',
+                provisioningOperationId: `op-${randomUUID()}`,
+            };
+            const first = bootstrapBody(shared);
+            const second = bootstrapBody(shared);
+            const barrier = transactionBarrier(2);
+            let responses: Awaited<ReturnType<typeof bootstrap>>[];
+            try {
+                responses = await Promise.all([bootstrap(first), bootstrap(second)]);
+            } finally {
+                barrier.restore();
+            }
+            expect(barrier.gated()).toBe(2);
+            expect(responses.map((response) => response.statusCode).sort()).toEqual([200, 409]);
+            const loser = responses.find((response) => response.statusCode === 409)!;
+            expect(loser.json().error).toBe('runtime-grant-exists');
+
+            // One grant for the generation, and the refused request left no
+            // machine of its own behind.
+            const grants = await db.managedDaemonGrant.findMany({ where: { accountId } });
+            expect(grants).toHaveLength(1);
+            const winner = responses.findIndex((response) => response.statusCode === 200);
+            expect(grants[0].daemonGrantId).toBe([first, second][winner].daemonGrantId);
+            expect(await db.machine.count({ where: { accountId } })).toBe(1);
+        });
+
+        it('refuses a reused grant id instead of failing inside the transaction', async () => {
+            await projectWorkspace();
+            // A grant id that already belongs to another generation. Both
+            // lookups inside the grant issue miss — different request id,
+            // different runtime — so the insert violates the primary key
+            // *inside the caller's transaction*.
+            //
+            // That transaction is already aborted by then, so a retry issued
+            // into it returns "current transaction is aborted" and the route
+            // sees an error it cannot classify: the P2002 is masked and the
+            // caller gets a server fault for what is a conflict. The recovery
+            // belongs to whoever owns the transaction, and it re-runs the
+            // whole thing rather than patching up inside a failed one.
+            const taken = bootstrapBody();
+            expect((await bootstrap(taken)).statusCode).toBe(200);
+
+            const before = await managedRowSnapshot();
+            const response = await bootstrap(bootstrapBody({
+                daemonGrantId: taken.daemonGrantId,
+            }));
+            expect(response.statusCode).toBe(409);
+            expect(response.json().error).toBe('daemon-grant-conflict');
+            // And the refused request left nothing of its own behind.
+            expect(await managedRowSnapshot()).toEqual(before);
+        });
+
+        it('has the loser of a key race adopt what the winner stored', async () => {
+            // Two bodies with different key material for the same keyless
+            // machine, held after their reads and released together. Only one
+            // may own the key; the other must be refused rather than told its
+            // own material was stored, which would hand back a credential for
+            // a machine whose contents it cannot read.
+            //
+            // What decides it here is the stored-key comparison on the retry,
+            // not the `updateMany` null guard: under Serializable the second
+            // writer is rolled back and re-run rather than shown a stale
+            // count, so the count-0 branch is a backstop this fixture does not
+            // reach.
+            await projectWorkspace();
+            const machineId = `machine-${randomUUID()}`;
+            // A machine registered the ordinary way, with no key yet.
+            await db.machine.create({
+                data: { id: machineId, accountId, metadata: '{}' },
+            });
+
+            const first = bootstrapBody({ machineId, metadata: '{}' });
+            const second = bootstrapBody({ machineId, metadata: '{}' });
+            const barrier = transactionBarrier(2);
+            let responses: Awaited<ReturnType<typeof bootstrap>>[];
+            try {
+                responses = await Promise.all([bootstrap(first), bootstrap(second)]);
+            } finally {
+                barrier.restore();
+            }
+            expect(barrier.gated()).toBe(2);
+            // Exactly one of them may own the key; the other is refused rather
+            // than told its own material was stored.
+            const codes = responses.map((response) => response.statusCode).sort();
+            expect(codes).toEqual([200, 409]);
+
+            const wonIndex = responses.findIndex((response) => response.statusCode === 200);
+            const winner = [first, second][wonIndex];
+            const stored = await db.machine.findFirst({ where: { id: machineId } });
+            expect(Buffer.from(stored!.dataEncryptionKey!).toString('base64'))
+                .toBe(winner.dataEncryptionKey);
+            // The refused one left nothing behind either.
+            expect(await db.managedDaemonGrant.count({ where: { accountId } })).toBe(1);
+            expect((await db.managedDaemonGrant.findMany({ where: { accountId } }))[0].daemonGrantId)
+                .toBe(winner.daemonGrantId);
+        });
+
+        it('refuses a retry that adds a server envelope the stored machine has not got', async () => {
+            // Stored null and submitted non-null used to compare equal, which
+            // let a different body through as if it were the same request.
+            await projectWorkspace();
+            const body = bootstrapBody();
+            expect((await bootstrap(body)).statusCode).toBe(200);
+            const conflicting = await bootstrap({
+                ...body,
+                serverDataEncryptionKey: machineEnvelope(),
+            });
+            expect(conflicting.statusCode).toBe(409);
+        });
+
+        it('re-reads the projection inside the transaction that writes', async () => {
+            // Fencing the generation *before* the request only exercises the
+            // check the handler already makes before the transaction opens —
+            // deleting the re-read inside it would not have shown up. The hook
+            // fences after that first check has passed and before the
+            // transaction's own read, which is the window the re-read exists
+            // for.
+            await projectWorkspace();
+            const body = bootstrapBody();
+            let fenced = false;
+            const restore = installTransactionHook({
+                onStart: async () => {
+                    if (fenced) return;
+                    fenced = true;
+                    await db.managedWorkspaceAuthority.update({
+                        where: { workspaceId },
+                        data: { epoch: 2 },
+                    });
+                },
+            });
+            const before = await managedRowSnapshot();
+            let response: Awaited<ReturnType<typeof bootstrap>>;
+            try {
+                response = await bootstrap(body);
+            } finally {
+                restore();
+            }
+            expect(fenced).toBe(true);
+            expect(response.statusCode).toBe(409);
+            expect(response.json().error).toBe('workspace-authority-mismatch');
+            // The fence itself changed the projection row, so the comparison is
+            // against the fenced state — everything else must be untouched.
+            const after = await managedRowSnapshot();
+            expect(after.machines).toEqual(before.machines);
+            expect(after.daemonGrants).toEqual(before.daemonGrants);
+        });
+
+        it('never mints a credential outliving what the signed request asked for', async () => {
+            await projectWorkspace();
+            // An idempotent retry can return a row renewed to a later expiry.
+            // Minting against that would let a replayed original request
+            // collect a credential longer than the one it signed for.
+            const body = bootstrapBody();
+            const first = await bootstrap(body);
+            expect(first.statusCode).toBe(200);
+            await db.managedDaemonGrant.update({
+                where: { daemonGrantId: body.daemonGrantId as string },
+                data: { expiresAt: BigInt((body.expiresAt as number) + 3_600_000) },
+            });
+            const replay = await bootstrap(body);
+            expect(replay.statusCode).toBe(200);
+            expect(replay.json().expiresAt).toBe(body.expiresAt);
         });
     });
 });

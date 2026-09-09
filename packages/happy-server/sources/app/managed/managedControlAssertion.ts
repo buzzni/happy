@@ -42,6 +42,12 @@ export type ControlOperation =
      * to look cannot be replayed to change anything.
      */
     | 'authority-snapshot'
+    /**
+     * Registers the managed Machine a runtime will run as and issues that
+     * runtime's own daemon credential. Its own operation: an assertion signed
+     * to mint a session grant must not also be able to create a machine.
+     */
+    | 'daemon-bootstrap'
     | 'grant-mint'
     | 'grant-renew'
     /**
@@ -54,6 +60,7 @@ export type ControlOperation =
 
 export const CONTROL_OPERATIONS: readonly ControlOperation[] = [
     'authority-sync', 'authority-snapshot',
+    'daemon-bootstrap',
     'grant-mint', 'grant-renew', 'grant-resolve', 'grant-revoke',
 ];
 

@@ -983,3 +983,59 @@ model ManagedSessionGrant {
     @@index([runId, attemptId])
     @@index([workspaceId, epoch])
 }
+
+/// The durable identity a managed Cloud daemon runs on.
+///
+/// A managed runtime has no human and no account of its own. The Machine it
+/// registers as belongs to a customer's account, but the daemon must never
+/// hold that account's bearer: it runs code the customer's agent can
+/// influence, and an account bearer reaches every session on that account.
+/// This row is what its own credential names.
+///
+/// Separate from key custody on purpose. This answers "is this daemon still
+/// allowed to act"; the Machine's wrapped key answers "what can it read".
+/// Revoking one does not silently invalidate the other, which is why both
+/// exist.
+model ManagedDaemonGrant {
+    daemonGrantId String @id
+    /// The account the Machine belongs to. Named by the credential, never
+    /// acted as.
+    accountId     String
+    machineId     String
+    runtimeId     String
+    provisioningOperationId String
+    workspaceId   String
+    projectId     String
+    /// The runtime generation this grant was issued for.
+    epoch         Int
+    /// Moved by a revocation. A credential from an older generation is refused
+    /// even while this row still exists, so a withdrawal takes effect without
+    /// waiting for a token to expire.
+    generation    Int    @default(0)
+    /// When the *grant* stops being usable. The credentials minted against it
+    /// carry their own, shorter, expiry.
+    expiresAt     BigInt
+    revokedAt     BigInt?
+    /// Reason code only — never provider text or request content.
+    revokedReason String?
+    /// The control-plane request that **created** this row, for exact-body
+    /// retry. Immutable: a renewal that overwrote it would make the original
+    /// issue retry miss its own row and collide on the unique index instead of
+    /// converging.
+    requestId     String
+    bodyDigest    String
+    /// The most recent renewal request, on its own axis so a renewal retry
+    /// converges the same way an issue retry does.
+    renewalRequestId String?
+    renewalBodyDigest String?
+    createdAt     BigInt
+    updatedAt     BigInt
+
+    /// One live grant per runtime generation: a re-issue supersedes in place
+    /// rather than leaving two credentials that both look current.
+    @@unique([runtimeId, provisioningOperationId])
+    @@unique([requestId])
+    @@unique([renewalRequestId])
+    @@index([accountId, machineId])
+    @@index([workspaceId, epoch])
+}

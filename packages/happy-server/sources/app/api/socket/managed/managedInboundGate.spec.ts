@@ -40,11 +40,19 @@ describe('rpc-call is refused outright', () => {
 
 describe('registration is by exact session and listed name', () => {
     it('accepts a listed name under the granted session', async () => {
-        for (const name of ['permission', 'abort', 'steer', 'bash', 'readFile']) {
+        for (const name of ['permission', 'abort', 'bash', 'readFile']) {
             expect(await inbound('rpc-register', { method: `${SID}:${name}` }), name)
                 .toEqual({ ok: true });
         }
         expect(await inbound('rpc-unregister', { method: `${SID}:permission` })).toEqual({ ok: true });
+    });
+
+    it('refuses steering, which no admission covers', async () => {
+        // Steering injects free text into the turn already running. Unlike
+        // `goal-action`, the name carries no sub-mode that could be allowed on
+        // its own, so it is off the list entirely.
+        expect(await inbound('rpc-register', { method: `${SID}:steer` }))
+            .not.toEqual({ ok: true });
     });
 
     it('refuses another session and a prefix that merely starts the same', async () => {

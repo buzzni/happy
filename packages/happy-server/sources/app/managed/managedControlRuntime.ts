@@ -14,6 +14,10 @@ import {
     type ControlAssertionVerifier,
 } from '@/app/managed/managedControlAssertion';
 import {
+    createManagedDaemonTokenIssuer,
+    type ManagedDaemonTokenIssuer,
+} from '@/app/auth/managedDaemonToken';
+import {
     createSessionScopedTokenIssuer,
     type SessionScopedTokenIssuer,
 } from '@/app/auth/sessionScopedToken';
@@ -28,6 +32,8 @@ export type ManagedControlEnv = {
 export type ManagedControlRuntime = {
     assertions: ControlAssertionVerifier;
     scopedTokens: SessionScopedTokenIssuer;
+    /** The daemon credential issuer. A different purpose, a different signature. */
+    daemonTokens: ManagedDaemonTokenIssuer;
     /**
      * The absolute origin managed relay URLs are built from. Taken from
      * configuration only: a URL derived from a request's own `Host` or
@@ -86,6 +92,7 @@ export async function createManagedControlRuntime(
     return {
         assertions,
         scopedTokens: await createSessionScopedTokenIssuer({ seed }),
+        daemonTokens: await createManagedDaemonTokenIssuer({ seed }),
         publicUrl: parsed.origin,
     };
 }
