@@ -178,7 +178,7 @@ export function assertProvisioningStat(
  * final component at all. The read is bounded by the stat'd size so a huge or
  * growing file cannot be pulled into memory.
  */
-function readProvisioningFile(
+export function readRootProtectedFile(
     path: string,
     gate: (stat: ProvisioningStat) => { reason: ManagedIdentityRefusal } | null,
 ): FileReadOutcome {
@@ -339,7 +339,7 @@ export function resolveManagedRuntimeIdentity(
     deps: ManagedProvisioningDeps = defaultDeps,
 ): ManagedIdentityResolution {
     const daemonUid = deps.getuid();
-    const file = readProvisioningFile(path, deps.statGate ?? assertProvisioningStat);
+    const file = readRootProtectedFile(path, deps.statGate ?? assertProvisioningStat);
     if (file.kind === 'absent') {
         // Absence is only interrogated where a managed runtime could actually
         // exist. Managed runtimes are Linux (the writer lock is a Linux
