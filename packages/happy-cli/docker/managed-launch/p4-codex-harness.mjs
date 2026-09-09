@@ -33,10 +33,10 @@ const session = await product.startManagedToolSession({
     },
     codexHome,
     /*
-     * **광고는 둘, scope 는 하나.** 승인은 서버 이름으로 통과하므로, 범위 강제가
-     * broker 에 있다는 것을 이 비대칭으로 확인한다.
+     * 기본은 경계 확인용 두 도구(광고는 둘, scope 는 하나)다. `P4_TOOLSET=coding`
+     * 이면 제품이 정의한 실제 코딩 도구 묶음을 광고한다.
      */
-    tools: [
+    tools: process.env.P4_TOOLSET === 'coding' ? product.MANAGED_CODING_TOOLS : [
         {
             name: 'read_file',
             description: 'Read a file from the managed workspace',
@@ -48,12 +48,17 @@ const session = await product.startManagedToolSession({
             inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
         },
     ],
-    scope: ['read_file'],
+    scope: process.env.P4_TOOLSET === 'coding'
+        ? product.MANAGED_CODING_TOOLS.map((tool) => tool.name)
+        : ['read_file'],
     ttlMs: 300_000,
     identity: { executor: { uid: 10602, gid: 10600 }, provider: { uid: 10601, gid: 10601 } },
     cgroupPath,
     helperPath: '/usr/local/lib/saycode/executor-helper',
-    workloadPath: '/usr/local/lib/saycode/tool-runner',
+    // 코딩 묶음은 제품 workload 가 처리한다. 그 밖에는 fixture 의 최소 runner.
+    workloadPath: process.env.P4_TOOLSET === 'coding'
+        ? '/usr/local/lib/saycode/tool-workload'
+        : '/usr/local/lib/saycode/tool-runner',
     toolTimeoutMs: 60_000,
     onUnprovenTermination: (info) => { unproven.push(info); },
 });

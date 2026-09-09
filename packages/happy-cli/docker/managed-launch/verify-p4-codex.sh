@@ -19,6 +19,9 @@ groupadd -g 10600 saycodetool 2>/dev/null
 useradd -u 10601 -M -s /bin/sh provideru 2>/dev/null
 useradd -u 10602 -M -g 10600 -s /bin/sh toolu 2>/dev/null
 mkdir -p /workspace/project && chmod 755 /workspace/project
+# 코딩 묶음은 executor 가 workspace 에 **쓴다**. production 에서도 workspace 는
+# executor uid 소유여야 한다(CODEX_HOME 과 같은 종류의 배포 계약).
+if [[ "${P4_TOOLSET:-}" == "coding" ]]; then chown 10602:10600 /workspace/project; fi
 echo "보고서 본문" > /workspace/project/보고서.md && chmod 644 /workspace/project/보고서.md
 mkdir -p /run/provider-home && chmod 777 /run/provider-home
 touch /run/provider-result.json /run/provider-stderr.log && chmod 666 /run/provider-result.json /run/provider-stderr.log
