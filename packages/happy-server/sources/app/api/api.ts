@@ -40,6 +40,7 @@ import { startScriptInvocationMaintenance } from "@/app/automation/scriptInvocat
 import { sessionFollowupRoutes } from "./routes/sessionFollowupRoutes";
 import { agentProfileRoutes } from "./routes/agentProfileRoutes";
 import { managedControlRoutes } from "./routes/managedControlRoutes";
+import { managedDaemonRenewRoutes } from '@/app/api/routes/managedDaemonRenewRoutes';
 import { createManagedControlRuntime, type ManagedControlRuntime } from "@/app/managed/managedControlRuntime";
 import {
     activateManagedStorage,
@@ -160,6 +161,10 @@ export async function startApi(opts: StartApiOptions = {}) {
 
     // Routes
     managedControlRoutes(typed, () => managedControl);
+    // The credential-recovery half of the same control plane: it extends or
+    // re-reads a daemon grant that already exists and never touches machine key
+    // material, so it is signed for under its own operations.
+    managedDaemonRenewRoutes(typed, () => managedControl);
     authRoutes(typed);
     pushRoutes(typed);
     sessionRoutes(typed);

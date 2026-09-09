@@ -218,6 +218,17 @@ describe('the read operations are their own', () => {
             ['grant-resolve', 'grant-mint'],
             ['grant-mint', 'grant-resolve'],
             ['authority-sync', 'authority-snapshot'],
+            // The daemon grant is a different authority from the session
+            // grant: one is a runtime's identity, the other a child's licence
+            // to act inside a conversation. Sharing an operation between them
+            // would let an assertion signed to keep a session alive keep a
+            // machine's identity alive too.
+            ['grant-renew', 'daemon-renew'],
+            ['daemon-renew', 'grant-renew'],
+            ['grant-resolve', 'daemon-resolve'],
+            ['daemon-resolve', 'grant-resolve'],
+            ['daemon-bootstrap', 'daemon-renew'],
+            ['daemon-resolve', 'daemon-renew'],
         ] as const) {
             expect(check(assertion({ op: signedOp }), { operation: usedOp }))
                 .toEqual({ ok: false, reason: 'wrong-operation' });

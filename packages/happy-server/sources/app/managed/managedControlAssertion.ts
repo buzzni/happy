@@ -48,6 +48,22 @@ export type ControlOperation =
      * to mint a session grant must not also be able to create a machine.
      */
     | 'daemon-bootstrap'
+    /**
+     * Extends the life of a daemon grant that already exists, in place.
+     *
+     * Separate from `grant-renew`, which is the session grant's. They name
+     * different authorities: a session credential lets a child act inside one
+     * conversation, while this one is the identity a whole runtime runs as. An
+     * assertion signed to keep a session alive must not also be able to keep a
+     * machine's identity alive, and the signature is what keeps the two apart.
+     */
+    | 'daemon-renew'
+    /**
+     * Reads a daemon grant and issues a token for it. Writes nothing, but it
+     * hands out a credential, so — like `grant-resolve` — it is its own
+     * operation rather than a read variant of the renewal.
+     */
+    | 'daemon-resolve'
     | 'grant-mint'
     | 'grant-renew'
     /**
@@ -60,7 +76,7 @@ export type ControlOperation =
 
 export const CONTROL_OPERATIONS: readonly ControlOperation[] = [
     'authority-sync', 'authority-snapshot',
-    'daemon-bootstrap',
+    'daemon-bootstrap', 'daemon-renew', 'daemon-resolve',
     'grant-mint', 'grant-renew', 'grant-resolve', 'grant-revoke',
 ];
 

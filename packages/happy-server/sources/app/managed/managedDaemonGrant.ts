@@ -35,6 +35,16 @@ type TransactionClient = {
     managedDaemonGrant: typeof db.managedDaemonGrant;
 };
 
+/**
+ * What the resolve path reads. The grant, the projection and the Machine are
+ * three tables and one decision, so a caller that mints against them reads
+ * them in a single snapshot.
+ */
+type SnapshotClient = TransactionClient & {
+    managedWorkspaceAuthority: typeof db.managedWorkspaceAuthority;
+    machine: typeof db.machine;
+};
+
 export type ManagedDaemonScope = {
     accountId: string;
     machineId: string;
@@ -227,12 +237,23 @@ export async function renewManagedDaemonGrant(input: {
     expiresAt: number;
     requestId: string;
     now: number;
+    /**
+     * An outer transaction to join.
+     *
+     * A caller that has already compared the projection, the Machine's owner
+     * and the row's scope needs those comparisons and this write to be one
+     * decision. Read in a transaction of their own, they are a snapshot that a
+     * promotion or an ownership change can invalidate before the renewal
+     * lands — and a renewal that extends a credential for a generation that
+     * has since been fenced keeps alive exactly what the fence cut off.
+     */
+    tx?: TransactionClient;
 }): Promise<RenewResult> {
     const digest = createHash('sha256').update(JSON.stringify([
         input.daemonGrantId, input.expectedGeneration, input.expiresAt,
     ])).digest('hex');
 
-    return inTx(async (tx) => {
+    const run = async (tx: TransactionClient): Promise<RenewResult> => {
         const existing = await tx.managedDaemonGrant.findUnique({
             where: { daemonGrantId: input.daemonGrantId },
         });
@@ -277,7 +298,8 @@ export async function renewManagedDaemonGrant(input: {
         });
         if (!reread) return { ok: false, reason: 'unknown-grant' as const };
         return { ok: true, grant: toRow(reread), idempotent: false };
-    });
+    };
+    return input.tx ? run(input.tx) : inTx(run);
 }
 
 export async function revokeManagedDaemonGrant(input: {
@@ -310,6 +332,16 @@ export async function resolveManagedDaemonGrant(input: {
     daemonGrantId: string;
     generation: number;
     /**
+     * A snapshot to read in.
+     *
+     * The row, the projection and the Machine are three reads, and this
+     * function hands out nothing but decides whether a credential may be.
+     * Callers that mint pass one to avoid combining different committed states.
+     * A snapshot does not authorize later use after a fence; consumers must
+     * continue checking the live grant and authority.
+     */
+    tx?: SnapshotClient;
+    /**
      * Everything the credential asserts, compared against the row.
      *
      * The row is the authority and the token only names it — so a token whose
@@ -319,7 +351,8 @@ export async function resolveManagedDaemonGrant(input: {
     claims: ManagedDaemonScope;
     now: number;
 }): Promise<ResolveResult> {
-    const existing = await db.managedDaemonGrant.findUnique({
+    const reader: SnapshotClient = input.tx ?? db;
+    const existing = await reader.managedDaemonGrant.findUnique({
         where: { daemonGrantId: input.daemonGrantId },
     });
     if (!existing) return { ok: false, reason: 'unknown-grant' };
@@ -346,7 +379,7 @@ export async function resolveManagedDaemonGrant(input: {
     // Read here rather than taken as an argument: the fencing axis is what the
     // control plane recorded, and a check satisfied by a number the caller
     // passed in is a check the caller performs on itself.
-    const authority = await db.managedWorkspaceAuthority.findUnique({
+    const authority = await reader.managedWorkspaceAuthority.findUnique({
         where: { workspaceId: row.workspaceId },
     });
     if (!authority) return { ok: false, reason: 'workspace-unknown' };
@@ -362,7 +395,7 @@ export async function resolveManagedDaemonGrant(input: {
     // The Machine really has to be the account's. Every id in the token can
     // line up with its own row while naming a machine that belongs to somebody
     // else, and that is the case this closes.
-    const machine = await db.machine.findUnique({ where: { id: row.machineId } });
+    const machine = await reader.machine.findUnique({ where: { id: row.machineId } });
     if (!machine || machine.accountId !== row.accountId) {
         return { ok: false, reason: 'machine-not-owned' };
     }
