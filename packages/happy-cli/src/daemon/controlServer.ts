@@ -34,6 +34,10 @@ import { attachTerminalWsRoute, type MachineEncryption as TerminalMachineEncrypt
  *
  * `/stop` is deliberately absent: shutting the daemon down would also kill the
  * lease watchdog, and that authority does not belong with report authority.
+ *
+ * On a managed runtime these paths do **not** take the daemon-wide bearer at
+ * all: the child never receives that secret, and requiring it would mean
+ * handing it over. The per-launch capability is the only credential here.
  */
 const MANAGED_REPORT_PATHS = new Set(['/session-started', '/session-runtime']);
 
@@ -177,6 +181,11 @@ export function startDaemonControlServer({
           });
           return;
         }
+        // 보고 경로는 여기서 통과시키고, 각 라우트가 per-launch capability 로
+        // 판정한다. daemon 전역 secret 을 요구하면 그 값을 child 에게 줘야 하고,
+        // 그러면 agent 의 도구가 읽어 다른 Run 의 세션을 위조할 수 있다.
+        // 통과가 곧 허용은 아니다 — verifier 가 없으면 라우트가 거부한다.
+        return;
       }
       if (request.headers.authorization !== `Bearer ${controlSecret}`) {
         await reply.code(401).send({ error: 'unauthorized' });
