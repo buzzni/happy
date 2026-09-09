@@ -49,6 +49,17 @@ async function lockRunWithToken(tx: ScriptQueueTransaction, id: string, token: s
   return run && run.claimHash === hash(token) ? { automation, run } : null;
 }
 
+/** Retain immutable snapshots while a run references them, then reclaim their encrypted artifacts. */
+export async function removeUnusedScriptRevisions(tx: ScriptQueueTransaction, automationId: string, currentRevision: number) {
+  const removed = await tx.query<{ artifactId: string }>(`DELETE FROM "ScriptAutomationRevision" r WHERE "automationId"=$1 AND revision<$2
+    AND NOT EXISTS (SELECT 1 FROM "ScriptInvocation" i WHERE i."automationId"=r."automationId" AND i.revision=r.revision)
+    RETURNING "artifactId"`, [automationId, currentRevision]);
+  for (const artifactId of new Set(removed.map((row) => row.artifactId))) {
+    await tx.query(`DELETE FROM "ScriptArtifact" a WHERE id=$1
+      AND NOT EXISTS (SELECT 1 FROM "ScriptAutomationRevision" r WHERE r."artifactId"=a.id)`, [artifactId]);
+  }
+}
+
 export function createScriptInvocationService(database: ScriptQueueDatabase) {
   async function mutateClaim(id: string, token: string, now: number, status: 'CLAIMED' | 'RUNNING', action: (tx: ScriptQueueTransaction, run: ScriptInvocation) => Promise<void>) {
     const valid = await database.transaction(async (tx) => {
@@ -104,8 +115,7 @@ export function createScriptInvocationService(database: ScriptQueueDatabase) {
           AND status NOT IN ('QUEUED','CLAIMED','RUNNING') AND "completedAt"<=$2::double precision-86400000 AND "inputCiphertext"<>''`, [automationId, now]);
         await tx.query(`DELETE FROM "ScriptInvocation" WHERE "automationId"=$1
           AND status NOT IN ('QUEUED','CLAIMED','RUNNING') AND "completedAt"<=$2::double precision-2592000000`, [automationId, now]);
-        await tx.query(`DELETE FROM "ScriptAutomationRevision" r WHERE "automationId"=$1 AND revision<$2
-          AND NOT EXISTS (SELECT 1 FROM "ScriptInvocation" i WHERE i."automationId"=r."automationId" AND i.revision=r.revision)`, [automationId, automation.revision]);
+        await removeUnusedScriptRevisions(tx, automationId, automation.revision);
       });
     },
     async enqueue(input: ScriptEnqueueInput, now: number): Promise<ScriptInvocation> {

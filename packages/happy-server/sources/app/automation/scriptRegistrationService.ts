@@ -5,7 +5,7 @@ import type { Automation, Prisma } from '@prisma/client';
 import { SCRIPT_AUTOMATION_PROTOCOL_VERSION, scriptAdmissionSchema, scriptRegistrationRequestSchema, type ScriptRegistrationRequest } from '@slopus/happy-wire';
 import { getAutomationTarget, projectAccess } from './automationService';
 import { createScriptArtifactService } from './scriptArtifactService';
-import type { ScriptQueueDatabase } from './scriptInvocationService';
+import { removeUnusedScriptRevisions, type ScriptQueueDatabase, type ScriptQueueTransaction } from './scriptInvocationService';
 import { compileScriptInputSchema } from './scriptExecutionService';
 
 /** Caller supplies the enclosing transaction: artifact/config/revision commit together. */
@@ -35,9 +35,10 @@ export async function saveScriptAutomation(tx: Prisma.TransactionClient, actorId
     if (input.expectedRevision !== current.revision) throw new Error('REVISION_CONFLICT');
   } else if (input.expectedRevision !== 0) throw new Error('REVISION_CONFLICT');
 
-  const database: ScriptQueueDatabase = { transaction: (action) => action({
+  const queueTransaction: ScriptQueueTransaction = {
     query: <T>(sql: string, values: unknown[] = []) => tx.$queryRawUnsafe<T[]>(sql, ...values),
-  }) };
+  };
+  const database: ScriptQueueDatabase = { transaction: (action) => action(queueTransaction) };
   const artifacts = createScriptArtifactService(database);
   if (input.artifact) await artifacts.put({ id: input.admission.artifactId, projectId, digest: input.admission.digest, encrypted: input.artifact });
   const artifact = await artifacts.get(projectId, input.admission.artifactId);
@@ -70,6 +71,7 @@ export async function saveScriptAutomation(tx: Prisma.TransactionClient, actorId
   if (row.paused || targetChanged) await tx.scriptInvocation.updateMany({
     where: { automationId: row.id, status: { in: ['QUEUED', 'CLAIMED'] } }, data: { status: 'CANCELLED', completedAt: Date.now() },
   });
+  await removeUnusedScriptRevisions(queueTransaction, row.id, row.revision);
   // Script v3 has its own machine poll contract; publishing it into the legacy
   // change stream would make older daemons reject their whole sync batch.
   return row;

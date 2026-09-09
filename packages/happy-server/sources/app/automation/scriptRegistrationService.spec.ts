@@ -54,6 +54,17 @@ it('atomically registers an encrypted artifact and automation with idempotent re
   expect(await client.scriptAutomationRevision.count({ where: { ready: false } })).toBe(1);
   expect(await client.automationChange.count()).toBe(0);
 });
+it('removes an unused previous revision and its artifact after a successful edit', async () => {
+  await client.$transaction((tx) => saveScriptAutomation(tx, 'owner', 'p1', registration));
+  const artifactId = 'code-2';
+  const changed = { ...registration, expectedRevision: 1,
+    admission: { ...registration.admission, artifactId, digest: 'b'.repeat(64) },
+    artifact: encryptScriptValue({ value: { source: 'changed' }, context: { ...context, resourceId: artifactId, purpose: 'artifact' }, viewerPublicKey: pair.publicKey, machinePublicKey: pair.publicKey }) };
+  await client.$transaction((tx) => saveScriptAutomation(tx, 'owner', 'p1', changed));
+  expect(await client.scriptAutomationRevision.findMany({ select: { revision: true, artifactId: true } }))
+    .toEqual([{ revision: 2, artifactId }]);
+  expect(await client.scriptArtifact.findMany({ select: { id: true } })).toEqual([{ id: artifactId }]);
+});
 it('requires the current machine and verified revision before manual admission, validates input and seals it for that run', async () => {
   const config = { ...registration, admission: { ...registration.admission, inputSchema: { type: 'object', properties: { count: { type: 'integer' } }, required: ['count'], additionalProperties: false } } };
   const row = await client.$transaction((tx) => saveScriptAutomation(tx, 'owner', 'p1', config));
@@ -104,6 +115,8 @@ it('rejects unsupported input schemas and schedules whose empty input cannot val
 });
 it('adds a code revision without invalidating accepted snapshots and rejects stale editors', async () => {
   const first = await client.$transaction((tx) => saveScriptAutomation(tx, 'owner', 'p1', registration));
+  await client.$transaction((tx) => markScriptReady(tx, 'owner', 'machine', first.id, 1, 1000));
+  await client.$transaction((tx) => enqueueScriptInput(tx, 'owner', 'p1', first.id, { input: {} }, 'retained-revision', 1001));
   const changed = { ...registration, expectedRevision: 1, encrypted: encryptScriptValue({ value: { changed: true }, context, viewerPublicKey: pair.publicKey, machinePublicKey: pair.publicKey }) };
   const second = await client.$transaction((tx) => saveScriptAutomation(tx, 'owner', 'p1', changed));
   expect(second.revision).toBe(2);
