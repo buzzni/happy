@@ -98,7 +98,11 @@ const SESSIONLESS_EVENTS: readonly string[] = ['ping', 'rpc-register', 'rpc-unre
 const ALLOWED_RPC_NAMES: readonly string[] = [
     'permission',
     'abort',
-    'steer',
+    // `steer` is deliberately absent. It injects free text into the turn that
+    // is already running, which is an instruction the run's admission never
+    // covered, and the name carries no sub-mode that could be allowed on its
+    // own — unlike `goal-action`, where clearing removes an instruction and
+    // only setting one is refused, by the child that can read the parameters.
     'goal-action',
     'killSession',
     'mcp-reconnect',

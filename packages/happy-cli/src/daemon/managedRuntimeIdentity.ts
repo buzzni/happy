@@ -47,6 +47,19 @@ const MAX_PROVISIONING_BYTES = 16 * 1024;
  * terminating that process both require a privileged launcher, so the backend
  * is that launcher — a declared cgroup root is not a substitute for it.
  */
+/**
+ * The project root of a managed Cloud runtime, as a literal.
+ *
+ * Not a template and not a setting: the parent, this daemon and the launcher
+ * all name the same path, and the launcher's real working directory has to be
+ * this one. A caller's `Project.path`, a `workspaceDir`, or a `cloud://…` in
+ * bootstrap metadata is never reinterpreted as a filesystem path. The parent
+ * repository holds the same literal in its own protocol module and the wire
+ * check compares them, so neither side depends on a shared package for one
+ * constant.
+ */
+export const MANAGED_PROJECT_ROOT = '/workspace/project';
+
 export const MANAGED_ISOLATION_BACKENDS = ['privileged-launch-supervisor'] as const;
 export type ManagedIsolationBackend = (typeof MANAGED_ISOLATION_BACKENDS)[number];
 

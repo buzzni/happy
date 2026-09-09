@@ -467,6 +467,11 @@ export class ApiSessionClient extends EventEmitter {
      */
     private readonly managed: ManagedCredentialMode | null;
 
+    /** The origin this client is allowed to talk to, when it is a managed one. */
+    getManagedOrigin(): string | null {
+        return this.managed?.serverOrigin ?? null;
+    }
+
     constructor(token: string, session: Session, managed?: ManagedCredentialMode) {
         super()
         this.token = token;

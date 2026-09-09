@@ -26,6 +26,7 @@ import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPr
 import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
 import type { CheckpointSessionComposition, CheckpointTurnPreparation } from '@/checkpoint/checkpointSessionComposition';
 import { CheckpointWriterProcessTree } from '@/checkpoint/checkpointWriterProcessTree';
+import { managedSettingSources } from '@/managed/managedStartup';
 
 export type ClaudeActiveInputSender = (text: string) => boolean;
 
@@ -36,6 +37,7 @@ export async function claudeRemote(opts: {
     path: string,
     mcpServers?: Record<string, any>,
     claudeEnvVars?: Record<string, string>,
+    managedSettingsLockdown?: boolean,
     claudeArgs?: string[],
     allowedTools: string[],
     signal?: AbortSignal,
@@ -171,6 +173,13 @@ export async function claudeRemote(opts: {
     // same way Saycode's own orchestration does) don't leak into managed
     // sessions. No-op when unset, so existing sessions are unchanged.
     const skillGovernance = buildSkillGovernanceOptions(readSkillGovernanceConfigFromEnv(process.env));
+    // A managed run loads no filesystem settings at all. A settings file's
+    // `env` block is applied to the agent and takes precedence over the
+    // environment this startup produced, so a `~/.claude/settings.json` left on
+    // the runtime image could point the agent at a different gateway or a
+    // different key after the approval was made. The empty list is explicit —
+    // the SDK's default is to load every source Claude Code would.
+    const settingSources = managedSettingSources(opts.managedSettingsLockdown, skillGovernance.settingSources);
     const mergedMcpServers = {
         ...opts.mcpServers,
         ...(opts.orchestratorMode ? opts.orchestratorMcpServers : {}),
@@ -209,7 +218,7 @@ export async function claudeRemote(opts: {
         disallowedTools: initial.mode.disallowedTools,
         effort: initial.mode.effort,
         agents: workerAgents.agents,
-        settingSources: skillGovernance.settingSources,
+        settingSources,
         skills: skillGovernance.skills,
         canCallTool: (toolName: string, input: unknown, options: { signal: AbortSignal; toolUseID: string }) => opts.canCallTool(toolName, input, mode, options),
         abort: opts.signal,

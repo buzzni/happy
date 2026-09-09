@@ -152,9 +152,17 @@ describe('RPC names', () => {
     }
 
     it('allows the session lifecycle handlers Claude and Codex register', () => {
-        for (const name of ['permission', 'abort', 'steer', 'goal-action', 'killSession', 'mcp-reconnect']) {
+        for (const name of ['permission', 'abort', 'goal-action', 'killSession', 'mcp-reconnect']) {
             expect(rpc(`${SID}:${name}`), name).toEqual(allow);
         }
+    });
+
+    it('refuses steering, which is an instruction no admission covered', () => {
+        // Steering injects free text into the turn already running. Unlike
+        // `goal-action`, where clearing removes an instruction and only setting
+        // one is refused by the child that can read the parameters, the name
+        // carries no sub-mode that could be allowed on its own.
+        expect(rpc(`${SID}:steer`)).not.toEqual(allow);
     });
 
     it('allows the common file and shell handlers a session registers', () => {

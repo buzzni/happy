@@ -128,7 +128,7 @@ afterEach(() => {
 async function runOffline(env: Record<string, string>) {
     Object.assign(process.env, env);
     const { runClaude } = await import('./runClaude');
-    return runClaude(CREDENTIALS, {});
+    return runClaude({ kind: 'account', credentials: CREDENTIALS }, {});
 }
 
 describe('runClaude offline start with required confirmed delivery', () => {
