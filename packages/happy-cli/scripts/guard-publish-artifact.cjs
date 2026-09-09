@@ -21,6 +21,8 @@ const EXPECTED_BUNDLED_FILES = [
     'package/node_modules/@slopus/happy-wire/package.json',
     'package/node_modules/@slopus/happy-wire/dist/index.mjs',
     'package/node_modules/zod/package.json',
+    'package/node_modules/tweetnacl/package.json',
+    'package/node_modules/tweetnacl/nacl-fast.js',
     'package/node_modules/@paralleldrive/cuid2/package.json',
     'package/node_modules/@paralleldrive/cuid2/node_modules/@noble/hashes/package.json'
 ];
@@ -30,6 +32,8 @@ const EXPECTED_INSTALLED_FILES = [
     'node_modules/@slopus/happy-wire/package.json',
     'node_modules/@slopus/happy-wire/dist/index.mjs',
     'node_modules/zod/package.json',
+    'node_modules/tweetnacl/package.json',
+    'node_modules/tweetnacl/nacl-fast.js',
     'node_modules/@paralleldrive/cuid2/package.json',
     'node_modules/@paralleldrive/cuid2/node_modules/@noble/hashes/package.json'
 ];

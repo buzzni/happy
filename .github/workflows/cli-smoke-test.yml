@@ -265,4 +265,23 @@ jobs:
 
         echo Smoke test passed on Windows!
 
-# We don't need a smoke test for macOS because most contributors are developing on macOS.
+  smoke-test-macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build CLI
+        run: pnpm --filter @buzzni/happy-cli build
+      - name: Verify host sandbox test is eligible
+        run: |
+          test "$(uname -s)" = Darwin
+          test -z "${CODEX_SANDBOX:-}"
+      - name: Run unit tests including real Git sandbox enforcement
+        run: pnpm --filter @buzzni/happy-cli exec vitest run --project unit

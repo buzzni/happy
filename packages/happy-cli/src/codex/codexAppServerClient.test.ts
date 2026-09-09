@@ -2927,6 +2927,124 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    // desktop-stuck-responding-state: a mid-turn agentMessage can legitimately
+    // carry phase 'final_answer' (Codex asking a clarifying question), which
+    // schedules our idle-fallback task_complete. When Codex then resumes the
+    // SAME provider turn — no fresh turn/started, since it never asked for a
+    // new turn — the authoritative turn/completed that eventually arrives for
+    // that turnId must not be dropped as a duplicate of the premature one, or
+    // the session never gets a real terminal marker again.
+    it('does not drop the authoritative completion when work resumes after a premature final_answer fallback', async () => {
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        const proc = createMockProcess({
+            pid: 3010,
+            onRequest: (msg, stdout) => {
+                appServerStdout = stdout;
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { thread: { id: 'thread-resume', path: '/tmp/thread-resume' } },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { turn: { id: 'turn-resume-1', items: [], status: 'inProgress', error: null } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: { threadId: 'thread-resume', turn: { id: 'turn-resume-1' } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'item/completed',
+                            params: {
+                                threadId: 'thread-resume',
+                                turnId: 'turn-resume-1',
+                                item: { type: 'agentMessage', id: 'msg-mid-turn', text: 'clarifying question', phase: 'final_answer' },
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((msg) => events.push(msg as Record<string, unknown>));
+
+        await client.connect();
+        await client.startThread({ model: 'gpt-test', cwd: '/tmp/project', approvalPolicy: 'never', sandbox: 'danger-full-access' });
+
+        // The premature fallback resolves sendTurnAndWait ~250ms after the
+        // final_answer-phase message, with no open command to defer behind.
+        await expect(client.sendTurnAndWait('initial request')).resolves.toEqual({ aborted: false });
+        expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(1);
+
+        // Codex keeps working on the SAME provider turn: no turn/started
+        // precedes this activity, matching the production log
+        // (~/.happy_remote/logs — exec_command_begin ~23s after task_complete
+        // with no intervening task_started).
+        if (!appServerStdout) throw new Error('app-server stdout unavailable');
+        pushJsonLine(appServerStdout, {
+            method: 'item/started',
+            params: {
+                threadId: 'thread-resume',
+                turnId: 'turn-resume-1',
+                item: { type: 'commandExecution', id: 'call-resume', command: 'cat file', cwd: '/tmp', status: 'inProgress' },
+            },
+        });
+        pushJsonLine(appServerStdout, {
+            method: 'item/completed',
+            params: {
+                threadId: 'thread-resume',
+                turnId: 'turn-resume-1',
+                item: {
+                    type: 'commandExecution', id: 'call-resume', command: 'cat file', cwd: '/tmp',
+                    aggregatedOutput: 'contents', exitCode: 0, durationMs: 1, status: 'completed',
+                },
+            },
+        });
+        pushJsonLine(appServerStdout, {
+            method: 'item/completed',
+            params: {
+                threadId: 'thread-resume',
+                turnId: 'turn-resume-1',
+                item: { type: 'agentMessage', id: 'msg-real-final', text: 'the real final answer', phase: 'final_answer' },
+            },
+        });
+        pushJsonLine(appServerStdout, {
+            method: 'turn/completed',
+            params: { threadId: 'thread-resume', turn: { id: 'turn-resume-1', status: 'completed', error: null } },
+        });
+
+        await waitFor(() => events.filter((event) => event.type === 'task_complete').length >= 2);
+        expect(events.filter((event) => event.type === 'exec_command_end')).toHaveLength(1);
+        expect(events.filter((event) => event.type === 'agent_message' && event.message === 'the real final answer')).toHaveLength(1);
+
+        let mapperState = {
+            currentTurnId: null as string | null,
+            currentProviderTurnId: null as string | null,
+        };
+        const lifecycleTypes = events.flatMap((event) => {
+            const mapped = mapCodexMcpMessageToSessionEnvelopes(event, mapperState);
+            mapperState = mapped;
+            return mapped.envelopes.map((envelope) => envelope.ev.t);
+        }).filter((type) => type === 'turn-start' || type === 'turn-end');
+        expect(lifecycleTypes).toEqual([
+            'turn-start',
+            'turn-end',
+            'turn-start',
+            'turn-end',
+        ]);
+
+        await client.disconnect();
+    });
+
     it('defers terminal completion until a command started by the turn completes', async () => {
         let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
         const proc = createMockProcess({

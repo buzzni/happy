@@ -142,18 +142,25 @@ describe('runAutonomousQualityGatePhase', () => {
                 timeoutMs: 5_000,
                 readinessUrl: `http://127.0.0.1:${port}/`,
             }, { cwd: process.cwd(), killGraceMs: 50 });
-            childPid = Number(result.stdoutTail);
-
             expect(result).toMatchObject({ status: 'passed', exitCode: 0, timedOut: false });
-            expect(Number.isInteger(childPid)).toBe(true);
-            // A SIGKILL request does not synchronously guarantee that
-            // kill(pid, 0) reports absence. Wait boundedly for observable
-            // disappearance; a SIGTERM-ignoring survivor must still fail.
-            await vi.waitFor(() => {
-                expect(() => process.kill(childPid!, 0)).toThrow();
-            }, { timeout: 1_000, interval: 10 });
+            // A positive safe integer, not merely "an integer": `Number('')` is
+            // 0, which would pass the weaker check and then make the cleanup
+            // below signal this process group.
+            const printed = result.stdoutTail.trim();
+            expect(printed).toMatch(/^[0-9]+$/);
+            const parsed = Number(printed);
+            expect(Number.isSafeInteger(parsed) && parsed > 0).toBe(true);
+            childPid = parsed;
+            // The port, not the pid. A killed descendant can sit in Z until
+            // its parent is reaped, and `kill(pid, 0)` still succeeds for a
+            // zombie — so absence of the process is not observable on a
+            // schedule this test can rely on. A closed listener is: it is the
+            // effect that matters here, and a survivor of the group kill keeps
+            // answering.
+            await expect(fetch(`http://127.0.0.1:${port}/`)).rejects.toThrow();
         } finally {
-            if (childPid) {
+            // Only the pid this test created, and never 0 or a group.
+            if (childPid !== undefined && Number.isSafeInteger(childPid) && childPid > 0) {
                 try { process.kill(childPid, 'SIGKILL'); } catch { /* already exited */ }
             }
         }

@@ -2,7 +2,12 @@ import fs from 'fs/promises';
 import os from 'os';
 import * as tmp from 'tmp';
 import axios from 'axios';
-import { AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
+import * as z from 'zod';
+import { AUTOMATION_PROTOCOL_VERSION, SCRIPT_AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
+import { createHash } from 'node:crypto';
+import { createScriptAutomationWorker, ScriptRequestError } from './automations/scriptAutomationWorker';
+import { prepareManagedScriptRuntime, recoverManagedScriptContainers } from './automations/managedScriptRuntime';
+import { runManagedScript } from './automations/managedScriptRunner';
 
 import { ApiClient } from '@/api/api';
 import { TrackedSession, SessionEncryptionData } from './types';
@@ -249,6 +254,27 @@ export const initialMachineMetadata: MachineMetadata = {
   additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
 };
 
+/**
+ * Whether this daemon runs script automations.
+ *
+ * Managed runtimes do not. The script worker prepares and recovers its own
+ * Docker containers and ticks on its own schedule, none of which goes through
+ * `spawnSession` — so the lease, epoch and budget checks that admit a managed
+ * run never see that work. The decision gates the whole initialisation rather
+ * than the tick, which is what keeps `prepare` and `recover` from running and
+ * leaves the automation protocol advertised at its legacy version.
+ *
+ * BYOS is unchanged: without the managed marker this is the same feature flag
+ * it has always been.
+ */
+export function shouldRunScriptAutomations(input: {
+    managedRuntimeActive: boolean;
+    enabled: string | undefined;
+}): boolean {
+    if (input.managedRuntimeActive) return false;
+    return input.enabled === '1';
+}
+
 export async function startDaemon(): Promise<void> {
   // The daemon can be auto-(re)started by any happy CLI child — including a
   // resumed/forked session that carries HAPPY_RECONNECT_*/HAPPY_FORK* in its
@@ -375,6 +401,7 @@ export async function startDaemon(): Promise<void> {
 
   let stopLogHousekeeping: () => void = () => undefined;
   let stopClaudeSwapSupervisor: () => void = () => undefined;
+  let stopScriptWorker: () => Promise<void> = async () => undefined;
   try {
     // Start caffeinate
     const caffeinateStarted = startCaffeinate();
@@ -2642,13 +2669,73 @@ export async function startDaemon(): Promise<void> {
     const aiCredentialRuntime = createNodeAiCredentialRuntime(claudeSwapSupervisor);
     resolveManagedAiCredentialEnvironment = (agent) => aiCredentialRuntime.sessionEnvironment(agent);
     let activeServerAutomationLeaseCount = 0;
+    let scriptWorker: ReturnType<typeof createScriptAutomationWorker> | null = null;
+    if (shouldRunScriptAutomations({
+        managedRuntimeActive: managedIdentity.status === 'active',
+        enabled: process.env.HAPPY_SCRIPT_AUTOMATIONS_ENABLED,
+    })) {
+      try {
+        const image = process.env.HAPPY_SCRIPT_RUNTIME_IMAGE;
+        if (!image) throw new Error('SCRIPT_RUNTIME_IMAGE_REQUIRED');
+        const studioConfigUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL;
+        if (!studioConfigUrl) throw new Error('SCRIPT_STUDIO_AUTHORIZATION_REQUIRED');
+        const studioUrl = new URL(studioConfigUrl);
+        if (studioUrl.protocol !== 'https:' && !(studioUrl.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(studioUrl.hostname))) throw new Error('SCRIPT_STUDIO_HTTPS_REQUIRED');
+        const request = async (method: string, path: string, body?: unknown, baseUrl = configuration.serverUrl): Promise<unknown> => {
+          try {
+            const response = await axios.request({ method, url: new URL(path, baseUrl).href,
+              headers: { Authorization: `Bearer ${credentials.token}` }, data: body, timeout: 10000,
+              maxContentLength: 16 * 1024 * 1024, maxBodyLength: 12 * 1024 * 1024, proxy: false });
+            return response.data;
+          } catch (error) {
+            if (axios.isAxiosError(error) && error.response) {
+              const code = error.response.data?.error;
+              throw new ScriptRequestError(error.response.status, typeof code === 'string' && /^[A-Z0-9_]{1,100}$/.test(code) ? code : 'SCRIPT_REQUEST_FAILED');
+            }
+            throw error;
+          }
+        };
+        const profile = await request('GET', '/v1/account/profile') as { id?: unknown };
+        if (typeof profile.id !== 'string' || !profile.id) throw new Error('SCRIPT_ACCOUNT_UNAVAILABLE');
+        const ownerId = createHash('sha256').update(JSON.stringify([configuration.serverUrl, profile.id, machineId])).digest('hex');
+        const directory = join(configuration.happyHomeDir, 'script-automations', ownerId);
+        const temporaryRoot = join(directory, 'work');
+        await prepareManagedScriptRuntime({ ownerId, directory: temporaryRoot, image });
+        await request('GET', `/v1/machines/${encodeURIComponent(machineId)}/script-automations`);
+        const authorize = async (runId: string, claimToken: string, secretRefs?: { [name: string]: string }) => {
+          const response = await request('POST', '/api/automation/script-execution', { machineId, runId, claimToken,
+            ...(secretRefs ? { secretRefs } : {}) }, studioUrl.origin);
+          return z.object({ executionProof: z.string().min(1), secrets: z.record(z.string(), z.string()),
+            approvedPrivateOrigins: z.array(z.string()) }).parse(response);
+        };
+        const worker = createScriptAutomationWorker({ machineId, accountId: profile.id,
+          machineSecretKey: machineAutomationKey.secretKey, image, directory: join(directory, 'outbox'), request,
+          recoverContainers: () => recoverManagedScriptContainers({ ownerId, directory: temporaryRoot }),
+          execute: (input) => runManagedScript({ ...input, ownerId, temporaryRoot }),
+          authorizeStart: async (_record, runId, token) => (await authorize(runId, token)).executionProof,
+          resolveSecrets: async (_record, refs, runId, token) => {
+            const { secrets, approvedPrivateOrigins } = await authorize(runId, token, refs);
+            return { secrets, approvedPrivateOrigins };
+          },
+          log: (message) => logger.debug(`[script-automations] ${message}`) });
+        await worker.recover();
+        scriptWorker = worker;
+        stopScriptWorker = () => worker.stop();
+      } catch (error) {
+        logger.debug(`[script-automations] Script runtime unavailable; capability remains disabled: ${error instanceof Error ? error.message : 'unknown error'}`);
+      }
+    }
+    const scriptAutomationTickRunner = createAutomationTickRunner({
+      runTick: async () => { await scriptWorker?.tick(); },
+      logDebug: (message) => logger.debug(`[script-automations] ${message}`),
+    });
     apiMachine.setAutomationKey(machineAutomationKey, (keyVersion) => {
       machineAutomationKey = updateMachineAutomationKeyRegistration(
         configuration.automationKeyFile,
         machineAutomationKey,
         keyVersion,
       );
-    });
+    }, scriptWorker ? SCRIPT_AUTOMATION_PROTOCOL_VERSION : AUTOMATION_PROTOCOL_VERSION);
     apiMachine.setServerAutomationCache(serverAutomationCache);
     const serverAutomationTickRunner = createAutomationTickRunner({
       runTick: () => runServerAutomationTick({
@@ -2894,6 +2981,7 @@ export async function startDaemon(): Promise<void> {
         + getDaemonTerminalSessionCount(),
       activeAutomationCount: Number(automationTickRunner.isRunning())
         + Number(serverAutomationTickRunner.isRunning())
+        + Number(scriptAutomationTickRunner.isRunning())
         + Number(sessionFollowupTickRunner.isRunning())
         + activeServerAutomationLeaseCount,
     });
@@ -3012,6 +3100,7 @@ export async function startDaemon(): Promise<void> {
         bundleReplaced,
         legacyAutomationRunning: automationTickRunner.isRunning(),
         serverAutomationRunning: serverAutomationTickRunner.isRunning()
+          || scriptAutomationTickRunner.isRunning()
           || sessionFollowupTickRunner.isRunning(),
         serverAutomationLeaseRunning: activeServerAutomationLeaseCount > 0,
         activeSessionCount: getRuntimeActivity().activeSessionCount,
@@ -3025,12 +3114,14 @@ export async function startDaemon(): Promise<void> {
         // 스킵된 due는 claim이 실행 직전에만 반영되므로 다음 tick이 집어간다.
         if (apiMachine.shouldRunLegacyAutomationScheduler()) automationTickRunner.trigger();
         serverAutomationTickRunner.trigger();
+        scriptAutomationTickRunner.trigger();
         sessionFollowupTickRunner.trigger();
       } else {
         // Pause first so no later trigger can enter between the idle check and
         // teardown. A tick already in flight is allowed to finish normally.
         automationTickRunner.pause();
         serverAutomationTickRunner.pause();
+        scriptAutomationTickRunner.pause();
         sessionFollowupTickRunner.pause();
       }
 
@@ -3107,6 +3198,7 @@ export async function startDaemon(): Promise<void> {
             serverRunner: serverAutomationTickRunner,
           });
           sessionFollowupTickRunner.resume();
+          scriptAutomationTickRunner.resume();
         }
       }
 
@@ -3157,6 +3249,8 @@ export async function startDaemon(): Promise<void> {
       }
       stopLogHousekeeping();
       claudeSwapSupervisor.shutdown();
+      scriptAutomationTickRunner.pause();
+      await stopScriptWorker();
 
       // Update daemon state before shutting down
       await apiMachine.updateDaemonState((state: DaemonState | null) => ({
@@ -3199,6 +3293,7 @@ export async function startDaemon(): Promise<void> {
   } catch (error) {
     stopLogHousekeeping();
     stopClaudeSwapSupervisor();
+    await stopScriptWorker().catch((shutdownError) => logger.debug('[script-automations] Shutdown report remains in outbox', shutdownError));
     logger.debug('[DAEMON RUN][FATAL] Failed somewhere unexpectedly - exiting with code 1', error);
     process.exit(1);
   }

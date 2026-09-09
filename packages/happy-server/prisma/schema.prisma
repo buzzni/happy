@@ -457,6 +457,7 @@ model UserKVStore {
 //
 
 model Project {
+    scriptArtifacts ScriptArtifact[]
     id                   String              @id @default(cuid())
     accountId            String
     account              Account             @relation(fields: [accountId], references: [id])
@@ -551,6 +552,7 @@ model Automation {
     revision           Int       @default(1)
     generation         Int       @default(1)
     payloadVersion     Int       @default(1)
+    scriptRegistrationKey String?
     payloadCiphertext  Bytes
     viewerKeyId        String
     viewerKeyVersion   Int
@@ -570,8 +572,12 @@ model Automation {
     createdAt          DateTime  @default(now())
     updatedAt          DateTime  @updatedAt
     runs               AutomationRun[]
+    scriptRevisions    ScriptAutomationRevision[]
+    scriptKeys         ScriptAutomationKeyEpoch[]
+    scriptInvocations  ScriptInvocation[]
 
     @@unique([legacyMachineId, legacyAutomationId])
+    @@unique([projectId, scriptRegistrationKey])
     @@index([projectId, deletedAt])
     @@index([ownerAccountId])
     @@index([machineAccountId, machineId, deletedAt])
@@ -627,6 +633,77 @@ model AutomationRun {
     @@unique([automationId, generation, scheduledFor])
     @@index([automationId, status])
     @@index([machineAccountId, machineId, status])
+}
+
+model ScriptArtifact {
+    id        String @id
+    projectId String
+    project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+    digest    String
+    encrypted Json
+    revisions ScriptAutomationRevision[]
+}
+
+model ScriptAutomationRevision {
+    automationId      String
+    automation        Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+    revision          Int
+    artifactId        String
+    artifact          ScriptArtifact @relation(fields: [artifactId], references: [id], onDelete: NoAction)
+    digest            String
+    payloadCiphertext String
+    admission         Json
+    ready             Boolean @default(false)
+    validationFailure String?
+    nextRunAt         Float?
+    scheduleInitialized Boolean @default(false)
+    invocations       ScriptInvocation[]
+
+    @@id([automationId, revision])
+}
+
+model ScriptAutomationKeyEpoch {
+    id           String @id
+    automationId String
+    automation   Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+    epoch        Int
+    revoked      Boolean @default(false)
+    expiresAt    Float
+    rateWindow   Float @default(0)
+    rateCount    Int @default(0)
+}
+
+model ScriptInvocation {
+    id              String @id
+    automationId    String
+    automation      Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+    revision        Int
+    scriptRevision  ScriptAutomationRevision @relation(fields: [automationId, revision], references: [automationId, revision], onDelete: NoAction)
+    generation      Int
+    trigger         String
+    requestedBy     String
+    keyId           String?
+    keyEpoch        Int?
+    idempotencyKey  String
+    bodyHash        String
+    snapshot        Json
+    inputCiphertext String
+    status          String @default("QUEUED")
+    claimHash       String?
+    leaseExpiresAt  Float?
+    createdAt       Float
+    startedAt       Float?
+    completedAt     Float?
+    exitCode        Int?
+    failureCode     String?
+    logCiphertext   String?
+    cancelRequestedAt Float?
+    scheduledFor    Float?
+    missedCount     Int @default(0)
+
+    @@unique([automationId, requestedBy, idempotencyKey])
+    @@index([automationId, status, createdAt, id], map: "ScriptInvocation_fifo")
+    // ScriptInvocation_active is a partial unique index in the SQL migration.
 }
 
 enum SessionFollowupStatus {

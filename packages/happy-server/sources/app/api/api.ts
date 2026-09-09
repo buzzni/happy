@@ -35,6 +35,8 @@ import { previewWebSocketRelay } from "@/modules/preview/previewWebSocketRelay";
 import { parsePreviewHost } from "@/modules/preview/parsePreviewHost";
 import { attachmentRoutes } from "./routes/attachmentRoutes";
 import { automationRoutes } from "./routes/automationRoutes";
+import { scriptAutomationRoutes } from "./routes/scriptAutomationRoutes";
+import { startScriptInvocationMaintenance } from "@/app/automation/scriptInvocationMaintenance";
 import { sessionFollowupRoutes } from "./routes/sessionFollowupRoutes";
 import { agentProfileRoutes } from "./routes/agentProfileRoutes";
 import { managedControlRoutes } from "./routes/managedControlRoutes";
@@ -180,6 +182,7 @@ export async function startApi(opts: StartApiOptions = {}) {
     previewRoutes(typed);
     attachmentRoutes(typed);
     automationRoutes(typed);
+    scriptAutomationRoutes(typed);
     sessionFollowupRoutes(typed);
 
     // Static webapp (self-host mode)
@@ -268,6 +271,10 @@ export async function startApi(opts: StartApiOptions = {}) {
     }
 
     // End
+    if (process.env.HAPPY_SCRIPT_AUTOMATIONS_ENABLED === '1') {
+        const scriptMaintenance = startScriptInvocationMaintenance();
+        onShutdown('script-invocation-maintenance', () => scriptMaintenance.stop());
+    }
     log(`API ready on http://${host}:${port}`);
     return { port, host };
 }
