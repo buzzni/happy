@@ -37,6 +37,8 @@ import { attachmentRoutes } from "./routes/attachmentRoutes";
 import { automationRoutes } from "./routes/automationRoutes";
 import { sessionFollowupRoutes } from "./routes/sessionFollowupRoutes";
 import { agentProfileRoutes } from "./routes/agentProfileRoutes";
+import { managedControlRoutes } from "./routes/managedControlRoutes";
+import { createManagedControlRuntime, type ManagedControlRuntime } from "@/app/managed/managedControlRuntime";
 import { isLocalStorage, getLocalFilesDir } from "@/storage/files";
 import * as path from "path";
 import * as fs from "fs";
@@ -140,7 +142,13 @@ export async function startApi(opts: StartApiOptions = {}) {
         });
     }
 
+    // Managed control is off unless the deployment configures verification
+    // keys; `createManagedControlRuntime` returns null when it has not, and the
+    // routes then refuse rather than falling back to the account bearer.
+    const managedControl: ManagedControlRuntime | null = await createManagedControlRuntime(process.env);
+
     // Routes
+    managedControlRoutes(typed, () => managedControl);
     authRoutes(typed);
     pushRoutes(typed);
     sessionRoutes(typed);
