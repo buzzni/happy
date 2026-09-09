@@ -360,6 +360,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     sessionId: session.sessionId,
                     path: session.path,
                     managedSettingsLockdown: session.managedSettingsLockdown,
+                    managedRun: session.managedRun,
                     allowedTools: session.allowedTools ?? [],
                     mcpServers: session.mcpServers,
                     mcpConfig: session.mcpConfig ? {

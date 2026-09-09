@@ -533,3 +533,44 @@ describe('a failed launch still hands back the cleanup', () => {
         expect(events).toContain('unproven:provider-generation');
     });
 });
+
+describe('the launch can pass trusted descriptors through', () => {
+    it('hands the supervisor exactly the descriptors the caller trusted it with', async () => {
+        const events: string[] = [];
+        let seen: Array<{ childFd: number; parentFd: number }> | undefined;
+        await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => ({
+                execGeneration: async (call: {
+                    inherit?: Array<{ childFd: number; parentFd: number }>;
+                    onAcquired?: (pid: number) => Promise<void>;
+                }) => {
+                    seen = call.inherit;
+                    if (call.onAcquired) await call.onAcquired(777);
+                    return { kind: 'exec-attempted' as const, pid: 777 };
+                },
+                stopGeneration: () => ({ stopped: true as const, observedEmptyAt: 1 }),
+            }),
+            // B2 부트 봉투 FD. 우리가 만들지 않고 그대로 넘긴다.
+            inherit: [{ childFd: 3, parentFd: 11 }],
+        });
+        expect(seen).toEqual([{ childFd: 3, parentFd: 11 }]);
+    });
+
+    it('passes nothing when the caller trusted nothing', async () => {
+        const events: string[] = [];
+        let seen: unknown = 'unset';
+        await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => ({
+                execGeneration: async (call: { inherit?: unknown; onAcquired?: (pid: number) => Promise<void> }) => {
+                    seen = call.inherit;
+                    if (call.onAcquired) await call.onAcquired(777);
+                    return { kind: 'exec-attempted' as const, pid: 777 };
+                },
+                stopGeneration: () => ({ stopped: true as const, observedEmptyAt: 1 }),
+            }),
+        });
+        expect(seen).toBeUndefined();
+    });
+});

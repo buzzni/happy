@@ -107,6 +107,8 @@ import { registerCodexSteerHandler } from './codexSteerHandler';
 import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
+import { isManagedBrokerServer } from '@/launcher/codexApproval';
+import { resolveManagedCodexArguments } from '@/launcher/managedCodexOptions';
 import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, clearForeignSessionLineage, managedCodexProviderArguments, requireAccountMachineId, requireAccountToken } from '@/managed/managedStartup';
 import type { RunnerPrincipal } from '@/claude/runClaude';
 
@@ -790,7 +792,16 @@ export async function runCodex(opts: {
         checkpointComposition.completeTurn,
         // Explicit, and only ever from the verified envelope: it turns off the
         // account-rotation proxy and pins the provider this run may use.
-        managedStartup ? managedCodexProviderArguments(managedStartup.envelope) : null,
+        /*
+         * B2 의 provider 고정 인자 뒤에 이 run 의 도구 경계(broker 등록·자격
+         * 환경변수 이름·기능 차단·effort)를 얹는다. 관리 실행인데 검증된 계획이
+         * 없으면 기존 동작으로 되돌아가지 않고 멈춘다.
+         */
+        resolveManagedCodexArguments({
+            managed: managedStartup !== null,
+            env: process.env,
+            base: managedStartup ? managedCodexProviderArguments(managedStartup.envelope) : null,
+        }),
     );
 
     registerCodexSteerHandler({
@@ -906,6 +917,19 @@ export async function runCodex(opts: {
             : params.type === 'patch'
                 ? { changes: params.fileChanges }
                 : (params.input ?? {});
+
+        /*
+         * 이 run 이 스스로 등록한 broker 로의 호출은 사람에게 물을 것이 없다 —
+         * 그 서버를 등록한 것이 우리이고, 어떤 도구를 쓸 수 있는지는 broker 가
+         * grant scope 로 최종 강제한다. 그 밖의 승인은 전부 기존 경로 그대로다.
+         */
+        if (isManagedBrokerServer({
+            managed: managedStartup !== null,
+            env: process.env,
+            serverName: params.serverName,
+        })) {
+            return 'approved';
+        }
 
         try {
             const result = await permissionHandler.handleToolCall(params.callId, toolName, input, {

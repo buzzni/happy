@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { CODEX_APPROVAL_ACCEPT, classifyCodexApproval } from './codexApproval';
+import { CODEX_APPROVAL_ACCEPT, classifyCodexApproval, isManagedBrokerServer } from './codexApproval';
 
 /** 설치본 0.153.4 가 실제로 보낸 요청. 필드 이름을 지어내지 않았다. */
 const REAL_REQUEST = {
@@ -92,5 +92,26 @@ describe('codex approval classification', () => {
         const renamed = { ...REAL_REQUEST, message: 'Allow "rm_rf" to run?' };
         expect(classifyCodexApproval({ params: renamed, session: SESSION }))
             .toEqual({ kind: 'auto-approve', scopeEnforcedBy: 'broker-grant' });
+    });
+});
+
+describe('managed broker approvals in the existing runner', () => {
+    const PLAN_ENV = {
+        SAYCODE_PROVIDER_CODEX_ARGS: JSON.stringify([
+            '-c', 'mcp_servers.saycode.url="http://127.0.0.1:8731/"',
+            '-c', 'mcp_servers.saycode.bearer_token_env_var="SAYCODE_BROKER_TOKEN"',
+        ]),
+    };
+
+    it('recognises this run’s own broker by the name the plan registered', () => {
+        expect(isManagedBrokerServer({ managed: true, env: PLAN_ENV, serverName: 'saycode' })).toBe(true);
+        expect(isManagedBrokerServer({ managed: true, env: PLAN_ENV, serverName: 'someone-else' })).toBe(false);
+        // 서버 이름이 없는 승인(exec/patch 같은 것)은 broker 가 아니다.
+        expect(isManagedBrokerServer({ managed: true, env: PLAN_ENV, serverName: undefined })).toBe(false);
+    });
+
+    it('claims nothing in a BYOS run or without a plan', () => {
+        expect(isManagedBrokerServer({ managed: false, env: PLAN_ENV, serverName: 'saycode' })).toBe(false);
+        expect(isManagedBrokerServer({ managed: true, env: {}, serverName: 'saycode' })).toBe(false);
     });
 });

@@ -46,6 +46,7 @@ export type ProviderSupervisorConfig = {
 export type ProviderRunSupervisor = {
     execGeneration: (input: {
         key: GenerationKey;
+        inherit?: Array<{ childFd: number; parentFd: number }>;
         statusFd: number;
         releaseFd: number;
         leaseExpiresMonotonic: number;
@@ -223,6 +224,12 @@ export async function startManagedProviderRun(input: {
      * 호출자다. 그래서 마지막에는 주장이 아니라 실제로 도는 프로세스에서 확인한다.
      */
     readProcEnviron: (pid: number) => Record<string, string>;
+    /**
+     * 자식에게 물려줄 신뢰 fd. **우리가 만들지 않고 그대로 넘긴다** — B2 부트
+     * 봉투처럼 호출자가 이미 신뢰 경계 안에서 연 것들이고, 여기서 해석하거나
+     * 늘리지 않는다(§5.36 의 fd 정책 그대로).
+     */
+    inherit?: Array<{ childFd: number; parentFd: number }>;
     /** 세대 cgroup 루트와 신뢰 helper. supervisor 설정에 그대로 들어간다. */
     cgroupRoot: string;
     helperPath: string;
@@ -326,6 +333,7 @@ export async function startManagedProviderRun(input: {
     try {
         outcome = await supervisor.execGeneration({
             key: input.key,
+            inherit: input.inherit,
             statusFd: input.statusFd,
             releaseFd: input.releaseFd,
             leaseExpiresMonotonic: input.leaseExpiresMonotonic,

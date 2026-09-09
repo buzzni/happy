@@ -23,6 +23,10 @@
 
 export const MANAGED_TOOL_BROKER_NAME = 'saycode-broker';
 
+/** SDK 가 받는 effort 단계. `sdk.d.ts:546` 의 `EffortLevel` 과 같다. */
+export const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type ClaudeEffort = (typeof CLAUDE_EFFORT_LEVELS)[number];
+
 export type ClaudeToolPolicyInput = {
     /** broker 의 loopback URL. 다른 UID 의 프로세스가 연다. */
     brokerUrl: string;
@@ -41,6 +45,22 @@ export type ClaudeToolPolicyInput = {
      * 도구들뿐 아니라 앞으로 생길 무엇이든 허가한다.
      */
     brokerTools?: string[];
+    /**
+     * 이 run 에 확정된 모델.
+     *
+     * gateway capability 는 **선택된 모델 하나**에만 유효하다. 그래서 주 호출뿐
+     * 아니라 CLI 가 스스로 고르는 자리(제목 생성용 작은 모델, 하위 에이전트)도
+     * 같은 값으로 고정한다 — 설치본 2.1.179 바이너리에서 확인한 이름들이다.
+     */
+    model: string;
+    /**
+     * 이 run 에 확정된 effort.
+     *
+     * `'none'` 이거나 없으면 **아무것도 싣지 않는다** — provider 기본값이 그대로
+     * 남아야 한다는 뜻이다. 우리가 대신 고르면 사용자가 고르지 않은 값이 조용히
+     * 적용된다. 값은 SDK 의 `EffortLevel` 만 받는다(`sdk.d.ts:546`).
+     */
+    effort?: ClaudeEffort | 'none';
     /** child 에게 줄 환경변수 **전체**. 여기 없는 것은 자식에 없다. */
     env: Record<string, string>;
 };
@@ -56,6 +76,12 @@ export type ClaudeToolPolicy = {
     env: Record<string, string>;
     /** 승인 프롬프트로 경계를 대신하지 않는다 — 경계는 UID 다. */
     permissionMode: 'default';
+    /** 이 run 에 확정된 모델. SDK 옵션과 env 양쪽에 실린다. */
+    model: string;
+    /** 이 run 이 고른 effort. 고르지 않았으면 `undefined` 다. */
+    effort?: ClaudeEffort;
+    /** SDK 옵션에 펼칠 조각. 고르지 않았으면 **빈 객체**다. */
+    sdkEffortOption: { effort?: ClaudeEffort };
     /** 프롬프트 없이 실행될 도구. 이 run 의 broker 도구만 들어간다. */
     allowedTools: string[];
     /**
@@ -135,6 +161,14 @@ export function buildClaudeToolPolicy(input: ClaudeToolPolicyInput): ClaudeToolP
     assertProviderEnv(input.env);
     // 자격 없이 만든 정책은 broker 에게 거부당한다. 그 조합을 만들지 않는다.
     if (input.brokerToken.trim() === '') throw new Error('claude policy requires a broker token');
+    if (typeof input.model !== 'string' || input.model.trim() === '') {
+        throw new Error('claude policy requires the run’s selected model');
+    }
+    const chosen = input.effort ?? 'none';
+    if (chosen !== 'none' && !(CLAUDE_EFFORT_LEVELS as readonly string[]).includes(chosen)) {
+        throw new Error(`claude policy received an effort the SDK does not have: ${chosen}`);
+    }
+    const effort = chosen === 'none' ? undefined : chosen as ClaudeEffort;
     return {
         tools: [],
         mcpServers: {
@@ -144,7 +178,17 @@ export function buildClaudeToolPolicy(input: ClaudeToolPolicyInput): ClaudeToolP
                 headers: { authorization: `Bearer ${input.brokerToken}` },
             },
         },
-        env: { ...input.env },
+        env: {
+            ...input.env,
+            // 세 자리를 모두 같은 값으로. 하나라도 다르면 그 호출만 gateway 에서 거절된다.
+            ANTHROPIC_MODEL: input.model,
+            ANTHROPIC_SMALL_FAST_MODEL: input.model,
+            CLAUDE_CODE_SUBAGENT_MODEL: input.model,
+        },
+        model: input.model,
+        // 고르지 않았으면 키 자체를 만들지 않는다.
+        ...(effort ? { effort } : {}),
+        sdkEffortOption: effort ? { effort } : {},
         permissionMode: 'default',
         allowedTools: (input.brokerTools ?? []).map(
             (tool) => `mcp__${MANAGED_TOOL_BROKER_NAME}__${tool}`,

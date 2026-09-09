@@ -1,5 +1,6 @@
 import { EnhancedMode } from "./loop";
 import { spawn } from 'node:child_process';
+import { bindManagedQueryOptions } from '@/launcher/managedClaudeOptions'
 import { query, type QueryOptions, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
 import type { MessageParam } from '@anthropic-ai/sdk/resources'
 import { mapToClaudeMode } from "./utils/permissionMode";
@@ -38,6 +39,8 @@ export async function claudeRemote(opts: {
     mcpServers?: Record<string, any>,
     claudeEnvVars?: Record<string, string>,
     managedSettingsLockdown?: boolean,
+    /** 관리 실행인가. 마지막 경계에서 계획을 덮을지 정한다. */
+    managedRun?: boolean,
     claudeArgs?: string[],
     allowedTools: string[],
     signal?: AbortSignal,
@@ -204,7 +207,7 @@ export async function claudeRemote(opts: {
 
     const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
     const writerProcessTree = opts.completeTurn ? new CheckpointWriterProcessTree() : null;
-    const sdkOptions: QueryOptions = {
+    const assembledOptions: QueryOptions = {
         cwd: providerPath,
         additionalDirectories: readAdditionalDirectoriesEnvironment(process.env),
         resume: startFrom ?? undefined,
@@ -263,6 +266,20 @@ export async function claudeRemote(opts: {
             role: 'user',
             content: initial.message,
         },
+    });
+
+    /*
+     * 마지막 소비 경계.
+     *
+     * 관리 실행이면 여기서 계획이 옵션을 덮는다 — 내장 도구 없음, broker 하나,
+     * 승인 프롬프트로 경계를 대신하지 않음, 파일시스템 설정 안 읽음, run 이
+     * 확정한 모델·effort. 중간 계층에 뿌리면 그 계층이 mode 값으로 다시 덮거나
+     * 필드를 몰라서 조용히 사라진다(실제로 `tools`·`effort` 가 그랬다).
+     * 검증된 계획이 없으면 기존 동작으로 돌아가지 않고 여기서 멈춘다.
+     */
+    const sdkOptions = bindManagedQueryOptions(assembledOptions, {
+        managed: opts.managedRun === true,
+        env: process.env,
     });
 
     // Start the loop

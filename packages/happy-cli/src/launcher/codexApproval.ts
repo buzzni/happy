@@ -93,3 +93,39 @@ export function classifyCodexApproval(input: {
 
     return { kind: 'auto-approve', scopeEnforcedBy: 'broker-grant' };
 }
+
+
+/**
+ * 이 승인 요청이 **이 run 이 스스로 등록한 broker** 의 것인가.
+ *
+ * codex 실행의 승인·프롬프트는 기존 runner(`CodexPermissionHandler`)가 소유한다.
+ * 여기서는 정책 하나만 답한다: 우리가 등록한 loopback broker 로의 도구 호출은
+ * 사람에게 물을 것이 없다 — 그 서버를 등록한 것이 우리이고, 무엇을 쓸 수 있는지는
+ * grant scope 가 broker 에서 최종 강제한다.
+ *
+ * 계획이 없거나 BYOS 실행이면 아무것도 주장하지 않는다(기존 동작 유지).
+ */
+export function isManagedBrokerServer(input: {
+    managed: boolean;
+    env: Record<string, string | undefined>;
+    serverName: string | undefined;
+}): boolean {
+    if (!input.managed || !input.serverName) return false;
+    const raw = input.env.SAYCODE_PROVIDER_CODEX_ARGS;
+    if (!raw) return false;
+    let args: unknown;
+    try {
+        args = JSON.parse(raw);
+    } catch {
+        return false;
+    }
+    if (!Array.isArray(args)) return false;
+    // 계획이 등록한 이름만 인정한다. 문자열을 지어내지 않고 실제 인자에서 읽는다.
+    const registered = new Set<string>();
+    for (const entry of args) {
+        if (typeof entry !== 'string') continue;
+        const found = /^mcp_servers\.([A-Za-z0-9_-]+)\.url=/.exec(entry);
+        if (found) registered.add(found[1]!);
+    }
+    return registered.has(input.serverName);
+}

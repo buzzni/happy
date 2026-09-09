@@ -16,8 +16,13 @@
  */
 import { MANAGED_PROJECT_ROOT } from '@/daemon/managedRuntimeIdentity';
 
-import { assertProviderEnv, buildClaudeToolPolicy } from './claudeToolPolicy';
-import { buildCodexToolPolicy } from './codexToolPolicy';
+import {
+    CLAUDE_EFFORT_LEVELS,
+    type ClaudeEffort,
+    assertProviderEnv,
+    buildClaudeToolPolicy,
+} from './claudeToolPolicy';
+import { DISABLED_CODEX_FEATURES, buildCodexToolPolicy } from './codexToolPolicy';
 
 export type ProviderAgent = 'claude' | 'codex';
 
@@ -27,6 +32,9 @@ export const PROVIDER_SDK_OPTIONS_ENV = 'SAYCODE_PROVIDER_SDK_OPTIONS';
 /** codex provider 가 자기 실행 인자를 읽는 자리. 같은 이유로 계획이 싣는다. */
 export const PROVIDER_CODEX_ARGS_ENV = 'SAYCODE_PROVIDER_CODEX_ARGS';
 
+/** 두 provider 공통으로, 이 run 에 확정된 모델이 실리는 자리. */
+export const PROVIDER_MODEL_ENV = 'SAYCODE_PROVIDER_MODEL';
+
 export type ProviderLaunchRequest = {
     agent: ProviderAgent;
     /** broker 의 loopback URL. supervisor 가 띄운 다른 UID 의 프로세스다. */
@@ -35,6 +43,13 @@ export type ProviderLaunchRequest = {
     brokerToken: string;
     /** 이 run 이 쓸 수 있는 broker 도구 이름들(= grant scope). */
     brokerTools?: string[];
+    /** 이 run 에 확정된 모델. gateway capability 가 이 하나에만 유효하다. */
+    model: string;
+    /**
+     * 이 run 에 확정된 effort. `'none'` 이거나 없으면 provider 기본값을 그대로 둔다 —
+     * 우리가 대신 고르지 않는다.
+     */
+    effort?: ClaudeEffort | 'none';
     /** 이 run 의 provider env. gateway capability 는 여기 있어도 된다. */
     providerEnv: Record<string, string>;
     /** codex 전용: 이 실행 전용 CODEX_HOME. */
@@ -57,6 +72,8 @@ export type ProviderLaunchPlan = {
         permissionMode: 'default';
         allowedTools: string[];
         settingSources: [];
+        model: string;
+        effort?: ClaudeEffort;
     } | null;
 };
 
@@ -68,9 +85,14 @@ export function planProviderLaunch(request: ProviderLaunchRequest): ProviderLaun
             brokerUrl: request.brokerUrl,
             brokerToken: request.brokerToken,
             brokerTools: request.brokerTools,
+            model: request.model,
+            effort: request.effort,
             env: request.providerEnv,
         });
         const sdkOptions = {
+            model: policy.model,
+            // 고르지 않았으면 키가 없다. 있으면 그 값 그대로.
+            ...policy.sdkEffortOption,
             tools: policy.tools,
             mcpServers: policy.mcpServers,
             permissionMode: policy.permissionMode,
@@ -96,6 +118,8 @@ export function planProviderLaunch(request: ProviderLaunchRequest): ProviderLaun
     }
     const policy = buildCodexToolPolicy({
         codexHome: request.codexHome,
+        // codex 의 같은 개념. 설치본 0.153.4 가 `model_reasoning_effort` 를 갖는다(실측).
+        effort: request.effort,
         brokerUrl: request.brokerUrl,
         // Claude 에만 자격을 넘기고 codex 를 빠뜨리면, codex run 은 broker 에
         // 붙지 못한 채 도구 없이 돈다.
@@ -106,7 +130,11 @@ export function planProviderLaunch(request: ProviderLaunchRequest): ProviderLaun
         agent: 'codex',
         cwd: MANAGED_PROJECT_ROOT,
         // 인자도 계획의 env 에 실어 실행 경계에 결속한다(claude 의 sdkOptions 와 같은 이유).
-        env: { ...policy.env, [PROVIDER_CODEX_ARGS_ENV]: JSON.stringify(policy.args) },
+        env: {
+            ...policy.env,
+            [PROVIDER_CODEX_ARGS_ENV]: JSON.stringify(policy.args),
+            [PROVIDER_MODEL_ENV]: request.model,
+        },
         args: policy.args,
         files: [{
             path: `${request.codexHome}/environments.toml`,
@@ -133,6 +161,8 @@ export function readProviderSdkOptions(env: Record<string, string | undefined>):
     permissionMode: 'default';
     allowedTools: string[];
     settingSources: [];
+    model: string;
+    effort?: ClaudeEffort;
 } {
     const raw = env[PROVIDER_SDK_OPTIONS_ENV];
     if (raw === undefined || raw === '') throw new Error('the provider environment carries no sdk options');
@@ -163,6 +193,13 @@ export function readProviderSdkOptions(env: Record<string, string | undefined>):
     if (!Array.isArray(options.allowedTools) || options.allowedTools.length === 0) {
         throw new Error('the provider sdk options must pre-authorize this run’s broker tools');
     }
+    if (typeof options.model !== 'string' || options.model.trim() === '') {
+        // 모델이 없으면 SDK 가 스스로 고른다. gateway 는 그 모델을 모른다.
+        throw new Error('the provider sdk options must name this run’s model');
+    }
+    if ('effort' in options && !(CLAUDE_EFFORT_LEVELS as readonly string[]).includes(String(options.effort))) {
+        throw new Error('the provider sdk options carry an effort the SDK does not have');
+    }
     return options as unknown as ReturnType<typeof readProviderSdkOptions>;
 }
 
@@ -185,12 +222,78 @@ export function readProviderCodexArgs(env: Record<string, string | undefined>): 
         throw new Error('the provider codex arguments are unreadable');
     }
     const args = parsed as string[];
-    const joined = args.join(' ');
-    if (!/mcp_servers\.[A-Za-z0-9_-]+\.url=/.test(joined)) {
-        throw new Error('the provider codex arguments must register this run’s broker');
-    }
-    if (!/mcp_servers\.[A-Za-z0-9_-]+\.bearer_token_env_var=/.test(joined)) {
-        throw new Error('the provider codex arguments must pass the broker credential by env var name');
+    /*
+     * **정확 일치로 판정한다.**
+     *
+     * 문자열이 들어 있는지만 보면 `--disable` 을 전부 지운 인자도, 뒤에 붙어 앞의
+     * 결정을 뒤집는 `-c features.hooks=true` 도 통과한다. codex 는 나중 `-c` 가
+     * 이기므로 "포함" 검사는 경계가 아니다. 그래서 이 함수는 계획이 만드는 것과
+     * **같은 규칙으로 다시 만들어** 비교한다: 인자 순서까지 같아야 한다.
+     */
+    const expected = canonicalCodexArguments(args);
+    if (expected === null || expected.length !== args.length
+        || expected.some((entry, index) => entry !== args[index])) {
+        throw new Error('the provider codex arguments are not the ones this run planned');
     }
     return args;
+}
+
+/**
+ * 인자에서 읽어 낸 값으로 **계획이 만들었을 인자열을 재구성한다**.
+ *
+ * 재구성한 것과 실제가 다르면 누가 지웠거나 덧붙인 것이다.
+ */
+function canonicalCodexArguments(args: string[]): string[] | null {
+    const url = /^mcp_servers\.saycode\.url=(".*")$/;
+    const bearer = /^mcp_servers\.saycode\.bearer_token_env_var=(".*")$/;
+    const effort = /^model_reasoning_effort=(".*")$/;
+    let brokerUrl: string | null = null;
+    let bearerEnv: string | null = null;
+    let chosenEffort: string | null = null;
+    const disabled: string[] = [];
+    for (let index = 0; index < args.length; index += 1) {
+        const entry = args[index]!;
+        if (entry === '--disable') {
+            const feature = args[index + 1];
+            if (feature === undefined) return null;
+            disabled.push(feature);
+            index += 1;
+            continue;
+        }
+        if (entry === '-c') {
+            const value = args[index + 1];
+            if (value === undefined) return null;
+            const foundUrl = url.exec(value);
+            const foundBearer = bearer.exec(value);
+            const foundEffort = effort.exec(value);
+            if (foundUrl) {
+                if (brokerUrl !== null) return null;
+                brokerUrl = foundUrl[1]!;
+            } else if (foundBearer) {
+                if (bearerEnv !== null) return null;
+                bearerEnv = foundBearer[1]!;
+            } else if (foundEffort) {
+                if (chosenEffort !== null) return null;
+                chosenEffort = foundEffort[1]!;
+            } else {
+                // 계획이 만들지 않는 설정이다.
+                return null;
+            }
+            index += 1;
+            continue;
+        }
+        // `--disable`/`-c` 밖의 인자는 계획에 없다.
+        return null;
+    }
+    if (brokerUrl === null || bearerEnv === null) return null;
+    if (disabled.length !== DISABLED_CODEX_FEATURES.length
+        || DISABLED_CODEX_FEATURES.some((feature, index) => feature !== disabled[index])) {
+        return null;
+    }
+    return [
+        ...DISABLED_CODEX_FEATURES.flatMap((feature) => ['--disable', feature]),
+        '-c', `mcp_servers.saycode.url=${brokerUrl}`,
+        '-c', `mcp_servers.saycode.bearer_token_env_var=${bearerEnv}`,
+        ...(chosenEffort !== null ? ['-c', `model_reasoning_effort=${chosenEffort}`] : []),
+    ];
 }

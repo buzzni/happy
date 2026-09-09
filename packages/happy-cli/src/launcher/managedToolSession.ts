@@ -33,6 +33,10 @@ export type ManagedToolSessionInput = {
     providerEnv: Record<string, string>;
     /** codex 전용 run-private CODEX_HOME. */
     codexHome?: string;
+    /** 이 run 에 확정된 모델. gateway capability 가 이 하나에만 유효하다. */
+    model: string;
+    /** 이 run 에 확정된 effort. 고르지 않았으면 넘기지 않는다. */
+    effort?: string;
     /** broker 가 알리는 도구. `scope` 밖의 이름은 등록돼 있어도 실행되지 않는다. */
     tools: BrokerTool[];
     scope: string[];
@@ -122,6 +126,8 @@ export async function startManagedToolSession(
             brokerToken: token,
             // grant scope 와 provider 가 부를 수 있는 도구는 같은 목록이다.
             brokerTools: input.scope,
+            model: input.model,
+            effort: input.effort as never,
             providerEnv: input.providerEnv,
             codexHome: input.codexHome,
         });

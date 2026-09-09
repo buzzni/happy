@@ -51,6 +51,7 @@ async function callBroker(port: number, token: string | null, name = 'read_file'
 function baseInput(events: string[], unproven: Array<{ tool: string }> = []) {
     return {
         agent: 'claude' as const,
+        model: 'claude-sonnet-5',
         providerEnv: { PATH: '/usr/bin', ANTHROPIC_AUTH_TOKEN: 'capability-for-this-run' },
         tools: TOOLS,
         scope: ['read_file'],

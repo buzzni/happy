@@ -41,6 +41,12 @@ export type CodexToolPolicyInput = {
      */
     brokerToken: string;
     env: Record<string, string>;
+    /**
+     * 이 run 에 확정된 effort. 없거나 `'none'` 이면 아무것도 싣지 않는다 —
+     * 설치본이 정한 기본값이 그대로 남아야 한다. 키 이름은 실측이다
+     * (`codex` 0.153.4 바이너리의 `model_reasoning_effort`).
+     */
+    effort?: string;
 };
 
 export type CodexToolPolicy = {
@@ -117,6 +123,9 @@ export function buildCodexToolPolicy(input: CodexToolPolicyInput): CodexToolPoli
             // MCP 는 이 broker 하나만.
             '-c', `mcp_servers.saycode.url=${JSON.stringify(input.brokerUrl)}`,
             '-c', `mcp_servers.saycode.bearer_token_env_var=${JSON.stringify(CODEX_BROKER_TOKEN_ENV)}`,
+            ...(input.effort && input.effort !== 'none'
+                ? ['-c', `model_reasoning_effort=${JSON.stringify(input.effort)}`]
+                : []),
         ],
         env: {
             ...input.env,
