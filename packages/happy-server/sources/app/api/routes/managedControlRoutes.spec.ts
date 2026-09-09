@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { generateKeyPairSync, randomUUID, sign as signBytes } from 'node:crypto';
 import fastify, { type FastifyInstance } from 'fastify';
 import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from 'fastify-type-provider-zod';
@@ -300,13 +300,15 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             await expect(modules.auth.auth.verifyToken(issued.token)).resolves.toBeNull();
 
             const renewBody = {
-                scope: scope(), expectedRenewalSeq: 0, expiresAt: Date.now() + 2 * HOUR,
+                scope: scope(), expectedGrantId: issued.grantId,
+                expectedRenewalSeq: 0, expiresAt: Date.now() + 2 * HOUR,
             };
             const renewed = await call({
                 path: '/v1/managed/control/grants/renew', op: 'grant-renew', body: renewBody,
             });
             expect(renewed.statusCode).toBe(200);
-            expect(renewed.json()).toMatchObject({ renewalSeq: 1 });
+            // The answer names the grant the caller asked to extend.
+            expect(renewed.json()).toMatchObject({ renewalSeq: 1, grantId: issued.grantId });
 
             const revoked = await call({
                 path: '/v1/managed/control/grants/revoke', op: 'grant-revoke',
@@ -532,11 +534,15 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
         it('re-evaluates the current grant under the signed cap, not the first answer', async () => {
             const base = Date.now();
             const mint = mintBody({ expiresAt: base + 500 });
-            expect((await call({
+            const minted = await call({
                 path: '/v1/managed/control/grants/mint', op: 'grant-mint', body: mint,
-            })).statusCode).toBe(200);
+            });
+            expect(minted.statusCode).toBe(200);
 
-            const renew = { scope: scope(), expectedRenewalSeq: 0, expiresAt: base + 1_500 };
+            const renew = {
+                scope: scope(), expectedGrantId: minted.json().grantId,
+                expectedRenewalSeq: 0, expiresAt: base + 1_500,
+            };
             expect((await call({
                 path: '/v1/managed/control/grants/renew', op: 'grant-renew', body: renew,
             })).statusCode).toBe(200);
@@ -719,7 +725,10 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             const renewedExpiry = Date.now() + 300_000;
             const renewed = await call({
                 path: '/v1/managed/control/grants/renew', op: 'grant-renew',
-                body: { scope: scope(), expectedRenewalSeq: 0, expiresAt: renewedExpiry },
+                body: {
+                    scope: scope(), expectedGrantId: first.json().grantId,
+                    expectedRenewalSeq: 0, expiresAt: renewedExpiry,
+                },
             });
             expect(renewed.statusCode).toBe(200);
             expect(renewed.json().expiresAt).toBe(renewedExpiry);
@@ -742,6 +751,253 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             // The grant itself keeps the renewal.
             const row = await db.managedSessionGrant.findFirstOrThrow({ where: { runId } });
             expect(Number(row.expiresAt)).toBe(renewedExpiry);
+        });
+    });
+
+    describe('reminting an expired grant over HTTP', () => {
+        beforeEach(syncAuthority);
+
+        /**
+         * Moves this process's clock forward.
+         *
+         * Only `Date.now`, and only forward: the server, the issuer and the
+         * grant core all read it, so an expiry reached this way is the one real
+         * issuance produces. Rewriting `expiresAt` in the database instead would
+         * put the row behind a token that is still valid — a state no writer can
+         * create, since a renewal only extends and a revoke is a separate
+         * field — and any conclusion drawn from it would be about the fixture.
+         */
+        function advanceClock(toEpochMs: number): () => void {
+            const spy = vi.spyOn(Date, 'now').mockReturnValue(toEpochMs);
+            return () => spy.mockRestore();
+        }
+
+        async function mintExpiring(ms: number) {
+            const body = mintBody({ expiresAt: Date.now() + ms });
+            const response = await call({ path: '/v1/managed/control/grants/mint', op: 'grant-mint', body });
+            expect(response.statusCode).toBe(200);
+            return response.json() as { token: string; grantId: string; expiresAt: number };
+        }
+
+        it('issues a new grant whose token replaces the expired one', async () => {
+            const first = await mintExpiring(400);
+            const runtime = await modules.runtime.createManagedControlRuntime(CONTROL_ENV);
+            await new Promise((resolve) => setTimeout(resolve, 500));
+
+            const second = await mintExpiring(60_000);
+            expect(second.grantId).not.toBe(first.grantId);
+
+            // The old token names a grant this family no longer has. Verified
+            // through the real issuer, not by inspecting the row.
+            const oldClaims = await runtime!.scopedTokens.verify(first.token, Date.now());
+            expect(oldClaims).toMatchObject({ ok: false, reason: 'expired' });
+
+            const newClaims = await runtime!.scopedTokens.verify(second.token, Date.now());
+            expect(newClaims).toMatchObject({ ok: true });
+            if (newClaims.ok) {
+                expect(newClaims.claims.grantId).toBe(second.grantId);
+                expect(await modules.grants.resolveLiveGrant({ claims: newClaims.claims, now: Date.now() }))
+                    .toMatchObject({ ok: true });
+            }
+        }, 20_000);
+
+        it('rejects a token minted for the superseded grant', async () => {
+            const runtime = await modules.runtime.createManagedControlRuntime(CONTROL_ENV);
+            const t0 = Date.now();
+            const first = await call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint',
+                body: mintBody({ expiresAt: t0 + 2_000 }),
+            });
+            expect(first.statusCode).toBe(200);
+            const firstJson = first.json() as { token: string; grantId: string };
+            const firstClaims = await runtime!.scopedTokens.verify(firstJson.token, t0);
+            expect(firstClaims).toMatchObject({ ok: true });
+
+            const restore = advanceClock(t0 + 2_500);
+            try {
+                const secondBody = mintBody({ expiresAt: t0 + 60_000 });
+                const second = await call({
+                    path: '/v1/managed/control/grants/mint', op: 'grant-mint', body: secondBody,
+                });
+                expect(second.statusCode).toBe(200);
+                expect(second.json().grantId).not.toBe(firstJson.grantId);
+
+                if (firstClaims.ok) {
+                    // Two independent refusals, both real: the token has passed
+                    // its own expiry, and the grant it names is gone. A direct
+                    // resolver call with an earlier timestamp isolates the ID
+                    // lookup check; it does not simulate a live earlier request.
+                    expect(await modules.grants.resolveLiveGrant({
+                        claims: firstClaims.claims, now: t0 + 1_999,
+                    })).toEqual({ ok: false, reason: 'grant-unknown' });
+                    expect(await runtime!.scopedTokens.verify(firstJson.token, Date.now()))
+                        .toMatchObject({ ok: false, reason: 'expired' });
+                }
+            } finally {
+                restore();
+            }
+        }, 20_000);
+
+        it('refuses a renewal signed for the grant the remint replaced', async () => {
+            const t0 = Date.now();
+            const firstResponse = await call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint',
+                body: mintBody({ expiresAt: t0 + 2_000 }),
+            });
+            expect(firstResponse.statusCode).toBe(200);
+            const first = firstResponse.json() as { grantId: string };
+
+            const restore = advanceClock(t0 + 2_500);
+            let second: { grantId: string };
+            try {
+                const secondResponse = await call({
+                    path: '/v1/managed/control/grants/mint', op: 'grant-mint',
+                    body: mintBody({ expiresAt: t0 + 60_000 }),
+                });
+                expect(secondResponse.statusCode).toBe(200);
+                second = secondResponse.json();
+            } finally {
+                restore();
+            }
+
+            // G1 names the superseded id and sequence 0; G2 now has sequence 1.
+            // The explicit grant mismatch is checked before sequence handling.
+            await expectInert(() => call({
+                path: '/v1/managed/control/grants/renew', op: 'grant-renew',
+                body: {
+                    scope: scope(), expectedGrantId: first.grantId,
+                    expectedRenewalSeq: 0, expiresAt: Date.now() + 2 * HOUR,
+                },
+            }), 403);
+
+            const row = await db.managedSessionGrant.findFirstOrThrow({ where: { runId } });
+            expect(row.grantId).toBe(second.grantId);
+            // Advanced by the remint, not reset: the sequence is the family's.
+            expect(row.renewalSeq).toBe(1);
+        });
+
+        it('refuses a remint of a revoked family and leaves it revoked', async () => {
+            await mintExpiring(60_000);
+            expect((await call({
+                path: '/v1/managed/control/grants/revoke', op: 'grant-revoke',
+                body: { scope: scope(), reason: 'operator' },
+            })).statusCode).toBe(200);
+            // Fixture shortcut, as above: no token is examined in this case.
+            await db.managedSessionGrant.updateMany({
+                where: { runId }, data: { expiresAt: BigInt(Date.now() - 1) },
+            });
+
+            const response = await expectInert(() => call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint', body: mintBody(),
+            }), 403);
+            expect(response.json()).toMatchObject({ error: 'family-revoked' });
+        });
+
+        it('keeps a delayed renewal off a later grant that carries the same id', async () => {
+            // A(seq 0) → B(seq 1) → A(seq 2), each generation reaching its own
+            // expiry by the clock rather than by a write. Then A's original
+            // holder submits the renewal it signed at the start: the assertion
+            // is still inside its own window, and only the sequence separates
+            // the generations.
+            const runtime = await modules.runtime.createManagedControlRuntime(CONTROL_ENV);
+            const t0 = Date.now();
+            const idA = `grant-${randomUUID()}`;
+
+            const first = await call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint',
+                body: mintBody({ grantId: idA, expiresAt: t0 + 2_000 }),
+            });
+            expect(first.statusCode).toBe(200);
+            expect(first.json()).toMatchObject({ grantId: idA, renewalSeq: 0 });
+            const tokenA = first.json().token as string;
+
+            // Signed now, submitted much later: what a delayed holder would send.
+            const staleRenewBody = {
+                scope: scope(), expectedGrantId: idA,
+                expectedRenewalSeq: 0, expiresAt: t0 + 4 * HOUR,
+            };
+            const staleAssertion = assertionFor('grant-renew', staleRenewBody);
+
+            let restore = advanceClock(t0 + 2_500);
+            let second: { grantId: string; token: string };
+            try {
+                const secondBody = mintBody({ expiresAt: t0 + 4_500 });
+                const response = await call({
+                    path: '/v1/managed/control/grants/mint', op: 'grant-mint', body: secondBody,
+                });
+                expect(response.statusCode).toBe(200);
+                expect(response.json()).toMatchObject({ renewalSeq: 1 });
+                expect(response.json().grantId).not.toBe(idA);
+                second = response.json();
+            } finally {
+                restore();
+            }
+            expect(second.grantId).not.toBe(idA);
+
+            restore = advanceClock(t0 + 5_000);
+            try {
+                const thirdBody = mintBody({ grantId: idA, expiresAt: t0 + 60_000 });
+                const third = await call({
+                    path: '/v1/managed/control/grants/mint', op: 'grant-mint', body: thirdBody,
+                });
+                expect(third.statusCode).toBe(200);
+                expect(third.json()).toMatchObject({ grantId: idA, renewalSeq: 2 });
+                const tokenC = third.json().token as string;
+
+                const before = await db.managedSessionGrant.findFirstOrThrow({ where: { runId } });
+                // The exact header and body signed at t0 — not a fresh one.
+                const stale = await call({
+                    path: '/v1/managed/control/grants/renew', op: 'grant-renew',
+                    body: staleRenewBody, assertion: staleAssertion,
+                });
+                // Five seconds in, so the assertion is well inside its own
+                // window: the refusal is the sequence, not the signature.
+                expect(stale.statusCode).toBe(409);
+                const after = await db.managedSessionGrant.findFirstOrThrow({ where: { runId } });
+                expect(after.renewalSeq).toBe(before.renewalSeq);
+                expect(Number(after.expiresAt)).toBe(Number(before.expiresAt));
+
+                // The first A's token has passed its own expiry, which is what
+                // real issuance guarantees: it never outlives its grant.
+                expect(await runtime!.scopedTokens.verify(tokenA, Date.now()))
+                    .toMatchObject({ ok: false, reason: 'expired' });
+
+                const currentClaims = await runtime!.scopedTokens.verify(tokenC, Date.now());
+                expect(currentClaims).toMatchObject({ ok: true });
+                if (currentClaims.ok) {
+                    expect(currentClaims.claims.grantId).toBe(idA);
+                    expect(await modules.grants.resolveLiveGrant({
+                        claims: currentClaims.claims, now: Date.now(),
+                    })).toMatchObject({ ok: true });
+                }
+            } finally {
+                restore();
+            }
+        }, 30_000);
+
+        it('refuses a remint that reuses the id it is replacing', async () => {
+            const first = await mintExpiring(60_000);
+            // Fixture shortcut: the row is aged directly because no token is
+            // examined here, so the token-outlives-grant invariant is not in
+            // play. The temporal proofs above use the clock instead.
+            await db.managedSessionGrant.updateMany({
+                where: { runId }, data: { expiresAt: BigInt(Date.now() - 1) },
+            });
+            const response = await expectInert(() => call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint',
+                body: mintBody({ grantId: first.grantId, expiresAt: Date.now() + 60_000 }),
+            }), 409);
+            expect(response.json()).toMatchObject({ error: 'grant-id-reused' });
+        });
+
+        it('requires the expected grant id on the wire', async () => {
+            await mintExpiring(60_000);
+            // A renewal that names no grant is not a renewal this contract can
+            // decide; the schema refuses it before anything is read.
+            await expectInert(() => call({
+                path: '/v1/managed/control/grants/renew', op: 'grant-renew',
+                body: { scope: scope(), expectedRenewalSeq: 0, expiresAt: Date.now() + 2 * HOUR },
+            }), 400);
         });
     });
 
@@ -834,7 +1090,10 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             // Refused and untouched: no renewal, no revocation, no timestamp.
             await expectInert(() => call({
                 path: '/v1/managed/control/grants/renew', op: 'grant-renew',
-                body: { scope: scope(), expectedRenewalSeq: 0, expiresAt: Date.now() + 2 * HOUR },
+                body: {
+                    scope: scope(), expectedGrantId: `grant-${randomUUID()}`,
+                    expectedRenewalSeq: 0, expiresAt: Date.now() + 2 * HOUR,
+                },
                 token: otherToken,
             }), 403);
             await expectInert(() => call({

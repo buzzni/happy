@@ -33,6 +33,15 @@ import { canonicalDigest } from '@/app/managed/canonicalDigest';
 import type { SessionScopedClaims } from '@/app/auth/sessionScopedToken';
 
 const UNIQUE_VIOLATION = 'P2002';
+
+/**
+ * Raised when a compare-and-set matched nothing.
+ *
+ * Not a failure to report: the row moved, and the answer is whatever it moved
+ * to. Reading that inside the same transaction would only re-read the snapshot
+ * this one started with, so the attempt is repeated in a fresh one.
+ */
+class ConcurrentGrantChange extends Error {}
 const FOREIGN_KEY_VIOLATION = 'P2003';
 
 /**
@@ -84,7 +93,15 @@ export type ScopeMismatch =
     | 'attempt-mismatch'
     | 'binding-mismatch';
 
+/**
+ * Postgres `INTEGER`. The sequence is compared and incremented, never wrapped:
+ * a counter that rolled over would make an old signature match again.
+ */
+const MAX_RENEWAL_SEQ = 2_147_483_647;
+
 export type GrantIssueFailure =
+    | 'grant-id-reused'
+    | 'sequence-exhausted'
     | ScopeMismatch
     | 'session-unknown'
     | 'session-owner-changed'
@@ -94,6 +111,8 @@ export type GrantIssueFailure =
     | 'already-expired';
 
 export type GrantRenewFailure =
+    | 'grant-mismatch'
+    | 'sequence-exhausted'
     | ScopeMismatch
     | 'grant-unknown'
     | 'revoked'
@@ -245,7 +264,7 @@ export type IssueGrantInput = {
 };
 
 /**
- * Issues a grant for a family that has none.
+ * Issues a first grant or replaces an expired, non-revoked family grant.
  *
  * Order matters and is the point of the function: the revoke state, the
  * authority comparison and the expiry are all decided *before* an exact retry
@@ -323,7 +342,60 @@ async function issueSessionGrantOnce(
                 idempotent: true,
             };
         }
-        if (existingFamily) return { ok: false, reason: 'family-exists' };
+        if (existingFamily) {
+            // The *grant* expired, which is not the same as the run stopping.
+            // Refusing forever would make a lapsed grant unrecoverable, and a
+            // second row would leave two live grants for one child — so the row
+            // is replaced in place, under the state it was read in. The scope
+            // was compared against the current authority above; nothing new is
+            // granted and no attempt is started by this.
+            if (Number(existingFamily.expiresAt) > input.now) {
+                return { ok: false, reason: 'family-exists' };
+            }
+            // The replacement must be a different grant. `expectedGrantId` is
+            // what tells a renewal which grant it holds, so reusing the id it
+            // is replacing would leave that check unable to tell them apart.
+            if (input.grantId === existingFamily.grantId) {
+                return { ok: false, reason: 'grant-id-reused' };
+            }
+            const nextSeq = existingFamily.renewalSeq + 1;
+            if (nextSeq > MAX_RENEWAL_SEQ) return { ok: false, reason: 'sequence-exhausted' };
+            const replaced = await tx.managedSessionGrant.updateMany({
+                where: {
+                    family,
+                    // The exact row that was read. A renewal that extended it,
+                    // or a revoke that closed it, between the read and here
+                    // makes this match nothing.
+                    grantId: existingFamily.grantId,
+                    renewalSeq: existingFamily.renewalSeq,
+                    expiresAt: existingFamily.expiresAt,
+                    revokedAt: null,
+                    tombstone: false,
+                },
+                data: {
+                    grantId: input.grantId,
+                    requestId: input.requestId,
+                    attemptId: input.scope.attemptId,
+                    epoch: input.scope.epoch,
+                    workspaceAuthorityVersion: input.scope.workspaceAuthorityVersion,
+                    runAuthorityVersion: input.scope.runAuthorityVersion,
+                    // Advanced, never reset. The sequence belongs to the family
+                    // rather than to one grant: resetting it let a signature for
+                    // an earlier grant match a later one at the same number,
+                    // which is the ABA `expectedGrantId` alone cannot close
+                    // while ids may repeat across generations.
+                    renewalSeq: nextSeq,
+                    expiresAt: BigInt(input.expiresAt),
+                    bodyDigest: digest,
+                    updatedAt: BigInt(input.now),
+                },
+            });
+            // Someone else moved the row first. Their result is the current
+            // one, and it has to be read in a transaction that can see it.
+            if (replaced.count !== 1) throw new ConcurrentGrantChange();
+            const row = await tx.managedSessionGrant.findUniqueOrThrow({ where: { family } });
+            return { ok: true, grant: toLiveGrant(row), idempotent: false };
+        }
 
         const created = await tx.managedSessionGrant.create({
             data: {
@@ -359,6 +431,14 @@ async function issueSessionGrantOnce(
  */
 export async function renewSessionGrant(input: {
     scope: ManagedScope;
+    /**
+     * The grant the caller believes it holds.
+     *
+     * Names the current grant explicitly, alongside the monotonically
+     * increasing family sequence. A renewal for a superseded grant must not
+     * receive or extend its replacement, including an idempotent response.
+     */
+    expectedGrantId: string;
     expectedRenewalSeq: number;
     expiresAt: number;
     now: number;
@@ -383,6 +463,12 @@ export async function renewSessionGrant(input: {
             || grant.workspaceId !== input.scope.workspaceId) {
             return { ok: false, reason: 'binding-mismatch' };
         }
+        // Compared before anything can succeed, the idempotent answer included:
+        // a caller naming a grant this family no longer has is holding a
+        // superseded one, and must be told so rather than handed the new one.
+        if (grant.grantId !== input.expectedGrantId) {
+            return { ok: false, reason: 'grant-mismatch' };
+        }
         // The scope passing the projection comparison only says the *caller* is
         // current. A grant minted against an older generation is stale, and
         // renewing must not carry it forward: that would promote it to an
@@ -392,8 +478,8 @@ export async function renewSessionGrant(input: {
             || grant.runAuthorityVersion !== input.scope.runAuthorityVersion) {
             return { ok: false, reason: 'authority-stale' };
         }
-        // An expiry that has passed already stopped the child; only a new mint
-        // brings one back. Checked before the idempotent answer, so a repeat of
+        // A lapsed grant cannot authorize the child; expiry alone does not
+        // prove process termination. Checked before the idempotent answer, so a repeat of
         // a renewal does not hand back a grant that has since lapsed.
         if (input.now >= Number(grant.expiresAt)) return { ok: false, reason: 'expired' };
 
@@ -407,9 +493,19 @@ export async function renewSessionGrant(input: {
         // A renewal that does not extend is a lost update wearing the right
         // sequence number.
         if (input.expiresAt <= Number(grant.expiresAt)) return { ok: false, reason: 'not-extending' };
+        if (grant.renewalSeq + 1 > MAX_RENEWAL_SEQ) {
+            return { ok: false, reason: 'sequence-exhausted' };
+        }
 
         const updated = await tx.managedSessionGrant.updateMany({
-            where: { family, renewalSeq: input.expectedRenewalSeq, revokedAt: null },
+            where: {
+                family,
+                // The id is part of the condition, not only of the read: a
+                // remint between the read and here must make this match nothing.
+                grantId: input.expectedGrantId,
+                renewalSeq: input.expectedRenewalSeq,
+                revokedAt: null,
+            },
             data: {
                 // The generation is deliberately untouched: a renewal extends
                 // a grant, it does not re-issue it under a new authority.
@@ -624,7 +720,13 @@ async function retryOnUniqueRace<T>(
         } catch (error) {
             const code = (error as { code?: string }).code;
             if (code === FOREIGN_KEY_VIOLATION && onMissingRun) return onMissingRun();
-            if (code !== UNIQUE_VIOLATION || remaining === 0) throw error;
+            const raced = error instanceof ConcurrentGrantChange;
+            if ((!raced && code !== UNIQUE_VIOLATION) || remaining === 0) {
+                // A race that survives the retry is reported as the state that
+                // beat it, not thrown at the caller.
+                if (raced) return { ok: false, reason: 'family-exists' } as T;
+                throw error;
+            }
         }
     }
 }

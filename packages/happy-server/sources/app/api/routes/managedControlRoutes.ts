@@ -94,6 +94,14 @@ const mintSchema = z.object({
 
 const renewSchema = z.object({
     scope: scopeSchema,
+    /**
+     * The grant the caller believes it holds.
+     *
+     * Required and signed with the rest of the body. Together with the
+     * monotonically increasing family sequence, this identifies the grant
+     * generation the caller intends to renew.
+     */
+    expectedGrantId: identifier,
     expectedRenewalSeq: version,
     expiresAt: z.number().int().min(1),
 }).strict();
@@ -125,6 +133,9 @@ const revokeSchema = z.object({
 const CONFLICT_REASONS = new Set([
     'version-conflict', 'body-conflict', 'request-conflict',
     'family-exists', 'renewal-conflict', 'not-extending',
+    // Both are the caller's mistake about the family's current state, not a
+    // refusal to let it act.
+    'grant-id-reused', 'sequence-exhausted',
 ]);
 
 function failureStatus(reason: string): number {
@@ -320,6 +331,7 @@ export function managedControlRoutes(
         const now = Date.now();
         const renewed = await renewSessionGrant({
             scope,
+            expectedGrantId: request.body.expectedGrantId,
             expectedRenewalSeq: request.body.expectedRenewalSeq,
             expiresAt: request.body.expiresAt,
             now,

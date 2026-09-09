@@ -72,8 +72,22 @@ function scope(over: Partial<GrantModule.ManagedScope> = {}): GrantModule.Manage
     };
 }
 
+/**
+ * The grant id the last `issueInput()` asked for.
+ *
+ * Renewal now names the grant it believes it is extending, so the fixture has
+ * to remember which one that is — a remint replaces the id in place, and a
+ * renewal that still names the old one must be refused rather than silently
+ * extending its successor.
+ */
+let lastIssuedGrantId = '';
+
+function currentGrantId(): string {
+    return lastIssuedGrantId;
+}
+
 function issueInput(over: Partial<GrantModule.IssueGrantInput> = {}): GrantModule.IssueGrantInput {
-    return {
+    const input: GrantModule.IssueGrantInput = {
         scope: scope(),
         grantId: `grant-${randomUUID()}`,
         expiresAt: NOW + HOUR,
@@ -81,6 +95,8 @@ function issueInput(over: Partial<GrantModule.IssueGrantInput> = {}): GrantModul
         now: NOW,
         ...over,
     };
+    lastIssuedGrantId = input.grantId;
+    return input;
 }
 
 function claimsFor(over: Partial<SessionScopedClaims> = {}): SessionScopedClaims {
@@ -329,7 +345,8 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
             expect(first).toMatchObject({ ok: true });
 
             await grants.renewSessionGrant({
-                scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 300_000, now: NOW + 20_000,
+                scope: scope(),
+                expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 300_000, now: NOW + 20_000,
             });
 
             // Replaying the original request must not hand back the extended
@@ -348,7 +365,8 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
             const input = issueInput({ expiresAt: NOW + 60_000 });
             await grants.issueSessionGrant(input);
             await grants.renewSessionGrant({
-                scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 300_000, now: NOW + 20_000,
+                scope: scope(),
+                expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 300_000, now: NOW + 20_000,
             });
             expect(await grants.issueSessionGrant({ ...input, now: NOW + 60_000 }))
                 .toEqual({ ok: false, reason: 'already-expired' });
@@ -361,6 +379,370 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
             ]);
             expect([a, b].filter((r) => r.ok)).toHaveLength(1);
             expect(await db.managedSessionGrant.count({ where: { runId } })).toBe(1);
+        });
+    });
+
+    describe('reminting an expired family', () => {
+        const EXPIRED_AT = NOW + 60_000;
+        const AFTER_EXPIRY = EXPIRED_AT + 1;
+
+        async function issueThenExpire(): Promise<string> {
+            const first = await grants.issueSessionGrant(issueInput({ expiresAt: EXPIRED_AT }));
+            if (!first.ok) throw new Error(`fixture failed: ${first.reason}`);
+            return first.grant.grantId;
+        }
+
+        it('replaces an expired grant with a fresh id and an advanced sequence', async () => {
+            const oldGrantId = await issueThenExpire();
+            // Renewed first, so the old row carries a non-zero sequence and the
+            // advance after it is visible.
+            expect(await grants.renewSessionGrant({
+                scope: scope() as never,
+                expectedGrantId: oldGrantId,
+                expectedRenewalSeq: 0,
+                expiresAt: EXPIRED_AT + 1_000,
+                now: NOW,
+            })).toMatchObject({ ok: true, idempotent: false });
+            await db.managedSessionGrant.updateMany({
+                where: { runId }, data: { expiresAt: BigInt(EXPIRED_AT) },
+            });
+
+            const remint = await grants.issueSessionGrant(issueInput({
+                expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY,
+            }));
+            expect(remint).toMatchObject({ ok: true, idempotent: false });
+            if (!remint.ok) return;
+            // A recovery of the same run, not a new one: same family, new ids.
+            expect(remint.grant.grantId).not.toBe(oldGrantId);
+            expect(remint.grant.family).toBe(grants.deriveGrantFamily(scope() as never));
+            // The sequence belongs to the family: one past the renewal above.
+            expect(remint.grant.renewalSeq).toBe(2);
+
+            const rows = await db.managedSessionGrant.findMany({ where: { runId } });
+            expect(rows).toHaveLength(1);
+            expect(rows[0].grantId).toBe(remint.grant.grantId);
+            expect(rows[0].renewalSeq).toBe(2);
+        });
+
+        it('carries the current authority, not the one the old grant held', async () => {
+            await issueThenExpire();
+            await projection.syncRunAuthority({
+                body: { runId, workspaceId, accountId, currentAttemptId: 'attempt-1', cancelled: false },
+                expectedVersion: 1,
+                now: AFTER_EXPIRY,
+            });
+            const current = scope({ runAuthorityVersion: 2 });
+            const remint = await grants.issueSessionGrant(issueInput({
+                scope: current, expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY,
+            }));
+            expect(remint).toMatchObject({ ok: true });
+            if (remint.ok) expect(remint.grant.runAuthorityVersion).toBe(2);
+        });
+
+        it('refuses a remint whose scope is not the current authority', async () => {
+            await issueThenExpire();
+            await projection.syncRunAuthority({
+                body: { runId, workspaceId, accountId, currentAttemptId: 'attempt-2', cancelled: false },
+                expectedVersion: 1,
+                now: AFTER_EXPIRY,
+            });
+            // Recovery still has to be the run the projection says it is.
+            expect(await grants.issueSessionGrant(issueInput({
+                expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY,
+            }))).toEqual({ ok: false, reason: 'attempt-mismatch' });
+        });
+
+        it('does not replace a family that is still live', async () => {
+            await grants.issueSessionGrant(issueInput());
+            expect(await grants.issueSessionGrant(issueInput()))
+                .toEqual({ ok: false, reason: 'family-exists' });
+        });
+
+        it('does not resurrect a revoked family', async () => {
+            await issueThenExpire();
+            await grants.revokeSessionGrant({ scope: scope() as never, reason: 'operator', now: NOW });
+            // Expired and revoked is still revoked: a remint recovers a run
+            // that stopped, never one that was withdrawn.
+            expect(await grants.issueSessionGrant(issueInput({
+                expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY,
+            }))).toEqual({ ok: false, reason: 'family-revoked' });
+        });
+
+        it('leaves nothing live when a revoke commits before the remint', async () => {
+            await issueThenExpire();
+            await grants.revokeSessionGrant({ scope: scope() as never, reason: 'operator', now: NOW });
+            await grants.issueSessionGrant(issueInput({
+                expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY,
+            }));
+            const row = await db.managedSessionGrant.findFirstOrThrow({ where: { runId } });
+            expect(row.revokedAt).not.toBeNull();
+        });
+
+        it('leaves nothing live when the revoke commits after the remint', async () => {
+            await issueThenExpire();
+            const remint = await grants.issueSessionGrant(issueInput({
+                expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY,
+            }));
+            expect(remint).toMatchObject({ ok: true });
+            expect(await grants.revokeSessionGrant({
+                scope: scope() as never, reason: 'operator', now: AFTER_EXPIRY,
+            })).toMatchObject({ ok: true, state: 'revoked' });
+            const row = await db.managedSessionGrant.findFirstOrThrow({ where: { runId } });
+            expect(row.revokedAt).not.toBeNull();
+        });
+
+        it('refuses a request whose own expiry has already passed', async () => {
+            await issueThenExpire();
+            // The request is expired, which is not the same fact as the family
+            // being expired — the latter is what a remint recovers.
+            expect(await grants.issueSessionGrant(issueInput({
+                expiresAt: AFTER_EXPIRY, now: AFTER_EXPIRY,
+            }))).toEqual({ ok: false, reason: 'already-expired' });
+        });
+
+        it('returns the same grant when the mint acknowledgement was lost', async () => {
+            await issueThenExpire();
+            const input = issueInput({ expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY });
+            const first = await grants.issueSessionGrant(input);
+            const retry = await grants.issueSessionGrant(input);
+            expect(retry).toMatchObject({ ok: true, idempotent: true });
+            if (first.ok && retry.ok) expect(retry.grant.grantId).toBe(first.grant.grantId);
+        });
+
+        it('refuses a replay of the request that produced the expired grant', async () => {
+            const original = issueInput({ expiresAt: EXPIRED_AT });
+            await grants.issueSessionGrant(original);
+            await grants.issueSessionGrant(issueInput({
+                expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY,
+            }));
+            // Its own signed expiry has passed, so the old signature is refused
+            // on that alone — the cap it was signed under is what stops it.
+            expect(await grants.issueSessionGrant({ ...original, now: AFTER_EXPIRY }))
+                .toEqual({ ok: false, reason: 'already-expired' });
+        });
+
+        it('refuses an old request that is still within its own expiry', async () => {
+            // Signed for long enough to outlive the grant it created, so the
+            // expiry check cannot be what refuses it: the family is live again
+            // under a different id, and the old request id names no row.
+            const original = issueInput({ expiresAt: AFTER_EXPIRY + 2 * HOUR });
+            const first = await grants.issueSessionGrant(original);
+            expect(first).toMatchObject({ ok: true });
+
+            await db.managedSessionGrant.updateMany({
+                where: { family: grants.deriveGrantFamily(scope() as never) },
+                data: { expiresAt: BigInt(EXPIRED_AT) },
+            });
+            const remint = await grants.issueSessionGrant(issueInput({
+                expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY,
+            }));
+            expect(remint).toMatchObject({ ok: true });
+
+            expect(await grants.issueSessionGrant({ ...original, now: AFTER_EXPIRY }))
+                .toEqual({ ok: false, reason: 'family-exists' });
+            const rows = await db.managedSessionGrant.findMany({ where: { runId } });
+            expect(rows).toHaveLength(1);
+            if (remint.ok) expect(rows[0].grantId).toBe(remint.grant.grantId);
+        });
+
+        it('never leaves a renewal attached to a grant that was replaced', async () => {
+            const oldGrantId = await issueThenExpire();
+            // A renewal for the expiring grant and a remint of the same family,
+            // racing. Whichever commits first, the row must never end up
+            // carrying one grant's id and the other's sequence.
+            const [renewed, reminted] = await Promise.all([
+                grants.renewSessionGrant({
+                    scope: scope() as never,
+                    expectedGrantId: oldGrantId,
+                    expectedRenewalSeq: 0,
+                    expiresAt: AFTER_EXPIRY + 2 * HOUR,
+                    now: NOW,
+                }),
+                grants.issueSessionGrant(issueInput({
+                    expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY,
+                })),
+            ]);
+
+            const rows = await db.managedSessionGrant.findMany({ where: { runId } });
+            expect(rows).toHaveLength(1);
+            const row = rows[0];
+            if (reminted.ok && row.grantId === reminted.grant.grantId) {
+                // The remint's grant is brand new: it has no renewals.
+                expect(row.renewalSeq).toBe(0);
+            } else {
+                // The old grant survived, so only its own renewal may show.
+                expect(row.grantId).toBe(oldGrantId);
+                expect(row.renewalSeq).toBe(renewed.ok ? 1 : 0);
+            }
+        });
+
+        it('refuses a remint that reuses the id it is replacing', async () => {
+            // Reported by review, reproduced here. Nothing stops a remint from
+            // presenting the id already on the row: the replacement is accepted
+            // and the sequence goes back to zero. A renewal signed for that id
+            // at sequence 0 — the old holder's, delayed — then matches both the
+            // id and the sequence, and extends a grant it never held.
+            //
+            // That is the ABA `expectedGrantId` exists to close, so the id must
+            // be required to be new. Failing until the contract is updated.
+            const reused = await issueThenExpire();
+            const remint = await grants.issueSessionGrant(issueInput({
+                grantId: reused, expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY,
+            }));
+            expect(remint).toEqual({ ok: false, reason: 'grant-id-reused' });
+            const row = await db.managedSessionGrant.findFirstOrThrow({ where: { runId } });
+            expect(row.grantId).toBe(reused);
+            expect(Number(row.expiresAt)).toBe(EXPIRED_AT);
+        });
+
+        it('does not let a delayed renewal extend a later grant that carries the same id', async () => {
+            // A(0) → B(1) → A(2). The id repeats across generations, which the
+            // single-row contract cannot prevent, so the sequence is what tells
+            // the generations apart.
+            const a = await issueThenExpire();
+            const second = await grants.issueSessionGrant(issueInput({
+                expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY,
+            }));
+            expect(second).toMatchObject({ ok: true });
+            if (second.ok) expect(second.grant.renewalSeq).toBe(1);
+
+            await db.managedSessionGrant.updateMany({
+                where: { runId }, data: { expiresAt: BigInt(AFTER_EXPIRY) },
+            });
+            const third = await grants.issueSessionGrant(issueInput({
+                grantId: a, expiresAt: AFTER_EXPIRY + 2 * HOUR, now: AFTER_EXPIRY + 1,
+            }));
+            expect(third).toMatchObject({ ok: true });
+            if (third.ok) {
+                expect(third.grant.grantId).toBe(a);
+                expect(third.grant.renewalSeq).toBe(2);
+            }
+
+            // A's original holder renews: the id matches again, the sequence
+            // does not.
+            expect(await grants.renewSessionGrant({
+                scope: scope() as never,
+                expectedGrantId: a,
+                expectedRenewalSeq: 0,
+                expiresAt: AFTER_EXPIRY + 5 * HOUR,
+                now: AFTER_EXPIRY + 1,
+            })).toEqual({ ok: false, reason: 'renewal-conflict' });
+
+            const row = await db.managedSessionGrant.findFirstOrThrow({ where: { runId } });
+            expect(row.renewalSeq).toBe(2);
+            expect(Number(row.expiresAt)).toBe(AFTER_EXPIRY + 2 * HOUR);
+        });
+
+        it('refuses a remint that would take the sequence past the column*s range', async () => {
+            await issueThenExpire();
+            await db.managedSessionGrant.updateMany({
+                where: { runId }, data: { renewalSeq: 2_147_483_647 },
+            });
+            // Wrapping would let an old signature match a number it already
+            // used. Exhaustion is reported instead.
+            expect(await grants.issueSessionGrant(issueInput({
+                expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY,
+            }))).toEqual({ ok: false, reason: 'sequence-exhausted' });
+        });
+
+        it('refuses a renewal that would take the sequence past the column*s range', async () => {
+            const issued = await grants.issueSessionGrant(issueInput());
+            if (!issued.ok) throw new Error('fixture failed');
+            await db.managedSessionGrant.updateMany({
+                where: { runId }, data: { renewalSeq: 2_147_483_647 },
+            });
+            expect(await grants.renewSessionGrant({
+                scope: scope() as never,
+                expectedGrantId: issued.grant.grantId,
+                expectedRenewalSeq: 2_147_483_647,
+                expiresAt: NOW + 5 * HOUR,
+                now: NOW,
+            })).toEqual({ ok: false, reason: 'sequence-exhausted' });
+        });
+
+        it('replays an already-successful mint without advancing the sequence', async () => {
+            await issueThenExpire();
+            const input = issueInput({ expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY });
+            const first = await grants.issueSessionGrant(input);
+            expect(first).toMatchObject({ ok: true });
+            const before = await db.managedSessionGrant.findFirstOrThrow({ where: { runId } });
+
+            const retry = await grants.issueSessionGrant(input);
+            expect(retry).toMatchObject({ ok: true, idempotent: true });
+            const after = await db.managedSessionGrant.findFirstOrThrow({ where: { runId } });
+            expect(after.renewalSeq).toBe(before.renewalSeq);
+            expect(after.grantId).toBe(before.grantId);
+        });
+
+        it('lets exactly one of two concurrent remints win', async () => {
+            await issueThenExpire();
+            const [a, b] = await Promise.all([
+                grants.issueSessionGrant(issueInput({ expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY })),
+                grants.issueSessionGrant(issueInput({ expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY })),
+            ]);
+            expect([a, b].filter((r) => r.ok)).toHaveLength(1);
+            const rows = await db.managedSessionGrant.findMany({ where: { runId } });
+            expect(rows).toHaveLength(1);
+        });
+    });
+
+    describe('a renewal names the grant it extends', () => {
+        const EXPIRED_AT = NOW + 60_000;
+        const AFTER_EXPIRY = EXPIRED_AT + 1;
+
+        it('refuses a renewal that names a grant this family no longer has', async () => {
+            const first = await grants.issueSessionGrant(issueInput({ expiresAt: EXPIRED_AT }));
+            if (!first.ok) throw new Error('fixture failed');
+            const staleGrantId = first.grant.grantId;
+            const remint = await grants.issueSessionGrant(issueInput({
+                expiresAt: AFTER_EXPIRY + HOUR, now: AFTER_EXPIRY,
+            }));
+            expect(remint).toMatchObject({ ok: true });
+
+            // The old holder's renewal, arriving late. The id no longer names
+            // the current grant, so it is refused before the sequence matters.
+            expect(await grants.renewSessionGrant({
+                scope: scope() as never,
+                expectedGrantId: staleGrantId,
+                expectedRenewalSeq: 0,
+                expiresAt: AFTER_EXPIRY + 2 * HOUR,
+                now: AFTER_EXPIRY,
+            })).toEqual({ ok: false, reason: 'grant-mismatch' });
+
+            const row = await db.managedSessionGrant.findFirstOrThrow({ where: { runId } });
+            expect(row.renewalSeq).toBe(1);
+            expect(Number(row.expiresAt)).toBe(AFTER_EXPIRY + HOUR);
+        });
+
+        it('compares the id before answering an idempotent retry', async () => {
+            const issued = await grants.issueSessionGrant(issueInput());
+            if (!issued.ok) throw new Error('fixture failed');
+            const args = {
+                scope: scope() as never,
+                expectedGrantId: issued.grant.grantId,
+                expectedRenewalSeq: 0,
+                expiresAt: NOW + 2 * HOUR,
+                now: NOW,
+            };
+            await grants.renewSessionGrant(args);
+            // A stale id must not reach the idempotent answer.
+            expect(await grants.renewSessionGrant({ ...args, expectedGrantId: 'someone-elses-grant' }))
+                .toEqual({ ok: false, reason: 'grant-mismatch' });
+            expect(await grants.renewSessionGrant(args)).toMatchObject({ ok: true, idempotent: true });
+        });
+
+        it('answers with the grant the caller named', async () => {
+            const issued = await grants.issueSessionGrant(issueInput());
+            if (!issued.ok) throw new Error('fixture failed');
+            const renewed = await grants.renewSessionGrant({
+                scope: scope() as never,
+                expectedGrantId: issued.grant.grantId,
+                expectedRenewalSeq: 0,
+                expiresAt: NOW + 2 * HOUR,
+                now: NOW,
+            });
+            expect(renewed).toMatchObject({ ok: true });
+            if (renewed.ok) expect(renewed.grant.grantId).toBe(issued.grant.grantId);
         });
     });
 
@@ -465,7 +847,8 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
         it('extends in place under compare-and-set', async () => {
             await grants.issueSessionGrant(issueInput());
             const renewed = await grants.renewSessionGrant({
-                scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW,
+                scope: scope(),
+                expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW,
             });
             expect(renewed).toMatchObject({ ok: true, idempotent: false });
             if (renewed.ok) expect(renewed.grant).toMatchObject({ renewalSeq: 1, expiresAt: NOW + 2 * HOUR });
@@ -473,14 +856,14 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
 
         it('returns the stored grant for an exact retry', async () => {
             await grants.issueSessionGrant(issueInput());
-            const args = { scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW };
+            const args = { scope: scope(), expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW };
             await grants.renewSessionGrant(args);
             expect(await grants.renewSessionGrant(args)).toMatchObject({ ok: true, idempotent: true });
         });
 
         it('refuses an idempotent retry once the authority has moved on', async () => {
             await grants.issueSessionGrant(issueInput());
-            const args = { scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW };
+            const args = { scope: scope(), expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW };
             await grants.renewSessionGrant(args);
             await projection.syncRunAuthority({
                 body: { runId, workspaceId, accountId, currentAttemptId: 'attempt-2', cancelled: false },
@@ -495,13 +878,16 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
         it('refuses a stale sequence and a renewal that shortens the grant', async () => {
             await grants.issueSessionGrant(issueInput());
             await grants.renewSessionGrant({
-                scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW,
+                scope: scope(),
+                expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW,
             });
             expect(await grants.renewSessionGrant({
-                scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 3 * HOUR, now: NOW,
+                scope: scope(),
+                expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 3 * HOUR, now: NOW,
             })).toEqual({ ok: false, reason: 'renewal-conflict' });
             expect(await grants.renewSessionGrant({
-                scope: scope(), expectedRenewalSeq: 1, expiresAt: NOW + HOUR, now: NOW,
+                scope: scope(),
+                expectedGrantId: currentGrantId(), expectedRenewalSeq: 1, expiresAt: NOW + HOUR, now: NOW,
             })).toEqual({ ok: false, reason: 'not-extending' });
         });
 
@@ -509,7 +895,8 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
             await grants.issueSessionGrant(issueInput());
             await grants.revokeSessionGrant({ scope: scope(), reason: 'operator', now: NOW });
             expect(await grants.renewSessionGrant({
-                scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW,
+                scope: scope(),
+                expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW,
             })).toEqual({ ok: false, reason: 'revoked' });
         });
 
@@ -521,7 +908,8 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
                 now: NOW,
             });
             expect(await grants.renewSessionGrant({
-                scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW,
+                scope: scope(),
+                expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW,
             })).toEqual({ ok: false, reason: 'authority-stale' });
         });
 
@@ -530,13 +918,14 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
             // Renewing an expired grant would revive a child the expiry already
             // stopped; a new mint is the only way back.
             expect(await grants.renewSessionGrant({
-                scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 10 * HOUR, now: NOW + HOUR,
+                scope: scope(),
+                expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 10 * HOUR, now: NOW + HOUR,
             })).toEqual({ ok: false, reason: 'expired' });
         });
 
         it('refuses an idempotent retry once the renewed grant has expired', async () => {
             await grants.issueSessionGrant(issueInput());
-            const args = { scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW };
+            const args = { scope: scope(), expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW };
             await grants.renewSessionGrant(args);
             expect(await grants.renewSessionGrant({ ...args, now: NOW + 3 * HOUR }))
                 .toEqual({ ok: false, reason: 'expired' });
@@ -553,7 +942,8 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
             // The scope is current, so the projection comparison passes. The
             // grant is not, and renewing must not carry it forward.
             expect(await grants.renewSessionGrant({
-                scope: current, expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW,
+                scope: current, expectedGrantId: currentGrantId(),
+                expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW,
             })).toEqual({ ok: false, reason: 'authority-stale' });
             const row = await db.managedSessionGrant.findFirstOrThrow({ where: { runId } });
             expect(row).toMatchObject({ epoch: 1, workspaceAuthorityVersion: 1, renewalSeq: 0 });
@@ -562,7 +952,8 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
         it('reports the stored versions, not the ones the caller sent', async () => {
             await grants.issueSessionGrant(issueInput());
             const renewed = await grants.renewSessionGrant({
-                scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW,
+                scope: scope(),
+                expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW,
             });
             const row = await db.managedSessionGrant.findFirstOrThrow({ where: { runId } });
             expect(renewed).toMatchObject({ ok: true });
@@ -580,8 +971,8 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
         it('lets exactly one of two concurrent renewals win', async () => {
             await grants.issueSessionGrant(issueInput());
             const [a, b] = await Promise.all([
-                grants.renewSessionGrant({ scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW }),
-                grants.renewSessionGrant({ scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 3 * HOUR, now: NOW }),
+                grants.renewSessionGrant({ scope: scope(), expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 2 * HOUR, now: NOW }),
+                grants.renewSessionGrant({ scope: scope(), expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 3 * HOUR, now: NOW }),
             ]);
             expect([a, b].filter((r) => r.ok)).toHaveLength(1);
             const row = await db.managedSessionGrant.findFirstOrThrow({ where: { runId } });
@@ -600,7 +991,8 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
             expect(await grants.issueSessionGrant(issueInput({ expiresAt: NOW + 500 })))
                 .toMatchObject({ ok: true });
             expect(await grants.renewSessionGrant({
-                scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 1_500, now: NOW,
+                scope: scope(),
+                expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 1_500, now: NOW,
             })).toMatchObject({ ok: true });
 
             const before = await storedRows();
@@ -735,7 +1127,8 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
             // token; it does not shorten the one already handed out. Revocation
             // is what stops a token early, and it is checked on every action.
             await grants.renewSessionGrant({
-                scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 5 * HOUR, now: NOW,
+                scope: scope(),
+                expectedGrantId: currentGrantId(), expectedRenewalSeq: 0, expiresAt: NOW + 5 * HOUR, now: NOW,
             });
             expect(await resolve({}, NOW + HOUR - 1)).toMatchObject({ ok: true });
             expect(await resolve({}, NOW + HOUR)).toEqual({ ok: false, reason: 'expired' });
