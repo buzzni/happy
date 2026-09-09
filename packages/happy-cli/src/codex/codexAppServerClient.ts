@@ -403,6 +403,45 @@ export class CodexAppServerClient {
         return fields;
     }
 
+    /**
+     * completedTurnIds exists to dedupe the SAME completion reported twice in
+     * quick succession (codex/event and v2 turn/completed racing for one
+     * turn, or a stray fallback timer firing after the authoritative signal
+     * already did — see emitOrDeferRawTurnCompletion/scheduleRawTurnCompletionFallback).
+     * It must not survive genuine NEW work starting: a mid-turn agentMessage
+     * can legitimately carry phase 'final_answer' (e.g. a clarifying
+     * question), which fires our idle-fallback task_complete while Codex has
+     * not actually finished. Codex then resumes the SAME provider turn — no
+     * fresh turn/started precedes it, since it never asked for a new turn —
+     * and with pendingTurnCompletion already null at that point, this
+     * resumed activity is the only signal available that the earlier
+     * completion was premature. Reopen the consumer lifecycle and forget the
+     * stale marker so the eventual authoritative completion is delivered as a
+     * balanced start/end pair instead of silently dropped. Otherwise the
+     * session receives no durable terminal marker for the resumed work
+     * (desktop-stuck-responding-state: a live client stayed "응답중" 24+
+     * minutes past the real end of work because of exactly this).
+     * Scoped to item/started (a new work item beginning) and its legacy
+     * exec_command_begin equivalent — never to item/completed or its legacy
+     * counterparts, so the same-tick dual-protocol completion race above
+     * stays untouched.
+     */
+    private reopenConsumerLifecycleOnResumedWork(turnId: string | null): void {
+        if (this.pendingTurnCompletion) return;
+        if (this.completedTurnIds.size === 0) return;
+        logger.debug('[CodexAppServer] New work started with no pending turn; reopening consumer lifecycle', {
+            turnIds: [...this.completedTurnIds],
+        });
+        this.completedTurnIds.clear();
+        if (turnId) {
+            this._turnId = turnId;
+        }
+        this.eventHandler?.({
+            type: 'task_started',
+            ...(turnId ? { turn_id: turnId } : {}),
+        });
+    }
+
     private emitRawTurnCompletion(
         turnId: string | null,
         status: string | null,
@@ -608,6 +647,10 @@ export class CodexAppServerClient {
         const item = params?.item;
         if (!item || typeof item !== 'object') {
             return method.startsWith('item/');
+        }
+
+        if (method === 'item/started') {
+            this.reopenConsumerLifecycleOnResumedWork(this.extractTurnId(params));
         }
 
         if (method === 'item/started' && item.type === 'commandExecution') {
@@ -1923,6 +1966,9 @@ export class CodexAppServerClient {
             const msg = params?.msg;
             if (msg) {
                 const turnId = msg.turn_id ?? msg.turnId ?? null;
+                if (msg.type === 'exec_command_begin') {
+                    this.reopenConsumerLifecycleOnResumedWork(turnId);
+                }
                 if (msg.type === 'task_started') {
                     if (!this.markPendingTurnStarted(turnId)) return;
                     if (turnId) {
