@@ -23,6 +23,24 @@ const PROJECT_ENV = JSON.stringify({
 });
 
 describe('resolveSessionSandboxConfig', () => {
+    it('preserves a project Git config grant through schema parsing', () => {
+        const resolved = resolveSessionSandboxConfig({
+            noSandbox: false,
+            env: { HAPPY_PROJECT_SANDBOX_CONFIG: JSON.stringify({ enabled: true, allowGitConfig: true }) },
+            settings: undefined,
+        });
+        expect(resolved?.allowGitConfig).toBe(true);
+    });
+
+    it('keeps an explicit project disable ahead of enabled machine settings', () => {
+        const resolved = resolveSessionSandboxConfig({
+            noSandbox: false,
+            env: { HAPPY_PROJECT_SANDBOX_CONFIG: JSON.stringify({ enabled: false }) },
+            settings: { sandboxConfig: { enabled: true } as never },
+        });
+        expect(resolved?.enabled).toBe(false);
+    });
+
     it('takes the daemon-injected project config over local settings', () => {
         const resolved = resolveSessionSandboxConfig({
             noSandbox: false,

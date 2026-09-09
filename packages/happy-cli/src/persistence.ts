@@ -24,6 +24,7 @@ export const SandboxConfigSchema = z.object({
   denyReadPaths: z.array(z.string()).default(['~/.ssh', '~/.aws', '~/.gnupg']),
   extraWritePaths: z.array(z.string()).default(['/tmp']),
   denyWritePaths: z.array(z.string()).default(['.env']),
+  allowGitConfig: z.boolean().optional(),
   networkMode: z.enum(['blocked', 'allowed', 'custom']).default('allowed'),
   allowedDomains: z.array(z.string()).default([]),
   deniedDomains: z.array(z.string()).default([]),
