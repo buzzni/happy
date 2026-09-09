@@ -49,6 +49,16 @@ import {
 
 type TransportResult = { ok: boolean; value?: any; error?: string }
 
+// 예약 세션은 대화의 매-turn orchestration을 거치지 않으므로 첫 작업에 진단 기준을 붙인다.
+const SCHEDULED_AUTOMATION_PROMPT_PREAMBLE = [
+  '## 예약 자동화 진단 지침',
+  '[연동 판단] 현재 세션의 도구 목록만으로 미연동을 단정하지 말고 Saycode의 연결 상태와 실제 도구 탐색·호출 결과를 확인한다.',
+  '[고장 판단] 사용 중인 실행 경로와 최신 실행 기록을 확인하며, 오래된 경로의 오류만으로 현재 자동화의 고장을 단정하지 않는다.',
+  '[사용자 요구] 재연동·설정 변경은 현재 Saycode 연결 상태와 실제 호출 오류로 필요성이 확인된 경우에만 요청한다.',
+  '[보고] 확인한 사실과 추정을 구분하고, 확인하지 못한 상태는 확인 불가로 보고하며 근거와 다음 확인 방법을 밝힌다.',
+  '[안전] 진단은 읽기 전용으로 수행하며 토큰·비밀값을 출력하거나 연결·설정을 임의로 변경하지 않는다.',
+].join('\n')
+
 export interface ServerAutomationTransport {
   claim(input: { automationId: string; generation: number; scheduledFor: number }): Promise<TransportResult>
   start(input: { runId: string; claimToken: string }): Promise<TransportResult>
@@ -1004,7 +1014,7 @@ async function executeStartedRun(
   degradedCode?: string
   queueDepth?: number
 }> {
-  let prompt = payload.prompt
+  let prompt = `${SCHEDULED_AUTOMATION_PROMPT_PREAMBLE}\n\n${payload.prompt}`
   let environmentVariables: Record<string, string> | undefined
   let agentTaskDispatch: AutomationAgentTaskDispatch | null = null
   let persistGithubTriggerState: ((
