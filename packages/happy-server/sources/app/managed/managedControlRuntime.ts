@@ -66,8 +66,21 @@ export async function createManagedControlRuntime(
     } catch {
         throw new Error('HAPPY_MANAGED_PUBLIC_URL must be an absolute URL');
     }
-    if (parsed.protocol !== 'https:' && parsed.hostname !== 'localhost') {
-        throw new Error('HAPPY_MANAGED_PUBLIC_URL must be https outside localhost');
+    // https anywhere, or plain http for localhost. Written as the two things
+    // that are allowed rather than as two things that are not: the earlier
+    // form — "not https AND not localhost" — let every other scheme through
+    // the loopback exemption, so `ftp://localhost` was accepted.
+    const localHttp = parsed.protocol === 'http:' && parsed.hostname === 'localhost';
+    if (parsed.protocol !== 'https:' && !localHttp) {
+        throw new Error('HAPPY_MANAGED_PUBLIC_URL must be https, or http on localhost');
+    }
+    // `URL.origin` drops credentials, path, query and fragment without saying
+    // so, which would publish an address nobody configured. A value that is
+    // not already a bare origin is refused instead of quietly rewritten.
+    if (parsed.username || parsed.password
+        || parsed.search || parsed.hash
+        || (parsed.pathname !== '' && parsed.pathname !== '/')) {
+        throw new Error('HAPPY_MANAGED_PUBLIC_URL must be a bare origin: no credentials, path, query or fragment');
     }
 
     return {

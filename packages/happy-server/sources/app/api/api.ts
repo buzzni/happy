@@ -41,7 +41,12 @@ import { sessionFollowupRoutes } from "./routes/sessionFollowupRoutes";
 import { agentProfileRoutes } from "./routes/agentProfileRoutes";
 import { managedControlRoutes } from "./routes/managedControlRoutes";
 import { createManagedControlRuntime, type ManagedControlRuntime } from "@/app/managed/managedControlRuntime";
-import { isLocalStorage, getLocalFilesDir } from "@/storage/files";
+import {
+    activateManagedStorage,
+    assertPrivateRootIsolated,
+    setManagedBucket,
+} from "@/app/managed/managedAttachmentStorage";
+import { isLocalStorage, getLocalFilesDir, getManagedFilesDir } from "@/storage/files";
 import * as path from "path";
 import * as fs from "fs";
 import { startUsageOutboxWorker } from "@/app/usage/usageOutbox";
@@ -180,7 +185,26 @@ export async function startApi(opts: StartApiOptions = {}) {
     workspaceRoutes(typed);
     mergeRequestRoutes(typed);
     previewRoutes(typed);
-    attachmentRoutes(typed);
+    // The same initialized runtime the scoped-token decorator uses. Building a
+    // second here would derive a second key and publish a second origin.
+    //
+    // Storage is a separate gate: the relay only runs once the private root is
+    // provably distinct from the public one, and — on an object store — the
+    // managed bucket has been seen to carry no policy at all. Anything less
+    // than that leaves the relay off rather than pointed somewhere public.
+    let managedStorageReady = false;
+    if (managedControl) {
+        assertPrivateRootIsolated(getLocalFilesDir(), getManagedFilesDir());
+        const activation = await activateManagedStorage(process.env);
+        if (activation.ok) {
+            managedStorageReady = true;
+            setManagedBucket(activation.mode === 's3' ? activation.bucket : null);
+        } else {
+            log({ module: 'managed-attachments', level: 'error' },
+                `Managed attachment storage inactive (${activation.reason})`);
+        }
+    }
+    attachmentRoutes(typed, () => (managedStorageReady ? managedControl : null));
     automationRoutes(typed);
     scriptAutomationRoutes(typed);
     sessionFollowupRoutes(typed);

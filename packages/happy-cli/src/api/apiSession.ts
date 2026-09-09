@@ -288,6 +288,75 @@ function buildMultipartUploadBody(
     };
 }
 
+/**
+ * The managed relay contract, as the child must enforce it.
+ *
+ * `serverOrigin` is the exact origin every managed attachment URL must be on.
+ * A scoped bearer is only ever sent there, and never through a redirect.
+ */
+export type ManagedCredentialMode = {
+    serverOrigin: string;
+};
+
+/**
+ * Checks a URL the server handed back before a scoped bearer is sent to it.
+ *
+ * Exact origin, no credentials, and the path this session owns. A redirect is
+ * refused at the transport (`maxRedirects: 0`) rather than inspected, because a
+ * 302 is read after the request — and the request already carried the token.
+ */
+export function assertManagedAttachmentUrl(
+    raw: string,
+    managed: ManagedCredentialMode,
+    sessionId: string,
+): URL {
+    let parsed: URL;
+    try {
+        parsed = new URL(raw);
+    } catch {
+        throw new Error('managed attachment URL is not absolute');
+    }
+    if (parsed.origin !== managed.serverOrigin) {
+        throw new Error('managed attachment URL is not on the configured server origin');
+    }
+    if (parsed.username || parsed.password) {
+        throw new Error('managed attachment URL carries credentials');
+    }
+    const expected = `/v1/sessions/${encodeURIComponent(sessionId)}/attachments/`;
+    if (!parsed.pathname.startsWith(expected)) {
+        throw new Error('managed attachment URL is not under this session');
+    }
+    return parsed;
+}
+
+/**
+ * Requires the configured server and the managed relay origin to be the one
+ * origin, compared canonically.
+ *
+ * String equality on the raw values would call `https://relay.test` and
+ * `https://relay.test/` different, and `HTTPS://Relay.test` the same as
+ * nothing at all; `URL.origin` normalises scheme, host and port and drops
+ * everything that is not part of an origin.
+ */
+export function assertManagedServerOrigin(managed: ManagedCredentialMode): string {
+    let configured: string;
+    try {
+        configured = new URL(configuration.serverUrl).origin;
+    } catch {
+        throw new Error('managed mode requires an absolute server URL');
+    }
+    let expected: string;
+    try {
+        expected = new URL(managed.serverOrigin).origin;
+    } catch {
+        throw new Error('managed mode requires an absolute relay origin');
+    }
+    if (configured !== expected) {
+        throw new Error('managed relay origin does not match the configured server origin');
+    }
+    return expected;
+}
+
 export class ApiSessionClient extends EventEmitter {
     private readonly token: string;
     readonly sessionId: string;
@@ -389,10 +458,34 @@ export class ApiSessionClient extends EventEmitter {
     private lastClaudeTurnResultUuid: string | null = null;
     private inputObservedForNextTurn = false;
     private launchedBackgroundJob = false;
+    /**
+     * Set only when the caller says so.
+     *
+     * Never inferred from the shape of the token or the key: a mode guessed
+     * from a credential is a mode that changes when the credential format
+     * does, and this one decides whether redirects are followed.
+     */
+    private readonly managed: ManagedCredentialMode | null;
 
-    constructor(token: string, session: Session) {
+    constructor(token: string, session: Session, managed?: ManagedCredentialMode) {
         super()
         this.token = token;
+        // Before the socket, before the handlers, before anything is sent.
+        //
+        // Every request below is built from `configuration.serverUrl`, which
+        // is process-wide and not this client's to own. A managed client that
+        // accepted a mismatch would put its scoped bearer wherever that value
+        // points — including the socket, which the constructor opens — and no
+        // check after the fact can recall it. Agreement is required up front
+        // rather than assumed to hold in some later configuration.
+        //
+        // What is kept is the *canonical* origin, not the text that was
+        // handed in. `HTTPS://Relay.test:443/` names the same origin as
+        // `https://relay.test` and is accepted as such, so storing the raw
+        // spelling would then fail every `URL.origin` comparison against it —
+        // the client would admit itself and refuse the very server it was
+        // configured for.
+        this.managed = managed ? { serverOrigin: assertManagedServerOrigin(managed) } : null;
         this.sessionId = session.id;
         this.metadata = session.metadata;
         this.metadataVersion = session.metadataVersion;
@@ -604,12 +697,16 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private async requestAttachmentUpload(filename: string, size: number): Promise<AttachmentUploadResult> {
+        const base = this.managed ? this.managed.serverOrigin : configuration.serverUrl;
         const response = await axios.post<AttachmentUploadResult>(
-            `${configuration.serverUrl}/v1/sessions/${encodeURIComponent(this.sessionId)}/attachments/request-upload`,
+            `${base}/v1/sessions/${encodeURIComponent(this.sessionId)}/attachments/request-upload`,
             { filename, size },
             {
                 headers: this.authHeaders(),
                 timeout: 30000,
+                // Managed: a redirect would carry the bearer somewhere this
+                // client never agreed to send it.
+                ...(this.managed ? { maxRedirects: 0 } : {}),
             },
         );
 
@@ -623,10 +720,17 @@ export class ApiSessionClient extends EventEmitter {
             throw new Error('request-upload returned an invalid response');
         }
 
-        return {
-            ...upload,
-            method: upload.method ?? 'PUT',
-        };
+        const method = upload.method ?? 'PUT';
+        if (this.managed) {
+            // The relay contract: this server, this session, a plain PUT. A
+            // presigned POST would carry its own authority to another origin.
+            if (method !== 'PUT') {
+                throw new Error('managed upload must be a PUT to the relay');
+            }
+            assertManagedAttachmentUrl(upload.uploadUrl, this.managed, this.sessionId);
+        }
+
+        return { ...upload, method };
     }
 
     private async uploadEncryptedAttachmentBlob(upload: AttachmentUploadResult, encrypted: Uint8Array): Promise<void> {
@@ -645,7 +749,10 @@ export class ApiSessionClient extends EventEmitter {
         const headers: Record<string, string> = {
             'Content-Type': 'application/octet-stream',
         };
-        if (upload.uploadUrl.startsWith(configuration.serverUrl)) {
+        if (this.managed) {
+            assertManagedAttachmentUrl(upload.uploadUrl, this.managed, this.sessionId);
+            headers.Authorization = `Bearer ${this.token}`;
+        } else if (upload.uploadUrl.startsWith(configuration.serverUrl)) {
             headers.Authorization = `Bearer ${this.token}`;
         }
 
@@ -653,6 +760,7 @@ export class ApiSessionClient extends EventEmitter {
             headers,
             timeout: 60000,
             maxBodyLength: 10 * 1024 * 1024,
+            ...(this.managed ? { maxRedirects: 0 } : {}),
         });
     }
 
@@ -681,13 +789,17 @@ export class ApiSessionClient extends EventEmitter {
      * presigned URL that does not accept extra headers.
      */
     async downloadAttachment(ref: string): Promise<Uint8Array> {
-        const requestUrl = `${configuration.serverUrl}/v1/sessions/${this.sessionId}/attachments/request-download`;
+        const base = this.managed ? this.managed.serverOrigin : configuration.serverUrl;
+        const requestUrl = `${base}/v1/sessions/${this.sessionId}/attachments/request-download`;
         const requestRes = await axios.post(
             requestUrl,
             { ref },
             {
                 headers: { 'Authorization': `Bearer ${this.token}`, 'Content-Type': 'application/json' },
                 timeout: 30000,
+                // Both metadata calls, not only the blob transfers: a redirect
+                // on this one carries the bearer just as far.
+                ...(this.managed ? { maxRedirects: 0 } : {}),
             },
         );
         const downloadUrl = requestRes.data?.downloadUrl;
@@ -695,16 +807,19 @@ export class ApiSessionClient extends EventEmitter {
             throw new Error('request-download returned no downloadUrl');
         }
 
-        const isServerUrl = downloadUrl.startsWith(configuration.serverUrl);
         const headers: Record<string, string> = {};
-        if (isServerUrl) {
+        if (this.managed) {
+            assertManagedAttachmentUrl(downloadUrl, this.managed, this.sessionId);
+            headers['Authorization'] = `Bearer ${this.token}`;
+        } else if (downloadUrl.startsWith(configuration.serverUrl)) {
             headers['Authorization'] = `Bearer ${this.token}`;
         }
         const response = await axios.get(downloadUrl, {
             headers,
             responseType: 'arraybuffer',
             timeout: 60000,
-            maxRedirects: 5,
+            // BYOS follows a presigned redirect; managed never does.
+            maxRedirects: this.managed ? 0 : 5,
             maxContentLength: 10 * 1024 * 1024,
         });
         return new Uint8Array(response.data);
