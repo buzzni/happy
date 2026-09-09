@@ -28,6 +28,16 @@ import { type ProviderLaunchPlan, planProviderLaunch, type ProviderAgent } from 
 import { systemMonotonicNow } from './supervisor';
 
 export type ManagedToolSessionInput = {
+    /**
+     * Passed straight through to the runtime, where every broker call goes
+     * through one place. The session does not own the drain: a checkpoint and
+     * the tool path have to share exactly one, and the checkpoint runner is
+     * what holds it.
+     */
+    checkpointDrain?: {
+        drain: { beginWrite: () => () => void };
+        writeTools: ReadonlySet<string>;
+    };
     agent: ProviderAgent;
     /** 이 run 의 provider env. gateway capability 는 여기 있어도 된다. */
     providerEnv: Record<string, string>;
@@ -114,6 +124,7 @@ export async function startManagedToolSession(
         timeoutMs: input.toolTimeoutMs,
         terminationWaitMs: input.terminationWaitMs,
         onUnprovenTermination: input.onUnprovenTermination,
+        checkpointDrain: input.checkpointDrain,
     }));
     // 포트 0 으로 열고 커널이 준 번호를 쓴다. 고정 포트는 다른 run 과 부딪힌다.
     const brokerPort = await broker.listen(0);

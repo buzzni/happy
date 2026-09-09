@@ -20,6 +20,16 @@ export const MAX_WRITE_BYTES = 1024 * 1024;
 /** 명령 하나의 상한. executor 전체 시한과 별개로 여기서도 끊는다. */
 export const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 
+/**
+ * The tools that can change the workspace.
+ *
+ * `run_command` is here because it *can* write, not because it always does.
+ * A checkpoint's consistency argument is that no write is in flight while the
+ * archive is taken, and "this command probably only reads" is not something
+ * that can be known from the outside.
+ */
+export const MANAGED_WRITE_TOOLS: ReadonlySet<string> = new Set(['write_file', 'run_command']);
+
 export const MANAGED_CODING_TOOLS: BrokerTool[] = [
     {
         name: 'read_file',

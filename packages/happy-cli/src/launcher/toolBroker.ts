@@ -64,6 +64,13 @@ export const BROKER_FAILURE_CODES = [
     'tool-unavailable',
     'execution-failed',
     'execution-timeout',
+    /**
+     * A checkpoint is being taken and writes are held. Distinct from
+     * `execution-failed` on purpose: this one is worth retrying in a moment
+     * and nothing went wrong, and folding it into the generic failure would
+     * tell the model its edit broke.
+     */
+    'checkpoint-paused',
 ] as const;
 export type BrokerFailureCode = (typeof BROKER_FAILURE_CODES)[number];
 

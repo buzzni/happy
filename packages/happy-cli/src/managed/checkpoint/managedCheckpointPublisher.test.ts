@@ -196,6 +196,27 @@ describe('publishManagedCheckpoint', () => {
         expect(store.objects.has('https://store.invalid/latest.json')).toBe(false);
     });
 
+    it('shouldRefuseWhenThePointerExistsButItsVersionIsUnknown', async () => {
+        const store = fakeStore();
+        store.objects.set('https://store.invalid/latest.json', Buffer.from('{"schemaVersion":1}'));
+        const versionless = {
+            ...store,
+            fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+                const response = await store.fetchImpl(url, init);
+                if (String(url).includes('latest.json') && (init?.method ?? 'GET') === 'GET') {
+                    // A store that answers without an ETag gives no version to
+                    // compare against.
+                    return new Response(await response.text(), { status: response.status });
+                }
+                return response;
+            }) as unknown as typeof globalThis.fetch,
+        };
+
+        await expect(publish({ store: versionless })).rejects.toMatchObject({ code: 'pointer-unreadable' });
+        // The existing pointer is left exactly as it was.
+        expect(store.objects.get('https://store.invalid/latest.json')!.toString()).toBe('{"schemaVersion":1}');
+    });
+
     it('shouldLeaveAnotherRuntimesPointerAloneWhenItPublishedFirst', async () => {
         const store = fakeStore();
         // Another runtime's pointer is already there, so this run's

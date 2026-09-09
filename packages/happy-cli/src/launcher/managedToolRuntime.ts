@@ -37,8 +37,46 @@ export function createManagedToolRuntime(input: {
      * 선택 인자가 아니다. 빠뜨릴 수 있게 두면 production 이 조용히 빠뜨린다.
      */
     onUnprovenTermination: (info: { tool: string; detail?: string }) => void;
+    /**
+     * Holds writes while a checkpoint is taken. Passed as one object because
+     * the gate and the set of tools it applies to are not independently
+     * useful — a drain with no write tools would silently hold nothing.
+     *
+     * This is the only place a drain can work: inside the executor the tool
+     * runs under a different uid, in its own pid and mount namespaces, with no
+     * way to see anything on this side.
+     */
+    checkpointDrain?: {
+        drain: { beginWrite: () => () => void };
+        writeTools: ReadonlySet<string>;
+    };
 }): ToolBrokerDeps {
     const execute = async (call: BrokerToolCall): Promise<BrokerToolResult> => {
+        let writeFinished: (() => void) | null = null;
+        if (input.checkpointDrain?.writeTools.has(call.name)) {
+            try {
+                writeFinished = input.checkpointDrain.drain.beginWrite();
+            } catch {
+                return { ok: false, code: 'checkpoint-paused' };
+            }
+        }
+        let terminationProven = true;
+        try {
+            return await runCall(call, () => { terminationProven = false; });
+        } finally {
+            // A write whose processes could not be proven stopped is not over.
+            // Releasing it here would let a checkpoint start while something
+            // is still writing to the workspace — and the archive would then
+            // hold a moment that never existed. The gate stays held; a drain
+            // waiting on it fails on its budget, which is the honest outcome.
+            if (terminationProven) writeFinished?.();
+        }
+    };
+
+    const runCall = async (
+        call: BrokerToolCall,
+        onUnprovenTermination: () => void,
+    ): Promise<BrokerToolResult> => {
         // 입구에서 인가한 그 자격을 붙든다. 그 사이 재발급된 자격이 이 호출을
         // 대신 인가하면, 폐기가 폐기가 아니게 된다.
         const admitted = input.grant();
@@ -64,6 +102,7 @@ export function createManagedToolRuntime(input: {
         }
         if (outcome.ok) return { ok: true, content: outcome.content };
         if (outcome.cancelProven === false) {
+            onUnprovenTermination();
             input.onUnprovenTermination({ tool: call.name, detail: outcome.cancelDetail });
         }
         return { ok: false, code: outcome.code };

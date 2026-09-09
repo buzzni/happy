@@ -18,6 +18,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { createCheckpointDrain } from './managedCheckpointDrain';
+import { createManagedCheckpointRunner } from './managedCheckpointRunner';
+import { MANAGED_WRITE_TOOLS } from '@/launcher/toolWorkload';
 import { putCheckpointPointer, readCheckpointPointer } from './managedCheckpointObjectStore';
 import { publishManagedCheckpoint } from './managedCheckpointPublisher';
 import { createManagedCheckpointSource } from './managedCheckpointResolver';
@@ -199,6 +201,50 @@ describe.skipIf(!base)('managed checkpoint against a real object store', () => {
             stagingRoot: home,
         });
         expect(await readFile(join(home, 'project/whose.txt'), 'utf8')).toBe(winner.content);
+    }, 60_000);
+
+    it('shouldPublishTwoSequentialCheckpointsFromOneRunner', async () => {
+        // The property root's fixture is after, proved against a store that
+        // actually implements conditional writes and returns ETags.
+        const prefix = `t13-${randomUUID()}`;
+        const root = await scratch();
+        await mkdir(join(root, 'src'), { recursive: true });
+        await writeFile(join(root, 'src/index.ts'), 'export const a = 1;\n');
+
+        const runner = createManagedCheckpointRunner({
+            tenant, volume, image: { imageVersion: 'img@1' },
+            sources: [{ area: 'project', root }],
+            workDir: join(await scratch(), 'work'),
+            drainBudgetMs: 5000,
+            writeTools: MANAGED_WRITE_TOOLS,
+            flushDeps: { run: async () => ({ code: 0, stdout: '0|0|0' }) },
+            now: () => Date.now(),
+        });
+
+        const takeOne = async () => {
+            const checkpointId = randomBytes(32).toString('hex');
+            const object = `${base}/${prefix}/${checkpointId}/project.tar.gz.enc`;
+            const manifest = `${base}/${prefix}/${checkpointId}/manifest.json.enc`;
+            return runner.takeCheckpoint({
+                checkpointId,
+                key,
+                targets: {
+                    objects: new Map([['project' as const, { putUrl: object, headUrl: object }]]),
+                    manifest: { putUrl: manifest, headUrl: manifest },
+                    pointer: {
+                        putUrl: `${base}/${prefix}/latest.json`,
+                        getUrl: `${base}/${prefix}/latest.json`,
+                    },
+                },
+            });
+        };
+
+        const first = await takeOne();
+        const second = await takeOne();
+
+        expect(second.pointer.checkpointId).not.toBe(first.pointer.checkpointId);
+        const pointer = await readCheckpointPointer({ url: `${base}/${prefix}/latest.json` });
+        expect(JSON.parse(pointer!.body).checkpointId).toBe(second.pointer.checkpointId);
     }, 60_000);
 
     it('shouldRefuseToWriteOverAnObjectThatAlreadyExists', async () => {

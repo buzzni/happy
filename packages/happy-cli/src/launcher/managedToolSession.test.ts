@@ -2,6 +2,8 @@ import { request as httpRequest } from 'node:http';
 
 import { describe, expect, it } from 'vitest';
 
+import { createCheckpointDrain } from '@/managed/checkpoint/managedCheckpointDrain';
+import { MANAGED_WRITE_TOOLS } from './toolWorkload';
 import { startManagedToolSession } from './managedToolSession';
 import { type ExecutorProcess, type ToolExecutorDeps } from './toolExecutor';
 
@@ -88,6 +90,32 @@ describe('managed tool session', () => {
             result: { content: [{ type: 'text', text: 'FILE-BODY' }] },
         });
         expect(events).toContain('release');
+        await session.close();
+    });
+
+    it('holds a write for the checkpoint the caller handed it, and lets reads through', async () => {
+        const events: string[] = [];
+        const drain = createCheckpointDrain();
+        const session = await startManagedToolSession({
+            ...baseInput(events),
+            tools: [...TOOLS, { name: 'write_file', description: 'write', inputSchema: { type: 'object' } }],
+            scope: ['read_file', 'write_file'],
+            checkpointDrain: { drain, writeTools: MANAGED_WRITE_TOOLS },
+        });
+        const token = session.providerPlan.sdkOptions!.mcpServers['saycode-broker']!
+            .headers.authorization.slice('Bearer '.length);
+        const held = await drain.drain(1000);
+
+        // The session forwards the gate; without that the write reaches the
+        // executor while the archive is being taken.
+        expect(await callBroker(session.brokerPort, token, 'write_file'))
+            .toMatchObject({ result: { isError: true, content: [{ text: 'checkpoint-paused' }] } });
+        expect(await callBroker(session.brokerPort, token, 'read_file'))
+            .toMatchObject({ result: { content: [{ type: 'text', text: 'FILE-BODY' }] } });
+
+        held.release();
+        expect(await callBroker(session.brokerPort, token, 'write_file'))
+            .toMatchObject({ result: { content: [{ type: 'text', text: 'FILE-BODY' }] } });
         await session.close();
     });
 

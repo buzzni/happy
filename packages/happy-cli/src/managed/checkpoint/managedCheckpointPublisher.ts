@@ -196,6 +196,14 @@ export async function publishManagedCheckpoint(input: {
             manifestDigest: product.manifestDigest,
             createdAtMs: input.now(),
         };
+        if (previous && previous.etag === null) {
+            // The pointer is there and the store did not say which version.
+            // Falling back to `expectedEtag: null` would send create-if-absent
+            // against an object that exists — a write that can only ever fail,
+            // reported as a conflict with a checkpoint nobody published. There
+            // is no safe compare-and-set without a version, so this says so.
+            throw new ManagedCheckpointPublishError('pointer-unreadable');
+        }
         const written = await putCheckpointPointer({
             url: input.targets.pointer.putUrl,
             body: JSON.stringify(pointer),

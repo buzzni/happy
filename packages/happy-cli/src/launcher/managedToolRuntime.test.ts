@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
+import { createCheckpointDrain } from '@/managed/checkpoint/managedCheckpointDrain';
+import { MANAGED_WRITE_TOOLS } from './toolWorkload';
 import { createManagedToolRuntime } from './managedToolRuntime';
 import { handleBrokerMessage, mintBrokerGrant, type BrokerGrant } from './toolBroker';
 import { createToolExecutor, planToolExecutorIsolation, type ExecutorProcess } from './toolExecutor';
@@ -134,5 +136,152 @@ describe('unproven termination reaches the lifecycle', () => {
         );
         expect(outcome).toEqual({ result: { isError: true, content: [{ type: 'text', text: 'execution-timeout' }] } });
         expect(unproven).toEqual([{ tool: 'read_file', detail: 'termination-unobserved' }]);
+    });
+});
+
+describe('createManagedToolRuntime with a checkpoint drain', () => {
+    function runtime(drain: { beginWrite: () => () => void }, executed: string[]) {
+        return createManagedToolRuntime({
+            tools: [],
+            plan: {} as never,
+            executor: { run: async (call: { call: { name: string } }) => {
+                executed.push(call.call.name);
+                return { ok: true, content: 'done' };
+            } } as never,
+            grant: () => ({ token: 't', scope: new Set(['write_file', 'read_file']), expiresMonotonic: 10 }) as never,
+            monotonicNow: () => 0,
+            timeoutMs: 1000,
+            onUnprovenTermination: () => undefined,
+            checkpointDrain: { drain, writeTools: MANAGED_WRITE_TOOLS },
+        });
+    }
+
+    it('shouldRefuseAWriteWhileTheDrainIsHeldAndSayItIsAPause', async () => {
+        const drain = createCheckpointDrain();
+        const executed: string[] = [];
+        const deps = runtime(drain, executed);
+        const held = await drain.drain(1000);
+
+        expect(await deps.execute({ name: 'write_file', arguments: {} }))
+            .toEqual({ ok: false, code: 'checkpoint-paused' });
+        expect(await deps.execute({ name: 'run_command', arguments: {} }))
+            .toEqual({ ok: false, code: 'checkpoint-paused' });
+        // The call never reached the executor, so nothing was half-written.
+        expect(executed).toEqual([]);
+
+        held.release();
+        expect(await deps.execute({ name: 'write_file', arguments: {} })).toEqual({ ok: true, content: 'done' });
+        expect(executed).toEqual(['write_file']);
+    });
+
+    it('shouldNotHoldReadsWhileACheckpointIsBeingTaken', async () => {
+        const drain = createCheckpointDrain();
+        const executed: string[] = [];
+        const deps = runtime(drain, executed);
+        await drain.drain(1000);
+
+        expect(await deps.execute({ name: 'read_file', arguments: {} })).toEqual({ ok: true, content: 'done' });
+        expect(await deps.execute({ name: 'list_files', arguments: {} })).toEqual({ ok: true, content: 'done' });
+        expect(executed).toEqual(['read_file', 'list_files']);
+    });
+
+    it('shouldMakeADrainWaitForAWriteThatIsAlreadyRunning', async () => {
+        const drain = createCheckpointDrain();
+        let finish: (() => void) | null = null;
+        const deps = createManagedToolRuntime({
+            tools: [],
+            plan: {} as never,
+            executor: { run: async () => {
+                await new Promise<void>((resolve) => { finish = resolve; });
+                return { ok: true, content: 'done' };
+            } } as never,
+            grant: () => ({ token: 't', scope: new Set(['write_file']), expiresMonotonic: 10 }) as never,
+            monotonicNow: () => 0,
+            timeoutMs: 1000,
+            onUnprovenTermination: () => undefined,
+            checkpointDrain: { drain, writeTools: MANAGED_WRITE_TOOLS },
+        });
+
+        const call = deps.execute({ name: 'write_file', arguments: {} });
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        let drained = false;
+        const pending = drain.drain(1000).then((held) => { drained = true; return held; });
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        expect(drained).toBe(false);
+
+        finish!();
+        await call;
+        await pending;
+        expect(drained).toBe(true);
+    });
+
+    it('shouldReleaseTheWriteEvenWhenTheToolFails', async () => {
+        const drain = createCheckpointDrain();
+        const deps = createManagedToolRuntime({
+            tools: [],
+            plan: {} as never,
+            executor: { run: async () => { throw new Error('boom'); } } as never,
+            grant: () => ({ token: 't', scope: new Set(['write_file']), expiresMonotonic: 10 }) as never,
+            monotonicNow: () => 0,
+            timeoutMs: 1000,
+            onUnprovenTermination: () => undefined,
+            checkpointDrain: { drain, writeTools: MANAGED_WRITE_TOOLS },
+        });
+
+        await expect(deps.execute({ name: 'write_file', arguments: {} })).rejects.toThrow();
+        // A write that blew up must not hold the gate shut forever.
+        expect(drain.inFlight()).toBe(0);
+        await expect(drain.drain(1000)).resolves.toBeDefined();
+    });
+});
+
+describe('an unproven write holds the checkpoint gate', () => {
+    it('shouldNotReleaseTheGateForAWriteWhoseProcessesCouldNotBeProvenStopped', async () => {
+        const drain = createCheckpointDrain();
+        const unproven: { tool: string }[] = [];
+        const deps = createManagedToolRuntime({
+            tools: [],
+            plan: {} as never,
+            executor: { run: async () => ({
+                ok: false,
+                code: 'execution-timeout',
+                cancelProven: false,
+                cancelDetail: 'processes may still be running',
+            }) } as never,
+            grant: () => ({ token: 't', scope: new Set(['run_command']), expiresMonotonic: 10 }) as never,
+            monotonicNow: () => 0,
+            timeoutMs: 1000,
+            onUnprovenTermination: (info: { tool: string }) => { unproven.push(info); },
+            checkpointDrain: { drain, writeTools: MANAGED_WRITE_TOOLS },
+        });
+
+        expect(await deps.execute({ name: 'run_command', arguments: {} }))
+            .toEqual({ ok: false, code: 'execution-timeout' });
+        expect(unproven).toHaveLength(1);
+
+        // Something may still be writing to the workspace, so a checkpoint
+        // must not be able to say the volume is quiet.
+        expect(drain.inFlight()).toBe(1);
+        // The drain has nothing to wait for that will ever finish, so it fails
+        // on its budget instead of reporting a quiet volume.
+        await expect(drain.drain(50)).rejects.toMatchObject({ code: 'drain-timeout' });
+    });
+
+    it('shouldReleaseTheGateWhenTerminationWasProven', async () => {
+        const drain = createCheckpointDrain();
+        const deps = createManagedToolRuntime({
+            tools: [],
+            plan: {} as never,
+            executor: { run: async () => ({ ok: false, code: 'execution-timeout', cancelProven: true }) } as never,
+            grant: () => ({ token: 't', scope: new Set(['run_command']), expiresMonotonic: 10 }) as never,
+            monotonicNow: () => 0,
+            timeoutMs: 1000,
+            onUnprovenTermination: () => undefined,
+            checkpointDrain: { drain, writeTools: MANAGED_WRITE_TOOLS },
+        });
+
+        await deps.execute({ name: 'run_command', arguments: {} });
+        expect(drain.inFlight()).toBe(0);
+        await expect(drain.drain(1000)).resolves.toBeDefined();
     });
 });
