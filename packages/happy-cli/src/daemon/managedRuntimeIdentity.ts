@@ -259,7 +259,7 @@ function componentRefusal(
     return null;
 }
 
-function trustedPathRefusal(
+export function trustedPathRefusal(
     target: string,
     daemonUid: number,
     reason: ManagedIdentityRefusal,
