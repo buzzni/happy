@@ -36,6 +36,48 @@ import { attachTerminalWsRoute, type MachineEncryption as TerminalMachineEncrypt
  * lease watchdog, and that authority does not belong with report authority.
  */
 const MANAGED_REPORT_PATHS = new Set(['/session-started', '/session-runtime']);
+
+/**
+ * What a managed lifecycle report claims, taken from the parsed body.
+ *
+ * The verifier must see this, not just the path and headers: a launch token in
+ * a header says which launch is speaking, while the body says which session is
+ * being reported, and checking only the former lets launch A report a session
+ * that belongs to B. The `kind` is passed so each report type can be validated
+ * on its own terms rather than through one catch-all check.
+ *
+ * The whole parsed body travels with the claim because `sessionId` alone is not
+ * the whole assertion. `metadata.hostPid` on a session-started report and
+ * `hostPid` on a runtime report both steer which process the daemon adopts
+ * (`run.ts` webhook and runtime handlers), so a registry that only saw the
+ * session id could not tell a correct report from one that keeps the session
+ * and swaps the process. Encryption scope is included for the same reason.
+ */
+export type ManagedReportClaim =
+    | {
+        kind: 'session-started';
+        sessionId: string;
+        headers: Record<string, unknown>;
+        /** Whole parsed body. `metadata.hostPid` steers session adoption. */
+        report: {
+            sessionId: string;
+            metadata: unknown;
+            encryption?: {
+                encryptionKey: string;
+                encryptionVariant: 'legacy' | 'dataKey';
+                seq: number;
+                metadataVersion: number;
+                agentStateVersion: number;
+            };
+        };
+    }
+    | {
+        kind: 'session-runtime';
+        sessionId: string;
+        headers: Record<string, unknown>;
+        /** Whole parsed body. `hostPid` adopts an untracked process. */
+        report: Record<string, unknown>;
+    };
 import type { ChildProcess } from 'node:child_process';
 import { homedir } from 'node:os';
 
@@ -84,13 +126,33 @@ export function startDaemonControlServer({
    * Checks a managed lifecycle report against the trusted launch registry.
    * Absent means no launcher is wired, and managed reports are then refused.
    */
-  verifyManagedReport?: (input: { path: string; headers: Record<string, unknown> }) =>
+  verifyManagedReport?: (input: ManagedReportClaim) =>
     Promise<{ ok: true } | { ok: false; reason: string }>;
 }): Promise<{ port: number; stop: () => Promise<void>; controlSecret: string }> {
   return new Promise((resolve) => {
     const app = fastify({
       logger: false // We use our own logger
     });
+
+    /**
+     * Refuses a managed lifecycle report that no launch verifier vouched for.
+     *
+     * Returns a value when the request was refused so the route can `return` it;
+     * `null` means the report may proceed. On a BYOS daemon this is inert.
+     */
+    const refuseUnverifiedManagedReport = async (
+      claim: ManagedReportClaim,
+    ): Promise<{ error: string; code: string } | null> => {
+      if (!managedRuntime) return null;
+      const verified = verifyManagedReport
+        ? await verifyManagedReport(claim)
+        : { ok: false as const, reason: 'no-launch-verifier' };
+      if (verified.ok) return null;
+      return {
+        error: `managed report rejected (${verified.reason})`,
+        code: 'MANAGED_LAUNCH_SCOPE_REQUIRED',
+      };
+    };
 
     // Loopback-only Bearer secret (ADR-061, specs/desktop-speed-breakthrough-
     // local-direct). This server binds 127.0.0.1 only, but loopback is shared
@@ -112,16 +174,6 @@ export function startDaemonControlServer({
           await reply.code(403).send({
             error: 'control endpoint is not available on a managed runtime',
             code: 'MANAGED_CAPABILITY_REQUIRED',
-          });
-          return;
-        }
-        const verified = verifyManagedReport
-          ? await verifyManagedReport({ path, headers: request.headers as Record<string, unknown> })
-          : { ok: false as const, reason: 'no-launch-verifier' };
-        if (!verified.ok) {
-          await reply.code(403).send({
-            error: `managed report rejected (${verified.reason})`,
-            code: 'MANAGED_LAUNCH_SCOPE_REQUIRED',
           });
           return;
         }
@@ -165,11 +217,28 @@ export function startDaemonControlServer({
         response: {
           200: z.object({
             status: z.literal('ok')
+          }),
+          403: z.object({
+            error: z.string(),
+            code: z.string(),
           })
         }
       }
-    }, async (request) => {
+    }, async (request, reply) => {
       const { sessionId, metadata, encryption } = request.body;
+
+      // Checked after parsing so the claim carries the session the body names,
+      // not just the launch the header names.
+      const refusal = await refuseUnverifiedManagedReport({
+        kind: 'session-started',
+        sessionId,
+        headers: request.headers as Record<string, unknown>,
+        report: { sessionId, metadata, ...(encryption ? { encryption } : {}) },
+      });
+      if (refusal) {
+        reply.code(403);
+        return refusal;
+      }
 
       logger.debug(`[CONTROL SERVER] Session started: ${sessionId}`);
 
@@ -211,11 +280,26 @@ export function startDaemonControlServer({
         response: {
           200: z.object({
             status: z.literal('ok')
+          }),
+          403: z.object({
+            error: z.string(),
+            code: z.string(),
           })
         }
       }
-    }, async (request) => {
+    }, async (request, reply) => {
       const { sessionId, reportSeq, thinking, hasOpenToolCall, pendingUserInput, lastUserInteractionAt, lastTurnEndAt, assistantTurns, providerTokens, launchedBackgroundJob, lastProcessedSeq, mode, hostPid } = request.body;
+
+      const refusal = await refuseUnverifiedManagedReport({
+        kind: 'session-runtime',
+        sessionId,
+        headers: request.headers as Record<string, unknown>,
+        report: request.body as Record<string, unknown>,
+      });
+      if (refusal) {
+        reply.code(403);
+        return refusal;
+      }
 
       onHappySessionRuntime(sessionId, {
         ...(reportSeq !== undefined ? { reportSeq } : {}),

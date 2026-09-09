@@ -25,7 +25,6 @@ import {
 } from './managedReceiptStore';
 import {
     probeProcessGroup,
-    requestProcessGroupStop,
     summarizeFencingEvidence,
     type ProcessGroupDeps,
     type ProcessGroupEvidence,
@@ -99,9 +98,12 @@ export type ManagedRuntime = {
          */
         requestStop: (input: {
             runId: string; attemptId: string; epoch: number; pgid: number | null;
-        }) => Promise<{ requested: boolean; detail: string }>;
+        }) => Promise<BackendStopResult>;
     };
 };
+
+/** Whether the trusted backend accepted the stop. `false` is never discarded. */
+export type BackendStopResult = { requested: boolean; detail: string };
 
 type RpcRegistrar = { registerHandler: (method: string, handler: (params: unknown) => unknown) => void };
 
@@ -186,54 +188,85 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
         return result.claims;
     };
 
-    /** pgids this process actually spawned. A persisted number is not ownership. */
-    const spawnedHere = new Set<number>();
 
-    /** Serializes lease renewal and epoch transition against each other. */
+    /**
+     * One serial section for renewal, epoch promotion and expiry handling.
+     *
+     * They all decide what this runtime may write, so interleaving them lets an
+     * expiry that started before a renewal stop a child the renewal has just
+     * made legitimate again. `pendingLeaseWork` is the count of operations that
+     * have entered or are queued for the section, so teardown can wait for all
+     * of them rather than only the most recent.
+     */
     let leaseChain: Promise<unknown> = Promise.resolve();
     let transitioning = false;
-    /** Spawns that passed admission but have not reached the launcher yet. */
+    /** True while expired work is being handed to the backend. */
+    let expiryHandling = false;
+    let pendingLeaseWork = 0;
+    /**
+     * Spawns between admission and the launcher returning. This window is what
+     * an epoch promotion must not cut across, so it is deliberately narrower
+     * than the whole RPC.
+     */
     let spawnsInFlight = 0;
+    /**
+     * Whole spawn RPCs, including the stop and receipt work that follows a
+     * launch. Teardown waits on these: `spawnsInFlight` alone would let the
+     * writer lock go while a post-launch stop was still running.
+     */
+    const activeSpawnRpcs = new Set<Promise<unknown>>();
 
     const serializeLease = <T>(work: () => Promise<T>): Promise<T> => {
-        const next = leaseChain.then(work, work);
+        pendingLeaseWork += 1;
+        const next = leaseChain.then(work, work).finally(() => { pendingLeaseWork -= 1; });
         leaseChain = next.then(() => undefined, () => undefined);
         return next;
     };
 
-    const stopGroup = async (receipt: ManagedReceipt): Promise<ProcessGroupEvidence> => {
-        if (receipt.pgid === null) return { kind: 'no-local-trace' };
-        const outcome = await requestProcessGroupStop({
+    const NO_BACKEND: BackendStopResult = { requested: false, detail: 'no-launch-backend' };
+
+    /**
+     * Asks the trusted backend to stop one attempt, and observes locally.
+     *
+     * The request is always made — a receipt with no pgid is a `spawning` row
+     * that may have a live child nobody wrote down, and an `EPERM` probe means
+     * the group is alive under another uid. Skipping either is how a child
+     * outlives its Run.
+     *
+     * This process never signals the group itself. A persisted pid is a number
+     * the kernel may have handed to something else since, so it is evidence
+     * about what is visible, never authority to kill.
+     */
+    const stopAttempt = async (receipt: ManagedReceipt): Promise<{
+        evidence: ProcessGroupEvidence;
+        backendStop: BackendStopResult;
+    }> => {
+        const evidence = receipt.pgid === null
+            ? { kind: 'no-local-trace' as const }
+            : probeProcessGroup(receipt.pgid, runtime.processGroupDeps);
+        if (!runtime.fencingBackend) return { evidence, backendStop: NO_BACKEND };
+        const backendStop = await runtime.fencingBackend.requestStop({
+            runId: receipt.runId,
+            attemptId: receipt.attemptId,
+            epoch: receipt.epoch,
             pgid: receipt.pgid,
-            graceMs: stopGraceMs,
-            ownership: spawnedHere.has(receipt.pgid)
-                ? { kind: 'live-tracked-child' }
-                : { kind: 'unverified' },
-            ...(runtime.processGroupDeps ? { deps: runtime.processGroupDeps } : {}),
         });
-        if (outcome.deferredTo === 'privileged-backend' && runtime.fencingBackend) {
-            await runtime.fencingBackend.requestStop({
-                runId: receipt.runId,
-                attemptId: receipt.attemptId,
-                epoch: receipt.epoch,
-                pgid: receipt.pgid,
-            });
-        }
-        return outcome.evidence;
+        return { evidence, backendStop };
     };
 
-    return {
-        /**
-         * Accepts a request at most once. A retry of the same attempt returns
-         * the existing receipt without starting anything; an intentional new
-         * attempt arrives under a different operation key.
-         */
-        async spawn(params: unknown) {
+    /**
+     * Accepts a request at most once. A retry of the same attempt returns the
+     * existing receipt without starting anything; an intentional new attempt
+     * arrives under a different operation key.
+     */
+    const spawnRpc = async (params: unknown) => {
             const claims = verify('spawn', params);
             if (!leaseValid()) throw new ManagedRpcError('lease-expired');
             // An epoch transition is in progress; starting work now would race
             // the fence it is trying to establish.
-            if (transitioning) throw new ManagedRpcError('epoch-transition-in-progress');
+            if (transitioning || expiryHandling) {
+                throw new ManagedRpcError('epoch-transition-in-progress');
+            }
 
             const payloadDigest = canonicalManagedPayloadDigest(
                 (params as Record<string, unknown>).params ?? {},
@@ -256,7 +289,13 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                 if (!sameScope || (receipt.spawnPayloadDigest !== null && receipt.spawnPayloadDigest !== payloadDigest)) {
                     throw new ManagedRpcError('operation-payload-conflict');
                 }
-                return { accepted: true, receipt: receiptView(receipt, runtime) };
+                return {
+                    accepted: true,
+                    receipt: receiptView(receipt, runtime),
+                    stopIntentRecorded: receipt.stopRequestedAt !== null,
+                    backendStop: null as BackendStopResult | null,
+                    terminationProven: false,
+                };
             };
 
             const existing = runtime.store.read(key);
@@ -285,7 +324,7 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
 
             // Re-checked here because a fence may have begun while this request
             // was between admission and the launcher.
-            if (transitioning || !leaseValid()) {
+            if (transitioning || expiryHandling || !leaseValid()) {
                 throw new ManagedRpcError('epoch-transition-in-progress');
             }
 
@@ -324,9 +363,9 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                 throw new ManagedRpcError('reconciliation-required', 'spawn outcome unknown');
             }
 
-            // The child is detached, so it leads its own process group, and it
-            // was started here — which is what makes signalling it legitimate.
-            spawnedHere.add(outcome.pid);
+            // The child is detached, so it leads its own process group. The pid
+            // is recorded for observation only; stopping it belongs to the
+            // trusted backend.
             const after = runtime.store.update(key, {
                 state: 'running',
                 pid: outcome.pid,
@@ -337,11 +376,38 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             // A stop that arrived while the spawn was in flight is honoured now
             // that there is something to signal.
             if (after.stopRequestedAt !== null) {
-                const evidence = await stopGroup(after);
+                const { evidence, backendStop } = await stopAttempt(after);
                 const stopped = runtime.store.update(key, { state: 'stopping' }, runtime.now());
-                return { accepted: true, receipt: receiptView(stopped, runtime), localEvidence: evidence };
+                // `accepted` describes this spawn: the request was admitted and
+                // a child was started. A backend that could not take the stop
+                // does not turn that into a rejection — the run exists and the
+                // caller must not read it as never-started.
+                return {
+                    accepted: true,
+                    receipt: receiptView(stopped, runtime),
+                    stopIntentRecorded: true,
+                    backendStop: backendStop as BackendStopResult | null,
+                    terminationProven: false,
+                    localEvidence: evidence,
+                };
             }
-            return { accepted: true, receipt: receiptView(after, runtime) };
+            // Uniform shape: a caller must not have to branch on field presence
+            // to learn whether a stop was involved.
+            return {
+                accepted: true,
+                receipt: receiptView(after, runtime),
+                stopIntentRecorded: false,
+                backendStop: null as BackendStopResult | null,
+                terminationProven: false,
+            };
+    };
+
+    return {
+        /** Tracked end to end so teardown waits for post-launch work too. */
+        spawn(params: unknown) {
+            const running = spawnRpc(params);
+            activeSpawnRpcs.add(running);
+            return running.finally(() => { activeSpawnRpcs.delete(running); });
         },
 
         /**
@@ -370,27 +436,59 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                     now: runtime.now(),
                 });
                 if (tomb.kind === 'corrupt') throw new ManagedRpcError('reconciliation-required', 'corrupt receipt');
-                if (tomb.kind === 'exists') {
-                    return { accepted: true, receipt: receiptView(tomb.receipt, runtime) };
-                }
-                return { accepted: true, receipt: receiptView(tomb.receipt, runtime) };
+                // Nothing was ever started, so there is nothing to terminate.
+                return {
+                    stopIntentRecorded: true,
+                    backendStop: { requested: true, detail: 'never-dispatched' },
+                    terminationProven: true,
+                    receipt: receiptView(tomb.receipt, runtime),
+                };
             }
 
             const receipt = existing.receipt;
             if (receipt.state === 'spawning') {
-                // No pid yet; the spawn path consumes this flag once it has one.
+                // No pid yet. The spawn path consumes this flag once it has one,
+                // but a persisted `spawning` row from a previous process may
+                // already have a live child, so the backend is asked as well.
                 const marked = runtime.store.update(key, { stopRequestedAt: runtime.now() }, runtime.now());
-                return { accepted: true, receipt: receiptView(marked, runtime) };
+                const { evidence, backendStop } = await stopAttempt(marked);
+                return {
+                    stopIntentRecorded: true,
+                    backendStop,
+                    terminationProven: false,
+                    receipt: receiptView(marked, runtime),
+                    localEvidence: evidence,
+                };
             }
-            if (receipt.state === 'stopped' || receipt.state === 'failed' || receipt.state === 'tombstone') {
-                return { accepted: true, receipt: receiptView(receipt, runtime) };
+            if (receipt.state === 'stopped' || receipt.state === 'tombstone'
+                || (receipt.state === 'failed' && receipt.failureReason === 'not-started')) {
+                // Terminal with evidence that nothing is running: there is
+                // nothing for the backend to stop.
+                return {
+                    stopIntentRecorded: true,
+                    backendStop: { requested: true, detail: 'already-terminal' },
+                    terminationProven: true,
+                    receipt: receiptView(receipt, runtime),
+                };
             }
 
             const marked = runtime.store.update(key, {
                 state: 'stopping', stopRequestedAt: runtime.now(),
             }, runtime.now());
-            const evidence = await stopGroup(marked);
-            return { accepted: true, receipt: receiptView(marked, runtime), localEvidence: evidence };
+            const { evidence, backendStop } = await stopAttempt(marked);
+            // Three separate facts, never collapsed:
+            //   stopIntentRecorded — the receipt durably says "stop this"
+            //   backendStop        — whether the launcher took the request
+            //   terminationProven  — whether anything actually ended
+            // Only cgroup emptiness or a provider stop can set the last one, so
+            // it is false here regardless of what the local probe saw.
+            return {
+                stopIntentRecorded: true,
+                backendStop,
+                terminationProven: false,
+                receipt: receiptView(marked, runtime),
+                localEvidence: evidence,
+            };
         },
 
         /** Durable receipt lookup — the only way to resolve a lost ACK. */
@@ -429,6 +527,10 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             // sequence backwards, which is exactly what replay protection
             // depends on not happening.
             return serializeLease(async () => {
+                // Re-checked inside the queue: an operation ahead of this one
+                // may have taken long enough for this token to age out, and a
+                // future `absoluteExpiry` is not a substitute for a live token.
+                if (claims.exp <= runtime.now()) throw new ManagedRpcError('token-expired');
                 const stored = storedLease();
                 // Checked inside the queue: a request minted at an older epoch
                 // can arrive after a promotion committed, and writing it back
@@ -462,7 +564,7 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                             && !(receipt.state === 'failed' && receipt.failureReason === 'not-started')
                         ));
                         const evidence: ProcessGroupEvidence[] = [];
-                        for (const receipt of live) evidence.push(await stopGroup(receipt));
+                        for (const receipt of live) evidence.push((await stopAttempt(receipt)).evidence);
                         const summary = summarizeFencingEvidence(evidence);
 
                         const proof = await runtime.fencingBackend.proveGenerationStopped({
@@ -535,7 +637,21 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
          * `actionRequired` instead of a clean stop.
          */
         async enforceLeaseExpiry() {
-            if (leaseValid()) return { expired: false, actionRequired: false, live: [] as string[] };
+            return serializeLease(async () => {
+            // Re-read inside the section: a renewal queued ahead of this call
+            // may have made the lease valid again, and stopping a child now
+            // would kill work the server has just re-authorised.
+            if (leaseValid()) {
+                return {
+                    expired: false,
+                    launching: false,
+                    actionRequired: false,
+                    live: [] as string[],
+                    unstoppable: [] as string[],
+                };
+            }
+            expiryHandling = true;
+            try {
             const listing = runtime.store.list();
             // A receipt without a pgid is included on purpose: `spawning` means
             // a child may exist whose pid was never recorded, and skipping it
@@ -546,17 +662,20 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             ));
 
             const handled: string[] = [];
+            const unstoppable: string[] = [];
             for (const receipt of live) {
-                await stopGroup(receipt);
-                if (runtime.fencingBackend) {
-                    await runtime.fencingBackend.requestStop({
-                        runId: receipt.runId,
-                        attemptId: receipt.attemptId,
-                        epoch: receipt.epoch,
-                        pgid: receipt.pgid,
-                    });
-                }
-                handled.push(receipt.requestKey);
+                // Written before the handover so the intent survives a restart
+                // in the middle of it. It is also what a spawn that is still
+                // launching reads when it finishes, so a child that arrives
+                // after its lease expired stops itself.
+                const marked = receipt.stopRequestedAt === null
+                    ? runtime.store.update(
+                        receipt.requestKey, { stopRequestedAt: runtime.now() }, runtime.now(),
+                    )
+                    : receipt;
+                const { backendStop } = await stopAttempt(marked);
+                if (!backendStop.requested) unstoppable.push(marked.requestKey);
+                handled.push(marked.requestKey);
             }
 
             // `no-local-trace` says only that nothing is visible from here, so
@@ -569,11 +688,36 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                 proven = proof.proven;
             }
             const storeUnreadable = listing.unknown.length > 0 || listing.listError !== undefined;
+            // A proof taken now says nothing about a child that has not been
+            // created yet, so an outstanding launch keeps this unresolved.
+            const launching = spawnsInFlight > 0;
             return {
                 expired: true,
-                actionRequired: live.length > 0 ? !proven || storeUnreadable : storeUnreadable,
+                launching,
+                actionRequired: launching || (live.length > 0
+                    ? !proven || storeUnreadable || unstoppable.length > 0
+                    : storeUnreadable),
                 live: handled,
+                unstoppable,
             };
+            } finally {
+                expiryHandling = false;
+            }
+            });
+        },
+
+        /**
+         * Resolves once every queued or running lease operation has finished.
+         * Teardown uses this so a stop or fence in progress cannot outlive the
+         * writer lock it is holding.
+         */
+        async drainLeaseWork(): Promise<void> {
+            // Spawn RPCs are drained too, in full: anything still running when
+            // the writer lock is released would write into a store another
+            // daemon may already own.
+            while (pendingLeaseWork > 0 || activeSpawnRpcs.size > 0) {
+                await Promise.allSettled([leaseChain, ...activeSpawnRpcs]);
+            }
         },
 
         /** Exposed for wiring tests: is the runtime currently allowed to work? */

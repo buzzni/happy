@@ -12,6 +12,10 @@
  * the target is alive but owned by another uid — which is the normal case once
  * agents run under their own uid — and reading it as "gone" would let a new
  * writable generation open on top of a live writer.
+ *
+ * Nothing here terminates anything. A persisted pid is a number the kernel may
+ * have reused, so it can support an observation but never authority to kill;
+ * stopping a managed child belongs to the privileged launch backend.
  */
 
 export type ProcessGroupEvidence =
@@ -81,117 +85,6 @@ export function probeProcessGroup(
         case 'indeterminate':
             return { kind: 'indeterminate', detail: outcome.detail };
     }
-}
-
-/**
- * Whether this process may signal the group at all.
- *
- * A stored pgid is just a number. After a daemon restart the kernel may have
- * reused it for something unrelated, so signalling on the strength of a
- * persisted value can kill a bystander. Only a child this process is still
- * tracking carries the ownership needed to signal; anything else is observed
- * and handed to the privileged backend that T09 will provide.
- */
-export type ProcessGroupOwnership =
-    | { kind: 'live-tracked-child' }
-    | { kind: 'unverified' };
-
-export type ProcessGroupStopResult = {
-    evidence: ProcessGroupEvidence;
-    escalated: boolean;
-    /** False when ownership could not be established, or input was invalid. */
-    signalled: boolean;
-    /** Set when the stop was handed off rather than performed. */
-    deferredTo?: 'privileged-backend';
-    /** Outcome of the SIGKILL escalation, kept so a failure is not lost. */
-    killOutcome?: SignalOutcome;
-};
-
-function isBoundedMs(value: number, min: number): boolean {
-    return Number.isFinite(value) && value >= min;
-}
-
-/**
- * Asks the group to stop, escalates, and reports what was observed afterwards.
- *
- * The evidence type is the same one a plain probe returns: having sent SIGKILL
- * does not upgrade "no local trace" into "stopped".
- */
-export async function requestProcessGroupStop(input: {
-    pgid: number;
-    graceMs: number;
-    pollMs?: number;
-    ownership: ProcessGroupOwnership;
-    deps?: ProcessGroupDeps;
-}): Promise<ProcessGroupStopResult> {
-    const deps = input.deps ?? defaultProcessGroupDeps;
-    const pollMs = input.pollMs ?? 200;
-
-    // An unbounded grace or a zero poll turns the loops below into a hang, and
-    // a hung stop looks identical to a stop that is merely slow.
-    if (!isBoundedMs(input.graceMs, 0) || !isBoundedMs(pollMs, 1)) {
-        return {
-            evidence: { kind: 'indeterminate', detail: 'invalid grace or poll interval' },
-            escalated: false,
-            signalled: false,
-        };
-    }
-
-    if (input.ownership.kind !== 'live-tracked-child') {
-        // Observe only. The number may name someone else's process now.
-        return {
-            evidence: probeProcessGroup(input.pgid, deps),
-            escalated: false,
-            signalled: false,
-            deferredTo: 'privileged-backend',
-        };
-    }
-
-    const term = signalProcessGroup(input.pgid, 'SIGTERM', deps);
-    if (term.kind === 'no-local-trace') {
-        return { evidence: { kind: 'no-local-trace' }, escalated: false, signalled: true };
-    }
-    if (term.kind === 'not-permitted') {
-        return { evidence: { kind: 'alive-foreign' }, escalated: false, signalled: true };
-    }
-    if (term.kind === 'indeterminate') {
-        return { evidence: { kind: 'indeterminate', detail: term.detail }, escalated: false, signalled: true };
-    }
-
-    const deadline = deps.now() + input.graceMs;
-    while (deps.now() < deadline) {
-        const evidence = probeProcessGroup(input.pgid, deps);
-        if (evidence.kind !== 'alive') return { evidence, escalated: false, signalled: true };
-        await deps.sleep(pollMs);
-    }
-
-    const killOutcome = signalProcessGroup(input.pgid, 'SIGKILL', deps);
-    if (killOutcome.kind === 'not-permitted' || killOutcome.kind === 'indeterminate') {
-        // Dropping this would report a clean stop for a group we could not kill.
-        return {
-            evidence: killOutcome.kind === 'not-permitted'
-                ? { kind: 'alive-foreign' }
-                : { kind: 'indeterminate', detail: killOutcome.detail },
-            escalated: true,
-            signalled: true,
-            killOutcome,
-        };
-    }
-
-    // SIGKILL is not instantaneous and the kernel may not have reaped yet, so
-    // the group is polled again rather than assumed gone.
-    const afterKillDeadline = deps.now() + input.graceMs;
-    while (deps.now() < afterKillDeadline) {
-        const evidence = probeProcessGroup(input.pgid, deps);
-        if (evidence.kind !== 'alive') return { evidence, escalated: true, signalled: true, killOutcome };
-    await deps.sleep(pollMs);
-    }
-    return {
-        evidence: probeProcessGroup(input.pgid, deps),
-        escalated: true,
-        signalled: true,
-        killOutcome,
-    };
 }
 
 /**

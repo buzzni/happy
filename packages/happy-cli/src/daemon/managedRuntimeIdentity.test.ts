@@ -61,10 +61,19 @@ function writeProvisioning(overrides: Record<string, unknown> = {}, path = provi
  * check is exercised separately with an injected uid. Everything else — mode,
  * symlink, path containment, directory ownership — uses the real filesystem.
  */
+/**
+ * The temp root lives under a world-writable `/tmp`, which the ancestor walk
+ * correctly refuses. Components at or above the temp root are therefore
+ * reported as a trusted chain so that the directories the tests actually
+ * create — and deliberately weaken — are what each case exercises.
+ */
 function deps(overrides: Partial<ManagedProvisioningDeps> = {}): ManagedProvisioningDeps {
     return {
         getuid: () => DAEMON_UID,
         lstatDir: (path) => {
+            if (!path.startsWith(root) || path === root) {
+                return { uid: 0, mode: 0o755, isDirectory: true, isSymbolicLink: false };
+            }
             const { lstatSync } = require('node:fs') as typeof import('node:fs');
             const stat = lstatSync(path);
             return {
@@ -85,10 +94,12 @@ describe('resolveManagedRuntimeIdentity — provisioning file', () => {
             .toEqual({ status: 'absent' });
     });
 
-    it('reports absent when a path component is not a directory', () => {
+    it('refuses when a path component is not a directory', () => {
+        // ENOTDIR is producible by anyone who can write the parent, so reading
+        // it as "no marker" would be a way to switch managed mode off.
         writeFileSync(join(root, 'file'), 'x');
-        expect(resolveManagedRuntimeIdentity(join(root, 'file', 'managed.json'), deps()))
-            .toEqual({ status: 'absent' });
+        const result = resolveManagedRuntimeIdentity(join(root, 'file', 'managed.json'), deps());
+        expect(result.status).toBe('refused');
     });
 
     it('refuses — never reports absent — when the marker cannot be read', () => {
@@ -203,8 +214,10 @@ describe('resolveManagedRuntimeIdentity — content and isolation', () => {
         const link = join(root, 'state-link');
         symlinkSync(stateDir, link);
         writeProvisioning({ stateDir: link });
-        expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()))
-            .toMatchObject({ status: 'refused', reason: 'state-dir-unsafe', detail: 'symlink' });
+        const result = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
+        expect(result).toMatchObject({ status: 'refused', reason: 'state-dir-unsafe' });
+        // The detail now names which component failed, not just "symlink".
+        if (result.status === 'refused') expect(result.detail).toContain('symlink');
     });
 
     it('refuses a state directory owned by the agent uid', () => {
@@ -282,5 +295,81 @@ describe('assertProvisioningStat', () => {
     it('refuses a file larger than the read bound', () => {
         expect(assertProvisioningStat({ ...base, size: 16 * 1024 + 1 }))
             .toEqual({ reason: 'too-large' });
+    });
+});
+
+describe('trusted path requires every ancestor, not just the leaf', () => {
+    it('refuses a state directory whose parent the agent can rename', () => {
+        // A 0700 leaf is worthless if its parent can be renamed away and a
+        // replacement put in its place — the lease and receipts would then be
+        // read from a directory the agent controls.
+        const parent = join(root, 'agent-owned');
+        const state = join(parent, 'managed');
+        mkdirSync(state, { recursive: true });
+        chmodSync(parent, 0o777);
+        chmodSync(state, 0o700);
+        writeProvisioning({ stateDir: state });
+        expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()))
+            .toMatchObject({ status: 'refused', reason: 'state-dir-unsafe' });
+    });
+
+    it('refuses when a grandparent is writable', () => {
+        const grand = join(root, 'g');
+        const parent = join(grand, 'p');
+        const state = join(parent, 'managed');
+        mkdirSync(state, { recursive: true });
+        chmodSync(grand, 0o777);
+        chmodSync(parent, 0o755);
+        chmodSync(state, 0o700);
+        writeProvisioning({ stateDir: state });
+        expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()))
+            .toMatchObject({ status: 'refused', reason: 'state-dir-unsafe' });
+    });
+
+    it('refuses when an ancestor is a symlink', () => {
+        const real = join(root, 'real-parent');
+        const link = join(root, 'linked-parent');
+        mkdirSync(join(real, 'managed'), { recursive: true });
+        chmodSync(join(real, 'managed'), 0o700);
+        chmodSync(real, 0o755);
+        symlinkSync(real, link);
+        writeProvisioning({ stateDir: join(link, 'managed') });
+        expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()))
+            .toMatchObject({ status: 'refused', reason: 'state-dir-unsafe' });
+    });
+
+    it('refuses when an ancestor is owned by the agent uid', () => {
+        const parent = join(root, 'p2');
+        const state = join(parent, 'managed');
+        mkdirSync(state, { recursive: true });
+        chmodSync(parent, 0o755);
+        chmodSync(state, 0o700);
+        writeProvisioning({
+            stateDir: state,
+            // The test user owns every temp directory here, so declaring it as
+            // the agent uid makes the ancestor check the thing under test.
+            isolation: { backend: 'privileged-launch-supervisor', agentUid: DAEMON_UID, cgroupRoot: '/c' },
+        });
+        const result = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
+        expect(result.status).toBe('refused');
+    });
+
+    it('applies the same walk to the provisioning marker path', () => {
+        const dir = join(root, 'marker-dir');
+        mkdirSync(dir);
+        chmodSync(dir, 0o777);
+        const marker = join(dir, 'managed-runtime.json');
+        writeProvisioning({}, marker);
+        // An agent that can replace the marker chooses this runtime's identity.
+        expect(resolveManagedRuntimeIdentity(marker, rootOwnedDeps()))
+            .toMatchObject({ status: 'refused' });
+    });
+
+    it('refuses — not reports absent — when a marker ancestor is not a directory', () => {
+        // ENOTDIR is reachable by swapping a path component, so treating it as
+        // "no marker" would be a downgrade switch.
+        writeFileSync(join(root, 'blocker'), 'x');
+        expect(resolveManagedRuntimeIdentity(join(root, 'blocker', 'managed-runtime.json'), rootOwnedDeps()))
+            .toMatchObject({ status: 'refused' });
     });
 });

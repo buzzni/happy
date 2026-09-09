@@ -256,6 +256,11 @@ describe('spawn', () => {
 
     it('honours a stop that landed while the spawn was in flight', async () => {
         await grantLease();
+        const stopCalls: Array<Record<string, unknown>> = [];
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: false, detail: 'unproven' }),
+            requestStop: async (input) => { stopCalls.push(input); return { requested: true, detail: 'ok' }; },
+        };
         let release: () => void = () => {};
         spawnResult = () => new Promise((resolve) => {
             release = () => resolve({ type: 'success', sessionId: 'sess-1', pid: 4242 });
@@ -267,7 +272,13 @@ describe('spawn', () => {
         release();
         const result = await inFlight;
         expect(result.receipt.state).toBe('stopping');
-        expect(killed.some(([, signal]) => signal === 'SIGTERM')).toBe(true);
+        // The stop is carried out by the trusted backend, not by signalling a
+        // pid this process happens to remember. Two requests are expected and
+        // safe: the first while the pid is still unknown, the second once it is
+        // — the backend is keyed by run/attempt/epoch and is idempotent.
+        expect(stopCalls.length).toBeGreaterThanOrEqual(1);
+        expect(stopCalls.every((c) => c.attemptId === ATTEMPT && c.runId === RUN)).toBe(true);
+        expect(killed.filter(([, signal]) => signal !== 0)).toEqual([]);
     });
 
     it('refuses new work once the lease has expired', async () => {
@@ -469,5 +480,332 @@ describe('epoch promotion barrier against an in-flight spawn', () => {
             params: { directory: '/w', runId: 'attacker-run' },
         });
         expect(seen).toMatchObject({ runId: RUN, attemptId: ATTEMPT, epoch: 0, projectId: 'proj-1' });
+    });
+});
+
+describe('stop always reaches the trusted backend', () => {
+    function withBackend() {
+        const calls: Array<Record<string, unknown>> = [];
+        let result: { requested: boolean; detail: string } = { requested: true, detail: 'ok' };
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: false, detail: 'unproven' }),
+            requestStop: async (input) => { calls.push(input); return result; },
+        };
+        return { calls, setResult: (r: typeof result) => { result = r; } };
+    }
+
+    it('delegates a stop for a receipt that never recorded a pgid', async () => {
+        await grantLease();
+        const backend = withBackend();
+        // A persisted `spawning` receipt may have a live child whose pid was
+        // never written down. Returning "no local trace" here leaves it running.
+        runtime.store.claim({
+            requestKey: OP_KEY, runId: RUN, attemptId: ATTEMPT, epoch: 0, now: wallClock,
+        });
+        runtime.store.update(OP_KEY, { state: 'spawning', pid: null, pgid: null }, wallClock);
+
+        await handlers.stop(call('stop', {}));
+        expect(backend.calls).toHaveLength(1);
+        expect(backend.calls[0]).toMatchObject({ runId: RUN, attemptId: ATTEMPT, epoch: 0 });
+    });
+
+    it('delegates a stop even when the local probe reports EPERM', async () => {
+        await grantLease();
+        const backend = withBackend();
+        livePgids.add(4242);
+        await handlers.spawn(call('spawn', { directory: '/w' }));
+        runtime.processGroupDeps!.kill = () => { throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); };
+
+        await handlers.stop(call('stop', {}));
+        expect(backend.calls).toHaveLength(1);
+    });
+
+    it('reports a backend refusal instead of dropping it', async () => {
+        await grantLease();
+        const backend = withBackend();
+        backend.setResult({ requested: false, detail: 'launcher-unavailable' });
+        livePgids.add(4242);
+        await handlers.spawn(call('spawn', { directory: '/w' }));
+
+        const outcome = await handlers.stop(call('stop', {}));
+        // The intent is durable, the delivery failed, and nothing ended —
+        // three facts that must not collapse into one flag.
+        expect(outcome.stopIntentRecorded).toBe(true);
+        expect(outcome.backendStop).toEqual({ requested: false, detail: 'launcher-unavailable' });
+        expect(outcome.terminationProven).toBe(false);
+    });
+
+    it('reports that no backend exists rather than implying a stop', async () => {
+        await grantLease();
+        livePgids.add(4242);
+        await handlers.spawn(call('spawn', { directory: '/w' }));
+        const outcome = await handlers.stop(call('stop', {}));
+        expect(outcome.stopIntentRecorded).toBe(true);
+        expect(outcome.backendStop).toEqual({ requested: false, detail: 'no-launch-backend' });
+        expect(outcome.terminationProven).toBe(false);
+    });
+
+    it('never signals a process group itself', async () => {
+        await grantLease();
+        withBackend();
+        livePgids.add(4242);
+        await handlers.spawn(call('spawn', { directory: '/w' }));
+        killed.length = 0;
+
+        await handlers.stop(call('stop', {}));
+        // A numeric pid is not authority: the kernel may have reused it.
+        expect(killed.filter(([, signal]) => signal !== 0)).toEqual([]);
+    });
+});
+
+describe('lease renewal, promotion and expiry share one serial section', () => {
+    function backend(overrides: Partial<{ proven: boolean }> = {}) {
+        const stops: Array<Record<string, unknown>> = [];
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: overrides.proven ?? true, detail: 'ok' }),
+            requestStop: async (input) => { stops.push(input); return { requested: true, detail: 'ok' }; },
+        };
+        return stops;
+    }
+
+    it('does not let a stale expiry stop a child after a renewal committed', async () => {
+        const stops = backend();
+        await grantLease({ renewalSeq: 1, leaseMs: 1_000 });
+        livePgids.add(4242);
+        await handlers.spawn(call('spawn', { directory: '/w' }));
+        monotonic += 5_000;
+
+        // The expiry sees an expired lease, but a renewal is queued behind it.
+        // If the two are not serialized the expiry stops a child that the
+        // renewal has just made legitimate again.
+        const expiry = handlers.enforceLeaseExpiry();
+        const renewal = handlers.lease(call('lease', {}, {
+            renewalSeq: 2, leaseMs: 60_000, absoluteExpiry: NOW + 900_000,
+            iat: wallClock, exp: wallClock + 60_000,
+        }));
+        const [expiryOutcome] = await Promise.all([expiry, renewal]);
+
+        if (expiryOutcome.expired) {
+            // Expiry ran first: the renewal must have observed a valid lease
+            // afterwards, and no stop may be issued once it did.
+            expect(handlers.isLeaseValid()).toBe(true);
+        }
+        const stopsAfterRenewal = stops.length;
+        await handlers.enforceLeaseExpiry();
+        expect(stops.length).toBe(stopsAfterRenewal);
+    });
+
+    it('blocks a new spawn until expiry handling has finished', async () => {
+        backend();
+        await grantLease({ renewalSeq: 1, leaseMs: 1_000 });
+        monotonic += 5_000;
+        let releaseStop: () => void = () => {};
+        runtime.fencingBackend!.requestStop = () => new Promise((resolve) => {
+            releaseStop = () => resolve({ requested: true, detail: 'ok' });
+        });
+        runtime.store.claim({
+            requestKey: OP_KEY, runId: RUN, attemptId: ATTEMPT, epoch: 0, now: wallClock,
+        });
+        runtime.store.update(OP_KEY, { state: 'running', pid: 4242, pgid: 4242 }, wallClock);
+
+        const expiry = handlers.enforceLeaseExpiry();
+        await Promise.resolve();
+        const other = managedOperationKey({ runId: 'run-2', attemptId: 'a-2' });
+        expect(other).not.toBe(OP_KEY);
+        await expect(handlers.spawn(call('spawn', { directory: '/w' })))
+            .rejects.toThrowError(/lease-expired|epoch-transition-in-progress/);
+        releaseStop();
+        await expiry;
+    });
+
+    it('re-checks token expiry inside the serial section, not only before it', async () => {
+        backend();
+        await grantLease({ renewalSeq: 1, epoch: 0 });
+        // A promotion is queued first and takes long enough that the renewal
+        // waiting behind it has aged out by the time it runs.
+        let releaseProof: () => void = () => {};
+        runtime.fencingBackend!.proveGenerationStopped = () => new Promise((resolve) => {
+            releaseProof = () => { wallClock += 300_000; resolve({ proven: true, detail: 'ok' }); };
+        });
+        const promotion = handlers.lease(call('lease', {}, {
+            epoch: 1, renewalSeq: 2, leaseMs: 60_000, absoluteExpiry: NOW + 900_000,
+        }));
+        await Promise.resolve();
+        const stale = handlers.lease(call('lease', {}, {
+            epoch: 1, renewalSeq: 3, leaseMs: 60_000, absoluteExpiry: NOW + 900_000,
+            iat: NOW, exp: NOW + 60_000,
+        }));
+        releaseProof();
+        await promotion.catch(() => undefined);
+        await expect(stale).rejects.toThrowError(/token-expired/);
+    });
+
+    it('runs one watchdog tick at a time', async () => {
+        backend();
+        await grantLease({ renewalSeq: 1, leaseMs: 1_000 });
+        monotonic += 5_000;
+        runtime.store.claim({
+            requestKey: OP_KEY, runId: RUN, attemptId: ATTEMPT, epoch: 0, now: wallClock,
+        });
+        runtime.store.update(OP_KEY, { state: 'running', pid: 4242, pgid: 4242 }, wallClock);
+
+        let inFlight = 0;
+        let maxConcurrent = 0;
+        runtime.fencingBackend!.requestStop = async () => {
+            inFlight += 1;
+            maxConcurrent = Math.max(maxConcurrent, inFlight);
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            inFlight -= 1;
+            return { requested: true, detail: 'ok' };
+        };
+        await Promise.all([
+            handlers.enforceLeaseExpiry(),
+            handlers.enforceLeaseExpiry(),
+            handlers.enforceLeaseExpiry(),
+        ]);
+        expect(maxConcurrent).toBe(1);
+    });
+
+    it('exposes a barrier that waits for every in-flight lease operation', async () => {
+        backend();
+        await grantLease({ renewalSeq: 1, leaseMs: 1_000 });
+        monotonic += 5_000;
+        runtime.store.claim({
+            requestKey: OP_KEY, runId: RUN, attemptId: ATTEMPT, epoch: 0, now: wallClock,
+        });
+        runtime.store.update(OP_KEY, { state: 'running', pid: 4242, pgid: 4242 }, wallClock);
+
+        let finished = false;
+        runtime.fencingBackend!.requestStop = async () => {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            finished = true;
+            return { requested: true, detail: 'ok' };
+        };
+        void handlers.enforceLeaseExpiry();
+        // Teardown must wait for whatever is running, not just the last tick.
+        await handlers.drainLeaseWork();
+        expect(finished).toBe(true);
+    });
+});
+
+describe('spawn acceptance is not the stop delivery result', () => {
+    it('still reports the run as accepted when the backend cannot take the stop', async () => {
+        await grantLease();
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: false, detail: 'unproven' }),
+            requestStop: async () => ({ requested: false, detail: 'launcher-unavailable' }),
+        };
+        let release: (v: ManagedSpawnOutcome) => void = () => {};
+        spawnResult = () => new Promise((resolve) => { release = resolve; });
+        const inFlight = handlers.spawn(call('spawn', { directory: '/w' }));
+        await Promise.resolve();
+        await handlers.stop(call('stop', {}));
+        livePgids.add(4242);
+        release({ type: 'success', sessionId: 'sess-1', pid: 4242 });
+
+        const result = await inFlight;
+        // A child exists. Reporting this as not-accepted would let the caller
+        // treat the run as never started and dispatch it a second time.
+        expect(result.accepted).toBe(true);
+        expect(result.receipt.sessionId).toBe('sess-1');
+        expect(result.backendStop).toEqual({ requested: false, detail: 'launcher-unavailable' });
+        expect(result.terminationProven).toBe(false);
+    });
+});
+
+describe('expiry versus a spawn that is still in flight', () => {
+    beforeEach(async () => {
+        await grantLease({ renewalSeq: 1, leaseMs: 1_000 });
+    });
+
+    it('records a durable stop intent on every live receipt it hands over', async () => {
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: true, detail: 'ok' }),
+            requestStop: async () => ({ requested: true, detail: 'ok' }),
+        };
+        livePgids.add(4242);
+        await handlers.spawn(call('spawn', { directory: '/w' }));
+        monotonic += 5_000;
+
+        await handlers.enforceLeaseExpiry();
+        const stored = runtime.store.read(OP_KEY);
+        expect(stored.kind).toBe('ok');
+        // Without this the intent lives only in the backend call, so a process
+        // that restarts mid-handover has no record that the run must stop.
+        if (stored.kind === 'ok') expect(stored.receipt.stopRequestedAt).not.toBeNull();
+    });
+
+    it('stops a spawn that completes after the expiry ran', async () => {
+        const stops: Array<Record<string, unknown>> = [];
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: true, detail: 'ok' }),
+            requestStop: async (input) => { stops.push(input); return { requested: true, detail: 'ok' }; },
+        };
+        let release: (v: ManagedSpawnOutcome) => void = () => {};
+        spawnResult = () => new Promise((resolve) => { release = resolve; });
+        const inFlight = handlers.spawn(call('spawn', { directory: '/w' }));
+        await Promise.resolve();
+
+        monotonic += 5_000;
+        await handlers.enforceLeaseExpiry();
+
+        livePgids.add(4242);
+        release({ type: 'success', sessionId: 'sess-1', pid: 4242 });
+        const result = await inFlight;
+
+        // The child arrived after its lease was gone; leaving it `running`
+        // would keep a writer alive that the expiry believed it had handed over.
+        expect(result.receipt.state).toBe('stopping');
+        expect(stops.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('does not report a clean handover while a spawn is still launching', async () => {
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: true, detail: 'ok' }),
+            requestStop: async () => ({ requested: true, detail: 'ok' }),
+        };
+        let release: (v: ManagedSpawnOutcome) => void = () => {};
+        spawnResult = () => new Promise((resolve) => { release = resolve; });
+        const inFlight = handlers.spawn(call('spawn', { directory: '/w' }));
+        await Promise.resolve();
+        monotonic += 5_000;
+
+        const outcome = await handlers.enforceLeaseExpiry();
+        // A proof taken now cannot cover a child that has not started yet.
+        expect(outcome.actionRequired).toBe(true);
+
+        release({ type: 'success', sessionId: 'sess-1', pid: 4242 });
+        await inFlight;
+    });
+
+    it('drains a launching spawn and its post-launch stop before teardown', async () => {
+        let stopFinished = false;
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: true, detail: 'ok' }),
+            requestStop: async () => {
+                await new Promise((resolve) => setTimeout(resolve, 10));
+                stopFinished = true;
+                return { requested: true, detail: 'ok' };
+            },
+        };
+        let launched = false;
+        spawnResult = async () => {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            launched = true;
+            return { type: 'success', sessionId: 'sess-1', pid: 4242 };
+        };
+        const inFlight = handlers.spawn(call('spawn', { directory: '/w' }));
+        await Promise.resolve();
+        monotonic += 5_000;
+        await handlers.enforceLeaseExpiry();
+        stopFinished = false;
+
+        await handlers.drainLeaseWork();
+        // The launcher window closes before the stop that follows it. Waiting
+        // only for the launch would release the writer lock while that stop is
+        // still writing to the receipt store.
+        expect(launched).toBe(true);
+        expect(stopFinished).toBe(true);
+        await inFlight;
     });
 });

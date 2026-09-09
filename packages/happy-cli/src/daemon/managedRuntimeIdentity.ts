@@ -27,7 +27,7 @@
  */
 
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { parseManagedVerifierKey } from './managedDispatchToken';
 import type { KeyObject } from 'node:crypto';
@@ -168,7 +168,13 @@ function readProvisioningFile(
     } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         // Only a genuinely missing path means "this is not a managed runtime".
-        if (code === 'ENOENT' || code === 'ENOTDIR') return { kind: 'absent' };
+        // ENOTDIR is not that: it means a path component is a file, which is a
+        // state anyone who can write the parent can create, so treating it as
+        // absence would be a switch for turning managed mode off.
+        if (code === 'ENOENT') return { kind: 'absent' };
+        if (code === 'ENOTDIR') {
+            return { kind: 'refused', reason: 'unreadable', detail: 'ENOTDIR' };
+        }
         if (code === 'ELOOP') return { kind: 'refused', reason: 'symlinked' };
         return { kind: 'refused', reason: 'unreadable', detail: code ?? 'open failed' };
     }
@@ -195,9 +201,48 @@ function readProvisioningFile(
 }
 
 /**
+ * Walks a path from the filesystem root and checks every component.
+ *
+ * Checking only the final directory is not enough: a 0700 leaf inside a
+ * writable parent can be renamed away and replaced, after which the lease and
+ * receipts are read from a directory the agent controls. Each ancestor must be
+ * a real directory, not a symlink, not owned by the agent, and not writable by
+ * group or other. No sticky-bit exception is assumed — a shared temp directory
+ * is not a safe home for fencing state, and guessing that it is would be the
+ * kind of assumption this check exists to remove.
+ */
+function trustedPathRefusal(
+    target: string,
+    agentUid: number,
+    reason: ManagedIdentityRefusal,
+    deps: ManagedProvisioningDeps,
+): { reason: ManagedIdentityRefusal; detail: string } | null {
+    const resolved = resolve(target);
+    const parts = resolved.split(sep).filter((part) => part.length > 0);
+    const chain: string[] = [sep];
+    for (let i = 0; i < parts.length; i += 1) {
+        chain.push(sep + parts.slice(0, i + 1).join(sep));
+    }
+    for (const component of chain) {
+        let stat: { uid: number; mode: number; isDirectory: boolean; isSymbolicLink: boolean };
+        try {
+            stat = deps.lstatDir(component);
+        } catch (error) {
+            return { reason, detail: `${component}: ${(error as NodeJS.ErrnoException).code ?? 'stat failed'}` };
+        }
+        if (stat.isSymbolicLink) return { reason, detail: `${component}: symlink` };
+        if (!stat.isDirectory) return { reason, detail: `${component}: not a directory` };
+        if (stat.uid === agentUid) return { reason, detail: `${component}: owned by agent uid` };
+        if ((stat.mode & 0o022) !== 0) return { reason, detail: `${component}: group or world writable` };
+    }
+    return null;
+}
+
+/**
  * The state directory holds the receipts and the lease that fencing reads. If
  * agent code can write there it can fabricate a stopped receipt or roll the
- * epoch back, so it must be outside the workspace and not agent-writable.
+ * epoch back, so it must be outside the workspace and not agent-writable —
+ * along its whole path, not just at the leaf.
  */
 function stateDirRefusal(
     stateDir: string,
@@ -212,17 +257,7 @@ function stateDirRefusal(
     if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) {
         return { reason: 'state-dir-unsafe', detail: 'inside workspace' };
     }
-    let stat: { uid: number; mode: number; isDirectory: boolean; isSymbolicLink: boolean };
-    try {
-        stat = deps.lstatDir(resolvedState);
-    } catch (error) {
-        return { reason: 'state-dir-unsafe', detail: (error as NodeJS.ErrnoException).code ?? 'stat failed' };
-    }
-    if (stat.isSymbolicLink) return { reason: 'state-dir-unsafe', detail: 'symlink' };
-    if (!stat.isDirectory) return { reason: 'state-dir-unsafe', detail: 'not a directory' };
-    if (stat.uid === agentUid) return { reason: 'state-dir-unsafe', detail: 'owned by agent uid' };
-    if ((stat.mode & 0o022) !== 0) return { reason: 'state-dir-unsafe', detail: 'group or world writable' };
-    return null;
+    return trustedPathRefusal(resolvedState, agentUid, 'state-dir-unsafe', deps);
 }
 
 export function resolveManagedRuntimeIdentity(
@@ -281,6 +316,13 @@ export function resolveManagedRuntimeIdentity(
     const daemonUid = deps.getuid();
     if (daemonUid < 0 || daemonUid === agentUid) {
         return { status: 'refused', reason: 'isolation-unverified', detail: 'daemon shares the agent uid' };
+    }
+
+    // The marker decides this runtime's identity, so an agent that can replace
+    // it chooses who the runtime is. Its directory chain gets the same walk.
+    const unsafeMarkerDir = trustedPathRefusal(dirname(resolve(path)), agentUid, 'not-root-owned', deps);
+    if (unsafeMarkerDir) {
+        return { status: 'refused', reason: 'not-root-owned', detail: unsafeMarkerDir.detail };
     }
 
     const unsafeStateDir = stateDirRefusal(stateDir, workspaceDir, agentUid, deps);

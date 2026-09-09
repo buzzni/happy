@@ -2505,8 +2505,8 @@ export async function startDaemon(): Promise<void> {
     // Create realtime machine session
     const apiMachine = api.machineSyncClient(machine);
     let managedLeaseWatchdog: ReturnType<typeof setInterval> | null = null;
-    /** Resolves when the watchdog tick that is already running has finished. */
-    let managedWatchdogTick: Promise<unknown> = Promise.resolve();
+    /** Drains every in-flight lease operation; set once the handlers exist. */
+    let managedDrainLeaseWork: (() => Promise<void>) | null = null;
 
     /**
      * Shared by both exits — normal shutdown and the self-update replacement.
@@ -2529,7 +2529,10 @@ export async function startDaemon(): Promise<void> {
         managedLeaseWatchdog = null;
       }
       managedWriterLockHeld = false;
-      await managedWatchdogTick.catch(() => undefined);
+      // Every queued or running lease operation, not just the most recent one:
+      // a stop handed to the backend mid-teardown must finish before the writer
+      // lock goes, or another daemon can claim the receipts underneath it.
+      if (managedDrainLeaseWork) await managedDrainLeaseWork().catch(() => undefined);
       if (!managedFencingBackendWired) {
         logger.debug('[managed] shutting down with no launch backend; running children are not fenced');
       }
@@ -2587,15 +2590,26 @@ export async function startDaemon(): Promise<void> {
       // Installed before setRPCHandlers so the allowlist sweeps the handlers
       // the constructor already registered and intercepts the rest.
       apiMachine.setManagedRuntime(managedHandlers);
+      managedDrainLeaseWork = () => managedHandlers.drainLeaseWork();
+      // The handler serializes expiry against renewal and promotion, so the
+      // interval only has to avoid piling work onto that queue: a tick is
+      // skipped while the previous one is still outstanding.
+      let watchdogBusy = false;
       managedLeaseWatchdog = setInterval(() => {
-        managedWatchdogTick = managedHandlers.enforceLeaseExpiry().then((outcome) => {
+        if (watchdogBusy) return;
+        watchdogBusy = true;
+        void managedHandlers.enforceLeaseExpiry().then((outcome) => {
           if (outcome.expired && outcome.actionRequired) {
-            logger.debug(`[managed] lease expired with ${outcome.live.length} unresolved run(s)`);
+            logger.debug(
+              `[managed] lease expired; ${outcome.live.length} run(s) handed over, `
+              + `${outcome.unstoppable.length} not accepted by any backend`,
+            );
           }
         }).catch((error) => {
           logger.debug(`[managed] lease watchdog failed: ${(error as Error).message}`);
+        }).finally(() => {
+          watchdogBusy = false;
         });
-        void managedWatchdogTick;
       }, 5_000);
       managedLeaseWatchdog.unref();
     }
