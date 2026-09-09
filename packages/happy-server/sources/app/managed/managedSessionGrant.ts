@@ -112,6 +112,17 @@ export type GrantCheckFailure =
 
 export type RevokeFailure = 'run-unknown' | 'binding-mismatch';
 
+export type GrantResolveFailure =
+    | ScopeMismatch
+    | 'grant-unknown'
+    | 'revoked'
+    | 'expired'
+    | 'session-unknown'
+    | 'session-owner-changed'
+    | 'already-expired'
+    /** The stored row was minted for an older generation of this scope. */
+    | 'grant-stale';
+
 export type LiveGrant = {
     grantId: string;
     family: string;
@@ -196,6 +207,32 @@ function compareScope(authority: AuthorityRow | null, scope: ManagedScope): Scop
         || authority.version !== scope.runAuthorityVersion) {
         return 'authority-stale';
     }
+    return null;
+}
+
+/**
+ * Compares the **stored row** against a scope, field by field.
+ *
+ * `compareScope` only says the caller agrees with the current projection; it
+ * says nothing about the row that was minted earlier. The family deliberately
+ * excludes epoch and the authority versions, so an old grant is still found by
+ * a scope that has since moved on — and answering with it would hand out a
+ * token whose claims describe a generation the row was never issued for. The
+ * family is re-derived here too: a row whose scope hashes elsewhere is not this
+ * scope's grant even when every field above matches.
+ */
+function compareStoredGrant(grant: GrantRow, scope: ManagedScope): 'mismatch' | null {
+    if (grant.sessionId !== scope.sessionId
+        || grant.accountId !== scope.accountId
+        || grant.workspaceId !== scope.workspaceId
+        || grant.runId !== scope.runId
+        || grant.attemptId !== scope.attemptId
+        || grant.epoch !== scope.epoch
+        || grant.workspaceAuthorityVersion !== scope.workspaceAuthorityVersion
+        || grant.runAuthorityVersion !== scope.runAuthorityVersion) {
+        return 'mismatch';
+    }
+    if (grant.family !== deriveGrantFamily(scope)) return 'mismatch';
     return null;
 }
 
@@ -530,18 +567,6 @@ export async function resolveLiveGrant(input: {
         }
         if (claims.expiresAt > Number(grant.expiresAt)) return { ok: false, reason: 'claims-mismatch' };
 
-        if (grant.sessionId !== claims.sessionId
-            || grant.accountId !== claims.accountId
-            || grant.workspaceId !== claims.workspaceId
-            || grant.runId !== claims.runId
-            || grant.attemptId !== claims.attemptId
-            || grant.epoch !== claims.epoch
-            || grant.workspaceAuthorityVersion !== claims.workspaceAuthorityVersion
-            || grant.runAuthorityVersion !== claims.runAuthorityVersion) {
-            return { ok: false, reason: 'claims-mismatch' };
-        }
-        // The family is derived, so a token whose scope hashes elsewhere is not
-        // the token this row was issued for even if every field above matched.
         const scope: ManagedScope = {
             tenantId: claims.tenantId,
             projectId: claims.projectId,
@@ -555,9 +580,9 @@ export async function resolveLiveGrant(input: {
             workspaceAuthorityVersion: claims.workspaceAuthorityVersion,
             runAuthorityVersion: claims.runAuthorityVersion,
         };
-        if (grant.family !== deriveGrantFamily(scope)) {
-            return { ok: false, reason: 'claims-mismatch' };
-        }
+        // Same comparison the resolve path makes: the stored row has to be the
+        // one this scope was issued for, not merely a member of its family.
+        if (compareStoredGrant(grant, scope)) return { ok: false, reason: 'claims-mismatch' };
 
         const authority = await tx.managedRunAuthority.findUnique({
             where: { runId: claims.runId },
@@ -608,4 +633,89 @@ async function retryOnUniqueRace<T>(
 export async function readGrantRow(grantId: string): Promise<LiveGrant | null> {
     const row = await db.managedSessionGrant.findUnique({ where: { grantId } });
     return row && !row.tombstone ? toLiveGrant(row) : null;
+}
+
+export type ResolveGrantInput = {
+    scope: ManagedScope;
+    /** The latest the caller signed for. The answer is never later than this. */
+    requestedTokenExpiresAt: number;
+    now: number;
+};
+
+export type ResolvedGrant = {
+    grant: LiveGrant;
+    /** `min(grant expiry, signed request expiry)`. */
+    tokenExpiresAt: number;
+};
+
+export type ResolveGrantResult =
+    | { ok: true; resolved: ResolvedGrant }
+    | { ok: false; reason: GrantResolveFailure };
+
+/**
+ * Reads the current grant for a scope so a caller that lost the mint response
+ * can recover it — **without writing anything**.
+ *
+ * This is not an idempotent replay of the original mint. The original answer is
+ * gone; what this returns is the grant as it stands now, bounded by the expiry
+ * the caller signed for. A grant minted to 500 and renewed to 1500, resolved
+ * under a signed cap of 1000, answers 1000: not the first answer, and never the
+ * renewal's own lifetime. That is why the response separates the two expiries.
+ *
+ * It runs every check a mint runs — authority, session ownership, revoke state,
+ * expiry — in the same read, because it hands out a credential. `requestId` is
+ * the caller's signed correlation only; nothing about it is stored or matched.
+ * A missing, revoked or expired grant is refused: this call cannot create one,
+ * resurrect one, or extend one.
+ */
+export async function resolveSessionGrant(
+    input: ResolveGrantInput,
+): Promise<ResolveGrantResult> {
+    const family = deriveGrantFamily(input.scope);
+
+    return inTx(async (tx) => {
+        const authority = await tx.managedRunAuthority.findUnique({
+            where: { runId: input.scope.runId },
+            include: AUTHORITY_INCLUDE,
+        });
+        const mismatch = compareScope(authority as AuthorityRow | null, input.scope);
+        if (mismatch) return { ok: false, reason: mismatch };
+
+        const session = await tx.session.findUnique({
+            where: { id: input.scope.sessionId },
+            select: { accountId: true },
+        });
+        if (!session) return { ok: false, reason: 'session-unknown' };
+        if (session.accountId !== input.scope.accountId) {
+            return { ok: false, reason: 'session-owner-changed' };
+        }
+
+        const grant = await tx.managedSessionGrant.findUnique({ where: { family } });
+        if (!grant || grant.tombstone) return { ok: false, reason: 'grant-unknown' };
+        if (grant.revokedAt !== null) return { ok: false, reason: 'revoked' };
+        // The row must be the one this exact scope was issued for. Without this
+        // an authority advance leaves an old row that the fresh scope still
+        // finds, and the answer would mix an old grant with a new DTO.
+        if (compareStoredGrant(grant, input.scope)) return { ok: false, reason: 'grant-stale' };
+
+        const grantExpiresAt = Number(grant.expiresAt);
+        if (!Number.isSafeInteger(grantExpiresAt)) return { ok: false, reason: 'expired' };
+        if (input.now >= grantExpiresAt) return { ok: false, reason: 'expired' };
+        // A cap that has already passed — or is not a real instant — authorises
+        // nothing, and quietly widening it to the grant's own expiry would
+        // ignore what was signed. `NaN` fails every comparison, so it is
+        // rejected by shape rather than by `<=`.
+        if (!Number.isSafeInteger(input.requestedTokenExpiresAt)
+            || input.requestedTokenExpiresAt <= input.now) {
+            return { ok: false, reason: 'already-expired' };
+        }
+
+        return {
+            ok: true,
+            resolved: {
+                grant: toLiveGrant(grant),
+                tokenExpiresAt: Math.min(grantExpiresAt, input.requestedTokenExpiresAt),
+            },
+        };
+    });
 }

@@ -42,6 +42,8 @@ const EVERY_ROUTE = [
     ['/v1/managed/control/grants/mint', 'grant-mint'],
     ['/v1/managed/control/grants/renew', 'grant-renew'],
     ['/v1/managed/control/grants/revoke', 'grant-revoke'],
+    ['/v1/managed/control/authority/snapshot', 'authority-snapshot'],
+    ['/v1/managed/control/grants/resolve', 'grant-resolve'],
 ] as const;
 
 const AUDIENCE = 'https://happy.control.test';
@@ -318,6 +320,388 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
                 expect(await modules.grants.resolveLiveGrant({ claims: verified.claims, now: Date.now() }))
                     .toEqual({ ok: false, reason: 'revoked' });
             }
+        });
+    });
+
+    function snapshotBody(over: Record<string, unknown> = {}) {
+        return {
+            requestId: `req-${randomUUID()}`,
+            tenantId: 'tenant-1',
+            projectId: 'project-1',
+            workspaceId,
+            runId,
+            accountId,
+            ...over,
+        };
+    }
+
+    function resolveBody(over: Record<string, unknown> = {}) {
+        return {
+            requestId: `req-${randomUUID()}`,
+            scope: scope(),
+            requestedTokenExpiresAt: Date.now() + HOUR,
+            ...over,
+        };
+    }
+
+    describe('authority snapshot', () => {
+        it('returns both projections from one read, and null before they exist', async () => {
+            const empty = await call({
+                path: '/v1/managed/control/authority/snapshot',
+                op: 'authority-snapshot', body: snapshotBody(),
+            });
+            expect(empty.statusCode).toBe(200);
+            expect(empty.json()).toMatchObject({ workspace: null, run: null });
+
+            await syncAuthority();
+            const body = snapshotBody();
+            const filled = await call({
+                path: '/v1/managed/control/authority/snapshot', op: 'authority-snapshot', body,
+            });
+            expect(filled.statusCode).toBe(200);
+            expect(filled.json()).toEqual({
+                requestId: body.requestId,
+                workspace: {
+                    workspaceId, tenantId: 'tenant-1', projectId: 'project-1',
+                    epoch: 1, runtimeId: 'runtime-1', version: 1,
+                },
+                run: {
+                    runId, workspaceId, accountId,
+                    currentAttemptId: 'attempt-1', cancelled: false, version: 1,
+                },
+            });
+        });
+
+        it('reports a workspace that exists before its run', async () => {
+            const workspaceBody = {
+                ownerAccountId: accountId, expectedVersion: 0,
+                body: {
+                    workspaceId, tenantId: 'tenant-1', projectId: 'project-1',
+                    epoch: 1, runtimeId: 'runtime-1',
+                },
+            };
+            expect((await call({
+                path: '/v1/managed/control/authority/workspace',
+                op: 'authority-sync', body: workspaceBody,
+            })).statusCode).toBe(200);
+
+            const filled = await call({
+                path: '/v1/managed/control/authority/snapshot',
+                op: 'authority-snapshot', body: snapshotBody(),
+            });
+            expect(filled.statusCode).toBe(200);
+            expect(filled.json().workspace).toMatchObject({ workspaceId, epoch: 1 });
+            expect(filled.json().run).toBeNull();
+        });
+
+        it.each([
+            ['tenantId', { tenantId: 'tenant-other' }],
+            ['projectId', { projectId: 'project-other' }],
+        ])('refuses a %s that does not match the stored workspace', async (_label, over) => {
+            await syncAuthority();
+            await expectInert(() => call({
+                path: '/v1/managed/control/authority/snapshot',
+                op: 'authority-snapshot', body: snapshotBody(over),
+            }), 403);
+        });
+
+        it('refuses a run that belongs to another workspace or account', async () => {
+            await syncAuthority();
+            const otherWorkspaceId = `ws-${randomUUID()}`;
+            createdWorkspaceIds.add(otherWorkspaceId);
+            await expectInert(() => call({
+                path: '/v1/managed/control/authority/snapshot',
+                op: 'authority-snapshot', body: snapshotBody({ workspaceId: otherWorkspaceId }),
+            }), 403);
+            await expectInert(() => call({
+                path: '/v1/managed/control/authority/snapshot',
+                op: 'authority-snapshot', body: snapshotBody({ accountId: otherAccountId }),
+            }), 403);
+        });
+
+        it('refuses when the bearer does not own the scope', async () => {
+            await syncAuthority();
+            await expectInert(() => call({
+                path: '/v1/managed/control/authority/snapshot',
+                op: 'authority-snapshot', body: snapshotBody(), token: otherToken,
+            }), 403);
+        });
+    });
+
+    describe('authority snapshot coherency', () => {
+        it('reads a committed pair after every interleaved write', async () => {
+            await syncAuthority();
+
+            // Writes and reads alternate deterministically: after each commit the
+            // snapshot must show exactly that state. A read that took the two
+            // projections from different moments would show the pair the writes
+            // never had — a run at attempt N+1 beside a workspace at epoch N.
+            let workspaceVersion = 1;
+            let runVersion = 1;
+            let epoch = 1;
+            let attempt = 1;
+
+            async function expectSnapshot() {
+                const response = await call({
+                    path: '/v1/managed/control/authority/snapshot',
+                    op: 'authority-snapshot', body: snapshotBody(),
+                });
+                expect(response.statusCode).toBe(200);
+                expect(response.json()).toMatchObject({
+                    workspace: { version: workspaceVersion, epoch },
+                    run: { version: runVersion, currentAttemptId: `attempt-${attempt}` },
+                });
+            }
+
+            await expectSnapshot();
+            for (let step = 0; step < 4; step += 1) {
+                epoch += 1;
+                expect((await call({
+                    path: '/v1/managed/control/authority/workspace', op: 'authority-sync',
+                    body: {
+                        ownerAccountId: accountId, expectedVersion: workspaceVersion,
+                        body: {
+                            workspaceId, tenantId: 'tenant-1', projectId: 'project-1',
+                            epoch, runtimeId: 'runtime-1',
+                        },
+                    },
+                })).statusCode).toBe(200);
+                workspaceVersion += 1;
+                // Read between the two writes: the run must still be the old one.
+                await expectSnapshot();
+
+                attempt += 1;
+                expect((await call({
+                    path: '/v1/managed/control/authority/run', op: 'authority-sync',
+                    body: {
+                        expectedVersion: runVersion,
+                        body: {
+                            runId, workspaceId, accountId,
+                            currentAttemptId: `attempt-${attempt}`, cancelled: false,
+                        },
+                    },
+                })).statusCode).toBe(200);
+                runVersion += 1;
+                await expectSnapshot();
+            }
+        });
+    });
+
+    describe('grant resolve', () => {
+        beforeEach(syncAuthority);
+
+        it('recovers a live grant after a lost mint response without changing it', async () => {
+            const minted = await call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint', body: mintBody(),
+            });
+            expect(minted.statusCode).toBe(200);
+            const issued = minted.json();
+
+            const before = await managedRowSnapshot();
+            const body = resolveBody();
+            const resolved = await call({
+                path: '/v1/managed/control/grants/resolve', op: 'grant-resolve', body,
+            });
+            expect(resolved.statusCode).toBe(200);
+            const payload = resolved.json();
+            expect(payload).toMatchObject({
+                requestId: body.requestId,
+                scope: scope(),
+                grantId: issued.grantId,
+                grantExpiresAt: issued.expiresAt,
+                renewalSeq: 0,
+            });
+            expect(payload.tokenExpiresAt).toBe(Math.min(issued.expiresAt, body.requestedTokenExpiresAt));
+            // A read that issues a credential still must not write.
+            expect(await managedRowSnapshot()).toEqual(before);
+
+            const runtime = await modules.runtime.createManagedControlRuntime(CONTROL_ENV);
+            const verified = await runtime!.scopedTokens.verify(payload.token, Date.now());
+            expect(verified).toMatchObject({ ok: true });
+            if (verified.ok) {
+                expect(verified.claims).toMatchObject({
+                    grantId: issued.grantId, sessionId, accountId, runId,
+                });
+                expect(await modules.grants.resolveLiveGrant({ claims: verified.claims, now: Date.now() }))
+                    .toMatchObject({ ok: true });
+            }
+            // Never an account principal.
+            await expect(modules.auth.auth.verifyToken(payload.token)).resolves.toBeNull();
+        });
+
+        it('re-evaluates the current grant under the signed cap, not the first answer', async () => {
+            const base = Date.now();
+            const mint = mintBody({ expiresAt: base + 500 });
+            expect((await call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint', body: mint,
+            })).statusCode).toBe(200);
+
+            const renew = { scope: scope(), expectedRenewalSeq: 0, expiresAt: base + 1_500 };
+            expect((await call({
+                path: '/v1/managed/control/grants/renew', op: 'grant-renew', body: renew,
+            })).statusCode).toBe(200);
+
+            const body = resolveBody({ requestedTokenExpiresAt: base + 1_000 });
+            const resolved = await call({
+                path: '/v1/managed/control/grants/resolve', op: 'grant-resolve', body,
+            });
+            expect(resolved.statusCode).toBe(200);
+            // Capped by the signed request, not the first response (500) and
+            // never the renewed value (1500).
+            expect(resolved.json()).toMatchObject({
+                tokenExpiresAt: base + 1_000, grantExpiresAt: base + 1_500, renewalSeq: 1,
+            });
+        });
+
+        it('does not create, resurrect or extend anything', async () => {
+            // No grant at all.
+            await expectInert(() => call({
+                path: '/v1/managed/control/grants/resolve', op: 'grant-resolve', body: resolveBody(),
+            }), 404);
+
+            expect((await call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint',
+                body: mintBody({ expiresAt: Date.now() + HOUR }),
+            })).statusCode).toBe(200);
+
+            // Revoked.
+            expect((await call({
+                path: '/v1/managed/control/grants/revoke', op: 'grant-revoke',
+                body: { scope: scope(), reason: 'operator' },
+            })).statusCode).toBe(200);
+            await expectInert(() => call({
+                path: '/v1/managed/control/grants/resolve', op: 'grant-resolve', body: resolveBody(),
+            }), 403);
+        });
+
+        it('refuses an expired grant even when the request asks for later', async () => {
+            const past = Date.now() + 40;
+            expect((await call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint',
+                body: mintBody({ expiresAt: past }),
+            })).statusCode).toBe(200);
+            await new Promise((resolve) => setTimeout(resolve, 60));
+            await expectInert(() => call({
+                path: '/v1/managed/control/grants/resolve', op: 'grant-resolve',
+                body: resolveBody({ requestedTokenExpiresAt: Date.now() + HOUR }),
+            }), 403);
+        });
+
+        it('refuses a requested expiry that is already in the past', async () => {
+            expect((await call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint', body: mintBody(),
+            })).statusCode).toBe(200);
+            await expectInert(() => call({
+                path: '/v1/managed/control/grants/resolve', op: 'grant-resolve',
+                body: resolveBody({ requestedTokenExpiresAt: Date.now() - 1_000 }),
+            }), 403);
+        });
+
+        it.each([
+            ['epoch', { epoch: 2 }],
+            ['runtimeId', { runtimeId: 'runtime-2' }],
+            ['attemptId', { attemptId: 'attempt-2' }],
+            ['workspaceAuthorityVersion', { workspaceAuthorityVersion: 2 }],
+            ['runAuthorityVersion', { runAuthorityVersion: 2 }],
+            ['tenantId', { tenantId: 'tenant-other' }],
+            ['projectId', { projectId: 'project-other' }],
+        ])('refuses a stale or wrong %s', async (_label, over) => {
+            expect((await call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint', body: mintBody(),
+            })).statusCode).toBe(200);
+            await expectInert(() => call({
+                path: '/v1/managed/control/grants/resolve', op: 'grant-resolve',
+                body: resolveBody({ scope: scope(over) }),
+            }), 403);
+        });
+
+        it('refuses when the bearer does not own the scope', async () => {
+            expect((await call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint', body: mintBody(),
+            })).statusCode).toBe(200);
+            await expectInert(() => call({
+                path: '/v1/managed/control/grants/resolve', op: 'grant-resolve',
+                body: resolveBody(), token: otherToken,
+            }), 403);
+        });
+
+        it('refuses a stored grant left behind by an authority advance', async () => {
+            expect((await call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint', body: mintBody(),
+            })).statusCode).toBe(200);
+
+            // The workspace moves on; the caller signs the new generation.
+            expect((await call({
+                path: '/v1/managed/control/authority/workspace', op: 'authority-sync',
+                body: {
+                    ownerAccountId: accountId, expectedVersion: 1,
+                    body: {
+                        workspaceId, tenantId: 'tenant-1', projectId: 'project-1',
+                        epoch: 2, runtimeId: 'runtime-1',
+                    },
+                },
+            })).statusCode).toBe(200);
+
+            const fresh = scope({ epoch: 2, workspaceAuthorityVersion: 2 });
+            await expectInert(() => call({
+                path: '/v1/managed/control/grants/resolve', op: 'grant-resolve',
+                body: resolveBody({ scope: fresh }),
+            }), 403);
+        });
+
+        it('issues a token whose claims are exactly the scope it answered with', async () => {
+            expect((await call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint', body: mintBody(),
+            })).statusCode).toBe(200);
+            const resolved = await call({
+                path: '/v1/managed/control/grants/resolve', op: 'grant-resolve', body: resolveBody(),
+            });
+            expect(resolved.statusCode).toBe(200);
+            const payload = resolved.json();
+
+            const runtime = await modules.runtime.createManagedControlRuntime(CONTROL_ENV);
+            const verified = await runtime!.scopedTokens.verify(payload.token, Date.now());
+            expect(verified).toMatchObject({ ok: true });
+            if (verified.ok) {
+                // Every one of the eleven axes, plus the expiry the DTO reports.
+                const claims = verified.claims as unknown as Record<string, unknown>;
+                const answered = payload.scope as Record<string, unknown>;
+                expect(Object.keys(answered)).toHaveLength(11);
+                for (const key of Object.keys(answered)) {
+                    expect(claims[key], key).toEqual(answered[key]);
+                }
+                expect(verified.claims.grantId).toBe(payload.grantId);
+                expect(verified.claims.expiresAt).toBe(payload.tokenExpiresAt);
+            }
+        });
+
+        it.each([
+            ['past the safe integer range', Number.MAX_SAFE_INTEGER + 1],
+            ['zero', 0],
+            ['negative', -1],
+            ['fractional', 1.5],
+        ])('refuses a requested expiry %s', async (_label, requested) => {
+            expect((await call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint', body: mintBody(),
+            })).statusCode).toBe(200);
+            const body = resolveBody({ requestedTokenExpiresAt: requested });
+            const before = await managedRowSnapshot();
+            const response = await call({
+                path: '/v1/managed/control/grants/resolve', op: 'grant-resolve', body,
+            });
+            expect(response.statusCode).not.toBe(200);
+            expect(await managedRowSnapshot()).toEqual(before);
+        });
+
+        it('refuses an assertion signed for another operation', async () => {
+            expect((await call({
+                path: '/v1/managed/control/grants/mint', op: 'grant-mint', body: mintBody(),
+            })).statusCode).toBe(200);
+            const body = resolveBody();
+            await expectInert(() => call({
+                path: '/v1/managed/control/grants/resolve', op: 'grant-resolve', body,
+                assertion: assertionFor('grant-mint', body),
+            }), 403);
         });
     });
 

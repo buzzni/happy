@@ -589,6 +589,130 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
         });
     });
 
+    describe('resolving a grant after a lost response', () => {
+        async function storedRows() {
+            return db.managedSessionGrant.findMany({
+                where: { runId: { in: [...createdRunIds] } }, orderBy: { grantId: 'asc' },
+            });
+        }
+
+        it('returns the current grant capped by the signed request and writes nothing', async () => {
+            expect(await grants.issueSessionGrant(issueInput({ expiresAt: NOW + 500 })))
+                .toMatchObject({ ok: true });
+            expect(await grants.renewSessionGrant({
+                scope: scope(), expectedRenewalSeq: 0, expiresAt: NOW + 1_500, now: NOW,
+            })).toMatchObject({ ok: true });
+
+            const before = await storedRows();
+            const resolved = await grants.resolveSessionGrant({
+                scope: scope(), requestedTokenExpiresAt: NOW + 1_000, now: NOW,
+            });
+            expect(resolved).toMatchObject({ ok: true });
+            if (resolved.ok) {
+                // Not the first answer (500) and never the renewal (1500).
+                expect(resolved.resolved.tokenExpiresAt).toBe(NOW + 1_000);
+                expect(resolved.resolved.grant).toMatchObject({
+                    renewalSeq: 1, expiresAt: NOW + 1_500,
+                });
+            }
+            expect(await storedRows()).toEqual(before);
+        });
+
+        it('caps at the grant when the request asks for later', async () => {
+            await grants.issueSessionGrant(issueInput({ expiresAt: NOW + 500 }));
+            const resolved = await grants.resolveSessionGrant({
+                scope: scope(), requestedTokenExpiresAt: NOW + HOUR, now: NOW,
+            });
+            expect(resolved).toMatchObject({ ok: true });
+            if (resolved.ok) expect(resolved.resolved.tokenExpiresAt).toBe(NOW + 500);
+        });
+
+        it.each([
+            ['no grant at all', async () => {}, 'grant-unknown'],
+            ['a revoked family', async () => {
+                await grants.issueSessionGrant(issueInput());
+                await grants.revokeSessionGrant({ scope: scope(), reason: 'operator', now: NOW });
+            }, 'revoked'],
+            ['a revoke that arrived first', async () => {
+                await grants.revokeSessionGrant({ scope: scope(), reason: 'operator', now: NOW });
+            }, 'grant-unknown'],
+            ['an expired grant', async () => {
+                await grants.issueSessionGrant(issueInput({ expiresAt: NOW + 10 }));
+            }, 'expired'],
+        ])('refuses %s and creates nothing', async (_label, prepare, reason) => {
+            await prepare();
+            const before = await storedRows();
+            expect(await grants.resolveSessionGrant({
+                scope: scope(), requestedTokenExpiresAt: NOW + HOUR, now: NOW + 1_000,
+            })).toEqual({ ok: false, reason });
+            expect(await storedRows()).toEqual(before);
+        });
+
+        it('refuses a requested expiry that has already passed', async () => {
+            await grants.issueSessionGrant(issueInput());
+            expect(await grants.resolveSessionGrant({
+                scope: scope(), requestedTokenExpiresAt: NOW - 1, now: NOW,
+            })).toEqual({ ok: false, reason: 'already-expired' });
+        });
+
+        it('refuses a stored grant left behind by an authority advance', async () => {
+            // The family deliberately excludes epoch and the versions, so an old
+            // grant is still found by a fresh scope. Returning it would hand out
+            // a token whose claims say "epoch 2" over a row minted at epoch 1.
+            await grants.issueSessionGrant(issueInput());
+            expect(await projection.syncWorkspaceAuthority({
+                body: {
+                    workspaceId, tenantId: 'tenant-1', projectId: 'project-1',
+                    epoch: 2, runtimeId: 'runtime-1',
+                },
+                expectedVersion: 1, now: NOW,
+            })).toMatchObject({ ok: true, version: 2 });
+
+            const fresh = scope({ epoch: 2, workspaceAuthorityVersion: 2 });
+            const before = await storedRows();
+            expect(await grants.resolveSessionGrant({
+                scope: fresh, requestedTokenExpiresAt: NOW + HOUR, now: NOW,
+            })).toEqual({ ok: false, reason: 'grant-stale' });
+            expect(await storedRows()).toEqual(before);
+        });
+
+        it.each([
+            ['not a safe integer', Number.MAX_SAFE_INTEGER + 1],
+            ['NaN', Number.NaN],
+            ['Infinity', Number.POSITIVE_INFINITY],
+            ['fractional', 1_800_000_000_000.5],
+        ])('refuses a requested expiry that is %s', async (_label, requested) => {
+            await grants.issueSessionGrant(issueInput());
+            expect(await grants.resolveSessionGrant({
+                scope: scope(), requestedTokenExpiresAt: requested, now: NOW,
+            })).toEqual({ ok: false, reason: 'already-expired' });
+        });
+
+        it('runs the same scope, session and freshness checks as a mint', async () => {
+            await grants.issueSessionGrant(issueInput());
+            for (const [over, reason] of [
+                [{ epoch: 2 }, 'authority-stale'],
+                [{ runtimeId: 'runtime-2' }, 'authority-stale'],
+                [{ workspaceAuthorityVersion: 2 }, 'authority-stale'],
+                [{ runAuthorityVersion: 2 }, 'authority-stale'],
+                [{ attemptId: 'attempt-2' }, 'attempt-mismatch'],
+                [{ tenantId: 'tenant-other' }, 'binding-mismatch'],
+                [{ projectId: 'project-other' }, 'binding-mismatch'],
+            ] as const) {
+                expect(await grants.resolveSessionGrant({
+                    scope: scope(over), requestedTokenExpiresAt: NOW + HOUR, now: NOW,
+                }), JSON.stringify(over)).toEqual({ ok: false, reason });
+            }
+
+            await db.session.update({
+                where: { id: sessionId }, data: { accountId: await createAccount() },
+            });
+            expect(await grants.resolveSessionGrant({
+                scope: scope(), requestedTokenExpiresAt: NOW + HOUR, now: NOW,
+            })).toEqual({ ok: false, reason: 'session-owner-changed' });
+        });
+    });
+
     describe('the check every action makes', () => {
         let grantId: string;
 

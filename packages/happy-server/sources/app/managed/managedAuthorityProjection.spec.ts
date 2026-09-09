@@ -5,6 +5,7 @@ import { Prisma } from '@prisma/client';
 import type { PrismaClient } from '@prisma/client';
 import type {
     readRunScopeAuthority as ReadRunScopeAuthority,
+    readAuthoritySnapshot as ReadAuthoritySnapshot,
     syncRunAuthority as SyncRunAuthority,
     syncWorkspaceAuthority as SyncWorkspaceAuthority,
     RunAuthorityBody,
@@ -54,6 +55,7 @@ let db: PrismaClient;
 let syncWorkspaceAuthority: typeof SyncWorkspaceAuthority;
 let syncRunAuthority: typeof SyncRunAuthority;
 let readRunScopeAuthority: typeof ReadRunScopeAuthority;
+let readAuthoritySnapshot: typeof ReadAuthoritySnapshot;
 
 /** Every id this file created, so cleanup never reaches beyond them. */
 const createdWorkspaceIds = new Set<string>();
@@ -132,6 +134,7 @@ describe.skipIf(!enabled)('managed authority projection (real PostgreSQL)', () =
             syncWorkspaceAuthority = projection.syncWorkspaceAuthority;
             syncRunAuthority = projection.syncRunAuthority;
             readRunScopeAuthority = projection.readRunScopeAuthority;
+            readAuthoritySnapshot = projection.readAuthoritySnapshot;
             db = (await import('@/storage/db')).db as unknown as PrismaClient;
         }
         workspaceId = newWorkspaceId();
@@ -303,6 +306,202 @@ describe.skipIf(!enabled)('managed authority projection (real PostgreSQL)', () =
             expect([a, b].filter((r) => r.ok)).toHaveLength(1);
             const stored = await db.managedWorkspaceAuthority.findUniqueOrThrow({ where: { workspaceId } });
             expect(stored.version).toBe(2);
+        });
+    });
+
+    describe('the recovery snapshot', () => {
+        function snapshotInput(over: Record<string, unknown> = {}) {
+            return {
+                tenantId: 'tenant-1',
+                projectId: 'project-1',
+                workspaceId,
+                runId,
+                accountId: 'account-1',
+                ...over,
+            };
+        }
+
+        it('reports nothing before either projection exists', async () => {
+            expect(await readAuthoritySnapshot(snapshotInput()))
+                .toEqual({ ok: true, workspace: null, run: null });
+        });
+
+        it('reports a workspace that exists before its run', async () => {
+            await syncWorkspaceAuthority({ body: workspaceBody(), expectedVersion: 0, now: NOW });
+            expect(await readAuthoritySnapshot(snapshotInput())).toEqual({
+                ok: true,
+                workspace: {
+                    workspaceId, tenantId: 'tenant-1', projectId: 'project-1',
+                    epoch: 1, runtimeId: 'runtime-1', version: 1,
+                },
+                run: null,
+            });
+        });
+
+        it('returns both once they exist, at their current versions', async () => {
+            await syncWorkspaceAuthority({ body: workspaceBody(), expectedVersion: 0, now: NOW });
+            await syncRunAuthority({ body: runBody(), expectedVersion: 0, now: NOW });
+            await syncRunAuthority({
+                body: runBody({ currentAttemptId: 'attempt-2' }), expectedVersion: 1, now: NOW,
+            });
+            expect(await readAuthoritySnapshot(snapshotInput())).toMatchObject({
+                ok: true,
+                workspace: { version: 1, epoch: 1 },
+                run: { currentAttemptId: 'attempt-2', version: 2, cancelled: false },
+            });
+        });
+
+        it.each([
+            ['a workspace under another tenant', { tenantId: 'tenant-other' }, 'workspace-mismatch'],
+            ['a workspace under another project', { projectId: 'project-other' }, 'workspace-mismatch'],
+            ['a run in another workspace', { workspaceId: 'ws-other' }, 'run-workspace-mismatch'],
+            ['a run owned by another account', { accountId: 'account-2' }, 'run-account-mismatch'],
+        ])('refuses %s instead of reporting it missing', async (_label, over, reason) => {
+            // Hiding a mismatch behind `null` would read as "create it".
+            await syncWorkspaceAuthority({ body: workspaceBody(), expectedVersion: 0, now: NOW });
+            await syncRunAuthority({ body: runBody(), expectedVersion: 0, now: NOW });
+            expect(await readAuthoritySnapshot(snapshotInput(over))).toEqual({ ok: false, reason });
+        });
+
+        it('reads both projections from one snapshot while a writer commits between them', async () => {
+            await syncWorkspaceAuthority({ body: workspaceBody(), expectedVersion: 0, now: NOW });
+            await syncRunAuthority({ body: runBody(), expectedVersion: 0, now: NOW });
+
+            let workspaceWasRead!: () => void;
+            const workspaceRead = new Promise<void>((resolve) => { workspaceWasRead = resolve; });
+            let releaseRunQuery!: () => void;
+            const runMayQuery = new Promise<void>((resolve) => { releaseRunQuery = resolve; });
+            let armed = true;
+
+            /**
+             * Gates the reader's **second** query before it executes.
+             *
+             * Blocking after the run row had already been read would prove
+             * nothing: it would have taken the old value either way. The point
+             * is that the run query runs *after* another transaction committed
+             * both rows, and still has to answer from the reader's snapshot.
+             */
+            function gate<T extends object>(client: T): T {
+                return new Proxy(client, {
+                    get(target, prop, receiver) {
+                        const value = Reflect.get(target, prop, receiver);
+                        if (prop !== 'managedWorkspaceAuthority' && prop !== 'managedRunAuthority') {
+                            return value;
+                        }
+                        const isRun = prop === 'managedRunAuthority';
+                        return new Proxy(value as object, {
+                            get(model, key, modelReceiver) {
+                                const inner = Reflect.get(model, key, modelReceiver);
+                                if (key !== 'findUnique') return inner;
+                                return async (...args: unknown[]) => {
+                                    if (isRun) await runMayQuery;
+                                    const result = await (inner as (...a: unknown[]) => Promise<unknown>)
+                                        .apply(model, args);
+                                    if (!isRun) workspaceWasRead();
+                                    return result;
+                                };
+                            },
+                        });
+                    },
+                });
+            }
+
+            const restore = replaceTransaction((original, ...args) => {
+                const [fn, options] = args as unknown as [
+                    (tx: unknown) => Promise<unknown>, unknown,
+                ];
+                if (!armed) return (original as (...a: never[]) => unknown)(...args);
+                return (original as unknown as (
+                    f: (tx: unknown) => Promise<unknown>, o: unknown,
+                ) => Promise<unknown>)((tx) => fn(gate(tx as object)), options);
+            });
+
+            /**
+             * The same gate on the client itself, so a version of the read that
+             * skipped the transaction is still gated — and fails on the values
+             * it returns rather than by hanging on a signal that never comes.
+             */
+            const restoreClient = (() => {
+                const originals = ['managedWorkspaceAuthority', 'managedRunAuthority'] as const;
+                const saved = originals.map((name) => [name, (db as never)[name]] as const);
+                for (const [name, model] of saved) {
+                    Object.defineProperty(db, name, {
+                        configurable: true,
+                        value: (gate({ [name]: model }) as never)[name],
+                    });
+                }
+                return () => {
+                    for (const [name, model] of saved) {
+                        Object.defineProperty(db, name, { configurable: true, value: model });
+                    }
+                };
+            })();
+
+            let snapshot: Awaited<ReturnType<typeof readAuthoritySnapshot>>;
+            try {
+                const reading = readAuthoritySnapshot({
+                    tenantId: 'tenant-1', projectId: 'project-1',
+                    workspaceId, runId, accountId: 'account-1',
+                });
+                await workspaceRead;
+                // Everything after this point must not be gated — the writer is
+                // a different transaction and has to be able to commit.
+                armed = false;
+                // The writer must not be gated: it goes through the transaction
+                // client, which is only wrapped while `armed`.
+                restoreClient();
+
+                // One transaction advancing **both** projections together.
+                await db.$transaction(async (tx) => {
+                    await tx.managedWorkspaceAuthority.update({
+                        where: { workspaceId },
+                        data: { epoch: 2, version: 2, updatedAt: BigInt(NOW) },
+                    });
+                    await tx.managedRunAuthority.update({
+                        where: { runId },
+                        data: { currentAttemptId: 'attempt-2', version: 2, updatedAt: BigInt(NOW) },
+                    });
+                });
+
+                releaseRunQuery();
+                snapshot = await reading;
+            } finally {
+                releaseRunQuery();
+                restore();
+                restoreClient();
+            }
+
+            // The committed pair the reader started from — never the old
+            // workspace beside the new run.
+            expect(snapshot).toMatchObject({
+                ok: true,
+                workspace: { version: 1, epoch: 1 },
+                run: { version: 1, currentAttemptId: 'attempt-1' },
+            });
+
+            // The write really did land.
+            expect(await readAuthoritySnapshot({
+                tenantId: 'tenant-1', projectId: 'project-1',
+                workspaceId, runId, accountId: 'account-1',
+            })).toMatchObject({
+                ok: true,
+                workspace: { version: 2, epoch: 2 },
+                run: { version: 2, currentAttemptId: 'attempt-2' },
+            });
+        }, 20_000);
+
+        it('writes nothing', async () => {
+            await syncWorkspaceAuthority({ body: workspaceBody(), expectedVersion: 0, now: NOW });
+            await syncRunAuthority({ body: runBody(), expectedVersion: 0, now: NOW });
+            const before = await Promise.all([
+                db.managedWorkspaceAuthority.findMany({ where: { workspaceId: { in: [...createdWorkspaceIds] } }, orderBy: { workspaceId: 'asc' } }),
+                db.managedRunAuthority.findMany({ where: { runId: { in: [...createdRunIds] } }, orderBy: { runId: 'asc' } }),
+            ]);
+            await readAuthoritySnapshot(snapshotInput());
+            expect(await Promise.all([
+                db.managedWorkspaceAuthority.findMany({ where: { workspaceId: { in: [...createdWorkspaceIds] } }, orderBy: { workspaceId: 'asc' } }),
+                db.managedRunAuthority.findMany({ where: { runId: { in: [...createdRunIds] } }, orderBy: { runId: 'asc' } }),
+            ])).toEqual(before);
         });
     });
 

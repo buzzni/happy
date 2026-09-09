@@ -201,3 +201,26 @@ describe('malformed input', () => {
         expect(check(assertion({ iat: 1.5 as number }))).toEqual({ ok: false, reason: 'malformed' });
     });
 });
+
+describe('the read operations are their own', () => {
+    it('accepts an assertion signed for each new operation', () => {
+        for (const op of ['authority-snapshot', 'grant-resolve'] as const) {
+            expect(check(assertion({ op }), { operation: op }))
+                .toMatchObject({ ok: true, operation: op });
+        }
+    });
+
+    it('does not let a read assertion authorise a write, or the reverse', () => {
+        // A signed look must never be replayable as a change, and a signed
+        // change must not be usable to collect a credential.
+        for (const [signedOp, usedOp] of [
+            ['authority-snapshot', 'authority-sync'],
+            ['grant-resolve', 'grant-mint'],
+            ['grant-mint', 'grant-resolve'],
+            ['authority-sync', 'authority-snapshot'],
+        ] as const) {
+            expect(check(assertion({ op: signedOp }), { operation: usedOp }))
+                .toEqual({ ok: false, reason: 'wrong-operation' });
+        }
+    });
+});

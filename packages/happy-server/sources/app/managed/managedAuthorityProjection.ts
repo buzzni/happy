@@ -305,3 +305,97 @@ export async function readRunScopeAuthority(runId: string) {
         workspaceVersion: run.workspace.version,
     };
 }
+
+export type AuthoritySnapshotWorkspace = {
+    workspaceId: string;
+    tenantId: string;
+    projectId: string;
+    epoch: number;
+    runtimeId: string;
+    version: number;
+};
+
+export type AuthoritySnapshotRun = {
+    runId: string;
+    workspaceId: string;
+    accountId: string;
+    currentAttemptId: string;
+    cancelled: boolean;
+    version: number;
+};
+
+export type AuthoritySnapshotMismatch =
+    | 'workspace-mismatch'
+    | 'run-workspace-mismatch'
+    | 'run-account-mismatch';
+
+export type AuthoritySnapshotResult =
+    | {
+        ok: true;
+        workspace: AuthoritySnapshotWorkspace | null;
+        run: AuthoritySnapshotRun | null;
+    }
+    | { ok: false; reason: AuthoritySnapshotMismatch };
+
+/**
+ * Both projections as one consistent read, for a control plane recovering the
+ * body it has to sign next.
+ *
+ * `null` means "this server has no such row", and it is the only thing that may
+ * be read as an invitation to create one. A row that exists but disagrees with
+ * the caller's ids is **not** reported as missing: hiding a mismatch behind
+ * `null` would turn "you are looking at someone else's workspace" into "go
+ * ahead and sync it". For the same reason a missing run says nothing about who
+ * may run it — the caller still has to pass every other check to act.
+ */
+export async function readAuthoritySnapshot(input: {
+    tenantId: string;
+    projectId: string;
+    workspaceId: string;
+    runId: string;
+    accountId: string;
+}): Promise<AuthoritySnapshotResult> {
+    return inTx(async (tx) => {
+        const [workspace, run] = await Promise.all([
+            tx.managedWorkspaceAuthority.findUnique({
+                where: { workspaceId: input.workspaceId },
+            }),
+            tx.managedRunAuthority.findUnique({ where: { runId: input.runId } }),
+        ]);
+
+        if (workspace && (workspace.tenantId !== input.tenantId
+            || workspace.projectId !== input.projectId)) {
+            return { ok: false, reason: 'workspace-mismatch' };
+        }
+        if (run && run.workspaceId !== input.workspaceId) {
+            return { ok: false, reason: 'run-workspace-mismatch' };
+        }
+        if (run && run.accountId !== input.accountId) {
+            return { ok: false, reason: 'run-account-mismatch' };
+        }
+
+        return {
+            ok: true,
+            workspace: workspace
+                ? {
+                    workspaceId: workspace.workspaceId,
+                    tenantId: workspace.tenantId,
+                    projectId: workspace.projectId,
+                    epoch: workspace.epoch,
+                    runtimeId: workspace.runtimeId,
+                    version: workspace.version,
+                }
+                : null,
+            run: run
+                ? {
+                    runId: run.runId,
+                    workspaceId: run.workspaceId,
+                    accountId: run.accountId,
+                    currentAttemptId: run.currentAttemptId,
+                    cancelled: run.cancelledAt !== null,
+                    version: run.version,
+                }
+                : null,
+        };
+    });
+}

@@ -37,12 +37,24 @@ const CLOCK_SKEW_MS = 5_000;
 
 export type ControlOperation =
     | 'authority-sync'
+    /**
+     * Reads both projections. Separate from the write op so an assertion signed
+     * to look cannot be replayed to change anything.
+     */
+    | 'authority-snapshot'
     | 'grant-mint'
     | 'grant-renew'
+    /**
+     * Reads the current grant and issues a token for it. It writes nothing, but
+     * it hands out a credential, so it is its own operation rather than a
+     * variant of the read above.
+     */
+    | 'grant-resolve'
     | 'grant-revoke';
 
 export const CONTROL_OPERATIONS: readonly ControlOperation[] = [
-    'authority-sync', 'grant-mint', 'grant-renew', 'grant-revoke',
+    'authority-sync', 'authority-snapshot',
+    'grant-mint', 'grant-renew', 'grant-resolve', 'grant-revoke',
 ];
 
 export type ControlAssertionFailure =

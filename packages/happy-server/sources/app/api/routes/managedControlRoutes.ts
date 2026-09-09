@@ -23,12 +23,14 @@ import { type Fastify } from '../types';
 import { CONTROL_ASSERTION_PURPOSE, type ControlOperation } from '@/app/managed/managedControlAssertion';
 import type { ManagedControlRuntime } from '@/app/managed/managedControlRuntime';
 import {
+    readAuthoritySnapshot,
     syncRunAuthority,
     syncWorkspaceAuthority,
 } from '@/app/managed/managedAuthorityProjection';
 import {
     issueSessionGrant,
     renewSessionGrant,
+    resolveSessionGrant,
     revokeSessionGrant,
     type ManagedScope,
 } from '@/app/managed/managedSessionGrant';
@@ -37,6 +39,14 @@ export const CONTROL_ASSERTION_HEADER = 'x-happy-control-assertion';
 
 const identifier = z.string().trim().min(1).max(200);
 const version = z.number().int().min(0);
+/**
+ * An instant this server will compare and store. `z.number().int()` alone
+ * accepts values past `Number.MAX_SAFE_INTEGER`, where JSON round-trips stop
+ * being exact — so the bound is stated here rather than assumed from the
+ * validator's version.
+ */
+const instant = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER)
+    .refine(Number.isSafeInteger, { message: 'must be a safe integer' });
 
 const scopeSchema = z.object({
     tenantId: identifier,
@@ -86,6 +96,21 @@ const renewSchema = z.object({
     scope: scopeSchema,
     expectedRenewalSeq: version,
     expiresAt: z.number().int().min(1),
+}).strict();
+
+const snapshotSchema = z.object({
+    requestId: identifier,
+    tenantId: identifier,
+    projectId: identifier,
+    workspaceId: identifier,
+    runId: identifier,
+    accountId: identifier,
+}).strict();
+
+const resolveSchema = z.object({
+    requestId: identifier,
+    scope: scopeSchema,
+    requestedTokenExpiresAt: instant,
 }).strict();
 
 const revokeSchema = z.object({
@@ -199,6 +224,37 @@ export function managedControlRoutes(
         return reply.send({ version: result.version, idempotent: result.idempotent });
     });
 
+    /**
+     * Reads both projections so a control plane that lost its own memory can
+     * sign the next body against what this server actually holds.
+     *
+     * A signed POST rather than a GET: the verifier binds the request body, so
+     * a GET's path and query would carry no proof at all.
+     */
+    app.post('/v1/managed/control/authority/snapshot', {
+        onRequest: [app.authenticate, requireConfigured],
+        schema: { body: snapshotSchema },
+    }, async (request, reply) => {
+        if (!authorize(request as never, reply as never, 'authority-snapshot')) return;
+        if (request.body.accountId !== request.userId) {
+            return reply.code(403).send({ error: 'Bearer does not own this scope' });
+        }
+        const snapshot = await readAuthoritySnapshot({
+            tenantId: request.body.tenantId,
+            projectId: request.body.projectId,
+            workspaceId: request.body.workspaceId,
+            runId: request.body.runId,
+            accountId: request.body.accountId,
+        });
+        // A mismatch is a refusal, never a `null` that reads as "create it".
+        if (!snapshot.ok) return reply.code(403).send({ error: snapshot.reason });
+        return reply.send({
+            requestId: request.body.requestId,
+            workspace: snapshot.workspace,
+            run: snapshot.run,
+        });
+    });
+
     app.post('/v1/managed/control/grants/mint', {
         onRequest: [app.authenticate, requireConfigured],
         schema: { body: mintSchema },
@@ -295,6 +351,70 @@ export function managedControlRoutes(
             renewalSeq: renewed.grant.renewalSeq,
             idempotent: renewed.idempotent,
             serverUrl: runtime.publicUrl,
+        });
+    });
+
+    /**
+     * Recovers the token for a grant that already exists.
+     *
+     * It writes nothing, but it issues a credential, so it carries the same two
+     * proofs and the same scope checks as a mint. The token's expiry is the
+     * lesser of the grant's own and the one the caller signed for, and the
+     * expiry is re-checked at the moment of issue: the read may have waited on
+     * the database long enough for the grant to lapse in between.
+     */
+    app.post('/v1/managed/control/grants/resolve', {
+        onRequest: [app.authenticate, requireConfigured],
+        schema: { body: resolveSchema },
+    }, async (request, reply) => {
+        const runtime = authorize(request as never, reply as never, 'grant-resolve');
+        if (!runtime) return;
+        const scope = request.body.scope as ManagedScope;
+        if (scope.accountId !== request.userId) {
+            return reply.code(403).send({ error: 'Bearer does not own this scope' });
+        }
+
+        const resolved = await resolveSessionGrant({
+            scope,
+            requestedTokenExpiresAt: request.body.requestedTokenExpiresAt,
+            now: Date.now(),
+        });
+        if (!resolved.ok) {
+            return reply.code(failureStatus(resolved.reason)).send({ error: resolved.reason });
+        }
+        const { grant, tokenExpiresAt } = resolved.resolved;
+
+        // Issued against the clock now, not the one the read started with.
+        const issuedAt = Date.now();
+        if (tokenExpiresAt <= issuedAt) {
+            return reply.code(403).send({ error: 'expired' });
+        }
+        const minted = await runtime.scopedTokens.mint({
+            v: 1,
+            grantId: grant.grantId,
+            accountId: grant.accountId,
+            sessionId: grant.sessionId,
+            tenantId: scope.tenantId,
+            projectId: scope.projectId,
+            workspaceId: grant.workspaceId,
+            runtimeId: scope.runtimeId,
+            runId: grant.runId,
+            attemptId: grant.attemptId,
+            epoch: grant.epoch,
+            workspaceAuthorityVersion: grant.workspaceAuthorityVersion,
+            runAuthorityVersion: grant.runAuthorityVersion,
+            expiresAt: tokenExpiresAt,
+        }, issuedAt);
+        if (!minted.ok) return reply.code(500).send({ error: 'Grant token could not be minted' });
+
+        return reply.send({
+            requestId: request.body.requestId,
+            scope,
+            grantId: grant.grantId,
+            token: minted.token,
+            tokenExpiresAt,
+            grantExpiresAt: grant.expiresAt,
+            renewalSeq: grant.renewalSeq,
         });
     });
 
