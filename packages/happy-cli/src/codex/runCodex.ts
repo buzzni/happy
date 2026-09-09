@@ -100,10 +100,14 @@ import {
     consumePendingInitialSaycodeSystemPromptEnabled,
     resolveInitialPromptPermissionMode,
 } from '@/utils/initialPrompt';
+
 import { registerCodexSteerHandler } from './codexSteerHandler';
 import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
+
+/** See the Claude counterpart. */
+const CODEX_INITIAL_PROMPT_ACK_TIMEOUT_MS = 30_000;
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
@@ -238,6 +242,7 @@ export async function runCodex(opts: {
     assertCodexAutomationServerAvailable({
         automationRunOnceRequested,
         serverAvailable: response !== null,
+        prepared: preparedInitialPrompt,
     });
     if (!response && sandboxConfig?.checkpointProtection) {
         throw new Error('checkpoint protection requires an authoritative server session');
@@ -466,6 +471,17 @@ export async function runCodex(opts: {
     });
     session.onUserMessage(handleUserMessage);
     const initialPromptDelivered = await prepareCodexSessionStart({
+        // An offline start has no session to confirm against; the guard above
+        // (`assertCodexAutomationServerAvailable`) already refused that case,
+        // and `prepareCodexSessionStart` refuses again if no confirmer reaches
+        // it. This condition only supplies the confirmer when one can exist.
+        ...(preparedInitialPrompt.requireConfirmedDelivery && response
+            ? {
+                confirmDelivery: (localId: string) => session.awaitMessageAck(
+                    localId, CODEX_INITIAL_PROMPT_ACK_TIMEOUT_MS,
+                ),
+            }
+            : {}),
         prepared: preparedInitialPrompt,
         sendSessionMessage: (envelope, localId) => session.sendSessionProtocolMessage(envelope, localId),
         pushPrompt: (prompt) => {

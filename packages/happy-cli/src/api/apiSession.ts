@@ -103,6 +103,53 @@ type V3PostSessionMessagesResponse = {
     }>;
 };
 
+/**
+ * Outcome of waiting for one message to be durably acknowledged.
+ *
+ * `ok: false` means the acknowledgement was not observed — **not** that the
+ * message was lost. A 2xx whose body omits our row leaves durability unknown,
+ * and a caller must treat it as "do not proceed", never as "it is gone".
+ */
+export type MessageAckOutcome =
+    | { ok: true; id: string; seq: number }
+    | { ok: false; reason: 'deadline' | 'closed' | 'sync-failed' | 'contradictory-ack' };
+
+/**
+ * Whether a server row is a usable acknowledgement for `localId`.
+ *
+ * Exported for the exhaustive shape tests; kept in this file because the
+ * acknowledgement map that consumes it is a concern of this class and moving
+ * one predicate out would not give it a second owner.
+ */
+export function readMessageAck(
+    rows: unknown,
+    localId: string,
+): { ok: true; id: string; seq: number } | { ok: false; reason: 'absent' | 'contradictory-ack' } {
+    // The body is network input: the declared type is a hope, not a guarantee.
+    if (!Array.isArray(rows)) return { ok: false, reason: 'absent' };
+    const matches = rows.filter((row) => (
+        row !== null && typeof row === 'object'
+        && (row as { localId?: unknown }).localId === localId
+    )) as Array<{ id?: unknown; seq?: unknown }>;
+    if (matches.length === 0) return { ok: false, reason: 'absent' };
+
+    const usable = matches.filter((row) => (
+        typeof row.id === 'string' && row.id.length > 0
+        && typeof row.seq === 'number' && Number.isSafeInteger(row.seq) && row.seq > 0
+    )) as Array<{ id: string; seq: number }>;
+    // A malformed row alongside a well-formed one is not a clean answer: the
+    // server is describing our localId twice and we cannot tell which is ours.
+    // Picking the valid one would turn an inconsistent response into a
+    // confirmation.
+    if (usable.length !== matches.length) return { ok: false, reason: 'contradictory-ack' };
+
+    const first = usable[0]!;
+    if (usable.some((row) => row.id !== first.id || row.seq !== first.seq)) {
+        return { ok: false, reason: 'contradictory-ack' };
+    }
+    return { ok: true, id: first.id, seq: first.seq };
+}
+
 type AttachmentUploadResult = {
     ref: string;
     uploadUrl: string;
@@ -310,6 +357,15 @@ export class ApiSessionClient extends EventEmitter {
     private runtimeProcessedSeqCap: number | null = null;
     private pendingOutbox: Array<{ content: string; localId: string }> = [];
     private readonly sendSync: InvalidateSync;
+    /**
+     * Callers waiting for a specific message to be acknowledged. Registered
+     * before the message is enqueued, because a flush can start immediately
+     * afterwards and a waiter added later would miss its own acknowledgement.
+     */
+    private readonly messageAckWaiters = new Map<string, {
+        settle: (outcome: MessageAckOutcome) => void;
+        timer: ReturnType<typeof setTimeout>;
+    }>();
     private readonly receiveSync: InvalidateSync;
     private receivePollInterval: NodeJS.Timeout | null = null;
     private currentThinking = false;
@@ -847,6 +903,8 @@ export class ApiSessionClient extends EventEmitter {
             return;
         }
         this.syncFatalHandled = true;
+        // Nothing will be flushed after this, so no acknowledgement can arrive.
+        this.settleAllMessageAcks('sync-failed');
         // A sync 404/410 is NOT proof the session row is gone: happy-server
         // returns the identical 404 for "row deleted" and "row exists under
         // another account" (2026-07-23 incident — the session was alive, the
@@ -984,6 +1042,64 @@ export class ApiSessionClient extends EventEmitter {
             ), this.lastSeq);
             this.lastSeq = maxSeq;
             this.pendingOutbox.splice(0, batch.length);
+            // Resolution rides the existing flush rather than a second POST, so
+            // ordering against everything already queued is unchanged. Only the
+            // localIds this batch actually carried are considered: a response
+            // naming anything else must not confirm a message that has not been
+            // sent yet.
+            this.resolveMessageAcks(messages, new Set(batch.map((item) => item.localId)));
+        }
+    }
+
+    /**
+     * Waits for one enqueued message to be acknowledged by the server.
+     *
+     * Register before enqueuing. The returned promise always resolves: an
+     * unobserved acknowledgement is an outcome, not an exception, and a
+     * rejected promise nobody awaited would surface as an unhandled rejection.
+     */
+    awaitMessageAck(localId: string, deadlineMs: number): Promise<MessageAckOutcome> {
+        if (this.messageAckWaiters.has(localId)) {
+            throw new Error(`message ack waiter already registered for ${localId}`);
+        }
+        return new Promise<MessageAckOutcome>((resolve) => {
+            const settle = (outcome: MessageAckOutcome) => {
+                const entry = this.messageAckWaiters.get(localId);
+                if (!entry) return;
+                this.messageAckWaiters.delete(localId);
+                clearTimeout(entry.timer);
+                resolve(outcome);
+            };
+            const timer = setTimeout(() => settle({ ok: false, reason: 'deadline' }), deadlineMs);
+            timer.unref?.();
+            this.messageAckWaiters.set(localId, { settle, timer });
+            // Registering after the session already died would otherwise wait
+            // for a flush that will never run.
+            if (this.closed) settle({ ok: false, reason: 'closed' });
+            else if (this.syncFatalHandled) settle({ ok: false, reason: 'sync-failed' });
+        });
+    }
+
+    private resolveMessageAcks(
+        rows: ReadonlyArray<{ id: string; seq: number; localId: string | null }>,
+        sentLocalIds: ReadonlySet<string>,
+    ): void {
+        if (this.messageAckWaiters.size === 0) return;
+        for (const localId of [...this.messageAckWaiters.keys()]) {
+            if (!sentLocalIds.has(localId)) continue;
+            const ack = readMessageAck(rows, localId);
+            // `absent` is not a verdict: this batch simply did not carry it,
+            // and a later batch or the deadline decides.
+            if (ack.ok) this.messageAckWaiters.get(localId)?.settle(ack);
+            else if (ack.reason === 'contradictory-ack') {
+                this.messageAckWaiters.get(localId)?.settle({ ok: false, reason: 'contradictory-ack' });
+            }
+        }
+    }
+
+    private settleAllMessageAcks(reason: 'closed' | 'sync-failed'): void {
+        for (const localId of [...this.messageAckWaiters.keys()]) {
+            this.messageAckWaiters.get(localId)?.settle({ ok: false, reason });
         }
     }
 
@@ -1578,6 +1694,7 @@ export class ApiSessionClient extends EventEmitter {
         logger.debug('[API] socket.close() called');
         // socket.close() 가 부를 disconnect 핸들러보다 먼저 세운다.
         this.closed = true;
+        this.settleAllMessageAcks('closed');
         this.sendSync.stop();
         this.receiveSync.stop();
         this.stopReceivePolling();

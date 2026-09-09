@@ -53,7 +53,11 @@ import { join } from 'node:path';
 import { RawJSONLinesSchema, type RawJSONLines } from './types';
 import { installBroadKillShims } from '@/utils/broadKillShims';
 import { readReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
-import { deliverPreparedClaudeSessionStart, prepareClaudeInitialPrompt } from './initialPrompt';
+import {
+    assertClaudeConfirmedDeliveryPossible,
+    deliverPreparedClaudeSessionStart,
+    prepareClaudeInitialPrompt,
+} from './initialPrompt';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
@@ -65,6 +69,13 @@ import {
 } from '@/prompt/promptProvenance';
 import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
+
+/**
+ * How long a confirmed initial prompt waits for its acknowledgement before the
+ * launch is refused. Long enough to ride a slow flush, short enough that a run
+ * does not hang on a server that will not answer.
+ */
+const INITIAL_PROMPT_ACK_TIMEOUT_MS = 30_000;
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -201,6 +212,14 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     } else {
         response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
     }
+
+    // A launch that requires confirmed delivery has nothing to confirm against
+    // without a server session, and the offline branch below never reaches the
+    // prepared-start helper that would otherwise catch it.
+    assertClaudeConfirmedDeliveryPossible({
+        prepared: preparedInitialPrompt,
+        serverAvailable: response !== null,
+    });
 
     // Handle server unreachable case - run Claude locally with hot reconnection
     // Note: connectionState.notifyOffline() was already called by api.ts with error details
@@ -977,6 +996,15 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // a reconnect resumes an existing conversation.
     await deliverPreparedClaudeSessionStart({
         prepared: preparedInitialPrompt,
+        // Only when the daemon asked for it. On every other launch this is
+        // undefined and delivery behaves exactly as it always has.
+        ...(preparedInitialPrompt.requireConfirmedDelivery
+            ? {
+                confirmDelivery: (localId: string) => session.awaitMessageAck(
+                    localId, INITIAL_PROMPT_ACK_TIMEOUT_MS,
+                ),
+            }
+            : {}),
         sink: {
             sessionId: session.sessionId,
             hasTitle: () => session.hasTitle(),

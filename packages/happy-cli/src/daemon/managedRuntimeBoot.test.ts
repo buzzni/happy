@@ -357,3 +357,34 @@ describe('report verification can see everything the daemon will act on', () => 
         expect(seen[0]).toMatchObject({ encryptionVariant: 'dataKey' });
     });
 });
+
+describe('the confirmed-delivery switch is the daemon\'s, not the caller\'s', () => {
+    it('strips a caller-supplied managed key before it can reach the child', async () => {
+        const { injectMcpCallerGrant } = await import('./mcpCallerGrantEnvelope');
+        // The caller tries to turn the switch off through spawn params.
+        const sanitized = injectMcpCallerGrant({
+            HAPPY_MANAGED_REQUIRE_PROMPT_ACK: '0',
+            SOMETHING_ELSE: 'kept',
+        }, undefined);
+        expect(sanitized.HAPPY_MANAGED_REQUIRE_PROMPT_ACK).toBeUndefined();
+        expect(sanitized.SOMETHING_ELSE).toBe('kept');
+    });
+
+    it('reads the switch only from the exact daemon-set value', async () => {
+        const { consumeConfirmedInitialPromptDelivery } = await import('@/utils/initialPrompt');
+        expect(consumeConfirmedInitialPromptDelivery({ HAPPY_MANAGED_REQUIRE_PROMPT_ACK: '1' })).toBe(true);
+        expect(consumeConfirmedInitialPromptDelivery({ HAPPY_MANAGED_REQUIRE_PROMPT_ACK: '0' })).toBe(false);
+    });
+
+    it('removes an inherited switch from the final child environment', async () => {
+        const { applyConfirmedPromptDeliveryFlag } = await import('./sessionEnv');
+        // The daemon's own environment is inherited wholesale on the default
+        // spawn path, so deleting the key from the caller's extras is not
+        // enough — a stale value would survive the merge.
+        const inherited = { HAPPY_MANAGED_REQUIRE_PROMPT_ACK: '1', KEEP: 'yes' };
+        expect(applyConfirmedPromptDeliveryFlag(inherited, false))
+            .toEqual({ KEEP: 'yes' });
+        expect(applyConfirmedPromptDeliveryFlag({ KEEP: 'yes' }, true))
+            .toEqual({ KEEP: 'yes', HAPPY_MANAGED_REQUIRE_PROMPT_ACK: '1' });
+    });
+});

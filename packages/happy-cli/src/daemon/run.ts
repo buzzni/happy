@@ -56,6 +56,7 @@ import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import {
+  applyConfirmedPromptDeliveryFlag,
   buildManagedSessionSpawnEnvironment,
   buildResumedSessionSpawnEnvironment,
   captureSaycodeAgentEnvironment,
@@ -1172,6 +1173,16 @@ export async function startDaemon(): Promise<void> {
           managedAiCredentialEnvironment,
         );
 
+        // Set after the caller's environment has been merged and expanded, so
+        // an external RPC cannot switch it off by supplying the same key. The
+        // caller's `HAPPY_MANAGED_` keys were already stripped upstream; this
+        // is the daemon's own decision, taken from an internal spawn option
+        // rather than anything the caller sent.
+        //
+        // It only turns on stricter delivery for this launch. It is not an
+        // identity, and nothing may read it as one.
+        const requireInitialPromptAck = options.requireInitialPromptAck === true;
+
         // Initial prompt (scheduled automations 등): 불투명한 사용자 텍스트라
         // 위의 ${VAR} 확장·검증을 통과시키면 안 된다 — 프롬프트 속 "${FOO}"는
         // 참조가 아니라 내용이다. 그래서 확장/검증 이후에 주입한다. tmux 경로와
@@ -1283,10 +1294,13 @@ export async function startDaemon(): Promise<void> {
           const windowName = `happy-${Date.now()}-${agent}`;
           // Explicit agent auth and task callbacks are overlaid after inherited
           // credentials are filtered, so isolated tasks keep only what they need.
-          const tmuxEnv = buildManagedSessionSpawnEnvironment(
-            inheritedSpawnEnvironment,
-            extraEnv,
-            managedAiCredentialEnvironment,
+          const tmuxEnv = applyConfirmedPromptDeliveryFlag(
+            buildManagedSessionSpawnEnvironment(
+              inheritedSpawnEnvironment,
+              extraEnv,
+              managedAiCredentialEnvironment,
+            ),
+            requireInitialPromptAck,
           );
 
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
@@ -1376,10 +1390,13 @@ export async function startDaemon(): Promise<void> {
             // scrub: 상속된 lineage env(HAPPY_RECONNECT_*/HAPPY_FORK*)가 새
             // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
             // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
-            env: buildManagedSessionSpawnEnvironment(
-              inheritedSpawnEnvironment,
-              extraEnv,
-              managedAiCredentialEnvironment,
+            env: applyConfirmedPromptDeliveryFlag(
+              buildManagedSessionSpawnEnvironment(
+                inheritedSpawnEnvironment,
+                extraEnv,
+                managedAiCredentialEnvironment,
+              ),
+              requireInitialPromptAck,
             ),
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
@@ -2563,6 +2580,10 @@ export async function startDaemon(): Promise<void> {
           const result = await spawnSession({
             directory: request.directory,
             agent: request.agent as SpawnSessionOptions['agent'],
+            // Forced here from the verified dispatch context, not taken from
+            // `request`: the caller does not get to choose whether its own
+            // prompt delivery is confirmed.
+            requireInitialPromptAck: true,
             ...(request.environmentVariables ? { environmentVariables: request.environmentVariables } : {}),
             ...(request.initialPrompt ? { initialPrompt: request.initialPrompt } : {}),
             ...(request.initialPromptLocalId ? { initialPromptLocalId: request.initialPromptLocalId } : {}),

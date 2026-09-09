@@ -278,6 +278,13 @@ export interface SpawnSessionOptions {
     saycodePromptBlocks?: Record<string, boolean>;
     /** Exit cleanly after the spawned agent completes its first turn. */
     exitAfterFirstTurn?: boolean;
+    /**
+     * Internal only. Set by the daemon's managed dispatch wrapper, never read
+     * from RPC params — a caller that supplied it would be choosing its own
+     * delivery guarantees. Turns on confirmed delivery of the initial prompt
+     * and nothing else; it conveys no identity or permission.
+     */
+    requireInitialPromptAck?: boolean;
     /** Remove inherited daemon credentials before applying the explicit spawn environment. */
     filterInheritedCredentials?: boolean;
     /** Restrict an unattended automation session to repository reads. */
