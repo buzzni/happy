@@ -26,28 +26,77 @@ const MAX_ID_LENGTH = 200;
 
 export const MANAGED_PROTOCOL_VERSION = 1;
 
-export const MANAGED_OPS = ['spawn', 'stop', 'query', 'lease'] as const;
+export const MANAGED_OPS = ['spawn', 'stop', 'query', 'lease', 'status', 'runtime-lease'] as const;
 export type ManagedOp = (typeof MANAGED_OPS)[number];
 
-export type ManagedTokenClaims = {
+/**
+ * Operations that act on a run, and therefore name one.
+ *
+ * `status` is deliberately outside this set: the parent asks whether a runtime
+ * is ready *before* it creates an attempt, so a claim that required a run and
+ * an attempt could only be satisfied by inventing them.
+ */
+const RUN_SCOPED_OPS: readonly ManagedOp[] = ['spawn', 'stop', 'query', 'lease'];
+
+/** Operations bound to a provisioning operation rather than to a run. */
+const PROVISIONING_SCOPED_OPS: readonly ManagedOp[] = ['status', 'runtime-lease'];
+
+type ManagedTokenCommon = {
     v: number;
     kid: string;
     aud: string;
-    op: ManagedOp;
     workspaceId: string;
     projectId: string;
-    runId: string;
-    attemptId: string;
     requestKey: string;
     epoch: number;
     payloadDigest: string;
     iat: number;
     exp: number;
+};
+
+/** A token that acts on a run: it names the run and the attempt it belongs to. */
+export type ManagedRunTokenClaims = ManagedTokenCommon & {
+    op: 'spawn' | 'stop' | 'query' | 'lease';
+    runId: string;
+    attemptId: string;
     /** lease tokens only — monotonically increasing renewal counter. */
     renewalSeq?: number;
     leaseMs?: number;
     absoluteExpiry?: number;
 };
+
+/**
+ * A token that reads a runtime's status, and nothing else.
+ *
+ * It names the provisioning operation it belongs to instead of a run, because
+ * at the moment it is used there is no run to name. It carries no lease fields
+ * either: reading a status must never be able to hold a write deadline open.
+ */
+export type ManagedStatusTokenClaims = ManagedTokenCommon & {
+    op: 'status';
+    provisioningOperationId: string;
+};
+
+/**
+ * A lease granted to a runtime that has no run yet.
+ *
+ * The parent needs a runtime fenced before it will dispatch anything, and that
+ * happens before an attempt exists. This is a write — it carries the fields
+ * the fence path needs — and it is bound to the provisioning operation instead
+ * of to a run it could only have invented.
+ */
+export type ManagedRuntimeLeaseTokenClaims = ManagedTokenCommon & {
+    op: 'runtime-lease';
+    provisioningOperationId: string;
+    renewalSeq: number;
+    leaseMs: number;
+    absoluteExpiry: number;
+};
+
+export type ManagedTokenClaims =
+    | ManagedRunTokenClaims
+    | ManagedStatusTokenClaims
+    | ManagedRuntimeLeaseTokenClaims;
 
 export type ManagedTokenFailure =
     | 'malformed'
@@ -55,6 +104,7 @@ export type ManagedTokenFailure =
     | 'wrong-audience'
     | 'wrong-workspace'
     | 'wrong-op'
+    | 'wrong-operation'
     | 'expired'
     | 'clock-skew'
     | 'ttl-too-long'
@@ -134,18 +184,17 @@ function parseClaims(raw: unknown): ManagedTokenClaims | null {
 
     if (readInt(record.v, MANAGED_PROTOCOL_VERSION, MANAGED_PROTOCOL_VERSION) === null) return null;
     if (typeof record.op !== 'string' || !MANAGED_OPS.includes(record.op as ManagedOp)) return null;
+    const op = record.op as ManagedOp;
 
-    const ids = {
+    const common = {
         kid: readId(record.kid),
         aud: readId(record.aud),
         workspaceId: readId(record.workspaceId),
         projectId: readId(record.projectId),
-        runId: readId(record.runId),
-        attemptId: readId(record.attemptId),
         requestKey: readId(record.requestKey),
         payloadDigest: readId(record.payloadDigest),
     };
-    for (const value of Object.values(ids)) {
+    for (const value of Object.values(common)) {
         if (value === null) return null;
     }
 
@@ -154,20 +203,61 @@ function parseClaims(raw: unknown): ManagedTokenClaims | null {
     const exp = readInt(record.exp, 0, Number.MAX_SAFE_INTEGER);
     if (epoch === null || iat === null || exp === null) return null;
 
-    const claims: ManagedTokenClaims = {
+    const base: ManagedTokenCommon = {
         v: MANAGED_PROTOCOL_VERSION,
-        op: record.op as ManagedOp,
-        kid: ids.kid!,
-        aud: ids.aud!,
-        workspaceId: ids.workspaceId!,
-        projectId: ids.projectId!,
-        runId: ids.runId!,
-        attemptId: ids.attemptId!,
-        requestKey: ids.requestKey!,
-        payloadDigest: ids.payloadDigest!,
+        kid: common.kid!,
+        aud: common.aud!,
+        workspaceId: common.workspaceId!,
+        projectId: common.projectId!,
+        requestKey: common.requestKey!,
+        payloadDigest: common.payloadDigest!,
         epoch,
         iat,
         exp,
+    };
+
+    if (PROVISIONING_SCOPED_OPS.includes(op)) {
+        const provisioningOperationId = readId(record.provisioningOperationId);
+        if (provisioningOperationId === null) return null;
+        // Neither shape may name a run: one is a reading, and the other is a
+        // grant made before any run exists.
+        for (const forbidden of ['runId', 'attemptId']) {
+            if (record[forbidden] !== undefined) return null;
+        }
+        if (op === 'runtime-lease') {
+            // The same fields the run-scoped lease needs, for the same reasons:
+            // without a sequence the grant replays forever, and without an
+            // absolute expiry the server cannot bound one it already regrets.
+            const renewalSeq = readInt(record.renewalSeq, 0, Number.MAX_SAFE_INTEGER);
+            const leaseMs = readInt(record.leaseMs, 1, MAX_LEASE_MS);
+            const absoluteExpiry = readInt(record.absoluteExpiry, 0, Number.MAX_SAFE_INTEGER);
+            if (renewalSeq === null || leaseMs === null || absoluteExpiry === null) return null;
+            return { ...base, op, provisioningOperationId, renewalSeq, leaseMs, absoluteExpiry };
+        }
+        // Refused for being *present*, not for being wrong. A status token that
+        // can name a run is a status token that can be replayed as one, and a
+        // status token carrying lease fields is a read that can hold a write
+        // deadline open.
+        // A reading must never be able to hold a write deadline open.
+        for (const forbidden of ['renewalSeq', 'leaseMs', 'absoluteExpiry']) {
+            if (record[forbidden] !== undefined) return null;
+        }
+        return { ...base, op: 'status', provisioningOperationId };
+    }
+
+    const runId = readId(record.runId);
+    const attemptId = readId(record.attemptId);
+    if (runId === null || attemptId === null) return null;
+    // The same separation from the other side: a work token has no business
+    // naming a provisioning operation, and one that does is a token built from
+    // the wrong shape.
+    if (record.provisioningOperationId !== undefined) return null;
+
+    const claims: ManagedRunTokenClaims = {
+        ...base,
+        op: op as ManagedRunTokenClaims['op'],
+        runId,
+        attemptId,
     };
 
     if (claims.op === 'lease') {
@@ -194,6 +284,13 @@ export function verifyManagedDispatchToken(input: {
     op: ManagedOp;
     paramsDigest: string;
     currentEpoch: number;
+    /**
+     * The provisioning operation this runtime was created by, from its
+     * protected marker. Required for `status`, which has no epoch gate: the
+     * operation is then the only thing tying the token to this runtime's
+     * generation.
+     */
+    provisioningOperationId?: string;
     now: number;
 }): ManagedTokenResult {
     if (typeof input.token !== 'string' || input.token.length > MAX_TOKEN_BYTES) {
@@ -253,9 +350,33 @@ export function verifyManagedDispatchToken(input: {
     // Only a lease renewal may carry a higher epoch, because that is the one
     // path that performs the fence (and refuses to persist the new epoch unless
     // every prior-generation process is provably gone).
-    if (claims.epoch < input.currentEpoch) return { ok: false, reason: 'stale-epoch' };
-    if (input.op !== 'lease' && claims.epoch !== input.currentEpoch) {
-        return { ok: false, reason: 'epoch-mismatch' };
+    //
+    // Reading a status is outside both rules. A newly booted runtime holds
+    // epoch 0 until its first grant, and the parent asks for its status
+    // precisely to find that out — an epoch gate would make the question
+    // unanswerable exactly when it matters, since the parent would have to
+    // know the answer in order to ask. The token is bound to the provisioning
+    // operation instead, and nothing is mutated by asking, so an epoch that
+    // does not match is a fact for the runtime to report rather than grounds
+    // to refuse the question.
+    if (claims.op === 'status' || claims.op === 'runtime-lease') {
+        // Fail closed: a runtime that knows of no operation cannot confirm
+        // that a token belongs to the life it is currently living, and a token
+        // minted for a different provisioning operation names resources this
+        // runtime may already have replaced.
+        if (input.provisioningOperationId === undefined
+            || claims.provisioningOperationId !== input.provisioningOperationId) {
+            return { ok: false, reason: 'wrong-operation' };
+        }
+    }
+    if (input.op !== 'status') {
+        if (claims.epoch < input.currentEpoch) return { ok: false, reason: 'stale-epoch' };
+        // Both lease shapes may carry a higher epoch, because both are the path
+        // that performs the fence before persisting it.
+        if (input.op !== 'lease' && input.op !== 'runtime-lease'
+            && claims.epoch !== input.currentEpoch) {
+            return { ok: false, reason: 'epoch-mismatch' };
+        }
     }
     if (claims.payloadDigest !== input.paramsDigest) return { ok: false, reason: 'payload-mismatch' };
 

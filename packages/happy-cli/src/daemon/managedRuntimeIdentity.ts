@@ -80,6 +80,22 @@ export type ManagedRuntimeIdentity = {
     workspaceId: string;
     projectId: string;
     keyId: string;
+    /**
+     * The **Happy** machine this runtime is reachable at.
+     *
+     * A different axis from the provider's machine id, and the only one that
+     * is an address. Using a provider id in its place asks a daemon that does
+     * not exist, or publishes to somebody else's machine — so it is written by
+     * the provisioner and read from here, never derived.
+     */
+    happyMachineId: string;
+    /** The provisioning operation that created this runtime. */
+    provisioningOperationId: string;
+    /** The configuration this runtime was created for, as the parent computes it. */
+    configDigest: string;
+    /** The provider resources this runtime actually runs on. */
+    providerMachineId: string;
+    providerInstanceId: string;
     verifier: KeyObject;
     /** Directory the receipt store owns. Never inside the agent workspace. */
     stateDir: string;
@@ -171,7 +187,11 @@ export function assertProvisioningStat(
 }
 
 /**
- * Open, stat and read through a single descriptor.
+ * Open, stat and read a root-protected file through a single descriptor.
+ *
+ * Exported so every root-protected read on this runtime goes through the same
+ * rules — a second implementation is a second set of rules, and the one that
+ * gets forgotten is the one an attacker uses.
  *
  * A stat-then-read pair checks one file and reads another if the path is
  * swapped in between, and `O_NOFOLLOW` keeps a symlink from redirecting the
@@ -382,10 +402,20 @@ export function resolveManagedRuntimeIdentity(
     const workspaceId = readString(record.workspaceId);
     const projectId = readString(record.projectId);
     const keyId = readString(record.keyId);
+    // The axes a readiness answer is compared against. All of them come from
+    // the marker only root can write: a runtime that could describe itself
+    // could describe itself as somebody else's.
+    const happyMachineId = readString(record.happyMachineId);
+    const provisioningOperationId = readString(record.provisioningOperationId);
+    const configDigest = readString(record.configDigest);
+    const providerMachineId = readString(record.providerMachineId);
+    const providerInstanceId = readString(record.providerInstanceId);
     const stateDir = readString(record.stateDir, 4096);
     const workspaceDir = readString(record.workspaceDir, 4096);
     const verifierKeyB64 = readString(record.verifierPublicKey, 4096);
-    if (!runtimeId || !workspaceId || !projectId || !keyId || !stateDir || !workspaceDir || !verifierKeyB64) {
+    if (!runtimeId || !workspaceId || !projectId || !keyId || !stateDir || !workspaceDir || !verifierKeyB64
+        || !happyMachineId || !provisioningOperationId || !configDigest
+        || !providerMachineId || !providerInstanceId) {
         return { status: 'refused', reason: 'malformed', detail: 'missing required field' };
     }
 
@@ -445,6 +475,11 @@ export function resolveManagedRuntimeIdentity(
             workspaceId,
             projectId,
             keyId,
+            happyMachineId,
+            provisioningOperationId,
+            configDigest,
+            providerMachineId,
+            providerInstanceId,
             verifier,
             stateDir: resolve(stateDir),
             isolation: { backend: backend as ManagedIsolationBackend, agentUid, cgroupRoot },

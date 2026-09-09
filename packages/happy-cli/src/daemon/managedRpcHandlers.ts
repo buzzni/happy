@@ -11,11 +11,16 @@
  *     stop was accepted and what was seen locally, never that a session ended.
  */
 
+import { buildManagedRuntimeStatus } from '@/managed/managedRuntimeStatus';
+import type { ManagedFilesystemFacts } from '@/managed/managedRuntimeFacts';
+import type { ManagedRestoreState } from '@/managed/managedRestoreState';
 import {
     canonicalManagedPayloadDigest,
     verifyManagedDispatchToken,
     type ManagedOp,
-    type ManagedTokenClaims,
+    type ManagedRunTokenClaims,
+    type ManagedRuntimeLeaseTokenClaims,
+    type ManagedStatusTokenClaims,
 } from './managedDispatchToken';
 import {
     classifyManagedReceipt,
@@ -80,6 +85,19 @@ export type ManagedRuntime = {
     /** Monotonic clock. Wall-clock jumps must not extend a write lease. */
     monotonicNow: () => number;
     processGroupDeps?: ProcessGroupDeps;
+    /**
+     * What the runtime can say about itself, gathered from things it cannot
+     * talk itself into: the kernel's mount view, the root-protected completion
+     * record, and the isolation backend's own answer.
+     *
+     * Absent until the boot producer has run, and then a status read reports
+     * what it found rather than guessing.
+     */
+    runtimeFacts?: () => {
+        filesystem: ManagedFilesystemFacts;
+        restore: ManagedRestoreState;
+        isolation: { verified: boolean; backend: string };
+    };
     /**
      * The privileged launch backend. It is the only thing that can prove a
      * previous generation is gone, and the only thing that can stop a child
@@ -153,7 +171,38 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             : { epoch: lease.record.epoch, renewalSeq: lease.record.renewalSeq };
     };
 
-    const verify = (op: ManagedOp, params: unknown): ManagedTokenClaims => {
+    /**
+     * The two axes the verifier cannot check for us.
+     *
+     * Audience and workspace are bound inside the token; project and key id are
+     * this runtime's trusted identity, read from the protected marker. A token
+     * minted for a sibling project — or by a key this runtime does not know —
+     * verifies perfectly and still belongs to something else.
+     *
+     * Shared by both entry points on purpose. The provisioning-scoped path
+     * used to omit them, so the same signer could take a `runtime-lease` for
+     * one project and have it accepted by another runtime in the same
+     * workspace: two implementations of one check are two checks that can
+     * disagree, and this pair already had.
+     */
+    const assertRuntimeIdentityClaims = (claims: { projectId: string; kid: string }): void => {
+        if (claims.projectId !== runtime.identity.projectId) {
+            throw new ManagedRpcError('token-wrong-project');
+        }
+        if (claims.kid !== runtime.identity.keyId) {
+            throw new ManagedRpcError('token-unknown-key');
+        }
+    };
+
+    /**
+     * Verifies a token for an operation that acts on a run.
+     *
+     * The return type is the run-scoped half of the claim union, so a caller
+     * reading `runId` cannot be handed a status token — the separation the
+     * token format enforces on the wire is the same one the type enforces
+     * here, rather than something each call site has to remember.
+     */
+    const verify = (op: ManagedRunTokenClaims['op'], params: unknown): ManagedRunTokenClaims => {
         if (!params || typeof params !== 'object' || Array.isArray(params)) {
             throw new ManagedRpcError('malformed-request');
         }
@@ -169,18 +218,16 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             op,
             paramsDigest: canonicalManagedPayloadDigest(payload),
             currentEpoch: storedLease().epoch,
+            provisioningOperationId: runtime.identity.provisioningOperationId,
             now: runtime.now(),
         });
         if (!result.ok) throw new ManagedRpcError(`token-${result.reason}`);
-        // Audience and workspace are checked inside the verifier; project and
-        // key id are this runtime's trusted identity and are checked here so a
-        // token minted for a sibling project cannot act on this workspace.
-        if (result.claims.projectId !== runtime.identity.projectId) {
-            throw new ManagedRpcError('token-wrong-project');
+        if (result.claims.op === 'status' || result.claims.op === 'runtime-lease') {
+            // Unreachable while `op` is run-scoped — the verifier already
+            // refuses a mismatched op — and stated rather than cast away.
+            throw new ManagedRpcError('token-wrong-op');
         }
-        if (result.claims.kid !== runtime.identity.keyId) {
-            throw new ManagedRpcError('token-unknown-key');
-        }
+        assertRuntimeIdentityClaims(result.claims);
         return result.claims;
     };
 
@@ -515,56 +562,54 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
     };
 
 
-    return {
-        /** Tracked end to end so teardown waits for post-launch work too. */
-        spawn(params: unknown) {
-            return trackRpc(spawnRpc(params));
-        },
+    /**
+     * Verifies a token bound to the provisioning operation rather than to a
+     * run. Returns the provisioning half of the claim union, so a caller
+     * reading `provisioningOperationId` cannot be handed a work token.
+     */
+    const verifyProvisioning = (
+        op: 'status' | 'runtime-lease',
+        params: unknown,
+    ): ManagedStatusTokenClaims | ManagedRuntimeLeaseTokenClaims => {
+        if (!params || typeof params !== 'object' || Array.isArray(params)) {
+            throw new ManagedRpcError('malformed-request');
+        }
+        const record = params as Record<string, unknown>;
+        const token = record.token;
+        if (typeof token !== 'string') throw new ManagedRpcError('malformed-request');
+        const result = verifyManagedDispatchToken({
+            token,
+            verifier: runtime.identity.verifier,
+            runtimeId: runtime.identity.runtimeId,
+            workspaceId: runtime.identity.workspaceId,
+            op,
+            paramsDigest: canonicalManagedPayloadDigest(record.params ?? {}),
+            currentEpoch: storedLease().epoch,
+            provisioningOperationId: runtime.identity.provisioningOperationId,
+            now: runtime.now(),
+        });
+        if (!result.ok) throw new ManagedRpcError(`token-${result.reason}`);
+        if (result.claims.op !== op) throw new ManagedRpcError('token-wrong-op');
+        assertRuntimeIdentityClaims(result.claims);
+        return result.claims;
+    };
 
-        /**
-         * Refuses further RPC entries. Store writes stay open so that work
-         * already inside can finish; teardown revokes those separately once
-         * `drainLeaseWork` reports everything settled.
-         */
-        closeEntries(): void {
-            entriesClosed = true;
-        },
-
-        stop(params: unknown) {
-            return trackRpc(stopRpc(params));
-        },
-
-        /** Durable receipt lookup — the only way to resolve a lost ACK. */
-        receipt(params: unknown) {
-            const claims = verify('query', params);
-            // Only the run and attempt the token was signed for. A listing of
-            // everything would let one signed query enumerate the workspace.
-            const key = managedOperationKey({ runId: claims.runId, attemptId: claims.attemptId });
-            const found = runtime.store.read(key);
-            if (found.kind === 'unknown') {
-                return { receipts: [], unknown: [{ file: 'requested', detail: found.detail }] };
-            }
-            return {
-                receipts: found.kind === 'ok' ? [receiptView(found.receipt, runtime)] : [],
-                unknown: [],
-            };
-        },
-
-        /**
-         * Renews the write lease and, when the server raises the epoch, performs
-         * the local part of fencing.
-         *
-         * A higher epoch is only persisted when nothing of the previous
-         * generation is visible here. That is a necessary condition, not a
-         * sufficient one: the server must still hold provider-level proof
-         * (T09) before it treats the new generation as writable.
-         */
-        async lease(params: unknown) {
-            const claims = verify('lease', params);
-            if (claims.renewalSeq === undefined || claims.leaseMs === undefined
-                || claims.absoluteExpiry === undefined) {
-                throw new ManagedRpcError('malformed-request');
-            }
+    /**
+     * The one place a write lease is granted.
+     *
+     * Both lease operations reach it: the run-scoped `lease`, and the
+     * `runtime-lease` a runtime is given before it has any run. They differ
+     * only in what their claim is bound to — the serialization, the sequence
+     * check and the fence that a promotion has to pass are the same code,
+     * because two implementations of a fence are two fences that can disagree.
+     */
+    const applyLeaseClaims = (claims: {
+        epoch: number;
+        renewalSeq: number;
+        leaseMs: number;
+        absoluteExpiry: number;
+        exp: number;
+    }) => {
             assertEntryOpen();
             // Renewal and epoch transition are serialized: two interleaved
             // renewals could otherwise commit out of order and walk the
@@ -657,6 +702,12 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                             grantedMs,
                             fenced: true,
                             localEvidence: evidence,
+                            // The ceiling this grant was actually clamped by.
+                            // Without it the parent knows only what it asked
+                            // for, and publishing a deadline from the request
+                            // rather than from the grant is how a lease outlives
+                            // what this runtime agreed to.
+                            absoluteExpiry: claims.absoluteExpiry,
                         };
                     } finally {
                         transitioning = false;
@@ -677,7 +728,121 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                     grantedMs,
                     fenced: false,
                     localEvidence: [] as ProcessGroupEvidence[],
+                    // Same reason as the promotion path: the parent must read
+                    // the ceiling that was applied, not the one it sent.
+                    absoluteExpiry: claims.absoluteExpiry,
                 };
+            });
+    };
+
+    return {
+        /**
+         * Reports what this runtime is, and what it currently holds.
+         *
+         * A reading. It renews nothing and advances nothing — the parent polls
+         * it, including while a runtime is expired, and a reading that renewed
+         * would make asking the way to stay alive.
+         */
+        status: async (params: unknown) => {
+            verifyProvisioning('status', params);
+            const facts = runtime.runtimeFacts?.() ?? {
+                // Before the boot producer has run there is nothing to report
+                // but the absence of it, and absence is not readiness.
+                filesystem: { ok: false as const, reason: 'root-not-mounted' as const },
+                restore: { status: 'pending' as const, checkpointId: null, manifestDigest: null },
+                isolation: { verified: false, backend: runtime.identity.isolation.backend },
+            };
+            const stored = storedLease();
+            return buildManagedRuntimeStatus({
+                identity: runtime.identity,
+                lease: {
+                    epoch: stored.epoch,
+                    renewalSeq: stored.renewalSeq,
+                    // Read, never extended.
+                    remainingMs: leaseUntilMonotonic === null
+                        ? 0
+                        : leaseUntilMonotonic - runtime.monotonicNow(),
+                },
+                filesystem: facts.filesystem,
+                restore: facts.restore,
+                isolation: facts.isolation,
+            });
+        },
+
+        /**
+         * Grants this runtime a lease before it has any run.
+         *
+         * The same serialized fencing path the run-scoped lease takes — a
+         * promotion still has to prove the previous generation is gone. Only
+         * what the claim is bound to differs.
+         */
+        'runtime-lease': async (params: unknown) => {
+            const claims = verifyProvisioning('runtime-lease', params);
+            if (claims.op !== 'runtime-lease') throw new ManagedRpcError('token-wrong-op');
+            return applyLeaseClaims({
+                epoch: claims.epoch,
+                renewalSeq: claims.renewalSeq,
+                leaseMs: claims.leaseMs,
+                absoluteExpiry: claims.absoluteExpiry,
+                exp: claims.exp,
+            });
+        },
+
+        /** Tracked end to end so teardown waits for post-launch work too. */
+        spawn(params: unknown) {
+            return trackRpc(spawnRpc(params));
+        },
+
+        /**
+         * Refuses further RPC entries. Store writes stay open so that work
+         * already inside can finish; teardown revokes those separately once
+         * `drainLeaseWork` reports everything settled.
+         */
+        closeEntries(): void {
+            entriesClosed = true;
+        },
+
+        stop(params: unknown) {
+            return trackRpc(stopRpc(params));
+        },
+
+        /** Durable receipt lookup — the only way to resolve a lost ACK. */
+        receipt(params: unknown) {
+            const claims = verify('query', params);
+            // Only the run and attempt the token was signed for. A listing of
+            // everything would let one signed query enumerate the workspace.
+            const key = managedOperationKey({ runId: claims.runId, attemptId: claims.attemptId });
+            const found = runtime.store.read(key);
+            if (found.kind === 'unknown') {
+                return { receipts: [], unknown: [{ file: 'requested', detail: found.detail }] };
+            }
+            return {
+                receipts: found.kind === 'ok' ? [receiptView(found.receipt, runtime)] : [],
+                unknown: [],
+            };
+        },
+
+        /**
+         * Renews the write lease and, when the server raises the epoch, performs
+         * the local part of fencing.
+         *
+         * A higher epoch is only persisted when nothing of the previous
+         * generation is visible here. That is a necessary condition, not a
+         * sufficient one: the server must still hold provider-level proof
+         * (T09) before it treats the new generation as writable.
+         */
+        async lease(params: unknown) {
+            const claims = verify('lease', params);
+            if (claims.renewalSeq === undefined || claims.leaseMs === undefined
+                || claims.absoluteExpiry === undefined) {
+                throw new ManagedRpcError('malformed-request');
+            }
+            return applyLeaseClaims({
+                epoch: claims.epoch,
+                renewalSeq: claims.renewalSeq,
+                leaseMs: claims.leaseMs,
+                absoluteExpiry: claims.absoluteExpiry,
+                exp: claims.exp,
             });
         },
 
@@ -911,6 +1076,8 @@ export function registerManagedRpcHandlers(
     registrar.registerHandler('managed:stop', (params) => normalizeManagedRefusal(() => handlers.stop(params)));
     registrar.registerHandler('managed:receipt', (params) => normalizeManagedRefusal(() => handlers.receipt(params)));
     registrar.registerHandler('managed:lease', (params) => normalizeManagedRefusal(() => handlers.lease(params)));
+    registrar.registerHandler('managed:status', (params) => normalizeManagedRefusal(() => handlers.status(params)));
+    registrar.registerHandler('managed:runtime-lease', (params) => normalizeManagedRefusal(() => handlers['runtime-lease'](params)));
 }
 
 /**
@@ -925,6 +1092,8 @@ export const MANAGED_ALLOWED_RPCS: readonly string[] = [
     'managed:stop',
     'managed:receipt',
     'managed:lease',
+    'managed:status',
+    'managed:runtime-lease',
 ];
 
 export class ManagedCapabilityError extends Error {

@@ -42,6 +42,11 @@ function writeProvisioning(overrides: Record<string, unknown> = {}, path = provi
         workspaceId: 'ws-1',
         projectId: 'proj-1',
         keyId: 'kid-1',
+        happyMachineId: 'machine-1',
+        provisioningOperationId: 'op-1',
+        configDigest: 'digest-1',
+        providerMachineId: 'fly-machine-1',
+        providerInstanceId: 'fly-instance-1',
         stateDir,
         workspaceDir,
         verifierPublicKey,
@@ -501,5 +506,54 @@ describe('the Linux absence walk needs a uid to stand on', () => {
             platform: 'linux',
             getuid: () => -1,
         }))).toMatchObject({ status: 'refused' });
+    });
+});
+
+/**
+ * The axes a readiness answer is compared against.
+ *
+ * The parent checks a runtime's reported identity field by field before it
+ * will dispatch to it — the Happy address it will actually talk to, the
+ * provisioning operation that created it, the configuration it was created
+ * for, and the provider resources it runs on. Every one of those has to come
+ * from the marker only root can write.
+ *
+ * Not from caller parameters, and not from a file in the project: those are
+ * exactly what an agent running inside the runtime can edit, and a runtime
+ * that can describe itself can describe itself as somebody else's.
+ */
+describe('resolveManagedRuntimeIdentity — the identity a readiness answer is built from', () => {
+    it('carries the address and provenance the parent compares against', () => {
+        writeProvisioning();
+        const resolution = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
+        expect(resolution).toMatchObject({ status: 'active' });
+        if (resolution.status !== 'active') return;
+        expect(resolution.identity.happyMachineId).toBe('machine-1');
+        expect(resolution.identity.provisioningOperationId).toBe('op-1');
+        expect(resolution.identity.configDigest).toBe('digest-1');
+        expect(resolution.identity.providerMachineId).toBe('fly-machine-1');
+        expect(resolution.identity.providerInstanceId).toBe('fly-instance-1');
+    });
+
+    it.each([
+        'happyMachineId',
+        'provisioningOperationId',
+        'configDigest',
+        'providerMachineId',
+        'providerInstanceId',
+    ])('refuses — never activates — when %s is missing', (field) => {
+        // Absent means the provisioner did not write it, which is a runtime
+        // that cannot be told apart from another. There is nothing safe to
+        // assume in its place.
+        writeProvisioning({ [field]: undefined });
+        expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()).status).toBe('refused');
+    });
+
+    it('refuses a Happy address that is only a provider id', () => {
+        // The two are different axes. Using a provider id as a Happy address
+        // asks a daemon that does not exist, or — worse — publishes to
+        // somebody else's machine.
+        writeProvisioning({ happyMachineId: '   ' });
+        expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()).status).toBe('refused');
     });
 });

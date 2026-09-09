@@ -39,6 +39,11 @@ const identity: ManagedRuntimeIdentity = {
     workspaceId: 'ws-1',
     projectId: 'proj-1',
     keyId: 'kid-1',
+    happyMachineId: 'machine-1',
+    provisioningOperationId: 'op-1',
+    configDigest: 'digest-1',
+    providerMachineId: 'provider-machine-1',
+    providerInstanceId: 'provider-instance-1',
     verifier,
     stateDir: '/unused',
     isolation: { backend: 'privileged-launch-supervisor', agentUid: 901, cgroupRoot: '/c' },
@@ -351,7 +356,10 @@ describe('managed runtime RPC allowlist', () => {
 
     it('allows only the managed dispatch methods', () => {
         expect([...MANAGED_ALLOWED_RPCS].sort())
-            .toEqual(['managed:lease', 'managed:receipt', 'managed:spawn', 'managed:stop']);
+            .toEqual([
+                'managed:lease', 'managed:receipt', 'managed:runtime-lease',
+                'managed:spawn', 'managed:status', 'managed:stop',
+            ]);
         for (const bypass of ['spawn-happy-session', 'stop-session', 'bash', 'ai-credential:apply']) {
             expect(MANAGED_ALLOWED_RPCS).not.toContain(bypass);
         }
@@ -1105,5 +1113,161 @@ describe('epoch promotion rests on the backend proof, not on local pid guesses',
         expect(result.localEvidence.length).toBeGreaterThan(0);
         expect(killed.filter(([, signal]) => signal !== 0)).toEqual([]);
         expect(ctx.stops.length).toBeGreaterThan(0);
+    });
+});
+
+/**
+ * Reading a runtime's status, and granting it a lease before it has a run.
+ *
+ * The parent asks both before it will dispatch anything, and both happen
+ * before an attempt exists — so neither can name one. Reading changes nothing;
+ * granting goes through the same fencing path the run-scoped lease uses.
+ */
+describe('managed status and runtime lease', () => {
+    /** Provisioning-scoped tokens carry no run or attempt at all. */
+    function provisioningToken(over: Record<string, unknown>): string {
+        const body = {
+            v: 1, kid: 'kid-1', aud: 'runtime-1',
+            workspaceId: 'ws-1', projectId: 'proj-1',
+            requestKey: 'client-request-key',
+            payloadDigest: canonicalManagedPayloadDigest({}),
+            iat: NOW, exp: NOW + 60_000,
+            ...over,
+        };
+        const encoded = Buffer.from(JSON.stringify(body), 'utf8').toString('base64url');
+        return `${encoded}.${sign(null, Buffer.from(encoded, 'utf8'), keys.privateKey).toString('base64url')}`;
+    }
+
+    function statusToken(over: Record<string, unknown> = {}) {
+        return provisioningToken({
+            op: 'status', provisioningOperationId: 'op-1', epoch: 0, ...over,
+        });
+    }
+
+    it('answers with the runtime facts, without touching the lease', async () => {
+        const before = runtime.store.readLease();
+        const response = await handlers.status({ token: statusToken(), params: {} });
+
+        expect(response).toMatchObject({
+            version: 1,
+            identity: expect.objectContaining({
+                runtimeId: 'runtime-1',
+                happyMachineId: 'machine-1',
+                provisioningOperationId: 'op-1',
+            }),
+        });
+        // Asking is not a renewal: the stored lease is untouched.
+        expect(runtime.store.readLease()).toEqual(before);
+    });
+
+    it('answers for a runtime that has never held an epoch', async () => {
+        const response = await handlers.status({ token: statusToken(), params: {} });
+        expect(response.epoch).toBe(0);
+        expect(response.leaseRemainingMs).toBe(0);
+    });
+
+    it('refuses a status token minted for another provisioning operation', async () => {
+        // Refused, and named: the operation is what ties a status token to
+        // this runtime's generation now that it carries no epoch gate.
+        await expect(handlers.status({
+            token: statusToken({ provisioningOperationId: 'op-other' }),
+            params: {},
+        })).rejects.toThrow(/wrong-operation/);
+    });
+
+    it.each([
+        ['another project', { projectId: 'proj-other' }, /wrong-project/],
+        ['a key this runtime does not know', { kid: 'kid-other' }, /unknown-key/],
+    ])('refuses a status token minted for %s', async (_name, over, expected) => {
+        // The verifier binds audience and workspace, not project or key id.
+        // Those are this runtime's trusted identity, and the run-scoped path
+        // has always checked them — the provisioning-scoped path did not, so
+        // the same signer could have a token for a sibling project accepted
+        // here.
+        await expect(handlers.status({ token: statusToken(over), params: {} }))
+            .rejects.toThrow(expected);
+    });
+
+    it.each([
+        ['another project', { projectId: 'proj-other' }, /wrong-project/],
+        ['a key this runtime does not know', { kid: 'kid-other' }, /unknown-key/],
+    ])('refuses a runtime-lease token minted for %s, changing nothing', async (
+        _name, over, expected,
+    ) => {
+        // A lease is a write. Refused before anything is written, so the
+        // stored lease is exactly what it was.
+        const before = runtime.store.readLease();
+        await expect(handlers['runtime-lease']({
+            token: provisioningToken({
+                op: 'runtime-lease',
+                provisioningOperationId: 'op-1',
+                epoch: 1,
+                renewalSeq: 1,
+                leaseMs: 60_000,
+                absoluteExpiry: NOW + 3_600_000,
+                ...over,
+            }),
+            params: {},
+        })).rejects.toThrow(expected);
+        expect(runtime.store.readLease()).toEqual(before);
+    });
+
+    it('returns the absolute expiry it actually applied', async () => {
+        /*
+         * The parent bounds the deadline it publishes by this value. Without
+         * it the parent knows only what it asked for, and a deadline taken
+         * from the request rather than from the grant is a lease that outlives
+         * what this runtime agreed to.
+         *
+         * The cross-repo half of this check — that the parent's reader accepts
+         * exactly this reply — lives outside this repository. A test here that
+         * imported the parent's parser would break every standalone clone.
+         */
+        await grantLease();
+        const reply = await handlers['runtime-lease']({
+            token: provisioningToken({
+                op: 'runtime-lease',
+                provisioningOperationId: 'op-1',
+                // Same epoch the stored lease already holds: no promotion, so
+                // the ordinary grant path runs without a fencing backend.
+                epoch: 0,
+                renewalSeq: 9,
+                leaseMs: 60_000,
+                absoluteExpiry: NOW + 120_000,
+            }),
+            params: {},
+        });
+
+        expect(reply).toMatchObject({
+            ok: true,
+            epoch: 0,
+            renewalSeq: 9,
+            fenced: false,
+            absoluteExpiry: NOW + 120_000,
+        });
+        // Every field the wire contract names is present — a missing one is
+        // read as a malformed reply by whoever consumes it.
+        for (const field of [
+            'ok', 'epoch', 'renewalSeq', 'grantedMs', 'fenced', 'localEvidence', 'absoluteExpiry',
+        ]) {
+            expect(reply).toHaveProperty(field);
+        }
+    });
+
+    it('grants a lease to a runtime with no run, and fences when it promotes', async () => {
+        await expect(handlers['runtime-lease']({
+            token: provisioningToken({
+                op: 'runtime-lease',
+                provisioningOperationId: 'op-1',
+                epoch: 1,
+                renewalSeq: 1,
+                leaseMs: 60_000,
+                absoluteExpiry: NOW + 3_600_000,
+            }),
+            params: {},
+        // No fencing backend is wired, so a promotion cannot be proven and the
+        // grant is refused rather than taken on trust — the same refusal the
+        // run-scoped lease gives, because it is the same code.
+        })).rejects.toThrow(/fence-proof-unavailable/);
     });
 });
