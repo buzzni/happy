@@ -9,7 +9,7 @@
  * This drives the real ordering rather than the helper, by calling the same
  * preparation `runCodex` calls, in the same sequence, against the envelope.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { afterEach, describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ExecSyncOptions } from 'node:child_process';
 
 /**
@@ -132,6 +132,25 @@ function envelope(): ManagedSpawnEnvelope {
     };
 }
 
+/**
+ * The plan a managed run carries, built by **the launcher's own planner**.
+ *
+ * Written by hand it drifts: the verifier reconstructs the argument list from
+ * its own rules and compares it exactly, so a hand-written fixture stops being
+ * a plan the moment those rules change — and the failure then looks like a
+ * broken control rather than a stale fixture.
+ */
+async function plannedProviderArguments(): Promise<void> {
+    const { buildCodexToolPolicy } = await import('@/launcher/codexToolPolicy');
+    const policy = buildCodexToolPolicy({
+        codexHome: '/workspace/.codex',
+        brokerUrl: 'http://127.0.0.1:8931/mcp',
+        brokerToken: 'broker-token-for-this-run',
+        env: {},
+    });
+    process.env.SAYCODE_PROVIDER_CODEX_ARGS = JSON.stringify(policy.args);
+}
+
 describe('a managed Codex start', () => {
     let env: NodeJS.ProcessEnv;
 
@@ -246,19 +265,36 @@ describe('runCodex itself, for a managed child', () => {
         };
     }
 
-    beforeEach(() => {
+    beforeEach(async () => {
         for (const key of Object.keys(process.env)) {
             if (key.startsWith('HAPPY_RECONNECT_') || key.startsWith('HAPPY_FORK')
                 || key.startsWith('HAPPY_CREATED_BY') || key.startsWith('HAPPY_INITIAL_')) {
                 delete process.env[key];
             }
         }
+        /*
+         * Every managed control below is a run the launcher started, and such a
+         * run now carries a verified provider plan or refuses. Set here, once,
+         * rather than in the controls that happen to notice: setting it inside
+         * one test left the others passing only because that test had run
+         * first, so the suite's result depended on ordering — green locally,
+         * red in CI, and red about the wrong thing when it failed.
+         *
+         * The one control that is *about* the missing plan deletes it itself.
+         */
+        await plannedProviderArguments();
         promptSeenAt.length = 0;
         mockAwaitMessageAck.mockReset();
         mockSendSessionEvent.mockReset();
         mockConnect.mockClear();
         mockClientConstructed.mockClear();
         mockReadThread.mockClear();
+    });
+
+    afterEach(() => {
+        // The plan is this run's, not the process's: leaving it set would let a
+        // later test pass on a neighbour's environment.
+        delete process.env.SAYCODE_PROVIDER_CODEX_ARGS;
     });
 
     it('has applied the envelope before it reads the prompt', async () => {
@@ -282,6 +318,37 @@ describe('runCodex itself, for a managed child', () => {
         expect(promptSeenAt[0].localId).toBe('d'.repeat(32));
     }, 60_000);
 
+    it('refuses a managed run that carries no verified provider plan', async () => {
+        /*
+         * The launcher pins this run's tool boundary in the provider plan. A
+         * managed run without one must stop rather than fall back to the
+         * ordinary arguments — falling back is how a managed child ends up
+         * running with no broker registration and no credential env var.
+         */
+        const { runCodex } = await import('@/codex/runCodex');
+        const { ApiClient } = await import('@/api/api');
+        const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue('/workspace/project');
+        const stub = sessionClientStub();
+        const managedSpy = vi.spyOn(ApiClient, 'managed').mockReturnValue({
+            getOrCreateMachine: vi.fn(async () => { throw new Error('must not register'); }),
+            getOrCreateSession: vi.fn(async () => { throw new Error('must not create'); }),
+            sessionSyncClient: vi.fn(() => stub),
+            deactivateSession: vi.fn(async () => {}),
+        } as never);
+        mockAwaitMessageAck.mockResolvedValue({ ok: true });
+        delete process.env.SAYCODE_PROVIDER_CODEX_ARGS;
+
+        try {
+            await expect(runCodex({
+                principal: { kind: 'managed', startup: { envelope: envelope(), attachment } },
+            })).rejects.toThrow(/no verified provider plan/);
+            expect(mockClientConstructed).not.toHaveBeenCalled();
+        } finally {
+            managedSpy.mockRestore();
+            cwdSpy.mockRestore();
+        }
+    }, 60_000);
+
     it('does reach the app-server once the acknowledgement succeeds', async () => {
         // The control for the test below: "connect was not called" only means
         // something if a run that is acknowledged does call it.
@@ -296,6 +363,9 @@ describe('runCodex itself, for a managed child', () => {
             deactivateSession: vi.fn(async () => {}),
         } as never);
         mockAwaitMessageAck.mockResolvedValue({ ok: true });
+        // A managed run now carries the launcher's verified provider plan, and
+        // refuses to start without one. Without it this control would fail for
+        // the wrong reason — before the app-server, not because of the ack.
 
         try {
             await runCodex({
