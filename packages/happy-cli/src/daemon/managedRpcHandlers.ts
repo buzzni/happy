@@ -29,6 +29,7 @@ import {
     type ProcessGroupEvidence,
 } from './managedProcessGroup';
 import type { ManagedRuntimeIdentity } from './managedRuntimeIdentity';
+import { logger } from '@/ui/logger';
 
 export const MANAGED_RPC_METHODS = [
     'managed:spawn', 'managed:stop', 'managed:receipt', 'managed:lease',
@@ -814,14 +815,102 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
 
 export type ManagedRpcHandlers = ReturnType<typeof createManagedRpcHandlers>;
 
+/**
+ * Refusal codes a caller may branch on. An allowlist, not a passthrough: an
+ * unrecognised code reaches the wire without a `code` field so a typo here can
+ * never be mistaken for a contract the server can act on.
+ *
+ * `token-*` mirrors `ManagedTokenFailure`, which `verify` prefixes.
+ */
+const WIRE_REFUSAL_CODES: ReadonlySet<string> = new Set([
+    'epoch-transition-in-progress',
+    'fence-incomplete',
+    'fence-proof-unavailable',
+    'lease-expired',
+    'lease-state-unreadable',
+    'malformed-request',
+    'operation-payload-conflict',
+    'reconciliation-required',
+    'shutting-down',
+    'spawn-rejected',
+    'stale-epoch',
+    'stale-renewal',
+    'stopped-before-dispatch',
+    'token-malformed',
+    'token-bad-signature',
+    'token-wrong-audience',
+    'token-wrong-workspace',
+    'token-wrong-op',
+    'token-expired',
+    'token-clock-skew',
+    'token-ttl-too-long',
+    'token-stale-epoch',
+    'token-epoch-mismatch',
+    'token-payload-mismatch',
+    // Thrown directly at :178/:181, not via the `token-${reason}` prefix.
+    'token-wrong-project',
+    'token-unknown-key',
+]);
+
+/**
+ * The single classifier put on the wire for every managed refusal.
+ *
+ * `ManagedRpcError.message` is `code: detail`, and the detail — however short —
+ * is not part of the contract. Shipping the message verbatim would make every
+ * future detail string a wire field nobody reviewed.
+ */
+const MANAGED_REFUSAL_ERROR = 'managed dispatch refused';
+
+/**
+ * Code reported when the managed boundary cannot classify a failure. It is
+ * deliberately not one of `WIRE_REFUSAL_CODES`: a caller must be able to tell
+ * "the daemon refused for reason X" from "something failed and nobody knows
+ * what", and must never read the second as the first.
+ */
+const MANAGED_UNKNOWN_CODE = 'managed-unknown-failure';
+
+/**
+ * Normalises **every** failure that escapes a managed handler.
+ *
+ * `RpcHandlerManager` turns a thrown error into `{ error: message }` on the
+ * wire *and* logs `{ error }`. Rethrowing here would therefore publish whatever
+ * an unexpected exception carries — a provider URL, a token, prompt text — and
+ * break the safe-error promise this boundary exists to make. So nothing is
+ * rethrown: managed refusals become their code, anything else becomes the
+ * unknown classifier.
+ *
+ * Teaching the generic class about managed types would couple every BYOS caller
+ * to the daemon's managed surface, so the conversion lives here instead and
+ * emits the same `{ error, code }` shape the manager's own managed allowlist
+ * rejection already uses. **BYOS handlers keep the existing fail path.**
+ */
+async function normalizeManagedRefusal<T>(
+    run: () => T | Promise<T>,
+): Promise<T | { error: string; code: string }> {
+    try {
+        // `await` covers both shapes: `receipt` answers synchronously while the
+        // others are async, and a synchronous throw must be normalised too.
+        return await run();
+    } catch (error: unknown) {
+        if (error instanceof ManagedRpcError && WIRE_REFUSAL_CODES.has(error.code)) {
+            return { error: MANAGED_REFUSAL_ERROR, code: error.code };
+        }
+        // No `error.message`, no stack, no cause — not on the wire and not in
+        // the log. A fixed line keeps the failure visible without carrying its
+        // payload; the daemon's own diagnostics keep the detail locally.
+        logger.debug('[managed] handler failed with an unclassified error');
+        return { error: MANAGED_REFUSAL_ERROR, code: MANAGED_UNKNOWN_CODE };
+    }
+}
+
 export function registerManagedRpcHandlers(
     registrar: RpcRegistrar,
     handlers: ManagedRpcHandlers,
 ): void {
-    registrar.registerHandler('managed:spawn', (params) => handlers.spawn(params));
-    registrar.registerHandler('managed:stop', (params) => handlers.stop(params));
-    registrar.registerHandler('managed:receipt', (params) => handlers.receipt(params));
-    registrar.registerHandler('managed:lease', (params) => handlers.lease(params));
+    registrar.registerHandler('managed:spawn', (params) => normalizeManagedRefusal(() => handlers.spawn(params)));
+    registrar.registerHandler('managed:stop', (params) => normalizeManagedRefusal(() => handlers.stop(params)));
+    registrar.registerHandler('managed:receipt', (params) => normalizeManagedRefusal(() => handlers.receipt(params)));
+    registrar.registerHandler('managed:lease', (params) => normalizeManagedRefusal(() => handlers.lease(params)));
 }
 
 /**
