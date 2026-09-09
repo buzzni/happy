@@ -4,7 +4,6 @@ import { spawn } from 'node:child_process';
 import {
     probeProcessGroup,
     signalProcessGroup,
-    summarizeFencingEvidence,
     type ProcessGroupDeps,
 } from './managedProcessGroup';
 
@@ -57,26 +56,6 @@ describe('probeProcessGroup', () => {
     it('maps EPERM to alive-foreign', () => {
         expect(probeProcessGroup(10, deps({ kill: () => { throw errno('EPERM'); } })))
             .toEqual({ kind: 'alive-foreign' });
-    });
-});
-
-describe('summarizeFencingEvidence', () => {
-    it('never calls local quiet sufficient on its own', () => {
-        const summary = summarizeFencingEvidence([{ kind: 'no-local-trace' }]);
-        expect(summary.allClear).toBe(true);
-        // A setsid child leaves the group and is invisible to every local check.
-        expect(summary.requiresExternalProof).toBe(true);
-    });
-
-    it('reports every non-clear observation', () => {
-        const summary = summarizeFencingEvidence([
-            { kind: 'alive' },
-            { kind: 'alive-foreign' },
-            { kind: 'indeterminate', detail: 'EIO' },
-            { kind: 'no-local-trace' },
-        ]);
-        expect(summary.allClear).toBe(false);
-        expect(summary.reasons).toEqual(['group-alive', 'group-alive-foreign', 'indeterminate:EIO']);
     });
 });
 

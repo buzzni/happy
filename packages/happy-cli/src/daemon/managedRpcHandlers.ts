@@ -25,7 +25,6 @@ import {
 } from './managedReceiptStore';
 import {
     probeProcessGroup,
-    summarizeFencingEvidence,
     type ProcessGroupDeps,
     type ProcessGroupEvidence,
 } from './managedProcessGroup';
@@ -607,18 +606,28 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                             && receipt.state !== 'tombstone'
                             && !(receipt.state === 'failed' && receipt.failureReason === 'not-started')
                         ));
+                        // Hand every prior-generation attempt to the backend,
+                        // then let the backend say whether the generation is
+                        // gone. The local probe is recorded alongside it, but
+                        // it does not decide anything:
+                        //
+                        // a receipt keeps a numeric pgid, and the kernel may
+                        // have since given that number to an unrelated process.
+                        // Reading `alive` (or `EPERM`, which is the normal
+                        // answer once agents run under their own uid) off such
+                        // a number and refusing the promotion blocks the
+                        // runtime forever on a coincidence, even when the
+                        // authoritative backend has proven the generation
+                        // stopped. Ownership is what makes an observation
+                        // actionable, and this process has none here.
                         const evidence: ProcessGroupEvidence[] = [];
                         for (const receipt of live) evidence.push((await stopAttempt(receipt)).evidence);
-                        const summary = summarizeFencingEvidence(evidence);
 
                         const proof = await runtime.fencingBackend.proveGenerationStopped({
                             belowEpoch: claims.epoch,
                         });
                         if (!proof.proven) {
                             throw new ManagedRpcError('fence-proof-unavailable', proof.detail);
-                        }
-                        if (!summary.allClear) {
-                            throw new ManagedRpcError('fence-incomplete', summary.reasons.join(','));
                         }
 
                         // Re-validated after the awaits above: another renewal

@@ -989,3 +989,121 @@ describe('maintenance reports what it could not read', () => {
         expect(stops.length - first).toBe(1);
     });
 });
+
+describe('epoch promotion rests on the backend proof, not on local pid guesses', () => {
+    /**
+     * A stale receipt keeps a numeric pgid. The kernel may have handed that
+     * number to something unrelated, so what the local probe sees about it says
+     * nothing about the generation being fenced.
+     */
+    async function staleReceiptFrom(observation: 'alive' | 'eperm', proven: boolean) {
+        const stops: Array<Record<string, unknown>> = [];
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven, detail: proven ? 'provider stopped' : 'unproven' }),
+            requestStop: async (input) => { stops.push(input); return { requested: true, detail: 'ok' }; },
+        };
+        await grantLease({ renewalSeq: 1, epoch: 0 });
+        runtime.store.claim({
+            requestKey: OP_KEY, runId: RUN, attemptId: ATTEMPT, epoch: 0, now: wallClock,
+        });
+        runtime.store.update(OP_KEY, { state: 'running', pid: 4242, pgid: 4242 }, wallClock);
+
+        if (observation === 'alive') livePgids.add(4242);
+        else {
+            runtime.processGroupDeps!.kill = () => {
+                throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+            };
+        }
+        killed.length = 0;
+        return { stops };
+    }
+
+    function promote(overrides: Record<string, unknown> = {}) {
+        return handlers.lease(call('lease', {}, {
+            epoch: 1, renewalSeq: 2, leaseMs: 60_000, absoluteExpiry: NOW + 900_000,
+            iat: wallClock, exp: wallClock + 60_000, ...overrides,
+        }));
+    }
+
+    it('promotes when the backend proved the generation stopped, though a reused pgid still looks alive', async () => {
+        await staleReceiptFrom('alive', true);
+        const result = await promote();
+        expect(result).toMatchObject({ ok: true, epoch: 1, fenced: true });
+        // Unconditional: a lease that came back `unknown` would otherwise slip
+        // through as a pass.
+        expect(runtime.store.readLease()).toMatchObject({ kind: 'ok', record: { epoch: 1 } });
+    });
+
+    it('promotes when the local probe cannot even see the group (EPERM)', async () => {
+        await staleReceiptFrom('eperm', true);
+        const result = await promote();
+        expect(result).toMatchObject({ ok: true, epoch: 1 });
+    });
+
+    it('still refuses when the backend cannot prove it', async () => {
+        await staleReceiptFrom('alive', false);
+        await expect(promote()).rejects.toThrowError(/fence-proof-unavailable/);
+        expect(runtime.store.readLease()).toMatchObject({ kind: 'ok', record: { epoch: 0 } });
+    });
+
+    it('still refuses while a spawn is reaching the launcher', async () => {
+        await staleReceiptFrom('alive', true);
+        let release: (v: ManagedSpawnOutcome) => void = () => {};
+        // Resolves once the launcher has actually been entered, so the
+        // promotion below races a real in-flight spawn rather than a guess
+        // about how many microtasks that takes.
+        let launcherEntered!: () => void;
+        const inLauncher = new Promise<void>((resolve) => { launcherEntered = resolve; });
+        spawnResult = () => new Promise((resolve) => {
+            release = resolve;
+            launcherEntered();
+        });
+        const other = handlers.spawn({
+            token: mint('spawn', { directory: '/w' }, { runId: 'run-2', attemptId: 'a-2' }),
+            params: { directory: '/w' },
+        });
+        await inLauncher;
+
+        try {
+            await expect(promote()).rejects.toThrowError(/fence-incomplete/);
+        } finally {
+            release({ type: 'success', sessionId: 's', pid: 5555 });
+            await Promise.allSettled([other]);
+        }
+    });
+
+    it('still refuses a token that aged out during the proof', async () => {
+        await staleReceiptFrom('alive', true);
+        runtime.fencingBackend!.proveGenerationStopped = async () => {
+            wallClock += 300_000;
+            return { proven: true, detail: 'ok' };
+        };
+        await expect(promote()).rejects.toThrowError(/token-expired/);
+    });
+
+    it('still refuses a renewal sequence that did not advance', async () => {
+        await staleReceiptFrom('alive', true);
+        await expect(promote({ renewalSeq: 1 })).rejects.toThrowError(/stale-renewal/);
+        expect(runtime.store.readLease()).toMatchObject({ kind: 'ok', record: { epoch: 0 } });
+    });
+
+    it('still refuses when the receipt store cannot be read in full', async () => {
+        await staleReceiptFrom('alive', true);
+        const { writeFileSync } = await import('node:fs');
+        const { join: joinPath } = await import('node:path');
+        const { managedReceiptFileName } = await import('./managedReceiptStore');
+        writeFileSync(joinPath(root, 'receipts', managedReceiptFileName(OP_KEY)), '{broken');
+        await expect(promote()).rejects.toThrowError(/fence-incomplete/);
+    });
+
+    it('reports the local observation as diagnostics without acting on it', async () => {
+        const ctx = await staleReceiptFrom('alive', true);
+        const result = await promote();
+        expect(runtime.store.readLease()).toMatchObject({ kind: 'ok', record: { epoch: 1 } });
+        // Useful for an operator; never a veto, and never a reason to signal a
+        // pid this process does not own.
+        expect(result.localEvidence.length).toBeGreaterThan(0);
+        expect(killed.filter(([, signal]) => signal !== 0)).toEqual([]);
+        expect(ctx.stops.length).toBeGreaterThan(0);
+    });
+});

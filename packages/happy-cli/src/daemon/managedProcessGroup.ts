@@ -86,28 +86,3 @@ export function probeProcessGroup(
             return { kind: 'indeterminate', detail: outcome.detail };
     }
 }
-
-/**
- * Whether a set of observations is enough to open a new writable generation.
- *
- * It never is on its own — `requiresExternalProof` is true whenever anything
- * was seen, and the caller must obtain cgroup emptiness or a provider stop
- * before raising the epoch.
- */
-export function summarizeFencingEvidence(
-    observations: readonly ProcessGroupEvidence[],
-): { allClear: boolean; requiresExternalProof: boolean; reasons: string[] } {
-    const reasons: string[] = [];
-    for (const observation of observations) {
-        if (observation.kind === 'alive') reasons.push('group-alive');
-        else if (observation.kind === 'alive-foreign') reasons.push('group-alive-foreign');
-        else if (observation.kind === 'indeterminate') reasons.push(`indeterminate:${observation.detail}`);
-    }
-    return {
-        allClear: reasons.length === 0,
-        // Even "all clear" needs external proof: a setsid child is invisible to
-        // every check this process can perform.
-        requiresExternalProof: true,
-        reasons,
-    };
-}
