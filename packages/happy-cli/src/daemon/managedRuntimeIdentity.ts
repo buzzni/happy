@@ -96,10 +96,35 @@ export type ManagedRuntimeIdentity = {
     /** The provider resources this runtime actually runs on. */
     providerMachineId: string;
     providerInstanceId: string;
+    /**
+     * The volume the provider attached, by the provider's own id.
+     *
+     * The runtime cannot derive this. `/proc/self/mountinfo` speaks in device
+     * numbers and mount sources; a `vol_…` id lives in the provider's API and
+     * appears nowhere the kernel can be asked. So it is written by whoever did
+     * the attaching and read from here — a runtime that named its own volume
+     * would be agreeing with itself.
+     */
+    providerVolumeId: string;
     verifier: KeyObject;
     /** Directory the receipt store owns. Never inside the agent workspace. */
     stateDir: string;
-    isolation: { backend: ManagedIsolationBackend; agentUid: number; cgroupRoot: string };
+    /**
+     * The two uids this runtime runs code under, and they are **two**.
+     *
+     * The provider holds the gateway capability and the session key; the tool
+     * executor runs code the model chose. Under one uid the executor can read
+     * `/proc/<provider pid>/environ` and the provider's descriptors, and the
+     * separation stops meaning anything — which is why `planToolExecutorIsolation`
+     * refuses a shared uid outright. The marker is where that split is decided,
+     * so it carries both and a marker naming one uid twice does not activate.
+     */
+    isolation: {
+        backend: ManagedIsolationBackend;
+        provider: { uid: number; gid: number };
+        executor: { uid: number; gid: number };
+        cgroupRoot: string;
+    };
 };
 
 export type ManagedIdentityResolution =
@@ -119,12 +144,13 @@ export type ManagedProvisioningDeps = {
     statGate?: (stat: ProvisioningStat) => { reason: ManagedIdentityRefusal } | null;
     /**
      * Asks the privileged launch backend whether it is actually wired up —
-     * meaning it can both start an agent under `agentUid` and terminate it.
+     * meaning it can both start code under these uids and terminate it.
      * T09 owns that implementation; until then this reports unavailable.
      */
     probeIsolationBackend: (input: {
         backend: ManagedIsolationBackend;
-        agentUid: number;
+        provider: { uid: number; gid: number };
+        executor: { uid: number; gid: number };
         cgroupRoot: string;
         daemonUid: number;
     }) => IsolationProbeResult;
@@ -138,7 +164,12 @@ export function probeIsolationBackendUnavailable(): IsolationProbeResult {
     return { verified: false, reason: 'trusted-launch-backend-not-implemented' };
 }
 
-const defaultDeps: ManagedProvisioningDeps = {
+/**
+ * How this daemon reads root-protected records on a real runtime. Exported so
+ * every such read on this process uses the **same** trust rules — a second set
+ * assembled at a call site is a second answer to "is this path trusted".
+ */
+export const defaultProvisioningDeps: ManagedProvisioningDeps = {
     getuid: () => (typeof process.getuid === 'function' ? process.getuid() : -1),
     platform: process.platform,
     lstatDir: (path) => {
@@ -176,6 +207,20 @@ export type ProvisioningStat = { uid: number; mode: number; isFile: boolean; siz
  * `resolveManagedRuntimeIdentity` uses this by default; a test may substitute
  * a narrower gate to exercise the parsing that follows.
  */
+/**
+ * A uid/gid pair, or `null`. Unprivileged and whole numbers — a role that runs
+ * as root is not a role that is contained by a uid.
+ */
+function readCredentials(raw: unknown): { uid: number; gid: number } | null {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const record = raw as Record<string, unknown>;
+    const uid = record.uid;
+    const gid = record.gid;
+    if (typeof uid !== 'number' || !Number.isSafeInteger(uid) || uid <= 0) return null;
+    if (typeof gid !== 'number' || !Number.isSafeInteger(gid) || gid <= 0) return null;
+    return { uid, gid };
+}
+
 export function assertProvisioningStat(
     stat: ProvisioningStat,
 ): { reason: ManagedIdentityRefusal } | null {
@@ -356,7 +401,7 @@ function stateDirRefusal(
 
 export function resolveManagedRuntimeIdentity(
     path: string = managedProvisioningPath(),
-    deps: ManagedProvisioningDeps = defaultDeps,
+    deps: ManagedProvisioningDeps = defaultProvisioningDeps,
 ): ManagedIdentityResolution {
     const daemonUid = deps.getuid();
     const file = readRootProtectedFile(path, deps.statGate ?? assertProvisioningStat);
@@ -410,12 +455,13 @@ export function resolveManagedRuntimeIdentity(
     const configDigest = readString(record.configDigest);
     const providerMachineId = readString(record.providerMachineId);
     const providerInstanceId = readString(record.providerInstanceId);
+    const providerVolumeId = readString(record.providerVolumeId);
     const stateDir = readString(record.stateDir, 4096);
     const workspaceDir = readString(record.workspaceDir, 4096);
     const verifierKeyB64 = readString(record.verifierPublicKey, 4096);
     if (!runtimeId || !workspaceId || !projectId || !keyId || !stateDir || !workspaceDir || !verifierKeyB64
         || !happyMachineId || !provisioningOperationId || !configDigest
-        || !providerMachineId || !providerInstanceId) {
+        || !providerMachineId || !providerInstanceId || !providerVolumeId) {
         return { status: 'refused', reason: 'malformed', detail: 'missing required field' };
     }
 
@@ -432,16 +478,24 @@ export function resolveManagedRuntimeIdentity(
     }
     const isolation = rawIsolation as Record<string, unknown>;
     const backend = readString(isolation.backend);
-    const agentUid = isolation.agentUid;
+    const provider = readCredentials(isolation.provider);
+    const executor = readCredentials(isolation.executor);
     const cgroupRoot = readString(isolation.cgroupRoot, 4096);
     if (!backend || !MANAGED_ISOLATION_BACKENDS.includes(backend as ManagedIsolationBackend)
-        || typeof agentUid !== 'number' || !Number.isSafeInteger(agentUid) || agentUid <= 0
-        || !cgroupRoot) {
+        || !provider || !executor || !cgroupRoot) {
         return { status: 'refused', reason: 'isolation-unverified', detail: 'incomplete attestation' };
     }
 
-    if (daemonUid < 0 || daemonUid === agentUid) {
-        return { status: 'refused', reason: 'isolation-unverified', detail: 'daemon shares the agent uid' };
+    // One uid named twice is no separation at all: the executor could read the
+    // provider's environment and descriptors, which is the whole thing the two
+    // uids exist to prevent. Refused here rather than at launch, because a
+    // runtime that admitted itself on this marker would already be answering
+    // the parent as isolated.
+    if (provider.uid === executor.uid) {
+        return { status: 'refused', reason: 'isolation-unverified', detail: 'one uid for both roles' };
+    }
+    if (daemonUid < 0 || daemonUid === provider.uid || daemonUid === executor.uid) {
+        return { status: 'refused', reason: 'isolation-unverified', detail: 'daemon shares a runtime uid' };
     }
 
     // The marker decides this runtime's identity, so an agent that can replace
@@ -460,7 +514,8 @@ export function resolveManagedRuntimeIdentity(
     // they do. Only the backend can answer that, and today none can.
     const probe = deps.probeIsolationBackend({
         backend: backend as ManagedIsolationBackend,
-        agentUid,
+        provider,
+        executor,
         cgroupRoot,
         daemonUid,
     });
@@ -480,9 +535,10 @@ export function resolveManagedRuntimeIdentity(
             configDigest,
             providerMachineId,
             providerInstanceId,
+            providerVolumeId,
             verifier,
             stateDir: resolve(stateDir),
-            isolation: { backend: backend as ManagedIsolationBackend, agentUid, cgroupRoot },
+            isolation: { backend: backend as ManagedIsolationBackend, provider, executor, cgroupRoot },
         },
     };
 }

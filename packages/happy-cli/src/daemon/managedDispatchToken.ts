@@ -26,7 +26,9 @@ const MAX_ID_LENGTH = 200;
 
 export const MANAGED_PROTOCOL_VERSION = 1;
 
-export const MANAGED_OPS = ['spawn', 'stop', 'query', 'lease', 'status', 'runtime-lease'] as const;
+export const MANAGED_OPS = [
+    'spawn', 'stop', 'query', 'lease', 'status', 'runtime-lease', 'checkpoint',
+] as const;
 export type ManagedOp = (typeof MANAGED_OPS)[number];
 
 /**
@@ -39,7 +41,7 @@ export type ManagedOp = (typeof MANAGED_OPS)[number];
 const RUN_SCOPED_OPS: readonly ManagedOp[] = ['spawn', 'stop', 'query', 'lease'];
 
 /** Operations bound to a provisioning operation rather than to a run. */
-const PROVISIONING_SCOPED_OPS: readonly ManagedOp[] = ['status', 'runtime-lease'];
+const PROVISIONING_SCOPED_OPS: readonly ManagedOp[] = ['status', 'runtime-lease', 'checkpoint'];
 
 type ManagedTokenCommon = {
     v: number;
@@ -93,10 +95,29 @@ export type ManagedRuntimeLeaseTokenClaims = ManagedTokenCommon & {
     absoluteExpiry: number;
 };
 
+/**
+ * Permission to snapshot this runtime's volume, for one named checkpoint.
+ *
+ * Bound to the provisioning operation rather than a run: a checkpoint is about
+ * the volume, and the volume outlives every run on it. It names the checkpoint
+ * it authorises, so a token cannot be replayed to write a different one, and it
+ * carries a digest of the request body — the presigned URLs and the one-time
+ * key travel in the parameters, and without binding them the same signature
+ * would authorise uploading this volume anywhere the caller liked.
+ */
+export type ManagedCheckpointTokenClaims = ManagedTokenCommon & {
+    op: 'checkpoint';
+    provisioningOperationId: string;
+    checkpointId: string;
+    /** Digest of the request parameters this token was signed for. */
+    paramsDigest: string;
+};
+
 export type ManagedTokenClaims =
     | ManagedRunTokenClaims
     | ManagedStatusTokenClaims
-    | ManagedRuntimeLeaseTokenClaims;
+    | ManagedRuntimeLeaseTokenClaims
+    | ManagedCheckpointTokenClaims;
 
 export type ManagedTokenFailure =
     | 'malformed'
@@ -223,6 +244,19 @@ function parseClaims(raw: unknown): ManagedTokenClaims | null {
         // grant made before any run exists.
         for (const forbidden of ['runId', 'attemptId']) {
             if (record[forbidden] !== undefined) return null;
+        }
+        if (op === 'checkpoint') {
+            // A checkpoint names what it writes and what it was signed for.
+            // Without the digest the parameters are unauthenticated, and the
+            // parameters are where the upload destinations live.
+            const checkpointId = readId(record.checkpointId);
+            const paramsDigest = readId(record.paramsDigest);
+            if (checkpointId === null || paramsDigest === null) return null;
+            // A checkpoint is not a lease: it may not hold a write deadline.
+            for (const forbidden of ['renewalSeq', 'leaseMs', 'absoluteExpiry']) {
+                if (record[forbidden] !== undefined) return null;
+            }
+            return { ...base, op, provisioningOperationId, checkpointId, paramsDigest };
         }
         if (op === 'runtime-lease') {
             // The same fields the run-scoped lease needs, for the same reasons:

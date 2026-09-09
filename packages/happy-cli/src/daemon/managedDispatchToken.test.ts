@@ -355,7 +355,8 @@ describe('the status claim', () => {
         // must keep verifying unchanged.
         const result = verify(mint(claims()));
         expect(result.ok).toBe(true);
-        if (!result.ok || result.claims.op === 'status' || result.claims.op === 'runtime-lease') return;
+        if (!result.ok || result.claims.op === 'status'
+            || result.claims.op === 'runtime-lease' || result.claims.op === 'checkpoint') return;
         expect(result.claims.runId).toBe('run-1');
         expect(result.claims.attemptId).toBe('attempt-1');
     });
@@ -454,7 +455,8 @@ describe('the runtime-lease claim', () => {
             op: 'lease', epoch: 4, renewalSeq: 2, leaseMs: 60_000, absoluteExpiry: NOW + 3_600_000,
         } as never)), { op: 'lease', currentEpoch: 3 });
         expect(result.ok).toBe(true);
-        if (!result.ok || result.claims.op === 'status' || result.claims.op === 'runtime-lease') return;
+        if (!result.ok || result.claims.op === 'status'
+            || result.claims.op === 'runtime-lease' || result.claims.op === 'checkpoint') return;
         expect(result.claims.runId).toBe('run-1');
         expect(result.claims.attemptId).toBe('attempt-1');
     });

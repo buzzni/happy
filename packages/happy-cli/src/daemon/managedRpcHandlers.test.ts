@@ -44,9 +44,10 @@ const identity: ManagedRuntimeIdentity = {
     configDigest: 'digest-1',
     providerMachineId: 'provider-machine-1',
     providerInstanceId: 'provider-instance-1',
+    providerVolumeId: 'vol_fixture_1',
     verifier,
     stateDir: '/unused',
-    isolation: { backend: 'privileged-launch-supervisor', agentUid: 901, cgroupRoot: '/c' },
+    isolation: { backend: 'privileged-launch-supervisor', provider: { uid: 901, gid: 901 }, executor: { uid: 902, gid: 901 }, cgroupRoot: '/c' },
 };
 
 function mint(op: ManagedOp, payload: unknown, overrides: Record<string, unknown> = {}): string {

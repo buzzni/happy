@@ -222,7 +222,8 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             now: runtime.now(),
         });
         if (!result.ok) throw new ManagedRpcError(`token-${result.reason}`);
-        if (result.claims.op === 'status' || result.claims.op === 'runtime-lease') {
+        if (result.claims.op === 'status' || result.claims.op === 'runtime-lease'
+            || result.claims.op === 'checkpoint') {
             // Unreachable while `op` is run-scoped — the verifier already
             // refuses a mismatched op — and stated rather than cast away.
             throw new ManagedRpcError('token-wrong-op');

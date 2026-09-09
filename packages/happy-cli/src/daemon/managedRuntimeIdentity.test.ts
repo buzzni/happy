@@ -47,12 +47,14 @@ function writeProvisioning(overrides: Record<string, unknown> = {}, path = provi
         configDigest: 'digest-1',
         providerMachineId: 'fly-machine-1',
         providerInstanceId: 'fly-instance-1',
+        providerVolumeId: 'vol_fixture_1',
         stateDir,
         workspaceDir,
         verifierPublicKey,
         isolation: {
             backend: 'privileged-launch-supervisor',
-            agentUid: AGENT_UID,
+            provider: { uid: AGENT_UID, gid: AGENT_UID },
+            executor: { uid: AGENT_UID + 1, gid: AGENT_UID },
             cgroupRoot: '/sys/fs/cgroup/saycode',
         },
         ...overrides,
@@ -186,15 +188,55 @@ describe('resolveManagedRuntimeIdentity — content and isolation', () => {
 
     it('refuses an unknown isolation backend', () => {
         writeProvisioning({
-            isolation: { backend: 'trust-me', agentUid: AGENT_UID, cgroupRoot: '/sys/fs/cgroup/x' },
+            isolation: {
+                backend: 'trust-me',
+                provider: { uid: AGENT_UID, gid: AGENT_UID },
+                executor: { uid: AGENT_UID + 1, gid: AGENT_UID },
+                cgroupRoot: '/sys/fs/cgroup/x',
+            },
         });
         expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()))
             .toMatchObject({ status: 'refused', reason: 'isolation-unverified' });
     });
 
-    it('refuses when the daemon shares the agent uid', () => {
+    it.each([
+        ['the provider uid', { provider: { uid: DAEMON_UID, gid: DAEMON_UID }, executor: { uid: AGENT_UID, gid: AGENT_UID } }],
+        ['the executor uid', { provider: { uid: AGENT_UID, gid: AGENT_UID }, executor: { uid: DAEMON_UID, gid: DAEMON_UID } }],
+    ])('refuses when the daemon shares %s', (_name, roles) => {
         writeProvisioning({
-            isolation: { backend: 'privileged-launch-supervisor', agentUid: DAEMON_UID, cgroupRoot: '/sys/fs/cgroup/x' },
+            isolation: { backend: 'privileged-launch-supervisor', ...roles, cgroupRoot: '/sys/fs/cgroup/x' },
+        });
+        expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()))
+            .toMatchObject({ status: 'refused', reason: 'isolation-unverified' });
+    });
+
+    it('refuses one uid wearing both roles', () => {
+        // The executor could then read the provider's environment and
+        // descriptors out of /proc, which is the entire reason there are two.
+        writeProvisioning({
+            isolation: {
+                backend: 'privileged-launch-supervisor',
+                provider: { uid: AGENT_UID, gid: AGENT_UID },
+                executor: { uid: AGENT_UID, gid: AGENT_UID },
+                cgroupRoot: '/sys/fs/cgroup/x',
+            },
+        });
+        const result = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
+        expect(result).toMatchObject({ status: 'refused', reason: 'isolation-unverified' });
+        if (result.status === 'refused') expect(result.detail).toContain('one uid');
+    });
+
+    it.each([
+        ['a missing executor', { provider: { uid: AGENT_UID, gid: AGENT_UID } }],
+        ['a missing provider', { executor: { uid: AGENT_UID, gid: AGENT_UID } }],
+        ['a root role', {
+            provider: { uid: 0, gid: 0 },
+            executor: { uid: AGENT_UID, gid: AGENT_UID },
+        }],
+        ['a role that is not a pair', { provider: AGENT_UID, executor: { uid: AGENT_UID + 1, gid: AGENT_UID } }],
+    ])('refuses %s', (_name, roles) => {
+        writeProvisioning({
+            isolation: { backend: 'privileged-launch-supervisor', ...roles, cgroupRoot: '/sys/fs/cgroup/x' },
         });
         expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()))
             .toMatchObject({ status: 'refused', reason: 'isolation-unverified' });
@@ -227,7 +269,12 @@ describe('resolveManagedRuntimeIdentity — content and isolation', () => {
 
     it('refuses a state directory owned by the agent uid', () => {
         writeProvisioning({
-            isolation: { backend: 'privileged-launch-supervisor', agentUid: DAEMON_UID + 0, cgroupRoot: '/c' },
+            isolation: {
+                backend: 'privileged-launch-supervisor',
+                provider: { uid: DAEMON_UID, gid: DAEMON_UID },
+                executor: { uid: AGENT_UID, gid: AGENT_UID },
+                cgroupRoot: '/c',
+            },
         });
         // agentUid === owner of stateDir (the test user) must be refused.
         const result = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
@@ -353,7 +400,12 @@ describe('trusted path requires every ancestor, not just the leaf', () => {
             stateDir: state,
             // The test user owns every temp directory here, so declaring it as
             // the agent uid makes the ancestor check the thing under test.
-            isolation: { backend: 'privileged-launch-supervisor', agentUid: DAEMON_UID, cgroupRoot: '/c' },
+            isolation: {
+                backend: 'privileged-launch-supervisor',
+                provider: { uid: DAEMON_UID, gid: DAEMON_UID },
+                executor: { uid: AGENT_UID, gid: AGENT_UID },
+                cgroupRoot: '/c',
+            },
         });
         const result = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
         expect(result.status).toBe('refused');
@@ -533,6 +585,9 @@ describe('resolveManagedRuntimeIdentity — the identity a readiness answer is b
         expect(resolution.identity.configDigest).toBe('digest-1');
         expect(resolution.identity.providerMachineId).toBe('fly-machine-1');
         expect(resolution.identity.providerInstanceId).toBe('fly-instance-1');
+        // The volume axis comes from the provider through the marker. Nothing
+        // the runtime can read names it, so it cannot be recovered later.
+        expect(resolution.identity.providerVolumeId).toBe('vol_fixture_1');
     });
 
     it.each([
@@ -541,6 +596,7 @@ describe('resolveManagedRuntimeIdentity — the identity a readiness answer is b
         'configDigest',
         'providerMachineId',
         'providerInstanceId',
+        'providerVolumeId',
     ])('refuses — never activates — when %s is missing', (field) => {
         // Absent means the provisioner did not write it, which is a runtime
         // that cannot be told apart from another. There is nothing safe to

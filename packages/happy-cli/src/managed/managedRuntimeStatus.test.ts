@@ -24,8 +24,9 @@ const identity = {
     configDigest: 'digest-1',
     providerMachineId: 'provider-machine-1',
     providerInstanceId: 'provider-instance-1',
+    providerVolumeId: 'vol_fixture_1',
     stateDir: '/state',
-    isolation: { backend: 'privileged-launch-supervisor' as const, agentUid: 901, cgroupRoot: '/c' },
+    isolation: { backend: 'privileged-launch-supervisor' as const, provider: { uid: 901, gid: 901 }, executor: { uid: 902, gid: 901 }, cgroupRoot: '/c' },
 };
 
 function deps(over: Record<string, unknown> = {}) {
