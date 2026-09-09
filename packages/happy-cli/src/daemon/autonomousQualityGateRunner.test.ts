@@ -117,7 +117,12 @@ describe('runAutonomousQualityGatePhase', () => {
 
             expect(result).toMatchObject({ status: 'passed', exitCode: 0, timedOut: false });
             expect(Number.isInteger(childPid)).toBe(true);
-            expect(() => process.kill(childPid!, 0)).toThrow();
+            // A SIGKILL request does not synchronously guarantee that
+            // kill(pid, 0) reports absence. Wait boundedly for observable
+            // disappearance; a SIGTERM-ignoring survivor must still fail.
+            await vi.waitFor(() => {
+                expect(() => process.kill(childPid!, 0)).toThrow();
+            }, { timeout: 1_000, interval: 10 });
         } finally {
             if (childPid) {
                 try { process.kill(childPid, 'SIGKILL'); } catch { /* already exited */ }
