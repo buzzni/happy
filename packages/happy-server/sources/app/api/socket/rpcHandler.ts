@@ -3,6 +3,9 @@ import { Server, Socket } from "socket.io";
 import type { RemoteSocket } from "socket.io";
 import type { DefaultEventsMap } from "socket.io/dist/typed-events";
 import { Counter, Histogram, register } from 'prom-client';
+import { randomUUID } from 'node:crypto';
+import { dispatchManagedRpc, managedRpcServer } from '@/app/api/socket/managed/managedDelivery';
+import { isManagedSessionId, splitRpcMethod } from '@/app/api/socket/managed/managedRpcTarget';
 
 // RPC routing uses Socket.IO rooms. A daemon registering method M for user U
 // joins room `rpc:U:M`. Callers look the daemon up cross-replica via
@@ -182,6 +185,44 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
             if (!method || typeof method !== 'string') {
                 finish('invalid_params');
                 callback?.({ ok: false, error: 'Invalid parameters: method is required' });
+                return;
+            }
+
+            // A managed session is answered only by its managed socket. The
+            // legacy room below is addressed by a name a child once claimed,
+            // so falling back to it when the child is offline or its grant was
+            // revoked would hand that session's calls to whoever holds the
+            // name now. `isManagedSessionId` is durable for exactly that
+            // reason: the answer does not change when the child goes away.
+            const parsed = splitRpcMethod(method);
+            if (parsed && await isManagedSessionId(parsed.sessionId)) {
+                const dispatched = await dispatchManagedRpc(managedRpcServer(), {
+                    sessionId: parsed.sessionId,
+                    accountId: userId,
+                    rpcName: parsed.name,
+                    requestId: randomUUID(),
+                    params,
+                    // The caller's deadline applies here exactly as it does on
+                    // the legacy path; taking the managed branch must not mean
+                    // waiting forever.
+                }, undefined, { deadlineMs: timeoutMs });
+                if (!dispatched.ok) {
+                    // Same envelope the legacy path answers with: the caller is
+                    // an ordinary account client and cannot be asked to learn a
+                    // second shape because the session happens to be managed.
+                    finish(dispatched.reason === 'no-target' ? 'not_available'
+                        : dispatched.reason === 'timeout' ? 'timeout' : 'failed');
+                    callback?.({
+                        ok: false,
+                        error: dispatched.error ?? 'RPC method not available',
+                    });
+                    return;
+                }
+                finish('success');
+                // `result` is whatever the child acknowledged with — an opaque
+                // encrypted string from its RPC handler manager. It is passed
+                // through, not interpreted.
+                callback?.({ ok: true, result: dispatched.result });
                 return;
             }
 

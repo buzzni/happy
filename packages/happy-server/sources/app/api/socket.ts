@@ -23,8 +23,11 @@ import { machineSocketIdentityExists } from "./socket/machineSocketAuth";
 import { automationSocketHandler } from "./socket/automationSocketHandler";
 import { markMachineOffline, markMachineOnline } from "@/app/presence/machinePresence";
 import { wrapServerForPreviewSubdomainBypass } from "@/modules/preview/previewEngineIoGuard";
+import { startManagedSocket } from "@/app/api/socket/managed/managedSocketServer";
+import { setManagedRpcServer } from "@/app/api/socket/managed/managedDelivery";
+import type { ManagedControlRuntime } from "@/app/managed/managedControlRuntime";
 
-export function startSocket(app: Fastify) {
+export function startSocket(app: Fastify, managedControl: ManagedControlRuntime | null = null) {
     // engine.io claims `/v1/updates` purely by path prefix, blind to Host —
     // so a preview-subdomain request for it would otherwise be swallowed by
     // engine.io instead of relayed to the previewed dev server the way every
@@ -47,7 +50,9 @@ export function startSocket(app: Fastify) {
         // path is not its own (`/v1/updates`) after `destroyUpgradeTimeout`.
         // The preview WebSocket relay (previewWebSocketRelay.ts) owns
         // `/v1/preview/:machineId/:port/*` upgrades on the same HTTP server, so
-        // we opt out of engine.io tearing those foreign upgrades down.
+        // we opt out of engine.io tearing those foreign upgrades down. The
+        // managed socket server below shares this HTTP server too, on its own
+        // path, and needs the same.
         destroyUpgrade: false,
         upgradeTimeout: 10000,
         connectTimeout: 20000,
@@ -197,6 +202,27 @@ export function startSocket(app: Fastify) {
             || undefined;
         next();
     });
+
+    // Managed children connect to a separate server with no packet recovery.
+    // The runtime is the one the API already built: a second call here would
+    // derive a second key and accept tokens the first would not. Null is the
+    // expected off state; anything else fails startup rather than leaving a
+    // server that looks healthy while managed access is silently missing.
+    const managedIo = startManagedSocket(app.server, {
+        issuer: managedControl?.scopedTokens ?? null,
+        adapter: isRedisConfigured(process.env)
+            // Its own stream: managed traffic and legacy traffic must not share
+            // a bus that either side can read.
+            ? createAdapter(createRedisClient(), {
+                streamName: 'socket.io.managed', maxLen: 200000, readCount: 2000,
+            }) as never
+            : undefined,
+    });
+    setManagedRpcServer(managedIo);
+    eventRouter.initManaged(managedIo);
+    if (managedControl && !managedIo) {
+        throw new Error('Managed control is configured but the managed socket server did not start');
+    }
 
     io.on("connection", (socket) => {
         const userId = socket.data.userId as string;

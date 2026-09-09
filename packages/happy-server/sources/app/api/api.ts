@@ -250,7 +250,7 @@ export async function startApi(opts: StartApiOptions = {}) {
     });
 
     // Start Socket
-    startSocket(typed);
+    startSocket(typed, managedControl);
 
     // Preview WebSocket relay — must attach after startSocket so engine.io's
     // upgrade listener is already in place (they coexist on app.server; see
