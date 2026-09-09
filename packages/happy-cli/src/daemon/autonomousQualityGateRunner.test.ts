@@ -117,7 +117,7 @@ describe('runAutonomousQualityGatePhase', () => {
 
             expect(result).toMatchObject({ status: 'passed', exitCode: 0, timedOut: false });
             expect(Number.isInteger(childPid)).toBe(true);
-            expect(() => process.kill(childPid!, 0)).toThrow();
+            await expect(fetch(`http://127.0.0.1:${port}/`)).rejects.toThrow();
         } finally {
             if (childPid) {
                 try { process.kill(childPid, 'SIGKILL'); } catch { /* already exited */ }
