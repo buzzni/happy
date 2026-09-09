@@ -26,6 +26,11 @@ import { wrapServerForPreviewSubdomainBypass } from "@/modules/preview/previewEn
 import { startManagedSocket } from "@/app/api/socket/managed/managedSocketServer";
 import { setManagedRpcServer } from "@/app/api/socket/managed/managedDelivery";
 import type { ManagedControlRuntime } from "@/app/managed/managedControlRuntime";
+import { authenticateManagedDaemonSocket } from "@/app/api/socket/managedDaemonSocketAuth";
+import { installManagedDaemonSocketGuard } from "@/app/api/socket/managedDaemonSocketGuard";
+import { setManagedControlRuntime } from "@/app/api/socket/managedDaemonOutboundGuard";
+import { installManagedDaemonRpcExecutor } from "@/app/api/socket/managedDaemonRpcRelay";
+import type { ManagedDaemonClaims } from "@/app/auth/managedDaemonToken";
 
 export function startSocket(app: Fastify, managedControl: ManagedControlRuntime | null = null) {
     // engine.io claims `/v1/updates` purely by path prefix, blind to Host —
@@ -172,8 +177,43 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             return;
         }
 
+        /*
+         * A managed runtime's daemon presents a credential of its **own
+         * purpose**, not an account bearer — that is the whole point of the
+         * split, since the daemon runs code the customer's agent can influence.
+         * Those tokens are signed under a different service, so
+         * `auth.verifyToken` cannot verify one and must not be asked to.
+         *
+         * Two checks, and both are needed on **every** connect: the signature
+         * says the token was issued here, and the grant row says it has not
+         * been withdrawn or superseded since. A signature cannot express a
+         * revocation, so a socket authenticated on the signature alone would
+         * outlive the withdrawal that was supposed to end it.
+         */
+        const managedDaemon = await authenticateManagedDaemonSocket({
+            handshake: { token, clientType, machineId },
+            managedControl,
+            now: Date.now(),
+        });
+        if (managedDaemon) {
+            socket.data.userId = managedDaemon.accountId;
+            socket.data.managedDaemon = managedDaemon;
+            socket.data.clientType = clientType;
+            socket.data.sessionId = sessionId;
+            socket.data.machineId = machineId;
+            socket.data.connectedAt = Date.now();
+            socket.data.happyClient = socket.handshake.auth.happyClient as string
+                || socket.handshake.headers['x-happy-client'] as string
+                || undefined;
+            next();
+            return;
+        }
+
         const verified = await auth.verifyToken(token);
         if (!verified) {
+            // One message for every way authentication can fail. A caller
+            // learning *which* way would learn whether a given credential or
+            // grant exists.
             log({ module: 'websocket' }, `Invalid token provided`);
             next(new Error('Invalid authentication token'));
             return;
@@ -219,6 +259,14 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             : undefined,
     });
     setManagedRpcServer(managedIo);
+    // The one runtime the API built. Registered rather than rebuilt: a second
+    // construction would derive a second key and accept tokens the first would
+    // not.
+    setManagedControlRuntime(managedControl);
+    // The recipient half of the daemon RPC relay. Installed on every replica:
+    // the one that owns a runtime's socket is the only one that can say the
+    // grant holds *and* emit in the same breath.
+    installManagedDaemonRpcExecutor(io);
     eventRouter.initManaged(managedIo);
     if (managedControl && !managedIo) {
         throw new Error('Managed control is configured but the managed socket server did not start');
@@ -331,15 +379,53 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             }
         });
 
-        // Handlers
+        /*
+         * Handlers, and **which** handlers depends on who this is.
+         *
+         * A managed runtime's daemon authenticated with a credential scoped to
+         * one machine. It appears under the customer's account because the
+         * Machine is theirs, but it is not the customer: it runs code the
+         * agent can influence. So it gets what a runtime needs — machine RPC,
+         * its own machine's state, liveness — and none of the handlers that
+         * reach the account: session updates, artifacts, access keys, terminal
+         * relay and usage all act on things this runtime was never given.
+         *
+         * Registering them and refusing inside would be a second boundary in a
+         * place where the first one is easy to get right; not registering them
+         * means the events simply have no listener.
+         */
+        const managedDaemon = socket.data.managedDaemon as ManagedDaemonClaims | undefined;
+        if (managedDaemon && managedControl) {
+            /*
+             * Installed **before** the handlers, so nothing they do can happen
+             * without passing it.
+             *
+             * The handlers below take a `userId` and act on whatever the
+             * payload names. That is correct for a person's daemon and wrong
+             * here: this socket's credential is scoped to one machine, and the
+             * account it belongs to owns others. The guard pins the machine and
+             * re-reads the grant on every event, so a withdrawal takes effect
+             * on the next thing this socket does rather than whenever it
+             * happens to reconnect.
+             */
+            const guard = installManagedDaemonSocketGuard({
+                socket,
+                claims: managedDaemon,
+                token: socket.handshake.auth.token as string,
+                managedControl,
+            });
+            socket.on('disconnect', () => guard.dispose());
+        }
         rpcHandler(userId, socket, io);
-        usageHandler(userId, socket);
-        sessionUpdateHandler(userId, socket, connection);
         pingHandler(socket);
         machineUpdateHandler(userId, socket);
-        artifactUpdateHandler(userId, socket);
-        accessKeyHandler(userId, socket);
-        terminalRelayHandler(userId, socket);
+        if (!managedDaemon) {
+            usageHandler(userId, socket);
+            sessionUpdateHandler(userId, socket, connection);
+            artifactUpdateHandler(userId, socket);
+            accessKeyHandler(userId, socket);
+            terminalRelayHandler(userId, socket);
+        }
         if (connection.connectionType === 'machine-scoped') {
             automationSocketHandler(userId, connection.machineId, socket);
             // proxy-ws-* only ever fires on the replica the daemon is attached

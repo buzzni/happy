@@ -6,6 +6,7 @@ import { Counter, Histogram, register } from 'prom-client';
 import { randomUUID } from 'node:crypto';
 import { dispatchManagedRpc, managedRpcServer } from '@/app/api/socket/managed/managedDelivery';
 import { isManagedSessionId, splitRpcMethod } from '@/app/api/socket/managed/managedRpcTarget';
+import { dispatchDaemonRpc } from '@/app/api/socket/managedDaemonRpcRelay';
 
 // RPC routing uses Socket.IO rooms. A daemon registering method M for user U
 // joins room `rpc:U:M`. Callers look the daemon up cross-replica via
@@ -250,6 +251,39 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
             if (target.id === socket.id) {
                 finish('self_call');
                 callback?.({ ok: false, error: 'Cannot call RPC on the same socket' });
+                return;
+            }
+
+            /*
+             * A managed runtime is dispatched through the relay, not through a
+             * broadcast ack.
+             *
+             * `emitWithAck` on a `RemoteSocket` sends nothing from here: the
+             * adapter publishes, and the replica that owns the socket delivers
+             * it later without consulting anything. A check on this side would
+             * therefore describe the past — a grant withdrawn during that gap
+             * would not stop the request. The relay re-reads the authority on
+             * the replica that actually emits, immediately before it does, with
+             * the socket id fixed and no re-selection anywhere.
+             */
+            if (target.data?.managedDaemon) {
+                const outcome = await dispatchDaemonRpc({
+                    io,
+                    request: {
+                        requestId: randomUUID(),
+                        targetSocketId: target.id,
+                        method,
+                        params,
+                        timeoutMs,
+                    },
+                });
+                if (outcome.ok) {
+                    finish('ok');
+                    callback?.({ ok: true, result: outcome.result });
+                    return;
+                }
+                finish(outcome.reason === 'refused' ? 'not_available' : 'error');
+                callback?.({ ok: false, error: 'RPC method not available' });
                 return;
             }
 
