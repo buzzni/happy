@@ -10,6 +10,7 @@
  * preparation `runCodex` calls, in the same sequence, against the envelope.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { ExecSyncOptions } from 'node:child_process';
 
 /**
  * The real runner is what has to hold the order, so the observation is made
@@ -31,6 +32,29 @@ vi.mock('@/codex/initialPrompt', async (importOriginal) => {
     };
 });
 vi.mock('@/utils/killShims', () => ({ installBroadKillShims: vi.fn() }));
+
+/**
+ * `runCodex` shells out to `codex --version` early and calls `process.exit(1)`
+ * when it is absent — correct for a user who has not installed it, and fatal
+ * for a suite that has nothing to do with the Codex CLI. A machine that
+ * happens to have it hides that: these tests passed locally and died on CI at
+ * the first assertion past the check, because the run had already exited.
+ *
+ * Only that one command is answered, matched exactly. A prefix would let any
+ * future `codex …` invocation be faked here, which is a different behaviour
+ * standing in for the real one.
+ */
+vi.mock('node:child_process', async (importOriginal) => {
+    const original = await importOriginal<typeof import('node:child_process')>();
+    // `execSync` is overloaded on its options, so the wrapper is written
+    // against one signature and asserted to the whole set once — the assertion
+    // is on the function, not on any value passing through it.
+    const execSync = ((command: string, options?: ExecSyncOptions) => {
+        if (command === 'codex --version') return 'codex-cli 0.140.0';
+        return original.execSync(command, options);
+    }) as typeof original.execSync;
+    return { ...original, execSync };
+});
 
 /**
  * Enough of the runner's surroundings for the real `runCodex` to reach the
