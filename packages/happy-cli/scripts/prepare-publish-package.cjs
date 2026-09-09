@@ -9,7 +9,8 @@ const BUNDLED_DEPENDENCIES = [
     '@buzzni/saycode-cli',
     '@paralleldrive/cuid2',
     '@noble/hashes',
-    'zod'
+    'zod',
+    'tweetnacl'
 ];
 
 function parseArgs(argv) {
@@ -131,6 +132,7 @@ function preparePublishPackage() {
     const cuid2Destination = copyDependency(cliDir, '@paralleldrive/cuid2', outputDir);
     copyDependency(cliDir, '@noble/hashes', outputDir);
     copyDependency(cliDir, 'zod', outputDir);
+    copyDependency(cliDir, 'tweetnacl', outputDir);
 
     const cuid2Source = fs.realpathSync(dependencyPath(cliDir, '@paralleldrive/cuid2'));
     const cuid2NestedNoble = path.resolve(cuid2Source, '..', '..', '@noble', 'hashes');

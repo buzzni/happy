@@ -24,6 +24,7 @@ function createPublishTarball(
         nativeHelperExecutable?: boolean
         omitNativeMessagingPermission?: boolean
         omitSaycodeAgent?: boolean
+        omitTweetnacl?: boolean
     } = {}
 ): string {
     const fixtureRoot = mkdtempSync(join(tmpdir(), 'happy-cli-guard-test-'))
@@ -38,6 +39,7 @@ function createPublishTarball(
             '@buzzni/saycode-cli': '0.2.2',
             '@slopus/happy-wire': '0.0.0-test',
             zod: '0.0.0-test',
+            tweetnacl: '0.0.0-test',
             '@paralleldrive/cuid2': '0.0.0-test',
             fastify: '0.0.0-test'
         },
@@ -45,6 +47,7 @@ function createPublishTarball(
             '@buzzni/saycode-cli',
             '@slopus/happy-wire',
             'zod',
+            'tweetnacl',
             '@paralleldrive/cuid2',
             'fastify'
         ],
@@ -88,6 +91,10 @@ function createPublishTarball(
     writeFixtureFile(packageRoot, 'node_modules/@slopus/happy-wire/package.json', JSON.stringify({ name: '@slopus/happy-wire', version: '0.0.0-test' }))
     writeFixtureFile(packageRoot, 'node_modules/@slopus/happy-wire/dist/index.mjs', 'export {};\n')
     writeFixtureFile(packageRoot, 'node_modules/zod/package.json', JSON.stringify({ name: 'zod', version: '0.0.0-test' }))
+    if (!options.omitTweetnacl) {
+        writeFixtureFile(packageRoot, 'node_modules/tweetnacl/package.json', JSON.stringify({ name: 'tweetnacl', version: '0.0.0-test', main: 'nacl-fast.js' }))
+        writeFixtureFile(packageRoot, 'node_modules/tweetnacl/nacl-fast.js', 'module.exports = {}\n')
+    }
     writeFixtureFile(packageRoot, 'node_modules/@paralleldrive/cuid2/package.json', JSON.stringify({ name: '@paralleldrive/cuid2', version: '0.0.0-test' }))
     writeFixtureFile(packageRoot, 'node_modules/@paralleldrive/cuid2/node_modules/@noble/hashes/package.json', JSON.stringify({ name: '@noble/hashes', version: '0.0.0-test' }))
     writeFixtureFile(packageRoot, 'browser-extension/manifest.json', JSON.stringify({
@@ -132,6 +139,12 @@ afterEach(() => {
 })
 
 describe('guard-publish-artifact', () => {
+    it('rejects a tarball missing the wire crypto runtime dependency', () => {
+        const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', { omitTweetnacl: true })
+        const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball], { encoding: 'utf8', timeout: 30_000 })
+        expect(result.status).toBe(1)
+        expect(result.stderr).toContain('tweetnacl')
+    })
     it('rejects an installed artifact that does not expose the bundled Saycode agent facade', () => {
         const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', {
             omitSaycodeAgent: true
