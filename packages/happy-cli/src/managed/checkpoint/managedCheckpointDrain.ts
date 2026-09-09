@@ -33,6 +33,26 @@ export type CheckpointDrain = {
     drain(budgetMs: number): Promise<{ release: () => void }>;
     inFlight(): number;
     isDraining(): boolean;
+    /**
+     * How many writes have been admitted, ever. Monotonic.
+     *
+     * A checkpoint is only still valid while nothing has been written since,
+     * and this is the runtime's evidence for that: a runtime can hand
+     * `() => drain.writes()` to the checkpoint coordinator, which compares it
+     * against the value captured when the last good checkpoint was taken.
+     * Writes that never go through this gate are invisible to it — which is
+     * why the coordinator also refuses on a failed attempt rather than relying
+     * on this alone.
+     */
+    writes(): number;
+    /**
+     * The write count at the moment the most recent drain became quiet.
+     *
+     * Captured inside the drained window, so it is exactly the count the
+     * archive was taken at. Reading `writes()` after the drain is released
+     * would race with the next write.
+     */
+    lastQuiescedWrites(): number;
 };
 
 export function createCheckpointDrain(deps?: {
@@ -43,6 +63,8 @@ export function createCheckpointDrain(deps?: {
         return { cancel: () => clearTimeout(handle) };
     });
     let inFlight = 0;
+    let admitted = 0;
+    let quiescedWrites = 0;
     let draining = false;
     let notifyIdle: (() => void) | null = null;
 
@@ -58,6 +80,7 @@ export function createCheckpointDrain(deps?: {
         beginWrite() {
             if (draining) throw new CheckpointDrainRefusal('drain-in-progress');
             inFlight += 1;
+            admitted += 1;
             let done = false;
             return () => {
                 // Idempotent: a caller that reports completion twice must not
@@ -72,7 +95,10 @@ export function createCheckpointDrain(deps?: {
             if (draining) throw new CheckpointDrainRefusal('drain-in-progress');
             draining = true;
             const release = (): void => { draining = false; };
-            if (inFlight === 0) return { release };
+            if (inFlight === 0) {
+                quiescedWrites = admitted;
+                return { release };
+            }
 
             // Declared as the union rather than inferred: the assignment
             // happens inside the executor, which the compiler cannot see
@@ -95,9 +121,12 @@ export function createCheckpointDrain(deps?: {
             } finally {
                 timer?.cancel();
             }
+            quiescedWrites = admitted;
             return { release };
         },
         inFlight: () => inFlight,
         isDraining: () => draining,
+        writes: () => admitted,
+        lastQuiescedWrites: () => quiescedWrites,
     };
 }

@@ -58,4 +58,33 @@ describe('createCheckpointDrain', () => {
         first();
         expect(drain.inFlight()).toBe(1);
     });
+
+    it('shouldCountEveryAdmittedWriteWithoutEverGoingBack', async () => {
+        const drain = createCheckpointDrain();
+        expect(drain.writes()).toBe(0);
+        const first = drain.beginWrite();
+        const second = drain.beginWrite();
+        expect(drain.writes()).toBe(2);
+        first();
+        second();
+        // Completing a write does not un-write it: this is what a checkpoint
+        // compares against to know whether anything happened since.
+        expect(drain.writes()).toBe(2);
+    });
+
+    it('shouldCaptureTheWriteCountAtTheMomentItBecameQuiet', async () => {
+        const drain = createCheckpointDrain();
+        const done = drain.beginWrite();
+        const pending = drain.drain(1000);
+        drain.beginWrite;
+        done();
+        const held = await pending;
+        // Captured inside the drained window — the archive was taken at this
+        // count, not at whatever it becomes after the gate opens.
+        expect(drain.lastQuiescedWrites()).toBe(1);
+        held.release();
+        drain.beginWrite();
+        expect(drain.writes()).toBe(2);
+        expect(drain.lastQuiescedWrites()).toBe(1);
+    });
 });
