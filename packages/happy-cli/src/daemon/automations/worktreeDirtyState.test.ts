@@ -83,3 +83,32 @@ describe('describeUnsavedWorktreeChanges', () => {
   });
 });
 
+// 2026-09-10 프로덕션 — worktree 14개(16GB)가 다시 쌓였다. 사유의 대부분이
+// `packages/web-ui/.omc/sessions/*.json` 처럼 **하위 디렉터리의** .omc 였다. 무시
+// 목록은 루트 접두 매칭이라 못 잡았다. 같은 부류, 다른 위치다. 최장 471회(4.9일)
+// 정리에 실패했다.
+describe('하위 디렉터리의 도구 산출물', () => {
+  it.each([
+    'packages/web-ui/.omc/sessions/d27428d0.json',
+    'packages/web-ui/server/.omc/state/agent-replay.jsonl',
+    'apps/api/node_modules/.cache/x',
+  ])('ignores %s wherever the tool put it', (path) => {
+    expect(hasUnsavedWorktreeChanges(`?? ${path}\n`)).toBe(false);
+  });
+
+  // 이름이 비슷하다고 무시하면 저장소 내용을 잃는다 — 경로 세그먼트가 정확히 같아야 한다.
+  it.each([
+    'src/.omcx/file.ts',
+    'packages/web-ui/omc/config.ts',
+    'src/node_modules_shim.ts',
+  ])('still protects %s', (path) => {
+    expect(hasUnsavedWorktreeChanges(`?? ${path}\n`)).toBe(true);
+  });
+
+  // memory/ 는 저장소 디렉터리 이름으로도 흔하다 — 루트에서만 무시한다.
+  it('keeps memory/ root-only because src/memory is a normal source directory', () => {
+    expect(hasUnsavedWorktreeChanges('?? memory/notes.md\n')).toBe(false);
+    expect(hasUnsavedWorktreeChanges('?? src/memory/index.ts\n')).toBe(true);
+  });
+});
+
