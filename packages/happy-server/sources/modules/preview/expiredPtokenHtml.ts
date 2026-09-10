@@ -16,7 +16,8 @@
  *      conventions, see packages/web-ui/src/lib/store/index.ts:480,491).
  *   3. POST /api/preview-mint-remote (relative URL — routes through whatever
  *      origin served this HTML, which when delivered via the vite proxy is
- *      the web-ui where the mint endpoint lives).
+ *      the web-ui where the mint endpoint lives), carrying `previousToken`
+ *      so the studio's trusted mint can keep a bound session bound.
  *   4. On success, replace ptoken in current URL and reload.
  *   5. On failure or no aplus-token, show a manual recovery message.
  *
@@ -34,6 +35,15 @@ export interface ExpiredPtokenHtmlParams {
      *                            elapsed or signature mismatch).
      */
     reason: 'missing' | 'expired-or-invalid';
+    /**
+     * specs/runtime-isolation-hardening (H3, P4) — the ptoken this page is
+     * replacing, forwarded verbatim to the mint. It is what tells the mint
+     * that the session being recovered was *bound*; without it a restart
+     * would come back with an unbound token whenever the policy is off, and
+     * quietly lose the ACL and runtime checks the session already had. Absent
+     * when the request arrived with no token at all.
+     */
+    previousToken?: string;
 }
 
 /**
@@ -86,6 +96,7 @@ export function renderExpiredPtokenHtml(params: ExpiredPtokenHtmlParams): string
             : '토큰 유효 기간이 지났습니다. 자동으로 새 토큰을 발급하는 중입니다…';
 
     const machineIdLiteral = jsString(params.machineId);
+    const previousTokenLiteral = params.previousToken ? jsString(params.previousToken) : null;
     const portLiteral = String(Number.isInteger(params.port) ? params.port : 0);
 
     // Inline script — no external deps. Uses sessionStorage to gate against
@@ -149,7 +160,8 @@ export function renderExpiredPtokenHtml(params: ExpiredPtokenHtmlParams): string
     body: JSON.stringify({
       machineId: ${machineIdLiteral},
       port: ${portLiteral},
-      activeCompanyId: activeCompanyId
+      activeCompanyId: activeCompanyId${previousTokenLiteral ? `,
+      previousToken: ${previousTokenLiteral}` : ''}
     })
   }).then(function (res) {
     return res.json().then(function (data) { return { status: res.status, data: data }; });

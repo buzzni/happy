@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+    planTrustedMint,
     resolvePreviewBindingPolicy,
     decideMintBinding,
     decideRelayBinding,
@@ -175,5 +176,109 @@ describe('isBindingEnforcementEchoed', () => {
         expect(isBindingEnforcementEchoed({})).toBe(false);
         expect(isBindingEnforcementEchoed({ bindingEnforced: 'true' })).toBe(false);
         expect(isBindingEnforcementEchoed(undefined)).toBe(false);
+    });
+});
+
+describe('planTrustedMint', () => {
+    // The trusted mint is the only path that can bind, so every "should this
+    // be bound" question lands here: the policy, the operator's explicit
+    // legacy exception, and a recovery that must not be downgraded.
+    const policy = (mode: 'off' | 'required', legacy: string[] = []) => ({
+        mode,
+        legacyMachineIds: new Set(legacy),
+    });
+    const base = {
+        machineId: 'machine-1',
+        port: 3000,
+        projectId: 'proj-1',
+        studioUserId: 'studio-1',
+    };
+    const boundPrevious = {
+        kind: 'token' as const,
+        claims: {
+            machineId: 'machine-1',
+            port: 3000,
+            bind: { projectId: 'proj-1', studioUserId: 'studio-1', leaseId: 'lease-1' },
+        },
+    };
+
+    it('binds when the studio asks and the policy is off', () => {
+        expect(planTrustedMint({ ...base, policy: policy('off'), previous: { kind: 'absent' } }))
+            .toMatchObject({ kind: 'bind' });
+    });
+
+    it('mints unbound on an explicitly excepted machine before attempting to bind', () => {
+        // The studio always sends the binding fields, so without this the
+        // operator's own documented exception could never be honoured — the
+        // machine would fail at the lease instead. The exception is explicit
+        // and per machine; nothing is inferred.
+        expect(planTrustedMint({ ...base, policy: policy('required', ['machine-1']), previous: { kind: 'absent' } }))
+            .toEqual({ kind: 'unbound', reason: 'legacy-machine' });
+    });
+
+    it('refuses an unbound mint under the required policy', () => {
+        expect(planTrustedMint({
+            ...base,
+            projectId: undefined,
+            studioUserId: undefined,
+            policy: policy('required'),
+            previous: { kind: 'absent' },
+        })).toMatchObject({ kind: 'reject', code: 'BINDING_REQUIRED' });
+    });
+
+    it('keeps a bound recovery bound even with the policy off', () => {
+        // The token being recovered was bound. Re-minting it unbound would
+        // quietly drop the ACL and runtime checks from a session that already
+        // had them, which is exactly what a dev-server restart must not do.
+        expect(planTrustedMint({ ...base, policy: policy('off'), previous: boundPrevious }))
+            .toEqual({ kind: 'bind', forced: true });
+    });
+
+    it('keeps a bound recovery bound even on an excepted machine', () => {
+        expect(planTrustedMint({
+            ...base,
+            policy: policy('off', ['machine-1']),
+            previous: boundPrevious,
+        })).toEqual({ kind: 'bind', forced: true });
+    });
+
+    it('refuses a previous token that does not verify', () => {
+        // Ignoring it would be the downgrade path: anyone able to reach the
+        // trusted endpoint could drop the field and get an unbound token.
+        expect(planTrustedMint({ ...base, policy: policy('off'), previous: { kind: 'invalid' } }))
+            .toMatchObject({ kind: 'reject', status: 400, code: 'INVALID_PREVIOUS_TOKEN' });
+    });
+
+    it('refuses a previous token minted for another machine or port', () => {
+        for (const claims of [
+            { machineId: 'machine-2', port: 3000, bind: boundPrevious.claims.bind },
+            { machineId: 'machine-1', port: 4000, bind: boundPrevious.claims.bind },
+        ]) {
+            expect(planTrustedMint({ ...base, policy: policy('off'), previous: { kind: 'token', claims } }))
+                .toMatchObject({ kind: 'reject', status: 400, code: 'PREVIOUS_TOKEN_MISMATCH' });
+        }
+    });
+
+    it('refuses a bound recovery whose project or studio user does not match', () => {
+        for (const override of [{ projectId: 'proj-2' }, { studioUserId: 'studio-2' }]) {
+            expect(planTrustedMint({ ...base, ...override, policy: policy('off'), previous: boundPrevious }))
+                .toMatchObject({ kind: 'reject', status: 403, code: 'PREVIOUS_TOKEN_MISMATCH' });
+        }
+    });
+
+    it('refuses a bound recovery that arrives without the studio identity', () => {
+        expect(planTrustedMint({
+            ...base,
+            projectId: undefined,
+            studioUserId: undefined,
+            policy: policy('off'),
+            previous: boundPrevious,
+        })).toMatchObject({ kind: 'reject', status: 403, code: 'PREVIOUS_TOKEN_MISMATCH' });
+    });
+
+    it('treats recovery of an unbound token as an ordinary mint', () => {
+        const previous = { kind: 'token' as const, claims: { machineId: 'machine-1', port: 3000 } };
+        expect(planTrustedMint({ ...base, policy: policy('off', ['machine-1']), previous }))
+            .toEqual({ kind: 'unbound', reason: 'legacy-machine' });
     });
 });

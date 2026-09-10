@@ -23,12 +23,18 @@ import { db } from "@/storage/db";
 import { log } from "@/utils/log";
 import { eventRouter } from "@/app/events/eventRouter";
 import { findMachineSockets as findMachineSocketsCrossReplica } from "@/app/events/findMachineSockets";
-import { signPreviewToken, verifyPreviewToken, type PreviewTokenBinding } from "@/modules/preview/previewToken";
+import {
+    signPreviewToken,
+    verifyPreviewToken,
+    verifyExpiredPreviewTokenForRecovery,
+    type PreviewTokenBinding,
+} from "@/modules/preview/previewToken";
 import {
     type LeaseFailureStatus,
     resolvePreviewBindingPolicy,
-    decideMintBinding,
+    planTrustedMint,
     decideBearerMint,
+    type PreviousTokenCheck,
     decideRelayBinding,
     interpretLeaseAck,
     describeLeaseFailure,
@@ -160,6 +166,13 @@ export function matchesTrustedSecret(provided: unknown, expected: string | undef
     // the same as equal ones.
     const digest = (value: Buffer) => crypto.createHash('sha256').update(value).digest();
     return crypto.timingSafeEqual(digest(a), digest(b));
+}
+
+/** Decode the replaced token for planTrustedMint — signature required, expiry not. */
+function readPreviousToken(previousToken: string | undefined): PreviousTokenCheck {
+    if (!previousToken) return { kind: 'absent' };
+    const claims = verifyExpiredPreviewTokenForRecovery(previousToken);
+    return claims ? { kind: 'token', claims } : { kind: 'invalid' };
 }
 
 /** Mint-time lease acquisition is short: an old daemon simply never answers. */
@@ -604,6 +617,19 @@ async function bindMintedToken(input: {
     };
 }
 
+/**
+ * specs/runtime-isolation-hardening (H3, P4) — the token this mint replaces.
+ *
+ * Sent by the re-mint page and forwarded verbatim by the studio. It is not a
+ * credential: the studio's own trusted secret authenticates the call, and the
+ * caller's authenticated project/user are checked against it. What it carries
+ * is the fact that the session being recovered *was bound*, which is the one
+ * thing a plain re-mint has no way to know.
+ */
+const previousTokenBody = {
+    previousToken: z.string().min(1).optional(),
+};
+
 const mintBindingBody = {
     /** Studio project this token is for. Required once the policy is `required`. */
     projectId: z.string().min(1).optional(),
@@ -689,6 +715,7 @@ export function previewRoutes(app: Fastify) {
                 machineId: z.string().min(1),
                 port: z.number().int().min(1).max(65535),
                 ...mintBindingBody,
+                ...previousTokenBody,
             }),
             response: {
                 200: z.object({
@@ -711,25 +738,32 @@ export function previewRoutes(app: Fastify) {
         if (!matchesTrustedSecret(provided, expected)) {
             return reply.code(401).send({ error: 'Invalid trusted secret' });
         }
-        const { machineId, port, projectId, studioUserId } = request.body;
+        const { machineId, port, projectId, studioUserId, previousToken } = request.body;
         const machine = await db.machine.findFirst({ where: { id: machineId } });
         if (!machine) {
             return reply.code(404).send({ error: 'Machine not found' });
         }
 
-        const policy = resolvePreviewBindingPolicy(process.env);
-        const mintDecision = decideMintBinding(policy, machineId);
-        if (!projectId || !studioUserId) {
-            if (mintDecision.kind === 'bind-required') {
-                return reply.code(400).send({
-                    error: 'projectId and studioUserId are required for preview tokens on this machine',
-                    code: 'BINDING_REQUIRED',
-                });
-            }
+        const plan = planTrustedMint({
+            policy: resolvePreviewBindingPolicy(process.env),
+            machineId,
+            port,
+            projectId,
+            studioUserId,
+            previous: readPreviousToken(previousToken),
+        });
+        if (plan.kind === 'reject') {
+            log(
+                { module: 'preview', level: 'warn' },
+                `preview mint refused reason=${plan.code} machine=${machineId} port=${port}`,
+            );
+            return reply.code(plan.status).send({ error: plan.message, code: plan.code });
+        }
+        if (plan.kind === 'unbound') {
             const signed = signPreviewToken({ userId: machine.accountId, machineId, port });
             log(
                 { module: 'preview', trusted: true, userId: machine.accountId, machineId, port },
-                'Minted preview token (trusted, unbound)',
+                `Minted preview token (trusted, unbound: ${plan.reason})`,
             );
             return reply.send({ token: signed.token, expiresAt: signed.expiresAt, binding: 'unbound' });
         }
@@ -737,8 +771,8 @@ export function previewRoutes(app: Fastify) {
         const bound = await bindMintedToken({
             machineId,
             port,
-            projectId,
-            studioUserId,
+            projectId: projectId!,
+            studioUserId: studioUserId!,
             ownerUserId: machine.accountId,
         });
         if (bound.kind === 'reject') {
@@ -746,7 +780,7 @@ export function previewRoutes(app: Fastify) {
         }
         const signed = signPreviewToken({ userId: machine.accountId, machineId, port, bind: bound.bind });
         log(
-            { module: 'preview', trusted: true, userId: machine.accountId, machineId, port, projectId },
+            { module: 'preview', trusted: true, userId: machine.accountId, machineId, port, projectId, recovered: plan.forced },
             'Minted preview token (trusted, bound)',
         );
         return reply.send({ token: signed.token, expiresAt: signed.expiresAt, binding: 'lease' });
@@ -834,6 +868,9 @@ export function previewRoutes(app: Fastify) {
                                 machineId: params.machineId,
                                 port: portNum,
                                 reason: 'expired-or-invalid',
+                                // Carries what the replaced session was bound
+                                // to, so the re-mint cannot come back weaker.
+                                previousToken: token,
                             }));
                     }
                     return reply.code(401).send({ error: 'Invalid or expired ptoken' });
@@ -865,6 +902,9 @@ export function previewRoutes(app: Fastify) {
                                 machineId: params.machineId,
                                 port: portNum,
                                 reason: 'expired-or-invalid',
+                                // Carries what the replaced session was bound
+                                // to, so the re-mint cannot come back weaker.
+                                previousToken: token,
                             }));
                     }
                     return reply
@@ -994,6 +1034,9 @@ export function previewRoutes(app: Fastify) {
                                 machineId: params.machineId,
                                 port: portNum,
                                 reason: 'expired-or-invalid',
+                                // Carries what the replaced session was bound
+                                // to, so the re-mint cannot come back weaker.
+                                previousToken: token,
                             }));
                     }
                     return reply.code(failure.status).send({ code: rpcResponse.code, error: rpcResponse.message });

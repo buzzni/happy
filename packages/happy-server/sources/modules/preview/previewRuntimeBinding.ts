@@ -55,6 +55,97 @@ export function decideMintBinding(policy: PreviewBindingPolicy, machineId: strin
     return { kind: 'bind-required' };
 }
 
+/**
+ * specs/runtime-isolation-hardening (H3, P4) — what the caller says about the
+ * token being replaced.
+ *
+ * `invalid` is never folded into `absent`. Ignoring an unreadable previous
+ * token would be the downgrade path itself: drop the field, get a weaker
+ * token.
+ */
+export type PreviousTokenCheck =
+    | { kind: 'absent' }
+    | { kind: 'invalid' }
+    | { kind: 'token'; claims: { machineId: string; port: number; bind?: PreviewTokenBinding } };
+
+export type TrustedMintPlan =
+    | { kind: 'bind'; forced: boolean }
+    | { kind: 'unbound'; reason: 'legacy-machine' | 'policy-off' }
+    | { kind: 'reject'; status: 400 | 403; code: string; message: string };
+
+/**
+ * The one place that decides whether a trusted (studio) mint binds.
+ *
+ * Order matters and is the whole point:
+ *
+ * 1. **A bound recovery stays bound.** The token being replaced already had
+ *    ACL and runtime checks; re-minting it unbound because a dev server
+ *    restarted would silently drop them. This outranks both the policy and
+ *    the operator's legacy exception.
+ * 2. **An explicit legacy machine mints unbound *before* any binding is
+ *    attempted.** The studio always sends the binding fields, so without this
+ *    the operator's own per-machine exception could never be honoured — the
+ *    machine would fail at the lease instead. Explicit ids only; nothing is
+ *    inferred from a port or a name.
+ * 3. Otherwise the policy decides.
+ */
+export function planTrustedMint(input: {
+    policy: PreviewBindingPolicy;
+    machineId: string;
+    port: number;
+    projectId?: string;
+    studioUserId?: string;
+    previous: PreviousTokenCheck;
+}): TrustedMintPlan {
+    const { previous } = input;
+    if (previous.kind === 'invalid') {
+        return {
+            kind: 'reject',
+            status: 400,
+            code: 'INVALID_PREVIOUS_TOKEN',
+            message: '재발급 요청의 이전 토큰을 확인할 수 없습니다.',
+        };
+    }
+    if (previous.kind === 'token') {
+        if (previous.claims.machineId !== input.machineId || previous.claims.port !== input.port) {
+            return {
+                kind: 'reject',
+                status: 400,
+                code: 'PREVIOUS_TOKEN_MISMATCH',
+                message: '이전 토큰이 이 머신/포트의 것이 아닙니다.',
+            };
+        }
+        const bind = previous.claims.bind;
+        if (bind) {
+            if (bind.projectId !== input.projectId || bind.studioUserId !== input.studioUserId) {
+                return {
+                    kind: 'reject',
+                    status: 403,
+                    code: 'PREVIOUS_TOKEN_MISMATCH',
+                    message: '이전 토큰의 프로젝트/사용자와 일치하지 않습니다.',
+                };
+            }
+            return { kind: 'bind', forced: true };
+        }
+    }
+
+    if (input.policy.legacyMachineIds.has(input.machineId)) {
+        return { kind: 'unbound', reason: 'legacy-machine' };
+    }
+    if (input.projectId && input.studioUserId) {
+        return { kind: 'bind', forced: false };
+    }
+    if (input.policy.mode === 'required') {
+        return {
+            kind: 'reject',
+            status: 400,
+            code: 'BINDING_REQUIRED',
+            message: 'projectId and studioUserId are required for preview tokens on this machine',
+        };
+    }
+    return { kind: 'unbound', reason: 'policy-off' };
+}
+
 export const BEARER_BINDING_UNSUPPORTED_CODE = 'BEARER_BINDING_UNSUPPORTED';
 
 export type BearerMintDecision =

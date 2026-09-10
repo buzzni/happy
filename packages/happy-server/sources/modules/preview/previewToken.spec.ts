@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import crypto from 'node:crypto';
-import { signPreviewToken, verifyPreviewToken } from '@/modules/preview/previewToken';
+import { signPreviewToken, verifyPreviewToken, verifyExpiredPreviewTokenForRecovery } from '@/modules/preview/previewToken';
 
 const SECRET = 'test-secret-0123456789abcdef';
 
@@ -175,5 +175,31 @@ describe('previewToken runtime binding claims (specs/runtime-isolation-hardening
             { secret: SECRET },
         );
         expect(bound.token).not.toBe(unbound.token);
+    });
+});
+
+describe('verifyExpiredPreviewTokenForRecovery', () => {
+    // Re-minting after a dev-server restart has to know what the *previous*
+    // token was bound to, and by then that token is usually expired. This is
+    // the only place an expired token is readable, and it never authorizes a
+    // request — it only describes the one being replaced.
+    it('reads an expired token that is otherwise properly signed', () => {
+        const signed = signPreviewToken(
+            { userId: 'u', machineId: 'm', port: 3000, bind: { projectId: 'p', studioUserId: 's', leaseId: 'l' } },
+            { secret: SECRET, ttlMs: -1000 },
+        );
+        expect(verifyPreviewToken(signed.token, { secret: SECRET })).toBeNull();
+        expect(verifyExpiredPreviewTokenForRecovery(signed.token, { secret: SECRET })).toMatchObject({
+            machineId: 'm',
+            port: 3000,
+            bind: { projectId: 'p', studioUserId: 's', leaseId: 'l' },
+        });
+    });
+
+    it('still refuses a forged or tampered token', () => {
+        const signed = signPreviewToken({ userId: 'u', machineId: 'm', port: 3000 }, { secret: SECRET });
+        expect(verifyExpiredPreviewTokenForRecovery(signed.token, { secret: 'other-secret' })).toBeNull();
+        expect(verifyExpiredPreviewTokenForRecovery(`${signed.token}x`, { secret: SECRET })).toBeNull();
+        expect(verifyExpiredPreviewTokenForRecovery('not-a-token', { secret: SECRET })).toBeNull();
     });
 });

@@ -17,6 +17,7 @@ import {
     describePreviewRelayFailure,
 } from '@/app/api/routes/previewRoutes';
 import { signPreviewToken, verifyPreviewToken } from '@/modules/preview/previewToken';
+import { renderExpiredPtokenHtml } from '@/modules/preview/expiredPtokenHtml';
 import { LEASE_UNSUPPORTED_CODE } from '@/modules/preview/previewRuntimeBinding';
 import { type Fastify as FastifyType } from '../types';
 
@@ -242,6 +243,19 @@ function mintBody(extra: Record<string, unknown> = {}) {
     return { machineId: MID, port: PORT, projectId: PROJECT, studioUserId: STUDIO_USER, ...extra };
 }
 
+/** A bound token that has already expired — what a re-mint actually carries. */
+function expiredBoundToken() {
+    return signPreviewToken(
+        {
+            userId: USER_ID,
+            machineId: MID,
+            port: PORT,
+            bind: { projectId: PROJECT, studioUserId: STUDIO_USER, leaseId: 'lease-1' },
+        },
+        { ttlMs: -1_000 },
+    ).token;
+}
+
 function boundToken(bind = { projectId: PROJECT, studioUserId: STUDIO_USER, leaseId: 'lease-1' }) {
     return signPreviewToken({ userId: USER_ID, machineId: MID, port: PORT, bind }).token;
 }
@@ -444,6 +458,95 @@ describe('preview mint route — runtime binding', () => {
         await app.close();
     });
 
+    it('keeps a restarted session bound when recovering an expired bound token', async () => {
+        // The policy is off, so an ordinary mint here would be unbound. The
+        // token being replaced was bound, and a dev-server restart must not
+        // be a way to come back with weaker access than the session already
+        // had.
+        stubAuthorizeCallback({ allowed: true, workspacePaths: ['/srv/proj-1'] });
+        setMachineSockets([daemonSocket({ lease: { type: 'success', leaseId: 'lease-2', evidenceKind: 'container' } })]);
+        const app = await buildApp();
+
+        const res = await trustedMint(app, mintBody({ previousToken: expiredBoundToken() }));
+
+        expect(res.statusCode).toBe(200);
+        expect(res.json().binding).toBe('lease');
+        expect(verifyPreviewToken(res.json().token)?.bind).toMatchObject({ leaseId: 'lease-2' });
+        await app.close();
+    });
+
+    it('does not downgrade a bound recovery on an explicitly excepted machine', async () => {
+        process.env.PREVIEW_BINDING_LEGACY_MACHINE_IDS = MID;
+        stubAuthorizeCallback({ allowed: true, workspacePaths: ['/srv/proj-1'] });
+        setMachineSockets([daemonSocket()]);
+        const app = await buildApp();
+
+        const res = await trustedMint(app, mintBody({ previousToken: expiredBoundToken() }));
+
+        expect(res.statusCode).toBe(200);
+        expect(res.json().binding).toBe('lease');
+        await app.close();
+    });
+
+    it('refuses a recovery whose previous token does not verify', async () => {
+        const app = await buildApp();
+
+        const res = await trustedMint(app, mintBody({ previousToken: 'not.a-real-token' }));
+
+        expect(res.statusCode).toBe(400);
+        expect(res.json().code).toBe('INVALID_PREVIOUS_TOKEN');
+        await app.close();
+    });
+
+    it('refuses a recovery pointing at another port', async () => {
+        const app = await buildApp();
+        const other = signPreviewToken({
+            userId: USER_ID,
+            machineId: MID,
+            port: PORT + 1,
+            bind: { projectId: PROJECT, studioUserId: STUDIO_USER, leaseId: 'lease-1' },
+        }).token;
+
+        const res = await trustedMint(app, mintBody({ previousToken: other }));
+
+        expect(res.statusCode).toBe(400);
+        expect(res.json().code).toBe('PREVIOUS_TOKEN_MISMATCH');
+        await app.close();
+    });
+
+    it('refuses a recovery whose previous binding names another project', async () => {
+        const app = await buildApp();
+        const other = signPreviewToken({
+            userId: USER_ID,
+            machineId: MID,
+            port: PORT,
+            bind: { projectId: 'proj-2', studioUserId: STUDIO_USER, leaseId: 'lease-1' },
+        }).token;
+
+        const res = await trustedMint(app, mintBody({ previousToken: other }));
+
+        expect(res.statusCode).toBe(403);
+        expect(res.json().code).toBe('PREVIOUS_TOKEN_MISMATCH');
+        await app.close();
+    });
+
+    it('mints unbound on an excepted machine even though the studio sent binding fields', async () => {
+        // The studio always sends them, so honouring the operator's explicit
+        // per-machine exception has to happen before the lease is attempted.
+        process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
+        process.env.PREVIEW_BINDING_LEGACY_MACHINE_IDS = MID;
+        const daemon = daemonSocket();
+        setMachineSockets([daemon]);
+        const app = await buildApp();
+
+        const res = await trustedMint(app, mintBody());
+
+        expect(res.statusCode).toBe(200);
+        expect(res.json().binding).toBe('unbound');
+        expect(daemon.emitWithAck).not.toHaveBeenCalled();
+        await app.close();
+    });
+
     it('rejects a trusted mint whose secret is wrong without leaking it', async () => {
         const app = await buildApp();
         process.env.WEB_UI_TRUSTED_PREVIEW_SECRET = TRUSTED_SECRET;
@@ -609,6 +712,27 @@ describe('preview relay route — runtime binding', () => {
         await app.close();
     });
 
+    it('hands the re-mint page the very token it is replacing', async () => {
+        // End of the P4 chain: the relay puts the bound token into the page,
+        // the page posts it back, and the trusted mint uses it to stay bound.
+        stubAuthorizeCallback({ allowed: true, workspacePaths: [] });
+        setMachineSockets([daemonSocket({
+            proxy: { type: 'error', code: 'LEASE_MISMATCH', message: 'runtime changed' },
+        })]);
+        const app = await buildApp();
+        const token = boundToken();
+
+        const res = await app.inject({
+            method: 'GET',
+            url: relayUrl(token),
+            headers: { accept: 'text/html', 'sec-fetch-dest': 'document' },
+        });
+
+        expect(res.statusCode).toBe(401);
+        expect(res.body).toContain(JSON.stringify(token));
+        await app.close();
+    });
+
     it('offers a re-mint page when the runtime restarted under a valid token', async () => {
         // A restart legitimately changes the lease. Answering 403 here would
         // strand a user who still has full access on a page that can never
@@ -627,6 +751,20 @@ describe('preview relay route — runtime binding', () => {
 
         expect(res.statusCode).toBe(401);
         expect(res.headers['content-type']).toContain('text/html');
+        await app.close();
+    });
+
+    it('never accepts an expired token, however recoverable it would be at mint', async () => {
+        // The recovery reader exists only for the mint path. If the relay
+        // could read an expired token, every bound session would outlive its
+        // own expiry.
+        stubAuthorizeCallback({ allowed: true, workspacePaths: [] });
+        setMachineSockets([daemonSocket()]);
+        const app = await buildApp();
+
+        const res = await app.inject({ method: 'GET', url: relayUrl(expiredBoundToken()) });
+
+        expect(res.statusCode).toBe(401);
         await app.close();
     });
 

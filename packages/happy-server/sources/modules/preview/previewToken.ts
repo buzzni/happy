@@ -145,6 +145,32 @@ export function verifyPreviewToken(
     token: string,
     options: PreviewTokenOptions = {},
 ): VerifiedPreviewToken | null {
+    return readPreviewToken(token, options, { allowExpired: false });
+}
+
+/**
+ * specs/runtime-isolation-hardening (H3, P4) — read the token a re-mint is
+ * replacing, expiry included.
+ *
+ * Recovery needs to know what the previous token was bound to, and by the
+ * time the page re-mints that token is usually expired. This is deliberately
+ * a separate function rather than a flag on `verifyPreviewToken`: nothing on
+ * a request path can reach it by passing an option, and the signature is
+ * still required, so an expired token describes the session being replaced
+ * without ever authorizing anything.
+ */
+export function verifyExpiredPreviewTokenForRecovery(
+    token: string,
+    options: PreviewTokenOptions = {},
+): VerifiedPreviewToken | null {
+    return readPreviewToken(token, options, { allowExpired: true });
+}
+
+function readPreviewToken(
+    token: string,
+    options: PreviewTokenOptions,
+    mode: { allowExpired: boolean },
+): VerifiedPreviewToken | null {
     const secret = getSecret(options.secret);
 
     if (typeof token !== 'string' || !token.includes('.')) {
@@ -170,7 +196,7 @@ export function verifyPreviewToken(
     if (!payload) {
         return null;
     }
-    if (payload.exp <= Date.now()) {
+    if (!mode.allowExpired && payload.exp <= Date.now()) {
         return null;
     }
 

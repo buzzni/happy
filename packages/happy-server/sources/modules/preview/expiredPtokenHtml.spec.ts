@@ -110,8 +110,35 @@ describe('renderExpiredPtokenHtml', () => {
             URL,
             fakeDate,
         );
-        return { status: () => statusEl.textContent, attempted: () => minted.length > 0 };
+        return {
+            status: () => statusEl.textContent,
+            attempted: () => minted.length > 0,
+            mintBody: () => minted[0] as Record<string, unknown>,
+        };
     }
+
+    it('sends the token it is replacing so the re-mint can stay bound', () => {
+        // Without this the re-mint has no way to know the session it is
+        // recovering was bound, and would come back unbound whenever the
+        // policy is off — losing the ACL and runtime checks it already had.
+        const env = { storage: new Map<string, string>(), now: 1_000_000 };
+        const run = runMintScript(
+            renderExpiredPtokenHtml({ ...baseParams, previousToken: 'prev.token-value' }),
+            env,
+        );
+        expect(run.mintBody()).toMatchObject({ previousToken: 'prev.token-value' });
+    });
+
+    it('omits the field entirely when there was no previous token', () => {
+        const env = { storage: new Map<string, string>(), now: 1_000_000 };
+        const run = runMintScript(renderExpiredPtokenHtml(baseParams), env);
+        expect(run.mintBody()).not.toHaveProperty('previousToken');
+    });
+
+    it('escapes the previous token so it cannot break out of the script', () => {
+        const html = renderExpiredPtokenHtml({ ...baseParams, previousToken: '</script><script>alert(1)</script>' });
+        expect(html).not.toContain('</script><script>alert(1)</script>');
+    });
 
     it('recovers from a second dev-server restart in the same tab', () => {
         // A once-per-tab latch answers the second restart with a dead page
