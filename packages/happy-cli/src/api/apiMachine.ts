@@ -40,7 +40,13 @@ import {
     createRuntimeLeaseCanonicalizer,
     type RuntimeLeaseDeps,
 } from '@/daemon/previewRuntimeLease';
-import { createEvidenceIo, probeListenerEvidence } from '@/daemon/previewRuntimeEvidence';
+import {
+    createBoundedProbe,
+    createEvidenceIo,
+    probeListenerEvidence,
+    DEFAULT_PROBE_LIMITS,
+    type ProbeFn,
+} from '@/daemon/previewRuntimeEvidence';
 import { PreviewWsProxy } from '@/daemon/previewWsProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import packageJson from '../../package.json';
@@ -440,8 +446,14 @@ export class ApiMachineClient {
     private previewWsProxy: PreviewWsProxy | null = null;
     // specs/runtime-isolation-hardening (H3). Probed per request, with no
     // memoization: a cached answer is a window in which a port that changed
-    // hands keeps verifying against the runtime it no longer serves.
+    // hands keeps verifying against the runtime it no longer serves. Only the
+    // number of probes running at once is bounded — a module burst from one
+    // preview page must not turn into hundreds of simultaneous docker spawns.
     private previewEvidenceIo = createEvidenceIo();
+    private previewProbe: ProbeFn = createBoundedProbe(
+        (port: number) => probeListenerEvidence(port, this.previewEvidenceIo),
+        DEFAULT_PROBE_LIMITS,
+    );
     private previewPortRegistry: PortRegistry | null = null;
     private previewPathCanonicalizer = createRuntimeLeaseCanonicalizer();
     // Running noVNC stack for the remote browser screen, if started.
@@ -1312,7 +1324,7 @@ export class ApiMachineClient {
         const registry = this.previewPortRegistry;
         if (!registry) return null;
         return {
-            probeEvidence: (port: number) => probeListenerEvidence(port, this.previewEvidenceIo),
+            probeEvidence: (port: number) => this.previewProbe(port),
             readPortRegistry: () => registry.readAll(),
             canonicalize: (target: string) => this.previewPathCanonicalizer(target),
         };

@@ -154,6 +154,14 @@ describe('acquireRuntimeLease — runtime and registry', () => {
     expect(result).toMatchObject({ type: 'error', code: 'EVIDENCE_UNAVAILABLE' })
   })
 
+  it('reports a saturated probe as busy — retryable, and never a lease', async () => {
+    const d = deps({ probeEvidence: vi.fn(async (): Promise<EvidenceProbeResult> => ({ status: 'busy', detail: 'probe queue full' })) })
+    await expect(acquireRuntimeLease(request(), d)).resolves.toMatchObject({ type: 'error', code: 'EVIDENCE_BUSY' })
+    await expect(verifyRuntimeLease({ ...request(), leaseId: 'x' }, d)).resolves.toMatchObject({ ok: false, code: 'EVIDENCE_BUSY' })
+    await expect(enforceRelayBinding({ projectId: 'proj-a', leaseId: 'x' }, 3000, d))
+      .resolves.toMatchObject({ outcome: 'rejected', code: 'EVIDENCE_BUSY' })
+  })
+
   it('refuses when the port registry says the port belongs to another project', async () => {
     const result = await acquireRuntimeLease(
       request(),

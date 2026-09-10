@@ -78,6 +78,8 @@ export type EvidenceProbeResult =
   | { status: 'none' }
   | { status: 'ambiguous'; detail: string }
   | { status: 'unavailable'; detail: string }
+  /** Not looked at all: the probe gate refused (see `createBoundedProbe`). */
+  | { status: 'busy'; detail: string }
 
 export type ExecResult =
   | { status: 'ok'; stdout: string }
@@ -155,6 +157,91 @@ export function createEvidenceIo(): EvidenceIo {
       ))
     }),
   }
+}
+
+export type ProbeFn = (port: number) => Promise<EvidenceProbeResult>
+
+export interface ProbeLimits {
+  /** Probes allowed to run at once. Each one is one or two subprocess spawns. */
+  maxConcurrent: number
+  /** Requests allowed to wait for a slot; the next one is refused outright. */
+  maxQueued: number
+  /** Longest a request may wait for a slot before it is refused. */
+  maxWaitMs: number
+}
+
+/**
+ * Measured on this project's macOS dev host (OrbStack docker, 12 containers):
+ *
+ * - container path (`docker ps` + `docker inspect`): 73–120 ms sequential;
+ *   throughput saturates at 4 concurrent (~55 ms effective per probe) and
+ *   per-slot latency then grows linearly (417 ms at 8, 862 ms at 16).
+ * - native path (`docker ps` miss + `lsof -iTCP` + `ps` + `lsof -p`): ~280 ms
+ *   sequential, ~150 ms effective at any concurrency from 2 to 16.
+ * - unbounded, a 200-request Vite module burst spawned 400 docker CLIs at
+ *   once and took 3.9 s in one run and 13 s in another.
+ *
+ * Eight slots is past the saturation point on both paths, so it costs no
+ * throughput and keeps a burst from becoming hundreds of simultaneous
+ * spawns. The wait bound is set from that throughput: 256 queued requests at
+ * ~55–150 ms each drain in 14–38 s, and happy-server's relay RPC timeout is
+ * 35 s — a request that cannot be served inside that is refused explicitly
+ * rather than answered late. Note that this bounds *how many* probes run, not
+ * *how much* a burst costs: 200 relayed sub-resources are still 200 probes.
+ */
+export const DEFAULT_PROBE_LIMITS: ProbeLimits = { maxConcurrent: 8, maxQueued: 256, maxWaitMs: 20_000 }
+
+/**
+ * Bound how many probes run at once — nothing more.
+ *
+ * This is a concurrency limiter, not a cache and not single-flight: every
+ * request that gets a slot runs its own probe against the live system, so a
+ * request queued behind a slow one still sees the listener as it is when its
+ * own probe runs. Reusing an in-flight answer would hand the second request a
+ * view from before it arrived, and that is the revocation window the whole
+ * per-request design exists to close. When the bound cannot be honoured the
+ * request is refused explicitly (`busy`) rather than waited for without limit
+ * or answered from someone else's probe.
+ */
+export function createBoundedProbe(probe: ProbeFn, limits: ProbeLimits): ProbeFn {
+  let running = 0
+  const queue: Array<{ port: number; resolve: (r: EvidenceProbeResult) => void; reject: (e: unknown) => void; timer: NodeJS.Timeout }> = []
+
+  const run = (port: number, resolve: (r: EvidenceProbeResult) => void, reject: (e: unknown) => void) => {
+    running += 1
+    probe(port).then(resolve, reject).finally(() => {
+      running -= 1
+      const next = queue.shift()
+      if (next) {
+        clearTimeout(next.timer)
+        run(next.port, next.resolve, next.reject)
+      }
+    })
+  }
+
+  return (port) => new Promise<EvidenceProbeResult>((resolve, reject) => {
+    if (running < limits.maxConcurrent) {
+      run(port, resolve, reject)
+      return
+    }
+    if (queue.length >= limits.maxQueued) {
+      resolve({ status: 'busy', detail: `preview runtime probe queue is full (${queue.length} waiting, ${running} running)` })
+      return
+    }
+    const entry = {
+      port,
+      resolve,
+      reject,
+      timer: setTimeout(() => {
+        const index = queue.indexOf(entry)
+        if (index === -1) return
+        queue.splice(index, 1)
+        resolve({ status: 'busy', detail: `preview runtime probe waited longer than ${limits.maxWaitMs}ms for a slot` })
+      }, limits.maxWaitMs),
+    }
+    entry.timer.unref?.()
+    queue.push(entry)
+  })
 }
 
 export function fingerprintEvidence(evidence: ListenerEvidence): string {

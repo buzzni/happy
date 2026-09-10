@@ -43,6 +43,8 @@ export type RuntimeLeaseErrorCode =
   | 'INVALID_REQUEST'
   | 'NO_LISTENER'
   | 'EVIDENCE_UNAVAILABLE'
+  /** The probe gate refused to look right now (load bound); retryable. */
+  | 'EVIDENCE_BUSY'
   | 'PORT_PROJECT_MISMATCH'
   | 'PROJECT_OWNERSHIP_MISMATCH'
   | 'WORKSPACE_UNVERIFIED'
@@ -164,6 +166,9 @@ async function resolveOwnedRuntime(
   const probe = await deps.probeEvidence(request.port)
   if (probe.status === 'none') {
     return { code: 'NO_LISTENER', message: `Nothing is listening on 127.0.0.1:${request.port}` }
+  }
+  if (probe.status === 'busy') {
+    return { code: 'EVIDENCE_BUSY', message: probe.detail }
   }
   if (probe.status === 'ambiguous' || probe.status === 'unavailable') {
     return { code: 'EVIDENCE_UNAVAILABLE', message: probe.detail }

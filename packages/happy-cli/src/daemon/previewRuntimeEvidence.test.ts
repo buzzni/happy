@@ -2,7 +2,9 @@ import { describe, it, expect, vi } from 'vitest'
 import {
   probeListenerEvidence,
   fingerprintEvidence,
+  createBoundedProbe,
   type EvidenceIo,
+  type EvidenceProbeResult,
 } from './previewRuntimeEvidence'
 
 const DOCKER_LINE = (id: string, ports: string, name: string, projectLabel: string) =>
@@ -554,5 +556,108 @@ describe('fingerprintEvidence', () => {
     expect(fingerprintEvidence(container)).not.toBe(fingerprintEvidence(base))
     expect(fingerprintEvidence({ ...container, projectLabel: 'proj-b' }))
       .not.toBe(fingerprintEvidence(container))
+  })
+})
+
+describe('createBoundedProbe — bounded concurrency, no result reuse', () => {
+  const found = (id: string): EvidenceProbeResult => ({
+    status: 'found',
+    evidence: { kind: 'process', id, startedAt: '1', cwd: '/w' },
+  })
+
+  /** A probe whose completion the test controls, one deferred per call. */
+  function controlledProbe() {
+    const pending: Array<(r: EvidenceProbeResult) => void> = []
+    let inFlight = 0
+    let peak = 0
+    const probe = vi.fn((_port: number) => new Promise<EvidenceProbeResult>((resolve) => {
+      inFlight += 1
+      peak = Math.max(peak, inFlight)
+      pending.push((r) => {
+        inFlight -= 1
+        resolve(r)
+      })
+    }))
+    return { probe, pending, peak: () => peak, inFlight: () => inFlight }
+  }
+
+  it('lets a normal burst through, each request with its own probe run', async () => {
+    const { probe, pending, peak } = controlledProbe()
+    const bounded = createBoundedProbe(probe, { maxConcurrent: 2, maxQueued: 10, maxWaitMs: 1_000 })
+    const requests = [bounded(3000), bounded(3000), bounded(3000), bounded(3000)]
+    await Promise.resolve()
+    expect(probe).toHaveBeenCalledTimes(2)
+    pending.shift()!(found('a'))
+    pending.shift()!(found('b'))
+    await Promise.resolve(); await Promise.resolve()
+    expect(probe).toHaveBeenCalledTimes(4)
+    pending.shift()!(found('c'))
+    pending.shift()!(found('d'))
+    const results = await Promise.all(requests)
+    expect(results.map((r) => r.status === 'found' && r.evidence.id)).toEqual(['a', 'b', 'c', 'd'])
+    expect(peak()).toBe(2)
+  })
+
+  it('never hands a later request an earlier probe\'s answer', async () => {
+    // The listener changes while the first probe is still running. The
+    // second request was queued before the change; it must still see the
+    // state at *its* execution, not inherit the first answer.
+    let current = 'old-runtime'
+    const probe = vi.fn(async (_port: number) => found(current))
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    const slowFirst = vi.fn(async (port: number) => { await gate; return probe(port) })
+    const bounded = createBoundedProbe(slowFirst, { maxConcurrent: 1, maxQueued: 10, maxWaitMs: 1_000 })
+    const first = bounded(3000)
+    const second = bounded(3000)
+    current = 'new-runtime'
+    release()
+    expect((await first).status === 'found' && (await first as any).evidence.id).toBe('new-runtime')
+    expect((await second).status === 'found' && (await second as any).evidence.id).toBe('new-runtime')
+    expect(slowFirst).toHaveBeenCalledTimes(2)
+  })
+
+  it('refuses with busy, immediately, once the queue is full', async () => {
+    const { probe, pending } = controlledProbe()
+    const bounded = createBoundedProbe(probe, { maxConcurrent: 1, maxQueued: 1, maxWaitMs: 1_000 })
+    const running = bounded(3000)
+    const queued = bounded(3000)
+    await expect(bounded(3000)).resolves.toMatchObject({ status: 'busy' })
+    expect(probe).toHaveBeenCalledTimes(1)
+    pending.shift()!(found('a'))
+    await running
+    await Promise.resolve()
+    pending.shift()!(found('b'))
+    await expect(queued).resolves.toMatchObject({ status: 'found' })
+  })
+
+  it('refuses with busy when a queued request has waited past the deadline', async () => {
+    vi.useFakeTimers()
+    try {
+      const { probe, pending } = controlledProbe()
+      const bounded = createBoundedProbe(probe, { maxConcurrent: 1, maxQueued: 10, maxWaitMs: 500 })
+      const running = bounded(3000)
+      const queued = bounded(3000)
+      await vi.advanceTimersByTimeAsync(600)
+      await expect(queued).resolves.toMatchObject({ status: 'busy' })
+      // The slow one is still allowed to finish normally.
+      pending.shift()!(found('a'))
+      await expect(running).resolves.toMatchObject({ status: 'found' })
+      expect(probe).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('frees the slot when a probe throws, so the next request still runs', async () => {
+    let calls = 0
+    const probe = vi.fn(async () => {
+      calls += 1
+      if (calls === 1) throw new Error('boom')
+      return found('ok')
+    })
+    const bounded = createBoundedProbe(probe, { maxConcurrent: 1, maxQueued: 10, maxWaitMs: 1_000 })
+    await expect(bounded(3000)).rejects.toThrow('boom')
+    await expect(bounded(3000)).resolves.toMatchObject({ status: 'found' })
   })
 })

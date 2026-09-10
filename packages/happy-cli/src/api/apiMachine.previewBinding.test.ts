@@ -54,6 +54,11 @@ async function newClient() {
     return new ApiMachineClient('token', machineClient()) as any
 }
 
+async function boundedProbeOver(probe: (port: number) => Promise<unknown>, limits: { maxConcurrent: number; maxQueued: number; maxWaitMs: number }) {
+    const { createBoundedProbe } = await import('@/daemon/previewRuntimeEvidence')
+    return createBoundedProbe(probe as any, limits)
+}
+
 describe('ApiMachineClient preview runtime binding gate', () => {
     beforeEach(() => {
         vi.clearAllMocks()
@@ -97,5 +102,30 @@ describe('ApiMachineClient preview runtime binding gate', () => {
             outcome: 'rejected',
             code: 'PORT_PROJECT_MISMATCH',
         })
+    })
+
+    it('refuses with EVIDENCE_BUSY instead of queueing without bound when probes pile up', async () => {
+        const client = await newClient()
+        client.setRPCHandlers(rpcHandlers({ readAll: vi.fn().mockResolvedValue({}) }))
+        let release!: (r: unknown) => void
+        const stuck = new Promise((r) => { release = r })
+        client.previewProbe = await boundedProbeOver(() => stuck, { maxConcurrent: 1, maxQueued: 0, maxWaitMs: 1_000 })
+        const first = client.enforcePreviewBinding(BINDING, 3000)
+        await expect(client.enforcePreviewBinding(BINDING, 3000)).resolves.toMatchObject({
+            outcome: 'rejected',
+            code: 'EVIDENCE_BUSY',
+        })
+        release({ status: 'none' })
+        await expect(first).resolves.toMatchObject({ outcome: 'rejected', code: 'NO_LISTENER' })
+    })
+
+    it('routes the mint-time lease through the same bounded probe as the relay gate', async () => {
+        const client = await newClient()
+        client.setRPCHandlers(rpcHandlers({ readAll: vi.fn().mockResolvedValue({}) }))
+        const probe = vi.fn(async () => ({ status: 'none' }))
+        client.previewProbe = await boundedProbeOver(probe, { maxConcurrent: 1, maxQueued: 0, maxWaitMs: 1_000 })
+        const deps = client.previewLeaseDeps()
+        await expect(deps.probeEvidence(3000)).resolves.toEqual({ status: 'none' })
+        expect(probe).toHaveBeenCalledWith(3000)
     })
 })
