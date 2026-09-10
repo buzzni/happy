@@ -33,6 +33,7 @@ import { inTx } from '@/storage/inTx';
 import { issueManagedDaemonGrant } from '@/app/managed/managedDaemonGrant';
 import {
     issueReadGrant,
+    resolveReadGrant,
     issueSessionGrant,
     revokeReadGrant,
     renewSessionGrant,
@@ -211,6 +212,15 @@ const readScopeSchema = z.object({
     sessionId: identifier,
     sessionOwnerAccountId: identifier,
     viewerAccountId: identifier,
+    /**
+     * The generation of the parent's access list this call belongs to.
+     *
+     * Required. Every read-grant write is compared against the highest
+     * generation this server has applied for the pair, so a message that
+     * arrives late — an old mint, an old revoke — is refused rather than
+     * silently undoing a newer decision.
+     */
+    aclRevision: z.number().int().min(0),
 }).strict();
 
 const readMintSchema = z.object({
@@ -230,6 +240,52 @@ const readMintSchema = z.object({
     purpose: z.enum(['transcript-read']).optional(),
 }).strict();
 
+/**
+ * Answering is bound to a run, so this body carries the full run scope.
+ *
+ * The difference from reading, stated in the shape: a transcript outlives its
+ * run and names none, while an approval is an act on the run that is asking —
+ * an answer for a superseded attempt would be answering a question nobody is
+ * still posing.
+ */
+const approvalMintSchema = z.object({
+    scope: scopeSchema,
+    grantId: identifier,
+    requestId: identifier,
+    expiresAt: z.number().int().min(1),
+    /** The Happy account that will answer. */
+    viewerAccountId: identifier,
+    /** The session key resealed for that account, base64. Required unless it owns the session. */
+    viewerDataEncryptionKey: z.string().min(1).optional(),
+}).strict();
+
+/**
+ * Withdrawing one approver's ability to answer.
+ *
+ * The viewer is part of the family, so it is named here: without it this would
+ * find the runner's row, and the answer to "revoke this approver" would be
+ * closing the run's own credential instead.
+ */
+const approvalRevokeSchema = z.object({
+    scope: scopeSchema,
+    reason: z.string().trim().min(1).max(200),
+    viewerAccountId: identifier,
+}).strict();
+
+/**
+ * Reading a token back for a grant that already exists.
+ *
+ * The recovery path, and deliberately not a mint: a fresh page load, a second
+ * tab, or a lost mint response must not rotate the grant the other holder is
+ * using. Nothing is written, and the answer is bounded by the expiry the caller
+ * signed for.
+ */
+const readResolveSchema = z.object({
+    scope: readScopeSchema,
+    requestedTokenExpiresAt: z.number().int().min(1),
+    purpose: z.enum(['transcript-read']).optional(),
+}).strict();
+
 const readRevokeSchema = z.object({
     scope: readScopeSchema,
     reason: z.string().trim().min(1).max(200),
@@ -245,6 +301,14 @@ const revokeSchema = z.object({
      * grant no longer silently closes the run's own credential instead.
      */
     purpose: z.enum(['runner', 'transcript-read', 'approval-control']).optional(),
+    /**
+     * The viewer the grant was resealed for, when the purpose has one.
+     *
+     * Part of the family, so omitting it on a non-runner purpose looks for a
+     * row that was never written. `/grants/approval/revoke` is the route that
+     * does not need the owner's bearer; this one keeps it.
+     */
+    viewerAccountId: identifier.optional(),
 }).strict();
 
 /**
@@ -257,6 +321,9 @@ const CONFLICT_REASONS = new Set([
     // Both are the caller's mistake about the family's current state, not a
     // refusal to let it act.
     'grant-id-reused', 'sequence-exhausted',
+    // The caller is behind the access list it is acting on: it should re-read
+    // its own state, which is a conflict rather than a denial.
+    'revision-stale',
 ]);
 
 function failureStatus(reason: string): number {
@@ -1018,6 +1085,158 @@ export function managedControlRoutes(
      * from a run, and a read grant has none — so without this a viewer removed
      * from a project kept a bearer nobody could take back.
      */
+    /**
+     * Issues a bearer for answering permission prompts on a live run.
+     *
+     * Separate from the read route because the authority is different: this one
+     * is compared against the **current** run authority, so a grant cannot be
+     * minted for an attempt that has been superseded. Separate from the runner
+     * route because what it authorises is one narrow act — the allowlist gives
+     * it the `permission` RPC and nothing else.
+     */
+    app.post('/v1/managed/control/grants/read/resolve', {
+        onRequest: [app.authenticate, requireConfigured],
+        schema: { body: readResolveSchema },
+    }, async (request, reply) => {
+        const runtime = authorize(request as never, reply as never, 'read-grant-resolve');
+        if (!runtime) return;
+        const scope = request.body.scope;
+        // Same rule as the mint route: the parent holds the viewer's token, and
+        // a caller may only recover a bearer for itself.
+        if (scope.viewerAccountId !== request.userId) {
+            return reply.code(403).send({ error: 'Bearer is not the viewer of this scope' });
+        }
+
+        const resolved = await resolveReadGrant({
+            scope,
+            requestedTokenExpiresAt: request.body.requestedTokenExpiresAt,
+            now: Date.now(),
+        });
+        if (!resolved.ok) {
+            return reply.code(failureStatus(resolved.reason)).send({ error: resolved.reason });
+        }
+        const { grant, tokenExpiresAt } = resolved.resolved;
+
+        // Against the clock now, not the one the read started with.
+        const issuedAt = Date.now();
+        if (tokenExpiresAt <= issuedAt) return reply.code(403).send({ error: 'expired' });
+        const minted = await runtime.scopedTokens.mint({
+            v: 1,
+            grantId: grant.grantId,
+            accountId: grant.accountId,
+            sessionId: grant.sessionId,
+            tenantId: scope.tenantId,
+            projectId: scope.projectId,
+            expiresAt: tokenExpiresAt,
+            purpose: grant.purpose,
+            ...(grant.viewerAccountId ? { viewerAccountId: grant.viewerAccountId } : {}),
+        }, issuedAt);
+        if (!minted.ok) return reply.code(500).send({ error: 'Grant token could not be minted' });
+
+        return reply.send({
+            token: minted.token,
+            grantId: grant.grantId,
+            /** The token's own expiry, which may be earlier than the grant's. */
+            expiresAt: tokenExpiresAt,
+            grantExpiresAt: grant.expiresAt,
+            purpose: grant.purpose,
+            viewerAccountId: grant.viewerAccountId ?? null,
+            serverUrl: runtime.publicUrl,
+        });
+    });
+
+    app.post('/v1/managed/control/grants/approval/mint', {
+        onRequest: [app.authenticate, requireConfigured],
+        schema: { body: approvalMintSchema },
+    }, async (request, reply) => {
+        const runtime = authorize(request as never, reply as never, 'approval-grant-mint');
+        if (!runtime) return;
+        const scope = request.body.scope as ManagedScope;
+        // The bearer is the approver, as on the read route: the parent holds
+        // that member's token, never the session owner's.
+        if (request.body.viewerAccountId !== request.userId) {
+            return reply.code(403).send({ error: 'Bearer is not the approver of this scope' });
+        }
+
+        const now = Date.now();
+        const issued = await issueSessionGrant({
+            scope,
+            grantId: request.body.grantId,
+            requestId: request.body.requestId,
+            expiresAt: request.body.expiresAt,
+            now,
+            purpose: 'approval-control',
+            viewerAccountId: request.body.viewerAccountId,
+            ...(request.body.viewerDataEncryptionKey
+                ? { viewerDataEncryptionKey: request.body.viewerDataEncryptionKey }
+                : {}),
+        });
+        if (!issued.ok) return reply.code(failureStatus(issued.reason)).send({ error: issued.reason });
+
+        const bound = issued.grant;
+        if (bound.workspaceId === null || bound.runId === null || bound.attemptId === null
+            || bound.epoch === null || bound.workspaceAuthorityVersion === null
+            || bound.runAuthorityVersion === null) {
+            // An approval grant without a run is not one: the run is what it
+            // answers for.
+            return reply.code(409).send({ error: 'grant-not-run-scoped' });
+        }
+        const minted = await runtime.scopedTokens.mint({
+            v: 1,
+            grantId: bound.grantId,
+            accountId: bound.accountId,
+            sessionId: bound.sessionId,
+            tenantId: scope.tenantId,
+            projectId: scope.projectId,
+            workspaceId: bound.workspaceId,
+            runtimeId: scope.runtimeId,
+            runId: bound.runId,
+            attemptId: bound.attemptId,
+            epoch: bound.epoch,
+            workspaceAuthorityVersion: bound.workspaceAuthorityVersion,
+            runAuthorityVersion: bound.runAuthorityVersion,
+            expiresAt: bound.expiresAt,
+            purpose: bound.purpose,
+            ...(bound.viewerAccountId ? { viewerAccountId: bound.viewerAccountId } : {}),
+        }, now);
+        if (!minted.ok) return reply.code(500).send({ error: 'Grant token could not be minted' });
+
+        return reply.send({
+            token: minted.token,
+            grantId: bound.grantId,
+            expiresAt: bound.expiresAt,
+            purpose: bound.purpose,
+            viewerAccountId: bound.viewerAccountId ?? null,
+            idempotent: issued.idempotent,
+            serverUrl: runtime.publicUrl,
+        });
+    });
+
+    app.post('/v1/managed/control/grants/approval/revoke', {
+        onRequest: [app.authenticate, requireConfigured],
+        schema: { body: approvalRevokeSchema },
+    }, async (request, reply) => {
+        if (!authorize(request as never, reply as never, 'approval-grant-revoke')) return;
+        /*
+         * The approver's own bearer is **not** required, for the same reason it
+         * is not on the read path: the removals that matter — a member dropped
+         * from the project, an account unlinked, a credential already gone —
+         * are exactly the ones where that bearer cannot be produced. The
+         * authority is the signed control assertion, and the scope is still
+         * verified in full, viewer included; only the bearer identity is
+         * relaxed.
+         */
+        const result = await revokeSessionGrant({
+            scope: request.body.scope as ManagedScope,
+            reason: request.body.reason,
+            now: Date.now(),
+            purpose: 'approval-control',
+            viewerAccountId: request.body.viewerAccountId,
+        });
+        if (!result.ok) return reply.code(failureStatus(result.reason)).send({ error: result.reason });
+        return reply.send({ state: result.state, alreadyRevoked: result.alreadyRevoked });
+    });
+
     app.post('/v1/managed/control/grants/read/revoke', {
         onRequest: [app.authenticate, requireConfigured],
         schema: { body: readRevokeSchema },
@@ -1064,6 +1283,7 @@ export function managedControlRoutes(
             reason: request.body.reason,
             now: Date.now(),
             ...(request.body.purpose ? { purpose: request.body.purpose } : {}),
+            ...(request.body.viewerAccountId ? { viewerAccountId: request.body.viewerAccountId } : {}),
         });
         if (!result.ok) return reply.code(failureStatus(result.reason)).send({ error: result.reason });
         return reply.send({ state: result.state, alreadyRevoked: result.alreadyRevoked });

@@ -40,6 +40,7 @@ import { startScriptInvocationMaintenance } from "@/app/automation/scriptInvocat
 import { sessionFollowupRoutes } from "./routes/sessionFollowupRoutes";
 import { agentProfileRoutes } from "./routes/agentProfileRoutes";
 import { managedControlRoutes } from "./routes/managedControlRoutes";
+import { managedApprovalRoutes } from "@/app/api/routes/managedApprovalRoutes";
 import { managedDaemonRenewRoutes } from '@/app/api/routes/managedDaemonRenewRoutes';
 import { createManagedControlRuntime, type ManagedControlRuntime } from "@/app/managed/managedControlRuntime";
 import {
@@ -165,6 +166,10 @@ export async function startApi(opts: StartApiOptions = {}) {
     // re-reads a daemon grant that already exists and never touches machine key
     // material, so it is signed for under its own operations.
     managedDaemonRenewRoutes(typed, () => managedControl);
+    // Answering a permission prompt from a browser. It needs the session-scope
+    // decorator enabled above, and nothing from the control runtime: the
+    // bearer it accepts is a managed one, not a control-plane assertion.
+    managedApprovalRoutes(typed);
     authRoutes(typed);
     pushRoutes(typed);
     sessionRoutes(typed);

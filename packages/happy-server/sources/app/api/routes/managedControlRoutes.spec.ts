@@ -1934,6 +1934,8 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
                 sessionId,
                 sessionOwnerAccountId: accountId,
                 viewerAccountId: accountId,
+                /** The generation the parent would have assigned. */
+                aclRevision: 1,
                 ...over,
             };
         }
@@ -1999,6 +2001,7 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
                     sessionId,
                     sessionOwnerAccountId: accountId,
                     viewerAccountId: otherAccountId,
+                    aclRevision: 1,
                 },
                 grantId: `grant-${randomUUID()}`,
                 requestId: `req-${randomUUID()}`,
@@ -2055,6 +2058,7 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             const scope = {
                 tenantId: 'tenant-1', projectId: 'project-1', sessionId,
                 sessionOwnerAccountId: accountId, viewerAccountId: otherAccountId,
+                aclRevision: 1,
             };
             const grantId = `grant-${randomUUID()}`;
             const minted = await call({
@@ -2091,6 +2095,7 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
                     scope: {
                         tenantId: 'tenant-1', projectId: 'project-1', sessionId,
                         sessionOwnerAccountId: otherAccountId, viewerAccountId: otherAccountId,
+                        aclRevision: 1,
                     },
                     reason: 'guessed',
                 },
@@ -2138,6 +2143,152 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             })).statusCode).toBe(403);
         });
 
+        describe('an access list that changes', () => {
+            const envelope = Buffer.concat([Buffer.from([0]), Buffer.alloc(104, 4)]).toString('base64');
+
+            function mint(revision: number, over: Record<string, unknown> = {}) {
+                return call({
+                    path: '/v1/managed/control/grants/read/mint',
+                    op: 'read-grant-mint',
+                    body: {
+                        scope: readScope({ viewerAccountId: otherAccountId, aclRevision: revision }),
+                        grantId: `grant-${randomUUID()}`,
+                        requestId: `req-${randomUUID()}`,
+                        expiresAt: Date.now() + 120_000,
+                        viewerDataEncryptionKey: envelope,
+                        ...over,
+                    },
+                    token: otherToken,
+                });
+            }
+
+            function resolve(revision: number, over: Record<string, unknown> = {}) {
+                return call({
+                    path: '/v1/managed/control/grants/read/resolve',
+                    op: 'read-grant-resolve',
+                    body: {
+                        scope: readScope({ viewerAccountId: otherAccountId, aclRevision: revision }),
+                        requestedTokenExpiresAt: Date.now() + 60_000,
+                        ...over,
+                    },
+                    token: otherToken,
+                });
+            }
+
+            it('refuses a request that names no generation at all', async () => {
+                // Type-level requirement is not enough: the wire has to refuse
+                // it too, or a caller written before this axis silently lands
+                // on one generation for all time.
+                const response = await call({
+                    path: '/v1/managed/control/grants/read/mint',
+                    op: 'read-grant-mint',
+                    body: {
+                        scope: {
+                            tenantId: 'tenant-1', projectId: 'project-1', sessionId,
+                            sessionOwnerAccountId: accountId, viewerAccountId: otherAccountId,
+                        },
+                        grantId: `grant-${randomUUID()}`,
+                        requestId: `req-${randomUUID()}`,
+                        expiresAt: Date.now() + 120_000,
+                        viewerDataEncryptionKey: envelope,
+                    },
+                    token: otherToken,
+                });
+                expect(response.statusCode).toBe(400);
+            });
+
+            it('lets a re-added member back in, and leaves the old row withdrawn', async () => {
+                const first = await mint(1);
+                expect(first.statusCode).toBe(200);
+                const revoked = await call({
+                    path: '/v1/managed/control/grants/read/revoke',
+                    op: 'read-grant-revoke',
+                    body: {
+                        scope: readScope({ viewerAccountId: otherAccountId, aclRevision: 1 }),
+                        reason: 'member-removed',
+                    },
+                });
+                expect(revoked.statusCode).toBe(200);
+
+                const rejoined = await mint(2);
+                expect(rejoined.statusCode).toBe(200);
+                expect(rejoined.json().grantId).not.toBe(first.json().grantId);
+                expect((await db.managedSessionGrant.findUniqueOrThrow({
+                    where: { grantId: first.json().grantId },
+                })).revokedAt).not.toBeNull();
+            });
+
+            it('answers a stale mint and a stale revoke with a conflict', async () => {
+                expect((await mint(2)).statusCode).toBe(200);
+                const staleMint = await mint(1);
+                expect(staleMint.statusCode).toBe(409);
+                expect(staleMint.json().error).toBe('revision-stale');
+
+                const staleRevoke = await call({
+                    path: '/v1/managed/control/grants/read/revoke',
+                    op: 'read-grant-revoke',
+                    body: {
+                        scope: readScope({ viewerAccountId: otherAccountId, aclRevision: 1 }),
+                        reason: 'late-removal',
+                    },
+                });
+                expect(staleRevoke.statusCode).toBe(409);
+                expect(staleRevoke.json().error).toBe('revision-stale');
+            });
+
+            it('hands a second reader a token without rotating the grant', async () => {
+                const minted = await mint(1);
+                expect(minted.statusCode).toBe(200);
+                const before = await db.managedSessionGrant.findUniqueOrThrow({
+                    where: { grantId: minted.json().grantId },
+                });
+
+                const resolved = await resolve(1);
+                expect(resolved.statusCode).toBe(200);
+                expect(resolved.json().grantId).toBe(minted.json().grantId);
+                expect(typeof resolved.json().token).toBe('string');
+                expect(resolved.json().token).not.toBe(minted.json().token);
+                expect(await db.managedSessionGrant.findUniqueOrThrow({
+                    where: { grantId: minted.json().grantId },
+                })).toEqual(before);
+            });
+
+            it('refuses to resolve what does not exist, and writes nothing', async () => {
+                const response = await resolve(1);
+                expect(response.statusCode).toBe(404);
+                expect(await db.managedReadAclWatermark.findMany({ where: { sessionId } })).toEqual([]);
+            });
+
+            it('refuses an assertion signed for minting', async () => {
+                // Recovering a token must not be reachable by a signature that
+                // was authorised to issue a new grant, or the reverse.
+                expect((await mint(1)).statusCode).toBe(200);
+                const response = await call({
+                    path: '/v1/managed/control/grants/read/resolve',
+                    op: 'read-grant-mint',
+                    body: {
+                        scope: readScope({ viewerAccountId: otherAccountId, aclRevision: 1 }),
+                        requestedTokenExpiresAt: Date.now() + 60_000,
+                    },
+                    token: otherToken,
+                });
+                expect(response.statusCode).toBeGreaterThanOrEqual(400);
+            });
+
+            it('refuses a bearer that is not the viewer', async () => {
+                expect((await mint(1)).statusCode).toBe(200);
+                const response = await call({
+                    path: '/v1/managed/control/grants/read/resolve',
+                    op: 'read-grant-resolve',
+                    body: {
+                        scope: readScope({ viewerAccountId: otherAccountId, aclRevision: 1 }),
+                        requestedTokenExpiresAt: Date.now() + 60_000,
+                    },
+                });
+                expect(response.statusCode).toBe(403);
+            });
+        });
+
         it('withdraws a viewer, and says so again on a repeat', async () => {
             const grantId = `grant-${randomUUID()}`;
             await call({
@@ -2156,6 +2307,189 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             expect(again.json()).toEqual({ state: 'revoked', alreadyRevoked: true });
             const row = await db.managedSessionGrant.findUniqueOrThrow({ where: { grantId } });
             expect(row.revokedAt).not.toBeNull();
+        });
+    });
+    describe('answering a permission prompt', () => {
+        const envelope = Buffer.concat([Buffer.from([0]), Buffer.alloc(104, 9)]).toString('base64');
+
+        beforeEach(async () => {
+            // An approval names the run it answers for, so the authority the
+            // scope is compared against has to exist.
+            await syncAuthority();
+        });
+
+        function approvalBody(over: Record<string, unknown> = {}) {
+            return {
+                scope: scope(),
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: Date.now() + HOUR,
+                viewerAccountId: otherAccountId,
+                viewerDataEncryptionKey: envelope,
+                ...over,
+            };
+        }
+
+        async function mintApproval(over: Record<string, unknown> = {}) {
+            const body = approvalBody(over);
+            const response = await call({
+                path: '/v1/managed/control/grants/approval/mint',
+                op: 'approval-grant-mint',
+                body,
+                token: otherToken,
+            });
+            return { body, response };
+        }
+
+        it('mints a bearer for the approver, carrying the run it answers for', async () => {
+            const { body, response } = await mintApproval();
+            expect(response.statusCode).toBe(200);
+            expect(response.json().purpose).toBe('approval-control');
+            expect(response.json().viewerAccountId).toBe(otherAccountId);
+            const row = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: body.grantId as string },
+            });
+            expect(row.viewerAccountId).toBe(otherAccountId);
+            // Unlike a read grant, this one names the run: an answer for a
+            // superseded attempt answers a question nobody is posing.
+            expect(row.runId).toBe(runId);
+            expect(row.attemptId).toBe('attempt-1');
+        });
+
+        it('leaves the runner grant of the same scope alone', async () => {
+            /*
+             * The regression this exists for: the family carries the viewer, so
+             * a lookup that forgets it finds the runner's row. Minting an
+             * approval must add a row, never move the run's own credential.
+             */
+            const runner = await call({
+                path: '/v1/managed/control/grants/mint',
+                op: 'grant-mint',
+                body: {
+                    scope: scope(), grantId: `grant-${randomUUID()}`,
+                    requestId: `req-${randomUUID()}`, expiresAt: Date.now() + HOUR,
+                },
+            });
+            expect(runner.statusCode).toBe(200);
+            const before = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: runner.json().grantId },
+            });
+
+            const { response } = await mintApproval();
+            expect(response.statusCode).toBe(200);
+            expect(await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: runner.json().grantId },
+            })).toEqual(before);
+        });
+
+        it('refuses a bearer that is not the approver it names', async () => {
+            // The parent holds the approver's token, never the owner's.
+            const body = approvalBody();
+            const response = await call({
+                path: '/v1/managed/control/grants/approval/mint',
+                op: 'approval-grant-mint',
+                body,
+            });
+            expect(response.statusCode).toBe(403);
+            expect(await db.managedSessionGrant.findUnique({
+                where: { grantId: body.grantId as string },
+            })).toBeNull();
+        });
+
+        it('refuses an approver who is not the owner and brings no envelope', async () => {
+            // Answering means sealing with the session key. A grant without an
+            // envelope for that account would be valid and unusable.
+            const body = approvalBody({ viewerDataEncryptionKey: undefined });
+            const response = await call({
+                path: '/v1/managed/control/grants/approval/mint',
+                op: 'approval-grant-mint',
+                body,
+                token: otherToken,
+            });
+            expect(response.statusCode).toBeGreaterThanOrEqual(400);
+            expect(await db.managedSessionGrant.findUnique({
+                where: { grantId: body.grantId as string },
+            })).toBeNull();
+        });
+
+        it('refuses an assertion signed for minting a reader', async () => {
+            // Handing out reading must not also hand out answering.
+            const body = approvalBody();
+            const response = await call({
+                path: '/v1/managed/control/grants/approval/mint',
+                op: 'read-grant-mint',
+                body,
+                token: otherToken,
+            });
+            expect(response.statusCode).toBeGreaterThanOrEqual(400);
+            expect(await db.managedSessionGrant.findUnique({
+                where: { grantId: body.grantId as string },
+            })).toBeNull();
+        });
+
+        it('withdraws an approver without that approver presenting anything', async () => {
+            const { body } = await mintApproval();
+            const revokeBody = {
+                scope: scope(), reason: 'approver-removed', viewerAccountId: otherAccountId,
+            };
+            // The owner's bearer; the removed approver presents nothing.
+            const revoked = await call({
+                path: '/v1/managed/control/grants/approval/revoke',
+                op: 'approval-grant-revoke',
+                body: revokeBody,
+            });
+            expect(revoked.statusCode).toBe(200);
+            expect(revoked.json()).toEqual({ state: 'revoked', alreadyRevoked: false });
+            const row = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: body.grantId as string },
+            });
+            expect(row.revokedAt).not.toBeNull();
+            expect(row.revokedReason).toBe('approver-removed');
+
+            const again = await call({
+                path: '/v1/managed/control/grants/approval/revoke',
+                op: 'approval-grant-revoke',
+                body: revokeBody,
+            });
+            expect(again.json()).toEqual({ state: 'revoked', alreadyRevoked: true });
+        });
+
+        it('withdraws one approver and not the run', async () => {
+            const { body: approval } = await mintApproval();
+            const runner = await call({
+                path: '/v1/managed/control/grants/mint',
+                op: 'grant-mint',
+                body: {
+                    scope: scope(), grantId: `grant-${randomUUID()}`,
+                    requestId: `req-${randomUUID()}`, expiresAt: Date.now() + HOUR,
+                },
+            });
+            expect(runner.statusCode).toBe(200);
+
+            await call({
+                path: '/v1/managed/control/grants/approval/revoke',
+                op: 'approval-grant-revoke',
+                body: { scope: scope(), reason: 'approver-removed', viewerAccountId: otherAccountId },
+            });
+            expect((await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: approval.grantId as string },
+            })).revokedAt).not.toBeNull();
+            expect((await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: runner.json().grantId },
+            })).revokedAt).toBeNull();
+        });
+
+        it('refuses an assertion signed for withdrawing a reader', async () => {
+            const { body } = await mintApproval();
+            const response = await call({
+                path: '/v1/managed/control/grants/approval/revoke',
+                op: 'read-grant-revoke',
+                body: { scope: scope(), reason: 'wrong-op', viewerAccountId: otherAccountId },
+            });
+            expect(response.statusCode).toBeGreaterThanOrEqual(400);
+            expect((await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: body.grantId as string },
+            })).revokedAt).toBeNull();
         });
     });
 });

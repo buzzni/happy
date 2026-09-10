@@ -82,13 +82,38 @@ export type ControlOperation =
      * signed for minting a runner's credential must not also mint a reader's.
      */
     | 'read-grant-mint'
-    | 'read-grant-revoke';
+    | 'read-grant-revoke'
+    /**
+     * Reads a token back for a read grant that already exists.
+     *
+     * Its own operation because it is not a mint and must not be reachable by
+     * an assertion signed for one: it creates nothing and changes nothing, and
+     * an assertion signed to *recover* a token should not also be able to issue
+     * a new grant.
+     */
+    | 'read-grant-resolve'
+    /**
+     * Issues a grant for **answering a permission prompt**.
+     *
+     * Its own operation, and bound to a live run: an approval answers the run
+     * that is asking, so unlike reading it carries the run axes and is checked
+     * against the current authority. An assertion signed to hand out reading
+     * must not also hand out answering.
+     */
+    | 'approval-grant-mint'
+    /**
+     * Withdraws one, and like `read-grant-revoke` it does not require the
+     * approver's own bearer: the moment withdrawal matters most is the moment
+     * that bearer is gone.
+     */
+    | 'approval-grant-revoke';
 
 export const CONTROL_OPERATIONS: readonly ControlOperation[] = [
     'authority-sync', 'authority-snapshot',
     'daemon-bootstrap', 'daemon-renew', 'daemon-resolve',
     'grant-mint', 'grant-renew', 'grant-resolve', 'grant-revoke',
-    'read-grant-mint', 'read-grant-revoke',
+    'read-grant-mint', 'read-grant-revoke', 'read-grant-resolve',
+    'approval-grant-mint', 'approval-grant-revoke',
 ];
 
 export type ControlAssertionFailure =

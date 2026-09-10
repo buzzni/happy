@@ -45,6 +45,10 @@ import {
     writeManagedLauncherBinding,
 } from '@/daemon/launch/managedLauncherBinding';
 import { createSupervisorRuntime } from '@/launcher/main';
+import {
+    adoptManagedDaemonCredential,
+    type ManagedCredentialAdoption,
+} from '@/daemon/managedDaemonCredentialInput';
 
 /** The socket lives here, under the state directory root already owns. */
 export function managedLauncherDirectory(stateDir: string): string {
@@ -85,7 +89,14 @@ export type ManagedRuntimeBootRefusal =
      * The runtime does not start and nothing is deleted — the leftovers may be
      * the only copy of what a destination used to hold.
      */
-    | 'restore-unresolved';
+    | 'restore-unresolved'
+    /**
+     * The identity the parent delivered is not one this runtime may run as, or
+     * could not be made its own. Separate from `identity-refused`, which is
+     * about the marker: this machine knows what it is and cannot prove who it
+     * is to the server.
+     */
+    | 'credential-unusable';
 
 export type ManagedRuntimeBootOutcome =
     | { ok: true; socketPath: string; published: 'created' | 'existing' }
@@ -153,6 +164,18 @@ export type ManagedRuntimeBootDeps = {
      * forgotten by the one caller that is not a test.
      */
     inspectRestoreStaging: () => Promise<'clear' | 'unresolved'>;
+    /**
+     * Takes the credential the parent delivered and makes it this runtime's
+     * own. **Required**, for the reason above it: an optional handoff is a
+     * handoff the one non-test caller forgets, and a runtime that boots without
+     * one authenticates as nothing.
+     */
+    adoptCredential: (input: {
+        stateDir: string;
+        expectedMachineId: string;
+        now: number;
+        deps: ManagedProvisioningDeps;
+    }) => Promise<ManagedCredentialAdoption>;
     provisioning?: ManagedProvisioningDeps;
     resolveIdentity?: typeof resolveManagedRuntimeIdentity;
 };
@@ -170,6 +193,34 @@ export async function runManagedRuntimeBoot(
 
     const stateDir = identity.identity.stateDir;
     const socketPath = managedLauncherSocketPath(stateDir);
+
+    /*
+     * The identity this runtime authenticates as, before anything is started.
+     *
+     * It arrives from the parent — nothing in a guest can mint it, by design —
+     * and `run.ts` refuses to start managed without it, so it has to be on the
+     * volume by the time this returns. Done first because it is the cheapest
+     * refusal: a credential this runtime may not run as should stop the boot
+     * before a supervisor exists and before anything is published.
+     *
+     * Absence is **not** a refusal. A parent that has not wired the delivery
+     * yet, and a machine whose credential is already on its volume, both land
+     * here with nothing delivered; what happens next is decided by the daemon
+     * when it reads the state directory, which is where that decision belongs.
+     */
+    let adoption: ManagedCredentialAdoption;
+    try {
+        adoption = await deps.adoptCredential({
+            stateDir,
+            expectedMachineId: identity.identity.happyMachineId,
+            now: Date.now(),
+            deps: provisioning,
+        });
+    } catch {
+        // Never the error: it can carry the delivered file's contents.
+        return { ok: false, reason: 'credential-unusable' };
+    }
+    if (adoption.status === 'refused') return { ok: false, reason: 'credential-unusable' };
     try {
         await deps.makeTrustedDirectory(managedLauncherDirectory(stateDir), 0o700);
     } catch {
@@ -349,6 +400,7 @@ export function defaultManagedRuntimeBootDeps(
 ): ManagedRuntimeBootDeps {
     return {
         inspectRestoreStaging: async () => inspectRestoreStagingSync(stagingRoot),
+        adoptCredential: (input) => adoptManagedDaemonCredential(input),
         makeTrustedDirectory: async (path, mode) => { makeTrustedDirectorySync(path, mode); },
         assignWorkspace: async ({ path, uid, gid }) => { assignTreeSync(path, uid, gid, chown); },
         assignProviderHome: async ({ path, uid, gid, mode }) => {

@@ -76,7 +76,19 @@ const ALLOWED_ROUTES: readonly RouteTemplate[] = [
     // never a third-party presigned URL.
     template('PUT', '/v1/sessions/:sessionId/attachments/:file'),
     template('GET', '/v1/sessions/:sessionId/attachments/:file'),
+    /**
+     * Answering a permission prompt, over HTTP.
+     *
+     * A browser cannot hold a managed socket — that server is the run's own
+     * connection and refuses anything that is not the runner — so the answer
+     * arrives here and the server relays it. Reachable by `approval-control`
+     * only; the branch below refuses it for every other purpose.
+     */
+    template('POST', '/v1/managed/sessions/:sessionId/permission'),
 ];
+
+/** The one route an approver may use that a reader may not. */
+const APPROVAL_ROUTE = 'POST /v1/managed/sessions/:sessionId/permission';
 
 /** Socket events a managed child may emit, and where each carries its session. */
 const ALLOWED_EVENTS: Readonly<Record<string, 'sid' | 'sessionId'>> = {
@@ -209,7 +221,20 @@ export function authorizeManagedHttpRequest(input: {
      * permission prompt happens over RPC, and the read surface is what it needs
      * to show the person what they are approving.
      */
-    if (input.purpose !== 'runner' && !isReadableRoute(route)) {
+    const named = `${route.method} /${route.segments.join('/')}`;
+    /*
+     * Answering is the approver's one act, and **only** the approver's.
+     *
+     * Stated before the read/runner split rather than inside it: a permission
+     * prompt exists because the run is not trusted to decide, so the run's own
+     * bearer must not be able to answer it either. Written as an exception to
+     * "not a runner", a runner sailed past this route entirely — it was never
+     * asked about — and the run could approve itself over HTTP.
+     */
+    if (named === APPROVAL_ROUTE) {
+        if (input.purpose !== 'approval-control') return deny('purpose-not-allowed');
+    } else if (input.purpose !== 'runner' && !isReadableRoute(route)) {
+        // A reader reads; nothing that writes or runs.
         return deny('purpose-not-allowed');
     }
 

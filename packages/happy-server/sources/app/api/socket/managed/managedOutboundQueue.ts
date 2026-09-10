@@ -49,6 +49,16 @@ export type ManagedOutboundItem = {
      */
     ack?: (...args: unknown[]) => void;
     /**
+     * A second authority, re-read immediately before this packet is emitted.
+     *
+     * The channel's own grant check covers the run this socket belongs to. It
+     * says nothing about a packet sent on somebody else's authority — an
+     * approver answering a permission prompt — and that authority can end while
+     * the item sits in this queue. Failing it refuses **this item**; the
+     * channel stays open, because the run's own grant is not what lapsed.
+     */
+    precondition?: () => Promise<{ ok: true } | { ok: false; reason: string }>;
+    /**
      * How long the child has to acknowledge this particular request.
      *
      * Per item, because the caller's deadline is what should govern: a fixed
@@ -88,6 +98,11 @@ export type ManagedChannelClosure =
     | { kind: 'queue-overflow' }
     | { kind: 'ack-overflow' }
     | { kind: 'expired' }
+    /**
+     * The authority *this packet* was sent on ended before it went out — not
+     * the run's. Refuses the item; the channel stays open.
+     */
+    | { kind: 'sender-revoked'; reason: string }
     | { kind: 'disconnected' };
 
 export type ManagedGrantCheck = () => Promise<{ ok: true } | { ok: false; reason: string }>;
@@ -299,6 +314,19 @@ export class ManagedOutboundChannel {
         this.queue = [];
         this.queuedBytes = 0;
         for (const queued of pending) this.refuse(queued.item, this.closure!);
+        /*
+         * The one that is no longer in the queue and not yet emitted.
+         *
+         * Between the shift and the emit there is an await — the second
+         * authority behind this packet is read there — and a channel that
+         * closed during it used to refuse everything except this item: it was
+         * gone from `queue` and not yet in `inFlight`, so nothing settled it
+         * and the caller waited out its own deadline for an answer that could
+         * never come.
+         */
+        const inTransit = this.inTransit;
+        this.inTransit = null;
+        if (inTransit) this.refuse(inTransit, this.closure!);
     }
 
     /**
@@ -380,6 +408,9 @@ export class ManagedOutboundChannel {
         };
     }
 
+    /** Left the queue, not yet emitted. See `flushRefusals`. */
+    private inTransit: ManagedOutboundItem | null = null;
+
     private releaseInFlight(): void {
         // A copy, but the set is not cleared first: `settle` removes its own
         // entry and does nothing if it is already gone, which is what keeps
@@ -413,13 +444,51 @@ export class ManagedOutboundChannel {
                 if (this.closure) return;
                 this.queue.shift();
                 this.queuedBytes = Math.max(0, this.queuedBytes - bytes);
+                // Held here until it is emitted or refused, so a close during
+                // the awaits below still settles it.
+                this.inTransit = item;
                 // The caller may have given up while the grant was being read.
                 // Releasing now would run a side effect nobody is waiting for.
                 // One expired item is dropped; the channel stays open.
                 if (item.expiresAt !== undefined && Date.now() >= item.expiresAt) {
+                    this.inTransit = null;
                     this.refuse(item, { kind: 'expired' });
                     continue;
                 }
+                if (item.precondition) {
+                    let allowed: { ok: true } | { ok: false; reason: string };
+                    try {
+                        allowed = await withTimeout(item.precondition(), this.limits.checkTimeoutMs);
+                    } catch {
+                        // Unable to look is not permission to send.
+                        allowed = { ok: false, reason: 'authority-unavailable' };
+                    }
+                    // Checked again after the await, as everywhere else here.
+                    // `flushRefusals` has already settled this item in that
+                    // case, so it must not be settled or emitted again.
+                    if (this.closure) return;
+                    if (!allowed.ok) {
+                        this.inTransit = null;
+                        this.refuse(item, { kind: 'sender-revoked', reason: allowed.reason });
+                        continue;
+                    }
+                    /*
+                     * The deadline again, measured now.
+                     *
+                     * Reading the second authority takes time — a database
+                     * round trip, and up to `checkTimeoutMs` of it. The window
+                     * the caller was waiting in can close inside that read, and
+                     * emitting afterwards sends a request whose answer nobody
+                     * will accept: the child does the work and the result is
+                     * discarded.
+                     */
+                    if (item.expiresAt !== undefined && Date.now() >= item.expiresAt) {
+                        this.inTransit = null;
+                        this.refuse(item, { kind: 'expired' });
+                        continue;
+                    }
+                }
+                this.inTransit = null;
                 if (item.deliver) {
                     runTrusted('deliver', item.deliver);
                 } else if (item.ack) {

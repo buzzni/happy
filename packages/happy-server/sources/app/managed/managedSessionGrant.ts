@@ -28,7 +28,7 @@
  */
 
 import { db } from '@/storage/db';
-import { inTx } from '@/storage/inTx';
+import { inTx, type Tx } from '@/storage/inTx';
 import {
     SESSION_SCOPED_PURPOSES,
     type SessionScopedPurpose,
@@ -92,6 +92,14 @@ export function deriveGrantFamily(
      * would orphan every stored row from the derivation that finds it.
      */
     purpose: SessionScopedPurpose = 'runner',
+    /**
+     * Who holds this grant, when that is not the run itself.
+     *
+     * Two people approving on one run are two grants: revoking one must not end
+     * the other, and each carries its own resealed key envelope. Absent for a
+     * runner, which has no viewer.
+     */
+    viewerAccountId?: string,
 ): string {
     if (purpose !== 'runner') {
         return canonicalDigest({
@@ -103,6 +111,7 @@ export function deriveGrantFamily(
             sessionId: scope.sessionId,
             accountId: scope.accountId,
             purpose,
+            viewerAccountId: viewerAccountId ?? null,
         });
     }
     return canonicalDigest({
@@ -130,6 +139,9 @@ export type ScopeMismatch =
  */
 const MAX_RENEWAL_SEQ = 2_147_483_647;
 
+/** The DEK envelope shape this server accepts, and the only thing it checks. */
+const DEK_ENVELOPE_BYTES = 105;
+
 export type GrantIssueFailure =
     | 'grant-id-reused'
     | 'sequence-exhausted'
@@ -139,7 +151,10 @@ export type GrantIssueFailure =
     | 'family-revoked'
     | 'family-exists'
     | 'request-conflict'
-    | 'already-expired';
+    | 'already-expired'
+    /** An approver who is not the owner cannot answer without their own key. */
+    | 'viewer-envelope-required'
+    | 'viewer-envelope-malformed';
 
 export type GrantRenewFailure =
     | 'grant-mismatch'
@@ -322,8 +337,21 @@ function compareStoredGrant(
      * that row's authority.
      */
     purpose: SessionScopedPurpose,
+    /**
+     * The account the grant was resealed for, on the purposes that have one.
+     *
+     * Part of the family since the viewer axis exists, so leaving it out here
+     * looked for a row that was never written: an `approval-control` grant is
+     * stored under a family containing its approver, and a lookup without one
+     * found nothing and reported the bearer's claims as wrong. It is also
+     * compared on its own, for the same reason the read path compares it — one
+     * viewer's row must never authorise another viewer's token, because the
+     * envelope on that row is sealed for a single account.
+     */
+    viewerAccountId?: string | null,
 ): 'mismatch' | null {
     if (readStoredPurpose(grant.purpose) !== purpose) return 'mismatch';
+    if ((grant.viewerAccountId ?? null) !== (viewerAccountId ?? null)) return 'mismatch';
     if (grant.sessionId !== scope.sessionId
         || grant.accountId !== scope.accountId
         || grant.workspaceId !== scope.workspaceId
@@ -334,7 +362,7 @@ function compareStoredGrant(
         || grant.runAuthorityVersion !== scope.runAuthorityVersion) {
         return 'mismatch';
     }
-    if (grant.family !== deriveGrantFamily(scope, purpose)) return 'mismatch';
+    if (grant.family !== deriveGrantFamily(scope, purpose, viewerAccountId ?? undefined)) return 'mismatch';
     return null;
 }
 
@@ -346,6 +374,16 @@ export type IssueGrantInput = {
     now: number;
     /** Defaults to `runner`: the behaviour every existing caller relies on. */
     purpose?: SessionScopedPurpose;
+    /**
+     * The account that will hold an `approval-control` grant, and the session
+     * key resealed for them.
+     *
+     * Approving means answering as the run — the response is sealed with the
+     * session key — so an approver who is not the owner needs their own
+     * envelope for the same reason a reader does. Absent on the runner path.
+     */
+    viewerAccountId?: string;
+    viewerDataEncryptionKey?: string;
 };
 
 /**
@@ -370,15 +408,40 @@ async function issueSessionGrantOnce(
     input: IssueGrantInput,
 ): Promise<GrantResult<GrantIssueFailure>> {
     const purpose = input.purpose ?? 'runner';
-    const family = deriveGrantFamily(input.scope, purpose);
+    const family = deriveGrantFamily(input.scope, purpose, input.viewerAccountId);
     const digest = canonicalDigest({
         scope: input.scope,
         grantId: input.grantId,
         expiresAt: input.expiresAt,
-        // Part of the body: a retry that asks for a different purpose under the
-        // same request id is a different request, not the same one again.
-        ...(purpose === 'runner' ? {} : { purpose }),
+        // Part of the body: a retry that asks for a different purpose, viewer or
+        // envelope under the same request id is a different request, not the
+        // same one again.
+        ...(purpose === 'runner' ? {} : {
+            purpose,
+            viewerAccountId: input.viewerAccountId ?? null,
+            viewerDataEncryptionKey: input.viewerDataEncryptionKey ?? null,
+        }),
     });
+    let approverEnvelope: Uint8Array<ArrayBuffer> | null = null;
+    if (purpose !== 'runner') {
+        // Same rule as the read path, for the same reason: answering as the run
+        // means holding the session key, and the stored envelope is the
+        // owner's. A grant without one would be valid and unusable.
+        if (input.viewerAccountId && input.viewerAccountId !== input.scope.accountId
+            && input.viewerDataEncryptionKey === undefined) {
+            return { ok: false, reason: 'viewer-envelope-required' };
+        }
+        if (input.viewerDataEncryptionKey !== undefined) {
+            const decoded = Buffer.from(input.viewerDataEncryptionKey, 'base64');
+            if (decoded.length !== DEK_ENVELOPE_BYTES || decoded[0] !== 0
+                || decoded.toString('base64') !== input.viewerDataEncryptionKey) {
+                return { ok: false, reason: 'viewer-envelope-malformed' };
+            }
+            const copy = new Uint8Array(new ArrayBuffer(decoded.length));
+            copy.set(decoded);
+            approverEnvelope = copy;
+        }
+    }
 
     return inTx(async (tx) => {
         const authority = await tx.managedRunAuthority.findUnique({
@@ -475,6 +538,16 @@ async function issueSessionGrantOnce(
                     // while ids may repeat across generations.
                     renewalSeq: nextSeq,
                     expiresAt: BigInt(input.expiresAt),
+                    /*
+                     * The envelope too, and this is why: a replacement is a new
+                     * request with a body of its own, and its body includes the
+                     * session key resealed for the approver. Left out, the
+                     * replaced row kept the **previous** envelope while the
+                     * caller was told the mint succeeded — an approver holding
+                     * a key blob it can no longer open, on a grant that reports
+                     * itself healthy.
+                     */
+                    viewerDataEncryptionKey: approverEnvelope,
                     bodyDigest: digest,
                     updatedAt: BigInt(input.now),
                 },
@@ -493,6 +566,8 @@ async function issueSessionGrantOnce(
                 sessionId: input.scope.sessionId,
                 accountId: input.scope.accountId,
                 purpose,
+                ...(input.viewerAccountId ? { viewerAccountId: input.viewerAccountId } : {}),
+                viewerDataEncryptionKey: approverEnvelope,
                 workspaceId: input.scope.workspaceId,
                 runId: input.scope.runId,
                 attemptId: input.scope.attemptId,
@@ -538,8 +613,10 @@ export async function renewSessionGrant(input: {
      * be renewed at all and a revoke aimed at the runner's row instead.
      */
     purpose?: SessionScopedPurpose;
+    /** The approver or viewer the grant was resealed for, when it has one. */
+    viewerAccountId?: string;
 }): Promise<GrantResult<GrantRenewFailure>> {
-    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner');
+    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner', input.viewerAccountId);
 
     return inTx(async (tx) => {
         const authority = await tx.managedRunAuthority.findUnique({
@@ -644,6 +721,8 @@ export async function revokeSessionGrant(input: {
     now: number;
     /** Which grant to withdraw. Omitted means `runner`. */
     purpose?: SessionScopedPurpose;
+    /** The approver or viewer the grant was resealed for, when it has one. */
+    viewerAccountId?: string;
 }): Promise<RevokeResult> {
     return retryOnUniqueRace(
         () => revokeSessionGrantOnce(input),
@@ -658,8 +737,9 @@ async function revokeSessionGrantOnce(input: {
     reason: string;
     now: number;
     purpose?: SessionScopedPurpose;
+    viewerAccountId?: string;
 }): Promise<RevokeResult> {
-    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner');
+    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner', input.viewerAccountId);
 
     return inTx(async (tx) => {
         const grant = await tx.managedSessionGrant.findUnique({ where: { family } });
@@ -785,6 +865,53 @@ export async function resolveLiveGrant(input: {
             if (readStoredPurpose(grant.purpose) !== 'transcript-read') {
                 return { ok: false, reason: 'claims-mismatch' };
             }
+            /*
+             * The generation this row was issued under, against the one that
+             * stands now.
+             *
+             * Without this, moving the mark forward did nothing to the bearers
+             * of the generation it replaced: the older row is still live, and
+             * it can no longer be withdrawn either — a revoke naming its
+             * generation is refused as stale, and one naming the current
+             * generation tombstones a different family. A removed reader kept
+             * reading until the grant lapsed.
+             *
+             * Checked here rather than fixed by a sweep on the writing side,
+             * because this is the check that still holds when the withdrawal
+             * never arrives: the parent bumps its own generation, and every
+             * bearer below it stops at the next action.
+             */
+            if (grant.viewerAccountId !== null) {
+                const mark = await tx.managedReadAclWatermark.findUnique({
+                    where: {
+                        sessionId_viewerAccountId: {
+                            sessionId: grant.sessionId,
+                            viewerAccountId: grant.viewerAccountId,
+                        },
+                    },
+                });
+                if (mark) {
+                    /*
+                     * A row written before this axis existed carries no
+                     * generation. Skipping it left exactly the hole the axis
+                     * closes: the parent advances to a new generation and
+                     * withdraws the old one, and the pre-migration bearer keeps
+                     * reading because its row has nothing to compare.
+                     *
+                     * So a mark for this pair makes a generation mandatory. No
+                     * mark at all means no generations are in play for this
+                     * viewer, and the row is left alone — that is the
+                     * back-compatible case, and it is the only one.
+                     */
+                    if (grant.aclRevision === null) return { ok: false, reason: 'revoked' };
+                    // Reported as revoked, because that is what it is: access
+                    // the access list no longer describes.
+                    // Compared only once it is known to be a number: `null`
+                    // happens to order below every revision in JavaScript, and
+                    // relying on that would make the line above look optional.
+                    if (grant.aclRevision < mark.revision) return { ok: false, reason: 'revoked' };
+                }
+            }
             return { ok: true, grant: toLiveGrant(grant as never) };
         }
         if (claims.workspaceId === undefined || claims.runtimeId === undefined
@@ -815,7 +942,7 @@ export async function resolveLiveGrant(input: {
         // this token says it is. Without it a read token carried a runner row's
         // authority, and a runner token would have been accepted against a read
         // row just as readily.
-        if (compareStoredGrant(grant, scope, claims.purpose)) {
+        if (compareStoredGrant(grant, scope, claims.purpose, claims.viewerAccountId)) {
             return { ok: false, reason: 'claims-mismatch' };
         }
 
@@ -870,6 +997,39 @@ async function retryOnUniqueRace<T>(
     }
 }
 
+/**
+ * Whether an approval grant is still good enough to send a packet on, read at
+ * the moment of sending.
+ *
+ * Its own function rather than `readGrantRow` plus a few comparisons at the
+ * call site: `readGrantRow` hides a revoked row behind a shape that looks live
+ * (it filters tombstones only), so a caller reaching for it would have been one
+ * missing field away from relaying an answer from a withdrawn approver. The
+ * checks that matter are here, next to the row they are about.
+ */
+export async function checkApprovalGrantForRelay(input: {
+    grantId: string;
+    sessionId: string;
+    accountId: string;
+    viewerAccountId?: string;
+    now: number;
+}): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const row = await db.managedSessionGrant.findUnique({ where: { grantId: input.grantId } });
+    if (!row || row.tombstone) return { ok: false, reason: 'grant-unknown' };
+    if (row.revokedAt !== null) return { ok: false, reason: 'revoked' };
+    if (input.now >= Number(row.expiresAt)) return { ok: false, reason: 'expired' };
+    if (readStoredPurpose(row.purpose) !== 'approval-control') {
+        return { ok: false, reason: 'purpose-not-allowed' };
+    }
+    if (row.sessionId !== input.sessionId || row.accountId !== input.accountId) {
+        return { ok: false, reason: 'scope-mismatch' };
+    }
+    if ((row.viewerAccountId ?? undefined) !== input.viewerAccountId) {
+        return { ok: false, reason: 'viewer-mismatch' };
+    }
+    return { ok: true };
+}
+
 /** Read-only view for callers that already hold a verified grant id. */
 export async function readGrantRow(grantId: string): Promise<LiveGrant | null> {
     const row = await db.managedSessionGrant.findUnique({ where: { grantId } });
@@ -886,6 +1046,12 @@ export type ResolveGrantInput = {
      * caller resolves exactly what it resolved before.
      */
     purpose?: SessionScopedPurpose;
+    /**
+     * The approver a non-runner grant was resealed for, when there is one.
+     *
+     * The family carries it, so resolving without it looks for a different row.
+     */
+    viewerAccountId?: string;
 };
 
 export type ResolvedGrant = {
@@ -917,7 +1083,7 @@ export type ResolveGrantResult =
 export async function resolveSessionGrant(
     input: ResolveGrantInput,
 ): Promise<ResolveGrantResult> {
-    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner');
+    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner', input.viewerAccountId);
 
     return inTx(async (tx) => {
         const authority = await tx.managedRunAuthority.findUnique({
@@ -942,7 +1108,7 @@ export async function resolveSessionGrant(
         // The row must be the one this exact scope was issued for. Without this
         // an authority advance leaves an old row that the fresh scope still
         // finds, and the answer would mix an old grant with a new DTO.
-        if (compareStoredGrant(grant, input.scope, input.purpose ?? 'runner')) {
+        if (compareStoredGrant(grant, input.scope, input.purpose ?? 'runner', input.viewerAccountId)) {
             return { ok: false, reason: 'grant-stale' };
         }
 
@@ -989,6 +1155,20 @@ export type ManagedReadScope = {
     sessionOwnerAccountId: string;
     /** Who is reading. The same account as the owner is normal, not special. */
     viewerAccountId: string;
+    /**
+     * Which generation of the parent's access list this request belongs to.
+     *
+     * **Required, and deliberately not optional.** A default would put every
+     * caller on one generation forever, which is the state this axis exists to
+     * leave: one generation means a removal's tombstone is permanent, so a
+     * member who is re-added can never be issued anything again, and the only
+     * way to make re-adding work would be to clear that tombstone — which
+     * would revive the bearer the removal withdrew.
+     *
+     * Monotonic per (session, viewer) and owned by the parent, which is what
+     * numbers its own access-list changes. This server only compares.
+     */
+    aclRevision: number;
 };
 
 /**
@@ -1009,6 +1189,13 @@ export function deriveReadGrantFamily(
         sessionOwnerAccountId: scope.sessionOwnerAccountId,
         viewerAccountId: scope.viewerAccountId,
         purpose,
+        /*
+         * The generation is part of the identity of the family, not a field on
+         * the row. That is what makes a re-add a different row from the removal
+         * that preceded it: generation N stays tombstoned and keeps every
+         * bearer minted under it withdrawn, while N+1 starts clean.
+         */
+        aclRevision: scope.aclRevision,
     });
 }
 
@@ -1022,10 +1209,13 @@ export type ReadGrantFailure =
     | 'request-conflict'
     | 'viewer-envelope-malformed'
     /** A viewer who is not the owner cannot read without one of their own. */
-    | 'viewer-envelope-required';
-
-/** The DEK envelope shape this server accepts, and the only thing it checks. */
-const DEK_ENVELOPE_BYTES = 105;
+    | 'viewer-envelope-required'
+    /**
+     * The request names an access-list generation older than one already
+     * applied here. Refused rather than honoured: a late mint would restore
+     * access that a newer removal withdrew.
+     */
+    | 'revision-stale';
 
 /**
  * The longest a read grant may live.
@@ -1041,6 +1231,78 @@ const DEK_ENVELOPE_BYTES = 105;
  * its time renewing.
  */
 export const MANAGED_READ_GRANT_MAX_TTL_MS = 15 * 60_000;
+
+/**
+ * Compares this request's ACL generation against the highest one applied here,
+ * advancing the mark when it is newer.
+ *
+ * Called inside the caller's transaction, before anything is decided, so a
+ * refusal leaves nothing behind and an advance commits with the write it
+ * authorised. `advance: false` is for a read-only caller, which must never move
+ * the mark: resolving a token is not an access-list change.
+ *
+ * Equal is allowed. A retry of the current generation — a lost response, a
+ * second browser tab — is the same request again, not a new one.
+ */
+async function readAclMark(tx: Tx, scope: ManagedReadScope): Promise<number | null> {
+    const mark = await tx.managedReadAclWatermark.findUnique({
+        where: {
+            sessionId_viewerAccountId: {
+                sessionId: scope.sessionId,
+                viewerAccountId: scope.viewerAccountId,
+            },
+        },
+    });
+    return mark ? mark.revision : null;
+}
+
+/**
+ * Whether this request's generation is still current enough to act on.
+ *
+ * Equal is allowed: a retry of the current generation — a lost response, a
+ * second browser tab — is the same request again, not a new one.
+ */
+async function aclRevisionIsCurrent(tx: Tx, scope: ManagedReadScope): Promise<boolean> {
+    const mark = await readAclMark(tx, scope);
+    return mark === null || scope.aclRevision >= mark;
+}
+
+/**
+ * Moves the mark up to this request's generation.
+ *
+ * Called **immediately before the write it authorises**, never at the top of
+ * the call. Advancing early burned the generation on requests that were then
+ * refused for something else entirely — an expiry in the past, a family that
+ * already existed — and the mark stayed up: the parent's real generation was
+ * now below it, every later mint was refused as stale, and that viewer was
+ * locked out until somebody guessed a higher number. A generation counts only
+ * what was actually issued or withdrawn.
+ */
+async function advanceAclRevision(tx: Tx, scope: ManagedReadScope, now: number): Promise<void> {
+    const mark = await readAclMark(tx, scope);
+    if (mark === null) {
+        await tx.managedReadAclWatermark.create({
+            data: {
+                sessionId: scope.sessionId,
+                viewerAccountId: scope.viewerAccountId,
+                revision: scope.aclRevision,
+                updatedAt: BigInt(now),
+            },
+        });
+        return;
+    }
+    if (scope.aclRevision <= mark) return;
+    // Guarded by the value read in this transaction: a concurrent writer that
+    // advanced past us loses the update rather than lowering the mark.
+    await tx.managedReadAclWatermark.updateMany({
+        where: {
+            sessionId: scope.sessionId,
+            viewerAccountId: scope.viewerAccountId,
+            revision: mark,
+        },
+        data: { revision: scope.aclRevision, updatedAt: BigInt(now) },
+    });
+}
 
 /**
  * Issues a grant for reading a transcript.
@@ -1130,6 +1392,17 @@ export async function issueReadGrant(input: {
         if (session.accountId !== input.scope.sessionOwnerAccountId) {
             return { ok: false, reason: 'session-owner-mismatch' as const };
         }
+        /*
+         * Compared before anything else, including the idempotent replay below:
+         * a retry of a mint from a generation that has since been superseded
+         * must be refused, not answered with the grant it originally produced.
+         * That replay is exactly how a withdrawn bearer would come back.
+         *
+         * Only compared here. The mark moves at the write, further down.
+         */
+        if (!await aclRevisionIsCurrent(tx, input.scope)) {
+            return { ok: false, reason: 'revision-stale' as const };
+        }
         if (input.expiresAt <= input.now) return { ok: false, reason: 'already-expired' as const };
         // Capped rather than refused: a caller asking for longer gets a shorter
         // grant, which is the answer that keeps working. Refusing would make a
@@ -1173,6 +1446,7 @@ export async function issueReadGrant(input: {
             // optional property widens the type Prisma accepts here.
             viewerDataEncryptionKey: viewerEnvelope,
             purpose,
+            aclRevision: input.scope.aclRevision,
             renewalSeq: 0,
             expiresAt: BigInt(expiresAt),
             requestId: input.requestId,
@@ -1180,6 +1454,9 @@ export async function issueReadGrant(input: {
             createdAt: BigInt(input.now),
             updatedAt: BigInt(input.now),
         };
+        // The generation is spent here, on the write it authorises, and not
+        // before: everything above can still refuse this request.
+        await advanceAclRevision(tx, input.scope, input.now);
         const row = existingFamily
             // The previous grant for this viewer lapsed. Replaced in place, so
             // one viewer never accumulates live grants for one session.
@@ -1189,7 +1466,84 @@ export async function issueReadGrant(input: {
     }));
 }
 
-export type ReadRevokeFailure = 'binding-mismatch';
+export type ReadResolveFailure =
+    | 'session-unknown'
+    | 'session-owner-mismatch'
+    | 'grant-unknown'
+    | 'revoked'
+    | 'expired'
+    | 'already-expired'
+    | 'revision-stale';
+
+export type ReadResolveResult =
+    | { ok: true; resolved: { grant: LiveGrant; tokenExpiresAt: number } }
+    | { ok: false; reason: ReadResolveFailure };
+
+/**
+ * Hands back a token for a read grant that already exists — **without writing
+ * anything**.
+ *
+ * This is the answer to a question a mint cannot answer honestly. A second
+ * browser tab, a page reloaded, a mint whose response was lost: each of those
+ * is a caller that needs a bearer for access it already has. Asked to mint, the
+ * server can only refuse (a live grant is in the way) or replace the row — and
+ * replacing it invalidates the bearer the other tab is reading with. Asked to
+ * resolve, it returns the grant as it stands, and both tabs read.
+ *
+ * It creates nothing, resurrects nothing and extends nothing: a missing,
+ * revoked, expired or superseded grant is refused. The generation is still
+ * compared, so a caller from an access-list generation that has since been
+ * replaced is told so rather than handed the older grant's token — but the mark
+ * is **not** advanced here, because reading a token back is not an access-list
+ * change.
+ */
+export async function resolveReadGrant(input: {
+    scope: ManagedReadScope;
+    /** The latest the caller signed for. The answer is never later than this. */
+    requestedTokenExpiresAt: number;
+    now: number;
+    purpose?: SessionScopedPurpose;
+}): Promise<ReadResolveResult> {
+    const purpose = input.purpose ?? 'transcript-read';
+    const family = deriveReadGrantFamily(input.scope, purpose);
+
+    return inTx(async (tx) => {
+        const session = await tx.session.findUnique({
+            where: { id: input.scope.sessionId },
+            select: { accountId: true },
+        });
+        if (!session) return { ok: false, reason: 'session-unknown' };
+        if (session.accountId !== input.scope.sessionOwnerAccountId) {
+            return { ok: false, reason: 'session-owner-mismatch' };
+        }
+        if (!await aclRevisionIsCurrent(tx, input.scope)) {
+            return { ok: false, reason: 'revision-stale' };
+        }
+
+        const grant = await tx.managedSessionGrant.findUnique({ where: { family } });
+        if (!grant || grant.tombstone) return { ok: false, reason: 'grant-unknown' };
+        if (grant.revokedAt !== null) return { ok: false, reason: 'revoked' };
+        const grantExpiresAt = Number(grant.expiresAt);
+        if (!Number.isSafeInteger(grantExpiresAt) || input.now >= grantExpiresAt) {
+            return { ok: false, reason: 'expired' };
+        }
+        // A cap that has already passed authorises nothing, and widening it to
+        // the grant's own expiry would ignore what the caller signed for.
+        if (!Number.isSafeInteger(input.requestedTokenExpiresAt)
+            || input.requestedTokenExpiresAt <= input.now) {
+            return { ok: false, reason: 'already-expired' };
+        }
+        return {
+            ok: true,
+            resolved: {
+                grant: toLiveGrant(grant as never),
+                tokenExpiresAt: Math.min(grantExpiresAt, input.requestedTokenExpiresAt),
+            },
+        };
+    });
+}
+
+export type ReadRevokeFailure = 'binding-mismatch' | 'revision-stale';
 
 export type ReadRevokeResult =
     | { ok: true; state: 'revoked' | 'tombstoned'; alreadyRevoked: boolean }
@@ -1237,6 +1591,18 @@ export async function revokeReadGrant(input: {
         if (!session || session.accountId !== input.scope.sessionOwnerAccountId) {
             return { ok: false as const, reason: 'binding-mismatch' as const };
         }
+        /*
+         * A withdrawal from an older generation is refused rather than applied.
+         *
+         * The case is a removal message that overtakes nothing on the way out
+         * but arrives after the member was re-added: applying it would end the
+         * access the *newer* decision granted, and the parent would have no way
+         * to tell that its re-add had been undone. The tombstone it would have
+         * written for its own generation is already there.
+         */
+        if (!await aclRevisionIsCurrent(tx, input.scope)) {
+            return { ok: false as const, reason: 'revision-stale' as const };
+        }
 
         const grant = await tx.managedSessionGrant.findUnique({ where: { family } });
         if (grant) {
@@ -1257,6 +1623,7 @@ export async function revokeReadGrant(input: {
                     alreadyRevoked: true,
                 };
             }
+            await advanceAclRevision(tx, input.scope, input.now);
             await tx.managedSessionGrant.update({
                 where: { family },
                 data: {
@@ -1268,6 +1635,7 @@ export async function revokeReadGrant(input: {
             return { ok: true as const, state: 'revoked' as const, alreadyRevoked: false };
         }
 
+        await advanceAclRevision(tx, input.scope, input.now);
         await tx.managedSessionGrant.create({
             data: {
                 grantId: `tombstone:${family}`,
@@ -1276,6 +1644,7 @@ export async function revokeReadGrant(input: {
                 accountId: input.scope.sessionOwnerAccountId,
                 viewerAccountId: input.scope.viewerAccountId,
                 purpose,
+                aclRevision: input.scope.aclRevision,
                 renewalSeq: 0,
                 expiresAt: BigInt(input.now),
                 revokedAt: BigInt(input.now),

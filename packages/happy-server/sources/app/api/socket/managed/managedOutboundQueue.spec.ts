@@ -525,3 +525,42 @@ describe('an answer from the child waits its turn', () => {
         expect(channel.closureReason).toEqual({ kind: 'grant-invalid', reason: 'revoked' });
     });
 });
+
+describe('the window between leaving the queue and going out', () => {
+    /*
+     * A packet sent on a second authority is checked again immediately before
+     * the emit, and that check is a database read. Two things can happen while
+     * it runs, and both used to end badly: the caller's deadline can pass, and
+     * the channel can close. Folded in from root's own fixture, assertions
+     * unchanged.
+     */
+    const allow = { ok: true } as const;
+
+    function barrier() {
+        let release!: () => void; let entered!: () => void;
+        const waiting = new Promise<void>((r) => { release = r; });
+        const started = new Promise<void>((r) => { entered = r; });
+        return { release, started, check: async () => { entered(); await waiting; return allow; } };
+    }
+
+    it('refuses an item whose deadline passes during approver validation', async () => {
+        const gate = barrier(); const emit = vi.fn(); const refused = vi.fn();
+        let now = 1000; const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+        const channel = new ManagedOutboundChannel({ emit, disconnect: vi.fn() }, async () => allow);
+        try {
+            channel.enqueue({ event: 'rpc-request', args: [], expiresAt: 2000, precondition: gate.check, onRefused: refused });
+            await gate.started; now = 2001; gate.release(); await settle();
+            expect(emit).not.toHaveBeenCalled(); expect(refused).toHaveBeenCalledOnce();
+        } finally { gate.release(); channel.close({ kind: 'authority-unavailable' }); clock.mockRestore(); }
+    });
+
+    it('settles the item if the channel closes while approver validation waits', async () => {
+        const gate = barrier(); const emit = vi.fn(); const refused = vi.fn();
+        const channel = new ManagedOutboundChannel({ emit, disconnect: vi.fn() }, async () => allow);
+        try {
+            channel.enqueue({ event: 'rpc-request', args: [], precondition: gate.check, onRefused: refused });
+            await gate.started; channel.close({ kind: 'authority-unavailable' }); gate.release(); await settle();
+            expect(emit).not.toHaveBeenCalled(); expect(refused).toHaveBeenCalledOnce();
+        } finally { gate.release(); channel.close({ kind: 'authority-unavailable' }); }
+    });
+});

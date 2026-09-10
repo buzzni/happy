@@ -109,6 +109,9 @@ function bootDeps(over: Partial<Parameters<typeof runManagedRuntimeBoot>[0]> = {
         // The default for cases that are not about staging. Every case that is
         // overrides it, and the real CLI's own is asserted separately.
         inspectRestoreStaging: async () => 'clear' as const,
+        // Likewise for the identity handoff: the cases about it override this,
+        // and the real CLI's own is asserted in its own file.
+        adoptCredential: async () => ({ status: 'absent' as const }),
         ...over,
     };
     return { deps: deps as Parameters<typeof runManagedRuntimeBoot>[0], log };
@@ -386,6 +389,76 @@ describe('the root boot stage of a managed runtime', () => {
         const { deps } = bootDeps();
         await runManagedRuntimeBoot(deps);
         expect(Object.values(process.env).some((value) => value === TOKEN)).toBe(false);
+    });
+});
+
+describe('the identity handoff, in the boot stage', () => {
+    /*
+     * `run.ts` refuses to start managed without a credential on the volume, and
+     * nothing inside a guest can mint one — both control-plane routes that
+     * issue them require a signature no process here holds. So the boot stage
+     * is where the parent's delivery becomes this runtime's own, and it happens
+     * before a supervisor exists: a credential this runtime may not run as
+     * should stop the boot while stopping is still cheap.
+     */
+    it('adopts before it starts anything', async () => {
+        const order: string[] = [];
+        const { deps } = bootDeps({
+            adoptCredential: async () => {
+                order.push('adopt');
+                return { status: 'adopted' as const, machineId: 'machine-1', expiresAt: 1 };
+            },
+            startSupervisor: async () => {
+                order.push('supervisor');
+                return { token: TOKEN };
+            },
+        });
+        expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: true });
+        expect(order).toEqual(['adopt', 'supervisor']);
+    });
+
+    it('refuses the boot when the delivered identity is not one to run as', async () => {
+        const { deps, log } = bootDeps({
+            adoptCredential: async () => ({ status: 'refused' as const, reason: 'machine-conflict' as const }),
+        });
+        expect(await runManagedRuntimeBoot(deps))
+            .toEqual({ ok: false, reason: 'credential-unusable' });
+        // Nothing started, nothing published: the refusal is inert.
+        expect(log.some((entry) => entry.event === 'supervisor')).toBe(false);
+    });
+
+    it('treats an adoption that throws as a refusal, never as absence', async () => {
+        const { deps } = bootDeps({
+            adoptCredential: async () => { throw new Error('cannot read /etc/saycode'); },
+        });
+        expect(await runManagedRuntimeBoot(deps))
+            .toEqual({ ok: false, reason: 'credential-unusable' });
+    });
+
+    it('boots on when nothing was delivered', async () => {
+        /*
+         * A parent that has not wired the delivery yet, and a machine whose
+         * credential is already on its volume, are the same thing here. What
+         * happens next is the daemon's decision, made where the state directory
+         * is actually read.
+         */
+        const { deps } = bootDeps({ adoptCredential: async () => ({ status: 'absent' as const }) });
+        expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: true });
+    });
+
+    it('boots on when the credential already there is the better one', async () => {
+        const { deps } = bootDeps({
+            adoptCredential: async () => ({
+                status: 'current' as const, machineId: 'machine-1', expiresAt: 2,
+            }),
+        });
+        expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: true });
+    });
+
+    it('is wired on the deps the CLI builds', () => {
+        // The lesson from the staging guard: an optional hook is one the single
+        // non-test caller forgets, and its absence is silent.
+        expect(typeof defaultManagedRuntimeBootDeps().adoptCredential).toBe('function');
     });
 });
 

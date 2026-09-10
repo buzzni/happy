@@ -284,6 +284,49 @@ describe('what each purpose may reach', () => {
         }
     });
 
+    it('lets an approver answer over HTTP, and a reader not', () => {
+        /*
+         * The browser has no managed socket — that server is the run's own
+         * connection — so the answer comes over HTTP. It is the approver's one
+         * extra route, and a read bearer must not reach it: reading a
+         * transcript is not deciding what the run may do.
+         */
+        const path = `/v1/managed/sessions/${SESSION}/permission`;
+        expect(authorizeManagedHttpRequest({
+            method: 'POST', path, sessionId: SESSION, purpose: 'approval-control',
+        })).toEqual({ ok: true });
+        expect(authorizeManagedHttpRequest({
+            method: 'POST', path, sessionId: SESSION, purpose: 'transcript-read',
+        })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
+    });
+
+    it('refuses the run its own permission prompt', () => {
+        /*
+         * The prompt exists because the run is not trusted to decide. Written
+         * as an exception to "not a runner", this route never asked about a
+         * runner at all and the run could answer itself over HTTP — with the
+         * bearer it already holds, on the session it is already running.
+         */
+        expect(authorizeManagedHttpRequest({
+            method: 'POST',
+            path: `/v1/managed/sessions/${SESSION}/permission`,
+            sessionId: SESSION,
+            purpose: 'runner',
+        })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
+    });
+
+    it('refuses an approver every write the run itself makes', () => {
+        // Approving is not taking the run over.
+        for (const [method, path] of [
+            ['POST', `/v3/sessions/${SESSION}/messages`],
+            ['POST', `/v1/sessions/${SESSION}/attachments/request-upload`],
+        ] as const) {
+            expect(authorizeManagedHttpRequest({
+                method, path, sessionId: SESSION, purpose: 'approval-control',
+            })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
+        }
+    });
+
     it('lets a reader register nothing', () => {
         expect(authorizeManagedRpcName({
             method: `${SESSION}:permission`, sessionId: SESSION, purpose: 'transcript-read',

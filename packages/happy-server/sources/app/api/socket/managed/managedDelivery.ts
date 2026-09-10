@@ -19,6 +19,7 @@
 import type { Server } from 'socket.io';
 
 import { log } from '@/utils/log';
+import { parseSessionScopedClaims, type SessionScopedClaims } from '@/app/auth/sessionScopedToken';
 import { managedSocketRegistry, type ManagedSocketRegistry } from '@/app/api/socket/managed/managedSocketRegistry';
 import type { ManagedChannelClosure } from '@/app/api/socket/managed/managedOutboundQueue';
 
@@ -106,6 +107,21 @@ export type ManagedRpcRequest = {
     /** Correlates the response with this request. */
     requestId: string;
     params: unknown;
+    /**
+     * A second grant that must still be live **where the emit happens**.
+     *
+     * The run's own grant is re-read by the channel on every packet, but a
+     * packet sent on somebody *else's* authority — an approver answering a
+     * permission prompt — carries an authority the channel knows nothing
+     * about. Between authorising the HTTP request and the emit, the packet can
+     * cross a replica boundary and wait in a queue; an approver removed in that
+     * window would still have their answer applied.
+     *
+     * Carried as ids rather than as a callback because it has to survive the
+     * cluster bus: the replica that owns the socket re-reads the row itself,
+     * which is the only side that can catch a revoke committed in flight.
+     */
+    approval?: { claims: SessionScopedClaims };
 };
 
 /** A candidate connection, addressable across the cluster by its socket id. */
@@ -128,10 +144,28 @@ export type ManagedRpcResult =
 function isRpcRequest(value: unknown): value is ManagedRpcRequest {
     if (!value || typeof value !== 'object') return false;
     const c = value as Record<string, unknown>;
-    return typeof c.sessionId === 'string' && c.sessionId.length > 0
+    if (!(typeof c.sessionId === 'string' && c.sessionId.length > 0
         && typeof c.accountId === 'string' && c.accountId.length > 0
         && typeof c.rpcName === 'string' && c.rpcName.length > 0
-        && typeof c.requestId === 'string' && c.requestId.length > 0;
+        && typeof c.requestId === 'string' && c.requestId.length > 0)) {
+        return false;
+    }
+    /*
+     * The second authority, when the payload carries one.
+     *
+     * It arrives from another process, so it is shape-checked like everything
+     * else here — and it is only ever ids. The row it names is read on this
+     * side; nothing the sender says about that row is believed.
+     */
+    if (c.approval !== undefined) {
+        if (!c.approval || typeof c.approval !== 'object') return false;
+        const approval = c.approval as Record<string, unknown>;
+        // The same parser the token decoder uses, so a payload from another
+        // process has to be claims-shaped before anything reads a field off it.
+        // Nothing it says is believed: the row it names is read on this side.
+        if (parseSessionScopedClaims(approval.claims) === null) return false;
+    }
+    return true;
 }
 
 /** Connections on this replica that could serve the call. */
@@ -188,6 +222,11 @@ export function executeManagedRpcLocally(
             params: request.params,
             requestId: request.requestId,
         }],
+        // Read here, on the replica that holds the socket, in the instant
+        // before the packet goes out.
+        ...(request.approval
+            ? { precondition: () => checkApprovalStillLive(request.approval!, request) }
+            : {}),
         // The child's answer crosses the boundary too: the channel re-reads the
         // grant before this runs.
         // `undefined` is how the channel reports an acknowledgement that never
@@ -208,6 +247,7 @@ export function executeManagedRpcLocally(
 function closureError(closure: ManagedChannelClosure): string {
     switch (closure.kind) {
         case 'grant-invalid': return 'Managed session grant is no longer valid';
+        case 'sender-revoked': return 'The authority behind this request is no longer valid';
         case 'authority-unavailable': return 'Authorization unavailable';
         case 'queue-overflow': return 'Managed session fell too far behind';
         case 'ack-overflow': return 'Managed session left too many calls unanswered';
@@ -422,4 +462,61 @@ export function setManagedRpcServer(io: Server | null): void {
 
 export function managedRpcServer(): Server | null {
     return managedServer;
+}
+
+/**
+ * Whether the approval grant behind a relayed answer is still live.
+ *
+ * Everything about it is compared against the stored row rather than taken
+ * from the packet: the purpose, the session, and the viewer it was resealed
+ * for. A revoke that commits while the packet is queued is caught here, and
+ * nowhere earlier — the sender's check happened before the wait.
+ */
+async function checkApprovalStillLive(
+    approval: { claims: SessionScopedClaims },
+    request: ManagedRpcRequest,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const { claims } = approval;
+    // The bearer's own claims, not just the row it names: an approval token has
+    // an expiry of its own, and it names the run it was minted for.
+    if (claims.purpose !== 'approval-control') return { ok: false, reason: 'purpose-not-allowed' };
+    if (claims.sessionId !== request.sessionId || claims.accountId !== request.accountId) {
+        return { ok: false, reason: 'scope-mismatch' };
+    }
+    try {
+        const { resolveLiveGrant } = await import('@/app/managed/managedSessionGrant');
+        /*
+         * The same check every action by that bearer makes, run **here** and
+         * with the clock read now.
+         *
+         * The row alone is not enough and was what this used to read. It loses
+         * two things: the token's own expiry — a bearer may not outlive the
+         * request it was issued for — and the run authority, so an answer for a
+         * superseded attempt, a cancelled run or an advanced epoch would still
+         * go out. `resolveLiveGrant` compares all of it against the current
+         * projection, in one transaction.
+         *
+         * `Date.now()` is read at this point on purpose: the packet may have
+         * waited, and the wait is exactly what this is here to catch.
+         */
+        const live = await resolveLiveGrant({ claims, now: Date.now() });
+        if (!live.ok) return { ok: false, reason: live.reason };
+        /*
+         * And again, after the resolver's own database round trips.
+         *
+         * The instant passed *into* the resolver is read before those awaits,
+         * so a window that closes while the row is being read is a window the
+         * resolver still calls open. The emit happens after all of it, so the
+         * only comparison that means anything is one made here: the bearer's
+         * expiry and the grant's, against the clock as it stands now.
+         */
+        const afterRead = Date.now();
+        if (afterRead >= claims.expiresAt || afterRead >= live.grant.expiresAt) {
+            return { ok: false, reason: 'expired' };
+        }
+        return { ok: true };
+    } catch {
+        // Unable to look is not permission to send.
+        return { ok: false, reason: 'authority-unavailable' };
+    }
 }

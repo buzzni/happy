@@ -338,7 +338,7 @@ describe.skipIf(!enabled)('managed session data routes (real Fastify + PostgreSQ
          * does not have is refused for that reason alone — which would make a
          * write-refusal test pass while the purpose gate was never consulted.
          */
-        async function readBearer(): Promise<string> {
+        async function readBearer(aclRevision = 1): Promise<string> {
             // The read path, not the runner path with a different label: a read
             // grant has no run, and a row that has one is a runner row wearing
             // the wrong name.
@@ -349,6 +349,7 @@ describe.skipIf(!enabled)('managed session data routes (real Fastify + PostgreSQ
                     sessionId,
                     sessionOwnerAccountId: accountId,
                     viewerAccountId: accountId,
+                    aclRevision,
                 },
                 grantId: `grant-${randomUUID()}`,
                 requestId: `req-${randomUUID()}`,
@@ -376,6 +377,41 @@ describe.skipIf(!enabled)('managed session data routes (real Fastify + PostgreSQ
             if (!minted.ok) throw new Error(`fixture mint failed: ${minted.reason}`);
             return minted.token;
         }
+
+        it('stops an older generation\'s bearer over real HTTP the moment the parent moves on', async () => {
+            /*
+             * The access-list generation, asserted where it actually decides
+             * something: a real request over the real route with the real
+             * bearer, not a unit call on the grant module.
+             *
+             * The bearer keeps working until its own expiry unless something
+             * re-reads the generation on every action. What made this worth a
+             * separate case is that the withdrawal may never arrive: a revoke
+             * naming the old generation is refused as stale, and one naming the
+             * new generation closes a different row. If this request still
+             * answered 200, a removed reader would keep reading for as long as
+             * the grant lived.
+             */
+            const oldToken = await readBearer(1);
+            expect((await request({
+                method: 'GET', url: `/v3/sessions/${sessionId}/messages`, token: oldToken,
+            })).statusCode).toBe(200);
+
+            // The parent re-issues under the next generation. Nothing is
+            // revoked, and nothing needs to be.
+            const newToken = await readBearer(2);
+
+            const afterMove = await request({
+                method: 'GET', url: `/v3/sessions/${sessionId}/messages`, token: oldToken,
+            });
+            expect(afterMove.statusCode).toBe(403);
+            expect(afterMove.json().reason).toBe('revoked');
+            // And the current generation's bearer is unaffected: this is about
+            // the old one stopping, not about reading breaking.
+            expect((await request({
+                method: 'GET', url: `/v3/sessions/${sessionId}/messages`, token: newToken,
+            })).statusCode).toBe(200);
+        });
 
         it('refuses a read bearer posting into the session, and writes nothing', async () => {
             const readToken = await readBearer();
@@ -410,6 +446,7 @@ describe.skipIf(!enabled)('managed session data routes (real Fastify + PostgreSQ
                 scope: {
                     tenantId: 'tenant-1', projectId: 'project-1', sessionId,
                     sessionOwnerAccountId: accountId, viewerAccountId: 'another-viewer',
+                    aclRevision: 1,
                 },
                 grantId: `grant-${randomUUID()}`,
                 requestId: `req-${randomUUID()}`,
@@ -492,6 +529,7 @@ describe.skipIf(!enabled)('managed session data routes (real Fastify + PostgreSQ
                 scope: {
                     tenantId: 'tenant-1', projectId: 'project-1', sessionId,
                     sessionOwnerAccountId: accountId, viewerAccountId,
+                    aclRevision: 1,
                 },
                 grantId: `grant-${randomUUID()}`,
                 requestId: `req-${randomUUID()}`,

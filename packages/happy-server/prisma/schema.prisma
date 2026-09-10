@@ -942,6 +942,30 @@ model ManagedRunAuthority {
 /// One scoped credential. `family` is stable per (run, attempt, session) so a
 /// renewal replaces its predecessor in place and a revoke tombstones the whole
 /// family — issuing a fresh `grantId` cannot resurrect what was revoked.
+/**
+ * The highest ACL generation this server has seen for one viewer of one
+ * session, and the compare-and-set point for every read-grant write.
+ *
+ * The parent owns the ACL and numbers its changes; this row is what makes a
+ * *late* message from that parent harmless. Control-plane calls arrive over a
+ * network that reorders, and both directions are dangerous: an old mint would
+ * hand back access that was withdrawn, and an old revoke would withdraw access
+ * that was re-granted. Comparing against the high-water mark refuses both,
+ * whichever order they arrive in.
+ *
+ * Keyed per (session, viewer) rather than per project: a project-wide counter
+ * would make any ACL change anywhere invalidate every session's read grants.
+ */
+model ManagedReadAclWatermark {
+    sessionId       String
+    viewerAccountId String
+    /// Monotonic. Advanced by a mint or a revoke, never lowered, never reset.
+    revision        Int
+    updatedAt       BigInt
+
+    @@id([sessionId, viewerAccountId])
+}
+
 model ManagedSessionGrant {
     grantId     String @id
     family      String
@@ -1000,6 +1024,14 @@ model ManagedSessionGrant {
     revokedReason String?
     /// Set on a tombstone created by a revoke that arrived before any issue.
     tombstone   Boolean @default(false)
+    /// The ACL generation a **read** grant was issued under.
+    ///
+    /// Part of the family, so a member removed and later re-added is issued
+    /// against a different row than the one their removal tombstoned. Without
+    /// it, re-adding somebody could only be made to work by clearing that
+    /// tombstone — which would resurrect the bearer the removal withdrew.
+    /// Null on a runner or approval grant, which are bound to a run instead.
+    aclRevision Int?
     /// Monotonic renewal counter. A renewal supersedes the grant in place, so
     /// this is the compare-and-set token that keeps two control-plane replicas
     /// from both extending the same grant.

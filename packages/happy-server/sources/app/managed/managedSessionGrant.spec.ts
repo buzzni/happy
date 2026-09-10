@@ -162,7 +162,11 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
     });
 
     afterEach(async () => {
+        // By session as well as by run: a read grant has no run, so a cleanup
+        // keyed only on `runId` left every read row of this file behind.
         await db.managedSessionGrant.deleteMany({ where: { runId: { in: [...createdRunIds] } } });
+        await db.managedSessionGrant.deleteMany({ where: { sessionId: { in: [...createdSessionIds] } } });
+        await db.managedReadAclWatermark.deleteMany({ where: { sessionId: { in: [...createdSessionIds] } } });
         await db.managedRunAuthority.deleteMany({ where: { runId: { in: [...createdRunIds] } } });
         await db.managedWorkspaceAuthority.deleteMany({
             where: { workspaceId: { in: [...createdWorkspaceIds] } },
@@ -174,6 +178,8 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
     afterAll(async () => {
         for (const [name, count] of [
             ['grants', await db.managedSessionGrant.count({ where: { runId: { in: [...createdRunIds] } } })],
+            ['read grants', await db.managedSessionGrant.count({ where: { sessionId: { in: [...createdSessionIds] } } })],
+            ['acl marks', await db.managedReadAclWatermark.count({ where: { sessionId: { in: [...createdSessionIds] } } })],
             ['runs', await db.managedRunAuthority.count({ where: { runId: { in: [...createdRunIds] } } })],
             ['workspaces', await db.managedWorkspaceAuthority.count({ where: { workspaceId: { in: [...createdWorkspaceIds] } } })],
             ['sessions', await db.session.count({ where: { id: { in: [...createdSessionIds] } } })],
@@ -1387,6 +1393,9 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
                 sessionId: s.sessionId,
                 sessionOwnerAccountId: s.accountId,
                 viewerAccountId: s.accountId,
+                // A generation the parent would have assigned. Fixtures that
+                // care about re-adding a member set their own.
+                aclRevision: 1,
                 ...over,
             };
         }
@@ -1622,6 +1631,511 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
             expect(await grants.issueReadGrant(readInput({
                 scope: readScope({ sessionId: 'no-such-session' }),
             }))).toEqual({ ok: false, reason: 'session-unknown' });
+        });
+    });
+    describe('replacing an approval grant that lapsed', () => {
+        const ENVELOPE_A = Buffer.concat([Buffer.from([0]), Buffer.alloc(104, 1)]).toString('base64');
+        const ENVELOPE_B = Buffer.concat([Buffer.from([0]), Buffer.alloc(104, 2)]).toString('base64');
+        const APPROVER = 'company-approver-1';
+
+        it('stores the envelope the replacement brought, not the one it replaced', async () => {
+            /*
+             * A replacement is a request with a body of its own, and the body
+             * includes the session key resealed for the approver. The row was
+             * updated in place without that field, so the approver was told the
+             * mint succeeded while the row still held the **previous** blob —
+             * a grant that reports itself healthy and cannot decrypt anything.
+             *
+             * The key can legitimately differ between the two: a rewrap, a
+             * rotated account key, or simply a second approval session.
+             */
+            const first = await grants.issueSessionGrant({
+                scope: scope(),
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: NOW + 1_000,
+                now: NOW,
+                purpose: 'approval-control',
+                viewerAccountId: APPROVER,
+                viewerDataEncryptionKey: ENVELOPE_A,
+            });
+            expect(first.ok).toBe(true);
+
+            // After it lapses, the same approver is issued another one.
+            const replaced = await grants.issueSessionGrant({
+                scope: scope(),
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: NOW + 2 * HOUR,
+                now: NOW + 2_000,
+                purpose: 'approval-control',
+                viewerAccountId: APPROVER,
+                viewerDataEncryptionKey: ENVELOPE_B,
+            });
+            expect(replaced.ok).toBe(true);
+            if (!replaced.ok) return;
+
+            const row = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: replaced.grant.grantId },
+            });
+            expect(Buffer.from(row.viewerDataEncryptionKey!).toString('base64')).toBe(ENVELOPE_B);
+            expect(row.viewerAccountId).toBe(APPROVER);
+        });
+    });
+
+    describe('an access list that changes, and messages that arrive late', () => {
+        const ENVELOPE = Buffer.concat([
+            Buffer.from([0]), Buffer.alloc(104, 3),
+        ]).toString('base64');
+        const MEMBER = 'company-member-9';
+
+        function scopeAt(revision: number): GrantModule.ManagedReadScope {
+            const s = scope();
+            return {
+                tenantId: s.tenantId,
+                projectId: s.projectId,
+                sessionId: s.sessionId,
+                sessionOwnerAccountId: s.accountId,
+                viewerAccountId: MEMBER,
+                aclRevision: revision,
+            };
+        }
+
+        function mintAt(revision: number, over: Record<string, unknown> = {}) {
+            return grants.issueReadGrant({
+                scope: scopeAt(revision),
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: NOW + 120_000,
+                now: NOW,
+                viewerDataEncryptionKey: ENVELOPE,
+                ...over,
+            } as Parameters<typeof grants.issueReadGrant>[0]);
+        }
+
+        it('lets a removed member back in without reviving their old bearer', async () => {
+            /*
+             * The defect this axis exists for. A removal tombstones the family;
+             * with one generation for all time that tombstone is the last word,
+             * and re-adding the member could only be made to work by clearing
+             * it — which would hand back the very credential the removal took
+             * away.
+             *
+             * With a generation, the removal's row stays exactly as it is and
+             * the re-add opens a different one.
+             */
+            const first = await mintAt(1);
+            expect(first.ok).toBe(true);
+            if (!first.ok) return;
+
+            expect(await grants.revokeReadGrant({
+                scope: scopeAt(1), reason: 'member-removed', now: NOW,
+            })).toEqual({ state: 'revoked', alreadyRevoked: false, ok: true });
+
+            // Re-added: a new generation, and it issues.
+            const rejoined = await mintAt(2);
+            expect(rejoined.ok).toBe(true);
+            if (!rejoined.ok) return;
+            expect(rejoined.grant.grantId).not.toBe(first.grant.grantId);
+
+            // The withdrawn row is untouched and still withdrawn.
+            const old = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: first.grant.grantId },
+            });
+            expect(old.revokedAt).not.toBeNull();
+            expect(old.revokedReason).toBe('member-removed');
+        });
+
+        it('refuses a mint from a generation that has been superseded', async () => {
+            // A message that took the slow path out of the parent. Honouring it
+            // would restore access a newer removal ended.
+            expect((await mintAt(2)).ok).toBe(true);
+            const late = await mintAt(1);
+            expect(late).toEqual({ ok: false, reason: 'revision-stale' });
+        });
+
+        it('refuses a replay of a mint whose generation has been superseded', async () => {
+            /*
+             * Sharper than the previous case: the same request id and the same
+             * body, which the idempotent path would otherwise answer with the
+             * grant it originally produced. A retry is not a licence to reissue
+             * a credential the access list has since withdrawn.
+             */
+            const body = {
+                scope: scopeAt(1),
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: NOW + 120_000,
+                now: NOW,
+                viewerDataEncryptionKey: ENVELOPE,
+            } as Parameters<typeof grants.issueReadGrant>[0];
+            expect((await grants.issueReadGrant(body)).ok).toBe(true);
+            expect((await mintAt(2)).ok).toBe(true);
+
+            expect(await grants.issueReadGrant(body)).toEqual({ ok: false, reason: 'revision-stale' });
+        });
+
+        it('replays a mint of the current generation as it always did', async () => {
+            // ACK loss inside one generation is still an exact retry.
+            const body = {
+                scope: scopeAt(3),
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: NOW + 120_000,
+                now: NOW,
+                viewerDataEncryptionKey: ENVELOPE,
+            } as Parameters<typeof grants.issueReadGrant>[0];
+            const first = await grants.issueReadGrant(body);
+            const again = await grants.issueReadGrant(body);
+            expect(first.ok && again.ok).toBe(true);
+            if (!first.ok || !again.ok) return;
+            expect(again.idempotent).toBe(true);
+            expect(again.grant.grantId).toBe(first.grant.grantId);
+        });
+
+        it('refuses a revoke from a generation that has been superseded', async () => {
+            /*
+             * The other direction, and the one that is easy to miss: a stale
+             * *removal* arriving after the member was re-added would end the
+             * access the newer decision granted, with nothing telling the
+             * parent its re-add had been undone.
+             */
+            expect((await mintAt(1)).ok).toBe(true);
+            expect(await grants.revokeReadGrant({
+                scope: scopeAt(1), reason: 'member-removed', now: NOW,
+            })).toMatchObject({ ok: true });
+            const rejoined = await mintAt(2);
+            expect(rejoined.ok).toBe(true);
+            if (!rejoined.ok) return;
+
+            expect(await grants.revokeReadGrant({
+                scope: scopeAt(1), reason: 'late-removal', now: NOW + 1,
+            })).toEqual({ ok: false, reason: 'revision-stale' });
+
+            const live = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: rejoined.grant.grantId },
+            });
+            expect(live.revokedAt).toBeNull();
+        });
+
+        it('refuses a mint that arrives after its own removal, in that order too', async () => {
+            // Revoke first, mint second, both at the same generation: the
+            // tombstone the revoke wrote is what refuses it.
+            expect(await grants.revokeReadGrant({
+                scope: scopeAt(4), reason: 'member-removed', now: NOW,
+            })).toMatchObject({ ok: true, state: 'tombstoned' });
+            expect(await mintAt(4)).toEqual({ ok: false, reason: 'family-revoked' });
+        });
+
+        it('never lowers the mark it has reached', async () => {
+            expect((await mintAt(5)).ok).toBe(true);
+            expect(await mintAt(2)).toEqual({ ok: false, reason: 'revision-stale' });
+            const mark = await db.managedReadAclWatermark.findUniqueOrThrow({
+                where: {
+                    sessionId_viewerAccountId: {
+                        sessionId: scopeAt(5).sessionId,
+                        viewerAccountId: MEMBER,
+                    },
+                },
+            });
+            expect(mark.revision).toBe(5);
+        });
+
+        describe('the two ways a superseded generation used to survive', () => {
+            it('stops the older generation\'s bearer at its next action', async () => {
+                /*
+                 * Found by the parent's cross fixture, on the real
+                 * authorisation path.
+                 *
+                 * Advancing the mark did nothing to the bearer already issued
+                 * under the generation it replaced, and that row could no
+                 * longer be withdrawn either: a revoke naming its generation is
+                 * refused as stale, and one naming the current generation
+                 * tombstones a different family. The removed reader kept
+                 * reading until the grant lapsed — up to fifteen minutes.
+                 *
+                 * The check lives on the read side on purpose: it holds even
+                 * when the withdrawal never arrives at all.
+                 */
+                const first = await mintAt(1);
+                expect(first.ok).toBe(true);
+                if (!first.ok) return;
+
+                const claims = {
+                    v: 1 as const,
+                    grantId: first.grant.grantId,
+                    accountId: first.grant.accountId,
+                    sessionId: first.grant.sessionId,
+                    tenantId: 'tenant-1',
+                    projectId: 'project-1',
+                    purpose: 'transcript-read' as const,
+                    viewerAccountId: MEMBER,
+                    expiresAt: first.grant.expiresAt,
+                };
+                expect((await grants.resolveLiveGrant({ claims, now: NOW })).ok).toBe(true);
+
+                // The parent re-issues under the next generation — which is
+                // what "this person's access changed" looks like here.
+                expect((await mintAt(2)).ok).toBe(true);
+
+                expect(await grants.resolveLiveGrant({ claims, now: NOW }))
+                    .toEqual({ ok: false, reason: 'revoked' });
+            });
+
+            it('stops a row from before this axis existed, once a generation is in play', async () => {
+                /*
+                 * Rows written before the migration carry no generation. A
+                 * check that skipped them left the exact hole the generation
+                 * closes: the parent moves to the next one and withdraws the
+                 * old, and the pre-migration bearer keeps reading because its
+                 * row has nothing to compare against.
+                 *
+                 * The row is aged here the way the migration left it — the
+                 * column added, the value null — rather than by deleting the
+                 * axis from the code.
+                 */
+                const legacy = await mintAt(1);
+                expect(legacy.ok).toBe(true);
+                if (!legacy.ok) return;
+                await db.managedSessionGrant.update({
+                    where: { grantId: legacy.grant.grantId },
+                    data: { aclRevision: null },
+                });
+                // And no mark, which is the state the migration left behind:
+                // rows that predate the axis, and no generation recorded for
+                // anyone yet.
+                await db.managedReadAclWatermark.deleteMany({
+                    where: { sessionId: legacy.grant.sessionId, viewerAccountId: MEMBER },
+                });
+
+                const claims = {
+                    v: 1 as const,
+                    grantId: legacy.grant.grantId,
+                    accountId: legacy.grant.accountId,
+                    sessionId: legacy.grant.sessionId,
+                    tenantId: 'tenant-1',
+                    projectId: 'project-1',
+                    purpose: 'transcript-read' as const,
+                    viewerAccountId: MEMBER,
+                    expiresAt: legacy.grant.expiresAt,
+                };
+                // With no generation in play anywhere, it still reads: that is
+                // the back-compatible case and the only one.
+                expect((await grants.resolveLiveGrant({ claims, now: NOW })).ok).toBe(true);
+
+                // The parent starts using generations for this viewer.
+                expect((await mintAt(2)).ok).toBe(true);
+                expect(await grants.resolveLiveGrant({ claims, now: NOW }))
+                    .toEqual({ ok: false, reason: 'revoked' });
+            });
+
+            it('does not spend a generation on a mint it refused', async () => {
+                /*
+                 * Also from the parent's fixture. The mark moved at the top of
+                 * the call, so a request refused further down — an expiry
+                 * already past, a family that exists — still burned its
+                 * generation. The parent's real generation was then below the
+                 * mark, every later mint was refused as stale, and that viewer
+                 * was locked out with no recovery but guessing a higher number.
+                 */
+                const refused = await mintAt(9, { expiresAt: NOW - 1 });
+                expect(refused).toEqual({ ok: false, reason: 'already-expired' });
+
+                // The generation the parent actually holds still works.
+                expect((await mintAt(1)).ok).toBe(true);
+                const mark = await db.managedReadAclWatermark.findUniqueOrThrow({
+                    where: {
+                        sessionId_viewerAccountId: {
+                            sessionId: scopeAt(1).sessionId,
+                            viewerAccountId: MEMBER,
+                        },
+                    },
+                });
+                expect(mark.revision).toBe(1);
+            });
+
+            it('does not spend a generation on a revoke it refused', async () => {
+                // The same rule in the other direction: a binding that does not
+                // hold is not an access-list change.
+                expect(await grants.revokeReadGrant({
+                    scope: { ...scopeAt(7), sessionId: 'no-such-session' },
+                    reason: 'guessed',
+                    now: NOW,
+                })).toEqual({ ok: false, reason: 'binding-mismatch' });
+                expect((await mintAt(1)).ok).toBe(true);
+            });
+        });
+
+        describe('two withdrawals racing, and a withdrawal racing a re-add', () => {
+            /*
+             * Real concurrency against the real database — two calls in flight
+             * at once, not one after the other. The parent's outbox retries, so
+             * two deliveries of the same removal overlapping is ordinary, and
+             * so is a removal overlapping the re-add that follows it.
+             */
+            it('lets exactly one withdrawal be the one that closed it', async () => {
+                const issued = await mintAt(1);
+                expect(issued.ok).toBe(true);
+                if (!issued.ok) return;
+
+                const [a, b] = await Promise.all([
+                    grants.revokeReadGrant({ scope: scopeAt(1), reason: 'removed-a', now: NOW }),
+                    grants.revokeReadGrant({ scope: scopeAt(1), reason: 'removed-b', now: NOW + 1 }),
+                ]);
+                expect(a.ok && b.ok).toBe(true);
+                if (!a.ok || !b.ok) return;
+                // One did it; the other says it was already done. Neither
+                // reports a failure the parent would keep retrying.
+                expect([a.alreadyRevoked, b.alreadyRevoked].sort()).toEqual([false, true]);
+
+                const row = await db.managedSessionGrant.findUniqueOrThrow({
+                    where: { grantId: issued.grant.grantId },
+                });
+                expect(row.revokedAt).not.toBeNull();
+                // The first reason stands, so an audit reads what actually
+                // ended the access rather than the last retry to arrive.
+                expect(['removed-a', 'removed-b']).toContain(row.revokedReason);
+                expect(await db.managedSessionGrant.count({
+                    where: { sessionId: scopeAt(1).sessionId, viewerAccountId: MEMBER },
+                })).toBe(1);
+            });
+
+            it('never leaves the older bearer usable when a re-add races the removal', async () => {
+                /*
+                 * The outcome that matters is not which call wins. It is that
+                 * no interleaving leaves generation 1's bearer authorised: the
+                 * re-add moves the mark, and the read side refuses anything
+                 * below it whether or not the removal ever landed.
+                 */
+                const first = await mintAt(1);
+                expect(first.ok).toBe(true);
+                if (!first.ok) return;
+
+                const [, rejoined] = await Promise.all([
+                    grants.revokeReadGrant({ scope: scopeAt(1), reason: 'removed', now: NOW }),
+                    mintAt(2),
+                ]);
+
+                const claims = {
+                    v: 1 as const,
+                    grantId: first.grant.grantId,
+                    accountId: first.grant.accountId,
+                    sessionId: first.grant.sessionId,
+                    tenantId: 'tenant-1',
+                    projectId: 'project-1',
+                    purpose: 'transcript-read' as const,
+                    viewerAccountId: MEMBER,
+                    expiresAt: first.grant.expiresAt,
+                };
+                expect((await grants.resolveLiveGrant({ claims, now: NOW })).ok).toBe(false);
+                // Whichever way it interleaved, the re-add either issued or was
+                // refused — never issued *and* left the old bearer alive.
+                if (rejoined.ok) {
+                    expect(rejoined.grant.grantId).not.toBe(first.grant.grantId);
+                }
+            });
+
+            it('does not double-count a generation when two callers advance it at once', async () => {
+                // Both advance to the same number; the mark must end there, not
+                // beyond it, or the parent's next call is refused as stale.
+                await Promise.all([mintAt(3), mintAt(3)]);
+                const mark = await db.managedReadAclWatermark.findUniqueOrThrow({
+                    where: {
+                        sessionId_viewerAccountId: {
+                            sessionId: scopeAt(3).sessionId,
+                            viewerAccountId: MEMBER,
+                        },
+                    },
+                });
+                expect(mark.revision).toBe(3);
+            });
+        });
+
+        describe('reading a token back instead of minting another', () => {
+            it('answers a second reader without touching the grant', async () => {
+                /*
+                 * Two tabs. The second one holds no bearer and asking it to
+                 * mint would either be refused for the live grant in the way or
+                 * replace that grant — which would silently break the first
+                 * tab. Resolving hands back the same row.
+                 */
+                const issued = await mintAt(1);
+                expect(issued.ok).toBe(true);
+                if (!issued.ok) return;
+                const before = await db.managedSessionGrant.findUniqueOrThrow({
+                    where: { grantId: issued.grant.grantId },
+                });
+
+                const resolved = await grants.resolveReadGrant({
+                    scope: scopeAt(1),
+                    requestedTokenExpiresAt: NOW + 60_000,
+                    now: NOW,
+                });
+                expect(resolved.ok).toBe(true);
+                if (!resolved.ok) return;
+                expect(resolved.resolved.grant.grantId).toBe(issued.grant.grantId);
+                // The token may be shorter than the grant; the grant is not.
+                expect(resolved.resolved.tokenExpiresAt).toBe(NOW + 60_000);
+                expect(await db.managedSessionGrant.findUniqueOrThrow({
+                    where: { grantId: issued.grant.grantId },
+                })).toEqual(before);
+            });
+
+            it('never answers later than the grant itself', async () => {
+                const issued = await mintAt(1);
+                expect(issued.ok).toBe(true);
+                if (!issued.ok) return;
+                const resolved = await grants.resolveReadGrant({
+                    scope: scopeAt(1),
+                    requestedTokenExpiresAt: NOW + 10 * HOUR,
+                    now: NOW,
+                });
+                expect(resolved.ok).toBe(true);
+                if (!resolved.ok) return;
+                expect(resolved.resolved.tokenExpiresAt).toBe(issued.grant.expiresAt);
+            });
+
+            it('creates nothing when there is no grant', async () => {
+                expect(await grants.resolveReadGrant({
+                    scope: scopeAt(1), requestedTokenExpiresAt: NOW + 60_000, now: NOW,
+                })).toEqual({ ok: false, reason: 'grant-unknown' });
+                // Scoped to this fixture's own session: other cases in this
+                // file leave rows for the same viewer on sessions of their own.
+                expect(await db.managedSessionGrant.findMany({
+                    where: { sessionId: scopeAt(1).sessionId, viewerAccountId: MEMBER },
+                })).toEqual([]);
+                // Read-only: a resolve must not create the mark either.
+                expect(await db.managedReadAclWatermark.findMany({
+                    where: { sessionId: scopeAt(1).sessionId, viewerAccountId: MEMBER },
+                })).toEqual([]);
+            });
+
+            it('refuses a withdrawn grant', async () => {
+                expect((await mintAt(1)).ok).toBe(true);
+                await grants.revokeReadGrant({
+                    scope: scopeAt(1), reason: 'member-removed', now: NOW,
+                });
+                expect(await grants.resolveReadGrant({
+                    scope: scopeAt(1), requestedTokenExpiresAt: NOW + 60_000, now: NOW,
+                })).toEqual({ ok: false, reason: 'revoked' });
+            });
+
+            it('refuses an expired grant rather than extending it', async () => {
+                const issued = await mintAt(1, { expiresAt: NOW + 1_000 });
+                expect(issued.ok).toBe(true);
+                expect(await grants.resolveReadGrant({
+                    scope: scopeAt(1),
+                    requestedTokenExpiresAt: NOW + 10_000,
+                    now: NOW + 2_000,
+                })).toEqual({ ok: false, reason: 'expired' });
+            });
+
+            it('refuses a caller from a superseded generation', async () => {
+                expect((await mintAt(2)).ok).toBe(true);
+                expect(await grants.resolveReadGrant({
+                    scope: scopeAt(1), requestedTokenExpiresAt: NOW + 60_000, now: NOW,
+                })).toEqual({ ok: false, reason: 'revision-stale' });
+            });
         });
     });
 });

@@ -35,6 +35,11 @@ import {
 } from './managedProcessGroup';
 import type { ManagedRuntimeIdentity } from './managedRuntimeIdentity';
 import { logger } from '@/ui/logger';
+import {
+    ManagedSpawnEnvelopeError,
+    parseManagedSpawnEnvelope,
+    type ManagedSpawnEnvelope,
+} from '@/managed/managedSpawnBootstrap';
 
 export const MANAGED_RPC_METHODS = [
     'managed:spawn', 'managed:stop', 'managed:receipt', 'managed:lease',
@@ -46,6 +51,22 @@ export type ManagedSpawnRequest = {
     environmentVariables?: Record<string, string>;
     initialPrompt?: string;
     initialPromptLocalId?: string;
+    /**
+     * The rest of the bootstrap envelope, which arrives **flat** in this same
+     * object: `model`, `effort`, `bootstrap`, `gateway`.
+     *
+     * Not nested under a field of its own, because the parent already signs
+     * this shape — `buildManagedSpawnParams` returns exactly these keys at the
+     * top level and the dispatcher forwards them unchanged. Introducing a
+     * wrapper here would have rejected every real spawn while every test that
+     * built its own request still passed.
+     *
+     * Left off this type on purpose: the fields are untrusted input and are
+     * only ever read through `parseManagedSpawnEnvelope`, which is what gives
+     * them a type. They carry a scoped bearer and the session's raw key, so
+     * they are never logged, never put in an environment, and never echoed in
+     * a failure.
+     */
 };
 
 export type ManagedSpawnOutcome =
@@ -73,6 +94,17 @@ export type ManagedSpawnContext = {
     projectId: string;
     /** Monotonic instant after which this runtime may no longer write. */
     leaseExpiresMonotonic: number;
+    /**
+     * The envelope, validated here and **re-serialized from what was parsed**.
+     *
+     * The launcher parses it again on its own side — it does not trust this
+     * process — and re-serializing the parsed value is what makes the two
+     * parses see the same document: a field this runtime did not validate
+     * cannot ride along inside the bytes that cross that boundary.
+     */
+    bootstrapEnvelope: Buffer;
+    /** The same content, parsed. For routing decisions here; never logged. */
+    envelope: ManagedSpawnEnvelope;
 };
 
 export type ManagedRuntime = {
@@ -405,9 +437,34 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                 throw new ManagedRpcError('epoch-transition-in-progress');
             }
 
+            /*
+             * The envelope is validated **before** anything is launched, and
+             * the failure says which field was wrong and nothing about its
+             * value: this document holds a bearer and a session key.
+             *
+             * A refusal here leaves the receipt in `spawning`, which is the
+             * honest state — the request was accepted and no child was started,
+             * so a reconciliation pass decides what happened rather than this
+             * path guessing.
+             */
+            let envelope: ManagedSpawnEnvelope;
+            try {
+                // The request **is** the envelope: the parent's signed wire.
+                envelope = parseManagedSpawnEnvelope(request, runtime.now());
+            } catch (error) {
+                const field = error instanceof ManagedSpawnEnvelopeError ? error.field : 'envelope';
+                runtime.store.update(key, {
+                    state: 'failed', failureReason: 'not-started',
+                }, runtime.now());
+                throw new ManagedRpcError('spawn-rejected', `envelope: ${field}`);
+            }
+
             // Everything the launcher is told comes from the verified token.
             const context: ManagedSpawnContext = {
                 operationKey: key,
+                // Only what parsed: see the field's own note.
+                bootstrapEnvelope: Buffer.from(JSON.stringify(envelope), 'utf8'),
+                envelope,
                 runId: claims.runId,
                 attemptId: claims.attemptId,
                 epoch: claims.epoch,

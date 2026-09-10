@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { canonicalManagedPayloadDigest, parseManagedVerifierKey, type ManagedOp } from './managedDispatchToken';
+import { GATEWAY_ROUTES } from '@/managed/managedSpawnBootstrap';
+import { MANAGED_PROJECT_ROOT } from './managedRuntimeIdentity';
 import { createManagedReceiptStore, managedOperationKey } from './managedReceiptStore';
 import {
     applyManagedRpcRestrictions,
@@ -20,6 +22,46 @@ const keys = generateKeyPairSync('ed25519');
 const verifier = parseManagedVerifierKey(keys.publicKey.export({ format: 'der', type: 'spki' }) as Buffer);
 
 const NOW = 1_800_000_000_000;
+/**
+ * A bootstrap envelope of the shape the parent actually sends.
+ *
+ * Built from the product's own route table rather than a copy of it: a literal
+ * here would keep passing after the real one moved, and the gateway row is
+ * matched whole by the parser precisely because a plausible-looking field is
+ * the mistake worth catching.
+ */
+function envelope(over: Record<string, unknown> = {}): Record<string, unknown> {
+    const route = GATEWAY_ROUTES.find((candidate) => candidate.agent === 'claude')!;
+    return {
+        directory: MANAGED_PROJECT_ROOT,
+        agent: 'claude',
+        model: 'claude-opus-5',
+        effort: 'high',
+        initialPrompt: 'hello',
+        initialPromptLocalId: 'local-1',
+        bootstrap: {
+            version: 1,
+            serverOrigin: 'https://happy.example.test',
+            sessionId: 'sess-1',
+            encryptionVariant: 'dataKey',
+            rawKeyBase64: Buffer.alloc(32, 9).toString('base64'),
+            wrappedKeyBase64: Buffer.alloc(105, 8).toString('base64'),
+            scopedToken: 'scoped.bearer.for.this.run',
+            // The runtime's clock, not the wall clock: the parser compares
+            // against the time the handler passes it.
+            tokenExpiresAt: NOW + 3_600_000,
+        },
+        gateway: {
+            baseUrl: `https://happy.example.test${route.path}`,
+            capability: 'anthropic-messages',
+            provider: route.provider,
+            endpoint: route.endpoint,
+            model: 'claude-opus-5',
+        },
+        ...over,
+    };
+}
+
 const RUN = 'run-1';
 const ATTEMPT = 'attempt-1';
 const OP_KEY = managedOperationKey({ runId: RUN, attemptId: ATTEMPT });
@@ -116,14 +158,14 @@ afterEach(() => rmSync(root, { recursive: true, force: true }));
 describe('token scope is checked against the trusted identity', () => {
     it('refuses a token whose projectId is not this runtime\'s project', async () => {
         await grantLease();
-        await expect(handlers.spawn(call('spawn', { directory: '/w' }, { projectId: 'proj-2' })))
+        await expect(handlers.spawn(call('spawn', envelope(), { projectId: 'proj-2' })))
             .rejects.toThrowError(/token-wrong-project|wrong-project/);
         expect(spawnCalls).toBe(0);
     });
 
     it('refuses a token signed under a different key id', async () => {
         await grantLease();
-        await expect(handlers.spawn(call('spawn', { directory: '/w' }, { kid: 'kid-2' })))
+        await expect(handlers.spawn(call('spawn', envelope(), { kid: 'kid-2' })))
             .rejects.toThrowError(/key/);
         expect(spawnCalls).toBe(0);
     });
@@ -132,7 +174,7 @@ describe('token scope is checked against the trusted identity', () => {
 describe('lease', () => {
     it('starts expired so a restart cannot execute on an old deadline', async () => {
         expect(handlers.isLeaseValid()).toBe(false);
-        await expect(handlers.spawn(call('spawn', { directory: '/w' })))
+        await expect(handlers.spawn(call('spawn', envelope())))
             .rejects.toThrowError(/lease-expired/);
         expect(spawnCalls).toBe(0);
     });
@@ -196,25 +238,25 @@ describe('lease', () => {
 describe('spawn', () => {
     it('runs a request exactly once and returns the same receipt on retry', async () => {
         await grantLease();
-        const first = await handlers.spawn(call('spawn', { directory: '/w' }));
-        const second = await handlers.spawn(call('spawn', { directory: '/w' }));
+        const first = await handlers.spawn(call('spawn', envelope()));
+        const second = await handlers.spawn(call('spawn', envelope()));
         expect(spawnCalls).toBe(1);
         expect(second.receipt.operationKey).toBe(first.receipt.operationKey);
     });
 
     it('refuses a second spawn that carries different params under the same operation', async () => {
         await grantLease();
-        await handlers.spawn(call('spawn', { directory: '/w' }));
+        await handlers.spawn(call('spawn', envelope()));
         // Same run+attempt, different signed payload: this is a conflict, not a
         // retry, and answering it with the first result would hide the bug.
-        await expect(handlers.spawn(call('spawn', { directory: '/other' })))
+        await expect(handlers.spawn(call('spawn', envelope({ initialPrompt: 'a different prompt' }))))
             .rejects.toThrowError(/operation-payload-conflict/);
         expect(spawnCalls).toBe(1);
     });
 
     it('records the payload digest without storing the payload', async () => {
         await grantLease();
-        await handlers.spawn(call('spawn', { directory: '/secret-path', initialPrompt: 'secret text' }));
+        await handlers.spawn(call('spawn', envelope({ initialPrompt: 'secret text' })));
         const { readFileSync, readdirSync } = await import('node:fs');
         const dir = join(root, 'receipts');
         const raw = readdirSync(dir).map((f) => readFileSync(join(dir, f), 'utf8')).join('');
@@ -225,7 +267,7 @@ describe('spawn', () => {
     it('refuses a dispatch that a stop already tombstoned', async () => {
         await grantLease();
         await handlers.stop(call('stop', {}));
-        await expect(handlers.spawn(call('spawn', { directory: '/w' })))
+        await expect(handlers.spawn(call('spawn', envelope())))
             .rejects.toThrowError(/stopped-before-dispatch/);
         expect(spawnCalls).toBe(0);
     });
@@ -233,7 +275,7 @@ describe('spawn', () => {
     it('keeps an unexplained spawn failure recoverable instead of calling it failed', async () => {
         await grantLease();
         spawnResult = async () => { throw new Error('socket closed at /tmp/x with token abc'); };
-        await expect(handlers.spawn(call('spawn', { directory: '/w' })))
+        await expect(handlers.spawn(call('spawn', envelope())))
             .rejects.toThrowError(ManagedRpcError);
         const stored = runtime.store.read(OP_KEY);
         expect(stored.kind).toBe('ok');
@@ -245,7 +287,7 @@ describe('spawn', () => {
     it('does not leak the underlying error text to the caller', async () => {
         await grantLease();
         spawnResult = async () => { throw new Error('token=abc123 at /home/u/.happy/access.key'); };
-        await handlers.spawn(call('spawn', { directory: '/w' })).catch((error: Error) => {
+        await handlers.spawn(call('spawn', envelope())).catch((error: Error) => {
             expect(error.message).not.toContain('abc123');
             expect(error.message).not.toContain('access.key');
         });
@@ -254,7 +296,7 @@ describe('spawn', () => {
     it('marks a run failed only on typed evidence that nothing started', async () => {
         await grantLease();
         spawnResult = async () => ({ type: 'error', errorMessage: 'bad directory', started: false });
-        await expect(handlers.spawn(call('spawn', { directory: '/w' }))).rejects.toThrow();
+        await expect(handlers.spawn(call('spawn', envelope()))).rejects.toThrow();
         const stored = runtime.store.read(OP_KEY);
         if (stored.kind === 'ok') expect(stored.receipt.state).toBe('failed');
     });
@@ -270,7 +312,7 @@ describe('spawn', () => {
         spawnResult = () => new Promise((resolve) => {
             release = () => resolve({ type: 'success', sessionId: 'sess-1', pid: 4242 });
         });
-        const inFlight = handlers.spawn(call('spawn', { directory: '/w' }));
+        const inFlight = handlers.spawn(call('spawn', envelope()));
         await Promise.resolve();
         await handlers.stop(call('stop', {}));
         livePgids.add(4242);
@@ -289,7 +331,7 @@ describe('spawn', () => {
     it('refuses new work once the lease has expired', async () => {
         await grantLease({ leaseMs: 1_000 });
         monotonic += 2_000;
-        await expect(handlers.spawn(call('spawn', { directory: '/w' })))
+        await expect(handlers.spawn(call('spawn', envelope())))
             .rejects.toThrowError(/lease-expired/);
     });
 });
@@ -298,7 +340,7 @@ describe('lease expiry does not silently leave a child running', () => {
     it('reports an action-required handoff when no trusted backend can fence', async () => {
         await grantLease();
         livePgids.add(4242);
-        await handlers.spawn(call('spawn', { directory: '/w' }));
+        await handlers.spawn(call('spawn', envelope()));
         monotonic += 120_000;
 
         const outcome = await handlers.runLeaseMaintenance();
@@ -313,7 +355,7 @@ describe('lease expiry does not silently leave a child running', () => {
 describe('receipt query', () => {
     it('returns only the signed run and attempt scope', async () => {
         await grantLease();
-        await handlers.spawn(call('spawn', { directory: '/w' }));
+        await handlers.spawn(call('spawn', envelope()));
         runtime.store.claim({
             requestKey: managedOperationKey({ runId: 'run-2', attemptId: 'attempt-9' }),
             runId: 'run-2', attemptId: 'attempt-9', epoch: 0, now: wallClock,
@@ -332,7 +374,7 @@ describe('receipt query', () => {
     it('does not call a spawning receipt determinate', async () => {
         await grantLease();
         spawnResult = async () => { throw new Error('unclear'); };
-        await handlers.spawn(call('spawn', { directory: '/w' })).catch(() => {});
+        await handlers.spawn(call('spawn', envelope())).catch(() => {});
         const result = await handlers.receipt(call('query', {}));
         expect(result.receipts[0]!.certainty).toBe('uncertain');
     });
@@ -401,7 +443,7 @@ describe('lease expiry hands off by stable identity', () => {
     beforeEach(async () => {
         await grantLease();
         livePgids.add(4242);
-        await handlers.spawn(call('spawn', { directory: '/w' }));
+        await handlers.spawn(call('spawn', envelope()));
         monotonic += 120_000;
     });
 
@@ -460,7 +502,7 @@ describe('epoch promotion barrier against an in-flight spawn', () => {
 
         let release: (v: ManagedSpawnOutcome) => void = () => {};
         spawnResult = () => new Promise((resolve) => { release = resolve; });
-        const inFlight = handlers.spawn(call('spawn', { directory: '/w' }));
+        const inFlight = handlers.spawn(call('spawn', envelope()));
         await Promise.resolve();
         await Promise.resolve();
 
@@ -484,10 +526,124 @@ describe('epoch promotion barrier against an in-flight spawn', () => {
         // The caller-supplied params claim a different run; the launcher must
         // be told the signed one.
         await handlers.spawn({
-            token: mint('spawn', { directory: '/w', runId: 'attacker-run' }),
-            params: { directory: '/w', runId: 'attacker-run' },
+            token: mint('spawn', envelope({ runId: 'attacker-run' })),
+            params: envelope({ runId: 'attacker-run' }),
         });
         expect(seen).toMatchObject({ runId: RUN, attemptId: ATTEMPT, epoch: 0, projectId: 'proj-1' });
+    });
+});
+
+describe('the bootstrap envelope the launcher is handed', () => {
+    /*
+     * The launcher does not trust this process and parses the envelope again on
+     * its own side. What this runtime owes it is that the bytes it parses are
+     * bytes this runtime validated — and that a document which fails validation
+     * never reaches it at all.
+     */
+    beforeEach(async () => {
+        await grantLease();
+    });
+
+    it('hands over exactly what parsed, and nothing that rode along', async () => {
+        let seen: { bootstrapEnvelope: Buffer; envelope: unknown } | undefined;
+        runtime.spawn = async (_request, context) => {
+            seen = context as never;
+            return { type: 'success', sessionId: 'sess-1', pid: 4242 };
+        };
+        const payload = { ...envelope(), smuggled: 'a field nobody validated' };
+        await handlers.spawn({ token: mint('spawn', payload), params: payload });
+
+        const parsed = JSON.parse(seen!.bootstrapEnvelope.toString('utf8'));
+        // The field is gone from the bytes that cross the boundary: only what
+        // the parser produced is re-serialized.
+        expect(parsed.smuggled).toBeUndefined();
+        expect(parsed.bootstrap.scopedToken).toBe('scoped.bearer.for.this.run');
+        expect(seen!.envelope).toEqual(parsed);
+    });
+
+    it.each([
+        ['nothing but a directory', undefined],
+        ['a directory that is not a path this runtime runs in', 'not-a-root'],
+        ['a directory that is not the managed project root', { directory: '/somewhere/else' }],
+        ['an agent this runtime does not support', { agent: 'not-an-agent' }],
+        ['a gateway route belonging to another agent', { gateway: { baseUrl: 'https://happy.example.test/api/cloud/gateway/openai/v1/responses', capability: 'openai-responses', provider: 'openai', endpoint: 'openai-responses', model: 'claude-opus-5' } }],
+        ['a model that disagrees with the gateway', { model: 'claude-sonnet-5' }],
+        ['a raw key that is not 32 bytes', { bootstrap: { rawKeyBase64: Buffer.alloc(16).toString('base64') } }],
+    ])('refuses %s without reaching the launcher', async (_name, over) => {
+        let launched = false;
+        runtime.spawn = async () => {
+            launched = true;
+            return { type: 'success', sessionId: 'sess-1', pid: 4242 };
+        };
+        const payload = over === undefined
+            ? { directory: MANAGED_PROJECT_ROOT }
+            : typeof over === 'string'
+                ? { directory: over }
+                : {
+                    ...envelope(),
+                    ...over,
+                    ...(('bootstrap' in over)
+                        ? { bootstrap: { ...(envelope().bootstrap as object), ...(over as { bootstrap: object }).bootstrap } }
+                        : {}),
+                };
+        await expect(handlers.spawn({ token: mint('spawn', payload), params: payload }))
+            .rejects.toThrowError(/spawn-rejected/);
+        expect(launched).toBe(false);
+    });
+
+    it('names the field it refused and never the value', async () => {
+        /*
+         * The document holds a scoped bearer and the session's raw key. A
+         * message that echoed the offending value would put one of them in a
+         * log line, which is the one place a secret is copied without anybody
+         * deciding to copy it.
+         */
+        const payload = {
+            ...envelope(),
+            bootstrap: { ...(envelope().bootstrap as object), scopedToken: '' },
+        };
+        const error = await handlers.spawn({ token: mint('spawn', payload), params: payload })
+            .then(() => null, (caught: Error) => caught);
+        expect(error).toBeTruthy();
+        expect(error!.message).toContain('bootstrap.scopedToken');
+        // Nothing from the document itself.
+        expect(error!.message).not.toContain('scoped.bearer.for.this.run');
+        expect(error!.message).not.toContain(Buffer.alloc(32, 9).toString('base64'));
+    });
+});
+
+describe('the wire shape the parent sends', () => {
+    /*
+     * The defect this exists for: this handler looked for the envelope under a
+     * field of its own, while the parent's builder returns those keys **flat**
+     * and the dispatcher signs and forwards that shape unchanged. Every real
+     * spawn was refused, and every test that built its own nested request still
+     * passed.
+     *
+     * The cross-package half — that the parent's *actual* builder produces
+     * exactly these keys — lives in the parent's own suite, because this
+     * package has to build and test on a checkout where the parent does not
+     * exist.
+     */
+    it('takes the envelope from the request itself, with nothing nested', async () => {
+        await grantLease();
+        let seen: { envelope: { bootstrap: { scopedToken: string } } } | undefined;
+        runtime.spawn = async (_request, context) => {
+            seen = context as never;
+            return { type: 'success', sessionId: 'sess-1', pid: 4242 };
+        };
+        const flat = envelope();
+        await expect(handlers.spawn(call('spawn', flat)))
+            .resolves.toMatchObject({ accepted: true, receipt: { state: 'running' } });
+        expect(seen!.envelope.bootstrap.scopedToken).toBe('scoped.bearer.for.this.run');
+    });
+
+    it('refuses the same content nested under a field of its own', async () => {
+        // The shape this handler briefly required. It is not the wire.
+        await grantLease();
+        const nested = { directory: MANAGED_PROJECT_ROOT, envelope: envelope() };
+        await expect(handlers.spawn(call('spawn', nested)))
+            .rejects.toThrowError(/spawn-rejected/);
     });
 });
 
@@ -521,7 +677,7 @@ describe('stop always reaches the trusted backend', () => {
         await grantLease();
         const backend = withBackend();
         livePgids.add(4242);
-        await handlers.spawn(call('spawn', { directory: '/w' }));
+        await handlers.spawn(call('spawn', envelope()));
         runtime.processGroupDeps!.kill = () => { throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); };
 
         await handlers.stop(call('stop', {}));
@@ -533,7 +689,7 @@ describe('stop always reaches the trusted backend', () => {
         const backend = withBackend();
         backend.setResult({ requested: false, detail: 'launcher-unavailable' });
         livePgids.add(4242);
-        await handlers.spawn(call('spawn', { directory: '/w' }));
+        await handlers.spawn(call('spawn', envelope()));
 
         const outcome = await handlers.stop(call('stop', {}));
         // The intent is durable, the delivery failed, and nothing ended —
@@ -546,7 +702,7 @@ describe('stop always reaches the trusted backend', () => {
     it('reports that no backend exists rather than implying a stop', async () => {
         await grantLease();
         livePgids.add(4242);
-        await handlers.spawn(call('spawn', { directory: '/w' }));
+        await handlers.spawn(call('spawn', envelope()));
         const outcome = await handlers.stop(call('stop', {}));
         expect(outcome.stopIntentRecorded).toBe(true);
         expect(outcome.backendStop).toEqual({ requested: false, detail: 'no-launch-backend' });
@@ -557,7 +713,7 @@ describe('stop always reaches the trusted backend', () => {
         await grantLease();
         withBackend();
         livePgids.add(4242);
-        await handlers.spawn(call('spawn', { directory: '/w' }));
+        await handlers.spawn(call('spawn', envelope()));
         killed.length = 0;
 
         await handlers.stop(call('stop', {}));
@@ -580,7 +736,7 @@ describe('lease renewal, promotion and expiry share one serial section', () => {
         const stops = backend();
         await grantLease({ renewalSeq: 1, leaseMs: 1_000 });
         livePgids.add(4242);
-        await handlers.spawn(call('spawn', { directory: '/w' }));
+        await handlers.spawn(call('spawn', envelope()));
         monotonic += 5_000;
 
         // The expiry sees an expired lease, but a renewal is queued behind it.
@@ -629,7 +785,7 @@ describe('lease renewal, promotion and expiry share one serial section', () => {
         await Promise.resolve();
         const other = managedOperationKey({ runId: 'run-2', attemptId: 'a-2' });
         expect(other).not.toBe(OP_KEY);
-        await expect(handlers.spawn(call('spawn', { directory: '/w' })))
+        await expect(handlers.spawn(call('spawn', envelope())))
             .rejects.toThrowError(/lease-expired|epoch-transition-in-progress/);
         releaseStop();
         await expiry;
@@ -714,7 +870,7 @@ describe('spawn acceptance is not the stop delivery result', () => {
         };
         let release: (v: ManagedSpawnOutcome) => void = () => {};
         spawnResult = () => new Promise((resolve) => { release = resolve; });
-        const inFlight = handlers.spawn(call('spawn', { directory: '/w' }));
+        const inFlight = handlers.spawn(call('spawn', envelope()));
         await Promise.resolve();
         await handlers.stop(call('stop', {}));
         livePgids.add(4242);
@@ -741,7 +897,7 @@ describe('expiry versus a spawn that is still in flight', () => {
             requestStop: async () => ({ requested: true, detail: 'ok' }),
         };
         livePgids.add(4242);
-        await handlers.spawn(call('spawn', { directory: '/w' }));
+        await handlers.spawn(call('spawn', envelope()));
         monotonic += 5_000;
 
         await handlers.runLeaseMaintenance();
@@ -760,7 +916,7 @@ describe('expiry versus a spawn that is still in flight', () => {
         };
         let release: (v: ManagedSpawnOutcome) => void = () => {};
         spawnResult = () => new Promise((resolve) => { release = resolve; });
-        const inFlight = handlers.spawn(call('spawn', { directory: '/w' }));
+        const inFlight = handlers.spawn(call('spawn', envelope()));
         await Promise.resolve();
 
         monotonic += 5_000;
@@ -783,7 +939,7 @@ describe('expiry versus a spawn that is still in flight', () => {
         };
         let release: (v: ManagedSpawnOutcome) => void = () => {};
         spawnResult = () => new Promise((resolve) => { release = resolve; });
-        const inFlight = handlers.spawn(call('spawn', { directory: '/w' }));
+        const inFlight = handlers.spawn(call('spawn', envelope()));
         await Promise.resolve();
         monotonic += 5_000;
 
@@ -811,7 +967,7 @@ describe('expiry versus a spawn that is still in flight', () => {
             launched = true;
             return { type: 'success', sessionId: 'sess-1', pid: 4242 };
         };
-        const inFlight = handlers.spawn(call('spawn', { directory: '/w' }));
+        const inFlight = handlers.spawn(call('spawn', envelope()));
         await Promise.resolve();
         monotonic += 5_000;
         await handlers.runLeaseMaintenance();
@@ -831,7 +987,7 @@ describe('shutdown entry gate is separate from store ownership', () => {
     it('refuses a new spawn once entries are closed', async () => {
         await grantLease();
         handlers.closeEntries();
-        await expect(handlers.spawn(call('spawn', { directory: '/w' })))
+        await expect(handlers.spawn(call('spawn', envelope())))
             .rejects.toThrowError(/shutting-down/);
         expect(spawnCalls).toBe(0);
     });
@@ -847,7 +1003,7 @@ describe('shutdown entry gate is separate from store ownership', () => {
         await grantLease();
         let release: (v: ManagedSpawnOutcome) => void = () => {};
         spawnResult = () => new Promise((resolve) => { release = resolve; });
-        const inFlight = handlers.spawn(call('spawn', { directory: '/w' }));
+        const inFlight = handlers.spawn(call('spawn', envelope()));
         await Promise.resolve();
 
         handlers.closeEntries();
@@ -865,7 +1021,7 @@ describe('explicit stop is drained too', () => {
     it('waits for a stop that is still handing over to the backend', async () => {
         await grantLease();
         livePgids.add(4242);
-        await handlers.spawn(call('spawn', { directory: '/w' }));
+        await handlers.spawn(call('spawn', envelope()));
 
         let handoverFinished = false;
         runtime.fencingBackend = {
@@ -899,7 +1055,7 @@ describe('a stop obligation survives a lease renewal', () => {
         };
         await grantLease({ renewalSeq: 1, leaseMs: 1_000 });
         livePgids.add(4242);
-        await handlers.spawn(call('spawn', { directory: '/w' }));
+        await handlers.spawn(call('spawn', envelope()));
         monotonic += 5_000;
         const expiry = await handlers.runLeaseMaintenance();
         expect(expiry.actionRequired).toBe(true);
@@ -986,7 +1142,7 @@ describe('maintenance reports what it could not read', () => {
         };
         await grantLease({ renewalSeq: 1, leaseMs: 1_000 });
         livePgids.add(4242);
-        await handlers.spawn(call('spawn', { directory: '/w' }));
+        await handlers.spawn(call('spawn', envelope()));
         monotonic += 5_000;
 
         await handlers.runLeaseMaintenance();
@@ -1068,8 +1224,8 @@ describe('epoch promotion rests on the backend proof, not on local pid guesses',
             launcherEntered();
         });
         const other = handlers.spawn({
-            token: mint('spawn', { directory: '/w' }, { runId: 'run-2', attemptId: 'a-2' }),
-            params: { directory: '/w' },
+            token: mint('spawn', envelope(), { runId: 'run-2', attemptId: 'a-2' }),
+            params: envelope(),
         });
         await inLauncher;
 
