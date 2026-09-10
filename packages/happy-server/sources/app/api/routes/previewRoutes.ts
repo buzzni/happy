@@ -134,21 +134,84 @@ export interface PreviewRelayMachineSocket {
     timeout(ms: number): { emitWithAck(event: string, payload: unknown): Promise<unknown> };
 }
 
+/**
+ * specs/runtime-isolation-hardening (H3, P1) — the event a *bound* request
+ * travels on.
+ *
+ * A daemon that predates runtime binding has no listener for it, so its ack
+ * simply never comes and nothing is executed. That is the point: the
+ * `bindingEnforced` echo check on the legacy event catches a downgraded
+ * *response*, but only after the daemon has already run the request against
+ * whatever was on that port — which for a POST is not something a 502 can
+ * take back.
+ */
+export const BOUND_PROXY_EVENT = 'preview-proxy-http-bound';
+
+/** Methods that may be re-issued to another candidate socket. */
+const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
 export async function relayProxyHttpRequest(
     machineSockets: PreviewRelayMachineSocket[],
     payload: ProxyHttpRequestPayload,
     timeoutMs = RPC_TIMEOUT_MS,
 ): Promise<ProxyRpcResponse> {
-    const attempts = machineSockets.map(async (socket) => {
-        const raw = await socket
-            .timeout(timeoutMs)
-            .emitWithAck('proxy-http-request', payload);
-        if (!isProxyRpcResponse(raw)) {
-            throw new Error(`Malformed proxy response from socket ${socket.id}`);
+    // Legacy (unbound) path, unchanged: race every candidate and take the
+    // first answer. Reconnects leave stale sockets behind and nothing here
+    // knows which is live.
+    if (!payload.binding) {
+        const attempts = machineSockets.map(async (socket) => {
+            const raw = await socket
+                .timeout(timeoutMs)
+                .emitWithAck('proxy-http-request', payload);
+            if (!isProxyRpcResponse(raw)) {
+                throw new Error(`Malformed proxy response from socket ${socket.id}`);
+            }
+            return raw;
+        });
+        return Promise.any(attempts);
+    }
+
+    // Bound path: one connection at a time, never in parallel. A fan-out
+    // executes the same request on every candidate, and for a mutation that
+    // is the same click landing twice on two runtimes.
+    const retryable = IDEMPOTENT_METHODS.has(payload.method.toUpperCase());
+    const deadline = Date.now() + timeoutMs;
+    let lastError: Error | null = null;
+    for (const socket of machineSockets) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        try {
+            const raw = await socket
+                .timeout(Math.min(timeoutMs, remaining))
+                .emitWithAck(BOUND_PROXY_EVENT, payload);
+            if (!isProxyRpcResponse(raw)) {
+                throw new Error(`Malformed proxy response from socket ${socket.id}`);
+            }
+            return raw;
+        } catch (err) {
+            lastError = err instanceof Error ? err : new Error(String(err));
+            // A socket that did not answer may still have done the work. Only
+            // a read may be re-issued somewhere else.
+            if (!retryable) break;
         }
-        return raw;
-    });
-    return Promise.any(attempts);
+    }
+    throw new BoundRelayUnansweredError(lastError?.message ?? 'no candidate daemon answered');
+}
+
+/**
+ * No candidate answered a bound request. Either the daemon predates the bound
+ * event (no listener, so no ack) or the socket is stale. Reported as one
+ * thing on purpose: from here they are indistinguishable, and the operator's
+ * next step — check that happy-cli is current — is the same. It is *not*
+ * folded into the generic relay timeout, because a silent old daemon is the
+ * failure this event was added to make visible.
+ */
+export class BoundRelayUnansweredError extends Error {
+    readonly code = LEASE_UNSUPPORTED_CODE;
+    constructor(detail: string) {
+        super(detail);
+        this.name = 'BoundRelayUnansweredError';
+    }
 }
 
 /**
@@ -166,6 +229,22 @@ export function matchesTrustedSecret(provided: unknown, expected: string | undef
     // the same as equal ones.
     const digest = (value: Buffer) => crypto.createHash('sha256').update(value).digest();
     return crypto.timingSafeEqual(digest(a), digest(b));
+}
+
+/**
+ * specs/runtime-isolation-hardening (H3, P4) — the token to hand the re-mint
+ * page, or nothing.
+ *
+ * The studio reads `previousToken` as "this session was bound" and forces a
+ * trusted, bound re-mint on it. So it may only be sent when the token really
+ * did carry a binding: passing an unbound or unreadable one would demand a
+ * shared secret and a current daemon for a flow that works without either
+ * today. Signature is checked (expiry is not — a stale bound token is exactly
+ * the case recovery exists for), so nothing a caller made up gets forwarded.
+ */
+function recoverableBoundToken(token: string | undefined): string | undefined {
+    if (!token) return undefined;
+    return verifyExpiredPreviewTokenForRecovery(token)?.bind ? token : undefined;
 }
 
 /** Decode the replaced token for planTrustedMint — signature required, expiry not. */
@@ -870,7 +949,7 @@ export function previewRoutes(app: Fastify) {
                                 reason: 'expired-or-invalid',
                                 // Carries what the replaced session was bound
                                 // to, so the re-mint cannot come back weaker.
-                                previousToken: token,
+                                previousToken: recoverableBoundToken(token),
                             }));
                     }
                     return reply.code(401).send({ error: 'Invalid or expired ptoken' });
@@ -904,7 +983,7 @@ export function previewRoutes(app: Fastify) {
                                 reason: 'expired-or-invalid',
                                 // Carries what the replaced session was bound
                                 // to, so the re-mint cannot come back weaker.
-                                previousToken: token,
+                                previousToken: recoverableBoundToken(token),
                             }));
                     }
                     return reply
@@ -1014,6 +1093,12 @@ export function previewRoutes(app: Fastify) {
                     });
                 } catch (err) {
                     log({ module: 'preview', level: 'error' }, `proxy-http-request relay failed for ${machineSockets.length} candidate(s): ${(err as Error).message}`);
+                    if (err instanceof BoundRelayUnansweredError) {
+                        return reply.code(409).send({
+                            error: '이 머신의 daemon 이 결속된 프리뷰 요청에 응답하지 않았습니다. happy-cli 를 업데이트한 뒤 다시 시도하세요.',
+                            code: err.code,
+                        });
+                    }
                     return reply.code(504).send({ error: 'Upstream relay timeout' });
                 }
 
@@ -1036,7 +1121,7 @@ export function previewRoutes(app: Fastify) {
                                 reason: 'expired-or-invalid',
                                 // Carries what the replaced session was bound
                                 // to, so the re-mint cannot come back weaker.
-                                previousToken: token,
+                                previousToken: recoverableBoundToken(token),
                             }));
                     }
                     return reply.code(failure.status).send({ code: rpcResponse.code, error: rpcResponse.message });

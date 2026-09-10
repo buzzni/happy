@@ -34,6 +34,13 @@ import {
     type StopSessionResult,
 } from '@/daemon/sessionIdleReaper';
 import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
+/**
+ * Bound preview requests travel on their own Socket.IO event. Kept as a
+ * constant so the daemon and happy-server cannot drift apart silently — a
+ * mismatch here reads, on the server side, as "this daemon predates runtime
+ * binding", which is exactly what it would be.
+ */
+export const PREVIEW_BOUND_PROXY_EVENT = 'preview-proxy-http-bound';
 import {
     acquireRuntimeLease,
     enforceRelayBinding,
@@ -173,6 +180,17 @@ interface ServerToDaemonEvents {
     // Preview WebSocket relay (raw byte tunnel). Counterpart to
     // proxy-http-request for upgrades (noVNC/websockify, ws, HMR). See
     // daemon/previewWsProxy.ts.
+    [PREVIEW_BOUND_PROXY_EVENT]: (
+        params: {
+            port: number;
+            method: string;
+            path: string;
+            headers: Record<string, string>;
+            bodyB64: string | null;
+            binding: { projectId: string; leaseId: string; workspacePaths?: string[] };
+        },
+        ack: (response: unknown) => void,
+    ) => void;
     'proxy-ws-open': (
         params: { tunnelId: string; port: number; dataB64: string; binding?: { projectId: string; leaseId: string; workspacePaths?: string[] } | null },
         ack: (response: unknown) => void,
@@ -1333,6 +1351,57 @@ export class ApiMachineClient {
         };
     }
 
+    /**
+     * specs/runtime-isolation-hardening (H3) — prove that the runtime still
+     * answering on this port is the one the token was minted for, before any
+     * bytes are relayed. `bindingEnforced` is echoed on success: it is the
+     * only way happy-server can tell an enforcing daemon apart from one that
+     * silently ignored the binding fields.
+     */
+    private async relayPreviewBoundHttp(params: any): Promise<any> {
+        if (params?.binding === undefined || params?.binding === null) {
+            return {
+                type: 'error',
+                code: 'INVALID_REQUEST',
+                message: 'This event carries bound preview requests only',
+            };
+        }
+        return this.relayPreviewHttp(PREVIEW_BOUND_PROXY_EVENT, params);
+    }
+
+    private async relayPreviewHttp(event: string, params: any): Promise<any> {
+        try {
+            const binding = await this.enforcePreviewBinding(params?.binding, params?.port);
+            if (binding.outcome === 'rejected') {
+                logger.debug(`[API MACHINE] ${event} refused: ${binding.code} ${binding.message}`);
+                return { type: 'error', code: binding.code, message: binding.message };
+            }
+            const result = await proxyHttp({
+                port: params?.port,
+                method: params?.method,
+                path: params?.path,
+                headers: params?.headers ?? {},
+                bodyB64: params?.bodyB64 ?? null,
+            });
+            logger.debug(
+                `[API MACHINE] ${event} ${params?.method} ${params?.path} -> ${result.status}${result.truncated ? ' (truncated)' : ''} binding=${binding.outcome}`,
+            );
+            return {
+                type: 'success',
+                ...result,
+                ...(binding.outcome === 'enforced' ? { bindingEnforced: true } : {}),
+            };
+        } catch (e) {
+            if (e instanceof PreviewProxyError) {
+                logger.debug(`[API MACHINE] ${event} failed: ${e.code} ${e.message}`);
+                return { type: 'error', code: e.code, message: e.message };
+            }
+            const message = e instanceof Error ? e.message : String(e);
+            logger.debug(`[API MACHINE] ${event} internal error: ${message}`);
+            return { type: 'error', code: 'INTERNAL', message };
+        }
+    }
+
     private async enforcePreviewBinding(
         binding: unknown,
         port: number,
@@ -2199,46 +2268,20 @@ export class ApiMachineClient {
         this.socket.on(
             'proxy-http-request',
             async (params: any, ack: (response: any) => void) => {
-                try {
-                    // specs/runtime-isolation-hardening (H3) — prove that the
-                    // runtime still answering on this port is the one the
-                    // token was minted for, before any bytes are relayed.
-                    // `bindingEnforced` is echoed on success: it is the only
-                    // way happy-server can tell an enforcing daemon apart from
-                    // one that silently ignored the binding fields.
-                    const binding = await this.enforcePreviewBinding(params?.binding, params?.port);
-                    if (binding.outcome === 'rejected') {
-                        logger.debug(
-                            `[API MACHINE] proxy-http-request refused: ${binding.code} ${binding.message}`,
-                        );
-                        ack({ type: 'error', code: binding.code, message: binding.message });
-                        return;
-                    }
-                    const result = await proxyHttp({
-                        port: params?.port,
-                        method: params?.method,
-                        path: params?.path,
-                        headers: params?.headers ?? {},
-                        bodyB64: params?.bodyB64 ?? null,
-                    });
-                    logger.debug(
-                        `[API MACHINE] proxy-http-request ${params?.method} ${params?.path} -> ${result.status}${result.truncated ? ' (truncated)' : ''} binding=${binding.outcome}`,
-                    );
-                    ack({
-                        type: 'success',
-                        ...result,
-                        ...(binding.outcome === 'enforced' ? { bindingEnforced: true } : {}),
-                    });
-                } catch (e) {
-                    if (e instanceof PreviewProxyError) {
-                        logger.debug(`[API MACHINE] proxy-http-request failed: ${e.code} ${e.message}`);
-                        ack({ type: 'error', code: e.code, message: e.message });
-                        return;
-                    }
-                    const message = e instanceof Error ? e.message : String(e);
-                    logger.debug(`[API MACHINE] proxy-http-request internal error: ${message}`);
-                    ack({ type: 'error', code: 'INTERNAL', message });
-                }
+                ack(await this.relayPreviewHttp('proxy-http-request', params));
+            },
+        );
+
+        // specs/runtime-isolation-hardening (H3, P1) — bound requests arrive
+        // here instead. The separate event is what keeps a daemon that
+        // predates runtime binding from executing them: it has no listener,
+        // so the request is never run rather than run and then refused by its
+        // answer. Since this event exists only for bound requests, serving it
+        // unbound would give the whole separation away.
+        this.socket.on(
+            PREVIEW_BOUND_PROXY_EVENT as any,
+            async (params: any, ack: (response: any) => void) => {
+                ack(await this.relayPreviewBoundHttp(params));
             },
         );
 

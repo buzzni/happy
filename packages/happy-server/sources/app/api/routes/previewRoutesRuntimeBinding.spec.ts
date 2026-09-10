@@ -15,6 +15,7 @@ import {
     authorizeRelayBinding,
     previewRoutes,
     describePreviewRelayFailure,
+    BOUND_PROXY_EVENT,
 } from '@/app/api/routes/previewRoutes';
 import { signPreviewToken, verifyPreviewToken } from '@/modules/preview/previewToken';
 import { renderExpiredPtokenHtml } from '@/modules/preview/expiredPtokenHtml';
@@ -206,12 +207,23 @@ function stubAuthorizeCallback(answer: { allowed: boolean; workspacePaths?: stri
 function daemonSocket(options: {
     lease?: unknown;
     proxy?: unknown;
+    /** Models a daemon that predates the bound relay event: no handler at all. */
+    handles?: (event: string) => boolean;
 } = {}) {
+    const upstream: string[] = [];
     const emitWithAck = vi.fn(async (event: string, payload: unknown) => {
+        if (options.handles && !options.handles(event)) {
+            // Socket.IO has no listener, so the ack never comes.
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            throw new Error('operation has timed out');
+        }
         if (event === 'preview-runtime-lease') {
             return options.lease ?? { type: 'success', leaseId: 'lease-1', evidenceKind: 'container' };
         }
-        void payload;
+        // Reaching a relay handler at all means the daemon opened the
+        // upstream request — the thing a mutation must never do twice, or
+        // once with an unenforced binding.
+        upstream.push(`${(payload as { method?: string })?.method ?? 'GET'} ${event}`);
         return options.proxy ?? {
             type: 'success',
             bindingEnforced: true,
@@ -222,10 +234,11 @@ function daemonSocket(options: {
         };
     });
     return {
-        id: 'daemon-1',
+        id: `daemon-${Math.random().toString(36).slice(2, 8)}`,
         data: { clientType: 'machine-scoped', machineId: MID },
         timeout: () => ({ emitWithAck }),
         emitWithAck,
+        upstream,
     };
 }
 
@@ -604,7 +617,8 @@ describe('preview relay route — runtime binding', () => {
 
         expect(res.statusCode).toBe(200);
         expect(res.body).toContain('UPSTREAM');
-        expect(daemon.emitWithAck).toHaveBeenCalledWith('proxy-http-request', expect.objectContaining({
+        // Bound requests travel on their own event — see BOUND_PROXY_EVENT.
+        expect(daemon.emitWithAck).toHaveBeenCalledWith(BOUND_PROXY_EVENT, expect.objectContaining({
             binding: { projectId: PROJECT, leaseId: 'lease-1', workspacePaths: ['/srv/proj-1'] },
         }));
         await app.close();
@@ -622,9 +636,96 @@ describe('preview relay route — runtime binding', () => {
         const res = await app.inject({ method: 'GET', url: relayUrl(boundToken()) });
 
         expect(res.statusCode).toBe(200);
-        expect(daemon.emitWithAck).toHaveBeenCalledWith('proxy-http-request', expect.objectContaining({
+        expect(daemon.emitWithAck).toHaveBeenCalledWith(BOUND_PROXY_EVENT, expect.objectContaining({
             binding: expect.objectContaining({ leaseId: 'lease-1' }),
         }));
+        await app.close();
+    });
+
+    it('never reaches an old daemon\'s upstream with a bound request', async () => {
+        // The echo check catches a downgraded *response*, but by then a POST
+        // has already been executed against whatever was on that port. A
+        // bound request therefore travels on an event an old daemon has no
+        // handler for, so there is nothing to execute.
+        stubAuthorizeCallback({ allowed: true, workspacePaths: [] });
+        const old = daemonSocket({ handles: (event) => event === 'proxy-http-request' });
+        setMachineSockets([old]);
+        const app = await buildApp();
+
+        const res = await app.inject({
+            method: 'POST',
+            url: relayUrl(boundToken()),
+            payload: 'a=1',
+        });
+
+        expect(res.statusCode).toBe(409);
+        expect(res.json().code).toBe(LEASE_UNSUPPORTED_CODE);
+        expect(old.upstream).toEqual([]);
+        await app.close();
+    });
+
+    it('sends a bound request to one daemon only, never fanned out', async () => {
+        // The legacy path races every candidate socket and takes the first
+        // answer. For a mutation that means the request can be executed more
+        // than once, on more than one runtime.
+        stubAuthorizeCallback({ allowed: true, workspacePaths: [] });
+        const first = daemonSocket();
+        const second = daemonSocket();
+        setMachineSockets([first, second]);
+        const app = await buildApp();
+
+        const res = await app.inject({ method: 'POST', url: relayUrl(boundToken()), payload: 'a=1' });
+
+        expect(res.statusCode).toBe(200);
+        expect(first.upstream.length + second.upstream.length).toBe(1);
+        await app.close();
+    });
+
+    it('does not retry a bound mutation on the next daemon when the first is stale', async () => {
+        // A stale socket that never answers is indistinguishable from one
+        // that answered after doing the work. Retrying a POST there is how a
+        // single click becomes two orders.
+        stubAuthorizeCallback({ allowed: true, workspacePaths: [] });
+        const stale = daemonSocket({ handles: () => false });
+        const live = daemonSocket();
+        setMachineSockets([stale, live]);
+        const app = await buildApp();
+
+        const res = await app.inject({ method: 'POST', url: relayUrl(boundToken()), payload: 'a=1' });
+
+        expect(res.statusCode).toBe(409);
+        expect(live.upstream).toEqual([]);
+        await app.close();
+    });
+
+    it('still recovers a bound GET from a stale socket', async () => {
+        // A read can safely be re-issued, and reconnects leave stale sockets
+        // behind often enough that refusing would break ordinary previews.
+        stubAuthorizeCallback({ allowed: true, workspacePaths: [] });
+        const stale = daemonSocket({ handles: () => false });
+        const live = daemonSocket();
+        setMachineSockets([stale, live]);
+        const app = await buildApp();
+
+        const res = await app.inject({ method: 'GET', url: relayUrl(boundToken()) });
+
+        expect(res.statusCode).toBe(200);
+        expect(live.upstream.length).toBe(1);
+        await app.close();
+    });
+
+    it('keeps the legacy unbound path on the original event and its fan-out', async () => {
+        const daemon = daemonSocket({ handles: (event) => event === 'proxy-http-request' });
+        setMachineSockets([daemon]);
+        const app = await buildApp();
+
+        const res = await app.inject({
+            method: 'GET',
+            url: relayUrl(signPreviewToken({ userId: USER_ID, machineId: MID, port: PORT }).token),
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(daemon.upstream).toEqual(['GET proxy-http-request']);
         await app.close();
     });
 
@@ -709,6 +810,55 @@ describe('preview relay route — runtime binding', () => {
 
         expect(res.statusCode).toBe(503);
         expect(daemon.emitWithAck).not.toHaveBeenCalled();
+        await app.close();
+    });
+
+    it('omits the previous token from the page when it carried no binding', async () => {
+        // The studio treats `previousToken` as "this session was bound" and
+        // forces a trusted, bound re-mint on it. Sending an unbound token
+        // would therefore demand a shared secret and a current daemon for a
+        // flow that works without either today — a regression dressed up as
+        // preservation.
+        const app = await buildApp();
+        const unbound = signPreviewToken({ userId: USER_ID, machineId: MID, port: PORT }, { ttlMs: -1_000 }).token;
+
+        const res = await app.inject({
+            method: 'GET',
+            url: relayUrl(unbound),
+            headers: { accept: 'text/html', 'sec-fetch-dest': 'document' },
+        });
+
+        expect(res.statusCode).toBe(401);
+        expect(res.body).not.toContain('previousToken');
+        await app.close();
+    });
+
+    it('omits an unreadable previous token from the page', async () => {
+        const app = await buildApp();
+
+        const res = await app.inject({
+            method: 'GET',
+            url: `/v1/preview/${MID}/${PORT}/index.html?ptoken=not.a-token`,
+            headers: { accept: 'text/html', 'sec-fetch-dest': 'document' },
+        });
+
+        expect(res.statusCode).toBe(401);
+        expect(res.body).not.toContain('previousToken');
+        await app.close();
+    });
+
+    it('includes it for a stale bound token, which is the case recovery exists for', async () => {
+        const app = await buildApp();
+        const stale = expiredBoundToken();
+
+        const res = await app.inject({
+            method: 'GET',
+            url: relayUrl(stale),
+            headers: { accept: 'text/html', 'sec-fetch-dest': 'document' },
+        });
+
+        expect(res.statusCode).toBe(401);
+        expect(res.body).toContain(JSON.stringify(stale));
         await app.close();
     });
 

@@ -149,3 +149,44 @@ describe('ApiMachineClient preview runtime binding gate', () => {
         }
     })
 })
+
+describe('ApiMachineClient bound preview relay event', () => {
+    // happy-server sends a bound request on its own event so that a daemon
+    // predating runtime binding — which has no listener for it — cannot
+    // execute the request at all. This side must therefore refuse to serve
+    // that event unbound, or the separation buys nothing.
+    it('refuses a bound-event request that carries no binding', async () => {
+        const client = await newClient()
+        client.setRPCHandlers(rpcHandlers({ readAll: vi.fn().mockResolvedValue({}) }))
+
+        const ack = await client.relayPreviewBoundHttp({ port: 3000, method: 'GET', path: '/' })
+
+        expect(ack).toMatchObject({ type: 'error', code: 'INVALID_REQUEST' })
+    })
+
+    it('verifies the binding before it relays anything', async () => {
+        const client = await newClient()
+        client.setRPCHandlers(rpcHandlers({
+            readAll: vi.fn().mockResolvedValue({
+                'session:other-project': { port: 3000, projectId: 'other-project' },
+            }),
+        }))
+
+        const ack = await client.relayPreviewBoundHttp({
+            port: 3000,
+            method: 'POST',
+            path: '/orders',
+            binding: BINDING,
+        })
+
+        expect(ack).toMatchObject({ type: 'error', code: 'PORT_PROJECT_MISMATCH' })
+    })
+
+    it('refuses when the daemon is not ready to verify yet', async () => {
+        const client = await newClient()
+
+        const ack = await client.relayPreviewBoundHttp({ port: 3000, method: 'GET', path: '/', binding: BINDING })
+
+        expect(ack).toMatchObject({ type: 'error', code: 'EVIDENCE_UNAVAILABLE' })
+    })
+})
