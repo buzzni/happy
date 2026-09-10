@@ -235,9 +235,21 @@ export async function prepareGithubTriggerWorktree(input: {
     const actualHeadSha = cleanSha(actual.stdout)
     if (!actualHeadSha) return failAfterCreation('GitHub worktree HEAD verification returned invalid data')
     if (actualHeadSha !== expectedHeadSha) {
-      return failAfterCreation(
-        `GitHub worktree HEAD mismatch: expected ${expectedHeadSha}, got ${actualHeadSha}`,
-      )
+      // 2026-09-10 aplus#3650 — PR 을 연 지 77초 만에 push 가 하나 더 왔다. 서버는
+      // head=A 로 task 를 만들었고 데몬이 16분 뒤 도착했을 땐 tip 이 B 였다. 이걸
+      // 영구로 접으면 push 는 리뷰를 다시 걸지 않으므로 그 PR 은 영영 리뷰되지 않는다.
+      //
+      // 서버가 색인한 A 는 보통 아직 있다(B 의 조상). tip 대신 A 를 체크아웃하면
+      // 서버가 준비한 diff 색인과 정확히 맞는 리뷰가 되고 코멘트도 그 SHA 를 밝힌다.
+      // A 가 없을 때(force-push)만 색인한 스냅샷 자체가 없는 것이므로 접는다.
+      const mismatch = `GitHub worktree HEAD mismatch: expected ${expectedHeadSha}, got ${actualHeadSha}`
+      // 핀의 성패는 checkout 의 종료 코드가 아니라 HEAD 를 다시 읽어 판정한다 —
+      // 한 가지 검사로 둘 다 잡는다.
+      await runCommand({ executable: 'git', args: ['checkout', '--detach', expectedHeadSha], cwd: worktreePath })
+      const verified = await commandOrError(runCommand, {
+        executable: 'git', args: ['rev-parse', 'HEAD'], cwd: worktreePath,
+      }, 'GitHub worktree HEAD verification failed')
+      if (!verified.ok || cleanSha(verified.stdout) !== expectedHeadSha) return failAfterCreation(mismatch)
     }
   }
 
