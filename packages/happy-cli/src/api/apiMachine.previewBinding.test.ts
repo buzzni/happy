@@ -128,4 +128,24 @@ describe('ApiMachineClient preview runtime binding gate', () => {
         await expect(deps.probeEvidence(3000)).resolves.toEqual({ status: 'none' })
         expect(probe).toHaveBeenCalledWith(3000)
     })
+
+    it('answers the mint-time lease inside the server ack window with EVIDENCE_BUSY when the probe cannot finish', async () => {
+        vi.useFakeTimers()
+        try {
+            const client = await newClient()
+            client.setRPCHandlers(rpcHandlers({ readAll: vi.fn().mockResolvedValue({}) }))
+            const probe = vi.fn(() => new Promise(() => { /* never settles */ }))
+            client.previewProbe = await boundedProbeOver(probe, { maxConcurrent: 1, maxQueued: 10, maxWaitMs: 60_000 })
+            const ack = vi.fn()
+            const answered = client.answerPreviewRuntimeLease({ projectId: 'proj-1', port: 3000, workspacePaths: ['/srv/proj-1'] }, ack)
+            await vi.advanceTimersByTimeAsync(2_500)
+            await answered
+            expect(ack).toHaveBeenCalledTimes(1)
+            expect(ack).toHaveBeenCalledWith(expect.objectContaining({ type: 'error', code: 'EVIDENCE_BUSY' }))
+            // The relay gate, by contrast, is not under the 3 s ack window.
+            expect(probe).toHaveBeenCalledWith(3000, expect.objectContaining({ deadlineMs: 2_500 }))
+        } finally {
+            vi.useRealTimers()
+        }
+    })
 })

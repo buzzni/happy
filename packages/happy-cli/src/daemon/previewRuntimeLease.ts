@@ -50,6 +50,15 @@ export type RuntimeLeaseErrorCode =
   | 'WORKSPACE_UNVERIFIED'
   | 'LEASE_MISMATCH'
 
+/**
+ * happy-server waits 3 s for the mint-time `preview-runtime-lease` ack and
+ * reads silence as "old daemon without the handler". The daemon therefore
+ * answers inside this budget — queue wait and probe included — with
+ * `EVIDENCE_BUSY` when it cannot finish, instead of a late real answer that
+ * would already have been misdiagnosed.
+ */
+export const MINT_LEASE_ANSWER_DEADLINE_MS = 2_500
+
 export interface RuntimeLeaseDeps {
   probeEvidence(port: number): Promise<EvidenceProbeResult>
   readPortRegistry(): Promise<PortRegistryData>

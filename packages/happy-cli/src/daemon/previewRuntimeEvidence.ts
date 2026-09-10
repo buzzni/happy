@@ -159,7 +159,18 @@ export function createEvidenceIo(): EvidenceIo {
   }
 }
 
-export type ProbeFn = (port: number) => Promise<EvidenceProbeResult>
+export interface ProbeCallOptions {
+  /**
+   * Total budget for *this* call — queue wait plus the running probe. Past
+   * it the caller gets `busy` immediately; a probe that is still running is
+   * left to finish on its own, its answer dropped, and its slot stays taken
+   * until it settles. Used by the mint-time lease, which must answer inside
+   * happy-server's 3 s ack window or be misread as an old daemon.
+   */
+  deadlineMs?: number
+}
+
+export type ProbeFn = (port: number, options?: ProbeCallOptions) => Promise<EvidenceProbeResult>
 
 export interface ProbeLimits {
   /** Probes allowed to run at once. Each one is one or two subprocess spawns. */
@@ -186,8 +197,15 @@ export interface ProbeLimits {
  * spawns. The wait bound is set from that throughput: 256 queued requests at
  * ~55–150 ms each drain in 14–38 s, and happy-server's relay RPC timeout is
  * 35 s — a request that cannot be served inside that is refused explicitly
- * rather than answered late. Note that this bounds *how many* probes run, not
- * *how much* a burst costs: 200 relayed sub-resources are still 200 probes.
+ * rather than answered late.
+ *
+ * Known normal-use limit, recorded rather than solved here: this bounds *how
+ * many* probes run, not *how much* a burst costs. 200 relayed sub-resources
+ * are 200 probes, i.e. roughly 11 s of probe work on the container path and
+ * up to 30 s on the macOS native path for one large dev-page load, whatever
+ * the concurrency. Cutting that means a cheaper evidence source (e.g. one
+ * `netstat -anv` at ~29 ms instead of an `lsof -iTCP` scan at 90–280 ms),
+ * which is a separate change with its own proof.
  */
 export const DEFAULT_PROBE_LIMITS: ProbeLimits = { maxConcurrent: 8, maxQueued: 256, maxWaitMs: 20_000 }
 
@@ -205,42 +223,83 @@ export const DEFAULT_PROBE_LIMITS: ProbeLimits = { maxConcurrent: 8, maxQueued: 
  */
 export function createBoundedProbe(probe: ProbeFn, limits: ProbeLimits): ProbeFn {
   let running = 0
-  const queue: Array<{ port: number; resolve: (r: EvidenceProbeResult) => void; reject: (e: unknown) => void; timer: NodeJS.Timeout }> = []
+  interface Waiter {
+    port: number
+    options: ProbeCallOptions | undefined
+    answer: (r: EvidenceProbeResult) => void
+    fail: (e: unknown) => void
+    timer: NodeJS.Timeout | null
+    startedAt: number
+  }
+  const queue: Waiter[] = []
 
-  const run = (port: number, resolve: (r: EvidenceProbeResult) => void, reject: (e: unknown) => void) => {
+  const startNext = () => {
+    const next = queue.shift()
+    if (!next) return
+    if (next.timer) clearTimeout(next.timer)
+    run(next)
+  }
+
+  const run = (waiter: Waiter) => {
     running += 1
-    probe(port).then(resolve, reject).finally(() => {
+    let answered = false
+    let deadlineTimer: NodeJS.Timeout | null = null
+    const remaining = waiter.options?.deadlineMs === undefined
+      ? null
+      : waiter.options.deadlineMs - (Date.now() - waiter.startedAt)
+    if (remaining !== null) {
+      // The budget keeps counting while the probe runs. Answering late is
+      // the same as not answering for the caller this exists for, so the
+      // answer goes out at the deadline; the probe itself is not cancelled
+      // (a subprocess in flight cannot be un-spawned) and its slot stays
+      // charged until it settles, which is what keeps the bound honest.
+      deadlineTimer = setTimeout(() => {
+        if (answered) return
+        answered = true
+        waiter.answer({
+          status: 'busy',
+          detail: `preview runtime probe did not finish within ${waiter.options!.deadlineMs}ms (still running)`,
+        })
+      }, Math.max(0, remaining))
+      deadlineTimer.unref?.()
+    }
+    (waiter.options ? probe(waiter.port, waiter.options) : probe(waiter.port)).then(
+      (result) => {
+        if (answered) return // late: discarded, never a second answer
+        answered = true
+        waiter.answer(result)
+      },
+      (error) => {
+        if (answered) return // late failure: nobody is waiting for it
+        answered = true
+        waiter.fail(error)
+      },
+    ).finally(() => {
+      if (deadlineTimer) clearTimeout(deadlineTimer)
       running -= 1
-      const next = queue.shift()
-      if (next) {
-        clearTimeout(next.timer)
-        run(next.port, next.resolve, next.reject)
-      }
+      startNext()
     })
   }
 
-  return (port) => new Promise<EvidenceProbeResult>((resolve, reject) => {
+  return (port, options) => new Promise<EvidenceProbeResult>((resolve, reject) => {
+    const waiter: Waiter = { port, options, answer: resolve, fail: reject, timer: null, startedAt: Date.now() }
     if (running < limits.maxConcurrent) {
-      run(port, resolve, reject)
+      run(waiter)
       return
     }
     if (queue.length >= limits.maxQueued) {
       resolve({ status: 'busy', detail: `preview runtime probe queue is full (${queue.length} waiting, ${running} running)` })
       return
     }
-    const entry = {
-      port,
-      resolve,
-      reject,
-      timer: setTimeout(() => {
-        const index = queue.indexOf(entry)
-        if (index === -1) return
-        queue.splice(index, 1)
-        resolve({ status: 'busy', detail: `preview runtime probe waited longer than ${limits.maxWaitMs}ms for a slot` })
-      }, limits.maxWaitMs),
-    }
-    entry.timer.unref?.()
-    queue.push(entry)
+    const waitBudget = options?.deadlineMs === undefined ? limits.maxWaitMs : Math.min(limits.maxWaitMs, options.deadlineMs)
+    waiter.timer = setTimeout(() => {
+      const index = queue.indexOf(waiter)
+      if (index === -1) return
+      queue.splice(index, 1) // late queued work never starts
+      resolve({ status: 'busy', detail: `preview runtime probe waited longer than ${waitBudget}ms for a slot` })
+    }, waitBudget)
+    waiter.timer.unref?.()
+    queue.push(waiter)
   })
 }
 

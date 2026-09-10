@@ -660,4 +660,77 @@ describe('createBoundedProbe — bounded concurrency, no result reuse', () => {
     await expect(bounded(3000)).rejects.toThrow('boom')
     await expect(bounded(3000)).resolves.toMatchObject({ status: 'found' })
   })
+
+  describe('per-call total deadline (mint-time lease must answer inside the server\'s 3 s ack)', () => {
+    it('refuses a queued request at its deadline and never starts its probe', async () => {
+      vi.useFakeTimers()
+      try {
+        const { probe, pending } = controlledProbe()
+        const bounded = createBoundedProbe(probe, { maxConcurrent: 1, maxQueued: 10, maxWaitMs: 60_000 })
+        const running = bounded(3000)
+        const queued = bounded(3000, { deadlineMs: 2_500 })
+        await vi.advanceTimersByTimeAsync(2_500)
+        await expect(queued).resolves.toMatchObject({ status: 'busy' })
+        expect(probe).toHaveBeenCalledTimes(1)
+        // Freeing the slot later must not resurrect the late request.
+        pending.shift()!(found('a'))
+        await running
+        await vi.advanceTimersByTimeAsync(0)
+        expect(probe).toHaveBeenCalledTimes(1)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('answers busy at the deadline while its probe is still running, and keeps the slot charged until that probe settles', async () => {
+      vi.useFakeTimers()
+      try {
+        const { probe, pending } = controlledProbe()
+        const bounded = createBoundedProbe(probe, { maxConcurrent: 1, maxQueued: 10, maxWaitMs: 60_000 })
+        const slow = bounded(3000, { deadlineMs: 2_500 })
+        await vi.advanceTimersByTimeAsync(2_500)
+        await expect(slow).resolves.toMatchObject({ status: 'busy' })
+        // The underlying probe has not settled: the slot is still taken, so a
+        // new request queues instead of starting a second probe.
+        const next = bounded(3000)
+        await vi.advanceTimersByTimeAsync(0)
+        expect(probe).toHaveBeenCalledTimes(1)
+        // Late completion: discarded, never a second answer, and it releases
+        // the slot for the queued request.
+        pending.shift()!(found('late'))
+        await vi.advanceTimersByTimeAsync(0)
+        await expect(slow).resolves.toMatchObject({ status: 'busy' })
+        expect(probe).toHaveBeenCalledTimes(2)
+        pending.shift()!(found('fresh'))
+        await expect(next).resolves.toMatchObject({ status: 'found', evidence: { id: 'fresh' } })
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('swallows a probe that throws after its deadline answer and still frees the slot', async () => {
+      vi.useFakeTimers()
+      try {
+        let failLate!: (e: Error) => void
+        const probe = vi.fn()
+          .mockImplementationOnce(() => new Promise<EvidenceProbeResult>((_r, reject) => { failLate = reject }))
+          .mockImplementationOnce(async () => found('after'))
+        const bounded = createBoundedProbe(probe, { maxConcurrent: 1, maxQueued: 10, maxWaitMs: 60_000 })
+        const slow = bounded(3000, { deadlineMs: 100 })
+        await vi.advanceTimersByTimeAsync(100)
+        await expect(slow).resolves.toMatchObject({ status: 'busy' })
+        failLate(new Error('late boom'))
+        await vi.advanceTimersByTimeAsync(0)
+        await expect(bounded(3000)).resolves.toMatchObject({ status: 'found', evidence: { id: 'after' } })
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('lets a fast probe answer normally well inside the deadline', async () => {
+      const probe = vi.fn(async () => found('quick'))
+      const bounded = createBoundedProbe(probe, { maxConcurrent: 1, maxQueued: 10, maxWaitMs: 60_000 })
+      await expect(bounded(3000, { deadlineMs: 2_500 })).resolves.toMatchObject({ status: 'found', evidence: { id: 'quick' } })
+    })
+  })
 })

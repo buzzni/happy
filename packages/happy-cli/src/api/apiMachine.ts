@@ -38,6 +38,7 @@ import {
     acquireRuntimeLease,
     enforceRelayBinding,
     createRuntimeLeaseCanonicalizer,
+    MINT_LEASE_ANSWER_DEADLINE_MS,
     type RuntimeLeaseDeps,
 } from '@/daemon/previewRuntimeLease';
 import {
@@ -1320,11 +1321,13 @@ export class ApiMachineClient {
      * run: without the port registry the daemon cannot spot a port that is
      * registered to another project, and a partial check is not the check.
      */
-    private previewLeaseDeps(): RuntimeLeaseDeps | null {
+    private previewLeaseDeps(options?: { probeDeadlineMs?: number }): RuntimeLeaseDeps | null {
         const registry = this.previewPortRegistry;
         if (!registry) return null;
         return {
-            probeEvidence: (port: number) => this.previewProbe(port),
+            probeEvidence: (port: number) => (options?.probeDeadlineMs === undefined
+                ? this.previewProbe(port)
+                : this.previewProbe(port, { deadlineMs: options.probeDeadlineMs })),
             readPortRegistry: () => registry.readAll(),
             canonicalize: (target: string) => this.previewPathCanonicalizer(target),
         };
@@ -1348,9 +1351,13 @@ export class ApiMachineClient {
         return enforceRelayBinding(binding, port, deps);
     }
 
-    /** Handler body of the `preview-runtime-lease` socket event (mint time). */
+    /**
+     * Handler body of the `preview-runtime-lease` socket event (mint time).
+     * Answers inside happy-server's 3 s ack window: a probe that cannot finish
+     * by then is reported as EVIDENCE_BUSY rather than left to ack late.
+     */
     private async answerPreviewRuntimeLease(params: any, ack: (response: any) => void): Promise<void> {
-        const deps = this.previewLeaseDeps();
+        const deps = this.previewLeaseDeps({ probeDeadlineMs: MINT_LEASE_ANSWER_DEADLINE_MS });
         if (!deps) {
             ack({
                 type: 'error',
