@@ -159,24 +159,30 @@ export async function prepareGithubTriggerWorktree(input: {
     return { ok: false, error: 'GitHub automation directory is outside the repository', cleaned: true }
   }
 
-  let expectedHeadSha = input.pullRequest?.expectedHeadSha
-    ? cleanSha(input.pullRequest.expectedHeadSha)
-    : null
-  if (input.pullRequest?.expectedHeadSha && !expectedHeadSha) {
-    return { ok: false, error: 'GitHub trigger expected HEAD is invalid', cleaned: true }
-  }
-  if (input.pullRequest && !expectedHeadSha) {
-    const queried = await commandOrError(runCommand, {
-      executable: 'gh',
-      args: ['pr', 'view', String(input.pullRequest.number), '--json', 'headRefOid', '--jq', '.headRefOid'],
-      cwd: repositoryRoot,
-      ...(input.githubEnvironment ? { environmentVariables: input.githubEnvironment } : {}),
-    }, 'GitHub pull request HEAD lookup failed')
-    if (!queried.ok) return { ok: false, error: queried.error, cleaned: true }
-    expectedHeadSha = cleanSha(queried.stdout)
-    if (!expectedHeadSha) {
-      return { ok: false, error: 'GitHub pull request HEAD lookup returned invalid data', cleaned: true }
+  // PR 경로의 기대 HEAD 는 아래 가드를 지나면 반드시 있다. 그 사실을 타입이 들고
+  // 있게 한 객체로 묶는다 — 뒤에서 null 검사를 다시 하거나 캐스트하지 않도록.
+  let pullRequest: { number: number; expectedHeadSha: string } | null = null
+  if (input.pullRequest) {
+    let expectedHeadSha = input.pullRequest.expectedHeadSha
+      ? cleanSha(input.pullRequest.expectedHeadSha)
+      : null
+    if (input.pullRequest.expectedHeadSha && !expectedHeadSha) {
+      return { ok: false, error: 'GitHub trigger expected HEAD is invalid', cleaned: true }
     }
+    if (!expectedHeadSha) {
+      const queried = await commandOrError(runCommand, {
+        executable: 'gh',
+        args: ['pr', 'view', String(input.pullRequest.number), '--json', 'headRefOid', '--jq', '.headRefOid'],
+        cwd: repositoryRoot,
+        ...(input.githubEnvironment ? { environmentVariables: input.githubEnvironment } : {}),
+      }, 'GitHub pull request HEAD lookup failed')
+      if (!queried.ok) return { ok: false, error: queried.error, cleaned: true }
+      expectedHeadSha = cleanSha(queried.stdout)
+      if (!expectedHeadSha) {
+        return { ok: false, error: 'GitHub pull request HEAD lookup returned invalid data', cleaned: true }
+      }
+    }
+    pullRequest = { number: input.pullRequest.number, expectedHeadSha }
   }
 
   try {
@@ -219,10 +225,11 @@ export async function prepareGithubTriggerWorktree(input: {
     return { ok: false as const, error, cleaned: cleanup.ok }
   }
 
-  if (input.pullRequest) {
+  if (pullRequest) {
+    const { expectedHeadSha } = pullRequest
     const checkedOut = await commandOrError(runCommand, {
       executable: 'gh',
-      args: ['pr', 'checkout', String(input.pullRequest.number), '--detach'],
+      args: ['pr', 'checkout', String(pullRequest.number), '--detach'],
       cwd: worktreePath,
       ...(input.githubEnvironment ? { environmentVariables: input.githubEnvironment } : {}),
     }, 'GitHub pull request checkout failed')
