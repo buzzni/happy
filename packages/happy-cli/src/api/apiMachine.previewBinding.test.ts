@@ -190,3 +190,167 @@ describe('ApiMachineClient bound preview relay event', () => {
         expect(ack).toMatchObject({ type: 'error', code: 'EVIDENCE_UNAVAILABLE' })
     })
 })
+
+describe('ApiMachineClient preview WS open cancellation', () => {
+    // specs/runtime-isolation-hardening (H3, P2). Binding verification runs
+    // *before* the upstream is opened, and it can take a while — a saturated
+    // probe queue, a slow docker call. happy-server's open deadline can pass
+    // during that window and it then tells us to close a tunnel it has
+    // already forgotten. Until the tunnel exists inside previewWsProxy there
+    // is nothing for that close to find, so it used to be dropped and the
+    // upstream opened anyway: a ghost with no owner, no expiry timer and no
+    // recheck behind it.
+    function fakeWsProxy() {
+        const opened: string[] = []
+        const closed: string[] = []
+        return {
+            opened,
+            closed,
+            open: vi.fn(async (params: { tunnelId: string }) => {
+                opened.push(params.tunnelId)
+                return { ok: true }
+            }),
+            close: vi.fn((tunnelId: string) => { closed.push(tunnelId) }),
+            closeAll: vi.fn(),
+        }
+    }
+
+    /** Holds verification open until the test decides it resolved. */
+    function deferredEnforce(client: any) {
+        let release: (value: { outcome: string }) => void = () => { /* set below */ }
+        const started = new Promise<void>((resolveStarted) => {
+            client.enforcePreviewBinding = () => {
+                resolveStarted()
+                return new Promise((resolve) => { release = resolve })
+            }
+        })
+        return { started, release: (value: { outcome: string }) => release(value) }
+    }
+
+    const OPEN = { tunnelId: 'tunnel-1', port: 3000, dataB64: '', binding: BINDING }
+
+    it('never opens an upstream for a tunnel closed while it was being verified', async () => {
+        const client = await newClient()
+        const proxy = fakeWsProxy()
+        client.previewWsProxy = proxy
+        const enforce = deferredEnforce(client)
+
+        const opening = client.openPreviewWsTunnel(OPEN)
+        await enforce.started
+        client.closePreviewWsTunnel('tunnel-1')
+        enforce.release({ outcome: 'enforced' })
+        const ack = await opening
+
+        expect(proxy.opened).toEqual([])
+        expect(ack).toMatchObject({ ok: false })
+    })
+
+    it('answers a cancelled open once, and a later close cannot resurrect it', async () => {
+        const client = await newClient()
+        const proxy = fakeWsProxy()
+        client.previewWsProxy = proxy
+        const enforce = deferredEnforce(client)
+
+        const opening = client.openPreviewWsTunnel(OPEN)
+        await enforce.started
+        client.closePreviewWsTunnel('tunnel-1')
+        enforce.release({ outcome: 'enforced' })
+        await opening
+
+        client.closePreviewWsTunnel('tunnel-1')
+        await new Promise((resolve) => setTimeout(resolve, 10))
+
+        expect(proxy.opened).toEqual([])
+    })
+
+    it('opens normally when nothing cancelled it', async () => {
+        const client = await newClient()
+        const proxy = fakeWsProxy()
+        client.previewWsProxy = proxy
+        client.enforcePreviewBinding = async () => ({ outcome: 'enforced' })
+
+        const ack = await client.openPreviewWsTunnel(OPEN)
+
+        expect(proxy.opened).toEqual(['tunnel-1'])
+        expect(ack).toMatchObject({ ok: true, bindingEnforced: true })
+    })
+
+    it('cancels every in-flight verification when the daemon socket drops', async () => {
+        const client = await newClient()
+        const proxy = fakeWsProxy()
+        client.previewWsProxy = proxy
+        const enforce = deferredEnforce(client)
+
+        const opening = client.openPreviewWsTunnel(OPEN)
+        await enforce.started
+        client.cancelPreviewWsTunnels()
+        enforce.release({ outcome: 'enforced' })
+        await opening
+
+        expect(proxy.opened).toEqual([])
+    })
+
+    it('forgets a tunnel once its open has finished, either way', async () => {
+        // The record exists only while an open is in flight. Keeping
+        // tombstones for every tunnel id we ever saw would be an unbounded
+        // map fed by the network.
+        const client = await newClient()
+        client.previewWsProxy = fakeWsProxy()
+        client.enforcePreviewBinding = async () => ({ outcome: 'enforced' })
+
+        await client.openPreviewWsTunnel(OPEN)
+        await client.openPreviewWsTunnel({ ...OPEN, tunnelId: 'tunnel-2' })
+
+        expect(client.previewWsPendingOpens.size).toBe(0)
+    })
+
+    it('still closes a tunnel that already opened', async () => {
+        const client = await newClient()
+        const proxy = fakeWsProxy()
+        client.previewWsProxy = proxy
+        client.enforcePreviewBinding = async () => ({ outcome: 'enforced' })
+
+        await client.openPreviewWsTunnel(OPEN)
+        client.closePreviewWsTunnel('tunnel-1')
+
+        expect(proxy.closed).toEqual(['tunnel-1'])
+    })
+})
+
+describe('ApiMachineClient bound preview WS event', () => {
+    // The upgrade counterpart of the bound HTTP event: happy-server sends a
+    // bound upgrade on an event an older daemon has no listener for, so the
+    // handshake is never written to the port at all. This side must refuse to
+    // serve that event unbound, or the separation buys nothing.
+    it('refuses a bound-event upgrade that carries no binding', async () => {
+        const client = await newClient()
+        client.setRPCHandlers(rpcHandlers({ readAll: vi.fn().mockResolvedValue({}) }))
+        client.previewWsProxy = { open: vi.fn(), close: vi.fn(), closeAll: vi.fn() }
+
+        const ack = await client.openPreviewWsTunnelBound({ tunnelId: 't', port: 3000, dataB64: '' })
+
+        expect(ack).toMatchObject({ ok: false, code: 'INVALID_REQUEST' })
+        expect(client.previewWsProxy.open).not.toHaveBeenCalled()
+    })
+
+    it('verifies the binding before it opens anything', async () => {
+        const client = await newClient()
+        client.setRPCHandlers(rpcHandlers({
+            readAll: vi.fn().mockResolvedValue({
+                'session:other-project': { port: 3000, projectId: 'other-project' },
+            }),
+        }))
+        const open = vi.fn()
+        client.previewWsProxy = { open, close: vi.fn(), closeAll: vi.fn() }
+
+        const ack = await client.openPreviewWsTunnelBound({
+            tunnelId: 't',
+            port: 3000,
+            dataB64: '',
+            binding: BINDING,
+        })
+
+        expect(ack).toMatchObject({ ok: false, code: 'PORT_PROJECT_MISMATCH' })
+        expect(open).not.toHaveBeenCalled()
+    })
+})

@@ -85,6 +85,18 @@ export const WS_BINDING_RECHECK_MS = 30_000;
 export const WS_RECHECK_DEADLINE_MS = 5_000;
 
 /**
+ * specs/runtime-isolation-hardening (H3, P1) — the event a *bound* upgrade
+ * travels on, mirroring the HTTP relay's.
+ *
+ * A daemon predating runtime binding has no listener for it, so it never
+ * writes the upgrade request to whatever is on that port. The approval buffer
+ * alone was not enough: it stops the *answer* from reaching the browser, but
+ * by then the handshake and the first bytes have already gone upstream — and
+ * for an upgrade that is a live connection to another project's runtime.
+ */
+export const BOUND_WS_OPEN_EVENT = 'preview-proxy-ws-open-bound';
+
+/**
  * Carries the daemon's refusal *code* out of the open attempt. The message is
  * free text meant for a human; only the code decides the status.
  */
@@ -224,7 +236,10 @@ export async function openPreviewWsTunnel<T extends PreviewWsMachineSocket>(
         try {
             ack = (await machineSocket
                 .timeout(Math.min(timeoutMs, remaining))
-                .emitWithAck('proxy-ws-open', { tunnelId, ...payload })) as typeof ack;
+                .emitWithAck(
+                    payload.binding ? BOUND_WS_OPEN_EVENT : 'proxy-ws-open',
+                    { tunnelId, ...payload },
+                )) as typeof ack;
         } catch (error) {
             // No ack is not "no tunnel": the daemon may still be connecting,
             // and may succeed after we gave up.

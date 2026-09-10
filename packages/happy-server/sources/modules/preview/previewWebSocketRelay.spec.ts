@@ -16,6 +16,7 @@ import {
     serializeUpgradeRequest,
     stripPreviewAuthCookie,
     PreviewWsOpenError,
+    BOUND_WS_OPEN_EVENT,
     WS_BINDING_RECHECK_MS,
     WS_RECHECK_DEADLINE_MS,
     wsOpenFailureStatus,
@@ -119,7 +120,12 @@ describe('openPreviewWsTunnel', () => {
         expect(opened.tunnelId).toBe(probe.begun[1]);
     });
 
-    it('carries the runtime binding to the daemon', async () => {
+    it('carries the runtime binding to the daemon on its own event', async () => {
+        // Same reason as the HTTP relay: a daemon predating runtime binding
+        // has no listener for this event, so it never writes the upgrade
+        // request to whatever is on that port. The approval buffer only stops
+        // the *answer* from reaching the browser — by then the handshake and
+        // the first bytes have already been delivered upstream.
         const emitWithAck = vi.fn(async () => ({ ok: true, bindingEnforced: true }));
         const daemon = { id: 'd1', emit: vi.fn(), timeout: () => ({ emitWithAck }) };
         const binding = { projectId: 'proj-1', leaseId: 'lease-1', workspacePaths: ['/srv/a'] };
@@ -127,10 +133,55 @@ describe('openPreviewWsTunnel', () => {
 
         await openPreviewWsTunnel([daemon], { ...OPEN_PAYLOAD, binding }, probe.hooks, 10, true);
 
-        expect(emitWithAck).toHaveBeenCalledWith('proxy-ws-open', {
+        expect(emitWithAck).toHaveBeenCalledWith(BOUND_WS_OPEN_EVENT, {
             tunnelId: probe.begun[0],
             ...OPEN_PAYLOAD,
             binding,
+        });
+    });
+
+    it('never reaches an old daemon at all with a bound upgrade', async () => {
+        // The old daemon answers `proxy-ws-open` and nothing else, so the
+        // bound event times out: no ack, and no upstream touched.
+        const handled: string[] = [];
+        const old = {
+            id: 'old',
+            emit: vi.fn(),
+            timeout: (ms: number) => ({
+                emitWithAck: async (event: string) => {
+                    if (event !== 'proxy-ws-open') {
+                        await new Promise((resolve) => setTimeout(resolve, ms));
+                        throw new Error('operation has timed out');
+                    }
+                    handled.push(event);
+                    return { ok: true };
+                },
+            }),
+        };
+        const probe = candidateHooks();
+
+        await expect(openPreviewWsTunnel(
+            [old],
+            { ...OPEN_PAYLOAD, binding: { projectId: 'p', leaseId: 'l', workspacePaths: [] } },
+            probe.hooks,
+            20,
+            true,
+        )).rejects.toThrow();
+
+        expect(handled).toEqual([]);
+        expect(probe.approved).toEqual([]);
+    });
+
+    it('keeps the legacy unbound upgrade on the original event', async () => {
+        const emitWithAck = vi.fn(async () => ({ ok: true }));
+        const daemon = { id: 'd1', emit: vi.fn(), timeout: () => ({ emitWithAck }) };
+        const probe = candidateHooks();
+
+        await openPreviewWsTunnel([daemon], OPEN_PAYLOAD, probe.hooks, 10);
+
+        expect(emitWithAck).toHaveBeenCalledWith('proxy-ws-open', {
+            tunnelId: probe.begun[0],
+            ...OPEN_PAYLOAD,
         });
     });
 

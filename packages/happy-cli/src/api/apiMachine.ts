@@ -41,6 +41,8 @@ import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
  * binding", which is exactly what it would be.
  */
 export const PREVIEW_BOUND_PROXY_EVENT = 'preview-proxy-http-bound';
+/** Upgrade counterpart of PREVIEW_BOUND_PROXY_EVENT — see openPreviewWsTunnelBound. */
+export const PREVIEW_BOUND_WS_OPEN_EVENT = 'preview-proxy-ws-open-bound';
 import {
     acquireRuntimeLease,
     enforceRelayBinding,
@@ -192,7 +194,19 @@ interface ServerToDaemonEvents {
         ack: (response: unknown) => void,
     ) => void;
     'proxy-ws-open': (
-        params: { tunnelId: string; port: number; dataB64: string; binding?: { projectId: string; leaseId: string; workspacePaths?: string[] } | null },
+        params: { tunnelId: string; port: number; dataB64: string },
+        ack: (response: unknown) => void,
+    ) => void;
+    // Bound upgrades only. An older daemon has no listener for this event, so
+    // it never writes the upgrade request to the port — the approval buffer
+    // on the server alone would already be too late.
+    [PREVIEW_BOUND_WS_OPEN_EVENT]: (
+        params: {
+            tunnelId: string;
+            port: number;
+            dataB64: string;
+            binding: { projectId: string; leaseId: string; workspacePaths?: string[] };
+        },
         ack: (response: unknown) => void,
     ) => void;
     'proxy-ws-data': (payload: { tunnelId: string; dataB64: string }) => void;
@@ -463,6 +477,22 @@ export class ApiMachineClient {
     private rpcHandlerManager: RpcHandlerManager;
     // Live raw-TCP tunnels for preview WebSocket upgrades (previewWsProxy.ts).
     private previewWsProxy: PreviewWsProxy | null = null;
+    /**
+     * specs/runtime-isolation-hardening (H3, P2) — opens whose binding is
+     * still being verified.
+     *
+     * Verification runs before the upstream is touched and can take a while
+     * (a saturated probe queue, a slow docker call). happy-server's open
+     * deadline can pass during that window, and the close it sends then finds
+     * nothing: previewWsProxy has no record of a tunnel that has not started
+     * connecting. Without this the upstream is opened afterwards anyway — a
+     * ghost with no owner, no expiry timer and no recheck behind it.
+     *
+     * Only ids with an open actually in flight are held, and each is removed
+     * when its open finishes: a map of every tunnel id ever seen would be
+     * unbounded and fed by the network.
+     */
+    private previewWsPendingOpens = new Map<string, { cancelled: boolean }>();
     // specs/runtime-isolation-hardening (H3). Probed per request, with no
     // memoization: a cached answer is a window in which a port that changed
     // hands keeps verifying against the runtime it no longer serves. Only the
@@ -1363,25 +1393,76 @@ export class ApiMachineClient {
      * and leaving it unchecked would make the upgrade path the way around the
      * binding.
      */
-    private async openPreviewWsTunnel(params: any): Promise<any> {
-        const binding = await this.enforcePreviewBinding(params?.binding, params?.port);
-        if (binding.outcome === 'rejected') {
-            logger.debug(`[API MACHINE] proxy-ws-open refused: ${binding.code} ${binding.message}`);
-            // The WS open ack is `{ok, code, message}` — not the HTTP relay's
-            // `{type}` envelope (openPreviewWsTunnel reads `ok`).
-            return { ok: false, code: binding.code, message: binding.message };
+    /**
+     * Bound upgrades arrive here instead. Since this event exists only for
+     * them, serving it unbound would give the whole separation away.
+     */
+    private async openPreviewWsTunnelBound(params: any): Promise<any> {
+        if (params?.binding === undefined || params?.binding === null) {
+            return {
+                ok: false,
+                code: 'INVALID_REQUEST',
+                message: 'This event carries bound preview upgrades only',
+            };
         }
-        const opened = await this.previewWsProxy!.open(params);
-        // The echo rides along only on a tunnel that actually opened —
-        // happy-server reads `ok` first, and a refusal carrying an
-        // enforcement flag would be a confusing thing to log.
-        return binding.outcome === 'enforced' && opened?.ok === true
-            ? { ...opened, bindingEnforced: true }
-            : opened;
+        return this.openPreviewWsTunnel(params);
+    }
+
+    private async openPreviewWsTunnel(params: any): Promise<any> {
+        const tunnelId = typeof params?.tunnelId === 'string' ? params.tunnelId : null;
+        if (!tunnelId) {
+            return { ok: false, code: 'INVALID_TUNNEL', message: 'Missing tunnelId' };
+        }
+        const cancelled = { ok: false, code: 'CANCELLED', message: 'Tunnel was closed before it opened' };
+        // Registered *before* the first await, so a close arriving mid-check
+        // has something to cancel.
+        const pending = { cancelled: false };
+        // A duplicate id supersedes the earlier attempt rather than racing it.
+        const superseded = this.previewWsPendingOpens.get(tunnelId);
+        if (superseded) superseded.cancelled = true;
+        this.previewWsPendingOpens.set(tunnelId, pending);
+        try {
+            const binding = await this.enforcePreviewBinding(params?.binding, params?.port);
+            if (pending.cancelled) return cancelled;
+            if (binding.outcome === 'rejected') {
+                logger.debug(`[API MACHINE] proxy-ws-open refused: ${binding.code} ${binding.message}`);
+                // The WS open ack is `{ok, code, message}` — not the HTTP
+                // relay's `{type}` envelope (openPreviewWsTunnel reads `ok`).
+                return { ok: false, code: binding.code, message: binding.message };
+            }
+            const opened = await this.previewWsProxy!.open(params);
+            if (pending.cancelled) {
+                // Cancelled while the TCP connect was in flight; previewWsProxy
+                // handles that itself, but say so rather than acking success.
+                this.previewWsProxy?.close(tunnelId);
+                return cancelled;
+            }
+            // The echo rides along only on a tunnel that actually opened —
+            // happy-server reads `ok` first, and a refusal carrying an
+            // enforcement flag would be a confusing thing to log.
+            return binding.outcome === 'enforced' && opened?.ok === true
+                ? { ...opened, bindingEnforced: true }
+                : opened;
+        } finally {
+            // The record lives exactly as long as the open does.
+            if (this.previewWsPendingOpens.get(tunnelId) === pending) {
+                this.previewWsPendingOpens.delete(tunnelId);
+            }
+        }
     }
 
     private closePreviewWsTunnel(tunnelId: string | undefined): void {
-        this.previewWsProxy?.close(tunnelId as string);
+        if (!tunnelId) return;
+        const pending = this.previewWsPendingOpens.get(tunnelId);
+        if (pending) pending.cancelled = true;
+        this.previewWsProxy?.close(tunnelId);
+    }
+
+    /** Daemon socket dropped: nothing in flight can still be wanted. */
+    private cancelPreviewWsTunnels(): void {
+        for (const pending of this.previewWsPendingOpens.values()) pending.cancelled = true;
+        this.previewWsPendingOpens.clear();
+        this.previewWsProxy?.closeAll();
     }
 
     private async relayPreviewBoundHttp(params: any): Promise<any> {
@@ -2263,8 +2344,9 @@ export class ApiMachineClient {
             this.rpcHandlerManager.onSocketDisconnect();
             this.stopKeepAlive();
             // Tear down any live preview WebSocket tunnels — the relay path is
-            // dead once the daemon socket drops, so leave no orphan TCP sockets.
-            this.previewWsProxy?.closeAll();
+            // dead once the daemon socket drops, so leave no orphan TCP
+            // sockets, including opens still waiting on their binding check.
+            this.cancelPreviewWsTunnels();
             // specs/remote-terminal/ Phase 2 — relay path is broken once
             // the socket drops, and the server's session map entry now
             // points at a dead socket. Kill local PTYs so no orphans
@@ -2332,6 +2414,9 @@ export class ApiMachineClient {
         );
         this.socket.on('proxy-ws-open', async (params, ack) => {
             ack(await this.openPreviewWsTunnel(params));
+        });
+        this.socket.on(PREVIEW_BOUND_WS_OPEN_EVENT as any, async (params: any, ack: (response: any) => void) => {
+            ack(await this.openPreviewWsTunnelBound(params));
         });
         this.socket.on('proxy-ws-data', (payload) => {
             this.previewWsProxy?.data(payload);
