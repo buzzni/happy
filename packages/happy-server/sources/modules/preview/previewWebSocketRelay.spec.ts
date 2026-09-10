@@ -1,10 +1,12 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
     parsePreviewUpgradeRequest,
     parsePreviewUpgradeUrl,
     openPreviewWsTunnel,
+    recheckOpenTunnelBinding,
     serializeUpgradeRequest,
     stripPreviewAuthCookie,
+    PreviewWsOpenError,
 } from '@/modules/preview/previewWebSocketRelay';
 
 describe('parsePreviewUpgradeUrl', () => {
@@ -52,6 +54,128 @@ describe('openPreviewWsTunnel', () => {
             { tunnelId: 'tunnel-1', port: 40002, dataB64: '' },
             10,
         )).resolves.toBe(fresh);
+    });
+
+    it('carries the runtime binding to the daemon', async () => {
+        const emitWithAck = vi.fn(async () => ({ ok: true, bindingEnforced: true }));
+        const daemon = { id: 'd1', timeout: () => ({ emitWithAck }) };
+        const payload = {
+            tunnelId: 'tunnel-1',
+            port: 40002,
+            dataB64: '',
+            binding: { projectId: 'proj-1', leaseId: 'lease-1', workspacePaths: ['/srv/a'] },
+        };
+
+        await expect(openPreviewWsTunnel([daemon], payload, 10, true)).resolves.toBe(daemon);
+        expect(emitWithAck).toHaveBeenCalledWith('proxy-ws-open', payload);
+    });
+
+    it('refuses a daemon that opened the tunnel without enforcing the binding', async () => {
+        // specs/runtime-isolation-hardening (H3) — an older daemon ignores the
+        // binding fields and answers a plain `{ ok: true }`. The upgrade path
+        // must not become the way around the binding the HTTP relay enforces.
+        const old = { id: 'old', timeout: () => ({ emitWithAck: async () => ({ ok: true }) }) };
+
+        await expect(openPreviewWsTunnel(
+            [old],
+            { tunnelId: 'tunnel-1', port: 40002, dataB64: '', binding: { projectId: 'p', leaseId: 'l', workspacePaths: [] } },
+            10,
+            true,
+        )).rejects.toThrow(/binding/i);
+    });
+
+    it('carries the daemon refusal code out, not just its prose', async () => {
+        // handleUpgrade answers 401 for a stale lease and 403 for an
+        // ownership refusal. The message is free text written for a human;
+        // only the code can decide that.
+        const daemon = {
+            id: 'd1',
+            timeout: () => ({
+                emitWithAck: async () => ({
+                    ok: false,
+                    code: 'LEASE_MISMATCH',
+                    message: 'The runtime serving this port is not the one the token was issued for',
+                }),
+            }),
+        };
+        await expect(openPreviewWsTunnel([daemon], { tunnelId: 't', port: 1, dataB64: '' }, 10))
+            .rejects.toMatchObject({ code: 'LEASE_MISMATCH' });
+    });
+
+    it('reports a daemon that ignored the binding with the unsupported code', async () => {
+        const old = { id: 'old', timeout: () => ({ emitWithAck: async () => ({ ok: true }) }) };
+        await expect(openPreviewWsTunnel(
+            [old],
+            { tunnelId: 't', port: 1, dataB64: '', binding: { projectId: 'p', leaseId: 'l', workspacePaths: [] } },
+            10,
+            true,
+        )).rejects.toBeInstanceOf(PreviewWsOpenError);
+    });
+});
+
+describe('recheckOpenTunnelBinding', () => {
+    // A tunnel makes exactly one request — the upgrade — and then lives for
+    // hours. Everything the HTTP relay re-checks per request has to be
+    // re-checked here on a timer, or the upgrade path becomes the way to hold
+    // access that was taken away.
+    const BIND = { projectId: 'proj-1', studioUserId: 'studio-1', leaseId: 'lease-1' };
+    const base = {
+        bind: BIND,
+        machineId: 'machine-1',
+        port: 3000,
+        policyMode: 'required' as const,
+        sockets: [],
+    };
+    const allowing = (workspacePaths: string[] = ['/srv/a']) => ({
+        authorize: vi.fn().mockResolvedValue({ kind: 'allowed', workspacePaths }),
+    });
+
+    it('keeps a tunnel whose project access and runtime are both unchanged', async () => {
+        const requestLease = vi.fn().mockResolvedValue({ type: 'success', leaseId: 'lease-1', evidenceKind: 'container' });
+        await expect(recheckOpenTunnelBinding({
+            ...base,
+            authorizer: allowing() as never,
+            requestLease,
+        })).resolves.toEqual({ ok: true });
+        expect(requestLease).toHaveBeenCalledWith([], {
+            projectId: 'proj-1',
+            port: 3000,
+            workspacePaths: ['/srv/a'],
+        });
+    });
+
+    it('drops a tunnel once the studio revokes project access', async () => {
+        await expect(recheckOpenTunnelBinding({
+            ...base,
+            authorizer: { authorize: vi.fn().mockResolvedValue({ kind: 'denied' }) } as never,
+            requestLease: vi.fn(),
+        })).resolves.toMatchObject({ ok: false });
+    });
+
+    it('drops a tunnel when the runtime behind the port was replaced', async () => {
+        const requestLease = vi.fn().mockResolvedValue({ type: 'success', leaseId: 'lease-2', evidenceKind: 'container' });
+        await expect(recheckOpenTunnelBinding({
+            ...base,
+            authorizer: allowing() as never,
+            requestLease,
+        })).resolves.toEqual({ ok: false, reason: 'LEASE_MISMATCH' });
+    });
+
+    it('drops a tunnel when the daemon can no longer prove the runtime', async () => {
+        const requestLease = vi.fn().mockResolvedValue({ type: 'error', code: 'NO_LISTENER', message: 'gone' });
+        await expect(recheckOpenTunnelBinding({
+            ...base,
+            authorizer: allowing() as never,
+            requestLease,
+        })).resolves.toEqual({ ok: false, reason: 'NO_LISTENER' });
+    });
+
+    it('drops a tunnel when the studio cannot answer under the required policy', async () => {
+        await expect(recheckOpenTunnelBinding({
+            ...base,
+            authorizer: { authorize: vi.fn().mockResolvedValue({ kind: 'unavailable', reason: 'down' }) } as never,
+            requestLease: vi.fn(),
+        })).resolves.toMatchObject({ ok: false });
     });
 });
 

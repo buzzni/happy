@@ -42,6 +42,15 @@ import {
     type PreviewWsDataMessage, type PreviewWsCloseMessage, type PreviewWsDaemonGoneMessage,
 } from "@/modules/preview/previewWsTunnels";
 import { verifyPreviewToken } from "@/modules/preview/previewToken";
+import {
+    resolvePreviewBindingPolicy,
+    decideRelayBinding,
+    isStaleRuntimeBinding,
+    LEASE_UNSUPPORTED_CODE,
+} from "@/modules/preview/previewRuntimeBinding";
+import type { PreviewTokenBinding } from "@/modules/preview/previewToken";
+import type { PreviewAuthorizer } from "@/modules/preview/previewAuthorizeClient";
+import { authorizeRelayBinding, getPreviewAuthorizer, requestRuntimeLease } from "@/app/api/routes/previewRoutes";
 import { cookieName, readPreviewCookie } from "@/modules/preview/previewCookie";
 import { parsePreviewHost } from "@/modules/preview/parsePreviewHost";
 import { log } from "@/utils/log";
@@ -51,6 +60,36 @@ import type { Fastify } from "@/app/api/types";
 // then lives as long as the WebSocket; there is no idle timeout here because a
 // framebuffer stream (VNC) can legitimately sit idle between screen updates.
 const WS_OPEN_TIMEOUT_MS = 15_000;
+
+/**
+ * specs/runtime-isolation-hardening (H3) — how often an *open* tunnel is
+ * re-checked.
+ *
+ * The HTTP relay re-verifies per request, which is what makes revocation take
+ * effect there. A tunnel has exactly one request — the upgrade — and then
+ * lives for hours, so without this it would be the one preview path where
+ * losing project access, or the runtime being replaced underneath, changes
+ * nothing until the browser reconnects.
+ */
+export const WS_BINDING_RECHECK_MS = 30_000;
+
+/**
+ * Carries the daemon's refusal *code* out of the open attempt. The message is
+ * free text meant for a human; only the code decides the status.
+ */
+export class PreviewWsOpenError extends Error {
+    constructor(message: string, readonly code: string | null) {
+        super(message);
+        this.name = 'PreviewWsOpenError';
+    }
+}
+
+/** Daemon refusals that mean "not this project's runtime", not "gateway broke". */
+const BINDING_REFUSAL_CODES = new Set([
+    'PROJECT_OWNERSHIP_MISMATCH',
+    'PORT_PROJECT_MISMATCH',
+    'WORKSPACE_UNVERIFIED',
+]);
 
 // Tunnel bookkeeping lives in previewWsTunnels.ts because the browser end is a
 // raw TCP socket pinned to this replica while the daemon end may be on another
@@ -70,22 +109,86 @@ interface PreviewWsMachineSocket {
 
 export async function openPreviewWsTunnel<T extends PreviewWsMachineSocket>(
     machineSockets: T[],
-    payload: { tunnelId: string; port: number; dataB64: string },
+    payload: {
+        tunnelId: string;
+        port: number;
+        dataB64: string;
+        /**
+         * specs/runtime-isolation-hardening (H3) — same binding the HTTP relay
+         * sends. A tunnel is a relayed request too; leaving it unbound would
+         * make the upgrade path the way around the binding.
+         */
+        binding?: { projectId: string; leaseId: string; workspacePaths: string[] };
+    },
     timeoutMs = WS_OPEN_TIMEOUT_MS,
+    requireBindingEnforced = false,
 ): Promise<T> {
     let lastError: Error | null = null;
     for (const machineSocket of machineSockets) {
         try {
             const ack = (await machineSocket
                 .timeout(timeoutMs)
-                .emitWithAck('proxy-ws-open', payload)) as { ok?: boolean; code?: string; message?: string } | undefined;
-            if (ack?.ok === true) return machineSocket;
-            lastError = new Error(ack?.message ?? ack?.code ?? `daemon ${machineSocket.id} refused tunnel`);
+                .emitWithAck('proxy-ws-open', payload)) as {
+                    ok?: boolean;
+                    code?: string;
+                    message?: string;
+                    bindingEnforced?: boolean;
+                } | undefined;
+            if (ack?.ok === true && (!requireBindingEnforced || ack.bindingEnforced === true)) {
+                return machineSocket;
+            }
+            if (ack?.ok === true) {
+                // Opened, but by a daemon that never checked the binding.
+                lastError = new PreviewWsOpenError(
+                    `daemon ${machineSocket.id} opened the tunnel without enforcing the runtime binding`,
+                    LEASE_UNSUPPORTED_CODE,
+                );
+                continue;
+            }
+            lastError = new PreviewWsOpenError(
+                ack?.message ?? ack?.code ?? `daemon ${machineSocket.id} refused tunnel`,
+                ack?.code ?? null,
+            );
         } catch (error) {
             lastError = error instanceof Error ? error : new Error(String(error));
         }
     }
     throw lastError ?? new Error('No live daemon accepted the preview tunnel');
+}
+
+/**
+ * Re-run the whole binding decision for a tunnel that is already open: the
+ * studio ACL, and the runtime the lease was issued over.
+ *
+ * The lease is re-derived from live evidence rather than remembered, so a
+ * container restart or a port handed to another project shows up as a
+ * different digest and the tunnel is dropped.
+ */
+export async function recheckOpenTunnelBinding(input: {
+    bind: PreviewTokenBinding;
+    machineId: string;
+    port: number;
+    policyMode: 'off' | 'required';
+    authorizer: PreviewAuthorizer | null;
+    sockets: PreviewWsMachineSocket[];
+    requestLease?: typeof requestRuntimeLease;
+}): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const access = await authorizeRelayBinding({
+        access: { projectId: input.bind.projectId, studioUserId: input.bind.studioUserId },
+        machineId: input.machineId,
+        port: input.port,
+        authorizer: input.authorizer,
+        policyMode: input.policyMode,
+    });
+    if (access.kind === 'reject') return { ok: false, reason: access.code };
+
+    const lease = await (input.requestLease ?? requestRuntimeLease)(
+        input.sockets,
+        { projectId: input.bind.projectId, port: input.port, workspacePaths: access.workspacePaths },
+    );
+    if (lease.type === 'error') return { ok: false, reason: lease.code };
+    if (lease.leaseId !== input.bind.leaseId) return { ok: false, reason: 'LEASE_MISMATCH' };
+    return { ok: true };
 }
 
 /** Cross-replica: the daemon may be attached to a different pod than this upgrade. */
@@ -280,6 +383,42 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
         return;
     }
 
+    // specs/runtime-isolation-hardening (H3) — the upgrade path gets the same
+    // treatment as the HTTP relay: the token's runtime binding decides whether
+    // this tunnel may open, and the studio ACL is re-checked here too.
+    const bindingPolicy = resolvePreviewBindingPolicy(process.env);
+    const bindingDecision = decideRelayBinding(bindingPolicy, machineId, claims);
+    if (bindingDecision.kind === 'reject') {
+        log({ module: 'preview', level: 'warn' },
+            `preview ws refused reason=${bindingDecision.code} machine=${machineId} port=${port}`);
+        writeHttpError(socket, bindingDecision.status, 'Unauthorized');
+        return;
+    }
+    let wsBinding: { projectId: string; leaseId: string; workspacePaths: string[] } | undefined;
+    if (bindingDecision.kind === 'enforce') {
+        const access = await authorizeRelayBinding({
+            access: {
+                projectId: bindingDecision.bind.projectId,
+                studioUserId: bindingDecision.bind.studioUserId,
+            },
+            machineId,
+            port,
+            authorizer: getPreviewAuthorizer(),
+            policyMode: bindingPolicy.mode,
+        });
+        if (access.kind === 'reject') {
+            log({ module: 'preview', level: 'warn' },
+                `preview ws refused reason=${access.code} machine=${machineId} port=${port} project=${bindingDecision.bind.projectId}`);
+            writeHttpError(socket, access.status, 'Forbidden');
+            return;
+        }
+        wsBinding = {
+            projectId: bindingDecision.bind.projectId,
+            leaseId: bindingDecision.bind.leaseId,
+            workspacePaths: access.workspacePaths,
+        };
+    }
+
     const { sockets: machineSockets, degraded } = await findMachineSockets(claims.userId, machineId);
     if (machineSockets.length === 0) {
         // `degraded` = the cross-replica lookup failed, so we do not know
@@ -313,16 +452,30 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
 
     let daemonSocketId: string;
     try {
-        const chosen = await openPreviewWsTunnel(machineSockets, {
-            tunnelId,
-            port,
-            dataB64: requestBytes.toString('base64'),
-        });
+        const chosen = await openPreviewWsTunnel(
+            machineSockets,
+            {
+                tunnelId,
+                port,
+                dataB64: requestBytes.toString('base64'),
+                ...(wsBinding ? { binding: wsBinding } : {}),
+            },
+            undefined,
+            Boolean(wsBinding),
+        );
         daemonSocketId = chosen.id;
     } catch (err) {
         deleteTunnel(tunnelId);
+        const code = err instanceof PreviewWsOpenError ? err.code : null;
         log({ module: 'preview', level: 'error' }, `proxy-ws-open failed for ${machineId}:${port}: ${(err as Error).message}`);
-        writeHttpError(socket, 502, 'Bad Gateway');
+        // A daemon that refused over the binding is an authorization answer,
+        // and a stale lease is a re-mintable one — same split as the HTTP
+        // relay, so the browser's reload lands somewhere that can recover.
+        writeHttpError(
+            socket,
+            code && isStaleRuntimeBinding(code) ? 401 : code && BINDING_REFUSAL_CODES.has(code) ? 403 : 502,
+            'Bad Gateway',
+        );
         return;
     }
 
@@ -346,13 +499,56 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
         toDaemon('proxy-ws-data', { tunnelId, dataB64: chunk.toString('base64') });
     });
     socket.resume();
+    let recheckTimer: NodeJS.Timeout | null = null;
     const teardown = () => {
+        if (recheckTimer) {
+            clearInterval(recheckTimer);
+            recheckTimer = null;
+        }
         if (deleteTunnel(tunnelId)) {
             toDaemon('proxy-ws-close', { tunnelId });
         }
     };
     socket.on('close', teardown);
     socket.on('error', teardown);
+
+    // Revocation for a connection that is already open. Access can be taken
+    // away, and the runtime can be replaced, long after the upgrade — the
+    // tunnel is the only preview path where nothing else would notice.
+    if (bindingDecision.kind === 'enforce') {
+        const bind = bindingDecision.bind;
+        recheckTimer = setInterval(() => {
+            void (async () => {
+                if (!hasTunnel(tunnelId)) {
+                    teardown();
+                    return;
+                }
+                let verdict: { ok: true } | { ok: false; reason: string };
+                try {
+                    const { sockets } = await findMachineSockets(claims.userId, machineId);
+                    verdict = await recheckOpenTunnelBinding({
+                        bind,
+                        machineId,
+                        port,
+                        policyMode: bindingPolicy.mode,
+                        authorizer: getPreviewAuthorizer(),
+                        sockets,
+                    });
+                } catch (err) {
+                    // The check itself broke. Keeping the tunnel open would
+                    // make an outage of this path the way to keep access.
+                    verdict = { ok: false, reason: `recheck-failed: ${(err as Error).message}` };
+                }
+                if (verdict.ok) return;
+                log({ module: 'preview', level: 'warn' },
+                    `preview ws revoked reason=${verdict.reason} machine=${machineId} port=${port} project=${bind.projectId}`);
+                teardown();
+                try { socket.destroy(); } catch { /* already gone */ }
+            })();
+        }, WS_BINDING_RECHECK_MS);
+        // Never hold the process open for a check.
+        recheckTimer.unref?.();
+    }
 }
 
 export function previewWebSocketRelay(app: Fastify): void {
