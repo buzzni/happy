@@ -102,12 +102,86 @@ describe('createPreviewAuthorizer', () => {
         await expect(serverError.authorize(REQUEST)).resolves.toMatchObject({ kind: 'unavailable' });
     });
 
-    it('treats a 401/403 from the studio as a denial', async () => {
+    it('treats every non-200 status as unavailable, never as a denial', async () => {
+        // Only the contract answer — 200 with `{allowed:false}` — is a
+        // decision. A 401/403 here means our own shared secret or path is
+        // wrong, and a 404 means the endpoint moved: reading either as "the
+        // user may not have this" would turn our misconfiguration into a
+        // permanent, silent denial for everyone.
+        for (const status of [301, 302, 400, 401, 403, 404, 500, 502]) {
+            const authorizer = createPreviewAuthorizer({
+                config: CONFIG,
+                fetchImpl: vi.fn().mockResolvedValue(jsonResponse(status, { error: 'nope' })),
+            });
+            await expect(authorizer.authorize(REQUEST)).resolves.toMatchObject({ kind: 'unavailable' });
+        }
+    });
+
+    it('refuses to follow a redirect rather than re-sending the secret elsewhere', async () => {
+        const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(200, { allowed: true }));
+        const authorizer = createPreviewAuthorizer({ config: CONFIG, fetchImpl });
+        await authorizer.authorize(REQUEST);
+        expect(fetchImpl).toHaveBeenCalledWith(
+            expect.any(String),
+            expect.objectContaining({ redirect: 'error' }),
+        );
+    });
+
+    it('ends within the deadline when the body never finishes arriving', async () => {
+        // Headers arrive, body stalls. Aborting only the connect phase would
+        // leave every preview request hanging on a half-open callback.
+        const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => new Response(
+            new ReadableStream({
+                start(controller) {
+                    controller.enqueue(new TextEncoder().encode('{"allowed":'));
+                    init?.signal?.addEventListener('abort', () => controller.error(new Error('aborted')));
+                },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ));
+        const authorizer = createPreviewAuthorizer({ config: CONFIG, fetchImpl, timeoutMs: 30 });
+
+        const started = Date.now();
+        await expect(authorizer.authorize(REQUEST)).resolves.toMatchObject({ kind: 'unavailable' });
+        expect(Date.now() - started).toBeLessThan(2_000);
+    });
+
+    it('refuses an answer larger than the response limit instead of buffering it', async () => {
+        const huge = JSON.stringify({ allowed: true, workspacePaths: ['/srv/' + 'a'.repeat(200_000)] });
         const authorizer = createPreviewAuthorizer({
             config: CONFIG,
-            fetchImpl: vi.fn().mockResolvedValue(jsonResponse(403, { error: 'nope' })),
+            fetchImpl: vi.fn().mockResolvedValue(jsonResponse(200, JSON.parse(huge))),
+            maxResponseBytes: 4_096,
         });
-        await expect(authorizer.authorize(REQUEST)).resolves.toEqual({ kind: 'denied' });
+        await expect(authorizer.authorize(REQUEST)).resolves.toMatchObject({ kind: 'unavailable' });
+    });
+
+    it('rejects an answer whose workspace list is not entirely strings', async () => {
+        // Filtering the bad entries out would quietly narrow the project's
+        // verified directories and turn a broken studio into an ownership
+        // refusal nobody can explain.
+        const authorizer = createPreviewAuthorizer({
+            config: CONFIG,
+            fetchImpl: vi.fn().mockResolvedValue(jsonResponse(200, { allowed: true, workspacePaths: ['/srv/a', 42] })),
+        });
+        await expect(authorizer.authorize(REQUEST)).resolves.toMatchObject({ kind: 'unavailable' });
+    });
+
+    it('rejects an answer whose workspace paths are not absolute', async () => {
+        const authorizer = createPreviewAuthorizer({
+            config: CONFIG,
+            fetchImpl: vi.fn().mockResolvedValue(jsonResponse(200, { allowed: true, workspacePaths: ['relative/path'] })),
+        });
+        await expect(authorizer.authorize(REQUEST)).resolves.toMatchObject({ kind: 'unavailable' });
+    });
+
+    it('never puts the shared secret in the reason it reports', async () => {
+        const authorizer = createPreviewAuthorizer({
+            config: CONFIG,
+            fetchImpl: vi.fn().mockRejectedValue(new Error(`connect failed for secret ${CONFIG.secret}`)),
+        });
+        const result = await authorizer.authorize(REQUEST);
+        expect(JSON.stringify(result)).not.toContain(CONFIG.secret);
     });
 
     it('asks the studio again for every request, never from a cache', async () => {
@@ -135,7 +209,7 @@ describe('createPreviewAuthorizer', () => {
 
     it('re-asks after a denial rather than pinning it', async () => {
         const fetchImpl = vi.fn()
-            .mockResolvedValueOnce(jsonResponse(403, { error: 'nope' }))
+            .mockResolvedValueOnce(jsonResponse(200, { allowed: false }))
             .mockResolvedValue(jsonResponse(200, { allowed: true }));
         const authorizer = createPreviewAuthorizer({ config: CONFIG, fetchImpl });
 
@@ -173,17 +247,14 @@ describe('createPreviewAuthorizer — workspace paths', () => {
         });
     });
 
-    it('ignores non-string entries rather than passing them to the daemon', async () => {
+    it('accepts an answer with no workspace list as an empty one', async () => {
+        // A container-published runtime proves ownership by its project
+        // label, so an allow with no paths is a legitimate answer.
         const authorizer = createPreviewAuthorizer({
             config: CONFIG,
-            fetchImpl: vi.fn().mockResolvedValue(
-                jsonResponse(200, { allowed: true, workspacePaths: ['/srv/a', 42, null] }),
-            ),
+            fetchImpl: vi.fn().mockResolvedValue(jsonResponse(200, { allowed: true })),
         });
-        await expect(authorizer.authorize(REQUEST)).resolves.toEqual({
-            kind: 'allowed',
-            workspacePaths: ['/srv/a'],
-        });
+        await expect(authorizer.authorize(REQUEST)).resolves.toEqual({ kind: 'allowed', workspacePaths: [] });
     });
 
     it('picks up workspace paths the studio changed between requests', async () => {
