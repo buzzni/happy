@@ -93,7 +93,10 @@ import {
 } from './resumeGuards';
 import { decideResumeCursorPersist } from './resumeCursorPersistence';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
-import { reportSandboxDependencyPreflight } from '@/sandbox/dependencyPreflight';
+import {
+  reportSandboxDependencyPreflight,
+  reportSandboxExecutionPreflight,
+} from '@/sandbox/dependencyPreflight';
 import { startLogHousekeeping } from '@/ui/logHousekeepingRunner';
 import {
   readDaemonSessionIdleReaperConfig,
@@ -267,6 +270,12 @@ export async function startDaemon(): Promise<void> {
   // 뜰 때까지 그 사실을 몰랐다 — 증상은 몇 분 뒤 네트워크 호출 실패로 나타나 원인과
   // 멀리 떨어졌다(2026-08-28: socat 부재).
   reportSandboxDependencyPreflight();
+
+  // 의존성이 다 있어도 비특권 컨테이너에서는 감싼 자식이 namespace 생성에서 죽는다
+  // (2026-09-10 기본 Docker 프로브). 격리가 필수인 머신에서만, 실제로 감싼 명령을
+  // 한 번 돌려 그 사실을 기동 로그에 남긴다 — 활성화 판단의 근거다. 진단이므로
+  // 실패해도 데몬 기동을 막지 않는다.
+  void reportSandboxExecutionPreflight();
 
   // We don't have cleanup function at the time of server construction
   // Control flow is:

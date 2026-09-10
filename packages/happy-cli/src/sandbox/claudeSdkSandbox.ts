@@ -22,7 +22,7 @@
  */
 import type { SandboxSettings } from '@anthropic-ai/claude-agent-sdk';
 import type { SandboxConfig } from '@/persistence';
-import { buildSandboxRuntimeConfig } from './config';
+import { buildSandboxRuntimeConfig, resolveSandboxTrustFloor } from './config';
 import { MandatorySandboxError, type SandboxPolicyMode } from './sandboxPolicy';
 
 export function buildClaudeRemoteSandboxSettings(input: {
@@ -75,4 +75,21 @@ export function resolveClaudeRemoteSandbox(input: {
         sessionPath: input.sessionPath,
         policyMode: input.policyMode,
     });
+}
+
+/**
+ * SDK sandbox 와 함께 내려보내는 CLI 권한 deny 규칙.
+ *
+ * sandbox 설정의 filesystem 은 주로 Bash 실행 경계에 걸린다. Read/Edit/Write
+ * 도구가 같은 경로를 직접 다루는 길은 CLI 권한 규칙으로 막아야 두 층이 맞는다.
+ * 이것이 OS 경계는 아니다 — 도구 레벨 거부이며, 프로세스 전체 경계는 여전히
+ * 자식을 감싸야 얻는다.
+ */
+export function buildMandatoryRemoteDenyRules(policyMode: SandboxPolicyMode): string[] {
+    if (policyMode !== 'mandatory') return [];
+    return resolveSandboxTrustFloor().flatMap((path) => [
+        `Read(${path}/**)`,
+        `Edit(${path}/**)`,
+        `Write(${path}/**)`,
+    ]);
 }

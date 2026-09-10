@@ -95,6 +95,18 @@ export function filterCredentialsFromEnv(env: NodeJS.ProcessEnv): Record<string,
     return filtered;
 }
 
+/**
+ * mandatory 머신에서 세션 config 가 낮출 수 없는 경로들. 이 프로세스의
+ * happyHomeDir 은 staged /tmp 홈일 수 있는데 그건 세션 자신의 것이므로 가리지
+ * 않는다 — 데몬의 홈만 덮는다(configuration.daemonHappyHomeDir).
+ */
+export function resolveSandboxTrustFloor(): string[] {
+    return sandboxTrustFloorPaths({
+        homeDir: trustedHomeDir(),
+        daemonHappyHomeDir: configuration.daemonHappyHomeDir,
+    });
+}
+
 export function buildSandboxRuntimeConfig(
     sandboxConfig: SandboxConfig,
     sessionPath: string,
@@ -160,14 +172,7 @@ export function buildSandboxRuntimeConfig(
             `쓰기 범위가 파일시스템/홈 루트입니다: ${allowWrite.join(', ')}`,
         );
     }
-    const floor = mandatory
-        ? sandboxTrustFloorPaths({
-            homeDir: trustedHomeDir(),
-            // 이 프로세스의 happyHomeDir 은 staged /tmp 홈일 수 있다. 그건
-            // 세션 자신의 것이므로 floor 로 가리지 않는다 — 데몬의 홈만 덮는다.
-            daemonHappyHomeDir: configuration.daemonHappyHomeDir,
-        })
-        : [];
+    const floor = mandatory ? resolveSandboxTrustFloor() : [];
 
     return {
         allowPty: true,

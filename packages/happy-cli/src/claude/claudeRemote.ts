@@ -52,6 +52,7 @@ export async function claudeRemote(opts: {
     orchestratorMcpServers?: Record<string, unknown>,
     mcpConfig?: McpConfigSource,
     sandbox?: QueryOptions['sandbox'],
+    permissionsDeny?: string[],
 
     // Dynamic parameters
     nextMessage: () => Promise<{ message: MessageParam['content'], mode: EnhancedMode } | null>,
@@ -216,6 +217,7 @@ export async function claudeRemote(opts: {
         settingsPath: opts.hookSettingsPath,
         promptSuggestions: true,
         sandbox: providerSandbox,
+        permissionsDeny: opts.permissionsDeny,
         spawnClaudeCodeProcess: writerProcessTree
             ? (spawnOptions) => {
                 const child = spawn(spawnOptions.command, spawnOptions.args, {

@@ -2,7 +2,11 @@ import { describe, expect, it } from 'vitest';
 
 import { configuration } from '@/configuration';
 import type { SandboxConfig } from '@/persistence';
-import { buildClaudeRemoteSandboxSettings, resolveClaudeRemoteSandbox } from './claudeSdkSandbox';
+import {
+    buildClaudeRemoteSandboxSettings,
+    buildMandatoryRemoteDenyRules,
+    resolveClaudeRemoteSandbox,
+} from './claudeSdkSandbox';
 
 function config(overrides: Partial<SandboxConfig> = {}): SandboxConfig {
     return {
@@ -137,5 +141,21 @@ describe('resolveClaudeRemoteSandbox', () => {
             sessionPath: '/tmp/session-a',
             policyMode: 'mandatory',
         })).toThrow(/missing-config/);
+    });
+});
+
+describe('buildMandatoryRemoteDenyRules', () => {
+    // SDK sandbox 는 Bash 경계다. Read/Edit/Write 같은 도구가 floor 경로를 직접
+    // 읽거나 쓰는 경로는 CLI 권한 규칙으로 막는다.
+    it('denies read and write tools on every floor path for a mandatory session', () => {
+        const rules = buildMandatoryRemoteDenyRules('mandatory');
+
+        expect(rules).toContain(`Read(${configuration.daemonHappyHomeDir}/**)`);
+        expect(rules).toContain(`Edit(${configuration.daemonHappyHomeDir}/**)`);
+        expect(rules).toContain(`Write(${configuration.daemonHappyHomeDir}/**)`);
+    });
+
+    it('adds nothing on a personal machine', () => {
+        expect(buildMandatoryRemoteDenyRules('owner-choice')).toEqual([]);
     });
 });
