@@ -1348,6 +1348,40 @@ export class ApiMachineClient {
         return enforceRelayBinding(binding, port, deps);
     }
 
+    /** Handler body of the `preview-runtime-lease` socket event (mint time). */
+    private async answerPreviewRuntimeLease(params: any, ack: (response: any) => void): Promise<void> {
+        const deps = this.previewLeaseDeps();
+        if (!deps) {
+            ack({
+                type: 'error',
+                code: 'EVIDENCE_UNAVAILABLE',
+                message: 'Daemon is not ready to resolve preview runtimes',
+            });
+            return;
+        }
+        try {
+            const result = await acquireRuntimeLease(
+                {
+                    projectId: params?.projectId,
+                    port: params?.port,
+                    // Workspace paths come from happy-server's
+                    // authenticated studio callback, never from a
+                    // browser-facing request.
+                    workspacePaths: Array.isArray(params?.workspacePaths) ? params.workspacePaths : [],
+                },
+                deps,
+            );
+            logger.debug(
+                `[API MACHINE] preview-runtime-lease project=${params?.projectId} port=${params?.port} -> ${result.type === 'success' ? result.evidenceKind : result.code}`,
+            );
+            ack(result);
+        } catch (e) {
+            const message = e instanceof Error ? e.message : String(e);
+            logger.debug(`[API MACHINE] preview-runtime-lease internal error: ${message}`);
+            ack({ type: 'error', code: 'EVIDENCE_UNAVAILABLE', message });
+        }
+    }
+
     setAutomationKey(key: MachineAutomationKey, persistVersion: (version: number) => void, protocolVersion: number = AUTOMATION_PROTOCOL_VERSION): void {
         this.automationKey = key;
         this.automationProtocolVersion = protocolVersion;
@@ -2207,38 +2241,7 @@ export class ApiMachineClient {
         // quietly falling back to an unbound token.
         this.socket.on(
             'preview-runtime-lease',
-            async (params: any, ack: (response: any) => void) => {
-                const deps = this.previewLeaseDeps();
-                if (!deps) {
-                    ack({
-                        type: 'error',
-                        code: 'EVIDENCE_UNAVAILABLE',
-                        message: 'Daemon is not ready to resolve preview runtimes',
-                    });
-                    return;
-                }
-                try {
-                    const result = await acquireRuntimeLease(
-                        {
-                            projectId: params?.projectId,
-                            port: params?.port,
-                            // Workspace paths come from happy-server's
-                            // authenticated studio callback, never from a
-                            // browser-facing request.
-                            workspacePaths: Array.isArray(params?.workspacePaths) ? params.workspacePaths : [],
-                        },
-                        deps,
-                    );
-                    logger.debug(
-                        `[API MACHINE] preview-runtime-lease project=${params?.projectId} port=${params?.port} -> ${result.type === 'success' ? result.evidenceKind : result.code}`,
-                    );
-                    ack(result);
-                } catch (e) {
-                    const message = e instanceof Error ? e.message : String(e);
-                    logger.debug(`[API MACHINE] preview-runtime-lease internal error: ${message}`);
-                    ack({ type: 'error', code: 'EVIDENCE_UNAVAILABLE', message });
-                }
-            },
+            (params: any, ack: (response: any) => void) => this.answerPreviewRuntimeLease(params, ack),
         );
 
         // Preview WebSocket relay — raw byte tunnel for upgrades (noVNC /
