@@ -171,3 +171,53 @@ describe('PreviewWsProxy', () => {
     expect(proxy.size).toBe(0)
   })
 })
+
+describe('PreviewWsProxy cancellation while still connecting', () => {
+  // specs/runtime-isolation-hardening (H3, P2). The server's open deadline
+  // can pass while this side is still connecting — a busy machine, a slow
+  // upstream. It then tells us to close a tunnel it has already forgotten. If
+  // that close is a no-op because the tunnel is not registered yet, the
+  // upstream connects a moment later and streams into a tunnel with no owner,
+  // no expiry timer and no recheck behind it.
+  it('does not open an upstream that was closed before it connected', async () => {
+    const server = net.createServer()
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = (server.address() as net.AddressInfo).port
+    const connections: net.Socket[] = []
+    server.on('connection', (socket) => connections.push(socket))
+
+    const emitted: Array<{ event: string; payload: unknown }> = []
+    const proxy = new PreviewWsProxy({
+      emit: (event: string, payload: unknown) => { emitted.push({ event, payload }) },
+    } as any)
+
+    const opening = proxy.open({ tunnelId: 't-cancel', port, dataB64: '' })
+    proxy.close('t-cancel')
+    const ack = await opening
+
+    expect(ack.ok).toBe(false)
+    expect(proxy.size).toBe(0)
+    // Nothing may be streamed for a tunnel the server has given up on.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(emitted.filter((e) => e.event === 'proxy-ws-data')).toEqual([])
+
+    for (const socket of connections) socket.destroy()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  })
+
+  it('still closes a tunnel that did connect', async () => {
+    const server = net.createServer()
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = (server.address() as net.AddressInfo).port
+    const proxy = new PreviewWsProxy({ emit: () => { /* ignored */ } } as any)
+
+    const ack = await proxy.open({ tunnelId: 't-live', port, dataB64: '' })
+    expect(ack.ok).toBe(true)
+    expect(proxy.size).toBe(1)
+
+    proxy.close('t-live')
+    expect(proxy.size).toBe(0)
+
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  })
+})

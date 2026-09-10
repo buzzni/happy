@@ -1,9 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+    hasTunnel,
+    deliverDaemonData,
+    applyRemoteData,
+    _resetPreviewTunnelsForTest,
+} from '@/modules/preview/previewWsTunnels';
 import { describe as _describe } from 'vitest';
 import {
     parsePreviewUpgradeRequest,
     parsePreviewUpgradeUrl,
     openPreviewWsTunnel,
+    createTunnelCandidateHooks,
     recheckOpenTunnelBinding,
     armTunnelRevocation,
     serializeUpgradeRequest,
@@ -43,6 +50,42 @@ describe('parsePreviewUpgradeUrl', () => {
     });
 });
 
+/**
+ * The open attempt now owns one pending tunnel per candidate daemon: it
+ * registers it before emitting, approves it only on an ack that proves the
+ * binding was enforced, and abandons it — telling that daemon to close —
+ * in every other case, including the ones where no ack ever arrives.
+ */
+function candidateHooks(options: { cancelled?: () => boolean; approve?: () => boolean } = {}) {
+    const begun: string[] = [];
+    const approved: Array<[string, string]> = [];
+    const abandoned: string[] = [];
+    let n = 0;
+    return {
+        begun,
+        approved,
+        abandoned,
+        hooks: {
+            begin: (daemonSocketId: string) => {
+                const id = `tunnel-${(n += 1)}-${daemonSocketId}`;
+                begun.push(id);
+                return id;
+            },
+            approve: (tunnelId: string, daemonSocketId: string) => {
+                approved.push([tunnelId, daemonSocketId]);
+                return options.approve ? options.approve() : true;
+            },
+            abandon: (tunnelId: string, socket: { emit: (event: string, payload: unknown) => unknown }) => {
+                abandoned.push(tunnelId);
+                socket.emit('proxy-ws-close', { tunnelId });
+            },
+            cancelled: options.cancelled ?? (() => false),
+        },
+    };
+}
+
+const OPEN_PAYLOAD = { port: 40002, dataB64: '' };
+
 describe('openPreviewWsTunnel', () => {
     it('falls back to another live daemon socket when the first one is stale', async () => {
         const socket = (id: string, response: unknown) => ({
@@ -55,46 +98,109 @@ describe('openPreviewWsTunnel', () => {
         });
         const stale = socket('stale', new Error('timeout'));
         const fresh = socket('fresh', { ok: true });
+        const { hooks } = candidateHooks();
 
-        await expect(openPreviewWsTunnel(
-            [stale, fresh],
-            { tunnelId: 'tunnel-1', port: 40002, dataB64: '' },
-            10,
-        )).resolves.toBe(fresh);
+        const opened = await openPreviewWsTunnel([stale, fresh], OPEN_PAYLOAD, hooks, 10);
+
+        expect(opened.socket).toBe(fresh);
+    });
+
+    it('gives each candidate its own tunnel id', async () => {
+        // One id shared across candidates means the daemon that lost the race
+        // can still write into the tunnel the winner is serving.
+        const refusing = { id: 'a', emit: vi.fn(), timeout: () => ({ emitWithAck: async () => ({ ok: false }) }) };
+        const accepting = { id: 'b', emit: vi.fn(), timeout: () => ({ emitWithAck: async () => ({ ok: true }) }) };
+        const probe = candidateHooks();
+
+        const opened = await openPreviewWsTunnel([refusing, accepting], OPEN_PAYLOAD, probe.hooks, 10);
+
+        expect(probe.begun).toHaveLength(2);
+        expect(new Set(probe.begun).size).toBe(2);
+        expect(opened.tunnelId).toBe(probe.begun[1]);
     });
 
     it('carries the runtime binding to the daemon', async () => {
         const emitWithAck = vi.fn(async () => ({ ok: true, bindingEnforced: true }));
         const daemon = { id: 'd1', emit: vi.fn(), timeout: () => ({ emitWithAck }) };
-        const payload = {
-            tunnelId: 'tunnel-1',
-            port: 40002,
-            dataB64: '',
-            binding: { projectId: 'proj-1', leaseId: 'lease-1', workspacePaths: ['/srv/a'] },
-        };
+        const binding = { projectId: 'proj-1', leaseId: 'lease-1', workspacePaths: ['/srv/a'] };
+        const probe = candidateHooks();
 
-        await expect(openPreviewWsTunnel([daemon], payload, 10, true)).resolves.toBe(daemon);
-        expect(emitWithAck).toHaveBeenCalledWith('proxy-ws-open', payload);
+        await openPreviewWsTunnel([daemon], { ...OPEN_PAYLOAD, binding }, probe.hooks, 10, true);
+
+        expect(emitWithAck).toHaveBeenCalledWith('proxy-ws-open', {
+            tunnelId: probe.begun[0],
+            ...OPEN_PAYLOAD,
+            binding,
+        });
     });
 
-    it('refuses a daemon that opened the tunnel without enforcing the binding', async () => {
-        // specs/runtime-isolation-hardening (H3) — an older daemon ignores the
-        // binding fields and answers a plain `{ ok: true }`. The upgrade path
-        // must not become the way around the binding the HTTP relay enforces.
+    it('never approves a tunnel a daemon opened without enforcing the binding', async () => {
         const old = { id: 'old', emit: vi.fn(), timeout: () => ({ emitWithAck: async () => ({ ok: true }) }) };
+        const probe = candidateHooks();
 
         await expect(openPreviewWsTunnel(
             [old],
-            { tunnelId: 'tunnel-1', port: 40002, dataB64: '', binding: { projectId: 'p', leaseId: 'l', workspacePaths: [] } },
+            { ...OPEN_PAYLOAD, binding: { projectId: 'p', leaseId: 'l', workspacePaths: [] } },
+            probe.hooks,
             10,
             true,
-        )).rejects.toThrow(/binding/i);
+        )).rejects.toBeInstanceOf(PreviewWsOpenError);
+
+        expect(probe.approved).toEqual([]);
+        expect(probe.abandoned).toEqual(probe.begun);
+        expect(old.emit).toHaveBeenCalledWith('proxy-ws-close', { tunnelId: probe.begun[0] });
+    });
+
+    it('tells a daemon to close the tunnel it opened after we stopped waiting', async () => {
+        // P2: the open deadline can pass while the daemon is still queueing.
+        // If it connects afterwards, nothing on the server knows about that
+        // tunnel any more — no expiry timer, no recheck — so the cancellation
+        // has to reach the daemon rather than only the local registry.
+        const slow = {
+            id: 'slow',
+            emit: vi.fn(),
+            timeout: (ms: number) => ({
+                emitWithAck: async () => {
+                    await new Promise((resolve) => setTimeout(resolve, ms));
+                    throw new Error('operation has timed out');
+                },
+            }),
+        };
+        const probe = candidateHooks();
+
+        await expect(openPreviewWsTunnel([slow], OPEN_PAYLOAD, probe.hooks, 20)).rejects.toThrow();
+
+        expect(slow.emit).toHaveBeenCalledWith('proxy-ws-close', { tunnelId: probe.begun[0] });
+    });
+
+    it('abandons an ack that arrives after the browser has gone', async () => {
+        // The browser leaves mid-open. The ack still comes back "ok", and the
+        // daemon is holding an upstream connection for a tunnel nobody will
+        // ever read — it has to be told.
+        let gone = false;
+        const daemon = {
+            id: 'd1',
+            emit: vi.fn(),
+            timeout: () => ({ emitWithAck: async () => { gone = true; return { ok: true }; } }),
+        };
+        const probe = candidateHooks({ cancelled: () => gone });
+
+        await expect(openPreviewWsTunnel([daemon], OPEN_PAYLOAD, probe.hooks, 10)).rejects.toThrow();
+
+        expect(probe.approved).toEqual([]);
+        expect(daemon.emit).toHaveBeenCalledWith('proxy-ws-close', { tunnelId: probe.begun[0] });
+    });
+
+    it('abandons a tunnel the registry refuses to approve', async () => {
+        const daemon = { id: 'd1', emit: vi.fn(), timeout: () => ({ emitWithAck: async () => ({ ok: true }) }) };
+        const probe = candidateHooks({ approve: () => false });
+
+        await expect(openPreviewWsTunnel([daemon], OPEN_PAYLOAD, probe.hooks, 10)).rejects.toThrow();
+
+        expect(probe.abandoned).toEqual(probe.begun);
     });
 
     it('carries the daemon refusal code out, not just its prose', async () => {
-        // handleUpgrade answers 401 for a stale lease and 403 for an
-        // ownership refusal. The message is free text written for a human;
-        // only the code can decide that.
         const daemon = {
             id: 'd1',
             emit: vi.fn(),
@@ -106,18 +212,32 @@ describe('openPreviewWsTunnel', () => {
                 }),
             }),
         };
-        await expect(openPreviewWsTunnel([daemon], { tunnelId: 't', port: 1, dataB64: '' }, 10))
+        await expect(openPreviewWsTunnel([daemon], OPEN_PAYLOAD, candidateHooks().hooks, 10))
             .rejects.toMatchObject({ code: 'LEASE_MISMATCH' });
     });
 
-    it('reports a daemon that ignored the binding with the unsupported code', async () => {
-        const old = { id: 'old', emit: vi.fn(), timeout: () => ({ emitWithAck: async () => ({ ok: true }) }) };
+    it('spends one budget across every candidate daemon instead of one each', async () => {
+        const attempted: string[] = [];
+        const hanging = (id: string) => ({
+            id,
+            emit: vi.fn(),
+            timeout: (ms: number) => ({
+                emitWithAck: async () => {
+                    attempted.push(id);
+                    await new Promise((resolve) => setTimeout(resolve, ms));
+                    throw new Error('operation has timed out');
+                },
+            }),
+        });
+
         await expect(openPreviewWsTunnel(
-            [old],
-            { tunnelId: 't', port: 1, dataB64: '', binding: { projectId: 'p', leaseId: 'l', workspacePaths: [] } },
-            10,
-            true,
-        )).rejects.toBeInstanceOf(PreviewWsOpenError);
+            [hanging('a'), hanging('b'), hanging('c')],
+            OPEN_PAYLOAD,
+            candidateHooks().hooks,
+            40,
+        )).rejects.toThrow();
+
+        expect(attempted.length).toBeLessThan(3);
     });
 });
 
@@ -264,60 +384,6 @@ describe('serializeUpgradeRequest', () => {
         const text = bytes.toString('utf-8');
 
         expect(text).not.toContain('Origin:');
-    });
-});
-
-describe('openPreviewWsTunnel — cleanup and budget', () => {
-    it('closes the tunnel a non-enforcing daemon opened before trying the next one', async () => {
-        // That daemon has a live upstream TCP connection to the dev server
-        // now. Walking away from it leaks the connection for as long as the
-        // daemon runs, and nothing else will ever reference this tunnelId.
-        const emit = vi.fn();
-        const old = {
-            id: 'old',
-            emit,
-            timeout: () => ({ emitWithAck: async () => ({ ok: true }) }),
-        };
-        const good = {
-            id: 'good',
-            emit: vi.fn(),
-            timeout: () => ({ emitWithAck: async () => ({ ok: true, bindingEnforced: true }) }),
-        };
-
-        const chosen = await openPreviewWsTunnel(
-            [old, good],
-            { tunnelId: 'tunnel-1', port: 1, dataB64: '', binding: { projectId: 'p', leaseId: 'l', workspacePaths: [] } },
-            10,
-            true,
-        );
-
-        expect(chosen).toBe(good);
-        expect(emit).toHaveBeenCalledWith('proxy-ws-close', { tunnelId: 'tunnel-1' });
-    });
-
-    it('spends one budget across every candidate daemon instead of one each', async () => {
-        // Three unreachable daemons must not turn a 15s open timeout into 45s
-        // of a browser waiting on an upgrade.
-        const attempted: string[] = [];
-        const hanging = (id: string) => ({
-            id,
-            emit: vi.fn(),
-            timeout: (ms: number) => ({
-                emitWithAck: async () => {
-                    attempted.push(id);
-                    await new Promise((resolve) => setTimeout(resolve, ms));
-                    throw new Error('operation has timed out');
-                },
-            }),
-        });
-
-        await expect(openPreviewWsTunnel(
-            [hanging('a'), hanging('b'), hanging('c')],
-            { tunnelId: 't', port: 1, dataB64: '' },
-            40,
-        )).rejects.toThrow();
-
-        expect(attempted.length).toBeLessThan(3);
     });
 });
 
@@ -475,5 +541,102 @@ describe('wsOpenFailureStatus', () => {
         expect(wsOpenFailureStatus('TIMEOUT')).toBe(502);
         expect(wsOpenFailureStatus('NO_LISTENER')).toBe(502);
         expect(wsOpenFailureStatus(null)).toBe(502);
+    });
+});
+
+describe('createTunnelCandidateHooks', () => {
+    function browserSocket() {
+        return {
+            writable: true,
+            written: [] as string[],
+            write(buf: Buffer) { this.written.push(buf.toString()); return true; },
+            end() { /* unused */ },
+            destroy() { /* unused */ },
+        };
+    }
+
+    beforeEach(() => _resetPreviewTunnelsForTest());
+
+    it('gives every candidate its own tunnel id', () => {
+        // A shared id lets the daemon that lost the race write into the
+        // tunnel the winner is serving.
+        const hooks = createTunnelCandidateHooks({
+            browserSocket: browserSocket() as never,
+            bound: true,
+            cancelled: () => false,
+        });
+
+        const first = hooks.begin('daemon-1');
+        const second = hooks.begin('daemon-2');
+
+        expect(first).not.toBe(second);
+        expect(hasTunnel(first)).toBe(true);
+        expect(hasTunnel(second)).toBe(true);
+    });
+
+    it('registers the tunnel closed, so nothing is delivered before approval', () => {
+        const socket = browserSocket();
+        const hooks = createTunnelCandidateHooks({
+            browserSocket: socket as never,
+            bound: true,
+            cancelled: () => false,
+        });
+        const tunnelId = hooks.begin('daemon-1');
+
+        deliverDaemonData(tunnelId, Buffer.from('early').toString('base64'), vi.fn(), 'daemon-1');
+        expect(socket.written).toEqual([]);
+
+        expect(hooks.approve(tunnelId, 'daemon-1')).toBe(true);
+        expect(socket.written).toEqual(['early']);
+    });
+
+    it('tells the daemon to close the upstream it may still be opening', () => {
+        // The whole point of P2: dropping our own registry entry leaves the
+        // daemon connecting into a tunnel nothing will ever read or close.
+        const hooks = createTunnelCandidateHooks({
+            browserSocket: browserSocket() as never,
+            bound: true,
+            cancelled: () => false,
+        });
+        const tunnelId = hooks.begin('daemon-1');
+        const machineSocket = { id: 'daemon-1', emit: vi.fn(), timeout: () => ({ emitWithAck: async () => ({}) }) };
+
+        hooks.abandon(tunnelId, machineSocket);
+
+        expect(hasTunnel(tunnelId)).toBe(false);
+        expect(machineSocket.emit).toHaveBeenCalledWith('proxy-ws-close', { tunnelId });
+    });
+
+    it('marks a bound tunnel bound, so a sender-less relayed frame is refused', () => {
+        // The flag is what makes the same-daemon pin strict for bound
+        // tunnels; a hook that always registered them unbound would leave the
+        // pin bypassable by any older peer replica.
+        const socket = browserSocket();
+        const hooks = createTunnelCandidateHooks({
+            browserSocket: socket as never,
+            bound: true,
+            cancelled: () => false,
+        });
+        const tunnelId = hooks.begin('daemon-1');
+        hooks.approve(tunnelId, 'daemon-1');
+
+        applyRemoteData({ tunnelId, dataB64: Buffer.from('no-sender').toString('base64') } as never);
+
+        expect(socket.written).toEqual([]);
+    });
+
+    it('marks an unbound tunnel unbound, keeping mixed-version delivery working', () => {
+        const socket = browserSocket();
+        const hooks = createTunnelCandidateHooks({
+            browserSocket: socket as never,
+            bound: false,
+            cancelled: () => false,
+        });
+        const tunnelId = hooks.begin('daemon-1');
+        hooks.approve(tunnelId, 'daemon-1');
+
+        applyRemoteData({ tunnelId, dataB64: Buffer.from('legacy').toString('base64') } as never);
+
+        expect(socket.written).toEqual(['legacy']);
     });
 });

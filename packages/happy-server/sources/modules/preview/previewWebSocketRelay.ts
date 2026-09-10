@@ -34,7 +34,7 @@ import { Socket as IoSocket, type Server as IoServer } from "socket.io";
 import { eventRouter } from "@/app/events/eventRouter";
 import { findMachineSockets as findMachineSocketsCrossReplica } from "@/app/events/findMachineSockets";
 import {
-    addTunnel, setTunnelOwner, deleteTunnel, hasTunnel,
+    addTunnel, approveTunnel, deleteTunnel, hasTunnel,
     deliverDaemonData, deliverDaemonClose, dropTunnelsOwnedBy,
     applyRemoteData, applyRemoteClose,
     PREVIEW_WS_DATA, PREVIEW_WS_CLOSE, PREVIEW_WS_DAEMON_GONE,
@@ -133,10 +133,66 @@ interface PreviewWsMachineSocket {
     };
 }
 
+/**
+ * specs/runtime-isolation-hardening (H3, P1/P2) — the per-candidate tunnel
+ * lifecycle the open attempt owns.
+ *
+ * Each candidate daemon gets its *own* tunnel id, registered before the emit
+ * and torn down after: a shared id would let the daemon that lost the race
+ * write into the tunnel the winner is serving, and a tunnel registered
+ * without a pending gate would deliver bytes we have not approved yet.
+ */
+export interface TunnelCandidateHooks {
+    /** Register a pending tunnel for this candidate; returns its id. */
+    begin(daemonSocketId: string): string;
+    /** Open the gate. False when the tunnel is gone or the daemon mismatched. */
+    approve(tunnelId: string, daemonSocketId: string): boolean;
+    /**
+     * Drop this candidate's tunnel *and tell that daemon to close it*. The
+     * second half is what P2 was missing: an open we stopped waiting for can
+     * still succeed on the daemon afterwards, and a tunnel the server has
+     * forgotten has no expiry timer and no recheck behind it.
+     */
+    abandon(tunnelId: string, socket: PreviewWsMachineSocket): void;
+    /** True once the browser has gone away. */
+    cancelled(): boolean;
+}
+
+/**
+ * The real per-candidate hooks: register a pending tunnel, open its gate on
+ * approval, and on abandonment drop it *and* tell that daemon to close the
+ * upstream it may still be opening.
+ *
+ * Exported so the wiring itself is under test. A fake that satisfies the
+ * interface proves nothing about whether each candidate really gets its own
+ * id, or whether the close really reaches the daemon.
+ */
+export function createTunnelCandidateHooks(input: {
+    browserSocket: NetSocket;
+    bound: boolean;
+    cancelled: () => boolean;
+}): TunnelCandidateHooks {
+    return {
+        begin: (daemonSocketId) => {
+            const tunnelId = randomUUID();
+            addTunnel(tunnelId, input.browserSocket, daemonSocketId, input.bound);
+            return tunnelId;
+        },
+        approve: (tunnelId, daemonSocketId) => approveTunnel(tunnelId, daemonSocketId),
+        abandon: (tunnelId, machineSocket) => {
+            deleteTunnel(tunnelId);
+            // Straight to the daemon that owns this attempt — it may open the
+            // upstream after we stop waiting, and this is the only thing that
+            // will ever close it.
+            try { machineSocket.emit('proxy-ws-close', { tunnelId }); } catch { /* gone */ }
+        },
+        cancelled: input.cancelled,
+    };
+}
+
 export async function openPreviewWsTunnel<T extends PreviewWsMachineSocket>(
     machineSockets: T[],
     payload: {
-        tunnelId: string;
         port: number;
         dataB64: string;
         /**
@@ -146,13 +202,15 @@ export async function openPreviewWsTunnel<T extends PreviewWsMachineSocket>(
          */
         binding?: { projectId: string; leaseId: string; workspacePaths: string[] };
     },
+    hooks: TunnelCandidateHooks,
     /** Total budget for the whole attempt, not per candidate daemon. */
     timeoutMs = WS_OPEN_TIMEOUT_MS,
     requireBindingEnforced = false,
-): Promise<T> {
+): Promise<{ socket: T; tunnelId: string }> {
     const deadline = Date.now() + timeoutMs;
     let lastError: Error | null = null;
     for (const machineSocket of machineSockets) {
+        if (hooks.cancelled()) break;
         // Stale sockets left by reconnects mean the candidate list can be
         // several deep; each one must come out of the same budget or a
         // browser waits N × the timeout on an upgrade that will never open.
@@ -161,36 +219,48 @@ export async function openPreviewWsTunnel<T extends PreviewWsMachineSocket>(
             lastError = lastError ?? new PreviewWsOpenError('preview tunnel open timed out', 'TIMEOUT');
             break;
         }
+        const tunnelId = hooks.begin(machineSocket.id);
+        let ack: { ok?: boolean; code?: string; message?: string; bindingEnforced?: boolean } | undefined;
         try {
-            const ack = (await machineSocket
+            ack = (await machineSocket
                 .timeout(Math.min(timeoutMs, remaining))
-                .emitWithAck('proxy-ws-open', payload)) as {
-                    ok?: boolean;
-                    code?: string;
-                    message?: string;
-                    bindingEnforced?: boolean;
-                } | undefined;
-            if (ack?.ok === true && (!requireBindingEnforced || ack.bindingEnforced === true)) {
-                return machineSocket;
-            }
-            if (ack?.ok === true) {
-                // Opened, but by a daemon that never checked the binding. It
-                // is holding a live upstream connection for a tunnel nothing
-                // will ever reference again, so close it before moving on.
-                machineSocket.emit('proxy-ws-close', { tunnelId: payload.tunnelId });
-                lastError = new PreviewWsOpenError(
-                    `daemon ${machineSocket.id} opened the tunnel without enforcing the runtime binding`,
-                    LEASE_UNSUPPORTED_CODE,
-                );
-                continue;
-            }
+                .emitWithAck('proxy-ws-open', { tunnelId, ...payload })) as typeof ack;
+        } catch (error) {
+            // No ack is not "no tunnel": the daemon may still be connecting,
+            // and may succeed after we gave up.
+            hooks.abandon(tunnelId, machineSocket);
+            lastError = error instanceof Error ? error : new Error(String(error));
+            continue;
+        }
+
+        if (hooks.cancelled()) {
+            hooks.abandon(tunnelId, machineSocket);
+            lastError = lastError ?? new PreviewWsOpenError('browser closed before the tunnel opened', 'CANCELLED');
+            break;
+        }
+        if (ack?.ok !== true) {
+            hooks.abandon(tunnelId, machineSocket);
             lastError = new PreviewWsOpenError(
                 ack?.message ?? ack?.code ?? `daemon ${machineSocket.id} refused tunnel`,
                 ack?.code ?? null,
             );
-        } catch (error) {
-            lastError = error instanceof Error ? error : new Error(String(error));
+            continue;
         }
+        if (requireBindingEnforced && ack.bindingEnforced !== true) {
+            // Opened, but by a daemon that never checked the binding.
+            hooks.abandon(tunnelId, machineSocket);
+            lastError = new PreviewWsOpenError(
+                `daemon ${machineSocket.id} opened the tunnel without enforcing the runtime binding`,
+                LEASE_UNSUPPORTED_CODE,
+            );
+            continue;
+        }
+        if (!hooks.approve(tunnelId, machineSocket.id)) {
+            hooks.abandon(tunnelId, machineSocket);
+            lastError = new PreviewWsOpenError('tunnel was gone before it could be approved', 'CANCELLED');
+            continue;
+        }
+        return { socket: machineSocket, tunnelId };
     }
     throw lastError ?? new Error('No live daemon accepted the preview tunnel');
 }
@@ -360,7 +430,9 @@ export function previewWsMachineHandler(machineSocket: IoSocket): void {
     };
 
     machineSocket.on('proxy-ws-data', (payload: WsFramePayload) => {
-        deliverDaemonData(payload?.tunnelId, payload?.dataB64, broadcast);
+        // The sender travels with the frame: a tunnel belongs to exactly one
+        // candidate daemon, and bytes from any other are not its content.
+        deliverDaemonData(payload?.tunnelId, payload?.dataB64, broadcast, machineSocket.id);
     });
 
     machineSocket.on('proxy-ws-close', (payload: { tunnelId: string }) => {
@@ -593,33 +665,43 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
         head,
     );
 
-    const tunnelId = randomUUID();
     // Defense-in-depth: keep the raw socket buffered (it is already paused after
     // an upgrade with no 'data' listener) until the tunnel is open, so no client
     // bytes are lost if anything ever attaches a transient 'data' listener.
     socket.pause();
-    addTunnel(tunnelId, socket);
 
-    let chosenSocket: (typeof machineSockets)[number];
-    try {
-        chosenSocket = await openPreviewWsTunnel(
-            machineSockets,
-            {
-                tunnelId,
-                port,
-                dataB64: requestBytes.toString('base64'),
-                ...(wsBinding ? { binding: wsBinding } : {}),
-            },
-            undefined,
-            Boolean(wsBinding),
-        );
-    } catch (err) {
-        deleteTunnel(tunnelId);
+    // Watch for the browser leaving *before* the open, not after. An upgrade
+    // that is abandoned while a busy daemon is still queueing used to leave
+    // nothing watching, and the tunnel the daemon opened afterwards had no
+    // owner, no expiry timer and no recheck behind it.
+    let browserGone = false;
+    const markGone = () => { browserGone = true; };
+    socket.on('close', markGone);
+    socket.on('error', markGone);
+
+    const opened = await openPreviewWsTunnel(
+        machineSockets,
+        {
+            port,
+            dataB64: requestBytes.toString('base64'),
+            ...(wsBinding ? { binding: wsBinding } : {}),
+        },
+        createTunnelCandidateHooks({
+            browserSocket: socket,
+            bound: Boolean(wsBinding),
+            cancelled: () => browserGone,
+        }),
+        undefined,
+        Boolean(wsBinding),
+    ).catch((err: unknown) => {
         const code = err instanceof PreviewWsOpenError ? err.code : null;
         log({ module: 'preview', level: 'error' }, `proxy-ws-open failed for ${machineId}:${port}: ${(err as Error).message}`);
-        writeHttpError(socket, wsOpenFailureStatus(code), 'Bad Gateway');
-        return;
-    }
+        if (!browserGone) writeHttpError(socket, wsOpenFailureStatus(code), 'Bad Gateway');
+        return null;
+    });
+    if (!opened) return;
+
+    const { socket: chosenSocket, tunnelId } = opened;
 
     // Browser → daemon. Addressed by socket id so it lands on whichever replica
     // owns the daemon (Socket.IO auto-joins every socket to a room named after
@@ -630,11 +712,11 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
 
     // The browser may have closed while we were opening the tunnel; if so, tell
     // the daemon to drop the just-opened upstream and stop.
-    if (!hasTunnel(tunnelId)) {
+    if (browserGone || !hasTunnel(tunnelId)) {
+        deleteTunnel(tunnelId);
         toDaemon('proxy-ws-close', { tunnelId });
         return;
     }
-    setTunnelOwner(tunnelId, daemonSocketId);
 
     // Resume the paused socket after wiring the listener so any bytes the
     // client buffered replay here in order.
@@ -652,6 +734,11 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
     };
     socket.on('close', teardown);
     socket.on('error', teardown);
+    if (browserGone) {
+        // It left while we were wiring up.
+        teardown();
+        return;
+    }
 
     // Revocation for a connection that is already open. Access can be taken
     // away, and the runtime can be replaced, long after the upgrade — the
