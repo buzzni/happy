@@ -377,6 +377,25 @@ describe('preview mint route — runtime binding', () => {
         await app.close();
     });
 
+    it('answers a saturated runtime probe with a retryable 503, never a weaker token', async () => {
+        // EVIDENCE_BUSY is backpressure: the daemon's probe queue is full, so
+        // it did not look. That is neither an authorization answer nor proof
+        // that nothing is there — and handing back an unbound token because
+        // the machine is busy would make load the way to lose the binding.
+        stubAuthorizeCallback({ allowed: true, workspacePaths: ['/srv/proj-1'] });
+        setMachineSockets([daemonSocket({
+            lease: { type: 'error', code: 'EVIDENCE_BUSY', message: 'preview runtime probe queue is full' },
+        })]);
+        const app = await buildApp();
+
+        const res = await trustedMint(app, mintBody());
+
+        expect(res.statusCode).toBe(503);
+        expect(res.json().code).toBe('EVIDENCE_BUSY');
+        expect(res.json().token).toBeUndefined();
+        await app.close();
+    });
+
     it('refuses to mint for a port whose runtime belongs to another project', async () => {
         stubAuthorizeCallback({ allowed: true, workspacePaths: ['/srv/proj-1'] });
         setMachineSockets([daemonSocket({
@@ -650,6 +669,28 @@ describe('preview relay route — runtime binding', () => {
         await app.close();
     });
 
+    it('answers a saturated runtime probe with a retryable 503 and no re-mint page', async () => {
+        // Re-minting cannot help a busy machine — the mint takes the same
+        // probe — so a page that re-mints and reloads would just add load to
+        // the thing that is already saturated.
+        stubAuthorizeCallback({ allowed: true, workspacePaths: [] });
+        setMachineSockets([daemonSocket({
+            proxy: { type: 'error', code: 'EVIDENCE_BUSY', message: 'preview runtime probe queue is full' },
+        })]);
+        const app = await buildApp();
+
+        const res = await app.inject({
+            method: 'GET',
+            url: relayUrl(boundToken()),
+            headers: { accept: 'text/html,application/xhtml+xml', 'sec-fetch-dest': 'document' },
+        });
+
+        expect(res.statusCode).toBe(503);
+        expect(res.headers['content-type']).not.toContain('text/html');
+        expect(res.json().code).toBe('EVIDENCE_BUSY');
+        await app.close();
+    });
+
     it('answers a genuine ownership refusal with 403 and no re-mint page', async () => {
         stubAuthorizeCallback({ allowed: true, workspacePaths: [] });
         setMachineSockets([daemonSocket({
@@ -689,6 +730,24 @@ describe('describePreviewRelayFailure — binding refusals', () => {
     it('answers an ownership refusal with 403, which re-minting cannot fix', () => {
         for (const code of ['PROJECT_OWNERSHIP_MISMATCH', 'PORT_PROJECT_MISMATCH', 'WORKSPACE_UNVERIFIED']) {
             expect(describePreviewRelayFailure({ kind: 'daemon-error', code, message: '' }, ctx).status).toBe(403);
+        }
+    });
+
+    it('answers a saturated probe with 503, apart from both 403 and the 502 contract', () => {
+        // 502 would read as "the dev server is unreachable" to
+        // checkPortReachable, and 403 as "you may not have this". It is
+        // neither: come back in a moment.
+        expect(describePreviewRelayFailure(
+            { kind: 'daemon-error', code: 'EVIDENCE_BUSY', message: 'queue full' },
+            ctx,
+        ).status).toBe(503);
+    });
+
+    it('leaves an unprovable runtime on the 502 relay contract, distinct from a busy one', () => {
+        // At relay time "nothing is listening" is what checkPortReachable
+        // polls for; only the busy answer moves off that contract.
+        for (const code of ['NO_LISTENER', 'EVIDENCE_UNAVAILABLE']) {
+            expect(describePreviewRelayFailure({ kind: 'daemon-error', code, message: '' }, ctx).status).toBe(502);
         }
     });
 

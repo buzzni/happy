@@ -46,6 +46,7 @@ import {
     resolvePreviewBindingPolicy,
     decideRelayBinding,
     isStaleRuntimeBinding,
+    isRuntimeEvidenceBusy,
     LEASE_UNSUPPORTED_CODE,
 } from "@/modules/preview/previewRuntimeBinding";
 import type { PreviewTokenBinding } from "@/modules/preview/previewToken";
@@ -100,6 +101,19 @@ const BINDING_REFUSAL_CODES = new Set([
     'PORT_PROJECT_MISMATCH',
     'WORKSPACE_UNVERIFIED',
 ]);
+
+/**
+ * The upgrade never becomes a WebSocket, so this status is all the browser
+ * and the operator get. It must say the same thing the HTTP relay says about
+ * the same daemon answer: retryable backpressure, a re-mintable stale lease,
+ * a refusal, or an ordinary gateway failure.
+ */
+export function wsOpenFailureStatus(code: string | null): number {
+    if (isRuntimeEvidenceBusy(code)) return 503;
+    if (code && isStaleRuntimeBinding(code)) return 401;
+    if (code && BINDING_REFUSAL_CODES.has(code)) return 403;
+    return 502;
+}
 
 // Tunnel bookkeeping lives in previewWsTunnels.ts because the browser end is a
 // raw TCP socket pinned to this replica while the daemon end may be on another
@@ -603,14 +617,7 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
         deleteTunnel(tunnelId);
         const code = err instanceof PreviewWsOpenError ? err.code : null;
         log({ module: 'preview', level: 'error' }, `proxy-ws-open failed for ${machineId}:${port}: ${(err as Error).message}`);
-        // A daemon that refused over the binding is an authorization answer,
-        // and a stale lease is a re-mintable one — same split as the HTTP
-        // relay, so the browser's reload lands somewhere that can recover.
-        writeHttpError(
-            socket,
-            code && isStaleRuntimeBinding(code) ? 401 : code && BINDING_REFUSAL_CODES.has(code) ? 403 : 502,
-            'Bad Gateway',
-        );
+        writeHttpError(socket, wsOpenFailureStatus(code), 'Bad Gateway');
         return;
     }
 

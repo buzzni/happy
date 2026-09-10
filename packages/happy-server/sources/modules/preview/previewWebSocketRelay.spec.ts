@@ -11,6 +11,7 @@ import {
     PreviewWsOpenError,
     WS_BINDING_RECHECK_MS,
     WS_RECHECK_DEADLINE_MS,
+    wsOpenFailureStatus,
 } from '@/modules/preview/previewWebSocketRelay';
 void _describe;
 
@@ -449,5 +450,30 @@ describe('armTunnelRevocation', () => {
         expect(recheck).not.toHaveBeenCalled();
         expect(revoke).not.toHaveBeenCalled();
         expect(vi.getTimerCount()).toBe(0);
+    });
+});
+
+describe('wsOpenFailureStatus', () => {
+    // The upgrade never becomes a WebSocket, so this status is the only thing
+    // the browser and the operator get. It has to say the same thing the HTTP
+    // relay says about the same daemon answer.
+    it('answers a saturated runtime probe with a retryable 503', () => {
+        expect(wsOpenFailureStatus('EVIDENCE_BUSY')).toBe(503);
+    });
+
+    it('answers a stale lease with 401 so the page can re-mint', () => {
+        expect(wsOpenFailureStatus('LEASE_MISMATCH')).toBe(401);
+    });
+
+    it('answers an ownership refusal with 403', () => {
+        for (const code of ['PROJECT_OWNERSHIP_MISMATCH', 'PORT_PROJECT_MISMATCH', 'WORKSPACE_UNVERIFIED']) {
+            expect(wsOpenFailureStatus(code)).toBe(403);
+        }
+    });
+
+    it('leaves everything else at 502', () => {
+        expect(wsOpenFailureStatus('TIMEOUT')).toBe(502);
+        expect(wsOpenFailureStatus('NO_LISTENER')).toBe(502);
+        expect(wsOpenFailureStatus(null)).toBe(502);
     });
 });

@@ -130,6 +130,19 @@ export function interpretLeaseAck(raw: unknown): LeaseAck {
     return { type: 'error', code: LEASE_UNSUPPORTED_CODE, message: UNSUPPORTED_MESSAGE };
 }
 
+/**
+ * The daemon's probe queue is saturated, so it did not look. Backpressure —
+ * not an authorization answer, and not evidence that nothing is there. It is
+ * the one daemon refusal that says "ask again in a moment", so it answers 503
+ * everywhere rather than 403 (which re-minting could never clear) or 502
+ * (which reads as "the dev server is unreachable" to checkPortReachable).
+ */
+export const EVIDENCE_BUSY_CODE = 'EVIDENCE_BUSY';
+
+export function isRuntimeEvidenceBusy(code: string | null | undefined): boolean {
+    return code === EVIDENCE_BUSY_CODE;
+}
+
 /** Narrow union so route reply schemas can name every status this can emit. */
 export type LeaseFailureStatus = 400 | 403 | 404 | 409 | 502 | 503;
 
@@ -139,6 +152,18 @@ export interface LeaseFailureResponse {
 }
 
 export function describeLeaseFailure(ack: { type: 'error'; code: string; message: string }): LeaseFailureResponse {
+    // Retryable: the machine is busy, so nothing about this project's access
+    // or runtime was decided. Never a weaker token — load must not become the
+    // way to lose the binding.
+    if (isRuntimeEvidenceBusy(ack.code)) {
+        return {
+            status: 503,
+            body: {
+                error: ack.message || '머신이 바빠 런타임을 확인하지 못했습니다. 잠시 후 다시 시도하세요.',
+                code: EVIDENCE_BUSY_CODE,
+            },
+        };
+    }
     if (ack.code === LEASE_UNSUPPORTED_CODE) {
         return { status: 409, body: { error: UNSUPPORTED_MESSAGE, code: LEASE_UNSUPPORTED_CODE } };
     }

@@ -34,6 +34,7 @@ import {
     describeLeaseFailure,
     isBindingEnforcementEchoed,
     isStaleRuntimeBinding,
+    isRuntimeEvidenceBusy,
     LEASE_UNSUPPORTED_CODE,
     type LeaseAck,
 } from "@/modules/preview/previewRuntimeBinding";
@@ -399,11 +400,15 @@ export function describePreviewRelayFailure(
                 // A stale lease (the runtime restarted) is 401 so the caller
                 // re-mints; an ownership failure is 403, because re-minting
                 // would only produce the same refusal.
-                : isStaleRuntimeBinding(outcome.code) ? 401
-                    : outcome.code === 'PROJECT_OWNERSHIP_MISMATCH'
-                        || outcome.code === 'PORT_PROJECT_MISMATCH'
-                        || outcome.code === 'WORKSPACE_UNVERIFIED' ? 403
-                        : 502;
+                // Backpressure from the daemon's probe queue. Retryable, so
+                // it is neither the 403 of an authorization answer nor the
+                // 502 that means the dev server could not be reached.
+                : isRuntimeEvidenceBusy(outcome.code) ? 503
+                    : isStaleRuntimeBinding(outcome.code) ? 401
+                        : outcome.code === 'PROJECT_OWNERSHIP_MISMATCH'
+                            || outcome.code === 'PORT_PROJECT_MISMATCH'
+                            || outcome.code === 'WORKSPACE_UNVERIFIED' ? 403
+                            : 502;
     const reason = outcome.kind === 'machine-offline'
         ? 'machine-offline'
         : outcome.kind === 'lookup-degraded'
