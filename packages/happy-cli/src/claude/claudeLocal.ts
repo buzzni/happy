@@ -15,6 +15,7 @@ import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPr
 import type { SandboxConfig } from "@/persistence";
 import { initializeSandbox, wrapCommand } from "@/sandbox/manager";
 import { filterCredentialsFromEnv } from "@/sandbox/config";
+import { MandatorySandboxError, resolveSandboxInitFailureAction, type SandboxPolicyMode } from "@/sandbox/sandboxPolicy";
 
 /**
  * Error thrown when the Claude process exits with a non-zero exit code.
@@ -53,6 +54,8 @@ export async function claudeLocal(opts: {
     /** Path to temporary settings file with SessionStart hook (optional - for session tracking) */
     hookSettingsPath?: string,
     sandboxConfig?: SandboxConfig,
+    /** 생략하면 개인 머신(owner-choice)으로 본다 — sandbox/sandboxPolicy.ts */
+    sandboxPolicyMode?: SandboxPolicyMode,
 }) {
 
     // Ensure project directory exists
@@ -297,8 +300,16 @@ export async function claudeLocal(opts: {
                 let spawnArgs: string[] = [claudeCliPath, ...args];
                 let spawnWithShell = false;
 
+                const initFailureAction = resolveSandboxInitFailureAction(
+                    opts.sandboxPolicyMode ?? 'owner-choice',
+                );
+
                 if (opts.sandboxConfig?.enabled) {
                     if (process.platform === 'win32') {
+                        if (initFailureAction === 'abort') {
+                            reject(new MandatorySandboxError('init-failed', 'sandbox is not supported on Windows'));
+                            return;
+                        }
                         logger.warn('[ClaudeLocal] Sandbox is not supported on Windows; continuing without sandbox.');
                     } else {
                         try {
@@ -320,8 +331,25 @@ export async function claudeLocal(opts: {
                                 `[ClaudeLocal] Sandbox enabled: workspace=${opts.sandboxConfig.workspaceRoot ?? opts.path}, network=${opts.sandboxConfig.networkMode}`,
                             );
                         } catch (error) {
-                            logger.warn('[ClaudeLocal] Failed to initialize sandbox; continuing without sandbox.', error);
+                            // 초기화가 성공한 뒤 wrapCommand 가 실패했을 수도 있다.
+                            // 그때 cleanup 을 버리면 SandboxManager 가 초기화된
+                            // 상태로 남으므로, 폴백/중단 어느 쪽이든 먼저 정리한다.
+                            const pendingCleanup = cleanupSandbox;
                             cleanupSandbox = null;
+                            if (pendingCleanup) {
+                                await pendingCleanup().catch((cleanupError) => {
+                                    logger.debug(`[ClaudeLocal] Sandbox cleanup after init failure failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+                                });
+                            }
+                            if (initFailureAction === 'abort') {
+                                // 공유 머신에서 비격리 child 를 띄우지 않는다.
+                                reject(new MandatorySandboxError(
+                                    'init-failed',
+                                    error instanceof Error ? error.message : String(error),
+                                ));
+                                return;
+                            }
+                            logger.warn('[ClaudeLocal] Failed to initialize sandbox; continuing without sandbox.', error);
                             spawnCommand = null;
                             spawnWithShell = false;
                             spawnArgs = [claudeCliPath, ...args];

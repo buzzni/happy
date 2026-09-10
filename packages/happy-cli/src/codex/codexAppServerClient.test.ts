@@ -752,6 +752,20 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    // 위 완화는 개인 머신 이야기다. mandatory 머신에서 폴백하면 네이티브 정책이
+    // workspace-write/danger-full-access 가 되어 호스트 전체가 열린다 — 턴을
+    // 기다리지 않고 connect 에서 멈춘다.
+    it('refuses to connect on a mandatory machine when sandbox init fails', async () => {
+        mockInitializeSandbox.mockRejectedValue(new Error('bwrap unavailable'));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(sandboxConfig, undefined, undefined, 'mandatory');
+
+        await expect(client.connect()).rejects.toThrow(/init-failed/);
+
+        expect(mockSpawn).not.toHaveBeenCalled();
+        await client.disconnect();
+    });
+
     it('leaves sandboxInitFailed false when the sandbox initialised cleanly', async () => {
         const { CodexAppServerClient } = await import('./codexAppServerClient');
         const client = new CodexAppServerClient(sandboxConfig);

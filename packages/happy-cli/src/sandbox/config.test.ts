@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { buildSandboxRuntimeConfig, filterCredentialsFromEnv } from './config';
 import type { SandboxConfig } from '@/persistence';
+import { configuration } from '@/configuration';
 import { macGetMandatoryDenyPatterns, wrapCommandWithSandboxMacOS } from '@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js';
 
 const temporaryRoot = process.platform === "darwin" ? "/private/tmp" : "/tmp";
@@ -287,5 +288,61 @@ describe('filterCredentialsFromEnv', () => {
             PATH: '/usr/bin',
             APLUS_AGENT_TASK_ID: 'task-1',
         });
+    });
+});
+
+// 공유 머신에서 세션 config 는 사용자·프로젝트가 고칠 수 있는 값이다. enabled 만
+// 확인하면 denyReadPaths:[] / customWritePaths:['/'] 로 격리를 그대로 벗을 수 있다.
+// mandatory 머신에서는 신뢰 floor 가 세션 config 위에 강제된다.
+describe('buildSandboxRuntimeConfig on a mandatory machine', () => {
+    it('denies read and write on the Happy home even when the session config clears them', () => {
+        const built = buildSandboxRuntimeConfig(
+            createConfig({ denyReadPaths: [], denyWritePaths: [] }),
+            sessionPath,
+            'mandatory',
+        );
+
+        expect(built.filesystem.denyRead).toContain(configuration.machineHappyHomeDir);
+        expect(built.filesystem.denyWrite).toContain(configuration.machineHappyHomeDir);
+        // 세션이 옮겨 쓰는 HAPPY_HOME_DIR 을 가리면 자기 자격증명까지 가려진다.
+        expect(built.filesystem.denyRead).not.toContain(configuration.happyHomeDir);
+    });
+
+    it('keeps the session own deny paths alongside the floor', () => {
+        const built = buildSandboxRuntimeConfig(
+            createConfig({ denyReadPaths: ['~/.ssh'] }),
+            sessionPath,
+            'mandatory',
+        );
+
+        expect(built.filesystem.denyRead).toContain(resolveLikeRuntime('~/.ssh'));
+        expect(built.filesystem.denyRead).toContain(configuration.machineHappyHomeDir);
+    });
+
+    // allowWrite 가 '/' 나 홈 루트면 floor 밖의 다른 사용자 워크스페이스와
+    // PATH 상의 실행 파일까지 쓰기 가능해진다 — 클램프가 아니라 거절이다.
+    it('refuses a filesystem-root write scope', () => {
+        expect(() => buildSandboxRuntimeConfig(
+            createConfig({ sessionIsolation: 'custom', customWritePaths: ['/'] }),
+            sessionPath,
+            'mandatory',
+        )).toThrow(/unsafe-write-scope/);
+    });
+
+    it('refuses a home-root write scope', () => {
+        expect(() => buildSandboxRuntimeConfig(
+            createConfig({ sessionIsolation: 'custom', customWritePaths: ['~'] }),
+            sessionPath,
+            'mandatory',
+        )).toThrow(/unsafe-write-scope/);
+    });
+
+    it('leaves an owner-choice machine exactly as before', () => {
+        const config = createConfig({ denyReadPaths: [], denyWritePaths: [] });
+
+        expect(buildSandboxRuntimeConfig(config, sessionPath))
+            .toEqual(buildSandboxRuntimeConfig(config, sessionPath, 'owner-choice'));
+        expect(buildSandboxRuntimeConfig(config, sessionPath).filesystem.denyRead)
+            .toEqual([]);
     });
 });

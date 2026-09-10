@@ -398,6 +398,35 @@ describe('claudeLocal --continue handling', () => {
         expect(mockSandboxCleanup).toHaveBeenCalledTimes(1);
     });
 
+    // 공유 머신(mandatory)에서는 위 폴백이 곧 격리 해제다. 개인 머신의 위 동작은
+    // 그대로 두고, 정책이 필수일 때만 child 를 띄우지 않고 사유와 함께 실패한다.
+    it('refuses to spawn an unsandboxed child when the machine policy is mandatory', async () => {
+        mockInitializeSandbox.mockRejectedValue(new Error('bwrap unavailable'));
+
+        await expect(claudeLocal({
+            abort: new AbortController().signal,
+            sessionId: null,
+            path: '/tmp',
+            onSessionFound,
+            claudeArgs: [],
+            sandboxPolicyMode: 'mandatory',
+            sandboxConfig: {
+                enabled: true,
+                sessionIsolation: 'workspace',
+                customWritePaths: [],
+                denyReadPaths: ['~/.ssh'],
+                extraWritePaths: ['/tmp'],
+                denyWritePaths: ['.env'],
+                networkMode: 'allowed',
+                allowedDomains: [],
+                deniedDomains: [],
+                allowLocalBinding: true,
+            },
+        })).rejects.toThrow(/init-failed/);
+
+        expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
     it('should continue without sandbox when initialization fails', async () => {
         mockInitializeSandbox.mockRejectedValue(new Error('sandbox failed'));
 

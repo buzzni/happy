@@ -35,6 +35,7 @@ class Configuration {
   public readonly serverAutomationsCacheFile: string
   public readonly serverAutomationsRuntimeFile: string
   public readonly currentCliVersion: string
+  public readonly machineHappyHomeDir: string
 
   public readonly isExperimentalEnabled: boolean
   public readonly disableCaffeinate: boolean
@@ -52,6 +53,11 @@ class Configuration {
     } else {
       this.happyHomeDir = join(homedir(), '.happy')
     }
+
+    // 신뢰 floor 의 기준. happyHomeDir 은 HAPPY_HOME_DIR 로 옮겨지고 그 값은
+    // spawn 페이로드에서 올 수 있으므로 정책·floor 의 기준으로 쓸 수 없다.
+    // 여기는 머신 고정 경로다 (세션이 옮긴 staged home 이 아니라 데몬의 것).
+    this.machineHappyHomeDir = join(homedir(), '.happy')
 
     this.logsDir = join(this.happyHomeDir, 'logs')
     this.settingsFile = join(this.happyHomeDir, 'settings.json')

@@ -59,6 +59,7 @@ import { CheckpointWriterProcessTree } from '@/checkpoint/checkpointWriterProces
 import { CODEX_INACTIVITY_ABORT_REASON, type CodexInactivityAbortFields } from './codexAbortNotice';
 import { prepareCodexMultiAuthProxy, type PreparedCodexMultiAuthProxy } from './codexMultiAuthProxy';
 import { initializeSandbox, wrapForMcpTransport } from '@/sandbox/manager';
+import { MandatorySandboxError, resolveSandboxInitFailureAction, type SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import packageJson from '../../package.json';
 import { resolveCodexSandboxPolicy } from './executionPolicy';
 
@@ -233,6 +234,7 @@ export class CodexAppServerClient {
     private processEpoch = 0;
     private connected = false;
     private sandboxConfig?: SandboxConfig;
+    private readonly sandboxPolicyMode: SandboxPolicyMode;
     private readonly beforeTurn?: () => Promise<CheckpointTurnPreparation | void>;
     private readonly completeTurn?: CheckpointSessionComposition['completeTurn'];
     private readonly protectedWriterTree: CheckpointWriterProcessTree | null;
@@ -310,8 +312,11 @@ export class CodexAppServerClient {
         sandboxConfig?: SandboxConfig,
         beforeTurn?: () => Promise<CheckpointTurnPreparation | void>,
         completeTurn?: CheckpointSessionComposition['completeTurn'],
+        /** 생략하면 개인 머신(owner-choice)으로 본다 — sandbox/sandboxPolicy.ts */
+        sandboxPolicyMode: SandboxPolicyMode = 'owner-choice',
     ) {
         this.sandboxConfig = sandboxConfig;
+        this.sandboxPolicyMode = sandboxPolicyMode;
         this.beforeTurn = beforeTurn;
         this.completeTurn = completeTurn;
         this.protectedWriterTree = completeTurn ? new CheckpointWriterProcessTree() : null;
@@ -801,6 +806,11 @@ export class CodexAppServerClient {
                 this.sandboxCleanup = null;
                 this.sandboxInitFailed = true;
                 this.sandboxInitFailureReason = error instanceof Error ? error.message : String(error);
+                // 공유 머신에서는 턴을 기다리지 않는다 — 폴백한 네이티브 정책이
+                // workspace-write/danger-full-access 면 호스트 전체가 열린다.
+                if (resolveSandboxInitFailureAction(this.sandboxPolicyMode) === 'abort') {
+                    throw new MandatorySandboxError('init-failed', this.sandboxInitFailureReason);
+                }
                 if (this.beforeTurn) {
                     throw new Error(
                         'checkpoint protection sandbox initialization failed; refusing to start Codex. '

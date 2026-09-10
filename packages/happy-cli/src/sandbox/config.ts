@@ -3,6 +3,13 @@ import { realpathSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import type { SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime';
 import type { SandboxConfig } from '@/persistence';
+import { configuration } from '@/configuration';
+import {
+    MandatorySandboxError,
+    isUnsafeMandatoryWriteScope,
+    sandboxTrustFloorPaths,
+    type SandboxPolicyMode,
+} from './sandboxPolicy';
 
 function expandPath(pathValue: string, sessionPath: string): string {
     const expandedHome = pathValue.replace(/^~(?=\/|$)/, homedir());
@@ -79,6 +86,8 @@ export function filterCredentialsFromEnv(env: NodeJS.ProcessEnv): Record<string,
 export function buildSandboxRuntimeConfig(
     sandboxConfig: SandboxConfig,
     sessionPath: string,
+    /** 생략하면 개인 머신(owner-choice)으로 본다 — sandboxPolicy.ts */
+    policyMode: SandboxPolicyMode = 'owner-choice',
 ): SandboxRuntimeConfig {
     const extraWritePaths = resolvePaths(sandboxConfig.extraWritePaths, sessionPath);
     const sharedAgentStatePaths = getSharedAgentStatePaths(sessionPath);
@@ -132,15 +141,24 @@ export function buildSandboxRuntimeConfig(
         ? true
         : undefined;
 
+    const mandatory = policyMode === 'mandatory';
+    if (mandatory && isUnsafeMandatoryWriteScope(allowWrite, homedir())) {
+        throw new MandatorySandboxError(
+            'unsafe-write-scope',
+            `쓰기 범위가 파일시스템/홈 루트입니다: ${allowWrite.join(', ')}`,
+        );
+    }
+    const floor = mandatory ? sandboxTrustFloorPaths(configuration.machineHappyHomeDir) : [];
+
     return {
         allowPty: true,
         enableWeakerNetworkIsolation,
         network,
         filesystem: {
             allowGitConfig: sandboxConfig.allowGitConfig === true && !sandboxConfig.checkpointProtection,
-            denyRead: resolvePaths(sandboxConfig.denyReadPaths, sessionPath),
+            denyRead: uniquePaths([...resolvePaths(sandboxConfig.denyReadPaths, sessionPath), ...floor]),
             allowWrite,
-            denyWrite: resolvePaths(sandboxConfig.denyWritePaths, sessionPath),
+            denyWrite: uniquePaths([...resolvePaths(sandboxConfig.denyWritePaths, sessionPath), ...floor]),
         },
     };
 }

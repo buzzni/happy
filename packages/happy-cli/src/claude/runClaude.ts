@@ -6,6 +6,7 @@ import { loop } from '@/claude/loop';
 import { AgentGoalStatus, AgentState } from '@/api/types';
 import { Credentials, readSettings } from '@/persistence';
 import { resolveSessionSandboxConfig } from '@/sandbox/resolveSessionSandboxConfig';
+import { resolveSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { EnhancedMode, PermissionMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
@@ -127,10 +128,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Get machine ID from settings (should already be set up)
     const settings = await readSettings();
     let machineId = settings?.machineId
+    // 머신 정책이 격리를 필수로 선언하면 아래 판정은 비격리로 물러나지 않고 던진다.
+    const sandboxPolicyMode = resolveSandboxPolicyMode(settings);
     const sandboxConfig = resolveSessionSandboxConfig({
         noSandbox: Boolean(options.noSandbox),
         env: process.env,
         settings,
+        policyMode: sandboxPolicyMode,
     });
     const sandboxEnabled = Boolean(sandboxConfig?.enabled);
     const requestedPermissionMode = resolveInitialClaudePermissionMode(
@@ -279,6 +283,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 mcpServers: {},
                 allowedTools: [],
                 sandboxConfig,
+                sandboxPolicyMode,
             });
         } finally {
             reconnection.cancel();
