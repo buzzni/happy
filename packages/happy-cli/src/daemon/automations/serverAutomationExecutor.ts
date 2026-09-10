@@ -233,15 +233,18 @@ export const MAX_GITHUB_EVENTS_PER_TICK = 3
 export const MAX_GITHUB_WORKER_SESSIONS = 6
 const DIRTY_WORKTREE_RETRY_MS = 15 * 60_000
 /**
- * dirty 보류가 이만큼 이어지면 결과를 말한다(15분 간격이므로 4회 = 1시간).
+ * dirty 보류가 이만큼 이어지면 알린다(15분 간격이므로 4회 = 1시간).
  *
- * 2026-09-05 프로덕션 — 리뷰 워커가 남긴 결과 파일 한 개로 정리가 거부됐고, 그
- * 자동화가 worktree 게이트에 걸려 그 저장소의 리뷰가 통째로 멈췄다. 로그는 15분마다
- * 같은 debug 한 줄이라 큐가 멈춘 사실은 어디에도 드러나지 않았고, 사용자가 "왜 아직
- * pending 이냐" 고 물어서야 발견됐다(aplus#3447, 2시간 이상). 보류 자체는 의도된
- * 동작이지만 그 대가는 말해야 한다.
+ * 보류 자체는 "사람이 작업물을 회수할 때까지 기다린다" 는 의도된 동작이지만, 그동안
+ * worktree 는 지워지지 않고 디스크를 차지한다(2026-09-10 에 14개·16GB). 15분마다
+ * 같은 debug 한 줄만 반복되면 아무도 알아차리지 못한다.
+ *
+ * 주의 — dirty 는 큐를 막지 않는다. 큐를 막는 것은 worktree 에 *프로세스가 붙어 있는*
+ * 경우다(trackLivePendingGithubWorktrees 의 isDirectoryInUse). 처음엔 이 경고를
+ * "queue is blocked" 라고 썼는데 틀린 말이었다 — 09-05 사고에서 큐를 막은 것은 좀비
+ * 프로세스였고 dirty 는 누적 원인이었을 뿐이다.
  */
-export const DIRTY_WORKTREE_BLOCKED_AFTER_ATTEMPTS = 4
+export const DIRTY_WORKTREE_WARN_AFTER_ATTEMPTS = 4
 const WORKTREE_CLEANUP_RETRY_MS = 60_000
 // 리뷰 worktree 는 대상 head 로만 체크아웃된 일회용 디렉토리다. 'strict' 는 그
 // 세션 경로만 쓰기 가능하게 하므로, 워커가 여기에 의존성을 설치해 대상 SHA 의
@@ -978,9 +981,9 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
     // 않는다. 그 밖의 실패는 예산 안에서만 재시도한다 — 상한이 없으면 2026-08-30 처럼
     // 매분 영원히 실패하며 디스크만 찬다.
     const attempts = (worktree.cleanupAttempts ?? 0) + 1
-    if (discarded.dirty && attempts === DIRTY_WORKTREE_BLOCKED_AFTER_ATTEMPTS) {
+    if (discarded.dirty && attempts === DIRTY_WORKTREE_WARN_AFTER_ATTEMPTS) {
       input.logDebug?.(
-        `[server-automation] ${worktree.automationId} GitHub queue is blocked:`
+        `[server-automation] ${worktree.automationId} dirty GitHub worktree is being kept and its disk is not reclaimed:`
         + ` ${worktree.worktreePath} has been dirty for ${attempts} cleanup attempts`
         + ` — ${discarded.error}`,
       )
