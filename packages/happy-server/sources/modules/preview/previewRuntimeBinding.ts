@@ -4,12 +4,14 @@
  *
  * Three rules this module exists to keep honest:
  *
- * 1. **The requirement is a server rollout policy, never a client flag.**
- *    Both mint endpoints read the same policy, so turning binding on for the
- *    trusted (studio) path cannot be sidestepped by calling the plain
- *    `/v1/preview-token` with a company happy token — on a shared company
- *    machine every member holds one, and that path only ever checked
- *    `machine.accountId`.
+ * 1. **Only the trusted studio path can bind.** A happy bearer proves which
+ *    *account* owns the machine, not who is asking: on a company-owned
+ *    machine every member holds one, and `/v1/preview-token` only ever
+ *    checked `machine.accountId`. A `studioUserId` arriving on that path is
+ *    a caller assertion, so binding to it would let any member mint a token
+ *    in anyone else's name. The bearer path therefore mints unbound or not
+ *    at all, and the requirement is a server rollout policy, never a client
+ *    flag.
  * 2. **An old daemon must fail loudly, not quietly.** It has no handler for
  *    the lease event, so its "answer" is silence or an unrecognised shape.
  *    That is reported as `RUNTIME_BINDING_UNSUPPORTED` with update guidance —
@@ -46,10 +48,35 @@ export function resolvePreviewBindingPolicy(env: Record<string, string | undefin
 
 export type MintBindingDecision = { kind: 'bind-required' } | { kind: 'bind-optional' };
 
+/** Trusted (studio) mint: may the caller still ask for an unbound token? */
 export function decideMintBinding(policy: PreviewBindingPolicy, machineId: string): MintBindingDecision {
     if (policy.mode !== 'required') return { kind: 'bind-optional' };
     if (policy.legacyMachineIds.has(machineId)) return { kind: 'bind-optional' };
     return { kind: 'bind-required' };
+}
+
+export const BEARER_BINDING_UNSUPPORTED_CODE = 'BEARER_BINDING_UNSUPPORTED';
+
+export type BearerMintDecision =
+    | { kind: 'unbound' }
+    | { kind: 'reject'; status: 403; code: string; message: string };
+
+/**
+ * Bearer mint: the token is always unbound, so the only question is whether
+ * an unbound token is still acceptable on this machine. Under the required
+ * policy it is not, and this path cannot produce a bound one — the honest
+ * answer is to send the caller to the trusted studio path rather than to
+ * quietly hand out the weaker token the policy just outlawed.
+ */
+export function decideBearerMint(policy: PreviewBindingPolicy, machineId: string): BearerMintDecision {
+    if (policy.mode !== 'required') return { kind: 'unbound' };
+    if (policy.legacyMachineIds.has(machineId)) return { kind: 'unbound' };
+    return {
+        kind: 'reject',
+        status: 403,
+        code: BEARER_BINDING_UNSUPPORTED_CODE,
+        message: '이 머신의 프리뷰 토큰은 aplus-dev-studio 를 통해서만 발급할 수 있습니다.',
+    };
 }
 
 export type RelayBindingDecision =

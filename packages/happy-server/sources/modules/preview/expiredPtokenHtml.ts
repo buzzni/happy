@@ -6,9 +6,12 @@
  * helper) and redirecting.
  *
  * Pure renderer. The inline JS:
- *   1. Bail (and show manual recovery message) if sessionStorage already
- *      marks a mint attempt for this tab — prevents infinite loop when mint
- *      keeps succeeding but the relay keeps 401-ing.
+ *   1. Spend one attempt from a small burst budget kept in sessionStorage,
+ *      and bail with a manual recovery message when it is exhausted —
+ *      prevents an infinite loop when mint keeps succeeding but the relay
+ *      keeps 401-ing. The budget ages out (see MINT_WINDOW_MS) so an ordinary
+ *      second or third dev-server restart later in the same tab still
+ *      recovers by itself; a once-per-tab guard would leave that tab dead.
  *   2. Read aplus-token + aplus-active-company from localStorage (web-ui SPA
  *      conventions, see packages/web-ui/src/lib/store/index.ts:480,491).
  *   3. POST /api/preview-mint-remote (relative URL — routes through whatever
@@ -33,9 +36,34 @@ export interface ExpiredPtokenHtmlParams {
     reason: 'missing' | 'expired-or-invalid';
 }
 
-export function shouldServeExpiredHtml(acceptHeader: string | undefined): boolean {
-    if (!acceptHeader) return false;
-    return acceptHeader.toLowerCase().includes('text/html');
+/**
+ * The page re-mints and then *reloads the URL it was served for*, so it may
+ * only be given to something that can act on it and for which a reload is
+ * harmless: a GET navigation.
+ *
+ * - A subresource (script/style/image/XHR) would either render as garbage or,
+ *   worse, run the re-mint inside the previewed app's own origin. `Accept`
+ *   alone does not separate those — an XHR can ask for text/html — so
+ *   `Sec-Fetch-Dest` decides whenever the browser sends it.
+ * - A mutation must never get it: reloading after a POST re-issues the POST.
+ */
+export interface ExpiredHtmlRequest {
+    method: string;
+    accept?: string;
+    secFetchDest?: string;
+    secFetchMode?: string;
+}
+
+const NAVIGATION_DESTINATIONS = new Set(['document', 'iframe', 'frame', 'nested-document']);
+
+export function shouldServeExpiredHtml(request: ExpiredHtmlRequest): boolean {
+    if (request.method.toUpperCase() !== 'GET') return false;
+    const dest = request.secFetchDest?.trim().toLowerCase();
+    if (dest) return NAVIGATION_DESTINATIONS.has(dest);
+    // No Sec-Fetch-Dest (older browser, non-browser client): fall back to the
+    // Accept header, which is what this gate used before.
+    if (request.secFetchMode && request.secFetchMode.trim().toLowerCase() !== 'navigate') return false;
+    return (request.accept ?? '').toLowerCase().includes('text/html');
 }
 
 /**
@@ -70,12 +98,29 @@ export function renderExpiredPtokenHtml(params: ExpiredPtokenHtmlParams): string
     if (statusEl) statusEl.textContent = text;
   }
   var MINT_KEY = 'aplus-preview-mint-attempted-' + ${machineIdLiteral} + '-' + ${portLiteral};
+  // Burst budget, not a one-shot latch: a dev server that restarts twice in a
+  // session is ordinary, and each restart must be able to recover on its own.
+  // What must not happen is a tight loop where mint keeps succeeding and the
+  // relay keeps refusing, so the budget is small and only resets once the
+  // window has passed without another attempt.
+  var MINT_MAX_ATTEMPTS = 3;
+  var MINT_WINDOW_MS = 60000;
+  var now = Date.now();
+  var spent = 0;
   try {
-    if (sessionStorage.getItem(MINT_KEY) === '1') {
+    var raw = sessionStorage.getItem(MINT_KEY);
+    if (raw) {
+      var record = JSON.parse(raw);
+      if (record && typeof record.n === 'number' && typeof record.t === 'number'
+        && now - record.t < MINT_WINDOW_MS) {
+        spent = record.n;
+      }
+    }
+    if (spent >= MINT_MAX_ATTEMPTS) {
       setStatus('자동 재발급이 반복적으로 실패했습니다. aplus-dev-studio 웹에서 프로젝트를 다시 열어 주세요.');
       return;
     }
-    sessionStorage.setItem(MINT_KEY, '1');
+    sessionStorage.setItem(MINT_KEY, JSON.stringify({ n: spent + 1, t: now }));
   } catch (e) {
     // sessionStorage unavailable (e.g., privacy mode) — continue without loop guard.
   }

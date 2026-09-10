@@ -74,6 +74,16 @@ const WS_OPEN_TIMEOUT_MS = 15_000;
 export const WS_BINDING_RECHECK_MS = 30_000;
 
 /**
+ * Total budget for one recheck — the studio callback and the daemon lease
+ * together. Without it the tunnel's termination guarantee would read "one
+ * interval plus however long a stalled callback takes", which is not a
+ * guarantee. The contract is: an open tunnel whose access or runtime changed
+ * is torn down within `WS_BINDING_RECHECK_MS + WS_RECHECK_DEADLINE_MS` of the
+ * change, under normal timer scheduling. Data keeps flowing during a check.
+ */
+export const WS_RECHECK_DEADLINE_MS = 5_000;
+
+/**
  * Carries the daemon's refusal *code* out of the open attempt. The message is
  * free text meant for a human; only the code decides the status.
  */
@@ -102,6 +112,8 @@ interface WsFramePayload {
 
 interface PreviewWsMachineSocket {
     id: string;
+    /** Fire-and-forget channel — used to close a tunnel we are abandoning. */
+    emit(event: string, payload: unknown): unknown;
     timeout(ms: number): {
         emitWithAck(event: string, payload: unknown): Promise<unknown>;
     };
@@ -120,14 +132,24 @@ export async function openPreviewWsTunnel<T extends PreviewWsMachineSocket>(
          */
         binding?: { projectId: string; leaseId: string; workspacePaths: string[] };
     },
+    /** Total budget for the whole attempt, not per candidate daemon. */
     timeoutMs = WS_OPEN_TIMEOUT_MS,
     requireBindingEnforced = false,
 ): Promise<T> {
+    const deadline = Date.now() + timeoutMs;
     let lastError: Error | null = null;
     for (const machineSocket of machineSockets) {
+        // Stale sockets left by reconnects mean the candidate list can be
+        // several deep; each one must come out of the same budget or a
+        // browser waits N × the timeout on an upgrade that will never open.
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+            lastError = lastError ?? new PreviewWsOpenError('preview tunnel open timed out', 'TIMEOUT');
+            break;
+        }
         try {
             const ack = (await machineSocket
-                .timeout(timeoutMs)
+                .timeout(Math.min(timeoutMs, remaining))
                 .emitWithAck('proxy-ws-open', payload)) as {
                     ok?: boolean;
                     code?: string;
@@ -138,7 +160,10 @@ export async function openPreviewWsTunnel<T extends PreviewWsMachineSocket>(
                 return machineSocket;
             }
             if (ack?.ok === true) {
-                // Opened, but by a daemon that never checked the binding.
+                // Opened, but by a daemon that never checked the binding. It
+                // is holding a live upstream connection for a tunnel nothing
+                // will ever reference again, so close it before moving on.
+                machineSocket.emit('proxy-ws-close', { tunnelId: payload.tunnelId });
                 lastError = new PreviewWsOpenError(
                     `daemon ${machineSocket.id} opened the tunnel without enforcing the runtime binding`,
                     LEASE_UNSUPPORTED_CODE,
@@ -168,27 +193,139 @@ export async function recheckOpenTunnelBinding(input: {
     bind: PreviewTokenBinding;
     machineId: string;
     port: number;
-    policyMode: 'off' | 'required';
     authorizer: PreviewAuthorizer | null;
     sockets: PreviewWsMachineSocket[];
+    deadlineMs?: number;
     requestLease?: typeof requestRuntimeLease;
 }): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const deadlineMs = input.deadlineMs ?? WS_RECHECK_DEADLINE_MS;
+    let expire: NodeJS.Timeout | undefined;
+    const expired = new Promise<{ ok: false; reason: string }>((resolve) => {
+        expire = setTimeout(() => resolve({ ok: false, reason: 'recheck-deadline' }), deadlineMs);
+    });
+    try {
+        return await Promise.race([runRecheck(input, Date.now() + deadlineMs), expired]);
+    } finally {
+        clearTimeout(expire);
+    }
+}
+
+async function runRecheck(
+    input: {
+        bind: PreviewTokenBinding;
+        machineId: string;
+        port: number;
+        authorizer: PreviewAuthorizer | null;
+        sockets: PreviewWsMachineSocket[];
+        requestLease?: typeof requestRuntimeLease;
+    },
+    deadline: number,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
     const access = await authorizeRelayBinding({
         access: { projectId: input.bind.projectId, studioUserId: input.bind.studioUserId },
         machineId: input.machineId,
         port: input.port,
         authorizer: input.authorizer,
-        policyMode: input.policyMode,
     });
     if (access.kind === 'reject') return { ok: false, reason: access.code };
 
+    // Whatever the ACL check already spent comes out of the same budget.
     const lease = await (input.requestLease ?? requestRuntimeLease)(
         input.sockets,
         { projectId: input.bind.projectId, port: input.port, workspacePaths: access.workspacePaths },
+        Math.max(1, deadline - Date.now()),
     );
     if (lease.type === 'error') return { ok: false, reason: lease.code };
     if (lease.leaseId !== input.bind.leaseId) return { ok: false, reason: 'LEASE_MISMATCH' };
     return { ok: true };
+}
+
+/**
+ * Keep an open tunnel honest for as long as it lives.
+ *
+ * A tunnel makes exactly one request — the upgrade — and then carries bytes
+ * for hours. Everything the HTTP relay re-checks per request has to happen
+ * here on a timer, or the upgrade path becomes the way to hold access that
+ * was taken away. Three things end a tunnel: the token's own expiry, a failed
+ * recheck, and the browser going away.
+ *
+ * The recheck is pinned to the daemon that actually accepted this upgrade.
+ * Re-resolving the machine's sockets would let a different daemon answer for
+ * a tunnel it is not carrying, and its answer would say nothing about the
+ * runtime these bytes are flowing to.
+ */
+export function armTunnelRevocation(input: {
+    tunnelId: string;
+    bind: PreviewTokenBinding;
+    machineId: string;
+    port: number;
+    /** Token expiry, epoch ms. */
+    expiresAt: number;
+    daemon: PreviewWsMachineSocket;
+    isOpen: () => boolean;
+    revoke: (reason: string) => void;
+    intervalMs?: number;
+    deadlineMs?: number;
+    recheck?: typeof recheckOpenTunnelBinding;
+}): () => void {
+    const recheck = input.recheck ?? recheckOpenTunnelBinding;
+    let stopped = false;
+    let inFlight = false;
+    let interval: NodeJS.Timeout | null = null;
+    let expiry: NodeJS.Timeout | null = null;
+
+    const stop = () => {
+        stopped = true;
+        if (interval) clearInterval(interval);
+        if (expiry) clearTimeout(expiry);
+        interval = null;
+        expiry = null;
+    };
+    const end = (reason: string) => {
+        if (stopped) return;
+        stop();
+        input.revoke(reason);
+    };
+
+    expiry = setTimeout(() => end('token-expired'), Math.max(0, input.expiresAt - Date.now()));
+    expiry.unref?.();
+
+    interval = setInterval(() => {
+        if (stopped) return;
+        if (!input.isOpen()) {
+            stop();
+            return;
+        }
+        // One check at a time. A slow callback must not stack another check
+        // on top of it every interval.
+        if (inFlight) return;
+        inFlight = true;
+        void (async () => {
+            let verdict: { ok: true } | { ok: false; reason: string };
+            try {
+                verdict = await recheck({
+                    bind: input.bind,
+                    machineId: input.machineId,
+                    port: input.port,
+                    authorizer: getPreviewAuthorizer(),
+                    sockets: [input.daemon],
+                    deadlineMs: input.deadlineMs,
+                });
+            } catch (err) {
+                // The check itself broke. Keeping the tunnel would make an
+                // outage of this path the way to keep access.
+                verdict = { ok: false, reason: `recheck-failed: ${(err as Error).message}` };
+            } finally {
+                inFlight = false;
+            }
+            if (verdict.ok) return;
+            end(verdict.reason);
+        })();
+    }, input.intervalMs ?? WS_BINDING_RECHECK_MS);
+    // Never hold the process open for a check.
+    interval.unref?.();
+
+    return stop;
 }
 
 /** Cross-replica: the daemon may be attached to a different pod than this upgrade. */
@@ -404,7 +541,6 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
             machineId,
             port,
             authorizer: getPreviewAuthorizer(),
-            policyMode: bindingPolicy.mode,
         });
         if (access.kind === 'reject') {
             log({ module: 'preview', level: 'warn' },
@@ -450,9 +586,9 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
     socket.pause();
     addTunnel(tunnelId, socket);
 
-    let daemonSocketId: string;
+    let chosenSocket: (typeof machineSockets)[number];
     try {
-        const chosen = await openPreviewWsTunnel(
+        chosenSocket = await openPreviewWsTunnel(
             machineSockets,
             {
                 tunnelId,
@@ -463,7 +599,6 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
             undefined,
             Boolean(wsBinding),
         );
-        daemonSocketId = chosen.id;
     } catch (err) {
         deleteTunnel(tunnelId);
         const code = err instanceof PreviewWsOpenError ? err.code : null;
@@ -482,6 +617,7 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
     // Browser → daemon. Addressed by socket id so it lands on whichever replica
     // owns the daemon (Socket.IO auto-joins every socket to a room named after
     // its id).
+    const daemonSocketId = chosenSocket.id;
     const toDaemon = (event: string, payload: unknown) =>
         eventRouter.server.to(daemonSocketId).emit(event as any, payload as any);
 
@@ -499,12 +635,10 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
         toDaemon('proxy-ws-data', { tunnelId, dataB64: chunk.toString('base64') });
     });
     socket.resume();
-    let recheckTimer: NodeJS.Timeout | null = null;
+    let stopRevocation: (() => void) | null = null;
     const teardown = () => {
-        if (recheckTimer) {
-            clearInterval(recheckTimer);
-            recheckTimer = null;
-        }
+        stopRevocation?.();
+        stopRevocation = null;
         if (deleteTunnel(tunnelId)) {
             toDaemon('proxy-ws-close', { tunnelId });
         }
@@ -516,38 +650,23 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
     // away, and the runtime can be replaced, long after the upgrade — the
     // tunnel is the only preview path where nothing else would notice.
     if (bindingDecision.kind === 'enforce') {
-        const bind = bindingDecision.bind;
-        recheckTimer = setInterval(() => {
-            void (async () => {
-                if (!hasTunnel(tunnelId)) {
-                    teardown();
-                    return;
-                }
-                let verdict: { ok: true } | { ok: false; reason: string };
-                try {
-                    const { sockets } = await findMachineSockets(claims.userId, machineId);
-                    verdict = await recheckOpenTunnelBinding({
-                        bind,
-                        machineId,
-                        port,
-                        policyMode: bindingPolicy.mode,
-                        authorizer: getPreviewAuthorizer(),
-                        sockets,
-                    });
-                } catch (err) {
-                    // The check itself broke. Keeping the tunnel open would
-                    // make an outage of this path the way to keep access.
-                    verdict = { ok: false, reason: `recheck-failed: ${(err as Error).message}` };
-                }
-                if (verdict.ok) return;
+        stopRevocation = armTunnelRevocation({
+            tunnelId,
+            bind: bindingDecision.bind,
+            machineId,
+            port,
+            expiresAt: claims.exp,
+            // The daemon that accepted this upgrade, not whichever socket the
+            // machine happens to have later.
+            daemon: chosenSocket,
+            isOpen: () => hasTunnel(tunnelId),
+            revoke: (reason) => {
                 log({ module: 'preview', level: 'warn' },
-                    `preview ws revoked reason=${verdict.reason} machine=${machineId} port=${port} project=${bind.projectId}`);
+                    `preview ws revoked reason=${reason} machine=${machineId} port=${port} project=${bindingDecision.bind.projectId}`);
                 teardown();
                 try { socket.destroy(); } catch { /* already gone */ }
-            })();
-        }, WS_BINDING_RECHECK_MS);
-        // Never hold the process open for a check.
-        recheckTimer.unref?.();
+            },
+        });
     }
 }
 

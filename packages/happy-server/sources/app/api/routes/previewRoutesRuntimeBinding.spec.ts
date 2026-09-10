@@ -123,7 +123,6 @@ describe('authorizeRelayBinding', () => {
             machineId: 'machine-1',
             port: 3000,
             authorizer: authorizer as never,
-            policyMode: 'required',
         })).resolves.toEqual({ kind: 'allow', workspacePaths: ['/srv/a'] });
         expect(authorizer.authorize).toHaveBeenCalledWith({
             studioUserId: 'studio-1',
@@ -139,41 +138,28 @@ describe('authorizeRelayBinding', () => {
             machineId: 'machine-1',
             port: 3000,
             authorizer: authorizerReturning({ kind: 'denied' }) as never,
-            policyMode: 'off',
         })).resolves.toMatchObject({ kind: 'reject', status: 403 });
     });
 
-    it('fails closed when the studio cannot answer and binding is required', async () => {
+    it('fails closed with no callback even while the policy is off', async () => {
+        // The policy decides who must be *issued* a bound token. A token that
+        // already carries a binding is verified either way, or turning the
+        // policy off would silently disarm every token minted while it was on.
+        await expect(authorizeRelayBinding({
+            access: BIND,
+            machineId: 'machine-1',
+            port: 3000,
+            authorizer: null,
+        })).resolves.toMatchObject({ kind: 'reject', status: 503 });
+    });
+
+    it('fails closed when the studio cannot answer, whatever the policy', async () => {
         await expect(authorizeRelayBinding({
             access: BIND,
             machineId: 'machine-1',
             port: 3000,
             authorizer: authorizerReturning({ kind: 'unavailable', reason: 'down' }) as never,
-            policyMode: 'required',
         })).resolves.toMatchObject({ kind: 'reject', status: 503 });
-    });
-
-    it('fails closed when binding is required but no callback is configured', async () => {
-        await expect(authorizeRelayBinding({
-            access: BIND,
-            machineId: 'machine-1',
-            port: 3000,
-            authorizer: null,
-            policyMode: 'required',
-        })).resolves.toMatchObject({ kind: 'reject', status: 503 });
-    });
-
-    it('keeps working while the policy is off and no callback is configured', async () => {
-        // Rollout order: bound tokens exist before the studio callback is
-        // deployed. The runtime lease is still enforced by the daemon; only
-        // the ACL re-check is skipped, and only while the policy is off.
-        await expect(authorizeRelayBinding({
-            access: BIND,
-            machineId: 'machine-1',
-            port: 3000,
-            authorizer: null,
-            policyMode: 'off',
-        })).resolves.toEqual({ kind: 'allow', workspacePaths: [] });
     });
 });
 
@@ -242,6 +228,16 @@ function daemonSocket(options: {
     };
 }
 
+function trustedMint(app: Awaited<ReturnType<typeof buildApp>>, payload: Record<string, unknown>) {
+    process.env.WEB_UI_TRUSTED_PREVIEW_SECRET = TRUSTED_SECRET;
+    return app.inject({
+        method: 'POST',
+        url: '/v1/preview-token-trusted',
+        headers: { 'x-trusted-preview-secret': TRUSTED_SECRET },
+        payload,
+    });
+}
+
 function mintBody(extra: Record<string, unknown> = {}) {
     return { machineId: MID, port: PORT, projectId: PROJECT, studioUserId: STUDIO_USER, ...extra };
 }
@@ -263,14 +259,73 @@ describe('preview mint route — runtime binding', () => {
         for (const key of ENV_KEYS) delete process.env[key];
     });
 
-    it('mints a token bound to the runtime the daemon leased', async () => {
+    it('never mints a bound token from a studio identity the caller supplied', async () => {
+        // A happy bearer proves which *happy account* owns the machine, not
+        // who is asking: on a company machine every member holds one. Letting
+        // this path bind to a caller-supplied studioUserId would let any
+        // member mint a token in anyone else's name, which is the opposite of
+        // what the binding is for. Only the trusted studio path may bind.
+        const daemon = daemonSocket();
+        setMachineSockets([daemon]);
+        stubAuthorizeCallback({ allowed: true, workspacePaths: ['/srv/proj-1'] });
+        const app = await buildApp();
+
+        const res = await app.inject({
+            method: 'POST',
+            url: '/v1/preview-token',
+            payload: mintBody({ studioUserId: 'someone-else' }),
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.json().binding).toBe('unbound');
+        expect(verifyPreviewToken(res.json().token)?.bind).toBeUndefined();
+        expect(daemon.emitWithAck).not.toHaveBeenCalled();
+        await app.close();
+    });
+
+    it('refuses the bearer mint outright once binding is required', async () => {
+        // Under the required policy an unbound token is not acceptable and a
+        // bound one cannot be issued here, so the only honest answer is to
+        // send the caller to the trusted studio path.
+        process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
+        const app = await buildApp();
+
+        const res = await app.inject({
+            method: 'POST',
+            url: '/v1/preview-token',
+            payload: mintBody(),
+        });
+
+        expect(res.statusCode).toBe(403);
+        expect(res.json().code).toBe('BEARER_BINDING_UNSUPPORTED');
+        expect(res.json().token).toBeUndefined();
+        await app.close();
+    });
+
+    it('still mints unbound on an explicitly excepted legacy machine', async () => {
+        process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
+        process.env.PREVIEW_BINDING_LEGACY_MACHINE_IDS = MID;
+        const app = await buildApp();
+
+        const res = await app.inject({
+            method: 'POST',
+            url: '/v1/preview-token',
+            payload: { machineId: MID, port: PORT },
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.json().binding).toBe('unbound');
+        await app.close();
+    });
+
+    it('mints a trusted token bound to the runtime the daemon leased', async () => {
         process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
         const fetchImpl = stubAuthorizeCallback({ allowed: true, workspacePaths: ['/srv/proj-1'] });
         const daemon = daemonSocket();
         setMachineSockets([daemon]);
         const app = await buildApp();
 
-        const res = await app.inject({ method: 'POST', url: '/v1/preview-token', payload: mintBody() });
+        const res = await trustedMint(app, mintBody());
 
         expect(res.statusCode).toBe(200);
         expect(res.json().binding).toBe('lease');
@@ -293,37 +348,11 @@ describe('preview mint route — runtime binding', () => {
         await app.close();
     });
 
-    it('refuses the legacy unbound mint on the bearer path once binding is required', async () => {
-        // The whole point of the policy living on the server: a shared company
-        // machine hands every member a happy token, and this endpoint only ever
-        // checked `machine.accountId`. If it could still mint unbound, the
-        // binding would be one HTTP call away from being opted out of.
+    it('refuses the legacy unbound mint on the trusted path once binding is required', async () => {
         process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
         const app = await buildApp();
 
-        const res = await app.inject({
-            method: 'POST',
-            url: '/v1/preview-token',
-            payload: { machineId: MID, port: PORT },
-        });
-
-        expect(res.statusCode).toBe(400);
-        expect(res.json().code).toBe('BINDING_REQUIRED');
-        expect(res.json().token).toBeUndefined();
-        await app.close();
-    });
-
-    it('refuses the legacy unbound mint on the trusted path too', async () => {
-        process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
-        process.env.WEB_UI_TRUSTED_PREVIEW_SECRET = TRUSTED_SECRET;
-        const app = await buildApp();
-
-        const res = await app.inject({
-            method: 'POST',
-            url: '/v1/preview-token-trusted',
-            headers: { 'x-trusted-preview-secret': TRUSTED_SECRET },
-            payload: { machineId: MID, port: PORT },
-        });
+        const res = await trustedMint(app, { machineId: MID, port: PORT });
 
         expect(res.statusCode).toBe(400);
         expect(res.json().code).toBe('BINDING_REQUIRED');
@@ -331,7 +360,6 @@ describe('preview mint route — runtime binding', () => {
     });
 
     it('refuses to mint when the daemon predates runtime binding', async () => {
-        process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
         stubAuthorizeCallback({ allowed: true, workspacePaths: [] });
         // An old daemon has no handler for the event, so the ack times out.
         setMachineSockets([{
@@ -341,7 +369,7 @@ describe('preview mint route — runtime binding', () => {
         }]);
         const app = await buildApp();
 
-        const res = await app.inject({ method: 'POST', url: '/v1/preview-token', payload: mintBody() });
+        const res = await trustedMint(app, mintBody());
 
         expect(res.statusCode).toBe(409);
         expect(res.json().code).toBe(LEASE_UNSUPPORTED_CODE);
@@ -356,7 +384,7 @@ describe('preview mint route — runtime binding', () => {
         })]);
         const app = await buildApp();
 
-        const res = await app.inject({ method: 'POST', url: '/v1/preview-token', payload: mintBody() });
+        const res = await trustedMint(app, mintBody());
 
         expect(res.statusCode).toBe(403);
         expect(res.json().code).toBe('PROJECT_OWNERSHIP_MISMATCH');
@@ -364,12 +392,16 @@ describe('preview mint route — runtime binding', () => {
     });
 
     it('refuses to mint once the studio says the user lost the project', async () => {
-        stubAuthorizeCallback(403);
+        stubAuthorizeCallback({ allowed: true, workspacePaths: [] });
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ allowed: false }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+        })));
         const daemon = daemonSocket();
         setMachineSockets([daemon]);
         const app = await buildApp();
 
-        const res = await app.inject({ method: 'POST', url: '/v1/preview-token', payload: mintBody() });
+        const res = await trustedMint(app, mintBody());
 
         expect(res.statusCode).toBe(403);
         // Denied before the daemon is asked to lease anything at all.
@@ -377,36 +409,35 @@ describe('preview mint route — runtime binding', () => {
         await app.close();
     });
 
-    it('mints unbound, not broken, when the studio callback is not configured yet', async () => {
-        // The landing configuration: policy off, shared secret not yet in
-        // place. Without the callback the server has no workspace paths, and
-        // sending an empty list would assert that the project owns no
-        // directories on that machine — which makes the daemon refuse every
-        // plain (non-container) dev server. An honest "unbound" is the answer;
-        // the token becomes bound the moment the callback is configured.
-        const daemon = daemonSocket({
-            lease: { type: 'error', code: 'WORKSPACE_UNVERIFIED', message: 'no verified workspace path' },
-        });
+    it('fails a requested trusted binding closed rather than handing back an unbound token', async () => {
+        // No callback configured. An unbound token here would be a silent
+        // downgrade of exactly the request that asked to be bound, and the
+        // caller would have no way to tell the two apart.
+        const daemon = daemonSocket();
         setMachineSockets([daemon]);
         const app = await buildApp();
 
-        const res = await app.inject({ method: 'POST', url: '/v1/preview-token', payload: mintBody() });
+        const res = await trustedMint(app, mintBody());
 
-        expect(res.statusCode).toBe(200);
-        expect(res.json().binding).toBe('unbound');
+        expect(res.statusCode).toBe(503);
+        expect(res.json().token).toBeUndefined();
         expect(daemon.emitWithAck).not.toHaveBeenCalled();
         await app.close();
     });
 
-    it('binds as soon as the callback is configured, with the policy still off', async () => {
-        stubAuthorizeCallback({ allowed: true, workspacePaths: ['/srv/proj-1'] });
-        setMachineSockets([daemonSocket()]);
+    it('rejects a trusted mint whose secret is wrong without leaking it', async () => {
         const app = await buildApp();
+        process.env.WEB_UI_TRUSTED_PREVIEW_SECRET = TRUSTED_SECRET;
 
-        const res = await app.inject({ method: 'POST', url: '/v1/preview-token', payload: mintBody() });
+        const res = await app.inject({
+            method: 'POST',
+            url: '/v1/preview-token-trusted',
+            headers: { 'x-trusted-preview-secret': 'wrong-but-same-length' },
+            payload: mintBody(),
+        });
 
-        expect(res.statusCode).toBe(200);
-        expect(res.json().binding).toBe('lease');
+        expect(res.statusCode).toBe(401);
+        expect(res.body).not.toContain(TRUSTED_SECRET);
         await app.close();
     });
 
@@ -577,6 +608,45 @@ describe('preview relay route — runtime binding', () => {
 
         expect(res.statusCode).toBe(401);
         expect(res.headers['content-type']).toContain('text/html');
+        await app.close();
+    });
+
+    it('never answers a mutation with the self-reloading re-mint page', async () => {
+        // The page reloads the URL it was served for, so serving it here
+        // would re-issue the POST as soon as a fresh token arrives.
+        stubAuthorizeCallback({ allowed: true, workspacePaths: [] });
+        setMachineSockets([daemonSocket({
+            proxy: { type: 'error', code: 'LEASE_MISMATCH', message: 'runtime changed' },
+        })]);
+        const app = await buildApp();
+
+        const res = await app.inject({
+            method: 'POST',
+            url: relayUrl(boundToken()),
+            headers: { accept: 'text/html,application/xhtml+xml' },
+            payload: 'a=1',
+        });
+
+        expect(res.statusCode).toBe(401);
+        expect(res.headers['content-type']).not.toContain('text/html');
+        await app.close();
+    });
+
+    it('never answers a subresource with the re-mint page', async () => {
+        stubAuthorizeCallback({ allowed: true, workspacePaths: [] });
+        setMachineSockets([daemonSocket({
+            proxy: { type: 'error', code: 'LEASE_MISMATCH', message: 'runtime changed' },
+        })]);
+        const app = await buildApp();
+
+        const res = await app.inject({
+            method: 'GET',
+            url: relayUrl(boundToken()),
+            headers: { accept: 'text/html', 'sec-fetch-dest': 'script', 'sec-fetch-mode': 'no-cors' },
+        });
+
+        expect(res.statusCode).toBe(401);
+        expect(res.headers['content-type']).not.toContain('text/html');
         await app.close();
     });
 
