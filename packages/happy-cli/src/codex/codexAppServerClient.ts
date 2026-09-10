@@ -60,6 +60,7 @@ import { CODEX_INACTIVITY_ABORT_REASON, type CodexInactivityAbortFields } from '
 import { prepareCodexMultiAuthProxy, type PreparedCodexMultiAuthProxy } from './codexMultiAuthProxy';
 import { initializeSandbox, wrapForMcpTransport } from '@/sandbox/manager';
 import { MandatorySandboxError, resolveSandboxInitFailureAction, type SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
+import { describeSandboxCapabilityFailure, verifySandboxExecutionCapability } from '@/sandbox/executionCapability';
 import packageJson from '../../package.json';
 import { resolveCodexSandboxPolicy } from './executionPolicy';
 
@@ -801,6 +802,15 @@ export class CodexAppServerClient {
                     process.cwd(),
                     this.sandboxPolicyMode,
                 );
+                if (resolveSandboxInitFailureAction(this.sandboxPolicyMode) === 'abort') {
+                    const capability = await verifySandboxExecutionCapability();
+                    if (!capability.ok) {
+                        throw new MandatorySandboxError(
+                            'capability-unavailable',
+                            describeSandboxCapabilityFailure(capability),
+                        );
+                    }
+                }
                 const wrapped = await wrapForMcpTransport('codex', args);
                 command = wrapped.command;
                 args = wrapped.args;
@@ -813,7 +823,9 @@ export class CodexAppServerClient {
                 // 공유 머신에서는 턴을 기다리지 않는다 — 폴백한 네이티브 정책이
                 // workspace-write/danger-full-access 면 호스트 전체가 열린다.
                 if (resolveSandboxInitFailureAction(this.sandboxPolicyMode) === 'abort') {
-                    throw new MandatorySandboxError('init-failed', this.sandboxInitFailureReason);
+                    throw error instanceof MandatorySandboxError
+                        ? error
+                        : new MandatorySandboxError('init-failed', this.sandboxInitFailureReason);
                 }
                 if (this.beforeTurn) {
                     throw new Error(

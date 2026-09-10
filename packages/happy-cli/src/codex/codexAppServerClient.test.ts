@@ -5,6 +5,7 @@ import { mapCodexMcpMessageToSessionEnvelopes } from './utils/sessionProtocolMap
 const {
     mockExecSync,
     mockInitializeSandbox,
+    mockVerifySandboxCapability,
     mockWrapForMcpTransport,
     mockSandboxCleanup,
     mockSpawn,
@@ -13,6 +14,7 @@ const {
 } = vi.hoisted(() => ({
     mockExecSync: vi.fn(),
     mockInitializeSandbox: vi.fn(),
+    mockVerifySandboxCapability: vi.fn(),
     mockWrapForMcpTransport: vi.fn(),
     mockSandboxCleanup: vi.fn(),
     mockSpawn: vi.fn(),
@@ -27,6 +29,11 @@ vi.mock('node:child_process', () => ({
 
 vi.mock('cross-spawn', () => ({
     spawn: mockSpawn,
+}));
+
+vi.mock('@/sandbox/executionCapability', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('@/sandbox/executionCapability')>()),
+    verifySandboxExecutionCapability: mockVerifySandboxCapability,
 }));
 
 vi.mock('@/sandbox/manager', () => ({
@@ -129,6 +136,7 @@ describe('CodexAppServerClient sandbox integration', () => {
         process.env.RUST_LOG = originalRustLog;
         mockExecSync.mockReturnValue('codex-cli 0.107.0');
         mockInitializeSandbox.mockResolvedValue(mockSandboxCleanup);
+        mockVerifySandboxCapability.mockResolvedValue({ ok: true });
         mockWrapForMcpTransport.mockResolvedValue({ command: 'sh', args: ['-c', 'wrapped codex app-server'] });
         mockPrepareCodexMultiAuthProxy.mockResolvedValue(null);
         mockProxyCleanup.mockResolvedValue(undefined);
@@ -749,6 +757,33 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(client.sandboxInitFailed).toBe(true);
         expect(mockSpawn).toHaveBeenCalled();
 
+        await client.disconnect();
+    });
+
+
+    // local 경로와 같은 확인이다: 초기화 성공은 격리 성공의 증거가 아니다.
+    it('refuses to connect on a mandatory machine when the sandbox cannot execute', async () => {
+        mockVerifySandboxCapability.mockResolvedValue({
+            ok: false,
+            reason: 'namespace-denied',
+            detail: 'bwrap: Creating new namespace failed: Operation not permitted',
+        });
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(sandboxConfig, undefined, undefined, 'mandatory');
+
+        await expect(client.connect()).rejects.toThrow(/capability-unavailable/);
+
+        expect(mockSpawn).not.toHaveBeenCalled();
+        await client.disconnect();
+    });
+
+    it('does not probe sandbox capability on an owner-choice machine', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(sandboxConfig);
+
+        await client.connect();
+
+        expect(mockVerifySandboxCapability).not.toHaveBeenCalled();
         await client.disconnect();
     });
 
