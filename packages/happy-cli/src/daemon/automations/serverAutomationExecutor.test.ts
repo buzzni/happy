@@ -11,7 +11,7 @@ import {
   MAX_GITHUB_WORKER_SESSIONS,
   runServerAutomationTick,
   type ServerAutomationExecutorInput,
-  DIRTY_WORKTREE_BLOCKED_AFTER_ATTEMPTS,
+  DIRTY_WORKTREE_WARN_AFTER_ATTEMPTS,
 } from './serverAutomationExecutor'
 
 // 상한을 상수에서 끌어와 만든다. 개수를 하드코딩하면 상한을 올릴 때 테스트가
@@ -3451,19 +3451,25 @@ describe('runServerAutomationTick', () => {
     return logDebug
   }
 
-  it('says the automation queue is blocked once a dirty hold has lasted', async () => {
-    const logDebug = await runDirtyCleanup(DIRTY_WORKTREE_BLOCKED_AFTER_ATTEMPTS - 1)
+  // 2026-09-10 — 이 경고는 처음에 "GitHub queue is blocked" 라고 썼는데 틀린 말이었다.
+  // 큐를 막는 것은 dirty 가 아니라 *프로세스가 붙어 있음*(isDirectoryInUse) 이다
+  // (trackLivePendingGithubWorktrees). dirty 만으로는 디스크만 찬다. 09-05 사고에서
+  // 큐를 막은 진짜 원인은 좀비 프로세스였고 dirty 는 누적 원인이었을 뿐인데 둘을
+  // 합쳐 읽었다. 경고는 사실만 말한다: 지워지지 않고 남아 있다.
+  it('says the dirty worktree is being kept once the hold has lasted', async () => {
+    const logDebug = await runDirtyCleanup(DIRTY_WORKTREE_WARN_AFTER_ATTEMPTS - 1)
 
-    const blocked = logDebug.mock.calls.map(([line]) => String(line)).filter((line) => /queue is blocked/.test(line))
-    expect(blocked).toHaveLength(1)
-    expect(blocked[0]).toContain('automation-1')
-    expect(blocked[0]).toContain('notes.md')
+    const kept = logDebug.mock.calls.map(([line]) => String(line)).filter((line) => /is being kept/.test(line))
+    expect(kept).toHaveLength(1)
+    expect(kept[0]).toContain('automation-1')
+    expect(kept[0]).toContain('notes.md')
+    expect(kept[0]).not.toMatch(/queue is blocked/)
   })
 
-  it('does not cry blocked while the hold is still young', async () => {
+  it('does not warn while the hold is still young', async () => {
     const logDebug = await runDirtyCleanup(0)
 
-    expect(logDebug.mock.calls.map(([line]) => String(line)).filter((line) => /queue is blocked/.test(line)))
+    expect(logDebug.mock.calls.map(([line]) => String(line)).filter((line) => /is being kept/.test(line)))
       .toHaveLength(0)
   })
 

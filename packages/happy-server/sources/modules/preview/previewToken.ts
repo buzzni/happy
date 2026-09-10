@@ -13,10 +13,29 @@
 
 import crypto from 'node:crypto';
 
+/**
+ * specs/runtime-isolation-hardening (H3) — the runtime binding a token is
+ * good for. `userId` above is the *happy account* that owns the machine and
+ * is only used to find the daemon socket; a company-owned shared machine
+ * mints every member's token under the same account. `studioUserId` is the
+ * studio identity that actually asked, and `projectId`/`leaseId` pin the
+ * token to one project's currently-running dev server. They are deliberately
+ * separate claims — treating the happy account as the studio user is what let
+ * any holder of a company happy token reach any project on the machine.
+ */
+export interface PreviewTokenBinding {
+    projectId: string;
+    studioUserId: string;
+    /** Daemon-computed digest of the runtime actually listening on `port`. */
+    leaseId: string;
+}
+
 export interface PreviewTokenPayload {
     userId: string;
     machineId: string;
     port: number;
+    /** Absent on legacy (unbound) tokens — see PREVIEW_RUNTIME_BINDING_POLICY. */
+    bind?: PreviewTokenBinding;
 }
 
 export interface VerifiedPreviewToken extends PreviewTokenPayload {
@@ -48,6 +67,23 @@ interface EncodedPayload extends PreviewTokenPayload {
     exp: number;
 }
 
+function decodeBinding(raw: unknown): PreviewTokenBinding | null {
+    if (!raw || typeof raw !== 'object') return null;
+    const candidate = raw as Partial<PreviewTokenBinding>;
+    if (
+        typeof candidate.projectId !== 'string' || candidate.projectId.length === 0 ||
+        typeof candidate.studioUserId !== 'string' || candidate.studioUserId.length === 0 ||
+        typeof candidate.leaseId !== 'string' || candidate.leaseId.length === 0
+    ) {
+        return null;
+    }
+    return {
+        projectId: candidate.projectId,
+        studioUserId: candidate.studioUserId,
+        leaseId: candidate.leaseId,
+    };
+}
+
 function getSecret(override?: string): string {
     const secret = override ?? process.env.HANDY_MASTER_SECRET;
     if (!secret) {
@@ -76,7 +112,15 @@ function decodePayload(encoded: string): EncodedPayload | null {
             Number.isInteger(parsed.port) &&
             Number.isInteger(parsed.exp)
         ) {
-            return parsed as EncodedPayload;
+            if (parsed.bind === undefined) {
+                return parsed as EncodedPayload;
+            }
+            const bind = decodeBinding(parsed.bind);
+            // A bind claim we cannot read is a hard failure, never a fallback
+            // to "unbound": silently dropping it would downgrade a bound token
+            // into one the relay stops enforcing.
+            if (!bind) return null;
+            return { ...(parsed as EncodedPayload), bind };
         }
         return null;
     } catch {
@@ -100,6 +144,32 @@ export function signPreviewToken(
 export function verifyPreviewToken(
     token: string,
     options: PreviewTokenOptions = {},
+): VerifiedPreviewToken | null {
+    return readPreviewToken(token, options, { allowExpired: false });
+}
+
+/**
+ * specs/runtime-isolation-hardening (H3, P4) — read the token a re-mint is
+ * replacing, expiry included.
+ *
+ * Recovery needs to know what the previous token was bound to, and by the
+ * time the page re-mints that token is usually expired. This is deliberately
+ * a separate function rather than a flag on `verifyPreviewToken`: nothing on
+ * a request path can reach it by passing an option, and the signature is
+ * still required, so an expired token describes the session being replaced
+ * without ever authorizing anything.
+ */
+export function verifyExpiredPreviewTokenForRecovery(
+    token: string,
+    options: PreviewTokenOptions = {},
+): VerifiedPreviewToken | null {
+    return readPreviewToken(token, options, { allowExpired: true });
+}
+
+function readPreviewToken(
+    token: string,
+    options: PreviewTokenOptions,
+    mode: { allowExpired: boolean },
 ): VerifiedPreviewToken | null {
     const secret = getSecret(options.secret);
 
@@ -126,7 +196,7 @@ export function verifyPreviewToken(
     if (!payload) {
         return null;
     }
-    if (payload.exp <= Date.now()) {
+    if (!mode.allowExpired && payload.exp <= Date.now()) {
         return null;
     }
 
@@ -135,5 +205,6 @@ export function verifyPreviewToken(
         machineId: payload.machineId,
         port: payload.port,
         exp: payload.exp,
+        ...(payload.bind ? { bind: payload.bind } : {}),
     };
 }

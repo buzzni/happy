@@ -96,7 +96,11 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
 }
 
 function resolveSettings(opts: QueryOptions | undefined): string | undefined {
-    if (!opts?.settingsPath || !opts.sandbox) return opts?.settingsPath
+    const denyRules = opts?.permissionsDeny ?? []
+    // SDK 는 settings 파일 경로와 sandbox 옵션의 동시 사용을 거부한다. 우리 규칙을
+    // 경로로 넘기면 CLI 가 그 파일만 읽고 여기서 더한 것은 사라지므로, 합쳐야 할
+    // 것이 하나라도 있으면 인라인한다.
+    if (!opts?.settingsPath || (!opts.sandbox && denyRules.length === 0)) return opts?.settingsPath
     const rawSettings = readFileSync(opts.settingsPath, 'utf8')
     let parsedSettings: unknown
     try {
@@ -107,5 +111,17 @@ function resolveSettings(opts: QueryOptions | undefined): string | undefined {
     if (!parsedSettings || typeof parsedSettings !== 'object' || Array.isArray(parsedSettings)) {
         throw new Error('Claude hook settings must be a JSON object before sandbox merge')
     }
-    return JSON.stringify(parsedSettings)
+    if (denyRules.length === 0) return JSON.stringify(parsedSettings)
+
+    const settings = parsedSettings as { permissions?: { deny?: unknown } }
+    const existingDeny = Array.isArray(settings.permissions?.deny)
+        ? (settings.permissions?.deny as string[])
+        : []
+    return JSON.stringify({
+        ...settings,
+        permissions: {
+            ...(settings.permissions ?? {}),
+            deny: [...new Set([...existingDeny, ...denyRules])],
+        },
+    })
 }
