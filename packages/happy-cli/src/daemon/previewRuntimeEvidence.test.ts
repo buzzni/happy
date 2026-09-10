@@ -15,8 +15,22 @@ function makeIo(overrides: Partial<EvidenceIo> = {}): EvidenceIo {
     readFile: vi.fn().mockResolvedValue(null),
     readDir: vi.fn().mockResolvedValue(null),
     readLink: vi.fn().mockResolvedValue(null),
+    connectLoopback: vi.fn().mockResolvedValue({ status: 'failed', detail: 'connect not stubbed' }),
     ...overrides,
   }
+}
+
+/** Real `lsof -nP -iTCP:<port> -sTCP:LISTEN -Fpnt` shape: p, then f/t/n per socket fd. */
+function lsofListing(entries: { pid: string; type: 'IPv4' | 'IPv6'; name: string }[]): string {
+  const byPid = new Map<string, typeof entries>()
+  for (const entry of entries) byPid.set(entry.pid, [...(byPid.get(entry.pid) ?? []), entry])
+  let out = ''
+  let fd = 12
+  for (const [pid, sockets] of byPid) {
+    out += `p${pid}\n`
+    for (const socket of sockets) out += `f${fd++}\nt${socket.type}\nn${socket.name}\n`
+  }
+  return out
 }
 
 /**
@@ -126,10 +140,26 @@ describe('probeListenerEvidence — container publish', () => {
     await expect(probeListenerEvidence(32780, io)).resolves.toMatchObject({ status: 'ambiguous' })
   })
 
-  it('accepts the loopback and wildcard publish addresses the platform actually uses', async () => {
-    for (const hostIp of ['0.0.0.0', '127.0.0.1', '[::]', '[::1]']) {
+  it('accepts the two publish addresses that 127.0.0.1 provably reaches', async () => {
+    for (const hostIp of ['0.0.0.0', '127.0.0.1']) {
       const io = dockerIo([DOCKER_LINE('abc123', `${hostIp}:32780->5173/tcp`, 'preview-a', 'proj-a')])
       await expect(probeListenerEvidence(32780, io)).resolves.toMatchObject({ status: 'found' })
+    }
+  })
+
+  it('accepts the usual dual publish line as long as the IPv4 half is there', async () => {
+    const io = dockerIo([DOCKER_LINE('abc123', '0.0.0.0:32780->5173/tcp, [::]:32780->5173/tcp', 'preview-a', 'proj-a')])
+    await expect(probeListenerEvidence(32780, io)).resolves.toMatchObject({ status: 'found' })
+  })
+
+  it('does not take an IPv6-only publish as proof about 127.0.0.1', async () => {
+    // `[::]` may or may not accept IPv4 depending on the proxy's socket
+    // options, and `[::1]` never does. Neither is what the relay connects
+    // to, so neither identifies the port — and the loopback address stays
+    // unexplained, which is ambiguous, not none.
+    for (const hostIp of ['[::]', '[::1]']) {
+      const io = dockerIo([DOCKER_LINE('abc123', `${hostIp}:32780->5173/tcp`, 'preview-a', 'proj-a')])
+      await expect(probeListenerEvidence(32780, io)).resolves.toMatchObject({ status: 'ambiguous' })
     }
   })
 
@@ -151,7 +181,7 @@ describe('probeListenerEvidence — container publish', () => {
       exec: vi.fn(async (file: string, args: string[]) => {
         if (file === 'docker') return { status: 'missing' as const }
         if (file === 'lsof' && args.join(' ').includes('-iTCP:3000')) {
-          return { status: 'ok' as const, stdout: 'p4242\nnnode\n' }
+          return { status: 'ok' as const, stdout: lsofListing([{ pid: '4242', type: 'IPv4', name: '127.0.0.1:3000' }]) }
         }
         if (file === 'ps') return { status: 'ok' as const, stdout: 'Wed Sep 10 10:00:00 2026\n' }
         if (file === 'lsof') return { status: 'ok' as const, stdout: 'p4242\nn/Users/dev/project-a\n' }
@@ -174,7 +204,7 @@ describe('probeListenerEvidence — container publish', () => {
       platform: 'darwin',
       exec: vi.fn(async (file: string, args: string[]) => {
         if (file === 'lsof' && args.join(' ').includes('-iTCP:3000')) {
-          return { status: 'ok' as const, stdout: 'p4242\n' }
+          return { status: 'ok' as const, stdout: lsofListing([{ pid: '4242', type: 'IPv4', name: '*:3000' }]) }
         }
         if (file === 'ps') return { status: 'ok' as const, stdout: '\n' }
         if (file === 'lsof') return { status: 'ok' as const, stdout: 'p4242\n' }
@@ -188,6 +218,121 @@ describe('probeListenerEvidence — container publish', () => {
 
   it('fails closed when neither /proc nor lsof can identify the listener', async () => {
     const io = makeIo({ platform: 'darwin' })
+    await expect(probeListenerEvidence(3000, io)).resolves.toMatchObject({ status: 'unavailable' })
+  })
+})
+
+describe('probeListenerEvidence — the listener must be the one 127.0.0.1 reaches', () => {
+  /**
+   * Measured on macOS: a Node `listen(port)` (dual-stack `::`) and a
+   * `listen({host:'::', ipv6Only:true})` print the *same* `tIPv6 n*:port`
+   * line, yet only the first accepts a 127.0.0.1 connection. The string
+   * cannot tell them apart; only connecting can.
+   */
+  function lsofIo(
+    listing: string | { status: 'failed'; detail: string; exitCode?: number; stderr?: string },
+    overrides: Partial<EvidenceIo> = {},
+  ): EvidenceIo {
+    return makeIo({
+      platform: 'darwin',
+      exec: vi.fn(async (file: string, args: string[]) => {
+        if (file === 'docker') return { status: 'missing' as const }
+        if (file === 'lsof' && args.join(' ').includes('-iTCP:3000')) {
+          return typeof listing === 'string' ? { status: 'ok' as const, stdout: listing } : listing
+        }
+        if (file === 'ps') return { status: 'ok' as const, stdout: `Wed Sep 10 10:00:00 2026\n` }
+        if (file === 'lsof') {
+          const pid = args[args.indexOf('-p') + 1]
+          return { status: 'ok' as const, stdout: `p${pid}\nn/Users/dev/project-${pid}\n` }
+        }
+        return { status: 'missing' as const }
+      }),
+      ...overrides,
+    })
+  }
+
+  it('takes a dual-stack wildcard listener only after 127.0.0.1 actually connected to it', async () => {
+    const io = lsofIo(lsofListing([{ pid: '4242', type: 'IPv6', name: '*:3000' }]), {
+      connectLoopback: vi.fn().mockResolvedValue({ status: 'connected' }),
+    })
+    await expect(probeListenerEvidence(3000, io)).resolves.toMatchObject({
+      status: 'found',
+      evidence: { kind: 'process', id: '4242' },
+    })
+    expect(io.connectLoopback).toHaveBeenCalledWith(3000, expect.any(Number))
+  })
+
+  it('answers none for an IPv6-only wildcard listener that refuses 127.0.0.1', async () => {
+    const io = lsofIo(lsofListing([{ pid: '4242', type: 'IPv6', name: '*:3000' }]), {
+      connectLoopback: vi.fn().mockResolvedValue({ status: 'refused' }),
+    })
+    await expect(probeListenerEvidence(3000, io)).resolves.toEqual({ status: 'none' })
+  })
+
+  it('fails closed when the reachability connect itself could not run', async () => {
+    const io = lsofIo(lsofListing([{ pid: '4242', type: 'IPv6', name: '*:3000' }]), {
+      connectLoopback: vi.fn().mockResolvedValue({ status: 'failed', detail: 'EPERM' }),
+    })
+    await expect(probeListenerEvidence(3000, io)).resolves.toMatchObject({ status: 'unavailable' })
+  })
+
+  it('never counts a ::1 listener — it cannot receive a 127.0.0.1 connection', async () => {
+    const io = lsofIo(lsofListing([{ pid: '4242', type: 'IPv6', name: '[::1]:3000' }]))
+    await expect(probeListenerEvidence(3000, io)).resolves.toEqual({ status: 'none' })
+    expect(io.connectLoopback).not.toHaveBeenCalled()
+  })
+
+  it('ignores a LAN-address listener on the same port and picks the loopback one', async () => {
+    // Two processes can legitimately share a port on different specific
+    // addresses. Only the one on 127.0.0.1 is what the relay talks to, so
+    // this is a clean answer, not an ambiguity.
+    const io = lsofIo(lsofListing([
+      { pid: '4242', type: 'IPv4', name: '127.0.0.1:3000' },
+      { pid: '5555', type: 'IPv4', name: '172.16.9.1:3000' },
+    ]))
+    await expect(probeListenerEvidence(3000, io)).resolves.toMatchObject({
+      status: 'found',
+      evidence: { id: '4242', cwd: '/Users/dev/project-4242' },
+    })
+    expect(io.connectLoopback).not.toHaveBeenCalled()
+  })
+
+  it('answers none when only a LAN-address listener holds the port', async () => {
+    const io = lsofIo(lsofListing([{ pid: '5555', type: 'IPv4', name: '172.16.9.1:3000' }]))
+    await expect(probeListenerEvidence(3000, io)).resolves.toEqual({ status: 'none' })
+  })
+
+  it('does not connect-probe when an IPv4 listener already proves the destination', async () => {
+    const io = lsofIo(lsofListing([{ pid: '4242', type: 'IPv4', name: '*:3000' }]))
+    await expect(probeListenerEvidence(3000, io)).resolves.toMatchObject({ status: 'found', evidence: { id: '4242' } })
+    expect(io.connectLoopback).not.toHaveBeenCalled()
+  })
+
+  it('is ambiguous when a second process holds a wildcard IPv6 listener beside the IPv4 one', async () => {
+    // With SO_REUSEPORT both could be accepting 127.0.0.1; nothing here can
+    // say which one the relay will land on.
+    const io = lsofIo(lsofListing([
+      { pid: '4242', type: 'IPv4', name: '127.0.0.1:3000' },
+      { pid: '5555', type: 'IPv6', name: '*:3000' },
+    ]))
+    await expect(probeListenerEvidence(3000, io)).resolves.toMatchObject({ status: 'ambiguous' })
+  })
+
+  it('treats one process holding both an IPv4 and an IPv6 wildcard socket as one listener', async () => {
+    const io = lsofIo(lsofListing([
+      { pid: '4242', type: 'IPv4', name: '*:3000' },
+      { pid: '4242', type: 'IPv6', name: '*:3000' },
+    ]))
+    await expect(probeListenerEvidence(3000, io)).resolves.toMatchObject({ status: 'found', evidence: { id: '4242' } })
+  })
+
+  it('reads lsof\'s exit status 1 with no output as "nothing is listening"', async () => {
+    const io = lsofIo({ status: 'failed', detail: '', exitCode: 1, stderr: '' })
+    await expect(probeListenerEvidence(3000, io)).resolves.toEqual({ status: 'none' })
+  })
+
+  it('still fails closed when lsof exits 1 with a complaint', async () => {
+    const io = lsofIo({ status: 'failed', detail: 'lsof: permission denied', exitCode: 1, stderr: 'lsof: permission denied' })
     await expect(probeListenerEvidence(3000, io)).resolves.toMatchObject({ status: 'unavailable' })
   })
 })
@@ -299,6 +444,77 @@ describe('probeListenerEvidence — linux /proc', () => {
   it('still answers none when both tables were readable and held no LISTEN row', async () => {
     const io = procIo({
       readFile: vi.fn(async (p: string) => (p.startsWith('/proc/net/tcp') ? 'header only\n' : null)),
+    })
+    await expect(probeListenerEvidence(3000, io)).resolves.toEqual({ status: 'none' })
+  })
+
+  // Same port, different addresses. /proc prints IPv4 as little-endian hex
+  // (0100007F = 127.0.0.1, 0109A8C0 = 192.168.9.1) and IPv6 as four such
+  // words (all zero = ::, ...01000000 = ::1).
+  const LAN_ROW = '   2: 0109A8C0:0BB8 00000000:0000 0A 00000000:00000000 00:00000000  00000000  1000        0 555555 1 0000 100 0 0 10 0'
+  const V6_ANY_ROW = '   0: 00000000000000000000000000000000:0BB8 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000  00000000  1000        0 666666 1 0000 100 0 0 10 0'
+  const V6_LOOPBACK_ROW = '   0: 00000000000000000000000001000000:0BB8 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000  00000000  1000        0 777777 1 0000 100 0 0 10 0'
+
+  function procTablesIo(tcp: string[], tcp6: string[], overrides: Partial<EvidenceIo> = {}): EvidenceIo {
+    const base = procIo()
+    return procIo({
+      readFile: vi.fn(async (p: string) => {
+        if (p === '/proc/net/tcp') return ['header', ...tcp].join('\n')
+        if (p === '/proc/net/tcp6') return ['header', ...tcp6].join('\n')
+        return base.readFile(p)
+      }),
+      readDir: vi.fn(async (p: string) => {
+        if (p === '/proc') return ['1', '4242', '5555']
+        if (p === '/proc/4242/fd') return ['17']
+        if (p === '/proc/5555/fd') return ['17']
+        return null
+      }),
+      readLink: vi.fn(async (p: string) => {
+        if (p === '/proc/4242/fd/17') return 'socket:[987654]'
+        if (p === '/proc/5555/fd/17') return 'socket:[555555]'
+        if (p === '/proc/4242/cwd') return '/home/dev/project-a'
+        if (p === '/proc/5555/cwd') return '/home/dev/project-b'
+        return null
+      }),
+      ...overrides,
+    })
+  }
+
+  it('picks the 127.0.0.1 listener over a LAN-address listener on the same port', async () => {
+    const io = procTablesIo([PROC_NET_TCP.split('\n')[1], LAN_ROW], [])
+    await expect(probeListenerEvidence(3000, io)).resolves.toMatchObject({
+      status: 'found',
+      evidence: { id: '4242', cwd: '/home/dev/project-a' },
+    })
+  })
+
+  it('answers none when only a LAN-address listener holds the port', async () => {
+    const io = procTablesIo([LAN_ROW], [])
+    await expect(probeListenerEvidence(3000, io)).resolves.toEqual({ status: 'none' })
+  })
+
+  it('never counts a ::1 listener as reachable from 127.0.0.1', async () => {
+    const io = procTablesIo([], [V6_LOOPBACK_ROW])
+    await expect(probeListenerEvidence(3000, io)).resolves.toEqual({ status: 'none' })
+    expect(io.connectLoopback).not.toHaveBeenCalled()
+  })
+
+  it('takes a :: listener only once 127.0.0.1 has actually connected to it', async () => {
+    const io = procTablesIo([], [V6_ANY_ROW], {
+      readLink: vi.fn(async (p: string) => {
+        if (p === '/proc/4242/fd/17') return 'socket:[666666]'
+        if (p === '/proc/4242/cwd') return '/home/dev/project-a'
+        return null
+      }),
+      connectLoopback: vi.fn().mockResolvedValue({ status: 'connected' }),
+    })
+    await expect(probeListenerEvidence(3000, io)).resolves.toMatchObject({ status: 'found', evidence: { id: '4242' } })
+  })
+
+  it('answers none for a :: listener that turns out to be IPv6-only', async () => {
+    const io = procTablesIo([], [V6_ANY_ROW], {
+      readLink: vi.fn(async (p: string) => (p === '/proc/4242/fd/17' ? 'socket:[666666]' : null)),
+      connectLoopback: vi.fn().mockResolvedValue({ status: 'refused' }),
     })
     await expect(probeListenerEvidence(3000, io)).resolves.toEqual({ status: 'none' })
   })

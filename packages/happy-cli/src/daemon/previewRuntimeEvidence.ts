@@ -29,9 +29,27 @@
  * `none`: a missing start time, an unreadable cwd, an unidentifiable listener
  * and a failed docker query are all missing evidence, and treating any of them
  * as absence would hand out a lease over a runtime nobody verified.
+ *
+ * **The listener must be the one the relay reaches.** Both proxies connect to
+ * exactly `127.0.0.1:{port}` (previewProxy.ts, previewWsProxy.ts), so the only
+ * evidence that counts is a socket that can accept that connection:
+ *
+ * - IPv4 `0.0.0.0` or `127.0.0.1` — accepts it by definition.
+ * - IPv6 `::` — accepts it only when the socket is dual-stack, and nothing in
+ *   `/proc/net/tcp6` or `lsof` says whether it is (measured: a Node
+ *   `listen(port)` and a `listen({host:'::', ipv6Only:true})` print the same
+ *   line). So a lone `::` listener is taken only after an actual connect to
+ *   127.0.0.1 succeeded; a refusal means nothing reaches the destination.
+ * - IPv6 `::1`, and any specific LAN address — never. A dev server bound to
+ *   `192.168.x.x:port` beside another on `127.0.0.1:port` is not an
+ *   ambiguity: only the loopback one is what the relay talks to.
+ *
+ * There is no fallback to another destination: if 127.0.0.1 cannot be proven,
+ * the answer is `none`/`ambiguous`/`unavailable`, never "try ::1 instead".
  */
 
 import crypto from 'node:crypto'
+import net from 'node:net'
 import { promises as fs } from 'node:fs'
 import { execFile } from 'node:child_process'
 
@@ -65,6 +83,13 @@ export type ExecResult =
   | { status: 'ok'; stdout: string }
   /** The binary is not installed — a definite answer, not a failure. */
   | { status: 'missing' }
+  | { status: 'failed'; detail: string; exitCode?: number; stderr?: string }
+
+/** Outcome of one TCP connect to `127.0.0.1:{port}` — the relay's destination. */
+export type ConnectResult =
+  | { status: 'connected' }
+  /** The kernel answered RST: nothing accepts on that address. */
+  | { status: 'refused' }
   | { status: 'failed'; detail: string }
 
 export interface EvidenceIo {
@@ -73,9 +98,19 @@ export interface EvidenceIo {
   readFile(path: string): Promise<string | null>
   readDir(path: string): Promise<string[] | null>
   readLink(path: string): Promise<string | null>
+  /**
+   * Reachability proof for a listener whose address family alone cannot
+   * prove it (see module doc). Always 127.0.0.1 — the destination is not a
+   * parameter, because the relay's is not either.
+   */
+  connectLoopback(port: number, timeoutMs: number): Promise<ConnectResult>
 }
 
 const EXEC_TIMEOUT_MS = 5_000
+const CONNECT_TIMEOUT_MS = 2_000
+
+/** The one address both preview proxies connect to. */
+export const RELAY_DESTINATION_HOST = '127.0.0.1'
 
 export function createEvidenceIo(): EvidenceIo {
   return {
@@ -88,15 +123,37 @@ export function createEvidenceIo(): EvidenceIo {
         }
         const code = (err as NodeJS.ErrnoException).code
         // ENOENT from execFile means the binary itself is absent; anything
-        // else means it ran and failed, which is not the same answer.
+        // else means it ran and failed, which is not the same answer. A
+        // numeric code is the process's own exit status (lsof uses 1 for
+        // "nothing matched"), kept apart from the free-text detail.
         resolve(code === 'ENOENT'
           ? { status: 'missing' }
-          : { status: 'failed', detail: (stderr || err.message).slice(0, 200) })
+          : {
+            status: 'failed',
+            detail: (stderr || err.message).slice(0, 200),
+            ...(typeof code === 'number' ? { exitCode: code } : {}),
+            stderr: (stderr ?? '').slice(0, 200),
+          })
       })
     }),
     readFile: async (p) => fs.readFile(p, 'utf-8').catch(() => null),
     readDir: async (p) => fs.readdir(p).catch(() => null),
     readLink: async (p) => fs.readlink(p).catch(() => null),
+    connectLoopback: (port, timeoutMs) => new Promise<ConnectResult>((resolve) => {
+      const socket = net.connect({ host: RELAY_DESTINATION_HOST, port })
+      const finish = (result: ConnectResult) => {
+        socket.removeAllListeners()
+        socket.destroy()
+        resolve(result)
+      }
+      socket.setTimeout(timeoutMs, () => finish({ status: 'failed', detail: `connect to ${RELAY_DESTINATION_HOST}:${port} timed out` }))
+      socket.once('connect', () => finish({ status: 'connected' }))
+      socket.once('error', (err: NodeJS.ErrnoException) => finish(
+        err.code === 'ECONNREFUSED'
+          ? { status: 'refused' }
+          : { status: 'failed', detail: `${err.code ?? 'error'}: ${err.message}`.slice(0, 200) },
+      ))
+    }),
   }
 }
 
@@ -116,12 +173,14 @@ export async function probeListenerEvidence(port: number, io: EvidenceIo): Promi
 }
 
 /**
- * A publish address the daemon's own `127.0.0.1:{port}` connection lands on.
- * Anything else — a container published on one specific LAN address — is not
- * what the relay talks to, so it can neither identify the port nor rule it
- * out; see `hostPortMatch`.
+ * A publish address the daemon's own `127.0.0.1:{port}` connection provably
+ * lands on. `[::]` is deliberately absent: whether docker's proxy socket on it
+ * takes IPv4 depends on its options, and the usual publish prints an IPv4
+ * half beside it anyway. `[::1]` and specific LAN addresses never reach.
+ * Anything not in this set can neither identify the port nor rule it out;
+ * see `hostPortMatch`.
  */
-const LOOPBACK_PUBLISH_ADDRESSES = new Set(['0.0.0.0', '127.0.0.1', '::', '[::]', '::1', '[::1]', ''])
+const IPV4_REACHABLE_PUBLISH_ADDRESSES = new Set(['0.0.0.0', '127.0.0.1'])
 
 export type HostPortMatch = 'loopback' | 'unreachable-address' | 'no-match'
 
@@ -136,7 +195,7 @@ export function hostPortMatch(ports: string, port: number): HostPortMatch {
     const match = mapping.trim().match(/^(.*):(\d+)->/)
     if (!match) continue
     if (Number.parseInt(match[2], 10) !== port) continue
-    if (LOOPBACK_PUBLISH_ADDRESSES.has(match[1].trim())) return 'loopback'
+    if (IPV4_REACHABLE_PUBLISH_ADDRESSES.has(match[1].trim())) return 'loopback'
     unreachable = true
   }
   return unreachable ? 'unreachable-address' : 'no-match'
@@ -220,9 +279,87 @@ async function probeListeningProcess(port: number, io: EvidenceIo): Promise<Evid
   return probeViaLsof(port, io)
 }
 
-/** `/proc/net/tcp` LISTEN rows: `st` is `0A`, the inode is column 9. */
-function listenInodesForPort(content: string, port: number): Set<string> {
-  const inodes = new Set<string>()
+/**
+ * How a LISTEN socket relates to the relay's destination.
+ * - `v4`: bound to 0.0.0.0 or 127.0.0.1 — accepts 127.0.0.1 by definition.
+ * - `v6-any`: bound to `::` — accepts 127.0.0.1 only if dual-stack, which
+ *   has to be proven by connecting.
+ * Everything else (::1, LAN addresses) is not a candidate at all.
+ */
+type DestinationClass = 'v4' | 'v6-any'
+
+interface DestinationOwners {
+  /** Processes holding a `v4` socket on the port. */
+  v4: Set<string>
+  /** Processes holding a `v6-any` socket on the port. */
+  v6Any: Set<string>
+  /** A candidate socket exists whose owning process could not be read. */
+  unowned: boolean
+}
+
+/**
+ * Decide which single process is the one `127.0.0.1:{port}` reaches, or why
+ * that cannot be said. Shared by the /proc and lsof probes so both platforms
+ * apply one rule.
+ */
+async function pickDestinationOwner(
+  owners: DestinationOwners,
+  port: number,
+  io: EvidenceIo,
+): Promise<{ status: 'found'; pid: string } | Exclude<EvidenceProbeResult, { status: 'found' }>> {
+  if (owners.unowned) {
+    // The socket exists — another user's process holds it, or its fds are
+    // not readable. Reporting "none" here would say nobody is listening on
+    // a port that is very much in use.
+    return { status: 'ambiguous', detail: `port ${port} is in LISTEN but no readable process owns the socket` }
+  }
+  if (owners.v4.size > 1) {
+    return { status: 'ambiguous', detail: `${owners.v4.size} processes listen on ${RELAY_DESTINATION_HOST}:${port}` }
+  }
+  if (owners.v4.size === 1) {
+    const [pid] = owners.v4
+    const others = [...owners.v6Any].filter((other) => other !== pid)
+    if (others.length > 0) {
+      // With SO_REUSEPORT both an IPv4 and a dual-stack `::` socket can be
+      // accepting 127.0.0.1; nothing here can say which one a connection
+      // lands on.
+      return {
+        status: 'ambiguous',
+        detail: `port ${port} has an IPv4 listener and another process's wildcard IPv6 listener; cannot tell which accepts ${RELAY_DESTINATION_HOST}`,
+      }
+    }
+    return { status: 'found', pid }
+  }
+  if (owners.v6Any.size === 0) return { status: 'none' }
+  if (owners.v6Any.size > 1) {
+    return { status: 'ambiguous', detail: `${owners.v6Any.size} processes hold a wildcard IPv6 listener on port ${port}` }
+  }
+  // A lone `::` listener. Dual-stack or v6-only is invisible in the tables;
+  // the only proof is the destination itself answering.
+  const reach = await io.connectLoopback(port, CONNECT_TIMEOUT_MS)
+  if (reach.status === 'connected') {
+    const [pid] = owners.v6Any
+    return { status: 'found', pid }
+  }
+  if (reach.status === 'refused') return { status: 'none' }
+  return { status: 'unavailable', detail: `could not prove ${RELAY_DESTINATION_HOST}:${port} reaches the IPv6 listener: ${reach.detail}` }
+}
+
+/** IPv4 in /proc is one little-endian 32-bit word; 0100007F is 127.0.0.1. */
+const PROC_V4_REACHABLE = new Set(['00000000', '0100007F'])
+const PROC_V6_ANY = '00000000000000000000000000000000'
+
+/**
+ * `/proc/net/tcp{,6}` LISTEN rows for the port: `st` is `0A`, the inode is
+ * column 9. Returns each candidate inode with its destination class; rows on
+ * addresses that cannot receive 127.0.0.1 are dropped here.
+ */
+export function listenSocketsForPort(
+  content: string,
+  port: number,
+  table: 'tcp' | 'tcp6',
+): Map<string, DestinationClass> {
+  const sockets = new Map<string, DestinationClass>()
   const wanted = port.toString(16).toUpperCase().padStart(4, '0')
   for (const line of content.split('\n').slice(1)) {
     const columns = line.trim().split(/\s+/)
@@ -230,75 +367,78 @@ function listenInodesForPort(content: string, port: number): Set<string> {
     const local = columns[1]
     const state = columns[3]
     if (state !== '0A') continue
-    if (!local || local.split(':')[1]?.toUpperCase() !== wanted) continue
-    inodes.add(columns[9])
+    const [address, localPort] = local?.split(':') ?? []
+    if (!address || localPort?.toUpperCase() !== wanted) continue
+    const upper = address.toUpperCase()
+    if (table === 'tcp' && PROC_V4_REACHABLE.has(upper)) sockets.set(columns[9], 'v4')
+    else if (table === 'tcp6' && upper === PROC_V6_ANY) sockets.set(columns[9], 'v6-any')
   }
-  return inodes
+  return sockets
 }
 
 async function probeViaProc(port: number, io: EvidenceIo): Promise<EvidenceProbeResult> {
-  const inodes = new Set<string>()
+  const sockets = new Map<string, DestinationClass>()
   const unread: string[] = []
-  for (const file of ['/proc/net/tcp', '/proc/net/tcp6']) {
-    const content = await io.readFile(file)
+  for (const table of ['tcp', 'tcp6'] as const) {
+    const content = await io.readFile(`/proc/net/${table}`)
     // `null` is a failed read; an empty string is a readable, empty table.
     if (content === null) {
-      unread.push(file)
+      unread.push(`/proc/net/${table}`)
       continue
     }
-    for (const inode of listenInodesForPort(content, port)) inodes.add(inode)
+    for (const [inode, klass] of listenSocketsForPort(content, port, table)) sockets.set(inode, klass)
   }
-  if (inodes.size === 0) {
+  if (sockets.size === 0) {
     // "No LISTEN row" is only an answer when every table was readable — a
-    // v6-bound dev server lives in exactly the file we may have missed.
+    // dual-stack dev server lives in exactly the file we may have missed.
     return unread.length === 0
       ? { status: 'none' }
       : { status: 'unavailable', detail: `could not read ${unread.join(', ')}` }
   }
 
-  const wanted = new Set([...inodes].map((inode) => `socket:[${inode}]`))
   const pids = await io.readDir('/proc')
   if (!pids) {
     return { status: 'ambiguous', detail: `port ${port} is in LISTEN but /proc could not be read` }
   }
 
-  const owners = new Set<string>()
+  const ownersByInode = new Map<string, Set<string>>()
+  const wanted = new Map([...sockets.keys()].map((inode) => [`socket:[${inode}]`, inode]))
   for (const entry of pids) {
     if (!/^\d+$/.test(entry)) continue
     const fds = await io.readDir(`/proc/${entry}/fd`)
     if (!fds) continue
     for (const fd of fds) {
       const target = await io.readLink(`/proc/${entry}/fd/${fd}`)
-      if (target && wanted.has(target)) {
-        owners.add(entry)
-        break
-      }
+      const inode = target ? wanted.get(target) : undefined
+      if (inode) ownersByInode.set(inode, new Set([...(ownersByInode.get(inode) ?? []), entry]))
     }
   }
 
-  if (owners.size === 0) {
-    // The socket exists — another user's process holds it, or its fds are not
-    // readable. Reporting "none" here would say nobody is listening on a port
-    // that is very much in use.
-    return {
-      status: 'ambiguous',
-      detail: `port ${port} is in LISTEN but no readable process owns the socket`,
+  const owners: DestinationOwners = { v4: new Set(), v6Any: new Set(), unowned: false }
+  for (const [inode, klass] of sockets) {
+    const holders = ownersByInode.get(inode)
+    if (!holders) {
+      owners.unowned = true
+      continue
     }
-  }
-  if (owners.size > 1) {
-    return { status: 'ambiguous', detail: `${owners.size} processes listen on port ${port}` }
+    // One socket shared by several processes (a pre-fork server) has no
+    // single runtime identity; every holder counts, and the picker reports
+    // more than one as ambiguous.
+    for (const pid of holders) (klass === 'v4' ? owners.v4 : owners.v6Any).add(pid)
   }
 
-  const pid = [...owners][0]
-  const startedAt = await readProcStartTime(pid, io)
-  const cwd = await io.readLink(`/proc/${pid}/cwd`)
+  const picked = await pickDestinationOwner(owners, port, io)
+  if (picked.status !== 'found') return picked
+
+  const startedAt = await readProcStartTime(picked.pid, io)
+  const cwd = await io.readLink(`/proc/${picked.pid}/cwd`)
   if (!startedAt || !cwd) {
     return {
       status: 'unavailable',
-      detail: `pid ${pid} holds port ${port} but its start time or cwd is unreadable`,
+      detail: `pid ${picked.pid} holds port ${port} but its start time or cwd is unreadable`,
     }
   }
-  return { status: 'found', evidence: { kind: 'process', id: pid, startedAt, cwd } }
+  return { status: 'found', evidence: { kind: 'process', id: picked.pid, startedAt, cwd } }
 }
 
 /**
@@ -324,28 +464,54 @@ function firstFieldValue(stdout: string, prefix: string): string | null {
   return null
 }
 
+/** lsof prints `*` for the wildcard address of either family. */
+const LSOF_V4_REACHABLE = new Set(['*', '0.0.0.0', '127.0.0.1'])
+
+/**
+ * `lsof -Fpnt` output: one `p<pid>` line, then `f`/`t`/`n` per socket fd.
+ * `t` is `IPv4`/`IPv6`, `n` is `<address>:<port>`. Classify each socket the
+ * same way the /proc probe does.
+ */
+export function listenOwnersFromLsof(stdout: string, port: number): DestinationOwners {
+  const owners: DestinationOwners = { v4: new Set(), v6Any: new Set(), unowned: false }
+  let pid: string | null = null
+  let type: string | null = null
+  for (const line of stdout.split('\n')) {
+    const key = line[0]
+    const value = line.slice(1).trim()
+    if (key === 'p') {
+      pid = value || null
+      type = null
+    } else if (key === 't') {
+      type = value
+    } else if (key === 'n' && pid) {
+      const separator = value.lastIndexOf(':')
+      if (separator === -1 || value.slice(separator + 1) !== String(port)) continue
+      const address = value.slice(0, separator)
+      if (type === 'IPv4' && LSOF_V4_REACHABLE.has(address)) owners.v4.add(pid)
+      else if (type === 'IPv6' && (address === '*' || address === '[::]')) owners.v6Any.add(pid)
+    }
+  }
+  return owners
+}
+
 async function probeViaLsof(port: number, io: EvidenceIo): Promise<EvidenceProbeResult> {
-  const listing = await io.exec('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpn'], EXEC_TIMEOUT_MS)
+  const listing = await io.exec('lsof', ['-nP', '-w', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpnt'], EXEC_TIMEOUT_MS)
+  if (listing.status === 'failed' && listing.exitCode === 1 && !(listing.stderr ?? '').trim()) {
+    // lsof's exit status for "no file matched": a readable answer of none.
+    return { status: 'none' }
+  }
   if (listing.status !== 'ok') {
     return {
       status: 'unavailable',
-      detail: `no usable listener probe on this platform (lsof ${listing.status})`,
+      detail: `no usable listener probe on this platform (lsof ${listing.status}${listing.status === 'failed' ? `: ${listing.detail}` : ''})`,
     }
   }
 
-  const pids = new Set<string>()
-  for (const line of listing.stdout.split('\n')) {
-    if (line.startsWith('p')) {
-      const pid = line.slice(1).trim()
-      if (pid) pids.add(pid)
-    }
-  }
-  if (pids.size === 0) return { status: 'none' }
-  if (pids.size > 1) {
-    return { status: 'ambiguous', detail: `${pids.size} processes listen on port ${port}` }
-  }
+  const picked = await pickDestinationOwner(listenOwnersFromLsof(listing.stdout, port), port, io)
+  if (picked.status !== 'found') return picked
 
-  const pid = [...pids][0]
+  const pid = picked.pid
   const started = await io.exec('ps', ['-o', 'lstart=', '-p', pid], EXEC_TIMEOUT_MS)
   const cwd = await io.exec('lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn'], EXEC_TIMEOUT_MS)
   const startedAt = started.status === 'ok' ? started.stdout.trim() : ''
