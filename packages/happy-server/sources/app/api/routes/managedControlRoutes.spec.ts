@@ -2479,6 +2479,135 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             })).revokedAt).toBeNull();
         });
 
+        it('hands a second tab a token for the same grant, without rotating it', async () => {
+            /*
+             * A browser loses its bearer on a reload, a new tab or a restart.
+             * Minting again is refused for the live family — and replacing it
+             * would kill the bearer the other tab is answering with. So the
+             * recovery is a read.
+             */
+            const { body } = await mintApproval();
+            const before = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: body.grantId as string },
+            });
+
+            const resolved = await call({
+                path: '/v1/managed/control/grants/approval/resolve',
+                op: 'approval-grant-resolve',
+                body: {
+                    scope: scope(),
+                    viewerAccountId: otherAccountId,
+                    requestedTokenExpiresAt: Date.now() + 60_000,
+                },
+                token: otherToken,
+            });
+            expect(resolved.statusCode).toBe(200);
+            expect(resolved.json().grantId).toBe(body.grantId);
+            expect(resolved.json().purpose).toBe('approval-control');
+            expect(resolved.json().viewerAccountId).toBe(otherAccountId);
+            expect(typeof resolved.json().token).toBe('string');
+            expect(await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: body.grantId as string },
+            })).toEqual(before);
+        });
+
+        it('never answers later than the grant itself', async () => {
+            await mintApproval();
+            const resolved = await call({
+                path: '/v1/managed/control/grants/approval/resolve',
+                op: 'approval-grant-resolve',
+                body: {
+                    scope: scope(),
+                    viewerAccountId: otherAccountId,
+                    requestedTokenExpiresAt: Date.now() + 10 * HOUR,
+                },
+                token: otherToken,
+            });
+            expect(resolved.statusCode).toBe(200);
+            expect(resolved.json().expiresAt).toBe(resolved.json().grantExpiresAt);
+        });
+
+        it('refuses to resolve a grant from a superseded attempt', async () => {
+            /*
+             * The one way this differs from reading a transcript: an approval
+             * names the run it answers for. Handing back a token minted for an
+             * attempt that has been replaced would let somebody answer a
+             * question nobody is still posing.
+             */
+            await mintApproval();
+            await modules.projection.syncRunAuthority({
+                body: {
+                    runId, workspaceId, accountId,
+                    currentAttemptId: 'attempt-2', cancelled: false,
+                },
+                expectedVersion: 1,
+                now: Date.now(),
+            });
+            const resolved = await call({
+                path: '/v1/managed/control/grants/approval/resolve',
+                op: 'approval-grant-resolve',
+                body: {
+                    scope: scope(),
+                    viewerAccountId: otherAccountId,
+                    requestedTokenExpiresAt: Date.now() + 60_000,
+                },
+                token: otherToken,
+            });
+            expect(resolved.statusCode).toBeGreaterThanOrEqual(400);
+        });
+
+        it('refuses to resolve what was withdrawn, and what never existed', async () => {
+            const missing = await call({
+                path: '/v1/managed/control/grants/approval/resolve',
+                op: 'approval-grant-resolve',
+                body: {
+                    scope: scope(),
+                    viewerAccountId: otherAccountId,
+                    requestedTokenExpiresAt: Date.now() + 60_000,
+                },
+                token: otherToken,
+            });
+            expect(missing.statusCode).toBe(404);
+
+            await mintApproval();
+            await call({
+                path: '/v1/managed/control/grants/approval/revoke',
+                op: 'approval-grant-revoke',
+                body: { scope: scope(), reason: 'approver-removed', viewerAccountId: otherAccountId },
+            });
+            const revoked = await call({
+                path: '/v1/managed/control/grants/approval/resolve',
+                op: 'approval-grant-resolve',
+                body: {
+                    scope: scope(),
+                    viewerAccountId: otherAccountId,
+                    requestedTokenExpiresAt: Date.now() + 60_000,
+                },
+                token: otherToken,
+            });
+            expect(revoked.statusCode).toBeGreaterThanOrEqual(400);
+        });
+
+        it('refuses a bearer that is not the approver, and an assertion signed to mint', async () => {
+            await mintApproval();
+            const body = {
+                scope: scope(),
+                viewerAccountId: otherAccountId,
+                requestedTokenExpiresAt: Date.now() + 60_000,
+            };
+            expect((await call({
+                path: '/v1/managed/control/grants/approval/resolve',
+                op: 'approval-grant-resolve',
+                body,
+            })).statusCode).toBe(403);
+            expect((await call({
+                path: '/v1/managed/control/grants/approval/resolve',
+                op: 'approval-grant-mint',
+                body,
+                token: otherToken,
+            })).statusCode).toBeGreaterThanOrEqual(400);
+        });
+
         it('refuses an assertion signed for withdrawing a reader', async () => {
             const { body } = await mintApproval();
             const response = await call({

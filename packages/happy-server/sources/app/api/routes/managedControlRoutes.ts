@@ -266,6 +266,20 @@ const approvalMintSchema = z.object({
  * find the runner's row, and the answer to "revoke this approver" would be
  * closing the run's own credential instead.
  */
+/**
+ * Reading a token back for an approval grant that already exists.
+ *
+ * The recovery path, and deliberately not a mint: a browser loses its bearer on
+ * a reload, a new tab or a restart, and minting again is refused for the live
+ * family — or, if it were allowed to replace it, would kill the bearer the
+ * other tab is answering with.
+ */
+const approvalResolveSchema = z.object({
+    scope: scopeSchema,
+    viewerAccountId: identifier,
+    requestedTokenExpiresAt: z.number().int().min(1),
+}).strict();
+
 const approvalRevokeSchema = z.object({
     scope: scopeSchema,
     reason: z.string().trim().min(1).max(200),
@@ -1208,6 +1222,79 @@ export function managedControlRoutes(
             purpose: bound.purpose,
             viewerAccountId: bound.viewerAccountId ?? null,
             idempotent: issued.idempotent,
+            serverUrl: runtime.publicUrl,
+        });
+    });
+
+    app.post('/v1/managed/control/grants/approval/resolve', {
+        onRequest: [app.authenticate, requireConfigured],
+        schema: { body: approvalResolveSchema },
+    }, async (request, reply) => {
+        const runtime = authorize(request as never, reply as never, 'approval-grant-resolve');
+        if (!runtime) return;
+        const scope = request.body.scope as ManagedScope;
+        // The approver's own bearer, as on the mint. Withdrawal is the one that
+        // relaxes this, because there the bearer may be gone by design.
+        if (request.body.viewerAccountId !== request.userId) {
+            return reply.code(403).send({ error: 'Bearer is not the approver of this scope' });
+        }
+
+        /*
+         * The same resolve the runner path uses, with the approval family's own
+         * axes. That matters here more than on the transcript side: an approval
+         * names the run it answers for, so the run axes are compared against
+         * the current authority and a grant from a superseded attempt is
+         * refused rather than handed back — answering a question nobody is
+         * still posing is the thing this whole purpose exists to prevent.
+         */
+        const resolved = await resolveSessionGrant({
+            scope,
+            requestedTokenExpiresAt: request.body.requestedTokenExpiresAt,
+            now: Date.now(),
+            purpose: 'approval-control',
+            viewerAccountId: request.body.viewerAccountId,
+        });
+        if (!resolved.ok) {
+            return reply.code(failureStatus(resolved.reason)).send({ error: resolved.reason });
+        }
+        const { grant, tokenExpiresAt } = resolved.resolved;
+        if (grant.workspaceId === null || grant.runId === null || grant.attemptId === null
+            || grant.epoch === null || grant.workspaceAuthorityVersion === null
+            || grant.runAuthorityVersion === null) {
+            // An approval grant without a run is not one.
+            return reply.code(409).send({ error: 'grant-not-run-scoped' });
+        }
+
+        const issuedAt = Date.now();
+        if (tokenExpiresAt <= issuedAt) return reply.code(403).send({ error: 'expired' });
+        const minted = await runtime.scopedTokens.mint({
+            v: 1,
+            grantId: grant.grantId,
+            accountId: grant.accountId,
+            sessionId: grant.sessionId,
+            tenantId: scope.tenantId,
+            projectId: scope.projectId,
+            workspaceId: grant.workspaceId,
+            runtimeId: scope.runtimeId,
+            runId: grant.runId,
+            attemptId: grant.attemptId,
+            epoch: grant.epoch,
+            workspaceAuthorityVersion: grant.workspaceAuthorityVersion,
+            runAuthorityVersion: grant.runAuthorityVersion,
+            expiresAt: tokenExpiresAt,
+            purpose: grant.purpose,
+            ...(grant.viewerAccountId ? { viewerAccountId: grant.viewerAccountId } : {}),
+        }, issuedAt);
+        if (!minted.ok) return reply.code(500).send({ error: 'Grant token could not be minted' });
+
+        return reply.send({
+            token: minted.token,
+            grantId: grant.grantId,
+            /** The token's own expiry, which may be earlier than the grant's. */
+            expiresAt: tokenExpiresAt,
+            grantExpiresAt: grant.expiresAt,
+            purpose: grant.purpose,
+            viewerAccountId: grant.viewerAccountId ?? null,
             serverUrl: runtime.publicUrl,
         });
     });

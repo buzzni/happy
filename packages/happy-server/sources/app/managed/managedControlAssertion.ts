@@ -106,14 +106,22 @@ export type ControlOperation =
      * approver's own bearer: the moment withdrawal matters most is the moment
      * that bearer is gone.
      */
-    | 'approval-grant-revoke';
+    | 'approval-grant-revoke'
+    /**
+     * Reads a token back for an approval grant that already exists.
+     *
+     * Its own operation for the same reason reading one back on the transcript
+     * side is: recovering a bearer must not be reachable by a signature that
+     * was authorised to issue a new grant, nor the reverse.
+     */
+    | 'approval-grant-resolve';
 
 export const CONTROL_OPERATIONS: readonly ControlOperation[] = [
     'authority-sync', 'authority-snapshot',
     'daemon-bootstrap', 'daemon-renew', 'daemon-resolve',
     'grant-mint', 'grant-renew', 'grant-resolve', 'grant-revoke',
     'read-grant-mint', 'read-grant-revoke', 'read-grant-resolve',
-    'approval-grant-mint', 'approval-grant-revoke',
+    'approval-grant-mint', 'approval-grant-revoke', 'approval-grant-resolve',
 ];
 
 export type ControlAssertionFailure =
