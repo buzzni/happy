@@ -1156,6 +1156,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Create claude loop
     const exitCode = await loop({
         path: workingDirectory,
+        sandboxPolicyMode,
         model: options.model,
         permissionMode: initialPermissionMode,
         startingMode: options.startingMode,

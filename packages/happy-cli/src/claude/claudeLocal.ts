@@ -16,6 +16,7 @@ import type { SandboxConfig } from "@/persistence";
 import { initializeSandbox, wrapCommand } from "@/sandbox/manager";
 import { filterCredentialsFromEnv } from "@/sandbox/config";
 import { MandatorySandboxError, resolveSandboxInitFailureAction, type SandboxPolicyMode } from "@/sandbox/sandboxPolicy";
+import { describeSandboxCapabilityFailure, verifySandboxExecutionCapability } from "@/sandbox/executionCapability";
 
 /**
  * Error thrown when the Claude process exits with a non-zero exit code.
@@ -328,6 +329,19 @@ export async function claudeLocal(opts: {
                                 ...spawnArgs.map((arg) => quoteShellArg(arg)),
                             ].join(' ');
 
+                            // 초기화 성공은 격리 성공의 증거가 아니다 — 비특권
+                            // 컨테이너에서는 감싼 자식이 namespace 생성에서 죽는다.
+                            // mandatory 머신에서는 자식을 띄우기 전에 확인한다.
+                            if (initFailureAction === 'abort') {
+                                const capability = await verifySandboxExecutionCapability();
+                                if (!capability.ok) {
+                                    throw new MandatorySandboxError(
+                                        'capability-unavailable',
+                                        describeSandboxCapabilityFailure(capability),
+                                    );
+                                }
+                            }
+
                             spawnCommand = await wrapCommand(fullCommand);
                             spawnWithShell = true;
 
@@ -347,10 +361,12 @@ export async function claudeLocal(opts: {
                             }
                             if (initFailureAction === 'abort') {
                                 // 공유 머신에서 비격리 child 를 띄우지 않는다.
-                                reject(new MandatorySandboxError(
-                                    'init-failed',
-                                    error instanceof Error ? error.message : String(error),
-                                ));
+                                reject(error instanceof MandatorySandboxError
+                                    ? error
+                                    : new MandatorySandboxError(
+                                        'init-failed',
+                                        error instanceof Error ? error.message : String(error),
+                                    ));
                                 return;
                             }
                             logger.warn('[ClaudeLocal] Failed to initialize sandbox; continuing without sandbox.', error);

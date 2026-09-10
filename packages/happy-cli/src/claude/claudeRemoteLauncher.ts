@@ -23,6 +23,7 @@ import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
+import { resolveClaudeRemoteSandbox } from '@/sandbox/claudeSdkSandbox';
 
 interface PermissionsField {
     date: number;
@@ -357,7 +358,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         },
                     } : undefined,
                     hookSettingsPath: session.hookSettingsPath,
-                    sandbox: session.checkpointComposition?.claudeSandbox,
+                    sandbox: resolveClaudeRemoteSandbox({
+                        checkpointSandbox: session.checkpointComposition?.claudeSandbox,
+                        sandboxConfig: session.sandboxConfig,
+                        sessionPath: session.path,
+                        policyMode: session.sandboxPolicyMode ?? 'owner-choice',
+                    }),
                     beforeTurn: session.checkpointComposition?.beforeTurn,
                     completeTurn: session.checkpointComposition?.completeTurn,
                     jsRuntime: session.jsRuntime,

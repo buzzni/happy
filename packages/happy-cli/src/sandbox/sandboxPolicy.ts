@@ -43,6 +43,7 @@ export type MandatorySandboxRefusalReason =
     | 'malformed-injection'
     | 'missing-config'
     | 'unsafe-write-scope'
+    | 'capability-unavailable'
     | 'init-failed';
 
 /** 같은 UID 사용자가 고칠 수 없어야 하므로 root 소유 경로에 둔다. */
