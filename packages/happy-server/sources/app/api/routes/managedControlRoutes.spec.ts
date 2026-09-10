@@ -2326,6 +2326,7 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
                 expiresAt: Date.now() + HOUR,
                 viewerAccountId: otherAccountId,
                 viewerDataEncryptionKey: envelope,
+                aclRevision: 1,
                 ...over,
             };
         }
@@ -2430,7 +2431,7 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
         it('withdraws an approver without that approver presenting anything', async () => {
             const { body } = await mintApproval();
             const revokeBody = {
-                scope: scope(), reason: 'approver-removed', viewerAccountId: otherAccountId,
+                scope: scope(), reason: 'approver-removed', viewerAccountId: otherAccountId, aclRevision: 1,
             };
             // The owner's bearer; the removed approver presents nothing.
             const revoked = await call({
@@ -2469,7 +2470,7 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             await call({
                 path: '/v1/managed/control/grants/approval/revoke',
                 op: 'approval-grant-revoke',
-                body: { scope: scope(), reason: 'approver-removed', viewerAccountId: otherAccountId },
+                body: { scope: scope(), reason: 'approver-removed', viewerAccountId: otherAccountId, aclRevision: 1 },
             });
             expect((await db.managedSessionGrant.findUniqueOrThrow({
                 where: { grantId: approval.grantId as string },
@@ -2497,6 +2498,7 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
                 body: {
                     scope: scope(),
                     viewerAccountId: otherAccountId,
+                    aclRevision: 1,
                     requestedTokenExpiresAt: Date.now() + 60_000,
                 },
                 token: otherToken,
@@ -2519,6 +2521,7 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
                 body: {
                     scope: scope(),
                     viewerAccountId: otherAccountId,
+                    aclRevision: 1,
                     requestedTokenExpiresAt: Date.now() + 10 * HOUR,
                 },
                 token: otherToken,
@@ -2549,6 +2552,7 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
                 body: {
                     scope: scope(),
                     viewerAccountId: otherAccountId,
+                    aclRevision: 1,
                     requestedTokenExpiresAt: Date.now() + 60_000,
                 },
                 token: otherToken,
@@ -2563,6 +2567,7 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
                 body: {
                     scope: scope(),
                     viewerAccountId: otherAccountId,
+                    aclRevision: 1,
                     requestedTokenExpiresAt: Date.now() + 60_000,
                 },
                 token: otherToken,
@@ -2573,7 +2578,7 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             await call({
                 path: '/v1/managed/control/grants/approval/revoke',
                 op: 'approval-grant-revoke',
-                body: { scope: scope(), reason: 'approver-removed', viewerAccountId: otherAccountId },
+                body: { scope: scope(), reason: 'approver-removed', viewerAccountId: otherAccountId, aclRevision: 1 },
             });
             const revoked = await call({
                 path: '/v1/managed/control/grants/approval/resolve',
@@ -2581,6 +2586,7 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
                 body: {
                     scope: scope(),
                     viewerAccountId: otherAccountId,
+                    aclRevision: 1,
                     requestedTokenExpiresAt: Date.now() + 60_000,
                 },
                 token: otherToken,
@@ -2593,6 +2599,7 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             const body = {
                 scope: scope(),
                 viewerAccountId: otherAccountId,
+                aclRevision: 1,
                 requestedTokenExpiresAt: Date.now() + 60_000,
             };
             expect((await call({
@@ -2613,7 +2620,7 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             const response = await call({
                 path: '/v1/managed/control/grants/approval/revoke',
                 op: 'read-grant-revoke',
-                body: { scope: scope(), reason: 'wrong-op', viewerAccountId: otherAccountId },
+                body: { scope: scope(), reason: 'wrong-op', viewerAccountId: otherAccountId, aclRevision: 1 },
             });
             expect(response.statusCode).toBeGreaterThanOrEqual(400);
             expect((await db.managedSessionGrant.findUniqueOrThrow({

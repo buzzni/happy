@@ -1683,6 +1683,156 @@ describe.skipIf(!enabled)('managed session grants (real PostgreSQL)', () => {
         });
     });
 
+    describe('an approver removed and re-added during the same run', () => {
+        /*
+         * The transcript side's problem, sharper.
+         *
+         * An approval family carries the **run**, so a member removed and
+         * re-added while that run is still going finds a family identical to
+         * the one their removal tombstoned. Without a generation, the person
+         * who was just given access back cannot approve anything on the run
+         * they were given access to, and no call can fix it: the tombstone is
+         * the last word and clearing it would revive the withdrawn bearer.
+         */
+        const ENVELOPE = Buffer.concat([Buffer.from([0]), Buffer.alloc(104, 5)]).toString('base64');
+        const APPROVER = 'company-approver-9';
+
+        function approvalAt(revision: number, over: Record<string, unknown> = {}) {
+            return grants.issueSessionGrant({
+                scope: scope() as never,
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: NOW + HOUR,
+                now: NOW,
+                purpose: 'approval-control',
+                viewerAccountId: APPROVER,
+                viewerDataEncryptionKey: ENVELOPE,
+                aclRevision: revision,
+                ...over,
+            } as Parameters<typeof grants.issueSessionGrant>[0]);
+        }
+
+        function revokeAt(revision: number, reason = 'member-removed', now = NOW) {
+            return grants.revokeSessionGrant({
+                scope: scope() as never,
+                reason,
+                now,
+                purpose: 'approval-control',
+                viewerAccountId: APPROVER,
+                aclRevision: revision,
+            });
+        }
+
+        function claimsFor(grant: { grantId: string; accountId: string; sessionId: string; expiresAt: number }) {
+            const s = scope();
+            return {
+                v: 1 as const,
+                grantId: grant.grantId,
+                accountId: grant.accountId,
+                sessionId: grant.sessionId,
+                tenantId: s.tenantId,
+                projectId: s.projectId,
+                workspaceId: s.workspaceId,
+                runtimeId: s.runtimeId,
+                runId: s.runId,
+                attemptId: s.attemptId,
+                epoch: s.epoch,
+                workspaceAuthorityVersion: s.workspaceAuthorityVersion,
+                runAuthorityVersion: s.runAuthorityVersion,
+                purpose: 'approval-control' as const,
+                viewerAccountId: APPROVER,
+                expiresAt: grant.expiresAt,
+            };
+        }
+
+        it('root: refuses resolving an approval generation superseded without a revoke', async () => {
+            /*
+             * Folded from root's fixture, assertions unchanged.
+             *
+             * No withdrawal here — the family of the older generation is still
+             * live. Reading a token back from it hands the caller something the
+             * authorization path refuses on its first use, so the refusal
+             * belongs where the caller can act on it.
+             */
+            expect((await approvalAt(1)).ok).toBe(true);
+            expect((await approvalAt(2)).ok).toBe(true);
+            expect(await grants.resolveSessionGrant({
+                scope: scope(), purpose: 'approval-control', viewerAccountId: APPROVER,
+                aclRevision: 1, requestedTokenExpiresAt: NOW + 1000, now: NOW,
+            } as never)).toEqual({ ok: false, reason: 'revision-stale' });
+        });
+
+        it('can approve again on the same run, and the withdrawn bearer cannot', async () => {
+            const first = await approvalAt(1);
+            expect(first.ok).toBe(true);
+            if (!first.ok) return;
+            const oldClaims = claimsFor(first.grant);
+            expect((await grants.resolveLiveGrant({ claims: oldClaims, now: NOW })).ok).toBe(true);
+
+            expect(await revokeAt(1)).toMatchObject({ ok: true, state: 'revoked' });
+
+            // Re-added under the next generation, on the same run.
+            const rejoined = await approvalAt(2);
+            expect(rejoined.ok).toBe(true);
+            if (!rejoined.ok) return;
+            expect(rejoined.grant.grantId).not.toBe(first.grant.grantId);
+            expect((await grants.resolveLiveGrant({ claims: claimsFor(rejoined.grant), now: NOW })).ok)
+                .toBe(true);
+
+            // And the bearer the removal withdrew stays withdrawn.
+            expect(await grants.resolveLiveGrant({ claims: oldClaims, now: NOW }))
+                .toEqual({ ok: false, reason: 'revoked' });
+        });
+
+        it('stops the older generation\'s bearer even when the removal never arrived', async () => {
+            /*
+             * The parent moving on is enough. This is the case where the
+             * withdrawal is lost in flight: nothing revoked the first grant,
+             * and it still stops.
+             */
+            const first = await approvalAt(1);
+            expect(first.ok).toBe(true);
+            if (!first.ok) return;
+            const oldClaims = claimsFor(first.grant);
+
+            expect((await approvalAt(2)).ok).toBe(true);
+            expect(await grants.resolveLiveGrant({ claims: oldClaims, now: NOW }))
+                .toEqual({ ok: false, reason: 'revoked' });
+        });
+
+        it('refuses a removal that arrives after the re-add, and leaves the new grant alone', async () => {
+            expect((await approvalAt(1)).ok).toBe(true);
+            expect(await revokeAt(1)).toMatchObject({ ok: true });
+            const rejoined = await approvalAt(2);
+            expect(rejoined.ok).toBe(true);
+            if (!rejoined.ok) return;
+
+            // The late one, still naming the generation it was issued for.
+            expect(await revokeAt(1, 'late-removal', NOW + 1))
+                .toEqual({ ok: false, reason: 'revision-stale' });
+            const live = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: rejoined.grant.grantId },
+            });
+            expect(live.revokedAt).toBeNull();
+            expect((await grants.resolveLiveGrant({ claims: claimsFor(rejoined.grant), now: NOW })).ok)
+                .toBe(true);
+        });
+
+        it('refuses a mint from a generation that has been superseded', async () => {
+            // The late ACK of a mint the parent has since moved past.
+            expect((await approvalAt(2)).ok).toBe(true);
+            expect(await approvalAt(1)).toEqual({ ok: false, reason: 'revision-stale' });
+        });
+
+        it('does not spend a generation on an approval it refused', async () => {
+            // An expiry in the past is refused after the generation is compared
+            // and before it is spent; the parent's real generation still mints.
+            expect(await approvalAt(9, { expiresAt: NOW - 1 }))
+                .toEqual({ ok: false, reason: 'already-expired' });
+            expect((await approvalAt(1)).ok).toBe(true);
+        });
+    });
+
     describe('an access list that changes, and messages that arrive late', () => {
         const ENVELOPE = Buffer.concat([
             Buffer.from([0]), Buffer.alloc(104, 3),

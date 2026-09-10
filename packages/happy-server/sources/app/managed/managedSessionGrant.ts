@@ -100,6 +100,20 @@ export function deriveGrantFamily(
      * runner, which has no viewer.
      */
     viewerAccountId?: string,
+    /**
+     * The generation of the parent's access list this grant belongs to.
+     *
+     * The same axis the transcript side uses, for the same reason and now on
+     * the same key: a withdrawal tombstones a family, and without a generation
+     * that tombstone is the last word. On the transcript side that meant a
+     * re-added member could never be issued anything again. Here it is sharper,
+     * because an approval family also carries the run: a member removed and
+     * re-added **during the same run** would find the same family, tombstoned,
+     * and could never approve on the run they were just given access to.
+     *
+     * Absent on a runner, which has no viewer and no access list.
+     */
+    aclRevision?: number,
 ): string {
     if (purpose !== 'runner') {
         return canonicalDigest({
@@ -112,6 +126,7 @@ export function deriveGrantFamily(
             accountId: scope.accountId,
             purpose,
             viewerAccountId: viewerAccountId ?? null,
+            aclRevision: aclRevision ?? null,
         });
     }
     return canonicalDigest({
@@ -154,7 +169,13 @@ export type GrantIssueFailure =
     | 'already-expired'
     /** An approver who is not the owner cannot answer without their own key. */
     | 'viewer-envelope-required'
-    | 'viewer-envelope-malformed';
+    | 'viewer-envelope-malformed'
+    /**
+     * The request names an access-list generation older than one already
+     * applied here. Refused rather than honoured: a late mint would restore
+     * access a newer removal ended.
+     */
+    | 'revision-stale';
 
 export type GrantRenewFailure =
     | 'grant-mismatch'
@@ -175,10 +196,11 @@ export type GrantCheckFailure =
     | 'session-owner-changed'
     | 'claims-mismatch';
 
-export type RevokeFailure = 'run-unknown' | 'binding-mismatch';
+export type RevokeFailure = 'run-unknown' | 'binding-mismatch' | 'revision-stale';
 
 export type GrantResolveFailure =
     | ScopeMismatch
+    | 'revision-stale'
     | 'grant-unknown'
     | 'revoked'
     | 'expired'
@@ -233,6 +255,8 @@ type GrantRow = {
     purpose: string;
     viewerAccountId?: string | null;
     viewerDataEncryptionKey?: Uint8Array | null;
+    /** The access-list generation, on the purposes that have a viewer. */
+    aclRevision?: number | null;
 };
 
 type AuthorityRow = {
@@ -349,9 +373,12 @@ function compareStoredGrant(
      * envelope on that row is sealed for a single account.
      */
     viewerAccountId?: string | null,
+    /** Part of the family since the generation axis exists; see it there. */
+    aclRevision?: number | null,
 ): 'mismatch' | null {
     if (readStoredPurpose(grant.purpose) !== purpose) return 'mismatch';
     if ((grant.viewerAccountId ?? null) !== (viewerAccountId ?? null)) return 'mismatch';
+    if ((grant.aclRevision ?? null) !== (aclRevision ?? null)) return 'mismatch';
     if (grant.sessionId !== scope.sessionId
         || grant.accountId !== scope.accountId
         || grant.workspaceId !== scope.workspaceId
@@ -362,7 +389,9 @@ function compareStoredGrant(
         || grant.runAuthorityVersion !== scope.runAuthorityVersion) {
         return 'mismatch';
     }
-    if (grant.family !== deriveGrantFamily(scope, purpose, viewerAccountId ?? undefined)) return 'mismatch';
+    if (grant.family !== deriveGrantFamily(
+        scope, purpose, viewerAccountId ?? undefined, aclRevision ?? undefined,
+    )) return 'mismatch';
     return null;
 }
 
@@ -384,6 +413,12 @@ export type IssueGrantInput = {
      */
     viewerAccountId?: string;
     viewerDataEncryptionKey?: string;
+    /**
+     * The access-list generation this grant belongs to, on the purposes that
+     * have a viewer. Required in practice by every viewer-scoped caller: see
+     * `deriveGrantFamily`.
+     */
+    aclRevision?: number;
 };
 
 /**
@@ -408,7 +443,7 @@ async function issueSessionGrantOnce(
     input: IssueGrantInput,
 ): Promise<GrantResult<GrantIssueFailure>> {
     const purpose = input.purpose ?? 'runner';
-    const family = deriveGrantFamily(input.scope, purpose, input.viewerAccountId);
+    const family = deriveGrantFamily(input.scope, purpose, input.viewerAccountId, input.aclRevision);
     const digest = canonicalDigest({
         scope: input.scope,
         grantId: input.grantId,
@@ -443,7 +478,27 @@ async function issueSessionGrantOnce(
         }
     }
 
+    /*
+     * A viewer-scoped grant belongs to a generation of the parent's access
+     * list, and the generation is part of its family. Without it, a member
+     * removed and re-added **during the same run** finds the family their
+     * removal tombstoned and can never approve again on the run they were just
+     * given access to — the run axes make the family identical.
+     */
+    const aclKey: AclKey | null = purpose !== 'runner' && input.viewerAccountId && input.aclRevision !== undefined
+        ? {
+            sessionId: input.scope.sessionId,
+            viewerAccountId: input.viewerAccountId,
+            aclRevision: input.aclRevision,
+        }
+        : null;
+
     return inTx(async (tx) => {
+        // Compared before anything else, and spent only at the write below: a
+        // request refused further down must not burn the generation.
+        if (aclKey && !await aclRevisionIsCurrent(tx, aclKey)) {
+            return { ok: false, reason: 'revision-stale' as const };
+        }
         const authority = await tx.managedRunAuthority.findUnique({
             where: { runId: input.scope.runId },
             include: AUTHORITY_INCLUDE,
@@ -510,6 +565,7 @@ async function issueSessionGrantOnce(
             if (input.grantId === existingFamily.grantId) {
                 return { ok: false, reason: 'grant-id-reused' };
             }
+            if (aclKey) await advanceAclRevision(tx, aclKey, input.now);
             const nextSeq = existingFamily.renewalSeq + 1;
             if (nextSeq > MAX_RENEWAL_SEQ) return { ok: false, reason: 'sequence-exhausted' };
             const replaced = await tx.managedSessionGrant.updateMany({
@@ -559,6 +615,7 @@ async function issueSessionGrantOnce(
             return { ok: true, grant: toLiveGrant(row), idempotent: false };
         }
 
+        if (aclKey) await advanceAclRevision(tx, aclKey, input.now);
         const created = await tx.managedSessionGrant.create({
             data: {
                 grantId: input.grantId,
@@ -567,6 +624,7 @@ async function issueSessionGrantOnce(
                 accountId: input.scope.accountId,
                 purpose,
                 ...(input.viewerAccountId ? { viewerAccountId: input.viewerAccountId } : {}),
+                ...(input.aclRevision === undefined ? {} : { aclRevision: input.aclRevision }),
                 viewerDataEncryptionKey: approverEnvelope,
                 workspaceId: input.scope.workspaceId,
                 runId: input.scope.runId,
@@ -615,8 +673,10 @@ export async function renewSessionGrant(input: {
     purpose?: SessionScopedPurpose;
     /** The approver or viewer the grant was resealed for, when it has one. */
     viewerAccountId?: string;
+    /** The access-list generation, on the purposes that have a viewer. */
+    aclRevision?: number;
 }): Promise<GrantResult<GrantRenewFailure>> {
-    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner', input.viewerAccountId);
+    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner', input.viewerAccountId, input.aclRevision);
 
     return inTx(async (tx) => {
         const authority = await tx.managedRunAuthority.findUnique({
@@ -723,6 +783,8 @@ export async function revokeSessionGrant(input: {
     purpose?: SessionScopedPurpose;
     /** The approver or viewer the grant was resealed for, when it has one. */
     viewerAccountId?: string;
+    /** The access-list generation, on the purposes that have a viewer. */
+    aclRevision?: number;
 }): Promise<RevokeResult> {
     return retryOnUniqueRace(
         () => revokeSessionGrantOnce(input),
@@ -738,10 +800,29 @@ async function revokeSessionGrantOnce(input: {
     now: number;
     purpose?: SessionScopedPurpose;
     viewerAccountId?: string;
+    aclRevision?: number;
 }): Promise<RevokeResult> {
-    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner', input.viewerAccountId);
+    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner', input.viewerAccountId, input.aclRevision);
+    /*
+     * A withdrawal belongs to a generation too, and a stale one must not reach
+     * the family a **newer** decision opened: a removal that overtook nothing
+     * on the way out but arrives after the member was re-added would end the
+     * access the re-add granted, with nothing telling the parent it had been
+     * undone.
+     */
+    const aclKey: AclKey | null = (input.purpose ?? 'runner') !== 'runner'
+        && input.viewerAccountId && input.aclRevision !== undefined
+        ? {
+            sessionId: input.scope.sessionId,
+            viewerAccountId: input.viewerAccountId,
+            aclRevision: input.aclRevision,
+        }
+        : null;
 
     return inTx(async (tx) => {
+        if (aclKey && !await aclRevisionIsCurrent(tx, aclKey)) {
+            return { ok: false as const, reason: 'revision-stale' as const };
+        }
         const grant = await tx.managedSessionGrant.findUnique({ where: { family } });
         if (grant) {
             // The derivation already ties the family to this scope; this catches
@@ -762,6 +843,7 @@ async function revokeSessionGrantOnce(input: {
                     alreadyRevoked: true,
                 };
             }
+            if (aclKey) await advanceAclRevision(tx, aclKey, input.now);
             await tx.managedSessionGrant.update({
                 where: { family },
                 data: {
@@ -773,10 +855,13 @@ async function revokeSessionGrantOnce(input: {
             return { ok: true, state: 'revoked', alreadyRevoked: false };
         }
 
+        if (aclKey) await advanceAclRevision(tx, aclKey, input.now);
         await tx.managedSessionGrant.create({
             data: {
                 grantId: `tombstone:${family}`,
                 family,
+                ...(input.aclRevision === undefined ? {} : { aclRevision: input.aclRevision }),
+                ...(input.viewerAccountId ? { viewerAccountId: input.viewerAccountId } : {}),
                 // The full signed scope, so the tombstone is the same shape as
                 // the grant it prevents rather than a blank placeholder.
                 sessionId: input.scope.sessionId,
@@ -942,7 +1027,7 @@ export async function resolveLiveGrant(input: {
         // this token says it is. Without it a read token carried a runner row's
         // authority, and a runner token would have been accepted against a read
         // row just as readily.
-        if (compareStoredGrant(grant, scope, claims.purpose, claims.viewerAccountId)) {
+        if (compareStoredGrant(grant, scope, claims.purpose, claims.viewerAccountId, grant.aclRevision)) {
             return { ok: false, reason: 'claims-mismatch' };
         }
 
@@ -962,6 +1047,34 @@ export async function resolveLiveGrant(input: {
         if (!session) return { ok: false, reason: 'session-unknown' };
         if (session.accountId !== claims.accountId) {
             return { ok: false, reason: 'session-owner-changed' };
+        }
+
+        /*
+         * And the access list, for a bearer that has a viewer.
+         *
+         * An approval grant is issued to a person, and that person's access can
+         * end while the run continues. The check is the same one the transcript
+         * side makes and it lives here for the same reason: it holds when the
+         * withdrawal never arrives, because the parent moving to a new
+         * generation is enough to stop every bearer below it.
+         */
+        if (grant.viewerAccountId) {
+            const mark = await tx.managedReadAclWatermark.findUnique({
+                where: {
+                    sessionId_viewerAccountId: {
+                        sessionId: grant.sessionId,
+                        viewerAccountId: grant.viewerAccountId,
+                    },
+                },
+            });
+            if (mark) {
+                // A row from before this axis existed carries no generation,
+                // and a mark means generations are in play for this pair.
+                if (grant.aclRevision === null || grant.aclRevision === undefined) {
+                    return { ok: false, reason: 'revoked' };
+                }
+                if (grant.aclRevision < mark.revision) return { ok: false, reason: 'revoked' };
+            }
         }
 
         return { ok: true, grant: toLiveGrant(grant) };
@@ -1052,6 +1165,8 @@ export type ResolveGrantInput = {
      * The family carries it, so resolving without it looks for a different row.
      */
     viewerAccountId?: string;
+    /** The access-list generation, for the same reason. */
+    aclRevision?: number;
 };
 
 export type ResolvedGrant = {
@@ -1083,9 +1198,31 @@ export type ResolveGrantResult =
 export async function resolveSessionGrant(
     input: ResolveGrantInput,
 ): Promise<ResolveGrantResult> {
-    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner', input.viewerAccountId);
+    const family = deriveGrantFamily(input.scope, input.purpose ?? 'runner', input.viewerAccountId, input.aclRevision);
+    /*
+     * A viewer-scoped resolve is answered against the access list too.
+     *
+     * The family of a superseded generation can still be perfectly live — the
+     * withdrawal may not have arrived, or may never — and reading a token back
+     * from it hands the caller something the authorization path will refuse on
+     * its first use. Answering "stale" is the same fact, said where the caller
+     * can act on it.
+     */
+    const aclKey: AclKey | null = (input.purpose ?? 'runner') !== 'runner'
+        && input.viewerAccountId && input.aclRevision !== undefined
+        ? {
+            sessionId: input.scope.sessionId,
+            viewerAccountId: input.viewerAccountId,
+            aclRevision: input.aclRevision,
+        }
+        : null;
 
     return inTx(async (tx) => {
+        // In the same transaction as the row it is about: a mark read outside
+        // it could move between the two reads.
+        if (aclKey && !await aclRevisionIsCurrent(tx, aclKey)) {
+            return { ok: false, reason: 'revision-stale' as const };
+        }
         const authority = await tx.managedRunAuthority.findUnique({
             where: { runId: input.scope.runId },
             include: AUTHORITY_INCLUDE,
@@ -1108,7 +1245,7 @@ export async function resolveSessionGrant(
         // The row must be the one this exact scope was issued for. Without this
         // an authority advance leaves an old row that the fresh scope still
         // finds, and the answer would mix an old grant with a new DTO.
-        if (compareStoredGrant(grant, input.scope, input.purpose ?? 'runner', input.viewerAccountId)) {
+        if (compareStoredGrant(grant, input.scope, input.purpose ?? 'runner', input.viewerAccountId, input.aclRevision)) {
             return { ok: false, reason: 'grant-stale' };
         }
 
@@ -1244,7 +1381,16 @@ export const MANAGED_READ_GRANT_MAX_TTL_MS = 15 * 60_000;
  * Equal is allowed. A retry of the current generation — a lost response, a
  * second browser tab — is the same request again, not a new one.
  */
-async function readAclMark(tx: Tx, scope: ManagedReadScope): Promise<number | null> {
+/**
+ * The (session, viewer, generation) triple the access-list mark is keyed by.
+ *
+ * Both viewer-scoped purposes share it: reading a transcript and approving on a
+ * run are two things one access list decides, and an ACL change that ends one
+ * ends the other. A runner has no viewer and never reaches this.
+ */
+type AclKey = { sessionId: string; viewerAccountId: string; aclRevision: number };
+
+async function readAclMark(tx: Tx, scope: AclKey): Promise<number | null> {
     const mark = await tx.managedReadAclWatermark.findUnique({
         where: {
             sessionId_viewerAccountId: {
@@ -1262,7 +1408,7 @@ async function readAclMark(tx: Tx, scope: ManagedReadScope): Promise<number | nu
  * Equal is allowed: a retry of the current generation — a lost response, a
  * second browser tab — is the same request again, not a new one.
  */
-async function aclRevisionIsCurrent(tx: Tx, scope: ManagedReadScope): Promise<boolean> {
+async function aclRevisionIsCurrent(tx: Tx, scope: AclKey): Promise<boolean> {
     const mark = await readAclMark(tx, scope);
     return mark === null || scope.aclRevision >= mark;
 }
@@ -1278,7 +1424,7 @@ async function aclRevisionIsCurrent(tx: Tx, scope: ManagedReadScope): Promise<bo
  * locked out until somebody guessed a higher number. A generation counts only
  * what was actually issued or withdrawn.
  */
-async function advanceAclRevision(tx: Tx, scope: ManagedReadScope, now: number): Promise<void> {
+async function advanceAclRevision(tx: Tx, scope: AclKey, now: number): Promise<void> {
     const mark = await readAclMark(tx, scope);
     if (mark === null) {
         await tx.managedReadAclWatermark.create({

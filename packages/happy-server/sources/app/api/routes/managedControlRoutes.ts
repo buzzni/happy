@@ -255,6 +255,14 @@ const approvalMintSchema = z.object({
     expiresAt: z.number().int().min(1),
     /** The Happy account that will answer. */
     viewerAccountId: identifier,
+    /**
+     * The generation of the parent's access list this grant belongs to.
+     *
+     * Required. It is part of the family, and without it a member removed and
+     * re-added during the same run finds the family their removal tombstoned —
+     * an approval family carries the run, so the two are identical.
+     */
+    aclRevision: z.number().int().min(0),
     /** The session key resealed for that account, base64. Required unless it owns the session. */
     viewerDataEncryptionKey: z.string().min(1).optional(),
 }).strict();
@@ -277,6 +285,8 @@ const approvalMintSchema = z.object({
 const approvalResolveSchema = z.object({
     scope: scopeSchema,
     viewerAccountId: identifier,
+    /** The generation the caller believes is current; see the mint. */
+    aclRevision: z.number().int().min(0),
     requestedTokenExpiresAt: z.number().int().min(1),
 }).strict();
 
@@ -284,6 +294,13 @@ const approvalRevokeSchema = z.object({
     scope: scopeSchema,
     reason: z.string().trim().min(1).max(200),
     viewerAccountId: identifier,
+    /**
+     * The generation this withdrawal belongs to.
+     *
+     * Compared, so a removal that arrives after the member was re-added is
+     * refused rather than ending the access the re-add granted.
+     */
+    aclRevision: z.number().int().min(0),
 }).strict();
 
 /**
@@ -1181,6 +1198,7 @@ export function managedControlRoutes(
             now,
             purpose: 'approval-control',
             viewerAccountId: request.body.viewerAccountId,
+            aclRevision: request.body.aclRevision,
             ...(request.body.viewerDataEncryptionKey
                 ? { viewerDataEncryptionKey: request.body.viewerDataEncryptionKey }
                 : {}),
@@ -1253,6 +1271,7 @@ export function managedControlRoutes(
             now: Date.now(),
             purpose: 'approval-control',
             viewerAccountId: request.body.viewerAccountId,
+            aclRevision: request.body.aclRevision,
         });
         if (!resolved.ok) {
             return reply.code(failureStatus(resolved.reason)).send({ error: resolved.reason });
@@ -1319,6 +1338,7 @@ export function managedControlRoutes(
             now: Date.now(),
             purpose: 'approval-control',
             viewerAccountId: request.body.viewerAccountId,
+            aclRevision: request.body.aclRevision,
         });
         if (!result.ok) return reply.code(failureStatus(result.reason)).send({ error: result.reason });
         return reply.send({ state: result.state, alreadyRevoked: result.alreadyRevoked });
