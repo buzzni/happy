@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { reportSandboxDependencyPreflight } from './dependencyPreflight';
+import {
+    reportSandboxDependencyPreflight,
+    reportSandboxExecutionPreflight,
+} from './dependencyPreflight';
 
 // 2026-08-28 프로덕션 — 이 머신에 socat 이 없어 bwrap 초기화가 실패했고, 그 사실이
 // AgentTask 워커가 실제로 뜰 때까지 드러나지 않았다. 증상은 몇 분 뒤 exec_command
@@ -71,4 +74,73 @@ describe('reportSandboxDependencyPreflight', () => {
     expect(ok).toBe(true);
     expect(logs.join('\n')).toContain('boom');
   });
+});
+
+describe('reportSandboxExecutionPreflight', () => {
+    // 개인 머신에 없던 기동 비용을 넣지 않는다.
+    it('does nothing on an owner-choice machine', async () => {
+        const initialize = vi.fn();
+        const logs: string[] = [];
+
+        const ok = await reportSandboxExecutionPreflight({
+            policyMode: 'owner-choice',
+            initialize,
+            verify: async () => ({ ok: true }),
+            log: (message) => logs.push(message),
+        });
+
+        expect(ok).toBe(true);
+        expect(initialize).not.toHaveBeenCalled();
+        expect(logs).toEqual([]);
+    });
+
+    it('reports a verified sandbox on a mandatory machine and cleans up', async () => {
+        const cleanup = vi.fn(async () => {});
+        const logs: string[] = [];
+
+        const ok = await reportSandboxExecutionPreflight({
+            policyMode: 'mandatory',
+            initialize: async () => cleanup,
+            verify: async () => ({ ok: true }),
+            log: (message) => logs.push(message),
+        });
+
+        expect(ok).toBe(true);
+        expect(cleanup).toHaveBeenCalledTimes(1);
+        expect(logs.join('\n')).toContain('verified');
+    });
+
+    // 이 로그가 활성화 판단의 근거다 — 원인을 그대로 남긴다.
+    it('names a namespace denial so the machine is not declared ready', async () => {
+        const logs: string[] = [];
+
+        const ok = await reportSandboxExecutionPreflight({
+            policyMode: 'mandatory',
+            initialize: async () => async () => {},
+            verify: async () => ({
+                ok: false,
+                reason: 'namespace-denied',
+                detail: 'bwrap: Creating new namespace failed: Operation not permitted',
+            }),
+            log: (message) => logs.push(message),
+        });
+
+        expect(ok).toBe(false);
+        expect(logs.join('\n')).toContain('namespace');
+    });
+
+    // 진단이 데몬 기동을 막지 않는다.
+    it('does not throw when initialization itself fails', async () => {
+        const logs: string[] = [];
+
+        const ok = await reportSandboxExecutionPreflight({
+            policyMode: 'mandatory',
+            initialize: async () => { throw new Error('bwrap not installed'); },
+            verify: async () => ({ ok: true }),
+            log: (message) => logs.push(message),
+        });
+
+        expect(ok).toBe(false);
+        expect(logs.join('\n')).toContain('bwrap not installed');
+    });
 });

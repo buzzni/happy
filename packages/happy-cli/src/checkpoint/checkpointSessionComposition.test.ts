@@ -252,6 +252,64 @@ describe('createCheckpointSessionComposition', () => {
         await result.completeTurn(async () => {});
     });
 
+
+    // Astra P1 (2026-09-10): checkpoint 세션은 policy 인자 없이 runtime 설정을 만들어
+    // 기본 owner-choice 로 떨어졌다. 런처가 checkpoint 설정을 그대로 반환하고 실제
+    // 실행도 initialTurn.claudeSandbox 를 우선하므로, 여기서 floor 가 빠지면 공유
+    // 머신 checkpoint remote 세션에 신뢰 경계가 아예 없다.
+    it('applies the mandatory trust floor to the initial turn and to every rotation', async () => {
+        const { configuration } = await import('@/configuration');
+        const result = await createCheckpointSessionComposition({
+            provider: 'claude-remote',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-1',
+            sandboxConfig: SandboxConfigSchema.parse({
+                checkpointProtection: protection,
+                denyReadPaths: [],
+            }),
+            env: contextEnv(),
+            checkpointEvents,
+            sandboxPolicyMode: 'mandatory',
+        });
+        if (!result.beforeTurn || !result.completeTurn) throw new Error('expected protected turn lifecycle');
+
+        expect(result.claudeSandbox?.filesystem?.denyRead).toContain(configuration.daemonHappyHomeDir);
+        expect(result.claudeSandbox?.filesystem?.denyWrite).toContain(configuration.daemonHappyHomeDir);
+        expect(result.claudeSandbox?.failIfUnavailable).toBe(true);
+        expect(result.claudeSandbox?.allowUnsandboxedCommands).toBe(false);
+
+        // 턴이 회전하면 설정이 새로 만들어진다 — 거기서 floor 가 떨어지면 안 된다.
+        const first = await result.beforeTurn();
+        expect(first.claudeSandbox?.filesystem?.denyRead).toContain(configuration.daemonHappyHomeDir);
+        await result.completeTurn(async () => {});
+        const second = await result.beforeTurn();
+
+        expect(second.providerPath).not.toBe(first.providerPath);
+        expect(result.claudeSandbox?.filesystem?.denyRead).toContain(configuration.daemonHappyHomeDir);
+        expect(result.claudeSandbox?.filesystem?.allowWrite).toContain(second.providerPath);
+        await result.completeTurn(async () => {});
+    });
+
+    it('leaves a personal machine checkpoint session unchanged', async () => {
+        const { configuration } = await import('@/configuration');
+        const result = await createCheckpointSessionComposition({
+            provider: 'claude-remote',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-1',
+            sandboxConfig: SandboxConfigSchema.parse({
+                checkpointProtection: protection,
+                denyReadPaths: [],
+            }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+
+        expect(result.claudeSandbox?.filesystem?.denyRead)
+            .not.toContain(configuration.daemonHappyHomeDir);
+    });
+
     it('records a daemon-readable pending decision when policy drift blocks dispatch', async () => {
         const result = await createCheckpointSessionComposition({
             provider: 'codex',
