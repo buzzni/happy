@@ -41,17 +41,29 @@ describe('runAutonomousQualityGatePhase', () => {
 
     it('kills the whole process group on timeout', async () => {
         const cwd = await mkdtemp(join(process.cwd(), '.happy-gate-runner-'));
+        let childPid = 0;
         try {
+            // Allow login-shell startup before the timeout. An empty tail
+            // becomes PID 0 (our process group), so require a real child PID.
+            // Check liveness immediately: polling could hide late cleanup.
             const result = await runAutonomousQualityGatePhase(
-                phase("trap '' TERM; sleep 30 & child=$!; printf \"$child\"; wait", 100),
+                phase("trap '' TERM; sleep 30 & child=$!; printf \"$child\"; wait", 2_000),
                 { cwd, killGraceMs: 50 },
             );
 
+            const parsedPid = Number(result.stdoutTail);
+            if (/^\d+$/.test(result.stdoutTail) && Number.isSafeInteger(parsedPid) && parsedPid > 0) {
+                childPid = parsedPid;
+            }
             expect(result).toMatchObject({ status: 'timed-out', timedOut: true, exitCode: null });
-            const childPid = Number(result.stdoutTail);
-            expect(Number.isInteger(childPid)).toBe(true);
+            expect(result.stdoutTail).toMatch(/^\d+$/);
+            expect(childPid).toBeGreaterThan(0);
             expect(() => process.kill(childPid, 0)).toThrow();
         } finally {
+            // A failed assertion above must not leave a 30s sleep behind.
+            if (childPid > 0) {
+                try { process.kill(childPid, 'SIGKILL'); } catch { /* already gone */ }
+            }
             await rm(cwd, { recursive: true, force: true });
         }
     });
