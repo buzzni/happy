@@ -1,4 +1,4 @@
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import type { SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime';
@@ -10,6 +10,18 @@ import {
     sandboxTrustFloorPaths,
     type SandboxPolicyMode,
 } from './sandboxPolicy';
+
+/**
+ * $HOME 은 spawn 페이로드로 올 수 있으므로 floor 기준으로 쓸 수 없다.
+ * passwd 항목을 먼저 보고, 그것을 못 읽는 환경에서만 homedir() 로 물러난다.
+ */
+function trustedHomeDir(): string {
+    try {
+        return userInfo().homedir || homedir();
+    } catch {
+        return homedir();
+    }
+}
 
 function expandPath(pathValue: string, sessionPath: string): string {
     const expandedHome = pathValue.replace(/^~(?=\/|$)/, homedir());
@@ -148,7 +160,14 @@ export function buildSandboxRuntimeConfig(
             `쓰기 범위가 파일시스템/홈 루트입니다: ${allowWrite.join(', ')}`,
         );
     }
-    const floor = mandatory ? sandboxTrustFloorPaths(configuration.machineHappyHomeDir) : [];
+    const floor = mandatory
+        ? sandboxTrustFloorPaths({
+            homeDir: trustedHomeDir(),
+            // 이 프로세스의 happyHomeDir 은 staged /tmp 홈일 수 있다. 그건
+            // 세션 자신의 것이므로 floor 로 가리지 않는다 — 데몬의 홈만 덮는다.
+            daemonHappyHomeDir: configuration.daemonHappyHomeDir,
+        })
+        : [];
 
     return {
         allowPty: true,

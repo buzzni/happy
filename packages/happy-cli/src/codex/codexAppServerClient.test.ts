@@ -681,7 +681,7 @@ describe('CodexAppServerClient sandbox integration', () => {
 
         await client.connect();
 
-        expect(mockInitializeSandbox).toHaveBeenCalledWith(sandboxConfig, process.cwd());
+        expect(mockInitializeSandbox).toHaveBeenCalledWith(sandboxConfig, process.cwd(), 'owner-choice');
         expect(mockWrapForMcpTransport).toHaveBeenCalledWith('codex', ['app-server', '--listen', 'stdio://']);
         expect(mockSpawn).toHaveBeenCalledWith(
             'sh',

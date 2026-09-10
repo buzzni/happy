@@ -796,7 +796,11 @@ export class CodexAppServerClient {
 
         if (this.sandboxConfig?.enabled && process.platform !== 'win32') {
             try {
-                this.sandboxCleanup = await initializeSandbox(this.sandboxConfig, process.cwd());
+                this.sandboxCleanup = await initializeSandbox(
+                    this.sandboxConfig,
+                    process.cwd(),
+                    this.sandboxPolicyMode,
+                );
                 const wrapped = await wrapForMcpTransport('codex', args);
                 command = wrapped.command;
                 args = wrapped.args;

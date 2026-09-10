@@ -388,6 +388,7 @@ describe('claudeLocal --continue handling', () => {
         expect(mockInitializeSandbox).toHaveBeenCalledWith(
             expect.objectContaining({ enabled: true }),
             '/tmp/workspace',
+            'owner-choice',
         );
         expect(mockWrapCommand).toHaveBeenCalledWith(expect.stringContaining('--dangerously-skip-permissions'));
         expect(mockSpawn).toHaveBeenCalledWith(

@@ -313,7 +313,11 @@ export async function claudeLocal(opts: {
                         logger.warn('[ClaudeLocal] Sandbox is not supported on Windows; continuing without sandbox.');
                     } else {
                         try {
-                            cleanupSandbox = await initializeSandbox(opts.sandboxConfig, opts.path);
+                            cleanupSandbox = await initializeSandbox(
+                                opts.sandboxConfig,
+                                opts.path,
+                                opts.sandboxPolicyMode ?? 'owner-choice',
+                            );
 
                             if (!spawnArgs.includes('--dangerously-skip-permissions')) {
                                 spawnArgs = [...spawnArgs, '--dangerously-skip-permissions'];

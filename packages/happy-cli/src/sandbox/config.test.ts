@@ -302,8 +302,8 @@ describe('buildSandboxRuntimeConfig on a mandatory machine', () => {
             'mandatory',
         );
 
-        expect(built.filesystem.denyRead).toContain(configuration.machineHappyHomeDir);
-        expect(built.filesystem.denyWrite).toContain(configuration.machineHappyHomeDir);
+        expect(built.filesystem.denyRead).toContain(configuration.daemonHappyHomeDir);
+        expect(built.filesystem.denyWrite).toContain(configuration.daemonHappyHomeDir);
         // 세션이 옮겨 쓰는 HAPPY_HOME_DIR 을 가리면 자기 자격증명까지 가려진다.
         expect(built.filesystem.denyRead).not.toContain(configuration.happyHomeDir);
     });
@@ -316,7 +316,7 @@ describe('buildSandboxRuntimeConfig on a mandatory machine', () => {
         );
 
         expect(built.filesystem.denyRead).toContain(resolveLikeRuntime('~/.ssh'));
-        expect(built.filesystem.denyRead).toContain(configuration.machineHappyHomeDir);
+        expect(built.filesystem.denyRead).toContain(configuration.daemonHappyHomeDir);
     });
 
     // allowWrite 가 '/' 나 홈 루트면 floor 밖의 다른 사용자 워크스페이스와

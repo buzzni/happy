@@ -13,7 +13,7 @@ import { logger } from '@/ui/logger';
 import { installBroadKillShims } from '@/utils/broadKillShims';
 import { Credentials, readSettings } from '@/persistence';
 import { resolveSessionSandboxConfig } from '@/sandbox/resolveSessionSandboxConfig';
-import { resolveSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
+import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { initialMachineMetadata } from '@/daemon/run';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
@@ -178,7 +178,7 @@ export async function runCodex(opts: {
     // daemon 이 서버 지시대로 넘긴 설정(AgentTask pr_review 의 networkMode:'allowed' 등)을
     // 로컬 머신 설정보다 우선한다. 이 배선이 없어서 agent=codex 워커가 샌드박스 없이 떴고,
     // Codex 네이티브 readOnly 정책으로 떨어져 lifecycle 콜백을 전부 놓쳤다.
-    const sandboxPolicyMode = resolveSandboxPolicyMode(settings);
+    const sandboxPolicyMode = resolveSessionSandboxPolicyMode(process.env);
     const sandboxConfig = resolveSessionSandboxConfig({
         noSandbox: Boolean(opts.noSandbox),
         env: process.env,
