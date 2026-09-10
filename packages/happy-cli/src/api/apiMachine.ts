@@ -1358,6 +1358,32 @@ export class ApiMachineClient {
      * only way happy-server can tell an enforcing daemon apart from one that
      * silently ignored the binding fields.
      */
+    /**
+     * Same binding gate as the HTTP relay: a tunnel is a relayed request too,
+     * and leaving it unchecked would make the upgrade path the way around the
+     * binding.
+     */
+    private async openPreviewWsTunnel(params: any): Promise<any> {
+        const binding = await this.enforcePreviewBinding(params?.binding, params?.port);
+        if (binding.outcome === 'rejected') {
+            logger.debug(`[API MACHINE] proxy-ws-open refused: ${binding.code} ${binding.message}`);
+            // The WS open ack is `{ok, code, message}` — not the HTTP relay's
+            // `{type}` envelope (openPreviewWsTunnel reads `ok`).
+            return { ok: false, code: binding.code, message: binding.message };
+        }
+        const opened = await this.previewWsProxy!.open(params);
+        // The echo rides along only on a tunnel that actually opened —
+        // happy-server reads `ok` first, and a refusal carrying an
+        // enforcement flag would be a confusing thing to log.
+        return binding.outcome === 'enforced' && opened?.ok === true
+            ? { ...opened, bindingEnforced: true }
+            : opened;
+    }
+
+    private closePreviewWsTunnel(tunnelId: string | undefined): void {
+        this.previewWsProxy?.close(tunnelId as string);
+    }
+
     private async relayPreviewBoundHttp(params: any): Promise<any> {
         if (params?.binding === undefined || params?.binding === null) {
             return {
@@ -2305,32 +2331,13 @@ export class ApiMachineClient {
             },
         );
         this.socket.on('proxy-ws-open', async (params, ack) => {
-            // Same binding gate as the HTTP relay: a tunnel is a relayed
-            // request too, and leaving it unchecked would make the upgrade
-            // path the way around the binding.
-            const binding = await this.enforcePreviewBinding(params?.binding, params?.port);
-            if (binding.outcome === 'rejected') {
-                logger.debug(`[API MACHINE] proxy-ws-open refused: ${binding.code} ${binding.message}`);
-                // The WS open ack is `{ok, code, message}` — not the HTTP
-                // relay's `{type}` envelope (openPreviewWsTunnel reads `ok`).
-                ack({ ok: false, code: binding.code, message: binding.message });
-                return;
-            }
-            const opened = await this.previewWsProxy!.open(params);
-            // The echo rides along only on a tunnel that actually opened —
-            // happy-server reads `ok` first, and a refusal carrying an
-            // enforcement flag would be a confusing thing to log.
-            ack(
-                binding.outcome === 'enforced' && opened?.ok === true
-                    ? { ...opened, bindingEnforced: true }
-                    : opened,
-            );
+            ack(await this.openPreviewWsTunnel(params));
         });
         this.socket.on('proxy-ws-data', (payload) => {
             this.previewWsProxy?.data(payload);
         });
         this.socket.on('proxy-ws-close', (payload) => {
-            this.previewWsProxy?.close(payload?.tunnelId);
+            this.closePreviewWsTunnel(payload?.tunnelId);
         });
 
         // specs/remote-terminal/ Phase 2 — interactive PTY relay.
