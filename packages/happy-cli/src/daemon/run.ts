@@ -34,6 +34,7 @@ import {
   PersistedTrackedSession,
   readDaemonState,
   acquireDaemonLock,
+  readDaemonLockHolderPid,
   releaseDaemonLock,
   isPidAlive,
   readPersistedSessions,
@@ -52,7 +53,7 @@ import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
 import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
 import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
-import { shouldYieldDaemonStateOwnership } from './daemonStateOwnership';
+import { resolveDaemonStateOwnership } from './daemonStateOwnership';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
 import { statSync } from 'fs';
@@ -3012,13 +3013,30 @@ export async function startDaemon(): Promise<void> {
       // Before wrecklessly overriting the daemon state file, we should check if we are the ones who own it
       // Race condition is possible, but thats okay for the time being :D
       const daemonState = await readDaemonState();
-      if (shouldYieldDaemonStateOwnership({
+      const lockHolderPid = readDaemonLockHolderPid();
+      const ownership = resolveDaemonStateOwnership({
         recordedPid: daemonState?.pid,
         ownPid: process.pid,
+        lockHolderPid,
         isProcessAlive: isPidAlive,
-      })) {
+      });
+      if (ownership.reason === 'foreign-daemon' || ownership.reason === 'foreign-without-lock') {
+        // Whoever wrote the file is not us — say exactly what we saw, so the next
+        // person reading this log does not have to correlate timestamps by hand.
+        logger.debug(`[DAEMON RUN] daemon.state.json is owned by another process (${ownership.reason})`, {
+          recordedPid: daemonState?.pid,
+          lockHolderPid,
+          ownPid: process.pid,
+          startedWithCliVersion: daemonState?.startedWithCliVersion,
+          httpPort: daemonState?.httpPort,
+          daemonLogPath: daemonState?.daemonLogPath,
+        });
+      }
+      if (ownership.yield) {
         logger.debug('[DAEMON RUN] Somehow a different daemon was started without killing us. We should kill ourselves.')
         requestShutdown('exception', 'A different daemon was started without killing us. We should kill ourselves.')
+      } else if (ownership.reason === 'foreign-without-lock') {
+        logger.debug('[DAEMON RUN] daemon.state.json was overwritten by a non-daemon process while we hold the daemon lock; reclaiming it on this heartbeat')
       }
 
       // Heartbeat
