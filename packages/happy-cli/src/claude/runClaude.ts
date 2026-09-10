@@ -313,6 +313,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         projectPath: workingDirectory,
         sessionId: response.id,
         sandboxConfig,
+        sandboxPolicyMode,
         env: process.env,
         checkpointEvents,
     });

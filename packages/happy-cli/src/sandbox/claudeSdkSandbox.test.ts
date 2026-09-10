@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { configuration } from '@/configuration';
+import { resolveSandboxTrustFloor } from './config';
 import type { SandboxConfig } from '@/persistence';
 import {
     buildClaudeRemoteSandboxSettings,
@@ -91,7 +92,15 @@ describe('buildClaudeRemoteSandboxSettings', () => {
 describe('resolveClaudeRemoteSandbox', () => {
     // checkpoint 보호 세션은 자기 workspace 경로로 이미 만들어 둔 설정이 있다.
     it('keeps a checkpoint-built sandbox as is', () => {
-        const checkpointSandbox = { enabled: true, failIfUnavailable: true } as const;
+        const checkpointSandbox = {
+            enabled: true,
+            failIfUnavailable: true,
+            filesystem: {
+                denyRead: resolveSandboxTrustFloor(),
+                allowWrite: ['/tmp/session-a'],
+                denyWrite: resolveSandboxTrustFloor(),
+            },
+        };
 
         expect(resolveClaudeRemoteSandbox({
             checkpointSandbox,
@@ -103,6 +112,41 @@ describe('resolveClaudeRemoteSandbox', () => {
 
     // 이 계약이 핵심이다: mandatory 머신에서 enabled 인 세션이 경계 없이 remote 로
     // 뜨면 bypassPermissions 만 켜진 세션이 된다.
+
+    // 근본 원인은 composition 에 policy 를 넘기는 것으로 고쳤다. 이 확인은 그 전달이
+    // 다시 끊겼을 때 조용히 무경계로 돌아가지 않게 하는 가드다.
+    it('refuses a checkpoint sandbox that lost the mandatory floor', () => {
+        expect(() => resolveClaudeRemoteSandbox({
+            checkpointSandbox: {
+                enabled: true,
+                failIfUnavailable: true,
+                filesystem: { denyRead: [], allowWrite: ['/tmp/session-a'], denyWrite: [] },
+            },
+            sandboxConfig: config(),
+            sessionPath: '/tmp/session-a',
+            policyMode: 'mandatory',
+        })).toThrow(/missing-floor/);
+    });
+
+    it('accepts a checkpoint sandbox that carries the floor', () => {
+        const checkpointSandbox = {
+            enabled: true,
+            failIfUnavailable: true,
+            filesystem: {
+                denyRead: resolveSandboxTrustFloor(),
+                allowWrite: ['/tmp/session-a'],
+                denyWrite: resolveSandboxTrustFloor(),
+            },
+        };
+
+        expect(resolveClaudeRemoteSandbox({
+            checkpointSandbox,
+            sandboxConfig: config(),
+            sessionPath: '/tmp/session-a',
+            policyMode: 'mandatory',
+        })).toBe(checkpointSandbox);
+    });
+
     it('never returns an empty sandbox for an enabled session on a mandatory machine', () => {
         const settings = resolveClaudeRemoteSandbox({
             checkpointSandbox: undefined,
@@ -145,14 +189,22 @@ describe('resolveClaudeRemoteSandbox', () => {
 });
 
 describe('buildMandatoryRemoteDenyRules', () => {
-    // SDK sandbox 는 Bash 경계다. Read/Edit/Write 같은 도구가 floor 경로를 직접
-    // 읽거나 쓰는 경로는 CLI 권한 규칙으로 막는다.
-    it('denies read and write tools on every floor path for a mandatory session', () => {
+    // Claude 권한 규칙에서 절대경로는 `//` 로 시작한다. 단일 `/` 는 설정 파일 기준
+    // 상대경로라, 지금까지의 규칙은 보호하려던 경로를 가리키지 않았다.
+    it('writes absolute paths with the // prefix', () => {
         const rules = buildMandatoryRemoteDenyRules('mandatory');
+        const floor = configuration.daemonHappyHomeDir;
+        const absolute = floor.replace(/^\/+/, '');
 
-        expect(rules).toContain(`Read(${configuration.daemonHappyHomeDir}/**)`);
-        expect(rules).toContain(`Edit(${configuration.daemonHappyHomeDir}/**)`);
-        expect(rules).toContain(`Write(${configuration.daemonHappyHomeDir}/**)`);
+        expect(rules).toContain(`Read(//${absolute}/**)`);
+        expect(rules).toContain(`Edit(//${absolute}/**)`);
+        expect(rules).not.toContain(`Read(${floor}/**)`);
+    });
+
+    // Write(path) 는 파일 권한 판정에 쓰이지 않는다 — Edit 규칙이 쓰기를 덮는다.
+    it('does not emit unsupported Write rules', () => {
+        expect(buildMandatoryRemoteDenyRules('mandatory').some((rule) => rule.startsWith('Write(')))
+            .toBe(false);
     });
 
     it('adds nothing on a personal machine', () => {

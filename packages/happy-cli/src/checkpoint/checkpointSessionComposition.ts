@@ -4,6 +4,7 @@ import { mkdir, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { SandboxConfig } from '@/persistence';
 import { buildSandboxRuntimeConfig } from '@/sandbox/config';
+import type { SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import type { QueryOptions } from '@/claude/sdk';
 import { createCheckpointRuntime } from './checkpointRuntime';
 import { readCheckpointSpawnContext } from './checkpointSpawnContext';
@@ -40,7 +41,15 @@ export async function createCheckpointSessionComposition(input: {
     sandboxConfig: SandboxConfig | undefined;
     env: Record<string, string | undefined>;
     checkpointEvents?: Pick<CheckpointEventPublisher, 'snapshot'>;
+    /**
+     * 생략하면 개인 머신(owner-choice). 이 값이 빠지면 checkpoint 세션의 runtime
+     * 설정이 기본 owner-choice 로 만들어져 공유 머신 신뢰 floor 가 통째로 빠진다
+     * — 런처가 checkpoint 설정을 그대로 쓰고 실제 실행도 턴 설정을 우선하므로,
+     * 이 인자가 그 경로의 유일한 전달 지점이다.
+     */
+    sandboxPolicyMode?: SandboxPolicyMode;
 }): Promise<CheckpointSessionComposition> {
+    const policyMode: SandboxPolicyMode = input.sandboxPolicyMode ?? 'owner-choice';
     const inputSandboxConfig = input.sandboxConfig;
     const protection = inputSandboxConfig?.checkpointProtection;
     if (!protection) return { sandboxConfig: input.sandboxConfig };
@@ -103,7 +112,9 @@ export async function createCheckpointSessionComposition(input: {
         ])],
     });
     const claudeSandboxFor = (config: SandboxConfig, path: string): QueryOptions['sandbox'] => {
-        const sandboxRuntime = buildSandboxRuntimeConfig(config, path);
+        // 최초 생성과 턴 회전이 같은 함수를 지나므로, 여기 policy 를 넣으면 두 경로가
+        // 함께 floor 와 쓰기 범위 검사를 받는다.
+        const sandboxRuntime = buildSandboxRuntimeConfig(config, path, policyMode);
         return {
             enabled: true,
             failIfUnavailable: true,

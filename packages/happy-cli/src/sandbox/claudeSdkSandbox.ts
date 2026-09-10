@@ -69,7 +69,19 @@ export function resolveClaudeRemoteSandbox(input: {
     sessionPath: string;
     policyMode: SandboxPolicyMode;
 }): SandboxSettings | undefined {
-    if (input.checkpointSandbox) return input.checkpointSandbox;
+    if (input.checkpointSandbox) {
+        // checkpoint composition 이 policy 를 받아 floor 를 얹었는지 확인한다.
+        // 그 전달이 끊기면 여기서 조용히 무경계 설정이 나가고, 실제 실행은 턴
+        // 설정을 우선하므로 런처 쪽 보완으로는 덮이지 않는다.
+        if (input.policyMode === 'mandatory') {
+            const denyRead = input.checkpointSandbox.filesystem?.denyRead ?? [];
+            const missing = resolveSandboxTrustFloor().filter((path) => !denyRead.includes(path));
+            if (missing.length > 0) {
+                throw new MandatorySandboxError('missing-floor', missing.join(', '));
+            }
+        }
+        return input.checkpointSandbox;
+    }
     return buildClaudeRemoteSandboxSettings({
         sandboxConfig: input.sandboxConfig,
         sessionPath: input.sessionPath,
@@ -80,16 +92,21 @@ export function resolveClaudeRemoteSandbox(input: {
 /**
  * SDK sandbox 와 함께 내려보내는 CLI 권한 deny 규칙.
  *
- * sandbox 설정의 filesystem 은 주로 Bash 실행 경계에 걸린다. Read/Edit/Write
- * 도구가 같은 경로를 직접 다루는 길은 CLI 권한 규칙으로 막아야 두 층이 맞는다.
+ * sandbox 설정의 filesystem 은 주로 Bash 실행 경계에 걸린다. Read/Edit 도구가
+ * 같은 경로를 직접 다루는 길은 CLI 권한 규칙으로 막아야 두 층이 맞는다.
+ *
+ * 문법: Claude 권한 규칙에서 **절대경로는 `//` 로 시작**한다. 단일 `/` 로 시작하면
+ * 설정 파일 기준 상대경로로 해석돼 보호하려던 경로를 가리키지 않는다. 쓰기는
+ * `Edit` 규칙이 덮으며 `Write(path)` 는 파일 권한 판정에 쓰이지 않는다.
+ * (https://code.claude.com/docs/en/permissions#read-and-edit)
+ *
  * 이것이 OS 경계는 아니다 — 도구 레벨 거부이며, 프로세스 전체 경계는 여전히
  * 자식을 감싸야 얻는다.
  */
 export function buildMandatoryRemoteDenyRules(policyMode: SandboxPolicyMode): string[] {
     if (policyMode !== 'mandatory') return [];
-    return resolveSandboxTrustFloor().flatMap((path) => [
-        `Read(${path}/**)`,
-        `Edit(${path}/**)`,
-        `Write(${path}/**)`,
-    ]);
+    return resolveSandboxTrustFloor().flatMap((path) => {
+        const absolute = path.replace(/\/+$/, '').replace(/^\/+/, '');
+        return [`Read(//${absolute}/**)`, `Edit(//${absolute}/**)`];
+    });
 }

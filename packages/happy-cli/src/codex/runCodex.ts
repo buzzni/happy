@@ -254,6 +254,7 @@ export async function runCodex(opts: {
             projectPath: process.cwd(),
             sessionId: response.id,
             sandboxConfig,
+            sandboxPolicyMode,
             env: process.env,
             checkpointEvents: sandboxConfig?.checkpointProtection
                 ? createCheckpointEventPublisher({
