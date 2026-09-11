@@ -10,9 +10,12 @@ afterEach(async () => {
   cleanups.length = 0;
 });
 
-async function upstream(options: { stallInitialize?: boolean } = {}) {
+async function upstream(options: { stallInitialize?: boolean; deferInitialize?: boolean } = {}) {
   const streams = new Set<ServerResponse>();
   let requests = 0;
+  let initializeRequests = 0;
+  let releaseInitialize: () => void = () => {};
+  const initializeGate = new Promise<void>(resolve => { releaseInitialize = resolve; });
   const server = createServer(async (req, res) => {
     if (req.method === 'GET') {
       streams.add(res);
@@ -26,7 +29,9 @@ async function upstream(options: { stallInitialize?: boolean } = {}) {
     const message = JSON.parse(body);
     if (message.id === undefined) { res.writeHead(202).end(); return; }
     requests++;
+    if (message.method === 'initialize') initializeRequests++;
     if (message.method === 'initialize' && options.stallInitialize) return;
+    if (message.method === 'initialize' && options.deferInitialize) await initializeGate;
     const result = message.method === 'initialize'
       ? { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'fixture', version: '1' } }
       : { tools: [{ name: 'fixture-tool', description: 'test', inputSchema: { type: 'object' } }] };
@@ -36,13 +41,15 @@ async function upstream(options: { stallInitialize?: boolean } = {}) {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   cleanups.push(async () => {
+    releaseInitialize();
     for (const stream of streams) stream.end();
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
   });
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('Missing address');
-  return { url: `http://127.0.0.1:${address.port}/mcp`, streams, requests: () => requests };
+  return { url: `http://127.0.0.1:${address.port}/mcp`, streams, requests: () => requests,
+    initializeRequests: () => initializeRequests, releaseInitialize };
 }
 
 function bridge(url: string, packaged = false) {
@@ -68,7 +75,7 @@ async function initialize(b: ReturnType<typeof bridge>) {
   b.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {
     protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '1' },
   } });
-  await expect.poll(b.output).toContain('"id":1');
+  await expect.poll(b.output, { timeout: 10_000 }).toContain('"id":1');
   b.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
   b.send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
   await expect.poll(b.output).toContain('fixture-tool');
@@ -78,14 +85,30 @@ function isRunning(child: ChildProcessWithoutNullStreams) {
   return child.exitCode === null && child.signalCode === null;
 }
 
-describe('Happy MCP bridge process lifetime', () => {
+describe('Happy MCP bridge process lifetime', { timeout: 15_000 }, () => {
+  it('shares one upstream initialization across concurrent first tool requests', async () => {
+    const http = await upstream({ deferInitialize: true });
+    const b = bridge(http.url);
+    b.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+      protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '1' },
+    } });
+    await expect.poll(b.output, { timeout: 10_000 }).toContain('"id":1');
+    b.child.stdin.write([2, 3, 4].map(id => JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/list' })).join('\n') + '\n');
+    await expect.poll(http.initializeRequests, { timeout: 10_000 }).toBeGreaterThanOrEqual(1);
+    http.releaseInitialize();
+    await expect.poll(() => b.output().split('\n').filter(Boolean).map(line => JSON.parse(line))
+      .filter(message => [2, 3, 4].includes(message.id) && message.result?.tools?.[0]?.name === 'fixture-tool').length).toBe(3);
+    expect(http.initializeRequests()).toBe(1);
+    await expect.poll(() => http.streams.size).toBe(1);
+  });
+
   it('exits on EOF before opening any upstream connection', async () => {
     const http = await upstream();
     const b = bridge(http.url);
     b.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {
       protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '1' },
     } });
-    await expect.poll(b.output).toContain('"id":1');
+    await expect.poll(b.output, { timeout: 10_000 }).toContain('"id":1');
     b.child.stdin.end();
     await expect.poll(() => isRunning(b.child)).toBe(false);
     expect(b.child.exitCode).toBe(0);
@@ -119,7 +142,7 @@ describe('Happy MCP bridge process lifetime', () => {
     b.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {
       protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '1' },
     } });
-    await expect.poll(b.output).toContain('"id":1');
+    await expect.poll(b.output, { timeout: 10_000 }).toContain('"id":1');
     b.send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
     await expect.poll(http.requests).toBe(1);
     b.child.stdin.end();
