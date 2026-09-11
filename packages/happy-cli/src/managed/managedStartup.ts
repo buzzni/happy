@@ -20,7 +20,13 @@ import {
     type ManagedSpawnEnvelope,
     type ManagedSpawnGateway,
 } from '@/managed/managedSpawnBootstrap';
-import { managedAiAuthProviderHome } from '@/managed/managedAiAuth';
+import {
+    isPersonalAiAuth,
+    managedAiAuthProviderHome,
+    type ManagedAiAuthProvider,
+} from '@/managed/managedAiAuth';
+import { readManagedAiAuthApiKey } from '@/managed/managedAiAuthStore';
+import { buildZaiClaudeEnvironment } from '@/managed/zaiClaudeEnvironment';
 import { attachManagedSession, ManagedAttachError, type ManagedAttachment } from '@/managed/managedSessionAttach';
 import {
     MANAGED_CONTROL_CHILD_FD,
@@ -28,7 +34,7 @@ import {
     readManagedControlChannel,
 } from '@/managed/managedControlChannel';
 import { requestManagedGracefulStop } from '@/managed/managedGracefulStop';
-import { writeSync } from 'node:fs';
+import { readFileSync, writeSync } from 'node:fs';
 import { Socket } from 'node:net';
 import { MANAGED_PROJECT_ROOT } from '@/daemon/managedRuntimeIdentity';
 
@@ -286,6 +292,15 @@ export function clearForeignSessionLineage(env: NodeJS.ProcessEnv): void {
 export function applyManagedGatewayEnvironment(
     env: NodeJS.ProcessEnv,
     envelope: ManagedSpawnEnvelope,
+    /**
+     * How the key file is read, for a `personal-api-key` run.
+     *
+     * A parameter because this function is otherwise pure and the file it needs
+     * exists only on a real runtime, under a uid only that runtime has. It
+     * throws on a missing file, like `readFileSync`; the reader turns that into
+     * "no key", and no key is a refusal.
+     */
+    readFile: (path: string) => string = (path) => readFileSync(path, 'utf8'),
 ): void {
     for (const key of PROVIDER_CREDENTIAL_ENV) delete env[key];
     for (const key of PROVIDER_AUTH_HOME_ENV) delete env[key];
@@ -306,6 +321,10 @@ export function applyManagedGatewayEnvironment(
         }
         return;
     }
+    if (envelope.aiAuth.kind === 'personal-api-key') {
+        applyPersonalApiKeyEnvironment(env, envelope.aiAuth, readFile);
+        return;
+    }
     const gateway = requireManagedGateway(envelope);
     const base = managedGatewayClientBaseUrl(envelope);
     if (envelope.agent === 'claude') {
@@ -315,6 +334,49 @@ export function applyManagedGatewayEnvironment(
     }
     env.OPENAI_BASE_URL = base;
     env.OPENAI_API_KEY = gateway.capability;
+}
+
+/**
+ * Points the agent at the key this connection registered.
+ *
+ * The key is read here rather than carried in the envelope: the envelope is
+ * built by the parent and crosses a socket, and a key in it would be a key in
+ * the parent's memory, its logs and its database. What the parent sends is the
+ * connection it was admitted on; the runtime holds the secret.
+ *
+ * A key that is not there is the end of the run. There is no fallback that is
+ * not a substitution — the gateway would spend Studio's budget on a run priced
+ * as the user's own, and an inherited variable is whatever the last launch
+ * left behind.
+ */
+function applyPersonalApiKeyEnvironment(
+    env: NodeJS.ProcessEnv,
+    aiAuth: { connectionId: string; provider: ManagedAiAuthProvider },
+    readFile: (path: string) => string,
+): void {
+    const home = managedAiAuthProviderHome(aiAuth.connectionId, aiAuth.provider);
+    const apiKey = readManagedAiAuthApiKey(home, (path) => readFile(path));
+    if (apiKey === null) throw new ManagedAttachError('personal api key is not present');
+    if (aiAuth.provider === 'codex') {
+        // `CODEX_HOME` stays the launcher plan's, exactly as on a personal
+        // subscription: `codexToolPolicy` refuses a provider environment that
+        // carries it.
+        env.OPENAI_API_KEY = apiKey;
+        return;
+    }
+    /*
+     * Both remaining providers are spent by Claude Code, so both get a config
+     * directory of their own — the agent writes state beside its credential,
+     * and two connections sharing one directory is two users sharing it.
+     */
+    env.CLAUDE_CONFIG_DIR = home;
+    if (aiAuth.provider === 'glm') {
+        // A GLM key is an Anthropic-wire key against Z.AI, which takes the
+        // whole route and the model mapping, not just a token.
+        Object.assign(env, buildZaiClaudeEnvironment(apiKey));
+        return;
+    }
+    env.ANTHROPIC_API_KEY = apiKey;
 }
 
 /**
@@ -373,14 +435,15 @@ export function managedClaudeGatewayBaseUrl(envelope: ManagedSpawnEnvelope): str
  */
 export function managedCodexProviderArguments(envelope: ManagedSpawnEnvelope): string[] {
     /*
-     * **Empty for a personal subscription.** There is no gateway to point at,
-     * and pinning `model_provider` would take the run off the default OpenAI
-     * provider that the requester's own `codex login` authenticates against.
-     * The tool-boundary arguments are a separate list and still apply —
-     * `resolveManagedCodexArguments` appends the verified plan to whatever
-     * this returns, and still refuses a managed run that has no plan.
+     * **Empty for either personal kind.** There is no gateway to point at, and
+     * pinning `model_provider` would take the run off the default OpenAI
+     * provider — the one the requester's own `codex login` authenticates
+     * against, and the one that reads `OPENAI_API_KEY` when the connection
+     * holds a key instead. The tool-boundary arguments are a separate list and
+     * still apply — `resolveManagedCodexArguments` appends the verified plan to
+     * whatever this returns, and still refuses a managed run that has no plan.
      */
-    if (envelope.aiAuth.kind === 'personal-subscription') return [];
+    if (isPersonalAiAuth(envelope.aiAuth)) return [];
     const base = managedGatewayClientBaseUrl(envelope);
     const provider = `model_providers.${MANAGED_CODEX_PROVIDER_ID}`;
     return [

@@ -51,11 +51,15 @@ import {
     generateClaudePkce,
 } from '@/commands/connect/claudeOAuth';
 import {
+    MANAGED_AI_AUTH_API_KEY_PATTERN,
+    MANAGED_AI_AUTH_CREDENTIAL_KINDS,
     MANAGED_AI_AUTH_HOME_ROOT,
     MANAGED_AI_AUTH_MARKER_FILE,
     MANAGED_AI_AUTH_MARKER_VERSION,
+    MANAGED_AI_AUTH_PROVIDERS,
     managedAiAuthConnectionDir,
     managedAiAuthProviderHome,
+    type ManagedAiAuthCredentialKind,
     type ManagedAiAuthMarker,
     type ManagedAiAuthProvider,
     type ManagedAiAuthRpcParams,
@@ -167,6 +171,15 @@ export type ManagedAiAuthStore = {
         connectionId: string;
         provider: ManagedAiAuthProvider;
         connectionVersion: number;
+        /**
+         * Which of the two personal kinds the run was admitted on.
+         *
+         * Checked, not inferred: a connection that was a login when the Run was
+         * accepted and is a key now is a different credential against a
+         * different account, and the environment the child would be given for
+         * one is not the one the other needs.
+         */
+        credentialKind: ManagedAiAuthCredentialKind;
     }) => boolean;
     /** Drops pending logins and kills their children. For daemon teardown. */
     close: () => void;
@@ -195,12 +208,48 @@ type PendingLogin = {
     deviceOutcome?: 'running' | 'succeeded' | 'failed';
 };
 
-const CLAUDE_CREDENTIAL_FILE = '.credentials.json';
-const CODEX_CREDENTIAL_FILE = 'auth.json';
+/**
+ * Where each provider's **login** lands — the file that CLI reads on its own.
+ *
+ * `glm` has none: there is no GLM subscription to log into, so the only
+ * credential a glm connection can hold is a key.
+ */
+const OAUTH_CREDENTIAL_FILE: Record<ManagedAiAuthProvider, string | null> = {
+    claude: '.credentials.json',
+    codex: 'auth.json',
+    glm: null,
+};
 
-function credentialPath(root: string, connectionId: string, provider: ManagedAiAuthProvider): string {
-    const home = withRoot(root, managedAiAuthProviderHome(connectionId, provider));
-    return `${home}/${provider === 'claude' ? CLAUDE_CREDENTIAL_FILE : CODEX_CREDENTIAL_FILE}`;
+/**
+ * Where a registered key lands, for every provider.
+ *
+ * This one is **ours**, not a vendor's: no provider CLI reads it. The child
+ * reads it at spawn and puts the key in the one environment variable that
+ * provider spends (`readManagedAiAuthApiKey`), which is why the shape is
+ * versioned and carries the provider it was registered for.
+ */
+export const MANAGED_AI_AUTH_API_KEY_FILE = 'api-key.json';
+export const MANAGED_AI_AUTH_API_KEY_VERSION = 1;
+
+/**
+ * The credential file a connection of this kind holds, or `null` when the
+ * combination cannot exist (a glm login).
+ */
+function credentialFile(
+    provider: ManagedAiAuthProvider, credentialKind: ManagedAiAuthCredentialKind,
+): string | null {
+    return credentialKind === 'api-key' ? MANAGED_AI_AUTH_API_KEY_FILE : OAUTH_CREDENTIAL_FILE[provider];
+}
+
+function credentialPath(
+    root: string,
+    connectionId: string,
+    provider: ManagedAiAuthProvider,
+    credentialKind: ManagedAiAuthCredentialKind,
+): string | null {
+    const file = credentialFile(provider, credentialKind);
+    if (file === null) return null;
+    return `${withRoot(root, managedAiAuthProviderHome(connectionId, provider))}/${file}`;
 }
 
 /**
@@ -293,14 +342,28 @@ export function createManagedAiAuthStore(deps: ManagedAiAuthStoreDeps): ManagedA
         try {
             const parsed = JSON.parse(raw) as Partial<ManagedAiAuthMarker>;
             if (parsed.v !== MANAGED_AI_AUTH_MARKER_VERSION) return null;
-            if (parsed.provider !== 'claude' && parsed.provider !== 'codex') return null;
+            if (!(MANAGED_AI_AUTH_PROVIDERS as readonly unknown[]).includes(parsed.provider)) return null;
             if (typeof parsed.connectionVersion !== 'number' || !Number.isSafeInteger(parsed.connectionVersion)) {
+                return null;
+            }
+            /*
+             * A marker written before keys existed has no kind, and it is a
+             * login: keys did not exist when it was written. An unreadable kind
+             * is not defaulted the same way — it is a marker this runtime
+             * cannot act on, and acting on it would be guessing which file to
+             * look for.
+             */
+            if (
+                parsed.credentialKind !== undefined
+                && !(MANAGED_AI_AUTH_CREDENTIAL_KINDS as readonly unknown[]).includes(parsed.credentialKind)
+            ) {
                 return null;
             }
             return {
                 v: MANAGED_AI_AUTH_MARKER_VERSION,
-                provider: parsed.provider,
+                provider: parsed.provider as ManagedAiAuthProvider,
                 connectionVersion: parsed.connectionVersion,
+                credentialKind: parsed.credentialKind ?? 'oauth',
                 ...(typeof parsed.accountLabel === 'string' ? { accountLabel: parsed.accountLabel } : {}),
             };
         } catch {
@@ -326,18 +389,43 @@ export function createManagedAiAuthStore(deps: ManagedAiAuthStoreDeps): ManagedA
     };
 
     const writeCredential = (
-        connectionId: string, provider: ManagedAiAuthProvider, contents: string,
+        connectionId: string,
+        provider: ManagedAiAuthProvider,
+        credentialKind: ManagedAiAuthCredentialKind,
+        contents: string,
     ): void => {
         const home = ensureConnectionHome(connectionId, provider);
-        const target = credentialPath(root, connectionId, provider);
+        const target = credentialPath(root, connectionId, provider, credentialKind);
+        if (target === null) throw new ManagedAiAuthError(MANAGED_AI_AUTH_FAILURES.providerUnavailable);
         const temp = `${home}/.${randomBytes(8).toString('hex')}`;
         fs.writeNew(temp, contents, 0o600);
         fs.chown(temp, deps.provider.uid, deps.provider.gid);
         fs.rename(temp, target);
     };
 
-    const hasCredential = (connectionId: string, provider: ManagedAiAuthProvider): boolean =>
-        fs.readFile(credentialPath(root, connectionId, provider)) !== null;
+    /**
+     * Drops whatever the connection held of the *other* kind.
+     *
+     * One connection holds one credential. Left behind, the loser is a second
+     * account under the same directory — and the child picks its file from the
+     * kind it was admitted on, so which one gets spent would come down to which
+     * write happened last.
+     */
+    const removeOtherCredential = (
+        connectionId: string, provider: ManagedAiAuthProvider, kept: ManagedAiAuthCredentialKind,
+    ): void => {
+        const stale = credentialPath(
+            root, connectionId, provider, kept === 'api-key' ? 'oauth' : 'api-key',
+        );
+        if (stale !== null) fs.removeTree(stale);
+    };
+
+    const hasCredential = (
+        connectionId: string, provider: ManagedAiAuthProvider, credentialKind: ManagedAiAuthCredentialKind,
+    ): boolean => {
+        const path = credentialPath(root, connectionId, provider, credentialKind);
+        return path !== null && fs.readFile(path) !== null;
+    };
 
     /** Drops an expired pending login and kills whatever it was running. */
     const livePending = (connectionId: string): PendingLogin | null => {
@@ -373,10 +461,14 @@ export function createManagedAiAuthStore(deps: ManagedAiAuthStoreDeps): ManagedA
             };
         }
         const marker = readMarker(connectionId);
-        if (marker && marker.provider === provider && hasCredential(connectionId, provider)) {
+        // The credential the marker *says* is there: a marker claiming a login
+        // with only a key beside it is not connected either way round.
+        const credentialKind = marker?.credentialKind ?? 'oauth';
+        if (marker && marker.provider === provider && hasCredential(connectionId, provider, credentialKind)) {
             return {
                 state: 'connected',
                 connectionVersion: marker.connectionVersion,
+                credentialKind,
                 ...(marker.accountLabel === undefined ? {} : { accountLabel: marker.accountLabel }),
             };
         }
@@ -390,7 +482,7 @@ export function createManagedAiAuthStore(deps: ManagedAiAuthStoreDeps): ManagedA
     /** Turns a finished device child into the answer its state implies. */
     const settleDeviceLogin = (connectionId: string, live: PendingLogin): ManagedAiAuthRpcResult => {
         pending.delete(connectionId);
-        if (live.deviceOutcome !== 'succeeded' || !hasCredential(connectionId, live.provider)) {
+        if (live.deviceOutcome !== 'succeeded' || !hasCredential(connectionId, live.provider, 'oauth')) {
             lastFailure.set(connectionId, MANAGED_AI_AUTH_FAILURES.exchangeFailed);
             return {
                 state: 'failed',
@@ -398,17 +490,22 @@ export function createManagedAiAuthStore(deps: ManagedAiAuthStoreDeps): ManagedA
                 failureCode: MANAGED_AI_AUTH_FAILURES.exchangeFailed,
             };
         }
-        const label = codexAccountLabel(fs.readFile(credentialPath(root, connectionId, 'codex')));
+        const label = codexAccountLabel(fs.readFile(credentialPath(root, connectionId, 'codex', 'oauth')!));
+        // A login replaces whatever key this connection held: see
+        // `removeOtherCredential`.
+        removeOtherCredential(connectionId, 'codex', 'oauth');
         writeMarker(connectionId, {
             v: MANAGED_AI_AUTH_MARKER_VERSION,
             provider: 'codex',
             connectionVersion: live.pendingVersion,
+            credentialKind: 'oauth',
             ...(label === null ? {} : { accountLabel: label }),
         });
         lastFailure.delete(connectionId);
         return {
             state: 'connected',
             connectionVersion: live.pendingVersion,
+            credentialKind: 'oauth',
             ...(label === null ? {} : { accountLabel: label }),
         };
     };
@@ -495,7 +592,8 @@ export function createManagedAiAuthStore(deps: ManagedAiAuthStoreDeps): ManagedA
                     : {}),
             },
         };
-        writeCredential(connectionId, 'claude', JSON.stringify(credential));
+        writeCredential(connectionId, 'claude', 'oauth', JSON.stringify(credential));
+        removeOtherCredential(connectionId, 'claude', 'oauth');
         const label = maskAccountLabel(tokens.account?.email_address);
         // The marker **after** the credential: a marker pointing at a
         // credential that is not there would report connected to a parent that
@@ -504,6 +602,7 @@ export function createManagedAiAuthStore(deps: ManagedAiAuthStoreDeps): ManagedA
             v: MANAGED_AI_AUTH_MARKER_VERSION,
             provider: 'claude',
             connectionVersion: live.pendingVersion,
+            credentialKind: 'oauth',
             ...(label === null ? {} : { accountLabel: label }),
         });
         pending.delete(connectionId);
@@ -511,6 +610,7 @@ export function createManagedAiAuthStore(deps: ManagedAiAuthStoreDeps): ManagedA
         return {
             state: 'connected',
             connectionVersion: live.pendingVersion,
+            credentialKind: 'oauth',
             ...(label === null ? {} : { accountLabel: label }),
         };
     };
@@ -614,6 +714,47 @@ export function createManagedAiAuthStore(deps: ManagedAiAuthStoreDeps): ManagedA
         });
     };
 
+    /**
+     * Registers a provider key as this connection's credential.
+     *
+     * The only write in this module the user does not have to leave the Studio
+     * for, and the one that must not leak: the key arrives in the RPC, lands in
+     * `api-key.json` under the provider uid, and appears in no reply and no log
+     * line — which is also why the reply carries no `accountLabel`. There is
+     * nothing in a key to label an account with, and inventing one from its
+     * prefix would put part of the secret in the parent's database.
+     *
+     * The same two refusals a login has. A pending login means the user is
+     * halfway through the other kind of connection on this same directory, and
+     * a version that does not advance cannot be told from a replay of the one
+     * already recorded.
+     */
+    const setKey = (
+        connectionId: string,
+        provider: ManagedAiAuthProvider,
+        connectionVersion: number,
+        apiKey: string,
+    ): ManagedAiAuthRpcResult => {
+        if (livePending(connectionId)) throw new ManagedAiAuthError(MANAGED_AI_AUTH_FAILURES.inProgress);
+        const marker = readMarker(connectionId);
+        if (marker !== null && connectionVersion <= marker.connectionVersion) {
+            throw new ManagedAiAuthError(MANAGED_AI_AUTH_FAILURES.versionConflict);
+        }
+        writeCredential(connectionId, provider, 'api-key', JSON.stringify({
+            v: MANAGED_AI_AUTH_API_KEY_VERSION, provider, apiKey,
+        }));
+        removeOtherCredential(connectionId, provider, 'api-key');
+        // After the key, for the same reason a login writes its marker last.
+        writeMarker(connectionId, {
+            v: MANAGED_AI_AUTH_MARKER_VERSION,
+            provider,
+            connectionVersion,
+            credentialKind: 'api-key',
+        });
+        lastFailure.delete(connectionId);
+        return { state: 'connected', connectionVersion, credentialKind: 'api-key' };
+    };
+
     const logout = (connectionId: string, connectionVersion: number): ManagedAiAuthRpcResult => {
         const live = pending.get(connectionId);
         live?.child?.kill();
@@ -632,6 +773,9 @@ export function createManagedAiAuthStore(deps: ManagedAiAuthStoreDeps): ManagedA
         const { connectionId, provider } = params;
         if (params.action === 'status') return status(connectionId, provider);
         if (params.action === 'logout') return logout(connectionId, params.connectionVersion!);
+        if (params.action === 'set-key') {
+            return setKey(connectionId, provider, params.connectionVersion!, params.apiKey!);
+        }
         if (params.action === 'login-cancel') {
             const live = pending.get(connectionId);
             live?.child?.kill();
@@ -641,6 +785,10 @@ export function createManagedAiAuthStore(deps: ManagedAiAuthStoreDeps): ManagedA
             return status(connectionId, provider);
         }
         if (params.action === 'login-start') {
+            // The parser refuses this already; the store refuses it too so a
+            // second caller cannot route a "glm login" into the codex device
+            // flow — there is no GLM subscription, only a key.
+            if (provider === 'glm') throw new ManagedAiAuthError(MANAGED_AI_AUTH_FAILURES.providerUnavailable);
             const live = livePending(connectionId);
             if (live) throw new ManagedAiAuthError(MANAGED_AI_AUTH_FAILURES.inProgress);
             const marker = readMarker(connectionId);
@@ -675,14 +823,15 @@ export function createManagedAiAuthStore(deps: ManagedAiAuthStoreDeps): ManagedA
 
     return {
         run: (params) => serialize(params.connectionId, () => run(params)),
-        holdsConnection: ({ connectionId, provider, connectionVersion }) => {
+        holdsConnection: ({ connectionId, provider, connectionVersion, credentialKind }) => {
             const marker = readMarker(connectionId);
             return marker !== null
                 && marker.provider === provider
                 && marker.connectionVersion === connectionVersion
-                // The marker alone is not the login: a credential removed
-                // beneath it would let a run start with nothing to run on.
-                && hasCredential(connectionId, provider);
+                && (marker.credentialKind ?? 'oauth') === credentialKind
+                // The marker alone is not the credential: one removed beneath
+                // it would let a run start with nothing to run on.
+                && hasCredential(connectionId, provider, credentialKind);
         },
         close: () => {
             for (const live of pending.values()) live.child?.kill();
@@ -716,6 +865,36 @@ export function parseCodexDeviceLogin(text: string): { loginUrl: string; userCod
     // A code announced by name, on the same line or the next one.
     const labelled = text.match(/code[^A-Za-z0-9]{0,20}([A-Z0-9][A-Z0-9-]{3,15})/i);
     return labelled ? { loginUrl: url[0], userCode: labelled[1] } : { loginUrl: url[0] };
+}
+
+/**
+ * The key a connection registered, read from its provider home.
+ *
+ * The **child's** half of `set-key`, and the reason it is a free function: the
+ * store runs in the daemon as root, while this runs in the managed run as the
+ * provider uid, with nothing of the store around it. `null` for anything it
+ * cannot read as a key — absent, unreadable, wrong version, wrong shape, or a
+ * value the RPC would itself have refused. The caller turns that into a refusal
+ * to start; there is nothing here to fall back to.
+ */
+export function readManagedAiAuthApiKey(
+    providerHome: string,
+    readFile: (path: string) => string | null,
+): string | null {
+    try {
+        const raw = readFile(`${providerHome}/${MANAGED_AI_AUTH_API_KEY_FILE}`);
+        if (raw === null) return null;
+        const parsed = JSON.parse(raw) as { v?: unknown; apiKey?: unknown };
+        if (parsed.v !== MANAGED_AI_AUTH_API_KEY_VERSION) return null;
+        if (typeof parsed.apiKey !== 'string' || !MANAGED_AI_AUTH_API_KEY_PATTERN.test(parsed.apiKey)) {
+            return null;
+        }
+        return parsed.apiKey;
+    } catch {
+        // A reader that throws on a missing file is the ordinary case
+        // (`readFileSync`), and malformed JSON is the other one.
+        return null;
+    }
 }
 
 /** `alice@example.com` → `al***@example.com`. Never the whole address. */

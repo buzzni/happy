@@ -20,10 +20,14 @@ import { fileURLToPath } from 'node:url';
 
 import {
     MANAGED_AI_AUTH_ACTIONS,
+    MANAGED_AI_AUTH_API_KEY_PATTERN,
     MANAGED_AI_AUTH_CONNECTION_ID_PATTERN,
+    MANAGED_AI_AUTH_CREDENTIAL_KINDS,
     MANAGED_AI_AUTH_HOME_ROOT,
     MANAGED_AI_AUTH_KINDS,
+    MANAGED_AI_AUTH_PROVIDERS,
     MANAGED_AI_AUTH_RPC_METHOD,
+    MANAGED_AI_AUTH_SUBSCRIPTION_PROVIDERS,
     MANAGED_AI_AUTH_TOKEN_OP,
 } from '@/managed/managedAiAuth';
 
@@ -45,13 +49,20 @@ describe('the ai-auth wire, on both sides of the submodule boundary', () => {
     it.skipIf(!present)('agrees on every constant the parent and the runtime both name', () => {
         const studio = readFileSync(STUDIO_COPY, 'utf8');
 
-        /** One `export const NAME = <value>` from the Studio copy. */
+        /**
+         * One `export const NAME = <value>` from the Studio copy.
+         *
+         * Spans lines: a list long enough to be wrapped is exactly the list
+         * that grows, and a single-line pattern read one of those as the bare
+         * `[` — which compares as "no members" and passes any comparison made
+         * against another empty list.
+         */
         const declared = (name: string): string => {
             const match = studio.match(
-                new RegExp(`^export const ${name}(?::[^=]+)? = (.+)$`, 'm'),
+                new RegExp(`^export const ${name}(?::[^=]+)? = ([\\s\\S]*?)(?: as const)?\\n(?=\\S|$)`, 'm'),
             );
             expect(match, `${name} is not declared in the Studio copy`).not.toBeNull();
-            return match![1].replace(/ as const$/, '').trim();
+            return match![1].trim();
         };
 
         expect(declared('CLOUD_AI_AUTH_HOME_ROOT')).toBe(`'${MANAGED_AI_AUTH_HOME_ROOT}'`);
@@ -59,12 +70,33 @@ describe('the ai-auth wire, on both sides of the submodule boundary', () => {
         expect(declared('MANAGED_AI_AUTH_TOKEN_OP')).toBe(`'${MANAGED_AI_AUTH_TOKEN_OP}'`);
         expect(declared('CLOUD_AI_AUTH_CONNECTION_ID_PATTERN'))
             .toBe(MANAGED_AI_AUTH_CONNECTION_ID_PATTERN.toString());
+        /*
+         * What a key is allowed to look like, on both sides.
+         *
+         * The parent refuses a malformed key before it ever sends one, and the
+         * runtime refuses it again on arrival. A looser pattern here would
+         * accept something the Studio's form rejected; a stricter one would
+         * refuse a key the user was told was fine, with the failure landing
+         * three layers away from the field they typed it into.
+         */
+        expect(declared('CLOUD_AI_AUTH_API_KEY_PATTERN'))
+            .toBe(MANAGED_AI_AUTH_API_KEY_PATTERN.toString());
         // Arrays are compared as their members, so a reordering is not a
         // failure but a missing or extra kind is.
         const members = (declaration: string): string[] =>
             [...declaration.matchAll(/'([^']+)'/g)].map((entry) => entry[1]).sort();
+        // A guard on the guard: every list below must actually have members,
+        // or two empty readings would agree with each other.
+        expect(members(declared('CLOUD_AI_AUTH_KINDS')).length).toBeGreaterThan(0);
         expect(members(declared('MANAGED_AI_AUTH_ACTIONS'))).toEqual([...MANAGED_AI_AUTH_ACTIONS].sort());
         expect(members(declared('CLOUD_AI_AUTH_KINDS'))).toEqual([...MANAGED_AI_AUTH_KINDS].sort());
+        // The provider axis, which the key kinds added to: `glm` exists on one
+        // side only for as long as it takes the other to refuse every run.
+        expect(members(declared('CLOUD_AI_AUTH_PROVIDERS'))).toEqual([...MANAGED_AI_AUTH_PROVIDERS].sort());
+        expect(members(declared('CLOUD_AI_AUTH_SUBSCRIPTION_PROVIDERS')))
+            .toEqual([...MANAGED_AI_AUTH_SUBSCRIPTION_PROVIDERS].sort());
+        expect(members(declared('CLOUD_AI_AUTH_CREDENTIAL_KINDS')))
+            .toEqual([...MANAGED_AI_AUTH_CREDENTIAL_KINDS].sort());
     });
 
     it('says plainly when the Studio copy is not checked out beside this one', () => {

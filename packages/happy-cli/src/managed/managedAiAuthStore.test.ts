@@ -11,7 +11,7 @@
  * root. So `chown` is recorded rather than applied, and what is asserted is
  * that the right uid was asked for on the right path.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,16 +20,22 @@ import {
     codexAccountLabel,
     createManagedAiAuthStore,
     defaultManagedAiAuthFs,
+    MANAGED_AI_AUTH_API_KEY_FILE,
     MANAGED_AI_AUTH_FAILURES,
     ManagedAiAuthError,
     maskAccountLabel,
     parseCodexDeviceLogin,
+    readManagedAiAuthApiKey,
     type ManagedAiAuthChild,
     type ManagedAiAuthFs,
     type ManagedAiAuthSpawn,
     type ManagedAiAuthStore,
 } from '@/managed/managedAiAuthStore';
-import { MANAGED_AI_AUTH_MARKER_FILE } from '@/managed/managedAiAuth';
+import {
+    MANAGED_AI_AUTH_MARKER_FILE,
+    type ManagedAiAuthProvider,
+} from '@/managed/managedAiAuth';
+import { logger } from '@/ui/logger';
 
 const CONNECTION = 'conn-0123456789ab';
 const NOW = 1_800_000_000_000;
@@ -205,7 +211,8 @@ describe('a claude login', () => {
             action: 'login-complete', connectionId: CONNECTION, provider: 'claude', code: 'the-code',
         });
         expect(done).toEqual({
-            state: 'connected', connectionVersion: 4, accountLabel: 'al***@example.test',
+            state: 'connected', connectionVersion: 4, credentialKind: 'oauth',
+            accountLabel: 'al***@example.test',
         });
         // Nothing secret came back with it.
         expect(JSON.stringify(done)).not.toContain('access-token-value');
@@ -221,7 +228,10 @@ describe('a claude login', () => {
         });
         expect(lstatSync(claudeCredential()).mode & 0o777).toBe(0o600);
         expect(JSON.parse(readFileSync(markerPath(), 'utf8')))
-            .toEqual({ v: 1, provider: 'claude', connectionVersion: 4, accountLabel: 'al***@example.test' });
+            .toEqual({
+                v: 1, provider: 'claude', connectionVersion: 4, credentialKind: 'oauth',
+                accountLabel: 'al***@example.test',
+            });
     });
 
     it('shouldAcceptTheCodeHashStateFormAndRefuseAForeignState', async () => {
@@ -325,7 +335,8 @@ describe('a codex login', () => {
             action: 'login-complete', connectionId: CONNECTION, provider: 'codex',
         });
         expect(done).toEqual({
-            state: 'connected', connectionVersion: 7, accountLabel: 'bo***@example.test',
+            state: 'connected', connectionVersion: 7, credentialKind: 'oauth',
+            accountLabel: 'bo***@example.test',
         });
         expect(JSON.parse(readFileSync(markerPath(), 'utf8')).connectionVersion).toBe(7);
     });
@@ -356,6 +367,17 @@ describe('a codex login', () => {
     });
 });
 
+describe('a glm connection is key-only', () => {
+    it('shouldRefuseALoginStartForGlmEvenWhenCalledDirectly', async () => {
+        // The parser already refuses it; this is the store's own refusal, so a
+        // caller that bypasses the parser cannot start a codex device flow
+        // under a glm connection.
+        await expect(store().run({
+            action: 'login-start', connectionId: CONNECTION, provider: 'glm', connectionVersion: 1, expiresAt: NOW + 1000,
+        })).rejects.toThrow(MANAGED_AI_AUTH_FAILURES.providerUnavailable);
+    });
+});
+
 describe('cancelling, logging out and reading state', () => {
     const complete = async (subject: ManagedAiAuthStore, version: number) => {
         await subject.run(start('claude', version));
@@ -378,7 +400,8 @@ describe('cancelling, logging out and reading state', () => {
         });
         // The connection is what it was: a cancelled re-login revokes nothing.
         expect(cancelled).toEqual({
-            state: 'connected', connectionVersion: 2, accountLabel: 'al***@example.test',
+            state: 'connected', connectionVersion: 2, credentialKind: 'oauth',
+            accountLabel: 'al***@example.test',
         });
         expect(existsSync(claudeCredential())).toBe(true);
     });
@@ -486,5 +509,238 @@ describe('reading what the provider printed', () => {
         expect(codexAccountLabel(JSON.stringify({ tokens: {} }))).toBeNull();
         expect(codexAccountLabel('not json')).toBeNull();
         expect(codexAccountLabel(null)).toBeNull();
+    });
+});
+
+describe('a registered api key', () => {
+    const KEY = 'sk-managed-key-0123456789';
+    const providerHome = (provider: ManagedAiAuthProvider) => join(connectionDir(), provider);
+    const keyFile = (provider: ManagedAiAuthProvider) =>
+        join(providerHome(provider), MANAGED_AI_AUTH_API_KEY_FILE);
+
+    const setKey = (
+        provider: ManagedAiAuthProvider, connectionVersion = 1, apiKey = KEY,
+    ) => ({
+        action: 'set-key' as const, connectionId: CONNECTION, provider, connectionVersion, apiKey,
+    });
+
+    const login = async (subject: ManagedAiAuthStore, version: number) => {
+        await subject.run(start('claude', version));
+        return subject.run({
+            action: 'login-complete', connectionId: CONNECTION, provider: 'claude', code: 'the-code',
+        });
+    };
+
+    it.each(['claude', 'codex', 'glm'] as const)('shouldRegisterAKeyFor(%s)', async (provider) => {
+        const subject = store();
+        const done = await subject.run(setKey(provider, 3));
+        // No account label, ever: there is nothing in a key to name an account
+        // with, and a prefix of it is a prefix of the secret.
+        expect(done).toEqual({ state: 'connected', connectionVersion: 3, credentialKind: 'api-key' });
+
+        expect(JSON.parse(readFileSync(keyFile(provider), 'utf8')))
+            .toEqual({ v: 1, provider, apiKey: KEY });
+        expect(lstatSync(keyFile(provider)).mode & 0o777).toBe(0o600);
+        expect(lstatSync(providerHome(provider)).mode & 0o777).toBe(0o700);
+        expect(owned).toContainEqual({ path: providerHome(provider), uid, gid });
+        expect(JSON.parse(readFileSync(markerPath(), 'utf8')))
+            .toEqual({ v: 1, provider, connectionVersion: 3, credentialKind: 'api-key' });
+
+        expect(await subject.run({ action: 'status', connectionId: CONNECTION, provider }))
+            .toEqual({ state: 'connected', connectionVersion: 3, credentialKind: 'api-key' });
+        expect(readManagedAiAuthApiKey(providerHome(provider), defaultManagedAiAuthFs.readFile))
+            .toBe(KEY);
+    });
+
+    it('shouldRefuseAKeyWhileALoginIsPending', async () => {
+        const subject = store();
+        await subject.run(start('claude'));
+        await expect(subject.run(setKey('claude', 2)))
+            .rejects.toThrow(MANAGED_AI_AUTH_FAILURES.inProgress);
+        expect(existsSync(keyFile('claude'))).toBe(false);
+    });
+
+    it('shouldRefuseAKeyThatWouldNotAdvanceTheRecordedVersion', async () => {
+        const subject = store();
+        await subject.run(setKey('claude', 5));
+        await expect(subject.run(setKey('claude', 5)))
+            .rejects.toThrow(MANAGED_AI_AUTH_FAILURES.versionConflict);
+        await expect(subject.run(setKey('claude', 4)))
+            .rejects.toThrow(MANAGED_AI_AUTH_FAILURES.versionConflict);
+        expect((await subject.run(setKey('claude', 6))).connectionVersion).toBe(6);
+    });
+
+    it('shouldRefuseALoginThatWouldNotAdvanceTheVersionAKeyRecorded', async () => {
+        const subject = store();
+        await subject.run(setKey('claude', 5));
+        await expect(subject.run(start('claude', 5)))
+            .rejects.toThrow(MANAGED_AI_AUTH_FAILURES.versionConflict);
+    });
+
+    it('shouldLeaveOnlyTheKeyWhenALoginIsReplacedByOne', async () => {
+        const subject = store();
+        await login(subject, 2);
+        expect(existsSync(claudeCredential())).toBe(true);
+        await subject.run(setKey('claude', 3));
+        // One connection holds one credential: the login it replaced is gone,
+        // not left beside it for whichever reader looks first.
+        expect(existsSync(claudeCredential())).toBe(false);
+        expect(existsSync(keyFile('claude'))).toBe(true);
+        expect(await subject.run({ action: 'status', connectionId: CONNECTION, provider: 'claude' }))
+            .toEqual({ state: 'connected', connectionVersion: 3, credentialKind: 'api-key' });
+    });
+
+    it('shouldLeaveOnlyTheLoginWhenAKeyIsReplacedByOne', async () => {
+        const subject = store();
+        await subject.run(setKey('claude', 1));
+        const done = await login(subject, 2);
+        expect(existsSync(keyFile('claude'))).toBe(false);
+        expect(existsSync(claudeCredential())).toBe(true);
+        expect(done).toEqual({
+            state: 'connected', connectionVersion: 2, credentialKind: 'oauth',
+            accountLabel: 'al***@example.test',
+        });
+    });
+
+    it('shouldDropACodexLoginWhenAKeyReplacesIt', async () => {
+        const subject = store();
+        mkdirSync(join(connectionDir(), 'codex'), { recursive: true });
+        writeFileSync(codexCredential(), JSON.stringify({ tokens: { access_token: 'x' } }));
+        await subject.run(setKey('codex', 2));
+        expect(existsSync(codexCredential())).toBe(false);
+        expect(existsSync(keyFile('codex'))).toBe(true);
+    });
+
+    it('shouldNotReportConnectedWhenTheFileDoesNotMatchTheMarkersKind', async () => {
+        const subject = store();
+        await subject.run(setKey('claude', 2));
+        // A login file left under a marker that says key: it is whatever was
+        // put there, and spending it would spend an account the parent never
+        // recorded. The key itself is gone, so the only file present is the
+        // one of the wrong kind.
+        rmSync(keyFile('claude'));
+        writeFileSync(claudeCredential(), '{}');
+        expect(await subject.run({ action: 'status', connectionId: CONNECTION, provider: 'claude' }))
+            .toEqual({ state: 'absent', connectionVersion: null });
+    });
+
+    it('shouldHoldTheConnectionOnlyForTheKindTheMarkerRecords', async () => {
+        const subject = store();
+        await subject.run(setKey('claude', 4));
+        /*
+         * A login file put there **after** the key was registered.
+         *
+         * The provider uid owns this directory and can write anything into it,
+         * and an upgrade can leave one behind. Without it this test would pass
+         * on the file check alone — the marker's kind would never be consulted
+         * — so the file that makes the two answers differ is planted on
+         * purpose.
+         */
+        writeFileSync(claudeCredential(), '{}');
+        const held = (over: Partial<Parameters<ManagedAiAuthStore['holdsConnection']>[0]>) =>
+            subject.holdsConnection({
+                connectionId: CONNECTION, provider: 'claude', connectionVersion: 4,
+                credentialKind: 'api-key', ...over,
+            });
+        expect(held({})).toBe(true);
+        // A run admitted on a subscription must not be served by the key that
+        // replaced it, even though both files are sitting in this connection.
+        expect(held({ credentialKind: 'oauth' })).toBe(false);
+        expect(held({ connectionVersion: 5 })).toBe(false);
+        expect(held({ provider: 'codex' })).toBe(false);
+    });
+
+    it('shouldNotHoldAnApiKeyRunAgainstALogin', async () => {
+        const subject = store();
+        await login(subject, 2);
+        const held = (credentialKind: 'oauth' | 'api-key') => subject.holdsConnection({
+            connectionId: CONNECTION, provider: 'claude', connectionVersion: 2, credentialKind,
+        });
+        expect(held('oauth')).toBe(true);
+        expect(held('api-key')).toBe(false);
+    });
+
+    it('shouldTreatAMarkerWrittenBeforeKeysExistedAsALogin', async () => {
+        const subject = store();
+        await login(subject, 2);
+        const marker = JSON.parse(readFileSync(markerPath(), 'utf8'));
+        delete marker.credentialKind;
+        writeFileSync(markerPath(), JSON.stringify(marker));
+        expect(await subject.run({ action: 'status', connectionId: CONNECTION, provider: 'claude' }))
+            .toMatchObject({ state: 'connected', credentialKind: 'oauth' });
+        expect(subject.holdsConnection({
+            connectionId: CONNECTION, provider: 'claude', connectionVersion: 2, credentialKind: 'oauth',
+        })).toBe(true);
+    });
+
+    it('shouldRemoveARegisteredKeyOnLogout', async () => {
+        const subject = store();
+        await subject.run(setKey('glm', 2));
+        expect(await subject.run({
+            action: 'logout', connectionId: CONNECTION, provider: 'glm', connectionVersion: 3,
+        })).toEqual({ state: 'absent', connectionVersion: 3 });
+        expect(existsSync(connectionDir())).toBe(false);
+    });
+
+    it('shouldKeepTheKeyOutOfEveryReplyAndEveryLogLine', async () => {
+        const written: string[] = [];
+        const record = (message: string, ...args: unknown[]) => {
+            written.push([message, ...args.map((arg) => JSON.stringify(arg) ?? '')].join(' '));
+        };
+        const spies = (['debug', 'info', 'infoDeveloper', 'warn'] as const)
+            .map((level) => vi.spyOn(logger, level).mockImplementation(record));
+        try {
+            const subject = store();
+            const replies = [
+                await subject.run(setKey('claude', 2)),
+                await subject.run({ action: 'status', connectionId: CONNECTION, provider: 'claude' }),
+                await subject.run({
+                    action: 'logout', connectionId: CONNECTION, provider: 'claude', connectionVersion: 3,
+                }),
+            ];
+            expect(JSON.stringify(replies)).not.toContain(KEY);
+            expect(written.join('\n')).not.toContain(KEY);
+        } finally {
+            for (const spy of spies) spy.mockRestore();
+        }
+    });
+});
+
+describe('reading a registered key back, as the child does', () => {
+    let home: string;
+
+    beforeEach(() => {
+        home = mkdtempSync(join(tmpdir(), 'managed-ai-auth-home-'));
+    });
+
+    afterEach(() => {
+        rmSync(home, { recursive: true, force: true });
+    });
+
+    const write = (contents: string) => {
+        writeFileSync(join(home, MANAGED_AI_AUTH_API_KEY_FILE), contents);
+    };
+
+    it('shouldReturnTheKeyItWasGiven', () => {
+        write(JSON.stringify({ v: 1, provider: 'glm', apiKey: 'sk-a-real-looking-key' }));
+        expect(readManagedAiAuthApiKey(home, defaultManagedAiAuthFs.readFile))
+            .toBe('sk-a-real-looking-key');
+    });
+
+    it('shouldSurviveAReaderThatThrowsOnAMissingFile', () => {
+        // `readFileSync` is the production reader and it throws; a reader that
+        // propagated would turn "no key" into a crash on an unrelated path.
+        expect(readManagedAiAuthApiKey(home, (path) => readFileSync(path, 'utf8'))).toBeNull();
+    });
+
+    it.each([
+        ['not json at all', 'nonsense'],
+        ['a version this runtime does not know', JSON.stringify({ v: 2, apiKey: 'sk-abcdefgh' })],
+        ['no key in it', JSON.stringify({ v: 1, provider: 'glm' })],
+        ['a key the rpc would itself refuse', JSON.stringify({ v: 1, apiKey: 'short' })],
+        ['a key with whitespace in it', JSON.stringify({ v: 1, apiKey: 'sk-a b c d e f' })],
+    ])('shouldRefuseToReadBack(%s)', (_name, contents) => {
+        write(contents);
+        expect(readManagedAiAuthApiKey(home, defaultManagedAiAuthFs.readFile)).toBeNull();
     });
 });

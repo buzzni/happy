@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { generateKeyPairSync, sign } from 'node:crypto';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import ts from 'typescript';
 import { createManagedSupervisorReadiness } from './managedSupervisorReadiness';
 import { createLauncherClient } from './launch/launcherClient';
@@ -21,7 +21,12 @@ import {
     type ManagedSpawnOutcome,
 } from './managedRpcHandlers';
 import type { ManagedRuntimeIdentity } from './managedRuntimeIdentity';
-import { ManagedAiAuthError } from '@/managed/managedAiAuthStore';
+import {
+    createManagedAiAuthStore,
+    defaultManagedAiAuthFs,
+    ManagedAiAuthError,
+} from '@/managed/managedAiAuthStore';
+import { MANAGED_AI_AUTH_MARKER_FILE } from '@/managed/managedAiAuth';
 
 const keys = generateKeyPairSync('ed25519');
 const verifier = parseManagedVerifierKey(keys.publicKey.export({ format: 'der', type: 'spki' }) as Buffer);
@@ -2449,6 +2454,7 @@ describe('spawning against a personal subscription', () => {
         expect(spawnCalls).toBe(1);
         expect(asked).toEqual([{
             connectionId: CONNECTION, provider: 'claude', connectionVersion: 5,
+            credentialKind: 'oauth',
         }]);
     });
 
@@ -2485,5 +2491,78 @@ describe('spawning against a personal subscription', () => {
         await handlers.spawn(call('spawn', envelope()));
         expect(spawnCalls).toBe(1);
         expect(asked).toBe(0);
+    });
+});
+
+
+/**
+ * The same gate, one axis further: **which kind** of credential.
+ *
+ * Driven through the real store against a temporary auth home rather than a
+ * stub, because the thing being checked is that the handler and the store agree
+ * on what "this connection" means. A stub that answers `true` proves the
+ * handler calls something; it does not prove a run admitted on a login is
+ * refused by a connection that now holds a key.
+ */
+describe('spawning against a registered api key', () => {
+    const CONNECTION = 'conn-0123456789ab';
+    const PROVIDER_UID = 4242;
+    let authRoot: string;
+
+    const selection = (kind: 'personal-subscription' | 'personal-api-key') => envelope({
+        aiAuth: { kind, provider: 'claude', connectionId: CONNECTION, connectionVersion: 5 },
+        gateway: undefined,
+    });
+
+    beforeEach(() => {
+        authRoot = mkdtempSync(join(tmpdir(), 'managed-rpc-ai-auth-'));
+        rmSync(authRoot, { recursive: true, force: true });
+        runtime.aiAuth = createManagedAiAuthStore({
+            provider: { uid: PROVIDER_UID, gid: PROVIDER_UID },
+            now: () => NOW,
+            root: authRoot,
+            // Giving a file away needs root; this suite is not root, and the
+            // ownership is not what is being checked here.
+            fs: { ...defaultManagedAiAuthFs, chown: () => undefined },
+        });
+    });
+
+    afterEach(() => {
+        rmSync(authRoot, { recursive: true, force: true });
+    });
+
+    /** A login, written the way `login-complete` leaves one. */
+    const plantLogin = () => {
+        mkdirSync(join(authRoot, CONNECTION, 'claude'), { recursive: true });
+        writeFileSync(join(authRoot, CONNECTION, 'claude', '.credentials.json'), '{}');
+        writeFileSync(join(authRoot, CONNECTION, MANAGED_AI_AUTH_MARKER_FILE), JSON.stringify({
+            v: 1, provider: 'claude', connectionVersion: 5, credentialKind: 'oauth',
+        }));
+    };
+
+    const registerKey = () => runtime.aiAuth!.run({
+        action: 'set-key',
+        connectionId: CONNECTION,
+        provider: 'claude',
+        connectionVersion: 5,
+        apiKey: 'sk-the-registered-key',
+    });
+
+    it('starts a key run against a connection that holds that key', async () => {
+        await registerKey();
+        await grantLease();
+        await handlers.spawn(call('spawn', selection('personal-api-key')));
+        expect(spawnCalls).toBe(1);
+    });
+
+    it.each([
+        ['a key run against a connection that holds a login', 'personal-api-key' as const, plantLogin],
+        ['a subscription run against a connection that holds a key', 'personal-subscription' as const, registerKey],
+    ])('refuses %s', async (_name, kind, arrange) => {
+        await arrange();
+        await grantLease();
+        await expect(handlers.spawn(call('spawn', selection(kind))))
+            .rejects.toMatchObject({ code: 'spawn-rejected', diagnostic: 'ai-auth-connection-mismatch' });
+        expect(spawnCalls).toBe(0);
     });
 });

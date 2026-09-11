@@ -37,6 +37,7 @@ import { randomUUID } from 'node:crypto';
 
 import { MANAGED_PROJECT_ROOT } from '@/daemon/managedRuntimeIdentity';
 import {
+    isPersonalAiAuth,
     ManagedAiAuthSelectionError,
     parseManagedAiAuthSelection,
     type ManagedAiAuthSelection,
@@ -330,8 +331,8 @@ export function parseManagedSpawnEnvelope(value: unknown, now: number): ManagedS
      * the refusal is what makes an old daemon reject a personal envelope
      * instead of quietly running it on the platform's key.
      */
-    if (aiAuth.kind === 'personal-subscription') {
-        if (raw.gateway !== undefined) fail('gateway', 'must be absent for a personal subscription');
+    if (isPersonalAiAuth(aiAuth)) {
+        if (raw.gateway !== undefined) fail('gateway', 'must be absent for a personal credential');
     }
     return {
         directory,
@@ -342,7 +343,7 @@ export function parseManagedSpawnEnvelope(value: unknown, now: number): ManagedS
         initialPromptLocalId: text(raw.initialPromptLocalId, 'initialPromptLocalId'),
         bootstrap: parseBootstrap(raw.bootstrap, now),
         aiAuth,
-        gateway: aiAuth.kind === 'personal-subscription'
+        gateway: isPersonalAiAuth(aiAuth)
             ? null
             : parseGateway(raw.gateway, agent as ManagedSpawnAgent, model),
     };

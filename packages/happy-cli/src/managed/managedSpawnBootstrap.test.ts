@@ -408,6 +408,63 @@ describe('the ai-auth selection', () => {
         expect(parsed.gateway).toBeNull();
     });
 
+    it('runs a glm key on the claude agent, with no gateway', () => {
+        // GLM has no login, so a glm connection is always a key — and the key
+        // is spent by Claude Code, which is why the agent is `claude`.
+        const parsed = parseManagedSpawnEnvelope(envelope({
+            aiAuth: {
+                kind: 'personal-api-key',
+                provider: 'glm',
+                connectionId: CONNECTION,
+                connectionVersion: 4,
+            },
+            gateway: undefined,
+        }), NOW);
+        expect(parsed.aiAuth).toEqual({
+            kind: 'personal-api-key', provider: 'glm', connectionId: CONNECTION, connectionVersion: 4,
+        });
+        expect(parsed.gateway).toBeNull();
+    });
+
+    it('refuses a glm key on the codex agent', () => {
+        // The other direction of the same rule: nothing spends a GLM key
+        // through Codex, and an envelope that says so was built wrong.
+        expect(() => parseManagedSpawnEnvelope(envelope({
+            agent: 'codex',
+            model: 'gpt-5',
+            aiAuth: {
+                kind: 'personal-api-key',
+                provider: 'glm',
+                connectionId: CONNECTION,
+                connectionVersion: 1,
+            },
+            gateway: undefined,
+        }), NOW)).toThrow(/aiAuth\.provider/);
+    });
+
+    it('refuses a glm subscription, which does not exist', () => {
+        expect(() => parseManagedSpawnEnvelope(envelope({
+            aiAuth: {
+                kind: 'personal-subscription',
+                provider: 'glm',
+                connectionId: CONNECTION,
+                connectionVersion: 1,
+            },
+            gateway: undefined,
+        }), NOW)).toThrow(/aiAuth\.provider/);
+    });
+
+    it('refuses a personal key that also carries a gateway', () => {
+        expect(() => parseManagedSpawnEnvelope(envelope({
+            aiAuth: {
+                kind: 'personal-api-key',
+                provider: 'claude',
+                connectionId: CONNECTION,
+                connectionVersion: 1,
+            },
+        }), NOW)).toThrow(/gateway/);
+    });
+
     it('refuses a personal subscription that also carries a gateway', () => {
         // Two admissions in one document. Dropping the gateway silently would
         // be the same bypass as ignoring the selection.

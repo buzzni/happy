@@ -13,8 +13,10 @@ import {
     managedClaudeGatewayBaseUrl,
     managedCodexProviderArguments,
     applyManagedGatewayEnvironment,
+    stripProviderCredentialOverrides,
 } from '@/managed/managedStartup';
 import type { ManagedSpawnEnvelope } from '@/managed/managedSpawnBootstrap';
+import { managedAiAuthCodexHome } from '@/managed/managedAiAuth';
 
 const SAYCODE = 'https://studio.example.test';
 
@@ -156,5 +158,128 @@ describe('a personal subscription', () => {
 
     it('refuses to build a gateway base URL for a run that has none', () => {
         expect(() => managedClaudeGatewayBaseUrl(personal('claude'))).toThrow(/personal subscription/);
+    });
+});
+
+/**
+ * The third route: the requester's own **key**.
+ *
+ * Same shape as a personal subscription — no capability, no gateway — but the
+ * credential is a string this runtime holds rather than a login the vendor CLI
+ * manages, so the thing that has to hold is the environment it is put into. A
+ * key in the wrong variable is a run that authenticates as nobody and falls
+ * back to whatever else it can find.
+ */
+describe('a registered api key', () => {
+    const CONNECTION = 'conn-0123456789ab';
+    const KEY = 'sk-the-registered-key';
+
+    const keyed = (provider: 'claude' | 'codex' | 'glm'): ManagedSpawnEnvelope => ({
+        ...envelope(provider === 'codex' ? 'codex' : 'claude'),
+        aiAuth: {
+            kind: 'personal-api-key',
+            provider,
+            connectionId: CONNECTION,
+            connectionVersion: 2,
+        },
+        gateway: null,
+    });
+
+    /** The key file as the store wrote it, served from the expected home only. */
+    const reader = (provider: string, contents = JSON.stringify({
+        v: 1, provider, apiKey: KEY,
+    })) => (path: string): string => {
+        if (path !== `/workspace/.auth/${CONNECTION}/${provider}/api-key.json`) {
+            throw new Error(`ENOENT: ${path}`);
+        }
+        return contents;
+    };
+
+    it('gives claude the key and a config directory of this connection\'s own', () => {
+        const env: NodeJS.ProcessEnv = {
+            ANTHROPIC_API_KEY: 'someone-elses-key',
+            ANTHROPIC_AUTH_TOKEN: 'someone-elses-capability',
+            CLAUDE_CONFIG_DIR: '/workspace/.auth/another-connection/claude',
+        };
+        applyManagedGatewayEnvironment(env, keyed('claude'), reader('claude'));
+        expect(env.ANTHROPIC_API_KEY).toBe(KEY);
+        expect(env.CLAUDE_CONFIG_DIR).toBe(`/workspace/.auth/${CONNECTION}/claude`);
+        // Nothing of the gateway route survives beside it.
+        expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+        expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
+    });
+
+    it('spends a glm key on the z.ai route, which is a whole environment', () => {
+        const env: NodeJS.ProcessEnv = { ANTHROPIC_BASE_URL: 'https://gateway.example.test' };
+        applyManagedGatewayEnvironment(env, keyed('glm'), reader('glm'));
+        expect(env.ANTHROPIC_AUTH_TOKEN).toBe(KEY);
+        expect(env.ANTHROPIC_BASE_URL).toBe('https://api.z.ai/api/anthropic');
+        expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.3');
+        expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-4.7');
+        expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-4.7');
+        expect(env.API_TIMEOUT_MS).toBe('3000000');
+        // Z.AI is reached with the Anthropic *auth token*, not an API key: a
+        // key in the other variable is a request that authenticates as nobody.
+        expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+        // Its own directory, not the claude one — two connections' Claude Code
+        // state must not land in the same place.
+        expect(env.CLAUDE_CONFIG_DIR).toBe(`/workspace/.auth/${CONNECTION}/glm`);
+    });
+
+    it('gives codex the key and still leaves CODEX_HOME to the launcher plan', () => {
+        const env: NodeJS.ProcessEnv = {
+            OPENAI_API_KEY: 'someone-elses-key',
+            OPENAI_BASE_URL: 'https://gateway.example.test',
+            CODEX_HOME: '/workspace/.auth/another-connection/codex',
+        };
+        applyManagedGatewayEnvironment(env, keyed('codex'), reader('codex'));
+        expect(env.OPENAI_API_KEY).toBe(KEY);
+        expect(env.OPENAI_BASE_URL).toBeUndefined();
+        expect(env.CODEX_HOME).toBeUndefined();
+        expect(env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    });
+
+    it('does not pin a model provider for a key either', () => {
+        expect(managedCodexProviderArguments(keyed('codex'))).toEqual([]);
+    });
+
+    it('sends the launcher to this connection\'s codex home for either personal kind', () => {
+        // The other half of "CODEX_HOME is the launcher plan's": the plan has
+        // to be built with the connection's own home, or the run reads the
+        // shared provider state the platform runs use.
+        const platform = '/workspace/.codex';
+        const home = `/workspace/.auth/${CONNECTION}/codex`;
+        expect(managedAiAuthCodexHome(keyed('codex').aiAuth, platform)).toBe(home);
+        expect(managedAiAuthCodexHome({
+            kind: 'personal-subscription', provider: 'codex',
+            connectionId: CONNECTION, connectionVersion: 2,
+        }, platform)).toBe(home);
+        expect(managedAiAuthCodexHome(envelope('codex').aiAuth, platform)).toBe(platform);
+    });
+
+    it.each([
+        ['there is no key file', () => { throw new Error('ENOENT'); }],
+        ['the file is not a key', () => 'nonsense'],
+        ['the key inside it is unusable', () => JSON.stringify({ v: 1, apiKey: 'short' })],
+    ])('refuses to start when %s', (_name, read) => {
+        const env: NodeJS.ProcessEnv = { ANTHROPIC_API_KEY: 'someone-elses-key' };
+        // No fallback: the gateway would spend Studio's budget on a run priced
+        // as the user's own, and the inherited key is somebody else's.
+        expect(() => applyManagedGatewayEnvironment(env, keyed('claude'), read as () => string))
+            .toThrow(/personal api key is not present/);
+        expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    });
+
+    it('still drops a caller override that would substitute the key', () => {
+        // `--claude-env` values are applied after startup, so an override named
+        // here wins over everything above.
+        expect(stripProviderCredentialOverrides({
+            ANTHROPIC_API_KEY: 'substituted',
+            ANTHROPIC_AUTH_TOKEN: 'substituted',
+            OPENAI_API_KEY: 'substituted',
+            CLAUDE_CONFIG_DIR: '/workspace/.auth/another-connection/claude',
+            CODEX_HOME: '/workspace/.auth/another-connection/codex',
+            HAPPY_SOMETHING_ELSE: 'kept',
+        })).toEqual({ HAPPY_SOMETHING_ELSE: 'kept' });
     });
 });

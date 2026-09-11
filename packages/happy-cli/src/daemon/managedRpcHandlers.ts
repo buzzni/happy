@@ -52,6 +52,8 @@ import {
     type ManagedAiAuthStore,
 } from '@/managed/managedAiAuthStore';
 import {
+    credentialKindForAiAuth,
+    isPersonalAiAuth,
     ManagedAiAuthSelectionError,
     parseManagedAiAuthRpcParams,
 } from '@/managed/managedAiAuth';
@@ -893,11 +895,15 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
              * receipt left as `failed: not-started`, and the parent asks its
              * user to reconnect.
              */
-            if (envelope.aiAuth.kind === 'personal-subscription') {
+            if (isPersonalAiAuth(envelope.aiAuth)) {
                 const held = runtime.aiAuth?.holdsConnection({
                     connectionId: envelope.aiAuth.connectionId,
                     provider: envelope.aiAuth.provider,
                     connectionVersion: envelope.aiAuth.connectionVersion,
+                    // The kind is part of the identity, not a detail of it: a
+                    // Run admitted on a login must not be served by a key that
+                    // replaced it, and the child's environment differs too.
+                    credentialKind: credentialKindForAiAuth(envelope.aiAuth.kind),
                 }) ?? false;
                 if (!held) {
                     runtime.store.update(key, {
