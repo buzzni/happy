@@ -33,6 +33,7 @@ const envelope = (): ManagedSpawnEnvelope => ({
         scopedToken: 'scoped',
         tokenExpiresAt: Date.now() + 60_000,
     },
+    aiAuth: { kind: 'platform-gateway' },
     gateway: {
         baseUrl: 'http://127.0.0.1:3005/api/cloud/gateway/anthropic/v1/messages',
         provider: 'anthropic',

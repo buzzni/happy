@@ -21,6 +21,7 @@ import {
     type ManagedSpawnOutcome,
 } from './managedRpcHandlers';
 import type { ManagedRuntimeIdentity } from './managedRuntimeIdentity';
+import { ManagedAiAuthError } from '@/managed/managedAiAuthStore';
 
 const keys = generateKeyPairSync('ed25519');
 const verifier = parseManagedVerifierKey(keys.publicKey.export({ format: 'der', type: 'spki' }) as Buffer);
@@ -485,7 +486,7 @@ describe('managed runtime RPC allowlist', () => {
     it('allows only the managed dispatch methods', () => {
         expect([...MANAGED_ALLOWED_RPCS].sort())
             .toEqual([
-                'managed:checkpoint', 'managed:credential',
+                'managed:ai-auth', 'managed:checkpoint', 'managed:credential',
                 'managed:lease', 'managed:receipt', 'managed:runtime-lease',
                 'managed:spawn', 'managed:status', 'managed:stop',
             ]);
@@ -2313,5 +2314,176 @@ describe('actual daemon readiness wiring without importing daemon startup', () =
         request.mockResolvedValueOnce(JSON.stringify({ ok: false, reason: 'hello-unavailable' }));
         dependencies.logger.debug = () => { throw new Error('logger failed'); };
         expect(await handlers.status(statusRequest)).toMatchObject({ isolation: { verified: false } });
+    });
+});
+
+
+describe('driving a personal AI login', () => {
+    /*
+     * The runtime is where the login has to happen (R23): a credential copied
+     * from the user's browser or from another device would be one this runtime
+     * holds without its owner having put it here. The parent drives the steps
+     * and keeps the state, the version and a masked label — never a token.
+     */
+    const CONNECTION = 'conn-0123456789ab';
+
+    function aiAuthToken(payload: unknown, over: Record<string, unknown> = {}): string {
+        const body = {
+            v: 1, kid: 'kid-1', aud: 'runtime-1',
+            op: 'ai-auth',
+            workspaceId: 'ws-1', projectId: 'proj-1',
+            provisioningOperationId: 'op-1', epoch: 0,
+            requestKey: 'client-request-key',
+            payloadDigest: canonicalManagedPayloadDigest(payload),
+            iat: NOW, exp: NOW + 60_000,
+            ...over,
+        };
+        const encoded = Buffer.from(JSON.stringify(body), 'utf8').toString('base64url');
+        return `${encoded}.${sign(null, Buffer.from(encoded, 'utf8'), keys.privateKey).toString('base64url')}`;
+    }
+
+    const aiAuthCall = (over: Record<string, unknown> = {}, tokenOver: Record<string, unknown> = {}) => {
+        const payload = {
+            action: 'status', connectionId: CONNECTION, provider: 'claude', ...over,
+        };
+        return { token: aiAuthToken(payload, tokenOver), params: payload };
+    };
+
+    const wireStore = (
+        run: NonNullable<ManagedRuntime['aiAuth']>['run'],
+        holds: NonNullable<ManagedRuntime['aiAuth']>['holdsConnection'] = () => true,
+    ) => {
+        runtime.aiAuth = { run, holdsConnection: holds, close: () => undefined };
+    };
+
+    it('hands the parsed action to the store and answers with what it said', async () => {
+        const seen: unknown[] = [];
+        wireStore(async (params) => {
+            seen.push(params);
+            return { state: 'pending', connectionVersion: null, loginMethod: 'paste-code', loginUrl: 'https://claude.ai/oauth/authorize?x=1' };
+        });
+        const answer = await handlers['ai-auth'](aiAuthCall({
+            action: 'login-start', connectionVersion: 3, expiresAt: NOW + 600_000,
+        }));
+        expect(seen).toEqual([{
+            action: 'login-start', connectionId: CONNECTION, provider: 'claude',
+            connectionVersion: 3, expiresAt: NOW + 600_000,
+        }]);
+        expect(answer).toMatchObject({ state: 'pending', loginMethod: 'paste-code' });
+    });
+
+    it('needs no lease and judges no epoch, because a login has neither', async () => {
+        // Deliberate: the login is started from a project screen, where there
+        // may be no run and no lease at all. `isLeaseValid` is false here.
+        wireStore(async () => ({ state: 'absent', connectionVersion: null }));
+        expect(handlers.isLeaseValid()).toBe(false);
+        expect(await handlers['ai-auth'](aiAuthCall({}, { epoch: 99 })))
+            .toEqual({ state: 'absent', connectionVersion: null });
+    });
+
+    it('refuses a request nothing is wired to serve', async () => {
+        // Not answered with `absent`: a parent told the connection is simply
+        // absent would go on offering a login nothing here can complete.
+        runtime.aiAuth = undefined;
+        await expect(handlers['ai-auth'](aiAuthCall()))
+            .rejects.toMatchObject({ code: 'capability-unavailable' });
+    });
+
+    it('turns a store refusal into its fixed code', async () => {
+        wireStore(async () => { throw new ManagedAiAuthError('ai-auth-login-in-progress'); });
+        await expect(handlers['ai-auth'](aiAuthCall({
+            action: 'login-start', connectionVersion: 2, expiresAt: NOW + 600_000,
+        }))).rejects.toMatchObject({ code: 'ai-auth-login-in-progress' });
+    });
+
+    it.each([
+        ['an unknown action', { action: 'login-everything' }],
+        ['a connection id that is a path', { connectionId: '../../etc' }],
+        ['login-start with no version', { action: 'login-start', expiresAt: NOW + 1 }],
+        ['an unexpected field', { surprise: true }],
+    ])('refuses %s before the store is reached', async (_name, over) => {
+        let reached = false;
+        wireStore(async () => { reached = true; return { state: 'absent', connectionVersion: null }; });
+        await expect(handlers['ai-auth'](aiAuthCall(over)))
+            .rejects.toMatchObject({ code: 'malformed-request' });
+        expect(reached).toBe(false);
+    });
+
+    it('refuses a token signed for a different set of parameters', async () => {
+        // The action and the connection are inside the digest, so one
+        // signature cannot drive a logout as easily as a status read.
+        wireStore(async () => ({ state: 'absent', connectionVersion: null }));
+        const forged: { token: string; params: Record<string, unknown> } = aiAuthCall();
+        forged.params = { action: 'logout', connectionId: CONNECTION, provider: 'claude', connectionVersion: 9 };
+        await expect(handlers['ai-auth'](forged))
+            .rejects.toMatchObject({ code: 'token-payload-mismatch' });
+    });
+
+    it('refuses a spawn token presented as a login', async () => {
+        wireStore(async () => ({ state: 'absent', connectionVersion: null }));
+        await expect(handlers['ai-auth'](call('spawn', envelope())))
+            .rejects.toMatchObject({ code: 'token-wrong-op' });
+    });
+});
+
+describe('spawning against a personal subscription', () => {
+    const CONNECTION = 'conn-0123456789ab';
+
+    const personal = () => envelope({
+        aiAuth: {
+            kind: 'personal-subscription', provider: 'claude',
+            connectionId: CONNECTION, connectionVersion: 5,
+        },
+        gateway: undefined,
+    });
+
+    it('starts when this runtime holds exactly the login the run was admitted on', async () => {
+        const asked: unknown[] = [];
+        runtime.aiAuth = {
+            run: async () => ({ state: 'absent', connectionVersion: null }),
+            holdsConnection: (input) => { asked.push(input); return true; },
+            close: () => undefined,
+        };
+        await grantLease();
+        await handlers.spawn(call('spawn', personal()));
+        expect(spawnCalls).toBe(1);
+        expect(asked).toEqual([{
+            connectionId: CONNECTION, provider: 'claude', connectionVersion: 5,
+        }]);
+    });
+
+    it.each([
+        ['the login was replaced or removed', () => {
+            runtime.aiAuth = {
+                run: async () => ({ state: 'absent', connectionVersion: null }),
+                holdsConnection: () => false,
+                close: () => undefined,
+            };
+        }],
+        // Falling back to the gateway here would spend Studio's account for a
+        // run the requester admitted on their own subscription.
+        ['no login capability is wired at all', () => { runtime.aiAuth = undefined; }],
+    ])('refuses when %s', async (_name, arrange) => {
+        arrange();
+        await grantLease();
+        await expect(handlers.spawn(call('spawn', personal())))
+            .rejects.toMatchObject({ code: 'spawn-rejected', diagnostic: 'ai-auth-connection-mismatch' });
+        expect(spawnCalls).toBe(0);
+        // The receipt says nothing started, so nothing has to be reconciled.
+        const found = runtime.store.read(OP_KEY);
+        expect(found.kind === 'ok' && found.receipt.state).toBe('failed');
+    });
+
+    it('does not consult the login store for a platform run', async () => {
+        let asked = 0;
+        runtime.aiAuth = {
+            run: async () => ({ state: 'absent', connectionVersion: null }),
+            holdsConnection: () => { asked += 1; return false; },
+            close: () => undefined,
+        };
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        expect(spawnCalls).toBe(1);
+        expect(asked).toBe(0);
     });
 });

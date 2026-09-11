@@ -152,6 +152,7 @@ function managedStartup(): ManagedStartup {
                 scopedToken: 'scoped.bearer.value',
                 tokenExpiresAt: Date.now() + 3_600_000,
             },
+            aiAuth: { kind: 'platform-gateway' },
             gateway: {
                 baseUrl: GATEWAY,
                 capability: 'capability-for-this-run',

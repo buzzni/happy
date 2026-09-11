@@ -357,6 +357,7 @@ describe('the status claim', () => {
         const result = verify(mint(claims()));
         expect(result.ok).toBe(true);
         if (!result.ok || result.claims.op === 'status' || result.claims.op === 'credential'
+            || result.claims.op === 'ai-auth'
             || result.claims.op === 'runtime-lease' || result.claims.op === 'checkpoint') return;
         expect(result.claims.runId).toBe('run-1');
         expect(result.claims.attemptId).toBe('attempt-1');
@@ -457,6 +458,7 @@ describe('the runtime-lease claim', () => {
         } as never)), { op: 'lease', currentEpoch: 3 });
         expect(result.ok).toBe(true);
         if (!result.ok || result.claims.op === 'status' || result.claims.op === 'credential'
+            || result.claims.op === 'ai-auth'
             || result.claims.op === 'runtime-lease' || result.claims.op === 'checkpoint') return;
         expect(result.claims.runId).toBe('run-1');
         expect(result.claims.attemptId).toBe('attempt-1');
@@ -685,6 +687,9 @@ describe('the epoch rules, per operation', () => {
     it.each([
         ['status', 'status' as const],
         ['credential', 'credential' as const],
+        // A personal login is started from a project screen, where there may
+        // be no run and no lease at all.
+        ['ai-auth', 'ai-auth' as const],
     ])('shouldNotGateOnEpochAtAllFor(%s)', (_name, op) => {
         const body: Record<string, unknown> = {
             ...claims(), op, epoch: 0, provisioningOperationId: 'op-1',
@@ -775,6 +780,7 @@ describe('verifyManagedDispatchMaterial', () => {
         ['checkpoint', 'checkpoint'],
         ['status', 'status'],
         ['credential', 'credential'],
+        ['ai-auth', 'ai-auth'],
         ['runtime-lease', 'runtime-lease'],
     ])('shouldRefuseATokenMintedForAnotherProvisioningOperation(%s)', (_name, op) => {
         /*
@@ -794,6 +800,7 @@ describe('verifyManagedDispatchMaterial', () => {
         ['checkpoint', 'checkpoint'],
         ['status', 'status'],
         ['credential', 'credential'],
+        ['ai-auth', 'ai-auth'],
         ['runtime-lease', 'runtime-lease'],
     ])('shouldRefuseWhenTheCallerNamesNoOperationAtAll(%s)', (_name, op) => {
         // Fail closed: a holder that cannot say which life it is living cannot
@@ -811,5 +818,74 @@ describe('verifyManagedDispatchMaterial', () => {
         ['params it was not signed for', () => material(provisioningToken('checkpoint'), { paramsDigest: OTHER_DIGEST }), 'payload-mismatch'],
     ])('shouldStillRefuse(%s)', (_name, run, reason) => {
         expect(run()).toEqual({ ok: false, reason });
+    });
+});
+
+/**
+ * The login operation's own claim shape (R23).
+ *
+ * It is provisioning-scoped like `credential`, and the refusals are what keep
+ * it that way: a token that could name a run could be replayed as one, and a
+ * token carrying lease fields would be a login holding a write deadline open.
+ */
+describe('the ai-auth token', () => {
+    const aiAuth = (over: Record<string, unknown> = {}) => {
+        const body: Record<string, unknown> = {
+            ...claims(), op: 'ai-auth', provisioningOperationId: 'op-1',
+        };
+        delete body.runId;
+        delete body.attemptId;
+        return mint({ ...body, ...over });
+    };
+
+    const check = (token: string, over: Partial<Parameters<typeof verifyManagedDispatchToken>[0]> = {}) =>
+        verify(token, { op: 'ai-auth', provisioningOperationId: 'op-1', ...over });
+
+    it('shouldAcceptOneBoundToThisProvisioningOperation', () => {
+        const result = check(aiAuth());
+        expect(result.ok).toBe(true);
+        if (result.ok && result.claims.op === 'ai-auth') {
+            expect(result.claims.provisioningOperationId).toBe('op-1');
+        }
+    });
+
+    it.each([
+        ['runId', { runId: 'run-1' }],
+        ['attemptId', { attemptId: 'attempt-1' }],
+        ['renewalSeq', { renewalSeq: 1 }],
+        ['leaseMs', { leaseMs: 60_000 }],
+        ['absoluteExpiry', { absoluteExpiry: NOW + 600_000 }],
+    ])('shouldRefuseOneCarrying(%s)', (_name, over) => {
+        expect(check(aiAuth(over))).toEqual({ ok: false, reason: 'malformed' });
+    });
+
+    it('shouldRefuseOneWithNoProvisioningOperation', () => {
+        const body: Record<string, unknown> = { ...claims(), op: 'ai-auth' };
+        delete body.runId;
+        delete body.attemptId;
+        delete body.provisioningOperationId;
+        expect(check(mint(body))).toEqual({ ok: false, reason: 'malformed' });
+    });
+
+    it('shouldRefuseOneMintedForAnotherOperation', () => {
+        expect(check(aiAuth({ provisioningOperationId: 'op-other' })))
+            .toEqual({ ok: false, reason: 'wrong-operation' });
+    });
+
+    it('shouldRefuseASpawnTokenPresentedAsALogin', () => {
+        // The whole reason it is its own op: a signature authorising work on a
+        // run must not also be able to delete somebody's credential.
+        expect(check(mint(claims()))).toEqual({ ok: false, reason: 'wrong-op' });
+    });
+
+    it('shouldRefuseALoginTokenPresentedAsWork', () => {
+        expect(verify(aiAuth(), { op: 'spawn' })).toEqual({ ok: false, reason: 'wrong-op' });
+    });
+
+    it('shouldStillBindTheParameters', () => {
+        // The action and the connection travel in the params; without this the
+        // same signature would drive a logout as easily as a status read.
+        expect(check(aiAuth(), { paramsDigest: canonicalManagedPayloadDigest({ other: true }) }))
+            .toEqual({ ok: false, reason: 'payload-mismatch' });
     });
 });

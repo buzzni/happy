@@ -141,6 +141,23 @@ export function isGatewayAiAuth(selection: ManagedAiAuthSelection): boolean {
     return selection.kind !== 'personal-subscription';
 }
 
+/**
+ * The `CODEX_HOME` one run must be launched with.
+ *
+ * Codex reads its login from that directory, so for a personal subscription it
+ * has to be the requester's own — not the shared provider state the platform
+ * runs use. The platform's path is passed in rather than named here: it is the
+ * launcher's, and this module knows only about auth homes.
+ */
+export function managedAiAuthCodexHome(
+    selection: ManagedAiAuthSelection,
+    platformCodexHome: string,
+): string {
+    return selection.kind === 'personal-subscription'
+        ? managedAiAuthProviderHome(selection.connectionId, 'codex')
+        : platformCodexHome;
+}
+
 // ---------------------------------------------------------------------------
 // `managed:ai-auth` RPC wire (parent → daemon)
 // ---------------------------------------------------------------------------

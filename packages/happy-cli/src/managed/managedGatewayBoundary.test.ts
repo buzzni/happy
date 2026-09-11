@@ -37,6 +37,7 @@ function envelope(agent: 'claude' | 'codex'): ManagedSpawnEnvelope {
             scopedToken: 'scoped.bearer.value',
             tokenExpiresAt: Date.now() + 3_600_000,
         },
+        aiAuth: { kind: 'platform-gateway' },
         gateway: {
             baseUrl: claude
                 ? `${SAYCODE}/api/cloud/gateway/anthropic/v1/messages`
@@ -56,7 +57,7 @@ describe('the base URL each SDK is given', () => {
         // produces `/anthropic/v1/messages/v1/messages`, which is not a route.
         const base = managedClaudeGatewayBaseUrl(envelope('claude'));
         expect(base).toBe(`${SAYCODE}/api/cloud/gateway/anthropic`);
-        expect(`${base}/v1/messages`).toBe(envelope('claude').gateway.baseUrl);
+        expect(`${base}/v1/messages`).toBe(envelope('claude').gateway!.baseUrl);
     });
 
     it('stops where the Codex provider starts appending', () => {
@@ -69,7 +70,7 @@ describe('the base URL each SDK is given', () => {
 
     it('refuses an endpoint that is not the route this agent was approved for', () => {
         const crossed = envelope('claude');
-        crossed.gateway.baseUrl = `${SAYCODE}/api/cloud/gateway/openai/v1/responses`;
+        crossed.gateway!.baseUrl = `${SAYCODE}/api/cloud/gateway/openai/v1/responses`;
         expect(() => managedClaudeGatewayBaseUrl(crossed)).toThrow(/gateway/i);
     });
 });
@@ -89,5 +90,71 @@ describe('the provider the Codex CLI is configured with', () => {
         applyManagedGatewayEnvironment(env, envelope('codex'));
         expect(env.OPENAI_API_KEY).toBe('capability-for-this-run');
         expect(env.OPENAI_BASE_URL).toBe(`${SAYCODE}/api/cloud/gateway/openai/v1`);
+    });
+});
+
+/**
+ * The other route (R21~R25): the requester's own subscription.
+ *
+ * No capability, no gateway, and a login this runtime holds for exactly one
+ * connection. What is checked here is that the two routes do not leak into
+ * each other — a gateway key left in the environment would run a personal
+ * subscription on the platform's account, and an auth home left behind would
+ * run a platform generation on somebody's personal one.
+ */
+describe('a personal subscription', () => {
+    const CONNECTION = 'conn-0123456789ab';
+
+    const personal = (agent: 'claude' | 'codex'): ManagedSpawnEnvelope => ({
+        ...envelope(agent),
+        aiAuth: {
+            kind: 'personal-subscription',
+            provider: agent,
+            connectionId: CONNECTION,
+            connectionVersion: 2,
+        },
+        gateway: null,
+    });
+
+    it('points claude at this connection\'s auth home and spends no capability', () => {
+        const env: NodeJS.ProcessEnv = {
+            ANTHROPIC_AUTH_TOKEN: 'someone-elses-capability',
+            ANTHROPIC_BASE_URL: 'https://gateway.example.test',
+            CLAUDE_CONFIG_DIR: '/workspace/.auth/another-connection/claude',
+        };
+        applyManagedGatewayEnvironment(env, personal('claude'));
+        expect(env.CLAUDE_CONFIG_DIR).toBe(`/workspace/.auth/${CONNECTION}/claude`);
+        expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+        expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
+    });
+
+    it('leaves CODEX_HOME to the launcher plan', () => {
+        // `buildCodexToolPolicy` refuses a provider environment carrying
+        // `CODEX_HOME` and sets it from the plan's `codexHome`. Setting it
+        // here would refuse every managed codex launch instead of configuring
+        // one.
+        const env: NodeJS.ProcessEnv = { CODEX_HOME: '/workspace/.auth/another-connection/codex' };
+        applyManagedGatewayEnvironment(env, personal('codex'));
+        expect(env.CODEX_HOME).toBeUndefined();
+        expect(env.OPENAI_API_KEY).toBeUndefined();
+    });
+
+    it('does not pin a model provider, so the chatgpt login is the one used', () => {
+        expect(managedCodexProviderArguments(personal('codex'))).toEqual([]);
+    });
+
+    it('clears an inherited auth home on the gateway route too', () => {
+        const env: NodeJS.ProcessEnv = {
+            CLAUDE_CONFIG_DIR: `/workspace/.auth/${CONNECTION}/claude`,
+            CODEX_HOME: `/workspace/.auth/${CONNECTION}/codex`,
+        };
+        applyManagedGatewayEnvironment(env, envelope('claude'));
+        expect(env.CLAUDE_CONFIG_DIR).toBeUndefined();
+        expect(env.CODEX_HOME).toBeUndefined();
+        expect(env.ANTHROPIC_AUTH_TOKEN).toBe('capability-for-this-run');
+    });
+
+    it('refuses to build a gateway base URL for a run that has none', () => {
+        expect(() => managedClaudeGatewayBaseUrl(personal('claude'))).toThrow(/personal subscription/);
     });
 });

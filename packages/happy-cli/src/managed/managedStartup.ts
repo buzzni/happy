@@ -13,12 +13,14 @@
  */
 import { logger } from '@/ui/logger';
 import {
-    GATEWAY_ROUTES,
+    findGatewayRoute,
     MANAGED_BOOTSTRAP_FD_ENV,
     readManagedSpawnEnvelopeFromFd,
     ManagedSpawnEnvelopeError,
     type ManagedSpawnEnvelope,
+    type ManagedSpawnGateway,
 } from '@/managed/managedSpawnBootstrap';
+import { managedAiAuthProviderHome } from '@/managed/managedAiAuth';
 import { attachManagedSession, ManagedAttachError, type ManagedAttachment } from '@/managed/managedSessionAttach';
 import {
     MANAGED_CONTROL_CHILD_FD,
@@ -187,6 +189,17 @@ const PROVIDER_CREDENTIAL_ENV = [
 ];
 
 /**
+ * Where an agent CLI reads a login from, rather than a credential itself.
+ *
+ * Same consequence, different kind of value, so it is a separate list: a
+ * `CLAUDE_CONFIG_DIR` inherited from anywhere points this run at somebody
+ * else's login, and on a managed runtime "somebody else" is another user's
+ * personal subscription under `/workspace/.auth`. Cleared on every managed
+ * launch and set again only for the connection this run was admitted on.
+ */
+const PROVIDER_AUTH_HOME_ENV = ['CLAUDE_CONFIG_DIR', 'CODEX_HOME'];
+
+/**
  * Drops provider credentials from a caller-supplied environment overlay.
  *
  * `--claude-env` values are written into `process.env` after startup
@@ -201,6 +214,9 @@ export function stripProviderCredentialOverrides(
     const kept: Record<string, string> = {};
     for (const [key, value] of Object.entries(overrides)) {
         if (PROVIDER_CREDENTIAL_ENV.includes(key)) continue;
+        // An override naming an auth home is the same substitution by another
+        // route: it would point this run at a login it was not admitted on.
+        if (PROVIDER_AUTH_HOME_ENV.includes(key)) continue;
         kept[key] = value;
     }
     return kept;
@@ -253,27 +269,66 @@ export function clearForeignSessionLineage(env: NodeJS.ProcessEnv): void {
 }
 
 /**
- * Points the agent at the approved gateway, and at nothing else.
+ * Points the agent at the one provider route this run was admitted on.
  *
- * The capability is the only credential this run may spend: it was minted for
- * this run, on this model, against this endpoint. Every other provider
- * credential is cleared first — an inherited key is not a fallback here, it is
- * a way to run outside the approval entirely, and clearing is what makes the
- * gateway the only route rather than the preferred one.
+ * Two routes, and they are exclusive. On a platform kind the capability is the
+ * only credential this run may spend: it was minted for this run, on this
+ * model, against this endpoint. On a personal subscription there is no
+ * capability at all — the provider CLI talks to the vendor with the login the
+ * requester put in this runtime's auth home, and the only thing this sets is
+ * where that home is.
+ *
+ * Every inherited provider credential **and** every inherited auth home is
+ * cleared first, on both branches. An inherited value is not a fallback here:
+ * a key is a way to run outside the approval, and a config directory is a way
+ * to run on another user's subscription.
  */
 export function applyManagedGatewayEnvironment(
     env: NodeJS.ProcessEnv,
     envelope: ManagedSpawnEnvelope,
 ): void {
     for (const key of PROVIDER_CREDENTIAL_ENV) delete env[key];
+    for (const key of PROVIDER_AUTH_HOME_ENV) delete env[key];
+    if (envelope.aiAuth.kind === 'personal-subscription') {
+        /*
+         * Claude reads its login from `CLAUDE_CONFIG_DIR`, so it is set here.
+         *
+         * Codex reads `CODEX_HOME`, and that one is **not** set here: the
+         * launcher plan owns it (`codexToolPolicy` refuses a provider
+         * environment that carries `CODEX_HOME` and then sets it from the
+         * plan's `codexHome`), so setting it here would refuse every managed
+         * codex launch rather than configure one.
+         */
+        if (envelope.agent === 'claude') {
+            env.CLAUDE_CONFIG_DIR = managedAiAuthProviderHome(
+                envelope.aiAuth.connectionId, 'claude',
+            );
+        }
+        return;
+    }
+    const gateway = requireManagedGateway(envelope);
     const base = managedGatewayClientBaseUrl(envelope);
     if (envelope.agent === 'claude') {
         env.ANTHROPIC_BASE_URL = base;
-        env.ANTHROPIC_AUTH_TOKEN = envelope.gateway.capability;
+        env.ANTHROPIC_AUTH_TOKEN = gateway.capability;
         return;
     }
     env.OPENAI_BASE_URL = base;
-    env.OPENAI_API_KEY = envelope.gateway.capability;
+    env.OPENAI_API_KEY = gateway.capability;
+}
+
+/**
+ * The envelope's gateway, for a path that cannot run without one.
+ *
+ * The parser already refuses a platform envelope with no gateway, so reaching
+ * this with `null` means a personal run took a gateway path. That is a bug in
+ * the branch above it, not a run to continue with a substitute.
+ */
+function requireManagedGateway(envelope: ManagedSpawnEnvelope): ManagedSpawnGateway {
+    if (envelope.gateway === null) {
+        throw new ManagedAttachError('this run has no gateway; it was admitted on a personal subscription');
+    }
+    return envelope.gateway;
 }
 
 /** The provider id this run's configuration is registered under. */
@@ -289,9 +344,13 @@ export const MANAGED_CODEX_PROVIDER_ID = 'saycode-managed';
  * mismatch is a refusal instead of a quietly different address.
  */
 export function managedGatewayClientBaseUrl(envelope: ManagedSpawnEnvelope): string {
-    const route = GATEWAY_ROUTES.find((candidate) => candidate.agent === envelope.agent);
-    if (!route) throw new ManagedAttachError('no gateway route for this agent');
-    const url = new URL(envelope.gateway.baseUrl);
+    const gateway = requireManagedGateway(envelope);
+    // By agent **and** provider: claude has two approved upstreams — Anthropic
+    // and the GLM route the default experience runs on — and a lookup by agent
+    // alone would hand a GLM run the Anthropic base URL.
+    const route = findGatewayRoute(envelope.agent, gateway.provider);
+    if (!route) throw new ManagedAttachError('no gateway route for this agent and provider');
+    const url = new URL(gateway.baseUrl);
     if (url.pathname !== route.path) {
         throw new ManagedAttachError('the gateway route is not the one this agent was approved for');
     }
@@ -313,6 +372,15 @@ export function managedClaudeGatewayBaseUrl(envelope: ManagedSpawnEnvelope): str
  * wire protocol, whether OpenAI auth is required — is pinned here.
  */
 export function managedCodexProviderArguments(envelope: ManagedSpawnEnvelope): string[] {
+    /*
+     * **Empty for a personal subscription.** There is no gateway to point at,
+     * and pinning `model_provider` would take the run off the default OpenAI
+     * provider that the requester's own `codex login` authenticates against.
+     * The tool-boundary arguments are a separate list and still apply —
+     * `resolveManagedCodexArguments` appends the verified plan to whatever
+     * this returns, and still refuses a managed run that has no plan.
+     */
+    if (envelope.aiAuth.kind === 'personal-subscription') return [];
     const base = managedGatewayClientBaseUrl(envelope);
     const provider = `model_providers.${MANAGED_CODEX_PROVIDER_ID}`;
     return [

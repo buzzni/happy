@@ -6,43 +6,24 @@
  */
 
 import { createServer, IncomingMessage, ServerResponse } from 'http';
-import { randomBytes, createHash } from 'crypto';
 import { openBrowser } from '@/utils/browser';
-import { ClaudeAuthTokens, PKCECodes } from './types';
+import { ClaudeAuthTokens } from './types';
+import {
+    buildClaudeAuthorizeUrl,
+    claudeOAuthRedirectUri,
+    claudeTokenExchangeBody,
+    CLAUDE_OAUTH_DEFAULT_PORT,
+    CLAUDE_OAUTH_TOKEN_URL,
+    generateClaudeOAuthState,
+    generateClaudePkce,
+} from './claudeOAuth';
 
-// Anthropic OAuth Configuration for Claude.ai
-const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
-const CLAUDE_AI_AUTHORIZE_URL = 'https://claude.ai/oauth/authorize';
-const TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
-const DEFAULT_PORT = 54545;
+// The client id, the two endpoints and the PKCE generation live in
+// `claudeOAuth.ts`: a managed runtime runs the same flow without a browser,
+// and two copies of these would be two things that can drift apart.
+const TOKEN_URL = CLAUDE_OAUTH_TOKEN_URL;
+const DEFAULT_PORT = CLAUDE_OAUTH_DEFAULT_PORT;
 const SCOPE = 'user:inference';
-
-/**
- * Generate PKCE codes for OAuth flow
- */
-function generatePKCE(): PKCECodes {
-    // Generate code verifier (43-128 characters, base64url)
-    const verifier = randomBytes(32)
-        .toString('base64url')
-        .replace(/[^a-zA-Z0-9\-._~]/g, '');
-
-    // Generate code challenge (SHA256 of verifier, base64url encoded)
-    const challenge = createHash('sha256')
-        .update(verifier)
-        .digest('base64url')
-        .replace(/=/g, '')
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_');
-
-    return { verifier, challenge };
-}
-
-/**
- * Generate random state for OAuth security
- */
-function generateState(): string {
-    return randomBytes(32).toString('base64url');
-}
 
 /**
  * Find an available port for the callback server
@@ -90,14 +71,12 @@ async function exchangeCodeForTokens(
         headers: {
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-            grant_type: 'authorization_code',
-            code: code,
-            redirect_uri: `http://localhost:${port}/callback`,
-            client_id: CLIENT_ID,
-            code_verifier: verifier,
-            state: state,
-        }),
+        body: JSON.stringify(claudeTokenExchangeBody({
+            code,
+            verifier,
+            redirectUri: claudeOAuthRedirectUri(port),
+            state,
+        })),
     });
     if (!tokenResponse.ok) {
         throw new Error(`Token exchange failed: ${tokenResponse.statusText}`);
@@ -208,8 +187,8 @@ export async function authenticateClaude(): Promise<ClaudeAuthTokens> {
     console.log('🚀 Starting Anthropic Claude authentication...');
 
     // Generate PKCE codes and state
-    const { verifier, challenge } = generatePKCE();
-    const state = generateState();
+    const { verifier, challenge } = generateClaudePkce();
+    const state = generateClaudeOAuthState();
 
     // Try to use default port, or find an available one
     let port = DEFAULT_PORT;
@@ -229,21 +208,12 @@ export async function authenticateClaude(): Promise<ClaudeAuthTokens> {
     await new Promise(resolve => setTimeout(resolve, 100));
 
     // Build authorization URL
-    const redirect_uri = `http://localhost:${port}/callback`;
+    const redirect_uri = claudeOAuthRedirectUri(port);
 
-    // Build authorization URL with code=true for Claude.ai
-    const params = new URLSearchParams({
-        code: 'true',  // This tells Claude.ai to show the code AND redirect
-        client_id: CLIENT_ID,
-        response_type: 'code',
-        redirect_uri: redirect_uri,
-        scope: SCOPE,
-        code_challenge: challenge,
-        code_challenge_method: 'S256',
-        state: state,
+    // `code=true` tells Claude.ai to show the code as well as redirecting.
+    const authUrl = buildClaudeAuthorizeUrl({
+        challenge, state, redirectUri: redirect_uri, scope: SCOPE,
     });
-
-    const authUrl = `${CLAUDE_AI_AUTHORIZE_URL}?${params}`;
 
     console.log('📋 Opening browser for authentication...');
     console.log('If browser doesn\'t open, visit this URL:');

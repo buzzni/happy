@@ -137,6 +137,9 @@ function bootDeps(over: Partial<Parameters<typeof runManagedRuntimeBoot>[0]> = {
                 detail: `${input.path}:${input.uid}:${input.gid}:${input.mode.toString(8)}`,
             });
         },
+        assignAuthHomeRoot: async (input: { path: string; mode: number }) => {
+            log.push({ event: 'auth-home-root', detail: `${input.path}:${input.mode.toString(8)}` });
+        },
         // The default for cases that are not about staging. Every case that is
         // overrides it, and the real CLI's own is asserted separately.
         inspectRestoreStaging: async () => 'clear' as const,
@@ -215,6 +218,36 @@ describe('the production ownership steps', () => {
         expect(visited).not.toContain(join(home, 'escape'));
     });
 
+    it.each([
+        ['a symlink', (path: string, target: string) => { symlinkSync(target, path); }, /symlink/],
+        ['a file', (path: string) => { writeFileSync(path, 'not a directory'); }, /not a directory/],
+    ])('refuses an auth home root that is already %s', async (_name, plant, message) => {
+        const target = join(base, `auth-target-${_name.replace(/\s/g, '-')}`);
+        mkdirSync(target, { recursive: true });
+        const path = join(base, `auth-root-${_name.replace(/\s/g, '-')}`);
+        plant(path, target);
+        await expect(defaultManagedRuntimeBootDeps().assignAuthHomeRoot({ path, mode: 0o711 }))
+            .rejects.toThrow(message);
+    });
+
+    it('makes the auth home root traversable but unlistable, and leaves what is in it', async () => {
+        const path = join(base, 'auth-root');
+        // Ownership is recorded rather than applied: handing a directory to
+        // root needs root, and this suite is not.
+        const owned: Array<[string, number, number]> = [];
+        const deps = defaultManagedRuntimeBootDeps(
+            (target, uid, gid) => { owned.push([target, uid, gid]); },
+        );
+        await deps.assignAuthHomeRoot({ path, mode: 0o711 });
+        // A login left by an earlier boot: re-running must not take it away
+        // from the uid that has to read it.
+        mkdirSync(join(path, 'conn-0123456789ab'), { mode: 0o700 });
+        await deps.assignAuthHomeRoot({ path, mode: 0o711 });
+        expect(lstatSync(path).mode & 0o777).toBe(0o711);
+        expect(lstatSync(join(path, 'conn-0123456789ab')).mode & 0o777).toBe(0o700);
+        expect(owned).toEqual([[path, 0, 0], [path, 0, 0]]);
+    });
+
     it('refuses a provider home reached through a symlink', async () => {
         const target = join(base, 'elsewhere');
         mkdirSync(target, { recursive: true });
@@ -246,7 +279,12 @@ describe('the root boot stage of a managed runtime', () => {
          * could reach exists.
          */
         expect(log.map((entry) => entry.event))
-            .toEqual(['directory', 'daemon-leaf', 'supervisor', 'workspace', 'provider-home', 'attestation']);
+            .toEqual([
+                'directory', 'daemon-leaf', 'supervisor', 'workspace', 'provider-home',
+                // Made as root, because nothing after this can: the daemon
+                // runs next and the provider uid owns nothing in `/workspace`.
+                'auth-home-root', 'attestation',
+            ]);
         // And the record the daemon will read is really there, readable through
         // the same trust rules the daemon applies.
         expect(readManagedLauncherBinding({ stateDir, deps: provisioning() })).toEqual({

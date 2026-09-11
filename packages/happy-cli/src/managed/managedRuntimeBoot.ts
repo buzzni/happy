@@ -33,6 +33,7 @@
 import { chmodSync, chownSync, lstatSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { MANAGED_AI_AUTH_HOME_ROOT } from '@/managed/managedAiAuth';
 import {
     resolveManagedRuntimeIdentity,
     defaultProvisioningDeps,
@@ -312,6 +313,17 @@ export type ManagedRuntimeBootDeps = {
     assignProviderHome: (
         input: { path: string; uid: number; gid: number; mode: number },
     ) => Promise<void>;
+    /**
+     * Creates the root that personal AI logins live under (R23).
+     *
+     * root-owned and `0711`: traversable, so the provider uid can reach its own
+     * connection directory, and unlistable, so nothing on this machine can
+     * enumerate who has logged in. Deliberately **not** the recursive
+     * assignment the two above use — what is inside belongs to the provider
+     * uid, and re-owning the tree on every boot would take every existing
+     * login away from the process that has to read it.
+     */
+    assignAuthHomeRoot: (input: { path: string; mode: number }) => Promise<void>;
     /**
      * Lays a checkpoint down, if this runtime has one to restore.
      *
@@ -772,6 +784,13 @@ export async function runManagedRuntimeBoot(
                 gid: isolation.provider.gid,
                 mode: 0o700,
             });
+            /*
+             * Made here, as root, because nothing later can: the daemon runs
+             * after this and the provider uid cannot create a directory in
+             * `/workspace` it does not own. Idempotent — a runtime restarted
+             * over an existing volume keeps the logins already in it.
+             */
+            await deps.assignAuthHomeRoot({ path: MANAGED_AI_AUTH_HOME_ROOT, mode: 0o711 });
         } catch {
             return { ok: false, reason: 'workspace-unassignable' };
         }
@@ -1057,6 +1076,20 @@ export function defaultManagedRuntimeBootDeps(
             return { ok: true, created: true };
         },
         assignWorkspace: async ({ path, uid, gid }) => { assignTreeSync(path, uid, gid, chown); },
+        assignAuthHomeRoot: async ({ path, mode }) => {
+            const existing = lstatSync(path, { throwIfNoEntry: false });
+            if (existing?.isSymbolicLink()) throw new Error('auth home root path is a symlink');
+            if (existing && !existing.isDirectory()) throw new Error('auth home root path is not a directory');
+            // `mkdir`'s mode is masked by the umask, so it is set again: a
+            // `0711` that silently became `0755` is a directory the agent can
+            // list, and what it would list is who has logged in here.
+            mkdirSync(path, { recursive: true, mode });
+            chmodSync(path, mode);
+            // The root only — never the tree. What is inside belongs to the
+            // provider uid, and re-owning it would take every login already
+            // there away from the process that has to read it.
+            chown(path, 0, 0);
+        },
         assignProviderHome: async ({ path, uid, gid, mode }) => {
             const existing = lstatSync(path, { throwIfNoEntry: false });
             if (existing?.isSymbolicLink()) throw new Error('provider home path is a symlink');

@@ -37,6 +37,15 @@ export const MANAGED_OPS = [
      * the runtime authenticates with.
      */
     'credential',
+    /**
+     * Drives one personal AI login on this runtime (R23).
+     *
+     * Bound to the provisioning operation for the same reason `credential` is:
+     * an auth home belongs to the runtime rather than to a run, and a
+     * signature authorising work on one run must not also be able to start a
+     * login, read its state, or delete somebody's credential.
+     */
+    'ai-auth',
 ] as const;
 export type ManagedOp = (typeof MANAGED_OPS)[number];
 
@@ -50,7 +59,9 @@ export type ManagedOp = (typeof MANAGED_OPS)[number];
 const RUN_SCOPED_OPS: readonly ManagedOp[] = ['spawn', 'stop', 'query', 'lease'];
 
 /** Operations bound to a provisioning operation rather than to a run. */
-const PROVISIONING_SCOPED_OPS: readonly ManagedOp[] = ['status', 'runtime-lease', 'checkpoint', 'credential'];
+const PROVISIONING_SCOPED_OPS: readonly ManagedOp[] = [
+    'status', 'runtime-lease', 'checkpoint', 'credential', 'ai-auth',
+];
 
 /**
  * Which claim shapes are bound to a provisioning operation rather than to a run.
@@ -114,6 +125,22 @@ export type ManagedCredentialTokenClaims = ManagedTokenCommon & {
 };
 
 /**
+ * Permission to drive one personal AI login on this runtime.
+ *
+ * The same shape a credential push has, and the same refusals: it names the
+ * provisioning operation, never a run, and carries no lease fields — starting
+ * a login must not be able to hold a write deadline open.
+ *
+ * The action and the connection it acts on travel in the parameters, which the
+ * common `payloadDigest` already binds. A separate claim for them would be a
+ * second binding of the same fact, and the two could disagree.
+ */
+export type ManagedAiAuthTokenClaims = ManagedTokenCommon & {
+    op: 'ai-auth';
+    provisioningOperationId: string;
+};
+
+/**
  * A lease granted to a runtime that has no run yet.
  *
  * The parent needs a runtime fenced before it will dispatch anything, and that
@@ -151,6 +178,7 @@ export type ManagedTokenClaims =
     | ManagedRunTokenClaims
     | ManagedStatusTokenClaims
     | ManagedCredentialTokenClaims
+    | ManagedAiAuthTokenClaims
     | ManagedRuntimeLeaseTokenClaims
     | ManagedCheckpointTokenClaims;
 
@@ -315,13 +343,18 @@ function parseClaims(raw: unknown): ManagedTokenClaims | null {
             if (renewalSeq === null || leaseMs === null || absoluteExpiry === null) return null;
             return { ...base, op, provisioningOperationId, renewalSeq, leaseMs, absoluteExpiry };
         }
-        if (op === 'credential') {
+        if (op === 'credential' || op === 'ai-auth') {
             /*
              * The same shape a reading has — it names the provisioning
              * operation and nothing about a run — and the same refusals, for
              * the same reasons: a credential token that could name a run could
              * be replayed as one, and one carrying lease fields could hold a
              * write deadline open.
+             *
+             * `ai-auth` shares the shape exactly. Both act on something that
+             * outlives every run on this runtime — the bearer it authenticates
+             * with, and the auth home a personal login lives in — so neither
+             * has a run to name and neither may hold a deadline.
              */
             for (const forbidden of ['renewalSeq', 'leaseMs', 'absoluteExpiry']) {
                 if (record[forbidden] !== undefined) return null;
@@ -339,6 +372,13 @@ function parseClaims(raw: unknown): ManagedTokenClaims | null {
         return { ...base, op: 'status', provisioningOperationId };
     }
 
+    /*
+     * Derived from the list rather than assumed: an op in neither list is one
+     * nobody has decided the shape of, and reading it as run-scoped would let
+     * a future operation acquire a run's claim shape simply by existing. Fail
+     * closed, the same way the provisioning set is derived above.
+     */
+    if (!RUN_SCOPED_OPS.includes(op)) return null;
     const runId = readId(record.runId);
     const attemptId = readId(record.attemptId);
     if (runId === null || attemptId === null) return null;
@@ -518,7 +558,13 @@ export function verifyManagedDispatchToken(input: {
     // would leave the runtime unable to renew exactly when it is least able to
     // recover. What bounds a replay is the token's own two-minute life and the
     // daemon's rule that a replacement must outlive what is stored.
-    if (input.op !== 'status' && input.op !== 'credential') {
+    //
+    // A personal login is outside it for the same reason. The auth home is the
+    // runtime's, not a generation's, and a login is started from a project
+    // screen rather than from a dispatch — there may be no run and no lease at
+    // all. What bounds a replay is again the token's own two-minute life, plus
+    // the connection version the parent issues and the runtime records.
+    if (input.op !== 'status' && input.op !== 'credential' && input.op !== 'ai-auth') {
         if (claims.epoch < input.currentEpoch) return { ok: false, reason: 'stale-epoch' };
         // Both lease shapes may carry a higher epoch, because both are the path
         // that performs the fence before persisting it.

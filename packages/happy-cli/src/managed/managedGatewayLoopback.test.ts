@@ -38,6 +38,7 @@ function envelope(agent: 'claude' | 'codex'): ManagedSpawnEnvelope {
             scopedToken: 'scoped.bearer.value',
             tokenExpiresAt: Date.now() + 3_600_000,
         },
+        aiAuth: { kind: 'platform-gateway' },
         gateway: {
             // A loopback origin, so the route below is one this test can serve.
             baseUrl: claude
@@ -124,7 +125,7 @@ describe('what the installed SDK sends when a managed run is configured', () => 
         // The defect this derivation exists to prevent, stated as an observed
         // request rather than as a rule about string concatenation.
         const client = new Anthropic({
-            baseURL: envelope('claude').gateway.baseUrl,
+            baseURL: envelope('claude').gateway!.baseUrl,
             authToken: 'capability-for-this-run',
             apiKey: null,
             maxRetries: 0,

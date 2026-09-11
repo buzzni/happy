@@ -131,6 +131,7 @@ import {
 import { createManagedReceiptStore } from './managedReceiptStore';
 import { createByosOfflineReceiveWiring } from '@/daemon/byosOfflineReceiveWiring';
 import { createManagedRpcHandlers, type ManagedRpcHandlers, type ManagedRuntimeFacts } from './managedRpcHandlers';
+import { createManagedAiAuthStore } from '@/managed/managedAiAuthStore';
 import {
   decideManagedStopRoute,
   launchManagedSpawn,
@@ -3035,9 +3036,22 @@ export async function startDaemon(): Promise<void> {
        * decides whether a parent-issued credential reaches the inbox at all.
        */
       const checkpointTargetBackend = managedFencingBackend;
+      /*
+       * Where personal Claude/Codex logins live on this runtime (R23).
+       *
+       * The provider uid comes from the marker, not from a request: the login
+       * has to be readable by the uid that will run the agent, and by nothing
+       * else on the machine. Built here because this is the only place that
+       * holds both the verified identity and the RPC surface.
+       */
+      const managedAiAuthStore = createManagedAiAuthStore({
+        provider: identity.isolation.provider,
+        now: Date.now,
+      });
       const managedHandlers = createManagedRpcHandlers({
         identity,
         store,
+        aiAuth: managedAiAuthStore,
         /*
          * The managed path does **not** reuse `spawnSession`. That is the
          * ordinary daemon spawn — a detached `happy` child in the daemon's own
@@ -3288,7 +3302,13 @@ export async function startDaemon(): Promise<void> {
       // the constructor already registered and intercepts the rest.
       apiMachine.setManagedRuntime(managedHandlers);
       managedDrainLeaseWork = () => managedHandlers.drainLeaseWork();
-      managedCloseEntries = () => managedHandlers.closeEntries();
+      managedCloseEntries = () => {
+        managedHandlers.closeEntries();
+        // A pending login is a child process and a verifier held in memory.
+        // Neither survives this daemon, so both end with it rather than being
+        // left for a supervisor to find.
+        managedAiAuthStore.close();
+      };
       // The handler serializes expiry against renewal and promotion, so the
       // interval only has to avoid piling work onto that queue: a tick is
       // skipped while the previous one is still outstanding.

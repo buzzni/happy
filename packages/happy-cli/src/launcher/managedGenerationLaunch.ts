@@ -62,6 +62,7 @@ import type { GenerationKey } from './generationManifest';
 import type { BrokerTool } from './toolBroker';
 import type { ToolExecutorDeps } from './toolExecutor';
 import type { ManagedSpawnEnvelope } from '@/managed/managedSpawnBootstrap';
+import { managedAiAuthCodexHome } from '@/managed/managedAiAuth';
 
 /** What a runtime needs to know before it can launch a managed generation. */
 export type ManagedGenerationLaunchConfig = {
@@ -531,7 +532,16 @@ export function createManagedGenerationLauncher(
                      * arrives as a launch failure rather than as a codex that
                      * reads somebody else's provider config.
                      */
-                    ...(input.envelope.agent === 'codex' ? { codexHome: config.codexHome } : {}),
+                    /*
+                     * A personal subscription's codex reads its login from its
+                     * own auth home, not from the shared provider state the
+                     * platform runs use — `codexToolPolicy` refuses a provider
+                     * environment carrying `CODEX_HOME` and sets it from here,
+                     * so this is the only place that choice can be made.
+                     */
+                    ...(input.envelope.agent === 'codex'
+                        ? { codexHome: managedAiAuthCodexHome(input.envelope.aiAuth, config.codexHome) }
+                        : {}),
                     tools: config.tools,
                     scope: config.scope,
                     /*

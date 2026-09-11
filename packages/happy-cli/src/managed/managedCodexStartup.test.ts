@@ -122,6 +122,7 @@ function envelope(): ManagedSpawnEnvelope {
             scopedToken: 'scoped.bearer.value',
             tokenExpiresAt: Date.now() + 3_600_000,
         },
+        aiAuth: { kind: 'platform-gateway' },
         gateway: {
             baseUrl: `${SAYCODE}/api/cloud/gateway/openai/v1/responses`,
             capability: 'capability-for-this-run',

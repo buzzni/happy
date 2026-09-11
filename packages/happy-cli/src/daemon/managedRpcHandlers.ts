@@ -22,6 +22,7 @@ import {
     type ManagedRuntimeLeaseTokenClaims,
     type ManagedCheckpointTokenClaims,
     type ManagedCredentialTokenClaims,
+    type ManagedAiAuthTokenClaims,
     type ManagedStatusTokenClaims,
     type ManagedTokenFailure,
 } from './managedDispatchToken';
@@ -45,6 +46,15 @@ import {
     parseManagedSpawnEnvelope,
     type ManagedSpawnEnvelope,
 } from '@/managed/managedSpawnBootstrap';
+import {
+    MANAGED_AI_AUTH_REFUSAL_CODES,
+    ManagedAiAuthError,
+    type ManagedAiAuthStore,
+} from '@/managed/managedAiAuthStore';
+import {
+    ManagedAiAuthSelectionError,
+    parseManagedAiAuthRpcParams,
+} from '@/managed/managedAiAuth';
 
 /**
  * Every RPC a managed runtime serves. **One list**, and everything downstream
@@ -82,6 +92,16 @@ export const MANAGED_RPC_METHODS = [
      * destinations.
      */
     'managed:checkpoint',
+    /**
+     * Drives one personal AI login on this runtime (R23).
+     *
+     * The login has to happen **here**, on the machine that will run the work:
+     * a credential copied from the user's browser or from another device would
+     * be a credential this runtime holds without its owner having chosen to
+     * put it here. The parent drives the steps and stores only the state, the
+     * version and a masked account label — never a token.
+     */
+    'managed:ai-auth',
 ] as const;
 
 export type ManagedSpawnRequest = {
@@ -263,6 +283,17 @@ export type ManagedRuntime = {
      * to do with the destinations belongs to the checkpoint session that owns
      * the drain, the archive and the pointer.
      */
+    /**
+     * Drives personal AI logins in this runtime's auth home.
+     *
+     * Injected rather than done here: this module decides whether a request is
+     * authorised and well-formed, and what touches `/workspace/.auth` belongs
+     * to the store that owns those paths and the provider uid they are given
+     * to. Absent means no login capability is wired, which is reported rather
+     * than treated as "there is no login" — a parent told a connection is
+     * absent would keep offering a login that can never complete.
+     */
+    aiAuth?: ManagedAiAuthStore;
     acceptCheckpointTarget?: (target: Record<string, unknown>, dispatchToken: string) => Promise<{
         accepted: boolean;
         /**
@@ -334,7 +365,13 @@ function launchRefusalStage(message: string): string {
  * boundary and the fallback. Derived from `LAUNCH_STAGES` so the two cannot
  * drift — a stage that is not allowed on the wire would be a silent hole.
  */
-const WIRE_DIAGNOSTICS = new Set([...LAUNCH_STAGES, 'envelope', 'unclassified']);
+const WIRE_DIAGNOSTICS = new Set([
+    ...LAUNCH_STAGES, 'envelope', 'unclassified',
+    // Named on the wire because the parent's next move differs from every
+    // other spawn refusal: it must ask its user to log in again rather than
+    // retry the dispatch.
+    'ai-auth-connection-mismatch',
+]);
 
 export class ManagedRpcError extends Error {
     /** Set only when it is one of `WIRE_DIAGNOSTICS`; otherwise dropped here. */
@@ -577,7 +614,8 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
         });
         if (!result.ok) throw new ManagedRpcError(`token-${result.reason}`);
         if (result.claims.op === 'status' || result.claims.op === 'runtime-lease'
-            || result.claims.op === 'checkpoint' || result.claims.op === 'credential') {
+            || result.claims.op === 'checkpoint' || result.claims.op === 'credential'
+            || result.claims.op === 'ai-auth') {
             // Unreachable while `op` is run-scoped — the verifier already
             // refuses a mismatched op — and stated rather than cast away.
             throw new ManagedRpcError('token-wrong-op');
@@ -842,6 +880,35 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                 throw new ManagedRpcError('spawn-rejected', `envelope: ${field}`, 'envelope');
             }
 
+            /*
+             * The login this run was admitted on has to still be the one this
+             * runtime holds (R24).
+             *
+             * The parent fixed the connection and its version when it accepted
+             * the Run; between then and the launch the user may have logged
+             * out, logged in again, or had the runtime replaced. Starting
+             * anyway would spend whichever account happens to be in the auth
+             * home now, and falling back to the gateway would spend Studio's —
+             * both are the substitution R24 forbids. So it refuses, with the
+             * receipt left as `failed: not-started`, and the parent asks its
+             * user to reconnect.
+             */
+            if (envelope.aiAuth.kind === 'personal-subscription') {
+                const held = runtime.aiAuth?.holdsConnection({
+                    connectionId: envelope.aiAuth.connectionId,
+                    provider: envelope.aiAuth.provider,
+                    connectionVersion: envelope.aiAuth.connectionVersion,
+                }) ?? false;
+                if (!held) {
+                    runtime.store.update(key, {
+                        state: 'failed', failureReason: 'not-started',
+                    }, runtime.now());
+                    throw new ManagedRpcError(
+                        'spawn-rejected', 'ai-auth-connection-mismatch', 'ai-auth-connection-mismatch',
+                    );
+                }
+            }
+
             // Everything the launcher is told comes from the verified token.
             const context: ManagedSpawnContext = {
                 operationKey: key,
@@ -1017,10 +1084,10 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
      * reading `provisioningOperationId` cannot be handed a work token.
      */
     const verifyProvisioning = (
-        op: 'status' | 'runtime-lease' | 'credential' | 'checkpoint',
+        op: 'status' | 'runtime-lease' | 'credential' | 'checkpoint' | 'ai-auth',
         params: unknown,
     ): ManagedStatusTokenClaims | ManagedRuntimeLeaseTokenClaims | ManagedCredentialTokenClaims
-    | ManagedCheckpointTokenClaims => {
+    | ManagedCheckpointTokenClaims | ManagedAiAuthTokenClaims => {
         if (!params || typeof params !== 'object' || Array.isArray(params)) {
             throw new ManagedRpcError('malformed-request');
         }
@@ -1312,7 +1379,57 @@ const credentialRpc = async (params: unknown) => {
         return { accepted: true, expiresAt: outcome.expiresAt };
     };
 
+/**
+ * Drives one step of a personal AI login (R23~R25).
+ *
+ * The token is bound to the parameters, so the same signature cannot drive a
+ * logout as easily as a status read: the action and the connection are inside
+ * the digest the parent signed.
+ *
+ * No lease is required and no epoch is judged. A login is started from a
+ * project screen, where there may be no run and no lease at all, and what it
+ * writes is outside every checkpoint area — the same reasoning that puts
+ * `managed:credential` outside the epoch gate.
+ */
+const aiAuthRpc = async (params: unknown) => {
+        assertEntryOpen();
+        verifyProvisioning('ai-auth', params);
+        if (!runtime.aiAuth) {
+            // Reported rather than answered with `absent`: a parent told the
+            // connection is simply absent would go on offering a login that
+            // nothing here can complete.
+            throw new ManagedRpcError('capability-unavailable');
+        }
+        const record = params as Record<string, unknown>;
+        let request;
+        try {
+            request = parseManagedAiAuthRpcParams(record.params);
+        } catch (error) {
+            // The field name only. The parameters can carry the code the user
+            // pasted, and a refusal that quoted them would log it.
+            const field = error instanceof ManagedAiAuthSelectionError ? error.field : 'params';
+            throw new ManagedRpcError('malformed-request', field);
+        }
+        try {
+            return await runtime.aiAuth.run(request);
+        } catch (error) {
+            if (error instanceof ManagedAiAuthError) throw new ManagedRpcError(error.code);
+            // Anything else is the store failing in a way nobody classified;
+            // the boundary's unknown code covers it and its message stays here.
+            logger.debug('[managed] ai-auth action failed');
+            throw error;
+        }
+    };
+
     return {
+        /**
+         * Drives one step of a personal AI login.
+         *
+         * Tracked like every other write entry, so teardown waits for a login
+         * that is already mid-flight rather than finishing beside it.
+         */
+        'ai-auth': (params: unknown) => trackRpc(aiAuthRpc(params)),
+
         /**
          * Reports what this runtime is, and what it currently holds.
          *
@@ -1668,6 +1785,20 @@ const WIRE_REFUSAL_CODES: ReadonlySet<string> = new Set([
      * signing URLs nobody can use.
      */
     'checkpoint-target-refused',
+    /**
+     * The personal-login surface. Each one is something the parent can act on:
+     * wait for the login in flight, start one before completing it, re-issue
+     * at a version that actually advances, tell the user the exchange was
+     * refused, or report that the provider CLI could not be run at all.
+     */
+    ...MANAGED_AI_AUTH_REFUSAL_CODES,
+    /**
+     * The run was admitted on a login this runtime no longer holds — logged
+     * out, replaced, or never completed. Refused rather than run on anything
+     * else: R24 forbids substituting another authentication for a Run that
+     * already fixed one.
+     */
+    'ai-auth-connection-mismatch',
     'stale-epoch',
     'stale-renewal',
     /**

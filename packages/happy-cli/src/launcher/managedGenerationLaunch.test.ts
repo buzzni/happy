@@ -37,6 +37,7 @@ const ENVELOPE = {
     // these cases are about. The origin is, because every prepare is now
     // checked against the runtime's own.
     bootstrap: { serverOrigin: TRUSTED_ORIGIN } as never,
+    aiAuth: { kind: 'platform-gateway' },
     gateway: {} as never,
 } as unknown as ManagedSpawnEnvelope;
 

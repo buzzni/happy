@@ -72,7 +72,7 @@ describe('reading the spawn envelope', () => {
     it('accepts a Happy origin and a Saycode gateway that are different services', () => {
         const parsed = parseManagedSpawnEnvelope(envelope(), NOW);
         expect(parsed.bootstrap.serverOrigin).toBe(HAPPY_ORIGIN);
-        expect(new URL(parsed.gateway.baseUrl).origin).toBe(SAYCODE_ORIGIN);
+        expect(new URL(parsed.gateway!.baseUrl).origin).toBe(SAYCODE_ORIGIN);
     });
 
     it('keeps the two origins apart rather than requiring one', () => {
@@ -331,9 +331,131 @@ describe('the wire the parent actually builds', () => {
         expect(parsed.initialPromptLocalId).toBe('099cd344ff450c89a2f3712423b0e578');
         expect(parsed.directory).toBe('/workspace/project');
         expect(parsed.bootstrap.sessionId).toBe('sess-1');
-        expect(parsed.gateway.endpoint).toBe('anthropic-messages');
+        expect(parsed.gateway!.endpoint).toBe('anthropic-messages');
         // The two services are addressed separately, and the wire says so.
-        expect(new URL(parsed.gateway.baseUrl).origin)
+        expect(new URL(parsed.gateway!.baseUrl).origin)
             .not.toBe(new URL(parsed.bootstrap.serverOrigin).origin);
+    });
+});
+
+/**
+ * The AI-authentication axis (R21~R25).
+ *
+ * The selection and the gateway are one decision read together: a personal
+ * subscription has no capability to spend, and a platform kind cannot run
+ * without one. Every combination is stated, because the failure this prevents
+ * is the quiet one — a field ignored and the run put on the platform's key.
+ */
+describe('the ai-auth selection', () => {
+    const CONNECTION = 'conn-0123456789ab';
+
+    it('reads a v1 envelope with no selection as the platform gateway', () => {
+        const parsed = parseManagedSpawnEnvelope(envelope(), NOW);
+        expect(parsed.aiAuth).toEqual({ kind: 'platform-gateway' });
+        expect(parsed.gateway).not.toBeNull();
+    });
+
+    it('keeps the gateway for the default GLM route', () => {
+        // The GLM upstream is its own row on the same agent: same
+        // Anthropic-shaped endpoint, different provider and different path.
+        const glm = envelope({
+            aiAuth: { kind: 'platform-glm' },
+            model: 'glm-4.6',
+            gateway: {
+                baseUrl: `${SAYCODE_ORIGIN}/api/cloud/gateway/zai/v1/messages`,
+                capability: 'cap-glm',
+                provider: 'zai',
+                endpoint: 'anthropic-messages',
+                model: 'glm-4.6',
+            },
+        });
+        const parsed = parseManagedSpawnEnvelope(glm, NOW);
+        expect(parsed.aiAuth).toEqual({ kind: 'platform-glm' });
+        expect(parsed.gateway?.provider).toBe('zai');
+        expect(parsed.gateway?.capability).toBe('cap-glm');
+    });
+
+    it.each([
+        // Each row is still matched whole: the GLM provider on the Anthropic
+        // path, or the Anthropic provider on the GLM path, is two routes mixed.
+        ['gateway.baseUrl', { provider: 'zai' }],
+        ['gateway.baseUrl', {
+            baseUrl: `${SAYCODE_ORIGIN}/api/cloud/gateway/zai/v1/messages`,
+        }],
+        ['gateway.provider', { provider: 'glm' }],
+    ])('refuses %s when the GLM and Anthropic rows are mixed', (field, over) => {
+        const mixed = envelope({
+            aiAuth: { kind: 'platform-glm' },
+            gateway: { ...(envelope().gateway as object), ...over },
+        });
+        expect(() => parseManagedSpawnEnvelope(mixed, NOW))
+            .toThrow(new RegExp(field.replace('.', '\\.')));
+    });
+
+    it('runs a personal subscription with no gateway at all', () => {
+        const parsed = parseManagedSpawnEnvelope(envelope({
+            aiAuth: {
+                kind: 'personal-subscription',
+                provider: 'claude',
+                connectionId: CONNECTION,
+                connectionVersion: 3,
+            },
+            gateway: undefined,
+        }), NOW);
+        expect(parsed.aiAuth).toEqual({
+            kind: 'personal-subscription', provider: 'claude', connectionId: CONNECTION, connectionVersion: 3,
+        });
+        expect(parsed.gateway).toBeNull();
+    });
+
+    it('refuses a personal subscription that also carries a gateway', () => {
+        // Two admissions in one document. Dropping the gateway silently would
+        // be the same bypass as ignoring the selection.
+        expect(() => parseManagedSpawnEnvelope(envelope({
+            aiAuth: {
+                kind: 'personal-subscription',
+                provider: 'claude',
+                connectionId: CONNECTION,
+                connectionVersion: 1,
+            },
+        }), NOW)).toThrow(/gateway/);
+    });
+
+    it.each([
+        ['no selection', undefined],
+        ['platform-glm', { kind: 'platform-glm' }],
+    ])('refuses a %s envelope with no gateway', (_name, aiAuth) => {
+        expect(() => parseManagedSpawnEnvelope(
+            envelope({ ...(aiAuth ? { aiAuth } : {}), gateway: undefined }), NOW,
+        )).toThrow(/gateway/);
+    });
+
+    it('refuses a connection for the other provider', () => {
+        // A Codex login cannot run a Claude generation, and an envelope that
+        // says otherwise was built from the wrong run.
+        expect(() => parseManagedSpawnEnvelope(envelope({
+            aiAuth: {
+                kind: 'personal-subscription',
+                provider: 'codex',
+                connectionId: CONNECTION,
+                connectionVersion: 1,
+            },
+            gateway: undefined,
+        }), NOW)).toThrow(/aiAuth\.provider/);
+    });
+
+    it.each([
+        ['aiAuth', null],
+        ['aiAuth.kind', { kind: 'platform-byo' }],
+        ['aiAuth', { kind: 'platform-gateway', connectionId: CONNECTION }],
+        ['aiAuth.connectionId', {
+            kind: 'personal-subscription', provider: 'claude', connectionId: '../etc', connectionVersion: 1,
+        }],
+        ['aiAuth.connectionVersion', {
+            kind: 'personal-subscription', provider: 'claude', connectionId: CONNECTION, connectionVersion: 0,
+        }],
+    ])('refuses %s', (field, aiAuth) => {
+        expect(() => parseManagedSpawnEnvelope(envelope({ aiAuth, gateway: undefined }), NOW))
+            .toThrow(new RegExp(field.replace('.', '\\.')));
     });
 });

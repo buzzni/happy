@@ -36,6 +36,11 @@ import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 
 import { MANAGED_PROJECT_ROOT } from '@/daemon/managedRuntimeIdentity';
+import {
+    ManagedAiAuthSelectionError,
+    parseManagedAiAuthSelection,
+    type ManagedAiAuthSelection,
+} from '@/managed/managedAiAuth';
 
 /** The agents this deployment actually runs, mirroring the parent's list. */
 export const MANAGED_SPAWN_AGENTS = ['claude', 'codex'] as const;
@@ -75,6 +80,12 @@ const WRAPPED_KEY_BYTES = 105;
  * would run one provider and bill another. The parent registers exactly these
  * routes, so they are compared as a unit rather than each field being accepted
  * on its own.
+ *
+ * One agent may have more than one row. Claude has two — Anthropic, and the
+ * GLM upstream the default experience runs on (R22) — which speak the same
+ * wire at different paths. So a row is found by **agent and provider**, not by
+ * agent alone: looking it up by agent would pick whichever row happened to be
+ * first and refuse the other as "not this agent's provider".
  */
 export const GATEWAY_ROUTES: ReadonlyArray<{
     agent: ManagedSpawnAgent;
@@ -98,11 +109,31 @@ export const GATEWAY_ROUTES: ReadonlyArray<{
         clientBasePath: '/api/cloud/gateway/anthropic',
     },
     {
+        /*
+         * `platform-glm`: still the gateway, still a capability, still the
+         * Studio's spend — only the upstream differs, and it answers the same
+         * Anthropic-shaped endpoint the claude CLI already calls.
+         */
+        agent: 'claude', provider: 'zai', endpoint: 'anthropic-messages',
+        path: '/api/cloud/gateway/zai/v1/messages',
+        clientBasePath: '/api/cloud/gateway/zai',
+    },
+    {
         agent: 'codex', provider: 'openai', endpoint: 'openai-responses',
         path: '/api/cloud/gateway/openai/v1/responses',
         clientBasePath: '/api/cloud/gateway/openai/v1',
     },
 ];
+
+/** The row for one agent and provider, or `undefined`. One lookup, one rule. */
+export function findGatewayRoute(
+    agent: ManagedSpawnAgent,
+    provider: string,
+): (typeof GATEWAY_ROUTES)[number] | undefined {
+    return GATEWAY_ROUTES.find(
+        (candidate) => candidate.agent === agent && candidate.provider === provider,
+    );
+}
 
 export type ManagedSpawnBootstrap = {
     version: typeof MANAGED_SPAWN_WIRE_VERSION;
@@ -131,7 +162,23 @@ export type ManagedSpawnEnvelope = {
     initialPrompt: string;
     initialPromptLocalId: string;
     bootstrap: ManagedSpawnBootstrap;
-    gateway: ManagedSpawnGateway;
+    /**
+     * Which AI authentication this run was admitted on.
+     *
+     * Absent on the wire means `platform-gateway`, the meaning every v1
+     * envelope already had. It is not a hint: it decides whether this run has
+     * a gateway capability to spend at all.
+     */
+    aiAuth: ManagedAiAuthSelection;
+    /**
+     * The approved gateway, or `null` for a personal subscription.
+     *
+     * `null` rather than optional, so every consumer has to say what it does
+     * without one. A personal run has no capability, and falling back to a
+     * gateway because a field was missing is precisely the compatibility
+     * bypass R25 forbids.
+     */
+    gateway: ManagedSpawnGateway | null;
 };
 
 export class ManagedSpawnEnvelopeError extends Error {
@@ -228,13 +275,14 @@ function parseGateway(
 
     const provider = text(raw.provider, 'gateway.provider');
     const endpoint = text(raw.endpoint, 'gateway.endpoint');
-    const route = GATEWAY_ROUTES.find((candidate) => candidate.agent === agent);
-    if (!route) fail('gateway.provider', 'no gateway route for this agent');
-    // One row, matched whole. Any single field being plausible on its own is
-    // exactly the mistake this is here to prevent.
-    if (provider !== route.provider) fail('gateway.provider', 'is not this agent\'s provider');
-    if (endpoint !== route.endpoint) fail('gateway.endpoint', 'is not this agent\'s endpoint');
-    if (url.pathname !== route.path) fail('gateway.baseUrl', 'path is not this agent\'s route');
+    // The row is chosen by agent **and** provider, because an agent may have
+    // more than one approved upstream; everything else is then matched against
+    // that row. Any single field being plausible on its own is exactly the
+    // mistake this is here to prevent.
+    const route = findGatewayRoute(agent, provider);
+    if (!route) fail('gateway.provider', 'is not an approved provider for this agent');
+    if (endpoint !== route.endpoint) fail('gateway.endpoint', 'is not this route\'s endpoint');
+    if (url.pathname !== route.path) fail('gateway.baseUrl', 'path is not this route');
 
     const model = text(raw.model, 'gateway.model');
     // Two model axes that disagree bill one model while running another.
@@ -259,6 +307,32 @@ export function parseManagedSpawnEnvelope(value: unknown, now: number): ManagedS
     // The root is the literal, not whatever the envelope would like it to be.
     if (directory !== MANAGED_PROJECT_ROOT) fail('directory', 'is not the managed project root');
     const model = text(raw.model, 'model');
+    /*
+     * Rethrown as this module's error so a refusal still names the field.
+     * `spawnRpc` reports `error.field` for a `ManagedSpawnEnvelopeError` and
+     * the bare string `envelope` for anything else, and an `aiAuth.kind` that
+     * arrived as "envelope" would tell the parent nothing about what it sent.
+     */
+    let aiAuth: ManagedAiAuthSelection;
+    try {
+        aiAuth = parseManagedAiAuthSelection(raw.aiAuth, agent);
+    } catch (error) {
+        if (error instanceof ManagedAiAuthSelectionError) fail(error.field, 'is not supported');
+        throw error;
+    }
+    /*
+     * The two halves of one decision, so they are read together.
+     *
+     * A personal run has no capability to carry, and a gateway beside one is
+     * an envelope built from two different admissions — refused rather than
+     * ignored, because ignoring it is how a personal run ends up spending
+     * Cloud AI budget. A gateway kind with no gateway is the mirror image, and
+     * the refusal is what makes an old daemon reject a personal envelope
+     * instead of quietly running it on the platform's key.
+     */
+    if (aiAuth.kind === 'personal-subscription') {
+        if (raw.gateway !== undefined) fail('gateway', 'must be absent for a personal subscription');
+    }
     return {
         directory,
         agent: agent as ManagedSpawnAgent,
@@ -267,7 +341,10 @@ export function parseManagedSpawnEnvelope(value: unknown, now: number): ManagedS
         initialPrompt: text(raw.initialPrompt, 'initialPrompt'),
         initialPromptLocalId: text(raw.initialPromptLocalId, 'initialPromptLocalId'),
         bootstrap: parseBootstrap(raw.bootstrap, now),
-        gateway: parseGateway(raw.gateway, agent as ManagedSpawnAgent, model),
+        aiAuth,
+        gateway: aiAuth.kind === 'personal-subscription'
+            ? null
+            : parseGateway(raw.gateway, agent as ManagedSpawnAgent, model),
     };
 }
 
