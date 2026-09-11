@@ -19,6 +19,7 @@ import { canonicalManagedPayloadDigest } from './managedDispatchToken';
 import {
     MANAGED_DAEMON_CREDENTIAL_VERSION,
     createManagedCredentialReceiver,
+    normalizeManagedCredentialParams,
     managedDaemonCredentialPath,
     readManagedDaemonCredential,
     replaceManagedDaemonCredential,
@@ -683,4 +684,32 @@ it('reports uncertain publication without equal-expiry retry success and release
     expect(writer).toHaveBeenCalledOnce();
     expect(await receiver.replace(signedCredential(renewed({ expiresAt: NOW + 180_000 }))))
         .toEqual({ ok: true, expiresAt: NOW + 180_000 });
+});
+
+
+describe('shared credential parameter normalization', () => {
+    it.each([undefined, null, [], renewed({ token: '' }), renewed({ expiresAt: 1.5 })])(
+        'refuses malformed fields before asking the clock (%j)', (params) => {
+            const clock = vi.fn(() => { throw new Error('unreachable private clock'); });
+            expect(normalizeManagedCredentialParams(params, clock)).toEqual({ ok: false, reason: 'malformed-request' });
+            expect(clock).not.toHaveBeenCalled();
+        },
+    );
+
+    it('owns normalized scalars, ignores unknown fields, and does not canonicalize the origin', () => {
+        const params = renewed({ token: '  bearer  ', machineId: ' machine-1 ', serverOrigin: ' https://happy.example.test/ ', extra: 'signed elsewhere' });
+        const clock = vi.fn(() => NOW);
+        const result = normalizeManagedCredentialParams(params, clock);
+        params.token = 'changed'; params.expiresAt = NOW + 999_000;
+        expect(result).toEqual({ ok: true, replacement: { token: 'bearer', machineId: MACHINE,
+            serverOrigin: 'https://happy.example.test/', expiresAt: NOW + 120_000 } });
+        expect(clock).toHaveBeenCalledOnce();
+    });
+
+    it('distinguishes valid-clock expiry from an invalid fresh clock', () => {
+        expect(normalizeManagedCredentialParams(renewed({ expiresAt: NOW }), () => NOW))
+            .toEqual({ ok: false, reason: 'credential-expired' });
+        expect(normalizeManagedCredentialParams(renewed({ expiresAt: NOW }), () => NaN))
+            .toEqual({ ok: false, reason: 'credential-clock-invalid' });
+    });
 });

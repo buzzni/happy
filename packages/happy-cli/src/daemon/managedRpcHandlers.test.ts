@@ -787,6 +787,43 @@ describe('taking a renewed credential', () => {
         return { token: credentialToken(payload, tokenOver), params: payload };
     }
 
+    it('carries original signed credential fields beside independently normalized scalars', async () => {
+        const observed: Array<{ replacement: Parameters<NonNullable<ManagedRuntime['replaceCredential']>>[0];
+            original: Parameters<NonNullable<ManagedRuntime['replaceCredential']>>[1] }> = [];
+        const request = credentialCall({ token: '  renewed.bearer  ', machineId: ' machine-1 ',
+            serverOrigin: ' https://happy.example.test ', unknownSigned: { retained: true } }, { epoch: 987 });
+        runtime.replaceCredential = async (replacement, original) => {
+            observed.push({ replacement, original });
+            return { ok: true, expiresAt: replacement.expiresAt };
+        };
+        expect(await handlers.credential(request)).toEqual({ accepted: true, expiresAt: NOW + 3_600_000 });
+        expect(observed).toEqual([{ replacement: { token: 'renewed.bearer', machineId: 'machine-1',
+            serverOrigin: 'https://happy.example.test', expiresAt: NOW + 3_600_000 },
+            original: { token: request.token, params: request.params } }]);
+        expect(observed[0].original.params).toBe(request.params);
+    });
+
+    it.each([NaN, Infinity, -1, 1.5, 'throw'] as const)('refuses invalid fresh credential clock %s before invoking replacement', async (clock) => {
+        const replace = vi.fn(async () => ({ ok: true as const, expiresAt: NOW + 3_600_000 }));
+        runtime.replaceCredential = replace;
+        runtime.now = vi.fn().mockReturnValueOnce(NOW).mockImplementation(() => {
+            if (clock === 'throw') throw new Error('private clock');
+            return clock;
+        });
+        await expect(handlers.credential(credentialCall())).rejects.toMatchObject({ code: 'credential-clock-invalid' });
+        expect(replace).not.toHaveBeenCalled();
+    });
+
+    it('preserves malformed-body precedence over a failing fresh clock', async () => {
+        const replace = vi.fn(async () => ({ ok: true as const, expiresAt: NOW + 3_600_000 }));
+        runtime.replaceCredential = replace;
+        const now = vi.fn().mockReturnValueOnce(NOW).mockImplementation(() => { throw new Error('private clock'); });
+        runtime.now = now;
+        await expect(handlers.credential(credentialCall({ token: '' }))).rejects.toMatchObject({ code: 'malformed-request' });
+        expect(now).toHaveBeenCalledOnce();
+        expect(replace).not.toHaveBeenCalled();
+    });
+
     it('writes it and reports the expiry that took', async () => {
         const taken: { token: string; expiresAt: number }[] = [];
         runtime.replaceCredential = async (input) => {

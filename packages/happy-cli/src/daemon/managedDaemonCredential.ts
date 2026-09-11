@@ -416,9 +416,9 @@ export function createManagedCredentialReceiver(input: {
 }
 
 
-type ManagedCredentialReplacement = { token: string; machineId: string; serverOrigin: string; expiresAt: number };
+export type ManagedCredentialReplacement = { token: string; machineId: string; serverOrigin: string; expiresAt: number };
 
-function normalizeManagedCredentialParams(params: unknown, now: () => number):
+export function normalizeManagedCredentialParams(params: unknown, now: () => number):
     | { ok: true; replacement: ManagedCredentialReplacement }
     | { ok: false; reason: 'malformed-request' | 'credential-expired' | 'credential-clock-invalid' } {
     if (!params || typeof params !== 'object' || Array.isArray(params)) return { ok: false, reason: 'malformed-request' };
@@ -436,3 +436,12 @@ function normalizeManagedCredentialParams(params: unknown, now: () => number):
     if (expiresAt <= observedNow) return { ok: false, reason: 'credential-expired' };
     return { ok: true, replacement: { token, machineId, serverOrigin, expiresAt } };
 }
+
+
+/** Original signed material, before replacement-field normalization. */
+export type ManagedCredentialEnvelope = { token: string; params: unknown };
+
+/** Closed callback contract for the later IPC relay; no transport is activated here. */
+export type ManagedCredentialRelayOutcome = ManagedCredentialReceiverOutcome
+    | { ok: false; reason: 'capability-unavailable' | 'shutting-down' | 'credential-request-too-large'
+        | 'credential-delivery-unknown' | 'live-adoption-unknown' };

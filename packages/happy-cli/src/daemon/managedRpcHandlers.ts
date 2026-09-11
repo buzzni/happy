@@ -37,7 +37,8 @@ import {
     type ProcessGroupEvidence,
 } from './managedProcessGroup';
 import type { ManagedRuntimeIdentity } from './managedRuntimeIdentity';
-import type { ManagedCredentialReplaceOutcome } from './managedDaemonCredential';
+import { normalizeManagedCredentialParams, type ManagedCredentialEnvelope, type ManagedCredentialReplacement,
+    type ManagedCredentialRelayOutcome } from './managedDaemonCredential';
 import { logger } from '@/ui/logger';
 import {
     ManagedSpawnEnvelopeError,
@@ -248,13 +249,12 @@ export type ManagedRuntime = {
      * them against what it holds. They are signed into the token's payload
      * digest, so a mismatch is not a badly-shaped request — it is a credential
      * that was issued for somebody else.
+     *
+     * `original` preserves the dispatch token and params before normalization,
+     * so the eventual privileged receiver can authenticate what was signed.
      */
-    replaceCredential?: (input: {
-        token: string;
-        expiresAt: number;
-        machineId: string;
-        serverOrigin: string;
-    }) => Promise<ManagedCredentialReplaceOutcome>;
+    replaceCredential?: (replacement: ManagedCredentialReplacement, original: ManagedCredentialEnvelope)
+        => Promise<ManagedCredentialRelayOutcome>;
     /**
      * Takes a checkpoint target the parent issued, for the checkpoint it names.
      *
@@ -1297,24 +1297,15 @@ const credentialRpc = async (params: unknown) => {
             // stops trying.
             throw new ManagedRpcError('capability-unavailable');
         }
-        const record = (params && typeof params === 'object' && !Array.isArray(params))
-            ? (params as Record<string, unknown>).params
-            : null;
-        if (!record || typeof record !== 'object' || Array.isArray(record)) {
-            throw new ManagedRpcError('malformed-request');
-        }
-        const body = record as Record<string, unknown>;
-        const token = typeof body.token === 'string' ? body.token.trim() : '';
-        const machineId = typeof body.machineId === 'string' ? body.machineId.trim() : '';
-        const serverOrigin = typeof body.serverOrigin === 'string' ? body.serverOrigin.trim() : '';
-        const expiresAt = body.expiresAt;
-        if (token === '' || machineId === '' || serverOrigin === ''
-            || typeof expiresAt !== 'number' || !Number.isSafeInteger(expiresAt)) {
-            throw new ManagedRpcError('malformed-request');
-        }
-        if (expiresAt <= runtime.now()) throw new ManagedRpcError('credential-expired');
-
-        const outcome = await runtime.replaceCredential({ token, expiresAt, machineId, serverOrigin });
+        // verifyProvisioning authenticated this envelope. Keep its original params,
+        // including signed unknown fields, separate from the normalized replacement.
+        const record = params as Record<string, unknown>;
+        const token = record.token;
+        if (typeof token !== 'string') throw new ManagedRpcError('malformed-request');
+        const original: ManagedCredentialEnvelope = { token, params: record.params };
+        const normalized = normalizeManagedCredentialParams(original.params, () => runtime.now());
+        if (!normalized.ok) throw new ManagedRpcError(normalized.reason);
+        const outcome = await runtime.replaceCredential(normalized.replacement, original);
         if (!outcome.ok) throw new ManagedRpcError(outcome.reason);
         // The expiry that is now **on the disk**, from the writer rather than
         // from the request: the parent must see which renewal actually took.
