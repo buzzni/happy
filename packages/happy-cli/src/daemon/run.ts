@@ -113,6 +113,11 @@ import {
   type StopSessionResult,
 } from './sessionIdleReaper';
 import {
+  createProcFs,
+  createProcProcessProbe,
+  stopSessionWithVerifiedExit,
+} from './sessionExitVerification';
+import {
   resolveOrphanAdoption,
   collectStartupOrphans,
   resolveTrackedPidOwner,
@@ -2104,6 +2109,19 @@ export async function startDaemon(): Promise<void> {
     // their (possibly days-old) session start.
     const daemonStartedAt = Date.now();
 
+    // The entry `stopSession` below would pick, without touching it. Same two
+    // conditions on purpose: the verification must snapshot the process the
+    // stop will signal, not a different one.
+    const findStopTarget = (sessionId: string): { pid: number; session: TrackedSession } | undefined => {
+      for (const [pid, session] of pidToTrackedSession.entries()) {
+        if (session.happySessionId === sessionId ||
+          (sessionId.startsWith('PID-') && pid === parseInt(sessionId.replace('PID-', '')))) {
+          return { pid, session };
+        }
+      }
+      return undefined;
+    };
+
     // Stop a session by sessionId or PID fallback.
     //
     // `context.mode` decides enforcement: 'force' (the default for user actions)
@@ -2185,6 +2203,23 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[DAEMON RUN] Session ${sessionId} not found`);
       return { stopped: false, reason: 'not-found' };
     };
+
+    // `stopped: true` above only means a SIGTERM was attempted — the kill call
+    // is wrapped in a catch — and never that anything exited. A caller that
+    // deletes the project next needs the stronger answer, so this variant
+    // snapshots the session's process tree first and then watches those exact
+    // processes exit.
+    // It sends no signal of its own and never answers 'exited' without evidence.
+    const sessionExitProbe = createProcProcessProbe(createProcFs());
+    const stopSessionWithExitVerification = (sessionId: string, context?: StopSessionContext) =>
+      stopSessionWithVerifiedExit({
+        findTarget: () => {
+          const target = findStopTarget(sessionId);
+          return target ? { pid: target.pid, token: target.session } : undefined;
+        },
+        stop: () => stopSession(sessionId, context),
+        probe: sessionExitProbe,
+      });
 
     // Handle child process exit — preserve session data for resume
     const onChildExited = (pid: number) => {
@@ -2751,6 +2786,7 @@ export async function startDaemon(): Promise<void> {
       resumeSession,
       recoverSession,
       stopSession,
+      stopSessionWithExitVerification,
       requestShutdown: () => requestShutdown('happy-app'),
       portRegistry,
       automationStore,

@@ -33,6 +33,10 @@ import {
     type StopSessionContext,
     type StopSessionResult,
 } from '@/daemon/sessionIdleReaper';
+import {
+    SESSION_EXIT_VERIFICATION_SCOPE,
+    type SessionExitVerification,
+} from '@/daemon/sessionExitVerification';
 import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
 /**
  * Bound preview requests travel on their own Socket.IO event. Kept as a
@@ -460,6 +464,15 @@ type MachineRpcHandlers = {
     }) => Promise<ResumeSessionResult>;
     recoverSession?: (sessionId: string, options: RecoverSessionOptions) => Promise<RecoverSessionResult>;
     stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
+    /**
+     * Stop plus proof that the session's processes are gone. Used only for a
+     * `verifyExit: true` request; absent on a daemon build without it, which
+     * answers such a request with the legacy stop and `unavailable` evidence.
+     */
+    stopSessionWithExitVerification?: (
+        sessionId: string,
+        context?: StopSessionContext,
+    ) => Promise<{ result: StopSessionResult; exitVerification: SessionExitVerification }>;
     requestShutdown: () => void;
     portRegistry: PortRegistry;
     /** When present, registers the scheduled-automation RPCs and advertises automationSupport. */
@@ -475,6 +488,39 @@ type MachineRpcHandlers = {
     aiCredentialRuntime: AiCredentialRuntime;
     autonomousQualityGate?: AutonomousQualityGateRpcHandlers;
     checkpoint?: CheckpointRpcHandlers;
+}
+
+/**
+ * The stop-session response every caller has always received. Kept in one place
+ * now that the verified variant wraps the same three outcomes.
+ */
+function describeStopResult(sessionId: string, result: StopSessionResult) {
+    if (result.stopped) {
+        logger.debug(`[API MACHINE] Stopped session ${sessionId}`);
+        return { message: 'Session stopped', stopped: true as const };
+    }
+
+    // Duplicate or untracked stop: a no-op acknowledgement so callers can retry
+    // idempotently. It says this daemon tracks no such session — not that any
+    // process exited; only `exitVerification` answers that.
+    if (result.reason === 'not-found') {
+        logger.debug(`[API MACHINE] Session ${sessionId} not tracked; treating stop as no-op success`);
+        return { message: 'Session not tracked', stopped: false as const, reason: 'not-found' as const };
+    }
+
+    // Guard refused an if-idle stop because the session is active. Return a
+    // structured refusal (not an error) so a policy caller can back off and
+    // re-evaluate later instead of retrying immediately or escalating.
+    logger.debug(
+        `[API MACHINE] Refused idle stop for active session ${sessionId} (guard=${result.guard})`,
+    );
+    return {
+        message: 'Session active; stop skipped',
+        stopped: false as const,
+        reason: 'active' as const,
+        guard: result.guard,
+        activity: result.activity,
+    };
 }
 
 function requireNonEmptyString(value: unknown, name: string): string {
@@ -672,6 +718,7 @@ export class ApiMachineClient {
         resumeSession,
         recoverSession,
         stopSession,
+        stopSessionWithExitVerification,
         requestShutdown,
         portRegistry,
         automationStore,
@@ -868,8 +915,8 @@ export class ApiMachineClient {
         this.syncRecoverSessionRpcRegistration();
 
         // Register stop session handler
-        this.rpcHandlerManager.registerHandler('stop-session', (params: any) => {
-            const { sessionId, source, reason, mode } = params || {};
+        this.rpcHandlerManager.registerHandler('stop-session', async (params: any) => {
+            const { sessionId, source, reason, mode, verifyExit } = params || {};
 
             if (!sessionId) {
                 throw new Error('Session ID is required');
@@ -885,34 +932,36 @@ export class ApiMachineClient {
                 source: context.source,
                 reason: context.reason,
                 mode: effectiveMode,
+                verifyExit: verifyExit === true,
             });
 
-            const result = stopSession(sessionId, context);
-
-            if (result.stopped) {
-                logger.debug(`[API MACHINE] Stopped session ${sessionId}`);
-                return { message: 'Session stopped', stopped: true };
+            // A caller that deletes data after the stop asks for proof of exit
+            // with `verifyExit: true`. Everyone else gets the response they
+            // always got, byte for byte, and pays none of the observation cost.
+            if (verifyExit !== true) {
+                return describeStopResult(sessionId, stopSession(sessionId, context));
             }
 
-            // Duplicate or untracked stop: safe no-op success so callers can retry
-            // idempotently (the process is already gone / never here).
-            if (result.reason === 'not-found') {
-                logger.debug(`[API MACHINE] Session ${sessionId} not tracked; treating stop as no-op success`);
-                return { message: 'Session not tracked', stopped: false, reason: 'not-found' };
+            if (!stopSessionWithExitVerification) {
+                // A daemon build without the verifier. Say so rather than
+                // implying the legacy stop proved anything.
+                return {
+                    ...describeStopResult(sessionId, stopSession(sessionId, context)),
+                    exitVerification: {
+                        status: 'unavailable' as const,
+                        scope: SESSION_EXIT_VERIFICATION_SCOPE,
+                        detail: 'verification-unsupported' as const,
+                    },
+                };
             }
 
-            // Guard refused an if-idle stop because the session is active. Return a
-            // structured refusal (not an error) so a policy caller can back off and
-            // re-evaluate later instead of retrying immediately or escalating.
+            const verified = await stopSessionWithExitVerification(sessionId, context);
             logger.debug(
-                `[API MACHINE] Refused idle stop for active session ${sessionId} (guard=${result.guard})`,
+                `[API MACHINE] Stop session ${sessionId} exit verification: ${verified.exitVerification.status}`,
             );
             return {
-                message: 'Session active; stop skipped',
-                stopped: false,
-                reason: 'active',
-                guard: result.guard,
-                activity: result.activity,
+                ...describeStopResult(sessionId, verified.result),
+                exitVerification: verified.exitVerification,
             };
         });
 
