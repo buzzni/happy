@@ -391,21 +391,13 @@ export function createManagedCredentialReceiver(input: {
                     if (!verified.ok) return { ok: false, reason: `token-${verified.reason}` };
                     if (verified.claims.projectId !== projectId) return { ok: false, reason: 'token-wrong-project' };
                     if (verified.claims.kid !== keyId) return { ok: false, reason: 'token-unknown-key' };
-                    if (!params || typeof params !== 'object' || Array.isArray(params)) return { ok: false, reason: 'malformed-request' };
-                    // Kept local until the IPC cutover can share this normalization with credentialRpc.
-                    const body = params as Record<string, unknown>;
-                    const token = typeof body.token === 'string' ? body.token.trim() : '';
-                    const machineId = typeof body.machineId === 'string' ? body.machineId.trim() : '';
-                    const serverOrigin = typeof body.serverOrigin === 'string' ? body.serverOrigin.trim() : '';
-                    const expiresAt = body.expiresAt;
-                    if (!token || !machineId || !serverOrigin || typeof expiresAt !== 'number' || !Number.isSafeInteger(expiresAt)) {
-                        return { ok: false, reason: 'malformed-request' };
-                    }
-                    try { observedNow = now(); } catch { return { ok: false, reason: 'credential-clock-invalid' }; }
-                    if (!Number.isSafeInteger(observedNow) || observedNow < 0) return { ok: false, reason: 'credential-clock-invalid' };
-                    if (expiresAt <= observedNow) return { ok: false, reason: 'credential-expired' };
+                    const normalized = normalizeManagedCredentialParams(params, () => {
+                        observedNow = now();
+                        return observedNow;
+                    });
+                    if (!normalized.ok) return normalized;
                     // All request fields and admitted axes are owned before the first write await.
-                    replacement = { token, machineId, serverOrigin, expiresAt };
+                    replacement = normalized.replacement;
                 } catch {
                     return { ok: false, reason: 'malformed-request' };
                 }
@@ -421,4 +413,26 @@ export function createManagedCredentialReceiver(input: {
             }
         },
     };
+}
+
+
+type ManagedCredentialReplacement = { token: string; machineId: string; serverOrigin: string; expiresAt: number };
+
+function normalizeManagedCredentialParams(params: unknown, now: () => number):
+    | { ok: true; replacement: ManagedCredentialReplacement }
+    | { ok: false; reason: 'malformed-request' | 'credential-expired' | 'credential-clock-invalid' } {
+    if (!params || typeof params !== 'object' || Array.isArray(params)) return { ok: false, reason: 'malformed-request' };
+    const body = params as Record<string, unknown>;
+    const token = typeof body.token === 'string' ? body.token.trim() : '';
+    const machineId = typeof body.machineId === 'string' ? body.machineId.trim() : '';
+    const serverOrigin = typeof body.serverOrigin === 'string' ? body.serverOrigin.trim() : '';
+    const expiresAt = body.expiresAt;
+    if (!token || !machineId || !serverOrigin || typeof expiresAt !== 'number' || !Number.isSafeInteger(expiresAt)) {
+        return { ok: false, reason: 'malformed-request' };
+    }
+    let observedNow: number;
+    try { observedNow = now(); } catch { return { ok: false, reason: 'credential-clock-invalid' }; }
+    if (!Number.isSafeInteger(observedNow) || observedNow < 0) return { ok: false, reason: 'credential-clock-invalid' };
+    if (expiresAt <= observedNow) return { ok: false, reason: 'credential-expired' };
+    return { ok: true, replacement: { token, machineId, serverOrigin, expiresAt } };
 }
