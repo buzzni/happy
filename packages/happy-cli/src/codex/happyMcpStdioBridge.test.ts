@@ -150,7 +150,8 @@ describe('Happy MCP bridge process lifetime', { timeout: 15_000 }, () => {
     expect(b.child.exitCode).toBe(0);
   });
 
-  it.each(['SIGTERM', 'SIGINT'] as const)('closes its HTTP stream on %s', async (signal) => {
+  // Windows process.kill terminates directly rather than delivering POSIX handlers.
+  it.skipIf(process.platform === 'win32').each(['SIGTERM', 'SIGINT'] as const)('closes its HTTP stream on %s', async (signal) => {
     const http = await upstream();
     const b = bridge(http.url);
     await initialize(b);
