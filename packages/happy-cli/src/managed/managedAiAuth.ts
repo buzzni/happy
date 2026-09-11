@@ -23,21 +23,53 @@
  * path contract, and the module that touches it is `managedAiAuthStore`.
  */
 
-export const MANAGED_AI_AUTH_KINDS = ['platform-gateway', 'platform-glm', 'personal-subscription'] as const;
+export const MANAGED_AI_AUTH_KINDS = [
+    'platform-gateway', 'platform-glm', 'personal-subscription', 'personal-api-key',
+] as const;
 export type ManagedAiAuthKind = (typeof MANAGED_AI_AUTH_KINDS)[number];
 
-export const MANAGED_AI_AUTH_PROVIDERS = ['claude', 'codex'] as const;
+/**
+ * `glm` is API-key only: there is no GLM subscription login, and a GLM key is
+ * spent by Claude Code (agent `claude`) against Z.AI's Anthropic-compatible
+ * endpoint.
+ */
+export const MANAGED_AI_AUTH_PROVIDERS = ['claude', 'codex', 'glm'] as const;
 export type ManagedAiAuthProvider = (typeof MANAGED_AI_AUTH_PROVIDERS)[number];
+export const MANAGED_AI_AUTH_SUBSCRIPTION_PROVIDERS = ['claude', 'codex'] as const;
+
+/** What a connection holds. One-to-one with the personal kinds. */
+export const MANAGED_AI_AUTH_CREDENTIAL_KINDS = ['oauth', 'api-key'] as const;
+export type ManagedAiAuthCredentialKind = (typeof MANAGED_AI_AUTH_CREDENTIAL_KINDS)[number];
+
+export type ManagedAiAuthPersonalKind = 'personal-subscription' | 'personal-api-key';
 
 export type ManagedAiAuthSelection =
     | { kind: 'platform-gateway' }
     | { kind: 'platform-glm' }
     | {
-        kind: 'personal-subscription';
+        kind: ManagedAiAuthPersonalKind;
         provider: ManagedAiAuthProvider;
         connectionId: string;
         connectionVersion: number;
     };
+
+export function isPersonalAiAuth(
+    selection: ManagedAiAuthSelection,
+): selection is Extract<ManagedAiAuthSelection, { kind: ManagedAiAuthPersonalKind }> {
+    return selection.kind === 'personal-subscription' || selection.kind === 'personal-api-key';
+}
+
+export function credentialKindForAiAuth(kind: ManagedAiAuthPersonalKind): ManagedAiAuthCredentialKind {
+    return kind === 'personal-subscription' ? 'oauth' : 'api-key';
+}
+
+/** The agent a provider's credential is spent by. A GLM key runs Claude Code. */
+export function aiAuthAgentForProvider(provider: ManagedAiAuthProvider): 'claude' | 'codex' {
+    return provider === 'codex' ? 'codex' : 'claude';
+}
+
+/** Z.AI's Anthropic-compatible base, the same one the trial lease points Claude Code at. */
+export const MANAGED_AI_AUTH_GLM_BASE_URL = 'https://api.z.ai/api/anthropic';
 
 /** Same character set as the parent: the id becomes a directory name. */
 export const MANAGED_AI_AUTH_CONNECTION_ID_PATTERN = /^[A-Za-z0-9-]{8,64}$/;
@@ -60,6 +92,8 @@ export type ManagedAiAuthMarker = {
     provider: ManagedAiAuthProvider;
     /** The parent-issued version this credential belongs to. */
     connectionVersion: number;
+    /** Absent in markers written before keys existed: those are logins. */
+    credentialKind?: ManagedAiAuthCredentialKind;
     /** Masked, non-secret account display. */
     accountLabel?: string;
 };
@@ -71,7 +105,7 @@ export function managedAiAuthConnectionDir(connectionId: string): string {
     return `${MANAGED_AI_AUTH_HOME_ROOT}/${connectionId}`;
 }
 
-/** `CLAUDE_CONFIG_DIR` for claude, `CODEX_HOME` for codex. */
+/** `CLAUDE_CONFIG_DIR` for claude, `CODEX_HOME` for codex, the key file's home for glm. */
 export function managedAiAuthProviderHome(connectionId: string, provider: ManagedAiAuthProvider): string {
     return `${managedAiAuthConnectionDir(connectionId)}/${provider}`;
 }
@@ -116,11 +150,20 @@ export function parseManagedAiAuthSelection(value: unknown, agent: string): Mana
     }
     const provider = record.provider;
     if (typeof provider !== 'string' || !(MANAGED_AI_AUTH_PROVIDERS as readonly string[]).includes(provider)) {
-        fail('aiAuth.provider', 'must be claude or codex');
+        fail('aiAuth.provider', 'must be claude, codex or glm');
+    }
+    if (
+        kind === 'personal-subscription'
+        && !(MANAGED_AI_AUTH_SUBSCRIPTION_PROVIDERS as readonly string[]).includes(provider)
+    ) {
+        fail('aiAuth.provider', 'a subscription login exists only for claude and codex');
     }
     // A Codex login cannot run a Claude generation, and the parent never asks
-    // for it; an envelope that does is built from the wrong run.
-    if (provider !== agent) fail('aiAuth.provider', 'does not match the agent');
+    // for it; an envelope that does is built from the wrong run. A GLM key is
+    // spent by Claude Code, so it maps to the claude agent.
+    if (aiAuthAgentForProvider(provider as ManagedAiAuthProvider) !== agent) {
+        fail('aiAuth.provider', 'does not match the agent');
+    }
     const connectionId = record.connectionId;
     if (typeof connectionId !== 'string' || !MANAGED_AI_AUTH_CONNECTION_ID_PATTERN.test(connectionId)) {
         fail('aiAuth.connectionId', 'is not a valid connection id');
@@ -130,7 +173,7 @@ export function parseManagedAiAuthSelection(value: unknown, agent: string): Mana
         fail('aiAuth.connectionVersion', 'must be a positive integer');
     }
     return {
-        kind: 'personal-subscription',
+        kind: kind as ManagedAiAuthPersonalKind,
         provider: provider as ManagedAiAuthProvider,
         connectionId,
         connectionVersion,
@@ -138,7 +181,7 @@ export function parseManagedAiAuthSelection(value: unknown, agent: string): Mana
 }
 
 export function isGatewayAiAuth(selection: ManagedAiAuthSelection): boolean {
-    return selection.kind !== 'personal-subscription';
+    return !isPersonalAiAuth(selection);
 }
 
 /**
@@ -153,7 +196,7 @@ export function managedAiAuthCodexHome(
     selection: ManagedAiAuthSelection,
     platformCodexHome: string,
 ): string {
-    return selection.kind === 'personal-subscription'
+    return isPersonalAiAuth(selection)
         ? managedAiAuthProviderHome(selection.connectionId, 'codex')
         : platformCodexHome;
 }
@@ -165,7 +208,9 @@ export function managedAiAuthCodexHome(
 export const MANAGED_AI_AUTH_RPC_METHOD = 'managed:ai-auth';
 export const MANAGED_AI_AUTH_TOKEN_OP = 'ai-auth';
 
-export const MANAGED_AI_AUTH_ACTIONS = ['login-start', 'login-complete', 'login-cancel', 'logout', 'status'] as const;
+export const MANAGED_AI_AUTH_ACTIONS = [
+    'login-start', 'login-complete', 'login-cancel', 'set-key', 'logout', 'status',
+] as const;
 export type ManagedAiAuthAction = (typeof MANAGED_AI_AUTH_ACTIONS)[number];
 
 export type ManagedAiAuthRpcParams = {
@@ -178,7 +223,15 @@ export type ManagedAiAuthRpcParams = {
     expiresAt?: number;
     /** login-complete (claude): the code the user pasted, `code#state` allowed. */
     code?: string;
+    /**
+     * set-key only. Lands in the auth home and nowhere else — never in a
+     * reply, never in a log line, never in the parent's database.
+     */
+    apiKey?: string;
 };
+
+/** Printable ASCII, 8..512, no whitespace. Provider prefixes are not checked: they change. */
+export const MANAGED_AI_AUTH_API_KEY_PATTERN = /^[\x21-\x7E]{8,512}$/;
 
 export type ManagedAiAuthLoginMethod = 'paste-code' | 'device-code';
 
@@ -190,6 +243,8 @@ export type ManagedAiAuthLoginMethod = 'paste-code' | 'device-code';
 export type ManagedAiAuthRpcResult = {
     state: 'absent' | 'pending' | 'connected' | 'failed';
     connectionVersion: number | null;
+    /** On `connected`: what kind of credential is held. */
+    credentialKind?: ManagedAiAuthCredentialKind;
     loginMethod?: ManagedAiAuthLoginMethod;
     loginUrl?: string;
     userCode?: string;
@@ -202,7 +257,7 @@ export function parseManagedAiAuthRpcParams(value: unknown): ManagedAiAuthRpcPar
     if (typeof value !== 'object' || value === null || Array.isArray(value)) fail('params', 'must be an object');
     const record = value as Record<string, unknown>;
     for (const key of Object.keys(record)) {
-        if (!['action', 'connectionId', 'provider', 'connectionVersion', 'expiresAt', 'code'].includes(key)) {
+        if (!['action', 'connectionId', 'provider', 'connectionVersion', 'expiresAt', 'code', 'apiKey'].includes(key)) {
             fail('params', 'has an unexpected field');
         }
     }
@@ -216,7 +271,7 @@ export function parseManagedAiAuthRpcParams(value: unknown): ManagedAiAuthRpcPar
     }
     const provider = record.provider;
     if (typeof provider !== 'string' || !(MANAGED_AI_AUTH_PROVIDERS as readonly string[]).includes(provider)) {
-        fail('provider', 'must be claude or codex');
+        fail('provider', 'must be claude, codex or glm');
     }
     const params: ManagedAiAuthRpcParams = {
         action: action as ManagedAiAuthAction,
@@ -245,8 +300,20 @@ export function parseManagedAiAuthRpcParams(value: unknown): ManagedAiAuthRpcPar
         }
         params.code = code.trim();
     }
-    if ((action === 'login-start' || action === 'logout') && params.connectionVersion === undefined) {
+    if (record.apiKey !== undefined) {
+        const apiKey = record.apiKey;
+        // The value never reaches a message: the failure names the field only.
+        if (typeof apiKey !== 'string' || !MANAGED_AI_AUTH_API_KEY_PATTERN.test(apiKey)) {
+            fail('apiKey', 'is not a usable api key');
+        }
+        params.apiKey = apiKey;
+    }
+    if ((action === 'login-start' || action === 'logout' || action === 'set-key') && params.connectionVersion === undefined) {
         fail('connectionVersion', `is required for ${action}`);
+    }
+    if (action === 'set-key' && params.apiKey === undefined) fail('apiKey', 'is required for set-key');
+    if ((action === 'login-start' || action === 'login-complete') && provider === 'glm') {
+        fail('provider', 'glm has no login; register a key');
     }
     if (action === 'login-start' && params.expiresAt === undefined) {
         fail('expiresAt', 'is required for login-start');
