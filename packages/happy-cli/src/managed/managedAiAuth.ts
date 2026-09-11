@@ -6,7 +6,7 @@
  * the top of `managedDispatchToken.ts` about the token contract), so the two
  * files carry the same constants and a cross-boundary test keeps them equal.
  *
- * Three kinds, and they are not interchangeable:
+ * Four kinds, and they are not interchangeable:
  *
  *  - `platform-gateway`     the meaning of an envelope with no `aiAuth` at all:
  *                           the approved Saycode gateway, spent with the
@@ -18,6 +18,11 @@
  *                           living under this runtime's auth home. No gateway,
  *                           no capability, no Studio AI budget. The provider
  *                           CLI talks to the vendor directly.
+ *  - `personal-api-key`     the requester's **own** Claude, Codex or GLM API
+ *                           key, registered into the same auth home. Same
+ *                           rules as a subscription; a GLM key is spent by
+ *                           Claude Code against Z.AI and is a different axis
+ *                           from `platform-glm`.
  *
  * Nothing here reads a file or the environment; the auth home layout is a
  * path contract, and the module that touches it is `managedAiAuthStore`.
