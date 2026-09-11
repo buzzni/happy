@@ -18,14 +18,21 @@ import { realpath } from 'node:fs/promises';
  * sessions carry no childProcess handle, so no exit event evicts them and only
  * the periodic health check prunes their PID. Answering "already running" for a
  * dead entry would turn a resume into a no-op, so the PID is verified here.
+ *
+ * `happySessionId` is only set once the child POSTs its session webhook, which
+ * can take minutes on a loaded daemon — and the spawn's 60s webhook timeout
+ * fails the RPC without killing the child (2026-09-11 incident). A resume spawn
+ * therefore also records the session it was launched for as
+ * `resumeTargetSessionId`, and that claim counts as attached from spawn onward.
  */
 export function hasLiveDaemonChild(
     happySessionId: string,
-    trackedSessions: Iterable<{ happySessionId?: string; pid: number }>,
+    trackedSessions: Iterable<{ happySessionId?: string; resumeTargetSessionId?: string; pid: number }>,
     isPidAlive: (pid: number) => boolean,
 ): boolean {
     for (const session of trackedSessions) {
-        if (session.happySessionId === happySessionId && isPidAlive(session.pid)) return true;
+        const attachedTo = session.happySessionId ?? session.resumeTargetSessionId;
+        if (attachedTo === happySessionId && isPidAlive(session.pid)) return true;
     }
     return false;
 }
