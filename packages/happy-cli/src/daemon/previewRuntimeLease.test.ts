@@ -279,3 +279,47 @@ describe('enforceRelayBinding', () => {
     await expect(enforceRelayBinding(undefined, 3000, deps())).resolves.toEqual({ outcome: 'unbound' })
   })
 })
+
+/**
+ * specs/runtime-isolation-hardening (H3, P3) — the reverse direction of the
+ * viewer split. A viewer claim on the project relay must be refused outright:
+ * accepting it as "a project binding with extra fields" would let a viewer
+ * token be spent on a project runtime, and turning it into `unbound` would be
+ * worse still, since unbound is the compatibility path for an older server.
+ */
+describe('enforceRelayBinding — project/viewer disjointness', () => {
+  const VIEWER_KEY = 'bv1_abcdefghijklmnopqrstuvwxyz012345'
+  const refusingDeps = {
+    probeEvidence: async () => { throw new Error('evidence must not be probed') },
+    readPortRegistry: async () => { throw new Error('registry must not be read') },
+    canonicalize: async () => { throw new Error('paths must not be resolved') },
+  } as never
+
+  it('refuses a viewer binding on the project event without probing anything', async () => {
+    await expect(enforceRelayBinding(
+      { purpose: 'viewer', viewerKey: VIEWER_KEY, leaseId: 'lease-1' },
+      3000,
+      refusingDeps,
+    )).resolves.toMatchObject({ outcome: 'rejected', code: 'INVALID_REQUEST' })
+  })
+
+  it('refuses a project binding that also carries a purpose', async () => {
+    await expect(enforceRelayBinding(
+      { projectId: 'proj-1', leaseId: 'lease-1', purpose: 'viewer' },
+      3000,
+      refusingDeps,
+    )).resolves.toMatchObject({ outcome: 'rejected', code: 'INVALID_REQUEST' })
+  })
+
+  it('refuses a project binding that smuggles a viewerKey', async () => {
+    await expect(enforceRelayBinding(
+      { projectId: 'proj-1', leaseId: 'lease-1', viewerKey: VIEWER_KEY },
+      3000,
+      refusingDeps,
+    )).resolves.toMatchObject({ outcome: 'rejected', code: 'INVALID_REQUEST' })
+  })
+
+  it('still reports a genuinely absent binding as unbound', async () => {
+    await expect(enforceRelayBinding(undefined, 3000, refusingDeps)).resolves.toEqual({ outcome: 'unbound' })
+  })
+})

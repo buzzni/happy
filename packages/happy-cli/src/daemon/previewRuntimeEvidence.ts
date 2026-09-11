@@ -347,7 +347,7 @@ export function hostPortMatch(ports: string, port: number): HostPortMatch {
   return unreachable ? 'unreachable-address' : 'no-match'
 }
 
-async function probeContainerPublish(port: number, io: EvidenceIo): Promise<EvidenceProbeResult> {
+export async function probeContainerPublish(port: number, io: EvidenceIo): Promise<EvidenceProbeResult> {
   const result = await io.exec(
     'docker',
     ['ps', '--no-trunc', '--format', '{{.ID}}\t{{.Ports}}\t{{.Names}}\t{{.Label "aplus.projectId"}}'],

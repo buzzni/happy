@@ -56,12 +56,32 @@ export function resolvePreviewAuthorizeConfig(
     return { origin: parsed.origin, secret };
 }
 
-export interface PreviewAuthorizeRequest {
+export interface PreviewAuthorizeProjectRequest {
     studioUserId: string;
     projectId: string;
     machineId: string;
     port: number;
 }
+
+/**
+ * specs/runtime-isolation-hardening (H3 viewer purpose) — the machine-scoped
+ * question. The studio answers it with `canUserAccessMachine` **and** by
+ * re-deriving the viewer key for this user on this machine: machine access
+ * alone would let anyone who may reach a shared machine ride another user's
+ * viewer, because "may open a screen here" and "owns this screen" are
+ * different facts.
+ */
+export interface PreviewAuthorizeViewerRequest {
+    purpose: 'viewer';
+    studioUserId: string;
+    viewerKey: string;
+    machineId: string;
+    port: number;
+}
+
+export type PreviewAuthorizeRequest =
+    | PreviewAuthorizeProjectRequest
+    | PreviewAuthorizeViewerRequest;
 
 export type PreviewAuthorizeResult =
     /**
@@ -71,7 +91,7 @@ export type PreviewAuthorizeResult =
      * and they must reach it from here — a path supplied by the caller would
      * prove nothing at all.
      */
-    | { kind: 'allowed'; workspacePaths: string[] }
+    | { kind: 'allowed'; workspacePaths: string[]; viewerKey?: string }
     | { kind: 'denied' }
     | { kind: 'unavailable'; reason: string };
 
@@ -117,12 +137,22 @@ export function createPreviewAuthorizer(options: {
                         'Content-Type': 'application/json',
                         'X-Trusted-Preview-Secret': options.config.secret,
                     },
-                    body: JSON.stringify({
-                        studioUserId: request.studioUserId,
-                        projectId: request.projectId,
-                        machineId: request.machineId,
-                        port: request.port,
-                    }),
+                    body: JSON.stringify(
+                        isViewerRequest(request)
+                            ? {
+                                purpose: 'viewer',
+                                studioUserId: request.studioUserId,
+                                viewerKey: request.viewerKey,
+                                machineId: request.machineId,
+                                port: request.port,
+                            }
+                            : {
+                                studioUserId: request.studioUserId,
+                                projectId: request.projectId,
+                                machineId: request.machineId,
+                                port: request.port,
+                            },
+                    ),
                     signal: controller.signal,
                 });
 
@@ -139,6 +169,19 @@ export function createPreviewAuthorizer(options: {
                     payload = JSON.parse(body);
                 } catch {
                     return unavailable('non-json answer');
+                }
+                if (isViewerRequest(request)) {
+                    const viewer = parseViewerAuthorizeAnswer(payload);
+                    if (!viewer) return unavailable('malformed answer');
+                    if (!viewer.allowed) return { kind: 'denied' };
+                    // The key the studio re-derived has to be the key the
+                    // token carries. An `allowed` that names a different
+                    // viewer is an answer to a different question, so it is
+                    // not an authorization at all.
+                    if (viewer.viewerKey !== request.viewerKey) {
+                        return unavailable('answer named a different viewer key');
+                    }
+                    return { kind: 'allowed', workspacePaths: [], viewerKey: viewer.viewerKey };
                 }
                 const answer = parseAuthorizeAnswer(payload);
                 if (!answer) return unavailable('malformed answer');
@@ -210,6 +253,32 @@ function parseAuthorizeAnswer(payload: unknown): { allowed: boolean; workspacePa
         if (typeof entry !== 'string' || !isAbsoluteWorkspacePath(entry)) return null;
     }
     return { allowed: candidate.allowed, workspacePaths: candidate.workspacePaths as string[] };
+}
+
+export function isViewerRequest(
+    request: PreviewAuthorizeRequest,
+): request is PreviewAuthorizeViewerRequest {
+    return (request as PreviewAuthorizeViewerRequest).purpose === 'viewer';
+}
+
+const VIEWER_KEY_PATTERN = /^bv1_[A-Za-z0-9_-]{32}$/;
+
+/**
+ * The viewer contract is `{allowed:false}` or `{allowed:true, viewerKey}` —
+ * nothing else. `workspacePaths` is refused rather than ignored: a viewer has
+ * no project directories, so an answer carrying them is answering about
+ * something else, and quietly dropping the field would hide that.
+ */
+function parseViewerAuthorizeAnswer(
+    payload: unknown,
+): { allowed: false } | { allowed: true; viewerKey: string } | null {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+    const candidate = payload as { allowed?: unknown; viewerKey?: unknown; workspacePaths?: unknown };
+    if (typeof candidate.allowed !== 'boolean') return null;
+    if (candidate.workspacePaths !== undefined) return null;
+    if (!candidate.allowed) return { allowed: false };
+    if (typeof candidate.viewerKey !== 'string' || !VIEWER_KEY_PATTERN.test(candidate.viewerKey)) return null;
+    return { allowed: true, viewerKey: candidate.viewerKey };
 }
 
 /**

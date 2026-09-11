@@ -16,6 +16,9 @@ import {
     previewRoutes,
     describePreviewRelayFailure,
     BOUND_PROXY_EVENT,
+    requestViewerRuntimeLease,
+    VIEWER_LEASE_EVENT,
+    VIEWER_BOUND_PROXY_EVENT,
 } from '@/app/api/routes/previewRoutes';
 import { signPreviewToken, verifyPreviewToken } from '@/modules/preview/previewToken';
 import { renderExpiredPtokenHtml } from '@/modules/preview/expiredPtokenHtml';
@@ -1045,5 +1048,382 @@ describe('describePreviewRelayFailure — binding refusals', () => {
             ctx,
         ).status).toBe(502);
         expect(describePreviewRelayFailure({ kind: 'machine-offline' }, ctx).status).toBe(502);
+    });
+
+    // specs/runtime-isolation-hardening (H3 viewer purpose) — the four
+    // previewViewerEvidence.ts codes must answer the same status here as at
+    // mint time (describeLeaseFailure), not the relay-specific 502 that
+    // NO_LISTENER/EVIDENCE_UNAVAILABLE get above.
+    it('answers a viewer key with no lease with 404, consistent with mint', () => {
+        expect(describePreviewRelayFailure(
+            { kind: 'daemon-error', code: 'VIEWER_UNKNOWN', message: '' },
+            ctx,
+        ).status).toBe(404);
+    });
+
+    it('answers a proven viewer port or runtime mismatch with 403, consistent with mint', () => {
+        for (const code of ['VIEWER_PORT_MISMATCH', 'VIEWER_RUNTIME_MISMATCH']) {
+            expect(describePreviewRelayFailure({ kind: 'daemon-error', code, message: '' }, ctx).status).toBe(403);
+        }
+    });
+
+    it('answers unsupported broker evidence with 409, consistent with mint', () => {
+        expect(describePreviewRelayFailure(
+            { kind: 'daemon-error', code: 'VIEWER_EVIDENCE_UNSUPPORTED', message: '' },
+            ctx,
+        ).status).toBe(409);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// specs/runtime-isolation-hardening (H3 viewer purpose)
+
+const VIEWER_KEY = 'bv1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+const OTHER_VIEWER_KEY = 'bv1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+const VIEWER_PORT = 6080;
+
+/** Studio answers the machine-scoped question and echoes the key it re-derived. */
+function stubViewerAuthorizeCallback(answer: { allowed: boolean; viewerKey?: string } | number) {
+    const fetchImpl = vi.fn(async () => (typeof answer === 'number'
+        ? new Response('nope', { status: answer })
+        : new Response(JSON.stringify(answer), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+        })));
+    vi.stubGlobal('fetch', fetchImpl);
+    process.env.PREVIEW_AUTHZ_ORIGIN = 'http://studio.internal:5173';
+    process.env.WEB_UI_TRUSTED_PREVIEW_SECRET = TRUSTED_SECRET;
+    return fetchImpl;
+}
+
+function viewerDaemonSocket(options: {
+    lease?: unknown;
+    proxy?: unknown;
+    handles?: (event: string) => boolean;
+} = {}) {
+    const upstream: string[] = [];
+    const seen: Array<{ event: string; payload: unknown }> = [];
+    const emitWithAck = vi.fn(async (event: string, payload: unknown) => {
+        seen.push({ event, payload });
+        if (options.handles && !options.handles(event)) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            throw new Error('operation has timed out');
+        }
+        if (event === VIEWER_LEASE_EVENT) {
+            return options.lease ?? { type: 'success', leaseId: 'viewer-lease-1', evidenceKind: 'viewer-native' };
+        }
+        upstream.push(`${(payload as { method?: string })?.method ?? 'GET'} ${event}`);
+        return options.proxy ?? {
+            type: 'success',
+            bindingEnforced: true,
+            status: 200,
+            headers: { 'content-type': 'text/html; charset=utf-8' },
+            bodyB64: Buffer.from('<html>VNC</html>', 'utf-8').toString('base64'),
+            truncated: false,
+        };
+    });
+    return {
+        id: `viewer-daemon-${Math.random().toString(36).slice(2, 8)}`,
+        data: { clientType: 'machine-scoped', machineId: MID },
+        timeout: () => ({ emitWithAck }),
+        emitWithAck,
+        upstream,
+        seen,
+    };
+}
+
+function viewerMintBody(extra: Record<string, unknown> = {}) {
+    return {
+        machineId: MID,
+        port: VIEWER_PORT,
+        purpose: 'viewer',
+        studioUserId: STUDIO_USER,
+        viewerKey: VIEWER_KEY,
+        ...extra,
+    };
+}
+
+function viewerBoundToken(
+    bind: Record<string, unknown> = { purpose: 'viewer', studioUserId: STUDIO_USER, viewerKey: VIEWER_KEY, leaseId: 'viewer-lease-1' },
+    ttlMs?: number,
+) {
+    return signPreviewToken(
+        { userId: USER_ID, machineId: MID, port: VIEWER_PORT, bind: bind as never },
+        ttlMs === undefined ? {} : { ttlMs },
+    ).token;
+}
+
+describe('requestViewerRuntimeLease', () => {
+    it('asks the daemon by viewer key, never by port alone', async () => {
+        const daemon = viewerDaemonSocket();
+        const ack = await requestViewerRuntimeLease([daemon], { viewerKey: VIEWER_KEY, port: VIEWER_PORT });
+        expect(ack).toEqual({ type: 'success', leaseId: 'viewer-lease-1', evidenceKind: 'viewer-native' });
+        expect(daemon.seen[0]).toEqual({
+            event: VIEWER_LEASE_EVENT,
+            payload: { viewerKey: VIEWER_KEY, port: VIEWER_PORT },
+        });
+    });
+
+    it('reports a daemon without the viewer handler as unsupported, never as a lease', async () => {
+        const daemon = viewerDaemonSocket({ handles: () => false });
+        const ack = await requestViewerRuntimeLease([daemon], { viewerKey: VIEWER_KEY, port: VIEWER_PORT }, 60);
+        expect(ack).toEqual({ type: 'error', code: LEASE_UNSUPPORTED_CODE, message: expect.any(String) });
+    });
+});
+
+describe('preview mint route — viewer binding', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        for (const key of ENV_KEYS) delete process.env[key];
+        vi.mocked(db.machine.findFirst).mockResolvedValue({ id: MID, accountId: USER_ID } as never);
+        setMachineSockets([]);
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        for (const key of ENV_KEYS) delete process.env[key];
+    });
+
+    it('mints a viewer token bound to the runtime the daemon leased', async () => {
+        process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
+        const daemon = viewerDaemonSocket();
+        setMachineSockets([daemon]);
+        stubViewerAuthorizeCallback({ allowed: true, viewerKey: VIEWER_KEY });
+        const app = await buildApp();
+
+        const res = await trustedMint(app, viewerMintBody());
+        expect(res.statusCode).toBe(200);
+        expect(res.json().binding).toBe('lease');
+        expect(verifyPreviewToken(res.json().token)?.bind).toEqual({
+            purpose: 'viewer',
+            studioUserId: STUDIO_USER,
+            viewerKey: VIEWER_KEY,
+            leaseId: 'viewer-lease-1',
+        });
+    });
+
+    it('refuses a viewer mint once the studio says the machine is no longer reachable', async () => {
+        process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
+        const daemon = viewerDaemonSocket();
+        setMachineSockets([daemon]);
+        stubViewerAuthorizeCallback({ allowed: false });
+        const app = await buildApp();
+
+        expect((await trustedMint(app, viewerMintBody())).statusCode).toBe(403);
+        // The daemon must not have been asked to look at anything.
+        expect(daemon.seen).toHaveLength(0);
+    });
+
+    it('fails a viewer mint closed when the studio cannot answer', async () => {
+        process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
+        setMachineSockets([viewerDaemonSocket()]);
+        stubViewerAuthorizeCallback(503);
+        const app = await buildApp();
+        expect((await trustedMint(app, viewerMintBody())).statusCode).toBe(503);
+    });
+
+    it('refuses a viewer mint when the daemon predates viewer binding', async () => {
+        process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
+        setMachineSockets([viewerDaemonSocket({ handles: (e) => e !== VIEWER_LEASE_EVENT })]);
+        stubViewerAuthorizeCallback({ allowed: true, viewerKey: VIEWER_KEY });
+        const app = await buildApp();
+        const res = await trustedMint(app, viewerMintBody());
+        expect(res.statusCode).toBe(409);
+        expect(res.json().code).toBe(LEASE_UNSUPPORTED_CODE);
+    });
+
+    it('rejects a mint that names both a project and a viewer', async () => {
+        process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
+        setMachineSockets([viewerDaemonSocket()]);
+        stubViewerAuthorizeCallback({ allowed: true, viewerKey: VIEWER_KEY });
+        const app = await buildApp();
+        const res = await trustedMint(app, viewerMintBody({ projectId: PROJECT }));
+        expect(res.statusCode).toBe(400);
+    });
+
+    it('rejects a viewer mint whose key is not a derived key shape', async () => {
+        process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
+        setMachineSockets([viewerDaemonSocket()]);
+        stubViewerAuthorizeCallback({ allowed: true, viewerKey: VIEWER_KEY });
+        const app = await buildApp();
+        expect((await trustedMint(app, viewerMintBody({ viewerKey: 'not-a-key' }))).statusCode).toBe(400);
+    });
+
+    it('keeps a restarted viewer bound when recovering an expired viewer token', async () => {
+        // Policy off on purpose: recovery must not be the way a bound viewer
+        // session comes back weaker than it was.
+        const daemon = viewerDaemonSocket({ lease: { type: 'success', leaseId: 'viewer-lease-2', evidenceKind: 'viewer-native' } });
+        setMachineSockets([daemon]);
+        stubViewerAuthorizeCallback({ allowed: true, viewerKey: VIEWER_KEY });
+        const app = await buildApp();
+
+        const res = await trustedMint(app, viewerMintBody({
+            previousToken: viewerBoundToken(undefined, -1_000),
+        }));
+        expect(res.statusCode).toBe(200);
+        expect(res.json().binding).toBe('lease');
+    });
+
+    it('refuses a viewer recovery presented by another user', async () => {
+        process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
+        setMachineSockets([viewerDaemonSocket()]);
+        stubViewerAuthorizeCallback({ allowed: true, viewerKey: OTHER_VIEWER_KEY });
+        const app = await buildApp();
+        const res = await trustedMint(app, viewerMintBody({
+            viewerKey: OTHER_VIEWER_KEY,
+            previousToken: viewerBoundToken(undefined, -1_000),
+        }));
+        expect(res.statusCode).toBe(403);
+        expect(res.json().code).toBe('PREVIOUS_TOKEN_MISMATCH');
+    });
+
+    it('refuses to consume a viewer token as a project recovery', async () => {
+        process.env.PREVIEW_RUNTIME_BINDING_POLICY = 'required';
+        setMachineSockets([viewerDaemonSocket()]);
+        stubAuthorizeCallback({ allowed: true, workspacePaths: ['/srv/proj-1'] });
+        const app = await buildApp();
+        const res = await trustedMint(app, {
+            machineId: MID,
+            port: VIEWER_PORT,
+            projectId: PROJECT,
+            studioUserId: STUDIO_USER,
+            previousToken: viewerBoundToken(undefined, -1_000),
+        });
+        expect(res.statusCode).toBe(403);
+    });
+});
+
+describe('preview relay route — viewer binding', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        for (const key of ENV_KEYS) delete process.env[key];
+        vi.mocked(db.machine.findFirst).mockResolvedValue({ id: MID, accountId: USER_ID } as never);
+        setMachineSockets([]);
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        for (const key of ENV_KEYS) delete process.env[key];
+    });
+
+    function relay(app: Awaited<ReturnType<typeof buildApp>>, token: string, method = 'GET') {
+        return app.inject({
+            method: method as 'GET',
+            url: `/v1/preview/${MID}/${VIEWER_PORT}/vnc.html?ptoken=${encodeURIComponent(token)}`,
+            headers: { host: 'studio.test' },
+        });
+    }
+
+    it('relays a bound viewer request on the viewer event and hands the daemon the binding', async () => {
+        const daemon = viewerDaemonSocket();
+        setMachineSockets([daemon]);
+        stubViewerAuthorizeCallback({ allowed: true, viewerKey: VIEWER_KEY });
+        const app = await buildApp();
+
+        const res = await relay(app, viewerBoundToken());
+        expect(res.statusCode).toBe(200);
+        const proxied = daemon.seen.find((entry) => entry.event === VIEWER_BOUND_PROXY_EVENT);
+        expect(proxied?.payload).toMatchObject({
+            binding: { purpose: 'viewer', viewerKey: VIEWER_KEY, leaseId: 'viewer-lease-1' },
+        });
+        // A viewer binding has no workspace concept; sending one would be a
+        // claim nothing verified.
+        expect((proxied?.payload as { binding: Record<string, unknown> }).binding.workspacePaths).toBeUndefined();
+    });
+
+    // 구 daemon 은 이 이벤트 handler 가 없다. 응답 뒤 검사로는 이미 실행된
+    // upstream 접속을 되돌릴 수 없으므로, 접속 전에 막히는 것이 계약이다.
+    it('never reaches an old daemon upstream with a bound viewer request', async () => {
+        const daemon = viewerDaemonSocket({ handles: (e) => e !== VIEWER_BOUND_PROXY_EVENT });
+        setMachineSockets([daemon]);
+        stubViewerAuthorizeCallback({ allowed: true, viewerKey: VIEWER_KEY });
+        const app = await buildApp();
+
+        const res = await relay(app, viewerBoundToken());
+        expect(res.statusCode).toBe(409);
+        expect(daemon.upstream).toEqual([]);
+    });
+
+    it('refuses to forward a body from a daemon that did not echo viewer enforcement', async () => {
+        const daemon = viewerDaemonSocket({
+            proxy: { type: 'success', status: 200, headers: {}, bodyB64: Buffer.from('leak').toString('base64'), truncated: false },
+        });
+        setMachineSockets([daemon]);
+        stubViewerAuthorizeCallback({ allowed: true, viewerKey: VIEWER_KEY });
+        const app = await buildApp();
+
+        const res = await relay(app, viewerBoundToken());
+        expect(res.statusCode).not.toBe(200);
+        expect(res.body).not.toContain('leak');
+    });
+
+    it('stops relaying the moment the studio stops recognising the viewer key', async () => {
+        const daemon = viewerDaemonSocket();
+        setMachineSockets([daemon]);
+        stubViewerAuthorizeCallback({ allowed: true, viewerKey: OTHER_VIEWER_KEY });
+        const app = await buildApp();
+
+        const res = await relay(app, viewerBoundToken());
+        expect(res.statusCode).toBe(503);
+        expect(daemon.upstream).toEqual([]);
+    });
+
+    it('enforces a viewer binding even while the policy is off', async () => {
+        const daemon = viewerDaemonSocket();
+        setMachineSockets([daemon]);
+        stubViewerAuthorizeCallback({ allowed: false });
+        const app = await buildApp();
+
+        const res = await relay(app, viewerBoundToken());
+        expect(res.statusCode).toBe(403);
+        expect(daemon.upstream).toEqual([]);
+    });
+
+    it('never sends a viewer binding on the project bound event', async () => {
+        const daemon = viewerDaemonSocket();
+        setMachineSockets([daemon]);
+        stubViewerAuthorizeCallback({ allowed: true, viewerKey: VIEWER_KEY });
+        const app = await buildApp();
+
+        await relay(app, viewerBoundToken());
+        expect(daemon.seen.some((entry) => entry.event === BOUND_PROXY_EVENT)).toBe(false);
+        expect(daemon.seen.some((entry) => entry.event === 'proxy-http-request')).toBe(false);
+    });
+});
+
+// 재발급 페이지는 검증된 viewer 토큰일 때만 목적을 밝힌다. 목적 없이 보내면
+// Studio 가 프로젝트 복구로 읽고, 뷰어 세션이 그 자리에서 결속을 잃는다.
+describe('renderExpiredPtokenHtml — viewer recovery', () => {
+    it('marks the recovery as a viewer recovery when the replaced token was one', () => {
+        const html = renderExpiredPtokenHtml({
+            machineId: MID,
+            port: VIEWER_PORT,
+            reason: 'expired-or-invalid',
+            previousToken: 'prev-token',
+            previousPurpose: 'viewer',
+        });
+        expect(html).toContain('purpose: "viewer"');
+        expect(html).toContain('previousToken: "prev-token"');
+    });
+
+    it('says nothing about purpose for a project recovery', () => {
+        const html = renderExpiredPtokenHtml({
+            machineId: MID,
+            port: PORT,
+            reason: 'expired-or-invalid',
+            previousToken: 'prev-token',
+        });
+        expect(html).not.toContain('purpose');
+    });
+
+    it('never claims a purpose without a token to back it', () => {
+        const html = renderExpiredPtokenHtml({
+            machineId: MID,
+            port: VIEWER_PORT,
+            reason: 'missing',
+            previousPurpose: 'viewer',
+        });
+        expect(html).not.toContain('purpose');
+        expect(html).not.toContain('previousToken');
     });
 });

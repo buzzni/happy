@@ -38,6 +38,7 @@ import path from 'node:path'
 import { promises as fs } from 'node:fs'
 import type { PortRegistryData } from './portRegistry'
 import { fingerprintEvidence, type EvidenceProbeResult, type ListenerEvidence } from './previewRuntimeEvidence'
+import { decodeProjectBinding } from './previewViewerBinding'
 
 export type RuntimeLeaseErrorCode =
   | 'INVALID_REQUEST'
@@ -265,28 +266,22 @@ export async function enforceRelayBinding(
   port: number,
   deps: RuntimeLeaseDeps,
 ): Promise<RelayBindingOutcome> {
-  if (binding === undefined || binding === null) return { outcome: 'unbound' }
-  if (typeof binding !== 'object') {
-    return { outcome: 'rejected', code: 'INVALID_REQUEST', message: 'binding must be an object' }
+  // specs/runtime-isolation-hardening (H3, P3) — decoding is strictly
+  // disjoint from the viewer variant: a claim carrying `purpose` or
+  // `viewerKey` is a viewer binding that arrived on the project event, and
+  // that is a hard failure rather than a project binding with extra fields.
+  const decoded = decodeProjectBinding(binding)
+  if (!decoded.ok) {
+    return { outcome: 'rejected', code: decoded.code, message: decoded.message }
   }
-  const candidate = binding as { projectId?: unknown; leaseId?: unknown; workspacePaths?: unknown }
-  if (typeof candidate.projectId !== 'string' || typeof candidate.leaseId !== 'string') {
-    return { outcome: 'rejected', code: 'INVALID_REQUEST', message: 'binding requires projectId and leaseId' }
-  }
-  const workspacePaths = candidate.workspacePaths ?? []
-  if (!Array.isArray(workspacePaths) || workspacePaths.some((entry) => typeof entry !== 'string')) {
-    // A malformed workspace list is refused rather than emptied: an empty list
-    // is itself a meaningful (and stricter) input, and silently substituting
-    // it would hide a broken caller.
-    return { outcome: 'rejected', code: 'INVALID_REQUEST', message: 'workspacePaths must be a list of strings' }
-  }
+  if (!decoded.binding) return { outcome: 'unbound' }
 
   const verified = await verifyRuntimeLease(
     {
-      projectId: candidate.projectId,
+      projectId: decoded.binding.projectId,
       port,
-      leaseId: candidate.leaseId,
-      workspacePaths: workspacePaths as string[],
+      leaseId: decoded.binding.leaseId,
+      workspacePaths: decoded.binding.workspacePaths,
     },
     deps,
   )

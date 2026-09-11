@@ -22,12 +22,16 @@
  *    envelope without it, and the relay treats that as a failure.
  */
 
-import type { PreviewTokenBinding } from '@/modules/preview/previewToken';
+import { isViewerBinding, type PreviewTokenBinding } from '@/modules/preview/previewToken';
 
 export const LEASE_UNSUPPORTED_CODE = 'RUNTIME_BINDING_UNSUPPORTED';
 
 const UNSUPPORTED_MESSAGE =
     '이 머신의 daemon 이 프리뷰 런타임 결속을 지원하지 않습니다. happy-cli 를 업데이트한 뒤 다시 시도하세요.';
+
+/** specs/runtime-isolation-hardening (H3 viewer purpose) — VIEWER_EVIDENCE_UNSUPPORTED. */
+const VIEWER_EVIDENCE_UNSUPPORTED_MESSAGE =
+    '이 머신의 browser session broker 가 이 viewer 의 컨테이너를 증명하지 못했습니다. happy-cli 를 업데이트한 뒤 다시 시도하세요.';
 
 export interface PreviewBindingPolicy {
     mode: 'off' | 'required';
@@ -70,8 +74,23 @@ export type PreviousTokenCheck =
 
 export type TrustedMintPlan =
     | { kind: 'bind'; forced: boolean }
+    | { kind: 'bind-viewer'; forced: boolean }
     | { kind: 'unbound'; reason: 'legacy-machine' | 'policy-off' }
     | { kind: 'reject'; status: 400 | 403; code: string; message: string };
+
+/** What the studio asserts for a machine-scoped viewer mint. Both values are
+ *  the studio's own: the authenticated user, and the key it derived for that
+ *  user on this machine. Neither is ever taken from the browser. */
+export interface ViewerMintRequest {
+    studioUserId: string;
+    viewerKey: string;
+}
+
+const MISMATCH_403 = {
+    kind: 'reject' as const,
+    status: 403 as const,
+    code: 'PREVIOUS_TOKEN_MISMATCH',
+};
 
 /**
  * The one place that decides whether a trusted (studio) mint binds.
@@ -95,15 +114,28 @@ export function planTrustedMint(input: {
     port: number;
     projectId?: string;
     studioUserId?: string;
+    /** Present only for a machine-scoped viewer mint — never alongside a project. */
+    viewer?: ViewerMintRequest;
     previous: PreviousTokenCheck;
 }): TrustedMintPlan {
-    const { previous } = input;
+    const { previous, viewer } = input;
     if (previous.kind === 'invalid') {
         return {
             kind: 'reject',
             status: 400,
             code: 'INVALID_PREVIOUS_TOKEN',
             message: '재발급 요청의 이전 토큰을 확인할 수 없습니다.',
+        };
+    }
+    // One request, one purpose. A caller that names both is ambiguous about
+    // what it wants proven, and the safe reading of an ambiguous authorization
+    // request is none of them.
+    if (viewer && (input.projectId !== undefined || input.studioUserId !== undefined)) {
+        return {
+            kind: 'reject',
+            status: 400,
+            code: 'MIXED_BINDING_PURPOSE',
+            message: '한 요청이 프로젝트와 뷰어 결속을 동시에 요구할 수 없습니다.',
         };
     }
     if (previous.kind === 'token') {
@@ -116,18 +148,31 @@ export function planTrustedMint(input: {
             };
         }
         const bind = previous.claims.bind;
+        if (bind && isViewerBinding(bind)) {
+            // The recovered token's purpose is not negotiable. Letting a
+            // viewer token be re-minted as a project binding (or the reverse)
+            // would make recovery the one place where purpose can be changed
+            // by asking — and recovery is exactly where nobody is watching.
+            if (!viewer || bind.studioUserId !== viewer.studioUserId || bind.viewerKey !== viewer.viewerKey) {
+                return { ...MISMATCH_403, message: '이전 토큰의 뷰어 사용자/키와 일치하지 않습니다.' };
+            }
+            return { kind: 'bind-viewer', forced: true };
+        }
         if (bind) {
-            if (bind.projectId !== input.projectId || bind.studioUserId !== input.studioUserId) {
-                return {
-                    kind: 'reject',
-                    status: 403,
-                    code: 'PREVIOUS_TOKEN_MISMATCH',
-                    message: '이전 토큰의 프로젝트/사용자와 일치하지 않습니다.',
-                };
+            // A project recovery serves a project request only. The mixed
+            // check above already rejects a request naming both, so this is a
+            // second lock on the same door.
+            if (viewer || bind.projectId !== input.projectId || bind.studioUserId !== input.studioUserId) {
+                return { ...MISMATCH_403, message: '이전 토큰의 프로젝트/사용자와 일치하지 않습니다.' };
             }
             return { kind: 'bind', forced: true };
         }
     }
+
+    // Ahead of the legacy exception on purpose: the allowlist grants the
+    // operator permission to mint *unbound*, not permission to discard a
+    // purpose the caller stated. Nothing else can produce a viewer token.
+    if (viewer) return { kind: 'bind-viewer', forced: false };
 
     if (input.policy.legacyMachineIds.has(input.machineId)) {
         return { kind: 'unbound', reason: 'legacy-machine' };
@@ -234,6 +279,31 @@ export function isRuntimeEvidenceBusy(code: string | null | undefined): boolean 
     return code === EVIDENCE_BUSY_CODE;
 }
 
+/**
+ * specs/runtime-isolation-hardening (H3 viewer purpose) — status for one of
+ * previewViewerEvidence.ts's four viewer-specific codes: VIEWER_UNKNOWN (no
+ * lease for this key — 404, the resource itself is absent, not an
+ * authorization refusal), VIEWER_PORT_MISMATCH/VIEWER_RUNTIME_MISMATCH (a
+ * lease exists but is proven to not be the one serving this port/runtime —
+ * 403, same shape as the project PORT_PROJECT_MISMATCH group), and
+ * VIEWER_EVIDENCE_UNSUPPORTED (broker mode, but the broker could not prove
+ * the container — 409, same upgrade/retry framing as
+ * RUNTIME_BINDING_UNSUPPORTED). Shared by mint (describeLeaseFailure below),
+ * the HTTP relay (previewRoutes.ts describePreviewRelayFailure) and the WS
+ * handshake (previewWebSocketRelay.ts wsOpenFailureStatus) so the same
+ * daemon refusal reads the same status everywhere. Returns null for
+ * anything else so callers fall through to their own mapping — this never
+ * widens what a non-viewer code means.
+ */
+export type ViewerLeaseFailureStatus = 403 | 404 | 409;
+
+export function viewerLeaseFailureStatus(code: string): ViewerLeaseFailureStatus | null {
+    if (code === 'VIEWER_UNKNOWN') return 404;
+    if (code === 'VIEWER_PORT_MISMATCH' || code === 'VIEWER_RUNTIME_MISMATCH') return 403;
+    if (code === 'VIEWER_EVIDENCE_UNSUPPORTED') return 409;
+    return null;
+}
+
 /** Narrow union so route reply schemas can name every status this can emit. */
 export type LeaseFailureStatus = 400 | 403 | 404 | 409 | 502 | 503;
 
@@ -282,6 +352,21 @@ export function describeLeaseFailure(ack: { type: 'error'; code: string; message
                 code: ack.code,
             },
         };
+    }
+    // The four viewer-specific codes — see viewerLeaseFailureStatus's doc
+    // comment above for what each one means and why.
+    const viewerStatus = viewerLeaseFailureStatus(ack.code);
+    if (viewerStatus !== null) {
+        // VIEWER_EVIDENCE_UNSUPPORTED always shows the upgrade guidance, same
+        // as RUNTIME_BINDING_UNSUPPORTED above — never let the daemon's own
+        // message hide it.
+        if (ack.code === 'VIEWER_EVIDENCE_UNSUPPORTED') {
+            return { status: viewerStatus, body: { error: VIEWER_EVIDENCE_UNSUPPORTED_MESSAGE, code: ack.code } };
+        }
+        const fallbackMessage = ack.code === 'VIEWER_UNKNOWN'
+            ? '이 머신에 해당 viewer key 의 lease 가 없습니다.'
+            : '요청한 포트가 이 viewer 의 실행 중인 런타임이 아닙니다.';
+        return { status: viewerStatus, body: { error: ack.message || fallbackMessage, code: ack.code } };
     }
     return { status: 502, body: { error: ack.message || 'Runtime lease failed', code: ack.code } };
 }

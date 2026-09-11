@@ -43,6 +43,24 @@ import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
 export const PREVIEW_BOUND_PROXY_EVENT = 'preview-proxy-http-bound';
 /** Upgrade counterpart of PREVIEW_BOUND_PROXY_EVENT — see openPreviewWsTunnelBound. */
 export const PREVIEW_BOUND_WS_OPEN_EVENT = 'preview-proxy-ws-open-bound';
+/**
+ * specs/runtime-isolation-hardening (H3, P3) — browser-viewer relays travel on
+ * their own events again, for the reason the project ones do and one more.
+ *
+ * The shared reason: a daemon that predates viewer binding has no listener
+ * here, so a viewer request reaches no upstream at all. Checking the answer
+ * instead would be too late — the bytes would already be on the port.
+ *
+ * The added reason: the viewer variant is *disjoint* from the project one.
+ * Sharing an event and switching on `purpose` would put one handler in charge
+ * of deciding which rules apply to a payload it was handed, which is exactly
+ * the shape that lets a mixed claim be read as whichever variant is weaker.
+ */
+export const PREVIEW_VIEWER_BOUND_PROXY_EVENT = 'preview-proxy-http-viewer-bound';
+/** Upgrade counterpart of PREVIEW_VIEWER_BOUND_PROXY_EVENT. */
+export const PREVIEW_VIEWER_BOUND_WS_OPEN_EVENT = 'preview-proxy-ws-viewer-bound';
+/** Mint-time viewer lease, counterpart of `preview-runtime-lease`. */
+export const PREVIEW_VIEWER_RUNTIME_LEASE_EVENT = 'preview-viewer-runtime-lease';
 import {
     acquireRuntimeLease,
     enforceRelayBinding,
@@ -57,6 +75,22 @@ import {
     DEFAULT_PROBE_LIMITS,
     type ProbeFn,
 } from '@/daemon/previewRuntimeEvidence';
+import {
+    acquireViewerLease,
+    enforceViewerRelayBinding,
+    type ViewerLeaseDeps,
+} from '@/daemon/previewViewerLease';
+import {
+    resolveBrokerViewerEvidence,
+    resolveNativeViewerEvidence,
+    type ViewerEvidenceRequest,
+    type ViewerEvidenceResult,
+} from '@/daemon/previewViewerEvidence';
+import { probeNativeViewerListenerEvidence } from '@/daemon/previewNativeViewerListener';
+import {
+    createBoundedViewerProof,
+    type ViewerProofFn,
+} from '@/daemon/previewViewerEvidenceGate';
 import { PreviewWsProxy } from '@/daemon/previewWsProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import packageJson from '../../package.json';
@@ -207,6 +241,35 @@ interface ServerToDaemonEvents {
             dataB64: string;
             binding: { projectId: string; leaseId: string; workspacePaths?: string[] };
         },
+        ack: (response: unknown) => void,
+    ) => void;
+    // specs/runtime-isolation-hardening (H3, P3) — viewer-bound relays. The
+    // binding shape is disjoint from the project one: no projectId, no
+    // workspacePaths, and `purpose` is mandatory.
+    [PREVIEW_VIEWER_BOUND_PROXY_EVENT]: (
+        params: {
+            port: number;
+            method: string;
+            path: string;
+            headers: Record<string, string>;
+            bodyB64: string | null;
+            binding: { purpose: 'viewer'; viewerKey: string; leaseId: string };
+        },
+        ack: (response: unknown) => void,
+    ) => void;
+    [PREVIEW_VIEWER_BOUND_WS_OPEN_EVENT]: (
+        params: {
+            tunnelId: string;
+            port: number;
+            dataB64: string;
+            binding: { purpose: 'viewer'; viewerKey: string; leaseId: string };
+        },
+        ack: (response: unknown) => void,
+    ) => void;
+    // Mint-time counterpart: which runtime currently serves this viewer key's
+    // port. An older daemon never acks, which is how the server tells.
+    [PREVIEW_VIEWER_RUNTIME_LEASE_EVENT]: (
+        params: { viewerKey: string; port: number },
         ack: (response: unknown) => void,
     ) => void;
     'proxy-ws-data': (payload: { tunnelId: string; dataB64: string }) => void;
@@ -525,6 +588,16 @@ export class ApiMachineClient {
         ? new BrowserSessionBrokerClient(process.env.HAPPY_BROWSER_BROKER_SOCKET)
         : null;
     private brokerRelayTouchedAt = new Map<number, number>();
+    /**
+     * specs/runtime-isolation-hardening (H3, P3) — one gate for the whole
+     * daemon, so the per-machine cap on viewer proof work is real. Reuses the
+     * project probe's measured limits (8 concurrent, 256 queued); the budget
+     * is per call and defaults to DEFAULT_VIEWER_PROOF_DEADLINE_MS.
+     */
+    private viewerProofGate: ViewerProofFn = createBoundedViewerProof(
+        (request) => this.resolveViewerEvidence(request),
+        DEFAULT_PROBE_LIMITS,
+    );
     // Unsafe extension commands are accepted only from the fd 3/4 pipe that
     // launched Chrome. Keep that owner alive for as long as this daemon uses
     // the browser; a CDP port cannot recreate or replace the pipe later.
@@ -1167,6 +1240,30 @@ export class ApiMachineClient {
             return this.startIsolatedViewerStack(viewerKey);
         });
 
+        /**
+         * specs/runtime-isolation-hardening (H3, P3) — the required path opens
+         * the viewer through this method instead of `browser-viewer:start`.
+         *
+         * A new method name is what makes the old-daemon case safe *before*
+         * any side effect: a daemon that predates viewer binding has no
+         * handler, so the RPC comes back "Method not found" having started
+         * nothing. Asking an old daemon for a capability and then calling
+         * start would leave a window between the two answers — and a
+         * singleton daemon that ignores params would already have launched a
+         * stack by the time its reply was checked.
+         *
+         * Validation happens strictly *before* the existing start body runs;
+         * the body itself is reused unchanged so the two paths cannot drift.
+         */
+        this.rpcHandlerManager.registerHandler('browser-viewer:start-bound', async (params: any) => {
+            const viewerKey = requireNonEmptyString(params?.viewerKey, 'viewerKey');
+            if (!validateViewerKey(viewerKey)) throw new Error('viewerKey is invalid');
+            // The key is server-derived from the authenticated user; the
+            // daemon accepts no other field that could widen what is opened.
+            if (this.browserSessionBroker) return this.startBrokerViewer(viewerKey);
+            return this.startIsolatedViewerStack(viewerKey);
+        });
+
         this.rpcHandlerManager.registerHandler('browser-viewer:lookup', async (params: any) => {
             const viewerKey = requireNonEmptyString(params?.viewerKey, 'viewerKey');
             if (!validateViewerKey(viewerKey)) throw new Error('viewerKey is invalid');
@@ -1379,6 +1476,152 @@ export class ApiMachineClient {
             readPortRegistry: () => registry.readAll(),
             canonicalize: (target: string) => this.previewPathCanonicalizer(target),
         };
+    }
+
+    /**
+     * specs/runtime-isolation-hardening (H3, P3) — the viewer counterpart of
+     * `previewLeaseDeps`.
+     *
+     * The mode is decided once, here, by whether a root broker is configured,
+     * and there is **no fallback between the two**. In broker mode the native
+     * registry describes nothing that is running, so reading it after a failed
+     * broker lookup would not be a second opinion — it would be a first
+     * opinion about the wrong machine state.
+     */
+    private viewerLeaseDeps(options?: { deadlineMs?: number }): ViewerLeaseDeps {
+        // Every viewer proof goes through the same gate instance, so the cap
+        // is per machine rather than per request. The budget is applied here
+        // too: an unbudgeted proof that overran the mint window used to be
+        // read by happy-server as "this daemon predates runtime binding",
+        // which records a wrong fact about the fleet instead of a refusal.
+        return { resolveEvidence: (request) => this.viewerProofGate(request, options) };
+    }
+
+    /**
+     * The unbounded proof itself. Mode is picked per call because the broker
+     * may be configured after construction; there is no fallback between the
+     * two — in broker mode the native registry describes nothing running.
+     */
+    private resolveViewerEvidence(request: ViewerEvidenceRequest): Promise<ViewerEvidenceResult> {
+        const broker = this.browserSessionBroker;
+        if (broker) {
+            return resolveBrokerViewerEvidence(request, {
+                lookupBrokerLease: async (viewerKey) => {
+                    const response = await broker.request({ op: 'lookup', viewerKey });
+                    if (!response.ok) throw new Error(response.code);
+                    return response.lease;
+                },
+            });
+        }
+        return resolveNativeViewerEvidence(request, {
+                    // Registry first, cache second: the on-disk record is what
+                    // survives a daemon restart, and verification must not be
+                    // decided by whatever this process happens to remember.
+                    getViewerLease: async (viewerKey) =>
+                        (await this.isolatedViewerRegistry.get(viewerKey))
+                        ?? this.isolatedViewerLeases.get(viewerKey)
+                        ?? null,
+                    // Viewer-only prober. The generic project probe reports
+                    // "2 processes listen on 127.0.0.1:<port>" for a healthy
+                    // viewer under load — websockify forks a worker that
+                    // inherits the listening socket — and that ambiguity is
+                    // the right answer for a project port and the wrong one
+                    // here, where the expected pid is known in advance. The
+                    // generic probe is left strict and untouched.
+                    probeListener: (port: number, expectedPid: number) =>
+                        probeNativeViewerListenerEvidence(port, expectedPid, this.previewEvidenceIo),
+                    readProcessCmdline: (pid: number) => this.previewEvidenceIo.readFile(`/proc/${pid}/cmdline`),
+        });
+    }
+
+    /**
+     * Same gate as the project relay, over the viewer variant. There is no
+     * `unbound` outcome: these events exist only for bound requests, so an
+     * absent binding is a caller error rather than an older server.
+     */
+    private enforceViewerBinding(
+        binding: unknown,
+        port: number,
+    ): Promise<{ outcome: 'enforced' } | { outcome: 'rejected'; code: string; message: string }> {
+        return enforceViewerRelayBinding(binding, port, this.viewerLeaseDeps());
+    }
+
+    /** Handler body of the `preview-viewer-runtime-lease` socket event. */
+    private async answerPreviewViewerRuntimeLease(params: any, ack: (response: any) => void): Promise<void> {
+        try {
+            const result = await acquireViewerLease(
+                { viewerKey: params?.viewerKey, port: params?.port },
+                this.viewerLeaseDeps({ deadlineMs: MINT_LEASE_ANSWER_DEADLINE_MS }),
+            );
+            logger.debug(
+                `[API MACHINE] preview-viewer-runtime-lease port=${params?.port} -> ${result.type === 'success' ? result.evidenceKind : result.code}`,
+            );
+            ack(result);
+        } catch (e) {
+            const message = e instanceof Error ? e.message : String(e);
+            logger.debug(`[API MACHINE] preview-viewer-runtime-lease internal error: ${message}`);
+            ack({ type: 'error', code: 'EVIDENCE_UNAVAILABLE', message });
+        }
+    }
+
+    private async relayPreviewViewerBoundHttp(params: any): Promise<any> {
+        const binding = await this.enforceViewerBinding(params?.binding, params?.port);
+        if (binding.outcome === 'rejected') {
+            logger.debug(`[API MACHINE] viewer-bound http refused: ${binding.code} ${binding.message}`);
+            return { type: 'error', code: binding.code, message: binding.message };
+        }
+        try {
+            const result = await proxyHttp({
+                port: params?.port,
+                method: params?.method,
+                path: params?.path,
+                headers: params?.headers ?? {},
+                bodyB64: params?.bodyB64 ?? null,
+            });
+            return { type: 'success', ...result, bindingEnforced: true };
+        } catch (e) {
+            if (e instanceof PreviewProxyError) {
+                return { type: 'error', code: e.code, message: e.message };
+            }
+            const message = e instanceof Error ? e.message : String(e);
+            logger.debug(`[API MACHINE] viewer-bound http internal error: ${message}`);
+            return { type: 'error', code: 'INTERNAL', message };
+        }
+    }
+
+    /**
+     * Viewer upgrades. Shares the whole cancellation / supersede / close
+     * machinery with the project tunnel — a second copy would drift, and the
+     * expiry and revocation behaviour is exactly what must not differ.
+     */
+    private async openPreviewViewerWsTunnelBound(params: any): Promise<any> {
+        const tunnelId = typeof params?.tunnelId === 'string' ? params.tunnelId : null;
+        if (!tunnelId) {
+            return { ok: false, code: 'INVALID_TUNNEL', message: 'Missing tunnelId' };
+        }
+        const cancelled = { ok: false, code: 'CANCELLED', message: 'Tunnel was closed before it opened' };
+        const pending = { cancelled: false };
+        const superseded = this.previewWsPendingOpens.get(tunnelId);
+        if (superseded) superseded.cancelled = true;
+        this.previewWsPendingOpens.set(tunnelId, pending);
+        try {
+            const binding = await this.enforceViewerBinding(params?.binding, params?.port);
+            if (pending.cancelled) return cancelled;
+            if (binding.outcome === 'rejected') {
+                logger.debug(`[API MACHINE] viewer-bound ws refused: ${binding.code} ${binding.message}`);
+                return { ok: false, code: binding.code, message: binding.message };
+            }
+            const opened = await this.previewWsProxy!.open(params);
+            if (pending.cancelled) {
+                this.previewWsProxy?.close(tunnelId);
+                return cancelled;
+            }
+            return opened?.ok === true ? { ...opened, bindingEnforced: true } : opened;
+        } finally {
+            if (this.previewWsPendingOpens.get(tunnelId) === pending) {
+                this.previewWsPendingOpens.delete(tunnelId);
+            }
+        }
     }
 
     /**
@@ -2418,6 +2661,22 @@ export class ApiMachineClient {
         this.socket.on(PREVIEW_BOUND_WS_OPEN_EVENT as any, async (params: any, ack: (response: any) => void) => {
             ack(await this.openPreviewWsTunnelBound(params));
         });
+        // specs/runtime-isolation-hardening (H3, P3) — viewer-bound relays and
+        // their mint-time lease. A daemon without these listeners performs no
+        // side effect at all for a viewer request: no upstream connect, no
+        // upstream write, no ack. That silence is the server's signal, and it
+        // is the only version of "old daemon refused" that happens *before*
+        // anything reaches the port.
+        this.socket.on(PREVIEW_VIEWER_BOUND_PROXY_EVENT as any, async (params: any, ack: (response: any) => void) => {
+            ack(await this.relayPreviewViewerBoundHttp(params));
+        });
+        this.socket.on(PREVIEW_VIEWER_BOUND_WS_OPEN_EVENT as any, async (params: any, ack: (response: any) => void) => {
+            ack(await this.openPreviewViewerWsTunnelBound(params));
+        });
+        this.socket.on(
+            PREVIEW_VIEWER_RUNTIME_LEASE_EVENT as any,
+            (params: any, ack: (response: any) => void) => this.answerPreviewViewerRuntimeLease(params, ack),
+        );
         this.socket.on('proxy-ws-data', (payload) => {
             this.previewWsProxy?.data(payload);
         });

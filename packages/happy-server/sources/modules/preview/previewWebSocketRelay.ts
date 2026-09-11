@@ -48,10 +48,17 @@ import {
     isStaleRuntimeBinding,
     isRuntimeEvidenceBusy,
     LEASE_UNSUPPORTED_CODE,
+    viewerLeaseFailureStatus,
 } from "@/modules/preview/previewRuntimeBinding";
-import type { PreviewTokenBinding } from "@/modules/preview/previewToken";
+import { isViewerBinding, type PreviewTokenBinding } from "@/modules/preview/previewToken";
 import type { PreviewAuthorizer } from "@/modules/preview/previewAuthorizeClient";
-import { authorizeRelayBinding, getPreviewAuthorizer, requestRuntimeLease } from "@/app/api/routes/previewRoutes";
+import {
+    authorizeRelayBinding,
+    authorizeViewerRelayBinding,
+    getPreviewAuthorizer,
+    requestRuntimeLease,
+    requestViewerRuntimeLease,
+} from "@/app/api/routes/previewRoutes";
 import { cookieName, readPreviewCookie } from "@/modules/preview/previewCookie";
 import { parsePreviewHost } from "@/modules/preview/parsePreviewHost";
 import { log } from "@/utils/log";
@@ -97,6 +104,29 @@ export const WS_RECHECK_DEADLINE_MS = 5_000;
 export const BOUND_WS_OPEN_EVENT = 'preview-proxy-ws-open-bound';
 
 /**
+ * specs/runtime-isolation-hardening (H3 viewer purpose) — the viewer variant,
+ * on its own event for the same pre-connect reason and separate from the
+ * project one so neither daemon handler can be handed the other's shape.
+ */
+export const VIEWER_BOUND_WS_OPEN_EVENT = 'preview-proxy-ws-viewer-bound';
+
+export type PreviewWsRelayBinding =
+    | { projectId: string; leaseId: string; workspacePaths: string[] }
+    | { purpose: 'viewer'; viewerKey: string; leaseId: string };
+
+/** One log-safe phrase for either variant. */
+function describeWsBindingTarget(binding: PreviewWsRelayBinding | undefined): string {
+    if (!binding) return 'unbound';
+    return isViewerRelayBinding(binding) ? `viewer=${binding.viewerKey}` : `project=${binding.projectId}`;
+}
+
+function isViewerRelayBinding(
+    binding: PreviewWsRelayBinding | undefined,
+): binding is { purpose: 'viewer'; viewerKey: string; leaseId: string } {
+    return (binding as { purpose?: string } | undefined)?.purpose === 'viewer';
+}
+
+/**
  * Carries the daemon's refusal *code* out of the open attempt. The message is
  * free text meant for a human; only the code decides the status.
  */
@@ -124,6 +154,12 @@ export function wsOpenFailureStatus(code: string | null): number {
     if (isRuntimeEvidenceBusy(code)) return 503;
     if (code && isStaleRuntimeBinding(code)) return 401;
     if (code && BINDING_REFUSAL_CODES.has(code)) return 403;
+    // specs/runtime-isolation-hardening (H3 viewer purpose) — same
+    // 404/403/409 as mint and the HTTP relay for the four
+    // previewViewerEvidence.ts codes; see viewerLeaseFailureStatus's doc
+    // comment in previewRuntimeBinding.ts.
+    const viewerStatus = code ? viewerLeaseFailureStatus(code) : null;
+    if (viewerStatus !== null) return viewerStatus;
     return 502;
 }
 
@@ -212,7 +248,7 @@ export async function openPreviewWsTunnel<T extends PreviewWsMachineSocket>(
          * sends. A tunnel is a relayed request too; leaving it unbound would
          * make the upgrade path the way around the binding.
          */
-        binding?: { projectId: string; leaseId: string; workspacePaths: string[] };
+        binding?: PreviewWsRelayBinding;
     },
     hooks: TunnelCandidateHooks,
     /** Total budget for the whole attempt, not per candidate daemon. */
@@ -237,7 +273,9 @@ export async function openPreviewWsTunnel<T extends PreviewWsMachineSocket>(
             ack = (await machineSocket
                 .timeout(Math.min(timeoutMs, remaining))
                 .emitWithAck(
-                    payload.binding ? BOUND_WS_OPEN_EVENT : 'proxy-ws-open',
+                    isViewerRelayBinding(payload.binding)
+                        ? VIEWER_BOUND_WS_OPEN_EVENT
+                        : payload.binding ? BOUND_WS_OPEN_EVENT : 'proxy-ws-open',
                     { tunnelId, ...payload },
                 )) as typeof ack;
         } catch (error) {
@@ -296,6 +334,7 @@ export async function recheckOpenTunnelBinding(input: {
     sockets: PreviewWsMachineSocket[];
     deadlineMs?: number;
     requestLease?: typeof requestRuntimeLease;
+    requestViewerLease?: typeof requestViewerRuntimeLease;
 }): Promise<{ ok: true } | { ok: false; reason: string }> {
     const deadlineMs = input.deadlineMs ?? WS_RECHECK_DEADLINE_MS;
     let expire: NodeJS.Timeout | undefined;
@@ -317,9 +356,34 @@ async function runRecheck(
         authorizer: PreviewAuthorizer | null;
         sockets: PreviewWsMachineSocket[];
         requestLease?: typeof requestRuntimeLease;
+        requestViewerLease?: typeof requestViewerRuntimeLease;
     },
     deadline: number,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    // A viewer tunnel is re-checked against the viewer's own ACL and its own
+    // lease event. Asking the project lease event about it would hand the
+    // question to a handler that knows nothing about viewers — and an old
+    // daemon would answer it.
+    if (isViewerBinding(input.bind)) {
+        const viewerBind = input.bind;
+        const viewerAccess = await authorizeViewerRelayBinding({
+            bind: { studioUserId: viewerBind.studioUserId, viewerKey: viewerBind.viewerKey },
+            machineId: input.machineId,
+            port: input.port,
+            authorizer: input.authorizer,
+        });
+        if (viewerAccess.kind === 'reject') return { ok: false, reason: viewerAccess.code };
+
+        const viewerLease = await (input.requestViewerLease ?? requestViewerRuntimeLease)(
+            input.sockets,
+            { viewerKey: viewerBind.viewerKey, port: input.port },
+            Math.max(1, deadline - Date.now()),
+        );
+        if (viewerLease.type === 'error') return { ok: false, reason: viewerLease.code };
+        if (viewerLease.leaseId !== viewerBind.leaseId) return { ok: false, reason: 'LEASE_MISMATCH' };
+        return { ok: true };
+    }
+
     const access = await authorizeRelayBinding({
         access: { projectId: input.bind.projectId, studioUserId: input.bind.studioUserId },
         machineId: input.machineId,
@@ -632,12 +696,34 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
         writeHttpError(socket, bindingDecision.status, 'Unauthorized');
         return;
     }
-    let wsBinding: { projectId: string; leaseId: string; workspacePaths: string[] } | undefined;
+    let wsBinding: PreviewWsRelayBinding | undefined;
     if (bindingDecision.kind === 'enforce') {
+      const enforced = bindingDecision.bind;
+      if (isViewerBinding(enforced)) {
+        const viewerBind = enforced;
+        const viewerAccess = await authorizeViewerRelayBinding({
+            bind: { studioUserId: viewerBind.studioUserId, viewerKey: viewerBind.viewerKey },
+            machineId,
+            port,
+            authorizer: getPreviewAuthorizer(),
+        });
+        if (viewerAccess.kind === 'reject') {
+            log({ module: 'preview', level: 'warn' },
+                `preview ws refused reason=${viewerAccess.code} machine=${machineId} port=${port} purpose=viewer`);
+            writeHttpError(socket, viewerAccess.status, 'Forbidden');
+            return;
+        }
+        wsBinding = {
+            purpose: 'viewer',
+            viewerKey: viewerBind.viewerKey,
+            leaseId: viewerBind.leaseId,
+        };
+      } else {
+        const projectBind = enforced;
         const access = await authorizeRelayBinding({
             access: {
-                projectId: bindingDecision.bind.projectId,
-                studioUserId: bindingDecision.bind.studioUserId,
+                projectId: projectBind.projectId,
+                studioUserId: projectBind.studioUserId,
             },
             machineId,
             port,
@@ -645,15 +731,16 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
         });
         if (access.kind === 'reject') {
             log({ module: 'preview', level: 'warn' },
-                `preview ws refused reason=${access.code} machine=${machineId} port=${port} project=${bindingDecision.bind.projectId}`);
+                `preview ws refused reason=${access.code} machine=${machineId} port=${port} project=${projectBind.projectId}`);
             writeHttpError(socket, access.status, 'Forbidden');
             return;
         }
         wsBinding = {
-            projectId: bindingDecision.bind.projectId,
-            leaseId: bindingDecision.bind.leaseId,
+            projectId: projectBind.projectId,
+            leaseId: projectBind.leaseId,
             workspacePaths: access.workspacePaths,
         };
+      }
     }
 
     const { sockets: machineSockets, degraded } = await findMachineSockets(claims.userId, machineId);
@@ -771,7 +858,7 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
             isOpen: () => hasTunnel(tunnelId),
             revoke: (reason) => {
                 log({ module: 'preview', level: 'warn' },
-                    `preview ws revoked reason=${reason} machine=${machineId} port=${port} project=${bindingDecision.bind.projectId}`);
+                    `preview ws revoked reason=${reason} machine=${machineId} port=${port} ${describeWsBindingTarget(wsBinding)}`);
                 teardown();
                 try { socket.destroy(); } catch { /* already gone */ }
             },

@@ -27,7 +27,9 @@ import {
     signPreviewToken,
     verifyPreviewToken,
     verifyExpiredPreviewTokenForRecovery,
+    isViewerBinding,
     type PreviewTokenBinding,
+    type PreviewViewerBinding,
 } from "@/modules/preview/previewToken";
 import {
     type LeaseFailureStatus,
@@ -43,6 +45,7 @@ import {
     isRuntimeEvidenceBusy,
     LEASE_UNSUPPORTED_CODE,
     type LeaseAck,
+    viewerLeaseFailureStatus,
 } from "@/modules/preview/previewRuntimeBinding";
 import {
     resolvePreviewAuthorizeConfig,
@@ -103,7 +106,9 @@ interface ProxyHttpRequestPayload {
     headers: Record<string, string>;
     bodyB64: string | null;
     /** Runtime the token was minted for; omitted for unbound (legacy) tokens. */
-    binding?: { projectId: string; leaseId: string; workspacePaths: string[] };
+    binding?:
+        | { projectId: string; leaseId: string; workspacePaths: string[] }
+        | { purpose: 'viewer'; viewerKey: string; leaseId: string };
 }
 
 function isProxyRpcResponse(raw: unknown): raw is ProxyRpcResponse {
@@ -147,6 +152,35 @@ export interface PreviewRelayMachineSocket {
  */
 export const BOUND_PROXY_EVENT = 'preview-proxy-http-bound';
 
+/**
+ * specs/runtime-isolation-hardening (H3 viewer purpose) — the viewer variant
+ * travels on its own event for the same reason the project one does, and
+ * separately from it so neither daemon handler can be handed the other's
+ * shape. A daemon that does not implement viewer binding has no listener
+ * here, so it never opens the upstream connection at all.
+ */
+export const VIEWER_BOUND_PROXY_EVENT = 'preview-proxy-http-viewer-bound';
+
+/** Mint/recheck-time viewer lease: `{viewerKey, port}`, same ack envelope. */
+export const VIEWER_LEASE_EVENT = 'preview-viewer-runtime-lease';
+
+/** The pre-H3, unbound relay event. Named so the dispatch below reads as a
+ *  three-way choice rather than one special case and a string literal. */
+const LEGACY_PROXY_EVENT = 'proxy-http-request';
+
+/** One log-safe phrase for either variant, so the relay's failure lines stay
+ *  comparable across purposes. */
+export function describeRelayBindingTarget(binding: ProxyHttpRequestPayload['binding']): string {
+    if (!binding) return 'unbound';
+    return isViewerRelayBinding(binding) ? `viewer=${binding.viewerKey}` : `project=${binding.projectId}`;
+}
+
+export function isViewerRelayBinding(
+    binding: ProxyHttpRequestPayload['binding'],
+): binding is { purpose: 'viewer'; viewerKey: string; leaseId: string } {
+    return (binding as { purpose?: string } | undefined)?.purpose === 'viewer';
+}
+
 /** Methods that may be re-issued to another candidate socket. */
 const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
@@ -162,7 +196,7 @@ export async function relayProxyHttpRequest(
         const attempts = machineSockets.map(async (socket) => {
             const raw = await socket
                 .timeout(timeoutMs)
-                .emitWithAck('proxy-http-request', payload);
+                .emitWithAck(LEGACY_PROXY_EVENT, payload);
             if (!isProxyRpcResponse(raw)) {
                 throw new Error(`Malformed proxy response from socket ${socket.id}`);
             }
@@ -183,7 +217,10 @@ export async function relayProxyHttpRequest(
         try {
             const raw = await socket
                 .timeout(Math.min(timeoutMs, remaining))
-                .emitWithAck(BOUND_PROXY_EVENT, payload);
+                .emitWithAck(
+                    isViewerRelayBinding(payload.binding) ? VIEWER_BOUND_PROXY_EVENT : BOUND_PROXY_EVENT,
+                    payload,
+                );
             if (!isProxyRpcResponse(raw)) {
                 throw new Error(`Malformed proxy response from socket ${socket.id}`);
             }
@@ -242,9 +279,23 @@ export function matchesTrustedSecret(provided: unknown, expected: string | undef
  * today. Signature is checked (expiry is not — a stale bound token is exactly
  * the case recovery exists for), so nothing a caller made up gets forwarded.
  */
-function recoverableBoundToken(token: string | undefined): string | undefined {
-    if (!token) return undefined;
-    return verifyExpiredPreviewTokenForRecovery(token)?.bind ? token : undefined;
+/**
+ * What the re-mint page may say about the session it is replacing: the token
+ * itself, and — only for a viewer — its purpose.
+ *
+ * The purpose is derived here from the *verified* claim rather than from
+ * anything the page or the browser could assert, and it never travels without
+ * the token that proves it.
+ */
+function recoverableBoundContext(
+    token: string | undefined,
+): { previousToken?: string; previousPurpose?: 'viewer' } {
+    if (!token) return {};
+    const bind = verifyExpiredPreviewTokenForRecovery(token)?.bind;
+    if (!bind) return {};
+    return isViewerBinding(bind)
+        ? { previousToken: token, previousPurpose: 'viewer' }
+        : { previousToken: token };
 }
 
 /** Decode the replaced token for planTrustedMint — signature required, expiry not. */
@@ -296,6 +347,82 @@ export async function requestRuntimeLease(
         code: LEASE_UNSUPPORTED_CODE,
         message: 'no daemon answered the runtime lease request',
     };
+}
+
+/**
+ * specs/runtime-isolation-hardening (H3 viewer purpose) — the viewer half of
+ * the same question, asked **by key**.
+ *
+ * The daemon is told which viewer to look for, not which port to look at. A
+ * port-first lookup on a shared machine would answer "something is serving
+ * 6080", which is true of another user's screen too; the key is what makes
+ * the answer about this user's runtime.
+ */
+export async function requestViewerRuntimeLease(
+    machineSockets: PreviewRelayMachineSocket[],
+    payload: { viewerKey: string; port: number },
+    timeoutMs = LEASE_TIMEOUT_MS,
+): Promise<LeaseAck> {
+    const deadline = Date.now() + timeoutMs;
+    let lastFailure: LeaseAck | null = null;
+    for (const socket of machineSockets) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        let ack: LeaseAck;
+        try {
+            ack = interpretLeaseAck(
+                await socket.timeout(Math.min(timeoutMs, remaining)).emitWithAck(VIEWER_LEASE_EVENT, payload),
+            );
+        } catch {
+            ack = { type: 'error', code: LEASE_UNSUPPORTED_CODE, message: 'daemon did not answer' };
+        }
+        if (ack.type === 'success') return ack;
+        lastFailure = ack;
+    }
+    return lastFailure ?? {
+        type: 'error',
+        code: LEASE_UNSUPPORTED_CODE,
+        message: 'no daemon answered the viewer runtime lease request',
+    };
+}
+
+/**
+ * Re-check the studio's machine ACL **and** the derived viewer key for a bound
+ * viewer token. Both, because they answer different questions: the ACL says
+ * this user may open a screen on this machine, the key says this is the screen
+ * that belongs to them.
+ */
+export async function authorizeViewerRelayBinding(input: {
+    bind: { studioUserId: string; viewerKey: string };
+    machineId: string;
+    port: number;
+    authorizer: PreviewAuthorizer | null;
+}): Promise<{ kind: 'allow' } | { kind: 'reject'; status: number; code: string; message: string }> {
+    const failClosed = {
+        kind: 'reject' as const,
+        status: 503,
+        code: 'authz-unavailable',
+        message: 'Viewer access could not be verified',
+    };
+    if (!input.authorizer) return failClosed;
+
+    const decision = await input.authorizer.authorize({
+        purpose: 'viewer',
+        studioUserId: input.bind.studioUserId,
+        viewerKey: input.bind.viewerKey,
+        machineId: input.machineId,
+        port: input.port,
+    });
+    if (decision.kind === 'allowed') return { kind: 'allow' };
+    if (decision.kind === 'denied') {
+        return {
+            kind: 'reject',
+            status: 403,
+            code: 'viewer-access-denied',
+            message: 'Viewer access denied',
+        };
+    }
+    return failClosed;
 }
 
 /**
@@ -500,7 +627,12 @@ export function describePreviewRelayFailure(
                         : outcome.code === 'PROJECT_OWNERSHIP_MISMATCH'
                             || outcome.code === 'PORT_PROJECT_MISMATCH'
                             || outcome.code === 'WORKSPACE_UNVERIFIED' ? 403
-                            : 502;
+                            // specs/runtime-isolation-hardening (H3 viewer
+                            // purpose) — same 404/403/409 as mint
+                            // (describeLeaseFailure), not the relay-specific
+                            // 502 that NO_LISTENER/EVIDENCE_UNAVAILABLE fall
+                            // through to below.
+                            : viewerLeaseFailureStatus(outcome.code) ?? 502;
     const reason = outcome.kind === 'machine-offline'
         ? 'machine-offline'
         : outcome.kind === 'lookup-degraded'
@@ -696,6 +828,56 @@ async function bindMintedToken(input: {
     };
 }
 
+/** The viewer counterpart: machine ACL + derived key, then the viewer runtime. */
+async function bindMintedViewerToken(input: {
+    machineId: string;
+    port: number;
+    studioUserId: string;
+    viewerKey: string;
+    ownerUserId: string;
+}): Promise<
+    | { kind: 'bound'; bind: PreviewViewerBinding }
+    | { kind: 'reject'; status: LeaseFailureStatus; body: { error: string; code: string } }
+> {
+    const access = await authorizeViewerRelayBinding({
+        bind: { studioUserId: input.studioUserId, viewerKey: input.viewerKey },
+        machineId: input.machineId,
+        port: input.port,
+        authorizer: getPreviewAuthorizer(),
+    });
+    if (access.kind === 'reject') {
+        return {
+            kind: 'reject',
+            status: access.status as LeaseFailureStatus,
+            body: { error: access.message, code: access.code },
+        };
+    }
+
+    const { sockets } = await findMachineSockets(input.ownerUserId, input.machineId);
+    const lease = await requestViewerRuntimeLease(sockets, {
+        viewerKey: input.viewerKey,
+        port: input.port,
+    });
+    if (lease.type === 'error') {
+        const failure = describeLeaseFailure(lease);
+        log(
+            { module: 'preview', level: 'warn' },
+            `preview viewer mint refused reason=${lease.code} machine=${input.machineId} port=${input.port}`,
+        );
+        return { kind: 'reject', status: failure.status, body: failure.body };
+    }
+
+    return {
+        kind: 'bound',
+        bind: {
+            purpose: 'viewer',
+            studioUserId: input.studioUserId,
+            viewerKey: input.viewerKey,
+            leaseId: lease.leaseId,
+        },
+    };
+}
+
 /**
  * specs/runtime-isolation-hardening (H3, P4) — the token this mint replaces.
  *
@@ -718,6 +900,18 @@ const mintBindingBody = {
      * under one account, so that account can never stand in for the person.
      */
     studioUserId: z.string().min(1).optional(),
+};
+
+/**
+ * specs/runtime-isolation-hardening (H3 viewer purpose) — a machine-scoped
+ * viewer mint. `viewerKey` is validated to the derived shape here so a caller
+ * cannot smuggle an arbitrary string into a signed claim; whether it is *this
+ * user's* key is settled by the studio callback re-deriving it, not by the
+ * pattern.
+ */
+const mintViewerBody = {
+    purpose: z.literal('viewer').optional(),
+    viewerKey: z.string().regex(/^bv1_[A-Za-z0-9_-]{32}$/).optional(),
 };
 
 const mintErrorBody = z.object({ error: z.string(), code: z.string().optional() });
@@ -794,6 +988,7 @@ export function previewRoutes(app: Fastify) {
                 machineId: z.string().min(1),
                 port: z.number().int().min(1).max(65535),
                 ...mintBindingBody,
+                ...mintViewerBody,
                 ...previousTokenBody,
             }),
             response: {
@@ -817,10 +1012,30 @@ export function previewRoutes(app: Fastify) {
         if (!matchesTrustedSecret(provided, expected)) {
             return reply.code(401).send({ error: 'Invalid trusted secret' });
         }
-        const { machineId, port, projectId, studioUserId, previousToken } = request.body;
+        const { machineId, port, projectId, studioUserId, purpose, viewerKey, previousToken } = request.body;
         const machine = await db.machine.findFirst({ where: { id: machineId } });
         if (!machine) {
             return reply.code(404).send({ error: 'Machine not found' });
+        }
+
+        // A viewer request carries its identity inside `viewer`, so the
+        // project fields stay empty and `planTrustedMint` can treat a request
+        // that fills both as the ambiguity it is.
+        const viewerRequested = purpose === 'viewer';
+        // Both halves or nothing. A viewer request missing either one would
+        // otherwise fall through to the policy and come back *unbound* — the
+        // exact downgrade this whole path exists to prevent.
+        if (viewerRequested && (!viewerKey || !studioUserId)) {
+            return reply.code(400).send({
+                error: 'viewerKey and studioUserId are required for a viewer preview token',
+                code: 'BINDING_REQUIRED',
+            });
+        }
+        if (!viewerRequested && viewerKey) {
+            return reply.code(400).send({
+                error: 'viewerKey requires purpose "viewer"',
+                code: 'MIXED_BINDING_PURPOSE',
+            });
         }
 
         const plan = planTrustedMint({
@@ -828,7 +1043,10 @@ export function previewRoutes(app: Fastify) {
             machineId,
             port,
             projectId,
-            studioUserId,
+            studioUserId: viewerRequested ? undefined : studioUserId,
+            viewer: viewerRequested && viewerKey && studioUserId
+                ? { studioUserId, viewerKey }
+                : undefined,
             previous: readPreviousToken(previousToken),
         });
         if (plan.kind === 'reject') {
@@ -847,19 +1065,27 @@ export function previewRoutes(app: Fastify) {
             return reply.send({ token: signed.token, expiresAt: signed.expiresAt, binding: 'unbound' });
         }
 
-        const bound = await bindMintedToken({
-            machineId,
-            port,
-            projectId: projectId!,
-            studioUserId: studioUserId!,
-            ownerUserId: machine.accountId,
-        });
+        const bound = plan.kind === 'bind-viewer'
+            ? await bindMintedViewerToken({
+                machineId,
+                port,
+                studioUserId: studioUserId!,
+                viewerKey: viewerKey!,
+                ownerUserId: machine.accountId,
+            })
+            : await bindMintedToken({
+                machineId,
+                port,
+                projectId: projectId!,
+                studioUserId: studioUserId!,
+                ownerUserId: machine.accountId,
+            });
         if (bound.kind === 'reject') {
             return reply.code(bound.status).send(bound.body);
         }
         const signed = signPreviewToken({ userId: machine.accountId, machineId, port, bind: bound.bind });
         log(
-            { module: 'preview', trusted: true, userId: machine.accountId, machineId, port, projectId, recovered: plan.forced },
+            { module: 'preview', trusted: true, userId: machine.accountId, machineId, port, projectId, purpose: plan.kind === 'bind-viewer' ? 'viewer' : 'project', recovered: plan.forced },
             'Minted preview token (trusted, bound)',
         );
         return reply.send({ token: signed.token, expiresAt: signed.expiresAt, binding: 'lease' });
@@ -949,7 +1175,7 @@ export function previewRoutes(app: Fastify) {
                                 reason: 'expired-or-invalid',
                                 // Carries what the replaced session was bound
                                 // to, so the re-mint cannot come back weaker.
-                                previousToken: recoverableBoundToken(token),
+                                ...recoverableBoundContext(token),
                             }));
                     }
                     return reply.code(401).send({ error: 'Invalid or expired ptoken' });
@@ -983,7 +1209,7 @@ export function previewRoutes(app: Fastify) {
                                 reason: 'expired-or-invalid',
                                 // Carries what the replaced session was bound
                                 // to, so the re-mint cannot come back weaker.
-                                previousToken: recoverableBoundToken(token),
+                                ...recoverableBoundContext(token),
                             }));
                     }
                     return reply
@@ -993,10 +1219,35 @@ export function previewRoutes(app: Fastify) {
 
                 let relayBinding: ProxyHttpRequestPayload['binding'];
                 if (bindingDecision.kind === 'enforce') {
+                  const enforced = bindingDecision.bind;
+                  if (isViewerBinding(enforced)) {
+                    const viewerBind = enforced;
+                    const access = await authorizeViewerRelayBinding({
+                        bind: { studioUserId: viewerBind.studioUserId, viewerKey: viewerBind.viewerKey },
+                        machineId: params.machineId,
+                        port: portNum,
+                        authorizer: getPreviewAuthorizer(),
+                    });
+                    if (access.kind === 'reject') {
+                        log(
+                            { module: 'preview', level: 'warn' },
+                            `preview relay refused reason=${access.code} machine=${params.machineId} port=${portNum} purpose=viewer`,
+                        );
+                        return reply.code(access.status).send({ error: access.message, code: access.code });
+                    }
+                    // No workspacePaths: a viewer has no project directories,
+                    // and an empty list would still be a claim about one.
+                    relayBinding = {
+                        purpose: 'viewer',
+                        viewerKey: viewerBind.viewerKey,
+                        leaseId: viewerBind.leaseId,
+                    };
+                  } else {
+                    const projectBind = enforced;
                     const access = await authorizeRelayBinding({
                         access: {
-                            projectId: bindingDecision.bind.projectId,
-                            studioUserId: bindingDecision.bind.studioUserId,
+                            projectId: projectBind.projectId,
+                            studioUserId: projectBind.studioUserId,
                         },
                         machineId: params.machineId,
                         port: portNum,
@@ -1005,15 +1256,16 @@ export function previewRoutes(app: Fastify) {
                     if (access.kind === 'reject') {
                         log(
                             { module: 'preview', level: 'warn' },
-                            `preview relay refused reason=${access.code} machine=${params.machineId} port=${portNum} project=${bindingDecision.bind.projectId}`,
+                            `preview relay refused reason=${access.code} machine=${params.machineId} port=${portNum} project=${projectBind.projectId}`,
                         );
                         return reply.code(access.status).send({ error: access.message, code: access.code });
                     }
                     relayBinding = {
-                        projectId: bindingDecision.bind.projectId,
-                        leaseId: bindingDecision.bind.leaseId,
+                        projectId: projectBind.projectId,
+                        leaseId: projectBind.leaseId,
                         workspacePaths: access.workspacePaths,
                     };
+                  }
                 }
 
                 if (
@@ -1121,7 +1373,7 @@ export function previewRoutes(app: Fastify) {
                                 reason: 'expired-or-invalid',
                                 // Carries what the replaced session was bound
                                 // to, so the re-mint cannot come back weaker.
-                                previousToken: recoverableBoundToken(token),
+                                ...recoverableBoundContext(token),
                             }));
                     }
                     return reply.code(failure.status).send({ code: rpcResponse.code, error: rpcResponse.message });
@@ -1135,7 +1387,7 @@ export function previewRoutes(app: Fastify) {
                 if (relayBinding && !isBindingEnforcementEchoed(rpcResponse)) {
                     log(
                         { module: 'preview', level: 'warn' },
-                        `preview relay refused reason=binding-not-enforced machine=${params.machineId} port=${portNum} project=${relayBinding.projectId} — daemon predates runtime binding`,
+                        `preview relay refused reason=binding-not-enforced machine=${params.machineId} port=${portNum} ${describeRelayBindingTarget(relayBinding)} — daemon predates runtime binding`,
                     );
                     return reply.code(502).send({
                         error: '이 머신의 daemon 이 프리뷰 런타임 결속을 적용하지 않았습니다. happy-cli 를 업데이트하세요.',
