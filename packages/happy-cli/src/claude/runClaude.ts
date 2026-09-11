@@ -368,6 +368,21 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     }
 
     logger.debug(`Session created: ${response.id}`);
+    /*
+     * Stage markers, for a managed run only.
+     *
+     * A managed provider is launched with its stdio ignored, so a throw
+     * anywhere between here and the first server the session talks to leaves
+     * **no trace at all** — the daemon reports a webhook timeout sixty seconds
+     * later and the reason dies with the process.
+     *
+     * Closed codes, never the error. The point is to name which step was
+     * reached, and an error's text on this path can carry a path or a token.
+     */
+    const stage = (code: string) => {
+        if (managedStartup) logger.debug(`[managed] startup-stage ${code}`);
+    };
+    stage('session-created');
     if (sandboxConfig?.checkpointProtection && (options.startingMode ?? 'local') !== 'remote') {
         throw new Error('checkpoint protection supports Claude remote mode only');
     }
@@ -381,6 +396,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             },
         })
         : undefined;
+    stage('checkpoint-events');
     const checkpointComposition = await createCheckpointSessionComposition({
         provider: 'claude-remote',
         platform: process.platform,
@@ -394,8 +410,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // SDK metadata (tools, slash commands) is now extracted from the
     // system.init message in claudeRemote.ts via onSDKMetadata callback
 
+    stage('checkpoint-composition');
     // Create realtime session
     const session = api.sessionSyncClient(response);
+    stage('session-client');
 
     // On reconnect, un-archive the session and skip replaying old messages.
     if (reconnectSessionId) {

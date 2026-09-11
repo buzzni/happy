@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { generateKeyPairSync } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash, generateKeyPairSync } from 'node:crypto';
+import {
+    chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -57,6 +59,10 @@ function writeProvisioning(overrides: Record<string, unknown> = {}, path = provi
             executor: { uid: AGENT_UID + 1, gid: AGENT_UID },
             cgroupRoot: '/sys/fs/cgroup/saycode',
         },
+        toolPolicy: { grantTtlMs: 600_000, callTimeoutMs: 120_000 },
+        checkpoint: { drainBudgetMs: 15_000 },
+        tenant: 'company:acme-1',
+        checkpointSchedule: { periodMs: 900_000, onTurnBoundary: true },
         ...overrides,
     };
     writeFileSync(path, JSON.stringify(body), { mode: 0o644 });
@@ -291,6 +297,69 @@ describe('resolveManagedRuntimeIdentity — content and isolation', () => {
         writeProvisioning({ workspaceId: '  ' });
         expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()))
             .toMatchObject({ status: 'refused', reason: 'malformed' });
+    });
+
+    it.each([
+        ['no checkpoint policy at all', undefined],
+        ['a drain budget of zero', { drainBudgetMs: 0 }],
+        ['a fractional drain budget', { drainBudgetMs: 1.5 }],
+        ['a drain budget that is not a number', { drainBudgetMs: 'soon' }],
+    ])('refuses a marker with %s', (_name, checkpoint) => {
+        // Same rule as the tool ceilings: the runtime does not choose how long
+        // a checkpoint waits for writes in flight. A marker from before this
+        // axis is a marker the parent wrote without approving one.
+        writeProvisioning({ checkpoint });
+        expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()))
+            .toMatchObject({ status: 'refused', reason: 'malformed', detail: 'checkpoint policy' });
+    });
+
+    it.each([
+        ['no tenant', undefined],
+        ['a blank tenant', '   '],
+        ['a tenant that is not a string', 42],
+    ])('refuses a marker with %s', (_name, tenant) => {
+        // The archive's AEAD binds it, so a wrong or invented tenant is an
+        // archive that cannot be opened — by this runtime or by a restore.
+        writeProvisioning({ tenant });
+        expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()))
+            .toMatchObject({ status: 'refused', reason: 'malformed' });
+    });
+
+    it.each([
+        ['no schedule at all', undefined],
+        ['a period of zero', { periodMs: 0, onTurnBoundary: true }],
+        ['a fractional period', { periodMs: 1.5, onTurnBoundary: true }],
+        ['no turn-boundary decision', { periodMs: 900_000 }],
+        ['a turn-boundary that is not a boolean', { periodMs: 900_000, onTurnBoundary: 'yes' }],
+        ['a backoff that is present and unusable', { periodMs: 900_000, onTurnBoundary: true, failureBackoffMs: 0 }],
+    ])('refuses a marker with %s', (_name, checkpointSchedule) => {
+        // 일정은 정책이다. 지어내면 아무도 승인하지 않은 주기로 볼륨을 봉인하고,
+        // 조용히 "안 찍음" 으로 두면 저장되고 있다는 믿음만 남는다.
+        writeProvisioning({ checkpointSchedule });
+        expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()))
+            .toMatchObject({ status: 'refused', reason: 'malformed', detail: 'checkpoint schedule' });
+    });
+
+    it('carries the approved schedule, backoff included only when set', () => {
+        writeProvisioning({
+            checkpointSchedule: { periodMs: 600_000, onTurnBoundary: false, failureBackoffMs: 30_000 },
+        });
+        const result = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
+        expect(result.status === 'active' && result.identity.checkpointSchedule)
+            .toEqual({ periodMs: 600_000, onTurnBoundary: false, failureBackoffMs: 30_000 });
+    });
+
+    it('carries the tenant onto the identity', () => {
+        writeProvisioning({ tenant: 'user:solo-9' });
+        const result = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
+        expect(result.status === 'active' && result.identity.tenant).toBe('user:solo-9');
+    });
+
+    it('carries the approved drain budget onto the identity', () => {
+        writeProvisioning({ checkpoint: { drainBudgetMs: 45_000 } });
+        const result = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
+        expect(result.status === 'active' && result.identity.checkpoint)
+            .toEqual({ drainBudgetMs: 45_000 });
     });
 
     it('refuses a non-ed25519 verifier key', () => {
@@ -611,5 +680,155 @@ describe('resolveManagedRuntimeIdentity — the identity a readiness answer is b
         // somebody else's machine.
         writeProvisioning({ happyMachineId: '   ' });
         expect(resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps()).status).toBe('refused');
+    });
+});
+
+describe('the marker digest travels with the read that produced it', () => {
+    /*
+     * F2 step 0. The digest must be of **the bytes this read saw**, taken
+     * before they are decoded - not of a re-encoding of the decoded string.
+     * `Buffer.from(content, "utf8")` is not the same bytes when the file holds
+     * a sequence UTF-8 decoding replaces, and a digest over that round trip
+     * would describe something nobody read.
+     *
+     * It rides on the resolution's `active` branch as a sibling of `identity`,
+     * not as a field of `ManagedRuntimeIdentity`: it is a property of this
+     * read rather than of the runtime's identity, and that type is built as a
+     * literal in many places.
+     */
+    const digestOf = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+
+    it('shouldCarryTheDigestOfTheExactBytesRead', () => {
+        writeProvisioning();
+        const raw = readFileSync(provisioningPath);
+        const result = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
+        expect(result.status).toBe('active');
+        if (result.status !== 'active') return;
+        expect(result.markerSha256).toBe(digestOf(raw));
+    });
+
+    it('shouldDigestTheRawBytesRatherThanAUtf8RoundTrip', () => {
+        /*
+         * One lone continuation byte inside a JSON string value. It parses, and
+         * it decodes to the replacement character - three bytes where the file
+         * has one - so the two digests differ. This is the case that tells the
+         * two implementations apart; every ASCII marker hides it.
+         */
+        writeProvisioning({ configDigest: 'digest-X' });
+        const raw = readFileSync(provisioningPath);
+        const at = raw.indexOf(Buffer.from('digest-X', 'utf8'));
+        expect(at).toBeGreaterThan(-1);
+        raw[at + 7] = 0x80;
+        writeFileSync(provisioningPath, raw, { mode: 0o644 });
+        chmodSync(provisioningPath, 0o644);
+
+        const onDisk = readFileSync(provisioningPath);
+        const roundTripped = Buffer.from(onDisk.toString('utf8'), 'utf8');
+        // The premise of the case: the round trip really is different bytes.
+        expect(roundTripped.equals(onDisk)).toBe(false);
+
+        const result = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
+        if (result.status !== 'active') {
+            // Then the fixture is not exercising what it claims.
+            throw new Error(`fixture did not resolve: ${result.status}`);
+        }
+        expect(result.markerSha256).toBe(digestOf(onDisk));
+        expect(result.markerSha256).not.toBe(digestOf(roundTripped));
+    });
+
+    it('shouldBeStableAcrossTwoReadsOfTheSameBytes', () => {
+        writeProvisioning();
+        const first = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
+        const second = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
+        if (first.status !== 'active' || second.status !== 'active') throw new Error('expected active');
+        expect(first.markerSha256).toBe(second.markerSha256);
+    });
+
+    it('shouldChangeWhenAnyByteOfTheMarkerChanges', () => {
+        writeProvisioning();
+        const before = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
+        writeProvisioning({ configDigest: 'digest-2' });
+        const after = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
+        if (before.status !== 'active' || after.status !== 'active') throw new Error('expected active');
+        expect(after.markerSha256).not.toBe(before.markerSha256);
+    });
+
+    it('shouldHashOnlyTheBytesReadWhenTheFileShrinksUnderTheGate', () => {
+        /*
+         * A short read, produced deterministically with no new production seam.
+         *
+         * The existing `statGate` callback runs **after** `fstat` and **before**
+         * the buffer is allocated from `stat.size`, so truncating the file from
+         * inside it leaves the reader allocating for the old size and reading
+         * fewer bytes. `Buffer.allocUnsafe` does not zero that tail, so a digest
+         * over the whole buffer covers bytes that were never read - and that is
+         * the one shape `content` cannot expose, because it is built from the
+         * same slice the digest must use.
+         *
+         * The file keeps its inode: `truncateSync` on the path, not a rewrite,
+         * so the already-open descriptor sees the shorter file.
+         */
+        writeProvisioning();
+        const valid = readFileSync(provisioningPath);
+        // Trailing whitespace: still one valid JSON document, and enough of it
+        // that a whole-buffer digest cannot coincide with the short one.
+        writeFileSync(
+            provisioningPath,
+            Buffer.concat([valid, Buffer.alloc(4096, 0x20)]),
+            { mode: 0o644 },
+        );
+        chmodSync(provisioningPath, 0o644);
+
+        let truncations = 0;
+        let sizeSeenByGate = 0;
+        const result = resolveManagedRuntimeIdentity(provisioningPath, deps({
+            statGate: (stat) => {
+                if (truncations === 0) {
+                    sizeSeenByGate = stat.size;
+                    truncateSync(provisioningPath, valid.length);
+                    truncations += 1;
+                }
+                // The policy the other active-path tests use, unchanged.
+                return assertProvisioningStat({ ...stat, uid: 0 });
+            },
+        }));
+
+        // The premise: exactly one truncation, and the reader was sized from a
+        // stat larger than what it could then read.
+        expect(truncations).toBe(1);
+        expect(sizeSeenByGate).toBeGreaterThan(valid.length);
+        if (result.status !== 'active') {
+            throw new Error(`fixture did not resolve: ${result.status}`);
+        }
+        expect(result.markerSha256).toBe(createHash('sha256').update(valid).digest('hex'));
+    });
+
+    it('shouldCarryNoDigestOnAnAbsentOrRefusedResolution', () => {
+        // A digest on a resolution that produced no identity would describe
+        // bytes nobody accepted.
+        const absent = resolveManagedRuntimeIdentity(join(root, 'nope.json'), deps());
+        expect(absent.status).toBe('absent');
+        expect((absent as Record<string, unknown>).markerSha256).toBeUndefined();
+
+        writeProvisioning();
+        const refused = resolveManagedRuntimeIdentity(provisioningPath, deps({
+            statGate: () => ({ reason: 'not-root-owned' as const }),
+        }));
+        expect(refused.status).toBe('refused');
+        expect((refused as Record<string, unknown>).markerSha256).toBeUndefined();
+    });
+
+    it('shouldLeaveTheIdentityItselfUnchanged', () => {
+        /*
+         * The digest is a sibling. Existing consumers destructure `identity`
+         * and must see exactly what they saw before - a required field on that
+         * type would have broken every literal that builds one.
+         */
+        writeProvisioning();
+        const result = resolveManagedRuntimeIdentity(provisioningPath, rootOwnedDeps());
+        if (result.status !== 'active') throw new Error('expected active');
+        expect(result.identity).not.toHaveProperty('markerSha256');
+        expect(result.identity.runtimeId).toBe('runtime-1');
+        expect(result.identity.provisioningOperationId).toBe('op-1');
     });
 });

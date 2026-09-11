@@ -34,6 +34,13 @@ const BOOT_INPUT = {
     saycode_state_dir: '/var/lib/saycode',
     saycode_workspace_dir: '/workspace',
     saycode_volume: 'vol_1',
+    // Execution controls the parent approves; the composer refuses without them.
+    saycode_tool_grant_ttl_ms: '60000',
+    saycode_tool_call_timeout_ms: '5000',
+    saycode_checkpoint_drain_budget_ms: '15000',
+    saycode_tenant: 'company:acme-1',
+    saycode_checkpoint_period_ms: '900000',
+    saycode_checkpoint_on_turn_boundary: 'true',
 };
 
 const instance = { providerMachineId: 'machine_1', providerInstanceId: 'instance_1' };

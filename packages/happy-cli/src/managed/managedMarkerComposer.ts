@@ -56,6 +56,47 @@ export type ManagedMarkerRecord = {
         executor: { uid: number; gid: number };
         cgroupRoot: string;
     };
+    /**
+     * The ceilings the parent approved for this runtime's tool use.
+     *
+     * `grantTtlMs` bounds a broker grant — the window in which this run may use
+     * tools at all — and is tightened again at launch to what is left of the
+     * write lease, because a grant may not outlive the right to write.
+     * `callTimeoutMs` bounds one invocation.
+     */
+    toolPolicy: { grantTtlMs: number; callTimeoutMs: number };
+    /**
+     * How long a checkpoint waits for writes already in flight before it seals.
+     *
+     * Execution control, like the two ceilings above, and for the same reason
+     * it is not an image constant: it varies by workspace and plan. A
+     * checkpoint that sealed after a budget nobody approved would either cut
+     * writes that were still landing or hold the runtime for a window nobody
+     * chose.
+     */
+    checkpoint: { drainBudgetMs: number };
+    /**
+     * The tenant this runtime's work belongs to (`company:<id>` / `user:<id>`).
+     *
+     * Not a label. The checkpoint archive binds it into the AEAD's additional
+     * data alongside the project and the area, so an archive sealed under one
+     * tenant does not open under another — which is also why it cannot be
+     * derived here from anything the runtime knows, and why a runtime without
+     * it does not activate.
+     */
+    tenant: string;
+    /**
+     * How often this runtime checkpoints, and whether the end of a turn is
+     * itself a reason.
+     *
+     * A policy, so it arrives rather than being invented: a period nobody
+     * approved seals the volume on a cadence nobody chose, and quietly taking
+     * none at all leaves the user believing their work is being saved while
+     * nothing is. `failureBackoffMs` is optional because the scheduler has a
+     * documented behaviour without one — absent means that behaviour, not a
+     * number made up here.
+     */
+    checkpointSchedule: { periodMs: number; onTurnBoundary: boolean; failureBackoffMs?: number };
 };
 
 export type ManagedMarkerRefusal =
@@ -88,6 +129,34 @@ const KEYS = {
     stateDir: 'saycode_state_dir',
     workspaceDir: 'saycode_workspace_dir',
     volume: 'saycode_volume',
+    /**
+     * How long one broker grant may live, and how long one tool call may run.
+     *
+     * Two different ceilings, and the names say which: a *grant* is the window
+     * this run may use tools at all, a *call* is a single invocation. The
+     * parent decides both — they vary by workspace and plan, and re-baking an
+     * image to change a timeout is not a deployment story.
+     */
+    toolGrantTtlMs: 'saycode_tool_grant_ttl_ms',
+    toolCallTimeoutMs: 'saycode_tool_call_timeout_ms',
+    /** How long a checkpoint waits for writes in flight before it seals. */
+    checkpointDrainBudgetMs: 'saycode_checkpoint_drain_budget_ms',
+    /** `company:<id>` or `user:<id>`. Sealing material, not a label. */
+    tenant: 'saycode_tenant',
+    /** How often a running runtime checkpoints, and whether a turn ends one. */
+    checkpointPeriodMs: 'saycode_checkpoint_period_ms',
+    checkpointOnTurnBoundary: 'saycode_checkpoint_on_turn_boundary',
+} as const;
+
+/**
+ * The one optional axis, named apart from `KEYS`.
+ *
+ * `KEYS` is the "all of these or this is not a managed machine" set, and the
+ * `not-managed` check reads it — putting an optional key in there would make a
+ * machine that omits it look unmanaged rather than managed-without-a-backoff.
+ */
+const OPTIONAL_KEYS = {
+    checkpointFailureBackoffMs: 'saycode_checkpoint_failure_backoff_ms',
 } as const;
 
 function text(metadata: Record<string, string | undefined>, key: string): string | null {
@@ -133,13 +202,41 @@ export function composeManagedMarker(input: {
         stateDir: text(metadata, KEYS.stateDir),
         workspaceDir: text(metadata, KEYS.workspaceDir),
         providerVolumeId: text(metadata, KEYS.volume),
+        tenant: text(metadata, KEYS.tenant),
     };
     const numbers = {
         providerUid: id(metadata, KEYS.providerUid),
         providerGid: id(metadata, KEYS.providerGid),
         executorUid: id(metadata, KEYS.executorUid),
         executorGid: id(metadata, KEYS.executorGid),
+        // Positive integers, and no default. A runtime that booted with an
+        // invented tool ceiling would be running under a policy nobody
+        // approved; refusing is the honest answer, and the parent can see it.
+        toolGrantTtlMs: id(metadata, KEYS.toolGrantTtlMs),
+        toolCallTimeoutMs: id(metadata, KEYS.toolCallTimeoutMs),
+        checkpointDrainBudgetMs: id(metadata, KEYS.checkpointDrainBudgetMs),
+        checkpointPeriodMs: id(metadata, KEYS.checkpointPeriodMs),
     };
+    /*
+     * `'true'` / `'false'` and nothing else.
+     *
+     * Not "anything truthy": a value the parent did not mean — `'yes'`, `'1'`,
+     * an empty string — would be read as a decision nobody made, and this one
+     * decides whether every turn ends in an archive.
+     */
+    const onTurnBoundaryRaw = text(metadata, KEYS.checkpointOnTurnBoundary);
+    const onTurnBoundary = onTurnBoundaryRaw === 'true'
+        ? true
+        : onTurnBoundaryRaw === 'false' ? false : null;
+    // Optional, but not lax: present and unreadable is a refusal, because the
+    // parent meant *something* and this runtime cannot tell what.
+    const backoffRaw = text(metadata, OPTIONAL_KEYS.checkpointFailureBackoffMs);
+    const failureBackoffMs = backoffRaw === null
+        ? undefined
+        : id(metadata, OPTIONAL_KEYS.checkpointFailureBackoffMs);
+    if (onTurnBoundary === null || failureBackoffMs === null) {
+        return { ok: false, reason: 'metadata-incomplete' };
+    }
     if (Object.values(strings).some((value) => value === null)
         || Object.values(numbers).some((value) => value === null)) {
         return { ok: false, reason: 'metadata-incomplete' };
@@ -175,6 +272,17 @@ export function composeManagedMarker(input: {
             stateDir: strings.stateDir!,
             workspaceDir: strings.workspaceDir!,
             verifierPublicKey: strings.verifierPublicKey!,
+            toolPolicy: {
+                grantTtlMs: numbers.toolGrantTtlMs!,
+                callTimeoutMs: numbers.toolCallTimeoutMs!,
+            },
+            checkpoint: { drainBudgetMs: numbers.checkpointDrainBudgetMs! },
+            tenant: strings.tenant!,
+            checkpointSchedule: {
+                periodMs: numbers.checkpointPeriodMs!,
+                onTurnBoundary,
+                ...(failureBackoffMs === undefined ? {} : { failureBackoffMs }),
+            },
             isolation: {
                 backend: strings.backend!,
                 provider: { uid: numbers.providerUid!, gid: numbers.providerGid! },

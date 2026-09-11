@@ -77,6 +77,15 @@ export type SupervisorDeps = {
          * 넘기면 자식이 supervisor 의 무관한 fd 를 물려받는다.
          */
         inheritFds: Array<{ childFd: number; parentFd: number }>;
+        /**
+         * 부모가 쓰고 자식이 읽는 pipe 를 만들 자식 fd 들.
+         *
+         * `inheritFds` 와 다른 것이다. 그쪽은 부모가 **이미 연** fd 를 자식
+         * 번호에 붙이는 것이고(봉투·자격 문서처럼 한 번 읽고 끝나는 것),
+         * 이것은 launch 시점에 **새로 만드는** 통로다 — 나중에 말을 걸 수 있어야
+         * 하므로 파일로는 안 된다.
+         */
+        pipeFds?: number[];
         /** 최종 child env. daemon 환경 전체를 물려주지 않는다. */
         env: Record<string, string>;
     }) => Promise<LaunchHandle>;
@@ -178,24 +187,25 @@ export function supervisorLockAddress(input: {
     return `\0saycode-supervisor:${digest}`;
 }
 
-export async function acquireSupervisorLock(input: {
-    runtimeId: string;
-    manifestRoot: string;
-    cgroupRoot: string;
-}): Promise<
-    { ok: true; release: () => Promise<void> } | { ok: false; reason: string }
+export type SupervisorLockScope = { runtimeId: string; manifestRoot: string; cgroupRoot: string };
+
+export async function acquireSupervisorLock(input: SupervisorLockScope): Promise<
+    { ok: true; address: string; release: () => Promise<void> }
+    | { ok: false; reason: 'not-linux' | 'already-held' | 'bind-failed' }
 > {
     // 추상 네임스페이스는 Linux 에만 있다. managed 런타임도 Linux 전용이므로
     // 다른 곳에서는 잠금을 흉내내지 않고 그 사실을 그대로 말한다.
     if (process.platform !== 'linux') return { ok: false, reason: 'not-linux' };
+    const address = supervisorLockAddress(input);
     const server = createServer();
     return new Promise((resolve) => {
         server.once('error', (error: NodeJS.ErrnoException) => {
             resolve({ ok: false, reason: error.code === 'EADDRINUSE' ? 'already-held' : 'bind-failed' });
         });
-        server.listen(supervisorLockAddress(input), () => {
+        server.listen(address, () => {
             resolve({
                 ok: true,
+                address,
                 release: () => new Promise<void>((done) => { server.close(() => done()); }),
             });
         });
@@ -211,6 +221,25 @@ export type LaunchHandle = {
     abort: () => void;
     /** helper 가 할 말을 다 한 뒤의 결과. */
     settled: Promise<{ status: string; pid: number | null }>;
+    /**
+     * `pipeFds` 로 요청한 자식 fd 별 쓰기 쪽.
+     *
+     * 이 write end 를 쥔 것은 특권 supervisor 뿐이고, 그것이 이 통로의 권한
+     * 전부다 — 검사할 token 도, 흉내낼 수 있는 port 도 없다.
+     */
+    controlWriters?: Map<number, { write: (text: string) => void; end: () => void }>;
+    /**
+     * 자식의 **실제 종료**. `exec-helper` 는 fork 없이 execve 하므로 이 종료가
+     * workload 자신의 종료이고, provider 클라이언트가 아니라 커널이 말한 것이다.
+     *
+     * `settled` 와 다른 것이다. `settled` 는 helper 가 status fd 에 할 말을 다
+     * 했다는 뜻이고, 오래 도는 세대에서는 그 뒤로도 계속 산다. 둘을 같은 것으로
+     * 읽으면 **아직 쓰고 있는 provider** 의 상태가 보관된다.
+     *
+     * 선택적이다 — 관측하지 못하는 deps 는 이 필드를 두지 않는다. 부재는
+     * "보지 못했다" 이고, 그것을 정지나 flush 로 접으면 안 된다.
+     */
+    exited?: Promise<{ code: number | null; signal: string | null }>;
 };
 
 export type StopOutcome =
@@ -231,6 +260,52 @@ export function createSupervisor(config: SupervisorConfig, deps: SupervisorDeps)
     const enroll = (entry: { key: GenerationKey; leaseExpiresMonotonic: number }) => {
         deps.enrollWatchdog?.(entry);
     };
+
+    /**
+     * **아무것도 돌지 않은 세대**의 기록을 그 자리에서 닫는다.
+     *
+     * 원장에는 helper 를 띄우기 **전에** 적는다(그래야 그 사이 죽은 세대가
+     * 재조정에서 보인다). 그런데 그 뒤 준비가 거절되면 pid 도 cgroup 도 없는
+     * 기록만 열린 채 남는다. 그 기록 하나가 `proveAllBelow` 를
+     * `termination-unknown` 으로 만들어 **epoch 승격과 공급자 checkpoint 를
+     * 막는다** — 정작 아무것도 실행되지 않았는데도. 그 기록을 닫는 경로는
+     * 있지만(`reconcile()`/`stop()`), 이 프로세스가 도는 동안에는 아무도
+     * 부르지 않으므로 그때까지 계속 막힌다.
+     *
+     * **부재를 가정하지 않는다.** 닫는 근거는 관측뿐이다:
+     *
+     * - `cgroup.events` 가 ENOENT — 그 자리에 세대가 **없다**. 닫는다.
+     * - `populated 0` 이고 rmdir 이 성공 — 커널이 비었다고 확인해 준 것이다. 닫는다.
+     * - 그 밖의 전부(EACCES 등 읽지 못함, 이미 뭔가 들어 있음, rmdir 거부)는
+     *   **모르는 것**이므로 열어 둔다. 모르는 것을 치웠다고 적으면 살아 있는
+     *   세대 위에 새 writer 가 열린다.
+     *
+     * 부재를 증거로 쓸 수 있는 전제는 `resolvePendingTermination` 과 같다 — 이
+     * supervisor 가 배타 잠금을 들고 있고 세대 이름이 재사용되지 않는다.
+     *
+     * 거절의 **분류는 바꾸지 않는다.** 정산은 원장의 일이다.
+     */
+    function settleNeverLaunched(key: GenerationKey): void {
+        const path = generation(key);
+        let events: string;
+        try {
+            events = deps.readFile(join(path, 'cgroup.events'));
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+                deps.manifest.recordTermination({ key, observedEmptyAt: deps.now() });
+            }
+            // 읽지 못한 것은 부재가 아니다. 열어 둔다.
+            return;
+        }
+        if (!/^populated 0$/m.test(events)) return;
+        try {
+            deps.rmdir(path);
+        } catch {
+            // 커널이 아직 비었다고 보지 않는다.
+            return;
+        }
+        deps.manifest.recordTermination({ key, observedEmptyAt: deps.now() });
+    }
 
     /**
      * 세대를 정지시키고 **비었음을 관측**한다.
@@ -255,8 +330,20 @@ export function createSupervisor(config: SupervisorConfig, deps: SupervisorDeps)
             deps.writeFile(join(path, 'cgroup.kill'), '1');
         } catch (error) {
             const code = (error as NodeJS.ErrnoException)?.code;
-            // 디렉터리가 이미 없다면 이 프로세스가 아는 근거가 없다.
-            if (code === 'ENOENT') return { stopped: false, detail: 'generation-absent' };
+            if (code === 'ENOENT') {
+                /*
+                 * 부재만으로는 아무 근거도 아니다. 그러나 이 세대의 정지를 **이미
+                 * 관측해 원장에 남겼다면** 그 기록이 증명이다 — 첫 호출이 치우고
+                 * 기록까지 마친 뒤의 재시도가 여기로 온다. 그때 실패로 답하면
+                 * 재시도가 영원히 수렴하지 않고, 그 세대를 들고 있는 쪽은 잠금을
+                 * 놓지 못한다. 답하는 것은 기록이지 ENOENT 가 아니다.
+                 */
+                const proof = deps.manifest.proveStopped(key);
+                if (proof.proven) {
+                    return { stopped: true, observedEmptyAt: proof.record.observedEmptyAt ?? deps.now() };
+                }
+                return { stopped: false, detail: 'generation-absent' };
+            }
             return { stopped: false, detail: 'kill-request-failed' };
         }
         let events: string;
@@ -294,6 +381,16 @@ export function createSupervisor(config: SupervisorConfig, deps: SupervisorDeps)
             key: GenerationKey;
             /** 자식이 받을 fd 와 그 자리에 붙일 부모 fd. */
             inherit?: Array<{ childFd: number; parentFd: number }>;
+            /**
+             * 이 세대에 열어 줄 제어 통로의 자식 fd.
+             *
+             * helper 의 fd allowlist 가 argv 의 keep 목록으로 오므로 여기에
+             * 넣어야 execve 를 넘어 살아남는다. 빠뜨리면 자식은 닫힌 fd 를
+             * 읽고, 증상은 "통로가 한 번도 말하지 않는다" 로만 나타난다.
+             */
+            controlFds?: number[];
+            /** 통로 쓰기 쪽을 호출자에게 준다. supervisor 말고는 아무도 못 쥔다. */
+            onControlWriters?: (writers: Map<number, { write: (text: string) => void }>) => void;
             statusFd: number;
             releaseFd: number;
             leaseExpiresMonotonic: number;
@@ -304,7 +401,10 @@ export function createSupervisor(config: SupervisorConfig, deps: SupervisorDeps)
             const path = generation(input.key);
             const credentials = config.resolveGenerationCredentials(input.key);
             const inherit = input.inherit ?? [];
-            const keep = inherit.map((entry) => entry.childFd);
+            const controlFds = input.controlFds ?? [];
+            // 문서와 통로 둘 다 allowlist 에 있어야 한다. 자식에게는 같은
+            // 종류의 것이다 — execve 를 넘어야 하는 fd.
+            const keep = [...inherit.map((entry) => entry.childFd), ...controlFds];
             const id = leaseId(input.key);
             if (inFlight.has(id)) return { kind: 'setup-refused', stage: 'already-launching' };
             if (input.statusFd === input.releaseFd
@@ -325,6 +425,7 @@ export function createSupervisor(config: SupervisorConfig, deps: SupervisorDeps)
                 deps.mkdir(path);
             } catch {
                 inFlight.delete(id);
+                settleNeverLaunched(input.key);
                 return { kind: 'setup-refused', stage: 'cgroup-create-failed' };
             }
             inFlight.add(id);
@@ -345,16 +446,44 @@ export function createSupervisor(config: SupervisorConfig, deps: SupervisorDeps)
                     statusFd: input.statusFd,
                     releaseFd: input.releaseFd,
                     inheritFds: inherit,
+                    ...(controlFds.length > 0 ? { pipeFds: controlFds } : {}),
                     env: { ...(config.envAllowlist ?? {}) },
                 });
             } catch {
                 inFlight.delete(id);
+                settleNeverLaunched(input.key);
                 return { kind: 'unknown', detail: 'launch-failed' };
+            }
+            if (handle.controlWriters && input.onControlWriters) {
+                input.onControlWriters(handle.controlWriters);
             }
             if (handle.pid === null) {
                 handle.abort();
                 inFlight.delete(id);
                 const settled = await handle.settled;
+                /*
+                 * **여기가 흔한 실패가 도는 자리다.** 기본 `launch` 는 spawn 이
+                 * 실패해도 던지지 않는다 — `error` 를 받아 settle 하고 `pid: null`
+                 * 인 handle 로 resolve 한다. 예외 경로만 정산하면 helper 경로
+                 * 오류 같은 평범한 거절이 그대로 열린 기록을 남긴다.
+                 *
+                 * 갈리는 것은 **프로세스가 생겼는가**다. `settled.pid` 는 helper
+                 * 의 ACK 가 아니라 spawn 이 실제로 만든 pid 이므로, 그것이 없다는
+                 * 것은 이 기동이 cgroup 에 무엇도 넣었을 수 없다는 뜻이다. 그때만
+                 * 정산을 시도하고, 그 안에서 다시 **관측**을 요구한다.
+                 */
+                if (settled.pid === null) {
+                    settleNeverLaunched(input.key);
+                } else {
+                    /*
+                     * 프로세스는 있었고 ACK 은 없었다. 그 helper 가 cgroup 에
+                     * 들어갔는지 모른다 — 치웠다고 적을 수 없다. 대신 감시에
+                     * 올려, lease 가 끝나면 이 프로세스 안에서 정지가 시도되게
+                     * 한다. 올리지 않으면 아무도 그 세대를 다시 보지 않는다.
+                     */
+                    deadlines.set(id, input.leaseExpiresMonotonic);
+                    enroll({ key: input.key, leaseExpiresMonotonic: input.leaseExpiresMonotonic });
+                }
                 return classifyHelperStatus({ status: settled.status, pid: settled.pid });
             }
             // park 된 지금 감시를 건다. release 는 그 다음이다.
@@ -414,13 +543,36 @@ export function createSupervisor(config: SupervisorConfig, deps: SupervisorDeps)
         async execGeneration(input: {
             key: GenerationKey;
             inherit?: Array<{ childFd: number; parentFd: number }>;
+            /**
+             * 이 세대에 열어 줄 제어 통로의 자식 fd.
+             *
+             * helper 의 fd allowlist 가 argv 의 keep 목록으로 오므로 여기에
+             * 넣어야 execve 를 넘어 살아남는다. 빠뜨리면 자식은 닫힌 fd 를
+             * 읽고, 증상은 "통로가 한 번도 말하지 않는다" 로만 나타난다.
+             */
+            controlFds?: number[];
+            /** 통로 쓰기 쪽을 호출자에게 준다. supervisor 말고는 아무도 못 쥔다. */
+            onControlWriters?: (writers: Map<number, { write: (text: string) => void }>) => void;
             statusFd: number;
             releaseFd: number;
             leaseExpiresMonotonic: number;
             onAcquired?: (pid: number) => Promise<void>;
+            /**
+             * 자식이 실제로 끝났을 때 한 번 불린다.
+             *
+             * 종료를 기다리지 않는다 — 오래 도는 세대를 붙잡으면 안 되기
+             * 때문이다. 관측되면 알려 줄 뿐이고, 관측되지 않는 것은
+             * **관측되지 않은 것**으로 남아야 한다.
+             */
+            onExit?: (exit: { code: number | null; signal: string | null }) => void;
         }): Promise<ExecOutcome> {
             const prepared = await this.prepareLaunch(input);
             if (prepared.kind !== 'parked') return prepared;
+            if (input.onExit) {
+                // deps 가 종료를 관측하지 못하면 아무 일도 없다. 그 침묵이
+                // 곧 '보지 못했다' 이고, 지어낸 값보다 그편이 맞다.
+                prepared.handle.exited?.then(input.onExit, () => { /* 시작조차 못했다 */ });
+            }
             try {
                 if (input.onAcquired) await input.onAcquired(prepared.pid ?? 0);
             } catch {
@@ -577,17 +729,58 @@ export const defaultSupervisorDeps: Omit<SupervisorDeps, 'manifest'> = {
     writeFile: (path, data) => { writeFileSync(path, data); },
     readFile: (path) => readFileSync(path, 'utf8'),
     rmdir: (path) => { rmdirSync(path); },
-    launch: async ({ helperPath, argv, statusFd, releaseFd, inheritFds, env }) => {
+    launch: async ({ helperPath, argv, statusFd, releaseFd, inheritFds, pipeFds, env }) => {
         // status fd 는 stdio 배열의 그 자리에 붙는다. helper 가 CLOEXEC 를 걸어
         // execve 시 닫히고, 그 EOF 가 "여기서 더 말할 것이 없다" 는 신호다.
         // 상속시킬 fd 도 같은 번호 자리에 실제로 매핑한다.
-        const slots = Math.max(statusFd, releaseFd, ...inheritFds.map((e) => e.childFd), 2) + 1;
+        const control = pipeFds ?? [];
+        const slots = Math.max(
+            statusFd, releaseFd, ...inheritFds.map((e) => e.childFd), ...control, 2,
+        ) + 1;
         const stdio: Array<'ignore' | 'pipe' | number> = new Array(slots).fill('ignore');
         stdio[statusFd] = 'pipe';
         stdio[releaseFd] = 'pipe';
         // 자식의 `childFd` 자리에 부모가 연 `parentFd` 를 붙인다.
         for (const entry of inheritFds) stdio[entry.childFd] = entry.parentFd;
+        /*
+         * 통로는 마지막에 놓는다. 이미 문서가 앉은 자리를 덮으면 자식은 봉투
+         * 대신 빈 pipe 를 읽게 되고, 그 실패는 여기서 멀리 떨어져 나타난다.
+         */
+        for (const fd of control) {
+            if (stdio[fd] !== 'ignore') {
+                throw new Error('managed launch cannot put a control pipe on a taken descriptor');
+            }
+            stdio[fd] = 'pipe';
+        }
         const child = spawn(helperPath, argv, { stdio, env });
+        /*
+         * execve 는 이 fd 들을 자식에게 그대로 넘긴다. helper 의 fd allowlist 는
+         * argv 의 keep 목록으로 받으므로, 통로도 그 목록에 있어야 살아남는다.
+         */
+        const controlWriters = new Map<number, { write: (text: string) => void; end: () => void }>();
+        for (const fd of control) {
+            const stream = child.stdio[fd] as { write: (text: string) => void; end: () => void } | null;
+            if (stream) controlWriters.set(fd, stream);
+        }
+
+        /*
+         * `exit` 이지 `close` 가 아니다. `close` 는 자식의 stdio 가 모두 닫힌
+         * 뒤에 오는데, workload 가 fd 를 물려준 손자를 남기면 그 시각은 종료보다
+         * 늦다 — 그리고 code/signal 은 `exit` 이 주는 값과 같다.
+         *
+         * spawn 자체가 실패하면 `exit` 은 오지 않는다. 그때 어떤 값으로
+         * resolve 하는 것은 일어나지 않은 종료를 지어내는 것이므로 reject 한다.
+         */
+        const exited = new Promise<{ code: number | null; signal: string | null }>((resolve, reject) => {
+            child.once('exit', (code, signal) => resolve({ code, signal }));
+            child.once('error', (error) => reject(error));
+        });
+        /*
+         * 아무도 붙지 않은 rejection 하나가 프로세스를 죽인다. 종료를 아무도
+         * 보지 않는 launch 는 정상이므로(park 뒤 setup 거부 등), 여기서 핸들러를
+         * 하나 달아 둔다. 기다리는 쪽의 reject 는 그대로다.
+         */
+        exited.catch(() => { /* 관측자가 없는 것은 오류가 아니다 */ });
 
         let status = '';
         let settledResolve: (value: { status: string; pid: number | null }) => void = () => {};
@@ -625,6 +818,8 @@ export const defaultSupervisorDeps: Omit<SupervisorDeps, 'manifest'> = {
                 try { if (release && 'end' in release) release.end(); } catch { /* 이미 닫혔다 */ }
             },
             settled,
+            exited,
+            ...(controlWriters.size > 0 ? { controlWriters } : {}),
         };
 
         child.on('error', settle);
@@ -678,11 +873,19 @@ export type LeaseWatchdog = {
 };
 
 export function createLeaseWatchdog(input: {
-    supervisor: Pick<ReturnType<typeof createSupervisor>, 'stopGeneration'>;
+    supervisor: Pick<ReturnType<typeof createSupervisor>, 'stopGeneration' | 'resolvePendingTermination'>;
     monotonicNow: () => number;
     intervalMs: number;
     setInterval?: (handler: () => void, ms: number) => NodeJS.Timeout;
     clearInterval?: (timer: NodeJS.Timeout) => void;
+    /**
+     * 세대를 정지시킨 직후에 불린다.
+     *
+     * 세대 cgroup 을 비우는 것으로 끝나지 않는 것이 있다 — 그 run 의 broker 와
+     * grant 는 다른 곳이 들고 있고, 여기서 알리지 않으면 TTL 이 끝날 때까지
+     * 열려 있는다. 정지를 관측하지 못한 경우에도 불린다.
+     */
+    afterStop?: (input: { key: GenerationKey; outcome: StopOutcome }) => void;
 }): LeaseWatchdog {
     const armed = new Map<string, { key: GenerationKey; leaseExpiresMonotonic: number }>();
     let timer: NodeJS.Timeout | null = null;
@@ -693,8 +896,22 @@ export function createLeaseWatchdog(input: {
         const results: Array<{ key: GenerationKey; outcome: StopOutcome }> = [];
         for (const [id, entry] of [...armed]) {
             if (now < entry.leaseExpiresMonotonic) continue;
-            const outcome = input.supervisor.stopGeneration(entry.key);
+            let outcome = input.supervisor.stopGeneration(entry.key);
+            /*
+             * `generation-absent` 는 **정지를 요청한 뒤** 본 부재다. 그 요청은
+             * 바로 위에서 원장에 남았으므로, 이 부재는 누가 치웠는지 모르는
+             * 부재가 아니다 — 마무리할 수 있다. 예전에는 여기서 같은 답을
+             * 영원히 되풀이했고, 그 기록은 명시적 재조정(`reconcile()`/`stop()`)
+             * 을 지날 때까지 닫히지 않았다.
+             *
+             * 마무리 자체는 여전히 관측을 요구한다. 상태를 읽지 못하면
+             * 그쪽이 실패를 돌려주고 감시는 그대로 걸려 있는다.
+             */
+            if (!outcome.stopped && outcome.detail === 'generation-absent') {
+                outcome = input.supervisor.resolvePendingTermination(entry.key);
+            }
             results.push({ key: entry.key, outcome });
+            input.afterStop?.({ key: entry.key, outcome });
             // 정지를 **관측**했을 때만 감시를 놓는다. 요청만으로 놓으면
             // 살아남은 세대가 다시는 집행되지 않는다.
             if (outcome.stopped) armed.delete(id);

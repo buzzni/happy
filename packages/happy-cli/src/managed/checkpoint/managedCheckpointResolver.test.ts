@@ -13,7 +13,7 @@ import { restoreManagedCheckpoint } from './managedCheckpointRestore';
 const created: string[] = [];
 const key = randomBytes(32);
 const checkpointId = 'a'.repeat(64);
-const tenant = { companyId: 'co_1', projectId: 'pr_1' };
+const tenant = { tenantId: 'co_1', projectId: 'pr_1' };
 const volume = { volumeId: 'vol_1', deviceUuid: 'dev-1' };
 
 async function scratch(): Promise<string> {
@@ -31,7 +31,7 @@ const MANIFEST = 'https://store.invalid/manifest.enc';
 const OBJECT = 'https://store.invalid/project.enc';
 
 async function published(overrides: {
-    tenant?: { companyId: string; projectId: string };
+    tenant?: { tenantId: string; projectId: string };
     checkpointId?: string;
 } = {}) {
     const root = await scratch();
@@ -53,7 +53,7 @@ async function published(overrides: {
         destination: manifestPath,
         key,
         binding: {
-            companyId: (overrides.tenant ?? tenant).companyId,
+            tenantId: (overrides.tenant ?? tenant).tenantId,
             projectId: (overrides.tenant ?? tenant).projectId,
             checkpointId: overrides.checkpointId ?? checkpointId,
             area: 'manifest',
@@ -70,7 +70,7 @@ function store(entries: Record<string, Buffer | string>) {
     }) as unknown as typeof globalThis.fetch;
 }
 
-function authority(overrides: Partial<{ tenant: { companyId: string; projectId: string } }> = {}) {
+function authority(overrides: Partial<{ tenant: { tenantId: string; projectId: string } }> = {}) {
     return {
         tenant: overrides.tenant ?? tenant,
         pointerUrl: POINTER,
@@ -158,7 +158,7 @@ describe('createManagedCheckpointSource', () => {
 
     it('shouldRefuseAnotherProjectsCheckpointEvenThoughItsOwnDigestIsConsistent', async () => {
         // A complete, internally consistent checkpoint — of a different project.
-        const other = await published({ tenant: { companyId: 'co_1', projectId: 'pr_other' } });
+        const other = await published({ tenant: { tenantId: 'co_1', projectId: 'pr_other' } });
         const source = createManagedCheckpointSource({
             authority: authority(),
             downloadDir: await scratch(),
@@ -192,7 +192,7 @@ describe('createManagedCheckpointSource', () => {
         // Sealed under *this* run's binding and digest-consistent with its
         // pointer, so nothing but the tenant comparison can catch it.
         const { product } = await published();
-        const forged = { ...product.manifest, tenant: { companyId: 'co_1', projectId: 'pr_other' } };
+        const forged = { ...product.manifest, tenant: { tenantId: 'co_1', projectId: 'pr_other' } };
         const digest = checkpointManifestDigest(forged);
         const manifestPath = join(await scratch(), 'forged.enc');
         await sealCheckpointBuffer({

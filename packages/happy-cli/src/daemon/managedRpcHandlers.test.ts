@@ -1,6 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { generateKeyPairSync, sign } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import ts from 'typescript';
+import { createManagedSupervisorReadiness } from './managedSupervisorReadiness';
+import { createLauncherClient } from './launch/launcherClient';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -13,6 +16,7 @@ import {
     createManagedRpcHandlers,
     MANAGED_ALLOWED_RPCS,
     ManagedRpcError,
+    registerManagedRpcHandlers,
     type ManagedRuntime,
     type ManagedSpawnOutcome,
 } from './managedRpcHandlers';
@@ -90,6 +94,10 @@ const identity: ManagedRuntimeIdentity = {
     verifier,
     stateDir: '/unused',
     isolation: { backend: 'privileged-launch-supervisor', provider: { uid: 901, gid: 901 }, executor: { uid: 902, gid: 901 }, cgroupRoot: '/c' },
+    toolPolicy: { grantTtlMs: 600_000, callTimeoutMs: 120_000 },
+    checkpoint: { drainBudgetMs: 15_000 },
+    tenant: 'company:acme-1',
+    checkpointSchedule: { periodMs: 900_000, onTurnBoundary: true },
 };
 
 function mint(op: ManagedOp, payload: unknown, overrides: Record<string, unknown> = {}): string {
@@ -135,6 +143,13 @@ beforeEach(() => {
     runtime = {
         identity,
         store,
+        /*
+         * Production always wires this: the renewal has to reach the thing that
+         * stops work. The fixture wires a consumer that confirms enforcement so
+         * the ordinary lease tests exercise the ordinary path; the tests that
+         * care about a refusing, throwing or absent consumer set their own.
+         */
+        onLeaseRenewed: async () => ({ enforced: true as const }),
         spawn: async () => { spawnCalls += 1; return spawnResult(); },
         isPidAlive: (pid) => livePgids.has(pid),
         now: () => wallClock,
@@ -301,6 +316,50 @@ describe('spawn', () => {
         if (stored.kind === 'ok') expect(stored.receipt.state).toBe('failed');
     });
 
+    it('keeps the launcher classifier so the refusal can be told apart', async () => {
+        /*
+         * `spawn-rejected` 하나로는 "봉투가 틀림" 과 "launch 가 거부됨" 이
+         * 구분되지 않는다. 분류자 하나만 남기면 그 둘이 갈린다 — 원문은
+         * 경로·자격을 담을 수 있으므로 옮기지 않는다.
+         */
+        await grantLease();
+        spawnResult = async () => ({
+            type: 'error', errorMessage: 'launch-refused:no-volume', started: false,
+        });
+        const error = await handlers.spawn(call('spawn', envelope())).catch((e: Error) => e);
+        expect((error as Error).message).toBe('spawn-rejected: launch-refused');
+        // 전선으로는 경계 이름 하나만 간다.
+        expect((error as ManagedRpcError).diagnostic).toBe('launch-refused');
+    });
+
+    it('drops a detail that is merely well-formed, such as a digest or a token', async () => {
+        /*
+         * 문자 클래스와 길이는 allowlist 가 아니다 — 소문자 32 hex 는 그 검사를
+         * 통과하지만 digest 이거나 bearer 일 수 있다. stage 이름만 남긴다.
+         */
+        await grantLease();
+        const digest = 'a3f1c09e5b7d4826af10e93c5d7b6142';
+        spawnResult = async () => ({
+            type: 'error', errorMessage: `launch-refused:${digest}`, started: false,
+        });
+        const error = await handlers.spawn(call('spawn', envelope())).catch((e: Error) => e);
+        expect((error as Error).message).toBe('spawn-rejected: launch-refused');
+        expect((error as Error).message).not.toContain(digest);
+        expect((error as ManagedRpcError).diagnostic).toBe('launch-refused');
+    });
+
+    it('refuses to carry launcher prose, keeping only that it was unclassified', async () => {
+        await grantLease();
+        spawnResult = async () => ({
+            type: 'error',
+            errorMessage: 'ENOENT: /Users/secret/path token=abc123',
+            started: false,
+        });
+        const error = await handlers.spawn(call('spawn', envelope())).catch((e: Error) => e);
+        expect((error as Error).message).toBe('spawn-rejected: unclassified');
+        expect((error as ManagedRpcError).diagnostic).toBe('unclassified');
+    });
+
     it('honours a stop that landed while the spawn was in flight', async () => {
         await grantLease();
         const stopCalls: Array<Record<string, unknown>> = [];
@@ -397,13 +456,52 @@ describe('managed runtime RPC allowlist', () => {
             .toThrowError(/dispatch-level allowlist/);
     });
 
+    it('serves every managed contract it registers, and nothing else', () => {
+        /*
+         * The gap the joint integration hit, and the reason no helper test
+         * could: two lists, drifting. `managed:checkpoint` and
+         * `managed:credential` were registered here and refused at the dispatch
+         * boundary, so a managed runtime answered `MANAGED_CAPABILITY_REQUIRED`
+         * for contracts it implements — a parent-issued checkpoint target could
+         * not arrive at all, and a live runtime's bearer could not be renewed.
+         * Both are signed contracts the parent already dispatches
+         * (`managedRpcTransport.ts` carries both in its own list, and
+         * `cloudRuntimeCredentialRenewal.ts` exists to send one), so this is
+         * alignment with what exists, not a new surface.
+         *
+         * Asserted as an equality against what registration actually did,
+         * rather than against a literal alone: a literal is the thing that went
+         * stale.
+         */
+        const registered: string[] = [];
+        registerManagedRpcHandlers(
+            { registerHandler: (method: string) => { registered.push(method); } } as never,
+            new Proxy({}, { get: () => async () => ({}) }) as never,
+        );
+        expect(registered.length).toBeGreaterThan(0);
+        expect([...registered].sort()).toEqual([...MANAGED_ALLOWED_RPCS].sort());
+    });
+
     it('allows only the managed dispatch methods', () => {
         expect([...MANAGED_ALLOWED_RPCS].sort())
             .toEqual([
+                'managed:checkpoint', 'managed:credential',
                 'managed:lease', 'managed:receipt', 'managed:runtime-lease',
                 'managed:spawn', 'managed:status', 'managed:stop',
             ]);
-        for (const bypass of ['spawn-happy-session', 'stop-session', 'bash', 'ai-credential:apply']) {
+        /*
+         * Reachable is not trusted: each of those still passes its own handler's
+         * token, scope and epoch checks, which have their own tests here.
+         *
+         * The legacy surface stays closed, and so does every name nobody
+         * registered — including ones that merely look like a managed contract.
+         * The prefix is not a pass.
+         */
+        for (const bypass of [
+            'spawn-happy-session', 'stop-session', 'bash', 'ai-credential:apply',
+            'requestShutdown', 'stop-daemon',
+            'managed:checkpoint:execute', 'managed:spawn-session', 'managed:',
+        ]) {
             expect(MANAGED_ALLOWED_RPCS).not.toContain(bypass);
         }
     });
@@ -644,6 +742,394 @@ describe('the wire shape the parent sends', () => {
         const nested = { directory: MANAGED_PROJECT_ROOT, envelope: envelope() };
         await expect(handlers.spawn(call('spawn', nested)))
             .rejects.toThrowError(/spawn-rejected/);
+    });
+});
+
+describe('taking a renewed credential', () => {
+    /*
+     * The runtime cannot renew its own — both control-plane routes that issue a
+     * daemon credential require the parent's signature — and the file it was
+     * delivered in is written once, at start. So this is the only way a
+     * long-running runtime's bearer is ever replaced, and every refusal here is
+     * a way the identity could be *moved* rather than renewed.
+     */
+    /**
+     * A provisioning-scoped token, like `status` and unlike `spawn`.
+     *
+     * The identity outlives every run on this runtime, so the signature that
+     * replaces it names the provisioning operation rather than a run.
+     */
+    function credentialToken(payload: unknown, over: Record<string, unknown> = {}): string {
+        const body = {
+            v: 1, kid: 'kid-1', aud: 'runtime-1',
+            op: 'credential',
+            workspaceId: 'ws-1', projectId: 'proj-1',
+            provisioningOperationId: 'op-1', epoch: 0,
+            requestKey: 'client-request-key',
+            payloadDigest: canonicalManagedPayloadDigest(payload),
+            iat: NOW, exp: NOW + 60_000,
+            ...over,
+        };
+        const encoded = Buffer.from(JSON.stringify(body), 'utf8').toString('base64url');
+        return `${encoded}.${sign(null, Buffer.from(encoded, 'utf8'), keys.privateKey).toString('base64url')}`;
+    }
+
+    function credentialCall(over: Record<string, unknown> = {}, tokenOver: Record<string, unknown> = {}) {
+        const payload = {
+            token: 'renewed.bearer',
+            expiresAt: NOW + 3_600_000,
+            // The identity the replacement claims. Signed into the digest, so
+            // the runtime can compare it with what it holds.
+            machineId: 'machine-1',
+            serverOrigin: 'https://happy.example.test',
+            ...over,
+        };
+        return { token: credentialToken(payload, tokenOver), params: payload };
+    }
+
+    it('writes it and reports the expiry that took', async () => {
+        const taken: { token: string; expiresAt: number }[] = [];
+        runtime.replaceCredential = async (input) => {
+            taken.push(input);
+            return { ok: true as const, expiresAt: input.expiresAt };
+        };
+        await expect(handlers.credential(credentialCall()))
+            .resolves.toEqual({ accepted: true, expiresAt: NOW + 3_600_000 });
+        expect(taken).toEqual([{
+            token: 'renewed.bearer', expiresAt: NOW + 3_600_000,
+            machineId: 'machine-1', serverOrigin: 'https://happy.example.test',
+        }]);
+    });
+
+    it('reports the expiry the daemon wrote, not the one that was asked for', async () => {
+        // The parent must be able to see which renewal actually took. Echoing
+        // the request would make every push look applied.
+        runtime.replaceCredential = async () => ({ ok: true as const, expiresAt: NOW + 10 });
+        await expect(handlers.credential(credentialCall()))
+            .resolves.toEqual({ accepted: true, expiresAt: NOW + 10 });
+    });
+
+    it('reports a replacement issued for another Machine', async () => {
+        runtime.replaceCredential = async () => ({ ok: false as const, reason: 'credential-not-mine' as const });
+        await expect(handlers.credential(credentialCall()))
+            .rejects.toThrowError(/credential-not-mine/);
+    });
+
+    it('refuses one that is already past', async () => {
+        // Writing it produces a runtime that authenticates once and stops.
+        runtime.replaceCredential = async () => ({ ok: true as const, expiresAt: NOW + 3_600_000 });
+        await expect(handlers.credential(credentialCall({ expiresAt: NOW - 1 })))
+            .rejects.toThrowError(/credential-expired/);
+    });
+
+    it('passes a replacement that does not outlive the stored one to the daemon, and reports its refusal', async () => {
+        /*
+         * The comparison is the daemon's, because the stored expiry is on its
+         * disk. What this asserts is that the refusal reaches the parent as a
+         * code it can act on rather than as an unclassified failure — a parent
+         * that cannot tell "already newer" from "broken" keeps retrying.
+         */
+        runtime.replaceCredential = async () => ({ ok: false as const, reason: 'credential-not-newer' as const });
+        await expect(handlers.credential(credentialCall()))
+            .rejects.toThrowError(/credential-not-newer/);
+    });
+
+    it('reports an unwritable credential rather than claiming the renewal took', async () => {
+        runtime.replaceCredential = async () => ({ ok: false as const, reason: 'credential-unwritable' as const });
+        await expect(handlers.credential(credentialCall()))
+            .rejects.toThrowError(/credential-unwritable/);
+    });
+
+    it('says so when nothing is wired to accept one', async () => {
+        // A parent that believes it renewed and did not is a parent that stops
+        // trying, and the runtime dies at its own expiry.
+        runtime.replaceCredential = undefined;
+        await expect(handlers.credential(credentialCall()))
+            .rejects.toThrowError(/capability-unavailable/);
+    });
+
+    it.each([
+        ['no token', { token: '' }],
+        ['a token that is not a string', { token: 42 }],
+        ['an expiry that is not an integer', { expiresAt: 1.5 }],
+        ['no Machine named', { machineId: '' }],
+        ['no origin named', { serverOrigin: '' }],
+    ])('refuses a body with %s', async (_name, over) => {
+        runtime.replaceCredential = async () => ({ ok: true as const, expiresAt: NOW + 3_600_000 });
+        await expect(handlers.credential(credentialCall(over)))
+            .rejects.toThrowError(/malformed-request/);
+    });
+
+    it('refuses once entries are closed, and is waited for by teardown', async () => {
+        /*
+         * Two properties every other RPC has and this one did not.
+         *
+         * A credential push accepted after `closeEntries` writes the runtime's
+         * identity while teardown believes nothing is running, and one that is
+         * not tracked lets teardown finish while the write is still in flight —
+         * a half-written credential is exactly the state the write-once file
+         * exists to prevent.
+         */
+        let release!: () => void;
+        const inFlight = new Promise<void>((resolve) => { release = resolve; });
+        runtime.replaceCredential = async () => {
+            await inFlight;
+            return { ok: true as const, expiresAt: NOW + 3_600_000 };
+        };
+        const pending = handlers.credential(credentialCall());
+        // Teardown must wait for it: the drain does not settle while it runs.
+        let drained = false;
+        void handlers.drainLeaseWork().then(() => { drained = true; });
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(drained).toBe(false);
+        release();
+        await pending;
+        await handlers.drainLeaseWork();
+
+        handlers.closeEntries();
+        await expect(handlers.credential(credentialCall()))
+            .rejects.toThrowError(/shutting-down/);
+    });
+
+    it('refuses a signature for a different operation', async () => {
+        /*
+         * The point of giving this its own operation: an assertion authorising
+         * work on a run must not also be able to replace the bearer the runtime
+         * authenticates with.
+         */
+        runtime.replaceCredential = async () => ({ ok: true as const, expiresAt: NOW + 3_600_000 });
+        const payload = { token: 'renewed.bearer', expiresAt: NOW + 3_600_000 };
+        await expect(handlers.credential({ token: credentialToken(payload, { op: 'status' }), params: payload }))
+            .rejects.toThrowError(/token-/);
+    });
+});
+
+describe('telling the launcher what the lease now is', () => {
+    /*
+     * The deadline lives here and the thing that enforces it lives in the
+     * launcher. Without this call the two drift apart on the very first
+     * renewal: the parent believes it extended the lease, this module agrees,
+     * and what actually stops work — and what decides whether a managed child
+     * may still report activity — is still holding the deadline the run started
+     * with.
+     */
+    it('reports the new deadline after a verified renewal, with the run it was granted for', async () => {
+        const renewals: unknown[] = [];
+        runtime.onLeaseRenewed = async (input) => {
+            renewals.push(input);
+            return { enforced: true };
+        };
+        await grantLease();
+        expect(renewals).toHaveLength(1);
+        expect(renewals[0]).toMatchObject({ epoch: 0, runId: RUN, attemptId: ATTEMPT });
+        expect((renewals[0] as { leaseExpiresMonotonic: number }).leaseExpiresMonotonic)
+            .toBeGreaterThan(monotonic);
+    });
+
+    it('refuses the renewal when nothing enforces it, and persists nothing', async () => {
+        /*
+         * A renewal that does not reach the thing which stops work is worse than
+         * a refusal: the parent is told `ok`, stops renewing, and the generation
+         * is killed at the deadline captured when it launched — which is exactly
+         * what a live run did, to the millisecond.
+         *
+         * So the consumer is awaited and its answer decides. Nothing is written
+         * before it: a store that recorded the extension while the enforcer kept
+         * the old deadline is this runtime lying to itself.
+         */
+        const before = runtime.store.readLease();
+        runtime.onLeaseRenewed = async () => ({ enforced: false, detail: 'never-launched' });
+        await expect(grantLease()).rejects.toThrowError(/renewal-not-enforced/);
+        expect(runtime.store.readLease()).toEqual(before);
+    });
+
+    it('refuses the renewal when the enforcement attempt itself throws', async () => {
+        // 이유는 소비자의 것이다. 집행되지 않았다는 사실만으로 거절한다.
+        runtime.onLeaseRenewed = async () => { throw new Error('/var/run/launcher.sock: ECONNREFUSED'); };
+        await expect(grantLease()).rejects.toThrowError(/renewal-not-enforced/);
+    });
+
+    it('refuses when no consumer is wired at all, rather than masking it', async () => {
+        /*
+         * 예전에는 콜백이 없거나 아무 답도 안 하면 성공으로 봤다. 그것이 정확히
+         * **배선이 끊긴 것을 가리는** 방법이었다 — production 은 이 콜백을 반드시
+         * 꽂고, 꽂히지 않았다면 그 갱신은 집행된 적이 없다. 그래서 거절한다.
+         */
+        delete (runtime as { onLeaseRenewed?: unknown }).onLeaseRenewed;
+        await expect(grantLease()).rejects.toThrowError(/renewal-not-enforced/);
+    });
+
+    it('does not extend local admission when the lease record cannot be written', async () => {
+        /*
+         * 집행은 성공했는데 기록이 실패하면, 이 프로세스만 연장된 권한을 갖는다 —
+         * store 는 옛 lease 이고 부모는 거절을 받는다. 그 상태로 `isLeaseValid()`
+         * 가 옛 deadline 을 넘겨 true 이면, 아무도 동의하지 않은 권한으로 일을
+         * 계속 admit 한다. Astra 가 재현한 그 결함이다.
+         */
+        await grantLease();
+        const stored = runtime.store.readLease();
+        monotonic += 50_000;
+        runtime.onLeaseRenewed = async () => ({ enforced: true });
+        runtime.store.writeLease = () => { throw new Error('disk-full'); };
+
+        await expect(grantLease({ renewalSeq: 2 })).rejects.toThrowError(/disk-full/);
+
+        // 기록은 그대로고, 이 프로세스의 권한도 그대로다.
+        expect(runtime.store.readLease()).toEqual(stored);
+        monotonic += 11_000;
+        expect(handlers.isLeaseValid()).toBe(false);
+    });
+
+    it('publishes the committed deadline once on a promotion, not twice', async () => {
+        /*
+         * 승격 경로는 보통 갱신과 **다른 분기**다. 그쪽에 공개 호출이 두 번 있으면
+         * 권한을 넓히는 소비자가 같은 lease 로 두 번 불리고, 테스트는 조용히
+         * 통과한다 — 실제로 제 편집 사고로 그 분기에 한 줄이 중복돼 있었고 129건이
+         * 전부 녹색이었다. 그래서 **횟수**를 세는 회귀가 필요하다.
+         */
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: true, detail: 'ok' }),
+            requestStop: async () => ({ requested: true, detail: 'ok' }),
+        };
+        const committed: unknown[] = [];
+        runtime.onLeaseCommitted = (input) => { committed.push(input); };
+        runtime.onLeaseRenewed = async () => ({ enforced: true });
+
+        await grantLease({ epoch: 1, renewalSeq: 1 });
+
+        expect(committed).toHaveLength(1);
+        expect(committed[0]).toMatchObject({ epoch: 1, runId: RUN, attemptId: ATTEMPT });
+    });
+
+    it('publishes the committed deadline only after the record is written', async () => {
+        // 권한을 넓히는 쪽(report capability 등)은 기록 뒤에만 알림을 받는다.
+        const committed: unknown[] = [];
+        runtime.onLeaseCommitted = (input) => { committed.push(input); };
+        runtime.onLeaseRenewed = async () => ({ enforced: true });
+        await grantLease();
+        expect(committed).toHaveLength(1);
+
+        committed.length = 0;
+        runtime.store.writeLease = () => { throw new Error('disk-full'); };
+        await expect(grantLease({ renewalSeq: 2 })).rejects.toThrowError(/disk-full/);
+        // 기록이 실패했으면 아무것도 넓히지 않는다.
+        expect(committed).toEqual([]);
+    });
+
+    it('makes a spawn wait for the renewal window, so it registers on the enforced deadline', async () => {
+        /*
+         * 갱신이 집행과 기록 사이에 있을 때 들어온 spawn 이 그냥 통과하면, 그
+         * 세대는 **옛** deadline 을 들고 시작하고 이 갱신의 snapshot 밖이라 아무도
+         * 다시 재무장하지 않는다 — 부모는 `ok` 를 받고 갱신을 멈춘다. Astra 가
+         * 그것을 측정했다(신참은 70_000, 갱신은 100_000).
+         *
+         * 거절도 창을 닫지만 기다리는 편이 낫다: 창은 집행 한 번 + 기록 한 번이고,
+         * 그 뒤에 등록되면 실제로 집행되는 deadline 을 들고 시작한다.
+         */
+        await grantLease();
+        monotonic += 30_000;
+        let release!: () => void;
+        const entered = new Promise<void>((resolve) => {
+            runtime.onLeaseRenewed = () => {
+                resolve();
+                return new Promise((settle) => { release = () => settle({ enforced: true }); });
+            };
+        });
+        const renewing = grantLease({ renewalSeq: 2 });
+        await entered;
+
+        let context: { leaseExpiresMonotonic: number } | undefined;
+        runtime.spawn = async (_request, given) => {
+            context = given as { leaseExpiresMonotonic: number };
+            return { type: 'success', sessionId: 'sess-1', pid: 4242 };
+        };
+        const spawning = handlers.spawn(call('spawn', envelope()));
+        await Promise.resolve();
+        // 아직 창 안이다 — spawn 은 등록을 시작하지 않았다.
+        expect(context).toBeUndefined();
+
+        release();
+        await renewing;
+        await spawning;
+        // 집행된 deadline 으로 등록됐다.
+        expect(context?.leaseExpiresMonotonic).toBe(monotonic + 60_000);
+    });
+
+    it('refuses a renewal while a spawn is still on its way to being registered', async () => {
+        // 반대 방향도 같다: 이미 들어온 spawn 이 등록되기 전이면 그 세대는 갱신의
+        // snapshot 에 없다.
+        await grantLease();
+        let releaseSpawn!: () => void;
+        spawnResult = () => new Promise((resolve) => {
+            releaseSpawn = () => resolve({ type: 'success', sessionId: 'sess-1', pid: 4242 });
+        });
+        const spawning = handlers.spawn(call('spawn', envelope()));
+        await Promise.resolve();
+        await expect(grantLease({ renewalSeq: 2 })).rejects.toThrowError(/renewal-race/);
+        releaseSpawn();
+        await spawning;
+    });
+
+    it('grants when the consumer confirms the extension is enforced', async () => {
+        runtime.onLeaseRenewed = async () => ({ enforced: true });
+        await expect(grantLease()).resolves.toMatchObject({ ok: true, renewalSeq: 1 });
+        expect(runtime.store.readLease()).toMatchObject({ kind: 'ok' });
+    });
+
+    it('says nothing when the renewal was refused', async () => {
+        // Folding a refusal into an extension would make the expiry meaningless
+        // — the registry would keep a capability the runtime does not have.
+        const renewals: unknown[] = [];
+        await grantLease();
+        runtime.onLeaseRenewed = (input) => { renewals.push(input); };
+        await expect(grantLease({ renewalSeq: 1 })).rejects.toThrowError(/stale-renewal/);
+        expect(renewals).toEqual([]);
+    });
+});
+
+describe('withdrawing what a generation was allowed to do', () => {
+    /*
+     * A report accepted after the child is gone re-registers state for a
+     * generation that no longer exists, and nothing later removes it. The
+     * capability has to be withdrawn by whatever ends the generation — and the
+     * two things that actually end one are the stop RPC and the watchdog, not
+     * the session paths that were doing it.
+     */
+    it('withdraws before the stop is requested, on the explicit stop', async () => {
+        const order: string[] = [];
+        runtime.onGenerationTerminated = (input) => {
+            order.push(`withdrawn:${input.runId}:${input.attemptId}:${input.epoch}`);
+        };
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: true, detail: 'stopped' }),
+            requestStop: async () => {
+                order.push('stop-requested');
+                return { requested: true, detail: 'asked' };
+            },
+        };
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        await handlers.stop(call('stop', {}));
+
+        // Withdrawn first: the window in which a late report could land is
+        // closed, not merely short.
+        expect(order).toEqual([`withdrawn:${RUN}:${ATTEMPT}:0`, 'stop-requested']);
+    });
+
+    it('withdraws when the lease runs out, not only when somebody asks', async () => {
+        // The watchdog path ends a generation without an RPC. It used to leave
+        // the capability standing.
+        const withdrawn: unknown[] = [];
+        runtime.onGenerationTerminated = (input) => { withdrawn.push(input); };
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: true, detail: 'stopped' }),
+            requestStop: async () => ({ requested: true, detail: 'asked' }),
+        };
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        monotonic += 120_000;
+        await handlers.runLeaseMaintenance();
+        expect(withdrawn).toEqual([{ runId: RUN, attemptId: ATTEMPT, epoch: 0 }]);
     });
 });
 
@@ -1301,6 +1787,56 @@ describe('managed status and runtime lease', () => {
         });
     }
 
+    const readyFacts = () => ({
+        filesystem: { ok: false as const, reason: 'root-not-mounted' as const },
+        restore: { status: 'pending' as const, checkpointId: null, manifestDigest: null },
+        isolation: { verified: true, backend: 'privileged-launch-supervisor' },
+    });
+    it('awaits deferred facts before answering and does not mutate the lease', async () => {
+        let finish!: (facts: ReturnType<typeof readyFacts>) => void;
+        runtime.runtimeFacts = () => new Promise((resolve) => { finish = resolve; });
+        const before = runtime.store.readLease(); let settled = false;
+        const pending = handlers.status({ token: statusToken(), params: {} }).then((result) => { settled = true; return result; });
+        await Promise.resolve(); expect(settled).toBe(false);
+        finish(readyFacts());
+        expect(await pending).toMatchObject({ isolation: { verified: true } });
+        expect(runtime.store.readLease()).toEqual(before);
+    });
+    it('reverifies expiration after awaiting facts without changing the lease', async () => {
+        let finish!: (facts: ReturnType<typeof readyFacts>) => void;
+        runtime.runtimeFacts = () => new Promise((resolve) => { finish = resolve; });
+        const before = runtime.store.readLease();
+        const pending = handlers.status({ token: statusToken(), params: {} });
+        const refused = expect(pending).rejects.toThrow(/token-expired/);
+        wallClock = NOW + 120_000; finish(readyFacts());
+        await refused; expect(runtime.store.readLease()).toEqual(before);
+    });
+    it('preserves the status epoch exemption and reads the lease committed during the facts await', async () => {
+        let finish!: (facts: ReturnType<typeof readyFacts>) => void;
+        runtime.runtimeFacts = () => new Promise((resolve) => { finish = resolve; });
+        const pending = handlers.status({ token: statusToken({ epoch: 0 }), params: {} });
+        const proof = vi.fn(async () => ({ proven: true, detail: 'fixture-empty' }));
+        runtime.fencingBackend = { proveGenerationStopped: proof, requestStop: async () => ({ requested: false, detail: 'unused' }) };
+        await handlers['runtime-lease']({ token: provisioningToken({
+            op: 'runtime-lease', provisioningOperationId: 'op-1', epoch: 1,
+            renewalSeq: 7, leaseMs: 60_000, absoluteExpiry: NOW + 120_000,
+        }), params: {} });
+        expect(proof).toHaveBeenCalledWith({ belowEpoch: 1 });
+        const committed = runtime.store.readLease();
+        expect(committed).toMatchObject({ kind: 'ok', record: { epoch: 1, renewalSeq: 7 } });
+        finish(readyFacts());
+        expect(await pending).toMatchObject({ epoch: 1, renewalSeq: 7, isolation: { verified: true } });
+        expect(runtime.store.readLease()).toEqual(committed);
+    });
+    it('keeps absent and synchronous facts supported and never observes for invalid authorization', async () => {
+        expect(await handlers.status({ token: statusToken(), params: {} })).toMatchObject({ isolation: { verified: false } });
+        const facts = vi.fn(readyFacts); runtime.runtimeFacts = facts;
+        await expect(handlers.status({ token: 'invalid', params: {} })).rejects.toThrow();
+        expect(facts).not.toHaveBeenCalled();
+        expect(await handlers.status({ token: statusToken(), params: {} })).toMatchObject({ isolation: { verified: true } });
+        expect(facts).toHaveBeenCalledOnce();
+    });
+
     it('answers with the runtime facts, without touching the lease', async () => {
         const before = runtime.store.readLease();
         const response = await handlers.status({ token: statusToken(), params: {} });
@@ -1369,6 +1905,53 @@ describe('managed status and runtime lease', () => {
         expect(runtime.store.readLease()).toEqual(before);
     });
 
+    it('shouldForwardTheVerbatimGrantEnvelopeOnTheRuntimeLeasePath', async () => {
+        /*
+         * The supervisor is another process holding the marker and the verifier
+         * key. Everything below this handler is derived numbers, so without the
+         * original `{token, params}` there is nothing for it to authenticate -
+         * it would be asked to trust the daemon's word, which is the whole
+         * thing this relay removes.
+         */
+        const renewals: Array<Record<string, unknown>> = [];
+        runtime.onLeaseRenewed = async (input) => {
+            renewals.push(input as Record<string, unknown>);
+            return { enforced: true };
+        };
+        // Signed over the params it is sent with, as the parent does.
+        const params = { requestedMs: 60_000 };
+        const token = provisioningToken({
+            op: 'runtime-lease', provisioningOperationId: 'op-1', epoch: 0,
+            renewalSeq: 11, leaseMs: 60_000, absoluteExpiry: NOW + 120_000,
+            payloadDigest: canonicalManagedPayloadDigest(params),
+        });
+        await handlers['runtime-lease']({ token, params });
+        expect(renewals).toHaveLength(1);
+        // Unaltered, both halves: a re-mint or a re-serialisation here would
+        // make the daemon the issuer of the authority being checked.
+        expect(renewals[0]?.grant).toEqual({ token, params: { requestedMs: 60_000 } });
+    });
+
+    it('shouldNotForwardAGrantEnvelopeOnTheRunScopedLeasePath', async () => {
+        /*
+         * `managed:lease` is a different op with a different claim shape, and
+         * it is unchanged by this increment. Attaching an envelope here would
+         * relay a run-scoped token as a runtime grant, which the supervisor
+         * would then refuse as `wrong-op` - turning a working path into a
+         * failing one.
+         */
+        const renewals: Array<Record<string, unknown>> = [];
+        runtime.onLeaseRenewed = async (input) => {
+            renewals.push(input as Record<string, unknown>);
+            return { enforced: true };
+        };
+        await grantLease();
+        expect(renewals).toHaveLength(1);
+        expect(renewals[0]?.grant).toBeUndefined();
+        // And it still does everything it did before: enforced, persisted, ACKed.
+        expect(renewals[0]).toMatchObject({ epoch: 0, runId: RUN, attemptId: ATTEMPT });
+    });
+
     it('returns the absolute expiry it actually applied', async () => {
         /*
          * The parent bounds the deadline it publishes by this value. Without
@@ -1426,5 +2009,272 @@ describe('managed status and runtime lease', () => {
         // grant is refused rather than taken on trust — the same refusal the
         // run-scoped lease gives, because it is the same code.
         })).rejects.toThrow(/fence-proof-unavailable/);
+    });
+});
+
+/*
+ * Taking a checkpoint target the parent issued.
+ *
+ * The runtime cannot issue one: the destinations are presigned by the parent's
+ * storage credentials and the authorisation is signed with a key no process
+ * here holds. So the target arrives, and what this handler owes is the same two
+ * things every write path owes — that the token authorises *this* runtime for
+ * *this* checkpoint, and that the runtime still holds the right to write at all.
+ */
+describe('accepting a checkpoint target', () => {
+    const TARGET_PARAMS = {
+        checkpointId: 'ckpt-7',
+        areas: [{ area: 'project', putUrl: 'https://storage.test/PUT/o', headUrl: 'https://storage.test/HEAD/o' }],
+        manifest: { putUrl: 'https://storage.test/PUT/m', headUrl: 'https://storage.test/HEAD/m' },
+        pointer: { putUrl: 'https://storage.test/PUT/p', getUrl: 'https://storage.test/GET/p' },
+        key: Buffer.alloc(32, 5).toString('base64'),
+        expiresAt: NOW + 600_000,
+    };
+
+    function checkpointCall(payload: unknown = TARGET_PARAMS, overrides: Record<string, unknown> = {}) {
+        const body = {
+            v: 1,
+            kid: 'kid-1',
+            aud: 'runtime-1',
+            op: 'checkpoint',
+            workspaceId: 'ws-1',
+            projectId: 'proj-1',
+            provisioningOperationId: 'op-1',
+            checkpointId: (payload as { checkpointId?: string }).checkpointId ?? 'ckpt-7',
+            requestKey: 'client-request-key',
+            epoch: 0,
+            payloadDigest: canonicalManagedPayloadDigest(payload),
+            paramsDigest: canonicalManagedPayloadDigest(payload),
+            iat: NOW,
+            exp: NOW + 60_000,
+            ...overrides,
+        };
+        const encoded = Buffer.from(JSON.stringify(body), 'utf8').toString('base64url');
+        return {
+            token: `${encoded}.${sign(null, Buffer.from(encoded, 'utf8'), keys.privateKey).toString('base64url')}`,
+            params: payload,
+        };
+    }
+
+    it('shouldForwardTheOriginalTokenBesideTheParamsItSigned', async () => {
+        /*
+         * The daemon verifying and discarding leaves the supervisor with an
+         * unauthenticated document: it holds the marker and the verifier key
+         * and would have nothing to check them against. The token travels
+         * **unaltered** - re-minting it here would make the daemon the issuer
+         * of its own authority.
+         */
+        const seen: Array<{ target: unknown; token: unknown }> = [];
+        runtime.acceptCheckpointTarget = async (target, dispatchToken) => {
+            seen.push({ target, token: dispatchToken });
+            return { accepted: true, state: 'queued', detail: 'queued' };
+        };
+        await grantLease();
+        const call = checkpointCall();
+        await expect(handlers.checkpoint(call))
+            .resolves.toEqual({ accepted: true, checkpointId: 'ckpt-7', state: 'queued' });
+        expect(seen[0]?.token).toBe((call as { token: string }).token);
+        expect(seen[0]?.target).toEqual(TARGET_PARAMS);
+    });
+
+    it('hands the parent-issued target to the runtime and reports the checkpoint', async () => {
+        const taken: unknown[] = [];
+        runtime.acceptCheckpointTarget = async (target) => {
+            taken.push(target);
+            return { accepted: true, state: 'queued', detail: 'queued' };
+        };
+        await grantLease();
+        await expect(handlers.checkpoint(checkpointCall()))
+            .resolves.toEqual({ accepted: true, checkpointId: 'ckpt-7', state: 'queued' });
+        expect(taken).toEqual([TARGET_PARAMS]);
+    });
+
+    it.each([
+        'in-flight', 'completed', 'deferred', 'unknown', 'needs-verification',
+    ] as const)('carries the acceptance state %s to the parent', async (state) => {
+        /*
+         * 전부 **수락**이다 — 문서는 도착했고 부모는 이 hop 을 재시도하면
+         * 안 된다. 다른 것은 이 전달로 아카이브가 따라오는지이고, 그 판정은
+         * 부모가 `state` 로 한다. 거절 코드로 만들면 "도착 못 함" 과 "도착했고
+         * 아카이브는 안 생김" 이 한 자리에 섞인다.
+         */
+        runtime.acceptCheckpointTarget = async () => ({ accepted: true, state, detail: state });
+        await grantLease();
+        await expect(handlers.checkpoint(checkpointCall()))
+            .resolves.toEqual({ accepted: true, checkpointId: 'ckpt-7', state });
+    });
+
+    it('refuses an acceptance that does not say what happened to it', async () => {
+        // 상태 없는 수락은 그 사실을 지운 것이다.
+        runtime.acceptCheckpointTarget = async () => ({ accepted: true, detail: 'accepted' });
+        await grantLease();
+        await expect(handlers.checkpoint(checkpointCall()))
+            .rejects.toThrowError(/malformed-request/);
+    });
+
+    it('does not report an acceptance the runtime refused', async () => {
+        /*
+         * The runtime that takes it is in another process, and it can say no —
+         * it may have no checkpoint session configured at all. Reporting
+         * `accepted: true` anyway tells the parent a credential it issued is
+         * in place, and that credential then expires where nobody is looking.
+         */
+        runtime.acceptCheckpointTarget = async () => ({
+            accepted: false, detail: 'checkpoint-unconfigured',
+        });
+        await grantLease();
+        await expect(handlers.checkpoint(checkpointCall()))
+            .rejects.toThrowError(/checkpoint-target-refused/);
+    });
+
+    it('refuses one whose lease has lapsed', async () => {
+        /*
+         * A checkpoint is a write, and it publishes a pointer other runtimes
+         * read. Taken without the right to write, it archives a volume this
+         * runtime may no longer own and then tells everybody that archive is
+         * the latest.
+         */
+        runtime.acceptCheckpointTarget = async () => ({ accepted: true, state: 'queued', detail: 'queued' });
+        await expect(handlers.checkpoint(checkpointCall()))
+            .rejects.toThrowError(/lease-expired/);
+    });
+
+    it('refuses a target whose destinations were not the ones signed', async () => {
+        // The digest is the grant: without it the same signature authorises
+        // uploading this volume anywhere the caller likes.
+        await grantLease();
+        runtime.acceptCheckpointTarget = async () => ({ accepted: true, state: 'queued', detail: 'queued' });
+        const call = checkpointCall()
+        const moved = {
+            ...TARGET_PARAMS,
+            areas: [{ ...TARGET_PARAMS.areas[0], putUrl: 'https://attacker.test/PUT/o' }],
+        };
+        await expect(handlers.checkpoint({ token: call.token, params: moved }))
+            .rejects.toThrowError(/token-/);
+    });
+
+    it('refuses a token whose checkpoint is not the one in the parameters', async () => {
+        // Otherwise a target for one checkpoint is accepted under another's
+        // authorisation, and the namespace the parent named is not the one
+        // written.
+        await grantLease();
+        runtime.acceptCheckpointTarget = async () => ({ accepted: true, state: 'queued', detail: 'queued' });
+        await expect(handlers.checkpoint(checkpointCall(TARGET_PARAMS, { checkpointId: 'ckpt-8' })))
+            .rejects.toThrowError(/token-/);
+    });
+
+    it('says so when nothing is wired to take one', async () => {
+        // A parent that believes it issued a target and did not is a parent
+        // whose checkpoints silently never happen.
+        await grantLease();
+        runtime.acceptCheckpointTarget = undefined;
+        await expect(handlers.checkpoint(checkpointCall()))
+            .rejects.toThrowError(/capability-unavailable/);
+    });
+
+    it('refuses once entries are closed, and is waited for by teardown', async () => {
+        let release!: () => void;
+        const inFlight = new Promise<void>((resolve) => { release = resolve; });
+        runtime.acceptCheckpointTarget = async () => {
+            await inFlight;
+            return { accepted: true, state: 'queued', detail: 'queued' };
+        };
+        await grantLease();
+        const pending = handlers.checkpoint(checkpointCall());
+        let drained = false;
+        void handlers.drainLeaseWork().then(() => { drained = true; });
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(drained).toBe(false);
+        release();
+        await pending;
+        await handlers.drainLeaseWork();
+
+        handlers.closeEntries();
+        await expect(handlers.checkpoint(checkpointCall()))
+            .rejects.toThrowError(/shutting-down/);
+    });
+});
+
+
+describe('actual daemon readiness wiring without importing daemon startup', () => {
+    it('captures one marker/client binding, observes before admission and freshly on every facts call', async () => {
+        const source = ts.createSourceFile('run.ts', readFileSync(join(__dirname, 'run.ts'), 'utf8'), ts.ScriptTarget.Latest, true);
+        const declarations = new Map<string, ts.VariableDeclaration>();
+        let factsAdapter: ts.PropertyAssignment | undefined;
+        function visit(node: ts.Node) {
+            if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) declarations.set(node.name.text, node);
+            if (ts.isPropertyAssignment(node) && node.name.getText(source) === 'runtimeFacts') factsAdapter = node;
+            ts.forEachChild(node, visit);
+        }
+        visit(source);
+        const marker = declarations.get('managedMarkerPath');
+        expect(marker).toBeDefined();
+        const admitted = declarations.get('managedIdentity')!;
+        const launcher = declarations.get('launcher')!;
+        const statement = launcher.parent.parent;
+        if (!ts.isBlock(statement.parent)) throw new Error('launcher must be in the active admission block');
+        const statements = [...statement.parent.statements];
+        const start = statements.indexOf(statement as ts.Statement);
+        const end = statements.findIndex((node, index) => index >= start && node.getText(source).includes(' admitted`'));
+        expect(start).toBeGreaterThanOrEqual(0); expect(end).toBeGreaterThan(start);
+        const body = [marker!.parent.parent.getText(source), admitted.parent.parent.getText(source),
+            'let managedFencingBackend = null; let managedRuntimeFacts;',
+            ...statements.slice(start, end + 1).map((node) => node.getText(source)),
+            `return { facts: (${factsAdapter!.initializer.getText(source)}), backend: managedFencingBackend };`].join('\n');
+        const js = ts.transpileModule(body, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
+        const events: string[] = [];
+        const sha = 'a'.repeat(64); const nonce = 'n'.repeat(32);
+        const binding = { token: 't'.repeat(43), socketPath: '/state/launcher.sock' };
+        const hello = { instanceNonce: nonce, runtimeId: identity.runtimeId,
+            provisioningOperationId: identity.provisioningOperationId, markerSha256: sha };
+        const request = vi.fn(async () => { events.push('hello'); return JSON.stringify({ ok: true, result: hello }); });
+        const startupBinding = vi.fn(() => ({ ok: true, binding }));
+        const readMarker = vi.fn(() => ({ kind: 'ok' as const, content: '', sha256: sha }));
+        const readBinding = vi.fn(() => ({ ok: true as const, binding: { token: 't'.repeat(43), socketPath: '/state/launcher.sock' } }));
+        const helper = vi.fn((...args: Parameters<typeof createManagedSupervisorReadiness>) => {
+            expect(args).toHaveLength(1);
+            return createManagedSupervisorReadiness(args[0], {
+                provisioning: { getuid: () => 0, lstatDir: () => ({ uid: 0, mode: 0o755, isDirectory: true, isSymbolicLink: false }),
+                    probeIsolationBackend: () => { throw new Error('must not probe'); } },
+                readProtectedFile: readMarker, readBinding,
+                readAttestation: () => ({ ok: true, attestation: { version: 1, ...hello, socketPath: '/state/launcher.sock' } }),
+            });
+        });
+        const markerPath = vi.fn(() => '/etc/saycode/managed-runtime.json');
+        const resolveIdentity = vi.fn(() => ({ status: 'active', identity: { ...identity }, markerSha256: sha }));
+        const socketRequest = vi.fn(() => ({ request }));
+        const dependencies = {
+            managedProvisioningPath: markerPath, resolveManagedRuntimeIdentity: resolveIdentity,
+            readManagedLauncherBinding: startupBinding, defaultProvisioningDeps: {},
+            createLauncherClient, createUnixSocketRequest: socketRequest, createManagedSupervisorReadiness: helper,
+            logger: { debug: (message: string) => { if (message.endsWith(' admitted')) events.push('admitted'); } },
+            resolveManagedVolumeBinding: async () => ({ ok: true, binding: { providerVolumeId: 'volume', fsUuid: 'uuid' } }),
+            observeManagedVolume: () => { throw new Error('not used by fixture volume reader'); },
+            MANAGED_PROJECT_ROOT: '/workspace/project', readMountinfoText: () => '', readFsUuidForDevice: () => null,
+            verifyOpenPathDevice: () => false,
+            resolveManagedFilesystemFacts: () => { events.push('filesystem'); return { ok: false, reason: 'root-not-mounted' }; },
+            readManagedRestoreState: () => { events.push('restore'); return { status: 'pending', checkpointId: null, manifestDigest: null }; },
+        };
+        // Execute the actual selected AST statements, not a copied readiness predicate.
+        const execute = new Function(...Object.keys(dependencies), `return (async () => { ${js} })();`);
+        const wired = await execute(...Object.values(dependencies));
+        expect(markerPath).toHaveBeenCalledOnce();
+        expect(resolveIdentity).toHaveBeenCalledExactlyOnceWith('/etc/saycode/managed-runtime.json');
+        expect(startupBinding).toHaveBeenCalledOnce(); expect(socketRequest).toHaveBeenCalledExactlyOnceWith('/state/launcher.sock');
+        expect(helper).toHaveBeenCalledOnce(); expect(request).toHaveBeenCalledOnce();
+        expect(events.indexOf('hello')).toBeLessThan(events.indexOf('admitted'));
+        expect(events).not.toContain('filesystem');
+        runtime.runtimeFacts = wired.facts;
+        const statusRequest = call('status', {}, { runId: undefined, attemptId: undefined, provisioningOperationId: 'op-1' });
+        binding.token = 'caller-mutated'; binding.socketPath = '/changed';
+        events.length = 0;
+        expect(await handlers.status(statusRequest)).toMatchObject({ isolation: { verified: true } });
+        expect(events).toEqual(['hello', 'filesystem', 'restore']);
+        expect(await handlers.status(statusRequest)).toMatchObject({ isolation: { verified: true } });
+        expect(request).toHaveBeenCalledTimes(3); expect(readMarker).toHaveBeenCalledTimes(3);
+        expect(readBinding).toHaveBeenCalledTimes(3); expect(startupBinding).toHaveBeenCalledOnce();
+        request.mockResolvedValueOnce(JSON.stringify({ ok: false, reason: 'hello-unavailable' }));
+        dependencies.logger.debug = () => { throw new Error('logger failed'); };
+        expect(await handlers.status(statusRequest)).toMatchObject({ isolation: { verified: false } });
     });
 });

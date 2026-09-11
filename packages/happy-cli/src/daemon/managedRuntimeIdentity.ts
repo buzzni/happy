@@ -33,6 +33,8 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
+import { createHash } from 'node:crypto';
+
 import { parseManagedVerifierKey } from './managedDispatchToken';
 import type { KeyObject } from 'node:crypto';
 
@@ -125,12 +127,80 @@ export type ManagedRuntimeIdentity = {
         executor: { uid: number; gid: number };
         cgroupRoot: string;
     };
+    /**
+     * The ceilings the parent approved for this runtime's tool use.
+     *
+     * `grantTtlMs` bounds a broker grant — the window in which this run may use
+     * tools at all — and `callTimeoutMs` bounds one invocation. Neither has a
+     * default here: a runtime that invented one would be running under a policy
+     * nobody approved, and the two vary by workspace and plan, so they arrive
+     * in the marker rather than being baked into the image.
+     */
+    toolPolicy: { grantTtlMs: number; callTimeoutMs: number };
+    /**
+     * How long a checkpoint waits for writes already in flight before it seals.
+     *
+     * The same kind of axis as the ceilings above, and with no default for the
+     * same reason: sealing after a budget nobody approved either cuts writes
+     * that were still landing or holds the runtime for a window nobody chose.
+     */
+    checkpoint: { drainBudgetMs: number };
+    /**
+     * The tenant axis (`company:<id>` / `user:<id>`) this runtime's work
+     * belongs to.
+     *
+     * Sealing material: the checkpoint archive binds it into the AEAD's
+     * additional data, so an archive sealed under one tenant does not open
+     * under another. That is why it arrives in the marker and is never derived
+     * — a runtime that guessed it could neither checkpoint nor restore.
+     */
+    tenant: string;
+    /**
+     * How often this runtime checkpoints, and whether a turn boundary is
+     * itself a reason.
+     *
+     * A policy the parent approves, never one this runtime invents: a cadence
+     * nobody chose seals the volume on its own schedule, and silently taking
+     * none leaves the user believing work is being saved while nothing is.
+     */
+    checkpointSchedule: { periodMs: number; onTurnBoundary: boolean; failureBackoffMs?: number };
 };
 
 export type ManagedIdentityResolution =
     | { status: 'absent' }
     | { status: 'refused'; reason: ManagedIdentityRefusal; detail?: string }
-    | { status: 'active'; identity: ManagedRuntimeIdentity };
+    /**
+     * `markerSha256` is a property of **the read**, not of the identity.
+     *
+     * It sits beside `identity` rather than inside it: that type is built as a
+     * literal in many places, and a required field would break every one of
+     * them for a value none of them can produce. Only an `active` resolution
+     * carries it - a digest on an absent or refused one would describe bytes
+     * that produced no identity.
+     */
+    | { status: 'active'; identity: ManagedRuntimeIdentity; markerSha256: string };
+
+import {
+    callerNetworkNamespace,
+    defaultIsolationLaunchDeps,
+    defaultIsolationProbeDeps,
+    verifyIsolationBackend,
+    MANAGED_ISOLATION_PROBE_PATH,
+    MANAGED_PROVIDER_HELPER_IMAGE_PATH,
+    MANAGED_TOOL_HELPER_IMAGE_PATH,
+} from '@/launcher/isolationBackendProbe';
+
+/** The probe's own generation. Its own directory, never a real one's. */
+export const MANAGED_ACTIVATION_PROBE_CGROUP = 'activation-probe';
+
+/**
+ * How long the activation probe may take.
+ *
+ * Bounded because this runs at boot: a probe that hangs would leave a Machine
+ * that never reports either way, which is the failure mode hardest to tell from
+ * a slow one.
+ */
+export const MANAGED_ACTIVATION_PROBE_TIMEOUT_MS = 10_000;
 
 export type IsolationProbeResult = { verified: true } | { verified: false; reason: string };
 
@@ -157,8 +227,8 @@ export type ManagedProvisioningDeps = {
 };
 
 /**
- * No trusted launch backend exists yet, so managed mode cannot activate. This
- * is the activation gate: it becomes a real probe in T09 and not before.
+ * The answer before the probe existed, kept for the tests that need a runtime
+ * which cannot activate. Production uses the real probe below.
  */
 export function probeIsolationBackendUnavailable(): IsolationProbeResult {
     return { verified: false, reason: 'trusted-launch-backend-not-implemented' };
@@ -181,7 +251,48 @@ export const defaultProvisioningDeps: ManagedProvisioningDeps = {
             isSymbolicLink: stat.isSymbolicLink(),
         };
     },
-    probeIsolationBackend: probeIsolationBackendUnavailable,
+    /*
+     * Still unavailable, deliberately.
+     *
+     * `checkIsolationStaticPreconditions` in `@/launcher/isolationBackendProbe`
+     * checks the static half — helpers present, root-owned and unwritable, two distinct
+     * programs, a delegated cgroup v2 root, three separate uids — and every one
+     * of those is necessary. None of them is sufficient: a helper that exists
+     * with the right mode has not been shown to *exec* under those uids or to
+     * *fence* what it started, and activating on file state alone would be the
+     * flag-flip this gate exists to prevent.
+     *
+     * The dynamic half is a root-owned, fixed, timeout-bounded probe that
+     * exercises the real helper and a real launch/fence. It cannot be the
+     * supervisor answering, because boot requires an active identity before it
+     * starts the supervisor and that is a cycle. Until that lands, this stays
+     * unavailable and no runtime activates.
+     */
+    /*
+     * The real gate: static preconditions **and** a real launch through the
+     * real helper **and** a real fence.
+     *
+     * `verifyIsolationBackend` is the only function that can answer
+     * `verified: true`; the static half returns a shape this field cannot
+     * accept, so it cannot be wired here by mistake. Synchronous by
+     * construction — the probe is `spawnSync` with a timeout — because this
+     * contract and every caller of identity resolution are synchronous.
+     */
+    probeIsolationBackend: (input) => verifyIsolationBackend({
+        provider: input.provider,
+        executor: input.executor,
+        cgroupRoot: input.cgroupRoot,
+        daemonUid: input.daemonUid,
+        probeCgroupName: MANAGED_ACTIVATION_PROBE_CGROUP,
+        probePath: MANAGED_ISOLATION_PROBE_PATH,
+        timeoutMs: MANAGED_ACTIVATION_PROBE_TIMEOUT_MS,
+        callerNetns: callerNetworkNamespace(),
+        deps: defaultIsolationProbeDeps({
+            toolHelperPath: MANAGED_TOOL_HELPER_IMAGE_PATH,
+            providerHelperPath: MANAGED_PROVIDER_HELPER_IMAGE_PATH,
+        }),
+        launchDeps: defaultIsolationLaunchDeps(),
+    }),
 };
 
 export function managedProvisioningPath(root = '/etc/saycode'): string {
@@ -197,7 +308,16 @@ function readString(value: unknown, max = 200): string | null {
 type FileReadOutcome =
     | { kind: 'absent' }
     | { kind: 'refused'; reason: ManagedIdentityRefusal; detail?: string }
-    | { kind: 'ok'; content: string };
+    /**
+     * `sha256` is of the bytes **this read saw**, hex.
+     *
+     * Taken before the decode, because the decode can be lossy: a byte UTF-8
+     * replaces is one byte on disk and three after a round trip, so a digest of
+     * `Buffer.from(content, 'utf8')` would describe a document nobody read.
+     * There is no second read either - re-opening the file could digest
+     * different bytes than the ones that were parsed.
+     */
+    | { kind: 'ok'; content: string; sha256: string };
 
 export type ProvisioningStat = { uid: number; mode: number; isFile: boolean; size: number };
 
@@ -211,6 +331,10 @@ export type ProvisioningStat = { uid: number; mode: number; isFile: boolean; siz
  * A uid/gid pair, or `null`. Unprivileged and whole numbers — a role that runs
  * as root is not a role that is contained by a uid.
  */
+function readPositiveInt(raw: unknown): number | null {
+    return typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0 ? raw : null;
+}
+
 function readCredentials(raw: unknown): { uid: number; gid: number } | null {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
     const record = raw as Record<string, unknown>;
@@ -277,7 +401,14 @@ export function readRootProtectedFile(
             if (chunk === 0) break;
             read += chunk;
         }
-        return { kind: 'ok', content: buffer.subarray(0, read).toString('utf8') };
+        // One slice, hashed and then decoded - the digest and the content are
+        // the same bytes by construction rather than by agreement.
+        const bytes = buffer.subarray(0, read);
+        return {
+            kind: 'ok',
+            content: bytes.toString('utf8'),
+            sha256: createHash('sha256').update(bytes).digest('hex'),
+        };
     } catch (error) {
         return { kind: 'refused', reason: 'unreadable', detail: (error as NodeJS.ErrnoException).code ?? 'read failed' };
     } finally {
@@ -344,7 +475,12 @@ export function trustedPathRefusal(
 }
 
 /**
- * Whether a missing marker may be read as "this is a BYOS machine".
+ * Whether a missing file may be read as "this is a BYOS machine".
+ *
+ * Exported because every root-protected file on this path has the same
+ * question and the same answer: the credential the parent delivers lives in
+ * the same directory as the marker, and a machine that was never provisioned
+ * has neither — treating that as a tamper signal would refuse every BYOS boot.
  *
  * A marker that is absent because an agent deleted it from a directory it can
  * write is not the same fact as a marker that was never provisioned, and the
@@ -353,7 +489,7 @@ export function trustedPathRefusal(
  * chain that simply does not exist is ordinary absence, which is what every
  * BYOS machine looks like.
  */
-function absenceRefusal(
+export function absenceRefusal(
     markerPath: string,
     daemonUid: number,
     deps: ManagedProvisioningDeps,
@@ -472,6 +608,48 @@ export function resolveManagedRuntimeIdentity(
         return { status: 'refused', reason: 'bad-verifier-key', detail: (error as Error).message };
     }
 
+    const rawPolicy = record.toolPolicy;
+    const policy = (rawPolicy && typeof rawPolicy === 'object' && !Array.isArray(rawPolicy))
+        ? rawPolicy as Record<string, unknown>
+        : null;
+    const grantTtlMs = policy ? readPositiveInt(policy.grantTtlMs) : null;
+    const callTimeoutMs = policy ? readPositiveInt(policy.callTimeoutMs) : null;
+    if (grantTtlMs === null || callTimeoutMs === null) {
+        // A marker without them is a marker from before this axis, or one the
+        // parent wrote without approving a policy. Either way the runtime does
+        // not get to choose the ceiling it runs tools under.
+        return { status: 'refused', reason: 'malformed', detail: 'tool policy' };
+    }
+
+    const tenant = readString(record.tenant);
+    if (!tenant) return { status: 'refused', reason: 'malformed', detail: 'tenant' };
+
+    const rawSchedule = record.checkpointSchedule;
+    const schedule = (rawSchedule && typeof rawSchedule === 'object' && !Array.isArray(rawSchedule))
+        ? rawSchedule as Record<string, unknown>
+        : null;
+    const periodMs = schedule ? readPositiveInt(schedule.periodMs) : null;
+    const onTurnBoundary = typeof schedule?.onTurnBoundary === 'boolean'
+        ? schedule.onTurnBoundary
+        : null;
+    // Optional, but present-and-unusable is a refusal: the parent meant
+    // something and this runtime cannot tell what.
+    const failureBackoffMs = schedule?.failureBackoffMs === undefined
+        ? undefined
+        : readPositiveInt(schedule.failureBackoffMs);
+    if (periodMs === null || onTurnBoundary === null || failureBackoffMs === null) {
+        return { status: 'refused', reason: 'malformed', detail: 'checkpoint schedule' };
+    }
+
+    const rawCheckpoint = record.checkpoint;
+    const checkpoint = (rawCheckpoint && typeof rawCheckpoint === 'object' && !Array.isArray(rawCheckpoint))
+        ? rawCheckpoint as Record<string, unknown>
+        : null;
+    const drainBudgetMs = checkpoint ? readPositiveInt(checkpoint.drainBudgetMs) : null;
+    if (drainBudgetMs === null) {
+        return { status: 'refused', reason: 'malformed', detail: 'checkpoint policy' };
+    }
+
     const rawIsolation = record.isolation;
     if (!rawIsolation || typeof rawIsolation !== 'object' || Array.isArray(rawIsolation)) {
         return { status: 'refused', reason: 'isolation-unverified', detail: 'missing attestation' };
@@ -525,6 +703,7 @@ export function resolveManagedRuntimeIdentity(
 
     return {
         status: 'active',
+        markerSha256: file.sha256,
         identity: {
             runtimeId,
             workspaceId,
@@ -539,6 +718,14 @@ export function resolveManagedRuntimeIdentity(
             verifier,
             stateDir: resolve(stateDir),
             isolation: { backend: backend as ManagedIsolationBackend, provider, executor, cgroupRoot },
+            toolPolicy: { grantTtlMs, callTimeoutMs },
+            checkpoint: { drainBudgetMs },
+            checkpointSchedule: {
+                periodMs,
+                onTurnBoundary,
+                ...(failureBackoffMs === undefined ? {} : { failureBackoffMs }),
+            },
+            tenant,
         },
     };
 }

@@ -112,7 +112,15 @@ describe('the daemon binding itself to its supervisor', () => {
         if (!binding.ok) return;
         const backend = createLauncherClient({
             token: binding.binding.token,
-            deps: createUnixSocketRequest(binding.binding.socketPath, 5_000),
+            /*
+             * 경로 게이트는 **끄지 않는다.** 관측만 좁힌다: 이 픽스처의 임시 트리는
+             * 테스트 사용자 소유라 실제 `lstat` 으로는 당연히 거절되고, 그러면 이
+             * 테스트가 증명하려던 것(실제 소켓 왕복과 boot 배선)이 사라진다. 걷기와
+             * root 전용 정책은 그대로 돈다.
+             */
+            deps: createUnixSocketRequest(binding.binding.socketPath, 5_000, {
+                provisioning: deps(),
+            }),
         });
 
         // Nothing was ever launched, so every generation below the ceiling is
@@ -131,7 +139,15 @@ describe('the daemon binding itself to its supervisor', () => {
         if (!binding.ok) return;
         const backend = createLauncherClient({
             token: binding.binding.token,
-            deps: createUnixSocketRequest(binding.binding.socketPath, 5_000),
+            /*
+             * 경로 게이트는 **끄지 않는다.** 관측만 좁힌다: 이 픽스처의 임시 트리는
+             * 테스트 사용자 소유라 실제 `lstat` 으로는 당연히 거절되고, 그러면 이
+             * 테스트가 증명하려던 것(실제 소켓 왕복과 boot 배선)이 사라진다. 걷기와
+             * root 전용 정책은 그대로 돈다.
+             */
+            deps: createUnixSocketRequest(binding.binding.socketPath, 5_000, {
+                provisioning: deps(),
+            }),
         });
 
         // A record can be well-formed and still not be this supervisor's. The
@@ -152,7 +168,14 @@ describe('the daemon binding itself to its supervisor', () => {
         if (!binding.ok) return;
         const backend = createLauncherClient({
             token: binding.binding.token,
-            deps: createUnixSocketRequest(binding.binding.socketPath, 1_000),
+            /*
+             * 여기서 보려는 것은 **아무도 듣고 있지 않다**는 사실이 답으로 읽히지
+             * 않는다는 것이다. 게이트가 먼저 거절하면 그 의미가 다른 것으로 바뀌므로,
+             * 경로는 신뢰되게 관측하고 transport 실패를 그대로 남긴다.
+             */
+            deps: createUnixSocketRequest(binding.binding.socketPath, 1_000, {
+                provisioning: deps(),
+            }),
         });
         expect(await backend.proveGenerationStopped({ belowEpoch: 5 }))
             .toMatchObject({ proven: false });

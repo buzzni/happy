@@ -11,7 +11,7 @@
 import { redactAutonomousGateText } from '@/daemon/autonomousQualityGateSafety';
 import { MANAGED_PROJECT_ROOT } from '@/daemon/managedRuntimeIdentity';
 
-import { readProviderSdkOptions } from './providerLaunch';
+import { PROVIDER_CODEX_ARGS_ENV, readProviderCodexArgs, readProviderSdkOptions } from './providerLaunch';
 
 /** 자격이 섞인 문구가 프로세스 밖으로 나가지 않게 한다. 이미 있는 규칙을 쓴다. */
 export const MAX_PROVIDER_ERROR_LENGTH = 500;
@@ -66,4 +66,39 @@ export function applyManagedProviderPlan<T extends Record<string, unknown>>(
         // 관리 실행은 조용히 다른 모델로 넘어가지 않는다.
         fallbackModel: undefined,
     };
+}
+/**
+ * Checks the exec line against the plan the environment already binds.
+ *
+ * The provider plan carries its arguments twice on purpose: on the generation
+ * script's exec line, and in the environment, where `resolveManagedCodexArguments`
+ * reads them. Only the environment copy is what the provider is actually
+ * started with, so an exec line that says something else is a plan and an
+ * execution that disagree — the exact thing the plan is bound to the boundary
+ * to prevent. It is refused rather than reconciled, and rather than dropped
+ * silently by an entry that simply ignores `argv`.
+ *
+ * Claude's plan carries no arguments at all (its options ride in the
+ * environment), so an empty exec line is the whole expectation there.
+ */
+export function assertProviderExecArguments(
+    argv: readonly string[],
+    env: Record<string, string | undefined>,
+): void {
+    /*
+     * The absence of the key is the claude shape — its plan carries no
+     * arguments at all. Anything else is a codex plan, and a codex plan that
+     * will not parse or does not canonicalise is refused rather than falling
+     * back to "no arguments expected": that fallback would accept an empty
+     * exec line for a run whose plan is unreadable.
+     */
+    const raw = env[PROVIDER_CODEX_ARGS_ENV];
+    if (raw === undefined || raw === '') {
+        if (argv.length === 0) return;
+        throw new Error('provider exec arguments do not match this run\'s plan');
+    }
+    const planned = readProviderCodexArgs(env);
+    if (argv.length !== planned.length || argv.some((entry, index) => entry !== planned[index])) {
+        throw new Error('provider exec arguments do not match this run\'s plan');
+    }
 }

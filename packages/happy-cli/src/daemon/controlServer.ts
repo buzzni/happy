@@ -372,7 +372,7 @@ export function startDaemonControlServer({
           200: z.object({
             success: z.boolean(),
             stopped: z.boolean(),
-            reason: z.enum(['not-found', 'active']).optional(),
+            reason: z.enum(['not-found', 'active', 'managed-generation']).optional(),
             guard: z.string().optional()
           })
         }

@@ -20,7 +20,10 @@ import {
     type ManagedOp,
     type ManagedRunTokenClaims,
     type ManagedRuntimeLeaseTokenClaims,
+    type ManagedCheckpointTokenClaims,
+    type ManagedCredentialTokenClaims,
     type ManagedStatusTokenClaims,
+    type ManagedTokenFailure,
 } from './managedDispatchToken';
 import {
     classifyManagedReceipt,
@@ -34,6 +37,7 @@ import {
     type ProcessGroupEvidence,
 } from './managedProcessGroup';
 import type { ManagedRuntimeIdentity } from './managedRuntimeIdentity';
+import type { ManagedCredentialReplaceOutcome } from './managedDaemonCredential';
 import { logger } from '@/ui/logger';
 import {
     ManagedSpawnEnvelopeError,
@@ -41,8 +45,42 @@ import {
     type ManagedSpawnEnvelope,
 } from '@/managed/managedSpawnBootstrap';
 
+/**
+ * Every RPC a managed runtime serves. **One list**, and everything downstream
+ * is derived from it: the registrations and the dispatch allowlist.
+ *
+ * There were two lists before, and they disagreed. `managed:checkpoint` and
+ * `managed:credential` were registered here and missing from the allowlist, so
+ * the dispatcher refused them as if they did not exist — a managed runtime
+ * could not be handed a checkpoint target at all, and the failure named a
+ * capability rather than the missing entry. `managed:status` and
+ * `managed:runtime-lease` were the mirror image: allowed, and absent from this
+ * one. Deriving both from here is what makes that class of gap unrepresentable.
+ */
 export const MANAGED_RPC_METHODS = [
     'managed:spawn', 'managed:stop', 'managed:receipt', 'managed:lease',
+    'managed:status', 'managed:runtime-lease',
+    /**
+     * Takes a renewed credential for the Machine this runtime already is.
+     *
+     * The runtime cannot renew its own: both control-plane routes that issue a
+     * daemon credential require the parent's signature, which no process here
+     * holds. And the file it was delivered in is written once, at start — so
+     * without this, a credential could only be replaced by recreating the
+     * machine, and a runtime whose credential lapsed would simply stop.
+     */
+    'managed:credential',
+    /**
+     * Takes the destinations one checkpoint may be written to.
+     *
+     * The runtime cannot produce them: the URLs are presigned with the parent's
+     * storage credentials and the authorisation is signed with a key no process
+     * here holds. What arrives is bound to one checkpoint and to the exact
+     * parameters it was signed for, so the same authorisation cannot be
+     * replayed into another checkpoint's namespace or against other
+     * destinations.
+     */
+    'managed:checkpoint',
 ] as const;
 
 export type ManagedSpawnRequest = {
@@ -107,6 +145,12 @@ export type ManagedSpawnContext = {
     envelope: ManagedSpawnEnvelope;
 };
 
+export type ManagedRuntimeFacts = {
+    filesystem: ManagedFilesystemFacts;
+    restore: ManagedRestoreState;
+    isolation: { verified: boolean; backend: string };
+};
+
 export type ManagedRuntime = {
     identity: ManagedRuntimeIdentity;
     store: ManagedReceiptStore;
@@ -125,11 +169,116 @@ export type ManagedRuntime = {
      * Absent until the boot producer has run, and then a status read reports
      * what it found rather than guessing.
      */
-    runtimeFacts?: () => {
-        filesystem: ManagedFilesystemFacts;
-        restore: ManagedRestoreState;
-        isolation: { verified: boolean; backend: string };
-    };
+    /**
+     * Told when a verified renewal has moved this runtime's write deadline.
+     *
+     * The launcher holds the generations and enforces the lease against them;
+     * this module holds the deadline. Without the call the two drift apart on
+     * the first renewal, and what enforces the lease keeps using the deadline
+     * the run started with.
+     *
+     * Called **after** the renewal is verified and persisted, never before: a
+     * refused renewal must not move anything.
+     */
+    /**
+     * Withdraws whatever a generation was allowed to do, when it is ending.
+     *
+     * Called on every path that ends one — the stop RPC, the fence a promotion
+     * performs, the lease-expiry handler — and called **before** the stop is
+     * requested, so a report already in flight cannot land after the child is
+     * gone and re-register state for a generation that no longer exists.
+     */
+    onGenerationTerminated?: (input: { runId: string; attemptId: string; epoch: number }) => void;
+    onLeaseRenewed?: (input: {
+        epoch: number;
+        /** Absent on a runtime-scoped lease, which is granted before any run. */
+        runId?: string;
+        attemptId?: string;
+        leaseExpiresMonotonic: number;
+        /**
+         * The sequence this grant committed at. Absent when the grant carried
+         * none, and then nothing may re-arm on its behalf.
+         *
+         * The supervisor refuses a renewal that does not advance it, so a
+         * caller re-arming a generation has to carry the one that was written
+         * rather than inventing a number.
+         */
+        renewalSeq?: number;
+        /**
+         * The parent's statement **exactly as it arrived**: the signed token and
+         * the params it covers.
+         *
+         * Present on the runtime-scoped path only. Everything else this
+         * callback receives is derived - numbers this daemon computed - and a
+         * supervisor holding the marker and the verifier key cannot check a
+         * number against a signature. Carried verbatim: a re-mint or a
+         * re-serialisation here would make the daemon the issuer of the very
+         * authority the supervisor is meant to be verifying.
+         *
+         * Absent on the run-scoped `managed:lease`, which is a different op
+         * with a different claim shape and is unchanged by this increment.
+         */
+        grant?: { token: string; params: unknown };
+
+    }) => void | Promise<{ enforced: boolean; detail?: string } | void>;
+    /**
+     * Called **after** the renewed lease is on disk, and only then.
+     *
+     * Anything that widens what this runtime may do — a report capability, a
+     * longer admission — belongs here rather than in `onLeaseRenewed`: the
+     * enforcement call has to happen before the write (so a renewal nobody
+     * enforces is refused), and the write can still fail. A capability published
+     * between the two outlives a record that was never written, which is the
+     * runtime granting itself something no store agrees to.
+     */
+    onLeaseCommitted?: (input: {
+        epoch: number;
+        runId?: string;
+        attemptId?: string;
+        leaseExpiresMonotonic: number;
+    }) => void;
+    /**
+     * Puts a renewed bearer on the disk and starts using it.
+     *
+     * Injected rather than done here: this module decides *whether* the request
+     * is well-formed and authorised, and the writing belongs to the daemon that
+     * owns the credential file and the socket.
+     *
+     * `machineId` and `serverOrigin` travel with it so the runtime can compare
+     * them against what it holds. They are signed into the token's payload
+     * digest, so a mismatch is not a badly-shaped request — it is a credential
+     * that was issued for somebody else.
+     */
+    replaceCredential?: (input: {
+        token: string;
+        expiresAt: number;
+        machineId: string;
+        serverOrigin: string;
+    }) => Promise<ManagedCredentialReplaceOutcome>;
+    /**
+     * Takes a checkpoint target the parent issued, for the checkpoint it names.
+     *
+     * Injected rather than acted on here: this module decides whether the
+     * request is authorised and whether this runtime may still write, and what
+     * to do with the destinations belongs to the checkpoint session that owns
+     * the drain, the archive and the pointer.
+     */
+    acceptCheckpointTarget?: (target: Record<string, unknown>, dispatchToken: string) => Promise<{
+        accepted: boolean;
+        /**
+         * What the inbox did with it, when it accepted.
+         *
+         * `queued` / `replaced-unconsumed` mean an archive follows from this
+         * delivery. `in-flight` means that id is already running, and
+         * `already-completed` means it published its pointer — both are
+         * acceptances of the *hop* and neither produces an archive, which is
+         * the distinction the parent needs and must never guess.
+         */
+        state?: string;
+        /** A fixed classifier from the runtime. Never a URL and never the key. */
+        detail: string;
+    }>;
+    runtimeFacts?: () => ManagedRuntimeFacts | Promise<ManagedRuntimeFacts>;
     /**
      * The privileged launch backend. It is the only thing that can prove a
      * previous generation is gone, and the only thing that can stop a child
@@ -155,12 +304,50 @@ export type BackendStopResult = { requested: boolean; detail: string };
 type RpcRegistrar = { registerHandler: (method: string, handler: (params: unknown) => unknown) => void };
 
 /** Refusals the caller can act on, distinct from a crash. */
+/**
+ * Which launch stage refused, as a closed set.
+ *
+ * The launcher reports `stage` or `stage:detail`, and only the stage is a
+ * reviewed value — the detail comes from the supervisor and can be anything.
+ * Shape checks are not an allowlist: a lower-case 32-hex digest, or a bearer
+ * that happens to be lower-case, passes any character-and-length test. So the
+ * detail is dropped outright and an unrecognised stage becomes `unclassified`.
+ * `WIRE_DIAGNOSTICS` is this set plus `envelope` and `unclassified`.
+ */
+const LAUNCH_STAGES = new Set([
+    'launcher-unavailable',
+    'launch-refused',
+    'prepared-without-pid',
+    'release-failed',
+    'child-not-ready',
+    'child-reported-another-session',
+]);
+
+/** The stage the launcher refused at, or `unclassified`. Never its detail. */
+function launchRefusalStage(message: string): string {
+    const stage = message.split(':', 1)[0]!;
+    return LAUNCH_STAGES.has(stage) ? stage : 'unclassified';
+}
+
+/**
+ * The diagnostics that may travel: the launch stages, plus the envelope
+ * boundary and the fallback. Derived from `LAUNCH_STAGES` so the two cannot
+ * drift — a stage that is not allowed on the wire would be a silent hole.
+ */
+const WIRE_DIAGNOSTICS = new Set([...LAUNCH_STAGES, 'envelope', 'unclassified']);
+
 export class ManagedRpcError extends Error {
-    constructor(readonly code: string, detail?: string) {
+    /** Set only when it is one of `WIRE_DIAGNOSTICS`; otherwise dropped here. */
+    readonly diagnostic?: string;
+
+    constructor(readonly code: string, detail?: string, diagnostic?: string) {
         // The code leads so a caller can branch on it without parsing prose,
         // and the detail is only ever a short classifier — never provider text.
         super(detail ? `${code}: ${detail}` : code);
         this.name = 'ManagedRpcError';
+        if (diagnostic !== undefined && WIRE_DIAGNOSTICS.has(diagnostic)) {
+            this.diagnostic = diagnostic;
+        }
     }
 }
 
@@ -188,6 +375,141 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
     let leaseUntilMonotonic: number | null = null;
 
     const leaseValid = () => leaseUntilMonotonic !== null && runtime.monotonicNow() < leaseUntilMonotonic;
+
+    /**
+     * Moves this runtime's write deadline, and tells whoever is enforcing it.
+     *
+     * One function rather than two assignments, because the two have to happen
+     * together: a renewal that updates the deadline here and not in the
+     * launcher's registry leaves the generation being fenced against the
+     * *previous* one — the parent believes it extended the lease, the runtime
+     * agrees, and the thing that actually stops work does not.
+     */
+    /**
+     * Extends the lease, and **only reports success if the extension is being
+     * enforced**.
+     *
+     * The renewal has to reach the thing that stops work. It did not: the
+     * supervisor arms a generation's watchdog with the deadline captured at
+     * launch, and a renewal that moved this record and the report authority left
+     * that watchdog alone — so a managed generation was killed at its original
+     * deadline while the parent, the store and this runtime all agreed the lease
+     * had been extended.
+     *
+     * So the consumer is **awaited**, and a consumer that says the extension is
+     * not enforced makes this a refusal rather than a grant: a parent told "ok"
+     * stops renewing, and the next thing that happens is a SIGKILL nobody
+     * expected. Nothing is persisted and nothing is moved before the enforcement
+     * answer, so a refusal leaves the previous lease exactly as it was.
+     *
+     * **An absent consumer is a refusal too.** Treating "nobody is wired" as
+     * acceptance is precisely how broken wiring hides: the enforcement claim has
+     * to come from something that enforces, and a host with nothing to re-arm
+     * says so by answering `{ enforced: true }` rather than by being silent.
+     */
+    const enforceLeaseUntil = async (
+        grantedMs: number,
+        claims: { epoch: number; runId?: string; attemptId?: string; renewalSeq?: number },
+        /** The runtime-scoped path's verbatim envelope; see `onLeaseRenewed`. */
+        grant?: { token: string; params: unknown },
+    ): Promise<number> => {
+        /*
+         * 이미 들어온 spawn 이 아직 등록되지 않았을 수 있다. 그 세대는 **옛**
+         * deadline 으로 등록되고, 이 갱신의 snapshot 에는 없으므로 아무도 다시
+         * 재무장하지 않는다. 그래서 기다리지 않고 거절한다 — 부모는 재시도한다.
+         */
+        if (spawnsInFlight > 0) throw new ManagedRpcError('renewal-race', 'spawn in flight');
+        const leaseExpiresMonotonic = runtime.monotonicNow() + grantedMs;
+        let outcome: { enforced: boolean; detail?: string } | void;
+        renewalEnforcing = true;
+        try {
+            outcome = await runtime.onLeaseRenewed?.({
+            epoch: claims.epoch,
+            leaseExpiresMonotonic,
+            // The sequence this grant committed at, so a consumer re-arming
+            // a generation carries the written one rather than inventing it.
+            ...(claims.renewalSeq === undefined ? {} : { renewalSeq: claims.renewalSeq }),
+            /*
+             * Present only on the run-scoped renewal. The runtime-scoped one is
+             * granted before any run exists, and it moves the deadline for
+             * **every** generation on this runtime rather than for one — a
+             * consumer that keyed it to a run would be inventing the run.
+             */
+            ...(claims.runId ? { runId: claims.runId } : {}),
+            ...(claims.attemptId ? { attemptId: claims.attemptId } : {}),
+            ...(grant ? { grant } : {}),
+            });
+        } catch {
+            // 이유는 소비자의 것이고 경로를 담을 수 있다. 집행되지 않았다는
+            // 사실만으로 거절한다.
+            throw new ManagedRpcError('renewal-not-enforced');
+        } finally {
+            renewalEnforcing = false;
+        }
+        /*
+         * `void` 도 수락이 아니다.
+         *
+         * 예전에는 반환값 없는 소비자를 성공으로 봤고, 그것이 **배선이 끊긴 것을
+         * 가리는** 정확한 방법이었다 — production 은 콜백을 반드시 꽂고, 꽂히지
+         * 않았거나 아무 답도 하지 않는다면 그 갱신은 집행된 적이 없다.
+         */
+        if (!outcome || outcome.enforced !== true) {
+            throw new ManagedRpcError(
+                'renewal-not-enforced',
+                // 소비자가 준 고정 코드만. 없으면 아무것도 싣지 않는다.
+                outcome?.detail,
+            );
+        }
+        /*
+         * 후보 값을 **돌려주기만** 한다. 이 runtime 의 권한을 여기서 늘리면,
+         * 뒤따르는 store 쓰기가 실패했을 때 기록은 옛 deadline 인데 이 프로세스는
+         * 연장된 것으로 행동한다 — Astra 가 그것을 재현했다(persist throw 뒤에도
+         * `isLeaseValid` 가 옛 deadline 을 넘겨 true).
+         */
+        return leaseExpiresMonotonic;
+    };
+
+    /**
+     * Tells whoever widens capabilities that the record is on disk.
+     *
+     * Never throws: the lease **is** persisted by the time this runs, so a
+     * consumer that fails here must not turn a committed renewal into a refusal
+     * the parent would retry against a store that already moved.
+     */
+    /**
+     * Runs one lease grant as a window a spawn can wait behind.
+     *
+     * Opened before the enforcement call and closed after the record is written
+     * (or after the failure), so a generation registered on the other side of it
+     * carries the deadline that is being enforced rather than the one it
+     * launched with.
+     */
+    const inRenewalWindow = async <T>(run: () => Promise<T>): Promise<T> => {
+        let close!: () => void;
+        renewalWindow = new Promise<void>((resolve) => { close = resolve; });
+        try {
+            return await run();
+        } finally {
+            renewalWindow = null;
+            close();
+        }
+    };
+
+    const publishLeaseCommitted = (
+        leaseExpiresMonotonic: number,
+        claims: { epoch: number; runId?: string; attemptId?: string },
+    ): void => {
+        try {
+            runtime.onLeaseCommitted?.({
+                epoch: claims.epoch,
+                leaseExpiresMonotonic,
+                ...(claims.runId ? { runId: claims.runId } : {}),
+                ...(claims.attemptId ? { attemptId: claims.attemptId } : {}),
+            });
+        } catch {
+            logger.debug('[managed] lease committed hook failed');
+        }
+    };
 
     const clampLease = (leaseMs: number, absoluteExpiry: number): number =>
         Math.max(0, Math.min(leaseMs, absoluteExpiry - runtime.now()));
@@ -255,7 +577,7 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
         });
         if (!result.ok) throw new ManagedRpcError(`token-${result.reason}`);
         if (result.claims.op === 'status' || result.claims.op === 'runtime-lease'
-            || result.claims.op === 'checkpoint') {
+            || result.claims.op === 'checkpoint' || result.claims.op === 'credential') {
             // Unreachable while `op` is run-scoped — the verifier already
             // refuses a mismatched op — and stated rather than cast away.
             throw new ManagedRpcError('token-wrong-op');
@@ -285,6 +607,32 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
      * than the whole RPC.
      */
     let spawnsInFlight = 0;
+    /**
+     * A renewal is between "the enforcer was told" and "the record was written".
+     *
+     * Spawns are refused in that window, and a renewal is refused while a spawn
+     * is in it: a generation registered while the enforcer's snapshot was already
+     * taken carries the **old** deadline and nothing renews it before the parent
+     * is told `ok`. Astra measured that — a newcomer left at 70_000 while the
+     * renewal reported 100_000.
+     *
+     * Both directions refuse rather than wait. Waiting would mean two paths
+     * holding each other under the same admission, and a retryable refusal is
+     * what the parent already knows how to handle.
+     */
+    let renewalEnforcing = false;
+    /**
+     * Settles when the renewal window closes — after the record is written, or
+     * after the renewal failed.
+     *
+     * A spawn that arrives inside the window **waits** for it rather than being
+     * refused: the window is one enforcement call plus one store write, and on
+     * the other side of it the generation is registered with the deadline that
+     * is actually being enforced. Waiting cannot deadlock, because a renewal
+     * never waits for a spawn — it refuses while one is mid-registration, and a
+     * waiting spawn has not begun registering yet.
+     */
+    let renewalWindow: Promise<void> | null = null;
     /**
      * Whole RPCs — spawn *and* explicit stop — including the bookkeeping and
      * backend handover that follows. Teardown waits on these: `spawnsInFlight`
@@ -352,6 +700,28 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
         const evidence = receipt.pgid === null
             ? { kind: 'no-local-trace' as const }
             : probeProcessGroup(receipt.pgid, runtime.processGroupDeps);
+        /*
+         * The generation's authority is withdrawn **before** the stop is asked
+         * for, and on every path that asks — the explicit stop, the epoch
+         * promotion's fence, and the lease-expiry handler all come through
+         * here.
+         *
+         * Before, because a request that was authorised a moment ago can still
+         * be in flight: a report accepted after the child is gone re-registers
+         * state for a generation that no longer exists, and nothing later
+         * removes it. Withdrawing first makes the window closed rather than
+         * short.
+         *
+         * Doing it here rather than at each call site is the point. The
+         * previous arrangement discarded only on the session paths, so the two
+         * that actually end a generation — the stop RPC and the watchdog —
+         * left the capability standing.
+         */
+        runtime.onGenerationTerminated?.({
+            runId: receipt.runId,
+            attemptId: receipt.attemptId,
+            epoch: receipt.epoch,
+        });
         if (!runtime.fencingBackend) return { evidence, backendStop: NO_BACKEND };
         const backendStop = await runtime.fencingBackend.requestStop({
             runId: receipt.runId,
@@ -431,6 +801,19 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             // uncertain and must go to reconciliation rather than be retried.
             runtime.store.update(key, { state: 'spawning', spawnAt: runtime.now() }, runtime.now());
 
+            /*
+             * 갱신이 집행과 기록 사이에 있으면 **여기서 기다린다** — lease 를 읽기
+             * 전이다.
+             *
+             * 창 안에서 등록되면 그 세대는 옛 deadline 을 들고 시작하고 이 갱신의
+             * snapshot 밖이라 아무도 다시 재무장하지 않는다. 거절해도 창은 닫히지만,
+             * 기다리는 편이 낫다: 창은 집행 한 번 + 기록 한 번이고 그 뒤에는 실제로
+             * 집행되는 deadline 으로 등록된다. 교착은 없다 — 갱신은 spawn 을
+             * 기다리지 않고(등록 중이면 거절), 여기서 기다리는 spawn 은 아직 등록을
+             * 시작하지 않았다.
+             */
+            if (renewalWindow) await renewalWindow;
+
             // Re-checked here because a fence may have begun while this request
             // was between admission and the launcher.
             if (transitioning || expiryHandling || !leaseValid()) {
@@ -456,7 +839,7 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                 runtime.store.update(key, {
                     state: 'failed', failureReason: 'not-started',
                 }, runtime.now());
-                throw new ManagedRpcError('spawn-rejected', `envelope: ${field}`);
+                throw new ManagedRpcError('spawn-rejected', `envelope: ${field}`, 'envelope');
             }
 
             // Everything the launcher is told comes from the verified token.
@@ -472,6 +855,7 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                 projectId: claims.projectId,
                 leaseExpiresMonotonic: leaseUntilMonotonic ?? 0,
             };
+
 
             let outcome: ManagedSpawnOutcome;
             spawnsInFlight += 1;
@@ -492,7 +876,14 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                     runtime.store.update(key, {
                         state: 'failed', failureReason: 'not-started',
                     }, runtime.now());
-                    throw new ManagedRpcError('spawn-rejected');
+                    /*
+                     * **stage 하나만** 남긴다 — 전선에도, 이 Error 에도, 로그
+                     * 에도. supervisor detail 은 검토된 값이 아니라 경로나
+                     * 자격을 담을 수 있고, 모양이 멀쩡하다고 안전한 것이 아니다.
+                     */
+                    const stage = launchRefusalStage(outcome.errorMessage);
+                    logger.debug(`[managed] spawn refused at ${stage}`);
+                    throw new ManagedRpcError('spawn-rejected', stage, stage);
                 }
                 throw new ManagedRpcError('reconciliation-required', 'spawn outcome unknown');
             }
@@ -626,9 +1017,10 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
      * reading `provisioningOperationId` cannot be handed a work token.
      */
     const verifyProvisioning = (
-        op: 'status' | 'runtime-lease',
+        op: 'status' | 'runtime-lease' | 'credential' | 'checkpoint',
         params: unknown,
-    ): ManagedStatusTokenClaims | ManagedRuntimeLeaseTokenClaims => {
+    ): ManagedStatusTokenClaims | ManagedRuntimeLeaseTokenClaims | ManagedCredentialTokenClaims
+    | ManagedCheckpointTokenClaims => {
         if (!params || typeof params !== 'object' || Array.isArray(params)) {
             throw new ManagedRpcError('malformed-request');
         }
@@ -667,6 +1059,17 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
         leaseMs: number;
         absoluteExpiry: number;
         exp: number;
+        /** Present on the run-scoped lease; a runtime lease has no run yet. */
+        runId?: string;
+        attemptId?: string;
+        /**
+         * The runtime-scoped path's verbatim `{token, params}`.
+         *
+         * Threaded rather than reconstructed: by the time execution reaches
+         * here the claims are parsed numbers, and the signed document exists
+         * only at the entry above.
+         */
+        grant?: { token: string; params: unknown };
     }) => {
             assertEntryOpen();
             // Renewal and epoch transition are serialized: two interleaved
@@ -746,13 +1149,23 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                         if (claims.renewalSeq! <= latest.renewalSeq || claims.epoch < latest.epoch) {
                             throw new ManagedRpcError('stale-renewal');
                         }
-                        runtime.store.writeLease({
-                            epoch: claims.epoch,
-                            renewalSeq: claims.renewalSeq!,
-                            updatedAt: runtime.now(),
-                        });
                         const grantedMs = clampLease(claims.leaseMs!, claims.absoluteExpiry!);
-                        leaseUntilMonotonic = runtime.monotonicNow() + grantedMs;
+                        /*
+                         * 집행 먼저, 기록은 그 다음이다. 순서를 바꾸면 집행이
+                         * 거절된 뒤에도 store 는 연장된 lease 를 들고 있게 되고,
+                         * 그 상태는 이 runtime 이 스스로에게 거짓말하는 것이다.
+                         */
+                        await inRenewalWindow(async () => {
+                            const enforcedUntil = await enforceLeaseUntil(grantedMs, claims, claims.grant);
+                            runtime.store.writeLease({
+                                epoch: claims.epoch,
+                                renewalSeq: claims.renewalSeq!,
+                                updatedAt: runtime.now(),
+                            });
+                            // 기록이 남은 뒤에 이 프로세스의 권한을 움직인다.
+                            leaseUntilMonotonic = enforcedUntil;
+                            publishLeaseCommitted(enforcedUntil, claims);
+                        });
                         return {
                             ok: true,
                             epoch: claims.epoch,
@@ -772,13 +1185,18 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                     }
                 }
 
-                runtime.store.writeLease({
-                    epoch: claims.epoch,
-                    renewalSeq: claims.renewalSeq!,
-                    updatedAt: runtime.now(),
-                });
                 const grantedMs = clampLease(claims.leaseMs!, claims.absoluteExpiry!);
-                leaseUntilMonotonic = runtime.monotonicNow() + grantedMs;
+                // 집행 먼저. 거절이면 아무것도 기록하지 않고 ACK 도 하지 않는다.
+                await inRenewalWindow(async () => {
+                    const enforcedUntil = await enforceLeaseUntil(grantedMs, claims, claims.grant);
+                    runtime.store.writeLease({
+                        epoch: claims.epoch,
+                        renewalSeq: claims.renewalSeq!,
+                        updatedAt: runtime.now(),
+                    });
+                    leaseUntilMonotonic = enforcedUntil;
+                    publishLeaseCommitted(enforcedUntil, claims);
+                });
                 return {
                     ok: true,
                     epoch: claims.epoch,
@@ -793,6 +1211,116 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             });
     };
 
+const checkpointRpc = async (params: unknown) => {
+        // The same two gates every other entry has, and for the same reasons:
+        // a target accepted after teardown has closed entries is a write set up
+        // while the runtime believes nothing is running, and an untracked one
+        // lets teardown finish while it is still being handed over.
+        assertEntryOpen();
+        const claims = verifyProvisioning('checkpoint', params) as ManagedCheckpointTokenClaims;
+        /*
+         * A checkpoint is a write, and it ends by publishing a pointer other
+         * runtimes read. Without a live lease the archive is a picture of a
+         * volume this runtime may no longer hold — and the pointer would then
+         * announce it as the latest.
+         */
+        if (!leaseValid()) throw new ManagedRpcError('lease-expired');
+        if (!runtime.acceptCheckpointTarget) {
+            // Reported rather than ignored: a parent that believes it issued a
+            // target and did not is a parent whose checkpoints never happen and
+            // whose runtime says nothing about it.
+            throw new ManagedRpcError('capability-unavailable');
+        }
+        const record = (params && typeof params === 'object' && !Array.isArray(params))
+            ? (params as Record<string, unknown>).params
+            : null;
+        if (!record || typeof record !== 'object' || Array.isArray(record)) {
+            throw new ManagedRpcError('malformed-request');
+        }
+        const target = record as Record<string, unknown>;
+        /*
+         * The token names the checkpoint; the parameters carry it too, and they
+         * must be the same one. Otherwise a target for one checkpoint is
+         * accepted under another's authorisation, and what gets written is not
+         * the namespace the parent named.
+         */
+        if (target.checkpointId !== claims.checkpointId) {
+            throw new ManagedRpcError('token-payload-mismatch');
+        }
+        /*
+         * The token as it arrived, beside the params it signed.
+         *
+         * This daemon's verification above authorises *this* hop and nothing
+         * further: the supervisor is another process, holds the root-owned
+         * marker and the verifier key, and has no way to establish that the
+         * parent issued this document unless the signature travels with it. It
+         * is passed unaltered - a re-mint here would make the daemon the issuer
+         * of the authority the supervisor is supposed to be checking.
+         */
+        const dispatchToken = (params as Record<string, unknown>).token as string;
+        const outcome = await runtime.acceptCheckpointTarget(target, dispatchToken);
+        if (!outcome.accepted) {
+            /*
+             * The runtime that holds the checkpoint session is another process
+             * and it can say no. Reporting an acceptance anyway tells the parent
+             * a credential it issued is in place — and that credential then
+             * expires where nobody is looking.
+             *
+             * The code is fixed; the runtime's own detail stays local, because
+             * what did not fit here is a target full of signed URLs.
+             */
+            logger.debug(`[managed] checkpoint target not accepted (${outcome.detail})`);
+            throw new ManagedRpcError('checkpoint-target-refused');
+        }
+        /*
+         * 받아들인 것과 아카이브가 도는 것은 다른 사실이고, 응답은 둘 다
+         * 말한다: 여기까지 왔으면 문서는 도착했고(수락), `state` 가 이 전달로
+         * 아카이브가 따라오는지를 말한다. 상태를 말하지 않는 runtime 은 그
+         * 사실을 지운 것이므로 답으로 읽지 않는다.
+         */
+        if (typeof outcome.state !== 'string' || outcome.state.trim() === '') {
+            throw new ManagedRpcError('malformed-request');
+        }
+        return { accepted: true, checkpointId: claims.checkpointId, state: outcome.state };
+    };
+
+const credentialRpc = async (params: unknown) => {
+        // The same two gates every other entry has: refused once teardown
+        // has closed entries, and tracked so teardown waits for a write
+        // that is already in flight. Without them a credential could be
+        // written while the runtime believed nothing was running.
+        assertEntryOpen();
+        verifyProvisioning('credential', params);
+        if (!runtime.replaceCredential) {
+            // Nothing wired to accept it. Reported rather than ignored: a
+            // parent that believes it renewed and did not is a parent that
+            // stops trying.
+            throw new ManagedRpcError('capability-unavailable');
+        }
+        const record = (params && typeof params === 'object' && !Array.isArray(params))
+            ? (params as Record<string, unknown>).params
+            : null;
+        if (!record || typeof record !== 'object' || Array.isArray(record)) {
+            throw new ManagedRpcError('malformed-request');
+        }
+        const body = record as Record<string, unknown>;
+        const token = typeof body.token === 'string' ? body.token.trim() : '';
+        const machineId = typeof body.machineId === 'string' ? body.machineId.trim() : '';
+        const serverOrigin = typeof body.serverOrigin === 'string' ? body.serverOrigin.trim() : '';
+        const expiresAt = body.expiresAt;
+        if (token === '' || machineId === '' || serverOrigin === ''
+            || typeof expiresAt !== 'number' || !Number.isSafeInteger(expiresAt)) {
+            throw new ManagedRpcError('malformed-request');
+        }
+        if (expiresAt <= runtime.now()) throw new ManagedRpcError('credential-expired');
+
+        const outcome = await runtime.replaceCredential({ token, expiresAt, machineId, serverOrigin });
+        if (!outcome.ok) throw new ManagedRpcError(outcome.reason);
+        // The expiry that is now **on the disk**, from the writer rather than
+        // from the request: the parent must see which renewal actually took.
+        return { accepted: true, expiresAt: outcome.expiresAt };
+    };
+
     return {
         /**
          * Reports what this runtime is, and what it currently holds.
@@ -801,15 +1329,51 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
          * it, including while a runtime is expired, and a reading that renewed
          * would make asking the way to stay alive.
          */
+        /**
+         * Replaces the bearer this runtime authenticates with.
+         *
+         * Three things it refuses, and each is a way the identity could be
+         * moved rather than renewed:
+         *
+         *  - a credential for **another Machine**. The marker says which one
+         *    this is; a replacement naming a different one would make this
+         *    runtime publish readiness where nobody is watching.
+         *  - one that does not **outlive** what is stored. A replay of an
+         *    earlier renewal would walk the credential backwards, and the
+         *    window it shortens is the one the runtime is living in.
+         *  - one for a **different server**. The bearer is only meaningful to
+         *    the origin that issued it, and sending it elsewhere is sending a
+         *    credential to a stranger.
+         *
+         * Key material is not part of this. A renewal extends a bearer; the
+         * machine key is write-once and stays exactly as it was.
+         */
+        credential: (params: unknown) => trackRpc(credentialRpc(params)),
+
+        /**
+         * Takes the destinations one checkpoint may be written to.
+         *
+         * Tracked like every other write entry, so teardown waits for a
+         * hand-over already in flight rather than finishing beside it.
+         */
+        checkpoint: (params: unknown) => trackRpc(checkpointRpc(params)),
+
+        /**
+         * The push itself. Kept separate so the exported entry can be tracked
+         * end to end, the way `spawn` and `stop` are.
+         */
         status: async (params: unknown) => {
             verifyProvisioning('status', params);
-            const facts = runtime.runtimeFacts?.() ?? {
+            const facts = await runtime.runtimeFacts?.() ?? {
                 // Before the boot producer has run there is nothing to report
                 // but the absence of it, and absence is not readiness.
                 filesystem: { ok: false as const, reason: 'root-not-mounted' as const },
                 restore: { status: 'pending' as const, checkpointId: null, manifestDigest: null },
                 isolation: { verified: false, backend: runtime.identity.isolation.backend },
             };
+            // Reuse status's existing policy (including its epoch exemption).
+            // Waiting for live evidence must not extend token validity.
+            verifyProvisioning('status', params);
             const stored = storedLease();
             return buildManagedRuntimeStatus({
                 identity: runtime.identity,
@@ -837,12 +1401,19 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
         'runtime-lease': async (params: unknown) => {
             const claims = verifyProvisioning('runtime-lease', params);
             if (claims.op !== 'runtime-lease') throw new ManagedRpcError('token-wrong-op');
+            /*
+             * The document as it arrived, kept alive across the layers below.
+             * `verifyProvisioning` has already read the same two fields to
+             * check them; this carries them rather than re-deriving anything.
+             */
+            const record = params as Record<string, unknown>;
             return applyLeaseClaims({
                 epoch: claims.epoch,
                 renewalSeq: claims.renewalSeq,
                 leaseMs: claims.leaseMs,
                 absoluteExpiry: claims.absoluteExpiry,
                 exp: claims.exp,
+                grant: { token: record.token as string, params: record.params ?? {} },
             });
         },
 
@@ -901,6 +1472,10 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                 leaseMs: claims.leaseMs,
                 absoluteExpiry: claims.absoluteExpiry,
                 exp: claims.exp,
+                // The generation this renewal is for. The runtime-scoped lease
+                // above has none — it is granted before any run exists.
+                runId: claims.runId,
+                attemptId: claims.attemptId,
             });
         },
 
@@ -1045,6 +1620,37 @@ export type ManagedRpcHandlers = ReturnType<typeof createManagedRpcHandlers>;
  *
  * `token-*` mirrors `ManagedTokenFailure`, which `verify` prefixes.
  */
+/**
+ * Every `ManagedTokenFailure`, as the code the wire carries.
+ *
+ * A `Record` keyed by the union rather than a hand-written list, so a new
+ * failure reason **fails the build** until it is classified. Hand-written was
+ * how `token-wrong-operation` came to be missing: `verify` returned it, the
+ * allowlist did not carry it, and a validly signed token minted for another
+ * provisioning operation came back as `managed-unknown-failure` — a caller
+ * cannot act on that, and it reads like a crash rather than the closed refusal
+ * it is. Deliberately not a `token-*` wildcard: a wildcard would admit whatever
+ * a future prefix produces, which is the property this set exists to deny.
+ */
+const TOKEN_REFUSAL_REASONS: Record<ManagedTokenFailure, true> = {
+    malformed: true,
+    'bad-signature': true,
+    'wrong-audience': true,
+    'wrong-workspace': true,
+    'wrong-op': true,
+    'wrong-operation': true,
+    expired: true,
+    'clock-skew': true,
+    'ttl-too-long': true,
+    'stale-epoch': true,
+    'epoch-mismatch': true,
+    'payload-mismatch': true,
+};
+
+/** `wrong-operation` → `token-wrong-operation`, the shape `verify` is prefixed into. */
+const TOKEN_REFUSAL_CODES: readonly string[] =
+    Object.keys(TOKEN_REFUSAL_REASONS).map((reason) => `token-${reason}`);
+
 const WIRE_REFUSAL_CODES: ReadonlySet<string> = new Set([
     'epoch-transition-in-progress',
     'fence-incomplete',
@@ -1056,20 +1662,37 @@ const WIRE_REFUSAL_CODES: ReadonlySet<string> = new Set([
     'reconciliation-required',
     'shutting-down',
     'spawn-rejected',
+    // The credential push. Each says something the parent can act on: wire the
+    // capability, renew again, or look at the runtime's disk.
+    'capability-unavailable',
+    'credential-expired',
+    'credential-not-mine',
+    'credential-not-newer',
+    'credential-unreadable',
+    'credential-unwritable',
+    /**
+     * The runtime did not take a checkpoint target the parent issued — most
+     * often because it has no checkpoint session wired at all. The parent's
+     * next move is to stop issuing until that is true, rather than to keep
+     * signing URLs nobody can use.
+     */
+    'checkpoint-target-refused',
     'stale-epoch',
     'stale-renewal',
+    /**
+     * A renewal and a spawn overlapped. Retryable, and refused rather than
+     * waited on: a generation registered inside the renewal's window keeps the
+     * deadline it launched with while the parent is told the lease moved.
+     */
+    'renewal-race',
+    /**
+     * The lease was extended nowhere that enforces it. The parent must not stop
+     * renewing on this answer — it is the one case where "ok" would be followed
+     * by a kill at the old deadline.
+     */
+    'renewal-not-enforced',
     'stopped-before-dispatch',
-    'token-malformed',
-    'token-bad-signature',
-    'token-wrong-audience',
-    'token-wrong-workspace',
-    'token-wrong-op',
-    'token-expired',
-    'token-clock-skew',
-    'token-ttl-too-long',
-    'token-stale-epoch',
-    'token-epoch-mismatch',
-    'token-payload-mismatch',
+    ...TOKEN_REFUSAL_CODES,
     // Thrown directly at :178/:181, not via the `token-${reason}` prefix.
     'token-wrong-project',
     'token-unknown-key',
@@ -1109,14 +1732,18 @@ const MANAGED_UNKNOWN_CODE = 'managed-unknown-failure';
  */
 async function normalizeManagedRefusal<T>(
     run: () => T | Promise<T>,
-): Promise<T | { error: string; code: string }> {
+): Promise<T | { error: string; code: string; diagnostic?: string }> {
     try {
         // `await` covers both shapes: `receipt` answers synchronously while the
         // others are async, and a synchronous throw must be normalised too.
         return await run();
     } catch (error: unknown) {
         if (error instanceof ManagedRpcError && WIRE_REFUSAL_CODES.has(error.code)) {
-            return { error: MANAGED_REFUSAL_ERROR, code: error.code };
+            return {
+                error: MANAGED_REFUSAL_ERROR,
+                code: error.code,
+                ...(error.diagnostic === undefined ? {} : { diagnostic: error.diagnostic }),
+            };
         }
         // No `error.message`, no stack, no cause — not on the wire and not in
         // the log. A fixed line keeps the failure visible without carrying its
@@ -1126,16 +1753,31 @@ async function normalizeManagedRefusal<T>(
     }
 }
 
+/** `managed:spawn` → `spawn`. The handler's name is the method without prefix. */
+type ManagedRpcHandlerName = (typeof MANAGED_RPC_METHODS)[number] extends `managed:${infer Name}`
+    ? Name
+    : never;
+
+/*
+ * Every method in the list names a real handler. A method added above with no
+ * handler behind it fails the build here rather than at the first call.
+ */
+const _everyMethodHasAHandler: ManagedRpcHandlerName extends keyof ManagedRpcHandlers ? true : never = true;
+void _everyMethodHasAHandler;
+
 export function registerManagedRpcHandlers(
     registrar: RpcRegistrar,
     handlers: ManagedRpcHandlers,
 ): void {
-    registrar.registerHandler('managed:spawn', (params) => normalizeManagedRefusal(() => handlers.spawn(params)));
-    registrar.registerHandler('managed:stop', (params) => normalizeManagedRefusal(() => handlers.stop(params)));
-    registrar.registerHandler('managed:receipt', (params) => normalizeManagedRefusal(() => handlers.receipt(params)));
-    registrar.registerHandler('managed:lease', (params) => normalizeManagedRefusal(() => handlers.lease(params)));
-    registrar.registerHandler('managed:status', (params) => normalizeManagedRefusal(() => handlers.status(params)));
-    registrar.registerHandler('managed:runtime-lease', (params) => normalizeManagedRefusal(() => handlers['runtime-lease'](params)));
+    for (const method of MANAGED_RPC_METHODS) {
+        const name = method.slice('managed:'.length) as ManagedRpcHandlerName;
+        /*
+         * 배선만 한다. 각 handler 의 params 타입은 그 handler 안에서 검사하고,
+         * 여기서 형을 좁히려 하면 목록이 다시 갈라질 자리를 만든다.
+         */
+        const handler = handlers[name] as (params: unknown) => unknown;
+        registrar.registerHandler(method, (params) => normalizeManagedRefusal(() => handler(params)));
+    }
 }
 
 /**
@@ -1145,14 +1787,7 @@ export function registerManagedRpcHandlers(
  * later, and the point of this gate is that a future RPC cannot become a bypass
  * simply by existing.
  */
-export const MANAGED_ALLOWED_RPCS: readonly string[] = [
-    'managed:spawn',
-    'managed:stop',
-    'managed:receipt',
-    'managed:lease',
-    'managed:status',
-    'managed:runtime-lease',
-];
+export const MANAGED_ALLOWED_RPCS: readonly string[] = MANAGED_RPC_METHODS;
 
 export class ManagedCapabilityError extends Error {
     readonly code = 'MANAGED_CAPABILITY_REQUIRED';

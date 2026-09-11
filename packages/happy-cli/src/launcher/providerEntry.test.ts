@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { applyManagedProviderPlan, sanitizeProviderFailure } from './providerEntry';
+import {
+    applyManagedProviderPlan,
+    assertProviderExecArguments,
+    sanitizeProviderFailure,
+} from './providerEntry';
 import { planProviderLaunch } from './providerLaunch';
 
 const PLAN = planProviderLaunch({
@@ -47,5 +51,63 @@ describe('provider failures carry no credentials', () => {
         expect(detail).not.toContain('sk-live-abcdefghijklmnop');
         expect(detail).not.toContain('hunter2');
         expect(detail).toContain('[REDACTED]');
+    });
+});
+
+describe('assertProviderExecArguments', () => {
+    it('shouldAcceptAnEmptyExecLineForTheClaudeShape', () => {
+        // Claude's plan carries no arguments: its options ride in the env.
+        expect(() => assertProviderExecArguments([], {})).not.toThrow();
+    });
+
+    it('shouldRefuseArgumentsWhenThePlanBindsNone', () => {
+        /*
+         * An entry that ignored `argv` would let the generation script say one
+         * thing while the provider ran with another, and neither side would
+         * report it.
+         */
+        expect(() => assertProviderExecArguments(['-c', 'model_provider="other"'], {}))
+            .toThrow(/do not match this run's plan/);
+    });
+
+    it('shouldAcceptAnExecLineThatMatchesTheCodexPlanExactly', () => {
+        // A real plan, so the canonical check the product performs is the one
+        // being satisfied rather than a shape invented here.
+        const codex = planProviderLaunch({
+            agent: 'codex',
+            model: 'gpt-5',
+            brokerUrl: 'http://127.0.0.1:8731/',
+            brokerToken: 'run-grant-token',
+            brokerTools: ['read_file'],
+            providerEnv: { PATH: '/usr/bin' },
+            codexHome: '/workspace/.codex',
+        });
+        expect(() => assertProviderExecArguments(codex.args, codex.env)).not.toThrow();
+        expect(codex.args.length).toBeGreaterThan(0);
+    });
+
+    it('shouldRefuseAnExecLineThatDiffersFromThePlanTheEnvironmentBinds', () => {
+        const codex = planProviderLaunch({
+            agent: 'codex',
+            model: 'gpt-5',
+            brokerUrl: 'http://127.0.0.1:8731/',
+            brokerToken: 'run-grant-token',
+            brokerTools: ['read_file'],
+            providerEnv: { PATH: '/usr/bin' },
+            codexHome: '/workspace/.codex',
+        });
+        // A trailing `-c` wins in codex, so an appended one reverses the plan.
+        expect(() => assertProviderExecArguments(
+            [...codex.args, '-c', 'features.hooks=true'], codex.env,
+        )).toThrow(/do not match this run's plan/);
+    });
+
+    it('shouldRefuseAnUnreadableCodexPlanRatherThanTreatItAsNoArguments', () => {
+        /*
+         * Falling back to the claude shape here would accept an empty exec
+         * line for a run whose plan cannot be read at all.
+         */
+        expect(() => assertProviderExecArguments([], { SAYCODE_PROVIDER_CODEX_ARGS: 'not json' }))
+            .toThrow();
     });
 });

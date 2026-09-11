@@ -27,6 +27,10 @@ const identity = {
     providerVolumeId: 'vol_fixture_1',
     stateDir: '/state',
     isolation: { backend: 'privileged-launch-supervisor' as const, provider: { uid: 901, gid: 901 }, executor: { uid: 902, gid: 901 }, cgroupRoot: '/c' },
+    toolPolicy: { grantTtlMs: 600_000, callTimeoutMs: 120_000 },
+    checkpoint: { drainBudgetMs: 15_000 },
+    tenant: 'company:acme-1',
+    checkpointSchedule: { periodMs: 900_000, onTurnBoundary: true },
 };
 
 function deps(over: Record<string, unknown> = {}) {

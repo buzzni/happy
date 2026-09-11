@@ -28,6 +28,15 @@ export const MANAGED_PROTOCOL_VERSION = 1;
 
 export const MANAGED_OPS = [
     'spawn', 'stop', 'query', 'lease', 'status', 'runtime-lease', 'checkpoint',
+    /**
+     * Hands the runtime a renewed credential for the Machine it already is.
+     *
+     * Its own operation, and bound to the provisioning operation rather than to
+     * a run: the identity outlives every run on this runtime, and a signature
+     * authorising work on one run must not also be able to replace the bearer
+     * the runtime authenticates with.
+     */
+    'credential',
 ] as const;
 export type ManagedOp = (typeof MANAGED_OPS)[number];
 
@@ -41,7 +50,20 @@ export type ManagedOp = (typeof MANAGED_OPS)[number];
 const RUN_SCOPED_OPS: readonly ManagedOp[] = ['spawn', 'stop', 'query', 'lease'];
 
 /** Operations bound to a provisioning operation rather than to a run. */
-const PROVISIONING_SCOPED_OPS: readonly ManagedOp[] = ['status', 'runtime-lease', 'checkpoint'];
+const PROVISIONING_SCOPED_OPS: readonly ManagedOp[] = ['status', 'runtime-lease', 'checkpoint', 'credential'];
+
+/**
+ * Which claim shapes are bound to a provisioning operation rather than to a run.
+ *
+ * A guard over the one list, so the parse side and the verify side cannot
+ * disagree about the set — they did, and the verify side's hand-written trio
+ * left `checkpoint` unbound.
+ */
+function isProvisioningScoped(
+    claims: { op: ManagedOp },
+): claims is { op: ManagedOp; provisioningOperationId: string } {
+    return PROVISIONING_SCOPED_OPS.includes(claims.op);
+}
 
 type ManagedTokenCommon = {
     v: number;
@@ -76,6 +98,18 @@ export type ManagedRunTokenClaims = ManagedTokenCommon & {
  */
 export type ManagedStatusTokenClaims = ManagedTokenCommon & {
     op: 'status';
+    provisioningOperationId: string;
+};
+
+/**
+ * A renewed credential for the Machine this runtime already is.
+ *
+ * Bound to the provisioning operation, like a reading: the identity outlives
+ * every run on this runtime, and a signature authorising work on one run must
+ * not also be able to replace the bearer the runtime authenticates with.
+ */
+export type ManagedCredentialTokenClaims = ManagedTokenCommon & {
+    op: 'credential';
     provisioningOperationId: string;
 };
 
@@ -116,6 +150,7 @@ export type ManagedCheckpointTokenClaims = ManagedTokenCommon & {
 export type ManagedTokenClaims =
     | ManagedRunTokenClaims
     | ManagedStatusTokenClaims
+    | ManagedCredentialTokenClaims
     | ManagedRuntimeLeaseTokenClaims
     | ManagedCheckpointTokenClaims;
 
@@ -252,6 +287,18 @@ function parseClaims(raw: unknown): ManagedTokenClaims | null {
             const checkpointId = readId(record.checkpointId);
             const paramsDigest = readId(record.paramsDigest);
             if (checkpointId === null || paramsDigest === null) return null;
+            /*
+             * The two digests are one binding, so they must be one value.
+             *
+             * `payloadDigest` is what the verifier compares against the request
+             * it was handed; `paramsDigest` was required here and compared
+             * nowhere. A field that is required and never checked is
+             * decoration — an issuer could fill it with a digest of something
+             * else and every review would still read it as a binding. Refusing
+             * the disagreement is the smallest way to make it mean what it
+             * says.
+             */
+            if (paramsDigest !== base.payloadDigest) return null;
             // A checkpoint is not a lease: it may not hold a write deadline.
             for (const forbidden of ['renewalSeq', 'leaseMs', 'absoluteExpiry']) {
                 if (record[forbidden] !== undefined) return null;
@@ -267,6 +314,19 @@ function parseClaims(raw: unknown): ManagedTokenClaims | null {
             const absoluteExpiry = readInt(record.absoluteExpiry, 0, Number.MAX_SAFE_INTEGER);
             if (renewalSeq === null || leaseMs === null || absoluteExpiry === null) return null;
             return { ...base, op, provisioningOperationId, renewalSeq, leaseMs, absoluteExpiry };
+        }
+        if (op === 'credential') {
+            /*
+             * The same shape a reading has — it names the provisioning
+             * operation and nothing about a run — and the same refusals, for
+             * the same reasons: a credential token that could name a run could
+             * be replayed as one, and one carrying lease fields could hold a
+             * write deadline open.
+             */
+            for (const forbidden of ['renewalSeq', 'leaseMs', 'absoluteExpiry']) {
+                if (record[forbidden] !== undefined) return null;
+            }
+            return { ...base, op, provisioningOperationId };
         }
         // Refused for being *present*, not for being wrong. A status token that
         // can name a run is a status token that can be replayed as one, and a
@@ -310,20 +370,28 @@ function parseClaims(raw: unknown): ManagedTokenClaims | null {
     return claims;
 }
 
-export function verifyManagedDispatchToken(input: {
+/**
+ * Everything a dispatch token must satisfy before its epoch is considered.
+ *
+ * Private, and ending **after** the provisioning-operation binding and
+ * **before** the epoch gate: that is the one place the two callers
+ * below diverge. It does not carry the payload check either - in the full
+ * verifier that check runs *after* the epoch gate, so putting it here would
+ * move a guard and change which reason a token with several faults reports.
+ *
+ * The binding belongs here, not in the wrapper. The first cut ended one block
+ * too early, so the epoch-free caller had no operation check at all and would
+ * have accepted a token minted for a **different provisioning operation** on
+ * the same runtime, workspace, project and epoch - the defect the comment
+ * inside that block records as having already happened once. An epoch cannot
+ * stand in for it: two operations can share one.
+ */
+function verifySignedStaticClaims(input: {
     token: string;
     verifier: KeyObject;
     runtimeId: string;
     workspaceId: string;
     op: ManagedOp;
-    paramsDigest: string;
-    currentEpoch: number;
-    /**
-     * The provisioning operation this runtime was created by, from its
-     * protected marker. Required for `status`, which has no epoch gate: the
-     * operation is then the only thing tying the token to this runtime's
-     * generation.
-     */
     provisioningOperationId?: string;
     now: number;
 }): ManagedTokenResult {
@@ -373,6 +441,58 @@ export function verifyManagedDispatchToken(input: {
     if (claims.exp < claims.iat || claims.exp - claims.iat > MAX_TOKEN_TTL_MS) {
         return { ok: false, reason: 'ttl-too-long' };
     }
+    /*
+     * 목록에서 유도한다 — 손으로 나열하면 갈라진다. 실제로 갈라져 있었다:
+     * `PROVISIONING_SCOPED_OPS` 는 `checkpoint` 를 포함하는데 이 조건은
+     * `status | runtime-lease | credential` 만 적어서, 같은 runtime·workspace·
+     * project·epoch 의 **다른 provisioning operation** 으로 서명된 checkpoint
+     * 토큰이 통과했다. 그 파라미터 안에는 업로드 목적지가 들어 있으므로, 그것을
+     * 가진 쪽은 이 runtime 이 현재 operation 이 허가하지 않은 namespace 로 볼륨을
+     * 봉인하게 만들 수 있었다. epoch 은 그것을 막지 못한다 — 두 operation 이 같은
+     * epoch 을 가질 수 있다.
+     */
+    if (isProvisioningScoped(claims)) {
+        // Fail closed: a runtime that knows of no operation cannot confirm
+        // that a token belongs to the life it is currently living, and a token
+        // minted for a different provisioning operation names resources this
+        // runtime may already have replaced.
+        if (input.provisioningOperationId === undefined
+            || claims.provisioningOperationId !== input.provisioningOperationId) {
+            return { ok: false, reason: 'wrong-operation' };
+        }
+    }
+    return { ok: true, claims };
+}
+
+/**
+ * The full verifier: static claims, then the epoch gate, then the payload.
+ *
+ * The order is the one this function has always had - the helper above holds
+ * only what already ran first, and the two checks below are unmoved. A token
+ * with several faults therefore reports the same reason it did before the
+ * extraction, which the precedence tests pin.
+ */
+export function verifyManagedDispatchToken(input: {
+    token: string;
+    verifier: KeyObject;
+    runtimeId: string;
+    workspaceId: string;
+    op: ManagedOp;
+    paramsDigest: string;
+    currentEpoch: number;
+    /**
+     * The provisioning operation this runtime was created by, from its
+     * protected marker. Required for `status`, which has no epoch gate: the
+     * operation is then the only thing tying the token to this runtime's
+     * generation.
+     */
+    provisioningOperationId?: string;
+    now: number;
+}): ManagedTokenResult {
+    const common = verifySignedStaticClaims(input);
+    if (!common.ok) return common;
+    const { claims } = common;
+
     // Epoch rules differ by operation, and collapsing them is a fencing hole.
     //
     // Work operations (spawn/stop/query) must match the epoch this runtime
@@ -393,17 +513,12 @@ export function verifyManagedDispatchToken(input: {
     // operation instead, and nothing is mutated by asking, so an epoch that
     // does not match is a fact for the runtime to report rather than grounds
     // to refuse the question.
-    if (claims.op === 'status' || claims.op === 'runtime-lease') {
-        // Fail closed: a runtime that knows of no operation cannot confirm
-        // that a token belongs to the life it is currently living, and a token
-        // minted for a different provisioning operation names resources this
-        // runtime may already have replaced.
-        if (input.provisioningOperationId === undefined
-            || claims.provisioningOperationId !== input.provisioningOperationId) {
-            return { ok: false, reason: 'wrong-operation' };
-        }
-    }
-    if (input.op !== 'status') {
+    // The identity outlives every epoch on this runtime, so a credential push
+    // is not judged against the current one: refusing it during a transition
+    // would leave the runtime unable to renew exactly when it is least able to
+    // recover. What bounds a replay is the token's own two-minute life and the
+    // daemon's rule that a replacement must outlive what is stored.
+    if (input.op !== 'status' && input.op !== 'credential') {
         if (claims.epoch < input.currentEpoch) return { ok: false, reason: 'stale-epoch' };
         // Both lease shapes may carry a higher epoch, because both are the path
         // that performs the fence before persisting it.
@@ -414,5 +529,44 @@ export function verifyManagedDispatchToken(input: {
     }
     if (claims.payloadDigest !== input.paramsDigest) return { ok: false, reason: 'payload-mismatch' };
 
+    return { ok: true, claims };
+}
+
+/**
+ * The same token, judged without an epoch.
+ *
+ * For a holder that has no current epoch to judge against - the privileged
+ * supervisor, whose root-owned marker carries the runtime, workspace, project,
+ * provisioning operation and verifier key, and no lease view at all. The three
+ * ways to call the full verifier from there are all forgeries: handing back the
+ * token's own epoch, passing `0`, or passing the generation ledger's maximum,
+ * which is launch intent rather than authority.
+ *
+ * **What it returns is authenticated material, not authorisation.** It says the
+ * parent signed this document, for this runtime, workspace and provisioning
+ * operation, within the token's own lifetime, and that the params are the ones
+ * it signed. It says nothing about whether that epoch is current, whether a
+ * promotion or revocation has happened since, or whether anything may be
+ * written. `claims.epoch` is a fact to record and compare against what the
+ * caller independently observes - never a value to feed back as truth.
+ *
+ * No production caller yet: this exists for the checkpoint-material relay and
+ * is unused until that increment lands.
+ */
+export function verifyManagedDispatchMaterial(input: {
+    token: string;
+    verifier: KeyObject;
+    runtimeId: string;
+    workspaceId: string;
+    op: ManagedOp;
+    paramsDigest: string;
+    provisioningOperationId?: string;
+    now: number;
+}): ManagedTokenResult {
+    const common = verifySignedStaticClaims(input);
+    if (!common.ok) return common;
+    const { claims } = common;
+    // The payload check, and nothing where the epoch gate would be.
+    if (claims.payloadDigest !== input.paramsDigest) return { ok: false, reason: 'payload-mismatch' };
     return { ok: true, claims };
 }

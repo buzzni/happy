@@ -40,14 +40,18 @@
  * is not evidence that any of the above ran.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { createReadStream } from 'node:fs';
-import { lstat, mkdir, readdir, readlink, rm, stat, writeFile } from 'node:fs/promises';
+import { constants, createReadStream, type Stats } from 'node:fs';
+import { lstat, mkdir, open, opendir, readdir, readlink, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
+import { Transform } from 'node:stream';
 import * as tar from 'tar';
+import { createGunzip } from 'node:zlib';
+import { claudeStateRequirements, classifyClaudeStateEntry, MANAGED_CLAUDE_CANONICAL_CWD, MANAGED_CLAUDE_PROVIDER_HOME, MANAGED_CLAUDE_PROJECT_SLUG, type ClaudeStateRequirements, type ClaudeSessionDependencies } from './managedClaudeStateLayout';
+import { discoverClaudeTranscriptDependencies, deriveClaudeTranscriptDependencies, type ClaudeTranscriptRecord } from './managedClaudeTranscriptDerivation';
 
 import { openCheckpointFile } from './managedCheckpointCrypto';
-import { checkpointManifestDigest, type ManagedCheckpointManifest } from './managedCheckpointManifest';
+import { checkpointManifestDigest, parseManagedCheckpointManifest, serializeManagedCheckpointManifest, type ManagedCheckpointManifest, type ManagedCheckpointManifestV2 } from './managedCheckpointManifest';
 import {
     managedPromotionJournalPath,
     promoteCheckpointTrees,
@@ -55,7 +59,18 @@ import {
 } from './managedCheckpointPromotion';
 import { classifyCheckpointEntry, type CheckpointArea } from './managedCheckpointScope';
 
+import { parseProviderStateScope, type ProviderStateScopeV1 } from './managedProviderStateScope';
+
+type NativeRestoreLimits = {
+    maxArchiveBytesPerArea: number; maxExpandedBytesPerArea: number; maxEntriesPerArea: number;
+    maxTarMetaBytes: number; maxTranscriptBytes: number; maxMetaBytes: number; maxArtifactBytes: number;
+    maxAggregateReadBytes: number; maxRecords: number;
+};
+
 export type ManagedCheckpointRestoreCode =
+    | 'native-scope-required' | 'native-input-invalid' | 'native-manifest-invalid'
+    | 'native-scope-mismatch' | 'native-budget-exceeded' | 'native-dependency-invalid'
+    | 'provider-state-unscoped'
     | 'tenant-mismatch'
     | 'source-volume-mismatch'
     | 'area-missing'
@@ -153,6 +168,74 @@ async function extractArchive(archivePath: string, into: string, budget: {
     if (exceeded) refuse('archive-exceeds-manifest');
 }
 
+/** V2 bounds decoded bytes (including metadata), then admits each actual member. */
+async function extractNativeArchive(archivePath: string, into: string, area: ManagedCheckpointManifestV2['areas'][number],
+    members: ManagedCheckpointManifestV2['entries'], limits: NativeRestoreLimits): Promise<void> {
+    await mkdir(into, { recursive: true, mode: 0o700 });
+    let failure: ManagedCheckpointRestoreCode | undefined;
+    let count = 0;
+    let bytes = 0;
+    const seen = new Set<string>();
+    const expected = new Map(members.filter(entry => entry.inline === undefined).map(entry => [entry.path, entry]));
+    const extractor = tar.x({
+        cwd: into, strict: true, preservePaths: false, preserveOwner: false,
+        brotli: false, zstd: false, maxMetaEntrySize: limits.maxTarMetaBytes,
+        filter: (path, entry) => {
+            if (failure) return false;
+            count++;
+            if (count > Math.min(limits.maxEntriesPerArea, area.entryCount)) {
+                failure = 'archive-exceeds-manifest'; return false;
+            }
+            if (!('type' in entry)) { failure = 'forbidden-content'; return false; }
+            const effective = entry.type === 'Directory' && path.endsWith('/') ? path.slice(0, -1) : path;
+            const declared = expected.get(effective);
+            if (seen.has(effective)) { failure = 'archive-exceeds-manifest'; return false; }
+            seen.add(effective);
+            if (!declared || (entry.type !== 'File' && entry.type !== 'Directory' && entry.type !== 'SymbolicLink')
+                || declared.type !== (entry.type === 'File' ? 'file' : entry.type === 'Directory' ? 'directory' : 'symlink')
+                || (declared.type === 'symlink' && entry.linkpath !== declared.linkTarget)) {
+                failure = 'forbidden-content'; return false;
+            }
+            if (!Number.isSafeInteger(entry.size) || entry.size < 0 || entry.size !== declared.bytes
+                || entry.size > limits.maxExpandedBytesPerArea - bytes) {
+                failure = 'archive-exceeds-manifest'; return false;
+            }
+            bytes += entry.size;
+            return true;
+        },
+    });
+    extractor.on('ignoredEntry', () => { failure ??= 'forbidden-content'; });
+    let expanded = 0;
+    let prefix = Buffer.alloc(0);
+    let prefixChecked = false;
+    const limiter = new Transform({
+        transform(chunk: Buffer, _encoding, done) {
+            if (failure) { done(new Error('refused')); return; }
+            if (chunk.length > limits.maxExpandedBytesPerArea - expanded) {
+                failure = 'native-budget-exceeded'; done(new Error('limit')); return;
+            }
+            expanded += chunk.length;
+            if (!prefixChecked) {
+                const need = 2 - prefix.length;
+                prefix = Buffer.concat([prefix, chunk.subarray(0, need)]);
+                if (prefix.length < 2) { done(); return; }
+                // tar auto-detects gzip even with gzip:false. Forward neither
+                // prefix byte until a split-safe check rules out a second inflate.
+                if (prefix[0] === 0x1f && prefix[1] === 0x8b) { done(new Error('nested')); return; }
+                prefixChecked = true;
+                this.push(prefix);
+                if (chunk.length > need) this.push(chunk.subarray(need));
+            } else this.push(chunk);
+            done();
+        },
+        flush(done) { done(prefixChecked ? undefined : new Error('short')); },
+    });
+    try {
+        await pipeline(createReadStream(archivePath), createGunzip(), limiter, extractor);
+    } catch { refuse(failure ?? 'extract-failed'); }
+    if (failure) refuse(failure);
+}
+
 type StagedEntry = {
     type: 'file' | 'directory' | 'symlink';
     bytes: number;
@@ -203,6 +286,137 @@ async function readStagedTree(root: string): Promise<Map<string, StagedEntry>> {
     };
     await visit('');
     return found;
+}
+
+/** Private staging has no other trusted writer. Never interpret temporary paths as Claude roots. */
+async function verifyNativeStaging(area: CheckpointArea, root: string, manifest: ManagedCheckpointManifestV2,
+    expectedUid: number, limits: NativeRestoreLimits): Promise<void> {
+    const members = manifest.entries.filter(entry => entry.area === area);
+    const expected = new Map(members.map(entry => [entry.path, entry]));
+    const requirements: ClaudeStateRequirements = { ok: true, slug: MANAGED_CLAUDE_PROJECT_SLUG, entries: manifest.nativeState.entries };
+    const found = new Map<string, Stats>();
+    const visit = async (relative: string): Promise<void> => {
+        const directory = await opendir(join(root, relative));
+        for await (const child of directory) {
+            const path = relative ? `${relative}/${child.name}` : child.name;
+            if (found.size >= members.length || !expected.has(path)) refuse('unexpected-entry');
+            const declared = expected.get(path)!;
+            const actual = await lstat(join(root, path));
+            const type = actual.isDirectory() ? 'directory' : actual.isFile() ? 'file' : actual.isSymbolicLink() ? 'symlink' : null;
+            if (!type || (area === 'provider-state'
+                ? classifyClaudeStateEntry({ path, type }, requirements).kind !== 'required'
+                : !classifyCheckpointEntry({ area, path, type, bytes: actual.isFile() ? actual.size : 0, linkTarget: declared.linkTarget }).include)) refuse('forbidden-content');
+            if (actual.uid !== expectedUid) refuse('ownership-mismatch');
+            if (type !== declared.type || (actual.mode & 0o7777) !== declared.mode
+                || !Number.isSafeInteger(actual.size) || actual.size < 0
+                || (type === 'file' && actual.size !== declared.bytes)) refuse('entry-mismatch');
+            found.set(path, actual);
+            if (type === 'directory') {
+                if (declared.sha256 !== createHash('sha256').update('').digest('hex')) refuse('entry-mismatch');
+                await visit(path);
+            } else if (type === 'symlink') {
+                const target = await readlink(join(root, path));
+                if (target !== declared.linkTarget || createHash('sha256').update(target).digest('hex') !== declared.sha256) refuse('entry-mismatch');
+            }
+        }
+    };
+    await visit('');
+    if (found.size !== expected.size) refuse('missing-entry');
+    let remaining = limits.maxAggregateReadBytes;
+    const cache = new Map<string, Buffer>();
+    const read = async (path: string, cap: number, retain = true): Promise<Buffer> => {
+        const cached = cache.get(path);
+        if (cached) return cached;
+        const declared = expected.get(path);
+        const before = found.get(path);
+        if (!declared || !before || declared.type !== 'file') refuse('native-dependency-invalid');
+        if (declared.bytes > cap || (retain && declared.bytes > remaining)) refuse('native-budget-exceeded');
+        const handle = await open(join(root, path), constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+            const same = (value: Stats) => value.isFile()
+                && value.dev === before.dev && value.ino === before.ino && value.size === before.size
+                && value.uid === expectedUid && (value.mode & 0o7777) === declared.mode
+                && value.mtimeMs === before.mtimeMs && value.ctimeMs === before.ctimeMs;
+            if (!same(await handle.stat())) refuse('entry-mismatch');
+            const hash = createHash('sha256');
+            const buffers: Buffer[] = [];
+            const scratch = Buffer.alloc(65536);
+            let bytes = 0;
+            while (true) {
+                const allowance = Math.min(cap - bytes, declared.bytes - bytes, retain ? remaining : cap - bytes);
+                const { bytesRead } = await handle.read(scratch, 0, Math.min(scratch.length, allowance + 1), null);
+                if (retain) remaining -= bytesRead;
+                if (bytesRead > allowance) refuse('native-budget-exceeded');
+                if (bytesRead === 0) break;
+                bytes += bytesRead;
+                const chunk = scratch.subarray(0, bytesRead);
+                hash.update(chunk);
+                if (retain) buffers.push(Buffer.from(chunk));
+            }
+            if (bytes !== declared.bytes || hash.digest('hex') !== declared.sha256 || !same(await handle.stat())) refuse('entry-mismatch');
+            const result = retain ? Buffer.concat(buffers, bytes) : Buffer.alloc(0);
+            if (retain) cache.set(path, result);
+            return result;
+        } finally { await handle.close(); }
+    };
+    if (area === 'project') {
+        for (const entry of members) if (entry.type === 'file') await read(entry.path, limits.maxExpandedBytesPerArea, false);
+        return;
+    }
+    const parse = (buffer: Buffer): ClaudeTranscriptRecord[] => {
+        const records: ClaudeTranscriptRecord[] = [];
+        let start = 0;
+        for (let end = 0; end <= buffer.length; end++) {
+            if (end !== buffer.length && buffer[end] !== 10) continue;
+            if (end > start) {
+                if (records.length >= limits.maxRecords) refuse('native-budget-exceeded');
+                try { records.push(JSON.parse(buffer.subarray(start, end).toString('utf8'))); }
+                catch { refuse('native-dependency-invalid'); }
+            }
+            start = end + 1;
+        }
+        return records;
+    };
+    const project = `.claude/projects/${MANAGED_CLAUDE_PROJECT_SLUG}`;
+    const dependencies = new Map<string, ClaudeSessionDependencies>();
+    for (const source of manifest.nativeState.providerStateScope.sources) {
+        for (const nativeId of [source.currentNativeId, ...source.retainedNativeIds]) {
+            if (dependencies.has(nativeId)) continue;
+            const records = parse(await read(`${project}/${nativeId}.jsonl`, limits.maxTranscriptBytes));
+            const context = { nativeId, canonicalCwd: MANAGED_CLAUDE_CANONICAL_CWD, providerHome: MANAGED_CLAUDE_PROVIDER_HOME, records };
+            const discovered = discoverClaudeTranscriptDependencies(context);
+            if (!discovered.discovered) refuse('native-dependency-invalid');
+            const children = new Map<string, { records: ClaudeTranscriptRecord[]; meta: unknown }>();
+            for (const agentId of discovered.agentIds) {
+                const base = `${project}/${nativeId}/subagents/agent-${agentId}`;
+                const records = parse(await read(`${base}.jsonl`, limits.maxTranscriptBytes));
+                const bytes = await read(`${base}.meta.json`, limits.maxMetaBytes);
+                let meta: unknown;
+                try { meta = JSON.parse(bytes.toString('utf8')); } catch { refuse('native-dependency-invalid'); }
+                children.set(agentId, { records, meta });
+            }
+            const derived = deriveClaudeTranscriptDependencies({ ...context, children });
+            if (!derived.derived) refuse('native-dependency-invalid');
+            for (const reference of derived.references) {
+                const path = `${project}/${nativeId}/tool-results/${reference.segment}`;
+                if (expected.get(path)?.bytes !== reference.size) refuse('native-dependency-invalid');
+                await read(path, limits.maxArtifactBytes);
+            }
+            dependencies.set(nativeId, { complete: true, subagents: derived.subagents, references: derived.references });
+        }
+    }
+    const actual = claudeStateRequirements({ providerHome: MANAGED_CLAUDE_PROVIDER_HOME, canonicalCwd: MANAGED_CLAUDE_CANONICAL_CWD,
+        sources: manifest.nativeState.providerStateScope.sources, dependencies });
+    if (!actual.ok || actual.entries.length !== requirements.entries.length
+        || cache.size !== members.filter(entry => entry.type === 'file').length) refuse('native-dependency-invalid');
+    const associationSet = (entry: ClaudeStateRequirements['entries'][number]) => new Set(entry.requiredBy.map(value => JSON.stringify([value.attemptId, value.nativeId, value.role])));
+    for (const entry of actual.entries) {
+        const declared = requirements.entries.find(value => value.path === entry.path);
+        if (!declared || declared.kind !== entry.kind) refuse('native-dependency-invalid');
+        const associations = associationSet(declared);
+        const derived = associationSet(entry);
+        if (associations.size !== derived.size || [...derived].some(value => !associations.has(value))) refuse('native-dependency-invalid');
+    }
 }
 
 function verifyArea(
@@ -278,7 +492,7 @@ export async function restoreManagedCheckpoint(input: {
     objects: Map<CheckpointArea, string>;
     key: Buffer;
     expected: {
-        tenant: { companyId: string; projectId: string };
+        tenant: { tenantId: string; projectId: string };
         /**
          * The volume the checkpoint must have been taken on. Omitted when any
          * volume of this tenant and project is acceptable — the ordinary case
@@ -292,6 +506,7 @@ export async function restoreManagedCheckpoint(input: {
     /** Must be on the same filesystem as every destination — promotion renames. */
     stagingRoot: string;
     expectedUid?: number;
+    nativeRestore?: { expectedSourceScope: ProviderStateScopeV1; limits: NativeRestoreLimits };
     providerStateSessions?: readonly string[];
     deps?: { rename?: (from: string, to: string) => Promise<void> };
 }): Promise<{
@@ -303,28 +518,120 @@ export async function restoreManagedCheckpoint(input: {
 }> {
     const expectedUid = input.expectedUid ?? process.getuid?.() ?? 0;
     const providerStateSessions = input.providerStateSessions ?? [];
-    const manifest = input.manifest;
+    // Own the plain metadata before the first await. The caller may keep editing
+    // its manifest; every check, path, inline write and digest below must describe
+    // the same document that passed entry-time policy. V2 also owns the additional
+    // scalar/path dependencies below; legacy v1 inputs retain their behavior.
+    let manifest = structuredClone(input.manifest);
+    if (manifest.schemaVersion !== 1 && manifest.schemaVersion !== 2) refuse('native-manifest-invalid');
+    let native: { scope: ProviderStateScopeV1; limits: NativeRestoreLimits } | undefined;
+    if (manifest.schemaVersion === 2) {
+        try {
+            manifest = parseManagedCheckpointManifest(serializeManagedCheckpointManifest(manifest));
+        } catch { refuse('native-manifest-invalid'); }
+        if (!input.nativeRestore) refuse('native-scope-required');
+        if (input.providerStateSessions !== undefined) refuse('native-input-invalid');
+        try {
+            const raw = input.nativeRestore.expectedSourceScope;
+            if (!raw || !Array.isArray(raw.sources) || raw.sources.length > 128
+                || Buffer.byteLength(JSON.stringify(raw)) > 262144) refuse('native-input-invalid');
+            const scope = parseProviderStateScope(structuredClone(raw));
+            const supplied = input.nativeRestore.limits;
+            const limits: NativeRestoreLimits = {
+                maxArchiveBytesPerArea: supplied.maxArchiveBytesPerArea,
+                maxExpandedBytesPerArea: supplied.maxExpandedBytesPerArea,
+                maxEntriesPerArea: supplied.maxEntriesPerArea, maxTarMetaBytes: supplied.maxTarMetaBytes,
+                maxTranscriptBytes: supplied.maxTranscriptBytes, maxMetaBytes: supplied.maxMetaBytes,
+                maxArtifactBytes: supplied.maxArtifactBytes, maxAggregateReadBytes: supplied.maxAggregateReadBytes,
+                maxRecords: supplied.maxRecords,
+            };
+            if (Object.values(limits).some(value => !Number.isSafeInteger(value) || value <= 0)
+                || !Number.isSafeInteger(expectedUid) || expectedUid < 0) refuse('native-input-invalid');
+            native = { scope, limits };
+        } catch { refuse('native-input-invalid'); }
+        if (manifest.schemaVersion !== 2
+            || JSON.stringify(native.scope) !== JSON.stringify(parseProviderStateScope(manifest.nativeState.providerStateScope))) {
+            refuse('native-scope-mismatch');
+        }
+        for (const entry of manifest.entries) {
+            if (entry.area === 'project' && !classifyCheckpointEntry({ ...entry }).include) refuse('forbidden-content');
+        }
+        if (manifest.entries.some(entry => !manifest.areas.some(area => area.area === entry.area))) refuse('native-manifest-invalid');
+        // Inline writes must not traverse a symlink/file (or an undeclared
+        // implicit directory). A safe-looking leaf path alone cannot establish
+        // containment when its declared ancestors are non-directories.
+        const projectMembers = new Map(manifest.entries.filter(entry => entry.area === 'project').map(entry => [entry.path, entry]));
+        for (const entry of projectMembers.values()) {
+            const parts = entry.path.split('/');
+            for (let depth = 1; depth < parts.length; depth++) {
+                if (projectMembers.get(parts.slice(0, depth).join('/'))?.type !== 'directory') refuse('forbidden-content');
+            }
+        }
+        const projectFiles = new Set(manifest.entries.filter(entry => entry.area === 'project' && entry.type === 'file').map(entry => entry.path));
+        for (const worktree of manifest.worktrees) {
+            if (!worktree.name || worktree.name === '.' || worktree.name === '..' || /[/\\\0]/.test(worktree.name)
+                || !projectFiles.has(`.git/worktrees/${worktree.name}/gitdir`)
+                || !projectFiles.has(`${worktree.path}/.git`)) refuse('forbidden-content');
+        }
+        let remaining = native.limits.maxAggregateReadBytes;
+        const kinds = new Map(manifest.nativeState.entries.map(entry => [entry.path, entry.kind]));
+        for (const area of manifest.areas) {
+            if (!input.objects.get(area.area) || !input.destinations.get(area.area)) refuse('area-missing');
+            if (!Number.isSafeInteger(area.archiveBytes) || area.archiveBytes <= 0
+                || area.archiveBytes > native.limits.maxArchiveBytesPerArea
+                || !Number.isSafeInteger(area.entryCount) || area.entryCount > native.limits.maxEntriesPerArea) refuse('native-budget-exceeded');
+            let areaRemaining = native.limits.maxExpandedBytesPerArea;
+            for (const entry of manifest.entries.filter(entry => entry.area === area.area)) {
+                if (!Number.isSafeInteger(entry.bytes) || entry.bytes < 0 || entry.bytes > areaRemaining) refuse('native-budget-exceeded');
+                areaRemaining -= entry.bytes;
+                if (area.area === 'provider-state' && entry.type === 'file') {
+                    const kind = kinds.get(entry.path);
+                    const cap = kind === 'artifact' ? native.limits.maxArtifactBytes : kind === 'subagent-meta' ? native.limits.maxMetaBytes : native.limits.maxTranscriptBytes;
+                    if (entry.bytes > cap || entry.bytes > remaining) refuse('native-budget-exceeded');
+                    remaining -= entry.bytes;
+                }
+            }
+        }
+    }
+    // Only v2 owns the additional scalar/path dependencies; v1 compatibility stays unchanged.
+    const options = native ? {
+        expected: structuredClone(input.expected), key: input.key, stagingRoot: input.stagingRoot,
+        objects: new Map(manifest.areas.map(area => [area.area, input.objects.get(area.area)!])),
+        destinations: new Map(manifest.areas.map(area => [area.area, input.destinations.get(area.area)!])),
+        deps: input.deps ? { rename: input.deps.rename } : undefined,
+    } : input;
 
-    if (manifest.tenant.companyId !== input.expected.tenant.companyId
-        || manifest.tenant.projectId !== input.expected.tenant.projectId) {
+    if (manifest.tenant.tenantId !== options.expected.tenant.tenantId
+        || manifest.tenant.projectId !== options.expected.tenant.projectId) {
         refuse('tenant-mismatch');
     }
-    const sourceVolume = input.expected.sourceVolume;
+    const sourceVolume = options.expected.sourceVolume;
     if (sourceVolume
         && (manifest.volume.volumeId !== sourceVolume.volumeId
             || manifest.volume.deviceUuid !== sourceVolume.deviceUuid)) {
         refuse('source-volume-mismatch');
     }
 
-    const staging = join(input.stagingRoot, `.managed-checkpoint-${randomUUID()}`);
+    // V1 records no scoped native inventory. Legacy session hints or omission of
+    // a provider destination cannot turn it into a verified native restore.
+    // Refuse the whole mixed restore before staging or reading either area.
+    if (manifest.schemaVersion === 1
+        && (manifest.areas.some(area => area.area === 'provider-state')
+            || manifest.entries.some(entry => entry.area === 'provider-state'))) {
+        refuse('provider-state-unscoped');
+    }
+
+    if (manifest.schemaVersion === 1 && input.nativeRestore) refuse('native-manifest-invalid');
+
+    const staging = join(options.stagingRoot, `.managed-checkpoint-${randomUUID()}`);
     let unreconciled = false;
     try {
         await mkdir(staging, { recursive: true, mode: 0o700 });
         const plan: { area: CheckpointArea; staged: string; destination: string; displaced: string }[] = [];
 
         for (const area of manifest.areas) {
-            const sealed = input.objects.get(area.area);
-            const destination = input.destinations.get(area.area);
+            const sealed = options.objects.get(area.area);
+            const destination = options.destinations.get(area.area);
             if (!sealed || !destination) refuse('area-missing');
 
             const archivePath = join(staging, `${area.area}.tar.gz`);
@@ -333,9 +640,10 @@ export async function restoreManagedCheckpoint(input: {
                 opened = await openCheckpointFile({
                     source: sealed,
                     destination: archivePath,
-                    key: input.key,
+                    key: options.key,
+                    maxPlaintextBytes: native ? Math.min(native.limits.maxArchiveBytesPerArea, area.archiveBytes) : undefined,
                     binding: {
-                        companyId: manifest.tenant.companyId,
+                        tenantId: manifest.tenant.tenantId,
                         projectId: manifest.tenant.projectId,
                         checkpointId: manifest.checkpointId,
                         area: area.area,
@@ -350,7 +658,8 @@ export async function restoreManagedCheckpoint(input: {
 
             const areaEntries = manifest.entries.filter((entry) => entry.area === area.area);
             const areaStaging = join(staging, area.area);
-            await extractArchive(archivePath, areaStaging, {
+            if (native) await extractNativeArchive(archivePath, areaStaging, area, areaEntries, native.limits);
+            else await extractArchive(archivePath, areaStaging, {
                 entries: area.entryCount,
                 totalBytes: areaEntries.reduce((total, entry) => total + entry.bytes, 0),
                 maxFileBytes: areaEntries.reduce((largest, entry) => Math.max(largest, entry.bytes), 0),
@@ -365,7 +674,13 @@ export async function restoreManagedCheckpoint(input: {
                 await writeFile(join(areaStaging, entry.path), entry.inline, { mode: entry.mode });
             }
 
-            verifyArea(area.area, manifest, await readStagedTree(areaStaging), expectedUid, providerStateSessions);
+            if (native && manifest.schemaVersion === 2) {
+                try { await verifyNativeStaging(area.area, areaStaging, manifest, expectedUid, native.limits); }
+                catch (error) {
+                    if (error instanceof ManagedCheckpointRestoreError) throw error;
+                    refuse('native-dependency-invalid');
+                }
+            } else verifyArea(area.area, manifest, await readStagedTree(areaStaging), expectedUid, providerStateSessions);
             if (area.area === 'project') await repairWorktrees(manifest, areaStaging, destination);
 
             plan.push({
@@ -381,10 +696,10 @@ export async function restoreManagedCheckpoint(input: {
 
         try {
             await promoteCheckpointTrees({
-                journalPath: managedPromotionJournalPath(input.stagingRoot, manifest.checkpointId),
+                journalPath: managedPromotionJournalPath(options.stagingRoot, manifest.checkpointId),
                 checkpointId: manifest.checkpointId,
                 entries: plan,
-                deps: input.deps,
+                deps: options.deps,
             });
         } catch (error) {
             if (error instanceof ManagedPromotionError) {
@@ -393,6 +708,9 @@ export async function restoreManagedCheckpoint(input: {
             }
             throw error;
         }
+    } catch (error) {
+        if (native && !(error instanceof ManagedCheckpointRestoreError)) refuse('extract-failed');
+        throw error;
     } finally {
         // Kept after an unreconciled promotion. The user's data is safe
         // either way — the displaced tree is a sibling of the destination, not
@@ -406,6 +724,6 @@ export async function restoreManagedCheckpoint(input: {
         checkpointId: manifest.checkpointId,
         manifestDigest: checkpointManifestDigest(manifest),
         sourceVolume: manifest.volume,
-        targetVolume: input.expected.targetVolume,
+        targetVolume: options.expected.targetVolume,
     };
 }

@@ -52,7 +52,7 @@ export class ManagedCheckpointResolveError extends Error {
 
 /** Everything the parent vouches for, and nothing the checkpoint claims. */
 export type ManagedCheckpointAuthority = {
-    tenant: { companyId: string; projectId: string };
+    tenant: { tenantId: string; projectId: string };
     /** Signed GET URLs, scoped by the parent to this project. */
     pointerUrl: string;
     manifestUrl: string;
@@ -118,7 +118,7 @@ export function createManagedCheckpointSource(input: {
                     destination: plainManifest,
                     key: input.authority.key,
                     binding: {
-                        companyId: input.authority.tenant.companyId,
+                        tenantId: input.authority.tenant.tenantId,
                         projectId: input.authority.tenant.projectId,
                         checkpointId: pointer.checkpointId,
                         area: 'manifest',
@@ -132,7 +132,7 @@ export function createManagedCheckpointSource(input: {
             // The three bindings, checked before anything large is fetched.
             if (manifest.checkpointId !== pointer.checkpointId
                 || checkpointManifestDigest(manifest) !== pointer.manifestDigest
-                || manifest.tenant.companyId !== input.authority.tenant.companyId
+                || manifest.tenant.tenantId !== input.authority.tenant.tenantId
                 || manifest.tenant.projectId !== input.authority.tenant.projectId) {
                 throw new ManagedCheckpointResolveError('authority-mismatch');
             }

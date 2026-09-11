@@ -98,7 +98,7 @@ describe('attaching a managed child to an existing session', () => {
 
     it('opens the session it was pointed at, on the root the runtime owns', async () => {
         const { attachManagedSession } = await import('@/managed/managedSessionAttach');
-        const attached = await attachManagedSession(bootstrap(), Date.now());
+        const attached = await attachManagedSession(bootstrap(), Date.now(), serverUrl);
 
         expect(attached.session.id).toBe(SESSION_ID);
         expect(attached.session.encryptionVariant).toBe('dataKey');
@@ -117,7 +117,7 @@ describe('attaching a managed child to an existing session', () => {
         const encryption = await import('@/api/encryption');
         const randomSpy = vi.spyOn(encryption, 'getRandomBytes');
         try {
-            await attachManagedSession(bootstrap(), Date.now());
+            await attachManagedSession(bootstrap(), Date.now(), serverUrl);
         } finally {
             randomSpy.mockRestore();
         }
@@ -137,7 +137,7 @@ describe('attaching a managed child to an existing session', () => {
             [sessionRow({ id: 'sess-other' })],
         ]) {
             lookupSessions = rows;
-            await expect(attachManagedSession(bootstrap(), Date.now())).rejects.toThrow(/session/i);
+            await expect(attachManagedSession(bootstrap(), Date.now(), serverUrl)).rejects.toThrow(/session/i);
         }
     });
 
@@ -146,7 +146,7 @@ describe('attaching a managed child to an existing session', () => {
         lookupSessions = [sessionRow({
             dataEncryptionKey: encodeBase64(new Uint8Array(105).fill(8)),
         })];
-        await expect(attachManagedSession(bootstrap(), Date.now())).rejects.toThrow(/key/i);
+        await expect(attachManagedSession(bootstrap(), Date.now(), serverUrl)).rejects.toThrow(/key/i);
         // And it does not fall back to making a session it could open.
         expect(seen).toEqual(['POST /v2/sessions/lookup']);
     });
@@ -156,14 +156,14 @@ describe('attaching a managed child to an existing session', () => {
         lookupSessions = [sessionRow({
             metadata: encodeBase64(encrypt(new Uint8Array(32).fill(1), 'dataKey', { path: '/x' })),
         })];
-        await expect(attachManagedSession(bootstrap(), Date.now())).rejects.toThrow(/metadata/i);
+        await expect(attachManagedSession(bootstrap(), Date.now(), serverUrl)).rejects.toThrow(/metadata/i);
     });
 
     it('says nothing about the bearer or the key when it refuses', async () => {
         const { attachManagedSession } = await import('@/managed/managedSessionAttach');
         lookupSessions = [];
         try {
-            await attachManagedSession(bootstrap(), Date.now());
+            await attachManagedSession(bootstrap(), Date.now(), serverUrl);
             expect.unreachable('should have thrown');
         } catch (error) {
             expect(String(error)).not.toContain('scoped.bearer.value');
@@ -178,10 +178,43 @@ describe('attaching a managed child to an existing session', () => {
         server.on('request', listener as never);
         try {
             const { attachManagedSession } = await import('@/managed/managedSessionAttach');
-            await attachManagedSession(bootstrap(), Date.now());
+            await attachManagedSession(bootstrap(), Date.now(), serverUrl);
             expect(authorizations).toEqual(['Bearer scoped.bearer.value']);
         } finally {
             server.off('request', listener as never);
         }
+    });
+
+    /*
+     * The attach's first act is to POST the scoped bearer to the envelope's
+     * origin. An envelope naming somewhere else must be refused **before that
+     * request**, because a refusal derived from the response has already
+     * handed the token over.
+     */
+    it('sends nothing at all when the envelope names another server', async () => {
+        const { attachManagedSession, ManagedAttachError } = await import('@/managed/managedSessionAttach');
+        const elsewhere = { ...bootstrap(), serverOrigin: 'https://elsewhere.example.test' };
+
+        await expect(attachManagedSession(elsewhere, Date.now(), serverUrl))
+            .rejects.toThrow(ManagedAttachError);
+        // The proof is the absence of a request, not the shape of the error.
+        expect(seen).toEqual([]);
+    });
+
+    it('attaches when the envelope names the configured server', async () => {
+        // Positive control: without it, a check that refused everything would
+        // pass the case above.
+        const { attachManagedSession } = await import('@/managed/managedSessionAttach');
+        await expect(attachManagedSession(bootstrap(), Date.now(), serverUrl)).resolves.toBeDefined();
+        expect(seen.length).toBeGreaterThan(0);
+    });
+
+    it('refuses when the runtime has no usable configured server', async () => {
+        // Not a reason to fall back to the envelope: with no configured server
+        // there is nothing the envelope could be checked against.
+        const { attachManagedSession, ManagedAttachError } = await import('@/managed/managedSessionAttach');
+        await expect(attachManagedSession(bootstrap(), Date.now(), 'not-a-url'))
+            .rejects.toThrow(ManagedAttachError);
+        expect(seen).toEqual([]);
     });
 });

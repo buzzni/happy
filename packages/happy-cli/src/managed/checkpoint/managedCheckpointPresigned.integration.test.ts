@@ -81,7 +81,7 @@ function presign(key: string, method: 'GET' | 'PUT' | 'HEAD'): string {
 
 describe.skipIf(!configured)('managed checkpoint over presigned URLs on a private bucket', () => {
     const key = randomBytes(32);
-    const tenant = { companyId: 'co_1', projectId: 'pr_1' };
+    const tenant = { tenantId: 'co_1', projectId: 'pr_1' };
     const volume = { volumeId: 'vol_1', deviceUuid: 'dev-1' };
 
     it('shouldRefuseAUrlMintedForADifferentMethod', async () => {

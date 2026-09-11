@@ -11,6 +11,7 @@
  * descriptor number left lying around is either closed or, later, reused for
  * something else entirely.
  */
+import { logger } from '@/ui/logger';
 import {
     GATEWAY_ROUTES,
     MANAGED_BOOTSTRAP_FD_ENV,
@@ -19,6 +20,14 @@ import {
     type ManagedSpawnEnvelope,
 } from '@/managed/managedSpawnBootstrap';
 import { attachManagedSession, ManagedAttachError, type ManagedAttachment } from '@/managed/managedSessionAttach';
+import {
+    MANAGED_CONTROL_CHILD_FD,
+    managedStopAck,
+    readManagedControlChannel,
+} from '@/managed/managedControlChannel';
+import { requestManagedGracefulStop } from '@/managed/managedGracefulStop';
+import { writeSync } from 'node:fs';
+import { Socket } from 'node:net';
 import { MANAGED_PROJECT_ROOT } from '@/daemon/managedRuntimeIdentity';
 
 export type ManagedStartup = {
@@ -35,6 +44,12 @@ export type ManagedStartup = {
 export async function readManagedStartup(
     env: NodeJS.ProcessEnv,
     now: number,
+    /**
+     * The server this runtime was configured for. The supervisor puts the
+     * stored credential's origin here, and the attach refuses an envelope
+     * naming any other one before it sends the scoped bearer anywhere.
+     */
+    configuredOrigin: string,
 ): Promise<ManagedStartup | null> {
     const raw = env[MANAGED_BOOTSTRAP_FD_ENV];
     if (raw === undefined) return null;
@@ -50,7 +65,20 @@ export async function readManagedStartup(
     }
 
     const envelope = await readManagedSpawnEnvelopeFromFd(fd, now);
-    const attachment = await attachManagedSession(envelope.bootstrap, now);
+    const attachment = await attachManagedSession(envelope.bootstrap, now, configuredOrigin);
+    /*
+     * The supervisor's only way to ask this run to end without killing it.
+     *
+     * Opened here because it has to be listening before the message loop
+     * exists — a stop asked for during startup is remembered by
+     * `requestManagedGracefulStop` and applied when the loop registers.
+     *
+     * A supervisor that does not provide the slot leaves the descriptor
+     * closed, and this run simply cannot be stopped gracefully. That is
+     * fail-closed on its own: with no end of input, the quiescence gate
+     * refuses `eof-unverified` and no checkpoint archives provider state.
+     */
+    openManagedControlChannel();
     return { envelope, attachment };
 }
 
@@ -324,4 +352,96 @@ export function managedSettingSources<T>(
     configured: T[] | undefined,
 ): T[] | undefined {
     return lockdown ? ([] as T[]) : configured;
+}
+
+/**
+ * Starts reading the control channel, if this runtime gave the child one.
+ *
+ * Exported for the test that proves a missing slot is survivable rather than
+ * fatal; production calls it from `readManagedStartup`.
+ */
+export function openManagedControlChannel(deps: {
+    open?: (fd: number) => Parameters<typeof readManagedControlChannel>[0]['source'];
+    onUnusable?: () => void;
+} = {}): (() => void) | null {
+    const open = deps.open ?? ((fd: number) => {
+        /*
+         * A socket, and **unref'd**.
+         *
+         * The extra stdio slot is a socketpair, so this end is a socket rather
+         * than a file. That matters twice over:
+         *
+         *  - `fs.createReadStream` keeps a read pending on the threadpool, and
+         *    a pending read holds the event loop open. The run then finishes
+         *    all its work, reports its verdict, and **never exits** — which
+         *    the supervisor sees as `exit-unobserved` and the gate turns into
+         *    a refusal. Measured: a provider alive 44s after its last log
+         *    line, with the whole checkpoint waiting on an exit it was itself
+         *    preventing.
+         *  - `unref()` says this listener is not a reason to stay alive. It
+         *    still delivers a stop while the run has work; it simply stops
+         *    outliving it.
+         */
+        const socket = new Socket({ fd, readable: true, writable: false });
+        socket.unref();
+        return socket;
+    });
+    try {
+        return readManagedControlChannel({
+            source: open(MANAGED_CONTROL_CHILD_FD),
+            onStop: requestManagedGracefulStop,
+            /*
+             * The failure that actually happens. A descriptor this runtime
+             * never opened constructs a stream fine and emits `error` on the
+             * first read — asynchronously, long after this `try` has returned.
+             * Unhandled, that is a fatal `error` event on the child.
+             */
+            onUnusable: deps.onUnusable,
+        });
+    } catch {
+        // Synchronous construction failed instead. Same conclusion: no
+        // channel, so nothing can end this run's input and the quiescence gate
+        // refuses `eof-unverified`. Not fatal, and not silently fine.
+        deps.onUnusable?.();
+        return null;
+    }
+}
+
+/**
+ * Tells the supervisor how this managed run ended, on the control descriptor.
+ *
+ * Written with `writeSync` rather than through a stream: this is the last
+ * thing the run does, and a buffered write would race the process leaving.
+ *
+ * A run with no channel simply cannot answer. That is not a failure to report
+ * — nothing asked it to stop — and the supervisor's own budget covers it.
+ */
+export function reportManagedStopOutcome(verdict: string, deps: {
+    write?: (fd: number, text: string) => void;
+    /**
+     * The native session this generation wrote, when it had one.
+     *
+     * Travels in the same frame as the verdict so the supervisor reads one
+     * observation rather than two it would have to pair up itself.
+     */
+    nativeId?: string | null;
+} = {}): boolean {
+    const write = deps.write ?? ((fd, text) => { writeSync(fd, text); });
+    /*
+     * The one thing that crosses this boundary, and until now it was invisible
+     * on both sides: the supervisor logs what it did with the verdict, never
+     * what the verdict was, and the child logged nothing at all. A refusal's
+     * cause then has to be deduced, and deduction is what kept being wrong.
+     *
+     * A closed code — the same vocabulary the channel carries.
+     */
+    logger.debug(`[managed] stop verdict ${/^[a-z-]{1,40}$/.test(verdict) ? verdict : 'unknown'}`);
+    try {
+        write(MANAGED_CONTROL_CHILD_FD, managedStopAck(verdict, deps.nativeId));
+        return true;
+    } catch {
+        // The channel is gone. Saying nothing is correct: the supervisor
+        // requires an ack it never received to be absent, not assumed.
+        return false;
+    }
 }

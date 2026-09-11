@@ -105,6 +105,17 @@ export type ManagedLaunchRegistry = {
             | { applicable: true; value: ManagedLaunchEncryption | null };
         now: number;
     }) => LaunchScopeVerdict;
+    /**
+     * 이 launch 가 보고할 수 있는 기한을 **연장한다**.
+     *
+     * 고정 창을 주면 그 뒤의 활동 보고가 전부 `launch-expired` 로 끊긴다 —
+     * 세션은 살아 있는데 daemon 이 활동을 못 보는 상태다. 반대로 무기한이면
+     * 보고 자격이 lease 보다 오래 산다. 그래서 기한은 **검증된 lease** 를
+     * 따라간다: 늘리는 것만 허용하고, 줄이거나 되살리지 않는다.
+     */
+    renew: (input: { launchId: string; expiresAt: number }) => boolean;
+    /** 끝난 launch 의 보고 자격을 즉시 거둔다. */
+    discard: (launchId: string) => void;
     get: (launchId: string) => ManagedLaunchRecord | null;
     /** 만료된 기록을 지운다. 지워진 launch 의 보고는 `unknown-launch` 다. */
     evictExpired: (now: number) => number;
@@ -195,6 +206,22 @@ export function createManagedLaunchRegistry(): ManagedLaunchRegistry {
 
             record.lastSeq = input.seq;
             return { ok: true, record };
+        },
+
+        renew({ launchId, expiresAt }) {
+            const record = records.get(launchId);
+            if (!record) return false;
+            if (!isSafePositiveInt(expiresAt)) return false;
+            // 늘리는 것만 한다. 줄이면 아직 유효한 자격을 임의로 잘라내는 것이고,
+            // 이미 지난 기록을 되살리는 것은 만료의 의미를 없앤다.
+            if (expiresAt <= record.expiresAt) return false;
+            records.set(launchId, { ...record, expiresAt });
+            return true;
+        },
+
+        discard(launchId) {
+            records.delete(launchId);
+            secrets.delete(launchId);
         },
 
         get(launchId) {

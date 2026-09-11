@@ -122,10 +122,23 @@ import {
   hydrateTrackedSessionFromPersisted,
   mergeTrackedSessionWebhook,
 } from './persistedSessionHydration';
-import { resolveManagedRuntimeIdentity } from './managedRuntimeIdentity';
+import { resolveManagedRuntimeIdentity, managedProvisioningPath } from './managedRuntimeIdentity';
 import { acquireManagedWriterLock } from './managedWriterLock';
+import {
+    inspectManagedDaemonStateLayout,
+    managedDaemonStateDir,
+} from './managedDaemonStateLayout';
 import { createManagedReceiptStore } from './managedReceiptStore';
-import { createManagedRpcHandlers, type ManagedRpcHandlers } from './managedRpcHandlers';
+import { createByosOfflineReceiveWiring } from '@/daemon/byosOfflineReceiveWiring';
+import { createManagedRpcHandlers, type ManagedRpcHandlers, type ManagedRuntimeFacts } from './managedRpcHandlers';
+import {
+  decideManagedStopRoute,
+  launchManagedSpawn,
+  stopManagedGeneration,
+} from './managedSpawnLaunch';
+import { createManagedLaunchRegistry } from './launch/managedLaunchRegistry';
+import { createManagedReportAuthority } from './launch/managedReportCredential';
+import { createManagedReportVerifier } from './launch/verifyManagedReport';
 import { teardownManagedRuntime as runManagedTeardown } from './managedTeardown';
 import { createAutomationStore } from './automations/automationStore';
 import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
@@ -226,8 +239,6 @@ import { captureAutonomousWorktreeFingerprint } from './autonomousQualityGateFin
 import { runAutonomousQualityGatePhase } from './autonomousQualityGateRunner';
 import { sendAutonomousQualityGateRepair } from './autonomousQualityGateMessageSender';
 import { createAutonomousQualityGateRpcHandlers } from './autonomousQualityGateRpc';
-import type { ManagedFilesystemFacts } from '@/managed/managedRuntimeFacts';
-import type { ManagedRestoreState } from '@/managed/managedRestoreState';
 import { resolveManagedFilesystemFacts } from '@/managed/managedRuntimeFacts';
 import { readManagedRestoreState } from '@/managed/managedRestoreState';
 import { resolveManagedVolumeBinding } from '@/managed/managedVolumeBinding';
@@ -238,9 +249,15 @@ import {
 } from '@/managed/managedRuntimeObserver';
 import { verifyOpenPathDevice } from '@/managed/managedRuntimeDurability';
 import { MANAGED_PROJECT_ROOT } from './managedRuntimeIdentity';
+import { createManagedSupervisorReadiness } from './managedSupervisorReadiness';
 import { readManagedLauncherBinding } from './launch/managedLauncherBinding';
-import { readManagedDaemonCredential } from './managedDaemonCredential';
+import {
+  readManagedDaemonCredential,
+  replaceManagedDaemonCredential,
+} from './managedDaemonCredential';
 import { readManagedCredentialAction } from './managedCredentialWatch';
+import { enforceLeaseRenewal } from './managedGenerationRearm';
+import { systemMonotonicNow } from '@/launcher/supervisor';
 import { createLauncherClient, createUnixSocketRequest } from './launch/launcherClient';
 import { defaultProvisioningDeps } from './managedRuntimeIdentity';
 
@@ -440,7 +457,8 @@ export async function startDaemon(): Promise<void> {
      * *before* the auth call rather than after it: after, a managed runtime
      * whose credential was missing would already have run the person's flow.
      */
-    const managedIdentity = resolveManagedRuntimeIdentity();
+    const managedMarkerPath = managedProvisioningPath();
+    const managedIdentity = resolveManagedRuntimeIdentity(managedMarkerPath);
     if (managedIdentity.status === 'refused') {
       throw new Error(
         `[managed] provisioning marker present but not trusted (${managedIdentity.reason}); refusing to start`,
@@ -502,11 +520,7 @@ export async function startDaemon(): Promise<void> {
      * asked again. A status that answered from a snapshot would keep saying
      * ready after the thing it described stopped being true.
      */
-    let managedRuntimeFacts: () => {
-      filesystem: ManagedFilesystemFacts;
-      restore: ManagedRestoreState;
-      isolation: { verified: boolean; backend: string };
-    } = () => ({
+    let managedRuntimeFacts: () => ManagedRuntimeFacts | Promise<ManagedRuntimeFacts> = () => ({
       filesystem: { ok: false, reason: 'root-not-mounted' },
       restore: { status: 'pending', checkpointId: null, manifestDigest: null },
       isolation: { verified: false, backend: 'privileged-launch-supervisor' },
@@ -564,17 +578,35 @@ export async function startDaemon(): Promise<void> {
         stateDir: managedIdentity.identity.stateDir,
         deps: defaultProvisioningDeps,
       });
+      let readinessLauncher: Parameters<typeof createManagedSupervisorReadiness>[0]['launcher'] = null;
       if (launcher.ok) {
-        managedFencingBackend = createLauncherClient({
+        const client = createLauncherClient({
           token: launcher.binding.token,
           deps: createUnixSocketRequest(launcher.binding.socketPath),
         });
+        managedFencingBackend = client;
+        readinessLauncher = { binding: launcher.binding, hello: client.hello };
         logger.debug('[managed] privileged launch backend bound');
       } else {
         // Named, not detailed: the reason is a fixed classifier, and the paths
         // and token behind it are not log material.
         logger.debug(`[managed] no privileged launch backend (${launcher.reason})`);
       }
+
+      const supervisorReadiness = createManagedSupervisorReadiness({
+        admitted: managedIdentity,
+        markerPath: managedMarkerPath,
+        launcher: readinessLauncher,
+      });
+      const observeSupervisorReadiness = async () => {
+        const observation = await supervisorReadiness.observe();
+        if (!observation.verified) {
+          try { logger.debug(`[managed] supervisor readiness ${observation.reason}`); }
+          catch { /* Diagnostic failure cannot change the readiness result. */ }
+        }
+        return observation;
+      };
+      await observeSupervisorReadiness();
 
       /*
        * The volume seal: written **once**, on the boot that observed it.
@@ -614,31 +646,34 @@ export async function startDaemon(): Promise<void> {
        * cannot say which volume it is on has nothing to compare a record to.
        */
       const bound = volume.ok ? volume.binding : null;
-      managedRuntimeFacts = () => ({
-        filesystem: bound === null
-          ? { ok: false, reason: 'volume-evidence-unavailable' }
-          : resolveManagedFilesystemFacts({
-            mountinfo: readMountinfoText() ?? '',
-            projectRoot: MANAGED_PROJECT_ROOT,
-            binding: bound,
-            readFsUuid: (device) => readFsUuidForDevice(device),
-            verifyOpenDevice: verifyOpenPathDevice,
-          }),
-        restore: bound === null
-          ? { status: 'pending', checkpointId: null, manifestDigest: null }
-          : readManagedRestoreState({
-            stateDir: identityForFacts.stateDir,
-            // The record is read **against the volume that is mounted now**,
-            // not against the one it claims to describe. A record beside a
-            // different filesystem is a record about something else.
-            volume: { volumeId: bound.providerVolumeId, deviceUuid: bound.fsUuid },
-            deps: defaultProvisioningDeps,
-          }),
-        isolation: {
-          verified: managedFencingBackend !== null,
-          backend: identityForFacts.isolation.backend,
-        },
-      });
+      managedRuntimeFacts = async () => {
+        const observation = await observeSupervisorReadiness();
+        return {
+          filesystem: bound === null
+            ? { ok: false, reason: 'volume-evidence-unavailable' }
+            : resolveManagedFilesystemFacts({
+              mountinfo: readMountinfoText() ?? '',
+              projectRoot: MANAGED_PROJECT_ROOT,
+              binding: bound,
+              readFsUuid: (device) => readFsUuidForDevice(device),
+              verifyOpenDevice: verifyOpenPathDevice,
+            }),
+          restore: bound === null
+            ? { status: 'pending', checkpointId: null, manifestDigest: null }
+            : readManagedRestoreState({
+              stateDir: identityForFacts.stateDir,
+              // The record is read **against the volume that is mounted now**,
+              // not against the one it claims to describe. A record beside a
+              // different filesystem is a record about something else.
+              volume: { volumeId: bound.providerVolumeId, deviceUuid: bound.fsUuid },
+              deps: defaultProvisioningDeps,
+            }),
+          isolation: {
+            verified: observation.verified,
+            backend: identityForFacts.isolation.backend,
+          },
+        };
+      };
       logger.debug(`[managed] runtime ${managedIdentity.identity.runtimeId} admitted`);
     }
     let machineAutomationKey = loadOrCreateMachineAutomationKey(configuration.automationKeyFile);
@@ -650,6 +685,84 @@ export async function startDaemon(): Promise<void> {
 
     // Setup state - key by PID
     const pidToTrackedSession = new Map<number, TrackedSession>();
+    /**
+     * Generations this daemon launched through the supervisor, by pid.
+     *
+     * The daemon's ordinary stop path signals a pid; for these it must not.
+     * Keeping the key here is what lets that path tell the two apart.
+     */
+    const managedGenerationForPid = new Map<number, { runId: string; attemptId: string; epoch: number }>();
+    /**
+     * Which launch each managed report is allowed to be. Filled between the
+     * supervisor's two phases and read by the control server's verifier.
+     */
+    const managedLaunchRegistry = createManagedLaunchRegistry();
+    /**
+     * The control server's port, read at launch rather than captured.
+     *
+     * The dispatch surface is built before the server is listening; a value
+     * captured here would be the one from before it had a port.
+     */
+    let managedControlPortValue = 0;
+    const managedControlPort = () => managedControlPortValue;
+    /** Who may report, keyed by generation. Revoked wherever one stops. */
+    const managedReportAuthority = createManagedReportAuthority({
+      discard: (launchId) => managedLaunchRegistry.discard(launchId),
+    });
+    /**
+     * The backend, with report authority revoked on every stop that reaches it.
+     *
+     * Wrapped rather than added at each call site: this is the one place every
+     * backend stop passes through, and a stop path that forgot to revoke is
+     * exactly the gap this closes. Revoked **before** the stop is requested —
+     * after it, a report racing the request would still be admitted.
+     */
+    const managedReportRevokingBackend = (
+      backend: NonNullable<typeof managedFencingBackend>,
+    ) => ({
+      ...backend,
+      requestStop: async (input: { runId: string; attemptId: string; epoch: number; pgid: number | null }) => {
+        managedReportAuthority.revoke(input);
+        return backend.requestStop(input);
+      },
+    });
+    /**
+     * The wall-clock instant a launch may report until: its write lease, and
+     * nothing added to it.
+     *
+     * An earlier version put a floor under this so a nearly-expired lease still
+     * left the child room to say it started. That floor could exceed the lease,
+     * which is authority to report for a generation that has lost the right to
+     * write — the very thing binding to the lease was meant to prevent. A lease
+     * with no room left is a launch that should not have happened, and
+     * `prepare` already refuses one that is gone.
+     */
+    /**
+     * The one monotonic clock the managed daemon reads.
+     *
+     * `leaseExpiresMonotonic` crosses to the supervisor, which enforces it
+     * against `systemMonotonicNow` (`/proc/uptime`, system-wide). The daemon
+     * used `process.hrtime.bigint()` — also monotonic, but read from a
+     * different clock domain (`CLOCK_MONOTONIC`) with its own arbitrary
+     * origin, and one that counts suspension differently from boot-time
+     * uptime. Neither origin is knowable from the other, so two readers of the
+     * same deadline are comparing two different numbers; that is not a skew
+     * that averages out, it is two different deadlines. Reading one shared
+     * function removes the assumption rather than estimating the offset.
+     * (No Fly suspend has been reproduced here — the domains differ on paper
+     * and that is enough reason not to mix them.)
+     *
+     * Both daemon sites read this, so they cannot drift apart from each other
+     * either — moving only one would extend report authority past the lease
+     * it is supposed to be bound to.
+     */
+    const managedMonotonicNow = (): number => systemMonotonicNow();
+    const managedReportExpiryFor = (leaseExpiresMonotonic: number): number =>
+      Date.now() + (leaseExpiresMonotonic - managedMonotonicNow());
+    const managedReportVerifier = createManagedReportVerifier({
+      registry: managedLaunchRegistry,
+      now: Date.now,
+    });
     // Only placeholders restored from the previous daemon belong here. A new
     // spawn in this process still has a live webhook awaiter and must retain
     // PENDING_SPAWN_OWNER protection until that webhook arrives.
@@ -2361,6 +2474,11 @@ export async function startDaemon(): Promise<void> {
     // Local idle guard config for policy-initiated (if-idle) stops. Read once;
     // env overrides are picked up on daemon restart, same as other knobs.
     const idleStopGuardConfig = readIdleStopGuardConfig(process.env);
+    /**
+     * On a managed runtime every session is a managed generation, so no session
+     * here may be stopped by signalling its pid.
+     */
+    const managedRuntimeActive = managedIdentity.status === 'active';
     // Recovered sessions haven't had a chance to report runtime to this daemon
     // yet — the guard measures their report silence from this moment, not from
     // their (possibly days-old) session start.
@@ -2416,6 +2534,59 @@ export async function startDaemon(): Promise<void> {
 
           autonomousQualityGateRegistry.noteSessionStopped(session.happySessionId ?? sessionId);
           preserveSessionForResume(session, `stop-session:${context?.source ?? mode}`);
+
+          const managedRoute = decideManagedStopRoute({
+            managedRuntimeActive,
+            key: managedGenerationForPid.get(pid),
+          });
+          const managedKey = managedRoute.route === 'supervisor' ? managedRoute.key : undefined;
+          if (managedRoute.route === 'refuse') {
+            /*
+             * A managed runtime's sessions are managed generations. This one is
+             * not in the map — a daemon restart hydrates tracked sessions from
+             * disk but not the generation identity, which is the supervisor's
+             * to hold. Falling through would signal the pid, which stops
+             * neither the generation's tools nor its broker and proves nothing.
+             *
+             * Refused rather than guessed: `managed:stop` carries the verified
+             * run identity and is the way to stop it.
+             */
+            logger.debug(`[managed] refusing a PID-only stop for ${sessionId}: generation identity unknown`);
+            return { stopped: false, reason: 'managed-generation', detail: managedRoute.detail };
+          }
+          if (managedKey) {
+            /*
+             * `process.kill(pid)` here would be a lie in two directions: the
+             * generation's tools run in its cgroup under a different uid and
+             * would survive, and nothing observes emptiness, so a "stopped"
+             * would be reported for a run still holding the volume. The
+             * supervisor kills the generation and proves it empty, and the
+             * launcher takes that run's broker down with it.
+             *
+             * Tracking is left in place. Removing it on an unproven stop is
+             * how a live child becomes invisible to the next sweep.
+             */
+            // Stopped generations do not get to keep reporting.
+            managedReportAuthority.revoke(managedKey);
+            void stopManagedGeneration({ backend: managedFencingBackend, key: managedKey })
+              .then((outcome) => {
+                logger.debug(
+                  `[managed] supervisor stop for ${sessionId}: stopped=${outcome.stopped} detail=${outcome.detail}`,
+                );
+              })
+              /*
+               * The transport can reject. Left unhandled it takes the daemon
+               * down (a single unhandled rejection is fatal here), and the
+               * failure would be invisible either way. Tracking stays, so the
+               * next stop or sweep tries again.
+               */
+              .catch((error) => {
+                logger.debug(
+                  `[managed] supervisor stop for ${sessionId} failed: ${error instanceof Error ? error.name : 'unknown'}`,
+                );
+              });
+            return { stopped: false, reason: 'managed-generation', detail: 'supervisor-stop-requested' };
+          }
 
           if (session.startedBy === 'daemon' && session.childProcess) {
             try {
@@ -2648,8 +2819,20 @@ export async function startDaemon(): Promise<void> {
       // 제어 서버의 파일 접근도 같은 잠금 정책을 따른다(HAPPY_RPC_ALLOWED_ROOT).
       allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
       managedRuntime: managedIdentity.status === 'active',
+      /*
+       * Without this the control server refuses every managed report with
+       * `no-launch-verifier` — the loopback bearer is readable by the agent's
+       * own tools, so a report is only trusted once the launch registry says
+       * which launch made it. The registry is filled at `register`, between
+       * the supervisor's two phases, so a report can only arrive after the
+       * launch it claims exists.
+       */
+      verifyManagedReport: async (claim) => managedReportVerifier(claim),
       getMachineEncryption: () => machineEncryptionForTerminalWs,
     });
+
+    // The managed launch path hands this to each child with its credential.
+    managedControlPortValue = controlPort;
 
     // Write initial daemon state (no lock needed for state file)
     const fileState: DaemonLocallyPersistedState = {
@@ -2824,56 +3007,282 @@ export async function startDaemon(): Promise<void> {
     // during early bootstrap; this only builds what needs `spawnSession`.
     if (managedIdentity.status === 'active') {
       const identity = managedIdentity.identity;
-      const store = createManagedReceiptStore(identity.stateDir, {
+      /*
+       * The layout is read **before** the store is opened, under the writer lock
+       * this startup already holds (acquired during early bootstrap). A runtime
+       * whose receipts or lease are still in the state root is refused rather
+       * than migrated: several renames cannot promise "nothing moved" when one
+       * fails, and an empty leaf beside a populated old layout would restart
+       * receipt de-duplication and read epoch 0 / seq 0 — re-admitting spent
+       * requests and accepting superseded leases. Nothing here moves, rewrites
+       * or re-owns a byte.
+       */
+      const layout = inspectManagedDaemonStateLayout(identity.stateDir);
+      if (!layout.usable) {
+        throw new Error(`managed daemon state layout refused: ${layout.reason} (${layout.detail})`);
+      }
+      const store = createManagedReceiptStore(managedDaemonStateDir(identity.stateDir), {
         assertHeld: (action) => {
           if (!managedWriterLockHeld) {
             throw new Error(`managed writer lock not held; refusing ${action}`);
           }
         },
       });
+      /*
+       * Captured so the checkpoint hand-off keeps the backend the guard
+       * tested. The variable is settled during boot, but a closure that reads
+       * it later would be answering with whatever it holds then, and this one
+       * decides whether a parent-issued credential reaches the inbox at all.
+       */
+      const checkpointTargetBackend = managedFencingBackend;
       const managedHandlers = createManagedRpcHandlers({
         identity,
         store,
-        // The managed path reuses the existing spawn implementation rather than
-        // duplicating it; only admission and bookkeeping are new.
-        spawn: async (request, context) => {
+        /*
+         * The managed path does **not** reuse `spawnSession`. That is the
+         * ordinary daemon spawn — a detached `happy` child in the daemon's own
+         * environment, with no broker, no provider plan and no separate
+         * executor uid. It goes through the supervisor's two-phase launch
+         * instead, and refuses when there is no supervisor to go through.
+         *
+         * The session already exists: the envelope carries the id the parent
+         * created along with that session's own initial prompt, so nothing
+         * here creates a session or delivers a prompt.
+         */
+        spawn: async (_request, context) => {
           logger.debug(
             `[managed] launching run=${context.runId} attempt=${context.attemptId} epoch=${context.epoch}`,
           );
-          const result = await spawnSession({
-            directory: request.directory,
-            agent: request.agent as SpawnSessionOptions['agent'],
-            // Forced here from the verified dispatch context, not taken from
-            // `request`: the caller does not get to choose whether its own
-            // prompt delivery is confirmed.
-            requireInitialPromptAck: true,
-            ...(request.environmentVariables ? { environmentVariables: request.environmentVariables } : {}),
-            ...(request.initialPrompt ? { initialPrompt: request.initialPrompt } : {}),
-            ...(request.initialPromptLocalId ? { initialPromptLocalId: request.initialPromptLocalId } : {}),
+          return launchManagedSpawn({
+            backend: managedFencingBackend,
+            context,
+            /*
+             * The child runs as a different uid and cannot read this daemon's
+             * state file to find the port, so the address travels with the
+             * launch credential instead. Loopback only.
+             */
+            reportBaseUrl: `http://127.0.0.1:${managedControlPort()}`,
+            // Between the phases: the child is parked and has a pid, and has
+            // not exec'd yet.
+            register: ({ pid, sessionId, launchId, secret, encryption }) => {
+              /*
+               * Registered before the release, with the session the parent
+               * created. Letting the first report choose the session would let
+               * a child holding this launch's capability nail down another
+               * Run's session as its own.
+               */
+              managedLaunchRegistry.register({
+                launchId,
+                scope: {
+                  operationKey: context.operationKey,
+                  runId: context.runId,
+                  attemptId: context.attemptId,
+                  epoch: context.epoch,
+                  workspaceId: context.workspaceId,
+                  projectId: context.projectId,
+                },
+                sessionId,
+                hostPids: [pid],
+                // From the envelope, not from whatever the first report says.
+                encryption,
+                /*
+                 * Tied to this generation's write lease, not to a window of my
+                 * own choosing. A fixed window cuts every activity report after
+                 * it — the session is alive and the daemon stops seeing it — and
+                 * an open-ended one outlives the right to write. The lease is
+                 * the authority, so the report authority follows it.
+                 */
+                expiresAt: managedReportExpiryFor(context.leaseExpiresMonotonic),
+                secret,
+              });
+              managedReportAuthority.grant({ key: context, pid, launchId });
+              const trackedSession: TrackedSession = {
+                startedBy: 'daemon',
+                directory: context.envelope.directory,
+                happySessionId: sessionId,
+                pid,
+              };
+              pidToTrackedSession.set(pid, trackedSession);
+              sessionStartTimes.set(pid, Date.now());
+              managedGenerationForPid.set(pid, {
+                runId: context.runId, attemptId: context.attemptId, epoch: context.epoch,
+              });
+              persistTrackedSessions();
+            },
+            unregister: ({ pid }) => {
+              // The launch never happened; its report authority goes with it.
+              managedReportAuthority.revoke(context);
+              pidToTrackedSession.delete(pid);
+              sessionStartTimes.delete(pid);
+              managedGenerationForPid.delete(pid);
+              persistTrackedSessions();
+            },
+            /*
+             * The same webhook wait the ordinary spawn path uses: the child
+             * POSTs `/session-started` with its pid and the daemon resolves
+             * the awaiter. Reporting success before that would report a run
+             * for a child that may never have got past `execve`.
+             */
+            waitForChildReady: async (pid) => {
+              const result = await waitForSessionWebhook({ pid, pidToAwaiter, label: '(managed)', logger });
+              if (result.type === 'success' && result.sessionId) {
+                return { ready: true, sessionId: result.sessionId };
+              }
+              // The child's message is not carried back: it is the daemon's
+              // own text, but the managed caller gets codes only.
+              return { ready: false, detail: 'session-webhook-unconfirmed' };
+            },
           });
-          if (result.type === 'success' && result.sessionId) {
-            const tracked = findTrackedSessionById(result.sessionId);
-            if (tracked?.pid) return { type: 'success', sessionId: result.sessionId, pid: tracked.pid };
-            // The session exists but its pid was never seen: reporting an error
-            // without `started: false` keeps it reconcilable instead of closed.
-            return { type: 'error', errorMessage: 'session started without a tracked pid' };
-          }
-          if (result.type === 'requestToApproveDirectoryCreation') {
-            return { type: 'error', errorMessage: 'directory approval required', started: false };
-          }
-          return { type: 'error', errorMessage: 'spawn failed' };
         },
         // The daemon asks; the supervisor decides and proves. Absent when the
         // boot path bound none, and every path that needs a proof then refuses.
-        ...(managedFencingBackend ? { fencingBackend: managedFencingBackend } : {}),
+        ...(managedFencingBackend ? { fencingBackend: managedReportRevokingBackend(managedFencingBackend) } : {}),
+        /*
+         * Parent → daemon → supervisor → the checkpoint session's inbox. The
+         * daemon holds the RPC but not the drain: the inbox lives beside the
+         * tool session in the supervisor process, so the target crosses the
+         * process boundary as bytes and the far side's answer is passed back
+         * unfolded — a refusal there must not read here as an acceptance.
+         *
+         * Absent when no supervisor is wired, which `managed:checkpoint`
+         * reports as `capability-unavailable` rather than accepting a target
+         * that has nowhere to go.
+         */
+        ...(checkpointTargetBackend ? {
+          acceptCheckpointTarget: (target: Record<string, unknown>, dispatchToken: string) =>
+            checkpointTargetBackend.pushCheckpointTarget(target, dispatchToken),
+        } : {}),
+        /*
+         * A generation's report authority lives exactly as long as its right to
+         * write. Without this the registry entry lapses at the first lease and
+         * every activity report after it is refused — the session is alive and
+         * the daemon stops seeing it.
+         *
+         * A runtime lease names no run and widens the window for every
+         * generation, so it renews all of them.
+         */
+        onLeaseRenewed: async ({
+          runId, attemptId, epoch, leaseExpiresMonotonic, renewalSeq, grant,
+        }) => {
+          /*
+           * And every generation's own deadline, which is a different clock.
+           *
+           * The supervisor arms a watchdog per generation at launch, from the
+           * lease that was live then, and the only thing that moves it is the
+           * IPC `renew`. Renewing here moved the report authority and nothing
+           * else, so that watchdog still fired at the spawn-time deadline and
+           * killed a generation whose right to write had been extended —
+           * measured to `launch + leaseMs` within 9ms.
+           *
+           * **Runtime-scoped grants are the ones that matter.** The parent only
+           * ever sends `managed:runtime-lease`; nothing in the product sends
+           * the run-scoped `managed:lease`. A re-arm that required a `runId`
+           * therefore never ran outside a harness, which is exactly how this
+           * looked fixed while the product still killed every generation at
+           * its spawn deadline. A runtime lease names no run because it widens
+           * the window for **all** of them, so all of them are re-armed.
+           *
+           * A checkpoint is the worst place for the kill to land: `cgroup.kill`
+           * arrives as the exit the quiescence gate was waiting for, and the
+           * proof is destroyed by the runtime enforcing a lease that is no
+           * longer the current one.
+           */
+          /*
+           * One call. What it decides — relay the parent's statement before any
+           * generation is re-armed, and treat a refusal at either step as an
+           * enforcement refusal — lives in `managedGenerationRearm.ts` where a
+           * test can reach it without booting a daemon.
+           *
+           * On a null backend: a successful managed boot writes the launcher
+           * binding before READY (`managedRuntimeBoot.ts:623-652`,
+           * `src/main.ts:139-160`, `docker/managed-runtime/entrypoint:95-141`)
+           * and the daemon reads it into a client at `run.ts:582-595`; without
+           * it the daemon still starts but `isolation.verified` is false
+           * (`:656`) and the spawn backend is unavailable. So a null backend is
+           * a degraded or refused state rather than a supported ready path.
+           * A non-null one is not proof of a live listener either — the F2
+           * hello that would is still pending.
+           */
+          return enforceLeaseRenewal({
+            grant,
+            lease: { epoch, runId, attemptId, renewalSeq, leaseExpiresMonotonic },
+            backend: managedFencingBackend,
+            liveGenerations: () => [...managedGenerationForPid.values()],
+            onRefused: (code: string) => logger.debug(`[managed] lease renewal refused ${code}`),
+          });
+        },
+        /*
+         * Report capability follows the lease, and only once the lease is on
+         * disk.
+         *
+         * It used to be published at the top of `onLeaseRenewed`, before the
+         * enforcement answer and before the write: a refused renewal still
+         * widened this runtime's right to report, and a failed write left that
+         * right extended past a lease this runtime never recorded — `Astra`
+         * reproduced the second as `isLeaseValid()` true past the old deadline
+         * after a `disk-full` throw.
+         *
+         * This hook runs after `store.writeLease`, so both are closed: nothing
+         * is published for a refusal, and nothing is published for a lease that
+         * did not persist.
+         */
+        onLeaseCommitted: ({ runId, attemptId, epoch, leaseExpiresMonotonic }) => {
+          const expiresAt = managedReportExpiryFor(leaseExpiresMonotonic);
+          const scope = runId !== undefined && attemptId !== undefined
+            ? { runId, attemptId, epoch }
+            : { epoch };
+          for (const launchId of managedReportAuthority.launchIdsFor(scope)) {
+            managedLaunchRegistry.renew({ launchId, expiresAt });
+          }
+        },
+        /*
+         * The common termination path: stop RPC, promotion fence and lease
+         * expiry all reach it, and it runs **before** the backend is asked, so
+         * a report already in flight cannot land after the child is gone and
+         * re-register state for a generation that no longer exists.
+         */
+        onGenerationTerminated: (key) => { managedReportAuthority.revoke(key); },
         isPidAlive,
         now: Date.now,
-        monotonicNow: () => Number(process.hrtime.bigint() / 1_000_000n),
+        // The same clock the supervisor enforces against; see
+        // `managedMonotonicNow`.
+        monotonicNow: managedMonotonicNow,
         // What this runtime can say about itself, read fresh on every status
         // request rather than captured once: a volume can be lost and an
         // isolation backend can stop answering, and a cached "ready" would
         // outlive both.
         runtimeFacts: () => managedRuntimeFacts(),
+        /*
+         * Takes a renewed bearer for the Machine this runtime already is.
+         *
+         * The judging belongs to the credential module: it carries the machine
+         * key, the account key and the origin forward from the stored record
+         * and refuses anything that is not this Machine, this origin, and
+         * strictly later. This wiring supplies only where the file lives and
+         * which Machine the **marker** says this is — never the request.
+         *
+         * On success the live socket takes it up too. `replaceToken` re-auths
+         * by dropping the connection so the reconnect presents the new bearer:
+         * the server revalidates the grant on every event against the token the
+         * handshake carried, so a socket still presenting the superseded one
+         * starts being refused immediately. Writing the file alone would leave
+         * a runtime that looks connected while everything it asks for fails.
+         *
+         * Only after the write. A socket re-authed with a bearer that was then
+         * refused for the disk would be presenting a credential this runtime
+         * does not have.
+         */
+        replaceCredential: async (replacement) => {
+          const outcome = await replaceManagedDaemonCredential({
+            stateDir: identity.stateDir,
+            expectedMachineId: identity.happyMachineId,
+            replacement,
+            now: Date.now(),
+            deps: defaultProvisioningDeps,
+          });
+          if (outcome.ok) apiMachine.replaceToken(replacement.token);
+          return outcome;
+        },
       });
       // Installed before setRPCHandlers so the allowlist sweeps the handlers
       // the constructor already registered and intercepts the rest.
@@ -3171,8 +3580,57 @@ export async function startDaemon(): Promise<void> {
       logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
     });
 
+    /*
+     * The BYOS offline receiver.
+     *
+     * Absent when no parent origin is configured, and that is deliberate: the
+     * adapter returns `undefined` rather than a handler that can only hold, so
+     * an unconfigured deployment registers nothing instead of looking like a
+     * queue that never drains.
+     *
+     * `unknown` is not `refused`. A refusal means the request never went out and
+     * the parent may re-queue it; `unknown` means nobody can say, and the parent
+     * must put it in front of a person. Only a receipt the server acknowledged
+     * counts as accepted.
+     *
+     * Not registered on a managed runtime. This receiver posts as the account
+     * (`readAccountToken`), and a managed runtime's `credentials.token` is a
+     * managed-daemon token, not an account one — registering here would offer a
+     * surface whose every delivery fails at the server, and would do it with a
+     * bearer minted for a different purpose. Managed dispatch keeps its own
+     * principal gate; nothing about it changes.
+     */
+    const byosOfflineReceive = managedRuntimeActive ? undefined : createByosOfflineReceiveWiring({
+      machineId,
+      happyHomeDir: configuration.happyHomeDir,
+      serverUrl: configuration.serverUrl,
+      readAccountToken: () => credentials.token,
+      parentConfigUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+      findTrackedSession: (sessionId) => findTrackedSessionById(sessionId) ?? null,
+      // The same per-session resume the follow-up runner uses; `resumeSession`
+      // is this scope's closure, not a free function.
+      ensureSessionRunning: async ({ sessionId }) => {
+        const result = await resumeSession(sessionId);
+        /*
+         * The resume's own classifier, never its message. `errorMessage` is
+         * free text assembled from whatever failed — a path, a spawn error, a
+         * lookup fault — and this value travels back to the parent. The union
+         * is closed: `code` for a refusal, and the result `type` for the one
+         * other shape (`requestToApproveDirectoryCreation`), which is not an
+         * error and must not be reported as one without saying which it was.
+         */
+        return result.type === 'success'
+          ? { ok: true }
+          : { ok: false, error: result.type === 'error' ? result.code : result.type };
+      },
+      onWakeFailed: ({ sessionId, reason }) => logger.debug(
+        `[DAEMON RUN] byos-offline delivered but could not wake ${sessionId}: ${reason}`,
+      ),
+    });
+
     // Set RPC handlers
     apiMachine.setRPCHandlers({
+      byosOfflineReceive,
       spawnSession,
       resumeSession,
       recoverSession,

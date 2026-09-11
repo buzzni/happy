@@ -2,15 +2,15 @@ import { createHash, randomBytes } from 'node:crypto';
 import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createManagedCheckpointRunner } from './managedCheckpointRunner';
 import { createManagedToolRuntime } from '@/launcher/managedToolRuntime';
-import { MANAGED_WRITE_TOOLS } from '@/launcher/toolWorkload';
+import { MANAGED_WRITE_TOOLS } from '@/launcher/managedToolCatalogue';
 
 const created: string[] = [];
 const key = randomBytes(32);
-const tenant = { companyId: 'co_1', projectId: 'pr_1' };
+const tenant = { tenantId: 'co_1', projectId: 'pr_1' };
 const volume = { volumeId: 'vol_1', deviceUuid: 'dev-1' };
 
 async function scratch(): Promise<string> {
@@ -83,7 +83,7 @@ async function runnerFor(store: ReturnType<typeof fakeStore>) {
     return {
         root,
         runner: createManagedCheckpointRunner({
-            tenant, volume, image: { imageVersion: 'img@1' },
+            tenant, volume: () => volume, image: { imageVersion: 'img@1' },
             sources: [{ area: 'project', root }],
             workDir: join(await scratch(), 'work'),
             drainBudgetMs: 1000,
@@ -132,7 +132,7 @@ describe('createManagedCheckpointRunner', () => {
         const root = await scratch();
         await writeFile(join(root, 'file.txt'), 'contents\n');
         const runner = createManagedCheckpointRunner({
-            tenant, volume, image: { imageVersion: 'img@1' },
+            tenant, volume: () => volume, image: { imageVersion: 'img@1' },
             sources: [{ area: 'project', root }],
             workDir,
             drainBudgetMs: 1000,
@@ -225,5 +225,78 @@ describe('createManagedCheckpointRunner', () => {
             .rejects.toMatchObject({ code: 'object-exists' });
         expect(runner.checkpointDrain.drain.isDraining()).toBe(false);
         expect(() => runner.checkpointDrain.drain.beginWrite()).not.toThrow();
+    });
+});
+
+describe('what the runner actually hands the publisher', () => {
+    /*
+     * Behavioural, not structural. The type can carry `providerStateScope` and
+     * the runner can still drop it on the floor while everything compiles, so
+     * this captures the publisher's real input through the module seam the
+     * runner already imports - no production hook added for the test.
+     */
+    const NATIVE = '330a1f93-cda9-4080-89a3-c780c9ade479';
+    const scope = {
+        version: 1 as const,
+        provider: 'claude' as const,
+        capability: 'native-resume' as const,
+        generation: {
+            projectId: 'proj-1', workspaceId: 'ws-1', runtimeId: 'runtime-1',
+            epoch: 3, provisioningOperationId: 'op-1',
+        },
+        sources: [{
+            attemptId: 'attempt-1', runId: 'run-1', happySessionId: 'sess-1',
+            runtimeId: 'runtime-1', epoch: 3, currentNativeId: NATIVE,
+            retainedNativeIds: [], metadataVersion: 1,
+        }],
+    };
+
+    it('shouldForwardTheScopeItWasGiven', async () => {
+        const captured: Array<Record<string, unknown>> = [];
+        vi.doMock('./managedCheckpointPublisher', async () => {
+            const actual = await vi.importActual<typeof import('./managedCheckpointPublisher')>(
+                './managedCheckpointPublisher',
+            );
+            return {
+                ...actual,
+                publishManagedCheckpoint: async (input: Record<string, unknown>) => {
+                    captured.push(input);
+                    throw new Error('stop here: only the input is under test');
+                },
+            };
+        });
+        vi.resetModules();
+        const { createManagedCheckpointRunner: create } = await import('./managedCheckpointRunner');
+
+        const root = await scratch();
+        await writeFile(join(root, 'file.txt'), 'work\n');
+        const runner = create({
+            tenant: { tenantId: 't', projectId: 'p' },
+            volume: () => ({ volumeId: 'v', deviceUuid: 'd' }),
+            image: { imageVersion: 'img@1' },
+            sources: [{ area: 'project', root }],
+            workDir: join(await scratch(), 'work'),
+            drainBudgetMs: 1000,
+            writeTools: MANAGED_WRITE_TOOLS,
+            flushDeps: { run: async () => ({ code: 0, stdout: '0|0|0' }) },
+            now: () => 1,
+            fetchImpl: (async () => new Response(null, { status: 200 })) as never,
+        });
+
+        await runner.takeCheckpoint({
+            checkpointId: 'a'.repeat(64),
+            key: Buffer.alloc(32, 1),
+            targets: {
+                objects: new Map([['project', { putUrl: 'https://s/p?put', headUrl: 'https://s/p?head' }]]),
+                manifest: { putUrl: 'https://s/m?put', headUrl: 'https://s/m?head' },
+                pointer: { putUrl: 'https://s/ptr?put', getUrl: 'https://s/ptr?get' },
+            },
+            providerStateScope: scope,
+        }).catch(() => undefined);
+
+        expect(captured).toHaveLength(1);
+        expect(captured[0]!.providerStateScope).toEqual(scope);
+        vi.doUnmock('./managedCheckpointPublisher');
+        vi.resetModules();
     });
 });

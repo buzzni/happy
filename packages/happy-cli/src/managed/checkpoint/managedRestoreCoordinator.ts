@@ -88,7 +88,7 @@ function failureCode(error: unknown, fallback: string): string {
 export async function coordinateManagedRestore(input: {
     /** This generation. Everything below its epoch must be proven stopped. */
     key: { runId: string; attemptId: string; epoch: number };
-    tenant: { companyId: string; projectId: string };
+    tenant: { tenantId: string; projectId: string };
     /** The volume being restored onto, from the machine's boot input. */
     targetVolume: { volumeId: string; deviceUuid: string };
     stagingRoot: string;
@@ -102,7 +102,7 @@ export async function coordinateManagedRestore(input: {
         objects: Map<CheckpointArea, string>;
         key: Buffer;
         expected: {
-            tenant: { companyId: string; projectId: string };
+            tenant: { tenantId: string; projectId: string };
             targetVolume: { volumeId: string; deviceUuid: string };
         };
         destinations: Map<CheckpointArea, string>;

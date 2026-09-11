@@ -112,14 +112,14 @@ describe('a managed startup', () => {
 
     it('is not started at all when nothing points at an envelope', async () => {
         const { readManagedStartup } = await import('@/managed/managedStartup');
-        await expect(readManagedStartup({}, Date.now())).resolves.toBeNull();
+        await expect(readManagedStartup({}, Date.now(), serverUrl)).resolves.toBeNull();
         expect(seen).toEqual([]);
     });
 
     it('reads the envelope off the descriptor and consumes the variable', async () => {
         const { readManagedStartup } = await import('@/managed/managedStartup');
         const env: NodeJS.ProcessEnv = { HAPPY_MANAGED_BOOTSTRAP_FD: String(anonymousFd(envelopeJson())) };
-        const startup = await readManagedStartup(env, Date.now());
+        const startup = await readManagedStartup(env, Date.now(), serverUrl);
 
         expect(startup).not.toBeNull();
         expect(startup!.envelope.agent).toBe('claude');
@@ -136,7 +136,7 @@ describe('a managed startup', () => {
 
     it('refuses a descriptor variable that is not a number, without looking anything up', async () => {
         const { readManagedStartup } = await import('@/managed/managedStartup');
-        await expect(readManagedStartup({ HAPPY_MANAGED_BOOTSTRAP_FD: 'nine' }, Date.now()))
+        await expect(readManagedStartup({ HAPPY_MANAGED_BOOTSTRAP_FD: 'nine' }, Date.now(), serverUrl))
             .rejects.toThrow(/descriptor/i);
         expect(seen).toEqual([]);
     });
@@ -145,7 +145,7 @@ describe('a managed startup', () => {
         const { readManagedStartup } = await import('@/managed/managedStartup');
         const { ApiClient } = await import('@/api/api');
         const startup = await readManagedStartup(
-            { HAPPY_MANAGED_BOOTSTRAP_FD: String(anonymousFd(envelopeJson())) }, Date.now(),
+            { HAPPY_MANAGED_BOOTSTRAP_FD: String(anonymousFd(envelopeJson())) }, Date.now(), serverUrl,
         );
         const api = ApiClient.managed(startup!.attachment);
         seen = [];
@@ -164,7 +164,7 @@ describe('a managed startup', () => {
         const { readManagedStartup } = await import('@/managed/managedStartup');
         const { ApiClient } = await import('@/api/api');
         const startup = await readManagedStartup(
-            { HAPPY_MANAGED_BOOTSTRAP_FD: String(anonymousFd(envelopeJson())) }, Date.now(),
+            { HAPPY_MANAGED_BOOTSTRAP_FD: String(anonymousFd(envelopeJson())) }, Date.now(), serverUrl,
         );
         const api = ApiClient.managed(startup!.attachment);
         const client = api.sessionSyncClient(startup!.attachment.session);
@@ -183,7 +183,7 @@ describe('a managed startup', () => {
             await import('@/managed/managedStartup');
         const { readManagedStartup } = await import('@/managed/managedStartup');
         const startup = await readManagedStartup(
-            { HAPPY_MANAGED_BOOTSTRAP_FD: String(anonymousFd(envelopeJson())) }, Date.now(),
+            { HAPPY_MANAGED_BOOTSTRAP_FD: String(anonymousFd(envelopeJson())) }, Date.now(), serverUrl,
         );
 
         // A launch environment carrying somebody else's prompt and model.

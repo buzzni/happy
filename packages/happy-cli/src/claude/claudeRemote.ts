@@ -1,4 +1,11 @@
 import { EnhancedMode } from "./loop";
+import { endManagedTurnInput } from '@/managed/managedGracefulStop';
+
+/**
+ * How long a managed provider gets to leave on its own once its turn's input
+ * has ended, before anything forces it.
+ */
+const MANAGED_TURN_END_INPUT_BUDGET_MS = 30_000;
 import { spawn } from 'node:child_process';
 import { bindManagedQueryOptions } from '@/launcher/managedClaudeOptions'
 import { query, type QueryOptions, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
@@ -41,6 +48,25 @@ export async function claudeRemote(opts: {
     managedSettingsLockdown?: boolean,
     /** 관리 실행인가. 마지막 경계에서 계획을 덮을지 정한다. */
     managedRun?: boolean,
+    /**
+     * Watches the process the SDK spawns, for a managed run's EOF proof.
+     *
+     * Separate from `completeTurn`'s writer tree: that one is about tool
+     * writes, this one is about whether the provider's own process finished on
+     * its own. Optional, and its absence means the runtime cannot prove that —
+     * which the quiescence gate turns into a refusal, never into a pass.
+     */
+    /** Called when this turn's input ended by exhaustion rather than a kill. */
+    onInputExhausted?: () => void,
+    /** How long the provider gets to leave on its own after its input ends. */
+    turnEndInputBudgetMs?: number,
+    providerExitObserver?: {
+        watch: (child: { once: (event: 'exit', handler: (code: number | null, signal: string | null) => void) => unknown }) => void,
+        /** Called at every kill or cancellation boundary, before any signal. */
+        markForced: () => void,
+        /** Code 0, no signal, nothing having asked it to die. */
+        exitedCleanly: () => boolean,
+    },
     claudeArgs?: string[],
     allowedTools: string[],
     signal?: AbortSignal,
@@ -228,7 +254,16 @@ export async function claudeRemote(opts: {
         settingsPath: opts.hookSettingsPath,
         promptSuggestions: true,
         sandbox: providerSandbox,
-        spawnClaudeCodeProcess: writerProcessTree
+        /*
+         * Installed for a managed run as well as for checkpoint protection.
+         *
+         * A managed run needs the SDK's **own** process exit, observed from
+         * the child object: the installed SDK's `waitForExit()` returns early
+         * once `process.killed` is set, and Node sets that when a signal is
+         * delivered rather than when the process dies. This seam is the only
+         * place that holds the object the kernel reports to.
+         */
+        spawnClaudeCodeProcess: (writerProcessTree || opts.providerExitObserver)
             ? (spawnOptions) => {
                 const child = spawn(spawnOptions.command, spawnOptions.args, {
                     cwd: spawnOptions.cwd,
@@ -237,7 +272,11 @@ export async function claudeRemote(opts: {
                     detached: true,
                     stdio: ['pipe', 'pipe', 'inherit'],
                 });
-                writerProcessTree.track(child);
+                writerProcessTree?.track(child);
+                // Per process, not per session: a restart is a different
+                // process, and the exit that matters is the one this run's
+                // provider actually had.
+                opts.providerExitObserver?.watch(child);
                 return child as NonNullable<QueryOptions['spawnClaudeCodeProcess']> extends (...args: any[]) => infer Result
                     ? Result
                     : never;
@@ -410,12 +449,62 @@ export async function claudeRemote(opts: {
                 }
 
                 if (opts.completeTurn) {
-                    messages.end();
-                    const applyResult = await opts.completeTurn(() => {
+                    const applyResult = await opts.completeTurn(async () => {
                         if (!writerProcessTree) {
                             throw new Error('checkpoint writer process tree is unavailable');
                         }
-                        return writerProcessTree.quiesce(() => response.close());
+                        /*
+                         * The input ends here, and the provider is given the
+                         * chance to leave on its own before anything kills it.
+                         *
+                         * This used to be `messages.end()` followed
+                         * immediately by `response.close()`. The end was real,
+                         * but the kill right behind it meant the exit could
+                         * never be a flush — and `response.close()` schedules
+                         * a kill whose signal a handled exit does not report,
+                         * so the exit alone reads exactly like a graceful end.
+                         */
+                        const observer = opts.providerExitObserver;
+                        if (!observer) {
+                            /*
+                             * Ordinary checkpoint protection, unchanged: end
+                             * the input and close. Waiting for an exit here
+                             * would be waiting on an observation nothing is
+                             * making, so it would always run out the budget.
+                             */
+                            messages.end();
+                            await writerProcessTree.quiesce(() => response.close());
+                            return;
+                        }
+                        const ended = await endManagedTurnInput({
+                            endInput: () => { messages.end(); },
+                            exitedCleanly: () => observer.exitedCleanly(),
+                            forceClose: async () => {
+                                // Recorded before the kill, not after.
+                                observer.markForced();
+                                await writerProcessTree.quiesce(() => response.close());
+                            },
+                            budgetMs: opts.turnEndInputBudgetMs ?? MANAGED_TURN_END_INPUT_BUDGET_MS,
+                        });
+                        if (ended.exhausted) opts.onInputExhausted?.();
+                        if (ended.forced) return;
+                        /*
+                         * The provider left on its own, but its descendants
+                         * may not have. The writers still have to be
+                         * quiesced — that is the checkpoint's gate, not the
+                         * provider's — and `quiesce` escalates to SIGTERM and
+                         * then SIGKILL.
+                         *
+                         * So ask first, read-only. A writer killed by that
+                         * escalation leaves the parent cgroup empty and the
+                         * SDK root's exit still reading as clean: a
+                         * manufactured proof one layer below the cgroup. The
+                         * cleanup still happens, because leaving writers
+                         * behind is worse — but the exit is no longer
+                         * evidence, and the gate refuses on it.
+                         */
+                        if (writerProcessTree.hasRemainingWriters()) observer.markForced();
+                        await writerProcessTree.quiesce(async () => undefined);
                     });
                     if (applyResult.status !== 'completed') {
                         throw new Error('checkpoint turn apply did not complete');
@@ -430,6 +519,25 @@ export async function claudeRemote(opts: {
                 opts.onReady();
 
                 if (opts.exitAfterFirstTurn) {
+                    /*
+                     * Automation's one turn. This used to return with the
+                     * iterator still open, so the provider was torn down with
+                     * its input never ended — an exhaustion that never
+                     * happened, and a managed checkpoint that could never be
+                     * proven.
+                     */
+                    if (opts.providerExitObserver) {
+                        const ended = await endManagedTurnInput({
+                            endInput: () => { messages.end(); },
+                            exitedCleanly: () => opts.providerExitObserver?.exitedCleanly() ?? false,
+                            // Nothing to force here: `claudeRemote` returning
+                            // is what ends this run, and inventing a kill
+                            // would make a clean exit unprovable.
+                            forceClose: async () => undefined,
+                            budgetMs: opts.turnEndInputBudgetMs ?? MANAGED_TURN_END_INPUT_BUDGET_MS,
+                        });
+                        if (ended.exhausted) opts.onInputExhausted?.();
+                    }
                     return 'turn-complete' as const;
                 }
 

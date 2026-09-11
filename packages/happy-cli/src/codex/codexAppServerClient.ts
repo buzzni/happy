@@ -923,6 +923,48 @@ export class CodexAppServerClient {
         }
     }
 
+    /**
+     * Ends the app server's input and waits for it to leave on its own.
+     *
+     * `disconnectInternal` is a shutdown, not a flush: it does `stdin.end()`
+     * and then `SIGTERM` in the same `try`, with `SIGKILL` two seconds later,
+     * and never awaits the exit. A checkpoint that archives provider state
+     * cannot use it — a signalled process did not flush, and an unawaited one
+     * was not observed leaving at all.
+     *
+     * This sends **no signal**. It closes stdin and reports what the kernel
+     * then said, within a budget. A timeout is reported as a timeout: the
+     * caller decides whether to fall back to `disconnect()`, and that fallback
+     * is a kill, so it is never quiescence.
+     */
+    async endInputAndAwaitExit(budgetMs: number): Promise<{
+        exited: boolean;
+        code: number | null;
+        signal: string | null;
+    }> {
+        const proc = this.process;
+        // Nothing to end. Reported as not-exited rather than as a clean exit:
+        // "there was no process" is not "the process finished writing".
+        if (!proc) return { exited: false, code: null, signal: null };
+
+        const left = new Promise<{ code: number | null; signal: string | null } | null>((resolve) => {
+            proc.once('exit', (code, signal) => resolve({ code, signal }));
+            const deadline = setTimeout(() => resolve(null), budgetMs);
+            deadline.unref?.();
+        });
+
+        try {
+            // The only thing sent. No `kill`, in this method or after it.
+            proc.stdin?.end();
+        } catch {
+            return { exited: false, code: null, signal: null };
+        }
+
+        const outcome = await left;
+        if (!outcome) return { exited: false, code: null, signal: null };
+        return { exited: true, code: outcome.code, signal: outcome.signal };
+    }
+
     private async disconnectInternal(opts?: {
         preserveThreadState?: boolean;
         preservePendingTurnCompletion?: boolean;

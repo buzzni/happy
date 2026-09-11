@@ -39,7 +39,7 @@
  * that path ends with a cloud runtime holding an account bearer.
  */
 import { constants, promises as fs } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, type KeyObject } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 
 import {
@@ -48,6 +48,8 @@ import {
     trustedPathRefusal,
     type ManagedProvisioningDeps,
 } from '@/daemon/managedRuntimeIdentity';
+
+import { canonicalManagedPayloadDigest, verifyManagedDispatchMaterial, type ManagedTokenFailure } from './managedDispatchToken';
 
 export const MANAGED_DAEMON_CREDENTIAL_VERSION = 1;
 
@@ -75,6 +77,22 @@ export type ManagedDaemonCredentialRefusal =
     | 'unusable'
     | 'expired'
     | 'wrong-machine';
+
+/**
+ * Why a renewal was not applied. Each is a different next move for the parent:
+ * stop sending this one, send a later one, look at the runtime's disk, or
+ * finish provisioning first.
+ */
+export type ManagedCredentialReplaceRefusal =
+    | 'credential-not-mine'
+    | 'credential-not-newer'
+    | 'credential-unreadable'
+    | 'credential-unwritable'
+    | 'credential-durability-unknown';
+
+export type ManagedCredentialReplaceOutcome =
+    | { ok: true; expiresAt: number }
+    | { ok: false; reason: ManagedCredentialReplaceRefusal };
 
 export type ManagedDaemonCredentialOutcome =
     | { ok: true; credential: ManagedDaemonCredential }
@@ -233,7 +251,16 @@ export async function writeManagedDaemonCredential(input: {
         await fs.rm(temporary, { force: true }).catch(() => undefined);
         throw error;
     }
-    await (input.syncDirectory ?? syncDirectoryEntry)(input.stateDir);
+    try {
+        await (input.syncDirectory ?? syncDirectoryEntry)(input.stateDir);
+    } catch {
+        // Rename succeeded; the new record may be visible without durable publication.
+        throw new ManagedCredentialDurabilityUnknownError();
+    }
+}
+
+export class ManagedCredentialDurabilityUnknownError extends Error {
+    constructor() { super('credential-durability-unknown'); }
 }
 
 async function syncDirectoryEntry(path: string): Promise<void> {
@@ -243,4 +270,155 @@ async function syncDirectoryEntry(path: string): Promise<void> {
     } finally {
         await dir.close();
     }
+}
+
+/**
+ * Replaces the bearer this runtime authenticates with, in place.
+ *
+ * A renewal extends an identity; it does not move one. So everything that says
+ * *which* Machine this is comes from the stored record — the machine key, the
+ * account it is wrapped for, the origin that issued it — and the replacement
+ * contributes exactly two things: a later bearer and a later expiry.
+ *
+ * The replacement still names the Machine and the origin it was issued for.
+ * Those are compared, not adopted: the parent signs them into the dispatch
+ * token's payload digest, so a mismatch means this is not the answer to a
+ * renewal of *this* runtime, and applying it would point a live daemon at a
+ * credential nobody issued for it.
+ */
+export async function replaceManagedDaemonCredential(input: {
+    stateDir: string;
+    /** The Machine the marker says this runtime is. */
+    expectedMachineId: string;
+    replacement: { token: string; expiresAt: number; machineId: string; serverOrigin: string };
+    now: number;
+    deps: ManagedProvisioningDeps;
+    /** Overridden only by tests, to fail the publish. */
+    write?: typeof writeManagedDaemonCredential;
+}): Promise<ManagedCredentialReplaceOutcome> {
+    /*
+     * Read with `now: 0` — deliberately, and it is not a bypass of the expiry
+     * guard.
+     *
+     * A runtime whose bearer has already lapsed is exactly the one that needs a
+     * renewal, and refusing to read its record would make expiry unrecoverable.
+     * What expires is the bearer; the identity axes in the record do not expire
+     * with it, and those are all this function carries forward. The new bearer's
+     * own window is checked below against the stored one.
+     */
+    const stored = readManagedDaemonCredential({
+        stateDir: input.stateDir,
+        expectedMachineId: input.expectedMachineId,
+        now: 0,
+        deps: input.deps,
+    });
+    // No record, or one this runtime may not use. There is nothing to extend,
+    // and building one out of the replacement alone would invent a Machine.
+    if (!stored.ok) return { ok: false, reason: 'credential-unreadable' };
+
+    if (input.replacement.machineId !== stored.credential.machineId
+        || input.replacement.serverOrigin !== stored.credential.serverOrigin) {
+        return { ok: false, reason: 'credential-not-mine' };
+    }
+    // Strictly later. Equal is a replay of the renewal already applied, and the
+    // window it would "extend" is the one already being lived in.
+    if (input.replacement.expiresAt <= stored.credential.expiresAt) {
+        return { ok: false, reason: 'credential-not-newer' };
+    }
+
+    try {
+        await (input.write ?? writeManagedDaemonCredential)({
+            stateDir: input.stateDir,
+            credential: {
+                ...stored.credential,
+                token: input.replacement.token,
+                expiresAt: input.replacement.expiresAt,
+            },
+        });
+    } catch (error) {
+        // A post-rename failure may leave the newer record visible. Neither
+        // visibility nor a retry proves that the directory entry was durable.
+        return { ok: false, reason: error instanceof ManagedCredentialDurabilityUnknownError
+            ? 'credential-durability-unknown' : 'credential-unwritable' };
+    }
+    return { ok: true, expiresAt: input.replacement.expiresAt };
+}
+
+
+export type ManagedCredentialReceiverOutcome = ManagedCredentialReplaceOutcome
+    | { ok: false; reason: `token-${ManagedTokenFailure}` | 'token-wrong-project' | 'token-unknown-key'
+        | 'malformed-request' | 'credential-expired' | 'credential-busy' | 'credential-clock-invalid' };
+
+/** An internal receiver; production must install exactly one under supervisor ownership. */
+export function createManagedCredentialReceiver(input: {
+    runtimeId: string;
+    workspaceId: string;
+    projectId: string;
+    keyId: string;
+    provisioningOperationId: string;
+    happyMachineId: string;
+    stateDir: string;
+    verifier: KeyObject;
+    now: () => number;
+    deps: ManagedProvisioningDeps;
+    /** Test-only writer observation; production uses the durable writer. */
+    write?: typeof writeManagedDaemonCredential;
+}): { replace(request: unknown): Promise<ManagedCredentialReceiverOutcome> } {
+    const { runtimeId, workspaceId, projectId, keyId, provisioningOperationId,
+        happyMachineId, stateDir, verifier, now, write } = input;
+    const deps = { ...input.deps };
+    let busy = false;
+    return {
+        async replace(request) {
+            if (busy) return { ok: false, reason: 'credential-busy' };
+            busy = true;
+            try {
+                let replacement: { token: string; machineId: string; serverOrigin: string; expiresAt: number };
+                let observedNow: number;
+                try {
+                    if (!request || typeof request !== 'object' || Array.isArray(request)) {
+                        return { ok: false, reason: 'malformed-request' };
+                    }
+                    const envelope = request as Record<string, unknown>;
+                    const dispatchToken = envelope.token;
+                    if (typeof dispatchToken !== 'string') return { ok: false, reason: 'malformed-request' };
+                    const params = envelope.params;
+                    const paramsDigest = canonicalManagedPayloadDigest(params ?? {});
+                    try { observedNow = now(); } catch { return { ok: false, reason: 'credential-clock-invalid' }; }
+                    if (!Number.isSafeInteger(observedNow) || observedNow < 0) return { ok: false, reason: 'credential-clock-invalid' };
+                    const verified = verifyManagedDispatchMaterial({ token: dispatchToken, verifier, runtimeId, workspaceId,
+                        provisioningOperationId, op: 'credential', paramsDigest, now: observedNow });
+                    if (!verified.ok) return { ok: false, reason: `token-${verified.reason}` };
+                    if (verified.claims.projectId !== projectId) return { ok: false, reason: 'token-wrong-project' };
+                    if (verified.claims.kid !== keyId) return { ok: false, reason: 'token-unknown-key' };
+                    if (!params || typeof params !== 'object' || Array.isArray(params)) return { ok: false, reason: 'malformed-request' };
+                    // Kept local until the IPC cutover can share this normalization with credentialRpc.
+                    const body = params as Record<string, unknown>;
+                    const token = typeof body.token === 'string' ? body.token.trim() : '';
+                    const machineId = typeof body.machineId === 'string' ? body.machineId.trim() : '';
+                    const serverOrigin = typeof body.serverOrigin === 'string' ? body.serverOrigin.trim() : '';
+                    const expiresAt = body.expiresAt;
+                    if (!token || !machineId || !serverOrigin || typeof expiresAt !== 'number' || !Number.isSafeInteger(expiresAt)) {
+                        return { ok: false, reason: 'malformed-request' };
+                    }
+                    try { observedNow = now(); } catch { return { ok: false, reason: 'credential-clock-invalid' }; }
+                    if (!Number.isSafeInteger(observedNow) || observedNow < 0) return { ok: false, reason: 'credential-clock-invalid' };
+                    if (expiresAt <= observedNow) return { ok: false, reason: 'credential-expired' };
+                    // All request fields and admitted axes are owned before the first write await.
+                    replacement = { token, machineId, serverOrigin, expiresAt };
+                } catch {
+                    return { ok: false, reason: 'malformed-request' };
+                }
+                try {
+                    return await replaceManagedDaemonCredential({ stateDir, expectedMachineId: happyMachineId,
+                        replacement, now: observedNow, deps, write });
+                } catch {
+                    // The durable writer's errors are classified by replace; this is a failed stored read.
+                    return { ok: false, reason: 'credential-unreadable' };
+                }
+            } finally {
+                busy = false;
+            }
+        },
+    };
 }

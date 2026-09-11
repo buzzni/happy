@@ -28,6 +28,91 @@ import { join } from 'node:path';
 
 export const MANAGED_IMAGE_LIB_DIR = '/usr/local/lib/saycode';
 
+/**
+ * The executor's `execve` target. Fixed, because the helper validates the path
+ * it was handed and a caller that could choose it could choose anything.
+ */
+export const MANAGED_TOOL_WORKLOAD_PATH = join(MANAGED_IMAGE_LIB_DIR, 'tool-workload');
+
+/**
+ * The generation's `execve` target — the provider layer's equivalent, and a
+ * different program on purpose. The tool workload is entered by the executor
+ * uid inside a per-call PID/mount/network namespace; this is the provider
+ * generation itself, under `exec-helper`.
+ */
+export const MANAGED_PROVIDER_EXEC_PATH = join(MANAGED_IMAGE_LIB_DIR, 'provider-workload');
+
+/**
+ * The Happy CLI entry the provider entry hands the run to.
+ *
+ * Installed as a directory, not a file: the build emits `index.mjs` beside
+ * content-hashed sibling chunks it imports by relative path, so the entry
+ * cannot be installed on its own, and the siblings' names change every build.
+ * Only the entry is named here; the build is what proves its siblings came
+ * with it.
+ */
+/**
+ * The two trusted helpers.
+ *
+ * They are the reason any of this is isolation at all, and they are **not**
+ * interchangeable: `executor-helper` enters a per-call PID/mount/network
+ * namespace and drops to the executor uid for one tool, `exec-helper` enters no
+ * namespace and runs the provider generation as the provider uid. Both are
+ * `0500 root` — the caller hands a path and the helper validates it, so a file
+ * anything in the running image could replace would make that check theatre.
+ *
+ * Listed here because an image without them cannot launch at all, and the
+ * layout check is what says so at build time rather than at the first spawn.
+ */
+export const MANAGED_TOOL_HELPER_IMAGE_PATH = join(MANAGED_IMAGE_LIB_DIR, 'executor-helper');
+export const MANAGED_PROVIDER_HELPER_IMAGE_PATH = join(MANAGED_IMAGE_LIB_DIR, 'exec-helper');
+
+/**
+ * The container entrypoint.
+ *
+ * Listed as an artefact because its absence is invisible: without it the image
+ * inherits the base's `CMD ["node"]` and a Machine comes up as a REPL with
+ * every file present and correctly moded. The layout check is what turns that
+ * into a build failure instead of a runtime that never starts.
+ */
+export const MANAGED_ENTRYPOINT_PATH = join(MANAGED_IMAGE_LIB_DIR, 'entrypoint');
+
+/**
+ * The activation gate's payload.
+ *
+ * Fixed and root-owned because the gate execs it through the real helper: if
+ * anything outside could choose the program, the gate would be verifying
+ * whatever that thing wanted verified. Listed here so an image without it fails
+ * the build rather than failing to activate.
+ */
+export const MANAGED_ISOLATION_PROBE_PATH = join(MANAGED_IMAGE_LIB_DIR, 'isolation-probe');
+
+/**
+ * What image this actually is, written at build time.
+ *
+ * The parent knows which image it *asked* for; a checkpoint has to record the
+ * one that is *running*. If those two ever differ — a rollback, a cached layer,
+ * a Machine that came back on an older image — an archive labelled with the
+ * parent's answer tells a restore to assume a contract this runtime never had.
+ * So the value comes from inside, and its absence is a build failure rather
+ * than an unlabelled archive.
+ */
+export const MANAGED_IMAGE_VERSION_PATH = join(MANAGED_IMAGE_LIB_DIR, 'image-version');
+
+/**
+ * Makes this Machine's generation cgroup root usable before the gate looks.
+ *
+ * Nothing created it: the production image never did and only the P4 verify
+ * scripts ever have, so the activation gate would refuse a machine that was
+ * otherwise correct.
+ */
+export const MANAGED_CGROUP_PREPARE_PATH = join(MANAGED_IMAGE_LIB_DIR, 'cgroup-prepare');
+
+export const MANAGED_PROVIDER_CLI_DIR = join(MANAGED_IMAGE_LIB_DIR, 'cli');
+export const MANAGED_PROVIDER_CLI_PATH = join(MANAGED_PROVIDER_CLI_DIR, 'index.mjs');
+
+
+
 export type ManagedImageArtifact = {
     path: string;
     /** Exact permission bits, not a minimum. */
@@ -35,20 +120,44 @@ export type ManagedImageArtifact = {
     role: 'executable' | 'data';
 };
 
-/**
- * The executor's `execve` target. Fixed, because the helper validates the path
- * it was handed and a caller that could choose it could choose anything.
- */
-export const MANAGED_TOOL_WORKLOAD_PATH = join(MANAGED_IMAGE_LIB_DIR, 'tool-workload');
+
+
 
 export const MANAGED_IMAGE_ARTIFACTS: readonly ManagedImageArtifact[] = [
     { path: MANAGED_TOOL_WORKLOAD_PATH, mode: 0o555, role: 'executable' },
     { path: join(MANAGED_IMAGE_LIB_DIR, 'tool-workload.mjs'), mode: 0o444, role: 'data' },
     { path: join(MANAGED_IMAGE_LIB_DIR, 'toolRuntime.cjs'), mode: 0o444, role: 'data' },
+    { path: MANAGED_PROVIDER_EXEC_PATH, mode: 0o555, role: 'executable' },
+    { path: join(MANAGED_IMAGE_LIB_DIR, 'provider-workload.mjs'), mode: 0o444, role: 'data' },
+    { path: MANAGED_PROVIDER_CLI_PATH, mode: 0o444, role: 'data' },
+    { path: MANAGED_TOOL_HELPER_IMAGE_PATH, mode: 0o500, role: 'executable' },
+    { path: MANAGED_PROVIDER_HELPER_IMAGE_PATH, mode: 0o500, role: 'executable' },
+    { path: MANAGED_ENTRYPOINT_PATH, mode: 0o555, role: 'executable' },
+    { path: MANAGED_ISOLATION_PROBE_PATH, mode: 0o555, role: 'executable' },
+    { path: MANAGED_IMAGE_VERSION_PATH, mode: 0o444, role: 'data' },
+    { path: MANAGED_CGROUP_PREPARE_PATH, mode: 0o555, role: 'executable' },
 ];
 
 /** Programs the image must carry for a checkpoint to be able to complete. */
-export const MANAGED_IMAGE_PROGRAMS: readonly string[] = ['sqlite3'];
+/**
+ * Programs the image must carry, each because a real path fails without it.
+ *
+ * `sqlite3` is the checkpoint's flush: without it every project holding a
+ * SQLite database fails its preflight.
+ *
+ * `ip`, `iptables` and `ip6tables` are how a tool call gets its network
+ * namespace — `toolExecutor` builds the veth pair, the default route and the
+ * REJECT rules that keep host services away from the executor
+ * (`toolExecutor.ts:495-505`). Missing, the isolation is not weakened, it is
+ * absent: the very first tool call fails at setup. They are listed here so
+ * that is a build failure rather than a discovery on the first run.
+ */
+export const MANAGED_IMAGE_PROGRAMS: readonly string[] = [
+    'sqlite3',
+    'ip',
+    'iptables',
+    'ip6tables',
+];
 
 export type ManagedImageLayoutProblem =
     | { path: string; reason: 'missing' }

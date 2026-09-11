@@ -1,4 +1,19 @@
 import { render } from "ink";
+import {
+    createManagedGracefulStop,
+    registerManagedGracefulStop,
+} from '@/managed/managedGracefulStop';
+import { reportManagedStopOutcome } from '@/managed/managedStartup';
+import { MANAGED_STOP_CLEAN } from '@/managed/managedControlChannel';
+
+/**
+ * How long a managed Codex run waits for its app server to leave after its
+ * stdin is closed.
+ *
+ * A budget that ran out is reported as a timeout, never folded into a clean
+ * exit — that is how a provider that is still writing gets archived.
+ */
+const CODEX_END_INPUT_BUDGET_MS = 10_000;
 import React from "react";
 import { ApiClient } from '@/api/api';
 import { CodexAppServerClient } from './codexAppServerClient';
@@ -1209,11 +1224,59 @@ export async function runCodex(opts: {
 
         let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string; attachments?: PendingAttachment[] } | null = null;
 
+        /*
+         * A managed Codex run can be asked to end its input without being
+         * killed. Same contract as the Claude path: the queue is only closed
+         * when nothing is queued and nothing is held back for the next turn.
+         */
+        const gracefulStop = managedStartup
+            ? createManagedGracefulStop({
+                queueSize: () => messageQueue.size(),
+                hasPending: () => pending !== null,
+                wake: () => { messageQueue.close(); },
+            })
+            : null;
+        registerManagedGracefulStop(gracefulStop);
+        /*
+         * Codex runs one app server for the whole session, so its generation
+         * record is a single one — but it is still a record beside the thing
+         * it describes, not a flag on the stop.
+         */
+        const codexProof = { inputExhausted: false };
+        /** Ends this generation's input by exhaustion, and says how it went. */
+        const endManagedInput = async (): Promise<void> => {
+            if (!gracefulStop?.requested()) return;
+            /*
+             * No signal. `disconnect()` does `stdin.end()` and `SIGTERM` in one
+             * breath and never awaits the exit, so it can never prove a flush;
+             * this ends stdin and waits for what the kernel actually says.
+             */
+            const left = await client.endInputAndAwaitExit(CODEX_END_INPUT_BUDGET_MS);
+            reportManagedStopOutcome(
+                codexProof.inputExhausted
+                    && left.exited && left.code === 0 && left.signal === null
+                    ? MANAGED_STOP_CLEAN
+                    : codexProof.inputExhausted
+                        ? 'provider-exit-unclean'
+                        : 'input-not-exhausted',
+            );
+        };
+
         while (!shouldExit) {
             logActiveHandles('loop-top');
             let message: { message: string; mode: EnhancedMode; isolate: boolean; hash: string; attachments?: PendingAttachment[] } | null = pending;
             pending = null;
             if (!message) {
+                /*
+                 * The turn boundary. A stop asked for mid-turn lands here,
+                 * with the turn finished and nothing accepted after it.
+                 */
+                if (gracefulStop?.mayEndInput()) {
+                    codexProof.inputExhausted = true;
+                    shouldExit = true;
+                    await endManagedInput();
+                    break;
+                }
                 // Capture the current signal to distinguish idle-abort from queue close
                 const waitSignal = abortController.signal;
                 const batch = await messageQueue.waitForMessagesAndGetAsString(waitSignal);
@@ -1222,6 +1285,15 @@ export async function runCodex(opts: {
                     if (waitSignal.aborted && !shouldExit) {
                         logger.debug('[codex]: Wait aborted while idle; ignoring and continuing');
                         continue;
+                    }
+                    /*
+                     * Woken by the stop rather than aborted. The abort check is
+                     * the point: a run aborted while a stop happened to be
+                     * pending did not exhaust its input.
+                     */
+                    if (gracefulStop?.requested() && !waitSignal.aborted) {
+                        codexProof.inputExhausted = true;
+                        await endManagedInput();
                     }
                     logger.debug(`[codex]: batch=${!!batch}, shouldExit=${shouldExit}`);
                     break;
@@ -1492,6 +1564,12 @@ export async function runCodex(opts: {
         }
 
     } finally {
+        /*
+         * The bridge points at this run's loop. Left registered, a stop
+         * arriving later would be applied to a loop that has ended, or handed
+         * to the next run, which nobody asked to stop.
+         */
+        registerManagedGracefulStop(null);
         // Clean up resources when main loop exits
         logger.debug('[codex]: Final cleanup start');
         logActiveHandles('cleanup-start');

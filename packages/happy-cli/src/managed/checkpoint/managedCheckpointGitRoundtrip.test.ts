@@ -44,7 +44,7 @@ async function restore(
 
 const created: string[] = [];
 const key = randomBytes(32);
-const tenant = { companyId: 'co_1', projectId: 'pr_1' };
+const tenant = { tenantId: 'co_1', projectId: 'pr_1' };
 const volume = { volumeId: 'vol_1', deviceUuid: 'dev-1' };
 
 async function scratch(prefix: string): Promise<string> {

@@ -18,5 +18,7 @@ export {
     assertManagedImageLayout,
     MANAGED_IMAGE_ARTIFACTS,
     MANAGED_IMAGE_PROGRAMS,
+    MANAGED_PROVIDER_CLI_PATH,
+    MANAGED_PROVIDER_EXEC_PATH,
     MANAGED_TOOL_WORKLOAD_PATH,
 } from './managedImagePackaging';

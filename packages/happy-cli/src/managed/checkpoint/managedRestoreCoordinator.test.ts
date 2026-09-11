@@ -12,7 +12,7 @@ import {
     reconcileManagedPromotion,
 } from './managedCheckpointPromotion';
 
-const tenant = { companyId: 'co_1', projectId: 'pr_1' };
+const tenant = { tenantId: 'co_1', projectId: 'pr_1' };
 const targetVolume = { volumeId: 'vol_new', deviceUuid: 'dev-new' };
 const key = { runId: 'r', attemptId: 'a', epoch: 3 };
 

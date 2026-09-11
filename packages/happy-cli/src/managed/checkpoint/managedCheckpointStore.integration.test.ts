@@ -19,7 +19,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { createCheckpointDrain } from './managedCheckpointDrain';
 import { createManagedCheckpointRunner } from './managedCheckpointRunner';
-import { MANAGED_WRITE_TOOLS } from '@/launcher/toolWorkload';
+import { MANAGED_WRITE_TOOLS } from '@/launcher/managedToolCatalogue';
 import { putCheckpointPointer, readCheckpointPointer } from './managedCheckpointObjectStore';
 import { publishManagedCheckpoint } from './managedCheckpointPublisher';
 import { createManagedCheckpointSource } from './managedCheckpointResolver';
@@ -40,7 +40,7 @@ afterEach(async () => {
 
 describe.skipIf(!base)('managed checkpoint against a real object store', () => {
     const key = randomBytes(32);
-    const tenant = { companyId: 'co_1', projectId: 'pr_1' };
+    const tenant = { tenantId: 'co_1', projectId: 'pr_1' };
     const volume = { volumeId: 'vol_1', deviceUuid: 'dev-1' };
 
     function targetsFor(prefix: string) {
@@ -212,7 +212,7 @@ describe.skipIf(!base)('managed checkpoint against a real object store', () => {
         await writeFile(join(root, 'src/index.ts'), 'export const a = 1;\n');
 
         const runner = createManagedCheckpointRunner({
-            tenant, volume, image: { imageVersion: 'img@1' },
+            tenant, volume: () => volume, image: { imageVersion: 'img@1' },
             sources: [{ area: 'project', root }],
             workDir: join(await scratch(), 'work'),
             drainBudgetMs: 5000,

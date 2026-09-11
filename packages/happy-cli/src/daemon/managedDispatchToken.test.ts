@@ -4,6 +4,7 @@ import { generateKeyPairSync, sign } from 'node:crypto';
 import {
     canonicalManagedPayloadDigest,
     parseManagedVerifierKey,
+    verifyManagedDispatchMaterial,
     verifyManagedDispatchToken,
     type ManagedRunTokenClaims,
 } from './managedDispatchToken';
@@ -355,7 +356,7 @@ describe('the status claim', () => {
         // must keep verifying unchanged.
         const result = verify(mint(claims()));
         expect(result.ok).toBe(true);
-        if (!result.ok || result.claims.op === 'status'
+        if (!result.ok || result.claims.op === 'status' || result.claims.op === 'credential'
             || result.claims.op === 'runtime-lease' || result.claims.op === 'checkpoint') return;
         expect(result.claims.runId).toBe('run-1');
         expect(result.claims.attemptId).toBe('attempt-1');
@@ -455,9 +456,360 @@ describe('the runtime-lease claim', () => {
             op: 'lease', epoch: 4, renewalSeq: 2, leaseMs: 60_000, absoluteExpiry: NOW + 3_600_000,
         } as never)), { op: 'lease', currentEpoch: 3 });
         expect(result.ok).toBe(true);
-        if (!result.ok || result.claims.op === 'status'
+        if (!result.ok || result.claims.op === 'status' || result.claims.op === 'credential'
             || result.claims.op === 'runtime-lease' || result.claims.op === 'checkpoint') return;
         expect(result.claims.runId).toBe('run-1');
         expect(result.claims.attemptId).toBe('attempt-1');
+    });
+});
+
+/*
+ * The checkpoint token's second digest.
+ *
+ * `ManagedCheckpointTokenClaims` requires a `paramsDigest` of its own, beside
+ * the `payloadDigest` every token carries — and nothing compared it. A field
+ * that is required and never checked is decoration: it looks like a binding in
+ * the type and in the review, and an issuer that filled it with anything at all
+ * would be accepted. Either it means the same thing as `payloadDigest`, and it
+ * must equal it, or it means something else and nobody says what.
+ */
+describe('the checkpoint token binds one digest, not two', () => {
+    const PARAMS = { areas: [{ area: 'project', put: 'https://storage.test/o/ckpt-7/project' }] };
+    const digest = canonicalManagedPayloadDigest(PARAMS);
+
+    const checkpointClaims = (overrides: Record<string, unknown> = {}) => ({
+        v: 1,
+        kid: 'test-kid',
+        aud: 'runtime-1',
+        op: 'checkpoint',
+        workspaceId: 'ws-1',
+        projectId: 'proj-1',
+        provisioningOperationId: 'op-1',
+        checkpointId: 'ckpt-7',
+        requestKey: 'req-ckpt-1',
+        epoch: 3,
+        payloadDigest: digest,
+        paramsDigest: digest,
+        iat: NOW,
+        exp: NOW + 60_000,
+        ...overrides,
+    });
+
+    const verifyCheckpoint = (body: Record<string, unknown>) => verifyManagedDispatchToken({
+        token: mint(body),
+        verifier,
+        runtimeId: 'runtime-1',
+        workspaceId: 'ws-1',
+        op: 'checkpoint',
+        paramsDigest: digest,
+        currentEpoch: 3,
+        provisioningOperationId: 'op-1',
+        now: NOW + 1_000,
+    });
+
+    it('accepts one whose two digests agree', () => {
+        expect(verifyCheckpoint(checkpointClaims()).ok).toBe(true);
+    });
+
+    it('refuses one minted for another provisioning operation of the same runtime', () => {
+        /*
+         * `PROVISIONING_SCOPED_OPS` carries `checkpoint`, and the parse side
+         * requires the id — but the verify side only compared it for `status`,
+         * `runtime-lease` and `credential`. So a validly signed checkpoint token
+         * from a **different** provisioning operation of the same runtime,
+         * workspace, project and epoch was accepted, and it names upload
+         * destinations: whoever holds one can have this runtime seal its volume
+         * into a namespace the current operation never authorised.
+         *
+         * The id is the only thing that ties a provisioning-scoped grant to the
+         * life this runtime is currently living; the epoch cannot, because the
+         * two operations can share one.
+         */
+        expect(verifyCheckpoint(checkpointClaims({ provisioningOperationId: 'op-someone-else' })))
+            .toEqual({ ok: false, reason: 'wrong-operation' });
+    });
+
+    it('refuses one when the runtime knows of no provisioning operation at all', () => {
+        // Fail closed: nothing to compare against is not a reason to accept.
+        expect(verifyManagedDispatchToken({
+            token: mint(checkpointClaims()),
+            verifier,
+            runtimeId: 'runtime-1',
+            workspaceId: 'ws-1',
+            op: 'checkpoint',
+            paramsDigest: digest,
+            currentEpoch: 3,
+            provisioningOperationId: undefined,
+            now: NOW + 1_000,
+        })).toEqual({ ok: false, reason: 'wrong-operation' });
+    });
+
+    it('refuses one whose two digests disagree', () => {
+        /*
+         * The destinations are in the parameters. A token carrying a second,
+         * unchecked digest of *something else* is a token whose binding cannot
+         * be read from the token.
+         *
+         * `malformed` rather than `payload-mismatch`, and the difference is
+         * real: `payload-mismatch` says "signed for other parameters than the
+         * ones handed to me", which is a comparison with the request. This one
+         * disagrees with **itself**, before any request is considered — so it
+         * is a shape that may not be read at all.
+         */
+        expect(verifyCheckpoint(checkpointClaims({
+            paramsDigest: canonicalManagedPayloadDigest({ areas: [] }),
+        }))).toEqual({ ok: false, reason: 'malformed' });
+    });
+});
+
+describe('which fault wins when a token has several', () => {
+    /*
+     * Every case in this file gives a token one fault. That left the order the
+     * guards run in unpinned: an extraction could reorder them and the suite
+     * would stay green, and the answer a caller acts on would change.
+     *
+     * The digest is broken **externally** - the claims stay valid and signed,
+     * and the caller passes a `paramsDigest` for other params. That is the real
+     * shape of the fault: a token signed for one document arriving with
+     * another, not a token someone edited.
+     */
+    const OTHER_DIGEST = canonicalManagedPayloadDigest({ different: true });
+
+    it('shouldSayStaleEpochRatherThanPayloadMismatch', () => {
+        // The pair the first C1 draft would have inverted.
+        expect(verify(mint(claims({ epoch: 2 })), { currentEpoch: 5, paramsDigest: OTHER_DIGEST }))
+            .toEqual({ ok: false, reason: 'stale-epoch' });
+    });
+
+    it('shouldSayEpochMismatchRatherThanPayloadMismatchForWork', () => {
+        expect(verify(mint(claims({ epoch: 7 })), { currentEpoch: 3, paramsDigest: OTHER_DIGEST }))
+            .toEqual({ ok: false, reason: 'epoch-mismatch' });
+    });
+
+    /**
+     * A checkpoint token carries `checkpointId` and its own `paramsDigest`,
+     * which must equal `payloadDigest` - and it carries neither `runId` nor
+     * `attemptId`. Building it from the work-token fixture gives `malformed`,
+     * which is the baseline telling me the fixture is wrong rather than the
+     * function; this is the real shape.
+     */
+    const checkpointToken = (over: Record<string, unknown> = {}) => {
+        const signedDigest = canonicalManagedPayloadDigest({ a: 1, b: 2 });
+        return mint({
+            v: 1, kid: 'test-kid', aud: 'runtime-1', op: 'checkpoint',
+            workspaceId: 'ws-1', projectId: 'proj-1', provisioningOperationId: 'op-1',
+            checkpointId: 'ckpt-7', requestKey: 'req-ckpt-1', epoch: 3,
+            payloadDigest: signedDigest, paramsDigest: signedDigest,
+            iat: NOW, exp: NOW + 60_000, ...over,
+        });
+    };
+
+    it('shouldSayEpochMismatchRatherThanPayloadMismatchForCheckpoint', () => {
+        expect(verify(checkpointToken({ epoch: 7 }), {
+            op: 'checkpoint', currentEpoch: 3, provisioningOperationId: 'op-1',
+            paramsDigest: OTHER_DIGEST,
+        })).toEqual({ ok: false, reason: 'epoch-mismatch' });
+    });
+
+    it('shouldSayWrongOperationBeforeEitherEpochOrPayload', () => {
+        expect(verify(checkpointToken({ epoch: 2, provisioningOperationId: 'op-other' }), {
+            op: 'checkpoint', currentEpoch: 5, provisioningOperationId: 'op-1',
+            paramsDigest: OTHER_DIGEST,
+        })).toEqual({ ok: false, reason: 'wrong-operation' });
+    });
+
+    it('shouldSayExpiredBeforeEveryLaterGuard', () => {
+        expect(verify(mint(claims({ epoch: 2, exp: NOW - 1 })), {
+            currentEpoch: 5, paramsDigest: OTHER_DIGEST,
+        })).toEqual({ ok: false, reason: 'expired' });
+    });
+
+    it('shouldSayWrongAudienceBeforeEpochOrPayload', () => {
+        expect(verify(mint(claims({ aud: 'runtime-2', epoch: 2 })), {
+            currentEpoch: 5, paramsDigest: OTHER_DIGEST,
+        })).toEqual({ ok: false, reason: 'wrong-audience' });
+    });
+
+    it('shouldStillSayPayloadMismatchWhenThatIsTheOnlyFault', () => {
+        // The control: without it the table above could be satisfied by a
+        // function that never reaches the payload check at all.
+        expect(verify(mint(claims()), { paramsDigest: OTHER_DIGEST }))
+            .toEqual({ ok: false, reason: 'payload-mismatch' });
+    });
+});
+
+describe('the epoch rules, per operation', () => {
+    /*
+     * Pinned as a matrix rather than as scattered cases, because the extraction
+     * must keep the gate exactly where it is and these are the rules it holds:
+     * work is exact, both lease shapes may rise but never fall, and `status`
+     * and `credential` are outside the gate entirely.
+     */
+    const workOp = (epoch: number, currentEpoch: number) =>
+        verify(mint(claims({ epoch })), { currentEpoch });
+
+    it.each([
+        ['equal', 3, 3, null],
+        ['below', 2, 3, 'stale-epoch'],
+        ['above', 4, 3, 'epoch-mismatch'],
+    ])('shouldJudgeWorkExactly(%s)', (_name, epoch, currentEpoch, reason) => {
+        const result = workOp(epoch as number, currentEpoch as number);
+        if (reason === null) expect(result.ok).toBe(true);
+        else expect(result).toEqual({ ok: false, reason });
+    });
+
+    it.each([
+        ['lease', 'lease' as const],
+        ['runtime-lease', 'runtime-lease' as const],
+    ])('shouldLetALeaseRiseButNotFall(%s)', (_name, op) => {
+        const lease = (epoch: number, currentEpoch: number) => {
+            const body: Record<string, unknown> = {
+                ...claims(), op, epoch,
+                renewalSeq: 1, leaseMs: 60_000, absoluteExpiry: NOW + 600_000,
+            };
+            if (op === 'runtime-lease') {
+                body.provisioningOperationId = 'op-1';
+                delete body.runId;
+                delete body.attemptId;
+            }
+            return verify(mint(body), {
+                op, currentEpoch,
+                ...(op === 'runtime-lease' ? { provisioningOperationId: 'op-1' } : {}),
+            });
+        };
+        expect(lease(3, 3).ok).toBe(true);
+        expect(lease(9, 3).ok).toBe(true);
+        expect(lease(2, 3)).toEqual({ ok: false, reason: 'stale-epoch' });
+    });
+
+    it.each([
+        ['status', 'status' as const],
+        ['credential', 'credential' as const],
+    ])('shouldNotGateOnEpochAtAllFor(%s)', (_name, op) => {
+        const body: Record<string, unknown> = {
+            ...claims(), op, epoch: 0, provisioningOperationId: 'op-1',
+        };
+        delete body.runId;
+        delete body.attemptId;
+        // Far below the current epoch, and still accepted: a booted runtime
+        // holds epoch 0 and the parent asks precisely to find that out.
+        expect(verify(mint(body), {
+            op, currentEpoch: 9, provisioningOperationId: 'op-1',
+        }).ok).toBe(true);
+    });
+});
+
+describe('verifyManagedDispatchMaterial', () => {
+    /*
+     * The epoch-free entry point, called directly. freeze85 shipped it with no
+     * test touching it at all, which is how the defect below survived review of
+     * a green suite: the extraction looked right and nothing exercised the new
+     * path.
+     *
+     * What it returns is authenticated **material**, not authorisation. Every
+     * guard the full verifier applies before its epoch gate must still apply
+     * here - a holder with no epoch has *fewer* reasons to trust a token, not
+     * more.
+     */
+    const DIGEST = canonicalManagedPayloadDigest({ a: 1, b: 2 });
+    const OTHER_DIGEST = canonicalManagedPayloadDigest({ different: true });
+
+    const provisioningToken = (op: string, over: Record<string, unknown> = {}) => {
+        const body: Record<string, unknown> = {
+            v: 1, kid: 'test-kid', aud: 'runtime-1', op,
+            workspaceId: 'ws-1', projectId: 'proj-1', provisioningOperationId: 'op-1',
+            requestKey: 'req-1', epoch: 3,
+            payloadDigest: DIGEST, iat: NOW, exp: NOW + 60_000,
+        };
+        if (op === 'checkpoint') {
+            body.checkpointId = 'ckpt-7';
+            body.paramsDigest = DIGEST;
+        }
+        if (op === 'runtime-lease') {
+            body.renewalSeq = 1;
+            body.leaseMs = 60_000;
+            body.absoluteExpiry = NOW + 600_000;
+        }
+        return mint({ ...body, ...over });
+    };
+
+    const material = (token: string, over: Partial<Parameters<typeof verifyManagedDispatchMaterial>[0]> = {}) =>
+        verifyManagedDispatchMaterial({
+            token,
+            verifier,
+            runtimeId: 'runtime-1',
+            workspaceId: 'ws-1',
+            op: 'checkpoint',
+            paramsDigest: DIGEST,
+            provisioningOperationId: 'op-1',
+            now: NOW + 1_000,
+            ...over,
+        });
+
+    it('shouldAcceptWhateverEpochTheParentSignedFor', () => {
+        /*
+         * The point of the entry point: a holder with no current epoch can
+         * still establish who signed this and for what. The epoch is recorded
+         * as a fact, not judged.
+         */
+        for (const epoch of [0, 3, 99]) {
+            const result = material(provisioningToken('checkpoint', { epoch }));
+            expect(result.ok).toBe(true);
+            if (result.ok) expect(result.claims.epoch).toBe(epoch);
+        }
+    });
+
+    it('shouldNotBeAuthorisationTheFullVerifierWouldRefuse', () => {
+        // The same token, same instant: material accepts, the full verifier
+        // refuses because that epoch is not the current one. If these ever
+        // agreed, the epoch gate would have been bypassed rather than skipped.
+        const token = provisioningToken('checkpoint', { epoch: 99 });
+        expect(material(token).ok).toBe(true);
+        expect(verifyManagedDispatchToken({
+            token, verifier, runtimeId: 'runtime-1', workspaceId: 'ws-1', op: 'checkpoint',
+            paramsDigest: DIGEST, currentEpoch: 3, provisioningOperationId: 'op-1', now: NOW + 1_000,
+        })).toEqual({ ok: false, reason: 'epoch-mismatch' });
+    });
+
+    it.each([
+        ['checkpoint', 'checkpoint'],
+        ['status', 'status'],
+        ['credential', 'credential'],
+        ['runtime-lease', 'runtime-lease'],
+    ])('shouldRefuseATokenMintedForAnotherProvisioningOperation(%s)', (_name, op) => {
+        /*
+         * Astra's blocker. Every one of these ops is provisioning-scoped, and
+         * the binding is what stops a token signed for a *different* operation
+         * on the same runtime, workspace, project and epoch from being acted
+         * on - the params of a checkpoint carry upload destinations, so holding
+         * such a token means choosing where this runtime seals its volume.
+         *
+         * The epoch cannot substitute: two operations can share one.
+         */
+        expect(material(provisioningToken(op, { provisioningOperationId: 'op-other' }), { op: op as never }))
+            .toEqual({ ok: false, reason: 'wrong-operation' });
+    });
+
+    it.each([
+        ['checkpoint', 'checkpoint'],
+        ['status', 'status'],
+        ['credential', 'credential'],
+        ['runtime-lease', 'runtime-lease'],
+    ])('shouldRefuseWhenTheCallerNamesNoOperationAtAll(%s)', (_name, op) => {
+        // Fail closed: a holder that cannot say which life it is living cannot
+        // confirm the token belongs to it.
+        expect(material(provisioningToken(op), { op: op as never, provisioningOperationId: undefined }))
+            .toEqual({ ok: false, reason: 'wrong-operation' });
+    });
+
+    it.each([
+        ['a forged signature', () => material(provisioningToken('checkpoint').slice(0, -8) + 'AAAAAAAA'), 'bad-signature'],
+        ['another runtime', () => material(provisioningToken('checkpoint'), { runtimeId: 'runtime-2' }), 'wrong-audience'],
+        ['another workspace', () => material(provisioningToken('checkpoint'), { workspaceId: 'ws-2' }), 'wrong-workspace'],
+        ['another op', () => material(provisioningToken('checkpoint'), { op: 'spawn' }), 'wrong-op'],
+        ['a token past its life', () => material(provisioningToken('checkpoint', { exp: NOW - 1 })), 'expired'],
+        ['params it was not signed for', () => material(provisioningToken('checkpoint'), { paramsDigest: OTHER_DIGEST }), 'payload-mismatch'],
+    ])('shouldStillRefuse(%s)', (_name, run, reason) => {
+        expect(run()).toEqual({ ok: false, reason });
     });
 });

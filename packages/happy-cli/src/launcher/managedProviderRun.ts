@@ -16,6 +16,16 @@
  * 호출을 잃을 뿐 계속 살아 있고, 세대를 먼저 죽이면 도구와 provider 가 함께
  * 끝난 뒤 문이 닫힌다.
  */
+import { logger } from '@/ui/logger';
+import {
+    MANAGED_CONTROL_CHILD_FD,
+    MANAGED_STOP_CLEAN,
+    managedStopRequest,
+    readManagedControlChannel,
+} from '@/managed/managedControlChannel';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { generationCgroupPath } from './supervisor';
 import { resolve, sep } from 'node:path';
 
 import {
@@ -50,7 +60,11 @@ export type ProviderRunSupervisor = {
         statusFd: number;
         releaseFd: number;
         leaseExpiresMonotonic: number;
+        controlFds?: number[];
         onAcquired?: (pid: number) => Promise<void>;
+        onExit?: (exit: { code: number | null; signal: string | null }) => void;
+        /** 이 세대의 제어 통로 쓰기 쪽. supervisor 만 쥔다. */
+        onControlWriters?: (writers: Map<number, { write: (text: string) => void }>) => void;
     }) => Promise<ExecOutcome>;
     stopGeneration: (key: GenerationKey) => StopOutcome;
 };
@@ -79,8 +93,54 @@ export class ManagedProviderLaunchError extends Error {
     }
 }
 
+/** 커널이 보고한 provider 자신의 종료. */
+export type ObservedProviderExit = { code: number | null; signal: string | null };
+
 export type ManagedProviderRun = {
     outcome: ExecOutcome;
+    /**
+     * 이 세대 provider 의 관측된 종료. 아직 관측되지 않았으면 `null`.
+     *
+     * **기다리지 않는다.** checkpoint 가 여기서 막히면 끝나지 않는 provider 하나가
+     * runtime 전체를 멈춘다. 기다림에 예산을 매기는 것은 부르는 쪽 일이고, 이
+     * 함수의 일은 '보았는가' 에 사실대로 답하는 것뿐이다.
+     *
+     * `null` 은 '정상 종료가 아니다' 가 아니라 **'모른다'** 이다. provider 상태를
+     * 보관해도 되는지 판정하는 쪽에서 그 둘은 같은 결론(보관 불가)으로 가지만,
+     * 이유가 다르므로 여기서 섞지 않는다.
+     */
+    observedExit: () => ObservedProviderExit | null;
+    /**
+     * 이 세대에게 **죽이지 않고** 입력을 끝내라고 청한다.
+     *
+     * 통로가 없으면 `false`. 그것은 실패가 아니라 "이 runtime 은 우아한 정지를
+     * 할 수 없다" 이고, 그러면 quiescence gate 가 `eof-unverified` 로 거절한다.
+     */
+    requestGracefulStop: () => boolean;
+    /**
+     * 정지를 청하고, **자식이 답할 때까지** 기다린다.
+     *
+     * 세 가지가 모두 있어야 한다:
+     *  1. 자식의 ack `exhausted-clean` — iterator 가 abort 가 아니라 소진으로
+     *     끝났고 SDK 자신의 프로세스가 code 0·무신호·강제 아님으로 나갔다.
+     *     이것만 자식이 알 수 있다.
+     *  2. 관측된 자식 종료. ack 는 "곧 나갈 것" 이지 "나갔다" 가 아니다.
+     *  3. 빈 cgroup. 종료한 자식이 손자를 남겼으면 아직 쓰고 있다.
+     *
+     * 예산이 지나면 `timeout` 이다. 그것을 깨끗한 정지로 접는 것이 아직 쓰고
+     * 있는 provider 를 보관하는 길이다.
+     */
+    awaitGracefulStop: (budgetMs: number) => Promise<{
+        stopped: boolean;
+        detail: 'stopped' | 'no-channel' | 'timeout' | 'exit-unobserved' | string;
+        /**
+         * 이 세대가 실제로 쓴 native session. 자식이 말하지 않았거나(구 peer,
+         * 세션을 얻기 전 종료) 충돌했으면 없다. **정지 판정의 조건이 아니다.**
+         */
+        nativeId?: string;
+        /** 자식이 한 세대에 두 개의 다른 신원을 주장했다. 신원은 버려진다. */
+        identity?: 'conflict';
+    }>;
     /**
      * 세대를 정지시키고 도구 경계를 거둔다.
      *
@@ -144,6 +204,20 @@ export function providerWorkloadScript(input: {
 
 /** workload 가 살 수 있는 유일한 디렉터리. 경로 문자열이 아니라 정규화로 판정한다. */
 export const TRUSTED_LAUNCH_ROOT = '/usr/local/lib/saycode';
+
+/*
+ * The image's exec targets, named again here rather than imported from
+ * `managedImagePackaging`.
+ *
+ * That module belongs to the image's runtime entry, which is bundled into
+ * **one** read-only CommonJS file. A module shared with the launcher's graph
+ * makes the bundler emit a sibling chunk, and the image installs one file — so
+ * the file it installs fails to load, at image build time if the layout check
+ * runs and at tool-call time if it does not. `managedImagePathsAgree` in
+ * `managedRunConfig.test.ts` is what keeps the two copies from drifting.
+ */
+export const TRUSTED_TOOL_WORKLOAD_PATH = `${TRUSTED_LAUNCH_ROOT}/tool-workload`;
+export const TRUSTED_PROVIDER_EXEC_PATH = `${TRUSTED_LAUNCH_ROOT}/provider-workload`;
 
 /**
  * 신뢰 경로 판정.
@@ -330,6 +404,45 @@ export async function startManagedProviderRun(input: {
 
     let envRefusal: Error | null = null;
     let outcome: ExecOutcome;
+    /*
+     * 한 번만 기록한다. 세대는 하나이고 프로세스는 한 번 끝난다 — 뒤에 오는
+     * 무엇이 첫 관측을 덮으면, 기록은 커널이 말한 것이 아니게 된다.
+     */
+    let observed: ObservedProviderExit | null = null;
+    /** 통로가 열렸으면 그 쓰기 쪽. 없으면 우아한 정지는 불가능하다. */
+    let controlWriter: { write: (text: string) => void } | null = null;
+    /**
+     * 세대 cgroup 을 **건드리지 않고** 읽는다.
+     *
+     * `unreadable` 은 `populated` 와 같은 결론(거절)으로 가지만 이유가 다르다.
+     * 읽지 못한 것을 비었다고 접는 것이 아무도 안 본 정적을 보고하는 길이다.
+     */
+    const observeGenerationPopulation = (): 'empty' | 'populated' | 'events-unreadable' => {
+        try {
+            const events = readFileSync(
+                join(generationCgroupPath(input.cgroupRoot, input.key), 'cgroup.events'),
+                'utf8',
+            );
+            return /^populated 0$/m.test(events) ? 'empty' : 'populated';
+        } catch (error) {
+            // 커널이 지운 cgroup 은 비어 있었다는 뜻이다. 그것만 관측이다.
+            if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return 'empty';
+            return 'events-unreadable';
+        }
+    };
+    /** 자식이 말한 결말. `null` 은 '아직 말하지 않았다' 이다. */
+    let ackVerdict: string | null = null;
+    /**
+     * The native session this generation said it wrote, once.
+     *
+     * Separate from `ackVerdict` because the two can disagree across frames and
+     * each disagreement means something different: a second verdict is a peer
+     * repeating itself, a second *identity* is a peer claiming this generation
+     * wrote two sessions. `identityConflict` remembers the latter so nothing
+     * downstream reads a first-come id as authoritative.
+     */
+    let ackNativeId: string | null = null;
+    let identityConflict = false;
     try {
         outcome = await supervisor.execGeneration({
             key: input.key,
@@ -344,6 +457,93 @@ export async function startManagedProviderRun(input: {
              * 사이 사용자 코드가 이미 돈다. park 상태의 자식은 아직 execve 전이지만
              * 그 environ 이 곧 실행될 환경이다(execve 는 환경을 물려준다).
              */
+            controlFds: [MANAGED_CONTROL_CHILD_FD],
+            onControlWriters: (writers) => {
+                const writer = writers.get(MANAGED_CONTROL_CHILD_FD) ?? null;
+                controlWriter = writer;
+                // 같은 descriptor 가 양방향이다(Node 의 추가 stdio pipe 는
+                // socketpair). 답이 오면 여기서 받는다.
+                const readable = writer as unknown as {
+                    on?: (event: string, handler: (chunk: Buffer | string) => void) => unknown;
+                } | null;
+                /*
+                 * 프레이밍은 reader 에게 맡긴다. 여기서 chunk 를 직접 자르면
+                 * 두 번째 파서가 되고, 그 파서는 `ended exhausted-cle` 처럼
+                 * **잘린 토큰도 통과시킨다** — 그리고 첫 답이 이기므로 그
+                 * 잘린 값이 영구히 남는다. 프레임 하나가 두 chunk 에 걸리면
+                 * 답 자체가 사라지기도 한다.
+                 */
+                if (readable?.on) {
+                    readManagedControlChannel({
+                        source: readable as never,
+                        // supervisor 쪽 끝이다. 여기로 오는 `stop` 은 자식이
+                        // 보낸 것이 아니므로 아무것도 하지 않는다.
+                        onStop: () => undefined,
+                        onAck: (ack) => {
+                            /*
+                             * 첫 답만. 뒤에 오는 것이 첫 답을 덮으면 기록은
+                             * 자식이 말한 것이 아니게 된다.
+                             *
+                             * 같은 프레임이 다시 오는 것(중복)은 무해하므로
+                             * 무시한다. 다른 native ID 가 오는 것(충돌)은
+                             * 다르다 — 한 세대가 두 세션을 썼다는 주장이고,
+                             * 둘 중 어느 쪽도 믿을 수 없다. 그래서 신원을
+                             * 버리고 충돌을 기억한다. verdict 는 첫 답 그대로
+                             * 두어 종료 판정이 신원 때문에 바뀌지 않게 한다.
+                             */
+                            if (ackVerdict === null) {
+                                ackVerdict = ack.verdict;
+                                ackNativeId = ack.nativeId;
+                                return;
+                            }
+                            /*
+                             * 충돌은 되돌릴 수 없다. 한 번 모순된 쌍을 말한
+                             * 자식이 그 뒤에 어느 한쪽을 다시 말해도 그것이
+                             * 맞다는 증거가 되지 않는다 — 마지막 프레임을
+                             * 채택하면 순서만 바꿔도 결론이 바뀐다.
+                             */
+                            if (identityConflict) return;
+                            /*
+                             * 프레임 하나가 관측 하나다. 그러니 **같은 세션에
+                             * 다른 verdict** 도 다른 세션만큼이나 모순이다 —
+                             * 신원을 남겨 두면 자식 스스로 동의하지 않는 쌍이
+                             * 승인한 세션을 아래로 넘기게 된다.
+                             */
+                            // 아무도 신원을 말하지 않았다면 오염시킬 신원이
+                            // 없다. 모순된 verdict 는 '첫 답만' 규칙이 이미
+                            // 처리하며, 없는 주장을 충돌로 적지 않는다.
+                            if (ack.nativeId === null && ackNativeId === null) return;
+                            /*
+                             * 철자까지 같아야 같은 세션이다.
+                             *
+                             * 예전에는 대소문자를 접었다 — "case is not
+                             * identity" 는 UUID 를 **숫자로** 볼 때의 이야기이고,
+                             * provider 가 디스크에 무엇을 쓰는지에 대한 증거가
+                             * 아니다. Claude 가 `ABCDEF…` 와 `abcdef…` 를 한
+                             * 세션으로 취급한다는 근거는 없고, 아래쪽은 전부
+                             * 정확히 비교한다: derivation 은 참조 경로를 문자
+                             * 단위로 맞추고, transcript 는 한 가지 철자로 적힌
+                             * 경로에 있다.
+                             *
+                             * 그래서 두 층이 어긋나 있었다 — ack 는 "같은 세션"
+                             * 이라고 하고 경로 층은 없는 파일을 찾는다. 다른
+                             * 철자는 자식이 어느 세션을 썼는지에 대해 스스로
+                             * 모순된 것이며, 그것은 충돌이다.
+                             */
+                            const sameSession = ack.nativeId === null || ackNativeId === null
+                                ? false
+                                : ack.nativeId === ackNativeId;
+                            if (ack.verdict !== ackVerdict || !sameSession) {
+                                identityConflict = true;
+                                ackNativeId = null;
+                            }
+                        },
+                    });
+                }
+            },
+            onExit: (exit) => {
+                if (observed === null) observed = exit;
+            },
             onAcquired: async (pid) => {
                 try {
                     assertLaunchedEnvironment(
@@ -374,5 +574,77 @@ export async function startManagedProviderRun(input: {
         // 실행되지 않았다. 열어 둔 broker 와 grant 를 그대로 두지 않는다.
         await stop();
     }
-    return { outcome, stop };
+    return {
+        outcome,
+        stop,
+        observedExit: () => observed,
+        async awaitGracefulStop(budgetMs) {
+            if (!controlWriter) return { stopped: false, detail: 'no-channel' };
+            try {
+                controlWriter.write(managedStopRequest());
+            } catch {
+                return { stopped: false, detail: 'no-channel' };
+            }
+            const deadline = Date.now() + budgetMs;
+            while (Date.now() < deadline) {
+                if (ackVerdict !== null && observed !== null) break;
+                await new Promise((resolve) => { setTimeout(resolve, 25).unref?.(); });
+            }
+            // 답이 없으면 timeout 이다. 없는 답을 깨끗하다고 읽지 않는다.
+            if (ackVerdict === null) return { stopped: false, detail: 'timeout' };
+            if (ackVerdict !== MANAGED_STOP_CLEAN) return { stopped: false, detail: ackVerdict };
+            // ack 는 '곧 나간다' 이고, 이것이 '나갔다' 이다.
+            if (observed === null) return { stopped: false, detail: 'exit-unobserved' };
+            if (observed.signal !== null || observed.code !== 0) {
+                /*
+                 * The kernel's own two values, recorded as they are.
+                 *
+                 * `exit-unclean` says the exit was not a flush; it does not
+                 * say whether something signalled the generation or whether it
+                 * chose a non-zero status, and those have different causes.
+                 * Both are kernel facts — a number and a signal name — so
+                 * neither carries anything of the provider's.
+                 */
+                logger.debug(
+                    `[managed] generation exit code=${observed.code ?? 'null'} `
+                    + `signal=${observed.signal ?? 'none'}`,
+                );
+                return { stopped: false, detail: 'exit-unclean' };
+            }
+            /*
+             * 마지막으로 빈 cgroup — **읽기만 한다.**
+             *
+             * `stop()` 은 `cgroup.kill` 로 비움을 만들어 내고 도구 경계까지
+             * 거둔다. 그것으로 증명을 만들면 "아직 쓰고 있는 손자를 죽여서
+             * 조용해졌으니 조용하다" 가 된다. 살아 있는 writer 는 거절해야 할
+             * 사실이지, 없애야 할 장애물이 아니다.
+             */
+            const population = observeGenerationPopulation();
+            if (population !== 'empty') return { stopped: false, detail: population };
+            /*
+             * 신원은 **성공의 조건이 아니다.**
+             *
+             * 이 증분은 무엇이 저장될 수 있는지를 넓히지 않는다. 신원이 없거나
+             * 충돌해도 이 세대는 여전히 깨끗하게 끝난 것이고, 그 판정은 EOF ·
+             * exit code · signal · writer 관측이 그대로 결정한다. 신원은 그
+             * 판정에 **동반되는 관측**이며, 없으면 없다고 말한다.
+             */
+            return {
+                stopped: true,
+                detail: 'stopped',
+                ...(ackNativeId === null ? {} : { nativeId: ackNativeId }),
+                ...(identityConflict ? { identity: 'conflict' as const } : {}),
+            };
+        },
+        requestGracefulStop: () => {
+            if (!controlWriter) return false;
+            try {
+                controlWriter.write(managedStopRequest());
+                return true;
+            } catch {
+                // 통로가 끊겼다. 청하지 못한 것을 청했다고 말하지 않는다.
+                return false;
+            }
+        },
+    };
 }

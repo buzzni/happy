@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { createCheckpointDrain } from '@/managed/checkpoint/managedCheckpointDrain';
-import { MANAGED_WRITE_TOOLS } from './toolWorkload';
+import { MANAGED_WRITE_TOOLS } from './managedToolCatalogue';
 import { createManagedToolRuntime } from './managedToolRuntime';
 import { handleBrokerMessage, mintBrokerGrant, type BrokerGrant } from './toolBroker';
 import { createToolExecutor, planToolExecutorIsolation, type ExecutorProcess } from './toolExecutor';

@@ -1,9 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, fsyncSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { createGenerationManifest, generationScopeDigest } from './generationManifest';
+import {
+    createGenerationManifest,
+    generationScopeDigest,
+    type GenerationNativeObservation,
+} from './generationManifest';
 
 const NOW = 1_800_000_000_000;
 const KEY = { runId: 'run-1', attemptId: 'attempt-1', epoch: 2 };
@@ -269,5 +273,395 @@ describe('open inventory and pending termination', () => {
         }));
         expect(manifest.proveAllBelow(Number.MAX_SAFE_INTEGER))
             .toMatchObject({ proven: false, detail: 'record-unreadable' });
+    });
+});
+
+describe('every record this ledger holds', () => {
+    let root: string;
+
+    beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'gen-manifest-all-')); });
+    afterEach(() => {
+        chmodSync(root, 0o700);
+        rmSync(root, { recursive: true, force: true });
+    });
+
+    const OPEN = { runId: 'run-open', attemptId: 'a1', epoch: 1 };
+    const PENDING = { runId: 'run-pending', attemptId: 'a2', epoch: 2 };
+    const CLOSED = { runId: 'run-closed', attemptId: 'a3', epoch: 3 };
+
+    function seeded() {
+        const manifest = createGenerationManifest(root);
+        manifest.recordLaunch({ key: OPEN, launchedAt: NOW });
+        manifest.recordLaunch({ key: PENDING, launchedAt: NOW });
+        manifest.recordTerminationRequested({ key: PENDING, requestedAt: NOW + 1 });
+        manifest.recordLaunch({ key: CLOSED, launchedAt: NOW });
+        manifest.recordTermination({ key: CLOSED, observedEmptyAt: NOW + 2 });
+        return manifest;
+    }
+
+    /** A record written straight to disk, under the name of its own digest. */
+    function plant(record: object, digestOf: object = record): void {
+        writeFileSync(
+            join(root, `${generationScopeDigest(digestOf as never)}.json`),
+            JSON.stringify(record),
+            { mode: 0o600 },
+        );
+    }
+
+    it('lists the closed generations as well as the open ones', () => {
+        const manifest = seeded();
+        const all = manifest.listAll();
+        expect(all.unreadable).toBe(0);
+        expect(all.records.map((record) => record.runId).sort())
+            .toEqual(['run-closed', 'run-open', 'run-pending']);
+        // The closure it records is the observation, with the request kept.
+        const closed = all.records.find((record) => record.runId === 'run-closed')!;
+        expect(closed.observedEmptyAt).toBe(NOW + 2);
+        const pending = all.records.find((record) => record.runId === 'run-pending')!;
+        expect(pending).toMatchObject({ terminationRequestedAt: NOW + 1, observedEmptyAt: null });
+    });
+
+    it('keeps listOpen a subset of it', () => {
+        const manifest = seeded();
+        const all = manifest.listAll();
+        const open = manifest.listOpen();
+        expect(open.records.map((record) => record.runId).sort()).toEqual(['run-open', 'run-pending']);
+        for (const record of open.records) expect(all.records).toContainEqual(record);
+        expect(open.unreadable).toBe(all.unreadable);
+    });
+
+    it('answers the same after a restart over the same directory', () => {
+        seeded();
+        const reopened = createGenerationManifest(root).listAll();
+        expect(reopened.records.map((record) => record.runId).sort())
+            .toEqual(['run-closed', 'run-open', 'run-pending']);
+        expect(reopened.unreadable).toBe(0);
+    });
+
+    it('counts a record whose ids are not safe segments rather than throwing', () => {
+        /*
+         * `generationScopeDigest` refuses an unsafe id by throwing, and the name
+         * check calls it on the record's *own* contents. So one planted record with
+         * a traversal id ended the whole listing as an exception — the inventory a
+         * restart reconciles from became "the ledger could not be read at all",
+         * which is not what happened and not what a caller can act on.
+         */
+        const manifest = seeded();
+        writeFileSync(join(root, `${'a'.repeat(64)}.json`), JSON.stringify({
+            version: 1, runId: '../escape', attemptId: 'a1', epoch: 1,
+            launchedAt: NOW, terminationRequestedAt: null, observedEmptyAt: null,
+        }), { mode: 0o600 });
+
+        const all = manifest.listAll();
+        expect(all.unreadable).toBe(1);
+        expect(all.records).toHaveLength(3);
+        expect(manifest.listOpen().unreadable).toBe(1);
+    });
+
+    it('answers the fencing proof on a ledger holding only that record, without throwing', () => {
+        /*
+         * Its own directory, one malformed record: nothing else can be reached
+         * first, so the answer is the record's own and not an artefact of
+         * `readdir` order. The shared name guard is what turns the digest throw
+         * into this refusal — the traversal itself is unchanged.
+         */
+        const alone = mkdtempSync(join(tmpdir(), 'gen-manifest-unsafe-'));
+        try {
+            const manifest = createGenerationManifest(alone);
+            writeFileSync(join(alone, `${'a'.repeat(64)}.json`), JSON.stringify({
+                version: 1, runId: '../escape', attemptId: 'a1', epoch: 1,
+                launchedAt: NOW, terminationRequestedAt: null, observedEmptyAt: null,
+            }), { mode: 0o600 });
+
+            expect(() => manifest.proveAllBelow(9)).not.toThrow();
+            expect(manifest.proveAllBelow(9)).toEqual({ proven: false, detail: 'record-unreadable' });
+            expect(manifest.listAll()).toEqual({ records: [], unreadable: 1 });
+        } finally {
+            rmSync(alone, { recursive: true, force: true });
+        }
+    });
+
+    it.each([
+        ['corrupt json', () => writeFileSync(join(root, `${'b'.repeat(64)}.json`), '{ not json', { mode: 0o600 })],
+        ['oversize', () => writeFileSync(join(root, `${'c'.repeat(64)}.json`), 'x'.repeat(5000), { mode: 0o600 })],
+        ['a name that is not a digest', () => writeFileSync(join(root, 'planted.json'), '{}', { mode: 0o600 })],
+    ])('counts %s as unreadable without dropping the records it could read', (_name, plantIt) => {
+        const manifest = seeded();
+        plantIt();
+        const all = manifest.listAll();
+        expect(all.unreadable).toBe(1);
+        expect(all.records).toHaveLength(3);
+    });
+
+    it('counts a record filed under another records digest as unreadable', () => {
+        const manifest = seeded();
+        // Valid content, wrong file name: the name is supposed to be its digest.
+        plant({
+            version: 1, runId: 'run-moved', attemptId: 'a9', epoch: 9,
+            launchedAt: NOW, terminationRequestedAt: null, observedEmptyAt: null,
+        }, { runId: 'run-other', attemptId: 'a8', epoch: 8 });
+        const all = manifest.listAll();
+        expect(all.unreadable).toBe(1);
+        expect(all.records.map((record) => record.runId)).not.toContain('run-moved');
+    });
+
+    it('reports a directory it cannot read as unreadable, not as an empty ledger', () => {
+        const manifest = seeded();
+        chmodSync(root, 0o000);
+        const all = manifest.listAll();
+        chmodSync(root, 0o700);
+        // An empty list here would tell a restart there was nothing to reconcile.
+        expect(all).toEqual({ records: [], unreadable: 1 });
+    });
+});
+
+describe('a native terminal observation', () => {
+    let root: string;
+
+    beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'gen-manifest-native-')); });
+    afterEach(() => {
+        chmodSync(root, 0o700);
+        rmSync(root, { recursive: true, force: true });
+    });
+
+    const KEY_N = { runId: 'run-n', attemptId: 'a1', epoch: 1 };
+    const SESSION = 'd6da1867-afd5-4637-bd7e-52a3e28c2fb8';
+    const OTHER_SESSION = '330a1f93-cda9-4080-89a3-c780c9ade479';
+
+    function observation(over: Partial<GenerationNativeObservation> = {}): GenerationNativeObservation {
+        return {
+            observedAt: NOW + 5,
+            outcome: 'clean-stopped',
+            nativeId: SESSION,
+            detail: 'stopped',
+            ...over,
+        };
+    }
+
+    function launched(io?: { rename?: typeof renameSync; fsync?: typeof fsyncSync }) {
+        // The launch is written with the real fs; only what happens afterwards is
+        // injected, so a failure belongs to the observation and not to the setup.
+        createGenerationManifest(root).recordLaunch({ key: KEY_N, launchedAt: NOW });
+        return createGenerationManifest(root, io ? { io } : {});
+    }
+
+    function storedObservation(manifest = createGenerationManifest(root)) {
+        return manifest.listAll().records.find((record) => record.runId === KEY_N.runId)?.nativeObservation;
+    }
+
+    it('stores the first proof of a launched generation', () => {
+        const manifest = launched();
+        expect(manifest.recordNativeObservation({ key: KEY_N, observation: observation() }))
+            .toEqual({ ok: true, stored: 'first' });
+        expect(storedObservation()).toEqual(observation());
+    });
+
+    it('refuses a generation it never launched, and writes nothing', () => {
+        // An observation must not manufacture a launch that never happened.
+        const manifest = createGenerationManifest(root);
+        expect(manifest.recordNativeObservation({ key: KEY_N, observation: observation() }))
+            .toEqual({ ok: false, reason: 'never-launched' });
+        expect(manifest.listAll()).toEqual({ records: [], unreadable: 0 });
+    });
+
+    it('keeps an absent observation distinct from one that reported no identity', () => {
+        const manifest = launched();
+        expect(storedObservation()).toBeUndefined();
+        manifest.recordNativeObservation({
+            key: KEY_N,
+            observation: observation({ outcome: 'native-unreported', nativeId: null }),
+        });
+        // Neither says the generation used no session; they differ only in
+        // whether a proof happened.
+        expect(storedObservation()).toMatchObject({ outcome: 'native-unreported', nativeId: null });
+    });
+
+    it('ignores a repeat that differs only in when it was observed', () => {
+        const manifest = launched();
+        manifest.recordNativeObservation({ key: KEY_N, observation: observation() });
+        expect(manifest.recordNativeObservation({
+            key: KEY_N, observation: observation({ observedAt: NOW + 999 }),
+        })).toEqual({ ok: true, stored: 'duplicate-ignored' });
+        // The stored time is when the fact was first proven.
+        expect(storedObservation()?.observedAt).toBe(NOW + 5);
+    });
+
+    it('turns two disagreeing proofs into a conflict that survives a reopen', () => {
+        const manifest = launched();
+        manifest.recordNativeObservation({ key: KEY_N, observation: observation() });
+        expect(manifest.recordNativeObservation({
+            key: KEY_N, observation: observation({ nativeId: OTHER_SESSION }),
+        })).toEqual({ ok: true, stored: 'first-conflicted' });
+
+        const reopened = createGenerationManifest(root);
+        expect(storedObservation(reopened))
+            .toMatchObject({ outcome: 'conflict', nativeId: null, observedAt: NOW + 5 });
+        // A peer that contradicted itself does not become trustworthy by
+        // repeating one half.
+        expect(reopened.recordNativeObservation({ key: KEY_N, observation: observation() }))
+            .toEqual({ ok: true, stored: 'conflict-kept' });
+        expect(storedObservation()).toMatchObject({ outcome: 'conflict', nativeId: null });
+    });
+
+    it('treats two spellings of one id as a conflict, not a duplicate', () => {
+        const manifest = launched();
+        manifest.recordNativeObservation({ key: KEY_N, observation: observation() });
+        expect(manifest.recordNativeObservation({
+            key: KEY_N, observation: observation({ nativeId: SESSION.toUpperCase() }),
+        })).toEqual({ ok: true, stored: 'first-conflicted' });
+    });
+
+    it.each([
+        ['an unknown outcome', { outcome: 'stopped-ish' as never }],
+        ['an id that is not a session id', { nativeId: 'nope' }],
+        ['an id on an outcome that reported none', { outcome: 'native-unreported' as const }],
+        ['a detail that is a sentence', { detail: 'it stopped, eventually' }],
+        ['an observation time of zero', { observedAt: 0 }],
+    ])('refuses %s as input rather than storing it', (_name, over) => {
+        const manifest = launched();
+        expect(manifest.recordNativeObservation({ key: KEY_N, observation: observation(over) }))
+            .toEqual({ ok: false, reason: 'observation-invalid' });
+        expect(storedObservation()).toBeUndefined();
+    });
+
+    it.each([
+        ['an unknown outcome', { outcome: 'stopped-ish' }],
+        ['an id that is not a session id', { nativeId: 'nope' }],
+        ['an id on an outcome that reported none', { outcome: 'native-unreported' }],
+        ['an observation time of zero', { observedAt: 0 }],
+        ['an outcome that is not a string', { outcome: 7 }],
+    ])('reads a record whose stored field is malformed — %s — as unreadable', (_name, over) => {
+        launched();
+        const path = join(root, `${generationScopeDigest(KEY_N)}.json`);
+        const record = JSON.parse(readFileSync(path, 'utf8'));
+        writeFileSync(path, JSON.stringify({
+            ...record,
+            nativeObservation: { ...observation(), ...over },
+        }), { mode: 0o600 });
+
+        expect(createGenerationManifest(root).listAll()).toEqual({ records: [], unreadable: 1 });
+    });
+
+    it('survives the writers that rebuild the whole record', () => {
+        /*
+         * `recordTerminationRequested` and `recordTermination` reconstruct the
+         * record from what was parsed, so a field they do not carry is erased by
+         * the next ordinary write — from inside, not from a downgrade.
+         */
+        const manifest = launched();
+        manifest.recordNativeObservation({ key: KEY_N, observation: observation() });
+        manifest.recordTerminationRequested({ key: KEY_N, requestedAt: NOW + 10 });
+        expect(storedObservation()).toEqual(observation());
+        manifest.recordTermination({ key: KEY_N, observedEmptyAt: NOW + 20 });
+
+        const reopened = createGenerationManifest(root);
+        expect(storedObservation(reopened)).toEqual(observation());
+        // And closure is what it was.
+        expect(reopened.proveStopped(KEY_N)).toMatchObject({ proven: true });
+    });
+
+    it('keeps a conflict through those writers too', () => {
+        const manifest = launched();
+        manifest.recordNativeObservation({ key: KEY_N, observation: observation() });
+        manifest.recordNativeObservation({ key: KEY_N, observation: observation({ nativeId: OTHER_SESSION }) });
+        manifest.recordTerminationRequested({ key: KEY_N, requestedAt: NOW + 10 });
+        manifest.recordTermination({ key: KEY_N, observedEmptyAt: NOW + 20 });
+        expect(storedObservation(createGenerationManifest(root)))
+            .toMatchObject({ outcome: 'conflict', nativeId: null });
+    });
+
+    it('does not change any fencing answer', () => {
+        const manifest = launched();
+        const before = {
+            stopped: manifest.proveStopped(KEY_N),
+            below: manifest.proveAllBelow(9),
+        };
+        manifest.recordNativeObservation({ key: KEY_N, observation: observation() });
+        expect(manifest.proveStopped(KEY_N)).toEqual(before.stopped);
+        expect(manifest.proveAllBelow(9)).toEqual(before.below);
+    });
+
+    describe('when the durable write fails', () => {
+        it('reports a failure before the rename, leaving the record as it was', () => {
+            const manifest = launched({
+                rename: () => { throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' }); },
+            });
+            expect(manifest.recordNativeObservation({ key: KEY_N, observation: observation() }))
+                .toEqual({ ok: false, reason: 'write-refused' });
+            // Untouched: the previous record is still the launch record.
+            expect(storedObservation()).toBeUndefined();
+            expect(createGenerationManifest(root).proveStopped(KEY_N))
+                .toMatchObject({ detail: 'termination-unknown' });
+        });
+
+        it('reports durability as unknown when only the directory barrier failed', () => {
+            let calls = 0;
+            const manifest = launched({
+                fsync: (fd: number) => {
+                    // A durable write syncs the file first, then the directory.
+                    // Only the second one fails here.
+                    if (calls++ === 1) throw Object.assign(new Error('EIO'), { code: 'EIO' });
+                    fsyncSync(fd);
+                },
+            });
+            expect(manifest.recordNativeObservation({ key: KEY_N, observation: observation() }))
+                .toEqual({ ok: false, reason: 'durability-unknown' });
+            // The rename landed, so the field is there — its durability is what
+            // is unknown, and nothing rolls back.
+            expect(storedObservation()).toEqual(observation());
+        });
+
+        it('re-attempts the barrier on a retry rather than calling it a duplicate', () => {
+            /*
+             * The rename landed and its directory entry was never made durable.
+             * Answering the retry `duplicate-ignored` on the value alone would
+             * report success while nothing had made those bytes survive a crash.
+             */
+            let calls = 0;
+            let failDirSync = true;
+            const barrierAttempts: number[] = [];
+            const manifest = launched({
+                fsync: (fd: number) => {
+                    // The first write syncs the file, then the directory; a
+                    // retry that stores nothing syncs the directory alone.
+                    const isDirectory = calls !== 0;
+                    calls += 1;
+                    if (!isDirectory) { fsyncSync(fd); return; }
+                    barrierAttempts.push(fd);
+                    if (failDirSync) throw Object.assign(new Error('EIO'), { code: 'EIO' });
+                    fsyncSync(fd);
+                },
+            });
+            expect(manifest.recordNativeObservation({ key: KEY_N, observation: observation() }))
+                .toEqual({ ok: false, reason: 'durability-unknown' });
+            const afterFirst = barrierAttempts.length;
+
+            // Same observation again, barrier still failing.
+            expect(manifest.recordNativeObservation({ key: KEY_N, observation: observation() }))
+                .toEqual({ ok: false, reason: 'durability-unknown' });
+            expect(barrierAttempts.length).toBeGreaterThan(afterFirst);
+
+            // Now it succeeds: the retry is what makes it durable.
+            failDirSync = false;
+            const attemptsBefore = barrierAttempts.length;
+            expect(manifest.recordNativeObservation({ key: KEY_N, observation: observation() }))
+                .toEqual({ ok: true, stored: 'duplicate-ignored' });
+            expect(barrierAttempts.length).toBeGreaterThan(attemptsBefore);
+            expect(storedObservation()?.observedAt).toBe(NOW + 5);
+        });
+
+        it('re-attempts the barrier on a conflict-kept retry as well', () => {
+            let syncs = 0;
+            const manifest = launched({
+                fsync: (fd: number) => { syncs += 1; fsyncSync(fd); },
+            });
+            manifest.recordNativeObservation({ key: KEY_N, observation: observation() });
+            manifest.recordNativeObservation({ key: KEY_N, observation: observation({ nativeId: OTHER_SESSION }) });
+            const before = syncs;
+            expect(manifest.recordNativeObservation({ key: KEY_N, observation: observation() }))
+                .toEqual({ ok: true, stored: 'conflict-kept' });
+            // The only sync a `conflict-kept` can issue is the barrier itself.
+            expect(syncs).toBeGreaterThan(before);
+        });
     });
 });

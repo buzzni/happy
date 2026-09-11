@@ -1,13 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { createGenerationManifest, generationScopeDigest } from './generationManifest';
 import {
+    acquireSupervisorLock,
+    supervisorLockAddress,
     classifyHelperStatus,
     createLeaseWatchdog,
     createSupervisor,
+    defaultSupervisorDeps,
     generationCgroupPath,
     type SupervisorDeps,
 } from './supervisor';
@@ -58,6 +61,14 @@ describe('helper status classification', () => {
             .toEqual({ kind: 'exec-attempted', pid: 4242 });
     });
 });
+
+
+/** 이 seam 이 낼 수 있는 실제 OS 오류. 코드가 판정을 가른다. */
+function errno(code: string): NodeJS.ErrnoException {
+    const error = new Error(code) as NodeJS.ErrnoException;
+    error.code = code;
+    return error;
+}
 
 describe('generation cgroup path', () => {
     it('is built from the delegated root and the generation identity', () => {
@@ -195,6 +206,31 @@ describe('supervisor', () => {
         expect(supervisor.stopGeneration(KEY)).toEqual({ stopped: false, detail: 'generation-absent' });
     });
 
+    it('a second stop of a generation it already proved empty converges on the record', () => {
+        const d = deps();
+        const { supervisor, path } = readyGeneration(d);
+        files.set(join(path, 'cgroup.events'), 'populated 0\nfrozen 0\n');
+
+        const first = supervisor.stopGeneration(KEY);
+        expect(first).toEqual({ stopped: true, observedEmptyAt: NOW });
+
+        /*
+         * The first stop removed the cgroup and recorded the proof. Answering
+         * the retry with `generation-absent` would mean a caller holding that
+         * generation never converges — and the runtime that will not release
+         * its lock until everything is proven down never releases it.
+         *
+         * What answers is the record, not the absence.
+         */
+        expect(supervisor.stopGeneration(KEY)).toEqual({ stopped: true, observedEmptyAt: NOW });
+    });
+
+    it('an absent generation it never proved stopped is still not a stop', () => {
+        // Same ENOENT, no record: absence on its own is not evidence.
+        const supervisor = createSupervisor(config, deps());
+        expect(supervisor.stopGeneration(KEY)).toEqual({ stopped: false, detail: 'generation-absent' });
+    });
+
     it('the watchdog does not act before the lease expires', () => {
         const d = deps({ monotonicNow: () => 1_000 });
         const { supervisor } = readyGeneration(d);
@@ -218,6 +254,259 @@ describe('supervisor', () => {
     });
 });
 
+describe('a launch refused before any helper ran', () => {
+    let manifestRoot: string;
+
+    beforeEach(() => { manifestRoot = mkdtempSync(join(tmpdir(), 'sup-refused-')); });
+    afterEach(() => { rmSync(manifestRoot, { recursive: true, force: true }); });
+
+    const config = {
+        cgroupRoot: '/sys/fs/cgroup/saycode',
+        helperPath: '/usr/local/lib/saycode/exec-helper',
+        workloadPath: '/usr/local/lib/saycode/node',
+        resolveGenerationCredentials: () => ({ uid: 10002, gid: 10002 }),
+    };
+
+    /** 실제 원장 + 실제 supervisor. 갈리는 것은 OS seam 뿐이다. */
+    function refuse(over: Partial<SupervisorDeps>) {
+        const manifest = createGenerationManifest(manifestRoot);
+        const supervisor = createSupervisor(config, {
+            manifest,
+            monotonicNow: () => 1_000,
+            now: () => NOW,
+            mkdir: () => { throw errno('EACCES'); },
+            writeFile: () => { throw errno('ENOENT'); },
+            readFile: () => { throw errno('ENOENT'); },
+            rmdir: () => {},
+            launch: async () => { throw new Error('never reached'); },
+            enrollWatchdog: () => {},
+            ...over,
+        });
+        return { manifest, supervisor };
+    }
+
+    const prepare = (supervisor: ReturnType<typeof createSupervisor>) => supervisor.prepareLaunch({
+        key: KEY, statusFd: 9, releaseFd: 8, leaseExpiresMonotonic: 60_000,
+    });
+
+    it('settles the ledger when the generation is confirmed never to have existed', async () => {
+        // 부모가 없어 mkdir 이 ENOENT 다. 그 자리에 세대가 있었을 수 없다.
+        const { manifest, supervisor } = refuse({ mkdir: () => { throw errno('ENOENT'); } });
+        expect(await prepare(supervisor)).toEqual({ kind: 'setup-refused', stage: 'cgroup-create-failed' });
+        /*
+         * 열린 채로 두면 epoch 승격과 공급자 checkpoint 가 **재시작 두 번까지**
+         * 막힌다. 아무것도 돌지 않았음이 확인됐으므로 그 자리에서 닫는다.
+         */
+        expect(manifest.proveAllBelow(KEY.epoch + 1)).toMatchObject({ proven: true });
+        expect(manifest.listOpen().records).toEqual([]);
+    });
+
+    it('leaves the ledger open when the cgroup state is unreadable', async () => {
+        // EACCES 는 "없다" 가 아니라 **모른다** 이다. 모르는 것을 통과시키지 않는다.
+        const { manifest, supervisor } = refuse({
+            mkdir: () => { throw errno('EACCES'); },
+            readFile: () => { throw errno('EACCES'); },
+        });
+        expect(await prepare(supervisor)).toEqual({ kind: 'setup-refused', stage: 'cgroup-create-failed' });
+        expect(manifest.proveAllBelow(KEY.epoch + 1)).toMatchObject({ proven: false });
+        expect(manifest.listOpen().records).toHaveLength(1);
+    });
+
+    it('leaves the ledger open when a group is already there with something in it', async () => {
+        // 남의 것이 살아 있다. 치웠다고 적으면 그 위에 새 writer 가 열린다.
+        const { manifest, supervisor } = refuse({
+            mkdir: () => { throw errno('EEXIST'); },
+            readFile: () => 'populated 1\n',
+        });
+        expect(await prepare(supervisor)).toEqual({ kind: 'setup-refused', stage: 'cgroup-create-failed' });
+        expect(manifest.proveAllBelow(KEY.epoch + 1)).toMatchObject({ proven: false });
+    });
+
+    it('settles when the helper never launched and the group it made is observed empty', async () => {
+        const removed: string[] = [];
+        const { manifest, supervisor } = refuse({
+            mkdir: () => {},
+            readFile: () => 'populated 0\n',
+            rmdir: (path) => { removed.push(path); },
+            launch: async () => { throw new Error('spawn failed'); },
+        });
+        expect(await prepare(supervisor)).toEqual({ kind: 'unknown', detail: 'launch-failed' });
+        expect(removed).toEqual([generationCgroupPath(config.cgroupRoot, KEY)]);
+        expect(manifest.proveAllBelow(KEY.epoch + 1)).toMatchObject({ proven: true });
+    });
+
+    it('leaves the ledger open when the kernel will not let the empty group go', async () => {
+        // rmdir 이 거부하면 커널은 아직 비었다고 보지 않는다. 그것이 판정이다.
+        const { manifest, supervisor } = refuse({
+            mkdir: () => {},
+            readFile: () => 'populated 0\n',
+            rmdir: () => { throw errno('EBUSY'); },
+            launch: async () => { throw new Error('spawn failed'); },
+        });
+        expect(await prepare(supervisor)).toEqual({ kind: 'unknown', detail: 'launch-failed' });
+        expect(manifest.proveAllBelow(KEY.epoch + 1)).toMatchObject({ proven: false });
+    });
+});
+
+describe('the watchdog and a generation whose stop was requested but never observed', () => {
+    let manifestRoot: string;
+
+    beforeEach(() => { manifestRoot = mkdtempSync(join(tmpdir(), 'sup-pending-')); });
+    afterEach(() => { rmSync(manifestRoot, { recursive: true, force: true }); });
+
+    /** 세대가 원장에 열려 있고 cgroup 은 사라진 상태를 만든다. */
+    function pendingSupervisor(over: Partial<SupervisorDeps> = {}) {
+        const manifest = createGenerationManifest(manifestRoot);
+        manifest.recordLaunch({ key: KEY, launchedAt: NOW });
+        return createSupervisor({
+            cgroupRoot: '/sys/fs/cgroup/saycode',
+            helperPath: '/x', workloadPath: '/y',
+            resolveGenerationCredentials: () => ({ uid: 1, gid: 1 }),
+        }, {
+            manifest,
+            monotonicNow: () => 9_000,
+            now: () => NOW,
+            mkdir: () => {},
+            // cgroup 이 이미 없다 — kill 요청이 ENOENT 로 돌아온다.
+            writeFile: () => { throw errno('ENOENT'); },
+            readFile: () => { throw errno('ENOENT'); },
+            rmdir: () => {},
+            launch: async () => { throw new Error('unused'); },
+            enrollWatchdog: () => {},
+            ...over,
+        });
+    }
+
+    it('resolves it in this process instead of waiting for a restart', () => {
+        const supervisor = pendingSupervisor();
+        const watchdog = createLeaseWatchdog({ supervisor, monotonicNow: () => 9_000, intervalMs: 100 });
+        watchdog.arm({ key: KEY, leaseExpiresMonotonic: 5_000 });
+        /*
+         * 첫 tick 은 정지를 **요청**하고 cgroup 이 없음을 본다. 그 부재는 이
+         * 요청 뒤의 것이므로 증거가 되며, 그 자리에서 마무리해야 한다. 예전에는
+         * `generation-absent` 만 돌려주고 영원히 다시 시도했다.
+         */
+        expect(watchdog.tick()[0]!.outcome).toMatchObject({ stopped: true });
+        expect(watchdog.armedCount()).toBe(0);
+    });
+
+    it('keeps watching when the cgroup state cannot be read', () => {
+        // 모르는 것은 통과가 아니다 — 감시를 놓으면 아무도 다시 시도하지 않는다.
+        const supervisor = pendingSupervisor({ readFile: () => { throw errno('EACCES'); } });
+        const watchdog = createLeaseWatchdog({ supervisor, monotonicNow: () => 9_000, intervalMs: 100 });
+        watchdog.arm({ key: KEY, leaseExpiresMonotonic: 5_000 });
+        expect(watchdog.tick()[0]!.outcome).toMatchObject({ stopped: false });
+        expect(watchdog.armedCount()).toBe(1);
+    });
+});
+
+describe('a launch that produced no helper at all', () => {
+    let manifestRoot: string;
+
+    beforeEach(() => { manifestRoot = mkdtempSync(join(tmpdir(), 'sup-nohelper-')); });
+    afterEach(() => { rmSync(manifestRoot, { recursive: true, force: true }); });
+
+    it('settles the ledger when the real spawn never produced a process', async () => {
+        /*
+         * **이 경로가 실제로 도는 경로다.** 기본 `launch` 는 spawn 이 실패해도
+         * 예외를 던지지 않는다 — `error` 를 받아 settle 하고 `pid: null` 인
+         * handle 로 **resolve** 한다. 그래서 예외 경로만 정산하면 흔한 실패
+         * (helper 경로 오류/ENOENT)는 그대로 열린 기록을 남긴다.
+         */
+        const removed: string[] = [];
+        const enrolled: unknown[] = [];
+        const manifest = createGenerationManifest(manifestRoot);
+        const supervisor = createSupervisor({
+            cgroupRoot: join(manifestRoot, 'cgroup-seam'),
+            helperPath: join(manifestRoot, 'nonexistent-helper'),
+            workloadPath: process.execPath,
+            resolveGenerationCredentials: () => ({ uid: 10002, gid: 10002 }),
+        }, {
+            ...defaultSupervisorDeps,
+            manifest,
+            monotonicNow: () => 1_000,
+            now: () => 2_000,
+            mkdir: () => {},
+            readFile: () => 'populated 0\n',
+            writeFile: () => {},
+            rmdir: (path) => { removed.push(path); },
+            enrollWatchdog: (entry) => { enrolled.push(entry); },
+        });
+        const result = await supervisor.prepareLaunch({
+            key: KEY, statusFd: 9, releaseFd: 8, leaseExpiresMonotonic: 60_000,
+        });
+        // 기동의 판정은 그대로여야 한다 — 정산은 원장의 일이다.
+        expect(result).toEqual({ kind: 'unknown', detail: 'no-ack-no-stage' });
+        expect(manifest.proveAllBelow(KEY.epoch + 1)).toMatchObject({ proven: true });
+        expect(removed).toEqual([generationCgroupPath(join(manifestRoot, 'cgroup-seam'), KEY)]);
+        // 아무것도 돌지 않았다. 감시할 것이 없다.
+        expect(enrolled).toEqual([]);
+    });
+
+    it('keeps the ledger open and watches when a process existed but never acked', async () => {
+        /*
+         * 프로세스는 있었고 ACK 은 없었다. 그 helper 가 cgroup 에 들어갔는지
+         * **모른다** — 치웠다고 적을 수 없다. 대신 감시에 올려, lease 가 끝나면
+         * 이 프로세스 안에서 정지가 시도되게 한다.
+         */
+        const enrolled: Array<{ key: unknown }> = [];
+        const manifest = createGenerationManifest(manifestRoot);
+        const supervisor = createSupervisor({
+            cgroupRoot: '/sys/fs/cgroup/saycode',
+            helperPath: '/x', workloadPath: '/y',
+            resolveGenerationCredentials: () => ({ uid: 1, gid: 1 }),
+        }, {
+            manifest,
+            monotonicNow: () => 1_000,
+            now: () => 2_000,
+            mkdir: () => {},
+            readFile: () => 'populated 0\n',
+            writeFile: () => {},
+            rmdir: () => {},
+            enrollWatchdog: (entry) => { enrolled.push(entry); },
+            launch: async () => ({
+                pid: null,
+                release: () => {}, abort: () => {},
+                // 프로세스는 존재했다 — spawn 은 성공했고 ACK 만 오지 않았다.
+                settled: Promise.resolve({ status: '', pid: 4242 }),
+            }) as never,
+        });
+        const result = await supervisor.prepareLaunch({
+            key: KEY, statusFd: 9, releaseFd: 8, leaseExpiresMonotonic: 60_000,
+        });
+        expect(result).toEqual({ kind: 'unknown', detail: 'no-ack-no-stage' });
+        expect(manifest.proveAllBelow(KEY.epoch + 1)).toMatchObject({ proven: false });
+        expect(enrolled).toHaveLength(1);
+    });
+
+    it('still refuses to settle an unreadable group even with no process', async () => {
+        const manifest = createGenerationManifest(manifestRoot);
+        const supervisor = createSupervisor({
+            cgroupRoot: '/sys/fs/cgroup/saycode',
+            helperPath: '/x', workloadPath: '/y',
+            resolveGenerationCredentials: () => ({ uid: 1, gid: 1 }),
+        }, {
+            manifest,
+            monotonicNow: () => 1_000,
+            now: () => 2_000,
+            mkdir: () => {},
+            // 상태를 읽지 못한다. 프로세스가 없었다는 것만으로 닫지 않는다.
+            readFile: () => { throw errno('EACCES'); },
+            writeFile: () => {},
+            rmdir: () => {},
+            enrollWatchdog: () => {},
+            launch: async () => ({
+                pid: null, release: () => {}, abort: () => {},
+                settled: Promise.resolve({ status: '', pid: null }),
+            }) as never,
+        });
+        await supervisor.prepareLaunch({
+            key: KEY, statusFd: 9, releaseFd: 8, leaseExpiresMonotonic: 60_000,
+        });
+        expect(manifest.proveAllBelow(KEY.epoch + 1)).toMatchObject({ proven: false });
+    });
+});
+
 describe('autonomous lease watchdog', () => {
     function fakeSupervisor(outcomes: Array<{ stopped: boolean; detail?: string }>) {
         const calls: unknown[] = [];
@@ -231,6 +520,15 @@ describe('autonomous lease watchdog', () => {
                     return next.stopped
                         ? { stopped: true as const, observedEmptyAt: NOW }
                         : { stopped: false as const, detail: next.detail ?? 'still-populated' };
+                },
+                /*
+                 * 이 축의 대역이지 판정이 아니다. 이 그룹의 결과는 전부
+                 * `still-populated` 라 watchdog 의 해소 분기로 들어가지 않는다 —
+                 * 그 분기는 실제 supervisor 로 따로 본다.
+                 */
+                resolvePendingTermination: (key: typeof KEY) => {
+                    calls.push(key);
+                    return { stopped: false as const, detail: 'termination-pending' };
                 },
             },
         };
@@ -588,4 +886,23 @@ describe('an expired lease cannot be revived by a newer renewal (Astra P1-2)', (
         // 그 tick 이 확실히 집행하도록 정지 의도가 남는다.
         expect(manifest.proveStopped(KEY)).toMatchObject({ detail: 'termination-pending' });
     });
+});
+
+
+it.runIf(process.platform === 'linux')('returns the exact bound physical address even when the alias changes after acquire', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ownership-address-'));
+    const firstRoot = join(root, 'first'); const secondRoot = join(root, 'second'); const alias = join(root, 'alias');
+    mkdirSync(firstRoot); mkdirSync(secondRoot); symlinkSync(firstRoot, alias);
+    const input = { runtimeId: 'first', manifestRoot: alias, cgroupRoot: join(root, 'cgroup') };
+    const expected = supervisorLockAddress(input);
+    const held = await acquireSupervisorLock(input);
+    expect(held.ok).toBe(true);
+    if (!held.ok) throw new Error('fixture lock unavailable');
+    try {
+        unlinkSync(alias); symlinkSync(secondRoot, alias);
+        expect(held.address).toBe(expected);
+        expect(supervisorLockAddress(input)).not.toBe(held.address);
+        expect(await acquireSupervisorLock({ ...input, runtimeId: 'another', manifestRoot: firstRoot }))
+            .toEqual({ ok: false, reason: 'already-held' });
+    } finally { await held.release(); rmSync(root, { recursive: true, force: true }); }
 });

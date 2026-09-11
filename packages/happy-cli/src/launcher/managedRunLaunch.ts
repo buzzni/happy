@@ -40,8 +40,6 @@
  */
 import { join } from 'node:path';
 
-import { MANAGED_TOOL_WORKLOAD_PATH } from '@/managed/managedImagePackaging';
-
 import {
     startManagedToolSession,
     type ManagedToolSession,
@@ -51,6 +49,7 @@ import { generationScopeDigest } from './generationManifest';
 import {
     startManagedProviderRun,
     TRUSTED_LAUNCH_ROOT,
+    TRUSTED_TOOL_WORKLOAD_PATH,
     type ManagedProviderRun,
 } from './managedProviderRun';
 import type { BrokerTool } from './toolBroker';
@@ -132,7 +131,7 @@ export async function launchManagedRun(input: {
         TRUSTED_LAUNCH_ROOT,
         `provider-exec-${generationScopeDigest(input.key).slice(0, 32)}`,
     );
-    if (providerScriptPath === MANAGED_TOOL_WORKLOAD_PATH) {
+    if (providerScriptPath === TRUSTED_TOOL_WORKLOAD_PATH) {
         throw new Error('provider script path must not be the tool workload');
     }
 
@@ -150,7 +149,7 @@ export async function launchManagedRun(input: {
         identity: { provider: isolation.provider, executor: isolation.executor },
         cgroupPath: input.cgroupPath,
         helperPath: input.toolHelperPath,
-        workloadPath: MANAGED_TOOL_WORKLOAD_PATH,
+        workloadPath: TRUSTED_TOOL_WORKLOAD_PATH,
         onUnprovenTermination: input.onUnprovenTermination,
         checkpointDrain: input.checkpointDrain,
         executorDeps: input.executorDeps,

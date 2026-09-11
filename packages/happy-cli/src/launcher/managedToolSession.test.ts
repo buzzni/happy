@@ -3,7 +3,7 @@ import { request as httpRequest } from 'node:http';
 import { describe, expect, it } from 'vitest';
 
 import { createCheckpointDrain } from '@/managed/checkpoint/managedCheckpointDrain';
-import { MANAGED_WRITE_TOOLS } from './toolWorkload';
+import { MANAGED_WRITE_TOOLS } from './managedToolCatalogue';
 import { startManagedToolSession } from './managedToolSession';
 import { type ExecutorProcess, type ToolExecutorDeps } from './toolExecutor';
 

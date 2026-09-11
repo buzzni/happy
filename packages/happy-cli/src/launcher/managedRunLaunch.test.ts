@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { launchManagedRun } from './managedRunLaunch';
 import { MANAGED_TOOL_WORKLOAD_PATH } from '@/managed/managedImagePackaging';
-import { MANAGED_CODING_TOOLS, MANAGED_WRITE_TOOLS } from './toolWorkload';
+import { MANAGED_CODING_TOOLS, MANAGED_WRITE_TOOLS } from './managedToolCatalogue';
 import type { ExecutorProcess, ToolExecutorDeps } from './toolExecutor';
 
 const identity = {

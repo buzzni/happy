@@ -22,6 +22,7 @@ import { encodeBase64, decodeBase64, encrypt, decrypt } from './encryption';
 import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer';
 import { backoff } from '@/utils/time';
 import { applyManagedRpcRestrictions, registerManagedRpcHandlers, type ManagedRpcHandlers } from '@/daemon/managedRpcHandlers';
+import type { ByosOfflineRpcHandlers } from '@/daemon/byosOfflineReceive';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { createRpcRequestListener } from './rpc/rpcRequestListener';
 import { detectCLIAvailability, CLIAvailability } from '@/utils/detectCLI';
@@ -357,6 +358,15 @@ type MachineRpcHandlers = {
     aiCredentialRuntime: AiCredentialRuntime;
     autonomousQualityGate?: AutonomousQualityGateRpcHandlers;
     checkpoint?: CheckpointRpcHandlers;
+    /**
+     * BYOS offline delivery, when the daemon wired it.
+     *
+     * Absent on a daemon that has no parent origin configured: without one the
+     * receiver cannot ask whether a delivery is authorized, and registering a
+     * handler that can only ever hold would make the parent wait for a person
+     * on every request.
+     */
+    byosOfflineReceive?: ByosOfflineRpcHandlers;
 }
 
 function requireNonEmptyString(value: unknown, name: string): string {
@@ -534,6 +544,7 @@ export class ApiMachineClient {
         aiCredentialRuntime,
         autonomousQualityGate,
         checkpoint,
+        byosOfflineReceive,
         linkSpawnedSession,
     }: MachineRpcHandlers) {
         this.resumeSessionHandler = resumeSession ?? null;
@@ -545,6 +556,15 @@ export class ApiMachineClient {
             this.rpcHandlerManager.registerHandler('autonomous-quality-gate:status', autonomousQualityGate.status);
             this.rpcHandlerManager.registerHandler('autonomous-quality-gate:control', autonomousQualityGate.control);
             this.autonomousQualityGateRpcAvailable = true;
+        }
+
+        if (byosOfflineReceive) {
+            this.rpcHandlerManager.registerHandler(
+                'byos-offline:confirm-session-host', byosOfflineReceive.confirmSessionHost,
+            );
+            this.rpcHandlerManager.registerHandler(
+                'byos-offline:deliver', byosOfflineReceive.deliver,
+            );
         }
 
         if (checkpoint) {
@@ -754,6 +774,19 @@ export class ApiMachineClient {
             if (result.reason === 'not-found') {
                 logger.debug(`[API MACHINE] Session ${sessionId} not tracked; treating stop as no-op success`);
                 return { message: 'Session not tracked', stopped: false, reason: 'not-found' };
+            }
+
+            if (result.reason === 'managed-generation') {
+                // The stop went to the supervisor, which is the only side that
+                // can kill a managed generation and observe it empty. Saying
+                // `stopped` here would report a stop nobody proved.
+                logger.debug(`[API MACHINE] Managed generation stop routed to the supervisor for ${sessionId}`);
+                return {
+                    message: 'Managed generation; stop requested from the supervisor',
+                    stopped: false,
+                    reason: 'managed-generation',
+                    detail: result.detail,
+                };
             }
 
             // Guard refused an if-idle stop because the session is active. Return a

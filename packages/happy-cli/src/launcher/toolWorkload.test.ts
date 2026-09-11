@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { MANAGED_CODING_TOOLS, handleToolCall } from './toolWorkload';
+import { handleToolCall } from './toolWorkload';
+import { MANAGED_CODING_TOOLS } from './managedToolCatalogue';
 
 /** 실제 실행 대신 관측 가능한 대역. 경계 판정만 본다. */
 function harness(overrides: Partial<Parameters<typeof handleToolCall>[1]> = {}) {

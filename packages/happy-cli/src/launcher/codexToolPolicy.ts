@@ -63,6 +63,8 @@ export type CodexToolPolicy = {
  * (`managedStartup.applyManagedGatewayEnvironment`). 금지 대상은 이 run 의
  * 것이 아닌 자격과 caller 가 정하면 안 되는 경로다.
  */
+import { TRUSTED_RUNTIME_BOOTSTRAP_ENV } from './managedRuntimeBootstrapEnv';
+
 const FORBIDDEN_PROVIDER_ENV = ['ANTHROPIC_API_KEY', 'CODEX_HOME', 'CODEX_ACCESS_TOKEN'];
 
 function assertLoopbackHttpUrl(value: string): void {
@@ -91,6 +93,10 @@ export function buildCodexToolPolicy(input: CodexToolPolicyInput): CodexToolPoli
         throw new Error('codexHome must be an absolute path');
     }
     for (const key of Object.keys(input.env)) {
+        // The runtime's own three are allowed by name; the prefix is otherwise
+        // closed. Codex keeps its own forbidden list — the lists differ by
+        // agent — but the trusted three are one set, named in one place.
+        if (TRUSTED_RUNTIME_BOOTSTRAP_ENV.has(key)) continue;
         if (FORBIDDEN_PROVIDER_ENV.includes(key) || key.startsWith('HAPPY_MANAGED_')) {
             throw new Error(`managed provider env must not carry ${key}`);
         }

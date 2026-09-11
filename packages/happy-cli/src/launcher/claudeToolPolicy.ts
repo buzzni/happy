@@ -118,6 +118,8 @@ function assertLoopbackHttpUrl(value: string): URL {
  * 승인된 자리다. 금지되는 것은 **이 run 의 것이 아닌** 자격이다: 상속된 개인
  * API 키, 계정 OAuth 토큰, daemon 의 홈.
  */
+import { TRUSTED_RUNTIME_BOOTSTRAP_ENV } from './managedRuntimeBootstrapEnv';
+
 const FORBIDDEN_PROVIDER_ENV = [
     'ANTHROPIC_API_KEY',
     'CLAUDE_CODE_OAUTH_TOKEN',
@@ -136,6 +138,7 @@ const FORBIDDEN_TOOL_ENV = [
 /** provider env 검사. 승인된 capability 자리는 남기고 나머지를 막는다. */
 export function assertProviderEnv(env: Record<string, string>): void {
     for (const key of Object.keys(env)) {
+        if (TRUSTED_RUNTIME_BOOTSTRAP_ENV.has(key)) continue;
         if (FORBIDDEN_PROVIDER_ENV.includes(key) || key.startsWith('HAPPY_MANAGED_')) {
             throw new Error(`managed provider env must not carry ${key}`);
         }

@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
-
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -572,5 +571,511 @@ describe('the launch can pass trusted descriptors through', () => {
             }),
         });
         expect(seen).toBeUndefined();
+    });
+});
+
+describe('the provider run reports the exit it was told about', () => {
+    /**
+     * `observedExit` is the runtime's only independent answer to "did the
+     * provider finish writing". The rule it has to keep is that silence stays
+     * silence: a run nobody saw end must not read as one that ended well.
+     */
+    it('shouldAnswerNullUntilSomethingObservesTheProviderLeaving', async () => {
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => ({
+                execGeneration: async (call: { onAcquired?: (pid: number) => Promise<void> }) => {
+                    if (call.onAcquired) await call.onAcquired(777);
+                    return { kind: 'exec-attempted' as const, pid: 777 };
+                },
+                stopGeneration: () => ({ stopped: true as const, observedEmptyAt: 1 }),
+            }),
+        });
+        // The generation was released and is running. Nothing has ended.
+        expect(run.observedExit()).toBeNull();
+    });
+
+    it('shouldReportTheExitTheSupervisorObserved', async () => {
+        const events: string[] = [];
+        let announce: ((exit: { code: number | null; signal: string | null }) => void) | null = null;
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => ({
+                execGeneration: async (call: {
+                    onAcquired?: (pid: number) => Promise<void>;
+                    onExit?: (exit: { code: number | null; signal: string | null }) => void;
+                }) => {
+                    announce = call.onExit ?? null;
+                    if (call.onAcquired) await call.onAcquired(777);
+                    return { kind: 'exec-attempted' as const, pid: 777 };
+                },
+                stopGeneration: () => ({ stopped: true as const, observedEmptyAt: 1 }),
+            }),
+        });
+        expect(announce).not.toBeNull();
+        announce!({ code: 0, signal: null });
+        expect(run.observedExit()).toEqual({ code: 0, signal: null });
+    });
+
+    it('shouldKeepTheFirstObservationRatherThanTheLastOne', async () => {
+        // One generation, one process, one ending. A later value overwriting
+        // the first would mean the record is no longer what the kernel said.
+        const events: string[] = [];
+        let announce: ((exit: { code: number | null; signal: string | null }) => void) | null = null;
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => ({
+                execGeneration: async (call: {
+                    onAcquired?: (pid: number) => Promise<void>;
+                    onExit?: (exit: { code: number | null; signal: string | null }) => void;
+                }) => {
+                    announce = call.onExit ?? null;
+                    if (call.onAcquired) await call.onAcquired(777);
+                    return { kind: 'exec-attempted' as const, pid: 777 };
+                },
+                stopGeneration: () => ({ stopped: true as const, observedEmptyAt: 1 }),
+            }),
+        });
+        announce!({ code: null, signal: 'SIGKILL' });
+        announce!({ code: 0, signal: null });
+        expect(run.observedExit()).toEqual({ code: null, signal: 'SIGKILL' });
+    });
+});
+
+/**
+ * A supervisor that opens a real two-way control channel, the way Node's extra
+ * `'pipe'` stdio slots do (they are socketpairs — measured, not assumed).
+ */
+function channelSupervisor(events: string[], behaviour: {
+    ack?: string | null;
+    /** The ack delivered in pieces, to exercise the framing. */
+    ackChunks?: string[];
+    exit?: { code: number | null; signal: string | null } | null;
+    stopped?: boolean;
+} = {}) {
+    const listeners: Array<(chunk: string) => void> = [];
+    const writer = {
+        write: (text: string) => {
+            events.push(`sent:${text.trim()}`);
+            // The child answers, on the same descriptor.
+            const chunks = behaviour.ackChunks
+                ?? (behaviour.ack !== null && behaviour.ack !== undefined
+                    ? [`ended ${behaviour.ack}\n`]
+                    : []);
+            for (const chunk of chunks) {
+                for (const listener of listeners) listener(chunk);
+            }
+        },
+        on: (event: string, handler: (chunk: string) => void) => {
+            if (event === 'data') listeners.push(handler);
+        },
+    };
+    return {
+        execGeneration: async (call: {
+            onAcquired?: (pid: number) => Promise<void>;
+            onExit?: (exit: { code: number | null; signal: string | null }) => void;
+            onControlWriters?: (writers: Map<number, unknown>) => void;
+        }) => {
+            call.onControlWriters?.(new Map([[5, writer]]));
+            if (call.onAcquired) await call.onAcquired(777);
+            const exit = behaviour.exit === undefined ? { code: 0, signal: null } : behaviour.exit;
+            if (exit && call.onExit) call.onExit(exit);
+            return { kind: 'exec-attempted' as const, pid: 777 };
+        },
+        stopGeneration: () => (behaviour.stopped === false
+            ? { stopped: false as const, detail: 'still-populated' }
+            : { stopped: true as const, observedEmptyAt: 1 }),
+    };
+}
+
+describe('asking a generation to end its input without killing it', () => {
+    it('shouldStopOnlyWhenTheChildSaidSoAndItWasSeenToLeaveAndTheCgroupIsEmpty', async () => {
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, { ack: 'exhausted-clean' }) as never,
+        });
+
+        expect(await run.awaitGracefulStop(500)).toEqual({ stopped: true, detail: 'stopped' });
+        // It asked, rather than killing.
+        expect(events).toContain('sent:stop');
+    });
+
+    it('shouldNotCallASilentChildAStoppedOne', async () => {
+        // The budget ran out with no answer. Reading that as clean is how a
+        // provider that is still writing gets archived.
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, { ack: null }) as never,
+        });
+
+        expect(await run.awaitGracefulStop(100)).toEqual({ stopped: false, detail: 'timeout' });
+    });
+
+    it('shouldReportTheChildsOwnRefusalRatherThanATimeout', async () => {
+        // The child answered, and its answer was that the input was not
+        // exhausted — an abort, not an end. That is a different fact.
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, { ack: 'input-not-exhausted' }) as never,
+        });
+
+        expect(await run.awaitGracefulStop(500))
+            .toEqual({ stopped: false, detail: 'input-not-exhausted' });
+    });
+
+    it('shouldNotTrustAnAckFromAChildNobodySawLeave', async () => {
+        /*
+         * The ack says "about to leave", not "left". Named as
+         * `exit-unobserved` rather than `timeout`: the child did answer, and
+         * what is missing is the observation — two different problems with two
+         * different next steps.
+         */
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, {
+                ack: 'exhausted-clean', exit: null,
+            }) as never,
+        });
+
+        expect(await run.awaitGracefulStop(100))
+            .toEqual({ stopped: false, detail: 'exit-unobserved' });
+    });
+
+
+
+    it.each([
+        [['ended exhausted-clean\n']],
+        [['ended exhausted-', 'clean\n']],
+        [['end', 'ed exh', 'austed-clean', '\n']],
+        [['ended exhausted-clean\nended something-else\n']],
+    ])('shouldReadTheSameVerdictHoweverTheAnswerWasChunked(%j)', async (chunks) => {
+        /*
+         * A frame split across reads must not disappear, and a truncated
+         * first token must not win — `ended exhausted-cle` matches the verdict
+         * shape, so a parser that read chunks directly would accept it and,
+         * because the first answer wins, keep it for good.
+         *
+         * The last case sends a second verdict in the same read: the first
+         * answer is the child's answer.
+         */
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, { ackChunks: chunks }) as never,
+        });
+
+        expect(await run.awaitGracefulStop(500)).toEqual({ stopped: true, detail: 'stopped' });
+    });
+
+    it('shouldRefuseALivingWriterRatherThanKillingItToMakeTheProof', async () => {
+        /*
+         * The child acked and was seen to exit 0, but its cgroup still has
+         * something in it — a grandchild holding provider state open.
+         *
+         * `stopGeneration` writes `cgroup.kill` before it checks anything, so
+         * proving emptiness through it would *create* the emptiness. The
+         * observation here is a read of `cgroup.events` and nothing else, and
+         * a living writer is a fact to refuse rather than an obstacle to
+         * remove.
+         */
+        const root = mkdtempSync(join(tmpdir(), 'op3-cgroup-'));
+        const generation = join(root, `run-${KEY.runId}`, `attempt-${KEY.attemptId}`, `epoch-${KEY.epoch}`);
+        mkdirSync(generation, { recursive: true });
+        writeFileSync(join(generation, 'cgroup.events'), 'populated 1\n');
+
+        const events: string[] = [];
+        try {
+            const run = await startManagedProviderRun({
+                ...base(events),
+                cgroupRoot: root,
+                createSupervisor: () => channelSupervisor(events, { ack: 'exhausted-clean' }) as never,
+            });
+
+            expect(await run.awaitGracefulStop(500))
+                .toEqual({ stopped: false, detail: 'populated' });
+            // Nothing was killed to get that answer.
+            expect(events).not.toContain('stop-generation');
+            expect(events).not.toContain('session-close');
+            // And the writer is still there.
+            expect(readFileSync(join(generation, 'cgroup.events'), 'utf8')).toContain('populated 1');
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it('shouldNotCallAnUnreadableCgroupEmpty', async () => {
+        // A read that failed is not an observation of quiet.
+        const root = mkdtempSync(join(tmpdir(), 'op3-cgroup-'));
+        const generation = join(root, `run-${KEY.runId}`, `attempt-${KEY.attemptId}`, `epoch-${KEY.epoch}`);
+        mkdirSync(generation, { recursive: true });
+        writeFileSync(join(generation, 'cgroup.events'), 'frozen 0\n');
+
+        const events: string[] = [];
+        try {
+            const run = await startManagedProviderRun({
+                ...base(events),
+                cgroupRoot: root,
+                createSupervisor: () => channelSupervisor(events, { ack: 'exhausted-clean' }) as never,
+            });
+            expect(await run.awaitGracefulStop(500)).toMatchObject({ stopped: false });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it('shouldSayThereIsNoChannelRatherThanFailingWhenTheRuntimeOpenedNone', async () => {
+        // Not a failure: this runtime cannot stop gracefully, and the
+        // quiescence gate turns that into a refusal.
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events), createSupervisor: () => fakeSupervisor(events),
+        });
+
+        expect(await run.awaitGracefulStop(100)).toEqual({ stopped: false, detail: 'no-channel' });
+        expect(run.requestGracefulStop()).toBe(false);
+    });
+});
+
+describe('the native session a stopped generation names', () => {
+    const A = '11111111-2222-4333-8444-555555555555';
+    const B = '66666666-7777-4888-8999-aaaaaaaaaaaa';
+
+    it('shouldReportTheSessionTheChildNamedAlongsideTheStop', async () => {
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, {
+                ackChunks: [`ended exhausted-clean ${A}\n`],
+            }) as never,
+        });
+        expect(await run.awaitGracefulStop(500))
+            .toEqual({ stopped: true, detail: 'stopped', nativeId: A });
+    });
+
+    it('shouldStopCleanlyForAChildThatNamedNoSession', async () => {
+        /*
+         * An older child, or one that left before the SDK named a session.
+         * Identity is **not** a condition of the stop: EOF, exit code, signal
+         * and the empty cgroup decide, exactly as before this field existed.
+         */
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, { ack: 'exhausted-clean' }) as never,
+        });
+        expect(await run.awaitGracefulStop(500)).toEqual({ stopped: true, detail: 'stopped' });
+    });
+
+    it('shouldKeepTheFirstAnswerWhenTheChildRepeatsItself', async () => {
+        // A generation ends once. A repeat is harmless and changes nothing.
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, {
+                ackChunks: [`ended exhausted-clean ${A}\n`, `ended exhausted-clean ${A}\n`],
+            }) as never,
+        });
+        expect(await run.awaitGracefulStop(500))
+            .toEqual({ stopped: true, detail: 'stopped', nativeId: A });
+    });
+
+    it('shouldDropBothIdentitiesWhenOneGenerationClaimsTwoSessions', async () => {
+        /*
+         * Two different sessions for one generation is a claim nobody can act
+         * on: neither is more credible than the other, and keeping whichever
+         * arrived first would preserve a session that may not be the one that
+         * was written. The verdict is untouched — the generation still ended
+         * exactly as cleanly as the kernel and the cgroup say it did.
+         */
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, {
+                ackChunks: [`ended exhausted-clean ${A}\n`, `ended exhausted-clean ${B}\n`],
+            }) as never,
+        });
+        expect(await run.awaitGracefulStop(500))
+            .toEqual({ stopped: true, detail: 'stopped', identity: 'conflict' });
+    });
+
+    it('shouldPoisonTheIdentityWhenOneSessionArrivesWithTwoVerdicts', async () => {
+        /*
+         * The frame is one observation, so a second frame naming the **same**
+         * session with a **different** verdict contradicts the first just as
+         * squarely as a second session would. Keeping the identity there would
+         * hand downstream a session blessed by a pair the child itself does not
+         * agree on.
+         *
+         * The verdict keeps its existing protection — first answer wins, and a
+         * later frame cannot turn a refusal into a stop.
+         */
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, {
+                ackChunks: [
+                    `ended exhausted-clean ${A}\n`,
+                    `ended provider-exit-unclean ${A}\n`,
+                ],
+            }) as never,
+        });
+        expect(await run.awaitGracefulStop(500))
+            .toEqual({ stopped: true, detail: 'stopped', identity: 'conflict' });
+    });
+
+    it('shouldNotInventAConflictWhenNoIdentityWasEverClaimed', async () => {
+        // Two frames, neither naming a session. There is no identity to poison,
+        // and the contradicting verdict is already covered by first-answer-wins.
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, {
+                ackChunks: ['ended exhausted-clean\n', 'ended something-else\n'],
+            }) as never,
+        });
+        expect(await run.awaitGracefulStop(500)).toEqual({ stopped: true, detail: 'stopped' });
+    });
+
+    it('shouldPoisonAnIdentityWhoseVerdictALaterFrameContradicts', async () => {
+        // The first frame blessed A with `exhausted-clean`; the second withdraws
+        // that verdict. A is no longer a session anyone said ended cleanly.
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, {
+                ackChunks: [`ended exhausted-clean ${A}\n`, 'ended provider-exit-unclean\n'],
+            }) as never,
+        });
+        expect(await run.awaitGracefulStop(500))
+            .toEqual({ stopped: true, detail: 'stopped', identity: 'conflict' });
+    });
+
+    it('shouldHandOnTheSessionExactlyAsTheChildSpelledIt', async () => {
+        /*
+         * The id reaches a path. Folding it anywhere between the child and the
+         * consumer means looking for a file that is not there, and the fold
+         * would be invisible in any test whose fixture is already lower case.
+         */
+        const upper = 'AABBCCDD-11EE-4FF1-8ABC-DEF123456789';
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, {
+                ackChunks: [`ended exhausted-clean ${upper}\n`],
+            }) as never,
+        });
+        expect(await run.awaitGracefulStop(500))
+            .toEqual({ stopped: true, detail: 'stopped', nativeId: upper });
+    });
+
+    it('shouldRefuseTwoSpellingsAsAContradiction', async () => {
+        /*
+         * Corrected. freeze73 folded case here on the reasoning that "case is
+         * not identity" - true of a UUID as a number, and **not** evidence about
+         * what the provider writes. Nothing establishes that Claude treats
+         * `ABCDEF…` and `abcdef…` as one session on disk, and every downstream
+         * comparison is exact: the derivation matches the reference path
+         * character for character, and the transcript lives at a path spelled
+         * one way.
+         *
+         * So the two layers disagreed - the ack said "one session", the path
+         * layer would have looked for a file that is not there. Astra's probe
+         * caught it: two spellings came back `{stopped: true, nativeId: <first>}`.
+         *
+         * A differing spelling is now what it is: a child contradicting itself
+         * about which session it wrote, which is a conflict and stays one.
+         */
+        const mixed = 'aabbccdd-11ee-4ff1-8abc-def123456789';
+        expect(mixed.toUpperCase()).not.toBe(mixed);
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, {
+                ackChunks: [
+                    `ended exhausted-clean ${mixed}\n`,
+                    `ended exhausted-clean ${mixed.toUpperCase()}\n`,
+                ],
+            }) as never,
+        });
+        expect(await run.awaitGracefulStop(500))
+            .toEqual({ stopped: true, detail: 'stopped', identity: 'conflict' });
+    });
+
+    it('shouldStillAcceptTheSameSpellingTwice', async () => {
+        // A byte-identical repeat is a peer repeating itself, not a
+        // contradiction. This is the line the fix must not cross.
+        const upper = 'AABBCCDD-11EE-4FF1-8ABC-DEF123456789';
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, {
+                ackChunks: [
+                    `ended exhausted-clean ${upper}\n`,
+                    `ended exhausted-clean ${upper}\n`,
+                ],
+            }) as never,
+        });
+        expect(await run.awaitGracefulStop(500))
+            .toEqual({ stopped: true, detail: 'stopped', nativeId: upper });
+    });
+
+    it('shouldKeepASpellingConflictStickyAcrossALaterAgreement', async () => {
+        // Same rule as every other conflict here: once the child has said two
+        // things, repeating one of them is not evidence for it.
+        const mixed = 'aabbccdd-11ee-4ff1-8abc-def123456789';
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, {
+                ackChunks: [
+                    `ended exhausted-clean ${mixed}\n`,
+                    `ended exhausted-clean ${mixed.toUpperCase()}\n`,
+                    `ended exhausted-clean ${mixed}\n`,
+                ],
+            }) as never,
+        });
+        expect(await run.awaitGracefulStop(500))
+            .toEqual({ stopped: true, detail: 'stopped', identity: 'conflict' });
+    });
+
+    it('shouldNotLetACorrectFrameResurrectAnIdentityAfterAConflict', async () => {
+        /*
+         * Three frames, through the real parser into the real supervisor-side
+         * reader: A, then B, then A again. Accepting the last one would make
+         * the conclusion depend on arrival order, and a child that contradicted
+         * itself once is not made credible by repeating one of its answers.
+         */
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, {
+                ackChunks: [
+                    `ended exhausted-clean ${A}\n`,
+                    `ended exhausted-clean ${B}\n`,
+                    `ended exhausted-clean ${A}\n`,
+                ],
+            }) as never,
+        });
+        expect(await run.awaitGracefulStop(500))
+            .toEqual({ stopped: true, detail: 'stopped', identity: 'conflict' });
+    });
+
+    it('shouldNotLetALaterAnswerRewriteARefusal', async () => {
+        // The first answer is the child's answer. A second one arriving after
+        // it must not turn a refusal into a stop, identity or no identity.
+        const events: string[] = [];
+        const run = await startManagedProviderRun({
+            ...base(events),
+            createSupervisor: () => channelSupervisor(events, {
+                ackChunks: ['ended input-not-exhausted\n', `ended exhausted-clean ${A}\n`],
+            }) as never,
+        });
+        expect(await run.awaitGracefulStop(500))
+            .toEqual({ stopped: false, detail: 'input-not-exhausted' });
     });
 });

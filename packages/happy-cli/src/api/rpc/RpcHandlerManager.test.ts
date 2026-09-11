@@ -71,6 +71,41 @@ describe('managed refusal codes survive the encrypted round trip', () => {
         expect(typeof body.error).toBe('string');
     });
 
+    it('carries a bounded launch diagnostic alongside the code', async () => {
+        /*
+         * `spawn-rejected` alone covers both "the envelope was wrong" and "the
+         * launch itself refused", and the parent cannot act on the difference.
+         * One enum member — reviewed here, not composed at the throw site —
+         * separates them without putting a message on the wire.
+         */
+        const manager = makeManager();
+        registerManagedRpcHandlers(
+            manager,
+            managedHandlersThrowing(
+                new ManagedRpcError('spawn-rejected', 'launch-refused:no-volume', 'launch-refused'),
+            ),
+        );
+        const body = await call(manager, 'managed:spawn', {});
+        expect(body.code).toBe('spawn-rejected');
+        expect(body.diagnostic).toBe('launch-refused');
+        // The detail behind it is still not a wire field.
+        expect(JSON.stringify(body)).not.toContain('no-volume');
+    });
+
+    it('drops a diagnostic that is not one of the reviewed members', async () => {
+        const manager = makeManager();
+        registerManagedRpcHandlers(
+            manager,
+            managedHandlersThrowing(
+                new ManagedRpcError('spawn-rejected', 'detail', 'sk-live-INVENTED'),
+            ),
+        );
+        const body = await call(manager, 'managed:spawn', {});
+        expect(body.code).toBe('spawn-rejected');
+        expect(body.diagnostic).toBeUndefined();
+        expect(JSON.stringify(body)).not.toContain('sk-live-INVENTED');
+    });
+
     it('reports an unrecognised refusal code as unknown, never as a real refusal', async () => {
         const manager = makeManager();
         registerManagedRpcHandlers(

@@ -35,7 +35,16 @@ const AUTH_TAG_BYTES = 16;
 const HEADER_BYTES = MAGIC.length + IV_BYTES;
 
 export type CheckpointCryptoBinding = {
-    companyId: string;
+    /**
+     * The tenant axis, not a company id.
+     *
+     * The parent's workspace key is `company:<id>` **or** `user:<id>` — a
+     * personal workspace has no company, and requiring one would leave those
+     * workspaces permanently unable to checkpoint. This field carried the name
+     * `companyId` while holding either, which is the kind of name that is right
+     * until somebody trusts it.
+     */
+    tenantId: string;
     projectId: string;
     checkpointId: string;
     /**
@@ -48,12 +57,12 @@ export type CheckpointCryptoBinding = {
 };
 
 function additionalData(binding: CheckpointCryptoBinding): Buffer {
-    if (!binding.companyId || !binding.projectId || !binding.checkpointId) {
+    if (!binding.tenantId || !binding.projectId || !binding.checkpointId) {
         throw new Error('managed checkpoint binding is incomplete');
     }
     // Length-prefixed so that no two different bindings can concatenate to the
     // same bytes (`co|1` + `pr` vs `co` + `1|pr`).
-    const parts = [binding.companyId, binding.projectId, binding.checkpointId, binding.area];
+    const parts = [binding.tenantId, binding.projectId, binding.checkpointId, binding.area];
     return Buffer.from(parts.map((part) => `${part.length}:${part}`).join(''), 'utf8');
 }
 
@@ -117,28 +126,37 @@ export async function openCheckpointFile(input: {
     destination: string;
     key: Buffer;
     binding: CheckpointCryptoBinding;
+    maxPlaintextBytes?: number;
 }): Promise<{ bytes: number; sha256: string }> {
-    assertKey(input.key);
+    const maximum = input.maxPlaintextBytes;
+    const owned = maximum === undefined ? input : { source: input.source, destination: input.destination, key: input.key };
+    assertKey(owned.key);
     const aad = additionalData(input.binding);
     const hash = createHash('sha256');
     let bytes = 0;
     let sourceHandle: Awaited<ReturnType<typeof open>> | null = null;
     let destinationHandle: Awaited<ReturnType<typeof open>> | null = null;
     try {
+        if (maximum !== undefined && (!Number.isSafeInteger(maximum) || maximum <= 0)) throw new Error('limit');
         // Everything that can refuse this object is checked before a
         // destination exists — format, size, magic. Creating it first and
         // cleaning up afterwards deleted whatever happened to be at that path
         // when the refusal had nothing to do with it.
-        sourceHandle = await open(input.source, 'r');
-        const size = (await sourceHandle.stat()).size;
+        sourceHandle = await open(owned.source, 'r');
+        const sourceStat = await sourceHandle.stat();
+        const size = sourceStat.size;
+        if (maximum !== undefined && (!sourceStat.isFile() || !Number.isSafeInteger(size) || size < 0
+            || size - HEADER_BYTES - AUTH_TAG_BYTES > maximum)) throw new Error('limit');
         if (size < HEADER_BYTES + AUTH_TAG_BYTES) throw new Error('format');
         const head = Buffer.allocUnsafe(HEADER_BYTES);
-        await sourceHandle.read(head, 0, HEADER_BYTES, 0);
+        const headRead = await sourceHandle.read(head, 0, HEADER_BYTES, 0);
+        if (maximum !== undefined && headRead.bytesRead !== HEADER_BYTES) throw new Error('format');
         if (!head.subarray(0, MAGIC.length).equals(MAGIC)) throw new Error('format');
         const tag = Buffer.allocUnsafe(AUTH_TAG_BYTES);
-        await sourceHandle.read(tag, 0, AUTH_TAG_BYTES, size - AUTH_TAG_BYTES);
+        const tagRead = await sourceHandle.read(tag, 0, AUTH_TAG_BYTES, size - AUTH_TAG_BYTES);
+        if (maximum !== undefined && tagRead.bytesRead !== AUTH_TAG_BYTES) throw new Error('format');
 
-        const decipher = createDecipheriv('aes-256-gcm', input.key, head.subarray(MAGIC.length));
+        const decipher = createDecipheriv('aes-256-gcm', owned.key, head.subarray(MAGIC.length));
         decipher.setAAD(aad);
         decipher.setAuthTag(tag);
 
@@ -147,12 +165,13 @@ export async function openCheckpointFile(input: {
             ? Readable.from([])
             : sourceHandle.createReadStream({ start: HEADER_BYTES, end: size - AUTH_TAG_BYTES - 1, autoClose: false });
 
-        destinationHandle = await open(input.destination, 'wx', 0o600);
+        destinationHandle = await open(owned.destination, 'wx', 0o600);
         await pipeline(
             body,
             decipher,
             async function* (chunks) {
                 for await (const chunk of chunks) {
+                    if (maximum !== undefined && (chunk as Buffer).length > maximum - bytes) throw new Error('limit');
                     bytes += (chunk as Buffer).length;
                     hash.update(chunk as Buffer);
                     yield chunk;
@@ -162,7 +181,7 @@ export async function openCheckpointFile(input: {
         );
     } catch {
         // Only if this call created it.
-        if (destinationHandle) await rm(input.destination, { force: true }).catch(() => undefined);
+        if (destinationHandle) await rm(owned.destination, { force: true }).catch(() => undefined);
         // One answer for every failure: which of tenant, project, checkpoint,
         // area, key or integrity was wrong is not something a caller holding
         // the ciphertext gets to learn.

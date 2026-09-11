@@ -10,6 +10,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, lstatSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import * as launcherMain from '@/launcher/main';
+import * as managedRunConfig from '@/launcher/managedRunConfig';
+import * as runtimeCheckpointing from '@/managed/checkpoint/managedRuntimeCheckpointing';
+import type { ManagedCheckpointTickLoop } from '@/managed/checkpoint/managedCheckpointTickLoop';
+import { supervisorLockAddress } from '@/launcher/supervisor';
 import { tmpdir } from 'node:os';
 
 import {
@@ -53,9 +58,13 @@ function provisioning(): ManagedProvisioningDeps {
     };
 }
 
+/** The digest the active resolution carries beside the identity (freeze93/94). */
+const MARKER_SHA256 = 'b'.repeat(64);
+
 function identity(over: Partial<ManagedIdentityResolution> = {}): () => ManagedIdentityResolution {
     return () => ({
         status: 'active',
+        markerSha256: MARKER_SHA256,
         identity: {
             runtimeId: 'rt-1',
             workspaceId: 'ws-1',
@@ -75,6 +84,7 @@ function identity(over: Partial<ManagedIdentityResolution> = {}): () => ManagedI
                 executor: { uid: AGENT_UID, gid: AGENT_UID },
                 cgroupRoot: '/sys/fs/cgroup/saycode',
             },
+            toolPolicy: { grantTtlMs: 600_000, callTimeoutMs: 120_000 },
         },
         ...over,
     } as ManagedIdentityResolution);
@@ -87,6 +97,9 @@ function bootDeps(over: Partial<Parameters<typeof runManagedRuntimeBoot>[0]> = {
     const log: Recorded[] = [];
     const deps = {
         resolveIdentity: identity() as never,
+        acquireOwnership: async (scope: { runtimeId: string; manifestRoot: string; cgroupRoot: string }) => ({
+            ok: true as const, ownership: { scope: { ...scope }, address: supervisorLockAddress(scope), release: async () => {} },
+        }),
         provisioning: provisioning(),
         makeTrustedDirectory: async (path: string, mode: number) => {
             log.push({ event: 'directory', detail: path });
@@ -95,7 +108,25 @@ function bootDeps(over: Partial<Parameters<typeof runManagedRuntimeBoot>[0]> = {
         },
         startSupervisor: async () => {
             log.push({ event: 'supervisor' });
-            return { token: TOKEN };
+            return {
+                token: TOKEN,
+                publishAttestation: () => {
+                    log.push({ event: 'attestation' });
+                    return 'published' as const;
+                },
+            };
+        },
+        // The image states the account; the fixture states it the same way.
+        resolveDaemonAccount: () => ({ uid: 999, gid: 999 }),
+        provisionDaemonStateLeaf: async (input: {
+            path: string; uid: number; gid: number; mode: number;
+        }) => {
+            log.push({
+                event: 'daemon-leaf',
+                detail: `${input.path}:${input.uid}:${input.gid}:${input.mode.toString(8)}`,
+            });
+            await mkdir(input.path, { recursive: true, mode: input.mode });
+            return { ok: true as const, created: true };
         },
         assignWorkspace: async (input: { path: string; uid: number; gid: number }) => {
             log.push({ event: 'workspace', detail: `${input.path}:${input.uid}:${input.gid}` });
@@ -112,7 +143,24 @@ function bootDeps(over: Partial<Parameters<typeof runManagedRuntimeBoot>[0]> = {
         // Likewise for the identity handoff: the cases about it override this,
         // and the real CLI's own is asserted in its own file.
         adoptCredential: async () => ({ status: 'absent' as const }),
+        // 저장된 credential 의 origin. 실제로는 디스크에서 읽는다.
+        readTrustedServerOrigin: () => 'https://happy.fixture.test',
+        // The marker producer. Cases about it override this; everything else
+        // is about what happens once a marker exists.
+        writeMarker: async () => ({ status: 'adopted' as const }),
+        readDeliveredMachineId: () => ({ status: 'ok' as const, machineId: 'machine-1' }),
+        observeVolume: async () => ({ ok: false as const }),
+        narrowDeliveredCredential: () => 'absent' as const,
+        providerInstance: () => ({ providerMachineId: 'fly_m1', providerInstanceId: 'inst_1' }),
         ...over,
+    };
+    const start = deps.startSupervisor;
+    deps.startSupervisor = async (input: Parameters<Parameters<typeof runManagedRuntimeBoot>[0]['startSupervisor']>[0]) => {
+        input.ownership.registerRuntime({ stop: async () => ({ stopped: true }) });
+        const taken = await input.ownership.take({ runtimeId: input.identity.runtimeId,
+            manifestRoot: join(input.identity.stateDir, 'manifest'), cgroupRoot: input.identity.isolation.cgroupRoot });
+        if (!taken.ok) throw new Error(taken.reason);
+        return start(input);
     };
     return { deps: deps as Parameters<typeof runManagedRuntimeBoot>[0], log };
 }
@@ -185,15 +233,84 @@ describe('the root boot stage of a managed runtime', () => {
 
         expect(outcome).toEqual({
             ok: true, socketPath: managedLauncherSocketPath(stateDir), published: 'created',
+            // Absent here: this fixture's volume cannot be observed, and an
+            // observation that failed is absent rather than guessed.
+            volume: null,
+            // This fixture's `startSupervisor` starts no consumer, so there is
+            // nothing for a shutdown to wait for — said as `null`, not omitted.
+            checkpointTicks: null,
         });
+        /*
+         * `daemon-leaf` sits between the launcher directory and the supervisor:
+         * root creates the daemon's own writable place before anything the daemon
+         * could reach exists.
+         */
         expect(log.map((entry) => entry.event))
-            .toEqual(['directory', 'supervisor', 'workspace', 'provider-home']);
+            .toEqual(['directory', 'daemon-leaf', 'supervisor', 'workspace', 'provider-home', 'attestation']);
         // And the record the daemon will read is really there, readable through
         // the same trust rules the daemon applies.
         expect(readManagedLauncherBinding({ stateDir, deps: provisioning() })).toEqual({
             ok: true,
             binding: { socketPath: managedLauncherSocketPath(stateDir), token: TOKEN },
         });
+    });
+
+    it('carries the checkpoint consumer the supervisor started out of the boot', async () => {
+        /*
+         * The wait for a checkpoint in flight belongs to whoever owns this
+         * process, not to the boot — so the handle has to leave the boot. A
+         * consumer that stayed inside would tick fine and be abandoned
+         * mid-upload on every stop, leaving an archive with no pointer at it.
+         */
+        const ticks = {
+            start: () => {},
+            tickNow: async () => ({ ticked: false }),
+            stop: async () => ({ pendingPublication: false }),
+        };
+        const { deps } = bootDeps({
+            startSupervisor: async () => ({ token: TOKEN, checkpointTicks: ticks, publishAttestation: () => 'published' as const }),
+        });
+        const outcome = await runManagedRuntimeBoot(deps);
+        expect(outcome.ok).toBe(true);
+        // The same object, not a copy of its shape.
+        expect(outcome.ok && outcome.checkpointTicks).toBe(ticks);
+    });
+
+    it('refuses the boot when the daemon leaf is not what it must be, rather than correcting it', async () => {
+        /*
+         * 이미 있는 leaf 를 고치면 이 부팅이 쓰지 않은 상태를 바꾸는 것이고, 이
+         * 부팅은 daemon 의 writer lock 을 들고 있지 않다 — 그 순간 daemon 이 그
+         * 안에 쓰고 있을 수 있다. 그래서 거절이고, 거절이면 launcher 기록도
+         * 남기지 않는다.
+         */
+        const { deps } = bootDeps({
+            provisionDaemonStateLeaf: async () => ({ ok: false as const, detail: 'owner' }),
+        });
+        expect(await runManagedRuntimeBoot(deps))
+            .toEqual({ ok: false, reason: 'daemon-state-leaf-unusable' });
+        expect(readManagedLauncherBinding({ stateDir, deps: provisioning() }))
+            .toEqual({ ok: false, reason: 'absent' });
+    });
+
+    it('refuses the boot when the image states no daemon account', async () => {
+        // 기본값을 주면 아무도 고르지 않은 uid 가 그 디렉터리를 소유한다.
+        const { deps } = bootDeps({ resolveDaemonAccount: () => null });
+        expect(await runManagedRuntimeBoot(deps))
+            .toEqual({ ok: false, reason: 'daemon-account-unusable' });
+    });
+
+    it('refuses the boot when the daemon account is one of the agent accounts', async () => {
+        /*
+         * marker 의 provider uid 와 같은 계정이면, 이 슬라이스가 만드는 leaf 는
+         * provider 가 쓸 수 있는 곳이 된다 — 그 안에는 자기 세대가 계속 돌아도
+         * 되는지를 결정하는 lease 가 있다. 기존 resolver 는 **실행** uid 만 보므로
+         * 이것을 잡지 못한다.
+         */
+        const { deps } = bootDeps({
+            resolveDaemonAccount: () => ({ uid: PROVIDER_UID, gid: 999 }),
+        });
+        expect(await runManagedRuntimeBoot(deps))
+            .toEqual({ ok: false, reason: 'daemon-account-unusable' });
     });
 
     it('publishes nothing when the supervisor does not start', async () => {
@@ -229,11 +346,18 @@ describe('the root boot stage of a managed runtime', () => {
         expect(log.filter((entry) => entry.event === 'provider-home')).toEqual([
             { event: 'provider-home', detail: `/workspace/.codex:${PROVIDER_UID}:${PROVIDER_UID}:700` },
         ]);
-        // And neither *assignment* touches the state directory: receipts, the
-        // volume seal and the launcher record stay root's. (The launcher socket
-        // directory is made under it — made, not handed over.)
+        /*
+         * Exactly one thing under the state directory is handed to another
+         * account: the daemon's own leaf. The receipts of the old layout, the
+         * volume seal, the adopted credential and the launcher record stay root's,
+         * and the launcher socket directory is *made* under it rather than handed
+         * over.
+         */
         const assignments = log.filter((entry) => entry.event !== 'directory');
-        expect(assignments.some((entry) => entry.detail?.startsWith(stateDir))).toBe(false);
+        const underStateDir = assignments.filter((entry) => entry.detail?.startsWith(stateDir));
+        expect(underStateDir).toEqual([
+            { event: 'daemon-leaf', detail: `${join(stateDir, 'daemon')}:999:999:700` },
+        ]);
     });
 
     it('assigns ownership after a restore, never before it', async () => {
@@ -314,16 +438,39 @@ describe('the root boot stage of a managed runtime', () => {
         expect(await runManagedRuntimeBoot(deps)).toEqual({ ok: false, reason: 'workspace-unassignable' });
     });
 
-    it('does not start a supervisor for a marker it cannot trust', async () => {
-        // "Boot anyway" here means running the agent unfenced, which is the
-        // state this whole path exists to prevent.
+    it('does not start a supervisor for a marker it cannot trust, and says why', async () => {
+        /*
+         * "Boot anyway" here means running the agent unfenced, which is the
+         * state this whole path exists to prevent.
+         *
+         * The refusal carries the identity's own classifier. Without it every
+         * way a marker can be untrustworthy — not root owned, isolation
+         * unverified, a tool policy the parent never approved — reaches the
+         * operator as one word, and the one thing they need to know next is
+         * exactly the part that was dropped. These are fixed codes, never paths
+         * or values, so carrying them is safe.
+         */
         const started = vi.fn();
         const { deps } = bootDeps({
-            resolveIdentity: (() => ({ status: 'refused', reason: 'not-root-owned' })) as never,
+            resolveIdentity: (() => ({
+                status: 'refused', reason: 'isolation-unverified', detail: 'probe-uid-not-applied',
+            })) as never,
             startSupervisor: started as never,
         });
-        expect(await runManagedRuntimeBoot(deps)).toEqual({ ok: false, reason: 'identity-refused' });
+        expect(await runManagedRuntimeBoot(deps)).toEqual({
+            ok: false,
+            reason: 'identity-inactive',
+            detail: 'isolation-unverified: probe-uid-not-applied',
+        });
         expect(started).not.toHaveBeenCalled();
+    });
+
+    it('reports the identity refusal even when it carries no detail', async () => {
+        const { deps } = bootDeps({
+            resolveIdentity: (() => ({ status: 'refused', reason: 'not-root-owned' })) as never,
+        });
+        expect(await runManagedRuntimeBoot(deps))
+            .toEqual({ ok: false, reason: 'identity-inactive', detail: 'not-root-owned' });
     });
 
     it('separates an ordinary machine from a broken managed one', async () => {
@@ -360,7 +507,7 @@ describe('the root boot stage of a managed runtime', () => {
                 offered.push(token);
                 // A supervisor handed a token uses it; only an unspecified one
                 // is minted. This fixture mirrors that.
-                return { token: token ?? 'a-freshly-minted-token' };
+                return { token: token ?? 'a-freshly-minted-token', publishAttestation: () => 'published' as const };
             },
         });
         expect(await runManagedRuntimeBoot(second.deps)).toMatchObject({ ok: true });
@@ -376,7 +523,7 @@ describe('the root boot stage of a managed runtime', () => {
 
     it('refuses when a record names a different supervisor', async () => {
         await runManagedRuntimeBoot(bootDeps().deps);
-        const { deps } = bootDeps({ startSupervisor: async () => ({ token: 'another-boots-token' }) });
+        const { deps } = bootDeps({ startSupervisor: async () => ({ token: 'another-boots-token', publishAttestation: () => 'published' as const }) });
         expect(await runManagedRuntimeBoot(deps)).toEqual({ ok: false, reason: 'binding-unpublishable' });
         // The first boot stays the authority: it owns the ledger and the
         // children, and the daemon must keep talking to it.
@@ -389,6 +536,224 @@ describe('the root boot stage of a managed runtime', () => {
         const { deps } = bootDeps();
         await runManagedRuntimeBoot(deps);
         expect(Object.values(process.env).some((value) => value === TOKEN)).toBe(false);
+    });
+});
+
+describe('the delivered credential\'s mode, before anything reads it', () => {
+    /*
+     * The provider writes the file and chooses its mode. Every read of it is
+     * judged by a gate that refuses anything another uid can read — correctly —
+     * so a `0644` delivery has to be narrowed before the *first* of those
+     * reads. Narrowing before adoption was late: the machine id comes out of
+     * the same file earlier, to write the marker, and that read hit the strict
+     * gate and reported an unusable credential on an ordinary delivery.
+     */
+    it('narrows before the machine id is read', async () => {
+        const order: string[] = [];
+        const { deps } = bootDeps({
+            narrowDeliveredCredential: () => { order.push('narrow'); return 'ok' as const; },
+            readDeliveredMachineId: () => {
+                order.push('read');
+                return { status: 'ok' as const, machineId: 'machine-1' };
+            },
+        });
+        await runManagedRuntimeBoot(deps);
+        expect(order).toEqual(['narrow', 'read']);
+    });
+
+    it('refuses the boot when the mode cannot be narrowed', async () => {
+        // A symlink where the file belongs, or a path this process may not
+        // touch. Reading on would mean judging a file somebody else controls.
+        const { deps, log } = bootDeps({
+            narrowDeliveredCredential: () => 'refused' as const,
+        });
+        expect(await runManagedRuntimeBoot(deps))
+            .toEqual({ ok: false, reason: 'credential-unusable' });
+        expect(log.some((entry) => entry.event === 'supervisor')).toBe(false);
+    });
+
+    it('boots on when there is nothing delivered to narrow', async () => {
+        const { deps } = bootDeps({ narrowDeliveredCredential: () => 'absent' as const });
+        expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: true });
+    });
+});
+
+describe('what this boot observed about its volume', () => {
+    /*
+     * The filesystem uuid is an observation of this machine's mounts. The
+     * marker is the parent's description of what it attached — a different
+     * kind of statement, and the one thing that must not stand in for the
+     * other: a checkpoint bound to a described uuid is a checkpoint bound to
+     * whatever the description happened to say.
+     */
+    it('carries the sealed observation out of the boot', async () => {
+        const { deps } = bootDeps({
+            observeVolume: async () => ({
+                ok: true as const,
+                binding: { providerVolumeId: 'vol_1', deviceMajorMinor: '259:1', fsUuid: 'fs-uuid-1' },
+            }),
+        });
+        expect(await runManagedRuntimeBoot(deps)).toMatchObject({
+            ok: true,
+            volume: { providerVolumeId: 'vol_1', deviceMajorMinor: '259:1', fsUuid: 'fs-uuid-1' },
+        });
+    });
+
+    it('hands the supervisor a volume reference that answers after the observation', async () => {
+        /*
+         * A **function**, not a value.
+         *
+         * The supervisor is started before the volume is observed — it has to
+         * be, because observing it is not what makes a runtime ready — so a
+         * value read at that moment would be the one from before anybody
+         * looked, and a checkpoint bound to it would be bound to nothing that
+         * was confirmed. Asked later, it answers what the kernel said.
+         */
+        let observed: (() => { volumeId: string; deviceUuid: string } | null) | null = null;
+        const { deps } = bootDeps({
+            startSupervisor: async ({ observedVolume }) => {
+                observed = observedVolume;
+                // 이 시점에는 아직 아무도 보지 않았다.
+                expect(observedVolume()).toBeNull();
+                return { token: 'launcher-token', publishAttestation: () => 'published' as const };
+            },
+            observeVolume: async () => ({
+                ok: true as const,
+                binding: { providerVolumeId: 'vol_9', deviceMajorMinor: '259:3', fsUuid: 'fs-uuid-9' },
+            }),
+        });
+        expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: true });
+        expect(observed).not.toBeNull();
+        expect((observed as unknown as () => unknown)())
+            .toEqual({ volumeId: 'vol_9', deviceUuid: 'fs-uuid-9' });
+    });
+
+    it('leaves the volume reference answering null when nothing was observed', async () => {
+        // 관측되지 않은 볼륨은 차단이지 추측이 아니다 — coordinator 가
+        // `volume-unobserved` 로 접는다.
+        let observed: (() => unknown) | null = null;
+        const { deps } = bootDeps({
+            startSupervisor: async ({ observedVolume }) => {
+                observed = observedVolume;
+                return { token: 'launcher-token', publishAttestation: () => 'published' as const };
+            },
+            observeVolume: async () => ({ ok: false as const }),
+        });
+        await runManagedRuntimeBoot(deps);
+        expect((observed as unknown as () => unknown)()).toBeNull();
+    });
+
+    it('reports no observation rather than a guess when it could not be sealed', async () => {
+        const { deps } = bootDeps({ observeVolume: async () => ({ ok: false as const }) });
+        expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: true, volume: null });
+    });
+
+    it('reports no observation when observing threw, and still boots', async () => {
+        // An observation that failed is an absent observation. It is not a
+        // reason to refuse a runtime that is otherwise ready, and it is not a
+        // reason to invent a uuid.
+        const { deps } = bootDeps({
+            observeVolume: async () => { throw new Error('mountinfo unreadable'); },
+        });
+        expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: true, volume: null });
+    });
+});
+
+describe('producing the marker the rest of the boot reads', () => {
+    /*
+     * Nothing else writes it. Without this the first boot of every machine
+     * reads an absent marker, concludes BYOS and does nothing — the runtime the
+     * parent just created never becomes one, and no line anywhere says why.
+     */
+    it('writes it before the identity is read', async () => {
+        const order: string[] = [];
+        const { deps } = bootDeps({
+            writeMarker: async () => { order.push('marker'); return { status: 'written' as const }; },
+            resolveIdentity: (() => {
+                order.push('identity');
+                return identity();
+            }) as never,
+        });
+        await runManagedRuntimeBoot(deps);
+        expect(order).toEqual(['marker', 'identity']);
+    });
+
+    it('names the Machine the delivered credential was minted for, and the instance the platform reported', async () => {
+        /*
+         * The ordering has no way around it: the marker records which Machine
+         * this is, and on a first boot there is nothing else on the disk that
+         * knows. The credential does — it was minted for that Machine and no
+         * other — so that one field is read before the marker exists, and
+         * adoption still compares against the marker afterwards.
+         */
+        const seen: unknown[] = [];
+        const { deps } = bootDeps({
+            writeMarker: async (input: unknown) => { seen.push(input); return { status: 'written' as const }; },
+            readDeliveredMachineId: () => ({ status: 'ok' as const, machineId: 'machine-1' }),
+            providerInstance: () => ({ providerMachineId: 'fly_m9', providerInstanceId: 'inst_9' }),
+        });
+        await runManagedRuntimeBoot(deps);
+        expect(seen).toEqual([{
+            happyMachineId: 'machine-1',
+            instance: { providerMachineId: 'fly_m9', providerInstanceId: 'inst_9' },
+        }]);
+    });
+
+    it('writes no marker when the parent delivered nothing', async () => {
+        // A machine with no credential file is either BYOS or a parent that has
+        // not delivered yet. Inventing a Machine id to write a marker with
+        // would make this runtime claim an identity nobody issued.
+        const seen: unknown[] = [];
+        const { deps } = bootDeps({
+            writeMarker: async (input: unknown) => { seen.push(input); return { status: 'written' as const }; },
+            readDeliveredMachineId: () => ({ status: 'absent' as const }),
+        });
+        await runManagedRuntimeBoot(deps);
+        expect(seen).toEqual([]);
+    });
+
+    it('refuses the boot when the delivered file is there and unreadable', async () => {
+        const { deps, log } = bootDeps({
+            readDeliveredMachineId: () => ({ status: 'refused' as const }),
+        });
+        expect(await runManagedRuntimeBoot(deps))
+            .toEqual({ ok: false, reason: 'credential-unusable' });
+        expect(log.some((entry) => entry.event === 'supervisor')).toBe(false);
+    });
+
+    it('refuses without a detail when the writer gave none', async () => {
+        const { deps } = bootDeps({
+            readDeliveredMachineId: () => ({ status: 'ok' as const, machineId: 'machine-1' }),
+            writeMarker: async () => ({ status: 'refused' as const }),
+        });
+        expect(await runManagedRuntimeBoot(deps)).toEqual({ ok: false, reason: 'marker-unwritable' });
+    });
+
+    it('refuses the boot when the marker cannot be written, with its own reason', async () => {
+        /*
+         * A marker that could not be produced is a runtime with no identity,
+         * and continuing would mean starting a supervisor for nobody.
+         *
+         * Its own reason, not the one the identity check uses: "could not write
+         * the marker" and "wrote it and then would not trust it" are different
+         * machines to look at, and one word for both means the operator cannot
+         * tell which happened — which is exactly what stalled the first real
+         * boot.
+         */
+        const { deps, log } = bootDeps({
+            readDeliveredMachineId: () => ({ status: 'ok' as const, machineId: 'machine-1' }),
+            writeMarker: async () => ({ status: 'refused' as const, reason: 'instance-unidentified' }),
+        });
+        /*
+         * The writer's own code travels. It has eleven of them — an untrusted
+         * path, an absent boot input, a marker that could not be written, an
+         * instance it could not identify — and folding all eleven into one word
+         * sent a real boot's diagnosis down the wrong path twice. They are
+         * fixed classifiers, like the identity's.
+         */
+        expect(await runManagedRuntimeBoot(deps))
+            .toEqual({ ok: false, reason: 'marker-unwritable', detail: 'instance-unidentified' });
+        expect(log.some((entry) => entry.event === 'supervisor')).toBe(false);
     });
 });
 
@@ -410,7 +775,7 @@ describe('the identity handoff, in the boot stage', () => {
             },
             startSupervisor: async () => {
                 order.push('supervisor');
-                return { token: TOKEN };
+                return { token: TOKEN, publishAttestation: () => 'published' as const };
             },
         });
         expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: true });
@@ -538,6 +903,343 @@ describe('the staging check the real CLI actually runs', () => {
             expect(await inspect()).toBe('unresolved');
         } finally {
             chmodSync(staging, 0o700);
+        }
+    });
+});
+
+describe('which Happy the runtime may talk to', () => {
+    it('refuses to start when the stored credential names no origin', async () => {
+        /*
+         * 그 값을 못 읽었다는 것은 이 runtime 이 자기 bearer 를 어디에 내밀어도
+         * 되는지 모른다는 뜻이다. 프로세스 기본값으로 떨어지면 승인되지 않은
+         * 서버에 자격을 내밀게 된다 — 시작하지 않는 편이 낫다.
+         */
+        const { deps } = bootDeps({ readTrustedServerOrigin: () => null });
+        expect(await runManagedRuntimeBoot(deps))
+            .toEqual({ ok: false, reason: 'credential-unusable' });
+    });
+
+    it('hands the stored origin to the supervisor, which is what reaches the child', async () => {
+        /*
+         * 읽어 놓고 내려보내지 않으면 자식 환경은 여전히 프로세스 기본값을 본다.
+         * 그 값이 `HAPPY_SERVER_URL` 로 매핑되는 자리(launcher)는 별도지만,
+         * 여기서 넘기지 않으면 그 매핑이 받을 것이 없다.
+         */
+        const seen: (string | undefined)[] = [];
+        const { deps } = bootDeps({
+            readTrustedServerOrigin: () => 'https://happy.stored.test',
+            startSupervisor: async (input) => {
+                seen.push(input.serverOrigin);
+                return { token: TOKEN, publishAttestation: () => 'published' as const };
+            },
+        });
+        await runManagedRuntimeBoot(deps);
+        expect(seen).toEqual(['https://happy.stored.test']);
+    });
+
+    it('reads the origin from the stored credential, not from the delivered envelope', async () => {
+        /*
+         * 봉투는 boot input 이 주장한 값이다. 그것으로 검사하면 검사가 자기
+         * 자신을 비교하게 된다. 저장본은 adoption 이 받아들인 것이고 marker 의
+         * machine id 와 대조된 뒤에만 그 자리에 있다.
+         */
+        const asked: { stateDir: string; expectedMachineId: string }[] = [];
+        const { deps } = bootDeps({
+            readTrustedServerOrigin: (input) => {
+                asked.push({
+                    stateDir: input.stateDir, expectedMachineId: input.expectedMachineId,
+                });
+                return 'https://happy.fixture.test';
+            },
+        });
+        await runManagedRuntimeBoot(deps);
+        expect(asked).toHaveLength(1);
+        // marker 가 말한 machine 의, 그 runtime 의 state 디렉터리에서 읽는다.
+        expect(asked[0].expectedMachineId).toBe('machine-1');
+        expect(asked[0].stateDir).toBe(stateDir);
+    });
+});
+
+describe('the boot publishes the supervisor attestation, last and with no arguments', () => {
+    /*
+     * The record is the supervisor's own statement that it is the instance
+     * listening on this socket for this marker. It is written **after every
+     * gate that can still fail**, because a record published by a boot that
+     * then refuses would name a supervisor nobody is meant to reach.
+     */
+    it('shouldCallTheBoundPublisherWithNoArgumentsAfterEveryGate', async () => {
+        const calls: unknown[][] = [];
+        const { deps, log } = bootDeps({
+            startSupervisor: async () => ({
+                token: TOKEN,
+                publishAttestation: (...args: unknown[]) => {
+                    calls.push(args);
+                    log.push({ event: 'attestation' });
+                    return 'published' as const;
+                },
+            }),
+        });
+        const result = await runManagedRuntimeBoot(deps as never);
+        expect(result).toMatchObject({ ok: true });
+        expect(calls).toEqual([[]]);
+        // Last: every observation the boot can refuse on has already happened.
+        const events = log.map((entry) => entry.event);
+        expect(events.at(-1)).toBe('attestation');
+    });
+
+    it('shouldCarryTheSameReadMarkerDigestToTheSupervisor', async () => {
+        // The digest of the bytes the marker was parsed from, handed down
+        // rather than re-derived: a second read could see different bytes.
+        let seen: string | undefined;
+        const { deps } = bootDeps({
+            startSupervisor: async (input: { markerSha256: string }) => {
+                seen = input.markerSha256;
+                return { token: TOKEN, publishAttestation: () => 'published' as const };
+            },
+        });
+        await runManagedRuntimeBoot(deps as never);
+        expect(seen).toBe(MARKER_SHA256);
+    });
+
+    it.each([
+        ['refused-not-current'],
+        ['refused-no-scope'],
+        ['refused-write:untrusted'],
+        ['refused-write:schema'],
+        ['refused-write:too-large'],
+        ['refused-write:temporary-exists'],
+        ['refused-write:staged'],
+        ['refused-write:promote'],
+        ['refused-write:durability-unknown'],
+    ] as const)('shouldFailTheBootWhenPublicationAnswers %s', async (outcome) => {
+        /*
+         * Every refusal in the publisher's union, including the two that leave
+         * something on disk: `promote` keeps the previous file and
+         * `durability-unknown` has already made the new one visible. The boot
+         * fails in both and **rolls nothing back** - pretending to undo a
+         * rename whose bytes are already gone is worse than saying so.
+         */
+        const { deps } = bootDeps({
+            startSupervisor: async () => ({
+                token: TOKEN,
+                publishAttestation: () => outcome,
+            }),
+        });
+        expect(await runManagedRuntimeBoot(deps as never))
+            .toEqual({ ok: false, reason: 'attestation-unpublishable' });
+    });
+
+    it('shouldNotPublishWhenAnEarlierGateAlreadyRefused', async () => {
+        // Staging that is not clear refuses before the publisher is reached.
+        let published = 0;
+        const { deps } = bootDeps({
+            inspectRestoreStaging: async () => 'dirty' as never,
+            startSupervisor: async () => ({
+                token: TOKEN,
+                publishAttestation: () => { published += 1; return 'published' as const; },
+            }),
+        });
+        expect(await runManagedRuntimeBoot(deps as never)).toMatchObject({ ok: false });
+        expect(published).toBe(0);
+    });
+    it.each(['supervisor', 'restore', 'workspace', 'provider-home', 'staging'] as const)(
+        'shouldNotInvokePublicationAfterThe%sGateRefuses', async (gate) => {
+            let publications = 0;
+            const over: Partial<Parameters<typeof runManagedRuntimeBoot>[0]> = {
+                startSupervisor: async () => ({ token: TOKEN, publishAttestation: () => { publications += 1; return 'published'; } }),
+            };
+            if (gate === 'supervisor') over.startSupervisor = async () => null;
+            if (gate === 'restore') over.restore = async () => { throw new Error('restore failed'); };
+            if (gate === 'workspace') over.assignWorkspace = async () => { throw new Error('assignment failed'); };
+            if (gate === 'provider-home') over.assignProviderHome = async () => { throw new Error('assignment failed'); };
+            if (gate === 'staging') over.inspectRestoreStaging = async () => 'unresolved';
+            const { deps } = bootDeps(over);
+            expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: false });
+            expect(publications).toBe(0);
+        },
+    );
+
+    it('shouldNotPublishWhenTheStableBindingRefusesAnotherToken', async () => {
+        expect(await runManagedRuntimeBoot(bootDeps().deps)).toMatchObject({ ok: true });
+        let publications = 0;
+        const { deps } = bootDeps({ startSupervisor: async () => ({
+            token: 'different-token',
+            publishAttestation: () => { publications += 1; return 'published'; },
+        }) });
+        expect(await runManagedRuntimeBoot(deps)).toEqual({ ok: false, reason: 'binding-unpublishable' });
+        expect(publications).toBe(0);
+        expect(readManagedLauncherBinding({ stateDir, deps: provisioning() })).toMatchObject({ ok: true, binding: { token: TOKEN } });
+    });
+
+});
+
+
+describe('boot owns credential adoption and transfers ownership once', () => {
+    it('refuses a conflicting owner before adopting credentials', async () => {
+        const adopt = vi.fn(async () => ({ status: 'absent' as const }));
+        const { deps } = bootDeps({ acquireOwnership: async () => ({ ok: false, reason: 'already-held' }), adoptCredential: adopt });
+        expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: false, reason: 'supervisor-unavailable' });
+        expect(adopt).not.toHaveBeenCalled();
+    });
+    it('releases unconsumed ownership on a pre-start refusal and reports a failed release', async () => {
+        const release = vi.fn(async () => { throw new Error('secret'); });
+        const { deps } = bootDeps({
+            acquireOwnership: async (scope) => ({ ok: true, ownership: { scope, address: supervisorLockAddress(scope), release } }),
+            adoptCredential: async () => ({ status: 'refused', reason: 'unwritable' }),
+        });
+        expect(await runManagedRuntimeBoot(deps)).toEqual({ ok: false, reason: 'supervisor-unavailable', detail: 'ownership-release-failed' });
+        expect(release).toHaveBeenCalledOnce();
+    });
+    it('requires registration, compares configured and physical scope, and refuses duplicate take', async () => {
+        const release = vi.fn(async () => {}); const stop = vi.fn(async () => ({ stopped: true as const }));
+        const { deps } = bootDeps({ acquireOwnership: async (scope) => ({ ok: true, ownership: { scope, address: supervisorLockAddress(scope), release } }) });
+        const outcomes: unknown[] = [];
+        deps.startSupervisor = async (input) => {
+            const scope = { runtimeId: input.identity.runtimeId, manifestRoot: join(stateDir, 'manifest'), cgroupRoot: input.identity.isolation.cgroupRoot };
+            outcomes.push(await input.ownership.take(scope));
+            input.ownership.registerRuntime({ stop });
+            outcomes.push(await input.ownership.take({ ...scope, runtimeId: 'different' }));
+            outcomes.push(await input.ownership.take(scope));
+            outcomes.push(await input.ownership.take(scope));
+            throw new Error('after-take');
+        };
+        expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: false, reason: 'supervisor-unavailable' });
+        expect(outcomes).toEqual([
+            { ok: false, reason: 'ownership-runtime-unregistered' },
+            { ok: false, reason: 'ownership-scope-mismatch' },
+            { ok: true, release },
+            { ok: false, reason: 'ownership-already-taken' },
+        ]);
+        expect(stop).toHaveBeenCalledOnce(); expect(release).not.toHaveBeenCalled();
+    });
+    it('refuses a changed physical address without taking or stopping an unowned runtime', async () => {
+        const release = vi.fn(async () => {}); const stop = vi.fn(async () => ({ stopped: true as const }));
+        const { deps } = bootDeps({ acquireOwnership: async (scope) => ({ ok: true, ownership: { scope, address: 'different-bound-address', release } }) });
+        let takeOutcome: unknown;
+        deps.startSupervisor = async (input) => {
+            input.ownership.registerRuntime({ stop });
+            takeOutcome = await input.ownership.take({ runtimeId: input.identity.runtimeId, manifestRoot: join(stateDir, 'manifest'), cgroupRoot: input.identity.isolation.cgroupRoot });
+            return null;
+        };
+        expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: false });
+        expect(takeOutcome).toEqual({ ok: false, reason: 'ownership-scope-mismatch' });
+        expect(stop).not.toHaveBeenCalled(); expect(release).toHaveBeenCalledOnce();
+    });
+    it.each(['true', 'false', 'throw', 'listen-failure'] as const)('actual checkpoint helper and production factory leave outer boot as the one cleanup owner (%s)', async (mode) => {
+        // Materialize the fixture manifest before measuring its physical address (/tmp is a symlink on macOS).
+        mkdirSync(join(stateDir, 'manifest'), { recursive: true });
+        const release = vi.fn(async () => {});
+        const { deps } = bootDeps({ acquireOwnership: async (scope) => ({ ok: true, ownership: { scope, address: supervisorLockAddress(scope), release } }) });
+        const admitted = identity()();
+        if (admitted.status !== 'active') throw new Error('fixture admission');
+        admitted.identity.checkpoint = { drainBudgetMs: 1000 };
+        admitted.identity.checkpointSchedule = { periodMs: 1000, onTurnBoundary: true };
+        admitted.identity.tenant = 'company:fixture';
+        deps.resolveIdentity = () => admitted;
+        const realComposition = managedRunConfig.defaultManagedRunConfig;
+        const compositionSpy = vi.spyOn(managedRunConfig, 'defaultManagedRunConfig').mockImplementation((input) => realComposition({
+            ...input, checkpoint: { ...input.checkpoint, image: { imageVersion: 'fixture' }, workDir: join(base, 'checkpoint-work') },
+        }));
+        const create = launcherMain.createSupervisorRuntime;
+        let originalStop: ReturnType<typeof launcherMain.createSupervisorRuntime>['stop'] | undefined;
+        const stops = vi.fn(async () => {
+            if (mode === 'throw') throw new Error('cleanup failed');
+            if (mode === 'false') return { stopped: false as const, open: [], unreadable: 0 };
+            return await originalStop!();
+        });
+        let startFailure: unknown;
+        const gateReached = vi.fn();
+        const runtimeSpy = vi.spyOn(launcherMain, 'createSupervisorRuntime').mockImplementation((options) => {
+            // A directory cannot be unlinked as a stale socket: actual IPC listen must reject.
+            if (mode === 'listen-failure') mkdirSync(options.socketPath);
+            const runtime = create(options);
+            originalStop = runtime.stop.bind(runtime);
+            const originalStart = runtime.start.bind(runtime);
+            vi.spyOn(runtime, 'start').mockImplementation(async () => {
+                try { await originalStart(); } catch (error) { startFailure = error; throw error; }
+            });
+            vi.spyOn(runtime, 'providerQuiescence').mockImplementation(() => { gateReached(); throw new Error('prerequisite'); });
+            vi.spyOn(runtime, 'stop').mockImplementation(stops);
+            return runtime;
+        });
+        deps.startSupervisor = defaultManagedRuntimeBootDeps().startSupervisor;
+        try {
+            const outcome = await runManagedRuntimeBoot(deps);
+            if (mode === 'listen-failure') {
+                expect(startFailure).toMatchObject({ code: 'EADDRINUSE' });
+                expect(gateReached).not.toHaveBeenCalled();
+            } else {
+                expect(startFailure).toBeUndefined();
+                expect(gateReached).toHaveBeenCalledOnce();
+            }
+            expect(runtimeSpy).toHaveBeenCalledOnce();
+            expect(stops).toHaveBeenCalledOnce();
+            expect(outcome).toMatchObject({ ok: false, reason: 'supervisor-unavailable',
+                ...(['true', 'listen-failure'].includes(mode) ? {} : { detail: 'supervisor-stop-unproven' }) });
+            expect(release).toHaveBeenCalledTimes(['true', 'listen-failure'].includes(mode) ? 1 : 0);
+        } finally {
+            // Fixture cleanup after assertions; not counted as product stop evidence.
+            if (originalStop) await originalStop();
+            runtimeSpy.mockRestore(); compositionSpy.mockRestore();
+        }
+    });
+});
+
+
+describe('production boot captures its checkpoint loop for runtime stop', () => {
+    it.each([false, true])('accounts for the actual loop or pre-arm failure (armed=%s)', async scheduled => {
+        mkdirSync(join(stateDir, 'manifest'), { recursive: true });
+        const release = vi.fn(async () => {});
+        const { deps } = bootDeps({ acquireOwnership: async scope => ({ ok: true, ownership: { scope, address: supervisorLockAddress(scope), release } }) });
+        const admitted = identity()();
+        if (admitted.status !== 'active') throw new Error('fixture admission');
+        admitted.identity.checkpoint = { drainBudgetMs: 1000 };
+        admitted.identity.checkpointSchedule = { periodMs: 60_000, onTurnBoundary: true };
+        admitted.identity.tenant = 'company:fixture';
+        deps.resolveIdentity = () => admitted;
+        deps.assignWorkspace = async () => { throw new Error('late boot refusal'); };
+        const compose = managedRunConfig.defaultManagedRunConfig;
+        const compositionSpy = vi.spyOn(managedRunConfig, 'defaultManagedRunConfig').mockImplementation(input => compose({
+            ...input, checkpoint: { ...input.checkpoint, image: { imageVersion: 'fixture' }, workDir: join(base, 'checkpoint-work') },
+        }));
+        const makeCheckpointing = runtimeCheckpointing.createManagedRuntimeCheckpointing;
+        const captured: { loop: ManagedCheckpointTickLoop | null } = { loop: null };
+        let loopStop: ReturnType<typeof vi.spyOn> | undefined;
+        const checkpointingSpy = vi.spyOn(runtimeCheckpointing, 'createManagedRuntimeCheckpointing').mockImplementation(config => {
+            const checkpointing = makeCheckpointing(config);
+            const start = checkpointing.startAfterSupervisor;
+            checkpointing.startAfterSupervisor = async input => {
+                captured.loop = await start(input); // Actual helper/loop, only observe the returned instance.
+                if (captured.loop) loopStop = vi.spyOn(captured.loop, 'stop');
+                return captured.loop;
+            };
+            return checkpointing;
+        });
+        const create = launcherMain.createSupervisorRuntime;
+        let runtime: ReturnType<typeof create> | undefined;
+        let suppliedStop: launcherMain.SupervisorRuntimeOptions['stopCheckpointWork'];
+        const runtimeSpy = vi.spyOn(launcherMain, 'createSupervisorRuntime').mockImplementation(options => {
+            suppliedStop = options.stopCheckpointWork;
+            runtime = create(options);
+            if (!scheduled) vi.spyOn(runtime, 'providerQuiescence').mockImplementation(() => { throw new Error('pre-arm prerequisite'); });
+            return runtime;
+        });
+        deps.startSupervisor = defaultManagedRuntimeBootDeps().startSupervisor;
+        try {
+            expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: false, reason: scheduled ? 'workspace-unassignable' : 'supervisor-unavailable' });
+            expect(typeof suppliedStop).toBe('function');
+            expect(release).toHaveBeenCalledOnce();
+            if (scheduled) {
+                expect(captured.loop).not.toBeNull();
+                expect(loopStop).toHaveBeenCalledOnce();
+                expect(await captured.loop!.tickNow('periodic')).toEqual({ ticked: false });
+            } else {
+                expect(captured.loop).toBeNull();
+                expect(await suppliedStop!()).toEqual({ pendingPublication: false });
+            }
+        } finally {
+            await captured.loop?.stop(); await runtime?.stop();
+            runtimeSpy.mockRestore(); checkpointingSpy.mockRestore(); compositionSpy.mockRestore();
         }
     });
 });

@@ -76,9 +76,39 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
 export async function attachManagedSession(
     bootstrap: ManagedSpawnBootstrap,
     now: number,
+    /**
+     * The Happy this runtime was configured for, from `HAPPY_SERVER_URL` —
+     * which the supervisor sets from the stored daemon credential.
+     *
+     * Required rather than optional: a caller that forgets it would send the
+     * scoped bearer wherever the envelope asked, which is the whole thing this
+     * argument prevents.
+     */
+    configuredOrigin: string,
 ): Promise<ManagedAttachment> {
     if (bootstrap.tokenExpiresAt <= now) throw new ManagedAttachError('the scoped token has expired');
     const origin = new URL(bootstrap.serverOrigin).origin;
+    /*
+     * Before the request, not after it.
+     *
+     * The first thing this function does with the origin is POST the scoped
+     * bearer to it. A check that ran on the response, or a refusal derived
+     * from a failed call, has already disclosed the token to whatever the
+     * envelope named.
+     *
+     * Compared against the runtime's configured server — the envelope compared
+     * against itself always agrees.
+     */
+    let configured: string;
+    try {
+        configured = new URL(configuredOrigin).origin;
+    } catch {
+        throw new ManagedAttachError('the runtime has no usable configured server');
+    }
+    if (origin !== configured) {
+        // Named as an axis. Neither origin goes into a message that is logged.
+        throw new ManagedAttachError('the envelope names a server this runtime is not configured for');
+    }
 
     let rows: unknown;
     try {

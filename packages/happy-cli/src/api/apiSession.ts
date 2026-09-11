@@ -514,14 +514,28 @@ export class ApiSessionClient extends EventEmitter {
         // Create socket
         //
 
-        this.socket = io(configuration.serverUrl, {
+        // The managed origin, where there is one: the constructor already
+        // refused to exist unless it matches the configured server, and the
+        // HTTP calls below already read it, so naming it here keeps the socket
+        // on the same axis instead of a second source that can drift.
+        this.socket = io(this.managed?.serverOrigin ?? configuration.serverUrl, {
             auth: {
                 token: this.token,
                 clientType: 'session-scoped' as const,
                 sessionId: this.sessionId,
                 happyClient: `cli-coding-session/${configuration.currentCliVersion}`
             },
-            path: '/v1/updates',
+            /*
+             * Two socket servers share the port: the ordinary one verifies
+             * account tokens, the managed one verifies scoped runner grants.
+             * A managed child carries a grant, so the ordinary path drops its
+             * token through to `auth.verifyToken` and rejects it — every three
+             * seconds, forever. The path is the server's wire format
+             * (`managedSocketPath.ts`), so this side is the one that matches
+             * it; it is written out here rather than imported because the
+             * server is not a dependency of this package.
+             */
+            path: this.managed ? '/v1/managed-updates' : '/v1/updates',
             reconnection: false,
             transports: ['websocket'],
             withCredentials: true,

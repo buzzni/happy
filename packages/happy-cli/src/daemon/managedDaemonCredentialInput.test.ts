@@ -14,6 +14,8 @@ import { tmpdir } from 'node:os';
 import {
     MANAGED_DAEMON_CREDENTIAL_INPUT_VERSION,
     adoptManagedDaemonCredential,
+    narrowDeliveredCredentialMode,
+    readDeliveredMachineId,
 } from '@/daemon/managedDaemonCredentialInput';
 import {
     managedDaemonCredentialPath,
@@ -396,5 +398,211 @@ describe('root: private credential adoption boundaries', () => {
         const result = stored(); expect(result.ok).toBe(true);
         if (!result.ok) throw new Error('stored credential lost');
         expect(result.credential.token).toBe('renewed-token');
+    });
+});
+
+describe('a machine that was never provisioned', () => {
+    /*
+     * BYOS. There is no `/etc/saycode` at all — no marker, no credential, no
+     * directory to hold either. A path walk that refuses whatever it cannot
+     * stat turns that ordinary state into a refusal, and the boot then reports
+     * a tampered credential on a machine that simply is not managed.
+     *
+     * Absence and untrustworthiness are different facts, and only the second
+     * one is a reason to stop.
+     */
+    it('reports absence when the whole directory is missing', async () => {
+        const missing = join(base, 'no-such-dir', 'daemon-credential.json');
+        expect(await adoptManagedDaemonCredential({
+            stateDir, expectedMachineId: MACHINE, now: NOW, deps: deps(), inputPath: missing,
+        })).toEqual({ status: 'absent' });
+        expect(readDeliveredMachineId({ deps: deps(), inputPath: missing }))
+            .toEqual({ status: 'absent' });
+    });
+
+    it('still refuses a file sitting where the directory belongs', async () => {
+        // Producible by anyone who can write the parent, so it is a tamper
+        // signal rather than absence — the one case that must not be softened
+        // by the rule above.
+        const asFile = join(base, 'not-a-dir');
+        writeFileSync(asFile, 'x', { mode: 0o600 });
+        const through = join(asFile, 'daemon-credential.json');
+        expect((await adoptManagedDaemonCredential({
+            stateDir, expectedMachineId: MACHINE, now: NOW, deps: deps(), inputPath: through,
+        })).status).toBe('refused');
+        expect(readDeliveredMachineId({ deps: deps(), inputPath: through }))
+            .toEqual({ status: 'refused' });
+    });
+
+    it('still refuses a directory anybody else can write', async () => {
+        const open = join(base, 'open-dir');
+        mkdirSync(open, { mode: 0o700 });
+        chmodSync(open, 0o777);
+        const inside = join(open, 'daemon-credential.json');
+        writeFileSync(inside, JSON.stringify(delivered()), { mode: 0o600 });
+        expect((await adoptManagedDaemonCredential({
+            stateDir, expectedMachineId: MACHINE, now: NOW, deps: deps(), inputPath: inside,
+        })).status).toBe('refused');
+    });
+});
+
+describe('a file the platform delivered 0644', () => {
+    /*
+     * The real shape of the bug Astra found: the provider writes the file with
+     * a mode of its choosing, and every read is judged by a gate that refuses
+     * anything another uid can read. Narrowing has to come before the *first*
+     * read — the machine id, for the marker — not before the last.
+     *
+     * Real modes on a real file; only ownership is injected.
+     */
+    it('is readable for the machine id once it has been narrowed', () => {
+        deliver();
+        chmodSync(inputPath, 0o644);
+        // Before: refused, exactly as the gate should.
+        expect(readDeliveredMachineId({ deps: deps(), inputPath }))
+            .toEqual({ status: 'refused' });
+
+        expect(narrowDeliveredCredentialMode(inputPath, deps())).toBe('ok');
+        expect(readDeliveredMachineId({ deps: deps(), inputPath }))
+            .toEqual({ status: 'ok', machineId: MACHINE });
+        expect(lstatSync(inputPath).mode & 0o077).toBe(0);
+    });
+
+    it('is adopted after the same narrowing', async () => {
+        deliver();
+        chmodSync(inputPath, 0o644);
+        expect(narrowDeliveredCredentialMode(inputPath, deps())).toBe('ok');
+        expect((await adopt()).status).toBe('adopted');
+    });
+
+    it('refuses to narrow a symlink standing where the file belongs', () => {
+        // Following it would rewrite the mode of a file somebody else chose.
+        const elsewhere = join(base, 'target.json');
+        writeFileSync(elsewhere, JSON.stringify(delivered()), { mode: 0o644 });
+        const link = join(inputDir, 'linked-credential.json');
+        symlinkSync(elsewhere, link);
+        const before = lstatSync(elsewhere).mode;
+        expect(narrowDeliveredCredentialMode(link, deps())).toBe('refused');
+        // The target's mode is whatever its owner chose, before and after.
+        expect(lstatSync(elsewhere).mode).toBe(before);
+    });
+
+    it('reports absence when there is nothing to narrow', () => {
+        expect(narrowDeliveredCredentialMode(join(base, 'no-such-file.json'), deps())).toBe('absent');
+    });
+});
+
+/*
+ * Narrowing is not a repair.
+ *
+ * The defect these cover: the chmod ran *first*, so a file anybody could have
+ * written came out `0600` and then satisfied every check downstream — and the
+ * only evidence of the tampering was the mode that had just been erased. A
+ * mode is not made trustworthy by being changed; it is either already the mode
+ * of a file only its owner could write, or it is a refusal.
+ *
+ * Real files with real modes. Only ownership is injected, because this suite
+ * does not run as root.
+ */
+describe('narrowing refuses rather than launders', () => {
+    const modeOf = (path: string) => lstatSync(path).mode & 0o7777;
+
+    it.each([
+        ['world writable', 0o666],
+        ['group writable', 0o660],
+        ['group writable without being group readable', 0o620],
+        ['world executable', 0o755],
+    ])('refuses a %s file and leaves its mode exactly as it was', (_name, mode) => {
+        deliver();
+        chmodSync(inputPath, mode);
+        expect(narrowDeliveredCredentialMode(inputPath, deps())).toBe('refused');
+        expect(modeOf(inputPath)).toBe(mode);
+        // And it stays refused downstream, which is the whole point: the
+        // laundered version passed here.
+        expect(readDeliveredMachineId({ deps: deps(), inputPath })).toEqual({ status: 'refused' });
+    });
+
+    it('refuses a setuid file and leaves its mode exactly as it was', () => {
+        /*
+         * A credential file needs none of setuid/setgid/sticky, so their
+         * presence says this is not the file the parent wrote. Narrowing while
+         * carrying them forward would preserve exactly the bit worth asking
+         * about — and note the reader's own gate looks at `0o077` only, so this
+         * refusal is the *only* thing standing between a setuid delivery and
+         * adoption.
+         */
+        deliver();
+        chmodSync(inputPath, 0o4600);
+        expect(narrowDeliveredCredentialMode(inputPath, deps())).toBe('refused');
+        expect(modeOf(inputPath)).toBe(0o4600);
+    });
+
+    it.each([
+        ['0644', 0o644],
+        ['0640', 0o640],
+    ])('narrows %s, removing only the read bits', (_name, mode) => {
+        deliver();
+        chmodSync(inputPath, mode);
+        expect(narrowDeliveredCredentialMode(inputPath, deps())).toBe('ok');
+        expect(modeOf(inputPath)).toBe(0o600);
+    });
+
+    it('leaves an already private file untouched', () => {
+        deliver();
+        chmodSync(inputPath, 0o600);
+        expect(narrowDeliveredCredentialMode(inputPath, deps())).toBe('ok');
+        expect(modeOf(inputPath)).toBe(0o600);
+    });
+
+    it('refuses a symlinked ancestor without touching the file behind it', () => {
+        /*
+         * `O_NOFOLLOW` covers the last component only. Without the chain walk
+         * this process — running as root — would rewrite the mode of a file
+         * inside a directory somebody else controls, which is an effect outside
+         * this runtime entirely.
+         */
+        const target = join(base, 'elsewhere');
+        mkdirSync(target, { mode: 0o755 });
+        const file = join(target, 'daemon-credential.json');
+        writeFileSync(file, JSON.stringify(delivered()));
+        // Explicit: the `mode` option is masked by the process umask, and this
+        // assertion is about the exact bits.
+        chmodSync(file, 0o644);
+        const link = join(base, 'linked-dir');
+        symlinkSync(target, link);
+
+        expect(narrowDeliveredCredentialMode(join(link, 'daemon-credential.json'), deps()))
+            .toBe('refused');
+        expect(modeOf(file)).toBe(0o644);
+    });
+
+    it('refuses an ancestor anybody may write, without touching the file', () => {
+        const open = join(base, 'open-dir');
+        mkdirSync(open, { mode: 0o777 });
+        chmodSync(open, 0o777);
+        const file = join(open, 'daemon-credential.json');
+        writeFileSync(file, JSON.stringify(delivered()));
+        chmodSync(file, 0o644);
+        expect(narrowDeliveredCredentialMode(file, deps())).toBe('refused');
+        expect(modeOf(file)).toBe(0o644);
+    });
+
+    it('refuses a file the parent did not write, judged by the real owner gate', () => {
+        // The only test here that does **not** neutralise ownership: this file
+        // belongs to whoever runs the suite, and the gate wants root.
+        deliver();
+        chmodSync(inputPath, 0o644);
+        expect(narrowDeliveredCredentialMode(inputPath, deps({ statGate: undefined })))
+            .toBe('refused');
+        expect(modeOf(inputPath)).toBe(0o644);
+    });
+
+    it('still reports absence on a machine that has no /etc/saycode at all', () => {
+        // BYOS. A chain that stops existing is absence, not tampering — the
+        // regression Opus3 found, kept covered now that the chain is walked
+        // before the file is opened.
+        expect(narrowDeliveredCredentialMode(
+            join(base, 'no-such-dir', 'nested', 'daemon-credential.json'), deps(),
+        )).toBe('absent');
     });
 });

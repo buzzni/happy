@@ -66,12 +66,14 @@
  * provider owns it, it is re-created on every start, and a runtime that deleted
  * it would have nothing to fall back to if its state directory were replaced.
  */
+import { closeSync, constants, fchmodSync, fstatSync, openSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
 import {
+    absenceRefusal,
     assertProvisioningStat,
+    defaultProvisioningDeps,
     readRootProtectedFile,
-    trustedPathRefusal,
     type ManagedIdentityRefusal,
     type ManagedProvisioningDeps,
     type ProvisioningStat,
@@ -190,6 +192,50 @@ function parseInput(content: string): ParsedInput | null {
 }
 
 /**
+ * Which Machine the parent says this runtime is, read from the delivered file
+ * and **nothing else**.
+ *
+ * Needed because of an ordering that has no way around it: the marker records
+ * the Machine, and on a first boot there is no marker to read it from. The one
+ * thing on the disk that knows is the credential the parent delivered — it was
+ * minted for that Machine and for no other.
+ *
+ * It compares nothing and writes nothing. Adoption still happens later, against
+ * the marker, so a credential naming a different Machine than the one this
+ * runtime already recorded is still refused there — this only breaks the tie on
+ * the boot where there is nothing to compare against yet.
+ */
+export function readDeliveredMachineId(input: {
+    deps: ManagedProvisioningDeps;
+    inputPath?: string;
+}): { status: 'ok'; machineId: string } | { status: 'absent' } | { status: 'refused' } {
+    const path = input.inputPath ?? MANAGED_DAEMON_CREDENTIAL_INPUT_PATH;
+    const ownerGate = input.deps.statGate ?? assertProvisioningStat;
+    const gate = (stat: ProvisioningStat) => assertPrivateCredentialStat(stat, ownerGate);
+    /*
+     * Absence and untrustworthiness are different facts.
+     *
+     * On a machine that was never provisioned there is no `/etc/saycode` at
+     * all, and walking that chain with a rule that refuses anything it cannot
+     * stat turns every BYOS boot into a refusal. The walk stops where the chain
+     * stops existing; what exists must still be root-owned and not
+     * agent-writable, and a file sitting where a directory belongs is a tamper
+     * signal rather than absence.
+     */
+    if (absenceRefusal(path, input.deps.getuid(), input.deps)) {
+        return { status: 'refused' };
+    }
+    const file = readRootProtectedFile(path, gate);
+    if (file.kind === 'absent') return { status: 'absent' };
+    if (file.kind !== 'ok') return { status: 'refused' };
+    const delivered = parseInput(file.content);
+    // The whole record is validated, not just the field being read: a file this
+    // reader would refuse later must not decide the machine's identity now.
+    if (!delivered) return { status: 'refused' };
+    return { status: 'ok', machineId: delivered.machineId };
+}
+
+/**
  * Reads the delivered credential and makes it this runtime's own.
  *
  * Called from the boot stage, before anything authenticates: `run.ts` reads
@@ -215,9 +261,12 @@ export async function adoptManagedDaemonCredential(input: {
     // The directory it sits in, then the file's own descriptor with
     // `O_NOFOLLOW`: a path anybody else can write is a path where this file can
     // be swapped between the check and the read.
-    if (trustedPathRefusal(dirname(resolve(path)), input.deps.getuid(), 'unreadable', input.deps)) {
+    // Same rule as above: a chain that does not exist is a machine that was
+    // never provisioned, not a machine somebody tampered with.
+    if (absenceRefusal(path, input.deps.getuid(), input.deps)) {
         return { status: 'refused', reason: 'input-untrusted' };
     }
+
     const file = readRootProtectedFile(path, gate);
     if (file.kind === 'absent') return { status: 'absent' };
     if (file.kind !== 'ok') return { status: 'refused', reason: 'input-untrusted' };
@@ -293,3 +342,110 @@ export async function adoptManagedDaemonCredential(input: {
 
 /** Where the runtime's own copy lives, for callers that report on it. */
 export { managedDaemonCredentialPath };
+
+/**
+ * Takes the group and other **read** bits off the delivered file, after
+ * establishing that this file is one this runtime may touch at all.
+ *
+ * **Separate from adoption on purpose.** The provider writes this file and the
+ * mode it chooses is not documented and is not ours; a credential delivered
+ * `0644` would be refused by the reader and the runtime would never boot —
+ * correct, and useless. So the boot narrows it first, and the reader still
+ * refuses a file that is readable by anyone else. The two together mean the
+ * narrowing is not assumed: if it did not happen, adoption fails.
+ *
+ * The order matters, and getting it wrong is what this comment is here for.
+ * An earlier version chmod'ed **first** and let the reader judge afterwards.
+ * That laundered: a `0666` file — one anybody could have written, so one whose
+ * contents nobody can vouch for — came out `0600` and then passed every check
+ * downstream, because the only evidence of the tampering was the mode this
+ * function had just erased. Narrowing is not a repair. It closes a file that
+ * was already trustworthy; it cannot make an untrustworthy one trustworthy.
+ *
+ * So, before the mode is touched:
+ *  - the **ancestors** are walked, by the same rule the marker's chain uses. A
+ *    symlinked ancestor is refused rather than followed: `O_NOFOLLOW` only
+ *    covers the last component, so without this the process would be rewriting
+ *    the mode of a file in a directory somebody else controls — an effect
+ *    outside this runtime entirely, done as root.
+ *  - the descriptor's **owner** is judged by the same gate every other
+ *    root-protected read on this runtime uses.
+ *  - any **write or execute** bit for group or other is a refusal, always.
+ *    That is the laundering case, and it is never narrowed.
+ *
+ * What is left after that is a file only its owner may modify, which is merely
+ * readable too widely — and that is the one case narrowing exists for.
+ *
+ * What this does **not** claim is that nothing read the file before this ran.
+ * The window is from the platform's write at machine start to this call, during
+ * which the only thing running in the guest is this root process — an argument
+ * about the image's startup order, not a property of the filesystem.
+ */
+export function narrowDeliveredCredentialMode(
+    path: string,
+    deps: ManagedProvisioningDeps = defaultProvisioningDeps,
+): 'ok' | 'absent' | 'refused' {
+    const daemonUid = deps.getuid();
+    /*
+     * The chain, first, and **before anything is opened**.
+     *
+     * `absenceRefusal` rather than `trustedPathRefusal`: a chain that simply
+     * stops existing is an ordinary BYOS machine with no `/etc/saycode` at all,
+     * which is absence and not tampering. What it does refuse is a symlink, a
+     * file where a directory belongs, or a component anyone may write.
+     */
+    if (absenceRefusal(path, daemonUid, deps)) return 'refused';
+
+    let fd: number;
+    try {
+        fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        // Only a genuinely missing file is absence. `ELOOP` is a symlink where
+        // the file should be, and that is a refusal.
+        if (code === 'ENOENT') return 'absent';
+        return 'refused';
+    }
+    try {
+        const stat = fstatSync(fd);
+        if (!stat.isFile()) return 'refused';
+        /*
+         * Judged on the descriptor that was opened, by the gate the rest of
+         * this runtime uses — so a file the parent did not write is refused
+         * here rather than being closed up and believed.
+         */
+        const ownerGate = deps.statGate ?? assertProvisioningStat;
+        if (ownerGate({
+            uid: stat.uid,
+            mode: stat.mode,
+            size: stat.size,
+            isFile: true,
+        })) return 'refused';
+        // `0o033`: write or execute for group or other. Never narrowed — see
+        // the laundering note above. Checked separately from the gate because
+        // the gate is the *ownership* rule and this one must hold regardless.
+        //
+        // `0o7000`: setuid, setgid, sticky. A credential file needs none of
+        // them, so their presence says this is not the file the parent wrote —
+        // and narrowing while carrying them forward would preserve exactly the
+        // bit worth asking about.
+        if ((stat.mode & 0o033) !== 0 || (stat.mode & 0o7000) !== 0) return 'refused';
+        /*
+         * What is left is a file only its owner may modify, which is merely
+         * readable too widely — so the read bits come off and it becomes
+         * `0600`.
+         *
+         * A fixed `0600` rather than `stat.mode & 0o700`: the only shapes that
+         * reach this line are `0600`, `0640` and `0644`, and for all three the
+         * two are the same value. Writing the expression would be claiming a
+         * behaviour (preserving an owner execute bit) that nothing here has any
+         * reason to want and no test covers.
+         */
+        if ((stat.mode & 0o044) !== 0) fchmodSync(fd, 0o600);
+        return 'ok';
+    } catch {
+        return 'refused';
+    } finally {
+        try { closeSync(fd); } catch { /* already gone */ }
+    }
+}
