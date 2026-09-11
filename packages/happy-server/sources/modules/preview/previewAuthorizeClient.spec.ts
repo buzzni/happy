@@ -269,3 +269,75 @@ describe('createPreviewAuthorizer — workspace paths', () => {
         });
     });
 });
+
+// specs/runtime-isolation-hardening (H3 viewer purpose) — 머신 스코프 뷰어의
+// 매 요청 재확인. 프로젝트 ACL 이 아니라 머신 ACL 이고, 스튜디오가 그 자리에서
+// 다시 파생한 viewerKey 가 토큰의 키와 같아야 한다. 머신 접근 권한만으로는
+// 같은 머신의 다른 사용자 뷰어를 막지 못하므로 두 증거가 모두 필요하다.
+describe('previewAuthorizer — viewer purpose', () => {
+    const config = { origin: 'https://studio.test', secret: 's3cr3t' };
+    const VIEWER_KEY = 'bv1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+    const viewerRequest = {
+        purpose: 'viewer' as const,
+        studioUserId: 'studio-1',
+        viewerKey: VIEWER_KEY,
+        machineId: 'm1',
+        port: 6080,
+    };
+
+    function authorizerReturning(status: number, body: unknown) {
+        const fetchImpl = vi.fn().mockResolvedValue(
+            new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }),
+        );
+        return { authorizer: createPreviewAuthorizer({ config, fetchImpl: fetchImpl as unknown as typeof fetch }), fetchImpl };
+    }
+
+    it('sends the purpose and key, and never a projectId', async () => {
+        const { authorizer, fetchImpl } = authorizerReturning(200, { allowed: true, viewerKey: VIEWER_KEY });
+        await authorizer.authorize(viewerRequest);
+        const body = JSON.parse((fetchImpl.mock.calls[0][1] as RequestInit).body as string);
+        expect(body).toEqual({
+            purpose: 'viewer',
+            studioUserId: 'studio-1',
+            viewerKey: VIEWER_KEY,
+            machineId: 'm1',
+            port: 6080,
+        });
+    });
+
+    it('allows only when the studio echoes the very key it re-derived', async () => {
+        const { authorizer } = authorizerReturning(200, { allowed: true, viewerKey: VIEWER_KEY });
+        await expect(authorizer.authorize(viewerRequest)).resolves.toEqual({
+            kind: 'allowed',
+            viewerKey: VIEWER_KEY,
+            workspacePaths: [],
+        });
+    });
+
+    // 키가 다르면 스튜디오가 이 사용자에 대해 파생한 뷰어가 토큰의 뷰어와
+    // 다르다는 뜻이다. allowed:true 라도 이 요청에 대한 승인이 아니다.
+    it('refuses an allow whose key is different, missing, or malformed', async () => {
+        for (const viewerKey of [undefined, '', 'bv1_ZZZ', 'bv1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 42]) {
+            const { authorizer } = authorizerReturning(200, { allowed: true, viewerKey });
+            await expect(authorizer.authorize(viewerRequest)).resolves.toMatchObject({ kind: 'unavailable' });
+        }
+    });
+
+    // 뷰어에는 워크스페이스 개념이 없다. 경로를 보내오면 계약 위반이다.
+    it('refuses an allow that carries workspacePaths', async () => {
+        const { authorizer } = authorizerReturning(200, {
+            allowed: true, viewerKey: VIEWER_KEY, workspacePaths: ['/home/u/proj'],
+        });
+        await expect(authorizer.authorize(viewerRequest)).resolves.toMatchObject({ kind: 'unavailable' });
+    });
+
+    it('reads a refusal as denied, not unavailable', async () => {
+        const { authorizer } = authorizerReturning(200, { allowed: false });
+        await expect(authorizer.authorize(viewerRequest)).resolves.toEqual({ kind: 'denied' });
+    });
+
+    it('fails closed when the studio cannot answer', async () => {
+        const { authorizer } = authorizerReturning(503, { error: 'down' });
+        await expect(authorizer.authorize(viewerRequest)).resolves.toMatchObject({ kind: 'unavailable' });
+    });
+});

@@ -44,6 +44,18 @@ export interface ExpiredPtokenHtmlParams {
      * when the request arrived with no token at all.
      */
     previousToken?: string;
+    /**
+     * specs/runtime-isolation-hardening (H3 viewer purpose) — the purpose the
+     * replaced token was bound to, stated only when `previousToken` is a
+     * signature-verified viewer token.
+     *
+     * The studio needs it to know which recovery this is: without it the
+     * re-mint is read as a project recovery, and a viewer session comes back
+     * having lost its binding. It is not a credential and grants nothing on
+     * its own — the server re-verifies the token's signature, user, key,
+     * machine and port before honouring the claim.
+     */
+    previousPurpose?: 'viewer';
 }
 
 /**
@@ -97,6 +109,10 @@ export function renderExpiredPtokenHtml(params: ExpiredPtokenHtmlParams): string
 
     const machineIdLiteral = jsString(params.machineId);
     const previousTokenLiteral = params.previousToken ? jsString(params.previousToken) : null;
+    // A purpose with no token behind it is an unbacked claim: the studio
+    // would take the viewer recovery path with nothing for the server to
+    // verify it against. The two travel together or not at all.
+    const viewerRecovery = previousTokenLiteral !== null && params.previousPurpose === 'viewer';
     const portLiteral = String(Number.isInteger(params.port) ? params.port : 0);
 
     // Inline script — no external deps. Uses sessionStorage to gate against
@@ -161,7 +177,8 @@ export function renderExpiredPtokenHtml(params: ExpiredPtokenHtmlParams): string
       machineId: ${machineIdLiteral},
       port: ${portLiteral},
       activeCompanyId: activeCompanyId${previousTokenLiteral ? `,
-      previousToken: ${previousTokenLiteral}` : ''}
+      previousToken: ${previousTokenLiteral}` : ''}${viewerRecovery ? `,
+      purpose: "viewer"` : ''}
     })
   }).then(function (res) {
     return res.json().then(function (data) { return { status: res.status, data: data }; });

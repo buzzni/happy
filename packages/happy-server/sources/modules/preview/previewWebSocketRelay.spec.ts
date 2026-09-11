@@ -17,6 +17,7 @@ import {
     stripPreviewAuthCookie,
     PreviewWsOpenError,
     BOUND_WS_OPEN_EVENT,
+    VIEWER_BOUND_WS_OPEN_EVENT,
     WS_BINDING_RECHECK_MS,
     WS_RECHECK_DEADLINE_MS,
     wsOpenFailureStatus,
@@ -593,6 +594,22 @@ describe('wsOpenFailureStatus', () => {
         expect(wsOpenFailureStatus('NO_LISTENER')).toBe(502);
         expect(wsOpenFailureStatus(null)).toBe(502);
     });
+
+    // specs/runtime-isolation-hardening (H3 viewer purpose) — same
+    // 404/403/409 as mint (describeLeaseFailure) and the HTTP relay
+    // (describePreviewRelayFailure), not the 502 fallback above.
+    it('answers a viewer key with no lease with 404, consistent with mint and the HTTP relay', () => {
+        expect(wsOpenFailureStatus('VIEWER_UNKNOWN')).toBe(404);
+    });
+
+    it('answers a proven viewer port or runtime mismatch with 403, consistent with mint and the HTTP relay', () => {
+        expect(wsOpenFailureStatus('VIEWER_PORT_MISMATCH')).toBe(403);
+        expect(wsOpenFailureStatus('VIEWER_RUNTIME_MISMATCH')).toBe(403);
+    });
+
+    it('answers unsupported broker evidence with 409, consistent with mint and the HTTP relay', () => {
+        expect(wsOpenFailureStatus('VIEWER_EVIDENCE_UNSUPPORTED')).toBe(409);
+    });
 });
 
 describe('createTunnelCandidateHooks', () => {
@@ -689,5 +706,109 @@ describe('createTunnelCandidateHooks', () => {
         applyRemoteData({ tunnelId, dataB64: Buffer.from('legacy').toString('base64') } as never);
 
         expect(socket.written).toEqual(['legacy']);
+    });
+});
+
+// specs/runtime-isolation-hardening (H3 viewer purpose) — noVNC 는 WS 로만
+// 픽셀이 흐른다. 업그레이드가 목적 결속을 빠져나가면 뷰어 결속 전체가
+// HTTP 한 번에만 걸린 장식이 된다.
+describe('viewer purpose over the WS upgrade', () => {
+    const VIEWER_KEY = 'bv1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+    const viewerBinding = { purpose: 'viewer' as const, viewerKey: VIEWER_KEY, leaseId: 'viewer-lease-1' };
+    const viewerBind = {
+        purpose: 'viewer' as const,
+        studioUserId: 'studio-1',
+        viewerKey: VIEWER_KEY,
+        leaseId: 'viewer-lease-1',
+    };
+
+    it('opens a viewer tunnel on its own event, never the project one', async () => {
+        const emitWithAck = vi.fn(async () => ({ ok: true, bindingEnforced: true }));
+        const daemon = { id: 'd1', emit: vi.fn(), timeout: () => ({ emitWithAck }) };
+        const probe = candidateHooks();
+
+        await openPreviewWsTunnel([daemon], { ...OPEN_PAYLOAD, binding: viewerBinding }, probe.hooks, 10, true);
+
+        expect(emitWithAck).toHaveBeenCalledWith(VIEWER_BOUND_WS_OPEN_EVENT, {
+            tunnelId: probe.begun[0],
+            ...OPEN_PAYLOAD,
+            binding: viewerBinding,
+        });
+    });
+
+    // 구 daemon 은 이 이벤트 handler 가 없다 — 업스트림 연결 자체가 없어야 한다.
+    it('never opens against a daemon that has no viewer handler', async () => {
+        const emitWithAck = vi.fn(async () => { throw new Error('operation has timed out'); });
+        const daemon = { id: 'd1', emit: vi.fn(), timeout: () => ({ emitWithAck }) };
+        const probe = candidateHooks();
+
+        await expect(openPreviewWsTunnel(
+            [daemon], { ...OPEN_PAYLOAD, binding: viewerBinding }, probe.hooks, 10, true,
+        )).rejects.toThrow();
+        expect(probe.approved).toEqual([]);
+    });
+
+    it('rechecks an open viewer tunnel by key, and drops it once the studio stops recognising it', async () => {
+        const requestLease = vi.fn(async () => ({ type: 'success' as const, leaseId: 'viewer-lease-1', evidenceKind: 'viewer-native' }));
+        const authorizer = {
+            authorize: vi.fn(async () => ({ kind: 'allowed' as const, workspacePaths: [], viewerKey: VIEWER_KEY })),
+        };
+
+        await expect(recheckOpenTunnelBinding({
+            bind: viewerBind,
+            machineId: 'm1',
+            port: 6080,
+            authorizer,
+            sockets: [],
+            requestViewerLease: requestLease,
+        })).resolves.toEqual({ ok: true });
+        expect(authorizer.authorize).toHaveBeenCalledWith(expect.objectContaining({
+            purpose: 'viewer', viewerKey: VIEWER_KEY, studioUserId: 'studio-1',
+        }));
+        expect(requestLease).toHaveBeenCalledWith([], { viewerKey: VIEWER_KEY, port: 6080 }, expect.any(Number));
+
+        const denied = {
+            authorize: vi.fn(async () => ({ kind: 'denied' as const })),
+        };
+        await expect(recheckOpenTunnelBinding({
+            bind: viewerBind,
+            machineId: 'm1',
+            port: 6080,
+            authorizer: denied,
+            sockets: [],
+            requestViewerLease: requestLease,
+        })).resolves.toMatchObject({ ok: false });
+    });
+
+    it('drops an open viewer tunnel when the runtime behind the key changed', async () => {
+        const requestLease = vi.fn(async () => ({ type: 'success' as const, leaseId: 'viewer-lease-2', evidenceKind: 'viewer-native' }));
+        const authorizer = {
+            authorize: vi.fn(async () => ({ kind: 'allowed' as const, workspacePaths: [], viewerKey: VIEWER_KEY })),
+        };
+
+        await expect(recheckOpenTunnelBinding({
+            bind: viewerBind,
+            machineId: 'm1',
+            port: 6080,
+            authorizer,
+            sockets: [],
+            requestViewerLease: requestLease,
+        })).resolves.toEqual({ ok: false, reason: 'LEASE_MISMATCH' });
+    });
+
+    // 뷰어 재검사가 프로젝트 lease 이벤트를 타면 구 daemon 이 응답해 버린다.
+    it('never asks the project lease event for a viewer tunnel', async () => {
+        const projectLease = vi.fn();
+        const viewerLease = vi.fn(async () => ({ type: 'success' as const, leaseId: 'viewer-lease-1', evidenceKind: 'viewer-native' }));
+        await recheckOpenTunnelBinding({
+            bind: viewerBind,
+            machineId: 'm1',
+            port: 6080,
+            authorizer: { authorize: vi.fn(async () => ({ kind: 'allowed' as const, workspacePaths: [], viewerKey: VIEWER_KEY })) },
+            sockets: [],
+            requestLease: projectLease as never,
+            requestViewerLease: viewerLease,
+        });
+        expect(projectLease).not.toHaveBeenCalled();
     });
 });

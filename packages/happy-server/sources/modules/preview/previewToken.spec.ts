@@ -203,3 +203,75 @@ describe('verifyExpiredPreviewTokenForRecovery', () => {
         expect(verifyExpiredPreviewTokenForRecovery('not-a-token', { secret: SECRET })).toBeNull();
     });
 });
+
+// specs/runtime-isolation-hardening (H3 viewer purpose) — 두 결속 변이는
+// 엄격히 분리된다. 하나의 토큰이 두 목적 모두로 읽히면 목적별 결속 자체가
+// 의미를 잃는다. 어떤 실패도 "unbound 로 강등" 이 아니라 hard reject 다.
+describe('previewToken viewer binding (specs/runtime-isolation-hardening H3)', () => {
+    const viewerBind = {
+        purpose: 'viewer' as const,
+        studioUserId: 'studio-user-1',
+        viewerKey: 'bv1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+        leaseId: 'lease-v1',
+    };
+
+    function tamperBind(bind: unknown): string {
+        const payload = { userId: 'acct-1', machineId: 'm1', port: 6080, exp: Date.now() + 60_000, bind };
+        const b64 = Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64url');
+        const sig = crypto.createHmac('sha256', SECRET).update(b64).digest('base64url');
+        return `${b64}.${sig}`;
+    }
+
+    it('round-trips a viewer binding', () => {
+        const signed = signPreviewToken(
+            { userId: 'acct-1', machineId: 'm1', port: 6080, bind: viewerBind },
+            { secret: SECRET },
+        );
+        expect(verifyPreviewToken(signed.token, { secret: SECRET })?.bind).toEqual(viewerBind);
+    });
+
+    // 기존에 발급되어 아직 유효한 토큰은 purpose 가 없다. 그 해석을 바꾸면
+    // 살아 있는 세션이 전부 끊긴다.
+    it('keeps reading an existing project binding that carries no purpose', () => {
+        const projectBind = { projectId: 'p1', studioUserId: 'studio-user-1', leaseId: 'lease-p1' };
+        const signed = signPreviewToken(
+            { userId: 'acct-1', machineId: 'm1', port: 3000, bind: projectBind },
+            { secret: SECRET },
+        );
+        expect(verifyPreviewToken(signed.token, { secret: SECRET })?.bind).toEqual(projectBind);
+    });
+
+    it('rejects an unknown or non-string purpose rather than guessing a variant', () => {
+        for (const purpose of ['project', 'admin', '', null, 7, {}]) {
+            expect(
+                verifyPreviewToken(
+                    tamperBind({ purpose, projectId: 'p1', studioUserId: 'u1', leaseId: 'l1' }),
+                    { secret: SECRET },
+                ),
+            ).toBeNull();
+        }
+    });
+
+    it('rejects a viewer binding that carries project fields, and the reverse', () => {
+        expect(verifyPreviewToken(tamperBind({ ...viewerBind, projectId: 'p1' }), { secret: SECRET })).toBeNull();
+        expect(
+            verifyPreviewToken(
+                tamperBind({ projectId: 'p1', studioUserId: 'u1', leaseId: 'l1', viewerKey: viewerBind.viewerKey }),
+                { secret: SECRET },
+            ),
+        ).toBeNull();
+    });
+
+    it('rejects a viewer binding with a missing or malformed viewerKey', () => {
+        for (const viewerKey of [undefined, '', 'not-a-viewer-key', 'bv1_short', 123]) {
+            expect(
+                verifyPreviewToken(tamperBind({ ...viewerBind, viewerKey }), { secret: SECRET }),
+            ).toBeNull();
+        }
+    });
+
+    it('rejects a viewer binding missing studioUserId or leaseId', () => {
+        expect(verifyPreviewToken(tamperBind({ ...viewerBind, studioUserId: '' }), { secret: SECRET })).toBeNull();
+        expect(verifyPreviewToken(tamperBind({ ...viewerBind, leaseId: undefined }), { secret: SECRET })).toBeNull();
+    });
+});

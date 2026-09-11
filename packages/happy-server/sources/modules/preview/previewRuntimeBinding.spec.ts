@@ -8,6 +8,7 @@ import {
     describeLeaseFailure,
     isBindingEnforcementEchoed,
     LEASE_UNSUPPORTED_CODE,
+    viewerLeaseFailureStatus,
 } from '@/modules/preview/previewRuntimeBinding';
 
 const BIND = { projectId: 'proj-1', studioUserId: 'studio-1', leaseId: 'lease-1' };
@@ -163,6 +164,66 @@ describe('describeLeaseFailure', () => {
         expect(failure.status).toBe(502);
         expect(failure.body.code).toBe('WEIRD');
     });
+
+    // specs/runtime-isolation-hardening (H3 viewer purpose) — the CLI's
+    // previewViewerEvidence.ts emits four viewer-specific codes
+    // (VIEWER_UNKNOWN/VIEWER_PORT_MISMATCH/VIEWER_RUNTIME_MISMATCH/
+    // VIEWER_EVIDENCE_UNSUPPORTED) that describeLeaseFailure did not know
+    // about yet and fell through to the generic 502 for. Project mappings
+    // above (PORT_PROJECT_MISMATCH etc., the unknown-code 502 fallback) must
+    // stay exactly as they are — these are new, additive branches only.
+    it('maps a viewer key with no lease on this machine to 404, not the generic 502', () => {
+        const failure = describeLeaseFailure({ type: 'error', code: 'VIEWER_UNKNOWN', message: 'no lease' });
+        expect(failure.status).toBe(404);
+        expect(failure.body.code).toBe('VIEWER_UNKNOWN');
+    });
+
+    it('maps a proven viewer port or runtime mismatch to 403, not the generic 502', () => {
+        for (const code of ['VIEWER_PORT_MISMATCH', 'VIEWER_RUNTIME_MISMATCH']) {
+            const failure = describeLeaseFailure({ type: 'error', code, message: '' });
+            expect(failure.status).toBe(403);
+            expect(failure.body.code).toBe(code);
+        }
+    });
+
+    it('maps unsupported broker evidence to 409 with upgrade/retry guidance, not the generic 502', () => {
+        const failure = describeLeaseFailure({
+            type: 'error',
+            code: 'VIEWER_EVIDENCE_UNSUPPORTED',
+            message: 'no fingerprint',
+        });
+        expect(failure.status).toBe(409);
+        expect(failure.body.code).toBe('VIEWER_EVIDENCE_UNSUPPORTED');
+        expect(failure.body.error).toContain('happy-cli');
+    });
+
+    it('still leaves a genuinely unrecognised code on the generic 502 fallback', () => {
+        // Regression guard for the fallback itself, distinct from the viewer
+        // codes above — a typo or a future daemon code must not silently
+        // land on one of the new specific statuses.
+        const failure = describeLeaseFailure({ type: 'error', code: 'VIEWER_TOTALLY_MADE_UP', message: 'x' });
+        expect(failure.status).toBe(502);
+        expect(failure.body.code).toBe('VIEWER_TOTALLY_MADE_UP');
+    });
+});
+
+// specs/runtime-isolation-hardening (H3 viewer purpose) — the exported
+// helper describeLeaseFailure now reuses above, and previewRoutes.ts /
+// previewWebSocketRelay.ts also reuse for HTTP relay and WS handshake so
+// the same daemon refusal reads the same status everywhere.
+describe('viewerLeaseFailureStatus', () => {
+    it('maps each of the four viewer codes to its status', () => {
+        expect(viewerLeaseFailureStatus('VIEWER_UNKNOWN')).toBe(404);
+        expect(viewerLeaseFailureStatus('VIEWER_PORT_MISMATCH')).toBe(403);
+        expect(viewerLeaseFailureStatus('VIEWER_RUNTIME_MISMATCH')).toBe(403);
+        expect(viewerLeaseFailureStatus('VIEWER_EVIDENCE_UNSUPPORTED')).toBe(409);
+    });
+
+    it('returns null for a non-viewer or unrecognised code, never guessing a status', () => {
+        for (const code of ['PORT_PROJECT_MISMATCH', 'LEASE_MISMATCH', 'EVIDENCE_BUSY', 'NO_LISTENER', 'WEIRD']) {
+            expect(viewerLeaseFailureStatus(code)).toBeNull();
+        }
+    });
 });
 
 describe('isBindingEnforcementEchoed', () => {
@@ -280,5 +341,125 @@ describe('planTrustedMint', () => {
         const previous = { kind: 'token' as const, claims: { machineId: 'machine-1', port: 3000 } };
         expect(planTrustedMint({ ...base, policy: policy('off', ['machine-1']), previous }))
             .toEqual({ kind: 'unbound', reason: 'legacy-machine' });
+    });
+});
+
+// specs/runtime-isolation-hardening (H3 viewer purpose) — 머신 스코프 뷰어.
+// 프로젝트가 없는 것이 이 기능의 정의이므로 projectId 요구로는 통과시킬 수
+// 없고, 포트 예외나 머신 allowlist 로 여는 것은 같은 머신의 프로젝트 결속까지
+// 함께 약화한다. 목적을 명시하고 그 목적에 맞는 대상을 증명하게 한다.
+describe('planTrustedMint — viewer purpose', () => {
+    const VIEWER_KEY = 'bv1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+    const OTHER_KEY = 'bv1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+    const required = { mode: 'required' as const, legacyMachineIds: new Set<string>() };
+    const off = { mode: 'off' as const, legacyMachineIds: new Set<string>() };
+
+    const viewerRequest = {
+        machineId: 'm1',
+        port: 6080,
+        viewer: { studioUserId: 'studio-1', viewerKey: VIEWER_KEY },
+        previous: { kind: 'absent' as const },
+    };
+
+    it('binds a viewer request under the required policy without a projectId', () => {
+        expect(planTrustedMint({ policy: required, ...viewerRequest }))
+            .toEqual({ kind: 'bind-viewer', forced: false });
+    });
+
+    // 프로젝트 결속과 같은 이유로, 목적을 밝힌 요청은 정책이 꺼져 있어도
+    // 결속한다. 정책은 "누가 결속을 요구받는가" 이지 "결속을 무시해도 되는가"
+    // 가 아니다.
+    it('binds a viewer request while the policy is off too', () => {
+        expect(planTrustedMint({ policy: off, ...viewerRequest }))
+            .toEqual({ kind: 'bind-viewer', forced: false });
+    });
+
+    it('refuses a request that names both a project and a viewer', () => {
+        const plan = planTrustedMint({
+            policy: required,
+            machineId: 'm1',
+            port: 6080,
+            projectId: 'p1',
+            studioUserId: 'studio-1',
+            viewer: { studioUserId: 'studio-1', viewerKey: VIEWER_KEY },
+            previous: { kind: 'absent' },
+        });
+        expect(plan).toMatchObject({ kind: 'reject', status: 400, code: 'MIXED_BINDING_PURPOSE' });
+    });
+
+    // 예외 머신은 unbound 발급 허가일 뿐, 목적을 밝힌 결속을 버릴 권한이 아니다.
+    it('does not fall back to unbound on a legacy machine when a viewer binding was asked for', () => {
+        expect(planTrustedMint({
+            policy: { mode: 'required', legacyMachineIds: new Set(['m1']) },
+            ...viewerRequest,
+        })).toEqual({ kind: 'bind-viewer', forced: false });
+    });
+
+    describe('bound recovery', () => {
+        const previousViewer = {
+            kind: 'token' as const,
+            claims: {
+                machineId: 'm1',
+                port: 6080,
+                bind: { purpose: 'viewer' as const, studioUserId: 'studio-1', viewerKey: VIEWER_KEY, leaseId: 'l1' },
+            },
+        };
+
+        it('keeps a viewer recovery bound to the same user and key', () => {
+            expect(planTrustedMint({ policy: off, ...viewerRequest, previous: previousViewer }))
+                .toEqual({ kind: 'bind-viewer', forced: true });
+        });
+
+        it('refuses a viewer recovery whose key belongs to another user', () => {
+            expect(planTrustedMint({
+                policy: required,
+                machineId: 'm1',
+                port: 6080,
+                viewer: { studioUserId: 'studio-1', viewerKey: OTHER_KEY },
+                previous: previousViewer,
+            })).toMatchObject({ kind: 'reject', status: 403, code: 'PREVIOUS_TOKEN_MISMATCH' });
+        });
+
+        it('refuses a viewer recovery asked for by a different studio user', () => {
+            expect(planTrustedMint({
+                policy: required,
+                machineId: 'm1',
+                port: 6080,
+                viewer: { studioUserId: 'studio-2', viewerKey: VIEWER_KEY },
+                previous: previousViewer,
+            })).toMatchObject({ kind: 'reject', status: 403, code: 'PREVIOUS_TOKEN_MISMATCH' });
+        });
+
+        // 목적을 건너뛰는 복구는 결속을 우회하는 가장 짧은 길이다.
+        it('refuses to turn a viewer token into a project binding', () => {
+            expect(planTrustedMint({
+                policy: required,
+                machineId: 'm1',
+                port: 6080,
+                projectId: 'p1',
+                studioUserId: 'studio-1',
+                previous: previousViewer,
+            })).toMatchObject({ kind: 'reject', status: 403, code: 'PREVIOUS_TOKEN_MISMATCH' });
+        });
+
+        it('refuses to turn a project token into a viewer binding', () => {
+            expect(planTrustedMint({
+                policy: required,
+                ...viewerRequest,
+                previous: {
+                    kind: 'token',
+                    claims: {
+                        machineId: 'm1',
+                        port: 6080,
+                        bind: { projectId: 'p1', studioUserId: 'studio-1', leaseId: 'l1' },
+                    },
+                },
+            })).toMatchObject({ kind: 'reject', status: 403, code: 'PREVIOUS_TOKEN_MISMATCH' });
+        });
+
+        it('still refuses a viewer recovery pointing at another machine or port', () => {
+            expect(planTrustedMint({ policy: required, ...viewerRequest, port: 6081, previous: previousViewer }))
+                .toMatchObject({ kind: 'reject', status: 400, code: 'PREVIOUS_TOKEN_MISMATCH' });
+        });
     });
 });
