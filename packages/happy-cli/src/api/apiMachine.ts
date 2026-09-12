@@ -2832,7 +2832,8 @@ export class ApiMachineClient {
         if (!this.managedHandlers) this.socket.on('proxy-ws-open', async (params, ack) => {
             ack(await this.openPreviewWsTunnel(params));
         });
-        this.socket.on(PREVIEW_BOUND_WS_OPEN_EVENT as any, async (params: any, ack: (response: any) => void) => {
+        // The bound variants reach the host the same way, so the same gate applies.
+        if (!this.managedHandlers) this.socket.on(PREVIEW_BOUND_WS_OPEN_EVENT as any, async (params: any, ack: (response: any) => void) => {
             ack(await this.openPreviewWsTunnelBound(params));
         });
         // specs/runtime-isolation-hardening (H3, P3) — viewer-bound relays and
@@ -2844,7 +2845,7 @@ export class ApiMachineClient {
         this.socket.on(PREVIEW_VIEWER_BOUND_PROXY_EVENT as any, async (params: any, ack: (response: any) => void) => {
             ack(await this.relayPreviewViewerBoundHttp(params));
         });
-        this.socket.on(PREVIEW_VIEWER_BOUND_WS_OPEN_EVENT as any, async (params: any, ack: (response: any) => void) => {
+        if (!this.managedHandlers) this.socket.on(PREVIEW_VIEWER_BOUND_WS_OPEN_EVENT as any, async (params: any, ack: (response: any) => void) => {
             ack(await this.openPreviewViewerWsTunnelBound(params));
         });
         this.socket.on(
