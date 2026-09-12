@@ -1280,6 +1280,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
 
             // Stop Happy MCP server
             happyServer.stop();
+            await checkpointComposition.dispose?.();
 
             // Stop Hook server and cleanup settings file
             hookServer.stop();
@@ -1424,6 +1425,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // Stop Happy MCP server
     happyServer.stop();
     logger.debug('Stopped Happy MCP server');
+    await checkpointComposition.dispose?.();
 
     // Stop Hook server and cleanup settings file
     hookServer.stop();
