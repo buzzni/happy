@@ -176,7 +176,7 @@ export async function startApi(opts: StartApiOptions = {}) {
     accountRoutes(typed);
     agentProfileRoutes(typed);
     connectRoutes(typed);
-    machinesRoutes(typed);
+    machinesRoutes(typed, () => managedControl);
     artifactsRoutes(typed);
     accessKeysRoutes(typed);
     machineSessionOwnerRoutes(typed);
