@@ -59,11 +59,9 @@ import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import {
-    applySessionModelPinPatch,
-    applySessionModelPinTurn,
+    createSessionModelPinPublisher,
     publishedSessionModelPin,
     type SessionModelPin,
-    type SessionModelPinTurn,
 } from '@/utils/sessionModelPin';
 import { createEnvelope } from '@slopus/happy-wire';
 import {
@@ -629,24 +627,16 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         ...(explicitInitialModel ? { model: explicitInitialModel } : {}),
         ...(explicitInitialEffort ? { effort: explicitInitialEffort } : {}),
     };
-    let sessionModelPin: SessionModelPin = initialModelPin;
-    let publishedModelPin: SessionModelPin = publishedSessionModelPin(metadata);
-    const publishSessionModelPin = (turn: SessionModelPinTurn) => {
-        const { pin, patch } = applySessionModelPinTurn({
-            pin: sessionModelPin,
-            published: publishedModelPin,
-            turn,
-        });
-        sessionModelPin = pin;
-        if (!patch) return;
-        publishedModelPin = pin;
-        session.updateMetadata((currentMetadata) => applySessionModelPinPatch(currentMetadata, patch));
-        logger.debug(`[loop] Session model pin published: ${patch.currentModelCode ?? 'cleared'} / ${patch.currentThoughtLevelCode ?? 'cleared'}`);
-    };
+    const sessionModelPinPublisher = createSessionModelPinPublisher({
+        initialPin: initialModelPin,
+        publishedPin: publishedSessionModelPin(metadata),
+        updateMetadata: (update) => session.updateMetadata(update),
+        onPublish: (patch) => logger.debug(`[loop] Session model pin published: ${patch.currentModelCode ?? 'cleared'} / ${patch.currentThoughtLevelCode ?? 'cleared'}`),
+    });
     // A session spawned with an explicit --model must advertise it before any
     // message arrives — otherwise the first turn sent from another device is
     // the one that loses the pin.
-    publishSessionModelPin({ specifiesModel: false, specifiesEffort: false });
+    sessionModelPinPublisher.publish({ specifiesModel: false, specifiesEffort: false });
 
     const resetTurnScopedOptions = () => {
         currentPermissionMode = initialPermissionMode;
@@ -657,7 +647,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         currentAllowedTools = undefined;
         currentDisallowedTools = initialDisallowedTools;
         currentEffort = initialEffortSeed;
-        sessionModelPin = initialModelPin;
+        sessionModelPinPublisher.reset();
         logger.debug('[loop] Reset turn-scoped options after abort');
     };
     const currentEnhancedMode = (): EnhancedMode => ({
@@ -907,7 +897,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             logger.debug(`[loop] User message received with no effort override, using current: ${currentEffort ?? 'default'}`);
         }
 
-        publishSessionModelPin({
+        sessionModelPinPublisher.publish({
             specifiesModel: message.meta?.hasOwnProperty('model') ?? false,
             model: messageModel,
             specifiesEffort: message.meta?.hasOwnProperty('effort') ?? false,

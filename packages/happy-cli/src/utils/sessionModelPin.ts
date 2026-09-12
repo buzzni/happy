@@ -99,3 +99,40 @@ export function publishedSessionModelPin(metadata: Metadata | undefined): Sessio
         ...(metadata?.currentThoughtLevelCode ? { effort: metadata.currentThoughtLevelCode } : {}),
     };
 }
+
+/**
+ * Owns the per-session pin state and the "publish only on change" bookkeeping,
+ * so the agent loops hold one object instead of three mutable variables each.
+ * Exists mainly to make the wiring testable: the loops themselves are not.
+ */
+export function createSessionModelPinPublisher(input: {
+    /** The pin implied by spawn options (`--model`, HAPPY_INITIAL_MODEL). */
+    initialPin: SessionModelPin;
+    /** What the session metadata already advertises, read once at startup. */
+    publishedPin: SessionModelPin;
+    updateMetadata: (update: (metadata: Metadata) => Metadata) => void;
+    onPublish?: (patch: SessionModelPinPatch) => void;
+}): {
+    publish: (turn: SessionModelPinTurn) => void;
+    /** Restores the spawn-time pin, mirroring the loops' turn-scoped abort reset. */
+    reset: () => void;
+} {
+    let pin = input.initialPin;
+    let published = input.publishedPin;
+
+    const publish = (turn: SessionModelPinTurn): void => {
+        const result = applySessionModelPinTurn({ pin, published, turn });
+        pin = result.pin;
+        if (!result.patch) return;
+        published = result.pin;
+        input.updateMetadata((metadata) => applySessionModelPinPatch(metadata, result.patch!));
+        input.onPublish?.(result.patch);
+    };
+
+    return {
+        publish,
+        reset: () => {
+            pin = input.initialPin;
+        },
+    };
+}

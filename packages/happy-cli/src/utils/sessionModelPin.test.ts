@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
     applySessionModelPinPatch,
     applySessionModelPinTurn,
+    createSessionModelPinPublisher,
     publishedSessionModelPin,
     type SessionModelPin,
 } from './sessionModelPin';
@@ -188,5 +189,88 @@ describe('publishedSessionModelPin', () => {
     // Seeded from the session snapshot at startup, which may not exist yet.
     it('tolerates missing metadata', () => {
         expect(publishedSessionModelPin(undefined)).toEqual({});
+    });
+});
+
+describe('createSessionModelPinPublisher', () => {
+    const metadata: Metadata = {
+        path: '/tmp/p',
+        host: 'h',
+        homeDir: '/home/u',
+        happyHomeDir: '/home/u/.happy',
+        happyLibDir: '/home/u/.happy/lib',
+        happyToolsDir: '/home/u/.happy/tools',
+    };
+
+    function harness(initialPin: SessionModelPin = {}, publishedPin: SessionModelPin = {}) {
+        const written: Metadata[] = [];
+        let current: Metadata = { ...metadata, ...(publishedPin.model ? { currentModelCode: publishedPin.model } : {}) };
+        const publisher = createSessionModelPinPublisher({
+            initialPin,
+            publishedPin,
+            updateMetadata: (update) => {
+                current = update(current);
+                written.push(current);
+            },
+        });
+        return { publisher, written, latest: () => current };
+    }
+
+    it('advertises a spawn-time pin on the startup converge call', () => {
+        const { publisher, written, latest } = harness({ model: 'opus', effort: 'high' });
+        publisher.publish({ specifiesModel: false, specifiesEffort: false });
+        expect(written).toHaveLength(1);
+        expect(latest().currentModelCode).toBe('opus');
+        expect(latest().currentThoughtLevelCode).toBe('high');
+    });
+
+    it('stays silent for a session with no pin', () => {
+        const { publisher, written } = harness();
+        publisher.publish({ specifiesModel: false, specifiesEffort: false });
+        publisher.publish({ specifiesModel: false, specifiesEffort: false });
+        expect(written).toHaveLength(0);
+    });
+
+    it('writes once when the user pins, and not again on repeat turns', () => {
+        const { publisher, written } = harness();
+        publisher.publish({ specifiesModel: true, model: 'claude-opus-5', specifiesEffort: false });
+        publisher.publish({ specifiesModel: true, model: 'claude-opus-5', specifiesEffort: false });
+        publisher.publish({ specifiesModel: false, specifiesEffort: false });
+        expect(written).toHaveLength(1);
+    });
+
+    it('deletes the advertised codes when the user resets to default', () => {
+        const { publisher, latest } = harness({ model: 'claude-opus-5' }, { model: 'claude-opus-5' });
+        publisher.publish({ specifiesModel: true, model: undefined, specifiesEffort: false });
+        expect('currentModelCode' in latest()).toBe(false);
+    });
+
+    // The regression this whole feature turns on: a router pick must leave no trace.
+    it('writes nothing for an auto-routed turn', () => {
+        const { publisher, written } = harness();
+        publisher.publish({ specifiesModel: true, model: 'claude-sonnet-5', specifiesEffort: true, effort: 'medium', source: 'auto' });
+        publisher.publish({ specifiesModel: true, model: 'claude-haiku-4-5', specifiesEffort: true, effort: 'low', source: 'auto' });
+        expect(written).toHaveLength(0);
+    });
+
+    it('restores the spawn-time pin after an abort reset', () => {
+        const { publisher, latest } = harness({ model: 'opus' }, { model: 'opus' });
+        publisher.publish({ specifiesModel: true, model: 'claude-haiku-4-5', specifiesEffort: false });
+        expect(latest().currentModelCode).toBe('claude-haiku-4-5');
+        publisher.reset();
+        publisher.publish({ specifiesModel: false, specifiesEffort: false });
+        expect(latest().currentModelCode).toBe('opus');
+    });
+
+    it('reports each published patch to the caller', () => {
+        const seen: unknown[] = [];
+        const publisher = createSessionModelPinPublisher({
+            initialPin: {},
+            publishedPin: {},
+            updateMetadata: () => {},
+            onPublish: (patch) => seen.push(patch),
+        });
+        publisher.publish({ specifiesModel: true, model: 'claude-opus-5', specifiesEffort: false });
+        expect(seen).toEqual([{ currentModelCode: 'claude-opus-5', currentThoughtLevelCode: null }]);
     });
 });
