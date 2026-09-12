@@ -10,6 +10,7 @@ import {
     getDefaultPermissionModeKey,
     mapMetadataOptions,
     resolveCurrentOption,
+    resolveSessionOption,
 } from './modelModeOptions';
 
 const translate = (key: string) => `tr:${key}`;
@@ -117,5 +118,23 @@ describe('modelModeOptions', () => {
 
         expect(resolveCurrentOption(options, ['missing', 'b', 'a'])).toEqual({ key: 'b', name: 'B' });
         expect(resolveCurrentOption(options, ['missing'])).toBeNull();
+    });
+});
+
+describe('session selection precedence', () => {
+    const options = [{ key: 'low', name: 'Low' }, { key: 'high', name: 'High' }];
+    it('uses the session effort pin when local state is null despite a resolved default', () => {
+        expect(resolveSessionOption(options, { localKey: null, sessionKey: 'high', defaultKey: 'low' }))
+            .toEqual(options[1]);
+    });
+    it('keeps an explicit local selection ahead of a shared pin', () => {
+        expect(resolveSessionOption(options, { localKey: 'low', sessionKey: 'high', defaultKey: 'high' }))
+            .toEqual(options[0]);
+    });
+    it('falls back when a session pin is absent or unsupported', () => {
+        for (const sessionKey of [null, 'unknown']) {
+            expect(resolveSessionOption(options, { localKey: null, sessionKey, defaultKey: 'low' }))
+                .toEqual(options[0]);
+        }
     });
 });

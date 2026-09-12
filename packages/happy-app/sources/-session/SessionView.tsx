@@ -9,6 +9,7 @@ import {
     getAvailablePermissionModes,
     getEffortLevelsForModel,
     resolveCurrentOption,
+    resolveSessionOption,
     EffortLevel,
 } from '@/components/modelModeOptions';
 import { getSuggestions } from '@/components/autocomplete/suggestions';
@@ -469,11 +470,11 @@ function SessionViewLoaded({ sessionId, session }: { sessionId: string, session:
     ), [availableModes, session.permissionMode, effectiveAgentDefaults.permissionMode, session.metadata?.currentOperatingModeCode]);
 
     const modelMode = React.useMemo<ModelMode | null>(() => (
-        resolveCurrentOption(availableModels, [
-            session.modelMode,
-            effectiveAgentDefaults.modelMode,
-            session.metadata?.currentModelCode,
-        ])
+        resolveSessionOption(availableModels, {
+            localKey: session.modelMode,
+            sessionKey: session.metadata?.currentModelCode,
+            defaultKey: effectiveAgentDefaults.modelMode,
+        })
     ), [availableModels, session.modelMode, effectiveAgentDefaults.modelMode, session.metadata?.currentModelCode]);
 
     // Effort level state
@@ -482,13 +483,11 @@ function SessionViewLoaded({ sessionId, session }: { sessionId: string, session:
         getEffortLevelsForModel(flavor, modelKey)
     ), [flavor, modelKey]);
     const effortLevel = React.useMemo<EffortLevel | null>(() => (
-        resolveCurrentOption(availableEffortLevels, [
-            session.effortLevel,
-            effectiveAgentDefaults.effortLevel,
-            // Mirrors the model chain above: effortLevel is local-only, so a session
-            // continued from another device would otherwise show no effort at all.
-            session.metadata?.currentThoughtLevelCode,
-        ])
+        resolveSessionOption(availableEffortLevels, {
+            localKey: session.effortLevel,
+            sessionKey: session.metadata?.currentThoughtLevelCode,
+            defaultKey: effectiveAgentDefaults.effortLevel,
+        })
     ), [
         availableEffortLevels,
         session.effortLevel,

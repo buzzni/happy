@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { MessageMetaSchema } from './types';
+import { applySessionModelPinTurn } from '@/utils/sessionModelPin';
 
 describe('MessageMetaSchema', () => {
   it('preserves an explicit Saycode system prompt policy', () => {
@@ -61,7 +62,7 @@ describe('MessageMetaSchema modelSource', () => {
 
   // Same hazard as saycodePromptBlocks: a safeParse failure in
   // apiSession.routeIncomingMessage stops routing the message as a user message
-  // entirely. An unknown marker must degrade to "no marker", never drop the turn.
+  // entirely. An unknown marker must remain non-pinnable, never drop the turn.
   it('never fails the whole message on an unknown marker', () => {
     const parsed = MessageMetaSchema.safeParse({
       permissionMode: 'default',
@@ -71,6 +72,26 @@ describe('MessageMetaSchema modelSource', () => {
     expect(parsed.success).toBe(true);
     expect(parsed.success && parsed.data.permissionMode).toBe('default');
     expect(parsed.success && parsed.data.model).toBe('claude-opus-5');
-    expect(parsed.success && parsed.data.modelSource).toBeUndefined();
+    expect(parsed.success && parsed.data.modelSource).toBe('auto');
+  });
+});
+
+describe('model provenance through schema and pin publication', () => {
+  it.each(['router-v2', null, 42, {}])('does not publish an unknown present marker (%j)', (modelSource) => {
+    const meta = MessageMetaSchema.parse({ model: 'routed-model', effort: 'high', modelSource });
+    const existing = { model: 'user-model', effort: 'low' };
+    expect(applySessionModelPinTurn({
+      pin: existing,
+      published: existing,
+      turn: { specifiesModel: true, model: meta.model!, specifiesEffort: true, effort: meta.effort!, source: meta.modelSource },
+    })).toEqual({ pin: existing, patch: null });
+  });
+
+  it('still publishes legacy user choices with an omitted marker', () => {
+    const meta = MessageMetaSchema.parse({ model: 'user-model' });
+    expect(applySessionModelPinTurn({
+      pin: {}, published: {},
+      turn: { specifiesModel: true, model: meta.model!, specifiesEffort: false, source: meta.modelSource },
+    }).patch).toEqual({ currentModelCode: 'user-model', currentThoughtLevelCode: null });
   });
 });

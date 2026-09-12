@@ -222,9 +222,9 @@ export const MessageMetaSchema = z.object({
   // made for a Default session. Only a pin is published as the session's active
   // model; publishing a router pick would freeze the session on it. Absent means
   // 'user' so clients that never auto-route (desktop, web) need no change.
-  // .catch() for the same reason as saycodePromptBlocks below: a malformed value
-  // must degrade to "no marker", never stop the message from being routed.
-  modelSource: z.enum(['user', 'auto']).optional().catch(undefined),
+  // Omitted markers remain legacy user choices. Invalid present markers must
+  // still route the message, but cannot turn an unknown router into a user pin.
+  modelSource: z.enum(['user', 'auto']).optional().catch('auto'),
   fallbackModel: z.string().nullable().optional(), // Fallback model for this message (null = reset)
   effort: z.string().nullable().optional(), // Reasoning effort for this message (null = reset)
   customSystemPrompt: z.string().nullable().optional(), // Custom system prompt for this message (null = reset)

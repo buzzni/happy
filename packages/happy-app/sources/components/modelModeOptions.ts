@@ -191,6 +191,18 @@ export function resolveCurrentOption<T extends ModeOption>(
     return null;
 }
 
+/** Local choices override shared session pins; defaults only fill missing selections. */
+export function resolveSessionOption<T extends ModeOption>(
+    options: T[],
+    selection: {
+        localKey?: string | null;
+        sessionKey?: string | null;
+        defaultKey?: string | null;
+    },
+): T | null {
+    return resolveCurrentOption(options, [selection.localKey, selection.sessionKey, selection.defaultKey]);
+}
+
 export function getDefaultModelKey(flavor: AgentFlavor): string {
     return getCodeAgentDefaults(flavor).modelMode;
 }
