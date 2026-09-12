@@ -511,7 +511,7 @@ describe('narrowing refuses rather than launders', () => {
         ['world writable', 0o666],
         ['group writable', 0o660],
         ['group writable without being group readable', 0o620],
-        ['world executable', 0o755],
+        ['world writable and executable', 0o777],
     ])('refuses a %s file and leaves its mode exactly as it was', (_name, mode) => {
         deliver();
         chmodSync(inputPath, mode);
@@ -540,7 +540,13 @@ describe('narrowing refuses rather than launders', () => {
     it.each([
         ['0644', 0o644],
         ['0640', 0o640],
-    ])('narrows %s, removing only the read bits', (_name, mode) => {
+        // Fly's init writes every delivered file 0755 and ignores the mode the
+        // parent asks for on a secret-backed file. Execute bits on a file
+        // nobody runs give nobody the power to alter it, which is what the
+        // laundering rule is about; they are read-side noise, narrowed away.
+        ['0755 (a Fly delivery)', 0o755],
+        ['0750', 0o750],
+    ])('narrows %s, removing the read and execute bits', (_name, mode) => {
         deliver();
         chmodSync(inputPath, mode);
         expect(narrowDeliveredCredentialMode(inputPath, deps())).toBe('ok');

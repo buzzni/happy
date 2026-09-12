@@ -33,21 +33,33 @@ esac
 # simply not exist, which reads as a working delegation until the first stop has
 # to prove something.
 #
-# The v2 hierarchy is not always at /sys/fs/cgroup itself: a hybrid host (Fly's
+# The v2 hierarchy is not always at /sys/fs/cgroup itself. A hybrid host (Fly's
 # init, for one) keeps the v1 controllers there and mounts v2 at
-# /sys/fs/cgroup/unified. The root is judged by the hierarchy it sits in, found
-# by walking up from it to the nearest directory that carries
-# cgroup.controllers.
-HIERARCHY=$(dirname "$ROOT")
-while [ "$HIERARCHY" != "/sys/fs" ] && [ ! -e "$HIERARCHY/cgroup.controllers" ]; do
-    HIERARCHY=$(dirname "$HIERARCHY")
-done
-if [ ! -e "$HIERARCHY/cgroup.controllers" ]; then
-    echo "cgroup-prepare: no cgroup v2 hierarchy above $ROOT" >&2
+# /sys/fs/cgroup/unified. The helpers fence their cgroup argument to
+# /sys/fs/cgroup/saycode/, so the root keeps its canonical name: the same
+# subtree is made in the v2 hierarchy and bound at the requested root. A bind
+# mount of a cgroup directory is that directory — children, kill, events and
+# procs included.
+if [ -e /sys/fs/cgroup/cgroup.controllers ]; then
+    mkdir -p "$ROOT"
+elif [ -e /sys/fs/cgroup/unified/cgroup.controllers ]; then
+    case "$ROOT" in
+        /sys/fs/cgroup/unified/*) mkdir -p "$ROOT" ;;
+        *)
+            if ! awk -v root="$ROOT" '$2 == root { found = 1 } END { exit !found }' /proc/self/mounts; then
+                SUBTREE="/sys/fs/cgroup/unified${ROOT#/sys/fs/cgroup}"
+                mkdir -p "$SUBTREE" "$ROOT"
+                mount --bind "$SUBTREE" "$ROOT" || {
+                    echo "cgroup-prepare: could not bind the v2 subtree at $ROOT" >&2
+                    exit 1
+                }
+            fi
+            ;;
+    esac
+else
+    echo "cgroup-prepare: cgroup v2 is not mounted" >&2
     exit 1
 fi
-
-mkdir -p "$ROOT"
 chown root:root "$ROOT"
 chmod 0755 "$ROOT"
 

@@ -289,6 +289,17 @@ export type ManagedRuntimeBootDeps = {
     /** Creates a directory with an exact mode, owned by root. */
     makeTrustedDirectory: (path: string, mode: number) => Promise<void>;
     /**
+     * The project root, made before the identity is resolved.
+     *
+     * The isolation probe runs inside the identity check, through the real
+     * executor helper, and that helper `chdir`s into the project root before it
+     * executes anything. On a fresh volume nothing has made that directory
+     * yet — `assignWorkspace` only runs after the identity is known — so the
+     * probe could never launch and the first boot always refused. Root makes
+     * it here; the workspace assignment later hands it to the executor.
+     */
+    ensureProjectRoot: (path: string) => Promise<void>;
+    /**
      * The account the image created for the daemon, or `null` when the image does
      * not state one. Read as root, from the image's own databases.
      */
@@ -531,6 +542,11 @@ export async function runManagedRuntimeBoot(
         }
     }
 
+    try {
+        await deps.ensureProjectRoot(MANAGED_PROJECT_ROOT);
+    } catch {
+        return { ok: false, reason: 'trusted-directory-unavailable' };
+    }
     const identity = (deps.resolveIdentity ?? resolveManagedRuntimeIdentity)();
     // Absence is a BYOS machine and nothing to do here. A marker that exists
     // and cannot be trusted is not the same thing, and it does not become one
@@ -603,19 +619,6 @@ export async function runManagedRuntimeBoot(
          * here with nothing delivered; what happens next is decided by the daemon
          * when it reads the state directory, which is where that decision belongs.
          */
-        /*
-         * The directory adoption writes into, made first. Nothing in the image
-         * creates it — the path is a marker field the image cannot vouch for —
-         * and on a first boot it does not exist, so the delivery would be
-         * refused as unwritable. Root makes it here, owner-only, the same way
-         * the launcher directory below is made.
-         */
-        try {
-            await deps.makeTrustedDirectory(stateDir, 0o700);
-        } catch {
-            return { ok: false, reason: 'trusted-directory-unavailable' };
-        }
-
         let adoption: ManagedCredentialAdoption;
         try {
             adoption = await deps.adoptCredential({
@@ -1045,6 +1048,7 @@ export function defaultManagedRuntimeBootDeps(
         // than an assumption.
         adoptCredential: (input) => adoptManagedDaemonCredential(input),
         makeTrustedDirectory: async (path, mode) => { makeTrustedDirectorySync(path, mode); },
+        ensureProjectRoot: async (path) => { makeTrustedDirectorySync(path, 0o755); },
         /*
          * Read from the image's own databases, as root. Not a marker field: a
          * required marker axis needs the parent's composer, every fixture on both

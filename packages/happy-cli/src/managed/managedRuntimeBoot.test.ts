@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, lstatSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 import * as launcherMain from '@/launcher/main';
 import * as managedRunConfig from '@/launcher/managedRunConfig';
 import * as runtimeCheckpointing from '@/managed/checkpoint/managedRuntimeCheckpointing';
@@ -101,6 +101,7 @@ function bootDeps(over: Partial<Parameters<typeof runManagedRuntimeBoot>[0]> = {
             ok: true as const, ownership: { scope: { ...scope }, address: supervisorLockAddress(scope), release: async () => {} },
         }),
         provisioning: provisioning(),
+        ensureProjectRoot: async (path: string) => { log.push({ event: 'project-root', detail: path }); },
         makeTrustedDirectory: async (path: string, mode: number) => {
             log.push({ event: 'directory', detail: path });
             await mkdir(path, { recursive: true, mode });
@@ -280,15 +281,14 @@ describe('the root boot stage of a managed runtime', () => {
          */
         expect(log.map((entry) => entry.event))
             .toEqual([
-                // The state directory first — adoption writes into it — then
-                // the launcher directory under it.
-                'directory', 'directory', 'daemon-leaf', 'supervisor', 'workspace', 'provider-home',
+                // The project root first: the identity check's probe launches
+                // through the executor helper, which `chdir`s into it.
+                'project-root',
+                'directory', 'daemon-leaf', 'supervisor', 'workspace', 'provider-home',
                 // Made as root, because nothing after this can: the daemon
                 // runs next and the provider uid owns nothing in `/workspace`.
                 'auth-home-root', 'attestation',
             ]);
-        expect(log.slice(0, 2).map((entry) => entry.detail))
-            .toEqual([stateDir, dirname(managedLauncherSocketPath(stateDir))]);
         // And the record the daemon will read is really there, readable through
         // the same trust rules the daemon applies.
         expect(readManagedLauncherBinding({ stateDir, deps: provisioning() })).toEqual({
@@ -581,26 +581,23 @@ describe('the root boot stage of a managed runtime', () => {
     });
 });
 
-describe('the state directory, before the credential is adopted into it', () => {
-    /*
-     * Nothing in the image creates it: the state directory is a marker field,
-     * and the image cannot vouch for a path it does not know. Adoption writes
-     * the credential into it, so on a first boot the directory has to be made
-     * first — by root, here — or every delivery is refused as unwritable.
-     */
-    it('creates the state directory before adopting the credential', async () => {
+describe('the project root, before the identity is resolved', () => {
+    it('makes the project root before the identity check runs its probe', async () => {
         const order: string[] = [];
         const { deps } = bootDeps({
-            makeTrustedDirectory: async (path: string, mode: number) => {
-                order.push(`directory:${path}:${mode.toString(8)}`);
-                await mkdir(path, { recursive: true, mode });
-            },
-            adoptCredential: async () => { order.push('adopt'); return { status: 'absent' as const }; },
+            ensureProjectRoot: async (path: string) => { order.push(`project-root:${path}`); },
+            resolveIdentity: (() => { order.push('identity'); return identity()(); }) as never,
         });
         await runManagedRuntimeBoot(deps);
-        const made = order.indexOf(`directory:${stateDir}:700`);
-        expect(made).toBeGreaterThanOrEqual(0);
-        expect(made).toBeLessThan(order.indexOf('adopt'));
+        expect(order.slice(0, 2)).toEqual(['project-root:/workspace/project', 'identity']);
+    });
+
+    it('refuses the boot when the project root cannot be made', async () => {
+        const { deps, log } = bootDeps({
+            ensureProjectRoot: async () => { throw new Error('EROFS'); },
+        });
+        expect(await runManagedRuntimeBoot(deps)).toEqual({ ok: false, reason: 'trusted-directory-unavailable' });
+        expect(log.some((entry) => entry.event === 'supervisor')).toBe(false);
     });
 });
 
