@@ -1182,6 +1182,9 @@ export async function runCodex(opts: {
     });
     const mcpRuntimeRecovery = new CodexMcpRuntimeRecovery(client);
     let appendSystemPromptInjected = false;
+    // Assigned inside the `try` once the loop's stop gate exists; called from
+    // its `finally`. Until then there is no stop to report.
+    let reportManagedStop: () => Promise<void> = async () => undefined;
 
     try {
         logger.debug('[codex]: client.connect begin');
@@ -1248,9 +1251,18 @@ export async function runCodex(opts: {
          * it describes, not a flag on the stop.
          */
         const codexProof = { inputExhausted: false };
-        /** Ends this generation's input by exhaustion, and says how it went. */
-        const endManagedInput = async (): Promise<void> => {
+        /**
+         * The verdict for this run, reported once, for a run that was asked
+         * to stop — from the loop's `finally`, so a loop that leaves by any
+         * route (an abort, a run-once turn, a throw) still answers the stop
+         * it was asked for rather than leaving the supervisor to its budget.
+         */
+        reportManagedStop = async (): Promise<void> => {
             if (!gracefulStop?.requested()) return;
+            if (!codexProof.inputExhausted) {
+                reportManagedStopOutcome('input-not-exhausted');
+                return;
+            }
             /*
              * No signal. `disconnect()` does `stdin.end()` and `SIGTERM` in one
              * breath and never awaits the exit, so it can never prove a flush;
@@ -1258,12 +1270,9 @@ export async function runCodex(opts: {
              */
             const left = await client.endInputAndAwaitExit(CODEX_END_INPUT_BUDGET_MS);
             reportManagedStopOutcome(
-                codexProof.inputExhausted
-                    && left.exited && left.code === 0 && left.signal === null
+                left.exited && left.code === 0 && left.signal === null
                     ? MANAGED_STOP_CLEAN
-                    : codexProof.inputExhausted
-                        ? 'provider-exit-unclean'
-                        : 'input-not-exhausted',
+                    : 'provider-exit-unclean',
             );
         };
 
@@ -1279,7 +1288,6 @@ export async function runCodex(opts: {
                 if (gracefulStop?.mayEndInput()) {
                     codexProof.inputExhausted = true;
                     shouldExit = true;
-                    await endManagedInput();
                     break;
                 }
                 // Capture the current signal to distinguish idle-abort from queue close
@@ -1294,11 +1302,13 @@ export async function runCodex(opts: {
                     /*
                      * Woken by the stop rather than aborted. The abort check is
                      * the point: a run aborted while a stop happened to be
-                     * pending did not exhaust its input.
+                     * pending did not exhaust its input — and neither did one
+                     * whose queue was closed by something else while work was
+                     * still queued or held back, which is what `mayEndInput`
+                     * rules out.
                      */
-                    if (gracefulStop?.requested() && !waitSignal.aborted) {
+                    if (gracefulStop?.mayEndInput() && !waitSignal.aborted) {
                         codexProof.inputExhausted = true;
-                        await endManagedInput();
                     }
                     logger.debug(`[codex]: batch=${!!batch}, shouldExit=${shouldExit}`);
                     break;
@@ -1569,6 +1579,7 @@ export async function runCodex(opts: {
         }
 
     } finally {
+        await reportManagedStop();
         /*
          * The bridge points at this run's loop. Left registered, a stop
          * arriving later would be applied to a loop that has ended, or handed

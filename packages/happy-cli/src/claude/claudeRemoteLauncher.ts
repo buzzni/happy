@@ -1,5 +1,5 @@
 import { render } from "ink";
-import { createManagedGracefulStop, registerManagedGracefulStop } from '@/managed/managedGracefulStop'
+import { createManagedGracefulStop, registerManagedGracefulStop, type ManagedGracefulStop } from '@/managed/managedGracefulStop'
 import { createProviderExitObserver, type ProviderExitObserver } from '@/managed/managedProviderExitObserver'
 import { waitForObservedExit, MANAGED_REPORT_EXIT_BUDGET_MS } from '@/managed/managedProviderExitObserver'
 import { reportManagedStopOutcome } from '@/managed/managedStartup'
@@ -358,6 +358,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         }
     }
 
+    // Declared outside the `try` because the stop verdict is reported from
+    // its `finally`, once the loop is really over.
+    let gracefulStop: ManagedGracefulStop | null = null;
     try {
         let pending: {
             message: MessageParam['content'];
@@ -372,7 +375,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
          * Only for managed runs: an ordinary session ends when its user says
          * so, and nothing else may end one on its behalf.
          */
-        const gracefulStop = session.managedRun
+        gracefulStop = session.managedRun
             ? createManagedGracefulStop({
                 queueSize: () => session.queue.size(),
                 hasPending: () => pending !== null,
@@ -682,45 +685,6 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     exitAfterFirstTurn: session.exitAfterFirstTurn,
                 });
 
-                /*
-                 * The verdict for this generation, reported once per loop
-                 * iteration and only for a run that was asked to stop.
-                 *
-                 * Both halves are required, and they are read **after the
-                 * provider's own process has been given a chance to leave**.
-                 * `claudeRemote` returns as soon as its message loop ends; the
-                 * SDK child exits a moment later. Reading `exitedCleanly()`
-                 * right here reported `provider-exit-unclean` for a provider
-                 * that was in the middle of exiting perfectly well — the
-                 * runtime then refused the checkpoint with `eof-unverified`,
-                 * which is a refusal caused entirely by reporting too early.
-                 *
-                 * So wait, bounded, for the exit this generation is about.
-                 */
-                if (gracefulStop?.requested()) {
-                    const generation = startedGeneration();
-                    // Which of the two silences this is: no generation to
-                    // report for, or one whose exit has not been seen yet.
-                    logger.debug(`[managed] stop report generation=${generation ? 'present' : 'absent'}`);
-                    if (generation) {
-                        await waitForObservedExit(
-                            generation.observer,
-                            MANAGED_REPORT_EXIT_BUDGET_MS,
-                        );
-                    }
-                    reportManagedStopOutcome(
-                        generation?.inputExhausted && generation.observer.exitedCleanly()
-                            ? MANAGED_STOP_CLEAN
-                            : generation?.inputExhausted
-                                ? 'provider-exit-unclean'
-                                : 'input-not-exhausted',
-                        // The identity of the generation being reported on, or
-                        // none — a generation that never learned a session has
-                        // nothing to name, and says so.
-                        { nativeId: generation?.nativeId ?? null },
-                    );
-                }
-
                 if (remoteResult === 'turn-complete') {
                     logger.debug('[remote]: Automation turn completed, exiting run-once session');
                     exitReason = 'exit';
@@ -785,6 +749,48 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             }
         }
     } finally {
+        /*
+         * The verdict for this run, reported once, and only for a run that was
+         * asked to stop.
+         *
+         * Here rather than inside the loop: a turn can end without the run
+         * ending — a mode change parks the message and relaunches — and a
+         * report there was a verdict for a run still going, followed by a
+         * second one when it actually ended. The supervisor reads one.
+         *
+         * Both halves are required, and they are read **after the provider's
+         * own process has been given a chance to leave**. `claudeRemote`
+         * returns as soon as its message loop ends; the SDK child exits a
+         * moment later. Reading `exitedCleanly()` right away reported
+         * `provider-exit-unclean` for a provider that was in the middle of
+         * exiting perfectly well — the runtime then refused the checkpoint
+         * with `eof-unverified`, which is a refusal caused entirely by
+         * reporting too early. So wait, bounded, for the exit this
+         * generation is about.
+         */
+        if (gracefulStop?.requested()) {
+            const generation = startedGeneration();
+            // Which of the two silences this is: no generation to report
+            // for, or one whose exit has not been seen yet.
+            logger.debug(`[managed] stop report generation=${generation ? 'present' : 'absent'}`);
+            if (generation) {
+                await waitForObservedExit(
+                    generation.observer,
+                    MANAGED_REPORT_EXIT_BUDGET_MS,
+                );
+            }
+            reportManagedStopOutcome(
+                generation?.inputExhausted && generation.observer.exitedCleanly()
+                    ? MANAGED_STOP_CLEAN
+                    : generation?.inputExhausted
+                        ? 'provider-exit-unclean'
+                        : 'input-not-exhausted',
+                // The identity of the generation being reported on, or none —
+                // a generation that never learned a session has nothing to
+                // name, and says so.
+                { nativeId: generation?.nativeId ?? null },
+            );
+        }
 
         activeInputSender = null;
         streamRelay.dispose();
