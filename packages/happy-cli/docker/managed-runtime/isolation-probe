@@ -19,7 +19,10 @@ exec 1>&2
 {
     echo "uid=$(id -u)"
     echo "gid=$(id -g)"
-    echo "cgroup=$(cat /proc/self/cgroup 2>/dev/null | head -1)"
+    # The v2 line only. On a hybrid host /proc/self/cgroup also lists one line
+    # per v1 controller, and those come first; the cgroup this process was put
+    # in is the unified hierarchy's line, `0::/...`.
+    echo "cgroup=$(grep '^0::' /proc/self/cgroup 2>/dev/null | head -1)"
     # In a PID namespace this process is 1. Outside one it is not.
     echo "pid=$$"
     # Asked over netlink, not from `/sys/class/net`.

@@ -370,11 +370,15 @@ export { managedDaemonCredentialPath };
  *    outside this runtime entirely, done as root.
  *  - the descriptor's **owner** is judged by the same gate every other
  *    root-protected read on this runtime uses.
- *  - any **write or execute** bit for group or other is a refusal, always.
- *    That is the laundering case, and it is never narrowed.
+ *  - any **write** bit for group or other is a refusal, always. That is the
+ *    laundering case, and it is never narrowed.
  *
  * What is left after that is a file only its owner may modify, which is merely
- * readable too widely — and that is the one case narrowing exists for.
+ * readable (or executable, which for a file nobody runs is the same noise) too
+ * widely — and that is the one case narrowing exists for. Execute bits are
+ * narrowed rather than refused because a provider chooses them: Fly's init
+ * writes every delivered file `0755` and ignores the mode the parent asks for,
+ * so refusing them would refuse every delivery from that provider.
  *
  * What this does **not** claim is that nothing read the file before this ran.
  * The window is from the platform's write at machine start to this call, during
@@ -421,15 +425,15 @@ export function narrowDeliveredCredentialMode(
             size: stat.size,
             isFile: true,
         })) return 'refused';
-        // `0o033`: write or execute for group or other. Never narrowed — see
-        // the laundering note above. Checked separately from the gate because
-        // the gate is the *ownership* rule and this one must hold regardless.
+        // `0o022`: write for group or other. Never narrowed — see the
+        // laundering note above. Checked separately from the gate because the
+        // gate is the *ownership* rule and this one must hold regardless.
         //
         // `0o7000`: setuid, setgid, sticky. A credential file needs none of
         // them, so their presence says this is not the file the parent wrote —
         // and narrowing while carrying them forward would preserve exactly the
         // bit worth asking about.
-        if ((stat.mode & 0o033) !== 0 || (stat.mode & 0o7000) !== 0) return 'refused';
+        if ((stat.mode & 0o022) !== 0 || (stat.mode & 0o7000) !== 0) return 'refused';
         /*
          * What is left is a file only its owner may modify, which is merely
          * readable too widely — so the read bits come off and it becomes

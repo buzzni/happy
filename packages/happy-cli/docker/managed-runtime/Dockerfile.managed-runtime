@@ -89,6 +89,14 @@ RUN mkdir -p /etc/saycode \
  && chown root:root /etc/saycode \
  && chmod 0755 /etc/saycode
 
+# The state directory the marker names (`saycode_state_dir`). The identity
+# check walks its chain before the boot may make anything, so it has to exist
+# here — root-owned, owner-only — or every first boot is refused as
+# `state-dir-unsafe`.
+RUN mkdir -p /var/lib/saycode/state \
+ && chown root:root /var/lib/saycode /var/lib/saycode/state \
+ && chmod 0700 /var/lib/saycode /var/lib/saycode/state
+
 # The account the managed daemon runs as.
 #
 # Created **here**, in the image, because that is what makes it trustworthy: root
