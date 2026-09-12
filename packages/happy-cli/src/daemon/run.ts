@@ -476,8 +476,14 @@ export async function startDaemon(): Promise<void> {
     const managedMarkerPath = managedProvisioningPath();
     const managedIdentity = resolveManagedRuntimeIdentity(managedMarkerPath);
     if (managedIdentity.status === 'refused') {
+      // Two different refusals share this branch: a marker that exists and
+      // cannot be trusted, and — on Linux with no marker at all — a path where
+      // one could be planted (`absenceRefusal`). The detail names which
+      // component refused, and without it a BYOS operator is told about a
+      // marker that is not there.
       throw new Error(
-        `[managed] provisioning marker present but not trusted (${managedIdentity.reason}); refusing to start`,
+        `[managed] runtime identity refused (${managedIdentity.reason}`
+        + `${managedIdentity.detail ? `: ${managedIdentity.detail}` : ''}); refusing to start`,
       );
     }
     const managedCredential = managedIdentity.status === 'active'
@@ -3956,9 +3962,15 @@ export async function startDaemon(): Promise<void> {
             await stopControlServer();
             await stopBrowserBridge();
             await cleanupDaemonState();
-            await teardownManagedRuntime();
-            await releaseDaemonLock(daemonLockHandle);
-            await stopCaffeinate();
+            try {
+              await teardownManagedRuntime();
+            } finally {
+              // The daemon lock is this process's, not the managed store's:
+              // a teardown that keeps the writer lock still has to let go of
+              // the lock file, or nothing can start after this exit.
+              await releaseDaemonLock(daemonLockHandle);
+              await stopCaffeinate();
+            }
           },
           spawnReplacement: (attempt) => {
             logger.debug(`[DAEMON RUN] Spawning replacement daemon (attempt ${attempt})`);
@@ -4096,8 +4108,13 @@ export async function startDaemon(): Promise<void> {
       });
 
       await stopCaffeinate();
-      await teardownManagedRuntime();
-      await releaseDaemonLock(daemonLockHandle);
+      try {
+        await teardownManagedRuntime();
+      } finally {
+        // Same as the handoff path: the lock file goes even when the managed
+        // teardown refused to complete, and the failure still propagates.
+        await releaseDaemonLock(daemonLockHandle);
+      }
 
       logger.debug('[DAEMON RUN] Cleanup completed, exiting process');
       process.exit(0);
