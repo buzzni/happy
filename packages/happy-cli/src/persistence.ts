@@ -107,6 +107,8 @@ export interface PersistedTrackedSession {
   startedAt: number;
   /** Tmp HAPPY_HOME_DIR staged for this session, if any. Cleaned on exit. */
   userHomeDir?: string;
+  /** Context file awaiting the first explicit user turn. */
+  deferredContinuationContextFile?: string;
 }
 
 /**
@@ -684,6 +686,8 @@ export type PersistedSession = {
   lastProcessedSeq?: number;
   /** Per-session orchestration capability restored after daemon restart. */
   agentEnvironment?: SaycodeAgentEnvironment;
+  /** File containing context pending delivery on the first explicit user turn. */
+  deferredContinuationContextFile?: string;
 };
 
 type SessionsFile = {

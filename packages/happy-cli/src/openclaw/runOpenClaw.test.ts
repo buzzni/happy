@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const mocks = vi.hoisted(() => {
   let userMessageHandler: ((message: any) => void) | null = null;
@@ -190,6 +193,35 @@ describe('runOpenClaw turn inactivity watchdog', () => {
       expect(mocks.backendState.prompts.length).toBeGreaterThan(before);
     });
   };
+
+  it('applies deferred continuation context to the first user turn only', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'happy-openclaw-continuation-'));
+    const contextFile = join(directory, 'context.txt');
+    writeFileSync(contextFile, 'Earlier OpenClaw answer', 'utf8');
+    process.env.HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE = contextFile;
+
+    try {
+      const runPromise = startRunner(1000);
+      const settled = runPromise.then(() => null).catch((error: Error) => error);
+      await vi.waitFor(() => {
+        expect(mocks.getUserMessageHandler()).toBeTypeOf('function');
+      });
+
+      await sendPrompt('first follow-up');
+      expect(mocks.backendState.prompts[0]).toContain('Earlier OpenClaw answer');
+      expect(mocks.backendState.prompts[0]).toContain('first follow-up');
+      emit({ type: 'status', status: 'idle' });
+
+      await sendPrompt('second follow-up');
+      expect(mocks.backendState.prompts[1]).toBe('second follow-up');
+
+      await mocks.getKillHandler()!();
+      await settled;
+    } finally {
+      delete process.env.HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
 
   it('cancels the backend when a turn goes silent for the inactivity window', async () => {
     const runPromise = startRunner(200);

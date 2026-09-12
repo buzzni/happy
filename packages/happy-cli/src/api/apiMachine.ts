@@ -152,6 +152,7 @@ import { BrowserSessionBrokerClient } from '@/daemon/browserSessionBrokerContrac
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken';
 import { deriveBrowserViewerBridgeToken } from '@/daemon/browserBridge';
 import { readFile, readdir } from 'node:fs/promises';
+import { DEFERRED_CONTINUATION_CONTEXT_MAX_BYTES } from '@/utils/deferredContinuationContext';
 import { ensureElectronGuiDisplay } from '@/daemon/electronGuiDisplay';
 import { projectPath } from '@/projectPath';
 import {
@@ -852,6 +853,7 @@ export class ApiMachineClient {
                 expectedConnectors,
                 resumeClaudeSessionId,
                 resumeCodexThreadId,
+                deferredContinuationContext,
                 parentSessionId,
                 forkedFromMessageId,
                 createdByAccountId,
@@ -885,6 +887,18 @@ export class ApiMachineClient {
                 && (typeof initialPrompt !== 'string' || !initialPrompt.trim())
             ) {
                 throw new Error('Initial prompt must be a non-empty string');
+            }
+            if (
+                deferredContinuationContext !== undefined
+                && (typeof deferredContinuationContext !== 'string' || !deferredContinuationContext.trim())
+            ) {
+                throw new Error('Deferred continuation context must be a non-empty string');
+            }
+            if (
+                typeof deferredContinuationContext === 'string'
+                && Buffer.byteLength(deferredContinuationContext, 'utf8') > DEFERRED_CONTINUATION_CONTEXT_MAX_BYTES
+            ) {
+                throw new Error('Deferred continuation context is too large');
             }
             if (exitAfterFirstTurn !== undefined && typeof exitAfterFirstTurn !== 'boolean') {
                 throw new Error('Exit-after-first-turn must be a boolean');
@@ -921,6 +935,7 @@ export class ApiMachineClient {
                 expectedConnectors: validExpectedConnectors,
                 resumeClaudeSessionId,
                 resumeCodexThreadId,
+                deferredContinuationContext,
                 parentSessionId,
                 forkedFromMessageId,
                 createdByAccountId,

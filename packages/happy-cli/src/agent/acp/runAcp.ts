@@ -33,6 +33,7 @@ import {
   mergeAcpSessionConfigIntoMetadata,
 } from './sessionConfigMetadata';
 import type { SessionConfigOption, SessionModeState, SessionModelState } from '@agentclientprotocol/sdk';
+import { createDeferredContinuationContextConsumer } from '@/utils/deferredContinuationContext';
 
 /** Max time without any backend activity before the turn is cancelled. */
 const TURN_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
@@ -480,6 +481,7 @@ export async function runAcp(opts: {
   const verbose = opts.verbose === true;
   const turnInactivityTimeoutMs = opts.turnInactivityTimeoutMs ?? TURN_INACTIVITY_TIMEOUT_MS;
   const sessionTag = randomUUID();
+  const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
   connectionState.setBackend(opts.agentName);
 
   const api = await ApiClient.create(opts.credentials);
@@ -931,10 +933,17 @@ export async function runAcp(opts: {
       logger.debug(`[${opts.agentName}] Requested ACP model: ${currentModel ?? 'null'}`);
     }
 
-    messageQueue.push(message.content.text, {
-      permissionMode: currentPermissionMode,
-      model: currentModel,
-    });
+    const deferredTurn = deferredContinuation.prepare(message.content.text);
+    try {
+      messageQueue.push(deferredTurn?.text ?? message.content.text, {
+        permissionMode: currentPermissionMode,
+        model: currentModel,
+      });
+      deferredTurn?.commit();
+    } catch (error) {
+      deferredTurn?.rollback();
+      throw error;
+    }
   });
   session.keepAlive(thinking, 'remote');
 

@@ -245,6 +245,8 @@ export interface SpawnSessionOptions {
      * session attaches to a forked Codex app-server thread.
      */
     resumeCodexThreadId?: string;
+    /** Prior transcript context applied to the first explicit user turn only. */
+    deferredContinuationContext?: string;
     /**
      * The managed Cloud spawn envelope (specs/managed-cloud-byos §5.33).
      *

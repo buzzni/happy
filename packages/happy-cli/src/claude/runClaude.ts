@@ -73,6 +73,7 @@ import {
     resolveInitialSaycodeAppendSystemPrompt,
     resolveSaycodeAppendSystemPromptForMessage,
 } from '@/prompt/promptProvenance';
+import { createDeferredContinuationContextConsumer } from '@/utils/deferredContinuationContext';
 import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 import { requireAccountToken, type ManagedStartup } from '@/managed/managedStartup';
@@ -162,6 +163,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // everything this session launches inherits the shimmed PATH.
     installBroadKillShims();
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
+    const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
 
     const workingDirectory = process.cwd();
     const sessionTag = randomUUID();
@@ -1056,6 +1058,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
 
         if (specialCommand.type === 'clear') {
             logger.debug('[start] Detected /clear command');
+            deferredContinuation.prepare(message.content.text);
             messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage);
             logger.debugLargeJson('[start] /clear command pushed to queue:', message);
             return;
@@ -1139,8 +1142,18 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             }
         }
 
-        // Push with resolved permission mode, model, system prompts, and tools
-        messageQueue.push(pushText, currentEnhancedMode(), attachmentsForThisMessage);
+        // The visible user row stays unchanged; only the provider receives the
+        // prior transcript on this first accepted turn.
+        const deferredTurn = deferredContinuation.prepare(pushText);
+        const queuedText = deferredTurn?.text ?? pushText;
+        try {
+            if (deferredTurn) recordAppPrompt(queuedText);
+            messageQueue.push(queuedText, currentEnhancedMode(), attachmentsForThisMessage);
+            deferredTurn?.commit();
+        } catch (error) {
+            deferredTurn?.rollback();
+            throw error;
+        }
         logger.debugLargeJson('User message pushed to queue:', message)
     });
 
