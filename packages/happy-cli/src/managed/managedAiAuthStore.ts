@@ -81,6 +81,9 @@ export const MANAGED_AI_AUTH_FAILURES = {
     providerUnavailable: 'ai-auth-provider-unavailable',
 } as const;
 
+/** A masked address is a few dozen characters; anything past this is not a label. */
+export const MANAGED_AI_AUTH_ACCOUNT_LABEL_MAX = 128;
+
 export const MANAGED_AI_AUTH_REFUSAL_CODES: readonly string[] = Object.values(MANAGED_AI_AUTH_FAILURES);
 
 /**
@@ -339,38 +342,12 @@ export function createManagedAiAuthStore(deps: ManagedAiAuthStoreDeps): ManagedA
         const path = `${withRoot(root, managedAiAuthConnectionDir(connectionId))}/${MANAGED_AI_AUTH_MARKER_FILE}`;
         const raw = fs.readFile(path);
         if (raw === null) return null;
-        try {
-            const parsed = JSON.parse(raw) as Partial<ManagedAiAuthMarker>;
-            if (parsed.v !== MANAGED_AI_AUTH_MARKER_VERSION) return null;
-            if (!(MANAGED_AI_AUTH_PROVIDERS as readonly unknown[]).includes(parsed.provider)) return null;
-            if (typeof parsed.connectionVersion !== 'number' || !Number.isSafeInteger(parsed.connectionVersion)) {
-                return null;
-            }
-            /*
-             * A marker written before keys existed has no kind, and it is a
-             * login: keys did not exist when it was written. An unreadable kind
-             * is not defaulted the same way — it is a marker this runtime
-             * cannot act on, and acting on it would be guessing which file to
-             * look for.
-             */
-            if (
-                parsed.credentialKind !== undefined
-                && !(MANAGED_AI_AUTH_CREDENTIAL_KINDS as readonly unknown[]).includes(parsed.credentialKind)
-            ) {
-                return null;
-            }
-            return {
-                v: MANAGED_AI_AUTH_MARKER_VERSION,
-                provider: parsed.provider as ManagedAiAuthProvider,
-                connectionVersion: parsed.connectionVersion,
-                credentialKind: parsed.credentialKind ?? 'oauth',
-                ...(typeof parsed.accountLabel === 'string' ? { accountLabel: parsed.accountLabel } : {}),
-            };
-        } catch {
-            // A marker this runtime cannot read is not a credential it may
-            // report as connected.
-            return null;
-        }
+        const marker = parseManagedAiAuthMarker(raw);
+        // Absent is ordinary; a marker that is there and cannot be read is
+        // not, and it is the one case that would otherwise leave no trace —
+        // reported as "nothing connected" beside a working credential.
+        if (marker === null) logger.debug(`[managed] ai-auth marker unreadable for ${connectionId}`);
+        return marker;
     };
 
     /**
@@ -756,6 +733,16 @@ export function createManagedAiAuthStore(deps: ManagedAiAuthStoreDeps): ManagedA
     };
 
     const logout = (connectionId: string, connectionVersion: number): ManagedAiAuthRpcResult => {
+        /*
+         * Older than what is on disk is a replay — a retried frame, or a
+         * token used again inside its window — arriving after a newer login
+         * wrote its marker. Removing the home now would remove that login.
+         * Equal is still a logout of the login the parent recorded.
+         */
+        const marker = readMarker(connectionId);
+        if (marker !== null && connectionVersion < marker.connectionVersion) {
+            throw new ManagedAiAuthError(MANAGED_AI_AUTH_FAILURES.versionConflict);
+        }
         const live = pending.get(connectionId);
         live?.child?.kill();
         pending.delete(connectionId);
@@ -858,14 +845,24 @@ type ClaudeTokenResponse = {
  * `ABCD-EFGH` are the two things every rendering of a device flow has.
  */
 export function parseCodexDeviceLogin(text: string): { loginUrl: string; userCode?: string } | null {
-    const url = text.match(/https:\/\/[^\s"'<>]+/);
-    if (!url) return null;
+    const urls = text.match(/https:\/\/[^\s"'<>]+/g);
+    if (!urls) return null;
+    /*
+     * The vendor's own host first. A docs or telemetry link printed before
+     * the verification URL would otherwise be the one handed to the person,
+     * and a login on that page never completes. With no such host anywhere
+     * the first URL stands, for the reason above.
+     */
+    const loginUrl = urls.find((candidate) => CODEX_DEVICE_LOGIN_HOSTS.test(candidate)) ?? urls[0];
     const dashed = text.match(/\b[A-Z0-9]{4}-[A-Z0-9]{4}\b/);
-    if (dashed) return { loginUrl: url[0], userCode: dashed[0] };
+    if (dashed) return { loginUrl, userCode: dashed[0] };
     // A code announced by name, on the same line or the next one.
     const labelled = text.match(/code[^A-Za-z0-9]{0,20}([A-Z0-9][A-Z0-9-]{3,15})/i);
-    return labelled ? { loginUrl: url[0], userCode: labelled[1] } : { loginUrl: url[0] };
+    return labelled ? { loginUrl, userCode: labelled[1] } : { loginUrl };
 }
+
+/** Where the Codex device flow actually completes; anything else is a banner. */
+const CODEX_DEVICE_LOGIN_HOSTS = /^https:\/\/(?:[a-z0-9-]+\.)*(?:auth\.openai\.com|chatgpt\.com)(?:[/:?#]|$)/i;
 
 /**
  * The key a connection registered, read from its provider home.
@@ -893,6 +890,57 @@ export function readManagedAiAuthApiKey(
     } catch {
         // A reader that throws on a missing file is the ordinary case
         // (`readFileSync`), and malformed JSON is the other one.
+        return null;
+    }
+}
+
+/**
+ * The connection marker, as far as this runtime can act on it.
+ *
+ * A free function because it has two readers in two processes: the store
+ * (daemon, root) when it reports state, and the launch (`managedStartup`) when
+ * it checks that the home still holds the login the run was admitted on. `null`
+ * for anything that is not a marker this version can act on.
+ */
+export function parseManagedAiAuthMarker(raw: string): ManagedAiAuthMarker | null {
+    try {
+        const parsed = JSON.parse(raw) as Partial<ManagedAiAuthMarker>;
+        if (parsed.v !== MANAGED_AI_AUTH_MARKER_VERSION) return null;
+        if (!(MANAGED_AI_AUTH_PROVIDERS as readonly unknown[]).includes(parsed.provider)) return null;
+        if (typeof parsed.connectionVersion !== 'number' || !Number.isSafeInteger(parsed.connectionVersion)) {
+            return null;
+        }
+        /*
+         * A marker written before keys existed has no kind, and it is a
+         * login: keys did not exist when it was written. An unreadable kind
+         * is not defaulted the same way — it is a marker this runtime
+         * cannot act on, and acting on it would be guessing which file to
+         * look for.
+         */
+        if (
+            parsed.credentialKind !== undefined
+            && !(MANAGED_AI_AUTH_CREDENTIAL_KINDS as readonly unknown[]).includes(parsed.credentialKind)
+        ) {
+            return null;
+        }
+        /*
+         * The label is display text and the file is the provider uid's, so
+         * the provider process can rewrite it. Bounded here so a rewritten
+         * label cannot carry a page into the parent's row; the credential
+         * itself is unaffected by what the label says.
+         */
+        const label = typeof parsed.accountLabel === 'string'
+            && parsed.accountLabel.length <= MANAGED_AI_AUTH_ACCOUNT_LABEL_MAX
+            ? parsed.accountLabel
+            : undefined;
+        return {
+            v: MANAGED_AI_AUTH_MARKER_VERSION,
+            provider: parsed.provider as ManagedAiAuthProvider,
+            connectionVersion: parsed.connectionVersion,
+            credentialKind: parsed.credentialKind ?? 'oauth',
+            ...(label === undefined ? {} : { accountLabel: label }),
+        };
+    } catch {
         return null;
     }
 }

@@ -420,6 +420,39 @@ describe('cancelling, logging out and reading state', () => {
             .toEqual({ state: 'absent', connectionVersion: null });
     });
 
+    it('shouldRefuseALogoutThatNamesAVersionOlderThanTheOneOnDisk', async () => {
+        /*
+         * A logout replayed after a newer login — a retried socket frame, or a
+         * token captured inside its window — would otherwise remove the
+         * credential the newer login just wrote.
+         */
+        const subject = store();
+        await complete(subject, 5);
+        await expect(subject.run({
+            action: 'logout', connectionId: CONNECTION, provider: 'claude', connectionVersion: 4,
+        })).rejects.toThrow(MANAGED_AI_AUTH_FAILURES.versionConflict);
+        expect(existsSync(claudeCredential())).toBe(true);
+        // The version the parent recorded the login at is still a logout of
+        // that login; only an older one is a replay.
+        expect(await subject.run({
+            action: 'logout', connectionId: CONNECTION, provider: 'claude', connectionVersion: 5,
+        })).toEqual({ state: 'absent', connectionVersion: 5 });
+        expect(existsSync(connectionDir())).toBe(false);
+    });
+
+    it('shouldDropAnOversizedAccountLabelRatherThanRelayIt', async () => {
+        // The marker is owned by the provider uid, so the provider process can
+        // rewrite it. The label is display text, and it is bounded here so a
+        // rewritten one cannot carry a page into the parent's row.
+        const subject = store();
+        await complete(subject, 2);
+        const marker = JSON.parse(readFileSync(markerPath(), 'utf8')) as Record<string, unknown>;
+        writeFileSync(markerPath(), JSON.stringify({ ...marker, accountLabel: 'x'.repeat(300) }));
+        const reported = await subject.run({ action: 'status', connectionId: CONNECTION, provider: 'claude' });
+        expect(reported).toMatchObject({ state: 'connected', connectionVersion: 2 });
+        expect(reported).not.toHaveProperty('accountLabel');
+    });
+
     it('shouldRefuseALoginThatWouldNotAdvanceTheRecordedVersion', async () => {
         const subject = store();
         await complete(subject, 5);
@@ -489,6 +522,21 @@ describe('reading what the provider printed', () => {
         ['a code named on the line', 'go to https://example.test/x\nYour code: AB12CD', 'AB12CD'],
     ])('shouldFind(%s)', (_name, text, code) => {
         expect(parseCodexDeviceLogin(text)?.userCode).toBe(code);
+    });
+
+    it('shouldPreferTheVendorsUrlOverABannerThatCameFirst', () => {
+        // Codex may print a docs or telemetry link before the verification
+        // URL. The first `https://` is then a page the login can never finish
+        // on, and the pending state would sit there until it expired.
+        const text = 'See https://developers.openai.com/codex/cli for help\n'
+            + 'Open https://auth.openai.com/codex/device and enter code: WXYZ-7788';
+        expect(parseCodexDeviceLogin(text)).toEqual({
+            loginUrl: 'https://auth.openai.com/codex/device', userCode: 'WXYZ-7788',
+        });
+        // With no vendor host anywhere the first URL still stands — the
+        // wording belongs to a CLI this package does not control.
+        expect(parseCodexDeviceLogin('go to https://example.test/x\nYour code: AB12CD')?.loginUrl)
+            .toBe('https://example.test/x');
     });
 
     it('shouldReturnNothingUntilThereIsAUrl', () => {
