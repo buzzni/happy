@@ -21,11 +21,15 @@ import {
     type ManagedSpawnGateway,
 } from '@/managed/managedSpawnBootstrap';
 import {
+    credentialKindForAiAuth,
     isPersonalAiAuth,
+    MANAGED_AI_AUTH_MARKER_FILE,
+    managedAiAuthConnectionDir,
     managedAiAuthProviderHome,
+    type ManagedAiAuthPersonalKind,
     type ManagedAiAuthProvider,
 } from '@/managed/managedAiAuth';
-import { readManagedAiAuthApiKey } from '@/managed/managedAiAuthStore';
+import { parseManagedAiAuthMarker, readManagedAiAuthApiKey } from '@/managed/managedAiAuthStore';
 import { buildZaiClaudeEnvironment } from '@/managed/zaiClaudeEnvironment';
 import { attachManagedSession, ManagedAttachError, type ManagedAttachment } from '@/managed/managedSessionAttach';
 import {
@@ -305,6 +309,7 @@ export function applyManagedGatewayEnvironment(
     for (const key of PROVIDER_CREDENTIAL_ENV) delete env[key];
     for (const key of PROVIDER_AUTH_HOME_ENV) delete env[key];
     if (envelope.aiAuth.kind === 'personal-subscription') {
+        assertAdmittedConnection(envelope.aiAuth, readFile);
         /*
          * Claude reads its login from `CLAUDE_CONFIG_DIR`, so it is set here.
          *
@@ -337,6 +342,42 @@ export function applyManagedGatewayEnvironment(
 }
 
 /**
+ * The home still holds the login this run was admitted on.
+ *
+ * The spawn gate compared the marker with the selection when the run was
+ * admitted; this is the same comparison where the environment is built. The
+ * home is keyed by connection id alone, so between the two a logout and a new
+ * login on the same connection put another account's credential under the
+ * same path — and a run started on it would spend a login it was never
+ * admitted on (R24). A marker that is gone, unreadable, or names another
+ * version, provider or credential kind is that substitution, or its trace.
+ */
+function assertAdmittedConnection(
+    aiAuth: {
+        kind: ManagedAiAuthPersonalKind;
+        provider: ManagedAiAuthProvider;
+        connectionId: string;
+        connectionVersion: number;
+    },
+    readFile: (path: string) => string,
+): void {
+    let raw: string;
+    try {
+        raw = readFile(`${managedAiAuthConnectionDir(aiAuth.connectionId)}/${MANAGED_AI_AUTH_MARKER_FILE}`);
+    } catch {
+        throw new ManagedAttachError('personal auth home is not the connection this run was admitted on');
+    }
+    const marker = parseManagedAiAuthMarker(raw);
+    const admitted = marker !== null
+        && marker.provider === aiAuth.provider
+        && marker.connectionVersion === aiAuth.connectionVersion
+        && marker.credentialKind === credentialKindForAiAuth(aiAuth.kind);
+    if (!admitted) {
+        throw new ManagedAttachError('personal auth home is not the connection this run was admitted on');
+    }
+}
+
+/**
  * Points the agent at the key this connection registered.
  *
  * The key is read here rather than carried in the envelope: the envelope is
@@ -351,12 +392,21 @@ export function applyManagedGatewayEnvironment(
  */
 function applyPersonalApiKeyEnvironment(
     env: NodeJS.ProcessEnv,
-    aiAuth: { connectionId: string; provider: ManagedAiAuthProvider },
+    aiAuth: {
+        kind: ManagedAiAuthPersonalKind;
+        provider: ManagedAiAuthProvider;
+        connectionId: string;
+        connectionVersion: number;
+    },
     readFile: (path: string) => string,
 ): void {
     const home = managedAiAuthProviderHome(aiAuth.connectionId, aiAuth.provider);
     const apiKey = readManagedAiAuthApiKey(home, (path) => readFile(path));
     if (apiKey === null) throw new ManagedAttachError('personal api key is not present');
+    // After the key, on purpose: the store writes the marker last, so a marker
+    // that still matches after the key was read is a key that was the
+    // admitted one when it was read.
+    assertAdmittedConnection(aiAuth, readFile);
     if (aiAuth.provider === 'codex') {
         // `CODEX_HOME` stays the launcher plan's, exactly as on a personal
         // subscription: `codexToolPolicy` refuses a provider environment that

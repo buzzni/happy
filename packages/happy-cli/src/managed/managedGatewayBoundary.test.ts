@@ -118,13 +118,25 @@ describe('a personal subscription', () => {
         gateway: null,
     });
 
+    /**
+     * The connection marker as the store wrote it. Read at launch and compared
+     * with the envelope: the home is keyed by connection id alone, so the
+     * marker is what says *which* login of that connection is in it.
+     */
+    const marker = (over: Partial<{ provider: string; connectionVersion: number; credentialKind: string }> = {}) => (
+        (path: string): string => {
+            if (path !== `/workspace/.auth/${CONNECTION}/connection.json`) throw new Error(`ENOENT: ${path}`);
+            return JSON.stringify({ v: 1, provider: 'claude', connectionVersion: 2, credentialKind: 'oauth', ...over });
+        }
+    );
+
     it('points claude at this connection\'s auth home and spends no capability', () => {
         const env: NodeJS.ProcessEnv = {
             ANTHROPIC_AUTH_TOKEN: 'someone-elses-capability',
             ANTHROPIC_BASE_URL: 'https://gateway.example.test',
             CLAUDE_CONFIG_DIR: '/workspace/.auth/another-connection/claude',
         };
-        applyManagedGatewayEnvironment(env, personal('claude'));
+        applyManagedGatewayEnvironment(env, personal('claude'), marker());
         expect(env.CLAUDE_CONFIG_DIR).toBe(`/workspace/.auth/${CONNECTION}/claude`);
         expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
         expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
@@ -136,9 +148,29 @@ describe('a personal subscription', () => {
         // here would refuse every managed codex launch instead of configuring
         // one.
         const env: NodeJS.ProcessEnv = { CODEX_HOME: '/workspace/.auth/another-connection/codex' };
-        applyManagedGatewayEnvironment(env, personal('codex'));
+        applyManagedGatewayEnvironment(env, personal('codex'), marker({ provider: 'codex' }));
         expect(env.CODEX_HOME).toBeUndefined();
         expect(env.OPENAI_API_KEY).toBeUndefined();
+    });
+
+    it.each([
+        ['the marker is gone', () => { throw new Error('ENOENT'); }],
+        ['the marker is not one', () => 'nonsense'],
+        ['a newer login replaced the admitted one', marker({ connectionVersion: 3 })],
+        ['the home now holds another provider', marker({ provider: 'codex' })],
+        ['a key replaced the login', marker({ credentialKind: 'api-key' })],
+    ])('refuses to start when %s', (_name, read) => {
+        /*
+         * The spawn gate checked the marker when the run was admitted; this
+         * is the same check where the environment is actually built. Between
+         * the two, a logout and a new login on the same connection would put
+         * another account's credential under the same path — and a run that
+         * started on it would spend a login it was never admitted on.
+         */
+        const env: NodeJS.ProcessEnv = { CLAUDE_CONFIG_DIR: '/workspace/.auth/another-connection/claude' };
+        expect(() => applyManagedGatewayEnvironment(env, personal('claude'), read as () => string))
+            .toThrow(/not the connection this run was admitted on/);
+        expect(env.CLAUDE_CONFIG_DIR).toBeUndefined();
     });
 
     it('does not pin a model provider, so the chatgpt login is the one used', () => {
@@ -185,10 +217,16 @@ describe('a registered api key', () => {
         gateway: null,
     });
 
-    /** The key file as the store wrote it, served from the expected home only. */
+    /**
+     * The key file and the marker as the store wrote them, served from the
+     * expected home only.
+     */
     const reader = (provider: string, contents = JSON.stringify({
         v: 1, provider, apiKey: KEY,
+    }), marker = JSON.stringify({
+        v: 1, provider, connectionVersion: 2, credentialKind: 'api-key',
     })) => (path: string): string => {
+        if (path === `/workspace/.auth/${CONNECTION}/connection.json`) return marker;
         if (path !== `/workspace/.auth/${CONNECTION}/${provider}/api-key.json`) {
             throw new Error(`ENOENT: ${path}`);
         }
@@ -267,6 +305,17 @@ describe('a registered api key', () => {
         // as the user's own, and the inherited key is somebody else's.
         expect(() => applyManagedGatewayEnvironment(env, keyed('claude'), read as () => string))
             .toThrow(/personal api key is not present/);
+        expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    });
+
+    it('refuses a key whose marker no longer names this run\'s admission', () => {
+        // Same substitution as on a subscription: a login that replaced the
+        // key between admission and launch leaves the key file behind for a
+        // moment, and the marker is what says it is no longer the credential.
+        const env: NodeJS.ProcessEnv = {};
+        expect(() => applyManagedGatewayEnvironment(env, keyed('claude'), reader('claude', undefined, JSON.stringify({
+            v: 1, provider: 'claude', connectionVersion: 3, credentialKind: 'oauth',
+        })))).toThrow(/not the connection this run was admitted on/);
         expect(env.ANTHROPIC_API_KEY).toBeUndefined();
     });
 
