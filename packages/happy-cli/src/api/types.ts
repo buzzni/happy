@@ -218,6 +218,13 @@ export const MessageMetaSchema = z.object({
   sentFrom: z.string().optional(), // Source identifier
   permissionMode: z.enum(['default', 'acceptEdits', 'bypassPermissions', 'plan', 'read-only', 'safe-yolo', 'yolo']).optional(), // Permission mode for this message
   model: z.string().nullable().optional(), // Model name for this message (null = reset)
+  // Whether `model` is a pin the user chose or a per-turn pick a client router
+  // made for a Default session. Only a pin is published as the session's active
+  // model; publishing a router pick would freeze the session on it. Absent means
+  // 'user' so clients that never auto-route (desktop, web) need no change.
+  // .catch() for the same reason as saycodePromptBlocks below: a malformed value
+  // must degrade to "no marker", never stop the message from being routed.
+  modelSource: z.enum(['user', 'auto']).optional().catch(undefined),
   fallbackModel: z.string().nullable().optional(), // Fallback model for this message (null = reset)
   effort: z.string().nullable().optional(), // Reasoning effort for this message (null = reset)
   customSystemPrompt: z.string().nullable().optional(), // Custom system prompt for this message (null = reset)

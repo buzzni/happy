@@ -37,3 +37,40 @@ describe('MessageMetaSchema saycodePromptBlocks resilience', () => {
     expect(parsed.success && parsed.data.permissionMode).toBe('default');
   });
 });
+
+describe('MessageMetaSchema modelSource', () => {
+  // Clients that auto-route a Default session send a concrete model they did not
+  // pin. Without this marker the CLI cannot tell that choice apart from a user
+  // pin, and publishing it back as the session's active pin would freeze the
+  // session on whatever the router last picked.
+  it('preserves an explicit auto marker', () => {
+    expect(MessageMetaSchema.parse({ model: 'claude-sonnet-5', modelSource: 'auto' }))
+      .toEqual({ model: 'claude-sonnet-5', modelSource: 'auto' });
+  });
+
+  it('preserves an explicit user marker', () => {
+    expect(MessageMetaSchema.parse({ modelSource: 'user' }))
+      .toEqual({ modelSource: 'user' });
+  });
+
+  // Absent marker means "user pin" so that desktop/web, which never sends the
+  // field, keeps working unchanged.
+  it('leaves the marker undefined when the client omits it', () => {
+    expect(MessageMetaSchema.parse({ model: 'claude-opus-5' }).modelSource).toBeUndefined();
+  });
+
+  // Same hazard as saycodePromptBlocks: a safeParse failure in
+  // apiSession.routeIncomingMessage stops routing the message as a user message
+  // entirely. An unknown marker must degrade to "no marker", never drop the turn.
+  it('never fails the whole message on an unknown marker', () => {
+    const parsed = MessageMetaSchema.safeParse({
+      permissionMode: 'default',
+      model: 'claude-opus-5',
+      modelSource: 'router-v2',
+    });
+    expect(parsed.success).toBe(true);
+    expect(parsed.success && parsed.data.permissionMode).toBe('default');
+    expect(parsed.success && parsed.data.model).toBe('claude-opus-5');
+    expect(parsed.success && parsed.data.modelSource).toBeUndefined();
+  });
+});
