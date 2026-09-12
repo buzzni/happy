@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createStreamDeltaRelay, type StreamDeltaFrame } from './streamDeltaRelay';
+import { createStreamDeltaRelay, DEFAULT_STREAM_MAX_BYTES, type StreamDeltaFrame } from './streamDeltaRelay';
 
 function relayWithFakeTimers(opts: { flushMs?: number; maxBytes?: number } = {}) {
     const frames: StreamDeltaFrame[] = [];
@@ -52,6 +52,21 @@ describe('streamDeltaRelay', () => {
         relay.handleStreamEvent(textDelta(0, 'e') as any);
         fire();
         expect(frames.map((f) => [f.offset, f.delta])).toEqual([[0, 'abcd'], [4, 'e']]);
+    });
+
+    it('keeps every emitted frame within the default limit when the threshold is crossed mid-delta', () => {
+        const { relay, frames, fire } = relayWithFakeTimers();
+        relay.handleStreamEvent(messageStart('msg_a') as any);
+        relay.handleStreamEvent(textDelta(0, 'a'.repeat(DEFAULT_STREAM_MAX_BYTES - 8)) as any);
+        relay.handleStreamEvent(textDelta(0, 'b'.repeat(20)) as any);
+
+        expect(frames.map((f) => [f.offset, f.delta.length])).toEqual([
+            [0, DEFAULT_STREAM_MAX_BYTES],
+            [DEFAULT_STREAM_MAX_BYTES, 12],
+        ]);
+        relay.handleStreamEvent(textDelta(0, 'c') as any);
+        fire();
+        expect(frames.at(-1)).toMatchObject({ offset: DEFAULT_STREAM_MAX_BYTES + 12, delta: 'c' });
     });
 
     it('marks the block final on content_block_stop and flushes immediately', () => {

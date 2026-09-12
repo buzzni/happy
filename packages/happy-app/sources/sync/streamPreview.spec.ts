@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { ApiEphemeralUpdateSchema, ApiSessionStreamDeltaSchema } from './apiTypes';
-import { buildSessionStreamPreviewMessage, reduceSessionStreamPreview } from './streamPreview';
+import {
+    ApiEphemeralUpdateSchema,
+    ApiSessionStreamDeltaSchema,
+    SESSION_STREAM_DELTA_MAX_CHARS,
+} from './apiTypes';
+import {
+    buildSessionStreamPreviewMessage,
+    reduceSessionStreamPreview,
+    SESSION_STREAM_PREVIEW_MAX_BLOCKS,
+    SESSION_STREAM_PREVIEW_MAX_CHARS,
+} from './streamPreview';
 
 describe('session stream preview', () => {
     it('accepts the server envelope and validates decrypted frame fields', () => {
@@ -15,6 +24,13 @@ describe('session stream preview', () => {
             index: 0,
             offset: -1,
             delta: 'text',
+            final: false,
+        }).success).toBe(false);
+        expect(ApiSessionStreamDeltaSchema.safeParse({
+            messageId: 'message-1',
+            index: 0,
+            offset: 0,
+            delta: 'x'.repeat(SESSION_STREAM_DELTA_MAX_CHARS + 1),
             final: false,
         }).success).toBe(false);
     });
@@ -51,6 +67,49 @@ describe('session stream preview', () => {
         preview = reduceSessionStreamPreview(preview, {
             messageId: 'message-1', index: 1, offset: 0, delta: 'late', final: true,
         }, 125);
+        expect(buildSessionStreamPreviewMessage(preview)).toBeNull();
+    });
+
+    it('hides a draft when its accumulated text exceeds the preview limit', () => {
+        let preview = reduceSessionStreamPreview(undefined, {
+            messageId: 'message-1', index: 0, offset: 0, delta: '', final: false,
+        }, 123);
+        const delta = 'x'.repeat(SESSION_STREAM_DELTA_MAX_CHARS);
+        for (let offset = 0; offset < SESSION_STREAM_PREVIEW_MAX_CHARS; offset += delta.length) {
+            preview = reduceSessionStreamPreview(preview, {
+                messageId: 'message-1', index: 0, offset, delta, final: false,
+            }, 123);
+        }
+
+        expect(buildSessionStreamPreviewMessage(preview)?.text).toHaveLength(SESSION_STREAM_PREVIEW_MAX_CHARS);
+        preview = reduceSessionStreamPreview(preview, {
+            messageId: 'message-1',
+            index: 0,
+            offset: SESSION_STREAM_PREVIEW_MAX_CHARS,
+            delta: 'x',
+            final: false,
+        }, 123);
+        expect(buildSessionStreamPreviewMessage(preview)).toBeNull();
+    });
+
+    it('hides a draft when its block count exceeds the preview limit', () => {
+        let preview = reduceSessionStreamPreview(undefined, {
+            messageId: 'message-1', index: 0, offset: 0, delta: 'x', final: true,
+        }, 123);
+        for (let index = 1; index < SESSION_STREAM_PREVIEW_MAX_BLOCKS; index++) {
+            preview = reduceSessionStreamPreview(preview, {
+                messageId: 'message-1', index, offset: 0, delta: 'x', final: true,
+            }, 123);
+        }
+
+        expect(buildSessionStreamPreviewMessage(preview)?.text).toHaveLength(SESSION_STREAM_PREVIEW_MAX_BLOCKS);
+        preview = reduceSessionStreamPreview(preview, {
+            messageId: 'message-1',
+            index: SESSION_STREAM_PREVIEW_MAX_BLOCKS,
+            offset: 0,
+            delta: 'x',
+            final: true,
+        }, 123);
         expect(buildSessionStreamPreviewMessage(preview)).toBeNull();
     });
 });

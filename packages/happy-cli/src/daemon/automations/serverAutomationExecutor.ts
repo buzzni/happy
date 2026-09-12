@@ -426,6 +426,12 @@ function reconcileSchedules(
   state: ServerAutomationRuntimeState,
   payloads: Map<string, ServerAutomationPayload>,
   now: number,
+  /**
+   * 복호 성공 여부와 무관하게 서버가 알고 있는 자동화 전부. githubTrigger 행은 이것으로
+   * 거른다 — 호출부는 스케줄을 복호 가능한 것만으로 조정하는데, 그 목록으로 트리거
+   * 행까지 거르면 일시적 복호 실패가 "삭제된 자동화" 와 구분되지 않아 상태를 잃는다.
+   */
+  knownAutomations: EncryptedServerAutomation[] = cache.automations,
 ): ServerAutomationRuntimeState {
   const activeIds = new Set(cache.automations.map((automation) => automation.automationId))
   const schedules = state.schedules.filter((schedule) => activeIds.has(schedule.automationId))
@@ -455,14 +461,33 @@ function reconcileSchedules(
       runRequestRevision: automation.revision,
     })
   }
-  const activeGenerations = new Map(cache.automations.map((automation) => [
+  const activeGenerations = new Map(knownAutomations.map((automation) => [
     automation.automationId,
     automation.generation,
   ]))
-  const githubTriggers = (state.githubTriggers ?? []).filter((entry) => (
-    activeGenerations.get(entry.automationId) === entry.generation
-      && payloads.get(entry.automationId)?.githubTrigger !== undefined
-  ))
+  // 트리거 상태는 "저장소에서 무엇을 이미 봤나"(highestPrNumber·processed)와 아직
+  // 처리하지 못한 큐다. 자동화 설정이 아니므로 편집으로 버리면 안 된다.
+  //
+  // 2026-09-12 프로덕션 — aplus 트리거를 저장하자 generation 이 13 → 14 로 올랐고
+  // 이 자리에서 옛 행이 버려졌다. 다음 폴링이 baseline 을 다시 잡으며("nothing fires
+  // until a newer one appears") 그 사이 열린 PR #3784·#3785·#3786 이 흡수돼 영영
+  // 발화하지 않았다. 프롬프트를 고쳤다고 그 PR 들을 안 본 것이 되지 않는다.
+  //
+  // 그래서 버리는 대신 새 generation 으로 넘긴다. 큐에 남은 이벤트도 함께 넘긴다 —
+  // 그 번호들은 이미 고수위 아래라 다시 발견되지 않으므로, 두고 가면 같이 사라진다.
+  const githubTriggers = (state.githubTriggers ?? [])
+    .filter((entry) => {
+      if (!activeGenerations.has(entry.automationId)) return false
+      // payloads 는 복호에 성공한 것만 담는다. 복호하지 못했으면 트리거가 사라졌는지
+      // 알 수 없으므로 지우지 않는다 — 일시적 복호 실패로 baseline 이 초기화되면
+      // 위와 똑같이 그 사이의 PR 이 전부 묻힌다. 실제로 트리거를 뗀 경우에만 버린다.
+      const payload = payloads.get(entry.automationId)
+      return payload === undefined || payload.githubTrigger !== undefined
+    })
+    .map((entry) => {
+      const generation = activeGenerations.get(entry.automationId)!
+      return generation === entry.generation ? entry : { ...entry, generation }
+    })
   // A worker from an older automation generation can still be running after
   // the trigger is edited. Keep those rows until isSessionRunning confirms
   // that they ended so the global worker limit remains accurate.
@@ -1618,7 +1643,9 @@ export async function runServerAutomationTick(
   }
 
   const before = input.runtimeStore.read()
-  const reconciled = reconcileSchedules({ ...cache, automations: decryptableAutomations }, before, payloads, now)
+  const reconciled = reconcileSchedules(
+    { ...cache, automations: decryptableAutomations }, before, payloads, now, cache.automations,
+  )
   if (JSON.stringify(reconciled.schedules) !== JSON.stringify(before.schedules)
     || JSON.stringify(reconciled.githubTriggers) !== JSON.stringify(before.githubTriggers ?? [])) {
     input.runtimeStore.write(reconciled)
