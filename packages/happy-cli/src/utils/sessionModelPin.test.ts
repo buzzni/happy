@@ -274,3 +274,65 @@ describe('createSessionModelPinPublisher', () => {
         expect(seen).toEqual([{ currentModelCode: 'claude-opus-5', currentThoughtLevelCode: null }]);
     });
 });
+
+describe('createSessionModelPinPublisher restart and reset convergence', () => {
+    const metadata: Metadata = {
+        path: '/tmp/p',
+        host: 'h',
+        homeDir: '/home/u',
+        happyHomeDir: '/home/u/.happy',
+        happyLibDir: '/home/u/.happy/lib',
+        happyToolsDir: '/home/u/.happy/tools',
+    };
+
+    function harness(initialPin: SessionModelPin, publishedPin: SessionModelPin) {
+        const written: Array<Metadata> = [];
+        let current: Metadata = {
+            ...metadata,
+            ...(publishedPin.model ? { currentModelCode: publishedPin.model } : {}),
+            ...(publishedPin.effort ? { currentThoughtLevelCode: publishedPin.effort } : {}),
+        };
+        const publisher = createSessionModelPinPublisher({
+            initialPin,
+            publishedPin,
+            updateMetadata: (update) => {
+                current = update(current);
+                written.push(current);
+            },
+        });
+        return { publisher, written, latest: () => current };
+    }
+
+    // The whole point of the feature is that a pin survives. A CLI restart or
+    // daemon reconnect spawns without --model, and the runtime knowing nothing
+    // is not the user clearing their choice: publishing a clear here wipes the
+    // pin every other device was reading.
+    it('does not wipe an advertised pin when the runtime restarts without one', () => {
+        // A restart/reconnect spawns with no --model, so the spawn-time pin is
+        // empty while the session still advertises what the user chose.
+        const { publisher, written, latest } = harness({}, { model: 'claude-opus-5', effort: 'high' });
+        publisher.publish({ specifiesModel: false, specifiesEffort: false });
+        expect(written).toHaveLength(0);
+        expect(latest().currentModelCode).toBe('claude-opus-5');
+        expect(latest().currentThoughtLevelCode).toBe('high');
+    });
+
+    // An explicit --model at spawn IS a fresh user choice and must win over
+    // whatever the session advertised before.
+    it('lets an explicit spawn pin replace the advertised one', () => {
+        const { publisher, latest } = harness({ model: 'claude-haiku-4-5' }, { model: 'claude-opus-5' });
+        publisher.publish({ specifiesModel: false, specifiesEffort: false });
+        expect(latest().currentModelCode).toBe('claude-haiku-4-5');
+    });
+
+    // reset() restores the spawn-time pin in memory; leaving the advertised
+    // value stale lets another device read the old pin and send it straight
+    // back as a user pin, silently undoing the reset.
+    it('converges the advertised pin when an abort resets it', () => {
+        const { publisher, latest } = harness({}, {});
+        publisher.publish({ specifiesModel: true, model: 'claude-opus-5', specifiesEffort: false });
+        expect(latest().currentModelCode).toBe('claude-opus-5');
+        publisher.reset();
+        expect('currentModelCode' in latest()).toBe(false);
+    });
+});

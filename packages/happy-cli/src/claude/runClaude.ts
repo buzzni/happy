@@ -576,10 +576,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // it also survives the post-abort reset. Invalid effort values are ignored.
     // Split out what the user actually asked for from the runtime fallback, so
     // callers can tell "no model was chosen" apart from "the default is opus".
-    const explicitInitialModel = normalizeClaudeModelForRuntime(
-        consumePendingInitialModel(process.env) ?? options.model,
-        process.env,
-    );
+    // The requested value is kept unnormalized for the published pin — see the
+    // pin publish call below for why the runtime substitution must not leak out.
+    const requestedInitialModel = consumePendingInitialModel(process.env) ?? options.model;
+    const explicitInitialModel = normalizeClaudeModelForRuntime(requestedInitialModel, process.env);
     const initialModelSeed = explicitInitialModel ?? DEFAULT_CLAUDE_MODEL;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env);
     if (rawInitialEffortSeed && !VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)) {
@@ -624,7 +624,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // the runtime default as a deliberate choice and stop other clients from
     // routing a Default session themselves.
     const initialModelPin: SessionModelPin = {
-        ...(explicitInitialModel ? { model: explicitInitialModel } : {}),
+        ...(requestedInitialModel ? { model: requestedInitialModel } : {}),
         ...(explicitInitialEffort ? { effort: explicitInitialEffort } : {}),
     };
     const sessionModelPinPublisher = createSessionModelPinPublisher({
@@ -899,7 +899,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
         sessionModelPinPublisher.publish({
             specifiesModel: message.meta?.hasOwnProperty('model') ?? false,
-            model: messageModel,
+            // Publish what the user asked for, never the runtime substitution.
+            // normalizeClaudeModelForRuntime rewrites models for the Z.AI backend:
+            // a pinned Fable becomes undefined (publishing that clears the user's
+            // pin) and a pinned Sonnet 4.6 becomes 'sonnet', which every other
+            // device reads back as Sonnet 5 — a silent model change. The
+            // substitution is this runtime's business; the pin is the user's.
+            model: message.meta?.model || undefined,
             specifiesEffort: message.meta?.hasOwnProperty('effort') ?? false,
             effort: messageEffort,
             source: message.meta?.modelSource,

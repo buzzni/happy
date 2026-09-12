@@ -117,7 +117,22 @@ export function createSessionModelPinPublisher(input: {
     /** Restores the spawn-time pin, mirroring the loops' turn-scoped abort reset. */
     reset: () => void;
 } {
-    let pin = input.initialPin;
+    // A restart or daemon reconnect spawns without --model, and the runtime
+    // knowing nothing is not the user clearing their choice. Adopt whatever the
+    // session already advertises for either half the spawn options did not speak
+    // to — otherwise the first converge publishes a clear and every restart
+    // wipes the pin the other devices were reading, which is the exact failure
+    // this feature exists to prevent. An explicit spawn option still wins: that
+    // one IS a fresh user choice.
+    const spawnPin: SessionModelPin = {
+        ...(input.initialPin.model ?? input.publishedPin.model
+            ? { model: input.initialPin.model ?? input.publishedPin.model }
+            : {}),
+        ...(input.initialPin.effort ?? input.publishedPin.effort
+            ? { effort: input.initialPin.effort ?? input.publishedPin.effort }
+            : {}),
+    };
+    let pin = spawnPin;
     let published = input.publishedPin;
 
     const publish = (turn: SessionModelPinTurn): void => {
@@ -132,7 +147,11 @@ export function createSessionModelPinPublisher(input: {
     return {
         publish,
         reset: () => {
-            pin = input.initialPin;
+            pin = spawnPin;
+            // Converge what the session advertises too. Leaving the old value up
+            // lets another device read the stale pin and send it right back as a
+            // user pin, silently undoing the reset.
+            publish({ specifiesModel: false, specifiesEffort: false });
         },
     };
 }
