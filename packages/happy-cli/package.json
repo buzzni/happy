@@ -61,6 +61,9 @@
     "./browserSessionBrokerMain": {
       "import": "./dist/browserSessionBrokerMain.mjs"
     },
+    "./electronGuiPreload": {
+      "require": "./dist/electronGuiPreload.cjs"
+    },
     "./managed/image": {
       "require": {
         "types": "./dist/managed/imageRuntimeEntry.d.cts",
