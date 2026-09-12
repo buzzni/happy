@@ -1,0 +1,186 @@
+# The managed runtime image: tool-execution layer and provider layer.
+#
+# Build from the happy-cli package root, after `pnpm run build`:
+#
+#   pnpm run build
+#   node scripts/prepare-publish-package.cjs --out .managed-image/cli-package
+#   docker build -f docker/managed-runtime/Dockerfile.managed-runtime .
+#
+# Everything it copies is either checked in or produced by that build — there
+# is no staging step to perform by hand, and nothing generated is committed.
+#
+# The modes are a read-only contract. The executor's trusted helper refuses to
+# exec a file that is writable by group or other, which `0755` would also
+# satisfy; `0555` and `0444` go further on purpose — nothing in the running
+# image, root included, has a reason to rewrite the code the agent is about to
+# become, and `assertManagedImageLayout` checks the exact bits rather than a
+# minimum so a drift shows up here instead of at runtime.
+#
+# `sqlite3` is a product dependency, not a convenience: without it every
+# project holding a SQLite database fails its checkpoint preflight.
+ARG NODE_IMAGE=node:22-bookworm-slim
+
+#
+# The CLI's own stage.
+#
+# The build output cannot be copied straight in. `dist/index.mjs` is a few
+# hundred bytes that imports content-hashed sibling chunks by relative path,
+# and those chunks import their runtime dependencies by bare specifier — so the
+# entry needs its whole tree *and* a `node_modules` beside it. The workspace's
+# own `node_modules` is not that tree: pnpm links it, and its native modules
+# are built for the machine running the build, not for this image.
+#
+# So the dependencies are installed here, in the target image's own
+# environment, which is what makes the native ones this image's.
+#
+FROM ${NODE_IMAGE} AS cli
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 make g++ \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+# The package as it is actually published, assembled by the product's own
+# `prepare:publish` script — its `bundledDependencies` include a workspace
+# package npm will not fetch from the registry, so an ordinary `npm install`
+# against `package.json` produces an artifact the CLI's own guard rejects.
+COPY .managed-image/cli-package/ ./
+# Everything else comes from the registry, installed here so the native
+# modules are built for this image rather than for the build host.
+RUN npm install --omit=dev \
+ && node scripts/verify-bundled-deps.cjs \
+ && node scripts/unpack-tools.cjs
+# What this image is, from the package it actually installed — not a build
+# argument. A checkpoint records the image that is running, and a label that can
+# be asserted from outside is a label that can be wrong.
+RUN node -e "process.stdout.write(require('/build/package.json').version)" > /build/image-version
+
+#
+# The trusted helpers.
+#
+# Compiled from the product's own sources — there is no second copy of either.
+# `executor-helper` isolates one tool call (PID/mount/network namespaces, the
+# executor uid); `exec-helper` runs the provider generation (no namespace, the
+# provider uid). Different programs, and the image must carry both or nothing
+# can be launched at all.
+#
+FROM ${NODE_IMAGE} AS helpers
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gcc libc6-dev \
+ && rm -rf /var/lib/apt/lists/*
+COPY src/launcher/executorHelper.c /build/executorHelper.c
+COPY src/launcher/execHelper.c /build/execHelper.c
+RUN mkdir -p /out \
+ && gcc -O2 -Wall -Wextra -Werror -o /out/executor-helper /build/executorHelper.c \
+ && gcc -O2 -Wall -Wextra -Werror -o /out/exec-helper /build/execHelper.c
+
+FROM ${NODE_IMAGE} AS managed-runtime
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends sqlite3 iproute2 iptables \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /usr/local/lib/saycode
+
+# Where the platform drops this Machine's provisioning input: the daemon
+# credential and, after the first boot, the marker. Created **here**, root-owned
+# and `0755`, rather than by whoever writes into it first — the readers refuse a
+# path whose ownership they cannot vouch for, and a directory created later by
+# something else is exactly such a path.
+RUN mkdir -p /etc/saycode \
+ && chown root:root /etc/saycode \
+ && chmod 0755 /etc/saycode
+
+# The account the managed daemon runs as.
+#
+# Created **here**, in the image, because that is what makes it trustworthy: root
+# builds the image, and the boot reads `/etc/passwd` and `/etc/group` as root
+# before any agent uid exists. Deliberately not a marker field — a required marker
+# axis would need the parent's composer, every fixture on both sides, and an answer
+# for machines already provisioned without it.
+#
+# Fixed ids, disjoint from the provider (10601) and executor (10602/10600)
+# accounts: the boot refuses when the daemon account collides with either, because
+# the directory it owns holds the receipt store and the lease that decides whether
+# a generation may still run.
+#
+# The group has **no members** and the user's shell is `nologin`: nothing logs in
+# as it, and no agent account inherits it as a supplementary group. The daemon does
+# not run as this account yet — the entrypoint still starts it as root, and the
+# privilege switch is a later, separately reviewed step.
+RUN groupadd --system --gid 10603 saycode-daemon \
+ && useradd --system --uid 10603 --gid 10603 \
+    --home-dir /var/lib/saycode-daemon --no-create-home \
+    --shell /usr/sbin/nologin saycode-daemon \
+ && [ "$(id -u saycode-daemon)" = "10603" ] \
+ && [ "$(id -g saycode-daemon)" = "10603" ] \
+ && [ -z "$(getent group saycode-daemon | cut -d: -f4)" ]
+
+# Emitted by `pnpm run build` from the package's `./managed/image` export.
+COPY dist/managed/imageRuntimeEntry.cjs /usr/local/lib/saycode/toolRuntime.cjs
+COPY docker/managed-runtime/tool-workload.mjs /usr/local/lib/saycode/tool-workload.mjs
+COPY docker/managed-runtime/tool-workload /usr/local/lib/saycode/tool-workload
+
+# The provider layer. `provider-workload` is the generation's `execve` target
+# and is deliberately a different program from `tool-workload`: the tool one is
+# entered by the executor uid inside a per-call PID/mount/network namespace,
+# this one is the provider generation under `exec-helper`.
+COPY docker/managed-runtime/provider-workload.mjs /usr/local/lib/saycode/provider-workload.mjs
+COPY docker/managed-runtime/provider-workload /usr/local/lib/saycode/provider-workload
+COPY --from=cli /build/dist/ /usr/local/lib/saycode/cli/
+COPY --from=cli /build/node_modules/ /usr/local/lib/saycode/cli/node_modules/
+COPY --from=cli /build/tools/ /usr/local/lib/saycode/cli/tools/
+# The CLI the provider entry hands the run to: it reads the envelope from the
+# inherited descriptor and enters the existing runner. Built in its own stage —
+# see the `cli` stage above for why it cannot simply be copied.
+
+RUN chown root:root /usr/local/lib/saycode/toolRuntime.cjs \
+                    /usr/local/lib/saycode/tool-workload.mjs \
+                    /usr/local/lib/saycode/tool-workload \
+                    /usr/local/lib/saycode/provider-workload.mjs \
+                    /usr/local/lib/saycode/provider-workload \
+                    /usr/local/lib/saycode/cli/index.mjs \
+ && chmod 0444 /usr/local/lib/saycode/toolRuntime.cjs \
+ && chmod 0444 /usr/local/lib/saycode/tool-workload.mjs \
+ && chmod 0555 /usr/local/lib/saycode/tool-workload \
+ && chmod 0444 /usr/local/lib/saycode/provider-workload.mjs \
+ && chmod 0555 /usr/local/lib/saycode/provider-workload \
+ && chown -R root:root /usr/local/lib/saycode/cli \
+ # Readable by everyone, writable by no one — in that order.
+ #
+ # `a-w` alone only removes write. The build stage produces the bundle's
+ # sibling chunks under its own umask (0600), so `a-w` left them 0400: root
+ # could read the CLI and the provider uid could not. The generation then died
+ # with `EACCES` on `main-*.mjs` before a line of our code ran, and the daemon
+ # saw only a session webhook that never arrived.
+ #
+ # `a+rX` adds read to files and traverse to directories without making
+ # anything executable that was not already, and `a-w` after it keeps the
+ # read-only contract this image rests on.
+ && chmod -R a+rX /usr/local/lib/saycode/cli \
+ && chmod -R a-w /usr/local/lib/saycode/cli \
+ && chmod 0444 /usr/local/lib/saycode/cli/index.mjs
+
+COPY docker/managed-runtime/entrypoint /usr/local/lib/saycode/entrypoint
+COPY docker/managed-runtime/isolation-probe /usr/local/lib/saycode/isolation-probe
+COPY docker/managed-runtime/cgroup-prepare /usr/local/lib/saycode/cgroup-prepare
+RUN chown root:root /usr/local/lib/saycode/entrypoint /usr/local/lib/saycode/isolation-probe \
+                    /usr/local/lib/saycode/cgroup-prepare \
+ && chmod 0555 /usr/local/lib/saycode/entrypoint /usr/local/lib/saycode/isolation-probe \
+               /usr/local/lib/saycode/cgroup-prepare
+
+COPY --from=helpers /out/executor-helper /usr/local/lib/saycode/executor-helper
+COPY --from=helpers /out/exec-helper /usr/local/lib/saycode/exec-helper
+RUN chown root:root /usr/local/lib/saycode/executor-helper /usr/local/lib/saycode/exec-helper \
+ && chmod 0500 /usr/local/lib/saycode/executor-helper /usr/local/lib/saycode/exec-helper
+
+COPY --from=cli /build/image-version /usr/local/lib/saycode/image-version
+RUN chown root:root /usr/local/lib/saycode/image-version \
+ && chmod 0444 /usr/local/lib/saycode/image-version
+
+COPY docker/managed-runtime/verify-image-layout.cjs /tmp/verify-image-layout.cjs
+RUN node /tmp/verify-image-layout.cjs && rm /tmp/verify-image-layout.cjs
+
+# Without this the base image's `CMD ["node"]` is inherited and the Machine
+# comes up as a REPL — every artefact present, nothing running. `ENTRYPOINT` in
+# exec form, so no shell sits between the init and the boot.
+ENTRYPOINT ["/usr/local/lib/saycode/entrypoint"]
+CMD []

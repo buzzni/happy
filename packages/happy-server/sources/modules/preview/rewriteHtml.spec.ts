@@ -212,6 +212,15 @@ describe('rewriteHtml — interceptor injection', () => {
         expect(out).toContain('NoopWS');
         expect(out).toContain('vite-hmr');
     });
+
+    it('injects the preview activity bridge with interaction events and throttling', () => {
+        const out = rewriteHtml('<html><head></head><body></body></html>', PREFIX);
+
+        expect(out).toContain("parent.postMessage({type:'aplus-preview-activity'},'*')");
+        expect(out).toContain("['pointerdown','keydown','wheel','touchstart','scroll']");
+        expect(out).toContain('if(now-last<60000)return');
+        expect(out).toContain('if(window.__aplusPreviewActivityBridge)return');
+    });
 });
 
 // Phase 2.5 (specs/preview-nextjs-turbopack-hydration/): Next.js App Router /

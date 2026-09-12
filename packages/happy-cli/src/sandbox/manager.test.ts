@@ -68,7 +68,7 @@ describe('sandbox manager', () => {
 
         const cleanup = await initializeSandbox(sandboxConfig, '/workspace/session');
 
-        expect(mockBuildSandboxRuntimeConfig).toHaveBeenCalledWith(sandboxConfig, '/workspace/session');
+        expect(mockBuildSandboxRuntimeConfig).toHaveBeenCalledWith(sandboxConfig, '/workspace/session', 'owner-choice');
         expect(mockInitialize).toHaveBeenCalledWith(runtimeConfig);
 
         await cleanup();
@@ -113,4 +113,49 @@ describe('sandbox manager', () => {
         });
     });
 
+});
+
+// d2a6b42e 리뷰 결함 — 정책을 판정만 하고 이 경계까지 전달하지 않아 프로덕션에서
+// floor 가 한 번도 적용되지 않았다. 실제 초기화 인자로 확인한다.
+describe('sandbox manager policy boundary', () => {
+    const sandboxConfig: SandboxConfig = {
+        enabled: true,
+        sessionIsolation: 'workspace',
+        customWritePaths: [],
+        denyReadPaths: [],
+        extraWritePaths: ['/tmp'],
+        denyWritePaths: [],
+        networkMode: 'allowed',
+        allowedDomains: [],
+        deniedDomains: [],
+        allowLocalBinding: true,
+    };
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockBuildSandboxRuntimeConfig.mockReturnValue({
+            network: { allowedDomains: ['*'], deniedDomains: [], allowLocalBinding: true, allowUnixSockets: [] },
+            filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+        } satisfies SandboxRuntimeConfig);
+    });
+
+    it('forwards the mandatory policy into the runtime config build', async () => {
+        await initializeSandbox(sandboxConfig, '/tmp/session', 'mandatory');
+
+        expect(mockBuildSandboxRuntimeConfig).toHaveBeenCalledWith(
+            sandboxConfig,
+            '/tmp/session',
+            'mandatory',
+        );
+    });
+
+    it('defaults to owner-choice when no policy is given', async () => {
+        await initializeSandbox(sandboxConfig, '/tmp/session');
+
+        expect(mockBuildSandboxRuntimeConfig).toHaveBeenCalledWith(
+            sandboxConfig,
+            '/tmp/session',
+            'owner-choice',
+        );
+    });
 });

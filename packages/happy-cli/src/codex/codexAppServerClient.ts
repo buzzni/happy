@@ -59,6 +59,8 @@ import { CheckpointWriterProcessTree } from '@/checkpoint/checkpointWriterProces
 import { CODEX_INACTIVITY_ABORT_REASON, type CodexInactivityAbortFields } from './codexAbortNotice';
 import { prepareCodexMultiAuthProxy, type PreparedCodexMultiAuthProxy } from './codexMultiAuthProxy';
 import { initializeSandbox, wrapForMcpTransport } from '@/sandbox/manager';
+import { MandatorySandboxError, resolveSandboxInitFailureAction, type SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
+import { describeSandboxCapabilityFailure, verifySandboxExecutionCapability } from '@/sandbox/executionCapability';
 import packageJson from '../../package.json';
 import { resolveCodexSandboxPolicy } from './executionPolicy';
 
@@ -233,12 +235,14 @@ export class CodexAppServerClient {
     private processEpoch = 0;
     private connected = false;
     private sandboxConfig?: SandboxConfig;
+    private readonly sandboxPolicyMode: SandboxPolicyMode;
     private readonly beforeTurn?: () => Promise<CheckpointTurnPreparation | void>;
     private readonly completeTurn?: CheckpointSessionComposition['completeTurn'];
     private readonly markTurnDispatched?: () => void;
     private readonly protectedWriterTree: CheckpointWriterProcessTree | null;
     private sandboxCleanup: (() => Promise<void>) | null = null;
     private multiAuthProxy: PreparedCodexMultiAuthProxy | null = null;
+    private readonly managedProviderArgs: string[] | null;
     private multiAuthProxyCleanup: Promise<void> | null = null;
     public sandboxEnabled = false;
     /**
@@ -319,11 +323,23 @@ export class CodexAppServerClient {
         sandboxConfig?: SandboxConfig,
         beforeTurn?: () => Promise<CheckpointTurnPreparation | void>,
         completeTurn?: CheckpointSessionComposition['completeTurn'],
+        /** 생략하면 개인 머신(owner-choice)으로 본다 — sandbox/sandboxPolicy.ts */
+        sandboxPolicyMode: SandboxPolicyMode = 'owner-choice',
+        /**
+         * The provider configuration a managed Cloud run must use.
+         *
+         * Present only for a managed run, and then it is the whole story: the
+         * account-rotation proxy is not consulted, and the provider is not
+         * chosen from whatever is in the user's config file.
+         */
+        managedProviderArgs?: string[] | null,
         markTurnDispatched?: () => void,
     ) {
         this.sandboxConfig = sandboxConfig;
+        this.sandboxPolicyMode = sandboxPolicyMode;
         this.beforeTurn = beforeTurn;
         this.completeTurn = completeTurn;
+        this.managedProviderArgs = managedProviderArgs ?? null;
         this.markTurnDispatched = markTurnDispatched;
         this.protectedWriterTree = completeTurn ? new CheckpointWriterProcessTree() : null;
     }
@@ -412,6 +428,45 @@ export class CodexAppServerClient {
         const fields = this.pendingInactivityAbort;
         this.pendingInactivityAbort = null;
         return fields;
+    }
+
+    /**
+     * completedTurnIds exists to dedupe the SAME completion reported twice in
+     * quick succession (codex/event and v2 turn/completed racing for one
+     * turn, or a stray fallback timer firing after the authoritative signal
+     * already did — see emitOrDeferRawTurnCompletion/scheduleRawTurnCompletionFallback).
+     * It must not survive genuine NEW work starting: a mid-turn agentMessage
+     * can legitimately carry phase 'final_answer' (e.g. a clarifying
+     * question), which fires our idle-fallback task_complete while Codex has
+     * not actually finished. Codex then resumes the SAME provider turn — no
+     * fresh turn/started precedes it, since it never asked for a new turn —
+     * and with pendingTurnCompletion already null at that point, this
+     * resumed activity is the only signal available that the earlier
+     * completion was premature. Reopen the consumer lifecycle and forget the
+     * stale marker so the eventual authoritative completion is delivered as a
+     * balanced start/end pair instead of silently dropped. Otherwise the
+     * session receives no durable terminal marker for the resumed work
+     * (desktop-stuck-responding-state: a live client stayed "응답중" 24+
+     * minutes past the real end of work because of exactly this).
+     * Scoped to item/started (a new work item beginning) and its legacy
+     * exec_command_begin equivalent — never to item/completed or its legacy
+     * counterparts, so the same-tick dual-protocol completion race above
+     * stays untouched.
+     */
+    private reopenConsumerLifecycleOnResumedWork(turnId: string | null): void {
+        if (this.pendingTurnCompletion) return;
+        if (this.completedTurnIds.size === 0) return;
+        logger.debug('[CodexAppServer] New work started with no pending turn; reopening consumer lifecycle', {
+            turnIds: [...this.completedTurnIds],
+        });
+        this.completedTurnIds.clear();
+        if (turnId) {
+            this._turnId = turnId;
+        }
+        this.eventHandler?.({
+            type: 'task_started',
+            ...(turnId ? { turn_id: turnId } : {}),
+        });
     }
 
     private emitRawTurnCompletion(
@@ -621,6 +676,10 @@ export class CodexAppServerClient {
             return method.startsWith('item/');
         }
 
+        if (method === 'item/started') {
+            this.reopenConsumerLifecycleOnResumedWork(this.extractTurnId(params));
+        }
+
         if (method === 'item/started' && item.type === 'commandExecution') {
             const callId = typeof item.id === 'string' ? item.id : '';
             if (callId) {
@@ -741,9 +800,17 @@ export class CodexAppServerClient {
         for (const [key, value] of Object.entries(process.env)) {
             if (typeof value === 'string') env[key] = value;
         }
-        this.multiAuthProxy = await prepareCodexMultiAuthProxy(env);
-        if (this.multiAuthProxy) {
-            env = this.multiAuthProxy.env;
+        if (!this.managedProviderArgs) {
+            // Account rotation swaps in another account's proxy, its own
+            // client key and its own base URL. For a managed run that is a
+            // different payer and a provider outside the approval, so the
+            // rotation is not consulted at all rather than consulted and
+            // overridden — a consulted rotation has already started a proxy
+            // and picked an account.
+            this.multiAuthProxy = await prepareCodexMultiAuthProxy(env);
+            if (this.multiAuthProxy) {
+                env = this.multiAuthProxy.env;
+            }
         }
 
         let command = 'codex';
@@ -751,7 +818,7 @@ export class CodexAppServerClient {
             'app-server',
             '--listen',
             'stdio://',
-            ...(this.multiAuthProxy?.args ?? []),
+            ...(this.managedProviderArgs ?? this.multiAuthProxy?.args ?? []),
         ];
         this.sandboxEnabled = false;
         this.sandboxInitFailed = false;
@@ -759,7 +826,20 @@ export class CodexAppServerClient {
 
         if (this.sandboxConfig?.enabled && process.platform !== 'win32') {
             try {
-                this.sandboxCleanup = await initializeSandbox(this.sandboxConfig, process.cwd());
+                this.sandboxCleanup = await initializeSandbox(
+                    this.sandboxConfig,
+                    process.cwd(),
+                    this.sandboxPolicyMode,
+                );
+                if (resolveSandboxInitFailureAction(this.sandboxPolicyMode) === 'abort') {
+                    const capability = await verifySandboxExecutionCapability();
+                    if (!capability.ok) {
+                        throw new MandatorySandboxError(
+                            'capability-unavailable',
+                            describeSandboxCapabilityFailure(capability),
+                        );
+                    }
+                }
                 const wrapped = await wrapForMcpTransport('codex', args);
                 command = wrapped.command;
                 args = wrapped.args;
@@ -769,6 +849,13 @@ export class CodexAppServerClient {
                 this.sandboxCleanup = null;
                 this.sandboxInitFailed = true;
                 this.sandboxInitFailureReason = error instanceof Error ? error.message : String(error);
+                // 공유 머신에서는 턴을 기다리지 않는다 — 폴백한 네이티브 정책이
+                // workspace-write/danger-full-access 면 호스트 전체가 열린다.
+                if (resolveSandboxInitFailureAction(this.sandboxPolicyMode) === 'abort') {
+                    throw error instanceof MandatorySandboxError
+                        ? error
+                        : new MandatorySandboxError('init-failed', this.sandboxInitFailureReason);
+                }
                 if (this.beforeTurn) {
                     throw new Error(
                         'checkpoint protection sandbox initialization failed; refusing to start Codex. '
@@ -871,6 +958,58 @@ export class CodexAppServerClient {
             await this.disconnectInternal();
             throw error;
         }
+    }
+
+    /**
+     * Ends the app server's input and waits for it to leave on its own.
+     *
+     * `disconnectInternal` is a shutdown, not a flush: it does `stdin.end()`
+     * and then `SIGTERM` in the same `try`, with `SIGKILL` two seconds later,
+     * and never awaits the exit. A checkpoint that archives provider state
+     * cannot use it — a signalled process did not flush, and an unawaited one
+     * was not observed leaving at all.
+     *
+     * This sends **no signal**. It closes stdin and reports what the kernel
+     * then said, within a budget. A timeout is reported as a timeout: the
+     * caller decides whether to fall back to `disconnect()`, and that fallback
+     * is a kill, so it is never quiescence.
+     */
+    async endInputAndAwaitExit(budgetMs: number): Promise<{
+        exited: boolean;
+        code: number | null;
+        signal: string | null;
+    }> {
+        const proc = this.process;
+        // Nothing to end. Reported as not-exited rather than as a clean exit:
+        // "there was no process" is not "the process finished writing".
+        if (!proc) return { exited: false, code: null, signal: null };
+        /*
+         * Already gone. `process` is not cleared by the exit handler (the
+         * reconnect path needs it to tell a stale exit from a live one), so a
+         * provider that left before the stop arrived would otherwise be waited
+         * for again — for the whole budget — and then reported as never seen
+         * leaving. What the kernel said is already on the object.
+         */
+        if (typeof proc.exitCode === 'number' || typeof proc.signalCode === 'string') {
+            return { exited: true, code: proc.exitCode ?? null, signal: proc.signalCode ?? null };
+        }
+
+        const left = new Promise<{ code: number | null; signal: string | null } | null>((resolve) => {
+            proc.once('exit', (code, signal) => resolve({ code, signal }));
+            const deadline = setTimeout(() => resolve(null), budgetMs);
+            deadline.unref?.();
+        });
+
+        try {
+            // The only thing sent. No `kill`, in this method or after it.
+            proc.stdin?.end();
+        } catch {
+            return { exited: false, code: null, signal: null };
+        }
+
+        const outcome = await left;
+        if (!outcome) return { exited: false, code: null, signal: null };
+        return { exited: true, code: outcome.code, signal: outcome.signal };
     }
 
     private async disconnectInternal(opts?: {
@@ -2007,6 +2146,9 @@ export class CodexAppServerClient {
             const msg = params?.msg;
             if (msg) {
                 const turnId = msg.turn_id ?? msg.turnId ?? null;
+                if (msg.type === 'exec_command_begin') {
+                    this.reopenConsumerLifecycleOnResumedWork(turnId);
+                }
                 if (msg.type === 'task_started') {
                     if (!this.markPendingTurnStarted(turnId)) return;
                     if (turnId) {

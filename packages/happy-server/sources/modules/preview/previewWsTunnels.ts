@@ -25,7 +25,7 @@ export const PREVIEW_WS_DATA = 'preview-ws-data';
 export const PREVIEW_WS_CLOSE = 'preview-ws-close';
 export const PREVIEW_WS_DAEMON_GONE = 'preview-ws-daemon-gone';
 
-export interface PreviewWsDataMessage { tunnelId: string; dataB64: string }
+export interface PreviewWsDataMessage { tunnelId: string; dataB64: string; fromDaemonSocketId?: string }
 export interface PreviewWsCloseMessage { tunnelId: string }
 export interface PreviewWsDaemonGoneMessage { daemonSocketId: string }
 
@@ -34,19 +34,72 @@ export type BroadcastToReplicas = (event: string, payload: unknown) => void;
 
 interface PreviewTunnel {
     socket: NetSocket;
-    /** Daemon socket id; null until proxy-ws-open is acked. */
-    ownerSocketId: string | null;
+    /**
+     * specs/runtime-isolation-hardening (H3, P1) — the one daemon this tunnel
+     * belongs to, known from the moment it is created because tunnel ids are
+     * per candidate. Bytes from anyone else are not this tunnel's content.
+     */
+    daemonSocketId: string;
+    /**
+     * Whether this tunnel carries a runtime binding. A bound tunnel requires
+     * the sender on *every* frame, including one relayed by a peer replica
+     * running an older build: treating a missing sender as "compatible" would
+     * make the oldest replica in the cluster the way around the same-daemon
+     * pin. Unbound tunnels have no such claim to protect and keep working in
+     * a mixed-version cluster.
+     */
+    bound: boolean;
+    /**
+     * Bytes that arrived before the binding was approved. A daemon starts
+     * streaming the upstream's 101 and its first frames as soon as it
+     * connects, which can beat its own ack to us — writing those through
+     * would mean a tunnel we are about to refuse had already delivered
+     * content.
+     */
+    pending: Buffer[] | null;
+    pendingBytes: number;
 }
+
+/**
+ * How much unapproved data one tunnel may hold. Enough for a handshake and
+ * the first frames; past that a daemon is either broken or spending our
+ * memory, and the tunnel fails closed rather than growing.
+ */
+const MAX_PENDING_BYTES = 512 * 1024;
 
 const tunnels = new Map<string, PreviewTunnel>();
 
-export function addTunnel(tunnelId: string, socket: NetSocket): void {
-    tunnels.set(tunnelId, { socket, ownerSocketId: null });
+export function addTunnel(
+    tunnelId: string,
+    socket: NetSocket,
+    daemonSocketId: string,
+    bound = false,
+): void {
+    tunnels.set(tunnelId, {
+        socket,
+        daemonSocketId,
+        bound,
+        pending: [],
+        pendingBytes: 0,
+    });
 }
 
-export function setTunnelOwner(tunnelId: string, ownerSocketId: string): void {
+/**
+ * Open the gate for a tunnel whose binding the daemon confirmed, flushing
+ * whatever arrived while it was closed. Returns false when the tunnel is gone
+ * (browser left, open refused) or the approval came from a daemon this tunnel
+ * was not opened with — in both cases nothing is delivered.
+ */
+export function approveTunnel(tunnelId: string, daemonSocketId: string): boolean {
     const tunnel = tunnels.get(tunnelId);
-    if (tunnel) tunnel.ownerSocketId = ownerSocketId;
+    if (!tunnel || tunnel.daemonSocketId !== daemonSocketId) return false;
+    const pending = tunnel.pending;
+    tunnel.pending = null;
+    tunnel.pendingBytes = 0;
+    if (pending && tunnel.socket.writable) {
+        for (const chunk of pending) tunnel.socket.write(chunk);
+    }
+    return true;
 }
 
 export function hasTunnel(tunnelId: string): boolean {
@@ -62,9 +115,10 @@ export function deliverDaemonData(
     tunnelId: string,
     dataB64: string,
     broadcast: BroadcastToReplicas,
+    fromDaemonSocketId: string,
 ): void {
-    if (writeLocal(tunnelId, dataB64)) return;
-    broadcast(PREVIEW_WS_DATA, { tunnelId, dataB64 } satisfies PreviewWsDataMessage);
+    if (writeLocal(tunnelId, dataB64, fromDaemonSocketId)) return;
+    broadcast(PREVIEW_WS_DATA, { tunnelId, dataB64, fromDaemonSocketId } satisfies PreviewWsDataMessage);
 }
 
 /** Daemon → browser close. Closes locally, or hands off to the owning replica. */
@@ -75,7 +129,7 @@ export function deliverDaemonClose(tunnelId: string, broadcast: BroadcastToRepli
 
 /** Bytes forwarded from a peer replica. No-op unless this replica owns the tunnel. */
 export function applyRemoteData(message: PreviewWsDataMessage): void {
-    writeLocal(message?.tunnelId, message?.dataB64);
+    writeLocal(message?.tunnelId, message?.dataB64, message?.fromDaemonSocketId);
 }
 
 /** Close forwarded from a peer replica. No-op unless this replica owns the tunnel. */
@@ -85,13 +139,16 @@ export function applyRemoteClose(message: PreviewWsCloseMessage): void {
 
 /**
  * Tears down the tunnels this replica holds for a daemon socket that has gone
- * away. Tunnels still opening (no owner yet) are left alone — their owner is
- * not known to be this daemon.
+ * away, including the ones still waiting on that daemon's ack. Tunnels opened
+ * for a *different* candidate are left alone.
  */
 export function dropTunnelsOwnedBy(daemonSocketId: string): string[] {
     const dropped: string[] = [];
     for (const [tunnelId, tunnel] of tunnels) {
-        if (tunnel.ownerSocketId !== daemonSocketId) continue;
+        // The candidate is known at registration, so a tunnel still waiting
+        // on this daemon's ack is just as dead as an approved one — and it is
+        // holding a browser socket.
+        if (tunnel.daemonSocketId !== daemonSocketId) continue;
         try { tunnel.socket.destroy(); } catch { /* already gone */ }
         tunnels.delete(tunnelId);
         dropped.push(tunnelId);
@@ -99,13 +156,37 @@ export function dropTunnelsOwnedBy(daemonSocketId: string): string[] {
     return dropped;
 }
 
-function writeLocal(tunnelId: string | undefined, dataB64: string | undefined): boolean {
+function writeLocal(
+    tunnelId: string | undefined,
+    dataB64: string | undefined,
+    fromDaemonSocketId: string | undefined,
+): boolean {
     const tunnel = tunnelId ? tunnels.get(tunnelId) : undefined;
     if (!tunnel) return false;
+    // Handled here either way: this replica owns the tunnel, so no peer has
+    // it and a broadcast could only make another replica guess.
+    if (tunnel.bound
+        ? fromDaemonSocketId !== tunnel.daemonSocketId
+        : fromDaemonSocketId !== undefined && fromDaemonSocketId !== tunnel.daemonSocketId) {
+        return true;
+    }
     // Owned here, but the socket is already going away: still "handled" — a
     // broadcast would not help, no other replica has this tunnel.
     if (!tunnel.socket.writable) return true;
-    tunnel.socket.write(Buffer.from(dataB64 ?? '', 'base64'));
+
+    const chunk = Buffer.from(dataB64 ?? '', 'base64');
+    if (tunnel.pending) {
+        tunnel.pendingBytes += chunk.byteLength;
+        if (tunnel.pendingBytes > MAX_PENDING_BYTES) {
+            // Fail closed: an unapproved tunnel does not get to grow.
+            tunnels.delete(tunnelId!);
+            try { tunnel.socket.destroy(); } catch { /* already gone */ }
+            return true;
+        }
+        tunnel.pending.push(chunk);
+        return true;
+    }
+    tunnel.socket.write(chunk);
     return true;
 }
 

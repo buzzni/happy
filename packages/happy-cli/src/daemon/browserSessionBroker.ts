@@ -2,13 +2,48 @@ import { appendFile, mkdir, open, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { BrowserSessionBrokerLease } from './browserSessionBrokerContract'
 
+type RuntimeState = {
+    webPort: number
+    profileVolume: string
+    /** Present only when the runtime could prove the container just now. */
+    runtimeFingerprint?: string
+}
+
 type Runtime = {
-    ensure(viewerKey: string, bridgeToken: string): Promise<{ webPort: number; profileVolume: string }>
-    lookup(viewerKey: string): Promise<{ webPort: number; profileVolume: string } | null>
+    ensure(viewerKey: string, bridgeToken: string): Promise<RuntimeState>
+    lookup(viewerKey: string): Promise<RuntimeState | null>
     stop(viewerKey: string): Promise<boolean>
     listManaged(): Promise<Array<{ viewerKey: string }>>
     migrateLegacyProfile(viewerKey: string, legacyProfileDir: string): Promise<void>
     profileBytes(viewerKey: string): Promise<number>
+}
+
+/**
+ * A lease refreshed from a runtime reading. `runtimeFingerprint` is rebuilt
+ * from that reading alone — never inherited from the cached lease — so
+ * "verified now" can never decay into "was verified once". A restarted or
+ * replaced container that the broker can no longer prove leaves the field
+ * absent, which is what makes the daemon refuse the stale token.
+ */
+function refreshedLease(
+    lease: BrowserSessionBrokerLease,
+    runtime: RuntimeState,
+    lastUsedAt: number,
+): BrowserSessionBrokerLease {
+    const { runtimeFingerprint: _stale, ...rest } = lease
+    return {
+        ...rest,
+        webPort: runtime.webPort,
+        profileVolume: runtime.profileVolume,
+        lastUsedAt,
+        ...(runtime.runtimeFingerprint ? { runtimeFingerprint: runtime.runtimeFingerprint } : {}),
+    }
+}
+
+/** Activity-only touch: nothing was re-verified, so nothing may be claimed. */
+function touchedLease(lease: BrowserSessionBrokerLease, lastUsedAt: number): BrowserSessionBrokerLease {
+    const { runtimeFingerprint: _stale, ...rest } = lease
+    return { ...rest, lastUsedAt }
 }
 
 export class BrowserSessionBroker {
@@ -43,7 +78,7 @@ export class BrowserSessionBroker {
         if (current) {
             const runtime = await this.options.runtime.lookup(viewerKey)
             if (runtime) {
-                const touched = { ...current, ...runtime, lastUsedAt: this.now() }
+                const touched = refreshedLease(current, runtime, this.now())
                 this.leases.set(viewerKey, touched)
                 return touched
             }
@@ -73,7 +108,7 @@ export class BrowserSessionBroker {
             this.leases.delete(viewerKey)
             return null
         }
-        const touched = { ...lease, ...runtime, lastUsedAt: this.now() }
+        const touched = refreshedLease(lease, runtime, this.now())
         this.leases.set(viewerKey, touched)
         return touched
     }
@@ -81,7 +116,7 @@ export class BrowserSessionBroker {
     async touch(viewerKey: string): Promise<BrowserSessionBrokerLease | null> {
         const lease = this.leases.get(viewerKey)
         if (!lease) return null
-        const touched = { ...lease, lastUsedAt: this.now() }
+        const touched = touchedLease(lease, this.now())
         this.leases.set(viewerKey, touched)
         return touched
     }
@@ -203,6 +238,7 @@ export class BrowserSessionBroker {
                 ready: true,
                 lastUsedAt: this.now(),
                 isolation: 'container',
+                ...(runtime.runtimeFingerprint ? { runtimeFingerprint: runtime.runtimeFingerprint } : {}),
             }
             this.leases.set(viewerKey, lease)
             this.starts += 1

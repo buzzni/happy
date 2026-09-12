@@ -112,7 +112,7 @@ export async function syncAutomations(
                 revision: { gte: change.revision },
             },
         });
-        if (!automation) {
+        if (!automation || automation.payloadVersion === 3) {
             changes.push({ seq: change.seq, automationId: change.automationId, revision: change.revision, generation: change.generation, kind: 'TOMBSTONE' });
             continue;
         }
@@ -168,6 +168,7 @@ export async function ackAutomationSync(
 
 function executable(automation: any, accountId: string, machineId: string, generation: number): boolean {
     return automation
+        && automation.payloadVersion !== 3
         && automation.machineAccountId === accountId
         && automation.machineId === machineId
         && automation.generation === generation

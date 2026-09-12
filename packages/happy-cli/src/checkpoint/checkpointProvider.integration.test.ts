@@ -80,6 +80,9 @@ describe.skipIf((process.platform !== 'darwin' && process.platform !== 'linux') 
                 composition.sandboxConfig,
                 composition.beforeTurn,
                 composition.completeTurn,
+                undefined,
+                undefined,
+                composition.markTurnDispatched,
             );
             client.setEventHandler((event) => {
                 events.push({

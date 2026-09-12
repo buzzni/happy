@@ -1,0 +1,39 @@
+#!/bin/sh
+# The activation gate's payload: a fixed, root-owned program that reports what
+# the machine actually gave it.
+#
+# It is a **fixed** command on purpose. The gate runs it through the real
+# `executorHelper`, so whatever it reports is what a tool call would get — but
+# only if nothing outside can choose what runs. It lives in the trusted
+# directory the helper is willing to exec, is `0555 root`, and takes no
+# arguments: there is no input to steer it with.
+#
+# It reports and exits. It does not decide — the caller compares what came back
+# against what the marker declared, and a probe that judged itself would be a
+# probe that could be satisfied by editing this file.
+#
+# Descriptor 5 is the report channel, opened by the caller and inherited
+# through the helper. stdout is not used: it is shared with the helper's own
+# ACK protocol.
+exec 1>&2
+{
+    echo "uid=$(id -u)"
+    echo "gid=$(id -g)"
+    echo "cgroup=$(cat /proc/self/cgroup 2>/dev/null | head -1)"
+    # In a PID namespace this process is 1. Outside one it is not.
+    echo "pid=$$"
+    # Asked over netlink, not from `/sys/class/net`.
+    #
+    # sysfs shows the interfaces of the network namespace its mount was created
+    # in. The helper unshares the mount and network namespaces but does not
+    # remount `/sys`, so that directory keeps listing the *old* namespace's
+    # interfaces — a probe reading it would report `eth0` for a correctly
+    # isolated tool, and would equally miss a namespace that never applied.
+    # `ip` goes to the kernel for the current namespace.
+    echo "ifaces=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | tr '\n' ',')"
+    # The namespace's own identity, so the caller can see it is not the host's.
+    echo "netns=$(readlink /proc/self/ns/net 2>/dev/null)"
+    # A fresh mount namespace still shows /proc; what matters is that the
+    # unshare happened at all, which the pid and ifaces above already show.
+    echo "ok=1"
+} >&5
