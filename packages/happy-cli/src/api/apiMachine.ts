@@ -1,3 +1,4 @@
+import { createWorktreeReclaimHandler } from '@/daemon/worktreeDependencyReclaimRpc';
 /**
  * WebSocket client for machine/daemon communication with Happy server
  * Similar to ApiSessionClient but for machine-scoped connections
@@ -720,6 +721,9 @@ export class ApiMachineClient {
         const allowedRoot = resolveDaemonAllowedRoot(process.env, homedir());
         this.allowedRoot = allowedRoot;
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot);
+        this.rpcHandlerManager.registerHandler(
+            'worktree-dependencies:reclaim', createWorktreeReclaimHandler(allowedRoot),
+        );
         this.rpcHandlerManager.registerHandler(
             'claude-session-transfer',
             createClaudeSessionTransferHandler({ allowedRoot }),
