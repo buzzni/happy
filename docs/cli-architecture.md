@@ -379,3 +379,24 @@ This mechanism allows the server and mobile clients to drive local actions witho
 - API clients: `packages/happy-cli/src/api`
 - Persistence: `packages/happy-cli/src/persistence.ts`
 - Config: `packages/happy-cli/src/configuration.ts`
+
+## Worktree dependency pressure reclaim
+
+The authenticated machine RPC `worktree-dependencies:reclaim` accepts `{ path }` within
+that daemon's allowed workspace root. Its process-wide queue coalesces canonical
+primary-repository requests and serializes deletion across repositories, including
+reconnected machine clients. `src/daemon/worktreeDependencyReclaim.ts` owns the filesystem
+safety checks; `worktreeDependencyReclaimRpc.ts` owns request validation and scheduling.
+
+Storage below `min(10%, 40GiB)` triggers reclaim, stopping at `min(15%, 60GiB)`.
+Only registered `.aplus/worktrees` descendants' ignored `node_modules` are eligible.
+Oldest-first execution handles >=7 day idle dependencies before the >=24 hour fallback.
+Lock, cwd, symlink, registration, idle activity, nearest Git-root ignore and force-tracked
+file checks are repeated immediately before deletion. Failed process inventory stops
+reclaim; normal-capacity calls do not enumerate Git or scan processes/directories.
+Source, branches and local edits are retained. The response separates diagnostic `du`
+bytes from before/after physical free space because APFS clones and pnpm hardlinks do
+not release independent blocks. This RPC is available from candidate .206 only after
+publication; Desktop scheduling is a separate consumer rollout. It does not install a
+background timer by itself. Revisit ownership if another privileged service takes over
+machine filesystem lifecycle; revert by removing the consumer calls before removing RPC.

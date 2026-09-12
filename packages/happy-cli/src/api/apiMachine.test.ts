@@ -143,6 +143,13 @@ describe('ApiMachineClient socket reconnection', () => {
         }
     });
 
+    it('registers dependency reclaim on the authenticated machine RPC surface', () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        expect((client as any).rpcHandlerManager.registerHandler).toHaveBeenCalledWith(
+            'worktree-dependencies:reclaim', expect.any(Function),
+        );
+    });
+
     it('registers the machine-scoped Claude session transfer RPC', () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         const manager = (client as any).rpcHandlerManager;
