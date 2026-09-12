@@ -146,7 +146,6 @@ export async function runCodex(opts: {
     resumeThreadId?: string;
     permissionMode?: PermissionMode;
 }): Promise<void> {
-    const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
     // Shield killall/pkill against broad kills before anything is spawned —
     // Codex has no PreToolUse hook system, so the PATH shim is its only guard.
     const managedStartup = opts.principal?.kind === 'managed' ? opts.principal.startup : null;
@@ -166,6 +165,7 @@ export async function runCodex(opts: {
         applyManagedInitialPrompt(process.env, managedStartup.envelope);
     }
 
+    const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
     installBroadKillShims();
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
     const reconnectSession = readReconnectSessionEnvironment(process.env);

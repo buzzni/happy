@@ -395,6 +395,7 @@ describe('runCodex itself, for a managed child', () => {
             deactivateSession: vi.fn(async () => {}),
         } as never);
         mockAwaitMessageAck.mockResolvedValue({ ok: true });
+        vi.stubEnv('HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE', '/foreign-session/continuation.txt');
         vi.stubEnv('HAPPY_FORK_CODEX_THREAD_ID', 'thread-somebody-else');
         vi.stubEnv('HAPPY_RECONNECT_SESSION_ID', 'sess-somebody-else');
 
