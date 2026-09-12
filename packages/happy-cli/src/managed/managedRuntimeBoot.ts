@@ -603,6 +603,19 @@ export async function runManagedRuntimeBoot(
          * here with nothing delivered; what happens next is decided by the daemon
          * when it reads the state directory, which is where that decision belongs.
          */
+        /*
+         * The directory adoption writes into, made first. Nothing in the image
+         * creates it — the path is a marker field the image cannot vouch for —
+         * and on a first boot it does not exist, so the delivery would be
+         * refused as unwritable. Root makes it here, owner-only, the same way
+         * the launcher directory below is made.
+         */
+        try {
+            await deps.makeTrustedDirectory(stateDir, 0o700);
+        } catch {
+            return { ok: false, reason: 'trusted-directory-unavailable' };
+        }
+
         let adoption: ManagedCredentialAdoption;
         try {
             adoption = await deps.adoptCredential({

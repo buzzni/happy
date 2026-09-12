@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, lstatSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import * as launcherMain from '@/launcher/main';
 import * as managedRunConfig from '@/launcher/managedRunConfig';
 import * as runtimeCheckpointing from '@/managed/checkpoint/managedRuntimeCheckpointing';
@@ -280,11 +280,15 @@ describe('the root boot stage of a managed runtime', () => {
          */
         expect(log.map((entry) => entry.event))
             .toEqual([
-                'directory', 'daemon-leaf', 'supervisor', 'workspace', 'provider-home',
+                // The state directory first — adoption writes into it — then
+                // the launcher directory under it.
+                'directory', 'directory', 'daemon-leaf', 'supervisor', 'workspace', 'provider-home',
                 // Made as root, because nothing after this can: the daemon
                 // runs next and the provider uid owns nothing in `/workspace`.
                 'auth-home-root', 'attestation',
             ]);
+        expect(log.slice(0, 2).map((entry) => entry.detail))
+            .toEqual([stateDir, dirname(managedLauncherSocketPath(stateDir))]);
         // And the record the daemon will read is really there, readable through
         // the same trust rules the daemon applies.
         expect(readManagedLauncherBinding({ stateDir, deps: provisioning() })).toEqual({
@@ -574,6 +578,29 @@ describe('the root boot stage of a managed runtime', () => {
         const { deps } = bootDeps();
         await runManagedRuntimeBoot(deps);
         expect(Object.values(process.env).some((value) => value === TOKEN)).toBe(false);
+    });
+});
+
+describe('the state directory, before the credential is adopted into it', () => {
+    /*
+     * Nothing in the image creates it: the state directory is a marker field,
+     * and the image cannot vouch for a path it does not know. Adoption writes
+     * the credential into it, so on a first boot the directory has to be made
+     * first — by root, here — or every delivery is refused as unwritable.
+     */
+    it('creates the state directory before adopting the credential', async () => {
+        const order: string[] = [];
+        const { deps } = bootDeps({
+            makeTrustedDirectory: async (path: string, mode: number) => {
+                order.push(`directory:${path}:${mode.toString(8)}`);
+                await mkdir(path, { recursive: true, mode });
+            },
+            adoptCredential: async () => { order.push('adopt'); return { status: 'absent' as const }; },
+        });
+        await runManagedRuntimeBoot(deps);
+        const made = order.indexOf(`directory:${stateDir}:700`);
+        expect(made).toBeGreaterThanOrEqual(0);
+        expect(made).toBeLessThan(order.indexOf('adopt'));
     });
 });
 
