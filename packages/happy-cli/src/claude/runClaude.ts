@@ -569,17 +569,21 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // HAPPY_INITIAL_EFFORT, e.g. automations). Consumed exactly once — read
     // then deleted so children never inherit — and treated like a CLI option:
     // it also survives the post-abort reset. Invalid effort values are ignored.
-    const initialModelSeed = normalizeClaudeModelForRuntime(
-        consumePendingInitialModel(process.env) ?? options.model ?? DEFAULT_CLAUDE_MODEL,
+    // Split out what the user actually asked for from the runtime fallback, so
+    // callers can tell "no model was chosen" apart from "the default is opus".
+    const explicitInitialModel = normalizeClaudeModelForRuntime(
+        consumePendingInitialModel(process.env) ?? options.model,
         process.env,
-    ) ?? DEFAULT_CLAUDE_MODEL;
+    );
+    const initialModelSeed = explicitInitialModel ?? DEFAULT_CLAUDE_MODEL;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env);
     if (rawInitialEffortSeed && !VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)) {
         logger.debug(`[START] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
     }
-    const initialEffortSeed = rawInitialEffortSeed && VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)
+    const explicitInitialEffort = rawInitialEffortSeed && VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)
         ? rawInitialEffortSeed as 'low' | 'medium' | 'high' | 'xhigh' | 'max'
-        : DEFAULT_CLAUDE_EFFORT;
+        : undefined;
+    const initialEffortSeed = explicitInitialEffort ?? DEFAULT_CLAUDE_EFFORT;
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );

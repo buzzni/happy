@@ -323,14 +323,18 @@ export async function runCodex(opts: {
     // HAPPY_INITIAL_EFFORT, e.g. automations). Consumed exactly once — read
     // then deleted so children never inherit. Effort is whitelisted against
     // ReasoningEffort; anything else falls back to the default.
-    const initialModelSeed = consumePendingInitialModel(process.env) ?? DEFAULT_CODEX_MODEL;
+    // Split out what the user actually asked for from the runtime fallback, so
+    // callers can tell "no model was chosen" apart from "the default model".
+    const explicitInitialModel = consumePendingInitialModel(process.env);
+    const initialModelSeed = explicitInitialModel ?? DEFAULT_CODEX_MODEL;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env);
     if (rawInitialEffortSeed && !isSupportedCodexReasoningEffort(rawInitialEffortSeed)) {
         logger.debug(`[Codex] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
     }
-    const initialEffortSeed = isSupportedCodexReasoningEffort(rawInitialEffortSeed)
+    const explicitInitialEffort = isSupportedCodexReasoningEffort(rawInitialEffortSeed)
         ? rawInitialEffortSeed
-        : DEFAULT_CODEX_EFFORT;
+        : undefined;
+    const initialEffortSeed = explicitInitialEffort ?? DEFAULT_CODEX_EFFORT;
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
