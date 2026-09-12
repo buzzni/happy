@@ -606,7 +606,7 @@ describe('the delivered credential\'s mode, before anything reads it', () => {
             narrowDeliveredCredential: () => 'refused' as const,
         });
         expect(await runManagedRuntimeBoot(deps))
-            .toEqual({ ok: false, reason: 'credential-unusable' });
+            .toEqual({ ok: false, reason: 'credential-unusable', detail: 'delivered-file-mode' });
         expect(log.some((entry) => entry.event === 'supervisor')).toBe(false);
     });
 
@@ -755,7 +755,7 @@ describe('producing the marker the rest of the boot reads', () => {
             readDeliveredMachineId: () => ({ status: 'refused' as const }),
         });
         expect(await runManagedRuntimeBoot(deps))
-            .toEqual({ ok: false, reason: 'credential-unusable' });
+            .toEqual({ ok: false, reason: 'credential-unusable', detail: 'delivered-file-unreadable' });
         expect(log.some((entry) => entry.event === 'supervisor')).toBe(false);
     });
 
@@ -825,7 +825,7 @@ describe('the identity handoff, in the boot stage', () => {
             adoptCredential: async () => ({ status: 'refused' as const, reason: 'machine-conflict' as const }),
         });
         expect(await runManagedRuntimeBoot(deps))
-            .toEqual({ ok: false, reason: 'credential-unusable' });
+            .toEqual({ ok: false, reason: 'credential-unusable', detail: 'adoption-machine-conflict' });
         // Nothing started, nothing published: the refusal is inert.
         expect(log.some((entry) => entry.event === 'supervisor')).toBe(false);
     });
@@ -835,7 +835,7 @@ describe('the identity handoff, in the boot stage', () => {
             adoptCredential: async () => { throw new Error('cannot read /etc/saycode'); },
         });
         expect(await runManagedRuntimeBoot(deps))
-            .toEqual({ ok: false, reason: 'credential-unusable' });
+            .toEqual({ ok: false, reason: 'credential-unusable', detail: 'adoption-threw' });
     });
 
     it('boots on when nothing was delivered', async () => {
@@ -954,7 +954,7 @@ describe('which Happy the runtime may talk to', () => {
          */
         const { deps } = bootDeps({ readTrustedServerOrigin: () => null });
         expect(await runManagedRuntimeBoot(deps))
-            .toEqual({ ok: false, reason: 'credential-unusable' });
+            .toEqual({ ok: false, reason: 'credential-unusable', detail: 'stored-origin-unreadable' });
     });
 
     it('hands the stored origin to the supervisor, which is what reaches the child', async () => {

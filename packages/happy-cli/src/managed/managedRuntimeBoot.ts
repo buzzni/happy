@@ -507,10 +507,14 @@ export async function runManagedRuntimeBoot(
      * mode rewritten.
      */
     const narrowed = deps.narrowDeliveredCredential();
-    if (narrowed === 'refused') return { ok: false, reason: 'credential-unusable' };
+    if (narrowed === 'refused') {
+        return { ok: false, reason: 'credential-unusable', detail: 'delivered-file-mode' };
+    }
 
     const delivered = deps.readDeliveredMachineId({ deps: provisioning });
-    if (delivered.status === 'refused') return { ok: false, reason: 'credential-unusable' };
+    if (delivered.status === 'refused') {
+        return { ok: false, reason: 'credential-unusable', detail: 'delivered-file-unreadable' };
+    }
     if (delivered.status === 'ok') {
         const written = await deps.writeMarker({
             instance: deps.providerInstance(),
@@ -609,9 +613,12 @@ export async function runManagedRuntimeBoot(
             });
         } catch {
             // Never the error: it can carry the delivered file's contents.
-            return { ok: false, reason: 'credential-unusable' };
+            return { ok: false, reason: 'credential-unusable', detail: 'adoption-threw' };
         }
-        if (adoption.status === 'refused') return { ok: false, reason: 'credential-unusable' };
+        if (adoption.status === 'refused') {
+            // A closed code, never the file: it names which rule refused.
+            return { ok: false, reason: 'credential-unusable', detail: `adoption-${adoption.reason}` };
+        }
 
         /*
          * **Which Happy this runtime talks to, from the credential that is on disk.**
@@ -632,7 +639,9 @@ export async function runManagedRuntimeBoot(
             now: Date.now(),
             deps: provisioning,
         });
-        if (trustedServerOrigin === null) return { ok: false, reason: 'credential-unusable' };
+        if (trustedServerOrigin === null) {
+            return { ok: false, reason: 'credential-unusable', detail: 'stored-origin-unreadable' };
+        }
 
         try {
             await deps.makeTrustedDirectory(managedLauncherDirectory(stateDir), 0o700);
