@@ -13,10 +13,62 @@
 
 import crypto from 'node:crypto';
 
+/**
+ * specs/runtime-isolation-hardening (H3) — the runtime binding a token is
+ * good for. `userId` above is the *happy account* that owns the machine and
+ * is only used to find the daemon socket; a company-owned shared machine
+ * mints every member's token under the same account. `studioUserId` is the
+ * studio identity that actually asked, and `projectId`/`leaseId` pin the
+ * token to one project's currently-running dev server. They are deliberately
+ * separate claims — treating the happy account as the studio user is what let
+ * any holder of a company happy token reach any project on the machine.
+ */
+export interface PreviewProjectBinding {
+    projectId: string;
+    studioUserId: string;
+    /** Daemon-computed digest of the runtime actually listening on `port`. */
+    leaseId: string;
+}
+
+/**
+ * specs/runtime-isolation-hardening (H3 viewer purpose) — the machine's remote
+ * browser screen. It has no project by design; what it is bound to is one
+ * user's viewer runtime on one machine.
+ *
+ * `viewerKey` is derived by the studio from its own secret plus the machine
+ * and the *authenticated* user — never accepted from the browser, never
+ * inferred from the port. The daemon looks the lease up **by this key** and
+ * then proves the port is that lease's runtime; looking it up by port first
+ * would hand user A the viewer of user B on a machine both may reach, which
+ * the machine ACL alone cannot prevent.
+ */
+export interface PreviewViewerBinding {
+    purpose: 'viewer';
+    studioUserId: string;
+    viewerKey: string;
+    /** Daemon-computed digest of the viewer runtime actually serving `port`. */
+    leaseId: string;
+}
+
+export type PreviewTokenBinding = PreviewProjectBinding | PreviewViewerBinding;
+
+export function isViewerBinding(bind: PreviewTokenBinding): bind is PreviewViewerBinding {
+    return (bind as PreviewViewerBinding).purpose === 'viewer';
+}
+
+/** Same shape the studio derives and the daemon registry validates. */
+const VIEWER_KEY_PATTERN = /^bv1_[A-Za-z0-9_-]{32}$/;
+
+export function isViewerKeyShape(value: unknown): value is string {
+    return typeof value === 'string' && VIEWER_KEY_PATTERN.test(value);
+}
+
 export interface PreviewTokenPayload {
     userId: string;
     machineId: string;
     port: number;
+    /** Absent on legacy (unbound) tokens — see PREVIEW_RUNTIME_BINDING_POLICY. */
+    bind?: PreviewTokenBinding;
 }
 
 export interface VerifiedPreviewToken extends PreviewTokenPayload {
@@ -48,6 +100,48 @@ interface EncodedPayload extends PreviewTokenPayload {
     exp: number;
 }
 
+/**
+ * Strictly disjoint: a binding is read as exactly one variant or not at all.
+ *
+ * `purpose` absent is the project variant — that is the encoding every token
+ * already in circulation uses, so it keeps working unchanged. `'viewer'` is
+ * the viewer variant. **Everything else is a hard failure**, including the
+ * literal `'project'`: a second way to spell the same claim is a second thing
+ * to keep in step, and nothing mints it.
+ *
+ * A variant carrying the other variant's fields is refused too. Accepting a
+ * mixed claim would let one token be read as a project binding on one code
+ * path and a viewer binding on another, which is precisely the confusion
+ * purpose-binding exists to remove.
+ */
+function decodeBinding(raw: unknown): PreviewTokenBinding | null {
+    if (!raw || typeof raw !== 'object') return null;
+    const candidate = raw as Record<string, unknown>;
+    const nonEmpty = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
+
+    if (!nonEmpty(candidate.studioUserId) || !nonEmpty(candidate.leaseId)) return null;
+
+    if (candidate.purpose === 'viewer') {
+        if (candidate.projectId !== undefined) return null;
+        if (!isViewerKeyShape(candidate.viewerKey)) return null;
+        return {
+            purpose: 'viewer',
+            studioUserId: candidate.studioUserId,
+            viewerKey: candidate.viewerKey,
+            leaseId: candidate.leaseId,
+        };
+    }
+
+    if (candidate.purpose !== undefined) return null;
+    if (candidate.viewerKey !== undefined) return null;
+    if (!nonEmpty(candidate.projectId)) return null;
+    return {
+        projectId: candidate.projectId,
+        studioUserId: candidate.studioUserId,
+        leaseId: candidate.leaseId,
+    };
+}
+
 function getSecret(override?: string): string {
     const secret = override ?? process.env.HANDY_MASTER_SECRET;
     if (!secret) {
@@ -76,7 +170,15 @@ function decodePayload(encoded: string): EncodedPayload | null {
             Number.isInteger(parsed.port) &&
             Number.isInteger(parsed.exp)
         ) {
-            return parsed as EncodedPayload;
+            if (parsed.bind === undefined) {
+                return parsed as EncodedPayload;
+            }
+            const bind = decodeBinding(parsed.bind);
+            // A bind claim we cannot read is a hard failure, never a fallback
+            // to "unbound": silently dropping it would downgrade a bound token
+            // into one the relay stops enforcing.
+            if (!bind) return null;
+            return { ...(parsed as EncodedPayload), bind };
         }
         return null;
     } catch {
@@ -100,6 +202,32 @@ export function signPreviewToken(
 export function verifyPreviewToken(
     token: string,
     options: PreviewTokenOptions = {},
+): VerifiedPreviewToken | null {
+    return readPreviewToken(token, options, { allowExpired: false });
+}
+
+/**
+ * specs/runtime-isolation-hardening (H3, P4) — read the token a re-mint is
+ * replacing, expiry included.
+ *
+ * Recovery needs to know what the previous token was bound to, and by the
+ * time the page re-mints that token is usually expired. This is deliberately
+ * a separate function rather than a flag on `verifyPreviewToken`: nothing on
+ * a request path can reach it by passing an option, and the signature is
+ * still required, so an expired token describes the session being replaced
+ * without ever authorizing anything.
+ */
+export function verifyExpiredPreviewTokenForRecovery(
+    token: string,
+    options: PreviewTokenOptions = {},
+): VerifiedPreviewToken | null {
+    return readPreviewToken(token, options, { allowExpired: true });
+}
+
+function readPreviewToken(
+    token: string,
+    options: PreviewTokenOptions,
+    mode: { allowExpired: boolean },
 ): VerifiedPreviewToken | null {
     const secret = getSecret(options.secret);
 
@@ -126,7 +254,7 @@ export function verifyPreviewToken(
     if (!payload) {
         return null;
     }
-    if (payload.exp <= Date.now()) {
+    if (!mode.allowExpired && payload.exp <= Date.now()) {
         return null;
     }
 
@@ -135,5 +263,6 @@ export function verifyPreviewToken(
         machineId: payload.machineId,
         port: payload.port,
         exp: payload.exp,
+        ...(payload.bind ? { bind: payload.bind } : {}),
     };
 }

@@ -242,7 +242,8 @@ export function rewriteHtml(html: string, prefix: string): string {
         baseHref +
         buildInterceptorScript(prefix) +
         buildInspectorBridgeScript() +
-        buildCaptureBridgeScript();
+        buildCaptureBridgeScript() +
+        buildActivityBridgeScript();
     if (out.includes('<head>')) {
         out = out.replace('<head>', `<head>${headInjection}`);
     } else if (out.includes('<html>')) {
@@ -511,6 +512,43 @@ function buildInspectorBridgeScript(): string {
         `});` +
         `document.addEventListener('mousemove',onMove,true);` +
         `document.addEventListener('click',onClick,true);` +
+        `})()</script>`
+    );
+}
+
+/**
+ * Activity bridge — 미리보기 문서 안의 실제 사용자 조작을 부모(studio)로 릴레이한다.
+ * specs/fly-machine-idle-lifecycle AC1 (aplus-dev-studio, Astra medium 리뷰 #2).
+ *
+ * cross-origin relay 에서는 studio 가 iframe 의 contentDocument 에 접근할 수 없어
+ * 안에서 일어나는 클릭·타이핑·스크롤을 전혀 볼 수 없다. 부모가 관측 가능한 유일한
+ * 신호는 포커스가 프레임으로 들어가는 **한 번**뿐이라, 미리보기를 한 시간 넘게 실제로
+ * 조작하는 사용자의 체험 머신이 유휴로 판정돼 정지됐다. inspector/capture bridge 와
+ * 같은 방식으로 여기서 박아 준다.
+ *
+ * 타이머가 아니라 이벤트다 — 조작이 없으면 아무것도 보내지 않는다(heartbeat 금지).
+ * 문서 안에서 60초로 접고, 신호에는 아무 데이터도 담지 않는다. 부모가 source/origin 을
+ * 검증한다.
+ *
+ * 본문은 studio 측 src/lib/previewActivityBridgeScript.ts 의
+ * PREVIEW_ACTIVITY_BRIDGE_SCRIPT 와 동기화 유지 필요 — drift 시 두 측 모두 일관 갱신.
+ */
+function buildActivityBridgeScript(): string {
+    return (
+        `<script>(function(){` +
+        `if(window.__aplusPreviewActivityBridge)return;` +
+        `window.__aplusPreviewActivityBridge=true;` +
+        `var last=0;` +
+        `function report(){` +
+        `var now=Date.now();` +
+        `if(now-last<60000)return;` +
+        `last=now;` +
+        `try{parent.postMessage({type:'aplus-preview-activity'},'*');}catch(e){}` +
+        `}` +
+        `var events=['pointerdown','keydown','wheel','touchstart','scroll'];` +
+        `for(var i=0;i<events.length;i++){` +
+        `document.addEventListener(events[i],report,{capture:true,passive:true});` +
+        `}` +
         `})()</script>`
     );
 }

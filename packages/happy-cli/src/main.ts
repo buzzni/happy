@@ -7,8 +7,11 @@
  */
 
 
+import { configuration } from '@/configuration'
 import chalk from 'chalk'
 import { runClaude, StartOptions } from '@/claude/runClaude'
+import { runCodex } from '@/codex/runCodex'
+import { assertProviderExecArguments } from '@/launcher/providerEntry'
 import { logger } from './ui/logger'
 import { readCredentials, readSettings } from './persistence'
 import { authAndSetupMachineIfNeeded } from './ui/auth'
@@ -39,6 +42,7 @@ import { handleCodexCommand } from './commands/codexCommand'
 import { runPreToolUseCli } from './hooks/runPreToolUseCli'
 import { preflightDaemonControlServer } from './daemon/controlServer'
 import { resolveMcpConfigPresetUrl } from './aplus/mcpConfigPresets'
+import { readManagedStartup } from '@/managed/managedStartup';
 
 
 (async () => {
@@ -114,6 +118,64 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       }
       process.exit(1)
     }
+    return;
+  } else if (subcommand === 'managed-boot') {
+    /*
+     * The root boot stage of a managed runtime, run by the image entrypoint
+     * **before** the daemon and before anything runs as the agent uid.
+     *
+     * It is a separate command rather than a step inside `daemon start` for
+     * two reasons: it needs root and the daemon does not, and the supervisor it
+     * starts has to outlive the daemon — a daemon restart that also restarted
+     * the ledger's owner would lose the lease enforcement for children that are
+     * still running.
+     *
+     * On a machine with no provisioning marker this exits 0 and does nothing:
+     * BYOS is not a failure. A marker that exists and cannot be trusted exits
+     * non-zero, and the entrypoint must not start the agent after that.
+     */
+    const { runManagedRuntimeBoot, defaultManagedRuntimeBootDeps } = await import('@/managed/managedRuntimeBoot');
+    const outcome = await runManagedRuntimeBoot(defaultManagedRuntimeBootDeps());
+    if (outcome.ok) {
+      /*
+       * This command returns while the process keeps running — the supervisor's
+       * socket and watchdog are what hold it open. So the checkpoint consumer
+       * the boot started is still ticking here, and a stop arriving mid-attempt
+       * would otherwise leave an archive uploaded with no pointer at it: a
+       * checkpoint that exists and that nothing can find.
+       *
+       * Bounded, and it re-raises the signal afterwards, so nothing here makes
+       * the machine harder to stop. With no consumer running it installs
+       * nothing.
+       */
+      const { drainManagedCheckpointTicksOnSignal } = await import('@/managed/checkpoint/managedCheckpointTicks');
+      drainManagedCheckpointTicksOnSignal({
+        ticks: outcome.checkpointTicks,
+        onStopped: ({ signal, pendingPublication }) => {
+          // 고정 분류자만. 어떤 신호였는지, 정산 못 한 발행이 남았는지.
+          console.log(`managed runtime boot: checkpoint consumer stopped on ${signal}`
+            + `${pendingPublication ? ' (publication pending)' : ''}`);
+        },
+      });
+      console.log(`managed runtime boot: supervisor listening (${outcome.published})`);
+      return;
+    }
+    if (outcome.reason === 'not-managed') return;
+    /*
+     * The reason is a fixed classifier, and so is the detail. Paths, tokens and
+     * provider text stay out of both — this line lands in image build and boot
+     * logs.
+     *
+     * The detail is printed because without it every way a marker can be
+     * untrustworthy arrives as one word, and the operator's next step is
+     * exactly the part that would be missing: which rule refused, and which of
+     * the isolation probe's checks was the one that did not hold.
+     */
+    console.error(
+      chalk.red('managed runtime boot refused:'),
+      outcome.detail ? `${outcome.reason} (${outcome.detail})` : outcome.reason,
+    );
+    process.exit(1);
     return;
   } else if (subcommand === 'sandbox') {
     try {
@@ -792,6 +854,51 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
       process.exit(0)
     }
 
+    // A managed Cloud spawn brings its own session and a bearer scoped to it.
+    // It authenticates no account, registers no machine, and starts no daemon:
+    // there is no local user here, and the runtime it runs inside is what the
+    // control plane already knows about.
+    const managed = await readManagedStartup(process.env, Date.now(), configuration.serverUrl);
+    if (managed) {
+      /*
+       * The arguments this process was started with, against the plan that was
+       * approved for it.
+       *
+       * Checked here rather than in the image entry: bundling that check into
+       * the image entry splits it into a sibling chunk the image does not
+       * install, and the runtime then fails on a missing module instead of on a
+       * bad plan. The plan's own policy stays where it is; this is the place
+       * that can see what actually reached `argv`.
+       */
+      assertProviderExecArguments(process.argv.slice(2), process.env);
+      try {
+        /*
+         * The agent the envelope was approved and billed for.
+         *
+         * Always starting Claude ran a Codex envelope on a different provider:
+         * the model the parent priced, the gateway route it signed and the
+         * capability it issued all say `codex`, and the process would have
+         * talked to Anthropic. The envelope is the authority on which of the
+         * two this is.
+         */
+        if (managed.envelope.agent === 'codex') {
+          // Codex takes one object: the principal and the start options are
+          // fields on it, not two arguments.
+          await runCodex({
+            principal: { kind: 'managed', startup: managed },
+            ...(options.startedBy ? { startedBy: options.startedBy } : {}),
+            ...(options.permissionMode ? { permissionMode: options.permissionMode } : {}),
+          });
+        } else {
+          await runClaude({ kind: 'managed', startup: managed }, options);
+        }
+      } catch (error) {
+        console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
+        process.exit(1)
+      }
+      return;
+    }
+
     // Normal flow - auth and machine setup
     const {
       credentials
@@ -800,7 +907,7 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
 
     // Start the CLI
     try {
-      await runClaude(credentials, options);
+      await runClaude({ kind: 'account', credentials }, options);
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
       if (process.env.DEBUG) {

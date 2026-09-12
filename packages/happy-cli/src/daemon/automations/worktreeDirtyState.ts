@@ -16,11 +16,18 @@
  * 섞여 있으면 지킨다. 목록을 넓힐 때는 "잃어도 되는가" 를 기준으로 판단할 것.
  */
 
-/** 에이전트가 남기는 산출물. 저장소 내용이 아니다. */
+/**
+ * 도구가 어디에든 만드는 디렉터리. 경로 세그먼트가 정확히 이 이름일 때만 무시한다.
+ *
+ * 2026-09-10 프로덕션 — worktree 14개(16GB)가 다시 쌓였다. 사유의 대부분이
+ * `packages/web-ui/.omc/sessions/*.json` 처럼 **하위 디렉터리의** .omc 였다. 아래
+ * 루트 접두 목록은 그것을 못 잡았고, 최장 471회(4.9일) 정리에 실패했다.
+ */
+const SCRATCH_DIRECTORIES_ANYWHERE = ['.omc', 'node_modules'];
+
+/** 에이전트가 루트에 남기는 산출물. `memory/` 는 저장소 디렉터리 이름으로도 흔해 루트만. */
 const SCRATCH_UNTRACKED = [
   'memory/',
-  '.omc/',
-  'node_modules/',
   // 2026-09-05 — 리뷰 워커가 제출을 끝낸 뒤 `.agenttask-3446-result.json` 을 루트에
   // 남겼다. 그 한 줄로 정리가 거부되고 자동화가 worktree 게이트에 걸려 그 저장소의
   // 리뷰가 통째로 멈췄다. 결과는 이미 서버에 있으므로 파일에는 잃을 것이 없다.
@@ -41,7 +48,8 @@ function isIgnorableEntry(line: string): boolean {
   const path = line.slice(3).trim();
   if (path.length === 0) return false;
   if (status === '??') {
-    return SCRATCH_UNTRACKED.some((prefix) => path === prefix || path.startsWith(prefix));
+    if (SCRATCH_UNTRACKED.some((prefix) => path === prefix || path.startsWith(prefix))) return true;
+    return path.split('/').some((segment) => SCRATCH_DIRECTORIES_ANYWHERE.includes(segment));
   }
 
   if (status === ' M' || status === 'M ') {

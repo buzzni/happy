@@ -21,6 +21,8 @@ import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt } from './encryption';
 import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer';
 import { backoff } from '@/utils/time';
+import { applyManagedRpcRestrictions, registerManagedRpcHandlers, type ManagedRpcHandlers } from '@/daemon/managedRpcHandlers';
+import type { ByosOfflineRpcHandlers } from '@/daemon/byosOfflineReceive';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { createRpcRequestListener } from './rpc/rpcRequestListener';
 import { detectCLIAvailability, CLIAvailability } from '@/utils/detectCLI';
@@ -33,7 +35,68 @@ import {
     type StopSessionContext,
     type StopSessionResult,
 } from '@/daemon/sessionIdleReaper';
+import {
+    SESSION_EXIT_VERIFICATION_SCOPE,
+    type SessionExitVerification,
+} from '@/daemon/sessionExitVerification';
 import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
+/**
+ * Bound preview requests travel on their own Socket.IO event. Kept as a
+ * constant so the daemon and happy-server cannot drift apart silently — a
+ * mismatch here reads, on the server side, as "this daemon predates runtime
+ * binding", which is exactly what it would be.
+ */
+export const PREVIEW_BOUND_PROXY_EVENT = 'preview-proxy-http-bound';
+/** Upgrade counterpart of PREVIEW_BOUND_PROXY_EVENT — see openPreviewWsTunnelBound. */
+export const PREVIEW_BOUND_WS_OPEN_EVENT = 'preview-proxy-ws-open-bound';
+/**
+ * specs/runtime-isolation-hardening (H3, P3) — browser-viewer relays travel on
+ * their own events again, for the reason the project ones do and one more.
+ *
+ * The shared reason: a daemon that predates viewer binding has no listener
+ * here, so a viewer request reaches no upstream at all. Checking the answer
+ * instead would be too late — the bytes would already be on the port.
+ *
+ * The added reason: the viewer variant is *disjoint* from the project one.
+ * Sharing an event and switching on `purpose` would put one handler in charge
+ * of deciding which rules apply to a payload it was handed, which is exactly
+ * the shape that lets a mixed claim be read as whichever variant is weaker.
+ */
+export const PREVIEW_VIEWER_BOUND_PROXY_EVENT = 'preview-proxy-http-viewer-bound';
+/** Upgrade counterpart of PREVIEW_VIEWER_BOUND_PROXY_EVENT. */
+export const PREVIEW_VIEWER_BOUND_WS_OPEN_EVENT = 'preview-proxy-ws-viewer-bound';
+/** Mint-time viewer lease, counterpart of `preview-runtime-lease`. */
+export const PREVIEW_VIEWER_RUNTIME_LEASE_EVENT = 'preview-viewer-runtime-lease';
+import {
+    acquireRuntimeLease,
+    enforceRelayBinding,
+    createRuntimeLeaseCanonicalizer,
+    MINT_LEASE_ANSWER_DEADLINE_MS,
+    type RuntimeLeaseDeps,
+} from '@/daemon/previewRuntimeLease';
+import {
+    createBoundedProbe,
+    createEvidenceIo,
+    probeListenerEvidence,
+    DEFAULT_PROBE_LIMITS,
+    type ProbeFn,
+} from '@/daemon/previewRuntimeEvidence';
+import {
+    acquireViewerLease,
+    enforceViewerRelayBinding,
+    type ViewerLeaseDeps,
+} from '@/daemon/previewViewerLease';
+import {
+    resolveBrokerViewerEvidence,
+    resolveNativeViewerEvidence,
+    type ViewerEvidenceRequest,
+    type ViewerEvidenceResult,
+} from '@/daemon/previewViewerEvidence';
+import { probeNativeViewerListenerEvidence } from '@/daemon/previewNativeViewerListener';
+import {
+    createBoundedViewerProof,
+    type ViewerProofFn,
+} from '@/daemon/previewViewerEvidenceGate';
 import { PreviewWsProxy } from '@/daemon/previewWsProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import packageJson from '../../package.json';
@@ -143,14 +206,76 @@ interface ServerToDaemonEvents {
             path: string;
             headers: Record<string, string>;
             bodyB64: string | null;
+            // specs/runtime-isolation-hardening (H3) — the runtime the relayed
+            // token was minted for. Absent from an older happy-server.
+            binding?: { projectId: string; leaseId: string; workspacePaths?: string[] } | null;
         },
+        ack: (response: unknown) => void,
+    ) => void;
+    // Mint-time counterpart: the server asks which runtime currently owns the
+    // port before it signs a bound token. An older daemon has no handler for
+    // this event, which is exactly how the server detects it.
+    'preview-runtime-lease': (
+        params: { projectId: string; port: number; workspacePaths?: string[] },
         ack: (response: unknown) => void,
     ) => void;
     // Preview WebSocket relay (raw byte tunnel). Counterpart to
     // proxy-http-request for upgrades (noVNC/websockify, ws, HMR). See
     // daemon/previewWsProxy.ts.
+    [PREVIEW_BOUND_PROXY_EVENT]: (
+        params: {
+            port: number;
+            method: string;
+            path: string;
+            headers: Record<string, string>;
+            bodyB64: string | null;
+            binding: { projectId: string; leaseId: string; workspacePaths?: string[] };
+        },
+        ack: (response: unknown) => void,
+    ) => void;
     'proxy-ws-open': (
         params: { tunnelId: string; port: number; dataB64: string },
+        ack: (response: unknown) => void,
+    ) => void;
+    // Bound upgrades only. An older daemon has no listener for this event, so
+    // it never writes the upgrade request to the port — the approval buffer
+    // on the server alone would already be too late.
+    [PREVIEW_BOUND_WS_OPEN_EVENT]: (
+        params: {
+            tunnelId: string;
+            port: number;
+            dataB64: string;
+            binding: { projectId: string; leaseId: string; workspacePaths?: string[] };
+        },
+        ack: (response: unknown) => void,
+    ) => void;
+    // specs/runtime-isolation-hardening (H3, P3) — viewer-bound relays. The
+    // binding shape is disjoint from the project one: no projectId, no
+    // workspacePaths, and `purpose` is mandatory.
+    [PREVIEW_VIEWER_BOUND_PROXY_EVENT]: (
+        params: {
+            port: number;
+            method: string;
+            path: string;
+            headers: Record<string, string>;
+            bodyB64: string | null;
+            binding: { purpose: 'viewer'; viewerKey: string; leaseId: string };
+        },
+        ack: (response: unknown) => void,
+    ) => void;
+    [PREVIEW_VIEWER_BOUND_WS_OPEN_EVENT]: (
+        params: {
+            tunnelId: string;
+            port: number;
+            dataB64: string;
+            binding: { purpose: 'viewer'; viewerKey: string; leaseId: string };
+        },
+        ack: (response: unknown) => void,
+    ) => void;
+    // Mint-time counterpart: which runtime currently serves this viewer key's
+    // port. An older daemon never acks, which is how the server tells.
+    [PREVIEW_VIEWER_RUNTIME_LEASE_EVENT]: (
+        params: { viewerKey: string; port: number },
         ack: (response: unknown) => void,
     ) => void;
     'proxy-ws-data': (payload: { tunnelId: string; dataB64: string }) => void;
@@ -341,6 +466,15 @@ type MachineRpcHandlers = {
     }) => Promise<ResumeSessionResult>;
     recoverSession?: (sessionId: string, options: RecoverSessionOptions) => Promise<RecoverSessionResult>;
     stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
+    /**
+     * Stop plus proof that the session's processes are gone. Used only for a
+     * `verifyExit: true` request; absent on a daemon build without it, which
+     * answers such a request with the legacy stop and `unavailable` evidence.
+     */
+    stopSessionWithExitVerification?: (
+        sessionId: string,
+        context?: StopSessionContext,
+    ) => Promise<{ result: StopSessionResult; exitVerification: SessionExitVerification }>;
     requestShutdown: () => void;
     portRegistry: PortRegistry;
     /** When present, registers the scheduled-automation RPCs and advertises automationSupport. */
@@ -356,6 +490,61 @@ type MachineRpcHandlers = {
     aiCredentialRuntime: AiCredentialRuntime;
     autonomousQualityGate?: AutonomousQualityGateRpcHandlers;
     checkpoint?: CheckpointRpcHandlers;
+    /**
+     * BYOS offline delivery, when the daemon wired it.
+     *
+     * Absent on a daemon that has no parent origin configured: without one the
+     * receiver cannot ask whether a delivery is authorized, and registering a
+     * handler that can only ever hold would make the parent wait for a person
+     * on every request.
+     */
+    byosOfflineReceive?: ByosOfflineRpcHandlers;
+}
+
+/**
+ * The stop-session response every caller has always received. Kept in one place
+ * now that the verified variant wraps the same three outcomes.
+ */
+function describeStopResult(sessionId: string, result: StopSessionResult) {
+    if (result.stopped) {
+        logger.debug(`[API MACHINE] Stopped session ${sessionId}`);
+        return { message: 'Session stopped', stopped: true as const };
+    }
+
+    // Duplicate or untracked stop: a no-op acknowledgement so callers can retry
+    // idempotently. It says this daemon tracks no such session — not that any
+    // process exited; only `exitVerification` answers that.
+    if (result.reason === 'not-found') {
+        logger.debug(`[API MACHINE] Session ${sessionId} not tracked; treating stop as no-op success`);
+        return { message: 'Session not tracked', stopped: false as const, reason: 'not-found' as const };
+    }
+
+    if (result.reason === 'managed-generation') {
+        // The stop went to the supervisor, which is the only side that
+        // can kill a managed generation and observe it empty. Saying
+        // `stopped` here would report a stop nobody proved.
+        logger.debug(`[API MACHINE] Managed generation stop routed to the supervisor for ${sessionId}`);
+        return {
+            message: 'Managed generation; stop requested from the supervisor',
+            stopped: false as const,
+            reason: 'managed-generation' as const,
+            detail: result.detail,
+        };
+    }
+
+    // Guard refused an if-idle stop because the session is active. Return a
+    // structured refusal (not an error) so a policy caller can back off and
+    // re-evaluate later instead of retrying immediately or escalating.
+    logger.debug(
+        `[API MACHINE] Refused idle stop for active session ${sessionId} (guard=${result.guard})`,
+    );
+    return {
+        message: 'Session active; stop skipped',
+        stopped: false as const,
+        reason: 'active' as const,
+        guard: result.guard,
+        activity: result.activity,
+    };
 }
 
 function requireNonEmptyString(value: unknown, name: string): string {
@@ -390,6 +579,8 @@ async function withCodexAppServerClient<T>(handler: (client: CodexAppServerClien
 
 export class ApiMachineClient {
     private socket!: Socket<ServerToDaemonEvents, DaemonToServerEvents>;
+    /** Set when the managed credential ended; suppresses every reconnect. */
+    private credentialStopped = false;
     private keepAliveInterval: NodeJS.Timeout | null = null;
     private runtimeActivityProvider: (() => {
         activeSessionCount: number;
@@ -409,6 +600,7 @@ export class ApiMachineClient {
     private autonomousQualityGateRpcAvailable = false;
     private lastKnownAutonomousQualityGateRpcAvailable: boolean | null = null;
     private automationKey: MachineAutomationKey | null = null;
+    private automationProtocolVersion: number = AUTOMATION_PROTOCOL_VERSION;
     private persistAutomationKeyVersion: ((version: number) => void) | null = null;
     private automationServerKeyVersion: number | null = null;
     // Fail closed while server-backed ownership is unresolved. Legacy file ticks
@@ -420,6 +612,34 @@ export class ApiMachineClient {
     private rpcHandlerManager: RpcHandlerManager;
     // Live raw-TCP tunnels for preview WebSocket upgrades (previewWsProxy.ts).
     private previewWsProxy: PreviewWsProxy | null = null;
+    /**
+     * specs/runtime-isolation-hardening (H3, P2) — opens whose binding is
+     * still being verified.
+     *
+     * Verification runs before the upstream is touched and can take a while
+     * (a saturated probe queue, a slow docker call). happy-server's open
+     * deadline can pass during that window, and the close it sends then finds
+     * nothing: previewWsProxy has no record of a tunnel that has not started
+     * connecting. Without this the upstream is opened afterwards anyway — a
+     * ghost with no owner, no expiry timer and no recheck behind it.
+     *
+     * Only ids with an open actually in flight are held, and each is removed
+     * when its open finishes: a map of every tunnel id ever seen would be
+     * unbounded and fed by the network.
+     */
+    private previewWsPendingOpens = new Map<string, { cancelled: boolean }>();
+    // specs/runtime-isolation-hardening (H3). Probed per request, with no
+    // memoization: a cached answer is a window in which a port that changed
+    // hands keeps verifying against the runtime it no longer serves. Only the
+    // number of probes running at once is bounded — a module burst from one
+    // preview page must not turn into hundreds of simultaneous docker spawns.
+    private previewEvidenceIo = createEvidenceIo();
+    private previewProbe: ProbeFn = createBoundedProbe(
+        (port: number) => probeListenerEvidence(port, this.previewEvidenceIo),
+        DEFAULT_PROBE_LIMITS,
+    );
+    private previewPortRegistry: PortRegistry | null = null;
+    private previewPathCanonicalizer = createRuntimeLeaseCanonicalizer();
     // Running noVNC stack for the remote browser screen, if started.
     // vncPort is null for a stack we adopted from a previous daemon: only the
     // process that spawned it knows which VNC port it bound, and nothing after
@@ -430,6 +650,8 @@ export class ApiMachineClient {
         callerWillLaunchBrowser: boolean;
         promise: Promise<ViewerStackStartResult>;
     } | null = null;
+    /** Set only on a verified managed runtime; null on every BYOS machine. */
+    private managedHandlers: ManagedRpcHandlers | null = null;
     private isolatedViewerLeases = new Map<string, BrowserViewerLeaseRecord>();
     private isolatedViewerStarts = new Map<string, Promise<IsolatedViewerStartResult>>();
     private isolatedViewerMutation: Promise<void> = Promise.resolve();
@@ -440,6 +662,16 @@ export class ApiMachineClient {
         ? new BrowserSessionBrokerClient(process.env.HAPPY_BROWSER_BROKER_SOCKET)
         : null;
     private brokerRelayTouchedAt = new Map<number, number>();
+    /**
+     * specs/runtime-isolation-hardening (H3, P3) — one gate for the whole
+     * daemon, so the per-machine cap on viewer proof work is real. Reuses the
+     * project probe's measured limits (8 concurrent, 256 queued); the budget
+     * is per call and defaults to DEFAULT_VIEWER_PROOF_DEADLINE_MS.
+     */
+    private viewerProofGate: ViewerProofFn = createBoundedViewerProof(
+        (request) => this.resolveViewerEvidence(request),
+        DEFAULT_PROBE_LIMITS,
+    );
     // Unsafe extension commands are accepted only from the fd 3/4 pipe that
     // launched Chrome. Keep that owner alive for as long as this daemon uses
     // the browser; a CDP port cannot recreate or replace the pipe later.
@@ -509,19 +741,30 @@ export class ApiMachineClient {
         );
     }
 
+    /**
+     * Enables the managed dispatch surface. Must be called before
+     * `setRPCHandlers`, which applies the restrictions as its last step.
+     */
+    setManagedRuntime(handlers: ManagedRpcHandlers): void {
+        this.managedHandlers = handlers;
+    }
+
     setRPCHandlers({
         spawnSession,
         resumeSession,
         recoverSession,
         stopSession,
+        stopSessionWithExitVerification,
         requestShutdown,
         portRegistry,
         automationStore,
         aiCredentialRuntime,
         autonomousQualityGate,
         checkpoint,
+        byosOfflineReceive,
         linkSpawnedSession,
     }: MachineRpcHandlers) {
+        this.previewPortRegistry = portRegistry;
         this.resumeSessionHandler = resumeSession ?? null;
         this.recoverSessionHandler = recoverSession ?? null;
         this.linkSpawnedSessionHandler = linkSpawnedSession ?? null;
@@ -531,6 +774,15 @@ export class ApiMachineClient {
             this.rpcHandlerManager.registerHandler('autonomous-quality-gate:status', autonomousQualityGate.status);
             this.rpcHandlerManager.registerHandler('autonomous-quality-gate:control', autonomousQualityGate.control);
             this.autonomousQualityGateRpcAvailable = true;
+        }
+
+        if (byosOfflineReceive) {
+            this.rpcHandlerManager.registerHandler(
+                'byos-offline:confirm-session-host', byosOfflineReceive.confirmSessionHost,
+            );
+            this.rpcHandlerManager.registerHandler(
+                'byos-offline:deliver', byosOfflineReceive.deliver,
+            );
         }
 
         if (checkpoint) {
@@ -709,8 +961,8 @@ export class ApiMachineClient {
         this.syncRecoverSessionRpcRegistration();
 
         // Register stop session handler
-        this.rpcHandlerManager.registerHandler('stop-session', (params: any) => {
-            const { sessionId, source, reason, mode } = params || {};
+        this.rpcHandlerManager.registerHandler('stop-session', async (params: any) => {
+            const { sessionId, source, reason, mode, verifyExit } = params || {};
 
             if (!sessionId) {
                 throw new Error('Session ID is required');
@@ -726,34 +978,36 @@ export class ApiMachineClient {
                 source: context.source,
                 reason: context.reason,
                 mode: effectiveMode,
+                verifyExit: verifyExit === true,
             });
 
-            const result = stopSession(sessionId, context);
-
-            if (result.stopped) {
-                logger.debug(`[API MACHINE] Stopped session ${sessionId}`);
-                return { message: 'Session stopped', stopped: true };
+            // A caller that deletes data after the stop asks for proof of exit
+            // with `verifyExit: true`. Everyone else gets the response they
+            // always got, byte for byte, and pays none of the observation cost.
+            if (verifyExit !== true) {
+                return describeStopResult(sessionId, stopSession(sessionId, context));
             }
 
-            // Duplicate or untracked stop: safe no-op success so callers can retry
-            // idempotently (the process is already gone / never here).
-            if (result.reason === 'not-found') {
-                logger.debug(`[API MACHINE] Session ${sessionId} not tracked; treating stop as no-op success`);
-                return { message: 'Session not tracked', stopped: false, reason: 'not-found' };
+            if (!stopSessionWithExitVerification) {
+                // A daemon build without the verifier. Say so rather than
+                // implying the legacy stop proved anything.
+                return {
+                    ...describeStopResult(sessionId, stopSession(sessionId, context)),
+                    exitVerification: {
+                        status: 'unavailable' as const,
+                        scope: SESSION_EXIT_VERIFICATION_SCOPE,
+                        detail: 'verification-unsupported' as const,
+                    },
+                };
             }
 
-            // Guard refused an if-idle stop because the session is active. Return a
-            // structured refusal (not an error) so a policy caller can back off and
-            // re-evaluate later instead of retrying immediately or escalating.
+            const verified = await stopSessionWithExitVerification(sessionId, context);
             logger.debug(
-                `[API MACHINE] Refused idle stop for active session ${sessionId} (guard=${result.guard})`,
+                `[API MACHINE] Stop session ${sessionId} exit verification: ${verified.exitVerification.status}`,
             );
             return {
-                message: 'Session active; stop skipped',
-                stopped: false,
-                reason: 'active',
-                guard: result.guard,
-                activity: result.activity,
+                ...describeStopResult(sessionId, verified.result),
+                exitVerification: verified.exitVerification,
             };
         });
 
@@ -1081,6 +1335,30 @@ export class ApiMachineClient {
             return this.startIsolatedViewerStack(viewerKey);
         });
 
+        /**
+         * specs/runtime-isolation-hardening (H3, P3) — the required path opens
+         * the viewer through this method instead of `browser-viewer:start`.
+         *
+         * A new method name is what makes the old-daemon case safe *before*
+         * any side effect: a daemon that predates viewer binding has no
+         * handler, so the RPC comes back "Method not found" having started
+         * nothing. Asking an old daemon for a capability and then calling
+         * start would leave a window between the two answers — and a
+         * singleton daemon that ignores params would already have launched a
+         * stack by the time its reply was checked.
+         *
+         * Validation happens strictly *before* the existing start body runs;
+         * the body itself is reused unchanged so the two paths cannot drift.
+         */
+        this.rpcHandlerManager.registerHandler('browser-viewer:start-bound', async (params: any) => {
+            const viewerKey = requireNonEmptyString(params?.viewerKey, 'viewerKey');
+            if (!validateViewerKey(viewerKey)) throw new Error('viewerKey is invalid');
+            // The key is server-derived from the authenticated user; the
+            // daemon accepts no other field that could widen what is opened.
+            if (this.browserSessionBroker) return this.startBrokerViewer(viewerKey);
+            return this.startIsolatedViewerStack(viewerKey);
+        });
+
         this.rpcHandlerManager.registerHandler('browser-viewer:lookup', async (params: any) => {
             const viewerKey = requireNonEmptyString(params?.viewerKey, 'viewerKey');
             if (!validateViewerKey(viewerKey)) throw new Error('viewerKey is invalid');
@@ -1276,10 +1554,367 @@ export class ApiMachineClient {
         // RPC envelope can't be used. The preview payload is inherently
         // non-sensitive (it's the HTTP request flowing from the iframe,
         // and happy-server already sees it to rewrite HTML).
+
+        // Applied last so it wins over every legacy registration above,
+        // regardless of the order those modules ran in. On a BYOS machine
+        // `managedHandlers` is null and nothing below executes, so the
+        // existing surface is untouched.
+        if (this.managedHandlers) {
+            applyManagedRpcRestrictions(this.rpcHandlerManager);
+            registerManagedRpcHandlers(this.rpcHandlerManager, this.managedHandlers);
+        }
     }
 
-    setAutomationKey(key: MachineAutomationKey, persistVersion: (version: number) => void): void {
+    /**
+     * specs/runtime-isolation-hardening (H3). Null until `setRPCHandlers` has
+     * run: without the port registry the daemon cannot spot a port that is
+     * registered to another project, and a partial check is not the check.
+     */
+    private previewLeaseDeps(options?: { probeDeadlineMs?: number }): RuntimeLeaseDeps | null {
+        const registry = this.previewPortRegistry;
+        if (!registry) return null;
+        return {
+            probeEvidence: (port: number) => (options?.probeDeadlineMs === undefined
+                ? this.previewProbe(port)
+                : this.previewProbe(port, { deadlineMs: options.probeDeadlineMs })),
+            readPortRegistry: () => registry.readAll(),
+            canonicalize: (target: string) => this.previewPathCanonicalizer(target),
+        };
+    }
+
+    /**
+     * specs/runtime-isolation-hardening (H3, P3) — the viewer counterpart of
+     * `previewLeaseDeps`.
+     *
+     * The mode is decided once, here, by whether a root broker is configured,
+     * and there is **no fallback between the two**. In broker mode the native
+     * registry describes nothing that is running, so reading it after a failed
+     * broker lookup would not be a second opinion — it would be a first
+     * opinion about the wrong machine state.
+     */
+    private viewerLeaseDeps(options?: { deadlineMs?: number }): ViewerLeaseDeps {
+        // Every viewer proof goes through the same gate instance, so the cap
+        // is per machine rather than per request. The budget is applied here
+        // too: an unbudgeted proof that overran the mint window used to be
+        // read by happy-server as "this daemon predates runtime binding",
+        // which records a wrong fact about the fleet instead of a refusal.
+        return { resolveEvidence: (request) => this.viewerProofGate(request, options) };
+    }
+
+    /**
+     * The unbounded proof itself. Mode is picked per call because the broker
+     * may be configured after construction; there is no fallback between the
+     * two — in broker mode the native registry describes nothing running.
+     */
+    private resolveViewerEvidence(request: ViewerEvidenceRequest): Promise<ViewerEvidenceResult> {
+        const broker = this.browserSessionBroker;
+        if (broker) {
+            return resolveBrokerViewerEvidence(request, {
+                lookupBrokerLease: async (viewerKey) => {
+                    const response = await broker.request({ op: 'lookup', viewerKey });
+                    if (!response.ok) throw new Error(response.code);
+                    return response.lease;
+                },
+            });
+        }
+        return resolveNativeViewerEvidence(request, {
+                    // Registry first, cache second: the on-disk record is what
+                    // survives a daemon restart, and verification must not be
+                    // decided by whatever this process happens to remember.
+                    getViewerLease: async (viewerKey) =>
+                        (await this.isolatedViewerRegistry.get(viewerKey))
+                        ?? this.isolatedViewerLeases.get(viewerKey)
+                        ?? null,
+                    // Viewer-only prober. The generic project probe reports
+                    // "2 processes listen on 127.0.0.1:<port>" for a healthy
+                    // viewer under load — websockify forks a worker that
+                    // inherits the listening socket — and that ambiguity is
+                    // the right answer for a project port and the wrong one
+                    // here, where the expected pid is known in advance. The
+                    // generic probe is left strict and untouched.
+                    probeListener: (port: number, expectedPid: number) =>
+                        probeNativeViewerListenerEvidence(port, expectedPid, this.previewEvidenceIo),
+                    readProcessCmdline: (pid: number) => this.previewEvidenceIo.readFile(`/proc/${pid}/cmdline`),
+        });
+    }
+
+    /**
+     * Same gate as the project relay, over the viewer variant. There is no
+     * `unbound` outcome: these events exist only for bound requests, so an
+     * absent binding is a caller error rather than an older server.
+     */
+    private enforceViewerBinding(
+        binding: unknown,
+        port: number,
+    ): Promise<{ outcome: 'enforced' } | { outcome: 'rejected'; code: string; message: string }> {
+        return enforceViewerRelayBinding(binding, port, this.viewerLeaseDeps());
+    }
+
+    /** Handler body of the `preview-viewer-runtime-lease` socket event. */
+    private async answerPreviewViewerRuntimeLease(params: any, ack: (response: any) => void): Promise<void> {
+        try {
+            const result = await acquireViewerLease(
+                { viewerKey: params?.viewerKey, port: params?.port },
+                this.viewerLeaseDeps({ deadlineMs: MINT_LEASE_ANSWER_DEADLINE_MS }),
+            );
+            logger.debug(
+                `[API MACHINE] preview-viewer-runtime-lease port=${params?.port} -> ${result.type === 'success' ? result.evidenceKind : result.code}`,
+            );
+            ack(result);
+        } catch (e) {
+            const message = e instanceof Error ? e.message : String(e);
+            logger.debug(`[API MACHINE] preview-viewer-runtime-lease internal error: ${message}`);
+            ack({ type: 'error', code: 'EVIDENCE_UNAVAILABLE', message });
+        }
+    }
+
+    private async relayPreviewViewerBoundHttp(params: any): Promise<any> {
+        const binding = await this.enforceViewerBinding(params?.binding, params?.port);
+        if (binding.outcome === 'rejected') {
+            logger.debug(`[API MACHINE] viewer-bound http refused: ${binding.code} ${binding.message}`);
+            return { type: 'error', code: binding.code, message: binding.message };
+        }
+        try {
+            const result = await proxyHttp({
+                port: params?.port,
+                method: params?.method,
+                path: params?.path,
+                headers: params?.headers ?? {},
+                bodyB64: params?.bodyB64 ?? null,
+            });
+            return { type: 'success', ...result, bindingEnforced: true };
+        } catch (e) {
+            if (e instanceof PreviewProxyError) {
+                return { type: 'error', code: e.code, message: e.message };
+            }
+            const message = e instanceof Error ? e.message : String(e);
+            logger.debug(`[API MACHINE] viewer-bound http internal error: ${message}`);
+            return { type: 'error', code: 'INTERNAL', message };
+        }
+    }
+
+    /**
+     * Viewer upgrades. Shares the whole cancellation / supersede / close
+     * machinery with the project tunnel — a second copy would drift, and the
+     * expiry and revocation behaviour is exactly what must not differ.
+     */
+    private async openPreviewViewerWsTunnelBound(params: any): Promise<any> {
+        const tunnelId = typeof params?.tunnelId === 'string' ? params.tunnelId : null;
+        if (!tunnelId) {
+            return { ok: false, code: 'INVALID_TUNNEL', message: 'Missing tunnelId' };
+        }
+        const cancelled = { ok: false, code: 'CANCELLED', message: 'Tunnel was closed before it opened' };
+        const pending = { cancelled: false };
+        const superseded = this.previewWsPendingOpens.get(tunnelId);
+        if (superseded) superseded.cancelled = true;
+        this.previewWsPendingOpens.set(tunnelId, pending);
+        try {
+            const binding = await this.enforceViewerBinding(params?.binding, params?.port);
+            if (pending.cancelled) return cancelled;
+            if (binding.outcome === 'rejected') {
+                logger.debug(`[API MACHINE] viewer-bound ws refused: ${binding.code} ${binding.message}`);
+                return { ok: false, code: binding.code, message: binding.message };
+            }
+            const opened = await this.previewWsProxy!.open(params);
+            if (pending.cancelled) {
+                this.previewWsProxy?.close(tunnelId);
+                return cancelled;
+            }
+            return opened?.ok === true ? { ...opened, bindingEnforced: true } : opened;
+        } finally {
+            if (this.previewWsPendingOpens.get(tunnelId) === pending) {
+                this.previewWsPendingOpens.delete(tunnelId);
+            }
+        }
+    }
+
+    /**
+     * specs/runtime-isolation-hardening (H3) — prove that the runtime still
+     * answering on this port is the one the token was minted for, before any
+     * bytes are relayed. `bindingEnforced` is echoed on success: it is the
+     * only way happy-server can tell an enforcing daemon apart from one that
+     * silently ignored the binding fields.
+     */
+    /**
+     * Same binding gate as the HTTP relay: a tunnel is a relayed request too,
+     * and leaving it unchecked would make the upgrade path the way around the
+     * binding.
+     */
+    /**
+     * Bound upgrades arrive here instead. Since this event exists only for
+     * them, serving it unbound would give the whole separation away.
+     */
+    private async openPreviewWsTunnelBound(params: any): Promise<any> {
+        if (params?.binding === undefined || params?.binding === null) {
+            return {
+                ok: false,
+                code: 'INVALID_REQUEST',
+                message: 'This event carries bound preview upgrades only',
+            };
+        }
+        return this.openPreviewWsTunnel(params);
+    }
+
+    private async openPreviewWsTunnel(params: any): Promise<any> {
+        const tunnelId = typeof params?.tunnelId === 'string' ? params.tunnelId : null;
+        if (!tunnelId) {
+            return { ok: false, code: 'INVALID_TUNNEL', message: 'Missing tunnelId' };
+        }
+        const cancelled = { ok: false, code: 'CANCELLED', message: 'Tunnel was closed before it opened' };
+        // Registered *before* the first await, so a close arriving mid-check
+        // has something to cancel.
+        const pending = { cancelled: false };
+        // A duplicate id supersedes the earlier attempt rather than racing it.
+        const superseded = this.previewWsPendingOpens.get(tunnelId);
+        if (superseded) superseded.cancelled = true;
+        this.previewWsPendingOpens.set(tunnelId, pending);
+        try {
+            const binding = await this.enforcePreviewBinding(params?.binding, params?.port);
+            if (pending.cancelled) return cancelled;
+            if (binding.outcome === 'rejected') {
+                logger.debug(`[API MACHINE] proxy-ws-open refused: ${binding.code} ${binding.message}`);
+                // The WS open ack is `{ok, code, message}` — not the HTTP
+                // relay's `{type}` envelope (openPreviewWsTunnel reads `ok`).
+                return { ok: false, code: binding.code, message: binding.message };
+            }
+            const opened = await this.previewWsProxy!.open(params);
+            if (pending.cancelled) {
+                // Cancelled while the TCP connect was in flight; previewWsProxy
+                // handles that itself, but say so rather than acking success.
+                this.previewWsProxy?.close(tunnelId);
+                return cancelled;
+            }
+            // The echo rides along only on a tunnel that actually opened —
+            // happy-server reads `ok` first, and a refusal carrying an
+            // enforcement flag would be a confusing thing to log.
+            return binding.outcome === 'enforced' && opened?.ok === true
+                ? { ...opened, bindingEnforced: true }
+                : opened;
+        } finally {
+            // The record lives exactly as long as the open does.
+            if (this.previewWsPendingOpens.get(tunnelId) === pending) {
+                this.previewWsPendingOpens.delete(tunnelId);
+            }
+        }
+    }
+
+    private closePreviewWsTunnel(tunnelId: string | undefined): void {
+        if (!tunnelId) return;
+        const pending = this.previewWsPendingOpens.get(tunnelId);
+        if (pending) pending.cancelled = true;
+        this.previewWsProxy?.close(tunnelId);
+    }
+
+    /** Daemon socket dropped: nothing in flight can still be wanted. */
+    private cancelPreviewWsTunnels(): void {
+        for (const pending of this.previewWsPendingOpens.values()) pending.cancelled = true;
+        this.previewWsPendingOpens.clear();
+        this.previewWsProxy?.closeAll();
+    }
+
+    private async relayPreviewBoundHttp(params: any): Promise<any> {
+        if (params?.binding === undefined || params?.binding === null) {
+            return {
+                type: 'error',
+                code: 'INVALID_REQUEST',
+                message: 'This event carries bound preview requests only',
+            };
+        }
+        return this.relayPreviewHttp(PREVIEW_BOUND_PROXY_EVENT, params);
+    }
+
+    private async relayPreviewHttp(event: string, params: any): Promise<any> {
+        try {
+            const binding = await this.enforcePreviewBinding(params?.binding, params?.port);
+            if (binding.outcome === 'rejected') {
+                logger.debug(`[API MACHINE] ${event} refused: ${binding.code} ${binding.message}`);
+                return { type: 'error', code: binding.code, message: binding.message };
+            }
+            const result = await proxyHttp({
+                port: params?.port,
+                method: params?.method,
+                path: params?.path,
+                headers: params?.headers ?? {},
+                bodyB64: params?.bodyB64 ?? null,
+            });
+            logger.debug(
+                `[API MACHINE] ${event} ${params?.method} ${params?.path} -> ${result.status}${result.truncated ? ' (truncated)' : ''} binding=${binding.outcome}`,
+            );
+            return {
+                type: 'success',
+                ...result,
+                ...(binding.outcome === 'enforced' ? { bindingEnforced: true } : {}),
+            };
+        } catch (e) {
+            if (e instanceof PreviewProxyError) {
+                logger.debug(`[API MACHINE] ${event} failed: ${e.code} ${e.message}`);
+                return { type: 'error', code: e.code, message: e.message };
+            }
+            const message = e instanceof Error ? e.message : String(e);
+            logger.debug(`[API MACHINE] ${event} internal error: ${message}`);
+            return { type: 'error', code: 'INTERNAL', message };
+        }
+    }
+
+    private async enforcePreviewBinding(
+        binding: unknown,
+        port: number,
+    ): Promise<{ outcome: 'enforced' | 'unbound' } | { outcome: 'rejected'; code: string; message: string }> {
+        if (binding === undefined || binding === null) return { outcome: 'unbound' };
+        const deps = this.previewLeaseDeps();
+        if (!deps) {
+            // A bound request we cannot verify is refused, never relayed —
+            // "could not check" is not "checked and fine".
+            return {
+                outcome: 'rejected',
+                code: 'EVIDENCE_UNAVAILABLE',
+                message: 'Daemon is not ready to verify the preview runtime binding',
+            };
+        }
+        return enforceRelayBinding(binding, port, deps);
+    }
+
+    /**
+     * Handler body of the `preview-runtime-lease` socket event (mint time).
+     * Answers inside happy-server's 3 s ack window: a probe that cannot finish
+     * by then is reported as EVIDENCE_BUSY rather than left to ack late.
+     */
+    private async answerPreviewRuntimeLease(params: any, ack: (response: any) => void): Promise<void> {
+        const deps = this.previewLeaseDeps({ probeDeadlineMs: MINT_LEASE_ANSWER_DEADLINE_MS });
+        if (!deps) {
+            ack({
+                type: 'error',
+                code: 'EVIDENCE_UNAVAILABLE',
+                message: 'Daemon is not ready to resolve preview runtimes',
+            });
+            return;
+        }
+        try {
+            const result = await acquireRuntimeLease(
+                {
+                    projectId: params?.projectId,
+                    port: params?.port,
+                    // Workspace paths come from happy-server's
+                    // authenticated studio callback, never from a
+                    // browser-facing request.
+                    workspacePaths: Array.isArray(params?.workspacePaths) ? params.workspacePaths : [],
+                },
+                deps,
+            );
+            logger.debug(
+                `[API MACHINE] preview-runtime-lease project=${params?.projectId} port=${params?.port} -> ${result.type === 'success' ? result.evidenceKind : result.code}`,
+            );
+            ack(result);
+        } catch (e) {
+            const message = e instanceof Error ? e.message : String(e);
+            logger.debug(`[API MACHINE] preview-runtime-lease internal error: ${message}`);
+            ack({ type: 'error', code: 'EVIDENCE_UNAVAILABLE', message });
+        }
+    }
+
+    setAutomationKey(key: MachineAutomationKey, persistVersion: (version: number) => void, protocolVersion: number = AUTOMATION_PROTOCOL_VERSION): void {
         this.automationKey = key;
+        this.automationProtocolVersion = protocolVersion;
         this.persistAutomationKeyVersion = persistVersion;
     }
 
@@ -1747,7 +2382,7 @@ export class ApiMachineClient {
         const answer = await this.socket.emitWithAck('automation-key-register', {
             expectedKeyVersion: key.registeredKeyVersion,
             publicKey: Buffer.from(key.publicKey).toString('base64'),
-            protocolVersion: AUTOMATION_PROTOCOL_VERSION,
+            protocolVersion: this.automationProtocolVersion,
         });
         if (!answer.ok || !answer.value || !Number.isSafeInteger(answer.value.keyVersion)) {
             if (answer.error === 'feature-disabled') {
@@ -1771,7 +2406,7 @@ export class ApiMachineClient {
                 serverBacked: true,
                 keyVersion,
                 sessionFollowup: true,
-                protocolVersion: AUTOMATION_PROTOCOL_VERSION,
+                protocolVersion: this.automationProtocolVersion,
             },
         }));
     }
@@ -2011,6 +2646,74 @@ export class ApiMachineClient {
         });
     }
 
+    /**
+     * Takes up a renewed credential — by **re-authenticating**, not by
+     * relabelling.
+     *
+     * Two things made the obvious version wrong.
+     *
+     * The handshake is what presents the credential, and it reads `socket.auth`
+     * at connect time, so changing only the field the constructor was given
+     * left every reconnect presenting the expired token: the connection alive
+     * today keeps working, and the first network flap ends the runtime in a way
+     * that reads as a network fault and never resolves.
+     *
+     * And the live connection is **not** fine as it is. The server re-reads the
+     * grant on every event against the token the handshake carried, and a
+     * renewal supersedes the previous grant the moment it is issued — so a
+     * connection still presenting the old bearer begins being refused
+     * immediately, and is dropped by the server's own revalidation shortly
+     * after. An earlier version of this comment claimed a live socket did not
+     * need the new token; that was wrong, and this is the correction.
+     *
+     * So the connection is dropped and the reconnect path brings it back
+     * authenticated with the new bearer, re-registering its RPC methods as any
+     * reconnect does. A few seconds of connection is the cost; the alternative
+     * is a runtime that looks connected while every request it makes is
+     * refused.
+     */
+    replaceToken(token: string): void {
+        if (token.trim() === '') throw new Error('a machine client cannot present an empty token');
+        if (token === this.token) return;
+        this.token = token;
+        if (!this.socket) return;
+        this.socket.auth = { ...(this.socket.auth as Record<string, unknown>), token };
+        // Dropped, not closed for good: `disconnect` runs the reconnect path,
+        // which dials again with the auth just replaced.
+        if (this.socket.connected) this.socket.disconnect();
+    }
+
+    /**
+     * Stops presenting a credential that is no longer valid, and stops working.
+     *
+     * Called when the credential expired and no renewal replaced it. The socket
+     * is closed and reconnection is not attempted: a runtime that kept retrying
+     * with a dead credential would look like a connectivity failure to
+     * everybody, while the real answer — this runtime is no longer authorised —
+     * is one the parent already knows.
+     */
+    stopForExpiredCredential(): void {
+        logger.debug('[API MACHINE] Managed credential expired; closing the machine socket');
+        /*
+         * Set **before** closing, and it outlives the close.
+         *
+         * Closing fires `disconnect`, and the disconnect handler is what starts
+         * the reconnect loop — so without a stop that survives that event the
+         * runtime immediately begins retrying with the credential that just
+         * expired. `startSmartReconnect` checks this flag, which is why it is a
+         * field rather than a local decision here.
+         */
+        this.credentialStopped = true;
+        if (this.reconnectInterval) {
+            clearInterval(this.reconnectInterval);
+            this.reconnectInterval = null;
+        }
+        // The field is non-nullable and every other path assumes a socket
+        // exists; closing is what stops the traffic, and `disconnected` is what
+        // the rest of this class already checks.
+        this.socket?.close();
+    }
+
     connect() {
         const serverUrl = configuration.serverUrl.replace(/^http/, 'ws');
         logger.debug(`[API MACHINE] Connecting to ${serverUrl}`);
@@ -2056,8 +2759,9 @@ export class ApiMachineClient {
             this.rpcHandlerManager.onSocketDisconnect();
             this.stopKeepAlive();
             // Tear down any live preview WebSocket tunnels — the relay path is
-            // dead once the daemon socket drops, so leave no orphan TCP sockets.
-            this.previewWsProxy?.closeAll();
+            // dead once the daemon socket drops, so leave no orphan TCP
+            // sockets, including opens still waiting on their binding check.
+            this.cancelPreviewWsTunnels();
             // specs/remote-terminal/ Phase 2 — relay path is broken once
             // the socket drops, and the server's session map entry now
             // points at a dead socket. Kill local PTYs so no orphans
@@ -2087,29 +2791,30 @@ export class ApiMachineClient {
         this.socket.on(
             'proxy-http-request',
             async (params: any, ack: (response: any) => void) => {
-                try {
-                    const result = await proxyHttp({
-                        port: params?.port,
-                        method: params?.method,
-                        path: params?.path,
-                        headers: params?.headers ?? {},
-                        bodyB64: params?.bodyB64 ?? null,
-                    });
-                    logger.debug(
-                        `[API MACHINE] proxy-http-request ${params?.method} ${params?.path} -> ${result.status}${result.truncated ? ' (truncated)' : ''}`,
-                    );
-                    ack({ type: 'success', ...result });
-                } catch (e) {
-                    if (e instanceof PreviewProxyError) {
-                        logger.debug(`[API MACHINE] proxy-http-request failed: ${e.code} ${e.message}`);
-                        ack({ type: 'error', code: e.code, message: e.message });
-                        return;
-                    }
-                    const message = e instanceof Error ? e.message : String(e);
-                    logger.debug(`[API MACHINE] proxy-http-request internal error: ${message}`);
-                    ack({ type: 'error', code: 'INTERNAL', message });
-                }
+                ack(await this.relayPreviewHttp('proxy-http-request', params));
             },
+        );
+
+        // specs/runtime-isolation-hardening (H3, P1) — bound requests arrive
+        // here instead. The separate event is what keeps a daemon that
+        // predates runtime binding from executing them: it has no listener,
+        // so the request is never run rather than run and then refused by its
+        // answer. Since this event exists only for bound requests, serving it
+        // unbound would give the whole separation away.
+        this.socket.on(
+            PREVIEW_BOUND_PROXY_EVENT as any,
+            async (params: any, ack: (response: any) => void) => {
+                ack(await this.relayPreviewBoundHttp(params));
+            },
+        );
+
+        // Mint-time lease: happy-server asks which runtime owns the port
+        // before signing a bound token. A daemon without this handler never
+        // acks, and the server reports RUNTIME_BINDING_UNSUPPORTED rather than
+        // quietly falling back to an unbound token.
+        this.socket.on(
+            'preview-runtime-lease',
+            (params: any, ack: (response: any) => void) => this.answerPreviewRuntimeLease(params, ack),
         );
 
         // Preview WebSocket relay — raw byte tunnel for upgrades (noVNC /
@@ -2122,14 +2827,36 @@ export class ApiMachineClient {
                 onActivity: (port) => this.touchBrokerViewerPort(port),
             },
         );
-        this.socket.on('proxy-ws-open', async (params, ack) => {
-            ack(await this.previewWsProxy!.open(params));
+        // Not attached on a managed runtime: the preview WebSocket proxy reaches the host outside
+        // the RPC dispatch gate, so the allowlist there would not see it.
+        if (!this.managedHandlers) this.socket.on('proxy-ws-open', async (params, ack) => {
+            ack(await this.openPreviewWsTunnel(params));
         });
+        // The bound variants reach the host the same way, so the same gate applies.
+        if (!this.managedHandlers) this.socket.on(PREVIEW_BOUND_WS_OPEN_EVENT as any, async (params: any, ack: (response: any) => void) => {
+            ack(await this.openPreviewWsTunnelBound(params));
+        });
+        // specs/runtime-isolation-hardening (H3, P3) — viewer-bound relays and
+        // their mint-time lease. A daemon without these listeners performs no
+        // side effect at all for a viewer request: no upstream connect, no
+        // upstream write, no ack. That silence is the server's signal, and it
+        // is the only version of "old daemon refused" that happens *before*
+        // anything reaches the port.
+        this.socket.on(PREVIEW_VIEWER_BOUND_PROXY_EVENT as any, async (params: any, ack: (response: any) => void) => {
+            ack(await this.relayPreviewViewerBoundHttp(params));
+        });
+        if (!this.managedHandlers) this.socket.on(PREVIEW_VIEWER_BOUND_WS_OPEN_EVENT as any, async (params: any, ack: (response: any) => void) => {
+            ack(await this.openPreviewViewerWsTunnelBound(params));
+        });
+        this.socket.on(
+            PREVIEW_VIEWER_RUNTIME_LEASE_EVENT as any,
+            (params: any, ack: (response: any) => void) => this.answerPreviewViewerRuntimeLease(params, ack),
+        );
         this.socket.on('proxy-ws-data', (payload) => {
             this.previewWsProxy?.data(payload);
         });
         this.socket.on('proxy-ws-close', (payload) => {
-            this.previewWsProxy?.close(payload?.tunnelId);
+            this.closePreviewWsTunnel(payload?.tunnelId);
         });
 
         // specs/remote-terminal/ Phase 2 — interactive PTY relay.
@@ -2144,7 +2871,9 @@ export class ApiMachineClient {
         const machineKey = this.machine.encryptionKey;
         const machineVariant = this.machine.encryptionVariant;
         const machineId = this.machine.id;
-        this.socket.on('terminal-open-fwd', async (msg, ack) => {
+        // Not attached on a managed runtime: the forwarded terminal opener reaches the host outside
+        // the RPC dispatch gate, so the allowlist there would not see it.
+        if (!this.managedHandlers) this.socket.on('terminal-open-fwd', async (msg, ack) => {
             try {
                 const { sessionId, params } = msg || {};
                 if (!sessionId || typeof sessionId !== 'string') {
@@ -2276,7 +3005,9 @@ export class ApiMachineClient {
             }
         });
 
-        this.socket.on('terminal-frame-fwd', (msg) => {
+        // Not attached on a managed runtime: forwarded terminal frames reaches the host outside
+        // the RPC dispatch gate, so the allowlist there would not see it.
+        if (!this.managedHandlers) this.socket.on('terminal-frame-fwd', (msg) => {
             const { sessionId, data } = msg || {};
             const entry = getDaemonTerminalSession(sessionId);
             if (!entry || typeof data !== 'string') return;
@@ -2419,7 +3150,7 @@ export class ApiMachineClient {
                         serverBacked: this.automationServerKeyVersion !== null,
                         ...(this.automationServerKeyVersion !== null ? { keyVersion: this.automationServerKeyVersion } : {}),
                         sessionFollowup: true,
-                        protocolVersion: AUTOMATION_PROTOCOL_VERSION,
+                        protocolVersion: this.automationProtocolVersion,
                     },
                     autonomousQualityGateSupport: {
                         apiVersion: 1,
@@ -2445,6 +3176,10 @@ export class ApiMachineClient {
     }
 
     private startSmartReconnect() {
+        // A runtime whose credential is gone does not reconnect. Retrying would
+        // present a dead bearer over and over while the parent already knows
+        // this runtime is not authorised.
+        if (this.credentialStopped) return;
         if (this.reconnectInterval) return;
 
         this.reconnectInterval = setInterval(() => {
@@ -2463,7 +3198,13 @@ export class ApiMachineClient {
 
         if (shouldReconnect()) {
             logger.debug('[API MACHINE] Network up + lid open — reconnecting in 1s');
-            setTimeout(() => { if (!this.socket.connected) this.socket.connect() }, 1000);
+            setTimeout(() => {
+                // Re-checked when it fires, not when it was scheduled. A stop
+                // that arrives in between leaves this timeout on the queue, and
+                // it would reconnect with the credential that just expired.
+                if (this.credentialStopped) return;
+                if (!this.socket.connected) this.socket.connect();
+            }, 1000);
         }
     }
 

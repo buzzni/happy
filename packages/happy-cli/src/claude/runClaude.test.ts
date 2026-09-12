@@ -129,6 +129,14 @@ async function startRemoteRunClaudeHarness(opts: {
     updateAgentState?: ReturnType<typeof vi.fn>;
     registerHandler?: ReturnType<typeof vi.fn>;
     runOptions?: Partial<Parameters<typeof runClaude>[1]>;
+    /**
+     * Test-only: how long to wait for the run to reach the loop.
+     *
+     * Exists so the start-failure path can be exercised **faithfully** - the
+     * run behaves exactly as it always does, and only the window shortens,
+     * which is what CPU pressure does to the default wait.
+     */
+    waitForTimeoutMs?: number;
 } = {}) {
     let metadata = opts.metadata ?? {
         claudeSessionId: 'claude-session-1',
@@ -184,22 +192,71 @@ async function startRemoteRunClaudeHarness(opts: {
     mockLoop.mockReturnValue(loopDeferred.promise);
 
     const runPromise = runClaude({
-        token: 'token',
-        encryption: { type: 'legacy', secret: new Uint8Array(32) },
+        kind: 'account',
+        credentials: {
+            token: 'token',
+            encryption: { type: 'legacy', secret: new Uint8Array(32) },
+        },
     } as any, {
         startingMode: 'remote',
         shouldStartDaemon: false,
         ...opts.runOptions,
     });
 
-    await vi.waitFor(() => {
-        expect(mockCreateSessionScanner).toHaveBeenCalled();
-        expect(mockLoop).toHaveBeenCalled();
-    });
+    /*
+     * The run is going from here on, whatever happens next. Nothing below may
+     * leave without stopping it: an abandoned run keeps reading the recovery
+     * env, and the production path **deletes** those variables once it has read
+     * them - so it does not merely outlive its test, it takes the next test's
+     * setup with it.
+     */
+    const stopRun = async () => {
+        const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
+            throw new Error('process.exit');
+        }) as never);
+        try {
+            loopDeferred.resolve(0);
+            /*
+             * The run itself, awaited to settlement. No timer.
+             *
+             * An earlier version raced this against a 500 ms timer and returned
+             * when the timer won. That does not stop anything: the run was
+             * still live, the `finally` below then put the **real**
+             * `process.exit` back under it, and the next test inherited both a
+             * running session and an unguarded exit. A fulfilled timer is not
+             * evidence of termination, and calling it one made this teardown
+             * claim exactly what it had failed to do.
+             *
+             * If a run cannot settle, this await hangs and the test fails on
+             * Vitest's own budget - which names the problem instead of hiding
+             * it behind a timer that always fires. The rejection is swallowed
+             * **here only**; the reason this teardown ran is the error the
+             * caller rethrows.
+             */
+            await runPromise.then(() => {}, () => {});
+        } finally {
+            // Only now, with the run settled, is it safe to hand `process.exit`
+            // back to the process.
+            exitSpy.mockRestore();
+        }
+    };
+
+    try {
+        await vi.waitFor(() => {
+            expect(mockCreateSessionScanner).toHaveBeenCalled();
+            expect(mockLoop).toHaveBeenCalled();
+        }, opts.waitForTimeoutMs === undefined ? undefined : { timeout: opts.waitForTimeoutMs });
+    } catch (error) {
+        // The start failure is real and must still surface — it is only the run
+        // that must not survive it.
+        await stopRun();
+        throw error;
+    }
 
     const scannerOptions = mockCreateSessionScanner.mock.calls.at(-1)?.[0];
     const loopOptions = mockLoop.mock.calls.at(-1)?.[0];
     if (!scannerOptions || !loopOptions) {
+        await stopRun();
         throw new Error('runClaude harness did not start');
     }
     const runtimeSession = { thinking: false, cleanup: vi.fn() };
@@ -210,9 +267,17 @@ async function startRemoteRunClaudeHarness(opts: {
         const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
             throw new Error('process.exit');
         }) as never);
-        loopDeferred.resolve(0);
-        await expect(runPromise).rejects.toThrow('process.exit');
-        exitSpy.mockRestore();
+        try {
+            loopDeferred.resolve(0);
+            // Still asserted: on this path the run is expected to have got far
+            // enough to exit, and silently accepting anything else would hide a
+            // run that ended some other way.
+            await expect(runPromise).rejects.toThrow('process.exit');
+        } finally {
+            // A spy left installed outlives its test and turns the next one's
+            // `process.exit` into a thrown error from nowhere.
+            exitSpy.mockRestore();
+        }
     };
 
     return {
@@ -254,9 +319,19 @@ function emitClaudeGoalStatus(
 describe('runClaude remote JSONL scanner', () => {
     const processEvents = ['SIGTERM', 'SIGINT', 'uncaughtException', 'unhandledRejection'] as const;
     const originalListeners = new Map<string, Array<(...args: any[]) => void>>();
+    let originalEnv: NodeJS.ProcessEnv = {};
 
     beforeEach(() => {
         vi.clearAllMocks();
+        /*
+         * A snapshot, because the list below is a **denylist** and a denylist
+         * only covers what somebody remembered to add. Two of the variables
+         * these tests set - `HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS` and
+         * `HAPPY_INITIAL_APPEND_SYSTEM_PROMPT` - were never on it, so they
+         * escaped between tests. Restoring the whole environment closes that by
+         * construction rather than by memory.
+         */
+        originalEnv = { ...process.env };
         for (const event of processEvents) {
             originalListeners.set(event, process.listeners(event as any) as Array<(...args: any[]) => void>);
         }
@@ -303,6 +378,10 @@ describe('runClaude remote JSONL scanner', () => {
     });
 
     afterEach(() => {
+        for (const key of Object.keys(process.env)) {
+            if (!(key in originalEnv)) delete process.env[key];
+        }
+        Object.assign(process.env, originalEnv);
         for (const [event, listeners] of originalListeners) {
             process.removeAllListeners(event as any);
             for (const listener of listeners) {
@@ -534,6 +613,124 @@ describe('runClaude remote JSONL scanner', () => {
             workerDelegation: false,
         });
         expect(process.env.HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS).toBeUndefined();
+
+        await harness.finish();
+    });
+
+    it('shouldCarryNoEnvironmentOutOfATestThatSetOne', async () => {
+        /*
+         * Paired with the test below it. This one sets a variable that is **not**
+         * on the denylist `beforeEach` clears, and the next asserts it is gone -
+         * which is only true because the whole environment is restored.
+         *
+         * The two variables that actually escaped in the failing run,
+         * `HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS` and
+         * `HAPPY_INITIAL_APPEND_SYSTEM_PROMPT`, were missing from that list for
+         * the same reason any denylist eventually is: somebody has to remember.
+         */
+        process.env.HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS = '{"axBase":false}';
+        process.env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT = 'ESCAPES THE DENYLIST';
+        expect(process.env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT).toBe('ESCAPES THE DENYLIST');
+    });
+
+    it('shouldSeeNoneOfThePreviousTestsEnvironment', () => {
+        expect(process.env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT).toBeUndefined();
+        expect(process.env.HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS).toBeUndefined();
+    });
+
+    it('shouldStopTheRunWhenTheHarnessNeverReachesTheLoop', async () => {
+        /*
+         * The start wait can expire under load - it did, in a full-suite run,
+         * where this file took 4,659 ms against 2,243 ms in isolation. When it
+         * does, the harness throws before the test can call `finish()`, and the
+         * run it started is left going.
+         *
+         * The failure must still surface: it is a real failure to start. What
+         * must not survive it is the run.
+         */
+        process.env.HAPPY_INITIAL_PROMPT = '복구 후 이어서 작업해줘';
+        process.env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT = 'LEFT BEHIND';
+        await expect(startRemoteRunClaudeHarness({ waitForTimeoutMs: 1 })).rejects.toThrow();
+    });
+
+    it('shouldWaitForAHeldStartupInsteadOfReturningFromCleanup', async () => {
+        /*
+         * A timer is not a termination.
+         *
+         * An earlier teardown raced the run against a 500 ms timer and returned
+         * when the timer won: it reported a stop that had not happened, and the
+         * `finally` then handed the **real** `process.exit` back while the run
+         * was still starting. Astra's independent repro held startup at
+         * `readSettings` and showed exactly that - cleanup returning first, the
+         * resumed run consuming the next test's env and calling `process.exit`.
+         *
+         * This is that scenario with the assertion inverted to what must now be
+         * true. Deterministic and no stress loop: the run is held at a gate this
+         * test owns. The single wait exists only to outlast the old 500 ms
+         * release, and the assertion is on the gate, not on the clock.
+         */
+        const startGate = createDeferred<any>();
+        mockReadSettings.mockImplementationOnce(() => startGate.promise);
+
+        let settled = false;
+        const attempt = startRemoteRunClaudeHarness({ waitForTimeoutMs: 1 })
+            .then(() => { settled = true; }, () => { settled = true; });
+
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        // Held before the loop is ever reached, so nothing has started and
+        // nothing has stopped. The old implementation had already returned.
+        expect(settled).toBe(false);
+        expect(mockLoop).not.toHaveBeenCalled();
+        /*
+         * And the guard is still in place while the run is still going. The
+         * rejected teardown restored the real `process.exit` in its `finally`
+         * as soon as its timer released it, so a run that exited afterwards
+         * would have taken the worker with it. Ordering asserted, not assumed.
+         */
+        expect(vi.isMockFunction(process.exit)).toBe(true);
+
+        /*
+         * The env a following test would have supplied. It is still consumed by
+         * the resumed run - that is the production path reading and deleting it
+         * - but it is consumed *here*, inside the test that owns the run,
+         * because cleanup has not returned. Containment is the ordering, not a
+         * claim that the run stops reading.
+         */
+        process.env.HAPPY_INITIAL_PROMPT = 'NEXT TEST SENTINEL';
+        startGate.resolve({ machineId: 'machine-1', sandboxConfig: undefined });
+
+        await attempt;
+        expect(settled).toBe(true);
+        // The run reached its exit under this harness's own guard, before the
+        // real `process.exit` was restored.
+        expect(mockLoop).toHaveBeenCalled();
+    });
+
+    it('shouldLeaveTheNextTestUntouchedAfterAStartFailure', async () => {
+        /*
+         * The regression. This is the AX-base case verbatim, and it runs
+         * **immediately after** a harness that failed to start.
+         *
+         * Before the fix it failed here with `expected undefined to be 'USER
+         * PROJECT CONTEXT'` - the abandoned run consumed this test's recovery
+         * env, because the production path deletes those variables once it has
+         * read them, and `beforeEach` clears a denylist that never included
+         * them.
+         */
+        process.env.HAPPY_INITIAL_PROMPT = '복구 후 이어서 작업해줘';
+        process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED = 'true';
+        process.env.HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS = '{"axBase":false}';
+        process.env.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT = [
+            '<!-- ax:base-prompt -->',
+            'SAYCODE AX BASE',
+            '<!-- ax:base-prompt -->',
+            '',
+            'USER PROJECT CONTEXT',
+        ].join('\n');
+
+        const harness = await startRemoteRunClaudeHarness();
+
+        expect(harness.loopOptions.messageQueue.queue[0].mode.appendSystemPrompt).toBe('USER PROJECT CONTEXT');
 
         await harness.finish();
     });

@@ -44,3 +44,4 @@ happy-*.tgz
 
 # npm auth token (never commit)
 .npmrc
+.managed-image/

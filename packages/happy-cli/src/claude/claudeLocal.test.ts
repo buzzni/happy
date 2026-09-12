@@ -6,6 +6,7 @@ const {
     mockSpawn,
     mockClaudeFindLastSession,
     mockInitializeSandbox,
+    mockVerifySandboxCapability,
     mockWrapCommand,
     mockSandboxCleanup,
     mockLoggerDebug,
@@ -13,6 +14,7 @@ const {
     mockSpawn: vi.fn(),
     mockClaudeFindLastSession: vi.fn(),
     mockInitializeSandbox: vi.fn(),
+    mockVerifySandboxCapability: vi.fn(),
     mockWrapCommand: vi.fn(),
     mockSandboxCleanup: vi.fn(),
     mockLoggerDebug: vi.fn(),
@@ -61,6 +63,11 @@ vi.mock('@/sandbox/manager', () => ({
     wrapCommand: mockWrapCommand,
 }));
 
+vi.mock('@/sandbox/executionCapability', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('@/sandbox/executionCapability')>()),
+    verifySandboxExecutionCapability: mockVerifySandboxCapability,
+}));
+
 describe('claudeLocal --continue handling', () => {
     let onSessionFound: any;
 
@@ -91,6 +98,8 @@ describe('claudeLocal --continue handling', () => {
         vi.clearAllMocks();
         mockInitializeSandbox.mockResolvedValue(mockSandboxCleanup);
         mockWrapCommand.mockResolvedValue('wrapped claude command');
+        mockVerifySandboxCapability.mockResolvedValue({ ok: true });
+        mockSandboxCleanup.mockResolvedValue(undefined);
     });
 
     it('should convert --continue to --resume with last session ID', async () => {
@@ -388,6 +397,7 @@ describe('claudeLocal --continue handling', () => {
         expect(mockInitializeSandbox).toHaveBeenCalledWith(
             expect.objectContaining({ enabled: true }),
             '/tmp/workspace',
+            'owner-choice',
         );
         expect(mockWrapCommand).toHaveBeenCalledWith(expect.stringContaining('--dangerously-skip-permissions'));
         expect(mockSpawn).toHaveBeenCalledWith(
@@ -396,6 +406,126 @@ describe('claudeLocal --continue handling', () => {
             expect.objectContaining({ shell: true, cwd: '/tmp/workspace' }),
         );
         expect(mockSandboxCleanup).toHaveBeenCalledTimes(1);
+    });
+
+
+    // root 프로브(2026-09-10): 기본 Docker 에서 initialize 는 성공하고 감싼 자식이
+    // `bwrap: Creating new namespace failed` 로 죽는다. mandatory 머신에서는 그
+    // 자식을 아예 띄우지 않는다 — 띄우고 실패시키면 비격리 재시도 여지가 남는다.
+    it('refuses before spawning when the sandbox cannot actually execute', async () => {
+        mockVerifySandboxCapability.mockResolvedValue({
+            ok: false,
+            reason: 'namespace-denied',
+            detail: 'bwrap: Creating new namespace failed: Operation not permitted',
+        });
+
+        await expect(claudeLocal({
+            abort: new AbortController().signal,
+            sessionId: null,
+            path: '/tmp',
+            onSessionFound,
+            claudeArgs: [],
+            sandboxPolicyMode: 'mandatory',
+            sandboxConfig: {
+                enabled: true,
+                sessionIsolation: 'workspace',
+                customWritePaths: [],
+                denyReadPaths: ['~/.ssh'],
+                extraWritePaths: ['/tmp'],
+                denyWritePaths: ['.env'],
+                networkMode: 'allowed',
+                allowedDomains: [],
+                deniedDomains: [],
+                allowLocalBinding: true,
+            },
+        })).rejects.toThrow(/capability-unavailable/);
+
+        expect(mockSpawn).not.toHaveBeenCalled();
+        expect(mockSandboxCleanup).toHaveBeenCalledTimes(1);
+    });
+
+    it('spawns the wrapped child when the sandbox can execute', async () => {
+        await claudeLocal({
+            abort: new AbortController().signal,
+            sessionId: null,
+            path: '/tmp',
+            onSessionFound,
+            claudeArgs: [],
+            sandboxPolicyMode: 'mandatory',
+            sandboxConfig: {
+                enabled: true,
+                sessionIsolation: 'workspace',
+                customWritePaths: [],
+                denyReadPaths: ['~/.ssh'],
+                extraWritePaths: ['/tmp'],
+                denyWritePaths: ['.env'],
+                networkMode: 'allowed',
+                allowedDomains: [],
+                deniedDomains: [],
+                allowLocalBinding: true,
+            },
+        });
+
+        expect(mockVerifySandboxCapability).toHaveBeenCalledTimes(1);
+        expect(mockSpawn).toHaveBeenCalledWith(
+            'wrapped claude command',
+            [],
+            expect.objectContaining({ shell: true }),
+        );
+    });
+
+    // 개인 머신에는 없던 비용·동작을 넣지 않는다.
+    it('does not probe sandbox capability on an owner-choice machine', async () => {
+        await claudeLocal({
+            abort: new AbortController().signal,
+            sessionId: null,
+            path: '/tmp',
+            onSessionFound,
+            claudeArgs: [],
+            sandboxConfig: {
+                enabled: true,
+                sessionIsolation: 'workspace',
+                customWritePaths: [],
+                denyReadPaths: ['~/.ssh'],
+                extraWritePaths: ['/tmp'],
+                denyWritePaths: ['.env'],
+                networkMode: 'allowed',
+                allowedDomains: [],
+                deniedDomains: [],
+                allowLocalBinding: true,
+            },
+        });
+
+        expect(mockVerifySandboxCapability).not.toHaveBeenCalled();
+    });
+
+    // 공유 머신(mandatory)에서는 위 폴백이 곧 격리 해제다. 개인 머신의 위 동작은
+    // 그대로 두고, 정책이 필수일 때만 child 를 띄우지 않고 사유와 함께 실패한다.
+    it('refuses to spawn an unsandboxed child when the machine policy is mandatory', async () => {
+        mockInitializeSandbox.mockRejectedValue(new Error('bwrap unavailable'));
+
+        await expect(claudeLocal({
+            abort: new AbortController().signal,
+            sessionId: null,
+            path: '/tmp',
+            onSessionFound,
+            claudeArgs: [],
+            sandboxPolicyMode: 'mandatory',
+            sandboxConfig: {
+                enabled: true,
+                sessionIsolation: 'workspace',
+                customWritePaths: [],
+                denyReadPaths: ['~/.ssh'],
+                extraWritePaths: ['/tmp'],
+                denyWritePaths: ['.env'],
+                networkMode: 'allowed',
+                allowedDomains: [],
+                deniedDomains: [],
+                allowLocalBinding: true,
+            },
+        })).rejects.toThrow(/init-failed/);
+
+        expect(mockSpawn).not.toHaveBeenCalled();
     });
 
     it('should continue without sandbox when initialization fails', async () => {

@@ -1,12 +1,15 @@
 import { SandboxManager } from '@anthropic-ai/sandbox-runtime';
 import type { SandboxConfig } from '@/persistence';
 import { buildSandboxRuntimeConfig } from './config';
+import type { SandboxPolicyMode } from './sandboxPolicy';
 
 export async function initializeSandbox(
     sandboxConfig: SandboxConfig,
     sessionPath: string,
+    /** 생략하면 개인 머신(owner-choice)으로 본다 — sandboxPolicy.ts */
+    policyMode: SandboxPolicyMode = 'owner-choice',
 ): Promise<() => Promise<void>> {
-    const runtimeConfig = buildSandboxRuntimeConfig(sandboxConfig, sessionPath);
+    const runtimeConfig = buildSandboxRuntimeConfig(sandboxConfig, sessionPath, policyMode);
     await SandboxManager.initialize(runtimeConfig);
 
     return async () => {

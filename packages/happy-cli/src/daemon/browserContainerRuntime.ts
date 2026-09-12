@@ -1,7 +1,78 @@
+import { createHash } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { validateViewerKey } from './remoteViewer'
 
 type Exec = (command: string, args: string[]) => Promise<string>
+
+/** The container port noVNC is served on; the only one ever published. */
+const VIEWER_CONTAINER_PORT = '6080/tcp'
+const MANAGED_SESSION_LABEL = 'ai.saycode.browser-session'
+const VIEWER_KEY_LABEL = 'ai.saycode.viewer-key'
+/**
+ * One `docker inspect` carrying everything the fingerprint is made of. A Go
+ * template rather than `{{json .}}` so the broker parses a fixed five-field
+ * line instead of the whole container document.
+ */
+const RUNTIME_INSPECT_FORMAT = [
+    '{{.Id}}',
+    '{{.State.StartedAt}}',
+    `{{index .Config.Labels "${VIEWER_KEY_LABEL}"}}`,
+    `{{index .Config.Labels "${MANAGED_SESSION_LABEL}"}}`,
+    '{{json .NetworkSettings.Ports}}',
+].join('\t')
+
+/** Docker prints this for a container that has never run. */
+const DOCKER_ZERO_TIME = '0001-01-01T00:00:00Z'
+/** Go templates print this for an absent map key. */
+const GO_NO_VALUE = '<no value>'
+const CONTAINER_ID_RE = /^[0-9a-f]{12,64}$/
+/** The publish address the daemon's own 127.0.0.1 connection provably lands on. */
+const LOOPBACK_HOST_IP = '127.0.0.1'
+
+type PortBinding = { HostIp?: unknown; HostPort?: unknown }
+
+/**
+ * Whether 6080 is published to loopback on exactly `hostPort`, and nowhere
+ * else. A second binding on 0.0.0.0 is not "also fine": it means the viewer
+ * is reachable from off-box, which is a different runtime posture than the
+ * one the fingerprint would be claiming.
+ */
+function publishesOnlyLoopback(ports: unknown, hostPort: number): boolean {
+    if (!ports || typeof ports !== 'object' || Array.isArray(ports)) return false
+    const bindings = (ports as Record<string, unknown>)[VIEWER_CONTAINER_PORT]
+    if (!Array.isArray(bindings) || bindings.length !== 1) return false
+    const [binding] = bindings as PortBinding[]
+    return binding?.HostIp === LOOPBACK_HOST_IP && String(binding?.HostPort) === String(hostPort)
+}
+
+/**
+ * Opaque proof of *this run of this container*, for the daemon to bind a
+ * viewer token to.
+ *
+ * `State.StartedAt` is in it for the same reason the project-side evidence
+ * uses it and not `CreatedAt`: a `docker restart` keeps the id and the name,
+ * so a fingerprint without the start time would still verify against the
+ * process that replaced the one the token was minted for. The host port is in
+ * it because the same container republished elsewhere is a different
+ * destination.
+ */
+export function browserContainerRuntimeFingerprint(input: {
+    containerId: string
+    startedAt: string
+    viewerKey: string
+    hostPort: number
+}): string {
+    return createHash('sha256')
+        .update([
+            'browser-viewer-container',
+            input.containerId,
+            input.startedAt,
+            input.viewerKey,
+            String(input.hostPort),
+            VIEWER_CONTAINER_PORT,
+        ].join('\0'))
+        .digest('hex')
+}
 
 function containerName(viewerKey: string): string {
     return `happy-browser-${viewerKey}`
@@ -134,12 +205,54 @@ export class BrowserContainerRuntime {
             .map((viewerKey) => ({ viewerKey }))
     }
 
-    async lookup(viewerKey: string): Promise<{ webPort: number; profileVolume: string } | null> {
+    async lookup(viewerKey: string): Promise<{
+        webPort: number
+        profileVolume: string
+        runtimeFingerprint?: string
+    } | null> {
         const name = containerName(viewerKey)
         const state = await this.inspectContainer(name)
         if (!state.running || await this.health(name) !== 'healthy') return null
-        const webPort = parsePublishedPort(await this.exec('docker', ['port', name, '6080/tcp']))
-        return { webPort, profileVolume: browserProfileVolume(viewerKey) }
+        const webPort = parsePublishedPort(await this.exec('docker', ['port', name, VIEWER_CONTAINER_PORT]))
+        const runtimeFingerprint = await this.runtimeFingerprint(name, viewerKey, webPort)
+        return {
+            webPort,
+            profileVolume: browserProfileVolume(viewerKey),
+            // Absent rather than faked when anything could not be proven: the
+            // daemon refuses a bound request with no fingerprint, and that is
+            // the intended outcome — it must never fall back to weaker
+            // evidence or to the native registry.
+            ...(runtimeFingerprint ? { runtimeFingerprint } : {}),
+        }
+    }
+
+    /**
+     * Reads the container's real identity and refuses to describe anything it
+     * could not confirm. Returns null on any mismatch or read failure.
+     */
+    private async runtimeFingerprint(
+        name: string,
+        viewerKey: string,
+        webPort: number,
+    ): Promise<string | null> {
+        const raw = await this.exec('docker', ['inspect', '--format', RUNTIME_INSPECT_FORMAT, name])
+            .then((value) => value.trim(), () => null)
+        if (!raw) return null
+        const [containerId, startedAt, viewerLabel, sessionLabel, portsJson] = raw.split('\t')
+        if (!containerId || !CONTAINER_ID_RE.test(containerId)) return null
+        if (!startedAt || startedAt === GO_NO_VALUE || startedAt === DOCKER_ZERO_TIME) return null
+        // The label is the only thing tying this container to *this* user's
+        // viewer; a name match is not the same claim.
+        if (viewerLabel !== viewerKey) return null
+        if (sessionLabel !== '1') return null
+        let ports: unknown
+        try {
+            ports = JSON.parse(portsJson ?? '')
+        } catch {
+            return null
+        }
+        if (!publishesOnlyLoopback(ports, webPort)) return null
+        return browserContainerRuntimeFingerprint({ containerId, startedAt, viewerKey, hostPort: webPort })
     }
 
     async migrateLegacyProfile(viewerKey: string, legacyProfileDir: string): Promise<void> {

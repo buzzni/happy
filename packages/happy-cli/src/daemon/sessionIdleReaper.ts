@@ -161,7 +161,14 @@ export type StopSessionContext = {
 export type StopSessionResult =
   | { stopped: true }
   | { stopped: false; reason: 'not-found' }
-  | { stopped: false; reason: 'active'; guard: string; activity: IdleStopGuardActivity };
+  | { stopped: false; reason: 'active'; guard: string; activity: IdleStopGuardActivity }
+  /**
+   * A managed generation. A signal to the tracked pid would stop neither the
+   * generation's tools nor the broker that grants them, and would prove
+   * nothing either way, so the stop goes to the supervisor instead and this
+   * path reports that it did not do it itself.
+   */
+  | { stopped: false; reason: 'managed-generation'; detail: string };
 
 const POLICY_STOP_SOURCES = new Set(['project-session-idle-stop', 'session-idle-reaper', 'session-zombie-sweep', 'session-empty-reaper']);
 
