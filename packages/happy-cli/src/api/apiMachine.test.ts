@@ -492,3 +492,106 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 });
+
+describe('stop-session verifyExit contract', () => {
+    const handlers = (overrides: Record<string, unknown> = {}) => ({
+        spawnSession: vi.fn(),
+        stopSession: vi.fn(() => ({ stopped: true as const })),
+        requestShutdown: vi.fn(),
+        portRegistry: {} as any,
+        aiCredentialRuntime: {} as any,
+        ...overrides,
+    });
+
+    const stopHandler = (client: ApiMachineClient) => (client as any).rpcHandlerManager
+        .registerHandler.mock.calls.find(([method]: [string]) => method === 'stop-session')?.[1];
+
+    it('answers a legacy request exactly as before, with no verification field', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const stopSessionWithExitVerification = vi.fn();
+        client.setRPCHandlers(handlers({ stopSessionWithExitVerification }) as any);
+
+        await expect(stopHandler(client)({ sessionId: 'session-1', source: 'project-delete' }))
+            .resolves.toEqual({ message: 'Session stopped', stopped: true });
+        expect(stopSessionWithExitVerification).not.toHaveBeenCalled();
+    });
+
+    it('returns the verified exit alongside the legacy fields for verifyExit: true', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const stopSession = vi.fn(() => ({ stopped: true as const }));
+        const stopSessionWithExitVerification = vi.fn(async () => ({
+            result: { stopped: true as const },
+            exitVerification: {
+                status: 'exited' as const,
+                scope: 'session-process-tree-snapshot' as const,
+                observedProcessCount: 3,
+            },
+        }));
+        client.setRPCHandlers(handlers({ stopSession, stopSessionWithExitVerification }) as any);
+
+        await expect(stopHandler(client)({
+            sessionId: 'session-1',
+            source: 'project-delete',
+            reason: 'deletion',
+            mode: 'force',
+            verifyExit: true,
+        })).resolves.toEqual({
+            message: 'Session stopped',
+            stopped: true,
+            exitVerification: {
+                status: 'exited',
+                scope: 'session-process-tree-snapshot',
+                observedProcessCount: 3,
+            },
+        });
+        expect(stopSessionWithExitVerification).toHaveBeenCalledWith('session-1', {
+            source: 'project-delete',
+            reason: 'deletion',
+            mode: 'force',
+        });
+        // The verifier owns the stop; the legacy path must not fire a second one.
+        expect(stopSession).not.toHaveBeenCalled();
+    });
+
+    it('returns an untracked acknowledgement, never an exited claim', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.setRPCHandlers(handlers({
+            stopSessionWithExitVerification: vi.fn(async () => ({
+                result: { stopped: false as const, reason: 'not-found' as const },
+                exitVerification: {
+                    status: 'not-tracked' as const,
+                    scope: 'session-process-tree-snapshot' as const,
+                    detail: 'session-not-tracked' as const,
+                },
+            })),
+        }) as any);
+
+        await expect(stopHandler(client)({ sessionId: 'session-1', verifyExit: true })).resolves.toEqual({
+            message: 'Session not tracked',
+            stopped: false,
+            reason: 'not-found',
+            exitVerification: {
+                status: 'not-tracked',
+                scope: 'session-process-tree-snapshot',
+                detail: 'session-not-tracked',
+            },
+        });
+    });
+
+    it('falls back to the legacy stop marked unavailable when the daemon cannot verify', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const stopSession = vi.fn(() => ({ stopped: true as const }));
+        client.setRPCHandlers(handlers({ stopSession }) as any);
+
+        await expect(stopHandler(client)({ sessionId: 'session-1', verifyExit: true })).resolves.toEqual({
+            message: 'Session stopped',
+            stopped: true,
+            exitVerification: {
+                status: 'unavailable',
+                scope: 'session-process-tree-snapshot',
+                detail: 'verification-unsupported',
+            },
+        });
+        expect(stopSession).toHaveBeenCalledTimes(1);
+    });
+});

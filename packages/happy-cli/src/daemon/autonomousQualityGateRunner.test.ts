@@ -44,13 +44,13 @@ describe('runAutonomousQualityGatePhase', () => {
         let childPid: number | undefined;
         try {
             const result = await runAutonomousQualityGatePhase(
-                // A second, not 100ms: the shell has to spawn and reach its
+                // Two seconds, not 100ms: the shell has to spawn and reach its
                 // `printf` before the phase is killed. The phase still times out
                 // — it waits on a 30s sleep — so what is under test is
                 // unchanged. A larger budget narrows the race against spawn
                 // latency; it does not remove it, which is why an unprinted pid
                 // now fails as itself rather than as a surviving child.
-                phase("trap '' TERM; sleep 30 & child=$!; printf \"$child\"; wait", 1_000),
+                phase("trap '' TERM; sleep 30 & child=$!; printf \"$child\"; wait", 2_000),
                 { cwd, killGraceMs: 50 },
             );
 
@@ -72,12 +72,14 @@ describe('runAutonomousQualityGatePhase', () => {
             // A SIGKILL request does not synchronously guarantee that
             // kill(pid, 0) reports absence; measured here, the descendant took
             // several milliseconds to disappear under load. Wait boundedly —
-            // a group that was never killed still fails.
+            // a group that was never killed still fails, because the fixture
+            // holds a 30s sleep that outlives this window.
             await vi.waitFor(() => {
                 expect(() => process.kill(childPid!, 0)).toThrow();
             }, { timeout: 2_000, interval: 10 });
         } finally {
-            // Only the pid this test created, and never 0 or a group.
+            // A failed assertion above must not leave a 30s sleep behind, and
+            // only the pid this test created — never 0 or a group.
             if (childPid !== undefined && Number.isSafeInteger(childPid) && childPid > 0) {
                 try { process.kill(childPid, 'SIGKILL'); } catch { /* already exited */ }
             }

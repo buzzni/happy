@@ -7,6 +7,7 @@ import { claudeRemoteLauncher } from "./claudeRemoteLauncher"
 import { ApiClient } from "@/lib"
 import type { JsRuntime } from "./runClaude"
 import type { SandboxConfig } from "@/persistence"
+import type { SandboxPolicyMode } from "@/sandbox/sandboxPolicy"
 import type { McpConfigSource } from './mcpConfigSynchronizer'
 import type { SaycodePromptBlockOverrides } from '@/prompt/promptProvenance'
 import type { CheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition'
@@ -59,6 +60,7 @@ interface LoopOptions {
     messageQueue: MessageQueue2<EnhancedMode>
     allowedTools?: string[]
     sandboxConfig?: SandboxConfig
+    sandboxPolicyMode?: SandboxPolicyMode
     checkpointComposition?: CheckpointSessionComposition
     onSessionReady?: (session: Session) => void
     onAbort?: () => void
@@ -91,6 +93,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         messageQueue: opts.messageQueue,
         allowedTools: opts.allowedTools,
         sandboxConfig: opts.sandboxConfig,
+        sandboxPolicyMode: opts.sandboxPolicyMode,
         checkpointComposition: opts.checkpointComposition,
         onModeChange: opts.onModeChange,
         onAbort: opts.onAbort,

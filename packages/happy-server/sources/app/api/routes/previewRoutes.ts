@@ -17,12 +17,41 @@
  *   an Authorization header).
  */
 
+import crypto from "node:crypto";
 import { z } from "zod";
 import { db } from "@/storage/db";
 import { log } from "@/utils/log";
 import { eventRouter } from "@/app/events/eventRouter";
 import { findMachineSockets as findMachineSocketsCrossReplica } from "@/app/events/findMachineSockets";
-import { signPreviewToken, verifyPreviewToken } from "@/modules/preview/previewToken";
+import {
+    signPreviewToken,
+    verifyPreviewToken,
+    verifyExpiredPreviewTokenForRecovery,
+    isViewerBinding,
+    type PreviewTokenBinding,
+    type PreviewViewerBinding,
+} from "@/modules/preview/previewToken";
+import {
+    type LeaseFailureStatus,
+    resolvePreviewBindingPolicy,
+    planTrustedMint,
+    decideBearerMint,
+    type PreviousTokenCheck,
+    decideRelayBinding,
+    interpretLeaseAck,
+    describeLeaseFailure,
+    isBindingEnforcementEchoed,
+    isStaleRuntimeBinding,
+    isRuntimeEvidenceBusy,
+    LEASE_UNSUPPORTED_CODE,
+    type LeaseAck,
+    viewerLeaseFailureStatus,
+} from "@/modules/preview/previewRuntimeBinding";
+import {
+    resolvePreviewAuthorizeConfig,
+    createPreviewAuthorizer,
+    type PreviewAuthorizer,
+} from "@/modules/preview/previewAuthorizeClient";
 import { readPreviewCookie, buildPreviewCookie } from "@/modules/preview/previewCookie";
 import {
     filterUpstreamCookieHeader,
@@ -42,6 +71,13 @@ import { type Fastify } from "../types";
 
 interface ProxySuccess {
     type: 'success';
+    /**
+     * specs/runtime-isolation-hardening (H3) — set only by a daemon that
+     * actually verified the relayed binding. A daemon predating H3 answers
+     * with an otherwise identical envelope, so the absence of this flag is
+     * how the relay notices that a bound token was served unchecked.
+     */
+    bindingEnforced?: boolean;
     status: number;
     // `set-cookie` arrives as an array from current daemons and as a
     // comma-joined string from older ones — see splitSetCookieValues.
@@ -69,6 +105,10 @@ interface ProxyHttpRequestPayload {
     path: string;
     headers: Record<string, string>;
     bodyB64: string | null;
+    /** Runtime the token was minted for; omitted for unbound (legacy) tokens. */
+    binding?:
+        | { projectId: string; leaseId: string; workspacePaths: string[] }
+        | { purpose: 'viewer'; viewerKey: string; leaseId: string };
 }
 
 function isProxyRpcResponse(raw: unknown): raw is ProxyRpcResponse {
@@ -99,21 +139,348 @@ export interface PreviewRelayMachineSocket {
     timeout(ms: number): { emitWithAck(event: string, payload: unknown): Promise<unknown> };
 }
 
+/**
+ * specs/runtime-isolation-hardening (H3, P1) — the event a *bound* request
+ * travels on.
+ *
+ * A daemon that predates runtime binding has no listener for it, so its ack
+ * simply never comes and nothing is executed. That is the point: the
+ * `bindingEnforced` echo check on the legacy event catches a downgraded
+ * *response*, but only after the daemon has already run the request against
+ * whatever was on that port — which for a POST is not something a 502 can
+ * take back.
+ */
+export const BOUND_PROXY_EVENT = 'preview-proxy-http-bound';
+
+/**
+ * specs/runtime-isolation-hardening (H3 viewer purpose) — the viewer variant
+ * travels on its own event for the same reason the project one does, and
+ * separately from it so neither daemon handler can be handed the other's
+ * shape. A daemon that does not implement viewer binding has no listener
+ * here, so it never opens the upstream connection at all.
+ */
+export const VIEWER_BOUND_PROXY_EVENT = 'preview-proxy-http-viewer-bound';
+
+/** Mint/recheck-time viewer lease: `{viewerKey, port}`, same ack envelope. */
+export const VIEWER_LEASE_EVENT = 'preview-viewer-runtime-lease';
+
+/** The pre-H3, unbound relay event. Named so the dispatch below reads as a
+ *  three-way choice rather than one special case and a string literal. */
+const LEGACY_PROXY_EVENT = 'proxy-http-request';
+
+/** One log-safe phrase for either variant, so the relay's failure lines stay
+ *  comparable across purposes. */
+export function describeRelayBindingTarget(binding: ProxyHttpRequestPayload['binding']): string {
+    if (!binding) return 'unbound';
+    return isViewerRelayBinding(binding) ? `viewer=${binding.viewerKey}` : `project=${binding.projectId}`;
+}
+
+export function isViewerRelayBinding(
+    binding: ProxyHttpRequestPayload['binding'],
+): binding is { purpose: 'viewer'; viewerKey: string; leaseId: string } {
+    return (binding as { purpose?: string } | undefined)?.purpose === 'viewer';
+}
+
+/** Methods that may be re-issued to another candidate socket. */
+const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
 export async function relayProxyHttpRequest(
     machineSockets: PreviewRelayMachineSocket[],
     payload: ProxyHttpRequestPayload,
     timeoutMs = RPC_TIMEOUT_MS,
 ): Promise<ProxyRpcResponse> {
-    const attempts = machineSockets.map(async (socket) => {
-        const raw = await socket
-            .timeout(timeoutMs)
-            .emitWithAck('proxy-http-request', payload);
-        if (!isProxyRpcResponse(raw)) {
-            throw new Error(`Malformed proxy response from socket ${socket.id}`);
+    // Legacy (unbound) path, unchanged: race every candidate and take the
+    // first answer. Reconnects leave stale sockets behind and nothing here
+    // knows which is live.
+    if (!payload.binding) {
+        const attempts = machineSockets.map(async (socket) => {
+            const raw = await socket
+                .timeout(timeoutMs)
+                .emitWithAck(LEGACY_PROXY_EVENT, payload);
+            if (!isProxyRpcResponse(raw)) {
+                throw new Error(`Malformed proxy response from socket ${socket.id}`);
+            }
+            return raw;
+        });
+        return Promise.any(attempts);
+    }
+
+    // Bound path: one connection at a time, never in parallel. A fan-out
+    // executes the same request on every candidate, and for a mutation that
+    // is the same click landing twice on two runtimes.
+    const retryable = IDEMPOTENT_METHODS.has(payload.method.toUpperCase());
+    const deadline = Date.now() + timeoutMs;
+    let lastError: Error | null = null;
+    for (const socket of machineSockets) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        try {
+            const raw = await socket
+                .timeout(Math.min(timeoutMs, remaining))
+                .emitWithAck(
+                    isViewerRelayBinding(payload.binding) ? VIEWER_BOUND_PROXY_EVENT : BOUND_PROXY_EVENT,
+                    payload,
+                );
+            if (!isProxyRpcResponse(raw)) {
+                throw new Error(`Malformed proxy response from socket ${socket.id}`);
+            }
+            return raw;
+        } catch (err) {
+            lastError = err instanceof Error ? err : new Error(String(err));
+            // A socket that did not answer may still have done the work. Only
+            // a read may be re-issued somewhere else.
+            if (!retryable) break;
         }
-        return raw;
+    }
+    throw new BoundRelayUnansweredError(lastError?.message ?? 'no candidate daemon answered');
+}
+
+/**
+ * No candidate answered a bound request. Either the daemon predates the bound
+ * event (no listener, so no ack) or the socket is stale. Reported as one
+ * thing on purpose: from here they are indistinguishable, and the operator's
+ * next step — check that happy-cli is current — is the same. It is *not*
+ * folded into the generic relay timeout, because a silent old daemon is the
+ * failure this event was added to make visible.
+ */
+export class BoundRelayUnansweredError extends Error {
+    readonly code = LEASE_UNSUPPORTED_CODE;
+    constructor(detail: string) {
+        super(detail);
+        this.name = 'BoundRelayUnansweredError';
+    }
+}
+
+/**
+ * specs/runtime-isolation-hardening (H3, F11) — constant-time comparison of
+ * the shared secret. `!==` returns as soon as two bytes differ, which leaks
+ * the length of the matching prefix to a caller that can time the endpoint;
+ * this route is reachable by anything that can reach the server.
+ */
+export function matchesTrustedSecret(provided: unknown, expected: string | undefined): boolean {
+    if (!expected || typeof provided !== 'string') return false;
+    const a = Buffer.from(provided, 'utf-8');
+    const b = Buffer.from(expected, 'utf-8');
+    // timingSafeEqual throws on a length mismatch, and the length itself is
+    // not the secret — compare a fixed-size digest so unequal lengths cost
+    // the same as equal ones.
+    const digest = (value: Buffer) => crypto.createHash('sha256').update(value).digest();
+    return crypto.timingSafeEqual(digest(a), digest(b));
+}
+
+/**
+ * specs/runtime-isolation-hardening (H3, P4) — the token to hand the re-mint
+ * page, or nothing.
+ *
+ * The studio reads `previousToken` as "this session was bound" and forces a
+ * trusted, bound re-mint on it. So it may only be sent when the token really
+ * did carry a binding: passing an unbound or unreadable one would demand a
+ * shared secret and a current daemon for a flow that works without either
+ * today. Signature is checked (expiry is not — a stale bound token is exactly
+ * the case recovery exists for), so nothing a caller made up gets forwarded.
+ */
+/**
+ * What the re-mint page may say about the session it is replacing: the token
+ * itself, and — only for a viewer — its purpose.
+ *
+ * The purpose is derived here from the *verified* claim rather than from
+ * anything the page or the browser could assert, and it never travels without
+ * the token that proves it.
+ */
+function recoverableBoundContext(
+    token: string | undefined,
+): { previousToken?: string; previousPurpose?: 'viewer' } {
+    if (!token) return {};
+    const bind = verifyExpiredPreviewTokenForRecovery(token)?.bind;
+    if (!bind) return {};
+    return isViewerBinding(bind)
+        ? { previousToken: token, previousPurpose: 'viewer' }
+        : { previousToken: token };
+}
+
+/** Decode the replaced token for planTrustedMint — signature required, expiry not. */
+function readPreviousToken(previousToken: string | undefined): PreviousTokenCheck {
+    if (!previousToken) return { kind: 'absent' };
+    const claims = verifyExpiredPreviewTokenForRecovery(previousToken);
+    return claims ? { kind: 'token', claims } : { kind: 'invalid' };
+}
+
+/** Mint-time lease acquisition is short: an old daemon simply never answers. */
+const LEASE_TIMEOUT_MS = 3_000;
+
+/**
+ * specs/runtime-isolation-hardening (H3) — ask the daemon which runtime owns
+ * the port before signing a token for it.
+ *
+ * Every failure mode collapses to a typed answer, never to "assume it is
+ * fine": a daemon with no handler for this event times out, and that is
+ * reported as `RUNTIME_BINDING_UNSUPPORTED` so the caller sees an explicit
+ * "update happy-cli" instead of quietly receiving an unbound token.
+ */
+export async function requestRuntimeLease(
+    machineSockets: PreviewRelayMachineSocket[],
+    payload: { projectId: string; port: number; workspacePaths: string[] },
+    /** Total budget for the whole attempt, not per candidate daemon. */
+    timeoutMs = LEASE_TIMEOUT_MS,
+): Promise<LeaseAck> {
+    const deadline = Date.now() + timeoutMs;
+    let lastFailure: LeaseAck | null = null;
+    for (const socket of machineSockets) {
+        // Reconnects leave stale sockets behind, so the candidate list can be
+        // several deep. Retrying each one on its own clock would let a mint
+        // (or an open tunnel's recheck) run for a multiple of the budget.
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        let ack: LeaseAck;
+        try {
+            ack = interpretLeaseAck(
+                await socket.timeout(Math.min(timeoutMs, remaining)).emitWithAck('preview-runtime-lease', payload),
+            );
+        } catch {
+            ack = { type: 'error', code: LEASE_UNSUPPORTED_CODE, message: 'daemon did not answer' };
+        }
+        if (ack.type === 'success') return ack;
+        lastFailure = ack;
+    }
+    return lastFailure ?? {
+        type: 'error',
+        code: LEASE_UNSUPPORTED_CODE,
+        message: 'no daemon answered the runtime lease request',
+    };
+}
+
+/**
+ * specs/runtime-isolation-hardening (H3 viewer purpose) — the viewer half of
+ * the same question, asked **by key**.
+ *
+ * The daemon is told which viewer to look for, not which port to look at. A
+ * port-first lookup on a shared machine would answer "something is serving
+ * 6080", which is true of another user's screen too; the key is what makes
+ * the answer about this user's runtime.
+ */
+export async function requestViewerRuntimeLease(
+    machineSockets: PreviewRelayMachineSocket[],
+    payload: { viewerKey: string; port: number },
+    timeoutMs = LEASE_TIMEOUT_MS,
+): Promise<LeaseAck> {
+    const deadline = Date.now() + timeoutMs;
+    let lastFailure: LeaseAck | null = null;
+    for (const socket of machineSockets) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        let ack: LeaseAck;
+        try {
+            ack = interpretLeaseAck(
+                await socket.timeout(Math.min(timeoutMs, remaining)).emitWithAck(VIEWER_LEASE_EVENT, payload),
+            );
+        } catch {
+            ack = { type: 'error', code: LEASE_UNSUPPORTED_CODE, message: 'daemon did not answer' };
+        }
+        if (ack.type === 'success') return ack;
+        lastFailure = ack;
+    }
+    return lastFailure ?? {
+        type: 'error',
+        code: LEASE_UNSUPPORTED_CODE,
+        message: 'no daemon answered the viewer runtime lease request',
+    };
+}
+
+/**
+ * Re-check the studio's machine ACL **and** the derived viewer key for a bound
+ * viewer token. Both, because they answer different questions: the ACL says
+ * this user may open a screen on this machine, the key says this is the screen
+ * that belongs to them.
+ */
+export async function authorizeViewerRelayBinding(input: {
+    bind: { studioUserId: string; viewerKey: string };
+    machineId: string;
+    port: number;
+    authorizer: PreviewAuthorizer | null;
+}): Promise<{ kind: 'allow' } | { kind: 'reject'; status: number; code: string; message: string }> {
+    const failClosed = {
+        kind: 'reject' as const,
+        status: 503,
+        code: 'authz-unavailable',
+        message: 'Viewer access could not be verified',
+    };
+    if (!input.authorizer) return failClosed;
+
+    const decision = await input.authorizer.authorize({
+        purpose: 'viewer',
+        studioUserId: input.bind.studioUserId,
+        viewerKey: input.bind.viewerKey,
+        machineId: input.machineId,
+        port: input.port,
     });
-    return Promise.any(attempts);
+    if (decision.kind === 'allowed') return { kind: 'allow' };
+    if (decision.kind === 'denied') {
+        return {
+            kind: 'reject',
+            status: 403,
+            code: 'viewer-access-denied',
+            message: 'Viewer access denied',
+        };
+    }
+    return failClosed;
+}
+
+/**
+ * Re-check the studio's project ACL for a bound token. The token proves which
+ * runtime it was minted for; it cannot prove the user still has access to the
+ * project an hour later, and happy-server has no project tables to answer that
+ * itself.
+ */
+export async function authorizeRelayBinding(input: {
+    access: { projectId: string; studioUserId: string };
+    machineId: string;
+    port: number;
+    authorizer: PreviewAuthorizer | null;
+}): Promise<
+    | { kind: 'allow'; workspacePaths: string[] }
+    | { kind: 'reject'; status: number; code: string; message: string }
+> {
+    const failClosed = {
+        kind: 'reject' as const,
+        status: 503,
+        code: 'authz-unavailable',
+        message: 'Project access could not be verified',
+    };
+    // Fail closed whatever the policy says. The policy decides who must be
+    // issued a bound token; it is not a switch that weakens a token that
+    // already is one. Substituting `allowed + []` for an unreachable studio
+    // would turn an outage of the ACL callback into open access, and the
+    // empty workspace list would additionally be a claim — "this project owns
+    // no directories here" — that nothing verified.
+    if (!input.authorizer) return failClosed;
+
+    const decision = await input.authorizer.authorize({
+        studioUserId: input.access.studioUserId,
+        projectId: input.access.projectId,
+        machineId: input.machineId,
+        port: input.port,
+    });
+    if (decision.kind === 'allowed') return { kind: 'allow', workspacePaths: decision.workspacePaths };
+    if (decision.kind === 'denied') {
+        return {
+            kind: 'reject',
+            status: 403,
+            code: 'project-access-denied',
+            message: 'Project access denied',
+        };
+    }
+    return failClosed;
+}
+
+/**
+ * Built from operator env on every call — never from a token or a request
+ * URL. Resolved per call rather than memoized so that turning the callback on
+ * takes effect on the next request instead of the next restart; there is no
+ * state to keep, because the authorizer deliberately holds no cache.
+ */
+export function getPreviewAuthorizer(): PreviewAuthorizer | null {
+    const config = resolvePreviewAuthorizeConfig(process.env);
+    return config ? createPreviewAuthorizer({ config, fetchImpl: fetch }) : null;
 }
 
 /**
@@ -245,7 +612,27 @@ export function describePreviewRelayFailure(
         ? 502
         : outcome.code === 'INVALID_PORT' || outcome.code === 'INVALID_PATH' ? 400
             : outcome.code === 'TIMEOUT' ? 504
-                : 502;
+                // specs/runtime-isolation-hardening (H3) — the daemon refused
+                // the relay over the token's runtime binding. That is an
+                // authorization answer, not a gateway failure, and 502/504 is
+                // a contract with checkPortReachable that must not absorb it.
+                // A stale lease (the runtime restarted) is 401 so the caller
+                // re-mints; an ownership failure is 403, because re-minting
+                // would only produce the same refusal.
+                // Backpressure from the daemon's probe queue. Retryable, so
+                // it is neither the 403 of an authorization answer nor the
+                // 502 that means the dev server could not be reached.
+                : isRuntimeEvidenceBusy(outcome.code) ? 503
+                    : isStaleRuntimeBinding(outcome.code) ? 401
+                        : outcome.code === 'PROJECT_OWNERSHIP_MISMATCH'
+                            || outcome.code === 'PORT_PROJECT_MISMATCH'
+                            || outcome.code === 'WORKSPACE_UNVERIFIED' ? 403
+                            // specs/runtime-isolation-hardening (H3 viewer
+                            // purpose) — same 404/403/409 as mint
+                            // (describeLeaseFailure), not the relay-specific
+                            // 502 that NO_LISTENER/EVIDENCE_UNAVAILABLE fall
+                            // through to below.
+                            : viewerLeaseFailureStatus(outcome.code) ?? 502;
     const reason = outcome.kind === 'machine-offline'
         ? 'machine-offline'
         : outcome.kind === 'lookup-degraded'
@@ -376,11 +763,167 @@ export function applySubdomainPreviewCorsHeaders(
     return headers;
 }
 
+/**
+ * Mint-time binding: prove the caller may still reach the project, learn its
+ * workspace paths from the studio, and have the daemon pin the runtime that is
+ * serving the port right now.
+ *
+ * Every failure is explicit. In particular a daemon that predates H3 answers
+ * nothing, which surfaces as `RUNTIME_BINDING_UNSUPPORTED` with instructions
+ * to update happy-cli — the one thing it must never do is hand back an
+ * unbound token, because that is the downgrade the whole feature exists to
+ * prevent.
+ */
+async function bindMintedToken(input: {
+    machineId: string;
+    port: number;
+    projectId: string;
+    studioUserId: string;
+    /** Happy account that owns the machine — used only to find its daemon socket. */
+    ownerUserId: string;
+}): Promise<
+    | { kind: 'bound'; bind: PreviewTokenBinding }
+    | { kind: 'reject'; status: LeaseFailureStatus; body: { error: string; code: string } }
+> {
+    // No unbound fallback anywhere below. A request that asked to be bound
+    // and could not be is refused, because a token that silently came back
+    // weaker than the one requested is indistinguishable, to the caller, from
+    // the one it asked for.
+    const access = await authorizeRelayBinding({
+        access: { projectId: input.projectId, studioUserId: input.studioUserId },
+        machineId: input.machineId,
+        port: input.port,
+        authorizer: getPreviewAuthorizer(),
+    });
+    if (access.kind === 'reject') {
+        return {
+            kind: 'reject',
+            status: access.status as LeaseFailureStatus,
+            body: { error: access.message, code: access.code },
+        };
+    }
+
+    const { sockets } = await findMachineSockets(input.ownerUserId, input.machineId);
+    const lease = await requestRuntimeLease(sockets, {
+        projectId: input.projectId,
+        port: input.port,
+        workspacePaths: access.workspacePaths,
+    });
+    if (lease.type === 'error') {
+        const failure = describeLeaseFailure(lease);
+        log(
+            { module: 'preview', level: 'warn' },
+            `preview mint refused reason=${lease.code} machine=${input.machineId} port=${input.port} project=${input.projectId}`,
+        );
+        return { kind: 'reject', status: failure.status, body: failure.body };
+    }
+
+    return {
+        kind: 'bound',
+        bind: {
+            projectId: input.projectId,
+            studioUserId: input.studioUserId,
+            leaseId: lease.leaseId,
+        },
+    };
+}
+
+/** The viewer counterpart: machine ACL + derived key, then the viewer runtime. */
+async function bindMintedViewerToken(input: {
+    machineId: string;
+    port: number;
+    studioUserId: string;
+    viewerKey: string;
+    ownerUserId: string;
+}): Promise<
+    | { kind: 'bound'; bind: PreviewViewerBinding }
+    | { kind: 'reject'; status: LeaseFailureStatus; body: { error: string; code: string } }
+> {
+    const access = await authorizeViewerRelayBinding({
+        bind: { studioUserId: input.studioUserId, viewerKey: input.viewerKey },
+        machineId: input.machineId,
+        port: input.port,
+        authorizer: getPreviewAuthorizer(),
+    });
+    if (access.kind === 'reject') {
+        return {
+            kind: 'reject',
+            status: access.status as LeaseFailureStatus,
+            body: { error: access.message, code: access.code },
+        };
+    }
+
+    const { sockets } = await findMachineSockets(input.ownerUserId, input.machineId);
+    const lease = await requestViewerRuntimeLease(sockets, {
+        viewerKey: input.viewerKey,
+        port: input.port,
+    });
+    if (lease.type === 'error') {
+        const failure = describeLeaseFailure(lease);
+        log(
+            { module: 'preview', level: 'warn' },
+            `preview viewer mint refused reason=${lease.code} machine=${input.machineId} port=${input.port}`,
+        );
+        return { kind: 'reject', status: failure.status, body: failure.body };
+    }
+
+    return {
+        kind: 'bound',
+        bind: {
+            purpose: 'viewer',
+            studioUserId: input.studioUserId,
+            viewerKey: input.viewerKey,
+            leaseId: lease.leaseId,
+        },
+    };
+}
+
+/**
+ * specs/runtime-isolation-hardening (H3, P4) — the token this mint replaces.
+ *
+ * Sent by the re-mint page and forwarded verbatim by the studio. It is not a
+ * credential: the studio's own trusted secret authenticates the call, and the
+ * caller's authenticated project/user are checked against it. What it carries
+ * is the fact that the session being recovered *was bound*, which is the one
+ * thing a plain re-mint has no way to know.
+ */
+const previousTokenBody = {
+    previousToken: z.string().min(1).optional(),
+};
+
+const mintBindingBody = {
+    /** Studio project this token is for. Required once the policy is `required`. */
+    projectId: z.string().min(1).optional(),
+    /**
+     * Studio identity that asked. Deliberately separate from the happy account
+     * in `userId`: a company-owned shared machine mints every member's token
+     * under one account, so that account can never stand in for the person.
+     */
+    studioUserId: z.string().min(1).optional(),
+};
+
+/**
+ * specs/runtime-isolation-hardening (H3 viewer purpose) — a machine-scoped
+ * viewer mint. `viewerKey` is validated to the derived shape here so a caller
+ * cannot smuggle an arbitrary string into a signed claim; whether it is *this
+ * user's* key is settled by the studio callback re-deriving it, not by the
+ * pattern.
+ */
+const mintViewerBody = {
+    purpose: z.literal('viewer').optional(),
+    viewerKey: z.string().regex(/^bv1_[A-Za-z0-9_-]{32}$/).optional(),
+};
+
+const mintErrorBody = z.object({ error: z.string(), code: z.string().optional() });
+
 export function previewRoutes(app: Fastify) {
     // Mint a short-lived ptoken that binds (userId, machineId, port) under HMAC.
     app.post('/v1/preview-token', {
         preHandler: app.authenticate,
         schema: {
+            // Deliberately without projectId/studioUserId: this path cannot
+            // bind, so accepting them would only invite the belief that it
+            // does. Zod strips anything else the caller sends.
             body: z.object({
                 machineId: z.string().min(1),
                 port: z.number().int().min(1).max(65535),
@@ -389,9 +932,10 @@ export function previewRoutes(app: Fastify) {
                 200: z.object({
                     token: z.string(),
                     expiresAt: z.number(),
+                    binding: z.enum(['lease', 'unbound']),
                 }),
-                403: z.object({ error: z.string() }),
-                404: z.object({ error: z.string() }),
+                403: mintErrorBody,
+                404: mintErrorBody,
             },
         },
     }, async (request, reply) => {
@@ -403,9 +947,22 @@ export function previewRoutes(app: Fastify) {
             return reply.code(404).send({ error: 'Machine not found' });
         }
 
+        // specs/runtime-isolation-hardening (H3) — see decideBearerMint. On a
+        // company-owned machine every member holds a bearer for the same
+        // account, so nothing here identifies the person asking, and a
+        // `studioUserId` in the body would be their own claim about
+        // themselves. This path mints unbound or refuses.
+        const bearer = decideBearerMint(resolvePreviewBindingPolicy(process.env), machineId);
+        if (bearer.kind === 'reject') {
+            log(
+                { module: 'preview', level: 'warn' },
+                `preview mint refused reason=${bearer.code} machine=${machineId} port=${port}`,
+            );
+            return reply.code(bearer.status).send({ error: bearer.message, code: bearer.code });
+        }
         const signed = signPreviewToken({ userId, machineId, port });
-        log({ module: 'preview', userId, machineId, port }, 'Minted preview token');
-        return reply.send({ token: signed.token, expiresAt: signed.expiresAt });
+        log({ module: 'preview', userId, machineId, port }, 'Minted preview token (unbound)');
+        return reply.send({ token: signed.token, expiresAt: signed.expiresAt, binding: 'unbound' });
     });
 
     // Trusted-server mint — bypasses strict accountId ACL.
@@ -430,33 +987,108 @@ export function previewRoutes(app: Fastify) {
             body: z.object({
                 machineId: z.string().min(1),
                 port: z.number().int().min(1).max(65535),
+                ...mintBindingBody,
+                ...mintViewerBody,
+                ...previousTokenBody,
             }),
             response: {
                 200: z.object({
                     token: z.string(),
                     expiresAt: z.number(),
+                    binding: z.enum(['lease', 'unbound']),
                 }),
-                401: z.object({ error: z.string() }),
-                404: z.object({ error: z.string() }),
+                400: mintErrorBody,
+                401: mintErrorBody,
+                403: mintErrorBody,
+                404: mintErrorBody,
+                409: mintErrorBody,
+                502: mintErrorBody,
+                503: mintErrorBody,
             },
         },
     }, async (request, reply) => {
         const provided = request.headers['x-trusted-preview-secret'];
         const expected = process.env.WEB_UI_TRUSTED_PREVIEW_SECRET;
-        if (!expected || !provided || provided !== expected) {
+        if (!matchesTrustedSecret(provided, expected)) {
             return reply.code(401).send({ error: 'Invalid trusted secret' });
         }
-        const { machineId, port } = request.body;
+        const { machineId, port, projectId, studioUserId, purpose, viewerKey, previousToken } = request.body;
         const machine = await db.machine.findFirst({ where: { id: machineId } });
         if (!machine) {
             return reply.code(404).send({ error: 'Machine not found' });
         }
-        const signed = signPreviewToken({ userId: machine.accountId, machineId, port });
+
+        // A viewer request carries its identity inside `viewer`, so the
+        // project fields stay empty and `planTrustedMint` can treat a request
+        // that fills both as the ambiguity it is.
+        const viewerRequested = purpose === 'viewer';
+        // Both halves or nothing. A viewer request missing either one would
+        // otherwise fall through to the policy and come back *unbound* — the
+        // exact downgrade this whole path exists to prevent.
+        if (viewerRequested && (!viewerKey || !studioUserId)) {
+            return reply.code(400).send({
+                error: 'viewerKey and studioUserId are required for a viewer preview token',
+                code: 'BINDING_REQUIRED',
+            });
+        }
+        if (!viewerRequested && viewerKey) {
+            return reply.code(400).send({
+                error: 'viewerKey requires purpose "viewer"',
+                code: 'MIXED_BINDING_PURPOSE',
+            });
+        }
+
+        const plan = planTrustedMint({
+            policy: resolvePreviewBindingPolicy(process.env),
+            machineId,
+            port,
+            projectId,
+            studioUserId: viewerRequested ? undefined : studioUserId,
+            viewer: viewerRequested && viewerKey && studioUserId
+                ? { studioUserId, viewerKey }
+                : undefined,
+            previous: readPreviousToken(previousToken),
+        });
+        if (plan.kind === 'reject') {
+            log(
+                { module: 'preview', level: 'warn' },
+                `preview mint refused reason=${plan.code} machine=${machineId} port=${port}`,
+            );
+            return reply.code(plan.status).send({ error: plan.message, code: plan.code });
+        }
+        if (plan.kind === 'unbound') {
+            const signed = signPreviewToken({ userId: machine.accountId, machineId, port });
+            log(
+                { module: 'preview', trusted: true, userId: machine.accountId, machineId, port },
+                `Minted preview token (trusted, unbound: ${plan.reason})`,
+            );
+            return reply.send({ token: signed.token, expiresAt: signed.expiresAt, binding: 'unbound' });
+        }
+
+        const bound = plan.kind === 'bind-viewer'
+            ? await bindMintedViewerToken({
+                machineId,
+                port,
+                studioUserId: studioUserId!,
+                viewerKey: viewerKey!,
+                ownerUserId: machine.accountId,
+            })
+            : await bindMintedToken({
+                machineId,
+                port,
+                projectId: projectId!,
+                studioUserId: studioUserId!,
+                ownerUserId: machine.accountId,
+            });
+        if (bound.kind === 'reject') {
+            return reply.code(bound.status).send(bound.body);
+        }
+        const signed = signPreviewToken({ userId: machine.accountId, machineId, port, bind: bound.bind });
         log(
-            { module: 'preview', trusted: true, userId: machine.accountId, machineId, port },
-            'Minted preview token (trusted)',
+            { module: 'preview', trusted: true, userId: machine.accountId, machineId, port, projectId, purpose: plan.kind === 'bind-viewer' ? 'viewer' : 'project', recovered: plan.forced },
+            'Minted preview token (trusted, bound)',
         );
-        return reply.send({ token: signed.token, expiresAt: signed.expiresAt });
+        return reply.send({ token: signed.token, expiresAt: signed.expiresAt, binding: 'lease' });
     });
 
     // Preview relay route lives inside its own encapsulation scope so we can
@@ -511,8 +1143,12 @@ export function previewRoutes(app: Fastify) {
                 // via /api/preview-mint-remote (Phase 10b) and reloads.
                 // Non-HTML callers (JSON clients, curl, image subresources)
                 // keep getting the existing JSON 401.
-                const acceptHeader = request.headers.accept as string | undefined;
-                const wantsHtmlFallback = shouldServeExpiredHtml(acceptHeader);
+                const wantsHtmlFallback = shouldServeExpiredHtml({
+                    method: request.method,
+                    accept: request.headers.accept as string | undefined,
+                    secFetchDest: request.headers['sec-fetch-dest'] as string | undefined,
+                    secFetchMode: request.headers['sec-fetch-mode'] as string | undefined,
+                });
                 const token = query.ptoken ?? cookieToken;
                 if (!token) {
                     if (wantsHtmlFallback) {
@@ -537,12 +1173,99 @@ export function previewRoutes(app: Fastify) {
                                 machineId: params.machineId,
                                 port: portNum,
                                 reason: 'expired-or-invalid',
+                                // Carries what the replaced session was bound
+                                // to, so the re-mint cannot come back weaker.
+                                ...recoverableBoundContext(token),
                             }));
                     }
                     return reply.code(401).send({ error: 'Invalid or expired ptoken' });
                 }
                 if (claims.machineId !== params.machineId || claims.port !== portNum) {
                     return reply.code(403).send({ error: 'Token does not match requested machine/port' });
+                }
+
+                // specs/runtime-isolation-hardening (H3) — from here on the
+                // token's runtime binding decides whether this request may be
+                // relayed at all, and the studio ACL is re-checked while we
+                // are at it. Both are per request: a token minted an hour ago
+                // proves nothing about now.
+                const bindingPolicy = resolvePreviewBindingPolicy(process.env);
+                const bindingDecision = decideRelayBinding(bindingPolicy, params.machineId, claims);
+                if (bindingDecision.kind === 'reject') {
+                    log(
+                        { module: 'preview', level: 'warn' },
+                        `preview relay refused reason=${bindingDecision.code} machine=${params.machineId} port=${portNum}`,
+                    );
+                    if (wantsHtmlFallback) {
+                        // A top-level navigation carrying an unbound token can
+                        // recover on its own: the fallback page re-mints, and
+                        // that mint now produces a bound token.
+                        return reply
+                            .code(401)
+                            .header('Content-Type', 'text/html; charset=utf-8')
+                            .send(renderExpiredPtokenHtml({
+                                machineId: params.machineId,
+                                port: portNum,
+                                reason: 'expired-or-invalid',
+                                // Carries what the replaced session was bound
+                                // to, so the re-mint cannot come back weaker.
+                                ...recoverableBoundContext(token),
+                            }));
+                    }
+                    return reply
+                        .code(bindingDecision.status)
+                        .send({ error: bindingDecision.message, code: bindingDecision.code });
+                }
+
+                let relayBinding: ProxyHttpRequestPayload['binding'];
+                if (bindingDecision.kind === 'enforce') {
+                  const enforced = bindingDecision.bind;
+                  if (isViewerBinding(enforced)) {
+                    const viewerBind = enforced;
+                    const access = await authorizeViewerRelayBinding({
+                        bind: { studioUserId: viewerBind.studioUserId, viewerKey: viewerBind.viewerKey },
+                        machineId: params.machineId,
+                        port: portNum,
+                        authorizer: getPreviewAuthorizer(),
+                    });
+                    if (access.kind === 'reject') {
+                        log(
+                            { module: 'preview', level: 'warn' },
+                            `preview relay refused reason=${access.code} machine=${params.machineId} port=${portNum} purpose=viewer`,
+                        );
+                        return reply.code(access.status).send({ error: access.message, code: access.code });
+                    }
+                    // No workspacePaths: a viewer has no project directories,
+                    // and an empty list would still be a claim about one.
+                    relayBinding = {
+                        purpose: 'viewer',
+                        viewerKey: viewerBind.viewerKey,
+                        leaseId: viewerBind.leaseId,
+                    };
+                  } else {
+                    const projectBind = enforced;
+                    const access = await authorizeRelayBinding({
+                        access: {
+                            projectId: projectBind.projectId,
+                            studioUserId: projectBind.studioUserId,
+                        },
+                        machineId: params.machineId,
+                        port: portNum,
+                        authorizer: getPreviewAuthorizer(),
+                    });
+                    if (access.kind === 'reject') {
+                        log(
+                            { module: 'preview', level: 'warn' },
+                            `preview relay refused reason=${access.code} machine=${params.machineId} port=${portNum} project=${projectBind.projectId}`,
+                        );
+                        return reply.code(access.status).send({ error: access.message, code: access.code });
+                    }
+                    relayBinding = {
+                        projectId: projectBind.projectId,
+                        leaseId: projectBind.leaseId,
+                        workspacePaths: access.workspacePaths,
+                    };
+                  }
                 }
 
                 if (
@@ -618,9 +1341,16 @@ export function previewRoutes(app: Fastify) {
                         path: upstreamPath,
                         headers: forwardHeaders,
                         bodyB64,
+                        ...(relayBinding ? { binding: relayBinding } : {}),
                     });
                 } catch (err) {
                     log({ module: 'preview', level: 'error' }, `proxy-http-request relay failed for ${machineSockets.length} candidate(s): ${(err as Error).message}`);
+                    if (err instanceof BoundRelayUnansweredError) {
+                        return reply.code(409).send({
+                            error: '이 머신의 daemon 이 결속된 프리뷰 요청에 응답하지 않았습니다. happy-cli 를 업데이트한 뒤 다시 시도하세요.',
+                            code: err.code,
+                        });
+                    }
                     return reply.code(504).send({ error: 'Upstream relay timeout' });
                 }
 
@@ -630,7 +1360,39 @@ export function previewRoutes(app: Fastify) {
                         failureContext,
                     );
                     log({ module: 'preview', level: 'warn' }, failure.logLine);
+                    if (isStaleRuntimeBinding(rpcResponse.code) && wantsHtmlFallback) {
+                        // The dev server restarted under a token that is
+                        // otherwise perfectly valid. The re-mint page asks for
+                        // a lease over the runtime that is there now.
+                        return reply
+                            .code(failure.status)
+                            .header('Content-Type', 'text/html; charset=utf-8')
+                            .send(renderExpiredPtokenHtml({
+                                machineId: params.machineId,
+                                port: portNum,
+                                reason: 'expired-or-invalid',
+                                // Carries what the replaced session was bound
+                                // to, so the re-mint cannot come back weaker.
+                                ...recoverableBoundContext(token),
+                            }));
+                    }
                     return reply.code(failure.status).send({ code: rpcResponse.code, error: rpcResponse.message });
+                }
+
+                // The daemon confirms enforcement explicitly. A daemon that
+                // predates H3 relays the request and answers with an
+                // otherwise identical success envelope, so the missing echo is
+                // the only evidence that a bound token was served unchecked —
+                // and being unable to tell is not permission to serve it.
+                if (relayBinding && !isBindingEnforcementEchoed(rpcResponse)) {
+                    log(
+                        { module: 'preview', level: 'warn' },
+                        `preview relay refused reason=binding-not-enforced machine=${params.machineId} port=${portNum} ${describeRelayBindingTarget(relayBinding)} — daemon predates runtime binding`,
+                    );
+                    return reply.code(502).send({
+                        error: '이 머신의 daemon 이 프리뷰 런타임 결속을 적용하지 않았습니다. happy-cli 를 업데이트하세요.',
+                        code: LEASE_UNSUPPORTED_CODE,
+                    });
                 }
 
                 // Successful proxy response — rewrite HTML/JS/CSS if applicable.

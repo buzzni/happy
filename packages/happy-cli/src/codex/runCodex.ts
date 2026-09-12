@@ -28,6 +28,7 @@ import { logger } from '@/ui/logger';
 import { installBroadKillShims } from '@/utils/broadKillShims';
 import { Credentials, readSettings } from '@/persistence';
 import { resolveSessionSandboxConfig } from '@/sandbox/resolveSessionSandboxConfig';
+import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { initialMachineMetadata } from '@/daemon/run';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
@@ -219,10 +220,12 @@ export async function runCodex(opts: {
     // daemon 이 서버 지시대로 넘긴 설정(AgentTask pr_review 의 networkMode:'allowed' 등)을
     // 로컬 머신 설정보다 우선한다. 이 배선이 없어서 agent=codex 워커가 샌드박스 없이 떴고,
     // Codex 네이티브 readOnly 정책으로 떨어져 lifecycle 콜백을 전부 놓쳤다.
+    const sandboxPolicyMode = resolveSessionSandboxPolicyMode(process.env);
     const sandboxConfig = resolveSessionSandboxConfig({
         noSandbox: Boolean(opts.noSandbox),
         env: process.env,
         settings,
+        policyMode: sandboxPolicyMode,
     });
     // See runClaude: a managed child has no account home and no machine id.
     if (!machineId && !managedStartup) {
@@ -305,6 +308,7 @@ export async function runCodex(opts: {
             projectPath: process.cwd(),
             sessionId: response.id,
             sandboxConfig,
+            sandboxPolicyMode,
             env: process.env,
             checkpointEvents: sandboxConfig?.checkpointProtection
                 ? createCheckpointEventPublisher({
@@ -805,6 +809,7 @@ export async function runCodex(opts: {
         checkpointComposition.sandboxConfig,
         checkpointComposition.beforeTurn,
         checkpointComposition.completeTurn,
+        sandboxPolicyMode,
         // Explicit, and only ever from the verified envelope: it turns off the
         // account-rotation proxy and pins the provider this run may use.
         /*

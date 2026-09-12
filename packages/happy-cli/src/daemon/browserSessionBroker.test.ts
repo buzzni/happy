@@ -171,3 +171,81 @@ describe('BrowserSessionBroker', () => {
         expect(docker.ensure).toHaveBeenCalledTimes(2)
     })
 })
+
+/**
+ * specs/runtime-isolation-hardening (H3, P3) — the fingerprint is the broker's
+ * statement that it *just* verified the container behind this viewer port.
+ *
+ * Everything here is about not letting that statement outlive the check. A
+ * cached lease carries the fingerprint of the moment it was made; re-serving
+ * it after a lookup that could no longer prove anything would turn "verified
+ * now" into "was verified once", which is exactly the claim a restarted or
+ * replaced container needs to be refused on.
+ */
+describe('BrowserSessionBroker — verified runtime fingerprint passthrough', () => {
+    function runtimeWithFingerprint(fingerprint: string | undefined) {
+        const base = runtime()
+        return {
+            ...base,
+            ensure: vi.fn(async (viewerKey: string) => ({
+                webPort: 49100,
+                profileVolume: `volume-${viewerKey}`,
+                reused: false,
+                ...(fingerprint ? { runtimeFingerprint: fingerprint } : {}),
+            })),
+            lookup: vi.fn(async (viewerKey: string) => ({
+                webPort: 49100,
+                profileVolume: `volume-${viewerKey}`,
+                ...(fingerprint ? { runtimeFingerprint: fingerprint } : {}),
+            })),
+        }
+    }
+
+    it('carries the fingerprint from ensure and lookup to the lease', async () => {
+        const docker = runtimeWithFingerprint('fp-1')
+        const broker = new BrowserSessionBroker({ runtime: docker, maxActive: 2, now: () => 1_000 })
+
+        await expect(broker.ensure(A, 'scoped-token-value')).resolves.toMatchObject({ runtimeFingerprint: 'fp-1' })
+        await expect(broker.lookup(A)).resolves.toMatchObject({ runtimeFingerprint: 'fp-1' })
+    })
+
+    it('drops a cached fingerprint when the runtime can no longer prove one', async () => {
+        // Without this the stale value survives the spread and a bound token
+        // keeps verifying against evidence nobody could re-read.
+        const docker = runtimeWithFingerprint('fp-1')
+        const broker = new BrowserSessionBroker({ runtime: docker, maxActive: 2, now: () => 1_000 })
+        await broker.ensure(A, 'scoped-token-value')
+
+        docker.lookup.mockResolvedValue({ webPort: 49100, profileVolume: `volume-${A}` } as never)
+
+        const lease = await broker.lookup(A)
+        expect(lease).toMatchObject({ webPort: 49100 })
+        expect(lease?.runtimeFingerprint).toBeUndefined()
+    })
+
+    it('replaces the fingerprint when the container behind the port changed', async () => {
+        const docker = runtimeWithFingerprint('fp-1')
+        const broker = new BrowserSessionBroker({ runtime: docker, maxActive: 2, now: () => 1_000 })
+        await broker.ensure(A, 'scoped-token-value')
+
+        docker.lookup.mockResolvedValue({
+            webPort: 49100,
+            profileVolume: `volume-${A}`,
+            runtimeFingerprint: 'fp-2',
+        } as never)
+
+        await expect(broker.lookup(A)).resolves.toMatchObject({ runtimeFingerprint: 'fp-2' })
+    })
+
+    it('does not report a fingerprint from touch, which verifies nothing', async () => {
+        // touch only records activity. Letting it hand back the last known
+        // fingerprint would make an idle-keepalive look like a fresh proof.
+        const docker = runtimeWithFingerprint('fp-1')
+        const broker = new BrowserSessionBroker({ runtime: docker, maxActive: 2, now: () => 1_000 })
+        await broker.ensure(A, 'scoped-token-value')
+
+        expect((await broker.touch(A))?.runtimeFingerprint).toBeUndefined()
+        expect((await broker.touchWebPort(49100))?.runtimeFingerprint).toBeUndefined()
+        expect(docker.lookup).not.toHaveBeenCalled()
+    })
+})

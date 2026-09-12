@@ -34,6 +34,7 @@ import {
   PersistedTrackedSession,
   readDaemonState,
   acquireDaemonLock,
+  readDaemonLockHolderPid,
   releaseDaemonLock,
   isPidAlive,
   readPersistedSessions,
@@ -52,7 +53,7 @@ import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
 import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
 import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
-import { shouldYieldDaemonStateOwnership } from './daemonStateOwnership';
+import { resolveDaemonStateOwnership } from './daemonStateOwnership';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
 import { statSync } from 'fs';
@@ -93,7 +94,10 @@ import {
 } from './resumeGuards';
 import { decideResumeCursorPersist } from './resumeCursorPersistence';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
-import { reportSandboxDependencyPreflight } from '@/sandbox/dependencyPreflight';
+import {
+  reportSandboxDependencyPreflight,
+  reportSandboxExecutionPreflight,
+} from '@/sandbox/dependencyPreflight';
 import { startLogHousekeeping } from '@/ui/logHousekeepingRunner';
 import {
   readDaemonSessionIdleReaperConfig,
@@ -109,6 +113,11 @@ import {
   type StopSessionContext,
   type StopSessionResult,
 } from './sessionIdleReaper';
+import {
+  createProcFs,
+  createProcProcessProbe,
+  stopSessionWithVerifiedExit,
+} from './sessionExitVerification';
 import {
   resolveOrphanAdoption,
   collectStartupOrphans,
@@ -328,6 +337,12 @@ export async function startDaemon(): Promise<void> {
   // 뜰 때까지 그 사실을 몰랐다 — 증상은 몇 분 뒤 네트워크 호출 실패로 나타나 원인과
   // 멀리 떨어졌다(2026-08-28: socat 부재).
   reportSandboxDependencyPreflight();
+
+  // 의존성이 다 있어도 비특권 컨테이너에서는 감싼 자식이 namespace 생성에서 죽는다
+  // (2026-09-10 기본 Docker 프로브). 격리가 필수인 머신에서만, 실제로 감싼 명령을
+  // 한 번 돌려 그 사실을 기동 로그에 남긴다 — 활성화 판단의 근거다. 진단이므로
+  // 실패해도 데몬 기동을 막지 않는다.
+  void reportSandboxExecutionPreflight();
 
   // We don't have cleanup function at the time of server construction
   // Control flow is:
@@ -2485,6 +2500,19 @@ export async function startDaemon(): Promise<void> {
     // their (possibly days-old) session start.
     const daemonStartedAt = Date.now();
 
+    // The entry `stopSession` below would pick, without touching it. Same two
+    // conditions on purpose: the verification must snapshot the process the
+    // stop will signal, not a different one.
+    const findStopTarget = (sessionId: string): { pid: number; session: TrackedSession } | undefined => {
+      for (const [pid, session] of pidToTrackedSession.entries()) {
+        if (session.happySessionId === sessionId ||
+          (sessionId.startsWith('PID-') && pid === parseInt(sessionId.replace('PID-', '')))) {
+          return { pid, session };
+        }
+      }
+      return undefined;
+    };
+
     // Stop a session by sessionId or PID fallback.
     //
     // `context.mode` decides enforcement: 'force' (the default for user actions)
@@ -2619,6 +2647,23 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[DAEMON RUN] Session ${sessionId} not found`);
       return { stopped: false, reason: 'not-found' };
     };
+
+    // `stopped: true` above only means a SIGTERM was attempted — the kill call
+    // is wrapped in a catch — and never that anything exited. A caller that
+    // deletes the project next needs the stronger answer, so this variant
+    // snapshots the session's process tree first and then watches those exact
+    // processes exit.
+    // It sends no signal of its own and never answers 'exited' without evidence.
+    const sessionExitProbe = createProcProcessProbe(createProcFs());
+    const stopSessionWithExitVerification = (sessionId: string, context?: StopSessionContext) =>
+      stopSessionWithVerifiedExit({
+        findTarget: () => {
+          const target = findStopTarget(sessionId);
+          return target ? { pid: target.pid, token: target.session } : undefined;
+        },
+        stop: () => stopSession(sessionId, context),
+        probe: sessionExitProbe,
+      });
 
     // Handle child process exit — preserve session data for resume
     const onChildExited = (pid: number) => {
@@ -3655,6 +3700,7 @@ export async function startDaemon(): Promise<void> {
       resumeSession,
       recoverSession,
       stopSession,
+      stopSessionWithExitVerification,
       requestShutdown: () => requestShutdown('happy-app'),
       portRegistry,
       automationStore,
@@ -3960,13 +4006,30 @@ export async function startDaemon(): Promise<void> {
       // Before wrecklessly overriting the daemon state file, we should check if we are the ones who own it
       // Race condition is possible, but thats okay for the time being :D
       const daemonState = await readDaemonState();
-      if (shouldYieldDaemonStateOwnership({
+      const lockHolderPid = readDaemonLockHolderPid();
+      const ownership = resolveDaemonStateOwnership({
         recordedPid: daemonState?.pid,
         ownPid: process.pid,
+        lockHolderPid,
         isProcessAlive: isPidAlive,
-      })) {
+      });
+      if (ownership.reason === 'foreign-daemon' || ownership.reason === 'foreign-without-lock') {
+        // Whoever wrote the file is not us — say exactly what we saw, so the next
+        // person reading this log does not have to correlate timestamps by hand.
+        logger.debug(`[DAEMON RUN] daemon.state.json is owned by another process (${ownership.reason})`, {
+          recordedPid: daemonState?.pid,
+          lockHolderPid,
+          ownPid: process.pid,
+          startedWithCliVersion: daemonState?.startedWithCliVersion,
+          httpPort: daemonState?.httpPort,
+          daemonLogPath: daemonState?.daemonLogPath,
+        });
+      }
+      if (ownership.yield) {
         logger.debug('[DAEMON RUN] Somehow a different daemon was started without killing us. We should kill ourselves.')
         requestShutdown('exception', 'A different daemon was started without killing us. We should kill ourselves.')
+      } else if (ownership.reason === 'foreign-without-lock') {
+        logger.debug('[DAEMON RUN] daemon.state.json was overwritten by a non-daemon process while we hold the daemon lock; reclaiming it on this heartbeat')
       }
 
       // Heartbeat

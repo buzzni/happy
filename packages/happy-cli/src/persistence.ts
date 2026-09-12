@@ -631,6 +631,19 @@ export async function acquireDaemonLock(
 }
 
 /**
+ * Pid recorded in daemon.state.json.lock by whoever holds the daemon lock.
+ * null when the lock file is missing, unreadable, or holds no integer.
+ */
+export function readDaemonLockHolderPid(): number | null {
+  try {
+    const raw = readFileSync(configuration.daemonLockFile, 'utf-8').trim();
+    return /^\d+$/.test(raw) ? Number(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Release daemon lock by closing handle and deleting lock file
  */
 export async function releaseDaemonLock(lockHandle: FileHandle): Promise<void> {

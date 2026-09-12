@@ -6,6 +6,7 @@ import { loop } from '@/claude/loop';
 import { AgentGoalStatus, AgentState } from '@/api/types';
 import { Credentials, readSettings } from '@/persistence';
 import { resolveSessionSandboxConfig } from '@/sandbox/resolveSessionSandboxConfig';
+import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { EnhancedMode, PermissionMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
@@ -186,10 +187,15 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // Get machine ID from settings (should already be set up)
     const settings = await readSettings();
     let machineId = settings?.machineId
+    // 머신 정책(root 소유 파일)이 격리를 필수로 선언하면 아래 판정은 비격리로
+    // 물러나지 않고 던진다. settings.json 은 세션별 staged 홈 상대라 정책 소스가
+    // 될 수 없다 — sandboxPolicy.ts 의 주석 참조.
+    const sandboxPolicyMode = resolveSessionSandboxPolicyMode(process.env);
     const sandboxConfig = resolveSessionSandboxConfig({
         noSandbox: Boolean(options.noSandbox),
         env: process.env,
         settings,
+        policyMode: sandboxPolicyMode,
     });
     const sandboxEnabled = Boolean(sandboxConfig?.enabled);
     const requestedPermissionMode = resolveInitialClaudePermissionMode(
@@ -360,6 +366,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 mcpServers: {},
                 allowedTools: [],
                 sandboxConfig,
+                sandboxPolicyMode,
             });
         } finally {
             reconnection.cancel();
@@ -403,6 +410,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         projectPath: workingDirectory,
         sessionId: response.id,
         sandboxConfig,
+        sandboxPolicyMode,
         env: process.env,
         checkpointEvents,
     });
@@ -1285,6 +1293,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // Create claude loop
     const exitCode = await loop({
         path: workingDirectory,
+        sandboxPolicyMode,
         model: options.model,
         permissionMode: initialPermissionMode,
         startingMode: options.startingMode,

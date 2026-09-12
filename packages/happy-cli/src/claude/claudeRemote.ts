@@ -83,6 +83,7 @@ export async function claudeRemote(opts: {
     orchestratorMcpServers?: Record<string, unknown>,
     mcpConfig?: McpConfigSource,
     sandbox?: QueryOptions['sandbox'],
+    permissionsDeny?: string[],
 
     // Dynamic parameters
     nextMessage: () => Promise<{ message: MessageParam['content'], mode: EnhancedMode } | null>,
@@ -254,6 +255,7 @@ export async function claudeRemote(opts: {
         settingsPath: opts.hookSettingsPath,
         promptSuggestions: true,
         sandbox: providerSandbox,
+        permissionsDeny: opts.permissionsDeny,
         /*
          * Installed for a managed run as well as for checkpoint protection.
          *
