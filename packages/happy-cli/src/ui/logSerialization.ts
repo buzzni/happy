@@ -16,7 +16,8 @@ function sanitizeLogValue(value: unknown, seen: WeakMap<object, unknown>): unkno
   if (!value || typeof value !== 'object') return value
   const existing = seen.get(value)
   if (existing) return existing
-  if (value instanceof Date || value instanceof Error || value instanceof Uint8Array) return value
+  if (value instanceof Date || value instanceof Uint8Array) return value
+  if (value instanceof Error) return sanitizeLogError(value, seen)
 
   if (Array.isArray(value)) {
     const sanitized: unknown[] = []
@@ -31,6 +32,34 @@ function sanitizeLogValue(value: unknown, seen: WeakMap<object, unknown>): unkno
     sanitized[key] = SENSITIVE_LOG_KEY.test(normalizeLogKey(key))
       ? '[REDACTED]'
       : sanitizeLogValue(item, seen)
+  }
+  return sanitized
+}
+
+/**
+ * An error is kept as an error — message, name and stack are what a log line
+ * is for — but its **enumerable own properties** go through the same rule as
+ * any object. An HTTP client error carries the request it was made with,
+ * headers included, and dumped raw on a 401 the log held the bearer that had
+ * just been refused.
+ */
+function sanitizeLogError(error: Error, seen: WeakMap<object, unknown>): Error {
+  const keys = Object.keys(error)
+  if (keys.length === 0) return error
+  // A real Error, so `inspect` prints it as one: the stack first, then the
+  // enumerable properties, exactly as the unsanitized error would print.
+  const sanitized = new Error(error.message)
+  seen.set(error, sanitized)
+  sanitized.name = error.name
+  if (typeof error.stack === 'string') sanitized.stack = error.stack
+  for (const key of keys) {
+    if (key === 'name' || key === 'message' || key === 'stack') continue
+    Object.defineProperty(sanitized, key, {
+      value: SENSITIVE_LOG_KEY.test(normalizeLogKey(key))
+        ? '[REDACTED]'
+        : sanitizeLogValue((error as unknown as Record<string, unknown>)[key], seen),
+      enumerable: true, configurable: true, writable: true,
+    })
   }
   return sanitized
 }
