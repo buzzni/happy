@@ -2,11 +2,11 @@
 # specs/linux-checkpoint-enforcement-backend — runs the Linux checkpoint sandbox integration test
 # inside an Ubuntu 22.04 container with real bubblewrap. Usage (from the monorepo root):
 #   docker build -t happy-linux-sandbox-check packages/happy-cli/scripts/checkpoint-linux-sandbox-check
-#   docker run --rm --security-opt seccomp=unconfined --security-opt systempaths=unconfined -v "$PWD":/src:ro happy-linux-sandbox-check \
+#   docker run --rm --init --security-opt seccomp=unconfined --security-opt systempaths=unconfined -v "$PWD":/src:ro happy-linux-sandbox-check \
 #     bash /src/packages/happy-cli/scripts/checkpoint-linux-sandbox-check/run-in-container.sh
 # The image runs as a non-root user. Docker seccomp must permit user namespaces for bwrap;
 # proc masking must also permit the child proc mount; no extra capabilities, host devices,
-# or Docker socket are needed. On a real Ubuntu host
+# or Docker socket are needed. --init reaps orphaned provider processes. On a real Ubuntu host
 # install bubblewrap, socat and ripgrep.
 set -euo pipefail
 mkdir -p /work && cd /work
