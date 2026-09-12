@@ -1,0 +1,176 @@
+#!/bin/sh
+# The managed runtime's container entrypoint.
+#
+# Without this the image inherits the base node image's `CMD ["node"]`, so a
+# Machine started from it comes up as an interactive REPL: no supervisor, no
+# ledger, no daemon. Every artefact present and correctly moded, nothing running.
+#
+# ## Why the boot stage is not a sequential command
+#
+# `managed-boot` starts the **supervisor**, and the supervisor is a listening
+# Unix socket plus a watchdog timer that deliberately holds the process open —
+# it has to outlive the daemon, because a daemon restart that also restarted the
+# ledger's owner would lose lease enforcement for children that are still
+# running. So on a runtime that actually has a provisioning marker, that command
+# **never returns**. Running it as `managed-boot && daemon` waits forever and the
+# daemon is never started.
+#
+# It is not enough to background it and hope, either: the daemon must not start
+# until the launcher socket exists, or it comes up with no fencing backend and
+# every path that needs a proof refuses. So this waits for the readiness line
+# `main.ts` already prints once the socket is listening and the binding is
+# published, and distinguishes three outcomes:
+#
+#   ready line  → supervisor is up; start the daemon.
+#   exit 0, no line → no marker. BYOS is not a failure; start the daemon.
+#   exit non-zero  → a marker that cannot be trusted. Start nothing.
+#
+# ## Why the daemon is a child rather than an `exec`
+#
+# `exec` would replace this process, and the supervisor — started here — would
+# be left with no parent that knows about it. Staying as PID 1 and waiting on
+# the daemon keeps both, and makes the container's exit mean "the daemon
+# stopped" rather than "the shell was replaced by something that stopped".
+set -u
+
+CLI=/usr/local/lib/saycode/cli/index.mjs
+READY='managed runtime boot: supervisor listening'
+
+# The generation cgroup root, before the boot's activation gate looks for it.
+#
+# From the marker when there is one, and from the **boot input** when there is
+# not. The first boot has no marker — the boot itself writes it — so a step that
+# only read the marker would prepare nothing on exactly the boot that needs it,
+# and the gate would refuse a machine that was otherwise correct. Both files are
+# root-only and in the same directory; the boot input is what the marker is
+# composed from, so they cannot disagree about this value.
+CGROUP_ROOT=$(node -e "
+const read = (path, pick) => {
+  try { return pick(require(path)) || ''; } catch { return ''; }
+};
+process.stdout.write(
+  read('/etc/saycode/managed-runtime.json', (m) => m.isolation && m.isolation.cgroupRoot)
+  || read('/etc/saycode/boot-input.json', (b) => b.saycode_cgroup_root)
+);
+" 2>/dev/null || true)
+if [ -n "${CGROUP_ROOT:-}" ]; then
+    # Not fatal on its own: the activation gate decides, and it refuses a root
+    # it cannot use. Saying so beats a silent refusal later.
+    /usr/local/lib/saycode/cgroup-prepare "$CGROUP_ROOT" || \
+        echo "managed runtime: cgroup root could not be prepared; activation will refuse" >&2
+fi
+
+boot_out=$(mktemp)
+node "$CLI" managed-boot > "$boot_out" 2>&1 &
+boot_pid=$!
+
+# Poll rather than block on a read: the boot may finish without printing
+# anything (no marker), and a blocking read would then wait for a line that is
+# never coming. Bounded, so a boot that neither prints nor exits is a failure
+# rather than a container that sits there looking healthy.
+BOOT_TIMEOUT=120
+# How long a child gets to honour TERM before it is killed.
+STOP_TIMEOUT=10
+# Stops one child, bounded, and does not take no for an answer.
+#
+# `wait` on a child that ignores TERM never returns, so a handler that sends
+# TERM and waits hangs exactly when the stop matters most — the container looks
+# like it is shutting down and never does. So: TERM, poll for a bounded number
+# of ticks, then KILL, and only then reap.
+stop_child() {
+    pid="$1"
+    kill -0 "$pid" 2>/dev/null || return 0
+    kill -TERM "$pid" 2>/dev/null
+    ticks=0
+    while [ "$ticks" -lt "$STOP_TIMEOUT" ]; do
+        kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }
+        sleep 1
+        ticks=$((ticks + 1))
+    done
+    kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    return 0
+}
+
+ready=0
+waited=0
+while [ "$waited" -lt "$BOOT_TIMEOUT" ]; do
+    if grep -q "$READY" "$boot_out" 2>/dev/null; then
+        ready=1
+        break
+    fi
+    if ! kill -0 "$boot_pid" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+done
+
+cat "$boot_out" >&2
+
+if [ "$ready" -eq 1 ]; then
+    echo "managed runtime: supervisor ready; starting the daemon" >&2
+elif kill -0 "$boot_pid" 2>/dev/null; then
+    # The cap ran out with the boot still alive. This has to be decided
+    # **before** waiting on it: `wait` on a live child blocks forever, so a cap
+    # checked afterwards is not a cap at all — the container would sit here
+    # looking healthy with no supervisor and no daemon.
+    #
+    # And the stop itself has to be bounded for the same reason the cap does. A
+    # boot that neither becomes ready nor exits is already behaving abnormally,
+    # so it is exactly the child least likely to honour a TERM — `kill` followed
+    # by a bare `wait` reintroduces the unbounded block one line after ruling it
+    # out, and the container hangs here with no supervisor, no daemon, and not
+    # even the message below to say so.
+    stop_child "$boot_pid"
+    echo "managed runtime: boot neither became ready nor exited within ${BOOT_TIMEOUT}s" >&2
+    rm -f "$boot_out"
+    exit 1
+else
+    # It exited. Its own classifier is already on stderr above; nothing here
+    # adds paths, tokens or provider text to it.
+    if ! wait "$boot_pid"; then
+        echo "managed runtime: boot refused; not starting the daemon" >&2
+        rm -f "$boot_out"
+        exit 1
+    fi
+    echo "managed runtime: no provisioning marker; starting the daemon" >&2
+fi
+rm -f "$boot_out"
+
+node "$CLI" daemon start-sync &
+daemon_pid=$!
+
+# Forward a stop to both, rather than dying and leaving them orphaned to the
+# Machine's init.
+forward() {
+    stop_child "$daemon_pid"
+    [ "$ready" -eq 1 ] && stop_child "$boot_pid"
+    exit 143
+}
+trap forward TERM INT
+
+# Both are watched, not just the daemon.
+#
+# The supervisor owns the ledger and the lease watchdog. If it dies first and
+# this only waited on the daemon, the daemon and every generation it launched
+# would keep running with no lease enforcement and no stop proof — execution
+# that has lost the premises its isolation rests on, in a container that still
+# looks healthy. So its death is a container failure, and the daemon goes with
+# it rather than being left to run unfenced.
+while : ; do
+    if [ "$ready" -eq 1 ] && ! kill -0 "$boot_pid" 2>/dev/null; then
+        echo "managed runtime: supervisor exited; stopping the daemon" >&2
+        stop_child "$daemon_pid"
+        exit 1
+    fi
+    if ! kill -0 "$daemon_pid" 2>/dev/null; then
+        wait "$daemon_pid"
+        daemon_status=$?
+        # The supervisor outlives a daemon *restart*, not the container. Left
+        # running it would hold the ledger lock against the next boot.
+        [ "$ready" -eq 1 ] && stop_child "$boot_pid"
+        exit "$daemon_status"
+    fi
+    sleep 1
+done

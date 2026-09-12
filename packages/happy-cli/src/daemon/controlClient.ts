@@ -7,8 +7,143 @@ import { logger } from '@/ui/logger';
 import { clearDaemonState, readDaemonState, readDaemonStateSnapshot, writeDaemonStateIfUnchanged } from '@/persistence';
 import { Metadata } from '@/api/types';
 import { configuration } from '@/configuration';
+import {
+    MANAGED_REPORT_CAPABILITY_HEADER,
+    type ManagedReportKind,
+} from './launch/managedReportCapability';
+import {
+    createManagedReportSigner,
+    MANAGED_REPORT_FD_ENV,
+    type ManagedReportSigner,
+} from './launch/managedReportCredential';
 
-async function daemonPost(path: string, body?: any): Promise<{ error?: string } | any> {
+/** How long one report's capability is good for. Minted per report. */
+const MANAGED_REPORT_CAPABILITY_TTL_MS = 60_000;
+
+/**
+ * This launch's report signer, resolved once.
+ *
+ * The control server refuses a managed lifecycle report that no launch vouched
+ * for: the loopback bearer is readable by the agent's own tools, so it proves
+ * "something on this host" and nothing about *which* launch is reporting.
+ * The launcher hands this child a per-launch secret on its own inherited
+ * descriptor, and this is where the report is signed with it.
+ *
+ * Resolved lazily and cached, because the descriptor is consumed by the first
+ * read. `null` is the ordinary spawn: no descriptor, nothing to sign, and the
+ * control server is not asking.
+ */
+let reportSigner: Promise<ManagedReportSigner | null> | null = null;
+/**
+ * Whether this process was launched as a managed child at all.
+ *
+ * Read before the signer consumes the variable, because "no credential" and
+ * "not managed" are different answers: the first must refuse to report, the
+ * second is an ordinary spawn that never had one.
+ */
+let managedChild: boolean | null = null;
+const isManagedChild = () => managedChild === true;
+/** Monotonic per-process. The registry refuses a repeated or lower value. */
+let reportSeq = 0;
+
+function managedReportSigner() {
+    // Captured before the signer consumes the variable, and lazily rather than
+    // at import: what matters is whether this process was launched managed,
+    // asked at the first moment anything needs to know.
+    managedChild ??= process.env[MANAGED_REPORT_FD_ENV] !== undefined;
+    reportSigner ??= createManagedReportSigner(process.env).catch((error) => {
+        // A launch that cannot sign will be refused by the control server, and
+        // that refusal is the honest outcome — reports do not fall back to
+        // unsigned. Only the shape of the failure is kept.
+        logger.debug(`[CONTROL CLIENT] managed report signer unavailable: ${(error as Error)?.name ?? 'unknown'}`);
+        return null;
+    });
+    return reportSigner;
+}
+
+/**
+ * A managed lifecycle report: the launch's own address, the launch's own
+ * capability, and nothing of the daemon's.
+ *
+ * The ordinary path cannot be used here. It finds the daemon by reading the
+ * daemon's state file — `0600`, owned by the daemon's uid — and then proves it
+ * is alive with `kill(pid, 0)`. A managed child runs as a **different uid**, so
+ * the read fails and the signal is `EPERM`: a provider that had to go that way
+ * could not report at all.
+ *
+ * It also must not: that file carries the daemon-wide bearer, and handing it to
+ * a process the agent influences would let the agent's own tools forge another
+ * Run's session. On a managed runtime the control server does not ask for that
+ * bearer on these two paths — the per-launch capability is the whole
+ * credential, so the child never needs the secret it must not have.
+ *
+ * **A report that cannot be signed is not sent.** Sending it unsigned would be
+ * refused anyway, but it would put the session's own metadata on the wire for a
+ * launch that could not prove it owns it.
+ */
+async function managedReportPost(
+  signer: ManagedReportSigner,
+  path: string,
+  body: unknown,
+  reportKind: ManagedReportKind,
+): Promise<{ error?: string } | any> {
+  reportSeq += 1;
+  const capability = signer.sign({
+    kind: reportKind,
+    seq: reportSeq,
+    // The window the registry already bounds this launch by; a capability that
+    // outlives the launch is one that outlives its reason to exist.
+    expiresAt: Date.now() + MANAGED_REPORT_CAPABILITY_TTL_MS,
+    // The whole body: the signature says this launch made *this* report, not
+    // merely that it made one.
+    body: body ?? {},
+  });
+  try {
+    const timeout = process.env.HAPPY_DAEMON_HTTP_TIMEOUT ? parseInt(process.env.HAPPY_DAEMON_HTTP_TIMEOUT) : 10_000;
+    const response = await fetch(`${signer.reportBaseUrl}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        [MANAGED_REPORT_CAPABILITY_HEADER]: capability,
+      },
+      body: JSON.stringify(body ?? {}),
+      signal: AbortSignal.timeout(timeout),
+    });
+    if (!response.ok) {
+      const errorMessage = `Request failed: ${path}, HTTP ${response.status}`;
+      logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
+      return { error: errorMessage };
+    }
+    return await response.json();
+  } catch (error) {
+    // The launch's address and capability are not echoed into the message.
+    const errorMessage = `Request failed: ${path}, ${error instanceof Error ? error.name : 'Unknown error'}`;
+    logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
+    return { error: errorMessage };
+  }
+}
+
+async function daemonPost(
+  path: string,
+  body?: any,
+  /** Set for the two managed lifecycle reports, which must be signed. */
+  reportKind?: ManagedReportKind,
+): Promise<{ error?: string } | any> {
+  if (reportKind) {
+    const signer = await managedReportSigner();
+    if (signer) return managedReportPost(signer, path, body, reportKind);
+    if (isManagedChild()) {
+      /*
+       * A managed child whose credential could not be read. There is no
+       * unsigned fallback: the report would be refused, and sending it anyway
+       * puts this session's metadata on the wire without the launch that owns
+       * it being able to say so.
+       */
+      const errorMessage = `Request failed: ${path}, managed report credential unavailable`;
+      logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
+      return { error: errorMessage };
+    }
+  }
   const state = await readDaemonState();
   if (!state?.httpPort) {
     const errorMessage = 'No daemon running, no state file found';
@@ -85,7 +220,7 @@ export async function notifyDaemonSessionStarted(
   let result: { error?: string } | any;
 
   while (true) {
-    result = await daemonPost('/session-started', payload);
+    result = await daemonPost('/session-started', payload, 'session-started');
     if (!result?.error) {
       return result;
     }
@@ -118,7 +253,7 @@ export async function notifyDaemonSessionRuntime(
   // session. hostPid is what lets that daemon adopt us instead of dropping the
   // report; taking the PID from a persisted record instead would risk acting on a
   // recycled PID.
-  return daemonPost('/session-runtime', { sessionId, ...runtime, hostPid: process.pid });
+  return daemonPost('/session-runtime', { sessionId, ...runtime, hostPid: process.pid }, 'session-runtime');
 }
 
 export async function listDaemonSessions(): Promise<any[]> {

@@ -266,3 +266,37 @@ describe('mergeResumeSessionEnvironment', () => {
         })
     })
 })
+
+describe('resumed agent sandbox policy', () => {
+    const key = 'HAPPY_PROJECT_SANDBOX_CONFIG'
+    const policy = JSON.stringify({ enabled: true, extraWritePaths: ['/repo/.aplus/agent-lineage.jsonl'], denyWritePaths: ['/repo/private'] })
+    const agentEnvironment = () => captureSaycodeAgentEnvironment({
+        SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/repo/.aplus/worktrees/task', [key]: policy,
+    })
+
+    it('restores the original file grant and deny policy without Desktop resending environment', () => {
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: { [key]: 'unrelated-daemon-policy' }, explicit: {}, agentEnvironment: agentEnvironment(), sessionId: 'child',
+        })[key]).toBe(policy)
+    })
+
+    it('preserves a non-agent session policy through capture and resume', () => {
+        const captured = captureSaycodeAgentEnvironment({ [key]: policy })
+        expect(captured).toEqual({ [key]: policy })
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: {}, explicit: {}, agentEnvironment: captured, sessionId: 'ordinary',
+        })[key]).toBe(policy)
+    })
+
+    it('preserves an explicit policy update on resume', () => {
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: {}, explicit: {}, runtime: { [key]: 'updated-policy' }, agentEnvironment: agentEnvironment(), sessionId: 'child',
+        })[key]).toBe('updated-policy')
+    })
+
+    it('does not give a legacy session an unrelated daemon policy', () => {
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: { [key]: policy }, explicit: {}, sessionId: 'legacy',
+        })).not.toHaveProperty(key)
+    })
+})

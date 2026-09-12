@@ -24,6 +24,7 @@ export const SandboxConfigSchema = z.object({
   denyReadPaths: z.array(z.string()).default(['~/.ssh', '~/.aws', '~/.gnupg']),
   extraWritePaths: z.array(z.string()).default(['/tmp']),
   denyWritePaths: z.array(z.string()).default(['.env']),
+  allowGitConfig: z.boolean().optional(),
   networkMode: z.enum(['blocked', 'allowed', 'custom']).default('allowed'),
   allowedDomains: z.array(z.string()).default([]),
   deniedDomains: z.array(z.string()).default([]),
@@ -95,6 +96,12 @@ export interface PersistedTrackedSession {
   /** Absolute launch cwd; present for daemon spawns created by newer clients. */
   directory?: string;
   happySessionId?: string;
+  /**
+   * Session this child was spawned to resume, recorded at spawn time. Survives
+   * a daemon restart so the resume guard still sees a running child that has
+   * not reported its session webhook yet.
+   */
+  resumeTargetSessionId?: string;
   startedBy: string;
   tmuxSessionId?: string;
   startedAt: number;
@@ -627,6 +634,19 @@ export async function acquireDaemonLock(
     }
   }
   return null;
+}
+
+/**
+ * Pid recorded in daemon.state.json.lock by whoever holds the daemon lock.
+ * null when the lock file is missing, unreadable, or holds no integer.
+ */
+export function readDaemonLockHolderPid(): number | null {
+  try {
+    const raw = readFileSync(configuration.daemonLockFile, 'utf-8').trim();
+    return /^\d+$/.test(raw) ? Number(raw) : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

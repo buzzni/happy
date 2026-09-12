@@ -46,9 +46,12 @@ async function main() {
   }
 
   let httpClient: Client | null = null;
+  let httpClientReady: Promise<Client> | null = null;
+  let closing = false;
 
   async function ensureHttpClient(): Promise<Client> {
-    if (httpClient) return httpClient;
+    if (closing) throw new Error('MCP bridge is closing');
+    if (httpClientReady) return httpClientReady;
     const client = new Client(
       { name: 'happy-stdio-bridge', version: '1.0.0' },
       { capabilities: {} }
@@ -57,9 +60,15 @@ async function main() {
     const transport = new StreamableHTTPClientTransport(new URL(baseUrl), {
       requestInit: requestHeaders ? { headers: requestHeaders } : undefined,
     });
-    await client.connect(transport);
+    // Retain the client before connect: stdin may close during initialization.
     httpClient = client;
-    return client;
+    httpClientReady = client.connect(transport).then(() => client).catch(async (error) => {
+      await client.close();
+      httpClient = null;
+      httpClientReady = null;
+      throw error;
+    });
+    return httpClientReady;
   }
 
   const server = new Server(
@@ -79,6 +88,26 @@ async function main() {
 
   // Start STDIO transport
   const stdio = new StdioServerTransport();
+  const shutdown = async () => {
+    if (closing) return;
+    closing = true;
+    // A dead parent must not leave this bridge alive on an HTTP stream or a
+    // stalled connection. Only this process and its own transports are closed.
+    const deadline = setTimeout(() => {
+      process.stderr.write('[happy-mcp] Shutdown timed out\n');
+      process.exit(1);
+    }, 3000);
+    const results = await Promise.allSettled([server.close(), httpClient?.close()]);
+    clearTimeout(deadline);
+    const failed = results.some(result => result.status === 'rejected');
+    if (failed) process.stderr.write('[happy-mcp] Transport shutdown failed\n');
+    process.exit(failed ? 1 : 0);
+  };
+  // StdioServerTransport does not treat stdin EOF as transport closure.
+  process.stdin.once('end', shutdown);
+  process.stdin.once('close', shutdown);
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
   await server.connect(stdio);
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "@buzzni/happy-cli",
-  "version": "1.1.10-aplus.190",
+  "version": "1.1.10-aplus.202",
   "description": "A+ Dev Studio fork of slopus/happy. Mobile and Web client for Claude Code and Codex.",
   "author": "Kirill Dubovitskiy (upstream), justinbuzzni (aplus fork)",
   "license": "MIT",
@@ -60,6 +60,16 @@
     },
     "./browserSessionBrokerMain": {
       "import": "./dist/browserSessionBrokerMain.mjs"
+    },
+    "./managed/image": {
+      "require": {
+        "types": "./dist/managed/imageRuntimeEntry.d.cts",
+        "default": "./dist/managed/imageRuntimeEntry.cjs"
+      },
+      "import": {
+        "types": "./dist/managed/imageRuntimeEntry.d.mts",
+        "default": "./dist/managed/imageRuntimeEntry.mjs"
+      }
     }
   },
   "files": [

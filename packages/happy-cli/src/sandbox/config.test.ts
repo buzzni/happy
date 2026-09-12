@@ -4,9 +4,15 @@ import { tmpdir } from 'node:os';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { buildSandboxRuntimeConfig, filterCredentialsFromEnv } from './config';
 import type { SandboxConfig } from '@/persistence';
+import { configuration } from '@/configuration';
+import { macGetMandatoryDenyPatterns, wrapCommandWithSandboxMacOS } from '@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js';
 
+const temporaryRoot = process.platform === "darwin" ? "/private/tmp" : "/tmp";
 const sessionPath = '/tmp/happy-session';
 
 function resolveLikeRuntime(pathValue: string): string {
@@ -44,6 +50,43 @@ function createConfig(overrides: Partial<SandboxConfig> = {}): SandboxConfig {
 }
 
 describe('buildSandboxRuntimeConfig', () => {
+    it('forwards an explicit Git config grant without discarding explicit deny paths', () => {
+        const config = buildSandboxRuntimeConfig(createConfig({
+            allowGitConfig: true,
+            denyWritePaths: ['.env', '.git/config'],
+        }), sessionPath);
+        expect(config.filesystem?.allowGitConfig).toBe(true);
+        expect(config.filesystem?.denyWrite).toContain(resolve(sessionPath, '.git/config'));
+    });
+
+    it('does not grant Git configuration by default or in a protected checkpoint session', () => {
+        expect(buildSandboxRuntimeConfig(createConfig(), sessionPath).filesystem?.allowGitConfig).toBe(false);
+        const config = buildSandboxRuntimeConfig(createConfig({
+            allowGitConfig: true,
+            checkpointProtection: { secretPatterns: ['.env*'], maxFileBytes: 100, maxFiles: 10, maxTotalBytes: 1000 },
+        }), sessionPath);
+        expect(config.filesystem?.allowGitConfig).toBe(false);
+    });
+
+    it.runIf(process.platform === 'darwin')('maps the approved macOS temporary directory to its real path', () => {
+        expect(buildSandboxRuntimeConfig(createConfig(), sessionPath).filesystem?.allowWrite)
+            .toContain('/private/tmp');
+    });
+
+    it.runIf(process.platform === 'darwin')('generates a profile with a working temporary root and retained hook protection', () => {
+        const config = buildSandboxRuntimeConfig(createConfig({ allowGitConfig: true }), sessionPath);
+        const deny = macGetMandatoryDenyPatterns(config.filesystem?.allowGitConfig);
+        expect(deny).toContain('**/.git/hooks/**');
+        expect(deny).not.toContain('**/.git/config');
+        expect(deny).toContain('**/.gitconfig');
+        const wrapped = wrapCommandWithSandboxMacOS({
+            command: 'true', needsNetworkRestriction: false, readConfig: undefined,
+            writeConfig: { allowOnly: config.filesystem!.allowWrite, denyWithinAllow: config.filesystem!.denyWrite },
+            allowGitConfig: config.filesystem?.allowGitConfig,
+        });
+        expect(wrapped).toContain('/private/tmp');
+    });
+
     it('builds strict filesystem isolation', () => {
         const runtimeConfig = buildSandboxRuntimeConfig(
             createConfig({ sessionIsolation: 'strict' }),
@@ -53,7 +96,7 @@ describe('buildSandboxRuntimeConfig', () => {
         expect(runtimeConfig.allowPty).toBe(true);
         expect(runtimeConfig.filesystem?.allowWrite).toEqual([
             resolve(sessionPath),
-            '/tmp',
+            temporaryRoot,
             ...expectedSharedAgentStatePaths(),
         ]);
     });
@@ -63,7 +106,7 @@ describe('buildSandboxRuntimeConfig', () => {
         expect(withWorkspaceRoot.filesystem?.allowWrite).toEqual([
             `${homedir()}/projects`,
             resolve(sessionPath),
-            '/tmp',
+            temporaryRoot,
             ...expectedSharedAgentStatePaths(),
         ]);
 
@@ -73,7 +116,7 @@ describe('buildSandboxRuntimeConfig', () => {
         );
         expect(withoutWorkspaceRoot.filesystem?.allowWrite).toEqual([
             resolve(sessionPath),
-            '/tmp',
+            temporaryRoot,
             ...expectedSharedAgentStatePaths(),
         ]);
     });
@@ -91,7 +134,7 @@ describe('buildSandboxRuntimeConfig', () => {
         expect(runtimeConfig.filesystem?.allowWrite).toEqual([
             `${homedir()}/sandbox`,
             resolve(sessionPath, 'relative/write'),
-            '/tmp',
+            temporaryRoot,
             resolve(sessionPath, '../scratch'),
             ...expectedSharedAgentStatePaths(),
         ]);
@@ -289,7 +332,7 @@ describe('buildSandboxRuntimeConfig with a linked git worktree', () => {
 
         expect(runtimeConfig.filesystem?.allowWrite).toEqual([
             resolve(root),
-            '/tmp',
+            temporaryRoot,
             ...expectedSharedAgentStatePathsFor(root),
         ]);
     });
@@ -302,7 +345,7 @@ describe('buildSandboxRuntimeConfig with a linked git worktree', () => {
 
         expect(runtimeConfig.filesystem?.allowWrite).toEqual([
             resolve(root),
-            '/tmp',
+            temporaryRoot,
             ...expectedSharedAgentStatePathsFor(root),
         ]);
     });
@@ -317,6 +360,55 @@ function expectedSharedAgentStatePathsFor(sessionPathForTest: string): string[] 
     };
     return [...new Set([expand(codexHome), expand(claudeConfigDir)])];
 }
+// Run from a macOS host test process. An inherited sandbox cannot be relaxed by a child profile.
+it.skipIf(process.platform !== 'darwin' || Boolean(process.env.CODEX_SANDBOX))(
+    'allows init, clone and submodule update in a managed worktree while denying hooks and sibling writes',
+    async () => {
+        const run = promisify(execFile);
+        const root = await mkdtemp(join(process.cwd(), '.tmp-git-sandbox-'));
+        const repository = join(root, 'repo');
+        const source = join(root, 'source');
+        const worktree = join(repository, '.aplus/worktrees/task');
+        const gitDirectory = join(repository, '.git');
+        const env = { ...process.env, GIT_TEMPLATE_DIR: '', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+        const quote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
+        const git = (cwd: string, args: string[]) => run('git', [
+            '-c', 'user.name=Sandbox Test', '-c', 'user.email=sandbox@example.invalid', ...args,
+        ], { cwd, env });
+        try {
+            await mkdir(source);
+            await mkdir(repository);
+            await git(source, ['init']);
+            await writeFile(join(source, 'file.txt'), 'fixture');
+            await git(source, ['add', 'file.txt']);
+            await git(source, ['commit', '-m', 'fixture']);
+            await git(repository, ['init']);
+            await git(repository, ['-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'vendor/library']);
+            await git(repository, ['commit', '-am', 'submodule']);
+            await git(repository, ['worktree', 'add', '-b', 'sandbox-test', worktree]);
+            const config = buildSandboxRuntimeConfig(createConfig({
+                workspaceRoot: undefined, allowGitConfig: true, denyReadPaths: [],
+                extraWritePaths: [gitDirectory],
+                denyWritePaths: ['.env', `${gitDirectory}/hooks`, `${gitDirectory}/**/hooks/**`],
+            }), worktree);
+            const sandbox = (args: string[]) => run('sh', ['-c', wrapCommandWithSandboxMacOS({
+                command: args.map(quote).join(' '), needsNetworkRestriction: false, readConfig: undefined,
+                writeConfig: { allowOnly: config.filesystem!.allowWrite, denyWithinAllow: config.filesystem!.denyWrite },
+                allowGitConfig: config.filesystem?.allowGitConfig,
+            })], { cwd: worktree, env });
+            await sandbox(['git', 'init', 'new-repository']);
+            await sandbox(['git', 'clone', source, 'cloned-repository']);
+            await sandbox(['git', 'config', '--local', 'sandbox.test', 'enabled']);
+            await sandbox(['git', '-c', 'protocol.file.allow=always', 'submodule', 'update', '--init']);
+            expect((await git(worktree, ['config', '--get', 'sandbox.test'])).stdout.trim()).toBe('enabled');
+            await expect(sandbox(['touch', join(root, 'outside.txt')])).rejects.toThrow();
+            await expect(sandbox(['touch', join(worktree, '.env')])).rejects.toThrow();
+            await expect(sandbox(['mkdir', '-p', join(gitDirectory, 'hooks')])).rejects.toThrow();
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    }, 30_000,
+);
 
 describe('filterCredentialsFromEnv', () => {
     it('removes inherited GitHub and cloud credentials while preserving runtime variables', () => {
@@ -329,5 +421,61 @@ describe('filterCredentialsFromEnv', () => {
             PATH: '/usr/bin',
             APLUS_AGENT_TASK_ID: 'task-1',
         });
+    });
+});
+
+// 공유 머신에서 세션 config 는 사용자·프로젝트가 고칠 수 있는 값이다. enabled 만
+// 확인하면 denyReadPaths:[] / customWritePaths:['/'] 로 격리를 그대로 벗을 수 있다.
+// mandatory 머신에서는 신뢰 floor 가 세션 config 위에 강제된다.
+describe('buildSandboxRuntimeConfig on a mandatory machine', () => {
+    it('denies read and write on the Happy home even when the session config clears them', () => {
+        const built = buildSandboxRuntimeConfig(
+            createConfig({ denyReadPaths: [], denyWritePaths: [] }),
+            sessionPath,
+            'mandatory',
+        );
+
+        expect(built.filesystem.denyRead).toContain(configuration.daemonHappyHomeDir);
+        expect(built.filesystem.denyWrite).toContain(configuration.daemonHappyHomeDir);
+        // 세션이 옮겨 쓰는 HAPPY_HOME_DIR 을 가리면 자기 자격증명까지 가려진다.
+        expect(built.filesystem.denyRead).not.toContain(configuration.happyHomeDir);
+    });
+
+    it('keeps the session own deny paths alongside the floor', () => {
+        const built = buildSandboxRuntimeConfig(
+            createConfig({ denyReadPaths: ['~/.ssh'] }),
+            sessionPath,
+            'mandatory',
+        );
+
+        expect(built.filesystem.denyRead).toContain(resolveLikeRuntime('~/.ssh'));
+        expect(built.filesystem.denyRead).toContain(configuration.daemonHappyHomeDir);
+    });
+
+    // allowWrite 가 '/' 나 홈 루트면 floor 밖의 다른 사용자 워크스페이스와
+    // PATH 상의 실행 파일까지 쓰기 가능해진다 — 클램프가 아니라 거절이다.
+    it('refuses a filesystem-root write scope', () => {
+        expect(() => buildSandboxRuntimeConfig(
+            createConfig({ sessionIsolation: 'custom', customWritePaths: ['/'] }),
+            sessionPath,
+            'mandatory',
+        )).toThrow(/unsafe-write-scope/);
+    });
+
+    it('refuses a home-root write scope', () => {
+        expect(() => buildSandboxRuntimeConfig(
+            createConfig({ sessionIsolation: 'custom', customWritePaths: ['~'] }),
+            sessionPath,
+            'mandatory',
+        )).toThrow(/unsafe-write-scope/);
+    });
+
+    it('leaves an owner-choice machine exactly as before', () => {
+        const config = createConfig({ denyReadPaths: [], denyWritePaths: [] });
+
+        expect(buildSandboxRuntimeConfig(config, sessionPath))
+            .toEqual(buildSandboxRuntimeConfig(config, sessionPath, 'owner-choice'));
+        expect(buildSandboxRuntimeConfig(config, sessionPath).filesystem.denyRead)
+            .toEqual([]);
     });
 });

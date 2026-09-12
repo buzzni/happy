@@ -4,6 +4,7 @@ import { EnhancedMode } from "./loop";
 import { logger } from "@/ui/logger";
 import type { JsRuntime } from "./runClaude";
 import type { SandboxConfig } from "@/persistence";
+import type { SandboxPolicyMode } from "@/sandbox/sandboxPolicy";
 import type { AplusMcpServersMap } from '@/aplus/fetchAplusMcpServers';
 import type { McpConfigSource } from './mcpConfigSynchronizer';
 import type { CheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
@@ -15,11 +16,16 @@ export class Session {
     readonly client: ApiSessionClient;
     readonly queue: MessageQueue2<EnhancedMode>;
     readonly claudeEnvVars?: Record<string, string>;
+    readonly managedSettingsLockdown?: boolean;
+    /** A managed Cloud run: unbound instruction paths are closed. */
+    readonly managedRun?: boolean;
     claudeArgs?: string[];  // Made mutable to allow filtering
     mcpServers: Record<string, any>;
     readonly mcpConfig?: McpConfigSource;
     readonly allowedTools?: string[];
     readonly sandboxConfig?: SandboxConfig;
+    /** 생략하면 개인 머신(owner-choice) — sandbox/sandboxPolicy.ts */
+    readonly sandboxPolicyMode?: SandboxPolicyMode;
     readonly checkpointComposition?: CheckpointSessionComposition;
     readonly _onModeChange: (mode: 'local' | 'remote') => void;
     readonly _onAbort?: () => void;
@@ -49,6 +55,8 @@ export class Session {
         logPath: string,
         sessionId: string | null,
         claudeEnvVars?: Record<string, string>,
+        managedSettingsLockdown?: boolean,
+        managedRun?: boolean,
         claudeArgs?: string[],
         mcpServers: Record<string, any>,
         mcpConfig?: McpConfigSource,
@@ -58,6 +66,7 @@ export class Session {
         onActiveUserInputAccepted?: (text: string) => void,
         allowedTools?: string[],
         sandboxConfig?: SandboxConfig,
+        sandboxPolicyMode?: SandboxPolicyMode,
         checkpointComposition?: CheckpointSessionComposition,
         /** Path to temporary settings file with SessionStart hook (required for session tracking) */
         hookSettingsPath: string,
@@ -76,11 +85,14 @@ export class Session {
         this.sessionId = opts.sessionId;
         this.queue = opts.messageQueue;
         this.claudeEnvVars = opts.claudeEnvVars;
+        this.managedSettingsLockdown = opts.managedSettingsLockdown;
+        this.managedRun = opts.managedRun;
         this.claudeArgs = opts.claudeArgs;
         this.mcpServers = opts.mcpServers;
         this.mcpConfig = opts.mcpConfig;
         this.allowedTools = opts.allowedTools;
         this.sandboxConfig = opts.sandboxConfig;
+        this.sandboxPolicyMode = opts.sandboxPolicyMode;
         this.checkpointComposition = opts.checkpointComposition;
         this._onModeChange = opts.onModeChange;
         this._onAbort = opts.onAbort;

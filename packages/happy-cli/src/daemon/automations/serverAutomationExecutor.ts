@@ -49,6 +49,16 @@ import {
 
 type TransportResult = { ok: boolean; value?: any; error?: string }
 
+// 예약 세션은 대화의 매-turn orchestration을 거치지 않으므로 첫 작업에 진단 기준을 붙인다.
+const SCHEDULED_AUTOMATION_PROMPT_PREAMBLE = [
+  '## 예약 자동화 진단 지침',
+  '[연동 판단] 현재 세션의 도구 목록만으로 미연동을 단정하지 말고 Saycode의 연결 상태와 실제 도구 탐색·호출 결과를 확인한다.',
+  '[고장 판단] 사용 중인 실행 경로와 최신 실행 기록을 확인하며, 오래된 경로의 오류만으로 현재 자동화의 고장을 단정하지 않는다.',
+  '[사용자 요구] 재연동·설정 변경은 현재 Saycode 연결 상태와 실제 호출 오류로 필요성이 확인된 경우에만 요청한다.',
+  '[보고] 확인한 사실과 추정을 구분하고, 확인하지 못한 상태는 확인 불가로 보고하며 근거와 다음 확인 방법을 밝힌다.',
+  '[안전] 진단은 읽기 전용으로 수행하며 토큰·비밀값을 출력하거나 연결·설정을 임의로 변경하지 않는다.',
+].join('\n')
+
 export interface ServerAutomationTransport {
   claim(input: { automationId: string; generation: number; scheduledFor: number }): Promise<TransportResult>
   start(input: { runId: string; claimToken: string }): Promise<TransportResult>
@@ -223,15 +233,18 @@ export const MAX_GITHUB_EVENTS_PER_TICK = 3
 export const MAX_GITHUB_WORKER_SESSIONS = 6
 const DIRTY_WORKTREE_RETRY_MS = 15 * 60_000
 /**
- * dirty 보류가 이만큼 이어지면 결과를 말한다(15분 간격이므로 4회 = 1시간).
+ * dirty 보류가 이만큼 이어지면 알린다(15분 간격이므로 4회 = 1시간).
  *
- * 2026-09-05 프로덕션 — 리뷰 워커가 남긴 결과 파일 한 개로 정리가 거부됐고, 그
- * 자동화가 worktree 게이트에 걸려 그 저장소의 리뷰가 통째로 멈췄다. 로그는 15분마다
- * 같은 debug 한 줄이라 큐가 멈춘 사실은 어디에도 드러나지 않았고, 사용자가 "왜 아직
- * pending 이냐" 고 물어서야 발견됐다(aplus#3447, 2시간 이상). 보류 자체는 의도된
- * 동작이지만 그 대가는 말해야 한다.
+ * 보류 자체는 "사람이 작업물을 회수할 때까지 기다린다" 는 의도된 동작이지만, 그동안
+ * worktree 는 지워지지 않고 디스크를 차지한다(2026-09-10 에 14개·16GB). 15분마다
+ * 같은 debug 한 줄만 반복되면 아무도 알아차리지 못한다.
+ *
+ * 주의 — dirty 는 큐를 막지 않는다. 큐를 막는 것은 worktree 에 *프로세스가 붙어 있는*
+ * 경우다(trackLivePendingGithubWorktrees 의 isDirectoryInUse). 처음엔 이 경고를
+ * "queue is blocked" 라고 썼는데 틀린 말이었다 — 09-05 사고에서 큐를 막은 것은 좀비
+ * 프로세스였고 dirty 는 누적 원인이었을 뿐이다.
  */
-export const DIRTY_WORKTREE_BLOCKED_AFTER_ATTEMPTS = 4
+export const DIRTY_WORKTREE_WARN_AFTER_ATTEMPTS = 4
 const WORKTREE_CLEANUP_RETRY_MS = 60_000
 // 리뷰 worktree 는 대상 head 로만 체크아웃된 일회용 디렉토리다. 'strict' 는 그
 // 세션 경로만 쓰기 가능하게 하므로, 워커가 여기에 의존성을 설치해 대상 SHA 의
@@ -968,9 +981,9 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
     // 않는다. 그 밖의 실패는 예산 안에서만 재시도한다 — 상한이 없으면 2026-08-30 처럼
     // 매분 영원히 실패하며 디스크만 찬다.
     const attempts = (worktree.cleanupAttempts ?? 0) + 1
-    if (discarded.dirty && attempts === DIRTY_WORKTREE_BLOCKED_AFTER_ATTEMPTS) {
+    if (discarded.dirty && attempts === DIRTY_WORKTREE_WARN_AFTER_ATTEMPTS) {
       input.logDebug?.(
-        `[server-automation] ${worktree.automationId} GitHub queue is blocked:`
+        `[server-automation] ${worktree.automationId} dirty GitHub worktree is being kept and its disk is not reclaimed:`
         + ` ${worktree.worktreePath} has been dirty for ${attempts} cleanup attempts`
         + ` — ${discarded.error}`,
       )
@@ -1004,7 +1017,7 @@ async function executeStartedRun(
   degradedCode?: string
   queueDepth?: number
 }> {
-  let prompt = payload.prompt
+  let prompt = `${SCHEDULED_AUTOMATION_PROMPT_PREAMBLE}\n\n${payload.prompt}`
   let environmentVariables: Record<string, string> | undefined
   let agentTaskDispatch: AutomationAgentTaskDispatch | null = null
   let persistGithubTriggerState: ((
