@@ -120,14 +120,21 @@ describe.skipIf(process.platform !== 'linux')('checkpoint Linux bubblewrap enfor
         const live = spawn('sh', ['-c', await wrapCommand(
             `while [ ! -e ${shellQuote(trigger)} ]; do sleep 0.05; done`,
         )], { stdio: ['ignore', 'pipe', 'pipe'] });
+        // Observe exit immediately: a failed bwrap can exit before the wait below.
+        const exited = new Promise<void>((resolve) => live.once('exit', () => resolve()));
+        let stderr = '';
+        live.stderr?.on('data', (chunk) => { stderr += String(chunk); });
         try {
-            await waitFor(async () => (await readdir(reserved)).length > 0);
+            await waitFor(async () => {
+                if (live.exitCode !== null) throw new Error(`bwrap exited before preparing mounts: ${stderr}`);
+                return (await readdir(reserved)).length > 0;
+            });
             expect(await readdir(reserved)).toEqual(expect.arrayContaining(['large.bin']));
             // Preparing the turn while that process still runs is exactly what used to fail.
             await expect(composition.beforeTurn()).rejects.toThrow('checkpoint turn workspace is not empty');
         } finally {
             await writeFile(trigger, 'go');
-            await new Promise((resolve) => live.once('exit', resolve));
+            await exited;
         }
         // The client stops codex first; after its sandbox cleanup the reserved workspace is empty again.
         await cleanupSandbox();
