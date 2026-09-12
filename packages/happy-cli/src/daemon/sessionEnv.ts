@@ -29,7 +29,7 @@ import {
 
 // 'HAPPY_INITIAL_' covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the
 // HAPPY_INITIAL_MODEL / HAPPY_INITIAL_EFFORT spawn seeds.
-export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_AUTOMATION_', 'HAPPY_ADDITIONAL_DIRECTORIES', 'HAPPY_CHECKPOINT_', 'APLUS_SESSION_', 'SAYCODE_AGENT_'] as const
+export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_DEFERRED_CONTINUATION_', 'HAPPY_AUTOMATION_', 'HAPPY_ADDITIONAL_DIRECTORIES', 'HAPPY_CHECKPOINT_', 'APLUS_SESSION_', 'SAYCODE_AGENT_'] as const
 
 const SAYCODE_AGENT_ENV_KEYS = [
     'SAYCODE_AGENT_ENV',
@@ -70,6 +70,17 @@ export function buildSessionSpawnEnvironment(
     return {
         ...scrubSessionLineageEnv(inherited),
         ...explicit,
+    }
+}
+
+/** Keeps request-supplied project env from impersonating daemon-owned session state. */
+export function buildSpawnRequestEnvironment(
+    auth: Record<string, string>,
+    requested: Record<string, string> | undefined,
+): Record<string, string> {
+    return {
+        ...scrubSessionLineageEnv(requested ?? {}),
+        ...auth,
     }
 }
 

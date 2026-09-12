@@ -475,6 +475,7 @@ describe('runClaude for a managed Cloud child', () => {
             }),
         ].join('\n'));
         mockGetProjectPath.mockReturnValue(historyDir);
+        vi.stubEnv('HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE', '/foreign-session/continuation.txt');
         vi.stubEnv('HAPPY_FORK_CLAUDE_SESSION_ID', 'claude-somebody-else');
         vi.stubEnv('HAPPY_FORKED_FROM_SESSION_ID', 'sess-somebody-else');
         vi.stubEnv('HAPPY_CREATED_BY_ACCOUNT_ID', 'account-somebody-else');

@@ -125,6 +125,7 @@ import {
 } from '@/utils/sessionModelPin';
 
 import { registerCodexSteerHandler } from './codexSteerHandler';
+import { createDeferredContinuationContextConsumer } from '@/utils/deferredContinuationContext';
 import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
@@ -169,6 +170,7 @@ export async function runCodex(opts: {
         applyManagedInitialPrompt(process.env, managedStartup.envelope);
     }
 
+    const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
     installBroadKillShims();
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
     const reconnectSession = readReconnectSessionEnvironment(process.env);
@@ -545,12 +547,20 @@ export async function runCodex(opts: {
             saycodePromptBlocks: currentSaycodePromptBlocks,
             effort: messageEffort,
         };
-        const enqueueResult = enqueueCodexUserText({
-            text: message.content.text,
-            mode: enhancedMode,
-            queue: messageQueue,
-            attachments: attachmentsForThisMessage,
-        });
+        const deferredTurn = deferredContinuation.prepare(message.content.text);
+        let enqueueResult: ReturnType<typeof enqueueCodexUserText>;
+        try {
+            enqueueResult = enqueueCodexUserText({
+                text: deferredTurn?.text ?? message.content.text,
+                mode: enhancedMode,
+                queue: messageQueue,
+                attachments: attachmentsForThisMessage,
+            });
+            deferredTurn?.commit();
+        } catch (error) {
+            deferredTurn?.rollback();
+            throw error;
+        }
         if (enqueueResult === 'clear') {
             logger.debug('[Codex] /clear command pushed to isolated queue');
         }

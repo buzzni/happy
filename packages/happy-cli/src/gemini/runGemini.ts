@@ -60,6 +60,7 @@ import {
   formatOptionsXml,
 } from '@/gemini/utils/optionsParser';
 import { ConversationHistory } from '@/gemini/utils/conversationHistory';
+import { createDeferredContinuationContextConsumer } from '@/utils/deferredContinuationContext';
 
 
 /**
@@ -69,6 +70,7 @@ export async function runGemini(opts: {
   credentials: Credentials;
   startedBy?: 'daemon' | 'terminal';
 }): Promise<void> {
+  const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
   // Shield killall/pkill against broad kills before anything is spawned —
   // Gemini has no PreToolUse hook system, so the PATH shim is its only guard.
   installBroadKillShims();
@@ -296,7 +298,14 @@ export async function runGemini(opts: {
       saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
       saycodePromptBlocks: currentSaycodePromptBlocks,
     };
-    messageQueue.push(originalUserMessage, mode);
+    const deferredTurn = deferredContinuation.prepare(originalUserMessage);
+    try {
+      messageQueue.push(deferredTurn?.text ?? originalUserMessage, mode);
+      deferredTurn?.commit();
+    } catch (error) {
+      deferredTurn?.rollback();
+      throw error;
+    }
 
     // Record each message before MessageQueue2 batches adjacent messages. A
     // restarted backend excludes the unanswered trailing turns from context.

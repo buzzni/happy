@@ -254,6 +254,7 @@ const FOREIGN_SESSION_LINEAGE_PREFIXES = [
     // metadata).
     'HAPPY_FORK',
     'HAPPY_CREATED_BY',
+    'HAPPY_DEFERRED_CONTINUATION_',
 ];
 
 /**
