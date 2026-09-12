@@ -826,6 +826,7 @@ export async function startDaemon(): Promise<void> {
             pid: persisted.pid,
             directory: persisted.directory,
             happySessionId: persisted.happySessionId,
+            resumeTargetSessionId: persisted.resumeTargetSessionId,
             tmuxSessionId: persisted.tmuxSessionId,
             // The state file's staged home dir is the more current one; fall
             // back to the persisted record rather than clobbering it.
@@ -1006,6 +1007,7 @@ export async function startDaemon(): Promise<void> {
         pid: s.pid,
         directory: s.directory,
         happySessionId: s.happySessionId,
+        resumeTargetSessionId: s.resumeTargetSessionId,
         startedBy: s.startedBy,
         tmuxSessionId: s.tmuxSessionId,
         startedAt: sessionStartTimes.get(s.pid) ?? Date.now(),
@@ -1784,6 +1786,7 @@ export async function startDaemon(): Promise<void> {
       directoryCreated = false,
       message,
       userHomeDir,
+      resumeTargetSessionId,
     }: {
       args: string[];
       cwd: string;
@@ -1791,6 +1794,12 @@ export async function startDaemon(): Promise<void> {
       directoryCreated?: boolean;
       message?: string;
       userHomeDir?: string;
+      /**
+       * Set for resume spawns, where the target session is known before the
+       * child reports itself. Makes the child visible to hasLiveDaemonChild
+       * from spawn onward instead of only after its session webhook lands.
+       */
+      resumeTargetSessionId?: string;
     }): Promise<SpawnSessionResult> => {
       const happyProcess = spawnHappyCLI(args, {
         cwd,
@@ -1818,6 +1827,7 @@ export async function startDaemon(): Promise<void> {
         directoryCreated,
         message,
         userHomeDir,
+        ...(resumeTargetSessionId ? { resumeTargetSessionId } : {}),
         ...(agentEnvironment ? { agentEnvironment } : {}),
       };
 
@@ -2218,6 +2228,7 @@ export async function startDaemon(): Promise<void> {
           // 상속분은 scrub 하고 이 세션의 값만 아래에서 다시 넣는다.
           env: resumedEnvironment,
           userHomeDir: credentialDecision.kind === 'user-staged' ? credentialDecision.homeDir : undefined,
+          resumeTargetSessionId: happySessionId,
         });
         return result.type === 'error'
           ? { ...result, code: 'SESSION_RESUME_FAILED' }

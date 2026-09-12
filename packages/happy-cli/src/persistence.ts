@@ -96,6 +96,12 @@ export interface PersistedTrackedSession {
   /** Absolute launch cwd; present for daemon spawns created by newer clients. */
   directory?: string;
   happySessionId?: string;
+  /**
+   * Session this child was spawned to resume, recorded at spawn time. Survives
+   * a daemon restart so the resume guard still sees a running child that has
+   * not reported its session webhook yet.
+   */
+  resumeTargetSessionId?: string;
   startedBy: string;
   tmuxSessionId?: string;
   startedAt: number;
