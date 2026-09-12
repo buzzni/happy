@@ -127,6 +127,8 @@ vi.mock("@/app/events/eventRouter", async (importOriginal) => {
     return { ...actual, eventRouter: { emitUpdate: emitUpdateSpy, emitEphemeral: emitEphemeralSpy } };
 });
 vi.mock("@/storage/db", () => ({ db: dbMock }));
+const { authorizeManagedDaemonSpy } = vi.hoisted(() => ({ authorizeManagedDaemonSpy: vi.fn() }));
+vi.mock("@/app/managed/managedDaemonAccess", () => ({ authorizeManagedDaemonRequest: authorizeManagedDaemonSpy }));
 vi.mock("@/storage/seq", () => ({ allocateUserSeq: allocateUserSeqMock }));
 vi.mock("@/storage/inTx", () => ({ inTx: async (fn: any) => fn(dbMock), afterTx: (_tx: any, cb: () => void) => cb() }));
 vi.mock("@/app/automation/sessionFollowupInvalidationService", () => ({
@@ -140,7 +142,10 @@ vi.mock("@/utils/log", () => ({ log: logSpy, warn: vi.fn(), error: vi.fn() }));
 import { machinesRoutes } from "./machinesRoutes";
 import { enableErrorHandlers } from "../utils/enableErrorHandlers";
 
-async function createApp({ withErrorHandlers = false } = {}) {
+async function createApp({ withErrorHandlers = false, managedControl = null }: {
+    withErrorHandlers?: boolean;
+    managedControl?: { daemonTokens: unknown } | null;
+} = {}) {
     const app = fastify();
     app.setValidatorCompiler(validatorCompiler);
     app.setSerializerCompiler(serializerCompiler);
@@ -155,7 +160,7 @@ async function createApp({ withErrorHandlers = false } = {}) {
     if (withErrorHandlers) {
         enableErrorHandlers(typed, { skipNotFoundHandler: true });
     }
-    machinesRoutes(typed);
+    machinesRoutes(typed, () => managedControl as never);
     await typed.ready();
     return typed;
 }
@@ -760,5 +765,74 @@ describe("machinesRoutes — DELETE /v1/machines/:id follow-up fence", () => {
         expect(res.statusCode).toBe(404);
         expect(invalidateSessionFollowupsSpy).not.toHaveBeenCalled();
         expect(machineDeleteSpy).not.toHaveBeenCalled();
+    });
+});
+
+// The one HTTP read a managed daemon makes about itself at start
+// (`attachRegisteredMachine`). Its credential is not an account bearer — the
+// daemon never holds one — so `authenticate` alone refused every managed
+// runtime at boot with "Invalid token".
+describe("machinesRoutes — GET /v1/machines/:id with the daemon's own credential", () => {
+    let app: Fastify;
+    const runtime = { daemonTokens: { verify: vi.fn() } };
+    const claims = (over: Record<string, unknown> = {}) => ({
+        v: 1, accountId: "user-1", machineId: "machine-1", runtimeId: "rt-1",
+        provisioningOperationId: "op-1", daemonGrantId: "grant-1", generation: 0,
+        workspaceId: "ws-1", projectId: "project-1", ...over,
+    });
+    beforeEach(() => {
+        resetState();
+        authorizeManagedDaemonSpy.mockReset();
+        state.existingMachine = {
+            id: "machine-1", accountId: "user-1", seq: 1, metadata: "m", metadataVersion: 1,
+            daemonState: null, daemonStateVersion: 0, dataEncryptionKey: null, serverDataEncryptionKey: null,
+            active: false, lastActiveAt: new Date(0), createdAt: new Date(0), updatedAt: new Date(0),
+        };
+    });
+    afterEach(async () => { if (app) await app.close(); });
+
+    it("answers the machine to its own daemon credential", async () => {
+        authorizeManagedDaemonSpy.mockResolvedValue({ ok: true, principal: { kind: "managed-daemon", claims: claims() } });
+        app = await createApp({ managedControl: runtime });
+        const res = await app.inject({
+            method: "GET", url: "/v1/machines/machine-1",
+            headers: { authorization: "Bearer daemon-token" },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(res.json().machine.id).toBe("machine-1");
+        // Verified as this machine's credential, against the issuer the server holds.
+        expect(authorizeManagedDaemonSpy).toHaveBeenCalledWith(expect.objectContaining({
+            token: "daemon-token", machineId: "machine-1", issuer: runtime.daemonTokens,
+        }));
+    });
+
+    it("refuses a daemon credential that names another machine", async () => {
+        authorizeManagedDaemonSpy.mockResolvedValue({ ok: false, reason: "machine-mismatch" });
+        app = await createApp({ managedControl: runtime });
+        const res = await app.inject({
+            method: "GET", url: "/v1/machines/machine-1",
+            headers: { authorization: "Bearer daemon-token" },
+        });
+        expect(res.statusCode).toBe(401);
+    });
+
+    it("does not consult the daemon issuer when the account bearer already authenticated", async () => {
+        app = await createApp({ managedControl: runtime });
+        const res = await app.inject({
+            method: "GET", url: "/v1/machines/machine-1",
+            headers: { "x-user-id": "user-1" },
+        });
+        expect(res.statusCode).toBe(200);
+        expect(authorizeManagedDaemonSpy).not.toHaveBeenCalled();
+    });
+
+    it("keeps refusing without a managed control runtime", async () => {
+        app = await createApp();
+        const res = await app.inject({
+            method: "GET", url: "/v1/machines/machine-1",
+            headers: { authorization: "Bearer daemon-token" },
+        });
+        expect(res.statusCode).toBe(401);
+        expect(authorizeManagedDaemonSpy).not.toHaveBeenCalled();
     });
 });

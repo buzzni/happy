@@ -9,6 +9,8 @@ import { allocateUserSeq } from "@/storage/seq";
 import { buildNewMachineUpdate, buildUpdateMachineUpdate, buildDeleteMachineUpdate } from "@/app/events/eventRouter";
 import { invalidateSessionFollowups } from "@/app/automation/sessionFollowupInvalidationService";
 import { emitProjectAutomationUpdate } from "@/app/automation/automationUpdate";
+import type { ManagedControlRuntime } from "@/app/managed/managedControlRuntime";
+import { authorizeManagedDaemonRequest } from "@/app/managed/managedDaemonAccess";
 
 const MACHINE_DATA_KEY_ENVELOPE_LENGTH = 105;
 const MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH = 140;
@@ -27,7 +29,48 @@ function machineDataKeyEnvelopesEqual(left: Uint8Array, right: Uint8Array): bool
     return Buffer.from(left).equals(Buffer.from(right));
 }
 
-export function machinesRoutes(app: Fastify) {
+export function machinesRoutes(
+    app: Fastify,
+    getManagedControl: () => ManagedControlRuntime | null = () => null,
+) {
+    /**
+     * `GET /v1/machines/:id` is the one HTTP read a managed daemon makes about
+     * itself, at start (`attachRegisteredMachine`). Its credential is not an
+     * account bearer — the daemon never holds one, by design — so `authenticate`
+     * alone refused every managed runtime at boot.
+     *
+     * The daemon's credential is tried first, and only as a credential for
+     * **this** machine: `authorizeManagedDaemonRequest` verifies the signature
+     * against the issuer this server holds and the grant row it was issued
+     * from, and refuses a token that names any other machine. What it yields
+     * is the account the machine belongs to, which is what the handler's
+     * `accountId` lookup needs. Anything else falls through to the account
+     * path unchanged, so the refusal and its log line stay where they were.
+     */
+    const authenticateMachineRead = async (request: any, reply: any) => {
+        const header = request.headers.authorization;
+        const token = typeof header === 'string' && header.startsWith('Bearer ') ? header.substring(7) : null;
+        const runtime = getManagedControl();
+        if (token && runtime) {
+            let result: Awaited<ReturnType<typeof authorizeManagedDaemonRequest>> | null = null;
+            try {
+                result = await authorizeManagedDaemonRequest({
+                    token,
+                    issuer: runtime.daemonTokens,
+                    machineId: String(request.params?.id ?? ''),
+                    now: Date.now(),
+                });
+            } catch {
+                result = null;
+            }
+            if (result?.ok) {
+                request.userId = result.principal.claims.accountId;
+                return;
+            }
+        }
+        return app.authenticate(request, reply);
+    };
+
     app.post('/v1/machines', {
         preHandler: app.authenticate,
         schema: {
@@ -246,7 +289,7 @@ export function machinesRoutes(app: Fastify) {
 
     // GET /v1/machines/:id - Get single machine by ID
     app.get('/v1/machines/:id', {
-        preHandler: app.authenticate,
+        preHandler: authenticateMachineRead,
         schema: {
             params: z.object({
                 id: z.string()
