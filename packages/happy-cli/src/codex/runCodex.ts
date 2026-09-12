@@ -118,6 +118,11 @@ import {
     consumePendingInitialSaycodeSystemPromptEnabled,
     resolveInitialPromptPermissionMode,
 } from '@/utils/initialPrompt';
+import {
+    createSessionModelPinPublisher,
+    publishedSessionModelPin,
+    type SessionModelPin,
+} from '@/utils/sessionModelPin';
 
 import { registerCodexSteerHandler } from './codexSteerHandler';
 import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
@@ -381,14 +386,18 @@ export async function runCodex(opts: {
     // HAPPY_INITIAL_EFFORT, e.g. automations). Consumed exactly once — read
     // then deleted so children never inherit. Effort is whitelisted against
     // ReasoningEffort; anything else falls back to the default.
-    const initialModelSeed = consumePendingInitialModel(process.env) ?? DEFAULT_CODEX_MODEL;
+    // Split out what the user actually asked for from the runtime fallback, so
+    // callers can tell "no model was chosen" apart from "the default model".
+    const explicitInitialModel = consumePendingInitialModel(process.env);
+    const initialModelSeed = explicitInitialModel ?? DEFAULT_CODEX_MODEL;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env);
     if (rawInitialEffortSeed && !isSupportedCodexReasoningEffort(rawInitialEffortSeed)) {
         logger.debug(`[Codex] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
     }
-    const initialEffortSeed = isSupportedCodexReasoningEffort(rawInitialEffortSeed)
+    const explicitInitialEffort = isSupportedCodexReasoningEffort(rawInitialEffortSeed)
         ? rawInitialEffortSeed
-        : DEFAULT_CODEX_EFFORT;
+        : undefined;
+    const initialEffortSeed = explicitInitialEffort ?? DEFAULT_CODEX_EFFORT;
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
@@ -399,6 +408,26 @@ export async function runCodex(opts: {
     });
     let currentModel: string | undefined = initialModelSeed;
     let currentEffort: ReasoningEffort | undefined = initialEffortSeed;
+
+    // The model/effort the *user* pinned, advertised on the session so another
+    // device can carry on with the same model. Kept apart from currentModel:
+    // that one always holds a concrete model, so publishing it would advertise
+    // the runtime default as a deliberate choice and stop other clients from
+    // routing a Default session themselves.
+    const initialModelPin: SessionModelPin = {
+        ...(explicitInitialModel ? { model: explicitInitialModel } : {}),
+        ...(explicitInitialEffort ? { effort: explicitInitialEffort } : {}),
+    };
+    const sessionModelPinPublisher = createSessionModelPinPublisher({
+        initialPin: initialModelPin,
+        publishedPin: publishedSessionModelPin(metadata),
+        updateMetadata: (update) => session.updateMetadata(update),
+        onPublish: (patch) => logger.debug(`[Codex] Session model pin published: ${patch.currentModelCode ?? 'cleared'} / ${patch.currentThoughtLevelCode ?? 'cleared'}`),
+    });
+    // A session spawned with an explicit model must advertise it before any
+    // message arrives — otherwise the first turn sent from another device is
+    // the one that loses the pin.
+    sessionModelPinPublisher.publish({ specifiesModel: false, specifiesEffort: false });
     let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt;
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
     let currentSaycodePromptBlocks: CodexEnhancedMode['saycodePromptBlocks'] = initialSaycodePromptBlocks;
@@ -407,6 +436,7 @@ export async function runCodex(opts: {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
         currentModel = initialModelSeed;
         currentEffort = initialEffortSeed;
+        sessionModelPinPublisher.reset();
         // Cached append prompt and account preference survive turn-scoped abort resets.
         logger.debug('[Codex] Reset turn-scoped options after abort');
     };
@@ -472,6 +502,14 @@ export async function runCodex(opts: {
         } else {
             logger.debug(`[Codex] User message received with no effort override, using current: ${currentEffort ?? 'default'}`);
         }
+
+        sessionModelPinPublisher.publish({
+            specifiesModel: message.meta?.hasOwnProperty('model') ?? false,
+            model: messageModel,
+            specifiesEffort: message.meta?.hasOwnProperty('effort') ?? false,
+            effort: messageEffort,
+            source: message.meta?.modelSource,
+        });
 
         let messageAppendSystemPrompt = currentAppendSystemPrompt;
         const hasAppendSystemPrompt = message.meta?.hasOwnProperty('appendSystemPrompt') ?? false;

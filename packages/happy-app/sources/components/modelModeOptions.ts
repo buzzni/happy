@@ -171,6 +171,28 @@ export function getAvailablePermissionModes(
     return hackModes(getHardcodedPermissionModes(flavor, translate));
 }
 
+/**
+ * Precedence for an existing session's model or effort.
+ *
+ * The agent default always resolves to a concrete value (claude falls back to
+ * opus/medium in code), so it has to come last: listing it before the session's
+ * own pin makes the pin unreachable, and a session another device pinned to
+ * sonnet would render — and send — opus. An agent default is a preference for
+ * NEW sessions; an existing session already has a running model.
+ */
+export function resolveSessionOption<T extends ModeOption>(
+    options: T[],
+    input: {
+        /** This device's explicit choice for this session. */
+        local: string | null | undefined;
+        /** What the session advertises it is running (metadata.current*Code). */
+        sessionPin: string | null | undefined;
+        agentDefault: string | null | undefined;
+    },
+): T | null {
+    return resolveCurrentOption(options, [input.local, input.sessionPin, input.agentDefault]);
+}
+
 export function findOptionByKey<T extends ModeOption>(options: T[], key: string | null | undefined): T | null {
     if (!key) {
         return null;

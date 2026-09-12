@@ -10,6 +10,7 @@ import {
     getDefaultPermissionModeKey,
     mapMetadataOptions,
     resolveCurrentOption,
+    resolveSessionOption,
 } from './modelModeOptions';
 
 const translate = (key: string) => `tr:${key}`;
@@ -117,5 +118,66 @@ describe('modelModeOptions', () => {
 
         expect(resolveCurrentOption(options, ['missing', 'b', 'a'])).toEqual({ key: 'b', name: 'B' });
         expect(resolveCurrentOption(options, ['missing'])).toBeNull();
+    });
+});
+
+describe('resolveSessionOption', () => {
+    const models = [
+        { key: 'default', name: 'default model' },
+        { key: 'opus', name: 'opus' },
+        { key: 'sonnet', name: 'sonnet' },
+        { key: 'haiku', name: 'haiku' },
+    ];
+    const efforts = [
+        { key: 'low', name: 'low' },
+        { key: 'medium', name: 'medium' },
+        { key: 'high', name: 'high' },
+        { key: 'max', name: 'max' },
+    ];
+
+    // The regression this ordering exists for. getCodeAgentDefaults('claude')
+    // always yields opus/medium, so an agent default listed before the session
+    // pin makes the pin unreachable and the session renders the wrong model.
+    it('prefers the session pin over the agent default when this device has no choice', () => {
+        expect(resolveSessionOption(models, {
+            local: null,
+            sessionPin: 'sonnet',
+            agentDefault: 'opus',
+        })).toEqual({ key: 'sonnet', name: 'sonnet' });
+
+        expect(resolveSessionOption(efforts, {
+            local: null,
+            sessionPin: 'max',
+            agentDefault: 'medium',
+        })).toEqual({ key: 'max', name: 'max' });
+    });
+
+    it("keeps this device's explicit choice above both", () => {
+        expect(resolveSessionOption(models, {
+            local: 'haiku',
+            sessionPin: 'sonnet',
+            agentDefault: 'opus',
+        })).toEqual({ key: 'haiku', name: 'haiku' });
+    });
+
+    it('falls back to the agent default for a session with no pin', () => {
+        expect(resolveSessionOption(models, {
+            local: null,
+            sessionPin: null,
+            agentDefault: 'opus',
+        })).toEqual({ key: 'opus', name: 'opus' });
+    });
+
+    // A pin this build does not know about must not strand the picker on null.
+    it('skips a pin that is not in this build option list', () => {
+        expect(resolveSessionOption(models, {
+            local: null,
+            sessionPin: 'claude-future-9',
+            agentDefault: 'opus',
+        })).toEqual({ key: 'opus', name: 'opus' });
+    });
+
+    it('returns null when nothing resolves', () => {
+        expect(resolveSessionOption(models, { local: null, sessionPin: null, agentDefault: null })).toBeNull();
     });
 });

@@ -63,6 +63,11 @@ import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata'
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
+import {
+    createSessionModelPinPublisher,
+    publishedSessionModelPin,
+    type SessionModelPin,
+} from '@/utils/sessionModelPin';
 import { createEnvelope } from '@slopus/happy-wire';
 import {
     resolveInitialSaycodeAppendSystemPrompt,
@@ -676,17 +681,21 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // HAPPY_INITIAL_EFFORT, e.g. automations). Consumed exactly once — read
     // then deleted so children never inherit — and treated like a CLI option:
     // it also survives the post-abort reset. Invalid effort values are ignored.
-    const initialModelSeed = normalizeClaudeModelForRuntime(
-        consumePendingInitialModel(process.env) ?? options.model ?? DEFAULT_CLAUDE_MODEL,
-        process.env,
-    ) ?? DEFAULT_CLAUDE_MODEL;
+    // Split out what the user actually asked for from the runtime fallback, so
+    // callers can tell "no model was chosen" apart from "the default is opus".
+    // The requested value is kept unnormalized for the published pin — see the
+    // pin publish call below for why the runtime substitution must not leak out.
+    const requestedInitialModel = consumePendingInitialModel(process.env) ?? options.model;
+    const explicitInitialModel = normalizeClaudeModelForRuntime(requestedInitialModel, process.env);
+    const initialModelSeed = explicitInitialModel ?? DEFAULT_CLAUDE_MODEL;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env);
     if (rawInitialEffortSeed && !VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)) {
         logger.debug(`[START] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
     }
-    const initialEffortSeed = rawInitialEffortSeed && VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)
+    const explicitInitialEffort = rawInitialEffortSeed && VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)
         ? rawInitialEffortSeed as 'low' | 'medium' | 'high' | 'xhigh' | 'max'
-        : DEFAULT_CLAUDE_EFFORT;
+        : undefined;
+    const initialEffortSeed = explicitInitialEffort ?? DEFAULT_CLAUDE_EFFORT;
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
@@ -716,6 +725,26 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     let currentDisallowedTools: string[] | undefined = initialDisallowedTools; // Track current disallowed tools
     let currentEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined = initialEffortSeed; // Track current Claude effort (thinking depth)
 
+    // The model/effort the *user* pinned, advertised on the session so another
+    // device can carry on with the same model. Kept apart from currentModel:
+    // that one always holds a concrete model, so publishing it would advertise
+    // the runtime default as a deliberate choice and stop other clients from
+    // routing a Default session themselves.
+    const initialModelPin: SessionModelPin = {
+        ...(requestedInitialModel ? { model: requestedInitialModel } : {}),
+        ...(explicitInitialEffort ? { effort: explicitInitialEffort } : {}),
+    };
+    const sessionModelPinPublisher = createSessionModelPinPublisher({
+        initialPin: initialModelPin,
+        publishedPin: publishedSessionModelPin(metadata),
+        updateMetadata: (update) => session.updateMetadata(update),
+        onPublish: (patch) => logger.debug(`[loop] Session model pin published: ${patch.currentModelCode ?? 'cleared'} / ${patch.currentThoughtLevelCode ?? 'cleared'}`),
+    });
+    // A session spawned with an explicit --model must advertise it before any
+    // message arrives — otherwise the first turn sent from another device is
+    // the one that loses the pin.
+    sessionModelPinPublisher.publish({ specifiesModel: false, specifiesEffort: false });
+
     const resetTurnScopedOptions = () => {
         currentPermissionMode = initialPermissionMode;
         currentModel = initialModelSeed;
@@ -725,6 +754,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         currentAllowedTools = undefined;
         currentDisallowedTools = initialDisallowedTools;
         currentEffort = initialEffortSeed;
+        sessionModelPinPublisher.reset();
         logger.debug('[loop] Reset turn-scoped options after abort');
     };
     const currentEnhancedMode = (): EnhancedMode => ({
@@ -999,6 +1029,20 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         } else {
             logger.debug(`[loop] User message received with no effort override, using current: ${currentEffort ?? 'default'}`);
         }
+
+        sessionModelPinPublisher.publish({
+            specifiesModel: message.meta?.hasOwnProperty('model') ?? false,
+            // Publish what the user asked for, never the runtime substitution.
+            // normalizeClaudeModelForRuntime rewrites models for the Z.AI backend:
+            // a pinned Fable becomes undefined (publishing that clears the user's
+            // pin) and a pinned Sonnet 4.6 becomes 'sonnet', which every other
+            // device reads back as Sonnet 5 — a silent model change. The
+            // substitution is this runtime's business; the pin is the user's.
+            model: message.meta?.model || undefined,
+            specifiesEffort: message.meta?.hasOwnProperty('effort') ?? false,
+            effort: messageEffort,
+            source: message.meta?.modelSource,
+        });
 
         // Check for special commands before processing
         const specialCommand = parseSpecialCommand(message.content.text);
