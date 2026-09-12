@@ -485,8 +485,16 @@ function SessionViewLoaded({ sessionId, session }: { sessionId: string, session:
         resolveCurrentOption(availableEffortLevels, [
             session.effortLevel,
             effectiveAgentDefaults.effortLevel,
+            // Mirrors the model chain above: effortLevel is local-only, so a session
+            // continued from another device would otherwise show no effort at all.
+            session.metadata?.currentThoughtLevelCode,
         ])
-    ), [availableEffortLevels, session.effortLevel, effectiveAgentDefaults.effortLevel]);
+    ), [
+        availableEffortLevels,
+        session.effortLevel,
+        effectiveAgentDefaults.effortLevel,
+        session.metadata?.currentThoughtLevelCode,
+    ]);
 
     const sessionStatus = useSessionStatus(session);
     const sessionUsage = useSessionUsage(sessionId);
