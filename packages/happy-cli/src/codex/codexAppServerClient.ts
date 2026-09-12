@@ -972,6 +972,16 @@ export class CodexAppServerClient {
         // Nothing to end. Reported as not-exited rather than as a clean exit:
         // "there was no process" is not "the process finished writing".
         if (!proc) return { exited: false, code: null, signal: null };
+        /*
+         * Already gone. `process` is not cleared by the exit handler (the
+         * reconnect path needs it to tell a stale exit from a live one), so a
+         * provider that left before the stop arrived would otherwise be waited
+         * for again — for the whole budget — and then reported as never seen
+         * leaving. What the kernel said is already on the object.
+         */
+        if (typeof proc.exitCode === 'number' || typeof proc.signalCode === 'string') {
+            return { exited: true, code: proc.exitCode ?? null, signal: proc.signalCode ?? null };
+        }
 
         const left = new Promise<{ code: number | null; signal: string | null } | null>((resolve) => {
             proc.once('exit', (code, signal) => resolve({ code, signal }));

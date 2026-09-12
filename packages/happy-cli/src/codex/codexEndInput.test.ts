@@ -80,6 +80,22 @@ describe('endInputAndAwaitExit', () => {
             .toEqual({ exited: false, code: null, signal: null });
     });
 
+    it('shouldAnswerAtOnceForAProcessThatHadAlreadyLeft', async () => {
+        // `exit` fired before anyone was listening. Waiting for it again would
+        // burn the whole budget and then call a finished process "not seen
+        // leaving" — an unclean verdict for a provider that flushed fine.
+        const { proc, endedCount } = processDouble();
+        (proc as unknown as { exitCode: number | null }).exitCode = 0;
+        (proc as unknown as { signalCode: string | null }).signalCode = null;
+        const instance = client(proc);
+
+        const started = Date.now();
+        expect(await instance.endInputAndAwaitExit(5_000)).toEqual({ exited: true, code: 0, signal: null });
+        expect(Date.now() - started).toBeLessThan(1_000);
+        // Nothing to end on a process that is gone.
+        expect(endedCount()).toBe(0);
+    });
+
     it('shouldReportASignalledExitAsSignalledRatherThanHidingIt', async () => {
         // It sends no signal, but something else may have. The caller needs to
         // see that, because it is never a flush.
