@@ -102,6 +102,13 @@ import {
     consumePendingInitialSaycodeSystemPromptEnabled,
     resolveInitialPromptPermissionMode,
 } from '@/utils/initialPrompt';
+import {
+    applySessionModelPinPatch,
+    applySessionModelPinTurn,
+    publishedSessionModelPin,
+    type SessionModelPin,
+    type SessionModelPinTurn,
+} from '@/utils/sessionModelPin';
 import { registerCodexSteerHandler } from './codexSteerHandler';
 import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
@@ -345,6 +352,34 @@ export async function runCodex(opts: {
     });
     let currentModel: string | undefined = initialModelSeed;
     let currentEffort: ReasoningEffort | undefined = initialEffortSeed;
+
+    // The model/effort the *user* pinned, advertised on the session so another
+    // device can carry on with the same model. Kept apart from currentModel:
+    // that one always holds a concrete model, so publishing it would advertise
+    // the runtime default as a deliberate choice and stop other clients from
+    // routing a Default session themselves.
+    const initialModelPin: SessionModelPin = {
+        ...(explicitInitialModel ? { model: explicitInitialModel } : {}),
+        ...(explicitInitialEffort ? { effort: explicitInitialEffort } : {}),
+    };
+    let sessionModelPin: SessionModelPin = initialModelPin;
+    let publishedModelPin: SessionModelPin = publishedSessionModelPin(metadata);
+    const publishSessionModelPin = (turn: SessionModelPinTurn) => {
+        const { pin, patch } = applySessionModelPinTurn({
+            pin: sessionModelPin,
+            published: publishedModelPin,
+            turn,
+        });
+        sessionModelPin = pin;
+        if (!patch) return;
+        publishedModelPin = pin;
+        session.updateMetadata((currentMetadata) => applySessionModelPinPatch(currentMetadata, patch));
+        logger.debug(`[Codex] Session model pin published: ${patch.currentModelCode ?? 'cleared'} / ${patch.currentThoughtLevelCode ?? 'cleared'}`);
+    };
+    // A session spawned with an explicit model must advertise it before any
+    // message arrives — otherwise the first turn sent from another device is
+    // the one that loses the pin.
+    publishSessionModelPin({ specifiesModel: false, specifiesEffort: false });
     let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt;
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
     let currentSaycodePromptBlocks: CodexEnhancedMode['saycodePromptBlocks'] = initialSaycodePromptBlocks;
@@ -353,6 +388,7 @@ export async function runCodex(opts: {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
         currentModel = initialModelSeed;
         currentEffort = initialEffortSeed;
+        sessionModelPin = initialModelPin;
         // Cached append prompt and account preference survive turn-scoped abort resets.
         logger.debug('[Codex] Reset turn-scoped options after abort');
     };
@@ -402,6 +438,14 @@ export async function runCodex(opts: {
         } else {
             logger.debug(`[Codex] User message received with no effort override, using current: ${currentEffort ?? 'default'}`);
         }
+
+        publishSessionModelPin({
+            specifiesModel: message.meta?.hasOwnProperty('model') ?? false,
+            model: messageModel,
+            specifiesEffort: message.meta?.hasOwnProperty('effort') ?? false,
+            effort: messageEffort,
+            source: message.meta?.modelSource,
+        });
 
         let messageAppendSystemPrompt = currentAppendSystemPrompt;
         const hasAppendSystemPrompt = message.meta?.hasOwnProperty('appendSystemPrompt') ?? false;
