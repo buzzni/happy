@@ -44,7 +44,7 @@ const SAYCODE_AGENT_ENV_KEYS = [
 
 type SaycodeAgentEnvironmentKey = typeof SAYCODE_AGENT_ENV_KEYS[number]
 const CHECKPOINT_CONTEXT_KEY = CHECKPOINT_SPAWN_CONTEXT_ENV_KEY
-type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof CHECKPOINT_CONTEXT_KEY
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof CHECKPOINT_CONTEXT_KEY | 'HAPPY_PROJECT_SANDBOX_CONFIG'
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey, string>>
 
@@ -120,6 +120,10 @@ export function captureSaycodeAgentEnvironment(
             SAYCODE_AGENT_ENV_KEYS.flatMap((key) => env[key] === undefined ? [] : [[key, env[key]]]),
         ))
     }
+    // Sandbox policy belongs to every session, including sessions without agent control.
+    if (env.HAPPY_PROJECT_SANDBOX_CONFIG !== undefined) {
+        captured.HAPPY_PROJECT_SANDBOX_CONFIG = env.HAPPY_PROJECT_SANDBOX_CONFIG
+    }
     const encodedCheckpointContext = env[CHECKPOINT_CONTEXT_KEY]
     if (encodedCheckpointContext && readCheckpointSpawnContext(env)) {
         captured[CHECKPOINT_CONTEXT_KEY] = encodedCheckpointContext
@@ -136,11 +140,16 @@ export function buildResumedSessionSpawnEnvironment(input: {
     agentEnvironment?: SaycodeAgentEnvironment
     sessionId: string
 }): Record<string, string> {
-    return buildSessionSpawnEnvironment(input.inherited, {
+    const policyKey = 'HAPPY_PROJECT_SANDBOX_CONFIG'
+    // A session keeps its own policy; explicit updates still take precedence.
+    const policy = input.explicit[policyKey] ?? input.automation?.[policyKey]
+        ?? input.runtime?.[policyKey] ?? input.agentEnvironment?.[policyKey]
+    return buildSessionSpawnEnvironment({ ...input.inherited, [policyKey]: undefined }, {
         ...scrubSessionLineageEnv(input.runtime ?? {}),
         ...scrubSessionLineageEnv(input.automation ?? {}),
         ...input.explicit,
         ...(input.agentEnvironment ?? {}),
+        ...(policy !== undefined ? { [policyKey]: policy } : {}),
         APLUS_SESSION_ID: input.sessionId,
     })
 }
