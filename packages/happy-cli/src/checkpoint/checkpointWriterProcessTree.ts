@@ -40,6 +40,27 @@ export class CheckpointWriterProcessTree {
         if (closeError) throw closeError;
     }
 
+    /**
+     * Whether anything is still running in the tracked process groups.
+     *
+     * **Read-only.** `quiesce` proves emptiness partly by creating it — it
+     * escalates to `SIGTERM` and then `SIGKILL` — so a managed checkpoint
+     * cannot use it to decide whether the provider finished on its own. A
+     * descendant killed by that escalation leaves the parent cgroup empty and
+     * the SDK root's exit still reading as clean, which is a manufactured
+     * proof one layer below the cgroup.
+     *
+     * Signal 0 asks the kernel without delivering anything. A group that has
+     * gone is forgotten, exactly as the polling path does — that is an
+     * observation, not a change.
+     */
+    hasRemainingWriters(): boolean {
+        for (const processGroupId of [...this.processGroupIds]) {
+            this.forgetIfGone(processGroupId);
+        }
+        return this.processGroupIds.size > 0;
+    }
+
     private signalRemaining(signal: NodeJS.Signals): void {
         for (const processGroupId of this.processGroupIds) {
             try {

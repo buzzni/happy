@@ -1,0 +1,18 @@
+#!/bin/sh
+# The provider generation's `execve` target.
+#
+# A shell stub for the same reason the tool workload is one: the trusted helper
+# checks the file it is about to exec — root-owned, no group or other write —
+# and that check only means something on a file nothing in the running image
+# can replace. A `node` invocation assembled by the caller would move the
+# decision into a string.
+#
+# This is deliberately a different program from `tool-workload`. That one is
+# entered by the executor uid inside a per-call PID/mount/network namespace;
+# this is the provider generation, run by the provider uid under `exec-helper`.
+#
+# The per-run script written by `startManagedProviderRun` has already chdir'd
+# to the plan's cwd, and this must not change it. Arguments are forwarded
+# unchanged so the entry can check them against the plan it was given rather
+# than silently running with something else.
+exec /usr/local/bin/node /usr/local/lib/saycode/provider-workload.mjs "$@"

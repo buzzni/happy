@@ -41,28 +41,47 @@ describe('runAutonomousQualityGatePhase', () => {
 
     it('kills the whole process group on timeout', async () => {
         const cwd = await mkdtemp(join(process.cwd(), '.happy-gate-runner-'));
-        let childPid = 0;
+        let childPid: number | undefined;
         try {
-            // Allow login-shell startup before the timeout. An empty tail
-            // becomes PID 0 (our process group), so require a real child PID.
-            // Check liveness immediately: polling could hide late cleanup.
             const result = await runAutonomousQualityGatePhase(
+                // Two seconds, not 100ms: the shell has to spawn and reach its
+                // `printf` before the phase is killed. The phase still times out
+                // — it waits on a 30s sleep — so what is under test is
+                // unchanged. A larger budget narrows the race against spawn
+                // latency; it does not remove it, which is why an unprinted pid
+                // now fails as itself rather than as a surviving child.
                 phase("trap '' TERM; sleep 30 & child=$!; printf \"$child\"; wait", 2_000),
                 { cwd, killGraceMs: 50 },
             );
 
-            const parsedPid = Number(result.stdoutTail);
-            if (/^\d+$/.test(result.stdoutTail) && Number.isSafeInteger(parsedPid) && parsedPid > 0) {
-                childPid = parsedPid;
-            }
             expect(result).toMatchObject({ status: 'timed-out', timedOut: true, exitCode: null });
-            expect(result.stdoutTail).toMatch(/^\d+$/);
-            expect(childPid).toBeGreaterThan(0);
-            expect(() => process.kill(childPid, 0)).toThrow();
+
+            // Checked before any signal, as a positive safe integer. `Number('')`
+            // is 0, `Number.isInteger(0)` is true, and `process.kill(0, 0)`
+            // probes *this* process group and succeeds — so the previous
+            // assertion reported "the child is still alive" for a fixture that
+            // had simply not printed yet. Both failures are reachable: a tight
+            // budget leaves the tail empty, and under load the descendant
+            // outlives the call. Which one the CI run hit is not established.
+            const printed = result.stdoutTail.trim();
+            expect(printed).toMatch(/^[0-9]+$/);
+            const parsed = Number(printed);
+            expect(Number.isSafeInteger(parsed) && parsed > 0).toBe(true);
+            childPid = parsed;
+
+            // A SIGKILL request does not synchronously guarantee that
+            // kill(pid, 0) reports absence; measured here, the descendant took
+            // several milliseconds to disappear under load. Wait boundedly —
+            // a group that was never killed still fails, because the fixture
+            // holds a 30s sleep that outlives this window.
+            await vi.waitFor(() => {
+                expect(() => process.kill(childPid!, 0)).toThrow();
+            }, { timeout: 2_000, interval: 10 });
         } finally {
-            // A failed assertion above must not leave a 30s sleep behind.
-            if (childPid > 0) {
-                try { process.kill(childPid, 'SIGKILL'); } catch { /* already gone */ }
+            // A failed assertion above must not leave a 30s sleep behind, and
+            // only the pid this test created — never 0 or a group.
+            if (childPid !== undefined && Number.isSafeInteger(childPid) && childPid > 0) {
+                try { process.kill(childPid, 'SIGKILL'); } catch { /* already exited */ }
             }
             await rm(cwd, { recursive: true, force: true });
         }
@@ -125,13 +144,25 @@ describe('runAutonomousQualityGatePhase', () => {
                 timeoutMs: 5_000,
                 readinessUrl: `http://127.0.0.1:${port}/`,
             }, { cwd: process.cwd(), killGraceMs: 50 });
-            childPid = Number(result.stdoutTail);
-
             expect(result).toMatchObject({ status: 'passed', exitCode: 0, timedOut: false });
-            expect(Number.isInteger(childPid)).toBe(true);
+            // A positive safe integer, not merely "an integer": `Number('')` is
+            // 0, which would pass the weaker check and then make the cleanup
+            // below signal this process group.
+            const printed = result.stdoutTail.trim();
+            expect(printed).toMatch(/^[0-9]+$/);
+            const parsed = Number(printed);
+            expect(Number.isSafeInteger(parsed) && parsed > 0).toBe(true);
+            childPid = parsed;
+            // The port, not the pid. A killed descendant can sit in Z until
+            // its parent is reaped, and `kill(pid, 0)` still succeeds for a
+            // zombie — so absence of the process is not observable on a
+            // schedule this test can rely on. A closed listener is: it is the
+            // effect that matters here, and a survivor of the group kill keeps
+            // answering.
             await expect(fetch(`http://127.0.0.1:${port}/`)).rejects.toThrow();
         } finally {
-            if (childPid) {
+            // Only the pid this test created, and never 0 or a group.
+            if (childPid !== undefined && Number.isSafeInteger(childPid) && childPid > 0) {
                 try { process.kill(childPid, 'SIGKILL'); } catch { /* already exited */ }
             }
         }

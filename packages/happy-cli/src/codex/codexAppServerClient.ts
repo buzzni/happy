@@ -241,6 +241,7 @@ export class CodexAppServerClient {
     private readonly protectedWriterTree: CheckpointWriterProcessTree | null;
     private sandboxCleanup: (() => Promise<void>) | null = null;
     private multiAuthProxy: PreparedCodexMultiAuthProxy | null = null;
+    private readonly managedProviderArgs: string[] | null;
     private multiAuthProxyCleanup: Promise<void> | null = null;
     public sandboxEnabled = false;
     /**
@@ -315,11 +316,20 @@ export class CodexAppServerClient {
         completeTurn?: CheckpointSessionComposition['completeTurn'],
         /** 생략하면 개인 머신(owner-choice)으로 본다 — sandbox/sandboxPolicy.ts */
         sandboxPolicyMode: SandboxPolicyMode = 'owner-choice',
+        /**
+         * The provider configuration a managed Cloud run must use.
+         *
+         * Present only for a managed run, and then it is the whole story: the
+         * account-rotation proxy is not consulted, and the provider is not
+         * chosen from whatever is in the user's config file.
+         */
+        managedProviderArgs?: string[] | null,
     ) {
         this.sandboxConfig = sandboxConfig;
         this.sandboxPolicyMode = sandboxPolicyMode;
         this.beforeTurn = beforeTurn;
         this.completeTurn = completeTurn;
+        this.managedProviderArgs = managedProviderArgs ?? null;
         this.protectedWriterTree = completeTurn ? new CheckpointWriterProcessTree() : null;
     }
 
@@ -779,9 +789,17 @@ export class CodexAppServerClient {
         for (const [key, value] of Object.entries(process.env)) {
             if (typeof value === 'string') env[key] = value;
         }
-        this.multiAuthProxy = await prepareCodexMultiAuthProxy(env);
-        if (this.multiAuthProxy) {
-            env = this.multiAuthProxy.env;
+        if (!this.managedProviderArgs) {
+            // Account rotation swaps in another account's proxy, its own
+            // client key and its own base URL. For a managed run that is a
+            // different payer and a provider outside the approval, so the
+            // rotation is not consulted at all rather than consulted and
+            // overridden — a consulted rotation has already started a proxy
+            // and picked an account.
+            this.multiAuthProxy = await prepareCodexMultiAuthProxy(env);
+            if (this.multiAuthProxy) {
+                env = this.multiAuthProxy.env;
+            }
         }
 
         let command = 'codex';
@@ -789,7 +807,7 @@ export class CodexAppServerClient {
             'app-server',
             '--listen',
             'stdio://',
-            ...(this.multiAuthProxy?.args ?? []),
+            ...(this.managedProviderArgs ?? this.multiAuthProxy?.args ?? []),
         ];
         this.sandboxEnabled = false;
         this.sandboxInitFailed = false;
@@ -929,6 +947,58 @@ export class CodexAppServerClient {
             await this.disconnectInternal();
             throw error;
         }
+    }
+
+    /**
+     * Ends the app server's input and waits for it to leave on its own.
+     *
+     * `disconnectInternal` is a shutdown, not a flush: it does `stdin.end()`
+     * and then `SIGTERM` in the same `try`, with `SIGKILL` two seconds later,
+     * and never awaits the exit. A checkpoint that archives provider state
+     * cannot use it — a signalled process did not flush, and an unawaited one
+     * was not observed leaving at all.
+     *
+     * This sends **no signal**. It closes stdin and reports what the kernel
+     * then said, within a budget. A timeout is reported as a timeout: the
+     * caller decides whether to fall back to `disconnect()`, and that fallback
+     * is a kill, so it is never quiescence.
+     */
+    async endInputAndAwaitExit(budgetMs: number): Promise<{
+        exited: boolean;
+        code: number | null;
+        signal: string | null;
+    }> {
+        const proc = this.process;
+        // Nothing to end. Reported as not-exited rather than as a clean exit:
+        // "there was no process" is not "the process finished writing".
+        if (!proc) return { exited: false, code: null, signal: null };
+        /*
+         * Already gone. `process` is not cleared by the exit handler (the
+         * reconnect path needs it to tell a stale exit from a live one), so a
+         * provider that left before the stop arrived would otherwise be waited
+         * for again — for the whole budget — and then reported as never seen
+         * leaving. What the kernel said is already on the object.
+         */
+        if (typeof proc.exitCode === 'number' || typeof proc.signalCode === 'string') {
+            return { exited: true, code: proc.exitCode ?? null, signal: proc.signalCode ?? null };
+        }
+
+        const left = new Promise<{ code: number | null; signal: string | null } | null>((resolve) => {
+            proc.once('exit', (code, signal) => resolve({ code, signal }));
+            const deadline = setTimeout(() => resolve(null), budgetMs);
+            deadline.unref?.();
+        });
+
+        try {
+            // The only thing sent. No `kill`, in this method or after it.
+            proc.stdin?.end();
+        } catch {
+            return { exited: false, code: null, signal: null };
+        }
+
+        const outcome = await left;
+        if (!outcome) return { exited: false, code: null, signal: null };
+        return { exited: true, code: outcome.code, signal: outcome.signal };
     }
 
     private async disconnectInternal(opts?: {
