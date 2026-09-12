@@ -5,4 +5,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y nodejs && rm -rf /var/lib/apt/lists/*
 RUN corepack enable && corepack prepare pnpm@10.11.0 --activate
+RUN useradd --create-home --uid 1000 checkpoint && mkdir -p /work && chown checkpoint:checkpoint /work
+USER checkpoint
 WORKDIR /work
