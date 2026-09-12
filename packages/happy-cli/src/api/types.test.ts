@@ -61,7 +61,7 @@ describe('MessageMetaSchema modelSource', () => {
 
   // Same hazard as saycodePromptBlocks: a safeParse failure in
   // apiSession.routeIncomingMessage stops routing the message as a user message
-  // entirely. An unknown marker must degrade to "no marker", never drop the turn.
+  // entirely. An unknown marker must never drop the turn.
   it('never fails the whole message on an unknown marker', () => {
     const parsed = MessageMetaSchema.safeParse({
       permissionMode: 'default',
@@ -71,6 +71,14 @@ describe('MessageMetaSchema modelSource', () => {
     expect(parsed.success).toBe(true);
     expect(parsed.success && parsed.data.permissionMode).toBe('default');
     expect(parsed.success && parsed.data.model).toBe('claude-opus-5');
-    expect(parsed.success && parsed.data.modelSource).toBeUndefined();
+  });
+
+  // It degrades to 'auto', not to "no marker". A client that named a provenance
+  // we cannot read has said this is something other than a plain user pin, and
+  // "no marker" means user pin — which would freeze the session on that model.
+  it('degrades an unreadable marker to auto rather than to a user pin', () => {
+    expect(MessageMetaSchema.parse({ modelSource: 'router-v2' }).modelSource).toBe('auto');
+    expect(MessageMetaSchema.parse({ modelSource: 42 }).modelSource).toBe('auto');
+    expect(MessageMetaSchema.parse({ modelSource: null }).modelSource).toBe('auto');
   });
 });

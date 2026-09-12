@@ -9,6 +9,7 @@ import {
     getAvailablePermissionModes,
     getEffortLevelsForModel,
     resolveCurrentOption,
+    resolveSessionOption,
     EffortLevel,
 } from '@/components/modelModeOptions';
 import { getSuggestions } from '@/components/autocomplete/suggestions';
@@ -468,12 +469,18 @@ function SessionViewLoaded({ sessionId, session }: { sessionId: string, session:
         ])
     ), [availableModes, session.permissionMode, effectiveAgentDefaults.permissionMode, session.metadata?.currentOperatingModeCode]);
 
+    // The session's own pin outranks the agent default. That default always
+    // resolves to a concrete value (claude falls back to opus/medium in code), so
+    // listing it first makes the pin unreachable: a session another device pinned
+    // to sonnet would render as opus here and send opus on the next turn. An
+    // agent default is a preference for NEW sessions; this session already has a
+    // running model. A session with no pin still lands on the default below.
     const modelMode = React.useMemo<ModelMode | null>(() => (
-        resolveCurrentOption(availableModels, [
-            session.modelMode,
-            effectiveAgentDefaults.modelMode,
-            session.metadata?.currentModelCode,
-        ])
+        resolveSessionOption(availableModels, {
+            local: session.modelMode,
+            sessionPin: session.metadata?.currentModelCode,
+            agentDefault: effectiveAgentDefaults.modelMode,
+        })
     ), [availableModels, session.modelMode, effectiveAgentDefaults.modelMode, session.metadata?.currentModelCode]);
 
     // Effort level state
@@ -481,14 +488,13 @@ function SessionViewLoaded({ sessionId, session }: { sessionId: string, session:
     const availableEffortLevels = React.useMemo<EffortLevel[]>(() => (
         getEffortLevelsForModel(flavor, modelKey)
     ), [flavor, modelKey]);
+    // Same ordering as the model chain above, for the same reason.
     const effortLevel = React.useMemo<EffortLevel | null>(() => (
-        resolveCurrentOption(availableEffortLevels, [
-            session.effortLevel,
-            effectiveAgentDefaults.effortLevel,
-            // Mirrors the model chain above: effortLevel is local-only, so a session
-            // continued from another device would otherwise show no effort at all.
-            session.metadata?.currentThoughtLevelCode,
-        ])
+        resolveSessionOption(availableEffortLevels, {
+            local: session.effortLevel,
+            sessionPin: session.metadata?.currentThoughtLevelCode,
+            agentDefault: effectiveAgentDefaults.effortLevel,
+        })
     ), [
         availableEffortLevels,
         session.effortLevel,
