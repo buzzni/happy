@@ -1,5 +1,9 @@
 import type { Automation, AutomationRun, Prisma } from '@prisma/client';
-import { AUTOMATION_RUN_NOW_PROTOCOL_VERSION } from '@slopus/happy-wire';
+import {
+    AUTOMATION_RUN_NOW_PROTOCOL_VERSION,
+    AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION,
+} from '@slopus/happy-wire';
+import { invalidateSessionFollowups } from './sessionFollowupInvalidationService';
 
 type Tx = Prisma.TransactionClient;
 
@@ -79,7 +83,7 @@ interface AutomationTarget {
     automationProtocolVersion: number;
 }
 
-async function projectAccess(tx: Tx, actorId: string, projectId: string): Promise<ProjectAccess | null> {
+export async function projectAccess(tx: Tx, actorId: string, projectId: string): Promise<ProjectAccess | null> {
     const project = await tx.project.findUnique({
         where: { id: projectId },
         select: {
@@ -140,6 +144,7 @@ export interface AutomationTargetView {
     viewerPublicKey: Binary | null;
     viewerKeyVersion: number;
     automationProtocolVersion: number;
+    sessionFollowupSupported: boolean;
 }
 
 export async function getAutomationTarget(
@@ -161,6 +166,8 @@ export async function getAutomationTarget(
             viewerPublicKey: access.project.automationViewerPublicKey,
             viewerKeyVersion: access.project.automationViewerKeyVersion,
             automationProtocolVersion: target.automationProtocolVersion,
+            sessionFollowupSupported:
+                target.automationProtocolVersion >= AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION,
         },
     };
 }
@@ -182,6 +189,7 @@ export async function setAutomationViewerKey(
         },
     });
     if (changed.count === 0) return { ok: false, error: 'viewer-key-version-conflict' };
+    await invalidateSessionFollowups(tx, { projectId }, 'DECRYPT_FAILED');
     return { ok: true, value: { keyVersion: input.expectedKeyVersion + 1 } };
 }
 
@@ -194,10 +202,13 @@ export async function replaceAutomationViewerKeyIfUnused(
     const access = await projectAccess(tx, actorId, projectId);
     if (!access) return { ok: false, error: 'not-found' };
     if (!access.canManageKeys) return { ok: false, error: 'forbidden' };
-    const activeAutomationCount = await tx.automation.count({
-        where: { projectId, deletedAt: null },
-    });
-    if (activeAutomationCount > 0) return { ok: false, error: 'viewer-key-in-use' };
+    const [activeAutomationCount, followupCount] = await Promise.all([
+        tx.automation.count({ where: { projectId, deletedAt: null } }),
+        tx.sessionFollowup.count({ where: { projectId, deletedAt: null } }),
+    ]);
+    if (activeAutomationCount > 0 || followupCount > 0) {
+        return { ok: false, error: 'viewer-key-in-use' };
+    }
     return setAutomationViewerKey(tx, actorId, projectId, input);
 }
 
@@ -244,7 +255,7 @@ export async function listAutomations(
     const access = await projectAccess(tx, actorId, projectId);
     if (!access) return { ok: false, error: 'not-found' };
     const rows = await tx.automation.findMany({
-        where: { projectId, deletedAt: null },
+        where: { projectId, deletedAt: null, payloadVersion: { not: 3 } },
         orderBy: { createdAt: 'desc' },
     });
     return { ok: true, value: rows };
@@ -289,6 +300,7 @@ export async function requestAutomationRun(
         },
     });
     if (!current) return { ok: false, error: 'not-found' };
+    if (current.payloadVersion === 3) return { ok: false, error: 'automation-run-unsupported' };
     if (current.revision !== expectedRevision) {
         return { ok: false, error: 'revision-conflict', latest: current };
     }
@@ -491,6 +503,8 @@ export async function updateAutomation(
     if (!current) return { ok: false, error: 'not-found' };
     if (current.legacyMigrationPending) return { ok: false, error: 'migration-pending' };
 
+    if (current.payloadVersion === 3) return { ok: false, error: 'invalid-payload-update' };
+
     const payloadUpdate = hasPayloadUpdate(input);
     if (!payloadUpdate && input.paused === undefined) {
         return { ok: false, error: 'invalid-payload-update' };
@@ -560,6 +574,7 @@ export async function deleteAutomation(
     if (!access.canEdit) return { ok: false, error: 'forbidden' };
     const current = await tx.automation.findFirst({ where: { id: automationId, projectId, deletedAt: null } });
     if (!current) return { ok: false, error: 'not-found' };
+    if (current.payloadVersion === 3) return { ok: false, error: 'invalid-payload-update' };
 
     const changed = await tx.automation.updateMany({
         where: { id: automationId, projectId, revision: expectedRevision, deletedAt: null },

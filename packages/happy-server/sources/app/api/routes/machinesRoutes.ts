@@ -7,6 +7,8 @@ import { log } from "@/utils/log";
 import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { allocateUserSeq } from "@/storage/seq";
 import { buildNewMachineUpdate, buildUpdateMachineUpdate, buildDeleteMachineUpdate } from "@/app/events/eventRouter";
+import { invalidateSessionFollowups } from "@/app/automation/sessionFollowupInvalidationService";
+import { emitProjectAutomationUpdate } from "@/app/automation/automationUpdate";
 
 const MACHINE_DATA_KEY_ENVELOPE_LENGTH = 105;
 const MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH = 140;
@@ -305,6 +307,19 @@ export function machinesRoutes(app: Fastify) {
                 return false;
             }
 
+            // Session follow-ups deliberately retain historical machine IDs
+            // instead of holding a foreign key. Fence active work before the
+            // machine disappears so deleting and later re-registering the same
+            // ID can never revive an old follow-up generation.
+            const invalidatedFollowups = await invalidateSessionFollowups(
+                tx,
+                { machineAccountId: userId, machineId: id },
+                'TARGET_MISMATCH',
+            );
+            const invalidatedProjectIds = [...new Set(
+                invalidatedFollowups.map((followup) => followup.projectId as string),
+            )];
+
             await tx.accessKey.deleteMany({
                 where: { accountId: userId, machineId: id }
             });
@@ -322,6 +337,9 @@ export function machinesRoutes(app: Fastify) {
                     recipientFilter: { type: 'user-scoped-only' }
                 });
                 log({ module: 'machines', machineId: id, userId }, 'Machine deleted');
+                await Promise.all(invalidatedProjectIds.map((projectId) =>
+                    emitProjectAutomationUpdate(projectId, { projectId, reason: 'sync' }, userId),
+                ));
             });
 
             return true;

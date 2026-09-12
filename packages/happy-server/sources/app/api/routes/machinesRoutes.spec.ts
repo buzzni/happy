@@ -17,12 +17,22 @@ const {
     machineUpdateMany,
     accessKeyMutationSpy,
     sessionMutationSpy,
+    machineDeleteSpy,
+    invalidateSessionFollowupsSpy,
+    emitProjectAutomationUpdateSpy,
     logSpy,
 } = vi.hoisted(() => {
     const emitUpdateSpy = vi.fn();
     const emitEphemeralSpy = vi.fn();
     const accessKeyMutationSpy = vi.fn();
     const sessionMutationSpy = vi.fn();
+    const machineDeleteSpy = vi.fn(async () => {
+        const deleted = state.existingMachine;
+        state.existingMachine = null;
+        return deleted;
+    });
+    const invalidateSessionFollowupsSpy = vi.fn(async (): Promise<any[]> => []);
+    const emitProjectAutomationUpdateSpy = vi.fn(async () => undefined);
     const logSpy = vi.fn();
     const state = {
         existingMachine: null as any,
@@ -85,7 +95,7 @@ const {
     });
     const machineFindMany = vi.fn(async (): Promise<any[]> => []);
     const dbMock = {
-        machine: { findFirst: machineFindFirst, create: machineCreate, update: machineUpdate, updateMany: machineUpdateMany, findMany: machineFindMany },
+        machine: { findFirst: machineFindFirst, create: machineCreate, update: machineUpdate, updateMany: machineUpdateMany, findMany: machineFindMany, delete: machineDeleteSpy },
         accessKey: { updateMany: accessKeyMutationSpy, deleteMany: accessKeyMutationSpy },
         session: { updateMany: sessionMutationSpy, deleteMany: sessionMutationSpy },
     };
@@ -102,6 +112,9 @@ const {
         machineUpdateMany,
         accessKeyMutationSpy,
         sessionMutationSpy,
+        machineDeleteSpy,
+        invalidateSessionFollowupsSpy,
+        emitProjectAutomationUpdateSpy,
         logSpy,
     };
 });
@@ -115,7 +128,13 @@ vi.mock("@/app/events/eventRouter", async (importOriginal) => {
 });
 vi.mock("@/storage/db", () => ({ db: dbMock }));
 vi.mock("@/storage/seq", () => ({ allocateUserSeq: allocateUserSeqMock }));
-vi.mock("@/storage/inTx", () => ({ inTx: async (fn: any) => fn({}), afterTx: (_tx: any, cb: () => void) => cb() }));
+vi.mock("@/storage/inTx", () => ({ inTx: async (fn: any) => fn(dbMock), afterTx: (_tx: any, cb: () => void) => cb() }));
+vi.mock("@/app/automation/sessionFollowupInvalidationService", () => ({
+    invalidateSessionFollowups: invalidateSessionFollowupsSpy,
+}));
+vi.mock("@/app/automation/automationUpdate", () => ({
+    emitProjectAutomationUpdate: emitProjectAutomationUpdateSpy,
+}));
 vi.mock("@/utils/log", () => ({ log: logSpy, warn: vi.fn(), error: vi.fn() }));
 
 import { machinesRoutes } from "./machinesRoutes";
@@ -675,5 +694,71 @@ describe("machinesRoutes — serverDataEncryptionKey dual-recipient wrap (aplus 
 
         expect(res.statusCode).toBe(200);
         expect(res.json()[0].serverDataEncryptionKey).toBe(Buffer.from(wrapped).toString("base64"));
+    });
+});
+
+describe("machinesRoutes — DELETE /v1/machines/:id follow-up fence", () => {
+    let app: Fastify;
+    beforeEach(() => {
+        resetState();
+        machineDeleteSpy.mockClear();
+        invalidateSessionFollowupsSpy.mockClear();
+        emitProjectAutomationUpdateSpy.mockClear();
+        accessKeyMutationSpy.mockClear();
+        emitUpdateSpy.mockClear();
+    });
+    afterEach(async () => { if (app) await app.close(); });
+
+    it("invalidates active session follow-ups before deleting an owned machine", async () => {
+        app = await createApp();
+        state.existingMachine = {
+            id: "machine-1",
+            accountId: "user-1",
+        };
+        invalidateSessionFollowupsSpy.mockResolvedValue([
+            { id: "followup-1", projectId: "project-1" },
+            { id: "followup-2", projectId: "project-1" },
+        ]);
+
+        const res = await app.inject({
+            method: "DELETE",
+            url: "/v1/machines/machine-1",
+            headers: { "x-user-id": "user-1" },
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(invalidateSessionFollowupsSpy).toHaveBeenCalledWith(
+            dbMock,
+            { machineAccountId: "user-1", machineId: "machine-1" },
+            "TARGET_MISMATCH",
+        );
+        expect(machineDeleteSpy).toHaveBeenCalledWith({ where: { id: "machine-1" } });
+        expect(accessKeyMutationSpy).toHaveBeenCalledWith({
+            where: { accountId: "user-1", machineId: "machine-1" },
+        });
+        expect(emitProjectAutomationUpdateSpy).toHaveBeenCalledTimes(1);
+        expect(emitProjectAutomationUpdateSpy).toHaveBeenCalledWith(
+            "project-1",
+            { projectId: "project-1", reason: "sync" },
+            "user-1",
+        );
+    });
+
+    it("does not invalidate or delete another account's machine", async () => {
+        app = await createApp();
+        state.existingMachine = {
+            id: "machine-1",
+            accountId: "user-2",
+        };
+
+        const res = await app.inject({
+            method: "DELETE",
+            url: "/v1/machines/machine-1",
+            headers: { "x-user-id": "user-1" },
+        });
+
+        expect(res.statusCode).toBe(404);
+        expect(invalidateSessionFollowupsSpy).not.toHaveBeenCalled();
+        expect(machineDeleteSpy).not.toHaveBeenCalled();
     });
 });

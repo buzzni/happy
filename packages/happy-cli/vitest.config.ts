@@ -13,6 +13,7 @@ export default defineConfig({
                     name: 'unit',
                     include: ['src/**/*.test.ts', 'scripts/**/*.test.ts'],
                     exclude: ['src/**/*.integration.test.ts'],
+                    setupFiles: ['./src/testing/unit.setup.ts'],
                     sequence: {
                         groupOrder: 0,
                     },
@@ -31,6 +32,9 @@ export default defineConfig({
                         'src/claude/claude.integration.test.ts',
                         'src/claude/mcpRuntimeRecovery.integration.test.ts',
                         'src/codex/codex.integration.test.ts',
+                        'src/checkpoint/checkpointProvider.integration.test.ts',
+                        'src/checkpoint/checkpointSandbox.integration.test.ts',
+                        'src/checkpoint/checkpointGitIsolation.integration.test.ts',
                         'src/sandbox/network.integration.test.ts',
                     ],
                     setupFiles: ['./src/testing/integration.setup.empty.ts'],

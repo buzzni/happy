@@ -22,6 +22,7 @@ import {
   sweepEmptySessions,
   sweepZombieSessions,
   type IdleStopGuardConfig,
+    evaluateBusyOnlyStopGuard,
 } from './sessionIdleReaper';
 import type { SessionRuntimeState, TrackedSession } from './types';
 
@@ -755,6 +756,86 @@ describe('readIdleStopGuardConfig', () => {
       adoptionGraceMs: 4000,
     });
   });
+});
+
+describe('trial budget exhausted stops', () => {
+    it('asks the daemon for a busy-only stop when the server flags a budget-exhausted session', async () => {
+        const stopSession = vi.fn(() => ({ stopped: true as const }));
+        const postCandidates = vi.fn(async () => ({
+            checkedAt: 20_000,
+            candidates: [
+                { sessionId: 'session-budget', projectId: 'p', machineId: 'machine-1', lastActiveAt: 19_500, idleMs: 500, reason: 'trial-budget-exhausted' as const },
+                { sessionId: 'session-idle', projectId: 'p', machineId: 'machine-1', lastActiveAt: 1_000, idleMs: 19_000, reason: 'turn-end' as const },
+            ],
+        }));
+
+        await runDaemonSessionIdleReaperTick({
+            machineId: 'machine-1',
+            serverUrl: 'https://aplus.example.com',
+            credentialsToken: 'token-1',
+            now: 20_000,
+            idleAfterMs: 10_000,
+            sessionStartTimes: new Map([[100, 19_000], [101, 1_000]]),
+            trackedSessions: [
+                tracked({ pid: 100, happySessionId: 'session-budget', runtime: { thinking: false, hasOpenToolCall: false, updatedAt: 19_900 } }),
+                tracked({ pid: 101, happySessionId: 'session-idle', runtime: { thinking: false, hasOpenToolCall: false, updatedAt: 19_000 } }),
+            ],
+            stopSession,
+            postCandidates,
+        });
+
+        expect(stopSession).toHaveBeenNthCalledWith(1, 'session-budget', expect.objectContaining({
+            reason: 'trial-budget-exhausted',
+            mode: 'if-not-busy',
+        }));
+        expect(stopSession).toHaveBeenNthCalledWith(2, 'session-idle', expect.objectContaining({
+            reason: 'turn-end',
+            mode: 'if-idle',
+        }));
+    });
+
+
+    it('maps the trial-budget-exhausted candidate reason to the busy-only stop mode', () => {
+        expect(resolveStopSessionMode({ source: 'session-idle-reaper', reason: 'turn-end' })).toBe('if-idle');
+        expect(resolveStopSessionMode({
+            source: 'session-idle-reaper',
+            reason: 'trial-budget-exhausted',
+        })).toBe('if-not-busy');
+        // 명시 mode 는 계속 우선한다.
+        expect(resolveStopSessionMode({
+            source: 'session-idle-reaper',
+            reason: 'trial-budget-exhausted',
+            mode: 'if-idle',
+        })).toBe('if-idle');
+    });
+
+    it('stops a session that just finished its turn, which the idle guard would refuse', () => {
+        const now = 1_000_000;
+        const runtime = {
+            thinking: false,
+            hasOpenToolCall: false,
+            pendingUserInput: false,
+            lastUserInteractionAt: now - 1_000,
+            updatedAt: now - 1_000,
+        } as never;
+        const config = readIdleStopGuardConfig({});
+
+        expect(evaluateIdleStopGuard({
+            runtime, sessionStartedAt: now - 2_000, startedBy: 'daemon', now, config,
+        })).toMatchObject({ allow: false });
+        expect(evaluateBusyOnlyStopGuard({ runtime })).toEqual({ allow: true });
+    });
+
+    it('still protects a session that is thinking, running a tool, or waiting on the user', () => {
+        for (const busy of ['thinking', 'hasOpenToolCall', 'pendingUserInput'] as const) {
+            const decision = evaluateBusyOnlyStopGuard({
+                runtime: { [busy]: true, updatedAt: 1 } as never,
+            });
+            expect(decision.allow).toBe(false);
+        }
+        // 런타임 보고가 아직 없으면 진행 여부를 모르므로 보호한다.
+        expect(evaluateBusyOnlyStopGuard({}).allow).toBe(false);
+    });
 });
 
 describe('evaluateIdleStopGuard', () => {

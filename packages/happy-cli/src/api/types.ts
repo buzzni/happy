@@ -1,7 +1,8 @@
 import { z } from 'zod'
-import type { Update, UpdateMachineBody } from '@slopus/happy-wire';
+import type { ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
 import type { SandboxConfig } from '@/persistence'
+import { AutonomousQualityGateCapabilityAdvertisementSchema } from './autonomousQualityGateProtocol'
 
 export {
   SessionMessageContentSchema,
@@ -110,6 +111,9 @@ export interface ClientToServerEvents {
       [key: string]: number
     }
   }) => void
+  'provider-usage-report': (data: ProviderUsageEventV1) => void
+  /** Volatile token-level preview frame; `data` is session-key encrypted. */
+  'session-stream': (data: { sid: string; time: number; data: string }) => void
 }
 
 /**
@@ -155,7 +159,10 @@ export const MachineMetadataSchema = z.object({
     rpcAvailable: z.boolean(),
     serverBacked: z.boolean().optional(),
     keyVersion: z.number().int().min(1).optional(),
+    sessionFollowup: z.literal(true).optional(),
+    protocolVersion: z.number().int().min(1).optional(),
   }).optional(),
+  autonomousQualityGateSupport: AutonomousQualityGateCapabilityAdvertisementSchema.optional(),
   additionalDirectories: z.object({
     version: z.literal(1),
     maxDirectories: z.literal(8),

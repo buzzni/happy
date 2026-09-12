@@ -32,6 +32,8 @@ export async function dispatchAutomationAgentTask(input: {
   claimToken: string
   credentialId: string
   event: AutomationAgentTaskEvent
+  /** high 발견 시 서버가 PR 코멘트에서 소환할 GitHub 핸들. */
+  escalateTo?: string[]
   fetchImpl?: typeof fetch
 }): Promise<
   | { ok: true; dispatch: AutomationAgentTaskDispatch | null; reason?: string }
@@ -59,6 +61,7 @@ export async function dispatchAutomationAgentTask(input: {
         claimToken: input.claimToken,
         credentialId: input.credentialId,
         event: input.event,
+        ...(input.escalateTo?.length ? { escalateTo: input.escalateTo } : {}),
       }),
       signal: controller.signal,
     })

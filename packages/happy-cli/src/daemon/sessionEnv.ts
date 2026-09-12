@@ -18,25 +18,35 @@
  * SAYCODE_AGENT_* grants per-session orchestration scope. A daemon restarted
  * by one agent must not leak that agent's root/depth/id into unrelated spawns;
  * tracked sessions re-add their captured capability explicitly on resume.
+ *
+ * HAPPY_CHECKPOINT_* binds protected checkpoint state to one daemon-verified
+ * project/worktree. It follows the same no-implicit-inheritance rule.
  */
+import {
+    CHECKPOINT_SPAWN_CONTEXT_ENV_KEY,
+    readCheckpointSpawnContext,
+} from '@/checkpoint/checkpointSpawnContext'
+
 // 'HAPPY_INITIAL_' covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the
 // HAPPY_INITIAL_MODEL / HAPPY_INITIAL_EFFORT spawn seeds.
-export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_DEFERRED_CONTINUATION_', 'HAPPY_AUTOMATION_', 'HAPPY_ADDITIONAL_DIRECTORIES', 'APLUS_SESSION_', 'SAYCODE_AGENT_'] as const
+export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_DEFERRED_CONTINUATION_', 'HAPPY_AUTOMATION_', 'HAPPY_ADDITIONAL_DIRECTORIES', 'HAPPY_CHECKPOINT_', 'APLUS_SESSION_', 'SAYCODE_AGENT_'] as const
 
 const SAYCODE_AGENT_ENV_KEYS = [
     'SAYCODE_AGENT_ENV',
     'SAYCODE_AGENT_ROOT',
+    // The tree siblings may live in (saycode-cli 0.4.0, Desktop ADR-061). Without it a
+    // resumed hub silently shrinks back to its own worktree.
+    'SAYCODE_AGENT_SCOPE',
     'SAYCODE_AGENT_DEPTH',
     'SAYCODE_AGENT_MAX_SPAWN',
     'SAYCODE_AGENT_ID',
 ] as const
 
 type SaycodeAgentEnvironmentKey = typeof SAYCODE_AGENT_ENV_KEYS[number]
+const CHECKPOINT_CONTEXT_KEY = CHECKPOINT_SPAWN_CONTEXT_ENV_KEY
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof CHECKPOINT_CONTEXT_KEY | 'HAPPY_PROJECT_SANDBOX_CONFIG'
 
-export type SaycodeAgentEnvironment = Partial<Record<SaycodeAgentEnvironmentKey, string>> & {
-    SAYCODE_AGENT_ENV: '1'
-    SAYCODE_AGENT_ROOT: string
-}
+export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey, string>>
 
 function isLineageKey(key: string): boolean {
     return SESSION_LINEAGE_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))
@@ -74,16 +84,62 @@ export function buildSpawnRequestEnvironment(
     }
 }
 
+export function overlayManagedCredentialEnvironment(
+    requested: Record<string, string>,
+    managed: Record<string, string>,
+): Record<string, string> {
+    return { ...stripManagedCredentialConflicts(requested, managed), ...managed }
+}
+
+export function stripManagedCredentialConflicts(
+    requested: Record<string, string>,
+    managed: Record<string, string>,
+): Record<string, string> {
+    const effectiveRequested = { ...requested }
+    for (const key of Object.keys(managed)) delete effectiveRequested[key]
+    if (managed.ANTHROPIC_BASE_URL === 'https://api.z.ai/api/anthropic') {
+        delete effectiveRequested.ANTHROPIC_API_KEY
+        delete effectiveRequested.CLAUDE_CODE_OAUTH_TOKEN
+        delete effectiveRequested.ANTHROPIC_MODEL
+        delete effectiveRequested.ANTHROPIC_SMALL_FAST_MODEL
+        delete effectiveRequested.ANTHROPIC_CUSTOM_HEADERS
+        delete effectiveRequested.CLAUDE_CODE_USE_BEDROCK
+        delete effectiveRequested.CLAUDE_CODE_USE_VERTEX
+        delete effectiveRequested.CLAUDE_CODE_USE_FOUNDRY
+    }
+    return effectiveRequested
+}
+
+export function buildManagedSessionSpawnEnvironment(
+    inherited: NodeJS.ProcessEnv,
+    explicit: Record<string, string>,
+    managed: Record<string, string>,
+): Record<string, string> {
+    return overlayManagedCredentialEnvironment(
+        buildSessionSpawnEnvironment(inherited, explicit),
+        managed,
+    )
+}
+
 /** Retains only the per-session Saycode capability needed by a later resume. */
 export function captureSaycodeAgentEnvironment(
     env: NodeJS.ProcessEnv,
 ): SaycodeAgentEnvironment | undefined {
-    if (env.SAYCODE_AGENT_ENV !== '1' || !env.SAYCODE_AGENT_ROOT?.trim()) {
-        return undefined
+    const captured: SaycodeAgentEnvironment = {}
+    if (env.SAYCODE_AGENT_ENV === '1' && env.SAYCODE_AGENT_ROOT?.trim()) {
+        Object.assign(captured, Object.fromEntries(
+            SAYCODE_AGENT_ENV_KEYS.flatMap((key) => env[key] === undefined ? [] : [[key, env[key]]]),
+        ))
     }
-    return Object.fromEntries(
-        SAYCODE_AGENT_ENV_KEYS.flatMap((key) => env[key] === undefined ? [] : [[key, env[key]]]),
-    ) as SaycodeAgentEnvironment
+    // Sandbox policy belongs to every session, including sessions without agent control.
+    if (env.HAPPY_PROJECT_SANDBOX_CONFIG !== undefined) {
+        captured.HAPPY_PROJECT_SANDBOX_CONFIG = env.HAPPY_PROJECT_SANDBOX_CONFIG
+    }
+    const encodedCheckpointContext = env[CHECKPOINT_CONTEXT_KEY]
+    if (encodedCheckpointContext && readCheckpointSpawnContext(env)) {
+        captured[CHECKPOINT_CONTEXT_KEY] = encodedCheckpointContext
+    }
+    return Object.keys(captured).length > 0 ? captured : undefined
 }
 
 /** Restores one tracked session's capability without inheriting the caller's. */
@@ -95,11 +151,37 @@ export function buildResumedSessionSpawnEnvironment(input: {
     agentEnvironment?: SaycodeAgentEnvironment
     sessionId: string
 }): Record<string, string> {
-    return buildSessionSpawnEnvironment(input.inherited, {
+    const policyKey = 'HAPPY_PROJECT_SANDBOX_CONFIG'
+    // A session keeps its own policy; explicit updates still take precedence.
+    const policy = input.explicit[policyKey] ?? input.automation?.[policyKey]
+        ?? input.runtime?.[policyKey] ?? input.agentEnvironment?.[policyKey]
+    return buildSessionSpawnEnvironment({ ...input.inherited, [policyKey]: undefined }, {
         ...scrubSessionLineageEnv(input.runtime ?? {}),
         ...scrubSessionLineageEnv(input.automation ?? {}),
         ...input.explicit,
         ...(input.agentEnvironment ?? {}),
+        ...(policy !== undefined ? { [policyKey]: policy } : {}),
         APLUS_SESSION_ID: input.sessionId,
     })
+}
+
+/**
+ * Sets or removes the confirmed-delivery switch on a **final** child
+ * environment.
+ *
+ * Applied after the merge because the daemon's own environment is inherited
+ * wholesale on the default path: deleting the key from the caller's extras is
+ * not enough, since a value already present in `process.env` would survive the
+ * merge and turn the switch on for a launch that never asked for it.
+ *
+ * The switch changes delivery behaviour only. It is not an identity and grants
+ * no permission.
+ */
+export function applyConfirmedPromptDeliveryFlag(
+    env: Record<string, string>,
+    required: boolean,
+): Record<string, string> {
+    if (required) return { ...env, HAPPY_MANAGED_REQUIRE_PROMPT_ACK: '1' }
+    const { HAPPY_MANAGED_REQUIRE_PROMPT_ACK: _removed, ...rest } = env
+    return rest
 }

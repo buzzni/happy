@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { useSession, useSessionMessages, useSetting } from "@/sync/storage";
+import { useSession, useSessionMessages, useSessionStreamPreview, useSetting } from "@/sync/storage";
 import { sync } from '@/sync/sync';
 import { ActivityIndicator, AppState, FlatList, NativeScrollEvent, NativeSyntheticEvent, Platform, Pressable, View } from 'react-native';
 import { useCallback } from 'react';
@@ -21,11 +21,16 @@ const SCROLL_THRESHOLD = 300;
 
 export const ChatList = React.memo((props: { session: Session }) => {
     const { messages, hasMoreOlder, isLoadingOlder } = useSessionMessages(props.session.id);
+    const streamPreview = useSessionStreamPreview(props.session.id);
+    const messagesWithPreview = React.useMemo(
+        () => streamPreview ? [streamPreview, ...messages] : messages,
+        [messages, streamPreview],
+    );
     return (
         <ChatListInternal
             metadata={props.session.metadata}
             sessionId={props.session.id}
-            messages={messages}
+            messages={messagesWithPreview}
             hasMoreOlder={hasMoreOlder}
             isLoadingOlder={isLoadingOlder}
         />

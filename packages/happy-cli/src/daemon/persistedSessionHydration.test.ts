@@ -64,6 +64,7 @@ describe('hydrateTrackedSessionFromPersisted', () => {
       SAYCODE_AGENT_DEPTH: '2',
       SAYCODE_AGENT_MAX_SPAWN: '4',
       SAYCODE_AGENT_ID: 'worker-1',
+      HAPPY_PROJECT_SANDBOX_CONFIG: JSON.stringify({ enabled: true, extraWritePaths: ['/repo/.aplus/agent-lineage.jsonl'] }),
     };
 
     expect(hydrateTrackedSessionFromPersisted(persisted({ agentEnvironment })).agentEnvironment)

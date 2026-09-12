@@ -58,6 +58,19 @@ describe('readWorkerConfigFromEnv', () => {
         expect(readWorkerConfigFromEnv({})).toEqual({ workerModel: undefined, workerEffort: undefined })
     })
 
+    it('maps Z.AI worker models to Claude aliases and disables Fable', () => {
+        const zaiEnv = { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic' }
+
+        expect(readWorkerConfigFromEnv({
+            ...zaiEnv,
+            HAPPY_WORKER_MODEL: 'claude-sonnet-5',
+        }).workerModel).toBe('sonnet')
+        expect(readWorkerConfigFromEnv({
+            ...zaiEnv,
+            HAPPY_WORKER_MODEL: 'claude-fable-5',
+        }).workerModel).toBeUndefined()
+    })
+
     it('round-trips through buildWorkerAgents from env', () => {
         const cfg = readWorkerConfigFromEnv({ HAPPY_WORKER_MODEL: 'sonnet', HAPPY_WORKER_EFFORT: 'medium' })
         const worker = buildWorkerAgents(cfg).agents![WORKER_AGENT_NAME]

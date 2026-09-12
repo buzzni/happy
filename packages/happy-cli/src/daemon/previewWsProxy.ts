@@ -58,6 +58,18 @@ export interface PreviewWsProxyOptions {
  */
 export class PreviewWsProxy {
     private readonly tunnels = new Map<string, { socket: net.Socket; port: number }>()
+    /**
+     * specs/runtime-isolation-hardening (H3, P2) — opens that have not
+     * connected yet.
+     *
+     * happy-server's open deadline can pass while this side is still
+     * connecting (busy machine, slow upstream), and it then tells us to close
+     * a tunnel it has already forgotten. Without this the close is a no-op —
+     * the tunnel is not in `tunnels` yet — and the upstream connects a moment
+     * later into a tunnel with no owner, no expiry timer and no recheck
+     * behind it.
+     */
+    private readonly connecting = new Map<string, { socket: net.Socket; cancelled: boolean; settle: (ack: OpenTunnelAck) => void }>()
     private readonly portMin: number
     private readonly portMax: number
     private readonly connectTimeoutMs: number
@@ -94,10 +106,13 @@ export class PreviewWsProxy {
             const settle = (ack: OpenTunnelAck) => {
                 if (settled) return
                 settled = true
+                this.connecting.delete(tunnelId)
                 resolve(ack)
             }
 
             const upstream = net.connect({ host: '127.0.0.1', port })
+            const pending = { socket: upstream, cancelled: false, settle }
+            this.connecting.set(tunnelId, pending)
             const timer = setTimeout(() => {
                 upstream.destroy()
                 settle({ ok: false, code: 'TIMEOUT', message: `Upstream connect timed out after ${this.connectTimeoutMs}ms` })
@@ -105,6 +120,15 @@ export class PreviewWsProxy {
 
             upstream.once('connect', () => {
                 clearTimeout(timer)
+                if (pending.cancelled) {
+                    // The server gave up on this tunnel while we connected.
+                    // Registering it now would stream bytes for a tunnel it
+                    // has already forgotten.
+                    upstream.destroy()
+                    this.logger?.debug(`[preview-ws] tunnel ${tunnelId} cancelled before it connected`)
+                    settle({ ok: false, code: 'CANCELLED', message: 'Tunnel was closed before it connected' })
+                    return
+                }
                 this.tunnels.set(tunnelId, { socket: upstream, port })
                 this.onActivity?.(port)
                 const initial = dataB64 ? Buffer.from(dataB64, 'base64') : null
@@ -148,8 +172,18 @@ export class PreviewWsProxy {
         }
     }
 
-    /** Close a single tunnel (server-initiated or on error). */
+    /** Close a single tunnel (server-initiated or on error), connected or not. */
     close(tunnelId: string): void {
+        const pending = this.connecting.get(tunnelId)
+        if (pending) {
+            // Remembered rather than just destroyed: the 'connect' handler may
+            // still be queued, and it must not register the tunnel. The ack is
+            // settled here too — destroying a connecting socket emits 'close'
+            // but no 'error', so nothing else would answer the open.
+            pending.cancelled = true
+            pending.socket.destroy()
+            pending.settle({ ok: false, code: 'CANCELLED', message: 'Tunnel was closed before it connected' })
+        }
         const tunnel = this.tunnels.get(tunnelId)
         if (tunnel) {
             this.tunnels.delete(tunnelId)
@@ -159,6 +193,11 @@ export class PreviewWsProxy {
 
     /** Tear down every tunnel — call on daemon socket disconnect. */
     closeAll(): void {
+        for (const pending of this.connecting.values()) {
+            pending.cancelled = true
+            pending.socket.destroy()
+            pending.settle({ ok: false, code: 'CANCELLED', message: 'Daemon connection dropped' })
+        }
         for (const { socket } of this.tunnels.values()) socket.destroy()
         this.tunnels.clear()
     }

@@ -9,9 +9,22 @@ const services = vi.hoisted(() => ({
     startAutomationRun: vi.fn(),
     syncAutomations: vi.fn(),
     emitAutomationUpdate: vi.fn(),
+    emitProjectAutomationUpdate: vi.fn(),
+    claimSessionFollowup: vi.fn(),
+    deliverSessionFollowupMessage: vi.fn(),
+    reportSessionFollowupEvaluation: vi.fn(),
+    syncSessionFollowups: vi.fn(),
+    emitSessionFollowupMessageUpdate: vi.fn(),
 }));
 vi.mock('@/app/automation/automationExecutionService', () => services);
-vi.mock('@/app/automation/automationUpdate', () => ({ emitAutomationUpdate: services.emitAutomationUpdate }));
+vi.mock('@/app/automation/sessionFollowupExecutionService', () => services);
+vi.mock('@/app/automation/automationUpdate', () => ({
+    emitAutomationUpdate: services.emitAutomationUpdate,
+    emitProjectAutomationUpdate: services.emitProjectAutomationUpdate,
+}));
+vi.mock('@/app/automation/sessionFollowupUpdate', () => ({
+    emitSessionFollowupMessageUpdate: services.emitSessionFollowupMessageUpdate,
+}));
 vi.mock('@/storage/inTx', () => ({ inTx: (callback: (tx: unknown) => unknown) => callback({}) }));
 
 import { automationSocketHandler } from './automationSocketHandler';
@@ -49,6 +62,8 @@ describe('automationSocketHandler', () => {
         expect([...handlers.keys()].sort()).toEqual([
             'automation-claim', 'automation-key-register', 'automation-run-heartbeat',
             'automation-run-report', 'automation-run-start', 'automation-sync', 'automation-sync-ack',
+            'session-followup-claim', 'session-followup-deliver', 'session-followup-evaluate',
+            'session-followup-sync',
         ]);
         const callback = vi.fn();
         await handlers.get('automation-sync')!({ afterSeq: '0', limit: 100, machineId: 'foreign' }, callback);
@@ -62,7 +77,10 @@ describe('automationSocketHandler', () => {
     it('registers run-now protocol support and treats an older daemon as version 1', async () => {
         const handlers = new Map<string, Function>();
         const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
-        services.registerAutomationMachineKey.mockResolvedValue({ ok: true, value: { keyVersion: 4 } });
+        services.registerAutomationMachineKey.mockResolvedValue({
+            ok: true,
+            value: { keyVersion: 4, invalidatedProjectIds: ['project-1'] },
+        });
         automationSocketHandler('account-1', 'machine-1', socket as never);
         const key = Buffer.from(new Uint8Array(32)).toString('base64');
 
@@ -76,6 +94,9 @@ describe('automationSocketHandler', () => {
         await handlers.get('automation-key-register')!({ expectedKeyVersion: 3, publicKey: key }, vi.fn());
         expect(services.registerAutomationMachineKey).toHaveBeenLastCalledWith(
             {}, 'account-1', 'machine-1', expect.objectContaining({ protocolVersion: 1 }),
+        );
+        expect(services.emitProjectAutomationUpdate).toHaveBeenCalledWith(
+            'project-1', { projectId: 'project-1', reason: 'sync' }, 'account-1',
         );
     });
 
@@ -122,5 +143,68 @@ describe('automationSocketHandler', () => {
             failureCode: 'secret: do not log',
         }, rejected);
         expect(rejected).toHaveBeenCalledWith({ ok: false, error: 'invalid-input' });
+    });
+
+    it('binds session follow-up delivery to the authenticated machine socket', async () => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        services.deliverSessionFollowupMessage.mockResolvedValue({
+            ok: true,
+            value: {
+                followup: { projectId: 'project-1', sessionId: 'session-1' },
+                idempotent: false,
+                messageSeq: 12,
+                deliveredMessage: {
+                    id: 'message-1', localId: 'local-1',
+                    createdAt: new Date(10), updatedAt: new Date(11),
+                },
+            },
+        });
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+        const callback = vi.fn();
+        await handlers.get('session-followup-deliver')!({
+            wireVersion: 1,
+            followupId: 'followup-1', generation: 2, step: 3, claimToken: 'claim',
+            expectedSeq: 11, localId: 'local-1', contentCiphertext: 'AQ==',
+            machineId: 'foreign-machine',
+        }, callback);
+        expect(services.deliverSessionFollowupMessage).toHaveBeenCalledWith(
+            {}, 'account-1', 'machine-1', expect.objectContaining({ followupId: 'followup-1' }),
+        );
+        expect(callback).toHaveBeenCalledWith({ ok: true, value: expect.objectContaining({ messageSeq: 12 }) });
+        expect(services.emitSessionFollowupMessageUpdate).toHaveBeenCalledWith({
+            userId: 'account-1', sessionId: 'session-1', id: 'message-1', seq: 12,
+            localId: 'local-1', contentCiphertext: 'AQ==',
+            createdAt: new Date(10), updatedAt: new Date(11),
+        });
+        expect(services.emitProjectAutomationUpdate).toHaveBeenCalledWith(
+            'project-1',
+            { projectId: 'project-1', reason: 'sync' },
+            'account-1',
+        );
+    });
+
+    it('rejects follow-up payloads outside the shared versioned wire contract', async () => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+
+        const invalidCiphertext = vi.fn();
+        await handlers.get('session-followup-deliver')!({
+            wireVersion: 1,
+            followupId: 'followup-1', generation: 2, step: 3, claimToken: 'claim',
+            expectedSeq: 11, localId: 'local-1', contentCiphertext: 'not base64!',
+        }, invalidCiphertext);
+        expect(invalidCiphertext).toHaveBeenCalledWith({ ok: false, error: 'invalid-input' });
+
+        const controlPlaneCode = vi.fn();
+        await handlers.get('session-followup-evaluate')!({
+            wireVersion: 1,
+            followupId: 'followup-1', generation: 2, step: 3, claimToken: 'claim',
+            decision: 'TERMINATE', observedSeq: 12, terminalCode: 'STOPPED',
+        }, controlPlaneCode);
+        expect(controlPlaneCode).toHaveBeenCalledWith({ ok: false, error: 'invalid-input' });
+        expect(services.deliverSessionFollowupMessage).not.toHaveBeenCalled();
+        expect(services.reportSessionFollowupEvaluation).not.toHaveBeenCalled();
     });
 });

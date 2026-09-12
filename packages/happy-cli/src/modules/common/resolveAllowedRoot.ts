@@ -21,13 +21,21 @@
  *      itself; we only widen the allowed prefix.
  */
 
-import { resolve } from 'path';
+import { join, resolve } from 'path';
+import { resolveMachineLockdownPolicy } from '@/daemon/machineLockdownPolicy';
 
 export interface ResolveAllowedRootInput {
     /** workspaceRoot from the machine-registry settings. May be null/undefined. */
     registryWorkspaceRoot?: string | null;
     /** Absolute path to the user's home directory (`os.homedir()`). */
     homeDir: string;
+    /**
+     * `'workspace'` (trial lockdown, HAPPY_RPC_ALLOWED_ROOT=workspace) never widens
+     * to the home directory: without a registry root it confines RPCs to
+     * `<home>/workspace`, which encloses the default project root. Credential
+     * files live directly under `<home>/.happy` etc. and stay out of reach.
+     */
+    mode?: 'home' | 'workspace';
 }
 
 function stripTrailingSlash(value: string): string {
@@ -36,8 +44,22 @@ function stripTrailingSlash(value: string): string {
 
 export function resolveAllowedRoot(input: ResolveAllowedRootInput): string {
     const { registryWorkspaceRoot, homeDir } = input;
-    if (!registryWorkspaceRoot) return homeDir;
+    if (!registryWorkspaceRoot) {
+        return input.mode === 'workspace' ? join(homeDir, 'workspace') : homeDir;
+    }
     const trimmed = stripTrailingSlash(registryWorkspaceRoot);
     if (trimmed.startsWith('/')) return trimmed;
     return resolve(homeDir, trimmed);
+}
+
+/** The daemon-wide allowed root: registry workspace root + lockdown policy from env. */
+export function resolveDaemonAllowedRoot(
+    env: Record<string, string | undefined>,
+    homeDir: string,
+): string {
+    return resolveAllowedRoot({
+        registryWorkspaceRoot: env.HAPPY_WORKSPACE_ROOT ?? null,
+        homeDir,
+        mode: resolveMachineLockdownPolicy(env).rpcAllowedRootMode,
+    });
 }

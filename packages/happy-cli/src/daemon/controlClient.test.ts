@@ -105,6 +105,25 @@ describe('checkIfDaemonRunningAndCleanupStaleState', () => {
       fetchSpy.mockRestore()
     }
   })
+
+  // ADR-061: the control server rejects every request without this header.
+  it('authenticates the control server call with the persisted controlSecret', async () => {
+    const state = { ...stateWithPid(process.pid), controlSecret: 's3cr3t-value' }
+    mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: true } as Response)
+
+    try {
+      await checkIfDaemonRunningAndCleanupStaleState()
+      expect(fetchSpy).toHaveBeenCalledWith(
+        `http://127.0.0.1:${HTTP_PORT}/list`,
+        expect.objectContaining({
+          headers: expect.objectContaining({ Authorization: 'Bearer s3cr3t-value' }),
+        }),
+      )
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
 })
 
 describe('stopDaemon', () => {

@@ -5,9 +5,66 @@ import { buildUsageEphemeral, eventRouter } from "@/app/events/eventRouter";
 import { persistSessionEvent } from "@/app/events/persistSessionEvent";
 import { SESSION_EVENT_TYPES } from "@/app/events/sessionEventTypes";
 import { log } from "@/utils/log";
+import { AiUsageEventV1Schema, ProviderUsageEventV1Schema } from "@slopus/happy-wire";
 
 export function usageHandler(userId: string, socket: Socket) {
     const receiveUsageLock = new AsyncLock();
+    socket.on('provider-usage-report', async (data: unknown, callback?: (response: unknown) => void) => {
+        await receiveUsageLock.inLock(async () => {
+            const parsed = ProviderUsageEventV1Schema.safeParse(data);
+            if (!parsed.success) {
+                log({ module: 'websocket', level: 'warn' }, 'Rejected invalid provider usage event');
+                callback?.({ success: false, error: 'Invalid provider usage event' });
+                return;
+            }
+
+            try {
+                const session = await db.session.findFirst({
+                    where: { id: parsed.data.sessionId, accountId: userId },
+                    select: { id: true },
+                });
+                if (!session) {
+                    callback?.({ success: false, error: 'Session not found' });
+                    return;
+                }
+
+                const event = AiUsageEventV1Schema.parse({
+                    ...parsed.data,
+                    happyAccountId: userId,
+                });
+                const usageEvent = await db.$transaction(async (tx) => {
+                    const stored = await tx.providerUsageEvent.upsert({
+                        where: {
+                            source_sourceEventId: {
+                                source: event.source,
+                                sourceEventId: event.sourceEventId,
+                            },
+                        },
+                        update: {},
+                        create: {
+                            accountId: userId,
+                            sessionId: event.sessionId,
+                            source: event.source,
+                            sourceEventId: event.sourceEventId,
+                            occurredAt: new Date(event.occurredAt),
+                            data: event,
+                        },
+                    });
+                    await tx.usageDeliveryOutbox.upsert({
+                        where: { usageEventId: stored.id },
+                        update: {},
+                        create: { usageEventId: stored.id, nextAttemptAt: new Date() },
+                    });
+                    return stored;
+                });
+                callback?.({ success: true, eventId: usageEvent.id });
+            } catch (error) {
+                log({ module: 'websocket', level: 'error' }, `Failed to persist provider usage event: ${error}`);
+                callback?.({ success: false, error: 'Failed to persist provider usage event' });
+            }
+        });
+    });
+
     socket.on('usage-report', async (data: any, callback?: (response: any) => void) => {
         await receiveUsageLock.inLock(async () => {
             try {

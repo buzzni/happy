@@ -6,10 +6,62 @@
  */
 
 import { join, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { writeFileSync, mkdirSync, unlinkSync, existsSync } from 'node:fs';
 import { configuration } from '@/configuration';
 import { logger } from '@/ui/logger';
 import { projectPath } from '@/projectPath';
+import {
+    managedCredentialDenyRules,
+    resolveMachineLockdownPolicy,
+    type MachineLockdownPolicy,
+} from '@/daemon/machineLockdownPolicy';
+
+/**
+ * Pure settings document. `permissions.deny` always guards broad kills; under
+ * the trial lockdown policy it also hides the daemon-managed credential files
+ * and environment dumps from the agent (aplus-dev-studio
+ * specs/trial-auto-onboarding-budget D7 — a mitigation, not a sandbox).
+ */
+export function buildHookSettings(input: {
+    hookCommand: string;
+    broadKillGuardCommand: string;
+    policy: MachineLockdownPolicy;
+    homeDir: string;
+}): Record<string, unknown> {
+    return {
+        permissions: {
+            deny: [
+                "Bash(killall:*)",
+                ...(input.policy.protectManagedCredentials ? managedCredentialDenyRules(input.homeDir) : []),
+            ]
+        },
+        hooks: {
+            SessionStart: [
+                {
+                    matcher: "*",
+                    hooks: [
+                        {
+                            type: "command",
+                            command: input.hookCommand
+                        }
+                    ]
+                }
+            ],
+            PreToolUse: [
+                {
+                    matcher: "Bash",
+                    hooks: [
+                        {
+                            type: "command",
+                            command: input.broadKillGuardCommand
+                        }
+                    ]
+                }
+            ]
+        }
+    };
+}
 
 /**
  * Generate a temporary settings file with SessionStart hook configuration
@@ -34,37 +86,12 @@ export function generateHookSettingsFile(port: number): string {
     const broadKillGuardScript = resolve(projectPath(), 'scripts', 'broad_kill_guard.cjs');
     const broadKillGuardCommand = `node "${broadKillGuardScript}"`;
 
-    const settings = {
-        permissions: {
-            deny: [
-                "Bash(killall:*)"
-            ]
-        },
-        hooks: {
-            SessionStart: [
-                {
-                    matcher: "*",
-                    hooks: [
-                        {
-                            type: "command",
-                            command: hookCommand
-                        }
-                    ]
-                }
-            ],
-            PreToolUse: [
-                {
-                    matcher: "Bash",
-                    hooks: [
-                        {
-                            type: "command",
-                            command: broadKillGuardCommand
-                        }
-                    ]
-                }
-            ]
-        }
-    };
+    const settings = buildHookSettings({
+        hookCommand,
+        broadKillGuardCommand,
+        policy: resolveMachineLockdownPolicy(process.env),
+        homeDir: homedir(),
+    });
 
     writeFileSync(filepath, JSON.stringify(settings, null, 2));
     logger.debug(`[generateHookSettings] Created hook settings file: ${filepath}`);

@@ -5,6 +5,7 @@ import { mapCodexMcpMessageToSessionEnvelopes } from './utils/sessionProtocolMap
 const {
     mockExecSync,
     mockInitializeSandbox,
+    mockVerifySandboxCapability,
     mockWrapForMcpTransport,
     mockSandboxCleanup,
     mockSpawn,
@@ -13,6 +14,7 @@ const {
 } = vi.hoisted(() => ({
     mockExecSync: vi.fn(),
     mockInitializeSandbox: vi.fn(),
+    mockVerifySandboxCapability: vi.fn(),
     mockWrapForMcpTransport: vi.fn(),
     mockSandboxCleanup: vi.fn(),
     mockSpawn: vi.fn(),
@@ -27,6 +29,11 @@ vi.mock('node:child_process', () => ({
 
 vi.mock('cross-spawn', () => ({
     spawn: mockSpawn,
+}));
+
+vi.mock('@/sandbox/executionCapability', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('@/sandbox/executionCapability')>()),
+    verifySandboxExecutionCapability: mockVerifySandboxCapability,
 }));
 
 vi.mock('@/sandbox/manager', () => ({
@@ -129,6 +136,7 @@ describe('CodexAppServerClient sandbox integration', () => {
         process.env.RUST_LOG = originalRustLog;
         mockExecSync.mockReturnValue('codex-cli 0.107.0');
         mockInitializeSandbox.mockResolvedValue(mockSandboxCleanup);
+        mockVerifySandboxCapability.mockResolvedValue({ ok: true });
         mockWrapForMcpTransport.mockResolvedValue({ command: 'sh', args: ['-c', 'wrapped codex app-server'] });
         mockPrepareCodexMultiAuthProxy.mockResolvedValue(null);
         mockProxyCleanup.mockResolvedValue(undefined);
@@ -147,6 +155,56 @@ describe('CodexAppServerClient sandbox integration', () => {
 
         mockExecSync.mockReturnValue('codex-cli 0.130.0');
         expect(new CodexAppServerClient().supportsGoalActions()).toBe(false);
+    });
+
+    it('emits response-scoped usage with the native Codex response id', async () => {
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (_msg, stdout) => {
+                appServerStdout = stdout;
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((event) => events.push(event));
+
+        await client.connect();
+        if (!appServerStdout) throw new Error('app-server stdout unavailable');
+        pushJsonLine(appServerStdout, {
+            method: 'rawResponse/completed',
+            params: {
+                threadId: 'thread-1',
+                turnId: 'turn-1',
+                responseId: 'response-1',
+                usage: {
+                    totalTokens: 150,
+                    inputTokens: 120,
+                    cachedInputTokens: 70,
+                    cacheWriteInputTokens: 10,
+                    outputTokens: 30,
+                    reasoningOutputTokens: 5,
+                },
+            },
+        });
+
+        await waitFor(() => events.length === 1);
+        expect(events[0]).toEqual({
+            type: 'codex_usage',
+            thread_id: 'thread-1',
+            turn_id: 'turn-1',
+            response_id: 'response-1',
+            usage: {
+                totalTokens: 150,
+                inputTokens: 120,
+                cachedInputTokens: 70,
+                cacheWriteInputTokens: 10,
+                outputTokens: 30,
+                reasoningOutputTokens: 5,
+            },
+        });
+
+        await client.disconnect();
     });
 
     it('adapts MCP startup notifications and paginated tool/auth inventory', async () => {
@@ -420,6 +478,163 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('does not dispatch a protected turn when the checkpoint gate fails', async () => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-protected', path: '/tmp/thread-protected' },
+                            model: 'gpt-test', modelProvider: 'openai', cwd: '/tmp/project',
+                            approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' }, reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { turn: { id: 'turn-should-not-start' } },
+                    }), 0);
+                }
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const beforeTurn = vi.fn(async () => {
+            throw new Error('checkpoint unavailable');
+        });
+        await client.connect();
+        await client.startThread({ cwd: '/tmp/project', sandbox: 'workspace-write' });
+
+        await expect(client.sendTurn('edit the project', { beforeTurn }))
+            .rejects.toThrow('checkpoint unavailable');
+
+        expect(beforeTurn).toHaveBeenCalledOnce();
+        expect(requests.some(({ method }) => method === 'turn/start')).toBe(false);
+        await client.disconnect();
+    });
+
+    it('does not create a checkpoint when no provider thread can accept the turn', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const beforeTurn = vi.fn(async () => {});
+
+        await expect(client.sendTurnAndWait('edit the project', { beforeTurn }))
+            .rejects.toThrow('No active thread');
+
+        expect(beforeTurn).not.toHaveBeenCalled();
+    });
+
+    it('runs the checkpoint gate exactly once before dispatching a protected turn', async () => {
+        const order: string[] = [];
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-gated', path: '/tmp/thread-gated' },
+                            model: 'gpt-test', modelProvider: 'openai', cwd: '/tmp/project',
+                            approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' }, reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    order.push('provider');
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-gated' } } });
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: {
+                                threadId: 'thread-gated',
+                                turn: { id: 'turn-gated', status: 'completed', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        }));
+        const beforeTurn = vi.fn(async () => {
+            order.push('gate');
+            return {
+                operationId: 'turn-1',
+                checkpointId: 'a'.repeat(40),
+                providerPath: '/private/checkpoints/codex-turn-1',
+            };
+        });
+        const completeTurn = vi.fn(async (quiesceWriters: () => Promise<void>) => {
+            await quiesceWriters();
+            order.push('apply');
+            return { status: 'completed' as const, entries: [] };
+        });
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(undefined, beforeTurn, completeTurn);
+        await client.connect();
+        await client.startThread({ cwd: '/tmp/project', sandbox: 'workspace-write' });
+
+        await expect(client.sendTurnAndWait('edit the project'))
+            .resolves.toEqual({ aborted: false });
+
+        expect(beforeTurn).toHaveBeenCalledOnce();
+        expect(completeTurn).toHaveBeenCalledOnce();
+        expect(order).toEqual(['gate', 'provider', 'apply']);
+        expect(requests.find(({ method }) => method === 'turn/start')?.params.cwd)
+            .toBe('/private/checkpoints/codex-turn-1');
+        await client.disconnect();
+    });
+
+    it('does not dispatch an excluded-path retry while protection confirmation is pending', async () => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-excluded', path: '/tmp/thread-excluded' },
+                            model: 'gpt-test', modelProvider: 'openai', cwd: '/tmp/project',
+                            approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' }, reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { turn: { id: 'turn-should-not-start' } },
+                    }), 0);
+                }
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        let rejectConfirmation!: (reason: Error) => void;
+        const confirmation = new Promise<void>((_, reject) => {
+            rejectConfirmation = reject;
+        });
+        const beforeTurn = vi.fn(() => confirmation);
+        await client.connect();
+        await client.startThread({ cwd: '/tmp/project', sandbox: 'workspace-write' });
+
+        const running = client.sendTurnAndWait(
+            'retry after the excluded .env write was denied',
+            { beforeTurn },
+        );
+        await vi.waitFor(() => expect(beforeTurn).toHaveBeenCalledOnce());
+
+        expect(requests.some(({ method }) => method === 'turn/start')).toBe(false);
+
+        rejectConfirmation(new Error('excluded path confirmation cancelled'));
+        await expect(running).rejects.toThrow('excluded path confirmation cancelled');
+        expect(requests.some(({ method }) => method === 'turn/start')).toBe(false);
+        await client.disconnect();
+    });
+
     it('clears persisted developer instructions when resume explicitly sends null', async () => {
         const requests: MockRpcMessage[] = [];
         mockSpawn.mockImplementation(() => createMockProcess({
@@ -474,7 +689,7 @@ describe('CodexAppServerClient sandbox integration', () => {
 
         await client.connect();
 
-        expect(mockInitializeSandbox).toHaveBeenCalledWith(sandboxConfig, process.cwd());
+        expect(mockInitializeSandbox).toHaveBeenCalledWith(sandboxConfig, process.cwd(), 'owner-choice');
         expect(mockWrapForMcpTransport).toHaveBeenCalledWith('codex', ['app-server', '--listen', 'stdio://']);
         expect(mockSpawn).toHaveBeenCalledWith(
             'sh',
@@ -491,21 +706,111 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
-    // 2026-08-28 프로덕션 — 이 테스트는 원래 버그를 정상으로 못박고 있었다.
-    // sandboxConfig.networkMode 는 'allowed' 인데, 초기화가 실패하면 계속 진행해
-    // sandboxEnabled=false 로 떨어졌다. 그 뒤 AgentTask 워커가 permissionMode
-    // read-only 로 Codex 네이티브 readOnly 정책(네트워크 없음)에 떨어졌고, 몇 분
-    // 뒤 exec_command 안의 네트워크 호출이 실패할 때가 돼서야 드러났다. 네트워크가
-    // 명시적으로 필요했던 자리에서는 조용히 계속 진행하지 않고 스폰 시점에 바로
-    // 실패해야 한다.
-    it('refuses to continue when network was required and sandbox init fails', async () => {
+    it('runs its protected runtime gate before every turn dispatch', async () => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: {
+                            thread: { id: 'thread-runtime', path: '/tmp/thread-runtime' },
+                            model: 'gpt-test', modelProvider: 'openai', cwd: '/tmp/project',
+                            approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' }, reasoningEffort: null,
+                        },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id,
+                        result: { turn: { id: 'turn-runtime' } },
+                    }), 0);
+                }
+            },
+        }));
+        const beforeTurn = vi.fn(async () => {});
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(sandboxConfig, beforeTurn);
+        await client.connect();
+        await client.startThread({ cwd: '/tmp/project' });
+
+        await client.sendTurn('edit the project');
+
+        expect(beforeTurn).toHaveBeenCalledOnce();
+        expect(requests.some(({ method }) => method === 'turn/start')).toBe(true);
+        await client.disconnect();
+    });
+
+    // 2026-08-31 회귀 — 8/28 수정이 스폰 시점에 무조건 죽이도록 만들어, 폴백해도
+    // 네트워크가 멀쩡한 세션까지 전부 죽였다. connect() 시점에는 permissionMode 를
+    // 아직 모른다 (턴마다 결정된다). 그러니 여기서는 초기화 실패 사실만 기록하고,
+    // 네트워크를 실제로 잃는지는 모드를 아는 턴 시점에서 판정한다.
+    it('records sandbox init failure and still connects — the turn decides if it is fatal', async () => {
         mockInitializeSandbox.mockRejectedValue(new Error('sandbox init failed'));
         const { CodexAppServerClient } = await import('./codexAppServerClient');
         const client = new CodexAppServerClient(sandboxConfig);
 
-        await expect(client.connect()).rejects.toThrow(/network access was required/);
+        await client.connect();
+
+        expect(client.sandboxEnabled).toBe(false);
+        expect(client.sandboxInitFailed).toBe(true);
+        expect(mockSpawn).toHaveBeenCalled();
+
+        await client.disconnect();
+    });
+
+
+    // local 경로와 같은 확인이다: 초기화 성공은 격리 성공의 증거가 아니다.
+    it('refuses to connect on a mandatory machine when the sandbox cannot execute', async () => {
+        mockVerifySandboxCapability.mockResolvedValue({
+            ok: false,
+            reason: 'namespace-denied',
+            detail: 'bwrap: Creating new namespace failed: Operation not permitted',
+        });
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(sandboxConfig, undefined, undefined, 'mandatory');
+
+        await expect(client.connect()).rejects.toThrow(/capability-unavailable/);
 
         expect(mockSpawn).not.toHaveBeenCalled();
+        await client.disconnect();
+    });
+
+    it('does not probe sandbox capability on an owner-choice machine', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(sandboxConfig);
+
+        await client.connect();
+
+        expect(mockVerifySandboxCapability).not.toHaveBeenCalled();
+        await client.disconnect();
+    });
+
+    // 위 완화는 개인 머신 이야기다. mandatory 머신에서 폴백하면 네이티브 정책이
+    // workspace-write/danger-full-access 가 되어 호스트 전체가 열린다 — 턴을
+    // 기다리지 않고 connect 에서 멈춘다.
+    it('refuses to connect on a mandatory machine when sandbox init fails', async () => {
+        mockInitializeSandbox.mockRejectedValue(new Error('bwrap unavailable'));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(sandboxConfig, undefined, undefined, 'mandatory');
+
+        await expect(client.connect()).rejects.toThrow(/init-failed/);
+
+        expect(mockSpawn).not.toHaveBeenCalled();
+        await client.disconnect();
+    });
+
+    it('leaves sandboxInitFailed false when the sandbox initialised cleanly', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(sandboxConfig);
+
+        await client.connect();
+
+        expect(client.sandboxEnabled).toBe(true);
+        expect(client.sandboxInitFailed).toBe(false);
+
+        await client.disconnect();
     });
 
     it('still falls back to non-sandbox transport when the sandbox deliberately blocks network', async () => {
@@ -530,6 +835,19 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(client.sandboxEnabled).toBe(false);
 
         await client.disconnect();
+    });
+
+    it('fails closed when a protected runtime cannot initialize its sandbox', async () => {
+        mockInitializeSandbox.mockRejectedValue(new Error('sandbox init failed'));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(
+            { ...sandboxConfig, networkMode: 'blocked' },
+            vi.fn(async () => {}),
+        );
+
+        await expect(client.connect()).rejects.toThrow(/checkpoint protection sandbox initialization failed/);
+
+        expect(mockSpawn).not.toHaveBeenCalled();
     });
 
     it('routes managed Codex sessions through multi-auth and closes the proxy on disconnect', async () => {
@@ -2118,6 +2436,10 @@ describe('CodexAppServerClient sandbox integration', () => {
             approvalPolicy: 'on-request',
             sandbox: 'workspace-write',
         });
+        const imported = await client.forkThreadFromPath({
+            path: '/tmp/imported-rollout.jsonl',
+            cwd: '/tmp/moved-project',
+        });
         const read = await client.readThread({ threadId: forked.threadId, includeTurns: true });
         const rolledBack = await client.rollbackThread({ threadId: forked.threadId, numTurns: 2 });
         const injected = await client.injectItems({
@@ -2130,6 +2452,7 @@ describe('CodexAppServerClient sandbox integration', () => {
         });
 
         expect(forked.threadId).toBe('thread-forked');
+        expect(imported.threadId).toBe('thread-forked');
         expect(read.thread.turns).toHaveLength(1);
         expect(rolledBack.thread.turns).toHaveLength(1);
         expect(injected).toEqual({});
@@ -2138,6 +2461,14 @@ describe('CodexAppServerClient sandbox integration', () => {
             cwd: '/tmp/project',
             approvalPolicy: 'on-request',
             sandbox: 'workspace-write',
+        }));
+        expect(requests.find((msg) => (
+            msg.method === 'thread/fork'
+            && (msg.params as { path?: string } | undefined)?.path === '/tmp/imported-rollout.jsonl'
+        ))?.params).toEqual(expect.objectContaining({
+            threadId: '',
+            path: '/tmp/imported-rollout.jsonl',
+            cwd: '/tmp/moved-project',
         }));
         expect(requests.find((msg) => msg.method === 'thread/read')?.params).toEqual({
             threadId: 'thread-forked',
@@ -2641,6 +2972,124 @@ describe('CodexAppServerClient sandbox integration', () => {
             expect.objectContaining({ type: 'agent_message', message: 'done' }),
         ]));
         expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(1);
+
+        await client.disconnect();
+    });
+
+    // desktop-stuck-responding-state: a mid-turn agentMessage can legitimately
+    // carry phase 'final_answer' (Codex asking a clarifying question), which
+    // schedules our idle-fallback task_complete. When Codex then resumes the
+    // SAME provider turn — no fresh turn/started, since it never asked for a
+    // new turn — the authoritative turn/completed that eventually arrives for
+    // that turnId must not be dropped as a duplicate of the premature one, or
+    // the session never gets a real terminal marker again.
+    it('does not drop the authoritative completion when work resumes after a premature final_answer fallback', async () => {
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        const proc = createMockProcess({
+            pid: 3010,
+            onRequest: (msg, stdout) => {
+                appServerStdout = stdout;
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { thread: { id: 'thread-resume', path: '/tmp/thread-resume' } },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: { turn: { id: 'turn-resume-1', items: [], status: 'inProgress', error: null } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/started',
+                            params: { threadId: 'thread-resume', turn: { id: 'turn-resume-1' } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'item/completed',
+                            params: {
+                                threadId: 'thread-resume',
+                                turnId: 'turn-resume-1',
+                                item: { type: 'agentMessage', id: 'msg-mid-turn', text: 'clarifying question', phase: 'final_answer' },
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((msg) => events.push(msg as Record<string, unknown>));
+
+        await client.connect();
+        await client.startThread({ model: 'gpt-test', cwd: '/tmp/project', approvalPolicy: 'never', sandbox: 'danger-full-access' });
+
+        // The premature fallback resolves sendTurnAndWait ~250ms after the
+        // final_answer-phase message, with no open command to defer behind.
+        await expect(client.sendTurnAndWait('initial request')).resolves.toEqual({ aborted: false });
+        expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(1);
+
+        // Codex keeps working on the SAME provider turn: no turn/started
+        // precedes this activity, matching the production log
+        // (~/.happy_remote/logs — exec_command_begin ~23s after task_complete
+        // with no intervening task_started).
+        if (!appServerStdout) throw new Error('app-server stdout unavailable');
+        pushJsonLine(appServerStdout, {
+            method: 'item/started',
+            params: {
+                threadId: 'thread-resume',
+                turnId: 'turn-resume-1',
+                item: { type: 'commandExecution', id: 'call-resume', command: 'cat file', cwd: '/tmp', status: 'inProgress' },
+            },
+        });
+        pushJsonLine(appServerStdout, {
+            method: 'item/completed',
+            params: {
+                threadId: 'thread-resume',
+                turnId: 'turn-resume-1',
+                item: {
+                    type: 'commandExecution', id: 'call-resume', command: 'cat file', cwd: '/tmp',
+                    aggregatedOutput: 'contents', exitCode: 0, durationMs: 1, status: 'completed',
+                },
+            },
+        });
+        pushJsonLine(appServerStdout, {
+            method: 'item/completed',
+            params: {
+                threadId: 'thread-resume',
+                turnId: 'turn-resume-1',
+                item: { type: 'agentMessage', id: 'msg-real-final', text: 'the real final answer', phase: 'final_answer' },
+            },
+        });
+        pushJsonLine(appServerStdout, {
+            method: 'turn/completed',
+            params: { threadId: 'thread-resume', turn: { id: 'turn-resume-1', status: 'completed', error: null } },
+        });
+
+        await waitFor(() => events.filter((event) => event.type === 'task_complete').length >= 2);
+        expect(events.filter((event) => event.type === 'exec_command_end')).toHaveLength(1);
+        expect(events.filter((event) => event.type === 'agent_message' && event.message === 'the real final answer')).toHaveLength(1);
+
+        let mapperState = {
+            currentTurnId: null as string | null,
+            currentProviderTurnId: null as string | null,
+        };
+        const lifecycleTypes = events.flatMap((event) => {
+            const mapped = mapCodexMcpMessageToSessionEnvelopes(event, mapperState);
+            mapperState = mapped;
+            return mapped.envelopes.map((envelope) => envelope.ev.t);
+        }).filter((type) => type === 'turn-start' || type === 'turn-end');
+        expect(lifecycleTypes).toEqual([
+            'turn-start',
+            'turn-end',
+            'turn-start',
+            'turn-end',
+        ]);
 
         await client.disconnect();
     });
@@ -3790,5 +4239,58 @@ describe('CodexAppServerClient sandbox integration', () => {
         ]));
 
         await client.disconnect();
+    });
+});
+
+/**
+ * A managed Cloud run configures its own provider, and only its own.
+ *
+ * Account rotation exists to spread load across the operator's own Codex
+ * accounts. For a managed run that is a different payer and a provider outside
+ * the approval, so it must not be consulted at all — consulting it has already
+ * started a proxy and picked an account by the time anything could override it.
+ */
+describe('CodexAppServerClient for a managed Cloud run', () => {
+    const MANAGED_ARGS = [
+        '-c', 'model_providers.saycode-managed.name="Saycode managed gateway"',
+        '-c', 'model_providers.saycode-managed.base_url="https://studio.example.test/api/cloud/gateway/openai/v1"',
+        '-c', 'model_providers.saycode-managed.env_key="OPENAI_API_KEY"',
+        '-c', 'model_providers.saycode-managed.requires_openai_auth=false',
+        '-c', 'model_providers.saycode-managed.wire_api="responses"',
+        '-c', 'model_provider="saycode-managed"',
+    ];
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockExecSync.mockReturnValue('codex-cli 0.140.0');
+        mockPrepareCodexMultiAuthProxy.mockResolvedValue({
+            args: ['-c', 'model_provider="codex-multi-auth"'],
+            env: { OPENAI_API_KEY: 'another-accounts-key' },
+            cleanup: mockProxyCleanup,
+        });
+        mockProxyCleanup.mockResolvedValue(undefined);
+        mockSpawn.mockImplementation(() => createMockProcess());
+    });
+
+    it('never consults account rotation, and starts with the managed provider', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(undefined, undefined, undefined, undefined, MANAGED_ARGS);
+        await client.connect();
+
+        expect(mockPrepareCodexMultiAuthProxy).not.toHaveBeenCalled();
+        const [, args] = mockSpawn.mock.calls[0];
+        for (const expected of MANAGED_ARGS) expect(args).toContain(expected);
+        // Not the rotation's provider, and not whatever the config file says.
+        expect(args).not.toContain('model_provider="codex-multi-auth"');
+    });
+
+    it('still uses account rotation for an ordinary run', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+
+        expect(mockPrepareCodexMultiAuthProxy).toHaveBeenCalled();
+        const [, args] = mockSpawn.mock.calls[0];
+        expect(args).toContain('model_provider="codex-multi-auth"');
     });
 });

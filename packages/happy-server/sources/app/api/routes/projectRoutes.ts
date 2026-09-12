@@ -7,6 +7,7 @@ import { projectGet } from "@/app/project/projectGet";
 import { projectUpdate } from "@/app/project/projectUpdate";
 import { projectDelete } from "@/app/project/projectDelete";
 import { ProjectError } from "@/app/project/types";
+import { emitProjectAutomationUpdate } from "@/app/automation/automationUpdate";
 
 const ProjectConfigSchema = z.object({
     workspaceDir: z.string().optional(),
@@ -91,6 +92,11 @@ export function projectRoutes(app: Fastify) {
         if (!result.ok) {
             return reply.code(errorToStatus(result.error)).send({ error: result.error });
         }
+        await emitProjectAutomationUpdate(
+            request.params.id,
+            { projectId: request.params.id, reason: 'sync' },
+            request.userId,
+        );
         return reply.send({ project: formatProject(result.value) });
     });
 

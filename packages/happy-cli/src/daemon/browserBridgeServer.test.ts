@@ -7,6 +7,8 @@ import type { PortRegistry } from './portRegistry'
 
 const TOKEN = 'bridge-test-token'
 
+const realFetch = globalThis.fetch
+
 const stubPortRegistry: PortRegistry = {
     allocate: async () => ({ port: 30000, reused: false }),
     release: async () => false,
@@ -116,6 +118,14 @@ describe('controlServer /browser routes', () => {
     let stopBridge: () => Promise<void>
     let baseUrl: string
     let stopControl: () => Promise<void>
+    let controlSecret = ''
+    // ADR-061: the control server rejects every request without this — every
+    // `fetch(...)` call below picks this up lexically (see controlServer.test.ts).
+    const fetch = (input: Parameters<typeof realFetch>[0], init?: RequestInit) =>
+        realFetch(input, {
+            ...init,
+            headers: { ...(init?.headers as Record<string, string> | undefined), Authorization: `Bearer ${controlSecret}` },
+        })
 
     beforeEach(async () => {
         bridge = new BrowserBridge({ authToken: TOKEN })
@@ -133,6 +143,7 @@ describe('controlServer /browser routes', () => {
         })
         baseUrl = `http://127.0.0.1:${control.port}`
         stopControl = control.stop
+        controlSecret = control.controlSecret
     })
 
     afterEach(async () => {

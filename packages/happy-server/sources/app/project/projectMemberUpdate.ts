@@ -3,6 +3,7 @@ import { inTx } from "@/storage/inTx";
 import { ProjectMemberInfo, ProjectRole, Result } from "./types";
 import { buildMemberInfo } from "./projectMemberList";
 import { getProjectAsOwner } from "./projectAccessCheck";
+import { invalidateSessionFollowups } from "@/app/automation/sessionFollowupInvalidationService";
 
 /**
  * Update a project member's role.
@@ -25,6 +26,14 @@ export async function projectMemberUpdate(
         });
         if (!member || member.projectId !== projectId) {
             return { ok: false, error: 'member-not-found' };
+        }
+
+        if (role === 'viewer' && member.role !== 'viewer') {
+            await invalidateSessionFollowups(
+                tx,
+                { projectId, ownerAccountId: member.accountId },
+                'PERMISSION_REVOKED',
+            );
         }
 
         const updated = await tx.projectMember.update({

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiSessionClient, toolCallStartLaunchesBackgroundJob } from './apiSession';
+import { buildInitialPromptUserRecord } from '@/utils/initialPrompt';
 import { decodeBase64, decrypt, decryptBlob, encodeBase64, encrypt } from './encryption';
 import type { Metadata, Update } from './types';
 import { logger } from '@/ui/logger';
@@ -194,6 +195,68 @@ describe('ApiSessionClient v3 messages API migration', () => {
         vi.restoreAllMocks();
     });
 
+    // 2026-09-05 프로덕션 — 리뷰 워커가 turn 을 끝내고 정리까지 마쳤는데
+    // (sendSessionDeath → flush → close → client.disconnect → happyServer.stop)
+    // 프로세스가 2시간 11분 살아남았다. close() 가 socket.close() 를 부르면 그
+    // 'disconnect' 핸들러가 startSmartReconnect() 를 걸어, 1초 뒤 소켓이 다시
+    // 붙는다. 살아있는 소켓이 이벤트 루프를 붙잡아 run-once 세션이 끝나지 못했고,
+    // 그 프로세스가 worktree 를 점유해 그 저장소의 리뷰 큐가 통째로 멈췄다.
+    it('never reconnects after the session was deliberately closed', async () => {
+        vi.useFakeTimers();
+        const client = new ApiSessionClient('fake-token', session);
+        mockSocket.connect.mockClear();
+
+        await client.close();
+        mockSocket.connected = false;
+        // close() 가 유발하는 disconnect 는 재연결을 걸면 안 된다.
+        emitSocketEvent('disconnect', 'io client disconnect');
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(mockSocket.connect).not.toHaveBeenCalled();
+    });
+
+    it('does not let a connect error revive a closed session either', async () => {
+        vi.useFakeTimers();
+        const client = new ApiSessionClient('fake-token', session);
+        mockSocket.connect.mockClear();
+
+        await client.close();
+        mockSocket.connected = false;
+        emitSocketEvent('connect_error', new Error('boom'));
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(mockSocket.connect).not.toHaveBeenCalled();
+    });
+
+    // close() 는 interval 은 지우지만 이미 예약된 1초 타이머는 지우지 못한다.
+    // 프로덕션에서 소켓이 다시 붙은 것이 close() 1.1초 뒤였다.
+    it('does not let a reconnect scheduled before close still fire', async () => {
+        vi.useFakeTimers();
+        const client = new ApiSessionClient('fake-token', session);
+        mockSocket.connected = false;
+        emitSocketEvent('disconnect', 'transport close');
+        mockSocket.connect.mockClear();
+
+        await client.close();
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(mockSocket.connect).not.toHaveBeenCalled();
+    });
+
+    // 닫지 않은 세션은 끊기면 당연히 다시 붙어야 한다 — 이 수정으로 그것까지
+    // 막으면 네트워크 순단마다 세션을 잃는다.
+    it('still reconnects a live session that dropped', async () => {
+        vi.useFakeTimers();
+        new ApiSessionClient('fake-token', session);
+        mockSocket.connect.mockClear();
+        mockSocket.connected = false;
+
+        emitSocketEvent('disconnect', 'transport close');
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        expect(mockSocket.connect).toHaveBeenCalled();
+    });
+
     it('registers core socket handlers and connects', () => {
         new ApiSessionClient('fake-token', session);
 
@@ -201,6 +264,21 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(mockSocket.on).toHaveBeenCalledWith('disconnect', expect.any(Function));
         expect(mockSocket.on).toHaveBeenCalledWith('update', expect.any(Function));
         expect(mockSocket.connect).toHaveBeenCalledTimes(1);
+    });
+
+    it('sends stream deltas as volatile, session-key encrypted session-stream frames', () => {
+        const client = new ApiSessionClient('fake-token', session);
+
+        client.sendStreamDelta({ messageId: 'msg_1', index: 0, offset: 3, delta: 'Hel', final: false });
+
+        expect(mockSocket.emit).not.toHaveBeenCalledWith('session-stream', expect.anything());
+        expect(mockSocket.volatile.emit).toHaveBeenCalledTimes(1);
+        const [event, payload] = mockSocket.volatile.emit.mock.calls[0];
+        expect(event).toBe('session-stream');
+        expect(payload.sid).toBe('test-session-id');
+        expect(typeof payload.time).toBe('number');
+        expect(decrypt(session.encryptionKey, session.encryptionVariant, decodeBase64(payload.data)))
+            .toEqual({ messageId: 'msg_1', index: 0, offset: 3, delta: 'Hel', final: false });
     });
 
     it('reapplies a metadata patch to the newest server document after a version mismatch', async () => {
@@ -547,6 +625,123 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
     });
 
+    it('emits idempotent provider usage events for duplicate Claude message sources', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        mockAxiosPost.mockImplementation(async (_url: string, payload: { messages: Array<{ localId: string }> }) => ({
+            data: {
+                messages: payload.messages.map((message, index) => ({
+                    id: `msg-${index + 1}`,
+                    seq: index + 1,
+                    localId: message.localId,
+                    createdAt: 1,
+                    updatedAt: 1,
+                })),
+            },
+        }));
+        const assistantMessage = {
+            type: 'assistant',
+            timestamp: 1_788_000_000_000,
+            message: {
+                id: 'msg-native-1',
+                model: 'claude-sonnet-4-5',
+                content: [],
+                usage: {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    cache_creation_input_tokens: 40,
+                    cache_read_input_tokens: 300,
+                },
+            },
+        } as any;
+
+        client.sendClaudeSessionMessage({ ...assistantMessage, uuid: 'sdk-random-uuid' });
+        client.sendClaudeSessionMessage({ ...assistantMessage, uuid: 'transcript-uuid' });
+
+        const events = mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === 'provider-usage-report')
+            .map(([, event]: [string, unknown]) => event);
+        expect(events).toHaveLength(2);
+        expect(events[0]).toEqual(events[1]);
+        expect(events[0]).toMatchObject({
+            sourceEventId: 'test-session-id:anthropic:msg-native-1',
+            occurredAt: 1_788_000_000_000,
+            model: 'claude-sonnet-4-5',
+            tokens: {
+                input: 100,
+                output: 20,
+                cacheRead: 300,
+                cacheWrite: 40,
+                reasoning: 0,
+                total: 460,
+            },
+        });
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', expect.objectContaining({
+            providerTokens: 460,
+        }));
+
+        await waitForCheck(() => {
+            expect(mockAxiosPost).toHaveBeenCalled();
+        });
+        await client.close();
+    });
+
+    it('emits one turn usage event from the result when assistant messages reported zero tokens', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        mockAxiosPost.mockImplementation(async (_url: string, payload: { messages: Array<{ localId: string }> }) => ({
+            data: { messages: payload.messages.map((message, index) => ({ id: `msg-${index + 1}`, seq: index + 1, localId: message.localId, createdAt: 1, updatedAt: 1 })) },
+        }));
+        // Z.AI 호환 경로: assistant usage 0, result 에만 토큰이 있다.
+        client.sendClaudeSessionMessage({
+            type: 'assistant',
+            uuid: 'sdk-uuid-zai',
+            timestamp: 1_788_000_000_000,
+            message: { id: 'msg-zai-1', model: 'glm-5.3-flash', content: [], usage: { input_tokens: 0, output_tokens: 0 } },
+        } as any);
+        client.applyClaudeTurnResult({
+            uuid: 'result-uuid-1',
+            usage: { input_tokens: 962, output_tokens: 3, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+            modelUsage: { 'glm-4.7': { inputTokens: 962, outputTokens: 3 } },
+        });
+        // 같은 result 가 다시 와도(중복 전달) 보정은 한 번뿐이다.
+        client.applyClaudeTurnResult({
+            uuid: 'result-uuid-1',
+            usage: { input_tokens: 962, output_tokens: 3 },
+        });
+
+        const events = mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === 'provider-usage-report')
+            .map(([, event]: [string, unknown]) => event);
+        expect(events.map((event: any) => event.sourceEventId)).toEqual([
+            'test-session-id:anthropic:msg-zai-1',
+            'test-session-id:anthropic:turn:result-uuid-1',
+        ]);
+        expect(events[1]).toMatchObject({ model: 'glm-4.7', tokens: { input: 962, output: 3, total: 965 } });
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', expect.objectContaining({
+            providerTokens: 965,
+        }));
+        await client.close();
+    });
+
+    it('does not emit a turn usage event when assistant messages already carried tokens', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        mockAxiosPost.mockImplementation(async (_url: string, payload: { messages: Array<{ localId: string }> }) => ({
+            data: { messages: payload.messages.map((message, index) => ({ id: `msg-${index + 1}`, seq: index + 1, localId: message.localId, createdAt: 1, updatedAt: 1 })) },
+        }));
+        client.sendClaudeSessionMessage({
+            type: 'assistant',
+            uuid: 'sdk-uuid-anthropic',
+            timestamp: 1_788_000_000_000,
+            message: { id: 'msg-a-1', model: 'claude-sonnet-4-5', content: [], usage: { input_tokens: 100, output_tokens: 20 } },
+        } as any);
+        client.applyClaudeTurnResult({ uuid: 'result-uuid-2', usage: { input_tokens: 100, output_tokens: 20 } });
+
+        const events = mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === 'provider-usage-report')
+            .map(([, event]: [string, unknown]) => event);
+        expect(events).toHaveLength(1);
+        await client.close();
+    });
+
     it('preserves the Studio optimistic id on a Claude initial prompt', async () => {
         const client = new ApiSessionClient('fake-token', session);
         mockAxiosPost.mockResolvedValueOnce({
@@ -775,6 +970,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             mode: 'remote'
         }));
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalledWith('test-session-id', {
+            reportSeq: expect.any(Number),
             thinking: true,
             hasOpenToolCall: false,
             pendingUserInput: false,
@@ -782,6 +978,40 @@ describe('ApiSessionClient v3 messages API migration', () => {
             lastProcessedSeq: expect.any(Number),
             mode: 'remote'
         });
+    });
+
+    it('does not report a daemon repair continuation as user intervention', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.keepAlive(false, 'remote');
+        mockNotifyDaemonSessionRuntime.mockClear();
+
+        (client as any).routeIncomingMessage({
+            role: 'user',
+            content: { type: 'text', text: '<quality-gate-evidence />' },
+            meta: { sentFrom: 'daemon' },
+        });
+        client.keepAlive(true, 'remote');
+
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalled();
+        for (const [, runtime] of mockNotifyDaemonSessionRuntime.mock.calls as unknown as Array<[string, Record<string, unknown>]>) {
+            expect(runtime).not.toHaveProperty('lastUserInteractionAt');
+        }
+    });
+
+    it('reports a routed human message as user intervention before the turn starts', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.keepAlive(false, 'remote');
+        mockNotifyDaemonSessionRuntime.mockClear();
+
+        (client as any).routeIncomingMessage({
+            role: 'user',
+            content: { type: 'text', text: 'manual instruction' },
+            meta: { sentFrom: 'app' },
+        });
+
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', expect.objectContaining({
+            lastUserInteractionAt: expect.any(Number),
+        }));
     });
 
     // The daemon uses this as the resume skip-baseline: report the seq actually
@@ -837,6 +1067,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
 
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', {
+            reportSeq: expect.any(Number),
             thinking: true,
             hasOpenToolCall: true,
             pendingUserInput: false,
@@ -854,6 +1085,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
 
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', {
+            reportSeq: expect.any(Number),
             thinking: true,
             hasOpenToolCall: false,
             pendingUserInput: false,
@@ -869,6 +1101,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         // A fresh idle report (no prior busy state) must NOT stamp a turn-end.
         client.keepAlive(false, 'remote');
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', {
+            reportSeq: expect.any(Number),
             thinking: false,
             hasOpenToolCall: false,
             pendingUserInput: false,
@@ -883,11 +1116,13 @@ describe('ApiSessionClient v3 messages API migration', () => {
         // …then finishes it (busy → idle): this is a turn-end.
         client.keepAlive(false, 'remote');
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', {
+            reportSeq: expect.any(Number),
             thinking: false,
             hasOpenToolCall: false,
             pendingUserInput: false,
             lastUserInteractionAt: expect.any(Number),
             lastTurnEndAt: expect.any(Number),
+            assistantTurns: 1,
             lastProcessedSeq: expect.any(Number),
             mode: 'remote'
         });
@@ -953,6 +1188,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
 
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalledWith('test-session-id', {
+            reportSeq: expect.any(Number),
             thinking: false,
             hasOpenToolCall: false,
             pendingUserInput: true,
@@ -976,6 +1212,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         client.keepAlive(true, 'remote');
 
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalledWith('test-session-id', {
+            reportSeq: expect.any(Number),
             thinking: false,
             hasOpenToolCall: false,
             pendingUserInput: true,
@@ -2022,6 +2259,153 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(mockSocket.close).toHaveBeenCalledTimes(1);
         expect(mockAxiosGet).not.toHaveBeenCalled();
         expect(mockAxiosPost).not.toHaveBeenCalled();
+    });
+
+    describe('managed durable message acknowledgement', () => {
+        /**
+         * The confirmation rides the existing outbox: a caller registers a waiter,
+         * enqueues through the normal path, and awaits. Nothing here bypasses
+         * `pendingOutbox`, so ordering against fork backfill is untouched.
+         */
+        function ackRow(localId: string, over: Partial<{ id: string; seq: number }> = {}) {
+            return { id: 'msg-1', seq: 1, localId, createdAt: 1, updatedAt: 1, ...over };
+        }
+
+        it('confirms once the server returns a matching acknowledgement', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockResolvedValue({ data: { messages: [ackRow('local-initial')] } });
+
+            const wait = client.awaitMessageAck('local-initial', 1_000);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('hi', 'sess-1'), 'local-initial');
+
+            await expect(wait).resolves.toMatchObject({ ok: true, id: 'msg-1', seq: 1 });
+        });
+
+        it('accepts an acknowledgement for a row the server already had', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            // Server-side dedupe returns the pre-existing row; that is a real ack.
+            mockAxiosPost.mockResolvedValue({
+                data: { messages: [ackRow('local-initial', { id: 'existing-1', seq: 7 })] }
+            });
+            const wait = client.awaitMessageAck('local-initial', 1_000);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('hi', 'sess-1'), 'local-initial');
+            await expect(wait).resolves.toMatchObject({ ok: true, id: 'existing-1', seq: 7 });
+        });
+
+        it('does not confirm on a 2xx that omits our acknowledgement', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockResolvedValue({ data: { messages: [] } });
+
+            const wait = client.awaitMessageAck('local-initial', 30);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('hi', 'sess-1'), 'local-initial');
+
+            // Not proof the message was lost — durability is simply unknown.
+            await expect(wait).resolves.toMatchObject({ ok: false, reason: 'deadline' });
+        });
+
+        it.each([
+            ['a missing id', { id: '' }],
+            ['a non-integer seq', { seq: 1.5 }],
+            ['a zero seq', { seq: 0 }],
+            ['a negative seq', { seq: -3 }],
+            ['an unsafe seq', { seq: Number.MAX_SAFE_INTEGER + 2 }],
+        ])('does not confirm on %s', async (_name, over) => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockResolvedValue({ data: { messages: [ackRow('local-initial', over)] } });
+            const wait = client.awaitMessageAck('local-initial', 30);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('x', 'sess-1'), 'local-initial');
+            await expect(wait).resolves.toMatchObject({ ok: false });
+        });
+
+        it('ignores an acknowledgement for a different localId', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockResolvedValue({ data: { messages: [ackRow('someone-else')] } });
+            const wait = client.awaitMessageAck('local-initial', 30);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('x', 'sess-1'), 'local-initial');
+            await expect(wait).resolves.toMatchObject({ ok: false, reason: 'deadline' });
+        });
+
+        it('refuses contradictory duplicate acknowledgements for one localId', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockResolvedValue({
+                data: {
+                    messages: [
+                        ackRow('local-initial', { id: 'msg-a', seq: 1 }),
+                        ackRow('local-initial', { id: 'msg-b', seq: 2 }),
+                    ]
+                }
+            });
+            const wait = client.awaitMessageAck('local-initial', 30);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('x', 'sess-1'), 'local-initial');
+            await expect(wait).resolves.toMatchObject({ ok: false, reason: 'contradictory-ack' });
+        });
+
+        it('reports unknown when the post keeps failing', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockRejectedValue(new Error('network down'));
+            const wait = client.awaitMessageAck('local-initial', 30);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('x', 'sess-1'), 'local-initial');
+            await expect(wait).resolves.toMatchObject({ ok: false });
+        });
+
+        it('resolves every pending waiter as unknown when the session closes', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockImplementation(() => new Promise(() => {}));
+            const wait = client.awaitMessageAck('local-initial', 10_000);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('x', 'sess-1'), 'local-initial');
+            await client.close();
+            await expect(wait).resolves.toMatchObject({ ok: false, reason: 'closed' });
+        });
+
+        it('refuses a second waiter for the same localId', () => {
+            const client = new ApiSessionClient('fake-token', session);
+            const first = client.awaitMessageAck('local-initial', 50);
+            expect(() => client.awaitMessageAck('local-initial', 50)).toThrowError(/already/);
+            return expect(first).resolves.toMatchObject({ ok: false });
+        });
+
+        it('keeps ordering: a backfilled queue is posted before the confirmed message', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            const posted: string[][] = [];
+            mockAxiosPost.mockImplementation(async (_url: string, payload: { messages: Array<{ localId: string }> }) => {
+                posted.push(payload.messages.map((m) => m.localId));
+                return { data: { messages: payload.messages.map((m, i) => ackRow(m.localId, { id: `id-${i}`, seq: posted.length * 10 + i + 1 })) } };
+            });
+
+            // Stands in for FORK BACKFILL: a historical transcript enqueued before
+            // the initial prompt ever runs.
+            for (let i = 0; i < 3; i += 1) client.sendCodexMessage({ type: `backfill-${i}` });
+            const wait = client.awaitMessageAck('local-initial', 1_000);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('x', 'sess-1'), 'local-initial');
+
+            await expect(wait).resolves.toMatchObject({ ok: true });
+            const flat = posted.flat();
+            // The confirmed message must not have jumped the queue.
+            expect(flat[flat.length - 1]).toBe('local-initial');
+            expect(flat.length).toBe(4);
+        });
+
+            it('ignores an acknowledgement that names a localId this batch did not carry', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            // An earlier batch's response naming an unrelated localId must not
+            // confirm a message that has not even been posted yet.
+            mockAxiosPost.mockResolvedValueOnce({
+                data: { messages: [ackRow('local-initial', { id: 'stray', seq: 99 })] }
+            });
+            client.sendCodexMessage({ type: 'backfill' });
+            const wait = client.awaitMessageAck('local-initial', 40);
+            await expect(wait).resolves.toMatchObject({ ok: false, reason: 'deadline' });
+        });
+
+    it('leaves no pending waiter state behind', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockResolvedValue({ data: { messages: [ackRow('local-initial')] } });
+            const wait = client.awaitMessageAck('local-initial', 1_000);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('x', 'sess-1'), 'local-initial');
+            await wait;
+            // Re-registering proves the previous entry was cleaned up.
+            expect(() => client.awaitMessageAck('local-initial', 10)).not.toThrow();
+        });
     });
 });
 

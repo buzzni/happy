@@ -13,7 +13,7 @@
  * prompt steers the agent to fall back to Claude's built-in Bash for those.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 
 const FLUSH_INTERVAL_MS = 200;
 const FLUSH_LINE_BATCH = 32;
@@ -29,6 +29,8 @@ export interface RunBashStreamInput {
   command: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  detached?: boolean;
+  onSpawn?: (child: ChildProcess) => void;
   onProgress: (progress: BashStreamProgress) => void;
 }
 
@@ -91,13 +93,15 @@ function capLine(text: string): string {
 }
 
 export async function runBashStream(input: RunBashStreamInput): Promise<RunBashStreamResult> {
-  const { command, cwd, env, onProgress } = input;
+  const { command, cwd, env, detached = false, onSpawn, onProgress } = input;
   return new Promise<RunBashStreamResult>((resolve, reject) => {
     const child = spawn('bash', ['-c', command], {
       cwd,
       env: env ?? process.env,
+      detached,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    onSpawn?.(child);
 
     let stdoutAggregate = '';
     let stderrAggregate = '';

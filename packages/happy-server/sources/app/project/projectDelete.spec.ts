@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => {
         },
         automation: { findMany: vi.fn() },
         automationChange: { createMany: vi.fn(async () => ({ count: 1 })) },
+        sessionFollowup: { findMany: vi.fn() },
+        sessionFollowupChange: { createMany: vi.fn(async () => ({ count: 1 })) },
     };
     return { tx };
 });
@@ -26,6 +28,10 @@ describe('projectDelete automation lifecycle', () => {
             id: 'automation-1', revision: 4, generation: 7,
             machineAccountId: 'owner-1', machineId: 'machine-1',
         }]);
+        mocks.tx.sessionFollowup.findMany.mockResolvedValue([{
+            id: 'followup-1', revision: 6, generation: 9,
+            machineAccountId: 'owner-1', machineId: 'machine-1',
+        }]);
     });
 
     it('appends durable tombstones before cascading project automations', async () => {
@@ -39,6 +45,14 @@ describe('projectDelete automation lifecycle', () => {
             }],
         });
         expect(mocks.tx.automationChange.createMany.mock.invocationCallOrder[0])
+            .toBeLessThan(mocks.tx.project.delete.mock.invocationCallOrder[0]!);
+        expect(mocks.tx.sessionFollowupChange.createMany).toHaveBeenCalledWith({
+            data: [{
+                followupId: 'followup-1', revision: 7, generation: 10,
+                machineAccountId: 'owner-1', machineId: 'machine-1', kind: 'TOMBSTONE',
+            }],
+        });
+        expect(mocks.tx.sessionFollowupChange.createMany.mock.invocationCallOrder[0])
             .toBeLessThan(mocks.tx.project.delete.mock.invocationCallOrder[0]!);
     });
 });

@@ -40,6 +40,7 @@ export interface GithubAutomationWorktreeState {
   sessionId: string | null
   createdAt: number
   cleanupRetryAt?: number
+  cleanupAttempts?: number
 }
 
 export interface PendingAutomationReport {
@@ -302,6 +303,9 @@ function parse(raw: string): ServerAutomationRuntimeState {
         createdAt: integer(row.createdAt),
         ...(row.cleanupRetryAt === undefined ? {} : {
           cleanupRetryAt: integer(row.cleanupRetryAt),
+        }),
+        ...(row.cleanupAttempts === undefined ? {} : {
+          cleanupAttempts: integer(row.cleanupAttempts),
         }),
       }
     })

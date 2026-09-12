@@ -4,6 +4,9 @@ import { access, chmod, mkdir, realpath } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
+import { releaseDanglingSubmoduleWorktreePointers } from './submoduleWorktreePointer'
+import { describeUnsavedWorktreeChanges, hasUnsavedWorktreeChanges } from './worktreeDirtyState'
+
 const execFileAsync = promisify(execFile)
 const COMMAND_TIMEOUT_MS = 60_000
 const COMMAND_MAX_BUFFER = 2 * 1024 * 1024
@@ -78,6 +81,7 @@ export async function removeGithubTriggerWorktree(input: {
   repositoryRoot: string
   worktreePath: string
   runCommand?: (command: GithubTriggerWorktreeCommand) => Promise<CommandResult>
+  releaseSubmodulePointers?: (input: { repositoryRoot: string }) => Promise<{ released: string[] }>
   pathExists?: (path: string) => Promise<boolean>
 }): Promise<
   | { ok: true }
@@ -99,15 +103,31 @@ export async function removeGithubTriggerWorktree(input: {
     cwd: input.worktreePath,
   }, 'GitHub automation worktree status failed')
   if (!status.ok) return { ok: false, dirty: false, error: status.error }
-  if (status.stdout.trim().length > 0) {
-    return { ok: false, dirty: true, error: 'GitHub automation worktree is dirty' }
+  // 한 줄이라도 있으면 보존하던 것이 worktree 45개(23GB)를 쌓았다. 사유가 작업물이
+  // 아니라 에이전트 산출물(?? memory/)과 서브모듈 gitlink( M vendor/happy)였기 때문이다.
+  // 무해하다고 아는 것만 무시하고, 하나라도 진짜 변경이 섞이면 그대로 지킨다.
+  if (hasUnsavedWorktreeChanges(status.stdout)) {
+    // 무엇이 막고 있는지 말한다 — 원인을 알려고 사람이 git status 를 다시 치게
+    // 만들면 그만큼 worktree 가 더 오래 남는다.
+    const blocking = describeUnsavedWorktreeChanges(status.stdout).join(', ')
+    return { ok: false, dirty: true, error: `GitHub automation worktree is dirty (${blocking})` }
   }
   const removed = await commandOrError(runCommand, {
     executable: 'git',
-    args: ['worktree', 'remove', input.worktreePath],
+    // --force 없이는 서브모듈을 가진 worktree 를 git 이 거부한다
+    // ("working trees containing submodules cannot be moved or removed").
+    // 바로 위의 dirty 검사가 이미 "잃을 변경이 없다"를 보장하므로, 여기서의
+    // --force 는 서브모듈 제약을 넘기 위한 것이지 작업물을 버리는 것이 아니다.
+    args: ['worktree', 'remove', '--force', input.worktreePath],
     cwd: input.repositoryRoot,
   }, 'GitHub automation worktree removal failed')
-  return removed.ok ? { ok: true } : { ok: false, dirty: false, error: removed.error }
+  if (!removed.ok) return { ok: false, dirty: false, error: removed.error }
+  // 방금 지운 worktree 를 서브모듈 core.worktree 가 가리키고 있으면 저장소의 모든
+  // 체크아웃에서 git 이 죽는다. 청소의 일부다.
+  await (input.releaseSubmodulePointers ?? releaseDanglingSubmoduleWorktreePointers)({
+    repositoryRoot: input.repositoryRoot,
+  })
+  return { ok: true }
 }
 
 export async function prepareGithubTriggerWorktree(input: {
@@ -117,6 +137,7 @@ export async function prepareGithubTriggerWorktree(input: {
   pullRequest?: { number: number; expectedHeadSha?: string | null }
   githubEnvironment?: Record<string, string>
   runCommand?: (command: GithubTriggerWorktreeCommand) => Promise<CommandResult>
+  releaseSubmodulePointers?: (input: { repositoryRoot: string }) => Promise<{ released: string[] }>
   ensureDirectory?: (path: string) => Promise<void>
   pathExists?: (path: string) => Promise<boolean>
   resolveRealPath?: (path: string) => Promise<string>
@@ -138,24 +159,30 @@ export async function prepareGithubTriggerWorktree(input: {
     return { ok: false, error: 'GitHub automation directory is outside the repository', cleaned: true }
   }
 
-  let expectedHeadSha = input.pullRequest?.expectedHeadSha
-    ? cleanSha(input.pullRequest.expectedHeadSha)
-    : null
-  if (input.pullRequest?.expectedHeadSha && !expectedHeadSha) {
-    return { ok: false, error: 'GitHub trigger expected HEAD is invalid', cleaned: true }
-  }
-  if (input.pullRequest && !expectedHeadSha) {
-    const queried = await commandOrError(runCommand, {
-      executable: 'gh',
-      args: ['pr', 'view', String(input.pullRequest.number), '--json', 'headRefOid', '--jq', '.headRefOid'],
-      cwd: repositoryRoot,
-      ...(input.githubEnvironment ? { environmentVariables: input.githubEnvironment } : {}),
-    }, 'GitHub pull request HEAD lookup failed')
-    if (!queried.ok) return { ok: false, error: queried.error, cleaned: true }
-    expectedHeadSha = cleanSha(queried.stdout)
-    if (!expectedHeadSha) {
-      return { ok: false, error: 'GitHub pull request HEAD lookup returned invalid data', cleaned: true }
+  // PR 경로의 기대 HEAD 는 아래 가드를 지나면 반드시 있다. 그 사실을 타입이 들고
+  // 있게 한 객체로 묶는다 — 뒤에서 null 검사를 다시 하거나 캐스트하지 않도록.
+  let pullRequest: { number: number; expectedHeadSha: string } | null = null
+  if (input.pullRequest) {
+    let expectedHeadSha = input.pullRequest.expectedHeadSha
+      ? cleanSha(input.pullRequest.expectedHeadSha)
+      : null
+    if (input.pullRequest.expectedHeadSha && !expectedHeadSha) {
+      return { ok: false, error: 'GitHub trigger expected HEAD is invalid', cleaned: true }
     }
+    if (!expectedHeadSha) {
+      const queried = await commandOrError(runCommand, {
+        executable: 'gh',
+        args: ['pr', 'view', String(input.pullRequest.number), '--json', 'headRefOid', '--jq', '.headRefOid'],
+        cwd: repositoryRoot,
+        ...(input.githubEnvironment ? { environmentVariables: input.githubEnvironment } : {}),
+      }, 'GitHub pull request HEAD lookup failed')
+      if (!queried.ok) return { ok: false, error: queried.error, cleaned: true }
+      expectedHeadSha = cleanSha(queried.stdout)
+      if (!expectedHeadSha) {
+        return { ok: false, error: 'GitHub pull request HEAD lookup returned invalid data', cleaned: true }
+      }
+    }
+    pullRequest = { number: input.pullRequest.number, expectedHeadSha }
   }
 
   try {
@@ -177,6 +204,12 @@ export async function prepareGithubTriggerWorktree(input: {
   const plan = { repositoryRoot, worktreePath, directory }
   input.onPlanned(plan)
 
+  // 앞선 실행이 남긴 core.worktree 가 이미 지워진 worktree 를 가리키면 이 저장소의
+  // git 명령이 전부 죽는다 — worktree add 자체도 같은 오류로 실패하므로 먼저 푼다.
+  await (input.releaseSubmodulePointers ?? releaseDanglingSubmoduleWorktreePointers)({
+    repositoryRoot,
+  })
+
   const added = await commandOrError(runCommand, {
     executable: 'git', args: ['worktree', 'add', '--detach', worktreePath, 'HEAD'], cwd: repositoryRoot,
   }, 'GitHub automation worktree creation failed')
@@ -192,10 +225,11 @@ export async function prepareGithubTriggerWorktree(input: {
     return { ok: false as const, error, cleaned: cleanup.ok }
   }
 
-  if (input.pullRequest) {
+  if (pullRequest) {
+    const { expectedHeadSha } = pullRequest
     const checkedOut = await commandOrError(runCommand, {
       executable: 'gh',
-      args: ['pr', 'checkout', String(input.pullRequest.number), '--detach'],
+      args: ['pr', 'checkout', String(pullRequest.number), '--detach'],
       cwd: worktreePath,
       ...(input.githubEnvironment ? { environmentVariables: input.githubEnvironment } : {}),
     }, 'GitHub pull request checkout failed')
@@ -208,9 +242,21 @@ export async function prepareGithubTriggerWorktree(input: {
     const actualHeadSha = cleanSha(actual.stdout)
     if (!actualHeadSha) return failAfterCreation('GitHub worktree HEAD verification returned invalid data')
     if (actualHeadSha !== expectedHeadSha) {
-      return failAfterCreation(
-        `GitHub worktree HEAD mismatch: expected ${expectedHeadSha}, got ${actualHeadSha}`,
-      )
+      // 2026-09-10 aplus#3650 — PR 을 연 지 77초 만에 push 가 하나 더 왔다. 서버는
+      // head=A 로 task 를 만들었고 데몬이 16분 뒤 도착했을 땐 tip 이 B 였다. 이걸
+      // 영구로 접으면 push 는 리뷰를 다시 걸지 않으므로 그 PR 은 영영 리뷰되지 않는다.
+      //
+      // 서버가 색인한 A 는 보통 아직 있다(B 의 조상). tip 대신 A 를 체크아웃하면
+      // 서버가 준비한 diff 색인과 정확히 맞는 리뷰가 되고 코멘트도 그 SHA 를 밝힌다.
+      // A 가 없을 때(force-push)만 색인한 스냅샷 자체가 없는 것이므로 접는다.
+      const mismatch = `GitHub worktree HEAD mismatch: expected ${expectedHeadSha}, got ${actualHeadSha}`
+      // 핀의 성패는 checkout 의 종료 코드가 아니라 HEAD 를 다시 읽어 판정한다 —
+      // 한 가지 검사로 둘 다 잡는다.
+      await runCommand({ executable: 'git', args: ['checkout', '--detach', expectedHeadSha], cwd: worktreePath })
+      const verified = await commandOrError(runCommand, {
+        executable: 'git', args: ['rev-parse', 'HEAD'], cwd: worktreePath,
+      }, 'GitHub worktree HEAD verification failed')
+      if (!verified.ok || cleanSha(verified.stdout) !== expectedHeadSha) return failAfterCreation(mismatch)
     }
   }
 

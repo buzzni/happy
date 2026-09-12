@@ -6,7 +6,7 @@
 
 import { FileHandle } from 'node:fs/promises'
 import { readFile, writeFile, mkdir, open, unlink, rename, stat } from 'node:fs/promises'
-import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs'
+import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync, chmodSync } from 'node:fs'
 import { constants } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { configuration } from '@/configuration'
@@ -24,10 +24,18 @@ export const SandboxConfigSchema = z.object({
   denyReadPaths: z.array(z.string()).default(['~/.ssh', '~/.aws', '~/.gnupg']),
   extraWritePaths: z.array(z.string()).default(['/tmp']),
   denyWritePaths: z.array(z.string()).default(['.env']),
+  allowGitConfig: z.boolean().optional(),
   networkMode: z.enum(['blocked', 'allowed', 'custom']).default('allowed'),
   allowedDomains: z.array(z.string()).default([]),
   deniedDomains: z.array(z.string()).default([]),
   allowLocalBinding: z.boolean().default(true),
+  checkpointProtection: z.object({
+    secretPatterns: z.array(z.string()),
+    maxFileBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    maxFiles: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    maxTotalBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    readOnlyPassthroughPaths: z.array(z.string()).optional(),
+  }).strict().optional(),
 });
 
 export type SandboxConfig = z.infer<typeof SandboxConfigSchema>;
@@ -88,6 +96,12 @@ export interface PersistedTrackedSession {
   /** Absolute launch cwd; present for daemon spawns created by newer clients. */
   directory?: string;
   happySessionId?: string;
+  /**
+   * Session this child was spawned to resume, recorded at spawn time. Survives
+   * a daemon restart so the resume guard still sees a running child that has
+   * not reported its session webhook yet.
+   */
+  resumeTargetSessionId?: string;
   startedBy: string;
   tmuxSessionId?: string;
   startedAt: number;
@@ -112,6 +126,14 @@ export interface DaemonLocallyPersistedState {
   state?: 'running' | 'stopped' | 'crashed';
   stateReason?: string;
   trackedSessions?: PersistedTrackedSession[];
+  /**
+   * Loopback-only Bearer secret for the control server (ADR-061,
+   * specs/desktop-speed-breakthrough-local-direct). Optional so state files
+   * written before this field existed still parse; a daemon that started
+   * before the auth rollout has no secret and its control server falls back
+   * to whatever `controlServer.ts` does for that case.
+   */
+  controlSecret?: string;
 }
 
 export async function readSettings(): Promise<Settings> {
@@ -462,10 +484,16 @@ export async function readDaemonState(): Promise<DaemonLocallyPersistedState | n
 }
 
 /**
- * Write daemon state to local file (synchronously for atomic operation)
+ * Write daemon state to local file (synchronously for atomic operation).
+ *
+ * Since 2026-09 this file can carry `controlSecret` (ADR-061), so it must be
+ * unreadable by other local users. `mode` on `writeFileSync` only applies when
+ * the file is newly created — a file that pre-dates this field (or was
+ * otherwise created with a looser mode) needs an explicit chmod too.
  */
 export function writeDaemonState(state: DaemonLocallyPersistedState): void {
-  writeFileSync(configuration.daemonStateFile, JSON.stringify(state, null, 2), 'utf-8');
+  writeFileSync(configuration.daemonStateFile, JSON.stringify(state, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  chmodSync(configuration.daemonStateFile, 0o600);
 }
 
 /**
@@ -608,6 +636,19 @@ export async function acquireDaemonLock(
     }
   }
   return null;
+}
+
+/**
+ * Pid recorded in daemon.state.json.lock by whoever holds the daemon lock.
+ * null when the lock file is missing, unreadable, or holds no integer.
+ */
+export function readDaemonLockHolderPid(): number | null {
+  try {
+    const raw = readFileSync(configuration.daemonLockFile, 'utf-8').trim();
+    return /^\d+$/.test(raw) ? Number(raw) : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

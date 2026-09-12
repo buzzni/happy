@@ -16,7 +16,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { startOfflineReconnection, printOfflineWarning, connectionState, isNetworkError, NETWORK_ERROR_CODES } from './serverConnectionErrors';
+import { startOfflineReconnection, printOfflineWarning, connectionState, isNetworkError, isConnectivityError, connectionErrorCode, NETWORK_ERROR_CODES, AMBIGUOUS_DELIVERY_ERROR_CODES, ERROR_DESCRIPTIONS } from './serverConnectionErrors';
 
 // Mock axios - only isAxiosError needed for error type detection
 vi.mock('axios', () => ({
@@ -552,14 +552,10 @@ describe('printOfflineWarning', () => {
 // ============================================================================
 
 describe('isNetworkError', () => {
-    it('should return true for all NETWORK_ERROR_CODES', () => {
-        // All codes in NETWORK_ERROR_CODES should return true
-        expect(isNetworkError('ECONNREFUSED')).toBe(true);
-        expect(isNetworkError('ENOTFOUND')).toBe(true);
-        expect(isNetworkError('ETIMEDOUT')).toBe(true);
-        expect(isNetworkError('ECONNRESET')).toBe(true);
-        expect(isNetworkError('EHOSTUNREACH')).toBe(true);
-        expect(isNetworkError('ENETUNREACH')).toBe(true);
+    it('should return true for every code in NETWORK_ERROR_CODES', () => {
+        for (const code of NETWORK_ERROR_CODES) {
+            expect(isNetworkError(code)).toBe(true);
+        }
     });
 
     it('should return false for non-network error codes', () => {
@@ -577,13 +573,85 @@ describe('isNetworkError', () => {
         expect(isNetworkError('')).toBe(false);
     });
 
-    it('should have exactly 6 network error codes', () => {
-        expect(NETWORK_ERROR_CODES).toHaveLength(6);
-        expect(NETWORK_ERROR_CODES).toContain('ECONNREFUSED');
-        expect(NETWORK_ERROR_CODES).toContain('ENOTFOUND');
-        expect(NETWORK_ERROR_CODES).toContain('ETIMEDOUT');
-        expect(NETWORK_ERROR_CODES).toContain('ECONNRESET');
-        expect(NETWORK_ERROR_CODES).toContain('EHOSTUNREACH');
-        expect(NETWORK_ERROR_CODES).toContain('ENETUNREACH');
+    // The distinction that keeps the session path safe: a code only belongs in
+    // NETWORK_ERROR_CODES if it proves the request never reached the server.
+    // ECONNABORTED is an axios client-side timeout — the server may well have
+    // committed the write — so it must stay out of the narrow set.
+    it('should not classify ambiguous-delivery codes as definite network errors', () => {
+        for (const code of AMBIGUOUS_DELIVERY_ERROR_CODES) {
+            expect(isNetworkError(code)).toBe(false);
+        }
+    });
+
+    it('should keep the two code sets disjoint', () => {
+        const narrow = new Set<string>(NETWORK_ERROR_CODES);
+        for (const code of AMBIGUOUS_DELIVERY_ERROR_CODES) {
+            expect(narrow.has(code)).toBe(false);
+        }
+    });
+
+    it('should describe every code it classifies', () => {
+        for (const code of [...NETWORK_ERROR_CODES, ...AMBIGUOUS_DELIVERY_ERROR_CODES]) {
+            expect(ERROR_DESCRIPTIONS).toHaveProperty(code);
+        }
+    });
+});
+
+describe('isConnectivityError', () => {
+    it('should accept both definite and ambiguous transport failures', () => {
+        for (const code of [...NETWORK_ERROR_CODES, ...AMBIGUOUS_DELIVERY_ERROR_CODES]) {
+            expect(isConnectivityError(code)).toBe(true);
+        }
+    });
+
+    // Regression: the axios `timeout` expiry that killed the daemon in
+    // production. It reached the machine-registration catch unclassified, was
+    // rethrown, and the daemon's top-level handler turned it into exit(1).
+    it('should accept the axios request timeout code', () => {
+        expect(isConnectivityError('ECONNABORTED')).toBe(true);
+    });
+
+    // A deliberate abort must never be laundered into "the server is down".
+    it('should reject a deliberate cancellation', () => {
+        expect(isConnectivityError('ERR_CANCELED')).toBe(false);
+    });
+
+    it('should reject codes that indicate a local defect', () => {
+        expect(isConnectivityError('ERR_BAD_OPTION')).toBe(false);
+        expect(isConnectivityError('ERR_INVALID_URL')).toBe(false);
+        expect(isConnectivityError(undefined)).toBe(false);
+    });
+
+    // axios stamps ERR_BAD_REQUEST on every 4xx and ERR_BAD_RESPONSE on every
+    // 5xx (lib/core/settle.js). Those are HTTP outcomes from a server that
+    // answered, not transport failures — classifying them as connectivity
+    // would swallow real responses and leave the status branches unreachable.
+    it('should not classify HTTP response codes as connectivity failures', () => {
+        expect(isConnectivityError('ERR_BAD_REQUEST')).toBe(false);
+        expect(isConnectivityError('ERR_BAD_RESPONSE')).toBe(false);
+    });
+});
+
+describe('connectionErrorCode', () => {
+    it('should read a code off a plain error object', () => {
+        expect(connectionErrorCode({ code: 'ECONNRESET' })).toBe('ECONNRESET');
+    });
+
+    // Node wraps the real transport failure on `cause` (undici, fetch-style
+    // stacks). Reading only the top-level code misses it, and a missed code is
+    // a crash instead of a graceful degradation.
+    it('should fall back to the code on cause', () => {
+        expect(connectionErrorCode({ cause: { code: 'EAI_AGAIN' } })).toBe('EAI_AGAIN');
+    });
+
+    it('should prefer the top-level code over cause', () => {
+        expect(connectionErrorCode({ code: 'EPIPE', cause: { code: 'EAI_AGAIN' } })).toBe('EPIPE');
+    });
+
+    it('should return undefined when there is no code', () => {
+        expect(connectionErrorCode(new Error('boom'))).toBeUndefined();
+        expect(connectionErrorCode(null)).toBeUndefined();
+        expect(connectionErrorCode('string')).toBeUndefined();
+        expect(connectionErrorCode({ code: 42 })).toBeUndefined();
     });
 });

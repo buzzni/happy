@@ -1,5 +1,6 @@
 import { Context } from "@/context";
-import { db } from "@/storage/db";
+import { inTx } from "@/storage/inTx";
+import { invalidateSessionFollowups } from "@/app/automation/sessionFollowupInvalidationService";
 import { Result } from "./types";
 
 interface ProjectUpdateParams {
@@ -24,23 +25,39 @@ export async function projectUpdate(ctx: Context, projectId: string, params: Pro
     createdAt: Date;
     updatedAt: Date;
 }>> {
-    const project = await db.project.findUnique({ where: { id: projectId } });
-    if (!project) {
-        return { ok: false, error: 'project-not-found' };
-    }
-    if (project.accountId !== ctx.uid) {
-        return { ok: false, error: 'not-owner' };
-    }
-
-    const updated = await db.project.update({
-        where: { id: projectId },
-        data: {
-            ...(params.name !== undefined && { name: params.name }),
-            ...(params.description !== undefined && { description: params.description }),
-            ...(params.color !== undefined && { color: params.color }),
-            ...(params.config !== undefined && { config: params.config ?? undefined })
+    return inTx(async (tx) => {
+        const project = await tx.project.findUnique({ where: { id: projectId } });
+        if (!project) {
+            return { ok: false, error: 'project-not-found' };
         }
-    });
+        if (project.accountId !== ctx.uid) {
+            return { ok: false, error: 'not-owner' };
+        }
 
-    return { ok: true, value: updated };
+        const target = (config: unknown) => {
+            const row = config && typeof config === 'object' ? config as Record<string, unknown> : {};
+            return {
+                machineId: typeof row.machineId === 'string' ? row.machineId : null,
+                workspaceDir: typeof row.workspaceDir === 'string' ? row.workspaceDir : null,
+            };
+        };
+        if (params.config !== undefined) {
+            const before = target(project.config);
+            const after = target(params.config);
+            if (before.machineId !== after.machineId || before.workspaceDir !== after.workspaceDir) {
+                await invalidateSessionFollowups(tx, { projectId }, 'TARGET_MISMATCH');
+            }
+        }
+        const updated = await tx.project.update({
+            where: { id: projectId },
+            data: {
+                ...(params.name !== undefined && { name: params.name }),
+                ...(params.description !== undefined && { description: params.description }),
+                ...(params.color !== undefined && { color: params.color }),
+                ...(params.config !== undefined && { config: params.config ?? undefined })
+            }
+        });
+
+        return { ok: true, value: updated };
+    });
 }

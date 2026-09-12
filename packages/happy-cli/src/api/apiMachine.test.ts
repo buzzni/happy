@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
 import { ApiMachineClient } from './apiMachine';
 import type { Machine } from './types';
 
@@ -126,6 +127,22 @@ describe('ApiMachineClient socket reconnection', () => {
         vi.restoreAllMocks();
     });
 
+    it('refuses terminal-open-fwd with TERMINAL_DISABLED under the trial lockdown policy', async () => {
+        const previous = process.env.HAPPY_REMOTE_TERMINAL_POLICY;
+        process.env.HAPPY_REMOTE_TERMINAL_POLICY = 'disabled';
+        try {
+            const client = new ApiMachineClient('fake-token', makeMachine());
+            client.connect();
+            const ack = vi.fn();
+            emitSocketEvent('terminal-open-fwd', { sessionId: 'term-1', params: null }, ack);
+            await vi.waitFor(() => expect(ack).toHaveBeenCalled());
+            expect(ack).toHaveBeenCalledWith({ ok: false, error: 'TERMINAL_DISABLED' });
+        } finally {
+            if (previous === undefined) delete process.env.HAPPY_REMOTE_TERMINAL_POLICY;
+            else process.env.HAPPY_REMOTE_TERMINAL_POLICY = previous;
+        }
+    });
+
     it('registers the machine-scoped Claude session transfer RPC', () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         const manager = (client as any).rpcHandlerManager;
@@ -134,6 +151,47 @@ describe('ApiMachineClient socket reconnection', () => {
             'claude-session-transfer',
             expect.any(Function),
         );
+    });
+
+    it('registers the machine-scoped Codex thread transfer RPC', () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const manager = (client as any).rpcHandlerManager;
+
+        expect(manager.registerHandler).toHaveBeenCalledWith(
+            'codex-thread-transfer',
+            expect.any(Function),
+        );
+    });
+
+    it('registers the checkpoint daemon RPC surface', () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const manager = (client as any).rpcHandlerManager;
+        const checkpoint = {
+            status: vi.fn(),
+            list: vi.fn(),
+            preview: vi.fn(),
+            execute: vi.fn(),
+            cancel: vi.fn(),
+            retry: vi.fn(),
+            decision: vi.fn(),
+            restart: vi.fn(),
+        };
+
+        client.setRPCHandlers({
+            spawnSession: vi.fn(),
+            stopSession: vi.fn(() => ({ stopped: true as const })),
+            requestShutdown: vi.fn(),
+            portRegistry: {} as any,
+            aiCredentialRuntime: {} as any,
+            checkpoint,
+        });
+
+        for (const method of Object.keys(checkpoint) as Array<keyof typeof checkpoint>) {
+            expect(manager.registerHandler).toHaveBeenCalledWith(
+                `checkpoint:${method}`,
+                checkpoint[method],
+            );
+        }
     });
 
     it('validates and forwards additional directories through the spawn RPC result', async () => {
@@ -255,7 +313,69 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
-    it('registers the persistent automation public key on connect and persists the acknowledged version', async () => {
+    it('publishes autonomous quality-gate capability on the first connection', async () => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        const client = new ApiMachineClient('fake-token', machine);
+        client.setRPCHandlers({
+            spawnSession: vi.fn(),
+            stopSession: vi.fn(),
+            requestShutdown: vi.fn(),
+            portRegistry: {} as any,
+            aiCredentialRuntime: {} as any,
+            autonomousQualityGate: {
+                start: vi.fn(), status: vi.fn(), control: vi.fn(),
+            },
+        });
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.autonomousQualityGateSupport).toEqual({
+            apiVersion: 1,
+            rpcAvailable: true,
+        }));
+
+        client.shutdown();
+    });
+
+    it('clears stale autonomous quality-gate capability when RPC handlers are unavailable', async () => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        machine.metadata = {
+            ...machine.metadata,
+            autonomousQualityGateSupport: { apiVersion: 1, rpcAvailable: true },
+        };
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.autonomousQualityGateSupport).toEqual({
+            apiVersion: 1,
+            rpcAvailable: false,
+        }));
+
+        client.shutdown();
+    });
+
+    it.each([undefined, 5])('registers the persistent automation key with the verified protocol %s', async (protocolVersion) => {
         mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
             if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 4 } };
             if (event === 'machine-update-metadata') {
@@ -271,7 +391,7 @@ describe('ApiMachineClient socket reconnection', () => {
             publicKey: new Uint8Array(32).fill(7),
             secretKey: new Uint8Array(32).fill(8),
             registeredKeyVersion: 3,
-        }, persistVersion);
+        }, persistVersion, protocolVersion);
         client.connect();
 
         socketHandlers.connect![0]!();
@@ -280,7 +400,7 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-key-register', {
             expectedKeyVersion: 3,
             publicKey: Buffer.from(new Uint8Array(32).fill(7)).toString('base64'),
-            protocolVersion: 3,
+            protocolVersion: protocolVersion ?? AUTOMATION_PROTOCOL_VERSION,
         });
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('machine-update-metadata', expect.any(Object));
         client.shutdown();
@@ -370,5 +490,108 @@ describe('ApiMachineClient socket reconnection', () => {
             automationId: 'automation-1', generation: 2, scheduledFor: 10,
         });
         client.shutdown();
+    });
+});
+
+describe('stop-session verifyExit contract', () => {
+    const handlers = (overrides: Record<string, unknown> = {}) => ({
+        spawnSession: vi.fn(),
+        stopSession: vi.fn(() => ({ stopped: true as const })),
+        requestShutdown: vi.fn(),
+        portRegistry: {} as any,
+        aiCredentialRuntime: {} as any,
+        ...overrides,
+    });
+
+    const stopHandler = (client: ApiMachineClient) => (client as any).rpcHandlerManager
+        .registerHandler.mock.calls.find(([method]: [string]) => method === 'stop-session')?.[1];
+
+    it('answers a legacy request exactly as before, with no verification field', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const stopSessionWithExitVerification = vi.fn();
+        client.setRPCHandlers(handlers({ stopSessionWithExitVerification }) as any);
+
+        await expect(stopHandler(client)({ sessionId: 'session-1', source: 'project-delete' }))
+            .resolves.toEqual({ message: 'Session stopped', stopped: true });
+        expect(stopSessionWithExitVerification).not.toHaveBeenCalled();
+    });
+
+    it('returns the verified exit alongside the legacy fields for verifyExit: true', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const stopSession = vi.fn(() => ({ stopped: true as const }));
+        const stopSessionWithExitVerification = vi.fn(async () => ({
+            result: { stopped: true as const },
+            exitVerification: {
+                status: 'exited' as const,
+                scope: 'session-process-tree-snapshot' as const,
+                observedProcessCount: 3,
+            },
+        }));
+        client.setRPCHandlers(handlers({ stopSession, stopSessionWithExitVerification }) as any);
+
+        await expect(stopHandler(client)({
+            sessionId: 'session-1',
+            source: 'project-delete',
+            reason: 'deletion',
+            mode: 'force',
+            verifyExit: true,
+        })).resolves.toEqual({
+            message: 'Session stopped',
+            stopped: true,
+            exitVerification: {
+                status: 'exited',
+                scope: 'session-process-tree-snapshot',
+                observedProcessCount: 3,
+            },
+        });
+        expect(stopSessionWithExitVerification).toHaveBeenCalledWith('session-1', {
+            source: 'project-delete',
+            reason: 'deletion',
+            mode: 'force',
+        });
+        // The verifier owns the stop; the legacy path must not fire a second one.
+        expect(stopSession).not.toHaveBeenCalled();
+    });
+
+    it('returns an untracked acknowledgement, never an exited claim', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.setRPCHandlers(handlers({
+            stopSessionWithExitVerification: vi.fn(async () => ({
+                result: { stopped: false as const, reason: 'not-found' as const },
+                exitVerification: {
+                    status: 'not-tracked' as const,
+                    scope: 'session-process-tree-snapshot' as const,
+                    detail: 'session-not-tracked' as const,
+                },
+            })),
+        }) as any);
+
+        await expect(stopHandler(client)({ sessionId: 'session-1', verifyExit: true })).resolves.toEqual({
+            message: 'Session not tracked',
+            stopped: false,
+            reason: 'not-found',
+            exitVerification: {
+                status: 'not-tracked',
+                scope: 'session-process-tree-snapshot',
+                detail: 'session-not-tracked',
+            },
+        });
+    });
+
+    it('falls back to the legacy stop marked unavailable when the daemon cannot verify', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const stopSession = vi.fn(() => ({ stopped: true as const }));
+        client.setRPCHandlers(handlers({ stopSession }) as any);
+
+        await expect(stopHandler(client)({ sessionId: 'session-1', verifyExit: true })).resolves.toEqual({
+            message: 'Session stopped',
+            stopped: true,
+            exitVerification: {
+                status: 'unavailable',
+                scope: 'session-process-tree-snapshot',
+                detail: 'verification-unsupported',
+            },
+        });
+        expect(stopSession).toHaveBeenCalledTimes(1);
     });
 });

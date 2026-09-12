@@ -54,10 +54,13 @@ import type {
     ListMcpServerStatusResponse,
 } from './codexAppServerTypes';
 import type { SandboxConfig } from '@/persistence';
+import type { CheckpointSessionComposition, CheckpointTurnPreparation } from '@/checkpoint/checkpointSessionComposition';
+import { CheckpointWriterProcessTree } from '@/checkpoint/checkpointWriterProcessTree';
 import { CODEX_INACTIVITY_ABORT_REASON, type CodexInactivityAbortFields } from './codexAbortNotice';
 import { prepareCodexMultiAuthProxy, type PreparedCodexMultiAuthProxy } from './codexMultiAuthProxy';
 import { initializeSandbox, wrapForMcpTransport } from '@/sandbox/manager';
-import { isNetworkRequiredSandboxFailureFatal } from './sandboxInitFailurePolicy';
+import { MandatorySandboxError, resolveSandboxInitFailureAction, type SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
+import { describeSandboxCapabilityFailure, verifySandboxExecutionCapability } from '@/sandbox/executionCapability';
 import packageJson from '../../package.json';
 import { resolveCodexSandboxPolicy } from './executionPolicy';
 
@@ -210,6 +213,20 @@ function normalizeRawFileChangeList(changes: unknown): LegacyPatchChanges | unde
     return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
+function applyCheckpointTurnPreparation<
+    T extends { cwd?: string; writableRoots?: string[] },
+>(
+    opts: T | undefined,
+    preparation: CheckpointTurnPreparation | void,
+): T | undefined {
+    if (!preparation) return opts;
+    return {
+        ...(opts ?? {}),
+        cwd: preparation.providerPath,
+        writableRoots: [preparation.providerPath],
+    } as T;
+}
+
 export class CodexAppServerClient {
     private process: ChildProcess | null = null;
     private readline: ReadlineInterface | null = null;
@@ -218,10 +235,23 @@ export class CodexAppServerClient {
     private processEpoch = 0;
     private connected = false;
     private sandboxConfig?: SandboxConfig;
+    private readonly sandboxPolicyMode: SandboxPolicyMode;
+    private readonly beforeTurn?: () => Promise<CheckpointTurnPreparation | void>;
+    private readonly completeTurn?: CheckpointSessionComposition['completeTurn'];
+    private readonly protectedWriterTree: CheckpointWriterProcessTree | null;
     private sandboxCleanup: (() => Promise<void>) | null = null;
     private multiAuthProxy: PreparedCodexMultiAuthProxy | null = null;
+    private readonly managedProviderArgs: string[] | null;
     private multiAuthProxyCleanup: Promise<void> | null = null;
     public sandboxEnabled = false;
+    /**
+     * 샌드박스가 요청됐지만 초기화가 실패해 네이티브 정책으로 떨어진 상태.
+     * connect() 시점에는 permissionMode 를 아직 모르므로(턴마다 결정된다)
+     * 여기서는 사실만 기록하고, 네트워크를 실제로 잃는지는 호출자가 모드를
+     * 아는 턴 시점에 isSandboxFallbackNetworkLoss 로 판정한다.
+     */
+    public sandboxInitFailed = false;
+    public sandboxInitFailureReason: string | null = null;
 
     // Session state
     private _threadId: string | null = null;
@@ -280,8 +310,27 @@ export class CodexAppServerClient {
     private eventHandler: ((msg: EventMsg) => void) | null = null;
     private approvalHandler: ApprovalHandler | null = null;
 
-    constructor(sandboxConfig?: SandboxConfig) {
+    constructor(
+        sandboxConfig?: SandboxConfig,
+        beforeTurn?: () => Promise<CheckpointTurnPreparation | void>,
+        completeTurn?: CheckpointSessionComposition['completeTurn'],
+        /** 생략하면 개인 머신(owner-choice)으로 본다 — sandbox/sandboxPolicy.ts */
+        sandboxPolicyMode: SandboxPolicyMode = 'owner-choice',
+        /**
+         * The provider configuration a managed Cloud run must use.
+         *
+         * Present only for a managed run, and then it is the whole story: the
+         * account-rotation proxy is not consulted, and the provider is not
+         * chosen from whatever is in the user's config file.
+         */
+        managedProviderArgs?: string[] | null,
+    ) {
         this.sandboxConfig = sandboxConfig;
+        this.sandboxPolicyMode = sandboxPolicyMode;
+        this.beforeTurn = beforeTurn;
+        this.completeTurn = completeTurn;
+        this.managedProviderArgs = managedProviderArgs ?? null;
+        this.protectedWriterTree = completeTurn ? new CheckpointWriterProcessTree() : null;
     }
 
     get threadId(): string | null {
@@ -290,6 +339,10 @@ export class CodexAppServerClient {
 
     get turnId(): string | null {
         return this._turnId;
+    }
+
+    get isConnected(): boolean {
+        return this.connected;
     }
 
     supportsGoalActions(): boolean {
@@ -328,6 +381,7 @@ export class CodexAppServerClient {
             || method === 'turn/completed'
             || method === 'thread/status/changed'
             || method === 'thread/tokenUsage/updated'
+            || method === 'rawResponse/completed'
             || method.startsWith('item/');
 
         if (!isRawNotification) {
@@ -363,6 +417,45 @@ export class CodexAppServerClient {
         const fields = this.pendingInactivityAbort;
         this.pendingInactivityAbort = null;
         return fields;
+    }
+
+    /**
+     * completedTurnIds exists to dedupe the SAME completion reported twice in
+     * quick succession (codex/event and v2 turn/completed racing for one
+     * turn, or a stray fallback timer firing after the authoritative signal
+     * already did — see emitOrDeferRawTurnCompletion/scheduleRawTurnCompletionFallback).
+     * It must not survive genuine NEW work starting: a mid-turn agentMessage
+     * can legitimately carry phase 'final_answer' (e.g. a clarifying
+     * question), which fires our idle-fallback task_complete while Codex has
+     * not actually finished. Codex then resumes the SAME provider turn — no
+     * fresh turn/started precedes it, since it never asked for a new turn —
+     * and with pendingTurnCompletion already null at that point, this
+     * resumed activity is the only signal available that the earlier
+     * completion was premature. Reopen the consumer lifecycle and forget the
+     * stale marker so the eventual authoritative completion is delivered as a
+     * balanced start/end pair instead of silently dropped. Otherwise the
+     * session receives no durable terminal marker for the resumed work
+     * (desktop-stuck-responding-state: a live client stayed "응답중" 24+
+     * minutes past the real end of work because of exactly this).
+     * Scoped to item/started (a new work item beginning) and its legacy
+     * exec_command_begin equivalent — never to item/completed or its legacy
+     * counterparts, so the same-tick dual-protocol completion race above
+     * stays untouched.
+     */
+    private reopenConsumerLifecycleOnResumedWork(turnId: string | null): void {
+        if (this.pendingTurnCompletion) return;
+        if (this.completedTurnIds.size === 0) return;
+        logger.debug('[CodexAppServer] New work started with no pending turn; reopening consumer lifecycle', {
+            turnIds: [...this.completedTurnIds],
+        });
+        this.completedTurnIds.clear();
+        if (turnId) {
+            this._turnId = turnId;
+        }
+        this.eventHandler?.({
+            type: 'task_started',
+            ...(turnId ? { turn_id: turnId } : {}),
+        });
     }
 
     private emitRawTurnCompletion(
@@ -548,9 +641,32 @@ export class CodexAppServerClient {
             return true;
         }
 
+        if (method === 'rawResponse/completed') {
+            const responseId = typeof params?.responseId === 'string' ? params.responseId : '';
+            const usage = params?.usage;
+            if (!responseId || !usage || typeof usage !== 'object') {
+                logger.warn('[CodexAppServer] Ignoring malformed rawResponse/completed usage notification');
+                return true;
+            }
+            const threadId = typeof params?.threadId === 'string' ? params.threadId : undefined;
+            const turnId = typeof params?.turnId === 'string' ? params.turnId : undefined;
+            this.eventHandler?.({
+                type: 'codex_usage',
+                ...(threadId ? { thread_id: threadId } : {}),
+                ...(turnId ? { turn_id: turnId } : {}),
+                response_id: responseId,
+                usage,
+            });
+            return true;
+        }
+
         const item = params?.item;
         if (!item || typeof item !== 'object') {
             return method.startsWith('item/');
+        }
+
+        if (method === 'item/started') {
+            this.reopenConsumerLifecycleOnResumedWork(this.extractTurnId(params));
         }
 
         if (method === 'item/started' && item.type === 'commandExecution') {
@@ -673,9 +789,17 @@ export class CodexAppServerClient {
         for (const [key, value] of Object.entries(process.env)) {
             if (typeof value === 'string') env[key] = value;
         }
-        this.multiAuthProxy = await prepareCodexMultiAuthProxy(env);
-        if (this.multiAuthProxy) {
-            env = this.multiAuthProxy.env;
+        if (!this.managedProviderArgs) {
+            // Account rotation swaps in another account's proxy, its own
+            // client key and its own base URL. For a managed run that is a
+            // different payer and a provider outside the approval, so the
+            // rotation is not consulted at all rather than consulted and
+            // overridden — a consulted rotation has already started a proxy
+            // and picked an account.
+            this.multiAuthProxy = await prepareCodexMultiAuthProxy(env);
+            if (this.multiAuthProxy) {
+                env = this.multiAuthProxy.env;
+            }
         }
 
         let command = 'codex';
@@ -683,28 +807,48 @@ export class CodexAppServerClient {
             'app-server',
             '--listen',
             'stdio://',
-            ...(this.multiAuthProxy?.args ?? []),
+            ...(this.managedProviderArgs ?? this.multiAuthProxy?.args ?? []),
         ];
         this.sandboxEnabled = false;
+        this.sandboxInitFailed = false;
+        this.sandboxInitFailureReason = null;
 
         if (this.sandboxConfig?.enabled && process.platform !== 'win32') {
             try {
-                this.sandboxCleanup = await initializeSandbox(this.sandboxConfig, process.cwd());
+                this.sandboxCleanup = await initializeSandbox(
+                    this.sandboxConfig,
+                    process.cwd(),
+                    this.sandboxPolicyMode,
+                );
+                if (resolveSandboxInitFailureAction(this.sandboxPolicyMode) === 'abort') {
+                    const capability = await verifySandboxExecutionCapability();
+                    if (!capability.ok) {
+                        throw new MandatorySandboxError(
+                            'capability-unavailable',
+                            describeSandboxCapabilityFailure(capability),
+                        );
+                    }
+                }
                 const wrapped = await wrapForMcpTransport('codex', args);
                 command = wrapped.command;
                 args = wrapped.args;
                 this.sandboxEnabled = true;
                 logger.info(`[CodexAppServer] Sandbox enabled`);
             } catch (error) {
-                logger.warn('[CodexAppServer] Failed to initialize sandbox; continuing without.', error);
                 this.sandboxCleanup = null;
-                if (isNetworkRequiredSandboxFailureFatal(this.sandboxConfig)) {
+                this.sandboxInitFailed = true;
+                this.sandboxInitFailureReason = error instanceof Error ? error.message : String(error);
+                // 공유 머신에서는 턴을 기다리지 않는다 — 폴백한 네이티브 정책이
+                // workspace-write/danger-full-access 면 호스트 전체가 열린다.
+                if (resolveSandboxInitFailureAction(this.sandboxPolicyMode) === 'abort') {
+                    throw error instanceof MandatorySandboxError
+                        ? error
+                        : new MandatorySandboxError('init-failed', this.sandboxInitFailureReason);
+                }
+                if (this.beforeTurn) {
                     throw new Error(
-                        `Sandbox initialization failed but network access was required `
-                        + `(networkMode=${this.sandboxConfig?.networkMode}). Continuing without the `
-                        + `sandbox would silently drop to Codex's native read-only policy, which has no `
-                        + `network at all. Original error: `
-                        + `${error instanceof Error ? error.message : String(error)}`,
+                        'checkpoint protection sandbox initialization failed; refusing to start Codex. '
+                        + `Original error: ${error instanceof Error ? error.message : String(error)}`,
                     );
                 }
             }
@@ -737,12 +881,14 @@ export class CodexAppServerClient {
                 stdio: ['pipe', 'pipe', 'pipe'],
                 env,
                 windowsHide: true,
+                detached: Boolean(this.protectedWriterTree),
             });
         } catch (error) {
             await this.disconnectInternal();
             throw error;
         }
         this.process = proc;
+        this.protectedWriterTree?.track(proc);
 
         proc.on('error', (err) => {
             logger.debug('[CodexAppServer] Process error:', err);
@@ -803,6 +949,58 @@ export class CodexAppServerClient {
         }
     }
 
+    /**
+     * Ends the app server's input and waits for it to leave on its own.
+     *
+     * `disconnectInternal` is a shutdown, not a flush: it does `stdin.end()`
+     * and then `SIGTERM` in the same `try`, with `SIGKILL` two seconds later,
+     * and never awaits the exit. A checkpoint that archives provider state
+     * cannot use it — a signalled process did not flush, and an unawaited one
+     * was not observed leaving at all.
+     *
+     * This sends **no signal**. It closes stdin and reports what the kernel
+     * then said, within a budget. A timeout is reported as a timeout: the
+     * caller decides whether to fall back to `disconnect()`, and that fallback
+     * is a kill, so it is never quiescence.
+     */
+    async endInputAndAwaitExit(budgetMs: number): Promise<{
+        exited: boolean;
+        code: number | null;
+        signal: string | null;
+    }> {
+        const proc = this.process;
+        // Nothing to end. Reported as not-exited rather than as a clean exit:
+        // "there was no process" is not "the process finished writing".
+        if (!proc) return { exited: false, code: null, signal: null };
+        /*
+         * Already gone. `process` is not cleared by the exit handler (the
+         * reconnect path needs it to tell a stale exit from a live one), so a
+         * provider that left before the stop arrived would otherwise be waited
+         * for again — for the whole budget — and then reported as never seen
+         * leaving. What the kernel said is already on the object.
+         */
+        if (typeof proc.exitCode === 'number' || typeof proc.signalCode === 'string') {
+            return { exited: true, code: proc.exitCode ?? null, signal: proc.signalCode ?? null };
+        }
+
+        const left = new Promise<{ code: number | null; signal: string | null } | null>((resolve) => {
+            proc.once('exit', (code, signal) => resolve({ code, signal }));
+            const deadline = setTimeout(() => resolve(null), budgetMs);
+            deadline.unref?.();
+        });
+
+        try {
+            // The only thing sent. No `kill`, in this method or after it.
+            proc.stdin?.end();
+        } catch {
+            return { exited: false, code: null, signal: null };
+        }
+
+        const outcome = await left;
+        if (!outcome) return { exited: false, code: null, signal: null };
+        return { exited: true, code: outcome.code, signal: outcome.signal };
+    }
+
     private async disconnectInternal(opts?: {
         preserveThreadState?: boolean;
         preservePendingTurnCompletion?: boolean;
@@ -835,6 +1033,7 @@ export class CodexAppServerClient {
                 } catch { /* already dead */ }
             }, 2000);
             killTimer.unref();
+            proc?.once('exit', () => clearTimeout(killTimer));
         }
 
         this.process = null;
@@ -1023,6 +1222,7 @@ export class CodexAppServerClient {
 
     async forkThread(opts: {
         threadId: string;
+        path?: string;
         model?: string;
         cwd?: string;
         approvalPolicy?: ApprovalPolicy;
@@ -1037,6 +1237,7 @@ export class CodexAppServerClient {
             : defaults.developerInstructions ?? null;
         const params: ForkConversationParams = {
             threadId: opts.threadId,
+            ...(opts.path ? { path: opts.path } : {}),
             model: opts.model ?? defaults.model ?? null,
             modelProvider: null,
             cwd: opts.cwd ?? defaults.cwd ?? process.cwd(),
@@ -1066,6 +1267,17 @@ export class CodexAppServerClient {
         });
         logger.debug('[CodexAppServer] Thread forked:', opts.threadId, '->', this._threadId);
         return { threadId: result.thread.id, model: result.model, thread: result.thread };
+    }
+
+    async forkThreadFromPath(opts: {
+        path: string;
+        cwd: string;
+    }): Promise<{ threadId: string; model: string; thread: Thread }> {
+        return this.forkThread({
+            threadId: '',
+            path: opts.path,
+            cwd: opts.cwd,
+        });
     }
 
     async readThread(opts: {
@@ -1231,6 +1443,7 @@ export class CodexAppServerClient {
         if (!pending) return;
         const isTurnActivity = method === 'turn/started'
             || method === 'thread/tokenUsage/updated'
+            || method === 'rawResponse/completed'
             || method === 'turn/diff/updated'
             || method.startsWith('item/')
             || method === 'codex/event'
@@ -1380,10 +1593,14 @@ export class CodexAppServerClient {
         writableRoots?: string[];
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
+        beforeTurn?: () => Promise<CheckpointTurnPreparation | void>;
     }): Promise<void> {
         if (!this._threadId) {
             throw new Error('No active thread. Call startThread first.');
         }
+
+        const turnPreparation = await this.resolveBeforeTurn(opts)?.();
+        const effectiveOpts = applyCheckpointTurnPreparation(opts, turnPreparation);
 
         const extraInputItems = opts?.extraInputItems ?? [];
         const input: InputItem[] = [];
@@ -1397,16 +1614,16 @@ export class CodexAppServerClient {
             threadId: this._threadId,
             input,
         };
-        if (opts?.cwd) params.cwd = opts.cwd;
-        if (opts?.approvalPolicy) params.approvalPolicy = opts.approvalPolicy;
-        if (opts?.model) params.model = opts.model;
-        if (opts?.effort) params.effort = opts.effort;
+        if (effectiveOpts?.cwd) params.cwd = effectiveOpts.cwd;
+        if (effectiveOpts?.approvalPolicy) params.approvalPolicy = effectiveOpts.approvalPolicy;
+        if (effectiveOpts?.model) params.model = effectiveOpts.model;
+        if (effectiveOpts?.effort) params.effort = effectiveOpts.effort;
 
         // Map sandbox mode to the camelCase policy format the server expects.
-        if (opts?.sandbox) {
+        if (effectiveOpts?.sandbox) {
             params.sandboxPolicy = resolveCodexSandboxPolicy(
-                opts.sandbox,
-                opts.writableRoots ?? this.threadDefaults?.writableRoots ?? [],
+                effectiveOpts.sandbox,
+                effectiveOpts.writableRoots ?? this.threadDefaults?.writableRoots ?? [],
             );
         }
 
@@ -1448,9 +1665,14 @@ export class CodexAppServerClient {
         writableRoots?: string[];
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
+        beforeTurn?: () => Promise<CheckpointTurnPreparation | void>;
         /** Max time without any turn activity before interrupting the provider. */
         turnTimeoutMs?: number;
     }): Promise<{ aborted: boolean }> {
+        if (!this._threadId) {
+            throw new Error('No active thread. Call startThread first.');
+        }
+
         // Wait for any in-flight interruptTurn() to complete before starting a new
         // turn. Otherwise the stale turn/interrupt RPC can reach Codex after our
         // turn/start and abort the wrong turn.
@@ -1464,6 +1686,9 @@ export class CodexAppServerClient {
 
         // Clear any stale watchdog snapshot so it can only describe this turn's abort.
         this.pendingInactivityAbort = null;
+
+        const turnPreparation = await this.resolveBeforeTurn(opts)?.();
+        const effectiveOpts = applyCheckpointTurnPreparation(opts, turnPreparation);
 
         const timeoutMs = opts?.turnTimeoutMs ?? CodexAppServerClient.TURN_TIMEOUT_MS;
         const completion = new Promise<boolean>((resolve) => {
@@ -1480,14 +1705,38 @@ export class CodexAppServerClient {
         });
 
         try {
-            await this.sendTurn(prompt, opts);
+            await this.sendTurn(
+                prompt,
+                effectiveOpts ? { ...effectiveOpts, beforeTurn: undefined } : undefined,
+            );
         } catch (err) {
             this.resolvePendingTurn(true);
             throw err;
         }
 
         const aborted = await completion;
+        if (this.completeTurn) {
+            const applyResult = await this.completeTurn(async () => {
+                if (!this.protectedWriterTree) {
+                    throw new Error('checkpoint writer process tree is unavailable');
+                }
+                await this.protectedWriterTree.quiesce(() => this.disconnectInternal({
+                    preserveThreadState: true,
+                }));
+            });
+            if (applyResult.status !== 'completed') {
+                throw new Error('checkpoint turn apply did not complete');
+            }
+        }
         return { aborted };
+    }
+
+    private resolveBeforeTurn(
+        opts: { beforeTurn?: () => Promise<CheckpointTurnPreparation | void> } | undefined,
+    ) {
+        return opts && Object.prototype.hasOwnProperty.call(opts, 'beforeTurn')
+            ? opts.beforeTurn
+            : this.beforeTurn;
     }
 
     async steerTurn(prompt: string): Promise<void> {
@@ -1813,6 +2062,9 @@ export class CodexAppServerClient {
             const msg = params?.msg;
             if (msg) {
                 const turnId = msg.turn_id ?? msg.turnId ?? null;
+                if (msg.type === 'exec_command_begin') {
+                    this.reopenConsumerLifecycleOnResumedWork(turnId);
+                }
                 if (msg.type === 'task_started') {
                     if (!this.markPendingTurnStarted(turnId)) return;
                     if (turnId) {

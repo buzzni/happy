@@ -18,6 +18,13 @@ const PERMANENT_PATTERNS: RegExp[] = [
   /couldn't find remote ref/i,
   /Could not resolve to a PullRequest/i,
   /no pull requests found/i,
+  // 기대 HEAD 를 체크아웃할 수 없다. worktree 준비는 tip 이 움직였으면 먼저 기대
+  // SHA 를 직접 핀하므로(githubTriggerWorktree), 여기 도달했다는 것은 그 SHA 자체가
+  // 없다는 뜻이다(force-push). 서버가 색인한 스냅샷이 사라졌으니 다시 checkout 해도
+  // 같아지지 않는다. 단, PR 은 push 로 리뷰가 다시 걸리지 않으므로 이 이벤트를 접으면
+  // 그 PR 은 이 cycle 에서 리뷰되지 않는다 — 그래서 핀이 먼저다.
+  // 'HEAD lookup failed'(조회 자체 실패)는 네트워크·권한 문제일 수 있어 제외한다.
+  /worktree HEAD mismatch/i,
 ];
 
 export function isPermanentGithubTriggerFailure(error: string): boolean {

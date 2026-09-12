@@ -19,8 +19,10 @@ export class BrowserClientError extends Error {
 
 const DEFAULT_TIMEOUT_MS = 35_000
 
-export async function requestBrowser({ port, method, params, timeoutMs, profile, viewerKey }: {
+export async function requestBrowser({ port, controlSecret, method, params, timeoutMs, profile, viewerKey }: {
     port: number
+    /** ADR-061 — the control server rejects every request without this. */
+    controlSecret: string
     method: string
     params?: unknown
     timeoutMs?: number
@@ -31,7 +33,7 @@ export async function requestBrowser({ port, method, params, timeoutMs, profile,
     try {
         response = await fetch(`http://127.0.0.1:${port}/browser/request`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${controlSecret}` },
             body: JSON.stringify({ method, params: params ?? {}, timeoutMs, profile, viewerKey }),
             signal: AbortSignal.timeout(timeoutMs ? timeoutMs + 5_000 : DEFAULT_TIMEOUT_MS),
         })
@@ -57,11 +59,16 @@ export async function requestBrowser({ port, method, params, timeoutMs, profile,
  */
 export async function fetchBrowserStatus(
     port: number,
+    /** ADR-061 — the control server rejects every request without this. */
+    controlSecret: string,
     viewerKey?: string,
 ): Promise<{ connections: Array<{ profile: string; pairingId?: string; viewerKey?: string }>; hasRecentAuthFailure: boolean } | null> {
     try {
         const query = viewerKey ? `?viewerKey=${encodeURIComponent(viewerKey)}` : ''
-        const response = await fetch(`http://127.0.0.1:${port}/browser/status${query}`, { signal: AbortSignal.timeout(2_000) })
+        const response = await fetch(`http://127.0.0.1:${port}/browser/status${query}`, {
+            headers: { Authorization: `Bearer ${controlSecret}` },
+            signal: AbortSignal.timeout(2_000),
+        })
         if (!response.ok) return null
         const body = await response.json() as { connections?: Array<{ profile: string; pairingId?: string; viewerKey?: string }>; hasRecentAuthFailure?: boolean }
         return {
@@ -73,12 +80,15 @@ export async function fetchBrowserStatus(
     }
 }
 
-/** Resolve the running daemon's control port, or null when no daemon is up. */
-export async function readDaemonControlPort(): Promise<number | null> {
+/**
+ * Resolve the running daemon's control port + auth secret, or null when no
+ * daemon is up (or it predates ADR-061 and has no secret yet).
+ */
+export async function readDaemonControlPort(): Promise<{ port: number; controlSecret: string } | null> {
     const state = await readDaemonState()
-    if (!state?.httpPort) {
-        logger.debug('[BROWSER CLIENT] No daemon state file; browser tools unavailable')
+    if (!state?.httpPort || !state.controlSecret) {
+        logger.debug('[BROWSER CLIENT] No daemon state file (or no controlSecret yet); browser tools unavailable')
         return null
     }
-    return state.httpPort
+    return { port: state.httpPort, controlSecret: state.controlSecret }
 }

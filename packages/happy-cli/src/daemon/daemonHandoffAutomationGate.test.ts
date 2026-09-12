@@ -36,13 +36,18 @@ describe('decideAutomationAwareHandoff', () => {
     })).toBe('defer-handoff')
   })
 
-  it('shouldDeferHandoffWhileAnInteractiveOrTerminalSessionIsRunning', () => {
+  // 2026-09-03: 대화형 세션은 몇 시간씩 살아 있다. 그동안 runner 를 멈추면 서버 이관
+  // 반복 리뷰(session follow-up)가 세션이 모두 끝날 때까지 굶는다 — 교대는 미루되 automation 은 계속.
+  it.each([
+    { legacyAutomationRunning: false, serverAutomationRunning: false },
+    { legacyAutomationRunning: false, serverAutomationRunning: true },
+    { legacyAutomationRunning: true, serverAutomationRunning: false, serverAutomationLeaseRunning: true },
+  ])('shouldKeepRunningAutomationsWhileAnInteractiveOrTerminalSessionDefersHandoff (%o)', (running) => {
     expect(decideAutomationAwareHandoff({
       bundleReplaced: true,
-      legacyAutomationRunning: false,
-      serverAutomationRunning: false,
+      ...running,
       activeSessionCount: 1,
-    })).toBe('defer-handoff')
+    })).toBe('run-automations')
   })
 
   it('shouldHandoffAfterEveryAutomationTickBecomesIdle', () => {

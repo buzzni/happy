@@ -1,0 +1,48 @@
+#!/bin/sh
+# Makes this Machine's own generation cgroup root usable, and nothing else.
+#
+# The activation gate needs a delegated cgroup v2 root it can create a
+# generation under, kill as a unit, and observe empty. Nothing creates that
+# today: the production Dockerfile never made it and only the P4 verify scripts
+# ever did, so the gate would refuse a machine that was otherwise correct.
+#
+# ## What it deliberately does not do
+#
+# It does not move any process. A `cgroup.procs` sweep — "put everything in a
+# leaf so the root can have subtrees" — would relocate this container's init,
+# the daemon, and any generation already running, which is how a preparation
+# step takes down the very things it exists to support. cgroup v2's "no internal
+# processes" rule only applies once a subtree has controllers enabled, and this
+# enables none: it creates one directory and stops.
+#
+# It also never touches anything above its own root. The path comes from the
+# marker, and everything here stays under it.
+set -eu
+
+ROOT=${1:?usage: cgroup-prepare <cgroup-root>}
+
+case "$ROOT" in
+    /sys/fs/cgroup/*) ;;
+    *) echo "cgroup-prepare: refusing a root outside /sys/fs/cgroup" >&2; exit 1 ;;
+esac
+case "$ROOT" in
+    *..*) echo "cgroup-prepare: refusing a root with a parent reference" >&2; exit 1 ;;
+esac
+
+# v2 or nothing. On v1 the directory would be creatable and `cgroup.kill` would
+# simply not exist, which reads as a working delegation until the first stop has
+# to prove something.
+if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then
+    echo "cgroup-prepare: cgroup v2 is not mounted" >&2
+    exit 1
+fi
+
+mkdir -p "$ROOT"
+chown root:root "$ROOT"
+chmod 0755 "$ROOT"
+
+# Report what the gate will ask about, so a refusal later is not a surprise.
+for control in cgroup.kill cgroup.events cgroup.procs; do
+    [ -e "$ROOT/$control" ] || { echo "cgroup-prepare: $control missing under the root" >&2; exit 1; }
+done
+echo "cgroup-prepare: ready" >&2

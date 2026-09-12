@@ -48,3 +48,23 @@ describe('isPermanentGithubTriggerFailure', () => {
     expect(isPermanentGithubTriggerFailure('GitHub worktree creation failed: disk full')).toBe(false);
   });
 });
+
+// 2026-08-29 프로덕션 — cmt9b2cdh 가 매분 재시도했다(21회+).
+//   GitHub worktree HEAD mismatch: expected c289987ef..., got a5e93a0db...
+// expected 는 이벤트를 잡은 시점의 main SHA 이고, got 은 현재 main HEAD 다. 이
+// automation 이 head=main 인 승격 PR(main->product)을 리뷰하려 했는데, main 은
+// 움직이는 브랜치라 checkout 할 때마다 어긋난다. 재시도해도 영영 같아지지 않는다.
+describe('isPermanentGithubTriggerFailure — HEAD mismatch', () => {
+  it('treats a HEAD mismatch as permanent for this event', () => {
+    expect(isPermanentGithubTriggerFailure(
+      'GitHub worktree HEAD mismatch: expected c289987ef2836666857ee9dd12cc8bdb61a60a1f, got a5e93a0db41dc9cac18347779739160df5c708d9',
+    )).toBe(true);
+  });
+
+  it('still treats a HEAD lookup failure as transient', () => {
+    // 조회 자체가 실패한 것은 네트워크·권한 문제일 수 있다 — 재시도 대상이다.
+    expect(isPermanentGithubTriggerFailure(
+      'GitHub pull request HEAD lookup failed: HTTP 503',
+    )).toBe(false);
+  });
+});

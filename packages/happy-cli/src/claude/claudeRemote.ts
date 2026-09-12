@@ -1,4 +1,13 @@
 import { EnhancedMode } from "./loop";
+import { endManagedTurnInput } from '@/managed/managedGracefulStop';
+
+/**
+ * How long a managed provider gets to leave on its own once its turn's input
+ * has ended, before anything forces it.
+ */
+const MANAGED_TURN_END_INPUT_BUDGET_MS = 30_000;
+import { spawn } from 'node:child_process';
+import { bindManagedQueryOptions } from '@/launcher/managedClaudeOptions'
 import { query, type QueryOptions, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
 import type { MessageParam } from '@anthropic-ai/sdk/resources'
 import { mapToClaudeMode } from "./utils/permissionMode";
@@ -23,6 +32,9 @@ import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/con
 import { buildClaudeSystemPromptOptions } from './claudePrompt';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
 import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
+import type { CheckpointSessionComposition, CheckpointTurnPreparation } from '@/checkpoint/checkpointSessionComposition';
+import { CheckpointWriterProcessTree } from '@/checkpoint/checkpointWriterProcessTree';
+import { managedSettingSources } from '@/managed/managedStartup';
 
 export type ClaudeActiveInputSender = (text: string) => boolean;
 
@@ -33,6 +45,28 @@ export async function claudeRemote(opts: {
     path: string,
     mcpServers?: Record<string, any>,
     claudeEnvVars?: Record<string, string>,
+    managedSettingsLockdown?: boolean,
+    /** 관리 실행인가. 마지막 경계에서 계획을 덮을지 정한다. */
+    managedRun?: boolean,
+    /**
+     * Watches the process the SDK spawns, for a managed run's EOF proof.
+     *
+     * Separate from `completeTurn`'s writer tree: that one is about tool
+     * writes, this one is about whether the provider's own process finished on
+     * its own. Optional, and its absence means the runtime cannot prove that —
+     * which the quiescence gate turns into a refusal, never into a pass.
+     */
+    /** Called when this turn's input ended by exhaustion rather than a kill. */
+    onInputExhausted?: () => void,
+    /** How long the provider gets to leave on its own after its input ends. */
+    turnEndInputBudgetMs?: number,
+    providerExitObserver?: {
+        watch: (child: { once: (event: 'exit', handler: (code: number | null, signal: string | null) => void) => unknown }) => void,
+        /** Called at every kill or cancellation boundary, before any signal. */
+        markForced: () => void,
+        /** Code 0, no signal, nothing having asked it to die. */
+        exitedCleanly: () => boolean,
+    },
     claudeArgs?: string[],
     allowedTools: string[],
     signal?: AbortSignal,
@@ -48,9 +82,13 @@ export async function claudeRemote(opts: {
     /** MCP servers to add for orchestrator worker management */
     orchestratorMcpServers?: Record<string, unknown>,
     mcpConfig?: McpConfigSource,
+    sandbox?: QueryOptions['sandbox'],
+    permissionsDeny?: string[],
 
     // Dynamic parameters
     nextMessage: () => Promise<{ message: MessageParam['content'], mode: EnhancedMode } | null>,
+    beforeTurn?: () => Promise<CheckpointTurnPreparation | void>,
+    completeTurn?: CheckpointSessionComposition['completeTurn'],
     onReady: () => void,
     isAborted: (toolCallId: string) => boolean,
 
@@ -58,6 +96,8 @@ export async function claudeRemote(opts: {
     onSessionFound: (id: string) => void,
     onThinkingChange?: (thinking: boolean) => void,
     onMessage: (message: SDKMessage) => void,
+    /** Token-level partials. Never persisted — see streamDeltaRelay. */
+    onStreamEvent?: (message: Extract<SDKMessage, { type: 'stream_event' }>) => void,
     onPromptSuggestionChange?: (suggestion: string | null) => void,
     onCompletionEvent?: (message: string) => void,
     onSessionReset?: () => void,
@@ -70,7 +110,7 @@ export async function claudeRemote(opts: {
 
     // Check if session is valid
     let startFrom = opts.sessionId;
-    if (opts.sessionId && !claudeCheckSession(opts.sessionId, opts.path)) {
+    if (opts.sessionId && !opts.completeTurn && !claudeCheckSession(opts.sessionId, opts.path)) {
         startFrom = null;
     }
     
@@ -132,6 +172,10 @@ export async function claudeRemote(opts: {
         return;
     }
 
+    const initialTurn = await opts.beforeTurn?.();
+    const providerPath = initialTurn?.providerPath ?? opts.path;
+    const providerSandbox = initialTurn?.claudeSandbox ?? opts.sandbox;
+
     // Handle /compact command
     let isCompactCommand = false;
     if (specialCommand.type === 'compact') {
@@ -159,6 +203,13 @@ export async function claudeRemote(opts: {
     // same way Saycode's own orchestration does) don't leak into managed
     // sessions. No-op when unset, so existing sessions are unchanged.
     const skillGovernance = buildSkillGovernanceOptions(readSkillGovernanceConfigFromEnv(process.env));
+    // A managed run loads no filesystem settings at all. A settings file's
+    // `env` block is applied to the agent and takes precedence over the
+    // environment this startup produced, so a `~/.claude/settings.json` left on
+    // the runtime image could point the agent at a different gateway or a
+    // different key after the approval was made. The empty list is explicit —
+    // the SDK's default is to load every source Claude Code would.
+    const settingSources = managedSettingSources(opts.managedSettingsLockdown, skillGovernance.settingSources);
     const mergedMcpServers = {
         ...opts.mcpServers,
         ...(opts.orchestratorMode ? opts.orchestratorMcpServers : {}),
@@ -182,8 +233,9 @@ export async function claudeRemote(opts: {
     });
 
     const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
-    const sdkOptions: QueryOptions = {
-        cwd: opts.path,
+    const writerProcessTree = opts.completeTurn ? new CheckpointWriterProcessTree() : null;
+    const assembledOptions: QueryOptions = {
+        cwd: providerPath,
         additionalDirectories: readAdditionalDirectoriesEnvironment(process.env),
         resume: startFrom ?? undefined,
         mcpServers: hasMcpServers ? mergedMcpServers : undefined,
@@ -196,12 +248,42 @@ export async function claudeRemote(opts: {
         disallowedTools: initial.mode.disallowedTools,
         effort: initial.mode.effort,
         agents: workerAgents.agents,
-        settingSources: skillGovernance.settingSources,
+        settingSources,
         skills: skillGovernance.skills,
         canCallTool: (toolName: string, input: unknown, options: { signal: AbortSignal; toolUseID: string }) => opts.canCallTool(toolName, input, mode, options),
         abort: opts.signal,
         settingsPath: opts.hookSettingsPath,
         promptSuggestions: true,
+        sandbox: providerSandbox,
+        permissionsDeny: opts.permissionsDeny,
+        /*
+         * Installed for a managed run as well as for checkpoint protection.
+         *
+         * A managed run needs the SDK's **own** process exit, observed from
+         * the child object: the installed SDK's `waitForExit()` returns early
+         * once `process.killed` is set, and Node sets that when a signal is
+         * delivered rather than when the process dies. This seam is the only
+         * place that holds the object the kernel reports to.
+         */
+        spawnClaudeCodeProcess: (writerProcessTree || opts.providerExitObserver)
+            ? (spawnOptions) => {
+                const child = spawn(spawnOptions.command, spawnOptions.args, {
+                    cwd: spawnOptions.cwd,
+                    env: spawnOptions.env,
+                    signal: spawnOptions.signal,
+                    detached: true,
+                    stdio: ['pipe', 'pipe', 'inherit'],
+                });
+                writerProcessTree?.track(child);
+                // Per process, not per session: a restart is a different
+                // process, and the exit that matters is the one this run's
+                // provider actually had.
+                opts.providerExitObserver?.watch(child);
+                return child as NonNullable<QueryOptions['spawnClaudeCodeProcess']> extends (...args: any[]) => infer Result
+                    ? Result
+                    : never;
+            }
+            : undefined,
     }
 
     // Track thinking state
@@ -225,6 +307,20 @@ export async function claudeRemote(opts: {
             role: 'user',
             content: initial.message,
         },
+    });
+
+    /*
+     * 마지막 소비 경계.
+     *
+     * 관리 실행이면 여기서 계획이 옵션을 덮는다 — 내장 도구 없음, broker 하나,
+     * 승인 프롬프트로 경계를 대신하지 않음, 파일시스템 설정 안 읽음, run 이
+     * 확정한 모델·effort. 중간 계층에 뿌리면 그 계층이 mode 값으로 다시 덮거나
+     * 필드를 몰라서 조용히 사라진다(실제로 `tools`·`effort` 가 그랬다).
+     * 검증된 계획이 없으면 기존 동작으로 돌아가지 않고 여기서 멈춘다.
+     */
+    const sdkOptions = bindManagedQueryOptions(assembledOptions, {
+        managed: opts.managedRun === true,
+        env: process.env,
     });
 
     // Start the loop
@@ -276,6 +372,13 @@ export async function claudeRemote(opts: {
                 continue;
             }
 
+            // Partial assistant output is a preview, not transcript: keep it
+            // out of the persisted onMessage path.
+            if (message.type === 'stream_event') {
+                opts.onStreamEvent?.(message);
+                continue;
+            }
+
             // Handle messages. During /compact, Claude emits the generated
             // summary as a normal assistant text message before the result.
             // Mark it so downstream UI/protocol mapping can treat it as
@@ -309,7 +412,7 @@ export async function claudeRemote(opts: {
                 // Start a watcher for to detect the session id
                 if (systemInit.session_id) {
                     logger.debug(`[claudeRemote] Waiting for session file to be written to disk: ${systemInit.session_id}`);
-                    const projectDir = getProjectPath(opts.path);
+                    const projectDir = getProjectPath(providerPath);
                     const found = await awaitFileExist(join(projectDir, `${systemInit.session_id}.jsonl`), 30000);
                     logger.debug(`[claudeRemote] Session file found: ${systemInit.session_id} ${found}`);
                     if (!found) {
@@ -347,10 +450,96 @@ export async function claudeRemote(opts: {
                     isCompactCommand = false;
                 }
 
+                if (opts.completeTurn) {
+                    const applyResult = await opts.completeTurn(async () => {
+                        if (!writerProcessTree) {
+                            throw new Error('checkpoint writer process tree is unavailable');
+                        }
+                        /*
+                         * The input ends here, and the provider is given the
+                         * chance to leave on its own before anything kills it.
+                         *
+                         * This used to be `messages.end()` followed
+                         * immediately by `response.close()`. The end was real,
+                         * but the kill right behind it meant the exit could
+                         * never be a flush — and `response.close()` schedules
+                         * a kill whose signal a handled exit does not report,
+                         * so the exit alone reads exactly like a graceful end.
+                         */
+                        const observer = opts.providerExitObserver;
+                        if (!observer) {
+                            /*
+                             * Ordinary checkpoint protection, unchanged: end
+                             * the input and close. Waiting for an exit here
+                             * would be waiting on an observation nothing is
+                             * making, so it would always run out the budget.
+                             */
+                            messages.end();
+                            await writerProcessTree.quiesce(() => response.close());
+                            return;
+                        }
+                        const ended = await endManagedTurnInput({
+                            endInput: () => { messages.end(); },
+                            exitedCleanly: () => observer.exitedCleanly(),
+                            forceClose: async () => {
+                                // Recorded before the kill, not after.
+                                observer.markForced();
+                                await writerProcessTree.quiesce(() => response.close());
+                            },
+                            budgetMs: opts.turnEndInputBudgetMs ?? MANAGED_TURN_END_INPUT_BUDGET_MS,
+                        });
+                        if (ended.exhausted) opts.onInputExhausted?.();
+                        if (ended.forced) return;
+                        /*
+                         * The provider left on its own, but its descendants
+                         * may not have. The writers still have to be
+                         * quiesced — that is the checkpoint's gate, not the
+                         * provider's — and `quiesce` escalates to SIGTERM and
+                         * then SIGKILL.
+                         *
+                         * So ask first, read-only. A writer killed by that
+                         * escalation leaves the parent cgroup empty and the
+                         * SDK root's exit still reading as clean: a
+                         * manufactured proof one layer below the cgroup. The
+                         * cleanup still happens, because leaving writers
+                         * behind is worse — but the exit is no longer
+                         * evidence, and the gate refuses on it.
+                         */
+                        if (writerProcessTree.hasRemainingWriters()) observer.markForced();
+                        await writerProcessTree.quiesce(async () => undefined);
+                    });
+                    if (applyResult.status !== 'completed') {
+                        throw new Error('checkpoint turn apply did not complete');
+                    }
+                    opts.onReady();
+                    return opts.exitAfterFirstTurn
+                        ? 'turn-complete' as const
+                        : 'protected-turn-complete' as const;
+                }
+
                 // Send ready event
                 opts.onReady();
 
                 if (opts.exitAfterFirstTurn) {
+                    /*
+                     * Automation's one turn. This used to return with the
+                     * iterator still open, so the provider was torn down with
+                     * its input never ended — an exhaustion that never
+                     * happened, and a managed checkpoint that could never be
+                     * proven.
+                     */
+                    if (opts.providerExitObserver) {
+                        const ended = await endManagedTurnInput({
+                            endInput: () => { messages.end(); },
+                            exitedCleanly: () => opts.providerExitObserver?.exitedCleanly() ?? false,
+                            // Nothing to force here: `claudeRemote` returning
+                            // is what ends this run, and inventing a kill
+                            // would make a clean exit unprovable.
+                            forceClose: async () => undefined,
+                            budgetMs: opts.turnEndInputBudgetMs ?? MANAGED_TURN_END_INPUT_BUDGET_MS,
+                        });
+                        if (ended.exhausted) opts.onInputExhausted?.();
+                    }
                     return 'turn-complete' as const;
                 }
 
@@ -362,9 +551,27 @@ export async function claudeRemote(opts: {
                         messages.end();
                     } else {
                         await mcpConfigSynchronizer?.sync();
+                        try {
+                            const nextTurn = await opts.beforeTurn?.();
+                            if (nextTurn?.providerPath && nextTurn.providerPath !== providerPath) {
+                                throw new Error('checkpoint protection requires a provider restart for the next turn');
+                            }
+                        } catch (error) {
+                            messages.setError(error instanceof Error ? error : new Error(String(error)));
+                            return;
+                        }
                         acceptsPromptSuggestion = false;
                         opts.onPromptSuggestionChange?.(null);
                         opts.onMcpControllerReady?.(null);
+                        // 결과 직후 복구 뒤에도 다음 입력을 기다리는 동안 서버가
+                        // 죽을 수 있다. 턴 dispatch 직전(= SDK 가 idle 인 경계)에
+                        // 한 번 더 살린다. 턴이 끝난 뒤 복구하면 그 턴 전체를
+                        // 도구 없이 돈다. Codex 의 recoverBeforeTurn 과 같은 취지다.
+                        //
+                        // 이 await 는 acceptsPromptSuggestion 플립 뒤에 와야 한다.
+                        // 앞에 두면 직전 턴의 늦은 prompt_suggestion 이 새 턴으로
+                        // 새어든다.
+                        await mcpRecovery.recoverFailedServers();
                         mode = next.mode;
                         acceptsActiveInput = true;
                         opts.onActiveInputReady?.(sendActiveInput);

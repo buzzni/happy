@@ -135,6 +135,7 @@ export type ThreadGoalClearResponse = {
 
 export type ForkConversationParams = {
     threadId: ThreadId;
+    path?: string | null;
     model?: string | null;
     modelProvider?: string | null;
     cwd?: string | null;

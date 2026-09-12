@@ -48,6 +48,13 @@ function makeTx() {
             findFirst: vi.fn(),
             findUnique: vi.fn(),
         },
+        sessionFollowup: {
+            findMany: vi.fn(async (): Promise<any[]> => []),
+            updateMany: vi.fn(async () => ({ count: 1 })),
+            findUnique: vi.fn(),
+        },
+        sessionFollowupChange: { create: vi.fn(async () => ({})) },
+        sessionFollowupHistory: { create: vi.fn(async () => ({})) },
         session: { findFirst: vi.fn(async (): Promise<{ id: string } | null> => null) },
     };
 }
@@ -59,7 +66,7 @@ describe('automationExecutionService', () => {
             expectedKeyVersion: 3,
             publicKey: new Uint8Array(32),
             protocolVersion: 2,
-        })).resolves.toEqual({ ok: true, value: { keyVersion: 4 } });
+        })).resolves.toEqual({ ok: true, value: { keyVersion: 4, invalidatedProjectIds: [] } });
         expect(tx.machine.updateMany).toHaveBeenCalledWith({
             where: { id: 'machine-1', accountId: 'account-1', automationKeyVersion: 3 },
             data: {
@@ -68,6 +75,9 @@ describe('automationExecutionService', () => {
                 automationProtocolVersion: 2,
             },
         });
+        expect(tx.sessionFollowup.findMany).toHaveBeenCalledWith({ where: expect.objectContaining({
+            machineAccountId: 'account-1', machineId: 'machine-1',
+        }) });
     });
 
     it('updates the protocol capability without rotating an unchanged key', async () => {
@@ -83,10 +93,56 @@ describe('automationExecutionService', () => {
             expectedKeyVersion: 4,
             publicKey,
             protocolVersion: 2,
-        })).resolves.toEqual({ ok: true, value: { keyVersion: 4 } });
+        })).resolves.toEqual({ ok: true, value: { keyVersion: 4, invalidatedProjectIds: [] } });
         expect(tx.machine.updateMany).toHaveBeenCalledWith({
             where: { id: 'machine-1', accountId: 'account-1', automationKeyVersion: 4 },
             data: { automationProtocolVersion: 2 },
+        });
+    });
+
+    it('generation-fences active follow-ups when the same key reports an unsupported protocol', async () => {
+        const tx = makeTx();
+        const publicKey = new Uint8Array(32);
+        const followup = {
+            id: 'followup-1', projectId: 'project-1', machineAccountId: 'account-1', machineId: 'machine-1',
+            revision: 2, generation: 3, step: 4, status: 'WAITING', deletedAt: null,
+            currentRound: 1, lastObservedSeq: 10,
+        };
+        tx.machine.findFirst.mockResolvedValue({
+            automationPublicKey: publicKey,
+            automationKeyVersion: 4,
+            automationProtocolVersion: 4,
+        });
+        tx.sessionFollowup.findMany.mockResolvedValue([followup]);
+        tx.sessionFollowup.findUnique.mockResolvedValue({
+            ...followup,
+            revision: 3,
+            generation: 4,
+            step: 5,
+            status: 'FAILED',
+            terminalCode: 'TARGET_MISMATCH',
+        });
+
+        await expect(registerAutomationMachineKey(tx as never, 'account-1', 'machine-1', {
+            expectedKeyVersion: 4,
+            publicKey,
+            protocolVersion: 3,
+        })).resolves.toEqual({
+            ok: true,
+            value: { keyVersion: 4, invalidatedProjectIds: ['project-1'] },
+        });
+        expect(tx.sessionFollowup.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            where: expect.objectContaining({
+                id: 'followup-1', revision: 2, generation: 3, step: 4,
+            }),
+            data: expect.objectContaining({
+                status: 'FAILED',
+                terminalCode: 'TARGET_MISMATCH',
+                generation: { increment: 1 },
+            }),
+        }));
+        expect(tx.sessionFollowupHistory.create).toHaveBeenCalledWith({
+            data: expect.objectContaining({ terminalCode: 'TARGET_MISMATCH' }),
         });
     });
 
@@ -102,7 +158,7 @@ describe('automationExecutionService', () => {
             expectedKeyVersion: 3,
             publicKey,
             protocolVersion: 2,
-        })).resolves.toEqual({ ok: true, value: { keyVersion: 4 } });
+        })).resolves.toEqual({ ok: true, value: { keyVersion: 4, invalidatedProjectIds: [] } });
     });
 
     it('returns only machine-targeted deltas without the viewer envelope', async () => {

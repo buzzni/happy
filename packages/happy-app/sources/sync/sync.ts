@@ -11,7 +11,7 @@ import {
     formatAttachmentDiagnosticForLog,
     getAttachmentDiagnostic,
 } from './attachmentDiagnostics';
-import { ApiEphemeralUpdateSchema, ApiMessage, ApiUpdateContainerSchema } from './apiTypes';
+import { ApiEphemeralUpdateSchema, ApiMessage, ApiSessionStreamDeltaSchema, ApiUpdateContainerSchema } from './apiTypes';
 import type { ApiEphemeralActivityUpdate } from './apiTypes';
 import { Session, Machine } from './storageTypes';
 import { InvalidateSync } from '@/utils/sync';
@@ -120,6 +120,8 @@ class Sync {
     private sessionMessageQueue = new Map<string, NormalizedMessage[]>();
     private sessionQueueProcessing = new Set<string>();
     private sessionMessageLocks = new Map<string, AsyncLock>();
+    private streamPreviewQueues = new Map<string, Promise<void>>();
+    private streamPreviewGenerations = new Map<string, object>();
     private sessionDataKeys = new Map<string, Uint8Array>(); // Store session data encryption keys internally
     private machineDataKeys = new Map<string, Uint8Array>(); // Store machine data encryption keys internally
     private artifactDataKeys = new Map<string, Uint8Array>(); // Store artifact data encryption keys internally
@@ -2120,6 +2122,7 @@ class Sync {
         if (updateData.body.t === 'automation-updated') {
             emitAutomationUpdate(updateData.body);
         } else if (updateData.body.t === 'new-message') {
+            this.clearSessionStreamPreview(updateData.body.sid);
 
             // Get encryption — may not be ready if sessions are still syncing
             let encryption = this.encryption.getSessionEncryption(updateData.body.sid);
@@ -2219,6 +2222,8 @@ class Sync {
             log.log('🗑️ Delete session update received');
             const sessionId = updateData.body.sid;
 
+            this.clearSessionStreamPreview(sessionId);
+
             // Remove session from storage
             storage.getState().deleteSession(sessionId);
 
@@ -2235,6 +2240,8 @@ class Sync {
             this.sessionMessageLocks.delete(sessionId);
             this.sessionMessageQueue.delete(sessionId);
             this.sessionQueueProcessing.delete(sessionId);
+            this.streamPreviewQueues.delete(sessionId);
+            this.streamPreviewGenerations.delete(sessionId);
 
             log.log(`🗑️ Session ${sessionId} deleted from local storage`);
         } else if (updateData.body.t === 'update-session') {
@@ -2656,6 +2663,38 @@ class Sync {
         }
     }
 
+    private handleStreamPreview = (update: { id: string; time: number; data: string }) => {
+        let generation = this.streamPreviewGenerations.get(update.id);
+        if (!generation) {
+            generation = {};
+            this.streamPreviewGenerations.set(update.id, generation);
+        }
+        const previous = this.streamPreviewQueues.get(update.id) ?? Promise.resolve();
+        const task = previous.then(async () => {
+            const encryption = this.encryption.getSessionEncryption(update.id);
+            if (!encryption) return;
+            const decrypted = await encryption.decryptRaw(update.data);
+            if (this.streamPreviewGenerations.get(update.id) !== generation) return;
+            if (this.encryption.getSessionEncryption(update.id) !== encryption) return;
+            const frame = ApiSessionStreamDeltaSchema.safeParse(decrypted);
+            if (!frame.success) return;
+            storage.getState().applySessionStreamFrame(update.id, update.time, frame.data);
+        }).catch((error) => {
+            log.log(`Failed to process session stream preview for ${update.id}: ${String(error)}`);
+        });
+        this.streamPreviewQueues.set(update.id, task);
+        void task.then(() => {
+            if (this.streamPreviewQueues.get(update.id) === task) {
+                this.streamPreviewQueues.delete(update.id);
+            }
+        });
+    };
+
+    private clearSessionStreamPreview = (sessionId: string) => {
+        this.streamPreviewGenerations.set(sessionId, {});
+        storage.getState().clearSessionStreamPreview(sessionId);
+    };
+
     private handleEphemeralUpdate = (update: unknown) => {
         const validatedUpdate = ApiEphemeralUpdateSchema.safeParse(update);
         if (!validatedUpdate.success) {
@@ -2666,6 +2705,11 @@ class Sync {
             // console.log('Ephemeral update received:', update);
         }
         const updateData = validatedUpdate.data;
+
+        if (updateData.type === 'stream') {
+            this.handleStreamPreview(updateData);
+            return;
+        }
 
         // Process activity updates through smart debounce accumulator
         if (updateData.type === 'activity') {

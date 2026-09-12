@@ -26,6 +26,8 @@ type ResumeThread = (opts: {
 type CodexMcpConfigSynchronizerOptions = {
     baseServers: McpServersMap;
     initialAplusServers: AplusMcpServersMap;
+    /** 대화를 열 때 있던 조직 등록 MCP. 이 세션 동안 제거하지 않는다 — Claude 경로와 같은 계약. */
+    floorServerNames?: string[];
     fetchAplusServers: () => Promise<AplusMcpServersFetchResult>;
     bridgeAplusServers: (servers: AplusMcpServersMap) => McpServersMap;
     credentialRefreshMs?: number;
@@ -46,6 +48,7 @@ function topologyKey(servers: AplusMcpServersMap): string {
 
 export class CodexMcpConfigSynchronizer {
     private currentAplusServers: AplusMcpServersMap;
+    private readonly floorServers: AplusMcpServersMap;
     private currentMcpServers: McpServersMap;
     private lastAppliedAt: number;
     private readonly credentialRefreshMs: number;
@@ -53,6 +56,11 @@ export class CodexMcpConfigSynchronizer {
 
     constructor(private readonly options: CodexMcpConfigSynchronizerOptions) {
         this.currentAplusServers = options.initialAplusServers;
+        this.floorServers = Object.fromEntries(
+            (options.floorServerNames ?? [])
+                .filter((name) => options.initialAplusServers[name])
+                .map((name) => [name, options.initialAplusServers[name]]),
+        );
         this.currentMcpServers = this.buildMcpServers(options.initialAplusServers);
         this.credentialRefreshMs = options.credentialRefreshMs ?? DEFAULT_CREDENTIAL_REFRESH_MS;
         this.now = options.now ?? Date.now;
@@ -107,13 +115,14 @@ export class CodexMcpConfigSynchronizer {
             return { threadId: input.threadId ?? null, mcpServers: this.currentMcpServers };
         }
 
-        const nextMcpServers = this.buildMcpServers(result.servers);
+        const aplusServers = this.withFloor(result.servers);
+        const nextMcpServers = this.buildMcpServers(aplusServers);
         if (!input.threadId || !input.resumeThread) {
-            this.apply(result.servers, nextMcpServers);
+            this.apply(aplusServers, nextMcpServers);
             return { threadId: input.threadId ?? null, mcpServers: this.currentMcpServers };
         }
 
-        const topologyChanged = topologyKey(this.currentAplusServers) !== topologyKey(result.servers);
+        const topologyChanged = topologyKey(this.currentAplusServers) !== topologyKey(aplusServers);
         const credentialsStale = this.now() - this.lastAppliedAt >= this.credentialRefreshMs;
         if (!topologyChanged && !credentialsStale) {
             return { threadId: input.threadId, mcpServers: this.currentMcpServers };
@@ -124,12 +133,21 @@ export class CodexMcpConfigSynchronizer {
                 threadId: input.threadId,
                 mcpServers: nextMcpServers,
             });
-            this.apply(result.servers, nextMcpServers);
+            this.apply(aplusServers, nextMcpServers);
             return { threadId: resumed.threadId, mcpServers: this.currentMcpServers };
         } catch (error) {
             logger.debug(`[codex] MCP config apply failed: ${sanitizeMcpError(error)}`);
             return { threadId: input.threadId, mcpServers: this.currentMcpServers };
         }
+    }
+
+    /** 바닥선은 조기 반환이 아니라 합집합으로 지킨다 — 다른 서버의 갱신은 계속 흘러야 한다. */
+    private withFloor(servers: AplusMcpServersMap): AplusMcpServersMap {
+        const out = { ...servers };
+        for (const [name, entry] of Object.entries(this.floorServers)) {
+            if (!out[name]) out[name] = entry;
+        }
+        return out;
     }
 
     private buildMcpServers(aplusServers: AplusMcpServersMap): McpServersMap {

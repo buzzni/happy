@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   AutomationApiError,
   automationPayloadSchema,
+  githubTriggerSchema,
   automationRunSchema,
   automationTargetSchema,
   createAutomationApiClient,
@@ -349,5 +350,32 @@ describe('createAutomationApiClient', () => {
       'https://happy.test/v1/projects/project-1/automation-adoptions/automation-1/activate',
       expect.objectContaining({ method: 'POST', body: JSON.stringify({ expectedRevision: 1 }) }),
     );
+  });
+});
+
+// 2026-08-31 — hsmoa 리뷰 프롬프트의 "high 이면 @eunchong 을 멘션하라" 는 한 번도
+// 동작하지 않았다. PR 코멘트는 서버가 조립하고 워커 텍스트가 들어가지 않기 때문이다.
+// 담당자는 설정으로 전달돼야 하고, 그 통로가 이 스키마다.
+describe('githubTriggerSchema escalateTo', () => {
+  const base = {
+    event: 'opened' as const,
+    filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+    action: 'agent-task-review' as const,
+    githubCredentialId: 'credential-1',
+  };
+
+  it('carries escalation handles', () => {
+    expect(githubTriggerSchema.parse({ ...base, escalateTo: ['eunchong'] }).escalateTo)
+      .toEqual(['eunchong']);
+  });
+
+  it('stays valid without the field so existing automations keep working', () => {
+    expect(githubTriggerSchema.safeParse(base).success).toBe(true);
+  });
+
+  it('rejects an unbounded list', () => {
+    expect(githubTriggerSchema.safeParse({
+      ...base, escalateTo: Array.from({ length: 11 }, (_, index) => `user-${index}`),
+    }).success).toBe(false);
   });
 });

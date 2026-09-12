@@ -2,7 +2,8 @@ import * as z from 'zod';
 
 export const AUTOMATION_RUN_NOW_PROTOCOL_VERSION = 2;
 export const AUTOMATION_ISSUE_TRIGGER_PROTOCOL_VERSION = 3;
-export const AUTOMATION_PROTOCOL_VERSION = AUTOMATION_ISSUE_TRIGGER_PROTOCOL_VERSION;
+export const AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION = 4;
+export const AUTOMATION_PROTOCOL_VERSION = AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION;
 
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const PAYLOAD_MAX_BYTES = 128 * 1024;
@@ -66,6 +67,10 @@ export const githubTriggerSchema = z.object({
   }),
   action: z.enum(['notify', 'start-session', 'agent-task-review']),
   githubCredentialId: z.string().trim().min(1).max(200).nullable(),
+  // high 발견이 있을 때 AgentTask 리뷰 코멘트에서 소환할 GitHub 핸들. 코멘트를
+  // 조립하는 건 서버라 워커 프롬프트로는 전달할 수 없다 — 설정이 유일한 통로다.
+  // 값의 형식(핸들 모양)은 코멘트를 만드는 쪽에서 다시 검증한다.
+  escalateTo: z.array(z.string().trim().min(1).max(64)).max(10).optional(),
 }).superRefine((trigger, context) => {
   if (trigger.action === 'agent-task-review' && trigger.githubCredentialId === null) {
     context.addIssue({
@@ -134,6 +139,7 @@ export const automationTargetSchema = z.object({
   viewerPublicKey: publicKeySchema.nullable(),
   viewerKeyVersion: z.number().int().min(0),
   automationProtocolVersion: positiveInteger.default(1),
+  sessionFollowupSupported: z.boolean().default(false),
 });
 export type AutomationTarget = z.infer<typeof automationTargetSchema>;
 

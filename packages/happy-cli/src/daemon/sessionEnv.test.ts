@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import {
+    buildManagedSessionSpawnEnvironment,
     buildResumedSessionSpawnEnvironment,
     buildSpawnRequestEnvironment,
     buildSessionSpawnEnvironment,
     captureSaycodeAgentEnvironment,
+    stripManagedCredentialConflicts,
     scrubSessionLineageEnv,
     SESSION_LINEAGE_ENV_PREFIXES,
 } from './sessionEnv'
+import { expandEnvironmentVariables } from '../utils/expandEnvVars'
 
 describe('scrubSessionLineageEnv', () => {
     it('removes reconnect and fork lineage variables while keeping everything else', () => {
@@ -38,6 +41,7 @@ describe('scrubSessionLineageEnv', () => {
             APLUS_SESSION_ID: 'parent-session',
             SAYCODE_AGENT_ENV: '1',
             SAYCODE_AGENT_ROOT: '/parent',
+            HAPPY_CHECKPOINT_SPAWN_CONTEXT: '{"schemaVersion":1,"projectId":"stale","worktreeId":null,"checkpointRoot":"/stale"}',
         }
         const scrubbed = scrubSessionLineageEnv(env)
         expect(scrubbed).toEqual({
@@ -64,10 +68,70 @@ describe('scrubSessionLineageEnv', () => {
         // daemon still scrubs stale lineage before process launch.
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('APLUS_SESSION_')
         expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('SAYCODE_AGENT_')
+        expect(SESSION_LINEAGE_ENV_PREFIXES).toContain('HAPPY_CHECKPOINT_')
     })
 })
 
 describe('buildSessionSpawnEnvironment', () => {
+    it('lets daemon-managed credentials override inherited and caller-supplied auth fields', () => {
+        expect(buildManagedSessionSpawnEnvironment({
+            PATH: '/usr/bin',
+            ANTHROPIC_API_KEY: 'inherited-api-key',
+            CLAUDE_CODE_OAUTH_TOKEN: 'inherited-oauth-token',
+            ANTHROPIC_MODEL: 'claude-opus-5',
+            ANTHROPIC_SMALL_FAST_MODEL: 'claude-haiku-4-5',
+            CLAUDE_CODE_USE_BEDROCK: '1',
+            ANTHROPIC_CUSTOM_HEADERS: 'x-api-key: inherited-key',
+        }, {
+            SAFE: 'value',
+            ANTHROPIC_AUTH_TOKEN: 'caller-token',
+            ANTHROPIC_BASE_URL: 'https://caller.invalid',
+            CLAUDE_CODE_USE_VERTEX: '1',
+            CLAUDE_CODE_USE_FOUNDRY: '1',
+            ANTHROPIC_CUSTOM_HEADERS: 'x-api-key: caller-key',
+        }, {
+            ANTHROPIC_AUTH_TOKEN: 'managed-token',
+            ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+        })).toEqual({
+            PATH: '/usr/bin',
+            SAFE: 'value',
+            ANTHROPIC_AUTH_TOKEN: 'managed-token',
+            ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+        })
+    })
+
+    it('keeps caller model overrides for native Claude credentials', () => {
+        expect(buildManagedSessionSpawnEnvironment({}, {
+            ANTHROPIC_MODEL: 'claude-opus-5',
+            ANTHROPIC_SMALL_FAST_MODEL: 'claude-haiku-4-5',
+        }, {
+            CLAUDE_CODE_OAUTH_TOKEN: 'managed-oauth-token',
+        })).toMatchObject({
+            ANTHROPIC_MODEL: 'claude-opus-5',
+            ANTHROPIC_SMALL_FAST_MODEL: 'claude-haiku-4-5',
+        })
+    })
+
+    it('keeps managed credential secrets out of caller variable expansion', () => {
+        const managed = {
+            ANTHROPIC_AUTH_TOKEN: 'managed-${MUST_STAY_LITERAL}',
+            ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+        }
+        const requested = stripManagedCredentialConflicts({
+            SAFE: '${EXPAND_ME}',
+            ANTHROPIC_AUTH_TOKEN: '${MISSING_CALLER_TOKEN}',
+            ANTHROPIC_API_KEY: '${MISSING_NATIVE_KEY}',
+            CLAUDE_CODE_OAUTH_TOKEN: '${MISSING_NATIVE_OAUTH}',
+        }, managed)
+
+        expect(expandEnvironmentVariables(requested, { EXPAND_ME: 'expanded' })).toEqual({
+            SAFE: 'expanded',
+        })
+        expect(buildManagedSessionSpawnEnvironment({}, requested, managed)).toMatchObject({
+            ANTHROPIC_AUTH_TOKEN: 'managed-${MUST_STAY_LITERAL}',
+        })
+    })
+
     it('scrubs inherited lineage before applying the explicit spawn environment', () => {
         expect(buildSessionSpawnEnvironment(
             {
@@ -130,6 +194,22 @@ describe('Saycode agent resume environment', () => {
         })
     })
 
+    it('captures the discovery scope so a resumed session keeps seeing sibling worktrees', () => {
+        // SAYCODE_AGENT_SCOPE (saycode-cli 0.4.0, Desktop ADR-061) widens ls/read/steer to the
+        // project tree. Dropping it on resume silently shrinks a hub back to its own worktree.
+        expect(captureSaycodeAgentEnvironment({
+            SAYCODE_AGENT_ENV: '1',
+            SAYCODE_AGENT_ROOT: '/repo/.aplus/worktrees/p/a',
+            SAYCODE_AGENT_SCOPE: '/repo',
+            SAYCODE_AGENT_DEPTH: '0',
+        })).toEqual({
+            SAYCODE_AGENT_ENV: '1',
+            SAYCODE_AGENT_ROOT: '/repo/.aplus/worktrees/p/a',
+            SAYCODE_AGENT_SCOPE: '/repo',
+            SAYCODE_AGENT_DEPTH: '0',
+        })
+    })
+
     it('restores the captured capability and current session id on resume', () => {
         expect(buildResumedSessionSpawnEnvironment({
             inherited: {
@@ -154,6 +234,31 @@ describe('Saycode agent resume environment', () => {
             SAYCODE_AGENT_DEPTH: '1',
             SAYCODE_AGENT_MAX_SPAWN: '4',
             SAYCODE_AGENT_ID: 'child-1',
+            APLUS_SESSION_ID: 'session-2',
+        })
+    })
+
+    it('captures and restores a validated checkpoint binding without unrelated environment', () => {
+        const encoded = JSON.stringify({
+            schemaVersion: 1,
+            projectId: 'project-1',
+            worktreeId: null,
+            checkpointRoot: '/machine/checkpoints',
+        })
+        const captured = captureSaycodeAgentEnvironment({
+            HAPPY_CHECKPOINT_SPAWN_CONTEXT: encoded,
+            SECRET: 'must-not-be-captured',
+        })
+
+        expect(captured).toEqual({ HAPPY_CHECKPOINT_SPAWN_CONTEXT: encoded })
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: { HAPPY_CHECKPOINT_SPAWN_CONTEXT: 'stale' },
+            explicit: { HAPPY_RECONNECT_SESSION_ID: 'session-2' },
+            agentEnvironment: captured,
+            sessionId: 'session-2',
+        })).toEqual({
+            HAPPY_RECONNECT_SESSION_ID: 'session-2',
+            HAPPY_CHECKPOINT_SPAWN_CONTEXT: encoded,
             APLUS_SESSION_ID: 'session-2',
         })
     })
@@ -185,5 +290,39 @@ describe('mergeResumeSessionEnvironment', () => {
             HAPPY_RECONNECT_SESSION_ID: 'session-1',
             APLUS_SESSION_ID: 'session-1',
         })
+    })
+})
+
+describe('resumed agent sandbox policy', () => {
+    const key = 'HAPPY_PROJECT_SANDBOX_CONFIG'
+    const policy = JSON.stringify({ enabled: true, extraWritePaths: ['/repo/.aplus/agent-lineage.jsonl'], denyWritePaths: ['/repo/private'] })
+    const agentEnvironment = () => captureSaycodeAgentEnvironment({
+        SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/repo/.aplus/worktrees/task', [key]: policy,
+    })
+
+    it('restores the original file grant and deny policy without Desktop resending environment', () => {
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: { [key]: 'unrelated-daemon-policy' }, explicit: {}, agentEnvironment: agentEnvironment(), sessionId: 'child',
+        })[key]).toBe(policy)
+    })
+
+    it('preserves a non-agent session policy through capture and resume', () => {
+        const captured = captureSaycodeAgentEnvironment({ [key]: policy })
+        expect(captured).toEqual({ [key]: policy })
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: {}, explicit: {}, agentEnvironment: captured, sessionId: 'ordinary',
+        })[key]).toBe(policy)
+    })
+
+    it('preserves an explicit policy update on resume', () => {
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: {}, explicit: {}, runtime: { [key]: 'updated-policy' }, agentEnvironment: agentEnvironment(), sessionId: 'child',
+        })[key]).toBe('updated-policy')
+    })
+
+    it('does not give a legacy session an unrelated daemon policy', () => {
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: { [key]: policy }, explicit: {}, sessionId: 'legacy',
+        })).not.toHaveProperty(key)
     })
 })

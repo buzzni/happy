@@ -8,6 +8,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createServer } from "node:http";
+import type { ChildProcess } from 'node:child_process';
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { AddressInfo } from "node:net";
 import { z } from "zod";
@@ -25,11 +26,15 @@ import { runBrowserTool, BROWSER_TOOL_NAMES, type BridgeRequest } from "./browse
 // tool name via this constant so per-runner mappers (sessionProtocolMapper
 // for Claude, AcpSessionManager for ACP, …) consistently key the call
 // registry against the same name.
+import { runScriptAutomationTool, scriptAutomationToolRequestSchema } from './scriptAutomationTools';
+
 export const BASH_STREAM_AGENT_TOOL_NAME = 'mcp__happy__bash_stream';
 
 export interface HappyServerHandlers {
     changeTitle: (title: string, branchSlug?: string) => Promise<{ success: boolean; error?: string }>;
     client: ApiSessionClient;
+    protectedBashCwd?: () => string | null;
+    trackProtectedBashProcess?: (child: ChildProcess) => void;
 }
 
 // The first title generated through change_title is the one users rely on to
@@ -80,6 +85,22 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
     const mcp = new McpServer({
         name: "Happy MCP",
         version: "1.0.0",
+    });
+
+    mcp.registerTool('script_automations', {
+        title: 'Manage Project Script Automations',
+        description: 'Manage Node bundle scripts in the project Execution > Automations admin without an LLM session. List before registering scheduled collection or batch work. Supports list/get/upsert/run/list_runs/set_enabled; use registrationKey and expectedRevision for safe retries. upsert reads sourcePath relative to this project, encrypts the bundle, and supports schedule=null or at/interval/daily/weekly, externalEnabled, JSON inputSchema, allowlisted origins and env:<mountedGroupId>:<KEY> secret references. No API keys are issued by this tool. Return and use the same admin ID; do not install OS cron or hidden background timers.',
+        inputSchema: { request: scriptAutomationToolRequestSchema },
+    }, async ({ request }) => {
+        try {
+            const metadata = handlers.client.getMetadata();
+            if (!metadata?.path) throw new Error('SCRIPT_PROJECT_CONTEXT_REQUIRED');
+            const result = await runScriptAutomationTool(request, { directory: metadata.path, machineId: metadata.machineId });
+            return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+        } catch (error) {
+            const code = error instanceof Error && /^[A-Z0-9_-]{1,100}$/.test(error.message) ? error.message : 'SCRIPT_MANAGEMENT_FAILED';
+            return { isError: true, content: [{ type: 'text' as const, text: code }] };
+        }
     });
 
     mcp.registerTool('change_title', {
@@ -134,9 +155,15 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
     }, async (args) => {
         logger.debug(`[bash_stream:tool] invoked command=${String(args.command).slice(0, 100)}`);
         try {
+            const protectedCwd = handlers.protectedBashCwd?.();
+            if (handlers.protectedBashCwd && !protectedCwd) {
+                throw new Error('checkpoint protection has no active turn workspace');
+            }
             const result = await runBashStream({
                 command: args.command,
-                cwd: args.cwd,
+                cwd: protectedCwd ?? args.cwd,
+                detached: Boolean(handlers.protectedBashCwd),
+                onSpawn: handlers.trackProtectedBashProcess,
                 onProgress: (progress) => {
                     const call = getActiveBashStreamCall();
                     logger.debug(`[bash_stream:tool] flush stream=${progress.stream} lines=${progress.lines.length} call=${call ?? '(none)'}`);
@@ -211,12 +238,12 @@ function registerBrowserTools(mcp: McpServer): void {
                 'Per-user browser routing is required but the server did not issue a viewer key',
             )
         }
-        const port = await readDaemonControlPort();
-        if (port === null) {
+        const connection = await readDaemonControlPort();
+        if (connection === null) {
             throw new BrowserClientError('DAEMON_UNREACHABLE', 'No happy daemon is running on this machine');
         }
         return requestBrowser({
-            port,
+            ...connection,
             method,
             params,
             ...(opts?.profile !== undefined ? { profile: opts.profile } : {}),
@@ -226,8 +253,10 @@ function registerBrowserTools(mcp: McpServer): void {
 
     // Only consulted when a command comes back looking wrong (see runBrowserTool).
     const status = async () => {
-        const port = await readDaemonControlPort();
-        return port === null ? null : fetchBrowserStatus(port, process.env.HAPPY_BROWSER_VIEWER_KEY);
+        const connection = await readDaemonControlPort();
+        return connection === null
+            ? null
+            : fetchBrowserStatus(connection.port, connection.controlSecret, process.env.HAPPY_BROWSER_VIEWER_KEY);
     };
 
     mcp.registerTool('browser_tabs', {
@@ -349,13 +378,24 @@ function registerBrowserTools(mcp: McpServer): void {
     }, async (args) => runBrowserTool({ request: bridge, status, method: 'tabs_close', params: { profile: args.profile, tabId: args.tabId } }));
 }
 
-export async function startHappyServer(client: ApiSessionClient) {
+export async function startHappyServer(
+    client: ApiSessionClient,
+    options: {
+        protectedBashCwd?: () => string | null;
+        trackProtectedBashProcess?: (child: ChildProcess) => void;
+    } = {},
+) {
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
 
     const changeTitle = createChangeTitleHandler(client);
 
     const server = createServer(async (req, res) => {
-        const mcp = createMcpServer({ changeTitle, client });
+        const mcp = createMcpServer({
+            changeTitle,
+            client,
+            protectedBashCwd: options.protectedBashCwd,
+            trackProtectedBashProcess: options.trackProtectedBashProcess,
+        });
         try {
             const transport = new StreamableHTTPServerTransport({
                 sessionIdGenerator: undefined
@@ -386,7 +426,7 @@ export async function startHappyServer(client: ApiSessionClient) {
 
     return {
         url: baseUrl.toString(),
-        toolNames: ['change_title', 'bash_stream', ...BROWSER_TOOL_NAMES],
+        toolNames: ['change_title', 'bash_stream', 'script_automations', ...BROWSER_TOOL_NAMES],
         stop: () => {
             logger.debug(`[happyMCP] server:stop sessionId=${client.sessionId}`);
             server.close();

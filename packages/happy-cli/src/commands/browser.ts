@@ -269,9 +269,9 @@ export async function handleBrowserCommand(args: string[]): Promise<void> {
     }
 
     const state = await readDaemonState()
-    const daemonRunning = Boolean(state?.httpPort)
+    const daemonRunning = Boolean(state?.httpPort && state?.controlSecret)
     const { connections, hasRecentAuthFailure } = (daemonRunning
-        ? await fetchBrowserStatus(state!.httpPort!)
+        ? await fetchBrowserStatus(state!.httpPort!, state!.controlSecret!)
         : null) ?? { connections: [], hasRecentAuthFailure: false }
 
     const extensionDir = resolveExtensionDir()

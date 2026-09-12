@@ -19,6 +19,14 @@ import type {
 import type { AutomationMcpCallerGrantResult, AutomationMcpSpawnContext } from './automationMcpCallerGrant'
 import type { AutomationConnectorPreflightResult } from './automationConnectorPreflight'
 import { isPermanentGithubTriggerFailure } from './githubTriggerPermanentFailure'
+import {
+  ensureAgentTaskReviewObjects,
+  reviewShasFromDispatchInput,
+  reviewWorktreeRequestFromDispatchInput,
+  applyWorktreeRequestFromDispatchInput,
+  readWorkspaceHeadSha,
+} from './agentTaskReviewObjects'
+import { shouldGiveUpWorktreeCleanup } from './worktreeCleanupGiveUp'
 import type { GithubTriggerWorktreePlan } from './githubTriggerWorktree'
 import type {
   AutomationAgentTaskDispatch,
@@ -29,6 +37,7 @@ import {
   GITHUB_TRIGGER_PROMPT_PREAMBLE,
   describeGithubTriggerBaseline,
   planGithubIssueTrigger,
+  isUnsupportedPathFilter,
   planGithubTrigger,
   selectPathFilterCandidates,
   renderGithubIssueTriggerPrompt,
@@ -39,6 +48,16 @@ import {
 } from './githubTriggerDomain'
 
 type TransportResult = { ok: boolean; value?: any; error?: string }
+
+// 예약 세션은 대화의 매-turn orchestration을 거치지 않으므로 첫 작업에 진단 기준을 붙인다.
+const SCHEDULED_AUTOMATION_PROMPT_PREAMBLE = [
+  '## 예약 자동화 진단 지침',
+  '[연동 판단] 현재 세션의 도구 목록만으로 미연동을 단정하지 말고 Saycode의 연결 상태와 실제 도구 탐색·호출 결과를 확인한다.',
+  '[고장 판단] 사용 중인 실행 경로와 최신 실행 기록을 확인하며, 오래된 경로의 오류만으로 현재 자동화의 고장을 단정하지 않는다.',
+  '[사용자 요구] 재연동·설정 변경은 현재 Saycode 연결 상태와 실제 호출 오류로 필요성이 확인된 경우에만 요청한다.',
+  '[보고] 확인한 사실과 추정을 구분하고, 확인하지 못한 상태는 확인 불가로 보고하며 근거와 다음 확인 방법을 밝힌다.',
+  '[안전] 진단은 읽기 전용으로 수행하며 토큰·비밀값을 출력하거나 연결·설정을 임의로 변경하지 않는다.',
+].join('\n')
 
 export interface ServerAutomationTransport {
   claim(input: { automationId: string; generation: number; scheduledFor: number }): Promise<TransportResult>
@@ -117,6 +136,7 @@ export interface ServerAutomationExecutorInput {
     | { ok: false; error: string }
   >
   dispatchAgentTask: (input: {
+    escalateTo?: string[]
     runId: string
     claimToken: string
     credentialId: string
@@ -126,6 +146,21 @@ export interface ServerAutomationExecutorInput {
     | { ok: false; error: string }
   >
   maintainAgentTaskLease: (dispatch: AutomationAgentTaskDispatch) => void
+  /**
+   * pr_review 워커가 diff 밖 문맥을 볼 수 있도록 base/head 커밋을 워크스페이스에
+   * 확보한다. 프로젝트 clone 은 기본 브랜치 단일 refspec 의 shallow 라 PR 커밋이
+   * 없고, preset 은 워커가 스스로 checkout·조회하는 것을 금지한다.
+   */
+  ensureReviewObjects?: (input: {
+    directory: string
+    shas: string[]
+    environmentVariables?: Record<string, string>
+  }) => Promise<{ ok: true; fetched: string[] } | { ok: false; error: string }>
+  /**
+   * review_apply 를 사용자 세션에서 재개해도 되는지 판정하기 위해 워크스페이스의
+   * 현재 HEAD 를 읽는다. 읽지 못하면 null 이고, 그때는 재개하지 않는다.
+   */
+  readHeadSha?: (input: { directory: string }) => Promise<string | null>
   resolveMcpSpawnContext: (input: {
     runId: string
     claimToken: string
@@ -185,12 +220,40 @@ export interface ServerAutomationExecutorInput {
 const SCRIPT_TIMEOUT_MS = 60_000
 const HEARTBEAT_MS = 60_000
 const EXPECTED_NEXT_DAEMON_TICK_MS = 60_000
-const MAX_GITHUB_EVENTS_PER_TICK = 3
+// 한 틱이 새로 집어오는 GitHub 이벤트 수. 폭주하는 저장소가 한 번에 큐를 다 비우지
+// 않게 하는 유입 제한이다.
+export const MAX_GITHUB_EVENTS_PER_TICK = 3
+// 동시에 살아 있을 수 있는 GitHub 워커 세션 수. 위와 다른 개념이다 — 유입 속도와
+// 동시 실행 수를 한 상수로 묶으면 둘 중 하나만 바꾸고 싶을 때 다른 하나가 끌려간다.
+//
+// 워커 하나가 에이전트 세션 하나라 메모리·CPU 를 쓴다. 2026-09-01 프로덕션 머신
+// 실측(12코어 load 5.24, 가용 메모리 30GB, 이미 에이전트 프로세스 113개)에서 여유가
+// 있어 3 → 6 으로 올렸다. 유입은 MAX_GITHUB_EVENTS_PER_TICK 이 틱당 3건으로 계속
+// 잡아 주므로, 한 번에 몰려도 상한까지 두 틱에 걸쳐 올라간다.
+export const MAX_GITHUB_WORKER_SESSIONS = 6
 const DIRTY_WORKTREE_RETRY_MS = 15 * 60_000
+/**
+ * dirty 보류가 이만큼 이어지면 알린다(15분 간격이므로 4회 = 1시간).
+ *
+ * 보류 자체는 "사람이 작업물을 회수할 때까지 기다린다" 는 의도된 동작이지만, 그동안
+ * worktree 는 지워지지 않고 디스크를 차지한다(2026-09-10 에 14개·16GB). 15분마다
+ * 같은 debug 한 줄만 반복되면 아무도 알아차리지 못한다.
+ *
+ * 주의 — dirty 는 큐를 막지 않는다. 큐를 막는 것은 worktree 에 *프로세스가 붙어 있는*
+ * 경우다(trackLivePendingGithubWorktrees 의 isDirectoryInUse). 처음엔 이 경고를
+ * "queue is blocked" 라고 썼는데 틀린 말이었다 — 09-05 사고에서 큐를 막은 것은 좀비
+ * 프로세스였고 dirty 는 누적 원인이었을 뿐이다.
+ */
+export const DIRTY_WORKTREE_WARN_AFTER_ATTEMPTS = 4
 const WORKTREE_CLEANUP_RETRY_MS = 60_000
+// 리뷰 worktree 는 대상 head 로만 체크아웃된 일회용 디렉토리다. 'strict' 는 그
+// 세션 경로만 쓰기 가능하게 하므로, 워커가 여기에 의존성을 설치해 대상 SHA 의
+// 테스트를 돌릴 수 있으면서도 저장소 밖으로는 여전히 나가지 못한다.
+// 2026-09-01 검증 전까지는 'custom' + 빈 목록이라 node_modules 조차 만들지 못해
+// 모든 테스트가 not_run 으로 끝났다.
 const PR_REVIEW_SANDBOX_CONFIG = JSON.stringify({
   enabled: true,
-  sessionIsolation: 'custom',
+  sessionIsolation: 'strict',
   customWritePaths: [],
   denyReadPaths: ['~/.ssh', '~/.aws', '~/.gnupg'],
   extraWritePaths: ['/tmp'],
@@ -203,7 +266,7 @@ const PR_REVIEW_SANDBOX_CONFIG = JSON.stringify({
 
 const AGENT_TASK_RESULT_CONTRACTS: Record<AutomationAgentTaskDispatch['type'], string> = {
   'pr_review.v1': '{"reviewedHeadSha":"40-64 hex","verdict":"approve|changes_requested","findings":[{"id":"stable-id","severity":"high|medium|low","file":"path","line":1,"title":"...","evidence":"...","suggestedFix":"...","confidence":0.0}],"checks":[{"name":"...","status":"passed|failed|not_run","details":"..."}]}',
-  'review_apply.v1': '{"status":"applied|no_changes|stale|failed","reviewedHeadSha":"40-64 hex","currentHeadSha":"40-64 hex","findings":[{"findingId":"...","decision":"applied|skipped","reason":"..."}],"checks":[{"name":"...","status":"passed|failed|not_run","details":"..."}],"commitSha":"40-64 hex or null","pushUrl":"https URL or null"}',
+  'review_apply.v1': '{"status":"applied|no_changes|stale|failed","reviewedHeadSha":"40-64 hex","currentHeadSha":"40-64 hex","findings":[{"findingId":"...","decision":"applied|skipped","reason":"..."}],"checks":[{"name":"...","status":"passed|failed|not_run","details":"..."}],"commitSha":"40-64 hex or null","pushUrl":"https URL or null","fixBranch":"review-fix/<prNumber>-<reviewedHeadSha7> or null","fixPrUrl":"https URL of the stacked pull request or null"}',
   'testing.v1': '{"sourceSha":"40-64 hex","verdict":"passed|failed|blocked","checks":[{"name":"...","status":"passed|failed|not_run","details":"..."}],"logArtifactRef":null}',
 }
 
@@ -225,6 +288,18 @@ const AGENT_TASK_QUALITY_CONTRACTS: Record<AutomationAgentTaskDispatch['type'], 
     '- Apply only high or medium findings that are CONFIRMED or can first be reproduced with a concrete failing test. Skip low and PLAUSIBLE-only findings automatically.',
     '- Keep changes within the validated finding scope; do not add unrelated refactors, formatting, or speculative improvements.',
     '- Run the smallest relevant tests for each applied change, then the appropriate related checks before commit and push.',
+    // 2026-09-02 — 작성자 브랜치에 직접 push 한 커밋이 원하지 않은 변경으로 남았다.
+    // 되돌리면 revert 가 이력에 남는다. 스택 PR 은 opt-in 이다: 머지하면 반영, 닫으면
+    // 흔적 없이 폐기. 독립 리뷰가 쓰는 review-fix/ 관례를 그대로 따른다.
+    '- Never push to the pull request\'s own branch. Create review-fix/<prNumber>-<reviewedHeadSha7> from reviewedHeadSha,'
+      + ' commit there, push that branch, and open a stacked pull request whose base is the reviewed pull request\'s head branch'
+      + ' (read it with `gh pr view <prNumber> --json headRefName`). Report fixBranch and fixPrUrl; pushUrl is the fix pull request URL.',
+    // 2026-09-03 — 스택 PR 만 보면 어느 리뷰에서 나온 수정인지 알 수 없다. 되돌아갈
+    // 링크를 본문에 넣는다. 종결 키워드(Fixes/Closes/Resolves)는 쓰지 않는다 — 수정
+    // PR 이 머지될 때 원본을 닫아 버릴 수 있다.
+    '- The stacked pull request body must link back to the reviewed pull request as'
+      + ' https://github.com/<repository>/pull/<prNumber> and name the reviewed head SHA, so a reader can return to it.'
+      + ' Use a plain reference; never a closing keyword such as Fixes, Closes, or Resolves.',
     '- Record an applied or skipped decision and reason for every finding, plus all passed, failed, blocked, or not-run checks.',
   ].join('\n'),
   'testing.v1': '',
@@ -249,11 +324,40 @@ function buildAgentTaskPrompt(
     'Use APLUS_AGENT_TASK_URL and the capability environment variables. Never print or echo the token values.',
     '1. POST $APLUS_AGENT_TASK_URL/$APLUS_AGENT_TASK_ID/start with version=1, token=$APLUS_AGENT_TASK_CLAIM_TOKEN, agentRunId=$APLUS_AGENT_TASK_RUN_ID, and a stable idempotencyKey.',
     '2. Keep the lease alive while working by POSTing /heartbeat at least every 30 seconds with the claim token.',
-    '3. Perform only the task. PR review is read-only. Before review_apply, verify the PR is open and current HEAD equals reviewedHeadSha; otherwise return stale/failed without mutating. review_apply may then edit, test, commit, and push; testing runs checks only.',
+    // 2026-09-01 프로덕션 — worktree 를 받고도 vitest 를 못 찾아 검사를 전부 포기했다.
+    // 이유는 워커가 지시를 정확히 지켰기 때문이다: "PR review is read-only" 라고만
+    // 하면 빈 worktree 에 의존성을 설치해도 되는지 알 수 없다. 무엇이 금지인지를
+    // PR 변경으로 좁히고, 설치는 허용하되 실패를 조용히 넘기지 못하게 한다.
+    '3. Perform only the task. PR review must not change the pull request — never commit, push, or edit tracked files —'
+      + ' but its worktree is a throwaway checkout of the reviewed head, so it may install dependencies and run checks there.'
+      + ' The worktree starts empty: install with the repository package manager using --ignore-scripts, plus any'
+      + ' build step the repository requires for its workspace packages, before running'
+      + ' targeted checks, and if the install fails record the affected check as not_run with the reason instead of dropping it.'
+      + ' Before review_apply, verify the PR is open and current HEAD equals reviewedHeadSha; otherwise return stale/failed'
+      + ' without mutating. review_apply may then edit, test, commit to its review-fix branch, push it, and open the stacked pull request; testing runs checks only.',
     `4. Complete with exactly this result shape: ${AGENT_TASK_RESULT_CONTRACTS[dispatch.type]}`,
     '5. POST /complete with version=1, token=$APLUS_AGENT_TASK_COMPLETE_TOKEN, agentRunId, a stable idempotencyKey, and result.',
+    // 2026-08-31 프로덕션 — pr_review 워커가 리뷰를 끝내고도 결과를 제출하지 못했다.
+    // 지시가 "POST ... and result" 뿐이라 워커가 셸에서 JSON 을 조립했고, 리뷰 본문의
+    // 따옴표·백틱·$ 가 보간을 타며 본문이 깨져 400 이 났다. 바로 아래 "4xx 는 재시도
+    // 금지" 규칙까지 정확히 지켜 조용히 끝났다 — 워커 잘못이 아니라 방법을 안 정해준
+    // 탓이다. 리뷰 본문은 임의의 코드 조각을 담으므로 셸을 거치면 언제든 깨진다.
+    'Write every request body to a file and send it with curl --data-binary @<file>'
+      + ' (or an equivalent that reads the file directly). Never build the JSON inline in a'
+      + ' shell argument such as -d \'{...}\' — findings quote code, so backticks, quotes,'
+      + ' and $ get interpolated and the body arrives corrupted.',
     'Retry network failures and 5xx responses with the same idempotencyKey; do not retry 4xx responses.',
-    'If the work cannot complete, POST /fail with the complete token and a concise reason. Do not put capabilities in output, commits, or PR text.',
+    // 손상된 본문은 재시도로 풀리지 않지만, 조용히 끝나서도 안 된다. 4xx 를 만나면
+    // 상태 코드와 응답 본문을 남겨 왜 제출이 실패했는지 사람이 볼 수 있게 한다.
+    // 2026-09-03 프로덕션 — 워커가 리뷰를 끝내고 /complete 에서 409 를 받자 이 지시대로
+    // /fail 을 불러 task 를 failed 로 닫았다. pr_review 는 maxAttempts 1 이고 dedupe 가
+    // cycle-1 이라 그 PR 은 다시 리뷰되지 않았다. /fail 은 "결과를 못 만들었다" 는 뜻이지
+    // "제출이 막혔다" 는 뜻이 아니다 — 둘을 섞으면 끝낸 작업을 워커가 스스로 파괴한다.
+    'If /complete returns 4xx, report the status code and response body in your final message and stop.'
+      + ' Do not POST /fail when the work finished and only the submission was refused — that discards a'
+      + ' completed result the task cannot produce again. Leave the task for the server to reconcile.',
+    'POST /fail with the complete token and a concise reason only when you could not produce a result at all.'
+      + ' Do not put capabilities in output, commits, or PR text.',
   ].join('\n')
 }
 
@@ -845,7 +949,13 @@ function deferGithubWorktreeCleanup(
   input.runtimeStore.write({
     ...state,
     githubWorktrees: (state.githubWorktrees ?? []).map((entry) => (
-      entry.runId === runId ? { ...entry, cleanupRetryAt: input.now + delayMs } : entry
+      entry.runId === runId
+        ? {
+          ...entry,
+          cleanupRetryAt: input.now + delayMs,
+          cleanupAttempts: (entry.cleanupAttempts ?? 0) + 1,
+        }
+        : entry
     )),
   })
 }
@@ -867,6 +977,25 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
     input.logDebug?.(
       `[server-automation] GitHub worktree cleanup failed for ${worktree.worktreePath}: ${discarded.error}`,
     )
+    // dirty 는 사람이 작업물을 회수할 때까지 기다리는 의도된 보류이므로 예산을 쓰지
+    // 않는다. 그 밖의 실패는 예산 안에서만 재시도한다 — 상한이 없으면 2026-08-30 처럼
+    // 매분 영원히 실패하며 디스크만 찬다.
+    const attempts = (worktree.cleanupAttempts ?? 0) + 1
+    if (discarded.dirty && attempts === DIRTY_WORKTREE_WARN_AFTER_ATTEMPTS) {
+      input.logDebug?.(
+        `[server-automation] ${worktree.automationId} dirty GitHub worktree is being kept and its disk is not reclaimed:`
+        + ` ${worktree.worktreePath} has been dirty for ${attempts} cleanup attempts`
+        + ` — ${discarded.error}`,
+      )
+    }
+    if (!discarded.dirty && shouldGiveUpWorktreeCleanup(attempts)) {
+      input.logDebug?.(
+        `[server-automation] giving up on GitHub worktree cleanup for ${worktree.worktreePath}`
+        + ` after ${attempts} attempts; remove it manually: ${discarded.error}`,
+      )
+      removeGithubWorktreeJournal(input, worktree.runId)
+      continue
+    }
     deferGithubWorktreeCleanup(
       input,
       worktree.runId,
@@ -888,7 +1017,7 @@ async function executeStartedRun(
   degradedCode?: string
   queueDepth?: number
 }> {
-  let prompt = payload.prompt
+  let prompt = `${SCHEDULED_AUTOMATION_PROMPT_PREAMBLE}\n\n${payload.prompt}`
   let environmentVariables: Record<string, string> | undefined
   let agentTaskDispatch: AutomationAgentTaskDispatch | null = null
   let persistGithubTriggerState: ((
@@ -1044,6 +1173,22 @@ async function executeStartedRun(
       previous,
       consume: githubMode === 'work',
     })
+    // 후보가 있었는데 경로 필터가 전부 떨어뜨렸고, 그 필터가 이 매처로는 표현할 수
+    // 없는 glob 이라면 설정 오류다. 조용히 0건이 되면 "제대로 걸렀다" 와 "고장났다" 를
+    // 구분할 수 없어, 2026-08-31 에는 그 상태로 자동화 두 개가 하루 넘게 멈춰 있었다.
+    // 후보가 있을 때만 알리므로, 정말 해당 없는 PR 만 흐르는 저장소는 조용하다.
+    // 후보를 받아왔는데 큐가 그대로 비어 있으면 경로 필터가 전부 떨어뜨렸다는 뜻이다.
+    // poll 단계는 consume:false 라 event 로는 판정할 수 없어 pending 을 본다.
+    if (fileCandidates.length > 0 && planned.state.pending.length === 0) {
+      const unsupported = payload.githubTrigger.filter.paths.filter(isUnsupportedPathFilter)
+      if (unsupported.length > 0) {
+        input.logDebug?.(
+          `[server-automation] ${automation.automationId} path filter matched nothing:`
+          + ` ${unsupported.join(', ')} cannot be matched — this matcher takes directory`
+          + ' prefixes (a trailing /* or /** is allowed), not general globs',
+        )
+      }
+    }
     persistGithubTriggerState = makeGithubTriggerStatePersister(input, automation, planned.state)
     if (githubMode === 'poll'
       && (payload.githubTrigger.action !== 'agent-task-review' || planned.state.pending.length > 0)) {
@@ -1060,6 +1205,11 @@ async function executeStartedRun(
         runId: run.runId,
         claimToken: run.claimToken,
         credentialId,
+        // 담당자 소환은 서버가 조립하는 코멘트에서만 가능하다. 서버는 자동화 payload 를
+        // 복호화할 수 없으므로 여기서 실어 보내야 알 수 있다.
+        ...(payload.githubTrigger.escalateTo?.length
+          ? { escalateTo: payload.githubTrigger.escalateTo }
+          : {}),
         event: planned.event ? {
           event: planned.event.event,
           prNumber: planned.event.pr.number,
@@ -1086,8 +1236,76 @@ async function executeStartedRun(
         }
       }
       agentTaskDispatch = bridged.dispatch
+      if (bridged.dispatch.type === 'pr_review.v1') {
+        // 리뷰 대상 head 로 체크아웃된 전용 worktree 에서 돌린다. 프로젝트 디렉터리에서
+        // 그대로 돌면 HEAD 가 사용자가 마지막에 둔 커밋이라, 워커가 대상 SHA 테스트를
+        // 실행할 수 없고 호출부도 git show 로 한 장씩 읽어야 한다.
+        githubWorktreeRequest = reviewWorktreeRequestFromDispatchInput(bridged.dispatch.input)
+          ? {
+            ...reviewWorktreeRequestFromDispatchInput(bridged.dispatch.input)!,
+            ...(query.githubEnvironment ? { githubEnvironment: query.githubEnvironment } : {}),
+          }
+          : null
+        const shas = reviewShasFromDispatchInput(bridged.dispatch.input)
+        if (shas.length > 0) {
+          const provisioned = await (input.ensureReviewObjects ?? ensureAgentTaskReviewObjects)({
+            directory: payload.directory,
+            shas,
+            ...(query.githubEnvironment ? { environmentVariables: query.githubEnvironment } : {}),
+          })
+          // 객체가 없어도 immutable diff artifact 로 리뷰는 가능하므로 멈추지 않는다.
+          // 다만 왜 문맥이 없는지는 남긴다 — 조용히 넘어가면 리뷰 품질이 낮아진 이유를
+          // 아무도 모른다 (AGENTS.md §1.13).
+          if (!provisioned.ok) {
+            input.logDebug?.(
+              `[server-automation] ${automation.automationId} review objects unavailable`
+              + ` — the worker cannot inspect call sites beyond the diff: ${provisioned.error}`,
+            )
+          }
+        }
+      } else if (bridged.dispatch.type === 'review_apply.v1') {
+        // 사용자 세션 재개는 원 리뷰 대화의 맥락과 "내 세션에서 고쳐진다" 는 가시성을
+        // 준다. 다만 그 디렉터리가 리뷰 대상 head 가 아니면 계약상 apply 는 mutate 없이
+        // stale 로 끝난다 — 사용자가 PR 을 올린 뒤 계속 일하는 정상 흐름이 곧 실패
+        // 조건이라, 지금까지 대부분의 apply 가 아무것도 반영하지 못했다.
+        const applyRequest = applyWorktreeRequestFromDispatchInput(bridged.dispatch.input)
+        if (applyRequest) {
+          const headSha = await (input.readHeadSha ?? readWorkspaceHeadSha)({
+            directory: payload.directory,
+          })
+          // 읽지 못한 경우도 어긋난 것으로 다룬다. 모르는 채로 사용자 디렉터리에서
+          // 시작하면 우리가 고치려는 그 조용한 stale 로 되돌아간다.
+          if (headSha !== applyRequest.pullRequest.expectedHeadSha) {
+            input.logDebug?.(
+              `[server-automation] ${automation.automationId} applying review findings in a worktree`
+              + ` — ${payload.directory} is at ${headSha ?? 'an unreadable HEAD'},`
+              + ` not the reviewed ${applyRequest.pullRequest.expectedHeadSha}`,
+            )
+            githubWorktreeRequest = {
+              ...applyRequest,
+              ...(query.githubEnvironment ? { githubEnvironment: query.githubEnvironment } : {}),
+            }
+          }
+        }
+      }
       prompt = buildAgentTaskPrompt(bridged.dispatch, payload.prompt)
       environmentVariables = {
+        // 2026-09-04 프로덕션 — 리뷰 워커 31건이 뜨자마자 exit 1 로 죽어 3시간 동안
+        // 리뷰가 한 건도 완료되지 않았다:
+        //   [aplus] MCP topology mismatch expected=gmail,google-drive,knoi,slack
+        //           configured=(none) missing=... attempt=2  → 세션 종료
+        //
+        // expected 는 서버가 만든 값이 아니라 워커가 헤더로 보낸 값이고, 출처는
+        // 데몬에서 상속된 이 환경변수다. 공용 머신에서 다른 계정 세션이 커넥터를
+        // 요구하며 값을 남기면 그때부터 모든 리뷰가 죽는다 — 리뷰 자신의 설정과
+        // 무관하게 옆 세션에 좌우된다.
+        //
+        // AgentTask 워커는 filterInheritedCredentials 로 사용자 토큰을 떼고 돌기
+        // 때문에 caller 가 (bearer-unmatched) 이고, 개인 커넥터를 받을 수단이
+        // 구조적으로 없다. 기대치가 비어 있지 않으면 100% mismatch 다. 리뷰는
+        // 커넥터를 쓰지 않으므로 여기서 명시적으로 비운다.
+        HAPPY_APLUS_EXPECTED_CONNECTORS: '[]',
+        HAPPY_APLUS_EXPECTED_MCP_SERVICES: '[]',
         ...(bridged.dispatch.type === 'review_apply.v1' ? query.githubEnvironment ?? {} : {}),
         ...(bridged.dispatch.type === 'pr_review.v1'
           ? { HAPPY_PROJECT_SANDBOX_CONFIG: PR_REVIEW_SANDBOX_CONFIG }
@@ -1231,10 +1449,12 @@ async function executeStartedRun(
       input.logDebug?.(
         `[server-automation] ${automation.automationId} GitHub worktree preparation failed: ${prepared.error}`,
       )
-      // 되돌릴 수 없는 실패(삭제된 브랜치 등)는 재시도해도 결과가 같다. ERROR 로
-      // 돌아가면 이 경로가 persistGithubTriggerState 에 도달하지 않아 이벤트가
-      // 소비되지 않고 매분 재시도된다(2026-08-29: 머지 후 삭제된 브랜치 하나가
-      // 그렇게 돌았다). 이벤트를 소비하고 SKIPPED_GATE 로 끊는다.
+      // 되돌릴 수 없는 실패(삭제된 브랜치 등)는 재시도해도, 폴백해도 결과가 같다 —
+      // 리뷰할 대상 자체가 없다. AgentTask 든 아니든 이벤트를 소비하고 끊는다.
+      //
+      // 이 판정이 아래 AgentTask 폴백보다 먼저 와야 한다. 2026-09-01 에 순서가
+      // 뒤바뀌어 있어, 머지되며 브랜치가 사라진 PR 을 프로젝트 디렉터리에서
+      // 리뷰하려고 워커를 띄웠다.
       if (isPermanentGithubTriggerFailure(prepared.error)) {
         input.logDebug?.(
           `[server-automation] ${automation.automationId} skipping permanently unavailable GitHub event`,
@@ -1245,12 +1465,24 @@ async function executeStartedRun(
           ...(degradedCode ? { degradedCode } : {}),
         }
       }
-      return {
-        outcome: 'ERROR', sessionId: null,
-        ...(degradedCode ? { degradedCode } : {}),
+      // 일시적 실패(디스크, 잠금 등)에서 AgentTask 는 이 시점에 서버가 task 를 이미
+      // 확정했다. 여기서 중단하면 그 task 는 워커 없이 lease 만료까지 남는다.
+      // worktree 는 리뷰 품질을 올려 주는 것이지 전제가 아니므로 프로젝트
+      // 디렉터리에서 계속한다 — 대상 SHA 테스트는 못 돌지만 리뷰 자체는 된다.
+      if (agentTaskDispatch) {
+        input.logDebug?.(
+          `[server-automation] ${automation.automationId} reviewing in the project directory instead`
+          + ' — the worker cannot run target-SHA tests there',
+        )
+      } else {
+        return {
+          outcome: 'ERROR', sessionId: null,
+          ...(degradedCode ? { degradedCode } : {}),
+        }
       }
+    } else {
+      githubWorktree = prepared
     }
-    githubWorktree = prepared
   }
   const initialPrompt = buildAutomationPrompt(prompt, scriptOutput)
   const spawnInput = {
@@ -1261,7 +1493,6 @@ async function executeStartedRun(
     ...(payload.model ? { model: payload.model } : {}),
     ...(payload.effort ? { effort: payload.effort } : {}),
     ...(agentTaskDispatch ? { filterInheritedCredentials: true } : {}),
-    ...(agentTaskDispatch?.type === 'pr_review.v1' ? { permissionMode: 'read-only' as const } : {}),
     ...(environmentVariables ? { environmentVariables } : {}),
     ...(spawnMcpContext ? { mcpSpawnContext: spawnMcpContext } : {}),
     ...(expectedConnectors && expectedConnectors.length > 0 ? { expectedConnectors } : {}),
@@ -1270,7 +1501,9 @@ async function executeStartedRun(
   let associateSpawnedSession = true
   if (agentTaskDispatch?.type === 'review_apply.v1'
       && agentTaskDispatch.targetSessionId
-      && environmentVariables) {
+      && environmentVariables
+      // worktree 를 준비했다면 사용자 디렉터리가 리뷰 대상 head 가 아니라는 뜻이다.
+      && !githubWorktree) {
     const resumed = await input.resumeSession({
       sessionId: agentTaskDispatch.targetSessionId,
       directory: payload.directory,
@@ -1438,7 +1671,7 @@ export async function runServerAutomationTick(
     }
     if (payload.githubTrigger && githubMode === 'work'
       && payload.githubTrigger.action !== 'notify'
-      && activeGithubWorkerSessions.size >= MAX_GITHUB_EVENTS_PER_TICK) {
+      && activeGithubWorkerSessions.size >= MAX_GITHUB_WORKER_SESSIONS) {
       scheduleNextTick(input, automation.automationId, now)
       continue
     }

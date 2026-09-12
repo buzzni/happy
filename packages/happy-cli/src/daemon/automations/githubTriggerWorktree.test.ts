@@ -64,9 +64,46 @@ describe('prepareGithubTriggerWorktree', () => {
     ])
   })
 
-  it('removes the prepared worktree and fails closed when checkout resolves a different head', async () => {
-    const actualHead = 'b'.repeat(40)
-    const runCommand = commandRunner(['/repo\n', '', '', `${actualHead}\n`, '', ''])
+  // 2026-09-10 프로덕션 — aplus#3650 은 PR 을 연 지 77초 만에 커밋을 하나 더 push
+  // 했다. 서버는 head=A 로 task 를 만들었고, 데몬이 16분 뒤 worktree 를 준비했을 땐
+  // 브랜치 tip 이 B 였다. 데몬은 "HEAD mismatch" 를 영구로 접어 이벤트를 소비했고,
+  // push 는 리뷰를 다시 걸지 않으므로 그 PR 은 영영 리뷰되지 않았다.
+  //
+  // 서버가 색인한 A 는 여전히 존재한다(B 의 조상). 브랜치 tip 이 아니라 A 를 체크아웃
+  // 하면 서버가 준비한 diff 색인과 정확히 맞는 리뷰가 된다 — 코멘트도 리뷰한 SHA 를
+  // 밝힌다. 리뷰 없음보다 훨씬 낫다.
+  it('pins the worktree to the reviewed head when the branch tip has moved on', async () => {
+    const movedTip = 'b'.repeat(40)
+    const runCommand = commandRunner(['/repo\n', '', '', `${movedTip}\n`, '', `${HEAD}\n`])
+
+    const result = await prepareGithubTriggerWorktree({
+      runId: 'run-2',
+      directory: '/repo',
+      managedRoot: '/happy/automation-worktrees',
+      pullRequest: { number: 12, expectedHeadSha: HEAD },
+      runCommand,
+      pathExists: vi.fn(async () => true),
+      resolveRealPath: vi.fn(async (path) => path),
+      ensureDirectory: vi.fn(async () => undefined),
+      onPlanned: vi.fn(),
+    })
+
+    expect(result).toMatchObject({ ok: true })
+    const commands = runCommand.mock.calls.map(([command]) => command)
+    expect(commands[4]).toMatchObject({ executable: 'git', args: ['checkout', '--detach', HEAD] })
+    expect(commands[5]).toMatchObject({ executable: 'git', args: ['rev-parse', 'HEAD'] })
+  })
+
+  // force-push 로 A 가 사라졌으면 색인한 스냅샷 자체가 없다 — 그때만 종전대로 접는다.
+  it('removes the prepared worktree and fails closed when the reviewed head is unreachable', async () => {
+    const movedTip = 'b'.repeat(40)
+    const outputs = ['/repo\n', '', '', `${movedTip}\n`]
+    const runCommand = vi.fn(async (command: GithubTriggerWorktreeCommand) => {
+      if (command.executable === 'git' && command.args[0] === 'checkout') {
+        return { ok: false as const, error: `fatal: reference is not a tree: ${HEAD}` }
+      }
+      return { ok: true as const, stdout: outputs.shift() ?? '' }
+    })
 
     const result = await prepareGithubTriggerWorktree({
       runId: 'run-2',
@@ -82,15 +119,32 @@ describe('prepareGithubTriggerWorktree', () => {
 
     expect(result).toEqual({
       ok: false,
-      error: `GitHub worktree HEAD mismatch: expected ${HEAD}, got ${actualHead}`,
+      error: `GitHub worktree HEAD mismatch: expected ${HEAD}, got ${movedTip}`,
       cleaned: true,
     })
-    expect(runCommand.mock.calls.at(-2)?.[0]).toMatchObject({
-      executable: 'git', args: ['status', '--porcelain', '--untracked-files=all'],
-    })
     expect(runCommand.mock.calls.at(-1)?.[0]).toMatchObject({
-      executable: 'git', args: ['worktree', 'remove', expect.any(String)], cwd: '/repo',
+      executable: 'git', args: ['worktree', 'remove', '--force', expect.any(String)], cwd: '/repo',
     })
+  })
+
+  // 체크아웃이 성공했다고 해도 실제 HEAD 가 다르면 믿지 않는다.
+  it('fails closed when the pin reports success but HEAD still differs', async () => {
+    const movedTip = 'b'.repeat(40)
+    const runCommand = commandRunner(['/repo\n', '', '', `${movedTip}\n`, '', `${movedTip}\n`, '', ''])
+
+    const result = await prepareGithubTriggerWorktree({
+      runId: 'run-2',
+      directory: '/repo',
+      managedRoot: '/happy/automation-worktrees',
+      pullRequest: { number: 12, expectedHeadSha: HEAD },
+      runCommand,
+      pathExists: vi.fn(async () => true),
+      resolveRealPath: vi.fn(async (path) => path),
+      ensureDirectory: vi.fn(async () => undefined),
+      onPlanned: vi.fn(),
+    })
+
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('HEAD mismatch') })
   })
 
   it('removes the worktree and fails closed when the monorepo project path is absent at the PR head', async () => {
@@ -115,7 +169,7 @@ describe('prepareGithubTriggerWorktree', () => {
       cleaned: true,
     })
     expect(runCommand.mock.calls.at(-1)?.[0]).toMatchObject({
-      executable: 'git', args: ['worktree', 'remove', expect.any(String)], cwd: '/repo',
+      executable: 'git', args: ['worktree', 'remove', '--force', expect.any(String)], cwd: '/repo',
     })
   })
 
@@ -207,7 +261,54 @@ describe('prepareGithubTriggerWorktree', () => {
   })
 })
 
+  // 2026-09-02 프로덕션 — 공유 .git/modules/vendor/happy/config 의 core.worktree 가
+  // 삭제된 자동화 worktree 를 가리켜 저장소의 모든 체크아웃에서 git 이 죽었다.
+  // worktree 를 만들기 전에 풀어야 한다 — 막힌 저장소에서는 worktree add 자체가
+  // 같은 오류로 실패한다.
+  it('releases dangling submodule worktree pointers before creating the worktree', async () => {
+    const order: string[] = []
+    const runCommand = vi.fn(async (command: { executable: string; args: string[] }) => {
+      order.push(`${command.executable} ${command.args.slice(0, 2).join(' ')}`)
+      return { ok: true as const, stdout: command.args[0] === 'rev-parse' ? '/repo\n' : '' }
+    })
+    const releaseSubmodulePointers = vi.fn(async () => {
+      order.push('release')
+      return { released: ['/repo/.git/modules/vendor/happy/config'] }
+    })
+
+    await prepareGithubTriggerWorktree({
+      runId: 'run-1',
+      directory: '/repo',
+      managedRoot: '/happy/automation-worktrees',
+      runCommand,
+      releaseSubmodulePointers,
+      pathExists: vi.fn(async () => true),
+      resolveRealPath: vi.fn(async (path: string) => path),
+      ensureDirectory: vi.fn(async () => undefined),
+      onPlanned: vi.fn(),
+    })
+
+    expect(releaseSubmodulePointers).toHaveBeenCalledWith({ repositoryRoot: '/repo' })
+    expect(order.indexOf('release')).toBeLessThan(order.indexOf('git worktree add'))
+  })
+
 describe('removeGithubTriggerWorktree', () => {
+  it('releases dangling submodule worktree pointers after removing the worktree', async () => {
+    const runCommand = vi.fn(async () => ({ ok: true as const, stdout: '' }))
+    const releaseSubmodulePointers = vi.fn(async () => ({ released: [] }))
+
+    const result = await removeGithubTriggerWorktree({
+      repositoryRoot: '/repo',
+      worktreePath: '/happy/automation-worktrees/abc',
+      runCommand,
+      releaseSubmodulePointers,
+      pathExists: vi.fn(async () => true),
+    })
+
+    expect(result).toEqual({ ok: true })
+    expect(releaseSubmodulePointers).toHaveBeenCalledWith({ repositoryRoot: '/repo' })
+  })
+
   it('treats an already absent worktree as cleaned without invoking git', async () => {
     const runCommand = commandRunner([])
 
@@ -222,6 +323,40 @@ describe('removeGithubTriggerWorktree', () => {
     expect(runCommand).not.toHaveBeenCalled()
   })
 
+  // 2026-09-04 프로덕션 — 정리가 `git status` 한 줄만 있어도 보존해 worktree 45개
+  // (23GB)가 쌓였다. 사유는 작업물이 아니라 에이전트 산출물과 서브모듈 gitlink 였다.
+  // 순수 함수만 덮으면 배선이 빠져도 통과하므로 정리 경로에서 고정한다.
+  it('removes a worktree whose only changes are agent scratch and the submodule gitlink', async () => {
+    const runCommand = commandRunner(['?? memory/\n M vendor/happy\n', ''])
+
+    const result = await removeGithubTriggerWorktree({
+      repositoryRoot: '/repo',
+      worktreePath: '/happy/automation-worktrees/run-1',
+      runCommand,
+      releaseSubmodulePointers: async () => ({ released: [] }),
+      pathExists: vi.fn(async () => true),
+    })
+
+    expect(result).toEqual({ ok: true })
+    expect(runCommand.mock.calls.map(([c]) => c.args.slice(0, 2))).toEqual([
+      ['status', '--porcelain'],
+      ['worktree', 'remove'],
+    ])
+  })
+
+  it('still preserves a worktree when a real change is mixed with scratch output', async () => {
+    const runCommand = commandRunner(['?? memory/\n M src/app.ts\n'])
+
+    const result = await removeGithubTriggerWorktree({
+      repositoryRoot: '/repo',
+      worktreePath: '/happy/automation-worktrees/run-1',
+      runCommand,
+      pathExists: vi.fn(async () => true),
+    })
+
+    expect(result).toMatchObject({ ok: false, dirty: true })
+  })
+
   it('preserves a dirty worktree without force removal', async () => {
     const runCommand = commandRunner([' M src/app.ts\n'])
 
@@ -232,8 +367,51 @@ describe('removeGithubTriggerWorktree', () => {
       pathExists: vi.fn(async () => true),
     })
 
-    expect(result).toEqual({ ok: false, dirty: true, error: 'GitHub automation worktree is dirty' })
+    // 2026-09-05 — "dirty" 만으로는 사람이 직접 git status 를 쳐야 했고, 그 사이
+    // 그 저장소의 리뷰 큐가 멈춰 있었다. 무엇이 막고 있는지 말한다.
+    expect(result).toEqual({
+      ok: false, dirty: true,
+      error: 'GitHub automation worktree is dirty (src/app.ts)',
+    })
     expect(runCommand).toHaveBeenCalledTimes(1)
+  })
+
+  // 2026-08-30 프로덕션 — 리뷰가 끝난 worktree 11개가 지워지지 않고 2.3GB 를 물고
+  // 앉아 있었다. 매분 재시도해 누적 1,192회 실패했다.
+  //   fatal: working trees containing submodules cannot be moved or removed
+  // 이 저장소는 vendor/happy 서브모듈을 갖고 있어 평범한 remove 가 항상 거부된다.
+  // 바로 앞의 dirty 검사가 이미 "잃을 것이 없다"를 보장하므로 --force 가 안전하다.
+  it('forces removal so a worktree containing submodules can be cleaned', async () => {
+    const runCommand = commandRunner(['', ''])
+
+    const result = await removeGithubTriggerWorktree({
+      repositoryRoot: '/repo',
+      worktreePath: '/happy/automation-worktrees/run-1',
+      runCommand,
+      pathExists: vi.fn(async () => true),
+    })
+
+    expect(result).toEqual({ ok: true })
+    const removeCall = runCommand.mock.calls
+      .map(([command]) => command)
+      .find((command) => command.args[0] === 'worktree')
+    expect(removeCall?.args).toEqual(['worktree', 'remove', '--force', '/happy/automation-worktrees/run-1'])
+  })
+
+  it('still refuses to force a dirty worktree', async () => {
+    // --force 는 서브모듈을 넘기 위한 것이지, 작업 중인 변경을 버리기 위한 것이
+    // 아니다. dirty 검사가 먼저 막아야 한다.
+    const runCommand = commandRunner([' M src/app.ts\n'])
+
+    const result = await removeGithubTriggerWorktree({
+      repositoryRoot: '/repo',
+      worktreePath: '/happy/automation-worktrees/run-1',
+      runCommand,
+      pathExists: vi.fn(async () => true),
+    })
+
+    expect(result).toMatchObject({ ok: false, dirty: true })
+    expect(runCommand.mock.calls.every(([c]) => c.args[0] !== 'worktree')).toBe(true)
   })
 })
 

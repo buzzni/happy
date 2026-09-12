@@ -8,6 +8,7 @@ import { projectMemberUpdate } from "@/app/project/projectMemberUpdate";
 import { projectMemberRemove } from "@/app/project/projectMemberRemove";
 import { projectMemberPending } from "@/app/project/projectMemberPending";
 import { ProjectError } from "@/app/project/types";
+import { emitProjectAutomationUpdate } from "@/app/automation/automationUpdate";
 
 const ProjectRoleSchema = z.enum(['owner', 'editor', 'viewer']);
 
@@ -94,6 +95,11 @@ export function projectMemberRoutes(app: Fastify) {
         if (!result.ok) {
             return reply.code(errorToStatus(result.error)).send({ error: result.error });
         }
+        await emitProjectAutomationUpdate(
+            projectId,
+            { projectId, reason: 'sync' },
+            request.userId,
+        );
         return reply.send({ member: result.value });
     });
 
@@ -112,6 +118,11 @@ export function projectMemberRoutes(app: Fastify) {
         if (!result.ok) {
             return reply.code(errorToStatus(result.error)).send({ error: result.error });
         }
+        await emitProjectAutomationUpdate(
+            projectId,
+            { projectId, reason: 'sync' },
+            request.userId,
+        );
         return reply.send({ success: true });
     });
 

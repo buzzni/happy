@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events'
 import { io, Socket } from 'socket.io-client'
 import { AgentState, ClientToServerEvents, FileEventMessage, FileEventMessageSchema, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
 import { decodeBase64, decryptBlob, decrypt, encodeBase64, encrypt, encryptBlob } from './encryption';
+import type { StreamDeltaFrame } from '@/claude/streamDeltaRelay';
 import { backoff, delay, isSessionGoneError } from '@/utils/time';
 import { configuration } from '@/configuration';
 import { RawJSONLines } from '@/claude/types';
@@ -23,6 +24,12 @@ import {
 import { InvalidateSync } from '@/utils/sync';
 import { notifyDaemonSessionRuntime } from '@/daemon/controlClient';
 import axios from 'axios';
+import {
+    ProviderUsageEventV1Schema,
+    type ProviderUsageEventV1,
+} from '@slopus/happy-wire';
+import { ClaudeTurnUsageTracker } from '@/usage/claudeTurnUsage';
+import { createClaudeTurnUsageEvent, createClaudeUsageEvent } from '@/usage/providerUsageAdapters';
 
 const DAEMON_RUNTIME_REPORT_MAX_INTERVAL_MS = 30_000;
 
@@ -95,6 +102,53 @@ type V3PostSessionMessagesResponse = {
         updatedAt: number;
     }>;
 };
+
+/**
+ * Outcome of waiting for one message to be durably acknowledged.
+ *
+ * `ok: false` means the acknowledgement was not observed — **not** that the
+ * message was lost. A 2xx whose body omits our row leaves durability unknown,
+ * and a caller must treat it as "do not proceed", never as "it is gone".
+ */
+export type MessageAckOutcome =
+    | { ok: true; id: string; seq: number }
+    | { ok: false; reason: 'deadline' | 'closed' | 'sync-failed' | 'contradictory-ack' };
+
+/**
+ * Whether a server row is a usable acknowledgement for `localId`.
+ *
+ * Exported for the exhaustive shape tests; kept in this file because the
+ * acknowledgement map that consumes it is a concern of this class and moving
+ * one predicate out would not give it a second owner.
+ */
+export function readMessageAck(
+    rows: unknown,
+    localId: string,
+): { ok: true; id: string; seq: number } | { ok: false; reason: 'absent' | 'contradictory-ack' } {
+    // The body is network input: the declared type is a hope, not a guarantee.
+    if (!Array.isArray(rows)) return { ok: false, reason: 'absent' };
+    const matches = rows.filter((row) => (
+        row !== null && typeof row === 'object'
+        && (row as { localId?: unknown }).localId === localId
+    )) as Array<{ id?: unknown; seq?: unknown }>;
+    if (matches.length === 0) return { ok: false, reason: 'absent' };
+
+    const usable = matches.filter((row) => (
+        typeof row.id === 'string' && row.id.length > 0
+        && typeof row.seq === 'number' && Number.isSafeInteger(row.seq) && row.seq > 0
+    )) as Array<{ id: string; seq: number }>;
+    // A malformed row alongside a well-formed one is not a clean answer: the
+    // server is describing our localId twice and we cannot tell which is ours.
+    // Picking the valid one would turn an inconsistent response into a
+    // confirmation.
+    if (usable.length !== matches.length) return { ok: false, reason: 'contradictory-ack' };
+
+    const first = usable[0]!;
+    if (usable.some((row) => row.id !== first.id || row.seq !== first.seq)) {
+        return { ok: false, reason: 'contradictory-ack' };
+    }
+    return { ok: true, id: first.id, seq: first.seq };
+}
 
 type AttachmentUploadResult = {
     ref: string;
@@ -234,6 +288,75 @@ function buildMultipartUploadBody(
     };
 }
 
+/**
+ * The managed relay contract, as the child must enforce it.
+ *
+ * `serverOrigin` is the exact origin every managed attachment URL must be on.
+ * A scoped bearer is only ever sent there, and never through a redirect.
+ */
+export type ManagedCredentialMode = {
+    serverOrigin: string;
+};
+
+/**
+ * Checks a URL the server handed back before a scoped bearer is sent to it.
+ *
+ * Exact origin, no credentials, and the path this session owns. A redirect is
+ * refused at the transport (`maxRedirects: 0`) rather than inspected, because a
+ * 302 is read after the request — and the request already carried the token.
+ */
+export function assertManagedAttachmentUrl(
+    raw: string,
+    managed: ManagedCredentialMode,
+    sessionId: string,
+): URL {
+    let parsed: URL;
+    try {
+        parsed = new URL(raw);
+    } catch {
+        throw new Error('managed attachment URL is not absolute');
+    }
+    if (parsed.origin !== managed.serverOrigin) {
+        throw new Error('managed attachment URL is not on the configured server origin');
+    }
+    if (parsed.username || parsed.password) {
+        throw new Error('managed attachment URL carries credentials');
+    }
+    const expected = `/v1/sessions/${encodeURIComponent(sessionId)}/attachments/`;
+    if (!parsed.pathname.startsWith(expected)) {
+        throw new Error('managed attachment URL is not under this session');
+    }
+    return parsed;
+}
+
+/**
+ * Requires the configured server and the managed relay origin to be the one
+ * origin, compared canonically.
+ *
+ * String equality on the raw values would call `https://relay.test` and
+ * `https://relay.test/` different, and `HTTPS://Relay.test` the same as
+ * nothing at all; `URL.origin` normalises scheme, host and port and drops
+ * everything that is not part of an origin.
+ */
+export function assertManagedServerOrigin(managed: ManagedCredentialMode): string {
+    let configured: string;
+    try {
+        configured = new URL(configuration.serverUrl).origin;
+    } catch {
+        throw new Error('managed mode requires an absolute server URL');
+    }
+    let expected: string;
+    try {
+        expected = new URL(managed.serverOrigin).origin;
+    } catch {
+        throw new Error('managed mode requires an absolute relay origin');
+    }
+    if (configured !== expected) {
+        throw new Error('managed relay origin does not match the configured server origin');
+    }
+    return expected;
+}
+
 export class ApiSessionClient extends EventEmitter {
     private readonly token: string;
     readonly sessionId: string;
@@ -264,6 +387,17 @@ export class ApiSessionClient extends EventEmitter {
     private encryptionKey: Uint8Array;
     private encryptionVariant: 'legacy' | 'dataKey';
     private reconnectInterval: NodeJS.Timeout | null = null;
+    /**
+     * close() 로 의도적으로 끝낸 세션인가.
+     *
+     * 2026-09-05 프로덕션 — 리뷰 워커가 turn 을 끝내고 정리까지 마쳤는데
+     * (sendSessionDeath → flush → close → client.disconnect → happyServer.stop)
+     * 프로세스가 2시간 11분 살아남았다. close() 의 socket.close() 가 'disconnect'
+     * 핸들러를 깨우고, 그 핸들러가 startSmartReconnect() 를 걸어 1초 뒤 소켓이 다시
+     * 붙는다. 살아있는 소켓이 이벤트 루프를 붙잡아 run-once 세션이 끝나지 못했고,
+     * 그 프로세스가 worktree 를 점유해 그 저장소의 리뷰 큐가 통째로 멈췄다.
+     */
+    private closed = false;
     private ignoreArchiveSignal = false;
     private syncFatalHandled = false;
     // Durable session-end event log baseline, captured on first connect.
@@ -292,6 +426,15 @@ export class ApiSessionClient extends EventEmitter {
     private runtimeProcessedSeqCap: number | null = null;
     private pendingOutbox: Array<{ content: string; localId: string }> = [];
     private readonly sendSync: InvalidateSync;
+    /**
+     * Callers waiting for a specific message to be acknowledged. Registered
+     * before the message is enqueued, because a flush can start immediately
+     * afterwards and a waiter added later would miss its own acknowledgement.
+     */
+    private readonly messageAckWaiters = new Map<string, {
+        settle: (outcome: MessageAckOutcome) => void;
+        timer: ReturnType<typeof setTimeout>;
+    }>();
     private readonly receiveSync: InvalidateSync;
     private receivePollInterval: NodeJS.Timeout | null = null;
     private currentThinking = false;
@@ -304,14 +447,50 @@ export class ApiSessionClient extends EventEmitter {
         pendingUserInput: boolean;
         reportedAt: number;
     } | null = null;
+    private daemonRuntimeReportSeq = 0;
     private currentMode: 'local' | 'remote' = 'remote';
     private lastUserInteractionAt: number | undefined;
     private lastTurnEndAt: number | undefined;
+    private assistantTurns = 0;
+    private providerTokens = 0;
+    private providerUsageEventIds = new Set<string>();
+    private readonly claudeTurnUsage = new ClaudeTurnUsageTracker();
+    private lastClaudeTurnResultUuid: string | null = null;
+    private inputObservedForNextTurn = false;
     private launchedBackgroundJob = false;
+    /**
+     * Set only when the caller says so.
+     *
+     * Never inferred from the shape of the token or the key: a mode guessed
+     * from a credential is a mode that changes when the credential format
+     * does, and this one decides whether redirects are followed.
+     */
+    private readonly managed: ManagedCredentialMode | null;
 
-    constructor(token: string, session: Session) {
+    /** The origin this client is allowed to talk to, when it is a managed one. */
+    getManagedOrigin(): string | null {
+        return this.managed?.serverOrigin ?? null;
+    }
+
+    constructor(token: string, session: Session, managed?: ManagedCredentialMode) {
         super()
         this.token = token;
+        // Before the socket, before the handlers, before anything is sent.
+        //
+        // Every request below is built from `configuration.serverUrl`, which
+        // is process-wide and not this client's to own. A managed client that
+        // accepted a mismatch would put its scoped bearer wherever that value
+        // points — including the socket, which the constructor opens — and no
+        // check after the fact can recall it. Agreement is required up front
+        // rather than assumed to hold in some later configuration.
+        //
+        // What is kept is the *canonical* origin, not the text that was
+        // handed in. `HTTPS://Relay.test:443/` names the same origin as
+        // `https://relay.test` and is accepted as such, so storing the raw
+        // spelling would then fail every `URL.origin` comparison against it —
+        // the client would admit itself and refuse the very server it was
+        // configured for.
+        this.managed = managed ? { serverOrigin: assertManagedServerOrigin(managed) } : null;
         this.sessionId = session.id;
         this.metadata = session.metadata;
         this.metadataVersion = session.metadataVersion;
@@ -335,14 +514,28 @@ export class ApiSessionClient extends EventEmitter {
         // Create socket
         //
 
-        this.socket = io(configuration.serverUrl, {
+        // The managed origin, where there is one: the constructor already
+        // refused to exist unless it matches the configured server, and the
+        // HTTP calls below already read it, so naming it here keeps the socket
+        // on the same axis instead of a second source that can drift.
+        this.socket = io(this.managed?.serverOrigin ?? configuration.serverUrl, {
             auth: {
                 token: this.token,
                 clientType: 'session-scoped' as const,
                 sessionId: this.sessionId,
                 happyClient: `cli-coding-session/${configuration.currentCliVersion}`
             },
-            path: '/v1/updates',
+            /*
+             * Two socket servers share the port: the ordinary one verifies
+             * account tokens, the managed one verifies scoped runner grants.
+             * A managed child carries a grant, so the ordinary path drops its
+             * token through to `auth.verifyToken` and rejects it — every three
+             * seconds, forever. The path is the server's wire format
+             * (`managedSocketPath.ts`), so this side is the one that matches
+             * it; it is written out here rather than imported because the
+             * server is not a dependency of this package.
+             */
+            path: this.managed ? '/v1/managed-updates' : '/v1/updates',
             reconnection: false,
             transports: ['websocket'],
             withCredentials: true,
@@ -523,12 +716,16 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private async requestAttachmentUpload(filename: string, size: number): Promise<AttachmentUploadResult> {
+        const base = this.managed ? this.managed.serverOrigin : configuration.serverUrl;
         const response = await axios.post<AttachmentUploadResult>(
-            `${configuration.serverUrl}/v1/sessions/${encodeURIComponent(this.sessionId)}/attachments/request-upload`,
+            `${base}/v1/sessions/${encodeURIComponent(this.sessionId)}/attachments/request-upload`,
             { filename, size },
             {
                 headers: this.authHeaders(),
                 timeout: 30000,
+                // Managed: a redirect would carry the bearer somewhere this
+                // client never agreed to send it.
+                ...(this.managed ? { maxRedirects: 0 } : {}),
             },
         );
 
@@ -542,10 +739,17 @@ export class ApiSessionClient extends EventEmitter {
             throw new Error('request-upload returned an invalid response');
         }
 
-        return {
-            ...upload,
-            method: upload.method ?? 'PUT',
-        };
+        const method = upload.method ?? 'PUT';
+        if (this.managed) {
+            // The relay contract: this server, this session, a plain PUT. A
+            // presigned POST would carry its own authority to another origin.
+            if (method !== 'PUT') {
+                throw new Error('managed upload must be a PUT to the relay');
+            }
+            assertManagedAttachmentUrl(upload.uploadUrl, this.managed, this.sessionId);
+        }
+
+        return { ...upload, method };
     }
 
     private async uploadEncryptedAttachmentBlob(upload: AttachmentUploadResult, encrypted: Uint8Array): Promise<void> {
@@ -564,7 +768,10 @@ export class ApiSessionClient extends EventEmitter {
         const headers: Record<string, string> = {
             'Content-Type': 'application/octet-stream',
         };
-        if (upload.uploadUrl.startsWith(configuration.serverUrl)) {
+        if (this.managed) {
+            assertManagedAttachmentUrl(upload.uploadUrl, this.managed, this.sessionId);
+            headers.Authorization = `Bearer ${this.token}`;
+        } else if (upload.uploadUrl.startsWith(configuration.serverUrl)) {
             headers.Authorization = `Bearer ${this.token}`;
         }
 
@@ -572,6 +779,7 @@ export class ApiSessionClient extends EventEmitter {
             headers,
             timeout: 60000,
             maxBodyLength: 10 * 1024 * 1024,
+            ...(this.managed ? { maxRedirects: 0 } : {}),
         });
     }
 
@@ -600,13 +808,17 @@ export class ApiSessionClient extends EventEmitter {
      * presigned URL that does not accept extra headers.
      */
     async downloadAttachment(ref: string): Promise<Uint8Array> {
-        const requestUrl = `${configuration.serverUrl}/v1/sessions/${this.sessionId}/attachments/request-download`;
+        const base = this.managed ? this.managed.serverOrigin : configuration.serverUrl;
+        const requestUrl = `${base}/v1/sessions/${this.sessionId}/attachments/request-download`;
         const requestRes = await axios.post(
             requestUrl,
             { ref },
             {
                 headers: { 'Authorization': `Bearer ${this.token}`, 'Content-Type': 'application/json' },
                 timeout: 30000,
+                // Both metadata calls, not only the blob transfers: a redirect
+                // on this one carries the bearer just as far.
+                ...(this.managed ? { maxRedirects: 0 } : {}),
             },
         );
         const downloadUrl = requestRes.data?.downloadUrl;
@@ -614,16 +826,19 @@ export class ApiSessionClient extends EventEmitter {
             throw new Error('request-download returned no downloadUrl');
         }
 
-        const isServerUrl = downloadUrl.startsWith(configuration.serverUrl);
         const headers: Record<string, string> = {};
-        if (isServerUrl) {
+        if (this.managed) {
+            assertManagedAttachmentUrl(downloadUrl, this.managed, this.sessionId);
+            headers['Authorization'] = `Bearer ${this.token}`;
+        } else if (downloadUrl.startsWith(configuration.serverUrl)) {
             headers['Authorization'] = `Bearer ${this.token}`;
         }
         const response = await axios.get(downloadUrl, {
             headers,
             responseType: 'arraybuffer',
             timeout: 60000,
-            maxRedirects: 5,
+            // BYOS follows a presigned redirect; managed never does.
+            maxRedirects: this.managed ? 0 : 5,
             maxContentLength: 10 * 1024 * 1024,
         });
         return new Uint8Array(response.data);
@@ -675,6 +890,11 @@ export class ApiSessionClient extends EventEmitter {
     private routeIncomingMessage(message: unknown) {
         const userResult = UserMessageSchema.safeParse(message);
         if (userResult.success) {
+            this.inputObservedForNextTurn = true;
+            if (userResult.data.meta?.sentFrom !== 'daemon') {
+                this.lastUserInteractionAt = Date.now();
+            }
+            this.reportDaemonRuntime(this.currentThinking, true);
             if (this.pendingMessageCallback) {
                 this.pendingMessageCallback(userResult.data);
             } else {
@@ -817,6 +1037,8 @@ export class ApiSessionClient extends EventEmitter {
             return;
         }
         this.syncFatalHandled = true;
+        // Nothing will be flushed after this, so no acknowledgement can arrive.
+        this.settleAllMessageAcks('sync-failed');
         // A sync 404/410 is NOT proof the session row is gone: happy-server
         // returns the identical 404 for "row deleted" and "row exists under
         // another account" (2026-07-23 incident — the session was alive, the
@@ -954,6 +1176,64 @@ export class ApiSessionClient extends EventEmitter {
             ), this.lastSeq);
             this.lastSeq = maxSeq;
             this.pendingOutbox.splice(0, batch.length);
+            // Resolution rides the existing flush rather than a second POST, so
+            // ordering against everything already queued is unchanged. Only the
+            // localIds this batch actually carried are considered: a response
+            // naming anything else must not confirm a message that has not been
+            // sent yet.
+            this.resolveMessageAcks(messages, new Set(batch.map((item) => item.localId)));
+        }
+    }
+
+    /**
+     * Waits for one enqueued message to be acknowledged by the server.
+     *
+     * Register before enqueuing. The returned promise always resolves: an
+     * unobserved acknowledgement is an outcome, not an exception, and a
+     * rejected promise nobody awaited would surface as an unhandled rejection.
+     */
+    awaitMessageAck(localId: string, deadlineMs: number): Promise<MessageAckOutcome> {
+        if (this.messageAckWaiters.has(localId)) {
+            throw new Error(`message ack waiter already registered for ${localId}`);
+        }
+        return new Promise<MessageAckOutcome>((resolve) => {
+            const settle = (outcome: MessageAckOutcome) => {
+                const entry = this.messageAckWaiters.get(localId);
+                if (!entry) return;
+                this.messageAckWaiters.delete(localId);
+                clearTimeout(entry.timer);
+                resolve(outcome);
+            };
+            const timer = setTimeout(() => settle({ ok: false, reason: 'deadline' }), deadlineMs);
+            timer.unref?.();
+            this.messageAckWaiters.set(localId, { settle, timer });
+            // Registering after the session already died would otherwise wait
+            // for a flush that will never run.
+            if (this.closed) settle({ ok: false, reason: 'closed' });
+            else if (this.syncFatalHandled) settle({ ok: false, reason: 'sync-failed' });
+        });
+    }
+
+    private resolveMessageAcks(
+        rows: ReadonlyArray<{ id: string; seq: number; localId: string | null }>,
+        sentLocalIds: ReadonlySet<string>,
+    ): void {
+        if (this.messageAckWaiters.size === 0) return;
+        for (const localId of [...this.messageAckWaiters.keys()]) {
+            if (!sentLocalIds.has(localId)) continue;
+            const ack = readMessageAck(rows, localId);
+            // `absent` is not a verdict: this batch simply did not carry it,
+            // and a later batch or the deadline decides.
+            if (ack.ok) this.messageAckWaiters.get(localId)?.settle(ack);
+            else if (ack.reason === 'contradictory-ack') {
+                this.messageAckWaiters.get(localId)?.settle({ ok: false, reason: 'contradictory-ack' });
+            }
+        }
+    }
+
+    private settleAllMessageAcks(reason: 'closed' | 'sync-failed'): void {
+        for (const localId of [...this.messageAckWaiters.keys()]) {
+            this.messageAckWaiters.get(localId)?.settle({ ok: false, reason });
         }
     }
 
@@ -987,6 +1267,31 @@ export class ApiSessionClient extends EventEmitter {
     private applyClaudeSessionMessageSideEffects(body: RawJSONLines) {
         // Track usage from assistant messages
         if (body.type === 'assistant' && body.message?.usage) {
+            try {
+                const rawMessage = body.message as { id?: unknown; model?: unknown };
+                const rawTimestamp = (body as { timestamp?: unknown }).timestamp;
+                const parsedTimestamp = typeof rawTimestamp === 'string'
+                    ? Date.parse(rawTimestamp)
+                    : rawTimestamp;
+                const occurredAt = typeof parsedTimestamp === 'number' && Number.isFinite(parsedTimestamp)
+                    ? Math.floor(parsedTimestamp)
+                    : Date.now();
+                this.sendProviderUsageEvent(createClaudeUsageEvent({
+                    sessionId: this.sessionId,
+                    occurredAt,
+                    messageId: typeof rawMessage.id === 'string' ? rawMessage.id : null,
+                    transcriptUuid: body.uuid,
+                    model: typeof rawMessage.model === 'string' ? rawMessage.model : null,
+                    usage: body.message.usage,
+                }));
+                this.claudeTurnUsage.noteAssistant({
+                    usage: body.message.usage,
+                    model: typeof rawMessage.model === 'string' ? rawMessage.model : null,
+                });
+            } catch (error) {
+                logger.warn('[SOCKET] Failed to normalize provider usage data:', error);
+            }
+
             try {
                 this.sendUsageData(body.message.usage, body.message.model);
             } catch (error) {
@@ -1209,6 +1514,20 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     /**
+     * Relay one coalesced slice of streaming assistant text. Volatile on
+     * purpose: a dropped frame costs nothing because the persisted assistant
+     * message that follows is authoritative, and the consumer detects the gap
+     * via `seq`.
+     */
+    sendStreamDelta(frame: StreamDeltaFrame) {
+        this.socket.volatile.emit('session-stream', {
+            sid: this.sessionId,
+            time: Date.now(),
+            data: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, frame)),
+        });
+    }
+
+    /**
      * Send a ping message to keep the connection alive
      */
     keepAlive(thinking: boolean, mode: 'local' | 'remote') {
@@ -1254,9 +1573,11 @@ export class ApiSessionClient extends EventEmitter {
         // the user just answered. The daemon idle guard uses this to protect
         // sessions the user touched recently, without conflating it with
         // keep-alive liveness.
-        if ((daemonThinking && !prev?.thinking) || (prev?.pendingUserInput === true && !pendingUserInput)) {
+        if ((daemonThinking && !prev?.thinking && !this.inputObservedForNextTurn)
+            || (prev?.pendingUserInput === true && !pendingUserInput)) {
             this.lastUserInteractionAt = now;
         }
+        if (daemonThinking && !prev?.thinking) this.inputObservedForNextTurn = false;
 
         // Stamp a turn-end timestamp when the agent goes from busy to fully idle
         // (finished a turn, now waiting on the user). This marks a safe point to
@@ -1265,6 +1586,7 @@ export class ApiSessionClient extends EventEmitter {
         const nowIdle = !daemonThinking && !hasOpenToolCall && !pendingUserInput;
         if (prevBusy && nowIdle) {
             this.lastTurnEndAt = now;
+            this.assistantTurns += 1;
         }
 
         if (!force && prev
@@ -1282,11 +1604,14 @@ export class ApiSessionClient extends EventEmitter {
             reportedAt: now
         };
         void notifyDaemonSessionRuntime(this.sessionId, {
+            reportSeq: ++this.daemonRuntimeReportSeq,
             thinking: daemonThinking,
             hasOpenToolCall,
             pendingUserInput,
             ...(this.lastUserInteractionAt !== undefined ? { lastUserInteractionAt: this.lastUserInteractionAt } : {}),
             ...(this.lastTurnEndAt !== undefined ? { lastTurnEndAt: this.lastTurnEndAt } : {}),
+            ...(this.assistantTurns > 0 ? { assistantTurns: this.assistantTurns } : {}),
+            ...(this.providerTokens > 0 ? { providerTokens: this.providerTokens } : {}),
             ...(this.launchedBackgroundJob ? { launchedBackgroundJob: true } : {}),
             // Resume skip-baseline: the last seq delivered to the agent loop.
             // Without it the daemon falls back to the server-head seq, which
@@ -1306,6 +1631,43 @@ export class ApiSessionClient extends EventEmitter {
     /**
      * Send usage data to the server
      */
+    /**
+     * 턴 종료 result 메시지. Z.AI 호환 경로처럼 assistant usage 가 0 으로 온 턴은 result 의
+     * 토큰으로 한 번 보정한다 (src/usage/claudeTurnUsage.ts). 이미 계량된 턴은 건드리지 않는다.
+     */
+    applyClaudeTurnResult(result: {
+        uuid?: unknown;
+        usage?: unknown;
+        modelUsage?: unknown;
+    }) {
+        // 같은 result 가 두 번 전달돼도(SDK 재전달) 한 턴은 한 번만 본다.
+        if (typeof result.uuid === 'string' && result.uuid === this.lastClaudeTurnResultUuid) return;
+        if (typeof result.uuid === 'string') this.lastClaudeTurnResultUuid = result.uuid;
+        const usage = result.usage && typeof result.usage === 'object' ? result.usage as Usage : null;
+        const modelUsage = result.modelUsage && typeof result.modelUsage === 'object'
+            ? result.modelUsage as Record<string, { inputTokens?: number; outputTokens?: number }>
+            : null;
+        const fallback = this.claudeTurnUsage.resolveResult({ usage, modelUsage });
+        if (!fallback || typeof result.uuid !== 'string' || !result.uuid.trim()) return;
+        try {
+            this.sendProviderUsageEvent(createClaudeTurnUsageEvent({
+                sessionId: this.sessionId,
+                occurredAt: Date.now(),
+                resultUuid: result.uuid,
+                model: fallback.model,
+                usage: fallback.usage,
+            }));
+        } catch (error) {
+            logger.warn('[SOCKET] Failed to normalize turn usage data:', error);
+            return;
+        }
+        try {
+            this.sendUsageData(fallback.usage, fallback.model ?? undefined);
+        } catch (error) {
+            logger.debug('[SOCKET] Failed to send turn usage data:', error);
+        }
+    }
+
     sendUsageData(usage: Usage, model?: string) {
         // Calculate total tokens
         const totalTokens = usage.input_tokens + usage.output_tokens + (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0);
@@ -1331,6 +1693,16 @@ export class ApiSessionClient extends EventEmitter {
         }
         logger.debugLargeJson('[SOCKET] Sending usage data:', usageReport)
         this.socket.emit('usage-report', usageReport);
+    }
+
+    sendProviderUsageEvent(event: ProviderUsageEventV1) {
+        const parsed = ProviderUsageEventV1Schema.parse(event);
+        this.socket.emit('provider-usage-report', parsed);
+        if (!this.providerUsageEventIds.has(parsed.sourceEventId)) {
+            this.providerUsageEventIds.add(parsed.sourceEventId);
+            this.providerTokens += parsed.tokens.total;
+            this.reportDaemonRuntime(this.currentThinking, true);
+        }
     }
 
     /**
@@ -1454,6 +1826,9 @@ export class ApiSessionClient extends EventEmitter {
 
     async close() {
         logger.debug('[API] socket.close() called');
+        // socket.close() 가 부를 disconnect 핸들러보다 먼저 세운다.
+        this.closed = true;
+        this.settleAllMessageAcks('closed');
         this.sendSync.stop();
         this.receiveSync.stop();
         this.stopReceivePolling();
@@ -1465,6 +1840,10 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private startSmartReconnect() {
+        if (this.closed) {
+            logger.debug('[API] Session closed — not reconnecting');
+            return;
+        }
         if (this.reconnectInterval) return;
 
         this.reconnectInterval = setInterval(() => {
@@ -1483,7 +1862,11 @@ export class ApiSessionClient extends EventEmitter {
 
         if (shouldReconnect()) {
             logger.debug('[API] Network up + lid open — reconnecting in 1s');
-            setTimeout(() => { if (!this.socket.connected) this.socket.connect() }, 1000);
+            // 이 타이머가 뜨는 사이 close() 가 들어올 수 있다.
+            setTimeout(() => {
+                if (this.closed) return;
+                if (!this.socket.connected) this.socket.connect();
+            }, 1000);
         }
     }
 }

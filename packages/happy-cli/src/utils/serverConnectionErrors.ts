@@ -244,15 +244,100 @@ export function startOfflineReconnection<TSession>(
 // Connection State - Simple state machine for offline status with deduplication
 // ============================================================================
 
-/** All network error codes that trigger offline mode */
+/**
+ * Transport failures treated as "the server is unreachable", so callers degrade
+ * to offline mode and retry later instead of propagating the error. Codes that
+ * no classification helper recognises bubble up as unexpected failures — on the
+ * daemon's startup path that means a FATAL exit, so a transient blip would take
+ * the whole process down.
+ *
+ * These are the codes safe enough for callers that are *not* idempotent. Most
+ * are connection-establishment failures, which prove the request never reached
+ * the server:
+ *
+ *   ECONNREFUSED ENOTFOUND EAI_AGAIN EHOSTUNREACH ENETUNREACH ENETDOWN
+ *   EHOSTDOWN EADDRNOTAVAIL
+ *
+ * Two members are weaker than that and are kept here for compatibility with
+ * long-standing behaviour rather than because they satisfy the invariant:
+ * `ECONNRESET` and `ETIMEDOUT` can both occur on an already-established
+ * connection *after* the server committed a write — a proxy recycling a worker,
+ * or a read timeout on a request that did land. Do not add new codes with that
+ * property; put them in AMBIGUOUS_DELIVERY_ERROR_CODES instead.
+ */
 export const NETWORK_ERROR_CODES = [
-    'ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT',
-    'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH'
+    // Connection never established
+    'ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH',
+    // Interface/route torn out from under us — laptop sleep, VPN toggle
+    'ENETDOWN', 'EHOSTDOWN', 'EADDRNOTAVAIL',
+    // Temporary DNS failure — resolver reachable but no answer yet
+    'EAI_AGAIN',
+    // Weaker members, kept for compatibility — see the note above
+    'ECONNRESET', 'ETIMEDOUT'
 ] as const;
 
-/** Check if error code indicates server unreachable */
+/**
+ * Failures where no reply arrived but the server may well have processed the
+ * request anyway.
+ *
+ * `ECONNABORTED` is axios' *client-side* `timeout` expiry: the socket usually
+ * connected fine and the server simply did not answer within the deadline — it
+ * may still have committed the write. `ERR_NETWORK` is axios' own "request
+ * failed without a response", which by definition says nothing about whether
+ * the request landed. `EPIPE` means the peer closed while we were writing,
+ * which is usually a benign keep-alive race but can also follow a completed,
+ * committed request.
+ *
+ * Only treat these as "offline" for operations that are idempotent. For a
+ * request that mints new state — a fresh session encryption key, say —
+ * assuming failure and retrying can strand state the server already persisted.
+ * See `isConnectivityError`.
+ */
+export const AMBIGUOUS_DELIVERY_ERROR_CODES = [
+    'ECONNABORTED', 'ERR_NETWORK', 'EPIPE'
+] as const;
+
+/**
+ * Check if the code means the server was unreachable and the request had no
+ * effect. Safe for any caller, including ones that are not idempotent.
+ */
 export function isNetworkError(code: string | undefined): boolean {
     return code !== undefined && (NETWORK_ERROR_CODES as readonly string[]).includes(code);
+}
+
+/** Check if the code leaves it unknown whether the server processed the request. */
+export function isAmbiguousDeliveryError(code: string | undefined): boolean {
+    return code !== undefined && (AMBIGUOUS_DELIVERY_ERROR_CODES as readonly string[]).includes(code);
+}
+
+/**
+ * Check if the code is any lost-connectivity failure, whether or not the
+ * request may have landed. Use this for idempotent operations, where retrying
+ * a request the server already applied costs nothing — it is the widest net and
+ * so the one that best keeps a long-lived process alive.
+ */
+export function isConnectivityError(code: string | undefined): boolean {
+    return isNetworkError(code) || isAmbiguousDeliveryError(code);
+}
+
+/**
+ * Pull a transport error code off an unknown thrown value.
+ *
+ * Transport failures do not always arrive as an AxiosError: they can surface as
+ * a plain Error carrying `code`, or be wrapped with the real failure on
+ * `cause`. Reading only `error.code` off an AxiosError misses both, and a
+ * missed code is a crash rather than a graceful degradation.
+ */
+export function connectionErrorCode(error: unknown): string | undefined {
+    if (!error || typeof error !== 'object') return undefined;
+    const direct = (error as { code?: unknown }).code;
+    if (typeof direct === 'string') return direct;
+    const cause = (error as { cause?: unknown }).cause;
+    if (cause && typeof cause === 'object') {
+        const causeCode = (cause as { code?: unknown }).code;
+        if (typeof causeCode === 'string') return causeCode;
+    }
+    return undefined;
 }
 
 /** Maps error codes to human-readable descriptions - exported for discoverability */
@@ -264,10 +349,18 @@ export const ERROR_DESCRIPTIONS: Record<string, string> = {
     ECONNRESET: 'connection reset by server',
     EHOSTUNREACH: 'server host unreachable',
     ENETUNREACH: 'network unreachable',
+    ENETDOWN: 'local network is down',
+    EHOSTDOWN: 'server host is down',
+    EADDRNOTAVAIL: 'no local address available for the connection',
+    EPIPE: 'connection closed while sending request',
+    EAI_AGAIN: 'temporary DNS resolution failure',
+    ERR_NETWORK: 'network request failed without a response',
+    ECONNABORTED: 'request timed out waiting for the server',
     // HTTP errors
     '401': 'authentication failed - run `happy auth`',
     '403': 'access forbidden',
     '404': 'endpoint not found, check server deployment',
+    '429': 'rate limited by the server',
     '500': 'server internal error',
     '502': 'bad gateway',
     '503': 'service unavailable',
