@@ -240,11 +240,13 @@ export const ApiEphemeralStreamUpdateSchema = z.object({
     data: z.string(),
 });
 
+export const SESSION_STREAM_DELTA_MAX_CHARS = 2_048;
+
 export const ApiSessionStreamDeltaSchema = z.object({
     messageId: z.string().min(1),
     index: z.number().int().nonnegative(),
     offset: z.number().int().nonnegative(),
-    delta: z.string(),
+    delta: z.string().max(SESSION_STREAM_DELTA_MAX_CHARS),
     final: z.boolean(),
 });
 
