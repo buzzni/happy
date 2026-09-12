@@ -1,11 +1,28 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+    hasTunnel,
+    deliverDaemonData,
+    applyRemoteData,
+    _resetPreviewTunnelsForTest,
+} from '@/modules/preview/previewWsTunnels';
+import { describe as _describe } from 'vitest';
 import {
     parsePreviewUpgradeRequest,
     parsePreviewUpgradeUrl,
     openPreviewWsTunnel,
+    createTunnelCandidateHooks,
+    recheckOpenTunnelBinding,
+    armTunnelRevocation,
     serializeUpgradeRequest,
     stripPreviewAuthCookie,
+    PreviewWsOpenError,
+    BOUND_WS_OPEN_EVENT,
+    VIEWER_BOUND_WS_OPEN_EVENT,
+    WS_BINDING_RECHECK_MS,
+    WS_RECHECK_DEADLINE_MS,
+    wsOpenFailureStatus,
 } from '@/modules/preview/previewWebSocketRelay';
+void _describe;
 
 describe('parsePreviewUpgradeUrl', () => {
     it('parses machineId, port, subPath, and query', () => {
@@ -35,10 +52,47 @@ describe('parsePreviewUpgradeUrl', () => {
     });
 });
 
+/**
+ * The open attempt now owns one pending tunnel per candidate daemon: it
+ * registers it before emitting, approves it only on an ack that proves the
+ * binding was enforced, and abandons it — telling that daemon to close —
+ * in every other case, including the ones where no ack ever arrives.
+ */
+function candidateHooks(options: { cancelled?: () => boolean; approve?: () => boolean } = {}) {
+    const begun: string[] = [];
+    const approved: Array<[string, string]> = [];
+    const abandoned: string[] = [];
+    let n = 0;
+    return {
+        begun,
+        approved,
+        abandoned,
+        hooks: {
+            begin: (daemonSocketId: string) => {
+                const id = `tunnel-${(n += 1)}-${daemonSocketId}`;
+                begun.push(id);
+                return id;
+            },
+            approve: (tunnelId: string, daemonSocketId: string) => {
+                approved.push([tunnelId, daemonSocketId]);
+                return options.approve ? options.approve() : true;
+            },
+            abandon: (tunnelId: string, socket: { emit: (event: string, payload: unknown) => unknown }) => {
+                abandoned.push(tunnelId);
+                socket.emit('proxy-ws-close', { tunnelId });
+            },
+            cancelled: options.cancelled ?? (() => false),
+        },
+    };
+}
+
+const OPEN_PAYLOAD = { port: 40002, dataB64: '' };
+
 describe('openPreviewWsTunnel', () => {
     it('falls back to another live daemon socket when the first one is stale', async () => {
         const socket = (id: string, response: unknown) => ({
             id,
+            emit: vi.fn(),
             timeout: () => ({ emitWithAck: async () => {
                 if (response instanceof Error) throw response;
                 return response;
@@ -46,12 +100,262 @@ describe('openPreviewWsTunnel', () => {
         });
         const stale = socket('stale', new Error('timeout'));
         const fresh = socket('fresh', { ok: true });
+        const { hooks } = candidateHooks();
+
+        const opened = await openPreviewWsTunnel([stale, fresh], OPEN_PAYLOAD, hooks, 10);
+
+        expect(opened.socket).toBe(fresh);
+    });
+
+    it('gives each candidate its own tunnel id', async () => {
+        // One id shared across candidates means the daemon that lost the race
+        // can still write into the tunnel the winner is serving.
+        const refusing = { id: 'a', emit: vi.fn(), timeout: () => ({ emitWithAck: async () => ({ ok: false }) }) };
+        const accepting = { id: 'b', emit: vi.fn(), timeout: () => ({ emitWithAck: async () => ({ ok: true }) }) };
+        const probe = candidateHooks();
+
+        const opened = await openPreviewWsTunnel([refusing, accepting], OPEN_PAYLOAD, probe.hooks, 10);
+
+        expect(probe.begun).toHaveLength(2);
+        expect(new Set(probe.begun).size).toBe(2);
+        expect(opened.tunnelId).toBe(probe.begun[1]);
+    });
+
+    it('carries the runtime binding to the daemon on its own event', async () => {
+        // Same reason as the HTTP relay: a daemon predating runtime binding
+        // has no listener for this event, so it never writes the upgrade
+        // request to whatever is on that port. The approval buffer only stops
+        // the *answer* from reaching the browser — by then the handshake and
+        // the first bytes have already been delivered upstream.
+        const emitWithAck = vi.fn(async () => ({ ok: true, bindingEnforced: true }));
+        const daemon = { id: 'd1', emit: vi.fn(), timeout: () => ({ emitWithAck }) };
+        const binding = { projectId: 'proj-1', leaseId: 'lease-1', workspacePaths: ['/srv/a'] };
+        const probe = candidateHooks();
+
+        await openPreviewWsTunnel([daemon], { ...OPEN_PAYLOAD, binding }, probe.hooks, 10, true);
+
+        expect(emitWithAck).toHaveBeenCalledWith(BOUND_WS_OPEN_EVENT, {
+            tunnelId: probe.begun[0],
+            ...OPEN_PAYLOAD,
+            binding,
+        });
+    });
+
+    it('never reaches an old daemon at all with a bound upgrade', async () => {
+        // The old daemon answers `proxy-ws-open` and nothing else, so the
+        // bound event times out: no ack, and no upstream touched.
+        const handled: string[] = [];
+        const old = {
+            id: 'old',
+            emit: vi.fn(),
+            timeout: (ms: number) => ({
+                emitWithAck: async (event: string) => {
+                    if (event !== 'proxy-ws-open') {
+                        await new Promise((resolve) => setTimeout(resolve, ms));
+                        throw new Error('operation has timed out');
+                    }
+                    handled.push(event);
+                    return { ok: true };
+                },
+            }),
+        };
+        const probe = candidateHooks();
 
         await expect(openPreviewWsTunnel(
-            [stale, fresh],
-            { tunnelId: 'tunnel-1', port: 40002, dataB64: '' },
+            [old],
+            { ...OPEN_PAYLOAD, binding: { projectId: 'p', leaseId: 'l', workspacePaths: [] } },
+            probe.hooks,
+            20,
+            true,
+        )).rejects.toThrow();
+
+        expect(handled).toEqual([]);
+        expect(probe.approved).toEqual([]);
+    });
+
+    it('keeps the legacy unbound upgrade on the original event', async () => {
+        const emitWithAck = vi.fn(async () => ({ ok: true }));
+        const daemon = { id: 'd1', emit: vi.fn(), timeout: () => ({ emitWithAck }) };
+        const probe = candidateHooks();
+
+        await openPreviewWsTunnel([daemon], OPEN_PAYLOAD, probe.hooks, 10);
+
+        expect(emitWithAck).toHaveBeenCalledWith('proxy-ws-open', {
+            tunnelId: probe.begun[0],
+            ...OPEN_PAYLOAD,
+        });
+    });
+
+    it('never approves a tunnel a daemon opened without enforcing the binding', async () => {
+        const old = { id: 'old', emit: vi.fn(), timeout: () => ({ emitWithAck: async () => ({ ok: true }) }) };
+        const probe = candidateHooks();
+
+        await expect(openPreviewWsTunnel(
+            [old],
+            { ...OPEN_PAYLOAD, binding: { projectId: 'p', leaseId: 'l', workspacePaths: [] } },
+            probe.hooks,
             10,
-        )).resolves.toBe(fresh);
+            true,
+        )).rejects.toBeInstanceOf(PreviewWsOpenError);
+
+        expect(probe.approved).toEqual([]);
+        expect(probe.abandoned).toEqual(probe.begun);
+        expect(old.emit).toHaveBeenCalledWith('proxy-ws-close', { tunnelId: probe.begun[0] });
+    });
+
+    it('tells a daemon to close the tunnel it opened after we stopped waiting', async () => {
+        // P2: the open deadline can pass while the daemon is still queueing.
+        // If it connects afterwards, nothing on the server knows about that
+        // tunnel any more — no expiry timer, no recheck — so the cancellation
+        // has to reach the daemon rather than only the local registry.
+        const slow = {
+            id: 'slow',
+            emit: vi.fn(),
+            timeout: (ms: number) => ({
+                emitWithAck: async () => {
+                    await new Promise((resolve) => setTimeout(resolve, ms));
+                    throw new Error('operation has timed out');
+                },
+            }),
+        };
+        const probe = candidateHooks();
+
+        await expect(openPreviewWsTunnel([slow], OPEN_PAYLOAD, probe.hooks, 20)).rejects.toThrow();
+
+        expect(slow.emit).toHaveBeenCalledWith('proxy-ws-close', { tunnelId: probe.begun[0] });
+    });
+
+    it('abandons an ack that arrives after the browser has gone', async () => {
+        // The browser leaves mid-open. The ack still comes back "ok", and the
+        // daemon is holding an upstream connection for a tunnel nobody will
+        // ever read — it has to be told.
+        let gone = false;
+        const daemon = {
+            id: 'd1',
+            emit: vi.fn(),
+            timeout: () => ({ emitWithAck: async () => { gone = true; return { ok: true }; } }),
+        };
+        const probe = candidateHooks({ cancelled: () => gone });
+
+        await expect(openPreviewWsTunnel([daemon], OPEN_PAYLOAD, probe.hooks, 10)).rejects.toThrow();
+
+        expect(probe.approved).toEqual([]);
+        expect(daemon.emit).toHaveBeenCalledWith('proxy-ws-close', { tunnelId: probe.begun[0] });
+    });
+
+    it('abandons a tunnel the registry refuses to approve', async () => {
+        const daemon = { id: 'd1', emit: vi.fn(), timeout: () => ({ emitWithAck: async () => ({ ok: true }) }) };
+        const probe = candidateHooks({ approve: () => false });
+
+        await expect(openPreviewWsTunnel([daemon], OPEN_PAYLOAD, probe.hooks, 10)).rejects.toThrow();
+
+        expect(probe.abandoned).toEqual(probe.begun);
+    });
+
+    it('carries the daemon refusal code out, not just its prose', async () => {
+        const daemon = {
+            id: 'd1',
+            emit: vi.fn(),
+            timeout: () => ({
+                emitWithAck: async () => ({
+                    ok: false,
+                    code: 'LEASE_MISMATCH',
+                    message: 'The runtime serving this port is not the one the token was issued for',
+                }),
+            }),
+        };
+        await expect(openPreviewWsTunnel([daemon], OPEN_PAYLOAD, candidateHooks().hooks, 10))
+            .rejects.toMatchObject({ code: 'LEASE_MISMATCH' });
+    });
+
+    it('spends one budget across every candidate daemon instead of one each', async () => {
+        const attempted: string[] = [];
+        const hanging = (id: string) => ({
+            id,
+            emit: vi.fn(),
+            timeout: (ms: number) => ({
+                emitWithAck: async () => {
+                    attempted.push(id);
+                    await new Promise((resolve) => setTimeout(resolve, ms));
+                    throw new Error('operation has timed out');
+                },
+            }),
+        });
+
+        await expect(openPreviewWsTunnel(
+            [hanging('a'), hanging('b'), hanging('c')],
+            OPEN_PAYLOAD,
+            candidateHooks().hooks,
+            40,
+        )).rejects.toThrow();
+
+        expect(attempted.length).toBeLessThan(3);
+    });
+});
+
+describe('recheckOpenTunnelBinding', () => {
+    // A tunnel makes exactly one request — the upgrade — and then lives for
+    // hours. Everything the HTTP relay re-checks per request has to be
+    // re-checked here on a timer, or the upgrade path becomes the way to hold
+    // access that was taken away.
+    const BIND = { projectId: 'proj-1', studioUserId: 'studio-1', leaseId: 'lease-1' };
+    const base = {
+        bind: BIND,
+        machineId: 'machine-1',
+        port: 3000,
+        sockets: [],
+    };
+    const allowing = (workspacePaths: string[] = ['/srv/a']) => ({
+        authorize: vi.fn().mockResolvedValue({ kind: 'allowed', workspacePaths }),
+    });
+
+    it('keeps a tunnel whose project access and runtime are both unchanged', async () => {
+        const requestLease = vi.fn().mockResolvedValue({ type: 'success', leaseId: 'lease-1', evidenceKind: 'container' });
+        await expect(recheckOpenTunnelBinding({
+            ...base,
+            authorizer: allowing() as never,
+            requestLease,
+        })).resolves.toEqual({ ok: true });
+        expect(requestLease).toHaveBeenCalledWith(
+            [],
+            { projectId: 'proj-1', port: 3000, workspacePaths: ['/srv/a'] },
+            // The lease inherits whatever is left of the recheck budget.
+            expect.any(Number),
+        );
+    });
+
+    it('drops a tunnel once the studio revokes project access', async () => {
+        await expect(recheckOpenTunnelBinding({
+            ...base,
+            authorizer: { authorize: vi.fn().mockResolvedValue({ kind: 'denied' }) } as never,
+            requestLease: vi.fn(),
+        })).resolves.toMatchObject({ ok: false });
+    });
+
+    it('drops a tunnel when the runtime behind the port was replaced', async () => {
+        const requestLease = vi.fn().mockResolvedValue({ type: 'success', leaseId: 'lease-2', evidenceKind: 'container' });
+        await expect(recheckOpenTunnelBinding({
+            ...base,
+            authorizer: allowing() as never,
+            requestLease,
+        })).resolves.toEqual({ ok: false, reason: 'LEASE_MISMATCH' });
+    });
+
+    it('drops a tunnel when the daemon can no longer prove the runtime', async () => {
+        const requestLease = vi.fn().mockResolvedValue({ type: 'error', code: 'NO_LISTENER', message: 'gone' });
+        await expect(recheckOpenTunnelBinding({
+            ...base,
+            authorizer: allowing() as never,
+            requestLease,
+        })).resolves.toEqual({ ok: false, reason: 'NO_LISTENER' });
+    });
+
+    it('drops a tunnel when the studio cannot answer under the required policy', async () => {
+        await expect(recheckOpenTunnelBinding({
+            ...base,
+            authorizer: { authorize: vi.fn().mockResolvedValue({ kind: 'unavailable', reason: 'down' }) } as never,
+            requestLease: vi.fn(),
+        })).resolves.toMatchObject({ ok: false });
     });
 });
 
@@ -132,5 +436,379 @@ describe('serializeUpgradeRequest', () => {
         const text = bytes.toString('utf-8');
 
         expect(text).not.toContain('Origin:');
+    });
+});
+
+describe('recheckOpenTunnelBinding — deadline', () => {
+    it('gives up within its deadline when the studio never answers', async () => {
+        // Without this the tunnel's termination guarantee would be "the
+        // recheck interval plus however long the callback feels like taking".
+        const started = Date.now();
+        await expect(recheckOpenTunnelBinding({
+            bind: { projectId: 'p', studioUserId: 's', leaseId: 'l' },
+            machineId: 'm',
+            port: 3000,
+            authorizer: { authorize: () => new Promise(() => { /* never answers */ }) } as never,
+            sockets: [],
+            deadlineMs: 30,
+        })).resolves.toMatchObject({ ok: false });
+        expect(Date.now() - started).toBeLessThan(2_000);
+    });
+});
+
+describe('armTunnelRevocation', () => {
+    const BIND = { projectId: 'proj-1', studioUserId: 'studio-1', leaseId: 'lease-1' };
+
+    function daemon(id = 'accepting-daemon') {
+        return { id, emit: vi.fn(), timeout: () => ({ emitWithAck: async () => ({}) }) };
+    }
+
+    function arm(overrides: Record<string, unknown> = {}) {
+        const revoke = vi.fn();
+        const recheck = vi.fn().mockResolvedValue({ ok: true });
+        const accepting = daemon();
+        const stop = armTunnelRevocation({
+            tunnelId: 't-1',
+            bind: BIND,
+            machineId: 'machine-1',
+            port: 3000,
+            expiresAt: Date.now() + 60 * 60_000,
+            daemon: accepting,
+            isOpen: () => true,
+            revoke,
+            recheck: recheck as never,
+            ...overrides,
+        });
+        return { stop, revoke, recheck, accepting };
+    }
+
+    beforeEach(() => {
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('rechecks against the daemon that actually accepted the upgrade', async () => {
+        // Re-resolving the machine's sockets would let a *different* daemon
+        // answer for a tunnel it is not carrying, and its answer would say
+        // nothing about the runtime this tunnel is attached to.
+        const { stop, recheck, accepting } = arm();
+
+        await vi.advanceTimersByTimeAsync(WS_BINDING_RECHECK_MS);
+
+        expect(recheck).toHaveBeenCalledWith(expect.objectContaining({ sockets: [accepting] }));
+        stop();
+    });
+
+    it('revokes when the token expires even while every recheck passes', async () => {
+        const { stop, revoke } = arm({ expiresAt: Date.now() + 5_000 });
+
+        await vi.advanceTimersByTimeAsync(5_001);
+
+        expect(revoke).toHaveBeenCalledWith('token-expired');
+        stop();
+    });
+
+    it('never runs two rechecks at once', async () => {
+        // A slow callback must not stack one check per interval on top of it.
+        let release: (() => void) | null = null;
+        const recheck = vi.fn(() => new Promise((resolve) => {
+            release = () => resolve({ ok: true });
+        }));
+        const { stop } = arm({ recheck });
+
+        await vi.advanceTimersByTimeAsync(WS_BINDING_RECHECK_MS * 3);
+        expect(recheck).toHaveBeenCalledTimes(1);
+
+        release!();
+        await vi.advanceTimersByTimeAsync(WS_BINDING_RECHECK_MS);
+        expect(recheck).toHaveBeenCalledTimes(2);
+        stop();
+    });
+
+    it('revokes and stops rechecking once the binding no longer holds', async () => {
+        const recheck = vi.fn().mockResolvedValue({ ok: false, reason: 'LEASE_MISMATCH' });
+        const { revoke } = arm({ recheck });
+
+        await vi.advanceTimersByTimeAsync(WS_BINDING_RECHECK_MS);
+        expect(revoke).toHaveBeenCalledWith('LEASE_MISMATCH');
+
+        await vi.advanceTimersByTimeAsync(WS_BINDING_RECHECK_MS * 3);
+        expect(recheck).toHaveBeenCalledTimes(1);
+    });
+
+    it('terminates within one interval plus one deadline in the worst case', () => {
+        // The contract the operator can rely on. Not "instant revocation",
+        // and not an unbounded wait either.
+        expect(WS_BINDING_RECHECK_MS + WS_RECHECK_DEADLINE_MS).toBeLessThanOrEqual(60_000);
+    });
+
+    it('stops every timer when the tunnel closes, and cannot revoke afterwards', async () => {
+        let release: ((value: unknown) => void) | null = null;
+        const recheck = vi.fn(() => new Promise((resolve) => { release = resolve; }));
+        const { stop, revoke } = arm({ recheck, expiresAt: Date.now() + WS_BINDING_RECHECK_MS * 10 });
+
+        await vi.advanceTimersByTimeAsync(WS_BINDING_RECHECK_MS);
+        stop();
+        // A check that was already in flight resolves against a closed tunnel.
+        release!({ ok: false, reason: 'LEASE_MISMATCH' });
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(revoke).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('stops rechecking a tunnel that is already gone', async () => {
+        const { revoke, recheck } = arm({ isOpen: () => false });
+
+        await vi.advanceTimersByTimeAsync(WS_BINDING_RECHECK_MS * 2);
+
+        expect(recheck).not.toHaveBeenCalled();
+        expect(revoke).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+    });
+});
+
+describe('wsOpenFailureStatus', () => {
+    // The upgrade never becomes a WebSocket, so this status is the only thing
+    // the browser and the operator get. It has to say the same thing the HTTP
+    // relay says about the same daemon answer.
+    it('answers a saturated runtime probe with a retryable 503', () => {
+        expect(wsOpenFailureStatus('EVIDENCE_BUSY')).toBe(503);
+    });
+
+    it('answers a stale lease with 401 so the page can re-mint', () => {
+        expect(wsOpenFailureStatus('LEASE_MISMATCH')).toBe(401);
+    });
+
+    it('answers an ownership refusal with 403', () => {
+        for (const code of ['PROJECT_OWNERSHIP_MISMATCH', 'PORT_PROJECT_MISMATCH', 'WORKSPACE_UNVERIFIED']) {
+            expect(wsOpenFailureStatus(code)).toBe(403);
+        }
+    });
+
+    it('leaves everything else at 502', () => {
+        expect(wsOpenFailureStatus('TIMEOUT')).toBe(502);
+        expect(wsOpenFailureStatus('NO_LISTENER')).toBe(502);
+        expect(wsOpenFailureStatus(null)).toBe(502);
+    });
+
+    // specs/runtime-isolation-hardening (H3 viewer purpose) — same
+    // 404/403/409 as mint (describeLeaseFailure) and the HTTP relay
+    // (describePreviewRelayFailure), not the 502 fallback above.
+    it('answers a viewer key with no lease with 404, consistent with mint and the HTTP relay', () => {
+        expect(wsOpenFailureStatus('VIEWER_UNKNOWN')).toBe(404);
+    });
+
+    it('answers a proven viewer port or runtime mismatch with 403, consistent with mint and the HTTP relay', () => {
+        expect(wsOpenFailureStatus('VIEWER_PORT_MISMATCH')).toBe(403);
+        expect(wsOpenFailureStatus('VIEWER_RUNTIME_MISMATCH')).toBe(403);
+    });
+
+    it('answers unsupported broker evidence with 409, consistent with mint and the HTTP relay', () => {
+        expect(wsOpenFailureStatus('VIEWER_EVIDENCE_UNSUPPORTED')).toBe(409);
+    });
+});
+
+describe('createTunnelCandidateHooks', () => {
+    function browserSocket() {
+        return {
+            writable: true,
+            written: [] as string[],
+            write(buf: Buffer) { this.written.push(buf.toString()); return true; },
+            end() { /* unused */ },
+            destroy() { /* unused */ },
+        };
+    }
+
+    beforeEach(() => _resetPreviewTunnelsForTest());
+
+    it('gives every candidate its own tunnel id', () => {
+        // A shared id lets the daemon that lost the race write into the
+        // tunnel the winner is serving.
+        const hooks = createTunnelCandidateHooks({
+            browserSocket: browserSocket() as never,
+            bound: true,
+            cancelled: () => false,
+        });
+
+        const first = hooks.begin('daemon-1');
+        const second = hooks.begin('daemon-2');
+
+        expect(first).not.toBe(second);
+        expect(hasTunnel(first)).toBe(true);
+        expect(hasTunnel(second)).toBe(true);
+    });
+
+    it('registers the tunnel closed, so nothing is delivered before approval', () => {
+        const socket = browserSocket();
+        const hooks = createTunnelCandidateHooks({
+            browserSocket: socket as never,
+            bound: true,
+            cancelled: () => false,
+        });
+        const tunnelId = hooks.begin('daemon-1');
+
+        deliverDaemonData(tunnelId, Buffer.from('early').toString('base64'), vi.fn(), 'daemon-1');
+        expect(socket.written).toEqual([]);
+
+        expect(hooks.approve(tunnelId, 'daemon-1')).toBe(true);
+        expect(socket.written).toEqual(['early']);
+    });
+
+    it('tells the daemon to close the upstream it may still be opening', () => {
+        // The whole point of P2: dropping our own registry entry leaves the
+        // daemon connecting into a tunnel nothing will ever read or close.
+        const hooks = createTunnelCandidateHooks({
+            browserSocket: browserSocket() as never,
+            bound: true,
+            cancelled: () => false,
+        });
+        const tunnelId = hooks.begin('daemon-1');
+        const machineSocket = { id: 'daemon-1', emit: vi.fn(), timeout: () => ({ emitWithAck: async () => ({}) }) };
+
+        hooks.abandon(tunnelId, machineSocket);
+
+        expect(hasTunnel(tunnelId)).toBe(false);
+        expect(machineSocket.emit).toHaveBeenCalledWith('proxy-ws-close', { tunnelId });
+    });
+
+    it('marks a bound tunnel bound, so a sender-less relayed frame is refused', () => {
+        // The flag is what makes the same-daemon pin strict for bound
+        // tunnels; a hook that always registered them unbound would leave the
+        // pin bypassable by any older peer replica.
+        const socket = browserSocket();
+        const hooks = createTunnelCandidateHooks({
+            browserSocket: socket as never,
+            bound: true,
+            cancelled: () => false,
+        });
+        const tunnelId = hooks.begin('daemon-1');
+        hooks.approve(tunnelId, 'daemon-1');
+
+        applyRemoteData({ tunnelId, dataB64: Buffer.from('no-sender').toString('base64') } as never);
+
+        expect(socket.written).toEqual([]);
+    });
+
+    it('marks an unbound tunnel unbound, keeping mixed-version delivery working', () => {
+        const socket = browserSocket();
+        const hooks = createTunnelCandidateHooks({
+            browserSocket: socket as never,
+            bound: false,
+            cancelled: () => false,
+        });
+        const tunnelId = hooks.begin('daemon-1');
+        hooks.approve(tunnelId, 'daemon-1');
+
+        applyRemoteData({ tunnelId, dataB64: Buffer.from('legacy').toString('base64') } as never);
+
+        expect(socket.written).toEqual(['legacy']);
+    });
+});
+
+// specs/runtime-isolation-hardening (H3 viewer purpose) — noVNC 는 WS 로만
+// 픽셀이 흐른다. 업그레이드가 목적 결속을 빠져나가면 뷰어 결속 전체가
+// HTTP 한 번에만 걸린 장식이 된다.
+describe('viewer purpose over the WS upgrade', () => {
+    const VIEWER_KEY = 'bv1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+    const viewerBinding = { purpose: 'viewer' as const, viewerKey: VIEWER_KEY, leaseId: 'viewer-lease-1' };
+    const viewerBind = {
+        purpose: 'viewer' as const,
+        studioUserId: 'studio-1',
+        viewerKey: VIEWER_KEY,
+        leaseId: 'viewer-lease-1',
+    };
+
+    it('opens a viewer tunnel on its own event, never the project one', async () => {
+        const emitWithAck = vi.fn(async () => ({ ok: true, bindingEnforced: true }));
+        const daemon = { id: 'd1', emit: vi.fn(), timeout: () => ({ emitWithAck }) };
+        const probe = candidateHooks();
+
+        await openPreviewWsTunnel([daemon], { ...OPEN_PAYLOAD, binding: viewerBinding }, probe.hooks, 10, true);
+
+        expect(emitWithAck).toHaveBeenCalledWith(VIEWER_BOUND_WS_OPEN_EVENT, {
+            tunnelId: probe.begun[0],
+            ...OPEN_PAYLOAD,
+            binding: viewerBinding,
+        });
+    });
+
+    // 구 daemon 은 이 이벤트 handler 가 없다 — 업스트림 연결 자체가 없어야 한다.
+    it('never opens against a daemon that has no viewer handler', async () => {
+        const emitWithAck = vi.fn(async () => { throw new Error('operation has timed out'); });
+        const daemon = { id: 'd1', emit: vi.fn(), timeout: () => ({ emitWithAck }) };
+        const probe = candidateHooks();
+
+        await expect(openPreviewWsTunnel(
+            [daemon], { ...OPEN_PAYLOAD, binding: viewerBinding }, probe.hooks, 10, true,
+        )).rejects.toThrow();
+        expect(probe.approved).toEqual([]);
+    });
+
+    it('rechecks an open viewer tunnel by key, and drops it once the studio stops recognising it', async () => {
+        const requestLease = vi.fn(async () => ({ type: 'success' as const, leaseId: 'viewer-lease-1', evidenceKind: 'viewer-native' }));
+        const authorizer = {
+            authorize: vi.fn(async () => ({ kind: 'allowed' as const, workspacePaths: [], viewerKey: VIEWER_KEY })),
+        };
+
+        await expect(recheckOpenTunnelBinding({
+            bind: viewerBind,
+            machineId: 'm1',
+            port: 6080,
+            authorizer,
+            sockets: [],
+            requestViewerLease: requestLease,
+        })).resolves.toEqual({ ok: true });
+        expect(authorizer.authorize).toHaveBeenCalledWith(expect.objectContaining({
+            purpose: 'viewer', viewerKey: VIEWER_KEY, studioUserId: 'studio-1',
+        }));
+        expect(requestLease).toHaveBeenCalledWith([], { viewerKey: VIEWER_KEY, port: 6080 }, expect.any(Number));
+
+        const denied = {
+            authorize: vi.fn(async () => ({ kind: 'denied' as const })),
+        };
+        await expect(recheckOpenTunnelBinding({
+            bind: viewerBind,
+            machineId: 'm1',
+            port: 6080,
+            authorizer: denied,
+            sockets: [],
+            requestViewerLease: requestLease,
+        })).resolves.toMatchObject({ ok: false });
+    });
+
+    it('drops an open viewer tunnel when the runtime behind the key changed', async () => {
+        const requestLease = vi.fn(async () => ({ type: 'success' as const, leaseId: 'viewer-lease-2', evidenceKind: 'viewer-native' }));
+        const authorizer = {
+            authorize: vi.fn(async () => ({ kind: 'allowed' as const, workspacePaths: [], viewerKey: VIEWER_KEY })),
+        };
+
+        await expect(recheckOpenTunnelBinding({
+            bind: viewerBind,
+            machineId: 'm1',
+            port: 6080,
+            authorizer,
+            sockets: [],
+            requestViewerLease: requestLease,
+        })).resolves.toEqual({ ok: false, reason: 'LEASE_MISMATCH' });
+    });
+
+    // 뷰어 재검사가 프로젝트 lease 이벤트를 타면 구 daemon 이 응답해 버린다.
+    it('never asks the project lease event for a viewer tunnel', async () => {
+        const projectLease = vi.fn();
+        const viewerLease = vi.fn(async () => ({ type: 'success' as const, leaseId: 'viewer-lease-1', evidenceKind: 'viewer-native' }));
+        await recheckOpenTunnelBinding({
+            bind: viewerBind,
+            machineId: 'm1',
+            port: 6080,
+            authorizer: { authorize: vi.fn(async () => ({ kind: 'allowed' as const, workspacePaths: [], viewerKey: VIEWER_KEY })) },
+            sockets: [],
+            requestLease: projectLease as never,
+            requestViewerLease: viewerLease,
+        });
+        expect(projectLease).not.toHaveBeenCalled();
     });
 });

@@ -4,6 +4,7 @@ import { Session } from "./session";
 import { Future } from "@/utils/future";
 import { createSessionScanner } from "./utils/sessionScanner";
 import type { SaycodePromptBlockOverrides } from "@/prompt/promptProvenance";
+import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
 
 export type LauncherResult = { type: 'switch' } | { type: 'exit', code: number };
 
@@ -130,6 +131,7 @@ export async function claudeLocalLauncher(
                     saycodePromptBlocks: options.saycodePromptBlocks,
                     hookSettingsPath: session.hookSettingsPath,
                     sandboxConfig: session.sandboxConfig,
+                    sandboxPolicyMode: session.sandboxPolicyMode,
                 });
 
                 // Consume one-time Claude flags after spawn
@@ -146,6 +148,15 @@ export async function claudeLocalLauncher(
                 }
             } catch (e) {
                 logger.debug('[local]: launch error', e);
+                // 격리 필수 머신의 거절은 재시도 대상이 아니다. 아래 일반 오류
+                // 경로는 `continue` 로 다시 띄우므로, 여기서 끊지 않으면 격리를
+                // 세울 수 없는 머신에서 무한 재기동이 된다.
+                if (e instanceof MandatorySandboxError) {
+                    session.client.sendSessionEvent({ type: 'message', message: e.message });
+                    session.client.closeClaudeSessionTurn('failed');
+                    exitReason = { type: 'exit', code: 1 };
+                    break;
+                }
                 // If Claude exited with non-zero exit code, propagate it
                 if (e instanceof ExitCodeError) {
                     if (exitReason) {

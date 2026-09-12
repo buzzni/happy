@@ -1,9 +1,17 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createServer } from 'node:http'
+import { once } from 'node:events'
+import { exchangeAutomationMcpCallerGrant } from './automationMcpCallerGrant'
+import { preflightAutomationConnectors } from './automationConnectorPreflight'
+import { readExpectedConnectors } from '@/aplus/fetchAplusMcpServers'
+import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance'
+import { buildClaudeSystemPromptOptions } from '@/claude/claudePrompt'
 
 import {
   MAX_GITHUB_WORKER_SESSIONS,
   runServerAutomationTick,
   type ServerAutomationExecutorInput,
+  DIRTY_WORKTREE_WARN_AFTER_ATTEMPTS,
 } from './serverAutomationExecutor'
 
 // 상한을 상수에서 끌어와 만든다. 개수를 하드코딩하면 상한을 올릴 때 테스트가
@@ -162,6 +170,191 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     prepareGithubWorktree, discardGithubWorktree, now,
   }
 }
+
+// #3556: daemon/run.ts와 동일하게 실제 exchange/preflight를 연결한다.
+// 외부 HTTP 응답과 세션 spawn만 fixture이며, fetch/SDK initialize/tools/list는 mock하지 않는다.
+describe('예약 자동화 커넥터 실제 HTTP 경로 (#3556)', () => {
+  afterEach(() => vi.unstubAllEnvs())
+
+  async function runWithConnectorGateway(
+    mode: 'ready' | 'missing' | 'auth' | 'empty' | 'config-error',
+    agent: 'claude' | 'codex' = 'claude',
+  ) {
+    for (const key of [
+      'HAPPY_APLUS_EXPECTED_CONNECTORS', 'HAPPY_APLUS_EXPECTED_MCP_SERVICES',
+      'HAPPY_BROWSER_VIEWER_SCOPE_REQUIRED', 'HAPPY_BROWSER_VIEWER_KEY',
+    ]) vi.stubEnv(key, undefined)
+    const fixture = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    const payload = fixture.decryptPayload(cacheRecord(), new Uint8Array(32))
+    fixture.input.decryptPayload = () => ({ ...payload, agent })
+    const requests: Array<{ path: string; method?: string; authorization?: string; grant?: string; body: any }> = []
+    const providers = ['gmail', 'google-drive']
+    let baseUrl = ''
+    const server = createServer((req, res) => {
+      void (async () => {
+        const chunks: Buffer[] = []
+        for await (const chunk of req) chunks.push(Buffer.from(chunk))
+        const raw = Buffer.concat(chunks).toString()
+        const body = raw ? JSON.parse(raw) : null
+        const path = new URL(req.url!, baseUrl).pathname
+        requests.push({
+          path, method: req.method, body,
+          authorization: req.headers.authorization,
+          grant: req.headers['x-aplus-caller-grant'] as string | undefined,
+        })
+        const json = (status: number, value: unknown) => {
+          res.writeHead(status, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(value))
+        }
+        if (path === '/api/automation/mcp-caller-grant') {
+          json(200, {
+            grant: 'LOCAL-SIGNED-GRANT', expiresAt: Date.now() + 120_000,
+            projectId: 'P-1', bindingStatus: 'BOUND',
+            connectorPolicy: 'required', requiredConnectors: providers,
+          })
+          return
+        }
+        if (path === '/api/me/mcp-config') {
+          if (mode === 'config-error') return json(400, { error: 'bad config request' })
+          json(200, {
+            mcpServers: Object.fromEntries((mode === 'missing' ? ['google-drive'] : providers).map((name) => [name, {
+              type: 'http', url: `${baseUrl}/mcp/connector/${name}`,
+              headers: { Authorization: `Bearer LOCAL-CAPABILITY-${name}` },
+            }])),
+            connectorReadiness: { expected: providers },
+          })
+          return
+        }
+        if (!providers.some((name) => path === `/mcp/connector/${name}`)) {
+          return json(404, { error: 'unexpected fixture path' })
+        }
+        if (mode === 'auth' && path.endsWith('/gmail')) return json(401, { error: 'expired' })
+        if (req.method !== 'POST') {
+          res.writeHead(405).end()
+          return
+        }
+        if (body.method === 'initialize') {
+          return json(200, {
+            jsonrpc: '2.0', id: body.id,
+            result: {
+              protocolVersion: body.params.protocolVersion,
+              capabilities: { tools: {} }, serverInfo: { name: 'local-connector-fixture', version: '1.0.0' },
+            },
+          })
+        }
+        if (body.method === 'notifications/initialized') {
+          res.writeHead(202).end()
+          return
+        }
+        if (body.method === 'tools/list') {
+          return json(200, {
+            jsonrpc: '2.0', id: body.id,
+            result: { tools: mode === 'empty' && path.endsWith('/gmail') ? [] : [{
+              name: path.endsWith('/gmail') ? 'gmail_search_messages' : 'drive_list_files',
+              inputSchema: { type: 'object', properties: {} },
+            }] },
+          })
+        }
+        json(400, { error: 'unexpected MCP request' })
+      })().catch((error) => {
+        res.writeHead(500).end(String(error))
+      })
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('local gateway did not bind TCP')
+    baseUrl = `http://127.0.0.1:${address.port}`
+    const connection = { configUrl: `${baseUrl}/api/me/mcp-config`, machineToken: 'LOCAL-MACHINE-TOKEN', machineId: 'M-1' }
+    fixture.input.resolveMcpSpawnContext = (run) => exchangeAutomationMcpCallerGrant({ ...connection, ...run })
+    fixture.input.preflightMcpConnectors = (input) => preflightAutomationConnectors({ ...connection, ...input })
+    try {
+      const result = await runServerAutomationTick(fixture.input)
+      return { ...fixture, result, requests }
+    } finally {
+      const closed = new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      server.closeAllConnections()
+      await closed
+    }
+  }
+
+  it('실제 grant 교환과 Gmail·Drive initialize/tools/list를 통과한 뒤 세션에 연결 문맥을 전달한다', async () => {
+    const { result, requests, spawnSession, transport } = await runWithConnectorGateway('ready')
+    expect(result).toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
+    expect(requests[0]).toMatchObject({
+      path: '/api/automation/mcp-caller-grant', method: 'POST', authorization: 'Bearer LOCAL-MACHINE-TOKEN',
+      body: { machineId: 'M-1', runId: 'run-1', claimToken: 'claim-token' },
+    })
+    expect(requests.find((request) => request.path === '/api/me/mcp-config')).toMatchObject({
+      method: 'GET', authorization: 'Bearer LOCAL-MACHINE-TOKEN', grant: 'LOCAL-SIGNED-GRANT',
+    })
+    for (const provider of ['gmail', 'google-drive']) {
+      expect(requests.filter((request) => request.path === `/mcp/connector/${provider}` && request.method === 'POST')
+        .map((request) => request.body.method)).toEqual(['initialize', 'notifications/initialized', 'tools/list'])
+      expect(requests.find((request) => request.path === `/mcp/connector/${provider}`))
+        .toMatchObject({ authorization: `Bearer LOCAL-CAPABILITY-${provider}` })
+    }
+    expect(spawnSession).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      expectedConnectors: ['gmail', 'google-drive'],
+      mcpSpawnContext: expect.objectContaining({ mcpCallerGrant: 'LOCAL-SIGNED-GRANT', mcpConfigProjectId: 'P-1' }),
+    }))
+    expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({ status: 'COMPLETED', outcome: 'WOKE' }))
+  })
+
+  it.each([
+    ['missing', 'CONNECTOR_CONFIG_MISSING'],
+    ['auth', 'CONNECTOR_AUTH_REQUIRED'],
+    ['empty', 'TOOL_INVENTORY_EMPTY'],
+    ['config-error', 'CONFIG_UNAVAILABLE'],
+  ] as const)('%s 응답을 실제 함수로 판별하고 %s로 보고하며 spawn을 차단한다', async (mode, failureCode) => {
+    const { result, spawnSession, transport, requests } = await runWithConnectorGateway(mode)
+    expect(result).toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }])
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'FAILED', outcome: 'ERROR', failureCode, sessionId: null,
+    }))
+    if (mode === 'empty') {
+      expect(requests.some((request) => request.path.endsWith('/gmail') && request.body?.method === 'tools/list')).toBe(true)
+    }
+  })
+
+  it.each([undefined, false])('별도 Claude 시스템 지침 생성기는 연결된 서비스의 탐색 안내를 유지한다 (Saycode prompt=%s)', async (enabled) => {
+    const { result } = await runWithConnectorGateway('ready')
+    expect(result).toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
+    // claudeRemote.ts가 쓰는 실제 생성 함수 조합을 검사한다. LLM 실행 자체는 아니다.
+    const services = listExpectedMcpServices({
+      expectedConnectors: readExpectedConnectors(), expectedMcpServices: [], configuredServerNames: [],
+    })
+    expect(services).toEqual(['gmail', 'google-drive'])
+    const options = buildClaudeSystemPromptOptions({
+      saycodeSystemPrompt: '', saycodeSystemPromptEnabled: enabled,
+      connectorGuidance: buildConnectorToolGuidance(services),
+    })
+    expect(options.appendSystemPrompt).toContain('gmail, google-drive')
+    expect(options.appendSystemPrompt).toContain('perform deferred MCP tool discovery')
+    expect(options.appendSystemPrompt).toContain('same-named claude.ai connector is a different integration')
+    expect(options.appendSystemPrompt).toContain('Do not recommend claude.ai connector reauthorization')
+  })
+
+  it.each(['claude', 'codex'] as const)('%s 예약 자동화 initialPrompt에 커넥터 진단·재연동 판단 지침을 전달한다 (#3556 재현)', async (agent) => {
+    const { spawnSession, result } = await runWithConnectorGateway('ready', agent)
+    expect(result).toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
+    expect(spawnSession).toHaveBeenCalledOnce()
+    const prompt = spawnSession.mock.calls[0]![0].initialPrompt
+    expect(prompt.startsWith('## 예약 자동화 진단 지침\n')).toBe(true)
+    expect(prompt.match(/## 예약 자동화 진단 지침/g)).toHaveLength(1)
+    for (const label of ['연동 판단', '고장 판단', '사용자 요구', '보고', '안전']) {
+      expect(prompt).toContain(`[${label}]`)
+    }
+    expect(prompt).toContain('현재 세션의 도구 목록만으로 미연동을 단정하지')
+    expect(prompt).toContain('실제 도구 탐색·호출')
+    expect(prompt).toContain('재연동·설정 변경')
+    expect(prompt.endsWith('\n\nprompt')).toBe(true)
+    expect(spawnSession.mock.calls[0]![0].agent).toBe(agent)
+  })
+})
 
 describe('runServerAutomationTick', () => {
   afterEach(() => vi.useRealTimers())
@@ -633,6 +826,7 @@ describe('runServerAutomationTick', () => {
       environmentVariables: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
     }))
     expect(store.state().githubTriggers?.[0]?.state.processed).toContain('10:opened')
+    expect(spawnSession.mock.calls[0]![0].initialPrompt).not.toContain('## 예약 자동화 진단 지침')
     expect(createGithubIssueProgressMarker).not.toHaveBeenCalled()
     expect(removeGithubIssueProgressMarker).toHaveBeenCalledWith(expect.objectContaining({
       issueNumber: 9,
@@ -697,6 +891,7 @@ describe('runServerAutomationTick', () => {
       environmentVariables: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
     }))
     expect(store.state().githubTriggers?.[0]?.state.processed).toContain('12:issue_opened')
+    expect(spawnSession.mock.calls[0]![0].initialPrompt).not.toContain('## 예약 자동화 진단 지침')
     expect(store.state().githubTriggers?.[0]?.state.highestIssueNumber).toBe(12)
     expect(spawnSession.mock.invocationCallOrder[0]).toBeLessThan(
       resolveGithubIssueProgressMarkerIdentity.mock.invocationCallOrder[0]!,
@@ -1435,6 +1630,7 @@ describe('runServerAutomationTick', () => {
     expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
       directory: '/isolated/run-1',
     }))
+    expect(spawnSession.mock.calls[0]![0].initialPrompt).not.toContain('## 예약 자동화 진단 지침')
   })
 
   it('skips a merged PR whose branch is gone instead of falling back', async () => {
@@ -1734,6 +1930,7 @@ describe('runServerAutomationTick', () => {
     expect(dispatchAgentTask.mock.calls[0]![0]).not.toHaveProperty('escalateTo')
     const spawned = spawnSession.mock.calls[0]![0]
     expect(spawned.initialPrompt).toContain('Task ID: apply-1')
+    expect(spawned.initialPrompt).not.toContain('## 예약 자동화 진단 지침')
     expect(spawned.initialPrompt).toContain('[Review apply quality contract]')
     expect(spawned.initialPrompt).toContain('PLAUSIBLE-only')
     expect(spawned.initialPrompt).toContain('Record an applied or skipped decision')
@@ -3227,6 +3424,53 @@ describe('runServerAutomationTick', () => {
     expect(store.state().githubWorktrees).toEqual([expect.objectContaining({
       worktreePath: '/isolated/run-old', cleanupAttempts: 4, cleanupRetryAt: now + 60_000,
     })])
+  })
+
+  // 2026-09-05 프로덕션 — dirty 보류는 자동화를 worktree 게이트에 걸어 그 저장소의
+  // 리뷰를 통째로 멈춘다. 그런데 로그는 15분마다 같은 debug 한 줄이라 큐가 멈춘
+  // 사실이 어디에도 드러나지 않았다(aplus#3447 이 2시간 넘게 대기, 사용자가 물어봐서
+  // 발견). 보류가 오래가면 결과를 말한다.
+  async function runDirtyCleanup(cleanupAttempts: number) {
+    const { input, store, discardGithubWorktree, logDebug } = setup()
+    input.cache = { read: () => ({
+      cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
+    }) }
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-old',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-old', directory: '/isolated/run-old',
+        sessionId: 'ended-session', createdAt: 1, cleanupAttempts,
+      }],
+    })
+    discardGithubWorktree.mockResolvedValue({
+      ok: false, dirty: true, error: 'GitHub automation worktree is dirty (notes.md)',
+    })
+
+    await runServerAutomationTick(input)
+    return logDebug
+  }
+
+  // 2026-09-10 — 이 경고는 처음에 "GitHub queue is blocked" 라고 썼는데 틀린 말이었다.
+  // 큐를 막는 것은 dirty 가 아니라 *프로세스가 붙어 있음*(isDirectoryInUse) 이다
+  // (trackLivePendingGithubWorktrees). dirty 만으로는 디스크만 찬다. 09-05 사고에서
+  // 큐를 막은 진짜 원인은 좀비 프로세스였고 dirty 는 누적 원인이었을 뿐인데 둘을
+  // 합쳐 읽었다. 경고는 사실만 말한다: 지워지지 않고 남아 있다.
+  it('says the dirty worktree is being kept once the hold has lasted', async () => {
+    const logDebug = await runDirtyCleanup(DIRTY_WORKTREE_WARN_AFTER_ATTEMPTS - 1)
+
+    const kept = logDebug.mock.calls.map(([line]) => String(line)).filter((line) => /is being kept/.test(line))
+    expect(kept).toHaveLength(1)
+    expect(kept[0]).toContain('automation-1')
+    expect(kept[0]).toContain('notes.md')
+    expect(kept[0]).not.toMatch(/queue is blocked/)
+  })
+
+  it('does not warn while the hold is still young', async () => {
+    const logDebug = await runDirtyCleanup(0)
+
+    expect(logDebug.mock.calls.map(([line]) => String(line)).filter((line) => /is being kept/.test(line)))
+      .toHaveLength(0)
   })
 
   it('never gives up on a dirty worktree, however many attempts it has taken', async () => {

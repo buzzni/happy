@@ -64,9 +64,46 @@ describe('prepareGithubTriggerWorktree', () => {
     ])
   })
 
-  it('removes the prepared worktree and fails closed when checkout resolves a different head', async () => {
-    const actualHead = 'b'.repeat(40)
-    const runCommand = commandRunner(['/repo\n', '', '', `${actualHead}\n`, '', ''])
+  // 2026-09-10 프로덕션 — aplus#3650 은 PR 을 연 지 77초 만에 커밋을 하나 더 push
+  // 했다. 서버는 head=A 로 task 를 만들었고, 데몬이 16분 뒤 worktree 를 준비했을 땐
+  // 브랜치 tip 이 B 였다. 데몬은 "HEAD mismatch" 를 영구로 접어 이벤트를 소비했고,
+  // push 는 리뷰를 다시 걸지 않으므로 그 PR 은 영영 리뷰되지 않았다.
+  //
+  // 서버가 색인한 A 는 여전히 존재한다(B 의 조상). 브랜치 tip 이 아니라 A 를 체크아웃
+  // 하면 서버가 준비한 diff 색인과 정확히 맞는 리뷰가 된다 — 코멘트도 리뷰한 SHA 를
+  // 밝힌다. 리뷰 없음보다 훨씬 낫다.
+  it('pins the worktree to the reviewed head when the branch tip has moved on', async () => {
+    const movedTip = 'b'.repeat(40)
+    const runCommand = commandRunner(['/repo\n', '', '', `${movedTip}\n`, '', `${HEAD}\n`])
+
+    const result = await prepareGithubTriggerWorktree({
+      runId: 'run-2',
+      directory: '/repo',
+      managedRoot: '/happy/automation-worktrees',
+      pullRequest: { number: 12, expectedHeadSha: HEAD },
+      runCommand,
+      pathExists: vi.fn(async () => true),
+      resolveRealPath: vi.fn(async (path) => path),
+      ensureDirectory: vi.fn(async () => undefined),
+      onPlanned: vi.fn(),
+    })
+
+    expect(result).toMatchObject({ ok: true })
+    const commands = runCommand.mock.calls.map(([command]) => command)
+    expect(commands[4]).toMatchObject({ executable: 'git', args: ['checkout', '--detach', HEAD] })
+    expect(commands[5]).toMatchObject({ executable: 'git', args: ['rev-parse', 'HEAD'] })
+  })
+
+  // force-push 로 A 가 사라졌으면 색인한 스냅샷 자체가 없다 — 그때만 종전대로 접는다.
+  it('removes the prepared worktree and fails closed when the reviewed head is unreachable', async () => {
+    const movedTip = 'b'.repeat(40)
+    const outputs = ['/repo\n', '', '', `${movedTip}\n`]
+    const runCommand = vi.fn(async (command: GithubTriggerWorktreeCommand) => {
+      if (command.executable === 'git' && command.args[0] === 'checkout') {
+        return { ok: false as const, error: `fatal: reference is not a tree: ${HEAD}` }
+      }
+      return { ok: true as const, stdout: outputs.shift() ?? '' }
+    })
 
     const result = await prepareGithubTriggerWorktree({
       runId: 'run-2',
@@ -82,15 +119,32 @@ describe('prepareGithubTriggerWorktree', () => {
 
     expect(result).toEqual({
       ok: false,
-      error: `GitHub worktree HEAD mismatch: expected ${HEAD}, got ${actualHead}`,
+      error: `GitHub worktree HEAD mismatch: expected ${HEAD}, got ${movedTip}`,
       cleaned: true,
-    })
-    expect(runCommand.mock.calls.at(-2)?.[0]).toMatchObject({
-      executable: 'git', args: ['status', '--porcelain', '--untracked-files=all'],
     })
     expect(runCommand.mock.calls.at(-1)?.[0]).toMatchObject({
       executable: 'git', args: ['worktree', 'remove', '--force', expect.any(String)], cwd: '/repo',
     })
+  })
+
+  // 체크아웃이 성공했다고 해도 실제 HEAD 가 다르면 믿지 않는다.
+  it('fails closed when the pin reports success but HEAD still differs', async () => {
+    const movedTip = 'b'.repeat(40)
+    const runCommand = commandRunner(['/repo\n', '', '', `${movedTip}\n`, '', `${movedTip}\n`, '', ''])
+
+    const result = await prepareGithubTriggerWorktree({
+      runId: 'run-2',
+      directory: '/repo',
+      managedRoot: '/happy/automation-worktrees',
+      pullRequest: { number: 12, expectedHeadSha: HEAD },
+      runCommand,
+      pathExists: vi.fn(async () => true),
+      resolveRealPath: vi.fn(async (path) => path),
+      ensureDirectory: vi.fn(async () => undefined),
+      onPlanned: vi.fn(),
+    })
+
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('HEAD mismatch') })
   })
 
   it('removes the worktree and fails closed when the monorepo project path is absent at the PR head', async () => {
@@ -313,7 +367,12 @@ describe('removeGithubTriggerWorktree', () => {
       pathExists: vi.fn(async () => true),
     })
 
-    expect(result).toEqual({ ok: false, dirty: true, error: 'GitHub automation worktree is dirty' })
+    // 2026-09-05 — "dirty" 만으로는 사람이 직접 git status 를 쳐야 했고, 그 사이
+    // 그 저장소의 리뷰 큐가 멈춰 있었다. 무엇이 막고 있는지 말한다.
+    expect(result).toEqual({
+      ok: false, dirty: true,
+      error: 'GitHub automation worktree is dirty (src/app.ts)',
+    })
     expect(runCommand).toHaveBeenCalledTimes(1)
   })
 

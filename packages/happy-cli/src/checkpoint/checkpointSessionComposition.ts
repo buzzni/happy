@@ -4,10 +4,16 @@ import { mkdir, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { SandboxConfig } from '@/persistence';
 import { buildSandboxRuntimeConfig } from '@/sandbox/config';
+import type { SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import type { QueryOptions } from '@/claude/sdk';
 import { createCheckpointRuntime } from './checkpointRuntime';
 import { readCheckpointSpawnContext } from './checkpointSpawnContext';
-import { CheckpointPolicyDriftError, type CheckpointProvider } from './checkpointExclusionPolicy';
+import { checkpointAttachmentPassthroughCandidates } from './checkpointAttachmentPassthrough';
+import {
+    CheckpointPolicyDriftError,
+    resolveCheckpointProtectionCapability,
+    type CheckpointProvider,
+} from './checkpointExclusionPolicy';
 import type { CheckpointEventPublisher } from './checkpointEventPublisher';
 import { CheckpointProtectionStateStore } from './checkpointProtectionState';
 import { CheckpointTurnWorkspace } from './checkpointTurnWorkspace';
@@ -40,7 +46,15 @@ export async function createCheckpointSessionComposition(input: {
     sandboxConfig: SandboxConfig | undefined;
     env: Record<string, string | undefined>;
     checkpointEvents?: Pick<CheckpointEventPublisher, 'snapshot'>;
+    /**
+     * 생략하면 개인 머신(owner-choice). 이 값이 빠지면 checkpoint 세션의 runtime
+     * 설정이 기본 owner-choice 로 만들어져 공유 머신 신뢰 floor 가 통째로 빠진다
+     * — 런처가 checkpoint 설정을 그대로 쓰고 실제 실행도 턴 설정을 우선하므로,
+     * 이 인자가 그 경로의 유일한 전달 지점이다.
+     */
+    sandboxPolicyMode?: SandboxPolicyMode;
 }): Promise<CheckpointSessionComposition> {
+    const policyMode: SandboxPolicyMode = input.sandboxPolicyMode ?? 'owner-choice';
     const inputSandboxConfig = input.sandboxConfig;
     const protection = inputSandboxConfig?.checkpointProtection;
     if (!protection) return { sandboxConfig: input.sandboxConfig };
@@ -68,7 +82,15 @@ export async function createCheckpointSessionComposition(input: {
         const { checkpointProtection: _checkpointProtection, ...unprotectedSandbox } = inputSandboxConfig;
         return { sandboxConfig: unprotectedSandbox };
     }
-    const runtime = await createCheckpointRuntime({
+    const capability = resolveCheckpointProtectionCapability(input);
+    if (!capability.supported) {
+        throw new Error(`checkpoint protection unavailable: ${capability.reason}`);
+    }
+    const checkpointEvents = input.checkpointEvents;
+    if (!checkpointEvents) {
+        throw new Error('checkpoint protection requires a durable event publisher');
+    }
+    const buildRuntime = (passthroughPaths: string[] | undefined) => createCheckpointRuntime({
         provider: input.provider,
         platform: input.platform,
         projectPath: input.projectPath,
@@ -78,15 +100,34 @@ export async function createCheckpointSessionComposition(input: {
             projectId: context.projectId,
             worktreeId: context.worktreeId,
         },
-        protection,
+        protection: passthroughPaths
+            ? { ...protection, readOnlyPassthroughPaths: passthroughPaths }
+            : protection,
     });
+    // Expose the chat-attachment upload directory to the turn workspace. A
+    // passthrough is a convenience, never a gate: if no candidate can be
+    // prepared or the manifest rejects them all, the session must still start
+    // without one rather than fail closed on an attachment feature.
+    const attachmentCandidates = await checkpointAttachmentPassthroughCandidates(
+        canonicalProjectPath,
+    );
+    const runtime = await (async () => {
+        for (const candidate of attachmentCandidates) {
+            try {
+                return await buildRuntime([
+                    ...(protection.readOnlyPassthroughPaths ?? []),
+                    candidate,
+                ]);
+            } catch {
+                continue;
+            }
+        }
+        return buildRuntime(undefined);
+    })();
+
     if (runtime.status !== 'protected') {
         const reason = runtime.status === 'unavailable' ? runtime.reason : 'disabled';
         throw new Error(`checkpoint protection unavailable: ${reason}`);
-    }
-    const checkpointEvents = input.checkpointEvents;
-    if (!checkpointEvents) {
-        throw new Error('checkpoint protection requires a durable event publisher');
     }
 
     const turnWorkspace = new CheckpointTurnWorkspace(canonicalCheckpointRoot);
@@ -103,7 +144,9 @@ export async function createCheckpointSessionComposition(input: {
         ])],
     });
     const claudeSandboxFor = (config: SandboxConfig, path: string): QueryOptions['sandbox'] => {
-        const sandboxRuntime = buildSandboxRuntimeConfig(config, path);
+        // 최초 생성과 턴 회전이 같은 함수를 지나므로, 여기 policy 를 넣으면 두 경로가
+        // 함께 floor 와 쓰기 범위 검사를 받는다.
+        const sandboxRuntime = buildSandboxRuntimeConfig(config, path, policyMode);
         return {
             enabled: true,
             failIfUnavailable: true,

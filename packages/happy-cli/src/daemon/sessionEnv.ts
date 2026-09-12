@@ -34,6 +34,9 @@ export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', '
 const SAYCODE_AGENT_ENV_KEYS = [
     'SAYCODE_AGENT_ENV',
     'SAYCODE_AGENT_ROOT',
+    // The tree siblings may live in (saycode-cli 0.4.0, Desktop ADR-061). Without it a
+    // resumed hub silently shrinks back to its own worktree.
+    'SAYCODE_AGENT_SCOPE',
     'SAYCODE_AGENT_DEPTH',
     'SAYCODE_AGENT_MAX_SPAWN',
     'SAYCODE_AGENT_ID',
@@ -41,7 +44,7 @@ const SAYCODE_AGENT_ENV_KEYS = [
 
 type SaycodeAgentEnvironmentKey = typeof SAYCODE_AGENT_ENV_KEYS[number]
 const CHECKPOINT_CONTEXT_KEY = CHECKPOINT_SPAWN_CONTEXT_ENV_KEY
-type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof CHECKPOINT_CONTEXT_KEY
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof CHECKPOINT_CONTEXT_KEY | 'HAPPY_PROJECT_SANDBOX_CONFIG'
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey, string>>
 
@@ -117,6 +120,10 @@ export function captureSaycodeAgentEnvironment(
             SAYCODE_AGENT_ENV_KEYS.flatMap((key) => env[key] === undefined ? [] : [[key, env[key]]]),
         ))
     }
+    // Sandbox policy belongs to every session, including sessions without agent control.
+    if (env.HAPPY_PROJECT_SANDBOX_CONFIG !== undefined) {
+        captured.HAPPY_PROJECT_SANDBOX_CONFIG = env.HAPPY_PROJECT_SANDBOX_CONFIG
+    }
     const encodedCheckpointContext = env[CHECKPOINT_CONTEXT_KEY]
     if (encodedCheckpointContext && readCheckpointSpawnContext(env)) {
         captured[CHECKPOINT_CONTEXT_KEY] = encodedCheckpointContext
@@ -133,11 +140,37 @@ export function buildResumedSessionSpawnEnvironment(input: {
     agentEnvironment?: SaycodeAgentEnvironment
     sessionId: string
 }): Record<string, string> {
-    return buildSessionSpawnEnvironment(input.inherited, {
+    const policyKey = 'HAPPY_PROJECT_SANDBOX_CONFIG'
+    // A session keeps its own policy; explicit updates still take precedence.
+    const policy = input.explicit[policyKey] ?? input.automation?.[policyKey]
+        ?? input.runtime?.[policyKey] ?? input.agentEnvironment?.[policyKey]
+    return buildSessionSpawnEnvironment({ ...input.inherited, [policyKey]: undefined }, {
         ...scrubSessionLineageEnv(input.runtime ?? {}),
         ...scrubSessionLineageEnv(input.automation ?? {}),
         ...input.explicit,
         ...(input.agentEnvironment ?? {}),
+        ...(policy !== undefined ? { [policyKey]: policy } : {}),
         APLUS_SESSION_ID: input.sessionId,
     })
+}
+
+/**
+ * Sets or removes the confirmed-delivery switch on a **final** child
+ * environment.
+ *
+ * Applied after the merge because the daemon's own environment is inherited
+ * wholesale on the default path: deleting the key from the caller's extras is
+ * not enough, since a value already present in `process.env` would survive the
+ * merge and turn the switch on for a launch that never asked for it.
+ *
+ * The switch changes delivery behaviour only. It is not an identity and grants
+ * no permission.
+ */
+export function applyConfirmedPromptDeliveryFlag(
+    env: Record<string, string>,
+    required: boolean,
+): Record<string, string> {
+    if (required) return { ...env, HAPPY_MANAGED_REQUIRE_PROMPT_ACK: '1' }
+    const { HAPPY_MANAGED_REQUIRE_PROMPT_ACK: _removed, ...rest } = env
+    return rest
 }

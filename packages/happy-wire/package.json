@@ -21,6 +21,16 @@
         "types": "./dist/index.d.mts",
         "default": "./dist/index.mjs"
       }
+    },
+    "./scriptServiceToken": {
+      "require": {
+        "types": "./dist/scriptServiceToken.d.cts",
+        "default": "./dist/scriptServiceToken.cjs"
+      },
+      "import": {
+        "types": "./dist/scriptServiceToken.d.mts",
+        "default": "./dist/scriptServiceToken.mjs"
+      }
     }
   },
   "files": [
@@ -37,6 +47,7 @@
   },
   "dependencies": {
     "@paralleldrive/cuid2": "^2.2.2",
+    "tweetnacl": "^1.0.3",
     "zod": "^4.0.0"
   },
   "devDependencies": {
@@ -51,5 +62,12 @@
     "access": "public",
     "registry": "https://registry.npmjs.org"
   },
-  "packageManager": "pnpm@10.11.0"
+  "packageManager": "pnpm@10.11.0",
+  "typesVersions": {
+    "*": {
+      "scriptServiceToken": [
+        "dist/scriptServiceToken.d.cts"
+      ]
+    }
+  }
 }

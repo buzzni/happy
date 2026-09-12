@@ -1,4 +1,19 @@
 import { render } from "ink";
+import {
+    createManagedGracefulStop,
+    registerManagedGracefulStop,
+} from '@/managed/managedGracefulStop';
+import { reportManagedStopOutcome } from '@/managed/managedStartup';
+import { MANAGED_STOP_CLEAN } from '@/managed/managedControlChannel';
+
+/**
+ * How long a managed Codex run waits for its app server to leave after its
+ * stdin is closed.
+ *
+ * A budget that ran out is reported as a timeout, never folded into a clean
+ * exit — that is how a provider that is still writing gets archived.
+ */
+const CODEX_END_INPUT_BUDGET_MS = 10_000;
 import React from "react";
 import { ApiClient } from '@/api/api';
 import { CodexAppServerClient } from './codexAppServerClient';
@@ -13,6 +28,7 @@ import { logger } from '@/ui/logger';
 import { installBroadKillShims } from '@/utils/broadKillShims';
 import { Credentials, readSettings } from '@/persistence';
 import { resolveSessionSandboxConfig } from '@/sandbox/resolveSessionSandboxConfig';
+import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { initialMachineMetadata } from '@/daemon/run';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
@@ -39,11 +55,13 @@ import { notifyDaemonSessionStarted } from "@/daemon/controlClient";
 import { encodeBase64 } from '@/api/encryption';
 import type { Session as ApiSession, UserMessage } from '@/api/types';
 import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler";
+import { createTerminationSignalHandler } from "@/codex/terminationSignals";
 import { connectionState } from '@/utils/serverConnectionErrors';
 import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import type { PermissionMode } from '@/api/types';
 import type { ApiSessionClient } from '@/api/apiSession';
 import { resolveCodexExecutionPolicy } from './executionPolicy';
+import { resolveRemoteCodexPermissionMode } from './permissionMode';
 import { isSandboxFallbackNetworkLoss } from './sandboxInitFailurePolicy';
 import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
 import {
@@ -100,10 +118,18 @@ import {
     consumePendingInitialSaycodeSystemPromptEnabled,
     resolveInitialPromptPermissionMode,
 } from '@/utils/initialPrompt';
+
 import { registerCodexSteerHandler } from './codexSteerHandler';
 import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
+import { isManagedBrokerServer } from '@/launcher/codexApproval';
+import { resolveManagedCodexArguments } from '@/launcher/managedCodexOptions';
+import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, clearForeignSessionLineage, managedCodexProviderArguments, requireAccountMachineId, requireAccountToken } from '@/managed/managedStartup';
+import type { RunnerPrincipal } from '@/claude/runClaude';
+
+/** See the Claude counterpart. */
+const CODEX_INITIAL_PROMPT_ACK_TIMEOUT_MS = 30_000;
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
@@ -113,7 +139,7 @@ const DEFAULT_CODEX_PERMISSION_MODE: PermissionMode = 'yolo';
  * Main entry point for the codex command with ink UI
  */
 export async function runCodex(opts: {
-    credentials: Credentials;
+    principal: RunnerPrincipal;
     startedBy?: 'daemon' | 'terminal';
     noSandbox?: boolean;
     resumeThreadId?: string;
@@ -121,6 +147,23 @@ export async function runCodex(opts: {
 }): Promise<void> {
     // Shield killall/pkill against broad kills before anything is spawned —
     // Codex has no PreToolUse hook system, so the PATH shim is its only guard.
+    const managedStartup = opts.principal?.kind === 'managed' ? opts.principal.startup : null;
+    const accountToken = opts.principal?.kind === 'account' ? opts.principal.credentials.token : null;
+    if (managedStartup) {
+        // Before every consumer, not merely before the API client. The initial
+        // prompt is read out of the environment a few lines below, so applying
+        // the envelope later means the child's first turn carries somebody
+        // else's prompt — or none, and no acknowledgement for the one it was
+        // launched to answer.
+        assertManagedWorkingDirectory(process.cwd());
+        // Before the reconnect environment is read, which happens within a few
+        // lines and would otherwise resume a session this run has nothing to
+        // do with — dropping its prompt on the way.
+        clearForeignSessionLineage(process.env);
+        applyManagedGatewayEnvironment(process.env, managedStartup.envelope);
+        applyManagedInitialPrompt(process.env, managedStartup.envelope);
+    }
+
     installBroadKillShims();
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
     const reconnectSession = readReconnectSessionEnvironment(process.env);
@@ -160,7 +203,9 @@ export async function runCodex(opts: {
     // Set backend for offline warnings (before any API calls)
     connectionState.setBackend('Codex');
 
-    const api = await ApiClient.create(opts.credentials);
+    const api = opts.principal.kind === 'managed'
+        ? ApiClient.managed(opts.principal.startup.attachment)
+        : await ApiClient.create(opts.principal.credentials);
 
     // Log startup options
     logger.debug(`[codex] Starting with options: startedBy=${opts.startedBy || 'terminal'}`);
@@ -175,20 +220,27 @@ export async function runCodex(opts: {
     // daemon 이 서버 지시대로 넘긴 설정(AgentTask pr_review 의 networkMode:'allowed' 등)을
     // 로컬 머신 설정보다 우선한다. 이 배선이 없어서 agent=codex 워커가 샌드박스 없이 떴고,
     // Codex 네이티브 readOnly 정책으로 떨어져 lifecycle 콜백을 전부 놓쳤다.
+    const sandboxPolicyMode = resolveSessionSandboxPolicyMode(process.env);
     const sandboxConfig = resolveSessionSandboxConfig({
         noSandbox: Boolean(opts.noSandbox),
         env: process.env,
         settings,
+        policyMode: sandboxPolicyMode,
     });
-    if (!machineId) {
+    // See runClaude: a managed child has no account home and no machine id.
+    if (!machineId && !managedStartup) {
         console.error(`[START] No machine ID found in settings, which is unexpected since authAndSetupMachineIfNeeded should have created it. Please report this issue on https://github.com/slopus/happy-cli/issues`);
         process.exit(1);
     }
     logger.debug(`Using machineId: ${machineId}`);
-    await api.getOrCreateMachine({
-        machineId,
-        metadata: initialMachineMetadata
-    });
+    // A managed child has no machine of its own; the runtime it runs inside is
+    // the registered thing.
+    if (!managedStartup) {
+        await api.getOrCreateMachine({
+            machineId: requireAccountMachineId(machineId),
+            metadata: initialMachineMetadata
+        });
+    }
 
     //
     // Create session
@@ -204,7 +256,9 @@ export async function runCodex(opts: {
 
     const { state, metadata: freshMetadata } = createSessionMetadata({
         flavor: 'codex',
-        machineId,
+        // Discarded for a managed run: its session metadata comes from the
+        // server, opened with the key this process was handed.
+        machineId: machineId ?? '',
         startedBy: opts.startedBy,
         sandbox: sandboxConfig,
         dangerouslySkipPermissions: initialPermissionMode === 'yolo' || initialPermissionMode === 'bypassPermissions',
@@ -225,7 +279,11 @@ export async function runCodex(opts: {
     const metadata = mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata);
 
     let response: ApiSession | null;
-    if (reconnectSession) {
+    if (managedStartup) {
+        // Looked up, proven against the key this process holds, and placed on
+        // the runtime's project root before anything reads the path.
+        response = managedStartup.attachment.session;
+    } else if (reconnectSession) {
         logger.debug(`[START] Reconnecting to existing session ${reconnectSessionId}`);
         response = {
             ...reconnectSession,
@@ -238,6 +296,7 @@ export async function runCodex(opts: {
     assertCodexAutomationServerAvailable({
         automationRunOnceRequested,
         serverAvailable: response !== null,
+        prepared: preparedInitialPrompt,
     });
     if (!response && sandboxConfig?.checkpointProtection) {
         throw new Error('checkpoint protection requires an authoritative server session');
@@ -249,10 +308,11 @@ export async function runCodex(opts: {
             projectPath: process.cwd(),
             sessionId: response.id,
             sandboxConfig,
+            sandboxPolicyMode,
             env: process.env,
             checkpointEvents: sandboxConfig?.checkpointProtection
                 ? createCheckpointEventPublisher({
-                    token: opts.credentials.token,
+                    token: requireAccountToken(accountToken),
                     sessionId: response.id,
                     encryption: {
                         encryptionKey: response.encryptionKey,
@@ -351,38 +411,35 @@ export async function runCodex(opts: {
         logger.debug('[Codex] Reset turn-scoped options after abort');
     };
 
-    // Valid Codex permission modes from remote messages. Matches the modes
-    // the mobile UI exposes for Codex sessions (see modelModeOptions.ts:
-    // getCodexPermissionModes) and mirrors the Gemini validation pattern at
-    // runGemini.ts:222. Anything outside this set is silently ignored — the
-    // previous code blindly cast `message.meta.permissionMode as PermissionMode`
-    // at runtime, meaning a crafted value like `'totally_unsafe'` would be
-    // accepted and then fall through to the `default` branch in
-    // resolveCodexExecutionPolicy() — or worse, an attacker-chosen valid value
-    // could escalate sandbox scope (issue #1092).
-    const VALID_REMOTE_PERMISSION_MODES: readonly PermissionMode[] = [
-        'default',
-        'read-only',
-        'safe-yolo',
-        'yolo',
-    ];
-
     const handleUserMessage = createSerialAsyncHandler<UserMessage>(async (message) => {
+        // A managed run answers exactly the prompt its envelope was admitted
+        // for. A message posted to this session by the account owner arrives
+        // here as an ordinary user turn: it would change the model, the
+        // permission mode and the system prompt, then queue another turn —
+        // spending this run's capability on work that passed no admission and
+        // silently replacing the selection that was priced. Refused before any
+        // of that happens; a new prompt needs a new run.
+        //
+        // This is the general free-text path only. Permission answers and tool
+        // responses arrive as their own RPCs, bound to an approval this run is
+        // already waiting on, and are untouched.
+        if (managedStartup) {
+            logger.debug('[managed] Refusing a user turn that did not come from an admitted run');
+            return;
+        }
+
         const attachmentsForThisMessage = await session.drainAttachmentsForUserMessage();
 
-        // Resolve permission mode (validate against Codex-native modes)
-        let messagePermissionMode = currentPermissionMode;
-        if (message.meta?.permissionMode) {
-            const incoming = message.meta.permissionMode as PermissionMode;
-            if (VALID_REMOTE_PERMISSION_MODES.includes(incoming)) {
-                messagePermissionMode = incoming;
-                currentPermissionMode = messagePermissionMode;
-                logger.debug(`[Codex] Permission mode updated from user message to: ${currentPermissionMode}`);
-            } else {
-                logger.debug(`[Codex] Ignoring invalid permission mode from user message: ${String(message.meta.permissionMode)}`);
-            }
+        // Resolve permission mode (validated + downgrade-guarded in permissionMode.ts)
+        const messagePermissionMode = resolveRemoteCodexPermissionMode(
+            currentPermissionMode,
+            message.meta?.permissionMode as PermissionMode | undefined,
+        );
+        if (messagePermissionMode !== currentPermissionMode) {
+            currentPermissionMode = messagePermissionMode;
+            logger.debug(`[Codex] Permission mode updated from user message to: ${currentPermissionMode}`);
         } else {
-            logger.debug(`[Codex] User message received with no permission mode override, using current: ${currentPermissionMode ?? 'default (effective)'}`);
+            logger.debug(`[Codex] Keeping current permission mode: ${currentPermissionMode ?? 'default (effective)'}`);
         }
 
         // Resolve model; explicit null resets to default (undefined)
@@ -466,6 +523,17 @@ export async function runCodex(opts: {
     });
     session.onUserMessage(handleUserMessage);
     const initialPromptDelivered = await prepareCodexSessionStart({
+        // An offline start has no session to confirm against; the guard above
+        // (`assertCodexAutomationServerAvailable`) already refused that case,
+        // and `prepareCodexSessionStart` refuses again if no confirmer reaches
+        // it. This condition only supplies the confirmer when one can exist.
+        ...(preparedInitialPrompt.requireConfirmedDelivery && response
+            ? {
+                confirmDelivery: (localId: string) => session.awaitMessageAck(
+                    localId, CODEX_INITIAL_PROMPT_ACK_TIMEOUT_MS,
+                ),
+            }
+            : {}),
         prepared: preparedInitialPrompt,
         sendSessionMessage: (envelope, localId) => session.sendSessionProtocolMessage(envelope, localId),
         pushPrompt: (prompt) => {
@@ -676,6 +744,19 @@ export async function runCodex(opts: {
 
     registerKillSessionHandler(session.rpcHandlerManager, handleKillSession);
 
+    // The daemon stops sessions with a bare SIGTERM (daemon/run.ts) — the idle
+    // reaper, the stop-session RPC and Ctrl-C all land here, never on the
+    // killSession RPC above. Without a handler Node's default disposition kills
+    // us on the spot, so sendSessionDeath/flush/close never run and the tail of
+    // the conversation is lost. runClaude has had these handlers all along;
+    // the Codex runner never grew them.
+    const handleTerminationSignal = createTerminationSignalHandler({
+        terminate: handleKillSession,
+        forceExit: (code) => process.exit(code),
+    });
+    process.on('SIGTERM', () => { void handleTerminationSignal('SIGTERM'); });
+    process.on('SIGINT', () => { void handleTerminationSignal('SIGINT'); });
+
     // Exit when the session is archived/deleted server-side: the web archive
     // button (ephemeral with reason='archived') or a fatal 404 from the
     // message sync. Without this the syncs stop but the process lingers.
@@ -728,11 +809,25 @@ export async function runCodex(opts: {
         checkpointComposition.sandboxConfig,
         checkpointComposition.beforeTurn,
         checkpointComposition.completeTurn,
+        sandboxPolicyMode,
+        // Explicit, and only ever from the verified envelope: it turns off the
+        // account-rotation proxy and pins the provider this run may use.
+        /*
+         * B2 의 provider 고정 인자 뒤에 이 run 의 도구 경계(broker 등록·자격
+         * 환경변수 이름·기능 차단·effort)를 얹는다. 관리 실행인데 검증된 계획이
+         * 없으면 기존 동작으로 되돌아가지 않고 멈춘다.
+         */
+        resolveManagedCodexArguments({
+            managed: managedStartup !== null,
+            env: process.env,
+            base: managedStartup ? managedCodexProviderArguments(managedStartup.envelope) : null,
+        }),
     );
 
     registerCodexSteerHandler({
         client,
         session,
+        managedRun: managedStartup !== null,
         onFailure: (message) => {
             logger.debug(`[Codex] Active-turn steer failed: ${message}`);
         },
@@ -808,6 +903,14 @@ export async function runCodex(opts: {
         if (!command) {
             throw new Error('Unsupported Codex goal action');
         }
+        if (managedStartup && command.type === 'set') {
+            // A managed run answers exactly the prompt its envelope was
+            // admitted for. A goal carries a free-text instruction into every
+            // turn after it — work no admission covered. Refused here, before
+            // the thread or the provider is touched; clearing a goal removes an
+            // instruction rather than adding one, so it stays.
+            throw new Error('A managed run cannot be given a new objective');
+        }
 
         const threadId = client.threadId;
         if (!threadId) {
@@ -834,6 +937,19 @@ export async function runCodex(opts: {
             : params.type === 'patch'
                 ? { changes: params.fileChanges }
                 : (params.input ?? {});
+
+        /*
+         * 이 run 이 스스로 등록한 broker 로의 호출은 사람에게 물을 것이 없다 —
+         * 그 서버를 등록한 것이 우리이고, 어떤 도구를 쓸 수 있는지는 broker 가
+         * grant scope 로 최종 강제한다. 그 밖의 승인은 전부 기존 경로 그대로다.
+         */
+        if (isManagedBrokerServer({
+            managed: managedStartup !== null,
+            env: process.env,
+            serverName: params.serverName,
+        })) {
+            return 'approved';
+        }
 
         try {
             const result = await permissionHandler.handleToolCall(params.callId, toolName, input, {
@@ -999,13 +1115,15 @@ export async function runCodex(opts: {
     // codex would otherwise fail to start the MCP server, the change_title tool would
     // not be visible to the model, and the model would improvise with shell echoes.
     const bridgeEntrypoint = join(projectPath(), 'bin', 'happy-mcp.mjs');
-    const initialAplusMcpSnapshot = await fetchAplusMcpConfigSnapshot(
-        opts.credentials.token,
-        machineId,
+    // Account-only: the aplus MCP config belongs to a user, and a managed run
+    // has none. Skipped rather than attempted with a scoped bearer.
+    const initialAplusMcpSnapshot = accountToken === null ? null : await fetchAplusMcpConfigSnapshot(
+        accountToken,
+        requireAccountMachineId(machineId),
         { sessionId: session.sessionId },
     );
-    const initialAplusMcpResult = initialAplusMcpSnapshot.result;
-    for (const status of mcpConfigFailureStatuses(initialAplusMcpResult)) {
+    const initialAplusMcpResult = initialAplusMcpSnapshot?.result ?? null;
+    for (const status of initialAplusMcpResult ? mcpConfigFailureStatuses(initialAplusMcpResult) : []) {
         session.updateMetadata((currentMetadata) => ({
             ...currentMetadata,
             mcpServers: [
@@ -1014,7 +1132,7 @@ export async function runCodex(opts: {
             ],
         }));
     }
-    const initialAplusMcpServers = initialAplusMcpSnapshot.servers;
+    const initialAplusMcpServers = initialAplusMcpSnapshot?.servers ?? {};
     const baseMcpServers = {
         happy: {
             command: process.execPath,
@@ -1043,10 +1161,11 @@ export async function runCodex(opts: {
         fetchAplusServers: async () => {
             // 조회 직전에 교환해야 새 grant 로 조회된다. 24시간을 넘겨 사는
             // 세션이 403 으로 마지막 정상 설정에 갇히는 것을 막는다.
-            await refreshMcpCallerGrantIfExpiring(opts.credentials.token, machineId);
+            const account = requireAccountMachineId(machineId);
+            await refreshMcpCallerGrantIfExpiring(requireAccountToken(accountToken), account);
             return fetchAplusMcpServersResult(
-                opts.credentials.token,
-                machineId,
+                requireAccountToken(accountToken),
+                account,
                 { sessionId: session.sessionId, lifecycle: 'turn' },
             );
         },
@@ -1063,6 +1182,9 @@ export async function runCodex(opts: {
     });
     const mcpRuntimeRecovery = new CodexMcpRuntimeRecovery(client);
     let appendSystemPromptInjected = false;
+    // Assigned inside the `try` once the loop's stop gate exists; called from
+    // its `finally`. Until then there is no stop to report.
+    let reportManagedStop: () => Promise<void> = async () => undefined;
 
     try {
         logger.debug('[codex]: client.connect begin');
@@ -1110,11 +1232,64 @@ export async function runCodex(opts: {
 
         let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string; attachments?: PendingAttachment[] } | null = null;
 
+        /*
+         * A managed Codex run can be asked to end its input without being
+         * killed. Same contract as the Claude path: the queue is only closed
+         * when nothing is queued and nothing is held back for the next turn.
+         */
+        const gracefulStop = managedStartup
+            ? createManagedGracefulStop({
+                queueSize: () => messageQueue.size(),
+                hasPending: () => pending !== null,
+                wake: () => { messageQueue.close(); },
+            })
+            : null;
+        registerManagedGracefulStop(gracefulStop);
+        /*
+         * Codex runs one app server for the whole session, so its generation
+         * record is a single one — but it is still a record beside the thing
+         * it describes, not a flag on the stop.
+         */
+        const codexProof = { inputExhausted: false };
+        /**
+         * The verdict for this run, reported once, for a run that was asked
+         * to stop — from the loop's `finally`, so a loop that leaves by any
+         * route (an abort, a run-once turn, a throw) still answers the stop
+         * it was asked for rather than leaving the supervisor to its budget.
+         */
+        reportManagedStop = async (): Promise<void> => {
+            if (!gracefulStop?.requested()) return;
+            if (!codexProof.inputExhausted) {
+                reportManagedStopOutcome('input-not-exhausted');
+                return;
+            }
+            /*
+             * No signal. `disconnect()` does `stdin.end()` and `SIGTERM` in one
+             * breath and never awaits the exit, so it can never prove a flush;
+             * this ends stdin and waits for what the kernel actually says.
+             */
+            const left = await client.endInputAndAwaitExit(CODEX_END_INPUT_BUDGET_MS);
+            reportManagedStopOutcome(
+                left.exited && left.code === 0 && left.signal === null
+                    ? MANAGED_STOP_CLEAN
+                    : 'provider-exit-unclean',
+            );
+        };
+
         while (!shouldExit) {
             logActiveHandles('loop-top');
             let message: { message: string; mode: EnhancedMode; isolate: boolean; hash: string; attachments?: PendingAttachment[] } | null = pending;
             pending = null;
             if (!message) {
+                /*
+                 * The turn boundary. A stop asked for mid-turn lands here,
+                 * with the turn finished and nothing accepted after it.
+                 */
+                if (gracefulStop?.mayEndInput()) {
+                    codexProof.inputExhausted = true;
+                    shouldExit = true;
+                    break;
+                }
                 // Capture the current signal to distinguish idle-abort from queue close
                 const waitSignal = abortController.signal;
                 const batch = await messageQueue.waitForMessagesAndGetAsString(waitSignal);
@@ -1123,6 +1298,17 @@ export async function runCodex(opts: {
                     if (waitSignal.aborted && !shouldExit) {
                         logger.debug('[codex]: Wait aborted while idle; ignoring and continuing');
                         continue;
+                    }
+                    /*
+                     * Woken by the stop rather than aborted. The abort check is
+                     * the point: a run aborted while a stop happened to be
+                     * pending did not exhaust its input — and neither did one
+                     * whose queue was closed by something else while work was
+                     * still queued or held back, which is what `mayEndInput`
+                     * rules out.
+                     */
+                    if (gracefulStop?.mayEndInput() && !waitSignal.aborted) {
+                        codexProof.inputExhausted = true;
                     }
                     logger.debug(`[codex]: batch=${!!batch}, shouldExit=${shouldExit}`);
                     break;
@@ -1393,6 +1579,13 @@ export async function runCodex(opts: {
         }
 
     } finally {
+        await reportManagedStop();
+        /*
+         * The bridge points at this run's loop. Left registered, a stop
+         * arriving later would be applied to a loop that has ended, or handed
+         * to the next run, which nobody asked to stop.
+         */
+        registerManagedGracefulStop(null);
         // Clean up resources when main loop exits
         logger.debug('[codex]: Final cleanup start');
         logActiveHandles('cleanup-start');

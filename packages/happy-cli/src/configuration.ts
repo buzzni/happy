@@ -6,7 +6,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import packageJson from '../package.json'
 import { resolveBrowserBridgeTokenFile } from './daemon/browserBridgeToken'
@@ -35,6 +35,7 @@ class Configuration {
   public readonly serverAutomationsCacheFile: string
   public readonly serverAutomationsRuntimeFile: string
   public readonly currentCliVersion: string
+  public readonly daemonHappyHomeDir: string
 
   public readonly isExperimentalEnabled: boolean
   public readonly disableCaffeinate: boolean
@@ -52,6 +53,15 @@ class Configuration {
     } else {
       this.happyHomeDir = join(homedir(), '.happy')
     }
+
+    // 신뢰 floor 가 함께 덮을 "이 프로세스가 실제로 쓰는 happy 홈".
+    // 새 env 를 하나 더 만들지 않는다 — spawn 페이로드가 그 값을 정할 수 있으면
+    // floor 기준을 호출자가 옮기게 된다. staged 세션 홈(/tmp/happy-session-*)은
+    // 세션 자신의 자격증명이므로 제외한다. 실제 데몬 홈들은 sandboxPolicy 의
+    // ~/.happy* 열거가 덮는다.
+    this.daemonHappyHomeDir = this.happyHomeDir.startsWith(tmpdir())
+      ? join(homedir(), '.happy')
+      : this.happyHomeDir
 
     this.logsDir = join(this.happyHomeDir, 'logs')
     this.settingsFile = join(this.happyHomeDir, 'settings.json')

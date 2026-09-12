@@ -1,4 +1,10 @@
 import { render } from "ink";
+import { createManagedGracefulStop, registerManagedGracefulStop, type ManagedGracefulStop } from '@/managed/managedGracefulStop'
+import { createProviderExitObserver, type ProviderExitObserver } from '@/managed/managedProviderExitObserver'
+import { waitForObservedExit, MANAGED_REPORT_EXIT_BUDGET_MS } from '@/managed/managedProviderExitObserver'
+import { reportManagedStopOutcome } from '@/managed/managedStartup'
+import { createGenerationProofs, type GenerationProof } from '@/managed/managedGenerationProof'
+import { MANAGED_STOP_CLEAN } from '@/managed/managedControlChannel'
 import { Session } from "./session";
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";
@@ -23,6 +29,7 @@ import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
+import { buildMandatoryRemoteDenyRules, resolveClaudeRemoteSandbox } from '@/sandbox/claudeSdkSandbox';
 
 interface PermissionsField {
     date: number;
@@ -80,8 +87,34 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let abortFuture: Future<void> | null = null;
     let activeInputSender: ClaudeActiveInputSender | null = null;
 
+    /**
+     * This generation's SDK exit observer, reachable from the abort path.
+     *
+     * The observer is per generation and lives inside the loop; an abort can
+     * arrive from outside it, and a cancelled provider must never be able to
+     * look like one that finished on its own.
+     */
+    /**
+     * One provider generation's proof, held as a single record.
+     *
+     * The two halves have to belong to the same SDK process, so they live
+     * together: the observer that watched it, and whether *its* input ended by
+     * exhaustion. A record is installed as `current` only when a real process
+     * is watched, so a loop turn that launches nothing can neither answer nor
+     * be written into — there is no shared latch to guard.
+     */
+    const generationProofs = createGenerationProofs();
+    const startedGeneration = (): GenerationProof | null => generationProofs.current();
+
     async function abort() {
         if (abortController && !abortController.signal.aborted) {
+            /*
+             * Recorded before the abort, not after. A provider that handles
+             * the cancellation and exits 0 reports no signal, so the exit
+             * alone reads exactly like a graceful end — the request is the
+             * only thing that distinguishes them.
+             */
+            startedGeneration()?.observer.markForced();
             abortController.abort();
         }
         await abortFuture?.promise;
@@ -105,6 +138,17 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     session.client.rpcHandlerManager.registerHandler('abort', doAbort); // When abort clicked
     session.client.rpcHandlerManager.registerHandler('switch', doSwitch); // When switch clicked
     session.client.rpcHandlerManager.registerHandler('steer', async (params: Record<string, unknown>) => {
+        if (session.managedRun) {
+            // A managed run answers exactly the prompt its envelope was admitted
+        // for. Steering and setting a goal are free-text instructions that
+        // reach the provider outside that admission — steering is injected
+        // into the turn already running, and a goal is carried into every turn
+        // after it. Refused before the provider or the queue is touched;
+        // clearing a goal removes an instruction rather than adding one, so it
+        // stays. Permission answers are bound to a request this run is already
+        // waiting on and are untouched.
+            return { success: false, error: 'A managed run cannot be steered' };
+        }
         const text = typeof params?.text === 'string' ? params.text : '';
         if (!text.trim()) {
             return { success: false, error: 'Steer text is required' };
@@ -169,6 +213,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         // Write to message log
         formatClaudeMessageForInk(message, messageBuffer);
 
+        // 턴 종료 result 는 transcript 로 가지 않는다 — 사용량 보정만 세션에 넘긴다
+        // (Z.AI 호환 경로의 assistant usage 0 문제, src/usage/claudeTurnUsage.ts).
+        if (message.type === 'result') {
+            session.client.applyClaudeTurnResult(message as unknown as { uuid?: unknown; usage?: unknown; modelUsage?: unknown });
+        }
+
         // Track active tool calls
         if (message.type === 'assistant') {
             let umessage = message as SDKAssistantMessage;
@@ -188,7 +238,11 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 continue;
             }
             notifiedQuestionToolCalls.add(toolCallId);
-            session.api.push().sendSessionNotification({
+            // A managed run holds a scoped runner grant: there is no account
+            // behind it, and `push()` refuses it — correctly, and that refusal
+            // stays. This is an ordinary progress notification, so on a managed
+            // run there is simply nobody to tell.
+            if (!session.managedRun) session.api.push().sendSessionNotification({
                 kind: 'question',
                 metadata: session.client.getMetadata(),
                 data: {
@@ -304,11 +358,36 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         }
     }
 
+    // Declared outside the `try` because the stop verdict is reported from
+    // its `finally`, once the loop is really over.
+    let gracefulStop: ManagedGracefulStop | null = null;
     try {
         let pending: {
             message: MessageParam['content'];
             mode: EnhancedMode;
         } | null = null;
+
+        /*
+         * A managed run can be asked to end its input without being killed.
+         *
+         * Built here because it needs `pending`, which is what the message
+         * loop holds back for the next turn and is invisible to the queue.
+         * Only for managed runs: an ordinary session ends when its user says
+         * so, and nothing else may end one on its behalf.
+         */
+        gracefulStop = session.managedRun
+            ? createManagedGracefulStop({
+                queueSize: () => session.queue.size(),
+                hasPending: () => pending !== null,
+                // Wakes the `nextMessage()` that is waiting for input. The
+                // queue is empty and nothing is pending, so this resolves the
+                // waiter with `false` rather than delivering anything.
+                wake: () => { session.queue.close(); },
+            })
+            : null;
+        // Reachable from the control channel, which was read long before this
+        // loop existed. A stop asked for in between is applied here.
+        registerManagedGracefulStop(gracefulStop);
 
         // Track session ID to detect when it actually changes
         // This prevents context loss when mode changes (permission mode, model, etc.)
@@ -318,6 +397,23 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         let previousSessionId: string | null = null;
         while (!exitReason) {
             logger.debug('[remote]: launch');
+            // Per generation, not per session — see the note at the call.
+            /*
+             * A generation begins when the SDK actually spawns a process, not
+             * when this loop comes round.
+             *
+             * A turn that returns `not-started` — an idle stop waking
+             * `nextMessage`, for instance — launches no query at all. Swapping
+             * in a fresh observer there would discard the previous
+             * generation's real clean exit and report `provider-exit-unclean`
+             * for a provider that had flushed and for a generation that never
+             * existed. So both halves move together, and only when something
+             * actually starts.
+             */
+            const proof = generationProofs.begin((onStarted) => (
+                session.managedRun ? createProviderExitObserver(onStarted) : null
+            ));
+            const sdkExit = proof?.observer ?? null;
             messageBuffer.addMessage('═'.repeat(40), 'status');
 
             // Only reset parent chain and show "new session" message when session ID actually changes
@@ -342,6 +438,25 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
                     path: session.path,
+                    managedSettingsLockdown: session.managedSettingsLockdown,
+                    managedRun: session.managedRun,
+                    /*
+                     * A fresh observer for **this** generation.
+                     *
+                     * The observer keeps the first exit it sees, so one reused
+                     * across generations would answer for a process that ended
+                     * before this one started. A restart is a different
+                     * process and gets a different observer.
+                     */
+                    ...(sdkExit ? { providerExitObserver: sdkExit } : {}),
+                    /*
+                     * `completeTurn` and `exitAfterFirstTurn` return without
+                     * ever calling `nextMessage`, so the exhaustion they do
+                     * reach has to be reported from there — otherwise a
+                     * managed run in either mode can never be proven, however
+                     * cleanly it ended.
+                     */
+                    onInputExhausted: () => { if (proof) proof.inputExhausted = true; },
                     allowedTools: session.allowedTools ?? [],
                     mcpServers: session.mcpServers,
                     mcpConfig: session.mcpConfig ? {
@@ -351,7 +466,17 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         },
                     } : undefined,
                     hookSettingsPath: session.hookSettingsPath,
-                    sandbox: session.checkpointComposition?.claudeSandbox,
+                    // SDK sandbox(주로 Bash 경계) 와 CLI 권한 규칙(도구 경계)을
+                    // 함께 내려보낸다 — 한쪽만으로는 floor 가 반만 걸린다.
+                    permissionsDeny: buildMandatoryRemoteDenyRules(
+                        session.sandboxPolicyMode ?? 'owner-choice',
+                    ),
+                    sandbox: resolveClaudeRemoteSandbox({
+                        checkpointSandbox: session.checkpointComposition?.claudeSandbox,
+                        sandboxConfig: session.sandboxConfig,
+                        sessionPath: session.path,
+                        policyMode: session.sandboxPolicyMode ?? 'owner-choice',
+                    }),
                     beforeTurn: session.checkpointComposition?.beforeTurn,
                     completeTurn: session.checkpointComposition?.completeTurn,
                     jsRuntime: session.jsRuntime,
@@ -367,7 +492,55 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             return p;
                         }
 
+                        /*
+                         * The turn boundary. A stop asked for mid-turn lands
+                         * here, with the turn finished and nothing accepted
+                         * after it.
+                         *
+                         * `exitReason` is set as well as returning `null`:
+                         * `null` alone ends this provider's input, and the
+                         * `while (!exitReason)` loop above would then launch a
+                         * fresh one.
+                         */
+                        if (gracefulStop?.mayEndInput()) {
+                            /*
+                             * The only natural exhaustion. Recorded here and
+                             * nowhere else: an abort also makes this function
+                             * return `null`, and so does a mode change holding
+                             * a message back, so the `null` itself proves
+                             * nothing.
+                             *
+                             * And only for a generation that exists. This
+                             * function is called for the *initial* message
+                             * too, before any query spawns — so on an idle
+                             * stop there is no SDK process at all, and marking
+                             * exhaustion here would retroactively turn the
+                             * previous generation's clean-but-unexhausted exit
+                             * into a proof it never earned.
+                             */
+                            // Recorded on **this** generation's record. If it
+                            // never started, nothing reads it.
+                            if (proof) proof.inputExhausted = true;
+                            exitReason = 'exit';
+                            return null;
+                        }
+
                         let msg = await session.queue.waitForMessagesAndGetAsString(controller.signal);
+                        if (msg === null && gracefulStop?.requested() && !controller.signal.aborted) {
+                            /*
+                             * Woken by the stop rather than aborted — and the
+                             * abort check is the whole point: a run that was
+                             * aborted while a stop happened to be pending must
+                             * not be recorded as having exhausted its input.
+                             *
+                             * Recorded on this generation's record. An idle
+                             * wake before any query spawned has no record
+                             * installed, so it ends the run without claiming
+                             * an exhaustion the previous generation never had.
+                             */
+                            if (proof) proof.inputExhausted = true;
+                            exitReason = 'exit';
+                        }
 
                         // Check if mode has changed
                         if (msg) {
@@ -429,6 +602,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         // Update converter's session ID when new session is found
                         sdkToLogConverter.updateSessionId(sessionId);
                         session.onSessionFound(sessionId);
+                        /*
+                         * Onto **this** generation's record, captured in this
+                         * iteration's closure — not `startedGeneration()`,
+                         * which is whichever generation is current when the
+                         * callback happens to run. The SDK reports a session
+                         * asynchronously, so a slow callback from a finished
+                         * generation can arrive after the next one began.
+                         */
+                        if (proof) proof.nativeId = sessionId;
                     },
                     onSDKMetadata: (metadata) => {
                         logger.debug('[remote] SDK metadata received, updating session:', metadata);
@@ -483,7 +665,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     onReady: () => {
                         session.client.closeClaudeSessionTurn('completed');
                         if (!pending && session.queue.size() === 0) {
-                            session.api.push().sendSessionNotification({
+                            // Same reason as the question notification above.
+                            // This one matters more: `onReady` fires on ANY SDK
+                            // result and fires *after* the turn finished, so a
+                            // throw here ends the launch at the moment of
+                            // completion and masks the turn's real outcome.
+                            if (!session.managedRun) session.api.push().sendSessionNotification({
                                 kind: 'done',
                                 metadata: session.client.getMetadata(),
                                 data: {
@@ -562,6 +749,48 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             }
         }
     } finally {
+        /*
+         * The verdict for this run, reported once, and only for a run that was
+         * asked to stop.
+         *
+         * Here rather than inside the loop: a turn can end without the run
+         * ending — a mode change parks the message and relaunches — and a
+         * report there was a verdict for a run still going, followed by a
+         * second one when it actually ended. The supervisor reads one.
+         *
+         * Both halves are required, and they are read **after the provider's
+         * own process has been given a chance to leave**. `claudeRemote`
+         * returns as soon as its message loop ends; the SDK child exits a
+         * moment later. Reading `exitedCleanly()` right away reported
+         * `provider-exit-unclean` for a provider that was in the middle of
+         * exiting perfectly well — the runtime then refused the checkpoint
+         * with `eof-unverified`, which is a refusal caused entirely by
+         * reporting too early. So wait, bounded, for the exit this
+         * generation is about.
+         */
+        if (gracefulStop?.requested()) {
+            const generation = startedGeneration();
+            // Which of the two silences this is: no generation to report
+            // for, or one whose exit has not been seen yet.
+            logger.debug(`[managed] stop report generation=${generation ? 'present' : 'absent'}`);
+            if (generation) {
+                await waitForObservedExit(
+                    generation.observer,
+                    MANAGED_REPORT_EXIT_BUDGET_MS,
+                );
+            }
+            reportManagedStopOutcome(
+                generation?.inputExhausted && generation.observer.exitedCleanly()
+                    ? MANAGED_STOP_CLEAN
+                    : generation?.inputExhausted
+                        ? 'provider-exit-unclean'
+                        : 'input-not-exhausted',
+                // The identity of the generation being reported on, or none —
+                // a generation that never learned a session has nothing to
+                // name, and says so.
+                { nativeId: generation?.nativeId ?? null },
+            );
+        }
 
         activeInputSender = null;
         streamRelay.dispose();
@@ -571,6 +800,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
         // Reset Terminal
         const t0 = Date.now();
+        /*
+         * The bridge points at this run's loop. Left registered, a stop
+         * arriving after a mode switch would be applied to a loop that has
+         * ended — or remembered and handed to the *next* run, which nobody
+         * asked to stop.
+         */
+        registerManagedGracefulStop(null);
         logger.debug(`[remote]: cleanup begin exitReason=${exitReason} hasInk=${!!inkInstance} rawMode=${(process.stdin as any).isRaw}`);
         if (inkInstance) {
             inkInstance.unmount();

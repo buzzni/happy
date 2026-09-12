@@ -71,6 +71,13 @@ export interface TrackedSession {
   /** Absolute launch cwd, persisted before the session-start webhook arrives. */
   directory?: string;
   happySessionId?: string;
+  /**
+   * Session this child was spawned to resume. Unlike `happySessionId` it is set
+   * at spawn time, so the resume guard can see that a child is already attached
+   * during the window before the session webhook arrives — a window the spawn's
+   * 60s webhook timeout ends without killing the child (2026-09-11 incident).
+   */
+  resumeTargetSessionId?: string;
   happySessionMetadataFromLocalWebhook?: Metadata;
   runtime?: SessionRuntimeState;
   encryption?: SessionEncryptionData;

@@ -46,6 +46,50 @@ describe('hasLiveDaemonChild', () => {
     });
 });
 
+// 2026-09-11 incident: resume RPC #1 spawned PID 2380763 at 08:16:44. Its
+// session webhook never arrived, so at 08:17:55 the 60s timeout failed the RPC
+// — releasing the in-flight slot — while leaving the process running and
+// attached to the session. The tracked entry still had no happySessionId
+// (only the webhook sets it), so the liveness guard below answered "no live
+// child" and resume RPC #2 at 08:18:33 spawned a second CLI. Both stayed
+// attached for over an hour: the Claude transcript forked in two, every user
+// message was written to both branches, and both processes' session scanners
+// re-uploaded them — the user saw each message as three bubbles.
+//
+// A daemon child claims its resume target at spawn time, so the guard must see
+// the claim during the whole window before the webhook lands.
+describe('hasLiveDaemonChild — resume target claimed before the webhook lands', () => {
+    const alive = () => true;
+
+    it('detects a resume child that has not reported its session webhook yet', () => {
+        expect(hasLiveDaemonChild('session-1', [
+            { resumeTargetSessionId: 'session-1', pid: 11 },
+        ], alive)).toBe(true);
+    });
+
+    it('does not match a resume claim for a different session', () => {
+        expect(hasLiveDaemonChild('session-1', [
+            { resumeTargetSessionId: 'session-other', pid: 11 },
+        ], alive)).toBe(false);
+    });
+
+    // The claim is not a liveness certificate: a spawn that died before its
+    // webhook must not make the retry a no-op, which would leave the session
+    // with no process at all.
+    it('ignores a resume claim whose process is already dead', () => {
+        expect(hasLiveDaemonChild('session-1', [
+            { resumeTargetSessionId: 'session-1', pid: 99 },
+        ], (pid) => pid !== 99)).toBe(false);
+    });
+
+    it('still finds a live webhook-confirmed child past a dead resume claim', () => {
+        expect(hasLiveDaemonChild('session-1', [
+            { resumeTargetSessionId: 'session-1', pid: 99 },
+            { happySessionId: 'session-1', pid: 100 },
+        ], (pid) => pid !== 99)).toBe(true);
+    });
+});
+
 describe('decideAutomationResumePreflight', () => {
     it('falls back immediately when a live target belongs to another directory', () => {
         expect(decideAutomationResumePreflight({

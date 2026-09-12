@@ -6,6 +6,7 @@ import {
   getCodexMultiAuthProxyStatus,
   isManagedCodexRotationSettings,
 } from '../codex/codexMultiAuthProxy'
+import { buildZaiClaudeEnvironment } from '../managed/zaiClaudeEnvironment'
 import { overlayManagedCredentialEnvironment } from './sessionEnv'
 
 const MAX_PAYLOAD_BYTES = 1024 * 1024
@@ -655,14 +656,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       || !/^[\x21-\x7e]{1,1024}$/.test(parsed.apiKey)) {
       throw new AiCredentialRuntimeError('ZAI_PAYLOAD_INVALID')
     }
-    return {
-      ANTHROPIC_AUTH_TOKEN: parsed.apiKey,
-      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
-      API_TIMEOUT_MS: '3000000',
-      ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3',
-      ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7',
-    }
+    return buildZaiClaudeEnvironment(parsed.apiKey)
   }
 
   function parseZaiEnvironment(raw: string): Record<string, string> {

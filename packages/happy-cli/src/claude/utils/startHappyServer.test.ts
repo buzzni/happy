@@ -147,6 +147,7 @@ describe('startHappyServer tool registration', () => {
 
             expect(names).toEqual(expect.arrayContaining([
                 'change_title',
+                'script_automations',
                 'bash_stream',
                 'browser_tabs',
                 'browser_snapshot',

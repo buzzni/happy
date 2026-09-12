@@ -1,4 +1,6 @@
 import { authAndSetupMachineIfNeeded } from '@/ui/auth'
+import { configuration } from '@/configuration'
+import { readManagedStartup } from '@/managed/managedStartup'
 import { runCodex } from '@/codex/runCodex'
 import { extractCodexResumeFlag } from '@/codex/cliArgs'
 import { extractNoSandboxFlag } from '@/utils/sandboxFlags'
@@ -21,11 +23,25 @@ export async function handleCodexCommand(args: string[]): Promise<void> {
     }
   }
 
+  // See main.ts: a managed Cloud spawn skips account auth, machine
+  // registration and the daemon entirely.
+  const managed = await readManagedStartup(process.env, Date.now(), configuration.serverUrl)
+  if (managed) {
+    await runCodex({
+      principal: { kind: 'managed', startup: managed },
+      startedBy,
+      noSandbox: sandboxArgs.noSandbox,
+      resumeThreadId: codexArgs.resumeThreadId ?? undefined,
+      permissionMode,
+    })
+    return
+  }
+
   const { credentials } = await authAndSetupMachineIfNeeded()
   await ensureDaemonRunning()
 
   await runCodex({
-    credentials,
+    principal: { kind: 'account', credentials },
     startedBy,
     noSandbox: sandboxArgs.noSandbox,
     resumeThreadId: codexArgs.resumeThreadId ?? undefined,

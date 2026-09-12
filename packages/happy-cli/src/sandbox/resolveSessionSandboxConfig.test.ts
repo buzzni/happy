@@ -23,6 +23,24 @@ const PROJECT_ENV = JSON.stringify({
 });
 
 describe('resolveSessionSandboxConfig', () => {
+    it('preserves a project Git config grant through schema parsing', () => {
+        const resolved = resolveSessionSandboxConfig({
+            noSandbox: false,
+            env: { HAPPY_PROJECT_SANDBOX_CONFIG: JSON.stringify({ enabled: true, allowGitConfig: true }) },
+            settings: undefined,
+        });
+        expect(resolved?.allowGitConfig).toBe(true);
+    });
+
+    it('keeps an explicit project disable ahead of enabled machine settings', () => {
+        const resolved = resolveSessionSandboxConfig({
+            noSandbox: false,
+            env: { HAPPY_PROJECT_SANDBOX_CONFIG: JSON.stringify({ enabled: false }) },
+            settings: { sandboxConfig: { enabled: true } as never },
+        });
+        expect(resolved?.enabled).toBe(false);
+    });
+
     it('takes the daemon-injected project config over local settings', () => {
         const resolved = resolveSessionSandboxConfig({
             noSandbox: false,
@@ -86,5 +104,76 @@ describe('resolveSessionSandboxConfig', () => {
     it('returns undefined when neither source has anything', () => {
         expect(resolveSessionSandboxConfig({ noSandbox: false, env: {}, settings: undefined }))
             .toBeUndefined();
+    });
+});
+
+// 공유(비신뢰) 실행 머신의 계약. 개인 머신(owner-choice)의 위 동작은 그대로 두고,
+// mandatory 머신에서만 "격리 없이 진행"을 없앤다 — 조용히 물러나는 대신 던진다.
+describe('resolveSessionSandboxConfig on a mandatory machine', () => {
+    const mandatory = { policyMode: 'mandatory' } as const;
+
+    it('refuses --no-sandbox instead of dropping isolation', () => {
+        expect(() => resolveSessionSandboxConfig({
+            ...mandatory,
+            noSandbox: true,
+            env: { HAPPY_PROJECT_SANDBOX_CONFIG: PROJECT_ENV },
+            settings: { sandboxConfig: { enabled: true } as never },
+        })).toThrow(/no-sandbox-flag/);
+    });
+
+    it('refuses an injected disable', () => {
+        expect(() => resolveSessionSandboxConfig({
+            ...mandatory,
+            noSandbox: false,
+            env: { HAPPY_PROJECT_SANDBOX_CONFIG: JSON.stringify({ enabled: false }) },
+            settings: { sandboxConfig: { enabled: true } as never },
+        })).toThrow(/disabled-config/);
+    });
+
+    it('refuses a locally disabled machine config', () => {
+        expect(() => resolveSessionSandboxConfig({
+            ...mandatory,
+            noSandbox: false,
+            env: {},
+            settings: { sandboxConfig: { enabled: false } as never },
+        })).toThrow(/disabled-config/);
+    });
+
+    it('does not fall back to local settings when the injection is malformed', () => {
+        expect(() => resolveSessionSandboxConfig({
+            ...mandatory,
+            noSandbox: false,
+            env: { HAPPY_PROJECT_SANDBOX_CONFIG: '{not json' },
+            settings: { sandboxConfig: { enabled: true, networkMode: 'blocked' } as never },
+        })).toThrow(/malformed-injection/);
+    });
+
+    it('does not fall back to local settings when the injection fails validation', () => {
+        expect(() => resolveSessionSandboxConfig({
+            ...mandatory,
+            noSandbox: false,
+            env: { HAPPY_PROJECT_SANDBOX_CONFIG: JSON.stringify({ networkMode: 'sideways' }) },
+            settings: { sandboxConfig: { enabled: true } as never },
+        })).toThrow(/malformed-injection/);
+    });
+
+    it('refuses a session that has no sandbox config at all', () => {
+        expect(() => resolveSessionSandboxConfig({
+            ...mandatory,
+            noSandbox: false,
+            env: {},
+            settings: undefined,
+        })).toThrow(/missing-config/);
+    });
+
+    it('returns the injected config unchanged when isolation is intact', () => {
+        const resolved = resolveSessionSandboxConfig({
+            ...mandatory,
+            noSandbox: false,
+            env: { HAPPY_PROJECT_SANDBOX_CONFIG: PROJECT_ENV },
+            settings: undefined,
+        });
+        expect(resolved?.enabled).toBe(true);
+        expect(resolved?.networkMode).toBe('allowed');
     });
 });

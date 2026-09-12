@@ -14,6 +14,19 @@ export type BrowserSessionBrokerLease = {
     ready: boolean
     lastUsedAt: number
     isolation: 'container'
+    /**
+     * specs/runtime-isolation-hardening (H3, P3) — opaque proof of the exact
+     * container run behind `webPort`, produced by the root broker after it
+     * verified the container id, `State.StartedAt`, the viewer label and the
+     * loopback publish mapping.
+     *
+     * Optional on purpose, and **only ever set by an operation that just
+     * checked**: a broker that could not read the container, or one older
+     * than this field, simply omits it, and the daemon refuses the bound
+     * request rather than accepting weaker evidence or reaching for the
+     * native registry.
+     */
+    runtimeFingerprint?: string
 }
 
 export type BrowserSessionBrokerResponse =

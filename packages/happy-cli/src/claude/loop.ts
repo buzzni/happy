@@ -7,6 +7,7 @@ import { claudeRemoteLauncher } from "./claudeRemoteLauncher"
 import { ApiClient } from "@/lib"
 import type { JsRuntime } from "./runClaude"
 import type { SandboxConfig } from "@/persistence"
+import type { SandboxPolicyMode } from "@/sandbox/sandboxPolicy"
 import type { McpConfigSource } from './mcpConfigSynchronizer'
 import type { SaycodePromptBlockOverrides } from '@/prompt/promptProvenance'
 import type { CheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition'
@@ -45,9 +46,21 @@ interface LoopOptions {
     api: ApiClient,
     claudeEnvVars?: Record<string, string>
     claudeArgs?: string[]
+    /**
+     * A managed Cloud run loads no filesystem settings.
+     *
+     * A settings file's `env` block is applied to the agent and wins over the
+     * environment this startup produced, so `~/.claude/settings.json` on the
+     * runtime image could redirect the gateway or substitute a key after the
+     * approval was made. Managed runs load none of those sources.
+     */
+    managedSettingsLockdown?: boolean
+    /** A managed Cloud run: steering and goal-setting are refused. */
+    managedRun?: boolean
     messageQueue: MessageQueue2<EnhancedMode>
     allowedTools?: string[]
     sandboxConfig?: SandboxConfig
+    sandboxPolicyMode?: SandboxPolicyMode
     checkpointComposition?: CheckpointSessionComposition
     onSessionReady?: (session: Session) => void
     onAbort?: () => void
@@ -72,12 +85,15 @@ export async function loop(opts: LoopOptions): Promise<number> {
         sessionId: null,
         claudeEnvVars: opts.claudeEnvVars,
         claudeArgs: opts.claudeArgs,
+        managedSettingsLockdown: opts.managedSettingsLockdown,
+        managedRun: opts.managedRun,
         mcpServers: opts.mcpServers,
         mcpConfig: opts.mcpConfig,
         logPath: logPath,
         messageQueue: opts.messageQueue,
         allowedTools: opts.allowedTools,
         sandboxConfig: opts.sandboxConfig,
+        sandboxPolicyMode: opts.sandboxPolicyMode,
         checkpointComposition: opts.checkpointComposition,
         onModeChange: opts.onModeChange,
         onAbort: opts.onAbort,
