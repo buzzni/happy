@@ -222,8 +222,14 @@ export const MessageMetaSchema = z.object({
   // made for a Default session. Only a pin is published as the session's active
   // model; publishing a router pick would freeze the session on it. Absent means
   // 'user' so clients that never auto-route (desktop, web) need no change.
-  // Omitted markers remain legacy user choices. Invalid present markers must
-  // still route the message, but cannot turn an unknown router into a user pin.
+  //
+  // .catch() for the same reason as saycodePromptBlocks below: a malformed value
+  // must never stop the message from being routed. It falls back to 'auto', not
+  // to undefined: a client that sent a marker we cannot read has told us the
+  // provenance is something other than a plain user pin, and undefined would
+  // turn that unknown into a durable pin that freezes the session's model. An
+  // omitted field still parses to undefined — only a present, invalid value
+  // lands here.
   modelSource: z.enum(['user', 'auto']).optional().catch('auto'),
   fallbackModel: z.string().nullable().optional(), // Fallback model for this message (null = reset)
   effort: z.string().nullable().optional(), // Reasoning effort for this message (null = reset)

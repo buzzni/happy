@@ -6,7 +6,7 @@ import {
     publishedSessionModelPin,
     type SessionModelPin,
 } from './sessionModelPin';
-import type { Metadata } from '@/api/types';
+import { MessageMetaSchema, type Metadata } from '@/api/types';
 
 const NO_PIN: SessionModelPin = {};
 
@@ -334,5 +334,55 @@ describe('createSessionModelPinPublisher restart and reset convergence', () => {
         expect(latest().currentModelCode).toBe('claude-opus-5');
         publisher.reset();
         expect('currentModelCode' in latest()).toBe(false);
+    });
+});
+
+// The schema and the pin decision are two halves of one contract: the loops feed
+// a parsed meta straight into applySessionModelPinTurn. Testing them apart let a
+// marker the schema could not read still arrive as "no marker", which the pin
+// logic reads as a deliberate user pin.
+describe('MessageMetaSchema + applySessionModelPinTurn, composed', () => {
+    function publishFor(rawMeta: unknown) {
+        const meta = MessageMetaSchema.parse(rawMeta);
+        return applySessionModelPinTurn({
+            pin: {},
+            published: {},
+            turn: {
+                specifiesModel: Object.prototype.hasOwnProperty.call(meta, 'model'),
+                model: meta.model ?? undefined,
+                specifiesEffort: Object.prototype.hasOwnProperty.call(meta, 'effort'),
+                effort: meta.effort ?? undefined,
+                source: meta.modelSource,
+            },
+        });
+    }
+
+    it('records a model the user pinned', () => {
+        expect(publishFor({ model: 'claude-opus-5', modelSource: 'user' }).patch)
+            .toEqual({ currentModelCode: 'claude-opus-5', currentThoughtLevelCode: null });
+    });
+
+    it('records a model from a client that sends no marker at all', () => {
+        expect(publishFor({ model: 'claude-opus-5' }).patch)
+            .toEqual({ currentModelCode: 'claude-opus-5', currentThoughtLevelCode: null });
+    });
+
+    it('never records a model the client marked as auto-routed', () => {
+        expect(publishFor({ model: 'claude-sonnet-5', modelSource: 'auto' }).patch).toBeNull();
+    });
+
+    // The case this composed test exists for: an unknown marker is not "no
+    // marker". A client that names a provenance we cannot read must not have its
+    // model frozen onto the session as a user pin.
+    it('never records a model whose marker it cannot read', () => {
+        expect(publishFor({ model: 'claude-sonnet-5', modelSource: 'router-v2' }).patch).toBeNull();
+        expect(publishFor({ model: 'claude-sonnet-5', modelSource: 42 }).patch).toBeNull();
+        expect(publishFor({ model: 'claude-sonnet-5', modelSource: null }).patch).toBeNull();
+    });
+
+    it('still routes the message when the marker is unreadable', () => {
+        const meta = MessageMetaSchema.parse({ permissionMode: 'default', model: 'x', modelSource: 'router-v2' });
+        expect(meta.permissionMode).toBe('default');
+        expect(meta.model).toBe('x');
     });
 });
