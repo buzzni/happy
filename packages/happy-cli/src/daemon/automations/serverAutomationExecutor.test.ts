@@ -773,6 +773,157 @@ describe('runServerAutomationTick', () => {
     expect(transport.report).toHaveBeenCalled()
   })
 
+  // 2026-09-12 프로덕션 — aplus 트리거 설정을 저장하자 generation 이 13 → 14 로 올랐고,
+  // pruneRuntimeState 가 옛 generation 의 githubTriggers 행을 통째로 버렸다. 다음 폴링이
+  // "baseline recorded from 100 pull requests; nothing fires until a newer one appears" 를
+  // 남기며 처음부터 다시 시작했고, 그 사이 열린 PR #3784·#3785·#3786 은 baseline 에
+  // 흡수돼 영영 발화하지 않았다. 로그 한 줄 말고는 PR 쪽에 흔적이 없어 "왜 리뷰가 안
+  // 돌지" 로만 보였다.
+  //
+  // 고수위(highestPrNumber)·processed 는 "저장소에서 무엇을 이미 봤나" 이지 자동화
+  // 설정이 아니다. 프롬프트나 필터를 고쳤다고 PR #3786 을 안 본 것이 되지 않는다.
+  it('carries the GitHub trigger high-water state across an automation edit', async () => {
+    const { input, store, queryGithubPullRequests, spawnSession, logDebug } = setup({
+      generation: 3,
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review {pr.number}: {pr.title}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      schedules: [{ automationId: 'automation-1', generation: 3, nextRunAt: 1_000_000, lastSessionId: null }],
+      // 편집 직전의 상태: 10번까지 봤고 10번은 이미 처리했다.
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 10, processed: ['10:opened'], pending: [] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
+      pullRequests: [{
+        number: 11, title: 'Add search', url: 'https://github.test/o/r/pull/11', author: { login: 'alice' },
+        baseRefName: 'main', headRefName: 'feature/search', isDraft: false, state: 'OPEN', mergedAt: null,
+        labels: [], changedFiles: 1, files: [{ path: 'apps/web/page.tsx' }],
+      }],
+    })
+
+    await runServerAutomationTick(input)
+
+    // 다시 baseline 을 잡으면 11번도 묻힌다.
+    expect(logDebug.mock.calls.map(([line]) => String(line)).filter((line) => /baseline recorded/.test(line)))
+      .toHaveLength(0)
+    expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
+      initialPrompt: expect.stringContaining('Review 11: Add search'),
+    }))
+    const carried = store.state().githubTriggers?.[0]
+    expect(carried?.generation).toBe(3)
+    expect(carried?.state.processed).toEqual(expect.arrayContaining(['10:opened', '11:opened']))
+  })
+
+  // 같은 사고가 다른 문으로도 들어온다. payloads 는 복호에 성공한 자동화만 담으므로,
+  // 일시적 복호 실패(머신 키 문제 등)에도 트리거 행이 버려져 baseline 이 초기화된다.
+  // 복호가 안 되면 트리거가 사라졌는지 알 수 없다 — 모르면 지우지 않는다.
+  it('keeps the GitHub trigger state when the payload cannot be decrypted', async () => {
+    const { input, store, queryGithubPullRequests } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => { throw new Error('machine key unavailable') })
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 10, processed: ['10:opened'], pending: [] },
+      }],
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(store.state().githubTriggers?.[0]?.state)
+      .toMatchObject({ highestPrNumber: 10, processed: ['10:opened'] })
+    expect(queryGithubPullRequests).not.toHaveBeenCalled()
+  })
+
+  // 반대로 트리거를 실제로 뗀 자동화의 행은 남길 이유가 없다.
+  it('drops the GitHub trigger state once the automation no longer has a trigger', async () => {
+    const { input, store } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'Plain', schedule: { kind: 'interval' as const, minutes: 15 as const },
+      prompt: 'run', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 10, processed: ['10:opened'], pending: [] },
+      }],
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(store.state().githubTriggers).toEqual([])
+  })
+
+  // 편집 시점에 아직 처리 못 한 이벤트는 고수위 아래라 다시 발견되지 않는다 — 같이
+  // 넘기지 않으면 그것도 조용히 사라진다.
+  it('carries a queued GitHub event across an automation edit', async () => {
+    const { input, store, queryGithubPullRequests, spawnSession } = setup({
+      generation: 3,
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const },
+      prompt: 'Review {pr.number}: {pr.title}', directory: '/repo', scriptCommand: null,
+      suppressSilent: false, agent: 'codex' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] },
+        action: 'start-session' as const,
+        githubCredentialId: 'credential-1',
+      },
+    }))
+    const queued = {
+      id: '9:opened', event: 'opened' as const,
+      pr: {
+        number: 9, title: 'Queued before the edit', url: 'https://github.test/o/r/pull/9',
+        author: { login: 'alice' }, baseRefName: 'main', headRefName: 'feature/queued',
+        isDraft: false, state: 'OPEN', mergedAt: null, labels: [], changedFiles: 1,
+        files: [{ path: 'apps/web/page.tsx' }],
+      },
+    }
+    store.write({
+      ...store.read(),
+      schedules: [{ automationId: 'automation-1', generation: 3, nextRunAt: 1_000_000, lastSessionId: null }],
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 10, processed: [], pending: [queued] },
+      }],
+    })
+    queryGithubPullRequests.mockResolvedValue({
+      ok: true,
+      githubEnvironment: { GH_TOKEN: 'run-scoped-token', GH_REPO: 'acme/app' },
+      pullRequests: [],
+    })
+
+    await runServerAutomationTick(input)
+
+    expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
+      initialPrompt: expect.stringContaining('Review 9: Queued before the edit'),
+    }))
+  })
+
   it('persists a matching GitHub event before starting a session with the rendered prompt', async () => {
     const {
       input, store, queryGithubPullRequests, spawnSession, createGithubIssueProgressMarker,
