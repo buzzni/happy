@@ -3426,13 +3426,21 @@ export async function startDaemon(): Promise<void> {
          * On success the live socket takes it up too. `replaceToken` re-auths
          * by dropping the connection so the reconnect presents the new bearer:
          * the server revalidates the grant on every event against the token the
-         * handshake carried, so a socket still presenting the superseded one
-         * starts being refused immediately. Writing the file alone would leave
-         * a runtime that looks connected while everything it asks for fails.
+         * handshake carried, and refuses the superseded one once its renewal
+         * grace ends. Writing the file alone would leave a runtime that looks
+         * connected while everything it asks for fails.
          *
          * Only after the write. A socket re-authed with a bearer that was then
          * refused for the disk would be presenting a credential this runtime
          * does not have.
+         *
+         * And only after the **answer has left**. This runs inside the
+         * `managed:credential` RPC; dropping the socket here drops the
+         * response with it, and the parent — told nothing — pushes again
+         * (seen on the first dev renewal: `io client disconnect` between the
+         * handler returning and its response being sent). The grace the
+         * server keeps for the superseded generation is what makes a moment's
+         * delay safe.
          */
         replaceCredential: async (replacement) => {
           const outcome = await replaceManagedDaemonCredential({
@@ -3442,7 +3450,9 @@ export async function startDaemon(): Promise<void> {
             now: Date.now(),
             deps: defaultProvisioningDeps,
           });
-          if (outcome.ok) apiMachine.replaceToken(replacement.token);
+          if (outcome.ok) {
+            setTimeout(() => apiMachine.replaceToken(replacement.token), 500).unref();
+          }
           return outcome;
         },
       });
