@@ -1098,6 +1098,13 @@ model ManagedDaemonGrant {
     /// converges the same way an issue retry does.
     renewalRequestId String?
     renewalBodyDigest String?
+    /// Until when the generation a renewal just superseded may still act.
+    /// A renewal is delivered to the daemon over the socket that authenticated
+    /// with the *previous* credential; refusing that generation the instant
+    /// the new one exists refuses the delivery itself, and the daemon can never
+    /// learn the credential that would let it back in. Bounded: after this the
+    /// old generation is refused like any other. A revocation ignores it.
+    supersededGraceUntil BigInt?
     createdAt     BigInt
     updatedAt     BigInt
 
