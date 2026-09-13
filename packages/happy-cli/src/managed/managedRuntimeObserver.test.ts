@@ -6,13 +6,14 @@
  * matched to a device, and that every way of not knowing answers `null` rather
  * than something that looks like knowledge.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
     FS_UUID_DIR,
     deviceForPath,
     observeManagedVolume,
     readFsUuidForDevice,
+    parseExt4SuperblockUuid,
 } from '@/managed/managedRuntimeObserver';
 
 /** Real `mountinfo` shape: id parent major:minor rootInDevice mountPoint … */
@@ -117,6 +118,57 @@ describe('what this boot can observe about its volume', () => {
         expect(observeManagedVolume({
             projectRoot: '/workspace/project',
             deps: { ...deps, listUuidEntries: () => [] },
+        })).toBeNull();
+    });
+});
+
+describe('the filesystem identity read from the superblock', () => {
+    // Fly's init runs no udev: there is no /dev/disk/by-uuid at all, so the
+    // identity has to come from where the kernel would have read it — the
+    // ext4 superblock of the device the project root is mounted from.
+    const superblock = (magic: number): Buffer => {
+        const buf = Buffer.alloc(256);
+        buf.writeUInt16LE(magic, 0x38);
+        Buffer.from('9447842d55f24180a4456bd90d9cb723', 'hex').copy(buf, 0x68);
+        return buf;
+    };
+
+    it('formats the ext4 UUID the way the by-uuid directory would name it', () => {
+        expect(parseExt4SuperblockUuid(superblock(0xef53)))
+            .toBe('9447842d-55f2-4180-a445-6bd90d9cb723');
+    });
+
+    it('refuses a superblock without the ext4 magic', () => {
+        // A random device read as a superblock yields random bytes, and random
+        // bytes formatted as a UUID would seal a volume to noise.
+        expect(parseExt4SuperblockUuid(superblock(0x1234))).toBeNull();
+        expect(parseExt4SuperblockUuid(Buffer.alloc(16))).toBeNull();
+    });
+
+    it('falls back to the superblock only when by-uuid publishes nothing', () => {
+        const node = vi.fn(() => '/dev/vdc');
+        const read = vi.fn(() => '9447842d-55f2-4180-a445-6bd90d9cb723');
+        expect(readFsUuidForDevice('254:32', {
+            listUuidEntries: () => [], readDeviceNode: node, readSuperblockUuid: read,
+        })).toBe('9447842d-55f2-4180-a445-6bd90d9cb723');
+        expect(node).toHaveBeenCalledWith('254:32');
+        expect(read).toHaveBeenCalledWith('/dev/vdc');
+    });
+
+    it('does not consult the superblock when by-uuid already answered', () => {
+        const node = vi.fn(() => '/dev/vdc');
+        expect(readFsUuidForDevice('259:1', {
+            listUuidEntries: () => ['1111-aaaa'],
+            deviceOf: () => 259 * 256 + 1,
+            readDeviceNode: node,
+            readSuperblockUuid: () => 'never',
+        })).toBe('1111-aaaa');
+        expect(node).not.toHaveBeenCalled();
+    });
+
+    it('answers null when the kernel names no node for the device', () => {
+        expect(readFsUuidForDevice('254:32', {
+            listUuidEntries: () => [], readDeviceNode: () => null, readSuperblockUuid: () => 'never',
         })).toBeNull();
     });
 });
