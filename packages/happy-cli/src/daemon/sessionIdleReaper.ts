@@ -367,7 +367,10 @@ export type DaemonSessionIdleReaperConfig = {
   batchMax: number;
 };
 
-export function readDaemonSessionIdleReaperConfig(env: NodeJS.ProcessEnv = process.env): DaemonSessionIdleReaperConfig {
+export function readDaemonSessionIdleReaperConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  runtime: { managedRuntimeActive: boolean } = { managedRuntimeActive: false },
+): DaemonSessionIdleReaperConfig {
   const idleAfterMs = parseOptionalMs(env.HAPPY_DAEMON_SESSION_IDLE_REAPER_AFTER_MS);
   const presenceStaleMs = parseOptionalMs(env.HAPPY_DAEMON_SESSION_IDLE_REAPER_PRESENCE_STALE_MS);
   // Turn-end reap: default 1h; env override; explicit 0 disables it (absolute
@@ -379,7 +382,12 @@ export function readDaemonSessionIdleReaperConfig(env: NodeJS.ProcessEnv = proce
     : (turnEndRaw > 0 ? turnEndRaw : undefined);
   const batchMax = parseOptionalCount(env.HAPPY_DAEMON_SESSION_IDLE_REAPER_BATCH_MAX);
   return {
-    disabled: isTruthy(env.HAPPY_DAEMON_SESSION_IDLE_REAPER_DISABLED),
+    // The candidates route authenticates an *account*. A managed runtime's
+    // bearer names a machine grant, so the round-trip would be refused on
+    // every tick; and the parent already owns that runtime's lifecycle through
+    // leases. Off, not "on and failing" — the same rule as script automations
+    // and the BYOS offline receiver.
+    disabled: runtime.managedRuntimeActive || isTruthy(env.HAPPY_DAEMON_SESSION_IDLE_REAPER_DISABLED),
     idleAfterMs: idleAfterMs ?? DEFAULT_DAEMON_SESSION_IDLE_REAPER_AFTER_MS,
     ...(presenceStaleMs !== undefined ? { presenceStaleMs } : {}),
     ...(turnEndReaperMs !== undefined ? { turnEndReaperMs } : {}),

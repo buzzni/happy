@@ -3885,7 +3885,7 @@ export async function startDaemon(): Promise<void> {
     const heartbeatIntervalMs = Number.isFinite(heartbeatIntervalMsEnv) && heartbeatIntervalMsEnv > 0
       ? heartbeatIntervalMsEnv
       : 60_000;
-    const idleReaperConfig = readDaemonSessionIdleReaperConfig(process.env);
+    const idleReaperConfig = readDaemonSessionIdleReaperConfig(process.env, { managedRuntimeActive });
     const emptySessionReaperMs = readEmptySessionReaperMs(process.env);
     let heartbeatRunning = false
     const restartOnStaleVersionAndHeartbeat = setInterval(async () => {
