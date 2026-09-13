@@ -48,6 +48,16 @@ describe('createManagedFollowUpGate', () => {
         expect(gate.take('m-2')).toBe('accepted');
     });
 
+    it('takes an id again once it was given back', () => {
+        const gate = createManagedFollowUpGate();
+        gate.take('m-1');
+        gate.release('m-1');
+        expect(gate.take('m-1')).toBe('accepted');
+        // Releasing an id nobody took changes nothing.
+        gate.release('m-9');
+        expect(gate.take('m-9')).toBe('accepted');
+    });
+
     it('remembers a bounded number of ids, oldest first out', () => {
         const gate = createManagedFollowUpGate({ remember: 2 });
         gate.take('a'); gate.take('b'); gate.take('c');
@@ -67,10 +77,26 @@ describe('createManagedFollowUpHandler', () => {
         return { handler, calls };
     }
 
-    it('shows the turn, then queues it, and reports it accepted', async () => {
+    it('queues the turn, shows it in the same tick, and reports it accepted', async () => {
         const { handler, calls } = build();
         expect(await handler({ localId: 'm-1', text: 'Reply PING' })).toEqual({ accepted: true });
-        expect(calls).toEqual(['echo:m-1:Reply PING', 'enqueue:Reply PING']);
+        expect(calls).toEqual(['enqueue:Reply PING', 'echo:m-1:Reply PING']);
+    });
+
+    it('gives the client id back when the queue refuses, so the retry is a turn and not a duplicate', async () => {
+        const calls: string[] = [];
+        let closed = true;
+        const handler = createManagedFollowUpHandler({
+            managed: () => true,
+            echo: (turn) => calls.push(`echo:${turn.localId}`),
+            enqueue: (text) => { if (closed) throw new Error('Cannot push to closed queue'); calls.push(`enqueue:${text}`); },
+        });
+        // A run winding down closes its queue; the sender sees a refusal, not a phantom acceptance.
+        expect(await handler({ localId: 'm-1', text: 'Reply PING' })).toEqual({ accepted: false, reason: 'not-accepting' });
+        expect(calls).toEqual([]);
+        closed = false;
+        expect(await handler({ localId: 'm-1', text: 'Reply PING' })).toEqual({ accepted: true });
+        expect(calls).toEqual(['enqueue:Reply PING', 'echo:m-1']);
     });
 
     it('takes a retry of the same turn once: the second answer says duplicate and queues nothing', async () => {
@@ -91,6 +117,6 @@ describe('createManagedFollowUpHandler', () => {
         expect(await handler({ localId: 'm-1', text: '/clear' })).toEqual({ accepted: false, reason: 'command-not-allowed' });
         // The id was not consumed: the same id with real text is a new turn.
         expect(await handler({ localId: 'm-1', text: 'Reply PING' })).toEqual({ accepted: true });
-        expect(calls).toEqual(['echo:m-1:Reply PING', 'enqueue:Reply PING']);
+        expect(calls).toEqual(['enqueue:Reply PING', 'echo:m-1:Reply PING']);
     });
 });

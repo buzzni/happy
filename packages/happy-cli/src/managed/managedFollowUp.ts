@@ -48,6 +48,8 @@ export function parseManagedFollowUp(params: unknown): ManagedFollowUpParse {
 export type ManagedFollowUpGate = {
     /** Whether this client id is a new turn. The first answer for an id is the only `accepted`. */
     take: (localId: string) => 'accepted' | 'duplicate';
+    /** Gives an id back when the turn it was taken for could not be queued. */
+    release: (localId: string) => void;
 };
 
 /**
@@ -70,20 +72,28 @@ export function createManagedFollowUpGate(options: { remember?: number } = {}): 
             }
             return 'accepted';
         },
+        release(localId) {
+            if (!index.delete(localId)) return;
+            const at = seen.indexOf(localId);
+            if (at >= 0) seen.splice(at, 1);
+        },
     };
 }
 
 export type ManagedFollowUpAnswer =
     | { accepted: true; duplicate?: true }
-    | { accepted: false; reason: 'not-managed' | ManagedFollowUpRefusal };
+    | { accepted: false; reason: 'not-managed' | 'not-accepting' | ManagedFollowUpRefusal };
 
 /**
  * The `follow-up` RPC handler, the same for every agent.
  *
- * Order matters and is fixed here: the turn is shown before it is queued, so
- * a transcript never carries an answer without the question above it. Nothing
- * is awaited between the gate and the queue, so `accepted` means the turn is
- * in the queue when the caller reads it.
+ * Nothing is awaited between the gate and the queue, so `accepted` means the
+ * turn is in the queue when the caller reads it. The queue goes first: it is
+ * the one step that can refuse (a run winding down closes it), and a turn
+ * shown but never queued is a question with no answer. The visible row is
+ * still queued to the socket in the same tick, before any provider output can
+ * exist, so the transcript order holds. A refused queue gives the client id
+ * back — a retry of that send must be a turn, not a `duplicate` of nothing.
  */
 export function createManagedFollowUpHandler(deps: {
     /** Whether this run is managed. Read per call: it is decided after startup. */
@@ -100,8 +110,13 @@ export function createManagedFollowUpHandler(deps: {
         const parsed = parseManagedFollowUp(params);
         if (!parsed.ok) return { accepted: false, reason: parsed.reason };
         if (gate.take(parsed.localId) === 'duplicate') return { accepted: true, duplicate: true };
+        try {
+            deps.enqueue(parsed.text);
+        } catch {
+            gate.release(parsed.localId);
+            return { accepted: false, reason: 'not-accepting' };
+        }
         deps.echo({ localId: parsed.localId, text: parsed.text });
-        deps.enqueue(parsed.text);
         return { accepted: true };
     };
 }

@@ -517,6 +517,21 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         return false;
     };
 
+    /*
+     * Follow-up turns already shown to the transcript (T07-L5-b). The scanner
+     * meets them in the JSONL when Claude takes them from the queue and must
+     * not show them a second time. Unlike `recentAppPrompts` these do not roll
+     * off with time: a turn queued behind a long one is taken minutes later,
+     * and an expired entry there means a duplicate row. Each is consumed once.
+     */
+    const shownFollowUps: string[] = [];
+    const consumeShownFollowUp = (text: string): boolean => {
+        const at = shownFollowUps.indexOf(text);
+        if (at < 0) return false;
+        shownFollowUps.splice(at, 1);
+        return true;
+    };
+
     let currentRunMode: 'local' | 'remote' = options.startingMode ?? 'local';
     let latestClaudeGoalStatus: AgentGoalStatus | null = null;
     const observedClaudeGoalRevisions = new Set<string>();
@@ -599,7 +614,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             if (content.trim().length === 0) return;
             // App-sent prompts will show up here because the SDK
             // writes them to the JSONL — dedupe by content.
-            if (consumeAppPrompt(content)) return;
+            if (consumeAppPrompt(content) || consumeShownFollowUp(content)) return;
             session.sendClaudeSessionMessage(raw);
         },
         onTranscriptEvent: updateClaudeGoalState,
@@ -789,13 +804,16 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             // The visible user row, sent as an envelope and not through the
             // transcript mapper: that mapper closes the running turn on a plain
             // user record, and a turn queued behind one in progress must not
-            // end it. `recordAppPrompt` keeps the scanner from showing the row
-            // a second time when Claude takes it from the queue.
-            recordAppPrompt(text);
+            // end it. The scanner will meet this text in the JSONL when Claude
+            // takes it, and skips it then — once, however long the wait.
+            shownFollowUps.push(text);
             session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }), localId);
         },
         enqueue: (text) => {
-            messageQueue.push(text, currentEnhancedMode(), []);
+            // Isolated: the queue joins consecutive same-mode inputs into one
+            // prompt, and a joined prompt matches no row the scanner was told
+            // about — it would show up again, as one row with two turns in it.
+            messageQueue.pushIsolated(text, currentEnhancedMode(), []);
             logger.debug('[managed] Follow-up turn queued');
         },
     }));
