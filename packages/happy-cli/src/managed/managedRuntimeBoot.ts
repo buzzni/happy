@@ -1031,7 +1031,10 @@ export function defaultManagedRuntimeBootDeps(
         },
         providerInstance: () => ({
             providerMachineId: process.env.FLY_MACHINE_ID?.trim() || null,
-            providerInstanceId: process.env.FLY_ALLOC_ID?.trim() || null,
+            // The machine's version — what the Machines API calls `instance_id`
+            // and what the parent recorded at creation. FLY_ALLOC_ID is the
+            // machine id again, not the instance.
+            providerInstanceId: process.env.FLY_MACHINE_VERSION?.trim() || null,
         }),
         writeMarker: async (input) => {
             const { writeManagedMarker } = await import('@/managed/managedMarkerWriter');
