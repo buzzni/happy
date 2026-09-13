@@ -47,6 +47,13 @@ export type ManagedMarkerRecord = {
     providerMachineId: string;
     providerInstanceId: string;
     providerVolumeId: string;
+    /**
+     * Whether this operation created the volume, as the parent's protected
+     * boot input states it. The only authority under which the boot may record
+     * a fresh volume as `empty-initialized`; absent from the input reads as
+     * `false`, never as "nothing is on it".
+     */
+    volumeCreatedByOperation: boolean;
     stateDir: string;
     workspaceDir: string;
     verifierPublicKey: string;
@@ -129,6 +136,7 @@ const KEYS = {
     stateDir: 'saycode_state_dir',
     workspaceDir: 'saycode_workspace_dir',
     volume: 'saycode_volume',
+    volumeCreated: 'saycode_volume_created',
     /**
      * How long one broker grant may live, and how long one tool call may run.
      *
@@ -234,7 +242,13 @@ export function composeManagedMarker(input: {
     const failureBackoffMs = backoffRaw === null
         ? undefined
         : id(metadata, OPTIONAL_KEYS.checkpointFailureBackoffMs);
-    if (onTurnBoundary === null || failureBackoffMs === null) {
+    // Optional — an older parent does not send it, and that reads as "not
+    // created by this operation" — but present and unreadable is a refusal.
+    const volumeCreatedRaw = text(metadata, KEYS.volumeCreated);
+    const volumeCreatedByOperation = volumeCreatedRaw === null
+        ? false
+        : volumeCreatedRaw === 'true' ? true : volumeCreatedRaw === 'false' ? false : null;
+    if (onTurnBoundary === null || failureBackoffMs === null || volumeCreatedByOperation === null) {
         return { ok: false, reason: 'metadata-incomplete' };
     }
     if (Object.values(strings).some((value) => value === null)
@@ -269,6 +283,7 @@ export function composeManagedMarker(input: {
             providerMachineId,
             providerInstanceId,
             providerVolumeId: strings.providerVolumeId!,
+            volumeCreatedByOperation,
             stateDir: strings.stateDir!,
             workspaceDir: strings.workspaceDir!,
             verifierPublicKey: strings.verifierPublicKey!,

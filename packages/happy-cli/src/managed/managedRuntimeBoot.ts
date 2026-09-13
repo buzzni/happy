@@ -69,6 +69,8 @@ import {
 } from '@/daemon/managedDaemonAccount';
 import { resolveManagedVolumeBinding } from '@/managed/managedVolumeBinding';
 import { readManagedDaemonCredential } from '@/daemon/managedDaemonCredential';
+import { prepareManagedVolume } from '@/managed/managedRuntimeBootstrap';
+import type { ManagedVolumeIdentity } from '@/managed/managedRestoreState';
 import {
     MANAGED_DAEMON_CREDENTIAL_INPUT_PATH,
     adoptManagedDaemonCredential,
@@ -345,7 +347,11 @@ export type ManagedRuntimeBootDeps = {
      * tool could touch its own project. Absent here means there is nothing to
      * restore (T13 supplies the archive side), not that restoring is optional.
      */
-    restore?: () => Promise<'restored' | 'nothing-to-restore'>;
+    restore?: (input: {
+        stateDir: string;
+        workspace: string;
+        volume: ManagedVolumeIdentity;
+    }) => Promise<'restored' | 'nothing-to-restore'>;
     /**
      * Asks what a crashed promotion left behind, and whether it may go.
      *
@@ -784,6 +790,24 @@ export async function runManagedRuntimeBoot(
          * seal and the launcher record — anything that could write there could tell
          * the parent whatever it liked about this runtime's readiness.
          */
+        /*
+         * Observed once, here, while this process is still the trusted one.
+         *
+         * The daemon reads the same binding later for its own facts; what this run
+         * adds is that whoever configures the supervisor gets the *observed* uuid
+         * rather than a value copied from the parent's description.
+         */
+        try {
+            const sealed = await deps.observeVolume({
+                stateDir,
+                providerVolumeId: identity.identity.providerVolumeId,
+                deps: provisioning,
+            });
+            volume = sealed.ok ? sealed.binding : null;
+        } catch {
+            // An observation that failed is an absent observation, never a guess.
+            volume = null;
+        }
         const isolation = identity.identity.isolation;
         try {
             /*
@@ -797,7 +821,17 @@ export async function runManagedRuntimeBoot(
              * entirely, and it throws: read as "nothing to restore" it would clear
              * a volume holding real work.
              */
-            if (deps.restore) await deps.restore();
+            if (deps.restore && volume !== null) {
+                await deps.restore({
+                    stateDir,
+                    workspace: MANAGED_PROJECT_ROOT,
+                    volume: {
+                        volumeId: volume.providerVolumeId,
+                        deviceUuid: volume.fsUuid,
+                        createdByThisOperation: identity.identity.volumeCreatedByOperation,
+                    },
+                });
+            }
             await deps.assignWorkspace({
                 path: MANAGED_PROJECT_ROOT,
                 uid: isolation.executor.uid,
@@ -840,24 +874,6 @@ export async function runManagedRuntimeBoot(
         }
         if (staging !== 'clear') return { ok: false, reason: 'restore-unresolved' };
 
-        /*
-         * Observed once, here, while this process is still the trusted one.
-         *
-         * The daemon reads the same binding later for its own facts; what this run
-         * adds is that whoever configures the supervisor gets the *observed* uuid
-         * rather than a value copied from the parent's description.
-         */
-        try {
-            const sealed = await deps.observeVolume({
-                stateDir,
-                providerVolumeId: identity.identity.providerVolumeId,
-                deps: provisioning,
-            });
-            volume = sealed.ok ? sealed.binding : null;
-        } catch {
-            // An observation that failed is an absent observation, never a guess.
-            volume = null;
-        }
 
         /*
          * Last, and only here.
@@ -1050,6 +1066,29 @@ export function defaultManagedRuntimeBootDeps(
         // strict, so a narrowing that did not happen is still a refusal rather
         // than an assumption.
         adoptCredential: (input) => adoptManagedDaemonCredential(input),
+        /*
+         * Lays the restore record down for a volume this operation created.
+         *
+         * Only the empty-initialisation half is wired: the checkpoint archive
+         * side (T13) is not, so `checkpoint` is `null` and the executor port
+         * refuses if it is ever reached. The producer lock is bypassed for the
+         * same reason — a fresh volume has no checkpoint store to lock against
+         * yet, and the only write here is one atomic record.
+         */
+        restore: async (input) => {
+            const state = await prepareManagedVolume({
+                stateDir: input.stateDir,
+                workspace: input.workspace,
+                volume: input.volume,
+                checkpoint: null,
+                restore: {
+                    execute: async () => { throw new Error('managed restore executor is not wired'); },
+                },
+                withProducerLock: (action) => action(),
+                deps: defaultProvisioningDeps,
+            });
+            return state.status === 'restored' ? 'restored' : 'nothing-to-restore';
+        },
         makeTrustedDirectory: async (path, mode) => { makeTrustedDirectorySync(path, mode); },
         ensureProjectRoot: async (path) => { makeTrustedDirectorySync(path, 0o755); },
         /*

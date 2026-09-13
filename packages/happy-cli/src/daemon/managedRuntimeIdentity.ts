@@ -108,6 +108,8 @@ export type ManagedRuntimeIdentity = {
      * would be agreeing with itself.
      */
     providerVolumeId: string;
+    /** The parent's statement that this operation created the volume; see the marker. */
+    volumeCreatedByOperation: boolean;
     verifier: KeyObject;
     /** Directory the receipt store owns. Never inside the agent workspace. */
     stateDir: string;
@@ -592,12 +594,18 @@ export function resolveManagedRuntimeIdentity(
     const providerMachineId = readString(record.providerMachineId);
     const providerInstanceId = readString(record.providerInstanceId);
     const providerVolumeId = readString(record.providerVolumeId);
+    // Written by the composer as a boolean; anything else is not the marker
+    // the boot wrote. Absent reads as `false` — a marker from before the axis
+    // existed says nothing about who created the volume.
+    const volumeCreatedRaw = record.volumeCreatedByOperation;
+    const volumeCreatedByOperation = volumeCreatedRaw === undefined ? false
+        : typeof volumeCreatedRaw === 'boolean' ? volumeCreatedRaw : null;
     const stateDir = readString(record.stateDir, 4096);
     const workspaceDir = readString(record.workspaceDir, 4096);
     const verifierKeyB64 = readString(record.verifierPublicKey, 4096);
     if (!runtimeId || !workspaceId || !projectId || !keyId || !stateDir || !workspaceDir || !verifierKeyB64
         || !happyMachineId || !provisioningOperationId || !configDigest
-        || !providerMachineId || !providerInstanceId || !providerVolumeId) {
+        || !providerMachineId || !providerInstanceId || !providerVolumeId || volumeCreatedByOperation === null) {
         return { status: 'refused', reason: 'malformed', detail: 'missing required field' };
     }
 
@@ -715,6 +723,7 @@ export function resolveManagedRuntimeIdentity(
             providerMachineId,
             providerInstanceId,
             providerVolumeId,
+            volumeCreatedByOperation,
             verifier,
             stateDir: resolve(stateDir),
             isolation: { backend: backend as ManagedIsolationBackend, provider, executor, cgroupRoot },
