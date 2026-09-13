@@ -97,6 +97,7 @@ const identity: ManagedRuntimeIdentity = {
     providerMachineId: 'provider-machine-1',
     providerInstanceId: 'provider-instance-1',
     providerVolumeId: 'vol_fixture_1',
+    volumeCreatedByOperation: false,
     verifier,
     stateDir: '/unused',
     isolation: { backend: 'privileged-launch-supervisor', provider: { uid: 901, gid: 901 }, executor: { uid: 902, gid: 901 }, cgroupRoot: '/c' },

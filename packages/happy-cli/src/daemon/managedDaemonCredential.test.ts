@@ -646,7 +646,7 @@ function credentialHandlers(replaceCredential: ManagedRuntime['replaceCredential
         identity: { runtimeId: admitted.runtimeId, workspaceId: admitted.workspaceId, projectId: admitted.projectId,
             keyId: admitted.keyId, provisioningOperationId: admitted.provisioningOperationId, happyMachineId: MACHINE,
             stateDir, verifier: admitted.verifier, configDigest: 'digest', providerMachineId: 'provider',
-            providerInstanceId: 'instance', providerVolumeId: 'volume',
+            providerInstanceId: 'instance', providerVolumeId: 'volume', volumeCreatedByOperation: false,
             isolation: { backend: 'privileged-launch-supervisor', provider: { uid: 901, gid: 901 }, executor: { uid: 902, gid: 901 }, cgroupRoot: '/unused' },
             toolPolicy: { grantTtlMs: 600_000, callTimeoutMs: 120_000 }, checkpoint: { drainBudgetMs: 15_000 },
             tenant: 'company:fixture', checkpointSchedule: { periodMs: 900_000, onTurnBoundary: true },

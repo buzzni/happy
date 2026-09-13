@@ -70,6 +70,7 @@ describe('composing the marker from the parent boot input', () => {
             providerMachineId: 'fly_m1',
             providerInstanceId: 'inst_1',
             providerVolumeId: 'vol_1',
+            volumeCreatedByOperation: false,
             stateDir: '/var/lib/saycode/state',
             toolPolicy: { grantTtlMs: 600_000, callTimeoutMs: 120_000 },
             checkpoint: { drainBudgetMs: 15_000 },
@@ -233,5 +234,32 @@ describe('the checkpoint schedule the parent approved', () => {
             happyMachineId: 'machine-1',
         });
         expect(composed.ok && composed.record.checkpointSchedule.onTurnBoundary).toBe(false);
+    });
+});
+
+describe('whether this operation created the volume', () => {
+    // The one authority under which a fresh volume may be recorded as
+    // empty-initialised. Optional so an older parent still boots — reading as
+    // "not created here" — but present and unreadable is a refusal.
+    it.each([
+        ['true', true],
+        ['false', false],
+    ])('carries %s from the parent', (raw, expected) => {
+        const outcome = compose({ metadata: { ...INPUT, saycode_volume_created: raw } });
+        expect(outcome.ok).toBe(true);
+        if (!outcome.ok) return;
+        expect(outcome.record.volumeCreatedByOperation).toBe(expected);
+    });
+
+    it('reads absence as not created by this operation', () => {
+        const outcome = compose();
+        expect(outcome.ok).toBe(true);
+        if (!outcome.ok) return;
+        expect(outcome.record.volumeCreatedByOperation).toBe(false);
+    });
+
+    it('refuses a value that is present and unreadable', () => {
+        expect(compose({ metadata: { ...INPUT, saycode_volume_created: 'yes' } }))
+            .toEqual({ ok: false, reason: 'metadata-incomplete' });
     });
 });

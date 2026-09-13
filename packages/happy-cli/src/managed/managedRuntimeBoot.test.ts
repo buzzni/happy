@@ -76,6 +76,8 @@ function identity(over: Partial<ManagedIdentityResolution> = {}): () => ManagedI
             providerMachineId: 'provider-machine-1',
             providerInstanceId: 'provider-instance-1',
             providerVolumeId: 'vol_1',
+            // The common first boot: this operation created the volume.
+            volumeCreatedByOperation: true,
             verifier: {} as never,
             stateDir,
             isolation: {
@@ -91,6 +93,13 @@ function identity(over: Partial<ManagedIdentityResolution> = {}): () => ManagedI
 }
 
 type Recorded = { event: string; detail?: string };
+/** A volume the boot could observe, so the restore has something to bind its record to. */
+const observedVolume = {
+    observeVolume: async () => ({
+        ok: true as const,
+        binding: { providerVolumeId: 'vol_1', deviceMajorMinor: '259:1', fsUuid: 'fs-uuid-1' },
+    }),
+};
 
 
 function bootDeps(over: Partial<Parameters<typeof runManagedRuntimeBoot>[0]> = {}) {
@@ -410,6 +419,7 @@ describe('the root boot stage of a managed runtime', () => {
          * and no tool can touch its own project.
          */
         const { deps, log } = bootDeps({
+            ...observedVolume,
             restore: async () => { log.push({ event: 'restore' }); return 'restored' as const; },
         });
         await runManagedRuntimeBoot(deps);
@@ -422,6 +432,7 @@ describe('the root boot stage of a managed runtime', () => {
         // A half-laid tree with ownership applied over it looks like a prepared
         // volume. It is not one, and the parent must not be told it is.
         const { deps, log } = bootDeps({
+            ...observedVolume,
             restore: async () => { throw new Error('promotion-failed'); },
         });
         expect(await runManagedRuntimeBoot(deps)).toEqual({ ok: false, reason: 'workspace-unassignable' });
@@ -431,8 +442,32 @@ describe('the root boot stage of a managed runtime', () => {
     it('treats "no checkpoint to restore" as a start, not a failure', async () => {
         // A volume this operation created has nothing behind it. Reporting that
         // as a failed boot stops every new project from ever starting.
-        const { deps } = bootDeps({ restore: async () => 'nothing-to-restore' as const });
+        const { deps } = bootDeps({ ...observedVolume, restore: async () => 'nothing-to-restore' as const });
         expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: true });
+    });
+    it('hands the restore the observed volume and the parent\'s created-by-this-operation fact', async () => {
+        // The record the restore writes is bound to the filesystem that is
+        // really mounted (observed uuid, not the parent's description) and to
+        // the one authority under which a fresh volume may be called empty.
+        const seen: unknown[] = [];
+        const { deps } = bootDeps({
+            ...observedVolume,
+            restore: async (input) => { seen.push(input); return 'nothing-to-restore' as const; },
+        });
+        expect(await runManagedRuntimeBoot(deps)).toMatchObject({ ok: true });
+        expect(seen).toEqual([{
+            stateDir,
+            workspace: '/workspace/project',
+            volume: { volumeId: 'vol_1', deviceUuid: 'fs-uuid-1', createdByThisOperation: true },
+        }]);
+    });
+    it('does not run the restore when the volume could not be observed', async () => {
+        // Without an observed filesystem there is nothing to bind a record to;
+        // the daemon reports the restore as pending and the parent waits.
+        const restore = vi.fn(async () => 'nothing-to-restore' as const);
+        const { deps } = bootDeps({ restore });
+        await runManagedRuntimeBoot(deps);
+        expect(restore).not.toHaveBeenCalled();
     });
 
     it('refuses to start when a crashed promotion left an unresolved tree', async () => {
@@ -1131,7 +1166,11 @@ describe('the boot publishes the supervisor attestation, last and with no argume
                 startSupervisor: async () => ({ token: TOKEN, publishAttestation: () => { publications += 1; return 'published'; } }),
             };
             if (gate === 'supervisor') over.startSupervisor = async () => null;
-            if (gate === 'restore') over.restore = async () => { throw new Error('restore failed'); };
+            if (gate === 'restore') {
+                // The restore only runs against an observed volume.
+                over.observeVolume = observedVolume.observeVolume;
+                over.restore = async () => { throw new Error('restore failed'); };
+            }
             if (gate === 'workspace') over.assignWorkspace = async () => { throw new Error('assignment failed'); };
             if (gate === 'provider-home') over.assignProviderHome = async () => { throw new Error('assignment failed'); };
             if (gate === 'staging') over.inspectRestoreStaging = async () => 'unresolved';

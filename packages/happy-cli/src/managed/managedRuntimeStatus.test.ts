@@ -25,6 +25,7 @@ const identity = {
     providerMachineId: 'provider-machine-1',
     providerInstanceId: 'provider-instance-1',
     providerVolumeId: 'vol_fixture_1',
+    volumeCreatedByOperation: false,
     stateDir: '/state',
     isolation: { backend: 'privileged-launch-supervisor' as const, provider: { uid: 901, gid: 901 }, executor: { uid: 902, gid: 901 }, cgroupRoot: '/c' },
     toolPolicy: { grantTtlMs: 600_000, callTimeoutMs: 120_000 },

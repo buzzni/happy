@@ -17,7 +17,7 @@ function fixture() {
             runtimeId: 'runtime-1', provisioningOperationId: 'operation-1', stateDir: '/state',
             workspaceId: 'workspace-1', projectId: 'project-1', keyId: 'key-1', happyMachineId: 'happy-1',
             configDigest: 'b'.repeat(64), providerMachineId: 'machine-1', providerInstanceId: 'instance-1',
-            providerVolumeId: 'volume-1', verifier, tenant: 'company:1',
+            providerVolumeId: 'volume-1', volumeCreatedByOperation: false, verifier, tenant: 'company:1',
             isolation: { backend: 'privileged-launch-supervisor', provider: { uid: 10601, gid: 10601 },
                 executor: { uid: 10602, gid: 10602 }, cgroupRoot: '/sys/fs/cgroup/saycode' },
             toolPolicy: { grantTtlMs: 1000, callTimeoutMs: 1000 }, checkpoint: { drainBudgetMs: 1000 },
