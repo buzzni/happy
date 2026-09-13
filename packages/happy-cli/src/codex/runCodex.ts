@@ -77,7 +77,7 @@ import {
 import { emitReadyIfIdle } from './emitReadyIfIdle';
 import { enqueueCodexUserText, isCodexClearText } from './codexClearCommand';
 import { createEnvelope } from '@slopus/happy-wire';
-import { createManagedFollowUpGate, parseManagedFollowUp } from '@/managed/managedFollowUp';
+import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
 import { downloadCodexFileEventAttachment } from './utils/attachmentEvents';
 import { prepareCodexImageInputItems } from './utils/imageInput';
 import { createSerialAsyncHandler } from './utils/serialAsyncHandler';
@@ -962,30 +962,24 @@ export async function runCodex(opts: {
      * `message-send` bearer's behalf (T07-L5-b). Text only, queued with the
      * options the run already has — see runClaude.ts for the full rationale.
      */
-    const managedFollowUpGate = createManagedFollowUpGate();
-    session.rpcHandlerManager.registerHandler('follow-up', async (params: unknown) => {
-        if (!managedStartup) return { accepted: false, reason: 'not-managed' };
-        const parsed = parseManagedFollowUp(params);
-        if (!parsed.ok) return { accepted: false, reason: parsed.reason };
-        if (managedFollowUpGate.take(parsed.localId) === 'duplicate') return { accepted: true, duplicate: true };
+    session.rpcHandlerManager.registerHandler('follow-up', createManagedFollowUpHandler({
+        managed: () => Boolean(managedStartup),
         // The visible user row, so the transcript shows the turn where it came from.
-        session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text: parsed.text }), parsed.localId);
-        enqueueCodexUserText({
-            text: parsed.text,
-            mode: {
+        echo: ({ text, localId }) => session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }), localId),
+        // Straight onto the queue: the parse already refused queue commands,
+        // and the command-reading path would drop the turns already taken.
+        enqueue: (text) => {
+            messageQueue.push(text, {
                 permissionMode: currentPermissionMode || 'default',
                 model: currentModel,
                 appendSystemPrompt: currentAppendSystemPrompt,
                 saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
                 saycodePromptBlocks: currentSaycodePromptBlocks,
                 effort: currentEffort,
-            },
-            queue: messageQueue,
-            attachments: [],
-        });
-        logger.debug('[managed] Follow-up turn queued');
-        return { accepted: true };
-    });
+            }, []);
+            logger.debug('[managed] Follow-up turn queued');
+        },
+    }));
 
     session.rpcHandlerManager.registerHandler('goal-action', async (params: Record<string, unknown>) => {
         const command = parseCodexGoalActionParams(params);

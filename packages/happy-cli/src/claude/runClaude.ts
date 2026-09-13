@@ -62,8 +62,7 @@ import {
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
-import { buildInitialPromptUserRecord } from '@/utils/initialPrompt';
-import { createManagedFollowUpGate, parseManagedFollowUp } from '@/managed/managedFollowUp';
+import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
 import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import {
     createSessionModelPinPublisher,
@@ -784,19 +783,22 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
      * The answer says whether the turn was taken, not whether it ran — that is
      * in the receipt. A retry of one send (same client id) is one turn.
      */
-    const managedFollowUpGate = createManagedFollowUpGate();
-    session.rpcHandlerManager.registerHandler('follow-up', async (params: unknown) => {
-        if (!managedStartup) return { accepted: false, reason: 'not-managed' };
-        const parsed = parseManagedFollowUp(params);
-        if (!parsed.ok) return { accepted: false, reason: parsed.reason };
-        if (managedFollowUpGate.take(parsed.localId) === 'duplicate') return { accepted: true, duplicate: true };
-        // The visible user row, so the transcript shows the turn where it came from.
-        recordAppPrompt(parsed.text);
-        session.sendClaudeSessionMessage(buildInitialPromptUserRecord(parsed.text, session.sessionId), parsed.localId);
-        messageQueue.push(parsed.text, currentEnhancedMode(), []);
-        logger.debug('[managed] Follow-up turn queued');
-        return { accepted: true };
-    });
+    session.rpcHandlerManager.registerHandler('follow-up', createManagedFollowUpHandler({
+        managed: () => Boolean(managedStartup),
+        echo: ({ text, localId }) => {
+            // The visible user row, sent as an envelope and not through the
+            // transcript mapper: that mapper closes the running turn on a plain
+            // user record, and a turn queued behind one in progress must not
+            // end it. `recordAppPrompt` keeps the scanner from showing the row
+            // a second time when Claude takes it from the queue.
+            recordAppPrompt(text);
+            session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }), localId);
+        },
+        enqueue: (text) => {
+            messageQueue.push(text, currentEnhancedMode(), []);
+            logger.debug('[managed] Follow-up turn queued');
+        },
+    }));
 
     session.rpcHandlerManager.registerHandler('goal-action', async (params: unknown) => {
         const actionParams = params && typeof params === 'object' && !Array.isArray(params)

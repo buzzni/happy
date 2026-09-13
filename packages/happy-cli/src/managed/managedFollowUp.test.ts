@@ -8,7 +8,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { createManagedFollowUpGate, parseManagedFollowUp } from './managedFollowUp';
+import { createManagedFollowUpGate, createManagedFollowUpHandler, parseManagedFollowUp } from './managedFollowUp';
 
 describe('parseManagedFollowUp', () => {
     it('reads a text turn with its client id', () => {
@@ -22,6 +22,13 @@ describe('parseManagedFollowUp', () => {
         expect(parseManagedFollowUp({ text: 'x' })).toEqual({ ok: false, reason: 'malformed' });
         expect(parseManagedFollowUp({ localId: 'm-1', text: '   ' })).toEqual({ ok: false, reason: 'empty-text' });
         expect(parseManagedFollowUp({ localId: 'm-1', text: 'x'.repeat(200_001) })).toEqual({ ok: false, reason: 'text-too-long' });
+    });
+
+    it('refuses a queue command: it is not a turn, and it drops turns already taken', () => {
+        expect(parseManagedFollowUp({ localId: 'm-1', text: '/clear' })).toEqual({ ok: false, reason: 'command-not-allowed' });
+        expect(parseManagedFollowUp({ localId: 'm-1', text: '  /compact  ' })).toEqual({ ok: false, reason: 'command-not-allowed' });
+        // A slash inside a sentence is text.
+        expect(parseManagedFollowUp({ localId: 'm-1', text: 'run /clear on the queue?' })).toMatchObject({ ok: true });
     });
 
     it('takes only the text: a follow-up carries no options, whatever the payload claims', () => {
@@ -46,5 +53,44 @@ describe('createManagedFollowUpGate', () => {
         gate.take('a'); gate.take('b'); gate.take('c');
         expect(gate.take('a')).toBe('accepted');
         expect(gate.take('c')).toBe('duplicate');
+    });
+});
+
+describe('createManagedFollowUpHandler', () => {
+    function build(over: { managed?: boolean } = {}) {
+        const calls: string[] = [];
+        const handler = createManagedFollowUpHandler({
+            managed: () => over.managed ?? true,
+            echo: (turn) => calls.push(`echo:${turn.localId}:${turn.text}`),
+            enqueue: (text) => calls.push(`enqueue:${text}`),
+        });
+        return { handler, calls };
+    }
+
+    it('shows the turn, then queues it, and reports it accepted', async () => {
+        const { handler, calls } = build();
+        expect(await handler({ localId: 'm-1', text: 'Reply PING' })).toEqual({ accepted: true });
+        expect(calls).toEqual(['echo:m-1:Reply PING', 'enqueue:Reply PING']);
+    });
+
+    it('takes a retry of the same turn once: the second answer says duplicate and queues nothing', async () => {
+        const { handler, calls } = build();
+        await handler({ localId: 'm-1', text: 'Reply PING' });
+        expect(await handler({ localId: 'm-1', text: 'Reply PING' })).toEqual({ accepted: true, duplicate: true });
+        expect(calls).toHaveLength(2);
+    });
+
+    it('refuses outside a managed run before anything is shown or queued', async () => {
+        const { handler, calls } = build({ managed: false });
+        expect(await handler({ localId: 'm-1', text: 'Reply PING' })).toEqual({ accepted: false, reason: 'not-managed' });
+        expect(calls).toEqual([]);
+    });
+
+    it('refuses a payload that is not a turn, naming why, and takes no client id for it', async () => {
+        const { handler, calls } = build();
+        expect(await handler({ localId: 'm-1', text: '/clear' })).toEqual({ accepted: false, reason: 'command-not-allowed' });
+        // The id was not consumed: the same id with real text is a new turn.
+        expect(await handler({ localId: 'm-1', text: 'Reply PING' })).toEqual({ accepted: true });
+        expect(calls).toEqual(['echo:m-1:Reply PING', 'enqueue:Reply PING']);
     });
 });

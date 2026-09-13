@@ -13,11 +13,15 @@
  * sends the same turn again. The client id is what makes one send one turn.
  */
 
+import { parseSpecialCommand } from '@/parsers/specialCommands';
+
 export type ManagedFollowUp = { localId: string; text: string };
+
+export type ManagedFollowUpRefusal = 'malformed' | 'empty-text' | 'text-too-long' | 'command-not-allowed';
 
 export type ManagedFollowUpParse =
     | ({ ok: true } & ManagedFollowUp)
-    | { ok: false; reason: 'malformed' | 'empty-text' | 'text-too-long' };
+    | { ok: false; reason: ManagedFollowUpRefusal };
 
 /** Generous for a chat turn, small for a payload nobody has inspected. */
 export const MANAGED_FOLLOW_UP_MAX_TEXT = 200_000;
@@ -31,6 +35,13 @@ export function parseManagedFollowUp(params: unknown): ManagedFollowUpParse {
     if (typeof text !== 'string') return { ok: false, reason: 'malformed' };
     if (text.trim().length === 0) return { ok: false, reason: 'empty-text' };
     if (text.length > MANAGED_FOLLOW_UP_MAX_TEXT) return { ok: false, reason: 'text-too-long' };
+    /*
+     * `/clear`, `/compact` and the like are not turns: read by the queue they
+     * drop turns already accepted, and a retry of one of those would report
+     * `duplicate` for a turn that no longer exists. A follow-up is text for
+     * the agent, nothing else.
+     */
+    if (parseSpecialCommand(text).type !== null) return { ok: false, reason: 'command-not-allowed' };
     return { ok: true, localId, text };
 }
 
@@ -59,5 +70,38 @@ export function createManagedFollowUpGate(options: { remember?: number } = {}): 
             }
             return 'accepted';
         },
+    };
+}
+
+export type ManagedFollowUpAnswer =
+    | { accepted: true; duplicate?: true }
+    | { accepted: false; reason: 'not-managed' | ManagedFollowUpRefusal };
+
+/**
+ * The `follow-up` RPC handler, the same for every agent.
+ *
+ * Order matters and is fixed here: the turn is shown before it is queued, so
+ * a transcript never carries an answer without the question above it. Nothing
+ * is awaited between the gate and the queue, so `accepted` means the turn is
+ * in the queue when the caller reads it.
+ */
+export function createManagedFollowUpHandler(deps: {
+    /** Whether this run is managed. Read per call: it is decided after startup. */
+    managed: () => boolean;
+    /** Shows the turn as the user's own row, without touching the turn in progress. */
+    echo: (turn: ManagedFollowUp) => void;
+    /** Places the text in the turn queue with the options the run already has. */
+    enqueue: (text: string) => void;
+    gate?: ManagedFollowUpGate;
+}): (params: unknown) => Promise<ManagedFollowUpAnswer> {
+    const gate = deps.gate ?? createManagedFollowUpGate();
+    return async (params) => {
+        if (!deps.managed()) return { accepted: false, reason: 'not-managed' };
+        const parsed = parseManagedFollowUp(params);
+        if (!parsed.ok) return { accepted: false, reason: parsed.reason };
+        if (gate.take(parsed.localId) === 'duplicate') return { accepted: true, duplicate: true };
+        deps.echo({ localId: parsed.localId, text: parsed.text });
+        deps.enqueue(parsed.text);
+        return { accepted: true };
     };
 }
