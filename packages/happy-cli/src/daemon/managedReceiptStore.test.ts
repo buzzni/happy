@@ -298,12 +298,12 @@ describe('observation axes (T07-L1b)', () => {
             if (claimed.kind !== 'created') throw new Error('claim failed');
             // 옛 파일: 새 필드가 아예 없다.
             const legacy = { ...claimed.receipt } as Record<string, unknown>;
-            for (const field of ['stopIntent', 'turnCount', 'lastTurnEndAt', 'reportThinking', 'reportOpenToolCall', 'reportPendingUserInput', 'childExitAt', 'childExitProof']) delete legacy[field];
+            for (const field of ['pidRecordedAt', 'stopIntent', 'turnCount', 'lastTurnEndAt', 'reportThinking', 'reportOpenToolCall', 'reportPendingUserInput', 'childExitAt', 'childExitProof']) delete legacy[field];
             writeFileSync(join(root, 'receipts', managedReceiptFileName(key)), JSON.stringify(legacy));
             const read = store.read(key);
             expect(read.kind).toBe('ok');
             if (read.kind === 'ok') {
-                expect(read.receipt).toMatchObject({ stopIntent: null, turnCount: null, lastTurnEndAt: null, reportThinking: null, reportOpenToolCall: null, reportPendingUserInput: null, childExitAt: null, childExitProof: null });
+                expect(read.receipt).toMatchObject({ pidRecordedAt: null, stopIntent: null, turnCount: null, lastTurnEndAt: null, reportThinking: null, reportOpenToolCall: null, reportPendingUserInput: null, childExitAt: null, childExitProof: null });
             }
         } finally {
             rmSync(root, { recursive: true, force: true });
@@ -339,6 +339,7 @@ describe('classifyManagedReceipt', () => {
         spawnPayloadDigest: null,
         pid: null,
         pgid: null,
+        pidRecordedAt: null,
         sessionId: null,
         stopRequestedAt: null,
         failureReason: null,

@@ -89,6 +89,8 @@ export type ManagedReceipt = {
     childExitProof: 'pid-absent' | null;
     claimedAt: number;
     spawnAt: number | null;
+    /** When `pid` was committed to this receipt. Orders incarnations of a reused pid; `claimedAt` cannot. */
+    pidRecordedAt: number | null;
     updatedAt: number;
     rev: number;
 };
@@ -162,6 +164,8 @@ function parseReceipt(raw: unknown, expectedRequestKey: string): ManagedReceipt 
     if (!Number.isSafeInteger(r.rev) || (r.rev as number) < 1) return null;
     if (!isTimestamp(r.claimedAt) || !isTimestamp(r.updatedAt)) return null;
     if (!isNullableTimestamp(r.spawnAt) || !isNullableTimestamp(r.stopRequestedAt)) return null;
+    // Absent on receipts written before it existed; absent and null are the same.
+    if (!isNullableTimestamp(r.pidRecordedAt ?? null)) return null;
     if (!isNullablePid(r.pid) || !isNullablePid(r.pgid)) return null;
     if (!isNullableString(r.sessionId) || !isNullableString(r.failureReason)) return null;
     if (typeof r.workspaceId !== 'string' || !r.workspaceId) return null;
@@ -171,7 +175,7 @@ function parseReceipt(raw: unknown, expectedRequestKey: string): ManagedReceipt 
     // and null mean the same thing; a present value must be well-formed.
     const observation = normalizeReceiptObservation(r);
     if (observation === null) return null;
-    return { ...(r as unknown as ManagedReceipt), ...observation };
+    return { ...(r as unknown as ManagedReceipt), pidRecordedAt: (r.pidRecordedAt ?? null) as number | null, ...observation };
 }
 
 const STOP_INTENTS = new Set(['parent-stop', 'lease-expired']);
@@ -405,6 +409,7 @@ export function createManagedReceiptStore(root: string, lock: ManagedStoreLock) 
                 state: 'claimed',
                 pid: null,
                 pgid: null,
+                pidRecordedAt: null,
                 sessionId: null,
                 stopRequestedAt: null,
                 failureReason: null,
@@ -445,6 +450,7 @@ export function createManagedReceiptStore(root: string, lock: ManagedStoreLock) 
                 state: 'tombstone',
                 pid: null,
                 pgid: null,
+                pidRecordedAt: null,
                 sessionId: null,
                 stopRequestedAt: input.now,
                 failureReason: null,

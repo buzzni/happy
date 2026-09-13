@@ -433,11 +433,11 @@ export const PENDING_EXIT_TTL_MS = 10 * 60_000;
 
 /**
  * The receipt an observation is about when several match: the latest
- * generation first, then the most recently claimed attempt. Ties on the
- * millisecond are broken by the last write and then by key — deterministic,
- * never directory order. Observations that carry a pid match on it exactly, so
- * a tie here means two receipts recorded the same pid in the same
- * millisecond, which a kernel does not do.
+ * generation first, then the receipt that had the pid committed to it last —
+ * two attempts can be claimed in the same millisecond, but a reused pid is
+ * committed to its new holder only after the old one died, so the commit time
+ * orders incarnations. Then the claim, the last write and the key —
+ * deterministic, never directory order.
  */
 function newestReceipt(
     receipts: ManagedReceipt[],
@@ -452,7 +452,8 @@ function newestReceipt(
 }
 
 function compareReceiptRecency(a: ManagedReceipt, b: ManagedReceipt): number {
-    return (a.epoch - b.epoch) || (a.claimedAt - b.claimedAt) || (a.updatedAt - b.updatedAt)
+    return (a.epoch - b.epoch) || ((a.pidRecordedAt ?? -1) - (b.pidRecordedAt ?? -1))
+        || (a.claimedAt - b.claimedAt) || (a.updatedAt - b.updatedAt)
         || (a.requestKey < b.requestKey ? -1 : a.requestKey > b.requestKey ? 1 : 0);
 }
 
@@ -1076,14 +1077,20 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                 state: 'running',
                 pid: outcome.pid,
                 pgid: outcome.pid,
+                pidRecordedAt: runtime.now(),
                 sessionId: outcome.sessionId,
             }, runtime.now());
             // A child that exited while the launch was still being committed
             // was invisible to the exit sweep (the receipt had no pid yet): the
-            // sweep left the exit pending, or the pid is simply gone now. Either
-            // way it is recorded here; `state` stays `running` like any other
-            // exit observation, and a failed write stays pending for maintenance.
-            if (pendingExits.has(outcome.pid) || pidAbsent(outcome.pid)) {
+            // sweep left the exit pending, or the pid is simply gone now. The
+            // live probe comes first — a pid that answers now is a new
+            // incarnation, and a pending exit for it belonged to an earlier
+            // holder no receipt ever named, so it is dropped rather than written
+            // onto a live child. `state` stays `running` like any other exit
+            // observation; a failed write stays pending for maintenance.
+            if (!pidAbsent(outcome.pid)) {
+                pendingExits.delete(outcome.pid);
+            } else {
                 if (!pendingExits.has(outcome.pid)) pendingExits.set(outcome.pid, runtime.now());
                 flushPendingExits();
                 const reread = runtime.store.read(key);

@@ -639,6 +639,33 @@ describe('receipt observation axes (T07-L1b)', () => {
         expect(result.receipt).toMatchObject({ state: 'running', childExitAt: seenAt, childExitProof: 'pid-absent' });
     });
 
+    it('a pending exit for a pid that is alive again at the commit is dropped, not written onto the new child', async () => {
+        await grantLease();
+        // An earlier child with pid 5151 died before any receipt named it; the sweep deferred it.
+        expect(handlers.noteChildExited(5151)).toBe('deferred');
+        // The kernel reuses 5151 for the next launch, which is alive.
+        runtime.spawn = async () => { livePids.add(5151); return { type: 'success', sessionId: 'sess-1', pid: 5151 }; };
+        const result = await handlers.spawn(call('spawn', envelope()));
+        expect(result.receipt).toMatchObject({ state: 'running', childExitAt: null });
+        // ...and maintenance does not resurrect it later.
+        await handlers.runLeaseMaintenance();
+        expect((await handlers.receipt(call('query', {}))).receipts[0]!).toMatchObject({ childExitAt: null, childExitProof: null });
+    });
+
+    it.each(ORDERS)('two attempts claimed in the same millisecond that end up with one pid: the report goes to the later incarnation, whatever was written last (%s then %s)', async (older, newer) => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope(), { attemptId: older, requestKey: `key-${older}` }));
+        // Same claim time; the pid is committed to the second attempt later.
+        spawnResult = async () => { wallClock += 5; return { type: 'success', sessionId: 'sess-1', pid: 4242 }; };
+        await handlers.spawn(call('spawn', envelope(), { attemptId: newer, requestKey: `key-${newer}` }));
+        // The old attempt's receipt is written after the new commit (a stop lands on it).
+        wallClock += 5;
+        await handlers.stop(call('stop', {}, { attemptId: older, requestKey: `key-${older}` }));
+        handlers.noteSessionRuntime('sess-1', 4242, { assistantTurns: 3, thinking: false, hasOpenToolCall: false, pendingUserInput: false });
+        expect((await handlers.receipt(call('query', {}, { attemptId: newer }))).receipts[0]!).toMatchObject({ turnCount: 3 });
+        expect((await handlers.receipt(call('query', {}, { attemptId: older }))).receipts[0]!).toMatchObject({ turnCount: null });
+    });
+
     it('a commit whose exit write fails keeps the exit pending for maintenance', async () => {
         await grantLease();
         runtime.spawn = async () => ({ type: 'success', sessionId: 'sess-1', pid: 5151 });
