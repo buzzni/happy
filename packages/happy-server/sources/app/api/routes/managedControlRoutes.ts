@@ -250,6 +250,8 @@ const readMintSchema = z.object({
  */
 const approvalMintSchema = z.object({
     scope: scopeSchema,
+    /** The approval family carries two purposes: deciding prompts, and authoring the next turn. */
+    purpose: z.enum(['approval-control', 'message-send']).optional(),
     grantId: identifier,
     requestId: identifier,
     expiresAt: z.number().int().min(1),
@@ -284,6 +286,8 @@ const approvalMintSchema = z.object({
  */
 const approvalResolveSchema = z.object({
     scope: scopeSchema,
+    /** The approval family carries two purposes: deciding prompts, and authoring the next turn. */
+    purpose: z.enum(['approval-control', 'message-send']).optional(),
     viewerAccountId: identifier,
     /** The generation the caller believes is current; see the mint. */
     aclRevision: z.number().int().min(0),
@@ -292,6 +296,8 @@ const approvalResolveSchema = z.object({
 
 const approvalRevokeSchema = z.object({
     scope: scopeSchema,
+    /** The approval family carries two purposes: deciding prompts, and authoring the next turn. */
+    purpose: z.enum(['approval-control', 'message-send']).optional(),
     reason: z.string().trim().min(1).max(200),
     viewerAccountId: identifier,
     /**
@@ -1196,7 +1202,7 @@ export function managedControlRoutes(
             requestId: request.body.requestId,
             expiresAt: request.body.expiresAt,
             now,
-            purpose: 'approval-control',
+            purpose: request.body.purpose ?? 'approval-control',
             viewerAccountId: request.body.viewerAccountId,
             aclRevision: request.body.aclRevision,
             ...(request.body.viewerDataEncryptionKey
@@ -1269,7 +1275,7 @@ export function managedControlRoutes(
             scope,
             requestedTokenExpiresAt: request.body.requestedTokenExpiresAt,
             now: Date.now(),
-            purpose: 'approval-control',
+            purpose: request.body.purpose ?? 'approval-control',
             viewerAccountId: request.body.viewerAccountId,
             aclRevision: request.body.aclRevision,
         });
@@ -1336,7 +1342,7 @@ export function managedControlRoutes(
             scope: request.body.scope as ManagedScope,
             reason: request.body.reason,
             now: Date.now(),
-            purpose: 'approval-control',
+            purpose: request.body.purpose ?? 'approval-control',
             viewerAccountId: request.body.viewerAccountId,
             aclRevision: request.body.aclRevision,
         });

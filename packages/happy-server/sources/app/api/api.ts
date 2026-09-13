@@ -41,6 +41,7 @@ import { sessionFollowupRoutes } from "./routes/sessionFollowupRoutes";
 import { agentProfileRoutes } from "./routes/agentProfileRoutes";
 import { managedControlRoutes } from "./routes/managedControlRoutes";
 import { managedApprovalRoutes } from "@/app/api/routes/managedApprovalRoutes";
+import { managedFollowUpRoutes } from "@/app/api/routes/managedFollowUpRoutes";
 import { managedDaemonRenewRoutes } from '@/app/api/routes/managedDaemonRenewRoutes';
 import { createManagedControlRuntime, type ManagedControlRuntime } from "@/app/managed/managedControlRuntime";
 import {
@@ -170,6 +171,7 @@ export async function startApi(opts: StartApiOptions = {}) {
     // decorator enabled above, and nothing from the control runtime: the
     // bearer it accepts is a managed one, not a control-plane assertion.
     managedApprovalRoutes(typed);
+    managedFollowUpRoutes(typed);
     authRoutes(typed);
     pushRoutes(typed);
     sessionRoutes(typed);

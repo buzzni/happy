@@ -50,7 +50,7 @@ const MAX_ID_LENGTH = 200;
  *    the current run, because an approval that arrived for a superseded attempt
  *    would be answering a question nobody is still asking.
  */
-export const SESSION_SCOPED_PURPOSES = ['runner', 'transcript-read', 'approval-control'] as const;
+export const SESSION_SCOPED_PURPOSES = ['runner', 'transcript-read', 'approval-control', 'message-send'] as const;
 export type SessionScopedPurpose = (typeof SESSION_SCOPED_PURPOSES)[number];
 
 export type SessionScopedClaims = {

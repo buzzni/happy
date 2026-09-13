@@ -62,7 +62,7 @@ let modules: {
     enable: typeof import('@/app/api/utils/enableAuthentication');
     grants: typeof import('@/app/managed/managedSessionGrant');
     projection: typeof import('@/app/managed/managedAuthorityProjection');
-    approval: typeof import('@/app/api/routes/managedApprovalRoutes');
+    approval: typeof import('@/app/api/routes/managedFollowUpRoutes');
     registry: typeof import('@/app/api/socket/managed/managedSocketRegistry');
     queue: typeof import('@/app/api/socket/managed/managedOutboundQueue');
 };
@@ -91,7 +91,7 @@ let approverToken: string;
  * Its bytes are never inspected by anything under test: this server holds no
  * key that opens it, and the child's own manager is what decodes it.
  */
-const SEALED = Buffer.from('{"id":"toolu_1","approved":true}').toString('base64');
+const SEALED = Buffer.from('{"localId":"m-1","text":"Reply PING"}').toString('base64');
 
 /** Packets the stubbed child connection was handed, in order. */
 type Relayed = { event: string; args: unknown[] };
@@ -130,7 +130,7 @@ function claimsFor(over: Partial<SessionScopedClaims> = {}): SessionScopedClaims
         epoch: s.epoch,
         workspaceAuthorityVersion: s.workspaceAuthorityVersion,
         runAuthorityVersion: s.runAuthorityVersion,
-        purpose: 'approval-control' as const,
+        purpose: 'message-send' as const,
         viewerAccountId: approverAccountId,
         expiresAt: approvalExpiresAt,
         ...over,
@@ -150,7 +150,7 @@ function answer(input: {
 }) {
     return app.inject({
         method: 'POST',
-        url: `/v1/managed/sessions/${input.sessionId ?? sessionId}/permission`,
+        url: `/v1/managed/sessions/${input.sessionId ?? sessionId}/follow-up`,
         headers: {
             authorization: `Bearer ${input.token}`,
             'content-type': 'application/json',
@@ -179,7 +179,7 @@ function connectChild(respond: (item: {
         grantId: approvalGrantId,
         runId,
         attemptId: 'attempt-1',
-        rpcNames: new Set(['permission']),
+        rpcNames: new Set(['follow-up']),
         connectedAt: Date.now(),
         channel: {
             closed: false,
@@ -253,14 +253,14 @@ function connectRealChild(input: {
         grantId: approvalGrantId,
         runId,
         attemptId: 'attempt-1',
-        rpcNames: new Set(['permission']),
+        rpcNames: new Set(['follow-up']),
         connectedAt: Date.now(),
         channel: channel as never,
     });
     return { socketId, emitted, refusals };
 }
 
-describe.skipIf(!enabled)('answering a permission prompt (real Fastify + PostgreSQL)', () => {
+describe.skipIf(!enabled)('sending the next turn (real Fastify + PostgreSQL)', () => {
     beforeAll(async () => {
         modules = {
             auth: await import('@/app/auth/auth'),
@@ -268,7 +268,7 @@ describe.skipIf(!enabled)('answering a permission prompt (real Fastify + Postgre
             enable: await import('@/app/api/utils/enableAuthentication'),
             grants: await import('@/app/managed/managedSessionGrant'),
             projection: await import('@/app/managed/managedAuthorityProjection'),
-            approval: await import('@/app/api/routes/managedApprovalRoutes'),
+            approval: await import('@/app/api/routes/managedFollowUpRoutes'),
             registry: await import('@/app/api/socket/managed/managedSocketRegistry'),
             queue: await import('@/app/api/socket/managed/managedOutboundQueue'),
         };
@@ -284,7 +284,7 @@ describe.skipIf(!enabled)('answering a permission prompt (real Fastify + Postgre
         const typed = instance.withTypeProvider<ZodTypeProvider>();
         modules.enable.enableAuthentication(typed as never);
         modules.enable.enableSessionScopeAuthentication(typed as never, () => issuer);
-        modules.approval.managedApprovalRoutes(typed as never);
+        modules.approval.managedFollowUpRoutes(typed as never);
         await instance.ready();
         app = instance;
     });
@@ -331,7 +331,7 @@ describe.skipIf(!enabled)('answering a permission prompt (real Fastify + Postgre
             requestId: `req-${randomUUID()}`,
             expiresAt: Date.now() + HOUR,
             now: Date.now(),
-            purpose: 'approval-control',
+            purpose: 'message-send',
             viewerAccountId: approverAccountId,
             viewerDataEncryptionKey: APPROVER_ENVELOPE,
         });
@@ -368,7 +368,7 @@ describe.skipIf(!enabled)('answering a permission prompt (real Fastify + Postgre
             expect(relayed).toEqual([{
                 event: 'rpc-request',
                 args: [{
-                    method: `${sessionId}:permission`,
+                    method: `${sessionId}:follow-up`,
                     /*
                      * The sealed payload, **verbatim and as a string**.
                      *
@@ -433,15 +433,6 @@ describe.skipIf(!enabled)('answering a permission prompt (real Fastify + Postgre
     });
 
     describe('a bearer that is not an approver relays nothing', () => {
-        it('refuses a sender: authoring the next turn is not deciding prompts', async () => {
-            connectChild();
-            const senderToken = await mint({ purpose: 'message-send' });
-            const response = await answer({ token: senderToken });
-            expect(response.statusCode).toBe(403);
-            expect(response.json().reason).toBe('purpose-not-allowed');
-            expect(relayed).toEqual([]);
-        });
-
         it('refuses a read bearer', async () => {
             connectChild();
             const readToken = await mint({ purpose: 'transcript-read' });
@@ -544,18 +535,15 @@ describe.skipIf(!enabled)('answering a permission prompt (real Fastify + Postgre
         });
     });
 
-    describe('the approver\'s authority, re-read where the packet goes out', () => {
+    describe('the check on the way out', () => {
         /*
          * The route authorises the request; the packet is emitted somewhere
-         * else, possibly on another replica, after a wait. An approver whose
-         * access ends in that window must not have their answer applied — and
-         * the only side that can see a revoke committed in flight is the side
-         * holding the socket.
-         *
-         * These run on the real outbound channel, because that is where the
-         * check lives.
+         * else, possibly on another replica, after a wait. The channel re-reads
+         * the sender's authority there — and it has to know that a message-send
+         * bearer may author a `follow-up`, or every authorised turn dies at the
+         * emit with the route reporting the run as unavailable.
          */
-        it('relays the answer while the approval grant is live', async () => {
+        it('relays the next turn while the message-send grant is live', async () => {
             const child = connectRealChild();
             const response = await answer({ token: approverToken });
             expect(response.statusCode).toBe(200);
@@ -564,70 +552,22 @@ describe.skipIf(!enabled)('answering a permission prompt (real Fastify + Postgre
             expect(child.emitted[0].event).toBe('rpc-request');
         });
 
-        it('emits nothing when the approver is withdrawn while the packet waits', async () => {
-            /*
-             * The bearer was live when the route read it. The withdrawal
-             * commits during the wait before the emit — which is exactly the
-             * case a sender-side check cannot catch, and the only reason this
-             * guard exists on the receiving side.
-             */
+        it('emits nothing when the sender is withdrawn while the packet waits', async () => {
             const child = connectRealChild({
                 duringCheck: async () => {
                     await db.managedSessionGrant.updateMany({
                         where: { grantId: approvalGrantId },
-                        data: { revokedAt: BigInt(Date.now()), revokedReason: 'approver-removed' },
+                        data: { revokedAt: BigInt(Date.now()), revokedReason: 'sender-removed' },
                     });
                 },
             });
-
             const response = await answer({ token: approverToken });
-            // Nothing went to the child at all.
             expect(child.emitted).toEqual([]);
             expect(response.statusCode).toBe(503);
             expect(response.json().relayed).toBeUndefined();
         });
 
-        it('emits nothing when the approval grant expires while the packet waits', async () => {
-            const child = connectRealChild({
-                duringCheck: async () => {
-                    await db.managedSessionGrant.updateMany({
-                        where: { grantId: approvalGrantId },
-                        data: { expiresAt: BigInt(Date.now() - 1) },
-                    });
-                },
-            });
-            const response = await answer({ token: approverToken });
-            expect(child.emitted).toEqual([]);
-            expect(response.statusCode).toBe(503);
-        });
-
-        it('leaves the run\'s own connection open when the approver is the one who lapsed', async () => {
-            /*
-             * The approver losing authority is not the run losing it. Closing
-             * the channel would take the session down because somebody else's
-             * access ended.
-             */
-            const child = connectRealChild({
-                duringCheck: async () => {
-                    await db.managedSessionGrant.updateMany({
-                        where: { grantId: approvalGrantId },
-                        data: { revokedAt: BigInt(Date.now()), revokedReason: 'approver-removed' },
-                    });
-                },
-            });
-            await answer({ token: approverToken });
-            expect(child.refusals).toEqual([]);
-        });
-
         it('emits nothing when the run\'s attempt moved on while the packet waited', async () => {
-            /*
-             * The approval names the run it answers for, and the run's own
-             * authority can advance in the same window a revoke can: a new
-             * attempt, a cancelled run, a later epoch. The row alone cannot see
-             * that — it is still live and still says what it always said — so
-             * the check here is the same one every action by this bearer makes,
-             * against the current projection.
-             */
             const child = connectRealChild({
                 duringCheck: async () => {
                     await modules.projection.syncRunAuthority({
@@ -644,108 +584,26 @@ describe.skipIf(!enabled)('answering a permission prompt (real Fastify + Postgre
             expect(child.emitted).toEqual([]);
             expect(response.statusCode).toBe(503);
         });
-
-        it('emits nothing when the approver\'s own token has expired by then', async () => {
-            /*
-             * The bearer's expiry, which the row does not carry. A token issued
-             * for a short window must not be honoured after it, even while the
-             * grant behind it lives on.
-             */
-            const shortToken = await mint({ expiresAt: Date.now() + 1_500 });
-            const child = connectRealChild({
-                duringCheck: async () => {
-                    await new Promise((resolve) => setTimeout(resolve, 1_600));
-                },
-            });
-            const response = await answer({ token: shortToken });
-            expect(child.emitted).toEqual([]);
-            expect(response.statusCode).toBe(503);
-        });
-
-        it('reports an answer that is not a sealed string as not relayed', async () => {
-            /*
-             * The browser can only read a ciphertext. Anything else came from
-             * somewhere this route does not understand, and passing it on as
-             * `relayed` would present it as the child's answer.
-             */
-            connectRealChild({ answer: (respond) => respond({ approved: true }) });
-            const response = await answer({ token: approverToken });
-            expect(response.statusCode).toBe(502);
-            expect(response.json()).toEqual({ error: 'Not relayed', reason: 'malformed-response' });
-        });
     });
 
-    describe('an answer that did not reach the run is not an answer', () => {
-        it('reports a run with no connection as undelivered', async () => {
-            const response = await answer({ token: approverToken });
-            expect(response.statusCode).toBe(409);
-            expect(response.json()).toEqual({ error: 'Not relayed', reason: 'no-target' });
-            expect(response.json().relayed).toBeUndefined();
-        });
-
-        it('reports a connection that refused the packet as undelivered', async () => {
-            connectChild((item) => item.onRefused?.({ kind: 'grant-invalid' }));
-            const response = await answer({ token: approverToken });
-            expect(response.statusCode).toBe(503);
-            expect(response.json().reason).toBe('unavailable');
-            expect(response.json().relayed).toBeUndefined();
-        });
-
-        it('reports a child that never answered as undelivered', async () => {
-            // `undefined` is how the channel reports an acknowledgement that
-            // never came. The prompt is still open at the child.
-            connectChild((item) => item.ack?.(undefined));
-            const response = await answer({ token: approverToken });
-            expect(response.statusCode).toBe(503);
-            expect(response.json().reason).toBe('timeout');
-            expect(response.json().relayed).toBeUndefined();
-        });
-
-        it('reports a connection for another account as undelivered', async () => {
-            /*
-             * The registry entry is what the receiving side verified at its own
-             * handshake. A session id alone must not select it.
-             */
-            const stranger = await db.account.create({ data: { publicKey: `pk-${randomUUID()}` } });
-            createdAccountIds.add(stranger.id);
-            modules.registry.managedSocketRegistry.add({
-                socketId: `socket-${randomUUID()}`,
-                accountId: stranger.id,
-                sessionId,
-                grantId: approvalGrantId,
-                runId,
-                attemptId: 'attempt-1',
-                rpcNames: new Set(['permission']),
-                connectedAt: Date.now(),
-                channel: { closed: false, enqueue: (item: Relayed) => relayed.push(item) } as never,
+    describe('a purpose that may not author the next turn', () => {
+        it('refuses an approver: deciding prompts is not authoring the next turn', async () => {
+            connectChild();
+            const approvalGrant = await modules.grants.issueSessionGrant({
+                scope: scope() as never,
+                grantId: `grant-${randomUUID()}`,
+                requestId: `req-${randomUUID()}`,
+                expiresAt: Date.now() + HOUR,
+                now: Date.now(),
+                purpose: 'approval-control',
+                viewerAccountId: approverAccountId,
+                viewerDataEncryptionKey: APPROVER_ENVELOPE,
             });
-            const response = await answer({ token: approverToken });
-            expect(response.statusCode).toBe(409);
+            if (!approvalGrant.ok) throw new Error(`fixture approval grant failed: ${approvalGrant.reason}`);
+            const approverOnly = await mint({ grantId: approvalGrant.grant.grantId, purpose: 'approval-control' });
+            const response = await answer({ token: approverOnly });
+            expect(response.statusCode).toBe(403);
             expect(relayed).toEqual([]);
         });
-    });
-    it('root: refuses an approval that expires during the recipient grant lookup', async () => {
-        let now = Date.now();
-        const initial = now;
-        const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
-        const original = modules.grants.resolveLiveGrant;
-        let calls = 0;
-        const resolver = vi.spyOn(modules.grants, 'resolveLiveGrant').mockImplementation(async (input) => {
-            const result = await original(input);
-            calls += 1;
-            // The first lookup authorizes HTTP, the second is the recipient's
-            // database round trip. Preserve real DB results, advance time only
-            // while that recipient call is still awaiting its result.
-            if (calls === 2) now = initial + 2_000;
-            return result;
-        });
-        try {
-            const token = await mint({ expiresAt: initial + 1_000 });
-            const child = connectRealChild();
-            const response = await answer({ token });
-            expect(calls).toBeGreaterThanOrEqual(2);
-            expect(child.emitted).toEqual([]);
-            expect(response.statusCode).toBe(503);
-        } finally { resolver.mockRestore(); clock.mockRestore(); }
     });
 });

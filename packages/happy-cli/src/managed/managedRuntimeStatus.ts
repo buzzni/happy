@@ -38,7 +38,17 @@ export type ManagedRuntimeStatus = {
     };
     restore: ManagedRestoreState;
     isolation: { verified: boolean; backend: string };
+    /**
+     * What this runtime's children can do beyond the admitted prompt. The
+     * parent opens a surface only when the runtime says it is there — an
+     * older image answers a relayed `follow-up` with a refusal at best and
+     * silence at worst, and the parent must not offer what it cannot deliver.
+     */
+    capabilities: readonly ManagedRuntimeCapability[];
 };
+
+export type ManagedRuntimeCapability = 'follow-up';
+export const MANAGED_RUNTIME_CAPABILITIES: readonly ManagedRuntimeCapability[] = ['follow-up'];
 
 export function buildManagedRuntimeStatus(input: {
     identity: ManagedRuntimeIdentity;
@@ -81,6 +91,7 @@ export function buildManagedRuntimeStatus(input: {
                 rootOnExpectedVolume: false,
             },
         restore: input.restore,
+        capabilities: MANAGED_RUNTIME_CAPABILITIES,
         isolation: { verified: input.isolation.verified, backend: input.isolation.backend },
     };
 }
