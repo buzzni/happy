@@ -31,8 +31,16 @@ describe('parseManagedFollowUp', () => {
         // the managed `goal-action` RPC refuses. The queue must not be a way round it.
         expect(parseManagedFollowUp({ localId: 'm-1', text: '/goal ship it' })).toEqual({ ok: false, reason: 'command-not-allowed' });
         expect(parseManagedFollowUp({ localId: 'm-1', text: '/GOAL clear' })).toEqual({ ok: false, reason: 'command-not-allowed' });
-        // A slash inside a sentence is text.
+        // The embedded Claude SDK dispatches its own slash commands from user text —
+        // reset, model, effort, mcp, exit — each of which changes what the run was
+        // admitted with. Any leading slash command is refused, whatever its name.
+        for (const text of ['/reset', '/new', '/clear named', '/model opus', '/effort high', '/mcp disable all', '/exit', ' /Custom:thing now']) {
+            expect(parseManagedFollowUp({ localId: 'm-1', text })).toEqual({ ok: false, reason: 'command-not-allowed' });
+        }
+        // A slash inside a sentence is text, and so is a leading path.
         expect(parseManagedFollowUp({ localId: 'm-1', text: 'run /clear on the queue?' })).toMatchObject({ ok: true });
+        expect(parseManagedFollowUp({ localId: 'm-1', text: '/src/app.ts 의 버그를 고쳐줘' })).toMatchObject({ ok: true });
+        expect(parseManagedFollowUp({ localId: 'm-1', text: '/ 로 시작하는 문장' })).toMatchObject({ ok: true });
     });
 
     it('takes only the text: a follow-up carries no options, whatever the payload claims', () => {

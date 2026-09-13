@@ -27,6 +27,17 @@ export type ManagedFollowUpParse =
 /** Generous for a chat turn, small for a payload nobody has inspected. */
 export const MANAGED_FOLLOW_UP_MAX_TEXT = 200_000;
 
+/**
+ * A slash command at the head of the text: `/name`, then the end or a space.
+ *
+ * Happy's own parser knows a few names; the embedded Claude SDK dispatches
+ * many more from plain user text (`/reset`, `/model`, `/effort`, `/mcp`,
+ * `/exit`), each changing what the run was admitted with. The shape is what
+ * is refused, not a list that would go stale. A leading path (`/src/app.ts`)
+ * is not a command: the name is followed by another slash.
+ */
+const LEADING_SLASH_COMMAND = /^\s*\/[A-Za-z][\w:-]*(?:\s|$)/;
+
 export function parseManagedFollowUp(params: unknown): ManagedFollowUpParse {
     if (!params || typeof params !== 'object' || Array.isArray(params)) return { ok: false, reason: 'malformed' };
     const record = params as Record<string, unknown>;
@@ -44,7 +55,8 @@ export function parseManagedFollowUp(params: unknown): ManagedFollowUpParse {
      * refuses, and the queue must not be a way round that. A follow-up is
      * text for the agent, nothing else.
      */
-    if (parseSpecialCommand(text).type !== null || parseCodexGoalCommand(text) !== null) {
+    if (parseSpecialCommand(text).type !== null || parseCodexGoalCommand(text) !== null
+        || LEADING_SLASH_COMMAND.test(text)) {
         return { ok: false, reason: 'command-not-allowed' };
     }
     return { ok: true, localId, text };
