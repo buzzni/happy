@@ -174,6 +174,85 @@ describe('buildSpawnRequestEnvironment', () => {
             PROJECT_TOKEN: 'project-token',
         })
     })
+
+    it('keeps a complete agent capability grant the spawn request supplies', () => {
+        // 2026-09-13: the lineage scrub also ate SAYCODE_AGENT_*, which the
+        // requester (Desktop root seed, `happy agent spawn` child seed) supplies
+        // per spawn. Every session then came up without the capability and
+        // `happy agent whoami` answered not_agent_env.
+        expect(buildSpawnRequestEnvironment({}, {
+            SAYCODE_AGENT_ENV: '1',
+            SAYCODE_AGENT_ROOT: '/repo/app/.aplus/worktrees/w1',
+            SAYCODE_AGENT_SCOPE: '/repo/app',
+            SAYCODE_AGENT_DEPTH: '1',
+            SAYCODE_AGENT_MAX_SPAWN: '8',
+            SAYCODE_AGENT_ID: 'ac-child-1',
+        })).toEqual({
+            SAYCODE_AGENT_ENV: '1',
+            SAYCODE_AGENT_ROOT: '/repo/app/.aplus/worktrees/w1',
+            SAYCODE_AGENT_SCOPE: '/repo/app',
+            SAYCODE_AGENT_DEPTH: '1',
+            SAYCODE_AGENT_MAX_SPAWN: '8',
+            SAYCODE_AGENT_ID: 'ac-child-1',
+        })
+    })
+
+    it('keeps the capability while still rejecting session-hijacking lineage', () => {
+        expect(buildSpawnRequestEnvironment({}, {
+            SAYCODE_AGENT_ENV: '1',
+            SAYCODE_AGENT_ROOT: '/repo/app',
+            HAPPY_RECONNECT_SESSION_ID: 'victim-session',
+            APLUS_SESSION_ID: 'victim-session',
+            HAPPY_CHECKPOINT_SPAWN_CONTEXT: '{"schemaVersion":1}',
+            HAPPY_CREATED_BY_ACCOUNT_ID: 'someone-else',
+        })).toEqual({
+            SAYCODE_AGENT_ENV: '1',
+            SAYCODE_AGENT_ROOT: '/repo/app',
+        })
+    })
+
+    it('accepts a root seed that carries no depth, budget or id', () => {
+        // The web/Desktop root seed omits MAX_SPAWN so saycode-cli derives it
+        // from machine capacity; the optional fields must not be required.
+        expect(buildSpawnRequestEnvironment({}, {
+            SAYCODE_AGENT_ENV: '1',
+            SAYCODE_AGENT_ROOT: '/repo/app',
+            SAYCODE_AGENT_DEPTH: '0',
+        })).toEqual({
+            SAYCODE_AGENT_ENV: '1',
+            SAYCODE_AGENT_ROOT: '/repo/app',
+            SAYCODE_AGENT_DEPTH: '0',
+        })
+    })
+
+    it.each([
+        ['flag is not the literal 1', { SAYCODE_AGENT_ENV: 'true', SAYCODE_AGENT_ROOT: '/repo/app' }],
+        ['root is missing', { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_DEPTH: '0' }],
+        ['root is blank', { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '   ' }],
+        ['root is relative', { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: 'repo/app' }],
+        ['scope is relative', { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/repo/app', SAYCODE_AGENT_SCOPE: '../..' }],
+        ['depth is not a number', { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/repo/app', SAYCODE_AGENT_DEPTH: 'deep' }],
+        ['max spawn is negative', { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/repo/app', SAYCODE_AGENT_MAX_SPAWN: '-1' }],
+        ['id carries shell metacharacters', { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/repo/app', SAYCODE_AGENT_ID: 'a b;rm -rf /' }],
+    ])('drops the whole grant when the %s', (_reason, requested) => {
+        // A partial grant is worse than none: SAYCODE_AGENT_ENV without a usable
+        // root fails isAgentEnv anyway, and a narrowed scope silently shrinks the
+        // tree the session can see.
+        expect(buildSpawnRequestEnvironment({ HAPPY_HOME_DIR: '/trusted/home' }, {
+            ...requested,
+            PROJECT_TOKEN: 'project-token',
+        })).toEqual({
+            HAPPY_HOME_DIR: '/trusted/home',
+            PROJECT_TOKEN: 'project-token',
+        })
+    })
+
+    it('never lets the request overwrite daemon-owned auth', () => {
+        expect(buildSpawnRequestEnvironment(
+            { CLAUDE_CODE_OAUTH_TOKEN: 'trusted' },
+            { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/repo/app', CLAUDE_CODE_OAUTH_TOKEN: 'attacker' },
+        ).CLAUDE_CODE_OAUTH_TOKEN).toBe('trusted')
+    })
 })
 
 describe('Saycode agent resume environment', () => {
