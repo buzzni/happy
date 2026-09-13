@@ -744,6 +744,30 @@ describe('receipt observation axes (T07-L1b)', () => {
         expect((await handlers.receipt(call('query', {}, { attemptId: 'attempt-2' }))).receipts[0]!).toMatchObject({ childExitAt: NOW + 2_000, childExitProof: 'pid-absent' });
     });
 
+    it('a clock that stepped backward between sightings does not exclude a launch that took the pid before the first one', async () => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));                      // O holds 4242
+        let finishA: () => void = () => {};
+        const releaseA = new Promise<void>((resolve) => { finishA = resolve; });
+        runtime.spawn = async () => { await releaseA; return { type: 'success', sessionId: 'sess-1', pid: 4242, pidRegisteredAt: NOW + 500 }; };
+        const spawnA = handlers.spawn(call('spawn', envelope(), { attemptId: 'attempt-a', requestKey: 'key-a' }));
+        for (let i = 0; i < 5; i += 1) await Promise.resolve();
+        wallClock = NOW + 2_000;
+        livePids.delete(4242);
+        expect(handlers.noteChildExited(4242)).toBe('recorded');              // serves O; sighting NOW+2000
+        // The clock steps back and the prune sweep sights the pid again.
+        wallClock = NOW - 5_000;
+        expect(handlers.noteChildExited(4242)).toBe('deferred');
+        // Forward again; B takes the pid and is alive.
+        wallClock = NOW + 3_000;
+        runtime.spawn = async () => { livePids.add(4242); return { type: 'success', sessionId: 'sess-1', pid: 4242, pidRegisteredAt: NOW + 3_000 }; };
+        await handlers.spawn(call('spawn', envelope(), { attemptId: 'attempt-b', requestKey: 'key-b' }));
+        wallClock = NOW + 4_000;
+        finishA();
+        expect((await spawnA).receipt).toMatchObject({ childExitAt: NOW + 2_000, childExitProof: 'pid-absent' });
+        expect((await handlers.receipt(call('query', {}, { attemptId: 'attempt-b' }))).receipts[0]!).toMatchObject({ childExitAt: null });
+    });
+
     it.each(ORDERS)('a launch that finishes late does not steal the reports of the incarnation that took the pid after it (%s then %s)', async (older, newer) => {
         await grantLease();
         // The older launch took pid 4242 first, then stalled before its commit.
