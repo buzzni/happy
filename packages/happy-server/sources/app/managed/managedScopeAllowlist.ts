@@ -85,10 +85,17 @@ const ALLOWED_ROUTES: readonly RouteTemplate[] = [
      * only; the branch below refuses it for every other purpose.
      */
     template('POST', '/v1/managed/sessions/:sessionId/permission'),
+    /**
+     * The next turn of a live session, from a browser. Reachable by
+     * `message-send` only: an approver decides what the run may do, not what
+     * it works on next, and the run may not author its own input.
+     */
+    template('POST', '/v1/managed/sessions/:sessionId/follow-up'),
 ];
 
 /** The one route an approver may use that a reader may not. */
 const APPROVAL_ROUTE = 'POST /v1/managed/sessions/:sessionId/permission';
+const FOLLOW_UP_ROUTE = 'POST /v1/managed/sessions/:sessionId/follow-up';
 
 /** Socket events a managed child may emit, and where each carries its session. */
 const ALLOWED_EVENTS: Readonly<Record<string, 'sid' | 'sessionId'>> = {
@@ -113,6 +120,12 @@ const SESSIONLESS_EVENTS: readonly string[] = ['ping', 'rpc-register', 'rpc-unre
  */
 const ALLOWED_RPC_NAMES: readonly string[] = [
     'permission',
+    /**
+     * The child's handler for a relayed next turn (T07-L5-b). Registered by the
+     * runner; reached over HTTP by a `message-send` bearer, never over the
+     * socket by anyone else.
+     */
+    'follow-up',
     'abort',
     // `steer` is deliberately absent. It injects free text into the turn that
     // is already running, which is an instruction the run's admission never
@@ -233,6 +246,12 @@ export function authorizeManagedHttpRequest(input: {
      */
     if (named === APPROVAL_ROUTE) {
         if (input.purpose !== 'approval-control') return deny('purpose-not-allowed');
+    } else if (named === FOLLOW_UP_ROUTE) {
+        if (input.purpose !== 'message-send') return deny('purpose-not-allowed');
+    } else if (input.purpose === 'message-send') {
+        // Authoring the next turn is all this purpose does: no reading, no
+        // writing on the run's behalf.
+        return deny('purpose-not-allowed');
     } else if (input.purpose !== 'runner' && !isReadableRoute(route)) {
         // A reader reads; nothing that writes or runs.
         return deny('purpose-not-allowed');
