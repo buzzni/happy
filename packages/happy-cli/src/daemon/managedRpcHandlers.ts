@@ -417,13 +417,27 @@ function receiptView(receipt: ManagedReceipt, runtime: ManagedRuntime) {
     };
 }
 
-/** What `noteChildExited` did with the observation; see its doc. */
-export type ManagedChildExitNote = 'recorded' | 'present' | 'no-receipt' | 'write-failed';
+/**
+ * What `noteChildExited` did with the observation: `present` — the kernel
+ * still answers for that pid, nothing to record; `recorded` — written on the
+ * receipt(s) that hold that pid; `deferred` — absence was seen but no receipt
+ * could be written yet (none names the pid so far, the store could not be
+ * read, or the write failed). A deferred exit is the handlers' own obligation:
+ * it is retried on every maintenance tick and consulted when a spawn commits
+ * the pid, and is dropped only after `PENDING_EXIT_TTL_MS`.
+ */
+export type ManagedChildExitNote = 'recorded' | 'present' | 'deferred';
+
+/** How long an exit seen for a pid no receipt names yet is kept for a late commit. */
+export const PENDING_EXIT_TTL_MS = 10 * 60_000;
 
 /**
  * The receipt an observation is about when several match: the latest
- * generation first, then the most recently claimed attempt. Directory order is
- * not an order.
+ * generation first, then the most recently claimed attempt. Ties on the
+ * millisecond are broken by the last write and then by key — deterministic,
+ * never directory order. Observations that carry a pid match on it exactly, so
+ * a tie here means two receipts recorded the same pid in the same
+ * millisecond, which a kernel does not do.
  */
 function newestReceipt(
     receipts: ManagedReceipt[],
@@ -432,10 +446,14 @@ function newestReceipt(
     let best: ManagedReceipt | undefined;
     for (const receipt of receipts) {
         if (!matches(receipt)) continue;
-        if (!best || receipt.epoch > best.epoch
-            || (receipt.epoch === best.epoch && receipt.claimedAt > best.claimedAt)) best = receipt;
+        if (!best || compareReceiptRecency(receipt, best) > 0) best = receipt;
     }
     return best;
+}
+
+function compareReceiptRecency(a: ManagedReceipt, b: ManagedReceipt): number {
+    return (a.epoch - b.epoch) || (a.claimedAt - b.claimedAt) || (a.updatedAt - b.updatedAt)
+        || (a.requestKey < b.requestKey ? -1 : a.requestKey > b.requestKey ? 1 : 0);
 }
 
 export function createManagedRpcHandlers(runtime: ManagedRuntime) {
@@ -777,15 +795,49 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
         }
     };
 
-    const recordChildExit = (receipt: ManagedReceipt): ManagedChildExitNote => {
-        try {
-            runtime.store.update(receipt.requestKey, {
-                childExitAt: runtime.now(), childExitProof: 'pid-absent',
-            }, runtime.now());
-            return 'recorded';
-        } catch {
-            logger.debug('[managed] could not record child exit on a receipt');
-            return 'write-failed';
+    /** Exits observed (ESRCH) that no receipt has recorded yet, by pid → when seen. */
+    const pendingExits = new Map<number, number>();
+
+    const exitObservable = (r: ManagedReceipt): boolean => (
+        r.childExitAt === null && (r.state === 'spawned' || r.state === 'running' || r.state === 'stopping')
+    );
+
+    /**
+     * Writes every pending exit it can. An absent pid is absent for **every**
+     * receipt that recorded it — a reused pid means the older child was gone
+     * first — so all of them get the observation, none is chosen. A listing
+     * that could not be read fully proves nothing about absence, and a write
+     * that failed keeps its obligation; both are retried next time.
+     */
+    const flushPendingExits = (): void => {
+        if (pendingExits.size === 0) return;
+        const now = runtime.now();
+        for (const [pid, seenAt] of pendingExits) {
+            if (now - seenAt > PENDING_EXIT_TTL_MS) pendingExits.delete(pid);
+        }
+        if (pendingExits.size === 0) return;
+        const listing = runtime.store.list();
+        if (listing.listError !== undefined || listing.unknown.length > 0) {
+            logger.debug('[managed] receipt store not fully readable; child exits stay pending');
+            return;
+        }
+        for (const [pid, seenAt] of pendingExits) {
+            const holders = listing.receipts.filter((r) => r.pid === pid && exitObservable(r));
+            // No receipt names it yet: a commit may still arrive (`spawning`
+            // receipts have no pid). Kept until the TTL.
+            if (holders.length === 0) continue;
+            let written = 0;
+            for (const receipt of holders) {
+                try {
+                    runtime.store.update(receipt.requestKey, {
+                        childExitAt: seenAt, childExitProof: 'pid-absent',
+                    }, now);
+                    written += 1;
+                } catch {
+                    logger.debug('[managed] could not record child exit on a receipt; retrying later');
+                }
+            }
+            if (written === holders.length) pendingExits.delete(pid);
         }
     };
 
@@ -1027,10 +1079,13 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                 sessionId: outcome.sessionId,
             }, runtime.now());
             // A child that exited while the launch was still being committed
-            // was invisible to the exit sweep (the receipt had no pid yet).
-            // Probed once here so that exit is not lost; `state` stays `running`
-            // like any other exit observation.
-            if (pidAbsent(outcome.pid) && recordChildExit(after) === 'recorded') {
+            // was invisible to the exit sweep (the receipt had no pid yet): the
+            // sweep left the exit pending, or the pid is simply gone now. Either
+            // way it is recorded here; `state` stays `running` like any other
+            // exit observation, and a failed write stays pending for maintenance.
+            if (pendingExits.has(outcome.pid) || pidAbsent(outcome.pid)) {
+                if (!pendingExits.has(outcome.pid)) pendingExits.set(outcome.pid, runtime.now());
+                flushPendingExits();
                 const reread = runtime.store.read(key);
                 if (reread.kind === 'ok') after = reread.receipt;
             }
@@ -1510,7 +1565,7 @@ const aiAuthRpc = async (params: unknown) => {
          * Nothing here is a terminal state and nothing here is a success:
          * a turn that ended in a provider error also goes busy→idle.
          */
-        noteSessionRuntime(sessionId: string, report: {
+        noteSessionRuntime(sessionId: string, pid: number, report: {
             assistantTurns?: number;
             lastTurnEndAt?: number;
             thinking: boolean;
@@ -1518,10 +1573,11 @@ const aiAuthRpc = async (params: unknown) => {
             pendingUserInput: boolean;
         }): void {
             // Several receipts may name one session (a retried attempt keeps
-            // the run's session). The report is about the child the parent is
-            // driving now: the newest attempt that has not been seen exiting.
+            // the run's session). The report was verified against the tracked
+            // process's pid, and the receipt recorded its pid at spawn: that
+            // is the identity, not the session.
             const receipt = newestReceipt(runtime.store.list().receipts, (r) => (
-                r.sessionId === sessionId && r.childExitAt === null
+                r.pid === pid && r.sessionId === sessionId && r.childExitAt === null
                 && (r.state === 'running' || r.state === 'stopping')
             ));
             if (!receipt) return;
@@ -1569,20 +1625,15 @@ const aiAuthRpc = async (params: unknown) => {
          * alone: a leader that exited says nothing about its descendants, and
          * `stopped` stays the backend-proven meaning it has always had.
          *
-         * The answer tells the caller whether its retry source may go:
-         * `write-failed` means the fact was seen and not stored, so the pid must
-         * stay tracked for the next sweep. `present` means the kernel still
-         * answers for that pid — a reused or unreadable one — and no evidence
-         * exists to store.
+         * The caller may drop its tracking whatever the answer: an exit that
+         * could not be recorded now is kept here and retried (see
+         * `flushPendingExits`).
          */
         noteChildExited(pid: number): ManagedChildExitNote {
             if (!pidAbsent(pid)) return 'present';
-            const receipt = newestReceipt(runtime.store.list().receipts, (r) => (
-                r.pid === pid && r.childExitAt === null
-                && (r.state === 'spawned' || r.state === 'running' || r.state === 'stopping')
-            ));
-            if (!receipt) return 'no-receipt';
-            return recordChildExit(receipt);
+            if (!pendingExits.has(pid)) pendingExits.set(pid, runtime.now());
+            flushPendingExits();
+            return pendingExits.has(pid) ? 'deferred' : 'recorded';
         },
 
         /**
@@ -1753,6 +1804,8 @@ const aiAuthRpc = async (params: unknown) => {
          */
         async runLeaseMaintenance() {
             return serializeLease(async () => {
+            // Exits seen but not yet on a receipt get another chance every tick.
+            flushPendingExits();
             // One listing for the whole tick. Reading it twice would let the
             // two passes disagree, and reading only `receipts` would hide an
             // entry we could not parse — which may be exactly the pending stop

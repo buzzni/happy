@@ -545,7 +545,7 @@ export async function startDaemon(): Promise<void> {
      * its child — verified runtime reports (turns, idle) and the pid vanishing.
      * Assigned once the handlers exist; before that there is no receipt to tell.
      */
-    let managedNoteSessionRuntime: ((sessionId: string, report: {
+    let managedNoteSessionRuntime: ((sessionId: string, pid: number, report: {
       assistantTurns?: number; lastTurnEndAt?: number;
       thinking: boolean; hasOpenToolCall: boolean; pendingUserInput: boolean;
     }) => void) | null = null;
@@ -1336,8 +1336,9 @@ export async function startDaemon(): Promise<void> {
         tokens: trackedSession.runtime.providerTokens,
         lastTurnEndAt: trackedSession.runtime.lastTurnEndAt,
       });
-      // The same merged report, on the managed receipt (L1b). Verified above.
-      managedNoteSessionRuntime?.(sessionId, {
+      // The same merged report, on the managed receipt (L1b). Verified above
+      // against the tracked process, whose pid is the receipt's identity.
+      managedNoteSessionRuntime?.(sessionId, trackedSession.pid, {
         ...(trackedSession.runtime.assistantTurns !== undefined ? { assistantTurns: trackedSession.runtime.assistantTurns } : {}),
         ...(trackedSession.runtime.lastTurnEndAt !== undefined ? { lastTurnEndAt: trackedSession.runtime.lastTurnEndAt } : {}),
         thinking: trackedSession.runtime.thinking ?? false,
@@ -2789,11 +2790,10 @@ export async function startDaemon(): Promise<void> {
     const onChildExited = (pid: number) => {
       const tracked = pidToTrackedSession.get(pid);
       // A managed attempt's child is gone: its receipt records the exit (L1b).
-      // A fact seen but not stored keeps its retry source: the pid stays
-      // tracked and the next prune calls here again.
-      if (managedNoteChildExited?.(pid) === 'write-failed') {
-        logger.debug(`[DAEMON RUN] Child exit of PID ${pid} not recorded on its receipt; keeping it tracked`);
-        return;
+      // An exit that cannot be recorded yet is the handlers' own obligation
+      // (retried on maintenance), so tracking is released here regardless.
+      if (managedNoteChildExited?.(pid) === 'deferred') {
+        logger.debug(`[DAEMON RUN] Child exit of PID ${pid} not yet on a receipt; deferred`);
       }
       if (tracked?.happySessionId) autonomousQualityGateRegistry.noteSessionStopped(tracked.happySessionId);
       const preservedForResume = tracked ? preserveSessionForResume(tracked, `process-exit:${pid}`) : false;
@@ -3485,7 +3485,7 @@ export async function startDaemon(): Promise<void> {
       // the constructor already registered and intercepts the rest.
       apiMachine.setManagedRuntime(managedHandlers);
       managedDrainLeaseWork = () => managedHandlers.drainLeaseWork();
-      managedNoteSessionRuntime = (sessionId, report) => managedHandlers.noteSessionRuntime(sessionId, report);
+      managedNoteSessionRuntime = (sessionId, pid, report) => managedHandlers.noteSessionRuntime(sessionId, pid, report);
       managedNoteChildExited = (pid) => managedHandlers.noteChildExited(pid);
       managedCloseEntries = () => {
         managedHandlers.closeEntries();
