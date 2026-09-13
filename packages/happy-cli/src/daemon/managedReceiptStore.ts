@@ -89,7 +89,7 @@ export type ManagedReceipt = {
     childExitProof: 'pid-absent' | null;
     claimedAt: number;
     spawnAt: number | null;
-    /** When `pid` was committed to this receipt. Orders incarnations of a reused pid; `claimedAt` cannot. */
+    /** When this receipt's launch took `pid` (registration, before its waits). Orders incarnations of a reused pid; `claimedAt` cannot. */
     pidRecordedAt: number | null;
     updatedAt: number;
     rev: number;

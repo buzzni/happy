@@ -115,7 +115,7 @@ describe('managed spawn goes through the supervisor', () => {
             unregister: r.unregister, waitForChildReady: r.waitForChildReady,
             reportBaseUrl: REPORT_BASE_URL,
         });
-        expect(outcome).toEqual({ type: 'success', sessionId: SESSION_ID, pid: 4242 });
+        expect(outcome).toEqual({ type: 'success', sessionId: SESSION_ID, pid: 4242, pidRegisteredAt: expect.any(Number) });
         // A release before the registration is a child nobody can stop.
         // The wait is armed before the gate opens: a report can arrive the
         // instant the child execs.

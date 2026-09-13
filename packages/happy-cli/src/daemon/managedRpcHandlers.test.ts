@@ -636,7 +636,48 @@ describe('receipt observation axes (T07-L1b)', () => {
             return { type: 'success', sessionId: 'sess-1', pid: 5151 };
         };
         const result = await handlers.spawn(call('spawn', envelope()));
-        expect(result.receipt).toMatchObject({ state: 'running', childExitAt: seenAt, childExitProof: 'pid-absent' });
+        // For this receipt the absence counts from the moment it took the pid — the sighting predates its identity.
+        expect(result.receipt).toMatchObject({ state: 'running', childExitAt: seenAt + 2_000, childExitProof: 'pid-absent' });
+    });
+
+    it('a live pid at the commit keeps the pending exit for the older holder it is owed to', async () => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        livePids.delete(4242);
+        const update = runtime.store.update;
+        runtime.store.update = () => { throw new Error('lock lost'); };
+        expect(handlers.noteChildExited(4242)).toBe('deferred');
+        runtime.store.update = update;
+        // The kernel reuses 4242 for the next attempt, which is alive at its commit.
+        wallClock += 1_000;
+        await handlers.spawn(call('spawn', envelope(), { attemptId: 'attempt-2', requestKey: 'key-attempt-2' }));
+        expect((await handlers.receipt(call('query', {}, { attemptId: 'attempt-2' }))).receipts[0]!).toMatchObject({ childExitAt: null });
+        await handlers.runLeaseMaintenance();
+        expect((await handlers.receipt(call('query', {}))).receipts[0]!).toMatchObject({ childExitAt: NOW + 1_000, childExitProof: 'pid-absent' });
+        expect((await handlers.receipt(call('query', {}, { attemptId: 'attempt-2' }))).receipts[0]!).toMatchObject({ childExitAt: null });
+    });
+
+    it.each(ORDERS)('a launch that finishes late does not steal the reports of the incarnation that took the pid after it (%s then %s)', async (older, newer) => {
+        await grantLease();
+        // The older launch took pid 4242 first, then stalled before its commit.
+        let finishOlder: () => void = () => {};
+        const olderRelease = new Promise<void>((resolve) => { finishOlder = resolve; });
+        runtime.spawn = async () => {
+            livePids.add(4242);
+            await olderRelease;
+            return { type: 'success', sessionId: 'sess-1', pid: 4242, pidRegisteredAt: NOW + 1_000 };
+        };
+        const olderSpawn = handlers.spawn(call('spawn', envelope(), { attemptId: older, requestKey: `key-${older}` }));
+        for (let i = 0; i < 5; i += 1) await Promise.resolve();
+        // Its child died and the kernel handed 4242 to the newer launch, which commits first.
+        runtime.spawn = async () => ({ type: 'success', sessionId: 'sess-1', pid: 4242, pidRegisteredAt: NOW + 2_000 });
+        await handlers.spawn(call('spawn', envelope(), { attemptId: newer, requestKey: `key-${newer}` }));
+        wallClock += 5_000;
+        finishOlder();
+        await olderSpawn;
+        handlers.noteSessionRuntime('sess-1', 4242, { assistantTurns: 2, thinking: true, hasOpenToolCall: false, pendingUserInput: false });
+        expect((await handlers.receipt(call('query', {}, { attemptId: newer }))).receipts[0]!).toMatchObject({ turnCount: 2 });
+        expect((await handlers.receipt(call('query', {}, { attemptId: older }))).receipts[0]!).toMatchObject({ turnCount: null });
     });
 
     it('a pending exit for a pid that is alive again at the commit is dropped, not written onto the new child', async () => {
