@@ -3684,6 +3684,12 @@ export async function startDaemon(): Promise<void> {
         }),
         discardGithubWorktree: removeGithubTriggerWorktree,
         isSessionRunning: isAutomationSessionRunning,
+        stopSession: (sessionId) => {
+          stopSession(sessionId, {
+            source: 'server-automation',
+            reason: 'GitHub worker session outlived the runtime cap',
+          });
+        },
         isDirectoryInUse: isAutomationDirectoryInUse,
         logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
       }),

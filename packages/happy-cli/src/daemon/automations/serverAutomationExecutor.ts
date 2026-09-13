@@ -212,6 +212,8 @@ export interface ServerAutomationExecutorInput {
     worktreePath: string
   }) => Promise<{ ok: true } | { ok: false; dirty: boolean; error: string }>
   isSessionRunning: (sessionId: string) => boolean
+  /** 매달린 워커 세션에 종료를 요청한다. 실제 종료는 다음 틱의 isSessionRunning 으로 확인한다. */
+  stopSession?: (sessionId: string) => void
   isDirectoryInUse: (directory: string) => boolean
   randomId?: () => string
   logDebug?: (message: string) => void
@@ -231,6 +233,20 @@ export const MAX_GITHUB_EVENTS_PER_TICK = 3
 // 있어 3 → 6 으로 올렸다. 유입은 MAX_GITHUB_EVENTS_PER_TICK 이 틱당 3건으로 계속
 // 잡아 주므로, 한 번에 몰려도 상한까지 두 틱에 걸쳐 올라간다.
 export const MAX_GITHUB_WORKER_SESSIONS = 6
+/**
+ * 워커 세션 하나가 살아 있을 수 있는 최대 시간.
+ *
+ * 2026-09-12~13 프로덕션 — 리뷰를 끝내고 결과까지 제출한(HTTP 200) 워커가 24시간
+ * 살아 있었다. /complete 를 보낸 python 이 urlopen 에 timeout 을 주지 않아 stalled
+ * 연결에서 영원히 블록됐고, 그 명령이 끝나지 않으니 턴도 세션도 끝나지 않았다
+ * (exec_command_begin 13 / end 12). 최근 워커 10건 중 3건이 같은 모양이었고 두 건은
+ * 17~24시간이었다. 그동안 위 6칸 중 하나와 worktree 를 붙들고 있는다.
+ *
+ * 프로토콜로 timeout 을 지시해도 어떤 명령이든 매달릴 수 있으므로 플랫폼이 상한을
+ * 둔다. 리뷰는 보통 수 분이고 AgentTask lease 는 5분이라 2시간이면 정상 작업을
+ * 끊을 일이 없다 — 여기 걸린 세션은 이미 서버가 task 를 회수한 뒤다.
+ */
+export const MAX_GITHUB_WORKER_RUNTIME_MS = 2 * 60 * 60_000
 const DIRTY_WORKTREE_RETRY_MS = 15 * 60_000
 /**
  * dirty 보류가 이만큼 이어지면 알린다(15분 간격이므로 4회 = 1시간).
@@ -347,6 +363,13 @@ function buildAgentTaskPrompt(
       + ' shell argument such as -d \'{...}\' — findings quote code, so backticks, quotes,'
       + ' and $ get interpolated and the body arrives corrupted.',
     'Retry network failures and 5xx responses with the same idempotencyKey; do not retry 4xx responses.',
+    // 2026-09-12 프로덕션 — 워커가 /complete 를 보낸 python 이 urlopen 에 timeout 을
+    // 주지 않아, 결과가 HTTP 200 으로 접수된 뒤에도 stalled 연결에서 영원히 블록됐다.
+    // 그 명령이 끝나지 않으니 턴도 세션도 끝나지 않아 24시간을 붙들고 있었다. 지시에
+    // 없으면 워커는 timeout 을 쓰지 않는다 — urllib 도 curl 도 기본값이 무제한이다.
+    'Give every one of these HTTP calls an explicit timeout (curl --max-time 30, or the'
+      + ' timeout argument of whatever client you use) — a stalled connection otherwise blocks'
+      + ' the command forever and the session can never finish.',
     // 손상된 본문은 재시도로 풀리지 않지만, 조용히 끝나서도 안 된다. 4xx 를 만나면
     // 상태 코드와 응답 본문을 남겨 왜 제출이 실패했는지 사람이 볼 수 있게 한다.
     // 2026-09-03 프로덕션 — 워커가 리뷰를 끝내고 /complete 에서 409 를 받자 이 지시대로
@@ -957,6 +980,16 @@ function writeGithubWorktree(
   })
 }
 
+function markGithubWorktreeStopRequested(input: ServerAutomationExecutorInput, runId: string): void {
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...state,
+    githubWorktrees: (state.githubWorktrees ?? []).map((entry) => (
+      entry.runId === runId ? { ...entry, stopRequestedAt: input.now } : entry
+    )),
+  })
+}
+
 function removeGithubWorktreeJournal(input: ServerAutomationExecutorInput, runId: string): void {
   const state = input.runtimeStore.read()
   input.runtimeStore.write({
@@ -989,7 +1022,23 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
   const worktrees = input.runtimeStore.read().githubWorktrees ?? []
   for (const worktree of worktrees) {
     if ((worktree.cleanupRetryAt ?? 0) > input.now) continue
-    if (worktree.sessionId && input.isSessionRunning(worktree.sessionId)) continue
+    if (worktree.sessionId && input.isSessionRunning(worktree.sessionId)) {
+      // 상한을 넘겼으면 종료를 요청하고 이번 틱은 넘어간다. 실제로 끝났는지는 다음
+      // 틱의 isSessionRunning 이 판정하고, 그때 평소 경로로 worktree 가 정리된다.
+      // 한 번만 보낸다 — 매 틱 SIGTERM 을 다시 보내면 종료 중인 프로세스를 계속
+      // 때리고 로그만 덮인다.
+      if (!worktree.stopRequestedAt
+        && input.now - worktree.createdAt >= MAX_GITHUB_WORKER_RUNTIME_MS) {
+        input.logDebug?.(
+          `[server-automation] ${worktree.automationId} stopping a GitHub worker session that outlived`
+          + ` the ${Math.round(MAX_GITHUB_WORKER_RUNTIME_MS / 60_000)}-minute runtime cap:`
+          + ` ${worktree.sessionId} (${worktree.worktreePath})`,
+        )
+        input.stopSession?.(worktree.sessionId)
+        markGithubWorktreeStopRequested(input, worktree.runId)
+      }
+      continue
+    }
     if (!worktree.sessionId && input.isDirectoryInUse(worktree.directory)) continue
     const discarded = await input.discardGithubWorktree({
       repositoryRoot: worktree.repositoryRoot,
