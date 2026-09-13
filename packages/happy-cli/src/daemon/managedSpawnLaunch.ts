@@ -103,6 +103,8 @@ export type ManagedSpawnLaunchInput = {
      * cannot read the daemon's state file across uids.
      */
     reportBaseUrl: string;
+    /** Wall clock; `Date.now` unless a test says otherwise. */
+    now?: () => number;
 };
 
 export async function launchManagedSpawn(input: ManagedSpawnLaunchInput): Promise<ManagedSpawnOutcome> {
@@ -147,6 +149,10 @@ export async function launchManagedSpawn(input: ManagedSpawnLaunchInput): Promis
         return { type: 'error', errorMessage: 'prepared-without-pid' };
     }
 
+    // When this launch took the pid — before anything is awaited. Two launches
+    // finishing out of order still commit in incarnation order by this stamp,
+    // because a pid is only handed out again after its holder died.
+    const pidRegisteredAt = (input.now ?? Date.now)();
     // The same identity the child was handed. A registry entry under a
     // different id would refuse every report the child actually signs.
     input.register({
@@ -184,7 +190,7 @@ export async function launchManagedSpawn(input: ManagedSpawnLaunchInput): Promis
          */
         return { type: 'error', errorMessage: 'child-reported-another-session' };
     }
-    return { type: 'success', sessionId, pid: prepared.pid };
+    return { type: 'success', sessionId, pid: prepared.pid, pidRegisteredAt };
 }
 
 /**

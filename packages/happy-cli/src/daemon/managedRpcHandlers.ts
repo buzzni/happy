@@ -29,10 +29,13 @@ import {
 import {
     classifyManagedReceipt,
     managedOperationKey,
+    normalizeReceiptObservation,
     type ManagedReceipt,
+    type ManagedReceiptObservation,
     type ManagedReceiptStore,
 } from './managedReceiptStore';
 import {
+    defaultProcessGroupDeps,
     probeProcessGroup,
     type ProcessGroupDeps,
     type ProcessGroupEvidence,
@@ -131,7 +134,11 @@ export type ManagedSpawnRequest = {
 };
 
 export type ManagedSpawnOutcome =
-    | { type: 'success'; sessionId: string; pid: number }
+    | {
+        type: 'success'; sessionId: string; pid: number
+        /** When the launch took the pid, before its readiness waits. Orders incarnations of a reused pid. */
+        pidRegisteredAt?: number
+    }
     /**
      * `started: false` is the only evidence that lets a run be recorded as
      * failed. Without it the child may already exist, so the receipt stays
@@ -401,7 +408,58 @@ function receiptView(receipt: ManagedReceipt, runtime: ManagedRuntime) {
         stopRequested: receipt.stopRequestedAt !== null,
         certainty: classifyManagedReceipt(receipt, runtime.isPidAlive),
         updatedAt: receipt.updatedAt,
+        // Observation axes (T07-L1b). Separate facts; the parent combines them.
+        failureReason: receipt.failureReason,
+        stopIntent: receipt.stopIntent,
+        turnCount: receipt.turnCount,
+        lastTurnEndAt: receipt.lastTurnEndAt,
+        reportThinking: receipt.reportThinking,
+        reportOpenToolCall: receipt.reportOpenToolCall,
+        reportPendingUserInput: receipt.reportPendingUserInput,
+        childExitAt: receipt.childExitAt,
+        childExitProof: receipt.childExitProof,
     };
+}
+
+/**
+ * What `noteChildExited` did with the observation: `present` — the kernel
+ * still answers for that pid, nothing to record; `recorded` — written on at
+ * least one receipt that holds that pid; `deferred` — absence was seen but no
+ * receipt could be written now (none names the pid so far, the store could not
+ * be read, or the write failed). Every sighting is the handlers' own
+ * obligation either way: it is retried on every maintenance tick and consulted
+ * when a spawn commits the pid, until `PENDING_EXIT_TTL_MS` after the last
+ * sighting.
+ */
+export type ManagedChildExitNote = 'recorded' | 'present' | 'deferred';
+
+/** How long an exit seen for a pid no receipt names yet is kept for a late commit. */
+export const PENDING_EXIT_TTL_MS = 10 * 60_000;
+
+/**
+ * The receipt an observation is about when several match: the latest
+ * generation first, then the receipt whose launch took the pid last
+ * (`pidRecordedAt`, stamped at registration before any await — two attempts
+ * can be claimed in one millisecond and their launches can finish out of
+ * order, but a pid is handed out again only after its holder died). Then the
+ * claim, the last write and the key — deterministic, never directory order.
+ */
+function newestReceipt(
+    receipts: ManagedReceipt[],
+    matches: (receipt: ManagedReceipt) => boolean,
+): ManagedReceipt | undefined {
+    let best: ManagedReceipt | undefined;
+    for (const receipt of receipts) {
+        if (!matches(receipt)) continue;
+        if (!best || compareReceiptRecency(receipt, best) > 0) best = receipt;
+    }
+    return best;
+}
+
+function compareReceiptRecency(a: ManagedReceipt, b: ManagedReceipt): number {
+    return (a.epoch - b.epoch) || ((a.pidRecordedAt ?? -1) - (b.pidRecordedAt ?? -1))
+        || (a.claimedAt - b.claimedAt) || (a.updatedAt - b.updatedAt)
+        || (a.requestKey < b.requestKey ? -1 : a.requestKey > b.requestKey ? 1 : 0);
 }
 
 export function createManagedRpcHandlers(runtime: ManagedRuntime) {
@@ -733,6 +791,79 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
      * the kernel may have handed to something else since, so it is evidence
      * about what is visible, never authority to kill.
      */
+    /** `kill(pid, 0)` on the leader itself — not its group. Only ESRCH is absence. */
+    const pidAbsent = (pid: number): boolean => {
+        try {
+            (runtime.processGroupDeps ?? defaultProcessGroupDeps).kill(pid, 0);
+            return false;
+        } catch (error) {
+            return (error as NodeJS.ErrnoException).code === 'ESRCH';
+        }
+    };
+
+    /**
+     * Exits observed (ESRCH), by pid. A sighting is for **every** receipt that
+     * holds the pid when it is made — whoever holds a pid the kernel does not
+     * answer for has a dead child, whatever its clock says. The only receipts
+     * it is not for are those that take the pid *afterwards* while alive: a
+     * newer incarnation, recognised at its commit by the live probe and by a
+     * registration no earlier than the sighting, and remembered in `notFor`. A
+     * fresh sighting clears that — the pid is absent again, for everyone.
+     *
+     * The time never moves backward (a clock adjustment must not disown a
+     * holder), and the entry stays until `PENDING_EXIT_TTL_MS` after the last
+     * sighting rather than being dropped once the visible holders are served:
+     * a launch that took the pid before the sighting may still commit late.
+     */
+    const pendingExits = new Map<number, { seenAt: number; notFor: Set<string> }>();
+
+    const exitObservable = (r: ManagedReceipt): boolean => (
+        r.childExitAt === null && (r.state === 'spawned' || r.state === 'running' || r.state === 'stopping')
+    );
+
+    const noteAbsence = (pid: number): void => {
+        const now = runtime.now();
+        const prior = pendingExits.get(pid);
+        pendingExits.set(pid, { seenAt: Math.max(prior?.seenAt ?? 0, now), notFor: new Set() });
+    };
+
+    /**
+     * Writes every pending exit it can and says how many receipts took one. A
+     * listing that could not be read fully proves nothing about absence, and
+     * a write that failed keeps its obligation; both are retried next time.
+     */
+    const flushPendingExits = (): number => {
+        if (pendingExits.size === 0) return 0;
+        const now = runtime.now();
+        for (const [pid, pending] of pendingExits) {
+            if (now - pending.seenAt > PENDING_EXIT_TTL_MS) pendingExits.delete(pid);
+        }
+        if (pendingExits.size === 0) return 0;
+        const listing = runtime.store.list();
+        if (listing.listError !== undefined || listing.unknown.length > 0) {
+            logger.debug('[managed] receipt store not fully readable; child exits stay pending');
+            return 0;
+        }
+        let written = 0;
+        for (const [pid, pending] of pendingExits) {
+            for (const receipt of listing.receipts) {
+                if (receipt.pid !== pid || !exitObservable(receipt) || pending.notFor.has(receipt.requestKey)) continue;
+                try {
+                    runtime.store.update(receipt.requestKey, {
+                        // Observed absent for *this* receipt no earlier than it
+                        // took the pid: a pre-identity sighting dates from the commit.
+                        childExitAt: Math.max(pending.seenAt, receipt.pidRecordedAt ?? pending.seenAt),
+                        childExitProof: 'pid-absent',
+                    }, now);
+                    written += 1;
+                } catch {
+                    logger.debug('[managed] could not record child exit on a receipt; retrying later');
+                }
+            }
+        }
+        return written;
+    };
+
     const stopAttempt = async (receipt: ManagedReceipt): Promise<{
         evidence: ProcessGroupEvidence;
         backendStop: BackendStopResult;
@@ -964,12 +1095,34 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             // The child is detached, so it leads its own process group. The pid
             // is recorded for observation only; stopping it belongs to the
             // trusted backend.
-            const after = runtime.store.update(key, {
+            let after = runtime.store.update(key, {
                 state: 'running',
                 pid: outcome.pid,
                 pgid: outcome.pid,
+                // Incarnation order: when the launch took the pid, not when this
+                // commit happened — launches finish out of order.
+                pidRecordedAt: outcome.pidRegisteredAt ?? runtime.now(),
                 sessionId: outcome.sessionId,
             }, runtime.now());
+            // A child that exited while the launch was still being committed
+            // was invisible to the exit sweep (the receipt had no pid yet): the
+            // sweep left the exit pending, or the pid is simply gone now. A pid
+            // that answers now is either a newer incarnation — registered no
+            // earlier than the sighting — which the sighting is not for, or a
+            // launch that took the pid before the sighting and commits late,
+            // which is owed it. `state` stays `running` like any other exit
+            // observation; a failed write stays pending for maintenance.
+            if (pidAbsent(outcome.pid)) {
+                noteAbsence(outcome.pid);
+            } else {
+                const pending = pendingExits.get(outcome.pid);
+                if (pending && after.pidRecordedAt !== null && after.pidRecordedAt >= pending.seenAt) pending.notFor.add(key);
+            }
+            if (pendingExits.has(outcome.pid)) {
+                flushPendingExits();
+                const reread = runtime.store.read(key);
+                if (reread.kind === 'ok') after = reread.receipt;
+            }
 
             // A stop that arrived while the spawn was in flight is honoured now
             // that there is something to signal.
@@ -1042,7 +1195,9 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                 // No pid yet. The spawn path consumes this flag once it has one,
                 // but a persisted `spawning` row from a previous process may
                 // already have a live child, so the backend is asked as well.
-                const marked = runtime.store.update(key, { stopRequestedAt: runtime.now() }, runtime.now());
+                const marked = runtime.store.update(key, {
+                    stopRequestedAt: runtime.now(), ...(receipt.stopIntent === null ? { stopIntent: 'parent-stop' as const } : {}),
+                }, runtime.now());
                 const { evidence, backendStop } = await stopAttempt(marked);
                 return {
                     stopIntentRecorded: true,
@@ -1066,6 +1221,8 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
 
             const marked = runtime.store.update(key, {
                 state: 'stopping', stopRequestedAt: runtime.now(),
+                // 첫 의도만 남긴다 — lease 만료가 먼저 기록했으면 그것이 원인에 가깝다.
+                ...(receipt.stopIntent === null ? { stopIntent: 'parent-stop' as const } : {}),
             }, runtime.now());
             const { evidence, backendStop } = await stopAttempt(marked);
             // Three separate facts, never collapsed:
@@ -1437,6 +1594,82 @@ const aiAuthRpc = async (params: unknown) => {
         'ai-auth': (params: unknown) => trackRpc(aiAuthRpc(params)),
 
         /**
+         * A verified runtime report from the child of a managed attempt
+         * (T07-L1b). Records the raw flags and the monotonic turn counters.
+         * Nothing here is a terminal state and nothing here is a success:
+         * a turn that ended in a provider error also goes busy→idle.
+         */
+        noteSessionRuntime(sessionId: string, pid: number, report: {
+            assistantTurns?: number;
+            lastTurnEndAt?: number;
+            thinking: boolean;
+            hasOpenToolCall: boolean;
+            pendingUserInput: boolean;
+        }): void {
+            // Several receipts may name one session (a retried attempt keeps
+            // the run's session). The report was verified against the tracked
+            // process's pid, and the receipt recorded its pid at spawn: that
+            // is the identity, not the session.
+            const receipt = newestReceipt(runtime.store.list().receipts, (r) => (
+                r.pid === pid && r.sessionId === sessionId && r.childExitAt === null
+                && (r.state === 'running' || r.state === 'stopping')
+            ));
+            if (!receipt) return;
+            // The raw report is validated before it is merged: a merge that
+            // clamps (max) would hide a malformed value and still write.
+            const reported = normalizeReceiptObservation({
+                ...receipt,
+                turnCount: report.assistantTurns ?? null,
+                lastTurnEndAt: report.lastTurnEndAt ?? null,
+                reportThinking: report.thinking,
+                reportOpenToolCall: report.hasOpenToolCall,
+                reportPendingUserInput: report.pendingUserInput,
+            });
+            // A report the file parser would refuse must not be written: it would
+            // turn a good receipt into an unreadable one on the next read.
+            if (reported === null) {
+                logger.debug('[managed] ignoring a malformed session runtime report');
+                return;
+            }
+            const observation: ManagedReceiptObservation = {
+                ...reported,
+                turnCount: reported.turnCount === null
+                    ? receipt.turnCount
+                    : Math.max(reported.turnCount, receipt.turnCount ?? 0),
+                lastTurnEndAt: reported.lastTurnEndAt === null
+                    ? receipt.lastTurnEndAt
+                    : Math.max(reported.lastTurnEndAt, receipt.lastTurnEndAt ?? 0),
+            };
+            const same = (Object.keys(observation) as Array<keyof ManagedReceiptObservation>)
+                .every((k) => observation[k] === receipt[k]);
+            if (same) return;
+            try {
+                runtime.store.update(receipt.requestKey, observation, runtime.now());
+            } catch {
+                // The writer lock is gone or the file changed under us; the next
+                // report tries again. A missed note is not a lost fact.
+                logger.debug('[managed] could not record session runtime on a receipt');
+            }
+        },
+
+        /**
+         * The daemon's tracking lost a child pid (T07-L1b). Recorded on the
+         * receipt as an **observation** — the pid is probed again here and only
+         * ESRCH counts; EPERM or anything else is not absence. `state` is left
+         * alone: a leader that exited says nothing about its descendants, and
+         * `stopped` stays the backend-proven meaning it has always had.
+         *
+         * The caller may drop its tracking whatever the answer: an exit that
+         * could not be recorded now is kept here and retried (see
+         * `flushPendingExits`).
+         */
+        noteChildExited(pid: number): ManagedChildExitNote {
+            if (!pidAbsent(pid)) return 'present';
+            noteAbsence(pid);
+            return flushPendingExits() > 0 ? 'recorded' : 'deferred';
+        },
+
+        /**
          * Reports what this runtime is, and what it currently holds.
          *
          * A reading. It renews nothing and advances nothing — the parent polls
@@ -1604,6 +1837,8 @@ const aiAuthRpc = async (params: unknown) => {
          */
         async runLeaseMaintenance() {
             return serializeLease(async () => {
+            // Exits seen but not yet on a receipt get another chance every tick.
+            flushPendingExits();
             // One listing for the whole tick. Reading it twice would let the
             // two passes disagree, and reading only `receipts` would hide an
             // entry we could not parse — which may be exactly the pending stop
@@ -1667,11 +1902,21 @@ const aiAuthRpc = async (params: unknown) => {
                 // in the middle of it. It is also what a spawn that is still
                 // launching reads when it finishes, so a child that arrives
                 // after its lease expired stops itself.
-                const marked = receipt.stopRequestedAt === null
+                //
+                // Re-read at the write: the listing was taken before the
+                // handovers above were awaited, and a parent stop may have landed
+                // on this receipt meanwhile. Its intent is the first one and must
+                // not be overwritten from a stale snapshot.
+                const fresh = runtime.store.read(receipt.requestKey);
+                const latest = fresh.kind === 'ok' ? fresh.receipt : receipt;
+                const marked = latest.stopRequestedAt === null
                     ? runtime.store.update(
-                        receipt.requestKey, { stopRequestedAt: runtime.now() }, runtime.now(),
+                        latest.requestKey, {
+                            stopRequestedAt: runtime.now(),
+                            ...(latest.stopIntent === null ? { stopIntent: 'lease-expired' as const } : {}),
+                        }, runtime.now(),
                     )
-                    : receipt;
+                    : latest;
                 const { backendStop } = await stopAttempt(marked);
                 if (!backendStop.requested) unstoppable.push(marked.requestKey);
                 handled.push(marked.requestKey);
