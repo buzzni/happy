@@ -305,8 +305,15 @@ export async function renewManagedDaemonGrant(input: {
                 renewalRequestId: input.requestId,
                 renewalBodyDigest: digest,
                 // The generation being superseded stays usable long enough to
-                // be told about its successor. See the constant.
+                // be told about its successor. See the constant. If the previous
+                // grace is still open, the floor stays where it was: the daemon
+                // may still be holding the generation *before* the previous
+                // renewal, and a second renewal must not lock it out.
                 supersededGraceUntil: BigInt(input.now + MANAGED_DAEMON_RENEWAL_GRACE_MS),
+                graceFloorGeneration: existing.supersededGraceUntil !== null
+                    && BigInt(input.now) < existing.supersededGraceUntil
+                    ? (existing.graceFloorGeneration ?? existing.generation)
+                    : existing.generation,
                 updatedAt: BigInt(input.now),
             },
         });
@@ -380,10 +387,12 @@ export async function resolveManagedDaemonGrant(input: {
     // A renewal supersedes the credential in place. Nothing can un-sign the one
     // minted before it, so this is what makes it unusable — after the grace in
     // which the renewal itself is delivered over the superseded credential's
-    // socket. Only the generation directly before the current one, and only
-    // until the moment the renewal recorded.
+    // socket. Every generation from the grace floor up to the current one,
+    // and only until the moment the latest renewal recorded.
     if (existing.generation !== input.generation) {
-        const withinGrace = input.generation === existing.generation - 1
+        const floor = existing.graceFloorGeneration ?? existing.generation - 1;
+        const withinGrace = input.generation >= floor
+            && input.generation < existing.generation
             && existing.supersededGraceUntil !== null
             && BigInt(input.now) < existing.supersededGraceUntil;
         if (!withinGrace) return { ok: false, reason: 'stale-generation' };

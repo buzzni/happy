@@ -1105,6 +1105,12 @@ model ManagedDaemonGrant {
     /// learn the credential that would let it back in. Bounded: after this the
     /// old generation is refused like any other. A revocation ignores it.
     supersededGraceUntil BigInt?
+    /// The lowest generation still inside the grace. A renewal that lands while
+    /// the previous grace is still open keeps the floor where it was, so a
+    /// parent that renews twice (a restart, a second replica that never saw
+    /// the undelivered credential) does not push the daemon two generations
+    /// back and out. The previous credentials' own expiry still bounds it.
+    graceFloorGeneration Int?
     createdAt     BigInt
     updatedAt     BigInt
 

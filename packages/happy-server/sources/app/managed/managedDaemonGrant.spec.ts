@@ -414,9 +414,11 @@ describe.skipIf(!enabled)('managed daemon grants (real PostgreSQL)', () => {
         } as never)).toEqual({ ok: false, reason: 'stale-generation' });
     });
 
-    it('refuses a generation two renewals back even inside the grace', async () => {
-        // The grace names one generation: the one just superseded. A credential
-        // from before that was already outside a grace of its own.
+    it('keeps a generation two renewals back usable while the first grace is still open', async () => {
+        // A parent that renews again before the daemon applied the first renewal
+        // (a worker restart, a second replica that never saw the undelivered
+        // credential) must not lock the daemon out: it still holds the first
+        // generation. The floor stays where the first renewal put it.
         const first = await issue();
         if (!first.ok) return;
         const second = await grants.renewManagedDaemonGrant({
@@ -432,13 +434,63 @@ describe.skipIf(!enabled)('managed daemon grants (real PostgreSQL)', () => {
             expectedGeneration: second.grant.generation,
             expiresAt: NOW + 3 * HOUR,
             requestId: `req-${randomUUID()}`,
-            now: NOW + 2_000,
+            now: NOW + 60_000,
         });
         expect(await grants.resolveManagedDaemonGrant({
             daemonGrantId: first.grant.daemonGrantId,
             generation: first.grant.generation,
-            now: NOW + 3_000,
+            now: NOW + 120_000,
+            claims: {
+                accountId: first.grant.accountId, machineId: first.grant.machineId,
+                runtimeId: first.grant.runtimeId, provisioningOperationId: first.grant.provisioningOperationId,
+                workspaceId: first.grant.workspaceId, projectId: first.grant.projectId, epoch: first.grant.epoch,
+            },
+        } as never)).toMatchObject({ ok: false, reason: 'workspace-unknown' });
+        // Past the *latest* grace it is refused like any other.
+        expect(await grants.resolveManagedDaemonGrant({
+            daemonGrantId: first.grant.daemonGrantId,
+            generation: first.grant.generation,
+            now: NOW + 60_000 + grants.MANAGED_DAEMON_RENEWAL_GRACE_MS,
         } as never)).toEqual({ ok: false, reason: 'stale-generation' });
+    });
+
+    it('moves the floor up once the previous grace has closed', async () => {
+        // First renewal at t=1s, its grace ends at t=1s+5m. A second renewal
+        // after that names the floor at the generation it supersedes: the first
+        // generation was already outside a grace of its own.
+        const first = await issue();
+        if (!first.ok) return;
+        const second = await grants.renewManagedDaemonGrant({
+            daemonGrantId: first.grant.daemonGrantId,
+            expectedGeneration: first.grant.generation,
+            expiresAt: NOW + 2 * HOUR,
+            requestId: `req-${randomUUID()}`,
+            now: NOW + 1_000,
+        });
+        if (!second.ok) return;
+        const later = NOW + 1_000 + grants.MANAGED_DAEMON_RENEWAL_GRACE_MS + 1;
+        await grants.renewManagedDaemonGrant({
+            daemonGrantId: first.grant.daemonGrantId,
+            expectedGeneration: second.grant.generation,
+            expiresAt: NOW + 3 * HOUR,
+            requestId: `req-${randomUUID()}`,
+            now: later,
+        });
+        expect(await grants.resolveManagedDaemonGrant({
+            daemonGrantId: first.grant.daemonGrantId,
+            generation: first.grant.generation,
+            now: later + 1_000,
+        } as never)).toEqual({ ok: false, reason: 'stale-generation' });
+        expect(await grants.resolveManagedDaemonGrant({
+            daemonGrantId: first.grant.daemonGrantId,
+            generation: second.grant.generation,
+            now: later + 1_000,
+            claims: {
+                accountId: first.grant.accountId, machineId: first.grant.machineId,
+                runtimeId: first.grant.runtimeId, provisioningOperationId: first.grant.provisioningOperationId,
+                workspaceId: first.grant.workspaceId, projectId: first.grant.projectId, epoch: first.grant.epoch,
+            },
+        } as never)).toMatchObject({ ok: false, reason: 'workspace-unknown' });
     });
 
     it('a revocation ignores the renewal grace', async () => {
