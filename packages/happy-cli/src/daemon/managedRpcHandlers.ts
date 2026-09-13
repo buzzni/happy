@@ -428,7 +428,7 @@ function receiptView(receipt: ManagedReceipt, runtime: ManagedRuntime) {
  * could be written yet (none names the pid so far, the store could not be
  * read, or the write failed). A deferred exit is the handlers' own obligation:
  * it is retried on every maintenance tick and consulted when a spawn commits
- * the pid, and is dropped only after `PENDING_EXIT_TTL_MS`.
+ * the pid, and is dropped only `PENDING_EXIT_TTL_MS` after the last sighting.
  */
 export type ManagedChildExitNote = 'recorded' | 'present' | 'deferred';
 
@@ -801,11 +801,14 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
     };
 
     /**
-     * Exits observed (ESRCH) that some receipt still owes, by pid: when the
-     * absence was seen, and the receipts it is **not** for — holders that took
-     * the pid after it was seen absent (a new incarnation, alive at its commit).
+     * Exits observed (ESRCH) that some receipt may still owe, by pid → when
+     * the absence was last seen. Which receipts it is for follows from time,
+     * not from a list: a holder that took the pid **no later than** the
+     * sighting is owed it; one that took the pid after it is a newer
+     * incarnation and is not. A fresh sighting moves the time forward, so a
+     * holder that was too new for the old sighting is owed the new one.
      */
-    const pendingExits = new Map<number, { seenAt: number; notFor: Set<string> }>();
+    const pendingExits = new Map<number, number>();
 
     const exitObservable = (r: ManagedReceipt): boolean => (
         r.childExitAt === null && (r.state === 'spawned' || r.state === 'running' || r.state === 'stopping')
@@ -821,8 +824,8 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
     const flushPendingExits = (): void => {
         if (pendingExits.size === 0) return;
         const now = runtime.now();
-        for (const [pid, pending] of pendingExits) {
-            if (now - pending.seenAt > PENDING_EXIT_TTL_MS) pendingExits.delete(pid);
+        for (const [pid, seenAt] of pendingExits) {
+            if (now - seenAt > PENDING_EXIT_TTL_MS) pendingExits.delete(pid);
         }
         if (pendingExits.size === 0) return;
         const listing = runtime.store.list();
@@ -830,9 +833,11 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             logger.debug('[managed] receipt store not fully readable; child exits stay pending');
             return;
         }
-        for (const [pid, pending] of pendingExits) {
+        for (const [pid, seenAt] of pendingExits) {
+            // Owed to every holder that took the pid no later than the sighting.
+            // A receipt without a registration time is an older one.
             const holders = listing.receipts.filter((r) => (
-                r.pid === pid && exitObservable(r) && !pending.notFor.has(r.requestKey)
+                r.pid === pid && exitObservable(r) && (r.pidRecordedAt ?? 0) <= seenAt
             ));
             // No receipt names it yet: a commit may still arrive (`spawning`
             // receipts have no pid). Kept until the TTL.
@@ -843,7 +848,7 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                     runtime.store.update(receipt.requestKey, {
                         // Observed absent for *this* receipt no earlier than it
                         // took the pid: a pre-identity sighting dates from the commit.
-                        childExitAt: Math.max(pending.seenAt, receipt.pidRecordedAt ?? pending.seenAt),
+                        childExitAt: Math.max(seenAt, receipt.pidRecordedAt ?? seenAt),
                         childExitProof: 'pid-absent',
                     }, now);
                     written += 1;
@@ -1097,17 +1102,14 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             }, runtime.now());
             // A child that exited while the launch was still being committed
             // was invisible to the exit sweep (the receipt had no pid yet): the
-            // sweep left the exit pending, or the pid is simply gone now. The
-            // live probe comes first — a pid that answers now is a new
-            // incarnation, so a pending exit for it is not this receipt's: it is
-            // kept for the older holders it is owed to and marked as not for
-            // this one. `state` stays `running` like any other exit
-            // observation; a failed write stays pending for maintenance.
-            const pending = pendingExits.get(outcome.pid);
-            if (!pidAbsent(outcome.pid)) {
-                pending?.notFor.add(key);
-            } else {
-                if (!pending) pendingExits.set(outcome.pid, { seenAt: runtime.now(), notFor: new Set() });
+            // sweep left the exit pending, or the pid is simply gone now. A pid
+            // that answers now is a new incarnation: the pending sighting, if
+            // any, predates this receipt's registration and the flush leaves it
+            // alone while still serving an older launch that committed late.
+            // `state` stays `running` like any other exit observation; a failed
+            // write stays pending for maintenance.
+            if (pidAbsent(outcome.pid)) pendingExits.set(outcome.pid, runtime.now());
+            if (pendingExits.has(outcome.pid)) {
                 flushPendingExits();
                 const reread = runtime.store.read(key);
                 if (reread.kind === 'ok') after = reread.receipt;
@@ -1654,7 +1656,9 @@ const aiAuthRpc = async (params: unknown) => {
          */
         noteChildExited(pid: number): ManagedChildExitNote {
             if (!pidAbsent(pid)) return 'present';
-            if (!pendingExits.has(pid)) pendingExits.set(pid, { seenAt: runtime.now(), notFor: new Set() });
+            // A fresh sighting supersedes an older one: whoever holds the pid
+            // now is owed it too.
+            pendingExits.set(pid, runtime.now());
             flushPendingExits();
             return pendingExits.has(pid) ? 'deferred' : 'recorded';
         },

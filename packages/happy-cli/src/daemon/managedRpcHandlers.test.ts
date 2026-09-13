@@ -657,6 +657,48 @@ describe('receipt observation axes (T07-L1b)', () => {
         expect((await handlers.receipt(call('query', {}, { attemptId: 'attempt-2' }))).receipts[0]!).toMatchObject({ childExitAt: null });
     });
 
+    it('a holder too new for an old sighting is owed the next one: its own death is recorded', async () => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        livePids.delete(4242);
+        const update = runtime.store.update;
+        runtime.store.update = () => { throw new Error('lock lost'); };
+        expect(handlers.noteChildExited(4242)).toBe('deferred');
+        runtime.store.update = update;
+        wallClock += 1_000;
+        spawnResult = async () => ({ type: 'success', sessionId: 'sess-2', pid: 4242, pidRegisteredAt: wallClock });
+        await handlers.spawn(call('spawn', envelope(), { attemptId: 'attempt-2', requestKey: 'key-attempt-2' }));
+        // The commit served the old sighting to the older holder; the new one was too new for it.
+        expect((await handlers.receipt(call('query', {}))).receipts[0]!).toMatchObject({ childExitAt: NOW + 1_000, childExitProof: 'pid-absent' });
+        expect((await handlers.receipt(call('query', {}, { attemptId: 'attempt-2' }))).receipts[0]!).toMatchObject({ childExitAt: null });
+        // The new holder dies too; the fresh sighting is for it.
+        wallClock += 1_000;
+        livePids.delete(4242);
+        expect(handlers.noteChildExited(4242)).toBe('recorded');
+        expect((await handlers.receipt(call('query', {}, { attemptId: 'attempt-2' }))).receipts[0]!).toMatchObject({ childExitAt: wallClock, childExitProof: 'pid-absent' });
+    });
+
+    it('a launch that took the pid before the sighting is owed it even when it commits after a newer live holder', async () => {
+        await grantLease();
+        let finishOlder: () => void = () => {};
+        const olderRelease = new Promise<void>((resolve) => { finishOlder = resolve; });
+        // A took 4242 at NOW+1000, died, and its commit is still pending.
+        runtime.spawn = async () => { await olderRelease; return { type: 'success', sessionId: 'sess-1', pid: 4242, pidRegisteredAt: NOW + 1_000 }; };
+        const olderSpawn = handlers.spawn(call('spawn', envelope()));
+        for (let i = 0; i < 5; i += 1) await Promise.resolve();
+        wallClock = NOW + 2_000;
+        expect(handlers.noteChildExited(4242)).toBe('deferred');
+        // B takes the reused pid after the sighting and is alive at its commit.
+        wallClock = NOW + 3_000;
+        runtime.spawn = async () => { livePids.add(4242); return { type: 'success', sessionId: 'sess-1', pid: 4242, pidRegisteredAt: NOW + 3_000 }; };
+        await handlers.spawn(call('spawn', envelope(), { attemptId: 'attempt-2', requestKey: 'key-attempt-2' }));
+        wallClock = NOW + 4_000;
+        finishOlder();
+        const older = await olderSpawn;
+        expect(older.receipt).toMatchObject({ childExitAt: NOW + 2_000, childExitProof: 'pid-absent' });
+        expect((await handlers.receipt(call('query', {}, { attemptId: 'attempt-2' }))).receipts[0]!).toMatchObject({ childExitAt: null });
+    });
+
     it.each(ORDERS)('a launch that finishes late does not steal the reports of the incarnation that took the pid after it (%s then %s)', async (older, newer) => {
         await grantLease();
         // The older launch took pid 4242 first, then stalled before its commit.
@@ -684,13 +726,19 @@ describe('receipt observation axes (T07-L1b)', () => {
         await grantLease();
         // An earlier child with pid 5151 died before any receipt named it; the sweep deferred it.
         expect(handlers.noteChildExited(5151)).toBe('deferred');
-        // The kernel reuses 5151 for the next launch, which is alive.
+        // The kernel later reuses 5151 for the next launch, which is alive.
+        wallClock += 1_000;
         runtime.spawn = async () => { livePids.add(5151); return { type: 'success', sessionId: 'sess-1', pid: 5151 }; };
         const result = await handlers.spawn(call('spawn', envelope()));
         expect(result.receipt).toMatchObject({ state: 'running', childExitAt: null });
         // ...and maintenance does not resurrect it later.
         await handlers.runLeaseMaintenance();
         expect((await handlers.receipt(call('query', {}))).receipts[0]!).toMatchObject({ childExitAt: null, childExitProof: null });
+        // When this child dies for real, the fresh sighting is its own — the stale one must not shadow it.
+        wallClock += 1_000;
+        livePids.delete(5151);
+        expect(handlers.noteChildExited(5151)).toBe('recorded');
+        expect((await handlers.receipt(call('query', {}))).receipts[0]!).toMatchObject({ childExitAt: wallClock, childExitProof: 'pid-absent' });
     });
 
     it.each(ORDERS)('two attempts claimed in the same millisecond that end up with one pid: the report goes to the later incarnation, whatever was written last (%s then %s)', async (older, newer) => {
