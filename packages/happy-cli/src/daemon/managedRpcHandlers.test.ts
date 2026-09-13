@@ -699,6 +699,51 @@ describe('receipt observation axes (T07-L1b)', () => {
         expect((await handlers.receipt(call('query', {}, { attemptId: 'attempt-2' }))).receipts[0]!).toMatchObject({ childExitAt: null });
     });
 
+    it('a sighting is kept for a launch that took the pid before it, even after the visible holder was served and a newer holder is alive', async () => {
+        await grantLease();
+        // O holds 4242 and is served by the sighting.
+        await handlers.spawn(call('spawn', envelope()));
+        // A took the reused 4242 at NOW+500 (O had died unobserved) and its commit is delayed.
+        let finishA: () => void = () => {};
+        const releaseA = new Promise<void>((resolve) => { finishA = resolve; });
+        runtime.spawn = async () => { await releaseA; return { type: 'success', sessionId: 'sess-1', pid: 4242, pidRegisteredAt: NOW + 500 }; };
+        const spawnA = handlers.spawn(call('spawn', envelope(), { attemptId: 'attempt-a', requestKey: 'key-a' }));
+        for (let i = 0; i < 5; i += 1) await Promise.resolve();
+        // A dies; the sighting serves O now.
+        wallClock = NOW + 2_000;
+        livePids.delete(4242);
+        expect(handlers.noteChildExited(4242)).toBe('recorded');
+        expect((await handlers.receipt(call('query', {}))).receipts[0]!).toMatchObject({ childExitProof: 'pid-absent' });
+        // B takes 4242 after the sighting and is alive.
+        wallClock = NOW + 3_000;
+        runtime.spawn = async () => { livePids.add(4242); return { type: 'success', sessionId: 'sess-1', pid: 4242, pidRegisteredAt: NOW + 3_000 }; };
+        await handlers.spawn(call('spawn', envelope(), { attemptId: 'attempt-b', requestKey: 'key-b' }));
+        // A finally commits: it is still owed the sighting.
+        wallClock = NOW + 4_000;
+        finishA();
+        expect((await spawnA).receipt).toMatchObject({ childExitAt: NOW + 2_000, childExitProof: 'pid-absent' });
+        expect((await handlers.receipt(call('query', {}, { attemptId: 'attempt-b' }))).receipts[0]!).toMatchObject({ childExitAt: null });
+    });
+
+    it('a clock that stepped backward does not disown a holder: the sighting time never moves back', async () => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));                      // A, pid 4242, registered NOW+1000
+        livePids.delete(4242);
+        const update = runtime.store.update;
+        runtime.store.update = () => { throw new Error('lock lost'); };
+        expect(handlers.noteChildExited(4242)).toBe('deferred');              // sighting NOW+1000, A's write failed
+        runtime.store.update = update;
+        wallClock = NOW + 2_000;
+        spawnResult = async () => ({ type: 'success', sessionId: 'sess-2', pid: 4242, pidRegisteredAt: NOW + 2_000 });
+        await handlers.spawn(call('spawn', envelope(), { attemptId: 'attempt-2', requestKey: 'key-attempt-2' }));   // B alive
+        // The wall clock steps back, then B dies.
+        wallClock = NOW - 5_000;
+        livePids.delete(4242);
+        expect(handlers.noteChildExited(4242)).toBe('recorded');
+        expect((await handlers.receipt(call('query', {}))).receipts[0]!).toMatchObject({ childExitAt: NOW + 1_000, childExitProof: 'pid-absent' });
+        expect((await handlers.receipt(call('query', {}, { attemptId: 'attempt-2' }))).receipts[0]!).toMatchObject({ childExitAt: NOW + 2_000, childExitProof: 'pid-absent' });
+    });
+
     it.each(ORDERS)('a launch that finishes late does not steal the reports of the incarnation that took the pid after it (%s then %s)', async (older, newer) => {
         await grantLease();
         // The older launch took pid 4242 first, then stalled before its commit.
@@ -726,9 +771,9 @@ describe('receipt observation axes (T07-L1b)', () => {
         await grantLease();
         // An earlier child with pid 5151 died before any receipt named it; the sweep deferred it.
         expect(handlers.noteChildExited(5151)).toBe('deferred');
-        // The kernel later reuses 5151 for the next launch, which is alive.
-        wallClock += 1_000;
-        runtime.spawn = async () => { livePids.add(5151); return { type: 'success', sessionId: 'sess-1', pid: 5151 }; };
+        // The kernel reuses 5151 for the next launch, registered in the very
+        // same millisecond as the sighting, and alive at its commit.
+        runtime.spawn = async () => { livePids.add(5151); return { type: 'success', sessionId: 'sess-1', pid: 5151, pidRegisteredAt: wallClock }; };
         const result = await handlers.spawn(call('spawn', envelope()));
         expect(result.receipt).toMatchObject({ state: 'running', childExitAt: null });
         // ...and maintenance does not resurrect it later.

@@ -423,12 +423,13 @@ function receiptView(receipt: ManagedReceipt, runtime: ManagedRuntime) {
 
 /**
  * What `noteChildExited` did with the observation: `present` — the kernel
- * still answers for that pid, nothing to record; `recorded` — written on the
- * receipt(s) that hold that pid; `deferred` — absence was seen but no receipt
- * could be written yet (none names the pid so far, the store could not be
- * read, or the write failed). A deferred exit is the handlers' own obligation:
- * it is retried on every maintenance tick and consulted when a spawn commits
- * the pid, and is dropped only `PENDING_EXIT_TTL_MS` after the last sighting.
+ * still answers for that pid, nothing to record; `recorded` — written on at
+ * least one receipt that holds that pid; `deferred` — absence was seen but no
+ * receipt could be written now (none names the pid so far, the store could not
+ * be read, or the write failed). Every sighting is the handlers' own
+ * obligation either way: it is retried on every maintenance tick and consulted
+ * when a spawn commits the pid, until `PENDING_EXIT_TTL_MS` after the last
+ * sighting.
  */
 export type ManagedChildExitNote = 'recorded' | 'present' | 'deferred';
 
@@ -801,54 +802,57 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
     };
 
     /**
-     * Exits observed (ESRCH) that some receipt may still owe, by pid → when
-     * the absence was last seen. Which receipts it is for follows from time,
-     * not from a list: a holder that took the pid **no later than** the
-     * sighting is owed it; one that took the pid after it is a newer
-     * incarnation and is not. A fresh sighting moves the time forward, so a
-     * holder that was too new for the old sighting is owed the new one.
+     * Exits observed (ESRCH), by pid. A sighting is for **every** receipt that
+     * holds the pid when it is made — whoever holds a pid the kernel does not
+     * answer for has a dead child, whatever its clock says. The only receipts
+     * it is not for are those that take the pid *afterwards* while alive: a
+     * newer incarnation, recognised at its commit by the live probe and by a
+     * registration no earlier than the sighting, and remembered in `notFor`. A
+     * fresh sighting clears that — the pid is absent again, for everyone.
+     *
+     * The time never moves backward (a clock adjustment must not disown a
+     * holder), and the entry stays until `PENDING_EXIT_TTL_MS` after the last
+     * sighting rather than being dropped once the visible holders are served:
+     * a launch that took the pid before the sighting may still commit late.
      */
-    const pendingExits = new Map<number, number>();
+    const pendingExits = new Map<number, { seenAt: number; notFor: Set<string> }>();
 
     const exitObservable = (r: ManagedReceipt): boolean => (
         r.childExitAt === null && (r.state === 'spawned' || r.state === 'running' || r.state === 'stopping')
     );
 
-    /**
-     * Writes every pending exit it can. An absent pid is absent for **every**
-     * receipt that recorded it — a reused pid means the older child was gone
-     * first — so all of them get the observation, none is chosen. A listing
-     * that could not be read fully proves nothing about absence, and a write
-     * that failed keeps its obligation; both are retried next time.
-     */
-    const flushPendingExits = (): void => {
-        if (pendingExits.size === 0) return;
+    const noteAbsence = (pid: number): void => {
         const now = runtime.now();
-        for (const [pid, seenAt] of pendingExits) {
-            if (now - seenAt > PENDING_EXIT_TTL_MS) pendingExits.delete(pid);
+        const prior = pendingExits.get(pid);
+        pendingExits.set(pid, { seenAt: Math.max(prior?.seenAt ?? 0, now), notFor: new Set() });
+    };
+
+    /**
+     * Writes every pending exit it can and says how many receipts took one. A
+     * listing that could not be read fully proves nothing about absence, and
+     * a write that failed keeps its obligation; both are retried next time.
+     */
+    const flushPendingExits = (): number => {
+        if (pendingExits.size === 0) return 0;
+        const now = runtime.now();
+        for (const [pid, pending] of pendingExits) {
+            if (now - pending.seenAt > PENDING_EXIT_TTL_MS) pendingExits.delete(pid);
         }
-        if (pendingExits.size === 0) return;
+        if (pendingExits.size === 0) return 0;
         const listing = runtime.store.list();
         if (listing.listError !== undefined || listing.unknown.length > 0) {
             logger.debug('[managed] receipt store not fully readable; child exits stay pending');
-            return;
+            return 0;
         }
-        for (const [pid, seenAt] of pendingExits) {
-            // Owed to every holder that took the pid no later than the sighting.
-            // A receipt without a registration time is an older one.
-            const holders = listing.receipts.filter((r) => (
-                r.pid === pid && exitObservable(r) && (r.pidRecordedAt ?? 0) <= seenAt
-            ));
-            // No receipt names it yet: a commit may still arrive (`spawning`
-            // receipts have no pid). Kept until the TTL.
-            if (holders.length === 0) continue;
-            let written = 0;
-            for (const receipt of holders) {
+        let written = 0;
+        for (const [pid, pending] of pendingExits) {
+            for (const receipt of listing.receipts) {
+                if (receipt.pid !== pid || !exitObservable(receipt) || pending.notFor.has(receipt.requestKey)) continue;
                 try {
                     runtime.store.update(receipt.requestKey, {
                         // Observed absent for *this* receipt no earlier than it
                         // took the pid: a pre-identity sighting dates from the commit.
-                        childExitAt: Math.max(seenAt, receipt.pidRecordedAt ?? seenAt),
+                        childExitAt: Math.max(pending.seenAt, receipt.pidRecordedAt ?? pending.seenAt),
                         childExitProof: 'pid-absent',
                     }, now);
                     written += 1;
@@ -856,8 +860,8 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                     logger.debug('[managed] could not record child exit on a receipt; retrying later');
                 }
             }
-            if (written === holders.length) pendingExits.delete(pid);
         }
+        return written;
     };
 
     const stopAttempt = async (receipt: ManagedReceipt): Promise<{
@@ -1103,12 +1107,17 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             // A child that exited while the launch was still being committed
             // was invisible to the exit sweep (the receipt had no pid yet): the
             // sweep left the exit pending, or the pid is simply gone now. A pid
-            // that answers now is a new incarnation: the pending sighting, if
-            // any, predates this receipt's registration and the flush leaves it
-            // alone while still serving an older launch that committed late.
-            // `state` stays `running` like any other exit observation; a failed
-            // write stays pending for maintenance.
-            if (pidAbsent(outcome.pid)) pendingExits.set(outcome.pid, runtime.now());
+            // that answers now is either a newer incarnation — registered no
+            // earlier than the sighting — which the sighting is not for, or a
+            // launch that took the pid before the sighting and commits late,
+            // which is owed it. `state` stays `running` like any other exit
+            // observation; a failed write stays pending for maintenance.
+            if (pidAbsent(outcome.pid)) {
+                noteAbsence(outcome.pid);
+            } else {
+                const pending = pendingExits.get(outcome.pid);
+                if (pending && after.pidRecordedAt !== null && after.pidRecordedAt >= pending.seenAt) pending.notFor.add(key);
+            }
             if (pendingExits.has(outcome.pid)) {
                 flushPendingExits();
                 const reread = runtime.store.read(key);
@@ -1656,11 +1665,8 @@ const aiAuthRpc = async (params: unknown) => {
          */
         noteChildExited(pid: number): ManagedChildExitNote {
             if (!pidAbsent(pid)) return 'present';
-            // A fresh sighting supersedes an older one: whoever holds the pid
-            // now is owed it too.
-            pendingExits.set(pid, runtime.now());
-            flushPendingExits();
-            return pendingExits.has(pid) ? 'deferred' : 'recorded';
+            noteAbsence(pid);
+            return flushPendingExits() > 0 ? 'recorded' : 'deferred';
         },
 
         /**
