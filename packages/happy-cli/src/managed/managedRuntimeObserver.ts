@@ -25,7 +25,7 @@
  * stay distinguishable from "knowing it is wrong" — the callers grade those
  * two differently.
  */
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { deviceIdFromMajorMinor } from '@/managed/managedRuntimeDurability';
@@ -42,7 +42,65 @@ export type ManagedRuntimeObserverDeps = {
     listUuidEntries?: () => string[];
     /** The device number of a `/dev` node, as `stat` reports it. */
     deviceOf?: (path: string) => number | null;
+    /** The device node the kernel names for a `major:minor`, e.g. `/dev/vdc`. */
+    readDeviceNode?: (deviceMajorMinor: string) => string | null;
+    /** The filesystem UUID read from that node's ext4 superblock. */
+    readSuperblockUuid?: (devicePath: string) => string | null;
 };
+
+/** Where the kernel names block devices by number: `/sys/dev/block/<maj>:<min>/uevent`. */
+export const SYS_DEV_BLOCK_DIR = '/sys/dev/block';
+/** The ext4 superblock starts 1024 bytes in; magic at 0x38, `s_uuid` at 0x68. */
+const EXT4_SUPERBLOCK_OFFSET = 1024;
+const EXT4_SUPERBLOCK_LENGTH = 256;
+const EXT4_MAGIC_OFFSET = 0x38;
+const EXT4_MAGIC = 0xef53;
+const EXT4_UUID_OFFSET = 0x68;
+
+/**
+ * The filesystem UUID an ext4 superblock carries, in the form the by-uuid
+ * directory would name it — or `null` when the bytes are not an ext4
+ * superblock at all. A random device read as one yields random bytes, and
+ * random bytes formatted as a UUID would seal a volume to noise, so the magic
+ * is required before anything is returned.
+ */
+export function parseExt4SuperblockUuid(superblock: Uint8Array): string | null {
+    if (superblock.length < EXT4_UUID_OFFSET + 16) return null;
+    const view = Buffer.from(superblock.buffer, superblock.byteOffset, superblock.byteLength);
+    if (view.readUInt16LE(EXT4_MAGIC_OFFSET) !== EXT4_MAGIC) return null;
+    const hex = view.subarray(EXT4_UUID_OFFSET, EXT4_UUID_OFFSET + 16).toString('hex');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function defaultReadDeviceNode(deviceMajorMinor: string): string | null {
+    if (!/^\d+:\d+$/.test(deviceMajorMinor)) return null;
+    let uevent: string;
+    try {
+        uevent = readFileSync(join(SYS_DEV_BLOCK_DIR, deviceMajorMinor, 'uevent'), 'utf8');
+    } catch {
+        return null;
+    }
+    const name = /^DEVNAME=([^\s/]+)$/m.exec(uevent)?.[1];
+    return name ? `/dev/${name}` : null;
+}
+
+function defaultReadSuperblockUuid(devicePath: string): string | null {
+    let fd: number;
+    try {
+        fd = openSync(devicePath, 'r');
+    } catch {
+        return null;
+    }
+    try {
+        const buf = Buffer.alloc(EXT4_SUPERBLOCK_LENGTH);
+        const read = readSync(fd, buf, 0, EXT4_SUPERBLOCK_LENGTH, EXT4_SUPERBLOCK_OFFSET);
+        return read === EXT4_SUPERBLOCK_LENGTH ? parseExt4SuperblockUuid(buf) : null;
+    } catch {
+        return null;
+    } finally {
+        closeSync(fd);
+    }
+}
 
 export function readMountinfoText(): string | null {
     try {
@@ -97,7 +155,18 @@ export function readFsUuidForDevice(
         if (found !== null && found !== entry) return null;
         found = entry;
     }
-    return found;
+    if (found !== null) return found;
+    /*
+     * No by-uuid entry at all is not "no identity": a host that runs no udev
+     * (Fly's init, for one) never populates that directory. The identity is
+     * still on the device — in its ext4 superblock, where udev would have read
+     * it — so it is read from there, through the node the kernel names for
+     * this device number. Consulted only when by-uuid had nothing to say, so
+     * a host that does publish entries is judged by them alone.
+     */
+    const node = (deps.readDeviceNode ?? defaultReadDeviceNode)(deviceMajorMinor);
+    if (node === null) return null;
+    return (deps.readSuperblockUuid ?? defaultReadSuperblockUuid)(node);
 }
 
 /**
