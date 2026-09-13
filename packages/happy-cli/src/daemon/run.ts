@@ -541,6 +541,16 @@ export async function startDaemon(): Promise<void> {
     // the legacy path is the outcome it is after.
     let managedWriterLockHeld = false;
     /**
+     * T07-L1b: the managed receipt learns what the daemon already knows about
+     * its child — verified runtime reports (turns, idle) and the pid vanishing.
+     * Assigned once the handlers exist; before that there is no receipt to tell.
+     */
+    let managedNoteSessionRuntime: ((sessionId: string, report: {
+      assistantTurns?: number; lastTurnEndAt?: number;
+      thinking: boolean; hasOpenToolCall: boolean; pendingUserInput: boolean;
+    }) => void) | null = null;
+    let managedNoteChildExited: ((pid: number) => void) | null = null;
+    /**
      * The runtime's own view of itself, for a status read.
      *
      * Nothing here is cached as "ready": the mount is re-read, the completion
@@ -3128,16 +3138,6 @@ export async function startDaemon(): Promise<void> {
       }
       : null;
     let managedLeaseWatchdog: ReturnType<typeof setInterval> | null = null;
-    /**
-     * T07-L1b: the managed receipt learns what the daemon already knows about
-     * its child — verified runtime reports (turns, idle) and the pid vanishing.
-     * Assigned once the handlers exist; before that there is no receipt to tell.
-     */
-    let managedNoteSessionRuntime: ((sessionId: string, report: {
-      assistantTurns?: number; lastTurnEndAt?: number;
-      thinking: boolean; hasOpenToolCall: boolean; pendingUserInput: boolean;
-    }) => void) | null = null;
-    let managedNoteChildExited: ((pid: number) => void) | null = null;
     /** Drains every in-flight managed operation; set once the handlers exist. */
     let managedDrainLeaseWork: (() => Promise<void>) | null = null;
     /** Refuses new managed RPC entries; set once the handlers exist. */

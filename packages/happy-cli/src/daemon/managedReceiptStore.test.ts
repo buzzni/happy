@@ -288,8 +288,8 @@ describe('update', () => {
     });
 });
 
-describe('terminal evidence fields (T07-L1b)', () => {
-    it('reads a receipt written before the fields existed as all-null evidence', () => {
+describe('observation axes (T07-L1b)', () => {
+    it('reads a receipt written before the axes existed as all-null', () => {
         const root = mkdtempSync(join(tmpdir(), 'managed-receipt-'));
         try {
             const store = createManagedReceiptStore(root, { assertHeld: () => {} });
@@ -298,26 +298,26 @@ describe('terminal evidence fields (T07-L1b)', () => {
             if (claimed.kind !== 'created') throw new Error('claim failed');
             // 옛 파일: 새 필드가 아예 없다.
             const legacy = { ...claimed.receipt } as Record<string, unknown>;
-            for (const field of ['stopCause', 'turnCount', 'lastTurnEndAt', 'idle', 'exitAt', 'exitProof']) delete legacy[field];
+            for (const field of ['stopIntent', 'turnCount', 'lastTurnEndAt', 'reportThinking', 'reportOpenToolCall', 'reportPendingUserInput', 'childExitAt', 'childExitProof']) delete legacy[field];
             writeFileSync(join(root, 'receipts', managedReceiptFileName(key)), JSON.stringify(legacy));
             const read = store.read(key);
             expect(read.kind).toBe('ok');
             if (read.kind === 'ok') {
-                expect(read.receipt).toMatchObject({ stopCause: null, turnCount: null, lastTurnEndAt: null, idle: null, exitAt: null, exitProof: null });
+                expect(read.receipt).toMatchObject({ stopIntent: null, turnCount: null, lastTurnEndAt: null, reportThinking: null, reportOpenToolCall: null, reportPendingUserInput: null, childExitAt: null, childExitProof: null });
             }
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
     });
 
-    it('rejects a receipt whose evidence is malformed rather than reading it as null', () => {
+    it('rejects a receipt whose observation is malformed rather than reading it as null', () => {
         const root = mkdtempSync(join(tmpdir(), 'managed-receipt-'));
         try {
             const store = createManagedReceiptStore(root, { assertHeld: () => {} });
             const key = managedOperationKey({ runId: 'run-1', attemptId: 'attempt-1' });
             const claimed = store.claim({ requestKey: key, runId: 'run-1', attemptId: 'attempt-1', epoch: 0, now: 1 });
             if (claimed.kind !== 'created') throw new Error('claim failed');
-            for (const bad of [{ stopCause: 'user' }, { turnCount: -1 }, { idle: 'yes' }, { exitProof: 'guess' }]) {
+            for (const bad of [{ stopIntent: 'user' }, { turnCount: -1 }, { reportThinking: 'yes' }, { childExitProof: 'guess' }, { childExitAt: 1.5 }]) {
                 writeFileSync(join(root, 'receipts', managedReceiptFileName(key)), JSON.stringify({ ...claimed.receipt, ...bad }));
                 expect(store.read(key).kind).toBe('unknown');
             }
@@ -342,12 +342,14 @@ describe('classifyManagedReceipt', () => {
         sessionId: null,
         stopRequestedAt: null,
         failureReason: null,
-        stopCause: null,
+        stopIntent: null,
         turnCount: null,
         lastTurnEndAt: null,
-        idle: null,
-        exitAt: null,
-        exitProof: null,
+        reportThinking: null,
+        reportOpenToolCall: null,
+        reportPendingUserInput: null,
+        childExitAt: null,
+        childExitProof: null,
         claimedAt: 1,
         spawnAt: null,
         updatedAt: 1,

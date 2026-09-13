@@ -29,10 +29,13 @@ import {
 import {
     classifyManagedReceipt,
     managedOperationKey,
+    normalizeReceiptObservation,
     type ManagedReceipt,
+    type ManagedReceiptObservation,
     type ManagedReceiptStore,
 } from './managedReceiptStore';
 import {
+    defaultProcessGroupDeps,
     probeProcessGroup,
     type ProcessGroupDeps,
     type ProcessGroupEvidence,
@@ -401,14 +404,16 @@ function receiptView(receipt: ManagedReceipt, runtime: ManagedRuntime) {
         stopRequested: receipt.stopRequestedAt !== null,
         certainty: classifyManagedReceipt(receipt, runtime.isPidAlive),
         updatedAt: receipt.updatedAt,
-        // Terminal evidence (T07-L1b). Three separate facts; the parent maps them.
+        // Observation axes (T07-L1b). Separate facts; the parent combines them.
         failureReason: receipt.failureReason,
-        stopCause: receipt.stopCause,
+        stopIntent: receipt.stopIntent,
         turnCount: receipt.turnCount,
         lastTurnEndAt: receipt.lastTurnEndAt,
-        idle: receipt.idle,
-        exitAt: receipt.exitAt,
-        exitProof: receipt.exitProof,
+        reportThinking: receipt.reportThinking,
+        reportOpenToolCall: receipt.reportOpenToolCall,
+        reportPendingUserInput: receipt.reportPendingUserInput,
+        childExitAt: receipt.childExitAt,
+        childExitProof: receipt.childExitProof,
     };
 }
 
@@ -1050,7 +1055,9 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                 // No pid yet. The spawn path consumes this flag once it has one,
                 // but a persisted `spawning` row from a previous process may
                 // already have a live child, so the backend is asked as well.
-                const marked = runtime.store.update(key, { stopRequestedAt: runtime.now(), stopCause: 'parent-stop' }, runtime.now());
+                const marked = runtime.store.update(key, {
+                    stopRequestedAt: runtime.now(), ...(receipt.stopIntent === null ? { stopIntent: 'parent-stop' as const } : {}),
+                }, runtime.now());
                 const { evidence, backendStop } = await stopAttempt(marked);
                 return {
                     stopIntentRecorded: true,
@@ -1073,7 +1080,9 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             }
 
             const marked = runtime.store.update(key, {
-                state: 'stopping', stopRequestedAt: runtime.now(), stopCause: 'parent-stop',
+                state: 'stopping', stopRequestedAt: runtime.now(),
+                // 첫 의도만 남긴다 — lease 만료가 먼저 기록했으면 그것이 원인에 가깝다.
+                ...(receipt.stopIntent === null ? { stopIntent: 'parent-stop' as const } : {}),
             }, runtime.now());
             const { evidence, backendStop } = await stopAttempt(marked);
             // Three separate facts, never collapsed:
@@ -1446,9 +1455,9 @@ const aiAuthRpc = async (params: unknown) => {
 
         /**
          * A verified runtime report from the child of a managed attempt
-         * (T07-L1b). Records what the parent needs to tell "turn finished" from
-         * "still running": turns completed, when the last one ended, whether
-         * the child is idle. Nothing here is a terminal state.
+         * (T07-L1b). Records the raw flags and the monotonic turn counters.
+         * Nothing here is a terminal state and nothing here is a success:
+         * a turn that ended in a provider error also goes busy→idle.
          */
         noteSessionRuntime(sessionId: string, report: {
             assistantTurns?: number;
@@ -1461,16 +1470,36 @@ const aiAuthRpc = async (params: unknown) => {
                 r.sessionId === sessionId && (r.state === 'running' || r.state === 'stopping')
             ));
             if (!receipt) return;
-            const turnCount = report.assistantTurns !== undefined
-                ? Math.max(report.assistantTurns, receipt.turnCount ?? 0)
-                : receipt.turnCount;
-            const lastTurnEndAt = report.lastTurnEndAt !== undefined
-                ? Math.max(report.lastTurnEndAt, receipt.lastTurnEndAt ?? 0)
-                : receipt.lastTurnEndAt;
-            const idle = !report.thinking && !report.hasOpenToolCall && !report.pendingUserInput;
-            if (turnCount === receipt.turnCount && lastTurnEndAt === receipt.lastTurnEndAt && idle === receipt.idle) return;
+            // The raw report is validated before it is merged: a merge that
+            // clamps (max) would hide a malformed value and still write.
+            const reported = normalizeReceiptObservation({
+                ...receipt,
+                turnCount: report.assistantTurns ?? null,
+                lastTurnEndAt: report.lastTurnEndAt ?? null,
+                reportThinking: report.thinking,
+                reportOpenToolCall: report.hasOpenToolCall,
+                reportPendingUserInput: report.pendingUserInput,
+            });
+            // A report the file parser would refuse must not be written: it would
+            // turn a good receipt into an unreadable one on the next read.
+            if (reported === null) {
+                logger.debug('[managed] ignoring a malformed session runtime report');
+                return;
+            }
+            const observation: ManagedReceiptObservation = {
+                ...reported,
+                turnCount: reported.turnCount === null
+                    ? receipt.turnCount
+                    : Math.max(reported.turnCount, receipt.turnCount ?? 0),
+                lastTurnEndAt: reported.lastTurnEndAt === null
+                    ? receipt.lastTurnEndAt
+                    : Math.max(reported.lastTurnEndAt, receipt.lastTurnEndAt ?? 0),
+            };
+            const same = (Object.keys(observation) as Array<keyof ManagedReceiptObservation>)
+                .every((k) => observation[k] === receipt[k]);
+            if (same) return;
             try {
-                runtime.store.update(receipt.requestKey, { turnCount, lastTurnEndAt, idle }, runtime.now());
+                runtime.store.update(receipt.requestKey, observation, runtime.now());
             } catch {
                 // The writer lock is gone or the file changed under us; the next
                 // report tries again. A missed note is not a lost fact.
@@ -1479,21 +1508,28 @@ const aiAuthRpc = async (params: unknown) => {
         },
 
         /**
-         * The child process of a managed attempt is gone (T07-L1b). The receipt
-         * becomes `stopped` with `exitProof: 'pid-reap'` — the only terminal
-         * proof this daemon issues; a backend generation proof keeps the stop
-         * obligation retrying and is not a per-attempt exit. Whether the exit
-         * was a stop, a lease lapse or unasked is in `stopCause`, and whether a
-         * turn had finished is in the turn fields. The parent reads all three.
+         * The daemon's tracking lost a child pid (T07-L1b). Recorded on the
+         * receipt as an **observation** — the pid is probed again here and only
+         * ESRCH counts; EPERM or anything else is not absence. `state` is left
+         * alone: a leader that exited says nothing about its descendants, and
+         * `stopped` stays the backend-proven meaning it has always had.
          */
         noteChildExited(pid: number): void {
+            try {
+                (runtime.processGroupDeps ?? defaultProcessGroupDeps).kill(pid, 0);
+                // Still there (or at least answering): not an exit.
+                return;
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return;
+            }
             const receipt = runtime.store.list().receipts.find((r) => (
-                r.pid === pid && (r.state === 'spawned' || r.state === 'running' || r.state === 'stopping')
+                r.pid === pid && r.childExitAt === null
+                && (r.state === 'spawned' || r.state === 'running' || r.state === 'stopping')
             ));
             if (!receipt) return;
             try {
                 runtime.store.update(receipt.requestKey, {
-                    state: 'stopped', exitAt: runtime.now(), exitProof: 'pid-reap',
+                    childExitAt: runtime.now(), childExitProof: 'pid-absent',
                 }, runtime.now());
             } catch {
                 logger.debug('[managed] could not record child exit on a receipt');
@@ -1733,7 +1769,10 @@ const aiAuthRpc = async (params: unknown) => {
                 // after its lease expired stops itself.
                 const marked = receipt.stopRequestedAt === null
                     ? runtime.store.update(
-                        receipt.requestKey, { stopRequestedAt: runtime.now(), stopCause: 'lease-expired' }, runtime.now(),
+                        receipt.requestKey, {
+                            stopRequestedAt: runtime.now(),
+                            ...(receipt.stopIntent === null ? { stopIntent: 'lease-expired' as const } : {}),
+                        }, runtime.now(),
                     )
                     : receipt;
                 const { backendStop } = await stopAttempt(marked);

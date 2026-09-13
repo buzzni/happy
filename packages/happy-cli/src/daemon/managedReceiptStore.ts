@@ -68,21 +68,25 @@ export type ManagedReceipt = {
     stopRequestedAt: number | null;
     failureReason: string | null;
     /**
-     * Terminal evidence (T07-L1b). Each is `null` until observed; an older
-     * receipt file without them parses as all-null. They are separate axes on
-     * purpose — a turn that ended, a process that is gone, and *why* it was
-     * asked to stop are three facts, and the parent maps them, not this file.
+     * Observation axes (T07-L1b). Each is `null` until observed; an older
+     * receipt file without them parses as all-null. They are separate facts
+     * and **none of them changes `state`**: `stopped` keeps meaning "the
+     * generation is proven stopped", which no child observation can assert.
+     * The parent combines them with its own knowledge (why it asked for a
+     * stop, whether a turn had ended) — this file does not judge outcomes.
      */
-    /** Who asked for the stop: the parent's `managed:stop`, or lease maintenance. */
-    stopCause: 'parent-stop' | 'lease-expired' | null;
-    /** From the child's verified runtime reports: assistant turns completed, when the last one ended. */
+    /** The first stop intent recorded, never overwritten: the parent's `managed:stop` (or a tombstone) or lease maintenance. */
+    stopIntent: 'parent-stop' | 'lease-expired' | null;
+    /** From the child's verified runtime reports, monotonic: turns that went busy→idle, when the last one ended. Not a success count. */
     turnCount: number | null;
     lastTurnEndAt: number | null;
-    /** Last verified report said: not thinking, no open tool call, not waiting on input. */
-    idle: boolean | null;
-    /** The child process is gone: this daemon saw the pid vanish. */
-    exitAt: number | null;
-    exitProof: 'pid-reap' | null;
+    /** The last verified report's raw flags. `pendingUserInput` means waiting on a permission/question. */
+    reportThinking: boolean | null;
+    reportOpenToolCall: boolean | null;
+    reportPendingUserInput: boolean | null;
+    /** This daemon probed the recorded pid and found no such process (ESRCH). An observation of the leader only — not a generation proof. */
+    childExitAt: number | null;
+    childExitProof: 'pid-absent' | null;
     claimedAt: number;
     spawnAt: number | null;
     updatedAt: number;
@@ -163,37 +167,55 @@ function parseReceipt(raw: unknown, expectedRequestKey: string): ManagedReceipt 
     if (typeof r.workspaceId !== 'string' || !r.workspaceId) return null;
     if (typeof r.projectId !== 'string' || !r.projectId) return null;
     if (!isNullableString(r.spawnPayloadDigest)) return null;
-    // Terminal evidence: absent on receipts written before it existed. Absent
+    // Observation axes: absent on receipts written before they existed. Absent
     // and null mean the same thing; a present value must be well-formed.
-    const evidence = normalizeTerminalEvidence(r);
-    if (evidence === null) return null;
-    return { ...(r as unknown as ManagedReceipt), ...evidence };
+    const observation = normalizeReceiptObservation(r);
+    if (observation === null) return null;
+    return { ...(r as unknown as ManagedReceipt), ...observation };
 }
 
-const STOP_CAUSES = new Set(['parent-stop', 'lease-expired']);
-const EXIT_PROOFS = new Set(['pid-reap']);
+const STOP_INTENTS = new Set(['parent-stop', 'lease-expired']);
+const CHILD_EXIT_PROOFS = new Set(['pid-absent']);
 
-function normalizeTerminalEvidence(r: Record<string, unknown>): Pick<ManagedReceipt,
-    'stopCause' | 'turnCount' | 'lastTurnEndAt' | 'idle' | 'exitAt' | 'exitProof'> | null {
-    const stopCause = r.stopCause ?? null;
-    if (stopCause !== null && !(typeof stopCause === 'string' && STOP_CAUSES.has(stopCause))) return null;
+export type ManagedReceiptObservation = Pick<ManagedReceipt,
+    'stopIntent' | 'turnCount' | 'lastTurnEndAt' | 'reportThinking' | 'reportOpenToolCall'
+    | 'reportPendingUserInput' | 'childExitAt' | 'childExitProof'>;
+
+function isNullableBoolean(value: unknown): boolean {
+    return value === null || typeof value === 'boolean';
+}
+
+/**
+ * The observation axes, from a raw object: absent and null both read as null;
+ * a present value must be well-formed or the whole receipt is refused. Shared
+ * by the file parser and the report writers, so a bad report cannot write a
+ * receipt the next read would refuse.
+ */
+export function normalizeReceiptObservation(r: Record<string, unknown>): ManagedReceiptObservation | null {
+    const stopIntent = r.stopIntent ?? null;
+    if (stopIntent !== null && !(typeof stopIntent === 'string' && STOP_INTENTS.has(stopIntent))) return null;
     const turnCount = r.turnCount ?? null;
     if (turnCount !== null && !(Number.isSafeInteger(turnCount) && (turnCount as number) >= 0)) return null;
     const lastTurnEndAt = r.lastTurnEndAt ?? null;
     if (!isNullableTimestamp(lastTurnEndAt)) return null;
-    const idle = r.idle ?? null;
-    if (idle !== null && typeof idle !== 'boolean') return null;
-    const exitAt = r.exitAt ?? null;
-    if (!isNullableTimestamp(exitAt)) return null;
-    const exitProof = r.exitProof ?? null;
-    if (exitProof !== null && !(typeof exitProof === 'string' && EXIT_PROOFS.has(exitProof))) return null;
+    const reportThinking = r.reportThinking ?? null;
+    const reportOpenToolCall = r.reportOpenToolCall ?? null;
+    const reportPendingUserInput = r.reportPendingUserInput ?? null;
+    if (!isNullableBoolean(reportThinking) || !isNullableBoolean(reportOpenToolCall)
+        || !isNullableBoolean(reportPendingUserInput)) return null;
+    const childExitAt = r.childExitAt ?? null;
+    if (!isNullableTimestamp(childExitAt)) return null;
+    const childExitProof = r.childExitProof ?? null;
+    if (childExitProof !== null && !(typeof childExitProof === 'string' && CHILD_EXIT_PROOFS.has(childExitProof))) return null;
     return {
-        stopCause: stopCause as ManagedReceipt['stopCause'],
+        stopIntent: stopIntent as ManagedReceipt['stopIntent'],
         turnCount: turnCount as number | null,
         lastTurnEndAt: lastTurnEndAt as number | null,
-        idle: idle as boolean | null,
-        exitAt: exitAt as number | null,
-        exitProof: exitProof as ManagedReceipt['exitProof'],
+        reportThinking: reportThinking as boolean | null,
+        reportOpenToolCall: reportOpenToolCall as boolean | null,
+        reportPendingUserInput: reportPendingUserInput as boolean | null,
+        childExitAt: childExitAt as number | null,
+        childExitProof: childExitProof as ManagedReceipt['childExitProof'],
     };
 }
 
@@ -386,12 +408,14 @@ export function createManagedReceiptStore(root: string, lock: ManagedStoreLock) 
                 sessionId: null,
                 stopRequestedAt: null,
                 failureReason: null,
-                stopCause: null,
+                stopIntent: null,
                 turnCount: null,
                 lastTurnEndAt: null,
-                idle: null,
-                exitAt: null,
-                exitProof: null,
+                reportThinking: null,
+                reportOpenToolCall: null,
+                reportPendingUserInput: null,
+                childExitAt: null,
+                childExitProof: null,
                 claimedAt: input.now,
                 spawnAt: null,
                 updatedAt: input.now,
@@ -424,12 +448,14 @@ export function createManagedReceiptStore(root: string, lock: ManagedStoreLock) 
                 sessionId: null,
                 stopRequestedAt: input.now,
                 failureReason: null,
-                stopCause: 'parent-stop',
+                stopIntent: 'parent-stop',
                 turnCount: null,
                 lastTurnEndAt: null,
-                idle: null,
-                exitAt: null,
-                exitProof: null,
+                reportThinking: null,
+                reportOpenToolCall: null,
+                reportPendingUserInput: null,
+                childExitAt: null,
+                childExitProof: null,
                 claimedAt: input.now,
                 spawnAt: null,
                 updatedAt: input.now,

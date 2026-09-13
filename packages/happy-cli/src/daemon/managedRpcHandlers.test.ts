@@ -418,57 +418,126 @@ describe('lease expiry does not silently leave a child running', () => {
     });
 });
 
-describe('terminal evidence (T07-L1b)', () => {
+describe('receipt observation axes (T07-L1b)', () => {
+    const NULL_AXES = {
+        stopIntent: null, turnCount: null, lastTurnEndAt: null, reportThinking: null,
+        reportOpenToolCall: null, reportPendingUserInput: null, childExitAt: null, childExitProof: null,
+    };
+
     it('starts every axis at null and exposes them on the view', async () => {
         await grantLease();
         await handlers.spawn(call('spawn', envelope()));
         const view = (await handlers.receipt(call('query', {}))).receipts[0]!;
-        expect(view).toMatchObject({
-            state: 'running', failureReason: null, stopCause: null, turnCount: null,
-            lastTurnEndAt: null, idle: null, exitAt: null, exitProof: null,
-        });
+        expect(view).toMatchObject({ state: 'running', failureReason: null, ...NULL_AXES });
     });
 
-    it('records verified runtime reports as turns and idleness, monotonically', async () => {
+    it('records verified runtime reports as monotonic turns and raw flags, never as a state', async () => {
         await grantLease();
         await handlers.spawn(call('spawn', envelope()));
-        handlers.noteSessionRuntime('sess-1', { assistantTurns: 1, lastTurnEndAt: NOW + 5_000, thinking: false, hasOpenToolCall: false, pendingUserInput: false });
+        handlers.noteSessionRuntime('sess-1', { assistantTurns: 1, lastTurnEndAt: NOW + 5_000, thinking: false, hasOpenToolCall: false, pendingUserInput: true });
         let view = (await handlers.receipt(call('query', {}))).receipts[0]!;
-        expect(view).toMatchObject({ state: 'running', turnCount: 1, lastTurnEndAt: NOW + 5_000, idle: true });
-        // 늦게 도착한 옛 보고는 turn 을 되돌리지 않는다; thinking 은 idle 을 끈다.
-        handlers.noteSessionRuntime('sess-1', { assistantTurns: 0, lastTurnEndAt: NOW + 1_000, thinking: true, hasOpenToolCall: false, pendingUserInput: false });
+        expect(view).toMatchObject({
+            state: 'running', turnCount: 1, lastTurnEndAt: NOW + 5_000,
+            reportThinking: false, reportOpenToolCall: false, reportPendingUserInput: true,
+        });
+        // 늦게 도착한 옛 보고는 turn 을 되돌리지 않는다; flag 는 마지막 보고 그대로다.
+        handlers.noteSessionRuntime('sess-1', { assistantTurns: 0, lastTurnEndAt: NOW + 1_000, thinking: true, hasOpenToolCall: true, pendingUserInput: false });
         view = (await handlers.receipt(call('query', {}))).receipts[0]!;
-        expect(view).toMatchObject({ turnCount: 1, lastTurnEndAt: NOW + 5_000, idle: false });
-        // 모르는 세션의 보고는 아무 receipt 도 바꾸지 않는다.
+        expect(view).toMatchObject({
+            state: 'running', turnCount: 1, lastTurnEndAt: NOW + 5_000,
+            reportThinking: true, reportOpenToolCall: true, reportPendingUserInput: false,
+        });
+        // 모르는 세션의 보고, 그리고 파서가 거부할 보고는 아무 receipt 도 바꾸지 않는다.
+        const before = view.updatedAt;
+        wallClock += 1_000;
         handlers.noteSessionRuntime('sess-other', { assistantTurns: 9, thinking: false, hasOpenToolCall: false, pendingUserInput: false });
-        expect((await handlers.receipt(call('query', {}))).receipts[0]!.turnCount).toBe(1);
+        handlers.noteSessionRuntime('sess-1', { assistantTurns: -1, thinking: false, hasOpenToolCall: false, pendingUserInput: false });
+        handlers.noteSessionRuntime('sess-1', { assistantTurns: 1, lastTurnEndAt: 1.5, thinking: true, hasOpenToolCall: true, pendingUserInput: false });
+        view = (await handlers.receipt(call('query', {}))).receipts[0]!;
+        expect(view).toMatchObject({ turnCount: 1, lastTurnEndAt: NOW + 5_000, updatedAt: before });
     });
 
-    it('turns the receipt stopped with pid-reap proof when the child pid is gone; the stop cause stays what it was', async () => {
+    it('records a vanished child pid as an observation and leaves the state alone', async () => {
         await grantLease();
         await handlers.spawn(call('spawn', envelope()));
+        // Still answering kill(pid, 0): the lost tracking is not an exit.
+        livePgids.add(4242);
         handlers.noteChildExited(4242);
-        const view = (await handlers.receipt(call('query', {}))).receipts[0]!;
-        expect(view).toMatchObject({ state: 'stopped', exitProof: 'pid-reap', stopCause: null, certainty: 'determinate' });
-        expect(view.exitAt).toBe(wallClock);
-        // 다른 pid 는 무시한다; 이미 stopped 인 receipt 도 다시 쓰지 않는다.
+        let view = (await handlers.receipt(call('query', {}))).receipts[0]!;
+        expect(view).toMatchObject({ state: 'running', childExitAt: null, childExitProof: null });
+
+        livePgids.delete(4242);
+        handlers.noteChildExited(4242);
+        view = (await handlers.receipt(call('query', {}))).receipts[0]!;
+        // The leader is gone; its descendants may not be. `stopped` is not asserted.
+        expect(view).toMatchObject({ state: 'running', childExitAt: wallClock, childExitProof: 'pid-absent', stopIntent: null });
+        // A second note does not rewrite it.
         const before = view.updatedAt;
         wallClock += 1_000;
         handlers.noteChildExited(4242);
-        handlers.noteChildExited(9999);
         expect((await handlers.receipt(call('query', {}))).receipts[0]!.updatedAt).toBe(before);
     });
 
-    it('a parent stop records its cause before the child is reaped', async () => {
+    it('a pid note reaches only the receipt that recorded that pid', async () => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        spawnResult = async () => ({ type: 'success', sessionId: 'sess-2', pid: 4343 });
+        await handlers.spawn(call('spawn', envelope(), { attemptId: 'attempt-2', requestKey: 'client-request-key-2' }));
+        handlers.noteChildExited(4343);
+        const first = (await handlers.receipt(call('query', {}))).receipts[0]!;
+        const second = (await handlers.receipt(call('query', {}, { attemptId: 'attempt-2' }))).receipts[0]!;
+        expect(first).toMatchObject({ childExitAt: null, childExitProof: null });
+        expect(second).toMatchObject({ childExitAt: wallClock, childExitProof: 'pid-absent' });
+    });
+
+    it('an unknown-permission probe is not absence', async () => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        runtime.processGroupDeps!.kill = () => { throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); };
+        handlers.noteChildExited(4242);
+        expect((await handlers.receipt(call('query', {}))).receipts[0]!).toMatchObject({ childExitAt: null, childExitProof: null });
+    });
+
+    it('a parent stop records its intent; a later child exit is an observation on the stopping receipt', async () => {
         await grantLease();
         await handlers.spawn(call('spawn', envelope()));
         livePgids.add(4242);
         await handlers.stop(call('stop', {}));
         let view = (await handlers.receipt(call('query', {}))).receipts[0]!;
-        expect(view).toMatchObject({ state: 'stopping', stopCause: 'parent-stop', stopRequested: true });
+        expect(view).toMatchObject({ state: 'stopping', stopIntent: 'parent-stop', stopRequested: true });
+        // The backend's stop went through and the leader is gone now.
+        livePgids.delete(4242);
         handlers.noteChildExited(4242);
         view = (await handlers.receipt(call('query', {}))).receipts[0]!;
-        expect(view).toMatchObject({ state: 'stopped', stopCause: 'parent-stop', exitProof: 'pid-reap' });
+        expect(view).toMatchObject({ state: 'stopping', stopIntent: 'parent-stop', childExitProof: 'pid-absent' });
+    });
+
+    it('the first stop intent wins: lease expiry after a parent stop, and a parent stop after lease expiry', async () => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        livePgids.add(4242);
+        await handlers.stop(call('stop', {}));
+        monotonic += 120_000;
+        await handlers.runLeaseMaintenance();
+        expect((await handlers.receipt(call('query', {}))).receipts[0]!.stopIntent).toBe('parent-stop');
+
+        // Fresh runtime: expiry first, then the parent's stop arrives.
+        rmSync(root, { recursive: true, force: true });
+        root = mkdtempSync(join(tmpdir(), 'managed-rpc-'));
+        monotonic = 10_000;
+        runtime = { ...runtime, store: createManagedReceiptStore(root, { assertHeld: () => {} }) };
+        handlers = createManagedRpcHandlers(runtime);
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        livePgids.add(4242);
+        monotonic += 120_000;
+        await handlers.runLeaseMaintenance();
+        let view = (await handlers.receipt(call('query', {}))).receipts[0]!;
+        expect(view.stopIntent).toBe('lease-expired');
+        await grantLease({ renewalSeq: 2 });
+        await handlers.stop(call('stop', {}));
+        view = (await handlers.receipt(call('query', {}))).receipts[0]!;
+        expect(view.stopIntent).toBe('lease-expired');
     });
 });
 
