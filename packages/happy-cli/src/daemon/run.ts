@@ -145,7 +145,7 @@ import {
 } from './managedDaemonStateLayout';
 import { createManagedReceiptStore } from './managedReceiptStore';
 import { createByosOfflineReceiveWiring } from '@/daemon/byosOfflineReceiveWiring';
-import { createManagedRpcHandlers, type ManagedRpcHandlers, type ManagedRuntimeFacts } from './managedRpcHandlers';
+import { createManagedRpcHandlers, type ManagedChildExitNote, type ManagedRpcHandlers, type ManagedRuntimeFacts } from './managedRpcHandlers';
 import { createManagedAiAuthStore } from '@/managed/managedAiAuthStore';
 import {
   decideManagedStopRoute,
@@ -549,7 +549,7 @@ export async function startDaemon(): Promise<void> {
       assistantTurns?: number; lastTurnEndAt?: number;
       thinking: boolean; hasOpenToolCall: boolean; pendingUserInput: boolean;
     }) => void) | null = null;
-    let managedNoteChildExited: ((pid: number) => void) | null = null;
+    let managedNoteChildExited: ((pid: number) => ManagedChildExitNote) | null = null;
     /**
      * The runtime's own view of itself, for a status read.
      *
@@ -2788,8 +2788,13 @@ export async function startDaemon(): Promise<void> {
     // Handle child process exit — preserve session data for resume
     const onChildExited = (pid: number) => {
       const tracked = pidToTrackedSession.get(pid);
-      // A managed attempt's child is gone: its receipt becomes terminal (L1b).
-      managedNoteChildExited?.(pid);
+      // A managed attempt's child is gone: its receipt records the exit (L1b).
+      // A fact seen but not stored keeps its retry source: the pid stays
+      // tracked and the next prune calls here again.
+      if (managedNoteChildExited?.(pid) === 'write-failed') {
+        logger.debug(`[DAEMON RUN] Child exit of PID ${pid} not recorded on its receipt; keeping it tracked`);
+        return;
+      }
       if (tracked?.happySessionId) autonomousQualityGateRegistry.noteSessionStopped(tracked.happySessionId);
       const preservedForResume = tracked ? preserveSessionForResume(tracked, `process-exit:${pid}`) : false;
       if (!preservedForResume) {

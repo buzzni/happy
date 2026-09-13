@@ -326,6 +326,16 @@ describe('controlServer POST /session-runtime', () => {
     expect(runtimeReports[0].runtime.updatedAt).toBeGreaterThan(0)
   })
 
+  it('refuses a fractional turn-end timestamp at the door rather than merging it', async () => {
+    const res = await fetch(`${baseUrl}/session-runtime`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'session-1', lastTurnEndAt: 1.5 }),
+    })
+    expect(res.status).toBe(400)
+    expect(runtimeReports).toHaveLength(0)
+  })
+
   it('forwards cumulative assistant turn and provider token counters', async () => {
     const res = await fetch(`${baseUrl}/session-runtime`, {
       method: 'POST',

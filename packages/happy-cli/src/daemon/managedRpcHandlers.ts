@@ -417,6 +417,27 @@ function receiptView(receipt: ManagedReceipt, runtime: ManagedRuntime) {
     };
 }
 
+/** What `noteChildExited` did with the observation; see its doc. */
+export type ManagedChildExitNote = 'recorded' | 'present' | 'no-receipt' | 'write-failed';
+
+/**
+ * The receipt an observation is about when several match: the latest
+ * generation first, then the most recently claimed attempt. Directory order is
+ * not an order.
+ */
+function newestReceipt(
+    receipts: ManagedReceipt[],
+    matches: (receipt: ManagedReceipt) => boolean,
+): ManagedReceipt | undefined {
+    let best: ManagedReceipt | undefined;
+    for (const receipt of receipts) {
+        if (!matches(receipt)) continue;
+        if (!best || receipt.epoch > best.epoch
+            || (receipt.epoch === best.epoch && receipt.claimedAt > best.claimedAt)) best = receipt;
+    }
+    return best;
+}
+
 export function createManagedRpcHandlers(runtime: ManagedRuntime) {
 
     /**
@@ -746,6 +767,28 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
      * the kernel may have handed to something else since, so it is evidence
      * about what is visible, never authority to kill.
      */
+    /** `kill(pid, 0)` on the leader itself — not its group. Only ESRCH is absence. */
+    const pidAbsent = (pid: number): boolean => {
+        try {
+            (runtime.processGroupDeps ?? defaultProcessGroupDeps).kill(pid, 0);
+            return false;
+        } catch (error) {
+            return (error as NodeJS.ErrnoException).code === 'ESRCH';
+        }
+    };
+
+    const recordChildExit = (receipt: ManagedReceipt): ManagedChildExitNote => {
+        try {
+            runtime.store.update(receipt.requestKey, {
+                childExitAt: runtime.now(), childExitProof: 'pid-absent',
+            }, runtime.now());
+            return 'recorded';
+        } catch {
+            logger.debug('[managed] could not record child exit on a receipt');
+            return 'write-failed';
+        }
+    };
+
     const stopAttempt = async (receipt: ManagedReceipt): Promise<{
         evidence: ProcessGroupEvidence;
         backendStop: BackendStopResult;
@@ -977,12 +1020,20 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             // The child is detached, so it leads its own process group. The pid
             // is recorded for observation only; stopping it belongs to the
             // trusted backend.
-            const after = runtime.store.update(key, {
+            let after = runtime.store.update(key, {
                 state: 'running',
                 pid: outcome.pid,
                 pgid: outcome.pid,
                 sessionId: outcome.sessionId,
             }, runtime.now());
+            // A child that exited while the launch was still being committed
+            // was invisible to the exit sweep (the receipt had no pid yet).
+            // Probed once here so that exit is not lost; `state` stays `running`
+            // like any other exit observation.
+            if (pidAbsent(outcome.pid) && recordChildExit(after) === 'recorded') {
+                const reread = runtime.store.read(key);
+                if (reread.kind === 'ok') after = reread.receipt;
+            }
 
             // A stop that arrived while the spawn was in flight is honoured now
             // that there is something to signal.
@@ -1466,8 +1517,12 @@ const aiAuthRpc = async (params: unknown) => {
             hasOpenToolCall: boolean;
             pendingUserInput: boolean;
         }): void {
-            const receipt = runtime.store.list().receipts.find((r) => (
-                r.sessionId === sessionId && (r.state === 'running' || r.state === 'stopping')
+            // Several receipts may name one session (a retried attempt keeps
+            // the run's session). The report is about the child the parent is
+            // driving now: the newest attempt that has not been seen exiting.
+            const receipt = newestReceipt(runtime.store.list().receipts, (r) => (
+                r.sessionId === sessionId && r.childExitAt === null
+                && (r.state === 'running' || r.state === 'stopping')
             ));
             if (!receipt) return;
             // The raw report is validated before it is merged: a merge that
@@ -1513,27 +1568,21 @@ const aiAuthRpc = async (params: unknown) => {
          * ESRCH counts; EPERM or anything else is not absence. `state` is left
          * alone: a leader that exited says nothing about its descendants, and
          * `stopped` stays the backend-proven meaning it has always had.
+         *
+         * The answer tells the caller whether its retry source may go:
+         * `write-failed` means the fact was seen and not stored, so the pid must
+         * stay tracked for the next sweep. `present` means the kernel still
+         * answers for that pid — a reused or unreadable one — and no evidence
+         * exists to store.
          */
-        noteChildExited(pid: number): void {
-            try {
-                (runtime.processGroupDeps ?? defaultProcessGroupDeps).kill(pid, 0);
-                // Still there (or at least answering): not an exit.
-                return;
-            } catch (error) {
-                if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return;
-            }
-            const receipt = runtime.store.list().receipts.find((r) => (
+        noteChildExited(pid: number): ManagedChildExitNote {
+            if (!pidAbsent(pid)) return 'present';
+            const receipt = newestReceipt(runtime.store.list().receipts, (r) => (
                 r.pid === pid && r.childExitAt === null
                 && (r.state === 'spawned' || r.state === 'running' || r.state === 'stopping')
             ));
-            if (!receipt) return;
-            try {
-                runtime.store.update(receipt.requestKey, {
-                    childExitAt: runtime.now(), childExitProof: 'pid-absent',
-                }, runtime.now());
-            } catch {
-                logger.debug('[managed] could not record child exit on a receipt');
-            }
+            if (!receipt) return 'no-receipt';
+            return recordChildExit(receipt);
         },
 
         /**
@@ -1767,14 +1816,21 @@ const aiAuthRpc = async (params: unknown) => {
                 // in the middle of it. It is also what a spawn that is still
                 // launching reads when it finishes, so a child that arrives
                 // after its lease expired stops itself.
-                const marked = receipt.stopRequestedAt === null
+                //
+                // Re-read at the write: the listing was taken before the
+                // handovers above were awaited, and a parent stop may have landed
+                // on this receipt meanwhile. Its intent is the first one and must
+                // not be overwritten from a stale snapshot.
+                const fresh = runtime.store.read(receipt.requestKey);
+                const latest = fresh.kind === 'ok' ? fresh.receipt : receipt;
+                const marked = latest.stopRequestedAt === null
                     ? runtime.store.update(
-                        receipt.requestKey, {
+                        latest.requestKey, {
                             stopRequestedAt: runtime.now(),
-                            ...(receipt.stopIntent === null ? { stopIntent: 'lease-expired' as const } : {}),
+                            ...(latest.stopIntent === null ? { stopIntent: 'lease-expired' as const } : {}),
                         }, runtime.now(),
                     )
-                    : receipt;
+                    : latest;
                 const { backendStop } = await stopAttempt(marked);
                 if (!backendStop.requested) unstoppable.push(marked.requestKey);
                 handled.push(marked.requestKey);

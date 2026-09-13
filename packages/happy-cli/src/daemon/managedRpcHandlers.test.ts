@@ -84,6 +84,8 @@ let spawnResult: () => Promise<ManagedSpawnOutcome>;
 let runtime: ManagedRuntime;
 let handlers: ReturnType<typeof createManagedRpcHandlers>;
 let livePgids: Set<number>;
+/** Pids that answer `kill(pid, 0)`. Kept apart from groups so a pid probe cannot be mistaken for a group probe. */
+let livePids: Set<number>;
 let killed: Array<[number, string | number]>;
 
 const identity: ManagedRuntimeIdentity = {
@@ -144,6 +146,7 @@ beforeEach(() => {
     monotonic = 10_000;
     spawnCalls = 0;
     livePgids = new Set();
+    livePids = new Set();
     killed = [];
     spawnResult = async () => ({ type: 'success', sessionId: 'sess-1', pid: 4242 });
     const store = createManagedReceiptStore(root, { assertHeld: () => {} });
@@ -157,14 +160,24 @@ beforeEach(() => {
          * care about a refusing, throwing or absent consumer set their own.
          */
         onLeaseRenewed: async () => ({ enforced: true as const }),
-        spawn: async () => { spawnCalls += 1; return spawnResult(); },
+        spawn: async () => {
+            spawnCalls += 1;
+            const outcome = await spawnResult();
+            if (outcome.type === 'success') livePids.add(outcome.pid);
+            return outcome;
+        },
         isPidAlive: (pid) => livePgids.has(pid),
         now: () => wallClock,
         monotonicNow: () => monotonic,
         processGroupDeps: {
             kill: (target, signal) => {
                 killed.push([target, signal]);
-                const pgid = Math.abs(target);
+                if (target > 0) {
+                    // A pid, not a group: the leader alone.
+                    if (signal === 0 && !livePids.has(target)) throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+                    return;
+                }
+                const pgid = -target;
                 if (signal === 0 && !livePgids.has(pgid)) throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
                 if (signal === 'SIGTERM' || signal === 'SIGKILL') livePgids.delete(pgid);
             },
@@ -461,20 +474,22 @@ describe('receipt observation axes (T07-L1b)', () => {
         await grantLease();
         await handlers.spawn(call('spawn', envelope()));
         // Still answering kill(pid, 0): the lost tracking is not an exit.
-        livePgids.add(4242);
-        handlers.noteChildExited(4242);
+        expect(handlers.noteChildExited(4242)).toBe('present');
         let view = (await handlers.receipt(call('query', {}))).receipts[0]!;
         expect(view).toMatchObject({ state: 'running', childExitAt: null, childExitProof: null });
 
-        livePgids.delete(4242);
-        handlers.noteChildExited(4242);
+        // The leader is gone while its group still answers: that is the exit
+        // of the leader, and it is what is recorded — not the group's state.
+        livePids.delete(4242);
+        livePgids.add(4242);
+        expect(handlers.noteChildExited(4242)).toBe('recorded');
         view = (await handlers.receipt(call('query', {}))).receipts[0]!;
         // The leader is gone; its descendants may not be. `stopped` is not asserted.
         expect(view).toMatchObject({ state: 'running', childExitAt: wallClock, childExitProof: 'pid-absent', stopIntent: null });
-        // A second note does not rewrite it.
+        // A second note finds no receipt still waiting for that pid.
         const before = view.updatedAt;
         wallClock += 1_000;
-        handlers.noteChildExited(4242);
+        expect(handlers.noteChildExited(4242)).toBe('no-receipt');
         expect((await handlers.receipt(call('query', {}))).receipts[0]!.updatedAt).toBe(before);
     });
 
@@ -483,7 +498,8 @@ describe('receipt observation axes (T07-L1b)', () => {
         await handlers.spawn(call('spawn', envelope()));
         spawnResult = async () => ({ type: 'success', sessionId: 'sess-2', pid: 4343 });
         await handlers.spawn(call('spawn', envelope(), { attemptId: 'attempt-2', requestKey: 'client-request-key-2' }));
-        handlers.noteChildExited(4343);
+        livePids.delete(4343);
+        expect(handlers.noteChildExited(4343)).toBe('recorded');
         const first = (await handlers.receipt(call('query', {}))).receipts[0]!;
         const second = (await handlers.receipt(call('query', {}, { attemptId: 'attempt-2' }))).receipts[0]!;
         expect(first).toMatchObject({ childExitAt: null, childExitProof: null });
@@ -494,7 +510,7 @@ describe('receipt observation axes (T07-L1b)', () => {
         await grantLease();
         await handlers.spawn(call('spawn', envelope()));
         runtime.processGroupDeps!.kill = () => { throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); };
-        handlers.noteChildExited(4242);
+        expect(handlers.noteChildExited(4242)).toBe('present');
         expect((await handlers.receipt(call('query', {}))).receipts[0]!).toMatchObject({ childExitAt: null, childExitProof: null });
     });
 
@@ -506,8 +522,8 @@ describe('receipt observation axes (T07-L1b)', () => {
         let view = (await handlers.receipt(call('query', {}))).receipts[0]!;
         expect(view).toMatchObject({ state: 'stopping', stopIntent: 'parent-stop', stopRequested: true });
         // The backend's stop went through and the leader is gone now.
-        livePgids.delete(4242);
-        handlers.noteChildExited(4242);
+        livePids.delete(4242);
+        expect(handlers.noteChildExited(4242)).toBe('recorded');
         view = (await handlers.receipt(call('query', {}))).receipts[0]!;
         expect(view).toMatchObject({ state: 'stopping', stopIntent: 'parent-stop', childExitProof: 'pid-absent' });
     });
@@ -538,6 +554,93 @@ describe('receipt observation axes (T07-L1b)', () => {
         await handlers.stop(call('stop', {}));
         view = (await handlers.receipt(call('query', {}))).receipts[0]!;
         expect(view.stopIntent).toBe('lease-expired');
+    });
+
+    /**
+     * Both orders of attempt ids: the receipt directory lists files by their
+     * hashed names, in whatever order the filesystem chooses, so exactly one of
+     * the two orders puts the older receipt first — a selector that takes the
+     * first match fails on that one.
+     */
+    const ORDERS: Array<[older: string, newer: string]> = [['attempt-1', 'attempt-2'], ['attempt-2', 'attempt-1']];
+
+    it.each(ORDERS)('a report lands on the newest receipt that names the session, not the first one on disk (%s then %s)', async (older, newer) => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope(), { attemptId: older, requestKey: `key-${older}` }));
+        wallClock += 1_000;
+        // A retried attempt keeps the run's session.
+        spawnResult = async () => ({ type: 'success', sessionId: 'sess-1', pid: 4343 });
+        await handlers.spawn(call('spawn', envelope(), { attemptId: newer, requestKey: `key-${newer}` }));
+        handlers.noteSessionRuntime('sess-1', { assistantTurns: 1, lastTurnEndAt: NOW + 5_000, thinking: false, hasOpenToolCall: false, pendingUserInput: false });
+        const first = (await handlers.receipt(call('query', {}, { attemptId: older }))).receipts[0]!;
+        const second = (await handlers.receipt(call('query', {}, { attemptId: newer }))).receipts[0]!;
+        expect(first).toMatchObject({ turnCount: null, reportThinking: null });
+        expect(second).toMatchObject({ turnCount: 1, reportThinking: false });
+    });
+
+    it.each(ORDERS)('a reused pid is attributed to the newest receipt still waiting for it (%s then %s)', async (older, newer) => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope(), { attemptId: older, requestKey: `key-${older}` }));
+        wallClock += 1_000;
+        // The kernel handed the same pid to the next child; the first exit went unobserved.
+        await handlers.spawn(call('spawn', envelope(), { attemptId: newer, requestKey: `key-${newer}` }));
+        livePids.delete(4242);
+        expect(handlers.noteChildExited(4242)).toBe('recorded');
+        expect((await handlers.receipt(call('query', {}, { attemptId: newer }))).receipts[0]!).toMatchObject({ childExitProof: 'pid-absent' });
+        expect((await handlers.receipt(call('query', {}, { attemptId: older }))).receipts[0]!).toMatchObject({ childExitProof: null });
+    });
+
+    it('a write that fails reports so, and leaves nothing half-written', async () => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        livePids.delete(4242);
+        const update = runtime.store.update;
+        runtime.store.update = () => { throw new Error('lock lost'); };
+        expect(handlers.noteChildExited(4242)).toBe('write-failed');
+        runtime.store.update = update;
+        expect((await handlers.receipt(call('query', {}))).receipts[0]!).toMatchObject({ childExitAt: null });
+        // The retry then succeeds.
+        expect(handlers.noteChildExited(4242)).toBe('recorded');
+    });
+
+    it('a child that died before the launch was committed is still observed, at the commit', async () => {
+        await grantLease();
+        // The launcher reports success for a pid that is already gone.
+        runtime.spawn = async () => ({ type: 'success', sessionId: 'sess-1', pid: 5151 });
+        const result = await handlers.spawn(call('spawn', envelope()));
+        expect(result.accepted).toBe(true);
+        expect(result.receipt).toMatchObject({ state: 'running', childExitAt: wallClock, childExitProof: 'pid-absent' });
+    });
+
+    it('lease maintenance does not overwrite a parent stop that landed while it was handing over another attempt', async () => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        spawnResult = async () => ({ type: 'success', sessionId: 'sess-2', pid: 4343 });
+        await handlers.spawn(call('spawn', envelope(), { attemptId: 'attempt-2', requestKey: 'client-request-key-2' }));
+        livePgids.add(4242); livePgids.add(4343);
+        let releaseFirst: () => void = () => {};
+        const firstHandover = new Promise<void>((resolve) => { releaseFirst = resolve; });
+        let stopsRequested = 0;
+        runtime.fencingBackend = {
+            proveGenerationStopped: async () => ({ proven: false, detail: 'unproven' }),
+            requestStop: async (input) => {
+                stopsRequested += 1;
+                if (input.attemptId === 'attempt-1' && stopsRequested === 1) await firstHandover;
+                return { requested: true, detail: 'ok' };
+            },
+        };
+        monotonic += 120_000;
+        const maintenance = handlers.runLeaseMaintenance();
+        // Let the expiry pass reach attempt-1's handover and block there.
+        for (let i = 0; i < 10; i += 1) await Promise.resolve();
+        expect(stopsRequested).toBe(1);
+        // The parent's stop for attempt-2 lands meanwhile.
+        await handlers.stop(call('stop', {}, { attemptId: 'attempt-2', requestKey: 'client-request-key-2' }));
+        releaseFirst();
+        await maintenance;
+        const second = (await handlers.receipt(call('query', {}, { attemptId: 'attempt-2' }))).receipts[0]!;
+        expect(second).toMatchObject({ stopIntent: 'parent-stop', stopRequested: true });
+        expect((await handlers.receipt(call('query', {}))).receipts[0]!).toMatchObject({ stopIntent: 'lease-expired' });
     });
 });
 
