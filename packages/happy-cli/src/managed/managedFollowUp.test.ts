@@ -8,7 +8,10 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { createManagedFollowUpGate, createManagedFollowUpHandler, parseManagedFollowUp } from './managedFollowUp';
+import {
+    MANAGED_FOLLOW_UP_FRAME, createManagedFollowUpGate, createManagedFollowUpHandler,
+    frameManagedFollowUpForProvider, parseManagedFollowUp,
+} from './managedFollowUp';
 
 describe('parseManagedFollowUp', () => {
     it('reads a text turn with its client id', () => {
@@ -31,16 +34,11 @@ describe('parseManagedFollowUp', () => {
         // the managed `goal-action` RPC refuses. The queue must not be a way round it.
         expect(parseManagedFollowUp({ localId: 'm-1', text: '/goal ship it' })).toEqual({ ok: false, reason: 'command-not-allowed' });
         expect(parseManagedFollowUp({ localId: 'm-1', text: '/GOAL clear' })).toEqual({ ok: false, reason: 'command-not-allowed' });
-        // The embedded Claude SDK dispatches its own slash commands from user text —
-        // reset, model, effort, mcp, exit — each of which changes what the run was
-        // admitted with. Any leading slash command is refused, whatever its name.
-        for (const text of ['/reset', '/new', '/clear named', '/model opus', '/effort high', '/mcp disable all', '/exit', ' /Custom:thing now']) {
-            expect(parseManagedFollowUp({ localId: 'm-1', text })).toEqual({ ok: false, reason: 'command-not-allowed' });
-        }
-        // A slash inside a sentence is text, and so is a leading path.
+        // A slash inside a sentence is text, and so is a leading path — the provider
+        // would take these as prompts, and so does the parse.
         expect(parseManagedFollowUp({ localId: 'm-1', text: 'run /clear on the queue?' })).toMatchObject({ ok: true });
         expect(parseManagedFollowUp({ localId: 'm-1', text: '/src/app.ts 의 버그를 고쳐줘' })).toMatchObject({ ok: true });
-        expect(parseManagedFollowUp({ localId: 'm-1', text: '/ 로 시작하는 문장' })).toMatchObject({ ok: true });
+        expect(parseManagedFollowUp({ localId: 'm-1', text: '/tmp 디렉터리를 확인해줘' })).toMatchObject({ ok: true });
     });
 
     it('takes only the text: a follow-up carries no options, whatever the payload claims', () => {
@@ -49,6 +47,29 @@ describe('parseManagedFollowUp', () => {
             localId: 'm-1', text: 'Reply PING', meta: { model: 'other', permissionMode: 'bypassPermissions' },
         });
         expect(parsed).toEqual({ ok: true, localId: 'm-1', text: 'Reply PING' });
+    });
+});
+
+describe('frameManagedFollowUpForProvider', () => {
+    it('frames anything the provider would read as its own command, whatever the name', () => {
+        /*
+         * The embedded Claude SDK dispatches /reset, /model, /effort, /mcp, /exit and
+         * any registered name — digits, underscores, non-ASCII too — from plain user
+         * text, and swallows an unknown name. Framed, it reads the user's words.
+         */
+        for (const text of [
+            '/reset', '/new', '/clear named', '/model opus', '/effort high', '/mcp disable all', '/exit',
+            ' /Custom:thing now', '/2fa', '/_internal', '/--model opus', '/:model opus', '/?!reset', '/한글명령',
+            '/tmp 디렉터리를 확인해줘', '/README 내용을 요약해줘', '/hello world/.test(value)',
+        ]) {
+            expect(frameManagedFollowUpForProvider(text)).toBe(`${MANAGED_FOLLOW_UP_FRAME}${text}`);
+        }
+    });
+
+    it('leaves text that no provider reads as a command untouched', () => {
+        for (const text of ['Reply PING', 'run /clear on the queue?', '/ 로 시작하는 문장', '／model opus']) {
+            expect(frameManagedFollowUpForProvider(text)).toBe(text);
+        }
     });
 });
 
@@ -88,6 +109,21 @@ describe('createManagedFollowUpHandler', () => {
         });
         return { handler, calls };
     }
+
+    it('queues the framed text for the provider but shows the user their own words', async () => {
+        const turns: Array<{ text: string; queued: string }> = [];
+        const queued: string[] = [];
+        const handler = createManagedFollowUpHandler({
+            managed: () => true,
+            echo: (turn) => turns.push({ text: turn.text, queued: turn.queued }),
+            enqueue: (text) => queued.push(text),
+        });
+        expect(await handler({ localId: 'm-1', text: '/tmp 디렉터리를 확인해줘' })).toEqual({ accepted: true });
+        // What the provider gets is framed; the transcript row is the original, and the
+        // scanner is told the framed text because that is what it will meet in the log.
+        expect(queued).toEqual([`${MANAGED_FOLLOW_UP_FRAME}/tmp 디렉터리를 확인해줘`]);
+        expect(turns).toEqual([{ text: '/tmp 디렉터리를 확인해줘', queued: `${MANAGED_FOLLOW_UP_FRAME}/tmp 디렉터리를 확인해줘` }]);
+    });
 
     it('queues the turn, shows it in the same tick, and reports it accepted', async () => {
         const { handler, calls } = build();

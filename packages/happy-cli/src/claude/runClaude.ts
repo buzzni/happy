@@ -800,13 +800,13 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
      */
     session.rpcHandlerManager.registerHandler('follow-up', createManagedFollowUpHandler({
         managed: () => Boolean(managedStartup),
-        echo: ({ text, localId }) => {
+        echo: ({ text, localId, queued }) => {
             // The visible user row, sent as an envelope and not through the
             // transcript mapper: that mapper closes the running turn on a plain
             // user record, and a turn queued behind one in progress must not
-            // end it. The scanner will meet this text in the JSONL when Claude
-            // takes it, and skips it then — once, however long the wait.
-            shownFollowUps.push(text);
+            // end it. The scanner will meet the *queued* text in the JSONL when
+            // Claude takes it, and skips it then — once, however long the wait.
+            shownFollowUps.push(queued);
             session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }), localId);
         },
         enqueue: (text) => {

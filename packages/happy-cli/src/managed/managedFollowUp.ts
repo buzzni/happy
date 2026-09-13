@@ -18,6 +18,18 @@ import { parseSpecialCommand } from '@/parsers/specialCommands';
 
 export type ManagedFollowUp = { localId: string; text: string };
 
+/** What each agent receives for one accepted turn. */
+export type ManagedFollowUpTurn = ManagedFollowUp & {
+    /**
+     * The text handed to the provider. Equal to `text` unless the turn starts
+     * with a slash, in which case it is framed so the provider reads it as the
+     * user's words and not as one of its own commands. The transcript row and
+     * the scanner's suppression use different sides of this: the row shows
+     * `text`, the scanner meets `queued` in the provider's log.
+     */
+    queued: string;
+};
+
 export type ManagedFollowUpRefusal = 'malformed' | 'empty-text' | 'text-too-long' | 'command-not-allowed';
 
 export type ManagedFollowUpParse =
@@ -28,15 +40,25 @@ export type ManagedFollowUpParse =
 export const MANAGED_FOLLOW_UP_MAX_TEXT = 200_000;
 
 /**
- * A slash command at the head of the text: `/name`, then the end or a space.
+ * Text the provider would read as one of its own commands: a slash at the
+ * head, anything but whitespace after it.
  *
- * Happy's own parser knows a few names; the embedded Claude SDK dispatches
- * many more from plain user text (`/reset`, `/model`, `/effort`, `/mcp`,
- * `/exit`), each changing what the run was admitted with. The shape is what
- * is refused, not a list that would go stale. A leading path (`/src/app.ts`)
- * is not a command: the name is followed by another slash.
+ * The embedded Claude SDK dispatches `/reset`, `/model`, `/effort`, `/mcp`,
+ * `/exit` and any registered name — with digits, underscores or non-ASCII
+ * letters too — from plain user text, and swallows an unknown name as an
+ * unknown command. Refusing the shape outright refused `/tmp 디렉터리를
+ * 확인해줘` as well, which the SDK itself would have taken as a prompt. So
+ * the shape is not refused: it is **framed** on the way to the provider, so
+ * the provider reads the user's words and dispatches nothing.
  */
-const LEADING_SLASH_COMMAND = /^\s*\/[A-Za-z][\w:-]*(?:\s|$)/;
+const LEADING_SLASH = /^\s*\/\S/u;
+
+export const MANAGED_FOLLOW_UP_FRAME = 'User follow-up:\n';
+
+/** The text as the provider receives it. Unchanged unless it starts with a slash. */
+export function frameManagedFollowUpForProvider(text: string): string {
+    return LEADING_SLASH.test(text) ? `${MANAGED_FOLLOW_UP_FRAME}${text}` : text;
+}
 
 export function parseManagedFollowUp(params: unknown): ManagedFollowUpParse {
     if (!params || typeof params !== 'object' || Array.isArray(params)) return { ok: false, reason: 'malformed' };
@@ -55,8 +77,7 @@ export function parseManagedFollowUp(params: unknown): ManagedFollowUpParse {
      * refuses, and the queue must not be a way round that. A follow-up is
      * text for the agent, nothing else.
      */
-    if (parseSpecialCommand(text).type !== null || parseCodexGoalCommand(text) !== null
-        || LEADING_SLASH_COMMAND.test(text)) {
+    if (parseSpecialCommand(text).type !== null || parseCodexGoalCommand(text) !== null) {
         return { ok: false, reason: 'command-not-allowed' };
     }
     return { ok: true, localId, text };
@@ -116,9 +137,9 @@ export function createManagedFollowUpHandler(deps: {
     /** Whether this run is managed. Read per call: it is decided after startup. */
     managed: () => boolean;
     /** Shows the turn as the user's own row, without touching the turn in progress. */
-    echo: (turn: ManagedFollowUp) => void;
-    /** Places the text in the turn queue with the options the run already has. */
-    enqueue: (text: string) => void;
+    echo: (turn: ManagedFollowUpTurn) => void;
+    /** Places `queued` in the turn queue with the options the run already has. */
+    enqueue: (queued: string) => void;
     gate?: ManagedFollowUpGate;
 }): (params: unknown) => Promise<ManagedFollowUpAnswer> {
     const gate = deps.gate ?? createManagedFollowUpGate();
@@ -127,13 +148,14 @@ export function createManagedFollowUpHandler(deps: {
         const parsed = parseManagedFollowUp(params);
         if (!parsed.ok) return { accepted: false, reason: parsed.reason };
         if (gate.take(parsed.localId) === 'duplicate') return { accepted: true, duplicate: true };
+        const queued = frameManagedFollowUpForProvider(parsed.text);
         try {
-            deps.enqueue(parsed.text);
+            deps.enqueue(queued);
         } catch {
             gate.release(parsed.localId);
             return { accepted: false, reason: 'not-accepting' };
         }
-        deps.echo({ localId: parsed.localId, text: parsed.text });
+        deps.echo({ localId: parsed.localId, text: parsed.text, queued });
         return { accepted: true };
     };
 }
