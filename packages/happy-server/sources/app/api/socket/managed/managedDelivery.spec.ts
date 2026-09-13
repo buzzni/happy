@@ -468,10 +468,17 @@ describe('a relay-only RPC without relayed authority goes nowhere', () => {
         expect(emitted).toEqual([]);
     });
 
-    it('lets the same call through with relayed claims attached', () => {
+    it('passes the authority guard with relayed claims attached, leaving the rest to the channel', () => {
+        /*
+         * Whether those claims are *live* is the channel's precondition, read
+         * against the database on the way out — the real-channel cases in
+         * managedFollowUpRoutes.spec cover that. This only shows the guard here
+         * is about the presence of relayed authority: with it attached, the
+         * call reaches the registry and an unknown socket is refused as such.
+         */
         const { registry } = followUpRegistry();
         const claims = { purpose: 'message-send', sessionId: 'session-1', accountId: 'account-1' };
-        expect(executeManagedRpcLocally({ ...bare, approval: { claims: claims as never } }, 'child', () => {}, registry))
-            .toEqual({ ok: true });
+        expect(executeManagedRpcLocally({ ...bare, approval: { claims: claims as never } }, 'nobody', () => {}, registry))
+            .toEqual({ ok: false, reason: 'no-target' });
     });
 });

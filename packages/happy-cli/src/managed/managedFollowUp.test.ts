@@ -27,6 +27,10 @@ describe('parseManagedFollowUp', () => {
     it('refuses a queue command: it is not a turn, and it drops turns already taken', () => {
         expect(parseManagedFollowUp({ localId: 'm-1', text: '/clear' })).toEqual({ ok: false, reason: 'command-not-allowed' });
         expect(parseManagedFollowUp({ localId: 'm-1', text: '  /compact  ' })).toEqual({ ok: false, reason: 'command-not-allowed' });
+        // A goal is an instruction carried into every later turn — the very thing
+        // the managed `goal-action` RPC refuses. The queue must not be a way round it.
+        expect(parseManagedFollowUp({ localId: 'm-1', text: '/goal ship it' })).toEqual({ ok: false, reason: 'command-not-allowed' });
+        expect(parseManagedFollowUp({ localId: 'm-1', text: '/GOAL clear' })).toEqual({ ok: false, reason: 'command-not-allowed' });
         // A slash inside a sentence is text.
         expect(parseManagedFollowUp({ localId: 'm-1', text: 'run /clear on the queue?' })).toMatchObject({ ok: true });
     });

@@ -928,6 +928,16 @@ export async function runCodex(opts: {
         command: CodexGoalCommand,
         threadId: string,
     ): Promise<boolean> => {
+        /*
+         * The same refusal the `goal-action` RPC makes, here at the one place a
+         * `/goal` text is executed — whichever way it reached the queue. A
+         * managed run answers the prompt it was admitted for; a goal is an
+         * instruction carried into every turn after it. Clearing removes one.
+         */
+        if (managedStartup && command.type === 'set') {
+            messageBuffer.addMessage('A managed run cannot be given a new objective', 'status');
+            return true;
+        }
         try {
             if (command.type === 'clear') {
                 const result = await client.clearGoal({ threadId });

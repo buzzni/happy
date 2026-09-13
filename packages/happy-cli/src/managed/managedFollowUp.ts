@@ -13,6 +13,7 @@
  * sends the same turn again. The client id is what makes one send one turn.
  */
 
+import { parseCodexGoalCommand } from '@/codex/codexGoalStatus';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 
 export type ManagedFollowUp = { localId: string; text: string };
@@ -38,10 +39,14 @@ export function parseManagedFollowUp(params: unknown): ManagedFollowUpParse {
     /*
      * `/clear`, `/compact` and the like are not turns: read by the queue they
      * drop turns already accepted, and a retry of one of those would report
-     * `duplicate` for a turn that no longer exists. A follow-up is text for
-     * the agent, nothing else.
+     * `duplicate` for a turn that no longer exists. `/goal` is an instruction
+     * carried into every later turn — what the managed `goal-action` RPC
+     * refuses, and the queue must not be a way round that. A follow-up is
+     * text for the agent, nothing else.
      */
-    if (parseSpecialCommand(text).type !== null) return { ok: false, reason: 'command-not-allowed' };
+    if (parseSpecialCommand(text).type !== null || parseCodexGoalCommand(text) !== null) {
+        return { ok: false, reason: 'command-not-allowed' };
+    }
     return { ok: true, localId, text };
 }
 
