@@ -76,6 +76,8 @@ import {
 } from './codexMcpRuntimeRecovery';
 import { emitReadyIfIdle } from './emitReadyIfIdle';
 import { enqueueCodexUserText, isCodexClearText } from './codexClearCommand';
+import { createEnvelope } from '@slopus/happy-wire';
+import { createManagedFollowUpGate, parseManagedFollowUp } from '@/managed/managedFollowUp';
 import { downloadCodexFileEventAttachment } from './utils/attachmentEvents';
 import { prepareCodexImageInputItems } from './utils/imageInput';
 import { createSerialAsyncHandler } from './utils/serialAsyncHandler';
@@ -955,6 +957,36 @@ export async function runCodex(opts: {
             return false;
         }
     };
+    /**
+     * The next turn of a managed session, relayed by the server on a
+     * `message-send` bearer's behalf (T07-L5-b). Text only, queued with the
+     * options the run already has — see runClaude.ts for the full rationale.
+     */
+    const managedFollowUpGate = createManagedFollowUpGate();
+    session.rpcHandlerManager.registerHandler('follow-up', async (params: unknown) => {
+        if (!managedStartup) return { accepted: false, reason: 'not-managed' };
+        const parsed = parseManagedFollowUp(params);
+        if (!parsed.ok) return { accepted: false, reason: parsed.reason };
+        if (managedFollowUpGate.take(parsed.localId) === 'duplicate') return { accepted: true, duplicate: true };
+        // The visible user row, so the transcript shows the turn where it came from.
+        session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text: parsed.text }), parsed.localId);
+        enqueueCodexUserText({
+            text: parsed.text,
+            mode: {
+                permissionMode: currentPermissionMode || 'default',
+                model: currentModel,
+                appendSystemPrompt: currentAppendSystemPrompt,
+                saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+                saycodePromptBlocks: currentSaycodePromptBlocks,
+                effort: currentEffort,
+            },
+            queue: messageQueue,
+            attachments: [],
+        });
+        logger.debug('[managed] Follow-up turn queued');
+        return { accepted: true };
+    });
+
     session.rpcHandlerManager.registerHandler('goal-action', async (params: Record<string, unknown>) => {
         const command = parseCodexGoalActionParams(params);
         if (!command) {

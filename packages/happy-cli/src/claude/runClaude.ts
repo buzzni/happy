@@ -62,6 +62,8 @@ import {
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
+import { buildInitialPromptUserRecord } from '@/utils/initialPrompt';
+import { createManagedFollowUpGate, parseManagedFollowUp } from '@/managed/managedFollowUp';
 import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import {
     createSessionModelPinPublisher,
@@ -770,6 +772,30 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         allowedTools: currentAllowedTools,
         disallowedTools: currentDisallowedTools,
         effort: currentEffort,
+    });
+
+    /**
+     * The next turn of a managed session, relayed by the server on a
+     * `message-send` bearer's behalf (T07-L5-b). A managed run answers the
+     * prompt it was admitted for; this is how the person continues it without
+     * a new admission: **text only**, queued with exactly the options the run
+     * already has. Whatever else the sealed payload carries is not read.
+     *
+     * The answer says whether the turn was taken, not whether it ran — that is
+     * in the receipt. A retry of one send (same client id) is one turn.
+     */
+    const managedFollowUpGate = createManagedFollowUpGate();
+    session.rpcHandlerManager.registerHandler('follow-up', async (params: unknown) => {
+        if (!managedStartup) return { accepted: false, reason: 'not-managed' };
+        const parsed = parseManagedFollowUp(params);
+        if (!parsed.ok) return { accepted: false, reason: parsed.reason };
+        if (managedFollowUpGate.take(parsed.localId) === 'duplicate') return { accepted: true, duplicate: true };
+        // The visible user row, so the transcript shows the turn where it came from.
+        recordAppPrompt(parsed.text);
+        session.sendClaudeSessionMessage(buildInitialPromptUserRecord(parsed.text, session.sessionId), parsed.localId);
+        messageQueue.push(parsed.text, currentEnhancedMode(), []);
+        logger.debug('[managed] Follow-up turn queued');
+        return { accepted: true };
     });
 
     session.rpcHandlerManager.registerHandler('goal-action', async (params: unknown) => {
