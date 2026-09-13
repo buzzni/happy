@@ -1326,6 +1326,14 @@ export async function startDaemon(): Promise<void> {
         tokens: trackedSession.runtime.providerTokens,
         lastTurnEndAt: trackedSession.runtime.lastTurnEndAt,
       });
+      // The same merged report, on the managed receipt (L1b). Verified above.
+      managedNoteSessionRuntime?.(sessionId, {
+        ...(trackedSession.runtime.assistantTurns !== undefined ? { assistantTurns: trackedSession.runtime.assistantTurns } : {}),
+        ...(trackedSession.runtime.lastTurnEndAt !== undefined ? { lastTurnEndAt: trackedSession.runtime.lastTurnEndAt } : {}),
+        thinking: trackedSession.runtime.thinking ?? false,
+        hasOpenToolCall: trackedSession.runtime.hasOpenToolCall ?? false,
+        pendingUserInput: trackedSession.runtime.pendingUserInput ?? false,
+      });
 
       // The cursor only exists in memory until something writes it. A daemon
       // killed without its clean-stop handlers takes it to the grave and the
@@ -2770,6 +2778,8 @@ export async function startDaemon(): Promise<void> {
     // Handle child process exit — preserve session data for resume
     const onChildExited = (pid: number) => {
       const tracked = pidToTrackedSession.get(pid);
+      // A managed attempt's child is gone: its receipt becomes terminal (L1b).
+      managedNoteChildExited?.(pid);
       if (tracked?.happySessionId) autonomousQualityGateRegistry.noteSessionStopped(tracked.happySessionId);
       const preservedForResume = tracked ? preserveSessionForResume(tracked, `process-exit:${pid}`) : false;
       if (!preservedForResume) {
@@ -3118,6 +3128,16 @@ export async function startDaemon(): Promise<void> {
       }
       : null;
     let managedLeaseWatchdog: ReturnType<typeof setInterval> | null = null;
+    /**
+     * T07-L1b: the managed receipt learns what the daemon already knows about
+     * its child — verified runtime reports (turns, idle) and the pid vanishing.
+     * Assigned once the handlers exist; before that there is no receipt to tell.
+     */
+    let managedNoteSessionRuntime: ((sessionId: string, report: {
+      assistantTurns?: number; lastTurnEndAt?: number;
+      thinking: boolean; hasOpenToolCall: boolean; pendingUserInput: boolean;
+    }) => void) | null = null;
+    let managedNoteChildExited: ((pid: number) => void) | null = null;
     /** Drains every in-flight managed operation; set once the handlers exist. */
     let managedDrainLeaseWork: (() => Promise<void>) | null = null;
     /** Refuses new managed RPC entries; set once the handlers exist. */
@@ -3460,6 +3480,8 @@ export async function startDaemon(): Promise<void> {
       // the constructor already registered and intercepts the rest.
       apiMachine.setManagedRuntime(managedHandlers);
       managedDrainLeaseWork = () => managedHandlers.drainLeaseWork();
+      managedNoteSessionRuntime = (sessionId, report) => managedHandlers.noteSessionRuntime(sessionId, report);
+      managedNoteChildExited = (pid) => managedHandlers.noteChildExited(pid);
       managedCloseEntries = () => {
         managedHandlers.closeEntries();
         // A pending login is a child process and a verifier held in memory.

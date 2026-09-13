@@ -401,6 +401,14 @@ function receiptView(receipt: ManagedReceipt, runtime: ManagedRuntime) {
         stopRequested: receipt.stopRequestedAt !== null,
         certainty: classifyManagedReceipt(receipt, runtime.isPidAlive),
         updatedAt: receipt.updatedAt,
+        // Terminal evidence (T07-L1b). Three separate facts; the parent maps them.
+        failureReason: receipt.failureReason,
+        stopCause: receipt.stopCause,
+        turnCount: receipt.turnCount,
+        lastTurnEndAt: receipt.lastTurnEndAt,
+        idle: receipt.idle,
+        exitAt: receipt.exitAt,
+        exitProof: receipt.exitProof,
     };
 }
 
@@ -1042,7 +1050,7 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
                 // No pid yet. The spawn path consumes this flag once it has one,
                 // but a persisted `spawning` row from a previous process may
                 // already have a live child, so the backend is asked as well.
-                const marked = runtime.store.update(key, { stopRequestedAt: runtime.now() }, runtime.now());
+                const marked = runtime.store.update(key, { stopRequestedAt: runtime.now(), stopCause: 'parent-stop' }, runtime.now());
                 const { evidence, backendStop } = await stopAttempt(marked);
                 return {
                     stopIntentRecorded: true,
@@ -1065,7 +1073,7 @@ export function createManagedRpcHandlers(runtime: ManagedRuntime) {
             }
 
             const marked = runtime.store.update(key, {
-                state: 'stopping', stopRequestedAt: runtime.now(),
+                state: 'stopping', stopRequestedAt: runtime.now(), stopCause: 'parent-stop',
             }, runtime.now());
             const { evidence, backendStop } = await stopAttempt(marked);
             // Three separate facts, never collapsed:
@@ -1437,6 +1445,62 @@ const aiAuthRpc = async (params: unknown) => {
         'ai-auth': (params: unknown) => trackRpc(aiAuthRpc(params)),
 
         /**
+         * A verified runtime report from the child of a managed attempt
+         * (T07-L1b). Records what the parent needs to tell "turn finished" from
+         * "still running": turns completed, when the last one ended, whether
+         * the child is idle. Nothing here is a terminal state.
+         */
+        noteSessionRuntime(sessionId: string, report: {
+            assistantTurns?: number;
+            lastTurnEndAt?: number;
+            thinking: boolean;
+            hasOpenToolCall: boolean;
+            pendingUserInput: boolean;
+        }): void {
+            const receipt = runtime.store.list().receipts.find((r) => (
+                r.sessionId === sessionId && (r.state === 'running' || r.state === 'stopping')
+            ));
+            if (!receipt) return;
+            const turnCount = report.assistantTurns !== undefined
+                ? Math.max(report.assistantTurns, receipt.turnCount ?? 0)
+                : receipt.turnCount;
+            const lastTurnEndAt = report.lastTurnEndAt !== undefined
+                ? Math.max(report.lastTurnEndAt, receipt.lastTurnEndAt ?? 0)
+                : receipt.lastTurnEndAt;
+            const idle = !report.thinking && !report.hasOpenToolCall && !report.pendingUserInput;
+            if (turnCount === receipt.turnCount && lastTurnEndAt === receipt.lastTurnEndAt && idle === receipt.idle) return;
+            try {
+                runtime.store.update(receipt.requestKey, { turnCount, lastTurnEndAt, idle }, runtime.now());
+            } catch {
+                // The writer lock is gone or the file changed under us; the next
+                // report tries again. A missed note is not a lost fact.
+                logger.debug('[managed] could not record session runtime on a receipt');
+            }
+        },
+
+        /**
+         * The child process of a managed attempt is gone (T07-L1b). The receipt
+         * becomes `stopped` with `exitProof: 'pid-reap'` — the only terminal
+         * proof this daemon issues; a backend generation proof keeps the stop
+         * obligation retrying and is not a per-attempt exit. Whether the exit
+         * was a stop, a lease lapse or unasked is in `stopCause`, and whether a
+         * turn had finished is in the turn fields. The parent reads all three.
+         */
+        noteChildExited(pid: number): void {
+            const receipt = runtime.store.list().receipts.find((r) => (
+                r.pid === pid && (r.state === 'spawned' || r.state === 'running' || r.state === 'stopping')
+            ));
+            if (!receipt) return;
+            try {
+                runtime.store.update(receipt.requestKey, {
+                    state: 'stopped', exitAt: runtime.now(), exitProof: 'pid-reap',
+                }, runtime.now());
+            } catch {
+                logger.debug('[managed] could not record child exit on a receipt');
+            }
+        },
+
+        /**
          * Reports what this runtime is, and what it currently holds.
          *
          * A reading. It renews nothing and advances nothing — the parent polls
@@ -1669,7 +1733,7 @@ const aiAuthRpc = async (params: unknown) => {
                 // after its lease expired stops itself.
                 const marked = receipt.stopRequestedAt === null
                     ? runtime.store.update(
-                        receipt.requestKey, { stopRequestedAt: runtime.now() }, runtime.now(),
+                        receipt.requestKey, { stopRequestedAt: runtime.now(), stopCause: 'lease-expired' }, runtime.now(),
                     )
                     : receipt;
                 const { backendStop } = await stopAttempt(marked);

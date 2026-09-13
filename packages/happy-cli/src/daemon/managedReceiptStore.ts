@@ -67,6 +67,22 @@ export type ManagedReceipt = {
     /** Set when a stop lands while the spawn is still in flight. */
     stopRequestedAt: number | null;
     failureReason: string | null;
+    /**
+     * Terminal evidence (T07-L1b). Each is `null` until observed; an older
+     * receipt file without them parses as all-null. They are separate axes on
+     * purpose — a turn that ended, a process that is gone, and *why* it was
+     * asked to stop are three facts, and the parent maps them, not this file.
+     */
+    /** Who asked for the stop: the parent's `managed:stop`, or lease maintenance. */
+    stopCause: 'parent-stop' | 'lease-expired' | null;
+    /** From the child's verified runtime reports: assistant turns completed, when the last one ended. */
+    turnCount: number | null;
+    lastTurnEndAt: number | null;
+    /** Last verified report said: not thinking, no open tool call, not waiting on input. */
+    idle: boolean | null;
+    /** The child process is gone: this daemon saw the pid vanish. */
+    exitAt: number | null;
+    exitProof: 'pid-reap' | null;
     claimedAt: number;
     spawnAt: number | null;
     updatedAt: number;
@@ -147,7 +163,38 @@ function parseReceipt(raw: unknown, expectedRequestKey: string): ManagedReceipt 
     if (typeof r.workspaceId !== 'string' || !r.workspaceId) return null;
     if (typeof r.projectId !== 'string' || !r.projectId) return null;
     if (!isNullableString(r.spawnPayloadDigest)) return null;
-    return r as unknown as ManagedReceipt;
+    // Terminal evidence: absent on receipts written before it existed. Absent
+    // and null mean the same thing; a present value must be well-formed.
+    const evidence = normalizeTerminalEvidence(r);
+    if (evidence === null) return null;
+    return { ...(r as unknown as ManagedReceipt), ...evidence };
+}
+
+const STOP_CAUSES = new Set(['parent-stop', 'lease-expired']);
+const EXIT_PROOFS = new Set(['pid-reap']);
+
+function normalizeTerminalEvidence(r: Record<string, unknown>): Pick<ManagedReceipt,
+    'stopCause' | 'turnCount' | 'lastTurnEndAt' | 'idle' | 'exitAt' | 'exitProof'> | null {
+    const stopCause = r.stopCause ?? null;
+    if (stopCause !== null && !(typeof stopCause === 'string' && STOP_CAUSES.has(stopCause))) return null;
+    const turnCount = r.turnCount ?? null;
+    if (turnCount !== null && !(Number.isSafeInteger(turnCount) && (turnCount as number) >= 0)) return null;
+    const lastTurnEndAt = r.lastTurnEndAt ?? null;
+    if (!isNullableTimestamp(lastTurnEndAt)) return null;
+    const idle = r.idle ?? null;
+    if (idle !== null && typeof idle !== 'boolean') return null;
+    const exitAt = r.exitAt ?? null;
+    if (!isNullableTimestamp(exitAt)) return null;
+    const exitProof = r.exitProof ?? null;
+    if (exitProof !== null && !(typeof exitProof === 'string' && EXIT_PROOFS.has(exitProof))) return null;
+    return {
+        stopCause: stopCause as ManagedReceipt['stopCause'],
+        turnCount: turnCount as number | null,
+        lastTurnEndAt: lastTurnEndAt as number | null,
+        idle: idle as boolean | null,
+        exitAt: exitAt as number | null,
+        exitProof: exitProof as ManagedReceipt['exitProof'],
+    };
 }
 
 function parseLease(raw: unknown): ManagedLeaseRecord | null {
@@ -339,6 +386,12 @@ export function createManagedReceiptStore(root: string, lock: ManagedStoreLock) 
                 sessionId: null,
                 stopRequestedAt: null,
                 failureReason: null,
+                stopCause: null,
+                turnCount: null,
+                lastTurnEndAt: null,
+                idle: null,
+                exitAt: null,
+                exitProof: null,
                 claimedAt: input.now,
                 spawnAt: null,
                 updatedAt: input.now,
@@ -371,6 +424,12 @@ export function createManagedReceiptStore(root: string, lock: ManagedStoreLock) 
                 sessionId: null,
                 stopRequestedAt: input.now,
                 failureReason: null,
+                stopCause: 'parent-stop',
+                turnCount: null,
+                lastTurnEndAt: null,
+                idle: null,
+                exitAt: null,
+                exitProof: null,
                 claimedAt: input.now,
                 spawnAt: null,
                 updatedAt: input.now,

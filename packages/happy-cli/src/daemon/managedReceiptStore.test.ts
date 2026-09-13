@@ -288,6 +288,45 @@ describe('update', () => {
     });
 });
 
+describe('terminal evidence fields (T07-L1b)', () => {
+    it('reads a receipt written before the fields existed as all-null evidence', () => {
+        const root = mkdtempSync(join(tmpdir(), 'managed-receipt-'));
+        try {
+            const store = createManagedReceiptStore(root, { assertHeld: () => {} });
+            const key = managedOperationKey({ runId: 'run-1', attemptId: 'attempt-1' });
+            const claimed = store.claim({ requestKey: key, runId: 'run-1', attemptId: 'attempt-1', epoch: 0, now: 1 });
+            if (claimed.kind !== 'created') throw new Error('claim failed');
+            // 옛 파일: 새 필드가 아예 없다.
+            const legacy = { ...claimed.receipt } as Record<string, unknown>;
+            for (const field of ['stopCause', 'turnCount', 'lastTurnEndAt', 'idle', 'exitAt', 'exitProof']) delete legacy[field];
+            writeFileSync(join(root, 'receipts', managedReceiptFileName(key)), JSON.stringify(legacy));
+            const read = store.read(key);
+            expect(read.kind).toBe('ok');
+            if (read.kind === 'ok') {
+                expect(read.receipt).toMatchObject({ stopCause: null, turnCount: null, lastTurnEndAt: null, idle: null, exitAt: null, exitProof: null });
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it('rejects a receipt whose evidence is malformed rather than reading it as null', () => {
+        const root = mkdtempSync(join(tmpdir(), 'managed-receipt-'));
+        try {
+            const store = createManagedReceiptStore(root, { assertHeld: () => {} });
+            const key = managedOperationKey({ runId: 'run-1', attemptId: 'attempt-1' });
+            const claimed = store.claim({ requestKey: key, runId: 'run-1', attemptId: 'attempt-1', epoch: 0, now: 1 });
+            if (claimed.kind !== 'created') throw new Error('claim failed');
+            for (const bad of [{ stopCause: 'user' }, { turnCount: -1 }, { idle: 'yes' }, { exitProof: 'guess' }]) {
+                writeFileSync(join(root, 'receipts', managedReceiptFileName(key)), JSON.stringify({ ...claimed.receipt, ...bad }));
+                expect(store.read(key).kind).toBe('unknown');
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+});
+
 describe('classifyManagedReceipt', () => {
     const base = {
         version: 1 as const,
@@ -303,6 +342,12 @@ describe('classifyManagedReceipt', () => {
         sessionId: null,
         stopRequestedAt: null,
         failureReason: null,
+        stopCause: null,
+        turnCount: null,
+        lastTurnEndAt: null,
+        idle: null,
+        exitAt: null,
+        exitProof: null,
         claimedAt: 1,
         spawnAt: null,
         updatedAt: 1,

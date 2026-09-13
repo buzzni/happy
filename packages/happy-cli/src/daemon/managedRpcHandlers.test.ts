@@ -418,6 +418,60 @@ describe('lease expiry does not silently leave a child running', () => {
     });
 });
 
+describe('terminal evidence (T07-L1b)', () => {
+    it('starts every axis at null and exposes them on the view', async () => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        const view = (await handlers.receipt(call('query', {}))).receipts[0]!;
+        expect(view).toMatchObject({
+            state: 'running', failureReason: null, stopCause: null, turnCount: null,
+            lastTurnEndAt: null, idle: null, exitAt: null, exitProof: null,
+        });
+    });
+
+    it('records verified runtime reports as turns and idleness, monotonically', async () => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        handlers.noteSessionRuntime('sess-1', { assistantTurns: 1, lastTurnEndAt: NOW + 5_000, thinking: false, hasOpenToolCall: false, pendingUserInput: false });
+        let view = (await handlers.receipt(call('query', {}))).receipts[0]!;
+        expect(view).toMatchObject({ state: 'running', turnCount: 1, lastTurnEndAt: NOW + 5_000, idle: true });
+        // 늦게 도착한 옛 보고는 turn 을 되돌리지 않는다; thinking 은 idle 을 끈다.
+        handlers.noteSessionRuntime('sess-1', { assistantTurns: 0, lastTurnEndAt: NOW + 1_000, thinking: true, hasOpenToolCall: false, pendingUserInput: false });
+        view = (await handlers.receipt(call('query', {}))).receipts[0]!;
+        expect(view).toMatchObject({ turnCount: 1, lastTurnEndAt: NOW + 5_000, idle: false });
+        // 모르는 세션의 보고는 아무 receipt 도 바꾸지 않는다.
+        handlers.noteSessionRuntime('sess-other', { assistantTurns: 9, thinking: false, hasOpenToolCall: false, pendingUserInput: false });
+        expect((await handlers.receipt(call('query', {}))).receipts[0]!.turnCount).toBe(1);
+    });
+
+    it('turns the receipt stopped with pid-reap proof when the child pid is gone; the stop cause stays what it was', async () => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        handlers.noteChildExited(4242);
+        const view = (await handlers.receipt(call('query', {}))).receipts[0]!;
+        expect(view).toMatchObject({ state: 'stopped', exitProof: 'pid-reap', stopCause: null, certainty: 'determinate' });
+        expect(view.exitAt).toBe(wallClock);
+        // 다른 pid 는 무시한다; 이미 stopped 인 receipt 도 다시 쓰지 않는다.
+        const before = view.updatedAt;
+        wallClock += 1_000;
+        handlers.noteChildExited(4242);
+        handlers.noteChildExited(9999);
+        expect((await handlers.receipt(call('query', {}))).receipts[0]!.updatedAt).toBe(before);
+    });
+
+    it('a parent stop records its cause before the child is reaped', async () => {
+        await grantLease();
+        await handlers.spawn(call('spawn', envelope()));
+        livePgids.add(4242);
+        await handlers.stop(call('stop', {}));
+        let view = (await handlers.receipt(call('query', {}))).receipts[0]!;
+        expect(view).toMatchObject({ state: 'stopping', stopCause: 'parent-stop', stopRequested: true });
+        handlers.noteChildExited(4242);
+        view = (await handlers.receipt(call('query', {}))).receipts[0]!;
+        expect(view).toMatchObject({ state: 'stopped', stopCause: 'parent-stop', exitProof: 'pid-reap' });
+    });
+});
+
 describe('receipt query', () => {
     it('returns only the signed run and attempt scope', async () => {
         await grantLease();
