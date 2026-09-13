@@ -30,6 +30,22 @@ import { inTx } from '@/storage/inTx';
 /** Postgres unique violation, as Prisma reports it. */
 const UNIQUE_VIOLATION = 'P2002';
 
+/**
+ * How long the generation a renewal superseded may still act.
+ *
+ * The renewed credential is delivered to the daemon as an RPC over the machine
+ * socket that authenticated with the *previous* credential, and that socket is
+ * re-authorised on every outbound request and every inbound event. Refusing the
+ * previous generation the instant the renewal lands therefore refuses the
+ * delivery — and its acknowledgement — and the daemon can never learn the
+ * credential that would let it back in.
+ *
+ * Five minutes covers the delivery, the daemon's heartbeat that applies it and
+ * the reconnect. It is not a revocation delay: a revocation ignores it, and the
+ * previous credential's own expiry still bounds it.
+ */
+export const MANAGED_DAEMON_RENEWAL_GRACE_MS = 5 * 60_000;
+
 /** The subset of the client both a transaction and the root client provide. */
 type TransactionClient = {
     managedDaemonGrant: typeof db.managedDaemonGrant;
@@ -288,6 +304,9 @@ export async function renewManagedDaemonGrant(input: {
                 expiresAt: BigInt(input.expiresAt),
                 renewalRequestId: input.requestId,
                 renewalBodyDigest: digest,
+                // The generation being superseded stays usable long enough to
+                // be told about its successor. See the constant.
+                supersededGraceUntil: BigInt(input.now + MANAGED_DAEMON_RENEWAL_GRACE_MS),
                 updatedAt: BigInt(input.now),
             },
         });
@@ -359,8 +378,16 @@ export async function resolveManagedDaemonGrant(input: {
     if (existing.revokedAt !== null) return { ok: false, reason: 'revoked' };
     if (BigInt(input.now) >= existing.expiresAt) return { ok: false, reason: 'expired' };
     // A renewal supersedes the credential in place. Nothing can un-sign the one
-    // minted before it, so this is what makes it unusable.
-    if (existing.generation !== input.generation) return { ok: false, reason: 'stale-generation' };
+    // minted before it, so this is what makes it unusable — after the grace in
+    // which the renewal itself is delivered over the superseded credential's
+    // socket. Only the generation directly before the current one, and only
+    // until the moment the renewal recorded.
+    if (existing.generation !== input.generation) {
+        const withinGrace = input.generation === existing.generation - 1
+            && existing.supersededGraceUntil !== null
+            && BigInt(input.now) < existing.supersededGraceUntil;
+        if (!withinGrace) return { ok: false, reason: 'stale-generation' };
+    }
 
     const row = toRow(existing);
     const claims = input.claims;

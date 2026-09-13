@@ -2,7 +2,8 @@
  * The last check before a request leaves for a managed runtime.
  *
  * A socket's authority is not a property of the connection: the grant behind it
- * can be withdrawn, superseded by a renewal, or expire, and none of those close
+ * can be withdrawn, superseded by a renewal (after the grace in which the
+ * renewal is delivered over this socket), or expire, and none of those close
  * the TCP connection. Between the moment a request picks its target and the
  * moment the bytes go out, any of them can have happened — and a daemon whose
  * grant is gone is exactly the daemon that must not be handed more work.
