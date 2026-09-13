@@ -73,6 +73,43 @@ export function buildSessionSpawnEnvironment(
     }
 }
 
+/**
+ * The Saycode agent capability is supplied per spawn, not inherited.
+ *
+ * A spawn request carries it in two legitimate cases: the client seeds a root
+ * (depth 0) session, and `happy agent spawn` seeds a child (depth + 1) through
+ * this same daemon RPC. Scrubbing it with the rest of the lineage left every
+ * session without the capability while the orchestration prompt still told it
+ * to use `happy agent` — 2026-09-13, `not_agent_env` everywhere.
+ *
+ * Only these keys, with values saycode-cli can actually use, pass through; a
+ * grant that fails any check is dropped whole. A partial grant is worse than
+ * none: SAYCODE_AGENT_ENV without a usable root fails isAgentEnv anyway, and a
+ * rejected scope would silently shrink the tree the session can see.
+ */
+const DIRECTORY_VALUE = /^(\/|[A-Za-z]:[\\/]|\\\\)/
+const COUNT_VALUE = /^\d{1,9}$/
+const AGENT_ID_VALUE = /^[A-Za-z0-9_-]{1,64}$/
+
+function readRequestedSaycodeAgentGrant(
+    requested: Record<string, string>,
+): SaycodeAgentEnvironment | undefined {
+    if (requested.SAYCODE_AGENT_ENV !== '1') return undefined
+    const isValid = (key: SaycodeAgentEnvironmentKey, pattern: RegExp): boolean => {
+        const value = requested[key]
+        return value === undefined || pattern.test(value.trim())
+    }
+    const root = requested.SAYCODE_AGENT_ROOT?.trim()
+    if (!root || !DIRECTORY_VALUE.test(root)) return undefined
+    if (!isValid('SAYCODE_AGENT_SCOPE', DIRECTORY_VALUE)) return undefined
+    if (!isValid('SAYCODE_AGENT_DEPTH', COUNT_VALUE)) return undefined
+    if (!isValid('SAYCODE_AGENT_MAX_SPAWN', COUNT_VALUE)) return undefined
+    if (!isValid('SAYCODE_AGENT_ID', AGENT_ID_VALUE)) return undefined
+    return Object.fromEntries(
+        SAYCODE_AGENT_ENV_KEYS.flatMap((key) => requested[key] === undefined ? [] : [[key, requested[key]]]),
+    )
+}
+
 /** Keeps request-supplied project env from impersonating daemon-owned session state. */
 export function buildSpawnRequestEnvironment(
     auth: Record<string, string>,
@@ -80,6 +117,7 @@ export function buildSpawnRequestEnvironment(
 ): Record<string, string> {
     return {
         ...scrubSessionLineageEnv(requested ?? {}),
+        ...readRequestedSaycodeAgentGrant(requested ?? {}),
         ...auth,
     }
 }
