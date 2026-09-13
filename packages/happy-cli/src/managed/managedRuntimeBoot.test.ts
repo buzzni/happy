@@ -601,6 +601,26 @@ describe('the project root, before the identity is resolved', () => {
     });
 });
 
+describe('the provider instance this runtime reports', () => {
+    it('reads the machine version, not the alloc id, as the instance', () => {
+        // Fly sets FLY_ALLOC_ID to the machine id and carries the machine's
+        // version — what the Machines API calls `instance_id`, the value the
+        // parent recorded at creation — in FLY_MACHINE_VERSION. Reporting the
+        // alloc id made every first run an identity mismatch.
+        vi.stubEnv('FLY_MACHINE_ID', '81561eb9599e18');
+        vi.stubEnv('FLY_ALLOC_ID', '81561eb9599e18');
+        vi.stubEnv('FLY_MACHINE_VERSION', '01M2C4QGCF0TR5APSHJX4095R7');
+        try {
+            expect(defaultManagedRuntimeBootDeps().providerInstance()).toEqual({
+                providerMachineId: '81561eb9599e18',
+                providerInstanceId: '01M2C4QGCF0TR5APSHJX4095R7',
+            });
+        } finally {
+            vi.unstubAllEnvs();
+        }
+    });
+});
+
 describe('the delivered credential\'s mode, before anything reads it', () => {
     /*
      * The provider writes the file and chooses its mode. Every read of it is
