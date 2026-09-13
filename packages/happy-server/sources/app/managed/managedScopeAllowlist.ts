@@ -379,6 +379,25 @@ export function authorizeManagedRpcName(input: {
     return deny('purpose-not-allowed');
 }
 
+/**
+ * Which relayed RPC a browser-side purpose may author.
+ *
+ * The HTTP route already gated the request by purpose; this is the same
+ * binding read again **where the emit happens**, on the replica holding the
+ * socket, after the wait. Without it the emit-time check knew only the
+ * approval purpose, and every authorised next turn died there with the run
+ * reported as unavailable. One purpose, one RPC: an approver answers prompts,
+ * a sender authors the next turn, and neither reaches the other's handler.
+ */
+export function authorizeManagedRelay(input: {
+    purpose: SessionScopedPurpose;
+    rpcName: string;
+}): ManagedScopeDecision {
+    if (input.purpose === 'approval-control' && input.rpcName === 'permission') return ALLOW;
+    if (input.purpose === 'message-send' && input.rpcName === 'follow-up') return ALLOW;
+    return deny('purpose-not-allowed');
+}
+
 /** Exposed so a coverage test can compare the list against real consumers. */
 export const MANAGED_SCOPE_SURFACE = {
     routes: ALLOWED_ROUTES.map((route) => `${route.method} /${route.segments.join('/')}`),

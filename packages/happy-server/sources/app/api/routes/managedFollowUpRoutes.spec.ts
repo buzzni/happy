@@ -535,6 +535,57 @@ describe.skipIf(!enabled)('sending the next turn (real Fastify + PostgreSQL)', (
         });
     });
 
+    describe('the check on the way out', () => {
+        /*
+         * The route authorises the request; the packet is emitted somewhere
+         * else, possibly on another replica, after a wait. The channel re-reads
+         * the sender's authority there — and it has to know that a message-send
+         * bearer may author a `follow-up`, or every authorised turn dies at the
+         * emit with the route reporting the run as unavailable.
+         */
+        it('relays the next turn while the message-send grant is live', async () => {
+            const child = connectRealChild();
+            const response = await answer({ token: approverToken });
+            expect(response.statusCode).toBe(200);
+            expect(response.json()).toEqual({ relayed: true, response: 'child-answer-ciphertext' });
+            expect(child.emitted).toHaveLength(1);
+            expect(child.emitted[0].event).toBe('rpc-request');
+        });
+
+        it('emits nothing when the sender is withdrawn while the packet waits', async () => {
+            const child = connectRealChild({
+                duringCheck: async () => {
+                    await db.managedSessionGrant.updateMany({
+                        where: { grantId: approvalGrantId },
+                        data: { revokedAt: BigInt(Date.now()), revokedReason: 'sender-removed' },
+                    });
+                },
+            });
+            const response = await answer({ token: approverToken });
+            expect(child.emitted).toEqual([]);
+            expect(response.statusCode).toBe(503);
+            expect(response.json().relayed).toBeUndefined();
+        });
+
+        it('emits nothing when the run\'s attempt moved on while the packet waited', async () => {
+            const child = connectRealChild({
+                duringCheck: async () => {
+                    await modules.projection.syncRunAuthority({
+                        body: {
+                            runId, workspaceId, accountId: ownerAccountId,
+                            currentAttemptId: 'attempt-2', cancelled: false,
+                        },
+                        expectedVersion: 1,
+                        now: Date.now(),
+                    });
+                },
+            });
+            const response = await answer({ token: approverToken });
+            expect(child.emitted).toEqual([]);
+            expect(response.statusCode).toBe(503);
+        });
+    });
+
     describe('a purpose that may not author the next turn', () => {
         it('refuses an approver: deciding prompts is not authoring the next turn', async () => {
             connectChild();

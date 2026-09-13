@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
     MANAGED_SCOPE_SURFACE,
     authorizeManagedHttpRequest,
+    authorizeManagedRelay,
     authorizeManagedRpcName,
     authorizeManagedSocketEvent,
 } from '@/app/managed/managedScopeAllowlist';
@@ -391,5 +392,22 @@ describe('what each purpose may reach', () => {
                 event: 'session-stream', payload: { sid: SESSION }, sessionId: SESSION, purpose,
             })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
         }
+    });
+});
+
+describe('what each purpose may relay, read again at the emit', () => {
+    it('binds one purpose to one RPC', () => {
+        expect(authorizeManagedRelay({ purpose: 'approval-control', rpcName: 'permission' })).toEqual({ ok: true });
+        expect(authorizeManagedRelay({ purpose: 'message-send', rpcName: 'follow-up' })).toEqual({ ok: true });
+    });
+
+    it.each([
+        ['an approver authoring the next turn', 'approval-control', 'follow-up'],
+        ['a sender answering a prompt', 'message-send', 'permission'],
+        ['a reader relaying anything', 'transcript-read', 'permission'],
+        ['the runner relaying to itself', 'runner', 'follow-up'],
+        ['a sender reaching the run\'s own work', 'message-send', 'bash'],
+    ] as const)('refuses %s', (_name, purpose, rpcName) => {
+        expect(authorizeManagedRelay({ purpose, rpcName })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
     });
 });

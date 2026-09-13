@@ -8,8 +8,13 @@ import {
     executeManagedRpcLocally,
     locateManagedRpcTargets,
     MANAGED_RPC_DEADLINE_MS,
+    MANAGED_RPC_EXECUTE_EVENT,
+    MANAGED_RPC_LOCATE_EVENT,
+    MANAGED_RPC_RESULT_EVENT,
     dispatchManagedRpc,
     installManagedRelayReceiver,
+    installManagedRpcReceiver,
+    installManagedRpcResultReceiver,
 } from '@/app/api/socket/managed/managedDelivery';
 import { ManagedSocketRegistry } from '@/app/api/socket/managed/managedSocketRegistry';
 import { ManagedOutboundChannel } from '@/app/api/socket/managed/managedOutboundQueue';
@@ -320,5 +325,93 @@ describe('RPC targets exactly one connection', () => {
         // A late answer must not resolve anything a second time.
         expect(() => release?.('too late')).not.toThrow();
         await settle();
+    });
+});
+
+describe('answers from another replica find their own caller', () => {
+    /**
+     * A bus with one remote replica that accepts every execute and answers
+     * only when the test says so, so two calls can be answered out of order.
+     */
+    function clusterBus() {
+        const handlers = new Map<string, (payload: unknown, ack?: (r: unknown) => void) => void>();
+        const executed: Array<{ request: { requestId: string }; correlationId?: string }> = [];
+        const io = {
+            on: (event: string, handler: (payload: unknown, ack?: (r: unknown) => void) => void) => {
+                handlers.set(event, handler);
+            },
+            serverSideEmit: (event: string, payload: unknown, ack?: (err: Error | null, r: unknown[]) => void) => {
+                if (event === MANAGED_RPC_LOCATE_EVENT) ack?.(null, [[{ socketId: 'remote', connectedAt: 1 }]]);
+                if (event === MANAGED_RPC_EXECUTE_EVENT) {
+                    executed.push(payload as (typeof executed)[number]);
+                    ack?.(null, [{ accepted: true }]);
+                }
+            },
+        };
+        installManagedRpcResultReceiver(io as never);
+        const answer = (execute: (typeof executed)[number], result: unknown) => {
+            handlers.get(MANAGED_RPC_RESULT_EVENT)?.({
+                requestId: execute.request.requestId, correlationId: execute.correlationId, result,
+            });
+        };
+        return { io, executed, answer };
+    }
+
+    const request = {
+        sessionId: 'session-1', accountId: 'account-1',
+        rpcName: 'follow-up', requestId: 'req-same', params: { id: 7 },
+    };
+
+    it('keeps two overlapping calls with the same request id apart', async () => {
+        /*
+         * The request id is the client's, and a retry carries the same one.
+         * Keyed by it, the second call took over the first waiter: the first
+         * caller timed out and the second got the first answer.
+         */
+        const bus = clusterBus();
+        const registry = new ManagedSocketRegistry();
+        const first = dispatchManagedRpc(bus.io as never, request, registry, { deadlineMs: 500 });
+        const second = dispatchManagedRpc(bus.io as never, request, registry, { deadlineMs: 500 });
+        await vi.waitFor(() => expect(bus.executed).toHaveLength(2));
+        expect(bus.executed[0].correlationId).not.toBe(bus.executed[1].correlationId);
+        bus.answer(bus.executed[1], { ok: true, result: 'second' });
+        bus.answer(bus.executed[0], { ok: true, result: 'first' });
+        expect(await first).toEqual({ ok: true, result: 'first' });
+        expect(await second).toEqual({ ok: true, result: 'second' });
+    });
+
+    it('answers on the executing side carry the caller\'s correlation id back', async () => {
+        const results: unknown[] = [];
+        const handlers = new Map<string, (payload: unknown, ack?: (r: unknown) => void) => void>();
+        const io = {
+            on: (event: string, handler: (payload: unknown, ack?: (r: unknown) => void) => void) => {
+                handlers.set(event, handler);
+            },
+            serverSideEmit: (event: string, payload: unknown) => {
+                if (event === MANAGED_RPC_RESULT_EVENT) results.push(payload);
+            },
+        };
+        const registry = new ManagedSocketRegistry();
+        registry.add({
+            socketId: 'here', accountId: 'account-1', sessionId: 'session-1', grantId: 'g', runId: 'run-1',
+            attemptId: 'attempt-1', rpcNames: new Set(['follow-up']), connectedAt: 1,
+            channel: new ManagedOutboundChannel(
+                {
+                    emit: (_event, ...args) => {
+                        const ack = args[args.length - 1] as (v: unknown) => void;
+                        ack('answer');
+                        return true;
+                    },
+                    disconnect: () => undefined,
+                },
+                async () => ({ ok: true }),
+            ),
+        });
+        installManagedRpcReceiver(io as never, registry);
+        handlers.get(MANAGED_RPC_EXECUTE_EVENT)?.(
+            { request, targetSocketId: 'here', correlationId: 'corr-1' }, () => undefined,
+        );
+        await vi.waitFor(() => expect(results).toHaveLength(1));
+        expect(results[0]).toMatchObject({ requestId: 'req-same', correlationId: 'corr-1' });
     });
 });

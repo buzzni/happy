@@ -433,6 +433,15 @@ describe.skipIf(!enabled)('answering a permission prompt (real Fastify + Postgre
     });
 
     describe('a bearer that is not an approver relays nothing', () => {
+        it('refuses a sender: authoring the next turn is not deciding prompts', async () => {
+            connectChild();
+            const senderToken = await mint({ purpose: 'message-send' });
+            const response = await answer({ token: senderToken });
+            expect(response.statusCode).toBe(403);
+            expect(response.json().reason).toBe('purpose-not-allowed');
+            expect(relayed).toEqual([]);
+        });
+
         it('refuses a read bearer', async () => {
             connectChild();
             const readToken = await mint({ purpose: 'transcript-read' });
