@@ -334,7 +334,68 @@ describe.skipIf(!enabled)('managed daemon grants (real PostgreSQL)', () => {
         expect(resolved).toEqual({ ok: false, reason: 'revoked' });
     });
 
-    it('refuses a credential from a superseded generation', async () => {
+    it('keeps the superseded generation usable while the renewal is being delivered', async () => {
+        // The renewed credential travels to the daemon over the socket that
+        // authenticated with the previous one, and that socket is re-checked
+        // on every request. Refused the instant the renewal lands, the
+        // delivery itself is refused and the daemon is locked out for good.
+        const account = await db.account.create({ data: { publicKey: `pk-${randomUUID()}` } });
+        createdAccounts.add(account.id);
+        const machine = await db.machine.create({
+            data: { id: `machine-${randomUUID()}`, accountId: account.id, metadata: '{}' },
+        });
+        createdMachines.add(machine.id);
+        const workspaceId = `ws-${randomUUID()}`;
+        const runtimeId = `runtime-${randomUUID()}`;
+        createdWorkspaces.add(workspaceId);
+        await db.managedWorkspaceAuthority.create({
+            data: {
+                workspaceId, tenantId: 'tenant-1', projectId: 'proj-1',
+                epoch: 3, runtimeId, version: 1, bodyDigest: 'd',
+                createdAt: BigInt(NOW), updatedAt: BigInt(NOW),
+            },
+        });
+        const first = await issue({
+            scope: {
+                ...scope(), accountId: account.id, machineId: machine.id,
+                runtimeId, workspaceId, epoch: 3,
+            },
+        });
+        if (!first.ok) return;
+        await grants.renewManagedDaemonGrant({
+            daemonGrantId: first.grant.daemonGrantId,
+            expectedGeneration: first.grant.generation,
+            expiresAt: NOW + 2 * HOUR,
+            requestId: `req-${randomUUID()}`,
+            now: NOW + 1_000,
+        });
+        const claims = {
+            accountId: first.grant.accountId,
+            machineId: first.grant.machineId,
+            runtimeId: first.grant.runtimeId,
+            provisioningOperationId: first.grant.provisioningOperationId,
+            workspaceId: first.grant.workspaceId,
+            projectId: first.grant.projectId,
+            epoch: first.grant.epoch,
+        };
+        // The previous generation, a minute after the renewal — the daemon's
+        // heartbeat applies a delivered credential within that — is still live.
+        expect(await grants.resolveManagedDaemonGrant({
+            daemonGrantId: first.grant.daemonGrantId,
+            generation: first.grant.generation,
+            now: NOW + 1_000 + 60_000,
+            claims,
+        })).toMatchObject({ ok: true, grant: expect.objectContaining({ generation: first.grant.generation + 1 }) });
+        // And the renewed one, as always.
+        expect(await grants.resolveManagedDaemonGrant({
+            daemonGrantId: first.grant.daemonGrantId,
+            generation: first.grant.generation + 1,
+            now: NOW + 2_000,
+            claims,
+        })).toMatchObject({ ok: true });
+    });
+
+    it('refuses a credential from a superseded generation once the grace has passed', async () => {
         const first = await issue();
         if (!first.ok) return;
         await grants.renewManagedDaemonGrant({
@@ -349,8 +410,55 @@ describe.skipIf(!enabled)('managed daemon grants (real PostgreSQL)', () => {
         expect(await grants.resolveManagedDaemonGrant({
             daemonGrantId: first.grant.daemonGrantId,
             generation: first.grant.generation,
-            now: NOW + 2_000,
+            now: NOW + 1_000 + grants.MANAGED_DAEMON_RENEWAL_GRACE_MS,
         } as never)).toEqual({ ok: false, reason: 'stale-generation' });
+    });
+
+    it('refuses a generation two renewals back even inside the grace', async () => {
+        // The grace names one generation: the one just superseded. A credential
+        // from before that was already outside a grace of its own.
+        const first = await issue();
+        if (!first.ok) return;
+        const second = await grants.renewManagedDaemonGrant({
+            daemonGrantId: first.grant.daemonGrantId,
+            expectedGeneration: first.grant.generation,
+            expiresAt: NOW + 2 * HOUR,
+            requestId: `req-${randomUUID()}`,
+            now: NOW + 1_000,
+        });
+        if (!second.ok) return;
+        await grants.renewManagedDaemonGrant({
+            daemonGrantId: first.grant.daemonGrantId,
+            expectedGeneration: second.grant.generation,
+            expiresAt: NOW + 3 * HOUR,
+            requestId: `req-${randomUUID()}`,
+            now: NOW + 2_000,
+        });
+        expect(await grants.resolveManagedDaemonGrant({
+            daemonGrantId: first.grant.daemonGrantId,
+            generation: first.grant.generation,
+            now: NOW + 3_000,
+        } as never)).toEqual({ ok: false, reason: 'stale-generation' });
+    });
+
+    it('a revocation ignores the renewal grace', async () => {
+        const first = await issue();
+        if (!first.ok) return;
+        await grants.renewManagedDaemonGrant({
+            daemonGrantId: first.grant.daemonGrantId,
+            expectedGeneration: first.grant.generation,
+            expiresAt: NOW + 2 * HOUR,
+            requestId: `req-${randomUUID()}`,
+            now: NOW + 1_000,
+        });
+        await grants.revokeManagedDaemonGrant({
+            daemonGrantId: first.grant.daemonGrantId, reason: 'test', now: NOW + 2_000,
+        });
+        expect(await grants.resolveManagedDaemonGrant({
+            daemonGrantId: first.grant.daemonGrantId,
+            generation: first.grant.generation,
+            now: NOW + 3_000,
+        } as never)).toEqual({ ok: false, reason: 'revoked' });
     });
 
     it('refuses a grant that has passed its own expiry', async () => {

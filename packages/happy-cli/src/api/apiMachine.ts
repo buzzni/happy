@@ -2693,11 +2693,13 @@ export class ApiMachineClient {
      *
      * And the live connection is **not** fine as it is. The server re-reads the
      * grant on every event against the token the handshake carried, and a
-     * renewal supersedes the previous grant the moment it is issued — so a
-     * connection still presenting the old bearer begins being refused
-     * immediately, and is dropped by the server's own revalidation shortly
-     * after. An earlier version of this comment claimed a live socket did not
-     * need the new token; that was wrong, and this is the correction.
+     * renewal supersedes the previous grant — after a short grace in which the
+     * renewal itself is delivered over this very socket (the server's
+     * `MANAGED_DAEMON_RENEWAL_GRACE_MS`). A connection still presenting the
+     * old bearer is refused once that grace ends, and dropped by the server's
+     * own revalidation shortly after. An earlier version of this comment
+     * claimed a live socket did not need the new token; that was wrong, and
+     * this is the correction.
      *
      * So the connection is dropped and the reconnect path brings it back
      * authenticated with the new bearer, re-registering its RPC methods as any

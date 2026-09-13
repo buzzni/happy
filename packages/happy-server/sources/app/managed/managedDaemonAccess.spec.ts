@@ -136,7 +136,10 @@ describe.skipIf(!enabled)('managed daemon access (real PostgreSQL)', () => {
         })).toEqual({ ok: false, reason: 'revoked' });
     });
 
-    it('refuses a credential from a superseded generation', async () => {
+    it('keeps a superseded credential usable while its renewal is being delivered', async () => {
+        // The renewed credential reaches the daemon over the socket that
+        // authenticated with this one, and that socket is re-authorised here
+        // on every request. Refused at once, the delivery is refused too.
         const { issuer, token, scope, grant } = await liveDaemon();
         await grants.renewManagedDaemonGrant({
             daemonGrantId: grant.daemonGrantId,
@@ -146,7 +149,22 @@ describe.skipIf(!enabled)('managed daemon access (real PostgreSQL)', () => {
             now: NOW + 500,
         });
         expect(await access.authorizeManagedDaemonRequest({
-            token, issuer, machineId: scope.machineId, now: NOW + 1_000,
+            token, issuer, machineId: scope.machineId, now: NOW + 500 + 60_000,
+        })).toMatchObject({ ok: true });
+    });
+
+    it('refuses a credential from a superseded generation once the grace has passed', async () => {
+        const { issuer, token, scope, grant } = await liveDaemon();
+        await grants.renewManagedDaemonGrant({
+            daemonGrantId: grant.daemonGrantId,
+            expectedGeneration: grant.generation,
+            expiresAt: NOW + 2 * HOUR,
+            requestId: `req-${randomUUID()}`,
+            now: NOW + 500,
+        });
+        expect(await access.authorizeManagedDaemonRequest({
+            token, issuer, machineId: scope.machineId,
+            now: NOW + 500 + grants.MANAGED_DAEMON_RENEWAL_GRACE_MS,
         })).toEqual({ ok: false, reason: 'stale-generation' });
     });
 

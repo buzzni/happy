@@ -1,0 +1,11 @@
+-- A renewal must not lock out the socket it is delivered over.
+--
+-- The new credential reaches the daemon as an RPC on the machine socket that
+-- authenticated with the previous credential, and every outbound request and
+-- inbound event on that socket re-reads the grant. With the previous generation
+-- refused the instant the renewal lands, the delivery is refused too, and the
+-- daemon can never present the credential that would let it back in.
+--
+-- So a renewal records until when the generation it superseded may still act.
+-- Bounded (`MANAGED_DAEMON_RENEWAL_GRACE_MS`), and a revocation ignores it.
+ALTER TABLE "ManagedDaemonGrant" ADD COLUMN "supersededGraceUntil" BIGINT;
