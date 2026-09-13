@@ -398,6 +398,21 @@ export function authorizeManagedRelay(input: {
     return deny('purpose-not-allowed');
 }
 
+/**
+ * RPCs that exist **only** as a relay of somebody else's authority.
+ *
+ * `follow-up` is authored by a `message-send` bearer through the HTTP route and
+ * nowhere else. Without this list the account socket's legacy `rpc-call` —
+ * the owner's own desktop client — could name the method directly, with no
+ * grant to check at the emit and no revocation to honour. Every dispatch of
+ * these names must carry the relayed claims, or it does not go out.
+ */
+const RELAY_ONLY_RPC_NAMES: readonly string[] = ['follow-up'];
+
+export function managedRpcRequiresRelayAuthority(rpcName: string): boolean {
+    return RELAY_ONLY_RPC_NAMES.includes(rpcName);
+}
+
 /** Exposed so a coverage test can compare the list against real consumers. */
 export const MANAGED_SCOPE_SURFACE = {
     routes: ALLOWED_ROUTES.map((route) => `${route.method} /${route.segments.join('/')}`),

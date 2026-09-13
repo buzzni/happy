@@ -357,9 +357,11 @@ describe('answers from another replica find their own caller', () => {
         return { io, executed, answer };
     }
 
+    // A permission answer: reachable without relayed claims, so these cases
+    // stay about correlation and not about authority.
     const request = {
         sessionId: 'session-1', accountId: 'account-1',
-        rpcName: 'follow-up', requestId: 'req-same', params: { id: 7 },
+        rpcName: 'permission', requestId: 'req-same', params: { id: 7 },
     };
 
     it('keeps two overlapping calls with the same request id apart', async () => {
@@ -374,10 +376,22 @@ describe('answers from another replica find their own caller', () => {
         const second = dispatchManagedRpc(bus.io as never, request, registry, { deadlineMs: 500 });
         await vi.waitFor(() => expect(bus.executed).toHaveLength(2));
         expect(bus.executed[0].correlationId).not.toBe(bus.executed[1].correlationId);
+        // The relayed request id is the correlation id, so a peer of either
+        // version answers under a key this side holds.
+        expect(bus.executed[0].request.requestId).toBe(bus.executed[0].correlationId);
         bus.answer(bus.executed[1], { ok: true, result: 'second' });
         bus.answer(bus.executed[0], { ok: true, result: 'first' });
         expect(await first).toEqual({ ok: true, result: 'first' });
         expect(await second).toEqual({ ok: true, result: 'second' });
+    });
+
+    it('still finds the waiter when a peer that predates the field answers by request id alone', async () => {
+        const bus = clusterBus();
+        const registry = new ManagedSocketRegistry();
+        const pending = dispatchManagedRpc(bus.io as never, request, registry, { deadlineMs: 500 });
+        await vi.waitFor(() => expect(bus.executed).toHaveLength(1));
+        bus.answer({ request: bus.executed[0].request }, { ok: true, result: 'old-peer' });
+        expect(await pending).toEqual({ ok: true, result: 'old-peer' });
     });
 
     it('answers on the executing side carry the caller\'s correlation id back', async () => {
@@ -394,7 +408,7 @@ describe('answers from another replica find their own caller', () => {
         const registry = new ManagedSocketRegistry();
         registry.add({
             socketId: 'here', accountId: 'account-1', sessionId: 'session-1', grantId: 'g', runId: 'run-1',
-            attemptId: 'attempt-1', rpcNames: new Set(['follow-up']), connectedAt: 1,
+            attemptId: 'attempt-1', rpcNames: new Set(['permission']), connectedAt: 1,
             channel: new ManagedOutboundChannel(
                 {
                     emit: (_event, ...args) => {
@@ -413,5 +427,51 @@ describe('answers from another replica find their own caller', () => {
         );
         await vi.waitFor(() => expect(results).toHaveLength(1));
         expect(results[0]).toMatchObject({ requestId: 'req-same', correlationId: 'corr-1' });
+    });
+});
+
+describe('a relay-only RPC without relayed authority goes nowhere', () => {
+    function followUpRegistry() {
+        const registry = new ManagedSocketRegistry();
+        const emitted: unknown[] = [];
+        registry.add({
+            socketId: 'child', accountId: 'account-1', sessionId: 'session-1', grantId: 'g', runId: 'run-1',
+            attemptId: 'attempt-1', rpcNames: new Set(['follow-up']), connectedAt: 1,
+            channel: new ManagedOutboundChannel(
+                { emit: (event, ...args) => { emitted.push(event); return true; }, disconnect: () => undefined },
+                async () => ({ ok: true }),
+            ),
+        });
+        return { registry, emitted };
+    }
+    const bare = {
+        sessionId: 'session-1', accountId: 'account-1',
+        rpcName: 'follow-up', requestId: 'req-1', params: {},
+    };
+
+    it('refuses the dispatch before locating anything', async () => {
+        /*
+         * The owner's own account client can name any method over the legacy
+         * `rpc-call`; that path carries no relayed claims. A follow-up from it
+         * would author a turn with no grant behind it and nothing to revoke.
+         */
+        const { registry, emitted } = followUpRegistry();
+        expect(await dispatchManagedRpc(null, bare, registry, { deadlineMs: 200 }))
+            .toMatchObject({ ok: false, reason: 'unavailable' });
+        expect(emitted).toEqual([]);
+    });
+
+    it('refuses at the socket too, so a bus envelope cannot sidestep the dispatch', () => {
+        const { registry, emitted } = followUpRegistry();
+        expect(executeManagedRpcLocally(bare, 'child', () => {}, registry))
+            .toEqual({ ok: false, reason: 'authority-required' });
+        expect(emitted).toEqual([]);
+    });
+
+    it('lets the same call through with relayed claims attached', () => {
+        const { registry } = followUpRegistry();
+        const claims = { purpose: 'message-send', sessionId: 'session-1', accountId: 'account-1' };
+        expect(executeManagedRpcLocally({ ...bare, approval: { claims: claims as never } }, 'child', () => {}, registry))
+            .toEqual({ ok: true });
     });
 });

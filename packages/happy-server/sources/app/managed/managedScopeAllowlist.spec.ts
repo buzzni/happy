@@ -5,6 +5,7 @@ import {
     authorizeManagedHttpRequest,
     authorizeManagedRelay,
     authorizeManagedRpcName,
+    managedRpcRequiresRelayAuthority,
     authorizeManagedSocketEvent,
 } from '@/app/managed/managedScopeAllowlist';
 
@@ -409,5 +410,14 @@ describe('what each purpose may relay, read again at the emit', () => {
         ['a sender reaching the run\'s own work', 'message-send', 'bash'],
     ] as const)('refuses %s', (_name, purpose, rpcName) => {
         expect(authorizeManagedRelay({ purpose, rpcName })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
+    });
+});
+
+describe('RPCs that only exist as a relay', () => {
+    it('names follow-up and nothing the run or an account client calls on its own', () => {
+        expect(managedRpcRequiresRelayAuthority('follow-up')).toBe(true);
+        // A permission answer has always been reachable by the owner's own client.
+        expect(managedRpcRequiresRelayAuthority('permission')).toBe(false);
+        expect(managedRpcRequiresRelayAuthority('abort')).toBe(false);
     });
 });

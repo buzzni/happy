@@ -22,7 +22,7 @@ import type { Server } from 'socket.io';
 
 import { log } from '@/utils/log';
 import { parseSessionScopedClaims, type SessionScopedClaims } from '@/app/auth/sessionScopedToken';
-import { authorizeManagedRelay } from '@/app/managed/managedScopeAllowlist';
+import { authorizeManagedRelay, managedRpcRequiresRelayAuthority } from '@/app/managed/managedScopeAllowlist';
 import { managedSocketRegistry, type ManagedSocketRegistry } from '@/app/api/socket/managed/managedSocketRegistry';
 import type { ManagedChannelClosure } from '@/app/api/socket/managed/managedOutboundQueue';
 
@@ -208,7 +208,12 @@ export function executeManagedRpcLocally(
     onResponse: (response: ManagedRpcResult) => void,
     registry: ManagedSocketRegistry = managedSocketRegistry,
     expiresAt?: number,
-): { ok: true } | { ok: false; reason: 'no-target' } {
+): { ok: true } | { ok: false; reason: 'no-target' | 'authority-required' } {
+    // A relay-only RPC with nothing to check at the emit is not a call that
+    // was authorised somewhere else; it is a call that skipped the check.
+    if (managedRpcRequiresRelayAuthority(request.rpcName) && !request.approval) {
+        return { ok: false, reason: 'authority-required' };
+    }
     const entry = registry.get(targetSocketId);
     if (!entry
         || entry.sessionId !== request.sessionId
@@ -277,8 +282,7 @@ export function installManagedRpcResultReceiver(io: Pick<Server, 'on'>): void {
         const envelope = payload as { requestId?: unknown; correlationId?: unknown; result?: unknown } | null;
         if (!envelope) return;
         // A replica that predates the correlation id answers by `requestId`
-        // alone; a waiter here is never keyed that way, so such an answer is
-        // simply not for this side and the caller's deadline reports it.
+        // alone — which this side set to the correlation id, so it still lands.
         const key = typeof envelope.correlationId === 'string' ? envelope.correlationId : envelope.requestId;
         if (typeof key !== 'string') return;
         // Unknown ids are normal: every replica sees every result, and only the
@@ -330,6 +334,14 @@ export async function dispatchManagedRpc(
     options: { deadlineMs?: number; locateTimeoutMs?: number } = {},
 ): Promise<ManagedRpcResult> {
     const startedAt = Date.now();
+    /*
+     * Refused before anything is located: the legacy account `rpc-call`, the
+     * owner's own client, reaches this with no relayed claims, and a
+     * `follow-up` from there would author a turn with no grant to revoke.
+     */
+    if (managedRpcRequiresRelayAuthority(request.rpcName) && !request.approval) {
+        return { ok: false, reason: 'unavailable', error: `${request.rpcName} is only reachable through its relay` };
+    }
     const local = locateManagedRpcTargets(request, registry);
     const remote = io ? await locateRemoteTargets(io, request, options.locateTimeoutMs) : [];
     const chosen = chooseManagedRpcTarget([...local, ...remote]);
@@ -361,9 +373,17 @@ export async function dispatchManagedRpc(
      */
     const correlationId = randomUUID();
     pendingResults.set(correlationId, settle);
+    /*
+     * The relayed request carries the correlation id **as its request id** as
+     * well. A replica that predates the field answers by request id alone, and
+     * that answer must still find this waiter; a replica that knows the field
+     * echoes both, and they agree. The child never needed the client's id — its
+     * own dedupe reads the sealed payload, not the transport.
+     */
+    const relayed: ManagedRpcRequest = { ...request, requestId: correlationId };
     (io.serverSideEmit as (ev: string, payload: unknown, ack: (err: Error | null, r: unknown[]) => void) => void)(
         MANAGED_RPC_EXECUTE_EVENT,
-        { request, targetSocketId: chosen.socketId, expiresAt, correlationId },
+        { request: relayed, targetSocketId: chosen.socketId, expiresAt, correlationId },
         (error, responses) => {
             if (error) {
                 // Nobody confirmed acceptance. The effect is unknown, so this
