@@ -246,6 +246,22 @@ describe('readDaemonSessionIdleReaperConfig', () => {
     });
   });
 
+  it('disables the server round-trip on a managed runtime regardless of env', () => {
+    // The candidates route authenticates the caller as an account; a managed
+    // runtime's bearer names a machine grant, not an account, so every tick
+    // would be refused (401) and logged as a fault. The parent owns a managed
+    // run's lifecycle through leases; there is nothing here for it to reap.
+    expect(readDaemonSessionIdleReaperConfig({}, { managedRuntimeActive: true })).toMatchObject({
+      disabled: true,
+    });
+    expect(readDaemonSessionIdleReaperConfig({
+      HAPPY_DAEMON_SESSION_IDLE_REAPER_DISABLED: '0',
+    }, { managedRuntimeActive: true })).toMatchObject({ disabled: true });
+    expect(readDaemonSessionIdleReaperConfig({}, { managedRuntimeActive: false })).toMatchObject({
+      disabled: false,
+    });
+  });
+
   it('allows env to override the per-tick stop batch cap', () => {
     expect(readDaemonSessionIdleReaperConfig({
       HAPPY_DAEMON_SESSION_IDLE_REAPER_BATCH_MAX: '25',
