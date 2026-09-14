@@ -71,6 +71,18 @@ describe('readWorkerConfigFromEnv', () => {
         }).workerModel).toBeUndefined()
     })
 
+    // 'default'/'inherit' 는 여기서 "메인 모델 상속 = 위임 끄기" 라는 뜻이다.
+    // 런타임 정규화가 이를 구체 모델로 번역하면 z.ai 세션에서만 위임이 켜지고
+    // orchestrator 시스템 프롬프트까지 바뀐다. 기존 테스트는 buildWorkerAgents 를
+    // 직접 호출해(정규화를 건너뛰어) 이 조합을 한 번도 밟지 않았다.
+    it('keeps the inherit sentinel intact on Z.AI so delegation stays off', () => {
+        const zaiEnv = { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic' }
+        for (const model of ['default', 'inherit', ' Default ']) {
+            const cfg = readWorkerConfigFromEnv({ ...zaiEnv, HAPPY_WORKER_MODEL: model })
+            expect(buildWorkerAgents(cfg)).toEqual({ delegationPrompt: '' })
+        }
+    })
+
     it('round-trips through buildWorkerAgents from env', () => {
         const cfg = readWorkerConfigFromEnv({ HAPPY_WORKER_MODEL: 'sonnet', HAPPY_WORKER_EFFORT: 'medium' })
         const worker = buildWorkerAgents(cfg).agents![WORKER_AGENT_NAME]
