@@ -82,3 +82,22 @@ describe('MessageMetaSchema modelSource', () => {
     expect(MessageMetaSchema.parse({ modelSource: null }).modelSource).toBe('auto');
   });
 });
+
+describe('MessageMetaSchema axStep', () => {
+  it('accepts office — the chat workspace 문서모드 step', () => {
+    expect(MessageMetaSchema.parse({ axStep: 'office' })).toEqual({ axStep: 'office' });
+  });
+
+  // Same hazard as saycodePromptBlocks above: a strict enum here means a newer app
+  // sending a step this CLI has not learned yet drops the user's turn with no error
+  // anywhere. An unknown step must degrade to "no explicit step", never to silence.
+  it('degrades an unknown step to undefined instead of dropping the message', () => {
+    const parsed = MessageMetaSchema.safeParse({
+      permissionMode: 'default',
+      axStep: 'a-step-from-a-newer-app',
+    });
+    expect(parsed.success).toBe(true);
+    expect(parsed.success && parsed.data.permissionMode).toBe('default');
+    expect(parsed.success && parsed.data.axStep).toBeUndefined();
+  });
+});
