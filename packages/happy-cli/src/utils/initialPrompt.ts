@@ -6,6 +6,7 @@ import { join } from 'node:path'
 
 import type { RawJSONLines } from '@/claude/types'
 import type { PermissionMode } from '@/api/types'
+import { ZAI_CLAUDE_DEFAULT_MODEL } from '@/managed/zaiClaudeEnvironment'
 
 /**
  * Largest prompt we still pass inline as an environment value.
@@ -102,6 +103,7 @@ export function normalizeClaudeModelForRuntime(
 ): string | undefined {
   if (env.ANTHROPIC_BASE_URL !== 'https://api.z.ai/api/anthropic' || !model) return model
   if (model === 'fable' || model.startsWith('claude-fable-')) return undefined
+  if (model === 'default') return ZAI_CLAUDE_DEFAULT_MODEL
   if (model.startsWith('claude-opus-')) return 'opus'
   if (model.startsWith('claude-sonnet-')) return 'sonnet'
   if (model.startsWith('claude-haiku-')) return 'haiku'

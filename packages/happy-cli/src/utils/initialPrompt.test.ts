@@ -146,6 +146,20 @@ describe('normalizeClaudeModelForRuntime', () => {
     })).toBe('haiku')
     expect(normalizeClaudeModelForRuntime('claude-fable-5', {})).toBe('claude-fable-5')
   })
+
+  it('resolves an unpicked Default to GLM-5.3-Flash on the Z.AI runtime', () => {
+    expect(normalizeClaudeModelForRuntime('default', {
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    })).toBe('glm-5.3-flash')
+    // 비 z.ai 런타임에서는 'default' 를 그대로 둔다 — CLI 자신의 기본 해석에 맡긴다.
+    expect(normalizeClaudeModelForRuntime('default', {})).toBe('default')
+  })
+
+  it('passes an explicitly picked GLM model id straight through unchanged', () => {
+    expect(normalizeClaudeModelForRuntime('glm-5.3-flash', {
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    })).toBe('glm-5.3-flash')
+  })
 })
 
 describe('consumePendingInitialEffort', () => {
