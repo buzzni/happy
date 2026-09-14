@@ -2155,7 +2155,7 @@ describe('runServerAutomationTick', () => {
       githubEnvironment: { GH_TOKEN: 'github-secret', GH_REPO: 'acme/app' },
       pullRequests: [],
     })
-    dispatchAgentTask.mockResolvedValue({
+    dispatchAgentTask.mockResolvedValueOnce({
       ok: true,
       dispatch: {
         taskId: 'apply-1', type: 'review_apply.v1', agentRunId: 'automation:run-1',
@@ -2167,6 +2167,7 @@ describe('runServerAutomationTick', () => {
 
     await expect(runServerAutomationTick(input)).resolves.toEqual([
       { automationId: 'automation-1', outcome: 'WOKE' },
+      { automationId: 'automation-1', outcome: 'SKIPPED_GATE' },
     ])
     expect(dispatchAgentTask).toHaveBeenCalledWith({
       runId: 'run-1', claimToken: 'claim-token', credentialId: 'credential-1', event: null,
@@ -2469,7 +2470,7 @@ describe('runServerAutomationTick', () => {
       }],
     })
     queryGithubPullRequests.mockResolvedValue({ ok: true, pullRequests: [] })
-    dispatchAgentTask.mockResolvedValue({
+    dispatchAgentTask.mockResolvedValueOnce({
       ok: true,
       dispatch: {
         taskId: 'apply-1', type: 'review_apply.v1', agentRunId: 'automation:run-1',
@@ -3027,7 +3028,7 @@ describe('runServerAutomationTick', () => {
     expect(notifyGithubTrigger).toHaveBeenCalledTimes(2)
   })
 
-  it('fills eight AgentTask worker slots across ticks and resumes after one finishes', async () => {
+  it.each(['empty', 'failed'] as const)('fills AgentTask slots three per tick, resumes a freed slot, and stops on %s dispatch', async (ending) => {
     const { input, store, transport, dispatchAgentTask, spawnSession } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
     })
@@ -3063,7 +3064,7 @@ describe('runServerAutomationTick', () => {
       },
     })
 
-    for (let count = 1; count <= 8; count += 1) {
+    for (const count of [3, 6, 8]) {
       await runServerAutomationTick(input)
       expect(spawnSession).toHaveBeenCalledTimes(count)
       expect(running.size).toBe(count)
@@ -3082,7 +3083,9 @@ describe('runServerAutomationTick', () => {
     expect(running.size).toBe(8)
 
     running.delete('review-2')
-    dispatchAgentTask.mockResolvedValue({ ok: true, dispatch: null })
+    dispatchAgentTask.mockResolvedValue(ending === 'empty'
+      ? { ok: true, dispatch: null }
+      : { ok: false, error: 'bridge unavailable' })
     input.now += 60_000
     await runServerAutomationTick(input)
     expect(dispatchAgentTask).toHaveBeenCalledTimes(10)

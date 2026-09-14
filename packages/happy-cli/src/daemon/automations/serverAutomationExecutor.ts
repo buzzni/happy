@@ -1731,7 +1731,9 @@ export async function runServerAutomationTick(
       scheduleNextTick(input, automation.automationId, now)
       continue
     }
-    if (payload.githubTrigger && githubMode === 'work'
+    const dispatchesGithubWork = payload.githubTrigger
+      && (githubMode === 'work' || payload.githubTrigger.action === 'agent-task-review')
+    if (dispatchesGithubWork
       && githubEventsProcessed >= MAX_GITHUB_EVENTS_PER_TICK) {
       scheduleNextTick(input, automation.automationId, now)
       continue
@@ -1796,7 +1798,10 @@ export async function runServerAutomationTick(
     if (payload.githubTrigger && result.queueDepth === undefined) {
       result.queueDepth = githubQueueDepth(input, automation)
     }
-    if (payload.githubTrigger && githubMode === 'work') githubEventsProcessed += 1
+    // A discovery-only poll has not dispatched work yet.
+    if (dispatchesGithubWork && (githubMode === 'work' || (result.queueDepth ?? 0) === 0)) {
+      githubEventsProcessed += 1
+    }
 
     let queuePosition: number | null = null
     let queueTotal: number | null = null
@@ -1818,7 +1823,7 @@ export async function runServerAutomationTick(
       advanceSchedule(input, automation.automationId, payload, now, result.sessionId)
     }
     // AgentTask의 서버 큐는 로컬 GitHub 이벤트 queueDepth에 포함되지 않는다.
-    // worker를 시작했으면 다음 tick에 다시 조회해 다른 리뷰도 빈 슬롯에서 실행한다.
+    // worker를 시작했으면 같은 tick의 남은 예산으로 다시 조회하고, 초과분은 다음 tick에 실행한다.
     if (payload.githubTrigger && ((result.queueDepth ?? 0) > 0
       || (payload.githubTrigger.action === 'agent-task-review' && result.sessionId !== null)
       || (result.outcome === 'SKIPPED_GATE' && result.sessionId !== null))) {
@@ -1855,7 +1860,9 @@ export async function runServerAutomationTick(
     if (!(payload.githubTrigger && githubMode === 'poll' && (result.queueDepth ?? 0) > 0)) {
       outcomes.push({ automationId: automation.automationId, outcome: result.outcome })
     }
-    if (payload.githubTrigger && result.outcome !== 'ERROR' && (result.queueDepth ?? 0) > 0
+    if (payload.githubTrigger && result.outcome !== 'ERROR'
+      && ((result.queueDepth ?? 0) > 0
+        || (payload.githubTrigger.action === 'agent-task-review' && result.sessionId !== null))
       && githubEventsProcessed < MAX_GITHUB_EVENTS_PER_TICK) {
       immediateWorkerIds.add(automation.automationId)
       workQueue.push(automation)

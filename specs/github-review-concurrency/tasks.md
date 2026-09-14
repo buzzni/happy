@@ -1,0 +1,4 @@
+- [x] Inspect PR and daemon state
+- [x] Add failing queue-drain regression
+- [x] Implement bounded draining
+- [x] Run automation tests and record evidence
