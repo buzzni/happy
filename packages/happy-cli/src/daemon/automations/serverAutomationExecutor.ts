@@ -224,11 +224,11 @@ const HEARTBEAT_MS = 60_000
 const EXPECTED_NEXT_DAEMON_TICK_MS = 60_000
 // 한 틱이 새로 집어오는 GitHub 이벤트 수. 폭주하는 저장소가 한 번에 큐를 다 비우지
 // 않게 하는 유입 제한이다.
-export const MAX_GITHUB_EVENTS_PER_TICK = 3
+export const MAX_GITHUB_EVENTS_PER_TICK = 4
 // 동시에 살아 있을 수 있는 GitHub 워커 세션 수. 위와 다른 개념이다 — 유입 속도와
 // 동시 실행 수를 한 상수로 묶으면 둘 중 하나만 바꾸고 싶을 때 다른 하나가 끌려간다.
 // AgentTask continuation과 새 GitHub 이벤트가 머신의 같은 워커 슬롯을 공유한다.
-export const MAX_GITHUB_WORKER_SESSIONS = 8
+export const MAX_GITHUB_WORKER_SESSIONS = 15
 /**
  * 워커 세션 하나가 살아 있을 수 있는 최대 시간.
  *

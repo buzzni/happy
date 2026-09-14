@@ -2917,7 +2917,7 @@ describe('runServerAutomationTick', () => {
     })
     queryGithubPullRequests.mockResolvedValue({
       ok: true,
-      pullRequests: [11, 12, 13, 14].map((number) => ({
+      pullRequests: [11, 12, 13, 14, 15].map((number) => ({
         number, title: `PR ${number}`, url: `https://github.test/o/r/pull/${number}`,
         author: { login: 'bob' }, baseRefName: 'main', headRefName: `pr-${number}`,
         isDraft: false, state: 'OPEN', mergedAt: null, labels: [], changedFiles: 0, files: [],
@@ -2925,6 +2925,7 @@ describe('runServerAutomationTick', () => {
     })
 
     await expect(runServerAutomationTick(input)).resolves.toEqual([
+      { automationId: 'automation-1', outcome: 'WOKE' },
       { automationId: 'automation-1', outcome: 'WOKE' },
       { automationId: 'automation-1', outcome: 'WOKE' },
       { automationId: 'automation-1', outcome: 'WOKE' },
@@ -2936,19 +2937,20 @@ describe('runServerAutomationTick', () => {
       queueTotal: report.queueTotal,
       notificationOnly: report.notificationOnly,
     }))).toEqual([
-      { queueDepth: 4, queuePosition: 0, queueTotal: 4, notificationOnly: false },
-      { queueDepth: 3, queuePosition: 1, queueTotal: 4, notificationOnly: true },
-      { queueDepth: 2, queuePosition: 2, queueTotal: 4, notificationOnly: true },
-      { queueDepth: 1, queuePosition: 3, queueTotal: 4, notificationOnly: true },
+      { queueDepth: 5, queuePosition: 0, queueTotal: 5, notificationOnly: false },
+      { queueDepth: 4, queuePosition: 1, queueTotal: 5, notificationOnly: true },
+      { queueDepth: 3, queuePosition: 2, queueTotal: 5, notificationOnly: true },
+      { queueDepth: 2, queuePosition: 3, queueTotal: 5, notificationOnly: true },
+      { queueDepth: 1, queuePosition: 4, queueTotal: 5, notificationOnly: true },
     ])
-    expect(notifyGithubTrigger).toHaveBeenCalledTimes(3)
+    expect(notifyGithubTrigger).toHaveBeenCalledTimes(4)
     expect(transport.report.mock.calls.map(([report]) => report.queueEstimatedAt)).toEqual([
-      now + 60_000, now + 60_000, now + 60_000, now + 60_000,
+      now + 60_000, now + 60_000, now + 60_000, now + 60_000, now + 60_000,
     ])
     expect(store.state().githubQueueProgress).toEqual([{
-      automationId: 'automation-1', generation: 2, total: 4, completed: 3,
+      automationId: 'automation-1', generation: 2, total: 5, completed: 4,
     }])
-    expect(store.state().schedules[0]!.nextRunAt).toBe(now + 4)
+    expect(store.state().schedules[0]!.nextRunAt).toBe(now + 5)
   })
 
   it('returns an empty GitHub poll to its configured cadence', async () => {
@@ -3028,7 +3030,7 @@ describe('runServerAutomationTick', () => {
     expect(notifyGithubTrigger).toHaveBeenCalledTimes(2)
   })
 
-  it.each(['empty', 'failed'] as const)('fills AgentTask slots three per tick, resumes a freed slot, and stops on %s dispatch', async (ending) => {
+  it.each(['empty', 'failed'] as const)('fills AgentTask slots four per tick, resumes a freed slot, and stops on %s dispatch', async (ending) => {
     const { input, store, transport, dispatchAgentTask, spawnSession } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
     })
@@ -3064,7 +3066,7 @@ describe('runServerAutomationTick', () => {
       },
     })
 
-    for (const count of [3, 6, 8]) {
+    for (const count of [4, 8, 12, 15]) {
       await runServerAutomationTick(input)
       expect(spawnSession).toHaveBeenCalledTimes(count)
       expect(running.size).toBe(count)
@@ -3072,15 +3074,15 @@ describe('runServerAutomationTick', () => {
       input.now += 60_000
     }
     await runServerAutomationTick(input)
-    expect(spawnSession).toHaveBeenCalledTimes(8)
-    expect(dispatchAgentTask).toHaveBeenCalledTimes(8)
-    expect(transport.claim).toHaveBeenCalledTimes(8)
+    expect(spawnSession).toHaveBeenCalledTimes(15)
+    expect(dispatchAgentTask).toHaveBeenCalledTimes(15)
+    expect(transport.claim).toHaveBeenCalledTimes(15)
 
     running.delete('review-1')
     input.now += 60_000
     await runServerAutomationTick(input)
-    expect(spawnSession).toHaveBeenCalledTimes(9)
-    expect(running.size).toBe(8)
+    expect(spawnSession).toHaveBeenCalledTimes(16)
+    expect(running.size).toBe(15)
 
     running.delete('review-2')
     dispatchAgentTask.mockResolvedValue(ending === 'empty'
@@ -3088,8 +3090,8 @@ describe('runServerAutomationTick', () => {
       : { ok: false, error: 'bridge unavailable' })
     input.now += 60_000
     await runServerAutomationTick(input)
-    expect(dispatchAgentTask).toHaveBeenCalledTimes(10)
-    expect(spawnSession).toHaveBeenCalledTimes(9)
+    expect(dispatchAgentTask).toHaveBeenCalledTimes(17)
+    expect(spawnSession).toHaveBeenCalledTimes(16)
     expect(store.state().schedules[0]!.nextRunAt).toBe(input.now + 15 * 60_000)
   })
 
@@ -3109,7 +3111,7 @@ describe('runServerAutomationTick', () => {
     }))
     store.write({
       ...store.read(),
-      githubActiveSessions: [{ automationId: 'automation-1', generation: 2, sessionIds: workerSessionIds('active-review', 7) }],
+      githubActiveSessions: [{ automationId: 'automation-1', generation: 2, sessionIds: workerSessionIds('active-review', MAX_GITHUB_WORKER_SESSIONS - 1) }],
       githubTriggers: [{
         automationId: 'automation-1', generation: 2,
         state: {
@@ -3138,7 +3140,7 @@ describe('runServerAutomationTick', () => {
     expect(spawnSession).toHaveBeenCalledTimes(1)
     expect(store.state().githubActiveSessions).toEqual([{
       automationId: 'automation-1', generation: 2,
-      sessionIds: [...workerSessionIds('active-review', 7), 'session-1'],
+      sessionIds: [...workerSessionIds('active-review', MAX_GITHUB_WORKER_SESSIONS - 1), 'session-1'],
     }])
   })
 
@@ -3271,11 +3273,11 @@ describe('runServerAutomationTick', () => {
     expect(queryGithubPullRequests).toHaveBeenCalledTimes(1)
   })
 
-  it('starts at most three GitHub-triggered sessions in one daemon tick', async () => {
+  it('starts at most four GitHub-triggered sessions in one daemon tick', async () => {
     const {
       input, store, transport, queryGithubPullRequests, spawnSession, prepareGithubWorktree, now,
     } = setup()
-    const automationIds = ['automation-1', 'automation-2', 'automation-3', 'automation-4']
+    const automationIds = ['automation-1', 'automation-2', 'automation-3', 'automation-4', 'automation-5']
     store.write({
       schedules: automationIds.map((automationId) => ({
         automationId, generation: 2, nextRunAt: now, lastSessionId: null,
@@ -3317,19 +3319,21 @@ describe('runServerAutomationTick', () => {
       { automationId: 'automation-1', outcome: 'WOKE' },
       { automationId: 'automation-2', outcome: 'WOKE' },
       { automationId: 'automation-3', outcome: 'WOKE' },
+      { automationId: 'automation-4', outcome: 'WOKE' },
     ])
-    expect(transport.claim).toHaveBeenCalledTimes(7)
-    expect(spawnSession).toHaveBeenCalledTimes(3)
-    expect(prepareGithubWorktree).toHaveBeenCalledTimes(3)
+    expect(transport.claim).toHaveBeenCalledTimes(9)
+    expect(spawnSession).toHaveBeenCalledTimes(4)
+    expect(prepareGithubWorktree).toHaveBeenCalledTimes(4)
     expect(spawnSession.mock.calls.map(([call]) => call.directory)).toEqual([
       '/isolated/run-automation-1',
       '/isolated/run-automation-2',
       '/isolated/run-automation-3',
+      '/isolated/run-automation-4',
     ])
-    expect(new Set(spawnSession.mock.calls.map(([call]) => call.directory)).size).toBe(3)
+    expect(new Set(spawnSession.mock.calls.map(([call]) => call.directory)).size).toBe(4)
     expect(spawnSession.mock.calls.some(([call]) => call.directory === '/repo')).toBe(false)
-    expect(queryGithubPullRequests).toHaveBeenCalledTimes(7)
-    expect(store.state().schedules.find((item) => item.automationId === 'automation-4')?.nextRunAt).toBe(now + 1)
+    expect(queryGithubPullRequests).toHaveBeenCalledTimes(9)
+    expect(store.state().schedules.find((item) => item.automationId === 'automation-5')?.nextRunAt).toBe(now + 1)
   })
 
   it('counts a newly timed-out worker against the concurrency limit in the same tick', async () => {

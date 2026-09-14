@@ -1,4 +1,5 @@
-- [x] Inspect PR and daemon state
-- [x] Add failing queue-drain regression
-- [x] Implement bounded draining
-- [x] Run automation tests and record evidence
+- [x] Confirm four-start regressions fail against the previous limits
+- [x] Set tick limit to 4 and machine limit to 15
+- [x] Verify 4/8/12/15 ramp, capacity blocking, freed slots, empty/error stopping
+- [x] Run automation tests and CLI typecheck
+- [x] Verify that permitting 5 starts or 16 workers breaks regression assertions

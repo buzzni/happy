@@ -1,8 +1,7 @@
 # Plan
 
-1. Diagnose PR and local daemon — Done.
-2. Reproduce slow queue ramp with a failing executor test — Done.
-3. Apply bounded same-tick queue draining; verify regression suite — Done.
-4. Record findings and delivery limits — Done.
+User requested four starts per tick and fifteen concurrent workers per machine.
 
-Implementation authorized by the user request to strengthen the PR where needed.
+1. Update limit regressions and confirm failure — Done.
+2. Change the two executor limits and run regression tests/typecheck — Done.
+3. Update validation notes and deliver through PR #433 — Done.
