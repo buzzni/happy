@@ -17,3 +17,9 @@ Eventless AgentTask dispatch and local GitHub event work share the tick budget. 
 The earlier inspected daemon state reported CLI 1.1.10-aplus.210. Installation, daemon restart, release and production concurrency verification have not been performed. Fifteen slots are shared across projects; actual concurrency also depends on server eligibility and launch latency. End-to-end review speed and machine resource use at fifteen workers have not been measured.
 
 Work is isolated from unrelated vendor/happy working changes. Code changes are limited to the executor and its tests.
+
+## Release follow-up
+
+The already-published .211 tag predates #433 and still has limits 3/6. Prepare .212 from main containing #433 to ship the requested 4/15 limits. The user requested npm publication if needed. Publication uses the GitHub Actions tag workflow, never a local publish command.
+
+Candidate .212 validation passed: clean frozen-lockfile dependency installation, wire and CLI builds/typechecks, automation tests (454 passed / 7 skipped), package preparation, npm pack, and artifact guard with install smoke. Existing pkgroll bin-path/empty-chunk warnings remain. Runtime installation paths are read-only in this execution environment; host daemon upgrade is not yet performed.
