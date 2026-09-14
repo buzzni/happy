@@ -16,7 +16,7 @@ afterEach(async () => {
 });
 
 describe('loadBasePrompt', () => {
-    it('returns the Saycode base prompt text mentioning all 4 modes', async () => {
+    it('returns the Saycode base prompt text mentioning all 5 modes', async () => {
         const text = await loadBasePrompt();
         expect(text).toMatch(/Saycode AI assistant/);
         expect(text).not.toMatch(/AX Studio AI assistant/);
@@ -24,6 +24,7 @@ describe('loadBasePrompt', () => {
         expect(text).toMatch(/design/);
         expect(text).toMatch(/work/);
         expect(text).toMatch(/free/);
+        expect(text).toMatch(/office/);
     });
 
     it('does not mention the removed PreToolUse hook enforcement', async () => {
@@ -85,6 +86,32 @@ describe('composeStepGuide', () => {
         expect(guide).toMatch(/Step: free/);
         expect(guide).toMatch(/full-stack/i);
         expect(guide).toMatch(/TDD/);
+    });
+
+    it('loads the office step guide', async () => {
+        const guide = await composeStepGuide('office');
+        expect(guide).toMatch(/Step: office/);
+        expect(guide).toMatch(/문서모드/);
+        expect(guide).toMatch(/documents\//);
+    });
+
+    // 문서모드의 유일한 존재 이유는 작업모드와 다르게 답하는 것이다. free 가이드를
+    // 복사해 제목만 바꾼 회귀를 잡으려면 "무엇이 아닌지"를 함께 고정해야 한다.
+    it('office guide answers 문서모드 and does not inherit the full-stack engineer persona', async () => {
+        const office = await composeStepGuide('office');
+        const free = await composeStepGuide('free');
+        expect(office).not.toEqual(free);
+        expect(office).not.toMatch(/full-stack/i);
+        expect(office).not.toMatch(/작업 ?모드/);
+    });
+
+    // A user can ask for an HTML report/deck as the actual thing they want — the same
+    // way they can ask for a PDF. The guide must not lump "HTML" in with intermediate
+    // code artifacts the assistant is told not to present as the result.
+    it('office guide treats a self-contained HTML document as a valid final deliverable, distinct from app code', async () => {
+        const guide = await composeStepGuide('office');
+        expect(guide).toMatch(/HTML .*valid final deliverable/);
+        expect(guide).not.toMatch(/self-contained HTML are all fine/);
     });
 });
 

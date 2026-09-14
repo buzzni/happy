@@ -408,7 +408,7 @@ export function startDaemonControlServer({
           environmentVariables: z.record(z.string(), z.string()).optional(),
           happyToken: z.string().optional(),
           happySecret: z.string().optional(),
-          axStep: z.enum(['plan', 'design', 'free']).optional(),
+          axStep: z.enum(['plan', 'design', 'free', 'office']).optional(),
           bootstrapFiles: z.array(z.object({
             relativePath: z.string(),
             content: z.string(),

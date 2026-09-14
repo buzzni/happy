@@ -1,6 +1,6 @@
 /**
  * Zod schemas + TypeScript types for `.ax/state.json` — the workspace SoT
- * for the AX Studio step workflow (plan / design / work / free).
+ * for the AX Studio step workflow (plan / design / work / free / office).
  *
  * Shape mirrors specs/20260519-start-from-planning/spec.md §"Data Structure / API"
  * with specs/20260522-ax-step-free-mode adjustments (free step + permissions
@@ -9,7 +9,7 @@
 
 import { z } from 'zod';
 
-export const AxStepSchema = z.enum(['plan', 'design', 'work', 'free']);
+export const AxStepSchema = z.enum(['plan', 'design', 'work', 'free', 'office']);
 export type AxStep = z.infer<typeof AxStepSchema>;
 
 export const CandidatesSourceSchema = z.enum(['claude-suggested', 'user-picked']);

@@ -251,7 +251,10 @@ export const MessageMetaSchema = z.object({
   }).nullable().optional().catch(undefined),
   allowedTools: z.array(z.string()).nullable().optional(), // Allowed tools for this message (null = reset)
   disallowedTools: z.array(z.string()).nullable().optional(), // Disallowed tools for this message (null = reset)
-  axStep: z.enum(['plan', 'design', 'free']).optional(),
+  // .catch() for the same reason as saycodePromptBlocks above: a strict enum drops
+  // the user's whole turn in routeIncomingMessage when a newer app sends a step this
+  // CLI predates. An unlearned step degrades to "no explicit step", never to silence.
+  axStep: z.enum(['plan', 'design', 'free', 'office']).optional().catch(undefined),
 })
 
 export type MessageMeta = z.infer<typeof MessageMetaSchema>
