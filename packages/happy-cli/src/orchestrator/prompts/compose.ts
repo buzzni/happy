@@ -6,8 +6,8 @@
  *
  * - L1 (base): inlined `BASE_PROMPT`, injected into the subprocess via
  *   `--append-system-prompt` (idempotent — see `integrate.ts`).
- * - L2 (step guide): one of `STEP_PLAN`/`STEP_DESIGN`/`STEP_WORK`/`STEP_FREE`/
- *   `STEP_OFFICE`, injected each turn.
+ * - L2 (step guide): one of `STEP_PLAN`/`STEP_DESIGN`/`STEP_WORK`/`STEP_FREE`,
+ *   injected each turn.
  * - L3 (dynamic context): a JSON state summary plus references to step-related
  *   md files. File bodies are intentionally not embedded every turn; the agent
  *   can read them from disk when the current task needs them.
@@ -19,14 +19,13 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { AxState, AxStep, DESIGN_MD_FILENAME } from '../state/schema';
-import { BASE_PROMPT, STEP_PLAN, STEP_DESIGN, STEP_WORK, STEP_FREE, STEP_OFFICE } from './assets';
+import { BASE_PROMPT, STEP_PLAN, STEP_DESIGN, STEP_WORK, STEP_FREE } from './assets';
 
 const STEP_GUIDES: Record<AxStep, string> = {
     plan: STEP_PLAN,
     design: STEP_DESIGN,
     work: STEP_WORK,
     free: STEP_FREE,
-    office: STEP_OFFICE,
 };
 
 export async function loadBasePrompt(): Promise<string> {
