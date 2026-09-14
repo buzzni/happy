@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { dispatchManagedRpc, managedRpcServer } from '@/app/api/socket/managed/managedDelivery';
 import { isManagedSessionId, splitRpcMethod } from '@/app/api/socket/managed/managedRpcTarget';
 import { dispatchDaemonRpc } from '@/app/api/socket/managedDaemonRpcRelay';
+import { newestMachineSocket } from '@/app/events/findMachineSockets';
 
 // RPC routing uses Socket.IO rooms. A daemon registering method M for user U
 // joins room `rpc:U:M`. Callers look the daemon up cross-replica via
@@ -242,12 +243,22 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
                 callback?.({ ok: false, error: 'RPC method not available' });
                 return;
             }
+            // Cross-replica room results have no recency ordering. A stale
+            // daemon can remain registered beside its replacement, so use the
+            // same server-stamped selection as terminal-open for machine RPCs.
+            // Ignore foreign room members when the requested machine is present.
+            // Session RPCs keep their existing selection. Never replay a sent
+            // mutation on a second socket: its first execution may have succeeded.
+            const machineId = method.slice(0, method.indexOf(':'));
+            const machineCandidates = targets.filter((candidate) =>
+                candidate.data?.clientType === 'machine-scoped'
+                && candidate.data.machineId === machineId);
+            const target = newestMachineSocket(machineCandidates) ?? targets[0];
             if (targets.length > 1) {
                 log({ module: 'websocket', level: 'warn' },
-                    `Multiple sockets in ${room} (${targets.length}); using first`);
+                    `Multiple sockets in ${room} (${targets.length}); using ${machineCandidates.length > 0 ? 'newest machine socket' : 'first'} ${target.id}`);
             }
 
-            const target = targets[0];
             if (target.id === socket.id) {
                 finish('self_call');
                 callback?.({ ok: false, error: 'Cannot call RPC on the same socket' });

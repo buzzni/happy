@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest';
 import {
     MANAGED_SCOPE_SURFACE,
     authorizeManagedHttpRequest,
+    authorizeManagedRelay,
     authorizeManagedRpcName,
+    managedRpcRequiresRelayAuthority,
     authorizeManagedSocketEvent,
 } from '@/app/managed/managedScopeAllowlist';
 
@@ -300,6 +302,53 @@ describe('what each purpose may reach', () => {
         })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
     });
 
+    it('lets a follow-up sender post the next turn over HTTP, and nobody else', () => {
+        /*
+         * The next turn of a live managed session is an act on the run, like
+         * an approval: it comes over HTTP under its own purpose. An approver
+         * may not send it (approving is not authoring), a reader may not, and
+         * the run may not post one to itself.
+         */
+        const path = `/v1/managed/sessions/${SESSION}/follow-up`;
+        expect(authorizeManagedHttpRequest({
+            method: 'POST', path, sessionId: SESSION, purpose: 'message-send',
+        })).toEqual({ ok: true });
+        for (const purpose of ['approval-control', 'transcript-read', 'runner'] as const) {
+            expect(authorizeManagedHttpRequest({
+                method: 'POST', path, sessionId: SESSION, purpose,
+            })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
+        }
+    });
+
+    it('lets a follow-up sender author the next turn and nothing else', () => {
+        // Not the transcript, not the run's own writes, not the prompt answers.
+        for (const [method, path] of [
+            ['POST', `/v1/managed/sessions/${SESSION}/permission`],
+            ['POST', `/v3/sessions/${SESSION}/messages`],
+            ['GET', `/v3/sessions/${SESSION}/messages`],
+            ['POST', `/v2/sessions/lookup`],
+        ] as const) {
+            expect(authorizeManagedHttpRequest({
+                method, path, sessionId: SESSION, purpose: 'message-send',
+            })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
+        }
+        expect(authorizeManagedRpcName({
+            method: `${SESSION}:follow-up`, sessionId: SESSION, purpose: 'message-send',
+        })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
+        expect(authorizeManagedSocketEvent({
+            event: 'message', sessionId: SESSION, purpose: 'message-send', payload: { sid: SESSION },
+        })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
+    });
+
+    it('lets the run register the follow-up handler the sender is relayed to', () => {
+        expect(authorizeManagedRpcName({
+            method: `${SESSION}:follow-up`, sessionId: SESSION, purpose: 'runner',
+        })).toEqual({ ok: true });
+        expect(authorizeManagedRpcName({
+            method: `${SESSION}:follow-up`, sessionId: SESSION, purpose: 'approval-control',
+        })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
+    });
+
     it('refuses the run its own permission prompt', () => {
         /*
          * The prompt exists because the run is not trusted to decide. Written
@@ -344,5 +393,31 @@ describe('what each purpose may reach', () => {
                 event: 'session-stream', payload: { sid: SESSION }, sessionId: SESSION, purpose,
             })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
         }
+    });
+});
+
+describe('what each purpose may relay, read again at the emit', () => {
+    it('binds one purpose to one RPC', () => {
+        expect(authorizeManagedRelay({ purpose: 'approval-control', rpcName: 'permission' })).toEqual({ ok: true });
+        expect(authorizeManagedRelay({ purpose: 'message-send', rpcName: 'follow-up' })).toEqual({ ok: true });
+    });
+
+    it.each([
+        ['an approver authoring the next turn', 'approval-control', 'follow-up'],
+        ['a sender answering a prompt', 'message-send', 'permission'],
+        ['a reader relaying anything', 'transcript-read', 'permission'],
+        ['the runner relaying to itself', 'runner', 'follow-up'],
+        ['a sender reaching the run\'s own work', 'message-send', 'bash'],
+    ] as const)('refuses %s', (_name, purpose, rpcName) => {
+        expect(authorizeManagedRelay({ purpose, rpcName })).toEqual({ ok: false, reason: 'purpose-not-allowed' });
+    });
+});
+
+describe('RPCs that only exist as a relay', () => {
+    it('names follow-up and nothing the run or an account client calls on its own', () => {
+        expect(managedRpcRequiresRelayAuthority('follow-up')).toBe(true);
+        // A permission answer has always been reachable by the owner's own client.
+        expect(managedRpcRequiresRelayAuthority('permission')).toBe(false);
+        expect(managedRpcRequiresRelayAuthority('abort')).toBe(false);
     });
 });

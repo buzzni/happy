@@ -12,6 +12,7 @@ import {
   runServerAutomationTick,
   type ServerAutomationExecutorInput,
   DIRTY_WORKTREE_WARN_AFTER_ATTEMPTS,
+  MAX_GITHUB_WORKER_RUNTIME_MS,
 } from './serverAutomationExecutor'
 
 // 상한을 상수에서 끌어와 만든다. 개수를 하드코딩하면 상한을 올릴 때 테스트가
@@ -156,12 +157,14 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     prepareGithubWorktree,
     discardGithubWorktree,
     isSessionRunning: vi.fn(() => false),
+    stopSession: vi.fn(() => true),
     isDirectoryInUse: vi.fn(() => false),
     randomId: () => 'report-1',
     logDebug,
   }
   return {
     input, store, transport, decryptPayload, logDebug, runScript, queryGithubPullRequests, queryGithubPullRequestFiles,
+    stopSession: input.stopSession,
     queryGithubIssues, notifyGithubTrigger, dispatchAgentTask, maintainAgentTaskLease,
     ensureReviewObjects,
     resolveGithubIssueProgressMarkerIdentity, createGithubIssueProgressMarker,
@@ -922,6 +925,98 @@ describe('runServerAutomationTick', () => {
     expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
       initialPrompt: expect.stringContaining('Review 9: Queued before the edit'),
     }))
+  })
+
+  // 2026-09-12~13 프로덕션 — 리뷰를 끝내고 결과까지 제출한(HTTP 200) 워커가 24시간
+  // 동안 살아 있었다. 워커가 /complete 를 보낸 python 이 urlopen 에 timeout 을 주지
+  // 않아 stalled 연결에서 영원히 블록됐고, 그 명령이 안 끝나니 턴도 세션도 끝나지
+  // 않았다(로그의 exec_command_begin 13 / end 12). 최근 AgentTask 워커 10건 중 3건이
+  // 같은 모양이었고 두 건은 17~24시간이었다.
+  //
+  // 그동안 그 세션은 MAX_GITHUB_WORKER_SESSIONS 6칸 중 하나와 worktree 를 붙들고
+  // 있는다. 프롬프트로 timeout 을 지시해도 어떤 명령이든 매달릴 수 있으므로, 플랫폼이
+  // 상한을 둔다. 리뷰는 보통 수 분, lease 는 5분이라 2시간은 충분히 관대하다.
+  it('stops a GitHub worker session that has outlived the runtime cap', async () => {
+    const { input, store, stopSession, logDebug } = setup()
+    const now = 1_000_000
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-stuck',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-stuck', directory: '/isolated/run-stuck',
+        sessionId: 'stuck-session', createdAt: now - MAX_GITHUB_WORKER_RUNTIME_MS - 1,
+      }],
+    })
+    input.isSessionRunning = vi.fn(() => true)
+
+    await runServerAutomationTick(input)
+
+    expect(stopSession).toHaveBeenCalledWith('stuck-session')
+    const stopped = logDebug.mock.calls.map(([line]) => String(line))
+      .filter((line) => /worker session/.test(line) && /stuck-session/.test(line))
+    expect(stopped).toHaveLength(1)
+    expect(stopped[0]).toContain('automation-1')
+  })
+
+  it('leaves a GitHub worker session alone while it is still within the cap', async () => {
+    const { input, store, stopSession } = setup()
+    const now = 1_000_000
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-busy',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-busy', directory: '/isolated/run-busy',
+        sessionId: 'busy-session', createdAt: now - MAX_GITHUB_WORKER_RUNTIME_MS + 60_000,
+      }],
+    })
+    input.isSessionRunning = vi.fn(() => true)
+
+    await runServerAutomationTick(input)
+
+    expect(stopSession).not.toHaveBeenCalled()
+  })
+
+  // 상수를 기준으로 시각을 계산하는 위 테스트들은 값 자체를 고정하지 못한다 — 상한을
+  // 0 으로 바꿔도 통과한다(뮤테이션에서 드러났다). 정상 리뷰는 수 분이고 lease 는
+  // 5분이므로, 30분짜리는 절대 끊지 말고 3시간짜리는 반드시 끊어야 한다.
+  it.each([
+    [30 * 60_000, false],
+    [3 * 60 * 60_000, true],
+  ])('stops a worker only when it has been running far beyond a normal review (%ims)', async (ageMs, expected) => {
+    const { input, store, stopSession } = setup()
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-x',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-x', directory: '/isolated/run-x',
+        sessionId: 'worker-session', createdAt: 1_000_000 - ageMs,
+      }],
+    })
+    input.isSessionRunning = vi.fn(() => true)
+
+    await runServerAutomationTick(input)
+
+    expect(stopSession).toHaveBeenCalledTimes(expected ? 1 : 0)
+  })
+
+  // 매 틱 SIGTERM 을 다시 보내면 로그가 도배되고 종료 중인 프로세스를 계속 때린다.
+  it('does not keep stopping the same worker session every tick', async () => {
+    const { input, store, stopSession } = setup()
+    const now = 1_000_000
+    store.write({
+      ...store.read(),
+      githubWorktrees: [{
+        automationId: 'automation-1', generation: 2, runId: 'run-stuck',
+        repositoryRoot: '/repo', worktreePath: '/isolated/run-stuck', directory: '/isolated/run-stuck',
+        sessionId: 'stuck-session', createdAt: now - MAX_GITHUB_WORKER_RUNTIME_MS - 1,
+      }],
+    })
+    input.isSessionRunning = vi.fn(() => true)
+
+    await runServerAutomationTick(input)
+    await runServerAutomationTick(input)
+
+    expect(stopSession).toHaveBeenCalledTimes(1)
   })
 
   it('persists a matching GitHub event before starting a session with the rendered prompt', async () => {
@@ -2101,6 +2196,10 @@ describe('runServerAutomationTick', () => {
     expect(spawned.initialPrompt).toContain('"fixBranch"')
     expect(spawned.initialPrompt).toContain('"fixPrUrl"')
     expect(spawned.initialPrompt).toContain('Retry network failures and 5xx responses')
+    // 2026-09-12 프로덕션 — 워커가 urlopen 에 timeout 을 주지 않아 stalled 연결에서
+    // 영원히 블록됐고, 결과 제출(HTTP 200) 뒤에도 세션이 24시간 살아 있었다. 지시에
+    // 없으면 워커는 timeout 을 쓰지 않는다.
+    expect(spawned.initialPrompt).toMatch(/timeout/i)
     expect(spawned.initialPrompt).not.toContain('claim-secret')
     expect(spawned.initialPrompt).not.toContain('complete-secret')
     expect(spawned.filterInheritedCredentials).toBe(true)

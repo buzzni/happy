@@ -276,7 +276,8 @@ export function startDaemonControlServer({
           hasOpenToolCall: z.boolean().optional(),
           pendingUserInput: z.boolean().optional(),
           lastUserInteractionAt: z.number().optional(),
-          lastTurnEndAt: z.number().optional(),
+          /** A wall-clock ms timestamp. Fractions are refused at the door: a merged max would pin one forever. */
+          lastTurnEndAt: z.number().int().min(0).optional(),
           assistantTurns: z.number().int().min(0).optional(),
           providerTokens: z.number().int().min(0).optional(),
           launchedBackgroundJob: z.boolean().optional(),

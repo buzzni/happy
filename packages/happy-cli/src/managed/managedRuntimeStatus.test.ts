@@ -125,3 +125,16 @@ describe('the status a runtime reports', () => {
         expect(frozen).toEqual(lease);
     });
 });
+
+describe('runtime capabilities', () => {
+    it('names follow-up so the parent may open the next-turn surface only for a runtime that has it', () => {
+        const status = buildManagedRuntimeStatus({
+            identity,
+            lease: { epoch: 0, renewalSeq: 0, remainingMs: 1_000 },
+            filesystem: { ok: false, reason: 'root-not-mounted' },
+            restore: { status: 'pending', checkpointId: null, manifestDigest: null },
+            isolation: { verified: false, backend: 'none' },
+        } as never);
+        expect(status.capabilities).toEqual(['follow-up']);
+    });
+});

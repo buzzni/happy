@@ -16,10 +16,13 @@
  * which is the only side that can catch it.
  */
 
+import { randomUUID } from 'node:crypto';
+
 import type { Server } from 'socket.io';
 
 import { log } from '@/utils/log';
 import { parseSessionScopedClaims, type SessionScopedClaims } from '@/app/auth/sessionScopedToken';
+import { authorizeManagedRelay, managedRpcRequiresRelayAuthority } from '@/app/managed/managedScopeAllowlist';
 import { managedSocketRegistry, type ManagedSocketRegistry } from '@/app/api/socket/managed/managedSocketRegistry';
 import type { ManagedChannelClosure } from '@/app/api/socket/managed/managedOutboundQueue';
 
@@ -205,7 +208,12 @@ export function executeManagedRpcLocally(
     onResponse: (response: ManagedRpcResult) => void,
     registry: ManagedSocketRegistry = managedSocketRegistry,
     expiresAt?: number,
-): { ok: true } | { ok: false; reason: 'no-target' } {
+): { ok: true } | { ok: false; reason: 'no-target' | 'authority-required' } {
+    // A relay-only RPC with nothing to check at the emit is not a call that
+    // was authorised somewhere else; it is a call that skipped the check.
+    if (managedRpcRequiresRelayAuthority(request.rpcName) && !request.approval) {
+        return { ok: false, reason: 'authority-required' };
+    }
     const entry = registry.get(targetSocketId);
     if (!entry
         || entry.sessionId !== request.sessionId
@@ -271,11 +279,15 @@ const pendingResults = new Map<string, (result: ManagedRpcResult) => void>();
 /** Delivers a result to the replica that issued the call. */
 export function installManagedRpcResultReceiver(io: Pick<Server, 'on'>): void {
     io.on(MANAGED_RPC_RESULT_EVENT as never, ((payload: unknown) => {
-        const envelope = payload as { requestId?: unknown; result?: unknown } | null;
-        if (!envelope || typeof envelope.requestId !== 'string') return;
+        const envelope = payload as { requestId?: unknown; correlationId?: unknown; result?: unknown } | null;
+        if (!envelope) return;
+        // A replica that predates the correlation id answers by `requestId`
+        // alone — which this side set to the correlation id, so it still lands.
+        const key = typeof envelope.correlationId === 'string' ? envelope.correlationId : envelope.requestId;
+        if (typeof key !== 'string') return;
         // Unknown ids are normal: every replica sees every result, and only the
         // caller has a pending entry for this one.
-        pendingResults.get(envelope.requestId)?.(envelope.result as ManagedRpcResult);
+        pendingResults.get(key)?.(envelope.result as ManagedRpcResult);
     }) as never);
 }
 
@@ -322,6 +334,14 @@ export async function dispatchManagedRpc(
     options: { deadlineMs?: number; locateTimeoutMs?: number } = {},
 ): Promise<ManagedRpcResult> {
     const startedAt = Date.now();
+    /*
+     * Refused before anything is located: the legacy account `rpc-call`, the
+     * owner's own client, reaches this with no relayed claims, and a
+     * `follow-up` from there would author a turn with no grant to revoke.
+     */
+    if (managedRpcRequiresRelayAuthority(request.rpcName) && !request.approval) {
+        return { ok: false, reason: 'unavailable', error: `${request.rpcName} is only reachable through its relay` };
+    }
     const local = locateManagedRpcTargets(request, registry);
     const remote = io ? await locateRemoteTargets(io, request, options.locateTimeoutMs) : [];
     const chosen = chooseManagedRpcTarget([...local, ...remote]);
@@ -344,10 +364,26 @@ export async function dispatchManagedRpc(
 
     if (!io) return { ok: false, reason: 'no-target' };
 
-    pendingResults.set(request.requestId, settle);
+    /*
+     * The waiter is keyed by an id this side makes, not by the caller's
+     * `requestId`. That one is chosen by the client and travels to the child,
+     * and two overlapping calls may carry the same one — a retry of a send
+     * whose acknowledgement was lost is exactly that. Keyed by `requestId`, the
+     * second call overwrote the first waiter and took its answer.
+     */
+    const correlationId = randomUUID();
+    pendingResults.set(correlationId, settle);
+    /*
+     * The relayed request carries the correlation id **as its request id** as
+     * well. A replica that predates the field answers by request id alone, and
+     * that answer must still find this waiter; a replica that knows the field
+     * echoes both, and they agree. The child never needed the client's id — its
+     * own dedupe reads the sealed payload, not the transport.
+     */
+    const relayed: ManagedRpcRequest = { ...request, requestId: correlationId };
     (io.serverSideEmit as (ev: string, payload: unknown, ack: (err: Error | null, r: unknown[]) => void) => void)(
         MANAGED_RPC_EXECUTE_EVENT,
-        { request, targetSocketId: chosen.socketId, expiresAt },
+        { request: relayed, targetSocketId: chosen.socketId, expiresAt, correlationId },
         (error, responses) => {
             if (error) {
                 // Nobody confirmed acceptance. The effect is unknown, so this
@@ -364,7 +400,7 @@ export async function dispatchManagedRpc(
     try {
         return await promise;
     } finally {
-        pendingResults.delete(request.requestId);
+        pendingResults.delete(correlationId);
     }
 }
 
@@ -407,7 +443,7 @@ export function installManagedRpcReceiver(
 
     io.on(MANAGED_RPC_EXECUTE_EVENT as never, ((payload: unknown, ack?: (response: unknown) => void) => {
         const envelope = payload as {
-            request?: unknown; targetSocketId?: unknown; expiresAt?: unknown;
+            request?: unknown; targetSocketId?: unknown; expiresAt?: unknown; correlationId?: unknown;
         } | null;
         if (!envelope || !isRpcRequest(envelope.request) || typeof envelope.targetSocketId !== 'string') {
             ack?.({ accepted: false });
@@ -421,7 +457,15 @@ export function installManagedRpcReceiver(
                 // The result travels on its own event, so the acknowledgement
                 // above is free to answer immediately.
                 (io as unknown as { serverSideEmit: (ev: string, payload: unknown) => void })
-                    .serverSideEmit(MANAGED_RPC_RESULT_EVENT, { requestId: request.requestId, result });
+                    .serverSideEmit(MANAGED_RPC_RESULT_EVENT, {
+                        requestId: request.requestId,
+                        // Echoed so the caller finds its own waiter; absent from
+                        // a caller that predates it, in which case the request
+                        // id is all there is.
+                        correlationId: typeof envelope.correlationId === 'string'
+                            ? envelope.correlationId : request.requestId,
+                        result,
+                    });
             },
             registry,
             typeof envelope.expiresAt === 'number' ? envelope.expiresAt : undefined,
@@ -479,7 +523,8 @@ async function checkApprovalStillLive(
     const { claims } = approval;
     // The bearer's own claims, not just the row it names: an approval token has
     // an expiry of its own, and it names the run it was minted for.
-    if (claims.purpose !== 'approval-control') return { ok: false, reason: 'purpose-not-allowed' };
+    const relay = authorizeManagedRelay({ purpose: claims.purpose, rpcName: request.rpcName });
+    if (!relay.ok) return { ok: false, reason: relay.reason };
     if (claims.sessionId !== request.sessionId || claims.accountId !== request.accountId) {
         return { ok: false, reason: 'scope-mismatch' };
     }

@@ -67,8 +67,30 @@ export type ManagedReceipt = {
     /** Set when a stop lands while the spawn is still in flight. */
     stopRequestedAt: number | null;
     failureReason: string | null;
+    /**
+     * Observation axes (T07-L1b). Each is `null` until observed; an older
+     * receipt file without them parses as all-null. They are separate facts
+     * and **none of them changes `state`**: `stopped` keeps meaning "the
+     * generation is proven stopped", which no child observation can assert.
+     * The parent combines them with its own knowledge (why it asked for a
+     * stop, whether a turn had ended) — this file does not judge outcomes.
+     */
+    /** The first stop intent recorded, never overwritten: the parent's `managed:stop` (or a tombstone) or lease maintenance. */
+    stopIntent: 'parent-stop' | 'lease-expired' | null;
+    /** From the child's verified runtime reports, monotonic: turns that went busy→idle, when the last one ended. Not a success count. */
+    turnCount: number | null;
+    lastTurnEndAt: number | null;
+    /** The last verified report's raw flags. `pendingUserInput` means waiting on a permission/question. */
+    reportThinking: boolean | null;
+    reportOpenToolCall: boolean | null;
+    reportPendingUserInput: boolean | null;
+    /** This daemon probed the recorded pid and found no such process (ESRCH). An observation of the leader only — not a generation proof. */
+    childExitAt: number | null;
+    childExitProof: 'pid-absent' | null;
     claimedAt: number;
     spawnAt: number | null;
+    /** When this receipt's launch took `pid` (registration, before its waits). Orders incarnations of a reused pid; `claimedAt` cannot. */
+    pidRecordedAt: number | null;
     updatedAt: number;
     rev: number;
 };
@@ -142,12 +164,63 @@ function parseReceipt(raw: unknown, expectedRequestKey: string): ManagedReceipt 
     if (!Number.isSafeInteger(r.rev) || (r.rev as number) < 1) return null;
     if (!isTimestamp(r.claimedAt) || !isTimestamp(r.updatedAt)) return null;
     if (!isNullableTimestamp(r.spawnAt) || !isNullableTimestamp(r.stopRequestedAt)) return null;
+    // Absent on receipts written before it existed; absent and null are the same.
+    if (!isNullableTimestamp(r.pidRecordedAt ?? null)) return null;
     if (!isNullablePid(r.pid) || !isNullablePid(r.pgid)) return null;
     if (!isNullableString(r.sessionId) || !isNullableString(r.failureReason)) return null;
     if (typeof r.workspaceId !== 'string' || !r.workspaceId) return null;
     if (typeof r.projectId !== 'string' || !r.projectId) return null;
     if (!isNullableString(r.spawnPayloadDigest)) return null;
-    return r as unknown as ManagedReceipt;
+    // Observation axes: absent on receipts written before they existed. Absent
+    // and null mean the same thing; a present value must be well-formed.
+    const observation = normalizeReceiptObservation(r);
+    if (observation === null) return null;
+    return { ...(r as unknown as ManagedReceipt), pidRecordedAt: (r.pidRecordedAt ?? null) as number | null, ...observation };
+}
+
+const STOP_INTENTS = new Set(['parent-stop', 'lease-expired']);
+const CHILD_EXIT_PROOFS = new Set(['pid-absent']);
+
+export type ManagedReceiptObservation = Pick<ManagedReceipt,
+    'stopIntent' | 'turnCount' | 'lastTurnEndAt' | 'reportThinking' | 'reportOpenToolCall'
+    | 'reportPendingUserInput' | 'childExitAt' | 'childExitProof'>;
+
+function isNullableBoolean(value: unknown): boolean {
+    return value === null || typeof value === 'boolean';
+}
+
+/**
+ * The observation axes, from a raw object: absent and null both read as null;
+ * a present value must be well-formed or the whole receipt is refused. Shared
+ * by the file parser and the report writers, so a bad report cannot write a
+ * receipt the next read would refuse.
+ */
+export function normalizeReceiptObservation(r: Record<string, unknown>): ManagedReceiptObservation | null {
+    const stopIntent = r.stopIntent ?? null;
+    if (stopIntent !== null && !(typeof stopIntent === 'string' && STOP_INTENTS.has(stopIntent))) return null;
+    const turnCount = r.turnCount ?? null;
+    if (turnCount !== null && !(Number.isSafeInteger(turnCount) && (turnCount as number) >= 0)) return null;
+    const lastTurnEndAt = r.lastTurnEndAt ?? null;
+    if (!isNullableTimestamp(lastTurnEndAt)) return null;
+    const reportThinking = r.reportThinking ?? null;
+    const reportOpenToolCall = r.reportOpenToolCall ?? null;
+    const reportPendingUserInput = r.reportPendingUserInput ?? null;
+    if (!isNullableBoolean(reportThinking) || !isNullableBoolean(reportOpenToolCall)
+        || !isNullableBoolean(reportPendingUserInput)) return null;
+    const childExitAt = r.childExitAt ?? null;
+    if (!isNullableTimestamp(childExitAt)) return null;
+    const childExitProof = r.childExitProof ?? null;
+    if (childExitProof !== null && !(typeof childExitProof === 'string' && CHILD_EXIT_PROOFS.has(childExitProof))) return null;
+    return {
+        stopIntent: stopIntent as ManagedReceipt['stopIntent'],
+        turnCount: turnCount as number | null,
+        lastTurnEndAt: lastTurnEndAt as number | null,
+        reportThinking: reportThinking as boolean | null,
+        reportOpenToolCall: reportOpenToolCall as boolean | null,
+        reportPendingUserInput: reportPendingUserInput as boolean | null,
+        childExitAt: childExitAt as number | null,
+        childExitProof: childExitProof as ManagedReceipt['childExitProof'],
+    };
 }
 
 function parseLease(raw: unknown): ManagedLeaseRecord | null {
@@ -336,9 +409,18 @@ export function createManagedReceiptStore(root: string, lock: ManagedStoreLock) 
                 state: 'claimed',
                 pid: null,
                 pgid: null,
+                pidRecordedAt: null,
                 sessionId: null,
                 stopRequestedAt: null,
                 failureReason: null,
+                stopIntent: null,
+                turnCount: null,
+                lastTurnEndAt: null,
+                reportThinking: null,
+                reportOpenToolCall: null,
+                reportPendingUserInput: null,
+                childExitAt: null,
+                childExitProof: null,
                 claimedAt: input.now,
                 spawnAt: null,
                 updatedAt: input.now,
@@ -368,9 +450,18 @@ export function createManagedReceiptStore(root: string, lock: ManagedStoreLock) 
                 state: 'tombstone',
                 pid: null,
                 pgid: null,
+                pidRecordedAt: null,
                 sessionId: null,
                 stopRequestedAt: input.now,
                 failureReason: null,
+                stopIntent: 'parent-stop',
+                turnCount: null,
+                lastTurnEndAt: null,
+                reportThinking: null,
+                reportOpenToolCall: null,
+                reportPendingUserInput: null,
+                childExitAt: null,
+                childExitProof: null,
                 claimedAt: input.now,
                 spawnAt: null,
                 updatedAt: input.now,

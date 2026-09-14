@@ -76,6 +76,8 @@ import {
 } from './codexMcpRuntimeRecovery';
 import { emitReadyIfIdle } from './emitReadyIfIdle';
 import { enqueueCodexUserText, isCodexClearText } from './codexClearCommand';
+import { createEnvelope } from '@slopus/happy-wire';
+import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
 import { downloadCodexFileEventAttachment } from './utils/attachmentEvents';
 import { prepareCodexImageInputItems } from './utils/imageInput';
 import { createSerialAsyncHandler } from './utils/serialAsyncHandler';
@@ -926,6 +928,16 @@ export async function runCodex(opts: {
         command: CodexGoalCommand,
         threadId: string,
     ): Promise<boolean> => {
+        /*
+         * The same refusal the `goal-action` RPC makes, here at the one place a
+         * `/goal` text is executed — whichever way it reached the queue. A
+         * managed run answers the prompt it was admitted for; a goal is an
+         * instruction carried into every turn after it. Clearing removes one.
+         */
+        if (managedStartup && command.type === 'set') {
+            messageBuffer.addMessage('A managed run cannot be given a new objective', 'status');
+            return true;
+        }
         try {
             if (command.type === 'clear') {
                 const result = await client.clearGoal({ threadId });
@@ -955,6 +967,30 @@ export async function runCodex(opts: {
             return false;
         }
     };
+    /**
+     * The next turn of a managed session, relayed by the server on a
+     * `message-send` bearer's behalf (T07-L5-b). Text only, queued with the
+     * options the run already has — see runClaude.ts for the full rationale.
+     */
+    session.rpcHandlerManager.registerHandler('follow-up', createManagedFollowUpHandler({
+        managed: () => Boolean(managedStartup),
+        // The visible user row, so the transcript shows the turn where it came from.
+        echo: ({ text, localId }) => session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }), localId),
+        // Straight onto the queue: the parse already refused queue commands,
+        // and the command-reading path would drop the turns already taken.
+        enqueue: (text) => {
+            messageQueue.push(text, {
+                permissionMode: currentPermissionMode || 'default',
+                model: currentModel,
+                appendSystemPrompt: currentAppendSystemPrompt,
+                saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+                saycodePromptBlocks: currentSaycodePromptBlocks,
+                effort: currentEffort,
+            }, []);
+            logger.debug('[managed] Follow-up turn queued');
+        },
+    }));
+
     session.rpcHandlerManager.registerHandler('goal-action', async (params: Record<string, unknown>) => {
         const command = parseCodexGoalActionParams(params);
         if (!command) {

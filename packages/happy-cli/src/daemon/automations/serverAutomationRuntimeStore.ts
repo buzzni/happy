@@ -41,6 +41,8 @@ export interface GithubAutomationWorktreeState {
   createdAt: number
   cleanupRetryAt?: number
   cleanupAttempts?: number
+  /** 수명 상한을 넘겨 종료를 요청한 시각. 매 틱 다시 SIGTERM 을 보내지 않기 위한 표시다. */
+  stopRequestedAt?: number
 }
 
 export interface PendingAutomationReport {

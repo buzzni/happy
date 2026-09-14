@@ -145,7 +145,7 @@ import {
 } from './managedDaemonStateLayout';
 import { createManagedReceiptStore } from './managedReceiptStore';
 import { createByosOfflineReceiveWiring } from '@/daemon/byosOfflineReceiveWiring';
-import { createManagedRpcHandlers, type ManagedRpcHandlers, type ManagedRuntimeFacts } from './managedRpcHandlers';
+import { createManagedRpcHandlers, type ManagedChildExitNote, type ManagedRpcHandlers, type ManagedRuntimeFacts } from './managedRpcHandlers';
 import { createManagedAiAuthStore } from '@/managed/managedAiAuthStore';
 import {
   decideManagedStopRoute,
@@ -540,6 +540,16 @@ export async function startDaemon(): Promise<void> {
     // that exists but cannot be trusted is a downgrade attempt, and reopening
     // the legacy path is the outcome it is after.
     let managedWriterLockHeld = false;
+    /**
+     * T07-L1b: the managed receipt learns what the daemon already knows about
+     * its child — verified runtime reports (turns, idle) and the pid vanishing.
+     * Assigned once the handlers exist; before that there is no receipt to tell.
+     */
+    let managedNoteSessionRuntime: ((sessionId: string, pid: number, report: {
+      assistantTurns?: number; lastTurnEndAt?: number;
+      thinking: boolean; hasOpenToolCall: boolean; pendingUserInput: boolean;
+    }) => void) | null = null;
+    let managedNoteChildExited: ((pid: number) => ManagedChildExitNote) | null = null;
     /**
      * The runtime's own view of itself, for a status read.
      *
@@ -1325,6 +1335,15 @@ export async function startDaemon(): Promise<void> {
         turns: trackedSession.runtime.assistantTurns,
         tokens: trackedSession.runtime.providerTokens,
         lastTurnEndAt: trackedSession.runtime.lastTurnEndAt,
+      });
+      // The same merged report, on the managed receipt (L1b). Verified above
+      // against the tracked process, whose pid is the receipt's identity.
+      managedNoteSessionRuntime?.(sessionId, trackedSession.pid, {
+        ...(trackedSession.runtime.assistantTurns !== undefined ? { assistantTurns: trackedSession.runtime.assistantTurns } : {}),
+        ...(trackedSession.runtime.lastTurnEndAt !== undefined ? { lastTurnEndAt: trackedSession.runtime.lastTurnEndAt } : {}),
+        thinking: trackedSession.runtime.thinking ?? false,
+        hasOpenToolCall: trackedSession.runtime.hasOpenToolCall ?? false,
+        pendingUserInput: trackedSession.runtime.pendingUserInput ?? false,
       });
 
       // The cursor only exists in memory until something writes it. A daemon
@@ -2770,6 +2789,12 @@ export async function startDaemon(): Promise<void> {
     // Handle child process exit — preserve session data for resume
     const onChildExited = (pid: number) => {
       const tracked = pidToTrackedSession.get(pid);
+      // A managed attempt's child is gone: its receipt records the exit (L1b).
+      // An exit that cannot be recorded yet is the handlers' own obligation
+      // (retried on maintenance), so tracking is released here regardless.
+      if (managedNoteChildExited?.(pid) === 'deferred') {
+        logger.debug(`[DAEMON RUN] Child exit of PID ${pid} not yet on a receipt; deferred`);
+      }
       if (tracked?.happySessionId) autonomousQualityGateRegistry.noteSessionStopped(tracked.happySessionId);
       const preservedForResume = tracked ? preserveSessionForResume(tracked, `process-exit:${pid}`) : false;
       if (!preservedForResume) {
@@ -3460,6 +3485,8 @@ export async function startDaemon(): Promise<void> {
       // the constructor already registered and intercepts the rest.
       apiMachine.setManagedRuntime(managedHandlers);
       managedDrainLeaseWork = () => managedHandlers.drainLeaseWork();
+      managedNoteSessionRuntime = (sessionId, pid, report) => managedHandlers.noteSessionRuntime(sessionId, pid, report);
+      managedNoteChildExited = (pid) => managedHandlers.noteChildExited(pid);
       managedCloseEntries = () => {
         managedHandlers.closeEntries();
         // A pending login is a child process and a verifier held in memory.
@@ -3657,6 +3684,12 @@ export async function startDaemon(): Promise<void> {
         }),
         discardGithubWorktree: removeGithubTriggerWorktree,
         isSessionRunning: isAutomationSessionRunning,
+        stopSession: (sessionId) => {
+          stopSession(sessionId, {
+            source: 'server-automation',
+            reason: 'GitHub worker session outlived the runtime cap',
+          });
+        },
         isDirectoryInUse: isAutomationDirectoryInUse,
         logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
       }),

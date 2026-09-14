@@ -85,10 +85,17 @@ const ALLOWED_ROUTES: readonly RouteTemplate[] = [
      * only; the branch below refuses it for every other purpose.
      */
     template('POST', '/v1/managed/sessions/:sessionId/permission'),
+    /**
+     * The next turn of a live session, from a browser. Reachable by
+     * `message-send` only: an approver decides what the run may do, not what
+     * it works on next, and the run may not author its own input.
+     */
+    template('POST', '/v1/managed/sessions/:sessionId/follow-up'),
 ];
 
 /** The one route an approver may use that a reader may not. */
 const APPROVAL_ROUTE = 'POST /v1/managed/sessions/:sessionId/permission';
+const FOLLOW_UP_ROUTE = 'POST /v1/managed/sessions/:sessionId/follow-up';
 
 /** Socket events a managed child may emit, and where each carries its session. */
 const ALLOWED_EVENTS: Readonly<Record<string, 'sid' | 'sessionId'>> = {
@@ -113,6 +120,12 @@ const SESSIONLESS_EVENTS: readonly string[] = ['ping', 'rpc-register', 'rpc-unre
  */
 const ALLOWED_RPC_NAMES: readonly string[] = [
     'permission',
+    /**
+     * The child's handler for a relayed next turn (T07-L5-b). Registered by the
+     * runner; reached over HTTP by a `message-send` bearer, never over the
+     * socket by anyone else.
+     */
+    'follow-up',
     'abort',
     // `steer` is deliberately absent. It injects free text into the turn that
     // is already running, which is an instruction the run's admission never
@@ -233,6 +246,12 @@ export function authorizeManagedHttpRequest(input: {
      */
     if (named === APPROVAL_ROUTE) {
         if (input.purpose !== 'approval-control') return deny('purpose-not-allowed');
+    } else if (named === FOLLOW_UP_ROUTE) {
+        if (input.purpose !== 'message-send') return deny('purpose-not-allowed');
+    } else if (input.purpose === 'message-send') {
+        // Authoring the next turn is all this purpose does: no reading, no
+        // writing on the run's behalf.
+        return deny('purpose-not-allowed');
     } else if (input.purpose !== 'runner' && !isReadableRoute(route)) {
         // A reader reads; nothing that writes or runs.
         return deny('purpose-not-allowed');
@@ -358,6 +377,40 @@ export function authorizeManagedRpcName(input: {
     if (purpose === 'runner') return ALLOW;
     if (purpose === 'approval-control' && name === 'permission') return ALLOW;
     return deny('purpose-not-allowed');
+}
+
+/**
+ * Which relayed RPC a browser-side purpose may author.
+ *
+ * The HTTP route already gated the request by purpose; this is the same
+ * binding read again **where the emit happens**, on the replica holding the
+ * socket, after the wait. Without it the emit-time check knew only the
+ * approval purpose, and every authorised next turn died there with the run
+ * reported as unavailable. One purpose, one RPC: an approver answers prompts,
+ * a sender authors the next turn, and neither reaches the other's handler.
+ */
+export function authorizeManagedRelay(input: {
+    purpose: SessionScopedPurpose;
+    rpcName: string;
+}): ManagedScopeDecision {
+    if (input.purpose === 'approval-control' && input.rpcName === 'permission') return ALLOW;
+    if (input.purpose === 'message-send' && input.rpcName === 'follow-up') return ALLOW;
+    return deny('purpose-not-allowed');
+}
+
+/**
+ * RPCs that exist **only** as a relay of somebody else's authority.
+ *
+ * `follow-up` is authored by a `message-send` bearer through the HTTP route and
+ * nowhere else. Without this list the account socket's legacy `rpc-call` —
+ * the owner's own desktop client — could name the method directly, with no
+ * grant to check at the emit and no revocation to honour. Every dispatch of
+ * these names must carry the relayed claims, or it does not go out.
+ */
+const RELAY_ONLY_RPC_NAMES: readonly string[] = ['follow-up'];
+
+export function managedRpcRequiresRelayAuthority(rpcName: string): boolean {
+    return RELAY_ONLY_RPC_NAMES.includes(rpcName);
 }
 
 /** Exposed so a coverage test can compare the list against real consumers. */

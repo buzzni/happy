@@ -11,6 +11,7 @@ vi.mock('@/storage/db', () => ({
 
 class FakeSocket {
     connected = true;
+    data: { clientType?: string; machineId?: string; connectedAt?: number } = {};
     timeoutCalls: number[] = [];
     emitted: Array<{ event: string; payload: unknown }> = [];
     handlers = new Map<string, (...args: any[]) => unknown>();
@@ -137,5 +138,77 @@ describe('rpcHandler result metrics', () => {
 
         expect(callback).toHaveBeenCalledWith({ ok: false, error: 'MCP reconnect failed' });
         expect(await register.metrics()).toContain('rpc_calls_total{method="mcp-reconnect",result="failed"}');
+    });
+});
+
+describe('rpcHandler duplicate machine connections', () => {
+    it.each([false, true])('uses the newest registered machine connection regardless of replica order (reversed=%s)', async (reversed) => {
+        const caller = new FakeSocket('caller');
+        const stale = new FakeSocket('stale');
+        stale.data = { clientType: 'machine-scoped', machineId: 'machine-1', connectedAt: 100 };
+        const current = new FakeSocket('current');
+        current.data = { clientType: 'machine-scoped', machineId: 'machine-1', connectedAt: 200 };
+        // Still in the adapter room, but no longer able to answer the request.
+        const staleEmit = vi.fn(async () => { throw new Error('operation has timed out'); });
+        stale.timeout = vi.fn(() => ({ emitWithAck: staleEmit }));
+        const currentEmit = vi.fn(async () => 'encrypted-result');
+        current.timeout = vi.fn(() => ({ emitWithAck: currentEmit }));
+        rpcHandler('u1', caller as any, fakeIo(reversed ? [current, stale] : [stale, current]) as any);
+        const callback = vi.fn();
+        await caller.trigger('rpc-call', { method: 'machine-1:bash', params: 'encrypted-create-worktree' }, callback);
+        expect(callback).toHaveBeenCalledExactlyOnceWith({ ok: true, result: 'encrypted-result' });
+        expect(currentEmit).toHaveBeenCalledExactlyOnceWith('rpc-request', {
+            method: 'machine-1:bash', params: 'encrypted-create-worktree',
+        });
+        expect(stale.timeout).not.toHaveBeenCalled();
+        expect(staleEmit).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        { clientType: 'session-scoped', connectedAt: 300 },
+        { clientType: 'machine-scoped', machineId: 'other-machine', connectedAt: 300 },
+        {},
+    ])('ignores a foreign room member when the requested machine is registered (%j)', async (foreignData) => {
+        const caller = new FakeSocket('caller');
+        const foreign = new FakeSocket('foreign');
+        foreign.data = foreignData;
+        const current = new FakeSocket('current');
+        current.data = { clientType: 'machine-scoped', machineId: 'machine-1', connectedAt: 200 };
+        rpcHandler('u1', caller as any, fakeIo([foreign, current]) as any);
+        const callback = vi.fn();
+        await caller.trigger('rpc-call', { method: 'machine-1:bash', params: 'encrypted' }, callback);
+        expect(current.timeoutCalls).toEqual([30000]);
+        expect(foreign.timeoutCalls).toEqual([]);
+        expect(callback).toHaveBeenCalledExactlyOnceWith({
+            ok: true, result: { method: 'machine-1:bash', params: 'encrypted' },
+        });
+    });
+
+    it('does not replay a timed-out mutation on another connection', async () => {
+        const caller = new FakeSocket('caller');
+        const stale = new FakeSocket('stale');
+        stale.data = { clientType: 'machine-scoped', machineId: 'machine-1', connectedAt: 100 };
+        const current = new FakeSocket('current');
+        current.data = { clientType: 'machine-scoped', machineId: 'machine-1', connectedAt: 200 };
+        const emit = vi.fn(async () => { throw new Error('operation has timed out'); });
+        current.timeout = vi.fn(() => ({ emitWithAck: emit }));
+        rpcHandler('u1', caller as any, fakeIo([stale, current]) as any);
+        const callback = vi.fn();
+        await caller.trigger('rpc-call', { method: 'machine-1:spawn-happy-session', params: 'encrypted' }, callback);
+        expect(callback).toHaveBeenCalledExactlyOnceWith({ ok: false, error: 'operation has timed out' });
+        expect(emit).toHaveBeenCalledTimes(1);
+        expect(stale.timeoutCalls).toEqual([]);
+    });
+
+    it('preserves session RPC selection when candidates are not machine connections', async () => {
+        const caller = new FakeSocket('caller');
+        const first = new FakeSocket('first');
+        first.data = { clientType: 'session-scoped', connectedAt: 100 };
+        const second = new FakeSocket('second');
+        second.data = { clientType: 'session-scoped', connectedAt: 200 };
+        rpcHandler('u1', caller as any, fakeIo([first, second]) as any);
+        await caller.trigger('rpc-call', { method: 'session-1:permission', params: 'encrypted' }, vi.fn());
+        expect(first.timeoutCalls).toEqual([30000]);
+        expect(second.timeoutCalls).toEqual([]);
     });
 });

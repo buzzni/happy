@@ -2357,6 +2357,20 @@ describe.skipIf(!enabled)('managed control routes (real Fastify + PostgreSQL)', 
             expect(row.attemptId).toBe('attempt-1');
         });
 
+        it('mints the follow-up purpose in the same family when asked, and stores it as such', async () => {
+            const { body, response } = await mintApproval({ purpose: 'message-send' });
+            expect(response.statusCode).toBe(200);
+            expect(response.json().purpose).toBe('message-send');
+            const row = await db.managedSessionGrant.findUniqueOrThrow({
+                where: { grantId: body.grantId as string },
+            });
+            expect(row.purpose).toBe('message-send');
+            expect(row.runId).toBe(runId);
+            // A purpose this family does not know is refused, not folded into approval.
+            const wrong = await mintApproval({ purpose: 'transcript-read' });
+            expect(wrong.response.statusCode).toBe(400);
+        });
+
         it('leaves the runner grant of the same scope alone', async () => {
             /*
              * The regression this exists for: the family carries the viewer, so
