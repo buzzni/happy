@@ -3027,6 +3027,69 @@ describe('runServerAutomationTick', () => {
     expect(notifyGithubTrigger).toHaveBeenCalledTimes(2)
   })
 
+  it('fills eight AgentTask worker slots across ticks and resumes after one finishes', async () => {
+    const { input, store, transport, dispatchAgentTask, spawnSession } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
+    })
+    input.decryptPayload = vi.fn(() => ({
+      name: 'PR review', schedule: { kind: 'github' as const, minutes: 15 as const }, prompt: 'Review',
+      directory: '/repo', scriptCommand: null, suppressSilent: false, agent: 'claude' as const,
+      githubTrigger: {
+        event: 'opened' as const,
+        filter: { baseBranch: null, label: null, excludeDraft: false, authors: [], paths: [] },
+        action: 'agent-task-review' as const, githubCredentialId: 'credential-1',
+      },
+    }))
+    store.write({
+      ...store.read(),
+      githubTriggers: [{
+        automationId: 'automation-1', generation: 2,
+        state: { snapshot: [], highestPrNumber: 0, processed: [], pending: [] },
+      }],
+    })
+    const running = new Set<string>()
+    input.isSessionRunning = vi.fn((id) => running.has(id))
+    spawnSession.mockImplementation(async () => {
+      const sessionId = `review-${spawnSession.mock.calls.length}`
+      running.add(sessionId)
+      return { ok: true, sessionId }
+    })
+    dispatchAgentTask.mockResolvedValue({
+      ok: true,
+      dispatch: {
+        taskId: 'review-task', type: 'pr_review.v1', agentRunId: 'automation:run-1',
+        claimToken: 'claim-secret', completeToken: 'complete-secret',
+        controlUrl: 'https://studio.test/api/agent-tasks', input: {}, context: [],
+      },
+    })
+
+    for (let count = 1; count <= 8; count += 1) {
+      await runServerAutomationTick(input)
+      expect(spawnSession).toHaveBeenCalledTimes(count)
+      expect(running.size).toBe(count)
+      expect(store.state().schedules[0]!.nextRunAt).toBeLessThanOrEqual(input.now + 60_000)
+      input.now += 60_000
+    }
+    await runServerAutomationTick(input)
+    expect(spawnSession).toHaveBeenCalledTimes(8)
+    expect(dispatchAgentTask).toHaveBeenCalledTimes(8)
+    expect(transport.claim).toHaveBeenCalledTimes(8)
+
+    running.delete('review-1')
+    input.now += 60_000
+    await runServerAutomationTick(input)
+    expect(spawnSession).toHaveBeenCalledTimes(9)
+    expect(running.size).toBe(8)
+
+    running.delete('review-2')
+    dispatchAgentTask.mockResolvedValue({ ok: true, dispatch: null })
+    input.now += 60_000
+    await runServerAutomationTick(input)
+    expect(dispatchAgentTask).toHaveBeenCalledTimes(10)
+    expect(spawnSession).toHaveBeenCalledTimes(9)
+    expect(store.state().schedules[0]!.nextRunAt).toBe(input.now + 15 * 60_000)
+  })
+
   it('starts another queued review while below the GitHub worker concurrency limit', async () => {
     const { input, store, transport, queryGithubPullRequests, spawnSession } = setup({
       claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } },
@@ -3043,7 +3106,7 @@ describe('runServerAutomationTick', () => {
     }))
     store.write({
       ...store.read(),
-      schedules: store.read().schedules.map((schedule) => ({ ...schedule, lastSessionId: 'active-review' })),
+      githubActiveSessions: [{ automationId: 'automation-1', generation: 2, sessionIds: workerSessionIds('active-review', 7) }],
       githubTriggers: [{
         automationId: 'automation-1', generation: 2,
         state: {
@@ -3072,7 +3135,7 @@ describe('runServerAutomationTick', () => {
     expect(spawnSession).toHaveBeenCalledTimes(1)
     expect(store.state().githubActiveSessions).toEqual([{
       automationId: 'automation-1', generation: 2,
-      sessionIds: ['active-review', 'session-1'],
+      sessionIds: [...workerSessionIds('active-review', 7), 'session-1'],
     }])
   })
 
