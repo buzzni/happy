@@ -35,22 +35,6 @@ describe('applyAxOrchestration', () => {
         expect(result?.appendSystemPrompt).toMatch(/Step: plan/);
     });
 
-    // Chat workspaces carry no specs bundle and often no state.json at all; the app
-    // sends axStep: 'office' on every turn, so that field alone has to be enough to
-    // put the assistant in 문서모드 rather than the full-stack engineer persona.
-    it('puts a stateless chat workspace into 문서모드 from the office step alone', async () => {
-        const result = await applyAxOrchestration({
-            workspaceRoot: workspace,
-            userText: '주간 보고서 초안 만들어줘',
-            explicitStep: 'office',
-        });
-
-        expect(result?.step).toBe('office');
-        expect(result?.appendSystemPrompt).toMatch(/Step: office/);
-        expect(result?.appendSystemPrompt).toMatch(/문서모드/);
-        expect(result?.appendSystemPrompt).not.toMatch(/Step: free/);
-    });
-
     it('uses an explicit step instead of a stale file step without mutating the file', async () => {
         await bootstrapWorkspace(workspace, 'free');
 

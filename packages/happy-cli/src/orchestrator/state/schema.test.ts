@@ -8,12 +8,11 @@ import {
 } from './schema';
 
 describe('AxStepSchema', () => {
-    it('accepts plan, design, work, free, office', () => {
+    it('accepts plan, design, work, free', () => {
         expect(AxStepSchema.parse('plan')).toBe('plan');
         expect(AxStepSchema.parse('design')).toBe('design');
         expect(AxStepSchema.parse('work')).toBe('work');
         expect(AxStepSchema.parse('free')).toBe('free');
-        expect(AxStepSchema.parse('office')).toBe('office');
     });
 
     it('rejects unknown step', () => {

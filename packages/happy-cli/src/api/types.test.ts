@@ -84,8 +84,10 @@ describe('MessageMetaSchema modelSource', () => {
 });
 
 describe('MessageMetaSchema axStep', () => {
-  it('accepts office — the chat workspace 문서모드 step', () => {
-    expect(MessageMetaSchema.parse({ axStep: 'office' })).toEqual({ axStep: 'office' });
+  it('accepts plan, design, and free', () => {
+    expect(MessageMetaSchema.parse({ axStep: 'plan' })).toEqual({ axStep: 'plan' });
+    expect(MessageMetaSchema.parse({ axStep: 'design' })).toEqual({ axStep: 'design' });
+    expect(MessageMetaSchema.parse({ axStep: 'free' })).toEqual({ axStep: 'free' });
   });
 
   // Same hazard as saycodePromptBlocks above: a strict enum here means a newer app

@@ -269,7 +269,7 @@ export interface SpawnSessionOptions {
      */
     createdByAccountId?: string;
     createdByDisplayName?: string;
-    axStep?: 'plan' | 'design' | 'free' | 'office';
+    axStep?: 'plan' | 'design' | 'free';
     bootstrapFiles?: Array<{ relativePath: string; content: string }>;
     /**
      * First user prompt for the spawned session. Delivered via
