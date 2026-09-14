@@ -1,4 +1,5 @@
 import { isSaycodePromptBlockEnabled, type SaycodePromptBlockOverrides } from '@/prompt/promptProvenance';
+import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
 
 function joinPromptBlocks(blocks: Array<string | undefined>): string | undefined {
   const prompt = blocks.filter((block): block is string => Boolean(block)).join('\n\n');
@@ -60,6 +61,7 @@ export function buildClaudeSystemPromptOptions({
       orchestratorPrompt,
       isWorkerDelegationEnabled ? workerDelegationPrompt : undefined,
       connectorGuidance,
+      saycodeSystemPromptEnabled !== false ? SAYCODE_API_GATEWAY_PROMPT : undefined,
     ]),
   };
 }
