@@ -24,4 +24,15 @@ describe('runClaude session model pin wiring', () => {
     it('still normalizes the model it hands to the SDK', () => {
         expect(source).toContain('normalizeClaudeModelForRuntime(requestedInitialModel, process.env)');
     });
+
+    // A spawn that named no model is the real Default path (the web UI omits
+    // meta.model for a Default selection and its spawn RPC carries no model at
+    // all). A bare DEFAULT_CLAUDE_MODEL here resolves to glm-5.3 on Z.AI —
+    // ~18x the input price of the flash model the product defaults to.
+    it('routes the no-model fallback through the runtime default', () => {
+        expect(source).toContain(
+            'explicitInitialModel ?? defaultClaudeModelForRuntime(process.env, DEFAULT_CLAUDE_MODEL)',
+        );
+        expect(source).not.toContain('explicitInitialModel ?? DEFAULT_CLAUDE_MODEL');
+    });
 });

@@ -62,7 +62,7 @@ import {
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
-import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
+import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, defaultClaudeModelForRuntime, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import {
     createSessionModelPinPublisher,
     publishedSessionModelPin,
@@ -689,7 +689,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // pin publish call below for why the runtime substitution must not leak out.
     const requestedInitialModel = consumePendingInitialModel(process.env) ?? options.model;
     const explicitInitialModel = normalizeClaudeModelForRuntime(requestedInitialModel, process.env);
-    const initialModelSeed = explicitInitialModel ?? DEFAULT_CLAUDE_MODEL;
+    const initialModelSeed = explicitInitialModel ?? defaultClaudeModelForRuntime(process.env, DEFAULT_CLAUDE_MODEL);
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env);
     if (rawInitialEffortSeed && !VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)) {
         logger.debug(`[START] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);

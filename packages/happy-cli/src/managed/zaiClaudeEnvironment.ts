@@ -29,16 +29,6 @@ export const ZAI_CLAUDE_MODELS = {
 } as const;
 
 /**
- * What an unpicked 'default' selection resolves to on the GLM route.
- *
- * Not one of the three tiers above: GLM-5.3-Flash is a distinct, much
- * cheaper model (see aiUsagePricing.ts in web-ui) offered as its own
- * catalog entry, and it is also what a session gets when nothing more
- * specific was chosen.
- */
-export const ZAI_CLAUDE_DEFAULT_MODEL = 'glm-5.3-flash';
-
-/**
  * Long, and deliberately: a GLM turn routed through the Anthropic wire can sit
  * well past the SDK's own default before its first token arrives.
  */

@@ -13,6 +13,7 @@ import {
   consumePendingInitialPrompt,
   consumePendingInitialSaycodePromptBlocks,
   consumePendingInitialSaycodeSystemPromptEnabled,
+  defaultClaudeModelForRuntime,
   normalizeClaudeModelForRuntime,
   stageInitialPromptEnvironment,
 } from './initialPrompt'
@@ -159,6 +160,25 @@ describe('normalizeClaudeModelForRuntime', () => {
     expect(normalizeClaudeModelForRuntime('glm-5.3-flash', {
       ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
     })).toBe('glm-5.3-flash')
+  })
+})
+
+// web-ui 는 'Default' 선택 시 meta.model 을 **아예 싣지 않고**(sync/index.ts:
+// `resolvedModel !== 'default' ? { model } : {}`), spawn RPC 에는 model 파라미터
+// 자체가 없다. 그래서 실제 "기본값" 경로는 'default' 문자열이 아니라 **모델 부재**다.
+// 여기서 opus 로 떨어지면 z.ai 에서 glm-5.3 (flash 대비 input 약 18배) 이 걸린다.
+describe('defaultClaudeModelForRuntime', () => {
+  it('falls back to GLM-5.3-Flash when a Z.AI spawn named no model', () => {
+    expect(defaultClaudeModelForRuntime({
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    }, 'opus')).toBe('glm-5.3-flash')
+  })
+
+  it('leaves the plain Claude fallback untouched', () => {
+    expect(defaultClaudeModelForRuntime({}, 'opus')).toBe('opus')
+    expect(defaultClaudeModelForRuntime({
+      ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+    }, 'opus')).toBe('opus')
   })
 })
 
