@@ -76,8 +76,15 @@ const DELEGATION_PROMPT = [
 
 /** Reads the per-session worker config from a process env-like record (pure). */
 export function readWorkerConfigFromEnv(env: Record<string, string | undefined>): WorkerConfig {
+    const requested = env.HAPPY_WORKER_MODEL
+    // 'default' here means "inherit the main model", not "the runtime's default
+    // model" — the two meanings collide on Z.AI, where the normalizer turns
+    // 'default' into a concrete model id. Translating it would flip delegation
+    // on (and append the orchestrator prompt) for a session that asked for the
+    // opposite, so the inherit sentinels are passed through untouched.
+    const inherits = INHERIT_MODEL_VALUES.has((requested ?? '').trim().toLowerCase())
     return {
-        workerModel: normalizeClaudeModelForRuntime(env.HAPPY_WORKER_MODEL, env),
+        workerModel: inherits ? requested : normalizeClaudeModelForRuntime(requested, env),
         workerEffort: env.HAPPY_WORKER_EFFORT,
     }
 }

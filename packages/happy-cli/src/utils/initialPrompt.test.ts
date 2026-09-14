@@ -13,6 +13,7 @@ import {
   consumePendingInitialPrompt,
   consumePendingInitialSaycodePromptBlocks,
   consumePendingInitialSaycodeSystemPromptEnabled,
+  defaultClaudeModelForRuntime,
   normalizeClaudeModelForRuntime,
   stageInitialPromptEnvironment,
 } from './initialPrompt'
@@ -145,6 +146,50 @@ describe('normalizeClaudeModelForRuntime', () => {
       ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
     })).toBe('haiku')
     expect(normalizeClaudeModelForRuntime('claude-fable-5', {})).toBe('claude-fable-5')
+  })
+
+  it('resolves an unpicked Default to GLM-5.3-Flash on the Z.AI runtime', () => {
+    expect(normalizeClaudeModelForRuntime('default', {
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    })).toBe('glm-5.3-flash')
+    // 비 z.ai 런타임에서는 'default' 를 그대로 둔다 — CLI 자신의 기본 해석에 맡긴다.
+    expect(normalizeClaudeModelForRuntime('default', {})).toBe('default')
+  })
+
+  it('passes an explicitly picked GLM model id straight through unchanged', () => {
+    expect(normalizeClaudeModelForRuntime('glm-5.3-flash', {
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    })).toBe('glm-5.3-flash')
+  })
+})
+
+// web-ui 는 'Default' 선택 시 meta.model 을 **아예 싣지 않고**(sync/index.ts:
+// `resolvedModel !== 'default' ? { model } : {}`), spawn RPC 에는 model 파라미터
+// 자체가 없다. 그래서 실제 "기본값" 경로는 'default' 문자열이 아니라 **모델 부재**다.
+// 여기서 opus 로 떨어지면 z.ai 에서 glm-5.3 (flash 대비 input 약 18배) 이 걸린다.
+describe('defaultClaudeModelForRuntime', () => {
+  it('falls back to GLM-5.3-Flash when a Z.AI spawn named no model', () => {
+    expect(defaultClaudeModelForRuntime({
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    }, 'opus')).toBe('glm-5.3-flash')
+  })
+
+  // happy-app(모바일/데스크탑)은 'Default' 를 meta.model = null 로 보낸다
+  // (sources/sync/messageMeta.ts:27). CLI 는 그것을 undefined 로 normalize 하는데,
+  // z.ai 에서 undefined 로 두면 CLI 기본 tier(sonnet) = glm-4.7 로 가버린다.
+  it('also covers a cleared model, which has no string fallback', () => {
+    expect(defaultClaudeModelForRuntime({
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    }, undefined)).toBe('glm-5.3-flash')
+    // 일반 Claude 세션의 '기본값으로 리셋' 은 그대로 undefined 여야 한다.
+    expect(defaultClaudeModelForRuntime({}, undefined)).toBeUndefined()
+  })
+
+  it('leaves the plain Claude fallback untouched', () => {
+    expect(defaultClaudeModelForRuntime({}, 'opus')).toBe('opus')
+    expect(defaultClaudeModelForRuntime({
+      ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+    }, 'opus')).toBe('opus')
   })
 })
 

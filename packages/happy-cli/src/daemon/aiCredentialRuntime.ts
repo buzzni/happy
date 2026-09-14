@@ -6,7 +6,12 @@ import {
   getCodexMultiAuthProxyStatus,
   isManagedCodexRotationSettings,
 } from '../codex/codexMultiAuthProxy'
-import { buildZaiClaudeEnvironment } from '../managed/zaiClaudeEnvironment'
+import {
+  buildZaiClaudeEnvironment,
+  ZAI_CLAUDE_DEFAULT_MODEL,
+  ZAI_CLAUDE_MODELS,
+  ZAI_CLAUDE_TIMEOUT_MS,
+} from '../managed/zaiClaudeEnvironment'
 import { overlayManagedCredentialEnvironment } from './sessionEnv'
 
 const MAX_PAYLOAD_BYTES = 1024 * 1024
@@ -668,13 +673,22 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     }
     if (!isObject(parsed)) throw new AiCredentialRuntimeError('ZAI_ENV_INVALID')
     const values = Object.values(parsed)
-    if (Object.keys(parsed).length !== 6
+    // ANTHROPIC_MODEL was added after machines were already running, and the
+    // file on disk is only rewritten on the next apply. Rejecting the older
+    // six-key form would invalidate the Z.AI credential of every machine
+    // between this CLI landing and that apply, so both shapes are accepted —
+    // such a session still reaches the flash default through the per-path
+    // fallbacks. The key set stays closed either way: an extra key is still
+    // rejected, so this file cannot smuggle arbitrary env into a session.
+    const hasDefaultModel = 'ANTHROPIC_MODEL' in parsed
+    if (Object.keys(parsed).length !== (hasDefaultModel ? 7 : 6)
       || values.some((value) => typeof value !== 'string')
       || parsed.ANTHROPIC_BASE_URL !== 'https://api.z.ai/api/anthropic'
-      || parsed.API_TIMEOUT_MS !== '3000000'
-      || parsed.ANTHROPIC_DEFAULT_OPUS_MODEL !== 'glm-5.3'
-      || parsed.ANTHROPIC_DEFAULT_SONNET_MODEL !== 'glm-4.7'
-      || parsed.ANTHROPIC_DEFAULT_HAIKU_MODEL !== 'glm-4.7'
+      || parsed.API_TIMEOUT_MS !== ZAI_CLAUDE_TIMEOUT_MS
+      || (hasDefaultModel && parsed.ANTHROPIC_MODEL !== ZAI_CLAUDE_DEFAULT_MODEL)
+      || parsed.ANTHROPIC_DEFAULT_OPUS_MODEL !== ZAI_CLAUDE_MODELS.opus
+      || parsed.ANTHROPIC_DEFAULT_SONNET_MODEL !== ZAI_CLAUDE_MODELS.sonnet
+      || parsed.ANTHROPIC_DEFAULT_HAIKU_MODEL !== ZAI_CLAUDE_MODELS.haiku
       || typeof parsed.ANTHROPIC_AUTH_TOKEN !== 'string'
       || !/^[\x21-\x7e]{1,1024}$/.test(parsed.ANTHROPIC_AUTH_TOKEN)) {
       throw new AiCredentialRuntimeError('ZAI_ENV_INVALID')

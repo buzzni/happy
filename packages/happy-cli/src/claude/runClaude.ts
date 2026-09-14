@@ -63,7 +63,7 @@ import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata'
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
-import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
+import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, defaultClaudeModelForRuntime, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import {
     createSessionModelPinPublisher,
     publishedSessionModelPin,
@@ -705,7 +705,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // pin publish call below for why the runtime substitution must not leak out.
     const requestedInitialModel = consumePendingInitialModel(process.env) ?? options.model;
     const explicitInitialModel = normalizeClaudeModelForRuntime(requestedInitialModel, process.env);
-    const initialModelSeed = explicitInitialModel ?? DEFAULT_CLAUDE_MODEL;
+    const initialModelSeed = explicitInitialModel ?? defaultClaudeModelForRuntime(process.env, DEFAULT_CLAUDE_MODEL);
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env);
     if (rawInitialEffortSeed && !VALID_CLAUDE_EFFORTS.has(rawInitialEffortSeed)) {
         logger.debug(`[START] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
@@ -974,6 +974,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 message.meta.model || undefined,
                 process.env,
             ); // null and Z.AI-incompatible Fable become undefined
+            // A cleared model means "the default" — and on Z.AI the default is
+            // the flash model, not the SDK's own sonnet tier (= glm-4.7 there).
+            // happy-app sends exactly this for a Default selection, so without
+            // it the first mobile turn silently changes the session's model.
+            messageModel = defaultClaudeModelForRuntime(process.env, messageModel);
             currentModel = messageModel;
             logger.debug(`[loop] Model updated from user message: ${messageModel || 'reset to default'}`);
         } else {

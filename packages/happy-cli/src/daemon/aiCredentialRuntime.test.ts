@@ -158,6 +158,7 @@ describe('AI credential machine runtime', () => {
       ANTHROPIC_AUTH_TOKEN: 'zai-secret-key',
       ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
       API_TIMEOUT_MS: '3000000',
+      ANTHROPIC_MODEL: 'glm-5.3-flash',
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3',
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7',
@@ -168,6 +169,7 @@ describe('AI credential machine runtime', () => {
       ANTHROPIC_AUTH_TOKEN: 'zai-secret-key',
       ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
       API_TIMEOUT_MS: '3000000',
+      ANTHROPIC_MODEL: 'glm-5.3-flash',
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3',
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7',
@@ -264,10 +266,13 @@ describe('AI credential machine runtime', () => {
       ANTHROPIC_AUTH_TOKEN: 'zai-secret-key',
       ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3',
+      // 상속된 claude-opus-5 를 지우는 데서 그치지 않고 z.ai 가 실제로 서빙하는
+      // 기본 모델로 덮어쓴다. 이 변수가 "아무것도 고르지 않았을 때" 의 최종
+      // 기준점이라, 개별 코드 경로를 일일이 패치하지 않아도 기본값이 하나로 모인다.
+      ANTHROPIC_MODEL: 'glm-5.3-flash',
     }))
     expect(probeEnvironment).not.toHaveProperty('ANTHROPIC_API_KEY')
     expect(probeEnvironment).not.toHaveProperty('CLAUDE_CODE_OAUTH_TOKEN')
-    expect(probeEnvironment).not.toHaveProperty('ANTHROPIC_MODEL')
     expect(probeEnvironment).not.toHaveProperty('ANTHROPIC_SMALL_FAST_MODEL')
   })
 
@@ -285,6 +290,41 @@ describe('AI credential machine runtime', () => {
     await expect(runtime.status({ provider: 'zai' })).resolves.toEqual({
       provider: 'zai', configured: false, accountCount: 0,
     })
+  })
+
+  // ANTHROPIC_MODEL 은 머신이 이미 돌고 있는 상태에서 추가된 키다. 디스크의 파일은
+  // 다음 apply 때까지 예전 6키 형태로 남아 있으므로, 그 사이 이 CLI 가 배포되면
+  // 기존 파일을 계속 읽을 수 있어야 한다 — 거부하면 재적용 전까지 z.ai 자격이
+  // 통째로 무효가 된다. 반대로 모르는 키가 하나라도 끼면 여전히 거부해야 한다.
+  it('still accepts the pre-ANTHROPIC_MODEL environment written by an older CLI', async () => {
+    const { runtime, files } = setup()
+    const legacyEnvironment = {
+      ANTHROPIC_AUTH_TOKEN: 'zai-secret-key',
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+      API_TIMEOUT_MS: '3000000',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7',
+    }
+
+    await runtime.apply({
+      provider: 'zai',
+      payload: zaiPayload,
+      trialLease: { ...trialLease, leaseId: 'lease-zai-1' },
+    })
+    files.set(
+      '/home/operator/.happy/zai-claude-env.json',
+      JSON.stringify(legacyEnvironment),
+    )
+
+    await expect(runtime.sessionEnvironment('claude')).resolves.toEqual(legacyEnvironment)
+
+    // 닫힌 키 집합은 그대로 — 임의 env 주입은 조용히 무시되는 게 아니라 거부된다.
+    files.set(
+      '/home/operator/.happy/zai-claude-env.json',
+      JSON.stringify({ ...legacyEnvironment, SOMETHING_ELSE: 'injected' }),
+    )
+    await expect(runtime.sessionEnvironment('claude')).rejects.toThrow(/ZAI_ENV_INVALID/)
   })
 
   it('reports a Z.AI key as unconfigured when the live Claude probe is not exact', async () => {

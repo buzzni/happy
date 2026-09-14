@@ -6,6 +6,7 @@ import { join } from 'node:path'
 
 import type { RawJSONLines } from '@/claude/types'
 import type { PermissionMode } from '@/api/types'
+import { ZAI_CLAUDE_DEFAULT_MODEL } from '@/managed/zaiClaudeEnvironment'
 
 /**
  * Largest prompt we still pass inline as an environment value.
@@ -96,16 +97,38 @@ export function consumePendingInitialModel(env: NodeJS.ProcessEnv): string | nul
   return model.length > 0 ? model : null
 }
 
+function isZaiClaudeRuntime(env: NodeJS.ProcessEnv): boolean {
+  return env.ANTHROPIC_BASE_URL === 'https://api.z.ai/api/anthropic'
+}
+
 export function normalizeClaudeModelForRuntime(
   model: string | undefined,
   env: NodeJS.ProcessEnv,
 ): string | undefined {
-  if (env.ANTHROPIC_BASE_URL !== 'https://api.z.ai/api/anthropic' || !model) return model
+  if (!isZaiClaudeRuntime(env) || !model) return model
   if (model === 'fable' || model.startsWith('claude-fable-')) return undefined
+  if (model === 'default') return ZAI_CLAUDE_DEFAULT_MODEL
   if (model.startsWith('claude-opus-')) return 'opus'
   if (model.startsWith('claude-sonnet-')) return 'sonnet'
   if (model.startsWith('claude-haiku-')) return 'haiku'
   return model
+}
+
+/**
+ * The model a session runs when the spawn named none.
+ *
+ * This — not the 'default' string — is the real Default path: the web UI omits
+ * meta.model entirely for a Default selection and its spawn RPC has no model
+ * parameter at all, so nothing reaches normalizeClaudeModelForRuntime. Letting
+ * the plain CLI fallback ('opus') stand would resolve to glm-5.3 on Z.AI, ~18x
+ * the input price of the flash model the product defaults to. The caller keeps
+ * owning the non-Z.AI fallback so ordinary Claude sessions are untouched.
+ */
+export function defaultClaudeModelForRuntime(
+  env: NodeJS.ProcessEnv,
+  fallback: string | undefined,
+): string | undefined {
+  return isZaiClaudeRuntime(env) ? ZAI_CLAUDE_DEFAULT_MODEL : fallback
 }
 
 /**
