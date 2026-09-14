@@ -182,3 +182,37 @@ guard/install smoke가 통과했다.
 원인을 숨기던 진단 누락을 수정했다. 실패 메시지가 Chrome 재기동에 필요한
 `--enable-unsafe-extension-debugging` 플래그를 직접 안내한다.
 Happy CLI 관련 169개 테스트와 typecheck/build가 통과했다.
+
+## 2026-09-14 — 원격 화면의 절반이 검게 남던 문제
+
+사용자 보고: noVNC 화면이 열리기는 하는데 "화면의 반 밖에 사용을 못 한다".
+
+원인은 세 가지가 겹친 것이다. 뷰어 디스플레이에는 **window manager 가 없고**,
+Chrome 은 `--window-size` 없이 떠서 **자기 기본 창 크기**를 쓰며, 그 창을
+나중에 최대화하거나 끌어서 늘려 줄 주체가 아무도 없다. 즉 기동 시점의 크기가
+그대로 최종 크기다.
+
+prod 체험 머신(`saycode-trial-machines-prod` / `80e999da010d28`)에서 실측:
+
+| 대상 | 창 bounds | 화면 |
+|---|---|---|
+| 사용자의 뷰어 Chromium (현행) | `945x1060 @ (10,10)` | `1920x1080` |
+| 같은 이미지, `--window-position=0,0 --window-size=1920,1080` | `1919x1079 @ (0,0)` | `1920x1080` |
+| 같은 이미지, 플래그 없음 (대조군) | `945x1060 @ (10,10)` | `1920x1080` |
+
+측정은 X11 유틸이 이미지에 없어 Chrome 자신의 CDP `Browser.getWindowForTarget`
+으로 했다. 대조군이 사용자 값과 정확히 일치하므로 플래그가 원인을 바꾼 것이
+맞다. 실험은 사용자의 `:99` 를 건드리지 않도록 별도 `:121` 디스플레이와 별도
+프로필에서 돌리고 전부 정리했다.
+
+수정: 화면 크기를 `remoteViewer.ts` 의 `VIEWER_SCREEN` 한 곳에 두고 Xvfb 와
+Chrome 창이 같은 값을 읽는다. 창 크기는 **우리가 소유한 디스플레이에만** 건다 —
+데스크톱의 실제 DISPLAY 로 뜨는 Chrome 의 창 배치는 그 사용자 것이다.
+`--window-position=0,0` 을 같이 주는 이유는 Chrome 이 프로필에 저장된 이전
+창 위치를 복원하기 때문이다(현행 값이 `(10,10)` 인 것이 그 흔적).
+
+한계: 이미 떠 있는 뷰어 Chrome 은 재사용되므로 이 플래그가 소급 적용되지
+않는다. 머신이 재시작돼 Chrome 이 새로 뜰 때부터 반영된다.
+
+검증: buildChromeLaunchArgs/VIEWER_SCREEN 신규 테스트 4개(수정 전 3개 red),
+viewer·browser 관련 10개 파일 189개 통과, CLI typecheck/build 통과.
