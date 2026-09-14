@@ -10,6 +10,7 @@ import { claudeFindLastSession } from "./utils/claudeFindLastSession";
 import { getProjectPath } from "./utils/path";
 import { projectPath } from "@/projectPath";
 import { CHAT_TITLE_SYSTEM_PROMPT, saycodeOwnedSystemPrompt } from "./utils/systemPrompt";
+import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
 import { isSaycodePromptBlockEnabled, type SaycodePromptBlockOverrides } from "@/prompt/promptProvenance";
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
 import type { SandboxConfig } from "@/persistence";
@@ -246,6 +247,7 @@ export async function claudeLocal(opts: {
                 isSaycodePromptBlockEnabled(
                     'agentOrchestration', opts.saycodePromptBlocks, opts.saycodeSystemPromptEnabled,
                 ) ? AGENT_ORCHESTRATION_SYSTEM_PROMPT : undefined,
+                opts.saycodeSystemPromptEnabled !== false ? SAYCODE_API_GATEWAY_PROMPT : undefined,
             ].filter(Boolean).join('\n\n');
             args.push('--append-system-prompt', localSystemPrompt);
 

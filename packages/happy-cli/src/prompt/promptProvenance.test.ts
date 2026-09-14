@@ -13,6 +13,7 @@ describe('prompt provenance inventory', () => {
   it('classifies every current provider and client-composed block', () => {
     expect(PROMPT_BLOCK_PROVENANCE).toEqual({
       'common:agent-orchestration': 'saycode',
+      'common:api-gateway': 'saycode',
       'claude:title': 'always-on',
       'claude:co-authored-credit': 'saycode',
       'claude:orchestrator': 'selected-feature',
