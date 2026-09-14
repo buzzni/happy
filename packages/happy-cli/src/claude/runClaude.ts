@@ -928,6 +928,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 message.meta.model || undefined,
                 process.env,
             ); // null and Z.AI-incompatible Fable become undefined
+            // A cleared model means "the default" — and on Z.AI the default is
+            // the flash model, not the SDK's own sonnet tier (= glm-4.7 there).
+            // happy-app sends exactly this for a Default selection, so without
+            // it the first mobile turn silently changes the session's model.
+            messageModel = defaultClaudeModelForRuntime(process.env, messageModel);
             currentModel = messageModel;
             logger.debug(`[loop] Model updated from user message: ${messageModel || 'reset to default'}`);
         } else {

@@ -126,8 +126,8 @@ export function normalizeClaudeModelForRuntime(
  */
 export function defaultClaudeModelForRuntime(
   env: NodeJS.ProcessEnv,
-  fallback: string,
-): string {
+  fallback: string | undefined,
+): string | undefined {
   return isZaiClaudeRuntime(env) ? ZAI_CLAUDE_DEFAULT_MODEL : fallback
 }
 

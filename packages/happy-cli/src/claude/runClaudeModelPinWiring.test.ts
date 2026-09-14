@@ -35,4 +35,17 @@ describe('runClaude session model pin wiring', () => {
         );
         expect(source).not.toContain('explicitInitialModel ?? DEFAULT_CLAUDE_MODEL');
     });
+
+    // happy-app sends meta.model = null for a Default selection
+    // (sources/sync/messageMeta.ts), which normalizes to undefined. Left that
+    // way on Z.AI the SDK falls to its own sonnet tier = glm-4.7, so the same
+    // Default that seeds flash would switch models on the first mobile turn.
+    it('applies the runtime default to a cleared model, but never to the fallback model', () => {
+        expect(source).toContain(
+            'messageModel = defaultClaudeModelForRuntime(process.env, messageModel)',
+        );
+        expect(source).not.toContain(
+            'messageFallbackModel = defaultClaudeModelForRuntime(',
+        );
+    });
 });

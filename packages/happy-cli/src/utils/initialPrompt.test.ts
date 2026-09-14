@@ -174,6 +174,17 @@ describe('defaultClaudeModelForRuntime', () => {
     }, 'opus')).toBe('glm-5.3-flash')
   })
 
+  // happy-app(모바일/데스크탑)은 'Default' 를 meta.model = null 로 보낸다
+  // (sources/sync/messageMeta.ts:27). CLI 는 그것을 undefined 로 normalize 하는데,
+  // z.ai 에서 undefined 로 두면 CLI 기본 tier(sonnet) = glm-4.7 로 가버린다.
+  it('also covers a cleared model, which has no string fallback', () => {
+    expect(defaultClaudeModelForRuntime({
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    }, undefined)).toBe('glm-5.3-flash')
+    // 일반 Claude 세션의 '기본값으로 리셋' 은 그대로 undefined 여야 한다.
+    expect(defaultClaudeModelForRuntime({}, undefined)).toBeUndefined()
+  })
+
   it('leaves the plain Claude fallback untouched', () => {
     expect(defaultClaudeModelForRuntime({}, 'opus')).toBe('opus')
     expect(defaultClaudeModelForRuntime({
