@@ -127,6 +127,7 @@ import {
     buildWebsockifyArgs,
     buildX11vncArgs,
     buildXvfbArgs,
+    VIEWER_SCREEN,
     VIEWER_SLOTS,
     VIEWER_VNC_PORTS,
     VIEWER_WEB_PORTS,
@@ -1266,11 +1267,16 @@ export class ApiMachineClient {
             }
             const headless = chosen.headless;
             const env = chosen.display ? { DISPLAY: chosen.display } : undefined;
+            // Sized only when this Chrome is going onto the viewer's own
+            // Xvfb screen. A daemon running under a real desktop display
+            // gets Chrome's normal window, which is that user's to arrange.
+            const windowSize = viewerState ? VIEWER_SCREEN : undefined;
             let launched = launchChrome(chrome.path, {
                 userDataDir,
                 cdpPort,
                 headless,
                 display: chosen.display ?? undefined,
+                windowSize,
             }, env);
             let { pid } = launched;
             let ready = await waitForCdp(cdpPort, 15_000);
@@ -1288,6 +1294,7 @@ export class ApiMachineClient {
                     headless,
                     display: chosen.display ?? undefined,
                     noSandbox: true,
+                    windowSize,
                 }, env);
                 ({ pid } = launched);
                 ready = await waitForCdp(cdpPort, 15_000);
@@ -2056,7 +2063,7 @@ export class ApiMachineClient {
         if (vncPort === null || webPort === null) {
             throw new Error('원격 화면에 쓸 포트를 찾지 못했습니다.');
         }
-        spawnDetached('Xvfb', buildXvfbArgs({ display, width: 1920, height: 1080 }));
+        spawnDetached('Xvfb', buildXvfbArgs({ display, ...VIEWER_SCREEN }));
         await delay(1500);
         spawnDetached('x11vnc', buildX11vncArgs({ display, vncPort }));
         await delay(800);
@@ -2199,7 +2206,7 @@ export class ApiMachineClient {
 
         const profileDir = resolveViewerProfileDir(configuration.happyHomeDir, viewerKey);
         mkdirSync(profileDir, { recursive: true, mode: 0o700 });
-        const xvfb = spawnDetached('Xvfb', buildXvfbArgs({ display: slot.display, width: 1920, height: 1080 }));
+        const xvfb = spawnDetached('Xvfb', buildXvfbArgs({ display: slot.display, ...VIEWER_SCREEN }));
         await delay(1500);
         const x11vnc = spawnDetached('x11vnc', buildX11vncArgs({ display: slot.display, vncPort: slot.vncPort }));
         await delay(800);
@@ -2315,7 +2322,7 @@ export class ApiMachineClient {
         const cdpPort = await pickFreeCdpPort();
         if (cdpPort === null) return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
         const env = { DISPLAY: display };
-        let launched = launchChrome(chrome.path, { userDataDir, cdpPort, headless: false, display }, env);
+        let launched = launchChrome(chrome.path, { userDataDir, cdpPort, headless: false, display, windowSize: VIEWER_SCREEN }, env);
         let up = await waitForCdp(cdpPort, 15_000);
         if (!up) {
             // Same kernel/namespace fallback the launch RPC uses.
@@ -2326,6 +2333,7 @@ export class ApiMachineClient {
                 headless: false,
                 display,
                 noSandbox: true,
+                windowSize: VIEWER_SCREEN,
             }, env);
             up = await waitForCdp(cdpPort, 15_000);
         }

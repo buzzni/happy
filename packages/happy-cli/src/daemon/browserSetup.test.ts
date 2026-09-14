@@ -86,6 +86,46 @@ describe('buildChromeLaunchArgs', () => {
         expect(args.some((arg) => arg.startsWith('--headless'))).toBe(false)
     })
 
+    it('fills the whole screen when a window size is requested', () => {
+        // The viewer display has no window manager, so nothing ever resizes
+        // or maximizes this window: whatever size Chrome picks at launch is
+        // the size the user is stuck with. Chrome's own default (1050x1400)
+        // left roughly half of the 1920x1080 remote screen black, with no way
+        // to reclaim it (observed on a trial machine, 2026-09-14).
+        const args = buildChromeLaunchArgs({
+            userDataDir: '/p/a',
+            cdpPort: 9222,
+            headless: false,
+            display: ':99',
+            windowSize: { width: 1920, height: 1080 },
+        })
+
+        expect(args).toContain('--window-size=1920,1080')
+    })
+
+    it('anchors the window at the screen origin when a window size is requested', () => {
+        // Chrome restores the previous window bounds from the persisted
+        // profile, so an offset left behind by an earlier launch would push
+        // the window off the screen edge again even at the right size.
+        const args = buildChromeLaunchArgs({
+            userDataDir: '/p/a',
+            cdpPort: 9222,
+            headless: false,
+            display: ':99',
+            windowSize: { width: 1920, height: 1080 },
+        })
+
+        expect(args).toContain('--window-position=0,0')
+    })
+
+    it('leaves the window size to Chrome when none is requested', () => {
+        // A desktop machine's own display is not ours to resize.
+        const args = buildChromeLaunchArgs({ userDataDir: '/p/a', cdpPort: 9222 })
+
+        expect(args.some((arg) => arg.startsWith('--window-size'))).toBe(false)
+        expect(args.some((arg) => arg.startsWith('--window-position'))).toBe(false)
+    })
+
     it('keeps the viewer display in the process arguments after Chrome sanitizes its environment', () => {
         const args = buildChromeLaunchArgs({
             userDataDir: '/p/a',
