@@ -10,7 +10,7 @@
  * older global copy, and `uv tool install --upgrade` installs when absent
  * and upgrades when outdated.
  *
- * Two conditions gate the work:
+ * Two conditions gate the normal path:
  *
  *   npm_config_global  Only a global CLI install should reach out and put
  *                      two more binaries on the user's PATH. npm leaves
@@ -23,6 +23,13 @@
  *                      the artifact and must not start depending on two
  *                      unrelated registries being reachable.
  *
+ * `HAPPY_SKIP_COMPANION_TOOLS` opts out regardless. guard-publish-artifact.cjs
+ * sets it so its smoke install stays hermetic: it asserts the dependency
+ * closure with `npm ls --global --prefix`, which covers everything in that
+ * prefix, and codex-multi-auth ships nested packages npm reports as `invalid`
+ * — enough to fail the guard and blame Happy's own artifact for it. The same
+ * switch lets an image build or an offline install skip the network entirely.
+ *
  * Under sudo only the npm half runs — see shouldInstallUvTools below.
  *
  * This never fails the happy install: a missing npm/uv or a failed
@@ -34,6 +41,9 @@ const { spawnSync } = require('node:child_process');
 const IS_WINDOWS = process.platform === 'win32';
 
 function shouldInstallCompanionTools(env) {
+    if (env.HAPPY_SKIP_COMPANION_TOOLS) {
+        return false;
+    }
     // `CI=false` / `CI=0` is a deliberate "not CI" signal, not a CI marker.
     const inCi = Boolean(env.CI) && env.CI !== '0' && env.CI !== 'false';
     return env.npm_config_global === 'true' && !inCi;

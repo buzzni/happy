@@ -35,6 +35,16 @@ describe('shouldInstallCompanionTools', () => {
         expect(shouldInstallCompanionTools({ npm_config_global: 'true', CI: '' })).toBe(true);
     });
 
+    // guard-publish-artifact.cjs sets this for its smoke install: the companion
+    // packages would otherwise land in the prefix whose dependency closure it
+    // asserts, turning a third-party package's problems into a Happy failure.
+    it('skips when HAPPY_SKIP_COMPANION_TOOLS is set', () => {
+        expect(shouldInstallCompanionTools({
+            npm_config_global: 'true',
+            HAPPY_SKIP_COMPANION_TOOLS: '1',
+        })).toBe(false);
+    });
+
     // `CI=false` is how people explicitly say "this is not CI"; reading it as a
     // CI marker would silently withhold the companion CLIs from a real install.
     it('treats CI=false and CI=0 as not CI', () => {
