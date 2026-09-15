@@ -125,6 +125,17 @@ export interface DaemonLocallyPersistedState {
   daemonLogPath?: string;
   state?: 'running' | 'stopped' | 'crashed';
   stateReason?: string;
+  /*
+   * specs/daemon-socket-watchdog/ — `state: 'running'` is true of the process
+   * and says nothing about the server link, so a daemon that has held no
+   * socket for hours still reads as healthy here. These two record the link
+   * itself. Optional: state files written before this field existed still
+   * parse, and `undefined` means "this daemon is too old to say", which is
+   * not the same as `false`.
+   */
+  socketConnected?: boolean;
+  /** Seconds since the machine socket was last up. Absent while connected. */
+  socketDisconnectedSeconds?: number;
   trackedSessions?: PersistedTrackedSession[];
   /**
    * Loopback-only Bearer secret for the control server (ADR-061,

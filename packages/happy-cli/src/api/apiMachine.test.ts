@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
 import { ApiMachineClient } from './apiMachine';
+import { logger } from '@/ui/logger';
 import type { Machine } from './types';
 
 const {
@@ -97,6 +98,10 @@ describe('ApiMachineClient socket reconnection', () => {
         const handlers = socketHandlers[event] || [];
         handlers.forEach((handler) => handler(...args));
     };
+
+    /** Supervisor lines saying a reconnect should have been running and was not. */
+    const repairLogs = () => vi.mocked(logger.debug).mock.calls
+        .filter(([message]) => typeof message === 'string' && message.includes('nothing retrying'));
 
     beforeEach(() => {
         vi.clearAllMocks();
@@ -287,6 +292,134 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(mockSocket.connect).toHaveBeenCalledTimes(2);
 
         client.shutdown();
+    });
+
+    /*
+     * The reconnect paths above are edge-triggered: they only run because
+     * `connect_error` or `disconnect` fired. A missed edge therefore leaves a
+     * daemon that is alive, heartbeating to its local state file, and holding
+     * no socket at all — with nothing anywhere that ever notices. That is the
+     * shape of the incident these tests exist for, so they drive the socket
+     * down without emitting any edge event and assert recovery anyway.
+     */
+    it('reconnects a socket that never came up, with no edge event to trigger it', async () => {
+        vi.useFakeTimers();
+
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.connect();
+
+        // Deliberately no connect_error and no disconnect: nothing is
+        // retrying, and before the supervisor's first look nothing can be.
+        await vi.advanceTimersByTimeAsync(29_000);
+        expect(mockSocket.connect).not.toHaveBeenCalled();
+
+        // The tick lands and starts the ordinary 1s-then-3s cadence.
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(mockSocket.connect).toHaveBeenCalledTimes(1);
+
+        await vi.advanceTimersByTimeAsync(3_000);
+        expect(mockSocket.connect).toHaveBeenCalledTimes(2);
+
+        client.shutdown();
+    });
+
+    it('reports how long the machine socket has been down', async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(0);
+
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.connect();
+
+        await vi.advanceTimersByTimeAsync(90_000);
+
+        expect(client.getConnectionHealth()).toEqual({
+            connected: false,
+            reconnecting: true,
+            disconnectedForMs: 90_000
+        });
+
+        client.shutdown();
+    });
+
+    it('leaves a healthy socket alone', async () => {
+        vi.useFakeTimers();
+
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.connect();
+        mockSocket.connected = true;
+
+        await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+        expect(mockSocket.connect).not.toHaveBeenCalled();
+        expect(client.getConnectionHealth()).toEqual({
+            connected: true,
+            reconnecting: false,
+            disconnectedForMs: null
+        });
+
+        client.shutdown();
+    });
+
+    /*
+     * The supervisor's log line is the only evidence that an edge was missed,
+     * so it has to stay rare enough to read as a defect. A server that is
+     * simply down produces a retry cadence and no such line.
+     */
+    it('stays quiet while a retry is already in flight', async () => {
+        vi.useFakeTimers();
+
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.connect();
+        emitSocketEvent('connect_error', new Error('ECONNREFUSED'));
+
+        await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+        expect(repairLogs()).toHaveLength(0);
+
+        client.shutdown();
+    });
+
+    it('reports the missed edge once, not on every tick', async () => {
+        vi.useFakeTimers();
+
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.connect();
+
+        await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+        // Repaired on the first tick; every tick after it finds a live
+        // retry cadence and says nothing.
+        expect(repairLogs()).toHaveLength(1);
+
+        client.shutdown();
+    });
+
+    it('stops supervising once the managed credential is gone', async () => {
+        vi.useFakeTimers();
+
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.connect();
+        client.stopForExpiredCredential();
+
+        await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+        expect(mockSocket.connect).not.toHaveBeenCalled();
+        // And it stops calling itself broken. A client that is deliberately
+        // finished must go quiet, or its log drowns the machines that are
+        // genuinely stuck.
+        expect(repairLogs()).toHaveLength(0);
+    });
+
+    it('stops supervising after shutdown', async () => {
+        vi.useFakeTimers();
+
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.connect();
+        client.shutdown();
+
+        await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+        expect(mockSocket.connect).not.toHaveBeenCalled();
     });
 
     it('publishes runtime activity on the encrypted daemon heartbeat', async () => {

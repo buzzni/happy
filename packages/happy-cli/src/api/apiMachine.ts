@@ -197,6 +197,25 @@ import type { CheckpointRpcHandlers } from '@/checkpoint/checkpointRpc';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BROKER_ACTIVITY_TOUCH_INTERVAL_MS = 60_000;
+/*
+ * How often the connection supervisor re-reads the socket's actual state.
+ *
+ * Long enough that a normal reconnect (a 1s kick, then every 3s) settles
+ * between two ticks and the supervisor never sees a transient gap worth
+ * reporting; short enough that a socket nobody is retrying is picked up in
+ * well under a minute rather than in hours.
+ */
+const CONNECTION_SUPERVISOR_INTERVAL_MS = 30_000;
+
+/** What the daemon can answer about its own link to the server. */
+export interface MachineConnectionHealth {
+    /** A live socket exists right now. */
+    connected: boolean;
+    /** A retry cadence is in flight. Meaningless while `connected`. */
+    reconnecting: boolean;
+    /** Milliseconds since the socket was last up, or null while connected. */
+    disconnectedForMs: number | null;
+}
 
 interface ServerToDaemonEvents {
     update: (data: Update) => void;
@@ -695,6 +714,20 @@ export class ApiMachineClient {
     // root the rest of the RPC surface uses (Files tab / writeFile).
     private allowedRoot: string;
     private reconnectInterval: NodeJS.Timeout | null = null;
+    /*
+     * specs/daemon-socket-watchdog/ — the level-triggered backstop.
+     *
+     * Every other reconnect path here is edge-triggered: it runs because
+     * `connect_error` or `disconnect` fired. An edge that is never wired, or
+     * never fires, leaves this process alive and socket-less forever, and
+     * nothing downstream can tell — the local heartbeat file keeps saying
+     * `running` and the server keeps serving the last daemon state it was
+     * told. This interval asks the question the edges cannot: is there a
+     * socket right now, and if not, is anyone trying?
+     */
+    private connectionSupervisorInterval: NodeJS.Timeout | null = null;
+    /** When the socket was last known to be down. Null only while connected. */
+    private disconnectedSince: number | null = null;
 
     constructor(
         private token: string,
@@ -2743,6 +2776,9 @@ export class ApiMachineClient {
             clearInterval(this.reconnectInterval);
             this.reconnectInterval = null;
         }
+        // The supervisor exists to restart reconnects; with no credential
+        // there is nothing for it to restart them with.
+        this.stopConnectionSupervisor();
         // The field is non-nullable and every other path assumes a socket
         // exists; closing is what stops the traffic, and `disconnected` is what
         // the rest of this class already checks.
@@ -2765,8 +2801,14 @@ export class ApiMachineClient {
             reconnection: false,
         });
 
+        // Down until proven up: a socket that never connects has been down
+        // since the moment we started dialling, not since some later event.
+        this.disconnectedSince = Date.now();
+        this.startConnectionSupervisor();
+
         this.socket.on('connect', () => {
             logger.debug('[API MACHINE] Connected to server');
+            this.disconnectedSince = null;
 
             if (this.reconnectInterval) {
                 clearInterval(this.reconnectInterval);
@@ -2791,6 +2833,7 @@ export class ApiMachineClient {
 
         this.socket.on('disconnect', (reason) => {
             logger.debug(`[API MACHINE] Disconnected from server — reason: ${reason}`);
+            this.disconnectedSince = Date.now();
             this.rpcHandlerManager.onSocketDisconnect();
             this.stopKeepAlive();
             // Tear down any live preview WebSocket tunnels — the relay path is
@@ -3210,6 +3253,59 @@ export class ApiMachineClient {
         this.runtimeActivityProvider = provider;
     }
 
+    /**
+     * What this daemon can honestly say about its link to the server.
+     *
+     * Read by the daemon heartbeat so the local state file records a socket
+     * that is down instead of a bare `running` that is true of the process
+     * and false of everything anyone actually wants from it.
+     */
+    getConnectionHealth(): MachineConnectionHealth {
+        const connected = this.socket?.connected === true;
+        return {
+            connected,
+            reconnecting: this.reconnectInterval !== null,
+            disconnectedForMs: connected || this.disconnectedSince === null
+                ? null
+                : Date.now() - this.disconnectedSince,
+        };
+    }
+
+    private startConnectionSupervisor() {
+        if (this.connectionSupervisorInterval) return;
+        this.connectionSupervisorInterval = setInterval(() => {
+            if (this.socket?.connected) {
+                this.disconnectedSince = null;
+                return;
+            }
+            if (this.disconnectedSince === null) this.disconnectedSince = Date.now();
+            /*
+             * A retry is already in flight, which is the ordinary shape of a
+             * server that is down: not a defect, so nothing is reported.
+             * `startSmartReconnect` would refuse to stack a second cadence on
+             * its own — what this guard is actually for is keeping the line
+             * below rare enough to mean something.
+             */
+            if (this.reconnectInterval) return;
+            /*
+             * Reached only when every edge-triggered path missed. Logged at
+             * the moment of repair rather than on every tick: a line here
+             * means a reconnect loop should have been running and was not,
+             * which is a defect worth finding in the log, not a status beat.
+             */
+            const downFor = Math.round((Date.now() - this.disconnectedSince) / 1000);
+            logger.debug(`[API MACHINE] Socket down ${downFor}s with nothing retrying — starting reconnect`);
+            this.startSmartReconnect();
+        }, CONNECTION_SUPERVISOR_INTERVAL_MS);
+    }
+
+    private stopConnectionSupervisor() {
+        if (this.connectionSupervisorInterval) {
+            clearInterval(this.connectionSupervisorInterval);
+            this.connectionSupervisorInterval = null;
+        }
+    }
+
     private startSmartReconnect() {
         // A runtime whose credential is gone does not reconnect. Retrying would
         // present a dead bearer over and over while the parent already knows
@@ -3254,6 +3350,7 @@ export class ApiMachineClient {
     shutdown() {
         logger.debug('[API MACHINE] Shutting down');
         this.stopKeepAlive();
+        this.stopConnectionSupervisor();
         for (const cdpPipe of this.browserCdpPipes.values()) cdpPipe.close();
         this.browserCdpPipes.clear();
         if (this.reconnectInterval) {
