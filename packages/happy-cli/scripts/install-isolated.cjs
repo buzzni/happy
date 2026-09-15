@@ -32,9 +32,17 @@ const IS_WINDOWS = process.platform === 'win32';
 
 // Same reason as install-local.cjs: an inherited npm prefix can redirect
 // `npm install -g` back into the workspace and shadow what we meant to build.
-const CHILD_ENV = Object.fromEntries(
-    Object.entries(process.env).filter(([key]) => !/^npm_config_(?:global_|local_)?prefix$/i.test(key))
-);
+const CHILD_ENV = {
+    ...Object.fromEntries(
+        Object.entries(process.env).filter(([key]) => !/^npm_config_(?:global_|local_)?prefix$/i.test(key))
+    ),
+    // The tarball's postinstall otherwise upgrades the companion CLIs. npm's
+    // half honours the --prefix below and stays inside the isolated root, but
+    // uv resolves its tool directory from HOME, which this install does not
+    // isolate — claude-swap would be upgraded in the developer's real home
+    // while we print that nothing outside the isolated root was touched.
+    HAPPY_SKIP_COMPANION_TOOLS: '1',
+};
 
 // Session-scoped variables that must not leak into the isolated daemon. Kept in
 // sync with the runbook's `env -u` list.

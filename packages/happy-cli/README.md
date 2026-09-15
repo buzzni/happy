@@ -10,6 +10,17 @@ Free. Open source. Code anywhere.
 npm install -g happy
 ```
 
+Installing or updating Happy also installs the two companion CLIs its credential
+runtime drives: `codex-multi-auth` goes into npm's global prefix next to `happy`
+itself, and `claude-swap` is installed with uv, which puts the `claude-swap` and
+`cswap` commands in uv's tool bin directory — Happy looks for them there even
+when that directory is not on your `PATH`. Both are installed at the exact
+versions Happy requires rather than the newest, because Happy checks those
+versions and reinstalls its own pinned copy if it finds anything else. Set
+`HAPPY_SKIP_COMPANION_TOOLS=1` to skip this step; Happy installs either one on
+demand when it needs it. Neither can fail the Happy install — a missing
+`npm`/`uv` or a failed install is only a warning.
+
 > Migrated from the `happy-coder` package. Thanks to [@franciscop](https://github.com/franciscop) for donating the `happy` package name!
 
 ## Usage

@@ -100,7 +100,7 @@
     "prepare:publish": "node scripts/prepare-publish-package.cjs",
     "guard:publish": "node scripts/guard-publish-artifact.cjs",
     "prepublishOnly": "node scripts/assert-publish-tool.cjs && pnpm test && node scripts/guard-publish-artifact.cjs . --install-smoke",
-    "postinstall": "node scripts/verify-bundled-deps.cjs && node scripts/unpack-tools.cjs && node scripts/fix-node-pty-perms.cjs"
+    "postinstall": "node scripts/verify-bundled-deps.cjs && node scripts/unpack-tools.cjs && node scripts/fix-node-pty-perms.cjs && node scripts/install-companion-tools.cjs"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.14.1",
