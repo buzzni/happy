@@ -23,6 +23,7 @@ const {
     state,
     emitUpdateMock,
     dbMock,
+    accountUpdateMock,
     resetState,
     seedSession,
     seedMessage
@@ -201,6 +202,7 @@ const {
         state,
         emitUpdateMock,
         dbMock,
+        accountUpdateMock: accountUpdate,
         resetState,
         seedSession,
         seedMessage
@@ -263,6 +265,7 @@ describe("v3SessionRoutes", () => {
     beforeEach(() => {
         resetState();
         emitUpdateMock.mockClear();
+        accountUpdateMock.mockClear();
     });
 
     afterEach(async () => {
@@ -475,6 +478,94 @@ describe("v3SessionRoutes", () => {
         const body = response.json();
         expect(body.messages.map((message: any) => message.seq)).toEqual([1, 2, 3]);
         expect(emitUpdateMock).toHaveBeenCalledTimes(3);
+    });
+
+    it("allocates every update seq for a batch in one Account.seq update", async () => {
+        seedSession({ id: "session-1", accountId: "user-1", seq: 0 });
+
+        app = await createApp();
+        const response = await app.inject({
+            method: "POST",
+            url: "/v3/sessions/session-1/messages",
+            headers: { "x-user-id": "user-1" },
+            payload: {
+                messages: [
+                    { localId: "l1", content: "enc-1" },
+                    { localId: "l2", content: "enc-2" },
+                    { localId: "l3", content: "enc-3" }
+                ]
+            }
+        });
+
+        expect(response.statusCode).toBe(200);
+        // Every account writer contends on the same row, so the whole batch
+        // takes its update seqs in a single increment.
+        expect(accountUpdateMock).toHaveBeenCalledTimes(1);
+        expect(accountUpdateMock).toHaveBeenCalledWith({
+            where: { id: "user-1" },
+            select: { seq: true },
+            data: { seq: { increment: 3 } }
+        });
+
+        // Each emitted update still carries its own strictly increasing seq,
+        // in the same order as the messages it announces.
+        const emitted = emitUpdateMock.mock.calls.map(([call]: any[]) => call);
+        expect(emitted.map((call: any) => call.payload.seq)).toEqual([1, 2, 3]);
+        expect(emitted.map((call: any) => call.payload.body.message.seq)).toEqual([1, 2, 3]);
+        expect(emitted.map((call: any) => call.payload.body.message.content.c)).toEqual([
+            "enc-1",
+            "enc-2",
+            "enc-3"
+        ]);
+    });
+
+    it("allocates update seqs only for messages it actually announces", async () => {
+        seedSession({ id: "session-1", accountId: "user-1", seq: 1 });
+        seedMessage({ sessionId: "session-1", seq: 1, localId: "existing", content: { t: "encrypted", c: "old" } });
+
+        app = await createApp();
+        const response = await app.inject({
+            method: "POST",
+            url: "/v3/sessions/session-1/messages",
+            headers: { "x-user-id": "user-1" },
+            payload: {
+                messages: [
+                    { localId: "existing", content: "ignored" },
+                    { localId: "new-1", content: "new-content" }
+                ]
+            }
+        });
+
+        expect(response.statusCode).toBe(200);
+        // A retry that only re-sends already persisted messages must not burn
+        // update seqs, and the deduplicated one must not either.
+        expect(accountUpdateMock).toHaveBeenCalledTimes(1);
+        expect(accountUpdateMock).toHaveBeenCalledWith({
+            where: { id: "user-1" },
+            select: { seq: true },
+            data: { seq: { increment: 1 } }
+        });
+        expect(emitUpdateMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not touch Account.seq when every message is already persisted", async () => {
+        seedSession({ id: "session-1", accountId: "user-1", seq: 1 });
+        seedMessage({ sessionId: "session-1", seq: 1, localId: "existing", content: { t: "encrypted", c: "old" } });
+
+        app = await createApp();
+        const response = await app.inject({
+            method: "POST",
+            url: "/v3/sessions/session-1/messages",
+            headers: { "x-user-id": "user-1" },
+            payload: {
+                messages: [{ localId: "existing", content: "ignored" }]
+            }
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json().messages.map((message: any) => message.localId)).toEqual(["existing"]);
+        expect(accountUpdateMock).not.toHaveBeenCalled();
+        expect(emitUpdateMock).not.toHaveBeenCalled();
     });
 
     it("deduplicates by localId and returns mixed existing/new messages sorted by seq", async () => {
