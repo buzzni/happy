@@ -4,7 +4,7 @@ import { join } from 'node:path';
 const SCRIPT = join(__dirname, '..', 'install-companion-tools.cjs');
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const { shouldInstallCompanionTools } = require(SCRIPT);
+const { shouldInstallCompanionTools, shouldInstallUvTools } = require(SCRIPT);
 
 describe('shouldInstallCompanionTools', () => {
     it('installs for a global CLI install', () => {
@@ -40,5 +40,19 @@ describe('shouldInstallCompanionTools', () => {
     it('treats CI=false and CI=0 as not CI', () => {
         expect(shouldInstallCompanionTools({ npm_config_global: 'true', CI: 'false' })).toBe(true);
         expect(shouldInstallCompanionTools({ npm_config_global: 'true', CI: '0' })).toBe(true);
+    });
+});
+
+describe('shouldInstallUvTools', () => {
+    it('installs when the user runs the install themselves', () => {
+        expect(shouldInstallUvTools({})).toBe(true);
+    });
+
+    // npm's global prefix is shared, so codex-multi-auth lands next to happy
+    // either way. uv resolves its tool directory from HOME, which sudo points
+    // at root — claude-swap would install somewhere the real user cannot reach
+    // while the log still claims success.
+    it('skips under sudo, where uv would install into root\'s home', () => {
+        expect(shouldInstallUvTools({ SUDO_USER: 'justin' })).toBe(false);
     });
 });

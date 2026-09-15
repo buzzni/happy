@@ -23,6 +23,8 @@
  *                      the artifact and must not start depending on two
  *                      unrelated registries being reachable.
  *
+ * Under sudo only the npm half runs — see shouldInstallUvTools below.
+ *
  * This never fails the happy install: a missing npm/uv or a failed
  * companion install is reported as a warning and nothing more.
  */
@@ -35,6 +37,15 @@ function shouldInstallCompanionTools(env) {
     // `CI=false` / `CI=0` is a deliberate "not CI" signal, not a CI marker.
     const inCi = Boolean(env.CI) && env.CI !== '0' && env.CI !== 'false';
     return env.npm_config_global === 'true' && !inCi;
+}
+
+// sudo resets HOME to root's, and uv installs its tools under HOME — so
+// claude-swap would land where the real user cannot reach it. npm needs no
+// such check: its global prefix is shared, and it is where happy itself just
+// went. Skipping with the command to run is honest; installing into root's
+// home and reporting success is not.
+function shouldInstallUvTools(env) {
+    return !env.SUDO_USER;
 }
 
 function installTool(name, command, args) {
@@ -59,10 +70,17 @@ function main() {
         return;
     }
     installTool('codex-multi-auth', 'npm', ['install', '-g', 'codex-multi-auth']);
-    installTool('claude-swap', 'uv', ['tool', 'install', '--upgrade', 'claude-swap']);
+    if (shouldInstallUvTools(process.env)) {
+        installTool('claude-swap', 'uv', ['tool', 'install', '--upgrade', 'claude-swap']);
+    } else {
+        console.warn(
+            '[happy-cli postinstall] running under sudo — skipping claude-swap, which uv ' +
+            "would install into root's home. Run as yourself: uv tool install --upgrade claude-swap"
+        );
+    }
 }
 
-module.exports = { shouldInstallCompanionTools };
+module.exports = { shouldInstallCompanionTools, shouldInstallUvTools };
 
 if (require.main === module) {
     main();
