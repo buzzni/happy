@@ -1,14 +1,21 @@
 #!/usr/bin/env node
 
 /**
- * Best-effort postinstall step: keep the companion CLIs that Happy's auth
- * switching relies on — `codex-multi-auth` (npm) and `claude-swap` (uv) —
- * installed and up to date alongside a global `happy`.
+ * Best-effort postinstall step: put the companion CLIs `codex-multi-auth`
+ * (npm) and `claude-swap` (uv) in place alongside a global `happy`.
  *
- * Both commands are idempotent and double as the update path: a bare
- * `npm install -g <pkg>` resolves the `latest` dist-tag and replaces an
- * older global copy, and `uv tool install --upgrade` installs when absent
- * and upgrades when outdated.
+ * codex-multi-auth is PINNED, not tracked to latest. Happy resolves this exact
+ * version out of the npm global root — see CODEX_MULTI_AUTH_VERSION in
+ * src/daemon/aiCredentialRuntime.ts and src/codex/codexMultiAuthProxy.ts —
+ * and installing `latest` over it makes those paths throw
+ * CODEX_MULTI_AUTH_VERSION_MISMATCH / "Managed codex-multi-auth <v> is not
+ * installed". Pre-installing the pinned version instead spares the first
+ * codex multi-auth use the on-demand install Happy would otherwise run.
+ * installCompanionTools.test.ts fails if this constant drifts from the source.
+ *
+ * claude-swap has no such coupling — nothing in Happy resolves it — so it
+ * tracks latest: `uv tool install --upgrade` installs when absent and
+ * upgrades when outdated.
  *
  * Two conditions gate the normal path:
  *
@@ -39,6 +46,9 @@
 const { spawnSync } = require('node:child_process');
 
 const IS_WINDOWS = process.platform === 'win32';
+
+// Must equal CODEX_MULTI_AUTH_VERSION in src/daemon/aiCredentialRuntime.ts.
+const CODEX_MULTI_AUTH_VERSION = '2.8.5';
 
 function shouldInstallCompanionTools(env) {
     if (env.HAPPY_SKIP_COMPANION_TOOLS) {
@@ -79,7 +89,8 @@ function main() {
     if (!shouldInstallCompanionTools(process.env)) {
         return;
     }
-    installTool('codex-multi-auth', 'npm', ['install', '-g', 'codex-multi-auth']);
+    const codexMultiAuth = `codex-multi-auth@${CODEX_MULTI_AUTH_VERSION}`;
+    installTool(codexMultiAuth, 'npm', ['install', '-g', codexMultiAuth]);
     if (shouldInstallUvTools(process.env)) {
         installTool('claude-swap', 'uv', ['tool', 'install', '--upgrade', 'claude-swap']);
     } else {
@@ -90,7 +101,7 @@ function main() {
     }
 }
 
-module.exports = { shouldInstallCompanionTools, shouldInstallUvTools };
+module.exports = { shouldInstallCompanionTools, shouldInstallUvTools, CODEX_MULTI_AUTH_VERSION };
 
 if (require.main === module) {
     main();

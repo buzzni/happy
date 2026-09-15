@@ -1,10 +1,18 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const SCRIPT = join(__dirname, '..', 'install-companion-tools.cjs');
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const { shouldInstallCompanionTools, shouldInstallUvTools } = require(SCRIPT);
+const { shouldInstallCompanionTools, shouldInstallUvTools, CODEX_MULTI_AUTH_VERSION } = require(SCRIPT);
+
+function pinnedVersionIn(sourceFile: string): string {
+    const source = readFileSync(join(__dirname, '..', '..', 'src', sourceFile), 'utf8');
+    const match = source.match(/const CODEX_MULTI_AUTH_VERSION = '([^']+)'/);
+    if (!match) throw new Error(`No CODEX_MULTI_AUTH_VERSION in src/${sourceFile}`);
+    return match[1];
+}
 
 describe('shouldInstallCompanionTools', () => {
     it('installs for a global CLI install', () => {
@@ -64,5 +72,21 @@ describe('shouldInstallUvTools', () => {
     // while the log still claims success.
     it('skips under sudo, where uv would install into root\'s home', () => {
         expect(shouldInstallUvTools({ SUDO_USER: 'justin' })).toBe(false);
+    });
+});
+
+// Happy resolves this exact version out of the npm global root
+// (aiCredentialRuntime.hasPinnedGlobalCodexMultiAuthPackage,
+// codexMultiAuthProxy.startPinnedRuntimeRotationProxy). The postinstall used to
+// install `latest` over it, which left 2.14.0 where 2.8.5 was required and made
+// both paths throw right after a Happy install. Pinning only helps while the
+// constants stay in lockstep, so a drift has to fail here.
+describe('CODEX_MULTI_AUTH_VERSION', () => {
+    it('matches the version the daemon runtime pins', () => {
+        expect(CODEX_MULTI_AUTH_VERSION).toBe(pinnedVersionIn('daemon/aiCredentialRuntime.ts'));
+    });
+
+    it('matches the version the codex proxy pins', () => {
+        expect(CODEX_MULTI_AUTH_VERSION).toBe(pinnedVersionIn('codex/codexMultiAuthProxy.ts'));
     });
 });
