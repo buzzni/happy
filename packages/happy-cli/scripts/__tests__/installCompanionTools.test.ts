@@ -8,6 +8,7 @@ const SCRIPT = join(__dirname, '..', 'install-companion-tools.cjs');
 const {
     shouldInstallCompanionTools,
     shouldInstallUvTools,
+    shellQuote,
     CODEX_MULTI_AUTH_VERSION,
     CLAUDE_SWAP_VERSION,
 } = require(SCRIPT);
@@ -112,5 +113,24 @@ describe('CLAUDE_SWAP_VERSION', () => {
         // eslint-disable-next-line no-eval
         const pattern = eval(guard[1]) as RegExp;
         expect(pattern.test(`cswap ${CLAUDE_SWAP_VERSION}`)).toBe(true);
+    });
+});
+
+// The failure path prints a command for the user to paste. `>=3.12` is a
+// redirection in a shell: zsh fails with "3.12 not found" and bash writes a
+// file named `=3.12` while dropping the --python value.
+describe('shellQuote', () => {
+    it('quotes a value a shell would read as a redirection', () => {
+        expect(shellQuote('>=3.12')).toBe("'>=3.12'");
+    });
+
+    it('leaves ordinary arguments alone', () => {
+        expect(shellQuote('install')).toBe('install');
+        expect(shellQuote('-g')).toBe('-g');
+        expect(shellQuote(`claude-swap==${CLAUDE_SWAP_VERSION}`)).toBe(`claude-swap==${CLAUDE_SWAP_VERSION}`);
+    });
+
+    it('escapes an embedded single quote', () => {
+        expect(shellQuote("a'b")).toBe("'a'\\''b'");
     });
 });

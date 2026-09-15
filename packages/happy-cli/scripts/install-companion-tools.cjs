@@ -77,6 +77,13 @@ function shouldInstallUvTools(env) {
     return !env.SUDO_USER;
 }
 
+// The retry hint is meant to be pasted into a shell, and `>=3.12` is a
+// redirection there — zsh fails with "3.12 not found", bash silently writes a
+// file named `=3.12` and drops the --python value.
+function shellQuote(value) {
+    return /^[A-Za-z0-9_@%+=:,.\/-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 function installTool(name, command, args) {
     console.log(`[happy-cli postinstall] ensuring ${name}...`);
     // `shell` on Windows because npm is npm.cmd there, which CreateProcess
@@ -89,7 +96,7 @@ function installTool(name, command, args) {
     if (result.error || result.status !== 0) {
         console.warn(
             `[happy-cli postinstall] ${name} failed — skipping ` +
-            `(to retry: ${command} ${args.join(' ')})`
+            `(to retry: ${command} ${args.map(shellQuote).join(' ')})`
         );
     }
 }
@@ -115,6 +122,7 @@ function main() {
 module.exports = {
     shouldInstallCompanionTools,
     shouldInstallUvTools,
+    shellQuote,
     CODEX_MULTI_AUTH_VERSION,
     CLAUDE_SWAP_VERSION,
 };
