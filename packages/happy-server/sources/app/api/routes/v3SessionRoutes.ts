@@ -1,6 +1,6 @@
 import { buildNewMessageUpdate, eventRouter } from "@/app/events/eventRouter";
 import { db } from "@/storage/db";
-import { allocateSessionSeqBatch, allocateUserSeq } from "@/storage/seq";
+import { allocateSessionSeqBatch, allocateUserSeqBatch } from "@/storage/seq";
 import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { z } from "zod";
 import { type Fastify } from "../types";
@@ -217,12 +217,19 @@ export function v3SessionRoutes(app: Fastify) {
             };
         });
 
-        for (const message of txResult.createdMessages) {
+        // Announce outside the transaction, and take the whole block of update
+        // seqs in one `Account.seq` increment: every writer for this account
+        // contends on that single row, so N separate allocations would take
+        // and release the same row lock N times for one request.
+        const announcements = txResult.createdMessages.flatMap((message) => {
             const content = message.localId ? contentByLocalId.get(message.localId) : null;
-            if (!content) {
-                continue;
-            }
-            const updSeq = await allocateUserSeq(userId);
+            return content ? [{ message, content }] : [];
+        });
+        const updSeqs = await allocateUserSeqBatch(userId, announcements.length);
+
+        for (let i = 0; i < announcements.length; i += 1) {
+            const { message, content } = announcements[i];
+            const updSeq = updSeqs[i];
             const updatePayload = buildNewMessageUpdate({
                 ...message,
                 content: {
