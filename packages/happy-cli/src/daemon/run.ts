@@ -4181,6 +4181,10 @@ export async function startDaemon(): Promise<void> {
 
       // Heartbeat
       try {
+        // Recorded on the beat that already exists so the file says whether
+        // this daemon can actually reach the server, not merely that its
+        // process is alive — see specs/daemon-socket-watchdog/.
+        const connection = apiMachine.getConnectionHealth();
         const updatedState: DaemonLocallyPersistedState = {
           pid: process.pid,
           httpPort: controlPort,
@@ -4189,6 +4193,10 @@ export async function startDaemon(): Promise<void> {
           lastHeartbeat: new Date().toLocaleString(),
           daemonLogPath: fileState.daemonLogPath,
           state: 'running',
+          socketConnected: connection.connected,
+          ...(connection.disconnectedForMs === null
+            ? {}
+            : { socketDisconnectedSeconds: Math.round(connection.disconnectedForMs / 1000) }),
           trackedSessions: serializeTrackedSessions(),
           controlSecret: fileState.controlSecret,
         };
