@@ -59,13 +59,22 @@ const IS_WINDOWS = process.platform === 'win32';
 const CODEX_MULTI_AUTH_VERSION = '2.8.5';
 const CLAUDE_SWAP_VERSION = '0.25.0';
 
+// An unbounded child here would hang `npm install -g happy` itself. Matches the
+// timeoutMs aiCredentialRuntime uses for these same two install commands — a
+// tighter bound would fail on links where Happy's own install would have
+// succeeded.
+const COMPANION_INSTALL_TIMEOUT_MS = 300_000;
+
 function shouldInstallCompanionTools(env) {
     if (env.HAPPY_SKIP_COMPANION_TOOLS) {
         return false;
     }
     // `CI=false` / `CI=0` is a deliberate "not CI" signal, not a CI marker.
     const inCi = Boolean(env.CI) && env.CI !== '0' && env.CI !== 'false';
-    return env.npm_config_global === 'true' && !inCi;
+    // `npm i -g` sets npm_config_global; `npm i --location=global` sets only
+    // npm_config_location, and reading just the first silently skips that user.
+    const global = env.npm_config_global === 'true' || env.npm_config_location === 'global';
+    return global && !inCi;
 }
 
 // sudo resets HOME to root's, and uv installs its tools under HOME — so
@@ -88,15 +97,29 @@ function installTool(name, command, args) {
     console.log(`[happy-cli postinstall] ensuring ${name}...`);
     // `shell` on Windows because npm is npm.cmd there, which CreateProcess
     // cannot launch directly. Every argument is a fixed literal.
-    const result = spawnSync(command, args, { stdio: 'inherit', shell: IS_WINDOWS });
+    const result = spawnSync(command, args, {
+        stdio: 'inherit',
+        shell: IS_WINDOWS,
+        timeout: COMPANION_INSTALL_TIMEOUT_MS,
+        killSignal: 'SIGTERM',
+    });
+    const retry = `${command} ${args.map(shellQuote).join(' ')}`;
     if (result.error && result.error.code === 'ENOENT') {
         console.warn(`[happy-cli postinstall] ${command} is not on PATH — skipping ${name}`);
         return;
     }
+    // A timeout leaves status null and signal SIGTERM, so say so rather than
+    // reporting a plain failure: the fix is a working network, not a retry.
+    if (result.error && result.error.code === 'ETIMEDOUT') {
+        console.warn(
+            `[happy-cli postinstall] ${name} timed out after ` +
+            `${COMPANION_INSTALL_TIMEOUT_MS / 1000}s — skipping (to retry: ${retry})`
+        );
+        return;
+    }
     if (result.error || result.status !== 0) {
         console.warn(
-            `[happy-cli postinstall] ${name} failed — skipping ` +
-            `(to retry: ${command} ${args.map(shellQuote).join(' ')})`
+            `[happy-cli postinstall] ${name} failed — skipping (to retry: ${retry})`
         );
     }
 }
@@ -125,6 +148,7 @@ module.exports = {
     shellQuote,
     CODEX_MULTI_AUTH_VERSION,
     CLAUDE_SWAP_VERSION,
+    COMPANION_INSTALL_TIMEOUT_MS,
 };
 
 if (require.main === module) {

@@ -11,6 +11,7 @@ const {
     shellQuote,
     CODEX_MULTI_AUTH_VERSION,
     CLAUDE_SWAP_VERSION,
+    COMPANION_INSTALL_TIMEOUT_MS,
 } = require(SCRIPT);
 
 function pinnedVersionIn(sourceFile: string, constantName: string): string {
@@ -26,6 +27,20 @@ describe('shouldInstallCompanionTools', () => {
     });
 
     // A local dependency install must not put two extra binaries on PATH.
+    // `npm i --location=global` is a real global install, but it sets only
+    // npm_config_location — reading npm_config_global alone skipped that user.
+    it('installs for a --location=global install', () => {
+        expect(shouldInstallCompanionTools({ npm_config_location: 'global' })).toBe(true);
+    });
+
+    it('still skips CI for a --location=global install', () => {
+        expect(shouldInstallCompanionTools({ npm_config_location: 'global', CI: 'true' })).toBe(false);
+    });
+
+    it('skips a --location=user install', () => {
+        expect(shouldInstallCompanionTools({ npm_config_location: 'user' })).toBe(false);
+    });
+
     it('skips when the install is not global', () => {
         expect(shouldInstallCompanionTools({})).toBe(false);
         expect(shouldInstallCompanionTools({ npm_config_global: 'false' })).toBe(false);
@@ -132,5 +147,18 @@ describe('shellQuote', () => {
 
     it('escapes an embedded single quote', () => {
         expect(shellQuote("a'b")).toBe("'a'\\''b'");
+    });
+});
+
+// An unbounded child would hang `npm install -g happy` itself. aiCredentialRuntime
+// runs these same two install commands under timeoutMs, and a tighter bound here
+// would fail on links where Happy's own install would have succeeded.
+describe('COMPANION_INSTALL_TIMEOUT_MS', () => {
+    it('matches the timeout the daemon runtime allows these installs', () => {
+        const source = readFileSync(join(__dirname, '..', '..', 'src', 'daemon', 'aiCredentialRuntime.ts'), 'utf8');
+        const timeouts = [...source.matchAll(/timeoutMs:\s*([0-9_]+)/g)]
+            .map((match) => Number(match[1].replace(/_/g, '')));
+        expect(timeouts.length).toBeGreaterThan(0);
+        expect(COMPANION_INSTALL_TIMEOUT_MS).toBe(Math.max(...timeouts));
     });
 });
