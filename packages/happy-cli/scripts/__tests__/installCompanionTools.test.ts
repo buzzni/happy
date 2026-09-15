@@ -34,4 +34,11 @@ describe('shouldInstallCompanionTools', () => {
     it('treats an empty CI value as not set', () => {
         expect(shouldInstallCompanionTools({ npm_config_global: 'true', CI: '' })).toBe(true);
     });
+
+    // `CI=false` is how people explicitly say "this is not CI"; reading it as a
+    // CI marker would silently withhold the companion CLIs from a real install.
+    it('treats CI=false and CI=0 as not CI', () => {
+        expect(shouldInstallCompanionTools({ npm_config_global: 'true', CI: 'false' })).toBe(true);
+        expect(shouldInstallCompanionTools({ npm_config_global: 'true', CI: '0' })).toBe(true);
+    });
 });

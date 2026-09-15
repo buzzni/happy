@@ -128,6 +128,8 @@ The final `npm publish` takes the guarded `.tgz` path, so the registry receives 
 
 `prepublishOnly` in both the source and the prepared package now runs `scripts/assert-publish-tool.cjs`, which rejects non-npm publishers, and the published artifact's `postinstall` runs `scripts/verify-bundled-deps.cjs`, which fails a registry install immediately when the bundled files are missing instead of crashing later with `ERR_MODULE_NOT_FOUND`.
 
+The same `postinstall` also runs `scripts/install-companion-tools.cjs`, which installs or upgrades the companion CLIs `codex-multi-auth` (npm) and `claude-swap` (uv) so they never fall behind a Happy upgrade. It acts only on a real global install (`npm_config_global`) and skips when `CI` is truthy, so neither the smoke test above nor the post-publish install check depends on those two registries being reachable. A missing `npm`/`uv` or a failed companion install is a warning only and never fails the Happy install.
+
 The command includes `--tag latest` because `*-aplus.*` versions are semver prereleases and npm requires an explicit dist-tag for those publishes.
 
 The install smoke runs every installed CLI command with an isolated
