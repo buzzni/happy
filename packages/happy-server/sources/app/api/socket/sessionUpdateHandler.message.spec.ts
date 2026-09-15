@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
     sessionFindUnique: vi.fn(),
@@ -7,7 +7,10 @@ const mocks = vi.hoisted(() => ({
     allocateUserSeq: vi.fn(),
     allocateSessionSeq: vi.fn(),
     emitUpdate: vi.fn(),
+    log: vi.fn(),
 }));
+
+vi.mock('@/utils/log', () => ({ log: mocks.log }));
 
 vi.mock('@/storage/db', () => ({
     db: {
@@ -57,6 +60,12 @@ describe('socket message persistence', () => {
         mocks.messageCreate.mockImplementation(async (args: any) => ({ id: 'msg-1', ...args.data }));
     });
 
+    afterEach(() => {
+        // The handler catches errors. A thrown lookup must not make the
+        // no-write assertions below pass as if a duplicate was found.
+        expect(mocks.log.mock.calls.filter(([context]) => context.level === 'error')).toEqual([]);
+    });
+
     it('persists a new message with the allocated seqs and announces it', async () => {
         await messageHandler()({ sid: 'session-1', message: 'ciphertext', localId: 'local-1' });
 
@@ -77,6 +86,9 @@ describe('socket message persistence', () => {
 
         await messageHandler()({ sid: 'session-1', message: 'ciphertext', localId: 'local-1' });
 
+        expect(mocks.messageFindFirst).toHaveBeenCalledWith({
+            where: { sessionId: 'session-1', localId: 'local-1' },
+        });
         // A retry of an already stored message must not take the contended
         // Account.seq / Session.seq row locks, and must not re-announce.
         expect(mocks.allocateUserSeq).not.toHaveBeenCalled();

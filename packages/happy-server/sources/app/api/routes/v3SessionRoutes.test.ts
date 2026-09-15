@@ -548,6 +548,32 @@ describe("v3SessionRoutes", () => {
         expect(emitUpdateMock).toHaveBeenCalledTimes(1);
     });
 
+    it("deduplicates repeated localIds within a batch before allocating announcement seqs", async () => {
+        seedSession({ id: "session-1", accountId: "user-1", seq: 0 });
+        app = await createApp();
+        const response = await app.inject({
+            method: "POST",
+            url: "/v3/sessions/session-1/messages",
+            headers: { "x-user-id": "user-1" },
+            payload: { messages: [
+                { localId: "l1", content: "first" },
+                { localId: "l1", content: "ignored-duplicate" },
+                { localId: "l2", content: "second" }
+            ] }
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json().messages.map((m: any) => m.localId)).toEqual(["l1", "l2"]);
+        expect(state.messages).toHaveLength(2);
+        expect(accountUpdateMock).toHaveBeenCalledTimes(1);
+        expect(accountUpdateMock).toHaveBeenCalledWith({
+            where: { id: "user-1" }, select: { seq: true }, data: { seq: { increment: 2 } }
+        });
+        const emitted = emitUpdateMock.mock.calls.map(([call]: any[]) => call.payload);
+        expect(emitted.map((payload: any) => payload.seq)).toEqual([1, 2]);
+        expect(emitted.map((payload: any) => payload.body.message.content.c)).toEqual(["first", "second"]);
+    });
+
     it("does not touch Account.seq when every message is already persisted", async () => {
         seedSession({ id: "session-1", accountId: "user-1", seq: 1 });
         seedMessage({ sessionId: "session-1", seq: 1, localId: "existing", content: { t: "encrypted", c: "old" } });
