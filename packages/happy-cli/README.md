@@ -11,11 +11,12 @@ npm install -g happy
 ```
 
 Installing or updating Happy also puts two companion CLIs on your PATH:
-`codex-multi-auth` (npm, pinned to the version Happy's Codex multi-auth runtime
-requires) and `claude-swap` (uv, which supplies the `claude-swap` and `cswap`
-commands). Set `HAPPY_SKIP_COMPANION_TOOLS=1` to skip them; Happy installs the
-pinned `codex-multi-auth` on demand if it needs it later. Neither can fail the
-Happy install — a missing `npm`/`uv` or a failed install is only a warning.
+`codex-multi-auth` (npm) and `claude-swap` (uv, which supplies the `claude-swap`
+and `cswap` commands). Both are installed at the exact versions Happy's
+credential runtime requires, not the newest — upgrading them yourself makes
+Happy reinstall its pinned copy. Set `HAPPY_SKIP_COMPANION_TOOLS=1` to skip this
+step; Happy installs either one on demand if it needs it later. Neither can fail
+the Happy install — a missing `npm`/`uv` or a failed install is only a warning.
 
 > Migrated from the `happy-coder` package. Thanks to [@franciscop](https://github.com/franciscop) for donating the `happy` package name!
 

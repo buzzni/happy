@@ -5,12 +5,17 @@ import { join } from 'node:path';
 const SCRIPT = join(__dirname, '..', 'install-companion-tools.cjs');
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const { shouldInstallCompanionTools, shouldInstallUvTools, CODEX_MULTI_AUTH_VERSION } = require(SCRIPT);
+const {
+    shouldInstallCompanionTools,
+    shouldInstallUvTools,
+    CODEX_MULTI_AUTH_VERSION,
+    CLAUDE_SWAP_VERSION,
+} = require(SCRIPT);
 
-function pinnedVersionIn(sourceFile: string): string {
+function pinnedVersionIn(sourceFile: string, constantName: string): string {
     const source = readFileSync(join(__dirname, '..', '..', 'src', sourceFile), 'utf8');
-    const match = source.match(/const CODEX_MULTI_AUTH_VERSION = '([^']+)'/);
-    if (!match) throw new Error(`No CODEX_MULTI_AUTH_VERSION in src/${sourceFile}`);
+    const match = source.match(new RegExp(`const ${constantName} = '([^']+)'`));
+    if (!match) throw new Error(`No ${constantName} in src/${sourceFile}`);
     return match[1];
 }
 
@@ -83,10 +88,29 @@ describe('shouldInstallUvTools', () => {
 // constants stay in lockstep, so a drift has to fail here.
 describe('CODEX_MULTI_AUTH_VERSION', () => {
     it('matches the version the daemon runtime pins', () => {
-        expect(CODEX_MULTI_AUTH_VERSION).toBe(pinnedVersionIn('daemon/aiCredentialRuntime.ts'));
+        expect(CODEX_MULTI_AUTH_VERSION).toBe(pinnedVersionIn('daemon/aiCredentialRuntime.ts', 'CODEX_MULTI_AUTH_VERSION'));
     });
 
     it('matches the version the codex proxy pins', () => {
-        expect(CODEX_MULTI_AUTH_VERSION).toBe(pinnedVersionIn('codex/codexMultiAuthProxy.ts'));
+        expect(CODEX_MULTI_AUTH_VERSION).toBe(pinnedVersionIn('codex/codexMultiAuthProxy.ts', 'CODEX_MULTI_AUTH_VERSION'));
+    });
+});
+
+// ensureClaudeSwap gates on `cswap --version` with a regex hard-coded to this
+// version, and Happy invokes the tool as `cswap` — grepping the repo for
+// "claude-swap" alone misses that and makes the coupling look nonexistent.
+// Installing latest here left 0.26.0 where 0.25.0 was required.
+describe('CLAUDE_SWAP_VERSION', () => {
+    it('matches the version the daemon runtime pins', () => {
+        expect(CLAUDE_SWAP_VERSION).toBe(pinnedVersionIn('daemon/aiCredentialRuntime.ts', 'CLAUDE_SWAP_VERSION'));
+    });
+
+    it('is the version ensureClaudeSwap accepts from `cswap --version`', () => {
+        const source = readFileSync(join(__dirname, '..', '..', 'src', 'daemon', 'aiCredentialRuntime.ts'), 'utf8');
+        const guard = source.match(/installed = (\/\^.*\/)\.test\(version\.stdout\)/);
+        if (!guard) throw new Error('ensureClaudeSwap version guard not found');
+        // eslint-disable-next-line no-eval
+        const pattern = eval(guard[1]) as RegExp;
+        expect(pattern.test(`cswap ${CLAUDE_SWAP_VERSION}`)).toBe(true);
     });
 });

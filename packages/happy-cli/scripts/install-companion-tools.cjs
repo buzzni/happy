@@ -4,18 +4,26 @@
  * Best-effort postinstall step: put the companion CLIs `codex-multi-auth`
  * (npm) and `claude-swap` (uv) in place alongside a global `happy`.
  *
- * codex-multi-auth is PINNED, not tracked to latest. Happy resolves this exact
- * version out of the npm global root — see CODEX_MULTI_AUTH_VERSION in
- * src/daemon/aiCredentialRuntime.ts and src/codex/codexMultiAuthProxy.ts —
- * and installing `latest` over it makes those paths throw
- * CODEX_MULTI_AUTH_VERSION_MISMATCH / "Managed codex-multi-auth <v> is not
- * installed". Pre-installing the pinned version instead spares the first
- * codex multi-auth use the on-demand install Happy would otherwise run.
- * installCompanionTools.test.ts fails if this constant drifts from the source.
+ * BOTH are PINNED, never tracked to latest, because Happy manages both itself
+ * and demands exact versions:
  *
- * claude-swap has no such coupling — nothing in Happy resolves it — so it
- * tracks latest: `uv tool install --upgrade` installs when absent and
- * upgrades when outdated.
+ *   codex-multi-auth  aiCredentialRuntime.hasPinnedGlobalCodexMultiAuthPackage
+ *                     and codexMultiAuthProxy.startPinnedRuntimeRotationProxy
+ *                     read the npm global root and require
+ *                     CODEX_MULTI_AUTH_VERSION exactly, else they throw
+ *                     CODEX_MULTI_AUTH_VERSION_MISMATCH / "Managed
+ *                     codex-multi-auth <v> is not installed".
+ *   claude-swap       aiCredentialRuntime.ensureClaudeSwap matches
+ *                     `cswap --version` against a regex hard-coded to
+ *                     CLAUDE_SWAP_VERSION. The binary is named `cswap`, which
+ *                     is why grepping for "claude-swap" alone suggests Happy
+ *                     does not use it.
+ *
+ * Installing `latest` over either one makes Happy reinstall its pinned copy at
+ * runtime, and the next Happy update clobbers it again. Pre-installing the
+ * pinned versions instead spares that first use the on-demand install.
+ * installCompanionTools.test.ts fails if either constant drifts from the
+ * source of truth in src/daemon/aiCredentialRuntime.ts.
  *
  * Two conditions gate the normal path:
  *
@@ -47,8 +55,9 @@ const { spawnSync } = require('node:child_process');
 
 const IS_WINDOWS = process.platform === 'win32';
 
-// Must equal CODEX_MULTI_AUTH_VERSION in src/daemon/aiCredentialRuntime.ts.
+// Must equal the same-named constants in src/daemon/aiCredentialRuntime.ts.
 const CODEX_MULTI_AUTH_VERSION = '2.8.5';
+const CLAUDE_SWAP_VERSION = '0.25.0';
 
 function shouldInstallCompanionTools(env) {
     if (env.HAPPY_SKIP_COMPANION_TOOLS) {
@@ -69,7 +78,7 @@ function shouldInstallUvTools(env) {
 }
 
 function installTool(name, command, args) {
-    console.log(`[happy-cli postinstall] installing/updating ${name}...`);
+    console.log(`[happy-cli postinstall] ensuring ${name}...`);
     // `shell` on Windows because npm is npm.cmd there, which CreateProcess
     // cannot launch directly. Every argument is a fixed literal.
     const result = spawnSync(command, args, { stdio: 'inherit', shell: IS_WINDOWS });
@@ -92,16 +101,23 @@ function main() {
     const codexMultiAuth = `codex-multi-auth@${CODEX_MULTI_AUTH_VERSION}`;
     installTool(codexMultiAuth, 'npm', ['install', '-g', codexMultiAuth]);
     if (shouldInstallUvTools(process.env)) {
-        installTool('claude-swap', 'uv', ['tool', 'install', '--upgrade', 'claude-swap']);
+        const claudeSwap = `claude-swap==${CLAUDE_SWAP_VERSION}`;
+        // `--python` mirrors ensureClaudeSwap so both resolve the same runtime.
+        installTool(claudeSwap, 'uv', ['tool', 'install', claudeSwap, '--python', '>=3.12']);
     } else {
         console.warn(
             '[happy-cli postinstall] running under sudo — skipping claude-swap, which uv ' +
-            "would install into root's home. Run as yourself: uv tool install --upgrade claude-swap"
+            `would install into root's home. Run as yourself: uv tool install claude-swap==${CLAUDE_SWAP_VERSION}`
         );
     }
 }
 
-module.exports = { shouldInstallCompanionTools, shouldInstallUvTools, CODEX_MULTI_AUTH_VERSION };
+module.exports = {
+    shouldInstallCompanionTools,
+    shouldInstallUvTools,
+    CODEX_MULTI_AUTH_VERSION,
+    CLAUDE_SWAP_VERSION,
+};
 
 if (require.main === module) {
     main();
