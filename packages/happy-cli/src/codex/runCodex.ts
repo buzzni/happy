@@ -1058,7 +1058,11 @@ export async function runCodex(opts: {
 
     // Event handler: same EventMsg types as the legacy MCP server — no changes needed
     client.setEventHandler((msg) => {
-        logger.debug(`[Codex] Event: ${JSON.stringify(msg)}`);
+        // Text deltas arrive many times per second. Logging their full body would
+        // stringify every preview frame and duplicate the answer in debug logs.
+        if (msg.type !== 'agent_message_delta') {
+            logger.debug(`[Codex] Event: ${JSON.stringify(msg)}`);
+        }
 
         if (msg.type === 'codex_usage') {
             try {
@@ -1075,7 +1079,21 @@ export async function runCodex(opts: {
         }
 
         // Add messages to the ink UI buffer based on message type
-        if (msg.type === 'agent_message') {
+        if (msg.type === 'agent_message_delta') {
+            const messageId = typeof msg.item_id === 'string' ? msg.item_id : null;
+            const index = typeof msg.index === 'number' ? msg.index : null;
+            const offset = typeof msg.offset === 'number' ? msg.offset : null;
+            const delta = typeof msg.delta === 'string' ? msg.delta : null;
+            if (messageId && index !== null && offset !== null && delta !== null) {
+                session.sendStreamDelta({
+                    messageId,
+                    index,
+                    offset,
+                    delta,
+                    final: msg.final === true,
+                });
+            }
+        } else if (msg.type === 'agent_message') {
             messageBuffer.addMessage((msg as any).message, 'assistant');
         } else if (msg.type === 'agent_reasoning_delta') {
             // Skip reasoning deltas in the UI to reduce noise
@@ -1179,7 +1197,7 @@ export async function runCodex(opts: {
 
         // Convert events into the unified session-protocol envelope stream.
         // Reasoning deltas are handled by ReasoningProcessor to avoid duplicate text output.
-        if (msg.type !== 'agent_reasoning_delta' && msg.type !== 'agent_reasoning' && msg.type !== 'agent_reasoning_section_break' && msg.type !== 'turn_diff') {
+        if (msg.type !== 'agent_message_delta' && msg.type !== 'agent_reasoning_delta' && msg.type !== 'agent_reasoning' && msg.type !== 'agent_reasoning_section_break' && msg.type !== 'turn_diff') {
             const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, {
                 currentTurnId,
                 currentProviderTurnId,
