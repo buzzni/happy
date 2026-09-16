@@ -29,6 +29,19 @@ describe('allowElectronInSeatbelt', () => {
         expect(tokens.slice(profileIndex + 1)).toEqual(['/bin/zsh', '-c', 'cd /w && echo "$HOME" && electron .']);
     });
 
+    it('leaves every byte outside the profile untouched, including backticks and quotes in the inner command', () => {
+        // shell-quote 의 parse→quote 왕복은 백틱마다 백슬래시를 하나 더 만든다. 프로필 인자만 바꿔야 한다.
+        const inner = "node '/p/launcher.cjs' --append-system-prompt 'call `x` first' \"$HOME\"";
+        const input = wrapped(PROFILE, inner);
+        const output = allowElectronInSeatbelt(input);
+        const tokens = shellquote.parse(output, (key) => `$${key}`) as string[];
+        expect(tokens[tokens.length - 1]).toBe(shellquote.parse(input, (key) => `$${key}`).at(-1));
+        const quotedProfile = shellquote.quote([PROFILE]);
+        const at = input.indexOf(quotedProfile);
+        expect(output.slice(0, at)).toBe(input.slice(0, at));
+        expect(output.endsWith(input.slice(at + quotedProfile.length))).toBe(true);
+    });
+
     it('returns the command unchanged when it is not a sandbox-exec wrapper', () => {
         expect(allowElectronInSeatbelt('electron .')).toBe('electron .');
         expect(allowElectronInSeatbelt('bwrap --ro-bind / / electron .')).toBe('bwrap --ro-bind / / electron .');

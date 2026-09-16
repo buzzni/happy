@@ -8,8 +8,8 @@
  * /bin/ps 는 setuid 라 seatbelt 안에서 exec 자체가 거부되고 pgrep 은 com.apple.sysmond 를 찾는다.)
  *
  * 프로필은 `sandbox-exec -p <profile>` 인자로 통째로 넘어가고 sandbox-runtime 은 규칙을 끼워
- * 넣을 진입점을 주지 않는다. 그래서 감싼 명령을 shell-quote 로 다시 파싱해 프로필 인자만 고치고
- * 같은 라이브러리로 다시 인용한다 — sandbox-runtime 이 쓰는 인용기와 같아 round-trip 이 무손실이다.
+ * 넣을 진입점을 주지 않는다. 그래서 감싼 명령을 shell-quote 로 파싱해 프로필 인자를 찾고, 그 인자에
+ * 해당하는 부분 문자열만 바꾼다(sandbox-runtime 이 같은 인용기로 인자별 인용하므로 원문에서 그대로 찾힌다).
  *
  * 규칙 목록은 2026-09-16 macOS 26.5 에서 seatbelt 거부 로그를 비워 가며 얻은 실측값이다.
  * 새 거부가 나오면 `/usr/bin/log show --predicate 'eventMessage CONTAINS "deny(1)"'` 로
@@ -57,8 +57,13 @@ export function allowElectronInSeatbelt(wrappedCommand: string): string {
     const denyDefaultIndex = lines.findIndex((line) => DENY_DEFAULT_LINE.test(line));
     if (denyDefaultIndex < 0) return wrappedCommand;
 
+    // 전체 토큰을 다시 인용하지 않는다 — shell-quote 의 parse→quote 왕복은 백틱마다 백슬래시를
+    // 하나 더 만들어 inner 명령이 바뀐다. 프로필 인자에 해당하는 부분 문자열만 바꾼다.
+    const quotedProfile = shellquote.quote([tokens[profileIndex]]);
+    const at = wrappedCommand.indexOf(quotedProfile);
+    if (at < 0) return wrappedCommand;
     lines.splice(denyDefaultIndex + 1, 0, ...ELECTRON_SEATBELT_RULES);
-    const next = [...tokens];
-    next[profileIndex] = lines.join('\n');
-    return shellquote.quote(next);
+    return wrappedCommand.slice(0, at)
+        + shellquote.quote([lines.join('\n')])
+        + wrappedCommand.slice(at + quotedProfile.length);
 }
