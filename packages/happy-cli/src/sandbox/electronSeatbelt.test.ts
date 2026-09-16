@@ -52,12 +52,12 @@ describe('allowElectronInSeatbelt', () => {
         expect(allowElectronInSeatbelt(once)).toBe(once);
     });
 
-    it('covers the operations Electron needs: rendezvous port, WindowServer, GPU helpers — and nothing process-wide', () => {
-        const text = ELECTRON_SEATBELT_RULES.join('\n');
-        expect(text).toContain('(allow mach-register (global-name-regex #"\\.MachPortRendezvousServer\\."))');
-        expect(text).toContain('(allow mach-lookup (global-name-regex #"\\.MachPortRendezvousServer\\."))');
-        expect(text).toContain('(global-name "com.apple.windowserver.active")');
-        expect(text).toContain('(global-name "com.apple.CARenderServer")');
-        expect(text).not.toContain('process-info');
+    it('opens only what Electron dies without: the rendezvous port and WindowServer', () => {
+        const rules = ELECTRON_SEATBELT_RULES.filter((line) => !line.startsWith(';'));
+        expect(rules).toEqual([
+            '(allow mach-register (global-name-regex #"\\.MachPortRendezvousServer\\."))',
+            '(allow mach-lookup (global-name-regex #"\\.MachPortRendezvousServer\\."))',
+            '(allow mach-lookup (global-name "com.apple.windowserver.active"))',
+        ]);
     });
 });

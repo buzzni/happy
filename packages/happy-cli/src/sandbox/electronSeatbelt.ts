@@ -11,9 +11,12 @@
  * 넣을 진입점을 주지 않는다. 그래서 감싼 명령을 shell-quote 로 파싱해 프로필 인자를 찾고, 그 인자에
  * 해당하는 부분 문자열만 바꾼다(sandbox-runtime 이 같은 인용기로 인자별 인용하므로 원문에서 그대로 찾힌다).
  *
- * 규칙 목록은 2026-09-16 macOS 26.5 에서 seatbelt 거부 로그를 비워 가며 얻은 실측값이다.
- * 새 거부가 나오면 `/usr/bin/log show --predicate 'eventMessage CONTAINS "deny(1)"'` 로
- * 대상을 확인하고 여기에 추가한다. Chromium 자체 샌드박스는 seatbelt 안에서 중첩될 수 없으므로
+ * 규칙은 2026-09-16 macOS 26.5 에서 하나씩 빼 가며 확인한 최소 집합이다 — 이 셋이 없으면 창이 안 뜨고,
+ * 이 셋만으로 Desktop Playwright e2e 7건이 통과한다. 이 래퍼는 명령마다가 아니라 에이전트 프로세스
+ * 전체에 한 번 걸리므로 GUI 실행 여부를 미리 알 수 없어 무조건 넣는다. 그래서 목록을 넓히지 않는다:
+ * 거부 로그에 뜨는 다른 서비스(CARenderServer·configd·dock·pasteboard·tccd 등)는 Chromium 이
+ * 재시도하거나 소프트웨어 경로로 넘어가므로 열지 않는다. 새 서비스는 "없으면 실제로 죽는다"를
+ * `/usr/bin/log show --predicate 'eventMessage CONTAINS "deny(1)"'` 와 함께 증명한 뒤에만 추가한다. Chromium 자체 샌드박스는 seatbelt 안에서 중첩될 수 없으므로
  * 앱 쪽은 `--no-sandbox` 로 띄워야 한다 (환경변수 `SANDBOX_RUNTIME=1` 로 판별 가능).
  */
 import shellquote from 'shell-quote';
@@ -22,19 +25,8 @@ export const ELECTRON_SEATBELT_RULES: readonly string[] = [
     '; Electron/Chromium GUI inside seatbelt (happy-cli)',
     '(allow mach-register (global-name-regex #"\\.MachPortRendezvousServer\\."))',
     '(allow mach-lookup (global-name-regex #"\\.MachPortRendezvousServer\\."))',
-    '(allow mach-lookup',
-    '  (global-name "com.apple.windowserver.active")',
-    '  (global-name "com.apple.CARenderServer")',
-    '  (global-name "com.apple.CoreServices.coreservicesd")',
-    '  (global-name "com.apple.DiskArbitration.diskarbitrationd")',
-    '  (global-name "com.apple.SystemConfiguration.configd")',
-    '  (global-name "com.apple.SystemConfiguration.DNSConfiguration")',
-    '  (global-name "com.apple.dock.server")',
-    '  (global-name "com.apple.hiservices-xpcservice")',
-    '  (global-name "com.apple.pasteboard.1")',
-    '  (global-name "com.apple.tccd.system")',
-    ')',
-];
+    '(allow mach-lookup (global-name "com.apple.windowserver.active"))',
+]
 
 const DENY_DEFAULT_LINE = /^\(deny default\b/;
 
