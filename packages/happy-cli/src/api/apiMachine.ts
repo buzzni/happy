@@ -167,6 +167,7 @@ import {
 import type { ChildProcess } from 'node:child_process';
 import type { BrowserCdpPipe } from '@/daemon/browserCdpPipe';
 import { shouldReconnect } from '@/utils/lidState';
+import { RECONNECT_DIAL_TIMEOUT_MS, reconnectDelayMs } from '@/api/reconnectCadence';
 import { getProjectPath } from '@/claude/utils/path';
 import {
     forkSession as claudeForkSession,
@@ -713,7 +714,21 @@ export class ApiMachineClient {
     // terminal-open-fwd handler can run validatePath against the same
     // root the rest of the RPC surface uses (Files tab / writeFile).
     private allowedRoot: string;
+    /**
+     * The pending next dial. Non-null means "a retry cadence is running", which
+     * is all `getConnectionHealth()` and the connection supervisor read it for.
+     */
     private reconnectInterval: NodeJS.Timeout | null = null;
+    /** Consecutive dials since the last successful connect. Drives the backoff. */
+    private reconnectAttempts = 0;
+    /**
+     * When the outstanding `socket.connect()` was issued, or null when no dial
+     * is out. specs/machine-socket-duplicate-registration/ — this is the
+     * single-flight guard: the old cadence dialled every 3s regardless, so a
+     * slow handshake collected several overlapping dials and several of them
+     * completed, leaving the server holding more than one live machine socket.
+     */
+    private reconnectDialStartedAt: number | null = null;
     /*
      * specs/daemon-socket-watchdog/ — the level-triggered backstop.
      *
@@ -2772,10 +2787,7 @@ export class ApiMachineClient {
          * field rather than a local decision here.
          */
         this.credentialStopped = true;
-        if (this.reconnectInterval) {
-            clearInterval(this.reconnectInterval);
-            this.reconnectInterval = null;
-        }
+        this.stopSmartReconnect();
         // The supervisor exists to restart reconnects; with no credential
         // there is nothing for it to restart them with.
         this.stopConnectionSupervisor();
@@ -2810,10 +2822,10 @@ export class ApiMachineClient {
             logger.debug('[API MACHINE] Connected to server');
             this.disconnectedSince = null;
 
-            if (this.reconnectInterval) {
-                clearInterval(this.reconnectInterval);
-                this.reconnectInterval = null;
-            }
+            // The dial landed: end the cadence and return the backoff to its
+            // first step so the next blip still recovers in about a second.
+            this.stopSmartReconnect();
+            this.reconnectAttempts = 0;
 
             this.updateDaemonState((state) => ({
                 ...state,
@@ -2834,6 +2846,10 @@ export class ApiMachineClient {
         this.socket.on('disconnect', (reason) => {
             logger.debug(`[API MACHINE] Disconnected from server — reason: ${reason}`);
             this.disconnectedSince = Date.now();
+            // A socket that was up has no dial outstanding; a socket that
+            // dropped mid-handshake has one that just resolved. Either way the
+            // next tick may dial without waiting out the in-flight budget.
+            this.reconnectDialStartedAt = null;
             this.rpcHandlerManager.onSocketDisconnect();
             this.stopKeepAlive();
             // Tear down any live preview WebSocket tunnels — the relay path is
@@ -3159,6 +3175,10 @@ export class ApiMachineClient {
 
         this.socket.on('connect_error', (error) => {
             logger.debug(`[API MACHINE] Connection error: ${error.message}`);
+            // This is how a dial resolves when it fails. Clearing the marker
+            // before rescheduling lets the next tick dial immediately instead
+            // of waiting out the in-flight budget.
+            this.reconnectDialStartedAt = null;
             this.startSmartReconnect();
         });
 
@@ -3312,31 +3332,62 @@ export class ApiMachineClient {
         // this runtime is not authorised.
         if (this.credentialStopped) return;
         if (this.reconnectInterval) return;
+        this.scheduleReconnectDial();
+    }
 
-        this.reconnectInterval = setInterval(() => {
+    /** Ends the cadence and forgets any dial it was waiting on. */
+    private stopSmartReconnect() {
+        if (this.reconnectInterval) {
+            clearTimeout(this.reconnectInterval);
+            this.reconnectInterval = null;
+        }
+        this.reconnectDialStartedAt = null;
+    }
+
+    /**
+     * True while a `socket.connect()` is still waiting for `connect` or
+     * `connect_error`. Expires on its own so a handshake that resolves with
+     * neither cannot wedge the cadence shut.
+     */
+    private isReconnectDialInFlight(): boolean {
+        if (this.reconnectDialStartedAt === null) return false;
+        if (Date.now() - this.reconnectDialStartedAt < RECONNECT_DIAL_TIMEOUT_MS) return true;
+        this.reconnectDialStartedAt = null;
+        return false;
+    }
+
+    private scheduleReconnectDial() {
+        const delayMs = reconnectDelayMs(this.reconnectAttempts);
+        this.reconnectInterval = setTimeout(() => {
+            this.reconnectInterval = null;
+            /*
+             * Every condition is re-read when the timer fires, not when it was
+             * scheduled. A stop that arrives in between leaves this callback on
+             * the queue, and it would otherwise reconnect with the credential
+             * that just expired.
+             */
+            if (this.credentialStopped) return;
             if (this.socket.connected) {
-                clearInterval(this.reconnectInterval!);
-                this.reconnectInterval = null;
+                this.reconnectAttempts = 0;
+                return;
+            }
+            if (this.isReconnectDialInFlight()) {
+                // Stacking a second dial on an unresolved one is precisely what
+                // duplicated the machine socket. Wait for this one to land.
+                this.scheduleReconnectDial();
                 return;
             }
             if (!shouldReconnect()) {
                 logger.debug('[API MACHINE] Still not ready to reconnect');
+                this.scheduleReconnectDial();
                 return;
             }
-            logger.debug('[API MACHINE] Attempting reconnect');
+            this.reconnectAttempts += 1;
+            this.reconnectDialStartedAt = Date.now();
+            logger.debug(`[API MACHINE] Attempting reconnect (attempt ${this.reconnectAttempts})`);
             this.socket.connect();
-        }, 3000);
-
-        if (shouldReconnect()) {
-            logger.debug('[API MACHINE] Network up + lid open — reconnecting in 1s');
-            setTimeout(() => {
-                // Re-checked when it fires, not when it was scheduled. A stop
-                // that arrives in between leaves this timeout on the queue, and
-                // it would reconnect with the credential that just expired.
-                if (this.credentialStopped) return;
-                if (!this.socket.connected) this.socket.connect();
-            }, 1000);
-        }
+            this.scheduleReconnectDial();
+        }, delayMs);
     }
 
     private stopKeepAlive() {
@@ -3353,10 +3404,7 @@ export class ApiMachineClient {
         this.stopConnectionSupervisor();
         for (const cdpPipe of this.browserCdpPipes.values()) cdpPipe.close();
         this.browserCdpPipes.clear();
-        if (this.reconnectInterval) {
-            clearInterval(this.reconnectInterval);
-            this.reconnectInterval = null;
-        }
+        this.stopSmartReconnect();
         if (this.socket) {
             this.socket.close();
             logger.debug('[API MACHINE] Socket closed');

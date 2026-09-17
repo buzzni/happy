@@ -90,6 +90,43 @@ export async function addTerminalSession(session: TerminalSession): Promise<void
     }, undefined);
 }
 
+/**
+ * Points one side of a session at a different socket, keeping the reverse
+ * index in step.
+ *
+ * specs/machine-socket-duplicate-registration/ — the ids in a session record
+ * are a routing target, not an identity. Both endpoints legitimately change
+ * socket id while the terminal is still the same terminal: the desktop
+ * terminal socket is opened with reconnection enabled precisely so a blip does
+ * not kill the panel, and a daemon re-handshake produces a fresh sid too.
+ * Freezing the ids at open time meant every such change silently black-holed
+ * the traffic — `io.to(deadId).emit()` is a no-op, and the frames coming back
+ * matched neither side of the pair, so they were dropped as well.
+ *
+ * Returns the updated session, or null when there is nothing to rebind.
+ */
+export async function rebindTerminalSessionSocket(
+    id: string,
+    side: 'client' | 'daemon',
+    socketId: string,
+): Promise<TerminalSession | null> {
+    const current = await getTerminalSession(id);
+    if (!current) return null;
+    const previous = side === 'client' ? current.clientSocketId : current.daemonSocketId;
+    if (previous === socketId) return current;
+    const next: TerminalSession = side === 'client'
+        ? { ...current, clientSocketId: socketId }
+        : { ...current, daemonSocketId: socketId };
+    cache.set(next.id, next);
+    await tolerate('rebind', async () => {
+        await backend!.set(sessionKey(next.id), JSON.stringify(next), 'EX', SESSION_TTL_SECONDS);
+        await backend!.srem(socketKey(previous), next.id);
+        await backend!.sadd(socketKey(socketId), next.id);
+        await backend!.expire(socketKey(socketId), SESSION_TTL_SECONDS);
+    }, undefined);
+    return next;
+}
+
 export async function getTerminalSession(id: string | undefined | null): Promise<TerminalSession | null> {
     if (!id) return null;
     const cached = cache.get(id);

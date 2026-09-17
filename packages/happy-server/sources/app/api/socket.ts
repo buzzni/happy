@@ -22,6 +22,7 @@ import { db } from "@/storage/db";
 import { machineSocketIdentityExists } from "./socket/machineSocketAuth";
 import { automationSocketHandler } from "./socket/automationSocketHandler";
 import { markMachineOffline, markMachineOnline } from "@/app/presence/machinePresence";
+import { evictSupersededMachineSockets } from "@/app/events/findMachineSockets";
 import { wrapServerForPreviewSubdomainBypass } from "@/modules/preview/previewEngineIoGuard";
 import { startManagedSocket } from "@/app/api/socket/managed/managedSocketServer";
 import { setManagedRpcServer } from "@/app/api/socket/managed/managedDelivery";
@@ -329,6 +330,28 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             // fire-and-forget: 이 쓰기가 실패해도 소켓은 살아 있어야 하고,
             // heartbeat flush 가 최대 35초 안에 같은 상태를 다시 기록한다.
             void markMachineOnline(userId, connection.machineId, connectedAt);
+
+            /*
+             * specs/machine-socket-duplicate-registration/ — one machine, one
+             * socket. Overlapping handshakes from a single daemon can each
+             * complete, and engine.io keeps every one of them in the machine
+             * room until its own ping budget runs out (pingInterval 15s +
+             * pingTimeout 45s). Work routed into a socket the daemon is no
+             * longer reading from is never answered — the caller just waits out
+             * its ack. Close the superseded ones now instead.
+             *
+             * Fire-and-forget: a cluster bus that cannot answer should cost a
+             * stale socket, not this connection.
+             */
+            void evictSupersededMachineSockets(io, userId, connection.machineId, socket.id)
+                .then((evicted) => {
+                    if (evicted > 0) {
+                        log({ module: 'websocket' }, `Evicted ${evicted} superseded machine socket(s) for machine ${connection.machineId}, keeping ${socket.id}`);
+                    }
+                })
+                .catch((error) => {
+                    log({ module: 'websocket', level: 'error' }, `Machine socket eviction failed for ${connection.machineId}: ${error}`);
+                });
         }
 
         // Track app focus state for push notification routing.

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { findMachineSocketsIn, machineRoom, newestMachineSocket } from './findMachineSockets';
+import { findMachineSocketsIn, machineRoom, newestMachineSocket, supersededMachineSockets } from './findMachineSockets';
 
 /**
  * Builds a fake `io` whose `in(room)` records the room and resolves
@@ -127,5 +127,64 @@ describe('newestMachineSocket', () => {
 
     it('shouldReturnNullWhenThereAreNoCandidates', () => {
         expect(newestMachineSocket([])).toBeNull();
+    });
+});
+
+/*
+ * specs/machine-socket-duplicate-registration/ — a machine has one daemon, so
+ * it should have one socket. Overlapping handshakes can leave several live at
+ * once, and engine.io keeps every one of them until its own ping budget runs
+ * out; work routed into a socket the daemon no longer reads from is simply
+ * never answered.
+ */
+describe('supersededMachineSockets', () => {
+    const at = (id: string, connectedAt?: number) => ({
+        id,
+        data: connectedAt === undefined ? {} : { connectedAt },
+    });
+
+    it('shouldReturnTheOlderSocketsAndKeepTheNewest', () => {
+        const stale = supersededMachineSockets([at('old', 1_000), at('new', 5_000)], 'new');
+        expect(stale.map(s => s.id)).toEqual(['old']);
+    });
+
+    it('shouldNotEvictSocketsNewerThanTheKeeper', () => {
+        // Run from the older socket's point of view: it must take nothing down.
+        const stale = supersededMachineSockets([at('old', 1_000), at('new', 5_000)], 'old');
+        expect(stale).toEqual([]);
+    });
+
+    /*
+     * The case that matters most: two sockets that connected in the same
+     * millisecond both run this. Without an ordered tie-break they evict each
+     * other and the daemon ends up with no socket at all.
+     */
+    it('shouldBreakATieSoExactlyOneOfTwoSocketsSurvives', () => {
+        const pair = [at('aaa', 7_000), at('bbb', 7_000)];
+        const fromB = supersededMachineSockets(pair, 'bbb').map(s => s.id);
+        const fromA = supersededMachineSockets(pair, 'aaa').map(s => s.id);
+        expect(fromB).toEqual(['aaa']);
+        expect(fromA).toEqual([]);
+    });
+
+    it('shouldBreakATieBetweenTwoUnstampedSocketsToo', () => {
+        const pair = [at('aaa'), at('bbb')];
+        expect(supersededMachineSockets(pair, 'bbb').map(s => s.id)).toEqual(['aaa']);
+        expect(supersededMachineSockets(pair, 'aaa')).toEqual([]);
+    });
+
+    it('shouldEvictAnUnstampedSocketInFavourOfAStampedOne', () => {
+        const stale = supersededMachineSockets([at('legacy'), at('fresh', 42)], 'fresh');
+        expect(stale.map(s => s.id)).toEqual(['legacy']);
+    });
+
+    it('shouldEvictNothingWhenTheKeeperIsNotInTheList', () => {
+        // A degraded cluster lookup returns an incomplete set; that must never
+        // read as "everything here is stale".
+        expect(supersededMachineSockets([at('a', 1), at('b', 2)], 'missing')).toEqual([]);
+    });
+
+    it('shouldEvictNothingWhenTheKeeperIsAlone', () => {
+        expect(supersededMachineSockets([at('only', 1)], 'only')).toEqual([]);
     });
 });

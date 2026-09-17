@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
 import { ApiMachineClient } from './apiMachine';
+import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_MAX_DELAY_MS } from './reconnectCadence';
 import { logger } from '@/ui/logger';
 import type { Machine } from './types';
 
@@ -106,6 +107,10 @@ describe('ApiMachineClient socket reconnection', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         mockShouldReconnect.mockReturnValue(true);
+        // specs/machine-socket-duplicate-registration/ — the dial cadence is
+        // jittered. Pinning the source to its top of range makes each delay
+        // exactly its nominal value, so these tests can assert on the clock.
+        vi.spyOn(Math, 'random').mockReturnValue(1);
         socketHandlers = {};
         mockSocket = {
             connected: false,
@@ -288,8 +293,41 @@ describe('ApiMachineClient socket reconnection', () => {
         await vi.advanceTimersByTimeAsync(1000);
         expect(mockSocket.connect).toHaveBeenCalledTimes(1);
 
-        await vi.advanceTimersByTimeAsync(3000);
+        /*
+         * specs/machine-socket-duplicate-registration/ AC1 — that dial has not
+         * come back yet, and the next tick must not stack a second one on top
+         * of it. Overlapping dials are what left the server holding several
+         * live sockets for one daemon.
+         */
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(mockSocket.connect).toHaveBeenCalledTimes(1);
+
+        // Once the dial resolves, the cadence carries on at its next tick.
+        emitSocketEvent('connect_error', new Error('ECONNREFUSED'));
+        await vi.advanceTimersByTimeAsync(2000);
         expect(mockSocket.connect).toHaveBeenCalledTimes(2);
+
+        client.shutdown();
+    });
+
+    /*
+     * The guard must not become a new way to never reconnect: socket.io
+     * normally resolves a dial with `connect` or `connect_error`, but a
+     * handshake that hangs fires neither. AC2.
+     */
+    it('dials again when a dial goes unanswered past its budget', async () => {
+        vi.useFakeTimers();
+
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.connect();
+
+        emitSocketEvent('connect_error', new Error('ECONNREFUSED'));
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(mockSocket.connect).toHaveBeenCalledTimes(1);
+
+        // No connect, no connect_error — nothing at all comes back.
+        await vi.advanceTimersByTimeAsync(RECONNECT_DIAL_TIMEOUT_MS + RECONNECT_MAX_DELAY_MS);
+        expect(mockSocket.connect.mock.calls.length).toBeGreaterThan(1);
 
         client.shutdown();
     });
@@ -313,11 +351,16 @@ describe('ApiMachineClient socket reconnection', () => {
         await vi.advanceTimersByTimeAsync(29_000);
         expect(mockSocket.connect).not.toHaveBeenCalled();
 
-        // The tick lands and starts the ordinary 1s-then-3s cadence.
+        // The tick lands and starts the ordinary cadence with its 1s first dial.
         await vi.advanceTimersByTimeAsync(2_000);
         expect(mockSocket.connect).toHaveBeenCalledTimes(1);
 
+        // Still single-flight: the recovered cadence is the same cadence.
         await vi.advanceTimersByTimeAsync(3_000);
+        expect(mockSocket.connect).toHaveBeenCalledTimes(1);
+
+        emitSocketEvent('connect_error', new Error('ECONNREFUSED'));
+        await vi.advanceTimersByTimeAsync(2_000);
         expect(mockSocket.connect).toHaveBeenCalledTimes(2);
 
         client.shutdown();

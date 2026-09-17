@@ -341,13 +341,26 @@ describe('ApiSessionClient v3 messages API migration', () => {
 
         expect(mockSocket.connect).toHaveBeenCalledTimes(1);
 
-        emitSocketEvent('connect_error', new Error('ECONNREFUSED'));
+        // specs/machine-socket-duplicate-registration/ — the cadence is
+        // jittered; pin the source so each delay is exactly its nominal value.
+        const random = vi.spyOn(Math, 'random').mockReturnValue(1);
+        try {
+            emitSocketEvent('connect_error', new Error('ECONNREFUSED'));
 
-        await vi.advanceTimersByTimeAsync(1000);
-        expect(mockSocket.connect).toHaveBeenCalledTimes(2);
+            await vi.advanceTimersByTimeAsync(1000);
+            expect(mockSocket.connect).toHaveBeenCalledTimes(2);
 
-        await vi.advanceTimersByTimeAsync(3000);
-        expect(mockSocket.connect).toHaveBeenCalledTimes(3);
+            // AC1 — the dial is still out; no second one is stacked on it.
+            await vi.advanceTimersByTimeAsync(2000);
+            expect(mockSocket.connect).toHaveBeenCalledTimes(2);
+
+            // Resolved, so the cadence carries on at its next tick.
+            emitSocketEvent('connect_error', new Error('ECONNREFUSED'));
+            await vi.advanceTimersByTimeAsync(2000);
+            expect(mockSocket.connect).toHaveBeenCalledTimes(3);
+        } finally {
+            random.mockRestore();
+        }
 
         await client.close();
     });
