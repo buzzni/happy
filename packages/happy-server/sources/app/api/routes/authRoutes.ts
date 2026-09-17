@@ -3,6 +3,7 @@ import { type Fastify } from "../types";
 import * as privacyKit from "privacy-kit";
 import { db } from "@/storage/db";
 import { auth } from "@/app/auth/auth";
+import { BROWSER_SYNC_MAX_TTL_MS } from "@/app/auth/browserSyncToken";
 import { log } from "@/utils/log";
 
 export function authRoutes(app: Fastify) {
@@ -239,6 +240,45 @@ export function authRoutes(app: Fastify) {
             });
         }
         return reply.send({ success: true });
+    });
+
+
+    /**
+     * Mint a browser's sync credential.
+     *
+     * Called by the web app's server with the account bearer it already holds,
+     * never by a browser: the whole point is that the browser does not have
+     * that bearer. What it gets back names the account and expires on its own,
+     * so a browser that stops being reissued falls off the socket.
+     *
+     * The bearer is the only proof required. A caller holding it can already do
+     * everything this credential allows and more, so a second proof here would
+     * protect nothing and would give the web app one more key to rotate.
+     */
+    app.post('/v1/auth/browser-sync', {
+        preHandler: app.authenticate,
+        schema: {
+            response: {
+                200: z.object({
+                    token: z.string(),
+                    expiresAt: z.number(),
+                }),
+                503: z.object({
+                    error: z.literal('Browser sync credential unavailable'),
+                }),
+            },
+        },
+    }, async (request, reply) => {
+        const now = Date.now();
+        const token = await auth.createBrowserSyncToken(request.userId, now);
+        if (!token) {
+            // The issuer refused. Reporting success with no usable credential
+            // would surface later as a socket that cannot connect, for reasons
+            // nobody can trace back to here.
+            log({ module: 'auth', level: 'error' }, 'Browser sync credential mint failed');
+            return reply.code(503).send({ error: 'Browser sync credential unavailable' as const });
+        }
+        return reply.send({ token, expiresAt: now + BROWSER_SYNC_MAX_TTL_MS });
     });
 
 }
