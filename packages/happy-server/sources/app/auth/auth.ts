@@ -1,6 +1,11 @@
 import * as privacyKit from "privacy-kit";
 import { log } from "@/utils/log";
 import type { Principal, SessionScopedTokenIssuer } from "@/app/auth/sessionScopedToken";
+import {
+    BROWSER_SYNC_MAX_TTL_MS,
+    createBrowserSyncTokenIssuer,
+    type BrowserSyncTokenIssuer,
+} from "@/app/auth/browserSyncToken";
 
 /** Cache entries expire after 24 hours */
 const TOKEN_CACHE_TTL = 24 * 60 * 60 * 1000;
@@ -24,6 +29,20 @@ interface AuthTokens {
 
 class AuthModule {
     private tokenCache = new Map<string, TokenCacheEntry>();
+    /**
+     * The browser sync credential issuer.
+     *
+     * Not behind managed control: a browser needs this wherever the server
+     * runs, and the seed it derives from is the one account tokens already
+     * use. See `browserSyncToken.ts` for why browsers stopped carrying the
+     * account bearer.
+     */
+    private browserSync: BrowserSyncTokenIssuer | null = null;
+
+    /** The socket handshake verifies with this directly. */
+    get browserSyncIssuer(): BrowserSyncTokenIssuer | null {
+        return this.browserSync;
+    }
     private tokens: AuthTokens | null = null;
     private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -58,6 +77,9 @@ class AuthModule {
 
 
         this.tokens = { generator, verifier, githubVerifier, githubGenerator };
+        this.browserSync = await createBrowserSyncTokenIssuer({
+            seed: process.env.HANDY_MASTER_SECRET!,
+        });
 
         // Start periodic cleanup of expired cache entries
         this.cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL);
@@ -203,6 +225,50 @@ class AuthModule {
         };
     }
     
+    /**
+     * Mint a browser's sync credential.
+     *
+     * `ttlMs` is capped by the issuer, not here — a caller asking for longer
+     * gets a refusal rather than a silently shortened credential, because a
+     * credential that lives a different length than the caller believes is how
+     * a logout appears to work and does not.
+     */
+    async createBrowserSyncToken(
+        accountId: string,
+        now: number,
+        ttlMs: number = BROWSER_SYNC_MAX_TTL_MS,
+    ): Promise<string | null> {
+        if (!this.browserSync) {
+            throw new Error('Auth module not initialized');
+        }
+        const minted = await this.browserSync.mint(
+            { v: 1, accountId, expiresAt: now + ttlMs },
+            now,
+        );
+        if (!minted.ok) {
+            log({ module: 'auth', level: 'error' }, `Browser sync mint refused: ${minted.reason}`);
+            return null;
+        }
+        return minted.token;
+    }
+
+    /**
+     * Verify a browser's sync credential.
+     *
+     * Deliberately not routed through `tokenCache`: that cache holds account
+     * bearers for 24 hours, and this credential's short life is the only thing
+     * that ends a logged-out browser's socket.
+     */
+    async verifyBrowserSyncToken(
+        token: string,
+        now: number,
+    ): Promise<{ accountId: string; expiresAt: number } | null> {
+        if (!this.browserSync) return null;
+        const verified = await this.browserSync.verify(token, now);
+        if (!verified.ok) return null;
+        return { accountId: verified.claims.accountId, expiresAt: verified.claims.expiresAt };
+    }
+
     async createGithubToken(userId: string): Promise<string> {
         if (!this.tokens) {
             throw new Error('Auth module not initialized');

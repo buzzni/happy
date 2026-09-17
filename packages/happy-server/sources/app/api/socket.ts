@@ -6,6 +6,7 @@ import { createAdapter } from "@socket.io/redis-streams-adapter";
 import { createRedisClient, isRedisConfigured } from "@/storage/createRedisClient";
 import { log } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
+import { authenticateBrowserSyncSocket } from "./socket/browserSyncSocketAuth";
 import { getMetricsLabelsFromSocket, redisStreamInfoFailuresCounter, redisStreamLagMsGauge, redisStreamWriteFailuresCounter, socketioClusterPeersGauge, websocketConnectionsGauge, websocketEventsCounter } from "../monitoring/metrics2";
 import { createLogThrottle, instrumentStreamWrites, readClusterPeerCount } from "../monitoring/redisHealth";
 import { usageHandler } from "./socket/usageHandler";
@@ -205,6 +206,38 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             socket.data.happyClient = socket.handshake.auth.happyClient as string
                 || socket.handshake.headers['x-happy-client'] as string
                 || undefined;
+            next();
+            return;
+        }
+
+        /*
+         * A browser presents a credential of its own purpose, not the account
+         * bearer. That is what makes "log this browser out" mean something on
+         * the socket: the bearer is one value per account, shared with the CLI
+         * and the phone, and nothing here can withdraw it.
+         *
+         * The credential is short-lived and the web app reissues it only while
+         * that browser's login session is live. So the connection is also given
+         * a deadline — a check that ran only at connect would leave a socket
+         * authenticated by a credential that has since stopped being reissued.
+         */
+        const browserSync = await authenticateBrowserSyncSocket({
+            handshake: { token, clientType },
+            issuer: auth.browserSyncIssuer,
+            now: Date.now(),
+        });
+        if (browserSync) {
+            socket.data.userId = browserSync.accountId;
+            socket.data.clientType = clientType;
+            socket.data.sessionId = sessionId;
+            socket.data.machineId = machineId;
+            socket.data.connectedAt = Date.now();
+            socket.data.happyClient = socket.handshake.auth.happyClient as string
+                || socket.handshake.headers['x-happy-client'] as string
+                || undefined;
+            const remaining = browserSync.expiresAt - Date.now();
+            const deadline = setTimeout(() => socket.disconnect(true), Math.max(0, remaining));
+            socket.on('disconnect', () => clearTimeout(deadline));
             next();
             return;
         }
