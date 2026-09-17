@@ -110,25 +110,38 @@ export function automationSocketHandler(accountId: string, machineId: string, so
             revision: integer(item?.revision, 1, Number.MAX_SAFE_INTEGER),
         }));
         return inTx((tx) => ackAutomationSync(tx, accountId, machineId, items));
-    }, () => emitAutomationUpdate(accountId, { projectId: null, reason: 'sync' })));
+    }, async (value) => {
+        // specs/automation-request-surge — an acknowledgement that advanced nothing
+        // announces nothing, and one that did announces only its own projects.
+        const { affectedProjectIds } = value as { affectedProjectIds: string[] };
+        await Promise.all(affectedProjectIds.map((projectId) =>
+            emitProjectAutomationUpdate(projectId, { projectId, reason: 'sync' }, accountId),
+        ));
+    }));
 
     on('automation-claim', async (data, callback) => answer(callback, () => inTx((tx) => claimAutomationRun(tx, accountId, machineId, {
         automationId: requiredString(data?.automationId),
         generation: integer(data?.generation, 1, Number.MAX_SAFE_INTEGER),
         scheduledFor: new Date(integer(data?.scheduledFor, 0, Number.MAX_SAFE_INTEGER)),
-    })), () => emitAutomationUpdate(accountId, {
-        projectId: null,
-        automationId: requiredString(data?.automationId),
-        reason: 'run',
-    })));
+    })), (value) => {
+        const { projectId } = value as { projectId: string };
+        return emitProjectAutomationUpdate(projectId, {
+            projectId,
+            automationId: requiredString(data?.automationId),
+            reason: 'run',
+        }, accountId);
+    }));
 
     on('automation-run-start', async (data, callback) => answer(callback, () => inTx((tx) => startAutomationRun(tx, accountId, machineId, {
         runId: requiredString(data?.runId), claimToken: requiredString(data?.claimToken),
-    })), () => emitAutomationUpdate(accountId, {
-        projectId: null,
-        runId: requiredString(data?.runId),
-        reason: 'run',
-    })));
+    })), (value) => {
+        const { projectId } = value as { projectId: string };
+        return emitProjectAutomationUpdate(projectId, {
+            projectId,
+            runId: requiredString(data?.runId),
+            reason: 'run',
+        }, accountId);
+    }));
 
     on('automation-run-heartbeat', async (data, callback) => answer(callback, () => inTx((tx) => heartbeatAutomationRun(tx, accountId, machineId, {
         runId: requiredString(data?.runId), claimToken: requiredString(data?.claimToken),
@@ -177,11 +190,16 @@ export function automationSocketHandler(accountId: string, machineId: string, so
                 ? null
                 : new Date(integer(data.queueEstimatedAt, 0, Number.MAX_SAFE_INTEGER)),
         }));
-    }, () => emitAutomationUpdate(accountId, {
-            projectId: null,
+    }, async (value) => {
+        // A replayed report is the same terminal state the clients already have.
+        const { idempotent, projectId } = value as { idempotent: boolean; projectId: string };
+        if (idempotent) return;
+        await emitProjectAutomationUpdate(projectId, {
+            projectId,
             runId: requiredString(data?.runId),
             reason: 'run',
-        })));
+        }, accountId);
+    }));
 
     on('session-followup-sync', async (data, callback) => answer(callback, () => {
         const input = sessionFollowupSyncRequestSchema.parse(data);
