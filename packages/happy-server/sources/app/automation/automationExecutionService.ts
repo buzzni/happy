@@ -148,8 +148,12 @@ export async function ackAutomationSync(
     machineId: string,
     items: Array<{ automationId: string; revision: number }>,
     now: Date = new Date(),
-): Promise<Result<{ acknowledged: number }>> {
+): Promise<Result<{ acknowledged: number; affectedProjectIds: string[] }>> {
     let acknowledged = 0;
+    // specs/automation-request-surge — only the automations whose applied revision
+    // actually advanced are worth announcing. A daemon re-acking what it already
+    // acked changes nothing, so it must produce no invalidation at all.
+    const advancedAutomationIds = new Set<string>();
     for (const item of items) {
         const changed = await tx.automation.updateMany({
             where: {
@@ -162,8 +166,25 @@ export async function ackAutomationSync(
             data: { appliedRevision: item.revision, appliedAt: now },
         });
         acknowledged += changed.count;
+        if (changed.count > 0) advancedAutomationIds.add(item.automationId);
     }
-    return { ok: true, value: { acknowledged } };
+    if (advancedAutomationIds.size === 0) {
+        return { ok: true, value: { acknowledged, affectedProjectIds: [] } };
+    }
+    // The project ids come from the rows this machine is allowed to touch, never
+    // from the acknowledgement payload.
+    const rows = await tx.automation.findMany({
+        where: {
+            id: { in: [...advancedAutomationIds] },
+            machineAccountId: accountId,
+            machineId,
+        },
+        select: { projectId: true },
+    });
+    return {
+        ok: true,
+        value: { acknowledged, affectedProjectIds: [...new Set(rows.map((row) => row.projectId))] },
+    };
 }
 
 function executable(automation: any, accountId: string, machineId: string, generation: number): boolean {
@@ -187,7 +208,7 @@ export async function claimAutomationRun(
     machineId: string,
     input: { automationId: string; generation: number; scheduledFor: Date },
     now: Date = new Date(),
-): Promise<Result<{ runId: string; claimToken: string; claimExpiresAt: Date; serverTime: Date }>> {
+): Promise<Result<{ runId: string; claimToken: string; claimExpiresAt: Date; serverTime: Date; projectId: string }>> {
     const automation = await tx.automation.findFirst({
         where: { id: input.automationId, machineAccountId: accountId, machineId, deletedAt: null },
         include: {
@@ -244,7 +265,7 @@ export async function claimAutomationRun(
             ? { ok: false, error: 'already-claimed' }
             : { ok: false, error: 'active-run' };
     }
-    return { ok: true, value: { runId, claimToken, claimExpiresAt, serverTime: now } };
+    return { ok: true, value: { runId, claimToken, claimExpiresAt, serverTime: now, projectId: automation.projectId } };
 }
 
 async function claimedRun(tx: Tx, accountId: string, machineId: string, runId: string, claimToken: string) {
@@ -267,7 +288,7 @@ export async function startAutomationRun(
     machineId: string,
     input: { runId: string; claimToken: string },
     now: Date = new Date(),
-): Promise<Result<{ runLeaseExpiresAt: Date }>> {
+): Promise<Result<{ runLeaseExpiresAt: Date; projectId: string }>> {
     const run = await claimedRun(tx, accountId, machineId, input.runId, input.claimToken);
     if (!run) return { ok: false, error: 'claim-not-found' };
     if (run.status !== 'CLAIMED') return { ok: false, error: 'claim-cancelled' };
@@ -285,7 +306,7 @@ export async function startAutomationRun(
         data: { status: 'RUNNING', startedAt: now, runLeaseExpiresAt },
     });
     return changed.count === 1
-        ? { ok: true, value: { runLeaseExpiresAt } }
+        ? { ok: true, value: { runLeaseExpiresAt, projectId: run.automation.projectId } }
         : { ok: false, error: 'claim-cancelled' };
 }
 
@@ -379,12 +400,18 @@ export async function reportAutomationRun(
         queueEstimatedAt?: Date | null;
     },
     now: Date = new Date(),
-): Promise<Result<{ idempotent: boolean; status: string; outcome: AutomationRunOutcome | null }>> {
+): Promise<Result<{ idempotent: boolean; status: string; outcome: AutomationRunOutcome | null; projectId: string }>> {
     const run = await claimedRun(tx, accountId, machineId, input.runId, input.claimToken);
     if (!run) return { ok: false, error: 'claim-not-found' };
     if (run.reportId) {
         return run.reportId === input.reportId
-            ? { ok: true, value: { idempotent: true, status: run.status, outcome: run.outcome } }
+            ? {
+                ok: true,
+                value: {
+                    idempotent: true, status: run.status, outcome: run.outcome,
+                    projectId: run.automation.projectId,
+                },
+            }
             : { ok: false, error: 'report-conflict' };
     }
     if (run.status !== 'RUNNING' && run.status !== 'ABANDONED') {
@@ -452,6 +479,12 @@ export async function reportAutomationRun(
         throw error;
     }
     return changed.count === 1
-        ? { ok: true, value: { idempotent: false, status: input.status, outcome: input.outcome } }
+        ? {
+            ok: true,
+            value: {
+                idempotent: false, status: input.status, outcome: input.outcome,
+                projectId: run.automation.projectId,
+            },
+        }
         : { ok: false, error: 'report-conflict' };
 }
