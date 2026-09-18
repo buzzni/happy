@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
 import { ApiMachineClient } from './apiMachine';
-import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_MAX_DELAY_MS } from './reconnectCadence';
+import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_MAX_DELAY_MS, RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { logger } from '@/ui/logger';
 import type { Machine } from './types';
 
@@ -328,6 +328,42 @@ describe('ApiMachineClient socket reconnection', () => {
         // No connect, no connect_error — nothing at all comes back.
         await vi.advanceTimersByTimeAsync(RECONNECT_DIAL_TIMEOUT_MS + RECONNECT_MAX_DELAY_MS);
         expect(mockSocket.connect.mock.calls.length).toBeGreaterThan(1);
+
+        client.shutdown();
+    });
+
+    /*
+     * A machine that says it is not ready to dial — a closed lid, a laptop that
+     * has not finished waking — is not a failed dial, so `reconnectAttempts`
+     * never moves and the backoff cannot pace that branch. Rescheduling from
+     * the backoff there re-asks `shouldReconnect()` every base delay for as
+     * long as the machine stays shut, and the predicate is not free: on macOS
+     * it shells out synchronously on the daemon's only thread.
+     */
+    it('polls the not-ready check on its own clock rather than at the base delay', async () => {
+        vi.useFakeTimers();
+        mockShouldReconnect.mockReturnValue(false);
+
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.connect();
+
+        emitSocketEvent('connect_error', new Error('ECONNREFUSED'));
+        mockShouldReconnect.mockClear();
+
+        const window = 60_000;
+        await vi.advanceTimersByTimeAsync(window);
+
+        // Jitter is pinned to its top of range in beforeEach, so every delay is
+        // its nominal value: one window at RECONNECT_NOT_READY_POLL_MS is ~20
+        // looks, against ~60 if this branch reused reconnectDelayMs(0).
+        const looks = mockShouldReconnect.mock.calls.length;
+        const expected = window / RECONNECT_NOT_READY_POLL_MS;
+        expect(looks).toBeLessThanOrEqual(expected + 1);
+        // Not-ready must not end the cadence either — it still has to notice
+        // the moment the machine becomes ready.
+        expect(looks).toBeGreaterThanOrEqual(expected - 1);
+        // And nothing was dialled while the machine said it was not ready.
+        expect(mockSocket.connect).not.toHaveBeenCalled();
 
         client.shutdown();
     });
