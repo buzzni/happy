@@ -15,7 +15,7 @@ import { createRpcRequestListener } from './rpc/rpcRequestListener';
 import { registerCommonHandlers } from '../modules/common/registerCommonHandlers';
 import { calculateCost } from '@/utils/pricing';
 import { shouldReconnect } from '@/utils/lidState';
-import { RECONNECT_DIAL_TIMEOUT_MS, reconnectDelayMs } from '@/api/reconnectCadence';
+import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_NOT_READY_POLL_MS, reconnectDelayMs } from '@/api/reconnectCadence';
 import { createEnvelope, type CreateEnvelopeOptions, type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
 import {
     closeClaudeTurnWithStatus,
@@ -1884,8 +1884,8 @@ export class ApiSessionClient extends EventEmitter {
         return false;
     }
 
-    private scheduleReconnectDial() {
-        const delayMs = reconnectDelayMs(this.reconnectAttempts);
+    private scheduleReconnectDial(overrideDelayMs?: number) {
+        const delayMs = overrideDelayMs ?? reconnectDelayMs(this.reconnectAttempts);
         this.reconnectInterval = setTimeout(() => {
             this.reconnectInterval = null;
             // 예약 시점이 아니라 발사 시점에 다시 읽는다 — 그 사이 close() 가
@@ -1902,7 +1902,11 @@ export class ApiSessionClient extends EventEmitter {
             }
             if (!shouldReconnect()) {
                 logger.debug('[API] Still not ready to reconnect');
-                this.scheduleReconnectDial();
+                // Not a failed dial: `reconnectAttempts` stays where it is, so
+                // the backoff cannot pace this branch. Poll on its own clock
+                // instead of re-asking `shouldReconnect()` every base delay for
+                // as long as the machine stays shut.
+                this.scheduleReconnectDial(RECONNECT_NOT_READY_POLL_MS);
                 return;
             }
             this.reconnectAttempts += 1;

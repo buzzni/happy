@@ -167,7 +167,7 @@ import {
 import type { ChildProcess } from 'node:child_process';
 import type { BrowserCdpPipe } from '@/daemon/browserCdpPipe';
 import { shouldReconnect } from '@/utils/lidState';
-import { RECONNECT_DIAL_TIMEOUT_MS, reconnectDelayMs } from '@/api/reconnectCadence';
+import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_NOT_READY_POLL_MS, reconnectDelayMs } from '@/api/reconnectCadence';
 import { getProjectPath } from '@/claude/utils/path';
 import {
     forkSession as claudeForkSession,
@@ -3356,8 +3356,8 @@ export class ApiMachineClient {
         return false;
     }
 
-    private scheduleReconnectDial() {
-        const delayMs = reconnectDelayMs(this.reconnectAttempts);
+    private scheduleReconnectDial(overrideDelayMs?: number) {
+        const delayMs = overrideDelayMs ?? reconnectDelayMs(this.reconnectAttempts);
         this.reconnectInterval = setTimeout(() => {
             this.reconnectInterval = null;
             /*
@@ -3379,7 +3379,11 @@ export class ApiMachineClient {
             }
             if (!shouldReconnect()) {
                 logger.debug('[API MACHINE] Still not ready to reconnect');
-                this.scheduleReconnectDial();
+                // Not a failed dial: `reconnectAttempts` stays where it is, so
+                // the backoff cannot pace this branch. Poll on its own clock
+                // instead of re-asking `shouldReconnect()` every base delay for
+                // as long as the machine stays shut.
+                this.scheduleReconnectDial(RECONNECT_NOT_READY_POLL_MS);
                 return;
             }
             this.reconnectAttempts += 1;

@@ -22,6 +22,20 @@ export const RECONNECT_BASE_DELAY_MS = 1_000;
 export const RECONNECT_MAX_DELAY_MS = 30_000;
 
 /**
+ * Poll interval for the "not ready to dial" branch — a closed lid, a machine
+ * that has not finished waking up.
+ *
+ * This branch is not a failed dial, so it must not reuse the backoff: the
+ * backoff only advances when a dial actually goes out, so rescheduling from it
+ * here would re-evaluate `shouldReconnect()` every `RECONNECT_BASE_DELAY_MS`
+ * for as long as the machine stays not-ready, however long that is. The
+ * predicate is not free — on macOS it shells out synchronously (`ioreg`, and
+ * `system_profiler` with a 10s budget once the lid is closed) on the daemon's
+ * only thread. 3s is the cadence the old `setInterval` polled at.
+ */
+export const RECONNECT_NOT_READY_POLL_MS = 3_000;
+
+/**
  * How long one dial may stay unresolved before the cadence stops waiting for it.
  *
  * Without this, the single-flight guard would become a new way to never
