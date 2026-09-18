@@ -196,6 +196,21 @@ interface CopyFileResponse {
  * This rpc type is used by the daemon, all other RPCs here are for sessions
 */
 
+/** Validate mode before any workspace, bootstrap or process side effect. */
+export function validateAxModeSpawn(options: SpawnSessionOptions): string | null {
+    if (options.axMode !== undefined && !['chat', 'work', 'project'].includes(options.axMode)) return 'Invalid axMode';
+    if (options.axMode !== 'chat') return null;
+    if (options.agent && options.agent !== 'claude' && options.agent !== 'codex') {
+        return 'Chat supports only Claude and Codex. Switch to Work for this agent.';
+    }
+    if (options.bootstrapFiles?.length || options.additionalDirectories?.length
+        || options.resumeClaudeSessionId || options.resumeCodexThreadId || options.deferredContinuationContext
+        || options.mcpConfigProjectId || options.axStep) {
+        return 'Chat cannot bootstrap or resume a filesystem workspace. Switch to Work first.';
+    }
+    return null;
+}
+
 export interface SpawnSessionOptions {
     machineId?: string;
     directory: string;
@@ -270,6 +285,7 @@ export interface SpawnSessionOptions {
     createdByAccountId?: string;
     createdByDisplayName?: string;
     axStep?: 'plan' | 'design' | 'free';
+    axMode?: 'chat' | 'work' | 'project';
     bootstrapFiles?: Array<{ relativePath: string; content: string }>;
     /**
      * First user prompt for the spawned session. Delivered via

@@ -1574,6 +1574,17 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it.each(['chat', 'work'])('does not read Project AX state in %s mode', async (axMode) => {
+        process.env.HAPPY_AX_MODE = axMode;
+        const orchestration = vi.spyOn(axIntegration, 'applyAxOrchestration').mockResolvedValue(null);
+        const harness = await startRemoteRunClaudeHarness();
+        await vi.waitFor(() => expect(harness.sessionClient.onUserMessage).toHaveBeenCalled());
+        await harness.sessionClient.onUserMessage.mock.calls[0][0]({ content: { text: '문서 작업' }, meta: {} });
+        expect(orchestration).not.toHaveBeenCalled();
+        orchestration.mockRestore();
+        await harness.finish();
+    });
+
     it('removes a stale AX Saycode base when only the axBase block is turned off', async () => {
         // applyAxOrchestration's own merge strips the stale base, but it returns null on a
         // non-AX / unavailable workspace — then this path is the only cleanup. Gating it on

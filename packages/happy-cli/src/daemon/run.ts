@@ -13,6 +13,7 @@ import { ApiClient } from '@/api/api';
 import { TrackedSession, SessionEncryptionData } from './types';
 import { MachineMetadata, DaemonState, Metadata, Machine } from '@/api/types';
 import {
+  validateAxModeSpawn,
   type RecoverSessionOptions,
   type RecoverSessionResult,
   type ResumeSessionResult,
@@ -1370,7 +1371,12 @@ export async function startDaemon(): Promise<void> {
         + ` callerGrant=${trustedMcpContext ? 'automation' : options.mcpCallerGrantEnvelope ? 'envelope' : 'absent'}`,
       );
 
-      const { directory, sessionId, machineId, approvedNewDirectoryCreation = true } = options;
+      const modeError = validateAxModeSpawn(options);
+      if (modeError) return { type: 'error', errorMessage: modeError };
+      const isChat = options.axMode === 'chat';
+      const { sessionId, machineId, approvedNewDirectoryCreation = true } = options;
+      // Chat only needs a process cwd; it must not create or inspect the requested workspace.
+      const directory = isChat ? (process.platform === 'win32' ? process.env.SystemDrive + '\\' : '/') : options.directory;
       let directoryCreated = false;
 
       try {
@@ -1479,7 +1485,7 @@ export async function startDaemon(): Promise<void> {
         if (options.bootstrapFiles) {
           await materializeSpawnBootstrapFiles(directory, options.bootstrapFiles);
         }
-        if (options.axStep) {
+        if (options.axStep && (!options.axMode || options.axMode === 'project')) {
           await persistExplicitStep(directory, options.axStep);
         }
 
@@ -1613,6 +1619,7 @@ export async function startDaemon(): Promise<void> {
           extraEnv,
           managedAiCredentialEnvironment,
         );
+        extraEnv.HAPPY_AX_MODE = options.axMode ?? (mcpConfigProjectId ? 'project' : 'work');
 
         // Set after the caller's environment has been merged and expanded, so
         // an external RPC cannot switch it off by supplying the same key. The
@@ -1632,7 +1639,7 @@ export async function startDaemon(): Promise<void> {
           // 큰 프롬프트(AgentTask 리뷰는 diff 를 인라인한다)를 env 값으로 넘기면
           // Linux 의 단일 env 한도(MAX_ARG_STRLEN)에 걸려 spawn 이 E2BIG 으로
           // 죽는다. 한도 이상이면 파일로 넘기고 경로만 env 에 싣는다.
-          const stagedPrompt = await stageInitialPromptEnvironment(options.initialPrompt);
+          const stagedPrompt = await stageInitialPromptEnvironment(options.initialPrompt, { memoryOnly: isChat });
           Object.assign(extraEnv, stagedPrompt.env);
           if (options.initialPromptLocalId) {
             extraEnv.HAPPY_INITIAL_PROMPT_LOCAL_ID = options.initialPromptLocalId;
@@ -3060,6 +3067,7 @@ export async function startDaemon(): Promise<void> {
       httpPort: controlPort,
       startedAt: Date.now(),
       mcpCallerGrantPublicKey: encodeBase64(mcpCallerGrantKeyPair.publicKey),
+      axModeVersion: 1,
     };
 
     // Create API client

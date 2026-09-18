@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { claudeRemote } from './claudeRemote';
 import { query } from '@/claude/sdk';
 import type { EnhancedMode } from './loop';
@@ -13,6 +13,28 @@ const mode: EnhancedMode = {
 };
 
 describe('claudeRemote', () => {
+    afterEach(() => vi.unstubAllEnvs());
+    it('Chat disables native file tools, local settings and non-document MCP servers', async () => {
+        vi.stubEnv('HAPPY_AX_MODE', 'chat');
+        vi.mocked(query).mockReturnValue({
+            setPermissionMode: vi.fn(), mcpServerStatus: vi.fn(async () => []),
+            async *[Symbol.asyncIterator]() { yield { type: 'result', subtype: 'success' }; },
+        } as any);
+        const saycode = { type: 'http' as const, url: 'https://saycode.test/mcp/documents' };
+        await claudeRemote({
+            sessionId: null, path: '/', allowedTools: ['Bash'], hookSettingsPath: '/tmp/settings.json',
+            exitAfterFirstTurn: true,
+            mcpServers: { saycode, happy: { type: 'http', url: 'http://localhost:1234' } },
+            nextMessage: async () => ({ message: '문서 만들어줘', mode }),
+            onReady: vi.fn(), canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false, onSessionFound: vi.fn(), onThinkingChange: vi.fn(), onMessage: vi.fn(),
+        });
+        const options = vi.mocked(query).mock.calls[0][0].options!;
+        expect(options).toMatchObject({ tools: [], settingSources: [], skills: [], strictMcpConfig: true, mcpServers: { saycode } });
+        expect(options.settingsPath).toBeUndefined();
+        expect(options.mcpServers).not.toHaveProperty('happy');
+        expect(await options.canCallTool!('Bash', {}, { signal: new AbortController().signal, toolUseID: 't1' })).toMatchObject({ behavior: 'deny' });
+    });
     beforeEach(() => {
         vi.mocked(query).mockReset();
     });

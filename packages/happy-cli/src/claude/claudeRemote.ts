@@ -188,13 +188,14 @@ export async function claudeRemote(opts: {
 
     // Prepare SDK options
     let mode = initial.mode;
+    const isChat = process.env.HAPPY_AX_MODE === 'chat';
     const orchestratorPrompt = opts.orchestratorMode ? ORCHESTRATOR_SYSTEM_PROMPT : undefined;
 
     // Per-session orchestrator/worker delegation: when a cheaper worker model is
     // declared (via HAPPY_WORKER_MODEL, applied to process.env above), register a
     // `worker` subagent bound to it and tell the main model to delegate mechanical
     // work to it. No-op when unset, so single-model sessions are unchanged.
-    const workerAgents = buildWorkerAgents(readWorkerConfigFromEnv(process.env));
+    const workerAgents = buildWorkerAgents(isChat ? {} : readWorkerConfigFromEnv(process.env));
 
     // Per-machine/session skill governance: when HAPPY_SETTING_SOURCES and/or
     // HAPPY_SKILL_ALLOWLIST are set (e.g. on a Saycode-managed machine), scope
@@ -210,7 +211,7 @@ export async function claudeRemote(opts: {
     // different key after the approval was made. The empty list is explicit —
     // the SDK's default is to load every source Claude Code would.
     const settingSources = managedSettingSources(opts.managedSettingsLockdown, skillGovernance.settingSources);
-    const mergedMcpServers = {
+    const mergedMcpServers = isChat ? (opts.mcpServers?.saycode ? { saycode: opts.mcpServers.saycode } : {}) : {
         ...opts.mcpServers,
         ...(opts.orchestratorMode ? opts.orchestratorMcpServers : {}),
     };
@@ -297,6 +298,24 @@ export async function claudeRemote(opts: {
             }
         }
     };
+    if (isChat) {
+        if (!mergedMcpServers.saycode) throw new Error('Chat 문서·모드 전환 도구를 불러오지 못했습니다.');
+        assembledOptions.persistSession = false;
+        assembledOptions.tools = [];
+        assembledOptions.allowedTools = [];
+        assembledOptions.settingSources = [];
+        assembledOptions.skills = [];
+        assembledOptions.agents = undefined;
+        assembledOptions.settingsPath = undefined;
+        assembledOptions.additionalDirectories = undefined;
+        assembledOptions.strictMcpConfig = true;
+        assembledOptions.canCallTool = async (name, input, options) => {
+            if (!/^mcp__saycode__(search_documents|read_document|write_document|get_mode|request_mode_transition)$/.test(name)) {
+                return { behavior: 'deny', message: 'Chat에서는 내 문서 도구만 사용할 수 있습니다. 파일·저장소 작업은 request_mode_transition으로 Work 전환을 요청하세요.' };
+            }
+            return opts.canCallTool(name, input, mode, options);
+        };
+    }
 
     // Push initial message
     let messages = new PushableAsyncIterable<SDKUserMessage>();
@@ -329,7 +348,7 @@ export async function claudeRemote(opts: {
         options: sdkOptions,
     });
     const mcpRecovery = new McpRuntimeRecovery(response, { onStatus: opts.onMcpStatus });
-    const mcpConfigSynchronizer = opts.mcpConfig
+    const mcpConfigSynchronizer = opts.mcpConfig && !isChat
         ? new McpConfigSynchronizer(response, { ...opts.mcpConfig, onStatus: opts.onMcpStatus })
         : null;
 
@@ -410,7 +429,7 @@ export async function claudeRemote(opts: {
 
                 // Session id is still in memory, wait until session file is written to disk
                 // Start a watcher for to detect the session id
-                if (systemInit.session_id) {
+                if (systemInit.session_id && !isChat) {
                     logger.debug(`[claudeRemote] Waiting for session file to be written to disk: ${systemInit.session_id}`);
                     const projectDir = getProjectPath(providerPath);
                     const found = await awaitFileExist(join(projectDir, `${systemInit.session_id}.jsonl`), 30000);

@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -78,4 +78,21 @@ describe('Logger content policy', () => {
       '2026-07-20-10-00-00-pid-1-daemon.log',
     ])
   })
+})
+
+
+it('Chat does not persist document content even when debug logging is enabled', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'happy-chat-logger-'))
+  const logPath = join(directory, 'chat.log')
+  vi.stubEnv('HAPPY_AX_MODE', 'chat')
+  vi.stubEnv('DEBUG', '1')
+  try {
+    const logger = new Logger(logPath)
+    logger.debug('document body', { content: '<h1>private report</h1>' })
+    logger.debugLargeJson('tool output', { content: '<h1>private report</h1>' })
+    expect(existsSync(logPath)).toBe(false)
+  } finally {
+    vi.unstubAllEnvs()
+    rmSync(directory, { recursive: true, force: true })
+  }
 })

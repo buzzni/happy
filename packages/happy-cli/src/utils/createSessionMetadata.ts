@@ -10,7 +10,7 @@
 import os from 'node:os';
 import { resolve } from 'node:path';
 
-import type { AgentState, Metadata } from '@/api/types';
+import { MessageMetaSchema, type AgentState, type Metadata } from '@/api/types';
 import { configuration } from '@/configuration';
 import { projectPath } from '@/projectPath';
 import type { SandboxConfig } from '@/persistence';
@@ -74,11 +74,13 @@ export interface SessionMetadataResult {
  * ```
  */
 export function createSessionMetadata(opts: CreateSessionMetadataOptions): SessionMetadataResult {
+    const axMode = MessageMetaSchema.shape.axMode.parse(process.env.HAPPY_AX_MODE);
     const state: AgentState = {
         controlledByUser: false,
     };
 
     const metadata: Metadata = {
+        ...(axMode ? { axMode } : {}),
         path: process.cwd(),
         host: os.hostname(),
         version: packageJson.version,

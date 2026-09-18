@@ -221,6 +221,9 @@ export class Logger {
   }
 
   private logToFile(prefix: string, message: string, ...args: unknown[]): void {
+    // Chat tool payloads can contain whole documents; keep them out of local logs.
+    // Console errors and the central Run status still report execution failures.
+    if (process.env.HAPPY_AX_MODE === 'chat') return
     const logLine = formatLogLine(prefix, message, args)
     
     // Send to remote server if configured

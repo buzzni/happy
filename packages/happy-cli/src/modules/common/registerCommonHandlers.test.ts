@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
-import { registerCommonHandlers } from './registerCommonHandlers';
+import { registerCommonHandlers, validateAxModeSpawn } from './registerCommonHandlers';
 
 type Handler = (data: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
@@ -94,5 +94,20 @@ describe('registerCommonHandlers readFileChunk', () => {
             success: false,
             error: 'Chunk length must be an integer between 1 and 3145728 bytes',
         });
+    });
+});
+
+
+describe('Chat spawn policy', () => {
+    it.each(['gemini', 'grok', 'openclaw', 'opencode'] as const)('rejects unsupported %s in Chat', (agent) => {
+        expect(validateAxModeSpawn({ directory: '/', axMode: 'chat', agent })).toContain('Claude');
+    });
+    it.each(['claude', 'codex'] as const)('accepts %s without a filesystem workspace in Chat', (agent) => {
+        expect(validateAxModeSpawn({ directory: '/', axMode: 'chat', agent })).toBeNull();
+    });
+    it('rejects a workspace resume and preserves Work and Project contracts', () => {
+        expect(validateAxModeSpawn({ directory: '/', axMode: 'chat', resumeCodexThreadId: 'old' })).toContain('Work');
+        expect(validateAxModeSpawn({ directory: '/work', axMode: 'work', agent: 'gemini' })).toBeNull();
+        expect(validateAxModeSpawn({ directory: '/project', axMode: 'project', axStep: 'plan' })).toBeNull();
     });
 });

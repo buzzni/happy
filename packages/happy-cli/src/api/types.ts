@@ -192,6 +192,7 @@ export const DaemonStateSchema = z.object({
     ]).optional(),
   /** Process-local X25519 public key used only for MCP caller grant envelopes. */
   mcpCallerGrantPublicKey: z.string().optional(),
+  axModeVersion: z.literal(1).optional(),
   activity: z.object({
     activeSessionCount: z.number().int().min(0),
     activeAutomationCount: z.number().int().min(0),
@@ -255,6 +256,7 @@ export const MessageMetaSchema = z.object({
   // the user's whole turn in routeIncomingMessage when a newer app sends a step this
   // CLI predates. An unlearned step degrades to "no explicit step", never to silence.
   axStep: z.enum(['plan', 'design', 'free']).optional().catch(undefined),
+  axMode: z.enum(['chat', 'work', 'project']).optional().catch(undefined),
 })
 
 export type MessageMeta = z.infer<typeof MessageMetaSchema>
@@ -340,6 +342,7 @@ export const MessageContentSchema = z.union([UserMessageSchema, AgentMessageSche
 export type MessageContent = z.infer<typeof MessageContentSchema>
 
 export type Metadata = {
+  axMode?: 'chat' | 'work' | 'project',
   /**
    * ACP session config option value (normalized for UI metadata consumers).
    */

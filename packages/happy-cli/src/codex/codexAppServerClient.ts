@@ -14,6 +14,7 @@
  */
 
 import { execSync, type ChildProcess } from 'node:child_process';
+import { prepareCodexChatRuntime } from './codexChatRuntime';
 import { spawn as crossSpawn } from 'cross-spawn';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { logger } from '@/ui/logger';
@@ -246,6 +247,8 @@ export class CodexAppServerClient {
     private sandboxCleanup: (() => Promise<void>) | null = null;
     private multiAuthProxy: PreparedCodexMultiAuthProxy | null = null;
     private readonly managedProviderArgs: string[] | null;
+    private readonly isChat = process.env.HAPPY_AX_MODE === 'chat';
+    private chatRuntimeCleanup: (() => Promise<void>) | null = null;
     private multiAuthProxyCleanup: Promise<void> | null = null;
     public sandboxEnabled = false;
     /**
@@ -912,6 +915,17 @@ export class CodexAppServerClient {
             'stdio://',
             ...(this.managedProviderArgs ?? this.multiAuthProxy?.args ?? []),
         ];
+        if (this.isChat) {
+            try {
+                const runtime = await prepareCodexChatRuntime(env, readCodexCliVersion());
+                this.chatRuntimeCleanup = runtime.cleanup;
+                env = runtime.env;
+                args.push(...runtime.args);
+            } catch (error) {
+                await this.cleanupMultiAuthProxy();
+                throw error;
+            }
+        }
         this.sandboxEnabled = false;
         this.sandboxInitFailed = false;
         this.sandboxInitFailureReason = null;
@@ -1120,7 +1134,8 @@ export class CodexAppServerClient {
             && !this.process
             && !this.sandboxCleanup
             && !this.multiAuthProxy
-            && !this.multiAuthProxyCleanup) return;
+            && !this.multiAuthProxyCleanup
+            && !this.chatRuntimeCleanup) return;
 
         const proc = this.process;
         const pid = proc?.pid;
@@ -1147,7 +1162,7 @@ export class CodexAppServerClient {
             proc?.once('exit', () => clearTimeout(killTimer));
         }
 
-        if (opts?.awaitProcessExit && proc && proc.exitCode == null && proc.signalCode == null) {
+        if ((opts?.awaitProcessExit || this.isChat) && proc && proc.exitCode == null && proc.signalCode == null) {
             // The SIGKILL timer above fires at 2s; anything still alive after the cap is unkillable
             // (uninterruptible I/O), and its bwrap mount points cannot be released. Fail closed
             // rather than run the sandbox cleanup — and the next gate — on a stale process.
@@ -1210,6 +1225,11 @@ export class CodexAppServerClient {
             await this.cleanupMultiAuthProxy();
         }
 
+        if (this.chatRuntimeCleanup) {
+            await this.chatRuntimeCleanup();
+            this.chatRuntimeCleanup = null;
+        }
+
         logger.debug('[CodexAppServer] Disconnected');
     }
 
@@ -1265,8 +1285,13 @@ export class CodexAppServerClient {
         mcpServers?: Record<string, unknown>,
         writableRoots?: readonly string[],
     ): Record<string, unknown> | null {
+        if (this.isChat && !mcpServers?.saycode) {
+            throw new Error('Chat requires the saycode document MCP server.');
+        }
         const config: Record<string, unknown> = {};
-        if (mcpServers) config.mcp_servers = mcpServers;
+        if (mcpServers) config.mcp_servers = this.isChat
+            ? (mcpServers.saycode ? { saycode: mcpServers.saycode } : {})
+            : mcpServers;
         if (writableRoots?.length) {
             config.sandbox_workspace_write = { writable_roots: [...writableRoots] };
         }
@@ -1304,7 +1329,7 @@ export class CodexAppServerClient {
         mcpServers?: Record<string, unknown>;
         developerInstructions?: string | null;
     }): Promise<{ threadId: string; model: string }> {
-        const params: NewConversationParams = {
+        const params: NewConversationParams & { ephemeral?: boolean } = {
             model: opts.model ?? null,
             modelProvider: null,
             profile: null,
@@ -1317,7 +1342,8 @@ export class CodexAppServerClient {
             compactPrompt: null,
             includeApplyPatchTool: null,
             experimentalRawEvents: false,
-            persistExtendedHistory: true,
+            persistExtendedHistory: !this.isChat,
+            ...(this.isChat ? { ephemeral: true } : {}),
         };
 
         const result = await this.request('thread/start', params) as NewConversationResponse;

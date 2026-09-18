@@ -47,6 +47,7 @@ import {
     resolveMcpFloorServerNames,
 } from '@/aplus/fetchAplusMcpServers';
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
+import { buildCodexChatMcpServers } from './codexChatRuntime';
 import { bridgeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { CodexDisplay } from "@/ui/ink/CodexDisplay";
@@ -114,6 +115,7 @@ import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createCodexUsageEvent } from '@/usage/providerUsageAdapters';
 import {
     consumePendingInitialAppendSystemPrompt,
+    hydrateMemoryInitialPrompt,
     consumePendingInitialEffort,
     consumePendingInitialModel,
     consumePendingInitialSaycodePromptBlocks,
@@ -175,6 +177,7 @@ export async function runCodex(opts: {
     const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
     installBroadKillShims();
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
+    await hydrateMemoryInitialPrompt(process.env);
     const reconnectSession = readReconnectSessionEnvironment(process.env);
     const reconnectSessionId = reconnectSession?.id;
     const allowAutomationReconnectPrompt = process.env.HAPPY_AUTOMATION_RESUME_PROMPT === '1';
@@ -276,7 +279,8 @@ export async function runCodex(opts: {
         ...(createdByAccountId ? { createdBy: { accountId: createdByAccountId, displayName: createdByDisplayName } } : {}),
     });
 
-    const skillCommands = await discoverCodexSkillCommands();
+    const isChat = process.env.HAPPY_AX_MODE === 'chat';
+    const skillCommands = isChat ? [] : await discoverCodexSkillCommands();
     if (skillCommands.length > 0) {
         freshMetadata.skills = skillCommands;
         freshMetadata.slashCommands = Array.from(new Set([...(freshMetadata.slashCommands ?? []), ...skillCommands]));
@@ -1244,7 +1248,7 @@ export async function runCodex(opts: {
         }));
     }
     const initialAplusMcpServers = initialAplusMcpSnapshot?.servers ?? {};
-    const baseMcpServers = {
+    const baseMcpServers = isChat ? {} : {
         happy: {
             command: process.execPath,
             args: ['--no-warnings', '--no-deprecation', bridgeEntrypoint, '--url', happyServer.url]
@@ -1280,7 +1284,9 @@ export async function runCodex(opts: {
                 { sessionId: session.sessionId, lifecycle: 'turn' },
             );
         },
-        bridgeAplusServers: (servers) => bridgeAplusMcpServers(servers, bridgeOptions),
+        bridgeAplusServers: (servers) => isChat
+            ? buildCodexChatMcpServers(servers)
+            : bridgeAplusMcpServers(servers, bridgeOptions),
         onStatus: (status) => {
             session.updateMetadata((currentMetadata) => ({
                 ...currentMetadata,

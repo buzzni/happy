@@ -2,7 +2,7 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   consumeConfirmedInitialPromptDelivery,
@@ -16,6 +16,7 @@ import {
   defaultClaudeModelForRuntime,
   normalizeClaudeModelForRuntime,
   stageInitialPromptEnvironment,
+  hydrateMemoryInitialPrompt,
 } from './initialPrompt'
 
 // 2026-08-27 프로덕션 — AgentTask 리뷰가 diff 를 프롬프트에 인라인하는데, 그
@@ -23,6 +24,25 @@ import {
 // MAX_ARG_STRLEN(32 * 4096 = 131072 바이트)이라, justin-work PR #17 의 143,500
 // 바이트 diff 에서 spawn 이 E2BIG 으로 죽었다. 큰 프롬프트는 파일로 넘긴다.
 describe('initial prompt staging (E2BIG)', () => {
+  it('Chat의 큰 프롬프트는 파일을 만들지 않고 한 번만 메모리로 전달한다', async () => {
+    const prompt = '한글 문서'.repeat(30_000)
+    const makeTempDir = vi.fn(async () => { throw new Error('disk access forbidden') })
+    const staged = await stageInitialPromptEnvironment(prompt, { memoryOnly: true, makeTempDir })
+    try {
+      expect(staged.env.HAPPY_INITIAL_PROMPT_FILE).toBeUndefined()
+      expect(staged.env.HAPPY_INITIAL_PROMPT_URL).toMatch(/^http:\/\/127\.0\.0\.1:/)
+      const env: NodeJS.ProcessEnv = { ...staged.env }
+      await hydrateMemoryInitialPrompt(env)
+      expect(consumePendingInitialPrompt(env)).toBe(prompt)
+      expect(consumePendingInitialPrompt(env)).toBeNull()
+      expect(env.HAPPY_INITIAL_PROMPT_URL).toBeUndefined()
+      expect(makeTempDir).not.toHaveBeenCalled()
+    } finally { await staged.cleanup?.() }
+  })
+
+  it('메모리 프롬프트를 읽지 못하면 빈 질문으로 실행하지 않는다', async () => {
+    await expect(hydrateMemoryInitialPrompt({ HAPPY_INITIAL_PROMPT_URL: 'https://example.com/prompt' })).rejects.toThrow()
+  })
   it('keeps a small prompt inline so the common spawn path is unchanged', async () => {
     const staged = await stageInitialPromptEnvironment('review this', {
       makeTempDir: () => mkdtemp(join(tmpdir(), 'happy-initial-prompt-test-')),

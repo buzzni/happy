@@ -143,6 +143,42 @@ const sandboxConfig: SandboxConfig = {
 };
 
 describe('CodexAppServerClient sandbox integration', () => {
+    it('Chat starts an ephemeral thread with only the document MCP server', async () => {
+        vi.stubEnv('HAPPY_AX_MODE', 'chat');
+        try {
+            const { CodexAppServerClient } = await import('./codexAppServerClient');
+            const client = new CodexAppServerClient();
+            const request = vi.spyOn(client as any, 'request').mockResolvedValue({ thread: { id: 'chat-thread' }, model: 'test' });
+            const saycode = { url: 'https://saycode.test/mcp/documents' };
+            await client.startThread({ mcpServers: { saycode, local: { command: 'files' } } });
+            expect(request).toHaveBeenCalledWith('thread/start', expect.objectContaining({
+                ephemeral: true, persistExtendedHistory: false, config: { mcp_servers: { saycode } },
+            }));
+        } finally { vi.unstubAllEnvs(); }
+    });
+    it('Chat rejects a thread without the document MCP before sending a request', async () => {
+        vi.stubEnv('HAPPY_AX_MODE', 'chat');
+        try {
+            const { CodexAppServerClient } = await import('./codexAppServerClient');
+            const client = new CodexAppServerClient();
+            const request = vi.spyOn(client as any, 'request').mockResolvedValue({ thread: { id: 'chat-thread' } });
+            await expect(client.startThread({})).rejects.toThrow('saycode');
+            expect(request).not.toHaveBeenCalled();
+        } finally { vi.unstubAllEnvs(); }
+    });
+
+    it('cleans up the account proxy when Chat runtime initialization rejects the CLI version', async () => {
+        vi.stubEnv('HAPPY_AX_MODE', 'chat');
+        try {
+            mockPrepareCodexMultiAuthProxy.mockResolvedValue({ env: {}, args: [], cleanup: mockProxyCleanup });
+            const { CodexAppServerClient } = await import('./codexAppServerClient');
+            const client = new CodexAppServerClient();
+            await expect(client.connect()).rejects.toThrow('0.155.0');
+            expect(mockProxyCleanup).toHaveBeenCalledOnce();
+            expect(mockSpawn).not.toHaveBeenCalled();
+        } finally { vi.unstubAllEnvs(); }
+    });
+
     const originalRustLog = process.env.RUST_LOG;
 
     beforeEach(() => {

@@ -50,6 +50,7 @@ import { encodeBase64 } from '@/api/encryption';
 import type { Session as ApiSession } from '@/api/types';
 import { getProjectPath } from './utils/path';
 import { readFile } from 'node:fs/promises';
+import { hydrateMemoryInitialPrompt } from '@/utils/initialPrompt';
 import { join } from 'node:path';
 import { RawJSONLinesSchema, type RawJSONLines } from './types';
 import { installBroadKillShims } from '@/utils/broadKillShims';
@@ -164,6 +165,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // everything this session launches inherits the shimmed PATH.
     installBroadKillShims();
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
+    await hydrateMemoryInitialPrompt(process.env);
     const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
 
     const workingDirectory = process.cwd();
@@ -1145,21 +1147,22 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         // inject the step guide + dynamic context into appendSystemPrompt.
         // Returns null for non-AX workspaces — fall through to default flow.
         let pushText = message.content.text;
-        const explicitAxStep = message.meta?.axStep;
+        const usesProjectSteps = !process.env.HAPPY_AX_MODE || process.env.HAPPY_AX_MODE === 'project';
+        const explicitAxStep = usesProjectSteps ? message.meta?.axStep : undefined;
         if (explicitAxStep) {
             await persistExplicitStep(workingDirectory, explicitAxStep).catch((err) => {
                 logger.debug(`[ax] explicit step persistence failed: ${(err as Error).message}`);
             });
         }
         try {
-            const ax = await applyAxOrchestration({
+            const ax = usesProjectSteps ? await applyAxOrchestration({
                 workspaceRoot: workingDirectory,
                 userText: pushText,
                 currentAppendSystemPrompt: messageAppendSystemPrompt,
                 explicitStep: explicitAxStep,
                 saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
                 saycodePromptBlocks: currentSaycodePromptBlocks,
-            });
+            }) : null;
             if (ax) {
                 pushText = ax.userText;
                 messageAppendSystemPrompt = ax.appendSystemPrompt;

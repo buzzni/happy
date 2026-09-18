@@ -47,6 +47,7 @@ export interface QueryOptions {
      * 도달하지 못한다.
      */
     tools?: string[]
+    persistSession?: boolean
     mcpServers?: Record<string, unknown>
     permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan'
     continue?: boolean

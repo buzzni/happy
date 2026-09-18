@@ -43,6 +43,10 @@ describe('query adapter', () => {
             }),
         }));
     });
+    it('forwards non-persistent Chat sessions to the SDK', () => {
+        query({ prompt: '문서 내용', options: { persistSession: false } });
+        expect((sdkQuery.mock.calls as unknown as Array<[{ options: { persistSession?: boolean } }]>)[0][0].options.persistSession).toBe(false);
+    });
 
     it('enables partial assistant message streaming so the app can render tokens before a block completes', () => {
         query({ prompt: 'continue', options: {} });

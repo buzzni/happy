@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { createServer } from 'node:http'
 import { readFileSync, rmSync } from 'node:fs'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -22,7 +23,7 @@ import { ZAI_CLAUDE_DEFAULT_MODEL } from '@/managed/zaiClaudeEnvironment'
 export const INITIAL_PROMPT_INLINE_LIMIT_BYTES = 64 * 1024
 
 export type StagedInitialPrompt = {
-  env: { HAPPY_INITIAL_PROMPT?: string; HAPPY_INITIAL_PROMPT_FILE?: string }
+  env: { HAPPY_INITIAL_PROMPT?: string; HAPPY_INITIAL_PROMPT_FILE?: string; HAPPY_INITIAL_PROMPT_URL?: string }
   /** Removes a staged file when the spawn never consumed it. */
   cleanup?: () => Promise<void>
 }
@@ -37,10 +38,41 @@ export type StagedInitialPrompt = {
  */
 export async function stageInitialPromptEnvironment(
   prompt: string,
-  deps: { makeTempDir?: () => Promise<string> } = {},
+  deps: { makeTempDir?: () => Promise<string>; memoryOnly?: boolean } = {},
 ): Promise<StagedInitialPrompt> {
   if (Buffer.byteLength(prompt, 'utf8') < INITIAL_PROMPT_INLINE_LIMIT_BYTES) {
     return { env: { HAPPY_INITIAL_PROMPT: prompt } }
+  }
+  if (deps.memoryOnly) {
+    let pending: string | null = prompt
+    const path = `/${randomUUID()}`
+    const server = createServer((req, res) => {
+      if (req.method !== 'GET' || req.url !== path || pending === null) {
+        res.writeHead(404).end()
+        return
+      }
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' })
+      res.end(pending)
+      pending = null
+      clearTimeout(expiry)
+      server.close()
+    })
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, '127.0.0.1', resolve)
+    })
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('Memory prompt listener unavailable')
+    const cleanup = async () => {
+      pending = null
+      clearTimeout(expiry)
+      server.closeAllConnections()
+      server.close()
+    }
+    const expiry = setTimeout(() => { void cleanup() }, 120_000)
+    expiry.unref()
+    server.unref()
+    return { env: { HAPPY_INITIAL_PROMPT_URL: `http://127.0.0.1:${address.port}${path}` }, cleanup }
   }
   const makeTempDir = deps.makeTempDir
     ?? (() => mkdtemp(join(tmpdir(), 'happy-initial-prompt-')))
@@ -52,6 +84,20 @@ export async function stageInitialPromptEnvironment(
     env: { HAPPY_INITIAL_PROMPT_FILE: file },
     cleanup: async () => { await rm(directory, { recursive: true, force: true }) },
   }
+}
+
+/** Load the daemon's one-use memory handoff before the synchronous prompt consumers run. */
+export async function hydrateMemoryInitialPrompt(env: NodeJS.ProcessEnv): Promise<void> {
+  const raw = env.HAPPY_INITIAL_PROMPT_URL
+  delete env.HAPPY_INITIAL_PROMPT_URL
+  if (!raw) return
+  const url = new URL(raw)
+  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.username || url.password) {
+    throw new Error('Invalid memory prompt endpoint')
+  }
+  const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(10_000) })
+  if (!response.ok) throw new Error('Memory prompt delivery failed')
+  env.HAPPY_INITIAL_PROMPT = await response.text()
 }
 
 /**

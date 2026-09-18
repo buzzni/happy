@@ -184,10 +184,12 @@ describe('shared wire message schemas', () => {
       meta: {
         sentFrom: 'mobile',
         axStep: 'plan',
+        axMode: 'project',
       },
     });
 
     expect(parsed.meta?.axStep).toBe('plan');
+    expect(parsed.meta?.axMode).toBe('project');
   });
 
   it('parses legacy decrypted agent message payload', () => {

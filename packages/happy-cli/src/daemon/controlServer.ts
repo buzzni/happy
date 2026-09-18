@@ -409,6 +409,7 @@ export function startDaemonControlServer({
           happyToken: z.string().optional(),
           happySecret: z.string().optional(),
           axStep: z.enum(['plan', 'design', 'free']).optional(),
+          axMode: z.enum(['chat', 'work', 'project']).optional(),
           bootstrapFiles: z.array(z.object({
             relativePath: z.string(),
             content: z.string(),
@@ -441,6 +442,7 @@ export function startDaemonControlServer({
         happyToken,
         happySecret,
         axStep,
+        axMode,
         bootstrapFiles,
       } = request.body;
 
@@ -463,6 +465,7 @@ export function startDaemonControlServer({
         happyToken,
         happySecret,
         axStep,
+        axMode,
         bootstrapFiles,
       });
 

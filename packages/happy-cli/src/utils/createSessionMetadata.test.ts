@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { SandboxConfig } from '@/persistence';
 import { createSessionMetadata } from './createSessionMetadata';
 
@@ -20,6 +20,12 @@ function createSandboxConfig(overrides: Partial<SandboxConfig> = {}): SandboxCon
 }
 
 describe('createSessionMetadata', () => {
+    it.each(['chat', 'work', 'project'])('preserves the daemon mode %s in session metadata', (axMode) => {
+        vi.stubEnv('HAPPY_AX_MODE', axMode);
+        try {
+            expect(createSessionMetadata({ flavor: 'claude', machineId: 'm1' }).metadata.axMode).toBe(axMode);
+        } finally { vi.unstubAllEnvs(); }
+    });
     it('advertises support for per-message Saycode system prompt policy', () => {
         const { metadata } = createSessionMetadata({
             flavor: 'claude',

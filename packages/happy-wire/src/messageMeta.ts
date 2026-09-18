@@ -13,6 +13,7 @@ export const MessageMetaSchema = z.object({
   disallowedTools: z.array(z.string()).nullable().optional(),
   displayText: z.string().optional(),
   axStep: z.enum(['plan', 'design', 'free']).optional(),
+  axMode: z.enum(['chat', 'work', 'project']).optional(),
 });
 export type MessageMeta = z.infer<typeof MessageMetaSchema>;
 

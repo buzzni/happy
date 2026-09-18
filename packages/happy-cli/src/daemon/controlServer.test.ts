@@ -245,6 +245,7 @@ describe('controlServer POST /spawn-session', () => {
         directory: dir,
         agent: 'claude',
         axStep: 'design',
+        axMode: 'project',
         bootstrapFiles,
       }),
     })
@@ -253,6 +254,7 @@ describe('controlServer POST /spawn-session', () => {
     expect(spawnRequests).toEqual([
       expect.objectContaining({
         axStep: 'design',
+        axMode: 'project',
         bootstrapFiles,
       }),
     ])
