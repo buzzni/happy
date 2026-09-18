@@ -143,6 +143,29 @@ const sandboxConfig: SandboxConfig = {
 };
 
 describe('CodexAppServerClient sandbox integration', () => {
+    it('Chat connects without app-server and completes an ephemeral exec turn through the same event handler', async () => {
+        vi.stubEnv('HAPPY_AX_MODE', 'chat');
+        mockExecSync.mockReturnValue('codex-cli 0.155.0');
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Record<string, unknown>[] = [];
+        client.setEventHandler(event => events.push(event));
+        try {
+            await client.connect();
+            expect(mockSpawn).not.toHaveBeenCalled();
+            const turn = client.sendChatTurnAndWait('make a document', {
+                mcpServers: { saycode: { url: 'http://studio/mcp/documents' } }, model: 'test',
+            });
+            const proc = mockSpawn.mock.results[0].value;
+            expect(mockSpawn.mock.calls[0][1][0]).toBe('exec');
+            pushJsonLine(proc.stdout, { type: 'item.completed', item: { type: 'agent_message', text: 'stored' } });
+            pushJsonLine(proc.stdout, { type: 'turn.completed' });
+            await new Promise(resolve => setImmediate(resolve));
+            proc.exitCode = 0; proc.emit('close', 0, null);
+            await expect(turn).resolves.toEqual({ aborted: false });
+            expect(events).toContainEqual(expect.objectContaining({ type: 'agent_message', message: 'stored' }));
+        } finally { await client.disconnect(); vi.unstubAllEnvs(); }
+    });
     it('Chat starts an ephemeral thread with only the document MCP server', async () => {
         vi.stubEnv('HAPPY_AX_MODE', 'chat');
         try {

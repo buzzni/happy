@@ -15,6 +15,7 @@
 
 import { execSync, type ChildProcess } from 'node:child_process';
 import { prepareCodexChatRuntime } from './codexChatRuntime';
+import { runCodexChatExec } from './codexChatExec';
 import { spawn as crossSpawn } from 'cross-spawn';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { logger } from '@/ui/logger';
@@ -249,6 +250,9 @@ export class CodexAppServerClient {
     private readonly managedProviderArgs: string[] | null;
     private readonly isChat = process.env.HAPPY_AX_MODE === 'chat';
     private chatRuntimeCleanup: (() => Promise<void>) | null = null;
+    private chatExecConfig: { env: Record<string, string>; args: string[] } | null = null;
+    private chatTurnAbort: AbortController | null = null;
+    private chatTurn: Promise<{ aborted: boolean }> | null = null;
     private multiAuthProxyCleanup: Promise<void> | null = null;
     public sandboxEnabled = false;
     /**
@@ -920,7 +924,11 @@ export class CodexAppServerClient {
                 const runtime = await prepareCodexChatRuntime(env, readCodexCliVersion());
                 this.chatRuntimeCleanup = runtime.cleanup;
                 env = runtime.env;
-                args.push(...runtime.args);
+                this.chatExecConfig = {
+                    env, args: [...(this.managedProviderArgs ?? this.multiAuthProxy?.args ?? []), ...runtime.args],
+                };
+                this.connected = true;
+                return;
             } catch (error) {
                 await this.cleanupMultiAuthProxy();
                 throw error;
@@ -1129,6 +1137,11 @@ export class CodexAppServerClient {
          */
         awaitProcessExit?: boolean;
     }): Promise<void> {
+        if (this.chatTurn) {
+            this.chatTurnAbort?.abort();
+            await this.chatTurn.catch(() => undefined);
+        }
+        this.chatExecConfig = null;
         this.clearAgentMessageDeltas();
         if (!this.connected
             && !this.process
@@ -1708,6 +1721,12 @@ export class CodexAppServerClient {
         gracePeriodMs?: number;
         forceRestartOnTimeout?: boolean;
     }): Promise<{ hadActiveTurn: boolean; aborted: boolean; forcedRestart: boolean; resumedThread: boolean }> {
+        if (this.isChat) {
+            const turn = this.chatTurn;
+            this.chatTurnAbort?.abort();
+            if (turn) await turn.catch(() => undefined);
+            return { hadActiveTurn: Boolean(turn), aborted: Boolean(turn), forcedRestart: false, resumedThread: false };
+        }
         const hadActiveTurn = this.hasPendingTurnCompletion();
 
         // No active turn pending in this client call-site.
@@ -1846,6 +1865,21 @@ export class CodexAppServerClient {
      * therefore runs without a wall-clock limit; only a silent provider is
      * interrupted.
      */
+    async sendChatTurnAndWait(prompt: string, opts: {
+        model?: string; effort?: string; developerInstructions?: string; mcpServers: Record<string, unknown>;
+    }): Promise<{ aborted: boolean }> {
+        if (!this.isChat || !this.chatExecConfig) throw new Error('Chat runtime is not connected');
+        if (this.chatTurn) throw new Error('A Chat turn is already running');
+        this.chatTurnAbort = new AbortController();
+        this.chatTurn = runCodexChatExec({
+            ...this.chatExecConfig, ...opts, prompt, signal: this.chatTurnAbort.signal,
+            onSpawn: child => { this.process = child; },
+            onEvent: event => { this.eventHandler?.(event); },
+        });
+        try { return await this.chatTurn; }
+        finally { this.chatTurn = null; this.chatTurnAbort = null; }
+    }
+
     async sendTurnAndWait(prompt: string, opts?: {
         model?: string;
         cwd?: string;

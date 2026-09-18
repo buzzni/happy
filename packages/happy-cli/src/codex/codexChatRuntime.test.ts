@@ -17,6 +17,7 @@ describe('Codex Chat runtime', () => {
             expect(runtime.args).toContain('features.unified_exec=false');
             expect(runtime.args).toContain('features.view_image=false');
             expect(runtime.args).toContain('features.code_mode=false');
+            expect(runtime.args).toContain('features.code_mode_host=true');
             expect(runtime.args).toContain('project_doc_max_bytes=0');
         } finally { await runtime.cleanup(); }
         await expect(access(directory)).rejects.toThrow();

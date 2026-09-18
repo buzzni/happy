@@ -23,7 +23,7 @@ export async function prepareCodexChatRuntime(
             // API-key/proxy authentication does not need a local auth.json.
         }
         const disabled = [
-            'shell_tool', 'unified_exec', 'view_image', 'code_mode', 'code_mode_host',
+            'shell_tool', 'unified_exec', 'view_image', 'code_mode',
             'multi_agent', 'multi_agent_v2', 'image_generation', 'computer_use', 'browser_use',
             'in_app_browser', 'workspace_dependencies', 'plugins', 'apps', 'hooks',
             'shell_snapshot', 'memories',
@@ -32,6 +32,9 @@ export async function prepareCodexChatRuntime(
             env: { ...env, CODEX_HOME: directory },
             args: [
                 ...disabled.flatMap((feature) => ['-c', `features.${feature}=false`]),
+                // Some models orchestrate MCP through this host; no local environment
+                // and disabled native tools still enforce the file access boundary.
+                '-c', 'features.code_mode_host=true',
                 '-c', 'history.persistence="none"',
                 '-c', 'project_doc_max_bytes=0',
                 '-c', 'include_environment_context=false',

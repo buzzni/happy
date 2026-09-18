@@ -1541,6 +1541,18 @@ export async function runCodex(opts: {
                     agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
                     mode: message.mode,
                 });
+                if (isChat) {
+                    await client.sendChatTurnAndWait(buildCodexTurnPrompt({
+                        message: message.message, mode: message.mode,
+                        includeAppendSystemPrompt: !appendSystemPromptInjected,
+                        hasTitle: true,
+                    }), {
+                        model: message.mode.model, effort: message.mode.effort,
+                        developerInstructions: nextDeveloperInstructions, mcpServers: mcpSync.mcpServers,
+                    });
+                    appendSystemPromptInjected = true;
+                    continue;
+                }
                 if (client.threadId && nextDeveloperInstructions !== currentDeveloperInstructions) {
                     await client.resumeThread({
                         threadId: client.threadId,
