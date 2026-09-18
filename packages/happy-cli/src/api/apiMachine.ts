@@ -3064,9 +3064,17 @@ export class ApiMachineClient {
                 if (cwdDecision.fallback) {
                     const banner = formatCwdFallbackBanner(cwdDecision);
                     if (banner) {
+                        // The banner is an output frame like any other, so it
+                        // takes seq 1 and goes into the replay buffer. Emitting
+                        // it unsequenced would both break the "every frame
+                        // carries a seq" contract this same ack advertises via
+                        // caps.resume, and consume seq 1 on the client — which
+                        // reads a missing seq as "the next one" — so the shell's
+                        // first real chunk would look like a duplicate.
+                        const seq = entry.output.push(banner);
                         try {
                             const data = encodeBase64(encrypt(machineKey, machineVariant, banner));
-                            this.socket.emit('terminal-frame', { sessionId, data });
+                            this.socket.emit('terminal-frame', { sessionId, seq, data });
                             recordBytesOut(sessionId, banner.length);
                         } catch (e) {
                             logger.debug(`[API MACHINE] terminal-open-fwd banner encrypt failed: ${(e as Error).message}`);

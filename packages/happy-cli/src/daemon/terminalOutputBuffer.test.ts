@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
     createTerminalOutputBuffer,
     DEFAULT_TERMINAL_BUFFER_CHARS,
+    DEFAULT_TERMINAL_BUFFER_FRAMES,
 } from './terminalOutputBuffer';
 
 describe('terminalOutputBuffer seq assignment', () => {
@@ -116,5 +117,40 @@ describe('terminalOutputBuffer bounding', () => {
 
     it('defaults to the same ceiling the desktop client buffers to', () => {
         expect(DEFAULT_TERMINAL_BUFFER_CHARS).toBe(1_000_000);
+    });
+
+    /*
+     * The character cap alone does not bound memory: each retained frame costs
+     * its object, its array slot and a string header on top of the characters
+     * it accounts for (~47 bytes measured), so a buffer full of one-character
+     * frames sits at ~47MB while reporting 1,000,000 chars. A slow steady
+     * printer reaches that through the coalescer's 8ms flush window without any
+     * adversary, so the frame count is capped too.
+     */
+    it('caps the frame count, not just the characters', () => {
+        const buffer = createTerminalOutputBuffer(DEFAULT_TERMINAL_BUFFER_CHARS, 10);
+        for (let i = 0; i < 100; i++) buffer.push('.');
+        // Well under the character cap, so only the frame cap can be holding it.
+        expect(buffer.bufferedChars()).toBe(10);
+        expect(buffer.lastSeq()).toBe(100);
+        expect(buffer.resume(95)).toEqual({
+            kind: 'replay',
+            frames: [96, 97, 98, 99, 100].map((seq) => ({ seq, chunk: '.' })),
+        });
+    });
+
+    it('trims whole frames when the frame cap is what bites', () => {
+        const buffer = createTerminalOutputBuffer(DEFAULT_TERMINAL_BUFFER_CHARS, 2);
+        buffer.push('abc');
+        buffer.push('[31mred');
+        buffer.push('xyz');
+        // Frame 1 is gone, so a client at 0 has fallen past the buffer — and
+        // what it gets back is the surviving frames whole, never a half escape
+        // sequence.
+        expect(buffer.resume(0)).toEqual({ kind: 'snapshot', seq: 3, data: '[31mredxyz' });
+    });
+
+    it('defaults the frame ceiling to the same order of magnitude as the character one', () => {
+        expect(DEFAULT_TERMINAL_BUFFER_FRAMES).toBe(20_000);
     });
 });

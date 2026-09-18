@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
 import { ApiMachineClient } from './apiMachine';
-import { addDaemonTerminalSession, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
+import { addDaemonTerminalSession, getDaemonTerminalSession, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
+import { encodeBase64, encrypt } from './encryption';
 import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_MAX_DELAY_MS, RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { logger } from '@/ui/logger';
 import type { Machine } from './types';
@@ -69,6 +70,9 @@ vi.mock('@/resume/localHappyAgentAuth', () => ({
 vi.mock('@/utils/lidState', () => ({
     shouldReconnect: mockShouldReconnect
 }));
+
+/** node-pty's unix build; the banner test below actually spawns a shell. */
+const describeUnix = process.platform === 'win32' ? describe.skip : describe;
 
 type SocketHandler = (...args: any[]) => void;
 type SocketHandlers = Record<string, SocketHandler[]>;
@@ -277,6 +281,60 @@ describe('ApiMachineClient socket reconnection', () => {
 
             vi.advanceTimersByTime(200);
             expect(pty.terminate).toHaveBeenCalled();
+        });
+    });
+
+    /*
+     * specs/remote-terminal-cwd-fallback/ meets specs/terminal-resume/ — the
+     * fallback banner is an output frame, and the ack that goes out with it
+     * advertises caps.resume. A banner emitted without a seq would break that
+     * promise in the same breath it is made: the client reads a missing seq as
+     * "the next one after what I had", so the banner would silently consume
+     * seq 1 and the shell's first real chunk would arrive looking like a
+     * duplicate. It would also vanish from every replay, never having entered
+     * the buffer.
+     *
+     * Unlike the resume tests above, this one has to go through
+     * terminal-open-fwd, because that is the only place the banner is written —
+     * so it spawns a real shell, and is skipped where node-pty cannot.
+     */
+    describeUnix('terminal-open-fwd cwd fallback banner', () => {
+        const sessionId = 'banner-seq-1';
+
+        const emitsOf = (event: string): any[] => mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === event)
+            .map(([, payload]: [string, any]) => payload);
+
+        afterEach(() => {
+            removeDaemonTerminalSession(sessionId);
+        });
+
+        it('carries a seq and enters the replay buffer like any other frame', async () => {
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+            const params = encodeBase64(encrypt(machine.encryptionKey, machine.encryptionVariant, {
+                userId: 'u1',
+                // Does not exist and is not under allowedRoot, so decideTerminalCwd
+                // falls back to homedir and the banner is written.
+                cwd: '/definitely/not/a/real/path/for/the/banner/test',
+                shell: '/bin/sh',
+            }));
+            mockSocket.emit.mockClear();
+
+            const ack = await new Promise<any>((resolve) => {
+                emitSocketEvent('terminal-open-fwd', { sessionId, params }, resolve);
+            });
+
+            expect(ack.ok).toBe(true);
+            expect(ack.caps).toEqual({ resume: true, snapshot: true });
+            const banner = emitsOf('terminal-frame')[0];
+            expect(banner.sessionId).toBe(sessionId);
+            expect(banner.seq).toBe(1);
+            // Buffered, so a client resuming from 0 gets the notice back.
+            const entry = getDaemonTerminalSession(sessionId)!;
+            expect(entry.output.lastSeq()).toBe(1);
+            expect(entry.output.bufferedChars()).toBeGreaterThan(0);
         });
     });
 
