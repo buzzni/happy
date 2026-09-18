@@ -187,7 +187,7 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
                 return;
             }
 
-            const ackResp = daemonAck as { ok?: boolean; error?: string } | null | undefined;
+            const ackResp = daemonAck as { ok?: boolean; error?: string; caps?: unknown } | null | undefined;
             if (!ackResp || ackResp.ok !== true) {
                 reply({ ok: false, error: ackResp?.error ?? 'Daemon failed to open terminal' });
                 return;
@@ -202,7 +202,14 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
                 createdAt: Date.now(),
             });
             log({ module: 'terminal-relay' }, `[REMOTE-TERMINAL] open user=${userId} machine=${machineId} session=${sessionId}`);
-            reply({ ok: true, sessionId });
+            /*
+             * specs/desktop-terminal-reliability/ Phase 3 — capability
+             * negotiation. The relay does not decide what is supported; it
+             * carries whatever the daemon claims. An older daemon sends no
+             * `caps` and the client stays in legacy mode, which is exactly the
+             * graceful degradation the client was built for.
+             */
+            reply({ ok: true, sessionId, ...(ackResp.caps ? { caps: ackResp.caps } : {}) });
         } catch (e) {
             log({ module: 'terminal-relay', level: 'error' }, `terminal-open error: ${(e as Error).message}`);
             reply({ ok: false, error: 'Internal error' });
@@ -224,11 +231,55 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
                 data: data?.data,
             });
         } else {
+            // `seq` is the daemon's; the relay neither assigns nor validates it.
             emitToSocket(session.clientSocketId, 'terminal-frame', {
                 sessionId: session.id,
+                seq: data?.seq,
                 data: data?.data,
             });
         }
+    });
+
+    /*
+     * specs/desktop-terminal-reliability/ Phase 3 — client → daemon.
+     *
+     * The client noticed a gap in `seq` (or just reconnected) and wants
+     * everything after the last frame it actually saw. The relay carries the
+     * ask; the daemon owns the buffer and decides between replay, snapshot and
+     * "there is a hole here".
+     */
+    socket.on('terminal-resume', async (data: any) => {
+        const resolved = await resolveTerminalSide(data?.sessionId, socket, userId);
+        if (!resolved || resolved.side !== 'client') return;
+        const afterSeq = Number(data?.afterSeq);
+        if (!Number.isFinite(afterSeq) || afterSeq < 0) return;
+        emitToSocket(resolved.session.daemonSocketId, 'terminal-resume-fwd', {
+            sessionId: resolved.session.id,
+            afterSeq: Math.trunc(afterSeq),
+        });
+    });
+
+    /*
+     * daemon → client. Both are answers to a resume, and both are routed the
+     * same way ordinary output is — the relay reads neither.
+     */
+    socket.on('terminal-snapshot', async (data: any) => {
+        const resolved = await resolveTerminalSide(data?.sessionId, socket, userId);
+        if (!resolved || resolved.side !== 'daemon') return;
+        emitToSocket(resolved.session.clientSocketId, 'terminal-snapshot', {
+            sessionId: resolved.session.id,
+            seq: data?.seq,
+            data: data?.data,
+        });
+    });
+
+    socket.on('terminal-frame-gap', async (data: any) => {
+        const resolved = await resolveTerminalSide(data?.sessionId, socket, userId);
+        if (!resolved || resolved.side !== 'daemon') return;
+        emitToSocket(resolved.session.clientSocketId, 'terminal-frame-gap', {
+            sessionId: resolved.session.id,
+            fromSeq: data?.fromSeq,
+        });
     });
 
     socket.on('terminal-resize', async (data: any) => {

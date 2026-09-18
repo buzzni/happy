@@ -162,6 +162,7 @@ import {
     killAllDaemonTerminalSessions,
     recordBytesIn,
     recordBytesOut,
+    recordTerminalActivity,
     removeDaemonTerminalSession,
 } from '@/daemon/daemonTerminalSessions';
 import type { ChildProcess } from 'node:child_process';
@@ -314,6 +315,9 @@ interface ServerToDaemonEvents {
     'terminal-frame-fwd': (msg: { sessionId: string; data: string }) => void;
     'terminal-resize-fwd': (msg: { sessionId: string; cols: number; rows: number }) => void;
     'terminal-close-fwd': (msg: { sessionId: string }) => void;
+    // specs/desktop-terminal-reliability/ Phase 3 — the client asks for
+    // everything after the last seq it saw, following a reconnect or a gap.
+    'terminal-resume-fwd': (msg: { sessionId: string; afterSeq: number }) => void;
     'rpc-registered': (data: { method: string }) => void;
     'rpc-unregistered': (data: { method: string }) => void;
     'rpc-error': (data: { type: string, error: string }) => void;
@@ -439,7 +443,16 @@ interface DaemonToServerEvents {
     // specs/remote-terminal/ Phase 2 — daemon-originated stream frames.
     // `data` is the E2EE-encrypted PTY chunk; happy-server forwards it
     // to the client without inspection.
-    'terminal-frame': (msg: { sessionId: string; data: string }) => void;
+    // `seq` is monotonic per session and starts at 1, so 0 means "seen
+    // nothing". Frames sent before this shipped carry none, which the client
+    // reads as "the next one after whatever I last had".
+    'terminal-frame': (msg: { sessionId: string; seq?: number; data: string }) => void;
+    // The whole replay buffer as one frame, when the client fell further behind
+    // than the buffer reaches. The client resets its screen to this.
+    'terminal-snapshot': (msg: { sessionId: string; seq: number; data: string }) => void;
+    // There is no honest answer to the resume: say where the hole starts rather
+    // than let the client believe it is current.
+    'terminal-frame-gap': (msg: { sessionId: string; fromSeq: number }) => void;
     'terminal-closed': (msg: { sessionId: string; code: number; signal: number | null }) => void;
     // Preview WebSocket relay — upstream→browser bytes and tunnel teardown.
     'proxy-ws-data': (payload: { tunnelId: string; dataB64: string }) => void;
@@ -3057,9 +3070,17 @@ export class ApiMachineClient {
                 const outputCoalescer = createTerminalOutputCoalescer({
                     sessionId,
                     emit: (chunk) => {
+                        /*
+                         * specs/desktop-terminal-reliability/ Phase 3 — the
+                         * coalesced chunk is the unit of replay, so it is what
+                         * gets a seq. Buffer first, then send: a frame the
+                         * client asks to replay must already be in the buffer
+                         * by the time the ask can arrive.
+                         */
+                        const seq = entry.output.push(chunk);
                         try {
                             const data = encodeBase64(encrypt(machineKey, machineVariant, chunk));
-                            this.socket.emit('terminal-frame', { sessionId, data });
+                            this.socket.emit('terminal-frame', { sessionId, seq, data });
                         } catch (e) {
                             logger.debug(`[API MACHINE] terminal-frame encrypt failed: ${(e as Error).message}`);
                         }
@@ -3091,7 +3112,13 @@ export class ApiMachineClient {
                 logger.debug(
                     `[REMOTE-TERMINAL] open session=${sessionId} user=${entry.userId} machine=${entry.machineId ?? '-'} pid=${pty.pid}`,
                 );
-                ack({ ok: true, pid: pty.pid });
+                /*
+                 * The desktop client has spoken resume/snapshot since
+                 * specs/desktop-terminal-reliability/ Phase 3 but has been
+                 * running in legacy mode all along, because nothing ever
+                 * advertised these. Both are honoured below.
+                 */
+                ack({ ok: true, pid: pty.pid, caps: { resume: true, snapshot: true } });
             } catch (e) {
                 const message = e instanceof Error ? e.message : String(e);
                 logger.debug(`[API MACHINE] terminal-open-fwd internal error: ${message}`);
@@ -3114,6 +3141,51 @@ export class ApiMachineClient {
             } catch (e) {
                 logger.debug(`[API MACHINE] terminal-frame-fwd decrypt failed: ${(e as Error).message}`);
             }
+        });
+
+        /*
+         * specs/desktop-terminal-reliability/ Phase 3 — a client that missed
+         * frames (a reconnect, or a gap it noticed in the seq) asks for
+         * everything after the last seq it saw.
+         *
+         * Not attached on a managed runtime, for the same reason as
+         * terminal-frame-fwd: forwarded terminal events reach the host outside
+         * the RPC dispatch gate, so the allowlist there would not see this.
+         */
+        if (!this.managedHandlers) this.socket.on('terminal-resume-fwd', (msg) => {
+            const { sessionId, afterSeq } = msg || {};
+            const entry = getDaemonTerminalSession(sessionId);
+            if (!entry) return;
+            const seen = Number.isFinite(afterSeq) ? Math.max(0, Math.trunc(afterSeq as number)) : 0;
+            const answer = entry.output.resume(seen);
+            /*
+             * A resume is proof the client is still watching. Without this the
+             * idle watchdog keeps counting from the last byte that actually
+             * moved, and a terminal recovered at minute 14 dies at minute 15.
+             */
+            recordTerminalActivity(sessionId);
+            try {
+                if (answer.kind === 'replay') {
+                    for (const frame of answer.frames) {
+                        const data = encodeBase64(encrypt(machineKey, machineVariant, frame.chunk));
+                        this.socket.emit('terminal-frame', { sessionId, seq: frame.seq, data });
+                    }
+                } else if (answer.kind === 'snapshot') {
+                    const data = encodeBase64(encrypt(machineKey, machineVariant, answer.data));
+                    this.socket.emit('terminal-snapshot', { sessionId, seq: answer.seq, data });
+                } else if (answer.kind === 'gap') {
+                    // Nothing to send that would be true. Say where the hole
+                    // starts rather than letting the client believe it is current.
+                    this.socket.emit('terminal-frame-gap', { sessionId, fromSeq: answer.fromSeq });
+                }
+            } catch (e) {
+                logger.debug(`[API MACHINE] terminal-resume-fwd reply failed: ${(e as Error).message}`);
+                return;
+            }
+            logger.debug(
+                `[REMOTE-TERMINAL] resume session=${sessionId} afterSeq=${seen} answer=${answer.kind}`
+                + (answer.kind === 'replay' ? ` frames=${answer.frames.length}` : ''),
+            );
         });
 
         this.socket.on('terminal-resize-fwd', (msg) => {
