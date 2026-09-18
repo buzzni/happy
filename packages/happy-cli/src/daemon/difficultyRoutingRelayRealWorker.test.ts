@@ -134,6 +134,36 @@ describe.skipIf(!enabled)('difficulty routing sealed relay with the real worker'
     expect(response.difficulty).toBeUndefined()
   }, 30_000)
 
+  // R7 은 8,000자 초과 거부를 요구한다. 상한은 **복호화한 뒤** 평문 길이로 적용되므로
+  // (암호문 길이 검사와 별개다) 실제 복호화를 타는 이 스위트에서만 확인된다.
+  //
+  // 주의: 거절이 host 와 worker 양쪽에 있어 응답만으로는 어느 쪽이 막았는지 구분할 수 없다.
+  // 그래서 "모델에 닿지 않는다" 같은 확인 불가능한 주장은 하지 않는다. 경계 양쪽을 고정하는
+  // 것으로 충분하며, teeth 는 두 겹을 모두 푸는 변이로 확인했다.
+  it('accepts a prompt of exactly the 8,000 character limit (R7)', async () => {
+    const response = await host.classify(request('a'.repeat(8000)))
+    expect(response.status).toBe('ok')
+    expect(['trivial', 'routine', 'hard']).toContain(response.difficulty)
+  }, 30_000)
+
+  it('refuses one character past the limit (R7)', async () => {
+    const response = await host.classify(request('a'.repeat(8001)))
+    expect(response.status).toBe('error')
+    expect(response.difficulty).toBeUndefined()
+  }, 30_000)
+
+  // 거절 경로가 큐 회계(admittedBytes)를 되돌리지 않으면 거절만 반복해도 호스트가 누적
+  // 입력 상한(256KiB)에 걸려 영구 'busy' 로 굳는다. 8,001자 요청의 암호문이 약 10.7KiB 라
+  // 25회쯤에서 상한을 넘으므로, **상한을 확실히 넘기는 30회**를 돌려야 누수가 드러난다.
+  // 몇 번만 돌리면 누수가 있어도 초록이다 — 실제로 3회로 썼다가 변이 검사에서 잡혔다.
+  it('keeps serving normal requests after repeated oversize rejections', async () => {
+    for (let i = 0; i < 30; i += 1) {
+      const rejected = await host.classify(request('a'.repeat(8001)))
+      expect(rejected.status).toBe('error')
+    }
+    expect((await host.classify(request('간단한 오타 수정'))).status).toBe('ok')
+  }, 120_000)
+
   it('stops answering once the organization policy is turned off', async () => {
     host.setEnabled(false)
     expect((await host.classify(request('OFF 이후 요청'))).status).toBe('revoked')
