@@ -237,36 +237,19 @@ class AuthModule {
         accountId: string,
         now: number,
         ttlMs: number = BROWSER_SYNC_MAX_TTL_MS,
-    ): Promise<string | null> {
+    ): Promise<{ token: string; expiresAt: number } | null> {
         if (!this.browserSync) {
             throw new Error('Auth module not initialized');
         }
-        const minted = await this.browserSync.mint(
-            { v: 1, accountId, expiresAt: now + ttlMs },
-            now,
-        );
+        const expiresAt = now + ttlMs;
+        const minted = await this.browserSync.mint({ v: 1, accountId, expiresAt }, now);
         if (!minted.ok) {
             log({ module: 'auth', level: 'error' }, `Browser sync mint refused: ${minted.reason}`);
             return null;
         }
-        return minted.token;
-    }
-
-    /**
-     * Verify a browser's sync credential.
-     *
-     * Deliberately not routed through `tokenCache`: that cache holds account
-     * bearers for 24 hours, and this credential's short life is the only thing
-     * that ends a logged-out browser's socket.
-     */
-    async verifyBrowserSyncToken(
-        token: string,
-        now: number,
-    ): Promise<{ accountId: string; expiresAt: number } | null> {
-        if (!this.browserSync) return null;
-        const verified = await this.browserSync.verify(token, now);
-        if (!verified.ok) return null;
-        return { accountId: verified.claims.accountId, expiresAt: verified.claims.expiresAt };
+        // 서명 안의 만료를 그대로 돌려준다 — 따로 계산하면 광고한 값과 서명된
+        // 값이 갈라질 수 있고, 그 차이는 만료 뒤에야 드러난다.
+        return { token: minted.token, expiresAt };
     }
 
     async createGithubToken(userId: string): Promise<string> {

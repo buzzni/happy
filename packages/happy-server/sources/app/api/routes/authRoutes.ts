@@ -3,7 +3,6 @@ import { type Fastify } from "../types";
 import * as privacyKit from "privacy-kit";
 import { db } from "@/storage/db";
 import { auth } from "@/app/auth/auth";
-import { BROWSER_SYNC_MAX_TTL_MS } from "@/app/auth/browserSyncToken";
 import { log } from "@/utils/log";
 
 export function authRoutes(app: Fastify) {
@@ -270,15 +269,15 @@ export function authRoutes(app: Fastify) {
         },
     }, async (request, reply) => {
         const now = Date.now();
-        const token = await auth.createBrowserSyncToken(request.userId, now);
-        if (!token) {
+        const minted = await auth.createBrowserSyncToken(request.userId, now);
+        if (!minted) {
             // The issuer refused. Reporting success with no usable credential
             // would surface later as a socket that cannot connect, for reasons
             // nobody can trace back to here.
             log({ module: 'auth', level: 'error' }, 'Browser sync credential mint failed');
             return reply.code(503).send({ error: 'Browser sync credential unavailable' as const });
         }
-        return reply.send({ token, expiresAt: now + BROWSER_SYNC_MAX_TTL_MS });
+        return reply.send(minted);
     });
 
 }

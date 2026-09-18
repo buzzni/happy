@@ -237,6 +237,8 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
                 || undefined;
             const remaining = browserSync.expiresAt - Date.now();
             const deadline = setTimeout(() => socket.disconnect(true), Math.max(0, remaining));
+            // 이 타이머가 종료를 막을 이유가 없다 — managedDaemonSocketGuard 와 같다.
+            deadline.unref?.();
             socket.on('disconnect', () => clearTimeout(deadline));
             next();
             return;
