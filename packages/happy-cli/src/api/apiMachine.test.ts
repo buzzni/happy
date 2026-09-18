@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
 import { ApiMachineClient } from './apiMachine';
+import { addDaemonTerminalSession, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
 import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_MAX_DELAY_MS, RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { logger } from '@/ui/logger';
 import type { Machine } from './types';
@@ -151,6 +152,132 @@ describe('ApiMachineClient socket reconnection', () => {
             if (previous === undefined) delete process.env.HAPPY_REMOTE_TERMINAL_POLICY;
             else process.env.HAPPY_REMOTE_TERMINAL_POLICY = previous;
         }
+    });
+
+    /*
+     * specs/desktop-terminal-reliability/ Phase 3 — the daemon side of resume.
+     *
+     * The buffer's own decisions are covered in terminalOutputBuffer.test.ts;
+     * what these check is the wiring: that a resume reaches the buffer, that
+     * each of its three answers leaves on the right event, and that a resume
+     * counts as the client still being there.
+     *
+     * A session is registered directly rather than opened through
+     * terminal-open-fwd, which would spawn a real shell (node-pty is not mocked
+     * here).
+     */
+    describe('terminal resume', () => {
+        const fakePty = () => ({
+            id: 'pty', userId: 'u1', pid: 1, cols: 80, rows: 24,
+            write: vi.fn(), resize: vi.fn(), kill: vi.fn(),
+            isAlive: () => true, terminate: vi.fn(async () => 'exited' as const),
+            onData: vi.fn(() => () => {}), onExit: vi.fn(() => () => {}),
+        });
+
+        const emitsOf = (event: string): any[] => mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === event)
+            .map(([, payload]: [string, any]) => payload);
+
+        afterEach(() => {
+            removeDaemonTerminalSession('resume-1');
+        });
+
+        function openRegisteredSession(chunks: string[], idleTimeoutMs = 0) {
+            const client = new ApiMachineClient('fake-token', makeMachine());
+            client.connect();
+            const entry = addDaemonTerminalSession('resume-1', fakePty() as any, {
+                userId: 'u1', machineId: 'test-machine-id', idleTimeoutMs,
+            });
+            for (const chunk of chunks) entry.output.push(chunk);
+            mockSocket.emit.mockClear();
+            return { client, entry };
+        }
+
+        it('replays the frames a client missed', () => {
+            openRegisteredSession(['one', 'two', 'three']);
+            emitSocketEvent('terminal-resume-fwd', { sessionId: 'resume-1', afterSeq: 1 });
+
+            expect(emitsOf('terminal-frame').map((p: any) => p.seq)).toEqual([2, 3]);
+        });
+
+        it('says nothing to a client that is already current', () => {
+            openRegisteredSession(['one']);
+            emitSocketEvent('terminal-resume-fwd', { sessionId: 'resume-1', afterSeq: 1 });
+
+            expect(mockSocket.emit).not.toHaveBeenCalled();
+        });
+
+        it('sends a snapshot when the client fell past the buffer', () => {
+            const { entry } = openRegisteredSession([]);
+            // A tiny buffer is easier to overflow than 1,000,000 chars.
+            const small = addDaemonTerminalSession('resume-1', fakePty() as any, {
+                userId: 'u1', machineId: 'test-machine-id', idleTimeoutMs: 0, outputBufferChars: 6,
+            });
+            expect(small).not.toBe(entry);
+            small.output.push('aaa');
+            small.output.push('bbb');
+            small.output.push('ccc');
+            mockSocket.emit.mockClear();
+
+            emitSocketEvent('terminal-resume-fwd', { sessionId: 'resume-1', afterSeq: 0 });
+
+            expect(emitsOf('terminal-snapshot')).toHaveLength(1);
+            expect(emitsOf('terminal-snapshot')[0].seq).toBe(3);
+            expect(emitsOf('terminal-frame')).toHaveLength(0);
+        });
+
+        it('reports a gap rather than pretending, when nothing useful is buffered', () => {
+            const session = addDaemonTerminalSession('resume-1', fakePty() as any, {
+                userId: 'u1', machineId: 'test-machine-id', idleTimeoutMs: 0, outputBufferChars: 1,
+            });
+            const client = new ApiMachineClient('fake-token', makeMachine());
+            client.connect();
+            session.output.push('aaaa');
+            session.output.push('bbbb');
+            mockSocket.emit.mockClear();
+
+            emitSocketEvent('terminal-resume-fwd', { sessionId: 'resume-1', afterSeq: 0 });
+
+            expect(emitsOf('terminal-frame-gap')).toEqual([{ sessionId: 'resume-1', fromSeq: 1 }]);
+        });
+
+        it('ignores a resume for a session this daemon does not have', () => {
+            openRegisteredSession(['one']);
+            emitSocketEvent('terminal-resume-fwd', { sessionId: 'no-such-session', afterSeq: 0 });
+
+            expect(mockSocket.emit).not.toHaveBeenCalled();
+        });
+
+        it('treats a missing or nonsense afterSeq as "I have seen nothing"', () => {
+            openRegisteredSession(['one', 'two']);
+            emitSocketEvent('terminal-resume-fwd', { sessionId: 'resume-1' });
+
+            expect(emitsOf('terminal-frame').map((p: any) => p.seq)).toEqual([1, 2]);
+        });
+
+        /*
+         * Why this matters: the client's input and the daemon's output are both
+         * silent during a disconnect, so the idle watchdog keeps counting. A
+         * terminal recovered at minute 14 would otherwise be torn down at 15 —
+         * the 900-second teardowns seen in the incident logs.
+         */
+        it('counts a resume as activity so the idle watchdog restarts', () => {
+            vi.useFakeTimers();
+            const client = new ApiMachineClient('fake-token', makeMachine());
+            client.connect();
+            const pty = fakePty();
+            addDaemonTerminalSession('resume-1', pty as any, {
+                userId: 'u1', machineId: 'test-machine-id', idleTimeoutMs: 1000,
+            });
+
+            vi.advanceTimersByTime(900);
+            emitSocketEvent('terminal-resume-fwd', { sessionId: 'resume-1', afterSeq: 0 });
+            vi.advanceTimersByTime(900);
+            expect(pty.terminate).not.toHaveBeenCalled();
+
+            vi.advanceTimersByTime(200);
+            expect(pty.terminate).toHaveBeenCalled();
+        });
     });
 
     it('registers dependency reclaim on the authenticated machine RPC surface', () => {

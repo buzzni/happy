@@ -11,6 +11,7 @@
  */
 
 import { type PtySession } from './remoteTerminal'
+import { createTerminalOutputBuffer, type TerminalOutputBuffer } from './terminalOutputBuffer'
 
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1000
 
@@ -31,6 +32,14 @@ export interface DaemonTerminalEntry {
     bytesOut: number
     /** Last in/out activity wallclock ms — drives the idle timer reset. */
     lastActivityAt: number
+    /**
+     * Bounded replay buffer for this terminal's output
+     * (specs/desktop-terminal-reliability/ Phase 3). Lives here rather than in
+     * the relay because happy-server is multi-replica: a buffer kept there
+     * would sit on one replica and a client reconnecting onto a peer would
+     * find nothing.
+     */
+    readonly output: TerminalOutputBuffer
 }
 
 interface InternalEntry extends DaemonTerminalEntry {
@@ -43,6 +52,8 @@ export interface AddSessionOptions {
     machineId?: string | null
     /** ms with no in/out activity before teardown. Defaults to 15 min. Pass 0 to disable. */
     idleTimeoutMs?: number
+    /** Replay buffer ceiling in characters. Defaults to DEFAULT_TERMINAL_BUFFER_CHARS. */
+    outputBufferChars?: number
 }
 
 const sessions = new Map<string, InternalEntry>()
@@ -80,6 +91,7 @@ export function addDaemonTerminalSession(
         bytesIn: 0,
         bytesOut: 0,
         lastActivityAt: now,
+        output: createTerminalOutputBuffer(opts.outputBufferChars),
         _idleTimeoutMs: opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
         _idleTimer: null,
     }
@@ -127,6 +139,22 @@ export function killAllDaemonTerminalSessions(): number {
         sessions.delete(id)
     }
     return killed
+}
+
+/**
+ * Mark the session as still being watched, without counting any bytes.
+ *
+ * For signals that prove a client is there but carry no terminal traffic — a
+ * `terminal-resume` after a reconnect. The byte counters feed the audit log, so
+ * inflating them here would misreport what actually crossed the wire; what this
+ * needs to move is the idle clock. Without it a terminal recovered at minute 14
+ * is still torn down at minute 15.
+ */
+export function recordTerminalActivity(id: string): void {
+    const entry = sessions.get(id)
+    if (!entry) return
+    entry.lastActivityAt = Date.now()
+    armIdleTimer(entry)
 }
 
 /**
