@@ -57,7 +57,27 @@ export interface TerminalOutputBuffer {
  */
 export const DEFAULT_TERMINAL_BUFFER_CHARS = 1_000_000
 
-export function createTerminalOutputBuffer(maxChars = DEFAULT_TERMINAL_BUFFER_CHARS): TerminalOutputBuffer {
+/**
+ * Default ceiling, in frames.
+ *
+ * The character cap alone does not bound memory: a retained frame costs its
+ * `{seq, chunk}` object, its array slot and a separate string header on top of
+ * the characters it accounts for — measured at ~47 bytes per frame, so a
+ * buffer sitting exactly at the character cap made entirely of one-character
+ * frames holds ~47 MB, not the ~2 MB the character cap suggests. That is
+ * reachable without an adversary: the output coalescer flushes on an 8 ms
+ * window, so any slow steady printer (a progress line, a spinner, `tail -f` on
+ * a quiet log) produces up to 125 tiny frames a second.
+ *
+ * 20,000 frames keeps the per-terminal ceiling in the same order as the ~2 MB
+ * the character cap implies, while still holding minutes of continuous output.
+ */
+export const DEFAULT_TERMINAL_BUFFER_FRAMES = 20_000
+
+export function createTerminalOutputBuffer(
+    maxChars = DEFAULT_TERMINAL_BUFFER_CHARS,
+    maxFrames = DEFAULT_TERMINAL_BUFFER_FRAMES,
+): TerminalOutputBuffer {
     const frames: BufferedTerminalFrame[] = []
     let nextSeq = 0
     let chars = 0
@@ -65,7 +85,7 @@ export function createTerminalOutputBuffer(maxChars = DEFAULT_TERMINAL_BUFFER_CH
     const trim = () => {
         // Drop whole frames from the front. A partially dropped frame would
         // corrupt the escape sequences inside it, which is worse than a gap.
-        while (frames.length > 0 && chars > maxChars) {
+        while (frames.length > 0 && (chars > maxChars || frames.length > maxFrames)) {
             chars -= frames[0].chunk.length
             frames.shift()
         }

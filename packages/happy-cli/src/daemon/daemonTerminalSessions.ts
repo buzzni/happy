@@ -54,6 +54,8 @@ export interface AddSessionOptions {
     idleTimeoutMs?: number
     /** Replay buffer ceiling in characters. Defaults to DEFAULT_TERMINAL_BUFFER_CHARS. */
     outputBufferChars?: number
+    /** Replay buffer ceiling in frames. Defaults to DEFAULT_TERMINAL_BUFFER_FRAMES. */
+    outputBufferFrames?: number
 }
 
 const sessions = new Map<string, InternalEntry>()
@@ -91,7 +93,7 @@ export function addDaemonTerminalSession(
         bytesIn: 0,
         bytesOut: 0,
         lastActivityAt: now,
-        output: createTerminalOutputBuffer(opts.outputBufferChars),
+        output: createTerminalOutputBuffer(opts.outputBufferChars, opts.outputBufferFrames),
         _idleTimeoutMs: opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
         _idleTimer: null,
     }
