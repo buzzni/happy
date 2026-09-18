@@ -103,3 +103,60 @@ export function findMachineSockets(
 ): Promise<MachineSocketLookup<AnyRemoteSocket>> {
     return findMachineSocketsIn(io as unknown as FetchSocketsIo<AnyRemoteSocket>, userId, machineId, timeoutMs);
 }
+
+function connectedAtOf(socket: { data?: any }): number {
+    return typeof socket.data?.connectedAt === 'number' ? socket.data.connectedAt : -Infinity;
+}
+
+/**
+ * Which of a machine's sockets are superseded by `keepSocketId`.
+ *
+ * A machine has exactly one daemon, so it should have exactly one socket. It
+ * ends up with more when several handshakes from the same daemon complete at
+ * once (specs/machine-socket-duplicate-registration/) — the client keeps one
+ * Socket object and notices nothing, while the server holds every session that
+ * got through and `newestMachineSocket` may well pick a zombie. Work routed
+ * into one is never answered: the RPC caller waits out its 45s ack, and an open
+ * terminal's frames go to a socket id nobody is listening on.
+ *
+ * Eviction is ordered, never mutual. Only sockets strictly older than the
+ * keeper are returned, and a tie — same millisecond, or both unstamped — is
+ * broken by socket id so that of any two sockets running this concurrently
+ * exactly one evicts the other. Two daemons cannot talk each other off the air.
+ */
+export function supersededMachineSockets<T extends { id: string; data?: any }>(
+    sockets: T[],
+    keepSocketId: string,
+): T[] {
+    const keeper = sockets.find((socket) => socket.id === keepSocketId);
+    // Nothing to reason about if the keeper is not in the list — a degraded
+    // cluster lookup must not be read as "every socket here is stale".
+    if (!keeper) return [];
+    const keeperAt = connectedAtOf(keeper);
+    return sockets.filter((socket) => {
+        if (socket.id === keepSocketId) return false;
+        const at = connectedAtOf(socket);
+        if (at !== keeperAt) return at < keeperAt;
+        return socket.id < keepSocketId;
+    });
+}
+
+/**
+ * Disconnects the sockets `supersededMachineSockets` identifies, and answers
+ * how many were closed.
+ *
+ * Fire-and-forget by design: this runs off a fresh connection, and a cluster
+ * bus that cannot answer must cost a stale socket, not the connection itself.
+ */
+export async function evictSupersededMachineSockets(
+    io: Server,
+    userId: string,
+    machineId: string,
+    keepSocketId: string,
+    timeoutMs: number = MACHINE_LOOKUP_TIMEOUT_MS,
+): Promise<number> {
+    const { sockets } = await findMachineSockets(io, userId, machineId, timeoutMs);
+    const stale = supersededMachineSockets(sockets, keepSocketId);
+    for (const socket of stale) socket.disconnect(true);
+    return stale.length;
+}

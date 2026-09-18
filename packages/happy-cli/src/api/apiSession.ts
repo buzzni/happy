@@ -15,6 +15,7 @@ import { createRpcRequestListener } from './rpc/rpcRequestListener';
 import { registerCommonHandlers } from '../modules/common/registerCommonHandlers';
 import { calculateCost } from '@/utils/pricing';
 import { shouldReconnect } from '@/utils/lidState';
+import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_NOT_READY_POLL_MS, reconnectDelayMs } from '@/api/reconnectCadence';
 import { createEnvelope, type CreateEnvelopeOptions, type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
 import {
     closeClaudeTurnWithStatus,
@@ -386,7 +387,19 @@ export class ApiSessionClient extends EventEmitter {
     private metadataLock = new AsyncLock();
     private encryptionKey: Uint8Array;
     private encryptionVariant: 'legacy' | 'dataKey';
+    /** 예약된 다음 dial. non-null 이면 재연결 cadence 가 돌고 있다는 뜻이다. */
     private reconnectInterval: NodeJS.Timeout | null = null;
+    /** 마지막 성공 연결 이후 연속 dial 횟수. 백오프 계산용. */
+    private reconnectAttempts = 0;
+    /**
+     * 응답을 기다리는 `socket.connect()` 가 발사된 시각. 대기 중인 dial 이 없으면 null.
+     *
+     * specs/machine-socket-duplicate-registration/ — apiMachine 과 같은 결함이다.
+     * 기존 cadence 는 직전 dial 의 성패와 무관하게 3초마다 connect() 를 다시 불렀고,
+     * 핸드셰이크가 느린 구간에서 여러 dial 이 겹쳐 성립해 서버가 같은 세션의 소켓을
+     * 여러 개 들고 있게 됐다.
+     */
+    private reconnectDialStartedAt: number | null = null;
     /**
      * close() 로 의도적으로 끝낸 세션인가.
      *
@@ -548,10 +561,9 @@ export class ApiSessionClient extends EventEmitter {
 
         this.socket.on('connect', () => {
             logger.debug('Socket connected successfully');
-            if (this.reconnectInterval) {
-                clearInterval(this.reconnectInterval);
-                this.reconnectInterval = null;
-            }
+            // dial 성공: cadence 를 끝내고 백오프를 첫 단계로 되돌린다.
+            this.stopSmartReconnect();
+            this.reconnectAttempts = 0;
             this.rpcHandlerManager.onSocketConnect(this.socket);
             this.startReceivePolling();
             this.receiveSync.invalidate();
@@ -577,6 +589,9 @@ export class ApiSessionClient extends EventEmitter {
 
         this.socket.on('disconnect', (reason) => {
             logger.debug(`[API] Socket disconnected: ${reason}`);
+            // dial 이 (성공 후든 핸드셰이크 중이든) 끝났다는 신호. 다음 tick 이
+            // in-flight 예산을 기다리지 않고 바로 dial 할 수 있게 지운다.
+            this.reconnectDialStartedAt = null;
             this.rpcHandlerManager.onSocketDisconnect();
             this.stopReceivePolling();
             this.startSmartReconnect();
@@ -584,6 +599,8 @@ export class ApiSessionClient extends EventEmitter {
 
         this.socket.on('connect_error', (error) => {
             logger.debug('[API] Socket connection error:', error);
+            // dial 이 실패로 결말난 경로.
+            this.reconnectDialStartedAt = null;
             this.rpcHandlerManager.onSocketDisconnect();
             this.stopReceivePolling();
             this.startSmartReconnect();
@@ -1832,10 +1849,7 @@ export class ApiSessionClient extends EventEmitter {
         this.sendSync.stop();
         this.receiveSync.stop();
         this.stopReceivePolling();
-        if (this.reconnectInterval) {
-            clearInterval(this.reconnectInterval);
-            this.reconnectInterval = null;
-        }
+        this.stopSmartReconnect();
         this.socket.close();
     }
 
@@ -1845,28 +1859,61 @@ export class ApiSessionClient extends EventEmitter {
             return;
         }
         if (this.reconnectInterval) return;
+        this.scheduleReconnectDial();
+    }
 
-        this.reconnectInterval = setInterval(() => {
+    /** cadence 를 끝내고 기다리던 dial 도 잊는다. */
+    private stopSmartReconnect() {
+        if (this.reconnectInterval) {
+            clearTimeout(this.reconnectInterval);
+            this.reconnectInterval = null;
+        }
+        this.reconnectDialStartedAt = null;
+    }
+
+    /**
+     * `connect` 나 `connect_error` 를 아직 기다리는 dial 이 있는가.
+     *
+     * 스스로 만료된다 — 둘 중 아무것도 못 받는 핸드셰이크가 single-flight 가드를
+     * "영원히 재연결 안 함"으로 바꿔 버리면 안 된다.
+     */
+    private isReconnectDialInFlight(): boolean {
+        if (this.reconnectDialStartedAt === null) return false;
+        if (Date.now() - this.reconnectDialStartedAt < RECONNECT_DIAL_TIMEOUT_MS) return true;
+        this.reconnectDialStartedAt = null;
+        return false;
+    }
+
+    private scheduleReconnectDial(overrideDelayMs?: number) {
+        const delayMs = overrideDelayMs ?? reconnectDelayMs(this.reconnectAttempts);
+        this.reconnectInterval = setTimeout(() => {
+            this.reconnectInterval = null;
+            // 예약 시점이 아니라 발사 시점에 다시 읽는다 — 그 사이 close() 가
+            // 들어왔을 수 있고, 그러면 이 세션은 다시 붙으면 안 된다.
+            if (this.closed) return;
             if (this.socket.connected) {
-                clearInterval(this.reconnectInterval!);
-                this.reconnectInterval = null;
+                this.reconnectAttempts = 0;
+                return;
+            }
+            if (this.isReconnectDialInFlight()) {
+                // 아직 응답이 없는 dial 위에 또 쌓는 것이 소켓을 복제한 원인이다.
+                this.scheduleReconnectDial();
                 return;
             }
             if (!shouldReconnect()) {
                 logger.debug('[API] Still not ready to reconnect');
+                // Not a failed dial: `reconnectAttempts` stays where it is, so
+                // the backoff cannot pace this branch. Poll on its own clock
+                // instead of re-asking `shouldReconnect()` every base delay for
+                // as long as the machine stays shut.
+                this.scheduleReconnectDial(RECONNECT_NOT_READY_POLL_MS);
                 return;
             }
-            logger.debug('[API] Attempting reconnect');
+            this.reconnectAttempts += 1;
+            this.reconnectDialStartedAt = Date.now();
+            logger.debug(`[API] Attempting reconnect (attempt ${this.reconnectAttempts})`);
             this.socket.connect();
-        }, 3000);
-
-        if (shouldReconnect()) {
-            logger.debug('[API] Network up + lid open — reconnecting in 1s');
-            // 이 타이머가 뜨는 사이 close() 가 들어올 수 있다.
-            setTimeout(() => {
-                if (this.closed) return;
-                if (!this.socket.connected) this.socket.connect();
-            }, 1000);
-        }
+            this.scheduleReconnectDial();
+        }, delayMs);
     }
 }
