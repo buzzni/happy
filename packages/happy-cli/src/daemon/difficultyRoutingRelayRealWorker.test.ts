@@ -26,8 +26,21 @@ import {
 
 const modelDir = process.env.HAPPY_DIFFICULTY_ROUTING_MODEL_DIR
 const entry = resolve(process.cwd(), 'dist/index.mjs')
-const enabled = process.env.HAPPY_DIFFICULTY_ROUTING_INTEGRATION === '1' && Boolean(modelDir) && existsSync(entry)
+const requested = process.env.HAPPY_DIFFICULTY_ROUTING_INTEGRATION === '1'
+// 켜 달라고 명시했는데 준비물이 없으면 **조용히 건너뛰지 않는다.** 모델 경로 오타나
+// `pnpm run build` 누락, 혹은 cwd 가 packages/happy-cli 가 아닌 경우가 여기 걸린다.
+// skip 으로 흘려보내면 "실제 worker 로 검증했다"는 초록을 받고도 아무것도 돌지 않는다.
+if (requested && !modelDir) {
+  throw new Error('HAPPY_DIFFICULTY_ROUTING_INTEGRATION=1 requires HAPPY_DIFFICULTY_ROUTING_MODEL_DIR')
+}
+if (requested && !existsSync(entry)) {
+  throw new Error(`worker entry not found at ${entry} — run pnpm --filter @buzzni/happy-cli build from packages/happy-cli`)
+}
+const enabled = requested
 
+// 이 suite 는 하나의 host 수명주기를 공유한다 — 첫 테스트가 켜서 모델을 올리고(1.1GB 라
+// 테스트마다 다시 올릴 수 없다) 마지막 테스트가 끈다. 따라서 **선언 순서대로** 돌아야 한다.
+// vitest 는 파일 안에서 순차 실행이고 이 저장소는 shuffle 을 쓰지 않는다.
 describe.skipIf(!enabled)('difficulty routing sealed relay with the real worker', () => {
   const hostKey = createDifficultyRoutingHostKey()
   const host = new DifficultyRoutingClassifierHost(hostKey, {
