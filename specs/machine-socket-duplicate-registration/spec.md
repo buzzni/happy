@@ -120,6 +120,53 @@ handshake 에서 걸러진다. 바뀌는 것은 **같은 사용자의 재연결�
 되찾을 수 있다**는 점이다. `shouldDropFramesFromASocketOutsideTheSessionPair`
 테스트는 실제로 지키던 경계(다른 사용자)를 명시하도록 고쳐 썼다.
 
+## 상태
+
+| | 상태 |
+|---|---|
+| AC1~AC3 (재연결 cadence) | 완료 — `apiMachine` / `apiSession` |
+| AC4~AC5 (머신 소켓 축출) | 완료 — `findMachineSockets` / `socket.ts` |
+| AC6~AC10 (터미널 릴레이) | 완료 — `terminalRelayHandler` / `terminalSessions` |
+
+검증: happy-server 1,419 passed, happy-cli 7,024 passed, 양쪽 typecheck 통과.
+신규 테스트는 축출 tie-break 7건, 백오프 7건, 릴레이 rebind/유예 6건.
+
+**실사용 관측은 아직 못 했다.** 원인이 네트워크 플랩·슬립/웨이크 타이밍에 걸려
+있어 단위 테스트로는 재현의 형태만 고정할 수 있다. 배포 뒤
+`~/.happy_remote/logs/` 에서 세 가지를 확인할 것:
+
+1. 같은 초 안의 `Connected to server` 연속 로그가 사라졌는가.
+2. `[REMOTE-TERMINAL] close` 의 `bytesIn=0` 세션이 사라졌는가.
+3. `operation has timed out` 재발 빈도.
+
+### 짝이 되는 클라이언트 작업
+
+데스크톱 쪽 두 건은 별도 저장소(`buzzni/aplus-dev-studio-desktop`)의
+`specs/machine-rpc-timeout-recovery/` 에 있다 — 타임아웃 난 RPC 소켓을 풀에서
+버리는 것과, branch 목록 조회 실패가 새 대화 전송을 막지 않게 하는 것. 이 스펙이
+"실패를 만들지 않는 쪽", 저쪽이 "실패를 겪은 뒤 회복하는 쪽"이다.
+
+## 다음에 할 일
+
+우선순위 순.
+
+1. **관측** (위 세 가지). 특히 터미널 세션이 정확히 900.0초에 닫히던 패턴 — 세 번
+   연속 정확히 같은 값이었는데 로그만으로는 원인을 못 찾았다. 데몬의
+   `killAllDaemonTerminalSessions` 도 `terminate session=` 도 찍히지 않았고 `TMOUT`
+   도 어디에도 없다(확인함). rebind 로 함께 사라지는지 먼저 본다.
+2. **`terminal-resume` 서버 구현.** 클라이언트는 이미 `seq` dedup, gap 감지,
+   `resume(afterSeq)`, snapshot 처리를 갖추고 `caps` 를 기다리고 있는데
+   (desktop `specs/desktop-terminal-reliability/` Phase 3) 서버가 안 내려줘 계속
+   legacy 로 돈다. 이번 rebind 는 그 아래 단계만 깔았으므로, 재접속 구간에 데몬이
+   뱉은 출력은 여전히 유실된다.
+3. **폴링 부하 (P2).** 같은 21시간 로그에서 bash RPC 약 64,000건,
+   `git fetch --unshallow --filter=blob:none` 7,945건, 폴링 대상 worktree 444개가
+   관측됐다(디스크에는 aplus-dev-studio 1,030 / -desktop 342 / happy 197 디렉터리).
+   실재하는 문제지만 원인도 작업도 별개이고, 고칠 코드는 대부분 데스크톱 쪽이다.
+4. **세션 스코프 소켓 축출.** cadence 는 고쳤지만 서버 측 축출은 machine-scoped
+   에만 넣었다. 세션 라우팅은 room 브로드캐스트라 같은 방식으로 조용히 유실되지는
+   않으므로 급하지 않다.
+
 ## 이 스펙이 다루지 **않는** 것
 
 - **재접속 구간에 흘러간 출력.** rebind 는 클라이언트의 첫 프레임에서 일어나므로,
