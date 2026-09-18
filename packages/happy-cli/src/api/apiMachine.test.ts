@@ -529,6 +529,40 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    /*
+     * shutdown() 은 socket.close() 를 부르고, 그것이 disconnect 를 발생시킨다.
+     * 그 핸들러가 재연결 cadence 를 다시 켜면 종료 절차가 이벤트 루프를 놓지
+     * 못하고 run.ts 의 1초 fallback 에 걸려 `forcing exit with code 1` 로 끝난다.
+     * 강제 종료는 정리를 건너뛰므로 서버는 소켓이 죽은 줄 ping 예산이 다 될
+     * 때까지 모르고, 재시작 한 번이 필요 이상으로 긴 오프라인이 된다.
+     */
+    it('does not restart the reconnect cadence while shutting down', async () => {
+        vi.useFakeTimers();
+
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.connect();
+        client.shutdown();
+
+        // socket.close() 가 실제로 부르는 그 이벤트.
+        emitSocketEvent('disconnect', 'io client disconnect');
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(mockSocket.connect).not.toHaveBeenCalled();
+        expect(client.getConnectionHealth().reconnecting).toBe(false);
+    });
+
+    it('stays shut down even if a later connect_error arrives', async () => {
+        vi.useFakeTimers();
+
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.connect();
+        client.shutdown();
+        emitSocketEvent('connect_error', new Error('ECONNREFUSED'));
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(mockSocket.connect).not.toHaveBeenCalled();
+    });
+
     it('reports how long the machine socket has been down', async () => {
         vi.useFakeTimers();
         vi.setSystemTime(0);

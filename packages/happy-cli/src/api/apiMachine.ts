@@ -742,6 +742,21 @@ export class ApiMachineClient {
      * completed, leaving the server holding more than one live machine socket.
      */
     private reconnectDialStartedAt: number | null = null;
+    /**
+     * `shutdown()` 이 시작됐는가.
+     *
+     * `socket.close()` 는 `disconnect` 를 발생시키고, 그 핸들러가 재연결 cadence 를
+     * 다시 켠다. 정리하려고 끈 타이머가 끄는 그 동작 때문에 되살아나는 것이라,
+     * 종료 절차가 이벤트 루프를 놓지 못하고 run.ts 의 1초 fallback 에 걸려
+     * `forcing exit with code 1` 로 끝난다. 강제 종료는 정리를 건너뛰므로 서버는
+     * 소켓이 죽은 줄 ping 예산이 다 될 때까지 모른다 — 재시작 한 번이 필요 이상으로
+     * 긴 오프라인이 되는 경로다.
+     *
+     * apiSession 은 같은 결함을 `closed` 플래그로 이미 막아 뒀다(2026-09-05:
+     * 닫은 세션이 1초 뒤 되살아나 프로세스가 2시간 11분 남았던 건). 여기에는
+     * 그 대응물이 없었다.
+     */
+    private shuttingDown = false;
     /*
      * specs/daemon-socket-watchdog/ — the level-triggered backstop.
      *
@@ -3403,6 +3418,8 @@ export class ApiMachineClient {
         // present a dead bearer over and over while the parent already knows
         // this runtime is not authorised.
         if (this.credentialStopped) return;
+        // Nor does one that is on its way out.
+        if (this.shuttingDown) return;
         if (this.reconnectInterval) return;
         this.scheduleReconnectDial();
     }
@@ -3476,6 +3493,10 @@ export class ApiMachineClient {
 
     shutdown() {
         logger.debug('[API MACHINE] Shutting down');
+        // Set before anything can fire `disconnect`, and never cleared: the
+        // close below wakes the disconnect handler, which would otherwise start
+        // the reconnect cadence right back up.
+        this.shuttingDown = true;
         this.stopKeepAlive();
         this.stopConnectionSupervisor();
         for (const cdpPipe of this.browserCdpPipes.values()) cdpPipe.close();
