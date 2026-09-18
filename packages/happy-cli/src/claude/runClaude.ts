@@ -8,7 +8,7 @@ import { Credentials, readSettings } from '@/persistence';
 import { resolveSessionSandboxConfig } from '@/sandbox/resolveSessionSandboxConfig';
 import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { EnhancedMode, PermissionMode } from './loop';
-import { MessageQueue2 } from '@/utils/MessageQueue2';
+import { MessageQueue2, type PendingAttachment } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { specialCommandResponse } from '@/claude/specialCommandResponse';
@@ -47,7 +47,7 @@ import {
 import { refreshMcpCallerGrantIfExpiring } from '@/aplus/refreshMcpCallerGrant';
 import { mergeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { encodeBase64 } from '@/api/encryption';
-import type { Session as ApiSession } from '@/api/types';
+import type { Session as ApiSession, UserMessage } from '@/api/types';
 import { getProjectPath } from './utils/path';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -79,6 +79,8 @@ import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessi
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 import { requireAccountToken, type ManagedStartup } from '@/managed/managedStartup';
 import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, clearForeignSessionLineage, requireAccountMachineId, stripAgentModelArguments, stripProviderCredentialOverrides } from '@/managed/managedStartup';
+import { resolveDifficultyRouting, type DifficultyRoutingState } from '@/difficultyRoutingRuntime';
+import { createSerialAsyncHandler } from '@/codex/utils/serialAsyncHandler';
 
 /**
  * How long a confirmed initial prompt waits for its acknowledgement before the
@@ -107,6 +109,7 @@ const DEFAULT_CLAUDE_PERMISSION_MODE: PermissionMode = 'yolo';
 const DEFAULT_CLAUDE_MODEL = 'opus';
 const DEFAULT_CLAUDE_EFFORT: 'low' | 'medium' | 'high' | 'xhigh' | 'max' = 'medium';
 const VALID_CLAUDE_EFFORTS: ReadonlySet<string> = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+const DIFFICULTY_ROUTING_POLICY_VERSION = 'org-shared-difficulty-routing.v1';
 type ClaudeGoalCommand = NonNullable<ReturnType<typeof parseClaudeGoalActionParams>>;
 type PendingClaudeGoalAction = {
     command: ClaudeGoalCommand;
@@ -114,6 +117,56 @@ type PendingClaudeGoalAction = {
     reject: (error: Error) => void;
     timeout: ReturnType<typeof setTimeout>;
 };
+type ClaimedUserMessage = {
+    message: UserMessage;
+    attachmentsPromise: Promise<PendingAttachment[]>;
+};
+
+function isDelegatedDifficultyRoutingMessage(message: Pick<UserMessage, 'meta'>): boolean {
+    const meta = message.meta;
+    if (!meta || meta.modelSource !== 'auto') return false;
+    if (typeof meta.difficultyRoutingAuthorization !== 'string' || meta.difficultyRoutingAuthorization.length === 0) return false;
+    const intent = meta.difficultyRoutingIntent;
+    return Boolean(intent
+        && intent.version === 1
+        && intent.mode === 'auto'
+        && intent.policy === DIFFICULTY_ROUTING_POLICY_VERSION
+        && typeof intent.clientRequestId === 'string'
+        && intent.clientRequestId.length > 0
+        && intent.clientRouteSource === 'default-auto');
+}
+
+function safeUserMessageDebugPayload(message: UserMessage): UserMessage | Record<string, unknown> {
+    if (!hasDifficultyRoutingSensitiveMeta(message)) return message;
+    return {
+        role: 'user',
+        localKey: message.localKey,
+        content: {
+            type: 'text',
+            textLength: message.content.text.length,
+        },
+        meta: {
+            sentFrom: message.meta?.sentFrom,
+            permissionMode: message.meta?.permissionMode,
+            modelSource: message.meta?.modelSource,
+            hasModel: Object.prototype.hasOwnProperty.call(message.meta ?? {}, 'model'),
+            hasEffort: Object.prototype.hasOwnProperty.call(message.meta ?? {}, 'effort'),
+            hasDifficultyRoutingIntent: Boolean(message.meta?.difficultyRoutingIntent),
+            hasDifficultyRoutingAuthorization: Boolean(message.meta?.difficultyRoutingAuthorization),
+            hasDifficultyRoutingPrompt: Boolean(message.meta?.difficultyRoutingPrompt),
+            difficultyRoutingPromptLength: typeof message.meta?.difficultyRoutingPrompt === 'string'
+                ? message.meta.difficultyRoutingPrompt.length
+                : undefined,
+        },
+    };
+}
+
+function hasDifficultyRoutingSensitiveMeta(message: Pick<UserMessage, 'meta'>): boolean {
+    if (!message.meta) return false;
+    return Object.prototype.hasOwnProperty.call(message.meta, 'difficultyRoutingAuthorization')
+        || Object.prototype.hasOwnProperty.call(message.meta, 'difficultyRoutingIntent')
+        || Object.prototype.hasOwnProperty.call(message.meta, 'difficultyRoutingPrompt');
+}
 
 /**
  * Who this run acts for.
@@ -430,6 +483,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // Create realtime session
     const session = api.sessionSyncClient(response);
     stage('session-client');
+    let difficultyRoutingState = session.getMetadata()?.difficultyRoutingState as DifficultyRoutingState | undefined;
 
     // On reconnect, un-archive the session and skip replaying old messages.
     if (reconnectSessionId) {
@@ -916,22 +970,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         session.trackAttachmentDownload(downloadPromise);
     });
 
-    session.onUserMessage(async (message) => {
-        // A managed run answers exactly the prompt its envelope was admitted
-        // for. A message posted to this session by the account owner arrives
-        // here as an ordinary user turn: it would change the model, the
-        // permission mode and the system prompt, then queue another turn —
-        // spending this run's capability on work that passed no admission and
-        // silently replacing the selection that was priced. Refused before any
-        // of that happens; a new prompt needs a new run.
-        //
-        // This is the general free-text path only. Permission answers and tool
-        // responses arrive as their own RPCs, bound to an approval this run is
-        // already waiting on, and are untouched.
-        if (managedStartup) {
-            logger.debug('[managed] Refusing a user turn that did not come from an admitted run');
-            return;
-        }
+    const handleUserMessage = createSerialAsyncHandler<ClaimedUserMessage>(async ({ message, attachmentsPromise }) => {
 
         // Stamp the prompt so the remote-mode JSONL scanner can dedupe
         // it later — the SDK is about to write this same text to disk
@@ -939,10 +978,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         if (message?.content?.text) {
             recordAppPrompt(message.content.text);
         }
+        const delegatedDifficultyRoutingMessage = isDelegatedDifficultyRoutingMessage(message);
 
         // Claim every file attachment that arrived strictly before this text.
         // New file events from this point on belong to the next user message.
-        const attachmentsForThisMessage = await session.drainAttachmentsForUserMessage();
+        const attachmentsForThisMessage = await attachmentsPromise;
 
         // Resolve permission mode from meta - pass through as-is, mapping happens at SDK boundary
         let messagePermissionMode: PermissionMode | undefined = currentPermissionMode;
@@ -979,8 +1019,12 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             // happy-app sends exactly this for a Default selection, so without
             // it the first mobile turn silently changes the session's model.
             messageModel = defaultClaudeModelForRuntime(process.env, messageModel);
-            currentModel = messageModel;
-            logger.debug(`[loop] Model updated from user message: ${messageModel || 'reset to default'}`);
+            if (!delegatedDifficultyRoutingMessage) {
+                currentModel = messageModel;
+                logger.debug(`[loop] Model updated from user message: ${messageModel || 'reset to default'}`);
+            } else {
+                logger.debug(`[loop] Auto-route fallback model received for this turn: ${messageModel || 'default'}`);
+            }
         } else {
             logger.debug(`[loop] User message received with no model override, using current: ${currentModel || 'default'}`);
         }
@@ -1070,11 +1114,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             const incoming = (message.meta as Record<string, unknown>).effort;
             if (incoming === null || incoming === undefined) {
                 messageEffort = undefined;
-                currentEffort = undefined;
+                if (!delegatedDifficultyRoutingMessage) currentEffort = undefined;
                 logger.debug(`[loop] Effort reset to default`);
             } else if (typeof incoming === 'string' && VALID_CLAUDE_EFFORTS.has(incoming)) {
                 messageEffort = incoming as 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-                currentEffort = messageEffort;
+                if (!delegatedDifficultyRoutingMessage) currentEffort = messageEffort;
                 logger.debug(`[loop] Effort updated from user message: ${messageEffort}`);
             } else {
                 logger.debug(`[loop] Ignoring invalid effort from user message: ${String(incoming)}`);
@@ -1103,7 +1147,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         if (specialCommand.type === 'compact') {
             logger.debug('[start] Detected /compact command');
             messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage);
-            logger.debugLargeJson('[start] /compact command pushed to queue:', message);
+            logger.debugLargeJson('[start] /compact command pushed to queue:', safeUserMessageDebugPayload(message));
             return;
         }
 
@@ -1111,7 +1155,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             logger.debug('[start] Detected /clear command');
             deferredContinuation.prepare(message.content.text);
             messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage);
-            logger.debugLargeJson('[start] /clear command pushed to queue:', message);
+            logger.debugLargeJson('[start] /clear command pushed to queue:', safeUserMessageDebugPayload(message));
             return;
         }
 
@@ -1139,6 +1183,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 return;
             }
         }
+
+        let enhancedModeForThisMessage: EnhancedMode | null = null;
 
         // Apply AX Studio orchestration (start-from-planning workflow): if the
         // workspace has `.ax/state.json`, keep the visible user text clean and
@@ -1174,6 +1220,50 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             logger.debug(`[ax] orchestration failed, falling through: ${(err as Error).message}`);
         }
 
+        const routed = delegatedDifficultyRoutingMessage
+            ? await resolveDifficultyRouting({
+                agent: 'claude',
+                sourceMachineId: machineId ?? '',
+                sessionId: response.id,
+                contentText: message.content.text,
+                meta: message.meta,
+                current: { model: messageModel, effort: messageEffort },
+                state: difficultyRoutingState,
+            })
+            : null;
+        if (routed) {
+            if (routed.route.model) {
+                messageModel = defaultClaudeModelForRuntime(
+                    process.env,
+                    normalizeClaudeModelForRuntime(routed.route.model, process.env),
+                );
+                routed.route.model = messageModel;
+            }
+            if (routed.route.effort && VALID_CLAUDE_EFFORTS.has(routed.route.effort)) {
+                messageEffort = routed.route.effort as 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+            } else if (routed.route.effort) {
+                logger.debug(`[loop] Ignoring invalid difficulty routing effort: ${routed.route.effort}`);
+                enhancedModeForThisMessage = null;
+            }
+            if (routed.event.ev.t === 'difficulty-routing') {
+                routed.event.ev.result.model = messageModel ?? '';
+                routed.event.ev.result.effort = messageEffort ?? null;
+            }
+        }
+
+        enhancedModeForThisMessage = {
+            permissionMode: messagePermissionMode || 'default',
+            model: messageModel,
+            fallbackModel: messageFallbackModel,
+            customSystemPrompt: messageCustomSystemPrompt,
+            appendSystemPrompt: messageAppendSystemPrompt,
+            saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+            saycodePromptBlocks: currentSaycodePromptBlocks,
+            allowedTools: messageAllowedTools,
+            disallowedTools: messageDisallowedTools,
+            effort: messageEffort,
+        };
+
         // Until the chat has a title, nudge the model to call `change_title`
         // by appending the instruction to the turn it actually reads. The base
         // system prompt carries the same instruction but the model routinely
@@ -1199,13 +1289,44 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         const queuedText = deferredTurn?.text ?? pushText;
         try {
             if (deferredTurn) recordAppPrompt(queuedText);
-            messageQueue.push(queuedText, currentEnhancedMode(), attachmentsForThisMessage);
+            messageQueue.push(queuedText, enhancedModeForThisMessage, attachmentsForThisMessage);
             deferredTurn?.commit();
+            if (routed) {
+                difficultyRoutingState = routed.state;
+                session.sendSessionProtocolMessage(routed.event);
+                session.updateMetadata((current) => ({
+                    ...current,
+                    difficultyRoutingState: routed.state,
+                }));
+            }
         } catch (error) {
             deferredTurn?.rollback();
             throw error;
         }
-        logger.debugLargeJson('User message pushed to queue:', message)
+        logger.debugLargeJson('User message pushed to queue:', safeUserMessageDebugPayload(message))
+    }, (error) => {
+        logger.warn('[loop] Failed to handle user message', {
+            errorName: error instanceof Error ? error.name : typeof error,
+        });
+    });
+    session.onUserMessage((message) => {
+        // A managed run answers exactly the prompt its envelope was admitted
+        // for. A message posted to this session by the account owner arrives
+        // here as an ordinary user turn: it would change the model, the
+        // permission mode and the system prompt, then queue another turn —
+        // spending this run's capability on work that passed no admission and
+        // silently replacing the selection that was priced. Refused before any
+        // of that happens; a new prompt needs a new run.
+        //
+        // This is the general free-text path only. Permission answers and tool
+        // responses arrive as their own RPCs, bound to an approval this run is
+        // already waiting on, and are untouched.
+        if (managedStartup) {
+            logger.debug('[managed] Refusing a user turn that did not come from an admitted run');
+            return;
+        }
+        const attachmentsPromise = session.drainAttachmentsForUserMessage();
+        return handleUserMessage({ message, attachmentsPromise });
     });
 
     // Daemon-spawned initial prompt (HAPPY_INITIAL_PROMPT, e.g. scheduled

@@ -24,6 +24,7 @@ import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer'
 import { backoff } from '@/utils/time';
 import { applyManagedRpcRestrictions, registerManagedRpcHandlers, type ManagedRpcHandlers } from '@/daemon/managedRpcHandlers';
 import type { ByosOfflineRpcHandlers } from '@/daemon/byosOfflineReceive';
+import type { DifficultyRoutingClassifierHost } from '@/daemon/difficultyRoutingClassifierHost';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { createRpcRequestListener } from './rpc/rpcRequestListener';
 import { detectCLIAvailability, CLIAvailability } from '@/utils/detectCLI';
@@ -522,6 +523,7 @@ type MachineRpcHandlers = {
      * on every request.
      */
     byosOfflineReceive?: ByosOfflineRpcHandlers;
+    difficultyRouting?: DifficultyRoutingClassifierHost;
 }
 
 /**
@@ -803,6 +805,7 @@ export class ApiMachineClient {
         checkpoint,
         byosOfflineReceive,
         linkSpawnedSession,
+        difficultyRouting,
     }: MachineRpcHandlers) {
         this.previewPortRegistry = portRegistry;
         this.resumeSessionHandler = resumeSession ?? null;
@@ -823,6 +826,12 @@ export class ApiMachineClient {
             this.rpcHandlerManager.registerHandler(
                 'byos-offline:deliver', byosOfflineReceive.deliver,
             );
+        }
+
+        if (difficultyRouting) {
+            this.rpcHandlerManager.registerHandler('difficulty-routing:classify', (params) => (
+                difficultyRouting.classify(params as never)
+            ));
         }
 
         if (checkpoint) {

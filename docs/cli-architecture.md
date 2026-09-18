@@ -400,3 +400,42 @@ not release independent blocks. This RPC is available from candidate .206 only a
 publication; Desktop scheduling is a separate consumer rollout. It does not install a
 background timer by itself. Revisit ownership if another privileged service takes over
 machine filesystem lifecycle; revert by removing the consumer calls before removing RPC.
+
+
+## Organization-shared difficulty routing
+
+`difficultyRoutingRuntime.ts` owns automatic Claude/Codex turn selection after a
+client supplies the versioned intent and a signed APlus user authorization. It
+validates the turn through the APlus API, applies P1, conditionally sends encrypted
+raw text for P2, and applies sticky/escalation policy within the allowed model
+snapshot. Manual selections and legacy messages retain their existing behavior.
+Selection state and the `difficulty-routing` session event are recorded after
+queue acceptance; client metadata is not an authoritative execution result.
+
+The daemon advertises its ephemeral host public key and polls the APlus host
+election endpoint. Only the elected, enabled shared machine prepares the pinned
+artifacts. `daemon/difficultyRoutingClassifierHost.ts` owns one worker, one native
+job, a bounded queue, revocation checks before decryption/dequeue, and process
+termination. A caller timeout never frees an active native slot. The worker starts
+before provider initialization with a minimal environment and receives no user or
+organization credential. Its process lifetime bounds native memory retention.
+The fixed fp32 model has measured worker RSS around 3.24 GiB on macOS arm64; this
+is not the size of the daemon or a cross-platform memory guarantee.
+
+Client authorization and runtime routing budgets are 250ms and 750ms respectively,
+with no classification retry. Failure preserves a validated P1 or legacy fallback,
+not a forged shared-classifier success. Explicit empty/malformed raw prompt
+overrides skip classification rather than falling back to wrapped system text.
+The APlus API origin is separate from the Happy relay origin. Revisit first-party
+worker ownership when a versioned headless Extension capability exists. Release
+artifact installation and model quality acceptance remain deployment gates; the
+feature defaults to OFF and this implementation does not change a release pin.
+
+The shared worker's `difficultyRoutingDecision.ts` validates both binary scores
+and applies the empirically selected hard threshold 0.1, tagged
+`binary-recall-v2-t010` after the artifact hash. Scores are not calibrated task
+probabilities. Shared P1 no longer treats bare Japanese/Chinese explanation
+requests as confidently trivial; Desktop's legacy OFF policy is unchanged.
+Independent synthetic evaluation found a small routing recall improvement, not
+95% P2 acceptance. Revisit the threshold only with separate development data and
+a fresh frozen evaluation; do not retune against the recorded test.

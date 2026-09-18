@@ -15,7 +15,7 @@
 import { createId, isCuid } from '@paralleldrive/cuid2';
 import * as z from 'zod';
 
-export const sessionRoleSchema = z.enum(['user', 'agent']);
+export const sessionRoleSchema = z.enum(['user', 'agent', 'session']);
 export type SessionRole = z.infer<typeof sessionRoleSchema>;
 
 export const sessionTextEventSchema = z.object({
@@ -106,6 +106,26 @@ export const sessionStopEventSchema = z.object({
   t: z.literal('stop'),
 });
 
+export const difficultyRoutingResultSchema = z.object({
+  version: z.literal(1),
+  clientRequestId: z.string().min(1),
+  mode: z.literal('auto'),
+  policyVersion: z.literal('org-shared-difficulty-routing.v1'),
+  policyRevision: z.number().int().min(0).nullable(),
+  model: z.string().min(1),
+  effort: z.string().min(1).nullable(),
+  difficulty: z.enum(['trivial', 'routine', 'hard', 'escalated']),
+  classifierSource: z.enum(['p1-local', 'p2-org-shared', 'p2-local', 'fallback-p1', 'manual-legacy']),
+  remoteStatus: z.enum(['ok', 'busy', 'not-ready', 'expired', 'revoked', 'unsupported', 'error']).optional(),
+  classifierRevision: z.string().min(1).optional(),
+});
+export type DifficultyRoutingResult = z.infer<typeof difficultyRoutingResultSchema>;
+
+export const sessionDifficultyRoutingEventSchema = z.object({
+  t: z.literal('difficulty-routing'),
+  result: difficultyRoutingResultSchema,
+});
+
 export const sessionEventSchema = z.discriminatedUnion('t', [
   sessionTextEventSchema,
   sessionServiceMessageEventSchema,
@@ -117,6 +137,7 @@ export const sessionEventSchema = z.discriminatedUnion('t', [
   sessionStartEventSchema,
   sessionTurnEndEventSchema,
   sessionStopEventSchema,
+  sessionDifficultyRoutingEventSchema,
 ]);
 
 export type SessionEvent = z.infer<typeof sessionEventSchema>;
@@ -154,6 +175,20 @@ export const sessionEnvelopeSchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: `${envelope.ev.t} events must use role "agent"`,
+        path: ['role'],
+      });
+    }
+    if (envelope.ev.t === 'difficulty-routing' && envelope.role !== 'session') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'difficulty-routing events must use role "session"',
+        path: ['role'],
+      });
+    }
+    if (envelope.ev.t !== 'difficulty-routing' && envelope.role === 'session') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'session role is reserved for session-owned events',
         path: ['role'],
       });
     }

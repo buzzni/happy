@@ -13,6 +13,15 @@ export const MessageMetaSchema = z.object({
   disallowedTools: z.array(z.string()).nullable().optional(),
   displayText: z.string().optional(),
   axStep: z.enum(['plan', 'design', 'free']).optional(),
+  difficultyRoutingIntent: z.object({
+    version: z.literal(1),
+    mode: z.literal('auto'),
+    policy: z.literal('org-shared-difficulty-routing.v1'),
+    clientRequestId: z.string(),
+    clientRouteSource: z.literal('default-auto'),
+  }).optional().catch(undefined),
+  difficultyRoutingPrompt: z.string().optional(),
+  difficultyRoutingAuthorization: z.string().optional(),
 });
 export type MessageMeta = z.infer<typeof MessageMetaSchema>;
 
