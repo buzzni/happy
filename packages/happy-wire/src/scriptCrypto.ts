@@ -68,7 +68,7 @@ export function decryptScriptValue(input: {
     const context = contextSchema.parse(input.context);
     const envelope = decode(input.recipient === 'viewer' ? encrypted.viewerKeyEnvelope : encrypted.machineKeyEnvelope);
     if (envelope.length !== 105 || envelope[0] !== 2) throw new Error();
-    key = nacl.box.open(envelope.subarray(57), envelope.subarray(33, 57), envelope.subarray(1, 33), input.secretKey);
+    key = nacl.box.open(envelope.subarray(57), envelope.subarray(33, 57), envelope.subarray(1, 33), input.secretKey) || null;
     if (!key || key.length !== 32) throw new Error();
     const bundle = decode(encrypted.ciphertext);
     if (bundle[0] !== 2 || bundle.length < 41) throw new Error();
