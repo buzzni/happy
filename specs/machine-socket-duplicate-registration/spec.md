@@ -66,6 +66,14 @@ specs/desktop-terminal-reliability). socket.io 재연결은 새 socket id 를 �
 07:20:21 open → 07:35:21 close   bytesIn=0  bytesOut=526
 ```
 
+세 번 모두 **정확히 900.0초**다. 처음에는 원인을 못 찾아 인프라 idle timeout 으로
+추정했는데, `daemonTerminalSessions.ts` 의
+`DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1000` 이 답이다. 입력도 출력도 유실되니
+`lastActivityAt` 이 갱신되지 않고, 15분 뒤 idle 워치독이 `session.terminate()` 를
+부른다. 이 경로는 `[REMOTE-TERMINAL] terminate session=` 을 남기지 않아 로그
+검색에 걸리지 않았다. 즉 **증상 하나가 아니라 둘이었다** — 프레임 유실(원인)과
+그로 인한 idle 종료(결과).
+
 ## 불변식
 
 > 한 머신에는 하나의 데몬이 있고, 따라서 서버에는 그 머신의 **살아 있는 소켓이
@@ -150,15 +158,8 @@ handshake 에서 걸러진다. 바뀌는 것은 **같은 사용자의 재연결�
 
 우선순위 순.
 
-1. **관측** (위 세 가지). 특히 터미널 세션이 정확히 900.0초에 닫히던 패턴 — 세 번
-   연속 정확히 같은 값이었는데 로그만으로는 원인을 못 찾았다. 데몬의
-   `killAllDaemonTerminalSessions` 도 `terminate session=` 도 찍히지 않았고 `TMOUT`
-   도 어디에도 없다(확인함). rebind 로 함께 사라지는지 먼저 본다.
-2. **`terminal-resume` 서버 구현.** 클라이언트는 이미 `seq` dedup, gap 감지,
-   `resume(afterSeq)`, snapshot 처리를 갖추고 `caps` 를 기다리고 있는데
-   (desktop `specs/desktop-terminal-reliability/` Phase 3) 서버가 안 내려줘 계속
-   legacy 로 돈다. 이번 rebind 는 그 아래 단계만 깔았으므로, 재접속 구간에 데몬이
-   뱉은 출력은 여전히 유실된다.
+1. **관측** (위 세 가지).
+2. ~~**`terminal-resume` 서버 구현.**~~ → `specs/terminal-resume/` 에서 구현했다.
 3. **폴링 부하 (P2).** 같은 21시간 로그에서 bash RPC 약 64,000건,
    `git fetch --unshallow --filter=blob:none` 7,945건, 폴링 대상 worktree 444개가
    관측됐다(디스크에는 aplus-dev-studio 1,030 / -desktop 342 / happy 197 디렉터리).
