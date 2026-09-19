@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime';
 import type { SandboxConfig } from '@/persistence';
+import shellquote from 'shell-quote';
+import { allowElectronInSeatbelt } from './electronSeatbelt';
 import {
     initializeSandbox,
     wrapCommand,
@@ -99,6 +101,19 @@ describe('sandbox manager', () => {
 
         expect(mockWrapWithSandbox).toHaveBeenCalledWith('node script.js');
         expect(wrapped).toBe('sandbox wrapped command');
+    });
+
+    it('wrapCommand opens the seatbelt for Electron GUI apps (macOS sandbox-exec wrapper)', async () => {
+        const profile = '(version 1)\n(deny default (with message "tag"))\n(allow process-exec)';
+        mockWrapWithSandbox.mockResolvedValue(
+            shellquote.quote(['env', 'SANDBOX_RUNTIME=1', 'sandbox-exec', '-p', profile, '/bin/zsh', '-c', 'electron .']),
+        );
+
+        const wrapped = await wrapCommand('electron .');
+
+        expect(wrapped).toBe(allowElectronInSeatbelt(await mockWrapWithSandbox.mock.results[0].value));
+        expect(wrapped).toContain('MachPortRendezvousServer');
+        expect(wrapped).toContain('com.apple.windowserver.active');
     });
 
     it('wrapForMcpTransport returns sh -c wrapped command', async () => {

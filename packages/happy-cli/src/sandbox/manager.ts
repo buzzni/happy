@@ -1,6 +1,7 @@
 import { SandboxManager } from '@anthropic-ai/sandbox-runtime';
 import type { SandboxConfig } from '@/persistence';
 import { buildSandboxRuntimeConfig } from './config';
+import { allowElectronInSeatbelt } from './electronSeatbelt';
 import type { SandboxPolicyMode } from './sandboxPolicy';
 
 export async function initializeSandbox(
@@ -18,7 +19,9 @@ export async function initializeSandbox(
 }
 
 export async function wrapCommand(command: string): Promise<string> {
-    return SandboxManager.wrapWithSandbox(command);
+    // macOS seatbelt 는 Electron 부팅에 필요한 mach 서비스를 닫아 둔다 — electronSeatbelt.ts 참조.
+    // Linux(bwrap) 등 다른 래퍼에는 손대지 않는다.
+    return allowElectronInSeatbelt(await SandboxManager.wrapWithSandbox(command));
 }
 
 export async function wrapForMcpTransport(
