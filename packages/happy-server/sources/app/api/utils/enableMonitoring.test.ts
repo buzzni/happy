@@ -1,3 +1,5 @@
+import { Readable } from "node:stream";
+
 import fastify from "fastify";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { enableMonitoring } from "./enableMonitoring";
@@ -134,6 +136,63 @@ describe("enableMonitoring hook timing", () => {
             expect(rejections).toEqual([]);
         },
     );
+});
+
+describe("enableMonitoring payload shapes", () => {
+    // 이 훅은 전 요청이 지나는 경로다. 직렬화를 건너뛰거나 본문이 없는 응답에서
+    // payload 를 잘못 되돌려주면 응답이 깨진다 — 프로덕션 배포 전 형태별로 고정한다.
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    async function buildApp() {
+        const app = fastify({ disableRequestLogging: true });
+        enableMonitoring(app as never);
+        app.get("/empty", async (_request, reply) => { reply.code(204); return null; });
+        app.get("/text", async (_request, reply) => { reply.type("text/plain"); return "hello"; });
+        app.get("/buffer", async (_request, reply) => { reply.type("application/octet-stream"); return Buffer.from("bytes"); });
+        app.get("/stream", async (_request, reply) => {
+            reply.type("text/plain");
+            return Readable.from(["chunk-a", "chunk-b"]);
+        });
+        await app.ready();
+        return app;
+    }
+
+    it("keeps a 204 empty response empty", async () => {
+        const app = await buildApp();
+        const response = await app.inject({ method: "GET", url: "/empty" });
+        expect(response.statusCode).toBe(204);
+        expect(response.body).toBe("");
+    });
+
+    it("passes a string payload through unchanged", async () => {
+        const app = await buildApp();
+        const response = await app.inject({ method: "GET", url: "/text" });
+        expect(response.statusCode).toBe(200);
+        expect(response.body).toBe("hello");
+    });
+
+    it("passes a Buffer payload through unchanged", async () => {
+        const app = await buildApp();
+        const response = await app.inject({ method: "GET", url: "/buffer" });
+        expect(response.statusCode).toBe(200);
+        expect(response.body).toBe("bytes");
+    });
+
+    it("passes a stream payload through unchanged", async () => {
+        const app = await buildApp();
+        const response = await app.inject({ method: "GET", url: "/stream" });
+        expect(response.statusCode).toBe(200);
+        expect(response.body).toBe("chunk-achunk-b");
+    });
+
+    it("answers HEAD without a body", async () => {
+        const app = await buildApp();
+        const response = await app.inject({ method: "HEAD", url: "/text" });
+        expect(response.statusCode).toBe(200);
+        expect(response.body).toBe("");
+    });
 });
 
 describe("enableMonitoring access logging", () => {
