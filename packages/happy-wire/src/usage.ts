@@ -47,7 +47,9 @@ export const UsageCostV1Schema = z.object({
  */
 export const AiAuthReportV1Schema = z.object({
     appliedSource: z.string().trim().max(64).nullish(),
-    connectionVersion: nonNegativeSafeInteger.nullish(),
+    // 상한은 수신 측 저장 컬럼(PostgreSQL INTEGER)에 맞춘다. 더 넓으면 부가
+    // metadata 하나 때문에 그 이벤트의 토큰 사용량까지 통째로 잃는다.
+    connectionVersion: nonNegativeSafeInteger.max(2_147_483_647).nullish(),
 }).strict();
 
 const providerUsageEventShape = {
