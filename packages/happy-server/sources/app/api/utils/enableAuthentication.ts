@@ -233,6 +233,12 @@ function replyAuthorizationUnavailable(reply: any, error: unknown) {
  */
 export async function requireAccountPrincipal(request: any, reply: any) {
     if (request.principal?.kind === 'account') return;
+    // 거절은 호출자에게만 보인다. 남겨 두지 않으면 "브라우저에서 터미널 승인이
+    // 안 된다" 같은 신고가 들어왔을 때 서버 쪽에 아무 흔적이 없다.
+    log(
+        { module: 'auth-decorator' },
+        `Auth refused - ${request.principal?.kind ?? 'unresolved'} principal on an account-only route: ${request.url}`,
+    );
     return reply.code(403).send({ error: 'Forbidden', reason: 'account-bearer-required' });
 }
 

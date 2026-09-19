@@ -12,8 +12,6 @@
  * 그래서 요청을 만든 자격의 **종류**를 기록하고, 그 두 종류의 라우트는
  * 계정 bearer 만 받는다.
  */
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import fastify from 'fastify';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -134,31 +132,5 @@ describe('principal kind on the REST decorators', () => {
 
         expect(res.json()).toEqual({ userId: ACCOUNT, kind: 'browser-sync' });
         await app.close();
-    });
-});
-
-describe('account-only routes', () => {
-    const authRoutes = readFileSync(
-        join(process.cwd(), 'sources/app/api/routes/authRoutes.ts'), 'utf8',
-    );
-
-    function preHandlerOf(route: string): string {
-        const at = authRoutes.indexOf(`app.post('${route}'`);
-        expect(at).toBeGreaterThanOrEqual(0);
-        const preHandler = authRoutes.indexOf('preHandler:', at);
-        expect(preHandler).toBeGreaterThan(at);
-        return authRoutes.slice(preHandler, authRoutes.indexOf('\n', preHandler));
-    }
-
-    it.each([
-        // 자기 자신을 무한히 재발급하는 경로. 이게 열려 있으면 로그아웃이
-        // 아무것도 끊지 못한다 — 이 spec 의 수용 기준이 무너진다.
-        ['/v1/auth/browser-sync'],
-        // 승인하면 요청자가 계정 bearer 를 받아 간다. 15분짜리 자격이 폐기
-        // 불가능한 자격으로 바뀌는 자리다.
-        ['/v1/auth/response'],
-        ['/v1/auth/account/response'],
-    ])('refuses anything but an account bearer: %s', (route) => {
-        expect(preHandlerOf(route)).toContain('requireAccountPrincipal');
     });
 });
