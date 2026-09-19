@@ -22,7 +22,7 @@
  * very object the UI drives — no fork of noVNC, no patched vendor tree.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 /** Where the bridge module lives inside the mirrored web root. */
@@ -232,21 +232,57 @@ export function ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode, onFall
         // it opens files per request: rebuilding one that is already correct
         // would 404 whatever asset is in flight for no gain.
         if (viewerWebRootIsCurrent({ sourceRoot, targetRoot, html, bridge })) return targetRoot
-        rmSync(targetRoot, { recursive: true, force: true })
-        mkdirSync(join(targetRoot, dirname(VIEWER_BRIDGE_PATH)), { recursive: true })
-        for (const entry of readdirSync(sourceRoot)) {
-            // Our own copies of both, so the page is patched whether it is
-            // reached as /vnc.html or as the directory index.
-            if (entry === 'vnc.html' || entry === 'index.html') continue
-            symlinkSync(join(sourceRoot, entry), join(targetRoot, entry))
+        // Built aside and swapped in, never in place: the slots already
+        // serving this directory must keep a complete tree if anything below
+        // throws halfway through.
+        const stagingRoot = `${targetRoot}.staging-${process.pid}-${Date.now().toString(36)}`
+        try {
+            rmSync(stagingRoot, { recursive: true, force: true })
+            mkdirSync(join(stagingRoot, dirname(VIEWER_BRIDGE_PATH)), { recursive: true })
+            for (const entry of readdirSync(sourceRoot)) {
+                // Our own copies of both, so the page is patched whether it is
+                // reached as /vnc.html or as the directory index.
+                if (entry === 'vnc.html' || entry === 'index.html') continue
+                symlinkSync(join(sourceRoot, entry), join(stagingRoot, entry))
+            }
+            writeFileSync(join(stagingRoot, 'vnc.html'), html)
+            writeFileSync(join(stagingRoot, 'index.html'), html)
+            writeFileSync(join(stagingRoot, VIEWER_BRIDGE_PATH), bridge)
+            swapViewerWebRoot({ stagingRoot, targetRoot })
+        } finally {
+            rmSync(stagingRoot, { recursive: true, force: true })
         }
-        writeFileSync(join(targetRoot, 'vnc.html'), html)
-        writeFileSync(join(targetRoot, 'index.html'), html)
-        writeFileSync(join(targetRoot, VIEWER_BRIDGE_PATH), bridge)
         return targetRoot
     } catch (error) {
         onFallback?.(String(error))
-        if (existsSync(targetRoot)) rmSync(targetRoot, { recursive: true, force: true })
+        // Deliberately leaves targetRoot untouched: it carries no slot
+        // identity, so removing it would 404 vnc.html and every asset for
+        // whichever slots are serving it right now — this start losing the
+        // enhancements must not take their screens down with it.
         return sourceRoot
     }
+}
+
+/**
+ * Moves a fully built staging tree into place.
+ *
+ * `renameSync` refuses a non-empty destination, so the live mirror is moved
+ * aside first and only dropped once the new tree has landed: a failure
+ * mid-swap puts the previous mirror back rather than leaving the slots
+ * serving it with nothing.
+ */
+function swapViewerWebRoot({ stagingRoot, targetRoot }: {
+    stagingRoot: string
+    targetRoot: string
+}): void {
+    const retiredRoot = `${targetRoot}.retired-${process.pid}-${Date.now().toString(36)}`
+    const retired = existsSync(targetRoot)
+    if (retired) renameSync(targetRoot, retiredRoot)
+    try {
+        renameSync(stagingRoot, targetRoot)
+    } catch (error) {
+        if (retired) renameSync(retiredRoot, targetRoot)
+        throw error
+    }
+    rmSync(retiredRoot, { recursive: true, force: true })
 }
