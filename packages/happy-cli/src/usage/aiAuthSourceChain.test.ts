@@ -15,7 +15,7 @@ describe('종단: 적용 원천이 이벤트까지 간다', () => {
     const env = applyAppliedAiAuthSourceEnv({
       ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
       ANTHROPIC_AUTH_TOKEN: 'x',
-    })
+    }, true)
     expect(env[HAPPY_AI_AUTH_SOURCE_ENV]).toBe('platform-glm')
     const event = createClaudeUsageEvent({ ...claudeArgs, env })
     expect(ProviderUsageEventV1Schema.safeParse(event).success).toBe(true)

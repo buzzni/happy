@@ -432,8 +432,18 @@ describe('applyAppliedAiAuthSourceEnv', () => {
             { PATH: '/usr/bin' },
             { ANTHROPIC_API_KEY: 'caller-key' },
             glmEnvironment,
-        ))
+        ), true)
         expect(child.HAPPY_AI_AUTH_SOURCE).toBe('platform-glm')
+    })
+
+    it('같은 Z.AI 환경이라도 임대를 적용하지 않았으면 플랫폼이라고 하지 않는다', () => {
+        // 개인 GLM 키가 같은 주소를 쓴다. 임대 여부는 daemon 만 안다.
+        const child = applyAppliedAiAuthSourceEnv(buildManagedSessionSpawnEnvironment(
+            { PATH: '/usr/bin' },
+            glmEnvironment,
+            {},
+        ))
+        expect(child.HAPPY_AI_AUTH_SOURCE).toBe('unknown')
     })
 
     it('does not claim a credential it cannot name when no managed credential applies', () => {
@@ -451,6 +461,7 @@ describe('applyAppliedAiAuthSourceEnv', () => {
         const beforeOverlay = { ANTHROPIC_BASE_URL: 'https://api.anthropic.com' }
         const child = applyAppliedAiAuthSourceEnv(
             overlayManagedCredentialEnvironment(beforeOverlay, glmEnvironment),
+            true,
         )
         expect(child.HAPPY_AI_AUTH_SOURCE).toBe('platform-glm')
     })
@@ -462,5 +473,18 @@ describe('applyAppliedAiAuthSourceEnv', () => {
             {},
         ))
         expect(child.HAPPY_AI_AUTH_SOURCE).toBe('unknown')
+    })
+})
+
+describe('부모 리뷰 수정: 연결 버전 잔재', () => {
+    it('원천을 새로 적을 때 이전 연결 버전을 남기지 않는다', () => {
+        // tmux 는 -e 로 덧씌울 뿐 전달하지 않은 변수를 지우지 않는다. 이전 세션의
+        // 버전이 남으면 새 원천과 옛 버전이 한 이벤트에 실린다.
+        const child = applyAppliedAiAuthSourceEnv({
+            PATH: '/usr/bin',
+            HAPPY_AI_AUTH_CONNECTION_VERSION: '99',
+        })
+        expect(child.HAPPY_AI_AUTH_SOURCE).toBe('unknown')
+        expect(child.HAPPY_AI_AUTH_CONNECTION_VERSION).toBeUndefined()
     })
 })

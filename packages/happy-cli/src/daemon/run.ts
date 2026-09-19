@@ -1968,7 +1968,7 @@ export async function startDaemon(): Promise<void> {
               managedAiCredentialEnvironment,
             ),
             requireInitialPromptAck,
-          ));
+          ), Object.keys(managedAiCredentialEnvironment).length > 0);
 
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
             sessionName: tmuxSessionName,
@@ -2066,7 +2066,7 @@ export async function startDaemon(): Promise<void> {
                 managedAiCredentialEnvironment,
               ),
               requireInitialPromptAck,
-            )),
+            ), Object.keys(managedAiCredentialEnvironment).length > 0),
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
             userHomeDir: stagedUserHomeDir,
@@ -2540,7 +2540,7 @@ export async function startDaemon(): Promise<void> {
               checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
             }
             : undefined,
-        ));
+        ), Object.keys(managedAiCredentialEnvironment).length > 0);
 
         const result = await spawnTrackedHappyProcess({
           args: launch.args,

@@ -71,9 +71,19 @@ describe('resolveAppliedAiAuthSource', () => {
         })).toBe('personal-api-key')
     })
 
-    it('recognises the Z.AI endpoint as the platform GLM route', () => {
+    it('does not read platform ownership out of the Z.AI endpoint', () => {
+        // 이 테스트는 원래 URL → platform-glm 을 고정하고 있었다. 개인 GLM 키가
+        // 같은 주소를 쓰므로 그 추론은 틀렸다 — 주소는 어느 wire 를 타는지를 말할 뿐
+        // 누구 자격으로 쓰는지를 말하지 않는다.
         expect(resolveAppliedAiAuthSource({
             env: { ANTHROPIC_BASE_URL: `${MANAGED_AI_AUTH_GLM_BASE_URL}/` },
+        })).toBe('unknown')
+    })
+
+    it('데몬이 체험 임대를 적용했다고 말할 때만 platform-glm 이다', () => {
+        expect(resolveAppliedAiAuthSource({
+            env: { ANTHROPIC_BASE_URL: `${MANAGED_AI_AUTH_GLM_BASE_URL}/` },
+            platformLeaseApplied: true,
         })).toBe('platform-glm')
     })
 
@@ -112,5 +122,46 @@ describe('readAiAuthConnectionVersion', () => {
         expect(readAiAuthConnectionVersion({
             [HAPPY_AI_AUTH_CONNECTION_VERSION_ENV]: value,
         })).toBeNull()
+    })
+})
+
+describe('부모 리뷰 수정: URL 은 소유권의 증거가 아니다', () => {
+    it('적어 둔 값은 임대 신호보다 우선한다 — 적어 둔 unknown 도 답이다', () => {
+        // "못 가른다" 고 적은 것을 뒤 레이어가 다시 추측하면 남의 키가 플랫폼
+        // 임대로 계량된다. 기록된 값이 없을 때만 임대 신호를 본다.
+        expect(resolveAppliedAiAuthSource({
+            env: {
+                [HAPPY_AI_AUTH_SOURCE_ENV]: 'unknown',
+                ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+            },
+            platformLeaseApplied: true,
+        })).toBe('unknown')
+    })
+
+    it('적어 둔 개인 키가 임대 신호를 이긴다', () => {
+        expect(resolveAppliedAiAuthSource({
+            env: { [HAPPY_AI_AUTH_SOURCE_ENV]: 'personal-api-key' },
+            platformLeaseApplied: true,
+        })).toBe('personal-api-key')
+    })
+
+    it('Z.AI 주소만으로는 플랫폼 임대라고 판정하지 않는다', () => {
+        expect(resolveAppliedAiAuthSource({
+            env: { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic' },
+        })).toBe('unknown')
+    })
+
+    it('daemon 이 체험 임대를 적용했다고 알려줄 때만 platform-glm 이다', () => {
+        expect(resolveAppliedAiAuthSource({
+            env: { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic' },
+            platformLeaseApplied: true,
+        })).toBe('platform-glm')
+    })
+
+    it('managed 봉투는 여전히 권위다', () => {
+        expect(resolveAppliedAiAuthSource({
+            env: { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic' },
+            managedAiAuthKind: 'personal-api-key',
+        })).toBe('personal-api-key')
     })
 })

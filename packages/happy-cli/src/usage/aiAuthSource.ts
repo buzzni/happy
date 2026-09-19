@@ -104,27 +104,35 @@ function isGlmBaseUrl(value: string | undefined): boolean {
  * The source this run is actually spending, in order of authority:
  *
  *  1. the managed envelope's `aiAuth.kind` — the parent already decided it and
- *     built the environment from it, so no fingerprint may overturn it;
- *  2. `HAPPY_AI_AUTH_SOURCE`, what the daemon knows and the child cannot see;
- *  3. an environment fingerprint, for what is unambiguous on its own.
+ *     built the environment from it, so nothing may overturn it;
+ *  2. `HAPPY_AI_AUTH_SOURCE`, what the daemon established and the child cannot
+ *     see for itself;
+ *  3. the daemon's own statement that it applied the platform's leased GLM
+ *     credential for this spawn.
  *
- * Only one fingerprint qualifies: Z.AI's Anthropic-compatible base URL, which
- * only the leased GLM route points at. `ANTHROPIC_API_KEY` deliberately does
- * **not** qualify — an organisation bundle and a person's own key are the same
- * variable, and telling them apart is exactly what layer 2 is for. Guessing
- * either one bills the wrong party.
+ * **No environment fingerprint qualifies.** An earlier revision read Z.AI's
+ * Anthropic-compatible base URL as proof of the leased GLM route; it is not.
+ * A person's own GLM key takes the same route — `applyPersonalApiKeyEnvironment`
+ * builds it with the same `buildZaiClaudeEnvironment` — so the URL says which
+ * wire the run uses, never whose credential pays for it. Reading it as platform
+ * ownership meters somebody's own key as ours.
+ *
+ * A written `unknown` is an answer, not a gap: the daemon looked and could not
+ * tell. Re-guessing past it is the same mistake one layer up.
  */
 export function resolveAppliedAiAuthSource(input: {
     env: Record<string, string | undefined>
     /** `envelope.aiAuth.kind`, for a managed Cloud run. */
     managedAiAuthKind?: string | null
+    /** The daemon applied the platform's leased GLM credential to this spawn. */
+    platformLeaseApplied?: boolean
 }): AiAuthSource {
     if (input.managedAiAuthKind !== undefined && input.managedAiAuthKind !== null) {
         return aiAuthSourceForManagedKind(input.managedAiAuthKind)
     }
-    const injected = normalizeAiAuthSource(input.env[HAPPY_AI_AUTH_SOURCE_ENV])
-    if (injected !== 'unknown') return injected
-    if (isGlmBaseUrl(input.env.ANTHROPIC_BASE_URL)) return 'platform-glm'
+    const raw = input.env[HAPPY_AI_AUTH_SOURCE_ENV]
+    if (typeof raw === 'string' && raw.trim() !== '') return normalizeAiAuthSource(raw)
+    if (input.platformLeaseApplied === true) return 'platform-glm'
     return 'unknown'
 }
 

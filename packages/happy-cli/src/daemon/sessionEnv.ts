@@ -27,6 +27,7 @@ import {
     readCheckpointSpawnContext,
 } from '@/checkpoint/checkpointSpawnContext'
 import {
+    HAPPY_AI_AUTH_CONNECTION_VERSION_ENV,
     HAPPY_AI_AUTH_SOURCE_ENV,
     resolveAppliedAiAuthSource,
 } from '@/usage/aiAuthSource'
@@ -226,8 +227,28 @@ export function buildResumedSessionSpawnEnvironment(input: {
  * source down as a personal subscription meters the run against somebody's own
  * plan.
  */
-export function applyAppliedAiAuthSourceEnv(env: Record<string, string>): Record<string, string> {
-    return { ...env, [HAPPY_AI_AUTH_SOURCE_ENV]: resolveAppliedAiAuthSource({ env }) }
+export function applyAppliedAiAuthSourceEnv(
+    env: Record<string, string>,
+    /**
+     * The daemon applied the platform's leased GLM credential to this spawn —
+     * `resolveManagedAiCredentialEnvironment` returned something. Only the
+     * daemon can say this: a person's own GLM key reaches the child through the
+     * same Z.AI variables, so the environment alone never proves ownership.
+     */
+    platformLeaseApplied = false,
+): Record<string, string> {
+    /*
+     * The version is dropped, not carried. tmux overlays `-e` onto an existing
+     * window environment and never deletes what the overlay omits, so a value
+     * left by an earlier session would ride along and pair a fresh source with
+     * a stale connection. Only a managed run has a version, and it writes its
+     * own (`applyManagedAiAuthReporting`).
+     */
+    const { [HAPPY_AI_AUTH_CONNECTION_VERSION_ENV]: _stale, ...rest } = env
+    return {
+        ...rest,
+        [HAPPY_AI_AUTH_SOURCE_ENV]: resolveAppliedAiAuthSource({ env, platformLeaseApplied }),
+    }
 }
 
 /**
