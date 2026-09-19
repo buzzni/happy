@@ -81,6 +81,10 @@ declare module 'fastify' {
          */
         managedGrant?: LiveGrant;
         startTime?: number;
+        /** 핸들러가 끝나고 직렬화가 시작되기 직전 (preSerialization). */
+        handlerDoneAt?: number;
+        /** 직렬화가 끝나고 소켓에 쓰기 직전 (onSend). */
+        serializedAt?: number;
     }
     interface FastifyInstance {
         authenticate: any;
