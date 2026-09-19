@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, readlinkSync, lstatSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import {
     buildViewerBridgeModule,
@@ -422,5 +422,34 @@ describe('ensureViewerWebRoot idempotence', () => {
 
         expect(existsSync(witness)).toBe(false)
         expect(existsSync(join(targetRoot, 'vendor'))).toBe(true)
+    })
+
+    // The mirror carries no slot identity, so every viewer slot's websockify
+    // is pointed at this one directory. Deleting it because a *later* start
+    // could not read noVNC would 404 vnc.html and every asset for the slots
+    // already serving it — the running screens die with nothing to rebuild
+    // them until the next start.
+    it('leaves the mirror other slots are serving alone when noVNC stops being patchable', () => {
+        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+        writeFileSync(join(sourceRoot, 'vnc.html'), '<html><body>no head</body></html>')
+
+        expect(ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })).toBe(sourceRoot)
+
+        expect(readFileSync(join(targetRoot, 'vnc.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
+        expect(existsSync(join(targetRoot, VIEWER_BRIDGE_PATH))).toBe(true)
+    })
+
+    // Same stake, failing one step later: the rebuild is what breaks, so the
+    // previous tree must still be there when it does.
+    it('keeps the previous mirror when the rebuild itself fails partway', () => {
+        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+        // A noVNC that ships its own directory where the bridge lives makes
+        // the symlink pass collide with the directory we just created.
+        mkdirSync(join(sourceRoot, dirname(VIEWER_BRIDGE_PATH)))
+
+        expect(ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'scale' })).toBe(sourceRoot)
+
+        expect(readFileSync(join(targetRoot, 'vnc.html'), 'utf8')).toContain("'resize', 'remote'")
+        expect(existsSync(join(targetRoot, VIEWER_BRIDGE_PATH))).toBe(true)
     })
 })

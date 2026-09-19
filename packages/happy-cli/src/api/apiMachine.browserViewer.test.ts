@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createServer, type Server } from 'node:net'
 
 const { browserMocks, viewerMocks, fsMocks, daemonMocks, leaseRegistryMocks, mockRunPairing } = vi.hoisted(() => ({
     browserMocks: {
@@ -15,7 +16,7 @@ const { browserMocks, viewerMocks, fsMocks, daemonMocks, leaseRegistryMocks, moc
         isViewerServing: vi.fn(),
     },
     daemonMocks: {
-        spawnDetached: vi.fn(() => ({ pid: 1234 })),
+        spawnDetached: vi.fn((_command: string, _args: string[], _env?: NodeJS.ProcessEnv) => ({ pid: 1234 })),
         ensureViewerWebRoot: vi.fn(() => '/usr/share/novnc'),
     },
     fsMocks: {
@@ -114,6 +115,37 @@ function rpcHandlers() {
             rotation: vi.fn(),
         },
     } as any
+}
+
+function spawnedCommands(): string[] {
+    return daemonMocks.spawnDetached.mock.calls.map(([command]) => command)
+}
+
+function spawnArgs(command: string): string[] | undefined {
+    return daemonMocks.spawnDetached.mock.calls.find(([name]) => name === command)?.[1]
+}
+
+/**
+ * Binds the given ports for the duration of a test.
+ *
+ * A port another service on this machine already holds reads the same way to
+ * `isPortFree`, so a refused listen is not a failure here.
+ */
+async function occupyPorts(ports: number[]): Promise<() => Promise<void>> {
+    const servers: Server[] = []
+    for (const port of ports) {
+        const server = createServer()
+        await new Promise<void>((resolve) => {
+            server.once('error', () => resolve())
+            server.listen(port, '127.0.0.1', resolve)
+        })
+        servers.push(server)
+    }
+    return async () => {
+        for (const server of servers) {
+            await new Promise<void>((resolve) => server.close(() => resolve()))
+        }
+    }
 }
 
 const ALICE_KEY = 'bv1_abcdefghijklmnopqrstuvwxyz012345'
@@ -226,6 +258,77 @@ describe('ApiMachineClient browser viewer RPC', () => {
         const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
 
         expect(result).toMatchObject({ webPort: 6080, browserReady: true })
+    })
+
+    // Everything below the reuse branch — which display server is spawned,
+    // the window manager that makes remote resizing safe, and the resize mode
+    // the page is seeded with — is only reachable when nothing is serving
+    // yet. With a lease seeded and isViewerServing true, every other test in
+    // this file returns at `reused: true` and never gets here.
+    describe('starting a viewer stack from nothing', () => {
+        let releasePorts: () => Promise<void>
+
+        beforeEach(async () => {
+            leaseRegistryMocks.records.clear()
+            viewerMocks.isViewerServing.mockResolvedValue(false)
+            // waitForPort reports what is actually bound, so real listeners on
+            // slot 0's ports stand in for the servers we are not spawning —
+            // without them the start blocks for the full 8s + 15s timeouts.
+            releasePorts = await occupyPorts([5900, 6080])
+        })
+
+        afterEach(async () => {
+            await releasePorts()
+        })
+
+        it('spawns TigerVNC with its clipboard helper and window manager, and asks for an exact fill', async () => {
+            viewerMocks.detectViewerCapabilities.mockResolvedValue({
+                hasXvnc: true,
+                hasXvfb: true,
+                hasX11vnc: true,
+                hasWebsockify: true,
+                hasWindowManager: true,
+                hasVncConfig: true,
+            })
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+
+            const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+            expect(spawnedCommands()).toEqual(['Xvnc', 'vncconfig', 'openbox', 'websockify'])
+            expect(daemonMocks.ensureViewerWebRoot).toHaveBeenCalledWith(
+                expect.objectContaining({ resizeMode: 'remote' }),
+            )
+            expect(spawnArgs('websockify')).toEqual(
+                ['--web', '/usr/share/novnc', '127.0.0.1:6080', '127.0.0.1:5900'],
+            )
+            expect(result).toMatchObject({ webPort: 6080, reused: false, ready: true })
+        }, 20_000)
+
+        // The legacy pair cannot honour SetDesktopSize, so the page must be
+        // seeded to scale instead: asking for an exact fill there leaves the
+        // original clipping in place.
+        it('spawns the legacy pair and stops asking for an exact fill', async () => {
+            viewerMocks.detectViewerCapabilities.mockResolvedValue({
+                hasXvnc: false,
+                hasXvfb: true,
+                hasX11vnc: true,
+                hasWebsockify: true,
+                hasWindowManager: false,
+            })
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+
+            const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+            expect(spawnedCommands()).toEqual(['Xvfb', 'x11vnc', 'websockify'])
+            expect(daemonMocks.ensureViewerWebRoot).toHaveBeenCalledWith(
+                expect.objectContaining({ resizeMode: 'scale' }),
+            )
+            expect(result).toMatchObject({ webPort: 6080, reused: false })
+        }, 20_000)
     })
 
     it('pairs a reused viewer Chrome on the exact CDP port before reporting bridge readiness', async () => {
