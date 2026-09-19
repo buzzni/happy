@@ -150,7 +150,6 @@ type ClaimedUserMessage = {
     attachmentsPromise: Promise<PendingAttachment[]>;
 };
 
-
 /**
  * Main entry point for the codex command with ink UI
  */

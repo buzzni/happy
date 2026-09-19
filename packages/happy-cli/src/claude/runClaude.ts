@@ -122,7 +122,6 @@ type ClaimedUserMessage = {
     attachmentsPromise: Promise<PendingAttachment[]>;
 };
 
-
 function safeUserMessageDebugPayload(message: UserMessage): UserMessage | Record<string, unknown> {
     if (!hasDifficultyRoutingSensitiveMeta(message)) return message;
     return {
