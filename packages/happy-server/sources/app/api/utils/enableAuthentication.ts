@@ -5,18 +5,6 @@ import type { Principal, SessionScopedTokenIssuer } from "@/app/auth/sessionScop
 import { authorizeManagedSessionRequest } from "@/app/managed/managedSessionAccess";
 import { resolveBrowserSyncRestPrincipal } from "./browserSyncRestAuth";
 
-/**
- * What actually resolved a request's bearer.
- *
- * `authenticate` sets `request.userId` for both account bearers and browser
- * sync credentials, on purpose: a route that only reads `userId` keeps
- * behaving exactly as before. But the two are not interchangeable everywhere —
- * a browser sync credential is bounded by its expiry, and a route that hands
- * back an account bearer would let it buy its way out of that bound. Such a
- * route reads this and refuses, via `refuseBrowserSyncPrincipal`.
- */
-export type AuthenticatedPrincipalKind = 'account' | 'browser-sync' | 'managed-session';
-
 export function enableAuthentication(app: Fastify) {
     app.decorate('authenticate', async function (request: any, reply: any) {
         try {
@@ -36,17 +24,28 @@ export function enableAuthentication(app: Fastify) {
             if (verified) {
                 debug({ module: 'auth-decorator' }, `Auth success - user: ${verified.userId}`);
                 request.userId = verified.userId;
-                request.principalKind = 'account' satisfies AuthenticatedPrincipalKind;
+                request.principal = {
+                    kind: 'account',
+                    accountId: verified.userId,
+                    ...(verified.extras !== undefined ? { extras: verified.extras } : {}),
+                };
                 return;
             }
 
             /*
              * A browser no longer carries the account bearer, so the same REST
              * surface it always used has to accept the short-lived credential
-             * it carries instead. This is not a narrower scope — it names the
-             * same account and authorises the same things — which is why it
-             * sits here rather than behind a per-route opt-in the way a managed
-             * session bearer does.
+             * it carries instead. It names the same account and authorises the
+             * same things, which is why it is resolved here rather than behind
+             * a per-route opt-in the way a managed session bearer is.
+             *
+             * It is still recorded as its own kind. Everything that makes it
+             * safe is its short life, and two kinds of route would undo that:
+             * the one that mints it (a browser could renew itself forever, and
+             * logout would stop cutting anything off) and the auth-approval
+             * routes (whoever is waiting on them receives an account bearer).
+             * Those say `requireAccountPrincipal`, which needs this field to
+             * be able to tell.
              *
              * The account verifier runs first and unchanged, so every existing
              * caller behaves exactly as before; only a bearer it rejects is
@@ -64,46 +63,11 @@ export function enableAuthentication(app: Fastify) {
 
             debug({ module: 'auth-decorator' }, `Auth success (browser sync) - user: ${browserSync.userId}`);
             request.userId = browserSync.userId;
-            request.principalKind = 'browser-sync' satisfies AuthenticatedPrincipalKind;
+            request.principal = { kind: 'browser-sync', accountId: browserSync.userId };
         } catch (error) {
             return reply.code(401).send({ error: 'Authentication failed' });
         }
     });
-}
-
-/**
- * Refuses a browser's sync credential on a route that issues account bearers.
- *
- * The credential is deliberately short-lived: expiry is the only thing that
- * bounds what a logged-out browser can still reach, because a signature cannot
- * express revocation. A route that mints this credential again, or that
- * approves a pending auth request whose collection endpoint answers with
- * `auth.createToken(...)`, converts that bounded credential into an unbounded
- * one — after which the bound it rests on is not enforced by anything.
- *
- * So those routes take this as a second `preHandler`, after `authenticate`:
- * `preHandler: [app.authenticate, refuseBrowserSyncPrincipal]`. It is opt-in
- * per route rather than a rule inside `authenticate` because `authenticate`
- * cannot know what a route does with the account it resolved.
- *
- * 403, not 401: the credential is valid and was understood. Answering 401
- * would tell a browser holding a good credential to throw it away and would
- * send it back through a login it does not need.
- *
- * The test is for the account kind, not against the browser one. Reached
- * without `authenticate` in front of it there is no kind at all, and the only
- * safe reading of that is refusal — a guard whose failure mode is to let the
- * request through protects nothing.
- */
-export async function refuseBrowserSyncPrincipal(request: any, reply: any) {
-    const kind: AuthenticatedPrincipalKind | undefined = request.principalKind;
-    if (kind !== 'account') {
-        log(
-            { module: 'auth-decorator' },
-            `Auth refused - ${kind ?? 'unresolved'} principal on an account-only route: ${request.url}`,
-        );
-        return reply.code(403).send({ error: 'Forbidden', reason: 'account-credential-required' });
-    }
 }
 
 /**
@@ -147,42 +111,29 @@ export function enableSessionScopeAuthentication(
         } catch (error) {
             return replyAuthorizationUnavailable(reply, error);
         }
-        /*
-         * The browser's sync credential resolves here too, for the same reason
-         * `authenticate` accepts it: a browser no longer carries the account
-         * bearer, and these routes — `/v2/sessions/lookup`, the `/v3` message
-         * and event reads, the attachment routes — are exactly the reads it
-         * has always made. Without this the routes a browser calls most would
-         * still answer 401 while the rest of the surface had been fixed.
-         *
-         * It takes the account shape because that is what it is: the same
-         * account, the same authorisation, a shorter life. It is never folded
-         * into the managed-session branch, which authorises per request against
-         * a grant this credential has none of. The kind is kept alongside so a
-         * route that issues account bearers can still refuse it.
-         */
-        let principalKind: AuthenticatedPrincipalKind = principal?.kind === 'managed-session'
-            ? 'managed-session'
-            : 'account';
         if (!principal) {
+            // The browser's own credential reaches these routes too. They are
+            // where its messages live — `/v3/sessions/:id/messages`,
+            // `/v2/sessions/lookup` — so leaving it out here does not make the
+            // browser safer, it makes reading and sending messages answer 401
+            // while every other route works. Resolved last, after both signed
+            // kinds, so no existing caller's path changes.
             const browserSync = await resolveBrowserSyncRestPrincipal({
                 token,
                 issuer: auth.browserSyncIssuer,
                 now: Date.now(),
             });
             if (browserSync) {
-                principal = { kind: 'account', accountId: browserSync.userId };
-                principalKind = 'browser-sync';
+                principal = { kind: 'browser-sync', accountId: browserSync.userId };
             }
         }
         if (!principal) {
             return reply.code(401).send({ error: 'Invalid token' });
         }
 
-        if (principal.kind === 'account') {
+        if (principal.kind === 'account' || principal.kind === 'browser-sync') {
             request.userId = principal.accountId;
             request.principal = principal;
-            request.principalKind = principalKind;
             return;
         }
 
@@ -214,7 +165,6 @@ export function enableSessionScopeAuthentication(
         // condition rather than a replacement for them.
         request.userId = principal.claims.accountId;
         request.principal = principal;
-        request.principalKind = principalKind;
         // The grant the request was authorised by, for handlers that must
         // answer *this* bearer rather than the account it acts for — a viewer
         // gets its own key envelope, and the owner's is not a substitute.
@@ -267,6 +217,29 @@ function replyAuthorizationUnavailable(reply: any, error: unknown) {
         `Authorization store unavailable (${classifyFailure(error)})`,
     );
     return reply.code(503).send({ error: 'Authorization unavailable' });
+}
+
+/**
+ * A route that only the account's own bearer may reach.
+ *
+ * Runs after `authenticate`, which has already said which kind of credential
+ * made the request. An allow-list, not a deny-list: a request that arrived
+ * without a recorded kind is refused too, because the alternative is that a
+ * future decorator which forgets to record one silently opens these routes.
+ *
+ * 403 rather than 401. The credential is valid; it just may not do this, and
+ * answering 401 would tell a healthy browser to throw away a good credential
+ * and send the user to a login screen.
+ */
+export async function requireAccountPrincipal(request: any, reply: any) {
+    if (request.principal?.kind === 'account') return;
+    // 거절은 호출자에게만 보인다. 남겨 두지 않으면 "브라우저에서 터미널 승인이
+    // 안 된다" 같은 신고가 들어왔을 때 서버 쪽에 아무 흔적이 없다.
+    log(
+        { module: 'auth-decorator' },
+        `Auth refused - ${request.principal?.kind ?? 'unresolved'} principal on an account-only route: ${request.url}`,
+    );
+    return reply.code(403).send({ error: 'Forbidden', reason: 'account-bearer-required' });
 }
 
 /**

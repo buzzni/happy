@@ -303,10 +303,19 @@ export async function createSessionScopedTokenIssuer(input: {
 /**
  * Who is making a request.
  *
- * The two kinds stay separate all the way to the call site. Flattening a
- * managed session onto a `userId` is what would let it inherit every route
- * written for an account holder.
+ * The kinds stay separate all the way to the call site. Flattening a managed
+ * session onto a `userId` is what would let it inherit every route written for
+ * an account holder.
+ *
+ * `browser-sync` names the same account as `account` and may do the same
+ * things — with one exception that is the whole reason it is a separate kind.
+ * Its safety rests on a short life that web-ui stops renewing at logout, so it
+ * must never reach a route that turns it into something longer-lived: neither
+ * its own mint route nor the auth-approval routes, which hand an account
+ * bearer to whoever is waiting on them. `requireAccountPrincipal` is how a
+ * route says so.
  */
 export type Principal =
     | { kind: 'account'; accountId: string; extras?: unknown }
+    | { kind: 'browser-sync'; accountId: string }
     | { kind: 'managed-session'; claims: SessionScopedClaims };

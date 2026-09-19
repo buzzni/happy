@@ -56,7 +56,7 @@ import { auth } from '@/app/auth/auth';
 import {
     enableAuthentication,
     enableSessionScopeAuthentication,
-    refuseBrowserSyncPrincipal,
+    requireAccountPrincipal,
     requireSessionScopeAuth,
 } from '@/app/api/utils/enableAuthentication';
 import { authRoutes } from '@/app/api/routes/authRoutes';
@@ -82,7 +82,7 @@ async function buildApp() {
     // 가드만 달고 `authenticate` 를 빠뜨린 라우트. 통과시키면 가드의 실패
     // 모드가 "그냥 들여보내기" 가 된다.
     typed.get('/spec/guard-without-authenticate', {
-        preHandler: refuseBrowserSyncPrincipal as never,
+        preHandler: requireAccountPrincipal as never,
     }, async () => ({ ok: true }));
     await instance.ready();
     return typed;
@@ -121,7 +121,7 @@ describe('browser sync credential on account-bearer-issuing routes', () => {
         });
 
         expect(response.statusCode).toBe(403);
-        expect(response.json()).toMatchObject({ reason: 'account-credential-required' });
+        expect(response.json()).toMatchObject({ reason: 'account-bearer-required' });
     });
 
     it('still mints for the account bearer the web app server holds', async () => {

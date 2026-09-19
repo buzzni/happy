@@ -3,7 +3,7 @@ import { type Fastify } from "../types";
 import * as privacyKit from "privacy-kit";
 import { db } from "@/storage/db";
 import { auth } from "@/app/auth/auth";
-import { refuseBrowserSyncPrincipal } from "@/app/api/utils/enableAuthentication";
+import { requireAccountPrincipal } from "@/app/api/utils/enableAuthentication";
 import { log } from "@/utils/log";
 
 export function authRoutes(app: Fastify) {
@@ -124,19 +124,15 @@ export function authRoutes(app: Fastify) {
         return reply.send({ status: 'pending', supportsV2: authRequest.supportsV2 });
     });
 
-    /*
-     * Approve a pending terminal auth request.
-     *
-     * Account bearer only. `/v1/auth/request` answers the approved terminal
-     * with `auth.createToken(...)`, so approving here is what causes an
-     * account bearer to be issued — and a browser sync credential is bounded
-     * by expiry precisely so that it cannot produce one. Approving a terminal
-     * from a browser that holds only the sync credential therefore needs a
-     * second proof; it is not something this route can grant on the strength
-     * of that credential alone.
-     */
+    // Approve auth request
+    //
+    // Approving hands `/v1/auth/request` an account bearer for whoever is
+    // polling it, so this may not be done with the browser's short-lived sync
+    // credential — that would turn a 15-minute credential into one nobody can
+    // revoke. web-ui approves through its own server, which holds the account
+    // bearer and checks the browser session first.
     app.post('/v1/auth/response', {
-        preHandler: [app.authenticate, refuseBrowserSyncPrincipal],
+        preHandler: [app.authenticate, requireAccountPrincipal],
         schema: {
             body: z.object({
                 response: z.string(),
@@ -221,17 +217,12 @@ export function authRoutes(app: Fastify) {
         return reply.send({ state: 'requested' });
     });
 
-    /*
-     * Approve a pending account auth request.
-     *
-     * Account bearer only, for the same reason as `/v1/auth/response`, and
-     * more sharply: `/v1/auth/account/request` is unauthenticated and, once
-     * approved, hands the waiting public key an unscoped `auth.createToken(...)`
-     * that nothing expires. A 15-minute credential must not be able to buy
-     * one.
-     */
+    // Approve account auth request
+    //
+    // Same reason as `/v1/auth/response`, and more directly: the account bearer
+    // `/v1/auth/account/request` returns is not even session-bound.
     app.post('/v1/auth/account/response', {
-        preHandler: [app.authenticate, refuseBrowserSyncPrincipal],
+        preHandler: [app.authenticate, requireAccountPrincipal],
         schema: {
             body: z.object({
                 response: z.string(),
@@ -272,14 +263,14 @@ export function authRoutes(app: Fastify) {
      * The bearer is the only proof required. A caller holding it can already do
      * everything this credential allows and more, so a second proof here would
      * protect nothing and would give the web app one more key to rotate.
+     *
+     * It must be the *account* bearer, and that is enforced rather than merely
+     * described: this credential now authenticates REST, so without the guard a
+     * browser could mint its own replacement forever and logout — which works by
+     * refusing to reissue — would stop cutting anything off.
      */
     app.post('/v1/auth/browser-sync', {
-        // The account bearer only — the doc comment above is the invariant,
-        // and `authenticate` alone no longer enforces it now that it accepts
-        // the sync credential too. Without this the credential renews itself:
-        // the reissue would stop depending on the web app's login session, and
-        // the residual window would no longer be one credential lifetime.
-        preHandler: [app.authenticate, refuseBrowserSyncPrincipal],
+        preHandler: [app.authenticate, requireAccountPrincipal],
         schema: {
             response: {
                 200: z.object({
