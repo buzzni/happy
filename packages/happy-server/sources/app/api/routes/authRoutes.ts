@@ -3,6 +3,7 @@ import { type Fastify } from "../types";
 import * as privacyKit from "privacy-kit";
 import { db } from "@/storage/db";
 import { auth } from "@/app/auth/auth";
+import { refuseBrowserSyncPrincipal } from "@/app/api/utils/enableAuthentication";
 import { log } from "@/utils/log";
 
 export function authRoutes(app: Fastify) {
@@ -123,9 +124,19 @@ export function authRoutes(app: Fastify) {
         return reply.send({ status: 'pending', supportsV2: authRequest.supportsV2 });
     });
 
-    // Approve auth request
+    /*
+     * Approve a pending terminal auth request.
+     *
+     * Account bearer only. `/v1/auth/request` answers the approved terminal
+     * with `auth.createToken(...)`, so approving here is what causes an
+     * account bearer to be issued — and a browser sync credential is bounded
+     * by expiry precisely so that it cannot produce one. Approving a terminal
+     * from a browser that holds only the sync credential therefore needs a
+     * second proof; it is not something this route can grant on the strength
+     * of that credential alone.
+     */
     app.post('/v1/auth/response', {
-        preHandler: app.authenticate,
+        preHandler: [app.authenticate, refuseBrowserSyncPrincipal],
         schema: {
             body: z.object({
                 response: z.string(),
@@ -210,9 +221,17 @@ export function authRoutes(app: Fastify) {
         return reply.send({ state: 'requested' });
     });
 
-    // Approve account auth request
+    /*
+     * Approve a pending account auth request.
+     *
+     * Account bearer only, for the same reason as `/v1/auth/response`, and
+     * more sharply: `/v1/auth/account/request` is unauthenticated and, once
+     * approved, hands the waiting public key an unscoped `auth.createToken(...)`
+     * that nothing expires. A 15-minute credential must not be able to buy
+     * one.
+     */
     app.post('/v1/auth/account/response', {
-        preHandler: app.authenticate,
+        preHandler: [app.authenticate, refuseBrowserSyncPrincipal],
         schema: {
             body: z.object({
                 response: z.string(),
@@ -255,7 +274,12 @@ export function authRoutes(app: Fastify) {
      * protect nothing and would give the web app one more key to rotate.
      */
     app.post('/v1/auth/browser-sync', {
-        preHandler: app.authenticate,
+        // The account bearer only — the doc comment above is the invariant,
+        // and `authenticate` alone no longer enforces it now that it accepts
+        // the sync credential too. Without this the credential renews itself:
+        // the reissue would stop depending on the web app's login session, and
+        // the residual window would no longer be one credential lifetime.
+        preHandler: [app.authenticate, refuseBrowserSyncPrincipal],
         schema: {
             response: {
                 200: z.object({

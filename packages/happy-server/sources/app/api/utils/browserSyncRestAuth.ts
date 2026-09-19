@@ -12,6 +12,11 @@
  *
  * 서명만으로는 폐기를 표현할 수 없다. 여기서 보는 것은 **만료**이고, 그것이
  * 로그아웃한 브라우저의 잔여 접근을 자격 수명으로 묶는 장치다.
+ *
+ * 그래서 예외가 하나 있다: **계정 bearer 를 발급하는 라우트**는 이 자격을
+ * 거절한다(`refuseBrowserSyncPrincipal`). 자격을 재발급하거나 대기 중인 auth
+ * 요청을 승인하게 두면 만료로 묶여 있던 것이 만료 없는 것으로 바뀌고, 위
+ * 전제가 그 순간 아무것도 묶지 못하게 된다.
  */
 import type { BrowserSyncTokenIssuer } from '@/app/auth/browserSyncToken';
 

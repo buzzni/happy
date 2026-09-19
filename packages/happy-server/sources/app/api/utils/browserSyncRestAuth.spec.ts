@@ -59,8 +59,12 @@ describe('REST decorator wiring', () => {
     it('offers a rejected bearer to the browser sync resolver', () => {
         // 위 단위 테스트는 헬퍼만 본다. 데코레이터가 이 헬퍼를 부르지 않으면
         // 그 테스트들은 통과하는데 브라우저는 여전히 401 을 받는다.
+        // `import.meta` 는 이 패키지의 tsconfig(`module: commonjs`)에서
+        // TS1343 이다. vitest 는 esbuild 로 넘겨 버려 통과하지만 `pnpm build`
+        // 가 `typecheck` 를 먼저 돌리므로 릴리스 시점에 터진다. vitest 는
+        // 패키지 루트를 cwd 로 잡으므로 거기서부터 짚는다.
         const decorator = readFileSync(
-            join(import.meta.dirname, 'enableAuthentication.ts'), 'utf8',
+            join(process.cwd(), 'sources/app/api/utils/enableAuthentication.ts'), 'utf8',
         );
 
         expect(decorator).toContain('resolveBrowserSyncRestPrincipal(');

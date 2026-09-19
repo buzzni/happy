@@ -5,6 +5,18 @@ import type { Principal, SessionScopedTokenIssuer } from "@/app/auth/sessionScop
 import { authorizeManagedSessionRequest } from "@/app/managed/managedSessionAccess";
 import { resolveBrowserSyncRestPrincipal } from "./browserSyncRestAuth";
 
+/**
+ * What actually resolved a request's bearer.
+ *
+ * `authenticate` sets `request.userId` for both account bearers and browser
+ * sync credentials, on purpose: a route that only reads `userId` keeps
+ * behaving exactly as before. But the two are not interchangeable everywhere —
+ * a browser sync credential is bounded by its expiry, and a route that hands
+ * back an account bearer would let it buy its way out of that bound. Such a
+ * route reads this and refuses, via `refuseBrowserSyncPrincipal`.
+ */
+export type AuthenticatedPrincipalKind = 'account' | 'browser-sync' | 'managed-session';
+
 export function enableAuthentication(app: Fastify) {
     app.decorate('authenticate', async function (request: any, reply: any) {
         try {
@@ -24,6 +36,7 @@ export function enableAuthentication(app: Fastify) {
             if (verified) {
                 debug({ module: 'auth-decorator' }, `Auth success - user: ${verified.userId}`);
                 request.userId = verified.userId;
+                request.principalKind = 'account' satisfies AuthenticatedPrincipalKind;
                 return;
             }
 
@@ -51,10 +64,46 @@ export function enableAuthentication(app: Fastify) {
 
             debug({ module: 'auth-decorator' }, `Auth success (browser sync) - user: ${browserSync.userId}`);
             request.userId = browserSync.userId;
+            request.principalKind = 'browser-sync' satisfies AuthenticatedPrincipalKind;
         } catch (error) {
             return reply.code(401).send({ error: 'Authentication failed' });
         }
     });
+}
+
+/**
+ * Refuses a browser's sync credential on a route that issues account bearers.
+ *
+ * The credential is deliberately short-lived: expiry is the only thing that
+ * bounds what a logged-out browser can still reach, because a signature cannot
+ * express revocation. A route that mints this credential again, or that
+ * approves a pending auth request whose collection endpoint answers with
+ * `auth.createToken(...)`, converts that bounded credential into an unbounded
+ * one — after which the bound it rests on is not enforced by anything.
+ *
+ * So those routes take this as a second `preHandler`, after `authenticate`:
+ * `preHandler: [app.authenticate, refuseBrowserSyncPrincipal]`. It is opt-in
+ * per route rather than a rule inside `authenticate` because `authenticate`
+ * cannot know what a route does with the account it resolved.
+ *
+ * 403, not 401: the credential is valid and was understood. Answering 401
+ * would tell a browser holding a good credential to throw it away and would
+ * send it back through a login it does not need.
+ *
+ * The test is for the account kind, not against the browser one. Reached
+ * without `authenticate` in front of it there is no kind at all, and the only
+ * safe reading of that is refusal — a guard whose failure mode is to let the
+ * request through protects nothing.
+ */
+export async function refuseBrowserSyncPrincipal(request: any, reply: any) {
+    const kind: AuthenticatedPrincipalKind | undefined = request.principalKind;
+    if (kind !== 'account') {
+        log(
+            { module: 'auth-decorator' },
+            `Auth refused - ${kind ?? 'unresolved'} principal on an account-only route: ${request.url}`,
+        );
+        return reply.code(403).send({ error: 'Forbidden', reason: 'account-credential-required' });
+    }
 }
 
 /**
@@ -98,6 +147,34 @@ export function enableSessionScopeAuthentication(
         } catch (error) {
             return replyAuthorizationUnavailable(reply, error);
         }
+        /*
+         * The browser's sync credential resolves here too, for the same reason
+         * `authenticate` accepts it: a browser no longer carries the account
+         * bearer, and these routes — `/v2/sessions/lookup`, the `/v3` message
+         * and event reads, the attachment routes — are exactly the reads it
+         * has always made. Without this the routes a browser calls most would
+         * still answer 401 while the rest of the surface had been fixed.
+         *
+         * It takes the account shape because that is what it is: the same
+         * account, the same authorisation, a shorter life. It is never folded
+         * into the managed-session branch, which authorises per request against
+         * a grant this credential has none of. The kind is kept alongside so a
+         * route that issues account bearers can still refuse it.
+         */
+        let principalKind: AuthenticatedPrincipalKind = principal?.kind === 'managed-session'
+            ? 'managed-session'
+            : 'account';
+        if (!principal) {
+            const browserSync = await resolveBrowserSyncRestPrincipal({
+                token,
+                issuer: auth.browserSyncIssuer,
+                now: Date.now(),
+            });
+            if (browserSync) {
+                principal = { kind: 'account', accountId: browserSync.userId };
+                principalKind = 'browser-sync';
+            }
+        }
         if (!principal) {
             return reply.code(401).send({ error: 'Invalid token' });
         }
@@ -105,6 +182,7 @@ export function enableSessionScopeAuthentication(
         if (principal.kind === 'account') {
             request.userId = principal.accountId;
             request.principal = principal;
+            request.principalKind = principalKind;
             return;
         }
 
@@ -136,6 +214,7 @@ export function enableSessionScopeAuthentication(
         // condition rather than a replacement for them.
         request.userId = principal.claims.accountId;
         request.principal = principal;
+        request.principalKind = principalKind;
         // The grant the request was authorised by, for handlers that must
         // answer *this* bearer rather than the account it acts for — a viewer
         // gets its own key envelope, and the owner's is not a substitute.
