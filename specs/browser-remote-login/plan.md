@@ -320,5 +320,7 @@ textarea 경로로 내려간다. (Chrome 은 첫 붙여넣기에서 클립보드
 
 - 이미 떠 있는 뷰어 스택은 재사용되므로 새 web root 와 Xvnc 로 **소급 전환되지
   않는다**. 스택이 죽거나 머신이 재시작한 뒤부터 적용된다.
-- x11vnc 백엔드의 클립보드는 RFB 표준 ClientCutText 라 Latin-1 만 안전하다.
-  UTF-8(한글) 붙여넣기는 확장 클립보드를 지원하는 Xvnc 백엔드에서만 온전하다.
+- x11vnc 백엔드의 클립보드는 RFB 표준 ClientCutText 라 Latin-1 만 전달된다 —
+  noVNC 가 0xff 를 넘는 코드포인트를 `?` 로 치환한다(core/rfb.js). 한글
+  붙여넣기가 온전한 것은 확장 클립보드를 쓰는 Xvnc 백엔드뿐이다. 레거시
+  머신에서 ASCII 붙여넣기는 실기로 확인했다(`legacy-ascii-42` 왕복).
