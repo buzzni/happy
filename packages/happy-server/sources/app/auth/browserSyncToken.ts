@@ -16,10 +16,37 @@
  * disagree about whether a browser is still logged in, and the logout would
  * depend on a call across services that can fail halfway.
  *
- * The residual window is therefore exactly `BROWSER_SYNC_MAX_TTL_MS`, and the
- * socket layer is what enforces it on a connection that is already open — a
- * credential checked only at connect would outlive the logout that was meant
- * to end it.
+ * ## What the lifetime actually bounds — and what it does not
+ *
+ * The credential itself stops working at `BROWSER_SYNC_MAX_TTL_MS`, and both
+ * enforcement points hold that line: REST verifies expiry per request, and the
+ * socket layer ends a connection that is already open (including one restored
+ * by connection state recovery, which skips the auth middleware — see
+ * `armBrowserSyncDeadline`).
+ *
+ * It does **not** follow that everything reachable with this credential dies
+ * with it. A route that hands back something with its own lifetime hands back
+ * that lifetime, not this one. Two kinds of route are therefore refused
+ * outright, via `requireAccountPrincipal`:
+ *
+ *   - routes that issue a longer-lived credential — `/v1/auth/browser-sync`
+ *     (it would renew itself, and logout would stop cutting anything off) and
+ *     the two auth-approval routes, whose collection endpoints answer with
+ *     `auth.createToken(...)`;
+ *   - routes that hand back a stored external secret (`/v1/connect/tokens`
+ *     and the two per-vendor `token` reads) or grant another account standing
+ *     authority (project member invite and role change).
+ *
+ * Known and **not** bounded by this credential's expiry, reviewed 2026-09-19
+ * and left as they are because each is already bounded on its own and capping
+ * them needs the expiry carried through every derivation:
+ *
+ *   - `/v1/preview-token` signs for 60 minutes;
+ *   - S3 upload/download signatures are 900 seconds from the call;
+ *   - the GitHub OAuth `state` is 5 minutes.
+ *
+ * Anything added here that issues or returns a credential must decide which of
+ * those two lists it belongs to.
  *
  * The service name is bound into privacy-kit's signature, so a token issued
  * here cannot be presented as an account bearer or a daemon credential even
@@ -36,9 +63,10 @@ const MAX_ID_LENGTH = 200;
 /**
  * The longest a browser sync credential may live.
  *
- * This is the residual exposure of a logout: the window between the web app
- * refusing to reissue and the socket actually falling off. Renewal is how a
- * browser stays connected, not a long lifetime.
+ * The window between the web app refusing to reissue and the socket actually
+ * falling off. Renewal is how a browser stays connected, not a long lifetime.
+ * It bounds the credential, not every credential derived through it — see the
+ * two lists above.
  */
 export const BROWSER_SYNC_MAX_TTL_MS = 15 * 60 * 1000;
 

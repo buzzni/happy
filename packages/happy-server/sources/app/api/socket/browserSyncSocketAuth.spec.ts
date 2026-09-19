@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { authenticateBrowserSyncSocket } from '@/app/api/socket/browserSyncSocketAuth';
+import { armBrowserSyncDeadline, authenticateBrowserSyncSocket } from '@/app/api/socket/browserSyncSocketAuth';
 import { createBrowserSyncTokenIssuer } from '@/app/auth/browserSyncToken';
 
 const NOW = 1_800_000_000_000;
@@ -73,3 +73,59 @@ describe('browser sync socket auth', () => {
         })).toBeNull();
     });
 });
+
+describe('armBrowserSyncDeadline', () => {
+    function fakeSocket(data: Record<string, unknown> = {}) {
+        const listeners: Record<string, (() => void)[]> = {};
+        return {
+            data,
+            disconnected: false,
+            disconnect(_close?: boolean) { this.disconnected = true; },
+            on(event: string, cb: () => void) { (listeners[event] ??= []).push(cb); },
+            fire(event: string) { for (const cb of listeners[event] ?? []) cb(); },
+        };
+    }
+
+    it('ends the connection when the credential expires', () => {
+        vi.useFakeTimers();
+        const socket = fakeSocket({ browserSyncExpiresAt: 10_000 });
+
+        expect(armBrowserSyncDeadline(socket as never, 4_000)).toBe('armed');
+        vi.advanceTimersByTime(5_999);
+        expect(socket.disconnected).toBe(false);
+        vi.advanceTimersByTime(1);
+
+        expect(socket.disconnected).toBe(true);
+        vi.useRealTimers();
+    });
+
+    it('ends a connection that is already past its credential', () => {
+        // socket.io 의 connection state recovery 는 **미들웨어를 건너뛰고**
+        // 복구한다(기본 `skipMiddlewares: true`). 그래서 복구된 소켓은 만료를
+        // 지난 자격으로 되살아날 수 있고, 그때 여기가 유일한 검사 지점이다.
+        const socket = fakeSocket({ browserSyncExpiresAt: 10_000 });
+
+        expect(armBrowserSyncDeadline(socket as never, 10_000)).toBe('expired');
+        expect(socket.disconnected).toBe(true);
+    });
+
+    it('leaves an account-bearer connection alone', () => {
+        const socket = fakeSocket({});
+
+        expect(armBrowserSyncDeadline(socket as never, 1_000)).toBe('none');
+        expect(socket.disconnected).toBe(false);
+    });
+
+    it('does not fire after the socket is already gone', () => {
+        vi.useFakeTimers();
+        const socket = fakeSocket({ browserSyncExpiresAt: 10_000 });
+        armBrowserSyncDeadline(socket as never, 0);
+
+        socket.fire('disconnect');
+        socket.disconnected = false;
+        vi.advanceTimersByTime(20_000);
+
+        expect(socket.disconnected).toBe(false);
+        vi.useRealTimers();
+    });
+})

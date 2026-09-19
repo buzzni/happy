@@ -43,6 +43,10 @@ async function makeApp() {
     const typed = app.withTypeProvider<ZodTypeProvider>() as unknown as Fastify;
     typed.decorate('authenticate', async (request: any) => {
         request.userId = 'owner-1';
+        // 실제 데코레이터와 같은 모양으로 둔다. `requireAccountPrincipal` 은
+        // 종류가 기록되지 않은 요청을 거절하므로(allow-list), `userId` 만
+        // 세우는 stand-in 은 역할 변경 라우트에서 403 이 된다.
+        request.principal = { kind: 'account', accountId: 'owner-1' };
     });
     projectRoutes(typed);
     projectMemberRoutes(typed);
