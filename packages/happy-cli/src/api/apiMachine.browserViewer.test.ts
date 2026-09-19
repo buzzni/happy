@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { browserMocks, viewerMocks, fsMocks, leaseRegistryMocks, mockRunPairing } = vi.hoisted(() => ({
+const { browserMocks, viewerMocks, fsMocks, daemonMocks, leaseRegistryMocks, mockRunPairing } = vi.hoisted(() => ({
     browserMocks: {
         detectChrome: vi.fn(),
         isCdpReachable: vi.fn(),
@@ -11,8 +11,12 @@ const { browserMocks, viewerMocks, fsMocks, leaseRegistryMocks, mockRunPairing }
         },
     },
     viewerMocks: {
-        detectMissingViewerTools: vi.fn(),
+        detectViewerCapabilities: vi.fn(),
         isViewerServing: vi.fn(),
+    },
+    daemonMocks: {
+        spawnDetached: vi.fn(() => ({ pid: 1234 })),
+        ensureViewerWebRoot: vi.fn(() => '/usr/share/novnc'),
     },
     fsMocks: {
         readdir: vi.fn(),
@@ -48,8 +52,15 @@ vi.mock('@/daemon/browserSetup', async (importOriginal) => ({
 
 vi.mock('@/daemon/remoteViewer', async (importOriginal) => ({
     ...await importOriginal<typeof import('@/daemon/remoteViewer')>(),
-    detectMissingViewerTools: viewerMocks.detectMissingViewerTools,
+    detectViewerCapabilities: viewerMocks.detectViewerCapabilities,
     isViewerServing: viewerMocks.isViewerServing,
+    // Real spawns would fork Xvnc/openbox off the test runner.
+    spawnDetached: daemonMocks.spawnDetached,
+}))
+
+vi.mock('@/daemon/viewerWebRoot', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/daemon/viewerWebRoot')>(),
+    ensureViewerWebRoot: daemonMocks.ensureViewerWebRoot,
 }))
 
 vi.mock('@/commands/browserPair', async (importOriginal) => ({
@@ -126,7 +137,13 @@ describe('ApiMachineClient browser viewer RPC', () => {
         vi.clearAllMocks()
         leaseRegistryMocks.records.clear()
         leaseRegistryMocks.records.set(ALICE_KEY, lease(ALICE_KEY, 0))
-        viewerMocks.detectMissingViewerTools.mockResolvedValue([])
+        viewerMocks.detectViewerCapabilities.mockResolvedValue({
+            hasXvnc: true,
+            hasXvfb: true,
+            hasX11vnc: true,
+            hasWebsockify: true,
+            hasWindowManager: true,
+        })
         viewerMocks.isViewerServing.mockResolvedValue(true)
         browserMocks.detectChrome.mockResolvedValue({
             path: '/usr/bin/google-chrome',
@@ -171,6 +188,44 @@ describe('ApiMachineClient browser viewer RPC', () => {
         } finally {
             now.mockRestore()
         }
+    })
+
+    // The screen cannot open without a display server, and the failure has to
+    // reach the user as one — quietly handing back a dead port is how this
+    // feature looked broken before (2026-08-14).
+    it('refuses to start when the machine has no display server at all', async () => {
+        viewerMocks.detectViewerCapabilities.mockResolvedValue({
+            hasXvnc: false,
+            hasXvfb: false,
+            hasX11vnc: false,
+            hasWebsockify: true,
+            hasWindowManager: false,
+        })
+        const { ApiMachineClient } = await import('./apiMachine')
+        const client = new ApiMachineClient('token', machineClient())
+        client.setRPCHandlers(rpcHandlers())
+
+        await expect(handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY }))
+            .rejects.toThrow(/Xvnc/)
+    })
+
+    // Xvfb + x11vnc is the older pair; it still runs the screen, so a machine
+    // that has it must never be told to install anything.
+    it('starts on a machine that only has the legacy Xvfb and x11vnc pair', async () => {
+        viewerMocks.detectViewerCapabilities.mockResolvedValue({
+            hasXvnc: false,
+            hasXvfb: true,
+            hasX11vnc: true,
+            hasWebsockify: true,
+            hasWindowManager: false,
+        })
+        const { ApiMachineClient } = await import('./apiMachine')
+        const client = new ApiMachineClient('token', machineClient())
+        client.setRPCHandlers(rpcHandlers())
+
+        const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+        expect(result).toMatchObject({ webPort: 6080, browserReady: true })
     })
 
     it('pairs a reused viewer Chrome on the exact CDP port before reporting bridge readiness', async () => {
@@ -364,9 +419,9 @@ describe('ApiMachineClient browser viewer RPC', () => {
     })
 
     it('shares one in-flight viewer start across concurrent RPC calls', async () => {
-        let releaseToolProbe: (missing: string[]) => void = () => {}
-        viewerMocks.detectMissingViewerTools.mockReturnValueOnce(new Promise((resolve) => {
-            releaseToolProbe = resolve
+        let releaseCapabilityProbe: (caps: any) => void = () => {}
+        viewerMocks.detectViewerCapabilities.mockReturnValueOnce(new Promise((resolve) => {
+            releaseCapabilityProbe = resolve
         }))
         const { ApiMachineClient } = await import('./apiMachine')
         const client = new ApiMachineClient('token', machineClient())
@@ -376,9 +431,15 @@ describe('ApiMachineClient browser viewer RPC', () => {
         const first = start({ viewerKey: ALICE_KEY })
         const second = start({ viewerKey: ALICE_KEY })
         await vi.waitFor(() => {
-            expect(viewerMocks.detectMissingViewerTools).toHaveBeenCalledTimes(1)
+            expect(viewerMocks.detectViewerCapabilities).toHaveBeenCalledTimes(1)
         })
-        releaseToolProbe([])
+        releaseCapabilityProbe({
+            hasXvnc: true,
+            hasXvfb: true,
+            hasX11vnc: true,
+            hasWebsockify: true,
+            hasWindowManager: true,
+        })
 
         await expect(Promise.all([first, second])).resolves.toHaveLength(2)
         expect(mockRunPairing).toHaveBeenCalledTimes(1)

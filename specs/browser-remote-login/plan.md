@@ -216,3 +216,109 @@ Chrome 창이 같은 값을 읽는다. 창 크기는 **우리가 소유한 디�
 
 검증: buildChromeLaunchArgs/VIEWER_SCREEN 신규 테스트 4개(수정 전 3개 red),
 viewer·browser 관련 10개 파일 189개 통과, CLI typecheck/build 통과.
+
+## 2026-09-19 — 창을 꽉 채우지 못하고 붙여넣기가 안 되던 문제
+
+사용자 보고 두 가지. ① 원격 화면이 브라우저를 채우지 못한다(오른쪽이 잘리고
+위아래가 검다). ② 로컬에서 복사한 값을 화면 안에 붙여넣을 수 없다.
+
+### 원인
+
+| 증상 | 원인 |
+|---|---|
+| 잘림 + 검은 띠 | noVNC 의 `resize` 기본값이 `off` 라 1920x1080 을 원본 크기로 그린다. 뷰어 창이 그보다 좁으면 잘리고, 낮으면 레터박스가 된다 |
+| ⌘V/Ctrl+V 무반응 | noVNC 가 캔버스의 모든 keydown 에 `preventDefault()` 를 건다(`core/input/keyboard.js` 의 `stopEvent`). 브라우저가 `paste` 이벤트를 아예 만들지 않는다. macOS 에서는 Meta 가 Alt 로 매핑돼 원격에 Ctrl+V 가 가지도 않는다 |
+
+둘 다 URL 파라미터로는 못 고친다 — 사용자는 `/vnc.html` 링크를 그대로
+북마크하거나 붙여 넣는다.
+
+### 결정 1 — 정확히 채우려면 서버를 바꿔야 한다
+
+x11vnc 소스에는 `setDesktopSizeHook` 자체가 없다(`src/screen.c`, `src/xrandr.c`
+확인). 즉 클라이언트가 `SetDesktopSize` 를 보내도 조용히 무시된다 — `resize=remote`
+를 켜 봐야 잘린 화면 그대로다. TigerVNC 의 `Xvnc` 는 이 요청을 받으므로
+Xvfb+x11vnc 쌍을 Xvnc 하나로 대체한다.
+
+화면만 리사이즈해서는 부족하다. 이 디스플레이에는 WM 이 없고 Chrome 창 크기는
+기동 시점이 최종이라(2026-09-14 실측), 화면만 커지면 브라우저가 그 일부만
+덮는다 — 스케일보다 나쁘다. openbox 를 함께 띄우는 이유는 하나다:
+`screen_resize()` 가 RandR 변경 때 모든 클라이언트를 `client_reconfigure()` 로
+다시 맞춘다(openbox `screen.c` 확인). rc.xml 로 모든 창을 maximized·decor 없음
+으로 강제해 브라우저가 화면을 정확히 덮게 한다.
+
+따라서 `selectViewerBackend` 는 **Xvnc 와 WM 이 둘 다 있을 때만** `remote` 를
+고르고, 하나라도 없으면 `scale` 로 내려간다. 이미 도는 Xvfb/x11vnc 머신은
+계속 동작한다(잘림 없이 축소).
+
+### 결정 2 — 페이지를 우리가 서빙한다
+
+`/usr/share/novnc` 를 쓰기 가능한 디렉터리로 미러링한다(자산은 전부 symlink,
+페이지만 우리 것). 페이지는 ① `resize` 기본값을 백엔드가 실제로 지원하는
+값으로 seed 하고(사용자가 설정 패널에서 고른 값은 덮지 않는다) ② 브리지
+모듈을 로드한다.
+
+브리지는 noVNC 의 `RFB` 객체를 **noVNC 자신이 import 하는 모듈 URL 을 그대로
+import** 해서 얻는다 — ES 모듈은 URL 당 싱글턴이라 같은 `UI` 객체다. noVNC 를
+포크하거나 vendor 트리를 패치하지 않는다.
+
+붙여넣기 경로: window capture 단계에서 ⌘V/Ctrl+V 를 가로채
+(`stopImmediatePropagation` 으로 noVNC 의 preventDefault 를 앞지른다) 숨긴
+textarea 에 포커스를 준다 → 브라우저가 native `paste` 를 그 textarea 에 쏜다 →
+`clipboardPasteFrom()` 으로 원격 클립보드를 채우고 원격에 Ctrl+V 키를 합성한
+뒤 포커스를 화면에 돌려준다. 권한 팝업(`navigator.clipboard.readText`)이
+필요 없는 경로다. 반대 방향(원격→로컬)은 `clipboard` 이벤트를
+`navigator.clipboard.writeText` 로 넘기되 거부되면 사유를 로그한다.
+
+### 실기에서 배운 것 두 가지 (설계를 바꿨다)
+
+**① 숨긴 textarea 에 포커스를 주는 붙여넣기 경로는 Chrome 에서 동작하지 않는다.**
+처음 구현은 keydown 을 가로채 숨긴 textarea 에 포커스를 주고 브라우저의 native
+`paste` 를 받는 방식이었다. 컨테이너 실기에서 `paste` 이벤트가 **아예 발생하지
+않았다** — Chrome 은 단축키를 처리하는 시점의 포커스 대상을 기준으로 붙여넣기를
+정하고, 캔버스는 편집 가능한 요소가 아니라 붙여넣을 곳이 없다고 본다. 그래서
+`navigator.clipboard.readText()` 를 1순위로 쓰고, 거부되거나 없는 브라우저에서만
+textarea 경로로 내려간다. (Chrome 은 첫 붙여넣기에서 클립보드 읽기 권한을 한 번
+묻는다.)
+
+**② TigerVNC 는 vncconfig 없이는 X 클립보드를 소유하지 않는다.**
+`clipboardPasteFrom` 이 실제로 호출되고 RFB 로도 나갔는데 원격에는 아무것도
+붙지 않았다. 원인은 Xvnc 가 클립보드를 X 로 넘기는 일을 자기 안에서 하지 않고
+`vncconfig` 헬퍼에 맡기기 때문이다. 확인:
+
+| 상태 | `xclip -o -selection clipboard` |
+|---|---|
+| vncconfig 없음 | selection 소유자 자체가 없음 (`target TARGETS not available`) |
+| `vncconfig -nowin` 실행 | 텍스트가 그대로 나옴, targets 에 `UTF8_STRING` 포함 |
+
+그래서 Xvnc 백엔드에는 `vncconfig -nowin` 을 함께 띄운다. 없으면 화면은
+멀쩡한데 붙여넣기만 조용히 안 되므로, 바이너리가 없을 때는 그 사실을 로그로
+남긴다.
+
+### 검증
+
+- 유닛: `viewerWebRoot` 23개(신규), `remoteViewer` 51개, viewer API 34개 —
+  관련 7파일 137개 통과 + CLI 빌드(`tsc --noEmit`) 통과.
+- 뮤테이션 5건 전부 kill: capture 플래그 / `stopImmediatePropagation` /
+  paste 후 포커스 복구 / `index.html` 미패치 / 도구 누락 시 start 차단.
+- **컨테이너 실기** (debian bookworm + tigervnc-standalone-server·openbox·
+  websockify·novnc, 실제 daemon 모듈을 Node 24 타입 스트리핑으로 그대로 실행,
+  호스트의 진짜 Chrome 이 클라이언트):
+
+  | 확인 | 결과 |
+  |---|---|
+  | 백엔드 판정 | Xvnc + openbox 감지 → `resizeMode: 'remote'` |
+  | 페이지 seed | `localStorage.resize === 'remote'` |
+  | 원격 해상도 | 1920x1080 → **1100x820** (뷰어 뷰포트와 동일) |
+  | 창 재맞춤 | openbox 가 창을 **1100x820+0+0** 으로, 장식 없이 |
+  | 붙여넣기 | ⌘V/Ctrl+V → 원격 X CLIPBOARD 에 그대로, `UTF8_STRING` 포함 |
+  | 한글 | `붙여넣기 한글 테스트 42` 왕복 성공 |
+
+  주의: TigerVNC 의 확장 클립보드는 **지연 전송**이라 뷰어가 연결돼 있는 동안만
+  selection 이 유효하다. 연결을 끊은 뒤 조회하면 비어 보이는 것이 정상이다.
+
+### 알려진 한계
+
+- 이미 떠 있는 뷰어 스택은 재사용되므로 새 web root 와 Xvnc 로 **소급 전환되지
+  않는다**. 스택이 죽거나 머신이 재시작한 뒤부터 적용된다.
+- x11vnc 백엔드의 클립보드는 RFB 표준 ClientCutText 라 Latin-1 만 안전하다.
+  UTF-8(한글) 붙여넣기는 확장 클립보드를 지원하는 Xvnc 백엔드에서만 온전하다.

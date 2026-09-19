@@ -107,8 +107,8 @@ import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
 import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
 import { validatePath } from '@/modules/common/pathSecurity';
-import { existsSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { exec } from 'node:child_process';
@@ -125,9 +125,13 @@ import {
     resolveProfileUserDataDir,
 } from '@/daemon/browserSetup';
 import {
+    buildOpenboxArgs,
+    buildOpenboxConfig,
+    buildVncConfigArgs,
     buildWebsockifyArgs,
     buildX11vncArgs,
     buildXvfbArgs,
+    buildXvncArgs,
     VIEWER_SCREEN,
     VIEWER_SLOTS,
     VIEWER_VNC_PORTS,
@@ -138,7 +142,11 @@ import {
     readFlagFromCmdline,
     summariseViewerBrowser,
     type ViewerBrowserSummary,
-    detectMissingViewerTools,
+    detectViewerCapabilities,
+    desiredViewerTools,
+    missingViewerTools,
+    selectViewerBackend,
+    type ViewerBackend,
     isViewerServing,
     planViewerInstall,
     resolveViewerProfileDir,
@@ -151,6 +159,7 @@ import {
     BrowserViewerLeaseRegistry,
     type BrowserViewerLeaseRecord,
 } from '@/daemon/browserViewerLeaseRegistry';
+import { ensureViewerWebRoot } from '@/daemon/viewerWebRoot';
 import { BrowserSessionBrokerClient } from '@/daemon/browserSessionBrokerContract';
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken';
 import { deriveBrowserViewerBridgeToken } from '@/daemon/browserBridge';
@@ -1408,19 +1417,30 @@ export class ApiMachineClient {
         // bridge's own click/fill are ref-based and cannot drive a captcha,
         // which is why this exists. See specs/browser-remote-login/.
         this.rpcHandlerManager.registerHandler('browser-viewer:status', async () => {
-            const missing = await detectMissingViewerTools();
+            const capabilities = await detectViewerCapabilities();
+            const missing = missingViewerTools(capabilities);
+            // `upgradable` is not `missing`: the screen works without these,
+            // it just cannot size itself to the viewer's window.
+            const upgradable = missing.length === 0 ? desiredViewerTools(capabilities) : [];
             return {
                 installed: missing.length === 0,
                 missing,
-                canSudo: missing.length === 0 ? false : await canSudoWithoutPassword(),
+                canSudo: missing.length === 0 && upgradable.length === 0
+                    ? false
+                    : await canSudoWithoutPassword(),
                 running: this.viewer !== null,
                 webPort: this.viewer?.webPort ?? null,
                 display: this.viewer?.display ?? null,
+                fill: selectViewerBackend(capabilities)?.resizeMode === 'remote' ? 'exact' : 'scaled',
+                upgradable,
             };
         });
 
         this.rpcHandlerManager.registerHandler('browser-viewer:install', async () => {
-            const missing = await detectMissingViewerTools();
+            // Installs the whole modern stack, not only what blocks the
+            // screen: the user has already accepted a package change here,
+            // and this is what turns a scaled screen into an exact fit.
+            const missing = desiredViewerTools(await detectViewerCapabilities());
             const plan = planViewerInstall({
                 missing,
                 canSudo: missing.length === 0 ? true : await canSudoWithoutPassword(),
@@ -1431,7 +1451,7 @@ export class ApiMachineClient {
                 return plan;
             }
             const result = await runShell(plan.command);
-            const stillMissing = await detectMissingViewerTools();
+            const stillMissing = missingViewerTools(await detectViewerCapabilities());
             return {
                 action: 'run',
                 command: plan.command,
@@ -2107,7 +2127,7 @@ export class ApiMachineClient {
     private async startViewerStackOnce(
         options: { callerWillLaunchBrowser?: boolean } = {},
     ): Promise<ViewerStackStartResult> {
-        const missing = await detectMissingViewerTools();
+        const missing = missingViewerTools(await detectViewerCapabilities());
         if (missing.length > 0) {
             throw new Error(`원격 화면에 필요한 프로그램이 없습니다: ${missing.join(', ')}`);
         }
@@ -2148,12 +2168,9 @@ export class ApiMachineClient {
         if (vncPort === null || webPort === null) {
             throw new Error('원격 화면에 쓸 포트를 찾지 못했습니다.');
         }
-        spawnDetached('Xvfb', buildXvfbArgs({ display, ...VIEWER_SCREEN }));
-        await delay(1500);
-        spawnDetached('x11vnc', buildX11vncArgs({ display, vncPort }));
-        await delay(800);
+        const shared = await this.startViewerDisplay(display, vncPort);
         spawnDetached('websockify', buildWebsockifyArgs({
-            webPort, vncPort, webRoot: resolveNovncWebRoot(),
+            webPort, vncPort, webRoot: shared.webRoot,
         }));
         const ready = await waitForPort(webPort, 15_000);
         this.viewer = { display, vncPort, webPort };
@@ -2231,7 +2248,7 @@ export class ApiMachineClient {
     }
 
     private async startIsolatedViewerStackOnce(viewerKey: string): Promise<IsolatedViewerStartResult> {
-        const missing = await detectMissingViewerTools();
+        const missing = missingViewerTools(await detectViewerCapabilities());
         if (missing.length > 0) {
             throw new Error(`원격 화면에 필요한 프로그램이 없습니다: ${missing.join(', ')}`);
         }
@@ -2291,14 +2308,11 @@ export class ApiMachineClient {
 
         const profileDir = resolveViewerProfileDir(configuration.happyHomeDir, viewerKey);
         mkdirSync(profileDir, { recursive: true, mode: 0o700 });
-        const xvfb = spawnDetached('Xvfb', buildXvfbArgs({ display: slot.display, ...VIEWER_SCREEN }));
-        await delay(1500);
-        const x11vnc = spawnDetached('x11vnc', buildX11vncArgs({ display: slot.display, vncPort: slot.vncPort }));
-        await delay(800);
+        const isolated = await this.startViewerDisplay(slot.display, slot.vncPort);
         const websockify = spawnDetached('websockify', buildWebsockifyArgs({
             webPort: slot.webPort,
             vncPort: slot.vncPort,
-            webRoot: resolveNovncWebRoot(),
+            webRoot: isolated.webRoot,
         }));
         const ready = await waitForPort(slot.webPort, 15_000);
         const browser = await this.ensureViewerBrowser(slot.display, false, profileDir, viewerKey);
@@ -2312,8 +2326,7 @@ export class ApiMachineClient {
             profileDir,
             lastUsedAt: Date.now(),
             processIds: {
-                ...(xvfb.pid ? { xvfb: xvfb.pid } : {}),
-                ...(x11vnc.pid ? { x11vnc: x11vnc.pid } : {}),
+                ...isolated.processIds,
                 ...(websockify.pid ? { websockify: websockify.pid } : {}),
             },
         };
@@ -2332,9 +2345,95 @@ export class ApiMachineClient {
         };
     }
 
+    /**
+     * Brings up the display and VNC server for one viewer slot.
+     *
+     * Two backends, chosen by what the machine has. TigerVNC's Xvnc accepts
+     * the client's `SetDesktopSize`, which is the only way the remote screen
+     * can become exactly the size of the user's window — noVNC otherwise
+     * draws a fixed 1920x1080 desktop clipped into whatever window it gets
+     * (reported 2026-09-19). Machines with only the older Xvfb + x11vnc pair
+     * keep working, scaled rather than clipped.
+     *
+     * The window manager is not decoration: a desktop that resizes under a
+     * browser window nothing re-maximizes is worse than one that does not
+     * resize at all, so `selectViewerBackend` only asks for remote resizing
+     * when openbox is there to refit the window.
+     */
+    private async startViewerDisplay(display: string, vncPort: number): Promise<{
+        backend: ViewerBackend;
+        webRoot: string;
+        processIds: { xvnc?: number; xvfb?: number; x11vnc?: number };
+    }> {
+        const capabilities = await detectViewerCapabilities();
+        const preferred = selectViewerBackend(capabilities);
+        if (!preferred) {
+            throw new Error(`원격 화면에 필요한 프로그램이 없습니다: ${missingViewerTools(capabilities).join(', ')}`);
+        }
+
+        const processIds: { xvnc?: number; xvfb?: number; x11vnc?: number } = {};
+        let backend = preferred;
+        let serving = false;
+        if (preferred.kind === 'xvnc') {
+            const xvnc = spawnDetached('Xvnc', buildXvncArgs({ display, vncPort, ...VIEWER_SCREEN }));
+            serving = await waitForPort(vncPort, 8_000);
+            if (serving) {
+                processIds.xvnc = xvnc.pid;
+                if (capabilities.hasVncConfig) {
+                    // Without this helper a paste reaches Xvnc and stops
+                    // there: nothing owns the X CLIPBOARD selection.
+                    spawnDetached('vncconfig', buildVncConfigArgs(), { DISPLAY: display });
+                } else {
+                    logger.debug('[viewer] vncconfig is missing; pasting into the remote screen will not work');
+                }
+            } else {
+                // Installed but unable to start — a display already in use, a
+                // missing font path. Say so: falling back silently reads to
+                // the user as "resizing just does not work on this machine".
+                logger.debug(`[viewer] Xvnc did not open ${vncPort} on ${display}; falling back to Xvfb + x11vnc`);
+                if (xvnc.pid) {
+                    try { process.kill(-xvnc.pid, 'SIGTERM'); } catch { /* already gone */ }
+                }
+            }
+        }
+        if (!serving) {
+            if (!capabilities.hasXvfb || !capabilities.hasX11vnc) {
+                throw new Error('원격 화면의 디스플레이 서버를 시작하지 못했습니다.');
+            }
+            const xvfb = spawnDetached('Xvfb', buildXvfbArgs({ display, ...VIEWER_SCREEN }));
+            await delay(1500);
+            const x11vnc = spawnDetached('x11vnc', buildX11vncArgs({ display, vncPort }));
+            await delay(800);
+            processIds.xvfb = xvfb.pid;
+            processIds.x11vnc = x11vnc.pid;
+            backend = {
+                kind: 'xvfb-x11vnc',
+                resizeMode: 'scale',
+                windowManager: capabilities.hasWindowManager,
+            };
+        }
+
+        if (backend.windowManager) {
+            // Not tracked as a viewer process: openbox is a client of this
+            // display and exits with it, so there is nothing extra to reap.
+            const configPath = join(configuration.happyHomeDir, 'browser-viewers', 'openbox.xml');
+            mkdirSync(dirname(configPath), { recursive: true, mode: 0o700 });
+            writeFileSync(configPath, buildOpenboxConfig());
+            spawnDetached('openbox', buildOpenboxArgs({ configPath }), { DISPLAY: display });
+        }
+
+        const webRoot = ensureViewerWebRoot({
+            sourceRoot: resolveNovncWebRoot(),
+            targetRoot: join(configuration.happyHomeDir, 'browser-viewers', 'novnc-web', backend.resizeMode),
+            resizeMode: backend.resizeMode,
+            onFallback: (reason) => logger.debug(`[viewer] serving stock noVNC: web root mirror failed: ${reason}`),
+        });
+        return { backend, webRoot, processIds };
+    }
+
     private async stopIsolatedViewerProcesses(lease: BrowserViewerLeaseRecord): Promise<void> {
         for (const [kind, pid] of Object.entries(lease.processIds ?? {}) as Array<[
-            'xvfb' | 'x11vnc' | 'websockify',
+            'xvfb' | 'xvnc' | 'x11vnc' | 'websockify',
             number,
         ]>) {
             if (!pid) continue;
