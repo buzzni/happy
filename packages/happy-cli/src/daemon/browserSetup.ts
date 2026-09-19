@@ -36,9 +36,20 @@ export interface ChromeLaunchOptions {
      * Off by default: this profile holds the user's logged-in sessions.
      */
     noSandbox?: boolean
+    /**
+     * Opens the window at this size, anchored at the display origin.
+     *
+     * Only for displays we own (the noVNC viewer's Xvfb): those have no
+     * window manager, so Chrome's own default bounds are final — nothing can
+     * maximize or drag the window afterwards. Chrome's default is 1050x1400,
+     * which on the viewer's 1920x1080 screen left the right half black with
+     * no way to reclaim it (trial machine, 2026-09-14). Omitted on a real
+     * desktop, whose window sizing is the user's, not ours.
+     */
+    windowSize?: { width: number; height: number }
 }
 
-export function buildChromeLaunchArgs({ userDataDir, cdpPort, headless, display, noSandbox }: ChromeLaunchOptions): string[] {
+export function buildChromeLaunchArgs({ userDataDir, cdpPort, headless, display, noSandbox, windowSize }: ChromeLaunchOptions): string[] {
     const args = [
         `--remote-debugging-port=${cdpPort}`,
         // Chromium gates unsafe extension commands on a launch-time pipe
@@ -67,6 +78,13 @@ export function buildChromeLaunchArgs({ userDataDir, cdpPort, headless, display,
     }
     if (noSandbox) {
         args.push('--no-sandbox')
+    }
+    if (windowSize) {
+        // Position too, not just size: Chrome restores the previous bounds
+        // from the persisted profile, so an offset left by an earlier launch
+        // would push a correctly sized window back off the screen edge.
+        args.push('--window-position=0,0')
+        args.push(`--window-size=${windowSize.width},${windowSize.height}`)
     }
     return args
 }

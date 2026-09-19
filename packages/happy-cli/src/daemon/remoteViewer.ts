@@ -25,6 +25,16 @@ const APT_PACKAGE: Record<string, string> = {
     novnc: 'novnc',
 }
 
+/**
+ * The screen the remote browser is drawn on.
+ *
+ * Sized once and read by both Xvfb and the browser window, because the
+ * viewer display has no window manager: nothing there can maximize or resize
+ * a window after the fact, so a browser that does not open at the screen's
+ * own size leaves dead black space the user cannot reclaim.
+ */
+export const VIEWER_SCREEN = { width: 1920, height: 1080 } as const
+
 export function buildXvfbArgs({ display, width, height }: {
     display: string
     width: number

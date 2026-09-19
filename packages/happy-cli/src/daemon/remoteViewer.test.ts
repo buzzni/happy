@@ -9,6 +9,7 @@ import {
     buildX11vncArgs,
     buildXvfbArgs,
     planViewerInstall,
+    VIEWER_SCREEN,
     readDisplayFromEnviron,
     readFlagFromCmdline,
     viewerProcessMatchesLease,
@@ -25,6 +26,18 @@ describe('buildXvfbArgs', () => {
         expect(args[0]).toBe(':99')
         expect(args).toContain('-screen')
         expect(args.join(' ')).toContain('1920x1080x24')
+    })
+})
+
+describe('VIEWER_SCREEN', () => {
+    it('is the geometry Xvfb actually creates', () => {
+        // One source of truth on purpose: the browser window is sized from
+        // this same constant, and a screen that drifts from the window size
+        // is exactly the half-black remote screen this constant exists to
+        // prevent.
+        const args = buildXvfbArgs({ display: ':99', ...VIEWER_SCREEN })
+
+        expect(args.join(' ')).toContain(`${VIEWER_SCREEN.width}x${VIEWER_SCREEN.height}x24`)
     })
 })
 
