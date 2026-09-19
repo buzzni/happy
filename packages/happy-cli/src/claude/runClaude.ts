@@ -81,6 +81,7 @@ import { requireAccountToken, type ManagedStartup } from '@/managed/managedStart
 import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, clearForeignSessionLineage, requireAccountMachineId, stripAgentModelArguments, stripProviderCredentialOverrides } from '@/managed/managedStartup';
 import { resolveDifficultyRouting, type DifficultyRoutingState } from '@/difficultyRoutingRuntime';
 import { createSerialAsyncHandler } from '@/codex/utils/serialAsyncHandler';
+import { DIFFICULTY_ROUTING_POLICY_VERSION } from '@/difficultyRouting';
 
 /**
  * How long a confirmed initial prompt waits for its acknowledgement before the
@@ -109,7 +110,6 @@ const DEFAULT_CLAUDE_PERMISSION_MODE: PermissionMode = 'yolo';
 const DEFAULT_CLAUDE_MODEL = 'opus';
 const DEFAULT_CLAUDE_EFFORT: 'low' | 'medium' | 'high' | 'xhigh' | 'max' = 'medium';
 const VALID_CLAUDE_EFFORTS: ReadonlySet<string> = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
-const DIFFICULTY_ROUTING_POLICY_VERSION = 'org-shared-difficulty-routing.v1';
 type ClaudeGoalCommand = NonNullable<ReturnType<typeof parseClaudeGoalActionParams>>;
 type PendingClaudeGoalAction = {
     command: ClaudeGoalCommand;

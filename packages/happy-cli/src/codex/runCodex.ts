@@ -136,6 +136,7 @@ import { isManagedBrokerServer } from '@/launcher/codexApproval';
 import { resolveManagedCodexArguments } from '@/launcher/managedCodexOptions';
 import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, clearForeignSessionLineage, managedCodexProviderArguments, requireAccountMachineId, requireAccountToken } from '@/managed/managedStartup';
 import type { RunnerPrincipal } from '@/claude/runClaude';
+import { DIFFICULTY_ROUTING_POLICY_VERSION } from '@/difficultyRouting';
 
 /** See the Claude counterpart. */
 const CODEX_INITIAL_PROMPT_ACK_TIMEOUT_MS = 30_000;
@@ -143,7 +144,6 @@ const CODEX_INITIAL_PROMPT_ACK_TIMEOUT_MS = 30_000;
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
 const DEFAULT_CODEX_PERMISSION_MODE: PermissionMode = 'yolo';
-const DIFFICULTY_ROUTING_POLICY_VERSION = 'org-shared-difficulty-routing.v1';
 
 type ClaimedUserMessage = {
     message: UserMessage;
