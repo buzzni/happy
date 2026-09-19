@@ -153,7 +153,7 @@ export async function resolveDifficultyRouting(
     return null
   }
   const deadline = Date.now() + RUNTIME_ROUTING_DEADLINE_MS
-  let grant: { ok: true; value: GrantOk } | { ok: false; reason?: string; aiModelPolicy?: DifficultyRoutingAiModelPolicy }
+  let grant: GrantRequestResult
   try {
     grant = await requestGrant(input, clientRequestId, deadline)
   } catch (error) {
@@ -168,10 +168,18 @@ export async function resolveDifficultyRouting(
     if ((grant.reason === 'host-unavailable' || grant.reason === 'unsupported') && grant.aiModelPolicy) {
       const p1 = classifyDifficultyHeuristic(prompt)
       noteRemoteFailure()
-      logRoutingOutcome('grant-rejected-falling-back', { clientRequestId, reason: grant.reason })
+      logRoutingOutcome('grant-rejected-falling-back', { clientRequestId, reason: grant.reason, failureStage: grant.failureStage })
       return logDecision('fallback-p1', buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, null, undefined, 'fallback-p1', grant.aiModelPolicy), clientRequestId, grant.reason)
     }
-    logRoutingOutcome('skipped', { reason: grant.reason ?? 'grant-rejected', clientRequestId })
+    logRoutingOutcome('skipped', {
+      reason: grant.reason ?? 'grant-rejected',
+      failureStage: grant.failureStage,
+      httpStatus: grant.httpStatus,
+      failed: grant.failed?.join(','),
+      expiresInMs: grant.expiresInMs,
+      relayDeadlineInMs: grant.relayDeadlineInMs,
+      clientRequestId,
+    })
     return null
   }
 
@@ -295,11 +303,29 @@ function buildLocalDecision(
   }
 }
 
+/**
+ * A rejected grant used to collapse to `{ ok: false }` with no reason on four
+ * different paths, so the field log could not tell a broken response from a
+ * failed check. Name the stage; keep whatever reason the server did send.
+ */
+type GrantRequestResult =
+  | { ok: true; value: GrantOk }
+  | {
+    ok: false
+    failureStage: 'parse' | 'http' | 'response' | 'validation'
+    reason?: string
+    httpStatus?: number
+    failed?: GrantFailureCode[]
+    expiresInMs?: number
+    relayDeadlineInMs?: number
+    aiModelPolicy?: DifficultyRoutingAiModelPolicy
+  }
+
 async function requestGrant(
   input: DifficultyRoutingRuntimeInput,
   clientRequestId: string,
   deadline: number,
-): Promise<{ ok: true; value: GrantOk } | { ok: false; reason?: string; aiModelPolicy?: DifficultyRoutingAiModelPolicy }> {
+): Promise<GrantRequestResult> {
   const response = await fetch(`${resolveAplusApiOrigin()}/api/me/difficulty-routing/grant`, {
     method: 'POST',
     headers: {
@@ -319,22 +345,32 @@ async function requestGrant(
     signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
   })
   const body = await response.json().catch(() => null) as unknown
-  if (!body || typeof body !== 'object') return { ok: false }
+  if (!body || typeof body !== 'object') return { ok: false, failureStage: 'parse' }
   const record = body as Record<string, unknown>
+  const reason = typeof record.reason === 'string' ? record.reason : undefined
   if (!response.ok) {
     return {
       ok: false,
-      reason: typeof record.reason === 'string' ? record.reason : undefined,
+      failureStage: 'http',
+      httpStatus: response.status,
+      reason,
       aiModelPolicy: parseAiModelPolicy(record.aiModelPolicy),
     }
   }
-  if (record.ok !== true) return {
-    ok: false,
-    reason: typeof record.reason === 'string' ? record.reason : undefined,
-    aiModelPolicy: parseAiModelPolicy(record.aiModelPolicy),
+  if (record.ok !== true) {
+    return { ok: false, failureStage: 'response', reason, aiModelPolicy: parseAiModelPolicy(record.aiModelPolicy) }
   }
-  if (!isGrantOk(record, { clientRequestId, sourceMachineId: input.sourceMachineId })) return { ok: false }
-  return { ok: true, value: record }
+  const validation = validateGrant(record, { clientRequestId, sourceMachineId: input.sourceMachineId }, Date.now())
+  if (!validation.ok) {
+    return {
+      ok: false,
+      failureStage: 'validation',
+      failed: validation.failed,
+      expiresInMs: validation.expiresInMs,
+      relayDeadlineInMs: validation.relayDeadlineInMs,
+    }
+  }
+  return { ok: true, value: validation.value }
 }
 
 async function requestRelay(input: {
@@ -385,52 +421,96 @@ async function requestRelay(input: {
   }
 }
 
-function isGrantOk(
+/**
+ * Every condition is evaluated, not short-circuited: a single reported cause
+ * sends the next investigation at the wrong field when several are wrong at
+ * once. Returns the narrowed grant on success so callers keep type safety
+ * without a cast.
+ *
+ * `now` is captured once by the caller and shared with the log, because
+ * reading the clock twice makes the reported remainder disagree with the
+ * decision that used it.
+ */
+type GrantFailureCode =
+  | 'ok' | 'signedGrant' | 'grant' | 'version' | 'grantId' | 'policyRevision'
+  | 'expiresAt' | 'expiresAt-past' | 'expiresAt-too-far'
+  | 'sourceMachineId' | 'hostMachineId' | 'hostProcessKeyId' | 'hostProcessPublicKey'
+  | 'maxInputChars' | 'modelMaxInputTokens'
+  | 'relayDeadlineAt' | 'relayDeadlineAt-past' | 'relayDeadlineAt-too-far'
+  | 'aiModelPolicy' | 'clientRequestId'
+
+type GrantValidation =
+  | { ok: true; value: GrantOk }
+  | { ok: false; failed: GrantFailureCode[]; expiresInMs?: number; relayDeadlineInMs?: number }
+
+function validateGrant(
   value: Record<string, unknown>,
   expected: { clientRequestId: string; sourceMachineId: string },
-): value is GrantOk {
+  now: number,
+): GrantValidation {
+  const failed: GrantFailureCode[] = []
+  const add = (code: GrantFailureCode, pass: boolean) => { if (!pass) failed.push(code) }
+
+  add('ok', value.ok === true)
+  add('signedGrant', typeof value.signedGrant === 'string'
+    && value.signedGrant.length > 0 && value.signedGrant.length <= 8192)
+  add('aiModelPolicy', isAiModelPolicy(value.aiModelPolicy))
+  add('clientRequestId', typeof expected.clientRequestId === 'string' && expected.clientRequestId.length > 0)
+
   const grant = value.grant
   const record = typeof grant === 'object' && grant !== null && !Array.isArray(grant)
     ? grant as Record<string, unknown>
     : null
-  const publicKey = typeof record?.hostProcessPublicKey === 'string'
+  if (record === null) {
+    failed.push('grant')
+    return { ok: false, failed }
+  }
+
+  add('version', record.version === 1)
+  add('grantId', typeof record.grantId === 'string' && record.grantId.length > 0 && record.grantId.length <= 200)
+  add('policyRevision', typeof record.policyRevision === 'number'
+    && Number.isSafeInteger(record.policyRevision) && record.policyRevision >= 0)
+
+  const expiresAt = typeof record.expiresAt === 'number' && Number.isFinite(record.expiresAt)
+    ? record.expiresAt
+    : null
+  if (expiresAt === null) failed.push('expiresAt')
+  else {
+    add('expiresAt-past', expiresAt > now)
+    add('expiresAt-too-far', expiresAt <= now + 60_000)
+  }
+
+  add('sourceMachineId', typeof record.sourceMachineId === 'string'
+    && record.sourceMachineId === expected.sourceMachineId)
+  add('hostMachineId', typeof record.hostMachineId === 'string'
+    && record.hostMachineId.length > 0 && record.hostMachineId.length <= 200)
+  add('hostProcessKeyId', typeof record.hostProcessKeyId === 'string'
+    && record.hostProcessKeyId.length > 0 && record.hostProcessKeyId.length <= 200)
+  const publicKey = typeof record.hostProcessPublicKey === 'string'
     ? decodeBase64OrNull(record.hostProcessPublicKey)
     : null
-  return value.ok === true
-    && typeof value.signedGrant === 'string'
-    && value.signedGrant.length > 0
-    && value.signedGrant.length <= 8192
-    && record !== null
-    && record.version === 1
-    && typeof record.grantId === 'string'
-    && record.grantId.length > 0
-    && record.grantId.length <= 200
-    && typeof record.policyRevision === 'number'
-    && Number.isSafeInteger(record.policyRevision)
-    && record.policyRevision >= 0
-    && typeof record.expiresAt === 'number'
-    && Number.isFinite(record.expiresAt)
-    && record.expiresAt > Date.now()
-    && record.expiresAt <= Date.now() + 60_000
-    && typeof record.sourceMachineId === 'string'
-    && record.sourceMachineId === expected.sourceMachineId
-    && typeof record.hostMachineId === 'string'
-    && record.hostMachineId.length > 0
-    && record.hostMachineId.length <= 200
-    && typeof record.hostProcessKeyId === 'string'
-    && record.hostProcessKeyId.length > 0
-    && record.hostProcessKeyId.length <= 200
-    && typeof record.hostProcessPublicKey === 'string'
-    && publicKey?.length === tweetnacl.box.publicKeyLength
-    && record.maxInputChars === 8000
-    && record.modelMaxInputTokens === 512
-    && typeof record.relayDeadlineAt === 'number'
-    && Number.isFinite(record.relayDeadlineAt)
-    && record.relayDeadlineAt > Date.now()
-    && record.relayDeadlineAt <= Date.now() + 1_000
-    && isAiModelPolicy(value.aiModelPolicy)
-    && typeof expected.clientRequestId === 'string'
-    && expected.clientRequestId.length > 0
+  add('hostProcessPublicKey', publicKey?.length === tweetnacl.box.publicKeyLength)
+  add('maxInputChars', record.maxInputChars === 8000)
+  add('modelMaxInputTokens', record.modelMaxInputTokens === 512)
+
+  const relayDeadlineAt = typeof record.relayDeadlineAt === 'number' && Number.isFinite(record.relayDeadlineAt)
+    ? record.relayDeadlineAt
+    : null
+  if (relayDeadlineAt === null) failed.push('relayDeadlineAt')
+  else {
+    add('relayDeadlineAt-past', relayDeadlineAt > now)
+    add('relayDeadlineAt-too-far', relayDeadlineAt <= now + 1_000)
+  }
+
+  if (failed.length > 0) {
+    return {
+      ok: false,
+      failed,
+      ...(expiresAt !== null ? { expiresInMs: expiresAt - now } : {}),
+      ...(relayDeadlineAt !== null ? { relayDeadlineInMs: relayDeadlineAt - now } : {}),
+    }
+  }
+  return { ok: true, value: value as unknown as GrantOk }
 }
 
 function parseAiModelPolicy(value: unknown): DifficultyRoutingAiModelPolicy | undefined {
