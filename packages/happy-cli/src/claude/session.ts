@@ -10,6 +10,8 @@ import type { McpConfigSource } from './mcpConfigSynchronizer';
 import type { CheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 
 export class Session {
+    prepareChannelExecution?: (requestId: string) => Promise<boolean>;
+    beginChannelExecution?: (requestId: string) => boolean;
     readonly path: string;
     readonly logPath: string;
     readonly api: ApiClient;

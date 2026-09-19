@@ -86,7 +86,12 @@ type PreparedDeferredContinuationTurn = {
 
 export function createDeferredContinuationContextConsumer(
   env: NodeJS.ProcessEnv,
-): { prepare: (userText: string) => PreparedDeferredContinuationTurn | null } {
+): {
+  prepare: (
+    userText: string,
+    options?: { fromChannel?: boolean },
+  ) => PreparedDeferredContinuationTurn | null
+} {
   const file = env[CONTEXT_ENV_KEY]
   delete env[CONTEXT_ENV_KEY]
 
@@ -105,8 +110,15 @@ export function createDeferredContinuationContextConsumer(
   let reserved = false
 
   return {
-    prepare(userText: string): PreparedDeferredContinuationTurn | null {
-      if (parseSpecialCommand(userText).type === 'clear') {
+    /**
+     * `options.fromChannel` marks text relayed from an external messenger
+     * (Saycode specs/desktop-messenger-channels). Such text is never read as session control:
+     * the `/clear` branch below *deletes* the staged continuation context, so without this an
+     * external sender could discard the conversation history this session was started to
+     * continue, just by typing seven characters.
+     */
+    prepare(userText: string, options?: { fromChannel?: boolean }): PreparedDeferredContinuationTurn | null {
+      if (options?.fromChannel !== true && parseSpecialCommand(userText).type === 'clear') {
         context = null
         reserved = false
         removeDeferredContinuationContextFile(file)

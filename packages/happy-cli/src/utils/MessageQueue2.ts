@@ -9,6 +9,14 @@ interface QueueItem<T> {
     isolate?: boolean; // If true, this message must be processed alone
     /** Decoded image attachments owned by *this* message (per-message ownership). */
     attachments?: PendingAttachment[];
+    /**
+     * Core-minted handle for a turn that answers an external messenger request
+     * (Saycode specs/desktop-messenger-channels). It travels with the message so the turn the
+     * queue eventually hands to the agent can be matched to the request that caused it — the
+     * alternative, guessing from sequence numbers or "the last assistant message", is wrong the
+     * moment anything else is in flight.
+     */
+    requestId?: string;
 }
 
 /**
@@ -29,6 +37,13 @@ export class MessageQueue2<T> {
         this.modeHasher = modeHasher;
         this.onMessageHandler = onMessageHandler;
         logger.debug(`[MessageQueue2] Initialized`);
+    }
+
+    /** Remove only a tagged channel request; ordinary Desktop input is never selected. */
+    removeByRequestId(requestId: string): number {
+        const before = this.queue.length;
+        this.queue = this.queue.filter(item => item.requestId !== requestId);
+        return before - this.queue.length;
     }
 
     /**
@@ -153,7 +168,7 @@ export class MessageQueue2<T> {
      * Push a message that must be processed alone without discarding
      * already-queued user prompts.
      */
-    pushIsolated(message: string, mode: T, attachments?: PendingAttachment[]): void {
+    pushIsolated(message: string, mode: T, attachments?: PendingAttachment[], requestId?: string): void {
         if (this.closed) {
             throw new Error('Cannot push to closed queue');
         }
@@ -167,6 +182,7 @@ export class MessageQueue2<T> {
             modeHash,
             isolate: true,
             attachments,
+            requestId,
         });
 
         // Trigger message handler if set
@@ -286,7 +302,7 @@ export class MessageQueue2<T> {
      * Wait for messages and return all messages with the same mode as a single string
      * Returns { message: string, mode: T } or null if aborted/closed
      */
-    async waitForMessagesAndGetAsString(abortSignal?: AbortSignal): Promise<{ message: string, mode: T, isolate: boolean, hash: string, attachments?: PendingAttachment[] } | null> {
+    async waitForMessagesAndGetAsString(abortSignal?: AbortSignal): Promise<{ message: string, mode: T, isolate: boolean, hash: string, attachments?: PendingAttachment[], requestIds?: string[] } | null> {
         // If we have messages, return them immediately
         if (this.queue.length > 0) {
             return this.collectBatch();
@@ -310,7 +326,7 @@ export class MessageQueue2<T> {
     /**
      * Collect a batch of messages with the same mode, respecting isolation requirements
      */
-    private collectBatch(): { message: string, mode: T, hash: string, isolate: boolean, attachments?: PendingAttachment[] } | null {
+    private collectBatch(): { message: string, mode: T, hash: string, isolate: boolean, attachments?: PendingAttachment[], requestIds?: string[] } | null {
         if (this.queue.length === 0) {
             return null;
         }
@@ -318,6 +334,7 @@ export class MessageQueue2<T> {
         const firstItem = this.queue[0];
         const sameModeMessages: string[] = [];
         const collectedAttachments: PendingAttachment[] = [];
+        const collectedRequestIds: string[] = [];
         let mode = firstItem.mode;
         let isolate = firstItem.isolate ?? false;
         const targetModeHash = firstItem.modeHash;
@@ -327,6 +344,7 @@ export class MessageQueue2<T> {
             const item = this.queue.shift()!;
             sameModeMessages.push(item.message);
             if (item.attachments) collectedAttachments.push(...item.attachments);
+            if (item.requestId) collectedRequestIds.push(item.requestId);
             logger.debug(`[MessageQueue2] Collected isolated message with mode hash: ${targetModeHash}`);
         } else {
             // Collect all messages with the same mode until we hit an isolated message
@@ -336,6 +354,7 @@ export class MessageQueue2<T> {
                 const item = this.queue.shift()!;
                 sameModeMessages.push(item.message);
                 if (item.attachments) collectedAttachments.push(...item.attachments);
+                if (item.requestId) collectedRequestIds.push(item.requestId);
             }
             logger.debug(`[MessageQueue2] Collected batch of ${sameModeMessages.length} messages with mode hash: ${targetModeHash}`);
         }
@@ -349,6 +368,7 @@ export class MessageQueue2<T> {
             hash: targetModeHash,
             isolate,
             attachments: collectedAttachments.length > 0 ? collectedAttachments : undefined,
+            requestIds: collectedRequestIds.length > 0 ? collectedRequestIds : undefined,
         };
     }
 

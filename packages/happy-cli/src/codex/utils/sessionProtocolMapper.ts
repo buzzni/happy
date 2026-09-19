@@ -7,7 +7,30 @@ import type { Thread, ThreadItem, ThreadTurn } from '../codexAppServerTypes';
 
 export type CodexTurnState = {
     currentTurnId: string | null;
+    /**
+     * Correlation for a turn that answers an external messenger request
+     * (Saycode specs/desktop-messenger-channels). Set before the turn opens and consumed by the
+     * `turn-start` it stamps; held in `currentRequestId` for the matching `turn-end`. Kept apart
+     * so an id waiting for a turn that never opens cannot be inherited by a later, unrelated one.
+     */
+    pendingRequestId?: string | null;
+    currentRequestId?: string | null;
     currentProviderTurnId?: string | null;
+    /**
+     * Provider turn id → the protocol turn it opened (Saycode specs/desktop-messenger-channels R8/R9).
+     *
+     * Recorded because an approval request is the one thing that needs to name its turn but is not
+     * given one: `ApprovalHandler`'s params carry no turn or thread id, and the approval arrives
+     * *before* the `exec_command_begin`/`patch_apply_begin` whose `tool-call-start` would have
+     * established call-level membership — and that event's `call_id` is a different namespace from
+     * the approval's `itemId` anyway. The provider turn id is supplied on both sides, so it is the
+     * only correlation here that is not a guess about what is current.
+     *
+     * Entries live only as long as their turn: the close paths drop them, and `codexProtocolTurnFor`
+     * additionally requires the mapped turn to still be open, so a stale provider turn id resolves
+     * to nothing rather than to the wrong turn.
+     */
+    providerTurnToProtocol?: Map<string, string>;
     startedSubagents?: Set<string>;
     activeSubagents?: Set<string>;
     providerSubagentToSessionSubagent?: Map<string, string>;
@@ -34,6 +57,29 @@ type LegacyToolLikeMessage = {
 };
 
 type TurnEndStatus = 'completed' | 'failed' | 'cancelled';
+
+function getProviderTurnToProtocol(state: CodexTurnState): Map<string, string> {
+    if (!state.providerTurnToProtocol) state.providerTurnToProtocol = new Map<string, string>();
+    return state.providerTurnToProtocol;
+}
+
+/**
+ * The protocol turn a provider turn opened, **while that turn is still open**, or null.
+ *
+ * Both halves matter. Without the mapping this would be a guess about the current turn; without
+ * the open-turn check a provider turn id left over from a completed turn would answer for a later
+ * approval and point a messenger at the wrong request.
+ */
+export function codexProtocolTurnFor(
+    state: CodexTurnState,
+    providerTurnId: string | null,
+): { turnId: string; requestId: string | null } | null {
+    if (!providerTurnId) return null;
+    const turnId = state.providerTurnToProtocol?.get(providerTurnId);
+    if (!turnId) return null;
+    if (state.currentTurnId !== turnId) return null;
+    return { turnId, requestId: state.currentRequestId ?? null };
+}
 
 function getStartedSubagents(state: CodexTurnState): Set<string> {
     return state.startedSubagents ?? new Set<string>();
@@ -429,7 +475,16 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
             };
         }
         const turnId = createId();
-        const turnStart = createEnvelope('agent', { t: 'turn-start' }, { turn: turnId });
+        const requestId = state.pendingRequestId ?? undefined;
+        const turnStart = createEnvelope(
+            'agent',
+            { t: 'turn-start', ...(requestId ? { requestId } : {}) },
+            { turn: turnId },
+        );
+        state.pendingRequestId = null;
+        state.currentRequestId = requestId ?? null;
+        // The only correlation an approval can use — see `providerTurnToProtocol`.
+        if (providerTurnId) getProviderTurnToProtocol(state).set(providerTurnId, turnId);
         startedSubagents.clear();
         activeSubagents.clear();
         providerSubagentToSessionSubagent.clear();
@@ -455,6 +510,30 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
             };
         }
         if (!state.currentTurnId) {
+            // A run that failed before `task_started` reaches its terminal with nothing open. A
+            // channel request waiting on it must still get a correlated answer: without this the
+            // id is stranded and the next unrelated turn inherits it.
+            if (state.pendingRequestId) {
+                const strandedRequestId = state.pendingRequestId;
+                const strandedTurnId = createId();
+                state.pendingRequestId = null;
+                state.currentRequestId = null;
+                return {
+                    currentTurnId: null,
+                    currentProviderTurnId: null,
+                    startedSubagents,
+                    activeSubagents,
+                    providerSubagentToSessionSubagent,
+                    envelopes: [
+                        createEnvelope('agent', { t: 'turn-start', requestId: strandedRequestId }, { turn: strandedTurnId }),
+                        createEnvelope('agent', {
+                            t: 'turn-end',
+                            status: pickTurnEndStatus(message, type),
+                            requestId: strandedRequestId,
+                        }, { turn: strandedTurnId }),
+                    ],
+                };
+            }
             return {
                 currentTurnId: null,
                 currentProviderTurnId: null,
@@ -466,7 +545,15 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
         }
 
         const lifecycleOpts = { turn: state.currentTurnId } satisfies CreateEnvelopeOptions;
+        // Dropped with its turn. Kept, this provider turn id would answer for a later approval and
+        // point a messenger at a request that is already finished.
+        const closingProviderTurn = state.currentProviderTurnId ?? providerTurnId;
+        if (closingProviderTurn) state.providerTurnToProtocol?.delete(closingProviderTurn);
         providerSubagentToSessionSubagent.clear();
+        // Read before clearing: the envelope below is built inside the return expression, which
+        // evaluates after any assignment placed ahead of it.
+        const endRequestId = state.currentRequestId ?? null;
+        state.currentRequestId = null;
         return {
             currentTurnId: null,
             currentProviderTurnId: null,
@@ -478,6 +565,7 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
                 createEnvelope('agent', {
                     t: 'turn-end',
                     status: pickTurnEndStatus(message, type),
+                    ...(endRequestId ? { requestId: endRequestId } : {}),
                 }, lifecycleOpts),
             ],
         };
@@ -512,6 +600,22 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
         const envelopes: SessionEnvelope[] = [];
         maybeEmitSubagentStart(subagent, opts, startedSubagents, activeSubagents, envelopes);
         envelopes.push(createEnvelope('agent', { t: 'text', text: message.message }, opts));
+        /*
+         * Codex's own final-answer marker (Saycode specs/desktop-messenger-channels — R14). Only
+         * a *candidate*: the client's own comment at codexAppServerClient.ts notes that a phase of
+         * `final_answer` can legitimately be a clarifying question the model then continues past,
+         * so what makes it deliverable is the matching `turn-end` with `status: 'completed'`.
+         *
+         * Emitted only for a turn answering a channel request; an in-app turn already shows its
+         * answer in the transcript.
+         */
+        if (message.phase === 'final_answer' && !subagent && state.currentRequestId) {
+            envelopes.push(createEnvelope(
+                'agent',
+                { t: 'final-answer', text: message.message, requestId: state.currentRequestId },
+                opts,
+            ));
+        }
         return {
             currentTurnId: state.currentTurnId,
             currentProviderTurnId: state.currentProviderTurnId ?? null,

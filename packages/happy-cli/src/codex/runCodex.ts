@@ -33,6 +33,7 @@ import { initialMachineMetadata } from '@/daemon/run';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
 import { MessageQueue2, type PendingAttachment } from '@/utils/MessageQueue2';
+import { ChannelPromptAcceptance, CHANNEL_ACK_DEADLINE_MS } from '@/channel/channelPromptAcceptance';
 import { projectPath } from '@/projectPath';
 import { join } from 'node:path';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
@@ -64,8 +65,10 @@ import { resolveCodexExecutionPolicy } from './executionPolicy';
 import { resolveRemoteCodexPermissionMode } from './permissionMode';
 import { isSandboxFallbackNetworkLoss } from './sandboxInitFailurePolicy';
 import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
+import { installCodexApprovalBoundary } from './utils/codexApprovalBoundary';
 import {
     mapCodexMcpMessageToSessionEnvelopes,
+    type CodexTurnState,
     mapCodexProcessorMessageToSessionEnvelopes,
 } from './utils/sessionProtocolMapper';
 import { resumeExistingThread } from './resumeExistingThread';
@@ -373,6 +376,13 @@ export async function runCodex(opts: {
     }
 
     const messageQueue = new MessageQueue2<EnhancedMode>(hashCodexEnhancedMode);
+    /**
+     * Correlation for a turn answering an external messenger request
+     * (Saycode specs/desktop-messenger-channels). Set when the batch carrying it becomes the
+     * running turn; the mapper consumes it on the `turn-start` it stamps.
+     */
+    let codexPendingRequestId: string | null = null;
+    let codexCurrentRequestId: string | null = null;
 
     session.onFileEvent((fileEvent) => {
         const ev = fileEvent.content.data.ev;
@@ -627,6 +637,11 @@ export async function runCodex(opts: {
     let thinking = false;
     let currentTurnId: string | null = null;
     let currentProviderTurnId: string | null = null;
+    /**
+     * Provider turn id → the protocol turn it opened. Lives here, not on the per-call state object
+     * the event handler rebuilds, because an approval arriving between two events has to find it.
+     */
+    const codexProviderTurnToProtocol = new Map<string, string>();
     let codexStartedSubagents = new Set<string>();
     let codexActiveSubagents = new Set<string>();
     let codexProviderSubagentToSessionSubagent = new Map<string, string>();
@@ -991,6 +1006,69 @@ export async function runCodex(opts: {
         },
     }));
 
+    /*
+     * External messenger channel ingress (Saycode specs/desktop-messenger-channels — R10/R12).
+     *
+     * Same contract as the Claude loop: the capability answer names *this* process, and the
+     * delivery names the process it was authorized against, so a runtime replaced between the two
+     * refuses instead of taking work whose capability was never checked. A runtime without these
+     * handlers answers "unknown method", which is the old-runtime refusal.
+     */
+    session.rpcHandlerManager.registerHandler('channel-capability', async () => ({
+        protocolVersion: 1,
+        supportsChannelCancellation: true,
+        supportsChannelExecutionApproval: true,
+        engine: 'codex',
+        // Same managed-run rule as the Claude loop; see ChannelAcceptanceDeps.isManagedRun.
+        honoursChannelOrigin: !managedStartup,
+        runtimeId: session.runtimeId,
+    }));
+
+    const channelAcceptance = new ChannelPromptAcceptance({
+        runtimeId: session.runtimeId,
+        requestApproval: ({ requestId, runtimeId, nonce }) => session.sendSessionProtocolMessage(
+            createEnvelope('agent', { t: 'channel-ready', requestId, runtimeId, nonce })),
+        isManagedRun: () => Boolean(managedStartup),
+        recordDurably: async ({ text, localId }) => {
+            const ack = session.awaitMessageAck(localId, CHANNEL_ACK_DEADLINE_MS);
+            session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }), localId);
+            const outcome = await ack;
+            // Every negative outcome is ambiguous: `onSyncFatal` settles all waiters at once, and
+            // a close can arrive after the server has already committed the row.
+            return outcome.ok ? { ok: true as const } : { ok: false as const, provenNotWritten: false };
+        },
+        enqueue: ({ text, requestId }) => {
+            const deferredTurn = deferredContinuation.prepare(text, { fromChannel: true });
+            try {
+                // Isolated so an external request is never folded into the same turn as whatever
+                // the Desktop user was typing, while everything already queued is preserved.
+                messageQueue.pushIsolated(deferredTurn?.text ?? text, {
+                    permissionMode: currentPermissionMode || 'default',
+                    model: currentModel,
+                    appendSystemPrompt: currentAppendSystemPrompt,
+                    saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+                    saycodePromptBlocks: currentSaycodePromptBlocks,
+                    effort: currentEffort,
+                }, [], requestId);
+                deferredTurn?.commit();
+            } catch (error) {
+                deferredTurn?.rollback();
+                throw error;
+            }
+        },
+        now: () => Date.now(),
+    });
+    session.rpcHandlerManager.registerHandler('channel-prompt', async (params: unknown) =>
+        channelAcceptance.accept(params));
+    session.rpcHandlerManager.registerHandler('channel-authorize', async (params: unknown) => channelAcceptance.authorize(params));
+    session.rpcHandlerManager.registerHandler('channel-cancel', async (params: unknown) => {
+        const result = channelAcceptance.cancel(params);
+        if (result.ok && result.state === 'cancelled') {
+            messageQueue.removeByRequestId((params as { requestId: string }).requestId);
+        }
+        return result;
+    });
+
     session.rpcHandlerManager.registerHandler('goal-action', async (params: Record<string, unknown>) => {
         const command = parseCodexGoalActionParams(params);
         if (!command) {
@@ -1018,42 +1096,27 @@ export async function runCodex(opts: {
         return { ok: true };
     });
 
-    // Approval handler: routes server → client approval requests to our permission handler
-    client.setApprovalHandler(async (params) => {
-        const toolName = params.type === 'exec'
-            ? 'CodexBash'
-            : params.type === 'patch'
-                ? 'CodexPatch'
-                : (params.toolName ?? 'McpTool');
-        const input = params.type === 'exec'
-            ? { command: params.command, cwd: params.cwd }
-            : params.type === 'patch'
-                ? { changes: params.fileChanges }
-                : (params.input ?? {});
-
+    // Approval handler: routes server → client approval requests to our permission handler.
+    // Installed from its own module so the path an app-server request takes is the tested one.
+    installCodexApprovalBoundary({
+        client,
+        permissionHandler,
+        runtimeId: session.runtimeId,
+        turnState: () => ({
+            currentTurnId,
+            currentRequestId: codexCurrentRequestId,
+            providerTurnToProtocol: codexProviderTurnToProtocol,
+        }),
         /*
          * 이 run 이 스스로 등록한 broker 로의 호출은 사람에게 물을 것이 없다 —
          * 그 서버를 등록한 것이 우리이고, 어떤 도구를 쓸 수 있는지는 broker 가
          * grant scope 로 최종 강제한다. 그 밖의 승인은 전부 기존 경로 그대로다.
          */
-        if (isManagedBrokerServer({
+        isAutoApproved: (params) => isManagedBrokerServer({
             managed: managedStartup !== null,
             env: process.env,
             serverName: params.serverName,
-        })) {
-            return 'approved';
-        }
-
-        try {
-            const result = await permissionHandler.handleToolCall(params.callId, toolName, input, {
-                serverName: params.serverName,
-            });
-            logger.debug('[Codex] Permission result:', result.decision);
-            return result.decision;
-        } catch (error) {
-            logger.debug('[Codex] Error handling permission:', error);
-            return 'denied';
-        }
+        }),
     });
 
     // Event handler: same EventMsg types as the legacy MCP server — no changes needed
@@ -1180,13 +1243,21 @@ export async function runCodex(opts: {
         // Convert events into the unified session-protocol envelope stream.
         // Reasoning deltas are handled by ReasoningProcessor to avoid duplicate text output.
         if (msg.type !== 'agent_reasoning_delta' && msg.type !== 'agent_reasoning' && msg.type !== 'agent_reasoning_section_break' && msg.type !== 'turn_diff') {
-            const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, {
+            // The state object is rebuilt per call, so the correlation fields are carried in and
+            // read back out rather than living on it.
+            const turnState = {
                 currentTurnId,
                 currentProviderTurnId,
                 startedSubagents: codexStartedSubagents,
                 activeSubagents: codexActiveSubagents,
                 providerSubagentToSessionSubagent: codexProviderSubagentToSessionSubagent,
-            });
+                pendingRequestId: codexPendingRequestId,
+                currentRequestId: codexCurrentRequestId,
+                providerTurnToProtocol: codexProviderTurnToProtocol,
+            };
+            const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, turnState);
+            codexPendingRequestId = turnState.pendingRequestId ?? null;
+            codexCurrentRequestId = turnState.currentRequestId ?? null;
             currentTurnId = mapped.currentTurnId;
             currentProviderTurnId = mapped.currentProviderTurnId;
             codexStartedSubagents = mapped.startedSubagents;
@@ -1323,7 +1394,7 @@ export async function runCodex(opts: {
             }
         }
 
-        let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string; attachments?: PendingAttachment[] } | null = null;
+        let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string; attachments?: PendingAttachment[]; requestIds?: string[] } | null = null;
 
         /*
          * A managed Codex run can be asked to end its input without being
@@ -1371,7 +1442,7 @@ export async function runCodex(opts: {
 
         while (!shouldExit) {
             logActiveHandles('loop-top');
-            let message: { message: string; mode: EnhancedMode; isolate: boolean; hash: string; attachments?: PendingAttachment[] } | null = pending;
+            let message: { message: string; mode: EnhancedMode; isolate: boolean; hash: string; attachments?: PendingAttachment[]; requestIds?: string[] } | null = pending;
             pending = null;
             if (!message) {
                 /*
@@ -1414,7 +1485,24 @@ export async function runCodex(opts: {
                 break;
             }
 
-            if (isCodexClearText(message.message)) {
+            /*
+             * Set here, after `message` has been resolved from *either* the deferred `pending`
+             * slot or a fresh batch, so a deferred channel turn keeps its handle and an ordinary
+             * turn clears it rather than inheriting the previous one. Assigning it in the wait
+             * branch alone would miss the deferred path, which is the one an isolated channel
+             * turn actually takes.
+             */
+            codexPendingRequestId = message.requestIds?.[0] ?? null;
+
+            /*
+             * Relayed channel text is never read as session control. This is a *second* parser,
+             * on the consumer side: a channel turn reaches the queue through the session's own
+             * RPC and never passes the enqueue handler, but it does arrive here — where `/clear`
+             * wipes the Codex thread state. Gating only the enqueue side would leave an external
+             * sender able to reset a session's context (Saycode specs/desktop-messenger-channels).
+             */
+            const fromChannel = (message.requestIds?.length ?? 0) > 0;
+            if (!fromChannel && isCodexClearText(message.message)) {
                 logger.debug('[Codex] Handling /clear command - resetting Codex thread state');
                 client.clearThreadState();
                 currentTurnId = null;
@@ -1606,6 +1694,14 @@ export async function runCodex(opts: {
                     hasTitle: session.hasTitle(),
                 });
 
+                // Prepared images/thread/checkpoint may have awaited since dequeue. Cancellation
+                // must still win here; once this synchronous boundary is crossed the turn runs.
+                if (message.requestIds?.length && (message.requestIds.length !== 1
+                    || !await channelAcceptance.prepareExecution(message.requestIds[0])
+                    || !channelAcceptance.beginExecution(message.requestIds[0]))) {
+                    codexPendingRequestId = null;
+                    continue;
+                }
                 const result = await client.sendTurnAndWait(turnPrompt, {
                     model: message.mode.model,
                     approvalPolicy: executionPolicy.approvalPolicy,
@@ -1639,16 +1735,25 @@ export async function runCodex(opts: {
                 const failureMessage = describeCheckpointFailure(error) ?? 'Process exited unexpectedly';
                 messageBuffer.addMessage(failureMessage, 'status');
                 session.sendSessionEvent({ type: 'message', message: failureMessage });
+                // Carries the correlation in and reads it back, like the normal event path. A
+                // dispatch or process failure is still the answer to whatever request was waiting
+                // on it; a fresh state object here would drop the id and leave the caller waiting.
+                const failureState: CodexTurnState = {
+                    currentTurnId,
+                    currentProviderTurnId,
+                    startedSubagents: codexStartedSubagents,
+                    activeSubagents: codexActiveSubagents,
+                    providerSubagentToSessionSubagent: codexProviderSubagentToSessionSubagent,
+                    pendingRequestId: codexPendingRequestId,
+                    currentRequestId: codexCurrentRequestId,
+                    providerTurnToProtocol: codexProviderTurnToProtocol,
+                };
                 const closed = mapCodexMcpMessageToSessionEnvelopes(
                     { type: 'turn_aborted', status: 'failed' },
-                    {
-                        currentTurnId,
-                        currentProviderTurnId,
-                        startedSubagents: codexStartedSubagents,
-                        activeSubagents: codexActiveSubagents,
-                        providerSubagentToSessionSubagent: codexProviderSubagentToSessionSubagent,
-                    },
+                    failureState,
                 );
+                codexPendingRequestId = failureState.pendingRequestId ?? null;
+                codexCurrentRequestId = failureState.currentRequestId ?? null;
                 currentTurnId = closed.currentTurnId;
                 currentProviderTurnId = closed.currentProviderTurnId;
                 codexStartedSubagents = closed.startedSubagents;

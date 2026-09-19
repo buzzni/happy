@@ -186,3 +186,11 @@ describe('createEnvelope', () => {
     expect(() => createEnvelope('user', { t: 'service', text: 'internal event' })).toThrow();
   });
 });
+
+
+it('accepts bounded channel-ready identity and refuses extra authority fields', () => {
+  const event = { t: 'channel-ready', requestId: 'r1', runtimeId: 'runtime-1', nonce: '00000000-0000-4000-8000-000000000001' };
+  expect(sessionEventSchema.safeParse(event).success).toBe(true);
+  expect(sessionEventSchema.safeParse({ ...event, permissionMode: 'yolo' }).success).toBe(false);
+  expect(sessionEventSchema.safeParse({ ...event, nonce: 'r1' }).success).toBe(false);
+});

@@ -875,3 +875,119 @@ describe('claudeRemote', () => {
         });
     });
 });
+
+describe('claudeRemote channel-origin slash handling', () => {
+    beforeEach(() => {
+        vi.mocked(query).mockReset();
+        vi.mocked(query).mockReturnValue({
+            setPermissionMode: vi.fn(),
+            mcpServerStatus: vi.fn(async () => []),
+            reconnectMcpServer: vi.fn(),
+            async *[Symbol.asyncIterator]() {
+                yield { type: 'result', subtype: 'success' };
+            },
+        } as any);
+    });
+
+    /**
+     * Saycode specs/desktop-messenger-channels R9/R11.
+     *
+     * This parser is a *second* one, separate from `runClaude.onUserMessage`. A channel turn
+     * reaches the queue through the session's own RPC and never passes through that handler, but
+     * it does arrive here — and here `/clear` calls `onSessionReset` and returns before the
+     * provider sees anything. Gating only the first parser leaves an external sender able to wipe
+     * a session's context with seven characters.
+     */
+    it('does not reset the session when a channel turn is the literal text /clear', async () => {
+        const onSessionReset = vi.fn();
+        await claudeRemote({
+            prepareChannelExecution: async () => true,
+            beginChannelExecution: () => true,
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage: vi.fn()
+                .mockResolvedValueOnce({ message: '/clear', mode, requestIds: ['core-req-1'] })
+                .mockResolvedValue(null),
+            onReady: vi.fn(),
+            onSessionReset,
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+        });
+
+        expect(onSessionReset).not.toHaveBeenCalled();
+        // It went to the provider as ordinary input instead.
+        expect(query).toHaveBeenCalled();
+    });
+
+    it('still resets the session for an in-app /clear', async () => {
+        const onSessionReset = vi.fn();
+        await claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage: vi.fn()
+                .mockResolvedValueOnce({ message: '/clear', mode })
+                .mockResolvedValue(null),
+            onReady: vi.fn(),
+            onSessionReset,
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+        });
+
+        expect(onSessionReset).toHaveBeenCalledTimes(1);
+        expect(query).not.toHaveBeenCalled();
+    });
+
+    it('does not treat a channel /compact as a compaction request', async () => {
+        const onCompletionEvent = vi.fn();
+        await claudeRemote({
+            prepareChannelExecution: async () => true,
+            beginChannelExecution: () => true,
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            nextMessage: vi.fn()
+                .mockResolvedValueOnce({ message: '/compact', mode, requestIds: ['core-req-2'] })
+                .mockResolvedValue(null),
+            onReady: vi.fn(),
+            onCompletionEvent,
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+        });
+
+        expect(onCompletionEvent).not.toHaveBeenCalledWith('Compaction started');
+    });
+});
+
+
+it('rechecks channel cancellation after checkpoint preparation and never starts the provider', async () => {
+    let allowed = true;
+    const beginChannelExecution = vi.fn(() => allowed);
+    vi.mocked(query).mockClear();
+    const result = await claudeRemote({
+        sessionId: null, path: process.cwd(), allowedTools: [],
+        hookSettingsPath: '/tmp/happy-test-settings.json',
+        nextMessage: async () => ({ message: 'cancelled work', mode, requestIds: ['r1'] }),
+        beforeTurn: async () => { await Promise.resolve(); allowed = false; },
+        prepareChannelExecution: async () => true,
+        beginChannelExecution,
+        onReady: vi.fn(), canCallTool: async () => ({ behavior: 'allow' }) as any,
+        isAborted: () => false, onSessionFound: vi.fn(), onThinkingChange: vi.fn(), onMessage: vi.fn(),
+    });
+    expect(beginChannelExecution).toHaveBeenCalledWith('r1');
+    expect(result).toBe('not-started');
+    expect(query).not.toHaveBeenCalled();
+});

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MessageMetaSchema } from './types';
+import { MachineMetadataSchema, MessageMetaSchema } from './types';
 
 describe('MessageMetaSchema', () => {
   it('preserves an explicit Saycode system prompt policy', () => {
@@ -81,4 +81,62 @@ describe('MessageMetaSchema modelSource', () => {
     expect(MessageMetaSchema.parse({ modelSource: 42 }).modelSource).toBe('auto');
     expect(MessageMetaSchema.parse({ modelSource: null }).modelSource).toBe('auto');
   });
+});
+
+describe('channelSupport approvals capability', () => {
+    const base = {
+        host: 'h', platform: 'darwin', happyCliVersion: '1.0.0',
+        homeDir: '/h', happyHomeDir: '/h/.happy', happyLibDir: '/h/.happy/lib',
+    };
+
+    it('parses a daemon that relays channel messages but cannot answer prompts', () => {
+        // The pre-T21 shape. Absence of `approvals` is the unsafe case, and a consumer must fail
+        // closed on it rather than read it as "probably fine".
+        const parsed = MachineMetadataSchema.safeParse({
+            ...base,
+            channelSupport: { protocolVersion: 1, engines: ['claude', 'codex'] },
+        });
+        expect(parsed.success).toBe(true);
+        expect(parsed.success && parsed.data.channelSupport?.approvals).toBeUndefined();
+    });
+
+    it('parses the approvals object with its own protocol version', () => {
+        const parsed = MachineMetadataSchema.safeParse({
+            ...base,
+            channelSupport: {
+                protocolVersion: 1,
+                engines: ['claude', 'codex'],
+                approvals: { protocolVersion: 1, engines: ['claude'] },
+            },
+        });
+        expect(parsed.success).toBe(true);
+        expect(parsed.success && parsed.data.channelSupport?.approvals)
+            .toEqual({ protocolVersion: 1, engines: ['claude'] });
+    });
+
+    it('refuses an approvals block without a protocol version, or with a future one', () => {
+        for (const approvals of [
+            { engines: ['claude'] },
+            { protocolVersion: 2, engines: ['claude'] },
+            { protocolVersion: 1 },
+            true,
+        ]) {
+            const parsed = MachineMetadataSchema.safeParse({
+                ...base,
+                channelSupport: { protocolVersion: 1, engines: ['claude'], approvals },
+            });
+            expect(parsed.success, JSON.stringify(approvals)).toBe(false);
+        }
+    });
+
+    it('refuses an engine name outside the known set', () => {
+        const parsed = MachineMetadataSchema.safeParse({
+            ...base,
+            channelSupport: {
+                protocolVersion: 1, engines: ['claude'],
+                approvals: { protocolVersion: 1, engines: ['acp'] },
+            },
+        });
+        expect(parsed.success).toBe(false);
+    });
 });

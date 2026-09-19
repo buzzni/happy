@@ -18,7 +18,9 @@ import { shouldReconnect } from '@/utils/lidState';
 import { createEnvelope, type CreateEnvelopeOptions, type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
 import {
     closeClaudeTurnWithStatus,
+    mapClaudeChannelFinalAnswer,
     mapClaudeLogMessageToSessionEnvelopes,
+    toolCallTurnFor,
     type ClaudeSessionProtocolState,
 } from '@/claude/utils/sessionProtocolMapper';
 import { InvalidateSync } from '@/utils/sync';
@@ -357,9 +359,26 @@ export function assertManagedServerOrigin(managed: ManagedCredentialMode): strin
     return expected;
 }
 
+/** One waiter per open prompt; a session does not hold many at once. */
+const MAX_PENDING_CHANNEL_BINDS = 64;
+
 export class ApiSessionClient extends EventEmitter {
     private readonly token: string;
     readonly sessionId: string;
+    /**
+     * Identity of *this process's* attachment to the session, minted per client instance
+     * (Saycode specs/desktop-messenger-channels).
+     *
+     * A caller that proved a runtime's capability names it when it later hands that runtime work.
+     * If the process has been replaced in between — a restart, a downgrade — the id no longer
+     * matches and the work is refused instead of being run by a runtime whose capability was
+     * never checked. A session id cannot do this job: it survives the process.
+     */
+    readonly runtimeId: string = randomUUID();
+    /** Permission prompts waiting for their tool call's turn to be mapped. */
+    private readonly pendingChannelPermissionBinds = new Map<string, (context: {
+        turnId: string; channelRequestId: string | null; runtimeId: string;
+    }) => void>();
     private metadata: Metadata | null;
     private metadataVersion: number;
     // Set synchronously the moment a summary (title) message passes through this
@@ -1316,11 +1335,93 @@ export class ApiSessionClient extends EventEmitter {
      * Send message to session
      * @param body - Message body (can be MessageContent or raw content for agent messages)
      */
+    /**
+     * Declares that the next turn to open answers an external messenger request
+     * (Saycode specs/desktop-messenger-channels).
+     *
+     * Called by the launcher at the moment it takes a batch off the queue, which is the only
+     * point where "this work" and "that request" are both known. The mapper consumes it on the
+     * `turn-start` it stamps, so an id set for a turn that never opens cannot leak onto a later
+     * unrelated one. Passing null clears it, which is what an in-app batch does.
+     */
+    setPendingTurnRequestId(requestId: string | null): void {
+        this.claudeSessionProtocolState.pendingRequestId = requestId;
+    }
+
+    /**
+     * Binds a permission prompt to the turn **that contains its tool call**, whenever both facts
+     * are known (Saycode specs/desktop-messenger-channels — R9).
+     *
+     * Order-independent on purpose. The SDK reads the assistant message and the permission
+     * `control_request` off one transport loop but puts them on different paths —
+     * `handleControlRequest` is dispatched without being awaited, and the message is enqueued into
+     * a separate input stream our own loop drains — so either can be observed first. "Which turn
+     * is current" would therefore sometimes name the previous turn, and a binding against the
+     * previous turn accepts an answer aimed at it while refusing the right one.
+     *
+     * So this waits for membership rather than reading a moving value: whichever of the two
+     * arrives second triggers the bind. Nothing is bound until then, which is the fail-closed
+     * direction — an answer arriving early is refused as `unknown-request`.
+     */
+    bindChannelPermissionWhenKnown(
+        toolCallId: string,
+        apply: (context: { turnId: string; channelRequestId: string | null; runtimeId: string }) => void,
+    ): void {
+        const membership = toolCallTurnFor(this.claudeSessionProtocolState, toolCallId);
+        if (membership) {
+            apply({
+                turnId: membership.turnId,
+                channelRequestId: membership.requestId,
+                runtimeId: this.runtimeId,
+            });
+            return;
+        }
+        // Bounded: one waiter per tool call, replaced rather than stacked, and dropped when the
+        // turn it would have belonged to is mapped.
+        this.pendingChannelPermissionBinds.set(toolCallId, apply);
+        while (this.pendingChannelPermissionBinds.size > MAX_PENDING_CHANNEL_BINDS) {
+            const oldest = this.pendingChannelPermissionBinds.keys().next();
+            if (oldest.done) break;
+            this.pendingChannelPermissionBinds.delete(oldest.value);
+        }
+    }
+
+    /** Resolves waiters whose tool call has since been mapped to a turn. */
+    private drainChannelPermissionBinds(): void {
+        if (this.pendingChannelPermissionBinds.size === 0) return;
+        for (const [toolCallId, apply] of [...this.pendingChannelPermissionBinds]) {
+            const membership = toolCallTurnFor(this.claudeSessionProtocolState, toolCallId);
+            if (!membership) continue;
+            this.pendingChannelPermissionBinds.delete(toolCallId);
+            apply({
+                turnId: membership.turnId,
+                channelRequestId: membership.requestId,
+                runtimeId: this.runtimeId,
+            });
+        }
+    }
+
+    /**
+     * Publishes the engine's authoritative final answer for an open or pending channel turn
+     * (Saycode specs/desktop-messenger-channels — R14).
+     *
+     * A result with no preceding transcript opens its pending channel turn first. An in-app turn shows its
+     * answer in the transcript, and adding a duplicate envelope for it would be noise on every
+     * ordinary session. Silently does nothing otherwise, which is why callers can hand it every
+     * result without checking first.
+     */
+    sendFinalAnswerForChannelTurn(text: string): void {
+        const mapped = mapClaudeChannelFinalAnswer(this.claudeSessionProtocolState, text);
+        this.enqueueSessionProtocolEnvelopes(mapped.envelopes, false);
+    }
+
     sendClaudeSessionMessage(body: RawJSONLines, localId?: string) {
         const mapped = mapClaudeLogMessageToSessionEnvelopes(body, this.claudeSessionProtocolState);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes, true, localId);
         this.applyClaudeSessionMessageSideEffects(body);
+        // A `tool-call-start` may have just named the turn a waiting prompt belongs to.
+        this.drainChannelPermissionBinds();
     }
 
     async sendClaudeSessionMessageFromLocalTranscript(body: RawJSONLines): Promise<void> {
@@ -1382,9 +1483,21 @@ export class ApiSessionClient extends EventEmitter {
                 turn: this.openAskUserQuestionTurnIds.get(call) ?? turnId
             })
         ));
-        envelopes.push(createEnvelope('agent', { t: 'turn-end', status: 'cancelled' }, { turn: turnId }));
+        // Carries the correlation the mapper's own `closeTurn` would have carried. This path
+        // builds the turn-end by hand, so without this a cancelled channel turn ends with no
+        // `requestId` and the caller waits forever for an answer that was already decided.
+        const requestId = this.claudeSessionProtocolState.currentRequestId ?? undefined;
+        envelopes.push(createEnvelope(
+            'agent',
+            { t: 'turn-end', status: 'cancelled', ...(requestId ? { requestId } : {}) },
+            { turn: turnId },
+        ));
 
         this.claudeSessionProtocolState.currentTurnId = null;
+        // Cleared for the same reason the mapper clears them: an id left behind here would be
+        // stamped onto whatever turn opens next, which answers the wrong request.
+        this.claudeSessionProtocolState.currentRequestId = null;
+        this.claudeSessionProtocolState.pendingRequestId = null;
         this.enqueueSessionProtocolEnvelopes(envelopes);
     }
 

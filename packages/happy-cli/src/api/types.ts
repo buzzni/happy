@@ -162,6 +162,42 @@ export const MachineMetadataSchema = z.object({
     sessionFollowup: z.literal(true).optional(),
     protocolVersion: z.number().int().min(1).optional(),
   }).optional(),
+  /**
+   * External messenger channel support (Saycode specs/desktop-messenger-channels).
+   *
+   * Advertised so Desktop can refuse to relay a channel message to a daemon that predates the
+   * handling. An older daemon ignores `meta.channelOrigin` entirely, which means it would read a
+   * channel `/clear` as session control and clear the queue, and would apply the AX
+   * plan→acceptEdits promotion to an external turn — the two things the field exists to prevent.
+   * Its absence is therefore *not* "probably fine": it is the unsafe case, and Desktop fails
+   * closed on it.
+   *
+   * `engines` lists the agents whose loops actually honour the field and correlate a reply to the
+   * request. It is deliberately explicit rather than "all of them": an engine that has not been
+   * wired yet would otherwise look supported and answer with the wrong turn.
+   */
+  channelSupport: z.object({
+    protocolVersion: z.literal(1),
+    engines: z.array(z.enum(['claude', 'codex', 'gemini', 'openclaw', 'opencode', 'grok'])),
+    /**
+     * One-shot permission approval from a messenger.
+     *
+     * A **separate axis** from `engines`, which only says the loop honours `meta.channelOrigin`
+     * and correlates a reply to the request. Answering a prompt needs more than that: the prompt
+     * must be bound to its turn as it is raised, published without its arguments, consumed
+     * atomically, and withdrawn on every path it leaves by. A daemon can do the first and none of
+     * the rest.
+     *
+     * Its own `protocolVersion` for the same reason `channelSupport` has one: the approval event
+     * shape can move without the channel transport moving. Not derived, not defaulted — absence
+     * means the daemon cannot do it, and a caller that offers the button anyway offers one whose
+     * answers are always refused. `engines` is a claim about each engine's loop, not the build.
+     */
+    approvals: z.object({
+      protocolVersion: z.literal(1),
+      engines: z.array(z.enum(['claude', 'codex', 'gemini', 'openclaw', 'opencode', 'grok'])),
+    }).optional(),
+  }).optional(),
   autonomousQualityGateSupport: AutonomousQualityGateCapabilityAdvertisementSchema.optional(),
   additionalDirectories: z.object({
     version: z.literal(1),

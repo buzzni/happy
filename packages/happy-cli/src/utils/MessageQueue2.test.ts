@@ -530,3 +530,46 @@ describe('MessageQueue2', () => {
         expect(batch3?.mode.type).toBe('B');
     });
 });
+
+describe('channel request correlation', () => {
+    // Saycode specs/desktop-messenger-channels — the handle has to survive the queue, because the
+    // turn that eventually runs is what the reply must be matched against.
+    it('carries an isolated message’s request id through to the batch', () => {
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.pushIsolated('from telegram', 'm', undefined, 'core-req-1');
+        expect(queue.queue.length).toBe(1);
+        const batch = (queue as unknown as { collectBatch(): { requestIds?: string[] } }).collectBatch();
+        expect(batch.requestIds).toEqual(['core-req-1']);
+    });
+
+    it('reports no request ids for ordinary in-app messages', () => {
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('typed in the app', 'm');
+        const batch = (queue as unknown as { collectBatch(): { requestIds?: string[] } }).collectBatch();
+        expect(batch.requestIds).toBeUndefined();
+    });
+
+    it('does not let a channel turn batch with in-app messages', () => {
+        // Same mode, so `push` would have merged them into one turn with two askers and no way to
+        // say which reply answers which request.
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('typed in the app', 'm');
+        queue.pushIsolated('from telegram', 'm', undefined, 'core-req-2');
+
+        const first = (queue as unknown as { collectBatch(): { message: string; requestIds?: string[] } }).collectBatch();
+        expect(first.message).toBe('typed in the app');
+        expect(first.requestIds).toBeUndefined();
+
+        const second = (queue as unknown as { collectBatch(): { message: string; requestIds?: string[] } }).collectBatch();
+        expect(second.message).toBe('from telegram');
+        expect(second.requestIds).toEqual(['core-req-2']);
+    });
+
+    it('keeps already-queued work when a channel message arrives', () => {
+        // `pushIsolateAndClear` would have discarded it; `pushIsolated` must not.
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('work someone is waiting on', 'm');
+        queue.pushIsolated('from telegram', 'm', undefined, 'core-req-3');
+        expect(queue.queue.length).toBe(2);
+    });
+});
