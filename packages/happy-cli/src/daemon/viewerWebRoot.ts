@@ -94,8 +94,17 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
         win.setTimeout(restoreFocus, FOCUS_RESTORE_MS)
     }
 
+    const isPasteKey = (event: any) => {
+        if (event.key === 'v' || event.key === 'V') return true
+        // With a Korean (or any non-Latin) layout active the browser can
+        // report the composed letter instead. Fall back to the physical key,
+        // but only when what it reported is not an ASCII letter of its own —
+        // on Dvorak that same key is a different letter and must stay one.
+        return event.code === 'KeyV' && !/^[a-zA-Z]$/.test(String(event.key))
+    }
+
     win.addEventListener('keydown', (event: any) => {
-        if (event.key !== 'v' && event.key !== 'V') return
+        if (!isPasteKey(event)) return
         if (event.altKey) return
         if (!event.ctrlKey && !event.metaKey) return
         if (!session()) return
@@ -222,6 +231,7 @@ export function ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode, onFall
     /** Called with the reason when the mirror could not be built. */
     onFallback?: (reason: string) => void
 }): string {
+    let rebuilding = false
     try {
         const html = buildViewerIndexHtml({
             sourceHtml: readFileSync(join(sourceRoot, 'vnc.html'), 'utf8'),
@@ -232,6 +242,7 @@ export function ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode, onFall
         // it opens files per request: rebuilding one that is already correct
         // would 404 whatever asset is in flight for no gain.
         if (viewerWebRootIsCurrent({ sourceRoot, targetRoot, html, bridge })) return targetRoot
+        rebuilding = true
         rmSync(targetRoot, { recursive: true, force: true })
         mkdirSync(join(targetRoot, dirname(VIEWER_BRIDGE_PATH)), { recursive: true })
         for (const entry of readdirSync(sourceRoot)) {
@@ -246,7 +257,10 @@ export function ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode, onFall
         return targetRoot
     } catch (error) {
         onFallback?.(String(error))
-        if (existsSync(targetRoot)) rmSync(targetRoot, { recursive: true, force: true })
+        // Only clean up a mirror this call was in the middle of building. A
+        // read failure before that leaves the previous mirror alone — another
+        // slot's websockify may be serving it right now.
+        if (rebuilding && existsSync(targetRoot)) rmSync(targetRoot, { recursive: true, force: true })
         return sourceRoot
     }
 }

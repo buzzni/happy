@@ -107,7 +107,7 @@ import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
 import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
 import { validatePath } from '@/modules/common/pathSecurity';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
@@ -1431,7 +1431,6 @@ export class ApiMachineClient {
                 running: this.viewer !== null,
                 webPort: this.viewer?.webPort ?? null,
                 display: this.viewer?.display ?? null,
-                fill: selectViewerBackend(capabilities)?.resizeMode === 'remote' ? 'exact' : 'scaled',
                 upgradable,
             };
         });
@@ -1451,12 +1450,17 @@ export class ApiMachineClient {
                 return plan;
             }
             const result = await runShell(plan.command);
-            const stillMissing = missingViewerTools(await detectViewerCapabilities());
+            const after = await detectViewerCapabilities();
+            const stillMissing = missingViewerTools(after);
             return {
                 action: 'run',
                 command: plan.command,
+                // `ok` still means "the screen can open" — that is what the
+                // caller gates on. What the install asked for beyond that
+                // travels separately instead of being folded into a success.
                 ok: stillMissing.length === 0,
                 missing: stillMissing,
+                upgradable: desiredViewerTools(after),
                 stderr: result.ok ? undefined : result.output,
             };
         });
@@ -2375,10 +2379,15 @@ export class ApiMachineClient {
         let backend = preferred;
         let serving = false;
         if (preferred.kind === 'xvnc') {
+            // Whoever holds it, a busy port makes the wait below meaningless:
+            // it would report someone else's server as ours.
+            if (!(await isPortFree(vncPort))) {
+                logger.debug(`[viewer] ${vncPort} was already in use before starting Xvnc on ${display}`);
+            }
             const xvnc = spawnDetached('Xvnc', buildXvncArgs({ display, vncPort, ...VIEWER_SCREEN }));
             serving = await waitForPort(vncPort, 8_000);
             if (serving) {
-                processIds.xvnc = xvnc.pid;
+                if (xvnc.pid) processIds.xvnc = xvnc.pid;
                 if (capabilities.hasVncConfig) {
                     // Without this helper a paste reaches Xvnc and stops
                     // there: nothing owns the X CLIPBOARD selection.
@@ -2393,6 +2402,9 @@ export class ApiMachineClient {
                 logger.debug(`[viewer] Xvnc did not open ${vncPort} on ${display}; falling back to Xvfb + x11vnc`);
                 if (xvnc.pid) {
                     try { process.kill(-xvnc.pid, 'SIGTERM'); } catch { /* already gone */ }
+                    // Xvfb cannot take a display whose lock file is still
+                    // there, and the lock goes with the process.
+                    await delay(500);
                 }
             }
         }
@@ -2404,8 +2416,8 @@ export class ApiMachineClient {
             await delay(1500);
             const x11vnc = spawnDetached('x11vnc', buildX11vncArgs({ display, vncPort }));
             await delay(800);
-            processIds.xvfb = xvfb.pid;
-            processIds.x11vnc = x11vnc.pid;
+            if (xvfb.pid) processIds.xvfb = xvfb.pid;
+            if (x11vnc.pid) processIds.x11vnc = x11vnc.pid;
             backend = {
                 kind: 'xvfb-x11vnc',
                 resizeMode: 'scale',
@@ -2418,7 +2430,12 @@ export class ApiMachineClient {
             // display and exits with it, so there is nothing extra to reap.
             const configPath = join(configuration.happyHomeDir, 'browser-viewers', 'openbox.xml');
             mkdirSync(dirname(configPath), { recursive: true, mode: 0o700 });
-            writeFileSync(configPath, buildOpenboxConfig());
+            // Written atomically: another slot's openbox may be reading this
+            // very file, and a half-written rc.xml silently falls back to
+            // decorated, unmaximized windows.
+            const configTemp = `${configPath}.${randomUUID()}.tmp`;
+            writeFileSync(configTemp, buildOpenboxConfig());
+            renameSync(configTemp, configPath);
             spawnDetached('openbox', buildOpenboxArgs({ configPath }), { DISPLAY: display });
         }
 

@@ -424,3 +424,71 @@ describe('ensureViewerWebRoot idempotence', () => {
         expect(existsSync(join(targetRoot, 'vendor'))).toBe(true)
     })
 })
+
+describe('installViewerClipboardBridge on a non-Latin keyboard layout', () => {
+    // With a Korean layout active the browser can report the composed letter
+    // for the same physical key; the shortcut has to keep working there.
+    it('accepts the physical V key when the reported letter is not Latin', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        let stopped = 0
+        dom.fireKeydown({ key: 'ㅍ', code: 'KeyV', metaKey: true, stopImmediatePropagation: () => { stopped += 1 } })
+
+        expect(stopped).toBe(1)
+    })
+
+    // On Dvorak that same physical key is a different letter, and typing it
+    // with a modifier must stay that letter.
+    it('leaves the physical V key alone when it types another Latin letter', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        let stopped = 0
+        dom.fireKeydown({ key: 'k', code: 'KeyV', ctrlKey: true, stopImmediatePropagation: () => { stopped += 1 } })
+
+        expect(stopped).toBe(0)
+    })
+})
+
+describe('ensureViewerWebRoot failure handling', () => {
+    // Several viewer slots share one mirror. A read failure that happens
+    // before any rebuild starts must not delete the mirror another slot's
+    // websockify is serving right now.
+    it('keeps a working mirror when the source becomes unreadable later', () => {
+        const base = mkdtempSync(join(tmpdir(), 'viewer-web-root-keep-'))
+        const sourceRoot = join(base, 'novnc')
+        const targetRoot = join(base, 'mirror')
+        mkdirSync(join(sourceRoot, 'app'), { recursive: true })
+        writeFileSync(join(sourceRoot, 'vnc.html'), STOCK_HTML)
+        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+
+        writeFileSync(join(sourceRoot, 'vnc.html'), '<html><body>no head</body></html>')
+        const root = ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+
+        expect(root).toBe(sourceRoot)
+        expect(existsSync(join(targetRoot, 'vnc.html'))).toBe(true)
+    })
+})
+
+describe('buildViewerBridgeModule ships browser-safe source', () => {
+    // The module is this function's own text (Function.prototype.toString), so
+    // anything the bundler injects into the body — a `__name()` call from
+    // --keep-names, a `__spreadValues` helper — would be an undefined
+    // identifier in the browser and kill the bridge with no clue why.
+    it('references no bundler helper from inside the served function', () => {
+        const source = buildViewerBridgeModule()
+
+        expect(source).not.toMatch(/__[A-Za-z]+\s*\(/)
+    })
+
+    // Same reason: the function must not reach for anything in module scope.
+    it('closes over nothing but its own arguments', () => {
+        const source = buildViewerBridgeModule()
+
+        expect(source).not.toContain('VIEWER_BRIDGE_PATH')
+        expect(source).not.toContain('logger')
+    })
+})
