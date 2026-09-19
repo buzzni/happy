@@ -31,7 +31,7 @@ function grantResponse(overrides: Record<string, unknown> = {}) {
       version: 1,
       grantId: 'grant-1',
       policyRevision: 7,
-      expiresAt: Date.now() + 10_000,
+      expiresAt: Date.now() + 60_000,
       sourceMachineId: 'source-1',
       hostMachineId: 'host-1',
       hostProcessKeyId: 'key-1',
@@ -388,6 +388,115 @@ describe('difficulty routing diagnostics', () => {
     const dump = JSON.stringify(lines)
     expect(dump).not.toContain('SECRET-PROMPT-TEXT')
     expect(dump).not.toContain('SECRET-AUTHORIZATION')
+  })
+})
+
+// grant 가 거부되면 턴은 조용히 기존 모델로 진행한다. 운영에서 실제로 여기서 끊겼는데
+// 로그가 `reason: 'grant-rejected'` 하나뿐이라 원인을 특정할 수 없었다 — reason 이 비는
+// 경로가 네 가지(parse/http/response/validation)이고, validation 안에서도 여러 조건이
+// 동시에 틀릴 수 있기 때문이다.
+describe('grant rejection detail', () => {
+  function captureDebug() {
+    const lines: Array<{ message: string; args: unknown[] }> = []
+    vi.spyOn(logger, 'debug').mockImplementation((message: string, ...args: unknown[]) => {
+      lines.push({ message, args })
+    })
+    return lines
+  }
+  const dump = (lines: Array<{ message: string; args: unknown[] }>) =>
+    JSON.stringify(lines.filter((l) => l.message.includes('[difficultyRouting]')))
+
+  it('names the stage when the response body is not an object', async () => {
+    const lines = captureDebug()
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('not json', { status: 200 })))
+
+    expect(await resolveDifficultyRouting(baseInput)).toBeNull()
+    expect(dump(lines)).toContain('parse')
+  })
+
+  it('names the stage and status when the server answers with an HTTP error', async () => {
+    const lines = captureDebug()
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({}, { status: 503 })))
+
+    expect(await resolveDifficultyRouting(baseInput)).toBeNull()
+    const text = dump(lines)
+    expect(text).toContain('http')
+    expect(text).toContain('503')
+  })
+
+  it('names the stage when the server answers ok:false without a reason', async () => {
+    const lines = captureDebug()
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ ok: false })))
+
+    expect(await resolveDifficultyRouting(baseInput)).toBeNull()
+    expect(dump(lines)).toContain('response')
+  })
+
+  // 단일 원인을 가정하면 첫 번째 실패만 보고 엉뚱한 곳을 고치게 된다.
+  it('collects every failed condition, not just the first', async () => {
+    const lines = captureDebug()
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse({
+      maxInputChars: 4000,
+      modelMaxInputTokens: 256,
+      hostMachineId: '',
+    }))))
+
+    expect(await resolveDifficultyRouting(baseInput)).toBeNull()
+    const text = dump(lines)
+    expect(text).toContain('validation')
+    expect(text).toContain('maxInputChars')
+    expect(text).toContain('modelMaxInputTokens')
+    expect(text).toContain('hostMachineId')
+  })
+
+  // 서버 시계가 앞서면 상한을 넘는다. 클라이언트 시계를 고정하고 발급값만 앞당겨
+  // 재현한다 — fake timer 를 전진시키면 TTL 이 줄어들 뿐이라 이 결함이 재현되지 않는다.
+  it('reports how far the deadlines were off when a clock offset pushes them past the ceiling', async () => {
+    const lines = captureDebug()
+    const serverNow = Date.now() + 5_000
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse({
+      expiresAt: serverNow + 60_000,
+      relayDeadlineAt: serverNow + 1_000,
+    }))))
+
+    expect(await resolveDifficultyRouting(baseInput)).toBeNull()
+    const text = dump(lines)
+    expect(text).toContain('expiresAt-too-far')
+    expect(text).toContain('relayDeadlineAt-too-far')
+    expect(text).toContain('expiresInMs')
+    expect(text).toContain('relayDeadlineInMs')
+  })
+
+  it('still accepts a grant issued exactly at the contract TTL', async () => {
+    captureDebug()
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    expect(await resolveDifficultyRouting(baseInput)).not.toBeNull()
+  })
+
+  it('rejects an already expired grant and a non-numeric deadline', async () => {
+    const lines = captureDebug()
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse({ expiresAt: Date.now() - 1 }))))
+    expect(await resolveDifficultyRouting(baseInput)).toBeNull()
+    expect(dump(lines)).toContain('expiresAt-past')
+
+    const other = captureDebug()
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse({ relayDeadlineAt: 'soon' }))))
+    expect(await resolveDifficultyRouting(baseInput)).toBeNull()
+    expect(dump(other)).toContain('relayDeadlineAt')
+  })
+
+  it('keeps the grant token and keys out of the failure log', async () => {
+    const lines = captureDebug()
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse({ maxInputChars: 1 }))))
+
+    expect(await resolveDifficultyRouting(baseInput)).toBeNull()
+    const text = dump(lines)
+    // 로그가 0건이면 아래 단언이 모두 무의미해진다.
+    expect(text).toContain('validation')
+    expect(text).not.toContain('signed-grant')
+    expect(text).not.toContain('routing-authorization')
+    expect(text).not.toContain(encodeBase64(new Uint8Array(32).fill(1)))
   })
 })
 
