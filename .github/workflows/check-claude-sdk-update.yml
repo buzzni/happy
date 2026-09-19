@@ -79,7 +79,7 @@ jobs:
           # Plain 'install' (not 'update') so only this dependency's resolved
           # version moves — 'pnpm update' re-resolves the whole workspace and
           # drags in unrelated bumps (observed while preparing buzzni/happy#455).
-          pnpm install --filter @buzzni/happy-cli...
+          pnpm install --no-frozen-lockfile --filter @buzzni/happy-cli...
 
       - name: Bump happy-cli release version
         if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
