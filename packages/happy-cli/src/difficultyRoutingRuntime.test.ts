@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { resolveAplusApiOrigin, resolveDifficultyRouting } from './difficultyRoutingRuntime'
+import { logger } from './ui/logger'
 import { configuration } from './configuration'
 import { encodeBase64 } from './api/encryption'
 
@@ -319,3 +320,74 @@ describe('difficulty routing runtime', () => {
     })
   })
 })
+
+// 이 경로는 실패해도 기존 모델로 조용히 폴백한다. 운영에서 "라우팅이 안 걸린다"를
+// 조사할 때 어느 단계에서 끊겼는지 알 방법이 로그뿐인데, 종전에는 이 파일에 로그
+// 호출이 하나도 없어 RPC 응답 바이트 크기로 성패를 추정해야 했다.
+describe('difficulty routing diagnostics', () => {
+  function captureDebug() {
+    const lines: Array<{ message: string; args: unknown[] }> = []
+    vi.spyOn(logger, 'debug').mockImplementation((message: string, ...args: unknown[]) => {
+      lines.push({ message, args })
+    })
+    return lines
+  }
+
+  it('records why a turn was skipped before any network call', async () => {
+    const lines = captureDebug()
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      meta: { difficultyRoutingIntent: intent },
+    })
+
+    expect(decision).toBeNull()
+    expect(fetchMock).not.toHaveBeenCalled()
+    const skipped = lines.find((line) => line.message.includes('[difficultyRouting]'))
+    expect(skipped, '건너뛴 사유가 로그에 남아야 한다').toBeTruthy()
+    expect(JSON.stringify(skipped)).toContain('missing-authorization')
+  })
+
+  it('records the applied decision with its classifier source, model and effort', async () => {
+    const lines = captureDebug()
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const decision = await resolveDifficultyRouting(baseInput)
+
+    expect(decision?.route.model).toBe('claude-haiku-4-5')
+    const applied = lines.filter((line) => line.message.includes('[difficultyRouting]'))
+    expect(applied.length, '결정이 로그에 남아야 한다').toBeGreaterThan(0)
+    const dump = JSON.stringify(applied)
+    expect(dump).toContain('p1-local')
+    expect(dump).toContain('claude-haiku-4-5')
+  })
+
+  it('never writes the prompt or the turn authorization into the log', async () => {
+    const lines = captureDebug()
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'SECRET-PROMPT-TEXT-do-not-log',
+      meta: {
+        difficultyRoutingIntent: intent,
+        difficultyRoutingAuthorization: 'SECRET-AUTHORIZATION-do-not-log',
+      },
+    })
+
+    // 건너뛰는 경로도 함께 본다 — 성공 경로만 덮으면 skip 분기에 프롬프트를 흘려도
+    // 초록이다(변이로 확인).
+    await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'SECRET-PROMPT-TEXT-do-not-log',
+      meta: { difficultyRoutingIntent: intent },
+    })
+
+    const dump = JSON.stringify(lines)
+    expect(dump).not.toContain('SECRET-PROMPT-TEXT')
+    expect(dump).not.toContain('SECRET-AUTHORIZATION')
+  })
+})
+
