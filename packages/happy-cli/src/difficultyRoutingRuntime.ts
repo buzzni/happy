@@ -1,6 +1,7 @@
 import tweetnacl from 'tweetnacl'
 import { createEnvelope, type SessionEnvelope } from '@slopus/happy-wire'
 import { configuration } from '@/configuration'
+import { logger } from '@/ui/logger'
 import { decodeBase64, encodeBase64, getRandomBytes } from '@/api/encryption'
 import {
   DIFFICULTY_ROUTING_POLICY_VERSION,
@@ -77,45 +78,106 @@ const RUNTIME_ROUTING_DEADLINE_MS = 750
 let circuitBreakerUntil = 0
 let consecutiveFailures = 0
 
+/**
+ * Every exit of `resolveDifficultyRouting` reports why, because a failure here
+ * is invisible by design: the turn silently keeps the client's model. Without
+ * this the only field evidence was the byte size of an encrypted relay
+ * response, which cannot distinguish "classified but discarded" from
+ * "never classified".
+ *
+ * Never pass the prompt, the intent or the turn authorization — the contract
+ * keeps routing text out of logs (`difficultyRoutingRuntime.test.ts` pins it).
+ */
+function logRoutingOutcome(
+  outcome: string,
+  detail: Record<string, string | number | boolean | null | undefined> = {},
+): void {
+  logger.debug(`[difficultyRouting] ${outcome}`, detail)
+}
+
+/**
+ * A decision builder returns null when the routed model/effort is unusable or
+ * the org AI policy disallows it. That discard is the one outcome that looks
+ * identical to "routing never ran" from outside, so name it explicitly.
+ */
+function logDecision(
+  classifierSource: string,
+  decision: DifficultyRoutingRuntimeDecision | null,
+  clientRequestId: string,
+  remoteStatus?: string,
+): DifficultyRoutingRuntimeDecision | null {
+  if (!decision) {
+    logRoutingOutcome('decision-discarded', { classifierSource, clientRequestId, remoteStatus })
+    return null
+  }
+  logRoutingOutcome('applied', {
+    classifierSource,
+    clientRequestId,
+    remoteStatus,
+    model: decision.route.model,
+    effort: decision.route.effort,
+    difficulty: decision.route.difficulty,
+  })
+  return decision
+}
+
 export async function resolveDifficultyRouting(
   input: DifficultyRoutingRuntimeInput,
 ): Promise<DifficultyRoutingRuntimeDecision | null> {
   const intent = input.meta?.difficultyRoutingIntent
-  if (hasManualModelOverride(input.meta)) return null
+  if (hasManualModelOverride(input.meta)) {
+    logRoutingOutcome('skipped', { reason: 'manual-model-override', sessionId: input.sessionId })
+    return null
+  }
   const clientRequestId = typeof intent === 'object' && intent !== null
     ? (intent as Record<string, unknown>).clientRequestId
     : undefined
-  if (typeof clientRequestId !== 'string' || !clientRequestId) return null
+  if (typeof clientRequestId !== 'string' || !clientRequestId) {
+    logRoutingOutcome('skipped', { reason: 'missing-client-request-id', sessionId: input.sessionId })
+    return null
+  }
   const prompt = pickDifficultyRoutingPrompt({
     intent,
     contentText: input.contentText,
     metaPrompt: input.meta?.difficultyRoutingPrompt,
   })
-  if (prompt === null) return null
+  if (prompt === null) {
+    logRoutingOutcome('skipped', { reason: 'prompt-not-routable', sessionId: input.sessionId, clientRequestId })
+    return null
+  }
   const authorization = typeof input.meta?.difficultyRoutingAuthorization === 'string'
     ? input.meta.difficultyRoutingAuthorization
     : ''
-  if (!authorization) return null
+  if (!authorization) {
+    logRoutingOutcome('skipped', { reason: 'missing-authorization', sessionId: input.sessionId, clientRequestId })
+    return null
+  }
   const deadline = Date.now() + RUNTIME_ROUTING_DEADLINE_MS
   let grant: { ok: true; value: GrantOk } | { ok: false; reason?: string; aiModelPolicy?: DifficultyRoutingAiModelPolicy }
   try {
     grant = await requestGrant(input, clientRequestId, deadline)
-  } catch {
+  } catch (error) {
     noteRemoteFailure()
+    logRoutingOutcome('grant-request-failed', {
+      clientRequestId,
+      errorName: error instanceof Error ? error.name : typeof error,
+    })
     return null
   }
   if (!grant.ok) {
     if ((grant.reason === 'host-unavailable' || grant.reason === 'unsupported') && grant.aiModelPolicy) {
       const p1 = classifyDifficultyHeuristic(prompt)
       noteRemoteFailure()
-      return buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, null, undefined, 'fallback-p1', grant.aiModelPolicy)
+      logRoutingOutcome('grant-rejected-falling-back', { clientRequestId, reason: grant.reason })
+      return logDecision('fallback-p1', buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, null, undefined, 'fallback-p1', grant.aiModelPolicy), clientRequestId, grant.reason)
     }
+    logRoutingOutcome('skipped', { reason: grant.reason ?? 'grant-rejected', clientRequestId })
     return null
   }
 
   const p1 = classifyDifficultyHeuristic(prompt)
   if (p1.confident || shouldReusePreviousDifficultyForContinuation(prompt, freshPreviousDifficulty(input.state)) || circuitBreakerUntil > Date.now()) {
-    return buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, grant.value.grant.policyRevision, undefined, 'p1-local', grant.value.aiModelPolicy)
+    return logDecision('p1-local', buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, grant.value.grant.policyRevision, undefined, 'p1-local', grant.value.aiModelPolicy), clientRequestId)
   }
 
   try {
@@ -132,15 +194,19 @@ export async function resolveDifficultyRouting(
     }, deadline)
     if (relay.status !== 'ok' || !relay.difficulty) {
       noteRemoteFailure()
-      return buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, grant.value.grant.policyRevision, relay.status, 'fallback-p1', grant.value.aiModelPolicy)
+      return logDecision('fallback-p1', buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, grant.value.grant.policyRevision, relay.status, 'fallback-p1', grant.value.aiModelPolicy), clientRequestId, relay.status)
     }
     consecutiveFailures = 0
 
-    return buildRemoteDecision(input, prompt, clientRequestId, relay.difficulty, grant.value.grant.policyRevision, relay, grant.value.aiModelPolicy)
-  } catch {
+    return logDecision('p2-org-shared', buildRemoteDecision(input, prompt, clientRequestId, relay.difficulty, grant.value.grant.policyRevision, relay, grant.value.aiModelPolicy), clientRequestId, relay.status)
+  } catch (error) {
     const p1 = classifyDifficultyHeuristic(prompt)
     noteRemoteFailure()
-    return buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, null, undefined, 'fallback-p1', grant.value.aiModelPolicy)
+    logRoutingOutcome('relay-request-failed', {
+      clientRequestId,
+      errorName: error instanceof Error ? error.name : typeof error,
+    })
+    return logDecision('fallback-p1', buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, null, undefined, 'fallback-p1', grant.value.aiModelPolicy), clientRequestId)
   }
 }
 
