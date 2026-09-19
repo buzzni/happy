@@ -67,3 +67,45 @@ describe('AiUsageEventV1Schema', () => {
         expect(() => AiUsageEventV1Schema.parse(providerEvent)).toThrow();
     });
 });
+
+describe('aiAuth report on a usage event', () => {
+    it('accepts an event from a CLI that does not report an auth source', () => {
+        expect(ProviderUsageEventV1Schema.parse(providerEvent)).toEqual(providerEvent);
+        expect(ProviderUsageEventV1Schema.parse({ ...providerEvent, aiAuth: null }).aiAuth).toBeNull();
+    });
+
+    it('keeps an applied source the receiver does not know yet', () => {
+        const event = {
+            ...providerEvent,
+            aiAuth: { appliedSource: 'some-future-source', connectionVersion: 3 },
+        };
+
+        expect(ProviderUsageEventV1Schema.parse(event)).toEqual(event);
+    });
+
+    it('carries the report through the server boundary schema too', () => {
+        const event = {
+            ...providerEvent,
+            happyAccountId: 'happy-account-1',
+            aiAuth: { appliedSource: 'platform-glm', connectionVersion: null },
+        };
+
+        expect(AiUsageEventV1Schema.parse(event)).toEqual(event);
+    });
+
+    it('stays on schema version 1 so older CLI events keep parsing', () => {
+        expect(ProviderUsageEventV1Schema.parse({
+            ...providerEvent,
+            aiAuth: { appliedSource: 'platform-glm' },
+        }).schemaVersion).toBe(1);
+    });
+
+    it.each([
+        ['a non-string applied source', { appliedSource: 7 }],
+        ['a fractional connection version', { appliedSource: 'org-bundle', connectionVersion: 1.5 }],
+        ['a negative connection version', { appliedSource: 'org-bundle', connectionVersion: -1 }],
+        ['an unexpected field', { appliedSource: 'org-bundle', ownerUserId: 'u1' }],
+    ])('rejects %s', (_label, aiAuth) => {
+        expect(() => ProviderUsageEventV1Schema.parse({ ...providerEvent, aiAuth })).toThrow();
+    });
+});
