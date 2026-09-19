@@ -6,7 +6,7 @@ import { createAdapter } from "@socket.io/redis-streams-adapter";
 import { createRedisClient, isRedisConfigured } from "@/storage/createRedisClient";
 import { log } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
-import { authenticateBrowserSyncSocket } from "./socket/browserSyncSocketAuth";
+import { BROWSER_SYNC_EXPIRES_AT, armBrowserSyncDeadline, authenticateBrowserSyncSocket } from "./socket/browserSyncSocketAuth";
 import { getMetricsLabelsFromSocket, redisStreamInfoFailuresCounter, redisStreamLagMsGauge, redisStreamWriteFailuresCounter, socketioClusterPeersGauge, websocketConnectionsGauge, websocketEventsCounter } from "../monitoring/metrics2";
 import { createLogThrottle, instrumentStreamWrites, readClusterPeerCount } from "../monitoring/redisHealth";
 import { usageHandler } from "./socket/usageHandler";
@@ -236,11 +236,11 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             socket.data.happyClient = socket.handshake.auth.happyClient as string
                 || socket.handshake.headers['x-happy-client'] as string
                 || undefined;
-            const remaining = browserSync.expiresAt - Date.now();
-            const deadline = setTimeout(() => socket.disconnect(true), Math.max(0, remaining));
-            // 이 타이머가 종료를 막을 이유가 없다 — managedDaemonSocketGuard 와 같다.
-            deadline.unref?.();
-            socket.on('disconnect', () => clearTimeout(deadline));
+            // 만료 시각만 남기고, 타이머는 connection 에서 건다. 여기서 걸면
+            // connection state recovery 로 되살아난 소켓이 만료 없이 산다 —
+            // 복구는 이 미들웨어를 건너뛰고, 앞선 disconnect 가 타이머를 이미
+            // 지웠기 때문이다. `socket.data` 는 복구 때 그대로 돌아온다.
+            socket.data[BROWSER_SYNC_EXPIRES_AT] = browserSync.expiresAt;
             next();
             return;
         }
@@ -309,6 +309,9 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
     }
 
     io.on("connection", (socket) => {
+        // 새 연결과 복구된 연결이 같이 지나는 유일한 지점이다. 자격이 이미
+        // 만료됐으면 여기서 끝난다.
+        if (armBrowserSyncDeadline(socket as never, Date.now()) === 'expired') return;
         const userId = socket.data.userId as string;
         const clientType = socket.data.clientType as 'session-scoped' | 'user-scoped' | 'machine-scoped' | undefined;
         const sessionId = socket.data.sessionId as string | undefined;

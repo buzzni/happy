@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { requireAccountPrincipal } from "@/app/api/utils/enableAuthentication";
 import { Fastify } from "../types";
 import { Context } from "@/context";
 import { projectMemberInvite } from "@/app/project/projectMemberInvite";
@@ -14,8 +15,13 @@ const ProjectRoleSchema = z.enum(['owner', 'editor', 'viewer']);
 
 export function projectMemberRoutes(app: Fastify) {
 
+    /*
+     * 계정 bearer 만. 멤버십은 **다른 계정에게** 이 요청을 만든 자격의 만료와
+     * 무관한 권한을 남긴다. 짧은 수명 자격으로 심을 수 있으면, 그 자격이
+     * 만료돼도 심어 둔 권한은 그대로 산다.
+     */
     app.post('/v1/projects/:projectId/members', {
-        preHandler: app.authenticate,
+        preHandler: [app.authenticate, requireAccountPrincipal],
         schema: {
             params: z.object({ projectId: z.string() }),
             // Either { username, role } (legacy) or { accountId, role }
@@ -79,8 +85,13 @@ export function projectMemberRoutes(app: Fastify) {
         return reply.send({ member: result.value });
     });
 
+    /*
+     * 계정 bearer 만. 멤버십은 **다른 계정에게** 이 요청을 만든 자격의 만료와
+     * 무관한 권한을 남긴다. 짧은 수명 자격으로 심을 수 있으면, 그 자격이
+     * 만료돼도 심어 둔 권한은 그대로 산다.
+     */
     app.post('/v1/projects/:projectId/members/:memberId/role', {
-        preHandler: app.authenticate,
+        preHandler: [app.authenticate, requireAccountPrincipal],
         schema: {
             params: z.object({
                 projectId: z.string(),

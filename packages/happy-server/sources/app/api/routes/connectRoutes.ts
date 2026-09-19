@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { type Fastify, GitHubProfile } from "../types";
 import { auth } from "@/app/auth/auth";
+import { requireAccountPrincipal } from "@/app/api/utils/enableAuthentication";
 import { log } from "@/utils/log";
 import { eventRouter } from "@/app/events/eventRouter";
 import { decryptString, encryptString } from "@/modules/encrypt";
@@ -268,8 +269,15 @@ export function connectRoutes(app: Fastify) {
         reply.send({ success: true });
     });
 
+    /*
+     * 계정 bearer 만. 여기가 돌려주는 것은 서버가 복호화한 **평문 외부 자격**
+     * 이고, 그 자격의 수명은 이 요청을 만든 자격과 아무 관계가 없다. 15분짜리
+     * browser sync 자격으로 꺼낼 수 있으면 잔여 노출을 자격 수명으로 묶는다는
+     * 전제가 무너진다 — 꺼내 간 PAT·벤더 토큰은 만료 뒤에도 외부에서 쓰인다.
+     * 이 경로들은 원래 서버(vite 미들웨어)와 CLI 가 쓰는 자리다.
+     */
     app.get('/v1/connect/:vendor/token', {
-        preHandler: app.authenticate,
+        preHandler: [app.authenticate, requireAccountPrincipal],
         schema: {
             params: z.object({
                 vendor: z.enum(INFERENCE_VENDORS)
@@ -311,8 +319,15 @@ export function connectRoutes(app: Fastify) {
         reply.send({ success: true });
     });
 
+    /*
+     * 계정 bearer 만. 여기가 돌려주는 것은 서버가 복호화한 **평문 외부 자격**
+     * 이고, 그 자격의 수명은 이 요청을 만든 자격과 아무 관계가 없다. 15분짜리
+     * browser sync 자격으로 꺼낼 수 있으면 잔여 노출을 자격 수명으로 묶는다는
+     * 전제가 무너진다 — 꺼내 간 PAT·벤더 토큰은 만료 뒤에도 외부에서 쓰인다.
+     * 이 경로들은 원래 서버(vite 미들웨어)와 CLI 가 쓰는 자리다.
+     */
     app.get('/v1/connect/tokens', {
-        preHandler: app.authenticate,
+        preHandler: [app.authenticate, requireAccountPrincipal],
         schema: {
             response: {
                 200: z.object({
@@ -416,8 +431,15 @@ export function connectRoutes(app: Fastify) {
         return reply.send({ success: true });
     });
 
+    /*
+     * 계정 bearer 만. 여기가 돌려주는 것은 서버가 복호화한 **평문 외부 자격**
+     * 이고, 그 자격의 수명은 이 요청을 만든 자격과 아무 관계가 없다. 15분짜리
+     * browser sync 자격으로 꺼낼 수 있으면 잔여 노출을 자격 수명으로 묶는다는
+     * 전제가 무너진다 — 꺼내 간 PAT·벤더 토큰은 만료 뒤에도 외부에서 쓰인다.
+     * 이 경로들은 원래 서버(vite 미들웨어)와 CLI 가 쓰는 자리다.
+     */
     app.get('/v1/connect/github-pat/token', {
-        preHandler: app.authenticate,
+        preHandler: [app.authenticate, requireAccountPrincipal],
         schema: {
             response: {
                 200: z.object({ token: z.string().nullable() })

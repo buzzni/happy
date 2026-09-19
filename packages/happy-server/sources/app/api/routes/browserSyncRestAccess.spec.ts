@@ -60,6 +60,8 @@ import {
     requireSessionScopeAuth,
 } from '@/app/api/utils/enableAuthentication';
 import { authRoutes } from '@/app/api/routes/authRoutes';
+import { connectRoutes } from '@/app/api/routes/connectRoutes';
+import { projectMemberRoutes } from '@/app/api/routes/projectMemberRoutes';
 import type { Fastify } from '@/app/api/types';
 
 const ACCOUNT = 'acc-victim';
@@ -76,6 +78,8 @@ async function buildApp() {
     // 켜 둔다 — 브라우저 자격이 그쪽에서도 풀려야 한다는 게 검증 대상이다.
     enableSessionScopeAuthentication(typed, () => null);
     authRoutes(typed);
+    connectRoutes(typed);
+    projectMemberRoutes(typed);
     typed.get('/spec/session-scope', {
         preHandler: requireSessionScopeAuth(typed) as never,
     }, async (request: any) => ({ userId: request.userId }));
@@ -214,6 +218,66 @@ describe('browser sync credential on account-bearer-issuing routes', () => {
         });
 
         expect(approve.statusCode).toBe(200);
+        // 200 만 보면 승인이 **아무것도 하지 않아도** 통과한다(핸들러의 DB
+        // 쓰기를 지워도 초록이었다). 승인의 결과는 기다리던 쪽이 실제로
+        // 계정 bearer 를 받는 것이므로, 거기까지 본다.
+        const collected = await (app as any).inject({
+            method: 'POST',
+            url: '/v1/auth/account/request',
+            payload: { publicKey: ATTACKER_PUBLIC_KEY },
+        });
+
+        expect(collected.json()).toMatchObject({
+            state: 'authorized',
+            response: 'sealed-answer',
+        });
+        const handed = await auth.verifyToken(collected.json().token);
+        expect(handed?.userId).toBe(ACCOUNT);
+    });
+});
+
+describe('browser sync credential on routes that outlive it', () => {
+    // 이 자격의 안전성은 전부 짧은 수명에 걸려 있다. 만료 없는 것을 내주는
+    // 라우트에 닿으면 그 전제가 사라진다 — 계정 bearer 만 받아야 한다.
+    it.each([
+        ['/v1/connect/tokens', '저장된 추론 서비스 토큰 평문'],
+        ['/v1/connect/github-pat/token', 'GitHub PAT 평문'],
+        ['/v1/connect/anthropic/token', '벤더 토큰 평문'],
+    ])('refuses to hand out a stored credential: %s', async (url) => {
+        const browserSync = await mintBrowserSyncCredential();
+
+        const response = await app.inject({
+            method: 'GET', url,
+            headers: { authorization: `Bearer ${browserSync}` },
+        });
+
+        expect(response.statusCode).toBe(403);
+    });
+
+    it('refuses to grant another account persistent project authority', async () => {
+        // 초대는 원래 자격의 만료와 무관한 권한을 남긴다. 15분짜리가 영구
+        // 권한을 공격자 계정에 심을 수 있으면 수명 보장이 의미가 없다.
+        const browserSync = await mintBrowserSyncCredential();
+
+        const invited = await app.inject({
+            method: 'POST', url: '/v1/projects/project-1/members',
+            headers: { authorization: `Bearer ${browserSync}` },
+            payload: { accountId: 'acc-attacker', role: 'owner' },
+        });
+
+        expect(invited.statusCode).toBe(403);
+    });
+
+    it('refuses to change a member role', async () => {
+        const browserSync = await mintBrowserSyncCredential();
+
+        const promoted = await app.inject({
+            method: 'POST', url: '/v1/projects/project-1/members/member-1/role',
+            headers: { authorization: `Bearer ${browserSync}` },
+            payload: { role: 'owner' },
+        });
+
+        expect(promoted.statusCode).toBe(403);
     });
 });
 
