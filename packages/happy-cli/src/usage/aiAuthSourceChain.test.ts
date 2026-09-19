@@ -65,26 +65,51 @@ describe('종단: 적용 원천이 이벤트까지 간다', () => {
  * 여기서는 소스 배선을 직접 본다.
  */
 describe('배선 가드: daemon 이 실제로 원천을 심는가', () => {
-  it('run.ts 의 spawn·resume 경로가 헬퍼를 통과한다', async () => {
+  async function source(relative: string): Promise<string> {
     const { readFile } = await import('node:fs/promises')
     const { fileURLToPath } = await import('node:url')
-    const source = await readFile(
-      fileURLToPath(new URL('../daemon/run.ts', import.meta.url)),
-      'utf8',
-    )
+    return readFile(fileURLToPath(new URL(relative, import.meta.url)), 'utf8')
+  }
+
+  it('run.ts 의 spawn·resume 경로가 헬퍼를 통과한다', async () => {
+    const text = await source('../daemon/run.ts')
     // 호출부 3 곳: tmux spawn / 일반 spawn / resume. import 줄은 괄호가 없어 안 세진다.
-    const calls = source.split('applyAppliedAiAuthSourceEnv(').length - 1
+    const calls = text.split('applyAppliedAiAuthSourceEnv(').length - 1
     expect(calls).toBeGreaterThanOrEqual(3)
   })
 
-  it('managed 실행이 봉투의 권위 값을 심는다', async () => {
-    const { readFile } = await import('node:fs/promises')
-    const { fileURLToPath } = await import('node:url')
-    const source = await readFile(
-      fileURLToPath(new URL('../managed/managedStartup.ts', import.meta.url)),
-      'utf8',
-    )
-    expect(source).toContain('aiAuthSourceForManagedKind')
-    expect(source).toContain(HAPPY_AI_AUTH_SOURCE_ENV)
+  it('헬퍼가 관리 자격 덮어쓰기 **바깥**에 있다 — 안쪽이면 쓰지도 못한 자격을 적는다', async () => {
+    const text = await source('../daemon/run.ts')
+    // 호출 횟수만 세면 헬퍼를 overlay 앞으로 옮겨도 3 회 그대로라 통과한다.
+    // 각 호출의 인자가 최종 env 를 만드는 함수인지 본다.
+    const wrapped = [...text.matchAll(/applyAppliedAiAuthSourceEnv\(\s*([A-Za-z]+)\(/g)]
+      .map((match) => match[1])
+    expect(wrapped).toHaveLength(3)
+    for (const inner of wrapped) {
+      expect([
+        'applyConfirmedPromptDeliveryFlag',
+        'injectCheckpointSpawnContext',
+      ]).toContain(inner)
+    }
+  })
+
+  it('각 호출이 체험 임대 적용 여부를 넘긴다 — 안 넘기면 개인 GLM 키가 플랫폼으로 잡힌다', async () => {
+    const text = await source('../daemon/run.ts')
+    const passes = text.split('managedAiCredentialEnvironment).length > 0').length - 1
+    expect(passes).toBe(3)
+  })
+
+  it('managed 실행이 봉투의 권위 값을 **호출**한다 — 정의만 남는 것은 배선이 아니다', async () => {
+    const text = await source('../managed/managedStartup.ts')
+    // substring 검사는 호출을 지우고 import·정의만 남겨도 통과한다. 함수 **정의**가
+    // 같은 이름 + `(` 로 시작하기 때문이다. 정의를 뺀 호출부만 센다.
+    const occurrences = [...text.matchAll(/(function\s+)?applyManagedAiAuthReporting\(/g)]
+    const definitions = occurrences.filter((match) => match[1] !== undefined).length
+    const calls = occurrences.length - definitions
+
+    expect(definitions).toBe(1)
+    expect(calls).toBeGreaterThanOrEqual(1)
+    // 그리고 그 헬퍼가 봉투의 권위 값으로 원천을 대입한다.
+    expect(text).toMatch(/\[HAPPY_AI_AUTH_SOURCE_ENV\]\s*=\s*aiAuthSourceForManagedKind\(/)
   })
 })
