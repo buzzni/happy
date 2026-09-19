@@ -81,7 +81,7 @@ import { requireAccountToken, type ManagedStartup } from '@/managed/managedStart
 import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, clearForeignSessionLineage, requireAccountMachineId, stripAgentModelArguments, stripProviderCredentialOverrides } from '@/managed/managedStartup';
 import { resolveDifficultyRouting, type DifficultyRoutingState } from '@/difficultyRoutingRuntime';
 import { createSerialAsyncHandler } from '@/codex/utils/serialAsyncHandler';
-import { DIFFICULTY_ROUTING_POLICY_VERSION } from '@/difficultyRouting';
+import { isDelegatedDifficultyRoutingMessage } from '@/difficultyRouting';
 
 /**
  * How long a confirmed initial prompt waits for its acknowledgement before the
@@ -122,19 +122,6 @@ type ClaimedUserMessage = {
     attachmentsPromise: Promise<PendingAttachment[]>;
 };
 
-function isDelegatedDifficultyRoutingMessage(message: Pick<UserMessage, 'meta'>): boolean {
-    const meta = message.meta;
-    if (!meta || meta.modelSource !== 'auto') return false;
-    if (typeof meta.difficultyRoutingAuthorization !== 'string' || meta.difficultyRoutingAuthorization.length === 0) return false;
-    const intent = meta.difficultyRoutingIntent;
-    return Boolean(intent
-        && intent.version === 1
-        && intent.mode === 'auto'
-        && intent.policy === DIFFICULTY_ROUTING_POLICY_VERSION
-        && typeof intent.clientRequestId === 'string'
-        && intent.clientRequestId.length > 0
-        && intent.clientRouteSource === 'default-auto');
-}
 
 function safeUserMessageDebugPayload(message: UserMessage): UserMessage | Record<string, unknown> {
     if (!hasDifficultyRoutingSensitiveMeta(message)) return message;

@@ -49,3 +49,25 @@ export function pickDifficultyRoutingPrompt(input: {
   if (!prompt.trim()) return null
   return prompt.length <= DIFFICULTY_ROUTING_MAX_INPUT_CHARS ? prompt : null
 }
+
+/**
+ * A turn the client delegated to organization-shared routing.
+ *
+ * Both runners decide model/effort handling from this, so the two copies must
+ * never drift: a copy that says "not delegated" silently falls back to the
+ * client's model and skips shared routing, with no error anywhere.
+ * The intent rules live in DifficultyRoutingIntentSchema — do not restate them.
+ */
+export function isDelegatedDifficultyRoutingMessage(message: {
+  meta?: {
+    modelSource?: string
+    difficultyRoutingAuthorization?: string
+    difficultyRoutingIntent?: unknown
+  } | null
+}): boolean {
+  const meta = message.meta
+  if (!meta || meta.modelSource !== 'auto') return false
+  if (typeof meta.difficultyRoutingAuthorization !== 'string' || meta.difficultyRoutingAuthorization.length === 0) return false
+  return DifficultyRoutingIntentSchema.safeParse(meta.difficultyRoutingIntent).success
+}
+

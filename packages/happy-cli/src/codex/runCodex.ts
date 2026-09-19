@@ -136,7 +136,7 @@ import { isManagedBrokerServer } from '@/launcher/codexApproval';
 import { resolveManagedCodexArguments } from '@/launcher/managedCodexOptions';
 import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, clearForeignSessionLineage, managedCodexProviderArguments, requireAccountMachineId, requireAccountToken } from '@/managed/managedStartup';
 import type { RunnerPrincipal } from '@/claude/runClaude';
-import { DIFFICULTY_ROUTING_POLICY_VERSION } from '@/difficultyRouting';
+import { isDelegatedDifficultyRoutingMessage } from '@/difficultyRouting';
 
 /** See the Claude counterpart. */
 const CODEX_INITIAL_PROMPT_ACK_TIMEOUT_MS = 30_000;
@@ -150,19 +150,6 @@ type ClaimedUserMessage = {
     attachmentsPromise: Promise<PendingAttachment[]>;
 };
 
-function isDelegatedDifficultyRoutingMessage(message: Pick<UserMessage, 'meta'>): boolean {
-    const meta = message.meta;
-    if (!meta || meta.modelSource !== 'auto') return false;
-    if (typeof meta.difficultyRoutingAuthorization !== 'string' || meta.difficultyRoutingAuthorization.length === 0) return false;
-    const intent = meta.difficultyRoutingIntent;
-    return Boolean(intent
-        && intent.version === 1
-        && intent.mode === 'auto'
-        && intent.policy === DIFFICULTY_ROUTING_POLICY_VERSION
-        && typeof intent.clientRequestId === 'string'
-        && intent.clientRequestId.length > 0
-        && intent.clientRouteSource === 'default-auto');
-}
 
 /**
  * Main entry point for the codex command with ink UI
