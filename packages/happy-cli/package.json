@@ -107,7 +107,6 @@
     "@anthropic-ai/claude-agent-sdk": "^0.3.179",
     "@anthropic-ai/sandbox-runtime": "^0.0.37",
     "@anthropic-ai/sdk": "0.96.0",
-    "@huggingface/transformers": "4.2.0",
     "@modelcontextprotocol/sdk": "1.29.0",
     "@noble/ed25519": "^3.0.0",
     "@noble/hashes": "^2.0.1",
@@ -144,6 +143,9 @@
     "tweetnacl": "^1.0.3",
     "ws": "^8.19.0",
     "zod": "^4.0.0"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "4.2.0"
   },
   "bundledDependencies": [
     "@slopus/happy-wire",

@@ -341,11 +341,20 @@ async function authorizeDifficultyRoutingRequest(request: DifficultyRoutingRelay
   }
 }
 
+/**
+ * `unavailable` is deliberately distinct from `disabled`: a deployment that
+ * does not serve this A+ route at all (no `HAPPY_APLUS_MCP_CONFIG_URL`, so the
+ * origin falls back to the web app) answers 404 forever, and the poll below
+ * must be able to tell that apart from an org that simply has not elected this
+ * machine. Only the first deserves backoff.
+ */
+type DifficultyRoutingHostElection = 'enabled' | 'disabled' | 'unavailable';
+
 async function readDifficultyRoutingHostElection(input: {
   machineId: string;
   hostProcessKeyId: string;
   token: string;
-}): Promise<boolean> {
+}): Promise<DifficultyRoutingHostElection> {
   try {
     const response = await fetch(`${resolveAplusDifficultyRoutingOrigin()}/api/me/difficulty-routing/host-election`, {
       method: 'POST',
@@ -360,37 +369,64 @@ async function readDifficultyRoutingHostElection(input: {
       }),
       signal: AbortSignal.timeout(2_000),
     });
-    if (!response.ok) return false;
+    if (!response.ok) return 'unavailable';
     const body = await response.json().catch(() => null) as { ok?: unknown; enabled?: unknown } | null;
-    return body?.ok === true && body.enabled === true;
+    if (body?.ok !== true) return 'unavailable';
+    return body.enabled === true ? 'enabled' : 'disabled';
   } catch {
-    return false;
+    return 'unavailable';
   }
 }
 
-function startDifficultyRoutingElectionPoll(input: {
+export const DIFFICULTY_ROUTING_ELECTION_POLL_MS = 15_000;
+const DIFFICULTY_ROUTING_ELECTION_MAX_POLL_MS = 15 * 60_000;
+
+/**
+ * Doubling delay while the route stays unreachable, capped at 15 minutes. A
+ * daemon pointed at a deployment without the route issues a handful of
+ * requests an hour instead of 240, and still notices within 15 minutes when
+ * the route comes back.
+ */
+export function nextDifficultyRoutingElectionDelayMs(consecutiveFailures: number): number {
+  if (consecutiveFailures <= 0) return DIFFICULTY_ROUTING_ELECTION_POLL_MS;
+  return Math.min(
+    DIFFICULTY_ROUTING_ELECTION_POLL_MS * 2 ** consecutiveFailures,
+    DIFFICULTY_ROUTING_ELECTION_MAX_POLL_MS,
+  );
+}
+
+export function startDifficultyRoutingElectionPoll(input: {
   host: DifficultyRoutingClassifierHost;
   machineId: string;
   hostProcessKeyId: string;
   token: string;
-}): void {
+}): () => void {
   let disposed = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let consecutiveFailures = 0;
   const refresh = async () => {
-    const enabled = await readDifficultyRoutingHostElection({
+    const election = await readDifficultyRoutingHostElection({
       machineId: input.machineId,
       hostProcessKeyId: input.hostProcessKeyId,
       token: input.token,
     });
-    if (!disposed) input.host.setEnabled(enabled);
+    if (disposed) return;
+    consecutiveFailures = election === 'unavailable' ? consecutiveFailures + 1 : 0;
+    input.host.setEnabled(election === 'enabled');
+    timer = setTimeout(() => { void refresh(); }, nextDifficultyRoutingElectionDelayMs(consecutiveFailures));
+    timer.unref?.();
+  };
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    if (timer) clearTimeout(timer);
+    timer = null;
+    process.off('exit', dispose);
+    input.host.setEnabled(false);
   };
   void refresh();
-  const timer = setInterval(() => { void refresh(); }, 15_000);
-  timer.unref?.();
-  process.once('exit', () => {
-    disposed = true;
-    clearInterval(timer);
-    input.host.setEnabled(false);
-  });
+  process.once('exit', dispose);
+  return dispose;
 }
 
 function resolveAplusDifficultyRoutingOrigin(): string {
@@ -405,6 +441,30 @@ function resolveAplusDifficultyRoutingOrigin(): string {
   return configuration.webappUrl;
 }
 
+/**
+ * The advertised difficulty-routing block must come from THIS run, not from
+ * whatever the server still has stored. `createDifficultyRoutingHostKey()`
+ * mints a fresh box keypair on every daemon start and `POST /v1/machines`
+ * leaves an already-registered machine's metadata untouched, so spreading the
+ * stored block here would republish the previous run's hostProcessKeyId and
+ * hostProcessPublicKey forever — clients would keep sealing relay requests to
+ * a public key whose secret key died with the previous process. Everything
+ * outside the block is still the server's to keep.
+ */
+export function buildDifficultyRoutingMetadataUpdate(input: {
+  stored: MachineMetadata | null;
+  baseMetadata: MachineMetadata;
+  ready: boolean;
+}): MachineMetadata {
+  return {
+    ...(input.stored ?? input.baseMetadata),
+    difficultyRouting: {
+      ...input.baseMetadata.difficultyRouting!,
+      ready: input.ready,
+    },
+  };
+}
+
 function startDifficultyRoutingMetadataPoll(input: {
   apiMachine: { updateMachineMetadata(handler: (metadata: MachineMetadata | null) => MachineMetadata): Promise<void> };
   host: DifficultyRoutingClassifierHost;
@@ -417,12 +477,10 @@ function startDifficultyRoutingMetadataPoll(input: {
     if (disposed || ready === lastReady) return;
     lastReady = ready;
     try {
-      await input.apiMachine.updateMachineMetadata((metadata) => ({
-        ...(metadata ?? input.baseMetadata),
-        difficultyRouting: {
-          ...((metadata ?? input.baseMetadata).difficultyRouting ?? input.baseMetadata.difficultyRouting!),
-          ready,
-        },
+      await input.apiMachine.updateMachineMetadata((metadata) => buildDifficultyRoutingMetadataUpdate({
+        stored: metadata,
+        baseMetadata: input.baseMetadata,
+        ready,
       }));
     } catch {
       lastReady = null;
