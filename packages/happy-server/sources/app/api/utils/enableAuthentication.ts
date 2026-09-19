@@ -3,6 +3,7 @@ import { log, debug } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
 import type { Principal, SessionScopedTokenIssuer } from "@/app/auth/sessionScopedToken";
 import { authorizeManagedSessionRequest } from "@/app/managed/managedSessionAccess";
+import { resolveBrowserSyncRestPrincipal } from "./browserSyncRestAuth";
 
 export function enableAuthentication(app: Fastify) {
     app.decorate('authenticate', async function (request: any, reply: any) {
@@ -20,13 +21,36 @@ export function enableAuthentication(app: Fastify) {
 
             const token = authHeader.substring(7);
             const verified = await auth.verifyToken(token);
-            if (!verified) {
+            if (verified) {
+                debug({ module: 'auth-decorator' }, `Auth success - user: ${verified.userId}`);
+                request.userId = verified.userId;
+                return;
+            }
+
+            /*
+             * A browser no longer carries the account bearer, so the same REST
+             * surface it always used has to accept the short-lived credential
+             * it carries instead. This is not a narrower scope — it names the
+             * same account and authorises the same things — which is why it
+             * sits here rather than behind a per-route opt-in the way a managed
+             * session bearer does.
+             *
+             * The account verifier runs first and unchanged, so every existing
+             * caller behaves exactly as before; only a bearer it rejects is
+             * offered here.
+             */
+            const browserSync = await resolveBrowserSyncRestPrincipal({
+                token,
+                issuer: auth.browserSyncIssuer,
+                now: Date.now(),
+            });
+            if (!browserSync) {
                 log({ module: 'auth-decorator' }, `Auth failed - invalid token`);
                 return reply.code(401).send({ error: 'Invalid token' });
             }
 
-            debug({ module: 'auth-decorator' }, `Auth success - user: ${verified.userId}`);
-            request.userId = verified.userId;
+            debug({ module: 'auth-decorator' }, `Auth success (browser sync) - user: ${browserSync.userId}`);
+            request.userId = browserSync.userId;
         } catch (error) {
             return reply.code(401).send({ error: 'Authentication failed' });
         }
