@@ -1,0 +1,172 @@
+name: Check claude-agent-sdk update
+
+# Weekly check for a newer @anthropic-ai/claude-agent-sdk release. That
+# package bundles the actual Claude Code binary (see manifest.json inside
+# it) — an old pin here means happy-cli ships a Claude Code binary that can
+# start rejecting newer models with "does not support this model; version
+# X or newer is required" (see buzzni/happy#455).
+#
+# This workflow only proposes a PR. It never merges, tags, or publishes —
+# that remains a human decision per docs/happy-cli-release.md.
+
+on:
+  schedule:
+    - cron: '0 3 * * 1' # Monday 03:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  check-and-bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.11.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Determine current and latest SDK version
+        id: versions
+        run: |
+          CURRENT="$(node -p "require('./packages/happy-cli/package.json').dependencies['@anthropic-ai/claude-agent-sdk'].replace(/^[^0-9]*/, '')")"
+          LATEST="$(npm view @anthropic-ai/claude-agent-sdk version)"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          if [ "$CURRENT" = "$LATEST" ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "pinned @anthropic-ai/claude-agent-sdk: $CURRENT (latest on npm: $LATEST)"
+
+      - name: Skip if a bump branch for this version already exists
+        if: steps.versions.outputs.up_to_date == 'false'
+        id: existing
+        run: |
+          BRANCH="chore/bump-claude-agent-sdk-${{ steps.versions.outputs.latest }}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump dependency and lockfile
+        if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        run: |
+          node -e "
+            const fs = require('node:fs');
+            const path = 'packages/happy-cli/package.json';
+            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            pkg.dependencies['@anthropic-ai/claude-agent-sdk'] = '^${{ steps.versions.outputs.latest }}';
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+          "
+          # Plain 'install' (not 'update') so only this dependency's resolved
+          # version moves — 'pnpm update' re-resolves the whole workspace and
+          # drags in unrelated bumps (observed while preparing buzzni/happy#455).
+          pnpm install --filter @buzzni/happy-cli...
+
+      - name: Bump happy-cli release version
+        if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        id: bump_version
+        run: |
+          NEW_VERSION="$(node -e "
+            const fs = require('node:fs');
+            const path = 'packages/happy-cli/package.json';
+            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const match = pkg.version.match(/^(.*-aplus\.)(\d+)$/);
+            if (!match) throw new Error('unexpected version format: ' + pkg.version);
+            const next = match[1] + (parseInt(match[2], 10) + 1);
+            pkg.version = next;
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+            process.stdout.write(next);
+          ")"
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build happy-cli (typecheck + bundle) to catch obvious breakage
+        if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        run: pnpm --filter @buzzni/happy-cli run build
+
+      - name: Commit, push, and open PR
+        if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.existing.outputs.branch }}
+          NEW_VERSION: ${{ steps.bump_version.outputs.new_version }}
+          LATEST: ${{ steps.versions.outputs.latest }}
+          CURRENT: ${{ steps.versions.outputs.current }}
+        run: |
+          cat > /tmp/commit-message.txt <<EOF
+          fix(cli): bump claude-agent-sdk $CURRENT -> $LATEST
+
+          Bundled Claude Code binary moves to whatever manifest.json inside
+          @anthropic-ai/claude-agent-sdk@$LATEST declares. Verify that version
+          before merging (unzip the installed package or check npm) and confirm
+          it still satisfies whatever minimum the Anthropic API is enforcing.
+
+          happy-cli: $NEW_VERSION
+          EOF
+
+          cat > /tmp/pr-body.md <<EOF
+          Automated weekly check found a newer \`@anthropic-ai/claude-agent-sdk\` on npm.
+
+          - Current pin: \`$CURRENT\`
+          - Latest on npm: \`$LATEST\`
+          - happy-cli version bumped to: \`$NEW_VERSION\`
+
+          This only bumps the dependency, lockfile, and happy-cli's own version —
+          it does not merge, tag, or publish. That follows docs/happy-cli-release.md:
+          every external release mutation needs explicit human approval right before
+          it happens.
+
+          Before merging:
+          - [ ] Check the CI smoke tests below (typecheck/build/unit tests + guard-publish-artifact) are green.
+          - [ ] Spot-check the new SDK version's bundled Claude Code binary version (its \`manifest.json\`) didn't jump in a way that suggests a breaking change.
+          - [ ] After merging, follow docs/happy-cli-release.md to tag + publish, then update aplus-dev-studio-desktop's \`config/happy-runtime-pin.json\` (that repo has its own weekly check for this, see \`.github/workflows/check-happy-cli-update.yml\`).
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add packages/happy-cli/package.json pnpm-lock.yaml
+          git commit -F /tmp/commit-message.txt
+          git push origin "$BRANCH"
+
+          gh pr create --repo buzzni/happy --base main --head "$BRANCH" \
+            --title "fix(cli): bump claude-agent-sdk $CURRENT -> $LATEST" \
+            --body-file /tmp/pr-body.md
+
+      - name: Open tracking issue if the bump failed
+        if: failure() && steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.versions.outputs.latest }}
+          CURRENT: ${{ steps.versions.outputs.current }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cat > /tmp/issue-body.md <<EOF
+          The weekly check-claude-sdk-update workflow found a newer @anthropic-ai/claude-agent-sdk (\`$LATEST\`, current pin \`$CURRENT\`) but the automated bump/build failed before a PR could be opened.
+
+          See the failed run: $RUN_URL
+
+          No branch or PR was pushed — bump manually if needed.
+          EOF
+
+          gh issue create --repo buzzni/happy \
+            --title "claude-agent-sdk auto-bump to $LATEST failed" \
+            --body-file /tmp/issue-body.md
