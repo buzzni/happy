@@ -14,6 +14,8 @@ export type BrowserViewerLeaseRecord = {
     lastUsedAt: number
     processIds?: {
         xvfb?: number
+        /** TigerVNC's Xvnc replaces the xvfb + x11vnc pair on machines that have it. */
+        xvnc?: number
         x11vnc?: number
         websockify?: number
     }

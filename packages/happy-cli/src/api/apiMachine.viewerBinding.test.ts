@@ -12,7 +12,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { proxyMocks, viewerMocks } = vi.hoisted(() => ({
     proxyMocks: { proxyHttp: vi.fn() },
-    viewerMocks: { detectMissingViewerTools: vi.fn(async () => []) },
+    viewerMocks: {
+        detectViewerCapabilities: vi.fn(async () => ({
+            hasXvnc: true,
+            hasXvfb: true,
+            hasX11vnc: true,
+            hasWebsockify: true,
+            hasWindowManager: true,
+        })),
+    },
 }))
 
 vi.mock('@/configuration', () => ({
@@ -37,7 +45,7 @@ vi.mock('@/daemon/previewProxy', async (importOriginal) => ({
 
 vi.mock('@/daemon/remoteViewer', async (importOriginal) => ({
     ...await importOriginal<typeof import('@/daemon/remoteViewer')>(),
-    detectMissingViewerTools: viewerMocks.detectMissingViewerTools,
+    detectViewerCapabilities: viewerMocks.detectViewerCapabilities,
 }))
 
 const KEY_A = 'bv1_abcdefghijklmnopqrstuvwxyz012345'
@@ -385,6 +393,6 @@ describe('ApiMachineClient browser-viewer:start-bound', () => {
 
         expect(startIsolated).not.toHaveBeenCalled()
         expect(startBroker).not.toHaveBeenCalled()
-        expect(viewerMocks.detectMissingViewerTools).not.toHaveBeenCalled()
+        expect(viewerMocks.detectViewerCapabilities).not.toHaveBeenCalled()
     })
 })
