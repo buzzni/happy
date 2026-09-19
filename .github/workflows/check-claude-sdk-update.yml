@@ -6,8 +6,21 @@ name: Check claude-agent-sdk update
 # start rejecting newer models with "does not support this model; version
 # X or newer is required" (see buzzni/happy#455).
 #
-# This workflow only proposes a PR. It never merges, tags, or publishes —
-# that remains a human decision per docs/happy-cli-release.md.
+# This workflow only proposes a draft PR. It never merges, tags, or
+# publishes — that remains a human decision per docs/happy-cli-release.md.
+#
+# CI CAVEAT — why this job runs the tests itself:
+# GitHub does not start workflow runs for events raised with the default
+# GITHUB_TOKEN, so a PR opened under that token gets NO checks:
+# cli-smoke-test.yml never fires even though the bump touches paths it
+# watches. Marking the draft ready does not help either — that raises
+# `ready_for_review`, which is not in the default `pull_request` type set.
+# So this job runs build + the unit suite + the publish-artifact guard
+# itself and only opens a PR if they pass, and the PR is opened as a DRAFT
+# so an unchecked bump cannot be merged casually. If the CI_AUTOMATION_PAT
+# secret is set (a GitHub PAT/App token with repo + PR scope) it is used
+# instead and cli-smoke-test.yml runs on the PR normally; the secret is
+# optional and these expressions fall back to github.token without it.
 
 on:
   schedule:
@@ -22,12 +35,15 @@ permissions:
 jobs:
   check-and-bump:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # Pushing under a real PAT is what lets the resulting PR get CI.
+          # Falls back to github.token (no checks — see CI CAVEAT).
+          token: ${{ secrets.CI_AUTOMATION_PAT || github.token }}
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -98,18 +114,37 @@ jobs:
           ")"
           echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Build happy-cli (typecheck + bundle) to catch obvious breakage
+      # These three stand in for cli-smoke-test.yml, which will not run on the
+      # PR this job opens (see CI CAVEAT). Without them the PR would carry no
+      # verification at all, and a reviewer has nothing to check but a diff.
+      - name: Build happy-cli (typecheck + bundle)
         if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
         run: pnpm --filter @buzzni/happy-cli run build
+
+      # Packing must happen BEFORE the unit suite. src/commands/browser.test.ts's
+      # resolveExtensionDir block has an afterEach that rmSync's the real
+      # packages/happy-cli/browser-extension build output, so after vitest runs,
+      # prepare-publish-package.cjs dies with "Required publish input is
+      # missing" — a packaging failure that has nothing to do with the bump.
+      - name: Guard the publish artifact
+        if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        run: |
+          node packages/happy-cli/scripts/prepare-publish-package.cjs --out "$RUNNER_TEMP/happy-cli-publish"
+          node packages/happy-cli/scripts/guard-publish-artifact.cjs "$RUNNER_TEMP/happy-cli-publish"
+
+      - name: Run happy-cli unit tests
+        if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        run: pnpm --filter @buzzni/happy-cli exec vitest run --project unit
 
       - name: Commit, push, and open PR
         if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.CI_AUTOMATION_PAT || github.token }}
           BRANCH: ${{ steps.existing.outputs.branch }}
           NEW_VERSION: ${{ steps.bump_version.outputs.new_version }}
           LATEST: ${{ steps.versions.outputs.latest }}
           CURRENT: ${{ steps.versions.outputs.current }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           cat > /tmp/commit-message.txt <<EOF
           fix(cli): bump claude-agent-sdk $CURRENT -> $LATEST
@@ -134,8 +169,20 @@ jobs:
           every external release mutation needs explicit human approval right before
           it happens.
 
-          Before merging:
-          - [ ] Check the CI smoke tests below (typecheck/build/unit tests + guard-publish-artifact) are green.
+          **This PR is a draft, and the check list on it is probably empty.**
+          GitHub does not start workflow runs for events raised with the default
+          \`GITHUB_TOKEN\`, so unless the \`CI_AUTOMATION_PAT\` secret is configured,
+          \`cli-smoke-test.yml\` did not fire here — and marking the draft ready will
+          not fire it either (\`ready_for_review\` is not in the default
+          \`pull_request\` type set). An empty check list means "not run", not "passed".
+
+          Instead, the job that opened this PR ran the equivalent checks itself and
+          only opened it because they passed — build (typecheck + bundle), the
+          happy-cli unit suite, and \`guard-publish-artifact.cjs\`. The run log is the
+          evidence: $RUN_URL
+
+          Before marking ready / merging:
+          - [ ] Read the run log above, or re-run \`cli-smoke-test.yml\` on this branch via workflow_dispatch for checks on all three platforms (this job only covers Linux).
           - [ ] Spot-check the new SDK version's bundled Claude Code binary version (its \`manifest.json\`) didn't jump in a way that suggests a breaking change.
           - [ ] After merging, follow docs/happy-cli-release.md to tag + publish, then update aplus-dev-studio-desktop's \`config/happy-runtime-pin.json\` (that repo has its own weekly check for this, see \`.github/workflows/check-happy-cli-update.yml\`).
           EOF
@@ -147,20 +194,28 @@ jobs:
           git commit -F /tmp/commit-message.txt
           git push origin "$BRANCH"
 
+          # Draft: under github.token this PR carries no checks at all, and a
+          # draft cannot be merged without a deliberate "ready for review".
           gh pr create --repo buzzni/happy --base main --head "$BRANCH" \
+            --draft \
             --title "fix(cli): bump claude-agent-sdk $CURRENT -> $LATEST" \
             --body-file /tmp/pr-body.md
 
       - name: Open tracking issue if the bump failed
-        if: failure() && steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        # Not keyed on steps.versions outputs: the version lookup is the most
+        # network-fragile step, and if IT fails those outputs are empty, which
+        # would silence this fallback exactly when it is needed.
+        if: failure() && steps.existing.outputs.exists != 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.CI_AUTOMATION_PAT || github.token }}
           LATEST: ${{ steps.versions.outputs.latest }}
           CURRENT: ${{ steps.versions.outputs.current }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           cat > /tmp/issue-body.md <<EOF
-          The weekly check-claude-sdk-update workflow found a newer @anthropic-ai/claude-agent-sdk (\`$LATEST\`, current pin \`$CURRENT\`) but the automated bump/build failed before a PR could be opened.
+          The weekly check-claude-sdk-update workflow failed before a PR could be opened — the bump itself, the build, the unit suite, or the publish-artifact guard did not pass.
+
+          Versions at the point of failure (blank if the lookup itself is what failed): latest \`$LATEST\`, current pin \`$CURRENT\`.
 
           See the failed run: $RUN_URL
 
@@ -168,5 +223,5 @@ jobs:
           EOF
 
           gh issue create --repo buzzni/happy \
-            --title "claude-agent-sdk auto-bump to $LATEST failed" \
+            --title "claude-agent-sdk auto-bump failed${LATEST:+ (target $LATEST)}" \
             --body-file /tmp/issue-body.md
