@@ -7,6 +7,8 @@ import {
     captureSaycodeAgentEnvironment,
     stripManagedCredentialConflicts,
     scrubSessionLineageEnv,
+    applyAppliedAiAuthSourceEnv,
+    overlayManagedCredentialEnvironment,
     SESSION_LINEAGE_ENV_PREFIXES,
 } from './sessionEnv'
 import { expandEnvironmentVariables } from '../utils/expandEnvVars'
@@ -50,6 +52,19 @@ describe('scrubSessionLineageEnv', () => {
         })
         // input is not mutated — resumeSession re-adds its own explicit values
         expect(env.HAPPY_RECONNECT_SESSION_ID).toBe('cmr-poisoned')
+    })
+
+    it('removes an inherited applied AI auth source so it cannot be re-reported', () => {
+        // The daemon can be restarted by a child and then inherits that child's
+        // whole environment. An un-scrubbed HAPPY_AI_AUTH_SOURCE means every
+        // later session on that machine meters its tokens against somebody
+        // else's credential.
+        const scrubbed = scrubSessionLineageEnv({
+            PATH: '/usr/bin',
+            HAPPY_AI_AUTH_SOURCE: 'personal-subscription',
+            HAPPY_AI_AUTH_CONNECTION_VERSION: '7',
+        })
+        expect(scrubbed).toEqual({ PATH: '/usr/bin' })
     })
 
     it('drops undefined values so the result is safe for spawn env', () => {
@@ -403,5 +418,49 @@ describe('resumed agent sandbox policy', () => {
         expect(buildResumedSessionSpawnEnvironment({
             inherited: { [key]: policy }, explicit: {}, sessionId: 'legacy',
         })).not.toHaveProperty(key)
+    })
+})
+
+describe('applyAppliedAiAuthSourceEnv', () => {
+    const glmEnvironment = {
+        ANTHROPIC_AUTH_TOKEN: 'zai-key',
+        ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+    }
+
+    it('reports the leased GLM route when the managed credential is the final one applied', () => {
+        const child = applyAppliedAiAuthSourceEnv(buildManagedSessionSpawnEnvironment(
+            { PATH: '/usr/bin' },
+            { ANTHROPIC_API_KEY: 'caller-key' },
+            glmEnvironment,
+        ))
+        expect(child.HAPPY_AI_AUTH_SOURCE).toBe('platform-glm')
+    })
+
+    it('does not claim a credential it cannot name when no managed credential applies', () => {
+        const child = applyAppliedAiAuthSourceEnv(buildManagedSessionSpawnEnvironment(
+            { PATH: '/usr/bin' },
+            { ANTHROPIC_API_KEY: 'caller-key' },
+            {},
+        ))
+        expect(child.HAPPY_AI_AUTH_SOURCE).toBe('unknown')
+    })
+
+    it('decides from the final environment, not the one the managed credential overwrote', () => {
+        // overlayManagedCredentialEnvironment runs last: a decision taken before
+        // it would record the credential the child never got to spend.
+        const beforeOverlay = { ANTHROPIC_BASE_URL: 'https://api.anthropic.com' }
+        const child = applyAppliedAiAuthSourceEnv(
+            overlayManagedCredentialEnvironment(beforeOverlay, glmEnvironment),
+        )
+        expect(child.HAPPY_AI_AUTH_SOURCE).toBe('platform-glm')
+    })
+
+    it('never inherits a stale source from the daemon environment', () => {
+        const child = applyAppliedAiAuthSourceEnv(buildManagedSessionSpawnEnvironment(
+            { PATH: '/usr/bin', HAPPY_AI_AUTH_SOURCE: 'personal-subscription' },
+            {},
+            {},
+        ))
+        expect(child.HAPPY_AI_AUTH_SOURCE).toBe('unknown')
     })
 })

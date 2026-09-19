@@ -26,10 +26,20 @@ import {
     CHECKPOINT_SPAWN_CONTEXT_ENV_KEY,
     readCheckpointSpawnContext,
 } from '@/checkpoint/checkpointSpawnContext'
+import {
+    HAPPY_AI_AUTH_SOURCE_ENV,
+    resolveAppliedAiAuthSource,
+} from '@/usage/aiAuthSource'
 
 // 'HAPPY_INITIAL_' covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the
 // HAPPY_INITIAL_MODEL / HAPPY_INITIAL_EFFORT spawn seeds.
-export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_DEFERRED_CONTINUATION_', 'HAPPY_AUTOMATION_', 'HAPPY_ADDITIONAL_DIRECTORIES', 'HAPPY_CHECKPOINT_', 'APLUS_SESSION_', 'SAYCODE_AGENT_'] as const
+// 'HAPPY_AI_AUTH_' covers HAPPY_AI_AUTH_SOURCE and
+// HAPPY_AI_AUTH_CONNECTION_VERSION: which credential a session is actually
+// spending is decided per spawn, never inherited. A daemon restarted by a
+// child inherits that child's environment, and an un-scrubbed value would make
+// every later session on the machine meter its tokens against somebody else's
+// credential.
+export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_DEFERRED_CONTINUATION_', 'HAPPY_AUTOMATION_', 'HAPPY_ADDITIONAL_DIRECTORIES', 'HAPPY_CHECKPOINT_', 'HAPPY_AI_AUTH_', 'APLUS_SESSION_', 'SAYCODE_AGENT_'] as const
 
 const SAYCODE_AGENT_ENV_KEYS = [
     'SAYCODE_AGENT_ENV',
@@ -201,6 +211,23 @@ export function buildResumedSessionSpawnEnvironment(input: {
         ...(policy !== undefined ? { [policyKey]: policy } : {}),
         APLUS_SESSION_ID: input.sessionId,
     })
+}
+
+/**
+ * Writes down which credential a **final** child environment actually spends.
+ *
+ * Applied to the finished environment on purpose. The managed credential is
+ * overlaid last (`overlayManagedCredentialEnvironment`), so a decision taken
+ * any earlier would record the credential the child never got to use.
+ *
+ * The value is the daemon's to decide because the child cannot: a managed
+ * lease and a person's own key reach it as the same variables. What the daemon
+ * cannot name is left `unknown` — never guessed. Writing an unestablished
+ * source down as a personal subscription meters the run against somebody's own
+ * plan.
+ */
+export function applyAppliedAiAuthSourceEnv(env: Record<string, string>): Record<string, string> {
+    return { ...env, [HAPPY_AI_AUTH_SOURCE_ENV]: resolveAppliedAiAuthSource({ env }) }
 }
 
 /**

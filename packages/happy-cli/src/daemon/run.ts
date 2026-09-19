@@ -63,6 +63,7 @@ import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import {
+  applyAppliedAiAuthSourceEnv,
   applyConfirmedPromptDeliveryFlag,
   buildManagedSessionSpawnEnvironment,
   buildResumedSessionSpawnEnvironment,
@@ -1960,14 +1961,14 @@ export async function startDaemon(): Promise<void> {
           const windowName = `happy-${Date.now()}-${agent}`;
           // Explicit agent auth and task callbacks are overlaid after inherited
           // credentials are filtered, so isolated tasks keep only what they need.
-          const tmuxEnv = applyConfirmedPromptDeliveryFlag(
+          const tmuxEnv = applyAppliedAiAuthSourceEnv(applyConfirmedPromptDeliveryFlag(
             buildManagedSessionSpawnEnvironment(
               inheritedSpawnEnvironment,
               extraEnv,
               managedAiCredentialEnvironment,
             ),
             requireInitialPromptAck,
-          );
+          ));
 
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
             sessionName: tmuxSessionName,
@@ -2058,14 +2059,14 @@ export async function startDaemon(): Promise<void> {
             // scrub: 상속된 lineage env(HAPPY_RECONNECT_*/HAPPY_FORK*)가 새
             // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
             // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
-            env: applyConfirmedPromptDeliveryFlag(
+            env: applyAppliedAiAuthSourceEnv(applyConfirmedPromptDeliveryFlag(
               buildManagedSessionSpawnEnvironment(
                 inheritedSpawnEnvironment,
                 extraEnv,
                 managedAiCredentialEnvironment,
               ),
               requireInitialPromptAck,
-            ),
+            )),
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
             userHomeDir: stagedUserHomeDir,
@@ -2530,7 +2531,7 @@ export async function startDaemon(): Promise<void> {
         }
         const authoritativeCheckpointProjectId = priorCheckpointContext?.projectId
           ?? (options?.mcpCallerGrantEnvelope ? checkpointProjectId : undefined);
-        const resumedEnvironment = injectCheckpointSpawnContext(
+        const resumedEnvironment = applyAppliedAiAuthSourceEnv(injectCheckpointSpawnContext(
           mcpEnvironment.environmentVariables,
           authoritativeCheckpointProjectId
             ? {
@@ -2539,7 +2540,7 @@ export async function startDaemon(): Promise<void> {
               checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
             }
             : undefined,
-        );
+        ));
 
         const result = await spawnTrackedHappyProcess({
           args: launch.args,
