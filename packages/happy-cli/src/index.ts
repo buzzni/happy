@@ -15,6 +15,8 @@ if (args[0] === 'agent') {
     console.error('Error:', error instanceof Error ? error.message : 'Unknown error')
     process.exit(1)
   }
+} else if (args[0] === 'difficulty-routing-worker') {
+  void import('./daemon/difficultyRoutingWorkerProcess')
 } else {
   void import('./main')
 }

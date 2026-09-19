@@ -144,6 +144,9 @@
     "ws": "^8.19.0",
     "zod": "^4.0.0"
   },
+  "optionalDependencies": {
+    "@huggingface/transformers": "4.2.0"
+  },
   "bundledDependencies": [
     "@slopus/happy-wire",
     "@buzzni/saycode-cli"

@@ -1,3 +1,4 @@
+import { DIFFICULTY_CLASSIFIER_REVISION } from './difficultyRoutingArtifacts';
 import fs from 'fs/promises';
 import os from 'os';
 import * as tmp from 'tmp';
@@ -75,6 +76,16 @@ import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from '@/api/encryption';
+import {
+  DIFFICULTY_ROUTING_MAX_INPUT_CHARS,
+  DIFFICULTY_ROUTING_MAX_INPUT_TOKENS,
+  DIFFICULTY_ROUTING_POLICY_VERSION,
+} from '@/difficultyRouting';
+import {
+  DifficultyRoutingClassifierHost,
+  createDifficultyRoutingHostKey,
+  type DifficultyRoutingRelayRequest,
+} from './difficultyRoutingClassifierHost';
 import {
   resolveInheritedSpawnEnvironment,
   resolveRegularSpawnAgentArgs,
@@ -303,6 +314,186 @@ export const initialMachineMetadata: MachineMetadata = {
   },
   additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
 };
+
+async function authorizeDifficultyRoutingRequest(request: DifficultyRoutingRelayRequest): Promise<boolean> {
+  try {
+    const response = await fetch(`${resolveAplusDifficultyRoutingOrigin()}/api/me/difficulty-routing/validate-grant`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Happy-Client': `cli-coding-session/${configuration.currentCliVersion}`,
+      },
+      body: JSON.stringify({
+        signedGrant: request.signedGrant,
+        requestId: request.requestId,
+        sourceMachineId: request.sourceMachineId,
+        hostMachineId: request.hostMachineId,
+        hostProcessKeyId: request.hostProcessKeyId,
+        policyRevision: request.policyRevision,
+      }),
+      signal: AbortSignal.timeout(Math.max(1, Math.min(250, request.deadlineAt - Date.now()))),
+    });
+    if (!response.ok) return false;
+    const body = await response.json().catch(() => null) as { ok?: unknown } | null;
+    return body?.ok === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `unavailable` is deliberately distinct from `disabled`: a deployment that
+ * does not serve this A+ route at all (no `HAPPY_APLUS_MCP_CONFIG_URL`, so the
+ * origin falls back to the web app) answers 404 forever, and the poll below
+ * must be able to tell that apart from an org that simply has not elected this
+ * machine. Only the first deserves backoff.
+ */
+type DifficultyRoutingHostElection = 'enabled' | 'disabled' | 'unavailable';
+
+async function readDifficultyRoutingHostElection(input: {
+  machineId: string;
+  hostProcessKeyId: string;
+  token: string;
+}): Promise<DifficultyRoutingHostElection> {
+  try {
+    const response = await fetch(`${resolveAplusDifficultyRoutingOrigin()}/api/me/difficulty-routing/host-election`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${input.token}`,
+        'Content-Type': 'application/json',
+        'X-Happy-Client': `cli-coding-session/${configuration.currentCliVersion}`,
+      },
+      body: JSON.stringify({
+        machineId: input.machineId,
+        hostProcessKeyId: input.hostProcessKeyId,
+      }),
+      signal: AbortSignal.timeout(2_000),
+    });
+    if (!response.ok) return 'unavailable';
+    const body = await response.json().catch(() => null) as { ok?: unknown; enabled?: unknown } | null;
+    if (body?.ok !== true) return 'unavailable';
+    return body.enabled === true ? 'enabled' : 'disabled';
+  } catch {
+    return 'unavailable';
+  }
+}
+
+export const DIFFICULTY_ROUTING_ELECTION_POLL_MS = 15_000;
+const DIFFICULTY_ROUTING_ELECTION_MAX_POLL_MS = 15 * 60_000;
+
+/**
+ * Doubling delay while the route stays unreachable, capped at 15 minutes. A
+ * daemon pointed at a deployment without the route issues a handful of
+ * requests an hour instead of 240, and still notices within 15 minutes when
+ * the route comes back.
+ */
+export function nextDifficultyRoutingElectionDelayMs(consecutiveFailures: number): number {
+  if (consecutiveFailures <= 0) return DIFFICULTY_ROUTING_ELECTION_POLL_MS;
+  return Math.min(
+    DIFFICULTY_ROUTING_ELECTION_POLL_MS * 2 ** consecutiveFailures,
+    DIFFICULTY_ROUTING_ELECTION_MAX_POLL_MS,
+  );
+}
+
+export function startDifficultyRoutingElectionPoll(input: {
+  host: DifficultyRoutingClassifierHost;
+  machineId: string;
+  hostProcessKeyId: string;
+  token: string;
+}): () => void {
+  let disposed = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let consecutiveFailures = 0;
+  const refresh = async () => {
+    const election = await readDifficultyRoutingHostElection({
+      machineId: input.machineId,
+      hostProcessKeyId: input.hostProcessKeyId,
+      token: input.token,
+    });
+    if (disposed) return;
+    consecutiveFailures = election === 'unavailable' ? consecutiveFailures + 1 : 0;
+    input.host.setEnabled(election === 'enabled');
+    timer = setTimeout(() => { void refresh(); }, nextDifficultyRoutingElectionDelayMs(consecutiveFailures));
+    timer.unref?.();
+  };
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    if (timer) clearTimeout(timer);
+    timer = null;
+    process.off('exit', dispose);
+    input.host.setEnabled(false);
+  };
+  void refresh();
+  process.once('exit', dispose);
+  return dispose;
+}
+
+function resolveAplusDifficultyRoutingOrigin(): string {
+  const configured = process.env.HAPPY_APLUS_MCP_CONFIG_URL;
+  if (configured) {
+    try {
+      return new URL(configured).origin;
+    } catch {
+      // Fall through to the configured web app URL.
+    }
+  }
+  return configuration.webappUrl;
+}
+
+/**
+ * The advertised difficulty-routing block must come from THIS run, not from
+ * whatever the server still has stored. `createDifficultyRoutingHostKey()`
+ * mints a fresh box keypair on every daemon start and `POST /v1/machines`
+ * leaves an already-registered machine's metadata untouched, so spreading the
+ * stored block here would republish the previous run's hostProcessKeyId and
+ * hostProcessPublicKey forever — clients would keep sealing relay requests to
+ * a public key whose secret key died with the previous process. Everything
+ * outside the block is still the server's to keep.
+ */
+export function buildDifficultyRoutingMetadataUpdate(input: {
+  stored: MachineMetadata | null;
+  baseMetadata: MachineMetadata;
+  ready: boolean;
+}): MachineMetadata {
+  return {
+    ...(input.stored ?? input.baseMetadata),
+    difficultyRouting: {
+      ...input.baseMetadata.difficultyRouting!,
+      ready: input.ready,
+    },
+  };
+}
+
+function startDifficultyRoutingMetadataPoll(input: {
+  apiMachine: { updateMachineMetadata(handler: (metadata: MachineMetadata | null) => MachineMetadata): Promise<void> };
+  host: DifficultyRoutingClassifierHost;
+  baseMetadata: MachineMetadata;
+}): void {
+  let disposed = false;
+  let lastReady: boolean | null = null;
+  const refresh = async () => {
+    const ready = input.host.capability().ready;
+    if (disposed || ready === lastReady) return;
+    lastReady = ready;
+    try {
+      await input.apiMachine.updateMachineMetadata((metadata) => buildDifficultyRoutingMetadataUpdate({
+        stored: metadata,
+        baseMetadata: input.baseMetadata,
+        ready,
+      }));
+    } catch {
+      lastReady = null;
+    }
+  };
+  void refresh();
+  const timer = setInterval(() => { void refresh(); }, 5_000);
+  timer.unref?.();
+  process.once('exit', () => {
+    disposed = true;
+    clearInterval(timer);
+  });
+}
 
 /**
  * Whether this daemon runs script automations.
@@ -716,6 +907,32 @@ export async function startDaemon(): Promise<void> {
     }
     let machineAutomationKey = loadOrCreateMachineAutomationKey(configuration.automationKeyFile);
     const mcpCallerGrantKeyPair = tweetnacl.box.keyPair();
+    const difficultyRoutingHostKey = createDifficultyRoutingHostKey();
+    const difficultyRoutingHost = new DifficultyRoutingClassifierHost(difficultyRoutingHostKey, {
+      authorize: authorizeDifficultyRoutingRequest,
+    });
+    const difficultyRoutingMachineMetadata: MachineMetadata = {
+      ...initialMachineMetadata,
+      difficultyRouting: {
+        version: 1,
+        protocol: DIFFICULTY_ROUTING_POLICY_VERSION,
+        hostProcessKeyId: difficultyRoutingHostKey.id,
+        hostProcessPublicKey: encodeBase64(difficultyRoutingHostKey.publicKey),
+        classifier: {
+          kind: 'transformers-binary',
+          modelMaxInputTokens: DIFFICULTY_ROUTING_MAX_INPUT_TOKENS,
+          maxInputChars: DIFFICULTY_ROUTING_MAX_INPUT_CHARS,
+          onnxSha256: '444c99b6f4d417e50859f73e1557db11943a2ad073ce4050a65f1b7d39403038',
+          tokenizerJsonSha256: 'acadd7d076a55a97edf9fb0521a0a2e9cf8cbbdd62e4d793f2aa3d1900916356',
+          revision: DIFFICULTY_CLASSIFIER_REVISION,
+        },
+        limits: {
+          concurrency: 1,
+          queueSize: 8,
+          requestDeadlineMs: 1000,
+        },
+      },
+    };
     const mcpCallerGrantConsumer = new McpCallerGrantEnvelopeConsumer({
       machineId,
       secretKey: mcpCallerGrantKeyPair.secretKey,
@@ -3107,7 +3324,7 @@ export async function startDaemon(): Promise<void> {
     } else try {
       machine = await api.getOrCreateMachine({
         machineId,
-        metadata: initialMachineMetadata,
+        metadata: difficultyRoutingMachineMetadata,
         daemonState: initialDaemonState,
         serverPublicKey
       });
@@ -3116,7 +3333,7 @@ export async function startDaemon(): Promise<void> {
       logger.debug('[DAEMON RUN] Machine registration failed unexpectedly, starting offline', error);
       machine = api.buildOfflineMachine({
         machineId,
-        metadata: initialMachineMetadata,
+        metadata: difficultyRoutingMachineMetadata,
         daemonState: initialDaemonState
       });
     }
@@ -3124,9 +3341,20 @@ export async function startDaemon(): Promise<void> {
     // encryption key, not server registration — set it either way so an
     // offline-degraded daemon still serves same-machine desktop clients.
     machineEncryptionForTerminalWs = { encryptionKey: machine.encryptionKey, encryptionVariant: machine.encryptionVariant };
+    startDifficultyRoutingElectionPoll({
+      host: difficultyRoutingHost,
+      machineId: machine.id,
+      hostProcessKeyId: difficultyRoutingHostKey.id,
+      token: credentials.token,
+    });
 
     // Create realtime machine session
     const apiMachine = api.machineSyncClient(machine);
+    startDifficultyRoutingMetadataPoll({
+      apiMachine,
+      host: difficultyRoutingHost,
+      baseMetadata: difficultyRoutingMachineMetadata,
+    });
     /** Set only for a managed runtime; the beat below keeps it current. */
     let managedCredentialState: {
       stateDir: string;
@@ -3842,6 +4070,7 @@ export async function startDaemon(): Promise<void> {
     // Set RPC handlers
     apiMachine.setRPCHandlers({
       byosOfflineReceive,
+      difficultyRouting: difficultyRoutingHost,
       spawnSession,
       resumeSession,
       recoverSession,
