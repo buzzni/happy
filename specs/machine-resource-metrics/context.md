@@ -78,6 +78,13 @@ Desktop(`aplus-dev-studio-desktop`)의 coordinator/store/UI도 별도 worktree�
 
 ## 다음 시작점
 
+### PR 후속 검증 (2026-09-20)
+
+- 최신 main(`420f1273`)을 병합하고 ApiMachineClient의 두 import를 모두 보존해 충돌을 해결했다.
+- 격리 worktree의 최신 happy-wire를 빌드해 사용했다. CLI 빌드(typecheck 포함)와 자원 수집 관련 80 tests가 통과했다.
+- 번들 도구 unpack, 신뢰 가능한 테스트 임시 경로, 최소 Git template을 준비한 전체 unit 재검증: 460 files / 7388 tests passed, 6 files / 23 tests failed, 26 tests skipped.
+- 남은 실패는 managed boot/supervisor 소켓, npm cache 접근, setuid 모드, 프로세스 조회 경계에서 관측됐다. 전체 통과로 표시하지 않는다. 로그: `/tmp/swift-finch-happy-recheck.log`.
+
 정상 실행 환경에서 전체 실패를 재검증한 뒤 이 PR과 Desktop 연동 PR을 함께 검토한다.
 wire 계약은 spec.md가 원본이며 status enum은 6종이다. 제품 적용에는 별도 승인된 CLI
 릴리스 후 Desktop runtime pin 갱신이 필요하다.

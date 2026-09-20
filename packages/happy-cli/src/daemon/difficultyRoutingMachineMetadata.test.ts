@@ -17,12 +17,13 @@ import { buildDifficultyRoutingMetadataUpdate } from './run'
  * the previous process.
  */
 
-function capability(keyId: string, publicKey: string): NonNullable<MachineMetadata['difficultyRouting']> {
+function capability(keyId: string, publicKey: string, timingVersions?: Array<1 | 2>): NonNullable<MachineMetadata['difficultyRouting']> {
   return {
     version: 1,
     protocol: DIFFICULTY_ROUTING_POLICY_VERSION,
     hostProcessKeyId: keyId,
     hostProcessPublicKey: publicKey,
+    ...(timingVersions ? { timingVersions } : {}),
     classifier: {
       kind: 'transformers-binary',
       modelMaxInputTokens: DIFFICULTY_ROUTING_MAX_INPUT_TOKENS,
@@ -61,6 +62,27 @@ describe('difficulty routing machine metadata advertised by the daemon', () => {
 
     expect((published as unknown as { daemonVersion: string }).daemonVersion).toBe('9.9.9')
     expect(published.difficultyRouting?.ready).toBe(false)
+  })
+
+  // The server decides whether to mint a v2 grant from exactly this field. If it survives
+  // `host.capability()` but not the readiness refresh, the first readiness change silently
+  // drops the machine back to legacy and every v2 request is answered `unsupported`.
+  it("keeps this run's timing contracts through a readiness refresh", () => {
+    const stored = { difficultyRouting: capability('RUN-1-KEY', 'RUN-1-PUB') } as unknown as MachineMetadata
+    const baseMetadata = { difficultyRouting: capability('RUN-2-KEY', 'RUN-2-PUB', [1, 2]) } as unknown as MachineMetadata
+
+    for (const ready of [true, false]) {
+      const published = buildDifficultyRoutingMetadataUpdate({ stored, baseMetadata, ready })
+      expect(published.difficultyRouting?.timingVersions, `ready=${ready}`).toEqual([1, 2])
+    }
+  })
+
+  it('does not invent timing support for a run that advertises none', () => {
+    const baseMetadata = { difficultyRouting: capability('RUN-2-KEY', 'RUN-2-PUB') } as unknown as MachineMetadata
+    const stored = { difficultyRouting: capability('RUN-1-KEY', 'RUN-1-PUB', [1, 2]) } as unknown as MachineMetadata
+
+    const published = buildDifficultyRoutingMetadataUpdate({ stored, baseMetadata, ready: true })
+    expect(published.difficultyRouting?.timingVersions).toBeUndefined()
   })
 
   it('falls back to the live metadata when the server has none stored', () => {

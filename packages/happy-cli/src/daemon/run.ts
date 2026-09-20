@@ -63,15 +63,20 @@ import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import {
+  AI_AUTH_SELECTION_CAPABILITY,
+  applyAppliedAiAuthSourceEnv,
   applyConfirmedPromptDeliveryFlag,
   buildManagedSessionSpawnEnvironment,
   buildResumedSessionSpawnEnvironment,
   buildSpawnRequestEnvironment,
   captureSaycodeAgentEnvironment,
+  honorsManagedAiCredentials,
   overlayManagedCredentialEnvironment,
   SESSION_LINEAGE_ENV_PREFIXES,
   stripManagedCredentialConflicts,
+  verifyAiAuthSelection,
 } from './sessionEnv';
+import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
@@ -313,9 +318,16 @@ export const initialMachineMetadata: MachineMetadata = {
     protocolVersion: AUTOMATION_PROTOCOL_VERSION,
   },
   additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
+  aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
 };
 
-async function authorizeDifficultyRoutingRequest(request: DifficultyRoutingRelayRequest): Promise<boolean> {
+/**
+ * The host owns this call's deadline and passes its own signal: recomputing one here from
+ * `request.deadlineAt` would read an absolute instant produced on another machine, and a v2
+ * request has no such field at all. The body echoes the negotiated contract so the server can
+ * refuse a signed v2 grant presented as v1.
+ */
+async function authorizeDifficultyRoutingRequest(request: DifficultyRoutingRelayRequest, signal: AbortSignal): Promise<boolean> {
   try {
     const response = await fetch(`${resolveAplusDifficultyRoutingOrigin()}/api/me/difficulty-routing/validate-grant`, {
       method: 'POST',
@@ -330,8 +342,9 @@ async function authorizeDifficultyRoutingRequest(request: DifficultyRoutingRelay
         hostMachineId: request.hostMachineId,
         hostProcessKeyId: request.hostProcessKeyId,
         policyRevision: request.policyRevision,
+        ...(request.timingVersion === 2 ? { timingVersion: 2 as const } : {}),
       }),
-      signal: AbortSignal.timeout(Math.max(1, Math.min(250, request.deadlineAt - Date.now()))),
+      signal,
     });
     if (!response.ok) return false;
     const body = await response.json().catch(() => null) as { ok?: unknown } | null;
@@ -918,6 +931,10 @@ export async function startDaemon(): Promise<void> {
         protocol: DIFFICULTY_ROUTING_POLICY_VERSION,
         hostProcessKeyId: difficultyRoutingHostKey.id,
         hostProcessPublicKey: encodeBase64(difficultyRoutingHostKey.publicKey),
+        // Advertised from the base metadata, not only from `host.capability()`: the readiness
+        // refresh rebuilds `difficultyRouting` from this object, so anything missing here is
+        // dropped the first time readiness changes.
+        timingVersions: [1, 2],
         classifier: {
           kind: 'transformers-binary',
           modelMaxInputTokens: DIFFICULTY_ROUTING_MAX_INPUT_TOKENS,
@@ -1647,15 +1664,22 @@ export async function startDaemon(): Promise<void> {
           primaryDirectory: directory,
           allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
         });
-        const finishSpawn = async (spawn: Promise<SpawnSessionResult>): Promise<SpawnSessionResult> => {
+        const finishSpawn = async (
+          spawn: Promise<SpawnSessionResult>,
+          appliedAiAuthSource?: AiAuthSource,
+        ): Promise<SpawnSessionResult> => {
           try {
             const result = await spawn;
             if (result.type !== 'success') {
               cleanupStagedDeferredContinuationContext();
             }
-            if (result.type !== 'success' || options.additionalDirectories === undefined) return result;
+            if (result.type !== 'success') return result;
+            const reported: SpawnSessionResult = appliedAiAuthSource === undefined
+              ? result
+              : { ...result, appliedAiAuthSource };
+            if (options.additionalDirectories === undefined) return reported;
             return {
-              ...result,
+              ...reported,
               additionalDirectories: {
                 version: 1,
                 accepted: additionalDirectoryResult.accepted,
@@ -1740,7 +1764,12 @@ export async function startDaemon(): Promise<void> {
           logger.debug(`[DAEMON RUN] User credentials staged at ${homeDir}/access.key`);
         }
 
-        const managedAiCredentialEnvironment = await resolveManagedAiCredentialEnvironment(options.agent);
+        // `machine-personal` 은 이 머신의 자기 로그인을 고른 것이다. 관리 자격을
+        // 해석해 두면 overlayManagedCredentialEnvironment 가 마지막에 덮어 항상
+        // 이긴다 — 그래서 해석 자체를 하지 않는다.
+        const managedAiCredentialEnvironment = honorsManagedAiCredentials(options.aiAuthSelection)
+          ? await resolveManagedAiCredentialEnvironment(options.agent)
+          : {};
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
           stripManagedCredentialConflicts(
             buildSpawnRequestEnvironment(authEnv, options.environmentVariables),
@@ -1960,14 +1989,22 @@ export async function startDaemon(): Promise<void> {
           const windowName = `happy-${Date.now()}-${agent}`;
           // Explicit agent auth and task callbacks are overlaid after inherited
           // credentials are filtered, so isolated tasks keep only what they need.
-          const tmuxEnv = applyConfirmedPromptDeliveryFlag(
+          const tmuxEnv = applyAppliedAiAuthSourceEnv(applyConfirmedPromptDeliveryFlag(
             buildManagedSessionSpawnEnvironment(
               inheritedSpawnEnvironment,
               extraEnv,
               managedAiCredentialEnvironment,
             ),
             requireInitialPromptAck,
-          );
+          ), Object.keys(managedAiCredentialEnvironment).length > 0);
+          // 최종 env 를 만든 **뒤** 선택과 대조한다. 어긋나면 대체하지 않고 멈춘다.
+          const tmuxSelection = verifyAiAuthSelection(options.aiAuthSelection, tmuxEnv);
+          if (tmuxSelection.rejection) {
+            return finishSpawn(Promise.resolve({
+              type: 'error',
+              errorMessage: tmuxSelection.rejection,
+            }));
+          }
 
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
             sessionName: tmuxSessionName,
@@ -2011,7 +2048,7 @@ export async function startDaemon(): Promise<void> {
               pidToAwaiter,
               label: '(tmux)',
               logger,
-            }));
+            }), tmuxSelection.appliedSource);
           } else {
             logger.debug(`[DAEMON RUN] Failed to spawn in tmux: ${tmuxResult.error}, falling back to regular spawning`);
             useTmux = false;
@@ -2052,24 +2089,34 @@ export async function startDaemon(): Promise<void> {
 
           // TODO: In future, sessionId could be used with --resume to continue existing sessions
           // For now, we ignore it - each spawn creates a new session
+          // scrub: 상속된 lineage env(HAPPY_RECONNECT_*/HAPPY_FORK*)가 새
+          // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
+          // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
+          const spawnEnvironment = applyAppliedAiAuthSourceEnv(applyConfirmedPromptDeliveryFlag(
+            buildManagedSessionSpawnEnvironment(
+              inheritedSpawnEnvironment,
+              extraEnv,
+              managedAiCredentialEnvironment,
+            ),
+            requireInitialPromptAck,
+          ), Object.keys(managedAiCredentialEnvironment).length > 0);
+          // 최종 env 를 만든 **뒤** 선택과 대조한다. 어긋나면 대체하지 않고 멈춘다.
+          const spawnSelection = verifyAiAuthSelection(options.aiAuthSelection, spawnEnvironment);
+          if (spawnSelection.rejection) {
+            return finishSpawn(Promise.resolve({
+              type: 'error',
+              errorMessage: spawnSelection.rejection,
+            }));
+          }
+
           return finishSpawn(spawnTrackedHappyProcess({
             args,
             cwd: directory,
-            // scrub: 상속된 lineage env(HAPPY_RECONNECT_*/HAPPY_FORK*)가 새
-            // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
-            // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
-            env: applyConfirmedPromptDeliveryFlag(
-              buildManagedSessionSpawnEnvironment(
-                inheritedSpawnEnvironment,
-                extraEnv,
-                managedAiCredentialEnvironment,
-              ),
-              requireInitialPromptAck,
-            ),
+            env: spawnEnvironment,
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
             userHomeDir: stagedUserHomeDir,
-          }));
+          }), spawnSelection.appliedSource);
         }
 
         // This should never be reached, but TypeScript requires a return statement
@@ -2530,7 +2577,7 @@ export async function startDaemon(): Promise<void> {
         }
         const authoritativeCheckpointProjectId = priorCheckpointContext?.projectId
           ?? (options?.mcpCallerGrantEnvelope ? checkpointProjectId : undefined);
-        const resumedEnvironment = injectCheckpointSpawnContext(
+        const resumedEnvironment = applyAppliedAiAuthSourceEnv(injectCheckpointSpawnContext(
           mcpEnvironment.environmentVariables,
           authoritativeCheckpointProjectId
             ? {
@@ -2539,7 +2586,7 @@ export async function startDaemon(): Promise<void> {
               checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
             }
             : undefined,
-        );
+        ), Object.keys(managedAiCredentialEnvironment).length > 0);
 
         const result = await spawnTrackedHappyProcess({
           args: launch.args,

@@ -2,6 +2,17 @@
 
 This document describes the Happy CLI (`packages/happy-cli`) and its daemon. The CLI is both an interactive tool and a background session manager that keeps machine state in sync with the server.
 
+## Unconfigured synced plugin MCP servers
+
+Claude loads synced plugin MCP definitions independently of Happy's injected
+gateway servers. The SDK query adapter excludes blank HTTP/SSE URLs in default
+synced plugin configurations using session-only `deniedMcpServers` entries.
+It does not edit the sync cache or persist a disabled flag: a URL configured
+later must become eligible on the next query. Configured servers, custom
+manifest MCP definitions, and ambiguous copies across accounts are left to
+the SDK. Revisit this boundary if Claude changes its synced plugin layout or
+server naming, or stops loading unconfigured placeholders itself.
+
 ## System overview
 
 ```mermaid

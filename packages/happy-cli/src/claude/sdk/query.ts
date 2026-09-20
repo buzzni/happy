@@ -4,7 +4,9 @@
  */
 
 import { query as sdkQuery, type Options, type Query } from '@anthropic-ai/claude-agent-sdk'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { QueryOptions, QueryPrompt, SDKMessage } from './types'
 import type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 import { ensureLocalProxyBypass } from '../utils/proxyBypass'
@@ -98,11 +100,12 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
 
 function resolveSettings(opts: QueryOptions | undefined): string | undefined {
     const denyRules = opts?.permissionsDeny ?? []
+    const emptyPluginServers = findEmptySyncedPluginServers().filter(name => !opts?.mcpServers?.[name])
     // SDK 는 settings 파일 경로와 sandbox 옵션의 동시 사용을 거부한다. 우리 규칙을
     // 경로로 넘기면 CLI 가 그 파일만 읽고 여기서 더한 것은 사라지므로, 합쳐야 할
     // 것이 하나라도 있으면 인라인한다.
-    if (!opts?.settingsPath || (!opts.sandbox && denyRules.length === 0)) return opts?.settingsPath
-    const rawSettings = readFileSync(opts.settingsPath, 'utf8')
+    if (emptyPluginServers.length === 0 && (!opts?.settingsPath || (!opts.sandbox && denyRules.length === 0))) return opts?.settingsPath
+    const rawSettings = opts?.settingsPath ? readFileSync(opts.settingsPath, 'utf8') : '{}'
     let parsedSettings: unknown
     try {
         parsedSettings = JSON.parse(rawSettings)
@@ -111,6 +114,15 @@ function resolveSettings(opts: QueryOptions | undefined): string | undefined {
     }
     if (!parsedSettings || typeof parsedSettings !== 'object' || Array.isArray(parsedSettings)) {
         throw new Error('Claude hook settings must be a JSON object before sandbox merge')
+    }
+    if (emptyPluginServers.length > 0) {
+        const settings = parsedSettings as { deniedMcpServers?: { serverName?: string }[] }
+        const existing = settings.deniedMcpServers ?? []
+        settings.deniedMcpServers = [
+            ...existing,
+            ...emptyPluginServers.filter(name => !existing.some(rule => rule.serverName === name))
+                .map(serverName => ({ serverName })),
+        ]
     }
     if (denyRules.length === 0) return JSON.stringify(parsedSettings)
 
@@ -125,4 +137,53 @@ function resolveSettings(opts: QueryOptions | undefined): string | undefined {
             deny: [...new Set([...existingDeny, ...denyRules])],
         },
     })
+}
+
+// Synced plugins are loaded by Claude itself, outside options.mcpServers. Apply
+// session-only exclusions; editing the sync cache or persisting disable flags
+// would keep a subsequently configured connector disabled.
+function findEmptySyncedPluginServers(): string[] {
+    const root = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'plugins', 'synced')
+    const empty = new Set<string>()
+    const configured = new Set<string>()
+    const customPlugins = new Set<string>()
+    const directories = (path: string): string[] => {
+        try {
+            return readdirSync(path, { withFileTypes: true })
+                .filter(entry => entry.isDirectory()).map(entry => join(path, entry.name))
+        } catch {
+            return []
+        }
+    }
+    for (const account of directories(root)) {
+        for (const plugin of directories(account)) {
+            try {
+                const manifest = JSON.parse(readFileSync(join(plugin, '.claude-plugin', 'plugin.json'), 'utf8'))
+                if (typeof manifest.name !== 'string' || !manifest.name) continue
+                // Custom paths/inline definitions can override the default file.
+                if (manifest.mcpServers !== undefined) {
+                    customPlugins.add(manifest.name)
+                    continue
+                }
+                const config = JSON.parse(readFileSync(join(plugin, '.mcp.json'), 'utf8'))
+                for (const [name, server] of Object.entries(config.mcpServers ?? config)) {
+                    if (!server || typeof server !== 'object') continue
+                    const entry = server as { type?: string; url?: unknown }
+                    const serverName = `plugin:${manifest.name}:${name}`
+                    if ((entry.type === 'http' || entry.type === 'sse') && typeof entry.url === 'string' && entry.url.trim() === '') {
+                        empty.add(serverName)
+                    } else {
+                        configured.add(serverName)
+                    }
+                }
+            } catch {
+                // Missing, malformed, or concurrently refreshed files remain the
+                // SDK's responsibility; never infer "unconfigured" from a read error.
+            }
+        }
+    }
+    // Multiple accounts can cache the same plugin. A usable definition in any
+    // account must not be blocked by a stale blank copy in another account.
+    return [...empty].filter(name => !configured.has(name)
+        && ![...customPlugins].some(plugin => name.startsWith(`plugin:${plugin}:`)))
 }

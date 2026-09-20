@@ -14,14 +14,22 @@ export function selectLegacyBrowserViewerPids(
     const lease = { display: ':99', vncPort: 5900, webPort: 6080 }
     const xvfb = processes.find((process) => viewerProcessMatchesLease('xvfb', process.cmdline, lease))
     const x11vnc = processes.find((process) => viewerProcessMatchesLease('x11vnc', process.cmdline, lease))
+    // Either display server counts: TigerVNC's Xvnc is one process where the
+    // older stack is two. Matching only the pair would leave an Xvnc-backed
+    // shared viewer holding :99/5900/6080 — the very slot the broker's first
+    // per-user viewer needs.
+    const xvnc = processes.find((process) => viewerProcessMatchesLease('xvnc', process.cmdline, lease))
+    const displayPids = xvnc
+        ? [xvnc.pid]
+        : (xvfb && x11vnc ? [xvfb.pid, x11vnc.pid] : null)
     const websockify = processes.find((process) => viewerProcessMatchesLease('websockify', process.cmdline, lease))
     const chrome = processes.find((process) => {
         const value = args(process.cmdline)
         return value.some((arg) => arg === `--user-data-dir=${legacyProfileDir}`)
             && value.some((arg) => arg === '--display=:99')
     })
-    return xvfb && x11vnc && websockify && chrome
-        ? [xvfb.pid, x11vnc.pid, websockify.pid, chrome.pid]
+    return displayPids && websockify && chrome
+        ? [...displayPids, websockify.pid, chrome.pid]
         : []
 }
 
