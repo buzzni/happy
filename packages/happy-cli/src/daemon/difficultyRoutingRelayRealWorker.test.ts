@@ -21,7 +21,7 @@ import { afterAll, describe, expect, it } from 'vitest'
 import {
   DifficultyRoutingClassifierHost,
   createDifficultyRoutingHostKey,
-  type DifficultyRoutingRelayRequest,
+  type DifficultyRoutingRelayRequestLegacy,
 } from './difficultyRoutingClassifierHost'
 
 const modelDir = process.env.HAPPY_DIFFICULTY_ROUTING_MODEL_DIR
@@ -68,7 +68,7 @@ describe.skipIf(!enabled)('difficulty routing sealed relay with the real worker'
     }
   }
 
-  const request = (text: string, overrides: Partial<DifficultyRoutingRelayRequest> = {}): DifficultyRoutingRelayRequest => ({
+  const request = (text: string, overrides: Partial<DifficultyRoutingRelayRequestLegacy> = {}): DifficultyRoutingRelayRequestLegacy => ({
     version: 1,
     requestId: randomUUID(),
     signedGrant: `grant-${randomUUID()}`,

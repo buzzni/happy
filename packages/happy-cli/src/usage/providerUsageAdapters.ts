@@ -1,7 +1,9 @@
 import {
     ProviderUsageEventV1Schema,
+    type AiAuthReportV1,
     type ProviderUsageEventV1,
 } from '@slopus/happy-wire';
+import { readAiAuthConnectionVersion, resolveAppliedAiAuthSource } from './aiAuthSource';
 
 type ClaudeUsage = {
     input_tokens: number;
@@ -19,6 +21,34 @@ type CodexUsage = {
     reasoningOutputTokens: number;
 };
 
+/**
+ * The environment the run was launched with, as an argument.
+ *
+ * Defaults to `process.env` because the three call sites (apiSession, runCodex)
+ * all report from inside the launched child and none of them has anything else
+ * to pass; tests inject instead of mutating a global.
+ */
+type UsageEventEnvironment = Record<string, string | undefined>;
+
+/**
+ * What the daemon wrote down at spawn — never re-derived here.
+ *
+ * An organisation bundle and a person's own key arrive as the same
+ * `ANTHROPIC_API_KEY`; only the layer that applied the credential can tell
+ * them apart, so this reads its decision and adds no fingerprint of its own.
+ *
+ * Returns `undefined` when nothing was established. The ledger folds a NULL
+ * column and an unrecognised token into the same `unknown` bucket, so an
+ * omitted report says exactly as much as a written `unknown` would, while
+ * keeping the event identical to what a daemon without this field produces.
+ */
+function aiAuthReport(env: UsageEventEnvironment): AiAuthReportV1 | undefined {
+    const appliedSource = resolveAppliedAiAuthSource({ env });
+    const connectionVersion = readAiAuthConnectionVersion(env);
+    if (appliedSource === 'unknown' && connectionVersion === null) return undefined;
+    return { appliedSource, connectionVersion };
+}
+
 function normalizedModel(model: string | null | undefined): string | null {
     const value = model?.trim();
     return value ? value : null;
@@ -31,6 +61,7 @@ export function createClaudeUsageEvent(input: {
     transcriptUuid: string;
     model?: string | null;
     usage: ClaudeUsage;
+    env?: UsageEventEnvironment;
 }): ProviderUsageEventV1 {
     const providerEventId = input.messageId?.trim() || input.transcriptUuid.trim();
     const cacheRead = input.usage.cache_read_input_tokens ?? 0;
@@ -57,6 +88,7 @@ export function createClaudeUsageEvent(input: {
         },
         cost: null,
         quality: 'exact',
+        aiAuth: aiAuthReport(input.env ?? process.env),
     });
 }
 
@@ -70,6 +102,7 @@ export function createClaudeTurnUsageEvent(input: {
     resultUuid: string;
     model?: string | null;
     usage: ClaudeUsage;
+    env?: UsageEventEnvironment;
 }): ProviderUsageEventV1 {
     return createClaudeUsageEvent({
         sessionId: input.sessionId,
@@ -78,6 +111,7 @@ export function createClaudeTurnUsageEvent(input: {
         transcriptUuid: input.resultUuid,
         model: input.model,
         usage: input.usage,
+        env: input.env,
     });
 }
 
@@ -87,6 +121,7 @@ export function createCodexUsageEvent(input: {
     occurredAt: number;
     model?: string | null;
     usage: CodexUsage;
+    env?: UsageEventEnvironment;
 }): ProviderUsageEventV1 {
     const exclusiveInput = input.usage.inputTokens
         - input.usage.cachedInputTokens
@@ -113,5 +148,6 @@ export function createCodexUsageEvent(input: {
         },
         cost: null,
         quality: 'exact',
+        aiAuth: aiAuthReport(input.env ?? process.env),
     });
 }

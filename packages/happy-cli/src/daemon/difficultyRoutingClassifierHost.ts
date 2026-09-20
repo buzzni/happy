@@ -5,7 +5,12 @@ import { spawn } from 'node:child_process'
 import tweetnacl from 'tweetnacl'
 import { decodeBase64 } from '@/api/encryption'
 
-export type DifficultyRoutingRelayRequest = {
+/**
+ * The two contracts are mutually exclusive on the wire. `deadlineAt` is an absolute instant
+ * produced by *another* machine; `remainingMs` is a duration this host starts counting on
+ * arrival, so it never compares its own clock against someone else's.
+ */
+type DifficultyRoutingRelayFields = {
   version: 1
   requestId: string
   signedGrant: string
@@ -13,7 +18,6 @@ export type DifficultyRoutingRelayRequest = {
   sourceMachineId: string
   hostMachineId: string
   hostProcessKeyId: string
-  deadlineAt: number
   sealedText: {
     alg: 'x25519-xsalsa20-poly1305'
     nonce: string
@@ -22,8 +26,26 @@ export type DifficultyRoutingRelayRequest = {
   }
 }
 
+/** Legacy: an absolute instant produced by the *sending* machine. */
+export type DifficultyRoutingRelayRequestLegacy = DifficultyRoutingRelayFields & {
+  timingVersion?: undefined
+  deadlineAt: number
+  remainingMs?: undefined
+}
+
+/** Timing v2: a duration this host starts counting on arrival. */
+export type DifficultyRoutingRelayRequestV2 = DifficultyRoutingRelayFields & {
+  timingVersion: 2
+  remainingMs: number
+  deadlineAt?: undefined
+}
+
+export type DifficultyRoutingRelayRequest = DifficultyRoutingRelayRequestLegacy | DifficultyRoutingRelayRequestV2
+
 export type DifficultyRoutingRelayResponse = {
   version: 1
+  /** Echoed on every answer to a v2 request, so the caller can tell the contracts apart. */
+  timingVersion?: 2
   requestId: string
   policyRevision: number
   status: 'ok' | 'busy' | 'not-ready' | 'expired' | 'revoked' | 'unsupported' | 'error'
@@ -40,18 +62,51 @@ type WorkerMessage =
 type Pending = {
   request: DifficultyRoutingRelayRequest
   resolve: (value: DifficultyRoutingRelayResponse) => void
-  startedAt: number
+  /** Both on the monotonic clock. Set once on admission and never recomputed. */
+  startedMono: number
+  deadlineMono: number
   settled: boolean
   timer: ReturnType<typeof setTimeout>
 }
 
 export type ClassifierHostDeps = {
   spawnWorker?: () => ChildProcess
-  now?: () => number
+  /**
+   * Wall clock. Used *only* to read a legacy `deadlineAt` at the entrance — that is the one
+   * place a foreign absolute instant has to be interpreted, and it is also the legacy flaw
+   * this contract exists to retire. Nothing downstream may use it.
+   */
+  wallNow?: () => number
+  /** Process monotonic clock: every deadline, timer, replay window and elapsed measurement. */
+  monotonicNow?: () => number
   /** Must validate live policy, exact signed grant, principal and session scope. */
-  authorize?: (request: DifficultyRoutingRelayRequest) => Promise<boolean>
+  authorize?: (request: DifficultyRoutingRelayRequest, signal: AbortSignal) => Promise<boolean>
   idleMs?: number
   hangGraceMs?: number
+}
+
+/** Longest a consumed grant must stay unusable: 60s of life, 15s of future-iat the server
+ *  still accepts, and the millisecond where `now === exp` is not yet expired. */
+const REPLAY_RETENTION_MS = 75_001
+
+type Budget = { ok: true; remainingMs: number } | { ok: false; status: 'expired' | 'error' | 'unsupported' }
+
+/** Reads whichever contract the body is on, without ever guessing which field wins. */
+export function readRelayBudget(request: DifficultyRoutingRelayRequest, wallNow: number): Budget {
+  if (request.timingVersion !== undefined) {
+    if (request.timingVersion !== 2) return { ok: false, status: 'unsupported' }
+    if (request.deadlineAt !== undefined) return { ok: false, status: 'error' }
+    const remainingMs = request.remainingMs
+    return typeof remainingMs === 'number' && Number.isSafeInteger(remainingMs) && remainingMs >= 1 && remainingMs <= 1000
+      ? { ok: true, remainingMs }
+      : { ok: false, status: 'error' }
+  }
+  if (request.remainingMs !== undefined) return { ok: false, status: 'error' }
+  const deadlineAt = request.deadlineAt
+  if (!Number.isFinite(deadlineAt) || deadlineAt <= wallNow) return { ok: false, status: 'expired' }
+  // Legacy only: this is the single place a foreign absolute instant is read, and the reason
+  // a clock difference used to kill the turn. Converted to a local duration immediately.
+  return deadlineAt > wallNow + 1000 ? { ok: false, status: 'error' } : { ok: true, remainingMs: deadlineAt - wallNow }
 }
 
 export class DifficultyRoutingClassifierHost {
@@ -70,9 +125,11 @@ export class DifficultyRoutingClassifierHost {
   private idleTimer?: ReturnType<typeof setTimeout>
   private hangTimer?: ReturnType<typeof setTimeout>
   private loadTimer?: ReturnType<typeof setTimeout>
-  private readonly now: () => number
+  private readonly wallNow: () => number
+  private readonly mono: () => number
   constructor(private readonly hostProcessKey: { id: string; publicKey: Uint8Array; secretKey: Uint8Array }, private readonly deps: ClassifierHostDeps = {}) {
-    this.now = deps.now ?? Date.now
+    this.wallNow = deps.wallNow ?? Date.now
+    this.mono = deps.monotonicNow ?? (() => performance.now())
   }
   capability() {
     return { hostProcessKeyId: this.hostProcessKey.id, hostProcessPublicKey: Buffer.from(this.hostProcessKey.publicKey).toString('base64'), ready: Boolean(this.classifierRevision) }
@@ -85,7 +142,7 @@ export class DifficultyRoutingClassifierHost {
     this.prepare()
   }
   prepare(): void {
-    if (!this.enabled || this.worker || this.preparation || this.now() < this.retryAt) return
+    if (!this.enabled || this.worker || this.preparation || this.mono() < this.retryAt) return
     if (this.deps.spawnWorker) {
       try { this.ensureWorker().send?.({ type: 'prepare' }) } catch { this.stopWorker('error') }
       return
@@ -101,38 +158,42 @@ export class DifficultyRoutingClassifierHost {
   async classify(request: DifficultyRoutingRelayRequest): Promise<DifficultyRoutingRelayResponse> {
     if (!this.enabled) return this.reply(request, 'revoked')
     if (!request || request.version !== 1 || request.hostProcessKeyId !== this.hostProcessKey.id) return this.reply(request, 'unsupported')
-    if (!Number.isFinite(request.deadlineAt) || request.deadlineAt <= this.now()) return this.reply(request, 'expired')
-    if (request.deadlineAt > this.now() + 1000 || !validId(request.requestId) || typeof request.signedGrant !== 'string' || request.signedGrant.length > 8192) return this.reply(request, 'error')
+    // One reading of the clock for this turn. Everything after this is a duration.
+    const h0 = this.mono()
+    const budget = readRelayBudget(request, this.wallNow())
+    if (!budget.ok) return this.reply(request, budget.status)
+    const deadlineMono = h0 + budget.remainingMs
+    if (!validId(request.requestId) || typeof request.signedGrant !== 'string' || request.signedGrant.length > 8192) return this.reply(request, 'error')
     if (!request.sealedText || typeof request.sealedText.ciphertext !== 'string' || request.sealedText.ciphertext.length > 42700) return this.reply(request, 'error')
     if (!this.classifierRevision) { this.prepare(); return this.reply(request, 'not-ready') }
     if (this.admittedBytes + request.sealedText.ciphertext.length > 256 * 1024) return this.reply(request, 'busy')
     if (this.queue.length + this.admitting >= 8 && this.active) return this.reply(request, 'busy')
-    for (const [key, expires] of this.replay) if (expires <= this.now()) this.replay.delete(key)
+    for (const [key, expires] of this.replay) if (expires <= this.mono()) this.replay.delete(key)
     const replayKey = request.signedGrant
     if (this.replay.has(replayKey)) return this.reply(request, 'revoked')
     if (this.replay.size >= 1024 || this.queue.length + this.admitting >= 9) return this.reply(request, 'busy')
-    this.replay.set(replayKey, this.now() + 60000)
+    this.replay.set(replayKey, this.mono() + REPLAY_RETENTION_MS)
     this.admittedBytes += request.sealedText.ciphertext.length
     this.admitting++
     const epoch = this.epoch
-    const authorized = await this.authorized(request)
+    const authorized = await this.authorized(request, deadlineMono)
     this.admitting--
     this.admittedBytes -= request.sealedText.ciphertext.length
     if (!authorized || !this.enabled || epoch !== this.epoch) {
       this.replay.delete(replayKey)
       return this.reply(request, 'revoked')
     }
-    if (request.deadlineAt <= this.now()) return this.reply(request, 'expired')
+    if (deadlineMono <= this.mono()) return this.reply(request, 'expired')
     clearTimeout(this.idleTimer)
     return new Promise((resolve) => {
-      const pending = { request, resolve, startedAt: this.now(), settled: false } as Pending
+      const pending = { request, resolve, startedMono: h0, deadlineMono, settled: false } as Pending
       pending.timer = setTimeout(() => {
         this.settle(pending, this.reply(request, 'expired'))
         if (this.active !== pending) {
           const index = this.queue.indexOf(pending)
           if (index >= 0) this.queue.splice(index, 1)
         }
-      }, Math.max(0, request.deadlineAt - this.now()))
+      }, Math.max(0, deadlineMono - this.mono()))
       this.admittedBytes += request.sealedText.ciphertext.length
       this.queue.push(pending)
       void this.pump()
@@ -150,10 +211,10 @@ export class DifficultyRoutingClassifierHost {
     this.epoch++
     this.preparation?.abort()
     this.preparation = null
-    if (status === 'error') this.retryAt = this.now() + 30000
+    if (status === 'error') this.retryAt = this.mono() + 30000
     clearTimeout(this.idleTimer); clearTimeout(this.hangTimer); clearTimeout(this.loadTimer)
     if (this.active) this.settle(this.active, this.reply(this.active.request, status))
-    for (const pending of this.queue.splice(0)) this.settle(pending, this.reply(pending.request, pending.request.deadlineAt <= this.now() ? 'expired' : status))
+    for (const pending of this.queue.splice(0)) this.settle(pending, this.reply(pending.request, pending.deadlineMono <= this.mono() ? 'expired' : status))
     this.active = null; this.classifierRevision = null
     const worker = this.worker
     this.stopping = Boolean(worker)
@@ -162,27 +223,38 @@ export class DifficultyRoutingClassifierHost {
       try { worker.kill('SIGKILL') } catch { /* exit listener owns release */ }
     }
   }
-  private async authorized(request: DifficultyRoutingRelayRequest): Promise<boolean> {
+  /**
+   * The callback gets the abort signal rather than recomputing a deadline of its own: the
+   * HTTP call it makes has to die on the same budget, and it cannot see this host's clock.
+   */
+  private async authorized(request: DifficultyRoutingRelayRequest, deadlineMono: number): Promise<boolean> {
     let timer: ReturnType<typeof setTimeout> | undefined
+    const controller = new AbortController()
     try {
       return await Promise.race([
-        this.deps.authorize?.(request) ?? Promise.resolve(false),
-        new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), Math.min(250, Math.max(1, request.deadlineAt - this.now()))) }),
+        this.deps.authorize?.(request, controller.signal) ?? Promise.resolve(false),
+        new Promise<boolean>(resolve => {
+          timer = setTimeout(() => { controller.abort(); resolve(false) }, Math.min(250, Math.max(1, deadlineMono - this.mono())))
+        }),
       ])
-    } catch { return false } finally { clearTimeout(timer) }
+    } catch { return false } finally { clearTimeout(timer); controller.abort() }
   }
   private async pump(): Promise<void> {
     if (this.active || !this.enabled || !this.classifierRevision) return
     const next = this.queue.shift()
     if (!next) { this.armIdle(); return }
-    if (next.settled || next.request.deadlineAt <= this.now()) {
+    // Redundant with `settled` whenever the admission timer ran on time — deliberately kept
+    // for when it did not. A starved event loop can deliver this dequeue late, and nothing
+    // past the budget may reach decryption. No test distinguishes the two.
+    if (next.settled || next.deadlineMono <= this.mono()) {
       this.settle(next, this.reply(next.request, 'expired')); void this.pump(); return
     }
     this.active = next
     const epoch = this.epoch
-    const authorized = await this.authorized(next.request)
+    // Re-validated on what is LEFT of the original budget — the queue never grants more time.
+    const authorized = await this.authorized(next.request, next.deadlineMono)
     if (epoch !== this.epoch || this.active !== next) return
-    if (!authorized || next.settled || next.request.deadlineAt <= this.now()) {
+    if (!authorized || next.settled || next.deadlineMono <= this.mono()) {
       this.settle(next, this.reply(next.request, authorized ? 'expired' : 'revoked'))
       this.active = null; void this.pump(); return
     }
@@ -190,7 +262,7 @@ export class DifficultyRoutingClassifierHost {
     if (text === null) {
       this.settle(next, this.reply(next.request, 'error')); this.active = null; void this.pump(); return
     }
-    this.hangTimer = setTimeout(() => this.stopWorker('error'), Math.max(0, next.request.deadlineAt - this.now()) + (this.deps.hangGraceMs ?? 1000))
+    this.hangTimer = setTimeout(() => this.stopWorker('error'), Math.max(0, next.deadlineMono - this.mono()) + (this.deps.hangGraceMs ?? 1000))
     try { this.worker?.send?.({ type: 'classify', requestId: next.request.requestId, text, maxInputTokens: 512 }) }
     catch { this.stopWorker('error') }
   }
@@ -222,9 +294,9 @@ export class DifficultyRoutingClassifierHost {
     if (!active || active.request.requestId !== message.requestId) return
     clearTimeout(this.hangTimer)
     this.active = null
-    if (active.request.deadlineAt <= this.now()) this.settle(active, this.reply(active.request, 'expired'))
+    if (active.deadlineMono <= this.mono()) this.settle(active, this.reply(active.request, 'expired'))
     else if (message.type === 'result' && message.classifierRevision === this.classifierRevision && ['trivial', 'routine', 'hard'].includes(message.difficulty)) {
-      this.settle(active, { ...this.reply(active.request, 'ok'), difficulty: message.difficulty, classifierRevision: message.classifierRevision, elapsedMs: this.now() - active.startedAt })
+      this.settle(active, { ...this.reply(active.request, 'ok'), difficulty: message.difficulty, classifierRevision: message.classifierRevision, elapsedMs: Math.max(0, this.mono() - active.startedMono) })
     } else this.settle(active, this.reply(active.request, 'error'))
     void this.pump()
   }
@@ -243,7 +315,8 @@ export class DifficultyRoutingClassifierHost {
     } catch { return null }
   }
   private reply(request: DifficultyRoutingRelayRequest, status: DifficultyRoutingRelayResponse['status']): DifficultyRoutingRelayResponse {
-    return { version: 1, requestId: request?.requestId, policyRevision: request?.policyRevision, status }
+    const base = { version: 1 as const, requestId: request?.requestId, policyRevision: request?.policyRevision, status }
+    return request?.timingVersion === 2 ? { ...base, timingVersion: 2 } : base
   }
 }
 function validId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 256 }

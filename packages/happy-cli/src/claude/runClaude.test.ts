@@ -1512,12 +1512,19 @@ describe('runClaude remote JSONL scanner', () => {
     });
 
     it('keeps difficulty routing sticky state locally when metadata persistence is delayed', async () => {
-        vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+        vi.stubGlobal('fetch', vi.fn(async (_url: string, init: { body: string }) => Response.json({
             ok: true,
             grant: {
                 version: 1,
                 grantId: 'grant-1',
                 policyRevision: 7,
+                // The client negotiates timing v2, so the server answers with durations and
+                // echoes the turn id back, exactly as the real grant endpoint does.
+                timingVersion: 2,
+                requestId: JSON.parse(init.body).clientRequestId,
+                issuedAt: Date.now(),
+                ttlMs: 10_000,
+                relayTtlMs: 1000,
                 expiresAt: Date.now() + 10_000,
                 sourceMachineId: 'machine-1',
                 hostMachineId: 'host-1',

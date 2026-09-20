@@ -19,6 +19,11 @@ export const DifficultyRoutingCapabilitySchema = z.object({
   hostProcessKeyId: z.string().min(1),
   hostProcessPublicKey: z.string().min(1),
   ready: z.boolean().optional(),
+  /**
+   * Relay timing contracts this host speaks. Absent means legacy `[1]` — an older daemon has
+   * no such field, and the server must not read that silence as v2 support.
+   */
+  timingVersions: z.array(z.union([z.literal(1), z.literal(2)])).min(1).optional(),
   classifier: z.object({
     kind: z.literal('transformers-binary'),
     modelMaxInputTokens: z.literal(DIFFICULTY_ROUTING_MAX_INPUT_TOKENS),
