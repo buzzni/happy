@@ -2053,20 +2053,22 @@ export async function startDaemon(): Promise<void> {
 
           // TODO: In future, sessionId could be used with --resume to continue existing sessions
           // For now, we ignore it - each spawn creates a new session
+          // scrub: 상속된 lineage env(HAPPY_RECONNECT_*/HAPPY_FORK*)가 새
+          // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
+          // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
+          const spawnEnvironment = applyAppliedAiAuthSourceEnv(applyConfirmedPromptDeliveryFlag(
+            buildManagedSessionSpawnEnvironment(
+              inheritedSpawnEnvironment,
+              extraEnv,
+              managedAiCredentialEnvironment,
+            ),
+            requireInitialPromptAck,
+          ), Object.keys(managedAiCredentialEnvironment).length > 0);
+
           return finishSpawn(spawnTrackedHappyProcess({
             args,
             cwd: directory,
-            // scrub: 상속된 lineage env(HAPPY_RECONNECT_*/HAPPY_FORK*)가 새
-            // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
-            // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
-            env: applyAppliedAiAuthSourceEnv(applyConfirmedPromptDeliveryFlag(
-              buildManagedSessionSpawnEnvironment(
-                inheritedSpawnEnvironment,
-                extraEnv,
-                managedAiCredentialEnvironment,
-              ),
-              requireInitialPromptAck,
-            ), Object.keys(managedAiCredentialEnvironment).length > 0),
+            env: spawnEnvironment,
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
             userHomeDir: stagedUserHomeDir,
